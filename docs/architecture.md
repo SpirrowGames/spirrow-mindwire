@@ -106,14 +106,16 @@ reply_to: 2                                           # 任意。 直前メッ�
 1 行 1 JSON、 append-only。 ripgrep / jq で横断検索可能。
 
 ```jsonl
-{"schema_version":1,"ts":"2026-05-07T08:43:07Z","type":"thread.created","thread_id":"01ARZ3...","title":""}
-{"schema_version":1,"ts":"2026-05-07T08:43:08Z","type":"message.received","thread_id":"01ARZ3...","seq":1,"from":"claude.ai","size_bytes":1234}
-{"schema_version":1,"ts":"2026-05-07T08:43:09Z","type":"thread.status.changed","thread_id":"01ARZ3...","from_status":"active","to_status":"awaiting-cc"}
-{"schema_version":1,"ts":"2026-05-07T08:43:10Z","type":"claude_code.invoke.start","thread_id":"01ARZ3...","msg_seq":1}
-{"schema_version":1,"ts":"2026-05-07T08:43:42Z","type":"claude_code.invoke.end","thread_id":"01ARZ3...","msg_seq":1,"duration_ms":33000,"exit_code":0}
-{"schema_version":1,"ts":"2026-05-07T08:43:42Z","type":"message.sent","thread_id":"01ARZ3...","seq":2,"from":"claude-code","size_bytes":4567}
-{"schema_version":1,"ts":"2026-05-07T08:43:42Z","type":"thread.status.changed","thread_id":"01ARZ3...","from_status":"awaiting-cc","to_status":"awaiting-cai"}
+{"schema_version":1,"event_id":"01ARZ4A...","ts":"2026-05-07T08:43:07Z","type":"thread.created","thread_id":"01ARZ3...","title":""}
+{"schema_version":1,"event_id":"01ARZ4B...","ts":"2026-05-07T08:43:08Z","type":"message.received","thread_id":"01ARZ3...","seq":1,"from":"claude.ai","size_bytes":1234}
+{"schema_version":1,"event_id":"01ARZ4C...","ts":"2026-05-07T08:43:09Z","type":"thread.status.changed","thread_id":"01ARZ3...","from_status":"active","to_status":"awaiting-cc"}
+{"schema_version":1,"event_id":"01ARZ4D...","ts":"2026-05-07T08:43:10Z","type":"claude_code.invoke.start","thread_id":"01ARZ3...","msg_seq":1}
+{"schema_version":1,"event_id":"01ARZ4E...","ts":"2026-05-07T08:43:42Z","type":"claude_code.invoke.end","thread_id":"01ARZ3...","msg_seq":1,"duration_ms":33000,"exit_code":0}
+{"schema_version":1,"event_id":"01ARZ4F...","ts":"2026-05-07T08:43:42Z","type":"message.sent","thread_id":"01ARZ3...","seq":2,"from":"claude-code","size_bytes":4567}
+{"schema_version":1,"event_id":"01ARZ4G...","ts":"2026-05-07T08:43:42Z","type":"thread.status.changed","thread_id":"01ARZ3...","from_status":"awaiting-cc","to_status":"awaiting-cai"}
 ```
+
+各イベントには **`event_id` (ULID)** を付与する。 dedup / cursor-based pagination / Connector の処理位置記録に利用される (詳細は `docs/mcp-interface.md` §4)。
 
 **初期イベントタイプ (Phase 0)**:
 - `thread.created` / `thread.status.changed` / `thread.archived` / `thread.resolved`
@@ -193,6 +195,11 @@ reply_to: 2                                           # 任意。 直前メッ�
 - MindWire は外部に push しない (webhook / event hook なし)
 - Connector は polling または file watch (`logs/threads/*.jsonl` を tail) で eventual consistency 前提
 - 「webhook が欲しい」 という将来の要望はこの原則で防衛 (秒〜分単位レイテンシ許容と整合)
+
+**Filesystem アクセス前提 (Phase 0)**:
+- 公開 MCP は read-only。 bidirectional Connector (例: Magickit ChatRoom 連携) が MindWire 側にメッセージを書き戻す経路は **filesystem 直書き** (claude-code と同じファイルプロトコル: `messages/<NNN>-from-<src>.md` を tmp + rename で書く)
+- 結果として **Phase 0 の Connector は MindWire データディレクトリへの filesystem アクセス権を持つ** ことが暗黙の前提
+- Phase 1+ で Connector を別ホスト / 別プロセスで独立サーバ化する場合は、 NFS / sync / write API のいずれかでこの結合を再構築する必要がある (将来論点)
 
 ### 期待される連携先 (温度感、 T02 時点)
 
