@@ -197,9 +197,10 @@ reply_to: 2                                           # 任意。 直前メッ�
 - 「webhook が欲しい」 という将来の要望はこの原則で防衛 (秒〜分単位レイテンシ許容と整合)
 
 **Filesystem アクセス前提 (Phase 0)**:
-- 公開 MCP は read-only。 bidirectional Connector (例: Magickit ChatRoom 連携) が MindWire 側にメッセージを書き戻す経路は **filesystem 直書き** (claude-code と同じファイルプロトコル: `messages/<NNN>-from-<src>.md` を tmp + rename で書く)
+- 公開 MCP は read-only。 bidirectional Connector (例: Magickit ChatRoom 連携) が MindWire 側にメッセージを書き戻す経路は **filesystem 直書き** (atomic tmp + rename プロトコル: `messages/<NNN>-from-<src>.md.tmp` → `rename` で公開、 watcher の `write_reply` と同じ手順)
 - 結果として **Phase 0 の Connector は MindWire データディレクトリへの filesystem アクセス権を持つ** ことが暗黙の前提
 - Phase 1+ で Connector を別ホスト / 別プロセスで独立サーバ化する場合は、 NFS / sync / write API のいずれかでこの結合を再構築する必要がある (将来論点)
+- **claude-code 自身は filesystem に直アクセスしない** (T06 で確定): SDK custom tool 経由で watcher にメッセージ書込みを委譲し、 ユーザのコードベース read も Phanthand 経由 (§6 参照)
 
 ### 期待される連携先 (温度感、 T02 時点)
 
@@ -213,25 +214,142 @@ reply_to: 2                                           # 任意。 直前メッ�
 
 **設計上の含意**: 強い候補は pull/read 中心。 T03 で MindWire の公開 I/F は **read 系を充実、 write 系は最小限** で進める方針。
 
-## 6. 設計判断の経緯
+## 6. claude-code 起動モデル (Phase 0)
 
-### 6.1 統合 (`messages/`) vs 分離 (`inbox/` `outbox/`) → 統合採用
+T06 で確定した watcher → claude-code spawn の構成。 「ファイルベース I/O が核」 (決定 4) と 「世界観の死守」 (決定 8) を両立させる。
+
+### 6.1 起動手段: Claude Agent SDK (Python)
+
+- `claude-agent-sdk` (Python) を採用。 PTY 直叩きはしない
+- 採用根拠: claude-code CLI auth 継承、 programmatic な cwd / system_prompt / allowed_tools / mcp_servers 制御、 async 統合容易、 CLI flag 変更への耐性
+- watcher は asyncio で書き、 SDK セッションを 1 invoke = 1 セッションで起動・完了させる
+
+### 6.2 Spawn 時の構成
+
+| パラメータ | 値 |
+|---|---|
+| `cwd` | thread dir (`threads/<ULID>/`) |
+| `tools` | `[]` (built-in tools 全切り) |
+| `mcp_servers` | in-process MindWire custom + 設定経由の pass-through |
+| `allowed_tools` | 上記 in-process custom + 設定で許可された pass-through tools |
+| `prompt` (user turn) | thread の全 context を XML 構造化 (§6.4) して 1 度に投入 |
+| `system_prompt` | role + protocol 説明 (static、 thread 状態に依らない) |
+
+### 6.3 MindWire 提供 custom tool セット (in-process)
+
+| tool | 役割 |
+|---|---|
+| `mcp__mindwire__write_reply(content)` | 次メッセージの atomic 書込み (`NNN-from-cc.md.tmp` → rename) |
+| `mcp__mindwire__read_file(path)` | Phanthand `/files/read` 経由 |
+| `mcp__mindwire__list_dir(path)` | Phanthand `/files/list` 経由 |
+| `mcp__mindwire__search(pattern)` | Phanthand `/files/search` 経由 |
+| `mcp__mindwire__file_info(path)` | Phanthand `/files/info` 経由 |
+
+claude-code は filesystem に直接アクセスしない:
+- MindWire データへの書込みは `write_reply` のみ (連番計算 / atomic rename を watcher 側で完結、 LLM はファイルレイアウトを知らない)
+- ユーザのコードベース read は Phanthand 経由 (§6.5)
+
+### 6.4 thread context の prompt 注入
+
+watcher は thread 状態 (meta.yaml + 全 messages) を XML 構造化して `prompt` parameter に積む (full eager push)。 system prompt 側で 「`<mw_thread>` 内の `is_latest="true"` の `<mw_message>` に対して `mcp__mindwire__write_reply` で返信」 と教える。
+
+XML フォーマット例:
+
+```xml
+<mw_thread thread_id="01ARZ3..." status="awaiting-cc"
+           participants="claude.ai,claude-code">
+  <mw_message seq="1" from="claude.ai" to="claude-code"
+              created_at="2026-05-07T08:43:07Z">
+本文 markdown (XML 特殊文字は &lt; &gt; &amp; にエスケープ)
+  </mw_message>
+  ...
+  <mw_message seq="N" ... is_latest="true">
+本文 (これに返信する対象)
+  </mw_message>
+</mw_thread>
+```
+
+prefix `mw_` でユーザ本文中の XML との衝突を回避。 本文は XML escape する。
+
+### 6.5 外部 file access layer: Phanthand 依存
+
+claude-code がユーザの project ファイルを参照する場合、 watcher が Phanthand HTTP API (`SpirrowGames/spirrow-phanthand`) を呼ぶ。
+
+- 各 PC で Phanthand を独立に起動 + whitelist 設定 → **MindWire schema に local path が一切入らない** ため multi-PC portability が完全達成される
+- Phanthand は read-only API のみ。 Phase 0 では write/exec 系操作 (役割 R3) は **サポートしない** (議論内で実装が必要な場合は §6.6 の handoff で委譲)
+
+### 6.6 Generic MCP pass-through (Connector パターン at SDK layer)
+
+`mindwire.toml` の `[claude_code.extra_mcp_servers.*]` で SDK セッションに追加 expose する MCP server を declarative に列挙する。 MindWire コアは pass-through 対象を一切知らない (世界観保護)。
+
+設定例 (Magickit ChatRoom 連携):
+
+```toml
+[claude_code.extra_mcp_servers.magickit]
+type = "stdio"
+command = "uv"
+args = ["run", "magickit-mcp"]
+allowed_tools = [
+  "mcp__magickit__chatroom_open_thread",
+  "mcp__magickit__chatroom_post_message",
+  "mcp__magickit__chatroom_close_thread",
+  "mcp__magickit__chatroom_get_thread",
+  "mcp__magickit__chatroom_list_threads",
+]
+```
+
+ユースケース: thread 議論中に 「実装してほしい」 「テストを走らせてほしい」 等、 Phase 0 の R2 (read-only) を超える要件が出た場合、 claude-code は ChatRoom thread を開いて人間 / 通常の対話 claude-code に handoff する。
+
+### 6.7 `mindwire.toml` schema 抜粋
+
+```toml
+[phanthand]
+endpoint = "http://localhost:7300"
+api_key_env = "PHANTHAND_API_KEY"
+
+[claude_code]
+allowed_tool_profile = "readonly"   # "minimal" | "readonly"
+                                     # "full" は Phase 0 ではサポート外
+
+[claude_code.extra_mcp_servers.magickit]
+# 上記参照
+```
+
+### 6.8 役割整理 (Phase 0)
+
+| Role | tools | Phase 0 での扱い |
+|---|---|---|
+| R1 (minimal) | `write_reply` のみ | ⚪ `allowed_tool_profile = "minimal"` で選択可能 |
+| R2 (readonly) | R1 + Phanthand 5 tool + ChatRoom (opt-in) | ⚪ **default 推奨** (`"readonly"`) |
+| R3 (full = write/exec) | Phanthand 範囲外 | ❌ Phase 0 スコープ外、 必要なら ChatRoom 経由で handoff |
+
+### 6.9 設計判断の経緯 (T06)
+
+- **Q1 起動手段**: Claude Agent SDK 採用 (PTY 直叩き案を退けた、 auth 継承と programmatic 制御を優先)
+- **Q2a ファイルプロトコル教育**: in-process custom tool で完全隠蔽 (LLM がファイルレイアウトを知らない構成)
+- **Q2b thread context 注入**: full eager push via `prompt` + XML 構造化 (`<mw_thread>` / `<mw_message>`)
+- **Q2c ファイル参照と handoff**: Phanthand 経由 read + generic MCP pass-through (ChatRoom 連携は設定例)
+- 詳細議論: T06 進行セッション
+
+## 7. 設計判断の経緯
+
+### 7.1 統合 (`messages/`) vs 分離 (`inbox/` `outbox/`) → 統合採用
 - 双方向通信での視点反転問題 (cai inbox = cc outbox) を回避
 - Magickit ChatRoom と同じ append-only + status 思想で整合
 - 視覚的キュー視認性は補助コマンド (将来) で代替
 
-### 6.2 別ファイル vs 単一 thread.md → 別ファイル採用
+### 7.2 別ファイル vs 単一 thread.md → 別ファイル採用
 - アトミック性: tmp+rename パターンが効くのは独立ファイルのみ
 - watcher の CREATE イベント検出が直接的 (パターン一致のみ、 差分計算不要)
 - 1 メッセージ = 1 イベントの append-only ログ思想と整合
 
-### 6.3 Thread ID: 連番 vs UUID vs ULID → ULID 採用
+### 7.3 Thread ID: 連番 vs UUID vs ULID → ULID 採用
 - ツール経由で常時アクセスする前提では人間可読性は弱い利点
 - 並行生成での衝突回避 (採番 race のリスク回避)
 - ULID の時刻プレフィックスで ID 単体ソート = 時刻順 (ツール実装が単純化)
 - ID 単体で作成時刻判別可能 (forensics で効く)
 
-### 6.4 外部参照 schema 内蔵 vs Connector 化 → Connector 化採用 (T02 確定)
+### 7.4 外部参照 schema 内蔵 vs Connector 化 → Connector 化採用 (T02 確定)
 - 当初の引き継ぎ ("双方向参照リンクは OK") を Takahito の追加指摘で refinement
 - 「リンクの管理主体をコアの外に追い出す」 ことで 「MindWire は AI-AI 通信に閉じる」 世界観を厳守
 - `metadata: {}` 汎用 dict も「世界観侵食を呼ぶ穴」 と判断、 設置せず
@@ -239,15 +357,17 @@ reply_to: 2                                           # 任意。 直前メッ�
 
 詳細議論: `T-connector-pattern-decision` thread (msg-003 〜 msg-007 の decide で resolved)
 
-## 7. Phase 0 / 後続フェーズへの影響
+## 8. Phase 0 / 後続フェーズへの影響
 
-### Phase 0 (= T05) 実装スコープ
+### Phase 0 (= T05+T06) 実装スコープ
 - `~/spirrow-mindwire-data/` ディレクトリ初期化 (config / new / threads / archive / logs)
 - `new/` ファイル監視 → thread 作成
-- `threads/<ULID>/messages/` への from-cai 書込みを検知 → claude-code 起動 (PTY 経由)
-- `threads/<ULID>/messages/` への from-cc 書込み (claude-code の応答)
+- `threads/<ULID>/messages/` への from-cai 書込みを検知 → **claude-code 起動 (Claude Agent SDK 経由、 custom tools + Phanthand)** (詳細 §6)
+- `threads/<ULID>/messages/` への from-cc 書込み (`mcp__mindwire__write_reply` 経由、 watcher が atomic 書込み)
 - `meta.yaml` の status 更新
 - イベントログ append (`logs/threads/<ULID>.jsonl`)
+- Phanthand HTTP client (read 系 custom tool の内部実装)
+- generic MCP pass-through 機構 (`mindwire.toml` driven)
 - `mindwire status` 等の最低限の運用 CLI (オプショナル)
 
 ### Phase 0 スコープ外
@@ -263,23 +383,30 @@ reply_to: 2                                           # 任意。 直前メッ�
 - Thirdy 連携 (Spec 抽出)
 - Connector 用の安定 I/F 仕様 (`schema_version` 約束を含む)
 
-## 8. 未決事項 / 将来論点 (記録のみ、 T02 では decide しない)
+## 9. 未決事項 / 将来論点 (記録のみ、 T02 では decide しない)
 
-### 8.1 Connector 用の identity / 認証境界
+### 9.1 Connector 用の identity / 認証境界
 - `participants` / message frontmatter `from` は単なる文字列で誰でも名乗れる
 - Phase 0 はローカルファイル + 単一ユーザで信頼境界が明確 → 問題化しない
 - T02 確定: **Connector は read-only** とすることで write-side identity 問題は当面回避
 - Phase 1+ で 「Connector 自身が書込みたい需要」 が出た場合に再議論する
 
-### 8.2 ログのローテーション戦略
+### 9.2 ログのローテーション戦略
 - Phase 0 = テキストベースで永久保存
 - 将来 GB 級になった場合の rotation / 圧縮 / 古いスレッドのコールドストレージ化を検討
 
-### 8.3 thread_id の衝突 (Phase 1+)
+### 9.3 thread_id の衝突 (Phase 1+)
 - ULID 採用で衝突リスクは事実上ゼロ
 - Phase 1+ で複数プロセスから thread 作成シナリオが出た場合、 採番 race は無いが file system レベルの mkdir 競合の整合性は別途検証必要
 
-### 8.4 Phase 0 実装言語 (T05 で確定予定)
-- Python (watchdog + tomllib + pty) を第一候補
-- TypeScript (chokidar + node-pty) も候補
-- T05 着手時に最終決定
+### 9.4 ~~Phase 0 実装言語~~ (T05 で Python 確定)
+- **Python** (`watchdog` + `tomllib` + `claude-agent-sdk`) を採用
+- 採用根拠: Claude Agent SDK の Python 版が最も成熟、 PTY 直叩き不要、 auth 継承
+
+### 9.5 watcher の進化方向 (Phase 1+)
+Phase 0 では単一 watcher プロセス + recursive `watchdog.Observer` (W-A) を採用。 将来の進化方向として以下が想定される:
+- **MCP write API への移行**: 現状の filesystem 直書きプロトコルから、 公開 MCP サーバの write tool 経由に再構築 (architecture.md §5 参照)。 これが実現すると watcher の filesystem 監視中心性が低下し、 W-A/W-B の選択は再評価対象外になる
+- **multi-instance / sharding**: 流量増 or HA 動機が出た場合、 thread 集合を複数 watcher で分担。 W-A 起点ではフィルタ層を挟む形で対応
+- **subscribe 型イベント API**: Connector が pull-polling から push 通知に進化したい場合、 watcher の event log を subscriber に転送する層を追加
+- **OS-level 制約への対応**: 多 thread 化時に Linux inotify per-user watch limit (default 8192〜65536) や Windows ReadDirectoryChangesW recursive buffer overflow が顕在化する可能性。 Phase 1+ で thread 数が 1000 を超える運用が見えた時点で kernel param 拡張 / W-B 系への再設計 / polling fallback 強制 等を再評価
+- これらはいずれも Phase 0 では YAGNI、 Phase 1+ で動機が顕在化した時点で再設計する
