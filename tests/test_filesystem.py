@@ -68,6 +68,21 @@ def test_atomic_write_cleans_up_tmp_on_failure(tmp_path: Path) -> None:
     assert leftovers == []
 
 
+def test_atomic_write_calls_fsync_by_default(tmp_path: Path) -> None:
+    target = tmp_path / "out.txt"
+    with patch("spirrow_mindwire.filesystem.atomic.os.fsync") as mock_fsync:
+        atomic_write_text(target, "ok")
+    mock_fsync.assert_called_once()
+
+
+def test_atomic_write_skips_fsync_when_disabled(tmp_path: Path) -> None:
+    target = tmp_path / "out.txt"
+    with patch("spirrow_mindwire.filesystem.atomic.os.fsync") as mock_fsync:
+        atomic_write_text(target, "ok", fsync=False)
+    mock_fsync.assert_not_called()
+    assert target.read_text(encoding="utf-8") == "ok"
+
+
 # ---------- ThreadDirLayout ---------------------------------------------
 
 
@@ -116,6 +131,22 @@ def test_message_path_rejects_seq_below_one(tmp_path: Path) -> None:
         layout.message_path(0, "claude.ai")
 
 
+def test_message_path_rejects_unknown_sender(tmp_path: Path) -> None:
+    layout = ThreadDirLayout(base_dir=tmp_path, thread_id=ULID_A)
+    with pytest.raises(ValueError, match="sender"):
+        layout.message_path(1, "gpt")  # type: ignore[arg-type]
+
+
+def test_thread_dir_rejects_path_traversal_in_thread_id(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="ULID"):
+        ThreadDirLayout(base_dir=tmp_path, thread_id="../etc")
+
+
+def test_thread_dir_rejects_non_ulid_thread_id(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="ULID"):
+        ThreadDirLayout(base_dir=tmp_path, thread_id="not-a-ulid")
+
+
 # ---------- EventLogWriter ----------------------------------------------
 
 
@@ -123,7 +154,13 @@ def test_event_log_append_writes_one_line(tmp_path: Path) -> None:
     log_path = tmp_path / "logs" / "threads" / f"{ULID_A}.jsonl"
     writer = EventLogWriter(log_path)
     writer.append(
-        ThreadCreated(event_id=ULID_E1, ts=NOW, thread_id=ULID_A, title="t")
+        ThreadCreated(
+            schema_version=1,
+            event_id=ULID_E1,
+            ts=NOW,
+            thread_id=ULID_A,
+            title="t",
+        )
     )
 
     lines = log_path.read_text(encoding="utf-8").splitlines()
@@ -138,10 +175,17 @@ def test_event_log_append_multiple_events(tmp_path: Path) -> None:
     log_path = tmp_path / f"{ULID_A}.jsonl"
     writer = EventLogWriter(log_path)
     writer.append(
-        ThreadCreated(event_id=ULID_E1, ts=NOW, thread_id=ULID_A, title="t")
+        ThreadCreated(
+            schema_version=1,
+            event_id=ULID_E1,
+            ts=NOW,
+            thread_id=ULID_A,
+            title="t",
+        )
     )
     writer.append(
         ThreadStatusChanged(
+            schema_version=1,
             event_id=ULID_E2,
             ts=NOW,
             thread_id=ULID_A,
@@ -162,6 +206,7 @@ def test_event_log_uses_from_alias_for_message_events(tmp_path: Path) -> None:
     writer.append(
         MessageReceived.model_validate(
             {
+                "schema_version": 1,
                 "event_id": ULID_E1,
                 "ts": NOW.isoformat(),
                 "thread_id": ULID_A,
@@ -181,6 +226,8 @@ def test_event_log_creates_parent_dir(tmp_path: Path) -> None:
     log_path = tmp_path / "logs" / "threads" / f"{ULID_A}.jsonl"
     assert not log_path.parent.exists()
     EventLogWriter(log_path).append(
-        ThreadCreated(event_id=ULID_E1, ts=NOW, thread_id=ULID_A)
+        ThreadCreated(
+            schema_version=1, event_id=ULID_E1, ts=NOW, thread_id=ULID_A
+        )
     )
     assert log_path.exists()

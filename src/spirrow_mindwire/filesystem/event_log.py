@@ -33,9 +33,13 @@ class EventLogWriter:
 
     def append(self, event: Event) -> None:
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
-        line = _EVENT_ADAPTER.dump_json(event, by_alias=True).decode("utf-8")
-        with open(self._log_path, "a", encoding="utf-8", newline="\n") as f:
-            f.write(line + "\n")
+        payload = _EVENT_ADAPTER.dump_json(event, by_alias=True) + b"\n"
+        # Binary append keeps each event a single low-level write,
+        # preserving the "<4KB write(2) is atomic" property described in
+        # docs/logging-design.md and avoiding an encode/decode round
+        # trip.
+        with open(self._log_path, "ab") as f:
+            f.write(payload)
 
 
 __all__ = ["EventLogWriter"]

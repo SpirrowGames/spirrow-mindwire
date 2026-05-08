@@ -14,12 +14,22 @@ import os
 from pathlib import Path
 
 
-def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+def atomic_write_text(
+    path: Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    fsync: bool = True,
+) -> None:
     """Atomically write *content* to *path*.
 
-    Writes ``<path>.tmp`` next to the target, fsyncs, and replaces the
-    final path. Any failure unlinks the temp file before re-raising so
-    no orphan ``.tmp`` survives a crashed write.
+    Writes ``<path>.tmp`` next to the target and replaces the final
+    path. ``fsync`` defaults to ``True`` (architecture.md §3.2 calls
+    it optional but durability matters for message persistence);
+    callers can opt out for high-frequency or recoverable writes.
+
+    Any failure unlinks the temp file before re-raising so no orphan
+    ``.tmp`` survives a crashed write.
     """
 
     parent = path.parent
@@ -29,7 +39,8 @@ def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> N
         with open(tmp_path, "w", encoding=encoding, newline="\n") as f:
             f.write(content)
             f.flush()
-            os.fsync(f.fileno())
+            if fsync:
+                os.fsync(f.fileno())
         os.replace(tmp_path, path)
     except BaseException:
         with contextlib.suppress(OSError):
