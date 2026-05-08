@@ -27,7 +27,13 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
-SCHEMA_VERSION = 1
+CONFIG_SCHEMA_VERSION = 1
+"""Version of the ``mindwire.toml`` configuration schema.
+
+Distinct from data-model schema versions (`spirrow_mindwire.schema`) so
+config and on-disk data formats can evolve on independent cadences.
+"""
+
 DEFAULT_DATA_DIR = Path.home() / "spirrow-mindwire-data"
 
 
@@ -122,7 +128,7 @@ class MindwireSettings(BaseSettings):
         extra="forbid",
     )
 
-    schema_version: int = SCHEMA_VERSION
+    schema_version: int = CONFIG_SCHEMA_VERSION
     paths: PathsConfig = Field(default_factory=PathsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     watcher: WatcherConfig = Field(default_factory=WatcherConfig)
@@ -132,10 +138,10 @@ class MindwireSettings(BaseSettings):
     @field_validator("schema_version")
     @classmethod
     def _validate_schema_version(cls, v: int) -> int:
-        if v != SCHEMA_VERSION:
+        if v != CONFIG_SCHEMA_VERSION:
             raise ValueError(
-                f"Unsupported schema_version={v}; this MindWire build "
-                f"requires schema_version={SCHEMA_VERSION}. "
+                f"Unsupported config schema_version={v}; this MindWire build "
+                f"requires schema_version={CONFIG_SCHEMA_VERSION}. "
                 "Migrate the config or pin a compatible MindWire version."
             )
         return v
@@ -188,8 +194,8 @@ def load_settings(config_path: Path | None = None) -> MindwireSettings:
 
 
 __all__ = [
+    "CONFIG_SCHEMA_VERSION",
     "DEFAULT_DATA_DIR",
-    "SCHEMA_VERSION",
     "ClaudeCodeConfig",
     "ExtraMCPServerConfig",
     "LoggingConfig",

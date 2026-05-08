@@ -16,8 +16,8 @@ import pytest
 from pydantic import ValidationError
 
 from spirrow_mindwire.config import (
+    CONFIG_SCHEMA_VERSION,
     DEFAULT_DATA_DIR,
-    SCHEMA_VERSION,
     MindwireSettings,
     load_settings,
 )
@@ -38,7 +38,7 @@ def test_defaults_only_when_no_toml_and_no_env(tmp_path: Path) -> None:
 
     s = load_settings(tmp_path / "absent.toml")
 
-    assert s.schema_version == SCHEMA_VERSION
+    assert s.schema_version == CONFIG_SCHEMA_VERSION
     assert s.paths.data_dir == DEFAULT_DATA_DIR
     assert s.logging.level == "INFO"
     assert s.logging.format == "json"
@@ -169,7 +169,7 @@ def test_strict_extra_key_in_toml_raises(tmp_path: Path) -> None:
 
 
 def test_unsupported_schema_version_raises(tmp_path: Path) -> None:
-    """schema_version must equal SCHEMA_VERSION."""
+    """schema_version must equal CONFIG_SCHEMA_VERSION."""
 
     cfg = tmp_path / "mindwire.toml"
     cfg.write_text("schema_version = 99\n", encoding="utf-8")
