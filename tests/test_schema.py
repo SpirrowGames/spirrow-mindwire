@@ -2,14 +2,14 @@
 
 Covers ``docs/architecture.md`` §3.1-§3.3 contracts:
 - field defaults, strict-extras rejection, schema_version pin
-- ULID format, timezone-aware datetime, literal enums
-- Message ``from`` alias + msg_id ↔ seq consistency
+- ULID format, UTC-only datetime, literal enums
+- Message ``from`` alias + msg_id ↔ seq consistency (zero-padded)
 - Event discriminated union dispatch
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -37,6 +37,7 @@ NOW = datetime(2026, 5, 7, 8, 43, 7, tzinfo=UTC)
 
 def _meta(**overrides: Any) -> ThreadMeta:
     base: dict[str, Any] = {
+        "schema_version": 1,
         "thread_id": ULID_A,
         "status": "active",
         "participants": ("claude.ai", "claude-code"),
@@ -49,7 +50,8 @@ def _meta(**overrides: Any) -> ThreadMeta:
 
 def _msg(**overrides: Any) -> Message:
     base: dict[str, Any] = {
-        "msg_id": f"{ULID_A}/1",
+        "schema_version": 1,
+        "msg_id": f"{ULID_A}/001",
         "seq": 1,
         "from": "claude.ai",
         "to": "claude-code",
@@ -68,6 +70,18 @@ def test_thread_meta_defaults() -> None:
     assert m.schema_version == SCHEMA_VERSION
     assert m.title == ""
     assert m.tags == ()
+
+
+def test_thread_meta_requires_schema_version() -> None:
+    base = {
+        "thread_id": ULID_A,
+        "status": "active",
+        "participants": ("claude.ai", "claude-code"),
+        "created_at": NOW,
+        "updated_at": NOW,
+    }
+    with pytest.raises(ValidationError, match="schema_version"):
+        ThreadMeta(**base)
 
 
 def test_thread_meta_rejects_unknown_field() -> None:
@@ -96,13 +110,19 @@ def test_thread_meta_rejects_naive_datetime() -> None:
         _meta(created_at=naive)
 
 
+def test_thread_meta_rejects_non_utc_offset() -> None:
+    jst = timezone(timedelta(hours=9))
+    with pytest.raises(ValidationError, match="UTC"):
+        _meta(created_at=NOW.astimezone(jst))
+
+
 def test_thread_meta_rejects_invalid_ulid() -> None:
     with pytest.raises(ValidationError):
         _meta(thread_id="not-a-ulid")
 
 
 def test_thread_meta_rejects_wrong_schema_version() -> None:
-    with pytest.raises(ValidationError, match="schema_version"):
+    with pytest.raises(ValidationError):
         _meta(schema_version=99)
 
 
@@ -130,23 +150,43 @@ def test_message_rejects_from_equal_to() -> None:
 
 def test_message_rejects_seq_zero() -> None:
     with pytest.raises(ValidationError):
-        _msg(msg_id=f"{ULID_A}/0", seq=0)
+        _msg(msg_id=f"{ULID_A}/000", seq=0)
 
 
 def test_message_rejects_msg_id_seq_mismatch() -> None:
     with pytest.raises(ValidationError, match="msg_id"):
-        _msg(msg_id=f"{ULID_A}/2", seq=1)
+        _msg(msg_id=f"{ULID_A}/002", seq=1)
 
 
 def test_message_rejects_msg_id_without_thread_prefix() -> None:
     with pytest.raises(ValidationError, match="msg_id"):
-        _msg(msg_id="/1")
+        _msg(msg_id="/001")
+
+
+def test_message_rejects_non_ulid_thread_prefix() -> None:
+    with pytest.raises(ValidationError, match="ULID"):
+        _msg(msg_id="not-a-ulid/001")
+
+
+def test_message_msg_id_three_digit_padding() -> None:
+    m = _msg(seq=42, msg_id=f"{ULID_A}/042")
+    assert m.seq == 42
+
+
+def test_message_msg_id_four_digit_at_overflow() -> None:
+    m = _msg(seq=1000, msg_id=f"{ULID_A}/1000")
+    assert m.seq == 1000
+
+
+def test_message_rejects_unpadded_seq() -> None:
+    with pytest.raises(ValidationError, match="msg_id"):
+        _msg(seq=42, msg_id=f"{ULID_A}/42")
 
 
 def test_message_reply_to_optional() -> None:
     m = _msg()
     assert m.reply_to is None
-    m2 = _msg(seq=2, msg_id=f"{ULID_A}/2", reply_to=1)
+    m2 = _msg(seq=2, msg_id=f"{ULID_A}/002", reply_to=1)
     assert m2.reply_to == 1
 
 
@@ -161,9 +201,25 @@ EVENT_ADAPTER: TypeAdapter[Event] = TypeAdapter(Event)
 
 
 def _event(**overrides: Any) -> dict[str, Any]:
-    base: dict[str, Any] = {"event_id": ULID_B, "ts": NOW.isoformat()}
+    base: dict[str, Any] = {
+        "schema_version": 1,
+        "event_id": ULID_B,
+        "ts": NOW.isoformat(),
+    }
     base.update(overrides)
     return base
+
+
+def test_event_requires_schema_version() -> None:
+    with pytest.raises(ValidationError, match="schema_version"):
+        EVENT_ADAPTER.validate_python(
+            {
+                "type": "thread.created",
+                "event_id": ULID_B,
+                "ts": NOW.isoformat(),
+                "thread_id": ULID_A,
+            }
+        )
 
 
 def test_event_dispatches_thread_created() -> None:

@@ -5,10 +5,11 @@ See ``docs/architecture.md`` §3.1.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field, field_validator
 
 from ._common import (
-    SCHEMA_VERSION,
     AwareDatetime,
     Participant,
     StrictModel,
@@ -18,7 +19,7 @@ from ._common import (
 
 
 class ThreadMeta(StrictModel):
-    schema_version: int = SCHEMA_VERSION
+    schema_version: Literal[1]
     thread_id: UlidStr
     title: str = ""
     status: ThreadStatus
@@ -26,16 +27,6 @@ class ThreadMeta(StrictModel):
     created_at: AwareDatetime
     updated_at: AwareDatetime
     tags: tuple[str, ...] = Field(default_factory=tuple)
-
-    @field_validator("schema_version")
-    @classmethod
-    def _pin_schema_version(cls, v: int) -> int:
-        if v != SCHEMA_VERSION:
-            raise ValueError(
-                f"Unsupported schema_version={v}; ThreadMeta requires "
-                f"schema_version={SCHEMA_VERSION}"
-            )
-        return v
 
     @field_validator("participants")
     @classmethod

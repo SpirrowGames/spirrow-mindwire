@@ -13,10 +13,9 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field
 
 from ._common import (
-    SCHEMA_VERSION,
     AwareDatetime,
     Participant,
     StrictModel,
@@ -26,19 +25,9 @@ from ._common import (
 
 
 class _BaseEvent(StrictModel):
-    schema_version: int = SCHEMA_VERSION
+    schema_version: Literal[1]
     event_id: UlidStr
     ts: AwareDatetime
-
-    @field_validator("schema_version")
-    @classmethod
-    def _pin_schema_version(cls, v: int) -> int:
-        if v != SCHEMA_VERSION:
-            raise ValueError(
-                f"Unsupported schema_version={v}; events require "
-                f"schema_version={SCHEMA_VERSION}"
-            )
-        return v
 
 
 class ThreadCreated(_BaseEvent):
