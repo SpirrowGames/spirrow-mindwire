@@ -32,15 +32,10 @@ Format conventions:
 
 from __future__ import annotations
 
-from datetime import datetime
 from xml.sax.saxutils import escape, quoteattr
 
+from spirrow_mindwire._time import iso_z
 from spirrow_mindwire.schema import Message, ThreadMeta
-
-
-def _iso_z(dt: datetime) -> str:
-    """Render a UTC datetime as ``YYYY-MM-DDTHH:MM:SSZ`` (architecture.md §3)."""
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def build_thread_prompt(meta: ThreadMeta, messages: list[Message]) -> str:
@@ -101,7 +96,7 @@ def build_thread_prompt(meta: ThreadMeta, messages: list[Message]) -> str:
             f' seq="{msg.seq}"'
             f" from={quoteattr(msg.from_)}"
             f" to={quoteattr(msg.to)}"
-            f' created_at="{_iso_z(msg.created_at)}"'
+            f' created_at="{iso_z(msg.created_at)}"'
             f"{is_latest_attr}>"
         )
         lines.append(escape(msg.body))

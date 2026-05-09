@@ -35,29 +35,11 @@ from claude_agent_sdk import (
     tool,
 )
 
+from spirrow_mindwire._seq import zero_padded_seq
+from spirrow_mindwire._time import iso_z
 from spirrow_mindwire.filesystem import ThreadDirLayout, atomic_write_text
 from spirrow_mindwire.phanthand import PhanthandClient, PhanthandError
 from spirrow_mindwire.schema import Participant
-
-
-def _zero_padded_seq(seq: int) -> str:
-    """Width-3 padding, expanding to len(str(seq)) on overflow (architecture.md §3.2)."""
-    width = 3 if seq < 1000 else len(str(seq))
-    return f"{seq:0{width}d}"
-
-
-def _iso_z(dt: datetime) -> str:
-    """Render a UTC datetime with the architecture-canonical ``Z`` suffix.
-
-    Mirrors the schema-side ``AwareDatetime`` validator: naive datetimes
-    are rejected loudly so a forgotten ``tzinfo`` doesn't produce a
-    timestamp that *looks* UTC but isn't. Non-UTC aware datetimes are
-    converted; we never emit a ``Z`` suffix on a wall-clock value from
-    another zone.
-    """
-    if dt.tzinfo is None:
-        raise ValueError("datetime must be timezone-aware")
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _ok(text: str) -> dict[str, Any]:
@@ -101,14 +83,14 @@ def build_mindwire_tools(
         # in the dispatcher is what enforces the invariant.
         body: str = args["content"]
         ts = now if now is not None else datetime.now(UTC)
-        msg_id = f"{layout.thread_id}/{_zero_padded_seq(next_seq)}"
+        msg_id = f"{layout.thread_id}/{zero_padded_seq(next_seq)}"
         frontmatter: dict[str, Any] = {
             "schema_version": 1,
             "msg_id": msg_id,
             "seq": next_seq,
             "from": sender,
             "to": recipient,
-            "created_at": _iso_z(ts),
+            "created_at": iso_z(ts),
         }
         yaml_block = yaml.safe_dump(
             frontmatter,
@@ -178,7 +160,7 @@ def build_mindwire_tools(
             return _error(str(e))
         kind = "dir" if data.is_dir else "file"
         # ``modified`` is a server-side timestamp from Phanthand and is
-        # passed through unmodified — we don't reformat it via ``_iso_z``
+        # passed through unmodified — we don't reformat it via ``iso_z``
         # because it's not a MindWire-emitted event time. Phanthand's
         # native ``+00:00`` form is preserved so callers can tell at a
         # glance that the value comes from upstream.
