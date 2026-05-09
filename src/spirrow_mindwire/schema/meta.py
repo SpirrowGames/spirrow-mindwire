@@ -19,6 +19,14 @@ from ._common import (
 
 
 class ThreadMeta(StrictModel):
+    """Thread metadata persisted as ``meta.yaml``.
+
+    ``title`` defaults to ``""`` — untitled threads are valid in Phase 0
+    because the watcher creates them before any human / agent has reason
+    to title them. ``tags`` likewise defaults to an empty tuple; per §3.1,
+    only the participants themselves may write tags (Connectors must not).
+    """
+
     schema_version: Literal[1]
     thread_id: UlidStr
     title: str = ""

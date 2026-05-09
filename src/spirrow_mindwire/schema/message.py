@@ -1,8 +1,16 @@
 """Per-message model (`threads/<ULID>/messages/NNN-from-{cai|cc}.md`).
 
-See ``docs/architecture.md`` §3.2. ``from`` is a Python reserved word, so
-the attribute is named ``from_`` and exposed via ``alias="from"`` for
-YAML frontmatter round-trips.
+See ``docs/architecture.md`` §3.2.
+
+- ``from`` is a Python reserved word, so the attribute is named
+  ``from_`` and exposed via ``alias="from"`` for YAML frontmatter
+  round-trips. ``populate_by_name=True`` is inherited from
+  :class:`StrictModel` so test code can pass ``from_=...`` directly;
+  on-disk YAML always uses the canonical ``from`` key.
+- ``from_`` and ``to`` identify *sender* and *recipient*, not the
+  direction relative to MindWire. A claude.ai → claude-code message
+  has ``from="claude.ai"``, ``to="claude-code"`` regardless of which
+  side serializes it.
 """
 
 from __future__ import annotations
@@ -31,6 +39,15 @@ def _zero_padded_seq(seq: int) -> str:
 
 
 class Message(StrictModel):
+    """A single message in a thread.
+
+    ``reply_to`` is an *intra-thread* seq reference — a message can only
+    reply to an earlier message in the same thread (``reply_to < seq``).
+    Cross-thread replies are intentionally unrepresentable in this
+    schema; if Phase 1+ needs them, the field type would change to
+    ``str (msg_id)`` rather than be silently widened.
+    """
+
     schema_version: Literal[1]
     msg_id: str
     seq: int = Field(ge=1)
@@ -65,6 +82,15 @@ class Message(StrictModel):
     def _from_and_to_must_differ(self) -> Message:
         if self.from_ == self.to:
             raise ValueError(f"from and to must differ; both are {self.from_!r}")
+        return self
+
+    @model_validator(mode="after")
+    def _reply_to_must_precede_seq(self) -> Message:
+        if self.reply_to is not None and self.reply_to >= self.seq:
+            raise ValueError(
+                f"reply_to={self.reply_to} must be < seq={self.seq} "
+                "(messages can only reply to earlier seqs in the same thread)"
+            )
         return self
 
 

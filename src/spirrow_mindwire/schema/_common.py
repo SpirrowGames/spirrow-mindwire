@@ -8,7 +8,7 @@ in §1 (no ``related.*`` / ``external_refs.*`` / ``metadata.*`` creep).
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict
@@ -25,12 +25,16 @@ def _validate_ulid(v: str) -> str:
     return v
 
 
-def _require_utc(v: datetime) -> datetime:
-    """Require a real UTC offset.
+def _normalize_to_utc(v: datetime) -> datetime:
+    """Coerce a UTC-equivalent datetime to a UTC-tagged datetime.
 
-    architecture.md §3 mandates UTC ISO 8601 (e.g. ``...Z``). Reject
-    naive datetimes, datetimes whose ``utcoffset()`` is ``None``
-    (pseudo-aware), and aware datetimes whose offset isn't zero.
+    architecture.md §3 mandates UTC ISO 8601 in the *recorded* form,
+    so aware datetimes in other zones (e.g. ``datetime.now()`` with
+    the system tz) are silently normalized via ``astimezone(UTC)``.
+
+    Programmer-error inputs are still rejected:
+    - naive datetimes (``tzinfo is None``)
+    - pseudo-aware datetimes whose ``utcoffset()`` returns ``None``
     """
 
     offset = v.utcoffset() if v.tzinfo is not None else None
@@ -38,13 +42,11 @@ def _require_utc(v: datetime) -> datetime:
         raise ValueError(
             "datetime must be timezone-aware (architecture.md §3 mandates UTC ISO 8601)"
         )
-    if offset != timedelta(0):
-        raise ValueError(f"datetime offset must be UTC (offset=0), got {offset}")
-    return v
+    return v.astimezone(UTC)
 
 
 UlidStr = Annotated[str, AfterValidator(_validate_ulid)]
-AwareDatetime = Annotated[datetime, AfterValidator(_require_utc)]
+AwareDatetime = Annotated[datetime, AfterValidator(_normalize_to_utc)]
 
 
 class StrictModel(BaseModel):

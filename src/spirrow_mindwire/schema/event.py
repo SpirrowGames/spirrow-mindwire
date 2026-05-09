@@ -4,6 +4,19 @@ See ``docs/architecture.md`` §3.3. Events form a discriminated union on
 the ``type`` field. New event types are added by defining a model with
 the corresponding ``type`` literal and extending :data:`Event`.
 
+Naming convention:
+- ``message.received`` / ``message.sent`` carry ``seq`` — the seq of
+  the message itself.
+- ``claude_code.invoke.start`` / ``invoke.end`` carry ``msg_seq`` — the
+  seq of the *triggering* message, not a seq of invokes. The different
+  field name disambiguates "message under invoke" from "the invoke's
+  own seq" (which doesn't exist as a concept in Phase 0).
+
+Each ``type`` field has its literal as a default so models can be built
+in tests / generators without restating the discriminator. ``TypeAdapter[Event]``
+parsing of on-disk JSONL still requires ``type`` to be present
+(discriminator dispatch happens before defaults apply).
+
 Phase 0 covers thread / message / claude_code.invoke events. ``error.*``
 sub-types are intentionally deferred to Feature 2 (robustness) where
 the taxonomy is co-designed with the dead-letter / retry layer.

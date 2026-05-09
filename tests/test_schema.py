@@ -110,10 +110,11 @@ def test_thread_meta_rejects_naive_datetime() -> None:
         _meta(created_at=naive)
 
 
-def test_thread_meta_rejects_non_utc_offset() -> None:
+def test_thread_meta_normalizes_non_utc_offset_to_utc() -> None:
     jst = timezone(timedelta(hours=9))
-    with pytest.raises(ValidationError, match="UTC"):
-        _meta(created_at=NOW.astimezone(jst))
+    m = _meta(created_at=NOW.astimezone(jst))
+    assert m.created_at == NOW
+    assert m.created_at.utcoffset() == timedelta(0)
 
 
 def test_thread_meta_rejects_invalid_ulid() -> None:
@@ -193,6 +194,14 @@ def test_message_reply_to_optional() -> None:
 def test_message_rejects_reply_to_zero() -> None:
     with pytest.raises(ValidationError):
         _msg(reply_to=0)
+
+
+def test_message_rejects_reply_to_at_or_after_seq() -> None:
+    """``reply_to`` must reference an *earlier* seq."""
+    with pytest.raises(ValidationError, match="reply_to"):
+        _msg(seq=2, msg_id=f"{ULID_A}/002", reply_to=2)
+    with pytest.raises(ValidationError, match="reply_to"):
+        _msg(seq=2, msg_id=f"{ULID_A}/002", reply_to=3)
 
 
 # ---------- Event discriminated union ------------------------------------
