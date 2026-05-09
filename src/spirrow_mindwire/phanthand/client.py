@@ -15,11 +15,12 @@ Error policy (per ``feedback_trust_llm_for_tool_errors``):
 
 from __future__ import annotations
 
+from functools import cache
 from types import TracebackType
 from typing import Any, TypeVar
 
 import httpx
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from .models import (
     ApiResponse,
@@ -33,6 +34,11 @@ from .models import (
 )
 
 T = TypeVar("T", bound=BaseModel)
+
+
+@cache
+def _adapter_for(model: type[BaseModel]) -> TypeAdapter[ApiResponse[Any]]:
+    return TypeAdapter(ApiResponse[model])  # type: ignore[valid-type]
 
 
 class PhanthandError(Exception):
@@ -84,6 +90,13 @@ class PhanthandClient:
         timeout_seconds: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        # ``endpoint`` must include the scheme (``http://`` or ``https://``).
+        # Without one, httpx treats the URL as relative and requests fail at
+        # send time with an opaque error. Validation lives in the config layer
+        # (Settings), not here.
+        # ``timeout_seconds`` is applied uniformly across connect/read/write
+        # phases of httpx.Timeout. Per-phase tuning is deferred to Feature 2
+        # (robustness) once retry/backoff logic informs the right values.
         headers: dict[str, str] = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -114,7 +127,7 @@ class PhanthandClient:
         """``GET /health``. Auth not required."""
         try:
             resp = await self._client.get("/health")
-        except httpx.HTTPError as e:
+        except httpx.RequestError as e:
             raise PhanthandHTTPError(f"GET /health: {e}") from e
         return self._unwrap("/health", resp, HealthData)
 
@@ -175,25 +188,16 @@ class PhanthandClient:
     ) -> T:
         try:
             resp = await self._client.post(endpoint, json=body)
-        except httpx.HTTPError as e:
+        except httpx.RequestError as e:
             raise PhanthandHTTPError(f"POST {endpoint}: {e}") from e
         return self._unwrap(endpoint, resp, model)
 
     @staticmethod
     def _unwrap(endpoint: str, resp: httpx.Response, model: type[T]) -> T:
-        if resp.status_code >= 500:
-            raise PhanthandHTTPError(
-                f"{endpoint} returned {resp.status_code}",
-                status_code=resp.status_code,
-            )
-        if resp.status_code in (401, 403):
-            raise PhanthandHTTPError(
-                f"{endpoint} returned {resp.status_code} (auth)",
-                status_code=resp.status_code,
-            )
         if resp.status_code >= 400:
+            suffix = " (auth)" if resp.status_code in (401, 403) else ""
             raise PhanthandHTTPError(
-                f"{endpoint} returned {resp.status_code}",
+                f"{endpoint} returned {resp.status_code}{suffix}",
                 status_code=resp.status_code,
             )
 
@@ -202,13 +206,15 @@ class PhanthandClient:
         except ValueError as e:
             raise PhanthandHTTPError(f"{endpoint}: malformed JSON: {e}") from e
 
-        adapter: TypeAdapter[ApiResponse[T]] = TypeAdapter(ApiResponse[model])  # type: ignore[valid-type]
-        envelope = adapter.validate_python(payload)
+        try:
+            envelope = _adapter_for(model).validate_python(payload)
+        except ValidationError as e:
+            raise PhanthandHTTPError(f"{endpoint}: response schema mismatch: {e}") from e
         if not envelope.success:
             raise PhanthandAPIError(envelope.error or "(no error message)", endpoint=endpoint)
         if envelope.data is None:
             raise PhanthandHTTPError(f"{endpoint}: success=True but data is null")
-        return envelope.data
+        return envelope.data  # type: ignore[no-any-return]
 
 
 __all__ = [
