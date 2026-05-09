@@ -75,6 +75,11 @@ async def run_watcher(settings: MindwireSettings, *, api_key: str | None) -> Non
 async def _safe_handle(dispatcher: ThreadDispatcher, event: ThreadEvent) -> None:
     try:
         await dispatcher.handle(event)
+    except asyncio.CancelledError:
+        # Cancellation must propagate so shutdown can complete; ``Exception``
+        # below would catch this in versions where ``CancelledError`` is a
+        # subclass, swallowing the cancel signal.
+        raise
     except Exception:
         logger.exception(
             "dispatcher failed on thread_id=%s seq=%d",

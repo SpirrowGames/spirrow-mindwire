@@ -32,6 +32,8 @@ class DedupCache:
     def __init__(self, ttl: timedelta, *, max_size: int = 4096) -> None:
         if ttl <= timedelta(0):
             raise ValueError(f"ttl must be positive, got {ttl}")
+        if max_size < 1:
+            raise ValueError(f"max_size must be positive, got {max_size}")
         self._ttl = ttl
         self._max_size = max_size
         self._seen: OrderedDict[_Key, datetime] = OrderedDict()
