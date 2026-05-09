@@ -33,9 +33,7 @@ def _message_filename(seq: int, sender: Participant) -> str:
         raise ValueError(f"seq must be >= 1, got {seq}")
     short = _SENDER_SHORT.get(sender)
     if short is None:
-        raise ValueError(
-            f"sender must be one of {sorted(_SENDER_SHORT)}, got {sender!r}"
-        )
+        raise ValueError(f"sender must be one of {sorted(_SENDER_SHORT)}, got {sender!r}")
     width = 3 if seq < 1000 else len(str(seq))
     return f"{seq:0{width}d}-from-{short}.md"
 
@@ -56,9 +54,7 @@ class ThreadDirLayout:
         try:
             ULID.from_str(self.thread_id)
         except ValueError as e:
-            raise ValueError(
-                f"thread_id must be a ULID, got {self.thread_id!r}"
-            ) from e
+            raise ValueError(f"thread_id must be a ULID, got {self.thread_id!r}") from e
 
     @property
     def threads_root(self) -> Path:

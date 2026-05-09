@@ -92,10 +92,7 @@ def test_thread_dir_paths(tmp_path: Path) -> None:
     assert layout.staging_dir == tmp_path / "threads" / f".staging-{ULID_A}"
     assert layout.meta_path == tmp_path / "threads" / ULID_A / "meta.yaml"
     assert layout.messages_dir == tmp_path / "threads" / ULID_A / "messages"
-    assert (
-        layout.event_log_path
-        == tmp_path / "logs" / "threads" / f"{ULID_A}.jsonl"
-    )
+    assert layout.event_log_path == tmp_path / "logs" / "threads" / f"{ULID_A}.jsonl"
 
 
 def test_thread_dir_staging_paths_mirror_final(tmp_path: Path) -> None:
@@ -226,8 +223,6 @@ def test_event_log_creates_parent_dir(tmp_path: Path) -> None:
     log_path = tmp_path / "logs" / "threads" / f"{ULID_A}.jsonl"
     assert not log_path.parent.exists()
     EventLogWriter(log_path).append(
-        ThreadCreated(
-            schema_version=1, event_id=ULID_E1, ts=NOW, thread_id=ULID_A
-        )
+        ThreadCreated(schema_version=1, event_id=ULID_E1, ts=NOW, thread_id=ULID_A)
     )
     assert log_path.exists()
