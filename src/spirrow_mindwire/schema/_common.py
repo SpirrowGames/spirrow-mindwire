@@ -39,9 +39,7 @@ def _require_utc(v: datetime) -> datetime:
             "datetime must be timezone-aware (architecture.md §3 mandates UTC ISO 8601)"
         )
     if offset != timedelta(0):
-        raise ValueError(
-            f"datetime offset must be UTC (offset=0), got {offset}"
-        )
+        raise ValueError(f"datetime offset must be UTC (offset=0), got {offset}")
     return v
 
 

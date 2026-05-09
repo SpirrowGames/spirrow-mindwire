@@ -30,9 +30,7 @@ class ThreadMeta(StrictModel):
 
     @field_validator("participants")
     @classmethod
-    def _participants_non_empty(
-        cls, v: tuple[Participant, ...]
-    ) -> tuple[Participant, ...]:
+    def _participants_non_empty(cls, v: tuple[Participant, ...]) -> tuple[Participant, ...]:
         if len(v) == 0:
             raise ValueError("participants must not be empty")
         return v

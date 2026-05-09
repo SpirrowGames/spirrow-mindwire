@@ -45,17 +45,13 @@ class Message(StrictModel):
         try:
             thread_id, seq_part = self.msg_id.split("/", 1)
         except ValueError as e:
-            raise ValueError(
-                f"msg_id must be '<thread_id>/<seq>', got {self.msg_id!r}"
-            ) from e
+            raise ValueError(f"msg_id must be '<thread_id>/<seq>', got {self.msg_id!r}") from e
         if not thread_id:
             raise ValueError(f"msg_id missing thread_id prefix: {self.msg_id!r}")
         try:
             ULID.from_str(thread_id)
         except ValueError as e:
-            raise ValueError(
-                f"msg_id thread_id prefix is not a ULID: {thread_id!r}"
-            ) from e
+            raise ValueError(f"msg_id thread_id prefix is not a ULID: {thread_id!r}") from e
         expected_seq_part = _zero_padded_seq(self.seq)
         if seq_part != expected_seq_part:
             raise ValueError(
@@ -68,9 +64,7 @@ class Message(StrictModel):
     @model_validator(mode="after")
     def _from_and_to_must_differ(self) -> Message:
         if self.from_ == self.to:
-            raise ValueError(
-                f"from and to must differ; both are {self.from_!r}"
-            )
+            raise ValueError(f"from and to must differ; both are {self.from_!r}")
         return self
 
 

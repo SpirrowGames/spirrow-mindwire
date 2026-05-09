@@ -73,7 +73,7 @@ def test_thread_meta_defaults() -> None:
 
 
 def test_thread_meta_requires_schema_version() -> None:
-    base = {
+    base: dict[str, Any] = {
         "thread_id": ULID_A,
         "status": "active",
         "participants": ("claude.ai", "claude-code"),
@@ -129,7 +129,7 @@ def test_thread_meta_rejects_wrong_schema_version() -> None:
 def test_thread_meta_is_frozen() -> None:
     m = _meta()
     with pytest.raises(ValidationError):
-        m.title = "mutated"  # type: ignore[misc]
+        m.title = "mutated"
 
 
 # ---------- Message -------------------------------------------------------
@@ -223,9 +223,7 @@ def test_event_requires_schema_version() -> None:
 
 
 def test_event_dispatches_thread_created() -> None:
-    e = EVENT_ADAPTER.validate_python(
-        _event(type="thread.created", thread_id=ULID_A, title="t")
-    )
+    e = EVENT_ADAPTER.validate_python(_event(type="thread.created", thread_id=ULID_A, title="t"))
     assert isinstance(e, ThreadCreated)
     assert e.title == "t"
 
@@ -244,12 +242,8 @@ def test_event_dispatches_thread_status_changed() -> None:
 
 
 def test_event_dispatches_thread_resolved_and_archived() -> None:
-    r = EVENT_ADAPTER.validate_python(
-        _event(type="thread.resolved", thread_id=ULID_A)
-    )
-    a = EVENT_ADAPTER.validate_python(
-        _event(type="thread.archived", thread_id=ULID_A)
-    )
+    r = EVENT_ADAPTER.validate_python(_event(type="thread.resolved", thread_id=ULID_A))
+    a = EVENT_ADAPTER.validate_python(_event(type="thread.archived", thread_id=ULID_A))
     assert isinstance(r, ThreadResolved)
     assert isinstance(a, ThreadArchived)
 
@@ -301,9 +295,7 @@ def test_event_dispatches_invoke_start_and_end() -> None:
 
 def test_event_rejects_unknown_type() -> None:
     with pytest.raises(ValidationError):
-        EVENT_ADAPTER.validate_python(
-            _event(type="thread.deleted", thread_id=ULID_A)
-        )
+        EVENT_ADAPTER.validate_python(_event(type="thread.deleted", thread_id=ULID_A))
 
 
 def test_event_rejects_extra_fields() -> None:
@@ -332,9 +324,7 @@ def test_event_rejects_negative_size_bytes() -> None:
 
 
 def test_event_round_trip_json() -> None:
-    e = EVENT_ADAPTER.validate_python(
-        _event(type="thread.created", thread_id=ULID_A, title="t")
-    )
+    e = EVENT_ADAPTER.validate_python(_event(type="thread.created", thread_id=ULID_A, title="t"))
     payload = e.model_dump_json(by_alias=True)
     parsed = EVENT_ADAPTER.validate_json(payload)
     assert parsed == e
