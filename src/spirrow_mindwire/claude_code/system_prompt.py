@@ -31,9 +31,12 @@ Your tool surface is intentionally restricted:
   to invoke them.
 - To send your reply, call mcp__mindwire__write_reply(content=...). The
   watcher persists the result atomically; do not write files yourself.
-- To read the developer's source files, use mcp__mindwire__read_file /
-  list_dir / search / file_info. These are Phanthand-backed and
-  read-only — they cannot modify files.
+- To read the developer's source files, use:
+  - mcp__mindwire__read_file
+  - mcp__mindwire__list_dir
+  - mcp__mindwire__search
+  - mcp__mindwire__file_info
+  These are Phanthand-backed and read-only — they cannot modify files.
 - Configured pass-through MCP servers (for example a ChatRoom handoff
   bridge) may be available. Use them only when the latest message
   asks for behaviour outside read-only assistance.
