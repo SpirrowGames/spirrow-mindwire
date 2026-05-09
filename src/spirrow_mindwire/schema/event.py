@@ -29,18 +29,18 @@ from typing import Annotated, Literal
 from pydantic import Field
 
 from ._common import (
-    AwareDatetime,
     Participant,
     StrictModel,
     ThreadStatus,
     UlidStr,
+    UTCDatetime,
 )
 
 
 class _BaseEvent(StrictModel):
     schema_version: Literal[1]
     event_id: UlidStr
-    ts: AwareDatetime
+    ts: UTCDatetime
 
 
 class ThreadCreated(_BaseEvent):

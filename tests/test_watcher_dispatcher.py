@@ -17,11 +17,12 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-import yaml
+from factories import seed_thread_meta, write_message_file
 
 from spirrow_mindwire.claude_code import InvokeResult
 from spirrow_mindwire.filesystem import ThreadDirLayout
 from spirrow_mindwire.phanthand import PhanthandClient
+from spirrow_mindwire.schema import Participant
 from spirrow_mindwire.watcher.dedup import DedupCache
 from spirrow_mindwire.watcher.dispatcher import ThreadDispatcher
 from spirrow_mindwire.watcher.events import ThreadEvent
@@ -30,43 +31,11 @@ ULID_A = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 NOW = datetime(2026, 5, 7, 8, 43, 7, tzinfo=UTC)
 
 
-def _seed_thread(base: Path, sender: str = "claude.ai", seq: int = 1) -> ThreadDirLayout:
+def _seed_thread(base: Path, sender: Participant = "claude.ai", seq: int = 1) -> ThreadDirLayout:
+    """Seed meta + one in-place message; the dispatcher does not need atomic writes."""
     layout = ThreadDirLayout(base_dir=base, thread_id=ULID_A)
-    layout.thread_dir.mkdir(parents=True, exist_ok=True)
-    layout.meta_path.write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "thread_id": ULID_A,
-                "title": "",
-                "status": "awaiting-cc",
-                "participants": ["claude.ai", "claude-code"],
-                "created_at": "2026-05-07T08:43:07Z",
-                "updated_at": "2026-05-07T08:43:07Z",
-                "tags": [],
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-    layout.messages_dir.mkdir(parents=True, exist_ok=True)
-    target = layout.message_path(seq, sender)  # type: ignore[arg-type]
-    target.write_text(
-        "---\n"
-        + yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "msg_id": f"{ULID_A}/{seq:03d}",
-                "seq": seq,
-                "from": sender,
-                "to": "claude-code" if sender == "claude.ai" else "claude.ai",
-                "created_at": "2026-05-07T08:43:07Z",
-            },
-            sort_keys=False,
-        )
-        + "---\n\nhello\n",
-        encoding="utf-8",
-    )
+    seed_thread_meta(layout)
+    write_message_file(layout, seq, sender, atomic=False)
     return layout
 
 
@@ -79,26 +48,10 @@ def _event(thread_id: str = ULID_A, seq: int = 1, when: datetime | None = None) 
     )
 
 
-def _write_message(layout: ThreadDirLayout, seq: int, sender: str, body: str = "hello") -> None:
-    """Write a fully-formed message file (frontmatter + body) at ``seq``."""
-    layout.messages_dir.mkdir(parents=True, exist_ok=True)
-    target = layout.message_path(seq, sender)  # type: ignore[arg-type]
-    target.write_text(
-        "---\n"
-        + yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "msg_id": f"{layout.thread_id}/{seq:03d}",
-                "seq": seq,
-                "from": sender,
-                "to": "claude-code" if sender == "claude.ai" else "claude.ai",
-                "created_at": "2026-05-07T08:43:07Z",
-            },
-            sort_keys=False,
-        )
-        + f"---\n\n{body}\n",
-        encoding="utf-8",
-    )
+def _write_message(
+    layout: ThreadDirLayout, seq: int, sender: Participant, body: str = "hello"
+) -> None:
+    write_message_file(layout, seq, sender, body, atomic=False)
 
 
 def _invoker(captured: dict[str, Any], result: InvokeResult) -> Any:
@@ -286,23 +239,7 @@ async def test_dispatcher_runs_distinct_threads_in_parallel(tmp_path: Path) -> N
     # Seed two distinct threads, each with one claude.ai message.
     layout_a = _seed_thread(tmp_path)  # ULID_A, seq=1
     layout_b = ThreadDirLayout(base_dir=tmp_path, thread_id=other_ulid)
-    layout_b.thread_dir.mkdir(parents=True, exist_ok=True)
-    layout_b.meta_path.write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "thread_id": other_ulid,
-                "title": "",
-                "status": "awaiting-cc",
-                "participants": ["claude.ai", "claude-code"],
-                "created_at": "2026-05-07T08:43:07Z",
-                "updated_at": "2026-05-07T08:43:07Z",
-                "tags": [],
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
+    seed_thread_meta(layout_b)
     _write_message(layout_b, 1, "claude.ai", "from-b")
     assert layout_a.thread_dir.exists()  # silence linter
 

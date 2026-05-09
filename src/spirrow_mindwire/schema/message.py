@@ -20,22 +20,12 @@ from typing import Literal
 from pydantic import Field, model_validator
 from ulid import ULID
 
+from .._seq import zero_padded_seq
 from ._common import (
-    AwareDatetime,
     Participant,
     StrictModel,
+    UTCDatetime,
 )
-
-
-def _zero_padded_seq(seq: int) -> str:
-    """Render *seq* with the §3.2 padding rule (3 digits, 4+ on overflow).
-
-    Kept symmetric with ``filesystem.thread_dir._message_filename`` so
-    ``msg_id`` and the on-disk filename always agree.
-    """
-
-    width = 3 if seq < 1000 else len(str(seq))
-    return f"{seq:0{width}d}"
 
 
 class Message(StrictModel):
@@ -53,7 +43,7 @@ class Message(StrictModel):
     seq: int = Field(ge=1)
     from_: Participant = Field(alias="from")
     to: Participant
-    created_at: AwareDatetime
+    created_at: UTCDatetime
     reply_to: int | None = Field(default=None, ge=1)
     body: str
 
@@ -69,7 +59,7 @@ class Message(StrictModel):
             ULID.from_str(thread_id)
         except ValueError as e:
             raise ValueError(f"msg_id thread_id prefix is not a ULID: {thread_id!r}") from e
-        expected_seq_part = _zero_padded_seq(self.seq)
+        expected_seq_part = zero_padded_seq(self.seq)
         if seq_part != expected_seq_part:
             raise ValueError(
                 f"msg_id seq part {seq_part!r} does not match seq={self.seq} "
