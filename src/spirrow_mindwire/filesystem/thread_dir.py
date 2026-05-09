@@ -42,9 +42,16 @@ def _message_filename(seq: int, sender: Participant) -> str:
 class ThreadDirLayout:
     """Path computations rooted at ``base_dir`` for a single thread.
 
-    ``thread_id`` is validated as a ULID in ``__post_init__`` so values
-    containing path separators (e.g. ``../etc``) cannot escape the data
-    root through ``thread_dir`` / ``staging_dir`` / ``event_log_path``.
+    Trust boundaries:
+    - ``thread_id`` is validated as a ULID in ``__post_init__`` so
+      values containing path separators (e.g. ``../etc``) cannot escape
+      the data root through ``thread_dir`` / ``staging_dir`` /
+      ``event_log_path``. This is the layer's defensive perimeter.
+    - ``base_dir`` is **not** validated. It is treated as trusted input
+      from the configuration layer (``MindwireSettings.paths``); if a
+      caller hands in an attacker-controlled ``base_dir``, the integrity
+      of the whole data directory is already compromised at a higher
+      layer.
     """
 
     base_dir: Path
