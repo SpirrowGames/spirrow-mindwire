@@ -17,7 +17,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-import yaml
+from factories import seed_thread_meta, write_message_file
 
 from spirrow_mindwire.claude_code import InvokeResult
 from spirrow_mindwire.filesystem import ThreadDirLayout
@@ -33,44 +33,13 @@ EVENT_TIMEOUT = 5.0
 
 def _seed_thread(base: Path) -> ThreadDirLayout:
     layout = ThreadDirLayout(base_dir=base, thread_id=ULID_A)
-    layout.thread_dir.mkdir(parents=True, exist_ok=True)
-    layout.meta_path.write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "thread_id": ULID_A,
-                "title": "",
-                "status": "awaiting-cc",
-                "participants": ["claude.ai", "claude-code"],
-                "created_at": "2026-05-07T08:43:07Z",
-                "updated_at": "2026-05-07T08:43:07Z",
-                "tags": [],
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
+    seed_thread_meta(layout)
     layout.messages_dir.mkdir(parents=True, exist_ok=True)
     return layout
 
 
 def _write_message_atomically(layout: ThreadDirLayout, seq: int, sender: str, body: str) -> None:
-    target = layout.message_path(seq, sender)  # type: ignore[arg-type]
-    fm = yaml.safe_dump(
-        {
-            "schema_version": 1,
-            "msg_id": f"{ULID_A}/{seq:03d}",
-            "seq": seq,
-            "from": sender,
-            "to": "claude-code" if sender == "claude.ai" else "claude.ai",
-            "created_at": "2026-05-07T08:43:07Z",
-        },
-        sort_keys=False,
-    )
-    content = f"---\n{fm}---\n\n{body}\n"
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(target)
+    write_message_file(layout, seq, sender, body, atomic=True)
 
 
 @pytest.mark.anyio

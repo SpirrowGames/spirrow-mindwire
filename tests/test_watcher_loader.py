@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-import yaml
+from factories import seed_thread_meta, write_message_file
 
 from spirrow_mindwire.filesystem import ThreadDirLayout
 from spirrow_mindwire.watcher.loader import load_messages, load_thread_meta
@@ -20,42 +20,16 @@ def _layout(base: Path) -> ThreadDirLayout:
 
 
 def _write_meta(layout: ThreadDirLayout, **overrides: object) -> None:
-    layout.thread_dir.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, object] = {
-        "schema_version": 1,
-        "thread_id": ULID_A,
-        "title": "test",
-        "status": "awaiting-cc",
-        "participants": ["claude.ai", "claude-code"],
-        "created_at": "2026-05-07T08:43:07Z",
-        "updated_at": "2026-05-07T08:43:07Z",
-        "tags": [],
-    }
+    """Seed meta with the loader-test default ``title='test'`` (overridable)."""
+    payload: dict[str, object] = {"title": "test"}
     payload.update(overrides)
-    layout.meta_path.write_text(
-        yaml.safe_dump(payload, default_flow_style=False, sort_keys=False),
-        encoding="utf-8",
-    )
+    seed_thread_meta(layout, **payload)
 
 
 def _write_message(
     layout: ThreadDirLayout, seq: int, sender: str, body: str, **overrides: object
 ) -> None:
-    layout.messages_dir.mkdir(parents=True, exist_ok=True)
-    fm: dict[str, object] = {
-        "schema_version": 1,
-        "msg_id": f"{ULID_A}/{seq:03d}",
-        "seq": seq,
-        "from": sender,
-        "to": "claude-code" if sender == "claude.ai" else "claude.ai",
-        "created_at": "2026-05-07T08:43:07Z",
-    }
-    fm.update(overrides)
-    target = layout.message_path(seq, sender)  # type: ignore[arg-type]
-    target.write_text(
-        f"---\n{yaml.safe_dump(fm, default_flow_style=False, sort_keys=False)}---\n\n{body}\n",
-        encoding="utf-8",
-    )
+    write_message_file(layout, seq, sender, body, atomic=False, **overrides)
 
 
 def test_load_thread_meta_round_trip(tmp_path: Path) -> None:

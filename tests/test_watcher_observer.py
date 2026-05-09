@@ -12,6 +12,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from factories import write_message_file
 
 from spirrow_mindwire.filesystem import ThreadDirLayout
 from spirrow_mindwire.watcher.events import ThreadEvent
@@ -46,12 +47,13 @@ def _layout(base: Path) -> ThreadDirLayout:
 
 
 def _write_message_atomically(layout: ThreadDirLayout, seq: int, sender: str) -> None:
-    """Write a message via the same .tmp → rename dance the watcher expects."""
-    layout.messages_dir.mkdir(parents=True, exist_ok=True)
-    target = layout.message_path(seq, sender)  # type: ignore[arg-type]
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text("body", encoding="utf-8")
-    tmp.replace(target)
+    """Write a message via the same .tmp → rename dance the watcher expects.
+
+    Thin wrapper over ``factories.write_message_file`` so the existing
+    callers stay terse; the body content is irrelevant to the observer
+    (which only cares about file-create events on ``messages/``).
+    """
+    write_message_file(layout, seq, sender, atomic=True)
 
 
 @pytest.mark.anyio
