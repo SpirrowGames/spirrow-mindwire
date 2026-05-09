@@ -38,13 +38,19 @@ DEFAULT_DATA_DIR = Path.home() / "spirrow-mindwire-data"
 
 
 class _StrictModel(BaseModel):
-    """Base for config sub-models: forbid extras only.
+    """Base for *config* sub-models: forbid extras only.
 
-    Distinct from :class:`spirrow_mindwire.schema.StrictModel` (which is
-    also ``frozen=True`` + ``populate_by_name=True``). Settings models
-    are intentionally kept mutable in Phase 0 because pydantic-settings'
-    env-override path interacts with frozen models in ways we haven't
-    audited; once that's verified we can promote to ``frozen=True``.
+    Deliberately distinct from :class:`spirrow_mindwire.schema.StrictModel`
+    (which is also ``frozen=True`` + ``populate_by_name=True``).
+    Settings models are intentionally kept mutable in Phase 0 because
+    pydantic-settings' env-override path interacts with frozen models
+    in ways we haven't audited; once that's verified we can promote to
+    ``frozen=True``.
+
+    Kept as two separate bases (instead of one shared one) because
+    config and schema live in their own layers — see
+    ``feedback_decoupling_preference`` — and the leading underscore
+    keeps this base out of the public API of this module.
     """
 
     model_config = ConfigDict(extra="forbid")
