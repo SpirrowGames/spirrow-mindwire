@@ -38,6 +38,15 @@ DEFAULT_DATA_DIR = Path.home() / "spirrow-mindwire-data"
 
 
 class _StrictModel(BaseModel):
+    """Base for config sub-models: forbid extras only.
+
+    Distinct from :class:`spirrow_mindwire.schema.StrictModel` (which is
+    also ``frozen=True`` + ``populate_by_name=True``). Settings models
+    are intentionally kept mutable in Phase 0 because pydantic-settings'
+    env-override path interacts with frozen models in ways we haven't
+    audited; once that's verified we can promote to ``frozen=True``.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
 
@@ -152,6 +161,15 @@ def _default_config_path() -> Path:
 
     Honours ``MINDWIRE_PATHS__DATA_DIR`` so the data root can be moved
     without editing TOML.
+
+    Note on env / TOML interaction: ``MINDWIRE_PATHS__DATA_DIR``
+    relocates the *whole* data root, which means TOML lookup also moves
+    to ``$MINDWIRE_PATHS__DATA_DIR/config/mindwire.toml``. If you need
+    to keep TOML at one path while pointing the data root somewhere
+    else, pass ``config_path`` to :func:`load_settings` directly.
+
+    Only ``expanduser()`` is applied; shell-style ``${VAR}`` expansion
+    is not performed.
     """
 
     env_data_dir = os.environ.get("MINDWIRE_PATHS__DATA_DIR")
@@ -173,6 +191,10 @@ def load_settings(config_path: Path | None = None) -> MindwireSettings:
 
     toml_path = resolved_path
 
+    # pydantic-settings v2's ``TomlConfigSettingsSource`` reads ``toml_file``
+    # at class-definition time, so we subclass per call to scope the path
+    # to this load. The instance returned is ``isinstance(MindwireSettings,
+    # ...)`` so external callers see the declared return type unchanged.
     class _ScopedSettings(MindwireSettings):
         @classmethod
         def settings_customise_sources(
