@@ -12,7 +12,22 @@ Why XML over JSON / YAML:
 - Message bodies are XML-escaped (``<`` / ``>`` / ``&``) so arbitrary
   markdown / code can ride through without re-parsing.
 
-Attribute order is fixed for diff stability across watcher runs.
+Scope of this layer:
+- This is a state-pure transform: ``(meta, messages)`` → ``str``. No
+  I/O, no clock reads, no decisions about *which* messages to include.
+- The watcher chooses the message snapshot to render; this builder
+  treats whatever it's given as the source of truth.
+
+Format conventions:
+- Attribute order is fixed for diff stability and prompt-cache friendliness.
+- Timestamps use second precision with the ``Z`` suffix (architecture.md
+  §3); sub-second precision is intentionally dropped.
+- Thread-level timestamps (``meta.created_at`` / ``updated_at``) are
+  intentionally **not** rendered — the per-message ``created_at`` series
+  carries the same information at the granularity Claude actually needs.
+- ``meta.participants`` is rendered as a comma-separated attribute. The
+  ``Participant`` literal type guarantees the values cannot contain
+  commas; a future schema widening would need to revisit this format.
 """
 
 from __future__ import annotations
@@ -31,13 +46,22 @@ def _iso_z(dt: datetime) -> str:
 def build_thread_prompt(meta: ThreadMeta, messages: list[Message]) -> str:
     """Render *meta* + *messages* as a ``<mw_thread>`` XML payload.
 
-    The most recent message (highest ``seq``) carries
-    ``is_latest="true"`` so the system prompt can point at the message
-    Claude is supposed to reply to.
+    Of the messages handed in, the one with the highest ``seq`` is
+    tagged ``is_latest="true"``. The semantics are:
 
-    Raises ``ValueError`` on an empty *messages* list (a thread with no
-    messages has nothing to prompt about; the watcher should never emit
-    one and we want the bug to surface loudly).
+        "the message Claude should reply to" == "highest seq in this
+        snapshot"
+
+    Choosing *which* message Claude should reply to is the watcher's
+    job — by deciding which messages to include in *messages*. This
+    builder is state-pure and does not look outside the input.
+
+    Raises ``ValueError`` on three malformed inputs (fail-loudly
+    philosophy, same as the empty-list check):
+    - empty *messages* list
+    - duplicate ``seq`` values (would emit multiple ``is_latest="true"``)
+    - any ``msg_id`` whose thread_id prefix doesn't match
+      ``meta.thread_id`` (mixing threads in one prompt is not allowed)
     """
 
     if not messages:

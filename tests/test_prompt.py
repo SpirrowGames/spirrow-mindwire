@@ -96,8 +96,13 @@ def test_messages_are_emitted_in_seq_order_regardless_of_input_order() -> None:
     out_normal = build_thread_prompt(_meta(), [_msg(), later_msg])
     out_reversed = build_thread_prompt(_meta(), [later_msg, _msg()])
     assert out_normal == out_reversed
-    # seq=1 appears before seq=2 in the rendered XML
-    assert out_normal.index('seq="1"') < out_normal.index('seq="2"')
+    # Anchor the assertion on the full ``<mw_message seq="N"`` opening so
+    # we're checking element position, not bare attribute substrings
+    # (which would tie-break by lex order even on broken sorts).
+    seq1_pos = out_normal.find('<mw_message seq="1"')
+    seq2_pos = out_normal.find('<mw_message seq="2"')
+    assert seq1_pos != -1 and seq2_pos != -1
+    assert seq1_pos < seq2_pos
 
 
 def test_xml_special_characters_in_body_are_escaped() -> None:
