@@ -23,7 +23,6 @@ from spirrow_mindwire.claude_code import (
 )
 from spirrow_mindwire.filesystem import ThreadDirLayout
 from spirrow_mindwire.phanthand import (
-    FileExistsData,
     FileInfoData,
     FileListData,
     FileListEntry,
@@ -32,6 +31,7 @@ from spirrow_mindwire.phanthand import (
     PhanthandAPIError,
     PhanthandClient,
 )
+from spirrow_mindwire.schema import Participant
 
 ULID_A = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 NOW = datetime(2026, 5, 7, 8, 43, 7, tzinfo=UTC)
@@ -46,15 +46,15 @@ def _make_tools(
     next_seq: int = 2,
     *,
     phanthand_client: Any | None = None,
-    sender: str = "claude-code",
-    recipient: str = "claude.ai",
+    sender: Participant = "claude-code",
+    recipient: Participant = "claude.ai",
     now: datetime | None = NOW,
 ) -> list[SdkMcpTool[Any]]:
     return build_mindwire_tools(
         layout=_layout(base),
         next_seq=next_seq,
-        sender=sender,  # type: ignore[arg-type]
-        recipient=recipient,  # type: ignore[arg-type]
+        sender=sender,
+        recipient=recipient,
         phanthand_client=phanthand_client or AsyncMock(spec=PhanthandClient),
         now=now,
     )
@@ -248,8 +248,6 @@ async def test_file_info_renders_metadata(tmp_path: Path) -> None:
     assert "kind: file" in text
     assert "size: 1234" in text
     assert "readonly: False" in text
-    # FileExistsData unused in this test path; reference to silence linters.
-    assert FileExistsData.__name__ == "FileExistsData"
 
 
 # ---------- factory wiring ----------------------------------------------
