@@ -77,6 +77,28 @@ class ThreadDispatcher:
         self._dedup = dedup
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._invoker: SdkInvoker = invoker or invoke_claude_code
+        # Per-thread serialization: architecture.md §4.0 requires that a
+        # single thread never run two invocations concurrently. Without
+        # this, two events landing close together (e.g. seq=1 then seq=2)
+        # would race on ``write_reply``'s next_seq computation and on the
+        # event log's start/end pairing. Independent threads still run in
+        # parallel, capped by ``self._semaphore``.
+        #
+        # Lock entries are intentionally never deleted in Phase 0:
+        # - The expected scale is ~tens of threads per running watcher
+        #   (1 user, small thread set), so dict growth is bounded.
+        # - The candidates for cleanup (`lock._waiters` introspection or
+        #   ref-counting) all add complexity for negligible payoff.
+        # - Feature 2 introduces startup-full-scan + graceful-shutdown,
+        #   which is the right place to consolidate lifecycle including
+        #   any thread-lock GC strategy.
+        # See ChatRoom thread T-T06-pr8-per-thread-serialization msg-019.
+        self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._locks_mutex = asyncio.Lock()
+
+    async def _get_thread_lock(self, thread_id: str) -> asyncio.Lock:
+        async with self._locks_mutex:
+            return self._thread_locks.setdefault(thread_id, asyncio.Lock())
 
     async def handle(self, event: ThreadEvent) -> None:
         if self._dedup.seen_recently(event.thread_id, event.seq, event.detected_at):
@@ -84,7 +106,8 @@ class ThreadDispatcher:
             return
         self._dedup.mark(event.thread_id, event.seq, event.detected_at)
 
-        async with self._semaphore:
+        thread_lock = await self._get_thread_lock(event.thread_id)
+        async with thread_lock, self._semaphore:
             await self._run_thread(event)
 
     async def _run_thread(self, event: ThreadEvent) -> None:

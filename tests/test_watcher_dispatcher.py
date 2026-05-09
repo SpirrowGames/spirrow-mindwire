@@ -8,7 +8,9 @@ dispatcher only forwards the client into the tool factory.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -74,6 +76,28 @@ def _event(thread_id: str = ULID_A, seq: int = 1, when: datetime | None = None) 
         seq=seq,
         path=Path("ignored"),
         detected_at=when or NOW,
+    )
+
+
+def _write_message(layout: ThreadDirLayout, seq: int, sender: str, body: str = "hello") -> None:
+    """Write a fully-formed message file (frontmatter + body) at ``seq``."""
+    layout.messages_dir.mkdir(parents=True, exist_ok=True)
+    target = layout.message_path(seq, sender)  # type: ignore[arg-type]
+    target.write_text(
+        "---\n"
+        + yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "msg_id": f"{layout.thread_id}/{seq:03d}",
+                "seq": seq,
+                "from": sender,
+                "to": "claude-code" if sender == "claude.ai" else "claude.ai",
+                "created_at": "2026-05-07T08:43:07Z",
+            },
+            sort_keys=False,
+        )
+        + f"---\n\n{body}\n",
+        encoding="utf-8",
     )
 
 
@@ -191,6 +215,127 @@ async def test_dispatcher_logs_error_end_when_invoke_raises(tmp_path: Path) -> N
     assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
     end = json.loads(log_lines[-1])
     assert end["exit_code"] == 1
+
+
+@pytest.mark.anyio
+async def test_dispatcher_serializes_invocations_per_thread(tmp_path: Path) -> None:
+    """Two events on the same thread must run one-after-the-other.
+
+    Architecture.md §4.0 forbids concurrent invocations on a single
+    thread — they would collide on ``write_reply``'s next_seq compute
+    and interleave the event log. We block the first invoker on an
+    asyncio.Event, fire the second, and assert the second task is still
+    pending. The Event-based wait is deterministic: it doesn't depend
+    on a tick race the way an "in_progress" boolean would.
+    """
+    layout = _seed_thread(tmp_path)  # seq=1 from claude.ai already on disk
+
+    first_active = asyncio.Event()
+    allow_first_finish = asyncio.Event()
+    invoker_seqs: list[int] = []
+
+    async def fake_invoker(**kwargs: Any) -> InvokeResult:
+        prompt = kwargs["prompt"]
+        m = re.search(r'<mw_message\s+seq="(\d+)"[^>]*is_latest="true"', prompt)
+        seq_in_prompt = int(m.group(1)) if m else -1
+        # First invocation: signal active and block until the test releases
+        if not first_active.is_set():
+            first_active.set()
+            await allow_first_finish.wait()
+        invoker_seqs.append(seq_in_prompt)
+        return _ok_result()
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=fake_invoker,
+    )
+
+    task1 = asyncio.create_task(dispatcher.handle(_event(seq=1)))
+    await asyncio.wait_for(first_active.wait(), timeout=2.0)
+
+    # Add a fresh seq=2 from claude.ai and dispatch a second event.
+    _write_message(layout, 2, "claude.ai", "second")
+    task2 = asyncio.create_task(dispatcher.handle(_event(seq=2)))
+
+    # Give the loop a tick to expose any concurrent entry; task2 must
+    # still be parked behind the per-thread lock.
+    await asyncio.sleep(0.1)
+    assert not task2.done(), (
+        "second invoke ran concurrently with first — per-thread serialization broken"
+    )
+    assert invoker_seqs == [], "first invoker has not appended yet (still blocked)"
+
+    # Release the first invoker; both tasks should now complete in order.
+    allow_first_finish.set()
+    await asyncio.gather(task1, task2)
+
+    assert invoker_seqs == [1, 2], (
+        f"expected per-thread FIFO [1, 2], got {invoker_seqs}"
+    )
+
+
+@pytest.mark.anyio
+async def test_dispatcher_runs_distinct_threads_in_parallel(tmp_path: Path) -> None:
+    """Different threads must NOT serialize against each other.
+
+    Counter-test to ``test_dispatcher_serializes_invocations_per_thread``:
+    the per-thread lock must key on ``thread_id``, not be a global mutex.
+    """
+    other_ulid = "01ARZ3NDEKTSV4RRFFQ69G5FBZ"
+
+    # Seed two distinct threads, each with one claude.ai message.
+    layout_a = _seed_thread(tmp_path)  # ULID_A, seq=1
+    layout_b = ThreadDirLayout(base_dir=tmp_path, thread_id=other_ulid)
+    layout_b.thread_dir.mkdir(parents=True, exist_ok=True)
+    layout_b.meta_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "thread_id": other_ulid,
+                "title": "",
+                "status": "awaiting-cc",
+                "participants": ["claude.ai", "claude-code"],
+                "created_at": "2026-05-07T08:43:07Z",
+                "updated_at": "2026-05-07T08:43:07Z",
+                "tags": [],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    _write_message(layout_b, 1, "claude.ai", "from-b")
+    assert layout_a.thread_dir.exists()  # silence linter
+
+    a_active = asyncio.Event()
+    b_active = asyncio.Event()
+    allow_finish = asyncio.Event()
+
+    async def fake_invoker(**kwargs: Any) -> InvokeResult:
+        thread_dir = kwargs["cwd"]
+        if thread_dir.name == ULID_A:
+            a_active.set()
+        elif thread_dir.name == other_ulid:
+            b_active.set()
+        await allow_finish.wait()
+        return _ok_result()
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=fake_invoker,
+    )
+
+    task_a = asyncio.create_task(dispatcher.handle(_event(thread_id=ULID_A, seq=1)))
+    task_b = asyncio.create_task(dispatcher.handle(_event(thread_id=other_ulid, seq=1)))
+
+    # Both must enter the invoker without waiting on each other.
+    await asyncio.wait_for(asyncio.gather(a_active.wait(), b_active.wait()), timeout=2.0)
+
+    allow_finish.set()
+    await asyncio.gather(task_a, task_b)
 
 
 @pytest.mark.anyio
