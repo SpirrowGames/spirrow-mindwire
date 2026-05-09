@@ -271,9 +271,7 @@ async def test_dispatcher_serializes_invocations_per_thread(tmp_path: Path) -> N
     allow_first_finish.set()
     await asyncio.gather(task1, task2)
 
-    assert invoker_seqs == [1, 2], (
-        f"expected per-thread FIFO [1, 2], got {invoker_seqs}"
-    )
+    assert invoker_seqs == [1, 2], f"expected per-thread FIFO [1, 2], got {invoker_seqs}"
 
 
 @pytest.mark.anyio
