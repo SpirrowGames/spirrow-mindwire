@@ -47,7 +47,17 @@ def _zero_padded_seq(seq: int) -> str:
 
 
 def _iso_z(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Render a UTC datetime with the architecture-canonical ``Z`` suffix.
+
+    Mirrors the schema-side ``AwareDatetime`` validator: naive datetimes
+    are rejected loudly so a forgotten ``tzinfo`` doesn't produce a
+    timestamp that *looks* UTC but isn't. Non-UTC aware datetimes are
+    converted; we never emit a ``Z`` suffix on a wall-clock value from
+    another zone.
+    """
+    if dt.tzinfo is None:
+        raise ValueError("datetime must be timezone-aware")
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _ok(text: str) -> dict[str, Any]:
@@ -84,6 +94,11 @@ def build_mindwire_tools(
         {"content": str},
     )
     async def write_reply(args: dict[str, Any]) -> dict[str, Any]:
+        # The caller (watcher dispatcher) is responsible for guaranteeing
+        # that ``next_seq`` has not been written by another process; this
+        # tool does not check for filename collisions and ``atomic_write_text``
+        # would silently overwrite via ``os.replace``. Per-thread serialization
+        # in the dispatcher is what enforces the invariant.
         body: str = args["content"]
         ts = now if now is not None else datetime.now(UTC)
         msg_id = f"{layout.thread_id}/{_zero_padded_seq(next_seq)}"
@@ -101,6 +116,10 @@ def build_mindwire_tools(
             sort_keys=False,
             allow_unicode=True,
         )
+        # Normalize trailing newlines on the YAML block so the framing
+        # ``---\n`` separator is always exactly one newline away, even
+        # if a future PyYAML changes its trailing-newline convention.
+        yaml_block = yaml_block.rstrip("\n") + "\n"
         content = f"---\n{yaml_block}---\n\n{body}\n"
         target = layout.message_path(next_seq, sender)
         atomic_write_text(target, content)
@@ -115,7 +134,7 @@ def build_mindwire_tools(
         try:
             data = await phanthand_client.read_file(args["path"])
         except PhanthandError as e:
-            return _error(f"read_file failed: {e}")
+            return _error(str(e))
         return _ok(data.content)
 
     @tool(
@@ -127,7 +146,7 @@ def build_mindwire_tools(
         try:
             data = await phanthand_client.list_directory(args["path"])
         except PhanthandError as e:
-            return _error(f"list_dir failed: {e}")
+            return _error(str(e))
         lines = [f"{'D' if entry.is_dir else 'F'} {entry.path}" for entry in data.entries]
         return _ok("\n".join(lines) if lines else "(empty)")
 
@@ -141,7 +160,7 @@ def build_mindwire_tools(
         try:
             data = await phanthand_client.file_search(args["path"], args["pattern"])
         except PhanthandError as e:
-            return _error(f"search failed: {e}")
+            return _error(str(e))
         body = "\n".join(data.matches) if data.matches else "(no matches)"
         if data.truncated:
             body += f"\n... (truncated at {data.count} matches)"
@@ -156,8 +175,13 @@ def build_mindwire_tools(
         try:
             data = await phanthand_client.file_info(args["path"])
         except PhanthandError as e:
-            return _error(f"file_info failed: {e}")
+            return _error(str(e))
         kind = "dir" if data.is_dir else "file"
+        # ``modified`` is a server-side timestamp from Phanthand and is
+        # passed through unmodified — we don't reformat it via ``_iso_z``
+        # because it's not a MindWire-emitted event time. Phanthand's
+        # native ``+00:00`` form is preserved so callers can tell at a
+        # glance that the value comes from upstream.
         modified = data.modified.isoformat() if data.modified else "(unknown)"
         text = (
             f"path: {data.path}\n"
