@@ -11,11 +11,11 @@ from __future__ import annotations
 
 from ._common import (
     SCHEMA_VERSION,
-    AwareDatetime,
     Participant,
     StrictModel,
     ThreadStatus,
     UlidStr,
+    UTCDatetime,
 )
 from .event import (
     ClaudeCodeInvokeEnd,
@@ -33,7 +33,6 @@ from .meta import ThreadMeta
 
 __all__ = [
     "SCHEMA_VERSION",
-    "AwareDatetime",
     "ClaudeCodeInvokeEnd",
     "ClaudeCodeInvokeStart",
     "Event",
@@ -48,5 +47,6 @@ __all__ = [
     "ThreadResolved",
     "ThreadStatus",
     "ThreadStatusChanged",
+    "UTCDatetime",
     "UlidStr",
 ]

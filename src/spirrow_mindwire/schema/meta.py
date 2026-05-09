@@ -10,11 +10,11 @@ from typing import Literal
 from pydantic import Field, field_validator
 
 from ._common import (
-    AwareDatetime,
     Participant,
     StrictModel,
     ThreadStatus,
     UlidStr,
+    UTCDatetime,
 )
 
 
@@ -32,8 +32,8 @@ class ThreadMeta(StrictModel):
     title: str = ""
     status: ThreadStatus
     participants: tuple[Participant, ...]
-    created_at: AwareDatetime
-    updated_at: AwareDatetime
+    created_at: UTCDatetime
+    updated_at: UTCDatetime
     tags: tuple[str, ...] = Field(default_factory=tuple)
 
     @field_validator("participants")
