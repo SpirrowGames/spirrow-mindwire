@@ -67,7 +67,10 @@ async def invoke_claude_code(
     The session is hard-configured per architecture.md §6.2:
 
     - ``tools=[]``: every built-in tool is disabled. claude-code only
-      sees what is explicitly listed in ``allowed_tools``.
+      sees what is explicitly listed in ``allowed_tools``. Combined with
+      ``allowed_tools or []`` below this is fail-closed: callers that
+      forget to pass ``allowed_tools`` get a session that can read but
+      cannot write or call any MCP tool.
     - ``cwd`` is set to the thread directory the watcher hands in.
     - ``mcp_servers`` carries the in-process MindWire tools and any
       config-driven pass-through servers; this layer doesn't construct
@@ -75,6 +78,15 @@ async def invoke_claude_code(
 
     *runner* defaults to :func:`claude_agent_sdk.query`; tests inject a
     fake async iterator instead of patching the import.
+
+    Stream-event handling:
+
+    - ``RateLimitEvent`` and ``StreamEvent`` are kept in
+      :attr:`InvokeResult.raw_messages` but not surfaced as fields.
+      Callers that need to react to rate limiting (e.g. the watcher's
+      retry layer in Feature 2) walk ``raw_messages`` themselves.
+    - If multiple ``ResultMessage`` instances arrive (the SDK contract
+      promises one, but we don't enforce it), the *last* wins.
 
     Raises :class:`RuntimeError` if the stream ends without a
     ``ResultMessage``. Network / SDK errors propagate out unchanged so
