@@ -276,9 +276,7 @@ async def test_response_schema_mismatch_wrapped_as_http_error() -> None:
     # ``size`` declared as int in FileReadData; returning a string should not
     # leak pydantic.ValidationError to the caller.
     def handler(req: httpx.Request) -> httpx.Response:
-        return _ok(
-            {"path": "/D/x.py", "content": "", "size": "not-an-int", "encoding": "utf-8"}
-        )
+        return _ok({"path": "/D/x.py", "content": "", "size": "not-an-int", "encoding": "utf-8"})
 
     async with _client(handler) as client:
         with pytest.raises(PhanthandHTTPError, match="response schema mismatch"):
