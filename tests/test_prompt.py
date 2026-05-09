@@ -121,6 +121,26 @@ def test_empty_messages_raises() -> None:
         build_thread_prompt(_meta(), [])
 
 
+def test_duplicate_seq_raises() -> None:
+    duplicate = _msg()
+    other = _msg(
+        msg_id=f"{ULID_A}/001",
+        seq=1,
+        **{"from": "claude-code"},
+        to="claude.ai",
+        body="dup",
+    )
+    with pytest.raises(ValueError, match="duplicate seq"):
+        build_thread_prompt(_meta(), [duplicate, other])
+
+
+def test_message_from_different_thread_raises() -> None:
+    other_thread = "01ARZ3NDEKTSV4RRFFQ69G5FBW"
+    foreign = _msg(msg_id=f"{other_thread}/001")
+    with pytest.raises(ValueError, match="does not belong to thread"):
+        build_thread_prompt(_meta(), [foreign])
+
+
 def test_thread_status_attribute_reflects_meta() -> None:
     out = build_thread_prompt(_meta(status="active"), [_msg()])
     assert ' status="active"' in out

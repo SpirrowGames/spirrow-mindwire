@@ -43,6 +43,22 @@ def build_thread_prompt(meta: ThreadMeta, messages: list[Message]) -> str:
     if not messages:
         raise ValueError("messages must not be empty")
 
+    seqs = [m.seq for m in messages]
+    if len(seqs) != len(set(seqs)):
+        raise ValueError(
+            f"messages contain duplicate seq values: {sorted(seqs)} "
+            "(architecture.md §6.4 requires exactly one is_latest message)"
+        )
+
+    for m in messages:
+        prefix = m.msg_id.split("/", 1)[0]
+        if prefix != meta.thread_id:
+            raise ValueError(
+                f"message {m.msg_id!r} does not belong to thread "
+                f"{meta.thread_id!r} (mixing threads in one prompt is "
+                "not allowed)"
+            )
+
     sorted_msgs = sorted(messages, key=lambda m: m.seq)
     last_seq = sorted_msgs[-1].seq
 
