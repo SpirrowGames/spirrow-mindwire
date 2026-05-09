@@ -9,6 +9,7 @@ import pytest
 from factories import seed_thread_meta, write_message_file
 
 from spirrow_mindwire.filesystem import ThreadDirLayout
+from spirrow_mindwire.schema import Participant
 from spirrow_mindwire.watcher.loader import load_messages, load_thread_meta
 
 ULID_A = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -27,7 +28,7 @@ def _write_meta(layout: ThreadDirLayout, **overrides: object) -> None:
 
 
 def _write_message(
-    layout: ThreadDirLayout, seq: int, sender: str, body: str, **overrides: object
+    layout: ThreadDirLayout, seq: int, sender: Participant, body: str, **overrides: object
 ) -> None:
     write_message_file(layout, seq, sender, body, atomic=False, **overrides)
 

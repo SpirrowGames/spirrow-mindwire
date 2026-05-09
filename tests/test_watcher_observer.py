@@ -15,6 +15,7 @@ import pytest
 from factories import write_message_file
 
 from spirrow_mindwire.filesystem import ThreadDirLayout
+from spirrow_mindwire.schema import Participant
 from spirrow_mindwire.watcher.events import ThreadEvent
 from spirrow_mindwire.watcher.observer import WatcherObserver
 
@@ -46,7 +47,7 @@ def _layout(base: Path) -> ThreadDirLayout:
     return ThreadDirLayout(base_dir=base, thread_id=ULID_A)
 
 
-def _write_message_atomically(layout: ThreadDirLayout, seq: int, sender: str) -> None:
+def _write_message_atomically(layout: ThreadDirLayout, seq: int, sender: Participant) -> None:
     """Write a message via the same .tmp → rename dance the watcher expects.
 
     Thin wrapper over ``factories.write_message_file`` so the existing

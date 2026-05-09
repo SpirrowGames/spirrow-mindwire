@@ -22,6 +22,7 @@ from factories import seed_thread_meta, write_message_file
 from spirrow_mindwire.claude_code import InvokeResult
 from spirrow_mindwire.filesystem import ThreadDirLayout
 from spirrow_mindwire.phanthand import PhanthandClient
+from spirrow_mindwire.schema import Participant
 from spirrow_mindwire.watcher.dedup import DedupCache
 from spirrow_mindwire.watcher.dispatcher import ThreadDispatcher
 from spirrow_mindwire.watcher.events import ThreadEvent
@@ -30,7 +31,7 @@ ULID_A = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 NOW = datetime(2026, 5, 7, 8, 43, 7, tzinfo=UTC)
 
 
-def _seed_thread(base: Path, sender: str = "claude.ai", seq: int = 1) -> ThreadDirLayout:
+def _seed_thread(base: Path, sender: Participant = "claude.ai", seq: int = 1) -> ThreadDirLayout:
     """Seed meta + one in-place message; the dispatcher does not need atomic writes."""
     layout = ThreadDirLayout(base_dir=base, thread_id=ULID_A)
     seed_thread_meta(layout)
@@ -47,7 +48,9 @@ def _event(thread_id: str = ULID_A, seq: int = 1, when: datetime | None = None) 
     )
 
 
-def _write_message(layout: ThreadDirLayout, seq: int, sender: str, body: str = "hello") -> None:
+def _write_message(
+    layout: ThreadDirLayout, seq: int, sender: Participant, body: str = "hello"
+) -> None:
     write_message_file(layout, seq, sender, body, atomic=False)
 
 

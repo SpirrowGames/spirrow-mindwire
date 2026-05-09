@@ -22,6 +22,7 @@ from factories import seed_thread_meta, write_message_file
 from spirrow_mindwire.claude_code import InvokeResult
 from spirrow_mindwire.filesystem import ThreadDirLayout
 from spirrow_mindwire.phanthand import PhanthandClient
+from spirrow_mindwire.schema import Participant
 from spirrow_mindwire.watcher.dedup import DedupCache
 from spirrow_mindwire.watcher.dispatcher import ThreadDispatcher
 from spirrow_mindwire.watcher.events import ThreadEvent
@@ -38,7 +39,9 @@ def _seed_thread(base: Path) -> ThreadDirLayout:
     return layout
 
 
-def _write_message_atomically(layout: ThreadDirLayout, seq: int, sender: str, body: str) -> None:
+def _write_message_atomically(
+    layout: ThreadDirLayout, seq: int, sender: Participant, body: str
+) -> None:
     write_message_file(layout, seq, sender, body, atomic=True)
 
 

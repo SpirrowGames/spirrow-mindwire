@@ -15,7 +15,9 @@ from typing import Any
 
 import yaml
 
+from spirrow_mindwire._seq import zero_padded_seq
 from spirrow_mindwire.filesystem import ThreadDirLayout
+from spirrow_mindwire.schema import Participant
 
 DEFAULT_TS = "2026-05-07T08:43:07Z"
 """Canonical UTC timestamp used in fixture frontmatter / meta defaults.
@@ -55,7 +57,7 @@ def seed_thread_meta(layout: ThreadDirLayout, **overrides: Any) -> None:
 def write_message_file(
     layout: ThreadDirLayout,
     seq: int,
-    sender: str,
+    sender: Participant,
     body: str = "hello",
     *,
     atomic: bool = True,
@@ -69,12 +71,16 @@ def write_message_file(
     ``atomic=False`` writes in place, appropriate for pre-seeding state
     outside any observer's life cycle (dispatcher unit tests, loader
     fixtures).
+
+    ``sender`` is typed as :data:`Participant` so the ``to`` derivation
+    below is exhaustive under mypy and the helper cannot accidentally
+    generate filenames for unknown participants.
     """
 
     layout.messages_dir.mkdir(parents=True, exist_ok=True)
     fm: dict[str, Any] = {
         "schema_version": 1,
-        "msg_id": f"{layout.thread_id}/{seq:03d}",
+        "msg_id": f"{layout.thread_id}/{zero_padded_seq(seq)}",
         "seq": seq,
         "from": sender,
         "to": "claude-code" if sender == "claude.ai" else "claude.ai",
@@ -83,7 +89,7 @@ def write_message_file(
     fm.update(frontmatter_overrides)
     yaml_block = yaml.safe_dump(fm, default_flow_style=False, sort_keys=False)
     content = f"---\n{yaml_block}---\n\n{body}\n"
-    target = layout.message_path(seq, sender)  # type: ignore[arg-type]
+    target = layout.message_path(seq, sender)
     if atomic:
         tmp = target.with_name(target.name + ".tmp")
         tmp.write_text(content, encoding="utf-8")

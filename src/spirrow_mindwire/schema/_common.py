@@ -50,12 +50,16 @@ UTCDatetime = Annotated[datetime, AfterValidator(_normalize_to_utc)]
 """A UTC-tagged ``datetime`` annotation for pydantic models.
 
 The ``AfterValidator`` runs ``_normalize_to_utc`` on every input, which
-means **the stored value is not ``==`` to the input** when the input
-carries a non-UTC offset:
+means **the stored value differs in representation** from inputs
+carrying non-UTC offsets — same instant in time, but different
+``tzinfo`` / ``utcoffset()`` / ``isoformat()`` output:
 
 >>> # input: 17:43 in JST (offset +09:00)
 >>> # stored: 08:43 in UTC (offset +00:00)
->>> # both refer to the same instant, but ``input.tzinfo != stored.tzinfo``
+>>> # ``input == stored`` is True (Python compares aware datetimes by
+>>> # absolute time), but the on-disk YAML form, ``isoformat()``, and
+>>> # ``tzinfo`` all differ — so anything that hashes / serializes the
+>>> # datetime sees a different value after the round-trip.
 
 Naive datetimes are rejected outright. The name was chosen over the
 shorter ``AwareDatetime`` (the prior name) because the latter only
