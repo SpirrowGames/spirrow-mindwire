@@ -20,7 +20,25 @@ from spirrow_mindwire.watcher.observer import WatcherObserver
 ULID_A = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
 EVENT_TIMEOUT = 5.0
-"""Seconds to wait for the observer thread to surface an event."""
+"""Seconds to wait for the observer thread to surface an event.
+
+Sized for inotify (Linux); macOS FSEvents and Windows
+ReadDirectoryChangesW are not exercised here. Cross-platform support
+needs separate manual verification.
+"""
+
+
+async def _assert_no_event(queue: asyncio.Queue[ThreadEvent], timeout: float = 0.5) -> None:
+    """Assert no event lands on the queue within ``timeout``.
+
+    ``queue.empty()`` is unreliable here: ``call_soon_threadsafe``
+    schedules ``queue.put_nowait`` from the watchdog thread, but the
+    event loop may not have ticked yet when the assertion runs.
+    Awaiting ``queue.get()`` with a timeout forces the loop to drain
+    pending callbacks first and gives a deterministic verdict.
+    """
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(queue.get(), timeout=timeout)
 
 
 def _layout(base: Path) -> ThreadDirLayout:
@@ -77,12 +95,9 @@ async def test_observer_ignores_tmp_files(tmp_path: Path) -> None:
         tmp = target.with_name(target.name + ".tmp")
         # Create the .tmp without renaming — should be ignored entirely.
         tmp.write_text("partial", encoding="utf-8")
-        # Give the observer a window to (incorrectly) emit something.
-        await asyncio.sleep(0.5)
+        await _assert_no_event(queue)
     finally:
         observer.stop()
-
-    assert queue.empty()
 
 
 @pytest.mark.anyio
@@ -99,11 +114,9 @@ async def test_observer_ignores_files_outside_thread_layout(tmp_path: Path) -> N
         await asyncio.sleep(0.1)
         # README at the threads root, not in any thread dir.
         (threads_root / "README.md").write_text("hi", encoding="utf-8")
-        await asyncio.sleep(0.5)
+        await _assert_no_event(queue)
     finally:
         observer.stop()
-
-    assert queue.empty()
 
 
 @pytest.mark.anyio
@@ -124,9 +137,9 @@ async def test_observer_distinct_seqs_emit_distinct_events(tmp_path: Path) -> No
         seqs: set[int] = set()
         # The observer may emit modify/move events around the rename;
         # collect everything until both seqs are seen or we time out.
-        deadline = asyncio.get_event_loop().time() + EVENT_TIMEOUT
+        deadline = loop.time() + EVENT_TIMEOUT
         while {1, 2} - seqs:
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
                 break
             event = await asyncio.wait_for(queue.get(), timeout=remaining)
