@@ -200,7 +200,54 @@ def transition_state(
     return new_meta
 
 
+def bump_retry_count(layout: ThreadDirLayout) -> ThreadMeta:
+    """Increment ``retry_count`` without changing ``status``.
+
+    Used by the retry path when the dispatcher's invoke fails on a
+    thread that's already in ``retrying`` state. ``retrying →
+    retrying`` is forbidden by :data:`_ALLOWED_TRANSITIONS` (Decide
+    #3b-1), but the retry counter still needs to advance for sub-PR 3
+    (retry) to enforce ``max_retries``. This helper writes a meta.yaml
+    update with only ``retry_count`` and ``updated_at`` changed.
+
+    Args:
+        layout: ThreadDirLayout pointing to the thread's directory.
+
+    Returns:
+        The new ThreadMeta after the write.
+
+    Raises:
+        ValueError: if the existing meta is in a state where retry
+            counter advancement makes no sense (i.e. terminal states).
+    """
+    old_meta_text = layout.meta_path.read_text(encoding="utf-8")
+    old_meta = ThreadMeta.model_validate(yaml.safe_load(old_meta_text))
+
+    if old_meta.status in TERMINAL_STATES:
+        raise ValueError(
+            f"bump_retry_count: cannot bump retry_count for terminal status "
+            f"{old_meta.status!r}; retry path applies to active/retrying only"
+        )
+
+    new_meta = old_meta.model_copy(
+        update={
+            "retry_count": old_meta.retry_count + 1,
+            "updated_at": datetime.now(UTC),
+        }
+    )
+    atomic_write_text(
+        layout.meta_path,
+        yaml.safe_dump(
+            new_meta.model_dump(mode="json"),
+            default_flow_style=False,
+            sort_keys=False,
+        ),
+    )
+    return new_meta
+
+
 __all__ = [
     "InvalidTransitionError",
+    "bump_retry_count",
     "transition_state",
 ]

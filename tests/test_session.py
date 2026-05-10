@@ -8,6 +8,7 @@ the real CLI.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
-from spirrow_mindwire.claude_code import invoke_claude_code
+from spirrow_mindwire.claude_code import InvokeTimeoutError, invoke_claude_code
 from spirrow_mindwire.claude_code.session import SdkMessage
 
 
@@ -173,3 +174,128 @@ async def test_invoke_passes_max_turns_when_provided(tmp_path: Path) -> None:
         runner=runner,
     )
     assert captured["options"].max_turns == 5
+
+
+# ----- Feature 2 sub-PR 2: timeout tests ------------------------------------
+
+
+@pytest.mark.anyio
+async def test_invoke_idle_timeout_fires(tmp_path: Path) -> None:
+    """``idle_timeout_seconds`` 内に SDK が次の message を yield しない場合に
+    ``InvokeTimeoutError(kind="idle")`` が raise される."""
+
+    async def slow_first_message(
+        *, prompt: str, options: ClaudeAgentOptions
+    ) -> AsyncIterator[SdkMessage]:
+        # Sleep longer than idle_timeout before any yield → fires idle.
+        await asyncio.sleep(10.0)
+        yield _result()
+
+    with pytest.raises(InvokeTimeoutError) as exc:
+        await invoke_claude_code(
+            prompt="x",
+            cwd=tmp_path,
+            system_prompt="role",
+            runner=slow_first_message,
+            idle_timeout_seconds=0.05,
+        )
+    assert exc.value.kind == "idle"
+    assert exc.value.elapsed_seconds >= 0.05
+
+
+@pytest.mark.anyio
+async def test_invoke_absolute_timeout_fires(tmp_path: Path) -> None:
+    """``absolute_timeout_seconds`` を超えると ``InvokeTimeoutError(kind="absolute")``.
+
+    Each per-message wait stays under ``idle_timeout_seconds``, but cumulative
+    wall-clock exceeds ``absolute_timeout_seconds`` → absolute timeout fires.
+    """
+
+    async def steady_chatter(
+        *, prompt: str, options: ClaudeAgentOptions
+    ) -> AsyncIterator[SdkMessage]:
+        # Each gap < idle threshold, but total > absolute threshold.
+        for _ in range(20):
+            await asyncio.sleep(0.02)
+            yield _assistant("...")
+        yield _result()
+
+    with pytest.raises(InvokeTimeoutError) as exc:
+        await invoke_claude_code(
+            prompt="x",
+            cwd=tmp_path,
+            system_prompt="role",
+            runner=steady_chatter,
+            idle_timeout_seconds=0.5,
+            absolute_timeout_seconds=0.05,
+        )
+    assert exc.value.kind == "absolute"
+    # Lower bound is generous because asyncio.wait_for can fire a few ms early
+    # depending on event-loop scheduling; what matters here is "kind == absolute".
+    assert exc.value.elapsed_seconds > 0
+
+
+@pytest.mark.anyio
+async def test_invoke_returns_normally_within_timeouts(tmp_path: Path) -> None:
+    """Timeout 引数を渡しても、 期限内に完了する run は正常 return (= 既存挙動 regression なし)."""
+    captured: dict[str, Any] = {}
+    runner = _runner(captured, [_assistant("quick"), _result(result="ok")])
+
+    out = await invoke_claude_code(
+        prompt="x",
+        cwd=tmp_path,
+        system_prompt="role",
+        runner=runner,
+        idle_timeout_seconds=5.0,
+        absolute_timeout_seconds=5.0,
+    )
+    assert out.text_output == "quick"
+    assert out.result_text == "ok"
+
+
+@pytest.mark.anyio
+async def test_invoke_no_timeout_default_preserves_existing_behavior(
+    tmp_path: Path,
+) -> None:
+    """両 timeout を None のままにすると既存 path をそのまま走る (defaults backward compat)."""
+    runner = _runner({}, [_assistant("hello"), _result()])
+    out = await invoke_claude_code(
+        prompt="x",
+        cwd=tmp_path,
+        system_prompt="role",
+        runner=runner,
+    )
+    # No timeout-related kwargs, no timeout fires.
+    assert out.text_output == "hello"
+
+
+@pytest.mark.anyio
+async def test_invoke_idle_propagates_unchanged_when_both_timeouts_set(
+    tmp_path: Path,
+) -> None:
+    """idle + absolute 両 set 時、 idle が先 fire したら kind="idle" のまま propagate.
+
+    Without the explicit ``except InvokeTimeoutError: raise`` ahead of the
+    outer ``except TimeoutError``, the outer wait_for catches the inner
+    InvokeTimeoutError (subclass match) and re-wraps it as kind="absolute".
+    This regression test covers that idle classification survives both-set.
+    """
+
+    async def slow_first_message(
+        *, prompt: str, options: ClaudeAgentOptions
+    ) -> AsyncIterator[SdkMessage]:
+        # Sleep > idle threshold but < absolute threshold → idle fires first.
+        await asyncio.sleep(10.0)
+        yield _result()
+
+    with pytest.raises(InvokeTimeoutError) as exc:
+        await invoke_claude_code(
+            prompt="x",
+            cwd=tmp_path,
+            system_prompt="role",
+            runner=slow_first_message,
+            idle_timeout_seconds=0.05,
+            absolute_timeout_seconds=5.0,  # comfortably larger than idle
+        )
+    # The crucial assertion: kind stays "idle"; nothing re-wraps it as absolute.
+    assert exc.value.kind == "idle"

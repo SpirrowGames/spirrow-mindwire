@@ -27,17 +27,19 @@ from pathlib import Path
 from spirrow_mindwire.claude_code import (
     SYSTEM_PROMPT,
     InvokeResult,
+    InvokeTimeoutError,
     build_mindwire_mcp_server,
     build_thread_prompt,
     invoke_claude_code,
 )
 from spirrow_mindwire.filesystem import EventLogWriter, ThreadDirLayout
-from spirrow_mindwire.lifecycle import TERMINAL_STATES
+from spirrow_mindwire.lifecycle import TERMINAL_STATES, bump_retry_count, transition_state
 from spirrow_mindwire.phanthand import PhanthandClient
 from spirrow_mindwire.schema import (
     ClaudeCodeInvokeEnd,
     ClaudeCodeInvokeStart,
     Participant,
+    ThreadStatusChanged,
 )
 from spirrow_mindwire.ulid_util import new_ulid
 
@@ -72,12 +74,23 @@ class ThreadDispatcher:
         dedup: DedupCache,
         max_concurrent: int = 4,
         invoker: SdkInvoker | None = None,
+        idle_timeout_seconds: float | None = None,
+        absolute_timeout_seconds: float | None = None,
     ) -> None:
         self._base_dir = base_dir
         self._phanthand_client = phanthand_client
         self._dedup = dedup
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._invoker: SdkInvoker = invoker or invoke_claude_code
+        # Feature 2 sub-PR 2: SDK invocation timeouts. ``None`` keeps the
+        # pre-Feature-2 behavior (no timeout); the watcher entry point
+        # (``run_watcher``) passes the values from
+        # :class:`spirrow_mindwire.config.WatcherConfig` so these are
+        # always set in production. Tests instantiate the dispatcher
+        # directly with ``None`` to keep most cases free of timing
+        # noise; the timeout-specific tests pass real values.
+        self._idle_timeout_seconds = idle_timeout_seconds
+        self._absolute_timeout_seconds = absolute_timeout_seconds
         # Per-thread serialization: architecture.md §4.0 requires that a
         # single thread never run two invocations concurrently. Without
         # this, two events landing close together (e.g. seq=1 then seq=2)
@@ -173,7 +186,62 @@ class ThreadDispatcher:
                 system_prompt=SYSTEM_PROMPT,
                 mcp_servers={"mindwire": mcp_server},
                 allowed_tools=_ALLOWED_MINDWIRE_TOOLS,
+                idle_timeout_seconds=self._idle_timeout_seconds,
+                absolute_timeout_seconds=self._absolute_timeout_seconds,
             )
+        except InvokeTimeoutError as exc:
+            # Feature 2 sub-PR 2: timeout advances the retry counter.
+            # Two source statuses are possible here:
+            # - ``active``: first failure → transition active → retrying
+            #   (logs ``ThreadStatusChanged``).
+            # - ``retrying``: thread was requeued by ``startup_scan`` after a
+            #   prior timeout → ``retrying → retrying`` is forbidden by
+            #   ``_ALLOWED_TRANSITIONS``; bump only ``retry_count`` via
+            #   :func:`lifecycle.bump_retry_count` (no ``ThreadStatusChanged``).
+            # The actual retry loop (re-invoking the thread) is sub-PR 3
+            # territory — for now, the watcher just records the new state
+            # and returns, leaving the next live event / startup_scan to
+            # pick the thread back up.
+            log.append(
+                ClaudeCodeInvokeEnd(
+                    schema_version=1,
+                    event_id=new_ulid(),
+                    ts=datetime.now(UTC),
+                    thread_id=event.thread_id,
+                    msg_seq=latest.seq,
+                    duration_ms=round(exc.elapsed_seconds * 1000),
+                    exit_code=1,
+                )
+            )
+            if meta.status == "active":
+                transition_state(
+                    layout,
+                    "retrying",
+                    awaiting_from=meta.awaiting_from,
+                    retry_count=meta.retry_count + 1,
+                )
+                log.append(
+                    ThreadStatusChanged(
+                        schema_version=1,
+                        event_id=new_ulid(),
+                        ts=datetime.now(UTC),
+                        thread_id=event.thread_id,
+                        from_status="active",
+                        to_status="retrying",
+                    )
+                )
+            else:  # already "retrying"
+                bump_retry_count(layout)
+                # No ``ThreadStatusChanged`` — status is unchanged.
+            logger.info(
+                "thread %s timed out (%s, %.1fs); retry_count=%d (status=%s)",
+                event.thread_id,
+                exc.kind,
+                exc.elapsed_seconds,
+                meta.retry_count + 1,
+                "retrying",
+            )
+            return
         except Exception:
             log.append(
                 ClaudeCodeInvokeEnd(

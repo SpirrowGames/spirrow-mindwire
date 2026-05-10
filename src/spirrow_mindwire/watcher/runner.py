@@ -77,6 +77,8 @@ async def run_watcher(settings: MindwireSettings, *, api_key: str | None) -> Non
             phanthand_client=phanthand,
             dedup=dedup,
             max_concurrent=settings.watcher.max_concurrent_threads,
+            idle_timeout_seconds=settings.watcher.idle_timeout_seconds,
+            absolute_timeout_seconds=settings.watcher.absolute_timeout_seconds,
         )
 
         observer.start()
