@@ -33,7 +33,7 @@ from spirrow_mindwire.claude_code import (
     invoke_claude_code,
 )
 from spirrow_mindwire.filesystem import EventLogWriter, ThreadDirLayout
-from spirrow_mindwire.lifecycle import TERMINAL_STATES, transition_state
+from spirrow_mindwire.lifecycle import TERMINAL_STATES, bump_retry_count, transition_state
 from spirrow_mindwire.phanthand import PhanthandClient
 from spirrow_mindwire.schema import (
     ClaudeCodeInvokeEnd,
@@ -190,11 +190,18 @@ class ThreadDispatcher:
                 absolute_timeout_seconds=self._absolute_timeout_seconds,
             )
         except InvokeTimeoutError as exc:
-            # Feature 2 sub-PR 2: timeout transitions ``active → retrying``.
-            # Retry counter is bumped here; the actual retry loop (re-invoking
-            # the thread) is sub-PR 3 territory — for now, the watcher just
-            # records the new state and returns, leaving the next live event
-            # / startup_scan to pick the thread back up.
+            # Feature 2 sub-PR 2: timeout advances the retry counter.
+            # Two source statuses are possible here:
+            # - ``active``: first failure → transition active → retrying
+            #   (logs ``ThreadStatusChanged``).
+            # - ``retrying``: thread was requeued by ``startup_scan`` after a
+            #   prior timeout → ``retrying → retrying`` is forbidden by
+            #   ``_ALLOWED_TRANSITIONS``; bump only ``retry_count`` via
+            #   :func:`lifecycle.bump_retry_count` (no ``ThreadStatusChanged``).
+            # The actual retry loop (re-invoking the thread) is sub-PR 3
+            # territory — for now, the watcher just records the new state
+            # and returns, leaving the next live event / startup_scan to
+            # pick the thread back up.
             log.append(
                 ClaudeCodeInvokeEnd(
                     schema_version=1,
@@ -202,32 +209,37 @@ class ThreadDispatcher:
                     ts=datetime.now(UTC),
                     thread_id=event.thread_id,
                     msg_seq=latest.seq,
-                    duration_ms=int(exc.elapsed_seconds * 1000),
+                    duration_ms=round(exc.elapsed_seconds * 1000),
                     exit_code=1,
                 )
             )
-            transition_state(
-                layout,
-                "retrying",
-                awaiting_from=meta.awaiting_from,
-                retry_count=meta.retry_count + 1,
-            )
-            log.append(
-                ThreadStatusChanged(
-                    schema_version=1,
-                    event_id=new_ulid(),
-                    ts=datetime.now(UTC),
-                    thread_id=event.thread_id,
-                    from_status=meta.status,
-                    to_status="retrying",
+            if meta.status == "active":
+                transition_state(
+                    layout,
+                    "retrying",
+                    awaiting_from=meta.awaiting_from,
+                    retry_count=meta.retry_count + 1,
                 )
-            )
+                log.append(
+                    ThreadStatusChanged(
+                        schema_version=1,
+                        event_id=new_ulid(),
+                        ts=datetime.now(UTC),
+                        thread_id=event.thread_id,
+                        from_status="active",
+                        to_status="retrying",
+                    )
+                )
+            else:  # already "retrying"
+                bump_retry_count(layout)
+                # No ``ThreadStatusChanged`` — status is unchanged.
             logger.info(
-                "thread %s timed out (%s, %.1fs); transitioned to retrying (retry_count=%d)",
+                "thread %s timed out (%s, %.1fs); retry_count=%d (status=%s)",
                 event.thread_id,
                 exc.kind,
                 exc.elapsed_seconds,
                 meta.retry_count + 1,
+                "retrying",
             )
             return
         except Exception:

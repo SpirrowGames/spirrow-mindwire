@@ -22,6 +22,7 @@ from spirrow_mindwire.filesystem import ThreadDirLayout
 from spirrow_mindwire.lifecycle import (
     TERMINAL_STATES,
     InvalidTransitionError,
+    bump_retry_count,
     transition_state,
 )
 from spirrow_mindwire.schema import ThreadMeta, ThreadStatus
@@ -254,3 +255,35 @@ def test_transition_state_rejects_none_awaiting_from_for_non_terminal(
     _seed_meta(layout, status="retrying", awaiting_from="claude-code")
     with pytest.raises(ValueError, match="must be a Participant for non-terminal"):
         transition_state(layout, "active", awaiting_from=None)  # invalid
+
+
+# ----- Feature 2 sub-PR 2 review: lifecycle.bump_retry_count ----------------
+
+
+def test_bump_retry_count_increments_without_status_change(
+    layout: ThreadDirLayout,
+) -> None:
+    """``bump_retry_count`` advances ``retry_count`` only; status / awaiting_from
+    / terminated_* are preserved (= the retrying → retrying self-loop work-around
+    used by the dispatcher when a timeout fires on an already-retrying thread)."""
+    _seed_meta(layout, status="retrying", awaiting_from="claude-code", retry_count=2)
+
+    new_meta = bump_retry_count(layout)
+
+    assert new_meta.status == "retrying"  # unchanged
+    assert new_meta.awaiting_from == "claude-code"  # unchanged
+    assert new_meta.retry_count == 3  # +1
+
+
+def test_bump_retry_count_rejects_terminal_state(layout: ThreadDirLayout) -> None:
+    """``bump_retry_count`` makes no sense in terminal states (terminated /
+    resolved / archived) — caller bug detection via ``ValueError``."""
+    _seed_meta(
+        layout,
+        status="terminated",
+        awaiting_from=None,
+        terminated_reason="retry-exhausted",
+        terminated_at="2026-05-07T08:43:07Z",
+    )
+    with pytest.raises(ValueError, match="terminal status"):
+        bump_retry_count(layout)

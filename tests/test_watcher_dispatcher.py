@@ -17,6 +17,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 from factories import seed_thread_meta, write_message_file
 
 from spirrow_mindwire.claude_code import InvokeResult, InvokeTimeoutError
@@ -336,7 +337,7 @@ async def test_dispatcher_timeout_transitions_active_to_retrying(
 
     # Meta が retrying に遷移、 retry_count が +1、 awaiting_from は preserve.
     new_meta = ThreadMeta.model_validate(
-        __import__("yaml").safe_load(layout.meta_path.read_text(encoding="utf-8"))
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
     )
     assert new_meta.status == "retrying"
     assert new_meta.retry_count == 1
@@ -376,9 +377,50 @@ async def test_dispatcher_timeout_increments_retry_count_from_existing(
     await dispatcher.handle(_event())
 
     new_meta = ThreadMeta.model_validate(
-        __import__("yaml").safe_load(layout.meta_path.read_text(encoding="utf-8"))
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
     )
     assert new_meta.retry_count == 3  # 2 + 1
+
+
+@pytest.mark.anyio
+async def test_dispatcher_timeout_from_retrying_status_bumps_retry_count(
+    tmp_path: Path,
+) -> None:
+    """retrying status の thread で timeout fire → retry_count +1、 status 不変、
+    ThreadStatusChanged event は append されない (= self-loop 回避 path).
+
+    sub-PR 1 で merged された ``startup_full_scan`` が retrying thread を
+    requeue するため、 dispatcher の ``_run_thread`` が ``meta.status ==
+    "retrying"`` で呼ばれる scenario が production 上で実際に発生する。
+    ``retrying → retrying`` は ``_ALLOWED_TRANSITIONS`` で禁止されているため、
+    通常の ``transition_state`` は ``InvalidTransitionError`` を raise する。
+    本 test は ``lifecycle.bump_retry_count`` 経由で status 不変のまま
+    retry_count が advance することを確認する。
+    """
+    layout = ThreadDirLayout(base_dir=tmp_path, thread_id=ULID_A)
+    seed_thread_meta(layout, status="retrying", awaiting_from="claude-code", retry_count=1)
+    write_message_file(layout, 1, "claude.ai", atomic=False)
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_timeout_invoker("idle", elapsed_seconds=0.5),
+    )
+
+    # Must not raise InvalidTransitionError.
+    await dispatcher.handle(_event())
+
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "retrying"  # unchanged (bump path, no transition)
+    assert new_meta.retry_count == 2  # +1 from seeded 1
+
+    # Event log: InvokeStart + InvokeEnd only — no ThreadStatusChanged for self-loop.
+    log_lines = layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    types = [json.loads(line)["type"] for line in log_lines]
+    assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
 
 
 @pytest.mark.anyio
@@ -403,7 +445,7 @@ async def test_dispatcher_timeout_dedups_subsequent_event_within_ttl(
     # 1 回目: timeout fire → active → retrying.
     await dispatcher.handle(_event(seq=1, when=NOW))
     meta_after_first = ThreadMeta.model_validate(
-        __import__("yaml").safe_load(layout.meta_path.read_text(encoding="utf-8"))
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
     )
     assert meta_after_first.status == "retrying"
     assert meta_after_first.retry_count == 1
@@ -412,7 +454,7 @@ async def test_dispatcher_timeout_dedups_subsequent_event_within_ttl(
     # invoker は再呼出されない (= retry_count は 1 のまま)。
     await dispatcher.handle(_event(seq=1, when=NOW + timedelta(seconds=2)))
     meta_after_second = ThreadMeta.model_validate(
-        __import__("yaml").safe_load(layout.meta_path.read_text(encoding="utf-8"))
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
     )
     assert meta_after_second.retry_count == 1  # 再呼出されない
 

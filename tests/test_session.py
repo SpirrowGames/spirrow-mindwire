@@ -267,3 +267,35 @@ async def test_invoke_no_timeout_default_preserves_existing_behavior(
     )
     # No timeout-related kwargs, no timeout fires.
     assert out.text_output == "hello"
+
+
+@pytest.mark.anyio
+async def test_invoke_idle_propagates_unchanged_when_both_timeouts_set(
+    tmp_path: Path,
+) -> None:
+    """idle + absolute 両 set 時、 idle が先 fire したら kind="idle" のまま propagate.
+
+    Without the explicit ``except InvokeTimeoutError: raise`` ahead of the
+    outer ``except TimeoutError``, the outer wait_for catches the inner
+    InvokeTimeoutError (subclass match) and re-wraps it as kind="absolute".
+    This regression test covers that idle classification survives both-set.
+    """
+
+    async def slow_first_message(
+        *, prompt: str, options: ClaudeAgentOptions
+    ) -> AsyncIterator[SdkMessage]:
+        # Sleep > idle threshold but < absolute threshold → idle fires first.
+        await asyncio.sleep(10.0)
+        yield _result()
+
+    with pytest.raises(InvokeTimeoutError) as exc:
+        await invoke_claude_code(
+            prompt="x",
+            cwd=tmp_path,
+            system_prompt="role",
+            runner=slow_first_message,
+            idle_timeout_seconds=0.05,
+            absolute_timeout_seconds=5.0,  # comfortably larger than idle
+        )
+    # The crucial assertion: kind stays "idle"; nothing re-wraps it as absolute.
+    assert exc.value.kind == "idle"

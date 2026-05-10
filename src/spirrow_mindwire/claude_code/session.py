@@ -65,10 +65,19 @@ class InvokeTimeoutError(asyncio.TimeoutError):
     """Raised by :func:`invoke_claude_code` when a timeout fires.
 
     Subclasses :class:`asyncio.TimeoutError` so naive callers using
-    ``except asyncio.TimeoutError`` still catch it; the watcher catches
-    this specific class to distinguish ``kind`` (``"idle"`` vs
-    ``"absolute"``) and to read ``elapsed_seconds`` for event-log
+    ``except asyncio.TimeoutError`` (or ``except TimeoutError`` —
+    these are aliased in Python 3.11+) still catch it. The watcher
+    catches this specific class to distinguish ``kind`` (``"idle"``
+    vs ``"absolute"``) and to read ``elapsed_seconds`` for event-log
     entries.
+
+    NOTE: This subclass relationship interacts with ``except`` clauses
+    inside :func:`invoke_claude_code` itself: the outer
+    ``asyncio.wait_for`` for absolute timeout would otherwise re-catch
+    an idle ``InvokeTimeoutError`` raised by the inner ``_drain``
+    (Python ``except`` matches subclasses). The implementation
+    explicitly re-raises ``InvokeTimeoutError`` before catching the
+    broader ``TimeoutError`` so idle timeouts propagate unchanged.
     """
 
     def __init__(self, kind: TimeoutKind, elapsed_seconds: float) -> None:
@@ -189,11 +198,14 @@ async def invoke_claude_code(
         return await _drain()
     try:
         return await asyncio.wait_for(_drain(), timeout=absolute_timeout_seconds)
+    except InvokeTimeoutError:
+        # Inner ``_drain`` raised an idle (or any future kind of)
+        # ``InvokeTimeoutError``; propagate as-is. Without this explicit
+        # re-raise, the broader ``except TimeoutError`` below would
+        # match the subclass and incorrectly re-wrap the idle timeout
+        # as kind="absolute" (Python ``except`` matches subclasses).
+        raise
     except TimeoutError as exc:
-        # The inner ``_drain`` may already have raised InvokeTimeoutError
-        # (= idle); re-raising the outer ``asyncio.TimeoutError`` would
-        # mask that. ``except`` matches subclasses, so an ``InvokeTimeoutError``
-        # short-circuits before this branch and propagates as-is.
         raise InvokeTimeoutError("absolute", time.monotonic() - started) from exc
 
 
