@@ -32,6 +32,7 @@ from spirrow_mindwire.claude_code import (
     invoke_claude_code,
 )
 from spirrow_mindwire.filesystem import EventLogWriter, ThreadDirLayout
+from spirrow_mindwire.lifecycle import TERMINAL_STATES
 from spirrow_mindwire.phanthand import PhanthandClient
 from spirrow_mindwire.schema import (
     ClaudeCodeInvokeEnd,
@@ -116,7 +117,7 @@ class ThreadDispatcher:
         # Feature 2: terminal states are never auto-revived (docs §3.6).
         # Operator manual transitions go through meta.yaml edits; until
         # status is set back to active by the operator, skip the event.
-        if meta.status in {"terminated", "resolved", "archived"}:
+        if meta.status in TERMINAL_STATES:
             logger.info(
                 "thread %s is in terminal state %s; skipping event",
                 event.thread_id,

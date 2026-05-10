@@ -19,7 +19,11 @@ import pytest
 import yaml
 
 from spirrow_mindwire.filesystem import ThreadDirLayout
-from spirrow_mindwire.lifecycle import InvalidTransitionError, transition_state
+from spirrow_mindwire.lifecycle import (
+    TERMINAL_STATES,
+    InvalidTransitionError,
+    transition_state,
+)
 from spirrow_mindwire.schema import ThreadMeta, ThreadStatus
 
 ULID_A = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -50,10 +54,13 @@ _FORBIDDEN: list[tuple[ThreadStatus, ThreadStatus]] = [
     ("active", "archived"),  # skip-resolved forbidden
     ("retrying", "resolved"),  # Naysayer reversal of claude.ai proposal
     ("retrying", "archived"),
-    ("active", "active"),  # identity not allowed
+    # Identity transitions (no ThreadStatus self-loops in _ALLOWED_TRANSITIONS).
+    ("active", "active"),
+    ("retrying", "retrying"),
+    ("terminated", "terminated"),
+    ("resolved", "resolved"),
+    ("archived", "archived"),
 ]
-
-_TERMINAL_STATES: set[ThreadStatus] = {"terminated", "resolved", "archived"}
 
 # Per docs/feature-2-design.md §3.3, terminated has two distinct entry
 # points with different reasons:
@@ -99,7 +106,7 @@ def test_allowed_transitions_pass(
     _seed_meta(
         layout,
         status=old,
-        awaiting_from=None if old in _TERMINAL_STATES else "claude-code",
+        awaiting_from=None if old in TERMINAL_STATES else "claude-code",
     )
     extra: dict[str, Any] = {}
     if new == "terminated":
@@ -109,7 +116,7 @@ def test_allowed_transitions_pass(
     new_meta = transition_state(
         layout,
         new,
-        awaiting_from=None if new in _TERMINAL_STATES else "claude.ai",
+        awaiting_from=None if new in TERMINAL_STATES else "claude.ai",
         **extra,
     )
     assert new_meta.status == new
@@ -122,7 +129,7 @@ def test_forbidden_transitions_raise(
     _seed_meta(
         layout,
         status=old,
-        awaiting_from=None if old in _TERMINAL_STATES else "claude-code",
+        awaiting_from=None if old in TERMINAL_STATES else "claude-code",
     )
     extra: dict[str, Any] = {}
     if new == "terminated":
@@ -133,7 +140,7 @@ def test_forbidden_transitions_raise(
         transition_state(
             layout,
             new,
-            awaiting_from=None if new in _TERMINAL_STATES else "claude.ai",
+            awaiting_from=None if new in TERMINAL_STATES else "claude.ai",
             **extra,
         )
     assert exc.value.old == old

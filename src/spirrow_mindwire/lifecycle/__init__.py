@@ -13,6 +13,16 @@ Forbidden transitions raise :class:`InvalidTransitionError`.
 
 from __future__ import annotations
 
-from .transitions import InvalidTransitionError, transition_state
+from .transitions import (
+    REQUEUE_STATES,
+    TERMINAL_STATES,
+    InvalidTransitionError,
+    transition_state,
+)
 
-__all__ = ["InvalidTransitionError", "transition_state"]
+__all__ = [
+    "REQUEUE_STATES",
+    "TERMINAL_STATES",
+    "InvalidTransitionError",
+    "transition_state",
+]

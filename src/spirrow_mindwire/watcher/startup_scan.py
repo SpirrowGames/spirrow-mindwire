@@ -27,16 +27,12 @@ from pathlib import Path
 import yaml
 
 from spirrow_mindwire.filesystem import ThreadDirLayout
-from spirrow_mindwire.schema import ThreadStatus
+from spirrow_mindwire.lifecycle import REQUEUE_STATES
 
 from .events import ThreadEvent
 from .loader import load_messages, load_thread_meta
 
 logger = logging.getLogger(__name__)
-
-# States that should be re-queued at startup. The dispatcher decides
-# downstream behavior (e.g. retry counter handling for ``retrying``).
-_REQUEUE_STATES: set[ThreadStatus] = {"active", "retrying"}
 
 
 def startup_full_scan(
@@ -52,8 +48,8 @@ def startup_full_scan(
     1. Skip if the directory name isn't a valid ULID (e.g.
        ``.staging-<ULID>/``).
     2. Skip if ``meta.yaml`` fails to parse / validate (logged at WARNING).
-    3. If ``meta.status`` is in :data:`_REQUEUE_STATES` and the thread
-       has at least one message, enqueue a synthetic
+    3. If ``meta.status`` is in :data:`spirrow_mindwire.lifecycle.REQUEUE_STATES`
+       and the thread has at least one message, enqueue a synthetic
        :class:`ThreadEvent` for the latest message.
     4. Otherwise log at INFO (terminal-state skip) or WARNING (no
        messages but non-terminal status) and move on.
@@ -97,7 +93,7 @@ def startup_full_scan(
             )
             continue
 
-        if meta.status not in _REQUEUE_STATES:
+        if meta.status not in REQUEUE_STATES:
             logger.info(
                 "startup_scan: skipping %s (status=%s, terminal)",
                 thread_dir.name,

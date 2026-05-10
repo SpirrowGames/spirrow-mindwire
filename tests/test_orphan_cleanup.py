@@ -173,3 +173,25 @@ def test_unlink_failure_continues(
     assert p1.exists()  # failed unlink leaves it
     assert not p2.exists()
     assert any("unlink failed" in record.message for record in caplog.records)
+
+
+def test_staging_dir_orphan_tmp_is_preserved(tmp_path: Path) -> None:
+    """``.staging-<ULID>/messages/*.tmp`` must NOT be touched.
+
+    Staging dirs hold incomplete-thread state being assembled atomically
+    (see thread_dir.py). Without the dot-prefix filter, ``Path.glob``
+    would match dot-prefix dir names (Python's glob doesn't auto-skip
+    dotfiles unlike POSIX shell), and we'd race with the in-progress
+    staging logic.
+    """
+    threads_root = tmp_path / "threads"
+    now = 10_000.0
+    msgs = threads_root / f".staging-{ULID_A}" / "messages"
+    msgs.mkdir(parents=True)
+    staging_tmp = msgs / "001-from-cai.md.tmp"
+    staging_tmp.write_text("staging-in-progress")
+    _set_mtime(staging_tmp, now - 1000.0)  # would be deleted without filter
+
+    deleted = cleanup_orphan_tmp(threads_root, age_threshold_seconds=300.0, now_seconds=now)
+    assert deleted == 0
+    assert staging_tmp.exists()

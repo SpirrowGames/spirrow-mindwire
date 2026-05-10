@@ -62,6 +62,12 @@ def cleanup_orphan_tmp(
 
     deleted = 0
     for tmp_path in threads_root.glob("*/messages/*.tmp"):
+        # Skip dot-prefix dirs (e.g. ``.staging-<ULID>/`` — incomplete
+        # threads being assembled atomically; see thread_dir.py). Without
+        # this filter, ``Path.glob`` would match ``.staging-<ULID>/messages/*.tmp``
+        # and we'd race with the in-progress staging logic.
+        if tmp_path.parent.parent.name.startswith("."):
+            continue
         try:
             mtime = tmp_path.stat().st_mtime
         except OSError:

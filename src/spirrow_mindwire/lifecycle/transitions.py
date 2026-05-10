@@ -47,16 +47,24 @@ thread). ``retrying → resolved`` is intentionally not allowed in
 Phase 0 (Naysayer reversal of an early claude.ai proposal).
 """
 
-_TERMINAL_STATES_FOR_AWAITING: set[ThreadStatus] = {
-    "terminated",
-    "resolved",
-    "archived",
-}
-"""Terminal states where ``awaiting_from`` must be ``None``.
+TERMINAL_STATES: frozenset[ThreadStatus] = frozenset({"terminated", "resolved", "archived"})
+"""States that cannot transition further automatically.
 
-Distinct from "terminal in transition graph" (``archived`` is the only
-strict terminal there); here we mean "no participant is expected to
-respond" — see ``docs/feature-2-design.md`` §3.1.
+- Operator manual transitions only (see ``docs/feature-2-design.md`` §3.6).
+- ``awaiting_from`` MUST be ``None`` while in any of these states
+  (``transition_state`` enforces this; see also ``ThreadMeta.awaiting_from``).
+- ``startup_full_scan`` skips threads in these states (no auto-revival).
+- ``ThreadDispatcher._run_thread`` short-circuits on these states.
+
+Note: distinct from "terminal in transition graph" — ``archived`` is the
+only strict graph terminal (no outgoing transitions in
+:data:`_ALLOWED_TRANSITIONS`).
+"""
+
+REQUEUE_STATES: frozenset[ThreadStatus] = frozenset({"active", "retrying"})
+"""States that ``startup_full_scan`` re-queues for dispatcher resumption.
+
+The complement of :data:`TERMINAL_STATES` within :data:`ThreadStatus`.
 """
 
 
@@ -94,18 +102,32 @@ def transition_state(
     the updated meta.yaml via :func:`atomic_write_text`. ``updated_at``
     is set to ``datetime.now(UTC)``.
 
+    NOTE: "Atomically" here refers to the meta.yaml WRITE step
+    (``atomic_write_text`` = tmp + os.replace). The full read-modify-
+    write is NOT serializable: an operator manual edit between the
+    read (line 1) and the write (last line) may be silently overwritten.
+    This is the Phase 0 race-acceptance contract documented in
+    ``docs/feature-2-design.md`` §3.6 ("operator should stop the
+    watcher before manual edits"). Multi-process / transactional write
+    is queued for a later Phase (FI-2).
+
     Args:
         layout: ThreadDirLayout pointing to the thread's directory.
         new_status: target ThreadStatus.
-        awaiting_from: new ``awaiting_from`` value. ``None`` for terminal
-            states (``terminated`` / ``resolved`` / ``archived``).
-        terminated_reason: required when entering ``terminated`` state.
-            Ignored (and preserved from the existing meta as audit trail)
-            for non-terminated transitions.
-        terminated_at: timestamp of terminated entry. Defaults to
-            ``datetime.now(UTC)`` when ``new_status='terminated'`` and
-            not explicitly provided. Ignored for non-terminated
-            transitions (existing value preserved as audit trail).
+        awaiting_from: new ``awaiting_from`` value. **Must be ``None``**
+            for states in :data:`TERMINAL_STATES` (``terminated`` /
+            ``resolved`` / ``archived``); **must be a non-``None``
+            Participant** otherwise. Mismatches raise ``ValueError``.
+        terminated_reason: only meaningful when
+            ``new_status == 'terminated'`` (where it is required).
+            For non-terminated transitions, any value passed here is
+            silently discarded; the existing ``terminated_reason``
+            from old meta (if any, audit trail) is preserved.
+        terminated_at: only meaningful when ``new_status == 'terminated'``;
+            defaults to the same ``now`` instant used for ``updated_at``
+            if not explicitly provided. For non-terminated transitions,
+            any value passed here is silently discarded; the existing
+            ``terminated_at`` from old meta (audit trail) is preserved.
         retry_count: optional new ``retry_count`` value. ``None``
             preserves the existing value.
 
@@ -120,7 +142,7 @@ def transition_state(
             ``new_status`` (terminal states require ``None``;
             non-terminal states require a non-``None`` Participant).
     """
-    if new_status in _TERMINAL_STATES_FOR_AWAITING:
+    if new_status in TERMINAL_STATES:
         if awaiting_from is not None:
             raise ValueError(
                 f"awaiting_from must be None for terminal state {new_status!r}, "
@@ -133,6 +155,12 @@ def transition_state(
                 f"{new_status!r}, got None"
             )
 
+    # Inline meta read (semantically equivalent to
+    # ``spirrow_mindwire.watcher.loader.load_thread_meta``). Duplicated
+    # here to keep the lifecycle layer free of a watcher dependency
+    # (lifecycle is lower in the layering than watcher). Promoting
+    # ``load_thread_meta`` into ``filesystem/`` so both layers can share
+    # it is a follow-up clean-up tracked separately, not in scope here.
     old_meta_text = layout.meta_path.read_text(encoding="utf-8")
     old_meta = ThreadMeta.model_validate(yaml.safe_load(old_meta_text))
 
