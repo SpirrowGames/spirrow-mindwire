@@ -47,6 +47,18 @@ thread). ``retrying → resolved`` is intentionally not allowed in
 Phase 0 (Naysayer reversal of an early claude.ai proposal).
 """
 
+_TERMINAL_STATES_FOR_AWAITING: set[ThreadStatus] = {
+    "terminated",
+    "resolved",
+    "archived",
+}
+"""Terminal states where ``awaiting_from`` must be ``None``.
+
+Distinct from "terminal in transition graph" (``archived`` is the only
+strict terminal there); here we mean "no participant is expected to
+respond" — see ``docs/feature-2-design.md`` §3.1.
+"""
+
 
 class InvalidTransitionError(ValueError):
     """Raised when a ThreadStatus transition violates :data:`_ALLOWED_TRANSITIONS`."""
@@ -104,8 +116,23 @@ def transition_state(
         InvalidTransitionError: if ``(old.status, new_status)`` violates
             :data:`_ALLOWED_TRANSITIONS`.
         ValueError: if ``new_status='terminated'`` but ``terminated_reason``
-            is ``None``.
+            is ``None``; or if ``awaiting_from`` does not match
+            ``new_status`` (terminal states require ``None``;
+            non-terminal states require a non-``None`` Participant).
     """
+    if new_status in _TERMINAL_STATES_FOR_AWAITING:
+        if awaiting_from is not None:
+            raise ValueError(
+                f"awaiting_from must be None for terminal state {new_status!r}, "
+                f"got {awaiting_from!r}"
+            )
+    else:
+        if awaiting_from is None:
+            raise ValueError(
+                f"awaiting_from must be a Participant for non-terminal state "
+                f"{new_status!r}, got None"
+            )
+
     old_meta_text = layout.meta_path.read_text(encoding="utf-8")
     old_meta = ThreadMeta.model_validate(yaml.safe_load(old_meta_text))
 

@@ -5,10 +5,16 @@ the asyncio queue, and forwards each :class:`ThreadEvent` to the
 dispatcher. ``Ctrl+C`` cancels the consumer task and stops the
 observer cleanly.
 
-Feature 2 sub-PR 1 adds orphan ``.tmp`` cleanup at startup
-(see :mod:`spirrow_mindwire.watcher.orphan_cleanup`). Further
-robustness (timeout, retry, terminate, state-based status scan) is
-queued for sub-PR 2 / 3 / 4.
+Feature 2 sub-PR 1 adds two startup hooks before the queue loop:
+
+- :func:`spirrow_mindwire.watcher.orphan_cleanup.cleanup_orphan_tmp` —
+  delete ``messages/*.tmp`` files older than the age threshold.
+- :func:`spirrow_mindwire.watcher.startup_scan.startup_full_scan` —
+  enqueue synthetic :class:`ThreadEvent` for ``active`` / ``retrying``
+  threads so the dispatcher picks them up after a restart.
+
+Further robustness (timeout, retry, terminate) is queued for sub-PR
+2 / 3 / 4.
 """
 
 from __future__ import annotations

@@ -55,6 +55,15 @@ _FORBIDDEN: list[tuple[ThreadStatus, ThreadStatus]] = [
 
 _TERMINAL_STATES: set[ThreadStatus] = {"terminated", "resolved", "archived"}
 
+# Per docs/feature-2-design.md §3.3, terminated has two distinct entry
+# points with different reasons:
+# - active → terminated: validation-failed (schema-level error)
+# - retrying → terminated: retry-exhausted (transient error exhausted)
+_REASON_FOR_TERMINATED: dict[ThreadStatus, str] = {
+    "active": "validation-failed",
+    "retrying": "retry-exhausted",
+}
+
 
 def _seed_meta(layout: ThreadDirLayout, **overrides: Any) -> None:
     """Seed meta.yaml directly, bypassing transition_state."""
@@ -94,7 +103,9 @@ def test_allowed_transitions_pass(
     )
     extra: dict[str, Any] = {}
     if new == "terminated":
-        extra["terminated_reason"] = "retry-exhausted"
+        # Use the reason that semantically matches the entry transition
+        # (docs §3.3: active=validation-failed / retrying=retry-exhausted).
+        extra["terminated_reason"] = _REASON_FOR_TERMINATED.get(old, "retry-exhausted")
     new_meta = transition_state(
         layout,
         new,
@@ -115,7 +126,9 @@ def test_forbidden_transitions_raise(
     )
     extra: dict[str, Any] = {}
     if new == "terminated":
-        extra["terminated_reason"] = "retry-exhausted"
+        # Use the reason that semantically matches the entry transition
+        # (docs §3.3: active=validation-failed / retrying=retry-exhausted).
+        extra["terminated_reason"] = _REASON_FOR_TERMINATED.get(old, "retry-exhausted")
     with pytest.raises(InvalidTransitionError) as exc:
         transition_state(
             layout,
@@ -211,3 +224,26 @@ def test_transition_state_retry_count_pass_through(layout: ThreadDirLayout) -> N
 
     m2 = transition_state(layout, "active", awaiting_from="claude.ai", retry_count=3)
     assert m2.retry_count == 3
+
+
+def test_transition_state_rejects_non_none_awaiting_from_for_terminal(
+    layout: ThreadDirLayout,
+) -> None:
+    """Terminal target (terminated/resolved/archived) with non-None awaiting_from raises."""
+    _seed_meta(layout, status="active", awaiting_from="claude-code")
+    with pytest.raises(ValueError, match="must be None for terminal state"):
+        transition_state(
+            layout,
+            "terminated",
+            awaiting_from="claude.ai",  # invalid
+            terminated_reason="validation-failed",
+        )
+
+
+def test_transition_state_rejects_none_awaiting_from_for_non_terminal(
+    layout: ThreadDirLayout,
+) -> None:
+    """Non-terminal target (active/retrying) with None awaiting_from raises."""
+    _seed_meta(layout, status="retrying", awaiting_from="claude-code")
+    with pytest.raises(ValueError, match="must be a Participant for non-terminal"):
+        transition_state(layout, "active", awaiting_from=None)  # invalid

@@ -65,17 +65,22 @@ class ThreadMeta(StrictModel):
     retry_count: int = Field(default=0, ge=0)
     """Cumulative retry attempts for this thread (Feature 2 sub-PR 3)."""
     terminated_reason: TerminatedReason | None = None
-    """Reason for entering ``terminated`` state. ``None`` outside terminated.
+    """Reason for entering ``terminated`` state.
 
-    Preserved across ``terminated → resolved`` / ``terminated →
-    archived`` transitions (audit trail). See
-    ``docs/feature-2-design.md`` §3.4.
+    ``None`` until the thread has ever entered ``terminated``. Once set,
+    **preserved across terminal-out transitions** (``terminated →
+    resolved`` / ``terminated → archived`` / and onward) as an audit
+    trail. So in ``resolved`` / ``archived`` states this field is
+    ``None`` if the thread reached the terminal directly (e.g.
+    ``active → resolved``) and non-``None`` if it transited via
+    ``terminated``. See ``docs/feature-2-design.md`` §3.4.
     """
     terminated_at: UTCDatetime | None = None
-    """Timestamp of transition into ``terminated`` state. ``None`` outside terminated.
+    """Timestamp of transition into ``terminated`` state.
 
-    Preserved across terminal-out transitions (audit trail). See
-    ``docs/feature-2-design.md`` §3.4.
+    Same invariant as :attr:`terminated_reason`: ``None`` until first
+    entry into ``terminated``, then preserved across terminal-out
+    transitions as audit trail. See ``docs/feature-2-design.md`` §3.4.
     """
 
     @field_validator("participants")
