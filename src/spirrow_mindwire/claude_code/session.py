@@ -12,13 +12,34 @@ construction, message-stream draining, result aggregation) and
 nothing else. The watcher is responsible for serializing per-thread
 invocations and for translating :class:`InvokeResult` into event-log
 entries.
+
+Feature 2 sub-PR 2 adds two optional timeouts:
+
+- ``idle_timeout_seconds``: max wait between successive SDK messages.
+  Fires :class:`InvokeTimeoutError` (kind=``"idle"``) if the iterator
+  produces no output for that long.
+- ``absolute_timeout_seconds``: cap on total wall-clock from invoke
+  start. Fires :class:`InvokeTimeoutError` (kind=``"absolute"``).
+
+Both default to ``None`` (= no timeout) so existing callers are
+unchanged. The watcher passes the values from
+:class:`spirrow_mindwire.config.WatcherConfig`.
+
+D-4 (SDK subprocess cleanup on cancellation): the SDK's ``query()``
+``async for`` is presumed to clean up its own subprocess / file
+handles when the iterator is cancelled (= ``GeneratorExit`` propagates
+through the ``async for``). We rely on that contract; observed leaks
+should be filed as a separate issue (see PR #19 D-4 design draft).
 """
 
 from __future__ import annotations
 
+import asyncio
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -36,6 +57,24 @@ from claude_agent_sdk import (
 SdkMessage = (
     UserMessage | AssistantMessage | SystemMessage | ResultMessage | StreamEvent | RateLimitEvent
 )
+
+TimeoutKind = Literal["idle", "absolute"]
+
+
+class InvokeTimeoutError(asyncio.TimeoutError):
+    """Raised by :func:`invoke_claude_code` when a timeout fires.
+
+    Subclasses :class:`asyncio.TimeoutError` so naive callers using
+    ``except asyncio.TimeoutError`` still catch it; the watcher catches
+    this specific class to distinguish ``kind`` (``"idle"`` vs
+    ``"absolute"``) and to read ``elapsed_seconds`` for event-log
+    entries.
+    """
+
+    def __init__(self, kind: TimeoutKind, elapsed_seconds: float) -> None:
+        super().__init__(f"invoke_claude_code: {kind} timeout fired after {elapsed_seconds:.1f}s")
+        self.kind: TimeoutKind = kind
+        self.elapsed_seconds = elapsed_seconds
 
 
 @dataclass(frozen=True)
@@ -61,6 +100,8 @@ async def invoke_claude_code(
     allowed_tools: list[str] | None = None,
     max_turns: int | None = None,
     runner: Callable[..., AsyncIterator[SdkMessage]] | None = None,
+    idle_timeout_seconds: float | None = None,
+    absolute_timeout_seconds: float | None = None,
 ) -> InvokeResult:
     """Run one SDK session to completion and collect the result.
 
@@ -103,31 +144,62 @@ async def invoke_claude_code(
     )
 
     run = runner if runner is not None else query
+    started = time.monotonic()
 
-    raw: list[SdkMessage] = []
-    text_chunks: list[str] = []
-    final: ResultMessage | None = None
+    async def _drain() -> InvokeResult:
+        raw: list[SdkMessage] = []
+        text_chunks: list[str] = []
+        final: ResultMessage | None = None
 
-    async for msg in run(prompt=prompt, options=options):
-        raw.append(msg)
-        if isinstance(msg, AssistantMessage):
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    text_chunks.append(block.text)
-        elif isinstance(msg, ResultMessage):
-            final = msg
+        iterator = run(prompt=prompt, options=options).__aiter__()
+        while True:
+            try:
+                if idle_timeout_seconds is not None:
+                    msg = await asyncio.wait_for(iterator.__anext__(), timeout=idle_timeout_seconds)
+                else:
+                    msg = await iterator.__anext__()
+            except StopAsyncIteration:
+                break
+            except TimeoutError as exc:
+                # ``wait_for`` raises asyncio.TimeoutError with no further
+                # context; rewrap with kind + elapsed for the watcher.
+                raise InvokeTimeoutError("idle", time.monotonic() - started) from exc
 
-    if final is None:
-        raise RuntimeError("SDK session ended without a ResultMessage")
+            raw.append(msg)
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        text_chunks.append(block.text)
+            elif isinstance(msg, ResultMessage):
+                final = msg
 
-    return InvokeResult(
-        is_error=final.is_error,
-        duration_ms=final.duration_ms,
-        text_output="".join(text_chunks),
-        result_text=final.result,
-        stop_reason=final.stop_reason,
-        raw_messages=tuple(raw),
-    )
+        if final is None:
+            raise RuntimeError("SDK session ended without a ResultMessage")
+
+        return InvokeResult(
+            is_error=final.is_error,
+            duration_ms=final.duration_ms,
+            text_output="".join(text_chunks),
+            result_text=final.result,
+            stop_reason=final.stop_reason,
+            raw_messages=tuple(raw),
+        )
+
+    if absolute_timeout_seconds is None:
+        return await _drain()
+    try:
+        return await asyncio.wait_for(_drain(), timeout=absolute_timeout_seconds)
+    except TimeoutError as exc:
+        # The inner ``_drain`` may already have raised InvokeTimeoutError
+        # (= idle); re-raising the outer ``asyncio.TimeoutError`` would
+        # mask that. ``except`` matches subclasses, so an ``InvokeTimeoutError``
+        # short-circuits before this branch and propagates as-is.
+        raise InvokeTimeoutError("absolute", time.monotonic() - started) from exc
 
 
-__all__ = ["InvokeResult", "invoke_claude_code"]
+__all__ = [
+    "InvokeResult",
+    "InvokeTimeoutError",
+    "TimeoutKind",
+    "invoke_claude_code",
+]

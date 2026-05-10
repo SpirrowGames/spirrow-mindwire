@@ -13,13 +13,15 @@ Phase 0 surface:
 from __future__ import annotations
 
 from .prompt import build_thread_prompt
-from .session import InvokeResult, invoke_claude_code
+from .session import InvokeResult, InvokeTimeoutError, TimeoutKind, invoke_claude_code
 from .system_prompt import SYSTEM_PROMPT
 from .tools import build_mindwire_mcp_server, build_mindwire_tools
 
 __all__ = [
     "SYSTEM_PROMPT",
     "InvokeResult",
+    "InvokeTimeoutError",
+    "TimeoutKind",
     "build_mindwire_mcp_server",
     "build_mindwire_tools",
     "build_thread_prompt",
