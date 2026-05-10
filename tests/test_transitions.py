@@ -165,6 +165,9 @@ def test_transition_state_sets_terminated_fields_on_entry(
     assert new_meta.terminated_reason == "retry-exhausted"
     assert new_meta.terminated_at is not None
     assert before <= new_meta.terminated_at <= after
+    # Single-now invariant: updated_at and terminated_at must share the
+    # same instant within one atomic transition (no second now() drift).
+    assert new_meta.updated_at == new_meta.terminated_at
 
 
 def test_transition_state_preserves_terminated_fields_on_terminal_out(

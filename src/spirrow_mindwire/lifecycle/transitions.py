@@ -111,10 +111,16 @@ def transition_state(
 
     _validate_transition(old_meta.status, new_status)
 
+    # Single ``now`` shared between ``updated_at`` and (if applicable)
+    # ``terminated_at`` so a single atomic transition produces a single
+    # consistent timestamp on disk (= same instant for the meta write
+    # and the terminated marker, no second call drift).
+    now = datetime.now(UTC)
+
     update: dict[str, Any] = {
         "status": new_status,
         "awaiting_from": awaiting_from,
-        "updated_at": datetime.now(UTC),
+        "updated_at": now,
     }
     if retry_count is not None:
         update["retry_count"] = retry_count
@@ -123,7 +129,7 @@ def transition_state(
         if terminated_reason is None:
             raise ValueError("terminated_reason is required when transitioning to 'terminated'")
         update["terminated_reason"] = terminated_reason
-        update["terminated_at"] = terminated_at if terminated_at is not None else datetime.now(UTC)
+        update["terminated_at"] = terminated_at if terminated_at is not None else now
     # Otherwise preserve existing terminated_reason / terminated_at as
     # audit trail (Decide #3b-2、 docs §3.4 terminal-out preservation).
 
