@@ -296,3 +296,49 @@ async def test_dispatcher_propagates_is_error_to_event_log(tmp_path: Path) -> No
     end = json.loads(log_lines[-1])
     assert end["exit_code"] == 1
     assert end["duration_ms"] == 50
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("status", "extra"),
+    [
+        (
+            "terminated",
+            {
+                "terminated_reason": "retry-exhausted",
+                "terminated_at": "2026-05-07T08:43:07Z",
+            },
+        ),
+        ("resolved", {}),
+        ("archived", {}),
+    ],
+)
+async def test_dispatcher_skips_terminal_state(
+    tmp_path: Path, status: str, extra: dict[str, Any]
+) -> None:
+    """Terminal-state threads must not auto-revive on live observer events.
+
+    Complements ``test_startup_scan.py::test_terminal_states_are_skipped``
+    (which covers the startup-scan path). This test exercises the
+    dispatcher's own ``meta.status in TERMINAL_STATES`` guard for events
+    that bypass startup_scan (e.g. operator wrote a message file after
+    terminating the thread, or the live observer got a delayed event).
+    """
+    layout = ThreadDirLayout(base_dir=tmp_path, thread_id=ULID_A)
+    seed_thread_meta(layout, status=status, awaiting_from=None, **extra)
+    write_message_file(layout, 1, "claude.ai", atomic=False)
+
+    captured: dict[str, Any] = {}
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_invoker(captured, _ok_result()),
+    )
+
+    await dispatcher.handle(_event())
+
+    # Invoker NOT called: skipped due to terminal status.
+    assert captured == {}
+    # No event log written either (early return is before any log.append).
+    assert not layout.event_log_path.exists()

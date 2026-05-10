@@ -32,6 +32,7 @@ from spirrow_mindwire.claude_code import (
     invoke_claude_code,
 )
 from spirrow_mindwire.filesystem import EventLogWriter, ThreadDirLayout
+from spirrow_mindwire.lifecycle import TERMINAL_STATES
 from spirrow_mindwire.phanthand import PhanthandClient
 from spirrow_mindwire.schema import (
     ClaudeCodeInvokeEnd,
@@ -113,6 +114,16 @@ class ThreadDispatcher:
     async def _run_thread(self, event: ThreadEvent) -> None:
         layout = ThreadDirLayout(base_dir=self._base_dir, thread_id=event.thread_id)
         meta = load_thread_meta(layout)
+        # Feature 2: terminal states are never auto-revived (docs §3.6).
+        # Operator manual transitions go through meta.yaml edits; until
+        # status is set back to active by the operator, skip the event.
+        if meta.status in TERMINAL_STATES:
+            logger.info(
+                "thread %s is in terminal state %s; skipping event",
+                event.thread_id,
+                meta.status,
+            )
+            return
         messages = load_messages(layout)
         if not messages:
             logger.warning("thread %s has no messages on disk; skipping", event.thread_id)

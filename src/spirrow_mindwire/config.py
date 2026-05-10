@@ -102,7 +102,7 @@ class WatcherConfig(_StrictModel):
     retry_backoff_seconds: tuple[float, ...] = (5.0, 30.0, 120.0)
     retry_jitter: float = Field(default=0.2, ge=0, le=1)
     max_retries: int = Field(default=3, ge=0)
-    shutdown_grace_seconds: float = Field(default=60.0, gt=0)
+    orphan_tmp_cleanup_age_seconds: float = Field(default=300.0, gt=0)
 
 
 class ExtraMCPServerConfig(_StrictModel):

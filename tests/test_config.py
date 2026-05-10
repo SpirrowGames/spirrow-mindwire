@@ -49,7 +49,7 @@ def test_defaults_only_when_no_toml_and_no_env(tmp_path: Path) -> None:
     assert s.watcher.absolute_timeout_seconds == 3600.0
     assert s.watcher.retry_backoff_seconds == (5.0, 30.0, 120.0)
     assert s.watcher.max_retries == 3
-    assert s.watcher.shutdown_grace_seconds == 60.0
+    assert s.watcher.orphan_tmp_cleanup_age_seconds == 300.0
     assert s.claude_code.allowed_tool_profile == "readonly"
     assert s.claude_code.extra_mcp_servers == {}
     assert s.phanthand.endpoint == "http://localhost:7300"

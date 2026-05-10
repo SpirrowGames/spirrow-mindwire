@@ -26,7 +26,8 @@ def _meta(**overrides: Any) -> ThreadMeta:
     base: dict[str, Any] = {
         "schema_version": 1,
         "thread_id": ULID_A,
-        "status": "awaiting-cc",
+        "status": "active",
+        "awaiting_from": "claude-code",
         "participants": ("claude.ai", "claude-code"),
         "created_at": NOW,
         "updated_at": LATER,
@@ -52,7 +53,7 @@ def _msg(**overrides: Any) -> Message:
 def test_single_message_marks_is_latest() -> None:
     out = build_thread_prompt(_meta(), [_msg()])
     assert '<mw_thread thread_id="01ARZ3NDEKTSV4RRFFQ69G5FAV"' in out
-    assert ' status="awaiting-cc"' in out
+    assert ' status="active"' in out
     assert ' participants="claude.ai,claude-code">' in out
     assert ' seq="1"' in out
     assert ' from="claude.ai"' in out
