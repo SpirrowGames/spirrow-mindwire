@@ -25,6 +25,7 @@ from .dispatcher import ThreadDispatcher
 from .events import ThreadEvent
 from .observer import WatcherObserver
 from .orphan_cleanup import cleanup_orphan_tmp
+from .startup_scan import startup_full_scan
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,11 @@ async def run_watcher(settings: MindwireSettings, *, api_key: str | None) -> Non
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[ThreadEvent] = asyncio.Queue()
     dedup = DedupCache(ttl=timedelta(seconds=settings.watcher.dedup_ttl_seconds))
+
+    # Feature 2: state-based recovery — enqueue active/retrying threads (docs §2.1).
+    enqueued = startup_full_scan(settings.paths.data_dir, queue)
+    if enqueued > 0:
+        logger.info("startup_scan: enqueued %d thread events for recovery", enqueued)
 
     observer = WatcherObserver(
         threads_root=settings.paths.threads_dir,

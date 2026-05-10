@@ -29,6 +29,7 @@ from .loader import load_messages, load_thread_meta
 from .observer import WatcherObserver
 from .orphan_cleanup import cleanup_orphan_tmp
 from .runner import run_watcher
+from .startup_scan import startup_full_scan
 
 __all__ = [
     "DedupCache",
@@ -40,6 +41,7 @@ __all__ = [
     "load_thread_meta",
     "main",
     "run_watcher",
+    "startup_full_scan",
 ]
 
 
