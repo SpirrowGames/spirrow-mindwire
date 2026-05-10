@@ -7,11 +7,11 @@ Sub-modules:
 - :mod:`observer` — watchdog → asyncio bridge
 - :mod:`loader` — read meta.yaml + messages from disk
 - :mod:`dispatcher` — per-event invoke + event-log persist
+- :mod:`orphan_cleanup` — startup orphan ``.tmp`` cleanup (Feature 2)
 - :mod:`runner` — entry point that wires everything
 
-Robustness (timeout, retry, dead-letter, validation) and lifecycle
-(startup full-scan, graceful shutdown grace window) live in Feature 2
-(``develop/feat-robustness``) — this module is intentionally minimal.
+Robustness (timeout, retry, terminate) lives in Feature 2 sub-PR 2 / 3 / 4.
+Sub-PR 1 adds orphan-cleanup + state-based recovery scaffolding.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from .dispatcher import ThreadDispatcher
 from .events import ThreadEvent
 from .loader import load_messages, load_thread_meta
 from .observer import WatcherObserver
+from .orphan_cleanup import cleanup_orphan_tmp
 from .runner import run_watcher
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "ThreadDispatcher",
     "ThreadEvent",
     "WatcherObserver",
+    "cleanup_orphan_tmp",
     "load_messages",
     "load_thread_meta",
     "main",

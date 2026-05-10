@@ -278,7 +278,7 @@ operator manual transition の前提 (Phase 0):
   watcher が古い状態を上書きする可能性は許容
 ```
 
-**reload 戦略 (per-iteration vs startup-only + invoke 開始時)** は §5.1 sub-PR 1 着手時に decide、 本 §に追記。
+**reload 戦略**: **(i) per-iteration reload** を採用 (sub-PR 1 着手時 decide、 commit `0960f21` 後に決定)。 watcher は `_run_thread` 開始時に毎回 `load_thread_meta(layout)` で meta.yaml を read する (= 現 `dispatcher.py:_run_thread` 実装と整合)。 (ii) startup 1 回 + invoke 開始時 cache 代替案は不採用 — cache 同期コスト > read cost、 また §3.6 の operator manual race acceptance (= 「次回 _run_thread 開始時に再読込」) との整合性が (i) のみで自然に成立する。
 
 ## 4. WatcherConfig defaults (Decide #4)
 

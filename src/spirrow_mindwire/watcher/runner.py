@@ -3,9 +3,12 @@
 Phase 0 happy path: a single coroutine starts the observer, drains
 the asyncio queue, and forwards each :class:`ThreadEvent` to the
 dispatcher. ``Ctrl+C`` cancels the consumer task and stops the
-observer cleanly. Lifecycle hardening (graceful shutdown grace
-window, startup full-scan, orphan staging cleanup) is queued for a
-later sub-PR.
+observer cleanly.
+
+Feature 2 sub-PR 1 adds orphan ``.tmp`` cleanup at startup
+(see :mod:`spirrow_mindwire.watcher.orphan_cleanup`). Further
+robustness (timeout, retry, terminate, state-based status scan) is
+queued for sub-PR 2 / 3 / 4.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from .dedup import DedupCache
 from .dispatcher import ThreadDispatcher
 from .events import ThreadEvent
 from .observer import WatcherObserver
+from .orphan_cleanup import cleanup_orphan_tmp
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,14 @@ async def run_watcher(settings: MindwireSettings, *, api_key: str | None) -> Non
     by the CLI wrapper (kept out of :class:`MindwireSettings` so secrets
     don't end up in TOML).
     """
+
+    # Feature 2: orphan .tmp cleanup at startup (docs §2.3).
+    deleted = cleanup_orphan_tmp(
+        settings.paths.threads_dir,
+        age_threshold_seconds=settings.watcher.orphan_tmp_cleanup_age_seconds,
+    )
+    if deleted > 0:
+        logger.info("orphan_cleanup: removed %d orphan .tmp files at startup", deleted)
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[ThreadEvent] = asyncio.Queue()
