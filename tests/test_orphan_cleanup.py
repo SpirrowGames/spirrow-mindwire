@@ -158,10 +158,10 @@ def test_unlink_failure_continues(
 
     real_unlink = Path.unlink
 
-    def fake_unlink(self: Path, *args: object, **kwargs: object) -> None:
+    def fake_unlink(self: Path, missing_ok: bool = False) -> None:
         if self == p1:
             raise PermissionError("simulated lock")
-        return real_unlink(self, *args, **kwargs)
+        return real_unlink(self, missing_ok=missing_ok)
 
     monkeypatch.setattr(Path, "unlink", fake_unlink)
 

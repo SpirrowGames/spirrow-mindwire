@@ -28,7 +28,7 @@ NOW = datetime(2026, 5, 7, 8, 43, 7, tzinfo=UTC)
 
 def _seed(base_dir: Path, ulid: str, **overrides: object) -> ThreadDirLayout:
     layout = ThreadDirLayout(base_dir=base_dir, thread_id=ulid)
-    seed_thread_meta(layout, **overrides)  # type: ignore[arg-type]
+    seed_thread_meta(layout, **overrides)
     return layout
 
 
