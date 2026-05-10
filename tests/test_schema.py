@@ -242,12 +242,12 @@ def test_event_dispatches_thread_status_changed() -> None:
         _event(
             type="thread.status.changed",
             thread_id=ULID_A,
-            from_status="awaiting-cc",
-            to_status="awaiting-cai",
+            from_status="active",
+            to_status="retrying",
         )
     )
     assert isinstance(e, ThreadStatusChanged)
-    assert e.from_status == "awaiting-cc"
+    assert e.from_status == "active"
 
 
 def test_event_dispatches_thread_resolved_and_archived() -> None:

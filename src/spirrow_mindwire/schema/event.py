@@ -39,6 +39,13 @@ from ._common import (
 
 class _BaseEvent(StrictModel):
     schema_version: Literal[1]
+    """Schema version for individual event log entries.
+
+    Independent from :data:`spirrow_mindwire.schema._common.SCHEMA_VERSION`
+    (which versions ``ThreadMeta`` on-disk YAML). Bumping one does not
+    require bumping the other.
+    """
+
     event_id: UlidStr
     ts: UTCDatetime
 

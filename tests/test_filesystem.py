@@ -187,7 +187,7 @@ def test_event_log_append_multiple_events(tmp_path: Path) -> None:
             ts=NOW,
             thread_id=ULID_A,
             from_status="active",
-            to_status="awaiting-cc",
+            to_status="retrying",
         )
     )
 

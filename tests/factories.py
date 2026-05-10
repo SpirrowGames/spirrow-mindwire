@@ -28,23 +28,27 @@ Tests that need a different time should pass ``created_at=...`` /
 
 
 def seed_thread_meta(layout: ThreadDirLayout, **overrides: Any) -> None:
-    """Write ``meta.yaml`` for *layout* using the canonical Phase 0 defaults.
+    """Write ``meta.yaml`` for *layout* using the canonical Feature 2 defaults.
 
-    Defaults: ``status='awaiting-cc'``, two participants, empty title /
-    tags, both timestamps at :data:`DEFAULT_TS`. ``overrides`` shallow-
-    merge into the payload before serialization, so tests can change
-    one field (``status='active'``) without restating the rest.
+    Defaults: ``status='active'``, ``awaiting_from='claude-code'``
+    (equivalent to the pre-Feature-2 ``awaiting-cc``), two participants,
+    empty title / tags, both timestamps at :data:`DEFAULT_TS`,
+    ``retry_count=0``, terminated fields ``None``. ``overrides``
+    shallow-merge into the payload before serialization, so tests can
+    change one field without restating the rest.
     """
 
     payload: dict[str, Any] = {
         "schema_version": 1,
         "thread_id": layout.thread_id,
         "title": "",
-        "status": "awaiting-cc",
+        "status": "active",
+        "awaiting_from": "claude-code",
         "participants": ["claude.ai", "claude-code"],
         "created_at": DEFAULT_TS,
         "updated_at": DEFAULT_TS,
         "tags": [],
+        "retry_count": 0,
     }
     payload.update(overrides)
     layout.thread_dir.mkdir(parents=True, exist_ok=True)

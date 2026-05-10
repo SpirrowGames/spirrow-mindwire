@@ -15,9 +15,34 @@ from pydantic import AfterValidator, BaseModel, ConfigDict
 from ulid import ULID
 
 SCHEMA_VERSION = 1
+"""Schema version for ThreadMeta on-disk YAML format.
+
+NOTE: This version is INDEPENDENT from event log schema version
+(:class:`spirrow_mindwire.schema.event._BaseEvent` ``schema_version``).
+The numeric value happening to be 1 in both cases is coincidental;
+bumping one does not require bumping the other. See
+``docs/architecture.md`` §3 for the snapshot vs audit log boundary.
+"""
 
 Participant = Literal["claude.ai", "claude-code"]
-ThreadStatus = Literal["active", "awaiting-cc", "awaiting-cai", "resolved", "archived"]
+ThreadStatus = Literal["active", "retrying", "terminated", "resolved", "archived"]
+"""MindWire watcher's filesystem-level thread state.
+
+NOTE: This is a separate namespace from ChatRoom (chatroom-magickit)
+thread state (``active / awaiting_reply / resolved / superseded /
+parked``). The ``active`` / ``resolved`` name overlap is incidental,
+not semantic. See ``docs/feature-2-design.md`` §3 for the lifecycle
+state machine.
+"""
+
+TerminatedReason = Literal["retry-exhausted", "validation-failed"]
+"""Reason for transitioning into ``terminated`` lifecycle state.
+
+- ``retry-exhausted``: retry loop hit ``max_retries`` without success
+- ``validation-failed``: schema-level error (no retry would help)
+
+See ``docs/feature-2-design.md`` §3.3 / §3.4.
+"""
 
 
 def _validate_ulid(v: str) -> str:
@@ -92,6 +117,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "Participant",
     "StrictModel",
+    "TerminatedReason",
     "ThreadStatus",
     "UTCDatetime",
     "UlidStr",
