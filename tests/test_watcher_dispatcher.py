@@ -13,16 +13,16 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock
 
 import pytest
 from factories import seed_thread_meta, write_message_file
 
-from spirrow_mindwire.claude_code import InvokeResult
+from spirrow_mindwire.claude_code import InvokeResult, InvokeTimeoutError
 from spirrow_mindwire.filesystem import ThreadDirLayout
 from spirrow_mindwire.phanthand import PhanthandClient
-from spirrow_mindwire.schema import Participant
+from spirrow_mindwire.schema import Participant, ThreadMeta
 from spirrow_mindwire.watcher.dedup import DedupCache
 from spirrow_mindwire.watcher.dispatcher import ThreadDispatcher
 from spirrow_mindwire.watcher.events import ThreadEvent
@@ -58,6 +58,22 @@ def _invoker(captured: dict[str, Any], result: InvokeResult) -> Any:
     async def fake(**kwargs: Any) -> InvokeResult:
         captured.update(kwargs)
         return result
+
+    return fake
+
+
+def _timeout_invoker(
+    kind: Literal["idle", "absolute"] = "idle", elapsed_seconds: float = 0.5
+) -> Any:
+    """Fake invoker that raises :class:`InvokeTimeoutError`.
+
+    Used by the timeout-handling tests (Feature 2 sub-PR 2 step 4) to drive
+    the dispatcher's ``except InvokeTimeoutError`` branch without spinning up
+    a real SDK session or relying on real-time sleep.
+    """
+
+    async def fake(**kwargs: Any) -> InvokeResult:
+        raise InvokeTimeoutError(kind, elapsed_seconds)
 
     return fake
 
@@ -296,6 +312,109 @@ async def test_dispatcher_propagates_is_error_to_event_log(tmp_path: Path) -> No
     end = json.loads(log_lines[-1])
     assert end["exit_code"] == 1
     assert end["duration_ms"] == 50
+
+
+# ----- Feature 2 sub-PR 2: timeout-handling tests --------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["idle", "absolute"])
+async def test_dispatcher_timeout_transitions_active_to_retrying(
+    tmp_path: Path, kind: Literal["idle", "absolute"]
+) -> None:
+    """idle / absolute timeout で active → retrying + retry_count +1 + event log 追加."""
+    layout = _seed_thread(tmp_path)
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_timeout_invoker(kind, elapsed_seconds=0.5),
+    )
+
+    await dispatcher.handle(_event())
+
+    # Meta が retrying に遷移、 retry_count が +1、 awaiting_from は preserve.
+    new_meta = ThreadMeta.model_validate(
+        __import__("yaml").safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "retrying"
+    assert new_meta.retry_count == 1
+    assert new_meta.awaiting_from == "claude-code"  # preserved (= failed invoke の actor)
+
+    # Event log: InvokeStart + InvokeEnd (exit_code=1, duration_ms=500) + ThreadStatusChanged.
+    log_lines = layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    assert len(log_lines) == 3
+    start = json.loads(log_lines[0])
+    end = json.loads(log_lines[1])
+    status_changed = json.loads(log_lines[2])
+    assert start["type"] == "claude_code.invoke.start"
+    assert end["type"] == "claude_code.invoke.end"
+    assert end["exit_code"] == 1
+    assert end["duration_ms"] == 500  # 0.5s * 1000
+    assert status_changed["type"] == "thread.status.changed"
+    assert status_changed["from_status"] == "active"
+    assert status_changed["to_status"] == "retrying"
+
+
+@pytest.mark.anyio
+async def test_dispatcher_timeout_increments_retry_count_from_existing(
+    tmp_path: Path,
+) -> None:
+    """既に retry_count=2 の thread で timeout fire → retry_count=3."""
+    layout = ThreadDirLayout(base_dir=tmp_path, thread_id=ULID_A)
+    seed_thread_meta(layout, status="active", awaiting_from="claude-code", retry_count=2)
+    write_message_file(layout, 1, "claude.ai", atomic=False)
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_timeout_invoker("idle", elapsed_seconds=1.0),
+    )
+
+    await dispatcher.handle(_event())
+
+    new_meta = ThreadMeta.model_validate(
+        __import__("yaml").safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.retry_count == 3  # 2 + 1
+
+
+@pytest.mark.anyio
+async def test_dispatcher_timeout_dedups_subsequent_event_within_ttl(
+    tmp_path: Path,
+) -> None:
+    """timeout 直後 (= retrying 状態) の同 (thread_id, seq) event は DedupCache で除外.
+
+    ThreadDispatcher の dedup は invoke を spawn するか否かの判断であり、
+    retrying 状態でも live observer が同じ message file の event を再発火した
+    場合に重複 invoke を防ぐ役割。 sub-PR 1 spirrowgames-ops review O-3
+    (= startup_scan ↔ live observer dedup race) の Phase 0 carry-over 確認。
+    """
+    layout = _seed_thread(tmp_path)
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_timeout_invoker(),
+    )
+
+    # 1 回目: timeout fire → active → retrying.
+    await dispatcher.handle(_event(seq=1, when=NOW))
+    meta_after_first = ThreadMeta.model_validate(
+        __import__("yaml").safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert meta_after_first.status == "retrying"
+    assert meta_after_first.retry_count == 1
+
+    # 2 回目: 同じ (thread_id, seq) は dedup_ttl 内なら DedupCache で skip。
+    # invoker は再呼出されない (= retry_count は 1 のまま)。
+    await dispatcher.handle(_event(seq=1, when=NOW + timedelta(seconds=2)))
+    meta_after_second = ThreadMeta.model_validate(
+        __import__("yaml").safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert meta_after_second.retry_count == 1  # 再呼出されない
 
 
 @pytest.mark.anyio
