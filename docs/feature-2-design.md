@@ -396,6 +396,62 @@ class WatcherConfig(_StrictModel):
 - 各 push 前に local で `uv run ruff format --check` + `mypy src/` 確認 (CI fail 防止)
 - spirrowgames-ops APPROVE は新規 PR で引き継がれない (元 PR 引用で対応、 PR #4 と同 pattern)
 
+### 5.2.1 sub-PR 間 contract integration checklist
+
+PR #27 (sub-PR 2 timeout) spirrowgames-ops review M-3 由来の meta-process improvement (Issue #28)。 chain merge pattern の各 sub-PR 着手前に、 直前 sub-PR で merged された contract を verify する事前 phase を運用化する。
+
+**背景**: PR #27 で C1 / C2 の 2 must bug が review で発見された。
+
+- **C1**: `InvokeTimeoutError(asyncio.TimeoutError)` (`claude_code/session.py`) の inheritance と Python 3.11+ `asyncio.TimeoutError = TimeoutError` alias の subtle interaction (except 順序 / isinstance subclass match) が抑え切れていなかった
+- **C2**: sub-PR 1 で merged された `REQUEUE_STATES` (`lifecycle/transitions.py`、 `startup_full_scan` 由来) と `_ALLOWED_TRANSITIONS` (`lifecycle/transitions.py`) の contract に対し、 sub-PR 2 dispatcher の timeout handler が unaware だった
+
+共通の根本原因: sub-PR 2 着手時に sub-PR 1 で merged された contract を chain integration verify する事前 step が存在しなかったこと。 既存 CI test では catch されず、 review で初めて検出。
+
+**checklist**: 各 sub-PR 着手時、 直前 sub-PR で merged された以下 contract を verify する。
+
+- [ ] `_ALLOWED_TRANSITIONS` (`lifecycle/transitions.py`) — 新規 invoke path で発生しうる全 status 遷移が allowed か
+- [ ] `REQUEUE_STATES` (`lifecycle/transitions.py`、 `startup_full_scan` で参照) — 新規 path が requeue される thread state を honor するか
+- [ ] `TERMINAL_STATES` (`lifecycle/transitions.py`、 `dispatcher._run_thread` で short-circuit) — terminal state skip が新規 path でも維持されるか
+- [ ] `transition_state` invariants (`awaiting_from` / `terminated_reason` / `terminated_at` / `retry_count`) — meta.yaml status 遷移を伴う書込は本 entry point 経由か、 rule 違反していないか
+- [ ] `bump_retry_count` (`lifecycle/transitions.py`) — meta.yaml status 不変で `retry_count` だけ advance する path が caller side で本 entry point 経由か (sub-PR 2 C2 由来、 `retrying → retrying` 自己遷移禁止と integration)
+- [ ] `DedupCache` semantic (`watcher/dedup.py`) — 新規 path が dedup と整合するか (sub-PR 1 review O-3、 sub-PR 2 で carry 確認済)
+- [ ] Python 3.11+ language alias (`asyncio.TimeoutError = TimeoutError` 等) との interaction — `except` 順序、 `isinstance` の subclass match (sub-PR 2 C1 由来)
+
+新たな contract symbol が sub-PR で導入された場合は本 checklist にも追加すること (= checklist 自体も sub-PR ごとに育てる)。
+
+**sub-PR 着手時の流れ**:
+
+1. **本 checklist を 1 項目ずつ verify** (= 各 contract を新規 path で confirm、 design level の整合性確認)
+2. branch 切り (`feat/feature-2-<name>` from `develop/feat-robustness`)
+3. 結果を sub-PR PR description に明記 ("Chain integration checklist verified" + 各項目の備考)
+4. 実装着手
+
+**PR description 記載 example** (sub-PR 3 retry の場合):
+
+````markdown
+## Chain integration checklist verified
+
+- ✅ `_ALLOWED_TRANSITIONS`: 新規 path `retrying → active` (retry 後 re-invoke 時の dispatcher transition) は `_ALLOWED_TRANSITIONS["retrying"] = {"active", "terminated"}` に含まれる、 整合
+- ✅ `REQUEUE_STATES`: 新規 path は requeue 対象 thread state を honor、 `startup_full_scan` 経由の retrying thread → retry path の chain を verify
+- ✅ `TERMINAL_STATES`: 新規 path で terminal state thread が再 invoke されない、 dispatcher の terminal short-circuit が retry 経路でも維持
+- ✅ `transition_state` invariants: retry 後の `active` 復帰時に `awaiting_from` を preserve、 `retry_count` も合わせて update
+- ✅ `bump_retry_count`: retry 経路では status 不変で retry_count advance のみ、 sub-PR 2 で確立した API を踏襲
+- ✅ `DedupCache` semantic: retry 経路の re-invoke は新規 event 由来 (= 別 seq) のため dedup と衝突しない
+- ✅ Python 3.11+ language alias: sub-PR 3 で `asyncio.TimeoutError` 派生例外を新規追加しない、 既存の `InvokeTimeoutError` (sub-PR 2 由来) のみ取扱い
+````
+
+各項目に **判定 (✅/❌)** + **理由 (1〜2 行)** の統一 form を採用、 reviewer (Copilot / claude.ai / Takahito) が見落としを catch しやすい。
+
+**Phase 0 完結後の扱い**: sub-PR 4 完了 + develop → main squash merge 後も §5.2.1 は残し、 Phase 1+ で sub-PR 構造を持つ任意の chain merge に適用可能な一般メタ運用として継承。
+
+**将来の extract 計画**: Phase 0 完結時点で、 本 §5.2.1 を `docs/chain-merge-pattern.md` 等の独立 doc に extract する task を別 Issue (#30) で trackable に carry。 Phase 1+ で Feature 3 / Feature 4 が chain merge pattern を採用する際、 Feature 2 専用 doc を読まずに済む構造を目指す。
+
+**関連**:
+
+- ChatRoom: PR #27 spirrowgames-ops review M-3 (`r3215170437`)
+- meta tracker: Issue #28 (※ issue body は提案時の symbol 名で記述、 現 code との差異あり、 docs §5.2.1 では現 code symbol を SoT 採用)
+- 直近適用先: sub-PR 3 (#20、 retry) 着手前
+
 ### 5.3 論点 4/5/6 の処遇
 
 | 当初提案論点 | 処遇 |
