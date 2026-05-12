@@ -1,19 +1,48 @@
 """Per-thread async dispatch: queue → invoke → event-log persist.
 
-Phase 0 happy-path only. Robustness (timeout, retry, dead-letter,
-validation) lives in Feature 2 (``develop/feat-robustness``).
+Phase 0 happy-path baseline + Feature 2 robustness (sub-PR 2 timeout +
+sub-PR 3 retry) layered on top.
 
 The dispatcher's loop:
 
 1. Pull a :class:`ThreadEvent` from the queue.
-2. Run TTL dedup; skip if seen recently.
-3. Acquire a slot from the global semaphore (``max_concurrent_threads``).
+2. Run TTL dedup; skip if seen recently (D-6 (a): retry loop below
+   bypasses this layer — only the *entry* into ``_run_thread`` is
+   deduped).
+3. Acquire a slot from the global semaphore (``max_concurrent_threads``)
+   and the per-thread asyncio lock.
 4. Read thread state (meta + messages) from disk.
 5. Build the prompt, the in-process MindWire MCP server, the
    pass-through MCP servers (left empty in Phase 0 happy path), and
    the allowed_tools list.
-6. Call ``invoke_claude_code`` and append events for the invoke
-   start / end.
+6. Run the **retry loop** (up to ``max_retries + 1`` attempts):
+
+   - Append :class:`ClaudeCodeInvokeStart` + call ``invoke_claude_code``.
+   - On success: append :class:`ClaudeCodeInvokeEnd` (exit_code=0). If
+     the thread was in ``retrying`` state on entry, transition back to
+     ``active`` with ``retry_count=None`` so the audit-trail counter is
+     preserved (D-7 (b) preserve, see docs/feature-2-design.md §3.5).
+   - On :class:`InvokeTimeoutError` (= transient): append
+     ``ClaudeCodeInvokeEnd`` (exit_code=1) + bump ``retry_count`` (=
+     ``active → retrying`` first time via :func:`transition_state`, or
+     ``bump_retry_count`` thereafter to avoid the forbidden
+     ``retrying → retrying`` transition) + append
+     :class:`RetryBackoffStarted` + sleep
+     ``retry_backoff_seconds[attempt] * (1 ± retry_jitter)`` + retry.
+     When the loop hits ``max_retries`` exhaustion, transition to
+     ``terminated`` with ``terminated_reason="retry-exhausted"``.
+   - On :class:`asyncio.CancelledError`: propagate (= shutdown path).
+   - On other exceptions (= permanent / unknown): safe-by-default
+     ``active → terminated`` with ``terminated_reason="validation-failed"``.
+     Allowlist-based transient classification is intentional — see
+     docs/feature-2-design.md §6 FI-4 for the dogfooding-pending re-audit.
+
+The retry loop runs entirely inside ``_run_thread``; new
+``ThreadEvent`` instances are not re-enqueued by the dispatcher
+itself. ``startup_full_scan`` (re-)queues ``retrying`` threads on
+watcher restart, so cumulative ``retry_count`` can exceed
+``max_retries`` across restarts — this is the audit-trail framing of
+``retry_count`` (D-7 (b), docs/feature-2-design.md §3.5).
 """
 
 from __future__ import annotations
