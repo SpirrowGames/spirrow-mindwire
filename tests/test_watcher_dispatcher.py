@@ -165,6 +165,15 @@ async def test_dispatcher_dedups_repeated_event(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_dispatcher_logs_error_end_when_invoke_raises(tmp_path: Path) -> None:
+    """Non-transient exceptions terminate the thread (safe-by-default permanent).
+
+    Feature 2 sub-PR 3 reframes 「invoke raises」 — instead of propagating the
+    exception up to ``run_watcher._safe_handle``, the dispatcher classifies
+    the exception via :func:`_is_transient` (allowlist = :class:`InvokeTimeoutError`),
+    and any non-transient exception goes directly to
+    ``terminated/validation-failed``. The traceback is captured in the
+    watcher log (logger.warning + exc_info=True) instead of being re-raised.
+    """
     layout = _seed_thread(tmp_path)
 
     async def failing_invoker(**kwargs: Any) -> InvokeResult:
@@ -177,14 +186,27 @@ async def test_dispatcher_logs_error_end_when_invoke_raises(tmp_path: Path) -> N
         invoker=failing_invoker,
     )
 
-    with pytest.raises(RuntimeError, match="SDK boom"):
-        await dispatcher.handle(_event())
+    # No raise: dispatcher swallows and terminates.
+    await dispatcher.handle(_event())
 
     log_lines = layout.event_log_path.read_text(encoding="utf-8").splitlines()
     types = [json.loads(line)["type"] for line in log_lines]
-    assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
-    end = json.loads(log_lines[-1])
+    assert types == [
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.status.changed",
+    ]
+    end = json.loads(log_lines[1])
     assert end["exit_code"] == 1
+    status_changed = json.loads(log_lines[2])
+    assert status_changed["from_status"] == "active"
+    assert status_changed["to_status"] == "terminated"
+
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "terminated"
+    assert new_meta.terminated_reason == "validation-failed"
 
 
 @pytest.mark.anyio
@@ -315,15 +337,22 @@ async def test_dispatcher_propagates_is_error_to_event_log(tmp_path: Path) -> No
     assert end["duration_ms"] == 50
 
 
-# ----- Feature 2 sub-PR 2: timeout-handling tests --------------------------
+# ----- Feature 2 sub-PR 2 + sub-PR 3: timeout / retry handling -------------
+#
+# These tests adapt the original sub-PR 2 "transition only" assertions to
+# the sub-PR 3 retry loop. ``max_retries=0`` is the default in
+# ``ThreadDispatcher.__init__`` (=  single transient failure goes straight
+# to ``terminated/retry-exhausted`` without sleeping), so unit tests that
+# don't exercise the retry loop itself can rely on the default. The full
+# retry-success / retry-exhausted / bump scenarios live in commit 5.
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("kind", ["idle", "absolute"])
-async def test_dispatcher_timeout_transitions_active_to_retrying(
+async def test_dispatcher_timeout_exhausts_to_terminated_with_max_retries_zero(
     tmp_path: Path, kind: Literal["idle", "absolute"]
 ) -> None:
-    """idle / absolute timeout で active → retrying + retry_count +1 + event log 追加."""
+    """``max_retries=0`` + idle / absolute timeout → terminated/retry-exhausted."""
     layout = _seed_thread(tmp_path)
 
     dispatcher = ThreadDispatcher(
@@ -335,15 +364,15 @@ async def test_dispatcher_timeout_transitions_active_to_retrying(
 
     await dispatcher.handle(_event())
 
-    # Meta が retrying に遷移、 retry_count が +1、 awaiting_from は preserve.
     new_meta = ThreadMeta.model_validate(
         yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
     )
-    assert new_meta.status == "retrying"
-    assert new_meta.retry_count == 1
-    assert new_meta.awaiting_from == "claude-code"  # preserved (= failed invoke の actor)
+    assert new_meta.status == "terminated"
+    assert new_meta.terminated_reason == "retry-exhausted"
+    # retry_count not bumped on direct exhaustion (attempt==max_retries=0).
+    assert new_meta.retry_count == 0
+    assert new_meta.awaiting_from is None
 
-    # Event log: InvokeStart + InvokeEnd (exit_code=1, duration_ms=500) + ThreadStatusChanged.
     log_lines = layout.event_log_path.read_text(encoding="utf-8").splitlines()
     assert len(log_lines) == 3
     start = json.loads(log_lines[0])
@@ -355,14 +384,15 @@ async def test_dispatcher_timeout_transitions_active_to_retrying(
     assert end["duration_ms"] == 500  # 0.5s * 1000
     assert status_changed["type"] == "thread.status.changed"
     assert status_changed["from_status"] == "active"
-    assert status_changed["to_status"] == "retrying"
+    assert status_changed["to_status"] == "terminated"
 
 
 @pytest.mark.anyio
-async def test_dispatcher_timeout_increments_retry_count_from_existing(
+async def test_dispatcher_timeout_preserves_retry_count_on_direct_exhaustion(
     tmp_path: Path,
 ) -> None:
-    """既に retry_count=2 の thread で timeout fire → retry_count=3."""
+    """既存 retry_count=2 + ``max_retries=0`` で timeout → status terminated、
+    retry_count は bump せず 2 のまま (= attempt==max_retries=0 で direct path)."""
     layout = ThreadDirLayout(base_dir=tmp_path, thread_id=ULID_A)
     seed_thread_meta(layout, status="active", awaiting_from="claude-code", retry_count=2)
     write_message_file(layout, 1, "claude.ai", atomic=False)
@@ -379,24 +409,17 @@ async def test_dispatcher_timeout_increments_retry_count_from_existing(
     new_meta = ThreadMeta.model_validate(
         yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
     )
-    assert new_meta.retry_count == 3  # 2 + 1
+    assert new_meta.status == "terminated"
+    assert new_meta.terminated_reason == "retry-exhausted"
+    assert new_meta.retry_count == 2  # unchanged (no bump on direct exhaustion)
 
 
 @pytest.mark.anyio
-async def test_dispatcher_timeout_from_retrying_status_bumps_retry_count(
+async def test_dispatcher_timeout_from_retrying_terminates_directly_with_max_retries_zero(
     tmp_path: Path,
 ) -> None:
-    """retrying status の thread で timeout fire → retry_count +1、 status 不変、
-    ThreadStatusChanged event は append されない (= self-loop 回避 path).
-
-    sub-PR 1 で merged された ``startup_full_scan`` が retrying thread を
-    requeue するため、 dispatcher の ``_run_thread`` が ``meta.status ==
-    "retrying"`` で呼ばれる scenario が production 上で実際に発生する。
-    ``retrying → retrying`` は ``_ALLOWED_TRANSITIONS`` で禁止されているため、
-    通常の ``transition_state`` は ``InvalidTransitionError`` を raise する。
-    本 test は ``lifecycle.bump_retry_count`` 経由で status 不変のまま
-    retry_count が advance することを確認する。
-    """
+    """retrying status の thread で timeout + ``max_retries=0`` →
+    ``retrying → terminated`` direct transition、 retry_count は preserve."""
     layout = ThreadDirLayout(base_dir=tmp_path, thread_id=ULID_A)
     seed_thread_meta(layout, status="retrying", awaiting_from="claude-code", retry_count=1)
     write_message_file(layout, 1, "claude.ai", atomic=False)
@@ -408,31 +431,38 @@ async def test_dispatcher_timeout_from_retrying_status_bumps_retry_count(
         invoker=_timeout_invoker("idle", elapsed_seconds=0.5),
     )
 
-    # Must not raise InvalidTransitionError.
     await dispatcher.handle(_event())
 
     new_meta = ThreadMeta.model_validate(
         yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
     )
-    assert new_meta.status == "retrying"  # unchanged (bump path, no transition)
-    assert new_meta.retry_count == 2  # +1 from seeded 1
+    assert new_meta.status == "terminated"
+    assert new_meta.terminated_reason == "retry-exhausted"
+    assert new_meta.retry_count == 1  # preserved
 
-    # Event log: InvokeStart + InvokeEnd only — no ThreadStatusChanged for self-loop.
     log_lines = layout.event_log_path.read_text(encoding="utf-8").splitlines()
     types = [json.loads(line)["type"] for line in log_lines]
-    assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
+    assert types == [
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.status.changed",
+    ]
+    status_changed = json.loads(log_lines[-1])
+    assert status_changed["from_status"] == "retrying"
+    assert status_changed["to_status"] == "terminated"
 
 
 @pytest.mark.anyio
 async def test_dispatcher_timeout_dedups_subsequent_event_within_ttl(
     tmp_path: Path,
 ) -> None:
-    """timeout 直後 (= retrying 状態) の同 (thread_id, seq) event は DedupCache で除外.
+    """timeout 直後 (= terminated state with max_retries=0) の同 (thread_id, seq)
+    event は ``TERMINAL_STATES`` short-circuit でも DedupCache でも skip される.
 
-    ThreadDispatcher の dedup は invoke を spawn するか否かの判断であり、
-    retrying 状態でも live observer が同じ message file の event を再発火した
-    場合に重複 invoke を防ぐ役割。 sub-PR 1 spirrowgames-ops review O-3
-    (= startup_scan ↔ live observer dedup race) の Phase 0 carry-over 確認。
+    The early dedup short-circuit fires first (DedupCache.seen_recently is
+    checked in ``handle`` before ``_run_thread``); the terminal-state
+    short-circuit inside ``_run_thread`` is a defense in depth for events
+    that bypass dedup (e.g. across watcher restarts).
     """
     layout = _seed_thread(tmp_path)
     dispatcher = ThreadDispatcher(
@@ -442,21 +472,19 @@ async def test_dispatcher_timeout_dedups_subsequent_event_within_ttl(
         invoker=_timeout_invoker(),
     )
 
-    # 1 回目: timeout fire → active → retrying.
+    # 1 回目: timeout fire → terminated (max_retries=0 default).
     await dispatcher.handle(_event(seq=1, when=NOW))
     meta_after_first = ThreadMeta.model_validate(
         yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
     )
-    assert meta_after_first.status == "retrying"
-    assert meta_after_first.retry_count == 1
+    assert meta_after_first.status == "terminated"
 
     # 2 回目: 同じ (thread_id, seq) は dedup_ttl 内なら DedupCache で skip。
-    # invoker は再呼出されない (= retry_count は 1 のまま)。
+    # invoker / event log とも変化なし。
+    log_size_before = layout.event_log_path.stat().st_size
     await dispatcher.handle(_event(seq=1, when=NOW + timedelta(seconds=2)))
-    meta_after_second = ThreadMeta.model_validate(
-        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
-    )
-    assert meta_after_second.retry_count == 1  # 再呼出されない
+    log_size_after = layout.event_log_path.stat().st_size
+    assert log_size_after == log_size_before  # 再呼出されない
 
 
 @pytest.mark.anyio

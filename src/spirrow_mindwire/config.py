@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -159,6 +159,50 @@ class WatcherConfig(_StrictModel):
     """
 
     orphan_tmp_cleanup_age_seconds: float = Field(default=300.0, gt=0)
+
+    @field_validator("retry_backoff_seconds")
+    @classmethod
+    def _retry_backoff_monotonic(cls, v: tuple[float, ...]) -> tuple[float, ...]:
+        """Enforce non-strict monotonic increase of retry_backoff_seconds.
+
+        Equal-adjacent values are allowed (= flat segments such as
+        ``(5.0, 5.0, 30.0)``); strict decrease is rejected. Empty
+        tuples are allowed at this layer — the cross-field
+        ``len(retry_backoff_seconds) >= max_retries`` check lives on
+        the model validator below so the error message can name both
+        fields.
+        """
+        for i in range(1, len(v)):
+            if v[i] < v[i - 1]:
+                raise ValueError(
+                    "retry_backoff_seconds must be non-strictly monotonic "
+                    "(each element ≥ the previous one); "
+                    f"got {v} (index {i}: {v[i]} < index {i - 1}: {v[i - 1]})"
+                )
+            if v[i] < 0:
+                raise ValueError(f"retry_backoff_seconds must contain non-negative values; got {v}")
+        if v and v[0] < 0:
+            raise ValueError(f"retry_backoff_seconds must contain non-negative values; got {v}")
+        return v
+
+    @model_validator(mode="after")
+    def _retry_backoff_length_covers_max_retries(self) -> Self:
+        """Cross-field: ``len(retry_backoff_seconds) >= max_retries``.
+
+        The dispatcher's retry loop indexes ``retry_backoff_seconds[attempt]``
+        for ``attempt in range(max_retries)`` (see dispatcher module
+        docstring). A shorter tuple would raise ``IndexError`` mid-retry,
+        which is a configuration bug we want to surface at load time.
+        """
+        if len(self.retry_backoff_seconds) < self.max_retries:
+            raise ValueError(
+                f"retry_backoff_seconds length ({len(self.retry_backoff_seconds)}) "
+                f"must be >= max_retries ({self.max_retries}) — the retry loop "
+                f"indexes retry_backoff_seconds[attempt] for "
+                f"attempt in [0, max_retries-1]; configure either a longer "
+                f"retry_backoff_seconds tuple or a smaller max_retries"
+            )
+        return self
 
 
 class ExtraMCPServerConfig(_StrictModel):
