@@ -224,6 +224,12 @@ class ThreadMeta(StrictModel):
 
 **Terminal-out transition 時の field 保持**: `terminated_reason` / `terminated_at` は **保持** (`terminated → resolved`、 `terminated → archived`、 `resolved → archived (terminated 経由)` で audit trail として残す)。 §3.5 sketch の `model_copy(update={...})` で caller が明示的に reset しない限り保持される実装と整合。
 
+**on-disk truth と D-3 commit semantics**: meta.yaml は thread 状態の on-disk SOT であり、 in-memory `meta` は read 時点の snapshot に過ぎない。 crash recovery (§2) や retry loop (§5.1 sub-PR 3) で in-memory state が信頼できなくなる場面でも、 「on-disk meta.yaml + events.jsonl + messages/」 を再 load すれば deterministic に状態復元できる。 D-3 next_seq commit semantics (`write_reply` rollback せず commit、 max(seq)+1 で deterministic 再計算) も on-disk truth principle の具体化。
+
+**Hedge (on-disk truth framework)**: 「on-disk truth」 は本 docs での decide における pattern recognition tool であって、 individual implementation choice の justification ではない。 将来 in-memory cache + WAL の hybrid や event-sourced derivation が技術的に妥当となる場面 (= multi-instance watcher、 high-throughput dogfooding 等) では、 具体 cons / pros を再評価して採用判断する。 「on-disk truth に反する」 を理由とした automatic reject はしない。
+
+**Hedge (責務分離 framework)**: 「snapshot (meta.yaml) vs audit log (events.jsonl)」 の責務分離も同様に pattern recognition tool。 同情報が両方に出る redundancy を許容 (§3.4 terminated_at) する判断、 や 「meta が SOT、 events は補完」 (§3.5 FI-2 帰結) の判断は、 責務分離 framework だけで自動的に決まるのではなく、 個別 trade-off (visibility / write atomicity / recovery cost) を見て決めている。 framework violation を理由とした automatic reject はしない。
+
 ### 3.5 Atomicity と enforcement
 
 **`transition_state` 関数を唯一 entry point** として 1 箇所集約。 status / awaiting_from / terminated_reason / terminated_at / updated_at を 1 atomic_write_text で同時更新。 Pydantic `model_validator` 追加せず (二重管理回避、 partial update バグは code 構造で防止)。
@@ -242,8 +248,12 @@ def transition_state(
     _validate_transition(old_meta.status, new_status)  # code-level enforce
     new_meta = old_meta.model_copy(update={...})
     atomic_write_text(layout.meta_path, yaml.safe_dump(new_meta.model_dump()))
-    # meta.yaml と events.jsonl の write 順序 / 失敗 detection は §6 FI-2 で sub-PR 3 着手時に formal decide
-    # (Phase 0 暫定: events.jsonl への ThreadStatusChanged append は本関数末尾で実施想定)
+    # FI-2 帰結 (sub-PR 3 着手前 decide、 T-FI2-transition-2pc):
+    # meta.yaml が SOT (= status の SoT)、 events.jsonl は best-effort audit log。
+    # write 順序は 「meta.yaml 先 → events.jsonl 後」 (caller 側で順に呼ぶ)。
+    # meta 成功 + events 失敗時は audit log に gap が残る一方 meta は最新状態を
+    # 反映、 startup_full_scan が WARNING で gap を log するのみで自動 rollback
+    # / retry はしない (Phase 0 race-acceptance contract、 §3.6 と整合)。
 ```
 
 **禁止 transition enforcement**: `_ALLOWED_TRANSITIONS: dict[ThreadStatus, set[ThreadStatus]]` table-driven 設計 + `pytest.parametrize` 網羅 test。 schema validator level での enforce はせず (= schema は instance 単独 validity の責任のみ)。
@@ -264,7 +274,22 @@ def _validate_transition(old: ThreadStatus, new: ThreadStatus) -> None:
 
 **`awaiting_from` 更新タイミング**: `write_reply` 成功完了時を SOT (§3.1 semantic と整合)。 invoke 開始 / 終了時には更新しない。 retry 中 (= retrying state) の `awaiting_from` は **失敗した invoke の actor を指したまま**。
 
+**FI-2 resolution detail (sub-PR 3、 T-FI2-transition-2pc)**: 「meta が SOT、 events は best-effort」 を採用。 write 順序 = `transition_state` 内 `atomic_write_text` 完了後 caller が `EventLogWriter.append(ThreadStatusChanged)`。 events.jsonl 側 failure (disk full / permission) は exception を raise しても caller が swallow / log のみ (= meta 反映は完了している)、 自動 rollback はしない。 起動時 `startup_full_scan` が events.jsonl 末尾を読んで meta.yaml.status と divergence があれば WARNING ログを出して継続。 (= gap detection 専用 transactional log や WAL は導入しない、 §6 FI-X1 / FI-X2 参照。)
+
+**retry_count semantics (sub-PR 3、 T-D7-retry-count-semantic、 (b) 採用)**:
+
+- **累積 (cumulative) 解釈**: `retry_count` は thread lifetime 全体での累積 retry 試行回数 (= 同 thread の 複数 `_run_thread` 呼出にまたがる)。 単一 `_run_thread` 内の retry loop も、 startup_full_scan で requeue された後の retry も、 すべて同 counter に積算する。
+- **preserve semantics**: `transition_state(..., retry_count=None)` で caller が明示 update しない限り on-disk 値を保持。 retry success による `retrying → active` 遷移でも `retry_count` を caller が渡さなければ保持され、 「直前 retry session の試行数を audit trail として残す」 形になる。
+- **max_retries 解釈と再 audit trigger**: `max_retries` (default 3) は **単一 `_run_thread` 呼出内の retry loop の上限** であり、 累積上限ではない。 startup_full_scan で requeue された後に再度 retry loop が回る scenario は許容、 結果として `retry_count` が `max_retries` を上回ることがある (= dogfooding 開始後の re-audit trigger、 FI-3 関連、 #14 を sub-PR 3 PR description checklist で carry)。
+- **audit trail framing (D-7 Naysayer 由来)**: `retry_count` の primary 目的は operator visibility / dogfooding 観測値 (= 「過去にどれだけ retry したか」)、 retry 制御の primary gate ではない。 gate は `max_retries` (= loop 内 counter) であり、 `retry_count` は disk-persisted observable。 framework としては audit trail (= 過去の記録) であり、 control state (= 今後の挙動を決める state) ではない。
+
+**Hedge (audit trail framework)**: 「audit trail (events.jsonl + retry_count 等の persisted counter)」 は本 docs での decide における pattern recognition tool。 将来 retry control を `events.jsonl` derive に切替えたり、 retry_count を意図的に削除して event log のみで再構築する選択肢が技術的に妥当となる場面 (= event-sourcing 全面移行、 §6 FI-X2) では、 audit trail framework の violation を理由に automatic reject せず、 具体 cons / pros を再評価する。
+
 ### 3.6 Operator manual transition (Phase 0)
+
+Phase 0 では `terminated → resolved` (再調査 / 再投入)、 `terminated → archived` (永久 retire)、 `resolved → archived` (運用整理)、 および稀な状況での `active → resolved` 直接 resolve など、 **operator (= 運用者) が直接 status を遷移させる** path が必要。 Phase 0 では専用 CLI / MCP write API を提供せず、 `meta.yaml` の **直接編集 (`yq` / editor / `sed`)** のみで運用する。
+
+**前提と race contract (Phase 0)**:
 
 ```
 operator manual transition の前提 (Phase 0):
@@ -277,6 +302,32 @@ operator manual transition の前提 (Phase 0):
 - 推奨運用に違反した場合の保証: 「invalid state にはならない」 のみ、
   watcher が古い状態を上書きする可能性は許容
 ```
+
+**安全な編集手順 (推奨)**:
+
+1. `pkill -INT spirrow-mindwire` (or `systemctl stop`) で watcher を停止
+2. `meta.yaml` を編集:
+   - `status: terminated` → `status: resolved` のように直接書換
+   - `awaiting_from`: 遷移先が terminal (`resolved` / `archived`) なら `null`、 non-terminal (`active` / `retrying`) なら `claude.ai` or `claude-code`
+   - `updated_at`: 任意更新 (= watcher は次回 transition 時に自動上書きするので必須ではない)
+3. `events.jsonl` には operator transition の event は手動 append 不要 (= watcher が次回 transition 時に append、 Phase 0 では operator transition の audit trail は editor の commit log + ファイル mtime で代替)
+4. watcher 再起動 (`uv run spirrow-mindwire`)、 `startup_full_scan` が再 enqueue / skip 判定
+
+**禁止事項**:
+
+- `_ALLOWED_TRANSITIONS` (§3.3 / `lifecycle/transitions.py`) で禁止された transition は手動でも実施しない (例: `archived → active`)。 watcher は次回 `transition_state` 呼出で `InvalidTransitionError` を raise し、 該当 invoke 失敗の event log のみ残す。
+- `meta.yaml` 内の `thread_id` / `created_at` / `schema_version` の編集禁止 (= invariant)。
+
+**保証されないこと**:
+
+- operator 編集中 (= watcher が走ったまま) の同時 write race: 「invalid state にはならない」 以外は何も保証しない。 watcher write が operator 編集を silently 上書き、 もしくは逆も発生しうる。
+- operator が edit 後 watcher 再起動を忘れた case: live event がそのまま新 status で処理される (= 期待通りの場合もあれば不本意な再 invoke 発火もある)。
+
+**Phase 1+ で予定する upgrade**:
+
+- MCP write API (`mcp__mindwire__resolve_thread` / `archive_thread`) 経由の transition、 audit trail 自動 append
+- これにより operator 介入も machine-readable event として残せる
+- §6 FI-1 (invoke 中 vs 未開始) の整理が完了したら、 「invoke 中 transition」 を MCP API で安全に許容する余地も検討
 
 **reload 戦略**: **(i) per-iteration reload** を採用 (sub-PR 1 着手時 decide、 commit `0960f21` 後に決定)。 watcher は `_run_thread` 開始時に毎回 `load_thread_meta(layout)` で meta.yaml を read する (= 現 `dispatcher.py:_run_thread` 実装と整合)。 (ii) startup 1 回 + invoke 開始時 cache 代替案は不採用 — cache 同期コスト > read cost、 また §3.6 の operator manual race acceptance (= 「次回 _run_thread 開始時に再読込」) との整合性が (i) のみで自然に成立する。
 
@@ -466,6 +517,31 @@ PR #27 (sub-PR 2 timeout) spirrowgames-ops review M-3 由来の meta-process imp
 
 設計議論で flag されたが本書 SOT には含めない future 課題。 Phase 1+ で取り扱う。
 
+### 6.0 Phase 0 設計前提 (4 assumptions)
+
+本書の設計 decide は以下 4 前提の上に成り立つ。 Phase 1+ でこれらが崩れる時 (= multi-instance / out-of-process / MCP write API による external writer) には FI-X1 / FI-X2 / FI-1 と合わせて再評価する。
+
+1. **single watcher process**: `data_dir` を監視する watcher process は同時に 1 つだけ走る。 multi-instance 並走 (= 同じ data_dir に 2 つの watcher) は想定しない。 仮に並走させた場合の挙動は undefined (= meta.yaml race、 events.jsonl 重複 append、 lock 同期手段なし)。
+2. **in-process MindWire MCP**: watcher が立ち上げる MCP server (`build_mindwire_mcp_server`) は watcher process 内 (= 同一 Python interpreter 内) で動く。 外部 MCP client が直接 `data_dir` に write することは想定しない (= `mcp__mindwire__write_reply` 等の tool 経由のみ)。
+3. **watcher-driven invocation**: claude-code SDK invocation は watcher (= dispatcher) のみが trigger する。 operator や別 process が直接 SDK を起動して thread に reply を書込むことは想定しない (= `_run_thread` 経由のみが invocation 経路)。
+4. **single writer**: `meta.yaml` / `events.jsonl` / `messages/` の write 主体は watcher process **のみ**。 operator manual transition (§3.6) は推奨運用上 watcher を止めて行う、 並走 write は race-accept (§3.6 contract)。
+
+これら 4 前提が成り立つ前提下で:
+
+- 責務分離 framework (= snapshot vs audit log) で構造を分けても、 同 process 内なので consistency を逐次担保できる
+- on-disk truth framework (= meta.yaml が SOT) で recovery を組んでも、 single writer なので write race を考えなくて良い
+- audit trail framework (= events.jsonl / retry_count) を best-effort にしても、 watcher 自身が読み戻すので gap を WARNING で済ませられる
+
+**3 hedge framework の cross-reference**:
+
+| framework | docs での主要適用箇所 | hedge wording (= 「pattern recognition tool」)
+|---|---|---|
+| 責務分離 (responsibility separation) | §3.4 redundancy 許容、 §3.5 FI-2 resolution | §3.4 末尾 hedge 段落 |
+| on-disk truth | §2 crash recovery、 §3.4 D-3 commit semantics、 §3.5 FI-2 resolution | §3.4 末尾 hedge 段落 |
+| audit trail | §3.5 retry_count semantics、 §3.5 events.jsonl gap detection | §3.5 末尾 hedge 段落 |
+
+framework は decide の pattern recognition tool であって individual implementation choice の justification ではないこと、 framework violation を理由とした automatic reject はしないこと、 を 3 framework すべてに共通の hedge として持つ (§3.4 / §3.5 各末尾)。
+
 ### FI-1: 「invoke 中 vs 未開始」 の表現を別途持つ必要性
 
 (Naysayer #3a-1 §3 flag、 GitHub Issue 化予定)
@@ -480,16 +556,11 @@ PR #27 (sub-PR 2 timeout) spirrowgames-ops review M-3 由来の meta-process imp
 
 ### FI-2: `transition_state` の 2-phase commit semantics
 
-(Naysayer #3b-2 §4 flag、 GitHub Issue 化予定)
+(Naysayer #3b-2 §4 flag) **Resolved in sub-PR 3 (§3.5 FI-2 resolution detail) — Issue #23 で thread closed**
 
-`atomic_write_text` (meta.yaml) と `EventLogWriter.append` (events.jsonl) は 2 つの file 操作。 1 つ目成功 + 2 つ目失敗 (disk full / permission error) で inconsistency 可能性。
+歴史的経緯: `atomic_write_text` (meta.yaml) と `EventLogWriter.append` (events.jsonl) は 2 つの file 操作で、 1 つ目成功 + 2 つ目失敗 (disk full / permission) で inconsistency 可能性ありと flag された。
 
-decide が必要な点:
-- meta.yaml 先 → events.jsonl 後 (meta.yaml が SOT、 events.jsonl は補完)
-- events.jsonl 先 → meta.yaml 後 (meta.yaml が「event log に書かれた事実」 のみ表現)
-- 失敗時の rollback / detection 戦略
-
-取り扱い時期: sub-PR 3 (retry) 着手時。 Phase 0 では現状の atomic_write_text 2 段で OK、 Phase 1+ で MCP write API 導入時に「transactional write」 が必要になったら SQLite or filesystem-level transaction 検討。
+採用された解: **meta が SOT + events は best-effort + WARNING-only gap detection** (T-FI2-transition-2pc / msg-XXX、 §3.5 参照)。 transactional log や SQLite-backed 解は §6 FI-X1 (WAL) / FI-X2 (event sourcing) に分離。
 
 ### FI-3: dogfooding 後の WatcherConfig 再 audit
 
@@ -498,6 +569,34 @@ decide が必要な点:
 現在の defaults は「実測なし、 経験的暫定値」 中心 (特に `idle_timeout_seconds` / `absolute_timeout_seconds` / `retry_backoff_seconds` / `retry_jitter` / `max_retries` / `orphan_tmp_cleanup_age_seconds`)。 dogfooding 開始後の Phase 1 着手前に実測値で再 audit。
 
 取り扱い時期: Phase 1 設計 phase 着手時。
+
+### FI-4: error classification の dogfooding 後 audit
+
+(sub-PR 3 T-decide-error-classification 由来、 Naysayer pass で carry、 GitHub Issue #32)
+
+sub-PR 3 の error 分類は **allowlist 始点 + safe-by-default permanent** を採用 (= `_TRANSIENT_ERROR_TYPES` で明示的に transient 扱いする exception class を列挙し、 それ以外の `Exception` は permanent → `validation-failed` direct terminated)。 採用根拠は 「未知 error が無限 retry で system を消耗させる」 risk を 「未知 transient を 1 回で terminate する」 risk より避けたいこと。
+
+dogfooding 開始後に観測される具体 error が allowlist に漏れている場合 (= 本来 transient なのに permanent 扱いされて即 terminated)、 retry 機会を逃して `terminated/validation-failed` thread が増える。 観測値で allowlist を拡張するか、 別 framework (e.g. error の `is_retryable` attribute をライブラリ側で持つ) に移行するか判定。
+
+取り扱い時期: dogfooding 開始 (= Phase 0 完了 + 実 thread 数十〜数百件の post-mortem) 後。 trigger は 「`terminated_reason="validation-failed"` thread が予想以上に出てきた case」、 もしくは 「`asyncio.CancelledError` 以外の expected transient error class が出現した case」。
+
+### FI-X1: WAL (write-ahead log) for transactional multi-file writes
+
+(sub-PR 3 T-FI2-transition-2pc Naysayer pass 由来、 GitHub Issue #33 部分連動)
+
+sub-PR 3 で採用された 「meta が SOT + events は best-effort」 は §6.0 の 4 前提 (特に single writer) の下で機能する。 Phase 1+ に MCP write API / multi-instance / external writer 等が加わると、 meta.yaml と events.jsonl の inconsistency window が visibility 上問題化する可能性。
+
+WAL (write-ahead log) や filesystem-level transaction (SQLite-backed log) を導入すると、 meta + events を atomic に commit できる。 ただし introduce すると Phase 0 hedge を一気に強い coupling に転化させる risk もあるので、 4 前提のどれが崩れる時に検討するかを decide してから着手。
+
+trigger 独立記載: 「Phase 1 MCP write API 着手時」 か 「multi-instance watcher 検討時」 のどちらか早い方。 FI-X2 (event sourcing) と排他、 同時採用しない。
+
+### FI-X2: event sourcing reformulation
+
+(sub-PR 3 T-FI2-transition-2pc Naysayer pass 由来、 GitHub Issue #33 部分連動)
+
+meta.yaml を SOT として持つ代わりに、 events.jsonl のみを SOT として meta.yaml を完全 derive する。 audit trail framework の自然な延長で、 retry_count / status / awaiting_from すべてを event log から derive 可能。 dogfooding で「events.jsonl gap が頻発する」 「meta.yaml と events.jsonl の divergence audit cost が高い」 と判明したら検討対象。
+
+trigger 独立記載: 「events.jsonl gap 頻度が `WARNING log 数 / startup 数` で 10% 超える case」 か 「Phase 2+ で web UI / dashboard が events.jsonl 一次依存になる case」 のどちらか。 FI-X1 (WAL) と排他、 同時採用しない。
 
 ## 7. References
 
