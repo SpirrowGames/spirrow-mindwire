@@ -276,7 +276,7 @@ def _validate_transition(old: ThreadStatus, new: ThreadStatus) -> None:
 
 **`awaiting_from` 更新タイミング**: `write_reply` 成功完了時を SOT (§3.1 semantic と整合)。 invoke 開始 / 終了時には更新しない。 retry 中 (= retrying state) の `awaiting_from` は **失敗した invoke の actor を指したまま**。
 
-**FI-2 resolution detail (sub-PR 3、 T-FI2-transition-2pc)**: 「meta が SOT、 events は best-effort」 を採用。 write 順序 = `transition_state` 内 `atomic_write_text` 完了後 caller が `EventLogWriter.append(ThreadStatusChanged)`。 events.jsonl 側 failure (disk full / permission) は exception を raise しても caller が swallow / log のみ (= meta 反映は完了している)、 自動 rollback はしない。 起動時 `startup_full_scan` が events.jsonl 末尾を読んで meta.yaml.status と divergence があれば WARNING ログを出して継続。 (= gap detection 専用 transactional log や WAL は導入しない、 §6 FI-X1 / FI-X2 参照。)
+**FI-2 resolution detail (sub-PR 3、 T-FI2-transition-2pc)**: 「meta が SOT、 events は best-effort」 を採用。 write 順序 = `transition_state` 内 `atomic_write_text` 完了後 caller が `EventLogWriter.append(ThreadStatusChanged)`。 events.jsonl 側 failure (disk full / permission) は exception を raise しても caller が swallow / log のみ (= meta 反映は完了している)、 自動 rollback はしない。 起動時 `startup_full_scan` が events.jsonl 末尾を読んで meta.yaml.status と divergence があれば WARNING ログを出して継続。 (= gap detection 専用 transactional log や WAL は導入しない、 §6 FI-X1 / FI-X2 参照。 元議論 trail は ChatRoom `T-FI2-transition-2pc` thread 参照。)
 
 **retry_count semantics (sub-PR 3、 T-D7-retry-count-semantic、 (b) 採用)**:
 
@@ -564,7 +564,7 @@ framework は decide の pattern recognition tool であって individual implem
 
 歴史的経緯: `atomic_write_text` (meta.yaml) と `EventLogWriter.append` (events.jsonl) は 2 つの file 操作で、 1 つ目成功 + 2 つ目失敗 (disk full / permission) で inconsistency 可能性ありと flag された。
 
-採用された解: **meta が SOT + events は best-effort + WARNING-only gap detection** (T-FI2-transition-2pc / msg-XXX、 §3.5 参照)。 transactional log や SQLite-backed 解は §6 FI-X1 (WAL) / FI-X2 (event sourcing) に分離。
+採用された解: **meta が SOT + events は best-effort + WARNING-only gap detection** (T-FI2-transition-2pc thread、 §3.5 参照)。 transactional log や SQLite-backed 解は §6 FI-X1 (WAL) / FI-X2 (event sourcing) に分離。
 
 ### FI-3: dogfooding 後の WatcherConfig 再 audit
 
@@ -586,21 +586,21 @@ dogfooding 開始後に観測される具体 error が allowlist に漏れてい
 
 ### FI-X1: WAL (write-ahead log) for transactional multi-file writes
 
-(sub-PR 3 T-FI2-transition-2pc Naysayer pass 由来、 GitHub Issue #33 部分連動)
+(sub-PR 3 T-FI2-transition-2pc Naysayer pass 由来、 GitHub Issue TBD)
 
 sub-PR 3 で採用された 「meta が SOT + events は best-effort」 は §6.0 の 4 前提 (特に single writer) の下で機能する。 Phase 1+ に MCP write API / multi-instance / external writer 等が加わると、 meta.yaml と events.jsonl の inconsistency window が visibility 上問題化する可能性。
 
 WAL (write-ahead log) や filesystem-level transaction (SQLite-backed log) を導入すると、 meta + events を atomic に commit できる。 ただし introduce すると Phase 0 hedge を一気に強い coupling に転化させる risk もあるので、 4 前提のどれが崩れる時に検討するかを decide してから着手。
 
-trigger 独立記載: 「Phase 1 MCP write API 着手時」 か 「multi-instance watcher 検討時」 のどちらか早い方。 FI-X2 (event sourcing) と排他、 同時採用しない。
+trigger 独立記載: 「Phase 1 MCP write API 着手時」 か 「multi-instance watcher 検討時」 のどちらか早い方。 FI-X2 (event sourcing) と排他、 同時採用しない。 (Note: 本 FI と FI-X2 は Issue #33 = retry_backoff_seconds vs dedup TTL cross-config invariant とは別 scope、 trigger 観測時に専用 Issue を立てて trackable 化する。)
 
 ### FI-X2: event sourcing reformulation
 
-(sub-PR 3 T-FI2-transition-2pc Naysayer pass 由来、 GitHub Issue #33 部分連動)
+(sub-PR 3 T-FI2-transition-2pc Naysayer pass 由来、 GitHub Issue TBD)
 
 meta.yaml を SOT として持つ代わりに、 events.jsonl のみを SOT として meta.yaml を完全 derive する。 audit trail framework の自然な延長で、 retry_count / status / awaiting_from すべてを event log から derive 可能。 dogfooding で「events.jsonl gap が頻発する」 「meta.yaml と events.jsonl の divergence audit cost が高い」 と判明したら検討対象。
 
-trigger 独立記載: 「events.jsonl gap 頻度が `WARNING log 数 / startup 数` で 10% 超える case」 か 「Phase 2+ で web UI / dashboard が events.jsonl 一次依存になる case」 のどちらか。 FI-X1 (WAL) と排他、 同時採用しない。
+trigger 独立記載: 「events.jsonl gap 頻度が `WARNING log 数 / startup 数` で 10% 超える case」 か 「Phase 2+ で web UI / dashboard が events.jsonl 一次依存になる case」 のどちらか。 FI-X1 (WAL) と排他、 同時採用しない。 (Note: Issue #33 とは別 scope、 trigger 観測時に専用 Issue 化。)
 
 ## 7. References
 

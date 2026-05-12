@@ -53,6 +53,7 @@ import random
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from spirrow_mindwire.claude_code import (
     SYSTEM_PROMPT,
@@ -103,6 +104,21 @@ allowlist hits the ``else`` branch in ``_run_thread`` and goes to
 transient types (e.g. an SDK rate-limit class once one exists upstream)
 by appending here. See docs/feature-2-design.md §6 FI-4 for the
 dogfooding-pending re-audit policy and Issue #32 for tracking.
+
+Phase 0 stance: module-level constant (= operator override unsupported,
+all changes happen in this module). Phase 1+ migration candidates if
+dogfooding shows the allowlist is too rigid for specific deployments
+(T-decide-error-classification msg-074 §2-2):
+
+- ``WatcherConfig.transient_error_types: frozenset[str] = ...`` —
+  operator declares additional transient classes by qualified name,
+  validated against an importable allowlist at config load.
+- ``lifecycle/error_classification.py`` extract — share the allowlist
+  + ``_is_transient`` helper with sub-PR 4 terminate path so the
+  ``transient`` / ``permanent`` taxonomy has a single source of truth
+  outside of the dispatcher.
+
+Until either trigger fires, the safe-by-default constant lives here.
 """
 
 
@@ -198,56 +214,83 @@ class ThreadDispatcher:
 
     async def _run_thread(self, event: ThreadEvent) -> None:
         layout = ThreadDirLayout(base_dir=self._base_dir, thread_id=event.thread_id)
-        initial_meta = load_thread_meta(layout)
-        # Feature 2: terminal states are never auto-revived (docs §3.6).
-        # Operator manual transitions go through meta.yaml edits; until
-        # status is set back to active by the operator, skip the event.
-        if initial_meta.status in TERMINAL_STATES:
-            logger.info(
-                "thread %s is in terminal state %s; skipping event",
-                event.thread_id,
-                initial_meta.status,
-            )
-            return
-        messages = load_messages(layout)
-        if not messages:
-            logger.warning("thread %s has no messages on disk; skipping", event.thread_id)
-            return
-
-        latest = messages[-1]
-        # Phase 0 happy path: the watcher only invokes claude-code in
-        # response to claude.ai messages. Replies authored by claude-code
-        # itself end up here too (we just wrote them via write_reply);
-        # skip those to avoid an infinite loop.
-        if latest.from_ != "claude.ai":
-            logger.debug(
-                "latest message in %s is from %s; nothing to do",
-                event.thread_id,
-                latest.from_,
-            )
-            return
-
-        sender: Participant = "claude-code"
-        recipient: Participant = "claude.ai"
-        next_seq = latest.seq + 1
-
-        prompt = build_thread_prompt(initial_meta, messages)
-        mcp_server = build_mindwire_mcp_server(
-            layout=layout,
-            next_seq=next_seq,
-            sender=sender,
-            recipient=recipient,
-            phanthand_client=self._phanthand_client,
-        )
-
         log = EventLogWriter(layout.event_log_path)
 
-        # Feature 2 sub-PR 3: retry loop. See dispatcher module docstring
-        # for the full algorithm; the loop bypasses dedup (D-6 (a)) and
-        # advances ThreadMeta.retry_count for audit-trail framing
-        # (D-7 (b)). max_retries=0 disables retry: a single transient
-        # failure terminates the thread.
+        # Feature 2 sub-PR 3 (Copilot review C-1 follow-up): the retry loop
+        # reloads meta + messages and rebuilds prompt + MCP server at the
+        # top of each attempt. This makes the dispatcher consistent with
+        # docs §3.4 D-3 on-disk truth / commit-and-forward semantics and
+        # protects three otherwise-silent edge cases:
+        #
+        #  (a) status staleness — after a transient failure transitions
+        #      meta to ``retrying``, attempt N>0 was previously sending a
+        #      prompt with ``status="active"`` baked in (build_thread_prompt
+        #      renders meta.status as an attribute).
+        #  (b) partial write_reply overwrite — claude-code can land a reply
+        #      via mcp__mindwire__write_reply just before a timeout fires;
+        #      reusing the original ``next_seq`` on retry would silently
+        #      overwrite that reply (next_seq is captured at MCP server
+        #      construction). On reload, ``next_seq = latest.seq + 1`` is
+        #      recomputed, and if the new latest is from claude-code we
+        #      treat the session as effectively succeeded and recover.
+        #  (c) operator manual terminate mid-retry — operator can edit
+        #      meta.yaml to ``terminated`` between attempts (docs §3.6);
+        #      reloading lets us honour that promptly instead of running
+        #      one more invoke we don't want.
+        #
+        # The reload is two disk reads per attempt — cheap relative to a
+        # real invoke. ``max_retries=0`` collapses to the original single-
+        # attempt behaviour.
         for attempt in range(self._max_retries + 1):
+            current_meta = load_thread_meta(layout)
+            # Edge (c): terminal states are never auto-revived (docs §3.6).
+            if current_meta.status in TERMINAL_STATES:
+                logger.info(
+                    "thread %s is in terminal state %s; skipping event",
+                    event.thread_id,
+                    current_meta.status,
+                )
+                return
+            messages = load_messages(layout)
+            if not messages:
+                logger.warning("thread %s has no messages on disk; skipping", event.thread_id)
+                return
+
+            latest = messages[-1]
+            if latest.from_ != "claude.ai":
+                # Phase 0 happy path: the watcher only invokes claude-code in
+                # response to claude.ai messages.
+                if current_meta.status == "retrying":
+                    # Edge (b): partial write_reply landed during a prior
+                    # attempt's invoke window. Recover to active so the
+                    # thread isn't stuck in ``retrying`` forever.
+                    self._recover_retrying_to_active(
+                        layout=layout,
+                        event=event,
+                        log=log,
+                        attempt=attempt,
+                        reason="partial_write_reply",
+                    )
+                else:
+                    logger.debug(
+                        "latest message in %s is from %s; nothing to do",
+                        event.thread_id,
+                        latest.from_,
+                    )
+                return
+
+            sender: Participant = "claude-code"
+            recipient: Participant = "claude.ai"
+            next_seq = latest.seq + 1
+            prompt = build_thread_prompt(current_meta, messages)
+            mcp_server = build_mindwire_mcp_server(
+                layout=layout,
+                next_seq=next_seq,
+                sender=sender,
+                recipient=recipient,
+                phanthand_client=self._phanthand_client,
+            )
+
             log.append(
                 ClaudeCodeInvokeStart(
                     schema_version=1,
@@ -314,6 +357,12 @@ class ThreadDispatcher:
                             event_id=new_ulid(),
                             ts=datetime.now(UTC),
                             thread_id=event.thread_id,
+                            # attempt_num is 1-based and refers to the
+                            # upcoming retry attempt (= attempt that runs
+                            # after this backoff); the 0-based ``attempt``
+                            # loop counter becomes 1-based here. See
+                            # ``RetryBackoffStarted`` docstring for the full
+                            # semantic.
                             attempt_num=attempt + 1,
                             backoff_seconds=backoff,
                         )
@@ -330,30 +379,7 @@ class ThreadDispatcher:
                     await asyncio.sleep(backoff)
                     continue
                 # Permanent (safe-by-default) → terminated/validation-failed.
-                logger.warning(
-                    "thread %s permanent failure (%s); terminating",
-                    event.thread_id,
-                    type(exc).__name__,
-                    exc_info=True,
-                )
-                current_meta = load_thread_meta(layout)
-                new_meta = transition_state(
-                    layout,
-                    "terminated",
-                    awaiting_from=None,
-                    terminated_reason="validation-failed",
-                )
-                log.append(
-                    ThreadStatusChanged(
-                        schema_version=1,
-                        event_id=new_ulid(),
-                        ts=datetime.now(UTC),
-                        thread_id=event.thread_id,
-                        from_status=current_meta.status,
-                        to_status="terminated",
-                        retry_count=new_meta.retry_count,
-                    )
-                )
+                self._handle_permanent_failure(layout=layout, event=event, exc=exc, log=log)
                 return
 
             # Success path.
@@ -368,34 +394,14 @@ class ThreadDispatcher:
                     exit_code=1 if result.is_error else 0,
                 )
             )
-            # If this _run_thread entered (or transitioned into)
-            # ``retrying`` during the loop, transition back to ``active``
-            # while preserving retry_count (D-7 (b) audit-trail framing).
-            current_meta = load_thread_meta(layout)
-            if current_meta.status == "retrying":
-                new_meta = transition_state(
-                    layout,
-                    "active",
-                    awaiting_from=current_meta.awaiting_from,
-                    # retry_count=None preserves on-disk value.
-                )
-                log.append(
-                    ThreadStatusChanged(
-                        schema_version=1,
-                        event_id=new_ulid(),
-                        ts=datetime.now(UTC),
-                        thread_id=event.thread_id,
-                        from_status="retrying",
-                        to_status="active",
-                        retry_count=new_meta.retry_count,
-                    )
-                )
-                logger.info(
-                    "thread %s recovered after %d retry attempt(s); retry_count preserved at %d",
-                    event.thread_id,
-                    attempt,
-                    new_meta.retry_count,
-                )
+            # If we entered ``retrying`` earlier in the loop, transition back.
+            self._recover_retrying_to_active(
+                layout=layout,
+                event=event,
+                log=log,
+                attempt=attempt,
+                reason="invoke_success",
+            )
             return
 
     def _handle_transient_failure(
@@ -477,12 +483,125 @@ class ThreadDispatcher:
             # No ThreadStatusChanged — status is unchanged (retrying → retrying
             # self-loop is forbidden, see _ALLOWED_TRANSITIONS).
 
+    def _handle_permanent_failure(
+        self,
+        *,
+        layout: ThreadDirLayout,
+        event: ThreadEvent,
+        exc: BaseException,
+        log: EventLogWriter,
+    ) -> None:
+        """Transition the thread to ``terminated/validation-failed``.
+
+        Symmetric counterpart of :meth:`_handle_transient_failure`: when
+        ``_is_transient(exc)`` is False (= allowlist miss = safe-by-default
+        permanent), the retry loop calls this helper instead of bumping
+        ``retry_count``. The traceback is captured at WARNING via
+        ``exc_info=True`` so the watcher log keeps a stack trace even
+        though the exception is intentionally swallowed (= contained at
+        the dispatcher boundary so a single bad invoke doesn't bring
+        down the watcher).
+
+        Allowlist policy and dogfooding re-audit triggers: see
+        docs/feature-2-design.md §6 FI-4 / Issue #32 and the
+        :data:`_TRANSIENT_ERROR_TYPES` docstring.
+        """
+        logger.warning(
+            "thread %s permanent failure (%s); terminating",
+            event.thread_id,
+            type(exc).__name__,
+            exc_info=True,
+        )
+        current_meta = load_thread_meta(layout)
+        new_meta = transition_state(
+            layout,
+            "terminated",
+            awaiting_from=None,
+            terminated_reason="validation-failed",
+        )
+        log.append(
+            ThreadStatusChanged(
+                schema_version=1,
+                event_id=new_ulid(),
+                ts=datetime.now(UTC),
+                thread_id=event.thread_id,
+                from_status=current_meta.status,
+                to_status="terminated",
+                retry_count=new_meta.retry_count,
+            )
+        )
+
+    def _recover_retrying_to_active(
+        self,
+        *,
+        layout: ThreadDirLayout,
+        event: ThreadEvent,
+        log: EventLogWriter,
+        attempt: int,
+        reason: Literal["invoke_success", "partial_write_reply"],
+    ) -> None:
+        """If meta is in ``retrying``, transition back to ``active``.
+
+        Shared between two retry-recovery code paths:
+
+        - ``invoke_success``: the SDK invoke returned normally, so the
+          thread is no longer waiting on a transient error.
+        - ``partial_write_reply``: a prior attempt's invoke timed out
+          *after* claude-code already wrote its reply via
+          ``mcp__mindwire__write_reply``; the per-attempt reload (Copilot
+          review C-1) detected the new reply and we treat the session as
+          effectively succeeded.
+
+        Either way ``retry_count`` is preserved (D-7 (b) audit-trail
+        framing; ``transition_state(retry_count=None)`` keeps the on-disk
+        value). No-op if the thread is not in ``retrying`` (e.g. attempt 0
+        succeeded without ever bumping).
+        """
+        current_meta = load_thread_meta(layout)
+        if current_meta.status != "retrying":
+            return
+        new_meta = transition_state(
+            layout,
+            "active",
+            awaiting_from=current_meta.awaiting_from,
+            # retry_count=None preserves on-disk value.
+        )
+        log.append(
+            ThreadStatusChanged(
+                schema_version=1,
+                event_id=new_ulid(),
+                ts=datetime.now(UTC),
+                thread_id=event.thread_id,
+                from_status="retrying",
+                to_status="active",
+                retry_count=new_meta.retry_count,
+            )
+        )
+        logger.info(
+            "thread %s recovered (%s) after attempt %d; retry_count preserved at %d",
+            event.thread_id,
+            reason,
+            attempt,
+            new_meta.retry_count,
+        )
+
     def _compute_backoff(self, attempt: int) -> float:
         """Return the post-attempt backoff sleep, with optional jitter.
 
         ``retry_backoff_seconds[attempt]`` is the base value; jitter is
         symmetric around it (``base * (1 ± retry_jitter)``) and clamped
         at zero so ``retry_jitter > 1`` never produces negative sleep.
+
+        NOTE on the ``max(0.0, ...)`` clamp: when ``ThreadDispatcher`` is
+        constructed via :class:`MindwireSettings` (= production path),
+        ``WatcherConfig.retry_jitter`` is validated to ``[0, 1]``
+        (``Field(default=0.2, ge=0, le=1)``), which makes the clamp dead
+        code — ``base + uniform(-base, base)`` is non-negative. The clamp
+        remains as **defense-in-depth** for unit tests / future paths
+        that instantiate the dispatcher directly with a ``retry_jitter``
+        outside the config-validated range (= MindwireSettings bypass).
+        Removing the clamp would silently produce negative sleeps in
+        that case, so we keep it.
         """
         base = self._retry_backoff_seconds[attempt]
         if self._retry_jitter == 0:

@@ -839,6 +839,80 @@ async def test_dispatcher_propagates_cancelled_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_dispatcher_retry_recovers_from_partial_write_reply(tmp_path: Path) -> None:
+    """Partial write_reply landed before timeout → reload detects it on
+    attempt 1 and recovers ``retrying → active`` instead of overwriting
+    via stale next_seq (Copilot review C-1 + docs §3.4 D-3 on-disk truth).
+
+    Without the per-attempt reload introduced in commit-XXX, the retry
+    loop would re-use the original ``next_seq`` captured at MCP server
+    construction time, causing the second invoke to silently overwrite
+    the partial reply via ``atomic_write_text``. With the reload, the
+    new ``latest.from_ == "claude-code"`` is detected before another
+    invoke; the retry session recovers and ``retry_count`` is preserved
+    as the audit trail of "one transient failure happened during this
+    session" (D-7 (b)).
+    """
+    layout = _seed_thread(tmp_path)
+    call_counter: list[int] = []
+
+    async def writes_then_times_out_invoker(**kwargs: Any) -> InvokeResult:
+        call_counter.append(1)
+        # Simulate partial write_reply: the reply file lands on disk via
+        # mcp__mindwire__write_reply during the SDK stream, then the SDK
+        # idle/absolute timeout fires before the run can complete.
+        write_message_file(layout, 2, "claude-code", body="partial reply landed", atomic=True)
+        raise InvokeTimeoutError("idle", 0.1)
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=writes_then_times_out_invoker,
+        max_retries=2,
+        retry_backoff_seconds=(0.0, 0.0),
+        retry_jitter=0.0,
+    )
+
+    await dispatcher.handle(_event())
+
+    # Invoker called exactly once: attempt 1 bails out at the reload check.
+    assert call_counter == [1], (
+        "retry must NOT re-invoke once a write_reply landed (would overwrite via stale next_seq)"
+    )
+
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "active"  # recovered from retrying
+    assert new_meta.retry_count == 1  # preserved bump from attempt 0
+    assert new_meta.awaiting_from == "claude-code"
+
+    log_lines = [
+        json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    types = [entry["type"] for entry in log_lines]
+    # Attempt 0: start + end + status_changed (active → retrying) + backoff_started.
+    # Attempt 1: reload short-circuits before InvokeStart; emits recovery
+    # status_changed (retrying → active).
+    assert types == [
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.status.changed",  # active → retrying (bump on attempt 0)
+        "thread.retry.backoff_started",
+        "thread.status.changed",  # retrying → active (partial-write_reply recovery)
+    ]
+    recovery = log_lines[-1]
+    assert recovery["from_status"] == "retrying"
+    assert recovery["to_status"] == "active"
+    assert recovery["retry_count"] == 1
+
+    # Verify the partial reply file actually exists (= not overwritten).
+    msg_path = layout.message_path(2, "claude-code")
+    assert msg_path.is_file()
+
+
+@pytest.mark.anyio
 async def test_dispatcher_permanent_error_terminates_without_retry(tmp_path: Path) -> None:
     """Non-allowlisted exception → terminated/validation-failed, no retry attempts."""
     layout = _seed_thread(tmp_path)
