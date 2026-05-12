@@ -531,3 +531,342 @@ async def test_dispatcher_skips_terminal_state(
     assert captured == {}
     # No event log written either (early return is before any log.append).
     assert not layout.event_log_path.exists()
+
+
+# ----- Feature 2 sub-PR 3: retry loop --------------------------------------
+
+
+def _flaky_timeout_invoker(
+    failures: int,
+    success_result: InvokeResult,
+    kind: Literal["idle", "absolute"] = "idle",
+    elapsed_seconds: float = 0.1,
+    call_counter: list[int] | None = None,
+) -> Any:
+    """Invoker that times out *failures* times, then returns *success_result*.
+
+    ``call_counter`` (if provided) is appended-to on each call so tests can
+    introspect how many attempts were made.
+    """
+    state = {"count": 0}
+
+    async def fake(**kwargs: Any) -> InvokeResult:
+        state["count"] += 1
+        if call_counter is not None:
+            call_counter.append(state["count"])
+        if state["count"] <= failures:
+            raise InvokeTimeoutError(kind, elapsed_seconds)
+        return success_result
+
+    return fake
+
+
+def _cancelled_invoker() -> Any:
+    async def fake(**kwargs: Any) -> InvokeResult:
+        raise asyncio.CancelledError()
+
+    return fake
+
+
+@pytest.mark.anyio
+async def test_dispatcher_retry_succeeds_after_transient_failures(tmp_path: Path) -> None:
+    """N transient failures then success → status=active, retry_count preserved.
+
+    Verifies the D-7 (b) preserve semantic: retry_count grows during the
+    retry session (1 bump per failure for the active→retrying first
+    transition), and stays at that value after the retrying→active
+    recovery (= the audit trail of "this thread needed N retries to
+    succeed" is persisted).
+    """
+    layout = _seed_thread(tmp_path)
+    call_counter: list[int] = []
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_flaky_timeout_invoker(
+            failures=1, success_result=_ok_result(), call_counter=call_counter
+        ),
+        max_retries=2,
+        retry_backoff_seconds=(0.0, 0.0),
+        retry_jitter=0.0,
+    )
+
+    await dispatcher.handle(_event())
+
+    # Invoker called twice (= 1 failure + 1 success).
+    assert call_counter == [1, 2]
+
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "active"
+    assert new_meta.retry_count == 1  # 1 bump during retry, preserved after success
+    assert new_meta.awaiting_from == "claude-code"
+
+    log_lines = [
+        json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    types = [entry["type"] for entry in log_lines]
+    assert types == [
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.status.changed",  # active → retrying
+        "thread.retry.backoff_started",
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.status.changed",  # retrying → active (recovery)
+    ]
+    sc_active_to_retrying = log_lines[2]
+    assert sc_active_to_retrying["from_status"] == "active"
+    assert sc_active_to_retrying["to_status"] == "retrying"
+    assert sc_active_to_retrying["retry_count"] == 1
+    assert log_lines[3]["attempt_num"] == 1
+    assert log_lines[3]["backoff_seconds"] == 0.0
+    sc_recovery = log_lines[6]
+    assert sc_recovery["from_status"] == "retrying"
+    assert sc_recovery["to_status"] == "active"
+    assert sc_recovery["retry_count"] == 1
+
+
+@pytest.mark.anyio
+async def test_dispatcher_retry_exhausts_to_terminated_with_bumps(tmp_path: Path) -> None:
+    """All retry attempts fail → terminated/retry-exhausted, retry_count = max bumps.
+
+    With ``max_retries=2`` + ``retry_count=0`` initial: 3 invoke attempts,
+    2 bumps (attempt 0 + attempt 1 are non-exhaustion paths), final attempt
+    skips bump and goes direct to terminated → retry_count ends at 2.
+    """
+    layout = _seed_thread(tmp_path)
+    call_counter: list[int] = []
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_flaky_timeout_invoker(
+            failures=99,  # always fail
+            success_result=_ok_result(),
+            call_counter=call_counter,
+        ),
+        max_retries=2,
+        retry_backoff_seconds=(0.0, 0.0),
+        retry_jitter=0.0,
+    )
+
+    await dispatcher.handle(_event())
+
+    # 3 invocations total (max_retries=2 → 3 attempts).
+    assert call_counter == [1, 2, 3]
+
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "terminated"
+    assert new_meta.terminated_reason == "retry-exhausted"
+    # 2 bumps (attempts 0 and 1); attempt 2 is direct exhaustion without bump.
+    assert new_meta.retry_count == 2
+    assert new_meta.awaiting_from is None
+
+    log_lines = [
+        json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    types = [entry["type"] for entry in log_lines]
+    assert types == [
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.status.changed",  # active → retrying (bump 1)
+        "thread.retry.backoff_started",
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        # bump_retry_count: no ThreadStatusChanged on retrying → retrying
+        "thread.retry.backoff_started",
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.status.changed",  # retrying → terminated (retry-exhausted)
+    ]
+    backoff_events = [e for e in log_lines if e["type"] == "thread.retry.backoff_started"]
+    assert [e["attempt_num"] for e in backoff_events] == [1, 2]
+    final_status = log_lines[-1]
+    assert final_status["from_status"] == "retrying"
+    assert final_status["to_status"] == "terminated"
+    assert final_status["retry_count"] == 2
+
+
+@pytest.mark.anyio
+async def test_dispatcher_retry_bypasses_dedup_between_attempts(tmp_path: Path) -> None:
+    """D-6 (a): the retry loop calls the invoker multiple times within a single
+    ``dispatcher.handle()`` call, regardless of DedupCache state.
+
+    DedupCache gates the *entry* into ``_run_thread`` (= which event spawns
+    a retry session) but not the attempts within a session. With
+    ``max_retries=2`` and an always-failing invoker, the invoker is hit 3
+    times even though the same (thread_id, seq) is being processed.
+    """
+    _seed_thread(tmp_path)
+    call_counter: list[int] = []
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=60)),  # long TTL irrelevant
+        invoker=_flaky_timeout_invoker(
+            failures=99, success_result=_ok_result(), call_counter=call_counter
+        ),
+        max_retries=2,
+        retry_backoff_seconds=(0.0, 0.0),
+        retry_jitter=0.0,
+    )
+
+    await dispatcher.handle(_event())
+
+    assert call_counter == [1, 2, 3], "retry loop must bypass dedup between attempts"
+
+
+@pytest.mark.anyio
+async def test_dispatcher_retry_count_cumulative_from_existing(tmp_path: Path) -> None:
+    """retry_count is cumulative across thread lifetime (D-7 (b) audit trail).
+
+    Seed retry_count=2 (= a prior retry session under a hypothetical earlier
+    watcher run). New retry session bumps to 2+max_retries (one bump per
+    non-exhaust attempt). Persistent counter grows; only ``max_retries`` is
+    the per-_run_thread gate.
+    """
+    layout = ThreadDirLayout(base_dir=tmp_path, thread_id=ULID_A)
+    seed_thread_meta(layout, status="active", awaiting_from="claude-code", retry_count=2)
+    write_message_file(layout, 1, "claude.ai", atomic=False)
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_timeout_invoker(),
+        max_retries=2,
+        retry_backoff_seconds=(0.0, 0.0),
+        retry_jitter=0.0,
+    )
+
+    await dispatcher.handle(_event())
+
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "terminated"
+    assert new_meta.retry_count == 4  # 2 initial + 2 bumps (attempts 0 + 1)
+
+
+@pytest.mark.anyio
+async def test_dispatcher_retry_uses_bump_when_entry_status_is_retrying(
+    tmp_path: Path,
+) -> None:
+    """retrying-on-entry (= startup_full_scan requeue scenario): first
+    transient failure uses ``bump_retry_count`` (not ``transition_state``)
+    because ``retrying → retrying`` is forbidden by ``_ALLOWED_TRANSITIONS``.
+
+    ``ThreadStatusChanged`` for the first attempt is **not** emitted (status
+    unchanged); on retry exhaustion the final ``retrying → terminated``
+    is emitted normally.
+    """
+    layout = ThreadDirLayout(base_dir=tmp_path, thread_id=ULID_A)
+    seed_thread_meta(layout, status="retrying", awaiting_from="claude-code", retry_count=1)
+    write_message_file(layout, 1, "claude.ai", atomic=False)
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_timeout_invoker(),
+        max_retries=1,
+        retry_backoff_seconds=(0.0,),
+        retry_jitter=0.0,
+    )
+
+    await dispatcher.handle(_event())
+
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "terminated"
+    assert new_meta.retry_count == 2  # 1 initial + 1 bump (attempt 0)
+
+    log_lines = [
+        json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    types = [entry["type"] for entry in log_lines]
+    # First attempt: bump-only, no ThreadStatusChanged.
+    # Second attempt: retry-exhausted, retrying → terminated.
+    assert types == [
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.retry.backoff_started",
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.status.changed",
+    ]
+    final_status = log_lines[-1]
+    assert final_status["from_status"] == "retrying"
+    assert final_status["to_status"] == "terminated"
+
+
+@pytest.mark.anyio
+async def test_dispatcher_propagates_cancelled_error(tmp_path: Path) -> None:
+    """``asyncio.CancelledError`` is shutdown signal: propagate, don't retry."""
+    layout = _seed_thread(tmp_path)
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_cancelled_invoker(),
+        max_retries=3,
+        retry_backoff_seconds=(0.0, 0.0, 0.0),
+        retry_jitter=0.0,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await dispatcher.handle(_event())
+
+    # Status is unchanged (still active) — we propagated before any transition.
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "active"
+    assert new_meta.retry_count == 0
+
+    # InvokeEnd was logged before the raise (for traceability), but no retry / transition.
+    log_lines = [
+        json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    types = [entry["type"] for entry in log_lines]
+    assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
+
+
+@pytest.mark.anyio
+async def test_dispatcher_permanent_error_terminates_without_retry(tmp_path: Path) -> None:
+    """Non-allowlisted exception → terminated/validation-failed, no retry attempts."""
+    layout = _seed_thread(tmp_path)
+    call_counter: list[int] = []
+
+    async def permanent_failing_invoker(**kwargs: Any) -> InvokeResult:
+        call_counter.append(1)
+        raise ValueError("malformed thread data — not a retry-worthy error")
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=permanent_failing_invoker,
+        max_retries=3,
+        retry_backoff_seconds=(0.0, 0.0, 0.0),
+        retry_jitter=0.0,
+    )
+
+    # Permanent error is swallowed (= safe-by-default).
+    await dispatcher.handle(_event())
+
+    # Invoker called once only — no retries on permanent errors.
+    assert len(call_counter) == 1
+
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "terminated"
+    assert new_meta.terminated_reason == "validation-failed"
+    assert new_meta.retry_count == 0  # never bumped, went direct to terminated
