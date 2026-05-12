@@ -377,6 +377,8 @@ class WatcherConfig(_StrictModel):
 
 **Flag (sub-PR 3 で対応)**: `retry_backoff_seconds: tuple[float, ...]` に min length / monotonic increase の field validator が無く、 例えば `(120, 30, 5)` のような decreasing 値も pass する。 sub-PR 3 (retry) 着手時に field validator 追加検討。
 
+**sub-PR 3 close note (#14 max_retries audit cycle carry、 T-D7-retry-count-semantic (b))**: `max_retries=3` は dogfooding まで暫定値として継続採用、 sub-PR 3 では値変更しない。 D-7 (b) で確定した cumulative + audit trail framing (= retry_count は per-_run_thread gate ではなく persisted observable、 §3.5 参照) の評価は dogfooding 開始後の FI-3 / FI-4 re-audit cycle で行う。 観測 trigger: 「`terminated/retry-exhausted` thread が予想以上に頻発」 or 「`retry_count` が累積で 3 を大きく超える case が一般化」、 どちらかが Phase 1 設計 phase 着手前に観測されたら `max_retries` 値そのものの再 audit に持ち込む。 sub-PR 3 完了後 `Issue #33` の cross-config invariant audit (= integration test pass で 「不要化 confirm」) と並行して、 dogfooding 観測値を集める運用に移行する。
+
 ## 5. 4 sub-PR の境界 + 着手順序 (Decide #5)
 
 ### 5.1 各 sub-PR の中身
