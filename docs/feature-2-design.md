@@ -272,6 +272,8 @@ def _validate_transition(old: ThreadStatus, new: ThreadStatus) -> None:
         raise InvalidTransitionError(...)
 ```
 
+**events.jsonl event types: occurrence vs snapshot**: sub-PR 3 で追加する `RetryBackoffStarted` (occurrence = backoff sleep が始まった事実) と、 既存 `ThreadStatusChanged` (snapshot = 遷移完了後の state を carry、 retry_count field 追加で snapshot 化を強化) は意図的に分離して持つ。 occurrence は 「いつ何が起きた」 audit、 snapshot は 「どの state に遷移したか」 audit で role が異なる。 `ThreadStatusChanged.retry_count` は post-write meta.yaml 値の mirror、 event log alone で retry 履歴を再構築できる。 詳細 docstring は `schema/event.py` module docstring 参照。
+
 **`awaiting_from` 更新タイミング**: `write_reply` 成功完了時を SOT (§3.1 semantic と整合)。 invoke 開始 / 終了時には更新しない。 retry 中 (= retrying state) の `awaiting_from` は **失敗した invoke の actor を指したまま**。
 
 **FI-2 resolution detail (sub-PR 3、 T-FI2-transition-2pc)**: 「meta が SOT、 events は best-effort」 を採用。 write 順序 = `transition_state` 内 `atomic_write_text` 完了後 caller が `EventLogWriter.append(ThreadStatusChanged)`。 events.jsonl 側 failure (disk full / permission) は exception を raise しても caller が swallow / log のみ (= meta 反映は完了している)、 自動 rollback はしない。 起動時 `startup_full_scan` が events.jsonl 末尾を読んで meta.yaml.status と divergence があれば WARNING ログを出して継続。 (= gap detection 専用 transactional log や WAL は導入しない、 §6 FI-X1 / FI-X2 参照。)
