@@ -9,7 +9,7 @@ in §1 (no ``related.*`` / ``external_refs.*`` / ``metadata.*`` creep).
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Literal, assert_never
 
 from pydantic import AfterValidator, BaseModel, ConfigDict
 from ulid import ULID
@@ -102,13 +102,22 @@ def opposite_of(participant: Participant) -> Participant:
     an explicit name, so callers updating ``awaiting_from`` after a
     write_reply success do not silently re-encode the pairing inline.
 
-    Phase 1+ multi-participant extension is not a future-proofing concern
-    here — the Literal will gain new members and any caller of this
-    helper will fail type checking at that point, which is the correct
-    forcing function (= the "next turn" concept is no longer a binary
-    flip, so the call site must be revisited).
+    **Exhaustive match + `assert_never`** (PR #40 review Copilot inline-4 /
+    claude.ai N1): a plain ``"claude-code" if ... else "claude.ai"``
+    silently maps any future Literal expansion (e.g. an additional
+    ``"operator"`` participant in Phase 1+) to ``"claude.ai"``. Using
+    ``match`` with explicit cases plus ``assert_never`` makes that
+    failure mode loud: mypy fails at the call site, and at runtime an
+    unknown participant raises ``AssertionError`` instead of returning
+    a misleading default.
     """
-    return "claude-code" if participant == "claude.ai" else "claude.ai"
+    match participant:
+        case "claude.ai":
+            return "claude-code"
+        case "claude-code":
+            return "claude.ai"
+        case _:
+            assert_never(participant)
 
 
 class StrictModel(BaseModel):

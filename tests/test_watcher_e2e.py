@@ -103,6 +103,10 @@ async def test_observer_to_dispatcher_happy_path(tmp_path: Path) -> None:
 
     async def fake_invoker(**kwargs: Any) -> InvokeResult:
         invoker_calls.append(kwargs)
+        # Simulate mcp__mindwire__write_reply landing the reply file
+        # (PR #40 review: dispatcher's Phase1-Obs1 gate requires the
+        # claude-code message at next_seq=3 on disk, not just SDK success).
+        write_message_file(layout, 3, "claude-code", "fake reply", atomic=True)
         return InvokeResult(
             is_error=False,
             duration_ms=42,
