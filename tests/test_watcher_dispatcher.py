@@ -63,6 +63,36 @@ def _invoker(captured: dict[str, Any], result: InvokeResult) -> Any:
     return fake
 
 
+def _invoker_with_write_reply(
+    layout: ThreadDirLayout,
+    next_seq: int,
+    sender: Participant,
+    result: InvokeResult,
+    captured: dict[str, Any] | None = None,
+    *,
+    body: str = "fake reply",
+) -> Any:
+    """Fake invoker that lands the reply message before returning ``result``.
+
+    Mirrors production behavior where the SDK invokes
+    ``mcp__mindwire__write_reply`` to write the reply file before
+    finishing. PR #40 review (Copilot inline-1〜3 / claude.ai C2)
+    pointed out that the bare ``_invoker`` returning success without
+    creating the reply file mis-pins the Phase1-Obs1 toggle (=
+    dispatcher's production gate is "claude-code message at next_seq
+    on disk", not "SDK returned success"). Use this fake when the test
+    intends to exercise the success-with-write_reply path."""
+
+    async def fake(**kwargs: Any) -> InvokeResult:
+        if captured is not None:
+            captured.update(kwargs)
+        # Simulate mcp__mindwire__write_reply landing the file.
+        write_message_file(layout, next_seq, sender, body, atomic=True)
+        return result
+
+    return fake
+
+
 def _timeout_invoker(
     kind: Literal["idle", "absolute"] = "idle", elapsed_seconds: float = 0.5
 ) -> Any:
@@ -97,7 +127,9 @@ async def test_dispatcher_invokes_for_claude_ai_message(tmp_path: Path) -> None:
         base_dir=tmp_path,
         phanthand_client=AsyncMock(spec=PhanthandClient),
         dedup=DedupCache(ttl=timedelta(seconds=5)),
-        invoker=_invoker(captured, _ok_result()),
+        invoker=_invoker_with_write_reply(
+            layout, next_seq=2, sender="claude-code", result=_ok_result(), captured=captured
+        ),
     )
 
     await dispatcher.handle(_event())
@@ -114,13 +146,114 @@ async def test_dispatcher_invokes_for_claude_ai_message(tmp_path: Path) -> None:
     assert "mindwire" in captured["mcp_servers"]
     assert "<mw_thread" in captured["prompt"]
 
-    # Event log got start + end entries.
+    # Event log got start + end + awaiting_from.changed entries.
     log_lines = layout.event_log_path.read_text(encoding="utf-8").splitlines()
     types = [json.loads(line)["type"] for line in log_lines]
-    assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
-    end = json.loads(log_lines[-1])
+    assert types == [
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.awaiting_from.changed",
+    ]
+    end = json.loads(log_lines[1])
     assert end["duration_ms"] == 120
     assert end["exit_code"] == 0
+
+
+@pytest.mark.anyio
+async def test_dispatcher_toggles_awaiting_from_on_success(tmp_path: Path) -> None:
+    """Phase1-Obs1 regression: after a successful invoke **with reply
+    landed on disk**, ``awaiting_from`` toggles to the message
+    recipient and an ``AwaitingFromChanged`` snapshot event is
+    appended (docs/feature-2-design.md §3.3 / §3.5).
+
+    The 1st dogfooding round trip (2026-05-13, thread
+    01KRGW518F92QVRMSCEMXBS71K) revealed that ``meta.yaml.awaiting_from``
+    stayed at ``"claude-code"`` after claude-code replied, breaking the
+    multi-turn handoff (claude.ai had no signal that it was its turn).
+    This test pins the fix: the success path must update both meta and
+    events.jsonl, and status must stay ``active`` (= the toggle is
+    status-orthogonal, per §3.1 design).
+
+    The fake invoker writes the reply file before returning success
+    (PR #40 review Copilot inline-1〜3 / claude.ai C2): the
+    dispatcher's production gate is **"new claude-code message at
+    ``next_seq`` on disk"**, not SDK success alone."""
+    layout = _seed_thread(tmp_path)
+    pre_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert pre_meta.awaiting_from == "claude-code"  # baseline
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_invoker_with_write_reply(
+            layout, next_seq=2, sender="claude-code", result=_ok_result()
+        ),
+    )
+
+    await dispatcher.handle(_event())
+
+    # Meta: awaiting_from toggled, status orthogonal (stays active).
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "active"  # status-orthogonal
+    assert new_meta.awaiting_from == "claude.ai"  # toggled
+
+    # Events.jsonl: AwaitingFromChanged appended with the snapshot
+    # semantic (= ``from_participant`` is the pre-write meta value, not
+    # the reply writer; PR #40 review Copilot-3).
+    log_lines = [
+        json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    awaiting_events = [e for e in log_lines if e["type"] == "thread.awaiting_from.changed"]
+    assert len(awaiting_events) == 1
+    toggle = awaiting_events[0]
+    assert toggle["thread_id"] == ULID_A
+    assert toggle["from_participant"] == "claude-code"  # pre-write meta
+    assert toggle["to_participant"] == "claude.ai"
+
+
+@pytest.mark.anyio
+async def test_dispatcher_skips_toggle_when_no_write_reply_on_disk(
+    tmp_path: Path,
+) -> None:
+    """SDK success without ``write_reply`` landing → no toggle, no event.
+
+    PR #40 review (Copilot inline-1〜3 / claude.ai C2) flagged that
+    ``result.is_error=False`` is not proof that the model actually
+    called ``mcp__mindwire__write_reply``; the model can finish a
+    turn successfully without invoking the tool, producing a thread
+    state where ``awaiting_from`` would falsely advertise claude.ai's
+    turn with no reply on disk. The production gate is the message
+    file's existence at ``next_seq``, not the SDK ``ResultMessage``."""
+    layout = _seed_thread(tmp_path)
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_invoker({}, _ok_result()),  # success, but does NOT write reply
+    )
+
+    await dispatcher.handle(_event())
+
+    # Meta unchanged: still awaiting claude-code (no reply landed).
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.awaiting_from == "claude-code"
+
+    # No AwaitingFromChanged in events.jsonl.
+    log_lines = [
+        json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    types = [entry["type"] for entry in log_lines]
+    assert "thread.awaiting_from.changed" not in types
+    # invoke.start + invoke.end only (no recovery, no toggle).
+    assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
 
 
 @pytest.mark.anyio
@@ -542,11 +675,19 @@ def _flaky_timeout_invoker(
     kind: Literal["idle", "absolute"] = "idle",
     elapsed_seconds: float = 0.1,
     call_counter: list[int] | None = None,
+    *,
+    write_reply_on_success: tuple[ThreadDirLayout, int, Participant] | None = None,
 ) -> Any:
     """Invoker that times out *failures* times, then returns *success_result*.
 
     ``call_counter`` (if provided) is appended-to on each call so tests can
     introspect how many attempts were made.
+
+    ``write_reply_on_success=(layout, next_seq, sender)`` simulates the
+    SDK calling ``mcp__mindwire__write_reply`` to land the reply file
+    on disk before the success return. The dispatcher's Phase1-Obs1
+    gate (= "new claude-code message at ``next_seq`` on disk")
+    requires this for the toggle to fire (PR #40 review).
     """
     state = {"count": 0}
 
@@ -556,6 +697,9 @@ def _flaky_timeout_invoker(
             call_counter.append(state["count"])
         if state["count"] <= failures:
             raise InvokeTimeoutError(kind, elapsed_seconds)
+        if write_reply_on_success is not None:
+            layout, next_seq, sender = write_reply_on_success
+            write_message_file(layout, next_seq, sender, "fake reply", atomic=True)
         return success_result
 
     return fake
@@ -585,7 +729,10 @@ async def test_dispatcher_retry_succeeds_after_transient_failures(tmp_path: Path
         phanthand_client=AsyncMock(spec=PhanthandClient),
         dedup=DedupCache(ttl=timedelta(seconds=5)),
         invoker=_flaky_timeout_invoker(
-            failures=1, success_result=_ok_result(), call_counter=call_counter
+            failures=1,
+            success_result=_ok_result(),
+            call_counter=call_counter,
+            write_reply_on_success=(layout, 2, "claude-code"),
         ),
         max_retries=2,
         retry_backoff_seconds=(0.0, 0.0),
@@ -602,12 +749,18 @@ async def test_dispatcher_retry_succeeds_after_transient_failures(tmp_path: Path
     )
     assert new_meta.status == "active"
     assert new_meta.retry_count == 1  # 1 bump during retry, preserved after success
-    assert new_meta.awaiting_from == "claude-code"
+    # Phase1-Obs1 fix: success path toggles awaiting_from to the message
+    # recipient (claude.ai), so after retry-success the meta reflects
+    # claude.ai's turn, not the original claude-code seed value.
+    assert new_meta.awaiting_from == "claude.ai"
 
     log_lines = [
         json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
     ]
     types = [entry["type"] for entry in log_lines]
+    # PR #40 review C-4: success path now recovers retrying→active
+    # BEFORE the awaiting_from toggle (= toggle's event-log failure
+    # cannot strand the thread in retrying).
     assert types == [
         "claude_code.invoke.start",
         "claude_code.invoke.end",
@@ -615,7 +768,8 @@ async def test_dispatcher_retry_succeeds_after_transient_failures(tmp_path: Path
         "thread.retry.backoff_started",
         "claude_code.invoke.start",
         "claude_code.invoke.end",
-        "thread.status.changed",  # retrying → active (recovery)
+        "thread.status.changed",  # retrying → active (recovery first)
+        "thread.awaiting_from.changed",  # Phase1-Obs1: toggled after recovery
     ]
     sc_active_to_retrying = log_lines[2]
     assert sc_active_to_retrying["from_status"] == "active"
@@ -886,23 +1040,30 @@ async def test_dispatcher_retry_recovers_from_partial_write_reply(tmp_path: Path
     )
     assert new_meta.status == "active"  # recovered from retrying
     assert new_meta.retry_count == 1  # preserved bump from attempt 0
-    assert new_meta.awaiting_from == "claude-code"
+    # Phase1-Obs1 fix applies to partial_write_reply path too: the
+    # partial reply WAS a successful write_reply, so awaiting_from
+    # toggles to claude.ai even though the surrounding invoke timed out.
+    assert new_meta.awaiting_from == "claude.ai"
 
     log_lines = [
         json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
     ]
     types = [entry["type"] for entry in log_lines]
     # Attempt 0: start + end + status_changed (active → retrying) + backoff_started.
-    # Attempt 1: reload short-circuits before InvokeStart; emits recovery
-    # status_changed (retrying → active).
+    # Attempt 1: reload short-circuits before InvokeStart; emits
+    # recovery status_changed (retrying → active) + awaiting_from.changed
+    # (Phase1-Obs1 toggle on partial recovery). PR #40 review C-4:
+    # recovery now runs first so the toggle's event-log failure cannot
+    # strand the thread in retrying.
     assert types == [
         "claude_code.invoke.start",
         "claude_code.invoke.end",
         "thread.status.changed",  # active → retrying (bump on attempt 0)
         "thread.retry.backoff_started",
-        "thread.status.changed",  # retrying → active (partial-write_reply recovery)
+        "thread.status.changed",  # retrying → active (partial-write_reply recovery first)
+        "thread.awaiting_from.changed",  # Phase1-Obs1 toggle after recovery
     ]
-    recovery = log_lines[-1]
+    recovery = log_lines[-2]
     assert recovery["from_status"] == "retrying"
     assert recovery["to_status"] == "active"
     assert recovery["retry_count"] == 1

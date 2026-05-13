@@ -133,6 +133,28 @@ class ClaudeCodeInvokeEnd(_BaseEvent):
     exit_code: int
 
 
+class AwaitingFromChanged(_BaseEvent):
+    """Snapshot of an ``awaiting_from`` toggle after a successful write_reply.
+
+    Logged immediately after :func:`set_awaiting_from` writes meta.yaml
+    on the dispatcher's success path (= meta is SOT, event is best-effort
+    audit log; see docs/feature-2-design.md §3.5 FI-2 resolution).
+    ``awaiting_from`` is orthogonal to :data:`ThreadStatus` (§3.1 / §3.3),
+    so this event is distinct from :class:`ThreadStatusChanged` even
+    though both are snapshot-class events.
+
+    Field naming mirrors :class:`ThreadStatusChanged.from_status` /
+    ``to_status``: the pre-write meta value is ``from_participant``, the
+    post-write value is ``to_participant``. Under the Phase 0 2-party
+    invariant (D-1) the two values are always opposites.
+    """
+
+    type: Literal["thread.awaiting_from.changed"] = "thread.awaiting_from.changed"
+    thread_id: UlidStr
+    from_participant: Participant
+    to_participant: Participant
+
+
 class RetryBackoffStarted(_BaseEvent):
     """Occurrence event: a retry backoff sleep just started.
 
@@ -165,12 +187,14 @@ Event = Annotated[
     | MessageSent
     | ClaudeCodeInvokeStart
     | ClaudeCodeInvokeEnd
-    | RetryBackoffStarted,
+    | RetryBackoffStarted
+    | AwaitingFromChanged,
     Field(discriminator="type"),
 ]
 
 
 __all__ = [
+    "AwaitingFromChanged",
     "ClaudeCodeInvokeEnd",
     "ClaudeCodeInvokeStart",
     "Event",

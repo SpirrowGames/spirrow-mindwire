@@ -64,14 +64,21 @@ from spirrow_mindwire.claude_code import (
     invoke_claude_code,
 )
 from spirrow_mindwire.filesystem import EventLogWriter, ThreadDirLayout
-from spirrow_mindwire.lifecycle import TERMINAL_STATES, bump_retry_count, transition_state
+from spirrow_mindwire.lifecycle import (
+    TERMINAL_STATES,
+    bump_retry_count,
+    set_awaiting_from,
+    transition_state,
+)
 from spirrow_mindwire.phanthand import PhanthandClient
 from spirrow_mindwire.schema import (
+    AwaitingFromChanged,
     ClaudeCodeInvokeEnd,
     ClaudeCodeInvokeStart,
     Participant,
     RetryBackoffStarted,
     ThreadStatusChanged,
+    opposite_of,
 )
 from spirrow_mindwire.ulid_util import new_ulid
 
@@ -264,12 +271,27 @@ class ThreadDispatcher:
                     # Edge (b): partial write_reply landed during a prior
                     # attempt's invoke window. Recover to active so the
                     # thread isn't stuck in ``retrying`` forever.
+                    # Same Phase1-Obs1 class: the partial write_reply was a
+                    # successful reply, so awaiting_from must also toggle.
+                    # Recovery first, toggle after (PR #40 review C-4):
+                    # if the toggle's event-log append fails, recovery has
+                    # already happened and the thread is no longer stuck in
+                    # retrying. Meta-write order doesn't depend on this
+                    # ordering because ``_recover_retrying_to_active`` and
+                    # ``_toggle_awaiting_from`` write disjoint meta fields
+                    # (status / retry_count vs awaiting_from).
                     self._recover_retrying_to_active(
                         layout=layout,
                         event=event,
                         log=log,
                         attempt=attempt,
                         reason="partial_write_reply",
+                    )
+                    self._toggle_awaiting_from(
+                        layout=layout,
+                        event=event,
+                        log=log,
+                        from_participant=latest.from_,
                     )
                 else:
                     logger.debug(
@@ -394,7 +416,12 @@ class ThreadDispatcher:
                     exit_code=1 if result.is_error else 0,
                 )
             )
-            # If we entered ``retrying`` earlier in the loop, transition back.
+            # If we entered ``retrying`` earlier in the loop, transition back
+            # first. Doing recovery before the awaiting_from toggle keeps the
+            # retrying→active transition atomic regardless of whether the
+            # subsequent toggle's event append succeeds (PR #40 review C-4:
+            # toggle's event log failure must not strand the thread in
+            # ``retrying``).
             self._recover_retrying_to_active(
                 layout=layout,
                 event=event,
@@ -402,6 +429,34 @@ class ThreadDispatcher:
                 attempt=attempt,
                 reason="invoke_success",
             )
+            # write_reply 成功完了時を SOT として awaiting_from を相手側に toggle
+            # (docs/feature-2-design.md §3.5、 Phase1-Obs1 fix)。 meta の
+            # atomic write を先に終え、 best-effort で AwaitingFromChanged
+            # event を append (= FI-2 resolution、 meta は SOT)。
+            #
+            # ``result.is_error=False`` だけでは write_reply 実行の保証にならない
+            # (PR #40 review Copilot-1〜3、 claude.ai C2): SDK ResultMessage が
+            # success でも model が tool を呼ばずに turn 終了することがある
+            # (= system_prompt は advisory、 invocation can finish with no reply
+            # file)。 production-correct な gate は **post-invoke message reload
+            # で claude-code の新 message が next_seq に存在することを verify**。
+            # partial_write_reply 経路は別途 ``latest.from_ == "claude-code"``
+            # の早期 return guard で同等 verify 済みのため、 同 check 不要。
+            if self._write_reply_completed(layout=layout, sender=sender, next_seq=next_seq):
+                self._toggle_awaiting_from(
+                    layout=layout,
+                    event=event,
+                    log=log,
+                    from_participant=sender,
+                )
+            else:
+                logger.info(
+                    "thread %s: SDK invoke succeeded but no claude-code reply "
+                    "landed at seq %d; awaiting_from kept (model finished turn "
+                    "without write_reply, or write_reply failed silently)",
+                    event.thread_id,
+                    next_seq,
+                )
             return
 
     def _handle_transient_failure(
@@ -528,6 +583,106 @@ class ThreadDispatcher:
                 from_status=current_meta.status,
                 to_status="terminated",
                 retry_count=new_meta.retry_count,
+            )
+        )
+
+    def _write_reply_completed(
+        self,
+        *,
+        layout: ThreadDirLayout,
+        sender: Participant,
+        next_seq: int,
+    ) -> bool:
+        """Verify a new claude-code reply landed at ``next_seq``.
+
+        Returns True iff the latest message on disk matches the expected
+        post-invoke shape (= same ``sender`` + ``next_seq`` we computed
+        before invoking the SDK). Used by the success path as the
+        production-correct gate for the ``awaiting_from`` toggle: SDK
+        ``result.is_error=False`` is **not** proof that
+        ``mcp__mindwire__write_reply`` actually ran (PR #40 review
+        Copilot inline-1〜3 / claude.ai C2、 system_prompt は advisory
+        instruction、 model can finish a turn without calling the tool).
+        Reading the on-disk state matches the
+        ``docs/feature-2-design.md`` §3.5 「``write_reply`` 成功完了時
+        SOT」 wording verbatim (= reality on disk, not SDK reply).
+        """
+        messages_after = load_messages(layout)
+        if not messages_after:
+            return False
+        latest_after = messages_after[-1]
+        return latest_after.from_ == sender and latest_after.seq == next_seq
+
+    def _toggle_awaiting_from(
+        self,
+        *,
+        layout: ThreadDirLayout,
+        event: ThreadEvent,
+        log: EventLogWriter,
+        from_participant: Participant,
+    ) -> None:
+        """Toggle ``awaiting_from`` to the opposite of ``from_participant``.
+
+        Encapsulates the Phase1-Obs1 fix: after a successful write_reply
+        (= claude-code wrote a reply), the next turn belongs to the other
+        participant, so meta.yaml's ``awaiting_from`` is updated via
+        :func:`set_awaiting_from` (status-orthogonal field-only write)
+        and an :class:`AwaitingFromChanged` snapshot event is appended.
+
+        ``from_participant`` names the participant who just wrote the
+        reply (= "whose turn just ended"). The new ``awaiting_from`` is
+        ``opposite_of(from_participant)``. Phase 0 hard-codes this as
+        claude-code → claude.ai but the :func:`opposite_of` indirection
+        lets the partial_write_reply path reuse the same helper with
+        ``latest.from_`` (which is always claude-code by the early-return
+        guard above, but the helper does not assume that).
+
+        **Snapshot semantic for the event** (PR #40 review Copilot-3):
+        :class:`AwaitingFromChanged` mirrors
+        :attr:`ThreadStatusChanged.from_status` — the pre-write meta
+        value, not the actor. This reads pre-meta inside this helper
+        and uses ``pre_meta.awaiting_from`` for the event's
+        ``from_participant``, so an operator-edited (or otherwise
+        already-toggled) pre-state shows up faithfully in the audit
+        log instead of being relabelled to the reply writer.
+
+        **Idempotent skip**: if pre-meta's ``awaiting_from`` is already
+        the target value (= operator pre-edit / replayed call), skip
+        both the meta write and the event append. Avoids a tautology
+        event ``from_participant == to_participant`` and a no-op
+        ``updated_at`` bump.
+        """
+        pre_meta = load_thread_meta(layout)
+        # Terminal-state defensive: ``_toggle_awaiting_from`` is only
+        # called from non-terminal control flow (success path after
+        # ``not in TERMINAL_STATES`` reload, or retrying-branch of the
+        # partial_write_reply early-return). ``awaiting_from`` is
+        # therefore non-None by the design invariant (§3.1: terminal
+        # ⇒ ``awaiting_from`` is None; non-terminal ⇒ Participant).
+        # If something violates this, log + skip so the failure path is
+        # observable but doesn't crash the dispatcher.
+        if pre_meta.awaiting_from is None:
+            logger.warning(
+                "thread %s: _toggle_awaiting_from called with awaiting_from=None "
+                "(status=%s); skipping",
+                event.thread_id,
+                pre_meta.status,
+            )
+            return
+        to_participant = opposite_of(from_participant)
+        if pre_meta.awaiting_from == to_participant:
+            # Idempotent: already at target. Skip the redundant write
+            # and avoid a tautology event in events.jsonl.
+            return
+        set_awaiting_from(layout, to_participant)
+        log.append(
+            AwaitingFromChanged(
+                schema_version=1,
+                event_id=new_ulid(),
+                ts=datetime.now(UTC),
+                thread_id=event.thread_id,
+                from_participant=pre_meta.awaiting_from,
+                to_participant=to_participant,
             )
         )
 

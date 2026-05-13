@@ -1,18 +1,42 @@
 """Lifecycle state transition logic for Spirrow MindWire (Feature 2).
 
-Single entry point for ThreadMeta status transitions, ensuring atomicity
-of ``status`` / ``awaiting_from`` / terminated fields / ``updated_at``
-updates via :func:`atomic_write_text`. Forbidden transitions raise
+Single entry point for ThreadMeta **status transitions** is
+:func:`transition_state`, ensuring atomicity of ``status`` /
+``awaiting_from`` / terminated fields / ``updated_at`` updates via
+:func:`atomic_write_text`. Forbidden transitions raise
 :class:`InvalidTransitionError`.
+
+**Entry point scope** (Phase1-Obs1 clarification, see
+docs/feature-2-design.md §3.5):
+
+- :func:`transition_state` — the only entry point for transitions that
+  change :data:`ThreadStatus`. Caller passes the new ``awaiting_from`` /
+  terminated fields / optional ``retry_count`` in the same atomic write.
+- :func:`bump_retry_count` — field-only update of ``retry_count`` when
+  status is unchanged (e.g. ``retrying → retrying`` self-loop is
+  forbidden, but the retry counter must still advance).
+- :func:`set_awaiting_from` — field-only update of ``awaiting_from``
+  when status is unchanged (e.g. dispatcher's success path, where the
+  ``write_reply`` SOT for ``awaiting_from`` toggles the recipient
+  without a status change; status is ``active``-and-stays-``active``,
+  so transition_state would reject the call under the forbidden
+  ``active → active`` self-loop).
+
+The split exists because ``_ALLOWED_TRANSITIONS`` is intentionally
+status-self-loop-free (Decide #3b-1, msg-055); the two field-only
+helpers occupy the space below the status transition table. Adding a
+new field-only helper for some other meta.yaml field follows the same
+pattern.
 
 See ``docs/feature-2-design.md`` §3.5 for the design rationale and the
 table-driven enforcement pattern.
 
-NOTE: events.jsonl ``ThreadStatusChanged`` append is intentionally NOT
-included in this module. The 2-phase commit semantics (meta.yaml ↔
-events.jsonl write order, failure detection / rollback) is FI-2,
-formal-decided in sub-PR 3 (retry). Until then, callers must append
-the event log entry separately in their own atomic block.
+NOTE: events.jsonl event append is intentionally NOT included in this
+module. The 2-phase commit semantics (meta.yaml ↔ events.jsonl write
+order, failure detection / rollback) is FI-2, resolved in sub-PR 3 with
+"meta is SOT, events.jsonl is best-effort audit log". Callers must
+append the event log entry separately in their own block following
+``atomic_write_text`` here.
 """
 
 from __future__ import annotations
@@ -258,8 +282,67 @@ def bump_retry_count(layout: ThreadDirLayout) -> ThreadMeta:
     return new_meta
 
 
+def set_awaiting_from(
+    layout: ThreadDirLayout,
+    new_awaiting_from: Participant,
+) -> ThreadMeta:
+    """Update ``awaiting_from`` without changing ``status``.
+
+    Sister to :func:`bump_retry_count`: ``status`` self-loops are
+    forbidden by :data:`_ALLOWED_TRANSITIONS`, so this helper exists
+    for the dispatcher's success path where ``awaiting_from`` toggles
+    to the message recipient while ``status`` stays ``active``.
+
+    The write follows the same atomic pattern as
+    :func:`transition_state`: read meta + ``model_copy`` + atomic_write.
+    Events.jsonl append (:class:`AwaitingFromChanged`) is the caller's
+    responsibility (meta is SOT, events is best-effort; see
+    docs/feature-2-design.md §3.5 FI-2 resolution).
+
+    Args:
+        layout: ThreadDirLayout pointing to the thread's directory.
+        new_awaiting_from: the Participant that should respond next.
+            Under the Phase 0 2-party invariant (D-1) this is the
+            opposite of the participant who just wrote the reply.
+
+    Returns:
+        The new ThreadMeta after the write.
+
+    Raises:
+        ValueError: if the thread is in a terminal state
+            (:data:`TERMINAL_STATES`), where ``awaiting_from`` is
+            required to be ``None`` (§3.1 / §3.4) and toggling has no
+            meaning. Symmetric to the guard in :func:`bump_retry_count`.
+    """
+    old_meta_text = layout.meta_path.read_text(encoding="utf-8")
+    old_meta = ThreadMeta.model_validate(yaml.safe_load(old_meta_text))
+
+    if old_meta.status in TERMINAL_STATES:
+        raise ValueError(
+            f"set_awaiting_from: cannot set awaiting_from for terminal status "
+            f"{old_meta.status!r}; awaiting_from must be None in terminal states"
+        )
+
+    new_meta = old_meta.model_copy(
+        update={
+            "awaiting_from": new_awaiting_from,
+            "updated_at": datetime.now(UTC),
+        }
+    )
+    atomic_write_text(
+        layout.meta_path,
+        yaml.safe_dump(
+            new_meta.model_dump(mode="json"),
+            default_flow_style=False,
+            sort_keys=False,
+        ),
+    )
+    return new_meta
+
+
 __all__ = [
     "InvalidTransitionError",
     "bump_retry_count",
+    "set_awaiting_from",
     "transition_state",
 ]
