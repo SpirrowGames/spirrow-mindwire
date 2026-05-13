@@ -129,7 +129,19 @@ def transition_state(
             any value passed here is silently discarded; the existing
             ``terminated_at`` from old meta (audit trail) is preserved.
         retry_count: optional new ``retry_count`` value. ``None``
-            preserves the existing value.
+            preserves the existing on-disk value (= D-7 (b) preserve
+            choice, see docs/feature-2-design.md §3.5 retry_count
+            semantics). Caller-side intent: in the dispatcher's retry
+            loop, the *retry-success* transition (``retrying →
+            active``) passes ``retry_count=None`` so the audit trail
+            of how many retries it took to succeed is preserved on
+            disk. Bumping on failure is done via :func:`bump_retry_count`
+            (``retrying → retrying`` self-loop) or by passing an
+            explicit incremented value here (``active → retrying``
+            with ``retry_count=meta.retry_count + 1``). ``retry_count``
+            is positioned as audit trail (= persisted observable), not
+            the retry control gate; the gate is :attr:`max_retries` in
+            :class:`~spirrow_mindwire.config.WatcherConfig`.
 
     Returns:
         The new ThreadMeta after the write.

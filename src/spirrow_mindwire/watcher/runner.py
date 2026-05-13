@@ -79,6 +79,9 @@ async def run_watcher(settings: MindwireSettings, *, api_key: str | None) -> Non
             max_concurrent=settings.watcher.max_concurrent_threads,
             idle_timeout_seconds=settings.watcher.idle_timeout_seconds,
             absolute_timeout_seconds=settings.watcher.absolute_timeout_seconds,
+            max_retries=settings.watcher.max_retries,
+            retry_backoff_seconds=settings.watcher.retry_backoff_seconds,
+            retry_jitter=settings.watcher.retry_jitter,
         )
 
         observer.start()
