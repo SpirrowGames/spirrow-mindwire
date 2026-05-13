@@ -191,16 +191,24 @@ async def test_invoke_idle_timeout_fires(tmp_path: Path) -> None:
         await asyncio.sleep(10.0)
         yield _result()
 
+    idle_timeout = 0.05
     with pytest.raises(InvokeTimeoutError) as exc:
         await invoke_claude_code(
             prompt="x",
             cwd=tmp_path,
             system_prompt="role",
             runner=slow_first_message,
-            idle_timeout_seconds=0.05,
+            idle_timeout_seconds=idle_timeout,
         )
     assert exc.value.kind == "idle"
-    assert exc.value.elapsed_seconds >= 0.05
+    # Lower bound tolerates a small precision/scheduling drift — on Windows
+    # ``time.monotonic()`` resolution + ``asyncio.wait_for`` event-loop wake-up
+    # have been observed to land a few ms before the nominal boundary
+    # (e.g. 0.047s < 0.05s on a 50ms timeout). The 0.9x factor mirrors the
+    # spirit of ``test_invoke_absolute_timeout_fires``'s ``> 0`` lower bound
+    # (= what matters is ``kind == "idle"`` and that the wait actually happened);
+    # see Issue #35 for the original reproductions.
+    assert exc.value.elapsed_seconds >= idle_timeout * 0.9
 
 
 @pytest.mark.anyio
