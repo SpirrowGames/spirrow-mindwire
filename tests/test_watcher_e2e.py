@@ -35,7 +35,7 @@ from factories import seed_thread_meta, write_message_file
 from spirrow_mindwire.claude_code import InvokeResult, InvokeTimeoutError
 from spirrow_mindwire.filesystem import ThreadDirLayout
 from spirrow_mindwire.phanthand import PhanthandClient
-from spirrow_mindwire.schema import Participant, ThreadMeta
+from spirrow_mindwire.schema import Participant, ThreadMeta, ThreadStatus
 from spirrow_mindwire.watcher.dedup import DedupCache
 from spirrow_mindwire.watcher.dispatcher import ThreadDispatcher
 from spirrow_mindwire.watcher.events import ThreadEvent
@@ -53,7 +53,10 @@ def _read_meta(layout: ThreadDirLayout) -> ThreadMeta:
 
 
 def _operator_edit_status(
-    layout: ThreadDirLayout, *, new_status: str, new_awaiting_from: str | None
+    layout: ThreadDirLayout,
+    *,
+    new_status: ThreadStatus,
+    new_awaiting_from: Participant | None,
 ) -> None:
     """Simulate §3.6 operator manual transition by editing meta.yaml directly.
 
@@ -64,6 +67,7 @@ def _operator_edit_status(
     are preserved as audit trail, matching docs §3.4.
     """
     meta_dict = yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    assert isinstance(meta_dict, dict), "meta.yaml must parse to a dict"
     meta_dict["status"] = new_status
     meta_dict["awaiting_from"] = new_awaiting_from
     layout.meta_path.write_text(
@@ -259,6 +263,9 @@ async def test_lifecycle_retry_exhaustion_to_terminated_then_operator_path(
         phanthand_client=AsyncMock(spec=PhanthandClient),
         dedup=DedupCache(ttl=timedelta(seconds=5)),
         invoker=always_timeout_invoker,
+        # ``len(retry_backoff_seconds) == max_retries`` samples the boundary
+        # edge of the sub-PR 3 invariant enforced by
+        # ``WatcherConfig._retry_backoff_length_covers_max_retries``.
         max_retries=2,
         retry_backoff_seconds=(0.0, 0.0),
         retry_jitter=0.0,
@@ -414,33 +421,11 @@ async def test_lifecycle_operator_edit_active_to_resolved_pre_invoke(tmp_path: P
     # permits active → resolved per §3.3 docs).
     _operator_edit_status(layout, new_status="resolved", new_awaiting_from=None)
 
-    # Watcher "restart": startup_full_scan + a never-invoke dispatcher.
-    invoked_thread_ids: list[str] = []
-
-    async def never_invoker(**kwargs: Any) -> InvokeResult:
-        invoked_thread_ids.append(kwargs["cwd"].name)
-        return InvokeResult(
-            is_error=False,
-            duration_ms=42,
-            text_output="ok",
-            result_text="ok",
-            stop_reason="end_turn",
-        )
-
+    # Watcher "restart": startup_full_scan skips the now-resolved thread.
+    # An empty queue is the proof of "no invoke" — no dispatcher run needed.
     queue: asyncio.Queue[ThreadEvent] = asyncio.Queue()
     assert startup_full_scan(tmp_path, queue) == 0
     assert queue.empty()
 
-    dispatcher = ThreadDispatcher(
-        base_dir=tmp_path,
-        phanthand_client=AsyncMock(spec=PhanthandClient),
-        dedup=DedupCache(ttl=timedelta(seconds=5)),
-        invoker=never_invoker,
-    )
-    # Nothing to dispatch, but assert the dispatcher object is wired in
-    # case future scenarios add live events post-restart.
-    assert dispatcher is not None
-
     meta_after = _read_meta(layout)
     assert meta_after.status == "resolved"
-    assert invoked_thread_ids == []
