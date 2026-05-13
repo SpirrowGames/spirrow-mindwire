@@ -420,13 +420,21 @@ class WatcherConfig(_StrictModel):
   - error 分類 (transient: filesystem IO / Phanthand transient HTTP / SDK rate limit → retry。 permanent: schema 起因 → direct terminated)
   - FI-2 `transition_state` の 2-phase commit semantics (meta.yaml ↔ events.jsonl の write 順序 / 失敗 detection)
 
-#### sub-PR 4: terminate
+#### sub-PR 4: terminate (= Phase 0 Feature 2 完結)
 
-- `active → terminated` direct trigger (schema 起因 error binding) → §3.3
-- `retrying → terminated` (retry 上限突破)
-- `terminated_reason` + `terminated_at` 設定 → §3.4
-- `terminated`/`resolved`/`archived` thread の startup skip 統合 test → §2.1
-- terminal state 関連 integration test
+- ✅ `active → terminated` direct trigger (schema 起因 error binding) — **sub-PR 3 で実装済** (= dispatcher の safe-by-default permanent path → `_handle_permanent_failure` → `terminated/validation-failed`、 §3.3)
+- ✅ `retrying → terminated` (retry 上限突破) — **sub-PR 3 で実装済** (= dispatcher retry loop `_handle_transient_failure` 内 `attempt == max_retries` 分岐 → `terminated/retry-exhausted`)
+- ✅ `terminated_reason` + `terminated_at` 設定 — **sub-PR 1/3 で実装済** (= `transition_state` 内で set、 schema/meta.py に field、 §3.4)
+- ✅ `terminated`/`resolved`/`archived` thread の startup skip — **sub-PR 1 で実装済** (`test_terminal_states_are_skipped`、 §2.1)
+- 🔧 **sub-PR 4 残 scope = full lifecycle e2e integration test** (= 上記実装の合成挙動を end-to-end で verify):
+  - (i) Permanent → terminated/validation-failed → operator → resolved → archived
+  - (ii) Retry exhaustion → terminated/retry-exhausted → operator → resolved → archived
+  - (iii) Mix startup_scan: terminal-skipped + active-requeued + retrying-requeued
+  - (iv) Operator-edited transition の watcher restart 反映
+
+sub-PR 4 着手前 design decide = ChatRoom thread `T-subPR4-integration-test-design` で trilateral debate **8 回目**、 三者合意 + divergent 2 件 user 判断確定 (= Naysayer 採用: (iii) partial write_reply sub-step 撤回 / Q1 section comment block default 不追加)。
+
+source code 変更なし (= dispatcher / lifecycle / schema 全て既実装の通り)、 test 追加のみで Phase 0 Feature 2 robustness を完結する。 Lines budget 想定 220-340 lines、 既存 `tests/test_watcher_e2e.py` 拡張で consolidated location、 SDK fake invoker pattern + factories.py 既存 helpers 流用。
 
 ### 5.2 着手順序 + chain merge pattern
 
@@ -471,6 +479,11 @@ PR #27 (sub-PR 2 timeout) spirrowgames-ops review M-3 由来の meta-process imp
 - [ ] `bump_retry_count` (`lifecycle/transitions.py`) — meta.yaml status 不変で `retry_count` だけ advance する path が caller side で本 entry point 経由か (sub-PR 2 C2 由来、 `retrying → retrying` 自己遷移禁止と integration)
 - [ ] `DedupCache` semantic (`watcher/dedup.py`) — 新規 path が dedup と整合するか (sub-PR 1 review O-3、 sub-PR 2 で carry 確認済)
 - [ ] Python 3.11+ language alias (`asyncio.TimeoutError = TimeoutError` 等) との interaction — `except` 順序、 `isinstance` の subclass match (sub-PR 2 C1 由来)
+- [ ] `_TRANSIENT_ERROR_TYPES` / `_is_transient` (`watcher/dispatcher.py`) — allowlist transient classification、 新規 exception class 導入時に allowlist 拡張が必要か判定 (sub-PR 3 由来)
+- [ ] `_handle_transient_failure` / `_handle_permanent_failure` / `_recover_retrying_to_active` / `_compute_backoff` (`watcher/dispatcher.py` private methods) — retry / permanent / recovery / backoff 各 path 拡張時の symmetry 維持、 新規 path が responsibility separation framework に従うか (sub-PR 3 由来、 PR #34 review S-1 helper extract 結果)
+- [ ] `RetryBackoffStarted` event type (`schema/event.py`、 occurrence event) — 新規 retry-adjacent event を追加する時、 occurrence vs snapshot semantic との整合 (sub-PR 3 由来)
+- [ ] `ThreadStatusChanged.retry_count` field (`schema/event.py`、 snapshot event) — 新規 ThreadStatusChanged emit 箇所で `retry_count=current_meta.retry_count` を populate しているか (sub-PR 3 由来、 snapshot mirror 維持)
+- [ ] **O-2 carry: `_handle_transient_failure` direct unit test** (`tests/lifecycle/test_error_classification.py` への extract) — sub-PR 3 PR #34 review O-2 carry、 sub-PR 4 内では実装せず carry note のみ、 future Phase 1+ で `lifecycle/error_classification.py` extract と並行 migrate (= module extract が trigger)
 
 新たな contract symbol が sub-PR で導入された場合は本 checklist にも追加すること (= checklist 自体も sub-PR ごとに育てる)。
 
