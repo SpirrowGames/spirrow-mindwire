@@ -64,14 +64,21 @@ from spirrow_mindwire.claude_code import (
     invoke_claude_code,
 )
 from spirrow_mindwire.filesystem import EventLogWriter, ThreadDirLayout
-from spirrow_mindwire.lifecycle import TERMINAL_STATES, bump_retry_count, transition_state
+from spirrow_mindwire.lifecycle import (
+    TERMINAL_STATES,
+    bump_retry_count,
+    set_awaiting_from,
+    transition_state,
+)
 from spirrow_mindwire.phanthand import PhanthandClient
 from spirrow_mindwire.schema import (
+    AwaitingFromChanged,
     ClaudeCodeInvokeEnd,
     ClaudeCodeInvokeStart,
     Participant,
     RetryBackoffStarted,
     ThreadStatusChanged,
+    opposite_of,
 )
 from spirrow_mindwire.ulid_util import new_ulid
 
@@ -264,6 +271,16 @@ class ThreadDispatcher:
                     # Edge (b): partial write_reply landed during a prior
                     # attempt's invoke window. Recover to active so the
                     # thread isn't stuck in ``retrying`` forever.
+                    # Same Phase1-Obs1 class: the partial write_reply was a
+                    # successful reply, so awaiting_from must also toggle.
+                    # Done before the recovery so the recovery's meta reload
+                    # observes (and preserves) the updated awaiting_from.
+                    self._toggle_awaiting_from(
+                        layout=layout,
+                        event=event,
+                        log=log,
+                        from_participant=latest.from_,
+                    )
                     self._recover_retrying_to_active(
                         layout=layout,
                         event=event,
@@ -394,7 +411,28 @@ class ThreadDispatcher:
                     exit_code=1 if result.is_error else 0,
                 )
             )
+            # write_reply 成功完了時を SOT として awaiting_from を相手側に toggle
+            # (docs/feature-2-design.md §3.5、 Phase1-Obs1 fix)。 meta の
+            # atomic write を先に終え、 best-effort で AwaitingFromChanged
+            # event を append (= FI-2 resolution、 meta は SOT)。
+            #
+            # ``result.is_error=True`` (= SDK reported a response-level error
+            # such as content-policy / token-limit / tool-execution failure)
+            # では write_reply が走った保証が無いため toggle skip (= 「write_reply
+            # 成功完了時 SOT」 の strict 解釈)。 partial_write_reply 経路は
+            # 別途 message file の存在で write_reply 完了を確認しているので
+            # この gate を必要としない。
+            if not result.is_error:
+                self._toggle_awaiting_from(
+                    layout=layout,
+                    event=event,
+                    log=log,
+                    from_participant=sender,
+                )
             # If we entered ``retrying`` earlier in the loop, transition back.
+            # ``_recover_retrying_to_active`` re-reads meta inside, so it
+            # preserves the just-updated ``awaiting_from`` while flipping
+            # status retrying → active.
             self._recover_retrying_to_active(
                 layout=layout,
                 event=event,
@@ -528,6 +566,43 @@ class ThreadDispatcher:
                 from_status=current_meta.status,
                 to_status="terminated",
                 retry_count=new_meta.retry_count,
+            )
+        )
+
+    def _toggle_awaiting_from(
+        self,
+        *,
+        layout: ThreadDirLayout,
+        event: ThreadEvent,
+        log: EventLogWriter,
+        from_participant: Participant,
+    ) -> None:
+        """Toggle ``awaiting_from`` to the opposite of ``from_participant``.
+
+        Encapsulates the Phase1-Obs1 fix: after a successful write_reply
+        (= claude-code wrote a reply), the next turn belongs to the other
+        participant, so meta.yaml's ``awaiting_from`` is updated via
+        :func:`set_awaiting_from` (status-orthogonal field-only write)
+        and an :class:`AwaitingFromChanged` snapshot event is appended.
+
+        ``from_participant`` is the participant who just wrote the reply;
+        the new ``awaiting_from`` is ``opposite_of(from_participant)``.
+        Phase 0 hard-codes this as claude-code → claude.ai but the
+        :func:`opposite_of` indirection lets the partial_write_reply
+        path reuse the same helper with ``latest.from_`` (which is
+        always claude-code by the early-return guard above, but the
+        helper does not assume that).
+        """
+        to_participant = opposite_of(from_participant)
+        set_awaiting_from(layout, to_participant)
+        log.append(
+            AwaitingFromChanged(
+                schema_version=1,
+                event_id=new_ulid(),
+                ts=datetime.now(UTC),
+                thread_id=event.thread_id,
+                from_participant=from_participant,
+                to_participant=to_participant,
             )
         )
 

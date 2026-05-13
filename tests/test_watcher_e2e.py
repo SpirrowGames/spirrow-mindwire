@@ -142,11 +142,16 @@ async def test_observer_to_dispatcher_happy_path(tmp_path: Path) -> None:
     assert "mindwire" in call["mcp_servers"]
     assert call["allowed_tools"][0] == "mcp__mindwire__write_reply"
 
-    # Event log carries the full start/end pair.
+    # Event log carries the full start/end pair plus the Phase1-Obs1
+    # awaiting_from toggle (success path SOT for awaiting_from).
     log_lines = layout.event_log_path.read_text(encoding="utf-8").splitlines()
     types = [json.loads(line)["type"] for line in log_lines]
-    assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
-    end_event = json.loads(log_lines[-1])
+    assert types == [
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.awaiting_from.changed",
+    ]
+    end_event = json.loads(log_lines[1])
     assert end_event["duration_ms"] == 42
     assert end_event["exit_code"] == 0
 

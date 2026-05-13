@@ -114,13 +114,65 @@ async def test_dispatcher_invokes_for_claude_ai_message(tmp_path: Path) -> None:
     assert "mindwire" in captured["mcp_servers"]
     assert "<mw_thread" in captured["prompt"]
 
-    # Event log got start + end entries.
+    # Event log got start + end + awaiting_from.changed entries.
     log_lines = layout.event_log_path.read_text(encoding="utf-8").splitlines()
     types = [json.loads(line)["type"] for line in log_lines]
-    assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
-    end = json.loads(log_lines[-1])
+    assert types == [
+        "claude_code.invoke.start",
+        "claude_code.invoke.end",
+        "thread.awaiting_from.changed",
+    ]
+    end = json.loads(log_lines[1])
     assert end["duration_ms"] == 120
     assert end["exit_code"] == 0
+
+
+@pytest.mark.anyio
+async def test_dispatcher_toggles_awaiting_from_on_success(tmp_path: Path) -> None:
+    """Phase1-Obs1 regression: after a successful invoke, ``awaiting_from``
+    toggles to the message recipient and an ``AwaitingFromChanged``
+    snapshot event is appended (docs/feature-2-design.md §3.3 / §3.5).
+
+    The 1st dogfooding round trip (2026-05-13, thread
+    01KRGW518F92QVRMSCEMXBS71K) revealed that ``meta.yaml.awaiting_from``
+    stayed at ``"claude-code"`` after claude-code replied, breaking the
+    multi-turn handoff (claude.ai had no signal that it was its turn).
+    This test pins the fix: the success path must update both meta and
+    events.jsonl, and status must stay ``active`` (= the toggle is
+    status-orthogonal, per §3.1 design)."""
+    layout = _seed_thread(tmp_path)
+    pre_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert pre_meta.awaiting_from == "claude-code"  # baseline
+
+    captured: dict[str, Any] = {}
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_invoker(captured, _ok_result()),
+    )
+
+    await dispatcher.handle(_event())
+
+    # Meta: awaiting_from toggled, status orthogonal (stays active).
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "active"  # status-orthogonal
+    assert new_meta.awaiting_from == "claude.ai"  # toggled
+
+    # Events.jsonl: AwaitingFromChanged appended with the right pairing.
+    log_lines = [
+        json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    awaiting_events = [e for e in log_lines if e["type"] == "thread.awaiting_from.changed"]
+    assert len(awaiting_events) == 1
+    toggle = awaiting_events[0]
+    assert toggle["thread_id"] == ULID_A
+    assert toggle["from_participant"] == "claude-code"
+    assert toggle["to_participant"] == "claude.ai"
 
 
 @pytest.mark.anyio
@@ -602,7 +654,10 @@ async def test_dispatcher_retry_succeeds_after_transient_failures(tmp_path: Path
     )
     assert new_meta.status == "active"
     assert new_meta.retry_count == 1  # 1 bump during retry, preserved after success
-    assert new_meta.awaiting_from == "claude-code"
+    # Phase1-Obs1 fix: success path toggles awaiting_from to the message
+    # recipient (claude.ai), so after retry-success the meta reflects
+    # claude.ai's turn, not the original claude-code seed value.
+    assert new_meta.awaiting_from == "claude.ai"
 
     log_lines = [
         json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
@@ -615,6 +670,7 @@ async def test_dispatcher_retry_succeeds_after_transient_failures(tmp_path: Path
         "thread.retry.backoff_started",
         "claude_code.invoke.start",
         "claude_code.invoke.end",
+        "thread.awaiting_from.changed",  # Phase1-Obs1: toggled on success
         "thread.status.changed",  # retrying → active (recovery)
     ]
     sc_active_to_retrying = log_lines[2]
@@ -623,7 +679,7 @@ async def test_dispatcher_retry_succeeds_after_transient_failures(tmp_path: Path
     assert sc_active_to_retrying["retry_count"] == 1
     assert log_lines[3]["attempt_num"] == 1
     assert log_lines[3]["backoff_seconds"] == 0.0
-    sc_recovery = log_lines[6]
+    sc_recovery = log_lines[7]
     assert sc_recovery["from_status"] == "retrying"
     assert sc_recovery["to_status"] == "active"
     assert sc_recovery["retry_count"] == 1
@@ -886,20 +942,26 @@ async def test_dispatcher_retry_recovers_from_partial_write_reply(tmp_path: Path
     )
     assert new_meta.status == "active"  # recovered from retrying
     assert new_meta.retry_count == 1  # preserved bump from attempt 0
-    assert new_meta.awaiting_from == "claude-code"
+    # Phase1-Obs1 fix applies to partial_write_reply path too: the
+    # partial reply WAS a successful write_reply, so awaiting_from
+    # toggles to claude.ai even though the surrounding invoke timed out.
+    assert new_meta.awaiting_from == "claude.ai"
 
     log_lines = [
         json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
     ]
     types = [entry["type"] for entry in log_lines]
     # Attempt 0: start + end + status_changed (active → retrying) + backoff_started.
-    # Attempt 1: reload short-circuits before InvokeStart; emits recovery
-    # status_changed (retrying → active).
+    # Attempt 1: reload short-circuits before InvokeStart; emits
+    # awaiting_from.changed (Phase1-Obs1 toggle, partial-write_reply
+    # was a successful write_reply) + recovery status_changed
+    # (retrying → active).
     assert types == [
         "claude_code.invoke.start",
         "claude_code.invoke.end",
         "thread.status.changed",  # active → retrying (bump on attempt 0)
         "thread.retry.backoff_started",
+        "thread.awaiting_from.changed",  # Phase1-Obs1 toggle on partial recovery
         "thread.status.changed",  # retrying → active (partial-write_reply recovery)
     ]
     recovery = log_lines[-1]

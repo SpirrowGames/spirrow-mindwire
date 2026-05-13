@@ -17,8 +17,10 @@ from ._common import (
     ThreadStatus,
     UlidStr,
     UTCDatetime,
+    opposite_of,
 )
 from .event import (
+    AwaitingFromChanged,
     ClaudeCodeInvokeEnd,
     ClaudeCodeInvokeStart,
     Event,
@@ -35,6 +37,7 @@ from .meta import ThreadMeta
 
 __all__ = [
     "SCHEMA_VERSION",
+    "AwaitingFromChanged",
     "ClaudeCodeInvokeEnd",
     "ClaudeCodeInvokeStart",
     "Event",
@@ -53,4 +56,5 @@ __all__ = [
     "ThreadStatusChanged",
     "UTCDatetime",
     "UlidStr",
+    "opposite_of",
 ]

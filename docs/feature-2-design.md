@@ -234,6 +234,16 @@ class ThreadMeta(StrictModel):
 
 **`transition_state` 関数を唯一 entry point** として 1 箇所集約。 status / awaiting_from / terminated_reason / terminated_at / updated_at を 1 atomic_write_text で同時更新。 Pydantic `model_validator` 追加せず (二重管理回避、 partial update バグは code 構造で防止)。
 
+**Entry point 射程解釈** (Phase1-Obs1 clarification、 decide T-phase1-obs1-awaiting-from-write-reply msg-103 Q1'): 「唯一 entry point」 は **status transition only** の射程を指す。 `_ALLOWED_TRANSITIONS` 経由しない **field-only update** (= status 不変、 単一 field のみ書換) は別 helper を介する:
+
+| helper | 対象 field | trigger |
+|---|---|---|
+| `transition_state` | status (+ awaiting_from / terminated_* / retry_count 同時更新可) | `_ALLOWED_TRANSITIONS` 内の 8 status transition |
+| `bump_retry_count` | retry_count のみ | retrying → retrying self-loop の代替 (sub-PR 3、 `_ALLOWED_TRANSITIONS` で禁止された self-loop の field-only 代替) |
+| `set_awaiting_from` | awaiting_from のみ | dispatcher 成功 path での write_reply 完了時 SOT update (Phase1-Obs1、 active → active 等 status 不変 self-loop が禁止のため field-only helper で対応) |
+
+3 helper は **同じ atomic_write 規律** (= tmp + os.replace の単一 write、 events.jsonl は best-effort 後続 append) を共有する。 新 field の field-only update が必要になった場合は本 pattern を踏襲して helper を追加し、 `transition_state` への parameter overloading は避ける (= concern separation 保持)。
+
 ```python
 def transition_state(
     layout: ThreadDirLayout,

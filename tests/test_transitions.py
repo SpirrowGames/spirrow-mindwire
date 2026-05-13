@@ -23,6 +23,7 @@ from spirrow_mindwire.lifecycle import (
     TERMINAL_STATES,
     InvalidTransitionError,
     bump_retry_count,
+    set_awaiting_from,
     transition_state,
 )
 from spirrow_mindwire.schema import ThreadMeta, ThreadStatus
@@ -287,3 +288,49 @@ def test_bump_retry_count_rejects_terminal_state(layout: ThreadDirLayout) -> Non
     )
     with pytest.raises(ValueError, match="terminal status"):
         bump_retry_count(layout)
+
+
+def test_set_awaiting_from_toggles_without_status_change(
+    layout: ThreadDirLayout,
+) -> None:
+    """``set_awaiting_from`` updates ``awaiting_from`` only; status /
+    retry_count / terminated_* are preserved (= the active → active /
+    retrying → retrying self-loop work-around used by the dispatcher's
+    success path to honour the §3.5 ``write_reply`` SOT)."""
+    _seed_meta(layout, status="active", awaiting_from="claude-code", retry_count=2)
+
+    new_meta = set_awaiting_from(layout, "claude.ai")
+
+    assert new_meta.status == "active"  # unchanged
+    assert new_meta.awaiting_from == "claude.ai"  # toggled
+    assert new_meta.retry_count == 2  # unchanged
+
+    on_disk = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert on_disk.awaiting_from == "claude.ai"
+
+
+def test_set_awaiting_from_rejects_terminal_state(layout: ThreadDirLayout) -> None:
+    """``set_awaiting_from`` makes no sense in terminal states (where
+    ``awaiting_from`` is required to be ``None``)。 Symmetric with
+    ``bump_retry_count`` (Phase1-Obs1 Naysayer flag, decide msg-103)."""
+    _seed_meta(
+        layout,
+        status="terminated",
+        awaiting_from=None,
+        terminated_reason="retry-exhausted",
+        terminated_at="2026-05-07T08:43:07Z",
+    )
+    with pytest.raises(ValueError, match="terminal status"):
+        set_awaiting_from(layout, "claude.ai")
+
+
+def test_set_awaiting_from_updates_updated_at(layout: ThreadDirLayout) -> None:
+    """``updated_at`` is bumped on every meta.yaml write (§3.4 docstring)."""
+    _seed_meta(layout, status="active", awaiting_from="claude-code")
+    before = datetime.now(UTC)
+    new_meta = set_awaiting_from(layout, "claude.ai")
+    after = datetime.now(UTC)
+
+    assert before <= new_meta.updated_at <= after

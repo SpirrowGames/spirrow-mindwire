@@ -93,6 +93,24 @@ need to know about when round-tripping values through the schema.
 """
 
 
+def opposite_of(participant: Participant) -> Participant:
+    """Return the other Participant under the Phase 0 2-party invariant.
+
+    ``Participant`` is a 2-party Literal (claude.ai / claude-code) and
+    Phase 0 hard-codes this assumption (D-1, docs/feature-2-design.md
+    §1.2). The function exists to give the concept of "the other side"
+    an explicit name, so callers updating ``awaiting_from`` after a
+    write_reply success do not silently re-encode the pairing inline.
+
+    Phase 1+ multi-participant extension is not a future-proofing concern
+    here — the Literal will gain new members and any caller of this
+    helper will fail type checking at that point, which is the correct
+    forcing function (= the "next turn" concept is no longer a binary
+    flip, so the call site must be revisited).
+    """
+    return "claude-code" if participant == "claude.ai" else "claude.ai"
+
+
 class StrictModel(BaseModel):
     """Base for all *schema* models: forbid extras, frozen, populate-by-name.
 
@@ -121,4 +139,5 @@ __all__ = [
     "ThreadStatus",
     "UTCDatetime",
     "UlidStr",
+    "opposite_of",
 ]

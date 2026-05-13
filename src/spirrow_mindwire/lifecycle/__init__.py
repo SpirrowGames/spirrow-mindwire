@@ -18,6 +18,7 @@ from .transitions import (
     TERMINAL_STATES,
     InvalidTransitionError,
     bump_retry_count,
+    set_awaiting_from,
     transition_state,
 )
 
@@ -26,5 +27,6 @@ __all__ = [
     "TERMINAL_STATES",
     "InvalidTransitionError",
     "bump_retry_count",
+    "set_awaiting_from",
     "transition_state",
 ]
