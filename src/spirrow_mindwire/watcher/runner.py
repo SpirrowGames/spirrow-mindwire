@@ -3,9 +3,18 @@
 Phase 0 happy path: a single coroutine starts the observer, drains
 the asyncio queue, and forwards each :class:`ThreadEvent` to the
 dispatcher. ``Ctrl+C`` cancels the consumer task and stops the
-observer cleanly. Lifecycle hardening (graceful shutdown grace
-window, startup full-scan, orphan staging cleanup) is queued for a
-later sub-PR.
+observer cleanly.
+
+Feature 2 sub-PR 1 adds two startup hooks before the queue loop:
+
+- :func:`spirrow_mindwire.watcher.orphan_cleanup.cleanup_orphan_tmp` —
+  delete ``messages/*.tmp`` files older than the age threshold.
+- :func:`spirrow_mindwire.watcher.startup_scan.startup_full_scan` —
+  enqueue synthetic :class:`ThreadEvent` for ``active`` / ``retrying``
+  threads so the dispatcher picks them up after a restart.
+
+Further robustness (timeout, retry, terminate) is queued for sub-PR
+2 / 3 / 4.
 """
 
 from __future__ import annotations
@@ -21,6 +30,8 @@ from .dedup import DedupCache
 from .dispatcher import ThreadDispatcher
 from .events import ThreadEvent
 from .observer import WatcherObserver
+from .orphan_cleanup import cleanup_orphan_tmp
+from .startup_scan import startup_full_scan
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +44,22 @@ async def run_watcher(settings: MindwireSettings, *, api_key: str | None) -> Non
     don't end up in TOML).
     """
 
+    # Feature 2: orphan .tmp cleanup at startup (docs §2.3).
+    deleted = cleanup_orphan_tmp(
+        settings.paths.threads_dir,
+        age_threshold_seconds=settings.watcher.orphan_tmp_cleanup_age_seconds,
+    )
+    if deleted > 0:
+        logger.info("orphan_cleanup: removed %d orphan .tmp files at startup", deleted)
+
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[ThreadEvent] = asyncio.Queue()
     dedup = DedupCache(ttl=timedelta(seconds=settings.watcher.dedup_ttl_seconds))
+
+    # Feature 2: state-based recovery — enqueue active/retrying threads (docs §2.1).
+    enqueued = startup_full_scan(settings.paths.data_dir, queue)
+    if enqueued > 0:
+        logger.info("startup_scan: enqueued %d thread events for recovery", enqueued)
 
     observer = WatcherObserver(
         threads_root=settings.paths.threads_dir,
@@ -53,6 +77,11 @@ async def run_watcher(settings: MindwireSettings, *, api_key: str | None) -> Non
             phanthand_client=phanthand,
             dedup=dedup,
             max_concurrent=settings.watcher.max_concurrent_threads,
+            idle_timeout_seconds=settings.watcher.idle_timeout_seconds,
+            absolute_timeout_seconds=settings.watcher.absolute_timeout_seconds,
+            max_retries=settings.watcher.max_retries,
+            retry_backoff_seconds=settings.watcher.retry_backoff_seconds,
+            retry_jitter=settings.watcher.retry_jitter,
         )
 
         observer.start()

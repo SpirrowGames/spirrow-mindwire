@@ -1,0 +1,659 @@
+# Spirrow MindWire Feature 2 設計仕様 (Robustness)
+
+> Feature 1 (Phase 0 happy-path watcher + claude-code session) 完成後の robustness 拡張 — lifecycle state machine、 timeout / retry、 crash recovery、 termination semantics の設計を確定する。 Phase 0 base commit `17b4908` (PR #16 squash merge to main) を起点とする。
+
+設計議論は ChatRoom 5 thread (`T-feat2-design-overview` + `T-feat2-d3a1-awaiting-from` / `T-feat2-d3a2-schema-version` / `T-feat2-d3b1-transition-table` / `T-feat2-d3b2-terminated-fields`) で 3 view (claude-code / claude.ai / claude.ai-naysayer) を経て決着。 本書は **decide 8 件 (msg 9 件: msg-028, msg-030, msg-053〜057, msg-059, msg-060)** の集約 SOT。
+
+## 1. Base 方針 (Decide #1)
+
+Feature 2 の全体方針として **Naysayer 寄り (縮小派)** を採用。 当初提案の 6 sub-PR plan に対し、 YAGNI / overscope / ハイブリッド複雑性の観点で縮小した結果。
+
+### 1.1 採用 base 方針
+
+| 項目 | 採用 |
+|---|---|
+| sub-PR 数 | **4** (元 6 から縮小): orphan-cleanup / timeout / retry / terminate |
+| state 数 | **5** (`active / retrying / terminated / resolved / archived`) |
+| dead letter ↔ rejection | **統合** (1 terminal `terminated` + `terminated_reason` field で区別、 命名は §3.4 / Decide #3b-2 で確定) |
+| state 表現方法 | **`meta.yaml.status` field 単独** (directory rename しない) |
+| graceful shutdown (元 sub-PR e) | **削除**、 即落とし運用、 crash recovery で吸収 |
+| f 後半 (thread_locks cleanup) | **削除**、 観測後別 issue 化 |
+| failure-injection test infra (新規論点 10) | **却下**、 各 sub-PR 内で local 整備 |
+| observability strategy (新規論点 11) | **却下**、 各 sub-PR 内で `logger.info` で足りる |
+| token budget (残課題 iv) | **却下**、 観測後別 phase |
+
+### 1.2 採用された (D) 4 盲点
+
+PR #1〜#16 review 経験から claude.ai が指摘し、 全 view 一致で組込決定:
+
+- **D-1** `Participant` Literal の 2-party 前提 → test fixture 設計時に意識 (→ §5.1 sub-PR 全般)
+- **D-2** EventLogWriter concurrent writers が Feature 2 で増 (timeout/retry/shutdown handler) → per-thread lock hold 時間考慮 (→ §5.1 sub-PR 3)
+- **D-3** (高 priority) `next_seq` retry 挙動 = **commit semantics** (write_reply は rollback せず commit、 next_seq は最大 seq+1 で deterministic 計算) → §5.1 sub-PR 3 (retry) で decide
+- **D-4** (高 priority) claude-code SDK subprocess の zombie / cleanup 責任分界 → §5.1 sub-PR 2 (timeout) で decide
+
+### 1.3 Monument hybrid
+
+議論結果の monument は 4 layer 分担 (3 view 一致):
+
+| Layer | 対象 | 役割 |
+|---|---|---|
+| `docs/feature-2-design.md` (本書) | SOT | 全 decide 結果 |
+| GitHub Issue | tracker | 各 sub-PR 進捗、 各論点が 「どの PR で解決」 された trace |
+| ChatRoom thread | process | 議論 trail |
+| 各 sub-PR description | per-PR context | 該当する decide への link |
+
+## 2. Crash Recovery Semantics (Decide #2)
+
+`(b) State-based recovery (status field-driven)` を採用。 startup 時に thread directory を scan し、 `meta.yaml.status` に基づき復帰挙動を分岐 (`status` field の定義は §3 参照)。
+
+### 2.1 復帰ロジック
+
+| status | 復帰挙動 |
+|---|---|
+| `active` | re-queue、 観測者ループに戻す |
+| `retrying` | re-queue、 retry counter は `meta.yaml.retry_count` から維持 |
+| `terminated` | skip (operator manual で復帰させたければ status 書換、 §3.6) |
+| `resolved` | skip |
+| `archived` | skip |
+
+「invoke 中だった thread」 の検出 (heartbeat / pid file) は **入れない**。 idempotency (D-3 commit semantics: `next_seq` deterministic) で safety net。
+
+### 2.2 `retry_count` の永続化
+
+`meta.yaml.retry_count: int = 0` field を採用。 各 retry 開始時に rewrite (= meta.yaml の atomic_write_text 1 回追加)。 operator が `meta.yaml` を見るだけで現状 retry 回数が判明する visibility を優先。
+
+`events.jsonl` 再計算は不採用 (計算 logic + load コスト増、 operator visibility 低下)。
+
+### 2.3 `.tmp` orphan cleanup の age threshold
+
+startup 時の即時削除は別 process の write_reply 中 (= staging 中の `.tmp`) を巻き込む risk があるため、 一定時間経過したもののみ削除。 config 値: `orphan_tmp_cleanup_age_seconds=300.0` (= `idle_timeout_seconds` と同 orderfo の **暫定値**、 staging 中の write_reply 完了想定時間 (本来は秒〜十数秒) とは異なる semantic、 dogfooding 後 FI-3 で再 audit、 §4 参照)。
+
+### 2.4 Test 戦略
+
+**重厚寄り**。 integration test で以下のシナリオを実機再現:
+
+- `.tmp` cleanup の age threshold 動作 (新しい `.tmp` は残る、 古い `.tmp` は削除)
+- `retrying` thread の crash 後 startup → retry counter 維持の確認
+- `active` thread の invoke 中 kill → 再起動 → next_seq deterministic で二重応答しないことの確認 (D-3 と integration)
+- `terminated` / `resolved` / `archived` thread が startup 時に skip される確認
+
+D-3 commit semantics の単体 test で済ませず、 crash recovery 全体パスを e2e で検証。 sub-PR 1 / 3 で実装。
+
+## 3. Lifecycle State Machine (Decide #3)
+
+5 状態 (`active / retrying / terminated / resolved / archived`) の表現、 transition 表、 atomicity、 enforcement を確定。
+
+> **Namespace disclaimer**: 本 §の `ThreadStatus` は MindWire watcher の filesystem-level thread 状態を指す。 ChatRoom (chatroom-magickit) の thread state (`active / awaiting_reply / resolved / superseded / parked`) とは **別 namespace**。 `active` / `resolved` の名前重複は意図的でない (混同しないこと)。
+
+### 3.1 Status enum と `awaiting_from` field (Decide #3a-1)
+
+既存 `awaiting-cc` / `awaiting-cai` を ThreadStatus enum から削除し、 「誰の応答待ちか」 は **直交 field** で表現。
+
+```python
+# src/spirrow_mindwire/schema/_common.py (Feature 2 後)
+ThreadStatus = Literal["active", "retrying", "terminated", "resolved", "archived"]
+
+class ThreadMeta(StrictModel):
+    status: ThreadStatus
+    awaiting_from: Participant | None = None  # 次に応答すべき participant (None: terminal state)
+```
+
+**`awaiting_from` の semantic**: 「次に応答すべき participant」 (「現在 invoke 中」 ではない、 watcher in-memory state とは責任分離)。
+
+**`awaiting_from` の初期値**: 新 thread 開設時 (`new/` から `threads/<ULID>/` への移動 / propose msg 書込時)、 **最初に thread 開設した participant の opposite** (= 次に応答すべき相手) を設定。 例: claude.ai が initial msg を `new/` に置いて開設すれば `awaiting_from="claude-code"`、 逆もまた然り。
+
+```
+status="active", awaiting_from="claude-code"
+  → 次に claude-code が応答すべき thread
+
+status="retrying", awaiting_from="claude-code"
+  → 次に claude-code が応答すべきだが、 直近の invoke 試行は失敗、 watcher が retry 中
+
+status="terminated", awaiting_from=None
+  → 誰の応答も待たない (terminal)
+
+status="active", awaiting_from="claude-code" (invoke 開始前 / event 検出待ち)
+  → §3.1 表現上は 1 つ目と同じ、 区別は §6 FI-1 で別途検討 (Phase 0 では区別不要、
+    watcher in-memory state + per-thread lock 状態で trace)
+```
+
+**multi-participant 拡張** (Phase 1+): `Participant` Literal 拡張で対応、 別 enum 設置せず。
+
+### 3.2 schema_version 据え置き (Decide #3a-2)
+
+`schema_version: Literal[1]` のまま、 enum 変更 (`awaiting-cc`/`awaiting-cai` 削除 + `retrying`/`terminated` 追加) と field 追加 (`awaiting_from` / `retry_count` / `terminated_reason` / `terminated_at`) を **同 version で実施**。
+
+理由: Phase 0 段階で production thread ゼロ、 schema bump コスト > 価値。 Phase 1 MCP write API 移行が初の real migration trigger (external consumer 出現で breaking 制約発生)、 そこで bump + migration infrastructure を整備。
+
+**semantic 固定**: 「on-disk schema の互換性」 のみを表現。 「lifecycle state machine の version」 は別概念。
+
+**namespace docstring 補強** (Naysayer §3 → Claude.ai 採用):
+
+```python
+SCHEMA_VERSION = 1
+"""Schema version for ThreadMeta on-disk YAML format.
+
+NOTE: This version is INDEPENDENT from event log schema version
+(_BaseEvent.schema_version). The numeric value happening to be 1 in
+both cases is coincidental; bumping one does not require bumping the
+other. See architecture.md §3 for the snapshot vs audit log boundary.
+"""
+
+class _BaseEvent(StrictModel):
+    schema_version: Literal[1]
+    """Schema version for individual event log entries.
+
+    Independent from ThreadMeta.schema_version. See SCHEMA_VERSION
+    docstring in this module.
+    """
+```
+
+**git bisect mitigation**: schema 変更を跨ぐ git bisect で古い test fixture (`status: "awaiting-cc"` 等) が新 schema で ValidationError 起こす risk → schema 変更 commit に test fixture 全再生成を pair commit。 sub-PR 1 で生成する fixture は **Feature 2 後の最終 schema** を想定 (§5.1 sub-PR 1 参照、 sub-PR 2〜4 は schema additive 変更を伴わない前提)。
+
+### 3.3 Transition 表 (Decide #3b-1)
+
+5 状態間の遷移は **8 transition** に限定:
+
+```
+active ─→ retrying          (invoke 失敗 = transient error)
+active ─→ terminated        (validation failed without retry)
+active ─→ resolved          (operator manual)
+retrying ─→ active          (retry 成功)
+retrying ─→ terminated      (retry exhausted)
+terminated ─→ resolved      (operator manual = re-investigate)
+terminated ─→ archived      (operator manual)
+resolved ─→ archived        (operator manual)
+```
+
+| transition | trigger | reason field 設定 |
+|---|---|---|
+| active → retrying | invoke 失敗 (transient) | — |
+| active → terminated | validation 失敗 | `terminated_reason="validation-failed"` |
+| active → resolved | **operator manual (Phase 0)、 claude.ai resolve は Phase 1+ MCP write API 経由** | — |
+| retrying → active | retry 成功 | — |
+| retrying → terminated | retry 上限突破 | `terminated_reason="retry-exhausted"` |
+| terminated → resolved | **operator manual (Phase 0)、 claude.ai resolve は Phase 1+ MCP write API 経由** | — |
+| terminated → archived | **operator manual (Phase 0)、 claude.ai resolve は Phase 1+ MCP write API 経由** | — |
+| resolved → archived | **operator manual (Phase 0)、 claude.ai resolve は Phase 1+ MCP write API 経由** | — |
+
+**禁止 transition**:
+- `terminated → active` 自動: 不可。 operator は status 書換で `terminated → resolved` に戻し、 必要なら新規 thread を起こす
+- `archived → 任意`: archived は terminal の terminal、 immutable
+- `resolved → retrying / terminated`: 不可。 resolved 後に問題が再発したら新規 thread
+
+**`archived` immutable の semantic 範囲**: 「software-level immutable」 (= watcher は archived thread に対する transition を実行しない) を指す。 operator は filesystem level で削除 (`rm -rf threads/<ULID>/`) 可能。
+
+**`active → terminated` direct trigger binding**: schema 起因 error (`pydantic.ValidationError` / `_FRONTMATTER_RE` parsing 失敗 / `msg_id` mismatch 等)。 これらは retry しても直らないため direct terminated。 詳細 error 分類 (どの SDK error / Phanthand error を transient と見なすか) は §5.1 sub-PR 3 (retry) 内 decide。
+
+`awaiting_from` field の transition は **status と直交**。 invoke 完了で都度更新、 SOT は `write_reply` 成功完了時 (§3.5)。
+
+### 3.4 Terminated fields (Decide #3b-2)
+
+`terminated` state に入った時の追加情報を **両方独立 field** として持つ。
+
+```python
+class ThreadMeta(StrictModel):
+    ...
+    terminated_reason: Literal["retry-exhausted", "validation-failed"] | None = None
+    terminated_at: UTCDatetime | None = None
+```
+
+**redundancy 許容**: `terminated_at` は `events.jsonl` の `ThreadStatusChanged` event timestamp と重複するが、 「snapshot vs audit log」 責任分離で同じ情報が両方に出るのは natural。 `transition_state` 唯一 entry point (§3.5) で inconsistency 構造的防止。
+
+**`terminated_reason` Literal 拡張性**: 拡張時 schema_version bump で値追加 (§3.2 整合)。 命名 kebab-case 統一。
+
+**非対称 OK**: `resolved_at` / `archived_at` は持たない (= operator manual 遷移、 自分が遷移させた時刻を覚えている / events.jsonl で確認可能)。 Phase 0 では terminated のみ独立、 Phase 1+ で必要になったら additive 追加。
+
+**`updated_at` docstring 補強** (Naysayer §3 → Claude.ai 採用):
+
+```python
+class ThreadMeta(StrictModel):
+    ...
+    updated_at: UTCDatetime
+    """Last write time of this meta.yaml, regardless of trigger.
+
+    Updated whenever ThreadMeta is persisted, including:
+    - status transition (transition_state function)
+    - awaiting_from update without status change
+    - any other meta.yaml write
+
+    Distinct from event log timestamps (events.jsonl), which record
+    when each event was appended.
+    """
+```
+
+**Terminal-out transition 時の field 保持**: `terminated_reason` / `terminated_at` は **保持** (`terminated → resolved`、 `terminated → archived`、 `resolved → archived (terminated 経由)` で audit trail として残す)。 §3.5 sketch の `model_copy(update={...})` で caller が明示的に reset しない限り保持される実装と整合。
+
+**on-disk truth と D-3 commit semantics**: meta.yaml は thread 状態の on-disk SOT であり、 in-memory `meta` は read 時点の snapshot に過ぎない。 crash recovery (§2) や retry loop (§5.1 sub-PR 3) で in-memory state が信頼できなくなる場面でも、 「on-disk meta.yaml + events.jsonl + messages/」 を再 load すれば deterministic に状態復元できる。 D-3 next_seq commit semantics (`write_reply` rollback せず commit、 max(seq)+1 で deterministic 再計算) も on-disk truth principle の具体化。
+
+**Hedge (on-disk truth framework)**: 「on-disk truth」 は本 docs での decide における pattern recognition tool であって、 individual implementation choice の justification ではない。 将来 in-memory cache + WAL の hybrid や event-sourced derivation が技術的に妥当となる場面 (= multi-instance watcher、 high-throughput dogfooding 等) では、 具体 cons / pros を再評価して採用判断する。 「on-disk truth に反する」 を理由とした automatic reject はしない。
+
+**Hedge (責務分離 framework)**: 「snapshot (meta.yaml) vs audit log (events.jsonl)」 の責務分離も同様に pattern recognition tool。 同情報が両方に出る redundancy を許容 (§3.4 terminated_at) する判断、 や 「meta が SOT、 events は補完」 (§3.5 FI-2 帰結) の判断は、 責務分離 framework だけで自動的に決まるのではなく、 個別 trade-off (visibility / write atomicity / recovery cost) を見て決めている。 framework violation を理由とした automatic reject はしない。
+
+### 3.5 Atomicity と enforcement
+
+**`transition_state` 関数を唯一 entry point** として 1 箇所集約。 status / awaiting_from / terminated_reason / terminated_at / updated_at を 1 atomic_write_text で同時更新。 Pydantic `model_validator` 追加せず (二重管理回避、 partial update バグは code 構造で防止)。
+
+```python
+def transition_state(
+    layout: ThreadDirLayout,
+    new_status: ThreadStatus,
+    *,
+    awaiting_from: Participant | None,
+    terminated_reason: TerminatedReason | None = None,
+    terminated_at: datetime | None = None,
+    ...
+) -> None:
+    old_meta = load_thread_meta(layout)
+    _validate_transition(old_meta.status, new_status)  # code-level enforce
+    new_meta = old_meta.model_copy(update={...})
+    atomic_write_text(layout.meta_path, yaml.safe_dump(new_meta.model_dump()))
+    # FI-2 帰結 (sub-PR 3 着手前 decide、 T-FI2-transition-2pc):
+    # meta.yaml が SOT (= status の SoT)、 events.jsonl は best-effort audit log。
+    # write 順序は 「meta.yaml 先 → events.jsonl 後」 (caller 側で順に呼ぶ)。
+    # meta 成功 + events 失敗時は audit log に gap が残る一方 meta は最新状態を
+    # 反映、 startup_full_scan が WARNING で gap を log するのみで自動 rollback
+    # / retry はしない (Phase 0 race-acceptance contract、 §3.6 と整合)。
+```
+
+**禁止 transition enforcement**: `_ALLOWED_TRANSITIONS: dict[ThreadStatus, set[ThreadStatus]]` table-driven 設計 + `pytest.parametrize` 網羅 test。 schema validator level での enforce はせず (= schema は instance 単独 validity の責任のみ)。
+
+```python
+_ALLOWED_TRANSITIONS: dict[ThreadStatus, set[ThreadStatus]] = {
+    "active":     {"retrying", "terminated", "resolved"},
+    "retrying":   {"active", "terminated"},
+    "terminated": {"resolved", "archived"},
+    "resolved":   {"archived"},
+    "archived":   set(),  # immutable terminal
+}
+
+def _validate_transition(old: ThreadStatus, new: ThreadStatus) -> None:
+    if new not in _ALLOWED_TRANSITIONS[old]:
+        raise InvalidTransitionError(...)
+```
+
+**events.jsonl event types: occurrence vs snapshot**: sub-PR 3 で追加する `RetryBackoffStarted` (occurrence = backoff sleep が始まった事実) と、 既存 `ThreadStatusChanged` (snapshot = 遷移完了後の state を carry、 retry_count field 追加で snapshot 化を強化) は意図的に分離して持つ。 occurrence は 「いつ何が起きた」 audit、 snapshot は 「どの state に遷移したか」 audit で role が異なる。 `ThreadStatusChanged.retry_count` は post-write meta.yaml 値の mirror、 event log alone で retry 履歴を再構築できる。 詳細 docstring は `schema/event.py` module docstring 参照。
+
+**`awaiting_from` 更新タイミング**: `write_reply` 成功完了時を SOT (§3.1 semantic と整合)。 invoke 開始 / 終了時には更新しない。 retry 中 (= retrying state) の `awaiting_from` は **失敗した invoke の actor を指したまま**。
+
+**FI-2 resolution detail (sub-PR 3、 T-FI2-transition-2pc)**: 「meta が SOT、 events は best-effort」 を採用。 write 順序 = `transition_state` 内 `atomic_write_text` 完了後 caller が `EventLogWriter.append(ThreadStatusChanged)`。 events.jsonl 側 failure (disk full / permission) は exception を raise しても caller が swallow / log のみ (= meta 反映は完了している)、 自動 rollback はしない。 起動時 `startup_full_scan` が events.jsonl 末尾を読んで meta.yaml.status と divergence があれば WARNING ログを出して継続。 (= gap detection 専用 transactional log や WAL は導入しない、 §6 FI-X1 / FI-X2 参照。 元議論 trail は ChatRoom `T-FI2-transition-2pc` thread 参照。)
+
+**retry_count semantics (sub-PR 3、 T-D7-retry-count-semantic、 (b) 採用)**:
+
+- **累積 (cumulative) 解釈**: `retry_count` は thread lifetime 全体での累積 retry 試行回数 (= 同 thread の 複数 `_run_thread` 呼出にまたがる)。 単一 `_run_thread` 内の retry loop も、 startup_full_scan で requeue された後の retry も、 すべて同 counter に積算する。
+- **preserve semantics**: `transition_state(..., retry_count=None)` で caller が明示 update しない限り on-disk 値を保持。 retry success による `retrying → active` 遷移でも `retry_count` を caller が渡さなければ保持され、 「直前 retry session の試行数を audit trail として残す」 形になる。
+- **max_retries 解釈と再 audit trigger**: `max_retries` (default 3) は **単一 `_run_thread` 呼出内の retry loop の上限** であり、 累積上限ではない。 startup_full_scan で requeue された後に再度 retry loop が回る scenario は許容、 結果として `retry_count` が `max_retries` を上回ることがある (= dogfooding 開始後の re-audit trigger、 FI-3 関連、 #14 を sub-PR 3 PR description checklist で carry)。
+- **audit trail framing (D-7 Naysayer 由来)**: `retry_count` の primary 目的は operator visibility / dogfooding 観測値 (= 「過去にどれだけ retry したか」)、 retry 制御の primary gate ではない。 gate は `max_retries` (= loop 内 counter) であり、 `retry_count` は disk-persisted observable。 framework としては audit trail (= 過去の記録) であり、 control state (= 今後の挙動を決める state) ではない。
+
+**Hedge (audit trail framework)**: 「audit trail (events.jsonl + retry_count 等の persisted counter)」 は本 docs での decide における pattern recognition tool。 将来 retry control を `events.jsonl` derive に切替えたり、 retry_count を意図的に削除して event log のみで再構築する選択肢が技術的に妥当となる場面 (= event-sourcing 全面移行、 §6 FI-X2) では、 audit trail framework の violation を理由に automatic reject せず、 具体 cons / pros を再評価する。
+
+### 3.6 Operator manual transition (Phase 0)
+
+Phase 0 では `terminated → resolved` (再調査 / 再投入)、 `terminated → archived` (永久 retire)、 `resolved → archived` (運用整理)、 および稀な状況での `active → resolved` 直接 resolve など、 **operator (= 運用者) が直接 status を遷移させる** path が必要。 Phase 0 では専用 CLI / MCP write API を提供せず、 `meta.yaml` の **直接編集 (`yq` / editor / `sed`)** のみで運用する。
+
+**前提と race contract (Phase 0)**:
+
+```
+operator manual transition の前提 (Phase 0):
+- meta.yaml 直接編集 (yq / 手動) のみ許容、 専用 CLI なし
+- watcher は次回 _run_thread 開始時に meta.yaml を再読込、 race は許容
+  (= operator 編集と watcher 読み込みのどちらが勝つかは undefined、
+   ただし transition rule は code-level _validate_transition でチェックされるので
+   invalid state にはならない)
+- operator は編集前に watcher を止める (pkill / systemctl stop) ことを推奨運用
+- 推奨運用に違反した場合の保証: 「invalid state にはならない」 のみ、
+  watcher が古い状態を上書きする可能性は許容
+```
+
+**安全な編集手順 (推奨)**:
+
+1. `pkill -INT spirrow-mindwire` (or `systemctl stop`) で watcher を停止
+2. `meta.yaml` を編集:
+   - `status: terminated` → `status: resolved` のように直接書換
+   - `awaiting_from`: 遷移先が terminal (`resolved` / `archived`) なら `null`、 non-terminal (`active` / `retrying`) なら `claude.ai` or `claude-code`
+   - `updated_at`: 任意更新 (= watcher は次回 transition 時に自動上書きするので必須ではない)
+3. `events.jsonl` には operator transition の event は手動 append 不要 (= watcher が次回 transition 時に append、 Phase 0 では operator transition の audit trail は editor の commit log + ファイル mtime で代替)
+4. watcher 再起動 (`uv run spirrow-mindwire`)、 `startup_full_scan` が再 enqueue / skip 判定
+
+**禁止事項**:
+
+- `_ALLOWED_TRANSITIONS` (§3.3 / `lifecycle/transitions.py`) で禁止された transition は手動でも実施しない (例: `archived → active`)。 watcher は次回 `transition_state` 呼出で `InvalidTransitionError` を raise し、 該当 invoke 失敗の event log のみ残す。
+- `meta.yaml` 内の `thread_id` / `created_at` / `schema_version` の編集禁止 (= invariant)。
+
+**保証されないこと**:
+
+- operator 編集中 (= watcher が走ったまま) の同時 write race: 「invalid state にはならない」 以外は何も保証しない。 watcher write が operator 編集を silently 上書き、 もしくは逆も発生しうる。
+- operator が edit 後 watcher 再起動を忘れた case: live event がそのまま新 status で処理される (= 期待通りの場合もあれば不本意な再 invoke 発火もある)。
+
+**Phase 1+ で予定する upgrade**:
+
+- MCP write API (`mcp__mindwire__resolve_thread` / `archive_thread`) 経由の transition、 audit trail 自動 append
+- これにより operator 介入も machine-readable event として残せる
+- §6 FI-1 (invoke 中 vs 未開始) の整理が完了したら、 「invoke 中 transition」 を MCP API で安全に許容する余地も検討
+
+**reload 戦略**: **(i) per-iteration reload** を採用 (sub-PR 1 着手時 decide、 commit `0960f21` 後に決定)。 watcher は `_run_thread` 開始時に毎回 `load_thread_meta(layout)` で meta.yaml を read する (= 現 `dispatcher.py:_run_thread` 実装と整合)。 (ii) startup 1 回 + invoke 開始時 cache 代替案は不採用 — cache 同期コスト > read cost、 また §3.6 の operator manual race acceptance (= 「次回 _run_thread 開始時に再読込」) との整合性が (i) のみで自然に成立する。
+
+## 4. WatcherConfig defaults (Decide #4)
+
+Naysayer §5-3 提案 (各値が 「観測 / 実測 / experience 由来か」 1 行 audit) に従う。
+
+### 4.1 Audit 結果
+
+| field | 現 default | 由来 | 結論 |
+|---|---|---|---|
+| `dedup_ttl_seconds` | `5.0` | filesystem event 重複観測 window、 PR #5 議論で確立 | **keep** |
+| `max_concurrent_threads` | `4` | ローカル dogfooding 想定、 LLM API rate limit 考慮 | **keep** |
+| `polling_mode` | `False` | filesystem watcher native event 優先 | **keep** |
+| `idle_timeout_seconds` | `300.0` | LLM 応答 30s〜数分、 5 分は安全側上限 (実測なし、 暫定) | **keep (要観測)** |
+| `absolute_timeout_seconds` | `3600.0` | 1 時間絶対上限、 異常 long invoke 検知 (実測なし、 暫定) | **keep (要観測)** |
+| `retry_backoff_seconds` | `(5.0, 30.0, 120.0)` | exponential-ish、 LLM API rate limit 標準的値 (実測なし、 暫定) | **keep (要観測)** |
+| `retry_jitter` | `0.2` | 20% jitter、 一般的妥当値 (実測なし、 暫定) | **keep (要観測)** |
+| `max_retries` | `3` | 一般的妥当値 (実測なし、 暫定) | **keep (要観測)** |
+| `shutdown_grace_seconds` | `60.0` | T06 hard-code、 graceful shutdown 用 | **削除** (§1.1 graceful shutdown 削除整合) |
+
+### 4.2 追加
+
+| field | default | 由来 |
+|---|---|---|
+| `orphan_tmp_cleanup_age_seconds` | `300.0` | §2.3 暫定値、 dogfooding 後 FI-3 で再 audit |
+
+### 4.3 Feature 2 後の WatcherConfig
+
+```python
+class WatcherConfig(_StrictModel):
+    """Watcher runtime tuning. Defaults are the T06+Feature2-confirmed values."""
+
+    dedup_ttl_seconds: float = Field(default=5.0, gt=0)
+    max_concurrent_threads: int = Field(default=4, ge=1)
+    polling_mode: bool = False
+    idle_timeout_seconds: float = Field(default=300.0, gt=0)
+    absolute_timeout_seconds: float = Field(default=3600.0, gt=0)
+    retry_backoff_seconds: tuple[float, ...] = (5.0, 30.0, 120.0)
+    retry_jitter: float = Field(default=0.2, ge=0, le=1)
+    max_retries: int = Field(default=3, ge=0)
+    orphan_tmp_cleanup_age_seconds: float = Field(default=300.0, gt=0)
+    # shutdown_grace_seconds 削除 (Decide #1)
+```
+
+**Flag (sub-PR 3 で対応)**: `retry_backoff_seconds: tuple[float, ...]` に min length / monotonic increase の field validator が無く、 例えば `(120, 30, 5)` のような decreasing 値も pass する。 sub-PR 3 (retry) 着手時に field validator 追加検討。
+
+**sub-PR 3 close note (#14 max_retries audit cycle carry、 T-D7-retry-count-semantic (b))**: `max_retries=3` は dogfooding まで暫定値として継続採用、 sub-PR 3 では値変更しない。 D-7 (b) で確定した cumulative + audit trail framing (= retry_count は per-_run_thread gate ではなく persisted observable、 §3.5 参照) の評価は dogfooding 開始後の FI-3 / FI-4 re-audit cycle で行う。 観測 trigger: 「`terminated/retry-exhausted` thread が予想以上に頻発」 or 「`retry_count` が累積で 3 を大きく超える case が一般化」、 どちらかが Phase 1 設計 phase 着手前に観測されたら `max_retries` 値そのものの再 audit に持ち込む。 sub-PR 3 完了後 `Issue #33` の cross-config invariant audit (= integration test pass で 「不要化 confirm」) と並行して、 dogfooding 観測値を集める運用に移行する。
+
+## 5. 4 sub-PR の境界 + 着手順序 (Decide #5)
+
+### 5.1 各 sub-PR の中身
+
+#### sub-PR 1: schema + orphan-cleanup
+
+最大 PR、 schema 変更を全集約。
+
+> **size warning**: sub-PR 1 は schema 変更を全集約するため **800〜1500 行規模** になる見込み (Phase 0 参考: PR #2 ~600 / PR #3 ~700 / PR #16 ~1000)。 review 効率のため、 PR description で 10 項目を明確に sectioning + Copilot review focus を `schema/`、 `storage/transition_state.py`、 `config/watcher.py` の 3 subsystem に分けて指定推奨。
+
+- ThreadStatus enum 変更 (`awaiting-cc`/`awaiting-cai` 削除 + `retrying`/`terminated` 追加) → §3.1
+- ThreadMeta 新規 4 field: `awaiting_from`, `retry_count`, `terminated_reason`, `terminated_at` → §3.1, §3.4
+- docstring 補強 (`updated_at` / `SCHEMA_VERSION` namespace) → §3.2, §3.4
+- `transition_state` 関数 (1 entry point) → §3.5
+- `_ALLOWED_TRANSITIONS` table + `pytest.parametrize` 網羅 test → §3.5
+- §3.6 operator manual transition 1 段落明文化 (docstring or 本書参照) → §3.6
+- `_run_thread` 開始時の meta.yaml reload 戦略を decide + §3.6 末尾に追記
+- WatcherConfig: `shutdown_grace_seconds` 削除 + `orphan_tmp_cleanup_age_seconds` 追加 → §4
+- startup `.tmp` cleanup with age threshold → §2.3
+- state-based status scan 枠組み → §2.1
+- test fixture 全再生成 (sub-PR 2〜4 は schema additive 変更を伴わない前提) → §3.2
+
+#### sub-PR 2: timeout
+
+- `idle_timeout_seconds` + `absolute_timeout_seconds` 監視ロジック
+- `active → retrying` 遷移 (transient timeout error)
+- timeout simulation fixture (PR 内 local 整備)
+- **sub-PR 内追加 decide**: D-4 SDK subprocess cleanup 責任分界 (claude-code SDK の `query()` cancel 時の zombie 処理、 候補 (a) SDK 依拠 / (b) watcher が subprocess tree track + kill / (c) zombie 許容)
+
+#### sub-PR 3: retry
+
+- retry loop (`retry_backoff_seconds` + `retry_jitter` + `max_retries`)
+- `meta.yaml.retry_count` 永続化 → §2.2
+- `retrying` state recovery integration test → §2.4
+- per-thread lock 範囲明確化 (Decide #3b-1 後送り、 lock hold 時間が長くなる影響)
+- `retry_backoff_seconds` field validator (min length / monotonic increase、 §4.3 flag)
+- **sub-PR 内追加 decide**:
+  - D-3 next_seq commit semantics (write_reply は rollback せず commit、 next_seq は最大 seq+1 で deterministic)
+  - error 分類 (transient: filesystem IO / Phanthand transient HTTP / SDK rate limit → retry。 permanent: schema 起因 → direct terminated)
+  - FI-2 `transition_state` の 2-phase commit semantics (meta.yaml ↔ events.jsonl の write 順序 / 失敗 detection)
+
+#### sub-PR 4: terminate (= Phase 0 Feature 2 完結)
+
+- ✅ `active → terminated` direct trigger (schema 起因 error binding) — **sub-PR 3 で実装済** (= dispatcher の safe-by-default permanent path → `_handle_permanent_failure` → `terminated/validation-failed`、 §3.3)
+- ✅ `retrying → terminated` (retry 上限突破) — **sub-PR 3 で実装済** (= dispatcher retry loop `_handle_transient_failure` 内 `attempt == max_retries` 分岐 → `terminated/retry-exhausted`)
+- ✅ `terminated_reason` + `terminated_at` 設定 — **sub-PR 1/3 で実装済** (= `transition_state` 内で set、 schema/meta.py に field、 §3.4)
+- ✅ `terminated`/`resolved`/`archived` thread の startup skip — **sub-PR 1 で実装済** (`test_terminal_states_are_skipped`、 §2.1)
+- 🔧 **sub-PR 4 残 scope = full lifecycle e2e integration test** (= 上記実装の合成挙動を end-to-end で verify):
+  - (i) Permanent → terminated/validation-failed → operator → resolved → archived
+  - (ii) Retry exhaustion → terminated/retry-exhausted → operator → resolved → archived
+  - (iii) Mix startup_scan: terminal-skipped + active-requeued + retrying-requeued
+  - (iv) Operator-edited transition の watcher restart 反映
+
+sub-PR 4 着手前 design decide = ChatRoom thread `T-subPR4-integration-test-design` で trilateral debate **8 回目**、 三者合意 + divergent 2 件 user 判断確定 (= Naysayer 採用: (iii) partial write_reply sub-step 撤回 / Q1 section comment block default 不追加)。
+
+source code 変更なし (= dispatcher / lifecycle / schema 全て既実装の通り)、 test 追加のみで Phase 0 Feature 2 robustness を完結する。 Lines budget 想定 220-340 lines、 既存 `tests/test_watcher_e2e.py` 拡張で consolidated location、 SDK fake invoker pattern + factories.py 既存 helpers 流用。
+
+### 5.2 着手順序 + chain merge pattern
+
+**順序**: 1 → 2 → 3 → 4 (依存順、 並行不可)。
+
+依存関係:
+- 1 が schema + transition_state を提供、 2/3/4 はその上で実装
+- 2 (timeout) が `active → retrying` 遷移を実装 → 3 (retry) が retrying state での backoff を実装 → 4 (terminate) が `retrying → terminated` を実装
+
+**chain merge pattern** (`feedback_chain_pr_merge.md` 整合):
+
+- `develop/feat-robustness` 統合 branch を main `17b4908` から切る
+- 各 sub-PR は base = 直前 sub-PR の head branch (chain)
+- squash merge 後に下流 sub-PR を rebase + 新規 PR 作成:
+  ```
+  git checkout feat/<next>
+  git rebase --onto develop/feat-robustness <prev-tip> feat/<next>
+  git push --force-with-lease
+  gh pr create --base develop/feat-robustness --head feat/<next>
+  ```
+- 全 4 sub-PR squash 後に develop を main へ squash merge
+- 各 push 前に local で `uv run ruff format --check` + `mypy src/` 確認 (CI fail 防止)
+- spirrowgames-ops APPROVE は新規 PR で引き継がれない (元 PR 引用で対応、 PR #4 と同 pattern)
+
+### 5.2.1 sub-PR 間 contract integration checklist
+
+PR #27 (sub-PR 2 timeout) spirrowgames-ops review M-3 由来の meta-process improvement (Issue #28)。 chain merge pattern の各 sub-PR 着手前に、 直前 sub-PR で merged された contract を verify する事前 phase を運用化する。
+
+**背景**: PR #27 で C1 / C2 の 2 must bug が review で発見された。
+
+- **C1**: `InvokeTimeoutError(asyncio.TimeoutError)` (`claude_code/session.py`) の inheritance と Python 3.11+ `asyncio.TimeoutError = TimeoutError` alias の subtle interaction (except 順序 / isinstance subclass match) が抑え切れていなかった
+- **C2**: sub-PR 1 で merged された `REQUEUE_STATES` (`lifecycle/transitions.py`、 `startup_full_scan` 由来) と `_ALLOWED_TRANSITIONS` (`lifecycle/transitions.py`) の contract に対し、 sub-PR 2 dispatcher の timeout handler が unaware だった
+
+共通の根本原因: sub-PR 2 着手時に sub-PR 1 で merged された contract を chain integration verify する事前 step が存在しなかったこと。 既存 CI test では catch されず、 review で初めて検出。
+
+**checklist**: 各 sub-PR 着手時、 直前 sub-PR で merged された以下 contract を verify する。
+
+- [ ] `_ALLOWED_TRANSITIONS` (`lifecycle/transitions.py`) — 新規 invoke path で発生しうる全 status 遷移が allowed か
+- [ ] `REQUEUE_STATES` (`lifecycle/transitions.py`、 `startup_full_scan` で参照) — 新規 path が requeue される thread state を honor するか
+- [ ] `TERMINAL_STATES` (`lifecycle/transitions.py`、 `dispatcher._run_thread` で short-circuit) — terminal state skip が新規 path でも維持されるか
+- [ ] `transition_state` invariants (`awaiting_from` / `terminated_reason` / `terminated_at` / `retry_count`) — meta.yaml status 遷移を伴う書込は本 entry point 経由か、 rule 違反していないか
+- [ ] `bump_retry_count` (`lifecycle/transitions.py`) — meta.yaml status 不変で `retry_count` だけ advance する path が caller side で本 entry point 経由か (sub-PR 2 C2 由来、 `retrying → retrying` 自己遷移禁止と integration)
+- [ ] `DedupCache` semantic (`watcher/dedup.py`) — 新規 path が dedup と整合するか (sub-PR 1 review O-3、 sub-PR 2 で carry 確認済)
+- [ ] Python 3.11+ language alias (`asyncio.TimeoutError = TimeoutError` 等) との interaction — `except` 順序、 `isinstance` の subclass match (sub-PR 2 C1 由来)
+- [ ] `_TRANSIENT_ERROR_TYPES` / `_is_transient` (`watcher/dispatcher.py`) — allowlist transient classification、 新規 exception class 導入時に allowlist 拡張が必要か判定 (sub-PR 3 由来)
+- [ ] `_handle_transient_failure` / `_handle_permanent_failure` / `_recover_retrying_to_active` / `_compute_backoff` (`watcher/dispatcher.py` private methods) — retry / permanent / recovery / backoff 各 path 拡張時の symmetry 維持、 新規 path が responsibility separation framework に従うか (sub-PR 3 由来、 PR #34 review S-1 helper extract 結果)
+- [ ] `RetryBackoffStarted` event type (`schema/event.py`、 occurrence event) — 新規 retry-adjacent event を追加する時、 occurrence vs snapshot semantic との整合 (sub-PR 3 由来)
+- [ ] `ThreadStatusChanged.retry_count` field (`schema/event.py`、 snapshot event) — 新規 ThreadStatusChanged emit 箇所で `retry_count=current_meta.retry_count` を populate しているか (sub-PR 3 由来、 snapshot mirror 維持)
+- [ ] **O-2 carry: `_handle_transient_failure` direct unit test** (`tests/lifecycle/test_error_classification.py` への extract) — sub-PR 3 PR #34 review O-2 carry、 sub-PR 4 内では実装せず carry note のみ、 future Phase 1+ で `lifecycle/error_classification.py` extract と並行 migrate (= module extract が trigger)
+
+新たな contract symbol が sub-PR で導入された場合は本 checklist にも追加すること (= checklist 自体も sub-PR ごとに育てる)。
+
+**sub-PR 着手時の流れ**:
+
+1. **本 checklist を 1 項目ずつ verify** (= 各 contract を新規 path で confirm、 design level の整合性確認)
+2. branch 切り (`feat/feature-2-<name>` from `develop/feat-robustness`)
+3. 結果を sub-PR PR description に明記 ("Chain integration checklist verified" + 各項目の備考)
+4. 実装着手
+
+**PR description 記載 example** (sub-PR 3 retry の場合):
+
+````markdown
+## Chain integration checklist verified
+
+- ✅ `_ALLOWED_TRANSITIONS`: 新規 path `retrying → active` (retry 後 re-invoke 時の dispatcher transition) は `_ALLOWED_TRANSITIONS["retrying"] = {"active", "terminated"}` に含まれる、 整合
+- ✅ `REQUEUE_STATES`: 新規 path は requeue 対象 thread state を honor、 `startup_full_scan` 経由の retrying thread → retry path の chain を verify
+- ✅ `TERMINAL_STATES`: 新規 path で terminal state thread が再 invoke されない、 dispatcher の terminal short-circuit が retry 経路でも維持
+- ✅ `transition_state` invariants: retry 後の `active` 復帰時に `awaiting_from` を preserve、 `retry_count` も合わせて update
+- ✅ `bump_retry_count`: retry 経路では status 不変で retry_count advance のみ、 sub-PR 2 で確立した API を踏襲
+- ✅ `DedupCache` semantic: retry 経路の re-invoke は新規 event 由来 (= 別 seq) のため dedup と衝突しない
+- ✅ Python 3.11+ language alias: sub-PR 3 で `asyncio.TimeoutError` 派生例外を新規追加しない、 既存の `InvokeTimeoutError` (sub-PR 2 由来) のみ取扱い
+````
+
+各項目に **判定 (✅/❌)** + **理由 (1〜2 行)** の統一 form を採用、 reviewer (Copilot / claude.ai / Takahito) が見落としを catch しやすい。
+
+**Phase 0 完結後の扱い**: sub-PR 4 完了 + develop → main squash merge 後も §5.2.1 は残し、 Phase 1+ で sub-PR 構造を持つ任意の chain merge に適用可能な一般メタ運用として継承。
+
+**将来の extract 計画**: Phase 0 完結時点で、 本 §5.2.1 を `docs/chain-merge-pattern.md` 等の独立 doc に extract する task を別 Issue (#30) で trackable に carry。 Phase 1+ で Feature 3 / Feature 4 が chain merge pattern を採用する際、 Feature 2 専用 doc を読まずに済む構造を目指す。
+
+**関連**:
+
+- ChatRoom: PR #27 spirrowgames-ops review M-3 (`r3215170437`)
+- meta tracker: Issue #28 (※ issue body は提案時の symbol 名で記述、 現 code との差異あり、 docs §5.2.1 では現 code symbol を SoT 採用)
+- 直近適用先: sub-PR 3 (#20、 retry) 着手前
+
+### 5.3 論点 4/5/6 の処遇
+
+| 当初提案論点 | 処遇 |
+|---|---|
+| 論点 4 (timeout 動作 semantics) | sub-PR 2 内 decide で消化 (D-4 含む) |
+| 論点 5 (retry 範囲) | sub-PR 3 内 decide で消化 (D-3、 error 分類、 FI-2 含む) |
+| 論点 6 (graceful shutdown ↔ retry interaction) | 削除確定 (§1.1 で graceful shutdown 削除済) |
+
+**sub-PR 内 decide における Naysayer pass の運用方針**: ChatRoom 派生 thread を立てるか、 PR description / review comment で済ますか、 sub-PR 着手時に決定 (Decide #1〜#5 と本 docs review で機能した multi-pass pattern を sub-PR 内でも継続するかは個別判断)。
+
+## 6. Future Issues (FI)
+
+設計議論で flag されたが本書 SOT には含めない future 課題。 Phase 1+ で取り扱う。
+
+### 6.0 Phase 0 設計前提 (4 assumptions)
+
+本書の設計 decide は以下 4 前提の上に成り立つ。 Phase 1+ でこれらが崩れる時 (= multi-instance / out-of-process / MCP write API による external writer) には FI-X1 / FI-X2 / FI-1 と合わせて再評価する。
+
+1. **single watcher process**: `data_dir` を監視する watcher process は同時に 1 つだけ走る。 multi-instance 並走 (= 同じ data_dir に 2 つの watcher) は想定しない。 仮に並走させた場合の挙動は undefined (= meta.yaml race、 events.jsonl 重複 append、 lock 同期手段なし)。
+2. **in-process MindWire MCP**: watcher が立ち上げる MCP server (`build_mindwire_mcp_server`) は watcher process 内 (= 同一 Python interpreter 内) で動く。 外部 MCP client が直接 `data_dir` に write することは想定しない (= `mcp__mindwire__write_reply` 等の tool 経由のみ)。
+3. **watcher-driven invocation**: claude-code SDK invocation は watcher (= dispatcher) のみが trigger する。 operator や別 process が直接 SDK を起動して thread に reply を書込むことは想定しない (= `_run_thread` 経由のみが invocation 経路)。
+4. **single writer**: `meta.yaml` / `events.jsonl` / `messages/` の write 主体は watcher process **のみ**。 operator manual transition (§3.6) は推奨運用上 watcher を止めて行う、 並走 write は race-accept (§3.6 contract)。
+
+これら 4 前提が成り立つ前提下で:
+
+- 責務分離 framework (= snapshot vs audit log) で構造を分けても、 同 process 内なので consistency を逐次担保できる
+- on-disk truth framework (= meta.yaml が SOT) で recovery を組んでも、 single writer なので write race を考えなくて良い
+- audit trail framework (= events.jsonl / retry_count) を best-effort にしても、 watcher 自身が読み戻すので gap を WARNING で済ませられる
+
+**3 hedge framework の cross-reference**:
+
+| framework | docs での主要適用箇所 | hedge wording (= 「pattern recognition tool」)
+|---|---|---|
+| 責務分離 (responsibility separation) | §3.4 redundancy 許容、 §3.5 FI-2 resolution | §3.4 末尾 hedge 段落 |
+| on-disk truth | §2 crash recovery、 §3.4 D-3 commit semantics、 §3.5 FI-2 resolution | §3.4 末尾 hedge 段落 |
+| audit trail | §3.5 retry_count semantics、 §3.5 events.jsonl gap detection | §3.5 末尾 hedge 段落 |
+
+framework は decide の pattern recognition tool であって individual implementation choice の justification ではないこと、 framework violation を理由とした automatic reject はしないこと、 を 3 framework すべてに共通の hedge として持つ (§3.4 / §3.5 各末尾)。
+
+### FI-1: 「invoke 中 vs 未開始」 の表現を別途持つ必要性
+
+(Naysayer #3a-1 §3 flag、 GitHub Issue 化予定)
+
+`(active, awaiting_from=claude-code)` の状態は:
+- claude-code が invoke 中
+- claude-code が invoke 未開始 (event 検出待ち)
+
+の 2 ケースを同表現する。 Phase 0 では per-thread lock + asyncio task 状態で trace 可能なため meta.yaml 範疇外、 ただし Phase 1+ の **observability / metric 出力時** (= 「invoke 中 thread 数」 を export したい時) に問題化する可能性。
+
+取り扱い時期: dogfooding 開始後の observability 議論。
+
+### FI-2: `transition_state` の 2-phase commit semantics
+
+(Naysayer #3b-2 §4 flag) **Resolved in sub-PR 3 (§3.5 FI-2 resolution detail) — Issue #23 で thread closed**
+
+歴史的経緯: `atomic_write_text` (meta.yaml) と `EventLogWriter.append` (events.jsonl) は 2 つの file 操作で、 1 つ目成功 + 2 つ目失敗 (disk full / permission) で inconsistency 可能性ありと flag された。
+
+採用された解: **meta が SOT + events は best-effort + WARNING-only gap detection** (T-FI2-transition-2pc thread、 §3.5 参照)。 transactional log や SQLite-backed 解は §6 FI-X1 (WAL) / FI-X2 (event sourcing) に分離。
+
+### FI-3: dogfooding 後の WatcherConfig 再 audit
+
+(Decide #4、 GitHub Issue 化予定)
+
+現在の defaults は「実測なし、 経験的暫定値」 中心 (特に `idle_timeout_seconds` / `absolute_timeout_seconds` / `retry_backoff_seconds` / `retry_jitter` / `max_retries` / `orphan_tmp_cleanup_age_seconds`)。 dogfooding 開始後の Phase 1 着手前に実測値で再 audit。
+
+取り扱い時期: Phase 1 設計 phase 着手時。
+
+### FI-4: error classification の dogfooding 後 audit
+
+(sub-PR 3 T-decide-error-classification 由来、 Naysayer pass で carry、 GitHub Issue #32)
+
+sub-PR 3 の error 分類は **allowlist 始点 + safe-by-default permanent** を採用 (= `_TRANSIENT_ERROR_TYPES` で明示的に transient 扱いする exception class を列挙し、 それ以外の `Exception` は permanent → `validation-failed` direct terminated)。 採用根拠は 「未知 error が無限 retry で system を消耗させる」 risk を 「未知 transient を 1 回で terminate する」 risk より避けたいこと。
+
+dogfooding 開始後に観測される具体 error が allowlist に漏れている場合 (= 本来 transient なのに permanent 扱いされて即 terminated)、 retry 機会を逃して `terminated/validation-failed` thread が増える。 観測値で allowlist を拡張するか、 別 framework (e.g. error の `is_retryable` attribute をライブラリ側で持つ) に移行するか判定。
+
+取り扱い時期: dogfooding 開始 (= Phase 0 完了 + 実 thread 数十〜数百件の post-mortem) 後。 trigger は 「`terminated_reason="validation-failed"` thread が予想以上に出てきた case」、 もしくは 「`asyncio.CancelledError` 以外の expected transient error class が出現した case」。
+
+### FI-X1: WAL (write-ahead log) for transactional multi-file writes
+
+(sub-PR 3 T-FI2-transition-2pc Naysayer pass 由来、 GitHub Issue TBD)
+
+sub-PR 3 で採用された 「meta が SOT + events は best-effort」 は §6.0 の 4 前提 (特に single writer) の下で機能する。 Phase 1+ に MCP write API / multi-instance / external writer 等が加わると、 meta.yaml と events.jsonl の inconsistency window が visibility 上問題化する可能性。
+
+WAL (write-ahead log) や filesystem-level transaction (SQLite-backed log) を導入すると、 meta + events を atomic に commit できる。 ただし introduce すると Phase 0 hedge を一気に強い coupling に転化させる risk もあるので、 4 前提のどれが崩れる時に検討するかを decide してから着手。
+
+trigger 独立記載: 「Phase 1 MCP write API 着手時」 か 「multi-instance watcher 検討時」 のどちらか早い方。 FI-X2 (event sourcing) と排他、 同時採用しない。 (Note: 本 FI と FI-X2 は Issue #33 = retry_backoff_seconds vs dedup TTL cross-config invariant とは別 scope、 trigger 観測時に専用 Issue を立てて trackable 化する。)
+
+### FI-X2: event sourcing reformulation
+
+(sub-PR 3 T-FI2-transition-2pc Naysayer pass 由来、 GitHub Issue TBD)
+
+meta.yaml を SOT として持つ代わりに、 events.jsonl のみを SOT として meta.yaml を完全 derive する。 audit trail framework の自然な延長で、 retry_count / status / awaiting_from すべてを event log から derive 可能。 dogfooding で「events.jsonl gap が頻発する」 「meta.yaml と events.jsonl の divergence audit cost が高い」 と判明したら検討対象。
+
+trigger 独立記載: 「events.jsonl gap 頻度が `WARNING log 数 / startup 数` で 10% 超える case」 か 「Phase 2+ で web UI / dashboard が events.jsonl 一次依存になる case」 のどちらか。 FI-X1 (WAL) と排他、 同時採用しない。 (Note: Issue #33 とは別 scope、 trigger 観測時に専用 Issue 化。)
+
+## 7. References
+
+### 7.1 ChatRoom thread
+
+- `T-feat2-design-overview` (parent、 全議論の roof) — Decide #1, #2, #4, #5
+- `T-feat2-d3a1-awaiting-from` (resolved) — Decide #3a-1
+- `T-feat2-d3a2-schema-version` (resolved) — Decide #3a-2
+- `T-feat2-d3b1-transition-table` (resolved) — Decide #3b-1
+- `T-feat2-d3b2-terminated-fields` (resolved) — Decide #3b-2
+
+### 7.2 Decide msg
+
+| Decide | resolved by | 内容 |
+|---|---|---|
+| #1 | msg-028 | base 方針 = Naysayer 寄り |
+| #2 | msg-030 | crash recovery = state-based |
+| #3a-1 | msg-053 / msg-056 (close) | `awaiting_from` field |
+| #3a-2 | msg-054 (close) | schema_version 据え置き |
+| #3b-1 | msg-055 (close) | 8 transition 表 |
+| #3b-2 | msg-057 (close) | terminated fields 両方独立 |
+| #4 | msg-059 | WatcherConfig audit |
+| #5 | msg-060 | sub-PR 境界 + 順序 |
+
+### 7.3 関連ドキュメント
+
+- `docs/architecture.md` §3 — Phase 0 baseline (snapshot vs audit log boundary)
+- `docs/logging-design.md` — logging 設計
+- `docs/mcp-interface.md` — MCP interface 仕様
+
+### 7.4 関連 feedback memory
+
+設計議論で参照された Takahito の persistent feedback:
+
+- `feedback_design_review_format` — Pros/Cons + 推奨 + 確認質問の format
+- `feedback_long_term_stepping_stone` — 短期最適 + 長期 optionality 両軸
+- `feedback_decoupling_preference` — Connector / MCP サーバレベルの分離志向
+- `feedback_config_defaults_first` — defaults を production-ready に、 手動編集前提にしない
+- `feedback_git_workflow` — feature slice + develop branch + squash merge
+- `feedback_chain_pr_merge` — chained PR の rebase + 新規 PR pattern
+- `feedback_pr_resolution_summary` — PR レビュー × ChatRoom 議論の GitHub-first 運用
+- `feedback_future_issues_monument` — Future Issues は GitHub Issue/Discussion 等の参照可能な場所に
+- `reference_chatroom_handoff` — ChatRoom が AI 間 handoff の現行レイヤ

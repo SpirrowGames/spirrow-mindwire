@@ -49,7 +49,7 @@ def test_defaults_only_when_no_toml_and_no_env(tmp_path: Path) -> None:
     assert s.watcher.absolute_timeout_seconds == 3600.0
     assert s.watcher.retry_backoff_seconds == (5.0, 30.0, 120.0)
     assert s.watcher.max_retries == 3
-    assert s.watcher.shutdown_grace_seconds == 60.0
+    assert s.watcher.orphan_tmp_cleanup_age_seconds == 300.0
     assert s.claude_code.allowed_tool_profile == "readonly"
     assert s.claude_code.extra_mcp_servers == {}
     assert s.phanthand.endpoint == "http://localhost:7300"
@@ -184,3 +184,115 @@ def test_direct_construction_skips_toml(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("MINDWIRE_WATCHER__MAX_CONCURRENT_THREADS", "12")
     s = MindwireSettings()
     assert s.watcher.max_concurrent_threads == 12
+
+
+# ----- Feature 2 sub-PR 3 O-2 (b): retry_backoff_seconds validators --------
+
+
+def test_retry_backoff_seconds_monotonic_non_strict_accepts_equal_adjacent(
+    tmp_path: Path,
+) -> None:
+    """Equal-adjacent values are allowed (= flat segments)."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [watcher]
+            retry_backoff_seconds = [5.0, 5.0, 30.0]
+            """
+        ),
+        encoding="utf-8",
+    )
+    s = load_settings(cfg)
+    assert s.watcher.retry_backoff_seconds == (5.0, 5.0, 30.0)
+
+
+def test_retry_backoff_seconds_strict_decrease_rejected(tmp_path: Path) -> None:
+    """Strictly decreasing tuple violates non-strict monotonic constraint."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [watcher]
+            retry_backoff_seconds = [30.0, 5.0, 1.0]
+            """
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError, match="non-strictly monotonic"):
+        load_settings(cfg)
+
+
+def test_retry_backoff_seconds_negative_rejected(tmp_path: Path) -> None:
+    """Negative values are rejected."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [watcher]
+            retry_backoff_seconds = [-1.0, 5.0, 30.0]
+            """
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError, match="non-negative"):
+        load_settings(cfg)
+
+
+def test_retry_backoff_seconds_shorter_than_max_retries_rejected(tmp_path: Path) -> None:
+    """``len(retry_backoff_seconds) < max_retries`` is a config bug (cross-field)."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [watcher]
+            retry_backoff_seconds = [5.0]
+            max_retries = 5
+            """
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError, match=r"retry_backoff_seconds length .* >= max_retries"):
+        load_settings(cfg)
+
+
+def test_retry_backoff_seconds_equal_length_to_max_retries_accepted(tmp_path: Path) -> None:
+    """``len(retry_backoff_seconds) == max_retries`` is the canonical config."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [watcher]
+            retry_backoff_seconds = [1.0, 2.0]
+            max_retries = 2
+            """
+        ),
+        encoding="utf-8",
+    )
+    s = load_settings(cfg)
+    assert s.watcher.retry_backoff_seconds == (1.0, 2.0)
+    assert s.watcher.max_retries == 2
+
+
+def test_retry_backoff_seconds_longer_than_max_retries_accepted(tmp_path: Path) -> None:
+    """Longer tuple than ``max_retries`` is allowed (= unused tail elements)."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [watcher]
+            retry_backoff_seconds = [1.0, 2.0, 3.0, 4.0, 5.0]
+            max_retries = 2
+            """
+        ),
+        encoding="utf-8",
+    )
+    s = load_settings(cfg)
+    assert s.watcher.retry_backoff_seconds == (1.0, 2.0, 3.0, 4.0, 5.0)
+
+
+def test_retry_backoff_seconds_empty_with_max_retries_zero_accepted() -> None:
+    """``max_retries=0`` (= retry disabled) tolerates empty tuple."""
+    s = MindwireSettings(watcher={"max_retries": 0, "retry_backoff_seconds": []})  # type: ignore[arg-type]
+    assert s.watcher.max_retries == 0
+    assert s.watcher.retry_backoff_seconds == ()

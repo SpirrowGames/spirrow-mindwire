@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -92,7 +92,15 @@ class LoggingConfig(_StrictModel):
 
 
 class WatcherConfig(_StrictModel):
-    """Watcher runtime tuning. Defaults are the T06-confirmed values."""
+    """Watcher runtime tuning. Defaults are the T06+Feature2-confirmed values.
+
+    Feature 2 sub-PR 3 (retry) consumes :attr:`retry_backoff_seconds` /
+    :attr:`retry_jitter` / :attr:`max_retries` together in the
+    dispatcher's per-thread retry loop. See
+    docs/feature-2-design.md §4 (config audit) and §5.1 sub-PR 3
+    (retry semantics) for the design rationale, dogfooding hedge, and
+    re-audit triggers (FI-3 / FI-4).
+    """
 
     dedup_ttl_seconds: float = Field(default=5.0, gt=0)
     max_concurrent_threads: int = Field(default=4, ge=1)
@@ -100,9 +108,101 @@ class WatcherConfig(_StrictModel):
     idle_timeout_seconds: float = Field(default=300.0, gt=0)
     absolute_timeout_seconds: float = Field(default=3600.0, gt=0)
     retry_backoff_seconds: tuple[float, ...] = (5.0, 30.0, 120.0)
+    """Sleep durations between successive retry attempts in seconds.
+
+    Indexed by *retry attempt number minus 1* — element ``[i]`` is the
+    sleep before retry attempt ``i+1``. For the default
+    ``(5.0, 30.0, 120.0)`` paired with ``max_retries=3``:
+
+    - attempt 0 (initial invoke) fails → sleep 5s  → attempt 1
+    - attempt 1 fails              → sleep 30s → attempt 2
+    - attempt 2 fails              → sleep 120s → attempt 3
+    - attempt 3 fails              → terminated (retry-exhausted)
+
+    So the **maximum per-_run_thread retry duration ≈ sum(retry_backoff_seconds)**
+    (= 155s for the default tuple, excluding the invoke latency itself).
+    Subsequent live events for the same (thread_id, seq) within this
+    window are gated by :attr:`dedup_ttl_seconds` (=5s default — much
+    shorter than the retry duration, so duplicate events that arrive
+    *while a retry sleep is in progress* are not deduped by
+    :class:`~spirrow_mindwire.watcher.dedup.DedupCache` alone; the
+    per-thread asyncio lock in :class:`~spirrow_mindwire.watcher.dispatcher.ThreadDispatcher`
+    serializes them, so they wait until the retry session ends).
+
+    Validation (sub-PR 3 O-2 (b) audit): the tuple must be non-strictly
+    monotonic (each element ≥ the previous one) to keep backoff
+    "exponential-ish" interpretable, and its length must be ≥
+    :attr:`max_retries` so the retry loop never indexes past the end.
+    Both checks are enforced via Pydantic validators (see below).
+    """
+
     retry_jitter: float = Field(default=0.2, ge=0, le=1)
+    """Fractional jitter applied to each backoff sleep.
+
+    Actual sleep = ``backoff_seconds * (1 + uniform(-retry_jitter, +retry_jitter))``.
+    A value of ``0`` disables jitter; ``1`` doubles or zeros the sleep.
+    See docs/feature-2-design.md §4.1 (dogfooding-pending re-audit).
+    """
+
     max_retries: int = Field(default=3, ge=0)
-    shutdown_grace_seconds: float = Field(default=60.0, gt=0)
+    """Maximum retry attempts after the initial invoke (per _run_thread).
+
+    ``max_retries=N`` means the loop tries ``N+1`` total times (1 initial
+    + N retries). ``max_retries=0`` disables retry: a single transient
+    failure terminates the thread with ``retry-exhausted``.
+
+    Note: this is the **per-_run_thread gate**, not the cumulative cap on
+    ``ThreadMeta.retry_count`` (which is an audit-trail counter that can
+    grow across multiple _run_thread invocations via startup_full_scan
+    requeue). See docs/feature-2-design.md §3.5 (retry_count semantics)
+    and FI-3 dogfooding re-audit.
+    """
+
+    orphan_tmp_cleanup_age_seconds: float = Field(default=300.0, gt=0)
+
+    @field_validator("retry_backoff_seconds")
+    @classmethod
+    def _retry_backoff_monotonic(cls, v: tuple[float, ...]) -> tuple[float, ...]:
+        """Enforce non-strict monotonic increase of retry_backoff_seconds.
+
+        Equal-adjacent values are allowed (= flat segments such as
+        ``(5.0, 5.0, 30.0)``); strict decrease is rejected. Empty
+        tuples are allowed at this layer — the cross-field
+        ``len(retry_backoff_seconds) >= max_retries`` check lives on
+        the model validator below so the error message can name both
+        fields.
+        """
+        for i in range(1, len(v)):
+            if v[i] < v[i - 1]:
+                raise ValueError(
+                    "retry_backoff_seconds must be non-strictly monotonic "
+                    "(each element ≥ the previous one); "
+                    f"got {v} (index {i}: {v[i]} < index {i - 1}: {v[i - 1]})"
+                )
+            if v[i] < 0:
+                raise ValueError(f"retry_backoff_seconds must contain non-negative values; got {v}")
+        if v and v[0] < 0:
+            raise ValueError(f"retry_backoff_seconds must contain non-negative values; got {v}")
+        return v
+
+    @model_validator(mode="after")
+    def _retry_backoff_length_covers_max_retries(self) -> Self:
+        """Cross-field: ``len(retry_backoff_seconds) >= max_retries``.
+
+        The dispatcher's retry loop indexes ``retry_backoff_seconds[attempt]``
+        for ``attempt in range(max_retries)`` (see dispatcher module
+        docstring). A shorter tuple would raise ``IndexError`` mid-retry,
+        which is a configuration bug we want to surface at load time.
+        """
+        if len(self.retry_backoff_seconds) < self.max_retries:
+            raise ValueError(
+                f"retry_backoff_seconds length ({len(self.retry_backoff_seconds)}) "
+                f"must be >= max_retries ({self.max_retries}) — the retry loop "
+                f"indexes retry_backoff_seconds[attempt] for "
+                f"attempt in [0, max_retries-1]; configure either a longer "
+                f"retry_backoff_seconds tuple or a smaller max_retries"
+            )
+        return self
 
 
 class ExtraMCPServerConfig(_StrictModel):
