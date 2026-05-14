@@ -121,6 +121,8 @@ status="active", awaiting_from="claude-code" (invoke 開始前 / event 検出待
 
 ### 3.2 schema_version 据え置き (Decide #3a-2)
 
+> **2026-05-15 historical update (F3-A sub-PR 1)**: 本節 §3.2 の predicted migration trigger が **Phase 1 で発火**、 `ThreadMeta.schema_version` を 1 → 2 に bump (= skeleton bump、 field shape 不変)。 詳細 / 後続 phase の roadmap は `docs/feature-3-design.md` §3.1 を参照。 本節は historical record として **そのまま維持** (= 「Phase 0 据え置き policy」 が当初判断、 後続 Phase での再評価が予定どおり発火した経緯を残す)。
+
 `schema_version: Literal[1]` のまま、 enum 変更 (`awaiting-cc`/`awaiting-cai` 削除 + `retrying`/`terminated` 追加) と field 追加 (`awaiting_from` / `retry_count` / `terminated_reason` / `terminated_at`) を **同 version で実施**。
 
 理由: Phase 0 段階で production thread ゼロ、 schema bump コスト > 価値。 Phase 1 MCP write API 移行が初の real migration trigger (external consumer 出現で breaking 制約発生)、 そこで bump + migration infrastructure を整備。

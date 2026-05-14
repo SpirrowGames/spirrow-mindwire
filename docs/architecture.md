@@ -57,7 +57,7 @@ MindWire は **AI エージェント同士の通信ハブ** に世界観を閉�
 ### 3.1 Thread (`threads/<ULID>/meta.yaml`)
 
 ```yaml
-schema_version: 1                                   # 必須
+schema_version: 2                                   # 必須 (Phase 1 era、 F3-A sub-PR 1 で v1→v2 bump)
 thread_id: 01ARZ3NDEKTSV4RRFFQ69G5FAV               # ULID (時刻ソート可、 衝突回避)
 title: ""                                            # 任意。 人間 / エージェントが付ける1行サマリ
 status: active                                       # active | awaiting-cc | awaiting-cai | resolved | archived
@@ -66,6 +66,8 @@ created_at: 2026-05-07T08:43:07Z                    # UTC ISO 8601
 updated_at: 2026-05-07T08:45:22Z                    # 最終更新 UTC ISO 8601
 tags: []                                             # participants 自身が付ける属性
 ```
+
+**`schema_version` namespace**: meta.yaml / message frontmatter / イベントログ それぞれが **独立** な `schema_version` を持つ (T02 原則 10、 `_common.py` SCHEMA_VERSION docstring 参照)。 同時に bump する必要なし。 2026-05-15 時点で meta.yaml = 2 (F3-A sub-PR 1)、 message frontmatter = 1、 event log = 1。 詳細 / 経緯は `docs/feature-3-design.md` §3.1 (= migration trigger fired) と `docs/feature-2-design.md` §3.2 (= Phase 0 据え置き policy + Phase 1 trigger fire 記録)。
 
 **設計上の禁則** (世界観保護):
 - `related.*` フィールドを追加しない (外部システム参照)
