@@ -4,6 +4,13 @@ See ``docs/architecture.md`` §3.1 for the Phase 0 baseline and
 ``docs/feature-2-design.md`` §3.1 / §3.4 for the Feature 2 fields
 (``awaiting_from`` / ``retry_count`` / ``terminated_reason`` /
 ``terminated_at``) extending the lifecycle state machine.
+
+The ``schema_version`` literal was bumped from 1 to 2 in Feature 3-A
+sub-PR 1 (skeleton bump, see ``docs/feature-3-design.md`` §3.1). No
+field shape changes accompanied that bump; the literal change marks
+the entry into Phase 1 era for ``meta.yaml`` writers. Pre-existing v1
+files must be migrated via ``uv run mindwire-migrate-v1-to-v2`` before
+the watcher loads them.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ class ThreadMeta(StrictModel):
     state machine; see ``docs/feature-2-design.md`` §3.1 / §3.4.
     """
 
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     thread_id: UlidStr
     title: str = ""
     status: ThreadStatus

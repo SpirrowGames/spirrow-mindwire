@@ -37,7 +37,7 @@ NOW = datetime(2026, 5, 7, 8, 43, 7, tzinfo=UTC)
 
 def _meta(**overrides: Any) -> ThreadMeta:
     base: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "thread_id": ULID_A,
         "status": "active",
         "participants": ("claude.ai", "claude-code"),

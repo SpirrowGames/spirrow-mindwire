@@ -39,7 +39,7 @@ def seed_thread_meta(layout: ThreadDirLayout, **overrides: Any) -> None:
     """
 
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "thread_id": layout.thread_id,
         "title": "",
         "status": "active",

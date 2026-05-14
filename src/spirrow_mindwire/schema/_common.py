@@ -14,14 +14,22 @@ from typing import Annotated, Literal, assert_never
 from pydantic import AfterValidator, BaseModel, ConfigDict
 from ulid import ULID
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 """Schema version for ThreadMeta on-disk YAML format.
 
 NOTE: This version is INDEPENDENT from event log schema version
-(:class:`spirrow_mindwire.schema.event._BaseEvent` ``schema_version``).
-The numeric value happening to be 1 in both cases is coincidental;
-bumping one does not require bumping the other. See
-``docs/architecture.md`` §3 for the snapshot vs audit log boundary.
+(:class:`spirrow_mindwire.schema.event._BaseEvent` ``schema_version``)
+and message frontmatter schema version
+(:class:`spirrow_mindwire.schema.message.Message` ``schema_version``).
+All three are bumped on their own cadence; bumping one does not require
+bumping the others. See ``docs/architecture.md`` §3 for the snapshot vs
+audit log boundary.
+
+Bumped from 1 to 2 in Feature 3-A sub-PR 1 (skeleton bump, see
+``docs/feature-3-design.md`` §3.1) — the field's literal value changes;
+no new fields are introduced at this step. Pre-existing v1 ``meta.yaml``
+files must be migrated via ``uv run mindwire-migrate-v1-to-v2`` before
+the watcher is started.
 """
 
 Participant = Literal["claude.ai", "claude-code"]
