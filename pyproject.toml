@@ -32,6 +32,7 @@ dev = [
 mindwire-watcher = "spirrow_mindwire.watcher:main"
 mindwire-mcp = "spirrow_mindwire.mcp_server:main"
 mindwire = "spirrow_mindwire.cli:main"
+mindwire-migrate-v1-to-v2 = "spirrow_mindwire.migration.v1_to_v2:main"
 
 [build-system]
 requires = ["hatchling"]
