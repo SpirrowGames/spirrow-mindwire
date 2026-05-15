@@ -51,8 +51,8 @@ F3-B (events.jsonl derive engine + operator dashboard / CLI) は本 Feature 3 �
 
 - **§2.1** mindwire-mcp-server 設計 (= layer / transport / auth、 sub-PR 2) — **filled**
 - **§2.2** claude.ai 側 write protocol (= exposed tools `send_message` / `open_thread` / `resolve_thread`、 sub-PR 2) — **filled**
-- **§2.3** claude.ai 側 awaiting_from 更新 + message write 実装 (sub-PR 3)
-- **§2.4** race monitoring instrumentation (sub-PR 3 bundle)
+- **§2.3** claude.ai 側 single writer crack 実発生 (sub-PR 3) — **filled**
+- **§2.4** race monitoring instrumentation (sub-PR 3 bundle) — **filled**
 - **§2.5** 2-phase commit re-design (sub-PR 4 deferred、 dogfooding race observation N+ 件 trigger)
 
 ### 2.1 mindwire-mcp-server 設計 (sub-PR 2)
@@ -159,6 +159,85 @@ caller (= claude.ai-side) が poll で `awaiting_from` を check する design �
 `send_message` の post-write awaiting_from toggle は **watcher dispatcher と shared helper** (= `awaiting_from_toggle.toggle_awaiting_from`) を使う。 terminal-state guard + idempotent skip + AwaitingFromChanged snapshot semantic を 2 callsite で SOT 一元化。
 
 **#39 carry N2 disposition** (= external caller idempotency for `set_awaiting_from`): shared helper 自体が「pre_meta.awaiting_from == target なら no-op」 idempotent skip を持っているので、 external caller 専用の関数 level guard 追加は不要。 dispatcher と MCP-server caller が同じ short-circuit を共有することで、 関数 level idempotency 議論は本 sub-PR で disposition 完結。 #39 N2 trigger は closed 候補。
+
+### 2.3 claude.ai 側 single writer crack 実発生 (sub-PR 3)
+
+**Trilateral decide SOT**: chatroom `T-feat3-d3-single-writer-crack` msg-131 (= integrator decide、 resolved 2026-05-15、 全 D3-N converge、 D3-1 = option-a で仕様増なし → user 別途承認不要)。 本節は decide msg の文書化記録、 議論ログは chatroom 一次。
+
+#### 2.3.1 single writer crack の位置付け
+
+`docs/feature-2-design.md` §6.0 の 4 assumptions のうち **single writer** が本 sub-PR で crack する。 server-side write (`send_message` / `open_thread` / `resolve_thread`) は sub-PR 2 (PR #45) で実装済 = claude.ai 側が MCP 経由で thread に書き込む path は既に存在。 sub-PR 3 は **その path を実 dogfooding loop に組込み crack を実発生させる + 観察可能にする**。
+
+| 4 assumption | sub-PR 3 後 |
+|---|---|
+| single writer | **crack** (= watcher dispatcher = claude-code writer に加え、 mindwire-mcp-server 経由 claude.ai writer が稼働) |
+| in-process MindWire MCP | crack 済 (= sub-PR 2) |
+| watcher-driven invocation | 維持 |
+| single watcher process | 維持 |
+
+#### 2.3.2 dogfooding exercise method (D3-3 = option-a 採用、 option-b smoke harness 不採用)
+
+claude.ai web の MCP connector config は **out-of-repo** (= user が claude.ai 側で設定)。 sub-PR 3 は repo 内に simulate 用 caller harness (= option-b) を**作らない**:
+
+- 実 claude.ai が dogfooding で server を叩く = Phase 1 「実機 reality check」 方針整合
+- server 内部 (auth / 3 tool / concurrency) は sub-PR 2 `tests/test_mcp_write_server.py` で unit verify 済、 client roundtrip は §2.4 cross-process integration test で実質 cover
+- 起案者 D3-3「最も不安」 flag (= server 単体 health 切り分け手段が repo にない) は **既存 primitives + recipe doc 明文化** で解消 (= 新 artifact ゼロ)：`docs/dogfooding.md` §3 に server → connector triage flow (= `curl` で 401-without / 401-bad-token / not-401-good-token の auth smoke) を明文化
+- option-b smoke harness 不採用 rationale (= naysayer Q5 4 原則 + review pass 同方向): driver 不在の新 repo artifact、 「smoke 通れば OK」 で実 dogfooding skip する形骸化誘惑
+
+review C2 + naysayer Q5 が独立に同一解 (= 既存 primitives + recipe doc 明文化、 option-b 不要) に到達した収束を採用。
+
+#### 2.3.3 MVP 完了 milestone
+
+sub-PR 3 完了 = **F3-A MVP (sub-PR 1-3) 完了** → 部分 deploy → **Phase 1 dogfooding resume** (= umbrella #41 採用 roadmap milestone)。 resume 前に `docs/dogfooding.md` §2 の phase-switch gate checklist (= migrate dry-run + server smoke + `uv run pytest -m manual`) を 1 回必須実行。
+
+### 2.4 race monitoring instrumentation (sub-PR 3)
+
+#### 2.4.1 D3-1 = option-a 採用 (minimal startup gap metric)
+
+single writer crack 後、 watcher dispatcher (= claude-code writer) と mindwire-mcp-server (= claude.ai writer) が同 thread の `next_seq` に ms 単位で衝突し得る (= msg-127 §1 D2-6 で Phase 1 MVP 受容済の race)。 sub-PR 3 は **観察のみ** を追加 (= 解消は sub-PR 4 = 2PC re-design 担当、 sub-PR 境界厳守):
+
+| 案 | 採否 |
+|---|---|
+| **option-a (minimal)** | **採用** — `startup_full_scan` に structural race-gap 検出 + per-scan structured summary log (`startup_scan race-gap summary: scanned=.. gap_detected=.. gap_rate=.. anomalies=..`) 追加。 新 event 型なし、 Event schema bump なし |
+| option-b (runtime detection) | 不採用 — 検知機構自体が cross-process race の hard problem (= 2PC 設計先食い、 sub-PR 境界侵食)、 race rate 未観察で検知機構 = observation-driven 違反、 Event schema 公開仕様増 |
+| option-c (hybrid) | 不採用 — option-b の問題継承 + 2 機構複雑性 |
+
+三者 converge (propose 推奨 / review Q1 十分判定 / naysayer Q4 賛成)。
+
+#### 2.4.2 frame 正確化 (= naysayer Q4 frame refinement 採用)
+
+- **frame**: option-a metric は race frequency の **下限 (lower bound) estimator**、 sub-PR 4 (2PC re-design) trigger 判定に**必要十分**。 「race 全件観察」 は主目的ではない (= user 逆 frame「under-instrumentation で主目的不達」 は primary goal 取り違え、 reject)
+- **trigger 判定論理**: 下限 LB が threshold を超える ⇒ 真 frequency > threshold 確実 ⇒ sub-PR 4 trigger 正当。 LB < threshold ⇒ 真値不明だが保守 bias = sub-PR 4 着手遅延寄り = observation 蓄積待ち behavior = observation-driven 核心整合
+- option-b/c を本 sub-PR で導入すると「検知機構を作った以上 sub-PR 4 着手は既定路線」 という sunk-cost bias を導入、 これも option-a が回避する副次 merit (= review Q1 指摘)
+
+#### 2.4.3 既知 blind spot の明示記録 (= naysayer Q4 (b) case)
+
+option-a metric が catch するのは **structural trace を残す race のみ**:
+
+| race 結末 | option-a 検知 |
+|---|---|
+| (a) duplicate seq (= 2 writer が同 next_seq、 異 `from` suffix → 両 file 残存) | ✅ catch |
+| (a') seq hole (= lost write で番号欠番) | ✅ catch |
+| (b) **silent content overwrite** (= 同 seq **かつ** 同 `from` suffix → `os.replace` later-wins、 file 1 個のみ、 structural trace なし) | ❌ **blind spot** |
+
+(b) は隠さず本節 + `startup_scan._detect_race_gap` docstring に **明示 trade-off** として記録。 これにより:
+
+- **option-b/c switch revisit trigger anchor**: dogfooding 中に「meta は consistent だが message content が想定と違う」 report が出た場合、 (b) silent overwrite の可能性として runtime detection (option-b/c) への switch を再評価する。 「option-a だから見落とした」 後付け批判の防止 + observation-driven escalation path の明示
+
+#### 2.4.4 cross-process integration test (D3-2 = γ 採用 = option-b CI default + option-a manual gate)
+
+D2-6 invariant (= filesystem 経由のみ coordinate) の verify 構成:
+
+| layer | 採用 | 内容 |
+|---|---|---|
+| **option-b (CI default)** | 採用 | in-process `WriteTools` + `ThreadDispatcher` を独立 instance で並行 invoke (real `tmp_path`)、 deterministic。 `tests/test_cross_process_integration.py` の `test_filesystem_mediated_roundtrip` (= multi-turn round trip、 D2-6 core) + `test_concurrent_same_thread_no_corruption` (= accepted race が silent overwrite 超の corruption を起こさない、 scheduling-independent assertion) |
+| **option-a (manual gate)** | 採用 | 実 `mindwire-mcp-server` subprocess 起動 (= 真 process 分離) + health/auth smoke。 `@pytest.mark.manual`、 CI は `addopts -m "not manual"` で skip、 Phase 1 dogfooding resume gate (`uv run pytest -m manual`) で実行 |
+
+**α manual の運用 framing refinement** (= review C1 + naysayer Q6 独立同一収束): option-a manual を「Phase 1 dogfooding resume 前 1 回必須 **gate**」 に紐付け、 「manual / periodic / 任意実行」 ambiguous framing は drop (= 構造的腐敗防止、 trigger = MVP 完了 という single 明確 event)。 `docs/dogfooding.md` §2 に gate checklist 明文化。
+
+#### 2.4.5 race-rate threshold spec の sub-PR 4 carry (= review C3 新規 carry)
+
+option-a metric は **数値出力までで止める**。 「race rate どの値で sub-PR 4 trigger か」 の threshold spec は本 sub-PR で**決めない** — 実 dogfooding observation 前に speculation threshold を打つと判断材料が circular (= endogenous bias)。 「race rate threshold spec」 を **sub-PR 4 propose に carry** (= msg-131 §5 新規 carry)。 downstream log aggregation が summary line を跨 startup で sum して cross-startup rate を出す (= in-process persistence なし、 minimal 維持)。
 
 ## 3. Schema policy
 
