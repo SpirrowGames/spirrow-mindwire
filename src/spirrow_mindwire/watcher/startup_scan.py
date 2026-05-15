@@ -15,6 +15,23 @@ When the watcher starts, it walks ``threads/`` and re-injects
   re-entry path, see ``docs/feature-2-design.md`` §3.6).
 
 See ``docs/feature-2-design.md`` §2.1.
+
+**Race-gap summary metric** (Feature 3-A sub-PR 3, D3-1 option-a — chatroom
+``T-feat3-d3-single-writer-crack`` msg-131): once claude.ai writes via
+``mindwire-mcp-server`` (single-writer crack, sub-PR 3), the dispatcher
+and the write server can race on the same thread's ``next_seq``
+(msg-127 §1 D2-6 accepted Phase 1 MVP race). This module's startup walk
+is the natural place to *observe* the structural fallout cheaply: see
+:func:`_detect_race_gap`. The scan emits one structured summary log
+line (``startup_scan race-gap summary: ...``) so downstream log
+aggregation can compute the cross-startup gap rate without any
+in-process persistence — that rate is the quantitative input for the
+sub-PR 4 (2-phase-commit re-design) trigger judgement. The
+race-rate→trigger *threshold* itself is intentionally deferred to the
+sub-PR 4 propose (msg-131 §5): pinning a speculative threshold before
+real dogfooding observation would make the judgement circular.
+
+This is purely observational — it never changes requeue behaviour.
 """
 
 from __future__ import annotations
@@ -28,11 +45,49 @@ import yaml
 
 from spirrow_mindwire.filesystem import ThreadDirLayout
 from spirrow_mindwire.lifecycle import REQUEUE_STATES
+from spirrow_mindwire.schema import Message
 
 from .events import ThreadEvent
 from .loader import load_messages, load_thread_meta
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_race_gap(messages: list[Message]) -> str | None:
+    """Detect a structural anomaly in the seq sequence (D3-1 option-a).
+
+    Two signatures of a cross-process write race
+    (dispatcher=claude-code vs mindwire-mcp-server=claude.ai both
+    computing the same ``next_seq``):
+
+    - **duplicate seq**: two message files share a seq. Different
+      ``from`` suffixes (``-from-cc`` vs ``-from-cai``) mean both files
+      survive on disk — the canonical structural trace of the race.
+    - **seq hole**: the sequence is non-contiguous. A lost write can
+      leave a gap.
+
+    ``messages`` is sorted by seq (loader contract). Returns a short
+    reason string if an anomaly is found, else ``None``.
+
+    BLIND SPOT (= D3-1 option-a known trade-off, naysayer Q4 case (b),
+    msg-131 §2): if both racing writers used the *same* filename (same
+    seq **and** same ``from`` suffix), ``os.replace`` later-wins leaves
+    exactly one file and no structural trace — this function cannot see
+    it. Detecting that needs runtime conflict detection (option-b/option-c), which is
+    deferred (a option-b/option-c-switch revisit is triggered if dogfooding reports
+    "meta consistent but message content unexpected"; see
+    docs/feature-3-design.md §2.4).
+    """
+    if not messages:
+        return None
+    seqs = [m.seq for m in messages]
+    dups = sorted({s for s in seqs if seqs.count(s) > 1})
+    if dups:
+        return f"duplicate_seq={dups}"
+    missing = sorted(set(range(seqs[0], seqs[-1] + 1)) - set(seqs))
+    if missing:
+        return f"seq_hole missing={missing}"
+    return None
 
 
 def startup_full_scan(
@@ -69,6 +124,13 @@ def startup_full_scan(
 
     detected_at = now if now is not None else datetime.now(UTC)
     enqueued = 0
+    # D3-1 option-a race-gap observation (msg-131 §2). Counted only over
+    # requeue-path threads with messages on disk — the race
+    # (dispatcher vs mindwire-mcp-server) only happens on
+    # active/retrying threads, so terminal threads are out of scope by
+    # construction (no scope expansion).
+    gap_scanned = 0
+    gap_anomalies: list[str] = []
 
     for thread_dir in sorted(threads_root.iterdir()):
         if not thread_dir.is_dir():
@@ -119,6 +181,18 @@ def startup_full_scan(
             )
             continue
 
+        # D3-1 option-a: observe (never gate) the structural race signature.
+        gap_scanned += 1
+        gap_reason = _detect_race_gap(messages)
+        if gap_reason is not None:
+            gap_anomalies.append(f"{thread_dir.name}:{gap_reason}")
+            logger.warning(
+                "startup_scan: race-gap anomaly on %s (%s); requeueing normally "
+                "(observation only, not a gate)",
+                thread_dir.name,
+                gap_reason,
+            )
+
         latest = messages[-1]
         evt = ThreadEvent(
             thread_id=thread_dir.name,
@@ -134,6 +208,19 @@ def startup_full_scan(
             meta.status,
             latest.seq,
         )
+
+    # D3-1 option-a: one structured summary line per scan. Downstream log
+    # aggregation sums these across startups to derive the cross-startup
+    # gap rate (= sub-PR 4 trigger input) — no in-process persistence,
+    # which keeps this minimal (msg-131 §2 / ClaudeCode review §1.4).
+    gap_rate = (len(gap_anomalies) / gap_scanned) if gap_scanned else 0.0
+    logger.info(
+        "startup_scan race-gap summary: scanned=%d gap_detected=%d gap_rate=%.3f anomalies=%s",
+        gap_scanned,
+        len(gap_anomalies),
+        gap_rate,
+        gap_anomalies,
+    )
 
     return enqueued
 
