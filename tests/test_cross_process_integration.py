@@ -24,8 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import subprocess
-import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -192,7 +192,15 @@ async def test_real_subprocess_server_health_and_auth(tmp_path: Path) -> None:
     Skipped in CI (``@pytest.mark.manual``); run via the Phase 1
     dogfooding-resume gate.
     """
-    port = int(os.environ.get("MINDWIRE_TEST_MCP_PORT", "7491"))
+    # Pick a free port at runtime (bind to :0) so the manual gate can't
+    # collide with an already-running local server; env override wins
+    # if set (PR #47 Copilot review).
+    if "MINDWIRE_TEST_MCP_PORT" in os.environ:
+        port = int(os.environ["MINDWIRE_TEST_MCP_PORT"])
+    else:
+        with socket.socket() as _s:
+            _s.bind(("127.0.0.1", 0))
+            port = _s.getsockname()[1]
     api_key = "manual-e2e-secret"
     env = {
         **os.environ,
@@ -201,8 +209,10 @@ async def test_real_subprocess_server_health_and_auth(tmp_path: Path) -> None:
         "MINDWIRE_MCP_SERVER__PORT": str(port),
         "MINDWIRE_MCP_SERVER__HOST": "127.0.0.1",
     }
+    # ``uv`` is a standalone binary, not a Python module — invoke it
+    # directly rather than via ``python -m uv`` (PR #47 Copilot review).
     proc = subprocess.Popen(
-        [sys.executable, "-m", "uv", "run", "mindwire-mcp-server"],
+        ["uv", "run", "mindwire-mcp-server"],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

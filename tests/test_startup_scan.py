@@ -216,11 +216,18 @@ def test_detect_race_gap_duplicate_seq() -> None:
 
 
 def test_detect_race_gap_seq_hole() -> None:
-    """A missing seq (lost write) shows up as a hole."""
+    """A missing seq (lost write) shows up as a compact (lo, hi) range."""
     msgs = [_msg(1, "claude.ai"), _msg(3, "claude.ai")]
     reason = _detect_race_gap(msgs)
     assert reason is not None
-    assert "seq_hole missing=[2]" in reason
+    assert "seq_hole missing_ranges=[(2, 2)]" in reason
+
+
+def test_detect_race_gap_wide_hole_is_compact() -> None:
+    """A huge gap is reported as one range, never enumerated int-by-int."""
+    msgs = [_msg(1, "claude.ai"), _msg(1_000_000, "claude.ai")]
+    reason = _detect_race_gap(msgs)
+    assert reason == "seq_hole missing_ranges=[(2, 999999)]"
 
 
 def test_summary_metric_emitted_no_anomaly(

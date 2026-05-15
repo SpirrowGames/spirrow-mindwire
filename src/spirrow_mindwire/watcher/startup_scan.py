@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 
 import yaml
@@ -69,6 +71,12 @@ def _detect_race_gap(messages: list[Message]) -> str | None:
     ``messages`` is sorted by seq (loader contract). Returns a short
     reason string if an anomaly is found, else ``None``.
 
+    Both checks are single-pass O(n): duplicates via :class:`Counter`,
+    holes via an adjacent-pair scan that reports compact
+    ``(lo, hi)`` ranges. Neither materialises ``range(min, max)``, so a
+    corrupted huge seq cannot blow up startup memory/time (PR #47
+    Copilot review).
+
     BLIND SPOT (= D3-1 option-a known trade-off, naysayer Q4 case (b),
     msg-131 §2): if both racing writers used the *same* filename (same
     seq **and** same ``from`` suffix), ``os.replace`` later-wins leaves
@@ -81,12 +89,15 @@ def _detect_race_gap(messages: list[Message]) -> str | None:
     if not messages:
         return None
     seqs = [m.seq for m in messages]
-    dups = sorted({s for s in seqs if seqs.count(s) > 1})
+    dups = sorted(s for s, c in Counter(seqs).items() if c > 1)
     if dups:
         return f"duplicate_seq={dups}"
-    missing = sorted(set(range(seqs[0], seqs[-1] + 1)) - set(seqs))
-    if missing:
-        return f"seq_hole missing={missing}"
+    # seqs is sorted (loader contract) and duplicate-free here. Report
+    # holes as compact (lo, hi) ranges via an adjacent-pair scan — never
+    # enumerate every missing int, so a corrupted huge seq stays cheap.
+    holes = [(prev + 1, cur - 1) for prev, cur in pairwise(seqs) if cur > prev + 1]
+    if holes:
+        return f"seq_hole missing_ranges={holes}"
     return None
 
 
@@ -213,13 +224,20 @@ def startup_full_scan(
     # aggregation sums these across startups to derive the cross-startup
     # gap rate (= sub-PR 4 trigger input) — no in-process persistence,
     # which keeps this minimal (msg-131 §2 / ClaudeCode review §1.4).
+    # The anomalies list is capped so a corrupt/adversarial data dir with
+    # many anomalous threads can't produce an unbounded log line (PR #47
+    # Copilot review); full per-thread detail is in the WARNING logs above.
     gap_rate = (len(gap_anomalies) / gap_scanned) if gap_scanned else 0.0
+    _max_shown = 20
+    shown = gap_anomalies[:_max_shown]
+    extra = len(gap_anomalies) - len(shown)
+    anomalies_repr = f"{shown}" + (f" ...(+{extra} more)" if extra else "")
     logger.info(
         "startup_scan race-gap summary: scanned=%d gap_detected=%d gap_rate=%.3f anomalies=%s",
         gap_scanned,
         len(gap_anomalies),
         gap_rate,
-        gap_anomalies,
+        anomalies_repr,
     )
 
     return enqueued
