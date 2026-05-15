@@ -67,6 +67,14 @@ class MigrationReport:
 
     @property
     def total_scanned(self) -> int:
+        """Number of thread dirs whose ``meta.yaml`` was classified.
+
+        Counts the four outcome buckets, so it excludes thread dirs that
+        were never opened: staging dirs (``.staging-<ULID>/``), empty
+        thread dirs (no ``meta.yaml``), and any non-dir entry under
+        ``threads/``. In other words, ``total_scanned`` is "threads the
+        migrator had an opinion about", not "directories enumerated".
+        """
         return (
             len(self.migrated)
             + len(self.skipped_already_v2)
@@ -86,6 +94,15 @@ def migrate_data_dir(data_dir: Path, *, dry_run: bool = False) -> MigrationRepor
     writes no files; the returned report still classifies each thread as
     if a real run had happened (a ``v1`` file that would have been
     rewritten lands in ``migrated`` with ``detail="dry-run"``).
+
+    **Field-preservation guarantee**: the rewrite only changes the
+    ``schema_version`` literal (1 → 2). Other fields are copied verbatim
+    from the v1 payload; no missing field is injected, no extra key is
+    added. A v1 file that omits a field required by the current
+    :class:`ThreadMeta` schema therefore lands in ``failed`` via the
+    pre-flight validation (= ``ThreadMeta.model_validate(new_payload)``)
+    rather than being silently completed — by design, since this is a
+    skeleton bump that must not move structure.
     """
 
     threads_root = data_dir / "threads"

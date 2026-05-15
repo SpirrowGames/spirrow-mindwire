@@ -47,7 +47,13 @@ F3-B (events.jsonl derive engine + operator dashboard / CLI) は本 Feature 3 �
 
 ## 2. 設計選択
 
-(sub-PR 2 以降で incremental 追加予定)
+(sub-PR 2 以降で incremental 追加予定。 想定 subsection)
+
+- **§2.1** mindwire-mcp-server 設計 (= layer / transport / auth、 sub-PR 2)
+- **§2.2** claude.ai 側 write protocol (= exposed tools `send_message` / `open_thread` / `resolve_thread`、 sub-PR 2)
+- **§2.3** claude.ai 側 awaiting_from 更新 + message write 実装 (sub-PR 3)
+- **§2.4** race monitoring instrumentation (sub-PR 3 bundle)
+- **§2.5** 2-phase commit re-design (sub-PR 4 deferred、 dogfooding race observation N+ 件 trigger)
 
 ## 3. Schema policy
 
@@ -66,6 +72,8 @@ mindwire core は **3 つの独立 `schema_version`** を持つ (= `docs/archite
 | `_BaseEvent.schema_version` | `logs/threads/<ULID>.jsonl` 各 event | 1 (= 据え置き) |
 
 F3-A の driver (= claude.ai 側 awaiting_from / message write) が直接触るのは ThreadMeta であり、 Message / Event の structural 変更は本 sub-PR に存在しない。 「3 schema 独立」 原則を曲げる driver なし、 不要な bump は cognitive friction を増やすだけ (= sub-PR 2 / 3 で新 field / 新 event 型が emerge した時点で incremental bump)。
+
+> **`schema_version` は per-resource、 era marker ではない** (= Naysayer pass msg-122 §1.3 cognitive friction defuse): meta.yaml が v2 で messages frontmatter が v1 という mixed 状態は **正しい状態**、 「Phase 1 era 全体を v2 で統一」 という連想は誤読。 各 resource は自身の breaking-change cadence で bump され、 cascade しない。 本節 §3.1.1 が文字通り 3 resource を横並びに列挙しているのはこの原則の visualization。
 
 #### 3.1.2 Big-bang 厳格 (= 並走 reader なし)
 
@@ -91,7 +99,11 @@ operator は **watcher 起動前に必ず一度** `uv run mindwire-migrate-v1-to
 
 ### 3.2 後続 sub-PR の schema 変更方針
 
-(sub-PR 2 以降で incremental 追加予定)
+(sub-PR 2 以降で incremental 追加予定。 想定 subsection)
+
+- **§3.2.1** Message schema_version bump trigger (= sub-PR 2/3 で claude.ai 側 write 用 frontmatter field 追加が emerge した時点)
+- **§3.2.2** Event schema_version bump trigger (= sub-PR 3 の race monitoring 用 event 型 / sub-PR 4 の 2-phase commit event 追加時)
+- **§3.2.3** schema_version は per-resource (= not era marker) — 1 resource の bump が他 resource に cascade しないこと、 「Phase N era = v_N」 という連想は誤読である旨を明示 (= Naysayer pass msg-122 §1.3 cognitive friction defuse)
 
 ## References
 
