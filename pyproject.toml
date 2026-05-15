@@ -68,4 +68,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+addopts = '-ra --strict-markers -m "not manual"'
+markers = [
+  "manual: real-subprocess e2e, skipped in CI by default (addopts -m 'not manual'); run via the Phase 1 dogfooding-resume gate with `uv run pytest -m manual` (Feature 3-A sub-PR 3 D3-2, msg-131 §3)",
+]

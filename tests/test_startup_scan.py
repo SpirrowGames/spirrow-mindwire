@@ -16,8 +16,9 @@ import pytest
 from factories import seed_thread_meta, write_message_file
 
 from spirrow_mindwire.filesystem import ThreadDirLayout
+from spirrow_mindwire.schema import Message
 from spirrow_mindwire.watcher.events import ThreadEvent
-from spirrow_mindwire.watcher.startup_scan import startup_full_scan
+from spirrow_mindwire.watcher.startup_scan import _detect_race_gap, startup_full_scan
 
 ULID_A = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 ULID_B = "01HRZ3NDEKTSV4RRFFQ69G5FAW"
@@ -172,3 +173,95 @@ def test_mix_of_states_only_active_and_retrying_enqueued(tmp_path: Path) -> None
 
     enqueued_ids = {queue.get_nowait().thread_id for _ in range(2)}
     assert enqueued_ids == {ULID_A, ULID_B}
+
+
+# ---------------------------------------------------------------------------
+# D3-1 option-a: race-gap observation (Feature 3-A sub-PR 3)
+# ---------------------------------------------------------------------------
+
+
+def _msg(seq: int, sender: str) -> Message:
+    to = "claude-code" if sender == "claude.ai" else "claude.ai"
+    return Message.model_validate(
+        {
+            "schema_version": 1,
+            "msg_id": f"{ULID_A}/{seq:03d}",
+            "seq": seq,
+            "from": sender,
+            "to": to,
+            "created_at": "2026-05-07T08:43:07Z",
+            "body": "x",
+        }
+    )
+
+
+def test_detect_race_gap_none_for_contiguous() -> None:
+    msgs = [_msg(1, "claude.ai"), _msg(2, "claude-code"), _msg(3, "claude.ai")]
+    assert _detect_race_gap(msgs) is None
+
+
+def test_detect_race_gap_none_for_empty() -> None:
+    assert _detect_race_gap([]) is None
+
+
+def test_detect_race_gap_duplicate_seq() -> None:
+    """Two writers computed the same next_seq → both files survive (race signature)."""
+    msgs = sorted(
+        [_msg(1, "claude.ai"), _msg(2, "claude-code"), _msg(2, "claude.ai")],
+        key=lambda m: m.seq,
+    )
+    reason = _detect_race_gap(msgs)
+    assert reason is not None
+    assert "duplicate_seq=[2]" in reason
+
+
+def test_detect_race_gap_seq_hole() -> None:
+    """A missing seq (lost write) shows up as a compact (lo, hi) range."""
+    msgs = [_msg(1, "claude.ai"), _msg(3, "claude.ai")]
+    reason = _detect_race_gap(msgs)
+    assert reason is not None
+    assert "seq_hole missing_ranges=[(2, 2)]" in reason
+
+
+def test_detect_race_gap_wide_hole_is_compact() -> None:
+    """A huge gap is reported as one range, never enumerated int-by-int."""
+    msgs = [_msg(1, "claude.ai"), _msg(1_000_000, "claude.ai")]
+    reason = _detect_race_gap(msgs)
+    assert reason == "seq_hole missing_ranges=[(2, 999999)]"
+
+
+def test_summary_metric_emitted_no_anomaly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    layout = _seed(tmp_path, ULID_A, status="active", awaiting_from="claude-code")
+    write_message_file(layout, seq=1, sender="claude.ai", atomic=False)
+
+    queue: asyncio.Queue[ThreadEvent] = asyncio.Queue()
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.watcher.startup_scan"):
+        startup_full_scan(tmp_path, queue, now=NOW)
+
+    summary = [r.message for r in caplog.records if "race-gap summary" in r.message]
+    assert len(summary) == 1
+    assert "scanned=1 gap_detected=0 gap_rate=0.000 anomalies=[]" in summary[0]
+
+
+def test_duplicate_seq_thread_still_enqueued_and_counted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Race-gap is observation-only: the thread is still requeued normally."""
+    layout = _seed(tmp_path, ULID_A, status="active", awaiting_from="claude-code")
+    # Two files at seq 2 with different `from` suffix = cross-process race trace.
+    write_message_file(layout, seq=1, sender="claude.ai", atomic=False)
+    write_message_file(layout, seq=2, sender="claude.ai", atomic=False)
+    write_message_file(layout, seq=2, sender="claude-code", atomic=False)
+
+    queue: asyncio.Queue[ThreadEvent] = asyncio.Queue()
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.watcher.startup_scan"):
+        n = startup_full_scan(tmp_path, queue, now=NOW)
+
+    # Still enqueued (observation does not gate recovery).
+    assert n == 1
+    summary = [r.message for r in caplog.records if "race-gap summary" in r.message]
+    assert len(summary) == 1
+    assert "scanned=1 gap_detected=1" in summary[0]
+    assert any("race-gap anomaly on" in r.message for r in caplog.records)
