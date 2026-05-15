@@ -230,6 +230,35 @@ class PhanthandConfig(_StrictModel):
     timeout_seconds: float = Field(default=10.0, gt=0)
 
 
+class MCPServerConfig(_StrictModel):
+    """HTTP MCP write server (``mindwire-mcp-server``) runtime settings.
+
+    The write server is a Phase 1 Feature 3-A addition (sub-PR 2). It is
+    a *separate* process from the in-process MCP server used by
+    claude-code during watcher dispatch — the `[claude_code]` /
+    ``extra_mcp_servers`` tree is unrelated. ``mindwire-mcp`` (the
+    read-only stub at :mod:`spirrow_mindwire.mcp_server`) is also
+    unrelated and unaffected by this config block; see
+    docs/feature-3-design.md §2.1 for the 3-layer separation rationale.
+
+    Defaults are production-ready (see [[feedback_config_defaults_first]]):
+
+    - ``host = "127.0.0.1"`` matches the Phanthand precedent — the write
+      server exposes file-system-mutating tools, so binding to localhost
+      is the safe-by-default surface. Operators who run the write server
+      on a separate host must override this explicitly.
+    - ``port = 7400`` sits one decade above phanthand's ``7300`` so the
+      two Spirrow services form an adjacent range without colliding.
+    - ``api_key_env`` names the environment variable holding the bearer
+      token (= the *name*, not the value — secrets stay out of TOML and
+      the value is read at process start).
+    """
+
+    host: str = "127.0.0.1"
+    port: int = Field(default=7400, ge=1, le=65535)
+    api_key_env: str = "MINDWIRE_MCP_API_KEY"
+
+
 class MindwireSettings(BaseSettings):
     """Top-level MindWire configuration.
 
@@ -249,6 +278,7 @@ class MindwireSettings(BaseSettings):
     watcher: WatcherConfig = Field(default_factory=WatcherConfig)
     claude_code: ClaudeCodeConfig = Field(default_factory=ClaudeCodeConfig)
     phanthand: PhanthandConfig = Field(default_factory=PhanthandConfig)
+    mcp_server: MCPServerConfig = Field(default_factory=MCPServerConfig)
 
     @field_validator("schema_version")
     @classmethod
@@ -327,6 +357,7 @@ __all__ = [
     "ClaudeCodeConfig",
     "ExtraMCPServerConfig",
     "LoggingConfig",
+    "MCPServerConfig",
     "MindwireSettings",
     "PathsConfig",
     "PhanthandConfig",

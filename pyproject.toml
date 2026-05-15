@@ -18,6 +18,13 @@ dependencies = [
   "httpx>=0.27",
   "claude-agent-sdk>=0.1.0,<0.2",
   "structlog>=24.1",
+  # mindwire-mcp-server (Phase 1 Feature 3-A): direct ASGI usage of the
+  # Starlette app produced by FastMCP, served by uvicorn. Both are
+  # transitively pulled in by ``mcp``, but they're listed explicitly
+  # here per [[feedback_decoupling_preference]] — we import them
+  # directly, so we own the contract.
+  "starlette>=0.40",
+  "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +38,7 @@ dev = [
 [project.scripts]
 mindwire-watcher = "spirrow_mindwire.watcher:main"
 mindwire-mcp = "spirrow_mindwire.mcp_server:main"
+mindwire-mcp-server = "spirrow_mindwire.mcp_write_server.http:main"
 mindwire = "spirrow_mindwire.cli:main"
 mindwire-migrate-v1-to-v2 = "spirrow_mindwire.migration.v1_to_v2:main"
 

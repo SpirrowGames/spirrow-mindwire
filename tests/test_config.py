@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from spirrow_mindwire.config import (
     CONFIG_SCHEMA_VERSION,
     DEFAULT_DATA_DIR,
+    MCPServerConfig,
     MindwireSettings,
     load_settings,
 )
@@ -54,6 +55,9 @@ def test_defaults_only_when_no_toml_and_no_env(tmp_path: Path) -> None:
     assert s.claude_code.extra_mcp_servers == {}
     assert s.phanthand.endpoint == "http://localhost:7300"
     assert s.phanthand.api_key_env == "PHANTHAND_API_KEY"
+    assert s.mcp_server.host == "127.0.0.1"
+    assert s.mcp_server.port == 7400
+    assert s.mcp_server.api_key_env == "MINDWIRE_MCP_API_KEY"
 
 
 def test_paths_derived_from_data_dir(tmp_path: Path) -> None:
@@ -296,3 +300,61 @@ def test_retry_backoff_seconds_empty_with_max_retries_zero_accepted() -> None:
     s = MindwireSettings(watcher={"max_retries": 0, "retry_backoff_seconds": []})  # type: ignore[arg-type]
     assert s.watcher.max_retries == 0
     assert s.watcher.retry_backoff_seconds == ()
+
+
+# ----- Feature 3-A sub-PR 2: MCPServerConfig (mindwire-mcp-server) ---------
+
+
+def test_mcp_server_toml_overrides_defaults(tmp_path: Path) -> None:
+    """``[mcp_server]`` TOML block overrides the production-ready defaults."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [mcp_server]
+            host = "0.0.0.0"
+            port = 9000
+            api_key_env = "CUSTOM_KEY_ENV"
+            """
+        ),
+        encoding="utf-8",
+    )
+    s = load_settings(cfg)
+    assert s.mcp_server.host == "0.0.0.0"
+    assert s.mcp_server.port == 9000
+    assert s.mcp_server.api_key_env == "CUSTOM_KEY_ENV"
+
+
+def test_mcp_server_env_overrides_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``MINDWIRE_MCP_SERVER__PORT`` wins over the TOML value."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text("[mcp_server]\nport = 9000\n", encoding="utf-8")
+    monkeypatch.setenv("MINDWIRE_MCP_SERVER__PORT", "9100")
+
+    s = load_settings(cfg)
+    assert s.mcp_server.port == 9100
+
+
+def test_mcp_server_port_out_of_range_rejected() -> None:
+    """Port must be a TCP port number (1..65535)."""
+    with pytest.raises(ValidationError):
+        MCPServerConfig(port=70000)
+    with pytest.raises(ValidationError):
+        MCPServerConfig(port=0)
+
+
+def test_mcp_server_extra_key_in_toml_raises(tmp_path: Path) -> None:
+    """Unknown keys under ``[mcp_server]`` fail loud (strict='forbid')."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [mcp_server]
+            host = "127.0.0.1"
+            bogus_key = "nope"
+            """
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError):
+        load_settings(cfg)
