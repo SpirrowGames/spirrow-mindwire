@@ -259,9 +259,7 @@ class WriteTools:
             )
         )
         log.append(
-            _message_received_event(
-                layout.thread_id, ts, 1, len(message_content.encode("utf-8"))
-            )
+            _message_received_event(layout.thread_id, ts, 1, len(message_content.encode("utf-8")))
         )
         return {
             "thread_id": layout.thread_id,

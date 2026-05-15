@@ -49,11 +49,116 @@ F3-B (events.jsonl derive engine + operator dashboard / CLI) は本 Feature 3 �
 
 (sub-PR 2 以降で incremental 追加予定。 想定 subsection)
 
-- **§2.1** mindwire-mcp-server 設計 (= layer / transport / auth、 sub-PR 2)
-- **§2.2** claude.ai 側 write protocol (= exposed tools `send_message` / `open_thread` / `resolve_thread`、 sub-PR 2)
+- **§2.1** mindwire-mcp-server 設計 (= layer / transport / auth、 sub-PR 2) — **filled**
+- **§2.2** claude.ai 側 write protocol (= exposed tools `send_message` / `open_thread` / `resolve_thread`、 sub-PR 2) — **filled**
 - **§2.3** claude.ai 側 awaiting_from 更新 + message write 実装 (sub-PR 3)
 - **§2.4** race monitoring instrumentation (sub-PR 3 bundle)
 - **§2.5** 2-phase commit re-design (sub-PR 4 deferred、 dogfooding race observation N+ 件 trigger)
+
+### 2.1 mindwire-mcp-server 設計 (sub-PR 2)
+
+**Trilateral decide SOT**: chatroom `T-feat3-d2-mcp-server` msg-127 (= integrator decide、 resolved 2026-05-15、 user 最終承認済 for D2-3 = A 採用)。 本節は decide msg を文書化した記録、 design 自体の議論ログは chatroom 一次。
+
+#### 2.1.1 3 layer 分離 (D2-3 = A 採用)
+
+`mindwire` repo は本 sub-PR 完了時点で **3 つの独立な MCP server layer** を持つ:
+
+| layer | entry point / file | scope | 本 sub-PR で touch |
+|---|---|---|---|
+| **mindwire-mcp** | `mindwire-mcp` CLI / `src/spirrow_mindwire/mcp_server.py` | read-only API stub (= `docs/mcp-interface.md` §3、 Phase 2+ Connector / observer / dashboard 用) | **touch なし** (= status quo preserve) |
+| **mindwire-mcp-server** (本 sub-PR で追加) | `mindwire-mcp-server` CLI / `src/spirrow_mindwire/mcp_write_server/` | **write-only HTTP MCP API** (= claude.ai 側からの thread 操作、 別 process) | **新規 entry point + 新 subpackage** |
+| **in-process mindwire MCP** | `src/spirrow_mindwire/claude_code/tools/mindwire_server.py` (= `build_mindwire_mcp_server`) | watcher が claude-code 起動時に inject する 5 tool (= `write_reply` / `read_file` / `list_dir` / `search` / `file_info`) | **touch なし** |
+
+**A 採用の rationale** (= msg-127 §2):
+
+| 観点 | A (= 3 layer 分離) merit | B (= 1 server 統合 rebrand) で問題化していた点 |
+|---|---|---|
+| YAGNI | 既存 read-only stub を driver 出現まで status quo preserve、 observation driven | read consumer (= Connector / observer) Phase 1 不在のまま「同 audience = external」 grouping、 future state anticipation 寄り |
+| spec scope | `docs/mcp-interface.md` §3 (= read-only spec) touch なし、 umbrella #41 射程内、 user 再承認不要 | spec 拡張 (= read-only → read+write) + entry point rebrand、 user 再承認必須 |
+| 複雑性 | read / write を別 server / 別 api_key で自然分離、 scope-based access control 不要 | 1 server / 1 api_key で read+write 混在、 Phase 2+ で scope-based access control 後付け carry |
+| phanthand precedent | 同 pattern (= driver 単位で entry point 分離) | 異なる pattern (= phanthand は read 専用、 write は別 mechanism) |
+| 「3 entry point overhead」 counter | 実質 0 cost (= read stub 放置)、 mental model は driver 単位の方が単純 | counter 自体が naysayer §3.3 で reject |
+
+**Naysayer §3 独立検証 trace** (= msg-126 §3、 起案 stance 撤回 trigger): Naysayer pass が「§1 YAGNI / §2 overscope / §3 ハイブリッド複雑性」 の 3 軸で B を独立 reject、 起案者 (claude-code) が integrator step で stance 撤回。 user judgment で A 採用 confirm、 procedural integrity 維持。
+
+#### 2.1.2 Transport / auth / startup (D2-2 + D2-5)
+
+| 項目 | 採用 |
+|---|---|
+| Transport | **streamable HTTP MCP** (= FastMCP の `streamable_http_app()` を Starlette ASGI として host、 uvicorn で foreground 起動) |
+| Auth | **API key bearer token** (= phanthand precedent と同 pattern)、 `Authorization: Bearer <token>` を `ApiKeyMiddleware` で constant-time 検証 (`hmac.compare_digest`) |
+| Lifecycle | **operator manual** (= `uv run mindwire-mcp-server`、 Ctrl-C で停止) |
+| Config | `[mcp_server]` section in `mindwire.toml`、 fields = `host` (default `127.0.0.1`) / `port` (default `7400`) / `api_key_env` (default `MINDWIRE_MCP_API_KEY`)。 secret 値は env var に置く (= TOML には name のみ) |
+| URL path | `/mcp` (= `streamable_http_path`、 module-level `MCP_PATH` constant) |
+| Server name | `mindwire-write` (= MCP handshake で advertise、 in-process `mindwire` server と区別) |
+
+`127.0.0.1` default は phanthand precedent + 「write tool 露出 surface は localhost 既定が安全」 の二軸根拠。 operator が別 host から接続する場合は `[mcp_server].host` 明示 override。
+
+#### 2.1.3 Cross-process invariant (D2-6)
+
+**Invariant**: `mindwire-mcp-server` と watcher dispatcher は **on-disk thread directory 経由でのみ coordinate する** (= shared memory なし、 socket-level RPC なし)。 両 process は同じ race-acceptance contract (= `docs/feature-2-design.md` §3.6 「operator should stop watcher before destructive manual edits」) を共有する。
+
+実装上の trace:
+
+- `src/spirrow_mindwire/mcp_write_server/http.py` module docstring: cross-process invariant を verbatim 記載
+- `src/spirrow_mindwire/mcp_write_server/tools_write.py` module docstring: 「watcher と MCP-server racing on same thread within a few ms can produce both processes computing the same next_seq」 と明示、 sub-PR 4 が 2-phase commit re-design 担当である旨も記載
+- `src/spirrow_mindwire/awaiting_from_toggle.py` module docstring: cross-process race scope (= AwaitingFromChanged event が 2 件 emit され得る) を独立 record
+
+**Test scope split** (= msg-127 §4 C3 + C4):
+
+| layer | scope | sub-PR |
+|---|---|---|
+| In-process concurrency (= MCP server 内で同 thread 2 send_message) | `tests/test_mcp_write_server.py::test_send_message_concurrent_writes` で per-thread asyncio.Lock 挙動 baseline | **本 sub-PR** |
+| Cross-process integration (= watcher + MCP server 同 thread race) | watcher 駆動 e2e test として sub-PR 3 で実装 | sub-PR 3 carry |
+
+#### 2.1.4 Layer architecture diff
+
+```
+新規 / 修正 (= 本 sub-PR 2):
+
+src/spirrow_mindwire/
+├── awaiting_from_toggle.py            # 新規。 dispatcher + MCP server 共有 helper (= C1)
+├── config.py                          # MCPServerConfig 追加、 MindwireSettings.mcp_server field
+├── mcp_server.py                      # touch なし (= stub status quo preserve)
+├── mcp_write_server/                  # 新 subpackage
+│   ├── __init__.py
+│   ├── http.py                        # FastMCP + uvicorn entry、 ApiKeyMiddleware wrap
+│   ├── auth.py                        # ApiKeyMiddleware + read_api_key
+│   └── tools_write.py                 # WriteTools class (= per-thread lock dict + 3 tool handlers)
+└── watcher/dispatcher.py              # 修正 (= self._toggle_awaiting_from 削除、 toggle_awaiting_from import)
+```
+
+`mindwire-mcp-server` entry point: `pyproject.toml` `[project.scripts]` に新規追加 (= 既存 `mindwire-mcp` は touch なし)。 `starlette` + `uvicorn` は MCP SDK に transitive 依存だが、 直接 import する以上 `[project.dependencies]` に明示 ([[feedback_decoupling_preference]] 整合)。
+
+### 2.2 claude.ai 側 write protocol (sub-PR 2)
+
+**Decide SOT**: chatroom `T-feat3-d2-mcp-server` msg-127 §1 D2-1 (= 3 tool 最小、 α 採用 + Naysayer Q4 frame inversion 受諾 = 「不追加が YAGNI 整合」)。
+
+#### 2.2.1 Tool surface
+
+| tool | args | return (success) | error 条件 (ToolError verbatim) |
+|---|---|---|---|
+| `send_message` | `thread_id: str (ULID)`、 `body: str` | `{thread_id, seq, msg_id, awaiting_from="claude-code"}` | invalid ULID / nonexistent thread / status terminal / `awaiting_from != "claude.ai"` (= 順番違反) |
+| `open_thread` | `initial_message: str`、 `title?: str`、 `tags?: list[str]` | `{thread_id, msg_id, awaiting_from="claude-code"}` | (operational fault 以外 user-actionable error 不在) |
+| `resolve_thread` | `thread_id: str (ULID)` | `{thread_id, status="resolved"}` (+ `noop=True` if already resolved) | invalid ULID / nonexistent thread / 遷移不可 (= e.g. `archived → resolved`) |
+
+#### 2.2.2 4 番目 tool (`update_awaiting_from`) 不採用 rationale
+
+Naysayer Q4 frame inversion (= msg-127 §5): 「driver 不在で reject = speculation」 frame は誤り、 正しい frame は **「driver 不在で追加するのが speculation、 不追加が YAGNI 整合」**。 観察 driver が emerge した時点で incremental に追加できる、 spec scope 拡張ではなく将来拡張余地の record。
+
+具体 anchor: `tools_write.py` module docstring の冒頭 paragraph に「A fourth potential tool `update_awaiting_from` ... is intentionally deferred ... Future drivers can append the tool incrementally without changing this module's contract」 と verbatim 記載済。
+
+#### 2.2.3 Turn-discipline guard for `send_message`
+
+`send_message` は `meta.awaiting_from == "claude.ai"` を要件化する (= turn-discipline guard)。 watcher dispatcher は claude-code reply 完了時に `awaiting_from` を `claude.ai` に toggle するので、 「claude.ai's turn」 = 「dispatcher が toggle を終えた状態」。 caller が turn 違反で送ろうとした場合 (= in-flight invoke と overlap する) は ToolError verbatim。
+
+caller (= claude.ai-side) が poll で `awaiting_from` を check する design は spec 範囲外 (= sub-PR 3 で integrate)、 本 sub-PR は MCP server side guard のみ。
+
+#### 2.2.4 Lifecycle helper reuse (C1 採用 = msg-127 §4)
+
+`send_message` の post-write awaiting_from toggle は **watcher dispatcher と shared helper** (= `awaiting_from_toggle.toggle_awaiting_from`) を使う。 terminal-state guard + idempotent skip + AwaitingFromChanged snapshot semantic を 2 callsite で SOT 一元化。
+
+**#39 carry N2 disposition** (= external caller idempotency for `set_awaiting_from`): shared helper 自体が「pre_meta.awaiting_from == target なら no-op」 idempotent skip を持っているので、 external caller 専用の関数 level guard 追加は不要。 dispatcher と MCP-server caller が同じ short-circuit を共有することで、 関数 level idempotency 議論は本 sub-PR で disposition 完結。 #39 N2 trigger は closed 候補。
 
 ## 3. Schema policy
 
