@@ -77,7 +77,7 @@ _REASON_FOR_TERMINATED: dict[ThreadStatus, str] = {
 def _seed_meta(layout: ThreadDirLayout, **overrides: Any) -> None:
     """Seed meta.yaml directly, bypassing transition_state."""
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "thread_id": layout.thread_id,
         "title": "",
         "status": "active",
