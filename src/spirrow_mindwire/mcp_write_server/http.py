@@ -16,11 +16,12 @@ same race-acceptance contract documented in
 before destructive manual edits). The api-key boundary lives between
 caller and this server; the watcher does not consult it.
 
-**Tool registration**: commit 2 of sub-PR 2 leaves
-:mod:`tools_write` empty so an MCP client sees an empty tool list —
-that is enough to verify the bootstrap + auth surface. Commit 3 fills
-the 3 write tools (``send_message`` / ``open_thread`` /
-``resolve_thread``) per integrator decide §1 D2-1 (= the 3-tool minimal set).
+**Tool registration**: the 3 write tools (``send_message`` /
+``open_thread`` / ``resolve_thread``) live in :mod:`tools_write` and
+are wired in via :func:`_register_write_tools`. Per integrator decide
+§1 D2-1 (= the 3-tool minimal set, Naysayer Q4 frame inversion: an
+additional ``update_awaiting_from`` tool is deferred until an observed
+driver demands toggle-without-message).
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from starlette.applications import Starlette
 
 from spirrow_mindwire.config import MindwireSettings, load_settings
 from spirrow_mindwire.mcp_write_server.auth import ApiKeyMiddleware, read_api_key
+from spirrow_mindwire.mcp_write_server.tools_write import WriteTools, register_tools
 
 logger = logging.getLogger(__name__)
 
@@ -74,16 +76,16 @@ def build_app(settings: MindwireSettings, *, api_key: str) -> Starlette:
 
 
 def _register_write_tools(fastmcp: FastMCP, settings: MindwireSettings) -> None:
-    """Register the write tools on ``fastmcp``.
+    """Register the 3 write tools on ``fastmcp``.
 
-    Commit 2 placeholder: no tools registered yet, so the server boots
-    with an empty tool list. Commit 3 of sub-PR 2 imports the concrete
-    handlers from :mod:`tools_write` and wires them here.
+    Constructs a single :class:`WriteTools` instance bound to
+    ``settings.paths.data_dir`` and shared across all incoming requests.
+    The per-thread asyncio.Lock dict inside :class:`WriteTools` is what
+    serialises same-thread send_message / resolve_thread calls within
+    this process.
     """
-    # Intentionally empty in commit 2. ``settings`` is passed through
-    # so commit 3 has the channel for ``settings.paths.threads_dir`` and
-    # other config-derived values without changing this signature.
-    del settings  # silence "unused" until commit 3 wires the handlers
+    tools = WriteTools(data_dir=settings.paths.data_dir)
+    register_tools(fastmcp, tools)
 
 
 def main() -> None:
