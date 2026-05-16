@@ -262,17 +262,20 @@ async def test_dispatcher_skips_toggle_when_is_error_and_no_write_reply(
 ) -> None:
     """``result.is_error=True`` with no reply on disk → no toggle, no event.
 
-    PR #40 C2 carry: ``test_dispatcher_skips_toggle_when_no_write_reply_on_disk``
-    pins the ``is_error=False`` skip path; this is its ``is_error=True``
-    counterpart. The two together pin that the toggle gate is governed
+    PR #40 C2 carry, quadrant 4 of the is_error/reply-landed matrix.
+    Paired with quadrant 2
+    (``test_dispatcher_skips_toggle_when_no_write_reply_on_disk``,
+    is_error=False + no reply): together they pin the toggle's
+    *negative* branch — "no reply on disk → no toggle, regardless of
+    ``is_error``". Note this quadrant alone does **not** catch a
+    ``if result.is_error: return`` regression (no reply → no toggle
+    here anyway, observably identical); that coupling is caught by the
+    *positive* branch in quadrant 3
+    (``test_dispatcher_toggles_awaiting_from_when_is_error_but_reply_landed``).
+    The two quadrants together pin that the toggle gate is governed
     **solely** by ``_write_reply_completed`` (on-disk reply at
-    ``next_seq``, the docs/feature-2-design.md §3.5 SOT) and is
-    *decoupled* from the SDK ``ResultMessage.is_error`` flag — the only
-    place ``is_error`` flows is the InvokeEnd ``exit_code``. This guards
-    against a future regression that couples the toggle to ``is_error``
-    (e.g. an early ``if result.is_error: return`` that would also skip
-    toggling even when a reply *did* land, or — symmetrically — toggling
-    on SDK success despite no reply)."""
+    ``next_seq``, the docs/feature-2-design.md §3.5 SOT), with
+    ``is_error`` flowing only to the InvokeEnd ``exit_code``."""
     layout = _seed_thread(tmp_path)
     err_result = InvokeResult(
         is_error=True,
@@ -305,6 +308,68 @@ async def test_dispatcher_skips_toggle_when_is_error_and_no_write_reply(
     assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
     assert "thread.awaiting_from.changed" not in types
     assert log_lines[-1]["exit_code"] == 1
+
+
+@pytest.mark.anyio
+async def test_dispatcher_toggles_awaiting_from_when_is_error_but_reply_landed(
+    tmp_path: Path,
+) -> None:
+    """``result.is_error=True`` BUT reply landed on disk → toggle STILL fires.
+
+    PR #40 C2 carry, quadrant 3 — the only quadrant that catches a
+    ``if result.is_error: return`` regression. PR #51 review (claude.ai
+    main / Copilot, independent convergence): quadrants 2 & 4 (no reply)
+    skip the toggle regardless of ``is_error``, so neither would notice
+    such a regression. Only here — reply on disk yet ``is_error=True`` —
+    is the toggle's *positive* branch exercised under SDK error: the
+    docs/feature-2-design.md §3.5 SOT is the on-disk reply, **not** the
+    SDK ``ResultMessage``, so the toggle must fire while ``is_error``
+    flows independently to ``exit_code``. ``_invoker_with_write_reply``
+    lands the reply at ``next_seq`` before returning the error result,
+    mirroring a model that called ``write_reply`` then the SDK surfaced
+    a non-fatal error."""
+    layout = _seed_thread(tmp_path)
+    pre_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert pre_meta.awaiting_from == "claude-code"  # baseline
+
+    err_result = InvokeResult(
+        is_error=True,
+        duration_ms=50,
+        text_output="",
+        result_text=None,
+        stop_reason="error",
+    )
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        # Reply lands at next_seq, THEN the SDK returns is_error=True.
+        invoker=_invoker_with_write_reply(
+            layout, next_seq=2, sender="claude-code", result=err_result
+        ),
+    )
+
+    await dispatcher.handle(_event())
+
+    # Toggle DID fire despite is_error=True — on-disk reply is the SOT.
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.status == "active"  # status-orthogonal
+    assert new_meta.awaiting_from == "claude.ai"  # toggled
+
+    log_lines = [
+        json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    awaiting_events = [e for e in log_lines if e["type"] == "thread.awaiting_from.changed"]
+    assert len(awaiting_events) == 1
+    assert awaiting_events[0]["from_participant"] == "claude-code"  # pre-write meta
+    assert awaiting_events[0]["to_participant"] == "claude.ai"
+    # is_error still flows to exit_code, decoupled from the toggle.
+    end = next(e for e in log_lines if e["type"] == "claude_code.invoke.end")
+    assert end["exit_code"] == 1
 
 
 @pytest.mark.anyio
