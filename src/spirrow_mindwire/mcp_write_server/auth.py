@@ -7,6 +7,15 @@ Missing / mismatched headers return 401 with a verbatim short detail
 message; the caller (= a claude.ai-side MCP client) decides how to react
 to auth failures per [[feedback_trust_llm_for_tool_errors]].
 
+Note: "secrets never land on disk" is a statement about *this server* —
+it reads only the env var, never a file. The dogfooding recipe
+(``docs/dogfooding.md`` §1, chatroom ``T-mcp-apikey-persistence``
+msg-140 Option A) does persist the key in an operator-side
+owner-only file and sources it into the env at launch; that is an
+operator-side convenience outside this module's contract and does not
+change the server-side env-only resolution path. A server-side
+``api_key_file`` option is deferred (Option B) until an observed driver.
+
 The constant-time comparison (:func:`hmac.compare_digest`) defends
 against timing side-channels — a meaningful safeguard for a long-lived
 bearer token even though the server binds to ``127.0.0.1`` by default.

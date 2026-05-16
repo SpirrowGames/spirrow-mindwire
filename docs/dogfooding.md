@@ -19,13 +19,61 @@ sync with the watcher / `mindwire-mcp-server` config defaults.
    - `PHANTHAND_API_KEY=<value-from-phanthand-config>` set
    - `uv run mindwire-watcher`
    - `ANTHROPIC_API_KEY` not required (bundled claude CLI OAuth carries over)
-3. **mindwire-mcp-server** — claude.ai-side write entry point
-   (Feature 3-A sub-PR 2). Single-writer crack (sub-PR 3) starts once
-   claude.ai writes through this server.
-   - `MINDWIRE_MCP_API_KEY=<secret>` set (name fixed by
-     `MCPServerConfig.api_key_env`; the value lives only in the env)
+3. **mindwire-mcp-server** — claude.ai-side write+read entry point
+   (Feature 3-A sub-PR 2 + Feature 3-C read tools). Single-writer
+   crack (sub-PR 3) starts once claude.ai writes through this server.
+   - **Stable secret (set up once, then never again)** — chatroom
+     `T-mcp-apikey-persistence` msg-140 decide (Option A): the API key
+     is a *persisted* secret, **not** a per-session throwaway. This
+     kills the recurring "regenerate key + re-sync Claude Desktop +
+     restart Desktop" friction (root cause of the 2026-05-17
+     connect-failure incident).
+     - **First time only**: generate one key and store it at
+       `<data_dir>/config/.mcp_api_key`, then lock it down to
+       owner-only read (= env-var blast-radius parity):
+       - Linux/macOS:
+         ```
+         umask 077
+         python -c "import secrets;open('<data_dir>/config/.mcp_api_key','w').write(secrets.token_urlsafe(32))"
+         chmod 600 <data_dir>/config/.mcp_api_key
+         ```
+       - Windows (PowerShell):
+         ```
+         $f="$env:USERPROFILE\spirrow-mindwire-data\config\.mcp_api_key"
+         $b=New-Object byte[] 32;[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+         Set-Content $f ([Convert]::ToBase64String($b).TrimEnd('=').Replace('+','-').Replace('/','_')) -NoNewline -Encoding ascii
+         icacls $f /inheritance:r /grant:r "$($env:USERNAME):R"
+         ```
+     - **Set the Claude Desktop connector token to this same value
+       once** (`claude_desktop_config.json` → `mindwire-participant`
+       entry; see §5). After that, neither side ever changes again.
+   - **Every launch**: source the stable file into the env, don't
+     regenerate:
+     - Linux/macOS: `MINDWIRE_MCP_API_KEY=$(cat <data_dir>/config/.mcp_api_key) uv run mindwire-mcp-server`
+     - Windows: `$env:MINDWIRE_MCP_API_KEY=(Get-Content "$env:USERPROFILE\spirrow-mindwire-data\config\.mcp_api_key" -Raw).Trim(); uv run mindwire-mcp-server`
+   - The env-var contract is unchanged (name still
+     `MCPServerConfig.api_key_env` = `MINDWIRE_MCP_API_KEY`; the server
+     still reads the *env*, never the file directly — file→env is an
+     operator-side step). Server having a config option to read the
+     file itself (`api_key_file`) is **deferred** (Option B) until an
+     observed driver shows the one-line source step is itself a
+     friction; see GitHub #48.
    - `uv run mindwire-mcp-server` (foreground; Ctrl-C to stop)
    - default bind `http://127.0.0.1:7400/mcp`
+   - **gitignore note** (override case only): the default `data_dir`
+     (`~/spirrow-mindwire-data`) is *outside* the repo, so the secret
+     file is never git-tracked. If you override
+     `MINDWIRE_PATHS__DATA_DIR` to a path *inside* a git repo, add
+     `**/config/.mcp_api_key` (or the whole `config/`) to that repo's
+     `.gitignore` — operator responsibility.
+   - **server-rename sync note**: the file name `.mcp_api_key` and the
+     env var `MINDWIRE_MCP_API_KEY` carry an `mcp` token on the
+     *server-name axis*. F3-C renamed the server
+     (`mindwire-write` → `mindwire-participant`) but deliberately kept
+     the env-var name unchanged (decide msg-136). If a future rename
+     ever changes `MCPServerConfig.api_key_env`, sync the stable file
+     name + this recipe + the Desktop connector token in lock-step
+     (naming-hygiene follow-up anchor, msg-139 §4-Q2).
 
 ## 2. Phase 1 dogfooding resume pre-checklist (run once at sub-PR 3 completion)
 
