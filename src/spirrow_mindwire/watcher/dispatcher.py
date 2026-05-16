@@ -298,14 +298,17 @@ class ThreadDispatcher:
                     )
                 return
 
-            sender: Participant = "claude-code"
+            replier: Participant = "claude-code"
             recipient: Participant = "claude.ai"
             next_seq = latest.seq + 1
             prompt = build_thread_prompt(current_meta, messages)
             mcp_server = build_mindwire_mcp_server(
                 layout=layout,
                 next_seq=next_seq,
-                sender=sender,
+                # ``sender=`` is build_mindwire_mcp_server's public param
+                # (out of PR #51 C1 scope: the rename is dispatcher-local);
+                # only the argument value follows the ``replier`` rename.
+                sender=replier,
                 recipient=recipient,
                 phanthand_client=self._phanthand_client,
             )
@@ -439,11 +442,11 @@ class ThreadDispatcher:
             # で claude-code の新 message が next_seq に存在することを verify**。
             # partial_write_reply 経路は別途 ``latest.from_ == "claude-code"``
             # の早期 return guard で同等 verify 済みのため、 同 check 不要。
-            if self._write_reply_completed(layout=layout, sender=sender, next_seq=next_seq):
+            if self._write_reply_completed(layout=layout, replier=replier, next_seq=next_seq):
                 toggle_awaiting_from(
                     layout=layout,
                     log=log,
-                    from_participant=sender,
+                    from_participant=replier,
                 )
             else:
                 logger.info(
@@ -586,13 +589,13 @@ class ThreadDispatcher:
         self,
         *,
         layout: ThreadDirLayout,
-        sender: Participant,
+        replier: Participant,
         next_seq: int,
     ) -> bool:
         """Verify a new claude-code reply landed at ``next_seq``.
 
         Returns True iff the latest message on disk matches the expected
-        post-invoke shape (= same ``sender`` + ``next_seq`` we computed
+        post-invoke shape (= same ``replier`` + ``next_seq`` we computed
         before invoking the SDK). Used by the success path as the
         production-correct gate for the ``awaiting_from`` toggle: SDK
         ``result.is_error=False`` is **not** proof that
@@ -607,7 +610,7 @@ class ThreadDispatcher:
         if not messages_after:
             return False
         latest_after = messages_after[-1]
-        return latest_after.from_ == sender and latest_after.seq == next_seq
+        return latest_after.from_ == replier and latest_after.seq == next_seq
 
     def _recover_retrying_to_active(
         self,
