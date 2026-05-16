@@ -21,7 +21,11 @@ caller and this server; the watcher does not consult it.
 are wired in via :func:`_register_write_tools`. Per integrator decide
 §1 D2-1 (= the 3-tool minimal set, Naysayer Q4 frame inversion: an
 additional ``update_awaiting_from`` tool is deferred until an observed
-driver demands toggle-without-message).
+driver demands toggle-without-message). Feature 3-C adds the 2
+claude.ai-participant read tools (``mindwire_list_threads`` /
+``mindwire_get_thread``) via :func:`_register_read_tools` — same
+audience as the write tools, hence same server (chatroom
+``T-feat3-read-overview`` msg-136 論点 4; see :data:`SERVER_NAME`).
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from starlette.applications import Starlette
 
 from spirrow_mindwire.config import MindwireSettings, load_settings
 from spirrow_mindwire.mcp_write_server.auth import ApiKeyMiddleware, read_api_key
+from spirrow_mindwire.mcp_write_server.tools_read import ReadTools, register_read_tools
 from spirrow_mindwire.mcp_write_server.tools_write import WriteTools, register_tools
 
 logger = logging.getLogger(__name__)
@@ -46,12 +51,27 @@ constant so tests and clients can import it without depending on
 FastMCP's default.
 """
 
-SERVER_NAME = "mindwire-write"
+SERVER_NAME = "mindwire-participant"
 """Logical MCP server name advertised in the streamable-http handshake.
+
+Renamed from ``mindwire-write`` in Feature 3-C (chatroom
+``T-feat3-read-overview`` msg-136 論点 4, user-approved 2026-05-16).
+The rename and the read-tool ride-along are an *atomic* decision: this
+server now serves both write tools and the claude.ai-participant read
+tools, so a ``-write`` name is a semantic mismatch. The boundary is
+re-framed from the *contract* axis (write) to the *audience* axis
+(participant) — a single audience (claude.ai-participant) legitimately
+needs both read and write, which is what restores the D2-3 "no
+scope-based access control needed" property (there is no read-only
+third party). The api-key env var name and port are **unchanged**
+(``MINDWIRE_MCP_API_KEY`` / ``7400``); only this advertised handshake
+name changes, so callers must update the connector entry's server name
+(see ``docs/dogfooding.md`` §5).
 
 Distinct from the in-process ``mindwire`` server (the one the watcher
 injects into claude-code) so a single caller can connect to both
-without name collisions.
+without name collisions, and from the read-only stub ``mindwire-mcp``
+(D2-3 status quo preserve, untouched).
 """
 
 
@@ -70,6 +90,7 @@ def build_app(settings: MindwireSettings, *, api_key: str) -> Starlette:
         streamable_http_path=MCP_PATH,
     )
     _register_write_tools(fastmcp, settings)
+    _register_read_tools(fastmcp, settings)
     app = fastmcp.streamable_http_app()
     app.add_middleware(ApiKeyMiddleware, api_key=api_key)
     return app
@@ -86,6 +107,21 @@ def _register_write_tools(fastmcp: FastMCP, settings: MindwireSettings) -> None:
     """
     tools = WriteTools(data_dir=settings.paths.data_dir)
     register_tools(fastmcp, tools)
+
+
+def _register_read_tools(fastmcp: FastMCP, settings: MindwireSettings) -> None:
+    """Register the 2 claude.ai-participant read tools on ``fastmcp``.
+
+    Feature 3-C (chatroom ``T-feat3-read-overview`` msg-136). The read
+    tools ride on this same server because the audience —
+    claude.ai-participant — is identical to the write tools' audience
+    (msg-136 論点 4, the rationale for the ``mindwire-participant``
+    server name). :class:`ReadTools` holds no per-thread lock: reads
+    are a best-effort snapshot (§5 race contract) and perform zero
+    file writes, so the sub-PR 3 startup race-gap metric is unaffected.
+    """
+    tools = ReadTools(data_dir=settings.paths.data_dir)
+    register_read_tools(fastmcp, tools)
 
 
 def main() -> None:
