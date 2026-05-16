@@ -75,6 +75,7 @@ from typing import Any
 import yaml
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from pydantic import ValidationError
 
 from spirrow_mindwire._time import iso_z
 from spirrow_mindwire.filesystem import ThreadDirLayout
@@ -239,14 +240,21 @@ class ReadTools:
         skip rules as :func:`startup_full_scan` /
         :func:`migrate_data_dir` (skip non-dirs, dot-dirs like
         ``.staging-<ULID>``, non-ULID names, dirs without ``meta.yaml``).
-        A meta.yaml that fails to parse is logged at WARNING and skipped
-        rather than failing the whole listing (one corrupt thread must
-        not blind the participant to every other thread).
+        A meta.yaml that fails to parse *or* fails schema validation is
+        logged at WARNING and skipped rather than failing the whole
+        listing (one corrupt thread must not blind the participant to
+        every other thread). Note ``pydantic.ValidationError`` is not a
+        ``ValueError`` subclass in pydantic v2 (it is a Rust-backed
+        ``pydantic_core`` exception), so it is caught explicitly.
+
+        No ``sorted()`` here: :meth:`list_threads` re-sorts the
+        projected summaries by ``(created_at, thread_id)``, so ordering
+        the iterdir would be dead work.
         """
         threads_root = self._data_dir / "threads"
         if not threads_root.is_dir():
             return
-        for thread_dir in sorted(threads_root.iterdir()):
+        for thread_dir in threads_root.iterdir():
             if not thread_dir.is_dir() or thread_dir.name.startswith("."):
                 continue
             try:
@@ -257,7 +265,7 @@ class ReadTools:
                 continue
             try:
                 meta = load_thread_meta(layout)
-            except (OSError, ValueError, yaml.YAMLError) as e:
+            except (OSError, ValueError, yaml.YAMLError, ValidationError) as e:
                 logger.warning(
                     "list_threads: skipping %s (meta.yaml unreadable: %s)",
                     thread_dir.name,

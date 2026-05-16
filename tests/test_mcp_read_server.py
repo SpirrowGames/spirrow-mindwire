@@ -230,6 +230,42 @@ async def test_list_threads_skips_corrupt_meta(read_tools: ReadTools, tmp_path: 
 
 
 @pytest.mark.anyio
+async def test_list_threads_skips_schema_invalid_meta(
+    read_tools: ReadTools, tmp_path: Path
+) -> None:
+    """Parseable YAML but pydantic-schema-invalid meta.yaml is skipped (3a fix).
+
+    Distinct path from test_list_threads_skips_corrupt_meta (YAML parse
+    failure): pydantic v2 ValidationError is not a ValueError subclass,
+    so this exercises the explicit ValidationError branch in
+    _iter_thread_metas. One schema-invalid thread must not 500 the
+    whole listing.
+    """
+    good = _layout(tmp_path, ULID_A)
+    seed_thread_meta(good, awaiting_from="claude-code")
+    bad = _layout(tmp_path, ULID_B)
+    bad.thread_dir.mkdir(parents=True, exist_ok=True)
+    # Valid YAML, valid required fields, but an extra=forbid violation.
+    bad.meta_path.write_text(
+        "schema_version: 2\n"
+        f"thread_id: {ULID_B}\n"
+        "title: bad\n"
+        "status: active\n"
+        "participants: [claude.ai, claude-code]\n"
+        "created_at: '2026-05-07T08:43:07Z'\n"
+        "updated_at: '2026-05-07T08:43:07Z'\n"
+        "tags: []\n"
+        "awaiting_from: claude-code\n"
+        "retry_count: 0\n"
+        "unknown_extra_field: nope\n",
+        encoding="utf-8",
+    )
+
+    result = await read_tools.list_threads()
+    assert {s["thread_id"] for s in result["items"]} == {ULID_A}
+
+
+@pytest.mark.anyio
 async def test_list_threads_skips_staging_and_non_ulid(
     read_tools: ReadTools, tmp_path: Path
 ) -> None:
@@ -351,10 +387,13 @@ async def test_register_read_tools_exposes_both_tools(tmp_path: Path) -> None:
     assert {"mindwire_list_threads", "mindwire_get_thread"} <= names
 
 
-def test_build_app_registers_read_alongside_write() -> None:
-    """build_app wires both tool sets onto one server (audience grouping)."""
+def test_build_app_smoke() -> None:
+    """build_app wires the read tools into the Starlette app without error.
+
+    Tool-level registration is verified separately in
+    test_register_read_tools_exposes_both_tools; this is a smoke test
+    that the read-tool wiring doesn't break build_app construction.
+    """
     settings = MindwireSettings()
     app = build_app(settings, api_key="s3cret")
-    # The Starlette app is constructed without error and the FastMCP
-    # tool manager holds all 5 tools (3 write + 2 read).
     assert app is not None
