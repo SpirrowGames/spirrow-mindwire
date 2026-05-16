@@ -54,6 +54,7 @@ F3-B (events.jsonl derive engine + operator dashboard / CLI) は本 Feature 3 �
 - **§2.3** claude.ai 側 single writer crack 実発生 (sub-PR 3) — **filled**
 - **§2.4** race monitoring instrumentation (sub-PR 3 bundle) — **filled**
 - **§2.5** 2-phase commit re-design (sub-PR 4 deferred、 dogfooding race observation N+ 件 trigger)
+- **§2.6** Feature 3-C: claude.ai-participant read tools (= 独立 feature、 F3-A umbrella #41 外、 GitHub tracker #48) — **filled**
 
 ### 2.1 mindwire-mcp-server 設計 (sub-PR 2)
 
@@ -90,7 +91,7 @@ F3-B (events.jsonl derive engine + operator dashboard / CLI) は本 Feature 3 �
 | Lifecycle | **operator manual** (= `uv run mindwire-mcp-server`、 Ctrl-C で停止) |
 | Config | `[mcp_server]` section in `mindwire.toml`、 fields = `host` (default `127.0.0.1`) / `port` (default `7400`) / `api_key_env` (default `MINDWIRE_MCP_API_KEY`)。 secret 値は env var に置く (= TOML には name のみ) |
 | URL path | `/mcp` (= `streamable_http_path`、 module-level `MCP_PATH` constant) |
-| Server name | `mindwire-write` (= MCP handshake で advertise、 in-process `mindwire` server と区別) |
+| Server name | `mindwire-participant` (= MCP handshake で advertise、 in-process `mindwire` server / read stub `mindwire-mcp` と区別)。 **sub-PR 2 では `mindwire-write`、 Feature 3-C (§2.6) で `mindwire-participant` に改名** (audience 軸 reframe、 API key env / port は不変) |
 
 `127.0.0.1` default は phanthand precedent + 「write tool 露出 surface は localhost 既定が安全」 の二軸根拠。 operator が別 host から接続する場合は `[mcp_server].host` 明示 override。
 
@@ -238,6 +239,44 @@ D2-6 invariant (= filesystem 経由のみ coordinate) の verify 構成:
 #### 2.4.5 race-rate threshold spec の sub-PR 4 carry (= review C3 新規 carry)
 
 option-a metric は **数値出力までで止める**。 「race rate どの値で sub-PR 4 trigger か」 の threshold spec は本 sub-PR で**決めない** — 実 dogfooding observation 前に speculation threshold を打つと判断材料が circular (= endogenous bias)。 「race rate threshold spec」 を **sub-PR 4 propose に carry** (= msg-131 §5 新規 carry)。 downstream log aggregation が summary line を跨 startup で sum して cross-startup rate を出す (= in-process persistence なし、 minimal 維持)。
+
+### 2.6 Feature 3-C: claude.ai-participant read tools
+
+**Trilateral decide SOT**: chatroom `T-feat3-read-overview` msg-136 (= integrator decide、 三者全論点 convergent、 user 最終承認 2026-05-16)。 propose=msg-133 (claude.ai main) / review pass=msg-134 (ClaudeCode) / naysayer pass=msg-135 (claude.ai-naysayer 4 原則) / integrator=msg-136 (ClaudeCode)。 GitHub monument = **Issue #48** (`[tracker] Feature 3-C`、 F3-A #41 と並列の独立 tracker)。 本節は decide msg の文書化記録、 議論ログは chatroom 一次。
+
+#### 2.6.1 位置付け (= 独立 feature、 F3-A umbrella 外)
+
+F3-C は **F3-A umbrella #41 の射程外の独立 feature**。 F3-A MVP (sub-PR 1-3) は `be7940c` で完了 + dogfooding resume gate 通過済 = 「MVP 完了 = dogfooding resume」 milestone は既に fire 済で、 F3-C が遡及して遅延させることは構造的に不能 (review msg-134 §依頼3a)。 sub-PR 5 化すると「F3-A 完結」 が曖昧化する (naming hygiene) ため、 driver / audience / scope が独立に identifiable な本件は独立 feature 化する。 scope = single sub-PR (read 2 tool 実装 + spec §1.1/§3.1/§5 additive + server 改名 + dogfooding runbook 更新)。
+
+driver = dogfooding harvest で局所化した relay friction = 「claude-code 返信 → claude.ai 側 relay」 経路に Claude Desktop の thread read 手段がなく本文目視手貼り。 observation-driven (= speculation でない実観察)。
+
+#### 2.6.2 採用結論 (= 三者 convergent、 divergent ゼロ)
+
+| 論点 | 採用 |
+|---|---|
+| 1 audience 拡張 | **A** = §3 read API の同一 read surface に `claude.ai-participant` audience を additive 追加 (別建て read tool set は signature SOT 二重化で reject)。 load-bearing = signature SOT 単一 + audience list additive 最小 + Phase 2+ Connector 自然合流 (worldview「participant も AI agent」 は secondary support) |
+| 2 scope | **2 tool minimal** = `mindwire_list_threads` + `mindwire_get_thread`。 1 tool minimal は thread_id 手貼り friction 再生で reject、 `get_events`/`status` は participant driver 不在で Phase 2+ Connector/Operator まで spec-only |
+| 3 前倒し配置 | **partial 前倒し + F3-C 独立 feature 化** (§2.6.1) |
+| 4 server 配置 | **A (mindwire-mcp-server 相乗り) + 改名を atomic decision (不可分)**。 改名なし A は naming mismatch + D2-3 rationale (read/write+api_key 分離) tension の独立 2 path で reject。 改名先 = `mindwire-participant` (user 承認、 §2.1.2 表更新済)。 read stub `mindwire-mcp` は D2-3 status quo preserve で touch なし |
+| 5 §3 spec additive | **additive 3 件**: (a) §1.1 audience list に `claude.ai-participant` (b) §3.1 `ThreadSummary.awaiting_from: string\|null` return field (c) §5.5 read consistency model (best-effort snapshot / transactional 非対象)。 `awaiting_from_filter` input filter は client-side filter で同 outcome + driver 不在で **defer**。 schema_version 据え置き (= backward compat) |
+
+#### 2.6.3 仕様増減 override = user 最終承認取得済
+
+公開 MCP API 増 (= 三者合意でも user 最終承認必須、 CLAUDE.md 仕様増減 override rule)。 2026-05-16 user AskUserQuestion で全面承認: (1) 公開 read API 2 tool 追加 (2) spec additive 3 件 (3) server 改名 `mindwire-write`→`mindwire-participant` (user 選択、 `mindwire-cai` 不採用) (4) D2-3 (user 承認済境界) の audience 軸再解釈。
+
+#### 2.6.4 非干渉確認 (= review msg-134 §3b、 実装で verify 済)
+
+- read tool は **file write ゼロ** (`atomic_write_text` / `os.replace` / `toggle_awaiting_from` を呼ばない、 `load_*` は pure read) → sub-PR 3 D3-1 race-gap metric に不変 (gap は seq-file 生成数依存)
+- read stub `mcp_server.py` は **touch なし** → D2-3 status quo preserve 維持
+- `ApiKeyMiddleware` は app-level blanket gate (BaseHTTPMiddleware、 routing 前に全 request 検証) → read tool を同 FastMCP に register しても per-tool bypass なし、 同 bearer gate を自動継承、 auth 機構不弱化。 唯一の帰結 = 同 api_key が read+write 両方を grant = これは §2.6.2 論点 4 の audience 軸 reframe で正当化済 (read だけ欲しい第三者不在)
+
+#### 2.6.5 実装 trace
+
+| commit 単位 | 内容 |
+|---|---|
+| c1 | `src/spirrow_mindwire/mcp_write_server/tools_read.py` (`ReadTools` = `list_threads` net-new enumeration + `get_thread` loader 薄 wrap) + `http.py` `_register_read_tools` 登録。 tool 名は §3 SOT 命名 100% 流用 (`mindwire_list_threads` / `mindwire_get_thread`)。 `tests/test_mcp_read_server.py` |
+| c2 | `docs/mcp-interface.md` §1.1 / §3.1 / §5.5 additive + §8 経緯 |
+| c3 | `SERVER_NAME` `mindwire-write`→`mindwire-participant` 改名 (http.py const + docstring) + 本 §2.1.2 表 / §2.6 + `docs/dogfooding.md` §5 connector 改名 runbook |
 
 ## 3. Schema policy
 

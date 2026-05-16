@@ -118,3 +118,37 @@ Triage order is always **server → connector**.
   overwrite leaves no structural trace; a dogfooding report of "meta
   consistent but message content unexpected" is the signal to revisit
   runtime conflict detection (see `docs/feature-3-design.md` §2.4).
+- read-tool relay (Feature 3-C): the claude.ai-participant side uses
+  `mindwire_list_threads` (find "my-turn" threads — filter on the
+  returned `awaiting_from`) then `mindwire_get_thread` (pull the latest
+  reply body) instead of hand-pasting from Claude Desktop. Both are
+  read-only (zero file writes), so they do not perturb the race-gap
+  metric above.
+
+## 5. Server rename — connector config update (Feature 3-C)
+
+Feature 3-C renames the advertised MCP server name from
+`mindwire-write` to `mindwire-participant` (chatroom
+`T-feat3-read-overview` msg-136 論点 4, user-approved 2026-05-16). The
+server now serves both the 3 write tools **and** the 2
+claude.ai-participant read tools, so a `-write` name is a semantic
+mismatch; the api-key boundary is re-framed onto the audience axis.
+
+**What changed:** only the advertised server name. **Unchanged:** the
+process / CLI (`uv run mindwire-mcp-server`), the bind address
+(`http://127.0.0.1:7400/mcp`), the api-key env var
+(`MINDWIRE_MCP_API_KEY`), and the api-key value.
+
+**Operator action (out-of-repo, one-time):** in
+`%APPDATA%\Claude\claude_desktop_config.json`, rename the connector
+entry key `mindwire-write` → `mindwire-participant` (the `mcp-remote`
+bridge command, URL, and `Authorization: Bearer <token>` header stay
+exactly as they were). Then **fully restart Claude Desktop** (tray →
+Quit, not just close the window) so it reloads the config. Verify in
+the server log that the `mcp-remote` handshake completes and a
+`ListToolsRequest` returns the 5 tools (3 write + 2 read).
+
+If the entry is left as `mindwire-write`, the bridge still connects
+(the JSON key is a client-side label), but the names drift from the
+server's advertised identity and from this runbook — rename it to keep
+operator mental model and logs aligned.
