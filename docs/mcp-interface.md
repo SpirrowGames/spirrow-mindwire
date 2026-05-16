@@ -4,12 +4,15 @@
 
 ## 1. 設計原則
 
-### 1.1 公開スコープ (T02 / T03-Q1 確定)
-公開 MCP は **read-only** に閉じる。 audience は:
+### 1.1 公開スコープ (T02 / T03-Q1 確定、 F3-C で audience 追加)
+公開 MCP の **read API** は read-only に閉じる。 audience は:
 - **Connector**: 外部システム連携 (Magickit ChatRoom / Prismind / Thirdy 等) を担う独立プロセス
 - **Operator**: サービス監視・運用 CLI
+- **claude.ai-participant** (Feature 3-C 追加): claude.ai 側 participant が自分宛て thread を一覧 / 取得し、 claude-code の返信を relay するための audience。 dogfooding harvest で観測した relay friction (= Claude Desktop に thread read 手段がなく本文目視手貼り) の解消が driver。 §3.1 `mindwire_list_threads` + §3.2 `mindwire_get_thread` の 2 tool のみがこの audience 向けに実装活性化される (§3.3 `mindwire_get_events` / §3.4 `mindwire_status` は Connector/Operator driver 出現まで spec-only のまま)
 
 claude-code 自身は MindWire MCP を使わず、 ファイルプロトコル (Write tool で `messages/<NNN>-from-cc.md` を直接書く) で応答する。 これにより 「ファイルベース I/O が核」 (architecture.md 決定 4) と整合。
+
+> **claude.ai-participant audience の server 配置** (Feature 3-C、 chatroom `T-feat3-read-overview` msg-136 論点 4): この audience 向け read tool は read-only stub (`mindwire-mcp`) ではなく、 同 audience (claude.ai-participant) が write tool も正当に要するため **`mindwire-participant` server** (旧 `mindwire-write`、 F3-C で改名) に相乗りする。 api-key 境界が contract 軸 (write) から audience 軸 (participant) に reframe され、 「read だけ欲しい第三者が存在しない」 ことで D2-3 の scope-based access control 不要性が回復する。 read stub (`mindwire-mcp`) は D2-3 status quo preserve のまま touch しない。 詳細は `docs/feature-3-design.md` §2.1。
 
 ### 1.2 同期 / 非同期方針 (T03-Q4 確定)
 すべての tool は **同期 return**。 「変化を待つ」 ニーズは Connector 側の polling で実現 (秒〜分レイテンシ許容と整合)。 long-poll / webhook は実装しない (T02 「lifecycle 通知は pull 専用」 と整合)。
@@ -58,12 +61,17 @@ ThreadSummary:
   thread_id: string (ULID)
   title: string
   status: string
+  awaiting_from: string | null     # F3-C additive; 次に応答すべき participant、 terminal 状態で null
   participants: array<string>
   created_at: string (UTC ISO 8601)
   updated_at: string
   tags: array<string>
   message_count: int
 ```
+
+> **`awaiting_from` return field** (Feature 3-C additive、 chatroom `T-feat3-read-overview` msg-136 論点 5): list 段階で turn 判定可 = participant が `get_thread` を都度叩かずに自分の turn の thread を絞り込める (N+1 削減)。 型は `string | null` (`Participant | None`、 terminal 状態で `null`)。 schema_version 据え置き (= additive、 §5.4 policy 整合)。
+>
+> **`awaiting_from_filter` input filter は意図的に defer** (msg-136 論点 5): server-side の `awaiting_from_filter` 入力は追加しない。 dogfooding scale では participant の thread 数が僅少で、 返却された `awaiting_from` の client-side filter で同 outcome が得られる = server-side filter は driver 不在の speculative surface。 driver 出現時に additive 追加可能 (schema_version 据え置き)。
 
 **エラー**:
 - `invalid_argument`: filter 引数の型不正、 ULID format 不正 (id_filter 内)、 created_after > created_before 等
@@ -261,6 +269,16 @@ error:
 - 互換性を保つ変更 (フィールド追加・新 enum 値追加) は version 据え置き
 - 破壊変更は新 tool (`_v2` 等) で並行運用、 旧 tool は次のマイナー版まで維持
 
+### 5.5 Read consistency model (Feature 3-C 追記)
+
+```
+# read is best-effort snapshot; transactional reads are out of scope
+```
+
+read tool (`mindwire_list_threads` / `mindwire_get_thread`) は **best-effort snapshot** を返す。 watcher / write tool が同 thread に書き込んでいる最中の read は、 stale-but-complete な状態を観測し得る (= `atomic_write_text` の `*.tmp` → `os.replace` 保証により torn file は観測されない、 loader contract)。 次回 call で convergent (= eventual consistency)。
+
+transactional read (= multi-thread / multi-message を 1 つの一貫した snapshot として atomic に読む) は **scope 外**。 participant の relay 用途 (= 最新 message を取得して貼る) には best-effort snapshot で十分。 cross-process write race contract は `docs/feature-2-design.md` §3.6 / `docs/feature-3-design.md` §2.1.3 (D2-6 invariant) と同じ = read tool は file write を一切行わないため sub-PR 3 race-gap metric に影響しない。
+
 ## 6. Connector polling パターン (典型例)
 
 ```python
@@ -326,5 +344,6 @@ Phase 0 では `Message` に `tags` を持たない (thread 単位の `tags` の
 - **T03-Q3** (signature 詳細): 個別 signature を確定 (§3 参照)
 - **T03-Q4** (同期 / エラー / バージョニング): sync only + 構造化エラー + return data の schema_version で確定
 - **T03-Q5** (Claude.ai レビュー): 6 観点中 #1 (Event 構造) を blocker として解決、 #2-5 を Phase 0 に取り込み (`last_event_at`, `id_filter`, filesystem 明記、 OR/AND/inclusive 明示)、 #6 を Future Work として記録
+- **F3-C** (claude.ai-participant audience 追加、 chatroom `T-feat3-read-overview` msg-136 = integrator decide、 三者 convergent + user 最終承認 2026-05-16、 GitHub tracker #48): §1.1 に audience `claude.ai-participant` 追加、 `mindwire_list_threads` + `mindwire_get_thread` の 2 tool を `mindwire-participant` server (旧 `mindwire-write`、 同 PR で改名) に相乗り実装活性化。 spec additive 3 件 = (a) §1.1 audience list (b) §3.1 `ThreadSummary.awaiting_from: string\|null` return field (c) §5.5 read consistency model。 `awaiting_from_filter` input filter / §3.3 `mindwire_get_events` / §3.4 `mindwire_status` は driver 不在で defer (spec SOT は維持、 additive 活性化余地)。 signature/命名は §3 SOT を 100% 流用、 schema_version 据え置き
 
-詳細議論: ChatRoom thread `T-mcp-interface-review` (msg-008 〜 msg-012)。
+詳細議論: ChatRoom thread `T-mcp-interface-review` (msg-008 〜 msg-012)、 F3-C は `T-feat3-read-overview` (msg-133 〜 msg-136)。
