@@ -257,6 +257,57 @@ async def test_dispatcher_skips_toggle_when_no_write_reply_on_disk(
 
 
 @pytest.mark.anyio
+async def test_dispatcher_skips_toggle_when_is_error_and_no_write_reply(
+    tmp_path: Path,
+) -> None:
+    """``result.is_error=True`` with no reply on disk → no toggle, no event.
+
+    PR #40 C2 carry: ``test_dispatcher_skips_toggle_when_no_write_reply_on_disk``
+    pins the ``is_error=False`` skip path; this is its ``is_error=True``
+    counterpart. The two together pin that the toggle gate is governed
+    **solely** by ``_write_reply_completed`` (on-disk reply at
+    ``next_seq``, the docs/feature-2-design.md §3.5 SOT) and is
+    *decoupled* from the SDK ``ResultMessage.is_error`` flag — the only
+    place ``is_error`` flows is the InvokeEnd ``exit_code``. This guards
+    against a future regression that couples the toggle to ``is_error``
+    (e.g. an early ``if result.is_error: return`` that would also skip
+    toggling even when a reply *did* land, or — symmetrically — toggling
+    on SDK success despite no reply)."""
+    layout = _seed_thread(tmp_path)
+    err_result = InvokeResult(
+        is_error=True,
+        duration_ms=50,
+        text_output="",
+        result_text=None,
+        stop_reason="error",
+    )
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=_invoker({}, err_result),  # error, and does NOT write reply
+    )
+
+    await dispatcher.handle(_event())
+
+    # Meta unchanged: still awaiting claude-code (no reply landed).
+    new_meta = ThreadMeta.model_validate(
+        yaml.safe_load(layout.meta_path.read_text(encoding="utf-8"))
+    )
+    assert new_meta.awaiting_from == "claude-code"
+
+    # invoke.start + invoke.end only — no toggle event — and is_error
+    # still surfaces as exit_code=1 (decoupled concerns).
+    log_lines = [
+        json.loads(line) for line in layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    types = [entry["type"] for entry in log_lines]
+    assert types == ["claude_code.invoke.start", "claude_code.invoke.end"]
+    assert "thread.awaiting_from.changed" not in types
+    assert log_lines[-1]["exit_code"] == 1
+
+
+@pytest.mark.anyio
 async def test_dispatcher_skips_when_latest_from_claude_code(tmp_path: Path) -> None:
     """Don't loop on our own write_reply output."""
     _seed_thread(tmp_path, sender="claude-code")
