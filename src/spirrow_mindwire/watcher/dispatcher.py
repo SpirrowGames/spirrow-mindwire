@@ -305,6 +305,9 @@ class ThreadDispatcher:
             mcp_server = build_mindwire_mcp_server(
                 layout=layout,
                 next_seq=next_seq,
+                # ``sender=`` is build_mindwire_mcp_server's public param
+                # (out of PR #51 C1 scope: the rename is dispatcher-local);
+                # only the argument value follows the ``replier`` rename.
                 sender=replier,
                 recipient=recipient,
                 phanthand_client=self._phanthand_client,
