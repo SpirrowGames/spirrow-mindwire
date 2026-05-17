@@ -384,6 +384,7 @@ allowed_tool_profile = "readonly"   # "minimal" | "readonly"
 - Prismind による全ログ indexing
 - Thirdy 連携 (Spec 抽出)
 - Connector 用の安定 I/F 仕様 (`schema_version` 約束を含む)
+- 大型 feature の sub-PR chain merge 運用は [`chain-merge-pattern.md`](chain-merge-pattern.md) (= contract integration checklist meta-process、 Feature 2 origin) を参照
 
 ## 9. 未決事項 / 将来論点 (記録のみ、 T02 では decide しない)
 
