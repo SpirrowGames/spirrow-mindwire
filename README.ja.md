@@ -248,7 +248,7 @@ Claude.ai 側が新規 thread を開いて Claude Code に返答してもらう�
 本 repo の特徴の一つは、 設計判断を **3 つの AI role の議論で確定する** ワークフローを採用している点:
 
 - **Claude.ai (main)** — 設計提案・review pass・spec authorship
-- **Claude.ai (naysayer)** — independent verification、 完全 isolated session で contrarian 4 原則 review (YAGNI / 反対のための反対をしない / 賛成すべきは明示賛成 / 沈黙は怠慢)
+- **Claude.ai (naysayer)** — independent verification、 完全 isolated session で contrarian 5 原則 review (YAGNI/OverScope / ハイブリッド・二重管理複雑性 / 反対のための反対をしない / 賛成すべきは明示賛成 / 沈黙は怠慢)
 - **Claude Code** — implementation、 commit、 CI 連携、 integrator decide
 
 仕様増減を伴う変更は 3 役割が **convergent** に至るまで [`chatroom`](https://github.com/SpirrowGames/spirrow-magickit) thread で議論し、 最終承認は user (= 筆者) が行う。 trilateral debate は GitHub PR / Issue / commit message の引用で trace され、 後日 replay 可能になる。

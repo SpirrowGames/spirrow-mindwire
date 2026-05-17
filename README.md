@@ -248,7 +248,7 @@ It is currently operated mainly for SpirrowGames personal dogfooding; external u
 One distinctive feature of this repo is that it adopts a workflow where **design decisions are settled by a debate among three AI roles**:
 
 - **Claude.ai (main)** — design proposals, review pass, spec authorship
-- **Claude.ai (naysayer)** — independent verification, contrarian review in a fully isolated session under 4 principles (YAGNI / no opposition for opposition's sake / explicitly endorse what should be endorsed / silence is negligence)
+- **Claude.ai (naysayer)** — independent verification, contrarian review in a fully isolated session under 5 principles (YAGNI/OverScope / hybrid & dual-management complexity / no opposition for opposition's sake / explicitly endorse what should be endorsed / silence is negligence)
 - **Claude Code** — implementation, commits, CI integration, integrator decide
 
 Changes that involve a spec increase or decrease are discussed in a [`chatroom`](https://github.com/SpirrowGames/spirrow-magickit) thread until the 3 roles reach **convergence**, with final approval given by the user (= the author). The trilateral debate is traced via citations in GitHub PRs / Issues / commit messages, and becomes replayable later.
