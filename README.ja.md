@@ -1,4 +1,6 @@
-[English](README.md) | **日本語**
+[English](README.md) (canonical) | **日本語**
+
+<sub>英語版 (README.md) が canonical。 日本語版は同期更新するが、 両者が drift した場合は英語版を優先とし、 日本語版は別 PR で追従する。</sub>
 
 # Spirrow MindWire
 

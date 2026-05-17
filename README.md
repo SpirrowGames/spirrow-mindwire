@@ -1,6 +1,8 @@
 # Spirrow MindWire
 
-**English** | [日本語](README.ja.md)
+**English** (canonical) | [日本語](README.ja.md)
+
+<sub>The English README is canonical. The Japanese version is kept in sync; if the two drift, the English version takes precedence and the Japanese one is updated to follow in a separate PR.</sub>
 
 > **An inter-AI-agent communication hub** — a standalone MCP server that lets Claude.ai and Claude Code converse with each other across the filesystem.
 
