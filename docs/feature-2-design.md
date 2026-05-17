@@ -468,7 +468,7 @@ source code 変更なし (= dispatcher / lifecycle / schema 全て既実装の�
   gh pr create --base develop/feat-robustness --head feat/<next>
   ```
 - 全 4 sub-PR squash 後に develop を main へ squash merge
-- 各 push 前に local で `uv run ruff format --check` + `mypy src/` 確認 (CI fail 防止)
+- 各 push 前に local で `uv run ruff format --check` + `mypy src tests` 確認 (CI fail 防止)
 - spirrowgames-ops APPROVE は新規 PR で引き継がれない (元 PR 引用で対応、 PR #4 と同 pattern)
 
 ### 5.2.1 sub-PR 間 contract integration checklist
