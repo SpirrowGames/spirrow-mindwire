@@ -41,7 +41,10 @@ class SpawnContext:
     these callbacks (I1 knowledge boundary).
 
     - ``on_reply``: emit a :class:`~value_objects.ReplyDraft` back to the
-      dispatcher (which completes + posts it).
+      dispatcher (which completes + posts it). Adapters MUST call this
+      **synchronously within ``deliver_event``** (not from a detached
+      background task), so the dispatcher's per-session serialization
+      sequences reply ordering and the I5 ``reply_seq`` counter.
     - ``on_event_log``: append an observational :class:`~value_objects.Event`
       to the flat JSONL log. **Observational only** (I7): no control-flow
       semantics; the dispatcher isolates a raising callback and never lets

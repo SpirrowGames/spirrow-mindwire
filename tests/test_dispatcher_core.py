@@ -1,0 +1,335 @@
+"""Tests for the Dispatcher core (ADR-06 §4, T13 PR-D Step 2)."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkAdapter
+from spirrow_mindwire.dispatcher.core import (
+    Dispatcher,
+    NoQualifiedAdapterError,
+    UnknownSessionError,
+)
+from spirrow_mindwire.dispatcher.event_log import (
+    EVENT_FIELD_AUTHOR,
+    EVENT_FIELD_MODEL_ID,
+    EVENT_KIND_REPLY_SENT,
+    reply_sent_event,
+)
+from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
+from spirrow_mindwire.ports import SpawnContext
+from spirrow_mindwire.ulid_util import new_ulid
+from spirrow_mindwire.value_objects import (
+    Capability,
+    ChatroomEvent,
+    Event,
+    EventType,
+    HealthStatus,
+    NewMessagePayload,
+    ReplyDraft,
+    Role,
+    SessionHandle,
+    SessionState,
+    ThreadRef,
+)
+
+_TS = datetime(2026, 5, 22, tzinfo=UTC)
+
+
+def _thread_ref() -> ThreadRef:
+    return ThreadRef(project_id="spirrow-mindwire", thread_id="01JTHREAD", chatroom_uri="mc://t/1")
+
+
+def _event(
+    *, event_id: str = "01JEVENT", author: str = "human", msg_id: str = "m1"
+) -> ChatroomEvent:
+    return ChatroomEvent(
+        event_id=event_id,
+        event_type=EventType.NEW_MESSAGE,
+        thread_ref=_thread_ref(),
+        occurred_at=_TS,
+        payload=NewMessagePayload(msg_id=msg_id, author=author, body="hi", parent_msg_id=None),
+    )
+
+
+class _FakeGateway:
+    def __init__(self) -> None:
+        self.posts: list[dict[str, Any]] = []
+
+    async def post_reply(
+        self,
+        thread_ref: ThreadRef,
+        *,
+        author: Role,
+        body: str,
+        reply_to_msg_id: str | None,
+        idempotency_key: str,
+    ) -> str:
+        self.posts.append(
+            {
+                "author": author,
+                "body": body,
+                "reply_to_msg_id": reply_to_msg_id,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        return f"posted-{len(self.posts)}"
+
+
+class _ReplyingAdapter:
+    """Fake adapter that emits one reply via ctx.on_reply on each delivery."""
+
+    adapter_id = "fake-replier"
+    capabilities = frozenset({Capability.READ_THREAD, Capability.POST_REPLY})
+
+    def __init__(self, *, reply_body: str = "ok") -> None:
+        self._reply_body = reply_body
+        self._ctx: SpawnContext | None = None
+        self.deliver_calls = 0
+        self.max_concurrent = 0
+        self._active = 0
+
+    async def spawn(self, thread_ref: ThreadRef, role: Role, ctx: SpawnContext) -> SessionHandle:
+        self._ctx = ctx
+        return SessionHandle(
+            session_id=new_ulid(),
+            adapter_id=self.adapter_id,
+            thread_ref=thread_ref,
+            role=role,
+            started_at=_TS,
+        )
+
+    async def deliver_event(self, handle: SessionHandle, event: ChatroomEvent) -> None:
+        self._active += 1
+        self.max_concurrent = max(self.max_concurrent, self._active)
+        self.deliver_calls += 1
+        try:
+            await asyncio.sleep(0)  # yield so any interleaving would surface
+            assert self._ctx is not None
+            await self._ctx.on_reply(
+                ReplyDraft(
+                    body=self._reply_body,
+                    reply_to_msg_id=event.payload.msg_id,
+                    adapter_metadata={"model_id": "fake-model"},
+                )
+            )
+        finally:
+            self._active -= 1
+
+    async def halt(self, handle: SessionHandle, *, grace: timedelta = timedelta(seconds=5)) -> None:
+        return None
+
+    async def health(self, handle: SessionHandle) -> HealthStatus:
+        return HealthStatus(state=SessionState.IDLE, last_active_at=_TS, error=None, details={})
+
+
+def _registry_with(adapter: Any) -> InMemoryAdapterRegistry:
+    reg = InMemoryAdapterRegistry()
+    reg.register(adapter)
+    return reg
+
+
+@pytest.mark.anyio
+async def test_spawn_and_dispatch_posts_reply() -> None:
+    adapter = _ReplyingAdapter(reply_body="hello")
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    await disp.dispatch(handle, _event(msg_id="m9"))
+    assert len(gateway.posts) == 1
+    post = gateway.posts[0]
+    assert post["author"] is Role.PROPOSER  # I3: author = role
+    assert post["body"] == "hello"
+    assert post["reply_to_msg_id"] == "m9"
+    assert post["idempotency_key"] == f"{handle.session_id}:1"  # I5
+
+
+@pytest.mark.anyio
+async def test_idempotency_key_increments_per_session() -> None:
+    adapter = _ReplyingAdapter()
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    await disp.dispatch(handle, _event(event_id="e1"))
+    await disp.dispatch(handle, _event(event_id="e2"))
+    keys = [p["idempotency_key"] for p in gateway.posts]
+    assert keys == [f"{handle.session_id}:1", f"{handle.session_id}:2"]
+
+
+@pytest.mark.anyio
+async def test_dedup_drops_duplicate_event_id() -> None:
+    adapter = _ReplyingAdapter()
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    await disp.dispatch(handle, _event(event_id="dup"))
+    await disp.dispatch(handle, _event(event_id="dup"))  # I4: skipped
+    assert adapter.deliver_calls == 1
+    assert len(gateway.posts) == 1
+
+
+@pytest.mark.anyio
+async def test_per_session_fifo_serializes_delivery() -> None:
+    adapter = _ReplyingAdapter()
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    await asyncio.gather(
+        disp.dispatch(handle, _event(event_id="e1")),
+        disp.dispatch(handle, _event(event_id="e2")),
+    )
+    # I9: per-session lock prevents deliver_event from interleaving.
+    assert adapter.max_concurrent == 1
+    assert adapter.deliver_calls == 2
+
+
+@pytest.mark.anyio
+async def test_event_sink_failure_is_isolated_i7() -> None:
+    adapter = _ReplyingAdapter()
+    gateway = _FakeGateway()
+
+    async def bad_sink(_event: Event) -> None:
+        raise RuntimeError("sink boom")
+
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway, event_sink=bad_sink)
+    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    # I7: a raising event-log sink must NOT break the main flow.
+    await disp.dispatch(handle, _event())
+    assert len(gateway.posts) == 1  # reply still posted despite the sink failure
+
+
+@pytest.mark.anyio
+async def test_reply_sent_event_uses_anchor6_keys() -> None:
+    adapter = _ReplyingAdapter()
+    gateway = _FakeGateway()
+    events: list[Event] = []
+
+    async def sink(event: Event) -> None:
+        events.append(event)
+
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway, event_sink=sink)
+    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    await disp.dispatch(handle, _event())
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.kind == EVENT_KIND_REPLY_SENT
+    # anchor #6: unified key names.
+    assert ev.fields[EVENT_FIELD_AUTHOR] == "proposer"
+    assert ev.fields[EVENT_FIELD_MODEL_ID] == "fake-model"
+
+
+@pytest.mark.anyio
+async def test_spawn_role_no_qualified_adapter_raises() -> None:
+    # _ReplyingAdapter lacks NAYSAYER_QUALIFIED → no naysayer candidate.
+    disp = Dispatcher(registry=_registry_with(_ReplyingAdapter()), gateway=_FakeGateway())
+    with pytest.raises(NoQualifiedAdapterError):
+        await disp.spawn_role(_thread_ref(), Role.NAYSAYER)
+
+
+@pytest.mark.anyio
+async def test_dispatch_unknown_handle_raises() -> None:
+    disp = Dispatcher(registry=_registry_with(_ReplyingAdapter()), gateway=_FakeGateway())
+    stray = SessionHandle(
+        session_id="01JSTRAY",
+        adapter_id="x",
+        thread_ref=_thread_ref(),
+        role=Role.PROPOSER,
+        started_at=_TS,
+    )
+    with pytest.raises(UnknownSessionError):
+        await disp.dispatch(stray, _event())
+
+
+# ----- live T11 ↔ T13 cross-check (real ClaudeCodeSdkAdapter) -----------------
+
+
+class _FakeSdkClient:
+    def __init__(self, responses: list[Any]) -> None:
+        self._responses = responses
+
+    async def connect(self) -> None:
+        return None
+
+    async def query(self, prompt: str) -> None:
+        return None
+
+    async def receive_response(self) -> AsyncIterator[Any]:
+        for message in self._responses:
+            yield message
+
+    async def interrupt(self) -> None:
+        return None
+
+    async def disconnect(self) -> None:
+        return None
+
+
+@pytest.mark.anyio
+async def test_live_claude_code_adapter_with_dispatcher(tmp_path: Path) -> None:
+    def factory(_options: Any) -> Any:
+        return _FakeSdkClient(
+            [
+                AssistantMessage(content=[TextBlock(text="real reply")], model="m"),
+                ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="s",
+                    stop_reason="end_turn",
+                    result="ok",
+                ),
+            ]
+        )
+
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=factory)
+    registry = InMemoryAdapterRegistry()
+    registry.register(adapter)
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=registry, gateway=gateway)
+
+    # ADR-05 §5 architecture-level independence: claude-code (same model family
+    # as main, no NAYSAYER_QUALIFIED) is excluded from the naysayer slot.
+    with pytest.raises(NoQualifiedAdapterError):
+        await disp.spawn_role(_thread_ref(), Role.NAYSAYER)
+
+    # …but it serves the proposer slot end-to-end (real adapter + dispatcher).
+    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    await disp.dispatch(handle, _event(msg_id="m1"))
+    assert len(gateway.posts) == 1
+    assert gateway.posts[0]["author"] is Role.PROPOSER
+    assert gateway.posts[0]["body"] == "real reply"
+
+
+def test_reply_sent_event_normalizes_missing_model_id() -> None:
+    handle = SessionHandle(
+        session_id="s",
+        adapter_id="a",
+        thread_ref=_thread_ref(),
+        role=Role.PROPOSER,
+        started_at=_TS,
+    )
+    # model_id present-but-None must render as "" (not the string "None").
+    ev_none = reply_sent_event(
+        handle,
+        ReplyDraft(body="x", reply_to_msg_id=None, adapter_metadata={"model_id": None}),
+        posted_msg_id="p",
+        idempotency_key="s:1",
+    )
+    assert ev_none.fields[EVENT_FIELD_MODEL_ID] == ""
+    # missing key also normalizes to "".
+    ev_missing = reply_sent_event(
+        handle,
+        ReplyDraft(body="x", reply_to_msg_id=None, adapter_metadata={}),
+        posted_msg_id="p",
+        idempotency_key="s:1",
+    )
+    assert ev_missing.fields[EVENT_FIELD_MODEL_ID] == ""
