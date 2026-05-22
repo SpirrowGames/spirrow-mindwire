@@ -34,8 +34,8 @@ def reply_sent_event(
     """Build the observational ``reply.sent`` Event log entry (anchor #6 keys).
 
     ``author`` / ``model_id`` use the unified key constants. ``model_id`` is
-    read from the adapter's ``adapter_metadata`` (empty string if the adapter
-    did not report one).
+    read from the adapter's ``adapter_metadata`` (empty string if missing or
+    ``None``).
     """
     return Event(
         event_id=new_ulid(),
@@ -43,7 +43,7 @@ def reply_sent_event(
         kind=EVENT_KIND_REPLY_SENT,
         fields={
             EVENT_FIELD_AUTHOR: handle.role.value,
-            EVENT_FIELD_MODEL_ID: str(draft.adapter_metadata.get("model_id", "")),
+            EVENT_FIELD_MODEL_ID: str(draft.adapter_metadata.get("model_id") or ""),
             EVENT_FIELD_SESSION_ID: handle.session_id,
             EVENT_FIELD_ADAPTER_ID: handle.adapter_id,
             EVENT_FIELD_POSTED_MSG_ID: posted_msg_id,

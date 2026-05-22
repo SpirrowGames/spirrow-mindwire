@@ -21,6 +21,7 @@ from spirrow_mindwire.dispatcher.event_log import (
     EVENT_FIELD_AUTHOR,
     EVENT_FIELD_MODEL_ID,
     EVENT_KIND_REPLY_SENT,
+    reply_sent_event,
 )
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
 from spirrow_mindwire.ports import SpawnContext
@@ -306,3 +307,29 @@ async def test_live_claude_code_adapter_with_dispatcher(tmp_path: Path) -> None:
     assert len(gateway.posts) == 1
     assert gateway.posts[0]["author"] is Role.PROPOSER
     assert gateway.posts[0]["body"] == "real reply"
+
+
+def test_reply_sent_event_normalizes_missing_model_id() -> None:
+    handle = SessionHandle(
+        session_id="s",
+        adapter_id="a",
+        thread_ref=_thread_ref(),
+        role=Role.PROPOSER,
+        started_at=_TS,
+    )
+    # model_id present-but-None must render as "" (not the string "None").
+    ev_none = reply_sent_event(
+        handle,
+        ReplyDraft(body="x", reply_to_msg_id=None, adapter_metadata={"model_id": None}),
+        posted_msg_id="p",
+        idempotency_key="s:1",
+    )
+    assert ev_none.fields[EVENT_FIELD_MODEL_ID] == ""
+    # missing key also normalizes to "".
+    ev_missing = reply_sent_event(
+        handle,
+        ReplyDraft(body="x", reply_to_msg_id=None, adapter_metadata={}),
+        posted_msg_id="p",
+        idempotency_key="s:1",
+    )
+    assert ev_missing.fields[EVENT_FIELD_MODEL_ID] == ""

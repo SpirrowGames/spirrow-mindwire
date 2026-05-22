@@ -117,8 +117,9 @@ class Dispatcher:
         await session.adapter.halt(handle)
 
     async def _handle_reply(self, session: _DispatchSession, draft: ReplyDraft) -> None:
-        # Runs inside the adapter's deliver_event (under the session lock), so
-        # reply_seq increments are serialized → I5 monotonic per session.
+        # Runs inside the adapter's deliver_event (under the session lock) per
+        # the SpawnContext.on_reply contract, so reply_seq increments are
+        # serialized → I5 monotonic per session.
         if session.handle is None:  # pragma: no cover - handle set before any delivery
             raise RuntimeError("reply emitted before the session handle was assigned")
         handle = session.handle
