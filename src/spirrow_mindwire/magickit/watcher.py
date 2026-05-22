@@ -72,7 +72,9 @@ class ChatroomWatcher:
         self._dispatcher = dispatcher
         self._watches = list(watches)
         self._handles: dict[WatchSpec, SessionHandle] = {}
-        self._seen_msg_ids: set[str] = set()
+        # Seen keys are thread-namespaced (== event_id) so the same msg_id in
+        # two watched threads is not cross-deduped.
+        self._seen: set[str] = set()
 
     async def start(self) -> None:
         """Spawn one adapter session per watch (call once before polling)."""
@@ -103,9 +105,12 @@ class ChatroomWatcher:
         # numeric msg-id order = chronological = occurred_at order (msg-190 note 1).
         for msg in messages:
             msg_id = msg.get("msg_id") if isinstance(msg, dict) else None
-            if not isinstance(msg_id, str) or msg_id in self._seen_msg_ids:
+            if not isinstance(msg_id, str):
                 continue
-            self._seen_msg_ids.add(msg_id)
+            seen_key = f"{watch.thread_ref.thread_id}:{msg_id}"  # == event_id
+            if seen_key in self._seen:
+                continue
+            self._seen.add(seen_key)
             await self._dispatcher.dispatch(handle, self._to_event(watch.thread_ref, msg))
             count += 1
         return count

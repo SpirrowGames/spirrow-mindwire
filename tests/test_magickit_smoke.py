@@ -2,8 +2,10 @@
 
 Marked ``manual`` → excluded from CI (``addopts -m "not manual"``); run with
 ``uv run pytest -m manual``. Requires the local no-auth magickit MCP reachable
-at ``MINDWIRE_MAGICKIT_MCP_URL`` (default ``http://100.79.84.62:8117/mcp``,
-Tailscale — chatroom thread msg-193).
+at the URL from :func:`~spirrow_mindwire.magickit.client.magickit_mcp_url`
+(``MINDWIRE_MAGICKIT_MCP_URL`` env, else the package default). The default's
+IP is environment-dependent — see ``magickit/client.py`` for the canonical
+value; set the env var to point elsewhere (chatroom thread msg-193).
 
 Scope (flagged for ADR-verify): the automated case is a **read-only
 connectivity check** (``chatroom_list_threads``). The full §8 round-trip —

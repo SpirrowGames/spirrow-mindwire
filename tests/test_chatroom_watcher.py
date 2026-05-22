@@ -168,3 +168,22 @@ async def test_fresh_watcher_dedups_via_stable_event_id() -> None:
     await w2.poll_once()  # dispatches the same stable event_id again...
     assert len(adapter.delivered) == 1  # ...dispatcher dedup → no second delivery
     assert len(gateway.posts) == 1
+
+
+@pytest.mark.anyio
+async def test_multi_watch_same_msg_id_not_cross_deduped() -> None:
+    # The watcher seen-set is thread-namespaced: the same msg_id in two watched
+    # threads must NOT be cross-deduped (both dispatch as distinct event_ids).
+    adapter = _RecordingReplyAdapter()
+    gateway = _FakeGateway()
+    dispatcher = _dispatcher_with(adapter, gateway)
+    tr_x = ThreadRef(project_id="p", thread_id="T-x", chatroom_uri="mc://x")
+    tr_y = ThreadRef(project_id="p", thread_id="T-y", chatroom_uri="mc://y")
+    watcher = ChatroomWatcher(
+        _FakeMcp([_msg("msg-1")]),  # same msg_id surfaced for every watched thread
+        dispatcher,
+        [WatchSpec(tr_x, Role.PROPOSER), WatchSpec(tr_y, Role.PROPOSER)],
+    )
+    await watcher.start()
+    assert await watcher.poll_once() == 2  # both dispatched (not cross-deduped)
+    assert {e.event_id for e in adapter.delivered} == {"T-x:msg-1", "T-y:msg-1"}
