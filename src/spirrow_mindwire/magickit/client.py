@@ -32,7 +32,8 @@ _DEFAULT_MAGICKIT_MCP_URL = "http://100.79.84.62:8117/mcp"
 
 def magickit_mcp_url() -> str:
     """Resolve the magickit MCP URL from ``MINDWIRE_MAGICKIT_MCP_URL`` (env) or the default."""
-    return os.environ.get("MINDWIRE_MAGICKIT_MCP_URL", _DEFAULT_MAGICKIT_MCP_URL)
+    # Treat unset *or empty* as "use default" (an empty URL would fail confusingly).
+    return os.environ.get("MINDWIRE_MAGICKIT_MCP_URL") or _DEFAULT_MAGICKIT_MCP_URL
 
 
 class MagickitMcpError(RuntimeError):
@@ -64,8 +65,11 @@ def parse_tool_result(result: Any) -> Any:
     for block in getattr(result, "content", None) or []:
         text = getattr(block, "text", None)
         if isinstance(text, str):
-            return json.loads(text)
-    raise MagickitMcpError(f"magickit tool returned no parseable content: {result!r}")
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                continue  # not JSON — try the next content block
+    raise MagickitMcpError(f"magickit tool returned no JSON content: {result!r}")
 
 
 class StreamableHttpChatroomMcp:

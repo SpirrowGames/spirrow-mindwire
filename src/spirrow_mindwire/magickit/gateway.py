@@ -13,10 +13,11 @@ Two integration-semantics choices flagged for ADR-verify:
    (``reply_msg_type``, default ``"report"``).
 2. **idempotency_key (I5)** — magickit ``chatroom_post_message`` exposes no
    idempotency parameter, so the dispatcher-computed key cannot be passed to
-   the ChatRoom. ChatRoom-side dedup stays Phase 2 (the original ADR-06 I5
-   note: "ChatRoom 側 dedup サポートが未実装なら Phase 2 対応"). The key is
-   not silently dropped — it is accepted and available for a future magickit
-   field; ChatRoom-side dedup is simply not yet enforced.
+   the ChatRoom. The key is **accepted for contract compatibility but
+   currently unused** (there is no magickit field to carry it). ChatRoom-side
+   dedup stays Phase 2 (the original ADR-06 I5 note: "ChatRoom 側 dedup
+   サポートが未実装なら Phase 2 対応") and is wired in when magickit adds an
+   idempotency field.
 """
 
 from __future__ import annotations
@@ -55,8 +56,9 @@ class MagickitChatroomGateway:
         idempotency_key: str,
     ) -> str:
         # idempotency_key is computed by the dispatcher (I5) but magickit
-        # chatroom_post_message has no idempotency field → ChatRoom-side dedup
-        # is Phase 2 (original ADR-06 I5 note). Not passed; not dropped silently.
+        # chatroom_post_message has no idempotency field, so it is accepted for
+        # contract compatibility but currently unused → ChatRoom-side dedup is
+        # Phase 2 (original ADR-06 I5 note).
         _ = idempotency_key
         arguments: dict[str, Any] = {
             "project": thread_ref.project_id,

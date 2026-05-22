@@ -111,3 +111,15 @@ def test_parse_tool_result_is_error_raises() -> None:
 def test_parse_tool_result_no_content_raises() -> None:
     with pytest.raises(MagickitMcpError):
         parse_tool_result(_FakeToolResult(content=[]))
+
+
+def test_parse_tool_result_skips_invalid_json_block() -> None:
+    # An invalid-JSON text block is skipped; a later valid block wins.
+    result = _FakeToolResult(content=[_FakeTextBlock("not json"), _FakeTextBlock('{"ok": 1}')])
+    assert parse_tool_result(result) == {"ok": 1}
+
+
+def test_parse_tool_result_all_invalid_json_raises_magickit_error() -> None:
+    # Invalid JSON surfaces as MagickitMcpError, not a raw JSONDecodeError.
+    with pytest.raises(MagickitMcpError):
+        parse_tool_result(_FakeToolResult(content=[_FakeTextBlock("not json")]))
