@@ -73,6 +73,7 @@ class _RecordingReplyAdapter:
     def __init__(self) -> None:
         self.ctx: SpawnContext | None = None
         self.delivered: list[ChatroomEvent] = []
+        self.halted: list[SessionHandle] = []
 
     async def spawn(self, thread_ref: ThreadRef, role: Role, ctx: SpawnContext) -> SessionHandle:
         self.ctx = ctx
@@ -92,7 +93,7 @@ class _RecordingReplyAdapter:
         )
 
     async def halt(self, handle: SessionHandle, *, grace: timedelta = timedelta(seconds=5)) -> None:
-        return None
+        self.halted.append(handle)
 
     async def health(self, handle: SessionHandle) -> HealthStatus:
         return HealthStatus(state=SessionState.IDLE, last_active_at=_TS, error=None, details={})
@@ -112,7 +113,7 @@ async def test_start_spawns_session() -> None:
         _dispatcher_with(adapter, _FakeGateway()),
         [WatchSpec(_thread_ref(), Role.PROPOSER)],
     )
-    await watcher.start()
+    await watcher.start(baseline=False)
     assert adapter.ctx is not None  # session spawned
 
 
@@ -125,7 +126,7 @@ async def test_poll_dispatches_new_messages_in_order() -> None:
         _dispatcher_with(adapter, gateway),
         [WatchSpec(_thread_ref(), Role.PROPOSER)],
     )
-    await watcher.start()
+    await watcher.start(baseline=False)
     assert await watcher.poll_once() == 2
     # fork 3 (msg-198): thread-namespaced stable event_id, in occurred_at order.
     assert [e.event_id for e in adapter.delivered] == ["T-x:msg-1", "T-x:msg-2"]
@@ -141,7 +142,7 @@ async def test_repoll_dedups_seen_messages() -> None:
         _dispatcher_with(adapter, gateway),
         [WatchSpec(_thread_ref(), Role.PROPOSER)],
     )
-    await watcher.start()
+    await watcher.start(baseline=False)
     assert await watcher.poll_once() == 1
     assert await watcher.poll_once() == 0  # already seen
     assert len(adapter.delivered) == 1
@@ -159,12 +160,12 @@ async def test_fresh_watcher_dedups_via_stable_event_id() -> None:
     messages = [_msg("msg-1")]
 
     w1 = ChatroomWatcher(_FakeMcp(messages), dispatcher, [WatchSpec(_thread_ref(), Role.PROPOSER)])
-    await w1.start()
+    await w1.start(baseline=False)
     assert await w1.poll_once() == 1
     assert len(adapter.delivered) == 1
 
     w2 = ChatroomWatcher(_FakeMcp(messages), dispatcher, [WatchSpec(_thread_ref(), Role.PROPOSER)])
-    await w2.start()
+    await w2.start(baseline=False)
     await w2.poll_once()  # dispatches the same stable event_id again...
     assert len(adapter.delivered) == 1  # ...dispatcher dedup → no second delivery
     assert len(gateway.posts) == 1
@@ -184,6 +185,52 @@ async def test_multi_watch_same_msg_id_not_cross_deduped() -> None:
         dispatcher,
         [WatchSpec(tr_x, Role.PROPOSER), WatchSpec(tr_y, Role.PROPOSER)],
     )
-    await watcher.start()
+    await watcher.start(baseline=False)
     assert await watcher.poll_once() == 2  # both dispatched (not cross-deduped)
     assert {e.event_id for e in adapter.delivered} == {"T-x:msg-1", "T-y:msg-1"}
+
+
+@pytest.mark.anyio
+async def test_baseline_skips_existing() -> None:
+    # Default baseline=True marks the thread's current messages seen without
+    # dispatching → the first poll dispatches nothing (no backlog reply).
+    adapter = _RecordingReplyAdapter()
+    gateway = _FakeGateway()
+    watcher = ChatroomWatcher(
+        _FakeMcp([_msg("msg-1"), _msg("msg-2")]),
+        _dispatcher_with(adapter, gateway),
+        [WatchSpec(_thread_ref(), Role.PROPOSER)],
+    )
+    await watcher.start()  # baseline=True (default)
+    assert await watcher.poll_once() == 0
+    assert adapter.delivered == []
+    assert gateway.posts == []
+
+
+@pytest.mark.anyio
+async def test_baseline_then_new_message() -> None:
+    # After baseline, only messages arriving afterwards are dispatched.
+    adapter = _RecordingReplyAdapter()
+    gateway = _FakeGateway()
+    fake = _FakeMcp([_msg("msg-1")])
+    watcher = ChatroomWatcher(
+        fake, _dispatcher_with(adapter, gateway), [WatchSpec(_thread_ref(), Role.PROPOSER)]
+    )
+    await watcher.start()  # baselines msg-1
+    fake.messages.append(_msg("msg-2"))  # new arrival after start
+    assert await watcher.poll_once() == 1
+    assert [e.event_id for e in adapter.delivered] == ["T-x:msg-2"]
+
+
+@pytest.mark.anyio
+async def test_stop_halts_sessions() -> None:
+    adapter = _RecordingReplyAdapter()
+    watcher = ChatroomWatcher(
+        _FakeMcp([]),
+        _dispatcher_with(adapter, _FakeGateway()),
+        [WatchSpec(_thread_ref(), Role.PROPOSER)],
+    )
+    await watcher.start(baseline=False)
+    await watcher.stop()
+    assert len(adapter.halted) == 1
+    assert await watcher.poll_once() == 0  # handles cleared → nothing to poll
