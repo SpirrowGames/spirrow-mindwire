@@ -76,10 +76,19 @@ class ChatroomWatcher:
         # two watched threads is not cross-deduped.
         self._seen: set[str] = set()
 
-    async def start(self) -> None:
-        """Spawn one adapter session per watch (call once before polling)."""
+    async def start(self, *, baseline: bool = True) -> None:
+        """Spawn one adapter session per watch (call once before polling).
+
+        With ``baseline=True`` (default, production-safe) each watch's current
+        messages are marked seen *without dispatching*, so the watcher acts only
+        on messages that arrive after start — it does not reply to the whole
+        thread history. Pass ``baseline=False`` to also dispatch the existing
+        messages (e.g. the dogfood driver answering a pre-posted question).
+        """
         for watch in self._watches:
             self._handles[watch] = await self._dispatcher.spawn_role(watch.thread_ref, watch.role)
+            if baseline:
+                await self._baseline(watch)
 
     async def poll_once(self) -> int:
         """Poll every watch once, dispatching new messages; return # dispatched."""
@@ -91,7 +100,7 @@ class ChatroomWatcher:
             dispatched += await self._poll_watch(watch, handle)
         return dispatched
 
-    async def _poll_watch(self, watch: WatchSpec, handle: SessionHandle) -> int:
+    async def _fetch_messages(self, watch: WatchSpec) -> list[Any]:
         result = await self._mcp.call_tool(
             "chatroom_get_thread",
             {
@@ -100,10 +109,29 @@ class ChatroomWatcher:
                 "mode": "full",
             },
         )
-        messages = result.get("messages", []) if isinstance(result, dict) else []
+        return result.get("messages", []) if isinstance(result, dict) else []
+
+    async def _baseline(self, watch: WatchSpec) -> int:
+        """Mark a watch's current messages seen *without dispatching* them.
+
+        So a watcher starting on a thread with history acts only on messages
+        arriving after start (no backlog reply). The seen-set is in-memory, so
+        a restart re-baselines: down-time messages are treated as outside the
+        watcher's responsibility window (durable last-seen persistence is
+        Stage 2, ``WatcherStateStore``).
+        """
+        count = 0
+        for msg in await self._fetch_messages(watch):
+            msg_id = msg.get("msg_id") if isinstance(msg, dict) else None
+            if isinstance(msg_id, str):
+                self._seen.add(f"{watch.thread_ref.thread_id}:{msg_id}")
+                count += 1
+        return count
+
+    async def _poll_watch(self, watch: WatchSpec, handle: SessionHandle) -> int:
         count = 0
         # numeric msg-id order = chronological = occurred_at order (msg-190 note 1).
-        for msg in messages:
+        for msg in await self._fetch_messages(watch):
             msg_id = msg.get("msg_id") if isinstance(msg, dict) else None
             if not isinstance(msg_id, str):
                 continue
@@ -145,6 +173,21 @@ class ChatroomWatcher:
             except Exception:
                 logger.exception("chatroom poll failed; continuing")
             await asyncio.sleep(poll_interval_seconds)
+
+    async def stop(self) -> None:
+        """Halt all spawned sessions (best-effort graceful shutdown).
+
+        Call in a ``finally`` after :meth:`poll_once` (or after cancelling
+        :meth:`run`) so adapter sessions — e.g. the Claude SDK subprocess —
+        disconnect cleanly and don't leak transports at interpreter exit. Halt
+        is idempotent (I8); a failing halt is logged and the rest still run.
+        """
+        for handle in self._handles.values():
+            try:
+                await self._dispatcher.halt(handle)
+            except Exception:
+                logger.exception("halt failed during stop; continuing")
+        self._handles.clear()
 
 
 __all__ = ["ChatroomWatcher", "WatchSpec"]

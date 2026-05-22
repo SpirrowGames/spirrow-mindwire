@@ -63,21 +63,26 @@ async def main() -> None:
     watcher = ChatroomWatcher(mcp, dispatcher, [WatchSpec(thread_ref, Role.PROPOSER)])
 
     print(f"[dogfood] watching {project}/{thread_id} as proposer (real Claude, billed)...")
-    await watcher.start()
-    dispatched = await watcher.poll_once()
-    print(f"[dogfood] dispatched {dispatched} message(s).")
+    # baseline=False: the dogfood intentionally answers the question already in
+    # the thread (production watchers use the default baseline=True).
+    await watcher.start(baseline=False)
+    try:
+        dispatched = await watcher.poll_once()
+        print(f"[dogfood] dispatched {dispatched} message(s).")
 
-    thread = await mcp.call_tool(
-        "chatroom_get_thread",
-        {"project": project, "thread_id": thread_id, "mode": "full"},
-    )
-    messages = thread.get("messages", []) if isinstance(thread, dict) else []
-    replies = [m for m in messages if m.get("author") == Role.PROPOSER.value]
-    if replies:
-        last = replies[-1]
-        print(f"\n[dogfood] proposer reply ({last.get('msg_id')}):\n{last.get('content')}")
-    else:
-        print("[dogfood] no author=proposer message found in the thread yet.")
+        thread = await mcp.call_tool(
+            "chatroom_get_thread",
+            {"project": project, "thread_id": thread_id, "mode": "full"},
+        )
+        messages = thread.get("messages", []) if isinstance(thread, dict) else []
+        replies = [m for m in messages if m.get("author") == Role.PROPOSER.value]
+        if replies:
+            last = replies[-1]
+            print(f"\n[dogfood] proposer reply ({last.get('msg_id')}):\n{last.get('content')}")
+        else:
+            print("[dogfood] no author=proposer message found in the thread yet.")
+    finally:
+        await watcher.stop()  # graceful halt -> SDK disconnect (no unclosed transport)
 
 
 if __name__ == "__main__":
