@@ -175,9 +175,7 @@ def test_qualified_for_routes_roles_to_distinct_adapters(tmp_path: Path) -> None
 def test_naysayer_slot_unfilled_without_independent_adapter(tmp_path: Path) -> None:
     # Sanity: without the Lexora adapter, the naysayer slot has no candidate
     # (a same-model proposer adapter can never silently fill it).
-    proposer = ClaudeCodeSdkAdapter(
-        cwd=tmp_path, client_factory=_sdk_factory(_FakeSdkClient("p"))
-    )
+    proposer = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_sdk_factory(_FakeSdkClient("p")))
     registry = InMemoryAdapterRegistry()
     registry.register(proposer)
     assert registry.qualified_for(Role.NAYSAYER) == []
@@ -185,9 +183,7 @@ def test_naysayer_slot_unfilled_without_independent_adapter(tmp_path: Path) -> N
 
 @pytest.mark.anyio
 async def test_naysayer_slot_unfilled_raises_on_spawn(tmp_path: Path) -> None:
-    proposer = ClaudeCodeSdkAdapter(
-        cwd=tmp_path, client_factory=_sdk_factory(_FakeSdkClient("p"))
-    )
+    proposer = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_sdk_factory(_FakeSdkClient("p")))
     registry = InMemoryAdapterRegistry()
     registry.register(proposer)
     disp = Dispatcher(registry=registry, gateway=_FakeGateway())
