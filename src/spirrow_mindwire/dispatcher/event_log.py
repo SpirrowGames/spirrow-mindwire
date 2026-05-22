@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from ..ulid_util import new_ulid
-from ..value_objects import Event, ReplyDraft, SessionHandle
+from ..value_objects import ChatroomEvent, Event, ReplyDraft, SessionHandle
 
 EVENT_FIELD_AUTHOR = "author"
 EVENT_FIELD_MODEL_ID = "model_id"
@@ -20,8 +20,11 @@ EVENT_FIELD_SESSION_ID = "session_id"
 EVENT_FIELD_ADAPTER_ID = "adapter_id"
 EVENT_FIELD_POSTED_MSG_ID = "posted_msg_id"
 EVENT_FIELD_IDEMPOTENCY_KEY = "idempotency_key"
+EVENT_FIELD_FAILED_EVENT_ID = "failed_event_id"
+EVENT_FIELD_ERROR = "error"
 
 EVENT_KIND_REPLY_SENT = "reply.sent"
+EVENT_KIND_DELIVERY_FAILED = "delivery.failed"
 
 
 def reply_sent_event(
@@ -52,13 +55,43 @@ def reply_sent_event(
     )
 
 
+def delivery_failed_event(
+    handle: SessionHandle,
+    event: ChatroomEvent,
+    error: BaseException,
+) -> Event:
+    """Build the observational ``delivery.failed`` Event log entry (ADR-06 §8).
+
+    Logged by the dispatcher when ``deliver_event`` raises, before the error
+    is re-raised (fail-loud). ``author`` uses the anchor #6 key constant;
+    ``failed_event_id`` is the failed :class:`ChatroomEvent`'s id (distinct
+    from this log entry's own ``event_id``).
+    """
+    return Event(
+        event_id=new_ulid(),
+        occurred_at=datetime.now(UTC),
+        kind=EVENT_KIND_DELIVERY_FAILED,
+        fields={
+            EVENT_FIELD_AUTHOR: handle.role.value,
+            EVENT_FIELD_SESSION_ID: handle.session_id,
+            EVENT_FIELD_ADAPTER_ID: handle.adapter_id,
+            EVENT_FIELD_FAILED_EVENT_ID: event.event_id,
+            EVENT_FIELD_ERROR: str(error),
+        },
+    )
+
+
 __all__ = [
     "EVENT_FIELD_ADAPTER_ID",
     "EVENT_FIELD_AUTHOR",
+    "EVENT_FIELD_ERROR",
+    "EVENT_FIELD_FAILED_EVENT_ID",
     "EVENT_FIELD_IDEMPOTENCY_KEY",
     "EVENT_FIELD_MODEL_ID",
     "EVENT_FIELD_POSTED_MSG_ID",
     "EVENT_FIELD_SESSION_ID",
+    "EVENT_KIND_DELIVERY_FAILED",
     "EVENT_KIND_REPLY_SENT",
+    "delivery_failed_event",
     "reply_sent_event",
 ]
