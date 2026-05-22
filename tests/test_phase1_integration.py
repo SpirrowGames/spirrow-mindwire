@@ -24,6 +24,8 @@ from spirrow_mindwire.adapters.claude_code_sdk import (
 from spirrow_mindwire.dispatcher.core import Dispatcher
 from spirrow_mindwire.dispatcher.event_log import (
     EVENT_FIELD_AUTHOR,
+    EVENT_FIELD_ERROR,
+    EVENT_FIELD_FAILED_EVENT_ID,
     EVENT_KIND_DELIVERY_FAILED,
     EVENT_KIND_REPLY_SENT,
 )
@@ -164,6 +166,9 @@ async def test_delivery_failure_logs_failed_event(tmp_path: Path) -> None:
 
     assert gateway.posts == []  # no reply posted on failure
     assert [e.kind for e in events] == [EVENT_KIND_DELIVERY_FAILED]
+    failed = events[0]
+    assert failed.fields[EVENT_FIELD_FAILED_EVENT_ID] == "01JEVENT"  # the failed ChatroomEvent id
+    assert failed.fields[EVENT_FIELD_ERROR]  # non-empty error string
     health = await adapter.health(handle)
     assert health.state is SessionState.FAILED
     assert health.error is not None
