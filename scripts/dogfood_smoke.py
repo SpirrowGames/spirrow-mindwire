@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 
 from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkAdapter
@@ -35,6 +36,13 @@ from spirrow_mindwire.magickit.client import StreamableHttpChatroomMcp
 from spirrow_mindwire.magickit.gateway import MagickitChatroomGateway
 from spirrow_mindwire.magickit.watcher import ChatroomWatcher, WatchSpec
 from spirrow_mindwire.value_objects import Role, ThreadRef
+
+# Windows consoles default to legacy codepages (e.g. cp932) that can't encode
+# the proposer's reply or em-dashes; emit UTF-8 so print() doesn't raise
+# UnicodeEncodeError. getattr keeps mypy happy (reconfigure is TextIOWrapper-only).
+_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if _reconfigure is not None:
+    _reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 async def main() -> None:
@@ -54,7 +62,7 @@ async def main() -> None:
     dispatcher = Dispatcher(registry=registry, gateway=MagickitChatroomGateway(mcp))
     watcher = ChatroomWatcher(mcp, dispatcher, [WatchSpec(thread_ref, Role.PROPOSER)])
 
-    print(f"[dogfood] watching {project}/{thread_id} as proposer (real Claude — billed)…")
+    print(f"[dogfood] watching {project}/{thread_id} as proposer (real Claude, billed)...")
     await watcher.start()
     dispatched = await watcher.poll_once()
     print(f"[dogfood] dispatched {dispatched} message(s).")
