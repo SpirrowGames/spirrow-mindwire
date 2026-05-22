@@ -35,9 +35,21 @@ _REQUIRED_CAPABILITIES: dict[Role, frozenset[Capability]] = {
 class AdapterAlreadyRegisteredError(ValueError):
     """Raised when registering an ``adapter_id`` that is already present."""
 
+    def __init__(self, adapter_id: str) -> None:
+        super().__init__(f"adapter_id {adapter_id!r} is already registered")
+        self.adapter_id = adapter_id
+
 
 class AdapterNotFoundError(KeyError):
     """Raised by :meth:`InMemoryAdapterRegistry.get` for an unknown ``adapter_id``."""
+
+    def __init__(self, adapter_id: str) -> None:
+        super().__init__(adapter_id)
+        self.adapter_id = adapter_id
+
+    def __str__(self) -> str:
+        # KeyError.__str__ would just repr the bare id; spell out the source.
+        return f"no adapter registered with adapter_id {self.adapter_id!r}"
 
 
 class InMemoryAdapterRegistry:
