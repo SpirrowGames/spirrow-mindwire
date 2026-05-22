@@ -188,10 +188,14 @@ async def test_health_returns_status_dict() -> None:
 
 
 @pytest.mark.anyio
-async def test_health_non_2xx_raises() -> None:
+async def test_health_non_2xx_raises_with_detail() -> None:
+    # Like chat_completion(), health() surfaces the upstream detail on non-2xx
+    # (the module's fail-loud policy must be consistent across endpoints).
     def handler(_req: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, text="down")
+        return httpx.Response(503, json={"detail": "backend unavailable"})
 
     async with _client(handler) as client:
-        with pytest.raises(LexoraHTTPError):
+        with pytest.raises(LexoraHTTPError) as ei:
             await client.health()
+    assert ei.value.status_code == 503
+    assert "backend unavailable" in str(ei.value)

@@ -210,7 +210,8 @@ class LexoraClient:
             raise LexoraHTTPError(f"GET /health: {e}") from e
         if resp.status_code >= 400:
             raise LexoraHTTPError(
-                f"/health returned {resp.status_code}", status_code=resp.status_code
+                f"/health returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
             )
         try:
             body = resp.json()
