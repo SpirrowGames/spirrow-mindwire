@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from ..ports import AdapterRegistry, RoleAdapter, SpawnContext
 from ..value_objects import ChatroomEvent, Event, ReplyDraft, Role, SessionHandle, ThreadRef
 from .dedup import DEFAULT_DEDUP_SET_SIZE, EventDedup
-from .event_log import reply_sent_event
+from .event_log import delivery_failed_event, reply_sent_event
 from .gateway import ChatroomGateway
 from .session_fsm import SessionStateMachine
 
@@ -103,11 +103,24 @@ class Dispatcher:
             raise UnknownSessionError(handle.session_id)
         if self._dedup.seen(event.event_id):
             return  # I4: this ULID event_id was already processed
+        # Mark before delivery — required for correct dedup under concurrency
+        # (marking after the await would let two concurrent same-event_id
+        # dispatches both pass seen()). A failed delivery is therefore not
+        # retried under the same event_id: Phase 1 is fail-loud; retry /
+        # dead-letter (and any dedup redesign it needs) is out of scope.
         self._dedup.mark(event.event_id)
         # I9: serialize deliver_event per SessionHandle (FIFO by call order; the
         # caller delivers in occurred_at order — ChatRoom msg-id monotonic).
         async with session.lock:
-            await session.adapter.deliver_event(handle, event)
+            try:
+                await session.adapter.deliver_event(handle, event)
+            except asyncio.CancelledError:
+                raise  # let cancellation propagate immediately (no FAILED noise)
+            except Exception as exc:
+                # §8: record a FAILED event before re-raising (fail-loud).
+                # _on_event_log isolates sink errors (I7).
+                await self._on_event_log(delivery_failed_event(handle, event, exc))
+                raise
 
     async def halt(self, handle: SessionHandle) -> None:
         """Halt a spawned session via its adapter (idempotent per I8)."""
