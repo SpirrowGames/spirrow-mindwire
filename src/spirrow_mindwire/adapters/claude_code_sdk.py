@@ -27,6 +27,7 @@ Option (i)), never duplicated into ``HealthStatus.details`` (I2).
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -62,12 +63,12 @@ from ..value_objects import (
     ThreadRef,
 )
 
-# halt() is an idempotent no-op for these states (ADR-06 §4 I8).
-_NO_HALT_STATES: frozenset[SessionState] = frozenset(
-    {SessionState.HALTED, SessionState.FAILED, SessionState.HALTING}
+# A session that is halting or terminal (ADR-06 §4 I8). For these states
+# halt() is an idempotent no-op, and deliver_event is rejected (no query()
+# may race halt()'s interrupt/disconnect; I8 shutdown is one-way).
+_SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
+    {SessionState.HALTING, SessionState.HALTED, SessionState.FAILED}
 )
-# deliver_event is rejected once a session reaches a terminal state.
-_TERMINAL_STATES: frozenset[SessionState] = frozenset({SessionState.HALTED, SessionState.FAILED})
 
 _DEFAULT_SYSTEM_PROMPT = """\
 You are an AI agent participating in a Spirrow MindWire ChatRoom thread \
@@ -155,9 +156,19 @@ async def _drain_reply(client: _SdkClient) -> str:
                     chunks.append(block.text)
         elif isinstance(msg, ResultMessage):
             final = msg
-    if final is not None and getattr(final, "is_error", False):
+    if final is None:
+        # Incomplete / aborted turn — treat as a protocol error rather than a
+        # silent empty reply, so deliver_event can mark the session FAILED.
+        raise RuntimeError("SDK session ended without a ResultMessage")
+    if getattr(final, "is_error", False):
         raise RuntimeError(getattr(final, "result", None) or "SDK session reported is_error")
     return "".join(chunks)
+
+
+async def _shutdown(client: _SdkClient) -> None:
+    """Interrupt then disconnect an SDK session (bounded by ``grace`` in halt)."""
+    await client.interrupt()
+    await client.disconnect()
 
 
 class ClaudeCodeSdkAdapter:
@@ -233,7 +244,9 @@ class ClaudeCodeSdkAdapter:
         session = self._sessions.get(handle)
         if session is None:
             raise ClaudeCodeSdkDeliveryError(f"unknown session {handle.session_id}")
-        if session.state in _TERMINAL_STATES:
+        if session.state in _SHUTDOWN_STATES:
+            # No delivery to a halting or terminal session (avoids a query()
+            # racing halt()'s interrupt/disconnect; I8 shutdown is one-way).
             raise ClaudeCodeSdkDeliveryError(
                 f"session {handle.session_id} is {session.state.value}; cannot deliver"
             )
@@ -250,6 +263,15 @@ class ClaudeCodeSdkAdapter:
         try:
             await session.client.query(_build_prompt(event, session.own_role))
             body = await _drain_reply(session.client)
+            # on_reply is inside the try: a raising dispatcher callback must not
+            # leave the session stuck in PROCESSING — it transitions to FAILED.
+            await session.ctx.on_reply(
+                ReplyDraft(
+                    body=body,
+                    reply_to_msg_id=payload.msg_id,
+                    adapter_metadata={"adapter_id": self.adapter_id},
+                )
+            )
         except Exception as exc:
             session.state = SessionState.FAILED
             session.error = ErrorInfo(
@@ -261,13 +283,6 @@ class ClaudeCodeSdkAdapter:
                 f"deliver_event failed for session {handle.session_id}: {exc}"
             ) from exc
 
-        await session.ctx.on_reply(
-            ReplyDraft(
-                body=body,
-                reply_to_msg_id=payload.msg_id,
-                adapter_metadata={"adapter_id": self.adapter_id},
-            )
-        )
         session.last_active_at = datetime.now(UTC)
         session.state = SessionState.IDLE
 
@@ -278,15 +293,15 @@ class ClaudeCodeSdkAdapter:
         grace: timedelta = timedelta(seconds=5),
     ) -> None:
         session = self._sessions.get(handle)
-        if session is None or session.state in _NO_HALT_STATES:
-            # Idempotent no-op on unknown / terminal / already-halting (I8).
+        if session is None or session.state in _SHUTDOWN_STATES:
+            # Idempotent no-op on unknown / halting / terminal (I8).
             return
         session.state = SessionState.HALTING
         try:
-            # ``grace`` is the graceful-shutdown budget; the SDK client's
-            # interrupt+disconnect is best-effort in Phase 1 (no timed wait).
-            await session.client.interrupt()
-            await session.client.disconnect()
+            # ``grace`` bounds the interrupt+disconnect shutdown; a hang past
+            # the budget (asyncio.TimeoutError) fails the halt rather than
+            # blocking indefinitely.
+            await asyncio.wait_for(_shutdown(session.client), timeout=grace.total_seconds())
         except Exception as exc:
             session.state = SessionState.FAILED
             session.error = ErrorInfo(

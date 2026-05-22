@@ -7,8 +7,9 @@ exception mapping without spinning up the real CLI.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -59,13 +60,26 @@ def _result(*, is_error: bool = False, result: str | None = "ok") -> ResultMessa
 class _FakeClient:
     """Structural stand-in for claude_agent_sdk.ClaudeSDKClient."""
 
-    def __init__(self, responses: list[Any], *, fail_on: str | None = None) -> None:
+    def __init__(
+        self,
+        responses: list[Any],
+        *,
+        fail_on: str | None = None,
+        block: asyncio.Event | None = None,
+        block_method: str | None = None,
+    ) -> None:
         self._responses = responses
         self._fail_on = fail_on
+        self._block = block
+        self._block_method = block_method
         self.connected = False
         self.disconnected = False
         self.interrupt_count = 0
         self.queries: list[str] = []
+
+    async def _maybe_block(self, method: str) -> None:
+        if self._block is not None and self._block_method == method:
+            await self._block.wait()
 
     async def connect(self) -> None:
         if self._fail_on == "connect":
@@ -84,9 +98,11 @@ class _FakeClient:
     async def interrupt(self) -> None:
         if self._fail_on == "interrupt":
             raise RuntimeError("interrupt boom")
+        await self._maybe_block("interrupt")
         self.interrupt_count += 1
 
     async def disconnect(self) -> None:
+        await self._maybe_block("disconnect")
         self.disconnected = True
 
 
@@ -275,3 +291,73 @@ def test_satisfies_roleadapter_protocol(tmp_path: Path) -> None:
     # Static structural conformance (mypy) is the real assertion.
     adapter: RoleAdapter = ClaudeCodeSdkAdapter(cwd=tmp_path)
     assert adapter.adapter_id == "claude-code-sdk"
+
+
+@pytest.mark.anyio
+async def test_deliver_missing_result_message_marks_failed(tmp_path: Path) -> None:
+    # SDK stream ends without a ResultMessage → protocol error, not silent success.
+    client = _FakeClient([_assistant("partial")])  # no _result()
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    with pytest.raises(ClaudeCodeSdkDeliveryError):
+        await adapter.deliver_event(handle, _event())
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.delivery_failed"
+
+
+@pytest.mark.anyio
+async def test_deliver_on_reply_failure_marks_failed(tmp_path: Path) -> None:
+    client = _FakeClient([_assistant("hi"), _result()])
+
+    async def on_reply(_draft: ReplyDraft) -> None:
+        raise RuntimeError("downstream boom")
+
+    async def on_event_log(_event: Event) -> None:
+        return None
+
+    ctx = SpawnContext(on_reply=on_reply, on_event_log=on_event_log, own_role=Role.PROPOSER)
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, ctx)
+    with pytest.raises(ClaudeCodeSdkDeliveryError):
+        await adapter.deliver_event(handle, _event())
+    # A raising on_reply must not leave the session stuck in PROCESSING.
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.delivery_failed"
+
+
+@pytest.mark.anyio
+async def test_deliver_rejected_while_halting(tmp_path: Path) -> None:
+    block = asyncio.Event()  # gates disconnect so halt() stalls mid-shutdown
+    client = _FakeClient([_assistant("x"), _result()], block=block, block_method="disconnect")
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    halt_task = asyncio.create_task(adapter.halt(handle))
+    # Let halt() reach the blocked disconnect (state == HALTING).
+    for _ in range(1000):
+        if (await adapter.health(handle)).state is SessionState.HALTING:
+            break
+        await asyncio.sleep(0)
+    assert (await adapter.health(handle)).state is SessionState.HALTING
+    with pytest.raises(ClaudeCodeSdkDeliveryError):
+        await adapter.deliver_event(handle, _event())
+    block.set()
+    await halt_task
+    assert (await adapter.health(handle)).state is SessionState.HALTED
+
+
+@pytest.mark.anyio
+async def test_halt_grace_timeout_marks_failed(tmp_path: Path) -> None:
+    block = asyncio.Event()  # never set → disconnect hangs past grace
+    client = _FakeClient([], block=block, block_method="disconnect")
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    with pytest.raises(ClaudeCodeSdkHaltError):
+        await adapter.halt(handle, grace=timedelta(seconds=0.05))
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.halt_failed"
