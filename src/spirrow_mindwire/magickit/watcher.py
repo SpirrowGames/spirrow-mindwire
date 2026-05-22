@@ -77,9 +77,7 @@ class ChatroomWatcher:
     async def start(self) -> None:
         """Spawn one adapter session per watch (call once before polling)."""
         for watch in self._watches:
-            self._handles[watch] = await self._dispatcher.spawn_role(
-                watch.thread_ref, watch.role
-            )
+            self._handles[watch] = await self._dispatcher.spawn_role(watch.thread_ref, watch.role)
 
     async def poll_once(self) -> int:
         """Poll every watch once, dispatching new messages; return # dispatched."""

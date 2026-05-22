@@ -91,18 +91,14 @@ class _RecordingReplyAdapter:
             ReplyDraft(body="ok", reply_to_msg_id=event.payload.msg_id, adapter_metadata={})
         )
 
-    async def halt(
-        self, handle: SessionHandle, *, grace: timedelta = timedelta(seconds=5)
-    ) -> None:
+    async def halt(self, handle: SessionHandle, *, grace: timedelta = timedelta(seconds=5)) -> None:
         return None
 
     async def health(self, handle: SessionHandle) -> HealthStatus:
         return HealthStatus(state=SessionState.IDLE, last_active_at=_TS, error=None, details={})
 
 
-def _dispatcher_with(
-    adapter: _RecordingReplyAdapter, gateway: _FakeGateway
-) -> Dispatcher:
+def _dispatcher_with(adapter: _RecordingReplyAdapter, gateway: _FakeGateway) -> Dispatcher:
     registry = InMemoryAdapterRegistry()
     registry.register(adapter)
     return Dispatcher(registry=registry, gateway=gateway)
