@@ -15,11 +15,13 @@ absorbed by this hierarchy.
 Adapters specialise these via subclasses (e.g. ``ClaudeCodeSdkSpawnError``,
 T11). The dispatcher catches the **base** class; subclass detail flows to
 observability via :attr:`~value_objects.HealthStatus.details` (I2). The
-exception's catalog *code* integrates with the inherited ``error.*``
-catalog (ADR-06 §1 / §6) and is cross-referenced through
-**``HealthStatus.error.code``** (``ErrorInfo.code``) as the single SOT —
-ADR-06 §3.4 Option (i). It is **not** duplicated in ``HealthStatus.details``
-(§3-axis dual-management avoidance).
+exception's catalog *code* follows the inherited error-code catalog
+convention (ADR-06 §1 / §6); adapter failure codes use the ``adapter.*``
+namespace (e.g. ``adapter.timeout``, see :class:`~value_objects.ErrorInfo`).
+That code is cross-referenced through **``HealthStatus.error.code``**
+(``ErrorInfo.code``) as the single SOT — ADR-06 §3.4 Option (i) — and is
+**not** duplicated in ``HealthStatus.details`` (§3-axis dual-management
+avoidance).
 
 The common :class:`AdapterError` root lets the dispatcher catch all Port
 failures with one ``except`` while still allowing per-method discrimination
