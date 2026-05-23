@@ -18,12 +18,28 @@ from .claude_code_sdk import (
     ClaudeCodeSdkHealthError,
     ClaudeCodeSdkSpawnError,
 )
+from .implementer import (
+    ImplementerAllowlistError,
+    ImplementerSdkAdapter,
+    ImplementerSdkDeliveryError,
+    ImplementerSdkHaltError,
+    ImplementerSdkHealthError,
+    ImplementerSdkSpawnError,
+    classify_tool_call,
+)
 from .naysayer_lexora import (
     NaysayerLexoraAdapter,
     NaysayerLexoraDeliveryError,
     NaysayerLexoraHaltError,
     NaysayerLexoraHealthError,
     NaysayerLexoraSpawnError,
+)
+from .naysayer_pr_review import (
+    NaysayerPrReviewAdapter,
+    NaysayerPrReviewDeliveryError,
+    NaysayerPrReviewHaltError,
+    NaysayerPrReviewHealthError,
+    NaysayerPrReviewSpawnError,
 )
 
 __all__ = [
@@ -32,9 +48,21 @@ __all__ = [
     "ClaudeCodeSdkHaltError",
     "ClaudeCodeSdkHealthError",
     "ClaudeCodeSdkSpawnError",
+    "ImplementerAllowlistError",
+    "ImplementerSdkAdapter",
+    "ImplementerSdkDeliveryError",
+    "ImplementerSdkHaltError",
+    "ImplementerSdkHealthError",
+    "ImplementerSdkSpawnError",
     "NaysayerLexoraAdapter",
     "NaysayerLexoraDeliveryError",
     "NaysayerLexoraHaltError",
     "NaysayerLexoraHealthError",
     "NaysayerLexoraSpawnError",
+    "NaysayerPrReviewAdapter",
+    "NaysayerPrReviewDeliveryError",
+    "NaysayerPrReviewHaltError",
+    "NaysayerPrReviewHealthError",
+    "NaysayerPrReviewSpawnError",
+    "classify_tool_call",
 ]

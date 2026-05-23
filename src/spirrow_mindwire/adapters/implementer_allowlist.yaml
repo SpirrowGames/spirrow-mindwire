@@ -1,0 +1,47 @@
+# Implementer allow-list — MINDWIRE_STAGE3_WIRING_ALLOWLIST_SPEC §B.3.
+#
+# Operation-based, default-deny gate for the Stage 3 implementer adapter
+# (ADR-2026-05-23-07 §2.3). Loaded by spirrow_mindwire.allowlist; each SDK tool
+# call is classified into an `operation` and checked here BEFORE execution. A
+# deny is fail-loud (the adapter halts the session). `<repo>` is substituted
+# with the implementer session's repo root at load time.
+#
+# The implementer's world is Tier A (allow) + Tier C (forbidden) only; Tier B
+# (naysayer review) is a post-PR gate, not an implementer operation (§B.2).
+version: 1
+default: deny
+
+# --- Tier A: allowed operations (optionally constrained) ---
+allow:
+  - operation: exec.code        # test / build / arbitrary local code execution
+  - operation: fs.read
+  - operation: search
+  - operation: github.read
+  - operation: fs.write         # repo files only
+    path_glob: "<repo>/**"
+  - operation: git.commit
+    branch_glob: ["feature/*", "develop"]
+  - operation: git.push
+    branch_glob: ["feature/*", "develop"]
+    force: false
+  - operation: git.merge        # feature/* -> develop self-review merge
+    source_glob: ["feature/*"]
+    target_glob: ["develop"]
+  - operation: github.pr.open   # opening a PR is reversible (Tier A); to develop or main
+    target_glob: ["develop", "main"]
+
+# --- Tier C: forbidden operations (explicit, with fail-loud reasons) ---
+# These are unreachable from the loop; each requires Takahito pre-GO (Tier C).
+forbidden:
+  - operation: git.merge_to_main
+    reason: "main への merge は Tier C (Takahito 事前承認)。loop からは実行不可。"
+  - operation: force_push
+    reason: "force-push は Tier C (不可逆・履歴破壊リスク)。"
+  - operation: history_rewrite
+    reason: "history rewrite (rebase / reset --hard / filter-branch 等) は Tier C。"
+  - operation: fs.delete
+    reason: "ファイル削除は Tier C (不可逆)。"
+  - operation: drive.write
+    reason: "Drive canonical 反映は Tier C (main チェーン管轄、implementer scope 外)。"
+  - operation: external.publish
+    reason: "外部副作用 (publish / post / send) は Tier C。"
