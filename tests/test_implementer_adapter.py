@@ -9,7 +9,7 @@ fail-loud allow-list-violation path is covered without the real CLI.
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -341,7 +341,7 @@ def _factory(
     simulate_tool: tuple[str, dict[str, Any]] | None = None,
     fail_on: str | None = None,
     capture: list[_FakeSdkClient] | None = None,
-):
+) -> Callable[[Any], _FakeSdkClient]:
     def make(options: Any) -> _FakeSdkClient:
         client = _FakeSdkClient(
             options, responses=responses, simulate_tool=simulate_tool, fail_on=fail_on

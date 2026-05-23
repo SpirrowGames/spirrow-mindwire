@@ -30,6 +30,7 @@ from spirrow_mindwire.value_objects import (
     NewMessagePayload,
     ReplyDraft,
     Role,
+    SessionHandle,
     SessionState,
     ThreadRef,
 )
@@ -58,7 +59,7 @@ class _FakeLexora:
         if self._raise is not None:
             raise self._raise
         return ChatCompletion(
-            content=self._content,
+            content=self._content or "",  # real client coerces None → "" (content: str)
             reasoning_content="...",
             finish_reason=self._fr,
             model="DeepSeek-V4-Flash",
@@ -130,7 +131,7 @@ def _event(*, author: str = "orchestrator", body: str = f"review {_PR_TEXT}") ->
     )
 
 
-async def _spawn(adapter: NaysayerPrReviewAdapter, captured: list[ReplyDraft]):
+async def _spawn(adapter: NaysayerPrReviewAdapter, captured: list[ReplyDraft]) -> SessionHandle:
     return await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
 
 
