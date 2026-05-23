@@ -8,6 +8,7 @@ fail-loud allow-list-violation path is covered without the real CLI.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -100,6 +101,11 @@ def test_classify_fs_write_carries_path() -> None:
         ("gh pr create --base develop", Operation.GITHUB_PR_OPEN),
         ("gh pr merge 5", Operation.GIT_MERGE_TO_MAIN),
         ("gh pr view 5", Operation.GITHUB_READ),
+        # indirection backstop: wrappers hide the inner command from tokenization.
+        ('bash -c "rm -rf x"', Operation.FS_DELETE),
+        ('eval "git push --force origin feature/x"', Operation.FORCE_PUSH),
+        ("echo hi && $(rm -rf y)", Operation.FS_DELETE),
+        ("sh -c 'git reset --hard HEAD~3'", Operation.HISTORY_REWRITE),
     ],
 )
 def test_classify_bash(cmd: str, expected: Operation) -> None:
@@ -160,6 +166,9 @@ def test_classify_sudo_rm() -> None:
         ("mcp__drive__smart_update_document", {}, Operation.DRIVE_WRITE),
         ("mcp__github__get_file_contents", {}, Operation.GITHUB_READ),
         ("mcp__weird__frobnicate", {}, Operation.UNKNOWN),
+        # default-deny: a "delete" variant must not pass as read; unknown read-ish → deny.
+        ("mcp__github__list_and_delete", {}, Operation.FS_DELETE),
+        ("mcp__github__list_widgets", {}, Operation.UNKNOWN),
     ],
 )
 def test_classify_mcp(name: str, inp: dict[str, Any], expected: Operation) -> None:
@@ -202,6 +211,63 @@ async def test_guard_denies_force_push_with_interrupt(tmp_path: Path) -> None:
     assert res.message
     assert len(guard.violations) == 1
     assert guard.violations[0].operation is Operation.FORCE_PUSH
+
+
+# --------------------------------------------------------------------------- #
+# guard branch enrichment (fail-closed on missing branch/target)
+# --------------------------------------------------------------------------- #
+
+
+def _init_head(repo_root: Path, branch: str | None) -> None:
+    git = repo_root / ".git"
+    git.mkdir(parents=True, exist_ok=True)
+    if branch is not None:
+        (git / "HEAD").write_text(f"ref: refs/heads/{branch}\n", encoding="utf-8")
+    # branch is None → no HEAD file → _current_branch() returns None (fail-closed)
+
+
+@pytest.mark.anyio
+async def test_guard_bare_push_on_feature_allowed(tmp_path: Path) -> None:
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git push"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
+
+
+@pytest.mark.anyio
+async def test_guard_bare_push_on_main_denied(tmp_path: Path) -> None:
+    # branch enriched from HEAD (main) → outside feature/*+develop → deny.
+    _init_head(tmp_path, "main")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git push"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violations[-1].operation is Operation.GIT_PUSH
+
+
+@pytest.mark.anyio
+async def test_guard_commit_on_main_denied(tmp_path: Path) -> None:
+    _init_head(tmp_path, "main")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git commit -m wip"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+
+
+@pytest.mark.anyio
+async def test_guard_merge_while_on_main_denied(tmp_path: Path) -> None:
+    # `git merge feature/x` while on main → target enriched to main → deny.
+    _init_head(tmp_path, "main")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git merge feature/x"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+
+
+@pytest.mark.anyio
+async def test_guard_undeterminable_branch_fails_closed(tmp_path: Path) -> None:
+    # no .git/HEAD → branch can't be resolved → downgrade to UNKNOWN → deny.
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git push"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violations[-1].operation is Operation.UNKNOWN
 
 
 # --------------------------------------------------------------------------- #
@@ -302,14 +368,14 @@ def _ctx(captured: list[ReplyDraft]) -> SpawnContext:
 
 
 def _event(
-    *, author: str = "human", event_type: EventType = EventType.NEW_MESSAGE
+    *, author: str = "human", body: str = "do it", event_type: EventType = EventType.NEW_MESSAGE
 ) -> ChatroomEvent:
     return ChatroomEvent(
         event_id="01JEVENT",
         event_type=event_type,
         thread_ref=_thread_ref(),
         occurred_at=_TS,
-        payload=NewMessagePayload(msg_id="m1", author=author, body="do it", parent_msg_id=None),
+        payload=NewMessagePayload(msg_id="m1", author=author, body=body, parent_msg_id=None),
     )
 
 
@@ -445,3 +511,36 @@ async def test_deliver_on_halted_session_raises(tmp_path: Path) -> None:
     await adapter.halt(handle)
     with pytest.raises(ImplementerSdkDeliveryError):
         await adapter.deliver_event(handle, _event())
+
+
+# --------------------------------------------------------------------------- #
+# manual SDK smoke (B3): verify the REAL SDK routes tool calls through the guard
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.manual
+@pytest.mark.anyio
+async def test_manual_sdk_routes_tool_calls_through_guard(tmp_path: Path) -> None:
+    """The whole gate rests on the real SDK calling can_use_tool for every tool.
+
+    Run with a working Lexora Anthropic-compat endpoint:
+        MINDWIRE_IMPLEMENTER_BASE_URL=... uv run pytest -m manual -k manual_sdk
+    Asks the model to run a forbidden command and asserts the guard denied it
+    (proving permission_mode=default + allowed_tools=[] route Bash through the
+    guard, not auto-approval).
+    """
+    base = os.environ.get("MINDWIRE_IMPLEMENTER_BASE_URL")
+    if not base:
+        pytest.skip("set MINDWIRE_IMPLEMENTER_BASE_URL (Lexora Anthropic-compat) to run")
+    _init_head(tmp_path, "feature/manual-smoke")
+    adapter = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url=base)
+    handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx([]))
+    try:
+        with pytest.raises(ImplementerAllowlistError):
+            await adapter.deliver_event(
+                handle,
+                _event(body="Run exactly this shell command and nothing else: rm -rf /tmp/denied"),
+            )
+        assert (await adapter.health(handle)).state is SessionState.FAILED
+    finally:
+        await adapter.halt(handle)

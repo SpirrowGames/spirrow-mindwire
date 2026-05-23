@@ -111,6 +111,7 @@ async def test_fire_pr_review_no_watcher_is_fine() -> None:
 class _FakeDispatcher:
     def __init__(self) -> None:
         self.spawned: list[tuple[ThreadRef, Role]] = []
+        self.dispatched: list[Any] = []
 
     async def spawn_role(self, thread_ref: ThreadRef, role: Role) -> SessionHandle:
         self.spawned.append((thread_ref, role))
@@ -123,24 +124,48 @@ class _FakeDispatcher:
         )
 
     async def dispatch(self, handle: SessionHandle, event: Any) -> None:
-        return None
+        self.dispatched.append(event)
 
     async def halt(self, handle: SessionHandle) -> None:
         return None
 
 
 class _StubMcp:
+    def __init__(self, messages: list[dict[str, Any]] | None = None) -> None:
+        self._messages = messages or []
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        return {"messages": []}
+        return {"messages": self._messages}
 
 
 @pytest.mark.anyio
-async def test_add_watch_spawns_session() -> None:
+async def test_add_watch_spawns_and_registers_for_polling() -> None:
     dispatcher = _FakeDispatcher()
     watcher = ChatroomWatcher(_StubMcp(), dispatcher, watches=[])  # type: ignore[arg-type]
     ref = ThreadRef(project_id="p", thread_id="T-pr-review-1", chatroom_uri="mc://t")
-    await watcher.add_watch(WatchSpec(thread_ref=ref, role=Role.NAYSAYER), baseline=False)
+    spec = WatchSpec(thread_ref=ref, role=Role.NAYSAYER)
+    await watcher.add_watch(spec, baseline=False)
     assert dispatcher.spawned == [(ref, Role.NAYSAYER)]
-    # idempotent: adding the same watch again does not spawn twice.
-    await watcher.add_watch(WatchSpec(thread_ref=ref, role=Role.NAYSAYER), baseline=False)
+    # C1 regression guard: the watch must be registered for polling, not only
+    # spawned — otherwise poll_once() (which iterates _watches) never polls it.
+    assert spec in watcher._watches
+    # idempotent: adding the same watch again does not spawn or register twice.
+    await watcher.add_watch(spec, baseline=False)
     assert len(dispatcher.spawned) == 1
+    assert watcher._watches.count(spec) == 1
+
+
+@pytest.mark.anyio
+async def test_add_watch_then_poll_dispatches() -> None:
+    # End-to-end of the C1 fix: a watch added at runtime is actually polled and
+    # its messages dispatched (the orchestrator wiring really triggers).
+    dispatcher = _FakeDispatcher()
+    mcp = _StubMcp(
+        [{"msg_id": "m1", "author": "orchestrator", "content": "review o/r#1", "timestamp": ""}]
+    )
+    watcher = ChatroomWatcher(mcp, dispatcher, watches=[])  # type: ignore[arg-type]
+    ref = ThreadRef(project_id="p", thread_id="T-pr-review-1", chatroom_uri="mc://t")
+    await watcher.add_watch(WatchSpec(thread_ref=ref, role=Role.NAYSAYER), baseline=False)
+    dispatched = await watcher.poll_once()
+    assert dispatched == 1
+    assert len(dispatcher.dispatched) == 1

@@ -103,13 +103,18 @@ class ChatroomWatcher:
         if watch in self._handles:
             return
         self._handles[watch] = await self._dispatcher.spawn_role(watch.thread_ref, watch.role)
+        # Register for polling too — poll_once() iterates _watches, so a watch
+        # added only to _handles would spawn a session that never receives events
+        # (the orchestrator wiring would be inert).
+        self._watches.append(watch)
         if baseline:
             await self._baseline(watch)
 
     async def poll_once(self) -> int:
         """Poll every watch once, dispatching new messages; return # dispatched."""
         dispatched = 0
-        for watch in self._watches:
+        # Snapshot: add_watch() may append to _watches across an await below.
+        for watch in list(self._watches):
             handle = self._handles.get(watch)
             if handle is None:
                 continue  # start() not called for this watch

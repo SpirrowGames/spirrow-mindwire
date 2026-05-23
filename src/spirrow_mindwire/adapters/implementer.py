@@ -21,11 +21,18 @@ and **refuses to spawn** if none is configured (no silent fallback to the
 default endpoint).
 
 Enforcement scope (mirrors :mod:`spirrow_mindwire.allowlist`): the hard
-guarantee is that the six Tier C operations are denied. Branch/path constraints
-are best-effort over a parsed command line; the blast-radius backstop is the
-environment (Tailscale ACL + egress default-deny + scoped token, ADR-07 §2.4).
-The push-to-main denial here is the loop-level backstop that keeps changes from
-reaching ``main`` even if the session checks out main locally.
+guarantee is that the six Tier C operations are denied. The guard resolves the
+*effective* branch from ``.git/HEAD`` (so a bare ``git push`` / ``git commit`` /
+``git merge`` while on ``main`` is denied, and an undeterminable branch fails
+closed → ``UNKNOWN`` → deny). Shell *indirection* (``bash -c`` / ``eval`` /
+``$(...)`` / backticks) hides the inner command from tokenization, so the raw
+string is additionally scanned for Tier C patterns. Both remain best-effort over
+a single command — defence-in-depth, not the only line. The blast-radius
+backstops are: (1) the **environment** (Tailscale ACL + egress default-deny +
+scoped token, ADR-07 §2.4 / env spec); and (2) GitHub **main branch protection**
+(env spec §7), which is the authoritative guard that changes never reach ``main``
+without Takahito review — the loop-level push-to-main / merge-to-main denials
+here reduce noise but do not solely carry that guarantee.
 """
 
 from __future__ import annotations
@@ -34,7 +41,7 @@ import asyncio
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -284,6 +291,31 @@ def _classify_single_bash(cmd: str) -> ClassifiedAction:
     return ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
 
 
+# Shell indirection that defeats token-level classification (the real command is
+# a quoted string / substitution we don't tokenize, e.g. ``bash -c "rm -rf x"``,
+# ``eval ...``, ``$(...)``, backticks). When present we additionally scan the RAW
+# command for Tier C patterns and fail-loud on a match (deny-safe; a false match
+# only over-denies an indirection command, which is rare).
+_INDIRECTION_RE = re.compile(r"\b(?:bash|sh|zsh|dash)\b\s+-\w*c\b|\beval\b|\$\(|`")
+_RAW_FORBIDDEN: tuple[tuple[re.Pattern[str], Operation], ...] = (
+    (re.compile(r"\b(?:rm|rmdir|shred|unlink)\b|-delete\b|\bRemove-Item\b"), Operation.FS_DELETE),
+    (
+        re.compile(r"\bgit\b.*\bpush\b.*(?:--force\b|--force-with-lease\b|\s-f\b)"),
+        Operation.FORCE_PUSH,
+    ),
+    (re.compile(r"\bgit\b.*\b(?:rebase|filter-branch|filter-repo)\b"), Operation.HISTORY_REWRITE),
+    (re.compile(r"\bgit\b.*\breset\b.*--hard\b"), Operation.HISTORY_REWRITE),
+)
+
+
+def _scan_raw_forbidden(command: str) -> ClassifiedAction | None:
+    """Scan the raw command string for Tier C patterns (indirection backstop)."""
+    for pattern, op in _RAW_FORBIDDEN:
+        if pattern.search(command):
+            return ClassifiedAction(op, detail=command)
+    return None
+
+
 # Ranking so a compound command is judged by its most dangerous sub-command.
 _DANGER_RANK: dict[Operation, int] = {
     Operation.GIT_MERGE_TO_MAIN: 100,
@@ -324,28 +356,68 @@ def _classify_bash(command: str) -> ClassifiedAction:
         for a in actions
     )
     if switches_to_main and any(a.operation is Operation.GIT_MERGE for a in actions):
-        return ClassifiedAction(Operation.GIT_MERGE_TO_MAIN, detail=command)
+        candidate = ClassifiedAction(Operation.GIT_MERGE_TO_MAIN, detail=command)
+    else:
+        candidate = max(actions, key=lambda a: _DANGER_RANK.get(a.operation, 0))
 
-    return max(actions, key=lambda a: _DANGER_RANK.get(a.operation, 0))
+    # Indirection backstop: a wrapper hides the inner command from tokenization,
+    # so scan the raw string and take the result if it is at least as dangerous.
+    if _INDIRECTION_RE.search(command):
+        scanned = _scan_raw_forbidden(command)
+        if scanned is not None and _DANGER_RANK.get(scanned.operation, 0) >= _DANGER_RANK.get(
+            candidate.operation, 0
+        ):
+            return scanned
+    return candidate
+
+
+# MCP read operations are POSITIVELY enumerated (§B.2 default-deny): anything not
+# matched as a known write below AND not in this set falls through to UNKNOWN →
+# deny. A substring read-allow (e.g. "list_") would let a `list_and_delete`
+# variant pass, so reads must be an exact whitelist.
+_MCP_READ_OPS = frozenset(
+    {
+        "get_file_contents",
+        "get_commit",
+        "list_commits",
+        "list_branches",
+        "list_tags",
+        "get_tag",
+        "search_code",
+        "search_repositories",
+        "search_issues",
+        "search_pull_requests",
+        "list_pull_requests",
+        "pull_request_read",
+        "list_issues",
+        "issue_read",
+        "list_releases",
+        "get_latest_release",
+        "get_release_by_tag",
+        "get_label",
+    }
+)
 
 
 def _classify_mcp(tool_name: str, tool_input: dict[str, Any]) -> ClassifiedAction:
-    name = tool_name.lower()
-    if "merge_pull_request" in name:
+    op = tool_name.split("__")[-1].lower()
+    # Dangerous writes first (explicit). "delete" anywhere → fs.delete (deny).
+    if "merge_pull_request" in op:
         return ClassifiedAction(Operation.GIT_MERGE_TO_MAIN, detail=tool_name)
-    if "create_pull_request" in name or ("pull_request" in name and "create" in name):
+    if "create_pull_request" in op:
         return ClassifiedAction(
             Operation.GITHUB_PR_OPEN, target=tool_input.get("base"), detail=tool_name
         )
-    if "delete_file" in name:
+    if "delete" in op:
         return ClassifiedAction(Operation.FS_DELETE, detail=tool_name)
-    if "create_or_update_file" in name or "push_files" in name:
+    if "create_or_update_file" in op or "push_files" in op:
         return ClassifiedAction(
             Operation.GIT_PUSH, branch=tool_input.get("branch"), detail=tool_name
         )
-    if "smart_create_document" in name or "smart_update_document" in name or "drive" in name:
+    if "smart_create_document" in op or "smart_update_document" in op or op.startswith("drive"):
         return ClassifiedAction(Operation.DRIVE_WRITE, detail=tool_name)
-    if any(k in name for k in ("get_", "list_", "search", "read", "view", "diff", "status")):
+    # Reads are a positive whitelist; everything else is UNKNOWN → default-deny.
+    if op in _MCP_READ_OPS:
         return ClassifiedAction(Operation.GITHUB_READ, detail=tool_name)
     return ClassifiedAction(Operation.UNKNOWN, detail=tool_name)
 
@@ -378,8 +450,24 @@ def classify_tool_call(tool_name: str, tool_input: dict[str, Any]) -> Classified
 # --------------------------------------------------------------------------- #
 
 
+def _current_branch(repo_root: Path) -> str | None:
+    """Read the repo's current branch from ``.git/HEAD``; None if undeterminable.
+
+    Returns None for a detached HEAD (raw sha) or an unreadable / worktree-file
+    ``.git`` — the guard treats None as fail-closed (the action is downgraded to
+    UNKNOWN → deny) rather than letting a missing branch pass a constraint.
+    """
+    try:
+        head = (repo_root / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if head.startswith("ref:"):
+        return head.split(":", 1)[1].strip().removeprefix("refs/heads/")
+    return None  # detached HEAD
+
+
 class _AllowlistGuard:
-    """Per-spawn ``can_use_tool`` callback: classify → check → allow/deny.
+    """Per-spawn ``can_use_tool`` callback: classify → enrich → check → allow/deny.
 
     A deny is recorded (so ``deliver_event`` can fail-loud) and returned with
     ``interrupt=True`` so the SDK aborts the turn immediately.
@@ -389,13 +477,36 @@ class _AllowlistGuard:
         self._allowlist = allowlist
         self.violations: list[AllowlistDecision] = []
 
+    def _enrich(self, action: ClassifiedAction) -> ClassifiedAction:
+        """Fill an unparsed branch/target from the repo's current branch.
+
+        ``git commit`` / bare ``git push`` carry no branch and ``git merge`` no
+        target on the command line, but the *effective* branch is the checked-out
+        one. Resolving it from ``.git/HEAD`` closes the fail-open where a commit/
+        push/merge while on ``main`` would otherwise pass (None == "no constraint
+        to check"). If the branch can't be determined, downgrade to UNKNOWN so
+        ``default: deny`` blocks it (fail-closed).
+        """
+        repo_root = self._allowlist.repo_root
+        if action.operation in (Operation.GIT_COMMIT, Operation.GIT_PUSH) and action.branch is None:
+            cur = _current_branch(repo_root)
+            return replace(action, operation=Operation.UNKNOWN) if cur is None else replace(
+                action, branch=cur
+            )
+        if action.operation is Operation.GIT_MERGE and action.target is None:
+            cur = _current_branch(repo_root)
+            return replace(action, operation=Operation.UNKNOWN) if cur is None else replace(
+                action, target=cur
+            )
+        return action
+
     async def __call__(
         self,
         tool_name: str,
         tool_input: dict[str, Any],
         context: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
-        action = classify_tool_call(tool_name, tool_input)
+        action = self._enrich(classify_tool_call(tool_name, tool_input))
         decision = self._allowlist.check(action)
         if decision.allowed:
             return PermissionResultAllow()
