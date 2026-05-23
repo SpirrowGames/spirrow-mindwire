@@ -29,10 +29,11 @@ closed → ``UNKNOWN`` → deny). Shell *indirection* (``bash -c`` / ``eval`` /
 string is additionally scanned for Tier C patterns. Both remain best-effort over
 a single command — defence-in-depth, not the only line. The blast-radius
 backstops are: (1) the **environment** (Tailscale ACL + egress default-deny +
-scoped token, ADR-07 §2.4 / env spec); and (2) GitHub **main branch protection**
-(env spec §7), which is the authoritative guard that changes never reach ``main``
-without Takahito review — the loop-level push-to-main / merge-to-main denials
-here reduce noise but do not solely carry that guarantee.
+scoped token, ADR-07 §2.4 / env spec); and (2) **Takahito's manual merge** — the
+Tier C human pre-GO is the authoritative guard that changes never reach ``main``
+(GitHub main branch protection is a *planned* hardening, env spec §7, deferred on
+the current plan). The loop-level push-to-main / merge-to-main denials here
+reduce noise but do not solely carry that guarantee.
 """
 
 from __future__ import annotations
