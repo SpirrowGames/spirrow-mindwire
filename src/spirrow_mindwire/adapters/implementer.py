@@ -491,13 +491,17 @@ class _AllowlistGuard:
         repo_root = self._allowlist.repo_root
         if action.operation in (Operation.GIT_COMMIT, Operation.GIT_PUSH) and action.branch is None:
             cur = _current_branch(repo_root)
-            return replace(action, operation=Operation.UNKNOWN) if cur is None else replace(
-                action, branch=cur
+            return (
+                replace(action, operation=Operation.UNKNOWN)
+                if cur is None
+                else replace(action, branch=cur)
             )
         if action.operation is Operation.GIT_MERGE and action.target is None:
             cur = _current_branch(repo_root)
-            return replace(action, operation=Operation.UNKNOWN) if cur is None else replace(
-                action, target=cur
+            return (
+                replace(action, operation=Operation.UNKNOWN)
+                if cur is None
+                else replace(action, target=cur)
             )
         return action
 
