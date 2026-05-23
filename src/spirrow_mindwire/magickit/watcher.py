@@ -90,6 +90,22 @@ class ChatroomWatcher:
             if baseline:
                 await self._baseline(watch)
 
+    async def add_watch(self, watch: WatchSpec, *, baseline: bool = True) -> None:
+        """Register a new ``(thread, role)`` after :meth:`start` — spawns its session.
+
+        Used by the PR-review orchestrator (T20) to wire a freshly-opened
+        ``T-pr-review-<n>`` thread to the naysayer at runtime. With
+        ``baseline=False`` the watch's existing messages (e.g. the orchestrator's
+        review-request) ARE dispatched on the next poll, so the naysayer acts on
+        the request immediately rather than ignoring it as backlog. A no-op if
+        the watch is already registered.
+        """
+        if watch in self._handles:
+            return
+        self._handles[watch] = await self._dispatcher.spawn_role(watch.thread_ref, watch.role)
+        if baseline:
+            await self._baseline(watch)
+
     async def poll_once(self) -> int:
         """Poll every watch once, dispatching new messages; return # dispatched."""
         dispatched = 0

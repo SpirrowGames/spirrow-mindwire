@@ -34,6 +34,13 @@ from .naysayer_lexora import (
     NaysayerLexoraHealthError,
     NaysayerLexoraSpawnError,
 )
+from .naysayer_pr_review import (
+    NaysayerPrReviewAdapter,
+    NaysayerPrReviewDeliveryError,
+    NaysayerPrReviewHaltError,
+    NaysayerPrReviewHealthError,
+    NaysayerPrReviewSpawnError,
+)
 
 __all__ = [
     "ClaudeCodeSdkAdapter",
@@ -52,5 +59,10 @@ __all__ = [
     "NaysayerLexoraHaltError",
     "NaysayerLexoraHealthError",
     "NaysayerLexoraSpawnError",
+    "NaysayerPrReviewAdapter",
+    "NaysayerPrReviewDeliveryError",
+    "NaysayerPrReviewHaltError",
+    "NaysayerPrReviewHealthError",
+    "NaysayerPrReviewSpawnError",
     "classify_tool_call",
 ]
