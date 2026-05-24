@@ -22,6 +22,7 @@ unreachable GitHub onto a fail-closed halt (ADR-07 §2.6).
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ _DEFAULT_TIMEOUT_SECONDS = 60.0
 
 _PR_URL_RE = re.compile(r"github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/(\d+)")
 _PR_SHORT_RE = re.compile(r"\b([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)#(\d+)\b")
+
+logger = logging.getLogger(__name__)
 
 
 def github_token() -> str | None:
@@ -60,8 +63,21 @@ def naysayer_github_token() -> str | None:
     formal APPROVE / REQUEST_CHANGES goes through. The token's scope is the
     caller's concern (env spec: repo-scoped, least privilege); this only resolves
     which identity to authenticate as.
+
+    Logs a warning on fallback so a forgotten token placement is visible rather
+    than silent: while falling back, the naysayer runs as the author identity
+    (author == approver) and its formal review is blocked / downgraded to a
+    COMMENT — "working" but not actually satisfying author≠approver (T22).
     """
-    return os.environ.get("MINDWIRE_NAYSAYER_GITHUB_TOKEN") or github_token()
+    token = os.environ.get("MINDWIRE_NAYSAYER_GITHUB_TOKEN")
+    if token:
+        return token
+    logger.warning(
+        "MINDWIRE_NAYSAYER_GITHUB_TOKEN is unset; the naysayer is falling back to "
+        "the shared author token and will run as author==approver (self-approval) "
+        "until the distinct takahito-spirrowgames token is provisioned (T22)."
+    )
+    return github_token()
 
 
 class ReviewEvent(StrEnum):

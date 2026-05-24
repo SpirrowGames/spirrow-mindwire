@@ -6,6 +6,7 @@ review submit) without a live GitHub.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
@@ -81,13 +82,16 @@ def test_naysayer_token_separate_identity(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_naysayer_token_falls_back_to_shared_until_provisioned(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # T22: before the distinct token is provisioned, the naysayer falls back to
-    # the shared author token (the same-identity 422 → COMMENT path then applies).
+    # the shared author token (the same-identity 422 → COMMENT path then applies),
+    # and warns so the fail-open (author == approver) is visible, not silent.
     monkeypatch.delenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("MINDWIRE_GITHUB_TOKEN", "author")
-    assert naysayer_github_token() == "author"
+    with caplog.at_level(logging.WARNING):
+        assert naysayer_github_token() == "author"
+    assert any("self-approval" in r.message for r in caplog.records)
 
 
 # ---------- fetch_pr_diff ------------------------------------------------- #
