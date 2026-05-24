@@ -6,14 +6,13 @@ names; the dispatcher builds Event entries through the helpers here, and a
 unit test asserts the keys come from these constants (the enforcement
 boundary placed in T13 per PR #56 verify / msg-183 carry-forward).
 
-NOTE (I3 v2.2 / T26): the chatroom reply *author* switched to ``instance_id``
-(T25), but the event-log ``author`` below intentionally still uses the bare
-role — the v2.2 amendment scoped ``event_log`` out. This temporarily diverges
-the identity SOT that anchor #6 unified (chatroom-author == event-log-author);
-unifying ``event_log`` author → ``instance_id`` is tracked as **T26**
-(blocked_by T25). No functional harm in Phase 1 (1-role-1-instance: role and
-instance_id are 1:1). PR #69 review (main) confirmed this is a follow-up, not
-an expansion of T25.
+I3 v2.2 (T25/T26): the ``author`` key carries the session's stable
+``instance_id`` (e.g. ``"proposer-1"``), matching the chatroom reply author —
+so anchor #6's "chatroom-author == event-log-author" unification holds on a
+single identity SOT (``instance_id``). T25 switched the chatroom post; T26
+(this) brought the event log into line (the v2.2 amendment had scoped
+event_log out; main's PR #69 review decided to unify). Phase 1 is
+1-role-1-instance, so this reads as ``"{role}-1"``.
 """
 
 from __future__ import annotations
@@ -45,16 +44,17 @@ def reply_sent_event(
 ) -> Event:
     """Build the observational ``reply.sent`` Event log entry (anchor #6 keys).
 
-    ``author`` / ``model_id`` use the unified key constants. ``model_id`` is
-    read from the adapter's ``adapter_metadata`` (empty string if missing or
-    ``None``).
+    ``author`` is the session's ``instance_id`` (I3 v2.2 / T26 — matches the
+    chatroom post author). ``author`` / ``model_id`` use the unified key
+    constants. ``model_id`` is read from the adapter's ``adapter_metadata``
+    (empty string if missing or ``None``).
     """
     return Event(
         event_id=new_ulid(),
         occurred_at=datetime.now(UTC),
         kind=EVENT_KIND_REPLY_SENT,
         fields={
-            EVENT_FIELD_AUTHOR: handle.role.value,  # T26: still role (see module note)
+            EVENT_FIELD_AUTHOR: handle.instance_id,  # I3 v2.2 / T26: author = instance_id
             EVENT_FIELD_MODEL_ID: str(draft.adapter_metadata.get("model_id") or ""),
             EVENT_FIELD_SESSION_ID: handle.session_id,
             EVENT_FIELD_ADAPTER_ID: handle.adapter_id,
@@ -72,16 +72,17 @@ def delivery_failed_event(
     """Build the observational ``delivery.failed`` Event log entry (ADR-06 §8).
 
     Logged by the dispatcher when ``deliver_event`` raises, before the error
-    is re-raised (fail-loud). ``author`` uses the anchor #6 key constant;
-    ``failed_event_id`` is the failed :class:`ChatroomEvent`'s id (distinct
-    from this log entry's own ``event_id``).
+    is re-raised (fail-loud). ``author`` is the session's ``instance_id``
+    (I3 v2.2 / T26, anchor #6 key constant); ``failed_event_id`` is the failed
+    :class:`ChatroomEvent`'s id (distinct from this log entry's own
+    ``event_id``).
     """
     return Event(
         event_id=new_ulid(),
         occurred_at=datetime.now(UTC),
         kind=EVENT_KIND_DELIVERY_FAILED,
         fields={
-            EVENT_FIELD_AUTHOR: handle.role.value,  # T26: still role (see module note)
+            EVENT_FIELD_AUTHOR: handle.instance_id,  # I3 v2.2 / T26: author = instance_id
             EVENT_FIELD_SESSION_ID: handle.session_id,
             EVENT_FIELD_ADAPTER_ID: handle.adapter_id,
             EVENT_FIELD_FAILED_EVENT_ID: event.event_id,

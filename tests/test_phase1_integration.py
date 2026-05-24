@@ -152,7 +152,11 @@ async def test_smoke_proposer_round_trip(tmp_path: Path) -> None:
     assert gateway.posts[0]["body"] == "reply text"
     assert gateway.posts[0]["idempotency_key"] == f"{handle.session_id}:1"
     assert [e.kind for e in events] == [EVENT_KIND_REPLY_SENT]
-    assert events[0].fields[EVENT_FIELD_AUTHOR] == "proposer"
+    assert events[0].fields[EVENT_FIELD_AUTHOR] == "proposer-1"  # T26: author = instance_id
+    # anchor #6 (I3 v2.2 / T26): the chatroom author and the event-log author are
+    # the same identity SOT — assert the equality directly so a future one-sided
+    # drift is caught (not just two literals that could both change together).
+    assert gateway.posts[0]["author"] == events[0].fields[EVENT_FIELD_AUTHOR]
 
 
 @pytest.mark.anyio
@@ -167,6 +171,7 @@ async def test_delivery_failure_logs_failed_event(tmp_path: Path) -> None:
     assert gateway.posts == []  # no reply posted on failure
     assert [e.kind for e in events] == [EVENT_KIND_DELIVERY_FAILED]
     failed = events[0]
+    assert failed.fields[EVENT_FIELD_AUTHOR] == "proposer-1"  # I3 v2.2 / T26: author = instance_id
     assert failed.fields[EVENT_FIELD_FAILED_EVENT_ID] == "01JEVENT"  # the failed ChatroomEvent id
     assert failed.fields[EVENT_FIELD_ERROR]  # non-empty error string
     health = await adapter.health(handle)
