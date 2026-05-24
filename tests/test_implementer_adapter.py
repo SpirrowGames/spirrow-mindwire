@@ -9,6 +9,7 @@ fail-loud allow-list-violation path is covered without the real CLI.
 from __future__ import annotations
 
 import os
+import subprocess
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -106,6 +107,25 @@ def test_classify_fs_write_carries_path() -> None:
         ('eval "git push --force origin feature/x"', Operation.FORCE_PUSH),
         ("echo hi && $(rm -rf y)", Operation.FS_DELETE),
         ("sh -c 'git reset --hard HEAD~3'", Operation.HISTORY_REWRITE),
+        # T23: mutating `gh api` → deny (UNKNOWN); a read (GET / no fields) stays read.
+        ("gh api repos/o/r/merges -X PUT", Operation.UNKNOWN),
+        ("gh api --method POST repos/o/r/pulls -f title=x", Operation.UNKNOWN),
+        ("gh api -f base=main repos/o/r/merges", Operation.UNKNOWN),
+        ("gh api repos/o/r/contents/x", Operation.GITHUB_READ),
+        ("gh api repos/o/r -X GET", Operation.GITHUB_READ),
+        # T23: external-publish + mutating gh api wrapped in indirection.
+        ('bash -c "npm publish"', Operation.EXTERNAL_PUBLISH),
+        ("eval 'twine upload dist/*'", Operation.EXTERNAL_PUBLISH),
+        ('bash -c "gh api repos/o/r/merges -X PUT"', Operation.UNKNOWN),
+        # T23 review (naysayer MUST-1): field-flag gh api via indirection (gh
+        # defaults to POST) + lowercase verb must also deny, not fall to READ.
+        ('bash -c "gh api repos/o/r/pulls -f title=x"', Operation.UNKNOWN),
+        ('bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('bash -c "gh api repos/o/r/contents/x -X post"', Operation.UNKNOWN),
+        # T23 review (main SHOULD): direct `-X` with value concatenated (no space).
+        ("gh api repos/o/r/merges -XPUT", Operation.UNKNOWN),
+        ("gh api repos/o/r/contents/x -XDELETE", Operation.UNKNOWN),
+        ("gh api repos/o/r -Xget", Operation.GITHUB_READ),
     ],
 )
 def test_classify_bash(cmd: str, expected: Operation) -> None:
@@ -219,11 +239,37 @@ async def test_guard_denies_force_push_with_interrupt(tmp_path: Path) -> None:
 
 
 def _init_head(repo_root: Path, branch: str | None) -> None:
-    git = repo_root / ".git"
-    git.mkdir(parents=True, exist_ok=True)
-    if branch is not None:
-        (git / "HEAD").write_text(f"ref: refs/heads/{branch}\n", encoding="utf-8")
-    # branch is None → no HEAD file → _current_branch() returns None (fail-closed)
+    """Make ``repo_root`` a real git repo checked out on ``branch``.
+
+    ``_current_branch`` now shells out to ``git rev-parse --abbrev-ref HEAD``
+    (worktree / packed-ref safe, T23), so the test needs a real repo rather than a
+    hand-written ``.git/HEAD``. ``branch=None`` leaves a non-repo → ``rev-parse``
+    fails → None (fail-closed).
+    """
+    if branch is None:
+        return
+    subprocess.run(
+        ["git", "init", "-q", "-b", branch], cwd=repo_root, check=True, capture_output=True
+    )
+    # An empty commit makes the branch born, so `git rev-parse --abbrev-ref HEAD`
+    # returns it on every git version. Identity via -c (don't depend on global cfg).
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=t@e.test",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
 
 
 @pytest.mark.anyio
