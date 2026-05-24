@@ -244,8 +244,8 @@ async def test_reply_sent_event_uses_anchor6_keys() -> None:
     assert len(events) == 1
     ev = events[0]
     assert ev.kind == EVENT_KIND_REPLY_SENT
-    # anchor #6: unified key names.
-    assert ev.fields[EVENT_FIELD_AUTHOR] == "proposer"
+    # anchor #6: unified key names; author = instance_id (I3 v2.2 / T26).
+    assert ev.fields[EVENT_FIELD_AUTHOR] == "proposer-1"
     assert ev.fields[EVENT_FIELD_MODEL_ID] == "fake-model"
 
 
