@@ -88,7 +88,12 @@ def _ctx(captured: list[ReplyDraft], *, own_role: Role = Role.NAYSAYER) -> Spawn
     async def on_event_log(_event: Event) -> None:
         return None
 
-    return SpawnContext(on_reply=on_reply, on_event_log=on_event_log, own_role=own_role)
+    return SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=own_role,
+        own_instance_id=f"{own_role.value}-1",
+    )
 
 
 def _thread_ref() -> ThreadRef:
@@ -114,6 +119,7 @@ def _event(
 def _stray_handle() -> SessionHandle:
     return SessionHandle(
         session_id="01JSTRAY",
+        instance_id="naysayer-1",
         adapter_id="naysayer-lexora",
         thread_ref=_thread_ref(),
         role=Role.NAYSAYER,
@@ -282,8 +288,9 @@ async def test_own_role_self_filter_skips() -> None:
     captured: list[ReplyDraft] = []
     adapter = NaysayerLexoraAdapter(client=fake)
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
-    # author == own_role ("naysayer") → our own post echoed back, filtered out.
-    await adapter.deliver_event(handle, _event(author="naysayer"))
+    # author == our instance_id ("naysayer-1") → our own post echoed back, filtered
+    # out (I3 v2.2: the self-filter keys on instance_id, not the bare role).
+    await adapter.deliver_event(handle, _event(author="naysayer-1"))
     assert captured == []
     assert fake.calls == []
 
@@ -316,7 +323,12 @@ async def test_deliver_on_reply_failure_marks_failed() -> None:
     async def on_event_log(_event: Event) -> None:
         return None
 
-    ctx = SpawnContext(on_reply=on_reply, on_event_log=on_event_log, own_role=Role.NAYSAYER)
+    ctx = SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=Role.NAYSAYER,
+        own_instance_id="naysayer-1",
+    )
     adapter = NaysayerLexoraAdapter(client=fake)
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, ctx)
     with pytest.raises(NaysayerLexoraDeliveryError):

@@ -60,9 +60,11 @@ async def main() -> None:
     registry = InMemoryAdapterRegistry()
     registry.register(ClaudeCodeSdkAdapter(cwd=Path.cwd()))  # real Claude Agent SDK
     dispatcher = Dispatcher(registry=registry, gateway=MagickitChatroomGateway(mcp))
-    watcher = ChatroomWatcher(mcp, dispatcher, [WatchSpec(thread_ref, Role.PROPOSER)])
+    watch = WatchSpec(thread_ref, Role.PROPOSER)
+    watcher = ChatroomWatcher(mcp, dispatcher, [watch])
+    who = watch.instance_id  # I3 v2.2 author = instance_id (e.g. "proposer-1")
 
-    print(f"[dogfood] watching {project}/{thread_id} as proposer (real Claude, billed)...")
+    print(f"[dogfood] watching {project}/{thread_id} as {who} (real Claude, billed)...")
     # baseline=False: the dogfood intentionally answers the question already in
     # the thread (production watchers use the default baseline=True).
     await watcher.start(baseline=False)
@@ -75,12 +77,12 @@ async def main() -> None:
             {"project": project, "thread_id": thread_id, "mode": "full"},
         )
         messages = thread.get("messages", []) if isinstance(thread, dict) else []
-        replies = [m for m in messages if m.get("author") == Role.PROPOSER.value]
+        replies = [m for m in messages if m.get("author") == who]
         if replies:
             last = replies[-1]
-            print(f"\n[dogfood] proposer reply ({last.get('msg_id')}):\n{last.get('content')}")
+            print(f"\n[dogfood] {who} reply ({last.get('msg_id')}):\n{last.get('content')}")
         else:
-            print("[dogfood] no author=proposer message found in the thread yet.")
+            print(f"[dogfood] no author={who} message found in the thread yet.")
     finally:
         await watcher.stop()  # graceful halt -> SDK disconnect (no unclosed transport)
 

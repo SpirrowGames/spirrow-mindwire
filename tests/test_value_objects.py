@@ -20,6 +20,7 @@ from spirrow_mindwire.value_objects import (
     SessionHandle,
     SessionState,
     ThreadRef,
+    mint_instance_id,
 )
 
 _TS = datetime(2026, 5, 22, tzinfo=UTC)
@@ -36,6 +37,7 @@ def _thread_ref() -> ThreadRef:
 def _handle(ref: ThreadRef) -> SessionHandle:
     return SessionHandle(
         session_id="01JSESSION",
+        instance_id="proposer-1",
         adapter_id="claude-code-sdk",
         thread_ref=ref,
         role=Role.PROPOSER,
@@ -74,6 +76,33 @@ def test_sessionhandle_frozen() -> None:
     h = _handle(_thread_ref())
     with pytest.raises(FrozenInstanceError):
         h.adapter_id = "x"  # type: ignore[misc]
+
+
+def test_sessionhandle_carries_instance_id() -> None:
+    # T24 / ADR-08 §2.1: instance_id is a distinct field from the per-spawn
+    # session_id (the stable per-instance label, SOT for the I3 v2.2 author).
+    h = _handle(_thread_ref())
+    assert h.instance_id == "proposer-1"
+    assert h.session_id != h.instance_id
+
+
+def test_sessionhandle_eq_false_holds_with_same_instance_id() -> None:
+    # T24 eq=False regression (I2): two handles sharing every field — including
+    # instance_id (a re-spawn of the same instance) — remain distinct by
+    # identity, so adding instance_id did not introduce value equality.
+    ref = _thread_ref()
+    h1 = _handle(ref)
+    h2 = _handle(ref)
+    assert h1.instance_id == h2.instance_id
+    assert h1 != h2
+    assert len({h1: 1, h2: 2}) == 2
+
+
+def test_mint_instance_id_phase1_suffix() -> None:
+    # T24 / ADR-08 §5: Phase 1 is 1-role-1-instance → "{role}-1".
+    assert mint_instance_id(Role.PROPOSER) == "proposer-1"
+    assert mint_instance_id(Role.NAYSAYER) == "naysayer-1"
+    assert mint_instance_id(Role.IMPLEMENTER) == "implementer-1"
 
 
 def test_chatroom_event_carries_payload() -> None:

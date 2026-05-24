@@ -113,10 +113,13 @@ class _FakeDispatcher:
         self.spawned: list[tuple[ThreadRef, Role]] = []
         self.dispatched: list[Any] = []
 
-    async def spawn_role(self, thread_ref: ThreadRef, role: Role) -> SessionHandle:
+    async def spawn_instance(
+        self, thread_ref: ThreadRef, role: Role, instance_id: str
+    ) -> SessionHandle:
         self.spawned.append((thread_ref, role))
         return SessionHandle(
             session_id=new_ulid(),
+            instance_id=instance_id,
             adapter_id="fake",
             thread_ref=thread_ref,
             role=role,

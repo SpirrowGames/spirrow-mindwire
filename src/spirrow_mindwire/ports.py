@@ -53,6 +53,13 @@ class SpawnContext:
       (Gap-2 (b)): lets the adapter self-filter its own posts echoed back
       to it (defensive against a dispatcher routing bug causing a
       self-reply loop).
+    - ``own_instance_id``: the stable per-instance label the dispatcher
+      assigned this session (ADR-2026-05-24-08 §2.1). The adapter stamps it
+      onto the :class:`~value_objects.SessionHandle` it returns from
+      ``spawn`` — the handle is keyed by identity (I2) so the dispatcher
+      cannot re-stamp it afterwards, hence it is delivered here at spawn
+      (mirrors ``own_role``; keeps the ``RoleAdapter.spawn`` signature
+      unchanged per ADR-08 §2.3).
 
     Not ``frozen`` (holds live callables); not identity-constrained.
     """
@@ -60,6 +67,7 @@ class SpawnContext:
     on_reply: Callable[[ReplyDraft], Awaitable[None]]
     on_event_log: Callable[[Event], Awaitable[None]]
     own_role: Role
+    own_instance_id: str
 
 
 class RoleAdapter(Protocol):
@@ -71,6 +79,15 @@ class RoleAdapter(Protocol):
     :class:`~exceptions.AdapterDeliveryError`,
     :class:`~exceptions.AdapterHaltError`,
     :class:`~exceptions.AdapterHealthError` respectively.
+
+    SEAM (ADR-2026-05-24-08 §2.3): the "model+transport" bundle this Protocol
+    still carries (one adapter = one transport x one role x one model) is the
+    Phase 2 decomposition point into ``TransportAdapter`` (the terminal /
+    browser pipe) x ``InstanceSpec`` (role + model_binding + capabilities).
+    Phase 1 keeps this signature unchanged — the bundle is split only once a
+    second transport (browser) appears; splitting now is YAGNI. Instance
+    individuation is achieved earlier via ``SessionHandle.instance_id``
+    (delivered through :attr:`SpawnContext.own_instance_id`).
     """
 
     adapter_id: str

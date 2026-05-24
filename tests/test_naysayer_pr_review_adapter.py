@@ -118,7 +118,12 @@ def _ctx(captured: list[ReplyDraft]) -> SpawnContext:
     async def on_event_log(_event: Event) -> None:
         return None
 
-    return SpawnContext(on_reply=on_reply, on_event_log=on_event_log, own_role=Role.NAYSAYER)
+    return SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=Role.NAYSAYER,
+        own_instance_id="naysayer-1",
+    )
 
 
 def _event(*, author: str = "orchestrator", body: str = f"review {_PR_TEXT}") -> ChatroomEvent:
@@ -229,7 +234,8 @@ async def test_own_role_self_filter() -> None:
     github = _FakeGitHub()
     adapter = NaysayerPrReviewAdapter(lexora=_FakeLexora(), github=github)
     handle = await _spawn(adapter, [])
-    await adapter.deliver_event(handle, _event(author="naysayer"))
+    # I3 v2.2: the self-filter keys on instance_id ("naysayer-1"), not the bare role.
+    await adapter.deliver_event(handle, _event(author="naysayer-1"))
     assert github.fetched == []
 
 

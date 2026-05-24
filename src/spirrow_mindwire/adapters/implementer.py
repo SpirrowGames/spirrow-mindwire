@@ -624,6 +624,7 @@ class ImplementerSdkAdapter:
         now = datetime.now(UTC)
         handle = SessionHandle(
             session_id=new_ulid(),
+            instance_id=ctx.own_instance_id,
             adapter_id=self.adapter_id,
             thread_ref=thread_ref,
             role=role,
@@ -650,7 +651,9 @@ class ImplementerSdkAdapter:
         if event.event_type is not EventType.NEW_MESSAGE:
             return
         payload = event.payload
-        if payload.author == session.own_role.value:
+        if payload.author == handle.instance_id:
+            # instance self-filter (Gap-2 (b), I3 v2.2): drop our own echoed post
+            # (author == our instance_id, e.g. "implementer-1"), not the bare role.
             return
 
         guard = session.guard

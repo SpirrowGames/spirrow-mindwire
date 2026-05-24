@@ -364,7 +364,12 @@ def _ctx(captured: list[ReplyDraft]) -> SpawnContext:
     async def on_event_log(_event: Event) -> None:
         return None
 
-    return SpawnContext(on_reply=on_reply, on_event_log=on_event_log, own_role=Role.IMPLEMENTER)
+    return SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=Role.IMPLEMENTER,
+        own_instance_id="implementer-1",
+    )
 
 
 def _event(
@@ -466,7 +471,8 @@ async def test_own_role_self_filter(tmp_path: Path) -> None:
         client_factory=_factory(responses=[_assistant("x"), _result()], capture=cap),
     )
     handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx(captured))
-    await adapter.deliver_event(handle, _event(author="implementer"))
+    # I3 v2.2: the self-filter keys on instance_id ("implementer-1"), not the bare role.
+    await adapter.deliver_event(handle, _event(author="implementer-1"))
     assert captured == []
     assert cap[0].queries == []
 

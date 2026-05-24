@@ -33,6 +33,7 @@ class _FakeAdapter:
     async def spawn(self, thread_ref: ThreadRef, role: Role, ctx: SpawnContext) -> SessionHandle:
         return SessionHandle(
             session_id="01JS",
+            instance_id=ctx.own_instance_id,
             adapter_id=self.adapter_id,
             thread_ref=thread_ref,
             role=role,
@@ -57,10 +58,16 @@ def test_fake_adapter_satisfies_roleadapter_protocol() -> None:
     assert Capability.POST_REPLY in adapter.capabilities
 
 
-def test_spawn_context_holds_own_role() -> None:
+def test_spawn_context_holds_own_role_and_instance_id() -> None:
     async def _on_reply(_: ReplyDraft) -> None: ...
 
     async def _on_event_log(_: Event) -> None: ...
 
-    ctx = SpawnContext(on_reply=_on_reply, on_event_log=_on_event_log, own_role=Role.NAYSAYER)
+    ctx = SpawnContext(
+        on_reply=_on_reply,
+        on_event_log=_on_event_log,
+        own_role=Role.NAYSAYER,
+        own_instance_id="naysayer-1",
+    )
     assert ctx.own_role is Role.NAYSAYER
+    assert ctx.own_instance_id == "naysayer-1"

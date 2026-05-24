@@ -5,6 +5,15 @@ keys to be unified. These constants are the single definition of those key
 names; the dispatcher builds Event entries through the helpers here, and a
 unit test asserts the keys come from these constants (the enforcement
 boundary placed in T13 per PR #56 verify / msg-183 carry-forward).
+
+NOTE (I3 v2.2 / T26): the chatroom reply *author* switched to ``instance_id``
+(T25), but the event-log ``author`` below intentionally still uses the bare
+role — the v2.2 amendment scoped ``event_log`` out. This temporarily diverges
+the identity SOT that anchor #6 unified (chatroom-author == event-log-author);
+unifying ``event_log`` author → ``instance_id`` is tracked as **T26**
+(blocked_by T25). No functional harm in Phase 1 (1-role-1-instance: role and
+instance_id are 1:1). PR #69 review (main) confirmed this is a follow-up, not
+an expansion of T25.
 """
 
 from __future__ import annotations
@@ -45,7 +54,7 @@ def reply_sent_event(
         occurred_at=datetime.now(UTC),
         kind=EVENT_KIND_REPLY_SENT,
         fields={
-            EVENT_FIELD_AUTHOR: handle.role.value,
+            EVENT_FIELD_AUTHOR: handle.role.value,  # T26: still role (see module note)
             EVENT_FIELD_MODEL_ID: str(draft.adapter_metadata.get("model_id") or ""),
             EVENT_FIELD_SESSION_ID: handle.session_id,
             EVENT_FIELD_ADAPTER_ID: handle.adapter_id,
@@ -72,7 +81,7 @@ def delivery_failed_event(
         occurred_at=datetime.now(UTC),
         kind=EVENT_KIND_DELIVERY_FAILED,
         fields={
-            EVENT_FIELD_AUTHOR: handle.role.value,
+            EVENT_FIELD_AUTHOR: handle.role.value,  # T26: still role (see module note)
             EVENT_FIELD_SESSION_ID: handle.session_id,
             EVENT_FIELD_ADAPTER_ID: handle.adapter_id,
             EVENT_FIELD_FAILED_EVENT_ID: event.event_id,

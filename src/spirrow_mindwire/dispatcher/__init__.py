@@ -1,7 +1,7 @@
 """T13 Dispatcher core — ADR-2026-05-21-06 §3.2 / §4 (Phase 1).
 
 - Step 1' (skeleton): I8 SessionState FSM + dict-backed AdapterRegistry.
-- Step 2 (live dispatch loop): :class:`Dispatcher` — spawn_role / dispatch
+- Step 2 (live dispatch loop): :class:`Dispatcher` — spawn_instance / dispatch
   (I4 dedup, I9 per-session FIFO) / reply completion (I5 idempotency_key
   via :class:`ChatroomGateway`) / on_event_log (I7 isolation).
 

@@ -57,7 +57,7 @@ class _FakeGateway:
         self,
         thread_ref: ThreadRef,
         *,
-        author: Role,
+        author: str,
         body: str,
         reply_to_msg_id: str | None,
         idempotency_key: str,
@@ -79,6 +79,7 @@ class _RecordingReplyAdapter:
         self.ctx = ctx
         return SessionHandle(
             session_id=new_ulid(),
+            instance_id=ctx.own_instance_id,
             adapter_id=self.adapter_id,
             thread_ref=thread_ref,
             role=role,
@@ -115,6 +116,34 @@ async def test_start_spawns_session() -> None:
     )
     await watcher.start(baseline=False)
     assert adapter.ctx is not None  # session spawned
+
+
+def test_watchspec_defaults_instance_id_to_phase1_mint() -> None:
+    # T24 / ADR-08 §2.2: a single-instance WatchSpec needs no explicit
+    # instance_id — it defaults to mint_instance_id(role) ("{role}-1").
+    assert WatchSpec(_thread_ref(), Role.PROPOSER).instance_id == "proposer-1"
+    assert WatchSpec(_thread_ref(), Role.NAYSAYER).instance_id == "naysayer-1"
+
+
+@pytest.mark.anyio
+async def test_watchspec_separates_instances_of_same_thread_role() -> None:
+    # T24 / ADR-08 §2.2: two instances of the same (thread, role) are distinct
+    # WatchSpec keys (instance_id is part of identity), so _handles no longer
+    # collides — the v2.1 dict-key collision (add_watch no-op'ing a 2nd
+    # same-(thread, role) instance) is structurally resolved.
+    ref = _thread_ref()
+    adapter = _RecordingReplyAdapter()
+    watcher = ChatroomWatcher(
+        _FakeMcp([]),
+        _dispatcher_with(adapter, _FakeGateway()),
+        [
+            WatchSpec(ref, Role.PROPOSER, instance_id="proposer-1"),
+            WatchSpec(ref, Role.PROPOSER, instance_id="proposer-2"),
+        ],
+    )
+    await watcher.start(baseline=False)
+    assert len(watcher._handles) == 2
+    assert {h.instance_id for h in watcher._handles.values()} == {"proposer-1", "proposer-2"}
 
 
 @pytest.mark.anyio

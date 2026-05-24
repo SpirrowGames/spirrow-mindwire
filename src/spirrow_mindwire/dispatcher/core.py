@@ -33,7 +33,7 @@ EventSink = Callable[[Event], Awaitable[None]]
 
 
 class NoQualifiedAdapterError(LookupError):
-    """Raised by :meth:`Dispatcher.spawn_role` when no adapter qualifies for a role."""
+    """Raised by :meth:`Dispatcher.spawn_instance` when no adapter qualifies for a role."""
 
 
 class UnknownSessionError(KeyError):
@@ -73,14 +73,30 @@ class Dispatcher:
         self._dedup = EventDedup(max_size=dedup_size)
         self._sessions: dict[SessionHandle, _DispatchSession] = {}
 
-    async def spawn_role(self, thread_ref: ThreadRef, role: Role) -> SessionHandle:
-        """Spawn a qualified adapter session for ``role`` on ``thread_ref``.
+    async def spawn_instance(
+        self, thread_ref: ThreadRef, role: Role, instance_id: str
+    ) -> SessionHandle:
+        """Spawn a qualified adapter session as instance ``instance_id``.
+
+        ``role`` is retained (Instance attribute) for adapter selection;
+        ``instance_id`` is the stable per-instance label (ADR-2026-05-24-08
+        §2.2) handed to the adapter via :attr:`SpawnContext.own_instance_id`
+        so it lands on the returned :class:`SessionHandle`. Phase 1 callers
+        mint it with :func:`~spirrow_mindwire.value_objects.mint_instance_id`
+        (``"{role}-1"``); the dispatcher does not mint here (parallel
+        allocation is a caller/Phase 2 concern, the seam is in ``mint_*``).
 
         Phase 1 policy = first qualified adapter (registry lookup only;
         ADR-06 §3.2 ``qualified_for`` policy-isation is Phase 2). Raises
         :class:`NoQualifiedAdapterError` if none qualify (e.g. no
         ``NAYSAYER_QUALIFIED`` adapter for the naysayer slot — ADR-05 §5).
+        Raises :class:`ValueError` on an empty/blank ``instance_id``: it becomes
+        the chatroom reply author (I3 v2.2), so a blank label would post an
+        author-less reply. Phase 1's only caller (``WatchSpec``) always mints a
+        non-empty id, but this Port is the Phase 2 public surface — fail loud.
         """
+        if not instance_id.strip():
+            raise ValueError("spawn_instance requires a non-empty instance_id")
         candidates = self._registry.qualified_for(role)
         if not candidates:
             raise NoQualifiedAdapterError(f"no adapter qualified for role {role.value!r}")
@@ -90,7 +106,12 @@ class Dispatcher:
         async def on_reply(draft: ReplyDraft) -> None:
             await self._handle_reply(session, draft)
 
-        ctx = SpawnContext(on_reply=on_reply, on_event_log=self._on_event_log, own_role=role)
+        ctx = SpawnContext(
+            on_reply=on_reply,
+            on_event_log=self._on_event_log,
+            own_role=role,
+            own_instance_id=instance_id,
+        )
         handle = await adapter.spawn(thread_ref, role, ctx)
         session.handle = handle
         self._sessions[handle] = session
@@ -140,7 +161,7 @@ class Dispatcher:
         idempotency_key = f"{handle.session_id}:{session.reply_seq}"  # I5
         posted_msg_id = await self._gateway.post_reply(
             handle.thread_ref,
-            author=handle.role,  # I3: author = session role
+            author=handle.instance_id,  # I3 v2.2 (ADR-06 amendment): author = instance_id
             body=draft.body,
             reply_to_msg_id=draft.reply_to_msg_id,
             idempotency_key=idempotency_key,

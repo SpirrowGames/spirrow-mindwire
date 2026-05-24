@@ -67,7 +67,7 @@ class _FakeGateway:
         self,
         thread_ref: ThreadRef,
         *,
-        author: Role,
+        author: str,
         body: str,
         reply_to_msg_id: str | None,
         idempotency_key: str,
@@ -100,6 +100,7 @@ class _ReplyingAdapter:
         self._ctx = ctx
         return SessionHandle(
             session_id=new_ulid(),
+            instance_id=ctx.own_instance_id,
             adapter_id=self.adapter_id,
             thread_ref=thread_ref,
             role=role,
@@ -141,14 +142,37 @@ async def test_spawn_and_dispatch_posts_reply() -> None:
     adapter = _ReplyingAdapter(reply_body="hello")
     gateway = _FakeGateway()
     disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     await disp.dispatch(handle, _event(msg_id="m9"))
     assert len(gateway.posts) == 1
     post = gateway.posts[0]
-    assert post["author"] is Role.PROPOSER  # I3: author = role
+    assert post["author"] == "proposer-1"  # I3 v2.2 (ADR-06 amendment): author = instance_id
     assert post["body"] == "hello"
     assert post["reply_to_msg_id"] == "m9"
     assert post["idempotency_key"] == f"{handle.session_id}:1"  # I5
+
+
+@pytest.mark.anyio
+async def test_spawn_instance_sets_instance_id_on_handle() -> None:
+    # T24 / ADR-08 §2.2: the instance_id handed to spawn_instance lands on the
+    # returned SessionHandle (delivered to the adapter via
+    # SpawnContext.own_instance_id, since the handle is identity-keyed / I2 and
+    # cannot be re-stamped after the adapter returns it).
+    adapter = _ReplyingAdapter()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=_FakeGateway())
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    assert handle.instance_id == "proposer-1"
+    assert handle.role is Role.PROPOSER
+
+
+@pytest.mark.anyio
+async def test_spawn_instance_rejects_blank_instance_id() -> None:
+    # SHOULD-3 (PR #69 naysayer): instance_id becomes the chatroom reply author
+    # (I3 v2.2), so a blank label is rejected at the dispatcher Port boundary.
+    disp = Dispatcher(registry=_registry_with(_ReplyingAdapter()), gateway=_FakeGateway())
+    for bad in ("", "   "):
+        with pytest.raises(ValueError, match="non-empty instance_id"):
+            await disp.spawn_instance(_thread_ref(), Role.PROPOSER, bad)
 
 
 @pytest.mark.anyio
@@ -156,7 +180,7 @@ async def test_idempotency_key_increments_per_session() -> None:
     adapter = _ReplyingAdapter()
     gateway = _FakeGateway()
     disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     await disp.dispatch(handle, _event(event_id="e1"))
     await disp.dispatch(handle, _event(event_id="e2"))
     keys = [p["idempotency_key"] for p in gateway.posts]
@@ -168,7 +192,7 @@ async def test_dedup_drops_duplicate_event_id() -> None:
     adapter = _ReplyingAdapter()
     gateway = _FakeGateway()
     disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     await disp.dispatch(handle, _event(event_id="dup"))
     await disp.dispatch(handle, _event(event_id="dup"))  # I4: skipped
     assert adapter.deliver_calls == 1
@@ -180,7 +204,7 @@ async def test_per_session_fifo_serializes_delivery() -> None:
     adapter = _ReplyingAdapter()
     gateway = _FakeGateway()
     disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     await asyncio.gather(
         disp.dispatch(handle, _event(event_id="e1")),
         disp.dispatch(handle, _event(event_id="e2")),
@@ -199,7 +223,7 @@ async def test_event_sink_failure_is_isolated_i7() -> None:
         raise RuntimeError("sink boom")
 
     disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway, event_sink=bad_sink)
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     # I7: a raising event-log sink must NOT break the main flow.
     await disp.dispatch(handle, _event())
     assert len(gateway.posts) == 1  # reply still posted despite the sink failure
@@ -215,7 +239,7 @@ async def test_reply_sent_event_uses_anchor6_keys() -> None:
         events.append(event)
 
     disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway, event_sink=sink)
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     await disp.dispatch(handle, _event())
     assert len(events) == 1
     ev = events[0]
@@ -226,11 +250,11 @@ async def test_reply_sent_event_uses_anchor6_keys() -> None:
 
 
 @pytest.mark.anyio
-async def test_spawn_role_no_qualified_adapter_raises() -> None:
+async def test_spawn_instance_no_qualified_adapter_raises() -> None:
     # _ReplyingAdapter lacks NAYSAYER_QUALIFIED → no naysayer candidate.
     disp = Dispatcher(registry=_registry_with(_ReplyingAdapter()), gateway=_FakeGateway())
     with pytest.raises(NoQualifiedAdapterError):
-        await disp.spawn_role(_thread_ref(), Role.NAYSAYER)
+        await disp.spawn_instance(_thread_ref(), Role.NAYSAYER, "naysayer-1")
 
 
 @pytest.mark.anyio
@@ -238,6 +262,7 @@ async def test_dispatch_unknown_handle_raises() -> None:
     disp = Dispatcher(registry=_registry_with(_ReplyingAdapter()), gateway=_FakeGateway())
     stray = SessionHandle(
         session_id="01JSTRAY",
+        instance_id="proposer-1",
         adapter_id="x",
         thread_ref=_thread_ref(),
         role=Role.PROPOSER,
@@ -299,19 +324,20 @@ async def test_live_claude_code_adapter_with_dispatcher(tmp_path: Path) -> None:
     # ADR-05 §5 architecture-level independence: claude-code (same model family
     # as main, no NAYSAYER_QUALIFIED) is excluded from the naysayer slot.
     with pytest.raises(NoQualifiedAdapterError):
-        await disp.spawn_role(_thread_ref(), Role.NAYSAYER)
+        await disp.spawn_instance(_thread_ref(), Role.NAYSAYER, "naysayer-1")
 
     # …but it serves the proposer slot end-to-end (real adapter + dispatcher).
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     await disp.dispatch(handle, _event(msg_id="m1"))
     assert len(gateway.posts) == 1
-    assert gateway.posts[0]["author"] is Role.PROPOSER
+    assert gateway.posts[0]["author"] == "proposer-1"  # I3 v2.2: author = instance_id
     assert gateway.posts[0]["body"] == "real reply"
 
 
 def test_reply_sent_event_normalizes_missing_model_id() -> None:
     handle = SessionHandle(
         session_id="s",
+        instance_id="proposer-1",
         adapter_id="a",
         thread_ref=_thread_ref(),
         role=Role.PROPOSER,
