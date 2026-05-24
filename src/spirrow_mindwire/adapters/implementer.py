@@ -254,6 +254,9 @@ def _classify_gh(tokens: list[str]) -> ClassifiedAction:
         base = _flag_value(tokens, "--base") or _flag_value(tokens, "-B")
         return ClassifiedAction(Operation.GITHUB_PR_OPEN, target=base, detail=detail)
     if group == "release" or (group == "repo" and sub in ("delete", "archive")):
+        # `gh release` is treated as publish for ALL subcommands — including reads
+        # (list/view/download). Deliberate over-deny on the safe side; the
+        # _RAW_FORBIDDEN indirection pattern mirrors it so direct == wrapped (T23).
         return ClassifiedAction(Operation.EXTERNAL_PUBLISH, detail=detail)
     if group == "api" and _gh_api_is_mutation(tokens):
         # A mutating `gh api` (-X/--method write verb, or field flags that make gh
@@ -288,6 +291,14 @@ def _gh_api_is_mutation(tokens: list[str]) -> bool:
     explicit GET/HEAD method, or no fields at all, reads.
     """
     method = (_flag_value(tokens, "-X") or _flag_value(tokens, "--method") or "").upper()
+    if not method:
+        # Short flag with the value concatenated, e.g. `-XPUT` / `-Xdelete` (gh
+        # accepts this; _flag_value only catches `-X PUT` and `-X=PUT`).
+        for tok in tokens:
+            concat = re.fullmatch(r"-X([A-Za-z]+)", tok)
+            if concat:
+                method = concat.group(1).upper()
+                break
     if method:
         return method in _GH_API_MUTATING_METHODS
     for tok in tokens:
@@ -347,10 +358,20 @@ _RAW_FORBIDDEN: tuple[tuple[re.Pattern[str], Operation], ...] = (
         ),
         Operation.EXTERNAL_PUBLISH,
     ),
-    # T23: mutating `gh api` via indirection (e.g. `bash -c "gh api .../merges -X PUT"`).
+    # T23: mutating `gh api` via indirection — an explicit write method
+    # (`bash -c "gh api .../merges -X PUT"`) OR a field flag
+    # (`... -f base=main`), since gh defaults to POST when fields are present and
+    # no method is given. Mirrors the direct-path _gh_api_is_mutation (method OR
+    # field); case-insensitive so lowercase verbs / -XPUT concatenation are caught.
     # Direct calls are classified in _classify_gh; this backstops the wrapped form.
     (
-        re.compile(r"\bgh\b.*\bapi\b.*(?:-X|--method)[=\s]*(?:POST|PUT|PATCH|DELETE)\b"),
+        re.compile(
+            r"\bgh\b.*\bapi\b(?:"
+            r".*(?:-X|--method)[=\s]*(?:POST|PUT|PATCH|DELETE)"
+            r"|.*(?:\s-[fF]\b|\s-[fF]\S*=|\s--field\b|\s--raw-field\b|\s--input\b)"
+            r")",
+            re.IGNORECASE,
+        ),
         Operation.UNKNOWN,
     ),
 )
@@ -508,6 +529,10 @@ def _current_branch(repo_root: Path) -> str | None:
     prints ``HEAD``), a non-repo, or any git failure — the guard treats None as
     fail-closed (the action is downgraded to UNKNOWN → deny) rather than letting a
     missing branch pass a constraint.
+
+    Assumes ``repo_root`` is implementer-managed (its own clone): running ``git``
+    there trusts that repo's ``.git/config`` (aliases / hooks). Acceptable in
+    Phase 1 (self-clone); flagged for later if untrusted repos are ever gated.
     """
     try:
         result = subprocess.run(

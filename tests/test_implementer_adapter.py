@@ -117,6 +117,15 @@ def test_classify_fs_write_carries_path() -> None:
         ('bash -c "npm publish"', Operation.EXTERNAL_PUBLISH),
         ("eval 'twine upload dist/*'", Operation.EXTERNAL_PUBLISH),
         ('bash -c "gh api repos/o/r/merges -X PUT"', Operation.UNKNOWN),
+        # T23 review (naysayer MUST-1): field-flag gh api via indirection (gh
+        # defaults to POST) + lowercase verb must also deny, not fall to READ.
+        ('bash -c "gh api repos/o/r/pulls -f title=x"', Operation.UNKNOWN),
+        ('bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('bash -c "gh api repos/o/r/contents/x -X post"', Operation.UNKNOWN),
+        # T23 review (main SHOULD): direct `-X` with value concatenated (no space).
+        ("gh api repos/o/r/merges -XPUT", Operation.UNKNOWN),
+        ("gh api repos/o/r/contents/x -XDELETE", Operation.UNKNOWN),
+        ("gh api repos/o/r -Xget", Operation.GITHUB_READ),
     ],
 )
 def test_classify_bash(cmd: str, expected: Operation) -> None:
