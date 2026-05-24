@@ -234,7 +234,8 @@ async def test_own_role_self_filter() -> None:
     github = _FakeGitHub()
     adapter = NaysayerPrReviewAdapter(lexora=_FakeLexora(), github=github)
     handle = await _spawn(adapter, [])
-    await adapter.deliver_event(handle, _event(author="naysayer"))
+    # I3 v2.2: the self-filter keys on instance_id ("naysayer-1"), not the bare role.
+    await adapter.deliver_event(handle, _event(author="naysayer-1"))
     assert github.fetched == []
 
 

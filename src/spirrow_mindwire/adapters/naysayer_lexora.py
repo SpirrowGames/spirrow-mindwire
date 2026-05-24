@@ -221,9 +221,12 @@ class NaysayerLexoraAdapter:
             # Phase 1/2 handle NEW_MESSAGE only; other event types are no-ops.
             return
         payload = event.payload
-        if payload.author == session.own_role.value:
-            # own_role self-filter (Gap-2 (b)): drop our own post echoed back,
-            # defending against a dispatcher routing bug causing a self-reply loop.
+        if payload.author == handle.instance_id:
+            # instance self-filter (Gap-2 (b), I3 v2.2): drop our own post echoed
+            # back — replies are now posted with author = instance_id (e.g.
+            # "naysayer-1"), so the filter compares against our instance_id, not
+            # the bare role. Defends against a dispatcher routing bug causing a
+            # self-reply loop.
             return
 
         session.state = SessionState.PROCESSING

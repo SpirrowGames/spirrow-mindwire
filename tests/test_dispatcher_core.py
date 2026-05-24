@@ -166,6 +166,16 @@ async def test_spawn_instance_sets_instance_id_on_handle() -> None:
 
 
 @pytest.mark.anyio
+async def test_spawn_instance_rejects_blank_instance_id() -> None:
+    # SHOULD-3 (PR #69 naysayer): instance_id becomes the chatroom reply author
+    # (I3 v2.2), so a blank label is rejected at the dispatcher Port boundary.
+    disp = Dispatcher(registry=_registry_with(_ReplyingAdapter()), gateway=_FakeGateway())
+    for bad in ("", "   "):
+        with pytest.raises(ValueError, match="non-empty instance_id"):
+            await disp.spawn_instance(_thread_ref(), Role.PROPOSER, bad)
+
+
+@pytest.mark.anyio
 async def test_idempotency_key_increments_per_session() -> None:
     adapter = _ReplyingAdapter()
     gateway = _FakeGateway()

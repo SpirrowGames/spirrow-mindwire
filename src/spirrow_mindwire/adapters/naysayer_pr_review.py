@@ -240,7 +240,9 @@ class NaysayerPrReviewAdapter:
         if event.event_type is not EventType.NEW_MESSAGE:
             return
         payload = event.payload
-        if payload.author == session.own_role.value:
+        if payload.author == handle.instance_id:
+            # instance self-filter (Gap-2 (b), I3 v2.2): drop our own echoed post
+            # (author == our instance_id, e.g. "naysayer-1"), not the bare role.
             return
         pr = parse_pr_ref(payload.body)
         if pr is None:

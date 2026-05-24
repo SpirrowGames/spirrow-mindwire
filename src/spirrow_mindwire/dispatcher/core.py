@@ -90,7 +90,13 @@ class Dispatcher:
         ADR-06 §3.2 ``qualified_for`` policy-isation is Phase 2). Raises
         :class:`NoQualifiedAdapterError` if none qualify (e.g. no
         ``NAYSAYER_QUALIFIED`` adapter for the naysayer slot — ADR-05 §5).
+        Raises :class:`ValueError` on an empty/blank ``instance_id``: it becomes
+        the chatroom reply author (I3 v2.2), so a blank label would post an
+        author-less reply. Phase 1's only caller (``WatchSpec``) always mints a
+        non-empty id, but this Port is the Phase 2 public surface — fail loud.
         """
+        if not instance_id.strip():
+            raise ValueError("spawn_instance requires a non-empty instance_id")
         candidates = self._registry.qualified_for(role)
         if not candidates:
             raise NoQualifiedAdapterError(f"no adapter qualified for role {role.value!r}")

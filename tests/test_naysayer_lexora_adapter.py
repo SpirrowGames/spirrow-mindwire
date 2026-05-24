@@ -288,8 +288,9 @@ async def test_own_role_self_filter_skips() -> None:
     captured: list[ReplyDraft] = []
     adapter = NaysayerLexoraAdapter(client=fake)
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
-    # author == own_role ("naysayer") → our own post echoed back, filtered out.
-    await adapter.deliver_event(handle, _event(author="naysayer"))
+    # author == our instance_id ("naysayer-1") → our own post echoed back, filtered
+    # out (I3 v2.2: the self-filter keys on instance_id, not the bare role).
+    await adapter.deliver_event(handle, _event(author="naysayer-1"))
     assert captured == []
     assert fake.calls == []
 

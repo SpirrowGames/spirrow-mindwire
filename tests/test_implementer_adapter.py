@@ -471,7 +471,8 @@ async def test_own_role_self_filter(tmp_path: Path) -> None:
         client_factory=_factory(responses=[_assistant("x"), _result()], capture=cap),
     )
     handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx(captured))
-    await adapter.deliver_event(handle, _event(author="implementer"))
+    # I3 v2.2: the self-filter keys on instance_id ("implementer-1"), not the bare role.
+    await adapter.deliver_event(handle, _event(author="implementer-1"))
     assert captured == []
     assert cap[0].queries == []
 

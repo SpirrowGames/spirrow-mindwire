@@ -238,10 +238,11 @@ async def test_proposer_then_naysayer_round_trip(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_naysayer_does_not_critique_its_own_post(tmp_path: Path) -> None:
     # The naysayer self-filters its own post echoed back (no self-reply loop).
+    # I3 v2.2: the echoed author is the instance_id ("naysayer-1"), not the role.
     disp, _registry, gateway = _build(tmp_path, proposal="p", critique="c")
     naysayer = await disp.spawn_instance(_thread_ref(), Role.NAYSAYER, "naysayer-1")
     await disp.dispatch(
         naysayer,
-        _new_message(event_id="e1", author="naysayer", body="my own critique", msg_id="n1"),
+        _new_message(event_id="e1", author="naysayer-1", body="my own critique", msg_id="n1"),
     )
     assert gateway.posts == []

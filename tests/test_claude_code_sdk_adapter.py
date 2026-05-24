@@ -203,8 +203,9 @@ async def test_own_role_self_filter_skips(tmp_path: Path) -> None:
     captured: list[ReplyDraft] = []
     adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
     handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx(captured))
-    # author == own_role ("proposer") → our own post echoed back, filtered out.
-    await adapter.deliver_event(handle, _event(author="proposer"))
+    # author == our instance_id ("proposer-1") → our own post echoed back, filtered
+    # out (I3 v2.2: the self-filter keys on instance_id, not the bare role).
+    await adapter.deliver_event(handle, _event(author="proposer-1"))
     assert captured == []
     assert client.queries == []
 
