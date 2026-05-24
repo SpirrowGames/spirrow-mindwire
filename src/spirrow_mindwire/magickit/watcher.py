@@ -35,6 +35,7 @@ from ..value_objects import (
     Role,
     SessionHandle,
     ThreadRef,
+    mint_instance_id,
 )
 from .client import McpToolCaller
 
@@ -43,10 +44,25 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class WatchSpec:
-    """One ``(thread, role)`` the watcher runs (Phase 1 explicit assignment)."""
+    """One ``(thread, role)`` instance the watcher runs (Phase 1 explicit assignment).
+
+    ``instance_id`` is the stable per-instance label (ADR-2026-05-24-08 §2.2);
+    it defaults to ``mint_instance_id(role)`` (``"{role}-1"``, the Phase 1
+    1-role-1-instance case) so existing single-instance call sites need not
+    pass it, while parallel instances (Phase 2) pass distinct ids. It is part
+    of the dataclass identity, so ``_handles`` keyed by ``WatchSpec`` separates
+    two instances of the same ``(thread, role)`` — the v2.1 dict-key collision
+    (``add_watch`` no-op'ing a same-``(thread, role)`` second instance) is
+    resolved structurally (ADR-08 §2.2).
+    """
 
     thread_ref: ThreadRef
     role: Role
+    instance_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.instance_id:
+            object.__setattr__(self, "instance_id", mint_instance_id(self.role))
 
 
 def _parse_occurred_at(value: Any) -> datetime:
@@ -86,7 +102,9 @@ class ChatroomWatcher:
         messages (e.g. the dogfood driver answering a pre-posted question).
         """
         for watch in self._watches:
-            self._handles[watch] = await self._dispatcher.spawn_role(watch.thread_ref, watch.role)
+            self._handles[watch] = await self._dispatcher.spawn_instance(
+                watch.thread_ref, watch.role, watch.instance_id
+            )
             if baseline:
                 await self._baseline(watch)
 
@@ -102,7 +120,9 @@ class ChatroomWatcher:
         """
         if watch in self._handles:
             return
-        self._handles[watch] = await self._dispatcher.spawn_role(watch.thread_ref, watch.role)
+        self._handles[watch] = await self._dispatcher.spawn_instance(
+            watch.thread_ref, watch.role, watch.instance_id
+        )
         # Register for polling too — poll_once() iterates _watches, so a watch
         # added only to _handles would spawn a session that never receives events
         # (the orchestrator wiring would be inert).

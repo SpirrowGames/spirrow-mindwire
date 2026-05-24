@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..value_objects import Role, ThreadRef
+from ..value_objects import ThreadRef
 from .client import MagickitMcpError, McpToolCaller
 
 
@@ -50,7 +50,7 @@ class MagickitChatroomGateway:
         self,
         thread_ref: ThreadRef,
         *,
-        author: Role,
+        author: str,
         body: str,
         reply_to_msg_id: str | None,
         idempotency_key: str,
@@ -64,7 +64,7 @@ class MagickitChatroomGateway:
             "project": thread_ref.project_id,
             "thread_id": thread_ref.thread_id,
             "msg_type": self._reply_msg_type,
-            "author": author.value,  # I3: author = role name
+            "author": author,  # I3 v2.2 (ADR-06 amendment): author = instance_id
             "content": body,
         }
         if reply_to_msg_id is not None:

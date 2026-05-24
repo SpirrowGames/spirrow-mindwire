@@ -128,7 +128,12 @@ async def test_live_naysayer_adapter_round_trip() -> None:
     async def on_event_log(_event: Event) -> None:
         return None
 
-    ctx = SpawnContext(on_reply=on_reply, on_event_log=on_event_log, own_role=Role.NAYSAYER)
+    ctx = SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=Role.NAYSAYER,
+        own_instance_id="naysayer-1",
+    )
     thread_ref = ThreadRef(
         project_id="spirrow-mindwire", thread_id="smoke-thread", chatroom_uri="mc://smoke"
     )

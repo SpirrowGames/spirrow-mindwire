@@ -215,6 +215,7 @@ class NaysayerPrReviewAdapter:
         now = datetime.now(UTC)
         handle = SessionHandle(
             session_id=new_ulid(),
+            instance_id=ctx.own_instance_id,
             adapter_id=self.adapter_id,
             thread_ref=thread_ref,
             role=role,

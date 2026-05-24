@@ -118,7 +118,12 @@ def _ctx(captured: list[ReplyDraft]) -> SpawnContext:
     async def on_event_log(_event: Event) -> None:
         return None
 
-    return SpawnContext(on_reply=on_reply, on_event_log=on_event_log, own_role=Role.NAYSAYER)
+    return SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=Role.NAYSAYER,
+        own_instance_id="naysayer-1",
+    )
 
 
 def _event(*, author: str = "orchestrator", body: str = f"review {_PR_TEXT}") -> ChatroomEvent:

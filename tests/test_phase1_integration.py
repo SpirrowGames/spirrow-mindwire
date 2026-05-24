@@ -95,7 +95,7 @@ class _FakeGateway:
         self,
         thread_ref: ThreadRef,
         *,
-        author: Role,
+        author: str,
         body: str,
         reply_to_msg_id: str | None,
         idempotency_key: str,
@@ -144,11 +144,11 @@ def _build(
 async def test_smoke_proposer_round_trip(tmp_path: Path) -> None:
     # §8 acceptance: 1 thread / 1 role / 1 round-trip → author=proposer reply.
     disp, _adapter, gateway, events = _build(_SdkClient(responses=_ok_responses()), tmp_path)
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     await disp.dispatch(handle, _event(msg_id="m9"))
 
     assert len(gateway.posts) == 1
-    assert gateway.posts[0]["author"] is Role.PROPOSER
+    assert gateway.posts[0]["author"] == "proposer-1"  # I3 v2.2: author = instance_id
     assert gateway.posts[0]["body"] == "reply text"
     assert gateway.posts[0]["idempotency_key"] == f"{handle.session_id}:1"
     assert [e.kind for e in events] == [EVENT_KIND_REPLY_SENT]
@@ -159,7 +159,7 @@ async def test_smoke_proposer_round_trip(tmp_path: Path) -> None:
 async def test_delivery_failure_logs_failed_event(tmp_path: Path) -> None:
     # §8: a failure leaves a FAILED entry in the Event log.
     disp, adapter, gateway, events = _build(_SdkClient(fail_on="query"), tmp_path)
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
 
     with pytest.raises(ClaudeCodeSdkDeliveryError):
         await disp.dispatch(handle, _event())
@@ -180,7 +180,7 @@ async def test_halt_releases_resources_and_blocks_delivery(tmp_path: Path) -> No
     # §8: halt releases resources (client disconnected) + the session stops.
     client = _SdkClient(responses=_ok_responses())
     disp, adapter, _gateway, _events = _build(client, tmp_path)
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     await disp.dispatch(handle, _event(event_id="e1"))
 
     await disp.halt(handle)
@@ -200,7 +200,7 @@ async def test_halt_releases_resources_and_blocks_delivery(tmp_path: Path) -> No
 async def test_consecutive_messages_preserve_fifo_and_seq(tmp_path: Path) -> None:
     # §8 integration: consecutive NEW_MESSAGE keep order + monotonic reply_seq (I5/I9).
     disp, _adapter, gateway, _events = _build(_SdkClient(responses=_ok_responses()), tmp_path)
-    handle = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     await disp.dispatch(handle, _event(event_id="e1", msg_id="m1"))
     await disp.dispatch(handle, _event(event_id="e2", msg_id="m2"))
 

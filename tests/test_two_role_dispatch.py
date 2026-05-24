@@ -109,7 +109,7 @@ class _FakeGateway:
         self,
         thread_ref: ThreadRef,
         *,
-        author: Role,
+        author: str,
         body: str,
         reply_to_msg_id: str | None,
         idempotency_key: str,
@@ -188,7 +188,7 @@ async def test_naysayer_slot_unfilled_raises_on_spawn(tmp_path: Path) -> None:
     registry.register(proposer)
     disp = Dispatcher(registry=registry, gateway=_FakeGateway())
     with pytest.raises(NoQualifiedAdapterError):
-        await disp.spawn_role(_thread_ref(), Role.NAYSAYER)
+        await disp.spawn_instance(_thread_ref(), Role.NAYSAYER, "naysayer-1")
 
 
 # --------------------------------------------------------------------------- #
@@ -203,8 +203,8 @@ async def test_proposer_then_naysayer_round_trip(tmp_path: Path) -> None:
         proposal="We should cache everything forever.",
         critique="You wrote 'cache everything forever' — that ignores invalidation.",
     )
-    proposer = await disp.spawn_role(_thread_ref(), Role.PROPOSER)
-    naysayer = await disp.spawn_role(_thread_ref(), Role.NAYSAYER)
+    proposer = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    naysayer = await disp.spawn_instance(_thread_ref(), Role.NAYSAYER, "naysayer-1")
     assert proposer.adapter_id == "claude-code-sdk"
     assert naysayer.adapter_id == "naysayer-lexora"
 
@@ -215,7 +215,7 @@ async def test_proposer_then_naysayer_round_trip(tmp_path: Path) -> None:
     )
     assert len(gateway.posts) == 1
     proposal_post = gateway.posts[0]
-    assert proposal_post["author"] is Role.PROPOSER
+    assert proposal_post["author"] == "proposer-1"  # I3 v2.2: author = instance_id
     assert proposal_post["body"] == "We should cache everything forever."
 
     # 2) proposer's proposal → naysayer: the independent critic responds.
@@ -230,7 +230,7 @@ async def test_proposer_then_naysayer_round_trip(tmp_path: Path) -> None:
     )
     assert len(gateway.posts) == 2
     critique_post = gateway.posts[1]
-    assert critique_post["author"] is Role.NAYSAYER
+    assert critique_post["author"] == "naysayer-1"  # I3 v2.2: author = instance_id
     assert "invalidation" in critique_post["body"]
     assert critique_post["reply_to_msg_id"] == "p1"
 
@@ -239,7 +239,7 @@ async def test_proposer_then_naysayer_round_trip(tmp_path: Path) -> None:
 async def test_naysayer_does_not_critique_its_own_post(tmp_path: Path) -> None:
     # The naysayer self-filters its own post echoed back (no self-reply loop).
     disp, _registry, gateway = _build(tmp_path, proposal="p", critique="c")
-    naysayer = await disp.spawn_role(_thread_ref(), Role.NAYSAYER)
+    naysayer = await disp.spawn_instance(_thread_ref(), Role.NAYSAYER, "naysayer-1")
     await disp.dispatch(
         naysayer,
         _new_message(event_id="e1", author="naysayer", body="my own critique", msg_id="n1"),

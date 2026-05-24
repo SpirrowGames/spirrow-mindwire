@@ -109,21 +109,47 @@ class SessionHandle:
     are never leaked through this token; they surface only via
     :attr:`HealthStatus.details` for observability (I2).
 
+    ``session_id`` vs ``instance_id`` (ADR-2026-05-24-08 §2.1): ``session_id``
+    is a per-spawn ULID that changes on every (re-)spawn, whereas
+    ``instance_id`` is the *stable* per-instance label (e.g.
+    ``"implementer-1"``) that identifies the same individual across re-spawns
+    and is the SOT for the chatroom reply author (I3 v2.2, ADR-06 amendment).
+    Phase 1 is 1-role-1-instance so ``instance_id`` is ``mint_instance_id``'s
+    ``"{role}-1"``; the ``-2`` … suffix seam is Phase 2.
+
     ``eq=False`` is **load-bearing** (ADR-06 §4 I2): equality must be
     *identity* equality (Python ``is``), never value equality. With
     ``eq=False`` the dataclass leaves ``__eq__`` / ``__hash__`` as
     ``object``'s identity-based implementations, so two ``spawn()`` results
     whose fields happen to coincide are still distinct sessions and remain
-    usable as ``dict`` keys by identity. ``frozen=True`` keeps the token
-    immutable. Do **not** add ``eq=True`` or override ``__eq__`` /
-    ``__hash__``.
+    usable as ``dict`` keys by identity. Adding ``instance_id`` does **not**
+    change this: two handles sharing an ``instance_id`` are still distinct
+    objects (a re-spawn is a new session of the same instance). ``frozen=True``
+    keeps the token immutable. Do **not** add ``eq=True`` or override
+    ``__eq__`` / ``__hash__``.
     """
 
-    session_id: str  # ULID
+    session_id: str  # ULID, per-spawn
+    instance_id: str  # stable per-instance label, e.g. "implementer-1" (ADR-08 §2.1)
     adapter_id: str
     thread_ref: ThreadRef
     role: Role
     started_at: datetime  # iso_z
+
+
+def mint_instance_id(role: Role) -> str:
+    """Mint the Phase 1 ``instance_id`` for ``role`` → ``"{role}-1"``.
+
+    Phase 1 (ADR-2026-05-24-08 §1 近期スコープ) runs 1 role = 1 instance, so a
+    role's instance is always its ``-1``. This function is the **seam** for
+    Phase 2 parallel instances: when the dispatcher spawns the Nth concurrent
+    instance of a role it will allocate an incrementing ``-2`` / ``-3`` …
+    suffix here. Kept beside :class:`Role` (a pure label policy) rather than in
+    the dispatcher so both the dispatcher and the watcher's :class:`WatchSpec`
+    default share one source (ADR-08 §5 names ``dispatcher/core.py``; placed
+    here to avoid a value-object → dispatcher import — see T24 report).
+    """
+    return f"{role.value}-1"
 
 
 # --------------------------------------------------------------------------- #
@@ -272,4 +298,5 @@ __all__ = [
     "SessionHandle",
     "SessionState",
     "ThreadRef",
+    "mint_instance_id",
 ]

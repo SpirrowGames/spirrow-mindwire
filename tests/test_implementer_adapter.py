@@ -364,7 +364,12 @@ def _ctx(captured: list[ReplyDraft]) -> SpawnContext:
     async def on_event_log(_event: Event) -> None:
         return None
 
-    return SpawnContext(on_reply=on_reply, on_event_log=on_event_log, own_role=Role.IMPLEMENTER)
+    return SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=Role.IMPLEMENTER,
+        own_instance_id="implementer-1",
+    )
 
 
 def _event(

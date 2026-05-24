@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from ..value_objects import Role, ThreadRef
+from ..value_objects import ThreadRef
 
 
 class ChatroomGateway(Protocol):
@@ -22,15 +22,17 @@ class ChatroomGateway(Protocol):
         self,
         thread_ref: ThreadRef,
         *,
-        author: Role,
+        author: str,
         body: str,
         reply_to_msg_id: str | None,
         idempotency_key: str,
     ) -> str:
         """Post a reply and return the ChatRoom-assigned message id.
 
-        ``author`` is the session role (ADR-06 §2.4 dispatcher-completed
-        field; I3 author = role). ``idempotency_key`` is the I5 dedup key
+        ``author`` is the session's stable ``instance_id`` (e.g.
+        ``"proposer-1"``) — ADR-06 §2.4 dispatcher-completed field, I3 v2.2
+        (ADR-06 amendment): author = instance_id, not the bare role.
+        ``idempotency_key`` is the I5 dedup key
         (``f"{session_id}:{reply_seq}"``) for ChatRoom-side dedup.
         """
         ...

@@ -120,7 +120,12 @@ def _ctx(captured: list[ReplyDraft], *, own_role: Role = Role.PROPOSER) -> Spawn
     async def on_event_log(_event: Event) -> None:
         return None
 
-    return SpawnContext(on_reply=on_reply, on_event_log=on_event_log, own_role=own_role)
+    return SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=own_role,
+        own_instance_id=f"{own_role.value}-1",
+    )
 
 
 def _thread_ref() -> ThreadRef:
@@ -146,6 +151,7 @@ def _event(
 def _stray_handle() -> SessionHandle:
     return SessionHandle(
         session_id="01JSTRAY",
+        instance_id="proposer-1",
         adapter_id="claude-code-sdk",
         thread_ref=_thread_ref(),
         role=Role.PROPOSER,
@@ -161,6 +167,7 @@ async def test_spawn_connects_and_returns_idle_handle(tmp_path: Path) -> None:
     assert client.connected is True
     assert handle.adapter_id == "claude-code-sdk"
     assert handle.role is Role.PROPOSER
+    assert handle.instance_id == "proposer-1"  # T24: stamped from ctx.own_instance_id
     hs = await adapter.health(handle)
     assert hs.state is SessionState.IDLE
     assert hs.error is None
@@ -317,7 +324,12 @@ async def test_deliver_on_reply_failure_marks_failed(tmp_path: Path) -> None:
     async def on_event_log(_event: Event) -> None:
         return None
 
-    ctx = SpawnContext(on_reply=on_reply, on_event_log=on_event_log, own_role=Role.PROPOSER)
+    ctx = SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=Role.PROPOSER,
+        own_instance_id="proposer-1",
+    )
     adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
     handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, ctx)
     with pytest.raises(ClaudeCodeSdkDeliveryError):
