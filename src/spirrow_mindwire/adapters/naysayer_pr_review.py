@@ -47,6 +47,7 @@ from ..github.client import (
     GitHubReviewClient,
     PrRef,
     ReviewEvent,
+    naysayer_github_token,
     parse_pr_ref,
 )
 from ..lexora.client import ChatMessage, LexoraChatClient, LexoraClient
@@ -201,8 +202,16 @@ class NaysayerPrReviewAdapter:
             if lexora is not None
             else LexoraClient(lexora_url, timeout_seconds=timeout_seconds)
         )
+        # T22: the naysayer authenticates as a SEPARATE GitHub identity
+        # (takahito-spirrowgames via MINDWIRE_NAYSAYER_GITHUB_TOKEN) so its
+        # APPROVE / REQUEST_CHANGES is not "approving your own PR". An explicit
+        # github_token arg wins (tests / overrides); otherwise resolve the
+        # naysayer identity (which falls back to the shared token until the
+        # distinct one is provisioned — see naysayer_github_token).
         self._github: GitHubReviewClient = (
-            github if github is not None else GitHubClient(github_token)
+            github
+            if github is not None
+            else GitHubClient(github_token if github_token is not None else naysayer_github_token())
         )
         self._sessions: dict[SessionHandle, _Session] = {}
 
@@ -313,11 +322,14 @@ class NaysayerPrReviewAdapter:
     async def _submit_review(self, pr: PrRef, verdict: ReviewEvent, body: str) -> None:
         """Submit the PR review, falling back to COMMENT on the same-identity 422.
 
-        GitHub forbids a formal APPROVE / REQUEST_CHANGES on your *own* PR. If the
-        scoped token shares the implementer's GitHub identity (env spec §4 SHOULD
-        provision a distinct one), the verdict event 422s — we then submit the
-        same body as a COMMENT review so the verdict (in the body) is still
-        recorded, rather than fail-closed-halting on a credential-config issue.
+        GitHub forbids a formal APPROVE / REQUEST_CHANGES on your *own* PR. T22
+        provisions the naysayer a distinct identity
+        (``MINDWIRE_NAYSAYER_GITHUB_TOKEN`` = ``takahito-spirrowgames``) so the
+        formal verdict goes through. This COMMENT fallback remains a backstop for
+        the window before that token is provisioned (the naysayer then shares the
+        author identity and the verdict event 422s): we re-submit the same body as
+        a COMMENT so the verdict (in the body) is still recorded, rather than
+        fail-closed-halting on a credential-config issue.
         """
         try:
             await self._github.submit_review(pr, event=verdict, body=body)

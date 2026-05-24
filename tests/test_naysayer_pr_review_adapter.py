@@ -19,7 +19,7 @@ from spirrow_mindwire.adapters.naysayer_pr_review import (
     _parse_verdict,
     _resolve_verdict,
 )
-from spirrow_mindwire.github.client import GitHubHTTPError, PrRef, ReviewEvent
+from spirrow_mindwire.github.client import GitHubClient, GitHubHTTPError, PrRef, ReviewEvent
 from spirrow_mindwire.lexora.client import ChatCompletion, ChatMessage
 from spirrow_mindwire.ports import RoleAdapter, SpawnContext
 from spirrow_mindwire.value_objects import (
@@ -428,3 +428,33 @@ async def test_same_identity_422_falls_back_to_comment() -> None:
     assert github.submitted[0][1] is ReviewEvent.COMMENT
     assert len(captured) == 1  # critique still posted
     assert (await adapter.health(handle)).state is SessionState.IDLE  # no fail-closed halt
+
+
+# ---------- T22: naysayer GitHub identity (token separation) -------------- #
+
+
+@pytest.mark.anyio
+async def test_adapter_authenticates_as_naysayer_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    # T22: with no explicit github client/token, the adapter authenticates GitHub
+    # as the SEPARATE naysayer identity (MINDWIRE_NAYSAYER_GITHUB_TOKEN), not the
+    # shared author token — so its APPROVE isn't "approving your own PR".
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", "nay-tok")
+    monkeypatch.setenv("MINDWIRE_GITHUB_TOKEN", "author-tok")
+    adapter = NaysayerPrReviewAdapter(lexora=_FakeLexora())
+    try:
+        assert isinstance(adapter._github, GitHubClient)
+        assert adapter._github._token == "nay-tok"
+    finally:
+        await adapter._github.aclose()
+
+
+@pytest.mark.anyio
+async def test_adapter_explicit_github_token_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An explicit github_token arg overrides env resolution (tests / overrides).
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", "nay-tok")
+    adapter = NaysayerPrReviewAdapter(lexora=_FakeLexora(), github_token="explicit-tok")
+    try:
+        assert isinstance(adapter._github, GitHubClient)
+        assert adapter._github._token == "explicit-tok"
+    finally:
+        await adapter._github.aclose()
