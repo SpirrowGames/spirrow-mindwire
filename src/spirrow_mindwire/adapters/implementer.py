@@ -42,6 +42,7 @@ import asyncio
 import os
 import re
 import shlex
+import subprocess
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -254,6 +255,14 @@ def _classify_gh(tokens: list[str]) -> ClassifiedAction:
         return ClassifiedAction(Operation.GITHUB_PR_OPEN, target=base, detail=detail)
     if group == "release" or (group == "repo" and sub in ("delete", "archive")):
         return ClassifiedAction(Operation.EXTERNAL_PUBLISH, detail=detail)
+    if group == "api" and _gh_api_is_mutation(tokens):
+        # A mutating `gh api` (-X/--method write verb, or field flags that make gh
+        # default to POST) bypasses the gh pr/release checks above — e.g.
+        # `gh api repos/o/r/merges -X PUT` or `... -f base=main`. Legit implementer
+        # mutations go via `gh pr create` / MCP create_pull_request, so any raw
+        # mutating gh api is UNKNOWN → default-deny (T23). A read (GET / no fields)
+        # falls through to GITHUB_READ below.
+        return ClassifiedAction(Operation.UNKNOWN, detail=detail)
     # pr view/list/diff/checks, issue, api GET, etc. → read via the scoped token.
     return ClassifiedAction(Operation.GITHUB_READ, detail=detail)
 
@@ -265,6 +274,28 @@ def _flag_value(tokens: list[str], flag: str) -> str | None:
         if tok.startswith(flag + "="):
             return tok.split("=", 1)[1]
     return None
+
+
+_GH_API_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _gh_api_is_mutation(tokens: list[str]) -> bool:
+    """True if a ``gh api`` call mutates rather than reads (T23).
+
+    Mutating = an explicit write method (``-X`` / ``--method`` =
+    POST/PUT/PATCH/DELETE), or field flags (``-f`` / ``-F`` / ``--field`` /
+    ``--raw-field`` / ``--input``) which make ``gh api`` default to POST. An
+    explicit GET/HEAD method, or no fields at all, reads.
+    """
+    method = (_flag_value(tokens, "-X") or _flag_value(tokens, "--method") or "").upper()
+    if method:
+        return method in _GH_API_MUTATING_METHODS
+    for tok in tokens:
+        if tok in ("-f", "-F", "--field", "--raw-field", "--input"):
+            return True
+        if tok.startswith(("--field=", "--raw-field=", "--input=")) or re.match(r"-[fF].*=", tok):
+            return True
+    return False
 
 
 def _classify_single_bash(cmd: str) -> ClassifiedAction:
@@ -306,6 +337,22 @@ _RAW_FORBIDDEN: tuple[tuple[re.Pattern[str], Operation], ...] = (
     ),
     (re.compile(r"\bgit\b.*\b(?:rebase|filter-branch|filter-repo)\b"), Operation.HISTORY_REWRITE),
     (re.compile(r"\bgit\b.*\breset\b.*--hard\b"), Operation.HISTORY_REWRITE),
+    # T23: external-publish via indirection (token-level _PUBLISH_PATTERNS is
+    # bypassed by `bash -c "npm publish"`). gh release (any subcommand) mirrors
+    # the token-level _classify_gh treatment.
+    (
+        re.compile(
+            r"\b(?:npm|yarn|pnpm|poetry|cargo)\s+publish\b"
+            r"|\btwine\s+upload\b|\bgem\s+push\b|\bdocker\s+push\b|\bgh\b.*\brelease\b"
+        ),
+        Operation.EXTERNAL_PUBLISH,
+    ),
+    # T23: mutating `gh api` via indirection (e.g. `bash -c "gh api .../merges -X PUT"`).
+    # Direct calls are classified in _classify_gh; this backstops the wrapped form.
+    (
+        re.compile(r"\bgh\b.*\bapi\b.*(?:-X|--method)[=\s]*(?:POST|PUT|PATCH|DELETE)\b"),
+        Operation.UNKNOWN,
+    ),
 )
 
 
@@ -452,19 +499,33 @@ def classify_tool_call(tool_name: str, tool_input: dict[str, Any]) -> Classified
 
 
 def _current_branch(repo_root: Path) -> str | None:
-    """Read the repo's current branch from ``.git/HEAD``; None if undeterminable.
+    """Return the repo's current branch via ``git rev-parse``; None if undeterminable.
 
-    Returns None for a detached HEAD (raw sha) or an unreadable / worktree-file
-    ``.git`` — the guard treats None as fail-closed (the action is downgraded to
-    UNKNOWN → deny) rather than letting a missing branch pass a constraint.
+    Uses ``git rev-parse --abbrev-ref HEAD`` rather than reading ``.git/HEAD``
+    directly so it resolves correctly for **worktrees** (``.git`` is a file, not a
+    dir) and **packed-refs**, where a raw ``.git/HEAD`` read would fail and force
+    an over-strict deny (T23). Returns None for a detached HEAD (``rev-parse``
+    prints ``HEAD``), a non-repo, or any git failure — the guard treats None as
+    fail-closed (the action is downgraded to UNKNOWN → deny) rather than letting a
+    missing branch pass a constraint.
     """
     try:
-        head = (repo_root / ".git" / "HEAD").read_text(encoding="utf-8").strip()
-    except OSError:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
-    if head.startswith("ref:"):
-        return head.split(":", 1)[1].strip().removeprefix("refs/heads/")
-    return None  # detached HEAD
+    if result.returncode != 0:
+        return None
+    branch = result.stdout.strip()
+    if not branch or branch == "HEAD":  # detached HEAD or empty output
+        return None
+    return branch
 
 
 class _AllowlistGuard:
