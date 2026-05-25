@@ -6,6 +6,7 @@ review submit) without a live GitHub.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
@@ -17,6 +18,7 @@ from spirrow_mindwire.github.client import (
     PrRef,
     ReviewEvent,
     github_token,
+    naysayer_github_token,
     parse_pr_ref,
 )
 
@@ -67,6 +69,29 @@ def test_github_token_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINDWIRE_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     assert github_token() is None
+
+
+def test_naysayer_token_separate_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    # T22: the naysayer resolves its own var; github_token() (the proposer/
+    # implementer author identity) must NOT pick it up — the two GitHub
+    # identities stay separate so the naysayer's review is author != approver.
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", "nay")
+    monkeypatch.setenv("MINDWIRE_GITHUB_TOKEN", "author")
+    assert naysayer_github_token() == "nay"
+    assert github_token() == "author"
+
+
+def test_naysayer_token_falls_back_to_shared_until_provisioned(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # T22: before the distinct token is provisioned, the naysayer falls back to
+    # the shared author token (the same-identity 422 → COMMENT path then applies),
+    # and warns so the fail-open (author == approver) is visible, not silent.
+    monkeypatch.delenv("MINDWIRE_NAYSAYER_GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("MINDWIRE_GITHUB_TOKEN", "author")
+    with caplog.at_level(logging.WARNING):
+        assert naysayer_github_token() == "author"
+    assert any("self-approval" in r.message for r in caplog.records)
 
 
 # ---------- fetch_pr_diff ------------------------------------------------- #

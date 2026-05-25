@@ -4,8 +4,11 @@ The PR-review naysayer adapter
 (:class:`~spirrow_mindwire.adapters.naysayer_pr_review.NaysayerPrReviewAdapter`)
 uses this to (1) fetch a PR's unified diff and (2) submit a PR review
 (``APPROVE`` / ``REQUEST_CHANGES``) on the develop→main PR. Auth is a
-**repo-scoped fine-grained token** (env spec §4: Contents R/W + PR R/W),
-resolved from ``MINDWIRE_GITHUB_TOKEN`` / ``GITHUB_TOKEN``.
+**repo-scoped fine-grained token** (env spec §4: Contents R/W + PR R/W).
+The proposer/implementer token is resolved from ``MINDWIRE_GITHUB_TOKEN`` /
+``GITHUB_TOKEN`` (:func:`github_token`); the **naysayer** uses a *separate*
+identity (``MINDWIRE_NAYSAYER_GITHUB_TOKEN``, :func:`naysayer_github_token`)
+so its review is author≠approver — GitHub rejects approving your own PR (T22).
 
 Error policy mirrors :mod:`spirrow_mindwire.lexora.client` / ``phanthand``:
 clean typed exceptions, **fail-loud** — any non-2xx becomes a
@@ -19,6 +22,7 @@ unreachable GitHub onto a fail-closed halt (ADR-07 §2.6).
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -34,10 +38,46 @@ _DEFAULT_TIMEOUT_SECONDS = 60.0
 _PR_URL_RE = re.compile(r"github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/(\d+)")
 _PR_SHORT_RE = re.compile(r"\b([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)#(\d+)\b")
 
+logger = logging.getLogger(__name__)
+
 
 def github_token() -> str | None:
-    """Resolve the scoped GitHub token from env (``MINDWIRE_GITHUB_TOKEN`` first)."""
+    """Resolve the proposer/implementer GitHub token from env.
+
+    ``MINDWIRE_GITHUB_TOKEN`` first, then ``GITHUB_TOKEN``. This is the shared
+    author identity (``takayan0908``); it deliberately does **not** read the
+    naysayer var, so the two identities stay separate (T22).
+    """
     return os.environ.get("MINDWIRE_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or None
+
+
+def naysayer_github_token() -> str | None:
+    """Resolve the naysayer's GitHub token — a *separate identity* (T22).
+
+    GitHub forbids approving your own PR, so the naysayer's review must come from
+    a different account (``takahito-spirrowgames``) than the proposer/implementer
+    author. Resolves ``MINDWIRE_NAYSAYER_GITHUB_TOKEN`` first; if that is not
+    provisioned yet it falls back to the shared :func:`github_token` so the
+    adapter still functions (the same-identity 422 is then handled by the
+    naysayer adapter's COMMENT fallback) — once the distinct token is set, the
+    formal APPROVE / REQUEST_CHANGES goes through. The token's scope is the
+    caller's concern (env spec: repo-scoped, least privilege); this only resolves
+    which identity to authenticate as.
+
+    Logs a warning on fallback so a forgotten token placement is visible rather
+    than silent: while falling back, the naysayer runs as the author identity
+    (author == approver) and its formal review is blocked / downgraded to a
+    COMMENT — "working" but not actually satisfying author≠approver (T22).
+    """
+    token = os.environ.get("MINDWIRE_NAYSAYER_GITHUB_TOKEN")
+    if token:
+        return token
+    logger.warning(
+        "MINDWIRE_NAYSAYER_GITHUB_TOKEN is unset; the naysayer is falling back to "
+        "the shared author token and will run as author==approver (self-approval) "
+        "until the distinct takahito-spirrowgames token is provisioned (T22)."
+    )
+    return github_token()
 
 
 class ReviewEvent(StrEnum):
@@ -200,5 +240,6 @@ __all__ = [
     "PrRef",
     "ReviewEvent",
     "github_token",
+    "naysayer_github_token",
     "parse_pr_ref",
 ]
