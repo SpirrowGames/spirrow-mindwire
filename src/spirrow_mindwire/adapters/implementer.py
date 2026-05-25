@@ -25,9 +25,12 @@ guarantee is that the six Tier C operations are denied. The guard resolves the
 *effective* branch from ``.git/HEAD`` (so a bare ``git push`` / ``git commit`` /
 ``git merge`` while on ``main`` is denied, and an undeterminable branch fails
 closed → ``UNKNOWN`` → deny). Shell *indirection* (``bash -c`` / ``eval`` /
-``$(...)`` / backticks) hides the inner command from tokenization, so the raw
-string is additionally scanned for Tier C patterns. Both remain best-effort over
-a single command — defence-in-depth, not the only line. The blast-radius
+``$(...)`` / backticks) hides the inner command from tokenization, so the inner
+command is extracted and re-classified through the **same** structural classifier
+(a wrapped Tier C command is judged identically to its direct form — T27), with a
+coarse keyword scan as a defence-in-depth floor for input that defeats the
+tokenizer. Both remain best-effort over a single command — defence-in-depth, not
+the only line. The blast-radius
 backstops are: (1) the **environment** (Tailscale ACL + egress default-deny +
 scoped token, ADR-07 §2.4 / env spec); and (2) **Takahito's manual merge** — the
 Tier C human pre-GO is the authoritative guard that changes never reach ``main``
@@ -309,7 +312,75 @@ def _gh_api_is_mutation(tokens: list[str]) -> bool:
     return False
 
 
-def _classify_single_bash(cmd: str) -> ClassifiedAction:
+_SHELL_CMDS = {"bash", "sh", "zsh", "dash"}
+
+# Bound the recursion when indirection nests (``bash -c "bash -c ..."`` /
+# ``$( $(...) )``). Past this we cannot meaningfully analyze the inner command, so
+# we fail closed (UNKNOWN → deny) rather than spin. Legit commands nest 0-1
+# levels; 5 is generous.
+_MAX_INDIRECTION_DEPTH = 5
+
+
+def _indirection_inner(tokens: list[str]) -> str | None:
+    """Return the inner command string for a shell ``-c`` / ``eval`` wrapper.
+
+    ``bash -c "<cmd>"`` (also ``sh``/``zsh``/``dash``, and combined flags ending
+    in ``c`` like ``-lc``) → ``<cmd>``; ``eval <args...>`` → the joined args.
+    Returns None when the head is not such a wrapper (e.g. ``bash script.sh`` runs
+    a file, not an inline command — nothing to recurse into). The caller recurses
+    the result through the *same* classifier, so a wrapped command is judged
+    identically to the direct form — the T27 unification, no regex mirror.
+
+    For ``bash -c X Y Z`` only ``X`` is the command (``Y``/``Z`` become ``$0``/
+    ``$1`` and are NOT executed); the coarse raw scan still backstops a Tier C verb
+    smuggled into a non-executed slot.
+    """
+    base = os.path.basename(tokens[0])
+    if base in _SHELL_CMDS:
+        i = 1
+        while i < len(tokens):
+            tok = tokens[i]
+            if not tok.startswith("-"):
+                return None  # first positional before any -c → script/file form
+            if re.fullmatch(r"-\w*c", tok):  # -c / -lc / -xc … (flag ending in c)
+                return tokens[i + 1] if i + 1 < len(tokens) else None
+            i += 1
+        return None
+    if base == "eval":
+        rest = tokens[1:]
+        return " ".join(rest) if rest else None
+    return None
+
+
+def _extract_substitutions(command: str) -> list[str]:
+    """Extract inner command strings from ``$(...)`` and backtick substitutions.
+
+    ``$(...)`` is matched with balanced-paren scanning so nesting (``$( $(...) )``)
+    works: the outer body is returned and the caller recurses into it (finding the
+    next level). Backticks (which don't nest) are matched pairwise. Deny-safe on a
+    missing close paren: the remainder of the string is returned as the body so its
+    content is still classified.
+    """
+    inners: list[str] = []
+    i, n = 0, len(command)
+    while i < n - 1:
+        if command[i] == "$" and command[i + 1] == "(":
+            depth, j = 1, i + 2
+            while j < n and depth > 0:
+                if command[j] == "(":
+                    depth += 1
+                elif command[j] == ")":
+                    depth -= 1
+                j += 1
+            inners.append(command[i + 2 : j - 1] if depth == 0 else command[i + 2 : j])
+            i = j
+        else:
+            i += 1
+    inners.extend(m.group(1) for m in re.finditer(r"`([^`]*)`", command))
+    return inners
+
+
+def _classify_single_bash(cmd: str, _depth: int = 0) -> ClassifiedAction:
     cmd = cmd.strip()
     if not cmd:
         return ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
@@ -320,6 +391,15 @@ def _classify_single_bash(cmd: str) -> ClassifiedAction:
     tokens = _strip_prefixes(tokens)
     if not tokens:
         return ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
+    # Shell indirection (bash -c / eval): extract the inner command and recurse
+    # through the SAME classifier, so `bash -c "<x>"` is judged exactly as `<x>`
+    # (T27: one classifier, no regex mirror to drift). The wrapper itself is plain
+    # code execution; the verdict is the more dangerous of wrapper vs. inner.
+    inner = _indirection_inner(tokens)
+    if inner is not None:
+        wrapper = ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
+        nested = _classify_bash(inner, _depth + 1)
+        return max((wrapper, nested), key=lambda a: _DANGER_RANK.get(a.operation, 0))
     head = tokens[0]
     base = os.path.basename(head)
     if base in _DELETE_CMDS or "-delete" in tokens or base == "Remove-Item":
@@ -334,13 +414,27 @@ def _classify_single_bash(cmd: str) -> ClassifiedAction:
     return ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
 
 
-# Shell indirection that defeats token-level classification (the real command is
-# a quoted string / substitution we don't tokenize, e.g. ``bash -c "rm -rf x"``,
-# ``eval ...``, ``$(...)``, backticks). When present we additionally scan the RAW
-# command for Tier C patterns and fail-loud on a match (deny-safe; a false match
-# only over-denies an indirection command, which is rare).
+# Detects the *presence* of indirection (shell -c / eval / $(...) / backticks).
+# Used only to gate the COARSE scan below — precise classification is the
+# recursive structural pass (_classify_single_bash / _extract_substitutions),
+# not this regex.
 _INDIRECTION_RE = re.compile(r"\b(?:bash|sh|zsh|dash)\b\s+-\w*c\b|\beval\b|\$\(|`")
-_RAW_FORBIDDEN: tuple[tuple[re.Pattern[str], Operation], ...] = (
+
+# COARSE defence-in-depth floor (T27). A deliberately broad keyword scan over the
+# raw string, applied ONLY when indirection is present and ONLY to ADD a denial —
+# it is never the sole classifier. The recursive structural pass above is the
+# single source of truth and already covers every *tokenizable* wrapped command
+# (so direct == wrapped); this floor only fails closed on input that defeats the
+# tokenizer (ANSI-C ``$'...'`` quoting, a Tier C verb smuggled into a non-executed
+# ``bash -c X Y`` slot, etc.).
+#
+# It is intentionally NOT a per-operation mirror of the structural checks: in
+# particular it carries NO ``gh api`` method/field logic — that precision lives
+# solely in ``_gh_api_is_mutation`` (applied via recursion), which removes the
+# #71 (T23) structured-vs-regex drift class that motivated this task. A gap here
+# can no longer cause an *under*-deny, because the structural classifier runs on
+# the extracted inner regardless; at worst this floor over-denies, which is safe.
+_RAW_COARSE: tuple[tuple[re.Pattern[str], Operation], ...] = (
     (re.compile(r"\b(?:rm|rmdir|shred|unlink)\b|-delete\b|\bRemove-Item\b"), Operation.FS_DELETE),
     (
         re.compile(r"\bgit\b.*\bpush\b.*(?:--force\b|--force-with-lease\b|\s-f\b)"),
@@ -348,9 +442,6 @@ _RAW_FORBIDDEN: tuple[tuple[re.Pattern[str], Operation], ...] = (
     ),
     (re.compile(r"\bgit\b.*\b(?:rebase|filter-branch|filter-repo)\b"), Operation.HISTORY_REWRITE),
     (re.compile(r"\bgit\b.*\breset\b.*--hard\b"), Operation.HISTORY_REWRITE),
-    # T23: external-publish via indirection (token-level _PUBLISH_PATTERNS is
-    # bypassed by `bash -c "npm publish"`). gh release (any subcommand) mirrors
-    # the token-level _classify_gh treatment.
     (
         re.compile(
             r"\b(?:npm|yarn|pnpm|poetry|cargo)\s+publish\b"
@@ -358,28 +449,12 @@ _RAW_FORBIDDEN: tuple[tuple[re.Pattern[str], Operation], ...] = (
         ),
         Operation.EXTERNAL_PUBLISH,
     ),
-    # T23: mutating `gh api` via indirection — an explicit write method
-    # (`bash -c "gh api .../merges -X PUT"`) OR a field flag
-    # (`... -f base=main`), since gh defaults to POST when fields are present and
-    # no method is given. Mirrors the direct-path _gh_api_is_mutation (method OR
-    # field); case-insensitive so lowercase verbs / -XPUT concatenation are caught.
-    # Direct calls are classified in _classify_gh; this backstops the wrapped form.
-    (
-        re.compile(
-            r"\bgh\b.*\bapi\b(?:"
-            r".*(?:-X|--method)[=\s]*(?:POST|PUT|PATCH|DELETE)"
-            r"|.*(?:\s-[fF]\b|\s-[fF]\S*=|\s--field\b|\s--raw-field\b|\s--input\b)"
-            r")",
-            re.IGNORECASE,
-        ),
-        Operation.UNKNOWN,
-    ),
 )
 
 
-def _scan_raw_forbidden(command: str) -> ClassifiedAction | None:
-    """Scan the raw command string for Tier C patterns (indirection backstop)."""
-    for pattern, op in _RAW_FORBIDDEN:
+def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
+    """Coarse raw-string scan for Tier C verbs (defence-in-depth, deny-only)."""
+    for pattern, op in _RAW_COARSE:
         if pattern.search(command):
             return ClassifiedAction(op, detail=command)
     return None
@@ -406,18 +481,29 @@ _DANGER_RANK: dict[Operation, int] = {
 }
 
 
-def _classify_bash(command: str) -> ClassifiedAction:
-    """Classify a (possibly compound) bash command by its most dangerous part.
+def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
+    """Classify a (possibly compound / wrapped) bash command by its most dangerous part.
 
-    A one-liner that checks out main and then merges (``git checkout main &&
-    git merge develop``) is surfaced as ``git.merge_to_main`` — the static
-    catch for the obvious main-merge; cross-tool-call sequences are backed by
-    the push-to-main denial + environment containment.
+    Indirection (``bash -c`` / ``eval`` / ``$(...)`` / backticks) is unwound by
+    extracting the inner command and recursing through the *same* classifier, so a
+    wrapped Tier C command is judged identically to its direct form (T27: direct ==
+    wrapped, one source of truth — no regex mirror to drift out of sync). A
+    one-liner that checks out main then merges (``git checkout main && git merge
+    develop``) is surfaced as ``git.merge_to_main``; cross-tool-call sequences are
+    backed by the push-to-main denial + environment containment.
+
+    Recursion is bounded by :data:`_MAX_INDIRECTION_DEPTH`; nesting past it fails
+    closed (UNKNOWN → deny) rather than risk an unbounded / unanalyzable parse.
     """
+    if _depth > _MAX_INDIRECTION_DEPTH:
+        return ClassifiedAction(Operation.UNKNOWN, detail=command)
     parts = [p.strip() for p in _BASH_SEP.split(command) if p.strip()]
     if not parts:
         return ClassifiedAction(Operation.EXEC_CODE, detail=command)
-    actions = [_classify_single_bash(p) for p in parts]
+    actions = [_classify_single_bash(p, _depth) for p in parts]
+    # Command substitutions ($(...) / backticks) anywhere in the raw command are
+    # inner commands too — recurse into each (same classifier, depth-bounded).
+    actions += [_classify_bash(inner, _depth + 1) for inner in _extract_substitutions(command)]
 
     switches_to_main = any(
         a.operation is Operation.EXEC_CODE
@@ -429,14 +515,15 @@ def _classify_bash(command: str) -> ClassifiedAction:
     else:
         candidate = max(actions, key=lambda a: _DANGER_RANK.get(a.operation, 0))
 
-    # Indirection backstop: a wrapper hides the inner command from tokenization,
-    # so scan the raw string and take the result if it is at least as dangerous.
+    # Coarse defence-in-depth floor: only when indirection is present, and only if
+    # at least as dangerous as the structural verdict — so it can ADD a denial the
+    # tokenizer missed, never downgrade one (see _RAW_COARSE).
     if _INDIRECTION_RE.search(command):
-        scanned = _scan_raw_forbidden(command)
-        if scanned is not None and _DANGER_RANK.get(scanned.operation, 0) >= _DANGER_RANK.get(
+        coarse = _scan_raw_coarse(command)
+        if coarse is not None and _DANGER_RANK.get(coarse.operation, 0) >= _DANGER_RANK.get(
             candidate.operation, 0
         ):
-            return scanned
+            return coarse
     return candidate
 
 
