@@ -44,6 +44,13 @@ per thread**, bridged by an orchestrator. Phase 1 ships no automatic
 convergence-detection / cross-thread relay engine, so here the test harness
 plays that orchestrator (and the human) — exactly the two manual touch-points
 the Phase 1 bar allows: the opening question and the final approval.
+
+Scope note (review): this is an *in-process composition* proof. It drives
+``ChatroomWatcher.poll_once`` directly for determinism, so the production daemon
+loop itself (``ChatroomWatcher.run``'s poll-interval sleep + continue-on-error
+guard) is **not** on this path — its resilience is the T14 unit tests' job, not
+this smoke's. ``_drive_until`` is a fail-loud liveness cap, not a timing
+assertion.
 """
 
 from __future__ import annotations
@@ -163,6 +170,11 @@ class _FakeMcp:
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         self.calls.append((name, arguments))
+        # Yield once on every chatroom read/write so concurrent streams genuinely
+        # interleave on the shared Dispatcher (Copilot review): with no suspension
+        # point in the fakes, asyncio.gather would run the streams effectively
+        # sequentially and the 2-thread test would not exercise real concurrency.
+        await asyncio.sleep(0)
         if name == "chatroom_get_thread":
             return {
                 "messages": self._chatroom.messages(str(arguments["thread_id"])),
@@ -373,40 +385,52 @@ async def _run_stream(h: _Harness, sid: str) -> dict[str, ThreadRef]:
     work = _thread_ref("work", sid)
     review = _thread_ref("review", sid)
     impl = _thread_ref("impl", sid)
+    # Stream-specific instance ids (Copilot review): with two concurrent streams
+    # sharing one Dispatcher, distinct authors per stream make a cross-stream
+    # routing leak observable — identical "{role}-1" labels across streams would
+    # mask it. For the single-stream test (sid="1") these read back as the Phase 1
+    # default "{role}-1" mint, so its audit-trail assertions are unchanged.
+    proposer_id = f"proposer-{sid}"
+    naysayer_id = f"naysayer-{sid}"
+    implementer_id = f"implementer-{sid}"
 
     h.chatroom.open_thread(work.thread_id)
-    watcher = ChatroomWatcher(h.mcp, h.dispatcher, [WatchSpec(work, Role.PROPOSER)])
+    watcher = ChatroomWatcher(
+        h.mcp, h.dispatcher, [WatchSpec(work, Role.PROPOSER, instance_id=proposer_id)]
+    )
     await watcher.start(baseline=False)  # spawn the proposer; thread is empty so far
 
     # (human #1) the opening question → proposer posts a proposal.
     h.chatroom.post(work.thread_id, author="human", content=_QUESTION)
-    await _drive_until(watcher, lambda: h.chatroom.authors(work.thread_id)[-1:] == ["proposer-1"])
+    await _drive_until(watcher, lambda: h.chatroom.authors(work.thread_id)[-1:] == [proposer_id])
     proposal_body = h.chatroom.latest(work.thread_id)["content"]
     assert "PROPOSAL" in proposal_body
 
     # (orchestrator) open the independent-review thread, wire the naysayer, relay
     # the proposal → the independent naysayer objects.
     h.chatroom.open_thread(review.thread_id)
-    await watcher.add_watch(WatchSpec(review, Role.NAYSAYER), baseline=False)
+    await watcher.add_watch(
+        WatchSpec(review, Role.NAYSAYER, instance_id=naysayer_id), baseline=False
+    )
     h.chatroom.post(review.thread_id, author="orchestrator", content=proposal_body)
-    await _drive_until(watcher, lambda: h.chatroom.authors(review.thread_id)[-1:] == ["naysayer-1"])
+    await _drive_until(watcher, lambda: h.chatroom.authors(review.thread_id)[-1:] == [naysayer_id])
     critique_body = h.chatroom.latest(review.thread_id)["content"]
     assert "REQUEST_CHANGES" in critique_body
 
     # (orchestrator) relay the objection back → proposer revises and converges.
     h.chatroom.post(work.thread_id, author="orchestrator", content=critique_body)
-    await _drive_until(watcher, lambda: h.chatroom.authors(work.thread_id).count("proposer-1") == 2)
+    await _drive_until(watcher, lambda: h.chatroom.authors(work.thread_id).count(proposer_id) == 2)
     revised_body = h.chatroom.latest(work.thread_id)["content"]
     assert "DECIDE" in revised_body
 
     # (orchestrator) on the decision, open the impl thread, wire the implementer,
     # post the build request → implementer "opens the PR".
     h.chatroom.open_thread(impl.thread_id)
-    await watcher.add_watch(WatchSpec(impl, Role.IMPLEMENTER), baseline=False)
-    h.chatroom.post(impl.thread_id, author="orchestrator", content=_BUILD)
-    await _drive_until(
-        watcher, lambda: h.chatroom.authors(impl.thread_id)[-1:] == ["implementer-1"]
+    await watcher.add_watch(
+        WatchSpec(impl, Role.IMPLEMENTER, instance_id=implementer_id), baseline=False
     )
+    h.chatroom.post(impl.thread_id, author="orchestrator", content=_BUILD)
+    await _drive_until(watcher, lambda: h.chatroom.authors(impl.thread_id)[-1:] == [implementer_id])
     assert h.chatroom.latest(impl.thread_id)["content"].startswith("PR opened")
 
     # (human #2) the final approval, then the threads close. No further polling,
@@ -482,15 +506,23 @@ async def test_e2e_two_threads_concurrent_role_isolation(tmp_path: Path) -> None
     # concurrently (each with its own watcher) — "dispatcher が並走できる".
     a, b = await asyncio.gather(_run_stream(h, "A"), _run_stream(h, "B"))
 
-    for refs in (a, b):
+    for refs, sid in ((a, "A"), (b, "B")):
         work, review, impl = refs["work"], refs["review"], refs["impl"]
-        # Role purity per thread: roles never cross onto the wrong thread.
-        assert set(h.chatroom.authors(work.thread_id)) == {"human", "orchestrator", "proposer-1"}
-        assert set(h.chatroom.authors(review.thread_id)) == {"orchestrator", "naysayer-1"}
-        assert set(h.chatroom.authors(impl.thread_id)) == {"orchestrator", "implementer-1"}
-        assert "implementer-1" not in h.chatroom.authors(work.thread_id)
-        assert "naysayer-1" not in h.chatroom.authors(work.thread_id)
-        assert "proposer-1" not in h.chatroom.authors(review.thread_id)
+        other = "B" if sid == "A" else "A"
+        # Role purity per thread, with stream-specific instance ids so a
+        # cross-stream routing leak is actually observable (Copilot review).
+        assert set(h.chatroom.authors(work.thread_id)) == {
+            "human",
+            "orchestrator",
+            f"proposer-{sid}",
+        }
+        assert set(h.chatroom.authors(review.thread_id)) == {"orchestrator", f"naysayer-{sid}"}
+        assert set(h.chatroom.authors(impl.thread_id)) == {"orchestrator", f"implementer-{sid}"}
+        # The OTHER stream's roles never leak onto this stream's threads — this is
+        # the assertion a same-label test could not make.
+        assert f"proposer-{other}" not in h.chatroom.authors(work.thread_id)
+        assert f"naysayer-{other}" not in h.chatroom.authors(review.thread_id)
+        assert f"implementer-{other}" not in h.chatroom.authors(impl.thread_id)
         assert h.chatroom.authors(work.thread_id).count("human") == 2
 
     # The two streams are genuinely independent threads.
@@ -504,10 +536,19 @@ async def test_e2e_two_threads_concurrent_role_isolation(tmp_path: Path) -> None
     )
     assert total_human == 4
 
-    # Audit channel stays clean under concurrency: 8 replies (4 per stream),
-    # all reply.sent.
+    # Audit channel stays clean under concurrency: 8 replies (4 per stream), all
+    # reply.sent, each attributed to its own stream's instances (no merge across
+    # the concurrently-running streams).
     assert {e.kind for e in h.events} == {EVENT_KIND_REPLY_SENT}
     assert len(h.events) == 8
+    assert {e.fields[EVENT_FIELD_AUTHOR] for e in h.events} == {
+        "proposer-A",
+        "naysayer-A",
+        "implementer-A",
+        "proposer-B",
+        "naysayer-B",
+        "implementer-B",
+    }
 
 
 # --------------------------------------------------------------------------- #
