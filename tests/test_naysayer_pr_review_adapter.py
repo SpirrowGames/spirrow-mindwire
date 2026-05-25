@@ -445,7 +445,7 @@ async def test_adapter_authenticates_as_naysayer_identity(monkeypatch: pytest.Mo
         assert isinstance(adapter._github, GitHubClient)
         assert adapter._github._token == "nay-tok"
     finally:
-        await adapter._github.aclose()
+        await adapter.aclose()
 
 
 @pytest.mark.anyio
@@ -457,4 +457,4 @@ async def test_adapter_explicit_github_token_wins(monkeypatch: pytest.MonkeyPatc
         assert isinstance(adapter._github, GitHubClient)
         assert adapter._github._token == "explicit-tok"
     finally:
-        await adapter._github.aclose()
+        await adapter.aclose()
