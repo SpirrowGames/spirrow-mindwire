@@ -214,6 +214,36 @@ def test_classify_bash_nesting_depth_fails_closed() -> None:
     assert classify_tool_call("Bash", {"command": cmd}).operation is Operation.UNKNOWN
 
 
+@pytest.mark.parametrize(
+    "cmd,expected",
+    [
+        # #74 naysayer MUST-1 / Copilot: a launcher before `bash -c` must not hide
+        # the inner from the structural classifier (#71 MUST-1 must not regress).
+        ('exec bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('env bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('command bash -c "rm -rf x"', Operation.FS_DELETE),
+        # value-taking launcher (timeout DURATION / nice -n N) before the shell.
+        ('timeout 5 bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('nice -n 10 bash -c "git push --force origin feature/x"', Operation.FORCE_PUSH),
+        # value-taking bash OPTIONS hide `-c` (--rcfile F / -O shopt): skip the arg.
+        ('bash --rcfile myrc -c "rm -rf x"', Operation.FS_DELETE),
+        ('bash --rcfile myrc -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('bash -O extglob -c "rm -rf x"', Operation.FS_DELETE),
+        # leading shell flags / option-arg + ANSI-C inner: structural mis-tokenizes,
+        # but the (broadened) indirection gate lets the coarse floor catch the verb.
+        ("bash -l -c $'rm -rf x'", Operation.FS_DELETE),
+        ("bash --rcfile x -c $'rm -rf x'", Operation.FS_DELETE),
+        # must NOT over-deny: a launcher/shell name as a mere argument isn't a wrapper.
+        ('echo bash -c "hello world"', Operation.EXEC_CODE),
+    ],
+)
+def test_classify_bash_launcher_and_option_wrappers(cmd: str, expected: Operation) -> None:
+    # #74 naysayer MUST-1: `_indirection_inner` must reach the inner across leading
+    # launchers (env/exec/timeout) and value-taking bash options (--rcfile/-O), so
+    # the #71 field-flag-gh-api indirection bypass cannot reappear behind a wrapper.
+    assert classify_tool_call("Bash", {"command": cmd}).operation is expected
+
+
 def test_classify_push_feature_branch_params() -> None:
     a = classify_tool_call("Bash", {"command": "git push origin feature/x"})
     assert a.branch == "feature/x"

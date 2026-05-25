@@ -160,8 +160,40 @@ _PUBLISH_PATTERNS = (
     ("gem", "push"),
     ("docker", "push"),
 )
-# Leading tokens that wrap the real command (skip to classify the inner one).
-_CMD_PREFIXES = {"sudo", "command", "time", "env", "nice", "nohup", "xargs"}
+# Leading no-arg launchers that wrap the real command (skip to classify the inner
+# one) — used by _strip_prefixes for the DIRECT path (e.g. `exec rm -rf x`).
+_CMD_PREFIXES = {
+    "sudo",
+    "command",
+    "time",
+    "env",
+    "nice",
+    "nohup",
+    "xargs",
+    "exec",
+    "setsid",
+    "doas",
+}
+
+# Launchers that may precede a `<shell> -c` wrapper — a superset of _CMD_PREFIXES
+# that also covers value-taking ones (`timeout 5` / `nice -n 10` / `stdbuf -oL`).
+# Used by _find_shell_index to locate the wrapped shell across a leading launcher
+# run, so a launcher before `bash -c` does not hide the inner command from the
+# structural classifier (#74 naysayer MUST-1 / Copilot).
+_LAUNCHER_CMDS = _CMD_PREFIXES | {
+    "timeout",
+    "stdbuf",
+    "ionice",
+    "taskset",
+    "chrt",
+    "setarch",
+    "flock",
+}
+
+# bash options that consume a following argument; the argument must be skipped when
+# scanning for `-c`, else `bash --rcfile myrc -c "<x>"` stops at `myrc` and never
+# reaches `-c` (#74 naysayer MUST-1 / Copilot).
+_BASH_VALUE_OPTS = {"--rcfile", "--init-file", "-O", "+O"}
 
 
 def _strip_prefixes(tokens: list[str]) -> list[str]:
@@ -324,36 +356,81 @@ _SHELL_CMDS = {"bash", "sh", "zsh", "dash"}
 # Bound the recursion when indirection nests (``bash -c "bash -c ..."`` /
 # ``$( $(...) )``). Past this we cannot meaningfully analyze the inner command, so
 # we fail closed (UNKNOWN → deny) rather than spin. Legit commands nest 0-1
-# levels; 5 is generous.
+# levels; 5 is generous. The cap's residual value is mainly for verbs the coarse
+# floor cannot see when nested (e.g. gh api mutation) — a dangerous verb the floor
+# DOES know (rm / force-push / publish) is caught at a shallow layer by the raw
+# scan before the cap is reached (#74 naysayer MINOR-3).
 _MAX_INDIRECTION_DEPTH = 5
+
+
+def _find_shell_index(tokens: list[str]) -> int | None:
+    """Index of the wrapped shell (``bash``/``sh``/``zsh``/``dash``), if any.
+
+    Allows a leading run of launcher tokens before the shell: a launcher name
+    (``_LAUNCHER_CMDS``), an option (``-x`` / ``--x`` / ``+x``), a ``VAR=val``
+    assignment, or — once a launcher has been seen — a bare operand such as
+    ``timeout``'s duration. Stops (returns None) at a non-launcher command in head
+    position, so a genuine command like ``rm -rf x`` is never mistaken for a
+    wrapper. Deny-safe: at worst it locates a shell token that is actually an
+    argument, but only a following ``-c`` (see :func:`_extract_dash_c`) turns that
+    into an extracted inner — and over-extraction can only over-deny.
+    """
+    seen_launcher = False
+    for idx, tok in enumerate(tokens):
+        base = os.path.basename(tok)
+        if base in _SHELL_CMDS:
+            return idx
+        if base in _LAUNCHER_CMDS:
+            seen_launcher = True
+            continue
+        if tok.startswith(("-", "+")):
+            continue
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tok):
+            continue
+        if seen_launcher:
+            continue  # an operand of a launcher (e.g. timeout's duration)
+        return None  # a non-launcher command in head position → not a wrapper
+    return None
+
+
+def _extract_dash_c(tokens: list[str], start: int) -> str | None:
+    """From ``start``, find a ``-c``-style flag and return its argument (the inner).
+
+    Skips value-taking bash options (``_BASH_VALUE_OPTS``) and their arguments, so
+    ``bash --rcfile myrc -c "<x>"`` / ``bash -O extglob -c "<x>"`` still reach
+    ``-c``. Returns None for ``bash script.sh`` (a bare token before any ``-c`` =
+    script/file form — nothing to recurse into).
+    """
+    i = start
+    while i < len(tokens):
+        tok = tokens[i]
+        if re.fullmatch(r"-\w*c", tok):  # -c / -lc / -xc … (flag ending in c)
+            return tokens[i + 1] if i + 1 < len(tokens) else None
+        if tok in _BASH_VALUE_OPTS:
+            i += 2  # skip the option AND its argument
+            continue
+        if not tok.startswith(("-", "+")):
+            return None  # bare token before -c → script/file form
+        i += 1
+    return None
 
 
 def _indirection_inner(tokens: list[str]) -> str | None:
     """Return the inner command string for a shell ``-c`` / ``eval`` wrapper.
 
-    ``bash -c "<cmd>"`` (also ``sh``/``zsh``/``dash``, and combined flags ending
-    in ``c`` like ``-lc``) → ``<cmd>``; ``eval <args...>`` → the joined args.
-    Returns None when the head is not such a wrapper (e.g. ``bash script.sh`` runs
-    a file, not an inline command — nothing to recurse into). The caller recurses
-    the result through the *same* classifier, so a wrapped command is judged
-    identically to the direct form — the T27 unification, no regex mirror.
-
-    For ``bash -c X Y Z`` only ``X`` is the command (``Y``/``Z`` become ``$0``/
-    ``$1`` and are NOT executed); the coarse raw scan still backstops a Tier C verb
-    smuggled into a non-executed slot.
+    Locates the wrapped shell across any leading launcher run
+    (``env``/``exec``/``timeout 5``/… — :func:`_find_shell_index`) and extracts its
+    ``-c`` argument past value-taking options (:func:`_extract_dash_c`); ``eval
+    <args...>`` → the joined args. Returns None when there is no such wrapper (e.g.
+    ``bash script.sh`` runs a file). The caller recurses the result through the
+    *same* classifier, so a wrapped command is judged identically to the direct
+    form — the T27 unification, no regex mirror. (For ``bash -c X Y Z`` only ``X``
+    is the command; ``Y``/``Z`` become ``$0``/``$1`` and are not executed.)
     """
-    base = os.path.basename(tokens[0])
-    if base in _SHELL_CMDS:
-        i = 1
-        while i < len(tokens):
-            tok = tokens[i]
-            if not tok.startswith("-"):
-                return None  # first positional before any -c → script/file form
-            if re.fullmatch(r"-\w*c", tok):  # -c / -lc / -xc … (flag ending in c)
-                return tokens[i + 1] if i + 1 < len(tokens) else None
-            i += 1
-        return None
-    if base == "eval":
+    shell_idx = _find_shell_index(tokens)
+    if shell_idx is not None:
+        return _extract_dash_c(tokens, shell_idx + 1)
+    if tokens and os.path.basename(tokens[0]) == "eval":
         rest = tokens[1:]
         return " ".join(rest) if rest else None
     return None
@@ -371,8 +448,11 @@ def _extract_substitutions(command: str) -> list[str]:
     """
     inners: list[str] = []
     i, n = 0, len(command)
-    while i < n - 1:
-        if command[i] == "$" and command[i + 1] == "(":
+    while i < n:
+        # `i + 1 < n` guard so a trailing `$` (or `$(` at the very end) is handled
+        # rather than skipped — detection-miss is under-deny, so stay inclusive
+        # (#74 naysayer SHOULD-2).
+        if command[i] == "$" and i + 1 < n and command[i + 1] == "(":
             depth, j = 1, i + 2
             while j < n and depth > 0:
                 if command[j] == "(":
@@ -402,21 +482,26 @@ def _classify_single_bash(cmd: str, _depth: int = 0) -> ClassifiedAction:
     if not cmd:
         return ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
     try:
-        tokens = shlex.split(cmd, posix=True)
+        raw_tokens = shlex.split(cmd, posix=True)
     except ValueError:
-        tokens = cmd.split()
-    tokens = _strip_prefixes(tokens)
-    if not tokens:
+        raw_tokens = cmd.split()
+    if not raw_tokens:
         return ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
-    # Shell indirection (bash -c / eval): extract the inner command and recurse
-    # through the SAME classifier, so `bash -c "<x>"` is judged exactly as `<x>`
-    # (T27: one classifier, no regex mirror to drift). The wrapper itself is plain
-    # code execution; the verdict is the more dangerous of wrapper vs. inner.
-    inner = _indirection_inner(tokens)
+    # Shell indirection (<launcher…> <shell> -c / eval): extract the inner command
+    # and recurse through the SAME classifier, so `bash -c "<x>"` is judged exactly
+    # as `<x>` (T27: one classifier, no regex mirror to drift). Run on the RAW
+    # tokens — before _strip_prefixes — so a launcher (env/exec/timeout) keeps its
+    # name for _find_shell_index. The wrapper is plain code execution; the verdict
+    # is the more dangerous of wrapper vs. inner.
+    inner = _indirection_inner(raw_tokens)
     if inner is not None:
         wrapper = ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
         nested = _classify_bash(inner, _depth + 1)
         return max((wrapper, nested), key=lambda a: _DANGER_RANK.get(a.operation, 0))
+    # Direct command: strip wrapper prefixes, then classify the real command.
+    tokens = _strip_prefixes(raw_tokens)
+    if not tokens:
+        return ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
     head = tokens[0]
     base = os.path.basename(head)
     if base in _DELETE_CMDS or "-delete" in tokens or base == "Remove-Item":
@@ -434,8 +519,10 @@ def _classify_single_bash(cmd: str, _depth: int = 0) -> ClassifiedAction:
 # Detects the *presence* of indirection (shell -c / eval / $(...) / backticks).
 # Used only to gate the COARSE scan below — precise classification is the
 # recursive structural pass (_classify_single_bash / _extract_substitutions),
-# not this regex.
-_INDIRECTION_RE = re.compile(r"\b(?:bash|sh|zsh|dash)\b\s+-\w*c\b|\beval\b|\$\(|`")
+# not this regex. The shell branch allows option/arg tokens between the shell and
+# `-c` (``bash --rcfile x -c`` / ``bash -l -c``) so the coarse floor still fires
+# when the inner is tokenizer-defeating (ANSI-C ``$'...'``) — #74 naysayer / Copilot.
+_INDIRECTION_RE = re.compile(r"\b(?:bash|sh|zsh|dash)\b(?:\s+\S+)*?\s+-\w*c\b|\beval\b|\$\(|`")
 
 # COARSE defence-in-depth floor (T27). A deliberately broad keyword scan over the
 # raw string, applied ONLY when indirection is present and ONLY to ADD a denial —
