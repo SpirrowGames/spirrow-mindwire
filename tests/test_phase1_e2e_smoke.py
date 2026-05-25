@@ -59,6 +59,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +143,17 @@ class _FakeChatroom:
 
     def messages(self, thread_id: str) -> list[dict[str, Any]]:
         return list(self._threads.get(thread_id, []))
+
+    def timeline(self) -> list[tuple[str, str]]:
+        """All messages across all threads in global post order → (msg_id, thread_id).
+
+        ``msg_id`` is ``f"m{seq}"`` from a single monotonic counter, so sorting by
+        it reconstructs the true temporal order across threads — which lets a test
+        observe whether two concurrently-driven streams actually interleaved or
+        ran one-after-the-other.
+        """
+        items = [(str(msg["msg_id"]), tid) for tid, msgs in self._threads.items() for msg in msgs]
+        return sorted(items, key=lambda it: int(it[0][1:]))  # "m12" -> 12
 
     def authors(self, thread_id: str) -> list[str]:
         return [str(msg["author"]) for msg in self._threads.get(thread_id, [])]
@@ -471,8 +483,12 @@ async def test_e2e_single_thread_full_cycle(tmp_path: Path) -> None:
     assert h.chatroom.latest(impl.thread_id)["content"].startswith("PR opened")
     assert h.chatroom.is_closed(work.thread_id)
 
-    # Minimal human input: exactly the opening question + the final approval.
-    assert h.chatroom.authors(work.thread_id).count("human") == 2
+    # Minimal human input: exactly the opening question + the final approval —
+    # counted across all of the stream's threads (MINOR-3: don't bake in the
+    # assumption that human touch-points only ever land on the work thread).
+    assert (
+        sum(h.chatroom.authors(ref.thread_id).count("human") for ref in (work, review, impl)) == 2
+    )
 
     # Observational audit channel (I7 sink): one reply.sent per adapter reply, in
     # order, no delivery.failed.
@@ -503,7 +519,9 @@ async def test_e2e_two_threads_concurrent_role_isolation(tmp_path: Path) -> None
     h = _build_harness(tmp_path)
 
     # One shared Dispatcher/registry/gateway/chatroom; the two streams run
-    # concurrently (each with its own watcher) — "dispatcher が並走できる".
+    # concurrently (each with its own watcher) — "dispatcher が並走できる". The
+    # fakes yield on every chatroom read/write, so gather genuinely interleaves
+    # the streams; that interleaving is asserted below (not just assumed).
     a, b = await asyncio.gather(_run_stream(h, "A"), _run_stream(h, "B"))
 
     for refs, sid in ((a, "A"), (b, "B")):
@@ -549,6 +567,20 @@ async def test_e2e_two_threads_concurrent_role_isolation(tmp_path: Path) -> None
         "naysayer-B",
         "implementer-B",
     }
+
+    # SHOULD-1 (naysayer #73): make "concurrent" a *verified* property, not a
+    # claim. The role-isolation checks above pass whether the streams interleave
+    # or run back-to-back, so on their own they only prove "two streams on one
+    # Dispatcher don't mix" — not isolation *under interleaving*. Prove genuine
+    # interleaving from the global post order: a run that degenerated to sequential
+    # (all of A, then all of B) is a single block boundary ("A…A B…B" → 2 blocks);
+    # real interleaving alternates the streams many times. This assertion FAILS if
+    # the harness ever silently degrades to sequential, so the isolation above is
+    # exercised against actually-interleaved traffic on the shared Dispatcher.
+    stream_tags = [tid.rsplit("-", 1)[-1] for _msg_id, tid in h.chatroom.timeline()]
+    assert stream_tags.count("A") == stream_tags.count("B")  # symmetric work per stream
+    blocks = 1 + sum(1 for x, y in pairwise(stream_tags) if x != y)
+    assert blocks > 2, f"streams did not interleave — sequential degradation: {stream_tags}"
 
 
 # --------------------------------------------------------------------------- #
