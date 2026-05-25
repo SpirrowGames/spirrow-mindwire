@@ -159,6 +159,10 @@ def test_classify_bash(cmd: str, expected: Operation) -> None:
         ("sh -c 'uv run mypy src'", Operation.EXEC_CODE),
         # `bash script.sh` runs a file (not -c) → not inline indirection.
         ("bash deploy.sh", Operation.EXEC_CODE),
+        # backticks: a closed pair, and (main #2) an unclosed trailing backtick
+        # whose remainder is taken as the body — deny-safe, symmetric with $(.
+        ("echo `rm -rf x` done", Operation.FS_DELETE),
+        ("echo `gh pr merge 5", Operation.GIT_MERGE_TO_MAIN),
     ],
 )
 def test_classify_bash_indirection_recursed(cmd: str, expected: Operation) -> None:

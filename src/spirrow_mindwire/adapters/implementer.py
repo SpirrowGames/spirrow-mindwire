@@ -140,6 +140,13 @@ class ImplementerSdkHealthError(AdapterHealthError):
 # --------------------------------------------------------------------------- #
 
 # Bash command separators we split a compound command on before classifying.
+# This plain regex does NOT honor quoting, so it can OVER-split a quoted body
+# (``bash -c "git push origin main; rm -rf /"`` splits at the inner ``;``). That is
+# fail-safe by construction: each fragment is classified independently and
+# ``_classify_bash`` takes the MOST dangerous verdict (max over ``_DANGER_RANK``),
+# so a stray split can only surface an extra dangerous fragment — never downgrade
+# one. The clean path for wrapped commands is the ``_indirection_inner`` recursion;
+# this split is the compound-command catch.
 _BASH_SEP = re.compile(r"&&|\|\||;|\||\n")
 
 _DELETE_CMDS = {"rm", "rmdir", "unlink", "shred", "del", "erase"}
@@ -357,8 +364,9 @@ def _extract_substitutions(command: str) -> list[str]:
 
     ``$(...)`` is matched with balanced-paren scanning so nesting (``$( $(...) )``)
     works: the outer body is returned and the caller recurses into it (finding the
-    next level). Backticks (which don't nest) are matched pairwise. Deny-safe on a
-    missing close paren: the remainder of the string is returned as the body so its
+    next level). Backticks (which don't nest) are matched pairwise; an unclosed
+    trailing backtick takes the remainder as its body. Deny-safe on a missing close
+    paren / backtick: the remainder of the string is returned as the body so its
     content is still classified.
     """
     inners: list[str] = []
@@ -376,7 +384,16 @@ def _extract_substitutions(command: str) -> list[str]:
             i = j
         else:
             i += 1
-    inners.extend(m.group(1) for m in re.finditer(r"`([^`]*)`", command))
+    # Backticks (no nesting): each `...` body; an unclosed trailing backtick takes
+    # the remainder as its body, mirroring the $( deny-safe rule above.
+    bt = command.find("`")
+    while bt != -1:
+        close = command.find("`", bt + 1)
+        if close == -1:
+            inners.append(command[bt + 1 :])
+            break
+        inners.append(command[bt + 1 : close])
+        bt = command.find("`", close + 1)
     return inners
 
 
@@ -434,6 +451,10 @@ _INDIRECTION_RE = re.compile(r"\b(?:bash|sh|zsh|dash)\b\s+-\w*c\b|\beval\b|\$\(|
 # #71 (T23) structured-vs-regex drift class that motivated this task. A gap here
 # can no longer cause an *under*-deny, because the structural classifier runs on
 # the extracted inner regardless; at worst this floor over-denies, which is safe.
+# Consequence (scope): a `gh api` mutation that ALSO defeats the tokenizer (e.g.
+# ANSI-C `$'gh api ... -XPUT'`) is caught by NEITHER the recursion nor this floor —
+# that residue is out of scope (environment containment + human merge carry it),
+# unlike rm / force-push / publish, which the floor still catches in the raw text.
 _RAW_COARSE: tuple[tuple[re.Pattern[str], Operation], ...] = (
     (re.compile(r"\b(?:rm|rmdir|shred|unlink)\b|-delete\b|\bRemove-Item\b"), Operation.FS_DELETE),
     (
