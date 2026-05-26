@@ -229,6 +229,16 @@ def test_classify_bash_nesting_depth_fails_closed() -> None:
         ('bash --rcfile myrc -c "rm -rf x"', Operation.FS_DELETE),
         ('bash --rcfile myrc -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
         ('bash -O extglob -c "rm -rf x"', Operation.FS_DELETE),
+        # #74 main Round-2 MINOR: lookahead for value-taking options used WITHOUT
+        # their argument (`bash -O -c "<x>"` / `bash +O -c …` / `bash --rcfile -c
+        # …`). Real bash 5.x errors out on these so the runtime would not execute
+        # the inner, but classify on intent so the gate denies the form anyway
+        # (defensive against a future bash / non-bash shell with looser semantics).
+        ('bash -O -c "rm -rf x"', Operation.FS_DELETE),
+        ('bash +O -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('bash --rcfile -c "rm -rf x"', Operation.FS_DELETE),
+        # control: option used WITH its argument still parses as before (no false deny).
+        ('bash -O extglob -c "echo hi"', Operation.EXEC_CODE),
         # leading shell flags / option-arg + ANSI-C inner: structural mis-tokenizes,
         # but the (broadened) indirection gate lets the coarse floor catch the verb.
         ("bash -l -c $'rm -rf x'", Operation.FS_DELETE),

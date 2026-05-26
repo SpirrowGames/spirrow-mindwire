@@ -400,6 +400,14 @@ def _extract_dash_c(tokens: list[str], start: int) -> str | None:
     ``bash --rcfile myrc -c "<x>"`` / ``bash -O extglob -c "<x>"`` still reach
     ``-c``. Returns None for ``bash script.sh`` (a bare token before any ``-c`` =
     script/file form — nothing to recurse into).
+
+    Lookahead for value-taking options (#74 main Round-2 MINOR): if the next token
+    is itself a ``-c``-style flag, treat the value-taking option as *arg-less* and
+    let ``-c`` be parsed normally (so ``bash -O -c "<x>"`` classifies on the
+    inner). Real bash 5.x errors out on this form rather than running ``<x>`` (the
+    production runtime would not execute it), but classifying on *intent* — and so
+    denying the form regardless — costs nothing and is robust against a future
+    bash relaxing the requirement or a non-bash shell with different semantics.
     """
     i = start
     while i < len(tokens):
@@ -407,7 +415,11 @@ def _extract_dash_c(tokens: list[str], start: int) -> str | None:
         if re.fullmatch(r"-\w*c", tok):  # -c / -lc / -xc … (flag ending in c)
             return tokens[i + 1] if i + 1 < len(tokens) else None
         if tok in _BASH_VALUE_OPTS:
-            i += 2  # skip the option AND its argument
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+            if nxt is not None and re.fullmatch(r"-\w*c", nxt):
+                i += 1  # option used without its argument; -c is the next token
+            else:
+                i += 2  # option WITH arg, skip both
             continue
         if not tok.startswith(("-", "+")):
             return None  # bare token before -c → script/file form
