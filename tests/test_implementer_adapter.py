@@ -132,6 +132,128 @@ def test_classify_bash(cmd: str, expected: Operation) -> None:
     assert classify_tool_call("Bash", {"command": cmd}).operation is expected
 
 
+# --------------------------------------------------------------------------- #
+# T27: indirection is unified via recursion (direct == wrapped), not a regex
+# mirror. These cover the shell-extraction edge cases (nesting, multiple -c,
+# $() nesting, tokenizer-defeating quoting, depth bound).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "cmd,expected",
+    [
+        # nested wrappers: the extracted inner is recursed through the SAME
+        # classifier, so danger surfaces however deep the wrapper nests.
+        ("bash -c \"bash -c 'rm -rf x'\"", Operation.FS_DELETE),
+        ("eval \"bash -c 'git push --force origin feature/x'\"", Operation.FORCE_PUSH),
+        # nested command substitution.
+        ("echo $(echo $(rm -rf z))", Operation.FS_DELETE),
+        ("echo $(git push --force origin feature/x)", Operation.FORCE_PUSH),
+        # a wrapped main-merge one-liner is still surfaced as merge-to-main.
+        ('bash -c "git checkout main && git merge develop"', Operation.GIT_MERGE_TO_MAIN),
+        # gh api precision now comes from recursion (single source), not a regex
+        # mirror: a wrapped field-flag gh api (gh defaults to POST) still denies.
+        ('bash -c "gh api repos/o/r/pulls --field title=x"', Operation.UNKNOWN),
+        # legit wrapped commands stay allowed (EXEC_CODE) — not over-denied.
+        ('bash -c "pytest -q && echo done"', Operation.EXEC_CODE),
+        ("sh -c 'uv run mypy src'", Operation.EXEC_CODE),
+        # `bash script.sh` runs a file (not -c) → not inline indirection.
+        ("bash deploy.sh", Operation.EXEC_CODE),
+        # backticks: a closed pair, and (main #2) an unclosed trailing backtick
+        # whose remainder is taken as the body — deny-safe, symmetric with $(.
+        ("echo `rm -rf x` done", Operation.FS_DELETE),
+        ("echo `gh pr merge 5", Operation.GIT_MERGE_TO_MAIN),
+    ],
+)
+def test_classify_bash_indirection_recursed(cmd: str, expected: Operation) -> None:
+    assert classify_tool_call("Bash", {"command": cmd}).operation is expected
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        "rm -rf x",
+        "git push --force origin feature/x",
+        "git reset --hard HEAD~3",
+        "npm publish",
+        "gh api repos/o/r/merges -X PUT",
+        "gh api repos/o/r/pulls -f title=x",
+        "gh pr merge 5",
+        "pytest -q",
+        "git status",
+    ],
+)
+def test_classify_direct_equals_wrapped(inner: str) -> None:
+    # The T27 invariant: wrapping a command in `bash -c "..."` must not change its
+    # classification — direct and indirection share one classifier (no drift).
+    direct = classify_tool_call("Bash", {"command": inner}).operation
+    wrapped = classify_tool_call("Bash", {"command": f'bash -c "{inner}"'}).operation
+    assert direct == wrapped
+
+
+@pytest.mark.parametrize(
+    "cmd,expected",
+    [
+        # ANSI-C $'...' quoting hides the verb from shlex → recursion mis-tokenizes,
+        # but the coarse defence-in-depth floor still catches the raw verb.
+        ("eval $'rm -rf x'", Operation.FS_DELETE),
+        # a Tier C verb smuggled into a non-executed `bash -c X Y` slot (only X
+        # runs) is still denied by the coarse floor.
+        ('bash -c "echo hi" -c "rm -rf x"', Operation.FS_DELETE),
+    ],
+)
+def test_classify_bash_coarse_floor_backstops_untokenizable(cmd: str, expected: Operation) -> None:
+    assert classify_tool_call("Bash", {"command": cmd}).operation is expected
+
+
+def test_classify_bash_nesting_depth_fails_closed() -> None:
+    # Pathologically nested indirection exceeds the recursion bound → fail closed
+    # (UNKNOWN → deny) rather than spin or silently pass. Neutral inner verb so the
+    # coarse floor doesn't classify it first.
+    cmd = "$(" * 10 + "git status" + ")" * 10
+    assert classify_tool_call("Bash", {"command": cmd}).operation is Operation.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "cmd,expected",
+    [
+        # #74 naysayer MUST-1 / Copilot: a launcher before `bash -c` must not hide
+        # the inner from the structural classifier (#71 MUST-1 must not regress).
+        ('exec bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('env bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('command bash -c "rm -rf x"', Operation.FS_DELETE),
+        # value-taking launcher (timeout DURATION / nice -n N) before the shell.
+        ('timeout 5 bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('nice -n 10 bash -c "git push --force origin feature/x"', Operation.FORCE_PUSH),
+        # value-taking bash OPTIONS hide `-c` (--rcfile F / -O shopt): skip the arg.
+        ('bash --rcfile myrc -c "rm -rf x"', Operation.FS_DELETE),
+        ('bash --rcfile myrc -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('bash -O extglob -c "rm -rf x"', Operation.FS_DELETE),
+        # #74 main Round-2 MINOR: lookahead for value-taking options used WITHOUT
+        # their argument (`bash -O -c "<x>"` / `bash +O -c …` / `bash --rcfile -c
+        # …`). Real bash 5.x errors out on these so the runtime would not execute
+        # the inner, but classify on intent so the gate denies the form anyway
+        # (defensive against a future bash / non-bash shell with looser semantics).
+        ('bash -O -c "rm -rf x"', Operation.FS_DELETE),
+        ('bash +O -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
+        ('bash --rcfile -c "rm -rf x"', Operation.FS_DELETE),
+        # control: option used WITH its argument still parses as before (no false deny).
+        ('bash -O extglob -c "echo hi"', Operation.EXEC_CODE),
+        # leading shell flags / option-arg + ANSI-C inner: structural mis-tokenizes,
+        # but the (broadened) indirection gate lets the coarse floor catch the verb.
+        ("bash -l -c $'rm -rf x'", Operation.FS_DELETE),
+        ("bash --rcfile x -c $'rm -rf x'", Operation.FS_DELETE),
+        # must NOT over-deny: a launcher/shell name as a mere argument isn't a wrapper.
+        ('echo bash -c "hello world"', Operation.EXEC_CODE),
+    ],
+)
+def test_classify_bash_launcher_and_option_wrappers(cmd: str, expected: Operation) -> None:
+    # #74 naysayer MUST-1: `_indirection_inner` must reach the inner across leading
+    # launchers (env/exec/timeout) and value-taking bash options (--rcfile/-O), so
+    # the #71 field-flag-gh-api indirection bypass cannot reappear behind a wrapper.
+    assert classify_tool_call("Bash", {"command": cmd}).operation is expected
+
+
 def test_classify_push_feature_branch_params() -> None:
     a = classify_tool_call("Bash", {"command": "git push origin feature/x"})
     assert a.branch == "feature/x"
