@@ -31,6 +31,7 @@ resume() で受け取った context は **要約** であり **spec ではない
 #### §N.1.3 入口チェック (実装着手前)
 
 1. `chatroom_get_thread(mode="full")` で関連 thread を全文取得
+   - ただし spec として identify すべき合意 msg が既に判明している場合 (例: 確定済 ADR の decide msg ID が既知) は、targeted message ID の再読でも入口 read-back を満たす。`mode="full"` 必須は spec msg 位置が不明なときの探索手段であり、本 ADR の趣旨「spec 本文を一次ソースで読む」は targeted re-read でも達成可能 (full mode の token コスト回避目的の最適化として許容)。
 2. 直近の合意 msg (proposer の確定 msg、decide msg 等) を **spec** として identify
 3. その spec を read-back してから実装着手
 4. TaskCreate で「Read-back: thread T-xxx msg-NNN §K の spec を反映する」と明示
@@ -61,9 +62,11 @@ resume() で受け取った context は **要約** であり **spec ではない
 
 trigger 該当 PR ごとに以下を記録する。記録の所在を CLAUDE.md 末尾に固定することで、昇格判断の根拠がコードベース上に残る (F-07「根拠がログに残らない」症状を本規約自身が再生産しないため)。
 
-| PR | trigger | 入口 read-back 対象 msg | 出口チェック結果 | miss 原因分類 |
+| PR # (repo) | trigger | 入口 read-back 対象 msg | 出口チェック結果 | miss 原因分類 |
 |---|---|---|---|---|
-| _(初期化、エントリは PR 完了ごとに追記)_ | — | — | — | — |
+| #75 (spirrow-mindwire) | #3 (ADR 反映実装) | T-implementer-spec-readback-checklist msg-326 | `clean` | — |
+| msg-327 着手前調査 (spirrow-mindwire) | #3 (ADR 反映実装、ADR-11/12 着手前) | T-author-partition-key-normalization msg-324 / T-embodiment-self-declared msg-325 | `gap-detected` (入口検出 2 件、`gap-detected-pre-impl` 相当: Cognilens 一本化 no-op + Magickit 先行反映済) | — |
+| msg-330 close-decide observation (spirrow-mindwire) | #3 派生 (ADR 反映実装の自己批判) | T-adr-11-12-pre-impl-investigation msg-329 (Bohr proposer 確定) | `self-improvement-note` (出口 miss なし、入口 read-back 対象に「自身の過去セッション完了状態」を追加すべきとの観察) | — |
 
 **出口チェック結果** (3 値):
 
@@ -76,7 +79,10 @@ trigger 該当 PR ごとに以下を記録する。記録の所在を CLAUDE.md 
 - `[散文埋め込み要件]`: spec 本文の散文に埋め込まれた要件を目視走査で拾い漏れ
 - `[trigger 判定漏れ]`: 該当 trigger に気づかず read-back 自体をスキップ
 - `[出口表の項目欠落]`: 出口突き合わせ表の作成時に項目を漏らした
-- `[spec 解釈差異]`: 要件の解釈が proposer と implementer で食い違った
+- `[spec 解釈差異]`: 要件の解釈が proposer と implementer で食い違った (implementer 側の read-back 精度の問題)
+- `[spec 欠陥]`: spec 本文に要件が欠落/矛盾していた、implementer 側の read-back は正しかった (proposer 側の spec 起案品質の問題)
+
+`[spec 解釈差異]` と `[spec 欠陥]` は **責任の所在**を切り分ける軸: 前者は implementer 規律の問題、後者は proposer の spec 起案品質の問題。この分類で §N.1.5 (c) Hook 昇格基準の「特定カテゴリ累積」判定を、implementer 規律改善 (前者累積) と spec テンプレート構造化 (後者累積) を異なる打ち手に振り分けられる。
 
 **昇格基準**:
 
@@ -86,6 +92,10 @@ trigger 該当 PR ごとに以下を記録する。記録の所在を CLAUDE.md 
 **リセット条件**: 5 回達成前に miss-after-merge が出たらカウンタをゼロリセットして再カウント。ledger に「リセット: 累積X→0」を 1 行追加 (履歴は消さない、累積カウンタのみリセット)。
 
 理由: miss が出たのは「まだ習慣化していない」証拠なので振り出し。累積で見ると「4 回 clean → 1 回 miss → あと 1 回 clean で 5 回」のような解釈ブレが起きる。ゼロリセットなら「直近 5 回連続 clean」が一貫した意味を持つ。
+
+**複数 trigger 該当時の記載方針**: 複数 trigger に該当する場合は両方を `trigger` 欄に列挙し、最も支配的な (= 当該実装の意味付けに直接対応する) trigger を先頭に書く。例: ADR 反映実装が「既存 spec を踏襲する」形を取る場合は `#3, #5` のように記載。trigger 解釈の境界 (`#3` = ADR の新規反映 / `#5` = 既存 spec 上の派生実装) は厳密には演繹できないので、PR 起案時点で implementer の判断で記載し、出口チェックの際に振り返って判定し直してよい (ledger に修正履歴は残す)。
+
+**集約方針 (cross-repo)**: 本 ledger は **spirrow-mindwire 集約** (§N と同じ場所)。cross-repo 適用 (例: spirrow-magickit / spirrow-prismind / spirrow-conclair) のエントリも本表に集約し、`PR # (repo)` 列で repo を識別する。理由: §N の SOT は本書と決めたので (ADR-2026-05-29-13 D-4)、従属メタデータの ledger も同じ場所に置くのが境界整合。cross-repo 適用の起点は常に mindwire 確定 ADR なので「ADR の確定先 = ledger 集約先」が読み手にとってシンプル。**ただし (b) global CLAUDE.md 昇格時 (miss-after-merge 直近 5 回連続 0 件 + cross-project 必要)** には、global への ledger 移動 or 各 repo 分散配置を再評価する。
 
 ---
 
@@ -113,3 +123,5 @@ ADR 本体は spirrow-docs リポジトリで管理。本 CLAUDE.md からは参
 - **§M (role / identity の規範定義)**: ADR が SOT、本書は参照のみ
 
 CLAUDE.md 内で §N と §M を無分類で混ぜない。プロセス規約と規範定義は別レイヤーで管理する。後続の追記は §N または §M のいずれかに必ず位置づけ、無分類の散文を CLAUDE.md ルートに置かないこと。
+
+なお規律の趣旨は **root 直書きの散文を禁止する** ことであり、§N/§M の二択を絶対視するものではない。将来 §N (プロセス規約) でも §M (規範参照) でもない第三カテゴリ (例: ビルド手順、テスト規約) が必要になった場合は §O 以降の新セクションを立ててよい。手段 (セクション分類) と目的 (root 直書き禁止 = 分散症状防止) を混同しないこと。
