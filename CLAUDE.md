@@ -67,6 +67,9 @@ trigger 該当 PR ごとに以下を記録する。記録の所在を CLAUDE.md 
 | #75 (spirrow-mindwire) | #3 (ADR 反映実装) | T-implementer-spec-readback-checklist msg-326 | `clean` | — |
 | msg-327 着手前調査 (spirrow-mindwire) | #3 (ADR 反映実装、ADR-11/12 着手前) | T-author-partition-key-normalization msg-324 / T-embodiment-self-declared msg-325 | `gap-detected` (入口検出 2 件、`gap-detected-pre-impl` 相当: Cognilens 一本化 no-op + Magickit 先行反映済) | — |
 | msg-330 close-decide observation (spirrow-mindwire) | #3 派生 (ADR 反映実装の自己批判) | T-adr-11-12-pre-impl-investigation msg-329 (Bohr proposer 確定) | `self-improvement-note` (出口 miss なし、入口 read-back 対象に「自身の過去セッション完了状態」を追加すべきとの観察) | — |
+| T15 msg-342 ack observation (spirrow-mindwire) | #3 派生 (ADR-08 PoC-H 実機検証 着手段階) | T-T15-poc-h-phase1-kickoff msg-293 / msg-302 (sg-tomtebo-01 上に本人常用 Chrome session がある暗黙前提) | `self-improvement-note` (出口 miss なし、入口 read-back 対象に「実装環境前提も Takahito に事前確認」を追加すべきとの観察、msg-338 で前提崩れ判明) | — |
+| T15 msg-346 checkpoint observation (spirrow-mindwire) | #3 派生 (ADR 反映実装の前提状態確認) | (GitHub 状態 — msg 外) PR #75 review/merge 状態 (resume 時の再 fetch 未実施) | `self-improvement-note` (出口 miss なし、入口 read-back 対象に「直前 checkpoint 後の GitHub PR review/merge 状況も再 fetch」を追加すべきとの観察、本セッション resume で merged 後判明) | — |
+| T15 msg-346 ack observation (spirrow-mindwire) | #3 派生 (ADR-08 PoC-H 実機検証、認証4軸 (d) Vaultwarden 整合評価中) | T-T15-poc-h-phase1-kickoff msg-302 §3 (b) (Vaultwarden bw CLI による memory-only 取り出しの暗黙前提) | `self-improvement-note` (出口 miss なし、bw CLI 2026.5.0 で `BW_CLIENTID`/`BW_CLIENTSECRET` env var が廃止され `bw login --apikey` が interactive prompt only に変更、automation hostility の環境前提変化として記録、入口 read-back 対象に「依存外部ツールの version/仕様前提」を加えるプロセス改善含意) | — |
 
 **出口チェック結果** (4 値):
 
