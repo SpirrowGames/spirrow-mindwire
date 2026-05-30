@@ -68,11 +68,12 @@ trigger 該当 PR ごとに以下を記録する。記録の所在を CLAUDE.md 
 | msg-327 着手前調査 (spirrow-mindwire) | #3 (ADR 反映実装、ADR-11/12 着手前) | T-author-partition-key-normalization msg-324 / T-embodiment-self-declared msg-325 | `gap-detected` (入口検出 2 件、`gap-detected-pre-impl` 相当: Cognilens 一本化 no-op + Magickit 先行反映済) | — |
 | msg-330 close-decide observation (spirrow-mindwire) | #3 派生 (ADR 反映実装の自己批判) | T-adr-11-12-pre-impl-investigation msg-329 (Bohr proposer 確定) | `self-improvement-note` (出口 miss なし、入口 read-back 対象に「自身の過去セッション完了状態」を追加すべきとの観察) | — |
 
-**出口チェック結果** (3 値):
+**出口チェック結果** (4 値):
 
 - `clean`: 全要件項目が反映済
-- `gap-detected`: 突き合わせで差分発見、修正してマージ
+- `gap-detected`: 突き合わせで差分発見、修正してマージ (入口段階で検出した場合は `gap-detected-pre-impl` と注釈)
 - `miss-after-merge`: マージ後に逸脱発覚
+- `self-improvement-note`: 出口 miss はないが、**入口 read-back の対象 / 出口表項目の網羅性 / trigger 判定 / 実装環境前提** 等について将来的に改善すべき観察を記録。累積 → 規律 / spec テンプレートの構造化判断 / 入口 read-back 対象の拡張 等の打ち手に繋げる。`miss-after-merge` ではないので昇格カウンタ (直近 5 回連続 clean) のリセット条件には該当しない。
 
 **miss 原因分類** (miss-after-merge 発生時のみ、1 語添える):
 
