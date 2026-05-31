@@ -109,13 +109,15 @@ trigger 該当 PR ごとに以下を記録する。記録の所在を CLAUDE.md 
 
 | ADR | 内容 | thread |
 |---|---|---|
-| ADR-2026-05-27-09 (T28) | identity 4 レイヤーモデル (identity_name / independence_class / role / 稼働形態 (embodiment) の直交分離) | T-T28-author-role-identity |
+| ADR-2026-05-27-09 (T28) | identity 4 レイヤーモデル (identity_name / independence_class / role / 稼働形態 (embodiment) の直交分離)。independence_class レイヤーは ADR-2026-05-31-15 で二値→グラデーション補強。 | T-T28-author-role-identity |
 | ADR-2026-05-29-10 (T29) | role registry (proposer / reviewer / implementer / integrator / dogfooder / naysayer / human の 7 role 定義、closeable_roles、close_reason enum) | T-T29-role-registry |
 | ADR-2026-05-29-11 | author/identity partition キー正規化 (lowercase + 区切り正規化 + 単射性 gate + strict-by-default) | T-author-partition-key-normalization |
 | ADR-2026-05-29-12 | embodiment 自己申告値化 (ADR-09 D-5 拡張・実装、5 API optional 受け口、enum、状態遷移 msg 必須化、human 例外、response-side omit) | T-embodiment-self-declared |
 | ADR-2026-05-29-13 | 実装着手前 spec read-back チェックリスト (本ファイル §N.1 の SOT) | T-implementer-spec-readback-checklist |
+| ADR-2026-05-31-15 | independence-class グラデーション化 + 「2 協調 1 独立」配置 (ADR-09/T28 の independence_class レイヤーを二値→グラデーションに補強、別訓練分布 naysayer の規範根拠、N-1/C-2 トレードオフ併記、§0 順序) | T-T15-poc-h-phase1-kickoff |
 
-注: ADR-2026-05-27-08 (T15 ガワ方式) は identity 規範定義ではないため §M 対象外 (UI 自動化手段選定 ADR)。
+注: ADR-2026-05-31-14 (T15 ガワ方式撤回。旧 §M 参照番号 ADR-2026-05-27-08 を実体化・置換) は identity 規範定義ではないため §M 対象外 (UI 自動化手段選定 ADR)。develop repo に実体あり。
+注: 上表 ADR-09 (T28) / ADR-10〜13 は §M 参照名のみで develop repo に文書実体が未作成のものを含む (実体化は別タスク = §M 棚卸し PR、ADR-2026-05-31-15 と ADR-2026-05-31-14 の 2 本のみ本バッチで実体化済)。
 
 ADR 本体は spirrow-docs リポジトリで管理。本 CLAUDE.md からは参照のみで、ADR の規範定義を本ファイルに転載しないこと (F-04 / F-07 系の分散症状を回避)。
 
