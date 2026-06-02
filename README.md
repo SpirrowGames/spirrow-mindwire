@@ -237,6 +237,8 @@ The human only poses the initial question and never intervenes in the relay. Eve
 - 🚧 **Phase 1** (Feature 3-A, in progress): schema v2 + write MCP server (`mindwire-mcp-server`) + race-gap monitoring + claude.ai-participant read tools + API-key persistence recipe
 - 📋 **Phase 2+** (not started): `events.jsonl`-primary tooling (CLI / dashboard / replay), cross-host distribution, multi-tenant isolation
 
+In parallel, the system is now **dogfooded as an autonomous trilateral dev loop (Stage 3)**: the watcher drives an implementer SDK adapter guarded by a Tier A/B/C action classifier + default-deny allow-list (a **loop-level main-merge guard** — direct, wrapped, and MCP forms all denied — since branch protection is unavailable on the free plan), and a naysayer reviews PRs on GitHub from a separate identity, running on a different model family (Gemini via spirrow-lexora). See ADR-2026-05-23-07 (Stage 3 autonomy gating) and ADR-2026-05-31-14/15 (naysayer placement).
+
 See [`docs/feature-3-design.md`](docs/feature-3-design.md) for the detailed phase breakdown.
 
 It is currently operated mainly for SpirrowGames personal dogfooding; external use is experimental. Not recommended for uses that need stability.
@@ -247,13 +249,15 @@ It is currently operated mainly for SpirrowGames personal dogfooding; external u
 
 One distinctive feature of this repo is that it adopts a workflow where **design decisions are settled by a debate among three AI roles**:
 
-- **Claude.ai (main)** — design proposals, review pass, spec authorship
-- **Claude.ai (naysayer)** — independent verification, contrarian review in a fully isolated session under 5 principles (YAGNI/OverScope / hybrid & dual-management complexity / no opposition for opposition's sake / explicitly endorse what should be endorsed / silence is negligence)
-- **Claude Code** — implementation, commits, CI integration, integrator decide
+- **proposer** — design proposals, review pass, spec authorship, decide
+- **implementer** — implementation, commits, CI integration, opens PRs
+- **naysayer** — independent, adversarial review under 5 principles (YAGNI/OverScope / hybrid & dual-management complexity / no opposition for opposition's sake / explicitly endorse what should be endorsed / silence is negligence)
+
+The roles run on a **"2 collaborate, 1 independent" placement** (ADR-2026-05-31-15): the proposer and implementer share one model family (Claude Code) for collaboration speed, while the **naysayer runs on a _different_ model family (Gemini, via [spirrow-lexora](https://github.com/SpirrowGames/spirrow-lexora))** for maximal independence — and reviews PRs on GitHub (APPROVE / REQUEST_CHANGES) from a _separate identity_ so that author ≠ approver. (Earlier the naysayer was a second isolated Claude.ai session; the move to a different model family is the T15 pivot — see ADR-2026-05-31-14.)
 
 Changes that involve a spec increase or decrease are discussed in a [`chatroom`](https://github.com/SpirrowGames/spirrow-magickit) thread until the 3 roles reach **convergence**, with final approval given by the user (= the author). The trilateral debate is traced via citations in GitHub PRs / Issues / commit messages, and becomes replayable later.
 
-This is less an attempt at "consensus governance among AIs" and closer to **a mechanism that structurally compensates for a single reviewer's blind spots**. Because the naysayer does not hold the main reviewer's context at all, it serves to flush out biases that don't share the same premises.
+This is less an attempt at "consensus governance among AIs" and closer to **a mechanism that structurally compensates for a single reviewer's blind spots**. Running the naysayer on a _different model family_ — rather than just a separate session of the same model — is what makes that independence real: it flushes out the common blind spots a same-distribution reviewer would share. The trade-off (the naysayer loses the Claude family's internal context) is mitigated by injecting full context at review time; see ADR-2026-05-31-15 §3.
 
 See [`docs/dogfooding.md`](docs/dogfooding.md) and the review trail of past PRs (e.g. [PR #51](https://github.com/SpirrowGames/spirrow-mindwire/pull/51)) for details.
 
