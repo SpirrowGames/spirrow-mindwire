@@ -237,6 +237,8 @@ Claude.ai 側が新規 thread を開いて Claude Code に返答してもらう�
 - 🚧 **Phase 1** (Feature 3-A、 進行中): schema v2 + write MCP server (`mindwire-mcp-server`) + race-gap monitoring + claude.ai-participant read tools + API key 永続化 recipe
 - 📋 **Phase 2+** (未着手): `events.jsonl` 一次依存 tooling (CLI / dashboard / replay)、 cross-host distribution、 multi-tenant 分離
 
+並行して、 本システムは現在 **自律 trilateral 開発ループ (Stage 3) として dogfood 中**: watcher が implementer SDK adapter を駆動し、 Tier A/B/C action classifier + default-deny allow-list (= **loop-level の main-merge guard** — direct / wrapped / MCP の各形態を deny。  無料プランで branch protection が使えないため) で守る。 naysayer は別 identity・別モデルファミリー (Gemini via spirrow-lexora) で GitHub 上の PR を review する。 ADR-2026-05-23-07 (Stage 3 autonomy gating) / ADR-2026-05-31-14/15 (naysayer 配置) 参照。
+
 詳細な phase 区分は [`docs/feature-3-design.md`](docs/feature-3-design.md) を参照。
 
 現状は SpirrowGames 個人 dogfooding を主目的に運用しており、 外部利用は実験的。 stability が必要な用途には未推奨。
@@ -247,13 +249,15 @@ Claude.ai 側が新規 thread を開いて Claude Code に返答してもらう�
 
 本 repo の特徴の一つは、 設計判断を **3 つの AI role の議論で確定する** ワークフローを採用している点:
 
-- **Claude.ai (main)** — 設計提案・review pass・spec authorship
-- **Claude.ai (naysayer)** — independent verification、 完全 isolated session で contrarian 5 原則 review (YAGNI/OverScope / ハイブリッド・二重管理複雑性 / 反対のための反対をしない / 賛成すべきは明示賛成 / 沈黙は怠慢)
-- **Claude Code** — implementation、 commit、 CI 連携、 integrator decide
+- **proposer** — 設計提案・review pass・spec authorship・decide
+- **implementer** — implementation、 commit、 CI 連携、 PR 起票
+- **naysayer** — independent な contrarian 5 原則 review (YAGNI/OverScope / ハイブリッド・二重管理複雑性 / 反対のための反対をしない / 賛成すべきは明示賛成 / 沈黙は怠慢)
+
+3 役割は **「2 協調 1 独立」配置** (ADR-2026-05-31-15) で動く: proposer と implementer は同一モデルファミリー (Claude Code) を共有して協調速度を取り、 **naysayer は _別の_ モデルファミリー (Gemini、 [spirrow-lexora](https://github.com/SpirrowGames/spirrow-lexora) 経由)** で最大の独立性を取る。 さらに naysayer は GitHub 上で PR を review (APPROVE / REQUEST_CHANGES) し、 _別 identity_ から行う (author ≠ approver)。 (以前は naysayer も 2 つ目の isolated な Claude.ai session だったが、 別モデルファミリーへの移行は T15 ピボット — ADR-2026-05-31-14 参照。)
 
 仕様増減を伴う変更は 3 役割が **convergent** に至るまで [`chatroom`](https://github.com/SpirrowGames/spirrow-magickit) thread で議論し、 最終承認は user (= 筆者) が行う。 trilateral debate は GitHub PR / Issue / commit message の引用で trace され、 後日 replay 可能になる。
 
-これは 「AI 同士の合議制」 を試行するというより、 **single reviewer の blind spot を構造的に補う仕組み** に近い。 naysayer は main reviewer の context を完全に持たないため、 同じ前提を共有しないバイアスを摘出する役割を果たす。
+これは 「AI 同士の合議制」 を試行するというより、 **single reviewer の blind spot を構造的に補う仕組み** に近い。 naysayer を (同一モデルの別 session でなく) _別のモデルファミリー_ で動かすことが、 その独立性を実体化させる: 同一分布の reviewer なら共有してしまう共通盲点を摘出できる。 トレードオフ (naysayer は Claude ファミリーの内部 context を失う) は review 時に full context を注入して緩和する。 ADR-2026-05-31-15 §3 参照。
 
 詳細は [`docs/dogfooding.md`](docs/dogfooding.md) と過去 PR の review trail (例: [PR #51](https://github.com/SpirrowGames/spirrow-mindwire/pull/51)) を参照。
 
