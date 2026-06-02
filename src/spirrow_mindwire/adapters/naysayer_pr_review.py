@@ -203,7 +203,7 @@ class NaysayerPrReviewAdapter:
             else LexoraClient(lexora_url, timeout_seconds=timeout_seconds)
         )
         # T22: the naysayer authenticates as a SEPARATE GitHub identity
-        # (takahito-spirrowgames via MINDWIRE_NAYSAYER_GITHUB_TOKEN) so its
+        # (spirrowgames-ops via MINDWIRE_NAYSAYER_GITHUB_TOKEN) so its
         # APPROVE / REQUEST_CHANGES is not "approving your own PR". An explicit
         # github_token arg wins (tests / overrides); otherwise resolve the
         # naysayer identity (which falls back to the shared token until the
@@ -324,7 +324,7 @@ class NaysayerPrReviewAdapter:
 
         GitHub forbids a formal APPROVE / REQUEST_CHANGES on your *own* PR. T22
         provisions the naysayer a distinct identity
-        (``MINDWIRE_NAYSAYER_GITHUB_TOKEN`` = ``takahito-spirrowgames``) so the
+        (``MINDWIRE_NAYSAYER_GITHUB_TOKEN`` = ``spirrowgames-ops``) so the
         formal verdict goes through. This COMMENT fallback remains a backstop for
         the window before that token is provisioned (the naysayer then shares the
         author identity and the verdict event 422s): we re-submit the same body as
