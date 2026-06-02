@@ -45,7 +45,7 @@ def github_token() -> str | None:
     """Resolve the proposer/implementer GitHub token from env.
 
     ``MINDWIRE_GITHUB_TOKEN`` first, then ``GITHUB_TOKEN``. This is the shared
-    author identity (``takayan0908``); it deliberately does **not** read the
+    author identity (``takahito-spirrowgames``); it deliberately does **not** read the
     naysayer var, so the two identities stay separate (T22).
     """
     return os.environ.get("MINDWIRE_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or None
@@ -55,7 +55,7 @@ def naysayer_github_token() -> str | None:
     """Resolve the naysayer's GitHub token — a *separate identity* (T22).
 
     GitHub forbids approving your own PR, so the naysayer's review must come from
-    a different account (``takahito-spirrowgames``) than the proposer/implementer
+    a different account (``spirrowgames-ops``) than the proposer/implementer
     author. Resolves ``MINDWIRE_NAYSAYER_GITHUB_TOKEN`` first; if that is not
     provisioned yet it falls back to the shared :func:`github_token` so the
     adapter still functions (the same-identity 422 is then handled by the
@@ -75,7 +75,7 @@ def naysayer_github_token() -> str | None:
     logger.warning(
         "MINDWIRE_NAYSAYER_GITHUB_TOKEN is unset; the naysayer is falling back to "
         "the shared author token and will run as author==approver (self-approval) "
-        "until the distinct takahito-spirrowgames token is provisioned (T22)."
+        "until the distinct spirrowgames-ops token is provisioned (T22)."
     )
     return github_token()
 
