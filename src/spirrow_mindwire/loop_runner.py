@@ -99,9 +99,7 @@ class Stage3ProposerAdapter(ClaudeCodeSdkAdapter):
     """
 
     adapter_id: str = "stage3-proposer"
-    capabilities: frozenset[Capability] = frozenset(
-        {Capability.READ_THREAD, Capability.POST_REPLY}
-    )
+    capabilities: frozenset[Capability] = frozenset({Capability.READ_THREAD, Capability.POST_REPLY})
 
 
 @dataclass
@@ -159,9 +157,7 @@ def build_registry(
     registry.register(proposer)
     registry.register(implementer)
     registry.register(naysayer)
-    _assert_role_resolution(
-        registry, proposer=proposer, implementer=implementer, naysayer=naysayer
-    )
+    _assert_role_resolution(registry, proposer=proposer, implementer=implementer, naysayer=naysayer)
     return registry
 
 
@@ -279,9 +275,7 @@ def build_loop(
     if naysayer is None:
         naysayer = build_naysayer()
 
-    registry = build_registry(
-        proposer=proposer, implementer=implementer, naysayer=naysayer
-    )
+    registry = build_registry(proposer=proposer, implementer=implementer, naysayer=naysayer)
     gateway = MagickitChatroomGateway(mcp)
     dispatcher = Dispatcher(registry=registry, gateway=gateway, event_sink=_log_event_sink)
     watches = build_watches(cfg)

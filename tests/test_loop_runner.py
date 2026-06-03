@@ -66,8 +66,13 @@ class _FakeChatroom:
         msg_id = f"m{self._seq}"
         ts = (datetime(2026, 6, 3, tzinfo=UTC) + timedelta(seconds=self._seq)).isoformat()
         self._msgs.append(
-            {"msg_id": msg_id, "author": author, "content": content,
-             "timestamp": ts, "reply_to": reply_to}
+            {
+                "msg_id": msg_id,
+                "author": author,
+                "content": content,
+                "timestamp": ts,
+                "reply_to": reply_to,
+            }
         )
         return msg_id
 
@@ -110,8 +115,14 @@ class _ScriptedSdkClient:
     async def receive_response(self) -> AsyncIterator[Any]:
         yield AssistantMessage(content=[TextBlock(text=self._text)], model="stub")
         yield ResultMessage(
-            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
-            num_turns=1, session_id="s", stop_reason="end_turn", result="ok",
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            stop_reason="end_turn",
+            result="ok",
         )
 
     async def interrupt(self) -> None: ...
@@ -128,8 +139,12 @@ class _StubAdapter:
 
     async def spawn(self, thread_ref: ThreadRef, role: Role, ctx: SpawnContext) -> SessionHandle:
         return SessionHandle(
-            session_id=new_ulid(), instance_id=ctx.own_instance_id, adapter_id=self.adapter_id,
-            thread_ref=thread_ref, role=role, started_at=datetime.now(UTC),
+            session_id=new_ulid(),
+            instance_id=ctx.own_instance_id,
+            adapter_id=self.adapter_id,
+            thread_ref=thread_ref,
+            role=role,
+            started_at=datetime.now(UTC),
         )
 
     async def deliver_event(self, handle: SessionHandle, event: ChatroomEvent) -> None:
@@ -149,9 +164,7 @@ def _exec_caps() -> frozenset[Capability]:
 
 
 def _naysayer_caps() -> frozenset[Capability]:
-    return frozenset(
-        {Capability.READ_THREAD, Capability.POST_REPLY, Capability.NAYSAYER_QUALIFIED}
-    )
+    return frozenset({Capability.READ_THREAD, Capability.POST_REPLY, Capability.NAYSAYER_QUALIFIED})
 
 
 def _real_adapters(tmp_path: Path) -> tuple[Stage3ProposerAdapter, ImplementerSdkAdapter, Any]:
