@@ -106,6 +106,64 @@ class PrRef:
         return f"{self.owner}/{self.repo}#{self.number}"
 
 
+class CiState(StrEnum):
+    """Aggregated CI state for a PR head SHA (ADR-2026-06-03-16 §D-4).
+
+    ``UNKNOWN`` is the fail-closed value: any 403 / network / parse failure (or
+    a head SHA with no CI runs) maps here, and the naysayer never treats it as
+    green. Only ``SUCCESS`` is "CI green".
+    """
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+    PENDING = "pending"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class CiStatus:
+    """CI status for a PR head SHA (ADR-16 L1 / L4)."""
+
+    state: CiState
+    head_sha: str | None
+    failing: list[str]  # names of failing workflow runs (for the REQUEST_CHANGES body)
+
+
+# Run conclusions that count as "not a failure" (ADR-16 §D-4 state mapping).
+_CI_OK_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+
+
+def _derive_ci_state(workflow_runs: list[Any], head_sha: str) -> CiStatus:
+    """Aggregate GitHub Actions ``workflow_runs`` into a :class:`CiStatus`.
+
+    Dedupe to the latest run per ``workflow_id`` (so a re-run / superseded older
+    run doesn't false-fail), then: any non-``completed`` → PENDING; any completed
+    run whose ``conclusion`` is not success/neutral/skipped → FAILURE; all
+    success → SUCCESS. No runs at all → UNKNOWN (can't confirm green → fail-closed).
+    """
+    latest: dict[Any, dict[str, Any]] = {}
+    for run in workflow_runs:
+        if not isinstance(run, dict):
+            continue
+        wid = run.get("workflow_id")
+        prev = latest.get(wid)
+        if prev is None or int(run.get("run_number") or 0) >= int(prev.get("run_number") or 0):
+            latest[wid] = run
+    runs = list(latest.values())
+    if not runs:
+        return CiStatus(state=CiState.UNKNOWN, head_sha=head_sha, failing=[])
+    if any(run.get("status") != "completed" for run in runs):
+        return CiStatus(state=CiState.PENDING, head_sha=head_sha, failing=[])
+    failing = [
+        str(run.get("name") or run.get("workflow_id"))
+        for run in runs
+        if run.get("conclusion") not in _CI_OK_CONCLUSIONS
+    ]
+    if failing:
+        return CiStatus(state=CiState.FAILURE, head_sha=head_sha, failing=failing)
+    return CiStatus(state=CiState.SUCCESS, head_sha=head_sha, failing=[])
+
+
 def parse_pr_ref(text: str) -> PrRef | None:
     """Extract a :class:`PrRef` from free text (PR URL or ``owner/repo#n``).
 
@@ -140,6 +198,8 @@ class GitHubReviewClient(Protocol):
     """Structural view of the GitHub methods the naysayer adapter drives."""
 
     async def fetch_pr_diff(self, pr: PrRef) -> str: ...
+
+    async def fetch_ci_status(self, pr: PrRef) -> CiStatus: ...
 
     async def submit_review(
         self, pr: PrRef, *, event: ReviewEvent, body: str
@@ -207,6 +267,58 @@ class GitHubClient:
             )
         return resp.text
 
+    async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
+        """Aggregate the PR head SHA's GitHub Actions CI state (ADR-16 L1 / §D-4).
+
+        Two reads: ``GET /pulls/{n}`` for the head SHA, then
+        ``GET /actions/runs?head_sha={sha}`` for the workflow runs. **Fail-closed**
+        (ADR-16 D-1): any 403 / network / parse failure → :attr:`CiState.UNKNOWN`
+        (the naysayer never treats UNKNOWN as green), rather than raising — a CI
+        read failure must not crash the review, it must withhold APPROVE.
+
+        Uses the **Actions API** (not check-runs / Combined Status): a
+        fine-grained PAT cannot be granted ``Checks`` permission, and Combined
+        Status is empty for Actions-based CI (false green) — ADR-16 §D-4. The
+        review token needs ``Actions: Read-only``.
+        """
+        pr_path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
+        try:
+            resp = await self._client.get(pr_path)
+        except httpx.RequestError as exc:
+            logger.warning("fetch_ci_status: GET %s failed: %s (fail-closed UNKNOWN)", pr_path, exc)
+            return CiStatus(state=CiState.UNKNOWN, head_sha=None, failing=[])
+        if resp.status_code >= 400:
+            logger.warning(
+                "fetch_ci_status: GET %s -> %s (fail-closed UNKNOWN)", pr_path, resp.status_code
+            )
+            return CiStatus(state=CiState.UNKNOWN, head_sha=None, failing=[])
+        try:
+            head_sha = str(resp.json()["head"]["sha"])
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning("fetch_ci_status: cannot parse head SHA: %s (fail-closed)", exc)
+            return CiStatus(state=CiState.UNKNOWN, head_sha=None, failing=[])
+
+        runs_path = f"/repos/{pr.owner}/{pr.repo}/actions/runs"
+        try:
+            resp = await self._client.get(runs_path, params={"head_sha": head_sha})
+        except httpx.RequestError as exc:
+            logger.warning("fetch_ci_status: GET %s failed: %s (fail-closed)", runs_path, exc)
+            return CiStatus(state=CiState.UNKNOWN, head_sha=head_sha, failing=[])
+        if resp.status_code >= 400:
+            logger.warning(
+                "fetch_ci_status: GET %s -> %s (fail-closed; check Actions:read on the token)",
+                runs_path,
+                resp.status_code,
+            )
+            return CiStatus(state=CiState.UNKNOWN, head_sha=head_sha, failing=[])
+        try:
+            body = resp.json()
+            workflow_runs = body["workflow_runs"] if isinstance(body, dict) else []
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning("fetch_ci_status: cannot parse runs: %s (fail-closed)", exc)
+            return CiStatus(state=CiState.UNKNOWN, head_sha=head_sha, failing=[])
+        return _derive_ci_state(workflow_runs if isinstance(workflow_runs, list) else [], head_sha)
+
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event."""
         path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
@@ -238,6 +350,8 @@ def _error_detail(resp: httpx.Response) -> str:
 
 
 __all__ = [
+    "CiState",
+    "CiStatus",
     "GitHubClient",
     "GitHubError",
     "GitHubHTTPError",

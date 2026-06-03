@@ -42,6 +42,8 @@ from ..exceptions import (
     AdapterSpawnError,
 )
 from ..github.client import (
+    CiState,
+    CiStatus,
     GitHubClient,
     GitHubHTTPError,
     GitHubReviewClient,
@@ -167,6 +169,33 @@ def _resolve_verdict(critique: str, *, truncated: bool, finish_reason: str | Non
     return _parse_verdict(critique)
 
 
+def _ci_gate_response(ci: CiStatus, pr_slug: str) -> tuple[ReviewEvent, str]:
+    """Map a non-green CI state to a (verdict, body) — the L1 gate (ADR-16 §D-2).
+
+    FAILURE → ``REQUEST_CHANGES`` (cite the failing runs). PENDING / UNKNOWN →
+    ``COMMENT`` hold — never APPROVE while CI is not confirmed green (fail-closed).
+    Caller invokes this **instead of** the Lexora content review (short-circuit).
+    """
+    head = ci.head_sha or "?"
+    if ci.state is CiState.FAILURE:
+        checks = ", ".join(ci.failing) or "one or more checks"
+        return ReviewEvent.REQUEST_CHANGES, (
+            f"CI is failing for {pr_slug} (head {head}): {checks}. Not reviewing "
+            f"content until CI is green.\n\nVERDICT: REQUEST_CHANGES"
+        )
+    if ci.state is CiState.PENDING:
+        return ReviewEvent.COMMENT, (
+            f"CI is still running for {pr_slug} (head {head}). Holding review until the "
+            f"checks complete — not approving while CI is pending (fail-closed)."
+        )
+    # UNKNOWN
+    return ReviewEvent.COMMENT, (
+        f"CI status for {pr_slug} (head {head}) could not be determined (fail-closed) — "
+        f"not approving until CI is confirmed green. If this persists, check that "
+        f"MINDWIRE_NAYSAYER_GITHUB_TOKEN has `Actions: Read-only`."
+    )
+
+
 def _build_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
     if len(diff) > _MAX_DIFF_CHARS:
         diff = diff[:_MAX_DIFF_CHARS] + "\n\n[diff truncated]"
@@ -272,43 +301,71 @@ class NaysayerPrReviewAdapter:
 
         session.state = SessionState.PROCESSING
         try:
-            # Fail-closed: an unreachable GitHub raises here (ADR-07 §2.6).
-            diff = await self._github.fetch_pr_diff(pr)
-            truncated = len(diff) > _MAX_DIFF_CHARS
-            completion = await self._lexora.chat_completion(
-                model=self._model,
-                messages=_build_messages(diff, pr.slug),
-                max_tokens=self._max_tokens,
-            )
-            body = (completion.content or "").strip()
-            if not body:
-                raise NaysayerPrReviewDeliveryError(
-                    f"naysayer returned empty review (finish_reason="
-                    f"{completion.finish_reason!r}) for {pr.slug}; refusing to post/submit empty"
+            # L1 CI-gate (ADR-16 §D-2): the naysayer's APPROVE must imply CI green
+            # for the reviewed head SHA. Query CI BEFORE the (costly) content review
+            # and short-circuit when it is not green — fail-closed: failure /
+            # pending / UNKNOWN never APPROVE (fetch_ci_status itself never raises).
+            ci = await self._github.fetch_ci_status(pr)
+            if ci.state is not CiState.SUCCESS:
+                verdict, body = _ci_gate_response(ci, pr.slug)
+                await session.ctx.on_reply(
+                    ReplyDraft(
+                        body=body,
+                        reply_to_msg_id=payload.msg_id,
+                        adapter_metadata={
+                            "adapter_id": self.adapter_id,
+                            "pr": pr.slug,
+                            "verdict": verdict.value,
+                            "ci_state": ci.state.value,
+                            "head_sha": ci.head_sha,  # L4: SHA the gate acted on
+                            "ci_gated": True,
+                        },
+                    )
                 )
-            # Never APPROVE a review the model could not fully see (truncated diff
-            # or hit the token cap) — force an objection.
-            verdict = _resolve_verdict(
-                body, truncated=truncated, finish_reason=completion.finish_reason
-            )
-            await session.ctx.on_reply(
-                ReplyDraft(
-                    body=body,
-                    reply_to_msg_id=payload.msg_id,
-                    adapter_metadata={
-                        "adapter_id": self.adapter_id,
-                        "model": completion.model or self._model,
-                        "pr": pr.slug,
-                        "verdict": verdict.value,
-                        "truncated": truncated,
-                        "finish_reason": completion.finish_reason,
-                        "usage": completion.usage,
-                    },
+                # No Lexora call — the gate stands in for the content review.
+                await self._submit_review(pr, verdict, body)
+            else:
+                # CI green → proceed to the content review (Lexora).
+                # Fail-closed: an unreachable GitHub raises here (ADR-07 §2.6).
+                diff = await self._github.fetch_pr_diff(pr)
+                truncated = len(diff) > _MAX_DIFF_CHARS
+                completion = await self._lexora.chat_completion(
+                    model=self._model,
+                    messages=_build_messages(diff, pr.slug),
+                    max_tokens=self._max_tokens,
                 )
-            )
-            # Fail-closed: an unreachable GitHub raises here too (after posting the
-            # critique to the thread — the human still sees the review).
-            await self._submit_review(pr, verdict, body)
+                body = (completion.content or "").strip()
+                if not body:
+                    raise NaysayerPrReviewDeliveryError(
+                        f"naysayer returned empty review (finish_reason="
+                        f"{completion.finish_reason!r}) for {pr.slug}; "
+                        f"refusing to post/submit empty"
+                    )
+                # Never APPROVE a review the model could not fully see (truncated diff
+                # or hit the token cap) — force an objection.
+                verdict = _resolve_verdict(
+                    body, truncated=truncated, finish_reason=completion.finish_reason
+                )
+                await session.ctx.on_reply(
+                    ReplyDraft(
+                        body=body,
+                        reply_to_msg_id=payload.msg_id,
+                        adapter_metadata={
+                            "adapter_id": self.adapter_id,
+                            "model": completion.model or self._model,
+                            "pr": pr.slug,
+                            "verdict": verdict.value,
+                            "truncated": truncated,
+                            "finish_reason": completion.finish_reason,
+                            "usage": completion.usage,
+                            "ci_state": ci.state.value,
+                            "head_sha": ci.head_sha,  # L4
+                        },
+                    )
+                )
+                # Fail-closed: an unreachable GitHub raises here too (after posting the
+                # critique to the thread — the human still sees the review).
+                await self._submit_review(pr, verdict, body)
         except Exception as exc:
             session.state = SessionState.FAILED
             session.error = ErrorInfo(

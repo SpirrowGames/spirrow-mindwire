@@ -12,8 +12,13 @@ from typing import Any
 
 import pytest
 
+from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent
 from spirrow_mindwire.magickit.watcher import ChatroomWatcher, WatchSpec
-from spirrow_mindwire.orchestrator import PrReviewOrchestrator
+from spirrow_mindwire.orchestrator import (
+    MergeBlockedError,
+    PrReviewOrchestrator,
+    require_ci_success,
+)
 from spirrow_mindwire.ulid_util import new_ulid
 from spirrow_mindwire.value_objects import Role, SessionHandle, ThreadRef
 
@@ -103,6 +108,52 @@ async def test_fire_pr_review_no_watcher_is_fine() -> None:
     orch = PrReviewOrchestrator(mcp)
     ref = await orch.fire_pr_review(project="p", pr_ref="o/r#7", number=1)
     assert ref.thread_id == "T-pr-review-1"  # no watcher → just opens the thread
+
+
+# ---------- L2 merge gate: require_ci_success (ADR-2026-06-03-16 D-3) ------ #
+
+
+class _FakeGitHubCi:
+    """Minimal GitHubReviewClient stub returning a fixed CI status."""
+
+    def __init__(self, ci: CiStatus) -> None:
+        self._ci = ci
+
+    async def fetch_pr_diff(self, pr: PrRef) -> str:
+        raise NotImplementedError
+
+    async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
+        return self._ci
+
+    async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.anyio
+async def test_require_ci_success_returns_status_when_green() -> None:
+    gh = _FakeGitHubCi(CiStatus(CiState.SUCCESS, "sha1", []))
+    status = await require_ci_success(gh, PrRef("o", "r", 1))
+    assert status.state is CiState.SUCCESS
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "ci",
+    [
+        CiStatus(CiState.FAILURE, "sha1", ["test"]),
+        CiStatus(CiState.PENDING, "sha1", []),
+        CiStatus(CiState.UNKNOWN, None, []),
+    ],
+)
+async def test_require_ci_success_blocks_when_not_green(ci: CiStatus) -> None:
+    # L2 is the deterministic merge gate — it must block on anything but SUCCESS,
+    # independently of any naysayer APPROVE (fail-closed).
+    gh = _FakeGitHubCi(ci)
+    with pytest.raises(MergeBlockedError):
+        await require_ci_success(gh, PrRef("o", "r", 1))
 
 
 # ---------- ChatroomWatcher.add_watch ------------------------------------- #

@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from spirrow_mindwire.github.client import (
+    CiState,
     GitHubClient,
     GitHubHTTPError,
     PrRef,
@@ -161,6 +162,109 @@ async def test_submit_review_non_2xx_fail_loud() -> None:
         with pytest.raises(GitHubHTTPError) as exc:
             await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="ok")
     assert exc.value.status_code == 422
+
+
+# ---------- fetch_ci_status (ADR-16 L1, Actions API) ---------------------- #
+
+
+def _ci_handler(
+    *,
+    head_sha: str = "sha1",
+    runs: list[dict[str, Any]] | None = None,
+    pulls_status: int = 200,
+    runs_status: int = 200,
+) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith(f"/pulls/{_PR.number}"):
+            if pulls_status != 200:
+                return httpx.Response(pulls_status, json={"message": "pulls error"})
+            return httpx.Response(200, json={"head": {"sha": head_sha}})
+        if path.endswith("/actions/runs"):
+            if runs_status != 200:
+                return httpx.Response(runs_status, json={"message": "runs error"})
+            return httpx.Response(200, json={"workflow_runs": runs if runs is not None else []})
+        return httpx.Response(500, json={"message": f"unexpected {path}"})
+
+    return handler
+
+
+def _run(**kw: Any) -> dict[str, Any]:
+    base = {
+        "workflow_id": 1,
+        "run_number": 1,
+        "name": "test",
+        "status": "completed",
+        "conclusion": "success",
+    }
+    base.update(kw)
+    return base
+
+
+@pytest.mark.anyio
+async def test_fetch_ci_status_success() -> None:
+    async with _client(_ci_handler(head_sha="abc", runs=[_run()])) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.SUCCESS
+    assert st.head_sha == "abc"
+    assert st.failing == []
+
+
+@pytest.mark.anyio
+async def test_fetch_ci_status_failure_names_failing_check() -> None:
+    runs = [_run(name="test", conclusion="failure")]
+    async with _client(_ci_handler(runs=runs)) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.FAILURE
+    assert st.failing == ["test"]
+
+
+@pytest.mark.anyio
+async def test_fetch_ci_status_pending_on_incomplete_run() -> None:
+    runs = [_run(status="in_progress", conclusion=None)]
+    async with _client(_ci_handler(runs=runs)) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.PENDING
+
+
+@pytest.mark.anyio
+async def test_fetch_ci_status_no_runs_is_unknown() -> None:
+    # No CI runs for the head SHA → can't confirm green → fail-closed UNKNOWN.
+    async with _client(_ci_handler(head_sha="abc", runs=[])) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.UNKNOWN
+    assert st.head_sha == "abc"
+
+
+@pytest.mark.anyio
+async def test_fetch_ci_status_latest_run_per_workflow_wins() -> None:
+    # An older failed run + a newer success run for the same workflow → SUCCESS
+    # (a re-run / superseded run must not false-fail).
+    runs = [
+        _run(run_number=4, conclusion="failure"),
+        _run(run_number=5, conclusion="success"),
+    ]
+    async with _client(_ci_handler(runs=runs)) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.SUCCESS
+
+
+@pytest.mark.anyio
+async def test_fetch_ci_status_runs_403_fail_closed() -> None:
+    # 403 on the runs read (e.g. token lacks Actions:read) → fail-closed UNKNOWN,
+    # NOT a raise (a CI read failure must withhold APPROVE, not crash the review).
+    async with _client(_ci_handler(head_sha="abc", runs_status=403)) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.UNKNOWN
+    assert st.head_sha == "abc"
+
+
+@pytest.mark.anyio
+async def test_fetch_ci_status_pulls_404_fail_closed() -> None:
+    async with _client(_ci_handler(pulls_status=404)) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.UNKNOWN
+    assert st.head_sha is None
 
 
 @pytest.mark.anyio

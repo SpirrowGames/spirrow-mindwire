@@ -189,6 +189,9 @@ class _FakeGitHub:
     async def fetch_pr_diff(self, pr: Any) -> str:
         raise AssertionError("not called")
 
+    async def fetch_ci_status(self, pr: Any) -> Any:
+        raise AssertionError("not called")
+
     async def submit_review(self, pr: Any, *, event: Any, body: str) -> Any:
         raise AssertionError("not called")
 
