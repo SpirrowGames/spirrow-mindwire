@@ -28,6 +28,7 @@ from spirrow_mindwire.github.client import (
     ReviewEvent,
 )
 from spirrow_mindwire.lexora.client import ChatCompletion, ChatMessage
+from spirrow_mindwire.naysayer.principles import build_preamble, principles_version
 from spirrow_mindwire.ports import RoleAdapter, SpawnContext
 from spirrow_mindwire.value_objects import (
     Capability,
@@ -226,6 +227,34 @@ async def test_lexora_called_with_naysayer_tier_and_budget() -> None:
     # the default must leave room for reasoning (~4k) AND a full critique. 4096
     # truncated the critique in practice; guard against regressing to it.
     assert max_tokens >= 8000
+
+
+@pytest.mark.anyio
+async def test_lexora_system_message_injects_principles_preamble() -> None:
+    # ADR-17 D-1: the PR-gate must inject the 5-principles SOT verbatim via the
+    # SAME build_preamble() entry point the design-time relay uses.
+    lexora = _FakeLexora()
+    adapter = NaysayerPrReviewAdapter(lexora=lexora, github=_FakeGitHub())
+    handle = await _spawn(adapter, [])
+    await adapter.deliver_event(handle, _event())
+    _model, messages, _max = lexora.calls[0]
+    assert messages[0].role == "system"
+    system = messages[0].content
+    assert build_preamble() in system  # whole SOT, verbatim (not paraphrased)
+    assert "silence is negligence" in system
+    assert "VERDICT: APPROVE" in system  # PR-review task instructions still follow it
+
+
+@pytest.mark.anyio
+async def test_content_review_metadata_records_principles_version() -> None:
+    # D-1 traceability, symmetric with the design-time relay's provenance.
+    lexora = _FakeLexora(content="all good\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha7", []))
+    captured: list[ReplyDraft] = []
+    adapter = NaysayerPrReviewAdapter(lexora=lexora, github=github)
+    handle = await _spawn(adapter, captured)
+    await adapter.deliver_event(handle, _event())
+    assert captured[0].adapter_metadata["principles_version"] == principles_version()
 
 
 # ---------- L1 CI-gate (ADR-2026-06-03-16) -------------------------------- #

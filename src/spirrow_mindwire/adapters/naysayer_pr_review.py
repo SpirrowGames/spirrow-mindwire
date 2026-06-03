@@ -6,9 +6,11 @@ review-request message (carrying a PR ref) it:
 
 1. parses the PR ref, fetches the unified diff from GitHub,
 2. runs an adversarial code review through Lexora's ``model="naysayer"`` tier
-   (Gemini — ADR-17 N-4 SOT; tier pinned in
-   ``naysayer.NAYSAYER_MODEL_TIER``) — independence inherited from
-   ADR-05 §5 (a different model family from main),
+   (Gemini — ADR-17 N-4 SOT; tier pinned in ``naysayer.NAYSAYER_MODEL_TIER``),
+   with the 5-principles SOT injected verbatim via ``naysayer.build_preamble()``
+   — the same single entry point the design-time relay uses (ADR-17 D-1, "both
+   paths inject the principles") — independence inherited from ADR-05 §5
+   (a different model family from main),
 3. posts the critique to the chatroom (``on_reply``) **and** submits a GitHub
    PR review with the verdict (``APPROVE`` / ``REQUEST_CHANGES``).
 
@@ -54,7 +56,7 @@ from ..github.client import (
     parse_pr_ref,
 )
 from ..lexora.client import ChatMessage, LexoraChatClient, LexoraClient
-from ..naysayer.principles import NAYSAYER_MODEL_TIER
+from ..naysayer.principles import NAYSAYER_MODEL_TIER, build_preamble, principles_version
 from ..ports import SpawnContext
 from ..ulid_util import new_ulid
 from ..value_objects import (
@@ -201,13 +203,20 @@ def _ci_gate_response(ci: CiStatus, pr_slug: str) -> tuple[ReviewEvent, str]:
 def _build_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
     if len(diff) > _MAX_DIFF_CHARS:
         diff = diff[:_MAX_DIFF_CHARS] + "\n\n[diff truncated]"
+    # ADR-17 D-1: the 5-principles SOT is injected verbatim via the SAME single
+    # entry point (``build_preamble()``) the design-time relay uses, so a one-place
+    # edit to ``spec/NAYSAYER_PRINCIPLES.md`` propagates to BOTH review paths and
+    # the principles are never restated as a prompt literal here. The PR-review
+    # task instructions follow the principles in one system message (fail-loud: a
+    # missing/blank SOT raises, rather than reviewing without the principles).
+    system = f"{build_preamble()}\n\n{_PR_REVIEW_SYSTEM_PROMPT}"
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
         f"specific hunks you object to, and end with your VERDICT line.\n\n"
         f"```diff\n{diff}\n```"
     )
     return [
-        ChatMessage(role="system", content=_PR_REVIEW_SYSTEM_PROMPT),
+        ChatMessage(role="system", content=system),
         ChatMessage(role="user", content=user),
     ]
 
@@ -362,6 +371,9 @@ class NaysayerPrReviewAdapter:
                             "usage": completion.usage,
                             "ci_state": ci.state.value,
                             "head_sha": ci.head_sha,  # L4
+                            # D-1 traceability: which principles version this review
+                            # judged under (symmetric with the design-time relay).
+                            "principles_version": principles_version(),
                         },
                     )
                 )
