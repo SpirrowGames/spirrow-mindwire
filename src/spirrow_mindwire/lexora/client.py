@@ -2,9 +2,14 @@
 
 Stage 2 (ADR-06 dogfood roadmap) wiring: the independent-naysayer
 RoleAdapter (:class:`~spirrow_mindwire.adapters.naysayer_lexora.NaysayerLexoraAdapter`)
-reaches DeepSeek V4-Flash through Lexora's ``model="naysayer"`` tier.
+reaches the naysayer model through Lexora's ``model="naysayer"`` tier.
 Lexora is an OpenAI-compatible gateway (``POST /v1/chat/completions``)
 fronting several backends; the *tier name* goes in the ``model`` field.
+
+The ``naysayer`` tier routes to **Gemini** (``gemini-3.1-pro-preview``) since
+the T15 pivot — SOT per ADR-2026-06-03-17 N-4 (the earlier "DeepSeek V4-Flash"
+was retired; the independent-model identity is pinned in
+:data:`spirrow_mindwire.naysayer.principles.NAYSAYER_UPSTREAM_MODEL`).
 
 Runtime target (chatroom ``T-phase2-stage2-naysayer-adapter`` msg-215):
 - Default endpoint is **``http://localhost:8110``** — Lexora binds
@@ -95,7 +100,7 @@ class ChatMessage:
 class ChatCompletion:
     """Parsed ``/v1/chat/completions`` result (the fields the adapter uses).
 
-    ``reasoning_content`` is the DeepSeek V4-Flash *deliberation* — a
+    ``reasoning_content`` is the reasoning model's *deliberation* — a
     **sibling** of ``content`` under ``choices[0].message`` (confirmed
     against the live gateway, msg-215 open point). It is captured for
     observability but the **reply is always ``content``**; the adapter
