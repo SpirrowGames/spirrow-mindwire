@@ -19,7 +19,14 @@ from spirrow_mindwire.adapters.naysayer_pr_review import (
     _parse_verdict,
     _resolve_verdict,
 )
-from spirrow_mindwire.github.client import GitHubClient, GitHubHTTPError, PrRef, ReviewEvent
+from spirrow_mindwire.github.client import (
+    CiState,
+    CiStatus,
+    GitHubClient,
+    GitHubHTTPError,
+    PrRef,
+    ReviewEvent,
+)
 from spirrow_mindwire.lexora.client import ChatCompletion, ChatMessage
 from spirrow_mindwire.ports import RoleAdapter, SpawnContext
 from spirrow_mindwire.value_objects import (
@@ -80,10 +87,13 @@ class _FakeGitHub:
         diff: str = "diff --git a/x b/x\n+added",
         fetch_exc: Exception | None = None,
         submit_exc: Exception | None = None,
+        ci: CiStatus | None = None,
     ) -> None:
         self._diff = diff
         self._fetch_exc = fetch_exc
         self._submit_exc = submit_exc
+        # Default CI = green so the existing content-review tests proceed to Lexora.
+        self._ci = ci if ci is not None else CiStatus(CiState.SUCCESS, "sha-default", [])
         self.fetched: list[PrRef] = []
         self.submitted: list[tuple[PrRef, ReviewEvent, str]] = []
 
@@ -92,6 +102,9 @@ class _FakeGitHub:
         if self._fetch_exc is not None:
             raise self._fetch_exc
         return self._diff
+
+    async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
+        return self._ci
 
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         # Model the same-identity 422: the verdict event fails, but a COMMENT
@@ -213,6 +226,67 @@ async def test_lexora_called_with_naysayer_tier_and_budget() -> None:
     # the default must leave room for reasoning (~4k) AND a full critique. 4096
     # truncated the critique in practice; guard against regressing to it.
     assert max_tokens >= 8000
+
+
+# ---------- L1 CI-gate (ADR-2026-06-03-16) -------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_ci_failure_short_circuits_request_changes_without_lexora() -> None:
+    lexora = _FakeLexora()
+    github = _FakeGitHub(ci=CiStatus(CiState.FAILURE, "sha9", ["test"]))
+    captured: list[ReplyDraft] = []
+    adapter = NaysayerPrReviewAdapter(lexora=lexora, github=github)
+    handle = await _spawn(adapter, captured)
+    await adapter.deliver_event(handle, _event())
+
+    assert lexora.calls == []  # gated before the (costly) content review
+    assert github.submitted[0][1] is ReviewEvent.REQUEST_CHANGES
+    assert "test" in github.submitted[0][2]  # failing check named in the body
+    assert captured[0].adapter_metadata["ci_state"] == "failure"
+    assert captured[0].adapter_metadata["head_sha"] == "sha9"  # L4
+
+
+@pytest.mark.anyio
+async def test_ci_pending_holds_with_comment_no_approve() -> None:
+    lexora = _FakeLexora()
+    github = _FakeGitHub(ci=CiStatus(CiState.PENDING, "sha9", []))
+    captured: list[ReplyDraft] = []
+    adapter = NaysayerPrReviewAdapter(lexora=lexora, github=github)
+    handle = await _spawn(adapter, captured)
+    await adapter.deliver_event(handle, _event())
+
+    assert lexora.calls == []
+    assert github.submitted[0][1] is ReviewEvent.COMMENT  # held, not approved
+
+
+@pytest.mark.anyio
+async def test_ci_unknown_fail_closed_never_approves() -> None:
+    # Even if the model *would* approve, an unobtainable CI state blocks APPROVE.
+    lexora = _FakeLexora(content="all good\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(ci=CiStatus(CiState.UNKNOWN, None, []))
+    captured: list[ReplyDraft] = []
+    adapter = NaysayerPrReviewAdapter(lexora=lexora, github=github)
+    handle = await _spawn(adapter, captured)
+    await adapter.deliver_event(handle, _event())
+
+    assert lexora.calls == []  # never reaches the model
+    assert github.submitted[0][1] is ReviewEvent.COMMENT  # held, never APPROVE
+
+
+@pytest.mark.anyio
+async def test_ci_success_proceeds_to_content_review_and_records_head_sha() -> None:
+    lexora = _FakeLexora(content="all good\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha7", []))
+    captured: list[ReplyDraft] = []
+    adapter = NaysayerPrReviewAdapter(lexora=lexora, github=github)
+    handle = await _spawn(adapter, captured)
+    await adapter.deliver_event(handle, _event())
+
+    assert lexora.calls != []  # CI green → model WAS consulted
+    assert github.submitted[0][1] is ReviewEvent.APPROVE
+    assert captured[0].adapter_metadata["head_sha"] == "sha7"  # L4
+    assert captured[0].adapter_metadata["ci_state"] == "success"
 
 
 # ---------- no-op / filters ---------------------------------------------- #

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef
 from .magickit.client import McpToolCaller
 from .magickit.watcher import ChatroomWatcher, WatchSpec
 from .value_objects import Role, ThreadRef
@@ -102,4 +103,32 @@ class PrReviewOrchestrator:
         return (max(nums) + 1) if nums else 1
 
 
-__all__ = ["PrReviewOrchestrator"]
+class MergeBlockedError(RuntimeError):
+    """Raised by :func:`require_ci_success` when CI is not green (ADR-16 L2 / D-3)."""
+
+    def __init__(self, status: CiStatus) -> None:
+        detail = ", ".join(status.failing) if status.failing else status.state.value
+        super().__init__(
+            f"merge blocked: CI is not green (state={status.state.value}, "
+            f"head={status.head_sha or '?'}: {detail})"
+        )
+        self.status = status
+
+
+async def require_ci_success(github: GitHubReviewClient, pr: PrRef) -> CiStatus:
+    """Deterministic merge-GO precondition (ADR-2026-06-03-16 L2 / D-3): CI must be SUCCESS.
+
+    The **deterministic** half of the two-condition merge gate: a green CI is a
+    necessary condition for merge-GO, checked in code *independently* of the
+    naysayer's (LLM) APPROVE — so a mis-firing L1 belt can never let a red PR
+    through. L2 is the authoritative gate; L1 (the CI-aware naysayer) is the belt.
+    Returns the :class:`~spirrow_mindwire.github.client.CiStatus` on success;
+    raises :class:`MergeBlockedError` for failure / pending / UNKNOWN (fail-closed).
+    """
+    status = await github.fetch_ci_status(pr)
+    if status.state is not CiState.SUCCESS:
+        raise MergeBlockedError(status)
+    return status
+
+
+__all__ = ["MergeBlockedError", "PrReviewOrchestrator", "require_ci_success"]
