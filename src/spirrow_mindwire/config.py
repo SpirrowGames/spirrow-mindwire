@@ -27,6 +27,8 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
+from .value_objects import Role
+
 CONFIG_SCHEMA_VERSION = 1
 """Version of the ``mindwire.toml`` configuration schema.
 
@@ -259,6 +261,60 @@ class MCPServerConfig(_StrictModel):
     api_key_env: str = "MINDWIRE_MCP_API_KEY"
 
 
+class LoopWatchConfig(_StrictModel):
+    """One ``(thread, role)`` the Stage 3 loop daemon watches (ADR-2026-05-21-06 §7).
+
+    Mirrors :class:`spirrow_mindwire.magickit.watcher.WatchSpec` in config form:
+    the daemon turns each entry into a ``WatchSpec`` at startup. ``instance_id``
+    is optional (defaults to ``mint_instance_id(role)`` = ``"{role}-1"`` in the
+    watcher); ``baseline`` follows the watcher default (mark current messages
+    seen without dispatching, so the daemon acts only on messages arriving after
+    start).
+
+    Topology invariant (T-stage3-loop-wiring msg-385 §5(a)): each *thread* must
+    carry exactly **one** auto-replying role — the watcher dedups per
+    ``(thread, msg_id)`` and the SDK adapters reply to every message, so two
+    auto-reply roles on one thread would steal each other's messages / ping-pong.
+    The operator is responsible for not listing two auto-reply roles for the same
+    ``thread_id`` (the naysayer's PR-review thread is wired separately via
+    :class:`spirrow_mindwire.orchestrator.PrReviewOrchestrator`).
+    """
+
+    thread_id: str
+    role: Role
+    instance_id: str = ""
+    baseline: bool = True
+
+
+class Stage3LoopConfig(_StrictModel):
+    """Stage 3 autonomous-loop daemon (``mindwire-loop``) settings.
+
+    Distinct from the Phase 0 relay watcher (:class:`WatcherConfig`) — this
+    configures the ``ChatroomWatcher``-backed RoleAdapter loop (proposer /
+    implementer / naysayer over the magickit chatroom), not the file-relay
+    ``ThreadDispatcher``.
+
+    Secrets and inference endpoints stay **out** of this config (and out of
+    TOML): the implementer's inference base URL
+    (``MINDWIRE_IMPLEMENTER_BASE_URL``), Lexora URL (``MINDWIRE_LEXORA_URL``)
+    and the naysayer's GitHub token (``MINDWIRE_NAYSAYER_GITHUB_TOKEN``) are
+    resolved from the environment by the adapters themselves at spawn (the same
+    "env name, not value, in config" principle as :class:`PhanthandConfig`).
+    """
+
+    project: str = "spirrow-mindwire"
+    poll_interval_seconds: float = Field(default=5.0, gt=0)
+    repo_dir: Path | None = None
+    """Working directory the proposer + implementer SDK sessions operate in.
+
+    Required to run the loop (the implementer edits / builds / commits here).
+    ``None`` is a config error surfaced at daemon startup, not load time, so a
+    process that only reads other settings is unaffected.
+    """
+
+    watches: tuple[LoopWatchConfig, ...] = ()
+
+
 class MindwireSettings(BaseSettings):
     """Top-level MindWire configuration.
 
@@ -279,6 +335,7 @@ class MindwireSettings(BaseSettings):
     claude_code: ClaudeCodeConfig = Field(default_factory=ClaudeCodeConfig)
     phanthand: PhanthandConfig = Field(default_factory=PhanthandConfig)
     mcp_server: MCPServerConfig = Field(default_factory=MCPServerConfig)
+    loop: Stage3LoopConfig = Field(default_factory=Stage3LoopConfig)
 
     @field_validator("schema_version")
     @classmethod
@@ -357,10 +414,12 @@ __all__ = [
     "ClaudeCodeConfig",
     "ExtraMCPServerConfig",
     "LoggingConfig",
+    "LoopWatchConfig",
     "MCPServerConfig",
     "MindwireSettings",
     "PathsConfig",
     "PhanthandConfig",
+    "Stage3LoopConfig",
     "WatcherConfig",
     "load_settings",
 ]
