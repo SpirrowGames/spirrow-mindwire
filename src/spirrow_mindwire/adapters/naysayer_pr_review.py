@@ -71,7 +71,13 @@ _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
 )
 
 _DEFAULT_MODEL = "naysayer"
-_DEFAULT_MAX_TOKENS = 4096  # >= the reasoning-model 1500 floor (§A.3), with content headroom
+# Gemini 3.1 Pro (the post-T15 naysayer tier) is a reasoning model: its reasoning
+# tokens count against the output budget (~4k observed), so the old 4096 was spent
+# almost entirely on reasoning and the visible critique was truncated mid-sentence
+# (finish_reason=length, which _resolve_verdict then forced to REQUEST_CHANGES).
+# Size for reasoning + a full critique; matches the Lexora gateway's 16000. (The
+# §A.3 floor of 1500 dates from the DeepSeek-V4-Flash era.)
+_DEFAULT_MAX_TOKENS = 16000
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 _MAX_DIFF_CHARS = 60_000  # truncate enormous diffs to stay within the model budget
 

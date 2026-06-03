@@ -209,7 +209,10 @@ async def test_lexora_called_with_naysayer_tier_and_budget() -> None:
     await adapter.deliver_event(handle, _event())
     model, _messages, max_tokens = lexora.calls[0]
     assert model == "naysayer"
-    assert max_tokens >= 1500  # §A.3 reasoning-model floor
+    # Reasoning-model floor: Gemini's reasoning tokens count against the budget, so
+    # the default must leave room for reasoning (~4k) AND a full critique. 4096
+    # truncated the critique in practice; guard against regressing to it.
+    assert max_tokens >= 8000
 
 
 # ---------- no-op / filters ---------------------------------------------- #
