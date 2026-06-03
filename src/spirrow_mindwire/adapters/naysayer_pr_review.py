@@ -6,7 +6,8 @@ review-request message (carrying a PR ref) it:
 
 1. parses the PR ref, fetches the unified diff from GitHub,
 2. runs an adversarial code review through Lexora's ``model="naysayer"`` tier
-   (DeepSeek V4-Flash, ``max_tokens >= 1500``) — independence inherited from
+   (Gemini — ADR-17 N-4 SOT; tier pinned in
+   ``naysayer.NAYSAYER_MODEL_TIER``) — independence inherited from
    ADR-05 §5 (a different model family from main),
 3. posts the critique to the chatroom (``on_reply``) **and** submits a GitHub
    PR review with the verdict (``APPROVE`` / ``REQUEST_CHANGES``).
@@ -53,6 +54,7 @@ from ..github.client import (
     parse_pr_ref,
 )
 from ..lexora.client import ChatMessage, LexoraChatClient, LexoraClient
+from ..naysayer.principles import NAYSAYER_MODEL_TIER
 from ..ports import SpawnContext
 from ..ulid_util import new_ulid
 from ..value_objects import (
@@ -72,7 +74,7 @@ _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
     {SessionState.HALTING, SessionState.HALTED, SessionState.FAILED}
 )
 
-_DEFAULT_MODEL = "naysayer"
+_DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.principles)
 # Gemini 3.1 Pro (the post-T15 naysayer tier) is a reasoning model: its reasoning
 # tokens count against the output budget (~4k observed), so the old 4096 was spent
 # almost entirely on reasoning and the visible critique was truncated mid-sentence

@@ -40,3 +40,6 @@ desktop.ini
 
 # MindWire runtime data (never commit)
 spirrow-mindwire-data/
+
+# Visual Studio (local-only IDE state)
+.vs/
