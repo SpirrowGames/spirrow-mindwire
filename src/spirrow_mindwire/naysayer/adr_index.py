@@ -1,21 +1,29 @@
-"""Deterministic CLAUDE.md §M all-ADR title index (ADR-2026-06-04-19 N-2).
+"""Deterministic in-repo ADR index manifest for the naysayer (ADR-2026-06-04-19 N-2).
 
-Salvaged from the retired ``context_bundle.py`` gather (which ADR-19 supersedes).
-The one piece of that bundle the agentized naysayer cannot reproduce on its own is
-the **complete** list of ADRs the project knows about: an LLM cannot search for an
-ADR it does not know exists, so if the proposer frames a thread without mentioning
-a conflicting historical ADR, a purely self-fetching naysayer would never look for
-it (Einstein, ``T-naysayer-agentization`` msg-421 Obj-2; ACCEPTed in msg-422).
+An agentized naysayer that only self-fetches context has a blind spot: **it cannot
+search for an ADR it does not know exists**. A thread framed without a conflicting
+historical ADR would never prompt the naysayer to look for it (Einstein,
+`T-naysayer-agentization` msg-421 Obj-2; ACCEPTed msg-422). So a complete, mechanical
+ADR index is injected into the naysayer's system prompt on every summon — the agent
+then holds a complete map and decides independently what to fetch.
 
-We therefore inject this deterministic, mechanically-parsed §M index into the
-naysayer's system prompt on **every summon** — the agent then holds a complete map
-and decides independently what to fetch, rather than relying on the proposer's
-breadcrumbs. The thread's *own* references are left to the agent to enumerate (it
-reads the thread); only the complete index must be supplied deterministically.
+**Source = the in-repo manifest** ``spec/adr_index.yaml`` (decided in
+`T-naysayer-unify-impl` msg-438). Why in-repo rather than parsing CLAUDE.md §M or an
+out-of-repo ``_docmap.yaml``:
 
-This module is the surviving home of the index parser: the ADR-19 N-4 follow-up
-removes ``context_bundle.py``, so the parser lives here and ``context_bundle.py``
-imports it until then.
+* §M is a *curated identity/role subset* (it omits the naysayer/architecture ADRs —
+  06/07/08/14/16-19), so a §M-only index lacks exactly the ADRs a naysayer reviewing a
+  naysayer design must cross-check (the original Step ① defect).
+* ``_docmap.yaml`` is *also* incomplete (it omits the §M-only identity ADRs 09-13,
+  which have no ``.md`` body). The complete set is the **union** of both.
+* An out-of-repo source (``MINDWIRE_DOCS_ROOT`` → spirrow-docs) is fragile: the loop
+  host has no docs checkout and the deploy topology is undecided (ADR-18). In-repo is
+  present on every host, deterministic, and needs no env wiring.
+
+The manifest is a **derived view** (id + title only, never the canonical ADR body,
+which lives in Drive / the scattered ADR set). The proposer regenerates it when an ADR
+is added/accepted (a future CI drift-check guards staleness) — the dual-management
+answer is "regenerated single derived view", not a hand-maintained second source.
 """
 
 from __future__ import annotations
@@ -23,57 +31,87 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import yaml
+
 # adr_index.py -> naysayer -> spirrow_mindwire -> src -> <repo root>
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+_MANIFEST_REL = Path("spec") / "adr_index.yaml"
 
-# A CLAUDE.md §M table row: ``| ADR-2026-05-27-09 (T28) | <title> | <thread> |``
+# A CLAUDE.md §M table row: ``| ADR-2026-05-27-09 (T28) | <title> | <thread> |``.
+# Retained for ``context_bundle.py`` only, until the ADR-19 N-4 (Step ③) removal —
+# the naysayer index itself no longer uses §M (it reads the manifest below).
 _ADR_INDEX_ROW_RE = re.compile(
     r"^\|\s*(ADR-\d{4}-\d{2}-\d{2}-\d+)[^|]*\|\s*([^|]+?)\s*\|", re.MULTILINE
 )
 
 
 def parse_adr_index(claude_md: str) -> tuple[tuple[str, str], ...]:
-    """Parse the CLAUDE.md §M ADR table into ``(adr_id, title)`` rows (deduped, sorted)."""
+    """Parse the CLAUDE.md §M ADR table into ``(adr_id, title)`` rows (deduped, sorted).
+
+    Used by ``context_bundle.py`` (the retired relay) until its Step ③ removal; the
+    naysayer system prompt now sources its index from the manifest, not §M.
+    """
     seen: dict[str, str] = {}
     for adr_id, title in _ADR_INDEX_ROW_RE.findall(claude_md):
         seen.setdefault(adr_id, title.strip())
     return tuple(sorted(seen.items()))
 
 
-def _read_claude_md(repo_root: Path) -> str | None:
-    """Read ``CLAUDE.md`` from ``repo_root``; ``None`` if it is absent/unreadable."""
+def load_adr_index(repo_root: Path | None = None) -> tuple[tuple[str, str], ...]:
+    """Load the in-repo ADR manifest as ``(id, title)`` rows (deduped, sorted).
+
+    Reads ``<repo_root>/spec/adr_index.yaml`` (``repo_root`` defaults to this repo;
+    the adapter passes the reviewed repo's cwd). Returns ``()`` if the manifest is
+    absent or malformed — the caller surfaces that **explicitly** rather than passing
+    off an empty/partial list as complete.
+    """
+    root = repo_root if repo_root is not None else _REPO_ROOT
     try:
-        return (repo_root / "CLAUDE.md").read_text(encoding="utf-8")
+        raw = (root / _MANIFEST_REL).read_text(encoding="utf-8")
     except OSError:
-        return None
+        return ()
+    data = yaml.safe_load(raw)
+    if not isinstance(data, dict):
+        return ()
+    entries = data.get("adrs")
+    if not isinstance(entries, list):
+        return ()
+    seen: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        adr_id = entry.get("id")
+        if isinstance(adr_id, str) and adr_id:
+            seen.setdefault(adr_id, str(entry.get("title", "")).strip())
+    return tuple(sorted(seen.items()))
 
 
 def build_adr_index_block(repo_root: Path | None = None) -> str:
-    """Render the injectable all-ADR index block (deterministic, complete).
+    """Render the injectable ADR index block from the in-repo manifest (deterministic).
 
-    Reads ``CLAUDE.md`` §M from ``repo_root`` (the reviewed repo; defaults to this
-    repo) and renders the index plus the cross-check instruction. When no §M index
-    is available the block says so **explicitly** rather than silently omitting it,
-    so a missing index is visible to the reviewer (and auditable) instead of a
-    silently narrowed worldview.
+    When the manifest cannot be loaded the block says so **explicitly** — a missing
+    index must be visible to the reviewer, never silently omitted nor mislabelled as
+    complete.
     """
-    root = repo_root if repo_root is not None else _REPO_ROOT
-    claude_md = _read_claude_md(root)
-    index = parse_adr_index(claude_md) if claude_md else ()
-    rows = (
-        "\n".join(f"- {adr_id} — {title}" for adr_id, title in index)
-        if index
-        else "(no ADR index available — CLAUDE.md §M not found in the reviewed repo)"
-    )
+    index = load_adr_index(repo_root)
+    if not index:
+        return (
+            "## ADR index — UNAVAILABLE\n"
+            "The in-repo ADR manifest (spec/adr_index.yaml) could not be loaded. Proceed "
+            "without a complete ADR map and note in your review that you could not "
+            "cross-check the design against the full ADR set."
+        )
+    rows = "\n".join(f"- {adr_id} — {title}" for adr_id, title in index)
     return (
-        "## All-ADR index (titles only, from CLAUDE.md §M) — deterministic, complete\n"
-        "This is the COMPLETE list of ADRs the project knows about, injected on every "
-        "summon so your review is not bounded by what this thread happens to cite. "
-        "Enumerate the ADRs/docs the thread DOES reference, cross-check the design under "
-        "review against the full list below, and flag any relevant ADR the discussion "
-        "never referenced — you cannot search for an ADR you do not know exists:\n"
+        "## ADR index (id + title) — the project's known ADRs, injected deterministically\n"
+        "A maintained in-repo derived view of every ADR the project knows about (bodies "
+        "live elsewhere), injected on every summon so your review is not bounded by what "
+        "this thread happens to cite. Enumerate the ADRs/docs the thread DOES reference, "
+        "cross-check the design under review against the full list below, and flag any "
+        "relevant ADR the discussion never referenced — you cannot search for an ADR you "
+        "do not know exists:\n"
         f"{rows}"
     )
 
 
-__all__ = ["build_adr_index_block", "parse_adr_index"]
+__all__ = ["build_adr_index_block", "load_adr_index", "parse_adr_index"]

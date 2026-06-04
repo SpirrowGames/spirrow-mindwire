@@ -1,0 +1,35 @@
+# mindwire ADR index (complete) — union of CLAUDE.md §M references + spirrow-docs _docmap adr entries.
+# Derived view: id + title only (NOT the canonical ADR body). Regenerate when an ADR is added/accepted.
+# Decided in T-naysayer-unify-impl msg-438 (ADR-2026-06-04-19 N-2). The canonical ADR set is scattered
+# (Drive / spirrow-docs / §M references); this in-repo derived view is injected into the naysayer's
+# system prompt so its review is not bounded by what a thread happens to cite, and is present on every
+# host the loop runs on (no out-of-repo MINDWIRE_DOCS_ROOT dependency — see the host-reality finding).
+adrs:
+  - id: ADR-2026-05-21-06
+    title: "mindwire Interface Contract (Ports) (+ amendment v2.2: I3 author=instance_id)"
+  - id: ADR-2026-05-23-07
+    title: "Stage 3 Autonomy Gating + Implementer 安全設計"
+  - id: ADR-2026-05-24-08
+    title: "Instance を一次概念とする識別モデル"
+  - id: ADR-2026-05-27-09
+    title: "identity 4 レイヤーモデル (identity_name/independence_class/role/embodiment 直交分離) (T28)"
+  - id: ADR-2026-05-29-10
+    title: "role registry (7 role 定義, closeable_roles, close_reason enum) (T29)"
+  - id: ADR-2026-05-29-11
+    title: "author/identity partition キー正規化 (lowercase + 区切り正規化 + 単射性 gate)"
+  - id: ADR-2026-05-29-12
+    title: "embodiment 自己申告値化 (5 API optional 受け口, 状態遷移 msg 必須, human 例外)"
+  - id: ADR-2026-05-29-13
+    title: "実装着手前 spec read-back チェックリスト (§N.1 SOT)"
+  - id: ADR-2026-05-31-14
+    title: "ガワ方式撤回 (claude.ai web 外部駆動 ToS 衝突 → Claude Code 転換)"
+  - id: ADR-2026-05-31-15
+    title: "independence-class グラデーション化 + 2協調1独立配置"
+  - id: ADR-2026-06-03-16
+    title: "naysayer CI-gate (APPROVE は CI 緑を含意 / approve-while-red 防止)"
+  - id: ADR-2026-06-03-17
+    title: "独立 naysayer の design-time 参加復元 (5原則常時注入 + relay orchestrator)"
+  - id: ADR-2026-06-04-18
+    title: "mindwire デプロイ・トポロジと magickit 到達性 (ADR-17 D-8 amendment)"
+  - id: ADR-2026-06-04-19
+    title: "独立 naysayer のエージェント化 + summon ルール (ADR-17 relay/bundle supersede)"
