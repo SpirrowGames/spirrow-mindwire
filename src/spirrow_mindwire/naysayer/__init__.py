@@ -9,6 +9,7 @@ design-thread context gather is
 
 from __future__ import annotations
 
+from .adr_index import build_adr_index_block, parse_adr_index
 from .context_bundle import BundleManifest, ContextBundle, build_context_bundle
 from .principles import (
     NAYSAYER_MODEL_TIER,
@@ -23,8 +24,10 @@ __all__ = [
     "NAYSAYER_UPSTREAM_MODEL",
     "BundleManifest",
     "ContextBundle",
+    "build_adr_index_block",
     "build_context_bundle",
     "build_preamble",
     "load_principles",
+    "parse_adr_index",
     "principles_version",
 ]

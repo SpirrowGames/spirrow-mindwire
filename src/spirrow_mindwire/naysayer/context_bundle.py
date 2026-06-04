@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from ..magickit.client import McpToolCaller
+from .adr_index import parse_adr_index
 from .principles import principles_version
 
 # context_bundle.py -> naysayer -> spirrow_mindwire -> src -> <repo root>
@@ -48,10 +49,6 @@ _STRUCTURAL_TYPES: frozenset[str] = frozenset({"propose", "decide", "handoff"})
 
 _ADR_RE = re.compile(r"ADR-\d{4}-\d{2}-\d{2}-\d+")
 _LOCAL_DOC_RE = re.compile(r"(?:spec|docs)/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+")
-# A CLAUDE.md §M table row: ``| ADR-2026-05-27-09 (T28) | <title> | <thread> |``
-_ADR_INDEX_ROW_RE = re.compile(
-    r"^\|\s*(ADR-\d{4}-\d{2}-\d{2}-\d+)[^|]*\|\s*([^|]+?)\s*\|", re.MULTILINE
-)
 
 
 @dataclass(frozen=True)
@@ -115,14 +112,6 @@ def extract_references(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     adrs = sorted(set(_ADR_RE.findall(text)))
     docs = sorted(set(_LOCAL_DOC_RE.findall(text)))
     return tuple(adrs), tuple(docs)
-
-
-def parse_adr_index(claude_md: str) -> tuple[tuple[str, str], ...]:
-    """Parse the CLAUDE.md §M ADR table into ``(adr_id, title)`` rows (deduped, sorted)."""
-    seen: dict[str, str] = {}
-    for adr_id, title in _ADR_INDEX_ROW_RE.findall(claude_md):
-        seen.setdefault(adr_id, title.strip())
-    return tuple(sorted(seen.items()))
 
 
 def _render_message(msg: dict[str, Any], *, keep_full: bool) -> tuple[str, bool]:

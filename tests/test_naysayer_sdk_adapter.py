@@ -135,6 +135,19 @@ def test_system_prompt_injects_principles_verbatim() -> None:
     assert "independent naysayer" in prompt  # role instructions follow
 
 
+def test_system_prompt_injects_adr_index(tmp_path: Path) -> None:
+    # N-2: the deterministic §M ADR index is injected so the agent's worldview is
+    # not bounded by what the thread happens to cite.
+    (tmp_path / "CLAUDE.md").write_text(
+        "## §M\n| ADR | x | y |\n|---|---|---|\n"
+        "| ADR-2026-05-31-15 | independence gradation | T |\n",
+        encoding="utf-8",
+    )
+    prompt = build_naysayer_system_prompt(tmp_path)
+    assert "All-ADR index" in prompt
+    assert "ADR-2026-05-31-15 — independence gradation" in prompt
+
+
 @pytest.mark.anyio
 async def test_spawn_fails_closed_without_base_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
