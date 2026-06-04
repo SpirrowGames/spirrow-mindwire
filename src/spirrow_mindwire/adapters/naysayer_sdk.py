@@ -133,12 +133,13 @@ class _Session:
 
 def build_naysayer_system_prompt(repo_root: Path | None = None) -> str:
     """Naysayer system prompt: 5-principles SOT (verbatim, D-1) + role instructions
-    + the deterministic all-ADR index (N-2).
+    + the deterministic ADR index (N-2).
 
-    The §M ADR index (read from ``repo_root``'s ``CLAUDE.md``, the reviewed repo) is
-    injected on every summon so the agent's worldview is not bounded by what the
-    thread happens to cite — it cannot search for an ADR it does not know exists
-    (ADR-19 N-2, salvaged from the retired context bundle).
+    The ADR index is read from the in-repo manifest ``spec/adr_index.yaml`` under
+    ``repo_root`` (the reviewed repo) and injected on every summon so the agent's
+    worldview is not bounded by what the thread happens to cite — it cannot search
+    for an ADR it does not know exists (ADR-19 N-2; the manifest is the complete
+    in-repo derived view, replacing the retired §M / context-bundle source).
     """
     return f"{build_preamble()}\n\n{_NAYSAYER_ROLE_PROMPT}\n\n{build_adr_index_block(repo_root)}"
 
