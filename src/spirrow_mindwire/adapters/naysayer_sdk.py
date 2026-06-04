@@ -48,6 +48,7 @@ from ..exceptions import (
     AdapterHealthError,
     AdapterSpawnError,
 )
+from ..naysayer.adr_index import build_adr_index_block
 from ..naysayer.principles import NAYSAYER_MODEL_TIER, build_preamble
 from ..ports import SpawnContext
 from ..ulid_util import new_ulid
@@ -130,9 +131,17 @@ class _Session:
     error: ErrorInfo | None = None
 
 
-def build_naysayer_system_prompt() -> str:
-    """Role instructions with the 5-principles SOT injected verbatim (D-1)."""
-    return f"{build_preamble()}\n\n{_NAYSAYER_ROLE_PROMPT}"
+def build_naysayer_system_prompt(repo_root: Path | None = None) -> str:
+    """Naysayer system prompt: 5-principles SOT (verbatim, D-1) + role instructions
+    + the deterministic ADR index (N-2).
+
+    The ADR index is read from the in-repo manifest ``spec/adr_index.yaml`` under
+    ``repo_root`` (the reviewed repo) and injected on every summon so the agent's
+    worldview is not bounded by what the thread happens to cite — it cannot search
+    for an ADR it does not know exists (ADR-19 N-2; the manifest is the complete
+    in-repo derived view, replacing the retired §M / context-bundle source).
+    """
+    return f"{build_preamble()}\n\n{_NAYSAYER_ROLE_PROMPT}\n\n{build_adr_index_block(repo_root)}"
 
 
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
@@ -197,7 +206,7 @@ class NaysayerSdkAdapter:
         )
         self._model = model
         self._system_prompt = (
-            system_prompt if system_prompt is not None else build_naysayer_system_prompt()
+            system_prompt if system_prompt is not None else build_naysayer_system_prompt(self._cwd)
         )
         self._allowed_tools = list(allowed_tools) if allowed_tools is not None else []
         self._mcp_servers = mcp_servers or {}

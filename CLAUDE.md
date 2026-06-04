@@ -108,6 +108,16 @@ trigger 該当 PR ごとに以下を記録する。記録の所在を CLAUDE.md 
 
 **集約方針 (cross-repo)**: 本 ledger は **spirrow-mindwire 集約** (§N と同じ場所)。cross-repo 適用 (例: spirrow-magickit / spirrow-prismind / spirrow-conclair) のエントリも本表に集約し、`PR # (repo)` 列で repo を識別する。理由: §N の SOT は本書と決めたので (ADR-2026-05-29-13 D-4)、従属メタデータの ledger も同じ場所に置くのが境界整合。cross-repo 適用の起点は常に mindwire 確定 ADR なので「ADR の確定先 = ledger 集約先」が読み手にとってシンプル。**ただし (b) global CLAUDE.md 昇格時 (miss-after-merge 直近 5 回連続 0 件 + cross-project 必要)** には、global への ledger 移動 or 各 repo 分散配置を再評価する。
 
+### §N.2 派生アーティファクト再生成手順 — naysayer ADR index manifest (ADR-2026-06-04-19 N-2)
+
+`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title のみ、ADR 本体は Drive)。canonical な ADR 集合は分散 (CLAUDE.md §M 参照 ∪ spirrow-docs `_docmap`) しており、loop host / CI には `_docmap` が無いため runtime union も CI drift-check も不可 → **in-repo の commit 済コピーは不可避** (host-reality finding, T-naysayer-unify-impl msg-438/443)。
+
+手書き二重管理を避けるため、本ファイルは **生成物**として扱う:
+
+- **再生成手順 (proposer)**: ADR を追加/Accepted した時、`_docmap` がある docs host で `python scripts/gen_adr_index.py --docmap <spirrow-docs/_docmap.yaml>` を実行し `spec/adr_index.yaml` を再生成・commit する (手編集しない)。
+- **CI の役割**: `_docmap` が CI に無いので drift-check は不可。CI は commit 済 manifest が **parse でき well-formed** であることのみ検証する (`test_real_in_repo_manifest_loads_and_is_well_formed`)。
+- `_docmap` schema は spirrow-docs 側が SOT で本 host から不可視のため、gen-script の `_docmap` reader は schema-tolerant (初回実行時に実 `_docmap` と突き合わせ確認)。
+
 ---
 
 ## §M. role / identity の規範定義 (ADR 参照のみ — ADR が SOT)

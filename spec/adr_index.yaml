@@ -1,0 +1,36 @@
+# mindwire ADR index — union of CLAUDE.md §M references + spirrow-docs _docmap adr entries.
+# GENERATED FILE — do not hand-edit. Regenerate with:
+#     python scripts/gen_adr_index.py --docmap <path-to-spirrow-docs/_docmap.yaml>
+# Run by the proposer on the docs host when an ADR is added/accepted (loop host/CI lacks
+# _docmap, so this committed copy is unavoidable; ADR-2026-06-04-19 N-2 / msg-438/443).
+# Derived view: id + title only (the canonical ADR body lives in Drive).
+# CI does not regenerate this (no _docmap in CI); it only checks it parses + is well-formed.
+adrs:
+  - id: ADR-2026-05-21-06
+    title: "mindwire Interface Contract (Ports)"
+  - id: ADR-2026-05-23-07
+    title: "Stage 3 Autonomy Gating + Implementer 安全設計"
+  - id: ADR-2026-05-24-08
+    title: "Instance を一次概念とする識別モデル"
+  - id: ADR-2026-05-27-09
+    title: "identity 4 レイヤーモデル (identity_name / independence_class / role / 稼働形態 (embodiment) の直交分離)。independence_class レイヤーは ADR-2026-05-31-15 で二値→グラデーション補強。"
+  - id: ADR-2026-05-29-10
+    title: "role registry (proposer / reviewer / implementer / integrator / dogfooder / naysayer / human の 7 role 定義、closeable_roles、close_reason enum)"
+  - id: ADR-2026-05-29-11
+    title: "author/identity partition キー正規化 (lowercase + 区切り正規化 + 単射性 gate + strict-by-default)"
+  - id: ADR-2026-05-29-12
+    title: "embodiment 自己申告値化 (ADR-09 D-5 拡張・実装、5 API optional 受け口、enum、状態遷移 msg 必須化、human 例外、response-side omit)"
+  - id: ADR-2026-05-29-13
+    title: "実装着手前 spec read-back チェックリスト (本ファイル §N.1 の SOT)"
+  - id: ADR-2026-05-31-14
+    title: "ガワ方式撤回 (claude.ai web 外部駆動の ToS 衝突 → Claude Code 転換)"
+  - id: ADR-2026-05-31-15
+    title: "independence-class グラデーション化 + 「2 協調 1 独立」配置 (ADR-09/T28 の independence_class レイヤーを二値→グラデーションに補強、別訓練分布 naysayer の規範根拠、N-1/C-2 トレードオフ併記、§0 順序)"
+  - id: ADR-2026-06-03-16
+    title: "naysayer CI-gate (APPROVE は CI 緑を含意 / approve-while-red 防止)"
+  - id: ADR-2026-06-03-17
+    title: "独立 naysayer の design-time 参加復元 (5原則の常時注入 + relay orchestrator)"
+  - id: ADR-2026-06-04-18
+    title: "mindwire デプロイ・トポロジと magickit 到達性 (ADR-17 D-8 amendment)"
+  - id: ADR-2026-06-04-19
+    title: "独立 naysayer のエージェント化 + summon ルール (ADR-17 relay/bundle を supersede)"
