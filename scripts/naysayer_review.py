@@ -55,12 +55,6 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="Fire an independent naysayer PR review.")
     parser.add_argument("--pr", required=True, help="PR ref: 'owner/repo#n' or a GitHub PR URL")
     parser.add_argument("--project", default="spirrow-mindwire", help="chatroom project id")
-    parser.add_argument(
-        "--number",
-        type=int,
-        default=None,
-        help="T-pr-review-<n> suffix (default: one past the highest existing)",
-    )
     args = parser.parse_args()
 
     mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or package default
@@ -71,7 +65,7 @@ async def main() -> None:
     print(f"[naysayer-review] opening review thread for {args.pr} (Gemini review, billed) ...")
     try:
         thread_ref, outcome = await orchestrator.fire_pr_review(
-            project=args.project, pr_ref=args.pr, number=args.number
+            project=args.project, pr_ref=args.pr
         )
         print(
             f"[naysayer-review] thread={thread_ref.thread_id}  verdict={outcome.verdict.value}  "

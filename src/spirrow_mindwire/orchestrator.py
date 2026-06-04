@@ -18,10 +18,8 @@ chain / a ``scripts/naysayer_review.py`` run / a future PR-event hook).
 
 from __future__ import annotations
 
-from typing import Any
-
 from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef, parse_pr_ref
-from .magickit.client import McpToolCaller
+from .magickit.client import MagickitMcpError, McpToolCaller
 from .naysayer.pr_review import NaysayerPrReviewDriver, PrReviewOutcome
 from .value_objects import ThreadRef
 
@@ -53,14 +51,14 @@ class PrReviewOrchestrator:
         *,
         project: str,
         pr_ref: str,
-        number: int | None = None,
         title: str | None = None,
     ) -> tuple[ThreadRef, PrReviewOutcome]:
         """Open the review thread for a develop→main PR and drive the naysayer review.
 
-        ``number`` is the ``<n>`` suffix; if omitted it is derived as one past the highest existing
-        ``T-pr-review-<n>`` thread in the project. Returns the new thread's :class:`ThreadRef` and
-        the :class:`~spirrow_mindwire.naysayer.pr_review.PrReviewOutcome`. Raises ``ValueError`` if
+        The thread id is **PR-derived and deterministic** — ``T-pr-review-<pr.number>`` — so there
+        is no max+1 numbering to race (Tier C decide msg-459, resolving the Tier B leak-vs-race
+        flip-flop). Returns the thread's :class:`ThreadRef` and the
+        :class:`~spirrow_mindwire.naysayer.pr_review.PrReviewOutcome`. Raises ``ValueError`` if
         ``pr_ref`` is unparseable; the driver fail-closes (raises) on an unreachable Lexora/GitHub
         or an empty review, so a failed review is never silently treated as a pass.
         """
@@ -70,8 +68,12 @@ class PrReviewOrchestrator:
                 f"unparseable PR ref: {pr_ref!r} (expected 'owner/repo#n' or a PR URL)"
             )
 
-        n = number if number is not None else await self._next_number(project)
-        thread_id = f"{self._thread_prefix}{n}"
+        # Deterministic, PR-derived thread id (Tier C decide msg-459): no max+1 numbering, so there
+        # is no compute→defer-open TOCTOU window (Tier B round-2 msg-457) and re-firing the same PR
+        # reuses its one thread. pr.number is unique within a repo and the chatroom is per-project,
+        # so this is project-unique for a single-repo project (a multi-repo-in-one-project setup
+        # would need the repo in the id — not the case today).
+        thread_id = f"{self._thread_prefix}{pr.number}"
         title = title or f"PR review (develop→main) — {pr_ref}"
         propose = (
             f"naysayer review request — develop→main PR {pr_ref}\n\n"
@@ -92,21 +94,12 @@ class PrReviewOrchestrator:
             # Open the thread LAZILY — only once there is a critique to put in it. The driver
             # calls this exactly once, after a review is produced. Opening durable chatroom state
             # up-front (before the fallible Lexora/GitHub calls inside driver.review) would leave
-            # an abandoned empty T-pr-review-<n> on every transient remote error, and _next_number
-            # would then skip past it on the rerun (Tier B msg-453). The critique is posted as the
-            # naysayer; the driver calls this before the GitHub submission.
+            # an abandoned empty T-pr-review-<n> on every transient remote error (Tier B msg-453).
+            # The critique is posted as the naysayer; the driver calls this before the GitHub submit.
             nonlocal opened
             if not opened:
-                await self._mcp.call_tool(
-                    "chatroom_open_thread",
-                    {
-                        "project": project,
-                        "thread_id": thread_id,
-                        "title": title,
-                        "owner": self._owner,
-                        "propose_content": propose,
-                        "tags": ["pr-review", "naysayer", "stage3"],
-                    },
+                await self._open_thread(
+                    project=project, thread_id=thread_id, title=title, propose=propose
                 )
                 opened = True
             await self._mcp.call_tool(
@@ -123,17 +116,30 @@ class PrReviewOrchestrator:
         outcome = await self._driver.review(pr, post_critique=post_critique)
         return thread_ref, outcome
 
-    async def _next_number(self, project: str) -> int:
-        result = await self._mcp.call_tool("chatroom_list_threads", {"project": project})
-        items: list[Any] = result.get("items", []) if isinstance(result, dict) else []
-        nums: list[int] = []
-        for item in items:
-            tid = item.get("thread_id") if isinstance(item, dict) else None
-            if isinstance(tid, str) and tid.startswith(self._thread_prefix):
-                suffix = tid[len(self._thread_prefix) :]
-                if suffix.isdigit():
-                    nums.append(int(suffix))
-        return (max(nums) + 1) if nums else 1
+    async def _open_thread(self, *, project: str, thread_id: str, title: str, propose: str) -> None:
+        """Open the review thread, treating an 'already exists' collision as success (idempotent).
+
+        Re-reviewing the same PR reuses its existing ``T-pr-review-<n>`` thread: conclair rejects a
+        duplicate ``thread_id`` with a ``ChatroomIntegrityError`` ("... already exists in project
+        ...", surfaced here as a :class:`MagickitMcpError`). Only that condition is swallowed — any
+        other open error re-raises (no masking), mirroring the driver's 422→COMMENT fallback.
+        """
+        try:
+            await self._mcp.call_tool(
+                "chatroom_open_thread",
+                {
+                    "project": project,
+                    "thread_id": thread_id,
+                    "title": title,
+                    "owner": self._owner,
+                    "propose_content": propose,
+                    "tags": ["pr-review", "naysayer", "stage3"],
+                },
+            )
+        except MagickitMcpError as exc:
+            if "already exists" in str(exc).lower():
+                return  # the PR's review thread already exists → reuse it (re-fire is idempotent)
+            raise
 
 
 class MergeBlockedError(RuntimeError):

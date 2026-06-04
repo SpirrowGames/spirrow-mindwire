@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent
+from spirrow_mindwire.magickit.client import MagickitMcpError
 from spirrow_mindwire.magickit.watcher import ChatroomWatcher, WatchSpec
 from spirrow_mindwire.naysayer.pr_review import PostCritique, PrReviewOutcome
 from spirrow_mindwire.orchestrator import (
@@ -30,12 +31,19 @@ _TS = datetime(2026, 5, 23, tzinfo=UTC)
 class _FakeMcp:
     """Records call_tool invocations; returns programmed results by tool name."""
 
-    def __init__(self, results: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        results: dict[str, Any] | None = None,
+        raise_on: dict[str, Exception] | None = None,
+    ) -> None:
         self._results = results or {}
+        self._raise_on = raise_on or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         self.calls.append((name, arguments))
+        if name in self._raise_on:
+            raise self._raise_on[name]
         return self._results.get(name, {})
 
     def args_for(self, name: str) -> dict[str, Any]:
@@ -61,53 +69,25 @@ class _FakeDriver:
 
 
 @pytest.mark.anyio
-async def test_fire_pr_review_opens_thread_with_explicit_number() -> None:
+async def test_fire_pr_review_thread_id_is_pr_derived() -> None:
+    # Tier C decide msg-459: the thread id is deterministic from the PR number (no max+1 numbering).
     mcp = _FakeMcp()
     driver = _FakeDriver()
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
-    ref, outcome = await orch.fire_pr_review(
-        project="spirrow-mindwire", pr_ref="org/repo#5", number=3
-    )
-    assert ref.thread_id == "T-pr-review-3"
+    ref, outcome = await orch.fire_pr_review(project="spirrow-mindwire", pr_ref="org/repo#42")
+    assert ref.thread_id == "T-pr-review-42"
     assert ref.project_id == "spirrow-mindwire"
     args = mcp.args_for("chatroom_open_thread")
-    assert args["thread_id"] == "T-pr-review-3"
+    assert args["thread_id"] == "T-pr-review-42"
     assert args["owner"] == "orchestrator"
-    assert "org/repo#5" in args["propose_content"]
+    assert "org/repo#42" in args["propose_content"]
     assert "pr-review" in args["tags"]
     # The driver was driven with the parsed PR ref, and its critique was posted to the thread.
-    assert driver.reviewed == [PrRef("org", "repo", 5)]
+    assert driver.reviewed == [PrRef("org", "repo", 42)]
     post = mcp.args_for("chatroom_post_message")
-    assert post["thread_id"] == "T-pr-review-3"
+    assert post["thread_id"] == "T-pr-review-42"
     assert post["content"] == outcome.body
     assert post["author"] == "naysayer-pr-review"
-
-
-@pytest.mark.anyio
-async def test_fire_pr_review_derives_next_number() -> None:
-    # Highest existing T-pr-review-<n> is 4 → next is 5 (ignores non-matching ids).
-    mcp = _FakeMcp(
-        {
-            "chatroom_list_threads": {
-                "items": [
-                    {"thread_id": "T-pr-review-2"},
-                    {"thread_id": "T-pr-review-4"},
-                    {"thread_id": "T-other-9"},
-                ]
-            }
-        }
-    )
-    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _outcome = await orch.fire_pr_review(project="p", pr_ref="o/r#1")
-    assert ref.thread_id == "T-pr-review-5"
-
-
-@pytest.mark.anyio
-async def test_fire_pr_review_first_number_when_none_exist() -> None:
-    mcp = _FakeMcp({"chatroom_list_threads": {"items": []}})
-    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _outcome = await orch.fire_pr_review(project="p", pr_ref="o/r#1")
-    assert ref.thread_id == "T-pr-review-1"
 
 
 @pytest.mark.anyio
@@ -119,7 +99,7 @@ async def test_fire_pr_review_returns_driver_outcome() -> None:
         head_sha="sha9",
     )
     orch = PrReviewOrchestrator(_FakeMcp(), driver=_FakeDriver(outcome))  # type: ignore[arg-type]
-    _ref, got = await orch.fire_pr_review(project="p", pr_ref="o/r#7", number=1)
+    _ref, got = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
     assert got is outcome
 
 
@@ -127,7 +107,37 @@ async def test_fire_pr_review_returns_driver_outcome() -> None:
 async def test_fire_pr_review_unparseable_ref_raises() -> None:
     orch = PrReviewOrchestrator(_FakeMcp(), driver=_FakeDriver())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="unparseable PR ref"):
-        await orch.fire_pr_review(project="p", pr_ref="not a pr ref", number=1)
+        await orch.fire_pr_review(project="p", pr_ref="not a pr ref")
+
+
+@pytest.mark.anyio
+async def test_fire_pr_review_idempotent_open_on_existing_thread() -> None:
+    # Re-firing the same PR finds T-pr-review-<n> already there; conclair's "already exists"
+    # collision (a MagickitMcpError) is swallowed and the critique is still posted (msg-459).
+    mcp = _FakeMcp(
+        raise_on={
+            "chatroom_open_thread": MagickitMcpError(
+                "Thread 'T-pr-review-7' already exists in project 'p'"
+            )
+        }
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    ref, _outcome = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    assert ref.thread_id == "T-pr-review-7"
+    assert any(name == "chatroom_post_message" for name, _ in mcp.calls)  # posted despite collision
+
+
+@pytest.mark.anyio
+async def test_fire_pr_review_non_exists_open_error_raises() -> None:
+    # Only the "already exists" collision is idempotent — any other open error must propagate
+    # (no masking; msg-459).
+    mcp = _FakeMcp(
+        raise_on={"chatroom_open_thread": MagickitMcpError("magickit MCP call failed: 500")}
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    with pytest.raises(MagickitMcpError):
+        await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    assert all(name != "chatroom_post_message" for name, _ in mcp.calls)  # never posted
 
 
 class _RaisingDriver:
@@ -144,7 +154,7 @@ async def test_fire_pr_review_does_not_leak_thread_on_review_error() -> None:
     mcp = _FakeMcp()
     orch = PrReviewOrchestrator(mcp, driver=_RaisingDriver())  # type: ignore[arg-type]
     with pytest.raises(RuntimeError):
-        await orch.fire_pr_review(project="p", pr_ref="o/r#1", number=1)
+        await orch.fire_pr_review(project="p", pr_ref="o/r#1")
     assert all(name != "chatroom_open_thread" for name, _ in mcp.calls)
     assert all(name != "chatroom_post_message" for name, _ in mcp.calls)
 
@@ -155,7 +165,7 @@ async def test_fire_pr_review_opens_thread_then_posts_on_success() -> None:
     # open precedes post (lazy-open happens inside the single post_critique call).
     mcp = _FakeMcp()
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    await orch.fire_pr_review(project="p", pr_ref="o/r#1", number=1)
+    await orch.fire_pr_review(project="p", pr_ref="o/r#1")
     names = [name for name, _ in mcp.calls]
     assert names == ["chatroom_open_thread", "chatroom_post_message"]
 
