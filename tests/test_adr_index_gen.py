@@ -38,6 +38,22 @@ def test_extract_docmap_adrs_tolerant_walk() -> None:
     assert adrs == {"ADR-2026-06-03-16": "naysayer CI-gate"}  # non-ADR doc ignored
 
 
+def test_extract_docmap_adrs_strips_id_prefix_from_title() -> None:
+    # Real _docmap titles carry the id as a prefix; the rendered "- {id} — {title}" line must
+    # not double-print the id (Tier B re-review msg-446). The title's own parens are preserved.
+    docmap = {
+        "docs": [
+            {
+                "path": "adr/ADR-2026-05-21-06.md",
+                "title": "ADR-2026-05-21-06 — mindwire Interface Contract (Ports)",
+            }
+        ]
+    }
+    assert extract_docmap_adrs(docmap) == {
+        "ADR-2026-05-21-06": "mindwire Interface Contract (Ports)"
+    }
+
+
 def test_build_manifest_index_is_the_union() -> None:
     index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
     ids = [adr_id for adr_id, _ in index]

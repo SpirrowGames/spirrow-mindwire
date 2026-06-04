@@ -28,6 +28,12 @@ from .adr_index import parse_adr_index
 
 _ADR_ID_RE = re.compile(r"ADR-\d{4}-\d{2}-\d{2}-\d+")
 
+# Some _docmap titles carry the ADR id as a prefix ("ADR-YYYY-MM-DD-N - Title"); strip it so
+# the rendered "- {id} - {title}" line does not print the id twice (Tier B re-review msg-446).
+# Strips the id plus one separator char (any dash/colon/etc.). ASCII-only pattern (carries no
+# ambiguous unicode); [^\w\s]? eats a single separator without over-eating the title's own text.
+_TITLE_ID_PREFIX_RE = re.compile(r"^ADR-\d{4}-\d{2}-\d{2}-\d+\s*[^\w\s]?\s*")
+
 # Emitted verbatim as the manifest's header; kept byte-identical to the committed
 # spec/adr_index.yaml header so ``--check`` does not report spurious drift.
 _HEADER = """\
@@ -68,7 +74,8 @@ def extract_docmap_adrs(docmap_data: Any) -> dict[str, str]:
             if isinstance(title, str) and title.strip():
                 adr_id = _first_adr_id(node)
                 if adr_id is not None:
-                    found.setdefault(adr_id, title.strip())
+                    clean = _TITLE_ID_PREFIX_RE.sub("", title.strip()).strip()
+                    found.setdefault(adr_id, clean)
             for value in node.values():
                 visit(value)
         elif isinstance(node, list):
