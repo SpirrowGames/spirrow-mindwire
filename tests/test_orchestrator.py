@@ -1,8 +1,9 @@
-"""Tests for T20 PR-review orchestrator (WIRING_ALLOWLIST_SPEC §A.2).
+"""Tests for the PR-review orchestrator (WIRING_ALLOWLIST_SPEC §A.2 → ADR-19 driver-化).
 
-Fake :class:`McpToolCaller` + a stub watcher exercise thread creation, number
-derivation, and naysayer-watch wiring. ``ChatroomWatcher.add_watch`` is tested
-directly with a fake dispatcher.
+A fake :class:`McpToolCaller` + a fake :class:`NaysayerPrReviewDriver` exercise thread creation,
+number derivation, and that ``fire_pr_review`` **drives the driver directly** (parses the PR ref,
+posts the critique to the thread, returns the outcome). ``require_ci_success`` (the L2 merge gate)
+and ``ChatroomWatcher.add_watch`` (the standing role watches) are tested directly.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import pytest
 
 from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent
 from spirrow_mindwire.magickit.watcher import ChatroomWatcher, WatchSpec
+from spirrow_mindwire.naysayer.pr_review import PostCritique, PrReviewOutcome
 from spirrow_mindwire.orchestrator import (
     MergeBlockedError,
     PrReviewOrchestrator,
@@ -40,19 +42,32 @@ class _FakeMcp:
         return next(args for n, args in self.calls if n == name)
 
 
-class _StubWatcher:
-    def __init__(self) -> None:
-        self.added: list[tuple[WatchSpec, bool]] = []
+class _FakeDriver:
+    """Records the reviewed PR + posts a critique via the callback; returns a fixed outcome."""
 
-    async def add_watch(self, watch: WatchSpec, *, baseline: bool = True) -> None:
-        self.added.append((watch, baseline))
+    def __init__(self, outcome: PrReviewOutcome | None = None) -> None:
+        self.reviewed: list[PrRef] = []
+        self._outcome = outcome or PrReviewOutcome(
+            verdict=ReviewEvent.APPROVE,
+            body="LGTM\n\nVERDICT: APPROVE",
+            ci_state=CiState.SUCCESS,
+            head_sha="sha1",
+        )
+
+    async def review(self, pr: PrRef, *, post_critique: PostCritique) -> PrReviewOutcome:
+        self.reviewed.append(pr)
+        await post_critique(self._outcome.body)
+        return self._outcome
 
 
 @pytest.mark.anyio
 async def test_fire_pr_review_opens_thread_with_explicit_number() -> None:
     mcp = _FakeMcp()
-    orch = PrReviewOrchestrator(mcp)
-    ref = await orch.fire_pr_review(project="spirrow-mindwire", pr_ref="org/repo#5", number=3)
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    ref, outcome = await orch.fire_pr_review(
+        project="spirrow-mindwire", pr_ref="org/repo#5", number=3
+    )
     assert ref.thread_id == "T-pr-review-3"
     assert ref.project_id == "spirrow-mindwire"
     args = mcp.args_for("chatroom_open_thread")
@@ -60,6 +75,12 @@ async def test_fire_pr_review_opens_thread_with_explicit_number() -> None:
     assert args["owner"] == "orchestrator"
     assert "org/repo#5" in args["propose_content"]
     assert "pr-review" in args["tags"]
+    # The driver was driven with the parsed PR ref, and its critique was posted to the thread.
+    assert driver.reviewed == [PrRef("org", "repo", 5)]
+    post = mcp.args_for("chatroom_post_message")
+    assert post["thread_id"] == "T-pr-review-3"
+    assert post["content"] == outcome.body
+    assert post["author"] == "naysayer-pr-review"
 
 
 @pytest.mark.anyio
@@ -76,38 +97,37 @@ async def test_fire_pr_review_derives_next_number() -> None:
             }
         }
     )
-    orch = PrReviewOrchestrator(mcp)
-    ref = await orch.fire_pr_review(project="p", pr_ref="o/r#1")
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    ref, _outcome = await orch.fire_pr_review(project="p", pr_ref="o/r#1")
     assert ref.thread_id == "T-pr-review-5"
 
 
 @pytest.mark.anyio
 async def test_fire_pr_review_first_number_when_none_exist() -> None:
     mcp = _FakeMcp({"chatroom_list_threads": {"items": []}})
-    orch = PrReviewOrchestrator(mcp)
-    ref = await orch.fire_pr_review(project="p", pr_ref="o/r#1")
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    ref, _outcome = await orch.fire_pr_review(project="p", pr_ref="o/r#1")
     assert ref.thread_id == "T-pr-review-1"
 
 
 @pytest.mark.anyio
-async def test_fire_pr_review_wires_naysayer_watch_without_baseline() -> None:
-    mcp = _FakeMcp()
-    watcher = _StubWatcher()
-    orch = PrReviewOrchestrator(mcp, watcher=watcher)  # type: ignore[arg-type]
-    ref = await orch.fire_pr_review(project="p", pr_ref="o/r#7", number=1)
-    assert len(watcher.added) == 1
-    watch, baseline = watcher.added[0]
-    assert watch.thread_ref == ref
-    assert watch.role is Role.NAYSAYER
-    assert baseline is False  # the review-request message must be dispatched
+async def test_fire_pr_review_returns_driver_outcome() -> None:
+    outcome = PrReviewOutcome(
+        verdict=ReviewEvent.REQUEST_CHANGES,
+        body="bug\n\nVERDICT: REQUEST_CHANGES",
+        ci_state=CiState.SUCCESS,
+        head_sha="sha9",
+    )
+    orch = PrReviewOrchestrator(_FakeMcp(), driver=_FakeDriver(outcome))  # type: ignore[arg-type]
+    _ref, got = await orch.fire_pr_review(project="p", pr_ref="o/r#7", number=1)
+    assert got is outcome
 
 
 @pytest.mark.anyio
-async def test_fire_pr_review_no_watcher_is_fine() -> None:
-    mcp = _FakeMcp()
-    orch = PrReviewOrchestrator(mcp)
-    ref = await orch.fire_pr_review(project="p", pr_ref="o/r#7", number=1)
-    assert ref.thread_id == "T-pr-review-1"  # no watcher → just opens the thread
+async def test_fire_pr_review_unparseable_ref_raises() -> None:
+    orch = PrReviewOrchestrator(_FakeMcp(), driver=_FakeDriver())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="unparseable PR ref"):
+        await orch.fire_pr_review(project="p", pr_ref="not a pr ref", number=1)
 
 
 # ---------- L2 merge gate: require_ci_success (ADR-2026-06-03-16 D-3) ------ #
@@ -149,14 +169,14 @@ async def test_require_ci_success_returns_status_when_green() -> None:
     ],
 )
 async def test_require_ci_success_blocks_when_not_green(ci: CiStatus) -> None:
-    # L2 is the deterministic merge gate — it must block on anything but SUCCESS,
-    # independently of any naysayer APPROVE (fail-closed).
+    # L2 is the deterministic merge gate — it must block on anything but SUCCESS, independently of
+    # any naysayer APPROVE (fail-closed).
     gh = _FakeGitHubCi(ci)
     with pytest.raises(MergeBlockedError):
         await require_ci_success(gh, PrRef("o", "r", 1))
 
 
-# ---------- ChatroomWatcher.add_watch ------------------------------------- #
+# ---------- ChatroomWatcher.add_watch (standing role watches) ------------- #
 
 
 class _FakeDispatcher:
@@ -196,12 +216,12 @@ class _StubMcp:
 async def test_add_watch_spawns_and_registers_for_polling() -> None:
     dispatcher = _FakeDispatcher()
     watcher = ChatroomWatcher(_StubMcp(), dispatcher, watches=[])  # type: ignore[arg-type]
-    ref = ThreadRef(project_id="p", thread_id="T-pr-review-1", chatroom_uri="mc://t")
-    spec = WatchSpec(thread_ref=ref, role=Role.NAYSAYER)
+    ref = ThreadRef(project_id="p", thread_id="T-x-1", chatroom_uri="mc://t")
+    spec = WatchSpec(thread_ref=ref, role=Role.PROPOSER)
     await watcher.add_watch(spec, baseline=False)
-    assert dispatcher.spawned == [(ref, Role.NAYSAYER)]
-    # C1 regression guard: the watch must be registered for polling, not only
-    # spawned — otherwise poll_once() (which iterates _watches) never polls it.
+    assert dispatcher.spawned == [(ref, Role.PROPOSER)]
+    # C1 regression guard: the watch must be registered for polling, not only spawned —
+    # otherwise poll_once() (which iterates _watches) never polls it.
     assert spec in watcher._watches
     # idempotent: adding the same watch again does not spawn or register twice.
     await watcher.add_watch(spec, baseline=False)
@@ -211,15 +231,11 @@ async def test_add_watch_spawns_and_registers_for_polling() -> None:
 
 @pytest.mark.anyio
 async def test_add_watch_then_poll_dispatches() -> None:
-    # End-to-end of the C1 fix: a watch added at runtime is actually polled and
-    # its messages dispatched (the orchestrator wiring really triggers).
     dispatcher = _FakeDispatcher()
-    mcp = _StubMcp(
-        [{"msg_id": "m1", "author": "orchestrator", "content": "review o/r#1", "timestamp": ""}]
-    )
+    mcp = _StubMcp([{"msg_id": "m1", "author": "proposer", "content": "hello", "timestamp": ""}])
     watcher = ChatroomWatcher(mcp, dispatcher, watches=[])  # type: ignore[arg-type]
-    ref = ThreadRef(project_id="p", thread_id="T-pr-review-1", chatroom_uri="mc://t")
-    await watcher.add_watch(WatchSpec(thread_ref=ref, role=Role.NAYSAYER), baseline=False)
+    ref = ThreadRef(project_id="p", thread_id="T-x-1", chatroom_uri="mc://t")
+    await watcher.add_watch(WatchSpec(thread_ref=ref, role=Role.PROPOSER), baseline=False)
     dispatched = await watcher.poll_once()
     assert dispatched == 1
     assert len(dispatcher.dispatched) == 1

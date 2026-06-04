@@ -6,9 +6,11 @@ touching any core (watcher / dispatcher / adapter):
 - **role resolution**: with the three production adapters registered, the
   registry routes PROPOSER → text-only ``Stage3ProposerAdapter``, IMPLEMENTER →
   the allow-list-gated ``ImplementerSdkAdapter``, NAYSAYER → the independent
-  ``NaysayerPrReviewAdapter`` (and *only* it — ADR-05 §5). This is the wrinkle
-  the runner solves: the base ``ClaudeCodeSdkAdapter`` declares EXECUTE_CODE and
-  would otherwise shadow the gated implementer under first-qualified.
+  design-time ``NaysayerSdkAdapter`` (and *only* it — ADR-05 §5; ADR-19 driver-化
+  unify made it the sole registry NAYSAYER, the PR-gate being a driver). This is
+  the wrinkle the runner solves: the base ``ClaudeCodeSdkAdapter`` declares
+  EXECUTE_CODE and would otherwise shadow the gated implementer under
+  first-qualified.
 - **config**: ``[loop].watches`` parse into ``WatchSpec``s with the right role.
 - **assembly**: a fully built loop dispatches a proposer reply over a fake
   chatroom (the registry→dispatcher→watcher→gateway composition is sound).
@@ -28,7 +30,7 @@ from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkAdapter
 from spirrow_mindwire.adapters.implementer import ImplementerSdkAdapter
-from spirrow_mindwire.adapters.naysayer_pr_review import NaysayerPrReviewAdapter
+from spirrow_mindwire.adapters.naysayer_sdk import NaysayerSdkAdapter
 from spirrow_mindwire.config import LoopWatchConfig, MindwireSettings, Stage3LoopConfig
 from spirrow_mindwire.loop_runner import (
     Stage3ProposerAdapter,
@@ -37,6 +39,7 @@ from spirrow_mindwire.loop_runner import (
     build_watches,
 )
 from spirrow_mindwire.magickit.watcher import WatchSpec
+from spirrow_mindwire.naysayer.pr_review import NaysayerPrReviewDriver
 from spirrow_mindwire.ports import SpawnContext
 from spirrow_mindwire.ulid_util import new_ulid
 from spirrow_mindwire.value_objects import (
@@ -168,11 +171,20 @@ def _naysayer_caps() -> frozenset[Capability]:
 
 
 def _real_adapters(tmp_path: Path) -> tuple[Stage3ProposerAdapter, ImplementerSdkAdapter, Any]:
-    """The three production adapter classes, built without network/SDK I/O."""
+    """The three production adapter classes, built without network/SDK I/O.
+
+    The registry naysayer is the design-time ``NaysayerSdkAdapter`` (ADR-19 driver-化 unify);
+    the PR-gate is the separate :func:`_pr_review_driver`, not a registered adapter.
+    """
     proposer = Stage3ProposerAdapter(cwd=tmp_path)
     implementer = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url="http://lexora.local")
-    naysayer = NaysayerPrReviewAdapter(lexora=_FakeLexora(), github=_FakeGitHub())
+    naysayer = NaysayerSdkAdapter(cwd=tmp_path, inference_base_url="http://lexora.local")
     return proposer, implementer, naysayer
+
+
+def _pr_review_driver() -> NaysayerPrReviewDriver:
+    """A PR-review driver with fake clients (never called here; avoids env/network)."""
+    return NaysayerPrReviewDriver(lexora=_FakeLexora(), github=_FakeGitHub())
 
 
 class _FakeLexora:
@@ -306,6 +318,7 @@ def test_build_loop_skips_repo_dir_when_adapters_injected(tmp_path: Path) -> Non
         proposer=proposer,
         implementer=implementer,
         naysayer=naysayer,
+        pr_review_driver=_pr_review_driver(),
     )
     assert loop.orchestrator is not None
     assert loop.registry.qualified_for(Role.IMPLEMENTER)[0] is implementer
@@ -330,7 +343,12 @@ async def test_built_loop_dispatches_proposer_reply(tmp_path: Path) -> None:
     naysayer = _StubAdapter("fake-naysayer", _naysayer_caps())
 
     loop = build_loop(
-        MindwireSettings(), mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer
+        MindwireSettings(),
+        mcp=mcp,
+        proposer=proposer,
+        implementer=implementer,
+        naysayer=naysayer,
+        pr_review_driver=_pr_review_driver(),
     )
 
     work = ThreadRef(
@@ -361,6 +379,7 @@ async def test_run_loop_idles_cleanly_with_no_watches(tmp_path: Path) -> None:
         proposer=proposer,
         implementer=implementer,
         naysayer=naysayer,
+        pr_review_driver=_pr_review_driver(),
     )
     # Nothing watched → a poll dispatches nothing and stop() is a no-op-safe halt.
     assert await loop.watcher.poll_once() == 0

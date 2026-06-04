@@ -34,12 +34,12 @@ from .naysayer_lexora import (
     NaysayerLexoraHealthError,
     NaysayerLexoraSpawnError,
 )
-from .naysayer_pr_review import (
-    NaysayerPrReviewAdapter,
-    NaysayerPrReviewDeliveryError,
-    NaysayerPrReviewHaltError,
-    NaysayerPrReviewHealthError,
-    NaysayerPrReviewSpawnError,
+from .naysayer_sdk import (
+    NaysayerSdkAdapter,
+    NaysayerSdkDeliveryError,
+    NaysayerSdkHaltError,
+    NaysayerSdkHealthError,
+    NaysayerSdkSpawnError,
 )
 
 __all__ = [
@@ -59,10 +59,10 @@ __all__ = [
     "NaysayerLexoraHaltError",
     "NaysayerLexoraHealthError",
     "NaysayerLexoraSpawnError",
-    "NaysayerPrReviewAdapter",
-    "NaysayerPrReviewDeliveryError",
-    "NaysayerPrReviewHaltError",
-    "NaysayerPrReviewHealthError",
-    "NaysayerPrReviewSpawnError",
+    "NaysayerSdkAdapter",
+    "NaysayerSdkDeliveryError",
+    "NaysayerSdkHaltError",
+    "NaysayerSdkHealthError",
+    "NaysayerSdkSpawnError",
     "classify_tool_call",
 ]

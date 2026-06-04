@@ -1,7 +1,7 @@
 """Async GitHub REST client — Stage 3 naysayer PR review (WIRING_ALLOWLIST_SPEC §A.3).
 
-The PR-review naysayer adapter
-(:class:`~spirrow_mindwire.adapters.naysayer_pr_review.NaysayerPrReviewAdapter`)
+The PR-review naysayer driver
+(:class:`~spirrow_mindwire.naysayer.pr_review.NaysayerPrReviewDriver`)
 uses this to (1) fetch a PR's unified diff and (2) submit a PR review
 (``APPROVE`` / ``REQUEST_CHANGES``) on the develop→main PR. Auth is a
 **repo-scoped fine-grained token** (env spec §4: Contents R/W + PR R/W).

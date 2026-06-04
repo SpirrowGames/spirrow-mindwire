@@ -56,7 +56,7 @@ from pathlib import Path
 
 from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter
 from .adapters.implementer import ImplementerSdkAdapter
-from .adapters.naysayer_pr_review import NaysayerPrReviewAdapter
+from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .config import MindwireSettings, Stage3LoopConfig, load_settings
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
@@ -68,6 +68,7 @@ from .dispatcher.registry import InMemoryAdapterRegistry
 from .magickit.client import McpToolCaller, StreamableHttpChatroomMcp
 from .magickit.gateway import MagickitChatroomGateway
 from .magickit.watcher import ChatroomWatcher, WatchSpec
+from .naysayer.pr_review import NaysayerPrReviewDriver
 from .orchestrator import PrReviewOrchestrator
 from .ports import RoleAdapter
 from .value_objects import Capability, Event, Role, ThreadRef
@@ -106,11 +107,11 @@ class Stage3ProposerAdapter(ClaudeCodeSdkAdapter):
 class Stage3Loop:
     """The assembled, ready-to-run Stage 3 loop (composition root output).
 
-    ``orchestrator`` is bound to the live ``watcher`` so the PR→naysayer-review
-    leg can add its ``T-pr-review`` watch at runtime (msg-385 §2/§3). In this
-    human-relay MVP the daemon itself runs only :attr:`watcher`; firing
-    ``orchestrator.fire_pr_review`` is the relay driver's / a follow-up
-    auto-trigger's job (msg-385 §4).
+    The daemon runs :attr:`watcher` (the standing role watches). The ``orchestrator``
+    drives the develop→main PR-review directly via its ``NaysayerPrReviewDriver``
+    (ADR-19 driver-化 unify — no naysayer watch / no watcher round-trip); firing
+    ``orchestrator.fire_pr_review`` is a ``scripts/naysayer_review.py`` run's / a
+    follow-up PR-event trigger's job.
     """
 
     mcp: McpToolCaller
@@ -207,9 +208,21 @@ def build_implementer(repo_dir: Path) -> ImplementerSdkAdapter:
     return ImplementerSdkAdapter(cwd=repo_dir)
 
 
-def build_naysayer() -> NaysayerPrReviewAdapter:
-    """Independent PR-review naysayer; Lexora URL + GitHub token from env/defaults."""
-    return NaysayerPrReviewAdapter()
+def build_naysayer(repo_dir: Path) -> NaysayerSdkAdapter:
+    """The single registry naysayer = the design-time agent (ADR-19 D-1 / driver-化 unify).
+
+    The PR-review gate is no longer a registry RoleAdapter (it is the driver built by
+    :func:`build_pr_review_driver`); the sole ``NAYSAYER_QUALIFIED`` adapter is this design-time
+    agent (independence by distribution: ``MINDWIRE_NAYSAYER_BASE_URL`` → Lexora Gemini, resolved
+    at spawn). It participates by summon, so the daemon registers it (the single-NAYSAYER
+    invariant) without a standing watch.
+    """
+    return NaysayerSdkAdapter(cwd=repo_dir)
+
+
+def build_pr_review_driver() -> NaysayerPrReviewDriver:
+    """The Tier B develop→main PR-review driver (Lexora one-shot + GitHub T22, env-resolved)."""
+    return NaysayerPrReviewDriver()
 
 
 def build_watches(cfg: Stage3LoopConfig) -> tuple[WatchSpec, ...]:
@@ -249,22 +262,28 @@ def build_loop(
     proposer: RoleAdapter | None = None,
     implementer: RoleAdapter | None = None,
     naysayer: RoleAdapter | None = None,
+    pr_review_driver: NaysayerPrReviewDriver | None = None,
 ) -> Stage3Loop:
     """Assemble the Stage 3 loop from settings (composition root).
 
     Components may be injected (tests pass fakes); anything left ``None`` is
     built from ``settings`` / the environment. Raises ``SystemExit`` if
     ``loop.repo_dir`` is unset and an SDK adapter must be built from config.
+    The ``naysayer`` is the design-time SDK agent (the sole registry NAYSAYER);
+    the PR-review gate is the ``pr_review_driver`` wired into the orchestrator
+    (ADR-19 driver-化 unify), not a registered adapter.
     """
     cfg = settings.loop
     if mcp is None:
         mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
 
-    if proposer is None or implementer is None:
+    # proposer / implementer / naysayer are all SDK adapters that operate in the repo, so any of
+    # them being unset requires loop.repo_dir.
+    if proposer is None or implementer is None or naysayer is None:
         if cfg.repo_dir is None:
             raise SystemExit(
                 "loop.repo_dir is not configured: set [loop].repo_dir (the repo the "
-                "proposer/implementer operate in) in mindwire.toml or "
+                "proposer/implementer/naysayer operate in) in mindwire.toml or "
                 "MINDWIRE_LOOP__REPO_DIR"
             )
         repo_dir = Path(cfg.repo_dir)
@@ -272,8 +291,10 @@ def build_loop(
             proposer = build_proposer(repo_dir)
         if implementer is None:
             implementer = build_implementer(repo_dir)
-    if naysayer is None:
-        naysayer = build_naysayer()
+        if naysayer is None:
+            naysayer = build_naysayer(repo_dir)
+    if pr_review_driver is None:
+        pr_review_driver = build_pr_review_driver()
 
     registry = build_registry(proposer=proposer, implementer=implementer, naysayer=naysayer)
     gateway = MagickitChatroomGateway(mcp)
@@ -282,7 +303,7 @@ def build_loop(
     # Constructor watches=() — each watch is added via add_watch() in run_loop so
     # its per-watch baseline is honoured (watcher.start() applies one flag to all).
     watcher = ChatroomWatcher(mcp, dispatcher, [])
-    orchestrator = PrReviewOrchestrator(mcp, watcher=watcher)
+    orchestrator = PrReviewOrchestrator(mcp, driver=pr_review_driver)
     return Stage3Loop(
         mcp=mcp,
         registry=registry,
@@ -343,6 +364,7 @@ __all__ = [
     "build_implementer",
     "build_loop",
     "build_naysayer",
+    "build_pr_review_driver",
     "build_proposer",
     "build_registry",
     "build_watches",
