@@ -1,9 +1,10 @@
-# mindwire ADR index (complete) — union of CLAUDE.md §M references + spirrow-docs _docmap adr entries.
-# Derived view: id + title only (NOT the canonical ADR body). Regenerate when an ADR is added/accepted.
-# Decided in T-naysayer-unify-impl msg-438 (ADR-2026-06-04-19 N-2). The canonical ADR set is scattered
-# (Drive / spirrow-docs / §M references); this in-repo derived view is injected into the naysayer's
-# system prompt so its review is not bounded by what a thread happens to cite, and is present on every
-# host the loop runs on (no out-of-repo MINDWIRE_DOCS_ROOT dependency — see the host-reality finding).
+# mindwire ADR index — union of CLAUDE.md §M references + spirrow-docs _docmap adr entries.
+# GENERATED FILE — do not hand-edit. Regenerate with:
+#     python scripts/gen_adr_index.py --docmap <path-to-spirrow-docs/_docmap.yaml>
+# Run by the proposer on the docs host when an ADR is added/accepted (loop host/CI lacks
+# _docmap, so this committed copy is unavoidable; ADR-2026-06-04-19 N-2 / msg-438/443).
+# Derived view: id + title only (the canonical ADR body lives in Drive).
+# CI does not regenerate this (no _docmap in CI); it only checks it parses + is well-formed.
 adrs:
   - id: ADR-2026-05-21-06
     title: "mindwire Interface Contract (Ports) (+ amendment v2.2: I3 author=instance_id)"

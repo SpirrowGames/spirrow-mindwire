@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from spirrow_mindwire.naysayer.adr_index import (
@@ -41,6 +42,17 @@ def test_load_adr_index_malformed_returns_empty(tmp_path: Path) -> None:
     assert load_adr_index(tmp_path) == ()  # not a {adrs: [...]} mapping
 
 
+def test_load_adr_index_yaml_syntax_error_returns_empty(tmp_path: Path) -> None:
+    # Tier B Finding-2 (msg-442): a syntax-broken manifest must fail open to () — never
+    # raise yaml.YAMLError up into prompt construction and crash the naysayer.
+    (tmp_path / "spec").mkdir()
+    (tmp_path / "spec" / "adr_index.yaml").write_text(
+        'adrs:\n  - id: ADR-1\n    title: "unclosed\n  - bad: [indent',  # ScannerError/ParserError
+        encoding="utf-8",
+    )
+    assert load_adr_index(tmp_path) == ()
+
+
 def test_build_block_lists_manifest_entries(tmp_path: Path) -> None:
     block = build_adr_index_block(_repo_with_manifest(tmp_path))
     assert "ADR index (id + title)" in block
@@ -56,12 +68,21 @@ def test_build_block_without_manifest_is_explicit(tmp_path: Path) -> None:
     assert "could not cross-check" in block
 
 
-def test_real_in_repo_manifest_loads() -> None:
-    # The committed spec/adr_index.yaml must parse and carry the ADR-19 entry.
+_ADR_ID_RE = re.compile(r"^ADR-\d{4}-\d{2}-\d{2}-\d+$")
+
+
+def test_real_in_repo_manifest_loads_and_is_well_formed() -> None:
+    # CI schema/parse validation of the committed spec/adr_index.yaml (the only CI check
+    # possible — _docmap is absent in CI, so no drift-check; msg-443).
     rows = load_adr_index()  # default repo root
+    assert rows, "committed manifest must be non-empty"
     ids = {r[0] for r in rows}
     assert "ADR-2026-06-04-19" in ids
     assert "ADR-2026-06-03-16" in ids  # an architecture ADR §M omits — must be present
+    # Well-formed: every entry has a well-shaped ADR id and a non-empty title.
+    for adr_id, title in rows:
+        assert _ADR_ID_RE.match(adr_id), f"malformed ADR id: {adr_id!r}"
+        assert title.strip(), f"empty title for {adr_id}"
 
 
 def test_parse_adr_index_still_parses_claude_md_section_m() -> None:

@@ -21,9 +21,14 @@ out-of-repo ``_docmap.yaml``:
   present on every host, deterministic, and needs no env wiring.
 
 The manifest is a **derived view** (id + title only, never the canonical ADR body,
-which lives in Drive / the scattered ADR set). The proposer regenerates it when an ADR
-is added/accepted (a future CI drift-check guards staleness) — the dual-management
-answer is "regenerated single derived view", not a hand-maintained second source.
+which lives in Drive / the scattered ADR set). It is *generated*, not hand-maintained:
+``scripts/gen_adr_index.py`` (logic in :mod:`spirrow_mindwire.naysayer.adr_index_gen`)
+rebuilds it from CLAUDE.md §M + the spirrow-docs ``_docmap``, run by the proposer on the
+docs host when an ADR is added/accepted. A committed copy is unavoidable — the loop host
+has no docs checkout and the deploy topology is undecided (ADR-18 / msg-438), so neither
+runtime union (needs ``_docmap``) nor a CI drift-check (``_docmap`` is absent in CI) is
+possible. What CI *does* enforce is that the committed manifest **parses and is
+well-formed** (``test_real_in_repo_manifest_loads``).
 """
 
 from __future__ import annotations
@@ -68,9 +73,13 @@ def load_adr_index(repo_root: Path | None = None) -> tuple[tuple[str, str], ...]
     root = repo_root if repo_root is not None else _REPO_ROOT
     try:
         raw = (root / _MANIFEST_REL).read_text(encoding="utf-8")
-    except OSError:
+        data = yaml.safe_load(raw)
+    except (OSError, yaml.YAMLError):
+        # Missing file (OSError) OR a malformed/un-parseable manifest (YAMLError, e.g. a
+        # typo'd bracket/indent in the hand-editable YAML) → fail open to (), so the
+        # caller emits the explicit "UNAVAILABLE" block rather than crashing the naysayer
+        # during prompt construction (Tier B Finding-2, msg-442).
         return ()
-    data = yaml.safe_load(raw)
     if not isinstance(data, dict):
         return ()
     entries = data.get("adrs")
