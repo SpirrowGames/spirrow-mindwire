@@ -80,26 +80,35 @@ class PrReviewOrchestrator:
             "An objection returns the change to the proposer/implementer fix loop; an "
             "approve is the necessary condition for Takahito's merge GO (Tier C)."
         )
-        await self._mcp.call_tool(
-            "chatroom_open_thread",
-            {
-                "project": project,
-                "thread_id": thread_id,
-                "title": title,
-                "owner": self._owner,
-                "propose_content": propose,
-                "tags": ["pr-review", "naysayer", "stage3"],
-            },
-        )
         thread_ref = ThreadRef(
             project_id=project,
             thread_id=thread_id,
             chatroom_uri=f"magickit://chatroom/thread/{thread_id}",
         )
 
+        opened = False
+
         async def post_critique(body: str) -> None:
-            # The critique is posted to the just-opened review thread (the human-visible record),
-            # authored as the naysayer; the driver calls this before the GitHub submission.
+            # Open the thread LAZILY — only once there is a critique to put in it. The driver
+            # calls this exactly once, after a review is produced. Opening durable chatroom state
+            # up-front (before the fallible Lexora/GitHub calls inside driver.review) would leave
+            # an abandoned empty T-pr-review-<n> on every transient remote error, and _next_number
+            # would then skip past it on the rerun (Tier B msg-453). The critique is posted as the
+            # naysayer; the driver calls this before the GitHub submission.
+            nonlocal opened
+            if not opened:
+                await self._mcp.call_tool(
+                    "chatroom_open_thread",
+                    {
+                        "project": project,
+                        "thread_id": thread_id,
+                        "title": title,
+                        "owner": self._owner,
+                        "propose_content": propose,
+                        "tags": ["pr-review", "naysayer", "stage3"],
+                    },
+                )
+                opened = True
             await self._mcp.call_tool(
                 "chatroom_post_message",
                 {

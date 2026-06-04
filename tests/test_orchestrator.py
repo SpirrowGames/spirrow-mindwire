@@ -130,6 +130,36 @@ async def test_fire_pr_review_unparseable_ref_raises() -> None:
         await orch.fire_pr_review(project="p", pr_ref="not a pr ref", number=1)
 
 
+class _RaisingDriver:
+    """A driver whose review fails before any critique (transient remote error)."""
+
+    async def review(self, pr: PrRef, *, post_critique: PostCritique) -> PrReviewOutcome:
+        raise RuntimeError("transient github/lexora error")
+
+
+@pytest.mark.anyio
+async def test_fire_pr_review_does_not_leak_thread_on_review_error() -> None:
+    # Tier B msg-453: the thread is opened lazily inside post_critique, so a review that raises
+    # before producing a critique must NOT leave an abandoned empty T-pr-review-<n> behind.
+    mcp = _FakeMcp()
+    orch = PrReviewOrchestrator(mcp, driver=_RaisingDriver())  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError):
+        await orch.fire_pr_review(project="p", pr_ref="o/r#1", number=1)
+    assert all(name != "chatroom_open_thread" for name, _ in mcp.calls)
+    assert all(name != "chatroom_post_message" for name, _ in mcp.calls)
+
+
+@pytest.mark.anyio
+async def test_fire_pr_review_opens_thread_then_posts_on_success() -> None:
+    # On a successful review the thread is opened (with the request) and the critique posted —
+    # open precedes post (lazy-open happens inside the single post_critique call).
+    mcp = _FakeMcp()
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    await orch.fire_pr_review(project="p", pr_ref="o/r#1", number=1)
+    names = [name for name, _ in mcp.calls]
+    assert names == ["chatroom_open_thread", "chatroom_post_message"]
+
+
 # ---------- L2 merge gate: require_ci_success (ADR-2026-06-03-16 D-3) ------ #
 
 
