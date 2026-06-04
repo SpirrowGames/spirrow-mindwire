@@ -95,7 +95,7 @@ class PrReviewOrchestrator:
             # calls this exactly once, after a review is produced. Opening durable chatroom state
             # up-front (before the fallible Lexora/GitHub calls inside driver.review) would leave
             # an abandoned empty T-pr-review-<n> on every transient remote error (Tier B msg-453).
-            # The critique is posted as the naysayer; the driver calls this before the GitHub submit.
+            # Posted as the naysayer; the driver calls this before the GitHub submission.
             nonlocal opened
             if not opened:
                 await self._open_thread(
