@@ -141,6 +141,14 @@ class PrReviewOrchestrator:
                 return  # the PR's review thread already exists → reuse it (re-fire is idempotent)
             raise
 
+    async def aclose(self) -> None:
+        """Close the PR-review driver's shared HTTP clients (loop teardown).
+
+        The driver is orchestrator-held, not registry-registered (ADR-19 driver-化), so the loop's
+        teardown closes it here rather than via the registry's adapter sweep (Tier B #93 round-4).
+        """
+        await self._driver.aclose()
+
 
 class MergeBlockedError(RuntimeError):
     """Raised by :func:`require_ci_success` when CI is not green (ADR-16 L2 / D-3)."""

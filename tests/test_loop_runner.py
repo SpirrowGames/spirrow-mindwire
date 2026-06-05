@@ -188,16 +188,23 @@ def _pr_review_driver() -> NaysayerPrReviewDriver:
 
 
 class _FakeLexora:
+    def __init__(self) -> None:
+        self.closed = False
+
     async def chat_completion(self, *, model: str, messages: Any, max_tokens: int) -> Any:
         raise AssertionError("not called")
 
     async def health(self) -> dict[str, Any]:
         return {"status": "ok"}
 
-    async def aclose(self) -> None: ...
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class _FakeGitHub:
+    def __init__(self) -> None:
+        self.closed = False
+
     async def fetch_pr_diff(self, pr: Any) -> str:
         raise AssertionError("not called")
 
@@ -207,7 +214,8 @@ class _FakeGitHub:
     async def submit_review(self, pr: Any, *, event: Any, body: str) -> Any:
         raise AssertionError("not called")
 
-    async def aclose(self) -> None: ...
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 # --------------------------------------------------------------------------- #
@@ -384,3 +392,22 @@ async def test_run_loop_idles_cleanly_with_no_watches(tmp_path: Path) -> None:
     # Nothing watched → a poll dispatches nothing and stop() is a no-op-safe halt.
     assert await loop.watcher.poll_once() == 0
     await loop.watcher.stop()
+
+
+@pytest.mark.anyio
+async def test_loop_aclose_closes_pr_review_driver(tmp_path: Path) -> None:
+    # Tier B #93 round-4: the driver is orchestrator-held (not in the registry, so no adapter
+    # sweep closes it), so daemon teardown (loop.aclose) must close its HTTP clients.
+    lexora, github = _FakeLexora(), _FakeGitHub()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    proposer, implementer, naysayer = _real_adapters(tmp_path)
+    loop = build_loop(
+        MindwireSettings(),
+        mcp=_FakeMcp(_FakeChatroom()),
+        proposer=proposer,
+        implementer=implementer,
+        naysayer=naysayer,
+        pr_review_driver=driver,
+    )
+    await loop.aclose()  # watcher.stop() + orchestrator.aclose() → driver.aclose()
+    assert lexora.closed and github.closed

@@ -121,6 +121,16 @@ class Stage3Loop:
     orchestrator: PrReviewOrchestrator
     watches: tuple[WatchSpec, ...]
 
+    async def aclose(self) -> None:
+        """Tear the loop down cleanly: stop the watcher + close the PR-review driver's clients.
+
+        The PR-review driver is orchestrator-held (not in the registry, so it is not swept by an
+        adapter teardown), so its HTTP pools are closed here (Tier B #93 round-4) — symmetric with
+        ``watcher.stop()``.
+        """
+        await self.watcher.stop()
+        await self.orchestrator.aclose()
+
 
 def _thread_ref(project: str, thread_id: str) -> ThreadRef:
     """Build a :class:`ThreadRef` for a magickit chatroom thread.
@@ -319,9 +329,10 @@ async def run_loop(settings: MindwireSettings) -> None:
 
     Each configured watch is added with its own ``baseline`` (so a freshly
     opened task thread can be acted on with ``baseline=False``, while an ongoing
-    thread uses the production-safe ``baseline=True``). ``watcher.stop()`` runs
-    in ``finally`` so the SDK subprocess sessions disconnect cleanly on shutdown
-    (watcher docstring / msg-381 §E-1).
+    thread uses the production-safe ``baseline=True``). ``loop.aclose()`` runs in
+    ``finally`` so the SDK subprocess sessions disconnect (watcher.stop) AND the
+    PR-review driver's HTTP clients close cleanly on shutdown (watcher docstring /
+    msg-381 §E-1; Tier B #93 round-4 for the driver close).
     """
     cfg = settings.loop
     loop = build_loop(settings)
@@ -345,7 +356,7 @@ async def run_loop(settings: MindwireSettings) -> None:
     try:
         await loop.watcher.run(poll_interval_seconds=cfg.poll_interval_seconds)
     finally:
-        await loop.watcher.stop()
+        await loop.aclose()
 
 
 def main() -> None:

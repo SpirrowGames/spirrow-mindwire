@@ -55,6 +55,7 @@ class _FakeDriver:
 
     def __init__(self, outcome: PrReviewOutcome | None = None) -> None:
         self.reviewed: list[PrRef] = []
+        self.closed = False
         self._outcome = outcome or PrReviewOutcome(
             verdict=ReviewEvent.APPROVE,
             body="LGTM\n\nVERDICT: APPROVE",
@@ -66,6 +67,9 @@ class _FakeDriver:
         self.reviewed.append(pr)
         await post_critique(self._outcome.body)
         return self._outcome
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 @pytest.mark.anyio
@@ -108,6 +112,16 @@ async def test_fire_pr_review_unparseable_ref_raises() -> None:
     orch = PrReviewOrchestrator(_FakeMcp(), driver=_FakeDriver())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="unparseable PR ref"):
         await orch.fire_pr_review(project="p", pr_ref="not a pr ref")
+
+
+@pytest.mark.anyio
+async def test_orchestrator_aclose_closes_driver() -> None:
+    # Tier B #93 round-4: the driver is orchestrator-held (not registry-registered), so the loop
+    # teardown closes it via the orchestrator.
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(_FakeMcp(), driver=driver)  # type: ignore[arg-type]
+    await orch.aclose()
+    assert driver.closed
 
 
 @pytest.mark.anyio
