@@ -111,12 +111,12 @@ trigger 該当 PR ごとに以下を記録する。記録の所在を CLAUDE.md 
 
 ### §N.2 派生アーティファクト再生成手順 — naysayer ADR index manifest (ADR-2026-06-04-19 N-2)
 
-`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title のみ、ADR 本体は Drive)。canonical な ADR 集合は分散 (CLAUDE.md §M 参照 ∪ spirrow-docs `_docmap`) しており、loop host / CI には `_docmap` が無いため runtime union も CI drift-check も不可 → **in-repo の commit 済コピーは不可避** (host-reality finding, T-naysayer-unify-impl msg-438/443)。
+`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title のみ、ADR 本体は Drive)。canonical な ADR 集合は分散 (CLAUDE.md §M 参照 ∪ spirrow-docs `_docmap`) しており、loop host / CI には `_docmap` が無いため runtime union も **full** drift-check も不可 → **in-repo の commit 済コピーは不可避** (host-reality finding, T-naysayer-unify-impl msg-438/443)。
 
 手書き二重管理を避けるため、本ファイルは **生成物**として扱う:
 
 - **再生成手順 (proposer)**: ADR を追加/Accepted した時、`_docmap` がある docs host で `python scripts/gen_adr_index.py --docmap <spirrow-docs/_docmap.yaml>` を実行し `spec/adr_index.yaml` を再生成・commit する (手編集しない)。
-- **CI の役割**: `_docmap` が CI に無いので drift-check は不可。CI は commit 済 manifest が **parse でき well-formed** であることのみ検証する (`test_real_in_repo_manifest_loads_and_is_well_formed`)。
+- **CI の役割**: `_docmap` が CI に無いので **full** drift-check (docs-only の architecture ADR まで照合) は不可。ただし CLAUDE.md は CI に在るので CI は (a) commit 済 manifest が **parse でき well-formed** (`test_real_in_repo_manifest_loads_and_is_well_formed`) と (b) **partial drift-check** = §M 参照 ADR が manifest の部分集合であること (`test_section_m_adrs_are_a_subset_of_the_manifest`、identity ADR を §M に足して再生成を忘れたケースを捕捉、Tier B msg-448) を検証する。
 - `_docmap` schema は spirrow-docs 側が SOT で本 host から不可視のため、gen-script の `_docmap` reader は schema-tolerant (初回実行時に実 `_docmap` と突き合わせ確認)。
 
 ---

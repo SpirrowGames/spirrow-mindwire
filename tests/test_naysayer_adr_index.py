@@ -85,6 +85,22 @@ def test_real_in_repo_manifest_loads_and_is_well_formed() -> None:
         assert title.strip(), f"empty title for {adr_id}"
 
 
+def test_section_m_adrs_are_a_subset_of_the_manifest() -> None:
+    # Partial CI drift-check (Tier B re-review msg-448): _docmap is absent in CI but CLAUDE.md IS
+    # present, so every §M-referenced ADR must already be in the committed manifest — catching an
+    # identity ADR added to §M without rerunning gen_adr_index.py. (A *full* drift-check, covering
+    # the docs-only architecture ADRs, would need _docmap, which CI does not have.)
+    repo_root = Path(__file__).resolve().parents[1]
+    claude_md = (repo_root / "CLAUDE.md").read_text(encoding="utf-8")
+    section_m = {adr_id for adr_id, _ in parse_adr_index(claude_md)}
+    manifest = {adr_id for adr_id, _ in load_adr_index()}
+    missing = section_m - manifest
+    assert not missing, (
+        f"CLAUDE.md §M references ADRs absent from spec/adr_index.yaml "
+        f"(rerun scripts/gen_adr_index.py): {sorted(missing)}"
+    )
+
+
 def test_parse_adr_index_still_parses_claude_md_section_m() -> None:
     # Retained §M parser (for context_bundle until its Step ③ removal).
     claude_md = (

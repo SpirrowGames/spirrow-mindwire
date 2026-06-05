@@ -25,10 +25,13 @@ which lives in Drive / the scattered ADR set). It is *generated*, not hand-maint
 ``scripts/gen_adr_index.py`` (logic in :mod:`spirrow_mindwire.naysayer.adr_index_gen`)
 rebuilds it from CLAUDE.md §M + the spirrow-docs ``_docmap``, run by the proposer on the
 docs host when an ADR is added/accepted. A committed copy is unavoidable — the loop host
-has no docs checkout and the deploy topology is undecided (ADR-18 / msg-438), so neither
-runtime union (needs ``_docmap``) nor a CI drift-check (``_docmap`` is absent in CI) is
-possible. What CI *does* enforce is that the committed manifest **parses and is
-well-formed** (``test_real_in_repo_manifest_loads``).
+has no docs checkout and the deploy topology is undecided (ADR-18 / msg-438), so a runtime
+union (which needs ``_docmap``) is not possible. CI cannot run a *full* drift-check either
+(``_docmap`` is absent in CI), but it does enforce two things: the committed manifest
+**parses and is well-formed** (``test_real_in_repo_manifest_loads_and_is_well_formed``), and
+— a **partial drift-check**, since CLAUDE.md *is* in CI — that every §M-referenced ADR is
+present in the manifest (``test_section_m_adrs_are_a_subset_of_the_manifest``), catching an
+identity ADR added to §M without regenerating (Tier B re-review msg-448).
 """
 
 from __future__ import annotations
