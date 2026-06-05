@@ -47,14 +47,21 @@ from ..lexora.client import ChatMessage, LexoraChatClient, LexoraClient
 from .principles import NAYSAYER_MODEL_TIER, build_preamble, principles_version
 
 _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.principles)
-# Gemini 3.1 Pro (the post-T15 naysayer tier) is a reasoning model: its reasoning tokens count
-# against the output budget (~4k observed), so the old 4096 was spent almost entirely on
-# reasoning and the visible critique was truncated mid-sentence (finish_reason=length, which
-# _resolve_verdict then forced to REQUEST_CHANGES). Size for reasoning + a full critique;
-# matches the Lexora gateway's 16000. (The §A.3 floor of 1500 dates from the DeepSeek-V4-Flash era.)
-_DEFAULT_MAX_TOKENS = 16000
+# Gemini 3.1 Pro (the current naysayer tier) is a reasoning model with a 1M+ token context: its
+# reasoning tokens count against the OUTPUT budget, so a real review of a large diff spends a big
+# slice on reasoning before emitting the critique + VERDICT line. The old 16000 ran out mid-review
+# on big PRs (finish_reason=length, which _resolve_verdict then forces to REQUEST_CHANGES — a false
+# RC); 32000 leaves room for reasoning plus a complete critique (connector-relay confirmed ~30k is
+# enough in practice).
+_DEFAULT_MAX_TOKENS = 32000
 _DEFAULT_TIMEOUT_SECONDS = 900.0
-_MAX_DIFF_CHARS = 60_000  # truncate enormous diffs to stay within the model budget
+# Truncate only genuinely enormous diffs. Gemini 3.1 Pro's 1M+ context easily holds a full real PR
+# (the old 60_000 chars (~15-20k tokens) truncated PRs like #93 (~127k chars), and a truncated diff
+# force-RCs via _resolve_verdict — a false RC). 400_000 chars (~100k tokens) passes a realistic PR's
+# full diff with the system preamble (principles + role + ADR index) still well inside budget. The
+# truncate-then-never-APPROVE path is KEPT as a safety valve: a diff too big to see in one shot must
+# be split, so it force-RCs rather than approving on a partial view.
+_MAX_DIFF_CHARS = 400_000
 
 # A verdict must be its own line (``^...$`` with MULTILINE). Diff hunk lines carry a +/-/space
 # prefix, so a ``VERDICT: APPROVE`` *inside the reviewed diff* (prompt injection) never satisfies
