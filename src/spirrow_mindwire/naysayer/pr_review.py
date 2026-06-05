@@ -47,14 +47,25 @@ from ..lexora.client import ChatMessage, LexoraChatClient, LexoraClient
 from .principles import NAYSAYER_MODEL_TIER, build_preamble, principles_version
 
 _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.principles)
-# Gemini 3.1 Pro (the post-T15 naysayer tier) is a reasoning model: its reasoning tokens count
-# against the output budget (~4k observed), so the old 4096 was spent almost entirely on
-# reasoning and the visible critique was truncated mid-sentence (finish_reason=length, which
-# _resolve_verdict then forced to REQUEST_CHANGES). Size for reasoning + a full critique;
-# matches the Lexora gateway's 16000. (The §A.3 floor of 1500 dates from the DeepSeek-V4-Flash era.)
-_DEFAULT_MAX_TOKENS = 16000
+# Gemini 3.1 Pro (the current naysayer tier) is a reasoning model with a 1M+ token context: its
+# reasoning tokens count against the OUTPUT budget, so a real review of a large diff spends a big
+# slice on reasoning before emitting the critique + VERDICT line. The old 16000 ran out mid-review
+# on big PRs (finish_reason=length, which _resolve_verdict then forces to REQUEST_CHANGES — a false
+# RC); 32000 leaves room for reasoning plus a complete critique (connector-relay confirmed ~30k is
+# enough in practice).
+_DEFAULT_MAX_TOKENS = 32000
 _DEFAULT_TIMEOUT_SECONDS = 900.0
-_MAX_DIFF_CHARS = 60_000  # truncate enormous diffs to stay within the model budget
+# The REVIEWABILITY gate, not a context-capacity limit: this is the largest RAW diff the naysayer
+# fully reviews and can therefore APPROVE. Beyond it the diff is truncated, and _resolve_verdict
+# force-RCs a truncated review ("too big to review thoroughly in one shot — split the PR"). So the
+# cap defines "small enough to review rigorously in a single pass", NOT "small enough to fit the
+# model's context". The old 60_000 chars (~15-20k tokens) was below real PRs (e.g. #93 ~127k chars),
+# so legitimate PRs got truncated → false RC. 150_000 chars covers the largest real PR seen so far
+# (#93 ~127k) with margin while — given a fine task-splitting discipline (keep PRs small) — keeping
+# the reviewability gate tight: a diff beyond this should have been split, so it truncates →
+# force-RC. The truncate-then-never-APPROVE path is KEPT as the safety valve: a diff too big to see
+# in one shot force-RCs rather than rubber-stamping on a partial view.
+_MAX_DIFF_CHARS = 150_000
 
 # A verdict must be its own line (``^...$`` with MULTILINE). Diff hunk lines carry a +/-/space
 # prefix, so a ``VERDICT: APPROVE`` *inside the reviewed diff* (prompt injection) never satisfies
