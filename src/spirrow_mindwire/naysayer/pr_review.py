@@ -55,13 +55,17 @@ _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.princ
 # enough in practice).
 _DEFAULT_MAX_TOKENS = 32000
 _DEFAULT_TIMEOUT_SECONDS = 900.0
-# Truncate only genuinely enormous diffs. Gemini 3.1 Pro's 1M+ context easily holds a full real PR
-# (the old 60_000 chars (~15-20k tokens) truncated PRs like #93 (~127k chars), and a truncated diff
-# force-RCs via _resolve_verdict — a false RC). 400_000 chars (~100k tokens) passes a realistic PR's
-# full diff with the system preamble (principles + role + ADR index) still well inside budget. The
-# truncate-then-never-APPROVE path is KEPT as a safety valve: a diff too big to see in one shot must
-# be split, so it force-RCs rather than approving on a partial view.
-_MAX_DIFF_CHARS = 400_000
+# The REVIEWABILITY gate, not a context-capacity limit: this is the largest RAW diff the naysayer
+# fully reviews and can therefore APPROVE. Beyond it the diff is truncated, and _resolve_verdict
+# force-RCs a truncated review ("too big to review thoroughly in one shot — split the PR"). So the
+# cap defines "small enough to review rigorously in a single pass", NOT "small enough to fit the
+# model's context". The old 60_000 chars (~15-20k tokens) was below real PRs (e.g. #93 ~127k chars),
+# so legitimate PRs got truncated → false RC. 256_000 chars ≈ 2x the largest real PR seen (#93
+# ~127k) — it covers real PRs with margin while keeping the "too big → split" gate meaningful (a
+# diff this large can't be reviewed rigorously line-by-line in one pass, so it must be split). The
+# truncate-then-never-APPROVE path is KEPT as the safety valve: a diff too big to see in one shot
+# force-RCs rather than rubber-stamping on a partial view.
+_MAX_DIFF_CHARS = 256_000
 
 # A verdict must be its own line (``^...$`` with MULTILINE). Diff hunk lines carry a +/-/space
 # prefix, so a ``VERDICT: APPROVE`` *inside the reviewed diff* (prompt injection) never satisfies
