@@ -32,7 +32,6 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
 
 from ..github.client import (
     CiState,
@@ -282,17 +281,6 @@ class NaysayerPrReviewDriver:
                 await self._github.submit_review(pr, event=ReviewEvent.COMMENT, body=body)
             else:
                 raise
-
-    async def health(self) -> dict[str, Any]:
-        """Lexora reachability probe (observability)."""
-        details: dict[str, Any] = {}
-        try:
-            lexora_health = await self._lexora.health()
-        except Exception as exc:  # health probe never raises — record unreachable + continue
-            details["lexora_health"] = f"unreachable: {exc}"
-        else:
-            details["lexora_health"] = lexora_health.get("status", lexora_health)
-        return details
 
     async def aclose(self) -> None:
         """Close the shared Lexora + GitHub clients (driver teardown)."""
