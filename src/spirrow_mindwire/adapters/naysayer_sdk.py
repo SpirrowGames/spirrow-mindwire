@@ -8,11 +8,11 @@ just with a **different model backend**. Independence (ADR-05 §5) is preserved 
 distribution: ``ANTHROPIC_BASE_URL`` points at the naysayer (Gemini) tier of the
 Lexora Anthropic-Messages-compatible gateway, never ``api.anthropic.com``.
 
-This replaces the bespoke ``scripts/design_review.py`` relay + context bundle:
-the naysayer now participates in the ordinary loop (watcher → dispatcher →
-adapter → gateway), so the chatroom gather/post is handled by the loop
-infrastructure exactly as for the other roles — no hand-built relay, no
-gatherer/relay session.
+This superseded the bespoke ``scripts/design_review.py`` relay + context bundle
+(both removed in the ADR-19 N-4 cleanup): the naysayer now participates in the
+ordinary loop (watcher → dispatcher → adapter → gateway), so the chatroom
+gather/post is handled by the loop infrastructure exactly as for the other roles
+— no hand-built relay, no gatherer/relay session.
 
 ADR-17 **D-1 is retained**: the 5-principles SOT (``spec/NAYSAYER_PRINCIPLES.md``)
 is injected verbatim into the system prompt via the single

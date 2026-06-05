@@ -102,7 +102,7 @@ def test_section_m_adrs_are_a_subset_of_the_manifest() -> None:
 
 
 def test_parse_adr_index_still_parses_claude_md_section_m() -> None:
-    # Retained §M parser (for context_bundle until its Step ③ removal).
+    # §M parser (used by adr_index_gen to build the manifest + the §M-subset drift-check).
     claude_md = (
         "## §M\n| ADR | x | y |\n|---|---|---|\n"
         "| ADR-2026-05-31-15 | independence gradation | T |\n"

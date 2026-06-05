@@ -45,9 +45,8 @@ import yaml
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MANIFEST_REL = Path("spec") / "adr_index.yaml"
 
-# A CLAUDE.md §M table row: ``| ADR-2026-05-27-09 (T28) | <title> | <thread> |``.
-# Retained for ``context_bundle.py`` only, until the ADR-19 N-4 (Step ③) removal —
-# the naysayer index itself no longer uses §M (it reads the manifest below).
+# A CLAUDE.md §M table row: ``| ADR-2026-05-27-09 (T28) | <title> | <thread> |``. The naysayer
+# index reads the manifest (below), not §M; §M is parsed only to build/validate the manifest.
 _ADR_INDEX_ROW_RE = re.compile(
     r"^\|\s*(ADR-\d{4}-\d{2}-\d{2}-\d+)[^|]*\|\s*([^|]+?)\s*\|", re.MULTILINE
 )
@@ -56,8 +55,9 @@ _ADR_INDEX_ROW_RE = re.compile(
 def parse_adr_index(claude_md: str) -> tuple[tuple[str, str], ...]:
     """Parse the CLAUDE.md §M ADR table into ``(adr_id, title)`` rows (deduped, sorted).
 
-    Used by ``context_bundle.py`` (the retired relay) until its Step ③ removal; the
-    naysayer system prompt now sources its index from the manifest, not §M.
+    Used by :mod:`~spirrow_mindwire.naysayer.adr_index_gen` (to fold §M into the generated
+    manifest) and by the partial CI drift-check (§M ⊆ manifest); the naysayer system prompt
+    itself sources its index from the manifest, not §M.
     """
     seen: dict[str, str] = {}
     for adr_id, title in _ADR_INDEX_ROW_RE.findall(claude_md):
