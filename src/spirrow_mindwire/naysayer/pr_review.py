@@ -43,7 +43,13 @@ from ..github.client import (
     ReviewEvent,
     naysayer_github_token,
 )
-from ..lexora.client import ChatMessage, LexoraChatClient, LexoraClient, LexoraTimeoutError
+from ..lexora.client import (
+    LEXORA_BACKEND_TIMEOUT_SECONDS,
+    ChatMessage,
+    LexoraChatClient,
+    LexoraClient,
+    LexoraTimeoutError,
+)
 from .principles import NAYSAYER_MODEL_TIER, build_preamble, principles_version
 
 _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.principles)
@@ -54,16 +60,15 @@ _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.princ
 # RC); 32000 leaves room for reasoning plus a complete critique (connector-relay confirmed ~30k is
 # enough in practice).
 _DEFAULT_MAX_TOKENS = 32000
-# M3 (T34): the Lexora gateway's own request timeout (long reasoning generations). Named here so
-# the relationship to the client timeout is explicit instead of two bare 900.0 literals that
-# silently tie/race. The CLIENT timeout must be backend + margin so the client always outlives the
-# backend: the backend therefore surfaces its result (completion / partial / error) as the response,
-# and we never time out *before* it does (the old equal-900s tie could lose that race, producing a
+# M3 (T34): the CLIENT timeout must be backend + margin so the client always outlives the backend:
+# the backend therefore surfaces its result (completion / partial / error) as the response, and we
+# never time out *before* it does (the old equal-900s tie could lose that race, producing a
 # client-side TimeoutException with no backend answer). On a genuine timeout the driver degrades to
 # a fail-closed REQUEST_CHANGES (M2), so the margin is about *who reports the timeout*, not safety.
-_LEXORA_BACKEND_TIMEOUT_SECONDS = 900.0
+# The backend fact (900s) is the SINGLE source of truth in ``lexora/client.py`` — imported here as
+# ``LEXORA_BACKEND_TIMEOUT_SECONDS`` rather than re-hardcoded, so the two files cannot drift.
 _CLIENT_TIMEOUT_MARGIN_SECONDS = 60.0
-_DEFAULT_TIMEOUT_SECONDS = _LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_TIMEOUT_MARGIN_SECONDS
+_DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_TIMEOUT_MARGIN_SECONDS
 # The REVIEWABILITY gate, not a context-capacity limit: this is the largest RAW diff the naysayer
 # fully reviews and can therefore APPROVE. Beyond it the diff is truncated, and _resolve_verdict
 # force-RCs a truncated review ("too big to review thoroughly in one shot — split the PR"). So the
@@ -217,7 +222,6 @@ class NaysayerPrReviewDriver:
     ) -> None:
         self._model = model
         self._max_tokens = max_tokens
-        self._timeout_seconds = timeout_seconds  # M2 (T34): surfaced in the timeout-degrade body
         self._lexora: LexoraChatClient = (
             lexora
             if lexora is not None
@@ -308,10 +312,10 @@ class NaysayerPrReviewDriver:
         be a COMMENT-hold is the open question Q left for the naysayer / Tier-C (msg-503).
         """
         body = (
-            f"The naysayer review for {pr.slug} did not complete within "
-            f"{self._timeout_seconds:g}s and timed out. A review that could not finish is treated "
-            f"as not-approved (fail-closed), the same as a truncated/length-capped review: an "
-            f"unfinished review must never APPROVE. Split the PR into smaller diffs or retry.\n\n"
+            f"The naysayer review for {pr.slug} exceeded the configured Lexora client timeout and "
+            f"did not complete. A review that could not finish is treated as not-approved "
+            f"(fail-closed), the same as a truncated/length-capped review: an unfinished review "
+            f"must never APPROVE. Split the PR into smaller diffs or retry.\n\n"
             f"VERDICT: REQUEST_CHANGES"
         )
         await post_critique(body)
@@ -321,6 +325,7 @@ class NaysayerPrReviewDriver:
             body=body,
             ci_state=ci.state,
             head_sha=ci.head_sha,
+            model=self._model,
             principles_version=principles_version(),
             timed_out=True,
         )

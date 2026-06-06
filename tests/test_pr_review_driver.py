@@ -21,6 +21,7 @@ from spirrow_mindwire.github.client import (
     ReviewEvent,
 )
 from spirrow_mindwire.lexora.client import (
+    LEXORA_BACKEND_TIMEOUT_SECONDS,
     ChatCompletion,
     ChatMessage,
     LexoraHTTPError,
@@ -28,7 +29,6 @@ from spirrow_mindwire.lexora.client import (
 )
 from spirrow_mindwire.naysayer.pr_review import (
     _DEFAULT_TIMEOUT_SECONDS,
-    _LEXORA_BACKEND_TIMEOUT_SECONDS,
     _MAX_DIFF_CHARS,
     NaysayerPrReviewDriver,
     NaysayerPrReviewError,
@@ -314,13 +314,16 @@ async def test_lexora_timeout_degrades_to_request_changes_not_raise() -> None:
 
     assert lexora.calls != []  # the model WAS consulted (CI was green) — it timed out
     assert len(posted) == 1  # explanatory critique posted to the thread
-    assert "timed out" in posted[0].lower()
+    # The body is generic about the timeout (no specific seconds number): a DI'd Lexora may carry a
+    # different timeout than the driver default, so the body must not assert a concrete value.
+    assert "timeout" in posted[0].lower()
     assert "VERDICT: REQUEST_CHANGES" in posted[0]
     assert len(github.submitted) == 1
     _pr_arg, event, _body = github.submitted[0]
     assert event is ReviewEvent.REQUEST_CHANGES  # GitHub review submitted as RC
     assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
     assert outcome.timed_out is True
+    assert outcome.model == "naysayer"  # model telemetry preserved on the timeout-degrade path
     assert outcome.head_sha == "sha-to"  # CI head SHA still recorded
     assert outcome.ci_state is CiState.SUCCESS
 
@@ -342,8 +345,9 @@ async def test_non_timeout_lexora_http_error_still_propagates() -> None:
 
 def test_client_default_timeout_exceeds_backend_by_margin() -> None:
     # M4 (iii): the client default must be strictly greater than the backend timeout so the client
-    # always outlives the backend (the backend's result surfaces; no equal-900s tie/race).
-    assert _DEFAULT_TIMEOUT_SECONDS > _LEXORA_BACKEND_TIMEOUT_SECONDS
+    # always outlives the backend (the backend's result surfaces; no equal-900s tie/race). The
+    # backend fact has a single source of truth in lexora/client.py (no duplicated 900.0 literal).
+    assert _DEFAULT_TIMEOUT_SECONDS > LEXORA_BACKEND_TIMEOUT_SECONDS
 
 
 # ---------- verdict parsing (fail-open hardening) ------------------------- #

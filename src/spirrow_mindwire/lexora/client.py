@@ -48,13 +48,17 @@ _DEFAULT_LEXORA_URL = "http://localhost:8110"
 """Default Lexora gateway endpoint. Loopback **by design** (no-auth surface) —
 env-overridable, but the default must not be a LAN/Tailscale IP."""
 
-# Lexora's gateway timeout is 900s (long reasoning generations). The client default is set BY THE
-# CALLER (e.g. the naysayer PR-review driver picks backend + margin so the client always outlives
-# the backend — see ``naysayer/pr_review.py``). This module-level value is only the bare default
-# for ad-hoc ``LexoraClient()`` use; it intentionally equals the backend timeout, so a caller that
-# needs the "never time out before the backend" guarantee must pass an explicit ``timeout_seconds``
-# margin rather than rely on this default.
-_DEFAULT_TIMEOUT_SECONDS = 900.0
+# The Lexora gateway's own request timeout (long reasoning generations). This is the **single
+# source of truth** for that backend fact: callers that need to relate their client timeout to the
+# backend (e.g. the naysayer PR-review driver, which picks backend + margin so the client always
+# outlives the backend — see ``naysayer/pr_review.py``) import THIS constant rather than re-hardcode
+# 900.0, so the fact lives in one place.
+LEXORA_BACKEND_TIMEOUT_SECONDS = 900.0
+
+# Bare default for ad-hoc ``LexoraClient()`` use; it intentionally equals the backend timeout, so a
+# caller that needs the "never time out before the backend" guarantee must pass an explicit
+# ``timeout_seconds`` margin rather than rely on this default.
+_DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS
 
 
 def lexora_url() -> str:
@@ -304,6 +308,7 @@ def _error_detail(resp: httpx.Response) -> str:
 
 
 __all__ = [
+    "LEXORA_BACKEND_TIMEOUT_SECONDS",
     "ChatCompletion",
     "ChatMessage",
     "LexoraAPIError",
