@@ -43,7 +43,13 @@ from ..github.client import (
     ReviewEvent,
     naysayer_github_token,
 )
-from ..lexora.client import ChatMessage, LexoraChatClient, LexoraClient
+from ..lexora.client import (
+    LEXORA_BACKEND_TIMEOUT_SECONDS,
+    ChatMessage,
+    LexoraChatClient,
+    LexoraClient,
+    LexoraTimeoutError,
+)
 from .principles import NAYSAYER_MODEL_TIER, build_preamble, principles_version
 
 _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.principles)
@@ -54,7 +60,15 @@ _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.princ
 # RC); 32000 leaves room for reasoning plus a complete critique (connector-relay confirmed ~30k is
 # enough in practice).
 _DEFAULT_MAX_TOKENS = 32000
-_DEFAULT_TIMEOUT_SECONDS = 900.0
+# M3 (T34): the CLIENT timeout must be backend + margin so the client always outlives the backend:
+# the backend therefore surfaces its result (completion / partial / error) as the response, and we
+# never time out *before* it does (the old equal-900s tie could lose that race, producing a
+# client-side TimeoutException with no backend answer). On a genuine timeout the driver degrades to
+# a fail-closed REQUEST_CHANGES (M2), so the margin is about *who reports the timeout*, not safety.
+# The backend fact (900s) is the SINGLE source of truth in ``lexora/client.py`` — imported here as
+# ``LEXORA_BACKEND_TIMEOUT_SECONDS`` rather than re-hardcoded, so the two files cannot drift.
+_CLIENT_TIMEOUT_MARGIN_SECONDS = 60.0
+_DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_TIMEOUT_MARGIN_SECONDS
 # The REVIEWABILITY gate, not a context-capacity limit: this is the largest RAW diff the naysayer
 # fully reviews and can therefore APPROVE. Beyond it the diff is truncated, and _resolve_verdict
 # force-RCs a truncated review ("too big to review thoroughly in one shot — split the PR"). So the
@@ -118,6 +132,7 @@ class PrReviewOutcome:
     model: str | None = None
     principles_version: int | None = None
     ci_gated: bool = False  # True when the L1 CI-gate short-circuited the content review
+    timed_out: bool = False  # M2 (T34): the Lexora review timed out → degraded to fail-closed RC
 
 
 def _parse_verdict(critique: str) -> ReviewEvent:
@@ -246,11 +261,21 @@ class NaysayerPrReviewDriver:
         # CI green → content review (Lexora). Fail-closed: an unreachable GitHub raises here.
         diff = await self._github.fetch_pr_diff(pr)
         truncated = len(diff) > _MAX_DIFF_CHARS
-        completion = await self._lexora.chat_completion(
-            model=self._model,
-            messages=_build_messages(diff, pr.slug),
-            max_tokens=self._max_tokens,
-        )
+        try:
+            completion = await self._lexora.chat_completion(
+                model=self._model,
+                messages=_build_messages(diff, pr.slug),
+                max_tokens=self._max_tokens,
+            )
+        except LexoraTimeoutError:
+            # M2 (T34): the review did not finish within the client timeout. Treat this like a
+            # truncated review — a partial/absent verdict must never APPROVE — and degrade to a
+            # fail-closed REQUEST_CHANGES via the SAME post_critique + _submit_review path, rather
+            # than letting the timeout propagate and crash the pipeline (a dangerous fail that the
+            # old code's unhandled LexoraHTTPError produced). Non-timeout LexoraHTTPError
+            # (unreachable / 5xx / unknown tier) is NOT caught here, so it keeps propagating
+            # (fail-loud).
+            return await self._degrade_on_timeout(pr, ci, post_critique=post_critique)
         body = (completion.content or "").strip()
         if not body:
             raise NaysayerPrReviewError(
@@ -273,6 +298,36 @@ class NaysayerPrReviewDriver:
             finish_reason=completion.finish_reason,
             model=completion.model or self._model,
             principles_version=principles_version(),
+        )
+
+    async def _degrade_on_timeout(
+        self, pr: PrRef, ci: CiStatus, *, post_critique: PostCritique
+    ) -> PrReviewOutcome:
+        """M2 (T34): a timed-out Lexora review → fail-closed REQUEST_CHANGES (never a silent pass).
+
+        Mirrors the truncated-review path: post an explanatory critique, submit a REQUEST_CHANGES
+        review, and return the :class:`PrReviewOutcome` with ``timed_out=True`` so the timeout is
+        observable to the caller. The default verdict (REQUEST_CHANGES) keeps the gate on the same
+        safe side as a length-capped / truncated review; whether a transient timeout should instead
+        be a COMMENT-hold is the open question Q left for the naysayer / Tier-C (msg-503).
+        """
+        body = (
+            f"The naysayer review for {pr.slug} exceeded the configured Lexora client timeout and "
+            f"did not complete. A review that could not finish is treated as not-approved "
+            f"(fail-closed), the same as a truncated/length-capped review: an unfinished review "
+            f"must never APPROVE. Split the PR into smaller diffs or retry.\n\n"
+            f"VERDICT: REQUEST_CHANGES"
+        )
+        await post_critique(body)
+        await self._submit_review(pr, ReviewEvent.REQUEST_CHANGES, body)
+        return PrReviewOutcome(
+            verdict=ReviewEvent.REQUEST_CHANGES,
+            body=body,
+            ci_state=ci.state,
+            head_sha=ci.head_sha,
+            model=self._model,
+            principles_version=principles_version(),
+            timed_out=True,
         )
 
     async def _submit_review(self, pr: PrRef, verdict: ReviewEvent, body: str) -> None:

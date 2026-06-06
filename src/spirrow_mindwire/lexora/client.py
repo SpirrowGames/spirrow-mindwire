@@ -48,9 +48,17 @@ _DEFAULT_LEXORA_URL = "http://localhost:8110"
 """Default Lexora gateway endpoint. Loopback **by design** (no-auth surface) —
 env-overridable, but the default must not be a LAN/Tailscale IP."""
 
-# Lexora's gateway timeout is 900s (long reasoning generations). The client
-# default matches it so we never time out before the backend does.
-_DEFAULT_TIMEOUT_SECONDS = 900.0
+# The Lexora gateway's own request timeout (long reasoning generations). This is the **single
+# source of truth** for that backend fact: callers that need to relate their client timeout to the
+# backend (e.g. the naysayer PR-review driver, which picks backend + margin so the client always
+# outlives the backend — see ``naysayer/pr_review.py``) import THIS constant rather than re-hardcode
+# 900.0, so the fact lives in one place.
+LEXORA_BACKEND_TIMEOUT_SECONDS = 900.0
+
+# Bare default for ad-hoc ``LexoraClient()`` use; it intentionally equals the backend timeout, so a
+# caller that needs the "never time out before the backend" guarantee must pass an explicit
+# ``timeout_seconds`` margin rather than rely on this default.
+_DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS
 
 
 def lexora_url() -> str:
@@ -78,6 +86,18 @@ class LexoraHTTPError(LexoraError):
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class LexoraTimeoutError(LexoraHTTPError):
+    """The request did not complete within the client timeout (``httpx.TimeoutException``).
+
+    A **subclass** of :class:`LexoraHTTPError`, so existing ``except LexoraHTTPError`` handlers
+    stay backward-compatible (a timeout is still an HTTP-layer failure). It is broken out so a
+    caller that wants to treat a timeout differently — e.g. the naysayer PR-review driver, which
+    degrades a timed-out review to a fail-closed REQUEST_CHANGES instead of crashing the pipeline —
+    can catch it *specifically* (``except LexoraTimeoutError``) ahead of the generic handler. Other
+    transport failures (connect / read errors, etc.) remain plain :class:`LexoraHTTPError`.
+    """
 
 
 class LexoraAPIError(LexoraError):
@@ -211,6 +231,10 @@ class LexoraClient:
         """``GET /health``. Returns the gateway's per-backend status dict."""
         try:
             resp = await self._client.get("/health")
+        except httpx.TimeoutException as e:
+            # TimeoutException is a subclass of RequestError, so it must be caught FIRST to wrap
+            # it as the (sub)typed LexoraTimeoutError rather than the generic LexoraHTTPError.
+            raise LexoraTimeoutError(f"GET /health timed out: {e}") from e
         except httpx.RequestError as e:
             raise LexoraHTTPError(f"GET /health: {e}") from e
         if resp.status_code >= 400:
@@ -247,6 +271,11 @@ class LexoraClient:
         }
         try:
             resp = await self._client.post("/v1/chat/completions", json=body)
+        except httpx.TimeoutException as e:
+            # TimeoutException is a subclass of RequestError, so it must be caught FIRST to wrap
+            # it as the (sub)typed LexoraTimeoutError. The naysayer driver catches this specifically
+            # to degrade a timed-out review to a fail-closed REQUEST_CHANGES instead of crashing.
+            raise LexoraTimeoutError(f"POST /v1/chat/completions ({model}) timed out: {e}") from e
         except httpx.RequestError as e:
             raise LexoraHTTPError(f"POST /v1/chat/completions ({model}): {e}") from e
         if resp.status_code >= 400:
@@ -279,6 +308,7 @@ def _error_detail(resp: httpx.Response) -> str:
 
 
 __all__ = [
+    "LEXORA_BACKEND_TIMEOUT_SECONDS",
     "ChatCompletion",
     "ChatMessage",
     "LexoraAPIError",
@@ -286,5 +316,6 @@ __all__ = [
     "LexoraClient",
     "LexoraError",
     "LexoraHTTPError",
+    "LexoraTimeoutError",
     "lexora_url",
 ]

@@ -20,8 +20,15 @@ from spirrow_mindwire.github.client import (
     PrRef,
     ReviewEvent,
 )
-from spirrow_mindwire.lexora.client import ChatCompletion, ChatMessage
+from spirrow_mindwire.lexora.client import (
+    LEXORA_BACKEND_TIMEOUT_SECONDS,
+    ChatCompletion,
+    ChatMessage,
+    LexoraHTTPError,
+    LexoraTimeoutError,
+)
 from spirrow_mindwire.naysayer.pr_review import (
+    _DEFAULT_TIMEOUT_SECONDS,
     _MAX_DIFF_CHARS,
     NaysayerPrReviewDriver,
     NaysayerPrReviewError,
@@ -288,6 +295,59 @@ async def test_github_submit_failure_after_post_fails_loud() -> None:
     with pytest.raises(RuntimeError):
         await driver.review(_pr(), post_critique=post)
     assert len(posted) == 1  # critique already posted to the thread
+
+
+# ---------- M2 (T34): timeout degrades to fail-closed REQUEST_CHANGES ----- #
+
+
+@pytest.mark.anyio
+async def test_lexora_timeout_degrades_to_request_changes_not_raise() -> None:
+    # M4 (i): a LexoraTimeoutError from the content review must NOT crash the pipeline. It degrades
+    # to a fail-closed REQUEST_CHANGES via the same post_critique + GitHub submit path, and the
+    # outcome records timed_out=True.
+    lexora = _FakeLexora(raise_exc=LexoraTimeoutError("POST /v1/chat/completions timed out"))
+    github = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha-to", []))
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert lexora.calls != []  # the model WAS consulted (CI was green) — it timed out
+    assert len(posted) == 1  # explanatory critique posted to the thread
+    # The body is generic about the timeout (no specific seconds number): a DI'd Lexora may carry a
+    # different timeout than the driver default, so the body must not assert a concrete value.
+    assert "timeout" in posted[0].lower()
+    assert "VERDICT: REQUEST_CHANGES" in posted[0]
+    assert len(github.submitted) == 1
+    _pr_arg, event, _body = github.submitted[0]
+    assert event is ReviewEvent.REQUEST_CHANGES  # GitHub review submitted as RC
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+    assert outcome.timed_out is True
+    assert outcome.model == "naysayer"  # model telemetry preserved on the timeout-degrade path
+    assert outcome.head_sha == "sha-to"  # CI head SHA still recorded
+    assert outcome.ci_state is CiState.SUCCESS
+
+
+@pytest.mark.anyio
+async def test_non_timeout_lexora_http_error_still_propagates() -> None:
+    # M4 (ii): a non-timeout LexoraHTTPError (unreachable / 5xx / unknown tier) is NOT degraded —
+    # it keeps propagating (fail-loud), so only an actual timeout takes the safe-degrade path.
+    lexora = _FakeLexora(raise_exc=LexoraHTTPError("502 unknown tier", status_code=502))
+    github = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha-err", []))
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+
+    with pytest.raises(LexoraHTTPError):
+        await driver.review(_pr(), post_critique=post)
+    assert posted == []  # nothing posted on the fail-loud path
+    assert github.submitted == []  # no review submitted
+
+
+def test_client_default_timeout_exceeds_backend_by_margin() -> None:
+    # M4 (iii): the client default must be strictly greater than the backend timeout so the client
+    # always outlives the backend (the backend's result surfaces; no equal-900s tie/race). The
+    # backend fact has a single source of truth in lexora/client.py (no duplicated 900.0 literal).
+    assert _DEFAULT_TIMEOUT_SECONDS > LEXORA_BACKEND_TIMEOUT_SECONDS
 
 
 # ---------- verdict parsing (fail-open hardening) ------------------------- #

@@ -20,6 +20,7 @@ from spirrow_mindwire.lexora.client import (
     LexoraAPIError,
     LexoraClient,
     LexoraHTTPError,
+    LexoraTimeoutError,
     lexora_url,
 )
 
@@ -149,6 +150,44 @@ async def test_network_error_raises_http_error() -> None:
     async with _client(handler) as client:
         with pytest.raises(LexoraHTTPError):
             await client.chat_completion(model="naysayer", messages=_msgs(), max_tokens=10)
+
+
+@pytest.mark.anyio
+async def test_timeout_raises_typed_timeout_error_subclass_of_http_error() -> None:
+    # M1 (T34): httpx.TimeoutException wraps to LexoraTimeoutError so the naysayer driver can catch
+    # a timeout specifically. It is a SUBCLASS of LexoraHTTPError, so existing
+    # ``except LexoraHTTPError`` handlers stay backward-compatible.
+    def handler(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out")
+
+    async with _client(handler) as client:
+        with pytest.raises(LexoraTimeoutError) as ei:
+            await client.chat_completion(model="naysayer", messages=_msgs(), max_tokens=10)
+    assert isinstance(ei.value, LexoraHTTPError)  # backward-compatible subclass
+
+
+@pytest.mark.anyio
+async def test_non_timeout_network_error_stays_plain_http_error() -> None:
+    # M1 (T34): a non-timeout transport error (e.g. connect refused) is NOT a LexoraTimeoutError —
+    # only an actual timeout takes the typed-timeout path; the driver must keep propagating these.
+    def handler(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    async with _client(handler) as client:
+        with pytest.raises(LexoraHTTPError) as ei:
+            await client.chat_completion(model="naysayer", messages=_msgs(), max_tokens=10)
+    assert not isinstance(ei.value, LexoraTimeoutError)
+
+
+@pytest.mark.anyio
+async def test_health_timeout_raises_typed_timeout_error() -> None:
+    # M1 (T34): health() must wrap a timeout the same way chat_completion() does (consistency).
+    def handler(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("health read timed out")
+
+    async with _client(handler) as client:
+        with pytest.raises(LexoraTimeoutError):
+            await client.health()
 
 
 @pytest.mark.anyio
