@@ -15,7 +15,10 @@ import httpx
 import pytest
 
 from spirrow_mindwire.lexora.client import (
+    _CLIENT_DEFAULT_MARGIN_SECONDS,
     _DEFAULT_LEXORA_URL,
+    _DEFAULT_TIMEOUT_SECONDS,
+    LEXORA_BACKEND_TIMEOUT_SECONDS,
     ChatMessage,
     LexoraAPIError,
     LexoraClient,
@@ -75,6 +78,19 @@ def test_lexora_url_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_lexora_url_empty_env_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINDWIRE_LEXORA_URL", "")
     assert lexora_url() == _DEFAULT_LEXORA_URL
+
+
+# ---------- default timeout (safe-by-default) ----------------------------
+
+
+def test_client_default_timeout_exceeds_backend_timeout() -> None:
+    # T35: the *client* default must outlive the backend's own gateway timeout, so an ad-hoc
+    # ``LexoraClient()`` caller is protected out-of-the-box from the client-times-out-before-the-
+    # backend race without passing an explicit ``timeout_seconds`` margin (safe-by-default).
+    assert _DEFAULT_TIMEOUT_SECONDS > LEXORA_BACKEND_TIMEOUT_SECONDS
+    assert (
+        _DEFAULT_TIMEOUT_SECONDS == LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_DEFAULT_MARGIN_SECONDS
+    )
 
 
 # ---------- chat_completion happy path -----------------------------------
