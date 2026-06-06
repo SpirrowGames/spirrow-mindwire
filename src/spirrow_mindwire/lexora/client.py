@@ -55,10 +55,18 @@ env-overridable, but the default must not be a LAN/Tailscale IP."""
 # 900.0, so the fact lives in one place.
 LEXORA_BACKEND_TIMEOUT_SECONDS = 900.0
 
-# Bare default for ad-hoc ``LexoraClient()`` use; it intentionally equals the backend timeout, so a
-# caller that needs the "never time out before the backend" guarantee must pass an explicit
-# ``timeout_seconds`` margin rather than rely on this default.
-_DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS
+# Small margin baked into the *client* default so it always outlives the backend's own gateway
+# timeout. 30s is the minimum headroom for the backend's 900s gateway timeout to fire and return a
+# response/error before the client cuts the connection — the driver's review-specific 60s headroom
+# is intentionally NOT imposed on this ad-hoc default (see ``naysayer/pr_review.py``; the client
+# margin (30) and driver margin (60) are separate concepts).
+_CLIENT_DEFAULT_MARGIN_SECONDS = 30.0
+
+# Default for ad-hoc ``LexoraClient()`` use. Safe-by-default: it exceeds the backend timeout by a
+# small margin, so even an ad-hoc caller that passes no explicit ``timeout_seconds`` is protected
+# out-of-the-box from the client-times-out-before-the-backend race (no caller-supplied margin
+# required).
+_DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_DEFAULT_MARGIN_SECONDS
 
 
 def lexora_url() -> str:
