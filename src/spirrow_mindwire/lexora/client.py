@@ -271,9 +271,7 @@ class LexoraClient:
             # TimeoutException is a subclass of RequestError, so it must be caught FIRST to wrap
             # it as the (sub)typed LexoraTimeoutError. The naysayer driver catches this specifically
             # to degrade a timed-out review to a fail-closed REQUEST_CHANGES instead of crashing.
-            raise LexoraTimeoutError(
-                f"POST /v1/chat/completions ({model}) timed out: {e}"
-            ) from e
+            raise LexoraTimeoutError(f"POST /v1/chat/completions ({model}) timed out: {e}") from e
         except httpx.RequestError as e:
             raise LexoraHTTPError(f"POST /v1/chat/completions ({model}): {e}") from e
         if resp.status_code >= 400:
