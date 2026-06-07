@@ -311,6 +311,30 @@ def test_ctor_rejects_bad_args() -> None:
         )
 
 
+def test_ctor_rejects_naysayer_identity_not_mapping_to_naysayer_role() -> None:
+    # Tier B msg-529: if naysayer_identity is absent from the roster (or maps to the wrong role),
+    # _naysayer_consulted never recognises the naysayer's posts → a forced naysayer every round to
+    # ROUND_CAP. Fail-fast at construction instead.
+    mcp = _FakeChatroomMcp()
+    disp = _ScriptedDispatcher(mcp, {})
+    with pytest.raises(ValueError, match="must map to role"):
+        Conductor(  # "Nobody" is absent from the roster
+            mcp=mcp,
+            dispatcher=disp,
+            thread_ref=_thread_ref(),
+            roster=_ROSTER,
+            naysayer_identity="Nobody",
+        )
+    with pytest.raises(ValueError, match="must map to role"):
+        Conductor(  # "Bohr" is in the roster but maps to PROPOSER, not NAYSAYER
+            mcp=mcp,
+            dispatcher=disp,
+            thread_ref=_thread_ref(),
+            roster=_ROSTER,
+            naysayer_identity="Bohr",
+        )
+
+
 # --------------------------------------------------------------------------- #
 # integration: real Dispatcher + real gateway over a fake MCP transport
 # --------------------------------------------------------------------------- #

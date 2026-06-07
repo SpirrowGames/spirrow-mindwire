@@ -105,6 +105,12 @@ class Conductor:
             raise ValueError("max_rounds must be >= 1")
         if not naysayer_identity.strip():
             raise ValueError("naysayer_identity must be non-empty (it authors a forced review)")
+        if _roster_role(roster, naysayer_identity) is not naysayer_role:
+            raise ValueError(
+                f"naysayer_identity {naysayer_identity!r} must map to role {naysayer_role.value!r} "
+                f"in the roster: Obj2 recognises a forced naysayer turn by this mapping, so a "
+                f"mismatch would force a naysayer every round to ROUND_CAP (Tier B msg-529)"
+            )
         self._mcp = mcp
         self._dispatcher = dispatcher
         self._thread_ref = thread_ref
@@ -117,7 +123,11 @@ class Conductor:
         """Drive the thread turn-by-turn until a stop condition; return the outcome.
 
         Each turn re-reads the thread (the prior turn's reply was posted synchronously by
-        ``dispatch`` → gateway), so the loop sees a fresh latest message and never needs to poll.
+        ``dispatch`` → gateway). **Precondition**: the gateway is read-your-writes consistent for a
+        single thread (magickit/conclair is; the shipped ``ChatroomWatcher`` relies on the same), so
+        the next read reflects the just-posted reply. Under a merely eventually-consistent transport
+        the no-progress guard could stop a round early — fail-safe (it routes to a human, no
+        corruption); a confirm-poll for that case is a PR-2 follow-up (Tier B msg-530).
         One adapter session is kept per participant **identity** and reused across turns (so a
         participant accumulates context in its session); each identity is (re-)spawned lazily.
         """
@@ -192,14 +202,7 @@ class Conductor:
 
     def _roster_role(self, author: str) -> Role | None:
         """Resolve a message author (persona name) to its role, case-insensitively."""
-        direct = self._roster.get(author)
-        if direct is not None:
-            return direct
-        folded = author.casefold()
-        for identity, role in self._roster.items():
-            if identity.casefold() == folded:
-                return role
-        return None
+        return _roster_role(self._roster, author)
 
     async def _fetch_messages(self) -> list[dict[str, Any]]:
         result = await self._mcp.call_tool(
@@ -254,6 +257,18 @@ def _author(msg: dict[str, Any]) -> str:
 
 def _content(msg: dict[str, Any]) -> str:
     return str(msg.get("content", ""))
+
+
+def _roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
+    """Resolve an author (persona name) to its role via the roster, case-insensitively."""
+    direct = roster.get(author)
+    if direct is not None:
+        return direct
+    folded = author.casefold()
+    for identity, role in roster.items():
+        if identity.casefold() == folded:
+            return role
+    return None
 
 
 def _parse_occurred_at(value: Any) -> datetime:
