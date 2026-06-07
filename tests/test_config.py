@@ -18,10 +18,12 @@ from pydantic import ValidationError
 from spirrow_mindwire.config import (
     CONFIG_SCHEMA_VERSION,
     DEFAULT_DATA_DIR,
+    ConductorConfig,
     MCPServerConfig,
     MindwireSettings,
     load_settings,
 )
+from spirrow_mindwire.value_objects import Role
 
 
 @pytest.fixture(autouse=True)
@@ -351,6 +353,89 @@ def test_mcp_server_extra_key_in_toml_raises(tmp_path: Path) -> None:
             """
             [mcp_server]
             host = "127.0.0.1"
+            bogus_key = "nope"
+            """
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError):
+        load_settings(cfg)
+
+
+# ----- PR-2a: ConductorConfig (mindwire-loop --mode conductor, msg-523) -----
+
+
+def test_conductor_config_defaults_are_empty_and_unobtrusive() -> None:
+    """Zero-config: the conductor block defaults empty (validated at daemon startup, not load)."""
+    s = MindwireSettings()
+    assert s.conductor.task_thread_id == ""
+    assert s.conductor.roster == {}
+    assert s.conductor.naysayer_identity == ""
+    assert s.conductor.max_rounds == 40  # mirrors the Conductor default
+
+
+def test_conductor_config_parses_roster_and_fields_from_toml(tmp_path: Path) -> None:
+    """``[conductor]`` parses the identity→role roster (string role → Role) and scalar knobs."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [conductor]
+            task_thread_id = "T-cross-thread-relay-conductor"
+            naysayer_identity = "Einstein"
+            max_rounds = 12
+
+            [conductor.roster]
+            Bohr = "proposer"
+            Heisenberg = "implementer"
+            Einstein = "naysayer"
+            """
+        ),
+        encoding="utf-8",
+    )
+    s = load_settings(cfg)
+    assert s.conductor.task_thread_id == "T-cross-thread-relay-conductor"
+    assert s.conductor.naysayer_identity == "Einstein"
+    assert s.conductor.max_rounds == 12
+    assert s.conductor.roster == {
+        "Bohr": Role.PROPOSER,
+        "Heisenberg": Role.IMPLEMENTER,
+        "Einstein": Role.NAYSAYER,
+    }
+
+
+def test_conductor_config_env_overrides_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``MINDWIRE_CONDUCTOR__*`` env vars win over TOML for scalar fields."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text("[conductor]\ntask_thread_id = \"T-from-toml\"\n", encoding="utf-8")
+    monkeypatch.setenv("MINDWIRE_CONDUCTOR__TASK_THREAD_ID", "T-from-env")
+
+    s = load_settings(cfg)
+    assert s.conductor.task_thread_id == "T-from-env"
+
+
+def test_conductor_config_rejects_unknown_role_in_roster() -> None:
+    """A roster value that is not a valid Role fails loud (enum validation)."""
+    with pytest.raises(ValidationError):
+        ConductorConfig(roster={"Bohr": "wizard"})  # type: ignore[dict-item]
+
+
+def test_conductor_config_rejects_max_rounds_below_one() -> None:
+    """``max_rounds`` must be >= 1 (mirrors the Conductor ctor invariant)."""
+    with pytest.raises(ValidationError):
+        ConductorConfig(max_rounds=0)
+
+
+def test_conductor_config_extra_key_in_toml_raises(tmp_path: Path) -> None:
+    """Unknown keys under ``[conductor]`` fail loud (strict='forbid')."""
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [conductor]
+            task_thread_id = "T-x"
             bogus_key = "nope"
             """
         ),

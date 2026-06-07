@@ -7,6 +7,18 @@ runs the poll loop. This is the "last piece" the loop was missing — every
 component it composes (watcher, dispatcher, registry, adapters, gateway,
 orchestrator) already exists; this module only *wires and runs* them.
 
+Two intake modes share that registry→dispatcher core (selected by ``mindwire-loop --mode``):
+
+- ``watcher`` (default): the Phase 1 ``ChatroomWatcher`` auto-reply loop described below (msg-385
+  Option A, PR #82).
+- ``conductor``: the NEXT-driven single-thread design conductor (``T-cross-thread-relay-conductor``
+  Tier-C decide msg-523) — :func:`build_conductor` / :func:`run_conductor` wire the PR-1
+  :class:`~spirrow_mindwire.conductor.core.Conductor` (core logic, already merged) onto this same
+  composition root. On the conductor path there is **no** standing auto-reply watcher (Obj1): the
+  conductor reads the one task thread and serially dispatches the single ``NEXT:``-named
+  participant. The PR-gate stays a synchronous ``orchestrator.fire_pr_review`` driver call (ADR-19
+  N-1, already watcher-independent), so no concurrent ``_seen`` watcher engine runs alongside it.
+
 Decided in chatroom ``T-stage3-loop-wiring`` (Bohr, msg-381 + msg-385,
 embodiment terminal_coding_agent):
 
@@ -49,6 +61,7 @@ at spawn (``MINDWIRE_IMPLEMENTER_BASE_URL`` / ``MINDWIRE_LEXORA_URL`` /
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -57,6 +70,7 @@ from pathlib import Path
 from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
+from .conductor import Conductor, ConductorOutcome
 from .config import MindwireSettings, Stage3LoopConfig, load_settings
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
@@ -130,6 +144,36 @@ class Stage3Loop:
         """
         await self.watcher.stop()
         await self.orchestrator.aclose()
+
+
+@dataclass
+class Stage3Conductor:
+    """The assembled, ready-to-run NEXT-driven conductor (conductor-mode composition root output).
+
+    Holds the same registry→dispatcher core as :class:`Stage3Loop` but with the serial
+    :class:`~spirrow_mindwire.conductor.core.Conductor` as the intake instead of the
+    ``ChatroomWatcher`` auto-reply path (Obj1, msg-523): there is no standing watcher on this path.
+    :meth:`run` drives the one task thread to a stop condition and returns the outcome;
+    :meth:`aclose` halts the spawned adapter sessions on shutdown (symmetric with
+    ``ChatroomWatcher.stop()``).
+    """
+
+    mcp: McpToolCaller
+    registry: InMemoryAdapterRegistry
+    dispatcher: Dispatcher
+    conductor: Conductor
+
+    async def run(self) -> ConductorOutcome:
+        """Drive the configured task thread turn-by-turn until a stop condition (D-4)."""
+        return await self.conductor.run()
+
+    async def aclose(self) -> None:
+        """Halt the adapter sessions the conductor spawned (clean daemon teardown).
+
+        The conductor spawns sessions directly through the dispatcher (no watcher records the
+        handles), so the dispatcher's own ``aclose`` is what tears the SDK subprocess sessions down.
+        """
+        await self.dispatcher.aclose()
 
 
 def _thread_ref(project: str, thread_id: str) -> ThreadRef:
@@ -265,23 +309,23 @@ async def _log_event_sink(event: Event) -> None:
         logger.info("loop event %s author=%s", event.kind, author)
 
 
-def build_loop(
+def _build_dispatcher(
     settings: MindwireSettings,
     *,
-    mcp: McpToolCaller | None = None,
-    proposer: RoleAdapter | None = None,
-    implementer: RoleAdapter | None = None,
-    naysayer: RoleAdapter | None = None,
-    pr_review_driver: NaysayerPrReviewDriver | None = None,
-) -> Stage3Loop:
-    """Assemble the Stage 3 loop from settings (composition root).
+    mcp: McpToolCaller | None,
+    proposer: RoleAdapter | None,
+    implementer: RoleAdapter | None,
+    naysayer: RoleAdapter | None,
+) -> tuple[McpToolCaller, InMemoryAdapterRegistry, Dispatcher]:
+    """Shared composition root for the watcher loop and the conductor.
 
-    Components may be injected (tests pass fakes); anything left ``None`` is
-    built from ``settings`` / the environment. Raises ``SystemExit`` if
-    ``loop.repo_dir`` is unset and an SDK adapter must be built from config.
-    The ``naysayer`` is the design-time SDK agent (the sole registry NAYSAYER);
-    the PR-review gate is the ``pr_review_driver`` wired into the orchestrator
-    (ADR-19 driver-化 unify), not a registered adapter.
+    Resolves the MCP transport + the three production adapters (proposer / implementer / naysayer)
+    from ``settings`` / the environment unless injected (tests pass fakes), then assembles the
+    registry + gateway + dispatcher. Both :func:`build_loop` (watcher mode) and
+    :func:`build_conductor` (conductor mode) build the *same* registry→dispatcher→gateway core; only
+    the intake differs (a ``ChatroomWatcher`` vs the serial
+    :class:`~spirrow_mindwire.conductor.core.Conductor`). Raises ``SystemExit`` if ``loop.repo_dir``
+    is unset and an SDK adapter must be built from config.
     """
     cfg = settings.loop
     if mcp is None:
@@ -303,12 +347,38 @@ def build_loop(
             implementer = build_implementer(repo_dir)
         if naysayer is None:
             naysayer = build_naysayer(repo_dir)
-    if pr_review_driver is None:
-        pr_review_driver = build_pr_review_driver()
 
     registry = build_registry(proposer=proposer, implementer=implementer, naysayer=naysayer)
     gateway = MagickitChatroomGateway(mcp)
     dispatcher = Dispatcher(registry=registry, gateway=gateway, event_sink=_log_event_sink)
+    return mcp, registry, dispatcher
+
+
+def build_loop(
+    settings: MindwireSettings,
+    *,
+    mcp: McpToolCaller | None = None,
+    proposer: RoleAdapter | None = None,
+    implementer: RoleAdapter | None = None,
+    naysayer: RoleAdapter | None = None,
+    pr_review_driver: NaysayerPrReviewDriver | None = None,
+) -> Stage3Loop:
+    """Assemble the Stage 3 watcher loop from settings (composition root).
+
+    Components may be injected (tests pass fakes); anything left ``None`` is
+    built from ``settings`` / the environment. Raises ``SystemExit`` if
+    ``loop.repo_dir`` is unset and an SDK adapter must be built from config.
+    The ``naysayer`` is the design-time SDK agent (the sole registry NAYSAYER);
+    the PR-review gate is the ``pr_review_driver`` wired into the orchestrator
+    (ADR-19 driver-化 unify), not a registered adapter.
+    """
+    cfg = settings.loop
+    mcp, registry, dispatcher = _build_dispatcher(
+        settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer
+    )
+    if pr_review_driver is None:
+        pr_review_driver = build_pr_review_driver()
+
     watches = build_watches(cfg)
     # Constructor watches=() — each watch is added via add_watch() in run_loop so
     # its per-watch baseline is honoured (watcher.start() applies one flag to all).
@@ -359,19 +429,136 @@ async def run_loop(settings: MindwireSettings) -> None:
         await loop.aclose()
 
 
+def build_conductor(
+    settings: MindwireSettings,
+    *,
+    mcp: McpToolCaller | None = None,
+    proposer: RoleAdapter | None = None,
+    implementer: RoleAdapter | None = None,
+    naysayer: RoleAdapter | None = None,
+) -> Stage3Conductor:
+    """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
+
+    Reuses :func:`_build_dispatcher` (same registry→dispatcher core as the watcher loop) and wires a
+    :class:`~spirrow_mindwire.conductor.core.Conductor` over the single
+    ``[conductor].task_thread_id`` thread. The conductor's ``project`` / ``repo_dir`` / adapters
+    come from ``[loop]``; the conductor-specific ``task_thread_id`` / ``roster`` /
+    ``naysayer_identity`` / ``max_rounds`` come from ``[conductor]``.
+
+    Raises ``SystemExit`` (daemon-startup config error, like ``build_loop``'s ``repo_dir`` guard)
+    if a required ``[conductor]`` field is unset, or if ``naysayer_identity`` does not map to the
+    naysayer role in ``roster`` (the :class:`Conductor` ctor's fail-loud invariant, Tier B msg-529,
+    surfaced here as a friendly startup error rather than a raw ``ValueError``).
+    """
+    loop_cfg = settings.loop
+    cond_cfg = settings.conductor
+    if not cond_cfg.task_thread_id.strip():
+        raise SystemExit(
+            "conductor.task_thread_id is not configured: set [conductor].task_thread_id (the "
+            "single design thread the conductor drives) in mindwire.toml or "
+            "MINDWIRE_CONDUCTOR__TASK_THREAD_ID"
+        )
+    if not cond_cfg.roster:
+        raise SystemExit(
+            "conductor.roster is empty: set [conductor].roster (the chatroom identity→role map, "
+            'e.g. Bohr = "proposer") so the conductor can resolve each NEXT: participant'
+        )
+    if not cond_cfg.naysayer_identity.strip():
+        raise SystemExit(
+            "conductor.naysayer_identity is not configured: set [conductor].naysayer_identity (the "
+            "roster persona that fills the independent naysayer slot) so Obj2 forced consultation "
+            "can recognise a naysayer turn"
+        )
+
+    mcp, registry, dispatcher = _build_dispatcher(
+        settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer
+    )
+    thread_ref = _thread_ref(loop_cfg.project, cond_cfg.task_thread_id)
+    try:
+        conductor = Conductor(
+            mcp=mcp,
+            dispatcher=dispatcher,
+            thread_ref=thread_ref,
+            roster=dict(cond_cfg.roster),
+            naysayer_identity=cond_cfg.naysayer_identity,
+            max_rounds=cond_cfg.max_rounds,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc
+    return Stage3Conductor(mcp=mcp, registry=registry, dispatcher=dispatcher, conductor=conductor)
+
+
+async def run_conductor(settings: MindwireSettings) -> ConductorOutcome:
+    """Build the conductor, drive the task thread once to a stop condition, and tear it down.
+
+    The conductor's :meth:`~spirrow_mindwire.conductor.core.Conductor.run` is itself the serial poll
+    loop (it re-reads the thread each turn); it returns when a D-4 stop condition is reached
+    (``NEXT: human`` Tier-C decision point / ``NEXT: none`` settled / a malformed handoff or
+    no-progress human fallback / the round cap). This entry therefore drives one design thread to
+    its stop and exits — re-arming after the human responds is an operator / follow-up concern. The
+    spawned adapter sessions are closed in ``finally`` so SDK subprocesses don't leak on shutdown.
+    """
+    cond = build_conductor(settings)
+    logger.info(
+        "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
+        settings.loop.project,
+        settings.conductor.task_thread_id,
+        len(settings.conductor.roster),
+        settings.conductor.max_rounds,
+    )
+    try:
+        outcome = await cond.run()
+        logger.info(
+            "conductor finished: stop_reason=%s rounds=%d forced_naysayer=%d last_msg=%s",
+            outcome.stop_reason.value,
+            outcome.rounds,
+            outcome.forced_naysayer_turns,
+            outcome.last_msg_id,
+        )
+        return outcome
+    finally:
+        await cond.aclose()
+
+
 def main() -> None:
-    """Entry point for the ``mindwire-loop`` console script."""
+    """Entry point for the ``mindwire-loop`` console script.
+
+    ``--mode watcher`` (default) runs the Phase 1 ``ChatroomWatcher`` auto-reply loop (msg-385
+    Option A, PR #82). ``--mode conductor`` runs the NEXT-driven single-thread design conductor
+    (Tier-C decide msg-523): the autonomous design path with no auto-reply watcher on it (Obj1). The
+    default is left at ``watcher`` for backward compatibility; flipping the default / retiring the
+    watcher auto-reply mode entirely is the remaining Obj1 decision (deferred — see PR body).
+    """
     logging.basicConfig(level=logging.INFO)
+    parser = argparse.ArgumentParser(
+        prog="mindwire-loop",
+        description="Spirrow MindWire Stage 3 autonomous-loop daemon.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("watcher", "conductor"),
+        default="watcher",
+        help=(
+            "watcher: Phase 1 auto-reply loop (default); "
+            "conductor: NEXT-driven single-thread design conductor (msg-523)"
+        ),
+    )
+    args = parser.parse_args()
     settings = load_settings()
     try:
-        asyncio.run(run_loop(settings))
+        if args.mode == "conductor":
+            asyncio.run(run_conductor(settings))
+        else:
+            asyncio.run(run_loop(settings))
     except KeyboardInterrupt:
         logger.info("stage3 loop interrupted; shut down cleanly")
 
 
 __all__ = [
+    "Stage3Conductor",
     "Stage3Loop",
     "Stage3ProposerAdapter",
+    "build_conductor",
     "build_implementer",
     "build_loop",
     "build_naysayer",
@@ -380,5 +567,6 @@ __all__ = [
     "build_registry",
     "build_watches",
     "main",
+    "run_conductor",
     "run_loop",
 ]
