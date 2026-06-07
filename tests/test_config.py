@@ -409,7 +409,7 @@ def test_conductor_config_env_overrides_toml(
 ) -> None:
     """``MINDWIRE_CONDUCTOR__*`` env vars win over TOML for scalar fields."""
     cfg = tmp_path / "mindwire.toml"
-    cfg.write_text("[conductor]\ntask_thread_id = \"T-from-toml\"\n", encoding="utf-8")
+    cfg.write_text('[conductor]\ntask_thread_id = "T-from-toml"\n', encoding="utf-8")
     monkeypatch.setenv("MINDWIRE_CONDUCTOR__TASK_THREAD_ID", "T-from-env")
 
     s = load_settings(cfg)
