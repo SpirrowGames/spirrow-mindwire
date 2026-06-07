@@ -118,10 +118,12 @@ class Conductor:
 
         Each turn re-reads the thread (the prior turn's reply was posted synchronously by
         ``dispatch`` → gateway), so the loop sees a fresh latest message and never needs to poll.
-        One adapter session is kept per role and reused across turns (so a role accumulates the
-        conversation in its session); the role is (re-)spawned lazily on first use.
+        One adapter session is kept per participant **identity** and reused across turns (so a
+        participant accumulates context in its session); each identity is (re-)spawned lazily.
         """
-        sessions: dict[Role, SessionHandle] = {}
+        # Keyed by identity, not role: two distinct personas sharing a role must each get their own
+        # session, else the second persona's turn is misrouted to the first (Tier B msg-526).
+        sessions: dict[str, SessionHandle] = {}
         processed_msg_id: str | None = None
         forced = 0
         for round_index in range(self._max_rounds):
@@ -142,12 +144,12 @@ class Conductor:
             if is_forced:
                 forced += 1
 
-            handle = sessions.get(target_role)
+            handle = sessions.get(target_identity)
             if handle is None:
                 handle = await self._dispatcher.spawn_instance(
                     self._thread_ref, target_role, target_identity
                 )
-                sessions[target_role] = handle
+                sessions[target_identity] = handle
             await self._dispatcher.dispatch(handle, self._to_event(latest))
             processed_msg_id = latest_msg_id
         return self._stop(self._max_rounds, StopReason.ROUND_CAP, processed_msg_id, forced)

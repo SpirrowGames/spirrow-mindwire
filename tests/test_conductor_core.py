@@ -259,6 +259,36 @@ async def test_session_is_reused_across_turns() -> None:
     assert outcome.stop_reason is StopReason.HUMAN
 
 
+@pytest.mark.anyio
+async def test_distinct_identities_same_role_get_distinct_sessions() -> None:
+    # Regression for the Tier B naysayer finding (msg-526): a sessions cache keyed by Role conflated
+    # two personas of the same role; keyed by identity each persona spawns + authors distinctly.
+    # (With the bug, Schrodinger's turn would be misrouted to Heisenberg's session.)
+    roster: Mapping[str, Role] = {
+        "Bohr": Role.PROPOSER,
+        "Heisenberg": Role.IMPLEMENTER,
+        "Schrodinger": Role.IMPLEMENTER,
+        "Einstein": Role.NAYSAYER,
+    }
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="kick\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(
+        mcp, {Role.IMPLEMENTER: ["impl A\n\nNEXT: Schrodinger", "impl B\n\nNEXT: none"]}
+    )
+    outcome = await Conductor(
+        mcp=mcp,
+        dispatcher=disp,
+        thread_ref=_thread_ref(),
+        roster=roster,
+        naysayer_identity="Einstein",
+    ).run()
+    # Both implementers spawn as distinct instances (the Role-keyed bug spawned only the first).
+    assert disp.spawns == [(Role.IMPLEMENTER, "Heisenberg"), (Role.IMPLEMENTER, "Schrodinger")]
+    # The second turn is authored under Schrodinger — not misrouted to Heisenberg's session.
+    assert [p["author"] for p in mcp.posts] == ["Heisenberg", "Schrodinger"]
+    assert outcome.stop_reason is StopReason.SETTLED
+
+
 def test_ctor_rejects_bad_args() -> None:
     mcp = _FakeChatroomMcp()
     disp = _ScriptedDispatcher(mcp, {})
