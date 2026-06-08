@@ -53,7 +53,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
-from ..github.client import ReviewEvent
+from ..github.client import ReviewEvent, parse_pr_ref
 from ..magickit.client import McpToolCaller
 from ..value_objects import (
     ChatroomEvent,
@@ -223,7 +223,14 @@ class Conductor:
             # REQUEST_CHANGES → dispatch the implementer to fix (carve-out ②: verdict-driven, so
             # guard (i) is never consulted). No orchestrator / no implementer persona → human.
             if handoff.kind is HandoffKind.PR_REVIEW:
-                if self._orchestrator is None or not handoff.token:
+                # Validate the ref (parse_pr_ref) BEFORE firing: an unparseable ref / raw garbage
+                # would make fire_pr_review raise and crash the loop, so fail-safe to the human
+                # rather than break the invariant (Tier B PR #103 round 4).
+                if (
+                    self._orchestrator is None
+                    or not handoff.token
+                    or parse_pr_ref(handoff.token) is None
+                ):
                     return self._stop(round_index, StopReason.HUMAN, latest_msg_id, forced)
                 verdict, relay_msg = await self._fire_pr_gate(handoff.token)
                 relay_msg_id = _msg_id(relay_msg)

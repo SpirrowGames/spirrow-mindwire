@@ -594,6 +594,20 @@ async def test_pr_gate_sentinel_without_orchestrator_routes_to_human() -> None:
     assert mcp.posts == []
 
 
+@pytest.mark.anyio
+async def test_pr_gate_malformed_ref_routes_to_human_without_firing() -> None:
+    # An unparseable PR ref must not reach fire_pr_review (which would raise and crash the loop);
+    # the conductor validates via parse_pr_ref and fails safe to the human (Tier B PR #103 round 4).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="oops\n\nNEXT: pr-review not-a-valid-ref")
+    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()
+    assert gate.fired == []  # never fired — the ref failed validation
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches == []
+
+
 def test_ctor_rejects_bad_args() -> None:
     mcp = _FakeChatroomMcp()
     disp = _ScriptedDispatcher(mcp, {})
