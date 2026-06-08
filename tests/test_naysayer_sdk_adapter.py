@@ -135,6 +135,14 @@ def test_system_prompt_injects_principles_verbatim() -> None:
     assert "independent naysayer" in prompt  # role instructions follow
 
 
+def test_system_prompt_injects_handoff_protocol() -> None:
+    # PR-2b-1: the naysayer ends each critique with a NEXT: line so the conductor can chain.
+    prompt = build_naysayer_system_prompt()
+    assert "Conductor handoff protocol" in prompt
+    assert "NEXT:" in prompt
+    assert "advisory, not a veto" in prompt  # naysayer-specific handoff guidance
+
+
 def test_system_prompt_injects_adr_index(tmp_path: Path) -> None:
     # N-2: the deterministic in-repo ADR index is injected so the agent's worldview is
     # not bounded by what the thread happens to cite.

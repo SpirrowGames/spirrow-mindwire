@@ -41,9 +41,12 @@ _NAME_SPLIT_RE = re.compile(r"[\s(（]")  # noqa: RUF001 (the fullwidth paren is
 # should not defeat the roster lookup).
 _TRAILING_PUNCT = " \t.,;:!?、。）)"  # noqa: RUF001 (fullwidth/CJK punctuation is intentional)
 
-# Reserved sentinels (case-insensitive). Not roster participants.
-_HUMAN_TOKEN = "human"
-_NONE_TOKEN = "none"
+# Reserved sentinels (case-insensitive). Not roster participants. Public because they are the
+# single source of truth for the NEXT vocabulary shared by the *parser* (below) and the *emission*
+# instructions injected into the adapters (:func:`build_handoff_protocol_block`) — the two must use
+# the same words, so they read them from here rather than re-spelling the literals.
+HUMAN_TOKEN = "human"
+NONE_TOKEN = "none"
 
 
 class HandoffKind(StrEnum):
@@ -97,15 +100,81 @@ def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
     if token is None:
         return Handoff(HandoffKind.ABSENT)
     folded = token.casefold()
-    if folded == _HUMAN_TOKEN:
+    if folded == HUMAN_TOKEN:
         return Handoff(HandoffKind.HUMAN, token=token)
-    if folded == _NONE_TOKEN:
+    if folded == NONE_TOKEN:
         return Handoff(HandoffKind.NONE, token=token)
     match = _roster_lookup(roster, token)
     if match is None:
         return Handoff(HandoffKind.ABSENT, token=token)
     identity, role = match
     return Handoff(HandoffKind.ROLE, identity=identity, role=role, token=token)
+
+
+# --------------------------------------------------------------------------- #
+# Emission side: the NEXT-protocol block injected into the adapter system prompts
+# (PR-2b-1). This is the counterpart of resolve_handoff (the parser) and lives in
+# the same module so the sentinel vocabulary (HUMAN_TOKEN / NONE_TOKEN + persona
+# names) has one source of truth and cannot drift between emit and parse.
+# --------------------------------------------------------------------------- #
+
+_HANDOFF_PROTOCOL_CORE = f"""\
+---
+Conductor handoff protocol (REQUIRED)
+
+A conductor drives this thread one turn at a time: after your reply is posted it \
+reads the LAST line of your message to decide who acts next. So end EVERY reply \
+with exactly one handoff line, and make it the FINAL line of your reply:
+
+    NEXT: <name>
+
+`<name>` is either another participant's persona name (spelled exactly as it \
+appears as a message author in this thread) or one of two reserved words:
+
+  - `NEXT: {HUMAN_TOKEN}` — hand to the human for a Tier-C decision (e.g. \
+approving a design for implementation, or merging to the main branch).
+  - `NEXT: {NONE_TOKEN}` — the thread is settled; there is nothing left to do.
+
+The handoff line is part of your verbatim reply, not meta-commentary: write it \
+out literally (for example `NEXT: {HUMAN_TOKEN}`) and put nothing after it."""
+
+_ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
+    Role.PROPOSER: (
+        "As the proposer: after you propose or revise a design, hand to the independent naysayer "
+        "for a design review (`NEXT: <naysayer persona>`). Do NOT hand a design straight to the "
+        "implementer — a design must clear an independent naysayer review and a human Tier-C "
+        f"decision before implementation, so when it is ready for that decision hand to "
+        f"`{HUMAN_TOKEN}`. (The conductor enforces this structurally: a `NEXT:` from you to the "
+        "implementer is redirected to the human.)"
+    ),
+    Role.IMPLEMENTER: (
+        "As the implementer: after you carry out the agreed work, hand back to the proposer for a "
+        "spec-review of what you built (`NEXT: <proposer persona>`). For a Tier-C decision such as "
+        f"merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself."
+    ),
+    Role.NAYSAYER: (
+        "As the naysayer: after your critique, hand back to the proposer if your objections need a "
+        f"disposition (`NEXT: <proposer persona>`), or to `{HUMAN_TOKEN}` if the design is clean "
+        "and ready for the human's Tier-C decision. You are advisory, not a veto."
+    ),
+}
+
+
+def build_handoff_protocol_block(role: Role) -> str:
+    """The NEXT-emission instruction block to append to ``role``'s adapter system prompt (PR-2b-1).
+
+    Teaching the proposer / implementer / naysayer adapters to end every reply with a ``NEXT:`` line
+    is what lets the conductor chain the design loop autonomously (msg-540 / Tier-C decide msg-543).
+    The block is the emission counterpart of :func:`resolve_handoff`; both read the reserved
+    sentinels from this module so emit and parse never diverge.
+
+    This is a *prompt* (a polite request to a well-behaved model), **not** the safety boundary: the
+    conductor's routing guards are the structural enforcement — design→implement handoffs from a
+    non-human / non-naysayer author are redirected to the human (Tier-C gate, ADR-2026-06-03-17),
+    and a human-terminal turn forces an independent naysayer consult first (Obj2). The role guidance
+    here only nudges a cooperating model toward the same outcome.
+    """
+    return f"{_HANDOFF_PROTOCOL_CORE}\n\n{_ROLE_HANDOFF_GUIDANCE[role]}\n"
 
 
 def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | None:
@@ -121,8 +190,11 @@ def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | 
 
 
 __all__ = [
+    "HUMAN_TOKEN",
+    "NONE_TOKEN",
     "Handoff",
     "HandoffKind",
+    "build_handoff_protocol_block",
     "parse_next_token",
     "resolve_handoff",
 ]

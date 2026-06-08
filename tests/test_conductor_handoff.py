@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from spirrow_mindwire.conductor.handoff import (
+    HUMAN_TOKEN,
+    NONE_TOKEN,
     Handoff,
     HandoffKind,
+    build_handoff_protocol_block,
     parse_next_token,
     resolve_handoff,
 )
@@ -80,3 +83,35 @@ def test_resolve_unknown_participant_is_absent() -> None:
     h = resolve_handoff("NEXT: Schrodinger", _ROSTER)
     assert h.kind is HandoffKind.ABSENT
     assert h.token == "Schrodinger"
+
+
+# --------------------------------------------------------------------------- #
+# build_handoff_protocol_block (emission side — PR-2b-1)
+# --------------------------------------------------------------------------- #
+
+
+def test_protocol_block_uses_the_reserved_sentinels_for_every_role() -> None:
+    # The emitted instructions and the parser read the SAME vocabulary (single SOT): the block
+    # spells the reserved words from HUMAN_TOKEN / NONE_TOKEN so emit and parse cannot drift.
+    for role in Role:
+        block = build_handoff_protocol_block(role)
+        assert "NEXT:" in block
+        assert f"NEXT: {HUMAN_TOKEN}" in block
+        assert f"NEXT: {NONE_TOKEN}" in block
+
+
+def test_proposer_block_forbids_direct_implementer_handoff() -> None:
+    block = build_handoff_protocol_block(Role.PROPOSER)
+    assert "naysayer" in block
+    assert "Do NOT hand a design straight to the implementer" in block
+
+
+def test_implementer_block_hands_back_to_proposer_and_never_merges() -> None:
+    block = build_handoff_protocol_block(Role.IMPLEMENTER)
+    assert "proposer" in block
+    assert "never merge" in block
+
+
+def test_naysayer_block_is_advisory() -> None:
+    block = build_handoff_protocol_block(Role.NAYSAYER)
+    assert "advisory, not a veto" in block

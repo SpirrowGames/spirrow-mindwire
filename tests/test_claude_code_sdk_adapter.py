@@ -17,6 +17,7 @@ import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from spirrow_mindwire.adapters.claude_code_sdk import (
+    _DEFAULT_SYSTEM_PROMPT,
     ClaudeCodeSdkAdapter,
     ClaudeCodeSdkDeliveryError,
     ClaudeCodeSdkHaltError,
@@ -374,3 +375,11 @@ async def test_halt_grace_timeout_marks_failed(tmp_path: Path) -> None:
     assert hs.state is SessionState.FAILED
     assert hs.error is not None
     assert hs.error.code == "adapter.halt_failed"
+
+
+def test_default_system_prompt_includes_proposer_handoff_protocol() -> None:
+    # PR-2b-1: the loop proposer is taught to end every reply with a NEXT: line so the conductor
+    # chains, and to route a ready design to the naysayer / human (not straight to the implementer).
+    assert "Conductor handoff protocol" in _DEFAULT_SYSTEM_PROMPT
+    assert "NEXT:" in _DEFAULT_SYSTEM_PROMPT
+    assert "Do NOT hand a design straight to the implementer" in _DEFAULT_SYSTEM_PROMPT

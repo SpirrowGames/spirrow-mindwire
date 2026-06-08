@@ -9,15 +9,26 @@ auto-reply retirement) is PR-2.
 from __future__ import annotations
 
 from .core import Conductor, ConductorDispatcher, ConductorOutcome, StopReason
-from .handoff import Handoff, HandoffKind, parse_next_token, resolve_handoff
+from .handoff import (
+    HUMAN_TOKEN,
+    NONE_TOKEN,
+    Handoff,
+    HandoffKind,
+    build_handoff_protocol_block,
+    parse_next_token,
+    resolve_handoff,
+)
 
 __all__ = [
+    "HUMAN_TOKEN",
+    "NONE_TOKEN",
     "Conductor",
     "ConductorDispatcher",
     "ConductorOutcome",
     "Handoff",
     "HandoffKind",
     "StopReason",
+    "build_handoff_protocol_block",
     "parse_next_token",
     "resolve_handoff",
 ]
