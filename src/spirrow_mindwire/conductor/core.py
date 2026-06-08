@@ -18,12 +18,14 @@ Stop conditions (D-4):
 
 Naysayer enforcement (Obj2, msg-522/523): the design-time naysayer is *advisory, not a veto*
 (ADR-17 D-5), but it must be **consulted at least once** before a design reaches the human. So
-when a non-naysayer participant terminates a turn at ``human`` and no naysayer has posted in the
-current segment (since the last ``NEXT: human`` boundary), the conductor forces a single naysayer
-turn first, then lets the flow proceed. This enforces *consultation*, not approval — the human
-decides. The Q-A reversal (msg-542 Demand 2) extends this: a content-bearing turn that fails to
-route (``ABSENT``) is also a human-terminal turn, so it too gets the forced consult before the
-human sees the un-reviewed design.
+when a non-naysayer, non-human participant terminates a turn at ``human`` and no naysayer has
+posted in the current segment (since the last ``NEXT: human`` boundary), the conductor forces a
+single naysayer turn first, then lets the flow proceed. This enforces *consultation*, not approval
+— the human decides. The Q-A reversal (msg-542 Demand 2) extends this: a content-bearing turn that
+fails to route (``ABSENT``) is also a human-terminal turn, so it too gets the forced consult before
+the human sees the un-reviewed design. The forced consult targets *un-reviewed agent* proposals: it
+is skipped when the latest turn is the naysayer's own or the **human's own**, so Obj2 never polices
+the human's instructions (an explicit ``NEXT: human`` or an "approved, go" with no ``NEXT:`` line).
 
 Design→implement Tier-C gate (guard (i), msg-543 §PR-2b-1 / ADR-2026-06-03-17): a ``NEXT:`` to the
 **implementer** from a non-human, non-naysayer author (i.e. the proposer) would let an un-reviewed,
@@ -240,10 +242,13 @@ class Conductor:
 
         # ABSENT — guard (ii) / Q-A reversal (msg-542 Demand 2): a content-bearing turn that fails
         # to route still terminates at the human, but a non-naysayer's un-reviewed content must
-        # get a naysayer consult first. An empty turn / the naysayer's own turn falls through to
-        # the human fallback (the no-progress guard already separates turns that post nothing).
+        # get a naysayer consult first. An empty turn / the naysayer's own turn / the human's own
+        # turn falls through to the human fallback (the no-progress guard already separates turns
+        # that post nothing; the human carve-out keeps Obj2 from policing the human's own message —
+        # e.g. an "approved, go" with no ``NEXT:`` line — symmetric with guard (i) and HUMAN above).
         if (
             author_role is not self._naysayer_role
+            and not self._is_human(author)
             and _content(messages[-1]).strip()
             and not self._naysayer_consulted(messages)
         ):
@@ -256,9 +261,19 @@ class Conductor:
         """Resolve a turn that terminates at the human (explicit ``NEXT: human`` or a guard (i)
         redirect): force one naysayer consult if none has happened in this segment (Obj2 —
         consultation, not veto), otherwise stop at the human for the Tier-C decision.
+
+        The forced consult protects the Tier-C gate from *un-reviewed agent* proposals, so it is
+        skipped when the latest message is the naysayer's own or the **human's own** — Obj2 must
+        not police the human's own instructions (e.g. an explicit ``NEXT: human``). This mirrors
+        guard (i)'s ``self._is_human(author) or author_role is self._naysayer_role`` carve-out.
         """
-        author_role = self._roster_role(_author(messages[-1]))
-        if author_role is not self._naysayer_role and not self._naysayer_consulted(messages):
+        author = _author(messages[-1])
+        author_role = self._roster_role(author)
+        if (
+            author_role is not self._naysayer_role
+            and not self._is_human(author)
+            and not self._naysayer_consulted(messages)
+        ):
             return self._naysayer_role, self._naysayer_identity, True, None
         return None, "", False, StopReason.HUMAN
 

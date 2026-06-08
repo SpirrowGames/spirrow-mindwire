@@ -228,6 +228,35 @@ async def test_empty_absent_turn_routes_to_human_without_forcing() -> None:
 
 
 @pytest.mark.anyio
+async def test_explicit_human_terminal_from_human_author_does_not_force_naysayer() -> None:
+    # Obj2 protects the Tier-C gate from un-reviewed *agent* proposals; it must not police the
+    # human's own message. An explicit NEXT: human from the human stops at the human directly, even
+    # with no naysayer in the segment — symmetric with guard (i)'s human carve-out.
+    # Regression: independent-naysayer REQUEST_CHANGES on PR #102 (T-pr-review-102 msg-548).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="let's pause here\n\nNEXT: human")
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.forced_naysayer_turns == 0
+    assert disp.dispatches == []
+
+
+@pytest.mark.anyio
+async def test_content_absent_from_human_author_does_not_force_naysayer() -> None:
+    # The likely case the naysayer flagged: the human posts "approved, go" and omits a NEXT line
+    # (ABSENT). The human carve-out keeps the Q-A reversal from forcing an AI naysayer to review the
+    # human's own instruction. Regression: PR #102 RC (T-pr-review-102 msg-548).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="approved, go")
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.NO_HANDOFF
+    assert outcome.forced_naysayer_turns == 0
+    assert disp.dispatches == []
+
+
+@pytest.mark.anyio
 async def test_next_none_settles() -> None:
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Einstein", content="closing out\n\nNEXT: none")
