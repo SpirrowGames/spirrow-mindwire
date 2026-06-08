@@ -352,7 +352,7 @@ async def test_distinct_identities_same_role_get_distinct_sessions() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# guard (i): design→implement Tier-C gate + carve-outs + delegation (PR-2b-1)
+# guard (i): design→implement Tier-C gate + carve-out ① (PR-2b-1; ② → -2, ③ → dedicated slice)
 # --------------------------------------------------------------------------- #
 
 
@@ -422,37 +422,12 @@ async def test_design_time_naysayer_to_implementer_is_gated_not_carved_out() -> 
 
 
 @pytest.mark.anyio
-async def test_delegation_lifts_human_stop_but_keeps_naysayer_consult() -> None:
-    # carve-out ③: a human DELEGATE declaration lets the proposer hand to the implementer WITHOUT
-    # stopping at the human — but the naysayer consult still runs (advisory), and only after it has
-    # spoken does a later proposer→implementer proceed instead of stopping at the human.
+async def test_proposer_to_implementer_stops_at_human_after_review() -> None:
+    # Even after an independent naysayer review, the proposer's design→implement handoff stops at
+    # the human for the Tier-C decision rather than proceeding to the implementer (carve-out ① — a
+    # human-authored decide — is the only path to the implementer in PR-2b-1).
     mcp = _FakeChatroomMcp()
-    mcp.seed(author="human", content="DELEGATE: design→impl thread\n\nNEXT: Bohr")
-    disp = _ScriptedDispatcher(
-        mcp,
-        {
-            Role.PROPOSER: ["design\n\nNEXT: Heisenberg", "revised\n\nNEXT: Heisenberg"],
-            Role.NAYSAYER: ["advisory review\n\nNEXT: Bohr"],
-            Role.IMPLEMENTER: ["built it\n\nNEXT: none"],
-        },
-    )
-    outcome = await _conductor(mcp, disp).run()
-    assert [role for role, _ in disp.dispatches] == [
-        Role.PROPOSER,  # human → Bohr
-        Role.NAYSAYER,  # Bohr → Heisenberg gated; consult forced (advisory) even under delegation
-        Role.PROPOSER,  # naysayer → Bohr
-        Role.IMPLEMENTER,  # Bohr → Heisenberg now proceeds (delegation lifted the human stop)
-    ]
-    assert outcome.forced_naysayer_turns == 1
-    assert outcome.stop_reason is StopReason.SETTLED
-
-
-@pytest.mark.anyio
-async def test_without_delegation_proposer_to_implementer_stops_at_human_after_review() -> None:
-    # Contrast with the delegation case: absent a DELEGATE, the same post-review proposer→impl
-    # handoff stops at the human for the Tier-C decision rather than proceeding to the implementer.
-    mcp = _FakeChatroomMcp()
-    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")  # no DELEGATE line
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
     disp = _ScriptedDispatcher(
         mcp,
         {
@@ -463,21 +438,6 @@ async def test_without_delegation_proposer_to_implementer_stops_at_human_after_r
     outcome = await _conductor(mcp, disp).run()
     assert [role for role, _ in disp.dispatches] == [Role.PROPOSER, Role.NAYSAYER, Role.PROPOSER]
     assert outcome.forced_naysayer_turns == 1
-    assert outcome.stop_reason is StopReason.HUMAN
-
-
-@pytest.mark.anyio
-async def test_delegation_ignored_when_not_human_authored() -> None:
-    # A non-human author cannot self-delegate: a proposer-authored DELEGATE line does not lift
-    # guard (i), so the design→implement handoff is still gated.
-    mcp = _FakeChatroomMcp()
-    mcp.seed(
-        author="Bohr",
-        content="DELEGATE: design→impl thread\n\ndesign\n\nNEXT: Heisenberg",
-    )
-    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["review\n\nNEXT: human"]})
-    outcome = await _conductor(mcp, disp).run()
-    assert disp.dispatches[0][0] is Role.NAYSAYER
     assert outcome.stop_reason is StopReason.HUMAN
 
 

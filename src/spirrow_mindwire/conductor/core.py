@@ -27,17 +27,16 @@ the human sees the un-reviewed design. The forced consult targets *un-reviewed a
 is skipped when the latest turn is the naysayer's own or the **human's own**, so Obj2 never polices
 the human's instructions (an explicit ``NEXT: human`` or an "approved, go" with no ``NEXT:`` line).
 
-Design→implement Tier-C gate (guard (i), msg-543 §PR-2b-1 / ADR-2026-06-03-17 / Tier-C msg-553): a
+Design→implement Tier-C gate (guard (i), msg-543 / ADR-2026-06-03-17 / Tier-C msg-553/557): a
 ``NEXT:`` to the **implementer** from any non-human author (the proposer or — crucially — an in-band
 design-time naysayer) would let an un-reviewed, un-approved design reach code. The conductor
 intercepts it and redirects to the human terminal (Obj2 consult → Tier-C decision). In PR-2b-1 the
-implementer may be directed only by ① a human-authored Tier-C decide or ③ a thread-wide human
-``DELEGATE: design→impl thread`` declaration — which lifts only the human STOP (the naysayer consult
-still runs, and the PR-gate + Tier-C merge stay hard backstops). The ② naysayer-name PR-gate
-REQUEST_CHANGES→fix relay re-enters in PR-2b-2, gated to that relay's structural marker rather
-than a broad ``author_role is naysayer`` trust (msg-552: the gate must not trust the AI's role
-assignment). This is a structural state machine invariant, not a prompt request: the adapters are
-*also* taught to emit a ``NEXT:`` line
+implementer may be directed only by ① a human-authored Tier-C decide. The other two carve-outs are
+deferred so the gate never trusts an AI's role assignment (msg-552): ② the naysayer-name PR-gate
+REQUEST_CHANGES→fix relay re-enters in PR-2b-2, gated to its structural marker; ③ the human
+``DELEGATE`` autonomy path re-enters in a dedicated slice with a reachable trigger and a naysayer
+consult that resets on implementation (msg-556). This is a structural state machine invariant, not
+a prompt request: the adapters are *also* taught to emit a ``NEXT:`` line
 (:func:`~spirrow_mindwire.conductor.handoff.build_handoff_protocol_block`) so a cooperating loop
 chains, but that prompt is advisory and the guards here are the enforcement.
 
@@ -48,7 +47,6 @@ structurally out of the loop.
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -69,13 +67,6 @@ from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, resolve_handoff
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_ROUNDS = 40
-
-# The human-only, thread-wide delegation declaration that lifts guard (i)'s design→implement Tier-C
-# stop (msg-543 §PR-2b-1). Recognised only on a *human-authored* message (the same trust basis as
-# ADR-2026-06-04-19 D-5's human-only ``naysayer_override_reason`` override), it removes only the
-# human STOP — the Obj2 naysayer consult still runs and the PR-gate + Tier-C merge stay hard
-# backstops. The arrow may be written ``→`` or ``->``; the line must stand on its own (MULTILINE).
-_DELEGATE_RE = re.compile(r"^\s*DELEGATE:\s*design\s*(?:→|->)\s*impl\s+thread\b", re.MULTILINE)
 
 
 class ConductorDispatcher(Protocol):
@@ -146,7 +137,7 @@ class Conductor:
         self._max_rounds = max_rounds
         self._naysayer_role = naysayer_role
         # guard (i): the role whose direct handoff from a proposer is gated behind Tier-C, and the
-        # author identity that counts as the human (Tier-C decide / DELEGATE). ``human_identity``
+        # author identity that counts as the human (Tier-C decide). ``human_identity``
         # defaults to the reserved ``human`` persona (the conventional Tier-C author); an empty
         # value disables the carve-out (fail-safe — every design→implement handoff hard-rejects).
         self._implementer_role = implementer_role
@@ -206,9 +197,10 @@ class Conductor:
         Returns ``(target_role, target_identity, is_forced, stop_reason)``; exactly one of
         ``target_role`` / ``stop_reason`` is set. The routing precedence:
 
-        - **guard (i)** — a handoff to the implementer from a non-human, non-naysayer author is the
-          design→implement Tier-C gate (msg-543): redirect to the human terminal unless a carve-out
-          (human-authored / naysayer-name relay) or a human thread delegation applies.
+        - **guard (i)** — a handoff to the implementer from any non-human author is the
+          design→implement Tier-C gate (msg-543): redirect to the human terminal unless carve-out ①
+          (a human-authored Tier-C decide) applies. (② naysayer relay → PR-2b-2; ③ delegation →
+          a dedicated slice.)
         - **human terminal** — an explicit ``NEXT: human``, or guard (i)'s redirect: force a single
           naysayer consult if none in this segment (Obj2), else stop at the human.
         - **role** — any other named participant dispatches as named.
@@ -221,20 +213,11 @@ class Conductor:
         # guard (i): design→implement Tier-C gate.
         if handoff.kind is HandoffKind.ROLE and handoff.role is self._implementer_role:
             if self._is_human(author):
-                # carve-out ① human-authored Tier-C decide. (carve-out ② — the naysayer-name
-                # PR-gate fix relay — is intentionally deferred to PR-2b-2, where it re-enters gated
-                # to the PR-gate relay's structural marker. A broad ``author_role is naysayer``
-                # bypass here would let an in-band design-time naysayer that emits ``NEXT:
-                # <implementer>`` (hallucination / prompt violation) wave an un-approved design
-                # straight to code — the structural gate must not trust the AI's role assignment.
-                # Tier-C msg-553 / independent-naysayer RC msg-552.)
-                assert handoff.identity is not None
-                return handoff.role, handoff.identity, False, None
-            if self._design_to_impl_delegated(messages):
-                # carve-out ③ human delegation: lift only the human STOP — still consult the
-                # naysayer at least once (advisory), then let the implementer proceed.
-                if not self._naysayer_consulted(messages):
-                    return self._naysayer_role, self._naysayer_identity, True, None
+                # carve-out ① human-authored Tier-C decide — the ONLY path to the implementer in
+                # PR-2b-1. ② the naysayer-name PR-gate relay and ③ the human DELEGATE are deferred
+                # (to PR-2b-2 and a dedicated delegation slice): the gate must not trust an AI's
+                # role assignment, so neither a design-time naysayer nor the proposer may emit
+                # ``NEXT: <implementer>`` and bypass the human. Tier-C msg-553 / msg-557.
                 assert handoff.identity is not None
                 return handoff.role, handoff.identity, False, None
             return self._human_terminal(messages)  # default: hard-reject → human terminal
@@ -290,18 +273,6 @@ class Conductor:
         """Is ``author`` the human (Tier-C) identity? Case-insensitive; empty identity ⇒ never (a
         fail-safe default that makes every design→implement handoff hard-reject)."""
         return bool(self._human_identity) and author.casefold() == self._human_identity.casefold()
-
-    def _design_to_impl_delegated(self, messages: list[dict[str, Any]]) -> bool:
-        """Has the human delegated the design→implement Tier-C stop for this thread (guard (i) ③)?
-
-        Recognised only on a **human-authored** ``DELEGATE: design→impl thread`` declaration (the
-        human-only trust basis of ADR-2026-06-04-19 D-5). It lifts only the human STOP; the Obj2
-        naysayer consult and the PR-gate + Tier-C merge backstops are unaffected. Absent the
-        declaration the default is hard-reject.
-        """
-        return any(
-            self._is_human(_author(m)) and _DELEGATE_RE.search(_content(m)) for m in messages
-        )
 
     def _naysayer_consulted(self, messages: list[dict[str, Any]]) -> bool:
         """Has the naysayer posted since the last ``NEXT: human`` boundary (excl. the latest msg)?
