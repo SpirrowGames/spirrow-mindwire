@@ -126,9 +126,11 @@ def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
         return Handoff(HandoffKind.ABSENT)
     pr_review = _PR_REVIEW_RE.match(raw)
     if pr_review is not None:
-        # NEXT: pr-review <owner/repo#n> — the whole ref is the token (not a leading name); the
-        # conductor validates it via parse_pr_ref and fires the synchronous Tier B review (PR-2b-2).
-        return Handoff(HandoffKind.PR_REVIEW, token=pr_review.group("ref"))
+        # NEXT: pr-review <owner/repo#n> — the ref is the first non-whitespace token, with trailing
+        # punctuation stripped (as persona names are) so a natural ``...#7.`` / ``...#7,`` does not
+        # reach GitHub as an invalid ref (Tier B PR #103 round 3). The conductor validates it via
+        # parse_pr_ref and fires the synchronous Tier B review (PR-2b-2).
+        return Handoff(HandoffKind.PR_REVIEW, token=pr_review.group("ref").strip(_TRAILING_PUNCT))
     token = _name_from_raw(raw)
     if token is None:
         return Handoff(HandoffKind.ABSENT, token=raw)

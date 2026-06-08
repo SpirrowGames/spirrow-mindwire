@@ -227,8 +227,16 @@ class Conductor:
                     return self._stop(round_index, StopReason.HUMAN, latest_msg_id, forced)
                 verdict, relay_msg = await self._fire_pr_gate(handoff.token)
                 relay_msg_id = _msg_id(relay_msg)
-                if verdict is not ReviewEvent.REQUEST_CHANGES or not self._implementer_identity:
-                    return self._stop(round_index, StopReason.HUMAN, relay_msg_id, forced)
+                # A missing relay id (post result with no msg_id) breaks no-progress tracking on
+                # the continue path, so fail-safe to the human instead of re-processing the relay
+                # next round (Tier B msg-572 #2). APPROVE / COMMENT also stop at the human.
+                if (
+                    not relay_msg_id
+                    or verdict is not ReviewEvent.REQUEST_CHANGES
+                    or not self._implementer_identity
+                ):
+                    last = relay_msg_id or latest_msg_id
+                    return self._stop(round_index, StopReason.HUMAN, last, forced)
                 handle = sessions.get(self._implementer_identity)
                 if handle is None:
                     handle = await self._dispatcher.spawn_instance(

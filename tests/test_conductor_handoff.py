@@ -87,6 +87,16 @@ def test_resolve_pr_review_strips_trailing_gloss() -> None:
     assert h.token == "acme/widgets#7"
 
 
+def test_resolve_pr_review_strips_trailing_punctuation() -> None:
+    # A ref directly followed by sentence punctuation (no space) must still resolve cleanly, else an
+    # invalid ``...#7.`` / ``...#7,`` reaches GitHub (Tier B PR #103 round 3).
+    dot = resolve_handoff("a\n\nNEXT: pr-review acme/widgets#7.", _ROSTER)
+    assert dot.kind is HandoffKind.PR_REVIEW
+    assert dot.token == "acme/widgets#7"
+    comma = resolve_handoff("b\n\nNEXT: pr-review acme/widgets#7, please review now", _ROSTER)
+    assert comma.token == "acme/widgets#7"
+
+
 # --------------------------------------------------------------------------- #
 # resolve_handoff
 # --------------------------------------------------------------------------- #

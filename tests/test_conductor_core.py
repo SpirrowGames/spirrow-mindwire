@@ -558,6 +558,29 @@ async def test_pr_gate_request_changes_without_implementer_routes_to_human() -> 
     assert outcome.stop_reason is StopReason.HUMAN
 
 
+class _NoMsgIdMcp(_FakeChatroomMcp):
+    """A chatroom whose post results omit the msg_id (schema-drift / ambiguous-return sim)."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        result = await super().call_tool(name, arguments)
+        if name == "chatroom_post_message":
+            return {"msg": {}}  # no msg_id field
+        return result
+
+
+@pytest.mark.anyio
+async def test_pr_gate_relay_without_msg_id_fails_safe_to_human() -> None:
+    # If the relay post returns no msg_id, the conductor cannot track no-progress on the continue
+    # path, so a RC fails safe to the human (no implementer dispatch) — Tier B msg-572 #2.
+    mcp = _NoMsgIdMcp()
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(ReviewEvent.REQUEST_CHANGES)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches == []
+
+
 @pytest.mark.anyio
 async def test_pr_gate_sentinel_without_orchestrator_routes_to_human() -> None:
     # Fail-safe: a pr-review sentinel with no orchestrator wired (PR-gate disabled) routes to the
