@@ -189,12 +189,70 @@ async def test_obj2_does_not_re_force_when_already_consulted() -> None:
 
 
 @pytest.mark.anyio
-async def test_absent_handoff_routes_to_human() -> None:
+async def test_content_absent_from_proposer_forces_naysayer_qa() -> None:
+    # Q-A reversal (msg-542 Demand 2): a content-bearing turn that forgets its NEXT line still
+    # terminates at the human — but the un-reviewed design gets a forced naysayer consult first
+    # (NEXT-presence is no longer the trigger; un-reviewed content reaching the human is).
     mcp = _FakeChatroomMcp()
-    mcp.seed(author="Bohr", content="a reply with no NEXT line")
+    mcp.seed(author="Bohr", content="a detailed design that forgot its NEXT line")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert disp.dispatches[0][0] is Role.NAYSAYER
+    assert outcome.forced_naysayer_turns == 1
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_absent_from_naysayer_routes_to_human() -> None:
+    # The naysayer's own un-routed turn is not re-reviewed: ABSENT from the naysayer falls straight
+    # to the human fallback (Obj3), no forced consult.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content="a critique that forgot its NEXT line")
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp).run()
     assert outcome.stop_reason is StopReason.NO_HANDOFF
+    assert disp.dispatches == []
+
+
+@pytest.mark.anyio
+async def test_empty_absent_turn_routes_to_human_without_forcing() -> None:
+    # An empty turn that also fails to route carries no design content to review → plain human
+    # fallback (the naysayer consult is for un-reviewed *content*, not for empty turns).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="   ")
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.NO_HANDOFF
+    assert outcome.forced_naysayer_turns == 0
+    assert disp.dispatches == []
+
+
+@pytest.mark.anyio
+async def test_explicit_human_terminal_from_human_author_does_not_force_naysayer() -> None:
+    # Obj2 protects the Tier-C gate from un-reviewed *agent* proposals; it must not police the
+    # human's own message. An explicit NEXT: human from the human stops at the human directly, even
+    # with no naysayer in the segment — symmetric with guard (i)'s human carve-out.
+    # Regression: independent-naysayer REQUEST_CHANGES on PR #102 (T-pr-review-102 msg-548).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="let's pause here\n\nNEXT: human")
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.forced_naysayer_turns == 0
+    assert disp.dispatches == []
+
+
+@pytest.mark.anyio
+async def test_content_absent_from_human_author_does_not_force_naysayer() -> None:
+    # The likely case the naysayer flagged: the human posts "approved, go" and omits a NEXT line
+    # (ABSENT). The human carve-out keeps the Q-A reversal from forcing an AI naysayer to review the
+    # human's own instruction. Regression: PR #102 RC (T-pr-review-102 msg-548).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="approved, go")
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.NO_HANDOFF
+    assert outcome.forced_naysayer_turns == 0
     assert disp.dispatches == []
 
 
@@ -209,9 +267,10 @@ async def test_next_none_settles() -> None:
 
 @pytest.mark.anyio
 async def test_no_progress_when_dispatched_role_is_silent() -> None:
-    # The named role posts nothing → latest is unchanged next round → no-progress stop (not a spin).
+    # A human Tier-C decide directs the implementer (carve-out ①); the implementer posts nothing →
+    # latest is unchanged next round → no-progress stop (not a spin).
     mcp = _FakeChatroomMcp()
-    mcp.seed(author="Bohr", content="ping\n\nNEXT: Heisenberg")
+    mcp.seed(author="human", content="approved, go\n\nNEXT: Heisenberg")
     disp = _ScriptedDispatcher(mcp, {})  # implementer has no scripted reply
     outcome = await _conductor(mcp, disp).run()
     assert disp.dispatches == [(Role.IMPLEMENTER, "m1")]
@@ -220,14 +279,15 @@ async def test_no_progress_when_dispatched_role_is_silent() -> None:
 
 @pytest.mark.anyio
 async def test_round_cap_backstops_a_nonconverging_loop() -> None:
-    # proposer ↔ implementer bounce forever; the round cap stops the runaway.
+    # proposer ↔ naysayer bounce forever (neither hands to the human / implementer, so no guard
+    # intercept); the round cap stops the runaway.
     mcp = _FakeChatroomMcp()
-    mcp.seed(author="Bohr", content="start\n\nNEXT: Heisenberg")
+    mcp.seed(author="Bohr", content="start\n\nNEXT: Einstein")
     disp = _ScriptedDispatcher(
         mcp,
         {
-            Role.IMPLEMENTER: [f"impl {i}\n\nNEXT: Bohr" for i in range(10)],
-            Role.PROPOSER: [f"prop {i}\n\nNEXT: Heisenberg" for i in range(10)],
+            Role.NAYSAYER: [f"nay {i}\n\nNEXT: Bohr" for i in range(10)],
+            Role.PROPOSER: [f"prop {i}\n\nNEXT: Einstein" for i in range(10)],
         },
     )
     outcome = await _conductor(mcp, disp, max_rounds=3).run()
@@ -239,22 +299,23 @@ async def test_round_cap_backstops_a_nonconverging_loop() -> None:
 @pytest.mark.anyio
 async def test_session_is_reused_across_turns() -> None:
     # A role dispatched twice in one run is spawned once (session reuse → accumulated context).
+    # Driven over legitimate handoffs only (proposer ⇄ naysayer); the naysayer is the role reused.
     mcp = _FakeChatroomMcp()
-    mcp.seed(author="Einstein", content="kick\n\nNEXT: Heisenberg")
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
     disp = _ScriptedDispatcher(
         mcp,
         {
-            Role.IMPLEMENTER: ["impl a\n\nNEXT: Einstein", "impl b\n\nNEXT: human"],
-            Role.NAYSAYER: ["review\n\nNEXT: Heisenberg"],
+            Role.NAYSAYER: ["review a\n\nNEXT: Bohr", "review b\n\nNEXT: human"],
+            Role.PROPOSER: ["revised\n\nNEXT: Einstein"],
         },
     )
     outcome = await _conductor(mcp, disp).run()
-    impl_spawns = [s for s in disp.spawns if s[0] is Role.IMPLEMENTER]
-    assert impl_spawns == [(Role.IMPLEMENTER, "Heisenberg")]  # spawned once despite two dispatches
+    nay_spawns = [s for s in disp.spawns if s[0] is Role.NAYSAYER]
+    assert nay_spawns == [(Role.NAYSAYER, "Einstein")]  # spawned once despite two dispatches
     assert [role for role, _ in disp.dispatches] == [
-        Role.IMPLEMENTER,
         Role.NAYSAYER,
-        Role.IMPLEMENTER,
+        Role.PROPOSER,
+        Role.NAYSAYER,
     ]
     assert outcome.stop_reason is StopReason.HUMAN
 
@@ -263,17 +324,18 @@ async def test_session_is_reused_across_turns() -> None:
 async def test_distinct_identities_same_role_get_distinct_sessions() -> None:
     # Regression for the Tier B naysayer finding (msg-526): a sessions cache keyed by Role conflated
     # two personas of the same role; keyed by identity each persona spawns + authors distinctly.
-    # (With the bug, Schrodinger's turn would be misrouted to Heisenberg's session.)
+    # (Driven through two proposers — the design→implement guard does not gate proposer handoffs —
+    # so the test isolates the identity-keyed-session mechanism; the implementer carve-outs are
+    # covered separately below.)
     roster: Mapping[str, Role] = {
-        "Bohr": Role.PROPOSER,
-        "Heisenberg": Role.IMPLEMENTER,
-        "Schrodinger": Role.IMPLEMENTER,
         "Einstein": Role.NAYSAYER,
+        "Bohr": Role.PROPOSER,
+        "Dirac": Role.PROPOSER,
     }
     mcp = _FakeChatroomMcp()
-    mcp.seed(author="Bohr", content="kick\n\nNEXT: Heisenberg")
+    mcp.seed(author="Einstein", content="kick\n\nNEXT: Bohr")
     disp = _ScriptedDispatcher(
-        mcp, {Role.IMPLEMENTER: ["impl A\n\nNEXT: Schrodinger", "impl B\n\nNEXT: none"]}
+        mcp, {Role.PROPOSER: ["prop A\n\nNEXT: Dirac", "prop B\n\nNEXT: none"]}
     )
     outcome = await Conductor(
         mcp=mcp,
@@ -282,11 +344,120 @@ async def test_distinct_identities_same_role_get_distinct_sessions() -> None:
         roster=roster,
         naysayer_identity="Einstein",
     ).run()
-    # Both implementers spawn as distinct instances (the Role-keyed bug spawned only the first).
-    assert disp.spawns == [(Role.IMPLEMENTER, "Heisenberg"), (Role.IMPLEMENTER, "Schrodinger")]
-    # The second turn is authored under Schrodinger — not misrouted to Heisenberg's session.
-    assert [p["author"] for p in mcp.posts] == ["Heisenberg", "Schrodinger"]
+    # Both proposers spawn as distinct instances (the Role-keyed bug spawned only the first).
+    assert disp.spawns == [(Role.PROPOSER, "Bohr"), (Role.PROPOSER, "Dirac")]
+    # The second turn is authored under Dirac — not misrouted to Bohr's session.
+    assert [p["author"] for p in mcp.posts] == ["Bohr", "Dirac"]
     assert outcome.stop_reason is StopReason.SETTLED
+
+
+# --------------------------------------------------------------------------- #
+# guard (i): design→implement Tier-C gate + carve-out ① (PR-2b-1; ② → -2, ③ → dedicated slice)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_guard_i_proposer_to_implementer_is_redirected_to_human() -> None:
+    # guard (i): the proposer cannot hand a design straight to the implementer; the conductor
+    # redirects to the human terminal, which (Obj2) forces an independent naysayer consult first —
+    # the implementer is never dispatched on the proposer's say-so.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert disp.dispatches[0][0] is Role.NAYSAYER
+    assert all(role is not Role.IMPLEMENTER for role, _ in disp.dispatches)
+    assert outcome.forced_naysayer_turns == 1
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_guard_i_redirect_stops_at_human_when_already_consulted() -> None:
+    # If the naysayer already reviewed this segment, the gated proposer→implementer handoff goes
+    # straight to the human for the Tier-C decision (no second forced review, no dispatch).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content="review\n\nNEXT: Bohr")
+    mcp.seed(author="Bohr", content="revised, ready to build\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert disp.dispatches == []
+    assert outcome.forced_naysayer_turns == 0
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_carveout_human_decide_directs_implementer() -> None:
+    # carve-out ①: a human-authored Tier-C decide may direct the implementer directly.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="approved for implementation\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(
+        mcp,
+        {
+            Role.IMPLEMENTER: ["done\n\nNEXT: Bohr"],
+            Role.PROPOSER: ["spec ok\n\nNEXT: none"],
+        },
+    )
+    outcome = await _conductor(mcp, disp).run()
+    assert disp.dispatches[0] == (Role.IMPLEMENTER, "m1")
+    assert outcome.forced_naysayer_turns == 0
+    assert outcome.stop_reason is StopReason.SETTLED
+
+
+@pytest.mark.anyio
+async def test_design_time_naysayer_to_implementer_is_gated_not_carved_out() -> None:
+    # carve-out ② (the broad `author_role is naysayer` bypass) is removed in PR-2b-1 (Tier-C
+    # msg-553): the structural gate must not trust an in-band design-time naysayer that emits
+    # NEXT: <implementer> (hallucination / prompt violation). It is redirected to the human
+    # terminal — and since the naysayer already spoke this segment, no second consult is forced.
+    # The PR-gate fix relay re-enters as a properly marker-gated carve-out in PR-2b-2.
+    # Regression: independent-naysayer RC on PR #102 (T-pr-review-102, msg-552).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content="REQUEST_CHANGES: fix the thing\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["fixed\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert disp.dispatches == []  # implementer NOT dispatched on the design-time naysayer's say-so
+    assert outcome.forced_naysayer_turns == 0
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_proposer_to_implementer_stops_at_human_after_review() -> None:
+    # Even after an independent naysayer review, the proposer's design→implement handoff stops at
+    # the human for the Tier-C decision rather than proceeding to the implementer (carve-out ① — a
+    # human-authored decide — is the only path to the implementer in PR-2b-1).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
+    disp = _ScriptedDispatcher(
+        mcp,
+        {
+            Role.PROPOSER: ["design\n\nNEXT: Heisenberg", "revised\n\nNEXT: Heisenberg"],
+            Role.NAYSAYER: ["advisory review\n\nNEXT: Bohr"],
+        },
+    )
+    outcome = await _conductor(mcp, disp).run()
+    assert [role for role, _ in disp.dispatches] == [Role.PROPOSER, Role.NAYSAYER, Role.PROPOSER]
+    assert outcome.forced_naysayer_turns == 1
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_empty_human_identity_disables_human_carveout() -> None:
+    # Fail-safe: with no configured human identity, even a "human"-authored handoff to the
+    # implementer is gated (the operator must set human_identity to enable carve-out ①).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="go\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["review\n\nNEXT: human"]})
+    outcome = await Conductor(
+        mcp=mcp,
+        dispatcher=disp,
+        thread_ref=_thread_ref(),
+        roster=_ROSTER,
+        naysayer_identity="Einstein",
+        human_identity="",
+    ).run()
+    assert disp.dispatches[0][0] is Role.NAYSAYER
+    assert outcome.stop_reason is StopReason.HUMAN
 
 
 def test_ctor_rejects_bad_args() -> None:

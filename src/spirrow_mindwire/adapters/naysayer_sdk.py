@@ -42,6 +42,7 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
+from ..conductor.handoff import build_handoff_protocol_block
 from ..exceptions import (
     AdapterDeliveryError,
     AdapterHaltError,
@@ -133,15 +134,22 @@ class _Session:
 
 def build_naysayer_system_prompt(repo_root: Path | None = None) -> str:
     """Naysayer system prompt: 5-principles SOT (verbatim, D-1) + role instructions
-    + the deterministic ADR index (N-2).
+    + the deterministic ADR index (N-2) + the conductor handoff protocol (PR-2b-1).
 
     The ADR index is read from the in-repo manifest ``spec/adr_index.yaml`` under
     ``repo_root`` (the reviewed repo) and injected on every summon so the agent's
     worldview is not bounded by what the thread happens to cite — it cannot search
     for an ADR it does not know exists (ADR-19 N-2; the manifest is the complete
     in-repo derived view, replacing the retired §M / context-bundle source).
+
+    The handoff-protocol block teaches the agent to end each critique with a ``NEXT:``
+    line so the conductor can chain the loop (hand back to the proposer for a
+    disposition, or to the human when the design is clean).
     """
-    return f"{build_preamble()}\n\n{_NAYSAYER_ROLE_PROMPT}\n\n{build_adr_index_block(repo_root)}"
+    return (
+        f"{build_preamble()}\n\n{_NAYSAYER_ROLE_PROMPT}\n\n"
+        f"{build_adr_index_block(repo_root)}\n\n{build_handoff_protocol_block(Role.NAYSAYER)}"
+    )
 
 
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:

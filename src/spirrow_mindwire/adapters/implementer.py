@@ -59,6 +59,7 @@ from claude_agent_sdk import (
 )
 
 from ..allowlist import Allowlist, AllowlistDecision, ClassifiedAction, Operation, default_allowlist
+from ..conductor.handoff import build_handoff_protocol_block
 from ..exceptions import (
     AdapterDeliveryError,
     AdapterHaltError,
@@ -92,7 +93,7 @@ _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
     {SessionState.HALTING, SessionState.HALTED, SessionState.FAILED}
 )
 
-_DEFAULT_IMPLEMENTER_SYSTEM_PROMPT = """\
+_BASE_IMPLEMENTER_SYSTEM_PROMPT = """\
 You are the implementer in a Spirrow MindWire ChatRoom thread. You write and \
 run code to carry out the agreed proposal. You operate under a strict, \
 fail-loud allow-list (Stage 3 autonomy gating):
@@ -109,6 +110,12 @@ Work on a feature/* branch, commit your changes, and (when ready) open a PR to \
 develop. When you reply in the thread, reply directly with the message body — \
 no preamble, no meta-commentary; your response is posted verbatim.
 """
+
+# The conductor reads the trailing NEXT: line to chain the loop (PR-2b-1); the implementer hands
+# back to the proposer for a spec-review, or to the human for a Tier-C decision (it never merges).
+_DEFAULT_IMPLEMENTER_SYSTEM_PROMPT = (
+    f"{_BASE_IMPLEMENTER_SYSTEM_PROMPT}\n{build_handoff_protocol_block(Role.IMPLEMENTER)}"
+)
 
 
 class ImplementerSdkSpawnError(AdapterSpawnError):

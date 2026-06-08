@@ -18,14 +18,30 @@ Stop conditions (D-4):
 
 Naysayer enforcement (Obj2, msg-522/523): the design-time naysayer is *advisory, not a veto*
 (ADR-17 D-5), but it must be **consulted at least once** before a design reaches the human. So
-when a non-naysayer participant hands to ``human`` and no naysayer has posted in the current
-segment (since the last ``NEXT: human`` boundary), the conductor forces a single naysayer turn
-first, then lets the flow proceed. This enforces *consultation*, not approval — the human decides.
+when a non-naysayer, non-human participant terminates a turn at ``human`` and no naysayer has
+posted in the current segment (since the last ``NEXT: human`` boundary), the conductor forces a
+single naysayer turn first, then lets the flow proceed. This enforces *consultation*, not approval
+— the human decides. The Q-A reversal (msg-542 Demand 2) extends this: a content-bearing turn that
+fails to route (``ABSENT``) is also a human-terminal turn, so it too gets the forced consult before
+the human sees the un-reviewed design. The forced consult targets *un-reviewed agent* proposals: it
+is skipped when the latest turn is the naysayer's own or the **human's own**, so Obj2 never polices
+the human's instructions (an explicit ``NEXT: human`` or an "approved, go" with no ``NEXT:`` line).
+
+Design→implement Tier-C gate (guard (i), msg-543 / ADR-2026-06-03-17 / Tier-C msg-553/557): a
+``NEXT:`` to the **implementer** from any non-human author (the proposer or — crucially — an in-band
+design-time naysayer) would let an un-reviewed, un-approved design reach code. The conductor
+intercepts it and redirects to the human terminal (Obj2 consult → Tier-C decision). In PR-2b-1 the
+implementer may be directed only by ① a human-authored Tier-C decide. The other two carve-outs are
+deferred so the gate never trusts an AI's role assignment (msg-552): ② the naysayer-name PR-gate
+REQUEST_CHANGES→fix relay re-enters in PR-2b-2, gated to its structural marker; ③ the human
+``DELEGATE`` autonomy path re-enters in a dedicated slice with a reachable trigger and a naysayer
+consult that resets on implementation (msg-556). This is a structural state machine invariant, not
+a prompt request: the adapters are *also* taught to emit a ``NEXT:`` line
+(:func:`~spirrow_mindwire.conductor.handoff.build_handoff_protocol_block`) so a cooperating loop
+chains, but that prompt is advisory and the guards here are the enforcement.
 
 The conductor never reaches ``main`` (D-5): merge-to-main stays a human / Tier-C action,
-structurally out of the loop. NB: the role adapters must end their replies with a ``NEXT:`` line
-for the loop to chain — teaching the proposer / implementer / naysayer adapters to emit one is the
-daemon-wiring follow-up (PR-2); the conductor degrades to a human fallback when one omits it.
+structurally out of the loop.
 """
 
 from __future__ import annotations
@@ -46,7 +62,7 @@ from ..value_objects import (
     SessionHandle,
     ThreadRef,
 )
-from .handoff import Handoff, HandoffKind, resolve_handoff
+from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, resolve_handoff
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +116,8 @@ class Conductor:
         naysayer_identity: str,
         max_rounds: int = _DEFAULT_MAX_ROUNDS,
         naysayer_role: Role = Role.NAYSAYER,
+        implementer_role: Role = Role.IMPLEMENTER,
+        human_identity: str = HUMAN_TOKEN,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -118,6 +136,12 @@ class Conductor:
         self._naysayer_identity = naysayer_identity
         self._max_rounds = max_rounds
         self._naysayer_role = naysayer_role
+        # guard (i): the role whose direct handoff from a proposer is gated behind Tier-C, and the
+        # author identity that counts as the human (Tier-C decide). ``human_identity``
+        # defaults to the reserved ``human`` persona (the conventional Tier-C author); an empty
+        # value disables the carve-out (fail-safe — every design→implement handoff hard-rejects).
+        self._implementer_role = implementer_role
+        self._human_identity = human_identity
 
     async def run(self) -> ConductorOutcome:
         """Drive the thread turn-by-turn until a stop condition; return the outcome.
@@ -148,9 +172,10 @@ class Conductor:
                 return self._stop(round_index, StopReason.NO_PROGRESS, latest_msg_id, forced)
 
             handoff = resolve_handoff(_content(latest), self._roster)
-            target_role, target_identity, is_forced = self._route(handoff, messages)
+            target_role, target_identity, is_forced, stop_reason = self._route(handoff, messages)
             if target_role is None:
-                return self._stop(round_index, _stop_for(handoff), latest_msg_id, forced)
+                assert stop_reason is not None  # _route always sets a reason when it stops
+                return self._stop(round_index, stop_reason, latest_msg_id, forced)
             if is_forced:
                 forced += 1
 
@@ -166,22 +191,88 @@ class Conductor:
 
     def _route(
         self, handoff: Handoff, messages: list[dict[str, Any]]
-    ) -> tuple[Role | None, str, bool]:
-        """Decide the participant to dispatch (``None`` = stop) + whether the turn was forced.
+    ) -> tuple[Role | None, str, bool, StopReason | None]:
+        """Decide who to dispatch (``role is None`` = stop with the returned ``StopReason``).
 
-        Obj2 enforcement: a ``NEXT: human`` from a non-naysayer author, with no naysayer post in the
-        current segment, is overridden to a single forced naysayer turn (consultation, not veto).
-        ``ROLE`` handoffs dispatch as named; ``NONE`` / ``ABSENT`` stop.
+        Returns ``(target_role, target_identity, is_forced, stop_reason)``; exactly one of
+        ``target_role`` / ``stop_reason`` is set. The routing precedence:
+
+        - **guard (i)** — a handoff to the implementer from any non-human author is the
+          design→implement Tier-C gate (msg-543): redirect to the human terminal unless carve-out ①
+          (a human-authored Tier-C decide) applies. (② naysayer relay → PR-2b-2; ③ delegation →
+          a dedicated slice.)
+        - **human terminal** — an explicit ``NEXT: human``, or guard (i)'s redirect: force a single
+          naysayer consult if none in this segment (Obj2), else stop at the human.
+        - **role** — any other named participant dispatches as named.
+        - **none / absent** — settle, or (guard (ii) / Q-A) force a naysayer consult on a
+          content-bearing un-routed turn before falling back to the human.
         """
+        author = _author(messages[-1])
+        author_role = self._roster_role(author)
+
+        # guard (i): design→implement Tier-C gate.
+        if handoff.kind is HandoffKind.ROLE and handoff.role is self._implementer_role:
+            if self._is_human(author):
+                # carve-out ① human-authored Tier-C decide — the ONLY path to the implementer in
+                # PR-2b-1. ② the naysayer-name PR-gate relay and ③ the human DELEGATE are deferred
+                # (to PR-2b-2 and a dedicated delegation slice): the gate must not trust an AI's
+                # role assignment, so neither a design-time naysayer nor the proposer may emit
+                # ``NEXT: <implementer>`` and bypass the human. Tier-C msg-553 / msg-557.
+                assert handoff.identity is not None
+                return handoff.role, handoff.identity, False, None
+            return self._human_terminal(messages)  # default: hard-reject → human terminal
+
         if handoff.kind is HandoffKind.HUMAN:
-            author_role = self._roster_role(_author(messages[-1]))
-            if author_role is not self._naysayer_role and not self._naysayer_consulted(messages):
-                return self._naysayer_role, self._naysayer_identity, True
-            return None, "", False
+            return self._human_terminal(messages)
+
         if handoff.kind is HandoffKind.ROLE:
             assert handoff.role is not None and handoff.identity is not None
-            return handoff.role, handoff.identity, False
-        return None, "", False  # NONE / ABSENT
+            return handoff.role, handoff.identity, False, None
+
+        if handoff.kind is HandoffKind.NONE:
+            return None, "", False, StopReason.SETTLED
+
+        # ABSENT — guard (ii) / Q-A reversal (msg-542 Demand 2): a content-bearing turn that fails
+        # to route still terminates at the human, but a non-naysayer's un-reviewed content must
+        # get a naysayer consult first. An empty turn / the naysayer's own turn / the human's own
+        # turn falls through to the human fallback (the no-progress guard already separates turns
+        # that post nothing; the human carve-out keeps Obj2 from policing the human's own message —
+        # e.g. an "approved, go" with no ``NEXT:`` line — symmetric with guard (i) and HUMAN above).
+        if (
+            author_role is not self._naysayer_role
+            and not self._is_human(author)
+            and _content(messages[-1]).strip()
+            and not self._naysayer_consulted(messages)
+        ):
+            return self._naysayer_role, self._naysayer_identity, True, None
+        return None, "", False, StopReason.NO_HANDOFF
+
+    def _human_terminal(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[Role | None, str, bool, StopReason | None]:
+        """Resolve a turn that terminates at the human (explicit ``NEXT: human`` or a guard (i)
+        redirect): force one naysayer consult if none has happened in this segment (Obj2 —
+        consultation, not veto), otherwise stop at the human for the Tier-C decision.
+
+        The forced consult protects the Tier-C gate from *un-reviewed agent* proposals, so it is
+        skipped when the latest message is the naysayer's own or the **human's own** — Obj2 must
+        not police the human's own instructions (e.g. an explicit ``NEXT: human``). This mirrors
+        guard (i)'s ``self._is_human(author) or author_role is self._naysayer_role`` carve-out.
+        """
+        author = _author(messages[-1])
+        author_role = self._roster_role(author)
+        if (
+            author_role is not self._naysayer_role
+            and not self._is_human(author)
+            and not self._naysayer_consulted(messages)
+        ):
+            return self._naysayer_role, self._naysayer_identity, True, None
+        return None, "", False, StopReason.HUMAN
+
+    def _is_human(self, author: str) -> bool:
+        """Is ``author`` the human (Tier-C) identity? Case-insensitive; empty identity ⇒ never (a
+        fail-safe default that makes every design→implement handoff hard-reject)."""
+        return bool(self._human_identity) and author.casefold() == self._human_identity.casefold()
 
     def _naysayer_consulted(self, messages: list[dict[str, Any]]) -> bool:
         """Has the naysayer posted since the last ``NEXT: human`` boundary (excl. the latest msg)?
@@ -278,14 +369,6 @@ def _parse_occurred_at(value: Any) -> datetime:
         except ValueError:
             pass
     return datetime.now(UTC)
-
-
-def _stop_for(handoff: Handoff) -> StopReason:
-    if handoff.kind is HandoffKind.HUMAN:
-        return StopReason.HUMAN
-    if handoff.kind is HandoffKind.NONE:
-        return StopReason.SETTLED
-    return StopReason.NO_HANDOFF  # ABSENT
 
 
 __all__ = [

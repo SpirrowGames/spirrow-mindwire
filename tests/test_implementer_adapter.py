@@ -26,6 +26,7 @@ from claude_agent_sdk import (
 )
 
 from spirrow_mindwire.adapters.implementer import (
+    _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT,
     ImplementerAllowlistError,
     ImplementerSdkAdapter,
     ImplementerSdkDeliveryError,
@@ -718,3 +719,11 @@ async def test_manual_sdk_routes_tool_calls_through_guard(tmp_path: Path) -> Non
         assert (await adapter.health(handle)).state is SessionState.FAILED
     finally:
         await adapter.halt(handle)
+
+
+def test_default_system_prompt_includes_implementer_handoff_protocol() -> None:
+    # PR-2b-1: the implementer ends every reply with a NEXT: line — hand back to the proposer for a
+    # spec-review, or to the human for a Tier-C decision (it never merges to main itself).
+    assert "Conductor handoff protocol" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
+    assert "NEXT:" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
+    assert "never merge" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT

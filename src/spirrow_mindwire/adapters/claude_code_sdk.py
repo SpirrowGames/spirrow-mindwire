@@ -42,6 +42,7 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
+from ..conductor.handoff import build_handoff_protocol_block
 from ..exceptions import (
     AdapterDeliveryError,
     AdapterHaltError,
@@ -70,7 +71,7 @@ _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
     {SessionState.HALTING, SessionState.HALTED, SessionState.FAILED}
 )
 
-_DEFAULT_SYSTEM_PROMPT = """\
+_BASE_SYSTEM_PROMPT = """\
 You are an AI agent participating in a Spirrow MindWire ChatRoom thread \
 between multiple agents. Each turn you receive the latest message in the \
 thread together with the role you are playing. Respond to that message in \
@@ -78,6 +79,11 @@ your assigned role. Your entire response is posted verbatim to the thread \
 as your reply, so reply directly with the message body — no preamble, no \
 tool calls, no meta-commentary.
 """
+
+# In the Stage 3 loop this adapter plays the proposer (the text-only Stage3ProposerAdapter), so it
+# carries the proposer handoff guidance. The conductor reads the trailing NEXT: line to chain the
+# design loop (PR-2b-1); the block is advisory — the conductor's routing guards are the enforcement.
+_DEFAULT_SYSTEM_PROMPT = f"{_BASE_SYSTEM_PROMPT}\n{build_handoff_protocol_block(Role.PROPOSER)}"
 
 
 class _SdkClient(Protocol):
