@@ -608,6 +608,22 @@ async def test_pr_gate_malformed_ref_routes_to_human_without_firing() -> None:
     assert disp.dispatches == []
 
 
+@pytest.mark.anyio
+async def test_pr_gate_normalizes_url_ref_to_slug_before_firing() -> None:
+    # A URL ref is normalized to the canonical owner/repo#n slug before the gate fires, so the
+    # orchestrator / GitHub client always receives a canonical ref (Tier B PR #103 round 5).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(
+        author="Heisenberg",
+        content="opened\n\nNEXT: pr-review https://github.com/acme/widgets/pull/7",
+    )
+    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()
+    assert gate.fired == ["acme/widgets#7"]  # normalized from the URL
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
 def test_ctor_rejects_bad_args() -> None:
     mcp = _FakeChatroomMcp()
     disp = _ScriptedDispatcher(mcp, {})

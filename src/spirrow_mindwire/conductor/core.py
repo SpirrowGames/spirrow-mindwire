@@ -223,16 +223,14 @@ class Conductor:
             # REQUEST_CHANGES → dispatch the implementer to fix (carve-out ②: verdict-driven, so
             # guard (i) is never consulted). No orchestrator / no implementer persona → human.
             if handoff.kind is HandoffKind.PR_REVIEW:
-                # Validate the ref (parse_pr_ref) BEFORE firing: an unparseable ref / raw garbage
-                # would make fire_pr_review raise and crash the loop, so fail-safe to the human
-                # rather than break the invariant (Tier B PR #103 round 4).
-                if (
-                    self._orchestrator is None
-                    or not handoff.token
-                    or parse_pr_ref(handoff.token) is None
-                ):
+                # Validate AND normalize the ref once here: parse it to the canonical owner/repo#n
+                # slug so the gate always fires on a canonical ref (a raw URL is normalized here),
+                # and an unparseable ref fails safe to the human instead of reaching fire_pr_review
+                # (Tier B PR #103 round 4/5).
+                parsed_ref = parse_pr_ref(handoff.token) if handoff.token else None
+                if self._orchestrator is None or parsed_ref is None:
                     return self._stop(round_index, StopReason.HUMAN, latest_msg_id, forced)
-                verdict, relay_msg = await self._fire_pr_gate(handoff.token)
+                verdict, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
                 # A missing relay id (post result with no msg_id) breaks no-progress tracking on
                 # the continue path, so fail-safe to the human instead of re-processing the relay
