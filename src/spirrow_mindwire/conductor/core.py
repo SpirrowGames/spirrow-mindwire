@@ -27,14 +27,17 @@ the human sees the un-reviewed design. The forced consult targets *un-reviewed a
 is skipped when the latest turn is the naysayer's own or the **human's own**, so Obj2 never polices
 the human's instructions (an explicit ``NEXT: human`` or an "approved, go" with no ``NEXT:`` line).
 
-Design→implement Tier-C gate (guard (i), msg-543 §PR-2b-1 / ADR-2026-06-03-17): a ``NEXT:`` to the
-**implementer** from a non-human, non-naysayer author (i.e. the proposer) would let an un-reviewed,
-un-approved design reach code. The conductor intercepts it and redirects to the human terminal
-(Obj2 consult → Tier-C decision). The implementer may be directed only by ① a human-authored
-Tier-C decide, ② the naysayer-name PR-gate REQUEST_CHANGES→fix relay (PR-2b-2), or ③ a thread-wide
-human ``DELEGATE: design→impl thread`` declaration — which lifts only the human STOP (the naysayer
-consult still runs, and the PR-gate + Tier-C merge stay hard backstops). This is a structural state
-machine invariant, not a prompt request: the adapters are *also* taught to emit a ``NEXT:`` line
+Design→implement Tier-C gate (guard (i), msg-543 §PR-2b-1 / ADR-2026-06-03-17 / Tier-C msg-553): a
+``NEXT:`` to the **implementer** from any non-human author (the proposer or — crucially — an in-band
+design-time naysayer) would let an un-reviewed, un-approved design reach code. The conductor
+intercepts it and redirects to the human terminal (Obj2 consult → Tier-C decision). In PR-2b-1 the
+implementer may be directed only by ① a human-authored Tier-C decide or ③ a thread-wide human
+``DELEGATE: design→impl thread`` declaration — which lifts only the human STOP (the naysayer consult
+still runs, and the PR-gate + Tier-C merge stay hard backstops). The ② naysayer-name PR-gate
+REQUEST_CHANGES→fix relay re-enters in PR-2b-2, gated to that relay's structural marker rather
+than a broad ``author_role is naysayer`` trust (msg-552: the gate must not trust the AI's role
+assignment). This is a structural state machine invariant, not a prompt request: the adapters are
+*also* taught to emit a ``NEXT:`` line
 (:func:`~spirrow_mindwire.conductor.handoff.build_handoff_protocol_block`) so a cooperating loop
 chains, but that prompt is advisory and the guards here are the enforcement.
 
@@ -217,8 +220,14 @@ class Conductor:
 
         # guard (i): design→implement Tier-C gate.
         if handoff.kind is HandoffKind.ROLE and handoff.role is self._implementer_role:
-            if self._is_human(author) or author_role is self._naysayer_role:
-                # carve-out ① human-authored Tier-C decide / ② naysayer-name PR-gate fix relay.
+            if self._is_human(author):
+                # carve-out ① human-authored Tier-C decide. (carve-out ② — the naysayer-name
+                # PR-gate fix relay — is intentionally deferred to PR-2b-2, where it re-enters gated
+                # to the PR-gate relay's structural marker. A broad ``author_role is naysayer``
+                # bypass here would let an in-band design-time naysayer that emits ``NEXT:
+                # <implementer>`` (hallucination / prompt violation) wave an un-approved design
+                # straight to code — the structural gate must not trust the AI's role assignment.
+                # Tier-C msg-553 / independent-naysayer RC msg-552.)
                 assert handoff.identity is not None
                 return handoff.role, handoff.identity, False, None
             if self._design_to_impl_delegated(messages):

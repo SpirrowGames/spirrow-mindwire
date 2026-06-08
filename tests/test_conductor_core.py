@@ -299,22 +299,23 @@ async def test_round_cap_backstops_a_nonconverging_loop() -> None:
 @pytest.mark.anyio
 async def test_session_is_reused_across_turns() -> None:
     # A role dispatched twice in one run is spawned once (session reuse → accumulated context).
+    # Driven over legitimate handoffs only (proposer ⇄ naysayer); the naysayer is the role reused.
     mcp = _FakeChatroomMcp()
-    mcp.seed(author="Einstein", content="kick\n\nNEXT: Heisenberg")
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
     disp = _ScriptedDispatcher(
         mcp,
         {
-            Role.IMPLEMENTER: ["impl a\n\nNEXT: Einstein", "impl b\n\nNEXT: human"],
-            Role.NAYSAYER: ["review\n\nNEXT: Heisenberg"],
+            Role.NAYSAYER: ["review a\n\nNEXT: Bohr", "review b\n\nNEXT: human"],
+            Role.PROPOSER: ["revised\n\nNEXT: Einstein"],
         },
     )
     outcome = await _conductor(mcp, disp).run()
-    impl_spawns = [s for s in disp.spawns if s[0] is Role.IMPLEMENTER]
-    assert impl_spawns == [(Role.IMPLEMENTER, "Heisenberg")]  # spawned once despite two dispatches
+    nay_spawns = [s for s in disp.spawns if s[0] is Role.NAYSAYER]
+    assert nay_spawns == [(Role.NAYSAYER, "Einstein")]  # spawned once despite two dispatches
     assert [role for role, _ in disp.dispatches] == [
-        Role.IMPLEMENTER,
         Role.NAYSAYER,
-        Role.IMPLEMENTER,
+        Role.PROPOSER,
+        Role.NAYSAYER,
     ]
     assert outcome.stop_reason is StopReason.HUMAN
 
@@ -404,14 +405,18 @@ async def test_carveout_human_decide_directs_implementer() -> None:
 
 
 @pytest.mark.anyio
-async def test_carveout_naysayer_relay_directs_implementer() -> None:
-    # carve-out ②: the naysayer-name relay of a PR-gate REQUEST_CHANGES → fix loop may direct the
-    # implementer (the conductor posts the RC verdict as the naysayer with NEXT: <implementer>).
+async def test_design_time_naysayer_to_implementer_is_gated_not_carved_out() -> None:
+    # carve-out ② (the broad `author_role is naysayer` bypass) is removed in PR-2b-1 (Tier-C
+    # msg-553): the structural gate must not trust an in-band design-time naysayer that emits
+    # NEXT: <implementer> (hallucination / prompt violation). It is redirected to the human
+    # terminal — and since the naysayer already spoke this segment, no second consult is forced.
+    # The PR-gate fix relay re-enters as a properly marker-gated carve-out in PR-2b-2.
+    # Regression: independent-naysayer RC on PR #102 (T-pr-review-102, msg-552).
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Einstein", content="REQUEST_CHANGES: fix the thing\n\nNEXT: Heisenberg")
     disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["fixed\n\nNEXT: human"]})
     outcome = await _conductor(mcp, disp).run()
-    assert disp.dispatches[0] == (Role.IMPLEMENTER, "m1")
+    assert disp.dispatches == []  # implementer NOT dispatched on the design-time naysayer's say-so
     assert outcome.forced_naysayer_turns == 0
     assert outcome.stop_reason is StopReason.HUMAN
 
