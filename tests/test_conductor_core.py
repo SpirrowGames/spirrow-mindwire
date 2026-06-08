@@ -99,6 +99,7 @@ class _ScriptedDispatcher:
         self._replies: dict[Role, list[str]] = {r: list(b) for r, b in replies.items()}
         self.spawns: list[tuple[Role, str]] = []
         self.dispatches: list[tuple[Role, str]] = []
+        self.events: list[ChatroomEvent] = []
 
     async def spawn_instance(
         self, thread_ref: ThreadRef, role: Role, instance_id: str
@@ -115,6 +116,7 @@ class _ScriptedDispatcher:
 
     async def dispatch(self, handle: SessionHandle, event: ChatroomEvent) -> None:
         self.dispatches.append((handle.role, event.payload.msg_id))
+        self.events.append(event)
         queue = self._replies.get(handle.role)
         if queue:
             body = queue.pop(0)
@@ -529,6 +531,9 @@ async def test_pr_gate_request_changes_dispatches_implementer_then_reapprove() -
     assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]
     assert outcome.forced_naysayer_turns == 0  # the PR-gate IS the naysayer; none forced
     assert outcome.stop_reason is StopReason.HUMAN
+    # the implementer is woken on the RC relay (verdict + critique), not its own pr-review trigger
+    assert "VERDICT: REQUEST_CHANGES" in disp.events[0].payload.body
+    assert "critique body" in disp.events[0].payload.body
 
 
 @pytest.mark.anyio
