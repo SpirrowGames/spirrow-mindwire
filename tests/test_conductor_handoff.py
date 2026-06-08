@@ -79,6 +79,14 @@ def test_resolve_bare_pr_review_without_ref_falls_through_to_absent() -> None:
     assert h.kind is HandoffKind.ABSENT
 
 
+def test_resolve_pr_review_strips_trailing_gloss() -> None:
+    # LLMs often append a parenthetical gloss; the ref is the single non-whitespace token, not the
+    # whole remainder of the line — else an invalid ref reaches GitHub (Tier B PR #103 round 2).
+    h = resolve_handoff("done\n\nNEXT: pr-review acme/widgets#7 (please review)", _ROSTER)
+    assert h.kind is HandoffKind.PR_REVIEW
+    assert h.token == "acme/widgets#7"
+
+
 # --------------------------------------------------------------------------- #
 # resolve_handoff
 # --------------------------------------------------------------------------- #

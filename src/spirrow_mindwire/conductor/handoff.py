@@ -52,7 +52,11 @@ NONE_TOKEN = "none"
 # review on the named PR (PR-2b-2). Unlike a persona handoff, the whole rest of the line is the PR
 # ref (it carries ``/`` and ``#``), so it is parsed off the RAW NEXT line before the name-split.
 PR_REVIEW_TOKEN = "pr-review"
-_PR_REVIEW_RE = re.compile(rf"^{PR_REVIEW_TOKEN}\s+(?P<ref>\S.*?)\s*$", re.IGNORECASE)
+# The ref is the single non-whitespace token after ``pr-review`` (an ``owner/repo#n`` or a URL —
+# neither contains a space). ``\S+`` (not ``.*?$``) so a trailing gloss an LLM appends, e.g.
+# ``pr-review acme/repo#7 (please review)``, is ignored rather than swallowed into the ref and
+# handed to GitHub as an invalid ref (Tier B PR #103 round 2).
+_PR_REVIEW_RE = re.compile(rf"^{PR_REVIEW_TOKEN}\s+(?P<ref>\S+)", re.IGNORECASE)
 
 
 class HandoffKind(StrEnum):
