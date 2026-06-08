@@ -16,7 +16,9 @@ import pytest
 from spirrow_mindwire.conductor.core import Conductor, ConductorDispatcher, StopReason
 from spirrow_mindwire.dispatcher.core import Dispatcher
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
+from spirrow_mindwire.github.client import CiState, ReviewEvent
 from spirrow_mindwire.magickit.gateway import MagickitChatroomGateway
+from spirrow_mindwire.naysayer.pr_review import PrReviewOutcome
 from spirrow_mindwire.ports import SpawnContext
 from spirrow_mindwire.ulid_util import new_ulid
 from spirrow_mindwire.value_objects import (
@@ -130,7 +132,11 @@ class _ScriptedDispatcher:
 
 
 def _conductor(
-    mcp: _FakeChatroomMcp, dispatcher: ConductorDispatcher, *, max_rounds: int = 40
+    mcp: _FakeChatroomMcp,
+    dispatcher: ConductorDispatcher,
+    *,
+    max_rounds: int = 40,
+    orchestrator: Any = None,
 ) -> Conductor:
     return Conductor(
         mcp=mcp,
@@ -139,7 +145,33 @@ def _conductor(
         roster=_ROSTER,
         naysayer_identity="Einstein",
         max_rounds=max_rounds,
+        orchestrator=orchestrator,
     )
+
+
+def _pr_outcome(verdict: ReviewEvent) -> PrReviewOutcome:
+    return PrReviewOutcome(
+        verdict=verdict, body="critique body", ci_state=CiState.SUCCESS, head_sha="abc123"
+    )
+
+
+class _ScriptedPrGate:
+    """A fake :class:`~spirrow_mindwire.conductor.core.PrGate`: returns scripted verdicts in order.
+
+    Records each fired pr_ref. With one verdict it repeats it; with several it pops one per call (so
+    an RC→fix→re-gate→APPROVE cycle can be scripted).
+    """
+
+    def __init__(self, *verdicts: ReviewEvent) -> None:
+        self._verdicts = list(verdicts)
+        self.fired: list[str] = []
+
+    async def fire_pr_review(
+        self, *, project: str, pr_ref: str
+    ) -> tuple[ThreadRef, PrReviewOutcome]:
+        self.fired.append(pr_ref)
+        verdict = self._verdicts.pop(0) if len(self._verdicts) > 1 else self._verdicts[0]
+        return _thread_ref(), _pr_outcome(verdict)
 
 
 # --------------------------------------------------------------------------- #
@@ -458,6 +490,80 @@ async def test_empty_human_identity_disables_human_carveout() -> None:
     ).run()
     assert disp.dispatches[0][0] is Role.NAYSAYER
     assert outcome.stop_reason is StopReason.HUMAN
+
+
+# --------------------------------------------------------------------------- #
+# PR-gate (PR-2b-2): NEXT: pr-review fires the Tier B review synchronously, routes by the verdict
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_pr_gate_approve_stops_at_human() -> None:
+    # NEXT: pr-review <ref> fires the gate; APPROVE → stop at the human (Tier-C merge). The verdict
+    # relay is posted under the reserved author, and the implementer is NOT dispatched.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()
+    assert gate.fired == ["acme/widgets#7"]
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches == []  # no implementer dispatch on APPROVE
+    assert mcp.posts[-1]["author"] == "pr-gate-relay"  # the verdict relay
+    assert "VERDICT: APPROVE" in mcp.posts[-1]["content"]
+
+
+@pytest.mark.anyio
+async def test_pr_gate_request_changes_dispatches_implementer_then_reapprove() -> None:
+    # REQUEST_CHANGES → the implementer is dispatched to fix (carve-out ②: verdict-driven, so
+    # guard (i) is never consulted and no design-time naysayer is forced). The implementer re-emits
+    # the pr-review sentinel; the second gate APPROVEs → stop at the human.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(ReviewEvent.REQUEST_CHANGES, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(
+        mcp, {Role.IMPLEMENTER: ["pushed a fix\n\nNEXT: pr-review acme/widgets#7"]}
+    )
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()
+    assert gate.fired == ["acme/widgets#7", "acme/widgets#7"]
+    assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]
+    assert outcome.forced_naysayer_turns == 0  # the PR-gate IS the naysayer; none forced
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_pr_gate_request_changes_without_implementer_routes_to_human() -> None:
+    # A roster with no single implementer persona cannot auto-dispatch the fix → a RC routes to the
+    # human (fail-safe) rather than guessing who fixes it.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(ReviewEvent.REQUEST_CHANGES)
+    disp = _ScriptedDispatcher(mcp, {})
+    conductor = Conductor(
+        mcp=mcp,
+        dispatcher=disp,
+        thread_ref=_thread_ref(),
+        roster={"Bohr": Role.PROPOSER, "Einstein": Role.NAYSAYER},  # no implementer
+        naysayer_identity="Einstein",
+        orchestrator=gate,
+    )
+    outcome = await conductor.run()
+    assert gate.fired == ["acme/widgets#7"]
+    assert disp.dispatches == []
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_pr_gate_sentinel_without_orchestrator_routes_to_human() -> None:
+    # Fail-safe: a pr-review sentinel with no orchestrator wired (PR-gate disabled) routes to the
+    # human rather than silently stranding — nothing is fired or relayed.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()  # orchestrator=None
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches == []
+    assert mcp.posts == []
 
 
 def test_ctor_rejects_bad_args() -> None:

@@ -48,6 +48,12 @@ _TRAILING_PUNCT = " \t.,;:!?、。）)"  # noqa: RUF001 (fullwidth/CJK punctuati
 HUMAN_TOKEN = "human"
 NONE_TOKEN = "none"
 
+# The PR-gate sentinel: ``NEXT: pr-review <owner/repo#n>`` fires the Tier B independent naysayer
+# review on the named PR (PR-2b-2). Unlike a persona handoff, the whole rest of the line is the PR
+# ref (it carries ``/`` and ``#``), so it is parsed off the RAW NEXT line before the name-split.
+PR_REVIEW_TOKEN = "pr-review"
+_PR_REVIEW_RE = re.compile(rf"^{PR_REVIEW_TOKEN}\s+(?P<ref>\S.*?)\s*$", re.IGNORECASE)
+
 
 class HandoffKind(StrEnum):
     """What a parsed ``NEXT:`` directive resolves to."""
@@ -55,6 +61,7 @@ class HandoffKind(StrEnum):
     ROLE = "role"  # a roster participant → dispatch that role's adapter
     HUMAN = "human"  # NEXT: human — a Tier-C decision point; the conductor stops
     NONE = "none"  # NEXT: none — the thread is settled; the conductor stops
+    PR_REVIEW = "pr_review"  # NEXT: pr-review <owner/repo#n> — fire the Tier B PR-gate (PR-2b-2)
     ABSENT = "absent"  # no parseable NEXT (missing / unknown participant) → human fallback (Obj3)
 
 
@@ -73,32 +80,54 @@ class Handoff:
     token: str | None = None
 
 
+def _last_next_raw(body: str) -> str | None:
+    """The raw text of the **last** ``NEXT:`` line (last wins; see module docstring), or ``None``.
+
+    The ``pr-review <ref>`` PR-gate sentinel needs the whole line (the ref carries ``/`` and ``#``),
+    so resolution works off this raw text and only name-splits for a persona handoff.
+    """
+    matches = _NEXT_LINE_RE.findall(body)
+    if not matches:
+        return None
+    return str(matches[-1]).strip()
+
+
+def _name_from_raw(raw: str) -> str | None:
+    """The persona name from a raw NEXT token (gloss + trailing punctuation stripped)."""
+    name = _NAME_SPLIT_RE.split(raw, maxsplit=1)[0].strip(_TRAILING_PUNCT)
+    return name or None
+
+
 def parse_next_token(body: str) -> str | None:
     """Return the participant name from the **last** ``NEXT:`` line, or ``None`` if there is none.
 
     The trailing parenthetical gloss many handoffs carry is stripped — only the leading name is
     returned (e.g. a name followed by a CJK or ASCII parenthetical gloss yields just the name).
     """
-    matches = _NEXT_LINE_RE.findall(body)
-    if not matches:
-        return None
-    raw = matches[-1].strip()
-    name = _NAME_SPLIT_RE.split(raw, maxsplit=1)[0].strip(_TRAILING_PUNCT)
-    return name or None
+    raw = _last_next_raw(body)
+    return _name_from_raw(raw) if raw is not None else None
 
 
 def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
     """Parse + resolve the latest ``NEXT:`` directive against the identity→role ``roster``.
 
-    Resolution order: the reserved ``human`` / ``none`` sentinels first, then the roster
-    (case-insensitive on the identity name). A missing ``NEXT:`` line, the empty token, or a name
-    that is not a known participant all resolve to :attr:`HandoffKind.ABSENT` — the conductor treats
-    every ABSENT as "route to human" (Obj3 / D-4) so a malformed handoff flags a human rather than
-    silently stranding the thread.
+    Resolution order: the ``pr-review <ref>`` PR-gate sentinel (PR-2b-2) first, then the reserved
+    ``human`` / ``none`` sentinels, then the roster (case-insensitive on the identity name). A
+    missing ``NEXT:`` line, the empty token, or a non-participant name all resolve to
+    :attr:`HandoffKind.ABSENT` — the conductor treats every ABSENT as "route to human" (Obj3 / D-4)
+    so a malformed handoff flags a human rather than silently stranding the thread.
     """
-    token = parse_next_token(body)
-    if token is None:
+    raw = _last_next_raw(body)
+    if raw is None:
         return Handoff(HandoffKind.ABSENT)
+    pr_review = _PR_REVIEW_RE.match(raw)
+    if pr_review is not None:
+        # NEXT: pr-review <owner/repo#n> — the whole ref is the token (not a leading name); the
+        # conductor validates it via parse_pr_ref and fires the synchronous Tier B review (PR-2b-2).
+        return Handoff(HandoffKind.PR_REVIEW, token=pr_review.group("ref"))
+    token = _name_from_raw(raw)
+    if token is None:
+        return Handoff(HandoffKind.ABSENT, token=raw)
     folded = token.casefold()
     if folded == HUMAN_TOKEN:
         return Handoff(HandoffKind.HUMAN, token=token)
@@ -148,9 +177,11 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "implementer is redirected to the human.)"
     ),
     Role.IMPLEMENTER: (
-        "As the implementer: after you carry out the agreed work, hand back to the proposer for a "
-        "spec-review of what you built (`NEXT: <proposer persona>`). For a Tier-C decision such as "
-        f"merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself."
+        "As the implementer: when you open or update a develop→main pull request, hand to the "
+        f"PR-gate — end your reply with `NEXT: {PR_REVIEW_TOKEN} <owner/repo#n>` (the PR ref) so "
+        "the independent naysayer review runs before any human merge. For other work, hand back "
+        "to the proposer for a spec-review (`NEXT: <proposer persona>`); for a Tier-C decision "
+        f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself."
     ),
     Role.NAYSAYER: (
         "As the naysayer: after your critique, hand back to the proposer if your objections need a "
@@ -192,6 +223,7 @@ def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | 
 __all__ = [
     "HUMAN_TOKEN",
     "NONE_TOKEN",
+    "PR_REVIEW_TOKEN",
     "Handoff",
     "HandoffKind",
     "build_handoff_protocol_block",

@@ -49,6 +49,37 @@ def test_parse_none_when_absent() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# resolve_handoff — PR-gate sentinel (PR-2b-2)
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_pr_review_sentinel() -> None:
+    h = resolve_handoff("opened the PR\n\nNEXT: pr-review acme/widgets#7", _ROSTER)
+    assert h.kind is HandoffKind.PR_REVIEW
+    assert h.token == "acme/widgets#7"  # the whole ref, not just a leading name
+
+
+def test_resolve_pr_review_case_insensitive_and_strips_surrounding_space() -> None:
+    h = resolve_handoff("x\n\nNEXT:  PR-Review   owner/repo#42  ", _ROSTER)
+    assert h.kind is HandoffKind.PR_REVIEW
+    assert h.token == "owner/repo#42"
+
+
+def test_resolve_pr_review_accepts_a_url_ref() -> None:
+    url = "https://github.com/acme/widgets/pull/7"
+    h = resolve_handoff(f"done\n\nNEXT: pr-review {url}", _ROSTER)
+    assert h.kind is HandoffKind.PR_REVIEW
+    assert h.token == url
+
+
+def test_resolve_bare_pr_review_without_ref_falls_through_to_absent() -> None:
+    # "pr-review" with no ref is not the PR-gate sentinel (the regex needs a ref); it falls through
+    # to a roster lookup, which fails → ABSENT (route to human), not a half-formed gate fire.
+    h = resolve_handoff("oops\n\nNEXT: pr-review", _ROSTER)
+    assert h.kind is HandoffKind.ABSENT
+
+
+# --------------------------------------------------------------------------- #
 # resolve_handoff
 # --------------------------------------------------------------------------- #
 

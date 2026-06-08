@@ -436,6 +436,7 @@ def build_conductor(
     proposer: RoleAdapter | None = None,
     implementer: RoleAdapter | None = None,
     naysayer: RoleAdapter | None = None,
+    pr_review_driver: NaysayerPrReviewDriver | None = None,
 ) -> Stage3Conductor:
     """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
 
@@ -473,6 +474,12 @@ def build_conductor(
     mcp, registry, dispatcher = _build_dispatcher(
         settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer
     )
+    if pr_review_driver is None:
+        pr_review_driver = build_pr_review_driver()
+    # PR-gate (PR-2b-2): the conductor fires the Tier B independent naysayer review synchronously on
+    # a ``NEXT: pr-review <ref>`` via this orchestrator (the same one build_loop wires for the
+    # watcher path) — driver-化 unify, ADR-19 N-1; no parallel watcher is added.
+    orchestrator = PrReviewOrchestrator(mcp, driver=pr_review_driver)
     thread_ref = _thread_ref(loop_cfg.project, cond_cfg.task_thread_id)
     try:
         conductor = Conductor(
@@ -482,6 +489,7 @@ def build_conductor(
             roster=dict(cond_cfg.roster),
             naysayer_identity=cond_cfg.naysayer_identity,
             max_rounds=cond_cfg.max_rounds,
+            orchestrator=orchestrator,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc

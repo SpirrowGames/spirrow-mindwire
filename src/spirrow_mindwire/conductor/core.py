@@ -51,8 +51,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
+from ..github.client import ReviewEvent
 from ..magickit.client import McpToolCaller
 from ..value_objects import (
     ChatroomEvent,
@@ -63,6 +64,9 @@ from ..value_objects import (
     ThreadRef,
 )
 from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, resolve_handoff
+
+if TYPE_CHECKING:
+    from ..naysayer.pr_review import PrReviewOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +84,27 @@ class ConductorDispatcher(Protocol):
     ) -> SessionHandle: ...
 
     async def dispatch(self, handle: SessionHandle, event: ChatroomEvent) -> None: ...
+
+
+class PrGate(Protocol):
+    """The orchestrator slice the conductor fires for the Tier B PR-gate (PR-2b-2).
+
+    The real :class:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator` satisfies this
+    structurally; tests inject a fake. ``fire_pr_review`` runs the review synchronously
+    (CI-gate → Gemini judge → GitHub submit) and posts its critique to the ``T-pr-review-<n>``
+    thread; the conductor routes by the returned verdict.
+    """
+
+    async def fire_pr_review(
+        self, *, project: str, pr_ref: str
+    ) -> tuple[ThreadRef, PrReviewOutcome]: ...
+
+
+# The conductor authors its PR-gate verdict relay under this reserved name when it posts the Tier B
+# outcome back into the design thread (PR-2b-2). It is informational only — the conductor routes by
+# the deterministic fire_pr_review *verdict*, never by re-parsing this relay — so it is NOT a trust
+# marker: the gate trusts the driver outcome, not any author (msg-552/557).
+_PR_GATE_RELAY_AUTHOR = "pr-gate-relay"
 
 
 class StopReason(StrEnum):
@@ -118,6 +143,8 @@ class Conductor:
         naysayer_role: Role = Role.NAYSAYER,
         implementer_role: Role = Role.IMPLEMENTER,
         human_identity: str = HUMAN_TOKEN,
+        orchestrator: PrGate | None = None,
+        implementer_identity: str = "",
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -142,6 +169,21 @@ class Conductor:
         # value disables the carve-out (fail-safe — every design→implement handoff hard-rejects).
         self._implementer_role = implementer_role
         self._human_identity = human_identity
+        # PR-gate (PR-2b-2): the orchestrator that fires the Tier B independent naysayer review on a
+        # ``NEXT: pr-review <ref>``, and the implementer dispatched to fix a REQUEST_CHANGES. A
+        # ``None`` orchestrator / a roster without exactly one implementer disables the gate path
+        # (a pr-review sentinel then routes to the human, fail-safe).
+        self._orchestrator = orchestrator
+        self._implementer_identity = implementer_identity or self._derive_implementer_identity()
+
+    def _derive_implementer_identity(self) -> str:
+        """The roster persona filling the implementer role, or "" if there is not exactly one.
+
+        Used for the PR-gate RC→fix dispatch (PR-2b-2). With zero or several implementer personas a
+        PR-gate REQUEST_CHANGES routes to the human instead of guessing (fail-safe).
+        """
+        matches = [name for name, role in self._roster.items() if role is self._implementer_role]
+        return matches[0] if len(matches) == 1 else ""
 
     async def run(self) -> ConductorOutcome:
         """Drive the thread turn-by-turn until a stop condition; return the outcome.
@@ -172,6 +214,31 @@ class Conductor:
                 return self._stop(round_index, StopReason.NO_PROGRESS, latest_msg_id, forced)
 
             handoff = resolve_handoff(_content(latest), self._roster)
+
+            # PR-gate (PR-2b-2): ``NEXT: pr-review <ref>`` fires the Tier B independent naysayer
+            # review synchronously (ADR-19 N-1) and routes by the *verdict* — not by any parsed NEXT
+            # line — so the gate trusts the deterministic driver outcome, not an author (msg-557).
+            # APPROVE / COMMENT → stop at the human (Tier-C merge; the daemon never merges, D-5).
+            # REQUEST_CHANGES → dispatch the implementer to fix (carve-out ②: verdict-driven, so
+            # guard (i) is never consulted). No orchestrator / no implementer persona → human.
+            if handoff.kind is HandoffKind.PR_REVIEW:
+                if self._orchestrator is None or not handoff.token:
+                    return self._stop(round_index, StopReason.HUMAN, latest_msg_id, forced)
+                verdict, relay_msg_id = await self._fire_pr_gate(handoff.token)
+                if verdict is not ReviewEvent.REQUEST_CHANGES or not self._implementer_identity:
+                    return self._stop(round_index, StopReason.HUMAN, relay_msg_id, forced)
+                handle = sessions.get(self._implementer_identity)
+                if handle is None:
+                    handle = await self._dispatcher.spawn_instance(
+                        self._thread_ref, self._implementer_role, self._implementer_identity
+                    )
+                    sessions[self._implementer_identity] = handle
+                await self._dispatcher.dispatch(handle, self._to_event(latest))
+                # Track the relay, not the pr-review msg: a silent implementer leaves the relay as
+                # the next latest, so the no-progress guard stops (the relay is never re-routed).
+                processed_msg_id = relay_msg_id
+                continue
+
             target_role, target_identity, is_forced, stop_reason = self._route(handoff, messages)
             if target_role is None:
                 assert stop_reason is not None  # _route always sets a reason when it stops
@@ -307,6 +374,52 @@ class Conductor:
         messages = result.get("messages", []) if isinstance(result, dict) else []
         return [m for m in messages if isinstance(m, dict)]
 
+    async def _fire_pr_gate(self, pr_ref: str) -> tuple[ReviewEvent, str | None]:
+        """Fire the Tier B naysayer review on ``pr_ref`` and relay its verdict (PR-2b-2).
+
+        Synchronous (ADR-19 N-1): the orchestrator runs the CI-gate + Gemini judge + GitHub submit
+        and posts its critique to the ``T-pr-review-<n>`` thread; here the conductor relays the
+        verdict (with the critique body, so the implementer has its fix context) into the design
+        thread. Returns the verdict and the relay msg id (for no-progress tracking).
+        """
+        assert self._orchestrator is not None
+        _thread_ref, outcome = await self._orchestrator.fire_pr_review(
+            project=self._thread_ref.project_id, pr_ref=pr_ref
+        )
+        relay_msg_id = await self._post_pr_relay(pr_ref, outcome)
+        return outcome.verdict, relay_msg_id
+
+    async def _post_pr_relay(self, pr_ref: str, outcome: PrReviewOutcome) -> str | None:
+        """Post the PR-gate verdict (+ critique body) into the design thread as the relay author.
+
+        Informational only — the conductor has already chosen the route from ``outcome.verdict``;
+        this post is the human-readable record and the implementer's fix context on a RC. Its
+        ``NEXT:`` line mirrors the chosen route for readability but is never re-parsed by the
+        conductor (no author is trusted; msg-557).
+        """
+        nxt = (
+            self._implementer_identity
+            if outcome.verdict is ReviewEvent.REQUEST_CHANGES and self._implementer_identity
+            else HUMAN_TOKEN
+        )
+        body = (
+            f"PR-gate (Tier B independent naysayer) — {pr_ref}\n\n"
+            f"VERDICT: {outcome.verdict.value} (ci={outcome.ci_state.value})\n\n"
+            f"{outcome.body}\n\n"
+            f"NEXT: {nxt}"
+        )
+        result = await self._mcp.call_tool(
+            "chatroom_post_message",
+            {
+                "project": self._thread_ref.project_id,
+                "thread_id": self._thread_ref.thread_id,
+                "msg_type": "report",
+                "author": _PR_GATE_RELAY_AUTHOR,
+                "content": body,
+            },
+        )
+        return _extract_relay_msg_id(result)
+
     def _to_event(self, msg: dict[str, Any]) -> ChatroomEvent:
         msg_id = _msg_id(msg)
         return ChatroomEvent(
@@ -336,6 +449,15 @@ class Conductor:
         return ConductorOutcome(
             rounds=rounds, stop_reason=reason, last_msg_id=last_msg_id, forced_naysayer_turns=forced
         )
+
+
+def _extract_relay_msg_id(result: Any) -> str | None:
+    """The msg_id of the conductor's own ``chatroom_post_message`` relay result, or ``None``."""
+    if isinstance(result, dict):
+        msg = result.get("msg")
+        if isinstance(msg, dict) and msg.get("msg_id"):
+            return str(msg["msg_id"])
+    return None
 
 
 def _msg_id(msg: dict[str, Any]) -> str:
