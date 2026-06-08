@@ -315,6 +315,40 @@ class Stage3LoopConfig(_StrictModel):
     watches: tuple[LoopWatchConfig, ...] = ()
 
 
+class ConductorConfig(_StrictModel):
+    """NEXT-driven design-loop conductor (``mindwire-loop --mode conductor``) settings.
+
+    The conductor (``T-cross-thread-relay-conductor`` Tier-C decide msg-523) drives **one** design
+    task thread serially: it reads the latest message's ``NEXT: <participant>`` handoff and
+    dispatches exactly that one participant, replacing the design-loop ``ChatroomWatcher``
+    auto-reply intake (Obj1). The adapters, inference endpoints, ``project`` and ``repo_dir`` are
+    shared with :class:`Stage3LoopConfig` (``[loop]``) — this block only adds the conductor knobs:
+
+    - ``task_thread_id`` — the single design thread the conductor drives (1 task = 1 thread).
+    - ``roster`` — the chatroom identity→role map (e.g. ``{"Bohr": "proposer", ...}``). The
+      ``NEXT:`` vocabulary is the persona name, and the conductor authors each reply under that
+      name; the reserved ``human`` / ``none`` sentinels are not roster entries.
+    - ``naysayer_identity`` — the roster persona that fills the independent naysayer slot; Obj2's
+      forced-consultation recognises a naysayer turn by this mapping, so it **must** map to the
+      naysayer role in ``roster`` (the :class:`~spirrow_mindwire.conductor.core.Conductor` ctor
+      enforces this fail-loud — Tier B msg-529).
+
+    All three required fields default empty and are validated at **daemon startup** (not load time,
+    mirroring :attr:`Stage3LoopConfig.repo_dir`) so a process that only reads other settings is
+    unaffected.
+    """
+
+    task_thread_id: str = ""
+    roster: dict[str, Role] = Field(default_factory=dict)
+    naysayer_identity: str = ""
+    max_rounds: int = Field(default=40, ge=1)
+    """Runaway backstop: the maximum number of serial turns before the conductor stops.
+
+    Mirrors the :class:`~spirrow_mindwire.conductor.core.Conductor` default (40); a turn that does
+    not converge to ``NEXT: human`` / ``none`` within this many rounds stops at the round cap.
+    """
+
+
 class MindwireSettings(BaseSettings):
     """Top-level MindWire configuration.
 
@@ -336,6 +370,7 @@ class MindwireSettings(BaseSettings):
     phanthand: PhanthandConfig = Field(default_factory=PhanthandConfig)
     mcp_server: MCPServerConfig = Field(default_factory=MCPServerConfig)
     loop: Stage3LoopConfig = Field(default_factory=Stage3LoopConfig)
+    conductor: ConductorConfig = Field(default_factory=ConductorConfig)
 
     @field_validator("schema_version")
     @classmethod
@@ -412,6 +447,7 @@ __all__ = [
     "CONFIG_SCHEMA_VERSION",
     "DEFAULT_DATA_DIR",
     "ClaudeCodeConfig",
+    "ConductorConfig",
     "ExtraMCPServerConfig",
     "LoggingConfig",
     "LoopWatchConfig",

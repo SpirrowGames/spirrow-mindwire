@@ -272,6 +272,55 @@ async def test_dispatch_unknown_handle_raises() -> None:
         await disp.dispatch(stray, _event())
 
 
+class _HaltTrackingAdapter(_ReplyingAdapter):
+    """Replying adapter that records the handles ``halt`` was called with."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.halted: list[str] = []
+
+    async def halt(self, handle: SessionHandle, *, grace: timedelta = timedelta(seconds=5)) -> None:
+        self.halted.append(handle.instance_id)
+
+
+@pytest.mark.anyio
+async def test_aclose_halts_all_spawned_sessions() -> None:
+    # The conductor spawns sessions directly through the dispatcher (no watcher records the
+    # handles), so dispatcher.aclose() is what tears them down on daemon shutdown — symmetric with
+    # ChatroomWatcher.stop(). It must halt every spawned session and be idempotent.
+    adapter = _HaltTrackingAdapter()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=_FakeGateway())
+    h1 = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    h2 = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-2")
+    await disp.aclose()
+    assert sorted(adapter.halted) == ["proposer-1", "proposer-2"]
+    # Sessions were cleared: a dispatch to a now-closed handle is an unknown session.
+    with pytest.raises(UnknownSessionError):
+        await disp.dispatch(h1, _event())
+    # Idempotent: a second aclose halts nothing more and does not raise.
+    await disp.aclose()
+    assert sorted(adapter.halted) == ["proposer-1", "proposer-2"]
+    assert h2.instance_id == "proposer-2"  # (handle retained for clarity; nothing left to halt)
+
+
+@pytest.mark.anyio
+async def test_aclose_continues_past_a_failing_halt() -> None:
+    # A failing halt is logged and the rest still run (best-effort, like watcher.stop()).
+    class _BadHalt(_HaltTrackingAdapter):
+        async def halt(
+            self, handle: SessionHandle, *, grace: timedelta = timedelta(seconds=5)
+        ) -> None:
+            self.halted.append(handle.instance_id)
+            raise RuntimeError("halt boom")
+
+    adapter = _BadHalt()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=_FakeGateway())
+    await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-2")
+    await disp.aclose()  # must not raise despite both halts failing
+    assert sorted(adapter.halted) == ["proposer-1", "proposer-2"]
+
+
 # ----- live T11 ↔ T13 cross-check (real ClaudeCodeSdkAdapter) -----------------
 
 

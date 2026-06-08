@@ -150,6 +150,22 @@ class Dispatcher:
             raise UnknownSessionError(handle.session_id)
         await session.adapter.halt(handle)
 
+    async def aclose(self) -> None:
+        """Halt every spawned session (best-effort), symmetric with ``ChatroomWatcher.stop()``.
+
+        The watcher records its handles and halts them in ``stop()``; the conductor instead spawns
+        sessions directly through this dispatcher (no watcher records the handles), so the conductor
+        daemon teardown calls this to halt the adapter sessions — e.g. the Claude SDK subprocess —
+        so they disconnect cleanly and don't leak transports at interpreter exit. Halt is idempotent
+        (I8); a failing halt is logged and the rest still run. Safe to call when no session is open.
+        """
+        for handle in list(self._sessions):
+            try:
+                await self.halt(handle)
+            except Exception:
+                logger.exception("halt failed during dispatcher aclose; continuing")
+        self._sessions.clear()
+
     async def _handle_reply(self, session: _DispatchSession, draft: ReplyDraft) -> None:
         # Runs inside the adapter's deliver_event (under the session lock) per
         # the SpawnContext.on_reply contract, so reply_seq increments are

@@ -28,15 +28,25 @@ from typing import Any
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
+from spirrow_mindwire import loop_runner
 from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkAdapter
 from spirrow_mindwire.adapters.implementer import ImplementerSdkAdapter
 from spirrow_mindwire.adapters.naysayer_sdk import NaysayerSdkAdapter
-from spirrow_mindwire.config import LoopWatchConfig, MindwireSettings, Stage3LoopConfig
+from spirrow_mindwire.conductor import StopReason
+from spirrow_mindwire.config import (
+    ConductorConfig,
+    LoopWatchConfig,
+    MindwireSettings,
+    Stage3LoopConfig,
+)
 from spirrow_mindwire.loop_runner import (
+    Stage3Conductor,
     Stage3ProposerAdapter,
+    build_conductor,
     build_loop,
     build_registry,
     build_watches,
+    run_conductor,
 )
 from spirrow_mindwire.magickit.watcher import WatchSpec
 from spirrow_mindwire.naysayer.pr_review import NaysayerPrReviewDriver
@@ -46,6 +56,7 @@ from spirrow_mindwire.value_objects import (
     Capability,
     ChatroomEvent,
     HealthStatus,
+    ReplyDraft,
     Role,
     SessionHandle,
     SessionState,
@@ -160,6 +171,10 @@ class _StubAdapter:
         return HealthStatus(
             state=SessionState.IDLE, last_active_at=datetime.now(UTC), error=None, details={}
         )
+
+
+def _proposer_caps() -> frozenset[Capability]:
+    return frozenset({Capability.READ_THREAD, Capability.POST_REPLY})
 
 
 def _exec_caps() -> frozenset[Capability]:
@@ -411,3 +426,239 @@ async def test_loop_aclose_closes_pr_review_driver(tmp_path: Path) -> None:
     )
     await loop.aclose()  # watcher.stop() + orchestrator.aclose() → driver.aclose()
     assert lexora.closed and github.closed
+
+
+# --------------------------------------------------------------------------- #
+# PR-2a: conductor mode (mindwire-loop --mode conductor, Tier-C decide msg-523)
+# --------------------------------------------------------------------------- #
+
+_CONDUCTOR_ROSTER = {
+    "Bohr": Role.PROPOSER,
+    "Heisenberg": Role.IMPLEMENTER,
+    "Einstein": Role.NAYSAYER,
+}
+
+
+def _conductor_settings(
+    tmp_path: Path | None = None,
+    *,
+    task_thread_id: str = "T-cond",
+    roster: dict[str, Role] | None = None,
+    naysayer_identity: str = "Einstein",
+    max_rounds: int = 40,
+) -> MindwireSettings:
+    return MindwireSettings(
+        loop=Stage3LoopConfig(repo_dir=tmp_path),
+        conductor=ConductorConfig(
+            task_thread_id=task_thread_id,
+            roster=_CONDUCTOR_ROSTER if roster is None else roster,
+            naysayer_identity=naysayer_identity,
+            max_rounds=max_rounds,
+        ),
+    )
+
+
+class _ScriptedReplyAdapter:
+    """RoleAdapter that emits scripted replies (each ending with a ``NEXT:`` line) + tracks halt."""
+
+    def __init__(
+        self, adapter_id: str, capabilities: frozenset[Capability], replies: list[str]
+    ) -> None:
+        self.adapter_id = adapter_id
+        self.capabilities = capabilities
+        self._replies = list(replies)
+        self._ctx: SpawnContext | None = None
+        self.halted = False
+
+    async def spawn(self, thread_ref: ThreadRef, role: Role, ctx: SpawnContext) -> SessionHandle:
+        self._ctx = ctx
+        return SessionHandle(
+            session_id=new_ulid(),
+            instance_id=ctx.own_instance_id,
+            adapter_id=self.adapter_id,
+            thread_ref=thread_ref,
+            role=role,
+            started_at=datetime.now(UTC),
+        )
+
+    async def deliver_event(self, handle: SessionHandle, event: ChatroomEvent) -> None:
+        if event.payload.author == handle.instance_id or not self._replies:
+            return
+        assert self._ctx is not None
+        await self._ctx.on_reply(
+            ReplyDraft(
+                body=self._replies.pop(0), reply_to_msg_id=event.payload.msg_id, adapter_metadata={}
+            )
+        )
+
+    async def halt(self, handle: SessionHandle, *, grace: timedelta = timedelta(seconds=5)) -> None:
+        self.halted = True
+
+    async def health(self, handle: SessionHandle) -> HealthStatus:
+        return HealthStatus(
+            state=SessionState.IDLE, last_active_at=datetime.now(UTC), error=None, details={}
+        )
+
+
+def test_build_conductor_wires_conductor_from_config(tmp_path: Path) -> None:
+    # Injected adapters skip repo_dir; the conductor is wired over [conductor].task_thread_id with
+    # the same registry→dispatcher core as build_loop (role resolution holds).
+    proposer = _StubAdapter("fake-proposer", _proposer_caps())
+    implementer = _StubAdapter("fake-implementer", _exec_caps())
+    naysayer = _StubAdapter("fake-naysayer", _naysayer_caps())
+    cond = build_conductor(
+        _conductor_settings(),
+        mcp=_FakeMcp(_FakeChatroom()),
+        proposer=proposer,
+        implementer=implementer,
+        naysayer=naysayer,
+    )
+    assert isinstance(cond, Stage3Conductor)
+    assert cond.registry.qualified_for(Role.IMPLEMENTER)[0] is implementer
+    assert cond.registry.qualified_for(Role.NAYSAYER) == [naysayer]
+
+
+def test_build_conductor_requires_task_thread_id(tmp_path: Path) -> None:
+    proposer, implementer, naysayer = _real_adapters(tmp_path)
+    with pytest.raises(SystemExit, match="task_thread_id"):
+        build_conductor(
+            _conductor_settings(task_thread_id="  "),
+            mcp=_FakeMcp(_FakeChatroom()),
+            proposer=proposer,
+            implementer=implementer,
+            naysayer=naysayer,
+        )
+
+
+def test_build_conductor_requires_roster(tmp_path: Path) -> None:
+    proposer, implementer, naysayer = _real_adapters(tmp_path)
+    with pytest.raises(SystemExit, match="roster"):
+        build_conductor(
+            _conductor_settings(roster={}),
+            mcp=_FakeMcp(_FakeChatroom()),
+            proposer=proposer,
+            implementer=implementer,
+            naysayer=naysayer,
+        )
+
+
+def test_build_conductor_requires_naysayer_identity(tmp_path: Path) -> None:
+    proposer, implementer, naysayer = _real_adapters(tmp_path)
+    with pytest.raises(SystemExit, match="naysayer_identity"):
+        build_conductor(
+            _conductor_settings(naysayer_identity=""),
+            mcp=_FakeMcp(_FakeChatroom()),
+            proposer=proposer,
+            implementer=implementer,
+            naysayer=naysayer,
+        )
+
+
+def test_build_conductor_rejects_naysayer_identity_not_mapping_to_naysayer_role(
+    tmp_path: Path,
+) -> None:
+    # The Conductor ctor's fail-loud invariant (Tier B msg-529) surfaces as a friendly SystemExit
+    # at daemon startup rather than a raw ValueError.
+    proposer, implementer, naysayer = _real_adapters(tmp_path)
+    with pytest.raises(SystemExit, match="misconfigured"):
+        build_conductor(
+            _conductor_settings(naysayer_identity="Bohr"),  # Bohr maps to PROPOSER, not NAYSAYER
+            mcp=_FakeMcp(_FakeChatroom()),
+            proposer=proposer,
+            implementer=implementer,
+            naysayer=naysayer,
+        )
+
+
+def test_build_conductor_requires_repo_dir_when_building_adapters() -> None:
+    # No adapters injected + loop.repo_dir unset → fail loud (same guard as build_loop).
+    settings = _conductor_settings(tmp_path=None)
+    with pytest.raises(SystemExit, match="repo_dir"):
+        build_conductor(settings, mcp=_FakeMcp(_FakeChatroom()))
+
+
+@pytest.mark.anyio
+async def test_run_conductor_drives_round_trip_and_closes_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # End-to-end over a fake chatroom: a proposer NEXT:Einstein → the naysayer replies NEXT:human →
+    # the conductor stops at HUMAN; run_conductor then aclose()s, halting the spawned session.
+    chatroom = _FakeChatroom()
+    chatroom.post(author="Bohr", content="design proposal\n\nNEXT: Einstein")
+    mcp = _FakeMcp(chatroom)
+    proposer = _StubAdapter("fake-proposer", _proposer_caps())
+    implementer = _StubAdapter("fake-implementer", _exec_caps())
+    naysayer = _ScriptedReplyAdapter(
+        "fake-naysayer", _naysayer_caps(), ["independent critique\n\nNEXT: human"]
+    )
+
+    # run_conductor calls build_conductor(settings) with no injection; patch it to inject our fakes.
+    real_build = loop_runner.build_conductor
+
+    def _build(settings: MindwireSettings) -> Stage3Conductor:
+        return real_build(
+            settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer
+        )
+
+    monkeypatch.setattr(loop_runner, "build_conductor", _build)
+    outcome = await run_conductor(_conductor_settings())
+
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.forced_naysayer_turns == 0  # NEXT named Einstein explicitly
+    assert chatroom.authors() == ["Bohr", "Einstein"]  # naysayer posted under its persona name
+    assert naysayer.halted  # aclose() in run_conductor's finally halted the spawned session
+
+
+@pytest.mark.anyio
+async def test_run_conductor_closes_sessions_even_when_run_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The aclose() teardown runs in finally even if the drive loop raises (no session leak).
+    closed = False
+
+    class _BoomConductor:
+        async def run(self) -> None:
+            raise RuntimeError("drive boom")
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr(loop_runner, "build_conductor", lambda _s: _BoomConductor())
+    with pytest.raises(RuntimeError, match="drive boom"):
+        await run_conductor(_conductor_settings())
+    assert closed
+
+
+def test_main_routes_to_conductor_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+        calls.append("conductor")
+
+    async def _fake_run_loop(_settings: MindwireSettings) -> None:
+        calls.append("watcher")
+
+    monkeypatch.setattr(loop_runner, "run_conductor", _fake_run_conductor)
+    monkeypatch.setattr(loop_runner, "run_loop", _fake_run_loop)
+    monkeypatch.setattr(loop_runner, "load_settings", lambda: MindwireSettings())
+    monkeypatch.setattr("sys.argv", ["mindwire-loop", "--mode", "conductor"])
+    loop_runner.main()
+    assert calls == ["conductor"]
+
+
+def test_main_defaults_to_watcher_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+        calls.append("conductor")
+
+    async def _fake_run_loop(_settings: MindwireSettings) -> None:
+        calls.append("watcher")
+
+    monkeypatch.setattr(loop_runner, "run_conductor", _fake_run_conductor)
+    monkeypatch.setattr(loop_runner, "run_loop", _fake_run_loop)
+    monkeypatch.setattr(loop_runner, "load_settings", lambda: MindwireSettings())
+    monkeypatch.setattr("sys.argv", ["mindwire-loop"])
+    loop_runner.main()
+    assert calls == ["watcher"]  # backward-compatible default
