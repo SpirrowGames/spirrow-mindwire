@@ -212,6 +212,7 @@ Claude.ai 側が新規 thread を開いて Claude Code に返答してもらう�
 | Command | 役割 | 配備 layer |
 |---|---|---|
 | `mindwire-watcher` | thread directory 監視 + Claude Code SDK 起動 daemon | host daemon |
+| `mindwire-loop` | Stage 3 trilateral ループ daemon — `--mode` で standing auto-reply watcher か、 NEXT 駆動の設計 **conductor** (1 つの設計 thread を読み、 各 `NEXT:` 指名 role を逐次 dispatch) を選択 | host daemon |
 | `mindwire-mcp-server` | Claude.ai 側 connector からの write+read API (HTTP MCP、 :7400) | host daemon |
 | `mindwire-mcp` | Claude Code session に in-process 注入される read-only stub | per-session |
 | `mindwire-migrate-v1-to-v2` | thread schema 移行 CLI (atomic / idempotent / pre-flight / dry-run) | one-shot |
@@ -228,6 +229,8 @@ Claude.ai 側が新規 thread を開いて Claude Code に返答してもらう�
 | [`docs/feature-3-design.md`](docs/feature-3-design.md) | Feature 3-A: schema v2 + write MCP server + race monitoring + read tools |
 | [`docs/dogfooding.md`](docs/dogfooding.md) | operator runbook (setup / API key persistence / triage flow / connector rename) |
 | [`docs/logging-design.md`](docs/logging-design.md) | `events.jsonl` の event 型 + audit trail 設計 |
+| [`docs/chain-merge-pattern.md`](docs/chain-merge-pattern.md) | sub-PR chain-merge の contract integration checklist (汎用メタプロセス) |
+| [`spec/NAYSAYER_PRINCIPLES.md`](spec/NAYSAYER_PRINCIPLES.md) | naysayer が review する canonical・versioned な 5 原則 (SOT) |
 
 ---
 
@@ -237,7 +240,13 @@ Claude.ai 側が新規 thread を開いて Claude Code に返答してもらう�
 - 🚧 **Phase 1** (Feature 3-A、 進行中): schema v2 + write MCP server (`mindwire-mcp-server`) + race-gap monitoring + claude.ai-participant read tools + API key 永続化 recipe
 - 📋 **Phase 2+** (未着手): `events.jsonl` 一次依存 tooling (CLI / dashboard / replay)、 cross-host distribution、 multi-tenant 分離
 
-並行して、 本システムは現在 **自律 trilateral 開発ループ (Stage 3) として dogfood 中**: watcher が implementer SDK adapter を駆動し、 Tier A/B/C action classifier + default-deny allow-list (= **loop-level の main-merge guard** — direct / wrapped / MCP の各形態を deny。  無料プランで branch protection が使えないため) で守る。 naysayer は別 identity・別モデルファミリー (Gemini via spirrow-lexora) で GitHub 上の PR を review する。 ADR-2026-05-23-07 (Stage 3 autonomy gating) / ADR-2026-05-31-14/15 (naysayer 配置) 参照。
+並行して、 本システムは現在 **自律 trilateral 開発ループ (Stage 3) として dogfood 中**で、 ループは end-to-end で配線済み:
+
+- **NEXT 駆動の conductor** (`mindwire-loop --mode conductor`) が 1 つの設計 thread を読み、 毎ターン唯一の `NEXT:` 指名 role を逐次 dispatch し、 proposer → implementer → naysayer を人間の中継なしで連鎖する;
+- **implementer SDK adapter** は Tier A/B/C action classifier + default-deny allow-list (= **loop-level の main-merge guard** — direct / wrapped / MCP の各形態を deny。 無料プランで branch protection が使えないため) で守られ、 いまや実 Claude Agent SDK を end-to-end で駆動する: read・edit・gate 実行・commit を自律で行う (tool 配線修正、 ADR-2026-05-23-07 / T37);
+- **naysayer** は _別の_ モデルファミリー (Gemini via spirrow-lexora) の独立ループ agent で、 GitHub 上の PR を別 identity から review (APPROVE / REQUEST_CHANGES) する。
+
+保護された `main` への merge は自動化されない — human (Tier C) の判断のまま。 ADR-2026-05-23-07 (Stage 3 autonomy gating) / ADR-2026-05-31-14/15 (naysayer 配置) / ADR-2026-06-04-19 (naysayer driver-unify) 参照。
 
 詳細な phase 区分は [`docs/feature-3-design.md`](docs/feature-3-design.md) を参照。
 
@@ -251,7 +260,9 @@ Claude.ai 側が新規 thread を開いて Claude Code に返答してもらう�
 
 - **proposer** — 設計提案・review pass・spec authorship・decide
 - **implementer** — implementation、 commit、 CI 連携、 PR 起票
-- **naysayer** — independent な contrarian 5 原則 review (YAGNI/OverScope / ハイブリッド・二重管理複雑性 / 反対のための反対をしない / 賛成すべきは明示賛成 / 沈黙は怠慢)
+- **naysayer** — independent な adversarial 5 原則 review (YAGNI/OverScope / ハイブリッド・二重管理複雑性 / 反対のための反対をしない / 賛成すべきは明示賛成 / 沈黙は怠慢)。 canonical・versioned な定義は [`spec/NAYSAYER_PRINCIPLES.md`](spec/NAYSAYER_PRINCIPLES.md) (この一覧は要約で、 spec が SOT — ADR-2026-06-03-17)。 PR-gate に加え、 naysayer は **設計時** にも参加する: 通常ループで動くのと同じ独立 agent (`NaysayerSdkAdapter`) として設計 thread に召喚される (ADR-2026-06-04-19; 旧 `scripts/design_review.py` relay は撤去済)。
+
+これら 3 役割は **NEXT 駆動の conductor** (`mindwire-loop --mode conductor`) が自動で連鎖する: 各 reply は末尾に `NEXT: <role>` ハンドオフ行を置き、 conductor はその 1 participant だけを次に dispatch する。 ハンドオフは構造的にガードされており、 design→implementation のハンドオフは human Tier-C 判断へリダイレクトされる — つまり設計は、 独立 naysayer review と human の承認を先に通さない限り implementer に届かない (ADR-2026-06-03-17)。
 
 3 役割は **「2 協調 1 独立」配置** (ADR-2026-05-31-15) で動く: proposer と implementer は同一モデルファミリー (Claude Code) を共有して協調速度を取り、 **naysayer は _別の_ モデルファミリー (Gemini、 [spirrow-lexora](https://github.com/SpirrowGames/spirrow-lexora) 経由)** で最大の独立性を取る。 さらに naysayer は GitHub 上で PR を review (APPROVE / REQUEST_CHANGES) し、 _別 identity_ から行う (author ≠ approver)。 (以前は naysayer も 2 つ目の isolated な Claude.ai session だったが、 別モデルファミリーへの移行は T15 ピボット — ADR-2026-05-31-14 参照。)
 
