@@ -106,14 +106,12 @@ FORBIDDEN (Tier C — never attempt; they will be denied and halt you): merging 
 to or pushing to main, force-push, history rewrite (rebase / reset --hard / \
 filter-branch), deleting files, writing to Drive, any external publish/post/send.
 
-GATE (run before every commit; never commit on a red gate): ensure the \
-repository's test gate passes. If the repo provides a gate entrypoint, that IS \
-the gate — for the voxel C++ repo run `pwsh -File Tools/voxel-gate/voxel-gate.ps1` \
-(exit 0 = green, non-zero = red; it builds VoxelCore and runs the GoogleTest suite). \
-Otherwise run the project's standard checks — for a Python repo, ruff check + \
-ruff format --check + mypy + pytest (via `uv run`). A red gate blocks the commit: \
-fix the cause, never commit around it. (T1 voxel gate covers VoxelCore logic only, \
-not the Unreal/UBT build — flag UE-module changes for separate human verification.)
+GATE (run before every commit; never commit on a red gate): run the \
+repository's own gate and ensure it passes. Discover it from the repo — do NOT \
+assume a toolchain or hard-code paths: if a `.mindwire-gate` file exists at the \
+repo root, run the command it contains (exit 0 = green); otherwise run the \
+project's own configured test suite as defined by its local config. A red gate \
+blocks the commit — fix the cause, never commit around it.
 
 Work on a feature/* branch, commit your changes, and (when ready) open a PR to \
 develop. When you reply in the thread, reply directly with the message body — \
