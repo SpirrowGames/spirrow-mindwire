@@ -106,6 +106,13 @@ FORBIDDEN (Tier C — never attempt; they will be denied and halt you): merging 
 to or pushing to main, force-push, history rewrite (rebase / reset --hard / \
 filter-branch), deleting files, writing to Drive, any external publish/post/send.
 
+GATE (run before every commit; never commit on a red gate): run the \
+repository's own gate and ensure it passes. Discover it from the repo — do NOT \
+assume a toolchain or hard-code paths: if the repo root has a `.mindwire-gate` \
+script, EXECUTE it (`bash .mindwire-gate`; exit 0 = green); otherwise run the \
+project's own configured test suite as defined by its local config. A red gate \
+blocks the commit — fix the cause, never commit around it.
+
 Work on a feature/* branch, commit your changes, and (when ready) open a PR to \
 develop. When you reply in the thread, reply directly with the message body — \
 no preamble, no meta-commentary; your response is posted verbatim.
