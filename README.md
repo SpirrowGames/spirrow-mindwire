@@ -212,6 +212,7 @@ The human only poses the initial question and never intervenes in the relay. Eve
 | Command | Role | Deployment layer |
 |---|---|---|
 | `mindwire-watcher` | thread-directory watching + Claude Code SDK launch daemon | host daemon |
+| `mindwire-loop` | Stage 3 trilateral-loop daemon — `--mode` selects the standing auto-reply watcher or the NEXT-driven design **conductor** (reads one design thread, serially dispatches each `NEXT:`-named role) | host daemon |
 | `mindwire-mcp-server` | write+read API from the Claude.ai-side connector (HTTP MCP, :7400) | host daemon |
 | `mindwire-mcp` | read-only stub injected in-process into the Claude Code session | per-session |
 | `mindwire-migrate-v1-to-v2` | thread schema migration CLI (atomic / idempotent / pre-flight / dry-run) | one-shot |
@@ -228,6 +229,8 @@ The human only poses the initial question and never intervenes in the relay. Eve
 | [`docs/feature-3-design.md`](docs/feature-3-design.md) | Feature 3-A: schema v2 + write MCP server + race monitoring + read tools |
 | [`docs/dogfooding.md`](docs/dogfooding.md) | operator runbook (setup / API key persistence / triage flow / connector rename) |
 | [`docs/logging-design.md`](docs/logging-design.md) | `events.jsonl` event types + audit-trail design |
+| [`docs/chain-merge-pattern.md`](docs/chain-merge-pattern.md) | sub-PR chain-merge contract-integration checklist (general meta-process) |
+| [`spec/NAYSAYER_PRINCIPLES.md`](spec/NAYSAYER_PRINCIPLES.md) | the canonical, versioned 5 principles the naysayer reviews under (the SOT) |
 
 ---
 
@@ -237,7 +240,13 @@ The human only poses the initial question and never intervenes in the relay. Eve
 - 🚧 **Phase 1** (Feature 3-A, in progress): schema v2 + write MCP server (`mindwire-mcp-server`) + race-gap monitoring + claude.ai-participant read tools + API-key persistence recipe
 - 📋 **Phase 2+** (not started): `events.jsonl`-primary tooling (CLI / dashboard / replay), cross-host distribution, multi-tenant isolation
 
-In parallel, the system is now **dogfooded as an autonomous trilateral dev loop (Stage 3)**: the watcher drives an implementer SDK adapter guarded by a Tier A/B/C action classifier + default-deny allow-list (a **loop-level main-merge guard** — direct, wrapped, and MCP forms all denied — since branch protection is unavailable on the free plan), and a naysayer reviews PRs on GitHub from a separate identity, running on a different model family (Gemini via spirrow-lexora). See ADR-2026-05-23-07 (Stage 3 autonomy gating) and ADR-2026-05-31-14/15 (naysayer placement).
+In parallel, the system is now **dogfooded as an autonomous trilateral dev loop (Stage 3)**, wired end-to-end:
+
+- a **NEXT-driven conductor** (`mindwire-loop --mode conductor`) reads one design thread and serially dispatches the single `NEXT:`-named role each turn, chaining proposer → implementer → naysayer with no human relay;
+- the **implementer SDK adapter** is guarded by a Tier A/B/C action classifier + default-deny allow-list (a **loop-level main-merge guard** — direct, wrapped, and MCP forms all denied — since branch protection is unavailable on the free plan) and now drives the real Claude Agent SDK end-to-end: it reads, edits, runs the gate, and commits autonomously (the tool-wiring fix, ADR-2026-05-23-07 / T37);
+- the **naysayer** is an independent loop agent on a _different_ model family (Gemini via spirrow-lexora) that reviews PRs on GitHub (APPROVE / REQUEST_CHANGES) from a separate identity.
+
+Merges to the protected `main` branch are never automated — they remain a human (Tier C) decision. See ADR-2026-05-23-07 (Stage 3 autonomy gating), ADR-2026-05-31-14/15 (naysayer placement), and ADR-2026-06-04-19 (naysayer driver-unify).
 
 See [`docs/feature-3-design.md`](docs/feature-3-design.md) for the detailed phase breakdown.
 
@@ -252,6 +261,8 @@ One distinctive feature of this repo is that it adopts a workflow where **design
 - **proposer** — design proposals, review pass, spec authorship, decide
 - **implementer** — implementation, commits, CI integration, opens PRs
 - **naysayer** — independent, adversarial review under 5 principles (YAGNI/OverScope / hybrid & dual-management complexity / no opposition for opposition's sake / explicitly endorse what should be endorsed / silence is negligence). The canonical, versioned definition is [`spec/NAYSAYER_PRINCIPLES.md`](spec/NAYSAYER_PRINCIPLES.md) (this list is a summary; the spec is the SOT — ADR-2026-06-03-17). Beyond the PR-gate, the naysayer also participates at **design time**: it is summoned onto a design thread as the same independent agent (`NaysayerSdkAdapter`) that runs in the ordinary loop (ADR-2026-06-04-19; the earlier `scripts/design_review.py` relay was retired).
+
+These roles are chained automatically by a **NEXT-driven conductor** (`mindwire-loop --mode conductor`): every reply ends with a `NEXT: <role>` handoff line, and the conductor dispatches exactly that one participant next. The handoff is structurally guarded — a design→implementation handoff is redirected to a human Tier-C decision, so a design cannot reach the implementer without first clearing an independent naysayer review and the human's approval (ADR-2026-06-03-17).
 
 The roles run on a **"2 collaborate, 1 independent" placement** (ADR-2026-05-31-15): the proposer and implementer share one model family (Claude Code) for collaboration speed, while the **naysayer runs on a _different_ model family (Gemini, via [spirrow-lexora](https://github.com/SpirrowGames/spirrow-lexora))** for maximal independence — and reviews PRs on GitHub (APPROVE / REQUEST_CHANGES) from a _separate identity_ so that author ≠ approver. (Earlier the naysayer was a second isolated Claude.ai session; the move to a different model family is the T15 pivot — see ADR-2026-05-31-14.)
 
