@@ -1,1 +1,10 @@
-uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest
+#!/usr/bin/env bash
+# Single source of truth for the spirrow-mindwire gate.
+# Run identically by CI (.github/workflows/ci.yml) and the autonomous loop's
+# implementer (it executes `bash .mindwire-gate`), so the two can never drift.
+# Exit 0 = green.
+set -euo pipefail
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src tests
+uv run pytest
