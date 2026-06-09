@@ -1,0 +1,33 @@
+# deploy/mindwire.toml.example — Stage 3 conductor daemon config template (ADR-18).
+#
+# Copy to <data_dir>/config/mindwire.toml (default <data_dir> = ~/spirrow-mindwire-data, or set
+# MINDWIRE_PATHS__DATA_DIR) and fill in [conductor].task_thread_id + [loop].repo_dir for your run.
+#
+# Secrets and inference endpoints stay OUT of this file — they are resolved from the environment by
+# the adapters at spawn (see deploy/run-conductor.ps1): MINDWIRE_IMPLEMENTER_BASE_URL,
+# MINDWIRE_NAYSAYER_BASE_URL, MINDWIRE_LEXORA_URL, MINDWIRE_NAYSAYER_GITHUB_TOKEN,
+# MINDWIRE_MAGICKIT_MCP_URL (the last defaults to the in-code Tailscale endpoint).
+
+schema_version = 1
+
+[loop]
+# The magickit chatroom project the conductor drives.
+project = "spirrow-voxelworld"
+# The implementer's own clone of the target repo (NOT a linked worktree — a worktree anchors
+# Claude Code's project-root to the main repo, so fs.write lands outside repo_root and is denied).
+repo_dir = "C:/workspace/sandbox/voxelworld-impl"
+
+[conductor]
+# The single design thread the conductor drives (1 task = 1 thread). REQUIRED.
+task_thread_id = "T-REPLACE-WITH-DESIGN-THREAD"
+# The roster persona that fills the independent naysayer slot; MUST map to "naysayer" in [roster].
+naysayer_identity = "Einstein"
+# Runaway backstop: max serial turns before the conductor stops (default 40).
+max_rounds = 40
+
+# Chatroom identity -> role map. The NEXT: vocabulary is the persona name; the conductor authors
+# each reply under that name. Reserved words `human` / `none` are NOT roster entries.
+[conductor.roster]
+Bohr = "proposer"
+Heisenberg = "implementer"
+Einstein = "naysayer"
