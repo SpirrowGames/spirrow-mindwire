@@ -30,12 +30,14 @@ the human's instructions (an explicit ``NEXT: human`` or an "approved, go" with 
 Design→implement Tier-C gate (guard (i), msg-543 / ADR-2026-06-03-17 / Tier-C msg-553/557): a
 ``NEXT:`` to the **implementer** from any non-human author (the proposer or — crucially — an in-band
 design-time naysayer) would let an un-reviewed, un-approved design reach code. The conductor
-intercepts it and redirects to the human terminal (Obj2 consult → Tier-C decision). In PR-2b-1 the
-implementer may be directed only by ① a human-authored Tier-C decide. The other two carve-outs are
-deferred so the gate never trusts an AI's role assignment (msg-552): ② the naysayer-name PR-gate
-REQUEST_CHANGES→fix relay re-enters in PR-2b-2, gated to its structural marker; ③ the human
-``DELEGATE`` autonomy path re-enters in a dedicated slice with a reachable trigger and a naysayer
-consult that resets on implementation (msg-556). This is a structural state machine invariant, not
+intercepts it and redirects to the human terminal (Obj2 consult → Tier-C decision). The implementer
+may be directed by ① a human-authored Tier-C decide; ② the PR-gate REQUEST_CHANGES→fix relay
+(PR-2b-2, verdict-driven, gated to its structural marker); or ③ under an active human ``DELEGATE``
+(PR-2b-3 D-4), the **independent naysayer's** own proceed-handoff to the implementer — only the
+naysayer may advance to code under delegation, so the proposer can never bypass an objection, and
+the next iteration needs a fresh naysayer proceed after each implementation (reset-on-impl).
+Delegation is derived, non-sticky state revoked by any human turn. The gate never trusts a
+non-human role assignment otherwise (msg-552). This is a structural state machine invariant, not
 a prompt request: the adapters are *also* taught to emit a ``NEXT:`` line
 (:func:`~spirrow_mindwire.conductor.handoff.build_handoff_protocol_block`) so a cooperating loop
 chains, but that prompt is advisory and the guards here are the enforcement.
@@ -64,7 +66,7 @@ from ..value_objects import (
     SessionHandle,
     ThreadRef,
 )
-from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, resolve_handoff
+from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, has_delegate_marker, resolve_handoff
 
 if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
@@ -299,11 +301,19 @@ class Conductor:
         # guard (i): design→implement Tier-C gate.
         if handoff.kind is HandoffKind.ROLE and handoff.role is self._implementer_role:
             if self._is_human(author):
-                # carve-out ① human-authored Tier-C decide — the ONLY path to the implementer in
-                # PR-2b-1. ② the naysayer-name PR-gate relay and ③ the human DELEGATE are deferred
-                # (to PR-2b-2 and a dedicated delegation slice): the gate must not trust an AI's
-                # role assignment, so neither a design-time naysayer nor the proposer may emit
-                # ``NEXT: <implementer>`` and bypass the human. Tier-C msg-553 / msg-557.
+                # carve-out ① human-authored Tier-C decide. Tier-C msg-553 / msg-557.
+                assert handoff.identity is not None
+                return handoff.role, handoff.identity, False, None
+            # carve-out ③ (D-4, msg-602): under active human delegation, the INDEPENDENT naysayer's
+            # OWN proceed-handoff to the implementer is honored without a per-step human GO. *Only*
+            # the naysayer may advance to code under delegation — the proposer cannot self-advance,
+            # which would let it bypass the naysayer's objection (Einstein msg-601 Fix-1). The
+            # naysayer's handoff IS this latest message (reviewing the current state), so a stale
+            # review cannot carry: the next iteration needs a fresh naysayer proceed AFTER the
+            # implementer's turn (reset-on-implementation). Delegation is derived, non-sticky state
+            # revoked by any human turn (Fix-2); a naysayer escalation (``NEXT: human``) is not a
+            # proceed-handoff and falls through to the human terminal below.
+            if author_role is self._naysayer_role and self._delegation_active(messages):
                 assert handoff.identity is not None
                 return handoff.role, handoff.identity, False, None
             return self._human_terminal(messages)  # default: hard-reject → human terminal
@@ -354,6 +364,20 @@ class Conductor:
         ):
             return self._naysayer_role, self._naysayer_identity, True, None
         return None, "", False, StopReason.HUMAN
+
+    def _delegation_active(self, messages: list[dict[str, Any]]) -> bool:
+        """Is human design→implement delegation active (carve-out ③ / D-4)?
+
+        Derived, non-sticky (Einstein msg-601 Fix-2): true iff the most recent **human-authored**
+        message in the thread carries the ``DELEGATE`` marker line (orthogonal to that message's
+        ``NEXT:`` handoff). Any later human turn without the marker (a steer, a ``NEXT: human``,
+        anything) becomes the most-recent human message and ends delegation — the human taking the
+        wheel snaps the loop out of unattended mode. There is no stored flag to forget;
+        ``max_rounds`` is the standing bound. Honored only from the human identity (D-3)."""
+        for msg in reversed(messages):
+            if self._is_human(_author(msg)):
+                return has_delegate_marker(_content(msg))
+        return False
 
     def _is_human(self, author: str) -> bool:
         """Is ``author`` the human (Tier-C) identity? Case-insensitive; empty identity ⇒ never (a
