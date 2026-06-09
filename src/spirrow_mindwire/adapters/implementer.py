@@ -879,6 +879,24 @@ def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
     )
 
 
+def _cwd_grounding_block(cwd: Path) -> str:
+    """Tell the implementer its working directory so it never guesses an absolute path (T40).
+
+    The adapter runs with a *custom* ``system_prompt`` (not the claude_code preset), so the SDK does
+    not inject the "working directory" dynamic section the agent would normally rely on. Without it
+    the agent has guessed a wrong absolute path (e.g. ``/home/user/<repo>/...`` on a non-cwd repo)
+    and the allow-list fail-loud denied the out-of-repo write — the loop made no progress. Grounding
+    the cwd + mandating relative paths closes that (observed on the spirrow-voxelworld conductor
+    smoke, T-voxel-autoloop-smoke).
+    """
+    return (
+        f"WORKING DIRECTORY: `{cwd}` — this directory IS the root of the repo you operate in. "
+        "Resolve every file path against it: prefer plain relative paths (e.g. `src/foo.py`) and "
+        "never invent or hard-code an absolute path to any other location. All your reads, edits, "
+        "builds, and git commands run inside this directory."
+    )
+
+
 class ImplementerSdkAdapter:
     """RoleAdapter for the implementer: SDK + EXECUTE_CODE + allow-list (T19).
 
@@ -918,7 +936,9 @@ class ImplementerSdkAdapter:
         # is the single enforcement point; auto-approval would bypass it).
         self._allowed_tools = list(allowed_tools) if allowed_tools is not None else []
         self._mcp_servers = mcp_servers or {}
-        self._system_prompt = system_prompt
+        # Append cwd grounding (T40): the custom system prompt omits the SDK's working-directory
+        # dynamic section, so the agent must be told its cwd explicitly or it guesses abs paths.
+        self._system_prompt = f"{system_prompt}\n\n{_cwd_grounding_block(self._cwd)}"
         self._extra_env = dict(extra_env or {})
         self._client_factory = client_factory or _default_client_factory
         self._sessions: dict[SessionHandle, _Session] = {}
