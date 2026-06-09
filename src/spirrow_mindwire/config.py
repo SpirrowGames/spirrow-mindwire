@@ -296,10 +296,16 @@ class Stage3LoopConfig(_StrictModel):
 
     Secrets and inference endpoints stay **out** of this config (and out of
     TOML): the implementer's inference base URL
-    (``MINDWIRE_IMPLEMENTER_BASE_URL``), Lexora URL (``MINDWIRE_LEXORA_URL``)
-    and the naysayer's GitHub token (``MINDWIRE_NAYSAYER_GITHUB_TOKEN``) are
-    resolved from the environment by the adapters themselves at spawn (the same
-    "env name, not value, in config" principle as :class:`PhanthandConfig`).
+    (``MINDWIRE_IMPLEMENTER_BASE_URL``), the design-time naysayer's base URL
+    (``MINDWIRE_NAYSAYER_BASE_URL`` → Lexora's ``naysayer`` / Gemini tier; the
+    naysayer adapter refuses to spawn without it, so leaving it unset silently
+    disables the loop's independent-review leg), the Lexora URL
+    (``MINDWIRE_LEXORA_URL``) and the naysayer's GitHub token
+    (``MINDWIRE_NAYSAYER_GITHUB_TOKEN``) are resolved from the environment by the
+    adapters themselves at spawn (the same "env name, not value, in config"
+    principle as :class:`PhanthandConfig`). The magickit chatroom MCP URL
+    (``MINDWIRE_MAGICKIT_MCP_URL``) likewise comes from the env / its in-code
+    default. See ``docs/deploy.md`` for the unattended-daemon runbook (ADR-18).
     """
 
     project: str = "spirrow-mindwire"
