@@ -117,6 +117,32 @@ _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT = (
     f"{_BASE_IMPLEMENTER_SYSTEM_PROMPT}\n{build_handoff_protocol_block(Role.IMPLEMENTER)}"
 )
 
+# The built-in Claude Code tools the implementer's SDK session exposes (T37 #1).
+# This is the SDK ``tools=`` base set: ``tools=[]`` means "disable ALL built-ins"
+# in claude-agent-sdk 0.1.77 (CLI ``--tools ""``), which left the autonomous
+# implementer with zero Read/Edit/Bash/… — the brain ran but had no hands, so it
+# could never act (the whole "implementer never ran for real" finding). We expose
+# the code / fs / search / shell + planning tools it needs and DELIBERATELY OMIT
+# the rest (no ``Task`` sub-agents, no ``WebFetch``/``WebSearch`` network reach,
+# no ``SlashCommand``) to keep the surface minimal. Exposure is NOT auto-approval:
+# every call still routes through the ``can_use_tool`` allow-list guard
+# (``allowed_tools=[]`` + ``permission_mode="default"``). ``BashOutput`` /
+# ``KillShell`` / ``TodoWrite`` are benign and whitelisted in the classifier
+# (``_BENIGN_BUILTIN_TOOLS``); the others map to their fs/git/exec operations.
+_IMPLEMENTER_BUILTIN_TOOLS: tuple[str, ...] = (
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Glob",
+    "Grep",
+    "TodoWrite",
+)
+
 
 class ImplementerSdkSpawnError(AdapterSpawnError):
     """``spawn`` failure for the implementer adapter (§3.4)."""
@@ -705,6 +731,17 @@ def _classify_mcp(tool_name: str, tool_input: dict[str, Any]) -> ClassifiedActio
     return ClassifiedAction(Operation.UNKNOWN, detail=tool_name)
 
 
+# Benign built-in Claude Code tools with NO filesystem / git / external side
+# effect: in-context planning (``TodoWrite``) and management of background shells
+# the agent itself spawned (``BashOutput`` reads a shell's output, ``KillShell``
+# stops one). They have no allow-list :class:`Operation` of their own, so without
+# this they would fall through to ``UNKNOWN`` → default-deny and halt the agent on
+# its first planning step (T37 #3 — observed: ``TodoWrite`` denied → initial halt).
+# Mapped to ``EXEC_CODE`` (Tier A allow). Kept deliberately small: a tool with any
+# real effect must be classified explicitly above, never added here.
+_BENIGN_BUILTIN_TOOLS = frozenset({"TodoWrite", "BashOutput", "KillShell"})
+
+
 def classify_tool_call(tool_name: str, tool_input: dict[str, Any]) -> ClassifiedAction:
     """Map one SDK tool call to a classified allow-list :class:`ClassifiedAction`.
 
@@ -723,6 +760,8 @@ def classify_tool_call(tool_name: str, tool_input: dict[str, Any]) -> Classified
         return ClassifiedAction(Operation.SEARCH, detail=tool_name)
     if tool_name == "Bash":
         return _classify_bash(str(tool_input.get("command", "")))
+    if tool_name in _BENIGN_BUILTIN_TOOLS:
+        return ClassifiedAction(Operation.EXEC_CODE, detail=tool_name)
     if tool_name.startswith("mcp__"):
         return _classify_mcp(tool_name, tool_input)
     return ClassifiedAction(Operation.UNKNOWN, detail=tool_name)
@@ -885,13 +924,43 @@ class ImplementerSdkAdapter:
         self._sessions: dict[SessionHandle, _Session] = {}
 
     def _make_options(self, guard: _AllowlistGuard) -> ClaudeAgentOptions:
-        env = {"ANTHROPIC_BASE_URL": self._inference_base_url, **self._extra_env}
+        env = {
+            "ANTHROPIC_BASE_URL": self._inference_base_url,
+            # Force UTF-8 in the CLI subprocess and any Python the agent spawns
+            # (``uv run`` / pytest / its own scripts). On Japanese Windows the
+            # default cp932 codec cannot encode em-dash / 日本語 in prompts or
+            # tool output and raises ``UnicodeEncodeError`` (T37 #2 — observed:
+            # ``'cp932' codec can't encode '—'``). PYTHONUTF8=1 is the
+            # canonical fix; PYTHONIOENCODING covers child stdio explicitly.
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+            **self._extra_env,
+        }
         kwargs: dict[str, Any] = {
             "cwd": self._cwd,
             "system_prompt": self._system_prompt,
-            "tools": [],
+            # Expose the implementer's built-in toolset. ``tools=[]`` DISABLES all
+            # built-ins (SDK 0.1.77 → ``--tools ""``); the guard below — not the
+            # exposure list — is the enforcement point (T37 #1).
+            "tools": list(_IMPLEMENTER_BUILTIN_TOOLS),
+            # Empty → nothing is auto-approved, so EVERY tool call routes through
+            # the can_use_tool guard (the single enforcement point).
             "allowed_tools": self._allowed_tools,
             "mcp_servers": self._mcp_servers,
+            # Isolation (T37 #4). setting_sources=[] runs the session in SDK
+            # isolation mode: it does NOT load this host's user/project/local
+            # settings (claude.ai connectors, CLAUDE.md, env, hooks). That both
+            # stops the implementer from inheriting the operator's MCP connectors
+            # (a credential-surface leak — the agent reached smart_read/Gmail/
+            # Drive) AND closes a guard bypass: a ``permissions.allow`` rule in
+            # host settings would auto-approve a tool so it never reaches
+            # can_use_tool (the SDK only invokes can_use_tool on an "ask"
+            # verdict). strict_mcp_config ignores any MCP config not passed here
+            # (project ``.mcp.json`` / plugin servers), so only ``mcp_servers``
+            # (empty by default) is honored. Inference auth (credentials file) is
+            # independent of settings sources, so this does not affect routing.
+            "setting_sources": [],
+            "strict_mcp_config": True,
             "can_use_tool": guard,
             "permission_mode": "default",  # NOT bypassPermissions — the guard must run
             "env": env,

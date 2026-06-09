@@ -26,7 +26,9 @@ from claude_agent_sdk import (
 )
 
 from spirrow_mindwire.adapters.implementer import (
+    _BENIGN_BUILTIN_TOOLS,
     _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT,
+    _IMPLEMENTER_BUILTIN_TOOLS,
     ImplementerAllowlistError,
     ImplementerSdkAdapter,
     ImplementerSdkDeliveryError,
@@ -66,6 +68,12 @@ _TS = datetime(2026, 5, 23, tzinfo=UTC)
         ("Read", {"file_path": "a.py"}, Operation.FS_READ),
         ("Glob", {"pattern": "**"}, Operation.SEARCH),
         ("Grep", {"pattern": "x"}, Operation.SEARCH),
+        # T37 #3: benign built-ins (planning + background-shell mgmt) classify to
+        # EXEC_CODE (Tier A allow), not UNKNOWN — else they halt the agent's first
+        # planning step. Anything with real fs/git/external effect stays explicit.
+        ("TodoWrite", {"todos": []}, Operation.EXEC_CODE),
+        ("BashOutput", {"bash_id": "1"}, Operation.EXEC_CODE),
+        ("KillShell", {"shell_id": "1"}, Operation.EXEC_CODE),
         ("Frobnicate", {}, Operation.UNKNOWN),
     ],
 )
@@ -592,6 +600,37 @@ async def test_spawn_routes_inference_via_base_url(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_make_options_exposes_builtins_and_isolates(tmp_path: Path) -> None:
+    # T37: regression guard for the four wiring fixes. The whole "implementer
+    # never ran for real" finding was that tools=[] disabled every built-in, so
+    # pin the exposure + isolation + UTF-8 + guard wiring against silent drift.
+    cap: list[_FakeSdkClient] = []
+    adapter = ImplementerSdkAdapter(
+        cwd=tmp_path,
+        inference_base_url="http://lx",
+        client_factory=_factory(responses=[], capture=cap),
+    )
+    await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx([]))
+    opts = cap[0].options
+    # #1 built-ins exposed (NOT tools=[]): the core code/fs/exec/search tools.
+    assert isinstance(opts.tools, list)
+    assert opts.tools, "tools must not be empty (else no built-ins)"
+    for tool in ("Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite"):
+        assert tool in opts.tools
+    # the guard is still the single enforcement point — nothing auto-approved.
+    assert opts.allowed_tools == []
+    assert opts.can_use_tool is not None
+    assert opts.permission_mode == "default"
+    # #4 isolation: no host settings (connectors/CLAUDE.md/permissions) inherited,
+    # and only explicitly-passed MCP servers are honored.
+    assert opts.setting_sources == []
+    assert opts.strict_mcp_config is True
+    # #2 UTF-8 forced for the subprocess + any python the agent spawns.
+    assert opts.env["PYTHONUTF8"] == "1"
+    assert opts.env["PYTHONIOENCODING"] == "utf-8"
+
+
+@pytest.mark.anyio
 async def test_deliver_emits_reply_when_allowed(tmp_path: Path) -> None:
     captured: list[ReplyDraft] = []
     adapter = ImplementerSdkAdapter(
@@ -688,6 +727,20 @@ async def test_deliver_on_halted_session_raises(tmp_path: Path) -> None:
         await adapter.deliver_event(handle, _event())
 
 
+def test_builtin_tool_set_is_self_consistent() -> None:
+    # T37: the benign-whitelist set must be a subset of the exposed tools (a tool
+    # the model can never call need not be whitelisted), and the core code/fs tools
+    # the implementer's job needs must actually be exposed. Pins the two T37 #1/#3
+    # constants against drifting apart.
+    exposed = set(_IMPLEMENTER_BUILTIN_TOOLS)
+    assert exposed >= _BENIGN_BUILTIN_TOOLS
+    assert exposed >= {"Read", "Write", "Edit", "Bash", "Glob", "Grep"}
+    # every exposed tool classifies to something the default allow-list can act on
+    # (never UNKNOWN — that would silently halt the agent on a tool we handed it).
+    for tool in exposed:
+        assert classify_tool_call(tool, {}).operation is not Operation.UNKNOWN
+
+
 # --------------------------------------------------------------------------- #
 # manual SDK smoke (B3): verify the REAL SDK routes tool calls through the guard
 # --------------------------------------------------------------------------- #
@@ -717,6 +770,45 @@ async def test_manual_sdk_routes_tool_calls_through_guard(tmp_path: Path) -> Non
                 _event(body="Run exactly this shell command and nothing else: rm -rf /tmp/denied"),
             )
         assert (await adapter.health(handle)).state is SessionState.FAILED
+    finally:
+        await adapter.halt(handle)
+
+
+@pytest.mark.manual
+@pytest.mark.anyio
+async def test_manual_sdk_executes_allowed_tool_through_guard(tmp_path: Path) -> None:
+    """The other half of the gate: an ALLOWED tool must actually EXECUTE (T37 #1).
+
+    Before the tool-wiring fix the session was launched with ``tools=[]`` and the
+    model had no built-in tools at all, so it could neither act nor trip the guard
+    — the deny test above would pass for the wrong reason (model can't call Bash)
+    while the implementer was in fact a no-op. This asks the model to create a
+    file inside the repo (a Tier A ``fs.write``) and asserts the file really lands
+    on disk, proving Write/Bash are exposed and the allow path runs end to end.
+
+        MINDWIRE_IMPLEMENTER_BASE_URL=... uv run pytest -m manual -k executes_allowed
+    """
+    base = os.environ.get("MINDWIRE_IMPLEMENTER_BASE_URL")
+    if not base:
+        pytest.skip("set MINDWIRE_IMPLEMENTER_BASE_URL (Lexora Anthropic-compat) to run")
+    _init_head(tmp_path, "feature/manual-exec")
+    captured: list[ReplyDraft] = []
+    adapter = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url=base)
+    handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx(captured))
+    marker = tmp_path / "t37_exec_proof.txt"
+    try:
+        await adapter.deliver_event(
+            handle,
+            _event(
+                body=(
+                    "Create a file named t37_exec_proof.txt in the current directory "
+                    "containing exactly the text OK, using the Write tool. Then reply done."
+                ),
+            ),
+        )
+        assert marker.is_file(), "the allowed Write tool did not execute (tools likely still empty)"
+        assert (await adapter.health(handle)).state is SessionState.IDLE
+        assert captured, "expected a reply after the tool executed"
     finally:
         await adapter.halt(handle)
 
