@@ -68,10 +68,13 @@ if (-not $env:MINDWIRE_NAYSAYER_GITHUB_TOKEN) { "MISSING github token" }
 
 ## Known limits (not yet wired — see the chatroom threads)
 
-- **Fully-autonomous design→implement** still needs a human GO: the conductor's Tier-C guard
-  redirects a proposer→implementer handoff to the human unless the GO is authored by the configured
-  `human_identity` (default `human`). Until that is operationalized (flag-1 / PR-2b-3), drive
-  design→implement by posting the GO as `author="human"` with `NEXT: <implementer>`.
+- **Fully-autonomous design→implement** still needs a *per-step* human GO: the conductor's Tier-C
+  guard redirects a proposer/naysayer→implementer handoff to the human unless the GO is authored by
+  `[conductor].human_identity` (default `human`; PR-2b-3 D-1 made it configurable). **運用規約**:
+  post the Tier-C GO under exactly that identity — e.g. `author="human"` with `NEXT: <implementer>`.
+  A GO under a relay name (e.g. `Bohr`) does **not** fire the carve-out (the flag-1 gap). Standing
+  autonomy without a per-step GO (`DELEGATE`) is a deferred slice (PR-2b-3 D-4). Author trust is the
+  environment trust model (D-3) — the authoritative guard is the human's manual `main` merge.
 - The design-time naysayer reaches Gemini via the SDK + Lexora `naysayer` tier (verified by the
   capability test, `T-design-naysayer-gemini-reach`); the only thing that was missing was
   `MINDWIRE_NAYSAYER_BASE_URL` — now set by the launcher.

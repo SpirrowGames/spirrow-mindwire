@@ -38,6 +38,11 @@ config and on-disk data formats can evolve on independent cadences.
 
 DEFAULT_DATA_DIR = Path.home() / "spirrow-mindwire-data"
 
+# Single source of truth for the conductor's runaway round-cap default, shared by
+# ``ConductorConfig.max_rounds`` (here) and the ``Conductor`` ctor default
+# (``conductor.core`` imports this) so the two cannot drift (PR-2b-3 D-2).
+DEFAULT_CONDUCTOR_MAX_ROUNDS = 40
+
 
 class _StrictModel(BaseModel):
     """Base for *config* sub-models: forbid extras only.
@@ -347,10 +352,23 @@ class ConductorConfig(_StrictModel):
     task_thread_id: str = ""
     roster: dict[str, Role] = Field(default_factory=dict)
     naysayer_identity: str = ""
-    max_rounds: int = Field(default=40, ge=1)
+    human_identity: str = "human"
+    """The chatroom persona whose authored Tier-C decide may direct the implementer — carve-out ①
+    of the conductor's design→implement gate (PR-2b-3 D-1 / flag-1).
+
+    Defaults to the reserved ``human`` token (the ``Conductor`` ctor default). Set it to the name
+    the human posts Tier-C GOs under; a GO authored under a relay name (not this identity) never
+    fires the carve-out — the flag-1 gap. An empty value disables the carve-out entirely (fail-safe:
+    every design→implement handoff hard-rejects).
+
+    Author trust is the **environment** trust model (D-3): the loop-level gate is best-effort
+    noise-reduction; the authoritative guard that changes never reach ``main`` is the human's manual
+    merge (the same stance as the implementer allow-list)."""
+    max_rounds: int = Field(default=DEFAULT_CONDUCTOR_MAX_ROUNDS, ge=1)
     """Runaway backstop: the maximum number of serial turns before the conductor stops.
 
-    Mirrors the :class:`~spirrow_mindwire.conductor.core.Conductor` default (40); a turn that does
+    Defaults to :data:`DEFAULT_CONDUCTOR_MAX_ROUNDS` — the single SOT shared with the
+    :class:`~spirrow_mindwire.conductor.core.Conductor` ctor default (PR-2b-3 D-2); a turn that does
     not converge to ``NEXT: human`` / ``none`` within this many rounds stops at the round cap.
     """
 

@@ -22,6 +22,10 @@ repo_dir = "C:/workspace/sandbox/voxelworld-impl"
 task_thread_id = "T-REPLACE-WITH-DESIGN-THREAD"
 # The roster persona that fills the independent naysayer slot; MUST map to "naysayer" in [roster].
 naysayer_identity = "Einstein"
+# The persona whose authored Tier-C decide may direct the implementer (design→implement carve-out).
+# 運用規約: post Tier-C GOs under EXACTLY this identity (a relay name like "Bohr" will not fire the
+# carve-out — the flag-1 gap). Empty string disables the carve-out (fail-safe). Default "human".
+human_identity = "human"
 # Runaway backstop: max serial turns before the conductor stops (default 40).
 max_rounds = 40
 

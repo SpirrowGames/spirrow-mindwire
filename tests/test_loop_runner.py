@@ -446,6 +446,7 @@ def _conductor_settings(
     task_thread_id: str = "T-cond",
     roster: dict[str, Role] | None = None,
     naysayer_identity: str = "Einstein",
+    human_identity: str = "human",
     max_rounds: int = 40,
 ) -> MindwireSettings:
     return MindwireSettings(
@@ -454,6 +455,7 @@ def _conductor_settings(
             task_thread_id=task_thread_id,
             roster=_CONDUCTOR_ROSTER if roster is None else roster,
             naysayer_identity=naysayer_identity,
+            human_identity=human_identity,
             max_rounds=max_rounds,
         ),
     )
@@ -508,7 +510,7 @@ def test_build_conductor_wires_conductor_from_config(tmp_path: Path) -> None:
     implementer = _StubAdapter("fake-implementer", _exec_caps())
     naysayer = _StubAdapter("fake-naysayer", _naysayer_caps())
     cond = build_conductor(
-        _conductor_settings(),
+        _conductor_settings(human_identity="takahito"),
         mcp=_FakeMcp(_FakeChatroom()),
         proposer=proposer,
         implementer=implementer,
@@ -517,6 +519,8 @@ def test_build_conductor_wires_conductor_from_config(tmp_path: Path) -> None:
     assert isinstance(cond, Stage3Conductor)
     assert cond.registry.qualified_for(Role.IMPLEMENTER)[0] is implementer
     assert cond.registry.qualified_for(Role.NAYSAYER) == [naysayer]
+    # PR-2b-3 D-1: [conductor].human_identity is wired into the Conductor (carve-out ① identity).
+    assert cond.conductor._human_identity == "takahito"
 
 
 def test_build_conductor_requires_task_thread_id(tmp_path: Path) -> None:
