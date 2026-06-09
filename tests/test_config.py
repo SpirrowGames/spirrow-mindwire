@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from spirrow_mindwire.config import (
     CONFIG_SCHEMA_VERSION,
+    DEFAULT_CONDUCTOR_MAX_ROUNDS,
     DEFAULT_DATA_DIR,
     ConductorConfig,
     MCPServerConfig,
@@ -371,7 +372,8 @@ def test_conductor_config_defaults_are_empty_and_unobtrusive() -> None:
     assert s.conductor.task_thread_id == ""
     assert s.conductor.roster == {}
     assert s.conductor.naysayer_identity == ""
-    assert s.conductor.max_rounds == 40  # mirrors the Conductor default
+    assert s.conductor.human_identity == "human"  # carve-out ① default (PR-2b-3 D-1)
+    assert s.conductor.max_rounds == DEFAULT_CONDUCTOR_MAX_ROUNDS  # single SOT (D-2)
 
 
 def test_conductor_config_parses_roster_and_fields_from_toml(tmp_path: Path) -> None:
@@ -383,6 +385,7 @@ def test_conductor_config_parses_roster_and_fields_from_toml(tmp_path: Path) -> 
             [conductor]
             task_thread_id = "T-cross-thread-relay-conductor"
             naysayer_identity = "Einstein"
+            human_identity = "takahito"
             max_rounds = 12
 
             [conductor.roster]
@@ -396,6 +399,7 @@ def test_conductor_config_parses_roster_and_fields_from_toml(tmp_path: Path) -> 
     s = load_settings(cfg)
     assert s.conductor.task_thread_id == "T-cross-thread-relay-conductor"
     assert s.conductor.naysayer_identity == "Einstein"
+    assert s.conductor.human_identity == "takahito"
     assert s.conductor.max_rounds == 12
     assert s.conductor.roster == {
         "Bohr": Role.PROPOSER,
@@ -426,6 +430,16 @@ def test_conductor_config_rejects_max_rounds_below_one() -> None:
     """``max_rounds`` must be >= 1 (mirrors the Conductor ctor invariant)."""
     with pytest.raises(ValidationError):
         ConductorConfig(max_rounds=0)
+
+
+def test_conductor_human_identity_configurable_and_max_rounds_single_sot() -> None:
+    """PR-2b-3: ``human_identity`` is configurable (D-1); the round-cap default is one SOT (D-2)."""
+    from spirrow_mindwire.conductor import core as _core
+
+    assert ConductorConfig(human_identity="takahito").human_identity == "takahito"
+    # D-2: the ConductorConfig default and the Conductor ctor default are the SAME constant.
+    assert ConductorConfig().max_rounds == DEFAULT_CONDUCTOR_MAX_ROUNDS
+    assert _core._DEFAULT_MAX_ROUNDS == DEFAULT_CONDUCTOR_MAX_ROUNDS
 
 
 def test_conductor_config_extra_key_in_toml_raises(tmp_path: Path) -> None:

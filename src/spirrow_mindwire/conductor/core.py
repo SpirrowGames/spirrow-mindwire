@@ -53,6 +53,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
+from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
 from ..github.client import ReviewEvent, parse_pr_ref
 from ..magickit.client import McpToolCaller
 from ..value_objects import (
@@ -70,7 +71,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_ROUNDS = 40
+# Single SOT in config.py so ConductorConfig.max_rounds and this ctor default cannot drift (D-2).
+_DEFAULT_MAX_ROUNDS = DEFAULT_CONDUCTOR_MAX_ROUNDS
 
 
 class ConductorDispatcher(Protocol):
@@ -355,7 +357,13 @@ class Conductor:
 
     def _is_human(self, author: str) -> bool:
         """Is ``author`` the human (Tier-C) identity? Case-insensitive; empty identity ⇒ never (a
-        fail-safe default that makes every design→implement handoff hard-reject)."""
+        fail-safe default that makes every design→implement handoff hard-reject).
+
+        Author trust is the **environment** trust model (PR-2b-3 D-3): the chatroom accepts any
+        ``author`` string, so this carve-out is best-effort loop-level noise-reduction, NOT the
+        authoritative Tier-C guard — that is the human's manual ``main`` merge (mirrors the
+        implementer allow-list's environment-containment stance). Stronger author authentication
+        (ADR-11 normalization) is a deferred hardening."""
         return bool(self._human_identity) and author.casefold() == self._human_identity.casefold()
 
     def _naysayer_consulted(self, messages: list[dict[str, Any]]) -> bool:

@@ -491,6 +491,7 @@ def build_conductor(
             thread_ref=thread_ref,
             roster=dict(cond_cfg.roster),
             naysayer_identity=cond_cfg.naysayer_identity,
+            human_identity=cond_cfg.human_identity,
             max_rounds=cond_cfg.max_rounds,
             orchestrator=orchestrator,
         )
