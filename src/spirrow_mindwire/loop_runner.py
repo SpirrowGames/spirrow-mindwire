@@ -64,6 +64,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import sys
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -528,6 +531,29 @@ async def run_conductor(settings: MindwireSettings) -> ConductorOutcome:
         await cond.aclose()
 
 
+def _ensure_utf8_runtime() -> None:
+    """Make the daemon UTF-8-safe (T39).
+
+    The implementer / naysayer adapters already force UTF-8 in their CLI subprocesses (T37 #2), but
+    the daemon *parent* process's own stdout / stderr default to the OS code page — cp932 on JP
+    Windows — which raises ``UnicodeEncodeError`` on em-dash / 日本語 in logged reply content. We
+    reconfigure the parent streams to UTF-8 and export ``PYTHONUTF8`` / ``PYTHONIOENCODING`` so any
+    process the daemon spawns inherits UTF-8 too.
+
+    The interpreter's own UTF-8 *mode* can only be set before startup, so the production service
+    launches the daemon with ``PYTHONUTF8=1`` (ADR-18 deploy); this is the in-code defensive floor
+    so a bare ``mindwire-loop`` invocation does not crash on non-ASCII before that wrapper exists.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with suppress(Exception):  # a redirected / non-text stream may not support it
+                reconfigure(encoding="utf-8")
+    # Propagate to children (setdefault: respect an explicit operator override).
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+
 def main() -> None:
     """Entry point for the ``mindwire-loop`` console script.
 
@@ -537,6 +563,7 @@ def main() -> None:
     default is left at ``watcher`` for backward compatibility; flipping the default / retiring the
     watcher auto-reply mode entirely is the remaining Obj1 decision (deferred — see PR body).
     """
+    _ensure_utf8_runtime()
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(
         prog="mindwire-loop",
