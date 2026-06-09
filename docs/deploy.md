@@ -66,15 +66,25 @@ Test-NetConnection 100.79.84.62 -Port 8110   # Lexora
 if (-not $env:MINDWIRE_NAYSAYER_GITHUB_TOKEN) { "MISSING github token" }
 ```
 
-## Known limits (not yet wired — see the chatroom threads)
+## Autonomy modes (design→implement)
 
-- **Fully-autonomous design→implement** still needs a *per-step* human GO: the conductor's Tier-C
-  guard redirects a proposer/naysayer→implementer handoff to the human unless the GO is authored by
-  `[conductor].human_identity` (default `human`; PR-2b-3 D-1 made it configurable). **運用規約**:
-  post the Tier-C GO under exactly that identity — e.g. `author="human"` with `NEXT: <implementer>`.
-  A GO under a relay name (e.g. `Bohr`) does **not** fire the carve-out (the flag-1 gap). Standing
-  autonomy without a per-step GO (`DELEGATE`) is a deferred slice (PR-2b-3 D-4). Author trust is the
-  environment trust model (D-3) — the authoritative guard is the human's manual `main` merge.
-- The design-time naysayer reaches Gemini via the SDK + Lexora `naysayer` tier (verified by the
-  capability test, `T-design-naysayer-gemini-reach`); the only thing that was missing was
-  `MINDWIRE_NAYSAYER_BASE_URL` — now set by the launcher.
+Two ways to clear the conductor's Tier-C design→implement gate. Either way, merges to `main` are
+never automated (D-5: the human's manual merge is the authoritative guard).
+
+- **Per-step GO (supervised)**: post a Tier-C GO authored as `[conductor].human_identity` (default
+  `human`; PR-2b-3 D-1) with `NEXT: <implementer>`. A GO under a relay name (e.g. `Bohr`) does
+  **not** fire the carve-out — the flag-1 gap.
+- **Standing autonomy — `DELEGATE` (PR-2b-3 D-4)**: include a standalone `DELEGATE` line in a
+  human-authored message to grant standing design→implement autonomy on the thread (alongside that
+  message's normal `NEXT:`). Then the **independent naysayer's own** proceed-handoff to the
+  implementer advances code with no per-step GO — but only the naysayer (never the proposer) can
+  advance, each iteration is freshly reviewed (reset-on-implementation), the naysayer's escalation
+  (`NEXT: human`) pulls the human back in, and **any** later human message without `DELEGATE`
+  revokes it. `max_rounds` bounds a run regardless.
+
+Author trust is the environment trust model (D-3) — the chatroom accepts any author string, so the
+carve-outs are best-effort loop-level gating; the authoritative guard is the human's manual merge.
+
+The design-time naysayer reaches Gemini via the SDK + Lexora `naysayer` tier (verified by the
+capability test, `T-design-naysayer-gemini-reach`); the only thing that was missing was
+`MINDWIRE_NAYSAYER_BASE_URL` — now set by the launcher.

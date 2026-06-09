@@ -495,6 +495,90 @@ async def test_empty_human_identity_disables_human_carveout() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# carve-out ③ (PR-2b-3 D-4): human DELEGATE — per-step-GO-free design→implement
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_delegate_allows_naysayer_proceed_to_implementer() -> None:
+    # Under an active human DELEGATE, the naysayer's OWN proceed-handoff to the implementer is
+    # honored without a per-step human GO (carve-out ③). The DELEGATE marker rides alongside the
+    # human's normal NEXT (here NEXT: Bohr starts the design loop).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="run this autonomously\nDELEGATE\n\nNEXT: Bohr")
+    disp = _ScriptedDispatcher(
+        mcp,
+        {
+            Role.PROPOSER: ["design\n\nNEXT: Einstein"],
+            Role.NAYSAYER: ["sound, build it\n\nNEXT: Heisenberg"],
+            Role.IMPLEMENTER: ["built\n\nNEXT: none"],
+        },
+    )
+    outcome = await _conductor(mcp, disp).run()
+    assert [role for role, _ in disp.dispatches] == [Role.PROPOSER, Role.NAYSAYER, Role.IMPLEMENTER]
+    assert outcome.stop_reason is StopReason.SETTLED
+
+
+@pytest.mark.anyio
+async def test_delegate_does_not_let_proposer_self_advance() -> None:
+    # Einstein msg-601 Fix-1: even under delegation, ONLY the naysayer may advance to code. A
+    # proposer→implementer handoff is redirected to the human terminal (forcing a naysayer consult
+    # first), so the proposer can never bypass the independent review.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="DELEGATE\n\nNEXT: Bohr")
+    disp = _ScriptedDispatcher(
+        mcp,
+        {
+            Role.PROPOSER: ["design\n\nNEXT: Heisenberg"],  # proposer tries to self-advance
+            Role.NAYSAYER: ["forced review\n\nNEXT: human"],
+        },
+    )
+    outcome = await _conductor(mcp, disp).run()
+    roles = [role for role, _ in disp.dispatches]
+    assert Role.IMPLEMENTER not in roles
+    assert roles == [Role.PROPOSER, Role.NAYSAYER]
+    assert outcome.forced_naysayer_turns == 1
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_naysayer_proceed_without_delegation_stops_at_human() -> None:
+    # Without an active DELEGATE, the naysayer's proceed-handoff to the implementer is still gated
+    # to the human (carve-out ③ requires active delegation).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")  # no DELEGATE marker
+    disp = _ScriptedDispatcher(
+        mcp,
+        {
+            Role.PROPOSER: ["design\n\nNEXT: Einstein"],
+            Role.NAYSAYER: ["sound, build it\n\nNEXT: Heisenberg"],
+        },
+    )
+    outcome = await _conductor(mcp, disp).run()
+    roles = [role for role, _ in disp.dispatches]
+    assert Role.IMPLEMENTER not in roles
+    assert roles == [Role.PROPOSER, Role.NAYSAYER]
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+def test_delegation_active_is_derived_and_revocable() -> None:
+    # Non-sticky derived state (Einstein msg-601 Fix-2): active iff the MOST-RECENT human message
+    # carries the marker; a later human turn without it revokes; a non-human DELEGATE is ignored.
+    cond = _conductor(_FakeChatroomMcp(), _ScriptedDispatcher(_FakeChatroomMcp(), {}))
+
+    def _m(author: str, content: str) -> dict[str, Any]:
+        return {"msg_id": "x", "author": author, "content": content, "timestamp": "t"}
+
+    delegate = _m("human", "go\nDELEGATE\n\nNEXT: Bohr")
+    later_human = _m("human", "actually, revise\n\nNEXT: Bohr")
+    agent = _m("Bohr", "design\n\nNEXT: Einstein")
+    assert cond._delegation_active([delegate, agent]) is True
+    assert cond._delegation_active([delegate, agent, later_human]) is False  # later human revokes
+    assert cond._delegation_active([agent]) is False  # no human message
+    assert cond._delegation_active([_m("Bohr", "DELEGATE\n\nNEXT: Heisenberg")]) is False  # spoof
+
+
+# --------------------------------------------------------------------------- #
 # PR-gate (PR-2b-2): NEXT: pr-review fires the Tier B review synchronously, routes by the verdict
 # --------------------------------------------------------------------------- #
 
