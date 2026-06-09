@@ -20,6 +20,7 @@ touching any core (watcher / dispatcher / adapter):
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -662,3 +663,26 @@ def test_main_defaults_to_watcher_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sys.argv", ["mindwire-loop"])
     loop_runner.main()
     assert calls == ["watcher"]  # backward-compatible default
+
+
+# --------------------------------------------------------------------------- #
+# T39: UTF-8 runtime for the daemon entrypoint
+# --------------------------------------------------------------------------- #
+
+
+def test_ensure_utf8_runtime_exports_child_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # T39: the daemon must export UTF-8 so the CLI subprocesses / the agent's own python don't crash
+    # on em-dash / 日本語 under the Windows cp932 default (the adapters also set it per-spawn; the
+    # entrypoint export is the parent-level belt). monkeypatch auto-restores os.environ after.
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    loop_runner._ensure_utf8_runtime()
+    assert os.environ["PYTHONUTF8"] == "1"
+    assert os.environ["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_ensure_utf8_runtime_respects_explicit_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    # setdefault, not overwrite: an operator who deliberately set PYTHONUTF8=0 is honoured.
+    monkeypatch.setenv("PYTHONUTF8", "0")
+    loop_runner._ensure_utf8_runtime()
+    assert os.environ["PYTHONUTF8"] == "0"

@@ -628,6 +628,22 @@ async def test_make_options_exposes_builtins_and_isolates(tmp_path: Path) -> Non
     # #2 UTF-8 forced for the subprocess + any python the agent spawns.
     assert opts.env["PYTHONUTF8"] == "1"
     assert opts.env["PYTHONIOENCODING"] == "utf-8"
+    # T40: the cwd grounding reaches the SDK system prompt (so the agent knows its working dir).
+    assert str(tmp_path) in opts.system_prompt
+
+
+def test_system_prompt_grounds_cwd(tmp_path: Path) -> None:
+    # T40: the implementer runs with a custom system prompt (no claude_code working-dir section), so
+    # it must be told its cwd explicitly — else it guesses an absolute path (observed on the
+    # voxelworld conductor smoke: it targeted /home/user/<repo>/... and the guard fail-loud denied
+    # the out-of-repo write). Grounding the cwd + mandating relative paths fixes it.
+    adapter = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url="http://lx")
+    sp = adapter._system_prompt
+    assert str(tmp_path) in sp
+    assert "WORKING DIRECTORY" in sp
+    assert "relative path" in sp
+    # grounding is appended, not a replacement — the role handoff guidance is preserved.
+    assert "Conductor handoff protocol" in sp
 
 
 @pytest.mark.anyio
