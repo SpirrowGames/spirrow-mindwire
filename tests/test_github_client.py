@@ -18,6 +18,8 @@ from spirrow_mindwire.github.client import (
     GitHubHTTPError,
     PrRef,
     ReviewEvent,
+    _derive_ci_state,
+    _required_workflows_from_env,
     github_token,
     naysayer_github_token,
     parse_pr_ref,
@@ -245,6 +247,69 @@ async def test_fetch_ci_status_latest_run_per_workflow_wins() -> None:
         _run(run_number=5, conclusion="success"),
     ]
     async with _client(_ci_handler(runs=runs)) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.SUCCESS
+
+
+# ---------- CI gate scoping (MINDWIRE_NAYSAYER_REQUIRED_WORKFLOWS) -------- #
+
+
+def test_derive_ci_state_required_workflows_ignores_advisory_pending() -> None:
+    # PR #14 case: the gating "voxel-gate" succeeded; an advisory "voxel-stats"
+    # is stuck pending (no self-hosted runner). Scoped to voxel-gate → SUCCESS.
+    runs = [
+        _run(workflow_id=1, name="voxel-gate", status="completed", conclusion="success"),
+        _run(workflow_id=2, name="voxel-stats", status="pending", conclusion=None),
+    ]
+    st = _derive_ci_state(runs, "abc", required_workflows=frozenset({"voxel-gate"}))
+    assert st.state is CiState.SUCCESS
+
+
+def test_derive_ci_state_required_workflow_missing_is_unknown() -> None:
+    # Only the advisory workflow ran; the required gate has no run → fail-closed.
+    runs = [_run(workflow_id=2, name="voxel-stats", status="pending", conclusion=None)]
+    st = _derive_ci_state(runs, "abc", required_workflows=frozenset({"voxel-gate"}))
+    assert st.state is CiState.UNKNOWN
+
+
+def test_derive_ci_state_required_workflow_failure_still_fails() -> None:
+    runs = [
+        _run(workflow_id=1, name="voxel-gate", conclusion="failure"),
+        _run(workflow_id=2, name="voxel-stats", status="pending", conclusion=None),
+    ]
+    st = _derive_ci_state(runs, "abc", required_workflows=frozenset({"voxel-gate"}))
+    assert st.state is CiState.FAILURE
+    assert st.failing == ["voxel-gate"]
+
+
+def test_derive_ci_state_default_considers_all_workflows() -> None:
+    # Unset (None) preserves prior behavior: an advisory pending still gates.
+    runs = [
+        _run(workflow_id=1, name="voxel-gate", status="completed", conclusion="success"),
+        _run(workflow_id=2, name="voxel-stats", status="pending", conclusion=None),
+    ]
+    assert _derive_ci_state(runs, "abc").state is CiState.PENDING
+
+
+def test_required_workflows_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MINDWIRE_NAYSAYER_REQUIRED_WORKFLOWS", raising=False)
+    assert _required_workflows_from_env() is None
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_REQUIRED_WORKFLOWS", " voxel-gate , ")
+    assert _required_workflows_from_env() == frozenset({"voxel-gate"})
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_REQUIRED_WORKFLOWS", "   ")
+    assert _required_workflows_from_env() is None
+
+
+@pytest.mark.anyio
+async def test_fetch_ci_status_scoped_to_required_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_REQUIRED_WORKFLOWS", "voxel-gate")
+    runs = [
+        _run(workflow_id=1, name="voxel-gate", status="completed", conclusion="success"),
+        _run(workflow_id=2, name="voxel-stats", status="pending", conclusion=None),
+    ]
+    async with _client(_ci_handler(head_sha="abc", runs=runs)) as client:
         st = await client.fetch_ci_status(_PR)
     assert st.state is CiState.SUCCESS
 

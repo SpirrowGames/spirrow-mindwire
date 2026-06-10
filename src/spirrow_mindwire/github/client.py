@@ -133,18 +133,46 @@ class CiStatus:
 _CI_OK_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 
 
-def _derive_ci_state(workflow_runs: list[Any], head_sha: str) -> CiStatus:
+def _required_workflows_from_env() -> frozenset[str] | None:
+    """The naysayer's CI gate scope, from ``MINDWIRE_NAYSAYER_REQUIRED_WORKFLOWS``.
+
+    A comma-separated list of GitHub Actions workflow ``name``s that constitute
+    the gate (e.g. ``voxel-gate``). When set, only those workflows decide the CI
+    state — advisory / warning-only workflows (a drift job that queues forever on
+    an unavailable self-hosted runner) can no longer hold the gate PENDING. When
+    unset (the default), every workflow counts, preserving the prior behavior.
+    Empty / whitespace-only → ``None`` (all workflows).
+    """
+    raw = os.environ.get("MINDWIRE_NAYSAYER_REQUIRED_WORKFLOWS", "").strip()
+    if not raw:
+        return None
+    names = frozenset(s.strip() for s in raw.split(",") if s.strip())
+    return names or None
+
+
+def _derive_ci_state(
+    workflow_runs: list[Any],
+    head_sha: str,
+    required_workflows: frozenset[str] | None = None,
+) -> CiStatus:
     """Aggregate GitHub Actions ``workflow_runs`` into a :class:`CiStatus`.
 
-    Dedupe to the latest run per ``workflow_id`` (so a re-run / superseded older
-    run doesn't false-fail), then: any non-``completed`` → PENDING; any completed
+    When ``required_workflows`` is non-empty, only runs whose ``name`` is in that
+    set are considered (advisory / non-gating workflows are ignored); if NONE of
+    the required workflows have a run for this SHA, the state is UNKNOWN (the gate
+    did not run → fail-closed), never SUCCESS.
+
+    Then dedupe to the latest run per ``workflow_id`` (so a re-run / superseded
+    older run doesn't false-fail): any non-``completed`` → PENDING; any completed
     run whose ``conclusion`` is not success/neutral/skipped → FAILURE; all
-    success → SUCCESS. No runs at all → UNKNOWN (can't confirm green → fail-closed).
+    success → SUCCESS. No (considered) runs at all → UNKNOWN (fail-closed).
     """
     latest: dict[Any, dict[str, Any]] = {}
     for run in workflow_runs:
         if not isinstance(run, dict):
             continue
+        if required_workflows and str(run.get("name") or "") not in required_workflows:
+            continue  # advisory / non-gating workflow: does not decide the gate
         wid = run.get("workflow_id")
         prev = latest.get(wid)
         if prev is None or int(run.get("run_number") or 0) >= int(prev.get("run_number") or 0):
@@ -317,7 +345,11 @@ class GitHubClient:
         except (ValueError, KeyError, TypeError) as exc:
             logger.warning("fetch_ci_status: cannot parse runs: %s (fail-closed)", exc)
             return CiStatus(state=CiState.UNKNOWN, head_sha=head_sha, failing=[])
-        return _derive_ci_state(workflow_runs if isinstance(workflow_runs, list) else [], head_sha)
+        return _derive_ci_state(
+            workflow_runs if isinstance(workflow_runs, list) else [],
+            head_sha,
+            _required_workflows_from_env(),
+        )
 
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event."""
