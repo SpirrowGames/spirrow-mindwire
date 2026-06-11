@@ -133,24 +133,69 @@ class CiStatus:
 _CI_OK_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 
 
-def _derive_ci_state(workflow_runs: list[Any], head_sha: str) -> CiStatus:
+def _required_workflows_from_env() -> frozenset[str] | None:
+    """The naysayer's CI gate scope, from ``MINDWIRE_NAYSAYER_REQUIRED_WORKFLOWS``.
+
+    A comma-separated list of GitHub Actions workflow ``name``s that constitute
+    the gate (e.g. ``voxel-gate``). When set, only those workflows decide the CI
+    state — advisory / warning-only workflows (a drift job that queues forever on
+    an unavailable self-hosted runner) can no longer hold the gate PENDING. When
+    unset (the default), every workflow counts, preserving the prior behavior.
+    Empty / whitespace-only → ``None`` (all workflows).
+    """
+    raw = os.environ.get("MINDWIRE_NAYSAYER_REQUIRED_WORKFLOWS", "").strip()
+    if not raw:
+        return None
+    names = frozenset(s.strip() for s in raw.split(",") if s.strip())
+    return names or None
+
+
+def _derive_ci_state(
+    workflow_runs: list[Any],
+    head_sha: str,
+    required_workflows: frozenset[str] | None = None,
+) -> CiStatus:
     """Aggregate GitHub Actions ``workflow_runs`` into a :class:`CiStatus`.
 
-    Dedupe to the latest run per ``workflow_id`` (so a re-run / superseded older
-    run doesn't false-fail), then: any non-``completed`` → PENDING; any completed
+    When ``required_workflows`` is non-empty, only runs whose ``name`` is in that
+    set are considered (advisory / non-gating workflows are ignored).
+
+    Then dedupe to the latest run per ``workflow_id`` (so a re-run / superseded
+    older run doesn't false-fail): any non-``completed`` → PENDING; any completed
     run whose ``conclusion`` is not success/neutral/skipped → FAILURE; all
-    success → SUCCESS. No runs at all → UNKNOWN (can't confirm green → fail-closed).
+    success → SUCCESS.
+
+    ``required_workflows`` is a *checklist*, not just an allowlist: SUCCESS also
+    requires that every name in the set has produced a run for this SHA. A required
+    workflow GitHub Actions has not created a run for yet (delayed scheduling, a
+    matrix not yet expanded) holds the gate PENDING — otherwise the subset that did
+    run could open the gate while a required workflow is still missing. With a
+    checklist an absent required run is *always* a wait state (PENDING), whether
+    NONE have been scheduled yet or only SOME — one reality, one state — never
+    UNKNOWN. UNKNOWN is reserved for the no-checklist case where the SHA has no CI
+    runs at all (plus read/parse failures upstream): the genuine "is there even CI
+    for this SHA?" fail-closed value, never SUCCESS.
     """
     latest: dict[Any, dict[str, Any]] = {}
     for run in workflow_runs:
         if not isinstance(run, dict):
             continue
+        if required_workflows and str(run.get("name") or "") not in required_workflows:
+            continue  # advisory / non-gating workflow: does not decide the gate
         wid = run.get("workflow_id")
         prev = latest.get(wid)
         if prev is None or int(run.get("run_number") or 0) >= int(prev.get("run_number") or 0):
             latest[wid] = run
     runs = list(latest.values())
     if not runs:
+        # No considered runs. With a checklist this is the same "a required run
+        # hasn't been scheduled yet" wait as the partial-coverage case below →
+        # PENDING, not UNKNOWN (UNKNOWN's gate message misreports a token/permissions
+        # problem). Without a checklist, zero runs is the genuine "is there any CI
+        # for this SHA?" fail-closed UNKNOWN. (naysayer PR #111 round 2: don't split
+        # one reality across UNKNOWN/PENDING by Actions' scheduling timeline.)
+        if required_workflows:
+            return CiStatus(state=CiState.PENDING, head_sha=head_sha, failing=[])
         return CiStatus(state=CiState.UNKNOWN, head_sha=head_sha, failing=[])
     if any(run.get("status") != "completed" for run in runs):
         return CiStatus(state=CiState.PENDING, head_sha=head_sha, failing=[])
@@ -161,6 +206,16 @@ def _derive_ci_state(workflow_runs: list[Any], head_sha: str) -> CiStatus:
     ]
     if failing:
         return CiStatus(state=CiState.FAILURE, head_sha=head_sha, failing=failing)
+    # Coverage check: with an explicit required-workflows checklist, every required
+    # workflow must have produced a run for this SHA before the gate can open. A
+    # required run GitHub Actions hasn't created yet would otherwise let the subset
+    # that did run open the gate — so a missing required workflow holds it PENDING
+    # (fail-closed), never SUCCESS. (naysayer PR #111: "required" is a checklist,
+    # not just an allowlist filter on the runs that happen to be present.)
+    if required_workflows:
+        present = {str(run.get("name") or "") for run in runs}
+        if not required_workflows <= present:
+            return CiStatus(state=CiState.PENDING, head_sha=head_sha, failing=[])
     return CiStatus(state=CiState.SUCCESS, head_sha=head_sha, failing=[])
 
 
@@ -317,7 +372,11 @@ class GitHubClient:
         except (ValueError, KeyError, TypeError) as exc:
             logger.warning("fetch_ci_status: cannot parse runs: %s (fail-closed)", exc)
             return CiStatus(state=CiState.UNKNOWN, head_sha=head_sha, failing=[])
-        return _derive_ci_state(workflow_runs if isinstance(workflow_runs, list) else [], head_sha)
+        return _derive_ci_state(
+            workflow_runs if isinstance(workflow_runs, list) else [],
+            head_sha,
+            _required_workflows_from_env(),
+        )
 
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event."""
