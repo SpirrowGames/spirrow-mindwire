@@ -265,11 +265,20 @@ def test_derive_ci_state_required_workflows_ignores_advisory_pending() -> None:
     assert st.state is CiState.SUCCESS
 
 
-def test_derive_ci_state_required_workflow_missing_is_unknown() -> None:
-    # Only the advisory workflow ran; the required gate has no run → fail-closed.
+def test_derive_ci_state_required_workflow_no_run_yet_is_pending() -> None:
+    # naysayer PR #111 (round 2): with a checklist, a required gate that has no run
+    # yet is the SAME wait-state as partial coverage → PENDING, not UNKNOWN (UNKNOWN
+    # would misreport a token/permissions problem). Only the advisory ran here, so
+    # the required "voxel-gate" is filtered out and no considered runs remain.
     runs = [_run(workflow_id=2, name="voxel-stats", status="pending", conclusion=None)]
     st = _derive_ci_state(runs, "abc", required_workflows=frozenset({"voxel-gate"}))
-    assert st.state is CiState.UNKNOWN
+    assert st.state is CiState.PENDING
+
+
+def test_derive_ci_state_no_required_no_runs_is_unknown() -> None:
+    # Without a checklist, zero runs for the SHA is the genuine "is there any CI?"
+    # fail-closed UNKNOWN — the one case UNKNOWN is reserved for (+ read failures).
+    assert _derive_ci_state([], "abc").state is CiState.UNKNOWN
 
 
 def test_derive_ci_state_required_workflow_failure_still_fails() -> None:

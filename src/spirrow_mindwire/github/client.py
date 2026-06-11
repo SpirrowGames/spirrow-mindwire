@@ -158,20 +158,23 @@ def _derive_ci_state(
     """Aggregate GitHub Actions ``workflow_runs`` into a :class:`CiStatus`.
 
     When ``required_workflows`` is non-empty, only runs whose ``name`` is in that
-    set are considered (advisory / non-gating workflows are ignored); if NONE of
-    the required workflows have a run for this SHA, the state is UNKNOWN (the gate
-    did not run → fail-closed), never SUCCESS.
+    set are considered (advisory / non-gating workflows are ignored).
 
     Then dedupe to the latest run per ``workflow_id`` (so a re-run / superseded
     older run doesn't false-fail): any non-``completed`` → PENDING; any completed
     run whose ``conclusion`` is not success/neutral/skipped → FAILURE; all
-    success → SUCCESS. No (considered) runs at all → UNKNOWN (fail-closed).
+    success → SUCCESS.
 
     ``required_workflows`` is a *checklist*, not just an allowlist: SUCCESS also
     requires that every name in the set has produced a run for this SHA. A required
     workflow GitHub Actions has not created a run for yet (delayed scheduling, a
     matrix not yet expanded) holds the gate PENDING — otherwise the subset that did
-    run could open the gate while a required workflow is still missing.
+    run could open the gate while a required workflow is still missing. With a
+    checklist an absent required run is *always* a wait state (PENDING), whether
+    NONE have been scheduled yet or only SOME — one reality, one state — never
+    UNKNOWN. UNKNOWN is reserved for the no-checklist case where the SHA has no CI
+    runs at all (plus read/parse failures upstream): the genuine "is there even CI
+    for this SHA?" fail-closed value, never SUCCESS.
     """
     latest: dict[Any, dict[str, Any]] = {}
     for run in workflow_runs:
@@ -185,6 +188,14 @@ def _derive_ci_state(
             latest[wid] = run
     runs = list(latest.values())
     if not runs:
+        # No considered runs. With a checklist this is the same "a required run
+        # hasn't been scheduled yet" wait as the partial-coverage case below →
+        # PENDING, not UNKNOWN (UNKNOWN's gate message misreports a token/permissions
+        # problem). Without a checklist, zero runs is the genuine "is there any CI
+        # for this SHA?" fail-closed UNKNOWN. (naysayer PR #111 round 2: don't split
+        # one reality across UNKNOWN/PENDING by Actions' scheduling timeline.)
+        if required_workflows:
+            return CiStatus(state=CiState.PENDING, head_sha=head_sha, failing=[])
         return CiStatus(state=CiState.UNKNOWN, head_sha=head_sha, failing=[])
     if any(run.get("status") != "completed" for run in runs):
         return CiStatus(state=CiState.PENDING, head_sha=head_sha, failing=[])
