@@ -282,6 +282,31 @@ def test_derive_ci_state_required_workflow_failure_still_fails() -> None:
     assert st.failing == ["voxel-gate"]
 
 
+def test_derive_ci_state_required_workflow_missing_run_is_pending() -> None:
+    # naysayer PR #111: with MULTIPLE required workflows, a required gate that has
+    # no run for this SHA yet (GitHub Actions hasn't scheduled it) must NOT let the
+    # subset that did run open the gate. backend-gate succeeded but frontend-gate is
+    # absent → PENDING (fail-closed), not SUCCESS.
+    runs = [_run(workflow_id=1, name="backend-gate", status="completed", conclusion="success")]
+    st = _derive_ci_state(
+        runs, "abc", required_workflows=frozenset({"backend-gate", "frontend-gate"})
+    )
+    assert st.state is CiState.PENDING
+    assert st.failing == []
+
+
+def test_derive_ci_state_required_workflows_full_coverage_is_success() -> None:
+    # Both required gates produced a successful run → coverage complete → SUCCESS.
+    runs = [
+        _run(workflow_id=1, name="backend-gate", status="completed", conclusion="success"),
+        _run(workflow_id=2, name="frontend-gate", status="completed", conclusion="success"),
+    ]
+    st = _derive_ci_state(
+        runs, "abc", required_workflows=frozenset({"backend-gate", "frontend-gate"})
+    )
+    assert st.state is CiState.SUCCESS
+
+
 def test_derive_ci_state_default_considers_all_workflows() -> None:
     # Unset (None) preserves prior behavior: an advisory pending still gates.
     runs = [

@@ -166,6 +166,12 @@ def _derive_ci_state(
     older run doesn't false-fail): any non-``completed`` → PENDING; any completed
     run whose ``conclusion`` is not success/neutral/skipped → FAILURE; all
     success → SUCCESS. No (considered) runs at all → UNKNOWN (fail-closed).
+
+    ``required_workflows`` is a *checklist*, not just an allowlist: SUCCESS also
+    requires that every name in the set has produced a run for this SHA. A required
+    workflow GitHub Actions has not created a run for yet (delayed scheduling, a
+    matrix not yet expanded) holds the gate PENDING — otherwise the subset that did
+    run could open the gate while a required workflow is still missing.
     """
     latest: dict[Any, dict[str, Any]] = {}
     for run in workflow_runs:
@@ -189,6 +195,16 @@ def _derive_ci_state(
     ]
     if failing:
         return CiStatus(state=CiState.FAILURE, head_sha=head_sha, failing=failing)
+    # Coverage check: with an explicit required-workflows checklist, every required
+    # workflow must have produced a run for this SHA before the gate can open. A
+    # required run GitHub Actions hasn't created yet would otherwise let the subset
+    # that did run open the gate — so a missing required workflow holds it PENDING
+    # (fail-closed), never SUCCESS. (naysayer PR #111: "required" is a checklist,
+    # not just an allowlist filter on the runs that happen to be present.)
+    if required_workflows:
+        present = {str(run.get("name") or "") for run in runs}
+        if not required_workflows <= present:
+            return CiStatus(state=CiState.PENDING, head_sha=head_sha, failing=[])
     return CiStatus(state=CiState.SUCCESS, head_sha=head_sha, failing=[])
 
 
