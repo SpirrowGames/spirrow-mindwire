@@ -130,6 +130,11 @@ class ConductorOutcome:
     stop_reason: StopReason
     last_msg_id: str | None
     forced_naysayer_turns: int
+    # Shadow / observability: forced consults on a NON-explicit-human terminal (a guard-(i)
+    # design→implement redirect or an ABSENT / Q-A turn) — exactly the ones that the cost lever
+    # ``force_naysayer_only_on_explicit_human`` would drop. With that lever off (default) this
+    # is the counterfactual saving; with it on it is ~0 (those consults no longer fire). Counted.
+    forced_naysayer_turns_saveable: int = 0
 
 
 class Conductor:
@@ -213,16 +218,21 @@ class Conductor:
         sessions: dict[str, SessionHandle] = {}
         processed_msg_id: str | None = None
         forced = 0
+        forced_saveable = 0
         for round_index in range(self._max_rounds):
             messages = await self._fetch_messages()
             if not messages:
-                return self._stop(round_index, StopReason.EMPTY, processed_msg_id, forced)
+                return self._stop(
+                    round_index, StopReason.EMPTY, processed_msg_id, forced, forced_saveable
+                )
             latest = messages[-1]
             latest_msg_id = _msg_id(latest)
             # No-progress guard: the role dispatched last round posted nothing new (empty reply /
             # self-filtered / handed to itself). Do not spin — flag a human (Obj3 spirit).
             if processed_msg_id is not None and latest_msg_id == processed_msg_id:
-                return self._stop(round_index, StopReason.NO_PROGRESS, latest_msg_id, forced)
+                return self._stop(
+                    round_index, StopReason.NO_PROGRESS, latest_msg_id, forced, forced_saveable
+                )
 
             handoff = resolve_handoff(_content(latest), self._roster)
 
@@ -239,7 +249,9 @@ class Conductor:
                 # (Tier B PR #103 round 4/5).
                 parsed_ref = parse_pr_ref(handoff.token) if handoff.token else None
                 if self._orchestrator is None or parsed_ref is None:
-                    return self._stop(round_index, StopReason.HUMAN, latest_msg_id, forced)
+                    return self._stop(
+                        round_index, StopReason.HUMAN, latest_msg_id, forced, forced_saveable
+                    )
                 verdict, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
                 # A missing relay id (post result with no msg_id) breaks no-progress tracking on
@@ -251,7 +263,7 @@ class Conductor:
                     or not self._implementer_identity
                 ):
                     last = relay_msg_id or latest_msg_id
-                    return self._stop(round_index, StopReason.HUMAN, last, forced)
+                    return self._stop(round_index, StopReason.HUMAN, last, forced, forced_saveable)
                 handle = sessions.get(self._implementer_identity)
                 if handle is None:
                     handle = await self._dispatcher.spawn_instance(
@@ -269,9 +281,15 @@ class Conductor:
             target_role, target_identity, is_forced, stop_reason = self._route(handoff, messages)
             if target_role is None:
                 assert stop_reason is not None  # _route always sets a reason when it stops
-                return self._stop(round_index, stop_reason, latest_msg_id, forced)
+                return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
             if is_forced:
                 forced += 1
+                # Saveable iff this forced consult is NOT on an explicit ``NEXT: human`` (i.e. a
+                # guard-(i) redirect or an ABSENT / Q-A terminal) — exactly what the cost lever
+                # ``force_naysayer_only_on_explicit_human`` would drop. Counted always, for the
+                # shadow measurement (read with the lever off to size the potential saving).
+                if handoff.kind is not HandoffKind.HUMAN:
+                    forced_saveable += 1
 
             handle = sessions.get(target_identity)
             if handle is None:
@@ -281,7 +299,9 @@ class Conductor:
                 sessions[target_identity] = handle
             await self._dispatcher.dispatch(handle, self._to_event(latest))
             processed_msg_id = latest_msg_id
-        return self._stop(self._max_rounds, StopReason.ROUND_CAP, processed_msg_id, forced)
+        return self._stop(
+            self._max_rounds, StopReason.ROUND_CAP, processed_msg_id, forced, forced_saveable
+        )
 
     def _route(
         self, handoff: Handoff, messages: list[dict[str, Any]]
@@ -502,17 +522,28 @@ class Conductor:
         )
 
     def _stop(
-        self, rounds: int, reason: StopReason, last_msg_id: str | None, forced: int
+        self,
+        rounds: int,
+        reason: StopReason,
+        last_msg_id: str | None,
+        forced: int,
+        forced_saveable: int = 0,
     ) -> ConductorOutcome:
         logger.info(
-            "conductor stopped: reason=%s rounds=%d forced_naysayer=%d last_msg=%s",
+            "conductor stopped: reason=%s rounds=%d forced_naysayer=%d "
+            "forced_naysayer_saveable=%d last_msg=%s",
             reason.value,
             rounds,
             forced,
+            forced_saveable,
             last_msg_id,
         )
         return ConductorOutcome(
-            rounds=rounds, stop_reason=reason, last_msg_id=last_msg_id, forced_naysayer_turns=forced
+            rounds=rounds,
+            stop_reason=reason,
+            last_msg_id=last_msg_id,
+            forced_naysayer_turns=forced,
+            forced_naysayer_turns_saveable=forced_saveable,
         )
 
 

@@ -56,3 +56,8 @@ max_review_rounds = 0
 # The GitHub login the naysayer submits reviews under (T22). The debounce counts only reviews by this
 # login, so other reviewers (Copilot, the author) are not mistaken for the naysayer's own.
 review_login = "spirrowgames-ops"
+# Shadow (observe-only) mode: compute + LOG the skip/cap decisions but DON'T act on them (the full
+# Gemini review still runs, so behaviour/coverage are unchanged). Set it together with
+# skip_if_head_unchanged / max_review_rounds to size the saving risk-free before enforcing.
+# (The conductor's forced-consult saving is always logged as forced_naysayer_saveable — no flag.)
+shadow = false

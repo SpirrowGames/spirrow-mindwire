@@ -290,6 +290,7 @@ def build_pr_review_driver(
         skip_if_head_unchanged=g.skip_if_head_unchanged,
         max_review_rounds=g.max_review_rounds,
         review_login=g.review_login,
+        shadow=g.shadow,
     )
 
 
@@ -533,10 +534,12 @@ async def run_conductor(settings: MindwireSettings) -> ConductorOutcome:
     try:
         outcome = await cond.run()
         logger.info(
-            "conductor finished: stop_reason=%s rounds=%d forced_naysayer=%d last_msg=%s",
+            "conductor finished: stop_reason=%s rounds=%d forced_naysayer=%d "
+            "forced_naysayer_saveable=%d last_msg=%s",
             outcome.stop_reason.value,
             outcome.rounds,
             outcome.forced_naysayer_turns,
+            outcome.forced_naysayer_turns_saveable,
             outcome.last_msg_id,
         )
         return outcome

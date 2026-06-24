@@ -62,6 +62,19 @@ unset preserves the prior behavior. See `deploy/mindwire.toml.example` for the i
 Enable in a dev run first and compare `forced_naysayer_turns` (logged at conductor finish) and the
 per-PR naysayer review counts against the baseline before flipping them on for the standing daemon.
 
+### Shadow measurement (size the savings risk-free)
+
+Both levers also have an observe-only mode that measures what they *would* save **without changing
+behaviour or coverage** — the full review still runs:
+
+- The conductor always logs `forced_naysayer_saveable` at finish — forced consults on a
+  non-explicit-human terminal that `force_naysayer_only_on_explicit_human` would drop. Read it with
+  that lever **off** to size Item 1's saving (no flag needed).
+- `[naysayer_gating].shadow = true` (with `skip_if_head_unchanged` / `max_review_rounds` set to the
+  policy you are evaluating) makes the PR-gate compute and log `would SKIP` / `would CAP` per review,
+  and surface `would_skip_head_unchanged` / `would_cap` on the outcome, while still running the full
+  review — so Item 2's saving is measured before you enforce it.
+
 ## Run
 
 ```powershell

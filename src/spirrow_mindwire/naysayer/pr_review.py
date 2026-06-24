@@ -29,6 +29,7 @@ caller fail-loud); an empty Lexora reply is likewise fail-loud.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -52,6 +53,8 @@ from ..lexora.client import (
     LexoraTimeoutError,
 )
 from .principles import NAYSAYER_MODEL_TIER, build_preamble, principles_version
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.principles)
 # Gemini 3.1 Pro (the current naysayer tier) is a reasoning model with a 1M+ token context: its
@@ -147,6 +150,8 @@ class PrReviewOutcome:
     timed_out: bool = False  # M2 (T34): the Lexora review timed out → degraded to fail-closed RC
     skipped_head_unchanged: bool = False  # debounce: re-review skipped (head unchanged since last)
     rounds_capped: bool = False  # debounce: review-round cap hit → COMMENT escalation to human
+    would_skip_head_unchanged: bool = False  # shadow: would-skip (head unchanged), measured
+    would_cap: bool = False  # shadow: would-cap (cap hit), measured not acted
 
 
 def _parse_verdict(critique: str) -> ReviewEvent:
@@ -236,12 +241,14 @@ class NaysayerPrReviewDriver:
         skip_if_head_unchanged: bool = False,
         max_review_rounds: int = 0,
         review_login: str = _DEFAULT_REVIEW_LOGIN,
+        shadow: bool = False,
     ) -> None:
         self._model = model
         self._max_tokens = max_tokens
         self._skip_if_head_unchanged = skip_if_head_unchanged
         self._max_review_rounds = max_review_rounds
         self._review_login = review_login
+        self._shadow = shadow
         self._lexora: LexoraChatClient = (
             lexora
             if lexora is not None
@@ -281,13 +288,47 @@ class NaysayerPrReviewDriver:
         # Debounce (cost lever, default off): consult the PR's prior naysayer reviews to (a) skip a
         # re-review of an unchanged head, or (b) cap the re-review rounds — both BEFORE the costly
         # Lexora/Gemini call, mirroring the L1 CI-gate short-circuit above. Fail-soft: an unreadable
-        # / empty review list disables both and falls through to a full review.
+        # / empty review list disables both and falls through to a full review. In ``shadow`` mode
+        # the same decisions are computed and LOGGED (the counterfactual saving) but NOT acted on —
+        # the full review still runs, so behaviour / coverage are unchanged while the saving is
+        # measured.
+        would_skip_head_unchanged = False
+        would_cap = False
         if self._skip_if_head_unchanged or self._max_review_rounds > 0:
             prior = [
                 r for r in await self._github.fetch_pr_reviews(pr) if r.login == self._review_login
             ]
-            if self._skip_if_head_unchanged:
-                skip = self._skip_unchanged_response(pr, ci, prior)
+            skip = (
+                self._skip_unchanged_response(pr, ci, prior)
+                if self._skip_if_head_unchanged
+                else None
+            )
+            # Count only the naysayer's own VERDICT reviews toward the cap (same _VERDICT_STATES as
+            # _latest_verdict_review). A CI-gate-hold COMMENT, a DISMISSED review, or the escalation
+            # COMMENT spent no Gemini review, so they must not inflate the round count — else a
+            # comment-only interaction would prematurely, and then permanently, escalate the gate
+            # (Copilot + naysayer review on #113).
+            verdict_rounds = sum(1 for r in prior if r.state in _VERDICT_STATES)
+            cap_hit = 0 < self._max_review_rounds <= verdict_rounds
+            if self._shadow:
+                if skip is not None:
+                    would_skip_head_unchanged = True
+                    logger.info(
+                        "naysayer debounce SHADOW: would SKIP %s (head %s already reviewed) "
+                        "— 1 Gemini review saved",
+                        pr.slug,
+                        ci.head_sha,
+                    )
+                if cap_hit:
+                    would_cap = True
+                    logger.info(
+                        "naysayer debounce SHADOW: would CAP %s (%d verdict reviews >= cap %d) "
+                        "— 1 Gemini review saved",
+                        pr.slug,
+                        verdict_rounds,
+                        self._max_review_rounds,
+                    )
+            else:
                 if skip is not None:
                     verdict, body = skip
                     await post_critique(body)
@@ -298,29 +339,24 @@ class NaysayerPrReviewDriver:
                         head_sha=ci.head_sha,
                         skipped_head_unchanged=True,
                     )
-            # Count only the naysayer's own VERDICT reviews toward the cap (same _VERDICT_STATES as
-            # _latest_verdict_review). A CI-gate-hold COMMENT, a DISMISSED review, or the escalation
-            # COMMENT spent no Gemini review, so they must not inflate the round count — else a
-            # comment-only interaction would prematurely, and then permanently, escalate the gate
-            # (Copilot + naysayer review on #113).
-            verdict_rounds = sum(1 for r in prior if r.state in _VERDICT_STATES)
-            if 0 < self._max_review_rounds <= verdict_rounds:
-                body = (
-                    f"Naysayer review-round cap reached for {pr.slug} "
-                    f"({verdict_rounds} prior verdict reviews >= cap {self._max_review_rounds}). "
-                    f"Escalating to the human (Tier-C) instead of spending another review — "
-                    f"the back-and-forth should be adjudicated, not re-litigated by the gate."
-                    f"\n\nVERDICT: COMMENT"
-                )
-                await post_critique(body)
-                await self._submit_review(pr, ReviewEvent.COMMENT, body)
-                return PrReviewOutcome(
-                    verdict=ReviewEvent.COMMENT,
-                    body=body,
-                    ci_state=ci.state,
-                    head_sha=ci.head_sha,
-                    rounds_capped=True,
-                )
+                if cap_hit:
+                    body = (
+                        f"Naysayer review-round cap reached for {pr.slug} "
+                        f"({verdict_rounds} prior verdict reviews >= "
+                        f"cap {self._max_review_rounds}). "
+                        f"Escalating to the human (Tier-C) instead of spending another review — "
+                        f"the back-and-forth should be adjudicated, not re-litigated by the gate."
+                        f"\n\nVERDICT: COMMENT"
+                    )
+                    await post_critique(body)
+                    await self._submit_review(pr, ReviewEvent.COMMENT, body)
+                    return PrReviewOutcome(
+                        verdict=ReviewEvent.COMMENT,
+                        body=body,
+                        ci_state=ci.state,
+                        head_sha=ci.head_sha,
+                        rounds_capped=True,
+                    )
 
         # CI green → content review (Lexora). Fail-closed: an unreachable GitHub raises here.
         diff = await self._github.fetch_pr_diff(pr)
@@ -362,6 +398,8 @@ class NaysayerPrReviewDriver:
             finish_reason=completion.finish_reason,
             model=completion.model or self._model,
             principles_version=principles_version(),
+            would_skip_head_unchanged=would_skip_head_unchanged,
+            would_cap=would_cap,
         )
 
     async def _degrade_on_timeout(
