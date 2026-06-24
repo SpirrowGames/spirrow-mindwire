@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent
+from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent, ReviewInfo
 from spirrow_mindwire.magickit.client import MagickitMcpError
 from spirrow_mindwire.magickit.watcher import ChatroomWatcher, WatchSpec
 from spirrow_mindwire.naysayer.pr_review import PostCritique, PrReviewOutcome
@@ -198,6 +198,9 @@ class _FakeGitHubCi:
 
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
         return self._ci
+
+    async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
+        return []
 
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         raise NotImplementedError

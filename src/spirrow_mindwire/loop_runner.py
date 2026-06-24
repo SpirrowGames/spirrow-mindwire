@@ -74,7 +74,7 @@ from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome
-from .config import MindwireSettings, Stage3LoopConfig, load_settings
+from .config import MindwireSettings, NaysayerGatingConfig, Stage3LoopConfig, load_settings
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
     EVENT_FIELD_AUTHOR,
@@ -277,9 +277,20 @@ def build_naysayer(repo_dir: Path) -> NaysayerSdkAdapter:
     return NaysayerSdkAdapter(cwd=repo_dir)
 
 
-def build_pr_review_driver() -> NaysayerPrReviewDriver:
-    """The Tier B develop→main PR-review driver (Lexora one-shot + GitHub T22, env-resolved)."""
-    return NaysayerPrReviewDriver()
+def build_pr_review_driver(
+    gating: NaysayerGatingConfig | None = None,
+) -> NaysayerPrReviewDriver:
+    """The Tier B develop→main PR-review driver (Lexora one-shot + GitHub T22, env-resolved).
+
+    ``gating`` (default-off when ``None``) supplies the PR-review debounce knobs
+    (``[naysayer_gating]``): skip a re-review of an unchanged head, and cap the re-review rounds.
+    """
+    g = gating or NaysayerGatingConfig()
+    return NaysayerPrReviewDriver(
+        skip_if_head_unchanged=g.skip_if_head_unchanged,
+        max_review_rounds=g.max_review_rounds,
+        review_login=g.review_login,
+    )
 
 
 def build_watches(cfg: Stage3LoopConfig) -> tuple[WatchSpec, ...]:
@@ -380,7 +391,7 @@ def build_loop(
         settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer
     )
     if pr_review_driver is None:
-        pr_review_driver = build_pr_review_driver()
+        pr_review_driver = build_pr_review_driver(settings.naysayer_gating)
 
     watches = build_watches(cfg)
     # Constructor watches=() — each watch is added via add_watch() in run_loop so
@@ -478,7 +489,7 @@ def build_conductor(
         settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer
     )
     if pr_review_driver is None:
-        pr_review_driver = build_pr_review_driver()
+        pr_review_driver = build_pr_review_driver(settings.naysayer_gating)
     # PR-gate (PR-2b-2): the conductor fires the Tier B independent naysayer review synchronously on
     # a ``NEXT: pr-review <ref>`` via this orchestrator (the same one build_loop wires for the
     # watcher path) — driver-化 unify, ADR-19 N-1; no parallel watcher is added.
@@ -493,6 +504,7 @@ def build_conductor(
             naysayer_identity=cond_cfg.naysayer_identity,
             human_identity=cond_cfg.human_identity,
             max_rounds=cond_cfg.max_rounds,
+            force_naysayer_only_on_explicit_human=cond_cfg.force_naysayer_only_on_explicit_human,
             orchestrator=orchestrator,
         )
     except ValueError as exc:

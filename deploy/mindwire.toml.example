@@ -28,6 +28,11 @@ naysayer_identity = "Einstein"
 human_identity = "human"
 # Runaway backstop: max serial turns before the conductor stops (default 40).
 max_rounds = 40
+# Cost lever (default false). When true, the conductor forces an Obj2 naysayer consult ONLY on an
+# explicit `NEXT: human` (the genuine Tier-C handoff) — not on a guard-(i) design->implement redirect
+# or an ABSENT / Q-A un-routed turn, which then fall straight through to the human. Trims redundant
+# design-loop naysayer (Gemini) calls; the per-segment single-consult bound is unchanged.
+force_naysayer_only_on_explicit_human = false
 
 # Chatroom identity -> role map. The NEXT: vocabulary is the persona name; the conductor authors
 # each reply under that name. Reserved words `human` / `none` are NOT roster entries.
@@ -35,3 +40,19 @@ max_rounds = 40
 Bohr = "proposer"
 Heisenberg = "implementer"
 Einstein = "naysayer"
+
+# PR-review debounce knobs (cost levers, all default-off). They trim redundant Tier B re-reviews —
+# a PR averaged ~2.4 naysayer reviews (max 13) because each implementer fix push re-fired a full
+# Gemini review. Leave unset/false to keep the prior behavior (a full review on every fire).
+[naysayer_gating]
+# Skip the (costly) Gemini review and reuse the prior verdict when the naysayer has already reviewed
+# THIS exact head SHA (its last verdict review's commit_id == the PR head) — catches accidental /
+# reflexive re-fires on an unchanged commit.
+skip_if_head_unchanged = false
+# Cap on naysayer reviews per PR before escalating to the human (0 = disabled). At the cap the gate
+# short-circuits to a COMMENT (which routes the conductor to the human Tier-C, not back into the
+# implementer fix loop) instead of spending another Gemini review. Bounds the long re-review tail.
+max_review_rounds = 0
+# The GitHub login the naysayer submits reviews under (T22). The debounce counts only reviews by this
+# login, so other reviewers (Copilot, the author) are not mistaken for the naysayer's own.
+review_login = "spirrowgames-ops"

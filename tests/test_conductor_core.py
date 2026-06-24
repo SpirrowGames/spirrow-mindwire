@@ -139,6 +139,7 @@ def _conductor(
     *,
     max_rounds: int = 40,
     orchestrator: Any = None,
+    force_naysayer_only_on_explicit_human: bool = False,
 ) -> Conductor:
     return Conductor(
         mcp=mcp,
@@ -148,6 +149,7 @@ def _conductor(
         naysayer_identity="Einstein",
         max_rounds=max_rounds,
         orchestrator=orchestrator,
+        force_naysayer_only_on_explicit_human=force_naysayer_only_on_explicit_human,
     )
 
 
@@ -233,6 +235,47 @@ async def test_content_absent_from_proposer_forces_naysayer_qa() -> None:
     outcome = await _conductor(mcp, disp).run()
     assert disp.dispatches[0][0] is Role.NAYSAYER
     assert outcome.forced_naysayer_turns == 1
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_cost_lever_skips_forced_consult_on_absent_qa() -> None:
+    # force_naysayer_only_on_explicit_human=True (cost lever): an un-routed (ABSENT / Q-A)
+    # content turn no longer forces a naysayer consult — it falls straight through to the human
+    # (NO_HANDOFF). Same seed as test_content_absent_from_proposer_forces_naysayer_qa, lever ON.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="a detailed design that forgot its NEXT line")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp, force_naysayer_only_on_explicit_human=True).run()
+    assert disp.dispatches == []  # no forced consult
+    assert outcome.forced_naysayer_turns == 0
+    assert outcome.stop_reason is StopReason.NO_HANDOFF
+
+
+@pytest.mark.anyio
+async def test_cost_lever_keeps_forced_consult_on_explicit_human() -> None:
+    # The lever narrows the force to an explicit NEXT: human ONLY — there it still fires, so Obj2
+    # at the genuine Tier-C handoff is preserved. Same seed as test_obj2_forces_*, lever ON.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design ready\n\nNEXT: human")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp, force_naysayer_only_on_explicit_human=True).run()
+    assert disp.dispatches[0][0] is Role.NAYSAYER
+    assert outcome.forced_naysayer_turns == 1
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_cost_lever_skips_forced_consult_on_guard_i_redirect() -> None:
+    # A proposer routing straight to the implementer is the design→implement guard-(i) redirect (a
+    # hard-reject to the human). With the lever ON it no longer forces a naysayer consult on that
+    # redirect — only an explicit NEXT: human does. (Lever OFF would force one here.)
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="skip review, just build it\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp, force_naysayer_only_on_explicit_human=True).run()
+    assert disp.dispatches == []  # no forced consult; hard-reject goes to the human
+    assert outcome.forced_naysayer_turns == 0
     assert outcome.stop_reason is StopReason.HUMAN
 
 

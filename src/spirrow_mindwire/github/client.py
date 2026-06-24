@@ -129,6 +129,16 @@ class CiStatus:
     failing: list[str]  # names of failing workflow runs (for the REQUEST_CHANGES body)
 
 
+@dataclass(frozen=True)
+class ReviewInfo:
+    """A submitted PR review (the subset the naysayer debounce reads)."""
+
+    login: str  # the reviewer's GitHub login (``user.login``)
+    state: str  # APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED / PENDING
+    commit_id: str | None  # the head SHA the review was submitted against
+    submitted_at: str | None
+
+
 # Run conclusions that count as "not a failure" (ADR-16 §D-4 state mapping).
 _CI_OK_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 
@@ -256,6 +266,8 @@ class GitHubReviewClient(Protocol):
 
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus: ...
 
+    async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]: ...
+
     async def submit_review(
         self, pr: PrRef, *, event: ReviewEvent, body: str
     ) -> dict[str, Any]: ...
@@ -378,6 +390,55 @@ class GitHubClient:
             _required_workflows_from_env(),
         )
 
+    async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
+        """``GET /repos/{owner}/{repo}/pulls/{n}/reviews`` → submitted reviews (paginated).
+
+        Fail-soft: any network / non-2xx / parse failure returns ``[]`` — a debounce that cannot
+        read the prior reviews simply proceeds to a full review (the safe, costlier path), unlike
+        the fail-loud diff fetch / review submit. Pages of 100 are followed until a short page (a PR
+        has far fewer than 100 reviews in practice, so this is usually a single request).
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
+        out: list[ReviewInfo] = []
+        page = 1
+        while True:
+            try:
+                resp = await self._client.get(path, params={"per_page": 100, "page": page})
+            except httpx.RequestError as exc:
+                logger.warning("fetch_pr_reviews: GET %s failed: %s (fail-soft [])", path, exc)
+                return []
+            if resp.status_code >= 400:
+                logger.warning(
+                    "fetch_pr_reviews: GET %s -> %s (fail-soft [])", path, resp.status_code
+                )
+                return []
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                logger.warning("fetch_pr_reviews: malformed JSON: %s (fail-soft [])", exc)
+                return []
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                user = row.get("user")
+                login = str(user.get("login") or "") if isinstance(user, dict) else ""
+                cid = row.get("commit_id")
+                submitted = row.get("submitted_at")
+                out.append(
+                    ReviewInfo(
+                        login=login,
+                        state=str(row.get("state") or ""),
+                        commit_id=str(cid) if cid else None,
+                        submitted_at=str(submitted) if submitted else None,
+                    )
+                )
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event."""
         path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
@@ -417,6 +478,7 @@ __all__ = [
     "GitHubReviewClient",
     "PrRef",
     "ReviewEvent",
+    "ReviewInfo",
     "github_token",
     "naysayer_github_token",
     "parse_pr_ref",
