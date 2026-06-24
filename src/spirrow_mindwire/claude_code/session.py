@@ -197,7 +197,14 @@ async def invoke_claude_code(
     if absolute_timeout_seconds is None:
         return await _drain()
     try:
-        return await asyncio.wait_for(_drain(), timeout=absolute_timeout_seconds)
+        # ``asyncio.timeout()`` (3.11+), NOT ``asyncio.wait_for(_drain(), ...)``: a nested
+        # ``wait_for`` (the inner idle ``wait_for`` inside ``_drain``) can swallow the outer
+        # cancellation under some event-loop schedulers — observed deterministically under the
+        # anyio asyncio backend on Windows, where the absolute timeout never fired and ``_drain``
+        # ran to completion. ``asyncio.timeout`` is the cancellation-correct primitive and enforces
+        # the cap on both the plain-asyncio daemon loop and the anyio test harness.
+        async with asyncio.timeout(absolute_timeout_seconds):
+            return await _drain()
     except InvokeTimeoutError:
         # Inner ``_drain`` raised an idle (or any future kind of)
         # ``InvokeTimeoutError``; propagate as-is. Without this explicit
