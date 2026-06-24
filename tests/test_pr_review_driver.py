@@ -241,6 +241,30 @@ async def test_debounce_counts_only_naysayer_login() -> None:
 
 
 @pytest.mark.anyio
+async def test_round_cap_counts_only_verdict_reviews() -> None:
+    # Non-verdict reviews by the naysayer login (a CI-gate-hold COMMENT, a DISMISSED review, the
+    # escalation COMMENT itself) must NOT count toward the cap — only APPROVED / CHANGES_REQUESTED
+    # do. Counting COMMENTs would prematurely and then permanently escalate the gate (Copilot +
+    # naysayer review on #113).
+    lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s1", "2026-06-10T00:00:01Z"),
+            ReviewInfo("spirrowgames-ops", "COMMENTED", "s2", "2026-06-10T00:00:02Z"),
+            ReviewInfo("spirrowgames-ops", "DISMISSED", "s3", "2026-06-10T00:00:03Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, max_review_rounds=2)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    # Only 1 verdict review (CHANGES_REQUESTED) < cap 2 → NOT capped; a full review runs.
+    assert len(lexora.calls) == 1
+    assert outcome.rounds_capped is False
+
+
+@pytest.mark.anyio
 async def test_approve_flow() -> None:
     lexora = _FakeLexora(content="all good\n\nVERDICT: APPROVE")
     github = _FakeGitHub()

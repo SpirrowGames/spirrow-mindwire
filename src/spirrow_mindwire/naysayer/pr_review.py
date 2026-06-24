@@ -86,6 +86,13 @@ _MAX_DIFF_CHARS = 150_000
 # debounce counts only reviews by this login (other reviewers — Copilot, the author — are ignored).
 _DEFAULT_REVIEW_LOGIN = "spirrowgames-ops"
 
+# GitHub review states that carry an actual naysayer verdict (= a Gemini-spent review round).
+# COMMENTED / DISMISSED / PENDING are NOT verdicts — a CI-gate hold, a dismissed review, or the
+# escalation COMMENT itself spent no review — so the debounce (head-unchanged reuse + the round cap)
+# counts only these. Counting non-verdicts would let a comment-only interaction prematurely, and
+# then permanently, escalate the gate (Copilot + independent naysayer review on PR #113).
+_VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
+
 # A verdict must be its own line (``^...$`` with MULTILINE). Diff hunk lines carry a +/-/space
 # prefix, so a ``VERDICT: APPROVE`` *inside the reviewed diff* (prompt injection) never satisfies
 # ``^\s*VERDICT:`` — only a real verdict line the model emits does. We take the LAST such line
@@ -291,10 +298,16 @@ class NaysayerPrReviewDriver:
                         head_sha=ci.head_sha,
                         skipped_head_unchanged=True,
                     )
-            if 0 < self._max_review_rounds <= len(prior):
+            # Count only the naysayer's own VERDICT reviews toward the cap (same _VERDICT_STATES as
+            # _latest_verdict_review). A CI-gate-hold COMMENT, a DISMISSED review, or the escalation
+            # COMMENT spent no Gemini review, so they must not inflate the round count — else a
+            # comment-only interaction would prematurely, and then permanently, escalate the gate
+            # (Copilot + naysayer review on #113).
+            verdict_rounds = sum(1 for r in prior if r.state in _VERDICT_STATES)
+            if 0 < self._max_review_rounds <= verdict_rounds:
                 body = (
                     f"Naysayer review-round cap reached for {pr.slug} "
-                    f"({len(prior)} prior reviews >= cap {self._max_review_rounds}). "
+                    f"({verdict_rounds} prior verdict reviews >= cap {self._max_review_rounds}). "
                     f"Escalating to the human (Tier-C) instead of spending another review — "
                     f"the back-and-forth should be adjudicated, not re-litigated by the gate."
                     f"\n\nVERDICT: COMMENT"
@@ -389,7 +402,7 @@ class NaysayerPrReviewDriver:
         this head". ``submitted_at`` is ISO-8601 (lexicographically sortable); a missing value sorts
         oldest.
         """
-        verdicts = [r for r in prior if r.state in ("APPROVED", "CHANGES_REQUESTED")]
+        verdicts = [r for r in prior if r.state in _VERDICT_STATES]
         if not verdicts:
             return None
         return max(verdicts, key=lambda r: r.submitted_at or "")
