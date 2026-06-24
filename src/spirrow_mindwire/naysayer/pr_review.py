@@ -378,7 +378,13 @@ class NaysayerPrReviewDriver:
             # old code's unhandled LexoraHTTPError produced). Non-timeout LexoraHTTPError
             # (unreachable / 5xx / unknown tier) is NOT caught here, so it keeps propagating
             # (fail-loud).
-            return await self._degrade_on_timeout(pr, ci, post_critique=post_critique)
+            return await self._degrade_on_timeout(
+                pr,
+                ci,
+                post_critique=post_critique,
+                would_skip_head_unchanged=would_skip_head_unchanged,
+                would_cap=would_cap,
+            )
         body = (completion.content or "").strip()
         if not body:
             raise NaysayerPrReviewError(
@@ -406,7 +412,13 @@ class NaysayerPrReviewDriver:
         )
 
     async def _degrade_on_timeout(
-        self, pr: PrRef, ci: CiStatus, *, post_critique: PostCritique
+        self,
+        pr: PrRef,
+        ci: CiStatus,
+        *,
+        post_critique: PostCritique,
+        would_skip_head_unchanged: bool = False,
+        would_cap: bool = False,
     ) -> PrReviewOutcome:
         """M2 (T34): a timed-out Lexora review → fail-closed REQUEST_CHANGES (never a silent pass).
 
@@ -433,6 +445,10 @@ class NaysayerPrReviewDriver:
             model=self._model,
             principles_version=principles_version(),
             timed_out=True,
+            # Preserve the shadow counterfactual flags across the timeout degrade so per-PR
+            # object-level telemetry matches the SHADOW log lines (naysayer #114 weakest point).
+            would_skip_head_unchanged=would_skip_head_unchanged,
+            would_cap=would_cap,
         )
 
     @staticmethod
