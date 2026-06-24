@@ -519,3 +519,10 @@ def test_naysayer_gating_extra_key_raises() -> None:
     """Unknown keys under ``[naysayer_gating]`` fail loud (strict='forbid')."""
     with pytest.raises(ValidationError):
         NaysayerGatingConfig(bogus=True)  # type: ignore[call-arg]
+
+
+def test_naysayer_gating_shadow_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shadow (observe-only) flag defaults off and is env-overridable."""
+    assert MindwireSettings().naysayer_gating.shadow is False
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_GATING__SHADOW", "true")
+    assert MindwireSettings().naysayer_gating.shadow is True

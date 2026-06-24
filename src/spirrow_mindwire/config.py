@@ -408,6 +408,14 @@ class NaysayerGatingConfig(_StrictModel):
     head-unchanged / round-cap state counts only reviews by this login, so other reviewers (Copilot,
     the author) are not mistaken for the naysayer's own re-reviews."""
 
+    shadow: bool = False
+    """Shadow (observe-only) mode for the PR-gate debounce. When True the skip / cap decisions are
+    computed and LOGGED (the counterfactual saving, surfaced on the outcome as
+    ``would_skip_head_unchanged`` / ``would_cap``) but NOT acted on — the full Gemini review still
+    runs, so behaviour and coverage are unchanged while the saving is measured. Set
+    ``skip_if_head_unchanged`` / ``max_review_rounds`` to the policy you are evaluating, then read
+    the logs before enforcing. Env: ``MINDWIRE_NAYSAYER_GATING__SHADOW=true``."""
+
 
 class MindwireSettings(BaseSettings):
     """Top-level MindWire configuration.

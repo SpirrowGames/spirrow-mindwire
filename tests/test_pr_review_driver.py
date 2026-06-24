@@ -265,6 +265,78 @@ async def test_round_cap_counts_only_verdict_reviews() -> None:
 
 
 @pytest.mark.anyio
+async def test_shadow_mode_measures_skip_without_acting() -> None:
+    # shadow=True: the head-unchanged skip is computed + recorded (would_skip_head_unchanged) but
+    # NOT acted on — the full Gemini review still runs (no behaviour / coverage change).
+    lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=github, skip_if_head_unchanged=True, shadow=True
+    )
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert len(lexora.calls) == 1  # full review ran (NOT skipped)
+    assert outcome.would_skip_head_unchanged is True
+    assert outcome.skipped_head_unchanged is False
+
+
+@pytest.mark.anyio
+async def test_shadow_mode_measures_cap_without_acting() -> None:
+    # shadow=True: the round cap is computed + recorded (would_cap) but NOT acted on — the full
+    # review runs and is submitted, instead of a cap-escalation COMMENT.
+    lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s1", "2026-06-10T00:00:01Z"),
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s2", "2026-06-10T00:00:02Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, max_review_rounds=2, shadow=True)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert len(lexora.calls) == 1  # full review ran (NOT capped)
+    assert outcome.would_cap is True
+    assert outcome.rounds_capped is False
+    assert [event for _, event, _ in github.submitted] == [ReviewEvent.APPROVE]
+
+
+@pytest.mark.anyio
+async def test_shadow_skip_takes_precedence_over_cap() -> None:
+    # A PR meeting BOTH the head-unchanged skip AND the round cap counts as ONE saved review (skip
+    # precedence, mirroring the enforcing path) — not double-counted (naysayer review on #114).
+    lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            # 2 verdict reviews (>= cap 2); the latest is against the current head (→ skip too).
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "old", "2026-06-10T00:00:01Z"),
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:02Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora,
+        github=github,
+        skip_if_head_unchanged=True,
+        max_review_rounds=2,
+        shadow=True,
+    )
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.would_skip_head_unchanged is True  # skip wins
+    assert outcome.would_cap is False  # NOT also counted (no double-count)
+    assert len(lexora.calls) == 1  # shadow: the full review still runs
+
+
+@pytest.mark.anyio
 async def test_approve_flow() -> None:
     lexora = _FakeLexora(content="all good\n\nVERDICT: APPROVE")
     github = _FakeGitHub()

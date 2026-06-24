@@ -130,6 +130,11 @@ class ConductorOutcome:
     stop_reason: StopReason
     last_msg_id: str | None
     forced_naysayer_turns: int
+    # Shadow / observability: forced consults on a NON-explicit-human terminal (a guard-(i)
+    # design→implement redirect or an ABSENT / Q-A turn) — exactly the ones that the cost lever
+    # ``force_naysayer_only_on_explicit_human`` would drop. With that lever off (default) this
+    # is the counterfactual saving; with it on it is ~0 (those consults no longer fire). Counted.
+    forced_naysayer_turns_saveable: int = 0
 
 
 class Conductor:
@@ -213,16 +218,21 @@ class Conductor:
         sessions: dict[str, SessionHandle] = {}
         processed_msg_id: str | None = None
         forced = 0
+        forced_saveable = 0
         for round_index in range(self._max_rounds):
             messages = await self._fetch_messages()
             if not messages:
-                return self._stop(round_index, StopReason.EMPTY, processed_msg_id, forced)
+                return self._stop(
+                    round_index, StopReason.EMPTY, processed_msg_id, forced, forced_saveable
+                )
             latest = messages[-1]
             latest_msg_id = _msg_id(latest)
             # No-progress guard: the role dispatched last round posted nothing new (empty reply /
             # self-filtered / handed to itself). Do not spin — flag a human (Obj3 spirit).
             if processed_msg_id is not None and latest_msg_id == processed_msg_id:
-                return self._stop(round_index, StopReason.NO_PROGRESS, latest_msg_id, forced)
+                return self._stop(
+                    round_index, StopReason.NO_PROGRESS, latest_msg_id, forced, forced_saveable
+                )
 
             handoff = resolve_handoff(_content(latest), self._roster)
 
@@ -239,7 +249,9 @@ class Conductor:
                 # (Tier B PR #103 round 4/5).
                 parsed_ref = parse_pr_ref(handoff.token) if handoff.token else None
                 if self._orchestrator is None or parsed_ref is None:
-                    return self._stop(round_index, StopReason.HUMAN, latest_msg_id, forced)
+                    return self._stop(
+                        round_index, StopReason.HUMAN, latest_msg_id, forced, forced_saveable
+                    )
                 verdict, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
                 # A missing relay id (post result with no msg_id) breaks no-progress tracking on
@@ -251,7 +263,7 @@ class Conductor:
                     or not self._implementer_identity
                 ):
                     last = relay_msg_id or latest_msg_id
-                    return self._stop(round_index, StopReason.HUMAN, last, forced)
+                    return self._stop(round_index, StopReason.HUMAN, last, forced, forced_saveable)
                 handle = sessions.get(self._implementer_identity)
                 if handle is None:
                     handle = await self._dispatcher.spawn_instance(
@@ -266,12 +278,19 @@ class Conductor:
                 processed_msg_id = relay_msg_id
                 continue
 
-            target_role, target_identity, is_forced, stop_reason = self._route(handoff, messages)
+            target_role, target_identity, is_forced, is_saveable, stop_reason = self._route(
+                handoff, messages
+            )
             if target_role is None:
                 assert stop_reason is not None  # _route always sets a reason when it stops
-                return self._stop(round_index, stop_reason, latest_msg_id, forced)
+                return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
             if is_forced:
                 forced += 1
+                # ``is_saveable`` comes from _route (the single source of truth for the forcing
+                # decision), so the shadow metric can never drift from the lever it shadows. Counted
+                # always; read it with the lever off to size the potential saving.
+                if is_saveable:
+                    forced_saveable += 1
 
             handle = sessions.get(target_identity)
             if handle is None:
@@ -281,15 +300,21 @@ class Conductor:
                 sessions[target_identity] = handle
             await self._dispatcher.dispatch(handle, self._to_event(latest))
             processed_msg_id = latest_msg_id
-        return self._stop(self._max_rounds, StopReason.ROUND_CAP, processed_msg_id, forced)
+        return self._stop(
+            self._max_rounds, StopReason.ROUND_CAP, processed_msg_id, forced, forced_saveable
+        )
 
     def _route(
         self, handoff: Handoff, messages: list[dict[str, Any]]
-    ) -> tuple[Role | None, str, bool, StopReason | None]:
+    ) -> tuple[Role | None, str, bool, bool, StopReason | None]:
         """Decide who to dispatch (``role is None`` = stop with the returned ``StopReason``).
 
-        Returns ``(target_role, target_identity, is_forced, stop_reason)``; exactly one of
-        ``target_role`` / ``stop_reason`` is set. The routing precedence:
+        Returns ``(target_role, target_identity, is_forced, is_saveable, stop_reason)``; exactly one
+        of ``target_role`` / ``stop_reason`` is set. ``is_saveable`` (the shadow flag) is ``True``
+        iff this forced consult is on a non-explicit-human terminal (a guard-(i) redirect or an
+        ABSENT / Q-A turn) — exactly what ``force_naysayer_only_on_explicit_human`` would drop.
+        Deciding it HERE, with the forcing logic, keeps it the single source of truth so the
+        counterfactual metric cannot drift from the lever it shadows. The routing precedence:
 
         - **guard (i)** — a handoff to the implementer from any non-human author is the
           design→implement Tier-C gate (msg-543): redirect to the human terminal unless carve-out ①
@@ -309,7 +334,7 @@ class Conductor:
             if self._is_human(author):
                 # carve-out ① human-authored Tier-C decide. Tier-C msg-553 / msg-557.
                 assert handoff.identity is not None
-                return handoff.role, handoff.identity, False, None
+                return handoff.role, handoff.identity, False, False, None
             # carve-out ③ (D-4, msg-602): under active human delegation, the INDEPENDENT naysayer's
             # OWN proceed-handoff to the implementer is honored without a per-step human GO. *Only*
             # the naysayer may advance to code under delegation — the proposer cannot self-advance,
@@ -321,7 +346,7 @@ class Conductor:
             # proceed-handoff and falls through to the human terminal below.
             if author_role is self._naysayer_role and self._delegation_active(messages):
                 assert handoff.identity is not None
-                return handoff.role, handoff.identity, False, None
+                return handoff.role, handoff.identity, False, False, None
             # guard-(i) redirect is NOT an explicit human handoff: under the cost lever it does not
             # force a consult (explicit_human=False).
             return self._human_terminal(messages, explicit_human=False)
@@ -331,10 +356,10 @@ class Conductor:
 
         if handoff.kind is HandoffKind.ROLE:
             assert handoff.role is not None and handoff.identity is not None
-            return handoff.role, handoff.identity, False, None
+            return handoff.role, handoff.identity, False, False, None
 
         if handoff.kind is HandoffKind.NONE:
-            return None, "", False, StopReason.SETTLED
+            return None, "", False, False, StopReason.SETTLED
 
         # ABSENT — guard (ii) / Q-A reversal (msg-542 Demand 2): a content-bearing turn that fails
         # to route still terminates at the human, but a non-naysayer's un-reviewed content must
@@ -349,12 +374,13 @@ class Conductor:
             and _content(messages[-1]).strip()
             and not self._naysayer_consulted(messages)
         ):
-            return self._naysayer_role, self._naysayer_identity, True, None
-        return None, "", False, StopReason.NO_HANDOFF
+            # ABSENT / Q-A is a non-explicit-human terminal → saveable.
+            return self._naysayer_role, self._naysayer_identity, True, True, None
+        return None, "", False, False, StopReason.NO_HANDOFF
 
     def _human_terminal(
         self, messages: list[dict[str, Any]], *, explicit_human: bool = True
-    ) -> tuple[Role | None, str, bool, StopReason | None]:
+    ) -> tuple[Role | None, str, bool, bool, StopReason | None]:
         """Resolve a turn that terminates at the human (explicit ``NEXT: human`` or a guard (i)
         redirect): force one naysayer consult if none has happened in this segment (Obj2 —
         consultation, not veto), otherwise stop at the human for the Tier-C decision.
@@ -372,8 +398,13 @@ class Conductor:
             and not self._is_human(author)
             and not self._naysayer_consulted(messages)
         ):
-            return self._naysayer_role, self._naysayer_identity, True, None
-        return None, "", False, StopReason.HUMAN
+            # ``is_saveable`` = NOT an explicit ``NEXT: human`` (a guard-(i) redirect, where _route
+            # called us with explicit_human=False). This branch IS reachable with the lever OFF: the
+            # condition above is ``explicit_human OR not self._force_only_on_explicit_human``, so it
+            # fires for explicit_human=False too. An explicit human handoff (explicit_human=True) is
+            # kept (not saveable). Covered by test_forced_naysayer_saveable_counts_guard_i_redirect.
+            return self._naysayer_role, self._naysayer_identity, True, not explicit_human, None
+        return None, "", False, False, StopReason.HUMAN
 
     def _delegation_active(self, messages: list[dict[str, Any]]) -> bool:
         """Is human design→implement delegation active (carve-out ③ / D-4)?
@@ -502,17 +533,28 @@ class Conductor:
         )
 
     def _stop(
-        self, rounds: int, reason: StopReason, last_msg_id: str | None, forced: int
+        self,
+        rounds: int,
+        reason: StopReason,
+        last_msg_id: str | None,
+        forced: int,
+        forced_saveable: int = 0,
     ) -> ConductorOutcome:
         logger.info(
-            "conductor stopped: reason=%s rounds=%d forced_naysayer=%d last_msg=%s",
+            "conductor stopped: reason=%s rounds=%d forced_naysayer=%d "
+            "forced_naysayer_saveable=%d last_msg=%s",
             reason.value,
             rounds,
             forced,
+            forced_saveable,
             last_msg_id,
         )
         return ConductorOutcome(
-            rounds=rounds, stop_reason=reason, last_msg_id=last_msg_id, forced_naysayer_turns=forced
+            rounds=rounds,
+            stop_reason=reason,
+            last_msg_id=last_msg_id,
+            forced_naysayer_turns=forced,
+            forced_naysayer_turns_saveable=forced_saveable,
         )
 
 

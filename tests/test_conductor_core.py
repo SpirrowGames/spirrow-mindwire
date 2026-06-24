@@ -280,6 +280,43 @@ async def test_cost_lever_skips_forced_consult_on_guard_i_redirect() -> None:
 
 
 @pytest.mark.anyio
+async def test_forced_naysayer_saveable_counts_non_explicit_human() -> None:
+    # Shadow metric (lever OFF): a forced consult on a non-explicit-human terminal (here an
+    # ABSENT / Q-A turn) is "saveable" — the count force_naysayer_only_on_explicit_human would drop.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="a detailed design that forgot its NEXT line")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.forced_naysayer_turns == 1
+    assert outcome.forced_naysayer_turns_saveable == 1  # ABSENT terminal → saveable
+
+
+@pytest.mark.anyio
+async def test_forced_naysayer_saveable_counts_guard_i_redirect() -> None:
+    # A guard-(i) design→implement redirect (the proposer routes straight to the implementer) forces
+    # a naysayer consult on a non-explicit-human terminal — so it is "saveable" (lever OFF). Proves
+    # the _human_terminal(explicit_human=False) saveable path is reachable: the condition is
+    # ``explicit_human OR not force_only_on_explicit_human``, so it fires for explicit_human=False.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="skip review, just build it\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.forced_naysayer_turns == 1
+    assert outcome.forced_naysayer_turns_saveable == 1  # guard-(i) redirect → saveable
+
+
+@pytest.mark.anyio
+async def test_forced_naysayer_explicit_human_not_saveable() -> None:
+    # An explicit NEXT: human forced consult is NOT saveable (the lever keeps it).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design ready\n\nNEXT: human")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.forced_naysayer_turns == 1
+    assert outcome.forced_naysayer_turns_saveable == 0  # explicit NEXT: human → not saveable
+
+
+@pytest.mark.anyio
 async def test_absent_from_naysayer_routes_to_human() -> None:
     # The naysayer's own un-routed turn is not re-reviewed: ABSENT from the naysayer falls straight
     # to the human fallback (Obj3), no forced consult.
