@@ -19,6 +19,7 @@ from spirrow_mindwire.github.client import (
     GitHubHTTPError,
     PrRef,
     ReviewEvent,
+    ReviewInfo,
 )
 from spirrow_mindwire.lexora.client import (
     LEXORA_BACKEND_TIMEOUT_SECONDS,
@@ -81,11 +82,13 @@ class _FakeGitHub:
         fetch_exc: Exception | None = None,
         submit_exc: Exception | None = None,
         ci: CiStatus | None = None,
+        reviews: list[ReviewInfo] | None = None,
     ) -> None:
         self._diff = diff
         self._fetch_exc = fetch_exc
         self._submit_exc = submit_exc
         self._ci = ci if ci is not None else CiStatus(CiState.SUCCESS, "sha-default", [])
+        self._reviews = list(reviews) if reviews is not None else []
         self.fetched: list[PrRef] = []
         self.submitted: list[tuple[PrRef, ReviewEvent, str]] = []
 
@@ -97,6 +100,9 @@ class _FakeGitHub:
 
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
         return self._ci
+
+    async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
+        return list(self._reviews)
 
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         # Model the same-identity 422: the verdict event fails, but a COMMENT review (the
@@ -142,6 +148,120 @@ async def test_request_changes_flow() -> None:
     _pr_arg, event, body = github.submitted[0]
     assert event is ReviewEvent.REQUEST_CHANGES
     assert "VERDICT" in body
+
+
+# ---------- debounce (cost lever): head-unchanged skip + round cap --------- #
+
+
+@pytest.mark.anyio
+async def test_skip_if_head_unchanged_reuses_prior_verdict_without_lexora() -> None:
+    # The naysayer already reviewed THIS head (its last verdict review's commit_id == ci.head_sha)
+    # → skip the Lexora/Gemini call and reuse the prior verdict; no new GitHub review submitted.
+    lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert lexora.calls == []  # no Gemini call
+    assert github.submitted == []  # the existing review stands; no duplicate
+    assert outcome.skipped_head_unchanged is True
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+    assert len(posted) == 1  # a short note is still posted to the thread
+
+
+@pytest.mark.anyio
+async def test_skip_if_head_unchanged_does_not_skip_when_head_moved() -> None:
+    # The prior naysayer review was against a different commit → a full review runs.
+    lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "newsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "oldsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert len(lexora.calls) == 1  # head moved → full review
+    assert outcome.skipped_head_unchanged is False
+
+
+@pytest.mark.anyio
+async def test_review_round_cap_escalates_to_comment_without_lexora() -> None:
+    # Once the naysayer has submitted >= the cap, the gate short-circuits to a COMMENT (which routes
+    # the conductor to the human Tier-C) instead of spending another Gemini review.
+    lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s1", "2026-06-10T00:00:01Z"),
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s2", "2026-06-10T00:00:02Z"),
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s3", "2026-06-10T00:00:03Z"),
+        ],
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, max_review_rounds=3)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert lexora.calls == []  # cap hit → no Gemini call
+    assert outcome.rounds_capped is True
+    assert outcome.verdict is ReviewEvent.COMMENT
+    assert [event for _, event, _ in github.submitted] == [ReviewEvent.COMMENT]  # GitHub trail
+    assert len(posted) == 1
+
+
+@pytest.mark.anyio
+async def test_debounce_counts_only_naysayer_login() -> None:
+    # Reviews by other logins (Copilot, the author) and non-verdict states do not trigger the skip
+    # or the cap — only the naysayer's own verdict reviews do.
+    lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("copilot", "COMMENTED", "headsha", "2026-06-10T00:00:01Z"),
+            ReviewInfo("takahito-spirrowgames", "COMMENTED", "headsha", "2026-06-10T00:00:02Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=github, skip_if_head_unchanged=True, max_review_rounds=1
+    )
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert len(lexora.calls) == 1  # no naysayer-owned reviews → full review
+    assert outcome.skipped_head_unchanged is False
+    assert outcome.rounds_capped is False
+
+
+@pytest.mark.anyio
+async def test_round_cap_counts_only_verdict_reviews() -> None:
+    # Non-verdict reviews by the naysayer login (a CI-gate-hold COMMENT, a DISMISSED review, the
+    # escalation COMMENT itself) must NOT count toward the cap — only APPROVED / CHANGES_REQUESTED
+    # do. Counting COMMENTs would prematurely and then permanently escalate the gate (Copilot +
+    # naysayer review on #113).
+    lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s1", "2026-06-10T00:00:01Z"),
+            ReviewInfo("spirrowgames-ops", "COMMENTED", "s2", "2026-06-10T00:00:02Z"),
+            ReviewInfo("spirrowgames-ops", "DISMISSED", "s3", "2026-06-10T00:00:03Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, max_review_rounds=2)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    # Only 1 verdict review (CHANGES_REQUESTED) < cap 2 → NOT capped; a full review runs.
+    assert len(lexora.calls) == 1
+    assert outcome.rounds_capped is False
 
 
 @pytest.mark.anyio

@@ -22,6 +22,7 @@ from spirrow_mindwire.config import (
     ConductorConfig,
     MCPServerConfig,
     MindwireSettings,
+    NaysayerGatingConfig,
     load_settings,
 )
 from spirrow_mindwire.value_objects import Role
@@ -457,3 +458,64 @@ def test_conductor_config_extra_key_in_toml_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(ValidationError):
         load_settings(cfg)
+
+
+# ----- cost levers: conductor forced-consult narrowing + naysayer-gating debounce -----
+
+
+def test_conductor_force_naysayer_flag_defaults_false() -> None:
+    """The forced-consult cost lever is default-off (baseline Obj2 behavior preserved)."""
+    assert MindwireSettings().conductor.force_naysayer_only_on_explicit_human is False
+    assert ConductorConfig().force_naysayer_only_on_explicit_human is False
+
+
+def test_conductor_force_naysayer_flag_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``MINDWIRE_CONDUCTOR__FORCE_NAYSAYER_ONLY_ON_EXPLICIT_HUMAN`` toggles the lever."""
+    monkeypatch.setenv("MINDWIRE_CONDUCTOR__FORCE_NAYSAYER_ONLY_ON_EXPLICIT_HUMAN", "true")
+    assert MindwireSettings().conductor.force_naysayer_only_on_explicit_human is True
+
+
+def test_naysayer_gating_defaults_are_off() -> None:
+    """Both PR-review debounce knobs default off (a full review on every fire)."""
+    g = MindwireSettings().naysayer_gating
+    assert g.skip_if_head_unchanged is False
+    assert g.max_review_rounds == 0
+    assert g.review_login == "spirrowgames-ops"
+
+
+def test_naysayer_gating_parses_from_toml(tmp_path: Path) -> None:
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text(
+        dedent(
+            """
+            [naysayer_gating]
+            skip_if_head_unchanged = true
+            max_review_rounds = 4
+            """
+        ),
+        encoding="utf-8",
+    )
+    g = load_settings(cfg).naysayer_gating
+    assert g.skip_if_head_unchanged is True
+    assert g.max_review_rounds == 4
+
+
+def test_naysayer_gating_env_overrides_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "mindwire.toml"
+    cfg.write_text("[naysayer_gating]\nmax_review_rounds = 2\n", encoding="utf-8")
+    monkeypatch.setenv("MINDWIRE_NAYSAYER_GATING__MAX_REVIEW_ROUNDS", "5")
+    assert load_settings(cfg).naysayer_gating.max_review_rounds == 5
+
+
+def test_naysayer_gating_rejects_negative_max_rounds() -> None:
+    """``max_review_rounds`` must be >= 0 (0 = disabled)."""
+    with pytest.raises(ValidationError):
+        NaysayerGatingConfig(max_review_rounds=-1)
+
+
+def test_naysayer_gating_extra_key_raises() -> None:
+    """Unknown keys under ``[naysayer_gating]`` fail loud (strict='forbid')."""
+    with pytest.raises(ValidationError):
+        NaysayerGatingConfig(bogus=True)  # type: ignore[call-arg]

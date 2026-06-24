@@ -371,6 +371,42 @@ class ConductorConfig(_StrictModel):
     :class:`~spirrow_mindwire.conductor.core.Conductor` ctor default (PR-2b-3 D-2); a turn that does
     not converge to ``NEXT: human`` / ``none`` within this many rounds stops at the round cap.
     """
+    force_naysayer_only_on_explicit_human: bool = False
+    """Cost lever: when True, the conductor forces an Obj2 naysayer consult ONLY on an explicit
+    ``NEXT: human`` (the genuine Tier-C handoff) — not on a guard-(i) design→implement redirect
+    or an ABSENT / Q-A un-routed turn, which then fall straight through to the human. Default False
+    preserves the baseline (force on every human-terminal). Set via
+    ``MINDWIRE_CONDUCTOR__FORCE_NAYSAYER_ONLY_ON_EXPLICIT_HUMAN=true``. The per-segment
+    single-consult bound (``_naysayer_consulted``) is unchanged either way; this only narrows WHICH
+    terminals trigger the forced consult, trimming redundant design-loop naysayer (Gemini) calls
+    while keeping the independent review at real Tier-C handoffs."""
+
+
+class NaysayerGatingConfig(_StrictModel):
+    """PR-review debounce knobs (cost lever) for the Tier B naysayer gate.
+
+    Default-off: with both knobs at their defaults the gate behaves exactly as before (a full
+    Lexora/Gemini review on every fire). They trim *redundant re-reviews* — a PR averaged ~2.4
+    naysayer reviews (max 13) because each implementer fix push re-fired a full review.
+    """
+
+    skip_if_head_unchanged: bool = False
+    """Skip the (costly) Lexora review and reuse the prior verdict when the naysayer has already
+    reviewed THIS exact head SHA (its last verdict review's ``commit_id`` == the PR head) — catches
+    accidental / reflexive re-fires on an unchanged commit. Env:
+    ``MINDWIRE_NAYSAYER_GATING__SKIP_IF_HEAD_UNCHANGED=true``."""
+
+    max_review_rounds: int = Field(default=0, ge=0)
+    """Cap on naysayer reviews per PR before escalating to the human (0 = disabled). When the
+    naysayer has already submitted >= this many reviews on the PR, the gate short-circuits to a
+    COMMENT — which routes the conductor to the human Tier-C (not back into the implementer fix
+    loop) — instead of spending another Gemini review. Bounds the long re-review tail. Env:
+    ``MINDWIRE_NAYSAYER_GATING__MAX_REVIEW_ROUNDS=4``."""
+
+    review_login: str = "spirrowgames-ops"
+    """The GitHub login the naysayer submits reviews under (T22 = ``spirrowgames-ops``); the
+    head-unchanged / round-cap state counts only reviews by this login, so other reviewers (Copilot,
+    the author) are not mistaken for the naysayer's own re-reviews."""
 
 
 class MindwireSettings(BaseSettings):
@@ -395,6 +431,7 @@ class MindwireSettings(BaseSettings):
     mcp_server: MCPServerConfig = Field(default_factory=MCPServerConfig)
     loop: Stage3LoopConfig = Field(default_factory=Stage3LoopConfig)
     conductor: ConductorConfig = Field(default_factory=ConductorConfig)
+    naysayer_gating: NaysayerGatingConfig = Field(default_factory=NaysayerGatingConfig)
 
     @field_validator("schema_version")
     @classmethod

@@ -148,6 +148,7 @@ class Conductor:
         implementer_role: Role = Role.IMPLEMENTER,
         human_identity: str = HUMAN_TOKEN,
         orchestrator: PrGate | None = None,
+        force_naysayer_only_on_explicit_human: bool = False,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -177,6 +178,11 @@ class Conductor:
         # ``None`` orchestrator / a roster without exactly one implementer disables the gate path
         # (a pr-review sentinel then routes to the human, fail-safe).
         self._orchestrator = orchestrator
+        # Cost lever (default off = baseline Obj2): force the naysayer consult only on an explicit
+        # ``NEXT: human`` (real Tier-C handoff), not on a guard-(i) redirect or an ABSENT / Q-A
+        # un-routed turn. Narrows WHICH terminals force a consult; the per-segment single-consult
+        # bound (``_naysayer_consulted``) is unchanged. Trims redundant design-loop naysayer calls.
+        self._force_only_on_explicit_human = force_naysayer_only_on_explicit_human
         # The implementer persona is derived from the roster (the single source of truth for role
         # assignment) — not a ctor arg, which would risk disjoint state (Tier B msg-567 #2).
         self._implementer_identity = self._derive_implementer_identity()
@@ -316,10 +322,12 @@ class Conductor:
             if author_role is self._naysayer_role and self._delegation_active(messages):
                 assert handoff.identity is not None
                 return handoff.role, handoff.identity, False, None
-            return self._human_terminal(messages)  # default: hard-reject → human terminal
+            # guard-(i) redirect is NOT an explicit human handoff: under the cost lever it does not
+            # force a consult (explicit_human=False).
+            return self._human_terminal(messages, explicit_human=False)
 
         if handoff.kind is HandoffKind.HUMAN:
-            return self._human_terminal(messages)
+            return self._human_terminal(messages, explicit_human=True)
 
         if handoff.kind is HandoffKind.ROLE:
             assert handoff.role is not None and handoff.identity is not None
@@ -335,7 +343,8 @@ class Conductor:
         # that post nothing; the human carve-out keeps Obj2 from policing the human's own message —
         # e.g. an "approved, go" with no ``NEXT:`` line — symmetric with guard (i) and HUMAN above).
         if (
-            author_role is not self._naysayer_role
+            not self._force_only_on_explicit_human
+            and author_role is not self._naysayer_role
             and not self._is_human(author)
             and _content(messages[-1]).strip()
             and not self._naysayer_consulted(messages)
@@ -344,7 +353,7 @@ class Conductor:
         return None, "", False, StopReason.NO_HANDOFF
 
     def _human_terminal(
-        self, messages: list[dict[str, Any]]
+        self, messages: list[dict[str, Any]], *, explicit_human: bool = True
     ) -> tuple[Role | None, str, bool, StopReason | None]:
         """Resolve a turn that terminates at the human (explicit ``NEXT: human`` or a guard (i)
         redirect): force one naysayer consult if none has happened in this segment (Obj2 —
@@ -358,7 +367,8 @@ class Conductor:
         author = _author(messages[-1])
         author_role = self._roster_role(author)
         if (
-            author_role is not self._naysayer_role
+            (explicit_human or not self._force_only_on_explicit_human)
+            and author_role is not self._naysayer_role
             and not self._is_human(author)
             and not self._naysayer_consulted(messages)
         ):

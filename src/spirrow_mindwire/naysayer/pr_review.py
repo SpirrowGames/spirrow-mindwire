@@ -41,6 +41,7 @@ from ..github.client import (
     GitHubReviewClient,
     PrRef,
     ReviewEvent,
+    ReviewInfo,
     naysayer_github_token,
 )
 from ..lexora.client import (
@@ -80,6 +81,17 @@ _DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_TIMEOUT_MARG
 # force-RC. The truncate-then-never-APPROVE path is KEPT as the safety valve: a diff too big to see
 # in one shot force-RCs rather than rubber-stamping on a partial view.
 _MAX_DIFF_CHARS = 150_000
+
+# T22: the GitHub login the naysayer submits reviews under (= the review-side identity). The
+# debounce counts only reviews by this login (other reviewers — Copilot, the author — are ignored).
+_DEFAULT_REVIEW_LOGIN = "spirrowgames-ops"
+
+# GitHub review states that carry an actual naysayer verdict (= a Gemini-spent review round).
+# COMMENTED / DISMISSED / PENDING are NOT verdicts — a CI-gate hold, a dismissed review, or the
+# escalation COMMENT itself spent no review — so the debounce (head-unchanged reuse + the round cap)
+# counts only these. Counting non-verdicts would let a comment-only interaction prematurely, and
+# then permanently, escalate the gate (Copilot + independent naysayer review on PR #113).
+_VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
 
 # A verdict must be its own line (``^...$`` with MULTILINE). Diff hunk lines carry a +/-/space
 # prefix, so a ``VERDICT: APPROVE`` *inside the reviewed diff* (prompt injection) never satisfies
@@ -133,6 +145,8 @@ class PrReviewOutcome:
     principles_version: int | None = None
     ci_gated: bool = False  # True when the L1 CI-gate short-circuited the content review
     timed_out: bool = False  # M2 (T34): the Lexora review timed out → degraded to fail-closed RC
+    skipped_head_unchanged: bool = False  # debounce: re-review skipped (head unchanged since last)
+    rounds_capped: bool = False  # debounce: review-round cap hit → COMMENT escalation to human
 
 
 def _parse_verdict(critique: str) -> ReviewEvent:
@@ -219,9 +233,15 @@ class NaysayerPrReviewDriver:
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         lexora_url: str | None = None,
         github_token: str | None = None,
+        skip_if_head_unchanged: bool = False,
+        max_review_rounds: int = 0,
+        review_login: str = _DEFAULT_REVIEW_LOGIN,
     ) -> None:
         self._model = model
         self._max_tokens = max_tokens
+        self._skip_if_head_unchanged = skip_if_head_unchanged
+        self._max_review_rounds = max_review_rounds
+        self._review_login = review_login
         self._lexora: LexoraChatClient = (
             lexora
             if lexora is not None
@@ -257,6 +277,50 @@ class NaysayerPrReviewDriver:
             return PrReviewOutcome(
                 verdict=verdict, body=body, ci_state=ci.state, head_sha=ci.head_sha, ci_gated=True
             )
+
+        # Debounce (cost lever, default off): consult the PR's prior naysayer reviews to (a) skip a
+        # re-review of an unchanged head, or (b) cap the re-review rounds — both BEFORE the costly
+        # Lexora/Gemini call, mirroring the L1 CI-gate short-circuit above. Fail-soft: an unreadable
+        # / empty review list disables both and falls through to a full review.
+        if self._skip_if_head_unchanged or self._max_review_rounds > 0:
+            prior = [
+                r for r in await self._github.fetch_pr_reviews(pr) if r.login == self._review_login
+            ]
+            if self._skip_if_head_unchanged:
+                skip = self._skip_unchanged_response(pr, ci, prior)
+                if skip is not None:
+                    verdict, body = skip
+                    await post_critique(body)
+                    return PrReviewOutcome(
+                        verdict=verdict,
+                        body=body,
+                        ci_state=ci.state,
+                        head_sha=ci.head_sha,
+                        skipped_head_unchanged=True,
+                    )
+            # Count only the naysayer's own VERDICT reviews toward the cap (same _VERDICT_STATES as
+            # _latest_verdict_review). A CI-gate-hold COMMENT, a DISMISSED review, or the escalation
+            # COMMENT spent no Gemini review, so they must not inflate the round count — else a
+            # comment-only interaction would prematurely, and then permanently, escalate the gate
+            # (Copilot + naysayer review on #113).
+            verdict_rounds = sum(1 for r in prior if r.state in _VERDICT_STATES)
+            if 0 < self._max_review_rounds <= verdict_rounds:
+                body = (
+                    f"Naysayer review-round cap reached for {pr.slug} "
+                    f"({verdict_rounds} prior verdict reviews >= cap {self._max_review_rounds}). "
+                    f"Escalating to the human (Tier-C) instead of spending another review — "
+                    f"the back-and-forth should be adjudicated, not re-litigated by the gate."
+                    f"\n\nVERDICT: COMMENT"
+                )
+                await post_critique(body)
+                await self._submit_review(pr, ReviewEvent.COMMENT, body)
+                return PrReviewOutcome(
+                    verdict=ReviewEvent.COMMENT,
+                    body=body,
+                    ci_state=ci.state,
+                    head_sha=ci.head_sha,
+                    rounds_capped=True,
+                )
 
         # CI green → content review (Lexora). Fail-closed: an unreachable GitHub raises here.
         diff = await self._github.fetch_pr_diff(pr)
@@ -329,6 +393,40 @@ class NaysayerPrReviewDriver:
             principles_version=principles_version(),
             timed_out=True,
         )
+
+    @staticmethod
+    def _latest_verdict_review(prior: list[ReviewInfo]) -> ReviewInfo | None:
+        """The naysayer's most recent review carrying a real verdict (APPROVED / CHANGES_REQUESTED).
+
+        COMMENTED / PENDING / DISMISSED carry no verdict, so they never define "already reviewed
+        this head". ``submitted_at`` is ISO-8601 (lexicographically sortable); a missing value sorts
+        oldest.
+        """
+        verdicts = [r for r in prior if r.state in _VERDICT_STATES]
+        if not verdicts:
+            return None
+        return max(verdicts, key=lambda r: r.submitted_at or "")
+
+    def _skip_unchanged_response(
+        self, pr: PrRef, ci: CiStatus, prior: list[ReviewInfo]
+    ) -> tuple[ReviewEvent, str] | None:
+        """A (verdict, body) reusing the prior verdict iff the naysayer already reviewed this head.
+
+        Returns ``None`` (→ proceed to a full review) when the head SHA is unknown, there is no
+        prior verdict review, or the latest verdict review was against a different commit.
+        """
+        if ci.head_sha is None:
+            return None
+        latest = self._latest_verdict_review(prior)
+        if latest is None or latest.commit_id != ci.head_sha:
+            return None
+        verdict = ReviewEvent.APPROVE if latest.state == "APPROVED" else ReviewEvent.REQUEST_CHANGES
+        body = (
+            f"No change since the last naysayer review of {pr.slug} "
+            f"(head {ci.head_sha[:12]}): the prior verdict {verdict.value} stands. "
+            f"Skipping a re-review of an unchanged head (cost lever).\n\nVERDICT: {verdict.value}"
+        )
+        return verdict, body
 
     async def _submit_review(self, pr: PrRef, verdict: ReviewEvent, body: str) -> None:
         """Submit the PR review, falling back to COMMENT on the same-identity 422.

@@ -44,6 +44,24 @@ Copy `deploy/mindwire.toml.example` to `<data_dir>/config/mindwire.toml` and fil
 own **clone** — not a linked worktree). `[conductor].roster` maps chatroom personas to roles and
 `naysayer_identity` must map to the `naysayer` role.
 
+## Cost levers (optional, default-off)
+
+Two independent knobs trim redundant naysayer (Gemini) calls — both default-off, so leaving them
+unset preserves the prior behavior. See `deploy/mindwire.toml.example` for the inline reference.
+
+- **`[conductor].force_naysayer_only_on_explicit_human`** (env
+  `MINDWIRE_CONDUCTOR__FORCE_NAYSAYER_ONLY_ON_EXPLICIT_HUMAN`): forces the Obj2 design-loop consult
+  only on an explicit `NEXT: human` (the real Tier-C handoff), not on a guard-(i) redirect or an
+  un-routed turn. The independent review at genuine handoffs is unchanged; only incidental forced
+  consults are dropped.
+- **`[naysayer_gating]`** (env `MINDWIRE_NAYSAYER_GATING__*`): PR-gate re-review debounce —
+  `skip_if_head_unchanged` reuses the prior verdict when the head SHA has not moved since the
+  naysayer's last review; `max_review_rounds` (0 = off) caps re-reviews per PR and escalates to the
+  human (a `COMMENT`) instead of re-billing a full Gemini review.
+
+Enable in a dev run first and compare `forced_naysayer_turns` (logged at conductor finish) and the
+per-PR naysayer review counts against the baseline before flipping them on for the standing daemon.
+
 ## Run
 
 ```powershell

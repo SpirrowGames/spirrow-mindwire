@@ -222,10 +222,14 @@ async def test_invoke_absolute_timeout_fires(tmp_path: Path) -> None:
     async def steady_chatter(
         *, prompt: str, options: ClaudeAgentOptions
     ) -> AsyncIterator[SdkMessage]:
-        # Each gap < idle threshold, but total > absolute threshold.
-        for _ in range(20):
-            await asyncio.sleep(0.02)
+        # One real gap (0.1s) already exceeds the 0.05s absolute cap while staying
+        # under the 0.5s idle cap, so the absolute timeout fires deterministically.
+        # (The old form — twenty 0.02s sleeps — raced on Windows: under load the
+        # event loop could coalesce them so the body finished before the cap, a
+        # pre-existing flake. A single 0.1s gap cannot collapse below 0.05s.)
+        for _ in range(5):
             yield _assistant("...")
+            await asyncio.sleep(0.1)
         yield _result()
 
     with pytest.raises(InvokeTimeoutError) as exc:
