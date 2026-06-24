@@ -398,8 +398,11 @@ class Conductor:
             and not self._is_human(author)
             and not self._naysayer_consulted(messages)
         ):
-            # Saveable iff this is NOT an explicit ``NEXT: human`` (i.e. a guard-(i) redirect) —
-            # what force_naysayer_only_on_explicit_human drops; an explicit human handoff is kept.
+            # ``is_saveable`` = NOT an explicit ``NEXT: human`` (a guard-(i) redirect, where _route
+            # called us with explicit_human=False). This branch IS reachable with the lever OFF: the
+            # condition above is ``explicit_human OR not self._force_only_on_explicit_human``, so it
+            # fires for explicit_human=False too. An explicit human handoff (explicit_human=True) is
+            # kept (not saveable). Covered by test_forced_naysayer_saveable_counts_guard_i_redirect.
             return self._naysayer_role, self._naysayer_identity, True, not explicit_human, None
         return None, "", False, False, StopReason.HUMAN
 
