@@ -310,8 +310,11 @@ class NaysayerPrReviewDriver:
             # (Copilot + naysayer review on #113).
             verdict_rounds = sum(1 for r in prior if r.state in _VERDICT_STATES)
             cap_hit = 0 < self._max_review_rounds <= verdict_rounds
-            if self._shadow:
-                if skip is not None:
+            # Skip takes precedence over the cap: the enforcing path returns on a skip before it
+            # ever evaluates the cap, so a single ``if skip ... elif cap_hit`` keeps shadow mode on
+            # the same precedence — else a PR meeting both would double-count (naysayer #114).
+            if skip is not None:
+                if self._shadow:
                     would_skip_head_unchanged = True
                     logger.info(
                         "naysayer debounce SHADOW: would SKIP %s (head %s already reviewed) "
@@ -319,17 +322,7 @@ class NaysayerPrReviewDriver:
                         pr.slug,
                         ci.head_sha,
                     )
-                if cap_hit:
-                    would_cap = True
-                    logger.info(
-                        "naysayer debounce SHADOW: would CAP %s (%d verdict reviews >= cap %d) "
-                        "— 1 Gemini review saved",
-                        pr.slug,
-                        verdict_rounds,
-                        self._max_review_rounds,
-                    )
-            else:
-                if skip is not None:
+                else:
                     verdict, body = skip
                     await post_critique(body)
                     return PrReviewOutcome(
@@ -339,7 +332,17 @@ class NaysayerPrReviewDriver:
                         head_sha=ci.head_sha,
                         skipped_head_unchanged=True,
                     )
-                if cap_hit:
+            elif cap_hit:
+                if self._shadow:
+                    would_cap = True
+                    logger.info(
+                        "naysayer debounce SHADOW: would CAP %s (%d verdict reviews >= cap %d) "
+                        "— 1 Gemini review saved",
+                        pr.slug,
+                        verdict_rounds,
+                        self._max_review_rounds,
+                    )
+                else:
                     body = (
                         f"Naysayer review-round cap reached for {pr.slug} "
                         f"({verdict_rounds} prior verdict reviews >= "
