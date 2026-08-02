@@ -187,10 +187,36 @@ Task settings that matter (Windows):
 
 ### Which thread gets driven
 
-The wrapper walks `$ThreadPriority` (edited at the top of the script) head-first and **advances past
-any candidate the conductor reports no work for**, so one settled thread cannot park the whole loop.
-Only a clean `rounds=0` advances: a non-zero exit or an unparseable run **stops** the sweep, so a
-genuine breakage is never laundered into "everything is idle".
+The sweep list lives in **`<data_dir>/config/sweep.json`** (template: `deploy/sweep.json.example`),
+not in the script. Each entry is a `(project, thread_id, repo_dir)` triple, and order is priority:
+
+```json
+{"candidates": [
+  {"project": "spirrow-voxelworld", "thread_id": "T-…", "repo_dir": "C:/workspace/sandbox/voxelworld-impl"},
+  {"project": "spirrow-mindwire",   "thread_id": "T-…", "repo_dir": "C:/workspace/sandbox/mindwire-impl"}
+]}
+```
+
+Two things follow from it being config:
+
+- **The loop is not single-project.** The wrapper rewrites `[loop].project`, `[loop].repo_dir` and
+  `[conductor].task_thread_id` per candidate, so MindWire's own threads can be driven alongside the
+  target repo's. All three move together — a stale `[loop]` would drive the right thread against the
+  wrong repo. The head probe runs once per distinct *project*, not per candidate.
+- **`repo_dir` must be the implementer's own clone for that project — never the checkout the daemon
+  itself runs from.** Otherwise the implementer edits its own running code.
+- A missing `sweep.json` is a **hard error**. There is deliberately no built-in fallback list: a
+  silent fallback would hide that the config was never read.
+
+> Originally this list was a literal in the script. That meant adding one thread cost a PR, and — worse
+> — a thread that was simply *not listed* was never picked up **at all, silently**. That is how
+> `T-pr-gate-adr-index-scope` sat stranded after being opened. State keys are `project/thread_id` for
+> the same reason: thread ids are only unique within a project.
+
+The wrapper walks the list head-first and **advances past any candidate the conductor reports no work
+for**, so one settled thread cannot park the whole loop. Only a clean `rounds=0` advances: a non-zero
+exit or an unparseable run **stops** the sweep, so a genuine breakage is never laundered into
+"everything is idle".
 
 `T-pr-review-*` threads are deliberately absent from that list. They resolve to
 `NEXT: pr-review <ref>`, which fires the Tier B PR-gate against the paid Lexora/Gemini backend —
