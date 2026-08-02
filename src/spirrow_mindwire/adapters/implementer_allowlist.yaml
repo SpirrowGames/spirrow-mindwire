@@ -27,8 +27,13 @@ allow:
   - operation: git.merge        # feature/* -> develop self-review merge
     source_glob: ["feature/*"]
     target_glob: ["develop"]
-  - operation: github.pr.open   # opening a PR is reversible (Tier A); to develop or main
-    target_glob: ["develop", "main"]
+  - operation: github.pr.open   # opening a PR is reversible (Tier A)
+    # V-4 (2026-08-02, dev-speed plan batch 1): the target repo moved to
+    # feature -> develop -> release -> main. base=main PRs are release-only
+    # (develop / release/* heads) and the main-base-guard CI turns everything
+    # else red, so the implementer opens PRs to develop ONLY
+    # (was: ["develop", "main"]).
+    target_glob: ["develop"]
 
 # --- Tier C: forbidden operations (explicit, with fail-loud reasons) ---
 # These are unreachable from the loop; each requires Takahito pre-GO (Tier C).
