@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Copy to <data_dir>/config/sweep.json and edit. Read by deploy/run-conductor-scheduled.ps1.",
+    "Order is priority: the sweep walks this list head-first and stops at the first candidate that",
+    "actually ran rounds. A thread NOT listed here is never picked up at all — silently.",
+    "",
+    "Each candidate needs all three fields. repo_dir is the implementer's own CLONE for that",
+    "project (not a linked worktree, and never the checkout the daemon itself is running from —",
+    "the implementer would be editing its own running code).",
+    "",
+    "Do NOT list T-pr-review-* threads: they resolve to `NEXT: pr-review <ref>`, which fires the",
+    "Tier B PR-gate against the paid Lexora/Gemini backend. Driving those from an unattended sweep",
+    "would spend money on a timer, so it stays an explicit human action."
+  ],
+  "candidates": [
+    {
+      "project": "spirrow-voxelworld",
+      "thread_id": "T-example-live-design-thread",
+      "repo_dir": "C:/workspace/sandbox/voxelworld-impl"
+    },
+    {
+      "project": "spirrow-mindwire",
+      "thread_id": "T-example-mindwire-thread",
+      "repo_dir": "C:/workspace/sandbox/mindwire-impl"
+    }
+  ]
+}

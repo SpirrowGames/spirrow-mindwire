@@ -32,24 +32,6 @@
 
 $ErrorActionPreference = "Stop"
 
-# --- the priority list (edit here; head of list wins) -------------------------------------------
-# Live candidates first, then the three dormant threads the first cut of this list held. Measured
-# 2026-08-02: all three of those end in `NEXT: none` (msg-1978 / msg-1074 / msg-1919), so they are
-# kept only so that a resume trigger (e.g. the §4 triggers Bohr named in msg-1978) picks them up
-# again without a config edit — the head probe means they cost nothing while dormant.
-#
-# `T-pr-review-*` threads are deliberately NOT listed: they resolve to `NEXT: pr-review <ref>`, which
-# fires the Tier B PR-gate against the paid Lexora/Gemini backend. Driving those from an unattended
-# sweep would spend money on a schedule, so it stays an explicit human action.
-$ThreadPriority = @(
-    "T-ci-scheduled-workflows-chronic-red",
-    "T-slope-extension-dead-mode",
-    "T-track-b-seam-octree-retirement",
-    "T-lod0-sliver-shards",
-    "T-coarse-lod-downsample-quality",
-    "T-materializechunk-zone-relocation-crash"
-)
-
 # --- paths -------------------------------------------------------------------------------------
 # mindwire-loop reads <data_dir>/config/mindwire.toml; honour the same env var run-conductor.ps1 does.
 $dataDir = if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } else { Join-Path $HOME "spirrow-mindwire-data" }
@@ -58,6 +40,7 @@ $logDir = Join-Path $dataDir "logs"
 $logPath = Join-Path $logDir ("conductor-" + (Get-Date -Format "yyyy-MM-dd") + ".log")
 $notifyStatePath = Join-Path $dataDir "state\notified.json"
 $headsStatePath = Join-Path $dataDir "state\heads.json"
+$sweepConfigPath = Join-Path $dataDir "config\sweep.json"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
@@ -199,11 +182,53 @@ function Send-NotificationIfChanged {
     $State[$Key] = $Signature
 }
 
-# --- config readers / writers -------------------------------------------------------------------
-# Line-oriented, section-aware: only the key inside [conductor] is touched, everything else
-# (comments, ordering, [conductor.roster], [naysayer_gating]) is preserved byte-for-byte.
-function Set-TaskThreadId {
-    param([string]$Path, [string]$ThreadId)
+# --- the sweep list (config, NOT code) -----------------------------------------------------------
+# Each candidate is a (project, thread_id, repo_dir) triple. Two reasons it is a file and not a
+# literal in this script:
+#   1. adding one thread to the loop used to require a PR against this repo — absurd friction for
+#      what is an operational decision, and it meant a live thread simply did not get worked;
+#   2. a thread that is not listed is never picked up *at all*, silently. That is how
+#      `T-pr-gate-adr-index-scope` sat stranded after being opened.
+#
+# It is JSON, not TOML, and separate from mindwire.toml on purpose: the sweep is the wrapper's
+# concern, not the daemon's, and `MindwireSettings` is a strict model — putting it there would force
+# a package change for what is a deployment list. PowerShell also parses JSON natively and has no
+# TOML reader.
+#
+# `T-pr-review-*` threads must NOT be listed: they resolve to `NEXT: pr-review <ref>`, which fires
+# the Tier B PR-gate against the paid Lexora/Gemini backend. Driving those from an unattended sweep
+# would spend money on a timer, so it stays an explicit human action.
+function Get-SweepCandidates {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        # Fail loud. A silent fallback to a hardcoded list is exactly the failure this file exists
+        # to end — the operator would never learn the config was not being read.
+        throw ("sweep config not found: $Path — copy deploy/sweep.json.example there and edit it. " +
+               "Refusing to fall back to a built-in list.")
+    }
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+    $out = @()
+    foreach ($c in @($raw.candidates)) {
+        foreach ($f in 'project', 'thread_id', 'repo_dir') {
+            if (-not $c.$f) { throw "sweep config entry missing '$f': $($c | ConvertTo-Json -Compress)" }
+        }
+        $out += [pscustomobject]@{
+            project   = $c.project
+            thread_id = $c.thread_id
+            repo_dir  = $c.repo_dir
+            key       = "$($c.project)/$($c.thread_id)"   # state key: thread ids are only unique per project
+        }
+    }
+    if ($out.Count -eq 0) { throw "sweep config has no candidates: $Path" }
+    return $out
+}
+
+# --- config writer --------------------------------------------------------------------------------
+# Line-oriented, section-aware: only the named key inside the named section is touched, everything
+# else (comments, ordering, [conductor.roster], [naysayer_gating]) is preserved byte-for-byte.
+function Set-TomlValue {
+    param([string]$Path, [string]$Section, [string]$Key, [string]$Value)
 
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "config not found: $Path (set MINDWIRE_PATHS__DATA_DIR to the data root holding config/mindwire.toml)"
@@ -216,7 +241,7 @@ function Set-TaskThreadId {
 
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match '^\s*\[([^\]]+)\]\s*$') { $section = $Matches[1]; continue }
-        if ($section -eq 'conductor' -and $lines[$i] -match '^\s*task_thread_id\s*=\s*"(.*)"\s*$') {
+        if ($section -eq $Section -and $lines[$i] -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*"(.*)"\s*$')) {
             $index = $i
             $current = $Matches[1]
             break
@@ -224,29 +249,15 @@ function Set-TaskThreadId {
     }
 
     if ($index -lt 0) {
-        throw "no [conductor].task_thread_id line found in $Path — refusing to guess; fix the config by hand."
+        throw "no [$Section].$Key line found in $Path — refusing to guess; fix the config by hand."
     }
+    if ($current -eq $Value) { return }
 
-    if ($current -eq $ThreadId) {
-        Write-Log "task_thread_id already `"$ThreadId`" — config left untouched"
-        return
-    }
-
-    $lines[$index] = 'task_thread_id = "' + $ThreadId + '"'
+    $lines[$index] = $Key + ' = "' + $Value + '"'
     # UTF-8 without BOM, LF-preserving via explicit join (ReadAllLines already stripped the endings).
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, ($lines -join "`n") + "`n", $utf8NoBom)
-    Write-Log "task_thread_id: `"$current`" -> `"$ThreadId`" ($Path)"
-}
-
-function Get-ConfigProject {
-    param([string]$Path)
-    $section = ""
-    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
-        if ($line -match '^\s*\[([^\]]+)\]\s*$') { $section = $Matches[1]; continue }
-        if ($section -eq 'loop' -and $line -match '^\s*project\s*=\s*"(.*)"\s*$') { return $Matches[1] }
-    }
-    return $null
+    Write-Log "[$Section].$Key : `"$current`" -> `"$Value`""
 }
 
 # --- head probe ----------------------------------------------------------------------------------
@@ -287,18 +298,18 @@ function Invoke-HeadProbe {
 # --- run ---------------------------------------------------------------------------------------
 $exitCode = 0
 try {
-    if (-not $ThreadPriority -or $ThreadPriority.Count -eq 0) {
-        throw "ThreadPriority is empty — nothing to drive. Edit deploy/run-conductor-scheduled.ps1."
-    }
-
     Write-Log "=== scheduled conductor run starting (host $env:COMPUTERNAME, user $env:USERNAME) ==="
-    Write-Log "priority list: $($ThreadPriority -join ', ')"
+    $candidates = Get-SweepCandidates -Path $sweepConfigPath
+    Write-Log "sweep list ($($candidates.Count) candidates from $sweepConfigPath): $(($candidates | ForEach-Object { $_.key }) -join ', ')"
 
-    $project = Get-ConfigProject -Path $configPath
-    if (-not $project) { throw "no [loop].project in $configPath" }
-
-    $heads = Invoke-HeadProbe -Project $project
-    if ($null -ne $heads) { Write-Log "head probe: $($heads.Count) threads reported" }
+    # One probe per distinct project, not per candidate — the probe returns every thread of a project
+    # in a single call, so N candidates in one project still cost one call.
+    $headsByProject = @{}
+    foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
+        $h = Invoke-HeadProbe -Project $proj
+        $headsByProject[$proj] = $h
+        if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
+    }
     $headsState = Get-JsonState -Path $headsStatePath
     $notifyState = Get-JsonState -Path $notifyStatePath
 
@@ -324,25 +335,32 @@ try {
         'empty_thread'         = "スレッドにメッセージがありません（優先リストの指定ミスの可能性）"
     }
 
-    foreach ($thread in $ThreadPriority) {
+    foreach ($cand in $candidates) {
         $attempt++
+        $thread = $cand.thread_id
+        $heads = $headsByProject[$cand.project]
         $probeHead = if ($null -ne $heads -and $heads.ContainsKey($thread)) { $heads[$thread] } else { $null }
-        $knownHead = if ($headsState.ContainsKey($thread)) { $headsState[$thread] } else { $null }
+        $knownHead = if ($headsState.ContainsKey($cand.key)) { $headsState[$cand.key] } else { $null }
 
         # The whole point: an unchanged head means the conductor would resolve the same handoff and
         # reach the same stop, so do not pay for the launch. Requires BOTH ids — a thread we have
         # never run, or one the probe did not report, is unknown and gets launched.
         if ($probeHead -and $knownHead -and $probeHead -eq $knownHead) {
             $skipped++
-            $sweepSignature += "$thread=$probeHead"
-            Write-Log "candidate $attempt/$($ThreadPriority.Count): $thread — head unchanged ($probeHead), not launching"
+            $sweepSignature += "$($cand.key)=$probeHead"
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head unchanged ($probeHead), not launching"
             continue
         }
 
         Confirm-LogWorthKeeping
         $why = if (-not $probeHead) { "head unknown (probe gap) — failing open" } elseif (-not $knownHead) { "no recorded head yet" } else { "head moved $knownHead -> $probeHead" }
-        Write-Log "--- candidate $attempt/$($ThreadPriority.Count): $thread ($why) ---"
-        Set-TaskThreadId -Path $configPath -ThreadId $thread
+        Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) ($why) ---"
+        # All three must move together: the daemon reads the thread from [conductor] but the project
+        # and the implementer's clone from [loop], so a stale [loop] would drive the right thread
+        # against the wrong repo.
+        Set-TomlValue -Path $configPath -Section 'loop'      -Key 'project'        -Value $cand.project
+        Set-TomlValue -Path $configPath -Section 'loop'      -Key 'repo_dir'       -Value $cand.repo_dir
+        Set-TomlValue -Path $configPath -Section 'conductor' -Key 'task_thread_id' -Value $thread
 
         $launched++
         $output = (& $inner *>&1) | ForEach-Object { "$_" }
@@ -353,17 +371,17 @@ try {
         if ($code -ne 0 -or $null -eq $verdict.rounds -or $verdict.rounds -gt 0) {
             Add-Content -LiteralPath $logPath -Value $output -Encoding utf8
         }
-        Write-Log "$thread -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"
+        Write-Log "$($cand.key) -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"
 
-        if ($verdict.last_msg) { $headsState[$thread] = $verdict.last_msg }
-        $sweepSignature += "$thread=$($verdict.last_msg)"
+        if ($verdict.last_msg) { $headsState[$cand.key] = $verdict.last_msg }
+        $sweepSignature += "$($cand.key)=$($verdict.last_msg)"
 
         if ($code -eq 0 -and $verdict.reason -and $needsHuman.ContainsKey($verdict.reason)) {
             # Signature carries the reason too, so a thread that changes *how* it is stuck re-alerts
             # even when last_msg has not moved.
-            Send-NotificationIfChanged -State $notifyState -Key $thread `
+            Send-NotificationIfChanged -State $notifyState -Key $cand.key `
                 -Signature "$($verdict.reason):$($verdict.last_msg)" `
-                -Message ("MindWire: **$thread** — " + $needsHuman[$verdict.reason] +
+                -Message ("MindWire: **$thread** ($($cand.project)) — " + $needsHuman[$verdict.reason] +
                           " (reason=$($verdict.reason), rounds=$($verdict.rounds), $($verdict.last_msg))。chatroom を確認してください。")
         }
 
@@ -388,19 +406,19 @@ try {
 
     Save-JsonState -Path $headsStatePath -State $headsState
 
-    if ($skipped -eq $ThreadPriority.Count) {
+    if ($skipped -eq $candidates.Count) {
         # The steady state at a 5-minute cadence. One line, no notification: by definition nothing
         # changed, so there is nothing new to tell anyone.
-        Write-QuietSummary "no thread moved ($skipped/$($ThreadPriority.Count) heads unchanged) — nothing to do"
+        Write-QuietSummary "no thread moved ($skipped/$($candidates.Count) heads unchanged) — nothing to do"
     }
-    elseif (-not $didWork -and $exitCode -eq 0 -and $attempt -eq $ThreadPriority.Count -and $launched -gt 0) {
+    elseif (-not $didWork -and $exitCode -eq 0 -and $attempt -eq $candidates.Count -and $launched -gt 0) {
         # Every candidate was settled or blocked on the human: the loop has run out of work and only
         # Takahito can give it more. Keyed on the whole sweep's head set, so a list that is still idle
         # for the same reason stays quiet and only a genuine change re-alerts.
         Write-Log "ALL CANDIDATES IDLE — no thread in the priority list had work; the loop needs a human"
         Send-NotificationIfChanged -State $notifyState -Key "__all_idle__" `
             -Signature ($sweepSignature -join '|') `
-            -Message "MindWire: 優先リストの $($ThreadPriority.Count) スレッド全てに仕事がありません。ループは停止したままです — 次に取り組む対象の指定が要ります。"
+            -Message "MindWire: sweep 対象の $($candidates.Count) スレッド全てに仕事がありません。ループは停止したままです — 次に取り組む対象の指定が要ります。"
     }
 
     Save-JsonState -Path $notifyStatePath -State $notifyState
