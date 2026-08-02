@@ -143,9 +143,11 @@ def test_system_prompt_injects_handoff_protocol() -> None:
     assert "advisory, not a veto" in prompt  # naysayer-specific handoff guidance
 
 
-def test_system_prompt_injects_adr_index(tmp_path: Path) -> None:
+def test_system_prompt_injects_adr_index_from_a_fixture_manifest(tmp_path: Path) -> None:
     # N-2: the deterministic in-repo ADR index is injected so the agent's worldview is
-    # not bounded by what the thread happens to cite.
+    # not bounded by what the thread happens to cite. ``repo_root`` is a TEST affordance
+    # for pointing at a fixture manifest — see the regression test below for why
+    # production callers must never pass it.
     (tmp_path / "spec").mkdir()
     (tmp_path / "spec" / "adr_index.yaml").write_text(
         'adrs:\n  - id: ADR-2026-05-31-15\n    title: "independence gradation"\n',
@@ -154,6 +156,39 @@ def test_system_prompt_injects_adr_index(tmp_path: Path) -> None:
     prompt = build_naysayer_system_prompt(tmp_path)
     assert "ADR index (id + title)" in prompt
     assert "ADR-2026-05-31-15 — independence gradation" in prompt
+
+
+def test_system_prompt_defaults_to_mindwires_own_manifest() -> None:
+    # The default must resolve to THIS repo's committed manifest, not the caller's cwd.
+    prompt = build_naysayer_system_prompt()
+    assert "ADR index (id + title)" in prompt
+    assert "UNAVAILABLE" not in prompt
+
+
+def test_adapter_injects_the_index_even_though_the_reviewed_repo_has_none(
+    tmp_path: Path,
+) -> None:
+    """Regression: the reviewed repo never carries MindWire's ADR manifest.
+
+    ``tmp_path`` stands in for the repo under review — like the real one, it has no
+    ``spec/adr_index.yaml``. The adapter used to pass this cwd through as ``repo_root``,
+    so ``load_adr_index`` fail-opened to ``()`` and EVERY design-time review ran with the
+    "ADR index — UNAVAILABLE" block. It was invisible because the old version of this
+    test planted a manifest inside ``tmp_path`` first, asserting a condition the
+    conductor path can never satisfy.
+
+    Asserting on the constructed prompt (not on a helper) is the point: the defect lived
+    in the wiring between the two, which is precisely what a helper-level test misses.
+    """
+    assert not (tmp_path / "spec" / "adr_index.yaml").exists()  # as in production
+
+    adapter = NaysayerSdkAdapter(cwd=tmp_path, inference_base_url=_BASE_URL)
+
+    prompt = adapter._system_prompt
+    assert "ADR index (id + title)" in prompt
+    assert "UNAVAILABLE" not in prompt
+    # A real entry from the committed manifest — proves it is MindWire's, not a stub.
+    assert "ADR-2026-05-31-15" in prompt
 
 
 @pytest.mark.anyio

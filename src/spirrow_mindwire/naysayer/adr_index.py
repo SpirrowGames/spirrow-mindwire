@@ -68,10 +68,17 @@ def parse_adr_index(claude_md: str) -> tuple[tuple[str, str], ...]:
 def load_adr_index(repo_root: Path | None = None) -> tuple[tuple[str, str], ...]:
     """Load the in-repo ADR manifest as ``(id, title)`` rows (deduped, sorted).
 
-    Reads ``<repo_root>/spec/adr_index.yaml`` (``repo_root`` defaults to this repo;
-    the adapter passes the reviewed repo's cwd). Returns ``()`` if the manifest is
-    absent or malformed — the caller surfaces that **explicitly** rather than passing
-    off an empty/partial list as complete.
+    Reads ``<repo_root>/spec/adr_index.yaml``. ``repo_root`` defaults to **this** repo
+    and production callers must leave it unset — the manifest is MindWire's derived view
+    of MindWire's ADRs, so it does not move with whatever repo is under review. The
+    parameter exists for tests that plant a fixture manifest in ``tmp_path``.
+
+    Returns ``()`` if the manifest is absent or malformed — the caller surfaces that
+    **explicitly** rather than passing off an empty/partial list as complete. Note the
+    cost of that fail-open: a caller that passes the wrong root gets a *silently*
+    index-less review, announced only inside the prompt. Do not re-introduce a
+    "``repo_root`` = the reviewed repo" reading; that misreading cost the design-time
+    naysayer its entire ADR index until 2026-08-02.
     """
     root = repo_root if repo_root is not None else _REPO_ROOT
     try:

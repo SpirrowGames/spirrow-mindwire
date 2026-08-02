@@ -136,11 +136,20 @@ def build_naysayer_system_prompt(repo_root: Path | None = None) -> str:
     """Naysayer system prompt: 5-principles SOT (verbatim, D-1) + role instructions
     + the deterministic ADR index (N-2) + the conductor handoff protocol (PR-2b-1).
 
-    The ADR index is read from the in-repo manifest ``spec/adr_index.yaml`` under
-    ``repo_root`` (the reviewed repo) and injected on every summon so the agent's
-    worldview is not bounded by what the thread happens to cite — it cannot search
-    for an ADR it does not know exists (ADR-19 N-2; the manifest is the complete
-    in-repo derived view, replacing the retired §M / context-bundle source).
+    The ADR index is read from **MindWire's own** ``spec/adr_index.yaml`` and injected
+    on every summon so the agent's worldview is not bounded by what the thread happens
+    to cite — it cannot search for an ADR it does not know exists (ADR-19 N-2; the
+    manifest is the complete in-repo derived view, replacing the retired §M /
+    context-bundle source).
+
+    ``repo_root`` therefore defaults to **this** repo and callers should leave it
+    unset. It exists only so tests can point at a fixture manifest. Passing the
+    *reviewed* repo silently disables the whole feature: that repo has no
+    ``spec/adr_index.yaml``, ``load_adr_index`` fails open to ``()``, and every review
+    runs with the "ADR index — UNAVAILABLE" block. That is exactly what happened —
+    the adapter passed its ``cwd`` here, so the design-time naysayer had never once
+    seen the index in the conductor path (found 2026-08-02 via a naysayer critique
+    that reported it could not cross-check against the ADR set).
 
     The handoff-protocol block teaches the agent to end each critique with a ``NEXT:``
     line so the conductor can chain the loop (hand back to the proposer for a
@@ -213,8 +222,10 @@ class NaysayerSdkAdapter:
             else os.environ.get(_ENV_BASE_URL, "")
         )
         self._model = model
+        # No repo_root: the ADR manifest is MindWire's, not the reviewed repo's. Passing
+        # ``self._cwd`` here is what disabled the N-2 index in the conductor path.
         self._system_prompt = (
-            system_prompt if system_prompt is not None else build_naysayer_system_prompt(self._cwd)
+            system_prompt if system_prompt is not None else build_naysayer_system_prompt()
         )
         self._allowed_tools = list(allowed_tools) if allowed_tools is not None else []
         self._mcp_servers = mcp_servers or {}
