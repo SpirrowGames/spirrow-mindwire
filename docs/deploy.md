@@ -101,6 +101,26 @@ batch 1, V-4: **feature → develop → release → main**.
   is a code-side follow-up, not covered by this doc.
 - D-5 is unchanged: merges to `main` are never automated — the human's manual merge remains the
   authoritative guard, now CI-backed.
+- **`develop` is ephemeral: after each develop→main release it is deleted and re-cut from `main`**
+  (Takahito, 2026-08-02 — the same rule his global CLAUDE.md already sets for MindWire, confirmed
+  here as the target repo's rule too). The current branch matches it: `merge-base(main, develop)`
+  is exactly `15883c1`, i.e. develop carries no history of its own from before the V-4 sync.
+  Two consequences worth stating, because both look like bugs otherwise:
+  - **A back-merge `main` → `develop` is never needed.** Re-cutting from `main` achieves it. Do not
+    cherry-pick release commits backwards.
+  - **`main` may legitimately sit ahead of `develop` between releases**, and that self-heals at the
+    re-cut. It happened on 2026-08-02: bot PR #174 (`0be6a7e`, the nightly baseline refresh) was
+    merged straight into `main` — wrong under V-4, and only possible because the guard is not live
+    on `main` yet. The next release merge keeps `main`'s newer baseline (develop never touched those
+    files after the merge-base, so there is no conflict), and the re-cut then clears the divergence.
+    The interim cost is real but bounded: `develop` carries the stale May baseline — the `null`
+    `chunk_memory_kb` / `seam_octree_leaf_usage` that #174 filled in — until the next release.
+
+> **Where this rule has to live.** The implementer runs with `setting_sources=[]` (SDK isolation, a
+> deliberate credential-surface fix — see the adapter), so it does **not** read any `CLAUDE.md`. A
+> branch rule recorded only there binds humans and not the loop. Spirrow-VoxelWorld currently has no
+> branch-policy document of its own, so this section is the de-facto record; the SOT belongs in the
+> target repo, and moving it there is an open follow-up.
 
 ## Cost levers (optional, default-off)
 
