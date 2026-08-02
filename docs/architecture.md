@@ -386,6 +386,81 @@ allowed_tool_profile = "readonly"   # "minimal" | "readonly"
 - Connector 用の安定 I/F 仕様 (`schema_version` 約束を含む)
 - 大型 feature の sub-PR chain merge 運用は [`chain-merge-pattern.md`](chain-merge-pattern.md) (= contract integration checklist meta-process、 Feature 2 origin) を参照
 
+## 8bis. Stage 3 — 第二の基盤 (magickit chatroom) とその上の層 (2026-08-02 追記)
+
+> **本章より前の §2〜§7 は Phase 0 = filesystem 基盤の仕様であり、 Stage 3 には適用されない。** 両者は同じリポジトリに同居する **別の基盤**である。 この章はその境界を明示するために足した。 §2〜§7 を書き換えてはいない (Phase 0 の記述として今も正しい)。
+
+### 8bis.1 基盤が 2 つある
+
+| | Phase 0 基盤 | Stage 3 基盤 |
+|---|---|---|
+| daemon | `mindwire-watcher` | `mindwire-loop` |
+| thread の実体 | `~/spirrow-mindwire-data/threads/<ULID>/messages/*.md` (§2/§3) | **magickit chatroom** (MCP 越し、 `chatroom_get_thread` / `chatroom_post_message`) |
+| 参加者 | Claude.ai ↔ Claude Code の 2 者 | Bohr (proposer) / Heisenberg (implementer) / Einstein (naysayer) / human の 4 者 |
+| 記述箇所 | 本書 §2〜§7 | 本章 + [`deploy.md`](deploy.md) |
+
+実装上の裏付け: `conductor/` と `magickit/` は `threads/` にも `meta.yaml` にも触れない。 `ChatroomWatcher` の名前が示すとおり、 Stage 3 の watcher モードも監視対象は chatroom であって filesystem ではない。
+
+∴ **§3 のデータモデル (`meta.yaml` / `NNN-from-{cai|cc}.md` / `schema_version`) は Stage 3 には無関係。** Stage 3 の thread schema は magickit 側が SOT である。
+
+### 8bis.2 層とその境界
+
+Stage 3 は 3 層で、 **層ごとに設定ファイルと責務が分かれる**。
+
+| 層 | 実体 | 責務 | 設定 |
+|---|---|---|---|
+| sweep | `deploy/run-conductor-scheduled.ps1` | **どのスレッドを、 いつ回すか**。 優先リストを head 順に歩き、 変化していないスレッドは起動しない | `<data_dir>/config/sweep.json` |
+| conductor | `mindwire-loop --mode conductor` | **1 スレッドを停止条件まで駆動する**。 末尾の `NEXT:` が指す 1 role だけを serial に dispatch | `mindwire.toml` の `[loop]` / `[conductor]` |
+| role adapter | `adapters/` の 3 実装 | 各 role の推論を回す。 implementer のみ allowlist gate 下 | 同上 + `implementer_allowlist.yaml` |
+
+**conductor は 1 スレッドを読んで終了する** (§8bis.3 の停止条件のいずれかで exit)。 複数スレッド・複数プロジェクトを跨ぐのは sweep 層であって conductor ではない。 README の CLI 表が `mindwire-loop` を 「reads one design thread」 と書いているのは、 この意味で正確である。
+
+**設定を 2 つに分けている理由**: sweep 対象の一覧は「運用上の判断」であって daemon の設定ではない。 かつ `MindwireSettings` は strict model ∴ `mindwire.toml` に置くと deployment 一覧のためにパッケージ変更が要る。 加えて sweep 層は PowerShell 実装で、 TOML reader を持たない。
+
+### 8bis.3 conductor の停止条件 (`StopReason`)
+
+`NEXT:` の解決結果で決まる。 **`none` (= 決着) 以外はすべて人間に戻る**。
+
+| reason | 意味 |
+|---|---|
+| `human` | `NEXT: human` — Tier-C 判断点 |
+| `none` | `NEXT: none` — スレッド決着。 sweep は次候補へ進む |
+| `no_handoff_to_human` | `NEXT:` が読めない / 名簿に無い → human へ fallback (Obj3) |
+| `no_progress_to_human` | dispatch した role が何も投稿しなかった |
+| `round_cap` | `max_rounds` 到達 (暴走バックストップ) |
+| `empty_thread` | スレッドにメッセージが無い |
+
+design→implement の handoff は構造的に human へ redirect される (Tier-C ゲート、 ADR-2026-06-03-17)。 `main` へのマージは**いかなる経路でも自動化されない** (D-5)。
+
+### 8bis.4 naysayer は 2 面あり、 worldview が異なる
+
+同じ 5 原則 SOT (`spec/NAYSAYER_PRINCIPLES.md`、 両者に**逐語**注入) を共有するが、 それ以外は別物である。
+
+| | design-time naysayer | Tier B PR-gate |
+|---|---|---|
+| 実体 | `adapters/naysayer_sdk.py` (summon、 Agent SDK) | `naysayer/pr_review.py` (one-shot `chat_completion`) |
+| 判断対象 | スレッド上の設計 | PR の静的 diff |
+| 出力の性質 | スレッド内の助言 | CI 上の blocking verdict |
+| ADR 索引 (N-2) | **注入する** | **注入しない** (2026-08-03 時点。 スコープ判断は `T-pr-gate-adr-index-scope` で係属中) |
+
+`transport != judge`: PR-gate が Agent ループでなく one-shot なのは、 静的 diff を読むのに SDK ループを立てるのが YAGNI だからで、 判断の中核 (5 原則) は共通化されている。
+
+**ADR 索引の参照先は MindWire 自身の `spec/adr_index.yaml` であって、 レビュー対象リポジトリではない。** ここを取り違えると索引が恒常的に空になる (実際に発生した。 PR #120)。
+
+### 8bis.5 利用プロジェクト側に置く規約ファイル
+
+Stage 3 は **対象リポジトリのルートに `.mindwire-*` を置き、 MindWire がそれを読む**という規約を持つ。 現状 1 本:
+
+- `.mindwire-gate` — その repo の CI ゲートを実行するためのエントリ
+
+2 本目 (デプロイ / ブランチ方針の宣言) は `T-per-project-deploy-rule` で設計中。 **背景**: 「どのブランチへ PR を開いてよいか」はプロジェクトごとに異なる (voxelworld = リリーストレイン / MindWire 自身 = main から継続デプロイ) ∴ MindWire の repo 非依存な allowlist に書くべきものではない。
+
+### 8bis.6 §1 の設計原則との関係
+
+原則 8 (外部システム連携はコアから完全分離) は **Stage 3 では成立していない**。 chatroom は magickit の MCP であり、 `magickit/` は Connector 層ではなくコアに同居する。 これは Phase 0 の原則を破ったというより、 **Stage 3 が原則 8 の想定しなかった軸 (AI 同士の多者ループ) に伸びた**結果である。 原則 8 を Stage 3 に遡及適用するか否かは未決 (§9 参照)。
+
+原則 9 (pull 専用、 push しない) は Stage 3 でも保たれている — sweep は polling であり、 chatroom からの push は無い。 ただし **sweep 層から人間への push は行う** (human 待ちで停止したとき Discord へ通知)。 これは 「MindWire がイベントを外部システムに push しない」 とは別の話であり、 原則 9 に抵触しない。
+
 ## 9. 未決事項 / 将来論点 (記録のみ、 T02 では decide しない)
 
 ### 9.1 Connector 用の identity / 認証境界
@@ -405,6 +480,16 @@ allowed_tool_profile = "readonly"   # "minimal" | "readonly"
 ### 9.4 ~~Phase 0 実装言語~~ (T05 で Python 確定)
 - **Python** (`watchdog` + `tomllib` + `claude-agent-sdk`) を採用
 - 採用根拠: Claude Agent SDK の Python 版が最も成熟、 PTY 直叩き不要、 auth 継承
+
+### 9.6 原則 8 を Stage 3 に遡及適用するか (2026-08-02 追記)
+§8bis.6 のとおり、 原則 8 (外部システム連携はコアから完全分離、 Connector 層が担う) は Stage 3 では成立していない — magickit chatroom への依存が `magickit/` としてコアに同居している。 選択肢は 3 つあり、 いずれも decide していない:
+- **原則 8 を Phase 0 基盤に限定された原則として明示する** (Stage 3 は別基盤 ∴ 別原則を立てる)
+- **Stage 3 の magickit 依存を Connector 層へ押し出す** (大きい。 動機が現状無い)
+- **原則 8 自体を改訂する** (「AI 同士の多者ループ」という軸を T02 は想定していなかった)
+本書は現状を記述したのみで、 どれも選んでいない。
+
+### 9.7 Phase 0 基盤の現況 (2026-08-02 追記)
+`mindwire-watcher` (§2〜§7 の filesystem 基盤) と Stage 3 が併存しているが、 **実際の開発ループは Stage 3 側でのみ回っている**。 Phase 0 基盤を維持するか、 縮退させるか、 Stage 3 に統合するかは未決。 §2〜§7 を消していないのは、 それが今も `mindwire-watcher` の正しい仕様だからであって、 現役であることを含意しない。
 
 ### 9.5 watcher の進化方向 (Phase 1+)
 Phase 0 では単一 watcher プロセス + recursive `watchdog.Observer` (W-A) を採用。 将来の進化方向として以下が想定される:

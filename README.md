@@ -217,6 +217,15 @@ The human only poses the initial question and never intervenes in the relay. Eve
 | `mindwire-mcp` | read-only stub injected in-process into the Claude Code session | per-session |
 | `mindwire-migrate-v1-to-v2` | thread schema migration CLI (atomic / idempotent / pre-flight / dry-run) | one-shot |
 
+The unattended layer is not a console script — it is invoked by the scheduler, and lives in `deploy/`:
+
+| File | Role |
+|---|---|
+| `deploy/run-conductor-scheduled.ps1` | **what Task Scheduler runs.** Picks the thread from `sweep.json`, skips threads that have not moved, logs, notifies on a human handoff |
+| `deploy/run-conductor.ps1` | one-shot launcher — env, secrets, UTF-8; drives a single thread to a stop condition |
+| `scripts/thread_heads.py` | the sweep's work detector — one `chatroom_my_unread` call returns every thread's head message id for a project, no message bodies |
+| `deploy/sync-clock-http.ps1` | clock correction from an HTTPS `Date` header, for hosts where NTP cannot leave the network |
+
 ---
 
 ## Design documents
@@ -244,6 +253,7 @@ The human only poses the initial question and never intervenes in the relay. Eve
 In parallel, the system is now **dogfooded as an autonomous trilateral dev loop (Stage 3)**, wired end-to-end:
 
 - a **NEXT-driven conductor** (`mindwire-loop --mode conductor`) reads one design thread and serially dispatches the single `NEXT:`-named role each turn, chaining proposer → implementer → naysayer with no human relay;
+- above it, an **unattended sweep** (`deploy/run-conductor-scheduled.ps1`) decides _which_ thread the conductor runs on: it walks a priority list of `(project, thread_id, repo_dir)` from config, skips any thread whose head message has not moved since the last run — one `chatroom_my_unread` call answers that for a whole project without fetching a message body — and pushes a notification when the loop parks on a human. That skip is what makes a 5-minute cadence affordable, and it spans projects, so MindWire's own threads are driven by the same loop as the target repo's;
 - the **implementer SDK adapter** is guarded by a Tier A/B/C action classifier + default-deny allow-list (a **loop-level main-merge guard** — direct, wrapped, and MCP forms all denied — since branch protection is unavailable on the free plan) and now drives the real Claude Agent SDK end-to-end: it reads, edits, runs the gate, and commits autonomously (the tool-wiring fix, ADR-2026-05-23-07 / T37);
 - the **naysayer** is an independent loop agent on a _different_ model family (Gemini via spirrow-lexora) that reviews PRs on GitHub (APPROVE / REQUEST_CHANGES) from a separate identity.
 

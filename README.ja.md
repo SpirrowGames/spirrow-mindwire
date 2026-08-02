@@ -217,6 +217,15 @@ Claude.ai 側が新規 thread を開いて Claude Code に返答してもらう�
 | `mindwire-mcp` | Claude Code session に in-process 注入される read-only stub | per-session |
 | `mindwire-migrate-v1-to-v2` | thread schema 移行 CLI (atomic / idempotent / pre-flight / dry-run) | one-shot |
 
+無人運用の層は console script ではなく、 scheduler から起動される `deploy/` 配下:
+
+| File | 役割 |
+|---|---|
+| `deploy/run-conductor-scheduled.ps1` | **Task Scheduler が実行するもの。** `sweep.json` から thread を選び、 動いていない thread はスキップし、 ログを残し、 human 引き渡しで通知する |
+| `deploy/run-conductor.ps1` | one-shot launcher — env / secret / UTF-8 を整え、 1 thread を停止条件まで駆動する |
+| `scripts/thread_heads.py` | sweep の作業検出器 — `chatroom_my_unread` 1 回で 1 プロジェクト分の head メッセージ id を返す (本文は引かない) |
+| `deploy/sync-clock-http.ps1` | NTP が外に出られないホスト向けの、 HTTPS `Date` ヘッダによる時計補正 |
+
 ---
 
 ## 設計ドキュメント
@@ -244,6 +253,7 @@ Claude.ai 側が新規 thread を開いて Claude Code に返答してもらう�
 並行して、 本システムは現在 **自律 trilateral 開発ループ (Stage 3) として dogfood 中**で、 ループは end-to-end で配線済み:
 
 - **NEXT 駆動の conductor** (`mindwire-loop --mode conductor`) が 1 つの設計 thread を読み、 毎ターン唯一の `NEXT:` 指名 role を逐次 dispatch し、 proposer → implementer → naysayer を人間の中継なしで連鎖する;
+- その上に **無人 sweep** (`deploy/run-conductor-scheduled.ps1`) があり、 conductor を *どの* thread で走らせるかを決める: 設定から `(project, thread_id, repo_dir)` の優先リストを head 順に歩き、 **前回から head メッセージが動いていない thread は起動しない** (`chatroom_my_unread` 1 回で 1 プロジェクト分の head を、 本文を引かずに取得する)。 human 待ちで停止したら通知を push する。 このスキップが 5 分間隔を成立させており、 プロジェクトを跨ぐので MindWire 自身の thread も対象リポジトリと同じループで回る;
 - **implementer SDK adapter** は Tier A/B/C action classifier + default-deny allow-list (= **loop-level の main-merge guard** — direct / wrapped / MCP の各形態を deny。 無料プランで branch protection が使えないため) で守られ、 いまや実 Claude Agent SDK を end-to-end で駆動する: read・edit・gate 実行・commit を自律で行う (tool 配線修正、 ADR-2026-05-23-07 / T37);
 - **naysayer** は _別の_ モデルファミリー (Gemini via spirrow-lexora) の独立ループ agent で、 GitHub 上の PR を別 identity から review (APPROVE / REQUEST_CHANGES) する。
 
