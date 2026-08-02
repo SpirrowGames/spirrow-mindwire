@@ -83,6 +83,25 @@ Copy `deploy/mindwire.toml.example` to `<data_dir>/config/mindwire.toml` and fil
 own **clone** — not a linked worktree). `[conductor].roster` maps chatroom personas to roles and
 `naysayer_identity` must map to the `naysayer` role.
 
+## Target-repo branch flow (V-4, 2026-08-02)
+
+The dogfooding target (Spirrow-VoxelWorld) switched to a release-train flow with dev-speed plan
+batch 1, V-4: **feature → develop → release → main**.
+
+- `develop` is the integration branch, synced to `main@15883c1` on 2026-08-02 (voxelworld PR #175).
+  Merges **into `develop` may be automated** — the github-mcp local policy already allows non-`main`
+  merges.
+- PRs with `base=main` are release-only (head `develop` or `release/*`). A CI guard
+  (`.github/workflows/main-base-guard.yml`, landed on voxelworld `develop` via #176/#177) turns any
+  other `base=main` PR red. The teeth engage once the workflow reaches `main` with the next
+  develop→main release PR — `pull_request` triggers read the workflow from the merge ref.
+- **Operational consequence for this loop: the implementer's PRs must target `develop`, not
+  `main`.** Through #150–#167 (…2026-07-29) they targeted `main` directly; a PR opened that way
+  after the guard is live goes red. Where the base branch is decided (implementer adapter / prompt)
+  is a code-side follow-up, not covered by this doc.
+- D-5 is unchanged: merges to `main` are never automated — the human's manual merge remains the
+  authoritative guard, now CI-backed.
+
 ## Cost levers (optional, default-off)
 
 Two independent knobs trim redundant naysayer (Gemini) calls — both default-off, so leaving them
@@ -156,6 +175,9 @@ genuine breakage is never laundered into "everything is idle".
 `T-pr-review-*` threads are deliberately absent from that list. They resolve to
 `NEXT: pr-review <ref>`, which fires the Tier B PR-gate against the paid Lexora/Gemini backend —
 driving those from an unattended schedule would spend money on a timer, so it stays a human action.
+(The entire `T-pr-review-150`〜`167` family was closed by the 2026-08-02 K-5 triage — all PRs merged
+with their verdicts recorded — but the exclusion rule here stays for future `T-pr-review-*`
+threads.)
 
 ### Why the sweep is cheap enough to run every 5 minutes
 
@@ -188,6 +210,12 @@ thread with no recorded head all launch the conductor anyway. The probe's exclus
 characterised — it reported 11 threads where `chatroom_list_threads` showed 33 active, omitting the
 `T-pr-review-*` family — so a gap must cost one cheap run rather than silently parking a live thread
 forever.
+
+> **2026-08-02 update (K-5 triage)**: the 33-active state above is historical. K-5 closed 22 threads
+> (the whole `T-pr-review-150`〜`167` review-record family plus the settled May–June threads),
+> leaving **11 active** — matching what the probe was returning at the time. Probe and
+> `chatroom_list_threads` should now agree, but the exclusion rule itself is *still* not
+> characterised, so the fail-open stance stays.
 
 > **The probe identity must never post and never mark read.** `chatroom_my_unread` is an inbox: it
 > lists threads with unread messages, so an identity whose read cursor has advanced under-reports
