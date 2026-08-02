@@ -228,6 +228,7 @@ The human only poses the initial question and never intervenes in the relay. Eve
 | [`docs/feature-2-design.md`](docs/feature-2-design.md) | watcher robustness (timeout / retry / state machine / startup scan) |
 | [`docs/feature-3-design.md`](docs/feature-3-design.md) | Feature 3-A: schema v2 + write MCP server + race monitoring + read tools |
 | [`docs/dogfooding.md`](docs/dogfooding.md) | operator runbook (setup / API key persistence / triage flow / connector rename) |
+| [`docs/deploy.md`](docs/deploy.md) | running the conductor unattended (Task Scheduler wiring, the head-probed sweep, cost levers, handoff notifications, egress + clock prerequisites) |
 | [`docs/logging-design.md`](docs/logging-design.md) | `events.jsonl` event types + audit-trail design |
 | [`docs/chain-merge-pattern.md`](docs/chain-merge-pattern.md) | sub-PR chain-merge contract-integration checklist (general meta-process) |
 | [`spec/NAYSAYER_PRINCIPLES.md`](spec/NAYSAYER_PRINCIPLES.md) | the canonical, versioned 5 principles the naysayer reviews under (the SOT) |

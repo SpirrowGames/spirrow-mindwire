@@ -228,6 +228,7 @@ Claude.ai 側が新規 thread を開いて Claude Code に返答してもらう�
 | [`docs/feature-2-design.md`](docs/feature-2-design.md) | watcher robustness (timeout / retry / state machine / startup scan) |
 | [`docs/feature-3-design.md`](docs/feature-3-design.md) | Feature 3-A: schema v2 + write MCP server + race monitoring + read tools |
 | [`docs/dogfooding.md`](docs/dogfooding.md) | operator runbook (setup / API key persistence / triage flow / connector rename) |
+| [`docs/deploy.md`](docs/deploy.md) | conductor の無人運用 (Task Scheduler 配線 / head probe による sweep / cost lever / human 引き渡し通知 / egress・時計の前提) |
 | [`docs/logging-design.md`](docs/logging-design.md) | `events.jsonl` の event 型 + audit trail 設計 |
 | [`docs/chain-merge-pattern.md`](docs/chain-merge-pattern.md) | sub-PR chain-merge の contract integration checklist (汎用メタプロセス) |
 | [`spec/NAYSAYER_PRINCIPLES.md`](spec/NAYSAYER_PRINCIPLES.md) | naysayer が review する canonical・versioned な 5 原則 (SOT) |
