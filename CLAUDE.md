@@ -125,6 +125,20 @@ trigger 該当 PR ごとに以下を記録する。記録の所在を CLAUDE.md 
 - **CI の役割**: `_docmap` が CI に無いので **full** drift-check (docs-only の architecture ADR まで照合) は不可。ただし CLAUDE.md は CI に在るので CI は (a) commit 済 manifest が **parse でき well-formed** (`test_real_in_repo_manifest_loads_and_is_well_formed`) と (b) **partial drift-check** = §M 参照 ADR が manifest の部分集合であること (`test_section_m_adrs_are_a_subset_of_the_manifest`、identity ADR を §M に足して再生成を忘れたケースを捕捉、Tier B msg-448) を検証する。
 - `_docmap` schema は spirrow-docs 側が SOT で本 host から不可視のため、gen-script の `_docmap` reader は schema-tolerant (初回実行時に実 `_docmap` と突き合わせ確認)。
 
+### §N.3 fail-open の宣言先を先に決める (2026-08-02)
+
+fail-open を設計するとき、**「degradation を宣言する」ことで足りたと判断しない。宣言の置き場所を先に決める。**
+
+根拠 (実測): 2026-08-02、naysayer の ADR 索引ローダは設計どおり正しく動いていた — クラッシュせず `ADR index — UNAVAILABLE` を明示していた。それでも **5 週間気づかれなかった**。宣言が review artifact 末尾の散文という、誰も grep しない場所に落ちていたため。設計は正しく、**置き場所だけで沈黙の失敗になった** (PR #120)。同日、同じ形が 4 件出た: exit 0 のまま 0 ラウンドで空振りする conductor / 未宣言 workflow / スクリプト直書きの sweep リスト / prompt にしか存在しない verdict 制約。
+
+**残すべき区別は狭い。** 「一度の人手確認ではなく毎 run 機構で確認する」は別種のより自明な洞察で、ループは自力で到達する (Bohr が本規約なしで `T-ci-scheduled-workflows-chronic-red` msg-2095 で同じ結論を出した)。**無料で手に入らないのは「正しく実装され正しく宣言している fail-open でも不可視でありうる」の方**。
+
+適用: 「これを誰が、いつ読むか」を問う。真実を含むだけの artifact より、**読み手のいる経路** (通知 / CI failure / 人が開くファイル) を選ぶ。報告が文書なら限界は**冒頭**に置く (脚注ではなく) — `T-slope-extension-dead-mode` msg-2111 が監査報告の不完全性を冒頭要件にしたのはこの理由。
+
+**`spec/NAYSAYER_PRINCIPLES.md` には意図的に足していない**: あの SOT は全 naysayer 呼び出しに逐語注入され、短いことで機能する。既知 5 件は個別に機構で塞がれており、ループは隣接する推論に独立到達できることが実測されている ∴ 原則リストを薄めるコストに見合わない。
+
+**併せて置き場所の注意**: 本書 (CLAUDE.md) に書いた規約が縛るのは**人間だけ**である。implementer は `setting_sources=[]` (SDK 隔離、credential 面の対策) で走り CLAUDE.md を読まない。naysayer の system prompt も preamble + role + ADR 索引 + handoff で本書を含まない。**ループに効かせたい規約は、ループが実際に読む場所に置くこと。**
+
 ---
 
 ## §M. role / identity の規範定義 (ADR 参照のみ — ADR が SOT)
