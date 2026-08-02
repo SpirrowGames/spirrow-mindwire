@@ -28,12 +28,33 @@ allow:
     source_glob: ["feature/*"]
     target_glob: ["develop"]
   - operation: github.pr.open   # opening a PR is reversible (Tier A)
-    # V-4 (2026-08-02, dev-speed plan batch 1): the target repo moved to
-    # feature -> develop -> release -> main. base=main PRs are release-only
-    # (develop / release/* heads) and the main-base-guard CI turns everything
-    # else red, so the implementer opens PRs to develop ONLY
-    # (was: ["develop", "main"]).
-    target_glob: ["develop"]
+    # PROVISIONAL (2026-08-02). Restored to ["develop", "main"] after being
+    # narrowed to ["develop"] the same day for V-4.
+    #
+    # Why it was narrowed, and why that was the wrong place: V-4 moved the
+    # TARGET repo (Spirrow-VoxelWorld) to feature -> develop -> release -> main,
+    # so base=main PRs became release-only there. Correct for that repo — but it
+    # was encoded HERE, in a repo-agnostic file. While the loop only ever drove
+    # one project that distinction cost nothing; once the sweep became
+    # multi-project it broke, because spirrow-mindwire has no `develop` and is
+    # deployed continuously from `main` (the scheduled conductor runs straight
+    # out of the main checkout, so a release train would make fixes wait for a
+    # release before reaching the running loop).
+    #
+    # A per-project branch policy does not belong in MindWire's allow-list at
+    # all. The permanent fix is a declaration file in the ROOT OF EACH TARGET
+    # REPO (the `.mindwire-gate` precedent), read by the loop — see thread
+    # T-per-project-deploy-rule. Two properties that fix must have: it fails
+    # CLOSED when the file is absent, and it can only NARROW this allow-list,
+    # never widen it (the file lives in a repo the implementer can write to, so
+    # replacement semantics would let it escalate its own permissions).
+    #
+    # Until then this is the ceiling and each repo enforces its own policy where
+    # it belongs: VoxelWorld's own main-base-guard CI reddens any base=main PR
+    # whose head is not develop / release/*. D-5 is untouched either way —
+    # merges to main are never automated; only PR OPENING is permitted here, and
+    # that is Tier A (reversible).
+    target_glob: ["develop", "main"]
 
 # --- Tier C: forbidden operations (explicit, with fail-loud reasons) ---
 # These are unreachable from the loop; each requires Takahito pre-GO (Tier C).

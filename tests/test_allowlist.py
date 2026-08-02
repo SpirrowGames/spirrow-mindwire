@@ -114,21 +114,31 @@ def test_git_merge_source_not_feature_denied(tmp_path: Path) -> None:
 # --- github.pr.open -------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("target", ["develop", None])
+@pytest.mark.parametrize("target", ["develop", "main", None])
 def test_github_pr_open_allowed(tmp_path: Path, target: str | None) -> None:
-    # Opening a PR is reversible (Tier A). V-4 (2026-08-02): base=develop only.
-    # target=None stays fail-open here (constraint semantics: no target, no
-    # constraint) because PR-open is reversible and the target repo's
-    # main-base-guard CI is the authoritative backstop.
+    """Opening a PR is reversible (Tier A), so this allow-list is the ceiling, not the policy.
+
+    `main` is permitted again as of 2026-08-02. It was narrowed to develop-only earlier the same
+    day for V-4 — right policy, wrong file: V-4 is the TARGET repo's branch flow, and this
+    allow-list is repo-agnostic. Once the sweep became multi-project that broke, because
+    spirrow-mindwire has no `develop` and deploys continuously from `main`.
+
+    Each repo enforces its own flow where it belongs (VoxelWorld's main-base-guard CI reddens a
+    base=main PR from the wrong head). The permanent fix is a per-repo declaration file —
+    thread T-per-project-deploy-rule.
+
+    `target=None` stays permitted under constraint semantics: no target, no constraint.
+    """
     assert _al(tmp_path).check(ClassifiedAction(Operation.GITHUB_PR_OPEN, target=target)).allowed
 
 
-def test_github_pr_open_to_main_denied(tmp_path: Path) -> None:
-    # V-4 (2026-08-02, dev-speed plan batch 1): the target repo's flow is
-    # feature -> develop -> release -> main and base=main PRs are release-only
-    # (main-base-guard CI turns the rest red) — the loop never opens PRs
-    # against main.
-    d = _al(tmp_path).check(ClassifiedAction(Operation.GITHUB_PR_OPEN, target="main"))
+def test_github_pr_open_does_not_imply_merge_to_main(tmp_path: Path) -> None:
+    """The invariant that actually matters, and that widening pr.open must not touch.
+
+    D-5: merges to `main` are never automated. Opening a PR against main is Tier A (reversible,
+    a human still merges); MERGING there is not, and stays denied regardless.
+    """
+    d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_MERGE, source="develop", target="main"))
     assert d.allowed is False
     assert d.reason
 
