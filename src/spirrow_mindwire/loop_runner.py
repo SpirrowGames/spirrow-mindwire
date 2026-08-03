@@ -73,7 +73,7 @@ from pathlib import Path
 from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
-from .conductor import Conductor, ConductorOutcome
+from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .config import MindwireSettings, NaysayerGatingConfig, Stage3LoopConfig, load_settings
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
@@ -507,6 +507,12 @@ def build_conductor(
             max_rounds=cond_cfg.max_rounds,
             force_naysayer_only_on_explicit_human=cond_cfg.force_naysayer_only_on_explicit_human,
             orchestrator=orchestrator,
+            # Per-project loop control (Part C). Keyed on ``[loop].project`` — the same key the
+            # sweep rewrites per candidate — so one daemon invocation controls exactly the project
+            # it was pointed at. Wired unconditionally and with no disable knob: a switch that
+            # turned the stop control off would be a way to make the loop unstoppable from the
+            # dashboard while still looking configured.
+            control=LoopControlReader(mcp, project=loop_cfg.project),
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc

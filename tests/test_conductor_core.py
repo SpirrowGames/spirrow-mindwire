@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from spirrow_mindwire.conductor.control import ControlState
 from spirrow_mindwire.conductor.core import Conductor, ConductorDispatcher, StopReason
 from spirrow_mindwire.dispatcher.core import Dispatcher
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
@@ -133,6 +134,27 @@ class _ScriptedDispatcher:
             )
 
 
+class _FakeControl:
+    """Loop-control fake: yields the given states in order, repeating the last one forever.
+
+    Recording ``observed`` separately from ``reads`` is what lets a test assert the write-back
+    happened on the very round the conductor acted on the state — including the round it stops on.
+    """
+
+    def __init__(self, *states: ControlState) -> None:
+        self._states = states or (ControlState.SUPERVISED,)
+        self.reads = 0
+        self.observed: list[ControlState] = []
+
+    async def read(self) -> ControlState:
+        state = self._states[min(self.reads, len(self._states) - 1)]
+        self.reads += 1
+        return state
+
+    async def report_observed(self, state: ControlState) -> None:
+        self.observed.append(state)
+
+
 def _conductor(
     mcp: _FakeChatroomMcp,
     dispatcher: ConductorDispatcher,
@@ -140,6 +162,7 @@ def _conductor(
     max_rounds: int = 40,
     orchestrator: Any = None,
     force_naysayer_only_on_explicit_human: bool = False,
+    control: Any = None,
 ) -> Conductor:
     return Conductor(
         mcp=mcp,
@@ -150,6 +173,7 @@ def _conductor(
         max_rounds=max_rounds,
         orchestrator=orchestrator,
         force_naysayer_only_on_explicit_human=force_naysayer_only_on_explicit_human,
+        control=control,
     )
 
 
@@ -575,18 +599,13 @@ async def test_empty_human_identity_disables_human_carveout() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# carve-out ③ (PR-2b-3 D-4): human DELEGATE — per-step-GO-free design→implement
+# carve-out ③: the naysayer's proceed to the implementer, gated on loop control
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.anyio
-async def test_delegate_allows_naysayer_proceed_to_implementer() -> None:
-    # Under an active human DELEGATE, the naysayer's OWN proceed-handoff to the implementer is
-    # honored without a per-step human GO (carve-out ③). The DELEGATE marker rides alongside the
-    # human's normal NEXT (here NEXT: Bohr starts the design loop).
-    mcp = _FakeChatroomMcp()
-    mcp.seed(author="human", content="run this autonomously\nDELEGATE\n\nNEXT: Bohr")
-    disp = _ScriptedDispatcher(
+def _design_to_code_dispatcher(mcp: _FakeChatroomMcp) -> _ScriptedDispatcher:
+    """proposer → naysayer → (proceed) implementer: the chain carve-out ③ decides."""
+    return _ScriptedDispatcher(
         mcp,
         {
             Role.PROPOSER: ["design\n\nNEXT: Einstein"],
@@ -594,18 +613,27 @@ async def test_delegate_allows_naysayer_proceed_to_implementer() -> None:
             Role.IMPLEMENTER: ["built\n\nNEXT: none"],
         },
     )
-    outcome = await _conductor(mcp, disp).run()
+
+
+@pytest.mark.anyio
+async def test_run_state_allows_naysayer_proceed_to_implementer() -> None:
+    # With loop control at `run`, the naysayer's OWN proceed-handoff to the implementer is honored
+    # without a per-step human GO (carve-out ③).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
+    disp = _design_to_code_dispatcher(mcp)
+    outcome = await _conductor(mcp, disp, control=_FakeControl(ControlState.RUN)).run()
     assert [role for role, _ in disp.dispatches] == [Role.PROPOSER, Role.NAYSAYER, Role.IMPLEMENTER]
     assert outcome.stop_reason is StopReason.SETTLED
 
 
 @pytest.mark.anyio
-async def test_delegate_does_not_let_proposer_self_advance() -> None:
-    # Einstein msg-601 Fix-1: even under delegation, ONLY the naysayer may advance to code. A
+async def test_run_state_does_not_let_proposer_self_advance() -> None:
+    # Even at `run`, ONLY the naysayer may advance to code (Einstein msg-601 Fix-1). A
     # proposer→implementer handoff is redirected to the human terminal (forcing a naysayer consult
-    # first), so the proposer can never bypass the independent review.
+    # first), so the proposer can never bypass the independent review by asking for the implementer.
     mcp = _FakeChatroomMcp()
-    mcp.seed(author="human", content="DELEGATE\n\nNEXT: Bohr")
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
     disp = _ScriptedDispatcher(
         mcp,
         {
@@ -613,7 +641,7 @@ async def test_delegate_does_not_let_proposer_self_advance() -> None:
             Role.NAYSAYER: ["forced review\n\nNEXT: human"],
         },
     )
-    outcome = await _conductor(mcp, disp).run()
+    outcome = await _conductor(mcp, disp, control=_FakeControl(ControlState.RUN)).run()
     roles = [role for role, _ in disp.dispatches]
     assert Role.IMPLEMENTER not in roles
     assert roles == [Role.PROPOSER, Role.NAYSAYER]
@@ -622,40 +650,80 @@ async def test_delegate_does_not_let_proposer_self_advance() -> None:
 
 
 @pytest.mark.anyio
-async def test_naysayer_proceed_without_delegation_stops_at_human() -> None:
-    # Without an active DELEGATE, the naysayer's proceed-handoff to the implementer is still gated
-    # to the human (carve-out ③ requires active delegation).
+async def test_supervised_state_stops_the_naysayer_proceed_at_the_human() -> None:
+    # At `supervised` (the pre-inversion behaviour) the naysayer's proceed is still gated to the
+    # human: carve-out ③ is closed, so nothing but a human decide or a PR-gate verdict reaches code.
     mcp = _FakeChatroomMcp()
-    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")  # no DELEGATE marker
-    disp = _ScriptedDispatcher(
-        mcp,
-        {
-            Role.PROPOSER: ["design\n\nNEXT: Einstein"],
-            Role.NAYSAYER: ["sound, build it\n\nNEXT: Heisenberg"],
-        },
-    )
-    outcome = await _conductor(mcp, disp).run()
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
+    disp = _design_to_code_dispatcher(mcp)
+    outcome = await _conductor(mcp, disp, control=_FakeControl(ControlState.SUPERVISED)).run()
     roles = [role for role, _ in disp.dispatches]
     assert Role.IMPLEMENTER not in roles
     assert roles == [Role.PROPOSER, Role.NAYSAYER]
     assert outcome.stop_reason is StopReason.HUMAN
 
 
-def test_delegation_active_is_derived_and_revocable() -> None:
-    # Non-sticky derived state (Einstein msg-601 Fix-2): active iff the MOST-RECENT human message
-    # carries the marker; a later human turn without it revokes; a non-human DELEGATE is ignored.
-    cond = _conductor(_FakeChatroomMcp(), _ScriptedDispatcher(_FakeChatroomMcp(), {}))
+@pytest.mark.anyio
+async def test_no_control_source_holds_the_supervised_baseline() -> None:
+    # A Conductor with no control plane wired must NOT read as "granted autonomy". It holds the
+    # pre-inversion baseline: the design loop turns, the naysayer's proceed does not reach code.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
+    disp = _design_to_code_dispatcher(mcp)
+    outcome = await _conductor(mcp, disp).run()
+    assert Role.IMPLEMENTER not in [role for role, _ in disp.dispatches]
+    assert outcome.stop_reason is StopReason.HUMAN
 
-    def _m(author: str, content: str) -> dict[str, Any]:
-        return {"msg_id": "x", "author": author, "content": content, "timestamp": "t"}
 
-    delegate = _m("human", "go\nDELEGATE\n\nNEXT: Bohr")
-    later_human = _m("human", "actually, revise\n\nNEXT: Bohr")
-    agent = _m("Bohr", "design\n\nNEXT: Einstein")
-    assert cond._delegation_active([delegate, agent]) is True
-    assert cond._delegation_active([delegate, agent, later_human]) is False  # later human revokes
-    assert cond._delegation_active([agent]) is False  # no human message
-    assert cond._delegation_active([_m("Bohr", "DELEGATE\n\nNEXT: Heisenberg")]) is False  # spoof
+# --------------------------------------------------------------------------- #
+# hold: the operator's stop switch
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_hold_stops_before_dispatching_or_even_reading_the_thread() -> None:
+    # A held project costs one control read and nothing else — no thread fetch, no dispatch, no
+    # inference. And the hold IS reported observed on the round that stops: that write-back is
+    # exactly what tells the operator's dashboard their stop landed, so the stopping path must not
+    # be the one path that skips it.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    disp = _ScriptedDispatcher(mcp, {})
+    control = _FakeControl(ControlState.HOLD)
+    outcome = await _conductor(mcp, disp, control=control).run()
+    assert outcome.stop_reason is StopReason.HOLD
+    assert outcome.rounds == 0
+    assert disp.dispatches == []
+    assert control.reads == 1
+    assert control.observed == [ControlState.HOLD]
+
+
+@pytest.mark.anyio
+async def test_hold_set_mid_run_lands_at_the_next_round_boundary() -> None:
+    # The latency promise: a HOLD set while a turn is in flight does not abort that turn, it stops
+    # the round after. Re-reading per round (not per run) is what bounds this to one round.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
+    disp = _design_to_code_dispatcher(mcp)
+    control = _FakeControl(ControlState.RUN, ControlState.HOLD)
+    outcome = await _conductor(mcp, disp, control=control).run()
+    assert [role for role, _ in disp.dispatches] == [Role.PROPOSER]  # the in-flight turn completed
+    assert outcome.stop_reason is StopReason.HOLD
+    assert control.observed == [ControlState.RUN, ControlState.HOLD]
+
+
+@pytest.mark.anyio
+async def test_control_state_is_reread_every_round() -> None:
+    # Carve-out ③ follows the CURRENT state, not the state the run started with: a project flipped
+    # to `run` mid-run advances to code, and one flipped away from it would not.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
+    disp = _design_to_code_dispatcher(mcp)
+    control = _FakeControl(ControlState.SUPERVISED, ControlState.RUN)
+    outcome = await _conductor(mcp, disp, control=control).run()
+    assert [role for role, _ in disp.dispatches] == [Role.PROPOSER, Role.NAYSAYER, Role.IMPLEMENTER]
+    assert outcome.stop_reason is StopReason.SETTLED
+    assert control.reads == 4  # one per round, including the round that settles
 
 
 # --------------------------------------------------------------------------- #
