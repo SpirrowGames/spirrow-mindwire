@@ -8,7 +8,6 @@ from spirrow_mindwire.conductor.handoff import (
     Handoff,
     HandoffKind,
     build_handoff_protocol_block,
-    has_delegate_marker,
     parse_next_token,
     resolve_handoff,
 )
@@ -17,14 +16,14 @@ from spirrow_mindwire.value_objects import Role
 _ROSTER = {"Bohr": Role.PROPOSER, "Heisenberg": Role.IMPLEMENTER, "Einstein": Role.NAYSAYER}
 
 
-def test_has_delegate_marker() -> None:
-    # PR-2b-3 D-4: the standing-autonomy DELEGATE marker is a standalone, case-sensitive line,
-    # orthogonal to NEXT. Inline prose / lowercase / absence do not match.
-    assert has_delegate_marker("run autonomously\nDELEGATE\n\nNEXT: Bohr") is True
-    assert has_delegate_marker("DELEGATE") is True
-    assert has_delegate_marker("please DELEGATE this to him\n\nNEXT: Bohr") is False
-    assert has_delegate_marker("delegate\n\nNEXT: Bohr") is False  # case-sensitive
-    assert has_delegate_marker("no marker\n\nNEXT: Bohr") is False
+def test_no_authorisation_marker_is_parsed_from_message_bodies() -> None:
+    # The DELEGATE marker that used to grant design→implement autonomy per thread is gone;
+    # authorisation is per-project state (conductor/control.py), not something written into a
+    # message. Pinned as a test because a marker re-introduced here would be a *second* source of
+    # the same truth, and the two would drift the moment they disagreed.
+    import spirrow_mindwire.conductor.handoff as handoff_mod
+
+    assert not [name for name in dir(handoff_mod) if "delegate" in name.casefold()]
 
 
 # --------------------------------------------------------------------------- #

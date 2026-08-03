@@ -99,10 +99,21 @@ class _FakeChatroom:
 
 
 class _FakeMcp:
-    """McpToolCaller over a single-thread :class:`_FakeChatroom`."""
+    """McpToolCaller over a single-thread :class:`_FakeChatroom`, plus loop control.
 
-    def __init__(self, chatroom: _FakeChatroom) -> None:
+    ``control_state`` is served to ``loop_control_get``; the conductor reads it every round and
+    stops on ``hold``, so a fake that did not answer this tool would fail closed and every
+    conductor test here would stop at round 0 (which is exactly what happened when the control
+    plane was added — the composition root wires it unconditionally). ``control_state=None``
+    simulates a control plane that cannot be reached at all.
+    """
+
+    def __init__(
+        self, chatroom: _FakeChatroom, *, control_state: str | None = "supervised"
+    ) -> None:
         self._chatroom = chatroom
+        self._control_state = control_state
+        self.observed: list[str] = []
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "chatroom_get_thread":
@@ -114,6 +125,13 @@ class _FakeMcp:
                 reply_to=arguments.get("reply_to"),
             )
             return {"msg": {"msg_id": msg_id}}
+        if name in ("loop_control_get", "loop_control_report_observed"):
+            if self._control_state is None:
+                raise ConnectionError(f"{name}: control plane unreachable")
+            if name == "loop_control_get":
+                return {"desired_state": self._control_state, "configured": True}
+            self.observed.append(str(arguments["state"]))
+            return {}
         raise AssertionError(f"unexpected tool {name!r}")
 
 
@@ -615,6 +633,48 @@ async def test_run_conductor_drives_round_trip_and_closes_sessions(
     assert outcome.forced_naysayer_turns == 0  # NEXT named Einstein explicitly
     assert chatroom.authors() == ["Bohr", "Einstein"]  # naysayer posted under its persona name
     assert naysayer.halted  # aclose() in run_conductor's finally halted the spawned session
+    assert mcp.observed == ["supervised"]  # the loop reported the state it acted on
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("control_state", "expect_reads"),
+    [("hold", True), (None, False)],
+    ids=["operator hold", "control plane unreachable"],
+)
+async def test_run_conductor_stops_on_hold_through_the_real_composition_root(
+    monkeypatch: pytest.MonkeyPatch, control_state: str | None, expect_reads: bool
+) -> None:
+    # Both ways a project ends up stopped, proven through the wiring rather than the Conductor
+    # alone: an operator HOLD, and a control plane that cannot be read at all (``None`` makes the
+    # fake reject loop_control_get, the same shape as magickit being down). The second case is the
+    # one worth pinning — build_conductor wires the reader unconditionally, so a regression that
+    # dropped the reader would show up as this test going green on the WRONG path (HUMAN, having
+    # driven the thread) rather than as an import error.
+    chatroom = _FakeChatroom()
+    chatroom.post(author="Bohr", content="design proposal\n\nNEXT: Einstein")
+    mcp = _FakeMcp(chatroom, control_state=control_state)
+    naysayer = _ScriptedReplyAdapter(
+        "fake-naysayer", _naysayer_caps(), ["independent critique\n\nNEXT: human"]
+    )
+    real_build = loop_runner.build_conductor
+
+    def _build(settings: MindwireSettings) -> Stage3Conductor:
+        return real_build(
+            settings,
+            mcp=mcp,
+            proposer=_StubAdapter("fake-proposer", _proposer_caps()),
+            implementer=_StubAdapter("fake-implementer", _exec_caps()),
+            naysayer=naysayer,
+        )
+
+    monkeypatch.setattr(loop_runner, "build_conductor", _build)
+    outcome = await run_conductor(_conductor_settings())
+
+    assert outcome.stop_reason is StopReason.HOLD
+    assert outcome.rounds == 0
+    assert chatroom.authors() == ["Bohr"]  # nothing was dispatched, nothing was posted
+    assert bool(mcp.observed) is expect_reads
 
 
 @pytest.mark.anyio

@@ -3,12 +3,19 @@
 #
 # Why: the Task Scheduler entry launched the conductor against whatever thread happened to be left in
 # mindwire.toml, and wrote no log anywhere. This wrapper
-#   1. asks the chatroom which threads have actually moved (scripts/thread_heads.py),
-#   2. walks an explicit priority list, head first, SKIPPING every thread whose head message is
+#   1. asks loop control whether each project is HELD (scripts/loop_control.py) and drops every
+#      candidate of a held project,
+#   2. asks the chatroom which threads have actually moved (scripts/thread_heads.py),
+#   3. walks an explicit priority list, head first, SKIPPING every thread whose head message is
 #      unchanged since the last time the conductor ran on it,
-#   3. writes each remaining candidate into <data_dir>/config/mindwire.toml [conductor].task_thread_id,
-#   4. runs the real launcher, stopping at the first thread that actually ran rounds, and
-#   5. pushes a Discord notification whenever the loop parks on a human.
+#   4. writes each remaining candidate into <data_dir>/config/mindwire.toml [conductor].task_thread_id,
+#   5. runs the real launcher, stopping at the first thread that actually ran rounds, and
+#   6. pushes a Discord notification whenever the loop parks on a human.
+#
+# (1) is an operator stop switch, set from the conclair dashboard or `loop_control_set` and stored
+# per project. It is a cost optimisation here, NOT the enforcement — the conductor reads the same
+# state every round and fails closed on it — which is why this probe fails open. See
+# Invoke-ControlProbe.
 #
 # Why (1)+(2) exist — this is what makes a 5-minute cadence affordable. A thread whose last message
 # is `NEXT: none` / `NEXT: human` is finished or waiting on Takahito, so the conductor exits at once
@@ -295,6 +302,43 @@ function Invoke-HeadProbe {
     }
 }
 
+# --- loop control probe --------------------------------------------------------------------------
+# Returns the project's desired control state ("run" / "supervised" / "hold"), or $null when it
+# could not be read. $null means UNKNOWN and the caller launches anyway.
+#
+# Failing OPEN here is deliberate and is not a hole: the conductor reads the same state itself every
+# round and fails CLOSED on it, so an unreadable state stops the loop one round in regardless. What
+# this probe buys is not safety but cost — a held project would otherwise pay for a process start, a
+# venv resolve and an MCP round trip on every tick just to be stopped. Failing closed here instead
+# would park every project the moment magickit hiccups, which is the silent-stop failure this
+# wrapper exists to prevent.
+function Invoke-ControlProbe {
+    param([string]$Project)
+
+    $probe = Join-Path $repoRoot "scripts\loop_control.py"
+    if (-not (Test-Path -LiteralPath $probe)) {
+        Write-Log "control probe not found at $probe — failing open (the conductor still enforces)"
+        return $null
+    }
+    try {
+        Push-Location $repoRoot
+        try { $raw = & uv run python $probe --project $Project 2>&1; $code = $LASTEXITCODE }
+        finally { Pop-Location }
+
+        if ($code -ne 0) {
+            Write-Log "control probe exited $code — failing open. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
+            return $null
+        }
+        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        if (-not $json) { Write-Log "control probe produced no JSON — failing open"; return $null }
+        return ($json | ConvertFrom-Json)
+    }
+    catch {
+        Write-Log "control probe failed ($($_.Exception.Message)) — failing open"
+        return $null
+    }
+}
+
 # --- run ---------------------------------------------------------------------------------------
 $exitCode = 0
 try {
@@ -305,7 +349,16 @@ try {
     # One probe per distinct project, not per candidate — the probe returns every thread of a project
     # in a single call, so N candidates in one project still cost one call.
     $headsByProject = @{}
+    $controlByProject = @{}
     foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
+        # Control first: a held project needs no head probe at all, so asking in this order keeps a
+        # deliberate HOLD to exactly one MCP read per project per tick.
+        $c = Invoke-ControlProbe -Project $proj
+        $controlByProject[$proj] = $c
+        if ($null -ne $c) {
+            Write-Log "control probe [$proj]: desired=$($c.desired_state) observed=$($c.observed_state) configured=$($c.configured)"
+        }
+        if ($null -ne $c -and $c.desired_state -eq 'hold') { continue }
         $h = Invoke-HeadProbe -Project $proj
         $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
@@ -318,6 +371,7 @@ try {
     $attempt = 0
     $launched = 0
     $skipped = 0
+    $held = 0
     $sweepSignature = @()
 
     # Stop reasons that need Takahito. Mirrors StopReason in conductor/core.py — `human` plus every
@@ -338,6 +392,18 @@ try {
     foreach ($cand in $candidates) {
         $attempt++
         $thread = $cand.thread_id
+
+        # HOLD is per project, so it takes every one of that project's candidates out at once. Not
+        # counted as "skipped" (that word means "head unchanged, nothing to do"); a held project has
+        # work and is being deliberately withheld, and reporting the two the same way would make an
+        # operator's HOLD look like an idle loop in the log and the summary.
+        $control = $controlByProject[$cand.project]
+        if ($null -ne $control -and $control.desired_state -eq 'hold') {
+            $held++
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — project HELD (desired=hold, loop last observed '$($control.observed_state)'), not launching"
+            continue
+        }
+
         $heads = $headsByProject[$cand.project]
         $probeHead = if ($null -ne $heads -and $heads.ContainsKey($thread)) { $heads[$thread] } else { $null }
         $knownHead = if ($headsState.ContainsKey($cand.key)) { $headsState[$cand.key] } else { $null }
@@ -406,12 +472,18 @@ try {
 
     Save-JsonState -Path $headsStatePath -State $headsState
 
-    if ($skipped -eq $candidates.Count) {
+    if ($held -gt 0 -and ($held + $skipped) -eq $candidates.Count) {
+        # Nothing ran, and at least part of the reason was a deliberate HOLD. Said separately from
+        # the line below so the log never describes a withheld loop as an idle one — those need
+        # opposite responses from a reader, and only one of them is a problem.
+        Write-QuietSummary "nothing to run ($held/$($candidates.Count) held by loop control, $skipped heads unchanged)"
+    }
+    elseif ($skipped -eq $candidates.Count) {
         # The steady state at a 5-minute cadence. One line, no notification: by definition nothing
         # changed, so there is nothing new to tell anyone.
         Write-QuietSummary "no thread moved ($skipped/$($candidates.Count) heads unchanged) — nothing to do"
     }
-    elseif (-not $didWork -and $exitCode -eq 0 -and $attempt -eq $candidates.Count -and $launched -gt 0) {
+    elseif (-not $didWork -and $exitCode -eq 0 -and $attempt -eq $candidates.Count -and $launched -gt 0 -and $held -eq 0) {
         # Every candidate was settled or blocked on the human: the loop has run out of work and only
         # Takahito can give it more. Keyed on the whole sweep's head set, so a list that is still idle
         # for the same reason stays quiet and only a genuine change re-alerts.

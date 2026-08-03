@@ -32,15 +32,23 @@ Design→implement Tier-C gate (guard (i), msg-543 / ADR-2026-06-03-17 / Tier-C 
 design-time naysayer) would let an un-reviewed, un-approved design reach code. The conductor
 intercepts it and redirects to the human terminal (Obj2 consult → Tier-C decision). The implementer
 may be directed by ① a human-authored Tier-C decide; ② the PR-gate REQUEST_CHANGES→fix relay
-(PR-2b-2, verdict-driven, gated to its structural marker); or ③ under an active human ``DELEGATE``
-(PR-2b-3 D-4), the **independent naysayer's** own proceed-handoff to the implementer — only the
-naysayer may advance to code under delegation, so the proposer can never bypass an objection, and
-the next iteration needs a fresh naysayer proceed after each implementation (reset-on-impl).
-Delegation is derived, non-sticky state revoked by any human turn. The gate never trusts a
-non-human role assignment otherwise (msg-552). This is a structural state machine invariant, not
-a prompt request: the adapters are *also* taught to emit a ``NEXT:`` line
+(PR-2b-2, verdict-driven, gated to its structural marker); or ③ when the project's loop control
+state is ``run``, the **independent naysayer's** own proceed-handoff to the implementer — only the
+naysayer may advance to code, so the proposer can never bypass an objection, and the next iteration
+needs a fresh naysayer proceed after each implementation (the naysayer's handoff IS the latest
+message, so a stale review cannot carry). The gate never trusts a non-human role assignment
+otherwise (msg-552). This is a structural state machine invariant, not a prompt request: the
+adapters are *also* taught to emit a ``NEXT:`` line
 (:func:`~spirrow_mindwire.conductor.handoff.build_handoff_protocol_block`) so a cooperating loop
 chains, but that prompt is advisory and the guards here are the enforcement.
+
+Loop control (:mod:`spirrow_mindwire.conductor.control`): carve-out ③ used to be authorised by a
+per-thread ``DELEGATE`` marker the human re-wrote every turn. It is now a **per-project, latching**
+state read from conclair at the top of every round — ``run`` (③ open) / ``supervised`` (③ closed;
+the pre-inversion behaviour) / ``hold`` (stop at this round boundary). Reading it per round rather
+than once per run is what bounds how long a ``hold`` takes to land: one round, not one process
+lifetime. A state that cannot be read is ``hold`` — the control plane being down must never hand
+the loop autonomy it was not granted.
 
 The conductor never reaches ``main`` (D-5): merge-to-main stays a human / Tier-C action,
 structurally out of the loop.
@@ -66,7 +74,8 @@ from ..value_objects import (
     SessionHandle,
     ThreadRef,
 )
-from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, has_delegate_marker, resolve_handoff
+from .control import BASELINE_CONTROL_STATE, ControlState, LoopControl
+from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, resolve_handoff
 
 if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
@@ -120,6 +129,7 @@ class StopReason(StrEnum):
     NO_PROGRESS = "no_progress_to_human"  # dispatched role posted nothing new → human fallback
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
+    HOLD = "hold"  # the project's loop control state is `hold` (or could not be read)
 
 
 @dataclass(frozen=True)
@@ -154,6 +164,7 @@ class Conductor:
         human_identity: str = HUMAN_TOKEN,
         orchestrator: PrGate | None = None,
         force_naysayer_only_on_explicit_human: bool = False,
+        control: LoopControl | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -188,6 +199,12 @@ class Conductor:
         # un-routed turn. Narrows WHICH terminals force a consult; the per-segment single-consult
         # bound (``_naysayer_consulted``) is unchanged. Trims redundant design-loop naysayer calls.
         self._force_only_on_explicit_human = force_naysayer_only_on_explicit_human
+        # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
+        # one was consulted and answered; the conductor then holds the pre-inversion
+        # ``supervised`` baseline, so a bare Conductor never self-authorises code. The state is
+        # re-read every round in ``run`` (see ``_read_control``); this is only the seed.
+        self._control = control
+        self._control_state: ControlState = BASELINE_CONTROL_STATE
         # The implementer persona is derived from the roster (the single source of truth for role
         # assignment) — not a ctor arg, which would risk disjoint state (Tier B msg-567 #2).
         self._implementer_identity = self._derive_implementer_identity()
@@ -220,6 +237,13 @@ class Conductor:
         forced = 0
         forced_saveable = 0
         for round_index in range(self._max_rounds):
+            # Control first: a `hold` then costs one MCP read and no thread fetch, and reading it
+            # per round rather than per run is what bounds an operator's HOLD to one round of
+            # latency. Unreadable ⇒ `hold` (control.FAILSAFE_CONTROL_STATE) — never fail open.
+            if await self._read_control() is ControlState.HOLD:
+                return self._stop(
+                    round_index, StopReason.HOLD, processed_msg_id, forced, forced_saveable
+                )
             messages = await self._fetch_messages()
             if not messages:
                 return self._stop(
@@ -318,8 +342,8 @@ class Conductor:
 
         - **guard (i)** — a handoff to the implementer from any non-human author is the
           design→implement Tier-C gate (msg-543): redirect to the human terminal unless carve-out ①
-          (a human-authored Tier-C decide) applies. (② naysayer relay → PR-2b-2; ③ delegation →
-          a dedicated slice.)
+          (a human-authored Tier-C decide) applies. (② PR-gate verdict relay → PR-2b-2; ③ the
+          independent naysayer's proceed while the control state is ``run``.)
         - **human terminal** — an explicit ``NEXT: human``, or guard (i)'s redirect: force a single
           naysayer consult if none in this segment (Obj2), else stop at the human.
         - **role** — any other named participant dispatches as named.
@@ -335,16 +359,16 @@ class Conductor:
                 # carve-out ① human-authored Tier-C decide. Tier-C msg-553 / msg-557.
                 assert handoff.identity is not None
                 return handoff.role, handoff.identity, False, False, None
-            # carve-out ③ (D-4, msg-602): under active human delegation, the INDEPENDENT naysayer's
-            # OWN proceed-handoff to the implementer is honored without a per-step human GO. *Only*
-            # the naysayer may advance to code under delegation — the proposer cannot self-advance,
-            # which would let it bypass the naysayer's objection (Einstein msg-601 Fix-1). The
-            # naysayer's handoff IS this latest message (reviewing the current state), so a stale
-            # review cannot carry: the next iteration needs a fresh naysayer proceed AFTER the
-            # implementer's turn (reset-on-implementation). Delegation is derived, non-sticky state
-            # revoked by any human turn (Fix-2); a naysayer escalation (``NEXT: human``) is not a
-            # proceed-handoff and falls through to the human terminal below.
-            if author_role is self._naysayer_role and self._delegation_active(messages):
+            # carve-out ③: when the project's loop control state is ``run``, the INDEPENDENT
+            # naysayer's OWN proceed-handoff to the implementer is honored without a per-step human
+            # GO. *Only* the naysayer may advance to code — the proposer cannot self-advance, which
+            # would let it bypass the naysayer's objection (Einstein msg-601 Fix-1). The naysayer's
+            # handoff IS this latest message (reviewing the current state), so a stale review cannot
+            # carry: the next iteration needs a fresh naysayer proceed AFTER the implementer's turn
+            # (reset-on-implementation). A naysayer escalation (``NEXT: human``) is not a
+            # proceed-handoff and falls through to the human terminal below, so the naysayer keeps
+            # its pull-the-human-back-in power at every state.
+            if author_role is self._naysayer_role and self._control_state is ControlState.RUN:
                 assert handoff.identity is not None
                 return handoff.role, handoff.identity, False, False, None
             # guard-(i) redirect is NOT an explicit human handoff: under the cost lever it does not
@@ -406,19 +430,25 @@ class Conductor:
             return self._naysayer_role, self._naysayer_identity, True, not explicit_human, None
         return None, "", False, False, StopReason.HUMAN
 
-    def _delegation_active(self, messages: list[dict[str, Any]]) -> bool:
-        """Is human design→implement delegation active (carve-out ③ / D-4)?
+    async def _read_control(self) -> ControlState:
+        """Refresh the project's loop control state for this round and report what we act on.
 
-        Derived, non-sticky (Einstein msg-601 Fix-2): true iff the most recent **human-authored**
-        message in the thread carries the ``DELEGATE`` marker line (orthogonal to that message's
-        ``NEXT:`` handoff). Any later human turn without the marker (a steer, a ``NEXT: human``,
-        anything) becomes the most-recent human message and ends delegation — the human taking the
-        wheel snaps the loop out of unattended mode. There is no stored flag to forget;
-        ``max_rounds`` is the standing bound. Honored only from the human identity (D-3)."""
-        for msg in reversed(messages):
-            if self._is_human(_author(msg)):
-                return has_delegate_marker(_content(msg))
-        return False
+        The observed write-back happens **before** the caller acts on the state, and for ``hold``
+        as much as for the others: a hold that the loop has actually seen is exactly the fact the
+        operator's dashboard is waiting for, so it must not be skipped on the path that stops.
+
+        With no control plane wired (``self._control is None``) the state stays at
+        :data:`~spirrow_mindwire.conductor.control.BASELINE_CONTROL_STATE` — deliberately *not* the
+        fail-safe value, because "no control source configured" is a different fact from "the
+        control source is unreachable": the former is the pre-inversion behaviour, the latter stops
+        the loop.
+        """
+        if self._control is None:
+            return self._control_state
+        state = await self._control.read()
+        self._control_state = state
+        await self._control.report_observed(state)
+        return state
 
     def _is_human(self, author: str) -> bool:
         """Is ``author`` the human (Tier-C) identity? Case-insensitive; empty identity ⇒ never (a

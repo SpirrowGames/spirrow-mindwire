@@ -8,6 +8,7 @@ auto-reply retirement) is PR-2.
 
 from __future__ import annotations
 
+from .control import ControlState, LoopControl, LoopControlReader
 from .core import Conductor, ConductorDispatcher, ConductorOutcome, StopReason
 from .handoff import (
     HUMAN_TOKEN,
@@ -25,8 +26,11 @@ __all__ = [
     "Conductor",
     "ConductorDispatcher",
     "ConductorOutcome",
+    "ControlState",
     "Handoff",
     "HandoffKind",
+    "LoopControl",
+    "LoopControlReader",
     "StopReason",
     "build_handoff_protocol_block",
     "parse_next_token",

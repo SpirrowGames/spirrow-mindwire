@@ -48,21 +48,11 @@ _TRAILING_PUNCT = " \t.,;:!?、。）)"  # noqa: RUF001 (fullwidth/CJK punctuati
 HUMAN_TOKEN = "human"
 NONE_TOKEN = "none"
 
-# Standing-autonomy marker (PR-2b-3 D-4, carve-out ③): a human includes a line ``DELEGATE`` in a
-# message to grant standing design→implement autonomy on this thread, ORTHOGONALLY to that
-# message's ``NEXT:`` handoff (one human message both routes the turn and grants autonomy — no
-# extra round, no overloading the NEXT vocabulary with a non-participant token). Honored only from
-# a human-authored message (environment trust, D-3). Derived / non-sticky: active while the
-# most-recent human message carries it; any later human message without it revokes (the human
-# taking the wheel exits unattended mode). Case-sensitive + own line so it never collides with the
-# word in prose.
-DELEGATE_MARKER = "DELEGATE"
-_DELEGATE_MARKER_RE = re.compile(rf"^\s*{DELEGATE_MARKER}\s*$", re.MULTILINE)
-
-
-def has_delegate_marker(body: str) -> bool:
-    """True if ``body`` carries the standalone ``DELEGATE`` marker line (carve-out ③ / D-4)."""
-    return bool(_DELEGATE_MARKER_RE.search(body))
+# The standing-autonomy ``DELEGATE`` marker that used to live here is gone. It authorised carve-out
+# ③ per *thread*, from the most recent human message, and non-stickily — so it had to be re-written
+# on every human turn and forgetting it stopped the loop. Authorisation is now per *project* and
+# latching, in :mod:`spirrow_mindwire.conductor.control`; there is nothing to parse out of a message
+# body for it, which is the point (a marker in a thread is a second source of the same truth).
 
 
 # The PR-gate sentinel: ``NEXT: pr-review <owner/repo#n>`` fires the Tier B independent naysayer
@@ -209,10 +199,11 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
     Role.NAYSAYER: (
         "As the naysayer: after your critique, hand back to the proposer if your objections need a "
         "disposition (`NEXT: <proposer persona>`); if the design is sound and ready to build, hand "
-        "to the implementer (`NEXT: <implementer persona>`) — under an active human delegation the "
-        "conductor builds it directly, otherwise it routes your go to the human for the Tier-C "
-        f"decision; or hand to `{HUMAN_TOKEN}` to escalate a concern that needs the human now. You "
-        "are advisory, not a veto — but under delegation your escalation pulls the human back in."
+        "to the implementer (`NEXT: <implementer persona>`) — while this project's loop is running "
+        "autonomously the conductor builds it directly, otherwise it routes your go to the human "
+        f"for the Tier-C decision; or hand to `{HUMAN_TOKEN}` to escalate a concern that needs the "
+        "human now. You are advisory, not a veto — but your escalation pulls the human back in "
+        "however autonomously the loop is running."
     ),
 }
 
@@ -247,14 +238,12 @@ def _roster_lookup(roster: Mapping[str, Role], name: str) -> tuple[str, Role] | 
 
 
 __all__ = [
-    "DELEGATE_MARKER",
     "HUMAN_TOKEN",
     "NONE_TOKEN",
     "PR_REVIEW_TOKEN",
     "Handoff",
     "HandoffKind",
     "build_handoff_protocol_block",
-    "has_delegate_marker",
     "parse_next_token",
     "resolve_handoff",
 ]
