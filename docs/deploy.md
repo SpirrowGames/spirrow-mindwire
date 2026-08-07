@@ -14,7 +14,8 @@ The pieces, and which file owns each:
 | File | Role |
 |---|---|
 | `deploy/run-conductor.ps1` | drives **one** thread to a stop condition and exits. Env + secrets + UTF-8 |
-| `deploy/run-conductor-scheduled.ps1` | **what Task Scheduler runs.** Picks the thread, skips threads that have not moved, logs, notifies |
+| `deploy/run-conductor-scheduled.ps1` | **what Task Scheduler runs.** Deploys, picks the thread, skips threads that have not moved, logs, notifies |
+| `deploy/sync-repo.ps1` | fast-forwards this checkout to `origin/main` — merging is not deploying |
 | `scripts/thread_heads.py` | the work detector — one chatroom call, every thread's head message id |
 | `deploy/sync-clock-http.ps1` | clock correction, because NTP cannot leave this host |
 
@@ -184,6 +185,44 @@ Task settings that matter (Windows):
 | `ExecutionTimeLimit` | `PT4H` | a real design round can take a while; `PT2H` was cutting runs off |
 | `RestartCount` / `RestartInterval` | `3` / `PT10M` | transient MCP or inference failures retry instead of waiting for the next tick |
 | Run as | the user holding `MINDWIRE_NAYSAYER_GITHUB_TOKEN`, the webhook var, and the Claude subscription | the wrapper reads the webhook from the **User** env scope |
+
+### Deploying a merged change
+
+**Merging is not deploying.** The task runs `uv run mindwire-loop` from this checkout — the venv holds
+an *editable* install, so the working tree IS the running module — and nothing pulled it. A merged fix
+could therefore sit undeployed indefinitely, with GitHub showing it merged and the task history
+showing exit 0. The only way to notice was to compare `git log` against `origin/main` by hand.
+
+Every tick now starts by running **`deploy/sync-repo.ps1`**, which fast-forwards the checkout to
+`origin/main` and prints one JSON verdict. This needs no separate approval: `main` only advances
+through a human's Tier-C merge, so the decision is already made by the time the script can see it.
+What it adds is delivery, not authority.
+
+| `status` | What it means | What the sweep does |
+|---|---|---|
+| `updated` | fast-forwarded to a new `main` | logs, notifies, and **stops this tick** |
+| `current` | already at `origin/main` | proceeds (one buffered log line) |
+| `skipped` | HEAD is not `main` — someone is working on this checkout | proceeds on that code, notifies once |
+| `blocked` | tracked files modified, or the branch diverged | proceeds on current code, notifies once |
+| `failed` | fetch / merge errored (network, auth, proxy) | proceeds on current code, notifies once |
+
+Three rules are load-bearing:
+
+- **A tick either updates the code or uses it, never both.** The wrapper was parsed from the old file
+  at startup, while `run-conductor.ps1` would be read from disk *after* the pull — a sweep spanning
+  two versions is not a thing worth debugging later. So a deploy tick launches nothing; the cost is
+  one 5-minute cycle of latency after a merge.
+- **Nothing but a pure fast-forward is ever performed.** A dirty tree or a diverged branch means
+  someone has work here; resolving that automatically would be the script inventing an answer nobody
+  asked for. Untracked files never block — the live host deliberately carries untracked working notes,
+  and a fast-forward cannot conflict with them.
+- **A sync failure is not a sweep failure.** One unreachable GitHub must not stop the loop; it keeps
+  running the code it has, which is known-good and merely possibly old.
+
+> The non-happy statuses report to **Discord**, not just the log. That is the point: a loop quietly
+> running week-old code because `git fetch` has been failing is precisely the kind of correct-but-
+> unread announcement that CLAUDE.md §N.3 exists to prevent. Alerts are deduped on the reason, so a
+> week spent on a feature branch costs one message, not 2016.
 
 ### Which thread gets driven
 
