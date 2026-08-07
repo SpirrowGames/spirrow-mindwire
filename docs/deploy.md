@@ -240,6 +240,27 @@ single message body (~1 s for all threads at once). If a thread's head equals th
 conductor reported last time, the conductor would resolve the same handoff and reach the same stop —
 so it is not launched at all.
 
+**The head alone is not enough to say "same stop".** Two inputs decide where a round lands, and the
+cache is keyed on both: the thread's head message *and* the project's loop control state. At an
+unchanged head, a naysayer→implementer handoff stops at the human gate under `hold` / `supervised`
+but dispatches the implementer under `run` (carve-out ③). So `state/heads.json` stores a pair per
+thread:
+
+```json
+{"spirrow-voxelworld/T-lod0-sliver-shards": {"head": "msg-2172", "control": "run"}}
+```
+
+and a thread is skipped only when **both** match. Anything unknown — an unreadable control probe, a
+thread the head probe did not report, a record written before control was tracked — fails open into
+a launch.
+
+> Without the control half, releasing a project from `hold` never took effect: every thread kept its
+> old head, so every thread was skipped, forever, while the log reported
+> `no thread moved (9/9 heads unchanged) — nothing to do` at exit 0. Measured 2026-08-06 — the same
+> line that means "healthy and idle" also meant "nothing can ever run", and nothing distinguished
+> them. Entries written before the upgrade are bare strings; they read as unknown control and cost
+> one launch each, once. `tests/Test-SweepHeadCache.ps1` (run by `.mindwire-gate`) guards the rule.
+
 Measured on a 6-candidate list:
 
 | | conductor launches | elapsed | log written |
