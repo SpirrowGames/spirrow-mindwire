@@ -6,8 +6,8 @@
 #   1. asks loop control whether each project is HELD (scripts/loop_control.py) and drops every
 #      candidate of a held project,
 #   2. asks the chatroom which threads have actually moved (scripts/thread_heads.py),
-#   3. walks an explicit priority list, head first, SKIPPING every thread whose head message is
-#      unchanged since the last time the conductor ran on it,
+#   3. walks an explicit priority list, head first, SKIPPING every thread whose head message AND
+#      project control state are both unchanged since the last time the conductor ran on it,
 #   4. writes each remaining candidate into <data_dir>/config/mindwire.toml [conductor].task_thread_id,
 #   5. runs the real launcher, stopping at the first thread that actually ran rounds, and
 #   6. pushes a Discord notification whenever the loop parks on a human.
@@ -120,6 +120,54 @@ function Save-JsonState {
     [System.IO.File]::WriteAllText($Path, ($State | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# --- head-state records ---------------------------------------------------------------------------
+# A head record is @{ head; control } — the message id the conductor last reported for a thread, AND
+# the project control state it reported it under. Both are needed to decide a skip; see Test-CanSkip.
+#
+# Entries written before this became a pair are bare strings. Those are read as control = $null,
+# which never matches a live state, so a pre-upgrade state file costs one launch per thread and then
+# self-heals into the new shape. That is deliberately the fail-open direction: the alternative
+# (assume the old head was recorded under the current state) would reproduce the very bug this
+# record exists to fix, once, silently, on the upgrade tick.
+function Get-HeadRecord {
+    param([hashtable]$State, [string]$Key)
+
+    $empty = @{ head = $null; control = $null }
+    if (-not $State.ContainsKey($Key)) { return $empty }
+    $value = $State[$Key]
+    if ($null -eq $value) { return $empty }
+    if ($value -is [string]) { return @{ head = $value; control = $null } }
+    return @{
+        head    = if ($value.PSObject.Properties.Name -contains 'head') { $value.head } else { $null }
+        control = if ($value.PSObject.Properties.Name -contains 'control') { $value.control } else { $null }
+    }
+}
+
+# The skip rule, stated in one place because getting it wrong is invisible.
+#
+# A thread may be skipped only when we can show the conductor would reach the SAME stop it reached
+# last time. Two inputs decide that stop, not one:
+#
+#   1. the thread's head message — does the same handoff still sit at the end of the thread?
+#   2. the project's loop control state — does that handoff still ROUTE the same way?
+#
+# (2) is not redundant. At an unchanged head, a naysayer→implementer handoff stops at the human gate
+# under `hold`/`supervised` but dispatches the implementer under `run` (carve-out ③, conductor/
+# core.py). Keying the cache on the head alone therefore skips forever exactly the threads a release
+# from `hold` was meant to start, while the log reports a healthy `no thread moved … nothing to do`
+# at exit 0 — measured 2026-08-06, 15+ minutes, indistinguishable from an idle loop.
+#
+# Anything unknown ($null) fails OPEN into a launch: an unreadable control probe, a thread the head
+# probe did not report, a never-run thread, a pre-upgrade record. One cheap run beats a silent park,
+# which is the same stance the rest of this wrapper takes.
+function Test-CanSkip {
+    param([string]$ProbeHead, [string]$KnownHead, [string]$CurrentControl, [string]$KnownControl)
+
+    if (-not $ProbeHead -or -not $KnownHead) { return $false }
+    if (-not $CurrentControl -or -not $KnownControl) { return $false }
+    return ($ProbeHead -eq $KnownHead) -and ($CurrentControl -eq $KnownControl)
+}
+
 # --- parse the conductor's own verdict ----------------------------------------------------------
 # The daemon's last word on stdout looks like:
 #   conductor stopped: reason=none rounds=0 forced_naysayer=0 ... last_msg=msg-1919
@@ -132,7 +180,11 @@ function Get-ConductorVerdict {
     if (-not $line) { return $verdict }
     if ($line -match 'reason=(\S+)') { $verdict.reason = $Matches[1] }
     if ($line -match 'rounds=(\d+)') { $verdict.rounds = [int]$Matches[1] }
-    if ($line -match 'last_msg=(\S+)') { $verdict.last_msg = $Matches[1] }
+    # `last_msg=None` is Python's None reaching stdout, i.e. the conductor had no message to report.
+    # Matched by \S+ like any id, so without this it was stored as the literal head "None" — never
+    # equal to a real id (so it failed open, harmlessly) but it made "no head recorded yet"
+    # indistinguishable from a real head in both the state file and the log.
+    if ($line -match 'last_msg=(\S+)' -and $Matches[1] -ne 'None') { $verdict.last_msg = $Matches[1] }
     return $verdict
 }
 
@@ -406,20 +458,30 @@ try {
 
         $heads = $headsByProject[$cand.project]
         $probeHead = if ($null -ne $heads -and $heads.ContainsKey($thread)) { $heads[$thread] } else { $null }
-        $knownHead = if ($headsState.ContainsKey($cand.key)) { $headsState[$cand.key] } else { $null }
+        $record = Get-HeadRecord -State $headsState -Key $cand.key
+        $knownHead = $record.head
+        $knownControl = $record.control
+        # $null when the control probe could not read the state — unknown, so nothing is skipped.
+        $currentControl = if ($null -ne $control) { $control.desired_state } else { $null }
 
-        # The whole point: an unchanged head means the conductor would resolve the same handoff and
-        # reach the same stop, so do not pay for the launch. Requires BOTH ids — a thread we have
-        # never run, or one the probe did not report, is unknown and gets launched.
-        if ($probeHead -and $knownHead -and $probeHead -eq $knownHead) {
+        # The whole point: same head AND same routing means the conductor would resolve the same
+        # handoff and reach the same stop, so do not pay for the launch. See Test-CanSkip for why
+        # both halves are load-bearing and why every unknown fails open.
+        if (Test-CanSkip -ProbeHead $probeHead -KnownHead $knownHead `
+                         -CurrentControl $currentControl -KnownControl $knownControl) {
             $skipped++
             $sweepSignature += "$($cand.key)=$probeHead"
-            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head unchanged ($probeHead), not launching"
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head unchanged ($probeHead, control $currentControl), not launching"
             continue
         }
 
         Confirm-LogWorthKeeping
-        $why = if (-not $probeHead) { "head unknown (probe gap) — failing open" } elseif (-not $knownHead) { "no recorded head yet" } else { "head moved $knownHead -> $probeHead" }
+        $why = if (-not $probeHead) { "head unknown (probe gap) — failing open" }
+               elseif (-not $knownHead) { "no recorded head yet" }
+               elseif ($probeHead -ne $knownHead) { "head moved $knownHead -> $probeHead" }
+               elseif (-not $currentControl) { "control unknown (probe gap) — failing open" }
+               elseif (-not $knownControl) { "head $probeHead recorded before control was tracked — re-running once" }
+               else { "control changed $knownControl -> $currentControl at head $probeHead — same head can route differently" }
         Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) ($why) ---"
         # All three must move together: the daemon reads the thread from [conductor] but the project
         # and the implementer's clone from [loop], so a stale [loop] would drive the right thread
@@ -439,7 +501,12 @@ try {
         }
         Write-Log "$($cand.key) -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"
 
-        if ($verdict.last_msg) { $headsState[$cand.key] = $verdict.last_msg }
+        # Record the state this head was reached under, not just the head. Written even when
+        # $currentControl is $null (an unreadable probe): storing the unknown keeps the next tick
+        # failing open rather than silently inheriting a state nobody confirmed.
+        if ($verdict.last_msg) {
+            $headsState[$cand.key] = @{ head = $verdict.last_msg; control = $currentControl }
+        }
         $sweepSignature += "$($cand.key)=$($verdict.last_msg)"
 
         if ($code -eq 0 -and $verdict.reason -and $needsHuman.ContainsKey($verdict.reason)) {

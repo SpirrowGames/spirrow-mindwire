@@ -7,4 +7,8 @@ set -euo pipefail
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src tests
+# The sweep wrapper is PowerShell, so pytest cannot reach its head-skip decision — the one place
+# where being wrong parks the loop silently instead of loudly. pwsh ships on the CI runner and on
+# the loop host; a missing pwsh is a real breakage of this gate, not a reason to skip the check.
+pwsh -NoProfile -File tests/Test-SweepHeadCache.ps1
 uv run pytest
