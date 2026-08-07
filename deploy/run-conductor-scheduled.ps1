@@ -391,10 +391,80 @@ function Invoke-ControlProbe {
     }
 }
 
+# --- deploy probe ---------------------------------------------------------------------------------
+# Fast-forwards this checkout to origin/main before the tick decides anything. Returns the parsed
+# verdict from deploy/sync-repo.ps1, or $null when it could not be run at all.
+#
+# Merging is not deploying: the scheduled task runs `uv run mindwire-loop` from this checkout and
+# nothing pulled it, so a merged fix could sit undeployed indefinitely with GitHub showing it merged
+# and the task history showing exit 0. Deploying merged `main` needs no separate approval — `main`
+# only advances through a human's Tier-C merge — so what this adds is delivery, not authority.
+function Invoke-RepoSync {
+    $probe = Join-Path $PSScriptRoot "sync-repo.ps1"
+    if (-not (Test-Path -LiteralPath $probe)) {
+        Write-Log "repo sync script not found at $probe — running whatever code is checked out"
+        return $null
+    }
+    try {
+        $raw = & pwsh -NoProfile -File $probe 2>&1
+        $code = $LASTEXITCODE
+        if ($code -ne 0) {
+            Write-Log "repo sync exited $code — running whatever code is checked out. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
+            return $null
+        }
+        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        if (-not $json) { Write-Log "repo sync produced no JSON — running whatever code is checked out"; return $null }
+        return ($json | ConvertFrom-Json)
+    }
+    catch {
+        Write-Log "repo sync failed ($($_.Exception.Message)) — running whatever code is checked out"
+        return $null
+    }
+}
+
 # --- run ---------------------------------------------------------------------------------------
 $exitCode = 0
 try {
     Write-Log "=== scheduled conductor run starting (host $env:COMPUTERNAME, user $env:USERNAME) ==="
+
+    # Loaded before the deploy step, which already needs it to dedupe its own alerts.
+    $notifyState = Get-JsonState -Path $notifyStatePath
+
+    # Deploy first, so a tick either updates the code or uses it — never both. When the pull moves
+    # HEAD this tick STOPS: the wrapper was parsed from the old file at startup while
+    # run-conductor.ps1 would be read from disk after the pull, and a sweep spanning two versions is
+    # not a thing worth debugging later. The cost is one 5-minute cycle of latency after a merge.
+    $sync = Invoke-RepoSync
+    if ($null -ne $sync) {
+        if ($sync.status -eq 'updated') {
+            Confirm-LogWorthKeeping
+            $depsNote = if ($sync.synced_deps) { ", deps synced" } else { "" }
+            Write-Log "deployed $($sync.from) -> $($sync.to) ($($sync.commits) commit(s)$depsNote)"
+            Send-NotificationIfChanged -State $notifyState -Key "__deploy__" `
+                -Signature "$($sync.from)->$($sync.to)" `
+                -Message ("MindWire: main を取り込みました（$($sync.from) → $($sync.to)、$($sync.commits) commit$depsNote）。" +
+                          "この tick は起動せず、次の tick から新しいコードで動きます。")
+            Save-JsonState -Path $notifyStatePath -State $notifyState
+            Write-Log "not launching this tick — the next one runs entirely on the new code"
+            return
+        }
+        elseif ($sync.status -eq 'current') {
+            # Buffered, not committed: on an idle tick this collapses away with everything else.
+            Write-Log "repo up to date ($($sync.head))"
+        }
+        else {
+            # skipped / blocked / failed. Deliberately NOT committed to the log on its own: the log is
+            # not a channel anyone watches, so the notification is the report and the log line is
+            # context that flushes with any tick that does something. Suppressed while unchanged, so a
+            # week on a feature branch costs one alert, not 2016.
+            Write-Log "repo sync $($sync.status): $($sync.reason)"
+            Send-NotificationIfChanged -State $notifyState -Key "__deploy_health__" `
+                -Signature "$($sync.status):$($sync.reason)" `
+                -Message ("MindWire: main の自動取り込みが **$($sync.status)** です — $($sync.reason)。" +
+                          "ループは現在チェックアウトされているコードで動き続けます（古い可能性があります）。")
+        }
+    }
+
     $candidates = Get-SweepCandidates -Path $sweepConfigPath
     Write-Log "sweep list ($($candidates.Count) candidates from $sweepConfigPath): $(($candidates | ForEach-Object { $_.key }) -join ', ')"
 
@@ -416,7 +486,6 @@ try {
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
     }
     $headsState = Get-JsonState -Path $headsStatePath
-    $notifyState = Get-JsonState -Path $notifyStatePath
 
     $inner = Join-Path $PSScriptRoot "run-conductor.ps1"
     $didWork = $false
