@@ -4,7 +4,8 @@
 # Why: the Task Scheduler entry launched the conductor against whatever thread happened to be left in
 # mindwire.toml, and wrote no log anywhere. This wrapper
 #   1. asks loop control whether each project is HELD (scripts/loop_control.py) and drops every
-#      candidate of a held project,
+#      candidate of a held project — but only once the loop has acknowledged that hold, so the first
+#      tick of a HOLD still launches and lands the acknowledgement (see Test-HoldObserved),
 #   2. asks the chatroom which threads have actually moved (scripts/thread_heads.py),
 #   3. walks an explicit priority list, head first, SKIPPING every thread whose head message AND
 #      project control state are both unchanged since the last time the conductor ran on it,
@@ -141,6 +142,30 @@ function Get-HeadRecord {
         head    = if ($value.PSObject.Properties.Name -contains 'head') { $value.head } else { $null }
         control = if ($value.PSObject.Properties.Name -contains 'control') { $value.control } else { $null }
     }
+}
+
+# May a held project's launch be optimised away this tick?
+#
+# ONLY once the loop has already reported that it saw the hold. `desired_state` is the operator's
+# request; `observed_state` is the loop's acknowledgement, and only a launched conductor writes it
+# (``LoopControlReader.report_observed``). Dropping the launch on `desired` alone therefore starves
+# the very write-back the dashboard uses to tell "stopping" from "stopped" — the hold shows as
+# pending forever, which reads as the loop ignoring the stop switch.
+#
+# Confirmed in production, and the way it was confirmed is the point: on 2026-08-06 both projects sat
+# at `hold`, and `spirrow-voxelworld` had `observed_state: null` — never acknowledged, because it was
+# never launched. `spirrow-mindwire` had `observed: hold` only because its control probe happened to
+# FAIL that tick, so the sweep failed open, launched, and the conductor landed the write-back. A
+# transient outage was the only reason the feedback loop ever closed. (Tier B naysayer on PR #126.)
+#
+# So the first tick of a hold pays for one process start; every tick after it costs one MCP read.
+# That is the whole cost of an operator being able to see their stop switch take effect.
+function Test-HoldObserved {
+    param($Control)
+
+    if ($null -eq $Control) { return $false }          # unreadable probe — fail open, launch
+    if ($Control.desired_state -ne 'hold') { return $false }
+    return ($Control.observed_state -eq 'hold')
 }
 
 # The skip rule, stated in one place because getting it wrong is invisible.
@@ -473,14 +498,15 @@ try {
     $headsByProject = @{}
     $controlByProject = @{}
     foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
-        # Control first: a held project needs no head probe at all, so asking in this order keeps a
-        # deliberate HOLD to exactly one MCP read per project per tick.
+        # Control first: a project whose hold has already landed needs no head probe at all, so asking
+        # in this order keeps a settled HOLD to exactly one MCP read per project per tick. A hold the
+        # loop has not acknowledged yet still gets probed and launched — see Test-HoldObserved.
         $c = Invoke-ControlProbe -Project $proj
         $controlByProject[$proj] = $c
         if ($null -ne $c) {
             Write-Log "control probe [$proj]: desired=$($c.desired_state) observed=$($c.observed_state) configured=$($c.configured)"
         }
-        if ($null -ne $c -and $c.desired_state -eq 'hold') { continue }
+        if (Test-HoldObserved -Control $c) { continue }
         $h = Invoke-HeadProbe -Project $proj
         $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
@@ -514,14 +540,17 @@ try {
         $attempt++
         $thread = $cand.thread_id
 
-        # HOLD is per project, so it takes every one of that project's candidates out at once. Not
-        # counted as "skipped" (that word means "head unchanged, nothing to do"); a held project has
-        # work and is being deliberately withheld, and reporting the two the same way would make an
-        # operator's HOLD look like an idle loop in the log and the summary.
+        # HOLD is per project, so it takes every one of that project's candidates out at once — but
+        # only once the loop has acknowledged the hold (Test-HoldObserved). Until then the candidate
+        # falls through and launches, which is what lands the acknowledgement.
+        #
+        # Not counted as "skipped" (that word means "head unchanged, nothing to do"); a held project
+        # has work and is being deliberately withheld, and reporting the two the same way would make
+        # an operator's HOLD look like an idle loop in the log and the summary.
         $control = $controlByProject[$cand.project]
-        if ($null -ne $control -and $control.desired_state -eq 'hold') {
+        if (Test-HoldObserved -Control $control) {
             $held++
-            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — project HELD (desired=hold, loop last observed '$($control.observed_state)'), not launching"
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — project HELD (desired=hold, loop observed hold), not launching"
             continue
         }
 
