@@ -64,6 +64,36 @@ def test_fs_write_no_path_denied(tmp_path: Path) -> None:
     assert _al(tmp_path).check(ClassifiedAction(Operation.FS_WRITE, path=None)).allowed is False
 
 
+# --- the scratch-file lesson (2026-08-08) ---------------------------------- #
+# The implementer finished both Step 0 commits and then died opening the PR: it wrote the
+# PR body to the OS temp directory, which this rule denies. Nothing about the rule was
+# wrong — the sanctioned alternative simply was not stated where the implementer reads
+# (its system prompt). These two pin the pair of facts that make that guidance correct,
+# so nobody "fixes" the recurrence by widening the constraint instead.
+
+
+def test_fs_write_os_temp_denied(tmp_path: Path) -> None:
+    """The exact write that halted the 2026-08-08 run. Widening this is the wrong fix."""
+    import tempfile
+
+    d = _al(tmp_path).check(
+        ClassifiedAction(Operation.FS_WRITE, path=str(Path(tempfile.gettempdir()) / "pr_body.md"))
+    )
+    assert d.allowed is False
+    assert "outside" in d.reason
+
+
+def test_fs_write_git_dir_scratch_allowed(tmp_path: Path) -> None:
+    """`<repo>/.git/mindwire-scratch/` — the location the system prompt sanctions.
+
+    Inside the repo, so containment allows it; under `.git`, so it can never show up in
+    `git status` or be committed by `git add`. Both halves matter: a scratch path in the
+    working tree would eventually be committed by accident.
+    """
+    p = str(tmp_path / ".git" / "mindwire-scratch" / "pr_body.md")
+    assert _al(tmp_path).check(ClassifiedAction(Operation.FS_WRITE, path=p)).allowed is True
+
+
 # --- git.commit / git.push branch constraints ------------------------------ #
 
 

@@ -113,6 +113,15 @@ script, EXECUTE it (`bash .mindwire-gate`; exit 0 = green); otherwise run the \
 project's own configured test suite as defined by its local config. A red gate \
 blocks the commit — fix the cause, never commit around it.
 
+SCRATCH FILES: every write lands inside the repository or is denied — including \
+the throwaway ones. A PR body, a message draft, a diff you want to re-read: do \
+NOT put them in the OS temp directory, that write is denied and it halts you. \
+Two options, in order: (1) skip the file — `gh pr create --body-file -` reads \
+the body from stdin, so a heredoc needs no file at all; (2) if you genuinely \
+need a file, use `<repo>/.git/mindwire-scratch/`, which is inside the repo yet \
+can never appear in `git status` or be committed by `git add`. Never put \
+scratch files in the working tree, where they would be committed by accident.
+
 Work on a feature/* branch, commit your changes, and (when ready) open a PR to \
 develop. When you reply in the thread, reply directly with the message body — \
 no preamble, no meta-commentary; your response is posted verbatim.
