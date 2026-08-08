@@ -175,11 +175,44 @@ conductor is worth it at all.
 > fire is a 0-round no-op that still exits 0 and still shows green in the task history. Observed for
 > an unknown number of days before the wrapper made it visible.
 
+### The daemon runs from its OWN checkout, never a working one
+
+**The scheduled task must point at a clone nobody edits** — on sg-tomtebo-01,
+`C:\Users\tomtar\spirrow-mindwire-daemon`, deliberately beside the data dir rather than in the dev
+workspace, so the location itself says "not a place to work".
+
+The reason is not tidiness. The venv holds an **editable** install, so the working tree *is* the
+running module — there is no build or copy step to lag behind an edit. A daemon pointed at the
+checkout a human works in therefore executes whatever is on disk at each tick, mid-edit and all.
+Measured 2026-08-07, while two PRs were being written against that shared checkout: four ticks ran
+work-in-progress code, one of them a version deliberately broken for a negative test, and
+`state/heads.json` was rewritten several times in two mutually unreadable schemas. Nothing broke —
+but only because every path involved fails open. That is luck plus fail-open design, not isolation.
+
+Setting it up:
+
+```pwsh
+git clone https://github.com/SpirrowGames/spirrow-mindwire.git C:\Users\tomtar\spirrow-mindwire-daemon
+cd C:\Users\tomtar\spirrow-mindwire-daemon
+uv sync                                    # its own venv, editable onto its own source
+```
+
+The data root is unaffected — both checkouts default to `~/spirrow-mindwire-data`, so logs, sweep
+config and state stay in one place and survive the move.
+
+**Nothing needs to keep the daemon checkout up to date by hand**: `deploy/sync-repo.ps1` fast-forwards
+it to `origin/main` at the top of every tick (see *Deploying a merged change*). And if someone does
+edit it, that is not silent either — a modified tracked file makes the sync return `blocked`, which
+pushes a Discord alert. Detection comes free from the sync step; no extra guard is needed.
+
+To see which commit is actually deployed: `git -C C:\Users\tomtar\spirrow-mindwire-daemon log -1`, or
+read the `repo up to date (<sha>)` line the sweep writes on any tick that does something.
+
 Task settings that matter (Windows):
 
 | Setting | Value | Why |
 |---|---|---|
-| Action | `pwsh -NoProfile -File <repo>\deploy\run-conductor-scheduled.ps1` | the wrapper, not the raw launcher |
+| Action | `pwsh -NoProfile -File <daemon-checkout>\deploy\run-conductor-scheduled.ps1` | the wrapper, not the raw launcher — and the **daemon** checkout, not a working one (above) |
 | Trigger | at logon **and** a repeating trigger, 5 min, indefinite | the head probe makes a short interval nearly free; see below |
 | `MultipleInstancesPolicy` | `IgnoreNew` | a tick that fires while the previous sweep is still working is dropped — this is the whole of the "already running?" handling, no lock file needed |
 | `ExecutionTimeLimit` | `PT4H` | a real design round can take a while; `PT2H` was cutting runs off |
