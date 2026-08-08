@@ -17,7 +17,18 @@ allow:
   - operation: fs.read
   - operation: search
   - operation: github.read
-  - operation: fs.write         # repo files only
+  # Repo files only. `<repo>/**` is repo-CONTAINMENT, not literal fnmatch (see
+  # allowlist._match_path_glob), so it already covers scratch files anywhere under the
+  # repo — no extra rule is needed for those, and none should be added.
+  #
+  # This bites in a way worth naming: 2026-08-08, the implementer finished both Step 0
+  # commits and then died opening the PR, because it wrote the PR body to the OS temp
+  # directory out of habit. Nothing here was wrong; the rule was never explained to the
+  # only party bound by it. The fix therefore lives in the implementer's SYSTEM PROMPT
+  # (adapters/implementer.py, "SCRATCH FILES"), which is what that session actually
+  # reads — it runs with `setting_sources=[]` and never sees this file or CLAUDE.md.
+  # Keep the two in step: a constraint stated only here is a constraint the loop cannot obey.
+  - operation: fs.write
     path_glob: "<repo>/**"
   - operation: git.commit
     branch_glob: ["feature/*", "develop"]
