@@ -47,8 +47,24 @@ CLI:
     obligations_readback.py --base-ref origin/main --head-ref HEAD
     obligations_readback.py --base-file <path> --head-file <path>   # test seam
 
-Always exits 0. A non-zero exit here would silently turn the advisory into a
-gate and mislead a future reader of the ``if: success()`` graph.
+Exit code contract (Einstein / msg-762 objection):
+
+- **Exits 0** on the normal path, regardless of whether any findings were
+  produced. Advisory findings are surfaced through the summary text, not
+  the exit code — turning them into a gate is exactly what this design
+  rejects.
+- **Exits non-zero** (via an unhandled exception propagating out of
+  ``main``) on a real tool failure — a Python error, a broken import, a
+  malformed CLI invocation. The workflow deliberately does NOT set
+  ``continue-on-error: true``, so a tool crash reds the check and the
+  implementer executing ``OBL-PRCHECK-READ`` triages the mechanism itself
+  rather than misreading "green + empty summary" as "zero findings".
+
+Tolerance boundary: a malformed manifest on either side (base or head) is
+treated as an empty set and reported as a clean advisory run, *not* a tool
+failure. That is deliberate — the fail-closed loader in
+``obligations.py`` is what validates schema at daemon startup, and this
+advisory must not double-gate the same invariant.
 """
 
 from __future__ import annotations
@@ -335,17 +351,28 @@ def _format_summary(findings: list[_Finding]) -> str:
 
 
 def _write_summary(text: str) -> None:
-    """Write ``text`` to ``$GITHUB_STEP_SUMMARY`` if set, otherwise stdout."""
+    """Write ``text`` to ``$GITHUB_STEP_SUMMARY`` if set, otherwise stdout.
+
+    A broken step-summary sink is intentionally handled by *also* mirroring to
+    stdout — GitHub captures stdout in the raw job log, so the finding text is
+    never lost even if the summary target cannot be opened. The advisory
+    contract (Einstein / msg-762) is that a genuine tool failure (import
+    error, unhandled exception) reds the check via a non-zero exit; a
+    successful analysis with a busted sink still counts as a successful
+    analysis and must not be conflated with a crash.
+    """
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    wrote_to_summary = False
     if summary_path:
         try:
             with open(summary_path, "a", encoding="utf-8") as fp:
                 fp.write(text)
-                return
+                wrote_to_summary = True
         except OSError:
             # Fall through to stdout — advisory must not fail on a broken step-summary sink.
             pass
-    sys.stdout.write(text)
+    if not wrote_to_summary:
+        sys.stdout.write(text)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:

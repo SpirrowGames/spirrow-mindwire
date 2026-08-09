@@ -6,20 +6,30 @@ name: obligations-readback (advisory)
 #
 #   * Only runs on `pull_request` (the only path this repo actually gates —
 #     `push: main` was rejected in msg-760 D because it names no reader).
-#   * Never blocks a merge. The job step always exits 0. There is no branch
-#     protection on this repo under the current GitHub plan (Pro upgrade
-#     rejected per msg-761), so the authoritative merge guard is the human
-#     at merge-time. The `(advisory)` suffix in the job name is where that
-#     is cheapest to state honestly — it appears next to the badge in the
-#     PR merge-box.
+#   * Advisory findings (obligation ids disappeared / renamed) do NOT turn
+#     the check red — the script surfaces them on $GITHUB_STEP_SUMMARY and
+#     always exits 0 on its normal path. There is no branch protection on
+#     this repo under the current GitHub plan (Pro upgrade rejected per
+#     msg-761), so the authoritative merge guard is the human at merge-time.
+#     The `(advisory)` suffix in the job name is where that is cheapest to
+#     state honestly — it appears next to the badge in the PR merge-box.
+#   * Tool-level failures (uv install fails, a Python exception in the
+#     script, a broken workflow file) DO turn the check red. This is the
+#     Einstein / msg-762 objection: `continue-on-error: true` at the step
+#     level would swallow crashes and yield "green + empty summary", which
+#     an implementer executing `OBL-PRCHECK-READ` would misread as "zero
+#     findings" rather than "the tool broke". A crashed advisory is worse
+#     than no advisory. So: only the SCRIPT is entitled to fail advisories
+#     silently (by exiting 0 after writing the summary); INFRASTRUCTURE
+#     failures stay visible as a red check the implementer must triage.
 #   * Base revision is the source of truth for the "expected" id set. No
-#     shadow list lives in this workflow or in the script; a shadow list was
-#     the exact dual-management the naysayer round-3 finding on this PR
-#     called out.
-#   * Details land in $GITHUB_STEP_SUMMARY (surviving `file:line` references
-#     for each removed / renamed id + one-line remediation). The reviewer
-#     does NOT have to dive into the repo to see what still points at a
-#     removed id — that's the point.
+#     shadow list lives in this workflow or in the script; a shadow list
+#     was the exact dual-management the naysayer round-3 finding on this
+#     PR called out.
+#   * Details land in $GITHUB_STEP_SUMMARY (surviving `file:line`
+#     references for each removed / renamed id + one-line remediation).
+#     The reviewer does NOT have to dive into the repo to see what still
+#     points at a removed id — that's the point.
 #
 # The reader-side complement is `OBL-PRCHECK-READ` in
 # spec/process/obligations.yaml: the implementer reads the PR check runs
@@ -52,12 +62,16 @@ jobs:
           version: "latest"
       - name: Set up Python
         run: uv python install 3.11
-      - name: obligations-readback (advisory) — diff base vs head, no blocking
-        # `continue-on-error: true` is a belt on top of the always-exit-0
-        # contract in the script itself — if a future edit accidentally
-        # makes the script raise, the check still stays advisory rather
-        # than silently becoming a gate on the merge-box.
-        continue-on-error: true
+      - name: obligations-readback (advisory) — diff base vs head, tool-red / advisory-green
+        # NO `continue-on-error: true` here — a step-level swallow would
+        # turn a tool crash into "green + empty summary", indistinguishable
+        # from a clean run (Einstein / msg-762 objection). Advisory-vs-tool
+        # is enforced by the SCRIPT's exit code, not by the workflow: the
+        # script exits 0 on its normal path (findings or not) and lets
+        # Python's default non-zero exit on an unhandled exception red the
+        # step. See tests/test_obligations_readback.py::
+        # test_findings_present_still_exits_zero for the contract test.
+        #
         # `uv run --with pyyaml` provisions a per-invocation venv with
         # PyYAML — the script's only runtime dep. This avoids `pip install
         # --system` on Ubuntu 24 (externally-managed Python 3.12 refuses

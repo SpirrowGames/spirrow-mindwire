@@ -120,7 +120,7 @@ Tier-C GO (msg-737 / msg-739) が v1 の scope を「4 obligations の manifest 
 
 `spec/process/obligations.yaml` の obligation id topology (追加 / 削除 / rename) を、PR の **base revision** と head の間で毎回差分する非阻止の advisory check。実装は `scripts/obligations_readback.py`。
 
-**設計上の核 (msg-760 A):**
+**設計上の核 (msg-760 A + msg-762 objection):**
 
 1. **check 名に `(advisory)` を含める** — PR merge-box の badge 隣で最も安く「これはゲートではない」と正直になれる場所。
 2. **非阻止の明記** — script docstring / workflow コメントに「本検査はマージを阻止しない。本リポジトリに branch protection は無く、authoritative guard は人間である」と書く。
@@ -129,6 +129,7 @@ Tier-C GO (msg-737 / msg-739) が v1 の scope を「4 obligations の manifest 
 5. **範囲の明記** — trigger は `pull_request` のみ。`main` への直接 push で入った不整合は検出されない。base 導出の設計上、いったん base に入った不整合は以後 base 側の正解として扱われるため恒久に検出されない。これは branch protection が使えないことの帰結であり、検査側では塞げない。
 6. **リリース PR 条項は無し** — 機構はブランチ非依存 ∴ 特別条項不要。
 7. **読み手** — Takahito (merge 判断時、PR merge-box)。implementer (human へ渡す前、下記 B により)。
+8. **advisory-vs-tool 二値分離 (msg-762 objection への対処)** — advisory 所見 (obligation が消えた / rename された) は check を **緑**にする (script が exit 0 して summary に出す)。**tool 自体が壊れた**場合 (uv install 失敗、Python 例外、workflow 構文エラー) は check を **赤**にする (Python の unhandled 例外による非ゼロ終了、workflow は `continue-on-error: true` を**置かない**)。step-level swallow を付けると tool crash と「所見ゼロ」が区別不能になり、`OBL-PRCHECK-READ` を実行する implementer は「緑 + 空 summary」を「所見なし」と誤読する — 壊れた advisory は無い advisory より悪い。この二値は `tests/test_obligations_readback.py` の `test_findings_present_still_exits_zero` (advisory 契約) と `test_tool_failure_propagates_nonzero_exit` (tool 契約) が対で守る。
 
 **scope 上「これは catch しない」もの:**
 

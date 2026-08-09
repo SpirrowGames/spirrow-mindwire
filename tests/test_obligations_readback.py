@@ -6,11 +6,13 @@ tests use the ``--base-file`` / ``--head-file`` test seams so we can exercise
 the drift-detection logic without needing a real ``git show`` — the git-read
 path is a thin subprocess wrapper covered by CI on the actual PR.
 
-We deliberately DO NOT re-test the "always exit 0" contract by aggregating a
-sample of scary manifests: exit 0 is asserted structurally (``return 0`` in
-``main``) and belt-and-braced by ``continue-on-error: true`` in the workflow.
-Chasing every path here would rebuild the same "shadow list" of behaviour the
-canary-① removal explicitly rejected.
+The workflow deliberately does NOT set ``continue-on-error: true`` (Einstein
+/ msg-762 objection): a step-level swallow would turn a tool crash into
+"green + empty summary", which an implementer executing ``OBL-PRCHECK-READ``
+would misread as "zero findings". The advisory-vs-tool split is therefore
+enforced by the script's exit code — see the last two tests
+(``test_findings_present_still_exits_zero`` / ``test_tool_failure_propagates_nonzero_exit``)
+for the paired contract.
 """
 
 from __future__ import annotations
@@ -187,3 +189,95 @@ def test_malformed_base_manifest_is_reported_as_empty_base(
     summary = _run(base, head, tmp_path, monkeypatch)
     # Nothing disappeared (base was empty) → clean summary, no crash.
     assert "No obligation ids disappeared" in summary
+
+
+# --------------------------------------------------------------------------- #
+# advisory-vs-tool exit-code contract (Einstein / msg-762 objection)
+# --------------------------------------------------------------------------- #
+#
+# The workflow deliberately does NOT set `continue-on-error: true`, so the
+# check goes red on any non-zero exit from the script. That makes the split
+# between "advisory findings" and "tool crash" *the script's* responsibility:
+#
+#   * advisory findings         → exit 0 (green + populated summary)
+#   * tool / infrastructure fail → non-zero exit (red — implementer triages)
+#
+# Losing this split re-opens the exact fail-open Einstein flagged: an
+# implementer executing `OBL-PRCHECK-READ` sees "green + empty summary" and
+# misreads a crashed tool as "zero missing obligations". The two tests below
+# hold both halves of the contract.
+
+
+def test_findings_present_still_exits_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A REMOVED / RENAMED finding must not turn the exit code non-zero.
+
+    Advisory findings are surfaced through the summary, not the exit code —
+    otherwise the workflow (which has no ``continue-on-error``) would go red
+    on every legitimate rename, defeating the "advisory means advisory"
+    contract in msg-760 A.
+    """
+    base = dedent(
+        """\
+        version: 1
+        obligations:
+          - id: OBL-DECLARE-UNREADABLE
+            role: implementer
+            body: "hello"
+          - id: OBL-DEFINITELY-GONE
+            role: implementer
+            body: "byebye"
+        """
+    )
+    head = dedent(
+        """\
+        version: 1
+        obligations:
+          - id: OBL-DECLARE-UNREADABLE
+            role: implementer
+            body: "hello"
+        """
+    )
+    base_file = tmp_path / "base.yaml"
+    head_file = tmp_path / "head.yaml"
+    base_file.write_text(base, encoding="utf-8")
+    head_file.write_text(head, encoding="utf-8")
+    summary_file = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+    exit_code = _MODULE.main(  # type: ignore[attr-defined]
+        ["--base-file", str(base_file), "--head-file", str(head_file)]
+    )
+    # Advisory MUST be green even when findings exist — the finding must go to
+    # the summary, not the exit code (msg-762).
+    assert exit_code == 0
+    summary = summary_file.read_text(encoding="utf-8")
+    assert "REMOVED: `OBL-DEFINITELY-GONE`" in summary
+
+
+def test_tool_failure_propagates_nonzero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unhandled exception in ``main`` must propagate (non-zero exit).
+
+    This is the second half of the advisory-vs-tool contract: a real crash
+    must be visible as a red check so the implementer executing
+    ``OBL-PRCHECK-READ`` triages the mechanism itself rather than misreading
+    silence as safety. We simulate an infrastructure failure by monkey-patching
+    the internal ``_load_snapshot`` (called by ``main``) to raise; the raise
+    must escape ``main`` rather than be swallowed into an exit-0.
+    """
+
+    def _boom(_text: str) -> None:
+        raise RuntimeError("simulated tool failure")
+
+    monkeypatch.setattr(_MODULE, "_load_snapshot", _boom)
+    base_file = tmp_path / "base.yaml"
+    head_file = tmp_path / "head.yaml"
+    base_file.write_text("version: 1\nobligations: []\n", encoding="utf-8")
+    head_file.write_text("version: 1\nobligations: []\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+
+    with pytest.raises(RuntimeError, match="simulated tool failure"):
+        _MODULE.main(  # type: ignore[attr-defined]
+            ["--base-file", str(base_file), "--head-file", str(head_file)]
+        )
