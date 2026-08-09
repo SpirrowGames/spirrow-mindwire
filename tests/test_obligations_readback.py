@@ -349,3 +349,159 @@ def test_tool_failure_propagates_nonzero_exit(
         _MODULE.main(  # type: ignore[attr-defined]
             ["--base-file", str(base_file), "--head-file", str(head_file)]
         )
+
+
+# --------------------------------------------------------------------------- #
+# base-read discrimination (Tier B naysayer Finding 3 on PR #135 / msg-766)
+# --------------------------------------------------------------------------- #
+#
+# `_read_base_manifest` used to `return ""` on ANY non-zero `git show` — which
+# swallowed unknown/unfetched refs, missing git binaries, and every other real
+# tool failure as "empty base = zero findings" (green). That defeated the
+# msg-762 exit contract from inside the script the contract was designed
+# around. The paired tests below hold the discrimination rule:
+#
+#   * `git show` returned "path does not exist in <rev>" style stderr →
+#     empty base is the correct advisory verdict (this PR is adding a new
+#     manifest; nothing to diff against).
+#   * `git show` failed for any other reason →
+#     ObligationsReadbackToolError, which propagates out of `main` and
+#     reds the check.
+
+
+def _make_completed_process(returncode: int, stderr: str, stdout: str = "") -> object:
+    """Small stand-in for ``subprocess.CompletedProcess`` — only the fields we read."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class _P:
+        returncode: int
+        stdout: str
+        stderr: str
+
+    return _P(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_base_read_treats_file_missing_at_revision_as_empty_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git's "path does not exist in <rev>" stderr → advisory empty-base path.
+
+    This is the added-in-this-PR-manifest case: the head has a manifest, the
+    base does not, so the diff should show every head id as "added" (no
+    removed/renamed findings) and the check goes green with a clean summary.
+    """
+
+    def _fake_git_show(*_args: object, **_kwargs: object) -> object:
+        return _make_completed_process(
+            returncode=128,
+            stderr=("fatal: path 'spec/process/obligations.yaml' does not exist in 'origin/main'"),
+        )
+
+    monkeypatch.setattr(_MODULE.subprocess, "run", _fake_git_show)  # type: ignore[attr-defined]
+    # Force the non-test-seam path so we exercise `_read_base_manifest` proper.
+    head_file = tmp_path / "head.yaml"
+    head_file.write_text(
+        dedent(
+            """\
+            version: 1
+            obligations:
+              - id: OBL-BRAND-NEW
+                role: implementer
+                body: "just landed"
+            """
+        ),
+        encoding="utf-8",
+    )
+    summary_file = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+    exit_code = _MODULE.main(  # type: ignore[attr-defined]
+        ["--base-ref", "origin/main", "--head-file", str(head_file)]
+    )
+    assert exit_code == 0
+    summary = summary_file.read_text(encoding="utf-8")
+    assert "No obligation ids disappeared" in summary
+
+
+def test_base_read_treats_exists_on_disk_stderr_as_empty_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The alternate git wording ("exists on disk, but not in <rev>") also
+    counts as legitimate empty base, not a tool failure.
+    """
+
+    def _fake_git_show(*_args: object, **_kwargs: object) -> object:
+        return _make_completed_process(
+            returncode=128,
+            stderr=(
+                "fatal: path 'spec/process/obligations.yaml' exists on disk, "
+                "but not in 'origin/main'"
+            ),
+        )
+
+    monkeypatch.setattr(_MODULE.subprocess, "run", _fake_git_show)  # type: ignore[attr-defined]
+    head_file = tmp_path / "head.yaml"
+    head_file.write_text("version: 1\nobligations: []\n", encoding="utf-8")
+    summary_file = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+    exit_code = _MODULE.main(  # type: ignore[attr-defined]
+        ["--base-ref", "origin/main", "--head-file", str(head_file)]
+    )
+    assert exit_code == 0
+
+
+def test_base_read_unknown_ref_raises_tool_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unfetched / unknown / ambiguous base ref must red the check.
+
+    This is the exact fail-open the Tier B naysayer flagged (Finding 3): the
+    previous "swallow every non-zero" branch would have called this an empty
+    base and returned green. Under the msg-762 contract it MUST raise so the
+    implementer triages the mechanism (bad checkout, missing fetch, etc.)
+    rather than trusting a lying green.
+    """
+
+    def _fake_git_show(*_args: object, **_kwargs: object) -> object:
+        return _make_completed_process(
+            returncode=128,
+            stderr=(
+                "fatal: ambiguous argument 'origin/no-such-branch': "
+                "unknown revision or path not in the working tree."
+            ),
+        )
+
+    monkeypatch.setattr(_MODULE.subprocess, "run", _fake_git_show)  # type: ignore[attr-defined]
+    head_file = tmp_path / "head.yaml"
+    head_file.write_text("version: 1\nobligations: []\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+
+    with pytest.raises(_MODULE.ObligationsReadbackToolError, match="ambiguous argument"):  # type: ignore[attr-defined]
+        _MODULE.main(  # type: ignore[attr-defined]
+            ["--base-ref", "origin/no-such-branch", "--head-file", str(head_file)]
+        )
+
+
+def test_base_read_missing_git_binary_propagates_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing ``git`` binary (OSError) must propagate — not be swallowed.
+
+    We deliberately do NOT try/except OSError inside `_read_base_manifest`;
+    the msg-762 contract requires infrastructure failures to red the check.
+    """
+
+    def _boom_no_git(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError("No such file or directory: 'git'")
+
+    monkeypatch.setattr(_MODULE.subprocess, "run", _boom_no_git)  # type: ignore[attr-defined]
+    head_file = tmp_path / "head.yaml"
+    head_file.write_text("version: 1\nobligations: []\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+
+    with pytest.raises(FileNotFoundError):
+        _MODULE.main(  # type: ignore[attr-defined]
+            ["--base-ref", "origin/main", "--head-file", str(head_file)]
+        )

@@ -75,6 +75,19 @@ treated as an empty set and reported as a clean advisory run, *not* a tool
 failure. That is deliberate — the fail-closed loader in
 ``obligations.py`` is what validates schema at daemon startup, and this
 advisory must not double-gate the same invariant.
+
+**Base-read discrimination (Tier B naysayer Finding 3 on PR #135):**
+"empty base" (returned as empty string, feeds the diff, exits 0) means
+strictly *"git reports the manifest file did not exist at that revision"*
+— the added-in-this-PR-manifest case, matched by
+:data:`_GIT_FILE_MISSING_STDERR_MARKERS`. Everything else that ``git
+show`` can fail with (missing binary, unknown ref, unfetched revision,
+ambiguous argument, network / permission) is a real tool failure and
+raises :class:`ObligationsReadbackToolError`, propagating out of
+``main`` and reding the check. The previous "swallow every non-zero"
+recreated the exact fail-open the msg-762 exit-contract exists to
+prevent — it would have interpreted a broken checkout as "empty base =
+zero findings" and reported green.
 """
 
 from __future__ import annotations
@@ -159,28 +172,73 @@ def _load_snapshot(text: str) -> dict[str, _ObligationSnapshot]:
     return snapshots
 
 
+# Substrings that appear in git's stderr when the requested path did not
+# exist at the requested revision (an added-in-this-PR manifest — a
+# legitimate empty base, not a tool failure). Case-insensitive match on the
+# lowered stderr; both wordings ship with modern git.
+#
+#   "fatal: path 'X' does not exist in 'Y'"
+#   "fatal: path 'X' exists on disk, but not in 'Y'"
+#
+# EVERY other git failure (missing binary → OSError; unknown/unfetched ref →
+# "fatal: bad revision"; ambiguous argument; network failure; permission
+# denied) is a tool / infrastructure failure and MUST propagate so the CI
+# check reds under the msg-762 advisory-vs-tool contract. Tier B naysayer
+# Finding 3 on PR #135 called out the previous "swallow every non-zero" as
+# the exact fail-open the contract was designed to prevent.
+_GIT_FILE_MISSING_STDERR_MARKERS: tuple[str, ...] = (
+    "does not exist in",
+    "exists on disk, but not in",
+)
+
+
+class ObligationsReadbackToolError(RuntimeError):
+    """A tool / infrastructure failure that must red the CI check.
+
+    Raised for anything that is NOT a "file missing at a valid revision"
+    result. Kept separate from :class:`RuntimeError` at the type level so a
+    caller (or a test) can assert on the discrimination itself — see
+    ``tests/test_obligations_readback.py::test_unknown_base_ref_is_treated_as_tool_failure``.
+    """
+
+
 def _read_base_manifest(base_ref: str) -> str:
     """Read ``spec/process/obligations.yaml`` at ``base_ref`` via ``git show``.
 
-    Returns the empty string on any git failure (the file did not exist at that
-    revision, the ref is unknown, etc.) — an added-in-this-PR manifest is not
-    a drift, so treating the base as empty is correct.
+    Returns the empty string ONLY when git reports "path did not exist at
+    that revision" (matched by :data:`_GIT_FILE_MISSING_STDERR_MARKERS`) —
+    that is the added-in-this-PR-manifest case, which is not a drift and
+    correctly compares against an empty base. Every other git failure is a
+    tool / infrastructure failure and is raised as
+    :class:`ObligationsReadbackToolError` so it propagates out of ``main``
+    and reds the CI check (msg-762 advisory-vs-tool contract; Tier B
+    naysayer Finding 3 on PR #135). ``OSError`` from ``subprocess.run``
+    (missing ``git`` binary, permission denied) is left to propagate for the
+    same reason — we deliberately do not catch it here.
     """
     rel = _MANIFEST_REL.as_posix()
-    try:
-        result = subprocess.run(
-            ["git", "show", f"{base_ref}:{rel}"],
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    result = subprocess.run(
+        ["git", "show", f"{base_ref}:{rel}"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode == 0:
+        return result.stdout
+    stderr_lower = (result.stderr or "").lower()
+    if any(marker in stderr_lower for marker in _GIT_FILE_MISSING_STDERR_MARKERS):
         return ""
-    if result.returncode != 0:
-        return ""
-    return result.stdout
+    raise ObligationsReadbackToolError(
+        f"`git show {base_ref}:{rel}` failed with return code {result.returncode} "
+        f"and this is NOT a 'file missing at valid revision' result — this is a "
+        f"tool / infrastructure failure (unknown or unfetched ref, ambiguous "
+        f"argument, environment issue). Under the msg-762 advisory-vs-tool "
+        f"contract this MUST red the CI check rather than be silently swallowed "
+        f"as 'empty base = zero findings' (Tier B naysayer Finding 3 on PR #135). "
+        f"git stderr: {result.stderr.strip()!r}"
+    )
 
 
 def _read_head_manifest() -> str:
