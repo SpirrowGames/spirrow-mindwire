@@ -484,6 +484,178 @@ def test_base_read_unknown_ref_raises_tool_error(
         )
 
 
+def test_base_read_forces_c_locale_for_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_read_base_manifest` must invoke `git show` with `LC_ALL=C` / `LANG=C`.
+
+    Tier B naysayer Finding 1 on msg-768: the "file missing at revision"
+    substring markers are English (`"does not exist in"` / `"exists on
+    disk, but not in"`). Without a forced C locale, git emits localised
+    stderr on a developer host set to e.g. `ja_JP.UTF-8` (executing this
+    script under `OBL-PRCHECK-READ` locally), the substring matcher
+    misses, and a valid empty-base result is misreported as a tool crash.
+
+    We capture the `env=` kwarg that `main` passes to `subprocess.run` and
+    assert both locale variables are set to `C` regardless of what the
+    ambient shell has.
+    """
+    captured_env: dict[str, str] = {}
+
+    def _capture_env(*_args: object, **kwargs: object) -> object:
+        env = kwargs.get("env")
+        if isinstance(env, dict):
+            captured_env.update({str(k): str(v) for k, v in env.items()})
+        return _make_completed_process(
+            returncode=128,
+            stderr=("fatal: path 'spec/process/obligations.yaml' does not exist in 'origin/main'"),
+        )
+
+    # Set the ambient locale to something non-C so we can see the override wins.
+    monkeypatch.setenv("LC_ALL", "ja_JP.UTF-8")
+    monkeypatch.setenv("LANG", "ja_JP.UTF-8")
+    monkeypatch.setattr(_MODULE.subprocess, "run", _capture_env)  # type: ignore[attr-defined]
+    head_file = tmp_path / "head.yaml"
+    head_file.write_text("version: 1\nobligations: []\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+
+    exit_code = _MODULE.main(  # type: ignore[attr-defined]
+        ["--base-ref", "origin/main", "--head-file", str(head_file)]
+    )
+    assert exit_code == 0
+    assert captured_env.get("LC_ALL") == "C", (
+        "git subprocess must run with LC_ALL=C so the 'file missing' "
+        "substring matcher works regardless of the ambient locale"
+    )
+    assert captured_env.get("LANG") == "C"
+
+
+# --------------------------------------------------------------------------- #
+# reference-scan robustness (Tier B naysayer Finding 2 on msg-768)
+# --------------------------------------------------------------------------- #
+
+
+def test_reference_scan_survives_non_utf8_bytes_in_a_scanned_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-UTF-8 byte in a scanned file must NOT hide OBL-* references in it.
+
+    Tier B naysayer Finding 2 on msg-768: swallowing `UnicodeDecodeError`
+    and `continue` skipped the entire file, so a single ISO-8859-1 smart
+    quote could silently drop every OBL-* reference in that file from the
+    advisory. `read_text(errors="replace")` decodes the ASCII parts
+    cleanly (the regex only needs the ASCII OBL-* tokens) while leaving
+    U+FFFD in place of the bad bytes.
+
+    We construct a fake repo containing (a) a manifest that removes an id
+    and (b) a docs file with a non-UTF-8 byte plus a surviving reference
+    to the removed id. The advisory MUST list the reference in its
+    summary; before the fix it silently reported zero surviving
+    references.
+    """
+    fake_repo = tmp_path / "fake_repo"
+    (fake_repo / "spec" / "process").mkdir(parents=True)
+    # Head manifest: OBL-STILL-HERE remains; OBL-JUST-GONE has been dropped.
+    (fake_repo / "spec" / "process" / "obligations.yaml").write_text(
+        dedent(
+            """\
+            version: 1
+            obligations:
+              - id: OBL-STILL-HERE
+                role: implementer
+                body: "still"
+            """
+        ),
+        encoding="utf-8",
+    )
+    # Scanned file: a Markdown doc that mentions OBL-JUST-GONE next to a
+    # non-UTF-8 byte. Written as bytes so we control the encoding exactly.
+    docs_dir = fake_repo / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "notes.md").write_bytes(
+        b"See OBL-JUST-GONE for context. Author name: Andr\xe9 (ISO-8859-1 e-acute).\n"
+    )
+    monkeypatch.setattr(_MODULE, "_REPO_ROOT", fake_repo)
+
+    # Base has both ids; head has only OBL-STILL-HERE → OBL-JUST-GONE = REMOVED.
+    base_file = tmp_path / "base.yaml"
+    base_file.write_text(
+        dedent(
+            """\
+            version: 1
+            obligations:
+              - id: OBL-STILL-HERE
+                role: implementer
+                body: "still"
+              - id: OBL-JUST-GONE
+                role: implementer
+                body: "bye"
+            """
+        ),
+        encoding="utf-8",
+    )
+    summary_file = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+    exit_code = _MODULE.main(  # type: ignore[attr-defined]
+        ["--base-file", str(base_file)]
+    )
+    assert exit_code == 0
+    summary = summary_file.read_text(encoding="utf-8")
+    assert "REMOVED: `OBL-JUST-GONE`" in summary
+    # The surviving reference to OBL-JUST-GONE MUST be listed — the whole
+    # point of Finding 2 is that a non-UTF-8 byte in `notes.md` must not
+    # cause the scan to skip the file entirely.
+    assert "docs/notes.md:1" in summary
+
+
+# --------------------------------------------------------------------------- #
+# rename-heuristic robustness (Tier B naysayer Finding 3 on msg-768)
+# --------------------------------------------------------------------------- #
+
+
+def test_body_match_rename_survives_dropping_origin_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rename that also drops the origin block on the same commit is a rename,
+    not a delete + add.
+
+    Tier B naysayer Finding 3 on msg-768: the body-match fallback used to
+    gate on ``old.moved_from is None AND candidate.moved_from is None``.
+    That was over-constrained — the very "reclassify a verbatim-move as
+    net-new AND rename it in the same commit" case (exactly what this PR
+    did for OBL-READBACK-ENTRY / OBL-READBACK-EXIT, minus the rename)
+    would fall through both branches and be reported as a spurious
+    deletion + addition.
+
+    Fixed: the body-match branch is unconditional on the old side's origin
+    state. We construct exactly the pathological case and assert on
+    RENAMED, not REMOVED.
+    """
+    base = dedent(
+        """\
+        version: 1
+        obligations:
+          - id: OBL-WAS-A-MOVE
+            role: implementer
+            origin:
+              moved_from: "some/place::LITERAL"
+              original_length: 32
+            body: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        """
+    )
+    head = dedent(
+        """\
+        version: 1
+        obligations:
+          - id: OBL-NOW-NET-NEW
+            role: implementer
+            body: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        """
+    )
+    summary = _run(base, head, tmp_path, monkeypatch)
+    assert "RENAMED: `OBL-WAS-A-MOVE` → `OBL-NOW-NET-NEW`" in summary
+    assert "REMOVED: `OBL-WAS-A-MOVE`" not in summary
+
+
 def test_base_read_missing_git_binary_propagates_oserror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

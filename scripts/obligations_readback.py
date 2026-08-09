@@ -215,6 +215,17 @@ def _read_base_manifest(base_ref: str) -> str:
     naysayer Finding 3 on PR #135). ``OSError`` from ``subprocess.run``
     (missing ``git`` binary, permission denied) is left to propagate for the
     same reason — we deliberately do not catch it here.
+
+    Locale-neutral by construction (Tier B naysayer Finding 1 on msg-768):
+    ``env={**os.environ, "LC_ALL": "C", "LANG": "C"}`` guarantees git
+    emits English stderr regardless of the ambient shell locale (e.g.
+    ``ja_JP.UTF-8`` on a developer running this script under
+    ``OBL-PRCHECK-READ`` locally). Without the override, git localises
+    the "path does not exist" wording and the substring matcher fails,
+    raising ``ObligationsReadbackToolError`` on what is actually a valid
+    empty-base result. Setting both ``LC_ALL`` and ``LANG`` is belt-and-
+    braces — ``LC_ALL`` wins over ``LANG`` per POSIX but a broken
+    ``LC_ALL`` on the host is not something to trust.
     """
     rel = _MANIFEST_REL.as_posix()
     result = subprocess.run(
@@ -224,6 +235,7 @@ def _read_base_manifest(base_ref: str) -> str:
         text=True,
         timeout=15,
         check=False,
+        env={**os.environ, "LC_ALL": "C", "LANG": "C"},
     )
     if result.returncode == 0:
         return result.stdout
@@ -295,8 +307,22 @@ def _scan_references(obligation_id: str) -> list[tuple[str, int]]:
             except OSError:
                 continue
             try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+                # ``errors="replace"`` on non-UTF-8 bytes rather than
+                # skipping the whole file. Skipping was the previous behaviour
+                # and it created a silent fail-open: a single non-UTF-8 byte
+                # (e.g. an ISO-8859-1 smart quote in a .md doc) meant every
+                # OBL-* reference in that file went unreported and the
+                # advisory ran green with a lying "No obligation ids
+                # disappeared" verdict. The reference scan only needs to
+                # spot ASCII OBL-* tokens; U+FFFD replacement characters
+                # inside non-ASCII strings do not affect the regex, so
+                # accepting a lossy decode is strictly safer than skipping
+                # (Tier B naysayer Finding 2 on msg-768). OSError on the
+                # read is still a skip — a genuinely unreadable path is not
+                # a silence problem, it is a filesystem problem the reference
+                # scan cannot do anything about here.
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
                 continue
             for lineno, line in enumerate(text.splitlines(), start=1):
                 if pattern.search(line):
@@ -321,11 +347,25 @@ def _match_rename(
 ) -> _ObligationSnapshot | None:
     """Heuristic: is ``old`` really the same clause under a new id in ``added``?
 
-    Two signals — the origin block (``moved_from`` + ``original_length``) is
-    the strongest (a moved clause carries its identity through the length
-    invariant), and the body text is the fallback for net-new formulations
-    without an origin. First-match wins; a second match would be noise and is
-    left as a plain removal for a reviewer to disambiguate.
+    Two signals, in order of strength:
+
+    1. **Matching origin block** (``moved_from`` + ``original_length``). A
+       moved clause carries its identity through the length invariant, so
+       an old id and a new id whose origins match are almost certainly the
+       same clause.
+    2. **Identical body text**. This is the fallback for net-new
+       formulations (no origin block) AND for the "same clause, dropped
+       its origin block in this commit" case — e.g. a former verbatim-move
+       that was reclassified as net-new (which is exactly what this PR did
+       for ``OBL-READBACK-ENTRY`` / ``OBL-READBACK-EXIT`` on Finding 1).
+       The body-match branch does NOT gate on the old side having
+       ``moved_from is None``: the previous version did, and Tier B
+       naysayer Finding 3 on msg-768 flagged it as an over-constrained
+       heuristic that would report a spurious deletion + addition for
+       exactly the "reclassify + rename in one commit" case.
+
+    First-match wins; a second match would be noise and is left as a plain
+    removal for a reviewer to disambiguate.
     """
     for candidate in added.values():
         if (
@@ -335,7 +375,7 @@ def _match_rename(
             and candidate.original_length is not None
         ):
             return candidate
-        if old.moved_from is None and candidate.moved_from is None and candidate.body == old.body:
+        if candidate.body == old.body:
             return candidate
     return None
 
