@@ -52,18 +52,20 @@ jobs:
           version: "latest"
       - name: Set up Python
         run: uv python install 3.11
-      - name: Install PyYAML (script's only runtime dep)
-        # Keep this narrow — the advisory check must not need the full dev
-        # extras (that would tie it to the head-revision loader schema, the
-        # very drift-coupling the script is designed to avoid).
-        run: uv pip install --system pyyaml
       - name: obligations-readback (advisory) — diff base vs head, no blocking
         # `continue-on-error: true` is a belt on top of the always-exit-0
         # contract in the script itself — if a future edit accidentally
         # makes the script raise, the check still stays advisory rather
         # than silently becoming a gate on the merge-box.
         continue-on-error: true
+        # `uv run --with pyyaml` provisions a per-invocation venv with
+        # PyYAML — the script's only runtime dep. This avoids `pip install
+        # --system` on Ubuntu 24 (externally-managed Python 3.12 refuses
+        # --system installs without --break-system-packages), and keeps the
+        # advisory check off the project's dev extras so it can never
+        # accidentally pick up the head-revision loader schema (the
+        # drift-coupling the script is designed to avoid).
         run: |
-          python scripts/obligations_readback.py \
+          uv run --python 3.11 --with pyyaml python scripts/obligations_readback.py \
             --base-ref "origin/${{ github.event.pull_request.base.ref }}" \
             --head-ref HEAD
