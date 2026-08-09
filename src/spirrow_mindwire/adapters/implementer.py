@@ -66,6 +66,7 @@ from ..exceptions import (
     AdapterHealthError,
     AdapterSpawnError,
 )
+from ..naysayer.adr_index import load_adr_index
 from ..ports import SpawnContext
 from ..ulid_util import new_ulid
 from ..value_objects import (
@@ -121,6 +122,18 @@ the body from stdin, so a heredoc needs no file at all; (2) if you genuinely \
 need a file, use `<repo>/.git/mindwire-scratch/`, which is inside the repo yet \
 can never appear in `git status` or be committed by `git add`. Never put \
 scratch files in the working tree, where they would be committed by accident.
+
+DOCUMENTS YOU CANNOT READ: you have this repository and this thread, and that \
+is all. ADR bodies live in a separate docs repository you cannot reach, and you \
+do not have CLAUDE.md. When a task asks you to check your work against a \
+document whose text you cannot see, do NOT reconstruct what it probably says — \
+say plainly "I cannot read <doc>'s text, so I have not verified against it", \
+then verify everything you CAN and report that. An incomplete report is always \
+better than a confident wrong one: stating the limit is what lets a human close \
+the gap, while a plausible invention closes the subject and is believed. This \
+applies to ADR titles too — a title is a summary, and reasoning outward from a \
+summary as if it were the document is the exact mistake ADR-2026-05-29-13 exists \
+to prevent.
 
 Work on a feature/* branch, commit your changes, and (when ready) open a PR to \
 develop. When you reply in the thread, reply directly with the message body — \
@@ -913,6 +926,46 @@ def _cwd_grounding_block(cwd: Path) -> str:
     )
 
 
+def _adr_index_block() -> str:
+    """Give the implementer the same deterministic ADR id+title map the naysayer gets (N-2).
+
+    Why the implementer needs it at all: the loop asks it to satisfy ADRs by number. Told to
+    "perform the ADR-2026-05-29-13 read-back" with no map and no bodies, a capable agent does the
+    only thing left — it reconstructs the ADR from context and states the result as fact. That
+    happened on 2026-08-08 (voxelworld PR #182): three of five read-back claims attributed things to
+    ADR-13 that it does not say, because ADR-13 is the *spec read-back checklist* and the agent had
+    no way to know. The failure was not ignorance, it was silent confident invention.
+
+    So this block, and the "DOCUMENTS YOU CANNOT READ" rule in the system prompt, are halves of one
+    fix and neither works alone. The map alone would be **worse than nothing**: a title is a
+    summary, and inviting an agent to reason outward from a summary as if it were the document
+    reproduces exactly what ADR-2026-05-29-13 warns against — only now the confabulation is better
+    grounded and therefore harder to catch. The rule alone leaves it unable to say even which ADR
+    it cannot read.
+
+    Source is the same in-repo manifest the naysayer uses (``spec/adr_index.yaml``); nothing is
+    duplicated. An unloadable manifest says so out loud rather than shipping a silent gap.
+    """
+    index = load_adr_index()
+    if not index:
+        return (
+            "ADR INDEX — UNAVAILABLE. The in-repo ADR manifest could not be loaded, so you do not "
+            "even have the list of ADR ids. If a task names an ADR, say that you could not look it "
+            "up; do not guess what it requires."
+        )
+    rows = "\n".join(f"- {adr_id} — {title}" for adr_id, title in index)
+    return (
+        "ADR INDEX (ids and TITLES ONLY — the bodies are not available to you):\n"
+        f"{rows}\n"
+        "Use this to identify an ADR and to avoid attributing to one what belongs to another. It "
+        "is NOT the ADRs. A title tells you the subject, never the requirements — so never write "
+        "that an ADR 'requires' or 'permits' something on the strength of its title. If a task "
+        "needs an "
+        "ADR's actual content, say you cannot read it and ask for the relevant text to be quoted "
+        "into the thread."
+    )
+
+
 class ImplementerSdkAdapter:
     """RoleAdapter for the implementer: SDK + EXECUTE_CODE + allow-list (T19).
 
@@ -954,7 +1007,9 @@ class ImplementerSdkAdapter:
         self._mcp_servers = mcp_servers or {}
         # Append cwd grounding (T40): the custom system prompt omits the SDK's working-directory
         # dynamic section, so the agent must be told its cwd explicitly or it guesses abs paths.
-        self._system_prompt = f"{system_prompt}\n\n{_cwd_grounding_block(self._cwd)}"
+        self._system_prompt = (
+            f"{system_prompt}\n\n{_cwd_grounding_block(self._cwd)}\n\n{_adr_index_block()}"
+        )
         self._extra_env = dict(extra_env or {})
         self._client_factory = client_factory or _default_client_factory
         self._sessions: dict[SessionHandle, _Session] = {}
