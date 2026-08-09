@@ -51,6 +51,7 @@ from ..exceptions import (
 )
 from ..naysayer.adr_index import build_adr_index_block
 from ..naysayer.principles import NAYSAYER_MODEL_TIER, build_preamble
+from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
 from ..ulid_util import new_ulid
 from ..value_objects import (
@@ -74,6 +75,12 @@ _ENV_BASE_URL = "MINDWIRE_NAYSAYER_BASE_URL"
 
 # The naysayer's role instructions; the 5-principles SOT is prepended verbatim by
 # build_preamble() so the agent always reasons under the current principles (D-1).
+# The verdict-constraint clause ("advisory, not a veto") has been MOVED to
+# ``spec/obligations.yaml`` (OBL-VERDICT-CONSTRAINT, CLAUDE.md §N.4) and is
+# injected here from the manifest passed by the composition root — deleted from
+# this literal, restored to the rendered prompt through injection. Keeping the
+# manifest as the sole owner is what lets the tests assert on the actual prompt
+# the loop reads rather than a mirror.
 _NAYSAYER_ROLE_PROMPT = """\
 You are the independent naysayer in a Spirrow MindWire ChatRoom design thread. \
 You run on a different model family from the proposer/implementer; your job is \
@@ -81,9 +88,8 @@ to apply the 5 principles above as an adversarial reviewer of the design under \
 discussion. Each turn you receive the latest message in the thread; respond with \
 your critique of it — explicitly endorse what is sound (principle 4), object with \
 a concrete basis (principle 3), and never stay silent about a real concern \
-(principle 5). You are advisory, not a veto: the final decision is the human's. \
-Your entire response is posted verbatim to the thread as your reply, so reply \
-directly with the critique — no preamble, no meta-commentary.
+(principle 5). Your entire response is posted verbatim to the thread as your \
+reply, so reply directly with the critique — no preamble, no meta-commentary.
 """
 
 
@@ -132,9 +138,21 @@ class _Session:
     error: ErrorInfo | None = None
 
 
-def build_naysayer_system_prompt(repo_root: Path | None = None) -> str:
+def build_naysayer_system_prompt(
+    *,
+    obligations: ObligationsManifest,
+    repo_root: Path | None = None,
+) -> str:
     """Naysayer system prompt: 5-principles SOT (verbatim, D-1) + role instructions
-    + the deterministic ADR index (N-2) + the conductor handoff protocol (PR-2b-1).
+    + injected obligations (OBL-VERDICT-CONSTRAINT) + the deterministic ADR index
+    (N-2) + the conductor handoff protocol (PR-2b-1).
+
+    The ``obligations`` manifest is passed by the composition root and injected
+    verbatim (CLAUDE.md §N.4) — the naysayer verdict-constraint clause lives in
+    that manifest, not in this module. Requiring the caller to pass it (no
+    default) is deliberate: the adapter must never reach for a module-global path
+    itself, so canary two-prime can assert on exactly the prompt the loop renders in
+    production from a manifest the test picks.
 
     The ADR index is read from **MindWire's own** ``spec/adr_index.yaml`` and injected
     on every summon so the agent's worldview is not bounded by what the thread happens
@@ -157,6 +175,7 @@ def build_naysayer_system_prompt(repo_root: Path | None = None) -> str:
     """
     return (
         f"{build_preamble()}\n\n{_NAYSAYER_ROLE_PROMPT}\n\n"
+        f"{obligations.render_role_obligations(Role.NAYSAYER)}\n\n"
         f"{build_adr_index_block(repo_root)}\n\n{build_handoff_protocol_block(Role.NAYSAYER)}"
     )
 
@@ -205,6 +224,7 @@ class NaysayerSdkAdapter:
         self,
         *,
         cwd: Path,
+        obligations: ObligationsManifest,
         inference_base_url: str | None = None,
         model: str | None = NAYSAYER_MODEL_TIER,
         system_prompt: str | None = None,
@@ -222,10 +242,17 @@ class NaysayerSdkAdapter:
             else os.environ.get(_ENV_BASE_URL, "")
         )
         self._model = model
+        # Loop-readable obligations are injected — the manifest passed in is the
+        # single source of truth (CLAUDE.md §N.4) and the adapter never reaches for
+        # a module-global path itself. The verdict-constraint clause
+        # (OBL-VERDICT-CONSTRAINT) lives in that manifest, not in _NAYSAYER_ROLE_PROMPT.
+        self._obligations = obligations
         # No repo_root: the ADR manifest is MindWire's, not the reviewed repo's. Passing
         # ``self._cwd`` here is what disabled the N-2 index in the conductor path.
         self._system_prompt = (
-            system_prompt if system_prompt is not None else build_naysayer_system_prompt()
+            system_prompt
+            if system_prompt is not None
+            else build_naysayer_system_prompt(obligations=obligations)
         )
         self._allowed_tools = list(allowed_tools) if allowed_tools is not None else []
         self._mcp_servers = mcp_servers or {}

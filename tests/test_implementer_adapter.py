@@ -37,6 +37,7 @@ from spirrow_mindwire.adapters.implementer import (
     classify_tool_call,
 )
 from spirrow_mindwire.allowlist import Operation, default_allowlist
+from spirrow_mindwire.obligations import load_manifest
 from spirrow_mindwire.ports import RoleAdapter, SpawnContext
 from spirrow_mindwire.value_objects import (
     Capability,
@@ -51,6 +52,11 @@ from spirrow_mindwire.value_objects import (
 )
 
 _TS = datetime(2026, 5, 23, tzinfo=UTC)
+
+# Loop-readable obligations manifest — required by the implementer adapter now
+# that the DECLARE-UNREADABLE clause has been MOVED to it (§N.4). Loaded once
+# at import time; the manifest is immutable.
+_OBLIGATIONS = load_manifest()
 
 
 # --------------------------------------------------------------------------- #
@@ -568,7 +574,9 @@ def test_capabilities_execute_code_not_naysayer() -> None:
 
 
 def test_satisfies_roleadapter_protocol(tmp_path: Path) -> None:
-    adapter: RoleAdapter = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url="http://lx")
+    adapter: RoleAdapter = ImplementerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lx"
+    )
     assert adapter.adapter_id == "implementer-sdk"
 
 
@@ -577,7 +585,9 @@ async def test_spawn_requires_inference_base_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("MINDWIRE_IMPLEMENTER_BASE_URL", raising=False)
-    adapter = ImplementerSdkAdapter(cwd=tmp_path, client_factory=_factory(responses=[]))
+    adapter = ImplementerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, client_factory=_factory(responses=[])
+    )
     with pytest.raises(ImplementerSdkSpawnError):
         await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx([]))
 
@@ -587,6 +597,7 @@ async def test_spawn_routes_inference_via_base_url(tmp_path: Path) -> None:
     cap: list[_FakeSdkClient] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
+        obligations=_OBLIGATIONS,
         inference_base_url="http://lexora:8110",
         client_factory=_factory(responses=[], capture=cap),
     )
@@ -607,6 +618,7 @@ async def test_make_options_exposes_builtins_and_isolates(tmp_path: Path) -> Non
     cap: list[_FakeSdkClient] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
+        obligations=_OBLIGATIONS,
         inference_base_url="http://lx",
         client_factory=_factory(responses=[], capture=cap),
     )
@@ -637,7 +649,9 @@ def test_system_prompt_grounds_cwd(tmp_path: Path) -> None:
     # it must be told its cwd explicitly — else it guesses an absolute path (observed on the
     # voxelworld conductor smoke: it targeted /home/user/<repo>/... and the guard fail-loud denied
     # the out-of-repo write). Grounding the cwd + mandating relative paths fixes it.
-    adapter = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url="http://lx")
+    adapter = ImplementerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lx"
+    )
     sp = adapter._system_prompt
     assert str(tmp_path) in sp
     assert "WORKING DIRECTORY" in sp
@@ -652,18 +666,35 @@ def test_system_prompt_grounds_cwd(tmp_path: Path) -> None:
 # context and stated the result as fact — three of five claims attributed to ADR-13 things it does
 # not say. The failure was not ignorance but silent confident invention, so the fix is two halves:
 # say what you cannot read, and know which ADRs exist. Neither half works alone.
+#
+# 2026-08-09 update (T-loop-readable-obligations): the DECLARE-UNREADABLE clause was MOVED to
+# spec/obligations.yaml (OBL-DECLARE-UNREADABLE) and is now injected via the manifest. Per the
+# Tier-C GO msg-737 ("delete the ping to the string literal? no — repoint at the rendered
+# prompt"), this test was kept and its assertions repointed at the assembled ``_system_prompt``
+# (which was already the target here). The check now verifies the WIRING — that the injection
+# path lands the moved body in the rendered prompt — rather than the string literal that no
+# longer exists in source.
 
 
 def test_system_prompt_forbids_reconstructing_unreadable_documents(tmp_path: Path) -> None:
-    sp = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url="http://lx")._system_prompt
+    sp = ImplementerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lx"
+    )._system_prompt
     assert "DOCUMENTS YOU CANNOT READ" in sp
     # The instruction must be to DECLARE the gap, not merely to be careful about it.
     assert "cannot read" in sp
     assert "do NOT reconstruct" in sp
+    # And the injection wiring must actually be the one delivering it — the id label
+    # travels alongside the body so a regression that dropped the injection path
+    # (e.g. someone re-inlining the paragraph in source instead of using the manifest)
+    # fires here as well as in the id-coverage canary.
+    assert "[OBL-DECLARE-UNREADABLE]" in sp
 
 
 def test_system_prompt_carries_the_adr_index_as_titles_only(tmp_path: Path) -> None:
-    sp = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url="http://lx")._system_prompt
+    sp = ImplementerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lx"
+    )._system_prompt
     assert "ADR INDEX" in sp
     # A real id from the in-repo manifest — the map is present, not a placeholder.
     assert "ADR-2026-05-29-13" in sp
@@ -690,6 +721,7 @@ async def test_deliver_emits_reply_when_allowed(tmp_path: Path) -> None:
     captured: list[ReplyDraft] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
+        obligations=_OBLIGATIONS,
         inference_base_url="http://lx",
         client_factory=_factory(
             responses=[_assistant("done"), _result()],
@@ -708,6 +740,7 @@ async def test_deliver_allowlist_violation_fails_loud(tmp_path: Path) -> None:
     captured: list[ReplyDraft] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
+        obligations=_OBLIGATIONS,
         inference_base_url="http://lx",
         client_factory=_factory(
             responses=[_assistant("ignored"), _result()],
@@ -730,6 +763,7 @@ async def test_own_role_self_filter(tmp_path: Path) -> None:
     cap: list[_FakeSdkClient] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
+        obligations=_OBLIGATIONS,
         inference_base_url="http://lx",
         client_factory=_factory(responses=[_assistant("x"), _result()], capture=cap),
     )
@@ -745,6 +779,7 @@ async def test_non_new_message_is_noop(tmp_path: Path) -> None:
     captured: list[ReplyDraft] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
+        obligations=_OBLIGATIONS,
         inference_base_url="http://lx",
         client_factory=_factory(responses=[_assistant("x"), _result()]),
     )
@@ -758,6 +793,7 @@ async def test_halt_disconnects_and_is_idempotent(tmp_path: Path) -> None:
     cap: list[_FakeSdkClient] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
+        obligations=_OBLIGATIONS,
         inference_base_url="http://lx",
         client_factory=_factory(responses=[], capture=cap),
     )
@@ -773,6 +809,7 @@ async def test_halt_disconnects_and_is_idempotent(tmp_path: Path) -> None:
 async def test_deliver_on_halted_session_raises(tmp_path: Path) -> None:
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
+        obligations=_OBLIGATIONS,
         inference_base_url="http://lx",
         client_factory=_factory(responses=[]),
     )
@@ -816,7 +853,7 @@ async def test_manual_sdk_routes_tool_calls_through_guard(tmp_path: Path) -> Non
     if not base:
         pytest.skip("set MINDWIRE_IMPLEMENTER_BASE_URL (Lexora Anthropic-compat) to run")
     _init_head(tmp_path, "feature/manual-smoke")
-    adapter = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url=base)
+    adapter = ImplementerSdkAdapter(cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url=base)
     handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx([]))
     try:
         with pytest.raises(ImplementerAllowlistError):
@@ -848,7 +885,7 @@ async def test_manual_sdk_executes_allowed_tool_through_guard(tmp_path: Path) ->
         pytest.skip("set MINDWIRE_IMPLEMENTER_BASE_URL (Lexora Anthropic-compat) to run")
     _init_head(tmp_path, "feature/manual-exec")
     captured: list[ReplyDraft] = []
-    adapter = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url=base)
+    adapter = ImplementerSdkAdapter(cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url=base)
     handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx(captured))
     marker = tmp_path / "t37_exec_proof.txt"
     try:

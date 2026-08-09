@@ -139,6 +139,14 @@ fail-open を設計するとき、**「degradation を宣言する」ことで�
 
 **併せて置き場所の注意**: 本書 (CLAUDE.md) に書いた規約が縛るのは**人間だけ**である。implementer は `setting_sources=[]` (SDK 隔離、credential 面の対策) で走り CLAUDE.md を読まない。naysayer の system prompt も preamble + role + ADR 索引 + handoff で本書を含まない。**ループに効かせたい規約は、ループが実際に読む場所に置くこと。**
 
+### §N.4 ループ可読な obligation は `spec/obligations.yaml` に置け (2026-08-09)
+
+ループのエージェント (implementer / naysayer) に効かせる prompt 節は、**必ず `spec/obligations.yaml` に置くこと**。Python ソースの文字列リテラルに直書きしない。既存の直書きを見つけたら本 manifest に move (copy ではない — ソースから削除し、注入経路で描画する) して、`origin.moved_from` と `origin.original_length` を記録すること。
+
+理由: §N.3 の教訓 (「正しく実装され正しく宣言している fail-open でも不可視でありうる」) は obligation にも当てはまる。同じ意味の節が adapter 側に散らばると、単一の PR ではもう全体を審査できず、レビュー時に見えていたはずの規約が知らぬ間にドリフトする (2026-08-09、voxelworld PR #182 で ADR-2026-05-29-13 の read-back 義務が「read できない ADR に対して何をするか」の未定義分岐で沈黙。義務は書かれていたが、`OBL-READBACK` として名前がついておらず抽出できなかった)。
+
+manifest の書式・読込 API・不変条件 (verbatim 長さ保持 = canary ②″) は `src/spirrow_mindwire/obligations.py` の docstring と `spec/obligations.yaml` の冒頭コメントに定義がある。composition root (`loop_runner._build_dispatcher`) が startup で 1 度だけ読み込み、失敗時は `SystemExit` で fail-closed。canary は `tests/test_obligations.py` に 3 本 (① id 網羅 / ②′ 描画注入 / ②″ 長さ保持) + 本節の pointer 存在 grep — いずれも skip 条件なし。
+
 ---
 
 ## §M. role / identity の規範定義 (ADR 参照のみ — ADR が SOT)

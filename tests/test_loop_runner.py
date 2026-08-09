@@ -51,6 +51,7 @@ from spirrow_mindwire.loop_runner import (
 )
 from spirrow_mindwire.magickit.watcher import WatchSpec
 from spirrow_mindwire.naysayer.pr_review import NaysayerPrReviewDriver
+from spirrow_mindwire.obligations import load_manifest
 from spirrow_mindwire.ports import SpawnContext
 from spirrow_mindwire.ulid_util import new_ulid
 from spirrow_mindwire.value_objects import (
@@ -204,6 +205,9 @@ def _naysayer_caps() -> frozenset[Capability]:
     return frozenset({Capability.READ_THREAD, Capability.POST_REPLY, Capability.NAYSAYER_QUALIFIED})
 
 
+_OBLIGATIONS = load_manifest()
+
+
 def _real_adapters(tmp_path: Path) -> tuple[Stage3ProposerAdapter, ImplementerSdkAdapter, Any]:
     """The three production adapter classes, built without network/SDK I/O.
 
@@ -211,8 +215,12 @@ def _real_adapters(tmp_path: Path) -> tuple[Stage3ProposerAdapter, ImplementerSd
     the PR-gate is the separate :func:`_pr_review_driver`, not a registered adapter.
     """
     proposer = Stage3ProposerAdapter(cwd=tmp_path)
-    implementer = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url="http://lexora.local")
-    naysayer = NaysayerSdkAdapter(cwd=tmp_path, inference_base_url="http://lexora.local")
+    implementer = ImplementerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lexora.local"
+    )
+    naysayer = NaysayerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lexora.local"
+    )
     return proposer, implementer, naysayer
 
 
@@ -300,7 +308,9 @@ def test_build_registry_rejects_proposer_that_shadows_implementer(tmp_path: Path
     # If the "proposer" advertises EXECUTE_CODE it also qualifies for IMPLEMENTER
     # and, registered first, would shadow the gated implementer — caught fail-loud.
     exec_proposer = _StubAdapter("exec-proposer", _exec_caps())
-    implementer = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url="http://lexora.local")
+    implementer = ImplementerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lexora.local"
+    )
     naysayer = _StubAdapter("nay", _naysayer_caps())
     with pytest.raises(RuntimeError, match="IMPLEMENTER"):
         build_registry(proposer=exec_proposer, implementer=implementer, naysayer=naysayer)
