@@ -54,8 +54,8 @@ from spirrow_mindwire.value_objects import (
 _TS = datetime(2026, 5, 23, tzinfo=UTC)
 
 # Loop-readable obligations manifest — required by the implementer adapter now
-# that the DECLARE-UNREADABLE clause has been MOVED to it (§N.4). Loaded once
-# at import time; the manifest is immutable.
+# that the DECLARE-UNREADABLE clause has been MOVED to it (spec/process/README.md).
+# Loaded once at import time; the manifest is immutable.
 _OBLIGATIONS = load_manifest()
 
 
@@ -668,8 +668,8 @@ def test_system_prompt_grounds_cwd(tmp_path: Path) -> None:
 # say what you cannot read, and know which ADRs exist. Neither half works alone.
 #
 # 2026-08-09 update (T-loop-readable-obligations): the DECLARE-UNREADABLE clause was MOVED to
-# spec/obligations.yaml (OBL-DECLARE-UNREADABLE) and is now injected via the manifest. Per the
-# Tier-C GO msg-737 ("delete the ping to the string literal? no — repoint at the rendered
+# spec/process/obligations.yaml (OBL-DECLARE-UNREADABLE) and is now injected via the manifest.
+# Per the Tier-C GO msg-737 ("delete the ping to the string literal? no — repoint at the rendered
 # prompt"), this test was kept and its assertions repointed at the assembled ``_system_prompt``
 # (which was already the target here). The check now verifies the WIRING — that the injection
 # path lands the moved body in the rendered prompt — rather than the string literal that no

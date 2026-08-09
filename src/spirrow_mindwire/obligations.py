@@ -1,4 +1,4 @@
-"""Loader for the loop-readable obligations manifest (``spec/obligations.yaml``).
+"""Loader for the loop-readable obligations manifest (``spec/process/obligations.yaml``).
 
 The manifest holds the prompt clauses that bind agent behaviour at runtime
 (read-back at entry/exit, the naysayer verdict constraint, the "declare what
@@ -16,10 +16,15 @@ and re-raises as ``SystemExit`` so a broken manifest halts the daemon at the
 door rather than silently degrading each session's prompt.
 
 Verbatim-move discipline: an entry with ``origin.moved_from`` claims its body
-was moved byte-for-byte from a Python string literal. Canary two-double-prime asserts
-``len(body) == origin.original_length`` on every such entry, so a paraphrase
-during a later edit reds the gate rather than drifting the loop's actual
-instructions away from what was reviewed.
+was moved byte-for-byte from a repo location — a Python string literal
+(``path::LITERAL_NAME``) or a documentation section (``path::§HEADING``). Canary
+two-double-prime asserts ``len(body) == origin.original_length`` on every such
+entry, so a paraphrase during a later edit reds the gate rather than drifting
+the loop's actual instructions away from what was reviewed. The loader treats
+``moved_from`` as an opaque non-empty string on purpose (no format validation):
+the invariant that matters is the length equality, and enshrining a specific
+format here would force a schema bump every time a new kind of source needed
+representing.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ from .value_objects import Role
 
 # obligations.py -> spirrow_mindwire -> src -> <repo root>
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_MANIFEST_REL = Path("spec") / "obligations.yaml"
+_DEFAULT_MANIFEST_REL = Path("spec") / "process" / "obligations.yaml"
 
 # Recognized role names inside the manifest — restricted to the two roles whose
 # system prompts the manifest actually feeds today. Extend deliberately (a typo
@@ -51,12 +56,15 @@ class ObligationsError(RuntimeError):
 
 @dataclass(frozen=True)
 class ObligationOrigin:
-    """Evidence that an obligation body was moved verbatim from source.
+    """Evidence that an obligation body was moved verbatim from a repo location.
 
-    The presence of an ``origin`` block asserts a move-not-copy: the source
-    literal named by ``moved_from`` has been deleted, and ``original_length``
-    records the character length the literal had at the time of the move so
-    canary two-double-prime can detect later paraphrasing.
+    The presence of an ``origin`` block asserts a move-not-copy: the source at
+    ``moved_from`` has been deleted, and ``original_length`` records the
+    character length that source had at the time of the move so canary
+    two-double-prime can detect later paraphrasing. ``moved_from`` is an
+    opaque non-empty string — a Python string literal
+    (``path::LITERAL_NAME``) or a documentation section (``path::§HEADING``);
+    the loader intentionally does not police the format.
     """
 
     moved_from: str
@@ -100,7 +108,7 @@ class ObligationsManifest:
 
 
 def default_manifest_path() -> Path:
-    """Return the in-repo default path for ``spec/obligations.yaml``.
+    """Return the in-repo default path for ``spec/process/obligations.yaml``.
 
     Exposed so tests can compare against it — not called from adapters (the
     adapters never load the manifest themselves; the composition root does).

@@ -288,10 +288,10 @@ def build_naysayer(repo_dir: Path, *, obligations: ObligationsManifest) -> Naysa
 def _load_obligations_or_exit() -> ObligationsManifest:
     """Load the loop-readable obligations manifest — fail-closed with ``SystemExit``.
 
-    The manifest (``spec/obligations.yaml``) holds the prompt clauses that bind
-    agent behaviour at runtime; a missing or malformed manifest would silently
-    degrade every session's prompt if the adapters loaded it themselves. The
-    composition root loads it once at daemon startup and converts any
+    The manifest (``spec/process/obligations.yaml``) holds the prompt clauses
+    that bind agent behaviour at runtime; a missing or malformed manifest would
+    silently degrade every session's prompt if the adapters loaded it themselves.
+    The composition root loads it once at daemon startup and converts any
     :class:`~spirrow_mindwire.obligations.ObligationsError` into ``SystemExit`` so
     the daemon refuses to start rather than serving weakened prompts. This is the
     "loader 欠損時 fail-closed" invariant (Tier-C GO msg-737).
@@ -301,8 +301,8 @@ def _load_obligations_or_exit() -> ObligationsManifest:
     except ObligationsError as exc:
         raise SystemExit(
             f"obligations manifest failed to load — daemon cannot start with a degraded "
-            f"prompt set (this is fail-closed by design; fix spec/obligations.yaml or the "
-            f"path override and retry): {exc}"
+            f"prompt set (this is fail-closed by design; fix spec/process/obligations.yaml "
+            f"or the path override and retry): {exc}"
         ) from exc
 
 
@@ -388,8 +388,8 @@ def _build_dispatcher(
         # Load the loop-readable obligations manifest once, at the composition root, and
         # pass it into every adapter that needs it. Fail-closed (SystemExit) on missing
         # or malformed manifest — a silent degradation of the loop's actual instructions
-        # would be exactly the "correct-but-invisible fail-open" that CLAUDE.md §N.3
-        # warns against.
+        # would be exactly the "correct-but-invisible fail-open" that
+        # spec/process/README.md warns against.
         obligations = _load_obligations_or_exit()
         if proposer is None:
             proposer = build_proposer(repo_dir)

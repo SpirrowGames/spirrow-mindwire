@@ -76,11 +76,11 @@ _ENV_BASE_URL = "MINDWIRE_NAYSAYER_BASE_URL"
 # The naysayer's role instructions; the 5-principles SOT is prepended verbatim by
 # build_preamble() so the agent always reasons under the current principles (D-1).
 # The verdict-constraint clause ("advisory, not a veto") has been MOVED to
-# ``spec/obligations.yaml`` (OBL-VERDICT-CONSTRAINT, CLAUDE.md §N.4) and is
-# injected here from the manifest passed by the composition root — deleted from
-# this literal, restored to the rendered prompt through injection. Keeping the
-# manifest as the sole owner is what lets the tests assert on the actual prompt
-# the loop reads rather than a mirror.
+# ``spec/process/obligations.yaml`` (OBL-VERDICT-CONSTRAINT, CLAUDE.md §N →
+# spec/process/README.md) and is injected here from the manifest passed by the
+# composition root — deleted from this literal, restored to the rendered prompt
+# through injection. Keeping the manifest as the sole owner is what lets the
+# tests assert on the actual prompt the loop reads rather than a mirror.
 _NAYSAYER_ROLE_PROMPT = """\
 You are the independent naysayer in a Spirrow MindWire ChatRoom design thread. \
 You run on a different model family from the proposer/implementer; your job is \
@@ -148,11 +148,12 @@ def build_naysayer_system_prompt(
     (N-2) + the conductor handoff protocol (PR-2b-1).
 
     The ``obligations`` manifest is passed by the composition root and injected
-    verbatim (CLAUDE.md §N.4) — the naysayer verdict-constraint clause lives in
-    that manifest, not in this module. Requiring the caller to pass it (no
-    default) is deliberate: the adapter must never reach for a module-global path
-    itself, so canary two-prime can assert on exactly the prompt the loop renders in
-    production from a manifest the test picks.
+    verbatim (CLAUDE.md §N → spec/process/README.md → obligations.yaml) — the
+    naysayer verdict-constraint clause lives in that manifest, not in this
+    module. Requiring the caller to pass it (no default) is deliberate: the
+    adapter must never reach for a module-global path itself, so canary two-prime
+    can assert on exactly the prompt the loop renders in production from a
+    manifest the test picks.
 
     The ADR index is read from **MindWire's own** ``spec/adr_index.yaml`` and injected
     on every summon so the agent's worldview is not bounded by what the thread happens
@@ -243,9 +244,10 @@ class NaysayerSdkAdapter:
         )
         self._model = model
         # Loop-readable obligations are injected — the manifest passed in is the
-        # single source of truth (CLAUDE.md §N.4) and the adapter never reaches for
-        # a module-global path itself. The verdict-constraint clause
-        # (OBL-VERDICT-CONSTRAINT) lives in that manifest, not in _NAYSAYER_ROLE_PROMPT.
+        # single source of truth (CLAUDE.md §N → spec/process/README.md) and the
+        # adapter never reaches for a module-global path itself. The verdict-
+        # constraint clause (OBL-VERDICT-CONSTRAINT) lives in that manifest, not
+        # in _NAYSAYER_ROLE_PROMPT.
         self._obligations = obligations
         # No repo_root: the ADR manifest is MindWire's, not the reviewed repo's. Passing
         # ``self._cwd`` here is what disabled the N-2 index in the conductor path.

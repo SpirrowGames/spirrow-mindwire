@@ -18,10 +18,13 @@ the Tier-C GO msg-737 nailed down:
   rather than silently drifting the loop's actual instruction away from what was
   reviewed.
 
-The CLAUDE.md §N.4 pointer grep test lives in this same module deliberately — the
-pointer is what keeps the "put loop-facing regulations where the loop reads them"
-instruction discoverable, so its existence is checked alongside the canaries the
-pointer refers to.
+The CLAUDE.md §N pointer + `spec/process/README.md` imperative-pointer grep tests
+live in this same module deliberately — the pointers are what keep the "put
+loop-facing regulations where the loop reads them" instruction discoverable, so
+their existence is checked alongside the canaries the pointers refer to. The
+imperative verb ("置け") is asserted on the README, not on CLAUDE.md §N, because
+the msg-733 §11.2 layout deliberately makes §N a pointer only (three lines) and
+puts the imperative in the destination (`spec/process/README.md`).
 """
 
 from __future__ import annotations
@@ -60,10 +63,11 @@ def test_canary_1_manifest_ids_match_the_ids_the_code_renders() -> None:
     """Every id the code renders is in the manifest, and every manifest id is rendered.
 
     A one-way check (e.g. only "manifest ⊂ rendered") would let a stale entry sit
-    unreferenced in ``spec/obligations.yaml`` forever; a one-way check the other way
-    would let a code path fabricate an id the manifest never defined. Both
-    directions must hold, and both role buckets must too — an implementer
-    obligation misfiled under ``role: naysayer`` never reaches the implementer.
+    unreferenced in ``spec/process/obligations.yaml`` forever; a one-way check
+    the other way would let a code path fabricate an id the manifest never
+    defined. Both directions must hold, and both role buckets must too — an
+    implementer obligation misfiled under ``role: naysayer`` never reaches the
+    implementer.
     """
     manifest = load_manifest()
     for role, expected in _EXPECTED_IDS_BY_ROLE.items():
@@ -71,7 +75,7 @@ def test_canary_1_manifest_ids_match_the_ids_the_code_renders() -> None:
         assert actual == expected, (
             f"role={role.value}: manifest ids {sorted(actual)} do not match the ids "
             f"the code renders for that role ({sorted(expected)}). If you added or "
-            "renamed an obligation, update spec/obligations.yaml AND "
+            "renamed an obligation, update spec/process/obligations.yaml AND "
             "tests/test_obligations.py::_EXPECTED_IDS_BY_ROLE."
         )
     all_manifest_ids = frozenset(o.id for o in manifest.obligations)
@@ -161,9 +165,10 @@ def test_canary_2_double_prime_moved_bodies_preserve_original_length() -> None:
     manifest = load_manifest()
     moved = [o for o in manifest.obligations if o.origin is not None]
     assert moved, (
-        "spec/obligations.yaml contains no obligations with an origin.moved_from block, "
-        "yet the whole design of this manifest is to be the destination of verbatim "
-        "moves out of Python source — check whether an OBL entry lost its origin block"
+        "spec/process/obligations.yaml contains no obligations with an origin.moved_from "
+        "block, yet the whole design of this manifest is to be the destination of verbatim "
+        "moves out of Python source or documentation sections — check whether an OBL entry "
+        "lost its origin block"
     )
     for obligation in moved:
         assert obligation.origin is not None  # for the type checker
@@ -176,30 +181,46 @@ def test_canary_2_double_prime_moved_bodies_preserve_original_length() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# CLAUDE.md §N.4 pointer must exist — the pointer is what makes the manifest
-# discoverable to a human reader of the repo. Kept in this same module so the
-# check travels with the canaries the pointer refers to.
+# pointer chain: CLAUDE.md §N (pointer only) → spec/process/README.md (imperative).
+# msg-733 §11.2 deliberately splits the human-facing regulation out of CLAUDE.md,
+# so the imperative verb no longer lives in §N — it lives at the destination.
+# Both checks travel with the canaries because a vanished pointer is exactly the
+# fail-open the fail-open-placement rule warns against (correctly-implemented
+# but invisible).
 # --------------------------------------------------------------------------- #
 
 
-def test_claude_md_section_n4_points_at_the_manifest() -> None:
-    """CLAUDE.md §N.4 must exist and instruct the reader (imperative form) to place
-    loop-readable obligations in ``spec/obligations.yaml``.
+def test_claude_md_section_n_points_at_spec_process() -> None:
+    """CLAUDE.md §N must exist and name ``spec/process/obligations.yaml`` as the SOT.
 
-    Two assertions: the section header is present, and the pointer names both the
-    file and an imperative verb ("置け" / "put"). A vanished pointer would leave a
-    reader with no discoverable path from the CLAUDE.md conventions to the
-    manifest — the exact fail-open §N.3 warns against (correctly-implemented but
-    invisible).
+    The old §N.4 imperative moved out of CLAUDE.md into ``spec/process/README.md``
+    per msg-733 §11.2 (§N is pointer-only now). The invariant kept here is that
+    §N still names both the section header and the target file, so a reader who
+    starts at CLAUDE.md still finds their way to the manifest.
     """
-    repo_root = default_manifest_path().parent.parent
+    # The repo root sits three levels above `spec/process/obligations.yaml`
+    # (obligations -> process -> spec -> root).
+    repo_root = default_manifest_path().parent.parent.parent
     claude_md = (repo_root / "CLAUDE.md").read_text(encoding="utf-8")
-    assert "### §N.4" in claude_md, "CLAUDE.md §N.4 section header is missing"
-    # Named file + imperative verb (Japanese "置け" is the imperative used in §N).
-    assert "spec/obligations.yaml" in claude_md
-    assert "置け" in claude_md, (
-        "CLAUDE.md §N.4 must be phrased in the imperative — a descriptive "
-        '"is where the manifest lives" is not enough (see §N.3 rationale)'
+    assert "## §N." in claude_md, "CLAUDE.md §N section header is missing"
+    assert "spec/process/obligations.yaml" in claude_md
+    assert "spec/process/README.md" in claude_md
+
+
+def test_spec_process_readme_carries_the_imperative_pointer() -> None:
+    """``spec/process/README.md`` must be phrased in the imperative — that is where
+    the "put loop-readable obligations here" rule now lives (msg-733 §11.2).
+
+    Named file + imperative verb (Japanese "置け" is the imperative used in the
+    ported §N.4). A descriptive "is where the manifest lives" is not enough (see
+    the fail-open-placement rule in the same README).
+    """
+    repo_root = default_manifest_path().parent.parent.parent
+    readme = (repo_root / "spec" / "process" / "README.md").read_text(encoding="utf-8")
+    assert "./obligations.yaml" in readme
+    assert "置け" in readme, (
+        "spec/process/README.md must be phrased in the imperative — a descriptive "
+        '"is where the manifest lives" is not enough (see the fail-open-placement rule)'
     )
 
 

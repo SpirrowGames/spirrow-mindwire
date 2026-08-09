@@ -7,17 +7,18 @@
 # change, and — the reason this file exists at all — so the constraint the loop
 # actually reads is a single artifact rather than one string per adapter.
 #
-# CLAUDE.md §N.4 points here as the SOT for what the loop reads. The pointer is
-# imperative and its presence is asserted by a grep test in
-# tests/test_obligations.py (the same module as the canaries below).
+# CLAUDE.md §N points here (via spec/process/README.md) as the SOT for what the
+# loop reads. The pointer is imperative and its presence is asserted by a grep
+# test in tests/test_obligations.py (the same module as the canaries below).
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY BODIES ARE VERBATIM MOVES — DO NOT PARAPHRASE
 #
-# An obligation whose `origin.moved_from` points at a Python string literal in
-# the repository has had that literal DELETED from source and its text moved
-# here byte-for-byte. The `origin.original_length` field records the character
-# length of the text as it lived in source; canary ②″ in tests/test_obligations.py
+# An obligation whose `origin.moved_from` names a repo location (a Python string
+# literal `path::LITERAL_NAME`, or a documentation section `path::§HEADING`) has
+# had that source DELETED and its text moved here byte-for-byte. The
+# `origin.original_length` field records the character length of the text as it
+# lived at the source, and canary two-double-prime in tests/test_obligations.py
 # asserts `len(body) == origin.original_length` on every moved entry. This is
 # the shape of the invariant: a well-meaning "cleanup" that shortens or reflows
 # the entry reds the gate rather than silently drifts the loop's actual
@@ -49,9 +50,14 @@ obligations:
 
   - id: OBL-READBACK-ENTRY
     role: implementer
-    body: |
-      READ-BACK AT ENTRY (ADR-2026-05-29-13 §N.1.3): before you begin work on a task that names a proposer decide-msg, an ADR, a schema change, or an existing spec you claim to preserve, re-read the specifying message(s) as your primary source. Do not act from a summary of them (yours or the harness's) — a summary is lossy at exactly the field-level detail that a spec turns on (enum values, invariants, boundary conditions, the difference between "preserve" and "extend"). In your first reply, name the msg-ids you read and quote the concrete requirements you took from them. If a required document is unreadable to you, satisfy OBL-DECLARE-UNREADABLE instead of guessing.
+    origin:
+      moved_from: "CLAUDE.md::§N.1.3"
+      original_length: 669
+    body: "READ-BACK AT ENTRY (ADR-2026-05-29-13 §N.1.3): before you begin work on a task that names a proposer decide-msg, an ADR, a schema change, or an existing spec you claim to preserve, re-read the specifying message(s) as your primary source. Do not act from a summary of them (yours or the harness's) — a summary is lossy at exactly the field-level detail that a spec turns on (enum values, invariants, boundary conditions, the difference between \"preserve\" and \"extend\"). In your first reply, name the msg-ids you read and quote the concrete requirements you took from them. If a required document is unreadable to you, satisfy OBL-DECLARE-UNREADABLE instead of guessing."
+
   - id: OBL-READBACK-EXIT
     role: implementer
-    body: |
-      READ-BACK AT EXIT (ADR-2026-05-29-13 §N.1.4): before you hand the work back, open the same specifying message(s) again and build a requirement-by-requirement table — one row per bulletable requirement in the spec, each row marked "reflected" (with a code/PR pointer) or "not reflected" (with the reason). Assemble the table from the spec text, not from memory of what you did. Include the table in the PR body. A completion without this table is not a completion; if the spec is unreadable to you, satisfy OBL-DECLARE-UNREADABLE and state which rows you could not construct.
+    origin:
+      moved_from: "CLAUDE.md::§N.1.4"
+      original_length: 574
+    body: "READ-BACK AT EXIT (ADR-2026-05-29-13 §N.1.4): before you hand the work back, open the same specifying message(s) again and build a requirement-by-requirement table — one row per bulletable requirement in the spec, each row marked \"reflected\" (with a code/PR pointer) or \"not reflected\" (with the reason). Assemble the table from the spec text, not from memory of what you did. Include the table in the PR body. A completion without this table is not a completion; if the spec is unreadable to you, satisfy OBL-DECLARE-UNREADABLE and state which rows you could not construct."

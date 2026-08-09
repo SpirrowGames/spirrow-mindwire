@@ -97,14 +97,15 @@ _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
 
 # The static (identity-only) portion of the implementer's system prompt. Loop-
 # readable obligations that constrain behaviour at runtime — "declare what you
-# cannot read", read-back at entry/exit — live in ``spec/obligations.yaml`` and
-# are injected here by the composition root via
+# cannot read", read-back at entry/exit — live in ``spec/process/obligations.yaml``
+# and are injected here by the composition root via
 # :class:`~spirrow_mindwire.obligations.ObligationsManifest`; the manifest, not
-# this literal, is the single source of truth for those clauses (CLAUDE.md §N.4).
-# The paragraphs that once lived inline (notably "DOCUMENTS YOU CANNOT READ")
-# have been MOVED to that manifest — deleted here, restored to the rendered
-# prompt through injection. Keeping the manifest as the sole owner is what lets
-# the tests assert on the actual prompt the loop reads rather than a mirror.
+# this literal, is the single source of truth for those clauses (CLAUDE.md §N →
+# spec/process/README.md → obligations.yaml). The paragraphs that once lived
+# inline (notably "DOCUMENTS YOU CANNOT READ") have been MOVED to that manifest —
+# deleted here, restored to the rendered prompt through injection. Keeping the
+# manifest as the sole owner is what lets the tests assert on the actual prompt
+# the loop reads rather than a mirror.
 _BASE_IMPLEMENTER_SYSTEM_PROMPT = """\
 You are the implementer in a Spirrow MindWire ChatRoom thread. You write and \
 run code to carry out the agreed proposal. You operate under a strict, \
@@ -1006,11 +1007,11 @@ class ImplementerSdkAdapter:
         self._allowed_tools = list(allowed_tools) if allowed_tools is not None else []
         self._mcp_servers = mcp_servers or {}
         # Loop-readable obligations are injected here — the manifest passed in is the
-        # single source of truth (CLAUDE.md §N.4) and the adapter never reaches for a
-        # module-global path itself. That injection shape is what canary two-prime
-        # (rendered-prompt-contains-obligation-body) reads: the assembled system
-        # prompt under test is exactly the one the adapter renders in production,
-        # from a manifest the test picks.
+        # single source of truth (CLAUDE.md §N → spec/process/README.md) and the
+        # adapter never reaches for a module-global path itself. That injection
+        # shape is what canary two-prime (rendered-prompt-contains-obligation-body)
+        # reads: the assembled system prompt under test is exactly the one the
+        # adapter renders in production, from a manifest the test picks.
         self._obligations = obligations
         # Append cwd grounding (T40): the custom system prompt omits the SDK's working-directory
         # dynamic section, so the agent must be told its cwd explicitly or it guesses abs paths.
