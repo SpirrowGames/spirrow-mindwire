@@ -1,12 +1,8 @@
 """Canaries and pointer-existence guard for the loop-readable obligations manifest.
 
-Three canaries + one grep, no skip conditions. Together they enforce the invariants
+Two canaries + one grep, no skip conditions. Together they enforce the invariants
 the Tier-C GO msg-737 nailed down:
 
-- **①** id-coverage: every obligation id the running code renders is present in the
-  in-repo manifest, and every manifest id belongs to a role a running adapter
-  actually renders. A drift between the code and the manifest (a rename, a stray
-  entry, a role that no longer receives its clause) is caught here.
 - **two-prime** wiring: the *rendered* system prompt each adapter assembles from a manifest
   contains that manifest's body verbatim. This is the "prompt builder receives the
   manifest by injection" invariant in test form — the assertion is on the prompt the
@@ -17,6 +13,20 @@ the Tier-C GO msg-737 nailed down:
   well-meaning "cleanup" that shortens or reflows the moved body reds this canary
   rather than silently drifting the loop's actual instruction away from what was
   reviewed.
+
+Canary ① (a hardcoded ``_EXPECTED_IDS_BY_ROLE`` shadow list of manifest ids in
+this module) was **removed** on the naysayer round-3 finding: production code
+(:meth:`~spirrow_mindwire.obligations.ObligationsManifest.render_role_obligations`)
+is fully data-driven — it iterates ``manifest.for_role(role)`` and renders
+whatever is present — so a rename in YAML does not break prompt construction,
+and canary two-prime already asserts that whatever the manifest contains
+reaches the assembled prompt. Maintaining a separate shadow list of ids in the
+test suite carried the cost of dual management with no mechanical benefit to
+the loop's correctness. The advisory ``obligations-readback (advisory)`` CI
+check (``scripts/obligations_readback.py``, invoked from
+``.github/workflows/obligations-readback.yml``) is the reader-facing check for
+disappearing / renamed ids across a PR — it derives its expected set from the
+PR **base revision** each run and never carries a shadow list of its own.
 
 The CLAUDE.md §N pointer + `spec/process/README.md` imperative-pointer grep tests
 live in this same module deliberately — the pointers are what keep the "put
@@ -42,51 +52,6 @@ from spirrow_mindwire.obligations import (
     load_manifest,
 )
 from spirrow_mindwire.value_objects import Role
-
-# The manifest ids the running code renders today, keyed by the role that renders
-# them. Any addition or removal of an obligation must be reflected here — that
-# manual step is deliberate: the canary is what forces someone to notice a rename.
-_EXPECTED_IDS_BY_ROLE: dict[Role, frozenset[str]] = {
-    Role.IMPLEMENTER: frozenset(
-        {"OBL-DECLARE-UNREADABLE", "OBL-READBACK-ENTRY", "OBL-READBACK-EXIT"}
-    ),
-    Role.NAYSAYER: frozenset({"OBL-VERDICT-CONSTRAINT"}),
-}
-
-
-# --------------------------------------------------------------------------- #
-# canary ① — id coverage between the manifest and the code that renders it
-# --------------------------------------------------------------------------- #
-
-
-def test_canary_1_manifest_ids_match_the_ids_the_code_renders() -> None:
-    """Every id the code renders is in the manifest, and every manifest id is rendered.
-
-    A one-way check (e.g. only "manifest ⊂ rendered") would let a stale entry sit
-    unreferenced in ``spec/process/obligations.yaml`` forever; a one-way check
-    the other way would let a code path fabricate an id the manifest never
-    defined. Both directions must hold, and both role buckets must too — an
-    implementer obligation misfiled under ``role: naysayer`` never reaches the
-    implementer.
-    """
-    manifest = load_manifest()
-    for role, expected in _EXPECTED_IDS_BY_ROLE.items():
-        actual = frozenset(o.id for o in manifest.for_role(role))
-        assert actual == expected, (
-            f"role={role.value}: manifest ids {sorted(actual)} do not match the ids "
-            f"the code renders for that role ({sorted(expected)}). If you added or "
-            "renamed an obligation, update spec/process/obligations.yaml AND "
-            "tests/test_obligations.py::_EXPECTED_IDS_BY_ROLE."
-        )
-    all_manifest_ids = frozenset(o.id for o in manifest.obligations)
-    all_expected = frozenset().union(*_EXPECTED_IDS_BY_ROLE.values())
-    orphan = sorted(all_manifest_ids - all_expected)
-    missing = sorted(all_expected - all_manifest_ids)
-    assert all_manifest_ids == all_expected, (
-        f"manifest contains ids the code does not render ({orphan!r}) "
-        f"or the code expects ids the manifest does not define ({missing!r})"
-    )
-
 
 # --------------------------------------------------------------------------- #
 # canary two-prime — the rendered system prompt actually carries the manifest body

@@ -92,7 +92,7 @@ manifest の書式・読込 API・不変条件 (verbatim 長さ保持 = canary �
 
 ## 残余 (v1 に載せなかった義務・洞察) — R1 / R2 / R3
 
-Tier-C GO (msg-737 / msg-739) が v1 の scope を「4 obligations の manifest 化」に絞ったため、周辺で議論された 3 項目は本 PR に載せていない。**黙って落としたのではない**ことを記名する場所として本節を用意する。
+Tier-C GO (msg-737 / msg-739) が v1 の scope を「4 obligations の manifest 化」に絞ったため、周辺で議論された 3 項目は本 PR に (下記 R2 の再判断分を除き) 載せていない。**黙って落としたのではない**ことを記名する場所として本節を用意する。
 
 ### R1 — 「fail-open の宣言先を先に決める」を obligation 化する
 - **性質**: 設計時の義務。宛先は degradation を設計する者 = ループ内では実質 proposer。
@@ -101,9 +101,52 @@ Tier-C GO (msg-737 / msg-739) が v1 の scope を「4 obligations の manifest 
 
 ### R2 — 「限界は冒頭に置く (脚注ではなく)」を配置規律として明文化
 - **性質**: 配置規律。implementer にも適用可能 (「読めなかった msg があります」は reply の最終段落ではなく冒頭に置く)。
-- **v1 非搭載の理由**: 現時点でどの prompt にも実在しない文言ゆえ、載せると v1 が「移設 only」でなくなり scope 逸脱になる。**意図的な defer**。
+- **判断**: v1 非搭載を維持する ((i) を選択、msg-761 の integrity 質問に対する回答)。
+- **理由**: 本 PR で新規追加した `OBL-PRCHECK-READ` (下記) は「①″ (obligations-readback advisory) が非阻止であることから生じる本変更自身の機構」= advisory check の reader-side を塞ぐ mechanism-of-this-design であって、§N からの移設ではないが「別 obligation を追加した」帰結は変わらない。ここで R2 と B (OBL-PRCHECK-READ) の**種類**を明示的に切り分けておく:
+  - **B (OBL-PRCHECK-READ)** = 本設計の内部で degradation を塞ぐために必要な追加 mechanism。「①″ を advisory として残す」判断を採ったなら reader-side の obligation を対で置かないと fail-open placement 規律に反する。同一 PR で対にする必然性がある。
+  - **R2 (limits-at-head)** = 一般的な配置規律。特定 mechanism の degradation を塞ぐわけではなく、複数場面で有用な水平規律。「まず適用先の prompt 系統を洗い出す → 各配送脚を確認する」というスコーピングを R2 単独 PR で行うほうが誠実で、B とバンドルすると「B と一緒に通したから R2 も通った」という審査手抜きを招く。
+- **v1 非搭載の理由 (原文の再掲)**: 現時点でどの prompt にも実在しない文言ゆえ、載せると v1 が「移設 only」でなくなり scope 逸脱になる — この理由は B の追加により実質的に消えているが、上記「(i) 種類が違う」で維持を選択した。
 - **follow-up task**: `T-r2-limits-at-head` (立てる時に obligation body を新規起草 = net-new formulation で `origin` を持たない)。
 
 ### R3 — 「正しく実装され正しく宣言された fail-open でも不可視でありうる」
 - **性質**: 洞察であって義務ではない。
 - **v1 非搭載の理由**: `obligations.yaml` は **義務を運ぶ器**であって根拠を運ぶ器ではない。洞察は本 README の旧 §N.3 節で説明されており、それ自体が正しい配置。**非搭載が正しい設計**。
+
+---
+
+## `obligations-readback (advisory)` = A + B のペア (msg-760 確定設計)
+
+### A — `.github/workflows/obligations-readback.yml` (非阻止 CI 通知)
+
+`spec/process/obligations.yaml` の obligation id topology (追加 / 削除 / rename) を、PR の **base revision** と head の間で毎回差分する非阻止の advisory check。実装は `scripts/obligations_readback.py`。
+
+**設計上の核 (msg-760 A):**
+
+1. **check 名に `(advisory)` を含める** — PR merge-box の badge 隣で最も安く「これはゲートではない」と正直になれる場所。
+2. **非阻止の明記** — script docstring / workflow コメントに「本検査はマージを阻止しない。本リポジトリに branch protection は無く、authoritative guard は人間である」と書く。
+3. **失敗出力契約** — `$GITHUB_STEP_SUMMARY` に (a) 消えた / 改名された obligation id、(b) 生存する参照箇所 (`file:line`)、(c) 最小是正 1 行を出す。人間にリポジトリ潜行を強いない。
+4. **期待値は base revision から毎回導出** — script は base の manifest を `git show <base_ref>:<manifest>` で読み、shadow list は持たない (canary ① を落とした理由と同じ)。
+5. **範囲の明記** — trigger は `pull_request` のみ。`main` への直接 push で入った不整合は検出されない。base 導出の設計上、いったん base に入った不整合は以後 base 側の正解として扱われるため恒久に検出されない。これは branch protection が使えないことの帰結であり、検査側では塞げない。
+6. **リリース PR 条項は無し** — 機構はブランチ非依存 ∴ 特別条項不要。
+7. **読み手** — Takahito (merge 判断時、PR merge-box)。implementer (human へ渡す前、下記 B により)。
+
+**scope 上「これは catch しない」もの:**
+
+- 直接 push (上記 5)。
+- id を保ったまま body だけ書き換わる意味的 drift → これは canary two-double-prime (`tests/test_obligations.py`) の担当 (moved-from body の length 不整合が gate を赤にする)。本 advisory は id 位相 (add / remove / rename) に scope を絞る。
+
+### B — `OBL-PRCHECK-READ` (implementer exit obligation)
+
+A が非阻止である以上、reader が居ないと advisory が実質沈黙する (§「fail-open の宣言先を先に決める」の直接違反)。それを塞ぐのが `spec/process/obligations.yaml` の `OBL-PRCHECK-READ` = implementer が `NEXT: human` を出す前に PR の check runs を読む義務。詳細は同 yaml 参照。
+
+**(a) 条件 (base でも赤) の運用定義**: ローカルで base に checkout して同一スクリプトを再実行する。`gh run list --commit <base_sha>` は新規追加 check の初回で run が存在せず判定不能になる ∴ 再実行の方が欠落しない (msg-760 B より)。
+
+**A と B の関係**: A は宣言先 (Takahito) + advisory 機構。B は implementer 側の reader を obligation として明示する。二者が対でないと A は reader-less advisory になり、§「fail-open の宣言先を先に決める」の教訓 (「正しく実装され正しく宣言している fail-open でも不可視でありうる」) を本 PR 自身が再生産する。
+
+---
+
+## 受容したリスク (規則で緩和されない事項) — msg-760 記載
+
+環境前提の誤りに対する規則的緩和は本 PR では置いていない (msg-760 で自己申告ラベル案が naysayer と human に撃ち落とされ、取り下げ済み)。**このリスクは規則で塞がず、後段ロール撃墜 + human の事前提示に依存する形で受容している。** msg-761 での human 側の訂正: この受容リスクを負うのは実質的に human (Takahito) 側で、本スレッド内でも既に 2〜3 回発現している。
+
+`OBL-PRCHECK-READ` (上記 B) は PR check の未読み放置という**別種の**degradation を塞ぐものであり、環境前提の誤りに対する緩和ではない。混同しないこと。

@@ -299,10 +299,15 @@ def _load_obligations_or_exit() -> ObligationsManifest:
     try:
         return load_manifest()
     except ObligationsError as exc:
+        # No path-override mechanism is exposed here on purpose: the composition
+        # root loads the in-repo manifest at its default location. Suggesting a
+        # non-existent override would misdirect the operator (naysayer round-3
+        # finding on this PR — "phantom path override"). Remediation is fixing
+        # the manifest file, or invoking the daemon from the repo root.
         raise SystemExit(
             f"obligations manifest failed to load — daemon cannot start with a degraded "
             f"prompt set (this is fail-closed by design; fix spec/process/obligations.yaml "
-            f"or the path override and retry): {exc}"
+            f"and retry from the repo root): {exc}"
         ) from exc
 
 

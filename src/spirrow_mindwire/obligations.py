@@ -119,12 +119,22 @@ def default_manifest_path() -> Path:
 def load_manifest(path: Path | None = None) -> ObligationsManifest:
     """Load and validate the obligations manifest — fail-loud on any deviation.
 
-    ``path`` defaults to :func:`default_manifest_path`; tests point it at a
-    fixture. The parse is strict: missing/duplicate ids, unknown roles, empty
-    bodies, and origin blocks whose recorded length disagrees with the actual
-    body length all raise :class:`ObligationsError`. That failure is caught at
-    the composition root and re-raised as ``SystemExit`` (loader ← composition
-    root ← daemon startup) — see :mod:`spirrow_mindwire.loop_runner`.
+    ``path`` is a **test-only seam**: tests point it at a fixture. Production
+    call sites (the composition root in :mod:`spirrow_mindwire.loop_runner`)
+    call this with no argument, so the in-repo :func:`default_manifest_path`
+    is loaded. There is deliberately **no environment-variable override and no
+    CLI-flag override**: a per-host manifest would be exactly the dual-management
+    the "obligations live in the manifest, not in adapter strings" invariant
+    exists to prevent. Any override plumbed in later would need the composition
+    root updated at the same time, and the misleading "path override" message
+    that used to live in that ``SystemExit`` was removed for the same reason
+    (naysayer round-3 finding on PR #135).
+
+    The parse is strict: missing/duplicate ids, unknown roles, empty bodies,
+    and origin blocks whose recorded length disagrees with the actual body
+    length all raise :class:`ObligationsError`. That failure is caught at the
+    composition root and re-raised as ``SystemExit`` (loader ← composition root
+    ← daemon startup) — see :mod:`spirrow_mindwire.loop_runner`.
     """
     resolved = path if path is not None else default_manifest_path()
     try:

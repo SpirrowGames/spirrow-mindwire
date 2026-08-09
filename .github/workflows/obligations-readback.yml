@@ -1,0 +1,69 @@
+name: obligations-readback (advisory)
+
+# ADVISORY, NON-BLOCKING check for obligation-id topology drift in
+# spec/process/obligations.yaml between the PR base and head. See
+# scripts/obligations_readback.py for the full contract; the short version:
+#
+#   * Only runs on `pull_request` (the only path this repo actually gates —
+#     `push: main` was rejected in msg-760 D because it names no reader).
+#   * Never blocks a merge. The job step always exits 0. There is no branch
+#     protection on this repo under the current GitHub plan (Pro upgrade
+#     rejected per msg-761), so the authoritative merge guard is the human
+#     at merge-time. The `(advisory)` suffix in the job name is where that
+#     is cheapest to state honestly — it appears next to the badge in the
+#     PR merge-box.
+#   * Base revision is the source of truth for the "expected" id set. No
+#     shadow list lives in this workflow or in the script; a shadow list was
+#     the exact dual-management the naysayer round-3 finding on this PR
+#     called out.
+#   * Details land in $GITHUB_STEP_SUMMARY (surviving `file:line` references
+#     for each removed / renamed id + one-line remediation). The reviewer
+#     does NOT have to dive into the repo to see what still points at a
+#     removed id — that's the point.
+#
+# The reader-side complement is `OBL-PRCHECK-READ` in
+# spec/process/obligations.yaml: the implementer reads the PR check runs
+# before it emits `NEXT: human`. Without that read, this check is
+# reader-less advisory and the fail-open-placement rule
+# (spec/process/README.md §「fail-open の宣言先を先に決める」) applies —
+# which is why B (OBL-PRCHECK-READ) is part of the same design as A.
+
+on:
+  pull_request:
+
+jobs:
+  obligations-readback:
+    # Job name is what appears in the PR merge-box badge; keep the
+    # `(advisory)` suffix so a reader of the badge alone sees it is not a
+    # gate. Do NOT add a `required` marker in branch protection for this
+    # check — that would defeat the advisory contract.
+    name: obligations-readback (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # We need the base revision available locally so `git show
+          # <base>:<manifest>` can read it. `fetch-depth: 0` gets the full
+          # history; the advisory check is I/O-light so the extra fetch is
+          # noise-tier cost.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+      - name: Set up Python
+        run: uv python install 3.11
+      - name: Install PyYAML (script's only runtime dep)
+        # Keep this narrow — the advisory check must not need the full dev
+        # extras (that would tie it to the head-revision loader schema, the
+        # very drift-coupling the script is designed to avoid).
+        run: uv pip install --system pyyaml
+      - name: obligations-readback (advisory) — diff base vs head, no blocking
+        # `continue-on-error: true` is a belt on top of the always-exit-0
+        # contract in the script itself — if a future edit accidentally
+        # makes the script raise, the check still stays advisory rather
+        # than silently becoming a gate on the merge-box.
+        continue-on-error: true
+        run: |
+          python scripts/obligations_readback.py \
+            --base-ref "origin/${{ github.event.pull_request.base.ref }}" \
+            --head-ref HEAD

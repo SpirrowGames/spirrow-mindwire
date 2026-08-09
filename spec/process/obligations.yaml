@@ -61,3 +61,13 @@ obligations:
       moved_from: "CLAUDE.md::§N.1.4"
       original_length: 574
     body: "READ-BACK AT EXIT (ADR-2026-05-29-13 §N.1.4): before you hand the work back, open the same specifying message(s) again and build a requirement-by-requirement table — one row per bulletable requirement in the spec, each row marked \"reflected\" (with a code/PR pointer) or \"not reflected\" (with the reason). Assemble the table from the spec text, not from memory of what you did. Include the table in the PR body. A completion without this table is not a completion; if the spec is unreadable to you, satisfy OBL-DECLARE-UNREADABLE and state which rows you could not construct."
+
+  - id: OBL-PRCHECK-READ
+    role: implementer
+    # Net-new formulation (no origin): this obligation is the reader-side mechanism
+    # that closes the fail-open in the ``obligations-readback (advisory)`` CI check.
+    # The advisory check names its consequences on $GITHUB_STEP_SUMMARY, but naming
+    # them is worthless unless someone actually reads the PR's check runs before
+    # handing to a human — that "actually reads" is what this obligation binds.
+    # See spec/process/README.md §「PR check の未読み放置を塞ぐ (OBL-PRCHECK-READ)」.
+    body: "READ THE PR CHECK RUNS BEFORE HANDING TO HUMAN: on a turn that carries a PR, before you emit `NEXT: human`, read that PR's check runs (`gh pr checks <n>` or the JSON `gh pr view <n> --json statusCheckRollup`). If a check is red, fix it. You may escalate to the human with a red check ONLY if one of these two holds and you state which in the reply: (a) the same check is red on the PR **base revision** (this failure is not from your PR — verify by checking out the base locally and re-running the same script; do NOT rely on `gh run list --commit <base_sha>` alone, since a newly added check has no run on base and the query returns empty rather than a verdict); or (b) fixing the failure requires an operation you cannot perform under Tier C (repo settings / branch protection / secrets / anything the allow-list denies). Neither condition being true, do not emit `NEXT: human` while a red PR check stands. The normative treatment of red CI on PR gates is ADR-2026-06-03-16; this obligation carries only the read-and-triage duty, not the gate policy."
