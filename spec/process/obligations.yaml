@@ -50,16 +50,26 @@ obligations:
 
   - id: OBL-READBACK-ENTRY
     role: implementer
-    origin:
-      moved_from: "CLAUDE.md::§N.1.3"
-      original_length: 669
+    # Net-new English formulation of the ADR-2026-05-29-13 §N.1.3 spirit — no `origin`.
+    # The pre-move CLAUDE.md §N.1.3 was a Japanese numbered list (「入口チェック
+    # (実装着手前)」) whose structure and phrasing do not survive a straight port to
+    # a prompt-injected obligation body. A prior revision of this file falsely
+    # claimed a verbatim `origin.moved_from: CLAUDE.md::§N.1.3` and set
+    # `original_length` to the character count of THIS English body — that
+    # bypassed canary two-double-prime by construction (the length-invariant
+    # only makes sense against the actually-moved source text). Tier B naysayer
+    # on PR #135 (Finding 1) called this out. Correct classification: net-new
+    # formulation. The Japanese source rationale remains in
+    # `spec/process/README.md` §「提案の核 — spec read-back」 for context.
     body: "READ-BACK AT ENTRY (ADR-2026-05-29-13 §N.1.3): before you begin work on a task that names a proposer decide-msg, an ADR, a schema change, or an existing spec you claim to preserve, re-read the specifying message(s) as your primary source. Do not act from a summary of them (yours or the harness's) — a summary is lossy at exactly the field-level detail that a spec turns on (enum values, invariants, boundary conditions, the difference between \"preserve\" and \"extend\"). In your first reply, name the msg-ids you read and quote the concrete requirements you took from them. If a required document is unreadable to you, satisfy OBL-DECLARE-UNREADABLE instead of guessing."
 
   - id: OBL-READBACK-EXIT
     role: implementer
-    origin:
-      moved_from: "CLAUDE.md::§N.1.4"
-      original_length: 574
+    # Net-new English formulation of the ADR-2026-05-29-13 §N.1.4 spirit — no `origin`.
+    # Same rationale as OBL-READBACK-ENTRY above: the pre-move CLAUDE.md §N.1.4
+    # was a Japanese numbered list, not a prose obligation body; declaring it a
+    # verbatim move + faking `original_length` to the English body's length
+    # would falsify the invariant. Tier B naysayer on PR #135 (Finding 1).
     body: "READ-BACK AT EXIT (ADR-2026-05-29-13 §N.1.4): before you hand the work back, open the same specifying message(s) again and build a requirement-by-requirement table — one row per bulletable requirement in the spec, each row marked \"reflected\" (with a code/PR pointer) or \"not reflected\" (with the reason). Assemble the table from the spec text, not from memory of what you did. Include the table in the PR body. A completion without this table is not a completion; if the spec is unreadable to you, satisfy OBL-DECLARE-UNREADABLE and state which rows you could not construct."
 
   - id: OBL-PRCHECK-READ

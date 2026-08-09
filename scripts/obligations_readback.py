@@ -44,8 +44,18 @@ next to the green/red badge.
 
 CLI:
 
-    obligations_readback.py --base-ref origin/main --head-ref HEAD
+    obligations_readback.py --base-ref origin/main
     obligations_readback.py --base-file <path> --head-file <path>   # test seam
+
+The head side ALWAYS reads from the working tree (both the manifest and the
+reference scan) — never from ``git show``. This is deliberate (Tier B naysayer
+Finding 2 on PR #135): if the manifest was read from a git object while
+``_scan_references`` walked the filesystem, the two would diverge on a dirty
+working tree, silently reporting references from one revision against a
+manifest from another. Unifying both reads on the working tree eliminates that
+hybrid state. In CI ``actions/checkout@v4`` puts the PR merge commit into the
+working tree, so the working-tree read is exactly the head; there is no
+``--head-ref`` argument because the redundancy would only re-open the hybrid.
 
 Exit code contract (Einstein / msg-762 objection):
 
@@ -173,14 +183,20 @@ def _read_base_manifest(base_ref: str) -> str:
     return result.stdout
 
 
-def _read_head_manifest(head_ref: str | None) -> str:
-    """Read the manifest at the head. ``head_ref`` = None means the working tree."""
-    if head_ref is None:
-        try:
-            return (_REPO_ROOT / _MANIFEST_REL).read_text(encoding="utf-8")
-        except OSError:
-            return ""
-    return _read_base_manifest(head_ref)
+def _read_head_manifest() -> str:
+    """Read the manifest from the working tree (never from ``git show``).
+
+    The reference scan (:func:`_scan_references`) also walks the working tree,
+    so unifying both reads on the same source of truth eliminates the
+    hybrid-state class Tier B naysayer Finding 2 flagged on PR #135. In CI
+    ``actions/checkout@v4`` puts the PR merge commit into the working tree;
+    locally, "head" means "whatever is on disk right now" — which is also
+    exactly what the reference scan sees.
+    """
+    try:
+        return (_REPO_ROOT / _MANIFEST_REL).read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 # A pattern that matches an obligation id as a whole token in code / docs.
@@ -386,11 +402,6 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="git ref for the PR base (e.g. origin/main). Read via `git show <ref>:<manifest>`.",
     )
     parser.add_argument(
-        "--head-ref",
-        default=None,
-        help="git ref for the PR head. Omit to read from the working tree.",
-    )
-    parser.add_argument(
         "--base-file",
         default=None,
         help="test seam: read the base manifest from this file instead of via git.",
@@ -398,7 +409,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--head-file",
         default=None,
-        help="test seam: read the head manifest from this file instead of via git.",
+        help=(
+            "test seam: read the head manifest from this file instead of the working tree. "
+            "There is deliberately no `--head-ref` — the head side always reads from the "
+            "working tree so it is guaranteed to match what `_scan_references` walks "
+            "(Tier B naysayer Finding 2 on PR #135)."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -413,14 +429,16 @@ def main(argv: list[str] | None = None) -> int:
     head_text = (
         Path(args.head_file).read_text(encoding="utf-8")
         if args.head_file
-        else _read_head_manifest(args.head_ref)
+        else _read_head_manifest()
     )
     base = _load_snapshot(base_text)
     head = _load_snapshot(head_text)
     findings = _build_findings(base, head)
     _write_summary(_format_summary(findings))
-    # Always exit 0 (advisory). See module docstring for why this must never
-    # become a gate here.
+    # Exit 0 on the normal path regardless of findings — the workflow does NOT
+    # set `continue-on-error: true`, so tool crashes propagate non-zero and
+    # red the check (Einstein / msg-762). See module docstring §「Exit code
+    # contract」.
     return 0
 
 

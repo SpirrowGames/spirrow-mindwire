@@ -81,5 +81,4 @@ jobs:
         # drift-coupling the script is designed to avoid).
         run: |
           uv run --python 3.11 --with pyyaml python scripts/obligations_readback.py \
-            --base-ref "origin/${{ github.event.pull_request.base.ref }}" \
-            --head-ref HEAD
+            --base-ref "origin/${{ github.event.pull_request.base.ref }}"

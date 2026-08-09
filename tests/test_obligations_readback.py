@@ -254,6 +254,74 @@ def test_findings_present_still_exits_zero(tmp_path: Path, monkeypatch: pytest.M
     assert "REMOVED: `OBL-DEFINITELY-GONE`" in summary
 
 
+def test_head_ref_flag_does_not_exist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The `--head-ref` flag was removed on Tier B Finding 2 (PR #135).
+
+    A `--head-ref` that reads via ``git show`` while ``_scan_references`` walks
+    the working tree creates a hybrid state: on a dirty working tree the two
+    diverge and the summary lists references from one revision against a
+    manifest from another. Removing the flag guarantees head-manifest read
+    and reference-scan see the same source of truth. This test locks that
+    removal so a "helpful" future PR cannot silently re-add it.
+    """
+    # argparse exits with SystemExit(2) on an unknown option and prints the
+    # error to stderr — a clean signal that the option is gone.
+    with pytest.raises(SystemExit):
+        _MODULE.main(  # type: ignore[attr-defined]
+            [
+                "--base-file",
+                str(tmp_path / "b"),
+                "--head-file",
+                str(tmp_path / "h"),
+                "--head-ref",
+                "HEAD",
+            ]
+        )
+
+
+def test_head_read_defaults_to_the_working_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no `--head-file` and no `--head-ref` (there IS no `--head-ref`), the
+    head comes from the working tree — the same source `_scan_references` walks.
+
+    We assert this by monkey-patching the module's ``_REPO_ROOT`` to a temp
+    directory that carries a manifest, and confirming the summary reflects
+    that manifest without any git subprocess ever running (the base is empty
+    because there is no git repo at the temp root; both sides come from disk).
+    """
+    fake_repo = tmp_path / "fake_repo"
+    (fake_repo / "spec" / "process").mkdir(parents=True)
+    (fake_repo / "spec" / "process" / "obligations.yaml").write_text(
+        dedent(
+            """\
+            version: 1
+            obligations:
+              - id: OBL-ONLY-IN-HEAD
+                role: implementer
+                body: "only-in-head"
+            """
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_MODULE, "_REPO_ROOT", fake_repo)
+    summary_file = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+    # Empty base file (test seam), no `--head-*`: head must come from fake_repo.
+    base_file = tmp_path / "base_empty.yaml"
+    base_file.write_text("version: 1\nobligations: []\n", encoding="utf-8")
+
+    exit_code = _MODULE.main(  # type: ignore[attr-defined]
+        ["--base-file", str(base_file)]
+    )
+    assert exit_code == 0
+    summary = summary_file.read_text(encoding="utf-8")
+    # Head coming from the working tree of fake_repo means the "added" id is
+    # OBL-ONLY-IN-HEAD; no removed id (base was empty) so the summary is clean.
+    assert "No obligation ids disappeared" in summary
+
+
 def test_tool_failure_propagates_nonzero_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
