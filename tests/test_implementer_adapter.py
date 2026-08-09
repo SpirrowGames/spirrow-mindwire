@@ -646,6 +646,45 @@ def test_system_prompt_grounds_cwd(tmp_path: Path) -> None:
     assert "Conductor handoff protocol" in sp
 
 
+# --- what the implementer may NOT read (2026-08-09) ------------------------- #
+# Voxelworld PR #182: asked to "perform the ADR-2026-05-29-13 read-back", the session had neither
+# the ADR body (separate docs repo) nor even the id->title map, so it reconstructed the ADR from
+# context and stated the result as fact — three of five claims attributed to ADR-13 things it does
+# not say. The failure was not ignorance but silent confident invention, so the fix is two halves:
+# say what you cannot read, and know which ADRs exist. Neither half works alone.
+
+
+def test_system_prompt_forbids_reconstructing_unreadable_documents(tmp_path: Path) -> None:
+    sp = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url="http://lx")._system_prompt
+    assert "DOCUMENTS YOU CANNOT READ" in sp
+    # The instruction must be to DECLARE the gap, not merely to be careful about it.
+    assert "cannot read" in sp
+    assert "do NOT reconstruct" in sp
+
+
+def test_system_prompt_carries_the_adr_index_as_titles_only(tmp_path: Path) -> None:
+    sp = ImplementerSdkAdapter(cwd=tmp_path, inference_base_url="http://lx")._system_prompt
+    assert "ADR INDEX" in sp
+    # A real id from the in-repo manifest — the map is present, not a placeholder.
+    assert "ADR-2026-05-29-13" in sp
+    # And it must be labelled for what it is. Handing over titles WITHOUT this caveat would invite
+    # better-grounded confabulation, which is harder to catch than the original failure.
+    assert "TITLES ONLY" in sp
+    assert "NOT the ADRs" in sp
+
+
+def test_adr_index_block_says_so_when_the_manifest_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing manifest is announced, never shipped as a silent gap (mirrors the naysayer)."""
+    import spirrow_mindwire.adapters.implementer as impl
+
+    monkeypatch.setattr(impl, "load_adr_index", lambda *a, **k: ())
+    block = impl._adr_index_block()
+    assert "UNAVAILABLE" in block
+    assert "do not guess" in block
+
+
 @pytest.mark.anyio
 async def test_deliver_emits_reply_when_allowed(tmp_path: Path) -> None:
     captured: list[ReplyDraft] = []
