@@ -35,9 +35,33 @@ allow:
   - operation: git.push
     branch_glob: ["feature/*", "develop"]
     force: false
-  - operation: git.merge        # feature/* -> develop self-review merge
+  # Two different operations wear the name `git.merge`, and only one of them was listed.
+  #
+  #   PUBLISH  feature/* -> develop   promotes work. Constrained by BOTH ends.
+  #   SYNC     <anything> -> feature/*  brings a branch up to date. Contained by its TARGET
+  #            alone: a merge into a feature branch cannot alter a protected branch, whatever
+  #            it merges from. The target is the containment; the source does not need one.
+  #
+  # Listing only PUBLISH denied the implementer `git merge origin/main` on its own feature
+  # branch — the ordinary way to get current before working. Measured 2026-08-09: the
+  # implementer's clone was 7 commits behind `origin/main`, the code it had been asked to MOVE
+  # was introduced in one of those commits, and nothing anywhere syncs that clone (#129 syncs
+  # the daemon checkout, not the implementer's). So the task was not merely awkward without
+  # SYNC, it was impossible — and the session halted instead.
+  #
+  # `source_glob: ["*"]` is deliberate, and is the lesson of #123 applied one rule to the left:
+  # naming `main` / `develop` here would re-encode one project's branch flow into a
+  # repo-agnostic file, which is exactly what #123 had to undo for `github.pr.open`. Safety
+  # does not come from the source list — it comes from the target, and from `git.merge_to_main`
+  # staying Tier C below. A merge target is resolved from `.git/HEAD` and fails CLOSED
+  # (UNKNOWN -> deny) when it cannot be determined, so an unparseable checkout does not slip
+  # through either.
+  - operation: git.merge        # PUBLISH: feature/* -> develop self-review merge
     source_glob: ["feature/*"]
     target_glob: ["develop"]
+  - operation: git.merge        # SYNC: bring a feature branch up to date
+    source_glob: ["*"]
+    target_glob: ["feature/*"]
   - operation: github.pr.open   # opening a PR is reversible (Tier A)
     # PROVISIONAL (2026-08-02). Restored to ["develop", "main"] after being
     # narrowed to ["develop"] the same day for V-4.
