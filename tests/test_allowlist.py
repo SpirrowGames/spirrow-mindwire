@@ -136,9 +136,53 @@ def test_git_merge_feature_to_develop_allowed(tmp_path: Path) -> None:
     assert d.allowed is True
 
 
-def test_git_merge_source_not_feature_denied(tmp_path: Path) -> None:
-    d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_MERGE, source="develop"))
+@pytest.mark.parametrize("source", ["origin/main", "main", "develop", "origin/develop"])
+def test_git_merge_sync_into_feature_allowed(tmp_path: Path, source: str) -> None:
+    """SYNC: bringing a feature branch up to date, whatever it merges from.
+
+    Denying this halted the loop on 2026-08-09 — the implementer's clone was 7 commits behind
+    `origin/main`, the code it was told to MOVE lived in one of them, and nothing syncs that
+    clone. Containment here is the TARGET: a merge into a feature branch cannot alter a
+    protected branch no matter what the source is.
+    """
+    d = _al(tmp_path).check(
+        ClassifiedAction(Operation.GIT_MERGE, source=source, target="feature/x")
+    )
+    assert d.allowed is True
+
+
+def test_git_merge_sync_source_is_unconstrained_by_design(tmp_path: Path) -> None:
+    """Any source, so long as the target is a feature branch (#123's lesson, one rule left).
+
+    Naming `main` / `develop` in `source_glob` would re-encode one project's branch flow into a
+    repo-agnostic file — exactly what #123 had to undo for `github.pr.open`.
+    """
+    d = _al(tmp_path).check(
+        ClassifiedAction(Operation.GIT_MERGE, source="release/2026-08", target="feature/x")
+    )
+    assert d.allowed is True
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        ("feature/x", "main"),  # publishing into main — the invariant that matters
+        ("origin/main", "main"),  # sync rule must not reach a protected target
+        ("origin/main", "develop"),  # neither rule: not a feature target, not a feature source
+    ],
+)
+def test_git_merge_outside_both_rules_denied(tmp_path: Path, source: str, target: str) -> None:
+    d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_MERGE, source=source, target=target))
     assert d.allowed is False
+    assert d.reason
+
+
+# A merge with NO target reaches neither rule's containment (`_constraints_pass` skips a
+# constraint whose action field is None). That is not this layer's job: the guard enriches the
+# target from `.git/HEAD` and downgrades to UNKNOWN when it cannot, which is fail-closed and
+# covered by `test_guard_merge_undeterminable_branch_fails_closed` in test_implementer_adapter.py.
+# Asserting the permissive result here would read as an endorsement of it, so the assertion that
+# matters lives at the layer that actually decides.
 
 
 # --- github.pr.open -------------------------------------------------------- #

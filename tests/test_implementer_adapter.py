@@ -439,6 +439,34 @@ async def test_guard_merge_while_on_main_denied(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_guard_sync_merge_on_feature_allowed(tmp_path: Path) -> None:
+    """`git merge origin/main` on a feature branch — the exact call that halted the loop.
+
+    Target is enriched to `feature/x` from HEAD, which is what contains it: the merge cannot
+    touch a protected branch. See the SYNC rule in implementer_allowlist.yaml.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git merge origin/main"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
+    assert guard.violations == []
+
+
+@pytest.mark.anyio
+async def test_guard_merge_undeterminable_branch_fails_closed(tmp_path: Path) -> None:
+    """No repo → merge target cannot be resolved → UNKNOWN → deny.
+
+    This carries more weight since the SYNC rule landed: `_constraints_pass` skips a target
+    constraint when the target is None, so the merge path's containment now rests on this
+    enrichment. The push variant below was already covered; merge was not.
+    """
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git merge origin/main"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violations[-1].operation is Operation.UNKNOWN
+
+
+@pytest.mark.anyio
 async def test_guard_undeterminable_branch_fails_closed(tmp_path: Path) -> None:
     # no .git/HEAD → branch can't be resolved → downgrade to UNKNOWN → deny.
     guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
