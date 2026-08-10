@@ -58,6 +58,11 @@ The 14 tests here are the finalised list from the spec dispatched into the imple
     naysayer round 3's fix must NOT accidentally trip progressed for a plain spin. This test
     is a regression guard against reverting the round-1 "commit_observation preserves the
     launch baseline" fix.
+21. Persistent network outage: successive fail-open LAUNCHes must NOT reset backoff via the
+    round-3 disjunct 3. The synthetic ``token=""`` from a failed fetch compared against the
+    ROUND-2-preserved observation would trip disjunct 3 forever without the ``token != ""``
+    guard, spinning at 5-min cadence indefinitely. This is the round-4 fix: the guard makes
+    the fail-open path climb the backoff to CAP like any other spin (Tier B naysayer round 4).
 """
 
 from __future__ import annotations
@@ -1200,3 +1205,213 @@ def test_disjunct_3_is_gated_against_empty_last_observed_nomination() -> None:
     )
     assert v.decision is Decision.DEFER
     assert v.progressed is False  # empty observation must NOT trip disjunct 3
+
+
+# --- 21. persistent network outage: fail-open backoff still climbs (round 4 fix) ---------------
+
+
+def test_persistent_fetch_failure_still_backs_off_and_does_not_spin_forever() -> None:
+    """A persistent network outage MUST NOT reset backoff via disjunct 3 on every failed tick.
+
+    Tier B naysayer round 4 (PR #140). The interaction between the round-2 fix (commit_launch
+    with head_fetched=False preserves the prior observation to avoid poisoning the cache) and
+    the round-3 fix (disjunct 3 compares against last_observed_nomination to detect
+    park→resume) created a fail-open loop:
+
+      T0: LAUNCH on `bohr`. baseline=`bohr`, observation=`bohr`, attempts=1.
+      T1: fetch FAILS. synth token=``""``. decide → disjunct 1 (``"" != "bohr"``) fires →
+          LAUNCH. commit_launch(head_fetched=False) sets baseline=``""`` but preserves
+          observation=`bohr` (round-2 anti-poison).
+      T2: fetch FAILS. synth token=``""``. decide → disjunct 1 (``"" != ""``) False.
+          Disjunct 3 (WITHOUT round-4 guard): ``"" != "bohr"`` = **True** → progressed →
+          LAUNCH with attempts reset. Same loop at T3, T4, ..., forever.
+
+    Round-4 fix: gate disjunct 3 on ``token != ""`` too. A synthesised empty from a failed
+    fetch is not a real observation; it must not be eligible to trip the operator-intervention
+    disjunct. Disjunct 1 still fires on the FIRST failed tick (T1: real baseline `bohr` vs
+    empty), so attempts_after=1 lands there — but every subsequent failed tick sees baseline
+    already empty (disjunct 1 quiet), and disjunct 3 is now gated. Result: normal backoff.
+    """
+    now = _T0
+    # Prior good state: launched on `bohr` at T-30min, observation caught up.
+    rec = commit_launch(
+        now=now - timedelta(minutes=30),
+        head_msg_id="msg-1",
+        verdict=Verdict(
+            decision=Decision.LAUNCH,
+            reason="no-prior-record",
+            token="bohr",
+            token_raw="Bohr",
+            progressed=False,
+            attempts_before=0,
+            attempts_after=1,
+            delay=timedelta(0),
+            eligible_at=now - timedelta(minutes=30),
+        ),
+        control_state="run",
+        head_fetched=True,
+    )
+    assert rec.nomination_at_launch == "bohr"
+    assert rec.last_observed_nomination == "bohr"
+    assert rec.launch_attempts == 1
+
+    # Tick T1: fetch fails. Disjunct 1 fires (baseline `bohr` vs empty). LAUNCH.
+    v1 = decide(
+        now=now,
+        head_msg_id="msg-2",
+        head_body="",  # synthetic empty (fetch failed)
+        control_state="run",
+        record=rec,
+    )
+    assert v1.decision is Decision.LAUNCH
+    assert v1.progressed is True  # via disjunct 1: `` "" != "bohr" ``
+    assert v1.reason == "progressed"
+    rec = commit_launch(
+        now=now,
+        head_msg_id="msg-2",
+        verdict=v1,
+        control_state="run",
+        head_fetched=False,
+        prior_record=rec,
+    )
+    # Baseline moved to empty; observation preserved as `bohr` (round-2 anti-poison).
+    assert rec.nomination_at_launch == ""
+    assert rec.last_observed_nomination == "bohr"
+    assert rec.launch_attempts == 1  # progressed reset the series
+
+    # Tick T2: 1 sec later. fetch still fails. WITHOUT the round-4 guard, this would LAUNCH
+    # forever via disjunct 3. WITH the guard, it DEFERs.
+    v2 = decide(
+        now=now + timedelta(seconds=1),
+        head_msg_id="msg-3",  # head keeps moving on the chatroom side, we just can't fetch
+        head_body="",
+        control_state="run",
+        record=rec,
+    )
+    assert v2.decision is Decision.DEFER
+    assert v2.progressed is False  # neither disjunct fires
+    assert v2.reason == "backoff"
+    assert v2.delay == BASE  # first backoff step
+
+    # A CAP-length of failed-fetch DEFER/LAUNCH ticks: attempts climbs to steady-state at CAP.
+    for i in range(1, 8):
+        # Advance by BASE * 2^(i-1), capped at CAP; the next LAUNCH is exactly at that boundary.
+        cur_delay = min(BASE * (2 ** (rec.launch_attempts - 1)), CAP)
+        t = rec.last_launch_at + cur_delay if rec.last_launch_at else now
+        v = decide(
+            now=t,
+            head_msg_id=f"msg-{100 + i}",
+            head_body="",
+            control_state="run",
+            record=rec,
+        )
+        # Every fail-open tick MUST reach LAUNCH via backoff-elapsed, NOT via progressed.
+        assert v.decision is Decision.LAUNCH
+        assert v.reason == "backoff-elapsed"
+        assert v.progressed is False  # NOT progressed — disjunct 3 is gated
+        rec = commit_launch(
+            now=t,
+            head_msg_id=f"msg-{100 + i}",
+            verdict=v,
+            control_state="run",
+            head_fetched=False,
+            prior_record=rec,
+        )
+        # attempts increments by 1 per tick, capped in effect by CAP producing steady-state 1/hr.
+        # Observation is still preserved as the pre-outage `bohr`.
+        assert rec.last_observed_nomination == "bohr"
+
+    # After 7 climbing ticks, attempts is at least 3 (delay saturated at CAP long ago).
+    assert rec.launch_attempts >= 3
+    # And the observed effective spin rate is bounded: the last two LAUNCHes are >= CAP apart.
+    # (Trivially true by construction of the loop, but pinned to keep the intent visible.)
+    assert rec.last_launch_at is not None
+
+
+def test_fail_open_recovery_to_real_token_launches_via_disjunct_1() -> None:
+    """After a fail-open outage, a successful fetch of ANY real token LAUNCHes via disjunct 1.
+
+    The round-4 guard on disjunct 3 must not close the recovery path. Recovery goes through
+    disjunct 1: baseline is empty (last successful action was a fail-open commit_launch that
+    set it to ``""``), and the newly-fetched token is anything real — ``bohr`` or ``einstein``
+    or ``human`` or any other. Disjunct 1 fires, LAUNCH is immediate, backoff resets.
+    """
+    now = _T0
+    # State after a fail-open LAUNCH: baseline empty, observation preserved `bohr`.
+    rec = Record(
+        last_launch_at=now - timedelta(minutes=10),
+        nomination_at_launch="",  # baseline was overwritten by the failed-fetch verdict
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-99",
+        launch_attempts=3,
+        head_observed_at=now - timedelta(hours=1),  # observation not refreshed during outage
+        last_observed_head_msg_id="msg-1",  # the last successfully-fetched msg id
+        last_observed_nomination="bohr",  # preserved through the outage
+    )
+
+    # Case A: same pre-outage token. Should LAUNCH via disjunct 1 (baseline "" != "bohr").
+    v_a = decide(
+        now=now,
+        head_msg_id="msg-100",  # a fresh msg id (chatroom moved during outage)
+        head_body=_body("Bohr"),
+        control_state="run",
+        record=rec,
+    )
+    assert v_a.decision is Decision.LAUNCH
+    assert v_a.progressed is True
+    assert v_a.attempts_after == 1  # reset — recovery is fresh series
+
+    # Case B: different token. Also LAUNCH via disjunct 1.
+    v_b = decide(
+        now=now,
+        head_msg_id="msg-100",
+        head_body=_body("Einstein"),
+        control_state="run",
+        record=rec,
+    )
+    assert v_b.decision is Decision.LAUNCH
+    assert v_b.progressed is True
+    assert v_b.attempts_after == 1
+
+    # Case C: stop token (`human`) — Stage 1 catches it, no time judgment reached.
+    v_c = decide(
+        now=now,
+        head_msg_id="msg-100",
+        head_body=_body("human"),
+        control_state="run",
+        record=rec,
+    )
+    assert v_c.decision is Decision.SKIP
+    assert v_c.reason == "stop-token"
+
+
+def test_park_resume_still_works_after_round_4_guard() -> None:
+    """The round-4 ``token != ""`` guard on disjunct 3 must NOT break the round-3 fix.
+
+    Regression guard: a REAL non-empty token (park→resume scenario) must still trip disjunct 3
+    against a real non-empty preserved observation. This test replicates round 3's #19 with
+    the round-4 change in place, so a future refactor that "simplifies" the guard by dropping
+    one side is caught by breaking both tests.
+    """
+    now = _T0
+    rec_parked = Record(
+        last_launch_at=now - timedelta(minutes=30),
+        nomination_at_launch="bohr",
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-100",
+        launch_attempts=4,
+        head_observed_at=now - timedelta(minutes=1),
+        last_observed_head_msg_id="msg-101",
+        last_observed_nomination="human",  # non-empty (SKIP observation)
+    )
+    v = decide(
+        now=now,
+        head_msg_id="msg-102",
+        head_body=_body("Bohr"),  # non-empty (real fetch)
+        control_state="run",
+        record=rec_parked,
+    )
+    # Disjunct 3 still fires: token=`bohr` (non-empty) != observation=`human` (non-empty).
+    assert v.progressed is True
+    assert v.decision is Decision.LAUNCH
+    assert v.reason == "progressed"

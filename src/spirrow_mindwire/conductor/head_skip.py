@@ -43,15 +43,18 @@ occupied the sweep's whole throughput and *starved* the other 13 candidates behi
 4. **Progress unwinds the backoff.** ``progressed`` is ``True`` when ANY of three moves is
    detected: (a) the nomination differs from the last LAUNCH baseline
    (``nomination_at_launch``), (b) the control state differs from the last LAUNCH baseline, or
-   (c) the nomination differs from the last OBSERVATION (``last_observed_nomination`` — which
-   captures SKIPs / DEFERs, not only LAUNCHes). Disjunct (c) is what makes a **park→resume** a
-   progress event: a thread parked with ``NEXT: human`` (SKIP) and then resumed to the
-   pre-park nomination has the SAME launch baseline, but the intermediate ``human`` observation
-   is visible in ``last_observed_nomination``, so backoff is correctly reset. Head-msg-id
-   changes ALONE do NOT count as progress: two different msg-ids that both say ``NEXT: Bohr``
-   under the same control state are, for scheduling purposes, the same input. The head msg-id
-   is still recorded (``head_msg_id_at_launch``) for **audit only**; it is never consulted by
-   :func:`decide`.
+   (c) BOTH the current token AND ``last_observed_nomination`` are populated AND they differ.
+   Disjunct (c) is what makes a **park→resume** a progress event: a thread parked with
+   ``NEXT: human`` (SKIP) and then resumed to the pre-park nomination has the SAME launch
+   baseline, but the intermediate ``human`` observation is visible in
+   ``last_observed_nomination``, so backoff is correctly reset. The both-populated guard on
+   disjunct (c) prevents a persistent-network-outage loop where the fail-open synthetic
+   ``token=""`` would otherwise trip the disjunct against the preserved observation on every
+   failed-fetch tick, resetting the backoff and launching every 5 min forever (Tier B
+   naysayer round 4). Head-msg-id changes ALONE do NOT count as progress: two different
+   msg-ids that both say ``NEXT: Bohr`` under the same control state are, for scheduling
+   purposes, the same input. The head msg-id is still recorded (``head_msg_id_at_launch``)
+   for **audit only**; it is never consulted by :func:`decide`.
 
 5. **Head cache TTL** (:attr:`HEAD_CACHE_TTL`). Head-msg-id equality does not catch an *edit* to
    the existing head message (the msg id is unchanged, only its body is). To bound how long a
@@ -352,7 +355,7 @@ def decide(
     #   2. ``control_state != control_at_launch``: control routing has changed since the last
     #      LAUNCH — a hold-then-run transition, for example, routes a naysayer→implementer
     #      handoff differently.
-    #   3. ``last_observed_nomination`` is populated AND ``token`` differs from it: the
+    #   3. BOTH ``token`` and ``last_observed_nomination`` are populated AND they differ: the
     #      nomination has changed since the last OBSERVATION (which includes SKIPs and DEFERs,
     #      not only LAUNCHes). This is the park→resume detector (Tier B naysayer round 3, PR
     #      #140): if a spinning thread on ``NEXT: bohr`` is parked by an operator posting
@@ -363,11 +366,22 @@ def decide(
     #      intervention would be invisible and the resumed thread would eat the remainder of
     #      the pre-park backoff (up to CAP = 60 min).
     #
-    #      The ``last_observed_nomination != ""`` guard keeps disjunct 3 quiet when there is no
-    #      observation to compare against — either a hand-constructed record in a test or a
-    #      never-actually-observed thread (a fresh-record fail-open LAUNCH commits an empty
-    #      observation; a later successful fetch tripping this would double-count with disjunct
-    #      1, which already fires from the empty baseline). Empty-vs-empty is not progress.
+    #      BOTH empty-guards are load-bearing:
+    #      - ``last_observed_nomination != ""``: no observation to compare against — a hand-
+    #        constructed test record or a never-actually-observed thread. Empty-vs-something
+    #        is not progress; disjunct 1 already fires when it should (empty baseline vs a real
+    #        token = fail-open recovery).
+    #      - ``token != ""``: **this is the Tier B naysayer round-4 fix.** On a persistent
+    #        network outage, ``commit_launch(head_fetched=False)`` preserves the prior
+    #        observation (the round-2 anti-poisoning rule) while ``decide()`` sees a
+    #        synthesised empty ``token`` from the failed fetch. Without this guard, disjunct 3
+    #        would then read ``"" != <preserved observation>`` = True on every subsequent
+    #        failed-fetch tick, reset the backoff to 0, and launch every 5 min forever —
+    #        exactly the degenerate loop the module was written to prevent. Requiring
+    #        ``token != ""`` recognises that a fail-open synthetic empty is not a real
+    #        observation of movement and therefore is not eligible to trip disjunct 3. Disjunct
+    #        1 still catches the genuine "fail-open recovery" case (a successful fetch of a
+    #        real token against the empty baseline committed at the last fail-open LAUNCH).
     #
     # Head msg-id is deliberately NOT read here — the spec-degeneracy failure was precisely a
     # moving head with unchanged nomination+control, and trusting head msg-id would reintroduce
@@ -375,7 +389,11 @@ def decide(
     progressed = (
         token != record.nomination_at_launch
         or control_state != record.control_at_launch
-        or (record.last_observed_nomination != "" and token != record.last_observed_nomination)
+        or (
+            token != ""
+            and record.last_observed_nomination != ""
+            and token != record.last_observed_nomination
+        )
     )
 
     attempts_before = record.launch_attempts
