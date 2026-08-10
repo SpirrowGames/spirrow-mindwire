@@ -35,7 +35,8 @@ function Write-Log { param([string]$Message) }
 $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
-                  'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest') {
+                  'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
+                  'Get-SystemicAlertSignature') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -64,6 +65,29 @@ Check "7d exactly -> stale" 'stale' `
     (Get-DerivedQuarantineState -FirstFailureAt $now.AddDays(-7) -Now $now)
 Check "10d -> stale" 'stale' `
     (Get-DerivedQuarantineState -FirstFailureAt $now.AddDays(-10) -Now $now)
+
+Write-Host "Get-FingerprintHint — survives a JSON round-trip (PSCustomObject, not hashtable)"
+# THE regression this section exists to prevent: the moment quarantine.json is written and read
+# back, ConvertFrom-Json parses the nested `failure_fingerprint` object into a PSCustomObject, NOT
+# a hashtable. A `[hashtable]$Fingerprint` parameter throws "Cannot process argument transformation"
+# on that value, taking the daily digest — and the whole sweep — down with it. Untyped $Fingerprint
+# duck-types on both shapes; this test locks that in.
+$fpPSObj = [pscustomobject]@{ head = 'msg-1'; control = 'run' }
+Check "PSCustomObject fingerprint: head change reported" '新規メッセージあり (head 変化)' `
+    (Get-FingerprintHint -Fingerprint $fpPSObj -CurrentHead 'msg-2' -CurrentControl 'run')
+Check "PSCustomObject fingerprint: nothing changed -> no hint" $null `
+    (Get-FingerprintHint -Fingerprint $fpPSObj -CurrentHead 'msg-1' -CurrentControl 'run')
+# Actually round-trip a whole quarantine record through ConvertTo-Json / ConvertFrom-Json to prove
+# the shape a real live sweep sees on any tick after the failure tick. This is what the previous
+# tests missed: they built @{} native hashtables directly and bypassed the serialization cycle.
+$fake = @{
+    state = 'quarantined'
+    failure_fingerprint = @{ head = 'msg-100'; control = 'run' }
+}
+$roundTripped = ($fake | ConvertTo-Json -Depth 5) | ConvertFrom-Json
+Check "round-tripped: hint still returned on head change" '新規メッセージあり (head 変化)' `
+    (Get-FingerprintHint -Fingerprint $roundTripped.failure_fingerprint `
+                         -CurrentHead 'msg-101' -CurrentControl 'run')
 
 Write-Host "Get-FingerprintHint — names ONLY what the runner observes, never 'input changed'"
 # Only head moved.
@@ -194,6 +218,51 @@ Check "digest carries the stale wording change" $true ($digest -match '直すか
 Check "escalated entry carries the head-change hint" $true ($digest -match 'T-escalated.*新規メッセージあり')
 Check "fresh entry has NO hint (nothing changed)" $true ($digest -notmatch 'T-fresh.*新規メッセージあり')
 Check "digest never uses the deleted 'input changed' wording (§4)" $true ($digest -notmatch '入力変化')
+
+Write-Host "New-DailyDigest — survives a real quarantine.json round-trip"
+# The failure path the previous test suite did not exercise: build a quarantine map the way the
+# sweep sees it on any tick AFTER the failure tick, i.e. with PSCustomObject values. Without the
+# Get-FingerprintHint type fix, this throws before New-DailyDigest even returns; with the fix, the
+# digest is rendered normally.
+$live_rt = @('p/T-rt-fresh', 'p/T-rt-old')
+$q_rt = @{}
+foreach ($pair in @(
+    @{ key = 'p/T-rt-fresh'; ageH = 1;  head = 'msg-a'; ctrl = 'run' }
+    @{ key = 'p/T-rt-old';   ageH = 30; head = 'msg-b'; ctrl = 'run' }
+)) {
+    $native = @{
+        state = 'quarantined'
+        first_failure_at = $now.AddHours(-$pair.ageH).ToString('o')
+        failure_fingerprint = @{ head = $pair.head; control = $pair.ctrl }
+    }
+    # ConvertFrom-Json returns PSCustomObject values, EXACTLY like Get-JsonState's output on read.
+    $q_rt[$pair.key] = ($native | ConvertTo-Json -Depth 5) | ConvertFrom-Json
+}
+$digest_rt = New-DailyDigest -QuarantineState $q_rt -EvaluatedState @{} `
+    -HeadsByProject @{ p = @{ 'T-rt-fresh' = 'msg-a'; 'T-rt-old' = 'msg-b2' } } `
+    -ControlByProject @{ p = [pscustomobject]@{ desired_state = 'run' } } `
+    -Now $now -LiveKeys $live_rt
+Check "round-tripped digest renders without throwing" $true ($digest_rt.Length -gt 0)
+Check "round-tripped digest surfaces the escalated entry" $true ($digest_rt -match 'T-rt-old')
+Check "round-tripped digest picks up the head-change hint from a PSCustomObject" $true `
+    ($digest_rt -match 'T-rt-old.*新規メッセージあり')
+
+Write-Host "Get-SystemicAlertSignature — day-bucketed, so an ongoing wave alerts ONCE per day"
+# The failure this dedup key exists to prevent: during a real systemic outage, tick T fills K=2 and
+# stops; tick T+5min hits K=2 again on the next 2 candidates; and so on. A tick-timestamp signature
+# defeats dedup entirely and floods Discord every 5 minutes. Bucketing on the UTC day keeps the
+# alert at once per day of the wave, then silent — with re-arm on the next day.
+$day1_t1 = [datetime]::Parse('2026-08-11T00:05:00Z').ToUniversalTime()
+$day1_t2 = [datetime]::Parse('2026-08-11T23:55:00Z').ToUniversalTime()
+$day2    = [datetime]::Parse('2026-08-12T00:05:00Z').ToUniversalTime()
+Check "same UTC day, different ticks -> SAME signature (dedup wins)" $true `
+    ((Get-SystemicAlertSignature -Now $day1_t1 -Count 2) -eq (Get-SystemicAlertSignature -Now $day1_t2 -Count 2))
+Check "next UTC day -> DIFFERENT signature (alert re-arms)" $false `
+    ((Get-SystemicAlertSignature -Now $day1_t1 -Count 2) -eq (Get-SystemicAlertSignature -Now $day2 -Count 2))
+# The count is included so if a future edit changes K the operator gets one fresh alert on the day
+# the new budget first bites. Not strictly required by the fix, but cheap insurance.
+Check "signature does NOT carry the wall-clock time (no HH:mm)" $false `
+    ((Get-SystemicAlertSignature -Now $day1_t1 -Count 2) -match ':\d\d:\d\d')
 
 Write-Host "New-DailyDigest — starvation section is pivoted on LIVE keys"
 # Same scenario as the Get-StarvedKeys checks: three live candidates, one launched-old, one

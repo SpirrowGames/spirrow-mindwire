@@ -333,9 +333,16 @@ function Get-DerivedQuarantineState {
 # in the abstract. The wider claim would silently over-promise coverage the fingerprint does not
 # have (spec/msg-814 §1, §4). No claim is a legitimate outcome and it means: no head movement and
 # no control change — not "not fixed."
+#
+# $Fingerprint is DELIBERATELY untyped. On the tick a failure occurs it is a native `hashtable`
+# (from New-QuarantineRecord). On every subsequent tick the record is round-tripped through
+# quarantine.json — ConvertFrom-Json parses nested objects into PSCustomObject, NOT hashtable, so a
+# `[hashtable]$Fingerprint` parameter would throw a terminating "Cannot process argument
+# transformation" the moment the daily digest touches an existing quarantine record. Untyped works
+# for both because dot-notation duck-types on either shape. (Tier B naysayer, PR #138 round 2.)
 function Get-FingerprintHint {
     param(
-        [hashtable]$Fingerprint,
+        $Fingerprint,
         [string]$CurrentHead,
         [string]$CurrentControl
     )
@@ -371,6 +378,20 @@ function Format-DurationDigest {
         return "${hours}h"
     }
     return "${minutes}m"
+}
+
+# The signature Send-NotificationIfChanged uses to dedup the K-budget "systemic cause suspected"
+# alert. Bucketed on the UTC date, NOT on the tick timestamp, because the failure this de-noise
+# addresses is not "same tick, twice" (impossible — the sweep breaks at K) but "adjacent ticks,
+# same underlying wave": during a real systemic outage, tick T fills its K=2 budget and stops; tick
+# T+5min skips the first 2 quarantined threads, fails the next 2, and hits the budget again — and
+# every one of the next 288 ticks does the same. A per-tick timestamp defeats the dedup and turns
+# the day into a Discord flood; a per-day bucket fires ONCE per day of an ongoing wave, then falls
+# silent. If the wave clears and returns days later, the day bucket has moved and the alert re-arms.
+# (Tier B naysayer, PR #138 round 2.)
+function Get-SystemicAlertSignature {
+    param([datetime]$Now, [int]$Count)
+    return "$($Now.ToUniversalTime().ToString('yyyy-MM-dd')):$Count"
 }
 
 # Build the daily digest string. Sent even when both lists are empty — a silent day IS the point,
@@ -1076,8 +1097,12 @@ try {
             # design refuses. The sweep breaks and fires a systemic-cause notification.
             if ($newlyQuarantined -ge $QuarantineFailureBudget) {
                 Write-Log "quarantine budget K=$QuarantineFailureBudget hit in one sweep — stopping (systemic cause suspected)"
+                # Day-bucketed signature (see Get-SystemicAlertSignature): one alert per UTC day of
+                # an ongoing systemic wave, then silence. A tick-level timestamp here spammed every
+                # 5 minutes — exactly the "retraining the channel into noise" mode this file avoids
+                # elsewhere.
                 Send-NotificationIfChanged -State $notifyState -Key "__quarantine_systemic__" `
-                    -Signature "${nowIso}:${newlyQuarantined}" `
+                    -Signature (Get-SystemicAlertSignature -Now $nowUtc -Count $newlyQuarantined) `
                     -Message ("MindWire: 同一 sweep で K=$QuarantineFailureBudget 件の quarantine が発生しました。" +
                               "systemic な原因の可能性が高いため、この tick を打ち切ります。" +
                               "残候補はスキップ (`not-reached`) 扱いで飢餓計測に載ります。")
