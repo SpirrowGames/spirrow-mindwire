@@ -488,6 +488,18 @@ frequency is the signal, `-Reason` is the payload). Clearing also drops the `hea
 the thread, so the next tick launches instead of head-skipping to the same head that was
 quarantined under.
 
+**Running Clear-Quarantine while the sweep is running is safe.** A single tick reads its state
+files once at start and holds them in memory for the whole run (measured minutes on a real
+AI-driven candidate). Without care, that stale in-memory map would silently overwrite the
+operator's disk write at end-of-tick and resurrect the entry — the sort of failure the whole
+quarantine story exists to end. So the sweep uses **merge-on-write**: at flush time it re-reads
+`quarantine.json` and `heads.json` from disk, and any key the operator removed during the tick
+stays removed. New adds from the sweep still land, age-driven state transitions still land; only
+operator-cleared entries survive the merge. This narrows the race from "the whole tick" to
+"between the re-read and the write" (sub-millisecond). Closing that residual window would take a
+file lock, and a multi-minute sweep holding a lock would block the operator for that entire time,
+defeating the point of a human-operable clear.
+
 ## Human-handoff notifications
 
 When the loop parks on a human it has, by construction, nothing left to do until someone acts — so

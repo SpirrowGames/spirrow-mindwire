@@ -175,6 +175,56 @@ function Save-JsonState {
     [System.IO.File]::WriteAllText($Path, ($State | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# Merge-on-write: re-read the file just before writing and preserve any keys the operator removed
+# during the tick. Used for state files where BOTH the sweep and an external tool (Clear-Quarantine)
+# may write during a sweep run — quarantine.json and heads.json.
+#
+# WHY IT EXISTS. A tick reads its state files once at start and holds them in memory for the whole
+# sweep (measured minutes on a real AI-driven candidate). If an operator runs Clear-Quarantine
+# midway through, their script perfectly removes the entry from disk — but a few minutes later, the
+# sweep flushes its stale in-memory map back to disk and RESURRECTS the entry. The operator's
+# action is silently destroyed, the thread stays skipped, and the whole point of "clearing is a
+# human act" collapses. (Tier B naysayer, PR #138 round 3.)
+#
+# The fix narrows the race from "the entire tick duration" (minutes) to "the gap between the
+# re-read and the write" (sub-millisecond). Closing that residual window fully would require a
+# real file lock, which is not a good trade because a multi-minute sweep holding a lock blocks
+# every operator action for that entire time — and the whole reason the operator has this button
+# is that a human's turnaround is measured in seconds. Narrowing to sub-ms IS the operational fix.
+#
+# MERGE POLICY:
+#   - Every key currently on disk that the sweep did not touch is kept from disk. This is why the
+#     merge starts by copying the current disk state in full.
+#   - For every key the sweep TOUCHED IN MEMORY:
+#       * if it was present at sweep START (in $OriginalKeys) AND is still present on disk after
+#         re-read → the sweep's in-memory version wins (age-driven state transitions, updates);
+#       * if it was present at sweep START but NOT on disk after re-read → the operator removed it
+#         during the sweep — DO NOT resurrect. This IS the operator-clear-survives contract;
+#       * if it was NOT present at sweep start → it is a new add this tick, write through.
+#         Only the sweep adds keys to these two files, so this branch is not contested.
+function Merge-StateForWrite {
+    param(
+        [hashtable]$Memory,
+        [string[]]$OriginalKeys,
+        [string]$DiskPath
+    )
+    $current = Get-JsonState -Path $DiskPath
+    $out = @{}
+    foreach ($k in @($current.Keys)) { $out[$k] = $current[$k] }
+    foreach ($k in @($Memory.Keys)) {
+        $wasOriginal = ($OriginalKeys -contains $k)
+        if ($wasOriginal) {
+            # Present at sweep start. Respect an operator removal; otherwise apply our updates.
+            if ($current.ContainsKey($k)) { $out[$k] = $Memory[$k] }
+        }
+        else {
+            # New this tick — the sweep added it. Nothing external adds to these files.
+            $out[$k] = $Memory[$k]
+        }
+    }
+    return $out
+}
+
 # --- head-state records ---------------------------------------------------------------------------
 # A head record is @{ head; control } — the message id the conductor last reported for a thread, AND
 # the project control state it reported it under. Both are needed to decide a skip; see Test-CanSkip.
@@ -884,6 +934,12 @@ try {
     $quarantineState = Get-JsonState -Path $quarantineStatePath
     $evaluatedState = Get-JsonState -Path $evaluatedStatePath
     $digestState = Get-JsonState -Path $digestStatePath
+    # Snapshot the keys present at sweep start. Used by Merge-StateForWrite at flush time to
+    # distinguish "operator removed this during the sweep" (must not resurrect) from "sweep never
+    # touched this" (already-agreed value, keep). See Merge-StateForWrite's header for the full
+    # contract.
+    $quarantineOriginalKeys = @($quarantineState.Keys)
+    $headsOriginalKeys = @($headsState.Keys)
     $nowUtc = [DateTime]::UtcNow
 
     # Age-driven state transitions on quarantine entries. Run BEFORE the candidate loop so the
@@ -1162,8 +1218,17 @@ try {
     }
     Write-Log ("dispositions: " + (($dispositions.Keys | Sort-Object | ForEach-Object { "$($_)=$($dispositions[$_])" }) -join ', '))
 
-    Save-JsonState -Path $headsStatePath -State $headsState
-    Save-JsonState -Path $quarantineStatePath -State $quarantineState
+    # Merge-on-write for the two files an operator may edit concurrently (heads.json and
+    # quarantine.json). The merge re-reads disk right before writing, so a mid-sweep
+    # Clear-Quarantine survives the sweep's end-of-tick flush. See Merge-StateForWrite's header.
+    # evaluated.json is written directly — it has no external writer, and the sweep prunes ex-live
+    # keys on it every tick (merge-on-write would resurrect those pruned keys from disk).
+    $mergedHeads = Merge-StateForWrite -Memory $headsState `
+        -OriginalKeys $headsOriginalKeys -DiskPath $headsStatePath
+    Save-JsonState -Path $headsStatePath -State $mergedHeads
+    $mergedQuarantine = Merge-StateForWrite -Memory $quarantineState `
+        -OriginalKeys $quarantineOriginalKeys -DiskPath $quarantineStatePath
+    Save-JsonState -Path $quarantineStatePath -State $mergedQuarantine
     Save-JsonState -Path $evaluatedStatePath -State $evaluatedState
 
     # Starvation report. Included in the log every tick that logs anything (an idle tick still

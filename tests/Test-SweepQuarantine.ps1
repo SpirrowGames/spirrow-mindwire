@@ -36,7 +36,8 @@ $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
                   'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
-                  'Get-SystemicAlertSignature') {
+                  'Get-SystemicAlertSignature', 'Merge-StateForWrite', 'Get-JsonState',
+                  'Save-JsonState') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -291,6 +292,90 @@ Check "starvation section excludes a brand-new live thread absent from state" $t
 # day forever. This check IS the regression guard for the failure mode the PR-gate review named.
 Check "starvation section excludes an ex-live thread (state file only)" $true `
     ($digest2 -notmatch 'p/T-ex-live')
+
+Write-Host "Merge-StateForWrite — a mid-sweep operator clear must NOT be resurrected"
+# The TOCTOU concern the PR-gate flagged: sweep reads state at T=0, holds it for minutes, operator
+# clears an entry at T=1min (real disk write), sweep flushes at T=3min. Without merge-on-write,
+# the operator's clear is silently overwritten because the sweep writes its stale in-memory map
+# unconditionally. The merge helper re-reads disk at flush time and respects operator removals.
+function New-MergeFixture {
+    # Real temp file, because Merge-StateForWrite calls Get-JsonState which reads from disk.
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ("mindwire-merge-" + [guid]::NewGuid().ToString('N') + ".json")
+    return $path
+}
+
+# Case A: sweep reads {A,B}; operator clears A mid-sweep (disk now {B}); sweep tries to write
+# {A,B}. Merge must produce {B} — A stays gone.
+$path = New-MergeFixture
+try {
+    Save-JsonState -Path $path -State @{ A = @{ x=1 }; B = @{ x=2 } }
+    $originalKeys = @('A', 'B')
+    # Operator clears A on disk mid-sweep.
+    Save-JsonState -Path $path -State @{ B = @{ x=2 } }
+    # Sweep's in-memory state still has both.
+    $memory = @{ A = @{ x=1 }; B = @{ x=2 } }
+    $merged = Merge-StateForWrite -Memory $memory -OriginalKeys $originalKeys -DiskPath $path
+    Check "operator clear survives: A dropped" $false ($merged.ContainsKey('A'))
+    Check "operator clear survives: B kept" $true ($merged.ContainsKey('B'))
+}
+finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
+
+# Case B: sweep reads {A}; operator does NOT clear; sweep updates A's state and adds new C. Merge
+# must produce {A(updated), C} — no losses, no resurrections.
+$path = New-MergeFixture
+try {
+    Save-JsonState -Path $path -State @{ A = @{ state='quarantined' } }
+    $originalKeys = @('A')
+    # No operator action. Disk unchanged.
+    $memory = @{ A = @{ state='escalated' }; C = @{ state='quarantined' } }
+    $merged = Merge-StateForWrite -Memory $memory -OriginalKeys $originalKeys -DiskPath $path
+    Check "sweep update to A applied (quarantined -> escalated)" 'escalated' $merged['A'].state
+    Check "sweep add of C written through" $true ($merged.ContainsKey('C'))
+    Check "no ghost keys" 2 $merged.Keys.Count
+}
+finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
+
+# Case C: sweep reads {A,B}; operator clears A AND sweep adds C this tick. Result: {B,C}.
+# The single test that proves the merge respects the operator AND still writes new adds.
+$path = New-MergeFixture
+try {
+    Save-JsonState -Path $path -State @{ A = @{ x=1 }; B = @{ x=2 } }
+    $originalKeys = @('A', 'B')
+    # Operator clears A.
+    Save-JsonState -Path $path -State @{ B = @{ x=2 } }
+    # Sweep adds C in memory (and still thinks it has A).
+    $memory = @{ A = @{ x=1 }; B = @{ x=2 }; C = @{ x=3 } }
+    $merged = Merge-StateForWrite -Memory $memory -OriginalKeys $originalKeys -DiskPath $path
+    Check "combined: operator's A drop survives" $false ($merged.ContainsKey('A'))
+    Check "combined: B still present" $true ($merged.ContainsKey('B'))
+    Check "combined: sweep's new C written through" $true ($merged.ContainsKey('C'))
+}
+finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
+
+# Case D: empty starting disk, sweep adds A. Merge must produce {A}. Straight-through add path.
+$path = New-MergeFixture
+try {
+    # File does not exist yet. Get-JsonState returns @{}.
+    $originalKeys = @()
+    $memory = @{ A = @{ x=1 } }
+    $merged = Merge-StateForWrite -Memory $memory -OriginalKeys $originalKeys -DiskPath $path
+    Check "fresh add on empty disk written through" $true ($merged.ContainsKey('A'))
+}
+finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
+
+# Case E: operator ADDS a key mid-sweep (not a real path for either file today, but the merge
+# should still handle it gracefully — keep the operator's add). Cheap insurance against a future
+# writer being added without noticing this contract.
+$path = New-MergeFixture
+try {
+    Save-JsonState -Path $path -State @{ A = @{ x=1 } }
+    $originalKeys = @('A')
+    Save-JsonState -Path $path -State @{ A = @{ x=1 }; OP_ADDED = @{ y=99 } }
+    $memory = @{ A = @{ x=1 } }
+    $merged = Merge-StateForWrite -Memory $memory -OriginalKeys $originalKeys -DiskPath $path
+    Check "operator-added key survives the sweep flush" $true ($merged.ContainsKey('OP_ADDED'))
+}
+finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
 
 Write-Host ""
 if ($script:failures -gt 0) {
