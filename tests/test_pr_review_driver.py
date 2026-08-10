@@ -177,7 +177,10 @@ async def test_skip_if_head_unchanged_reuses_prior_verdict_without_lexora() -> N
 
 @pytest.mark.anyio
 async def test_skip_if_head_unchanged_does_not_skip_when_head_moved() -> None:
-    # The prior naysayer review was against a different commit → a full review runs.
+    # The prior naysayer review was against a different commit → a full review runs. Under the
+    # A-3 two-pass structure this means TWO Lexora calls (pass 1 = verdict, pass 2 = ADR pointer
+    # collection), so we assert the full-review branch was taken (>= 1 call), not the "exactly
+    # one call" ordinal — the driver runs pass 1 + pass 2 in parallel on the full-review branch.
     lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
     github = _FakeGitHub(
         ci=CiStatus(CiState.SUCCESS, "newsha", []),
@@ -189,7 +192,7 @@ async def test_skip_if_head_unchanged_does_not_skip_when_head_moved() -> None:
     driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
     outcome = await driver.review(_pr(), post_critique=post)
 
-    assert len(lexora.calls) == 1  # head moved → full review
+    assert lexora.calls != []  # head moved → full review (2-pass, so >= 1 call)
     assert outcome.skipped_head_unchanged is False
 
 
@@ -235,7 +238,7 @@ async def test_debounce_counts_only_naysayer_login() -> None:
     )
     outcome = await driver.review(_pr(), post_critique=post)
 
-    assert len(lexora.calls) == 1  # no naysayer-owned reviews → full review
+    assert lexora.calls != []  # no naysayer-owned reviews → full review (2-pass, so >= 1 call)
     assert outcome.skipped_head_unchanged is False
     assert outcome.rounds_capped is False
 
@@ -259,8 +262,9 @@ async def test_round_cap_counts_only_verdict_reviews() -> None:
     driver = NaysayerPrReviewDriver(lexora=lexora, github=github, max_review_rounds=2)
     outcome = await driver.review(_pr(), post_critique=post)
 
-    # Only 1 verdict review (CHANGES_REQUESTED) < cap 2 → NOT capped; a full review runs.
-    assert len(lexora.calls) == 1
+    # Only 1 verdict review (CHANGES_REQUESTED) < cap 2 → NOT capped; a full review runs
+    # (2-pass, so >= 1 Lexora call).
+    assert lexora.calls != []
     assert outcome.rounds_capped is False
 
 
@@ -281,7 +285,7 @@ async def test_shadow_mode_measures_skip_without_acting() -> None:
     )
     outcome = await driver.review(_pr(), post_critique=post)
 
-    assert len(lexora.calls) == 1  # full review ran (NOT skipped)
+    assert lexora.calls != []  # full review ran (NOT skipped) — 2-pass, so >= 1 call
     assert outcome.would_skip_head_unchanged is True
     assert outcome.skipped_head_unchanged is False
 
@@ -302,7 +306,7 @@ async def test_shadow_mode_measures_cap_without_acting() -> None:
     driver = NaysayerPrReviewDriver(lexora=lexora, github=github, max_review_rounds=2, shadow=True)
     outcome = await driver.review(_pr(), post_critique=post)
 
-    assert len(lexora.calls) == 1  # full review ran (NOT capped)
+    assert lexora.calls != []  # full review ran (NOT capped) — 2-pass, so >= 1 call
     assert outcome.would_cap is True
     assert outcome.rounds_capped is False
     assert [event for _, event, _ in github.submitted] == [ReviewEvent.APPROVE]
@@ -333,7 +337,7 @@ async def test_shadow_skip_takes_precedence_over_cap() -> None:
 
     assert outcome.would_skip_head_unchanged is True  # skip wins
     assert outcome.would_cap is False  # NOT also counted (no double-count)
-    assert len(lexora.calls) == 1  # shadow: the full review still runs
+    assert lexora.calls != []  # shadow: the full review still runs (2-pass, so >= 1 call)
 
 
 @pytest.mark.anyio
@@ -359,11 +363,19 @@ async def test_ambiguous_verdict_defaults_to_request_changes() -> None:
 
 @pytest.mark.anyio
 async def test_lexora_called_with_naysayer_tier_and_budget() -> None:
+    # Pass 1 (the verdict pass) uses the reasoning-model tier + budget. Pass 2 (ADR-pointer
+    # collection, added by the A-3 two-pass design) also calls "naysayer" but with a smaller
+    # budget — we assert on the pass-1 call which is the one whose budget matters for the
+    # verdict-side reasoning.
     lexora = _FakeLexora()
     _posted, post = _capture()
     driver = NaysayerPrReviewDriver(lexora=lexora, github=_FakeGitHub())
     await driver.review(_pr(), post_critique=post)
-    model, _messages, max_tokens = lexora.calls[0]
+    # Locate the pass-1 call — it is the one with the larger max_tokens budget (pass 2 is
+    # small-JSON only). Deterministic even under parallel gather because we key on budget,
+    # not order.
+    pass_1 = max(lexora.calls, key=lambda call: call[2])
+    model, _messages, max_tokens = pass_1
     assert model == "naysayer"
     assert max_tokens >= 8000  # reasoning-model floor (4096 truncated the critique)
 
@@ -371,12 +383,16 @@ async def test_lexora_called_with_naysayer_tier_and_budget() -> None:
 @pytest.mark.anyio
 async def test_lexora_system_message_injects_principles_preamble() -> None:
     # ADR-17 D-1 / ADR-19 single judging-behavior core: the PR-gate injects the 5-principles SOT
-    # verbatim via the SAME build_preamble() entry point the design-time agent uses.
+    # verbatim via the SAME build_preamble() entry point the design-time agent uses. Under the
+    # A-3 two-pass structure BOTH passes carry the preamble (pass 2 is index-injected too and
+    # still needs the principles). We assert on the pass-1 (verdict) call since it carries the
+    # ``VERDICT: APPROVE`` task instructions.
     lexora = _FakeLexora()
     _posted, post = _capture()
     driver = NaysayerPrReviewDriver(lexora=lexora, github=_FakeGitHub())
     await driver.review(_pr(), post_critique=post)
-    _model, messages, _max = lexora.calls[0]
+    # Pass 1 has the largest max_tokens budget (see other tests) — key on that for stability.
+    _model, messages, _max = max(lexora.calls, key=lambda call: call[2])
     assert messages[0].role == "system"
     system = messages[0].content
     assert build_preamble() in system  # whole SOT, verbatim
@@ -504,7 +520,11 @@ async def test_lexora_timeout_degrades_to_request_changes_not_raise() -> None:
 
     outcome = await driver.review(_pr(), post_critique=post)
 
-    assert lexora.calls != []  # the model WAS consulted (CI was green) — it timed out
+    # The model WAS consulted (CI was green) — it timed out. Under the A-3 two-pass structure
+    # both pass 1 (the verdict) and pass 2 (the ADR-pointer collection) go through the same fake,
+    # so both raise; the driver takes the degrade path from pass 1's timeout and pass 2's
+    # exception is caught into an ``unavailable(call-failed)`` selection (fail-open, msg-694 §3-3).
+    assert lexora.calls != []
     assert len(posted) == 1  # explanatory critique posted to the thread
     # The body is generic about the timeout (no specific seconds number): a DI'd Lexora may carry a
     # different timeout than the driver default, so the body must not assert a concrete value.

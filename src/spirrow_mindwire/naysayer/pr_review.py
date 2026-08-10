@@ -14,25 +14,39 @@ What stays in **code** (the driver), not the LLM (D-7 / ADR-16):
 2. the **injection-safe verdict parsing** (last standalone ``VERDICT:`` line; never APPROVE on a
    truncated / length-capped review);
 3. the **T22 GitHub-review submission** as the separate ``spirrowgames-ops`` identity, with the
-   same-identity 422 → COMMENT fallback.
+   same-identity 422 → COMMENT fallback;
+4. the **A-3 two-pass ADR-pointer structure** (spec-thread ``T-pr-gate-adr-index-scope``
+   msg-692..705): pass 1 = index-less verdict pass (unchanged behaviour, sole source of the
+   ``VERDICT:`` line); pass 2 = index-injected, JSON-only ADR-pointer collection whose output is
+   rendered as a NON-BLOCKING hints section and cannot alter the verdict. The verdict-safety of
+   pass 2 is a structural invariant, not a prompt guardrail — the driver never reads a verdict
+   token from pass-2's return value (msg-692 §2). All definitions of ``pointer`` / ``N`` / ``p``
+   / ``d`` / marker / target-driver live in :mod:`.pr_review_adr_pointers`, not in chat history
+   (Einstein condition, spec msg-822).
 
-Only the adversarial *judgement* is delegated — to Lexora's ``naysayer`` (Gemini) tier via a
-**one-shot** ``chat_completion`` (``transport != judge``: spinning up an Agent SDK loop to read a
-static diff would be YAGNI — msg-430/432). The 5-principles SOT is injected verbatim via the SAME
+Only the adversarial *judgement* is delegated — to Lexora's ``naysayer`` (Gemini) tier via
+**one-shot** ``chat_completion`` calls (``transport != judge``: spinning up an Agent SDK loop to
+read a static diff would be YAGNI — msg-430/432; calling ``chat_completion`` TWICE in parallel is
+transport, not an Agent loop). The 5-principles SOT is injected verbatim via the SAME
 :func:`~spirrow_mindwire.naysayer.principles.build_preamble` entry point the design-time agent
 uses (ADR-17 D-1) — that single judging-behavior core unifies the two surfaces; the transport is
 optimised per surface.
 
-Fail modes (ADR-07 §2.6, fail-closed): Lexora **or** GitHub unreachable → the call raises (the
-caller fail-loud); an empty Lexora reply is likewise fail-loud.
+Fail modes (ADR-07 §2.6, fail-closed): Lexora **or** GitHub unreachable on pass 1 → the call
+raises (the caller fail-loud); an empty pass-1 Lexora reply is likewise fail-loud. Pass 2 is
+fail-OPEN (msg-694 §3-3): any failure (timeout / HTTP error / cancellation / parse-fail /
+oversize) collapses to ``ADR-INDEX: unavailable`` on the marker so pass 1's verdict + posting +
+GitHub submission never depend on pass 2 succeeding.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from ..github.client import (
     CiState,
@@ -52,7 +66,17 @@ from ..lexora.client import (
     LexoraClient,
     LexoraTimeoutError,
 )
-from .principles import NAYSAYER_MODEL_TIER, build_preamble, principles_version
+from .pr_review_adr_pointers import (
+    AdrPointerSelection,
+    append_marker,
+    available_log_line,
+    build_pr_review_pass1_system_prompt,
+    build_pr_review_pass2_messages,
+    load_manifest_ids,
+    select_adr_pointers,
+    unavailable_log_line,
+)
+from .principles import NAYSAYER_MODEL_TIER, principles_version
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +176,14 @@ class PrReviewOutcome:
     rounds_capped: bool = False  # debounce: review-round cap hit → COMMENT escalation to human
     would_skip_head_unchanged: bool = False  # shadow: would-skip (head unchanged), measured
     would_cap: bool = False  # shadow: would-cap (cap hit), measured not acted
+    # Pass-2 outcome (A-3 two-pass structure). Always set on every path that renders a
+    # body (including CI-gate, debounce, timeout-degrade), so a caller inspecting the
+    # outcome can locate the marker's ``pointers=<p>, dropped=<d>`` counters even when
+    # the body was rendered by a short-circuit path. ``None`` iff the driver never
+    # attempted pass 2 (e.g. a short-circuit path where the marker is stamped as
+    # ``unavailable`` via a pre-built selection; see the code paths that use
+    # :func:`_unavailable_selection`).
+    adr_pointer_selection: AdrPointerSelection | None = None
 
 
 def _parse_verdict(critique: str) -> ReviewEvent:
@@ -206,14 +238,24 @@ def _ci_gate_response(ci: CiStatus, pr_slug: str) -> tuple[ReviewEvent, str]:
     )
 
 
-def _build_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
+def _truncate_diff(diff: str) -> str:
     if len(diff) > _MAX_DIFF_CHARS:
-        diff = diff[:_MAX_DIFF_CHARS] + "\n\n[diff truncated]"
-    # ADR-17 D-1: the 5-principles SOT is injected verbatim via the SAME single entry point
-    # (``build_preamble()``) the design-time agent uses, so a one-place edit to
-    # ``spec/NAYSAYER_PRINCIPLES.md`` propagates to BOTH surfaces and the principles are never
-    # restated as a prompt literal here (fail-loud: a missing/blank SOT raises).
-    system = f"{build_preamble()}\n\n{_PR_REVIEW_SYSTEM_PROMPT}"
+        return diff[:_MAX_DIFF_CHARS] + "\n\n[diff truncated]"
+    return diff
+
+
+def _build_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
+    """Pass-1 (verdict) messages — the SINGLE entry point for the pass-1 system prompt.
+
+    Tests import this to construct the exact system message the driver sends, so any
+    later drift between "what the test asserts on" and "what the driver actually sends"
+    fails a test (T1 anti-tautology). ADR-17 D-1: the 5-principles SOT is injected
+    verbatim via ``build_preamble()`` in the same single entry point the design-time
+    agent uses, so a one-place edit to ``spec/NAYSAYER_PRINCIPLES.md`` propagates to
+    both surfaces (fail-loud: a missing/blank SOT raises).
+    """
+    diff = _truncate_diff(diff)
+    system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
         f"specific hunks you object to, and end with your VERDICT line.\n\n"
@@ -223,6 +265,71 @@ def _build_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
         ChatMessage(role="system", content=system),
         ChatMessage(role="user", content=user),
     ]
+
+
+def _build_pass2_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
+    """Pass-2 (ADR-pointer) messages — the sibling entry point for the pass-2 prompt.
+
+    Delegates to :func:`build_pr_review_pass2_messages` after applying the same diff
+    truncation cap as pass 1: pass 2 sees the same evidence pass 1 sees, so a pointer
+    emitted against a truncated hunk was at least judged from the same view.
+    """
+    return build_pr_review_pass2_messages(_truncate_diff(diff), pr_slug)
+
+
+# The pass-2 (ADR-pointer collection) call gets its OWN, shorter timeout so a wedged
+# pass-2 cannot delay the pass-1 verdict + PR-review submission (msg-694 §3-3 fail-open,
+# msg-696 §4 short pass-B timeout). Half the pass-1 budget keeps pass 2 comfortably
+# generous for the small JSON payload it should produce, while ensuring a pass-2 hang
+# still returns control to the driver within the pass-1 window rather than blocking it.
+_ADR_POINTER_TIMEOUT_SECONDS = _DEFAULT_TIMEOUT_SECONDS / 2
+
+# ``max_tokens`` for pass 2. Deliberately smaller than pass 1 because pass 2's entire
+# legitimate output is a small JSON array (see MAX_POINTER_PAYLOAD_BYTES rationale in
+# :mod:`.pr_review_adr_pointers`). A tighter budget also caps the pathological runaway:
+# even if the model ignores the "JSON only" instruction, it cannot spend the full 32 000-
+# token pass-1 output budget on prose here.
+_ADR_POINTER_MAX_TOKENS = 4000
+
+
+def _not_attempted_selection() -> AdrPointerSelection:
+    """A synthesised ``unavailable(not-attempted)`` selection for short-circuit paths.
+
+    Used by CI-gate, head-unchanged skip, round-cap escalation — paths where the driver
+    intentionally does NOT run pass 2 (nothing to point at, or nothing to review). Keeps
+    the marker invariant intact: every posted body carries the marker line, and
+    ``not-attempted`` is a distinct log-side reason from a call that ran and failed.
+    """
+    return AdrPointerSelection(
+        available=False,
+        unavailable_reason="not-attempted",
+        measured_bytes=0,
+    )
+
+
+def _call_failed_selection(exc: BaseException) -> AdrPointerSelection:
+    """A synthesised ``unavailable(call-failed)`` for a pass-2 call that raised.
+
+    Any exception on pass 2 (timeout / HTTP error / cancellation / anything unexpected)
+    collapses to this — pass 2 is fail-open (msg-694 §3-3): its failure never propagates
+    into pass 1's verdict path. The exception message is retained for the M5' log line
+    only; the marker itself stays reasonless (msg-705 M3).
+    """
+    return AdrPointerSelection(
+        available=False,
+        unavailable_reason=f"call-failed: {type(exc).__name__}",
+        measured_bytes=0,
+    )
+
+
+def _log_pass2(pr_slug: str, selection: AdrPointerSelection, raw: str) -> None:
+    """Emit the M5' log line for a pass-2 outcome (unavailable OR available)."""
+    if selection.available:
+        line = available_log_line(selection, raw)
+    else:
+        line = unavailable_log_line(selection)
+    if line:
+        logger.info("%s (%s)", line, pr_slug)
 
 
 class NaysayerPrReviewDriver:
@@ -272,6 +379,12 @@ class NaysayerPrReviewDriver:
         the GitHub submission so the human still sees the critique even if the submit fails.
         Returns the :class:`PrReviewOutcome`. Raises on an empty model reply or an unreachable
         Lexora / GitHub (fail-closed — the caller never treats a failed review as a pass).
+
+        Marker invariant (msg-690 M2, msg-692 §3): every body this driver posts (CI-gate,
+        debounce skip/cap, timeout-degrade, normal APPROVE/REQUEST_CHANGES) carries the ADR-
+        pointer marker as its final line — a short-circuit path stamps ``ADR-INDEX: unavailable``
+        because pass 2 was not attempted, so an inspecting human can always see whether the
+        review carried an ADR-index cross-check.
         """
         # L1 CI-gate (ADR-16 §D-2): the APPROVE must imply CI green for the reviewed head SHA.
         # Query CI BEFORE the (costly) content review and short-circuit when it is not green —
@@ -279,10 +392,17 @@ class NaysayerPrReviewDriver:
         ci = await self._github.fetch_ci_status(pr)
         if ci.state is not CiState.SUCCESS:
             verdict, body = _ci_gate_response(ci, pr.slug)
+            selection = _not_attempted_selection()
+            body = append_marker(body, selection)
             await post_critique(body)
             await self._submit_review(pr, verdict, body)  # no Lexora call — gate stands in
             return PrReviewOutcome(
-                verdict=verdict, body=body, ci_state=ci.state, head_sha=ci.head_sha, ci_gated=True
+                verdict=verdict,
+                body=body,
+                ci_state=ci.state,
+                head_sha=ci.head_sha,
+                ci_gated=True,
+                adr_pointer_selection=selection,
             )
 
         # Debounce (cost lever, default off): consult the PR's prior naysayer reviews to (a) skip a
@@ -324,6 +444,8 @@ class NaysayerPrReviewDriver:
                     )
                 else:
                     verdict, body = skip
+                    selection = _not_attempted_selection()
+                    body = append_marker(body, selection)
                     await post_critique(body)
                     return PrReviewOutcome(
                         verdict=verdict,
@@ -331,6 +453,7 @@ class NaysayerPrReviewDriver:
                         ci_state=ci.state,
                         head_sha=ci.head_sha,
                         skipped_head_unchanged=True,
+                        adr_pointer_selection=selection,
                     )
             elif cap_hit:
                 if self._shadow:
@@ -351,6 +474,8 @@ class NaysayerPrReviewDriver:
                         f"the back-and-forth should be adjudicated, not re-litigated by the gate."
                         f"\n\nVERDICT: COMMENT"
                     )
+                    selection = _not_attempted_selection()
+                    body = append_marker(body, selection)
                     await post_critique(body)
                     await self._submit_review(pr, ReviewEvent.COMMENT, body)
                     return PrReviewOutcome(
@@ -359,32 +484,43 @@ class NaysayerPrReviewDriver:
                         ci_state=ci.state,
                         head_sha=ci.head_sha,
                         rounds_capped=True,
+                        adr_pointer_selection=selection,
                     )
 
         # CI green → content review (Lexora). Fail-closed: an unreachable GitHub raises here.
         diff = await self._github.fetch_pr_diff(pr)
         truncated = len(diff) > _MAX_DIFF_CHARS
-        try:
-            completion = await self._lexora.chat_completion(
-                model=self._model,
-                messages=_build_messages(diff, pr.slug),
-                max_tokens=self._max_tokens,
-            )
-        except LexoraTimeoutError:
-            # M2 (T34): the review did not finish within the client timeout. Treat this like a
-            # truncated review — a partial/absent verdict must never APPROVE — and degrade to a
-            # fail-closed REQUEST_CHANGES via the SAME post_critique + _submit_review path, rather
-            # than letting the timeout propagate and crash the pipeline (a dangerous fail that the
-            # old code's unhandled LexoraHTTPError produced). Non-timeout LexoraHTTPError
-            # (unreachable / 5xx / unknown tier) is NOT caught here, so it keeps propagating
-            # (fail-loud).
+
+        # A-3 two-pass structure (msg-692 §1): run pass 1 (verdict) and pass 2 (ADR-pointer
+        # collection) in parallel. Pass 1 = judge; pass 2 = index-injected hint collection whose
+        # output cannot alter the verdict (structural guarantee — the driver never reads a
+        # verdict token from pass 2's return value). Both fire against the SAME diff at the SAME
+        # commit, so a reviewer can trust the ADR pointer section corresponds to the same
+        # evidence the verdict was formed on.
+        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(diff, pr.slug)
+
+        if isinstance(pass1_result, LexoraTimeoutError):
+            # M2 (T34): pass 1 did not finish within the client timeout. Degrade to fail-closed
+            # REQUEST_CHANGES via the same post_critique + _submit_review path, rather than
+            # letting the timeout propagate and crash the pipeline. Pass 2's own outcome
+            # (whatever it was — usually also unavailable when Lexora is wedged) is stamped on
+            # the marker of the degrade body, keeping the marker invariant intact.
             return await self._degrade_on_timeout(
                 pr,
                 ci,
+                pass2_selection=pass2_selection,
+                pass2_raw=pass2_raw,
                 post_critique=post_critique,
                 would_skip_head_unchanged=would_skip_head_unchanged,
                 would_cap=would_cap,
             )
+        if isinstance(pass1_result, BaseException):
+            # Non-timeout Lexora / other exception on pass 1 keeps propagating (fail-loud). Pass
+            # 2's coroutine already completed one way or the other (return_exceptions=True), so
+            # we do not leak a background task by raising here.
+            raise pass1_result
+
+        completion = pass1_result
         body = (completion.content or "").strip()
         if not body:
             raise NaysayerPrReviewError(
@@ -395,6 +531,12 @@ class NaysayerPrReviewDriver:
         verdict = _resolve_verdict(
             body, truncated=truncated, finish_reason=completion.finish_reason
         )
+        # Stamp the ADR-pointer section + marker onto the body BEFORE posting / submitting, so
+        # the chat-room copy, the GitHub review, and the outcome all carry the same rendered
+        # body (the marker is the final line — the driver relies on that fixed position).
+        _log_pass2(pr.slug, pass2_selection, pass2_raw)
+        body = append_marker(body, pass2_selection)
+
         await post_critique(body)
         # Fail-closed: unreachable GitHub raises here too (posted first, so the human sees it).
         await self._submit_review(pr, verdict, body)
@@ -409,13 +551,80 @@ class NaysayerPrReviewDriver:
             principles_version=principles_version(),
             would_skip_head_unchanged=would_skip_head_unchanged,
             would_cap=would_cap,
+            adr_pointer_selection=pass2_selection,
         )
+
+    async def _run_two_passes(
+        self, diff: str, pr_slug: str
+    ) -> tuple[Any, AdrPointerSelection, str]:
+        """Execute pass 1 + pass 2 concurrently, return their (typed) outcomes.
+
+        Returns a triple:
+
+        * ``pass1_result`` — the ``ChatCompletion`` on success, OR the exception raised by
+          pass 1 (``LexoraTimeoutError`` for the safe-degrade path, or any other Exception
+          for the fail-loud path). The caller inspects it with ``isinstance``.
+        * ``pass2_selection`` — the :class:`AdrPointerSelection` produced by running pass 2's
+          raw ``content`` through the M1'/M2 pipeline. On any pass-2 failure (timeout /
+          HTTP error / cancellation) this is a synthesised ``unavailable(call-failed)``
+          selection so the marker is always well-defined (fail-open).
+        * ``pass2_raw`` — the raw ``content`` string pass 2 returned (empty string on
+          failure). Retained for the M5' log line (msg-701 §2, msg-703 M5').
+        """
+        pass1_task = self._lexora.chat_completion(
+            model=self._model,
+            messages=_build_messages(diff, pr_slug),
+            max_tokens=self._max_tokens,
+        )
+        pass2_task = self._collect_adr_pointers(diff, pr_slug)
+        # ``return_exceptions=True`` isolates the two passes: pass 2's exception must never
+        # reach the caller (fail-open), and pass 1's exception is inspected below so the
+        # LexoraTimeoutError → degrade path is preserved while other exceptions still
+        # propagate fail-loud.
+        pass1_outcome, pass2_outcome = await asyncio.gather(
+            pass1_task, pass2_task, return_exceptions=True
+        )
+        if isinstance(pass2_outcome, BaseException):
+            # Pass 2 collapses to fail-open unavailable on ANY exception (timeout, HTTP error,
+            # cancellation, unexpected). msg-694 §3-3.
+            return pass1_outcome, _call_failed_selection(pass2_outcome), ""
+        pass2_selection, pass2_raw = pass2_outcome
+        return pass1_outcome, pass2_selection, pass2_raw
+
+    async def _collect_adr_pointers(
+        self, diff: str, pr_slug: str
+    ) -> tuple[AdrPointerSelection, str]:
+        """Run pass 2 → M1'/M2 pipeline. Returns (selection, raw_content).
+
+        Applies :data:`_ADR_POINTER_TIMEOUT_SECONDS` as the pass-2 budget via
+        ``asyncio.wait_for``: a wedged pass 2 cannot exceed this budget even if the Lexora
+        client timeout is longer. On timeout the pipeline gets no content and produces
+        ``unavailable(call-failed)`` — the exception is caught here so pass 2's timeout can
+        never itself be observed by the caller (pass 2 is fail-open).
+        """
+        try:
+            completion = await asyncio.wait_for(
+                self._lexora.chat_completion(
+                    model=self._model,
+                    messages=_build_pass2_messages(diff, pr_slug),
+                    max_tokens=_ADR_POINTER_MAX_TOKENS,
+                ),
+                timeout=_ADR_POINTER_TIMEOUT_SECONDS,
+            )
+        except (TimeoutError, LexoraTimeoutError) as exc:
+            return _call_failed_selection(exc), ""
+        raw = completion.content or ""
+        manifest_ids = load_manifest_ids()
+        selection = select_adr_pointers(raw, manifest_ids)
+        return selection, raw
 
     async def _degrade_on_timeout(
         self,
         pr: PrRef,
         ci: CiStatus,
         *,
+        pass2_selection: AdrPointerSelection | None = None,
+        pass2_raw: str = "",
         post_critique: PostCritique,
         would_skip_head_unchanged: bool = False,
         would_cap: bool = False,
@@ -427,6 +636,11 @@ class NaysayerPrReviewDriver:
         observable to the caller. The default verdict (REQUEST_CHANGES) keeps the gate on the same
         safe side as a length-capped / truncated review; whether a transient timeout should instead
         be a COMMENT-hold is the open question Q left for the naysayer / Tier-C (msg-503).
+
+        The pass-2 selection (may be a real outcome if pass 2 finished before pass 1 timed out,
+        or ``call-failed`` if it too failed) is stamped on the marker so the timeout-degrade
+        body carries the marker like every other body — the marker invariant does not weaken
+        on the safe-degrade path.
         """
         body = (
             f"The naysayer review for {pr.slug} exceeded the configured Lexora client timeout and "
@@ -435,6 +649,9 @@ class NaysayerPrReviewDriver:
             f"must never APPROVE. Split the PR into smaller diffs or retry.\n\n"
             f"VERDICT: REQUEST_CHANGES"
         )
+        selection = pass2_selection if pass2_selection is not None else _not_attempted_selection()
+        _log_pass2(pr.slug, selection, pass2_raw)
+        body = append_marker(body, selection)
         await post_critique(body)
         await self._submit_review(pr, ReviewEvent.REQUEST_CHANGES, body)
         return PrReviewOutcome(
@@ -449,6 +666,7 @@ class NaysayerPrReviewDriver:
             # object-level telemetry matches the SHADOW log lines (naysayer #114 weakest point).
             would_skip_head_unchanged=would_skip_head_unchanged,
             would_cap=would_cap,
+            adr_pointer_selection=selection,
         )
 
     @staticmethod
