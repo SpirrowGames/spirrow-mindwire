@@ -149,7 +149,12 @@ async def test_smoke_proposer_round_trip(tmp_path: Path) -> None:
 
     assert len(gateway.posts) == 1
     assert gateway.posts[0]["author"] == "proposer-1"  # I3 v2.2: author = instance_id
-    assert gateway.posts[0]["body"] == "reply text"
+    # The dispatcher stamps the harness-derived source marker on the body
+    # (msg-805 D3 / msg-834 §2). The agent text is preserved verbatim; the
+    # marker is the trailing HTML-comment line derived from SDK options.
+    posted_body = gateway.posts[0]["body"]
+    assert posted_body.startswith("reply text")
+    assert posted_body.rstrip().splitlines()[-1].startswith("<!-- source:")
     assert gateway.posts[0]["idempotency_key"] == f"{handle.session_id}:1"
     assert [e.kind for e in events] == [EVENT_KIND_REPLY_SENT]
     assert events[0].fields[EVENT_FIELD_AUTHOR] == "proposer-1"  # T26: author = instance_id

@@ -118,6 +118,13 @@ class _Session:
     own_role: Role
     state: SessionState
     last_active_at: datetime
+    # The exact ``ClaudeAgentOptions`` instance passed to the SDK client on
+    # spawn — kept so :meth:`ClaudeCodeSdkAdapter.source_marker_options` can
+    # hand the harness that same object (msg-834 §2 (a)). ``Any`` typing so
+    # the dataclass file need not import the SDK type where it is already
+    # imported at module scope; the runtime value is a real
+    # ``ClaudeAgentOptions``.
+    options: Any = None
     error: ErrorInfo | None = None
 
 
@@ -244,8 +251,26 @@ class ClaudeCodeSdkAdapter:
             own_role=role,  # == ctx.own_role by dispatcher contract (Gap-2 (b))
             state=SessionState.IDLE,
             last_active_at=now,
+            # Store the same ``ClaudeAgentOptions`` object handed to the SDK
+            # so the harness can derive the source marker from it on every
+            # reply without asking the agent to declare it (D3 / msg-805).
+            options=options,
         )
         return handle
+
+    def source_marker_options(self, handle: SessionHandle) -> Any:
+        """Return the ``ClaudeAgentOptions`` for ``handle``, or ``None`` if unknown.
+
+        Public so the dispatcher can retrieve the exact options object the
+        SDK client was spawned with (msg-834 §2 (a)) and hand it to
+        :func:`spirrow_mindwire.source_marker.render_source_marker`. This
+        getter is the seam that lets **this** file — the adapter — never
+        import the marker builder (msg-834 §2 (c)): the adapter exposes the
+        options, and the dispatcher (which does import the builder) reads
+        them through the port.
+        """
+        session = self._sessions.get(handle)
+        return None if session is None else session.options
 
     async def deliver_event(self, handle: SessionHandle, event: ChatroomEvent) -> None:
         session = self._sessions.get(handle)

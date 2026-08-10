@@ -135,6 +135,12 @@ class _Session:
     own_role: Role
     state: SessionState
     last_active_at: datetime
+    # The exact ``ClaudeAgentOptions`` handed to the SDK on spawn — kept so
+    # :meth:`NaysayerSdkAdapter.source_marker_options` can hand the same
+    # object to the harness (msg-834 §2 (a)). ``Any`` typing on the field so
+    # the dataclass loads without touching the SDK type here (already
+    # imported at module scope for the constructor).
+    options: Any = None
     error: ErrorInfo | None = None
 
 
@@ -288,8 +294,9 @@ class NaysayerSdkAdapter:
                 "the naysayer must route inference via the Lexora Gemini tier, never "
                 "api.anthropic.com directly (ADR-05 §5 independence)"
             )
+        options = self._make_options()
         try:
-            client = self._client_factory(self._make_options())
+            client = self._client_factory(options)
             await client.connect()
         except Exception as exc:
             raise NaysayerSdkSpawnError(
@@ -311,8 +318,21 @@ class NaysayerSdkAdapter:
             own_role=role,
             state=SessionState.IDLE,
             last_active_at=now,
+            # Retain the exact ``ClaudeAgentOptions`` for the harness marker
+            # (msg-805 D3 / msg-834 §2 (a)) — never re-read, never re-declared.
+            options=options,
         )
         return handle
+
+    def source_marker_options(self, handle: SessionHandle) -> Any:
+        """Return the ``ClaudeAgentOptions`` for ``handle``, or ``None`` if unknown.
+
+        Public seam so the dispatcher can derive the source marker without
+        this file importing :mod:`spirrow_mindwire.source_marker`
+        (msg-834 §2 (c)).
+        """
+        session = self._sessions.get(handle)
+        return None if session is None else session.options
 
     async def deliver_event(self, handle: SessionHandle, event: ChatroomEvent) -> None:
         session = self._sessions.get(handle)
