@@ -67,6 +67,7 @@ from ..exceptions import (
     AdapterSpawnError,
 )
 from ..naysayer.adr_index import load_adr_index
+from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
 from ..ulid_util import new_ulid
 from ..value_objects import (
@@ -94,6 +95,17 @@ _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
     {SessionState.HALTING, SessionState.HALTED, SessionState.FAILED}
 )
 
+# The static (identity-only) portion of the implementer's system prompt. Loop-
+# readable obligations that constrain behaviour at runtime — "declare what you
+# cannot read", read-back at entry/exit — live in ``spec/process/obligations.yaml``
+# and are injected here by the composition root via
+# :class:`~spirrow_mindwire.obligations.ObligationsManifest`; the manifest, not
+# this literal, is the single source of truth for those clauses (CLAUDE.md §N →
+# spec/process/README.md → obligations.yaml). The paragraphs that once lived
+# inline (notably "DOCUMENTS YOU CANNOT READ") have been MOVED to that manifest —
+# deleted here, restored to the rendered prompt through injection. Keeping the
+# manifest as the sole owner is what lets the tests assert on the actual prompt
+# the loop reads rather than a mirror.
 _BASE_IMPLEMENTER_SYSTEM_PROMPT = """\
 You are the implementer in a Spirrow MindWire ChatRoom thread. You write and \
 run code to carry out the agreed proposal. You operate under a strict, \
@@ -122,18 +134,6 @@ the body from stdin, so a heredoc needs no file at all; (2) if you genuinely \
 need a file, use `<repo>/.git/mindwire-scratch/`, which is inside the repo yet \
 can never appear in `git status` or be committed by `git add`. Never put \
 scratch files in the working tree, where they would be committed by accident.
-
-DOCUMENTS YOU CANNOT READ: you have this repository and this thread, and that \
-is all. ADR bodies live in a separate docs repository you cannot reach, and you \
-do not have CLAUDE.md. When a task asks you to check your work against a \
-document whose text you cannot see, do NOT reconstruct what it probably says — \
-say plainly "I cannot read <doc>'s text, so I have not verified against it", \
-then verify everything you CAN and report that. An incomplete report is always \
-better than a confident wrong one: stating the limit is what lets a human close \
-the gap, while a plausible invention closes the subject and is believed. This \
-applies to ADR titles too — a title is a summary, and reasoning outward from a \
-summary as if it were the document is the exact mistake ADR-2026-05-29-13 exists \
-to prevent.
 
 Work on a feature/* branch, commit your changes, and (when ready) open a PR to \
 develop. When you reply in the thread, reply directly with the message body — \
@@ -982,6 +982,7 @@ class ImplementerSdkAdapter:
         self,
         *,
         cwd: Path,
+        obligations: ObligationsManifest,
         allowlist: Allowlist | None = None,
         inference_base_url: str | None = None,
         model: str | None = None,
@@ -1005,10 +1006,19 @@ class ImplementerSdkAdapter:
         # is the single enforcement point; auto-approval would bypass it).
         self._allowed_tools = list(allowed_tools) if allowed_tools is not None else []
         self._mcp_servers = mcp_servers or {}
+        # Loop-readable obligations are injected here — the manifest passed in is the
+        # single source of truth (CLAUDE.md §N → spec/process/README.md) and the
+        # adapter never reaches for a module-global path itself. That injection
+        # shape is what canary two-prime (rendered-prompt-contains-obligation-body)
+        # reads: the assembled system prompt under test is exactly the one the
+        # adapter renders in production, from a manifest the test picks.
+        self._obligations = obligations
         # Append cwd grounding (T40): the custom system prompt omits the SDK's working-directory
         # dynamic section, so the agent must be told its cwd explicitly or it guesses abs paths.
         self._system_prompt = (
-            f"{system_prompt}\n\n{_cwd_grounding_block(self._cwd)}\n\n{_adr_index_block()}"
+            f"{system_prompt}\n\n{_cwd_grounding_block(self._cwd)}\n\n"
+            f"{obligations.render_role_obligations(Role.IMPLEMENTER)}\n\n"
+            f"{_adr_index_block()}"
         )
         self._extra_env = dict(extra_env or {})
         self._client_factory = client_factory or _default_client_factory

@@ -1,0 +1,83 @@
+# mindwire loop-readable obligations manifest — a single source of truth for the
+# prompt clauses that bind agent behaviour at runtime.
+#
+# Rendered into each role's system prompt at composition time (see
+# src/spirrow_mindwire/obligations.py + the two SDK adapters). Kept out of the
+# Python source so a change to what the loop is told does not require a code
+# change, and — the reason this file exists at all — so the constraint the loop
+# actually reads is a single artifact rather than one string per adapter.
+#
+# CLAUDE.md §N points here (via spec/process/README.md) as the SOT for what the
+# loop reads. The pointer is imperative and its presence is asserted by a grep
+# test in tests/test_obligations.py (the same module as the canaries below).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY BODIES ARE VERBATIM MOVES — DO NOT PARAPHRASE
+#
+# An obligation whose `origin.moved_from` names a repo location (a Python string
+# literal `path::LITERAL_NAME`, or a documentation section `path::§HEADING`) has
+# had that source DELETED and its text moved here byte-for-byte. The
+# `origin.original_length` field records the character length of the text as it
+# lived at the source, and canary two-double-prime in tests/test_obligations.py
+# asserts `len(body) == origin.original_length` on every moved entry. This is
+# the shape of the invariant: a well-meaning "cleanup" that shortens or reflows
+# the entry reds the gate rather than silently drifts the loop's actual
+# instructions away from what was reviewed. If you have a genuine reason to
+# rewrite a moved entry, that is an obligation change — bump `original_length`
+# in the same commit and expect it to be discussed in PR review.
+#
+# Entries without `origin.moved_from` are net-new loop-readable formulations
+# (nothing was deleted from source to create them); the length invariant does
+# not apply to them and they evolve through the normal proposal flow.
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: 1
+
+obligations:
+  - id: OBL-DECLARE-UNREADABLE
+    role: implementer
+    origin:
+      moved_from: "src/spirrow_mindwire/adapters/implementer.py::_BASE_IMPLEMENTER_SYSTEM_PROMPT"
+      original_length: 795
+    body: "DOCUMENTS YOU CANNOT READ: you have this repository and this thread, and that is all. ADR bodies live in a separate docs repository you cannot reach, and you do not have CLAUDE.md. When a task asks you to check your work against a document whose text you cannot see, do NOT reconstruct what it probably says — say plainly \"I cannot read <doc>'s text, so I have not verified against it\", then verify everything you CAN and report that. An incomplete report is always better than a confident wrong one: stating the limit is what lets a human close the gap, while a plausible invention closes the subject and is believed. This applies to ADR titles too — a title is a summary, and reasoning outward from a summary as if it were the document is the exact mistake ADR-2026-05-29-13 exists to prevent."
+
+  - id: OBL-VERDICT-CONSTRAINT
+    role: naysayer
+    origin:
+      moved_from: "src/spirrow_mindwire/adapters/naysayer_sdk.py::_NAYSAYER_ROLE_PROMPT"
+      original_length: 64
+    body: "You are advisory, not a veto: the final decision is the human's."
+
+  - id: OBL-READBACK-ENTRY
+    role: implementer
+    # Net-new English formulation of the ADR-2026-05-29-13 §N.1.3 spirit — no `origin`.
+    # The pre-move CLAUDE.md §N.1.3 was a Japanese numbered list (「入口チェック
+    # (実装着手前)」) whose structure and phrasing do not survive a straight port to
+    # a prompt-injected obligation body. A prior revision of this file falsely
+    # claimed a verbatim `origin.moved_from: CLAUDE.md::§N.1.3` and set
+    # `original_length` to the character count of THIS English body — that
+    # bypassed canary two-double-prime by construction (the length-invariant
+    # only makes sense against the actually-moved source text). Tier B naysayer
+    # on PR #135 (Finding 1) called this out. Correct classification: net-new
+    # formulation. The Japanese source rationale remains in
+    # `spec/process/README.md` §「提案の核 — spec read-back」 for context.
+    body: "READ-BACK AT ENTRY (ADR-2026-05-29-13 §N.1.3): before you begin work on a task that names a proposer decide-msg, an ADR, a schema change, or an existing spec you claim to preserve, re-read the specifying message(s) as your primary source. Do not act from a summary of them (yours or the harness's) — a summary is lossy at exactly the field-level detail that a spec turns on (enum values, invariants, boundary conditions, the difference between \"preserve\" and \"extend\"). In your first reply, name the msg-ids you read and quote the concrete requirements you took from them. If a required document is unreadable to you, satisfy OBL-DECLARE-UNREADABLE instead of guessing."
+
+  - id: OBL-READBACK-EXIT
+    role: implementer
+    # Net-new English formulation of the ADR-2026-05-29-13 §N.1.4 spirit — no `origin`.
+    # Same rationale as OBL-READBACK-ENTRY above: the pre-move CLAUDE.md §N.1.4
+    # was a Japanese numbered list, not a prose obligation body; declaring it a
+    # verbatim move + faking `original_length` to the English body's length
+    # would falsify the invariant. Tier B naysayer on PR #135 (Finding 1).
+    body: "READ-BACK AT EXIT (ADR-2026-05-29-13 §N.1.4): before you hand the work back, open the same specifying message(s) again and build a requirement-by-requirement table — one row per bulletable requirement in the spec, each row marked \"reflected\" (with a code/PR pointer) or \"not reflected\" (with the reason). Assemble the table from the spec text, not from memory of what you did. Include the table in the PR body. A completion without this table is not a completion; if the spec is unreadable to you, satisfy OBL-DECLARE-UNREADABLE and state which rows you could not construct."
+
+  - id: OBL-PRCHECK-READ
+    role: implementer
+    # Net-new formulation (no origin): this obligation is the reader-side mechanism
+    # that closes the fail-open in the ``obligations-readback (advisory)`` CI check.
+    # The advisory check names its consequences on $GITHUB_STEP_SUMMARY, but naming
+    # them is worthless unless someone actually reads the PR's check runs before
+    # handing to a human — that "actually reads" is what this obligation binds.
+    # See spec/process/README.md §「PR check の未読み放置を塞ぐ (OBL-PRCHECK-READ)」.
+    body: "READ THE PR CHECK RUNS BEFORE HANDING TO HUMAN: on a turn that carries a PR, before you emit `NEXT: human`, read that PR's check runs (`gh pr checks <n>` or the JSON `gh pr view <n> --json statusCheckRollup`). If a check is red, fix it. You may escalate to the human with a red check ONLY if one of these two holds and you state which in the reply: (a) the same check is red on the PR **base revision** (this failure is not from your PR — verify by checking out the base locally and re-running the same script; do NOT rely on `gh run list --commit <base_sha>` alone, since a newly added check has no run on base and the query returns empty rather than a verdict); or (b) fixing the failure requires an operation you cannot perform under Tier C (repo settings / branch protection / secrets / anything the allow-list denies). Neither condition being true, do not emit `NEXT: human` while a red PR check stands. The normative treatment of red CI on PR gates is ADR-2026-06-03-16; this obligation carries only the read-and-triage duty, not the gate policy."

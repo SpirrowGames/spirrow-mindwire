@@ -21,6 +21,7 @@ from spirrow_mindwire.adapters.naysayer_sdk import (
     NaysayerSdkSpawnError,
     build_naysayer_system_prompt,
 )
+from spirrow_mindwire.obligations import load_manifest
 from spirrow_mindwire.ports import RoleAdapter, SpawnContext
 from spirrow_mindwire.value_objects import (
     Capability,
@@ -36,6 +37,11 @@ from spirrow_mindwire.value_objects import (
 
 _TS = datetime(2026, 6, 4, tzinfo=UTC)
 _BASE_URL = "http://lexora.local:8110"
+
+# Loop-readable obligations manifest — required by the adapter and the prompt
+# builder now that the verdict-constraint clause has been MOVED to it (§N.4).
+# Loaded once at import time; the manifest is immutable.
+_OBLIGATIONS = load_manifest()
 
 
 def _assistant(text: str) -> AssistantMessage:
@@ -124,12 +130,14 @@ def test_capabilities_naysayer_qualified_no_execute() -> None:
 
 
 def test_satisfies_roleadapter_protocol(tmp_path: Path) -> None:
-    adapter: RoleAdapter = NaysayerSdkAdapter(cwd=tmp_path, inference_base_url=_BASE_URL)
+    adapter: RoleAdapter = NaysayerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url=_BASE_URL
+    )
     assert adapter.adapter_id == "naysayer-sdk"
 
 
 def test_system_prompt_injects_principles_verbatim() -> None:
-    prompt = build_naysayer_system_prompt()
+    prompt = build_naysayer_system_prompt(obligations=_OBLIGATIONS)
     assert "silence is negligence" in prompt  # the SOT, verbatim
     assert "principles_version=" in prompt
     assert "independent naysayer" in prompt  # role instructions follow
@@ -137,10 +145,16 @@ def test_system_prompt_injects_principles_verbatim() -> None:
 
 def test_system_prompt_injects_handoff_protocol() -> None:
     # PR-2b-1: the naysayer ends each critique with a NEXT: line so the conductor can chain.
-    prompt = build_naysayer_system_prompt()
+    prompt = build_naysayer_system_prompt(obligations=_OBLIGATIONS)
     assert "Conductor handoff protocol" in prompt
     assert "NEXT:" in prompt
-    assert "advisory, not a veto" in prompt  # naysayer-specific handoff guidance
+    # The verdict-constraint clause is now delivered via OBL-VERDICT-CONSTRAINT
+    # (moved out of source, injected from the manifest). The assertion is on the
+    # rendered prompt so the injection wiring itself is under test, not just the
+    # manifest text — repointed at the assembled prompt per the Tier-C GO
+    # ("existing tests: repoint at the rendered prompt, do not delete").
+    assert "advisory, not a veto" in prompt
+    assert "[OBL-VERDICT-CONSTRAINT]" in prompt
 
 
 def test_system_prompt_injects_adr_index_from_a_fixture_manifest(tmp_path: Path) -> None:
@@ -153,14 +167,14 @@ def test_system_prompt_injects_adr_index_from_a_fixture_manifest(tmp_path: Path)
         'adrs:\n  - id: ADR-2026-05-31-15\n    title: "independence gradation"\n',
         encoding="utf-8",
     )
-    prompt = build_naysayer_system_prompt(tmp_path)
+    prompt = build_naysayer_system_prompt(obligations=_OBLIGATIONS, repo_root=tmp_path)
     assert "ADR index (id + title)" in prompt
     assert "ADR-2026-05-31-15 — independence gradation" in prompt
 
 
 def test_system_prompt_defaults_to_mindwires_own_manifest() -> None:
     # The default must resolve to THIS repo's committed manifest, not the caller's cwd.
-    prompt = build_naysayer_system_prompt()
+    prompt = build_naysayer_system_prompt(obligations=_OBLIGATIONS)
     assert "ADR index (id + title)" in prompt
     assert "UNAVAILABLE" not in prompt
 
@@ -182,7 +196,9 @@ def test_adapter_injects_the_index_even_though_the_reviewed_repo_has_none(
     """
     assert not (tmp_path / "spec" / "adr_index.yaml").exists()  # as in production
 
-    adapter = NaysayerSdkAdapter(cwd=tmp_path, inference_base_url=_BASE_URL)
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url=_BASE_URL
+    )
 
     prompt = adapter._system_prompt
     assert "ADR index (id + title)" in prompt
@@ -196,7 +212,9 @@ async def test_spawn_fails_closed_without_base_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("MINDWIRE_NAYSAYER_BASE_URL", raising=False)
-    adapter = NaysayerSdkAdapter(cwd=tmp_path, inference_base_url="")  # no URL, no env
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url=""
+    )  # no URL, no env
     with pytest.raises(NaysayerSdkSpawnError):
         await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
 
@@ -206,7 +224,10 @@ async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
     opts: list[Any] = []
     client = _FakeClient([_assistant("…"), _result()])
     adapter = NaysayerSdkAdapter(
-        cwd=tmp_path, inference_base_url=_BASE_URL, client_factory=_factory(client, opts)
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, opts),
     )
     await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     # Independence: inference is pinned to the Lexora Gemini tier, never api.anthropic.com.
@@ -222,7 +243,10 @@ async def test_deliver_event_posts_critique(tmp_path: Path) -> None:
         [_assistant("This over-scopes. "), _assistant("VERDICT: object."), _result()]
     )
     adapter = NaysayerSdkAdapter(
-        cwd=tmp_path, inference_base_url=_BASE_URL, client_factory=_factory(client, [])
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, []),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event())
@@ -237,7 +261,10 @@ async def test_self_post_is_filtered(tmp_path: Path) -> None:
     captured: list[ReplyDraft] = []
     client = _FakeClient([_assistant("x"), _result()])
     adapter = NaysayerSdkAdapter(
-        cwd=tmp_path, inference_base_url=_BASE_URL, client_factory=_factory(client, [])
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, []),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event(author="naysayer-1"))  # our own echoed post

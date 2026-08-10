@@ -254,7 +254,7 @@ Three rules are load-bearing:
 
 > The non-happy statuses report to **Discord**, not just the log. That is the point: a loop quietly
 > running week-old code because `git fetch` has been failing is precisely the kind of correct-but-
-> unread announcement that CLAUDE.md §N.3 exists to prevent. Alerts are deduped on the reason, so a
+> unread announcement that `spec/process/README.md` (the fail-open-placement rule) exists to prevent. Alerts are deduped on the reason, so a
 > week spent on a feature branch costs one message, not 2016.
 
 ### Which thread gets driven

@@ -86,6 +86,7 @@ from .magickit.client import McpToolCaller, StreamableHttpChatroomMcp
 from .magickit.gateway import MagickitChatroomGateway
 from .magickit.watcher import ChatroomWatcher, WatchSpec
 from .naysayer.pr_review import NaysayerPrReviewDriver
+from .obligations import ObligationsError, ObligationsManifest, load_manifest
 from .orchestrator import PrReviewOrchestrator
 from .ports import RoleAdapter
 from .value_objects import Capability, Event, Role, ThreadRef
@@ -254,18 +255,22 @@ def build_proposer(repo_dir: Path) -> Stage3ProposerAdapter:
     return Stage3ProposerAdapter(cwd=repo_dir)
 
 
-def build_implementer(repo_dir: Path) -> ImplementerSdkAdapter:
+def build_implementer(repo_dir: Path, *, obligations: ObligationsManifest) -> ImplementerSdkAdapter:
     """Allow-list-gated implementer; inference base URL + allow-list from env/defaults.
 
     ``inference_base_url`` is left to the adapter's
     ``MINDWIRE_IMPLEMENTER_BASE_URL`` resolution; the adapter **refuses to
     spawn** if it is unset (no silent fallback to ``api.anthropic.com`` — ADR-07
     §2.4), which surfaces a misconfigured daemon loudly at first watch.
+
+    ``obligations`` is the loop-readable obligations manifest loaded at the
+    composition root and passed in by injection — the adapter never reaches for a
+    module-global path itself. See :func:`_load_obligations_or_exit`.
     """
-    return ImplementerSdkAdapter(cwd=repo_dir)
+    return ImplementerSdkAdapter(cwd=repo_dir, obligations=obligations)
 
 
-def build_naysayer(repo_dir: Path) -> NaysayerSdkAdapter:
+def build_naysayer(repo_dir: Path, *, obligations: ObligationsManifest) -> NaysayerSdkAdapter:
     """The single registry naysayer = the design-time agent (ADR-19 D-1 / driver-化 unify).
 
     The PR-review gate is no longer a registry RoleAdapter (it is the driver built by
@@ -273,8 +278,37 @@ def build_naysayer(repo_dir: Path) -> NaysayerSdkAdapter:
     agent (independence by distribution: ``MINDWIRE_NAYSAYER_BASE_URL`` → Lexora Gemini, resolved
     at spawn). It participates by summon, so the daemon registers it (the single-NAYSAYER
     invariant) without a standing watch.
+
+    ``obligations`` is the loop-readable obligations manifest loaded at the
+    composition root and passed in by injection.
     """
-    return NaysayerSdkAdapter(cwd=repo_dir)
+    return NaysayerSdkAdapter(cwd=repo_dir, obligations=obligations)
+
+
+def _load_obligations_or_exit() -> ObligationsManifest:
+    """Load the loop-readable obligations manifest — fail-closed with ``SystemExit``.
+
+    The manifest (``spec/process/obligations.yaml``) holds the prompt clauses
+    that bind agent behaviour at runtime; a missing or malformed manifest would
+    silently degrade every session's prompt if the adapters loaded it themselves.
+    The composition root loads it once at daemon startup and converts any
+    :class:`~spirrow_mindwire.obligations.ObligationsError` into ``SystemExit`` so
+    the daemon refuses to start rather than serving weakened prompts. This is the
+    "loader 欠損時 fail-closed" invariant (Tier-C GO msg-737).
+    """
+    try:
+        return load_manifest()
+    except ObligationsError as exc:
+        # No path-override mechanism is exposed here on purpose: the composition
+        # root loads the in-repo manifest at its default location. Suggesting a
+        # non-existent override would misdirect the operator (naysayer round-3
+        # finding on this PR — "phantom path override"). Remediation is fixing
+        # the manifest file, or invoking the daemon from the repo root.
+        raise SystemExit(
+            f"obligations manifest failed to load — daemon cannot start with a degraded "
+            f"prompt set (this is fail-closed by design; fix spec/process/obligations.yaml "
+            f"and retry from the repo root): {exc}"
+        ) from exc
 
 
 def build_pr_review_driver(
@@ -356,12 +390,18 @@ def _build_dispatcher(
                 "MINDWIRE_LOOP__REPO_DIR"
             )
         repo_dir = Path(cfg.repo_dir)
+        # Load the loop-readable obligations manifest once, at the composition root, and
+        # pass it into every adapter that needs it. Fail-closed (SystemExit) on missing
+        # or malformed manifest — a silent degradation of the loop's actual instructions
+        # would be exactly the "correct-but-invisible fail-open" that
+        # spec/process/README.md warns against.
+        obligations = _load_obligations_or_exit()
         if proposer is None:
             proposer = build_proposer(repo_dir)
         if implementer is None:
-            implementer = build_implementer(repo_dir)
+            implementer = build_implementer(repo_dir, obligations=obligations)
         if naysayer is None:
-            naysayer = build_naysayer(repo_dir)
+            naysayer = build_naysayer(repo_dir, obligations=obligations)
 
     registry = build_registry(proposer=proposer, implementer=implementer, naysayer=naysayer)
     gateway = MagickitChatroomGateway(mcp)
