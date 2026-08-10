@@ -120,6 +120,28 @@ try {
 }
 finally { Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction SilentlyContinue }
 
+Write-Host "Clear-Quarantine — history root is ALWAYS a JSON array (never flip-flops with count)"
+# The PR-gate review on #138 called this out: without -AsArray, PowerShell's ConvertTo-Json unrolls
+# a one-element array into a bare object, so the file's root shape depended on how many clears had
+# happened. The script itself tolerates both on read, but any external reader (log ingester, dashboard,
+# a naysayer-tool built later) would be surprised in exactly the way that reproduces silent-schema-drift.
+# This test locks the shape in.
+$dataDir = New-DataFixture
+try {
+    # First clear -> exactly 1 element. THIS is the case that used to emit a JSON object.
+    $null = Invoke-Clear -DataDir $dataDir -Thread 'proj/T-broken' -Reason 'reason 1'
+    $raw = Get-Content -LiteralPath (Join-Path $dataDir "state\quarantine-history.json") -Raw -Encoding utf8
+    Check "history file starts with '[' after the first clear" $true ($raw.TrimStart().StartsWith('['))
+    Check "history file ends with ']' after the first clear" $true ($raw.TrimEnd().EndsWith(']'))
+
+    # Second clear -> 2 elements. Should still be an array (this always worked, but re-checking
+    # here means a future editor cannot 'simplify' the writer back into the flip-flop.)
+    $null = Invoke-Clear -DataDir $dataDir -Thread 'proj/T-other' -Reason 'reason 2'
+    $raw = Get-Content -LiteralPath (Join-Path $dataDir "state\quarantine-history.json") -Raw -Encoding utf8
+    Check "history file still starts with '[' after the second clear" $true ($raw.TrimStart().StartsWith('['))
+}
+finally { Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction SilentlyContinue }
+
 Write-Host ""
 if ($script:failures -gt 0) {
     Write-Host "Clear-Quarantine: $($script:failures) check(s) FAILED"

@@ -94,7 +94,12 @@ $entry = [ordered]@{
     record       = $removed
 }
 $history += $entry
-[System.IO.File]::WriteAllText($quarantineHistoryPath, ($history | ConvertTo-Json -Depth 6), $utf8NoBom)
+# -AsArray forces the root to be a JSON array even when $history has exactly one element. Without
+# it, ConvertTo-Json emits a single JSON object (PowerShell pipeline unrolls a one-element array),
+# so the root schema flip-flops between Object and Array depending on the entry count. This script
+# tolerates both shapes on read, but a file whose shape depends on its length is fragile for any
+# outside reader; making it always an array closes that surprise once.
+[System.IO.File]::WriteAllText($quarantineHistoryPath, (ConvertTo-Json -InputObject $history -Depth 6 -AsArray), $utf8NoBom)
 
 # Also drop the head-skip cache entry. Otherwise the next tick would see the current head match the
 # quarantined-time head and skip the launch — which defeats the point of clearing (the clear IS the

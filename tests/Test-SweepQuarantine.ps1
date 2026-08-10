@@ -115,19 +115,43 @@ Check "fingerprint does NOT carry git_rev (§1)" $false $hasGitRev
 Check "fingerprint does NOT carry config_hash (§1)" $false $hasConfigHash
 Check "tail preserved" 2 $rec.session_log_tail.Count
 
-Write-Host "Get-StarvedKeys — quarantined threads must count too (Q4 honesty rule)"
+Write-Host "Get-StarvedKeys — pivots on LIVE keys, not on the state file's accumulated keys"
 $eval = @{
     'p/T-fresh'        = @{ last_evaluated_at = $now.AddHours(-1).ToString('o') }
     'p/T-old-worked'   = @{ last_evaluated_at = $now.AddHours(-25).ToString('o') }
     'p/T-quarantined'  = @{ last_evaluated_at = $now.AddHours(-30).ToString('o') }
+    'p/T-never-live'   = @{ last_evaluated_at = $now.AddDays(-30).ToString('o') }
+    'p/T-just-seen'    = @{ first_seen_at    = $now.AddHours(-1).ToString('o') }
+    'p/T-never-launched-old' = @{ first_seen_at = $now.AddHours(-25).ToString('o') }
 }
-$starved = Get-StarvedKeys -EvaluatedState $eval -Now $now
+$live = @('p/T-fresh', 'p/T-old-worked', 'p/T-quarantined', 'p/T-brand-new',
+          'p/T-just-seen', 'p/T-never-launched-old')
+$starved = Get-StarvedKeys -EvaluatedState $eval -Now $now -LiveKeys $live
 Check "starved list includes 25h-idle thread" $true ($starved -contains 'p/T-old-worked')
-# The whole point: a quarantined thread's evaluation timestamp is never refreshed, so it appears
-# starved once its last real evaluation ages out. If this check ever fails, the metric has
-# silently developed a blind spot exactly where the design refuses to have one.
+# The whole point of the Q4 honesty rule: a quarantined thread's evaluation timestamp is never
+# refreshed, so it appears starved once its last real evaluation ages out. If this check ever fails,
+# the metric has silently developed a blind spot exactly where the design refuses to have one.
 Check "starved list includes an old quarantined thread" $true ($starved -contains 'p/T-quarantined')
 Check "starved list excludes a fresh thread" $false ($starved -contains 'p/T-fresh')
+# False-negative fix: a live candidate that has never actually launched (only first_seen_at is set)
+# must count once its first_seen_at ages past the threshold. Missing this reproduces the exact "dark
+# area" failure mode Q4 forbids — see the PR-gate review on #138.
+Check "starved list includes a never-launched live thread once its first_seen_at ages out" $true `
+    ($starved -contains 'p/T-never-launched-old')
+Check "starved list excludes a just-first-seen live thread (age < 24h)" $false `
+    ($starved -contains 'p/T-just-seen')
+# The other side of the same coin: a live candidate not in EvaluatedState at all must not be starved
+# on the very first tick — its 24h clock starts now, not at epoch zero. This complements the
+# runner-side first_seen_at write (which is what promotes 'p/T-brand-new' to a normal entry on the
+# next tick).
+Check "starved list excludes a live candidate absent from the state file" $false `
+    ($starved -contains 'p/T-brand-new')
+# False-positive fix: a state key that is no longer in the live sweep list must not appear. Without
+# pruning to $LiveKeys, folded threads sit in the file and their timestamps eventually age past the
+# threshold, spamming the digest with entries the operator can no longer act on. This check IS the
+# regression guard for the "removed keys spam forever" bug the PR-gate review named.
+Check "starved list excludes an ex-live thread (removed from the sweep list)" $false `
+    ($starved -contains 'p/T-never-live')
 
 Write-Host "Format-DurationDigest — coarse, readable, no seconds"
 Check "3d 4h" '3d 4h' (Format-DurationDigest -Span ([TimeSpan]::FromHours(76)))
@@ -138,7 +162,7 @@ Check "<1m" '<1m' (Format-DurationDigest -Span ([TimeSpan]::FromSeconds(15)))
 
 Write-Host "New-DailyDigest — empty day is a heartbeat, not a no-op (spec §5, §7)"
 $digest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
-    -HeadsByProject @{} -ControlByProject @{} -Now $now
+    -HeadsByProject @{} -ControlByProject @{} -Now $now -LiveKeys @()
 Check "empty digest still names the section '隔離中: 0 件'" $true ($digest -match '隔離中: 0 件')
 Check "empty digest still names the section '飢餓 .* 0 件'" $true ($digest -match '飢餓.*0 件')
 # The one thing an empty digest CANNOT do is be silent — that reproduces the failure mode this
@@ -160,7 +184,8 @@ $q = @{
 $heads = @{ p = @{ 'T-fresh' = 'msg-1'; 'T-escalated' = 'msg-2b'; 'T-stale-fp' = 'msg-3' } }
 $ctrls = @{ p = [pscustomobject]@{ desired_state = 'run' } }
 $digest = New-DailyDigest -QuarantineState $q -EvaluatedState @{} `
-    -HeadsByProject $heads -ControlByProject $ctrls -Now $now
+    -HeadsByProject $heads -ControlByProject $ctrls -Now $now `
+    -LiveKeys @('p/T-fresh', 'p/T-escalated', 'p/T-stale-fp')
 Check "digest mentions the escalated section" $true ($digest -match '\[escalated\]')
 Check "digest mentions the stale section" $true ($digest -match '\[stale\]')
 Check "digest carries the stale wording change" $true ($digest -match '直すか、スレッドを畳むか決めよ')
@@ -169,6 +194,34 @@ Check "digest carries the stale wording change" $true ($digest -match '直すか
 Check "escalated entry carries the head-change hint" $true ($digest -match 'T-escalated.*新規メッセージあり')
 Check "fresh entry has NO hint (nothing changed)" $true ($digest -notmatch 'T-fresh.*新規メッセージあり')
 Check "digest never uses the deleted 'input changed' wording (§4)" $true ($digest -notmatch '入力変化')
+
+Write-Host "New-DailyDigest — starvation section is pivoted on LIVE keys"
+# Same scenario as the Get-StarvedKeys checks: three live candidates, one launched-old, one
+# never-launched-old, one just-seen-fresh — plus a lingering non-live key that must NOT appear.
+$eval2 = @{
+    'p/T-launched-old' = @{ last_evaluated_at = $now.AddHours(-30).ToString('o') }
+    'p/T-never-old'    = @{ first_seen_at    = $now.AddHours(-30).ToString('o') }
+    'p/T-just-seen'    = @{ first_seen_at    = $now.AddHours(-1).ToString('o') }
+    'p/T-ex-live'      = @{ last_evaluated_at = $now.AddDays(-30).ToString('o') }
+}
+$live2 = @('p/T-launched-old', 'p/T-never-old', 'p/T-just-seen', 'p/T-brand-new')
+$digest2 = New-DailyDigest -QuarantineState @{} -EvaluatedState $eval2 `
+    -HeadsByProject @{} -ControlByProject @{} -Now $now -LiveKeys $live2
+Check "starvation section lists a launched-then-idle live thread" $true `
+    ($digest2 -match 'p/T-launched-old')
+Check "starvation section lists a never-launched live thread with old first_seen_at" $true `
+    ($digest2 -match 'p/T-never-old')
+Check "the never-launched entry is labelled (未評価)" $true `
+    ($digest2 -match 'p/T-never-old.*未評価')
+Check "starvation section excludes a just-seen live thread" $true `
+    ($digest2 -notmatch 'p/T-just-seen')
+Check "starvation section excludes a brand-new live thread absent from state" $true `
+    ($digest2 -notmatch 'p/T-brand-new')
+# The critical false-positive guard: a state key that is not on the live sweep list must not appear
+# in the digest, no matter how stale its timestamp. Without this, a folded thread would spam every
+# day forever. This check IS the regression guard for the failure mode the PR-gate review named.
+Check "starvation section excludes an ex-live thread (state file only)" $true `
+    ($digest2 -notmatch 'p/T-ex-live')
 
 Write-Host ""
 if ($script:failures -gt 0) {

@@ -374,7 +374,7 @@ forever.
 | `<data_dir>/state/notified.json` | last alert fired per thread, for de-duplication |
 | `<data_dir>/state/quarantine.json` | quarantined threads — one entry per `project/thread_id`; see *Quarantine and daily digest* |
 | `<data_dir>/state/quarantine-history.json` | append-only clear log; every `Clear-Quarantine` writes its `-Reason` here |
-| `<data_dir>/state/evaluated.json` | `last_evaluated_at` per thread — what the starvation metric reads |
+| `<data_dir>/state/evaluated.json` | `first_seen_at` + `last_evaluated_at` per **live** thread; the starvation metric pivots on the current sweep list and prunes ex-live keys |
 | `<data_dir>/state/digest.json` | `last_sent_at` of the daily digest — one send per 24h max |
 
 Deleting `heads.json` costs one full bootstrap sweep; `notified.json` at most one duplicate alert.
@@ -433,10 +433,28 @@ to values the runner already has in hand for its own purposes.** Widening the su
 brings one of coupling by overreach, silent coverage-loss on the metric, or false positives, and
 the digest is *the* load-bearing channel — polluting it degrades every entry on it.
 
-**Starvation metric.** `<data_dir>/state/evaluated.json` records `last_evaluated_at` per thread.
-"Evaluated" means the sweep launched the conductor and got a verdict (`worked`, `no-work`, or a
-non-zero exit); `head-skipped` / `quarantined-skipped` / `held` / `not-reached` do **not** reset it.
-A thread whose last evaluation is older than 24h shows up as `starved` in the digest and the log.
+**Starvation metric.** `<data_dir>/state/evaluated.json` records two fields per thread:
+`first_seen_at` (written the first tick a candidate appears on the sweep list, before any per-candidate
+decision) and `last_evaluated_at` (refreshed only when the sweep launched the conductor and got a
+verdict — `worked`, `no-work`, or a non-zero exit). `head-skipped` / `quarantined-skipped` / `held` /
+`not-reached` do **not** refresh either. A candidate whose effective age
+(`last_evaluated_at`, falling back to `first_seen_at`) is ≥24h shows up as `starved` in the digest
+and the log; a never-launched entry carries the `(未評価)` label so an operator's eye lands on it
+distinctly from "stuck after real work."
+
+The report is **pivoted on the current live sweep list**, not on the state file's accumulated keys.
+Two failure modes that pivot closes:
+
+- *False negatives* — a candidate that never enters `evaluated.json` (permanently `not-reached`
+  behind a K-budget hit, or held / quarantined on its very first tick) would be silently absent
+  from the metric if the report iterated over `evaluated.json`'s keys. That reproduces the exact
+  "suppressed dark area" Q4 forbids.
+- *False positives* — `evaluated.json` accumulates keys forever; without pruning, a folded thread
+  stays in the file, inevitably ages past the threshold, and spams the digest every day.
+
+The wrapper prunes any key not on the current sweep list and records `first_seen_at` for any new
+live key before any candidate decision — so the 24h clock ticks from first sight for a candidate
+that never launches, and a folded thread simply disappears from the metric.
 
 Quarantined threads are **included** in the starvation count. That is the design's honesty rule —
 a suppressed area on the "how long since I actually reached this candidate?" metric is exactly the

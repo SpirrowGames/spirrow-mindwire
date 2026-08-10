@@ -376,13 +376,30 @@ function Format-DurationDigest {
 # Build the daily digest string. Sent even when both lists are empty — a silent day IS the point,
 # because "no alert" then still means "the channel is alive," which is what the 5h failure
 # specifically lacked (spec/msg-814 §5, §7).
+#
+# The starvation report is pivoted on `$LiveKeys` — the sweep list of the current tick — not on the
+# keys accumulated in `$EvaluatedState`. Two failure modes that pivot fixes:
+#   1. False negatives. A candidate that never launched (permanently `not-reached` behind a K-budget
+#      hit, or held/quarantined on creation) never enters `EvaluatedState` and would silently be
+#      invisible to the metric. That reproduces the exact "suppressed dark area" Q4 forbids.
+#   2. False positives. `EvaluatedState` accumulates keys forever; a folded thread stays in the
+#      file, inevitably ages past the threshold, and spams the digest every day.
+# Iterating over the live sweep list closes both — and it is the *only* metric that meaningfully
+# answers "how long since we actually reached this candidate?", because "this candidate" only exists
+# for the sweep in the first place through the sweep list.
+#
+# Age fallback: when a live key has no `last_evaluated_at` yet (never launched), the wrapper writes
+# `first_seen_at` the first tick the candidate appears, and the age is computed against that. So a
+# newly-added candidate is not "immediately starved" — its 24h clock starts ticking from first
+# sight, which is the earliest moment the metric can honestly say the thread was in scope.
 function New-DailyDigest {
     param(
         [hashtable]$QuarantineState,
         [hashtable]$EvaluatedState,
         [hashtable]$HeadsByProject,
         [hashtable]$ControlByProject,
-        [datetime]$Now
+        [datetime]$Now,
+        [string[]]$LiveKeys = @()
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -420,15 +437,27 @@ function New-DailyDigest {
         }
     }
 
-    # Starvation: last_evaluated_at older than the threshold OR never evaluated.
+    # Starvation. Pivoted on $LiveKeys, NOT $EvaluatedState.Keys — the same reason the header of
+    # this function spells out. A live key that is absent from $EvaluatedState (never launched) is
+    # a legitimate starvation candidate; a state key that is not live (folded from the sweep list)
+    # is not, and must not appear here.
     $starvedList = @()
-    foreach ($key in $EvaluatedState.Keys) {
-        $lastAtStr = $EvaluatedState[$key].last_evaluated_at
-        if (-not $lastAtStr) { continue }
-        $lastAt = [datetime]::Parse($lastAtStr).ToUniversalTime()
-        $age = $Now - $lastAt
+    foreach ($key in $LiveKeys) {
+        $entry = if ($EvaluatedState.ContainsKey($key)) { $EvaluatedState[$key] } else { $null }
+        $lastAtStr = if ($entry) { $entry.last_evaluated_at } else { $null }
+        $firstSeenStr = if ($entry) { $entry.first_seen_at } else { $null }
+        # Fallback ladder: last_evaluated_at (best), else first_seen_at (candidate has never launched
+        # but was in scope from tick T), else THIS tick (a candidate the sweep just discovered — its
+        # 24h clock starts now, so it is not yet starved).
+        $ageBase = if ($lastAtStr) { [datetime]::Parse($lastAtStr).ToUniversalTime() }
+                   elseif ($firstSeenStr) { [datetime]::Parse($firstSeenStr).ToUniversalTime() }
+                   else { $Now }
+        $age = $Now - $ageBase
         if ($age -ge $script:StarvedThreshold) {
-            $starvedList += "  $key   $(Format-DurationDigest -Span $age)"
+            # A "never evaluated" thread carries a slightly different label so the operator does not
+            # spend cognitive effort deciding whether the entry means "stuck" or "never touched."
+            $suffix = if (-not $lastAtStr) { "   (未評価)" } else { "" }
+            $starvedList += "  $key   $(Format-DurationDigest -Span $age)$suffix"
         }
     }
 
@@ -471,18 +500,32 @@ function New-DailyDigest {
     return ($lines -join "`n")
 }
 
-# The starvation view over the evaluation timestamps. A thread key appears here IFF its last
-# evaluated time is older than $StarvedThreshold. Quarantined threads are INCLUDED — the spec is
+# The starvation view. Pivoted on the LIVE sweep candidates ($LiveKeys), not on the keys that
+# happen to have accumulated in $EvaluatedState. See the header of New-DailyDigest for why: pivoting
+# on the state file opens exactly the two failure modes this whole design refuses (silently dropping
+# never-launched candidates, and permanently spamming for folded ones).
+#
+# A live key IS starved when its effective evaluation age (last_evaluated_at, or first_seen_at when
+# never launched) is at least $Threshold. Quarantined threads are INCLUDED — their timestamps are
+# never refreshed while quarantined, so they age past the threshold on their own; the spec is
 # explicit that this metric's honesty depends on the quarantine-induced dark area being visible
 # (msg-814 Q4).
 function Get-StarvedKeys {
-    param([hashtable]$EvaluatedState, [datetime]$Now, [TimeSpan]$Threshold = $script:StarvedThreshold)
+    param(
+        [hashtable]$EvaluatedState,
+        [datetime]$Now,
+        [TimeSpan]$Threshold = $script:StarvedThreshold,
+        [string[]]$LiveKeys = @()
+    )
     $out = @()
-    foreach ($key in $EvaluatedState.Keys) {
-        $lastAtStr = $EvaluatedState[$key].last_evaluated_at
-        if (-not $lastAtStr) { continue }
-        $lastAt = [datetime]::Parse($lastAtStr).ToUniversalTime()
-        if (($Now - $lastAt) -ge $Threshold) { $out += $key }
+    foreach ($key in $LiveKeys) {
+        $entry = if ($EvaluatedState.ContainsKey($key)) { $EvaluatedState[$key] } else { $null }
+        $lastAtStr = if ($entry) { $entry.last_evaluated_at } else { $null }
+        $firstSeenStr = if ($entry) { $entry.first_seen_at } else { $null }
+        $ageBase = if ($lastAtStr) { [datetime]::Parse($lastAtStr).ToUniversalTime() }
+                   elseif ($firstSeenStr) { [datetime]::Parse($firstSeenStr).ToUniversalTime() }
+                   else { $Now }
+        if (($Now - $ageBase) -ge $Threshold) { $out += $key }
     }
     return $out
 }
@@ -849,6 +892,29 @@ try {
         }
     }
 
+    # The live sweep list, as a bare key list. Passed to the starvation report (which pivots on it,
+    # not on $EvaluatedState.Keys) and used below to prune stale keys and record first-seen times.
+    $liveKeys = @($candidates | ForEach-Object { $_.key })
+
+    # Prune any key that is no longer on the sweep list. Left in place, folded threads sit in the
+    # state file forever and their timestamps eventually age past the threshold — spamming the daily
+    # digest with entries the operator can no longer act on. Pruning is safe: a thread put back on
+    # the list will get a fresh first_seen_at on the very same tick.
+    foreach ($k in @($evaluatedState.Keys)) {
+        if ($liveKeys -notcontains $k) { [void]$evaluatedState.Remove($k) }
+    }
+
+    # Record first-seen for every live candidate that has never entered the file. This is the
+    # timestamp the starvation clock ticks from when the candidate never actually launches (held on
+    # creation, immediately quarantined, or permanently 'not-reached' behind a K-budget hit). Set
+    # BEFORE any per-candidate decision so a held/quarantined-on-creation thread still starts its
+    # clock.
+    foreach ($k in $liveKeys) {
+        if (-not $evaluatedState.ContainsKey($k)) {
+            $evaluatedState[$k] = @{ first_seen_at = $nowUtc.ToString("o") }
+        }
+    }
+
     $inner = Join-Path $PSScriptRoot "run-conductor.ps1"
     $didWork = $false
     $attempt = 0
@@ -965,7 +1031,13 @@ try {
         # An actual evaluation happened — reset the starvation clock for this thread. Any launched
         # verdict counts, even a non-zero exit: it still tells us the thread was tried this tick,
         # which is the metric's meaning ("how long since I actually reached this candidate?").
-        $evaluatedState[$cand.key] = @{ last_evaluated_at = $nowUtc.ToString("o") }
+        # first_seen_at is preserved: it records the first tick this key appeared on the sweep list,
+        # which is the fallback the starvation report uses if last_evaluated_at is ever cleared.
+        $firstSeen = $null
+        if ($evaluatedState.ContainsKey($cand.key)) { $firstSeen = $evaluatedState[$cand.key].first_seen_at }
+        $rowUpdate = @{ last_evaluated_at = $nowUtc.ToString("o") }
+        if ($firstSeen) { $rowUpdate.first_seen_at = $firstSeen }
+        $evaluatedState[$cand.key] = $rowUpdate
 
         # NON-ZERO EXIT — quarantine, notify, keep going. The old wrapper broke the sweep here
         # (silent), which was the exact failure mode of the 2026-08-11 5h starvation on threads
@@ -1072,7 +1144,8 @@ try {
     # Starvation report. Included in the log every tick that logs anything (an idle tick still
     # collapses to one line), so the metric is visible without waiting for the digest. The digest is
     # the "someone WILL see this" channel; the log line is "someone COULD see this in context."
-    $starved = Get-StarvedKeys -EvaluatedState $evaluatedState -Now $nowUtc
+    # Pivoted on $liveKeys — see New-DailyDigest's header for the two failure modes this closes.
+    $starved = Get-StarvedKeys -EvaluatedState $evaluatedState -Now $nowUtc -LiveKeys $liveKeys
     if ($starved.Count -gt 0) {
         Confirm-LogWorthKeeping
         Write-Log "starved threads (>=$(Format-DurationDigest -Span $StarvedThreshold) since last evaluation): $($starved -join ', ')"
@@ -1090,7 +1163,8 @@ try {
     if ($digestDue) {
         $digest = New-DailyDigest -QuarantineState $quarantineState `
             -EvaluatedState $evaluatedState `
-            -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc
+            -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc `
+            -LiveKeys $liveKeys
         Confirm-LogWorthKeeping
         Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved)"
         $sent = Send-Notification -Message $digest
