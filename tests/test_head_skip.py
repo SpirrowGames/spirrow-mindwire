@@ -48,6 +48,16 @@ The 14 tests here are the finalised list from the spec dispatched into the imple
     cache for HEAD_CACHE_TTL (60 min): subsequent ticks would synthesise ``NEXT: `` and either
     bypass a real ``NEXT: human`` SKIP or ignore progress under the same head msg id. The
     observation fields must be preserved from ``prior_record`` (also naysayer round 2).
+19. Park→resume: a spinning thread parked with ``NEXT: human`` (SKIP) and then resumed to the
+    SAME pre-park nomination must LAUNCH immediately, not eat the residual pre-park backoff.
+    The ``progressed`` check has three disjuncts, and the third (``token !=
+    last_observed_nomination``) is the operator-intervention detector (Tier B naysayer round 3
+    on PR #140). Without it, an operator's SKIP + resume looks like a continuation of the
+    original spin, and the resumed thread waits up to CAP (60 min) before actually starting.
+20. Spin continues climbing across ``commit_observation`` DEFERs when the token stays the same:
+    naysayer round 3's fix must NOT accidentally trip progressed for a plain spin. This test
+    is a regression guard against reverting the round-1 "commit_observation preserves the
+    launch baseline" fix.
 """
 
 from __future__ import annotations
@@ -1001,3 +1011,192 @@ def test_commit_launch_head_fetched_false_preserves_prior_observation() -> None:
     assert rec_c.last_observed_head_msg_id == "msg-2"
     assert rec_c.last_observed_nomination == "einstein"
     assert rec_c.head_observed_at == now
+
+
+# --- 19. park -> resume: intermediate SKIP + resume-to-same-token launches immediately ----------
+
+
+def test_park_and_resume_to_same_token_is_progress_and_launches_immediately() -> None:
+    """A parked thread resumed to the SAME pre-park nomination must LAUNCH now, not wait backoff.
+
+    Tier B naysayer round 3 (PR #140). Scenario:
+      T1..Tn: thread spins on ``NEXT: bohr``, backoff accumulates to CAP.
+      Tp:     operator parks it by posting ``NEXT: human``. SKIP. Launch baseline unchanged
+              (still ``bohr``), observation now ``human``.
+      Tr:     operator resumes to the same ``NEXT: bohr``.
+
+    Under the old two-disjunct progressed check (``token != baseline_nomination`` OR
+    ``control changed``), disjunct 1 is False (``bohr != bohr``) and disjunct 2 is False
+    (control unchanged): the intervention is invisible and the resumed thread eats the
+    remainder of the pre-park backoff (up to CAP = 60 min).
+
+    The fix: a third disjunct compares against ``last_observed_nomination``, which the SKIP
+    updated to ``human``. On resume, ``bohr != human`` -> progressed=True -> LAUNCH now, not
+    DEFER.
+    """
+    now = _T0
+    # State after spinning to attempts=4 (delay CAP = 60 min) and then being parked:
+    #   - launch baseline still points at the spin (bohr / attempts=4)
+    #   - observation reflects the current parked state (human)
+    rec_parked = Record(
+        last_launch_at=now - timedelta(minutes=30),  # 30 min into the 60 min CAP delay
+        nomination_at_launch="bohr",
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-100",
+        launch_attempts=4,
+        head_observed_at=now - timedelta(minutes=1),
+        last_observed_head_msg_id="msg-101",  # the operator's `NEXT: human` msg
+        last_observed_nomination="human",  # SKIP updated this
+    )
+
+    # Resume: operator posts msg-102 with NEXT: bohr — the pre-park nomination.
+    v = decide(
+        now=now,
+        head_msg_id="msg-102",
+        head_body=_body("Bohr"),
+        control_state="run",  # control unchanged
+        record=rec_parked,
+    )
+
+    # Progressed detects the resume even though baseline and control did not change.
+    assert v.progressed is True
+    assert v.decision is Decision.LAUNCH
+    assert v.reason == "progressed"
+    # attempts reset: the operator intervention starts a fresh series.
+    assert v.attempts_after == 1
+    # Zero delay: no residual pre-park backoff applies.
+    assert v.delay == timedelta(0)
+
+
+def test_park_and_resume_to_different_token_launches_immediately_too() -> None:
+    """A parked thread resumed to a DIFFERENT nomination also launches now (disjunct 1 fires).
+
+    Belt-and-suspenders: this case would launch even without the round-3 fix (disjunct 1 fires
+    on ``einstein != bohr``), but pinning it here makes explicit that the two paths converge to
+    the same "immediate launch" verdict, so a future refactor cannot silently favour one
+    disjunct over the other.
+    """
+    now = _T0
+    rec_parked = Record(
+        last_launch_at=now - timedelta(minutes=30),
+        nomination_at_launch="bohr",
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-100",
+        launch_attempts=4,
+        head_observed_at=now - timedelta(minutes=1),
+        last_observed_head_msg_id="msg-101",
+        last_observed_nomination="human",
+    )
+    v = decide(
+        now=now,
+        head_msg_id="msg-102",
+        head_body=_body("Einstein"),  # different from pre-park bohr
+        control_state="run",
+        record=rec_parked,
+    )
+    assert v.progressed is True
+    assert v.decision is Decision.LAUNCH
+    assert v.attempts_after == 1
+
+
+# --- 20. round-3 fix does NOT break the pure spin case (regression guard) -----------------------
+
+
+def test_spin_still_climbs_backoff_when_only_head_msg_id_changes() -> None:
+    """Every commit_observation DEFER between two LAUNCHes must NOT trip progressed=True.
+
+    Regression guard against naysayer round 3's fix over-firing: if the third disjunct
+    (``token != last_observed_nomination``) fired on a plain spin, every intermediate DEFER
+    (which sets ``last_observed_nomination = token``) would still leave the fields equal, so
+    it should NOT trip. But a subtle bug could compare against a STALE observation. Pin this
+    explicitly.
+
+    Sequence: LAUNCH on `bohr`; 3 DEFER ticks (head msg-id moves each time, token stays `bohr`);
+    then backoff-elapsed. attempts must climb to 2 on the second LAUNCH, not reset to 1.
+    """
+    now = _T0
+    rec = commit_launch(
+        now=now,
+        head_msg_id="msg-1",
+        verdict=Verdict(
+            decision=Decision.LAUNCH,
+            reason="no-prior-record",
+            token="bohr",
+            token_raw="Bohr",
+            progressed=False,
+            attempts_before=0,
+            attempts_after=1,
+            delay=timedelta(0),
+            eligible_at=now,
+        ),
+        control_state="run",
+        head_fetched=True,
+    )
+    assert rec.launch_attempts == 1
+    assert rec.nomination_at_launch == "bohr"
+    assert rec.last_observed_nomination == "bohr"
+
+    # 3 DEFER ticks (each with a fresh head msg id but the same nomination token).
+    for i in range(1, 4):
+        rec = commit_observation(
+            now=now + timedelta(minutes=i),
+            head_msg_id=f"msg-{1 + i}",
+            token="bohr",  # unchanged
+            record=rec,
+        )
+        # Neither the launch baseline nor the counter moved.
+        assert rec.nomination_at_launch == "bohr"
+        assert rec.launch_attempts == 1
+        # Observation stays `bohr` on every DEFER (the disjunct-3 guard against park→resume
+        # false positives depends on this — an unchanged spin must NOT look like a resume).
+        assert rec.last_observed_nomination == "bohr"
+
+    # Backoff elapsed (attempts=1 -> delay=BASE=15min). LAUNCH now, climbing to attempts=2.
+    v = decide(
+        now=now + BASE,
+        head_msg_id="msg-99",  # head moved again, still same token
+        head_body=_body("Bohr"),
+        control_state="run",
+        record=rec,
+    )
+    assert v.decision is Decision.LAUNCH
+    assert v.reason == "backoff-elapsed"  # NOT "progressed"
+    assert v.progressed is False  # spin did NOT progress
+    assert v.attempts_after == 2  # climbed to 2, NOT reset to 1
+
+
+def test_disjunct_3_is_gated_against_empty_last_observed_nomination() -> None:
+    """The third disjunct MUST NOT fire when ``last_observed_nomination == ""``.
+
+    Empty observation means "we have not observed via a non-launch, or fail-open erased it".
+    Comparing against it would trip disjunct 3 for every non-empty token, which:
+      - would break the ``test_defer_does_not_consume_an_attempt`` case (record with empty
+        observation, token=`bohr`, DEFER expected but progressed would fire and LAUNCH);
+      - would double-count with disjunct 1 on fail-open recovery (baseline also empty →
+        disjunct 1 fires; no need to redundantly fire disjunct 3);
+      - is not the naysayer's scenario anyway (their scenario has an intermediate SKIP
+        producing a NON-empty observation).
+
+    Pin the gate so a "simplification" that drops it is caught.
+    """
+    now = _T0
+    rec = Record(
+        last_launch_at=now,
+        nomination_at_launch="bohr",
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-1",
+        launch_attempts=1,
+        head_observed_at=now,
+        last_observed_head_msg_id="",  # hand-constructed / never observed
+        last_observed_nomination="",
+    )
+    # Same token as baseline, one second later. Would DEFER under the correct predicate.
+    v = decide(
+        now=now + timedelta(seconds=1),
+        head_msg_id="msg-2",
+        head_body=_body("Bohr"),
+        control_state="run",
+        record=rec,
+    )
+    assert v.decision is Decision.DEFER
+    assert v.progressed is False  # empty observation must NOT trip disjunct 3

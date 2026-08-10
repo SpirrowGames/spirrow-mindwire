@@ -40,11 +40,18 @@ occupied the sweep's whole throughput and *starved* the other 13 candidates behi
    delay elapses. This is the design's core invariant: **backoff is a floor on launch rate, not a
    permanent silence.**
 
-4. **Progress unwinds the backoff.** ``progressed`` is ``True`` when EITHER the nomination token OR
-   the control state changed since the last recorded launch. Head-msg-id changes ALONE do NOT
-   count as progress: two different msg-ids that both say ``NEXT: Bohr`` under the same control
-   state are, for scheduling purposes, the same input. The head msg-id is still recorded
-   (``head_msg_id_at_launch``) for **audit only**; it is never consulted by :func:`decide`.
+4. **Progress unwinds the backoff.** ``progressed`` is ``True`` when ANY of three moves is
+   detected: (a) the nomination differs from the last LAUNCH baseline
+   (``nomination_at_launch``), (b) the control state differs from the last LAUNCH baseline, or
+   (c) the nomination differs from the last OBSERVATION (``last_observed_nomination`` — which
+   captures SKIPs / DEFERs, not only LAUNCHes). Disjunct (c) is what makes a **park→resume** a
+   progress event: a thread parked with ``NEXT: human`` (SKIP) and then resumed to the
+   pre-park nomination has the SAME launch baseline, but the intermediate ``human`` observation
+   is visible in ``last_observed_nomination``, so backoff is correctly reset. Head-msg-id
+   changes ALONE do NOT count as progress: two different msg-ids that both say ``NEXT: Bohr``
+   under the same control state are, for scheduling purposes, the same input. The head msg-id
+   is still recorded (``head_msg_id_at_launch``) for **audit only**; it is never consulted by
+   :func:`decide`.
 
 5. **Head cache TTL** (:attr:`HEAD_CACHE_TTL`). Head-msg-id equality does not catch an *edit* to
    the existing head message (the msg id is unchanged, only its body is). To bound how long a
@@ -336,10 +343,40 @@ def decide(
             eligible_at=now,
         )
 
-    # Progress = nomination OR control moved. Head msg-id is deliberately NOT read here — the
-    # spec-degeneracy failure was precisely a moving head with unchanged nomination+control, and
-    # trusting head msg-id would reintroduce it. Head msg-id is stored in the record for AUDIT.
-    progressed = token != record.nomination_at_launch or control_state != record.control_at_launch
+    # Progress = the environment moved since we last observed it. Three disjuncts, all needed:
+    #
+    #   1. ``token != nomination_at_launch``: the nomination has changed since the last LAUNCH
+    #      baseline. This is the primary "spin has ended" signal — and it also catches a
+    #      fail-open recovery (a prior LAUNCH with head_fetched=False committed an empty
+    #      baseline; a subsequent successful fetch with any real token trips this).
+    #   2. ``control_state != control_at_launch``: control routing has changed since the last
+    #      LAUNCH — a hold-then-run transition, for example, routes a naysayer→implementer
+    #      handoff differently.
+    #   3. ``last_observed_nomination`` is populated AND ``token`` differs from it: the
+    #      nomination has changed since the last OBSERVATION (which includes SKIPs and DEFERs,
+    #      not only LAUNCHes). This is the park→resume detector (Tier B naysayer round 3, PR
+    #      #140): if a spinning thread on ``NEXT: bohr`` is parked by an operator posting
+    #      ``NEXT: human`` and later resumed to the same ``NEXT: bohr``, disjuncts 1 & 2 are
+    #      both False (baseline is still bohr / unchanged control), but the intermediate
+    #      ``human`` observation lives in ``last_observed_nomination`` — disjunct 3 fires,
+    #      backoff resets, LAUNCH is immediate. Without this disjunct, the operator's
+    #      intervention would be invisible and the resumed thread would eat the remainder of
+    #      the pre-park backoff (up to CAP = 60 min).
+    #
+    #      The ``last_observed_nomination != ""`` guard keeps disjunct 3 quiet when there is no
+    #      observation to compare against — either a hand-constructed record in a test or a
+    #      never-actually-observed thread (a fresh-record fail-open LAUNCH commits an empty
+    #      observation; a later successful fetch tripping this would double-count with disjunct
+    #      1, which already fires from the empty baseline). Empty-vs-empty is not progress.
+    #
+    # Head msg-id is deliberately NOT read here — the spec-degeneracy failure was precisely a
+    # moving head with unchanged nomination+control, and trusting head msg-id would reintroduce
+    # it. Head msg-id is stored in the record for AUDIT only.
+    progressed = (
+        token != record.nomination_at_launch
+        or control_state != record.control_at_launch
+        or (record.last_observed_nomination != "" and token != record.last_observed_nomination)
+    )
 
     attempts_before = record.launch_attempts
     # Progressed launches reset the backoff counter to 0 BEFORE they add themselves — so the next
