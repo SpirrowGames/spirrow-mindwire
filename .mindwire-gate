@@ -12,5 +12,7 @@ uv run mypy src tests
 # the loop host; a missing pwsh is a real breakage of this gate, not a reason to skip the check.
 pwsh -NoProfile -File tests/Test-SweepHeadCache.ps1
 pwsh -NoProfile -File tests/Test-SweepHoldGate.ps1
+pwsh -NoProfile -File tests/Test-SweepQuarantine.ps1
+pwsh -NoProfile -File tests/Test-ClearQuarantine.ps1
 pwsh -NoProfile -File tests/Test-SyncRepo.ps1
 uv run pytest

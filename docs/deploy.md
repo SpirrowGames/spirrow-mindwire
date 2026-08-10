@@ -14,7 +14,8 @@ The pieces, and which file owns each:
 | File | Role |
 |---|---|
 | `deploy/run-conductor.ps1` | drives **one** thread to a stop condition and exits. Env + secrets + UTF-8 |
-| `deploy/run-conductor-scheduled.ps1` | **what Task Scheduler runs.** Deploys, picks the thread, skips threads that have not moved, logs, notifies |
+| `deploy/run-conductor-scheduled.ps1` | **what Task Scheduler runs.** Deploys, picks the thread, skips threads that have not moved, logs, notifies, **quarantines failures** |
+| `deploy/Clear-Quarantine.ps1` | the one legitimate way to release a quarantined thread — records the reason to `state/quarantine-history.json` |
 | `deploy/sync-repo.ps1` | fast-forwards this checkout to `origin/main` — merging is not deploying |
 | `scripts/thread_heads.py` | the work detector — one chatroom call, every thread's head message id |
 | `deploy/sync-clock-http.ps1` | clock correction, because NTP cannot leave this host |
@@ -371,9 +372,143 @@ forever.
 | `<data_dir>/logs/clock-YYYY-MM-DD.log` | clock-sync log |
 | `<data_dir>/state/heads.json` | last head message id observed per thread — the skip decision above |
 | `<data_dir>/state/notified.json` | last alert fired per thread, for de-duplication |
+| `<data_dir>/state/quarantine.json` | quarantined threads — one entry per `project/thread_id`; see *Quarantine and daily digest* |
+| `<data_dir>/state/quarantine-history.json` | append-only clear log; every `Clear-Quarantine` writes its `-Reason` here |
+| `<data_dir>/state/evaluated.json` | `first_seen_at` + `last_evaluated_at` per **live** thread; the starvation metric pivots on the current sweep list and prunes ex-live keys |
+| `<data_dir>/state/digest.json` | `last_sent_at` of the daily digest — one send per 24h max |
 
-Deleting either state file is safe: `heads.json` costs one full bootstrap sweep, `notified.json`
-costs at most one duplicate alert.
+Deleting `heads.json` costs one full bootstrap sweep; `notified.json` at most one duplicate alert.
+Deleting `quarantine.json` **un-quarantines every thread silently** — do not do it as a shortcut for
+`Clear-Quarantine`; the history file exists precisely so cleared-with-reason and cleared-without-
+context are not confusable later. Deleting `evaluated.json` resets the starvation clock (harmless,
+one tick of empty starvation report). Deleting `digest.json` forces the next tick to send a digest.
+
+## Quarantine and daily digest
+
+**Why it exists.** The prior wrapper broke the sweep on any non-zero exit. That fail-safe stopped a
+real failure from being laundered into "everything idle" — but the mechanism was itself silent: the
+loop just stopped, every candidate behind the broken one starved, and nothing announced the state
+anywhere. Measured 2026-08-11, five unattended hours on threads that had work. The direct cause of
+that specific starvation is closed (PR #136 / `OBL-MERGE-MECHANISM`); this section describes the
+mechanism that keeps the NEXT unknown breakage from dying the same silent way.
+
+**Signal / scheduling split.** A non-zero exit now
+1. is **declared** — the candidate is written into `state/quarantine.json` and a Discord alert
+   fires,
+2. does **not** stop the sweep — the next candidate is tried, so downstream work still progresses.
+
+The old sweep-break fail-safe is retained but re-aimed: only a **failure to write the declaration**
+(and a "conductor stopped: … rounds=…" line that never arrived) breaks the sweep. If we cannot
+even record what went wrong, we still cannot quietly move on.
+
+**K-budget (2 per sweep).** Two quarantines in one tick suggest a shared cause; a third would spend
+another inference on that same cause before stopping. At K=2 the sweep breaks and a "systemic
+cause suspected" notification fires. Remaining candidates count as `not-reached` on the starvation
+metric — the honesty rule below.
+
+**Escalation ladder.** A quarantine record's derived state is a function of its age, not any
+scheduling flag (it stays skipped either way):
+
+| Age | State | Digest wording |
+|---|---|---|
+| 0–24h | `quarantined` | plain listing |
+| 24h–7d | `escalated` | broken out at the top of the digest; state-transition alert fires once |
+| ≥7d | `stale` | "fix it or fold the thread"; state-transition alert fires once |
+
+Only a human clear (`Clear-Quarantine`) ever transitions a thread out. There is deliberately no
+auto-clear on a `(head, control)` change — see *Fingerprint hint* below.
+
+**Fingerprint hint.** Each quarantine record stores the `(head, control)` pair observed at the
+failure. On every daily digest the current probe is compared against it; the difference is shown
+as a hint next to the entry:
+
+- current head ≠ stored head → `⚠ 新規メッセージあり (head 変化)`
+- current control ≠ stored control → `⚠ control 変更あり`
+- neither changed → **no hint** — meaning "no new head, no control change," **not** "not fixed."
+
+The runner does not read fingerprints for scheduling. The two components are the *same* pair the
+head-skip cache already computes each tick — no new observation surface, no external state, no
+`git rev`, no `config hash`. The general rule this follows: **fingerprint components are limited
+to values the runner already has in hand for its own purposes.** Widening the surface always
+brings one of coupling by overreach, silent coverage-loss on the metric, or false positives, and
+the digest is *the* load-bearing channel — polluting it degrades every entry on it.
+
+**Starvation metric.** `<data_dir>/state/evaluated.json` records two fields per thread:
+`first_seen_at` (written the first tick a candidate appears on the sweep list, before any per-candidate
+decision) and `last_evaluated_at` (refreshed on every disposition where the sweep actually reached
+the candidate — a launched verdict of `worked` / `no-work` / non-zero exit, **and** a `head-skipped`
+where the sweep probed the head and proved nothing had moved). `quarantined-skipped` /
+`held` / `not-reached` do **not** refresh — the sweep never asked the question for those, and
+that is the whole point of the metric. A candidate whose effective age
+(`last_evaluated_at`, falling back to `first_seen_at`) is ≥24h shows up as `starved` in the digest
+and the log; a never-launched entry carries the `(未評価)` label so an operator's eye lands on it
+distinctly from "stuck after real work."
+
+> A head-skip counts even though nothing was launched, because the metric asks "how long since I
+> actually reached this candidate?" and a head-skip IS reaching: the sweep probes the chatroom,
+> sees the head has not moved (or the control state has not changed), and correctly fast-paths.
+> If a head-skip did *not* refresh, every legitimately-idle thread over a weekend would flag as
+> starved on Monday, the digest would fill with perfectly healthy inactive threads, and the metric
+> would be trained into noise. The distinction that matters is "did the sweep evaluate this?",
+> not "did the sweep launch an inference for this?".
+
+The report is **pivoted on the current live sweep list**, not on the state file's accumulated keys.
+Two failure modes that pivot closes:
+
+- *False negatives* — a candidate that never enters `evaluated.json` (permanently `not-reached`
+  behind a K-budget hit, or held / quarantined on its very first tick) would be silently absent
+  from the metric if the report iterated over `evaluated.json`'s keys. That reproduces the exact
+  "suppressed dark area" Q4 forbids.
+- *False positives* — `evaluated.json` accumulates keys forever; without pruning, a folded thread
+  stays in the file, inevitably ages past the threshold, and spams the digest every day.
+
+The wrapper prunes any key not on the current sweep list and records `first_seen_at` for any new
+live key before any candidate decision — so the 24h clock ticks from first sight for a candidate
+that never launches, and a folded thread simply disappears from the metric.
+
+Quarantined threads are **included** in the starvation count. That is the design's honesty rule —
+a suppressed area on the "how long since I actually reached this candidate?" metric is exactly the
+silent degradation this whole file exists to end. If it hurts to see the same thread in both
+sections, that is the metric working.
+
+**Daily digest.** Sent through the same Discord webhook, at most once per 24h from the last send.
+**Sent even when both lists are empty.** The empty-day digest is not decoration: it is a positive
+heartbeat that proves the channel is alive. "No alert" without a heartbeat would mean either
+"nothing wrong" or "the webhook died" — those two are indistinguishable, which was exactly the
+5-hour failure mode. The digest closes that ambiguity; what it cannot close is *the human not
+reading the digest*, which is not channel failure but operational abandonment. Machines cannot
+detect that; do not try to.
+
+**Where the tunables live.** Failure budget, escalation cutoff, stale cutoff and starvation
+cutoff are collected in one block at the top of `deploy/run-conductor-scheduled.ps1` under the
+comment "NONE OF THESE FOUR ARE DERIVED VALUES." They are policy calls (K=2, escalated=24h,
+stale=7d, starved=24h), not derived from anything, and the comment says so beside each value along
+with the observation that would trigger revisiting it. Do not scatter magic numbers away from that
+block.
+
+### Clearing a quarantine
+
+```powershell
+pwsh deploy/Clear-Quarantine.ps1 -Thread 'spirrow-mindwire/T-foo-bar' -Reason 'root cause fixed in #999'
+```
+
+The `-Reason` is required and is appended to `state/quarantine-history.json` — this text is the
+first-hand data for whether the quarantine judgement was over-sensitive (`Clear-Quarantine`
+frequency is the signal, `-Reason` is the payload). Clearing also drops the `heads.json` entry for
+the thread, so the next tick launches instead of head-skipping to the same head that was
+quarantined under.
+
+**Running Clear-Quarantine while the sweep is running is safe.** A single tick reads its state
+files once at start and holds them in memory for the whole run (measured minutes on a real
+AI-driven candidate). Without care, that stale in-memory map would silently overwrite the
+operator's disk write at end-of-tick and resurrect the entry — the sort of failure the whole
+quarantine story exists to end. So the sweep uses **merge-on-write**: at flush time it re-reads
+`quarantine.json` and `heads.json` from disk, and any key the operator removed during the tick
+stays removed. New adds from the sweep still land, age-driven state transitions still land; only
+operator-cleared entries survive the merge. This narrows the race from "the whole tick" to
+"between the re-read and the write" (sub-millisecond). Closing that residual window would take a
+file lock, and a multi-minute sweep holding a lock would block the operator for that entire time,
+defeating the point of a human-operable clear.
 
 ## Human-handoff notifications
 

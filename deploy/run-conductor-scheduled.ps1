@@ -11,7 +11,7 @@
 #      project control state are both unchanged since the last time the conductor ran on it,
 #   4. writes each remaining candidate into <data_dir>/config/mindwire.toml [conductor].task_thread_id,
 #   5. runs the real launcher, stopping at the first thread that actually ran rounds, and
-#   6. pushes a Discord notification whenever the loop parks on a human.
+#   6. pushes a Discord notification whenever the loop parks on a human OR a candidate is quarantined.
 #
 # (1) is an operator stop switch, set from the conclair dashboard or `loop_control_set` and stored
 # per project. It is a cost optimisation here, NOT the enforcement — the conductor reads the same
@@ -34,11 +34,61 @@
 # Overlapping runs need no handling here — the task is registered MultipleInstancesPolicy=IgnoreNew,
 # so a tick that fires while the previous sweep is still working is dropped by the scheduler.
 #
-# Fail-safe on the sweep itself: only a clean `rounds=0` advances to the next candidate. A non-zero
-# exit or an unparseable run stops the sweep, so a genuine breakage cannot chew through the whole
-# list and be reported as "everything idle".
+# Signal / scheduling split (2026-08-11, T-sweep-failure-isolation).
+# The prior fail-safe on the sweep itself was "any non-zero exit stops the sweep." Its INTENT was
+# right — a real breakage must not be laundered into `everything is idle` — but the mechanism was
+# itself silent: the loop just stopped, no downstream candidate ever ran, and the only signal was a
+# quiet exit code in Task Scheduler. Measured 2026-08-11: five hours of unattended starvation on
+# every candidate behind the broken one, invisible from every dashboard.
+#
+# Fix: SIGNAL and SCHEDULING are separated. A non-zero exit now
+#   (a) is DECLARED — the candidate is quarantined (record written + Discord notification), and
+#   (b) does NOT stop the sweep — the next candidate is tried, so downstream work still progresses.
+# The old sweep-break fail-safe is retained but re-aimed: only a FAILURE TO WRITE THE DECLARATION
+# breaks the sweep. That reason still holds — if we cannot even record what went wrong, we must not
+# quietly move on. See the quarantine block below (Test-QuarantineDerivedState / New-DailyDigest
+# / the K-budget short-circuit) for the full mechanism, and docs/deploy.md → "Quarantine and daily
+# digest" for the operational contract.
+#
+# Not a re-fix of the specific 2026-08-11 5h starvation. Its DIRECT cause (a merge misclassified as
+# a Tier-C denial) is already closed by PR #136 (OBL-MERGE-MECHANISM). This wrapper's job is to make
+# sure the NEXT unknown failure does not die in the same silent way — i.e., that "the sweep died"
+# announces itself, whatever the reason.
 
 $ErrorActionPreference = "Stop"
+
+# --- tunables ------------------------------------------------------------------------------------
+# NONE OF THESE FOUR ARE DERIVED VALUES. They are policy calls, and are collected in one place so
+# nobody has to hunt for a magic number scattered across the file. Change any one of them ONLY when a
+# concrete observation says the current value is wrong, and record what that observation was.
+#
+#   $QuarantineFailureBudget (K)  = 2
+#     One failure is local, two in a sweep suggest a systemic cause. K=1 kills the whole tick on any
+#     flake; K>=3 spends inferences on non-local failures before stopping. Revisit if 3+ concurrent
+#     quarantines are observed — that is a candidate-order problem, not a K problem.
+#
+#   $QuarantineEscalatedAfter      = 24h
+#     sweep cadence is 5min; 24h = 288 unattended ticks. Matches "the human reads the digest once a
+#     day" — below that "escalated overnight" becomes routine and the tier loses meaning.
+#
+#   $QuarantineStaleAfter          = 7d
+#     Practical cutoff for "not being fixed." At 7d the digest wording changes from "look at this"
+#     to "fix it or fold the thread"; that wording change IS the point of the threshold.
+#
+#   $StarvedThreshold              = 24h
+#     Deliberately EQUAL to $QuarantineEscalatedAfter. A different value would create the
+#     inexplicable state "quarantined 24h but not starved." Same value = "not evaluated in 24h" is
+#     the only meaning both need to carry.
+$QuarantineFailureBudget  = 2
+$QuarantineEscalatedAfter = [TimeSpan]::FromHours(24)
+$QuarantineStaleAfter     = [TimeSpan]::FromDays(7)
+$StarvedThreshold         = [TimeSpan]::FromHours(24)
+
+# Digest cadence and how many lines of session tail we keep with a quarantine record. These ARE
+# derived from the four above (digest is daily because escalation is daily) but stated here to keep
+# the whole tuning surface in one section.
+$DailyDigestInterval  = [TimeSpan]::FromHours(24)
+$SessionLogTailLines  = 50
 
 # --- paths -------------------------------------------------------------------------------------
 # mindwire-loop reads <data_dir>/config/mindwire.toml; honour the same env var run-conductor.ps1 does.
@@ -49,6 +99,10 @@ $logPath = Join-Path $logDir ("conductor-" + (Get-Date -Format "yyyy-MM-dd") + "
 $notifyStatePath = Join-Path $dataDir "state\notified.json"
 $headsStatePath = Join-Path $dataDir "state\heads.json"
 $sweepConfigPath = Join-Path $dataDir "config\sweep.json"
+$quarantineStatePath = Join-Path $dataDir "state\quarantine.json"
+$quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
+$evaluatedStatePath = Join-Path $dataDir "state\evaluated.json"
+$digestStatePath = Join-Path $dataDir "state\digest.json"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
@@ -119,6 +173,110 @@ function Save-JsonState {
     $dir = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     [System.IO.File]::WriteAllText($Path, ($State | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# Coerce a JSON-round-tripped timestamp into a UTC [DateTime]. Necessary because ConvertFrom-Json
+# auto-parses ISO 8601 strings into [DateTime] LOCAL objects, so a naive `[datetime]::Parse($v)`
+# on such a value implicitly stringifies via the current culture, parses back, and only "happens
+# to survive" because ToUniversalTime() cancels out Parse's Local-assumption offset. That coupling
+# is brittle: a culture change, a DateTimeKind change, or a future refactor that drops the trailing
+# ToUniversalTime() would silently produce off-by-hours ages in the starvation metric. Centralise
+# the coercion here and stop scattering `[datetime]::Parse` calls across timestamp readers.
+# (Tier B naysayer, PR #138 round 5, weakest remaining point.)
+function ConvertTo-UtcInstant {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    return [datetime]::Parse("$Value").ToUniversalTime()
+}
+
+# Merge-on-write: re-read the file just before writing and preserve any keys the operator removed
+# during the tick. Used for state files where BOTH the sweep and an external tool (Clear-Quarantine)
+# may write during a sweep run — quarantine.json and heads.json.
+#
+# WHY IT EXISTS. A tick reads its state files once at start and holds them in memory for the whole
+# sweep (measured minutes on a real AI-driven candidate). If an operator runs Clear-Quarantine
+# midway through, their script perfectly removes the entry from disk — but a few minutes later, the
+# sweep flushes its stale in-memory map back to disk and RESURRECTS the entry. The operator's
+# action is silently destroyed, the thread stays skipped, and the whole point of "clearing is a
+# human act" collapses. (Tier B naysayer, PR #138 round 3.)
+#
+# The fix narrows the race from "the entire tick duration" (minutes) to "the gap between the
+# re-read and the write" (sub-millisecond). Closing that residual window fully would require a
+# real file lock, which is not a good trade because a multi-minute sweep holding a lock blocks
+# every operator action for that entire time — and the whole reason the operator has this button
+# is that a human's turnaround is measured in seconds. Narrowing to sub-ms IS the operational fix.
+#
+# MERGE POLICY:
+#   - Every key currently on disk that the sweep did not touch is kept from disk. This is why the
+#     merge starts by copying the current disk state in full.
+#   - For every key the sweep TOUCHED IN MEMORY:
+#       * if it was present at sweep START (in $OriginalKeys) AND is still present on disk after
+#         re-read → the sweep's in-memory version wins (age-driven state transitions, updates);
+#       * if it was present at sweep START but NOT on disk after re-read → the operator removed it
+#         during the sweep — DO NOT resurrect. This IS the operator-clear-survives contract;
+#       * if it was NOT present at sweep start → it is a new add this tick, write through.
+#         Only the sweep adds keys to these two files, so this branch is not contested.
+function Merge-StateForWrite {
+    param(
+        [hashtable]$Memory,
+        [string[]]$OriginalKeys,
+        [string]$DiskPath
+    )
+    $current = Get-JsonState -Path $DiskPath
+    $out = @{}
+    foreach ($k in @($current.Keys)) { $out[$k] = $current[$k] }
+    foreach ($k in @($Memory.Keys)) {
+        $wasOriginal = ($OriginalKeys -contains $k)
+        if ($wasOriginal) {
+            # Present at sweep start. Respect an operator removal; otherwise apply our updates.
+            if ($current.ContainsKey($k)) { $out[$k] = $Memory[$k] }
+        }
+        else {
+            # New this tick — the sweep added it. Nothing external adds to these files.
+            $out[$k] = $Memory[$k]
+        }
+    }
+    return $out
+}
+
+# Refresh an evaluated.json entry's last_evaluated_at while preserving its first_seen_at. Called
+# from every disposition that ACTUALLY REACHED the candidate — a launched verdict (worked, no-work,
+# non-zero exit) AND a head-skip (the sweep probed the head, proved nothing has moved, and
+# correctly fast-pathed).
+#
+# WHY HEAD-SKIP COUNTS. A chatroom thread being idle for 24h (a weekend) is normal behaviour. If
+# head-skip did NOT refresh, every legitimately-idle thread would flag as `starved` on Monday
+# morning — the starvation section would fill with perfectly healthy inactive threads and the
+# metric would be trained into noise. The metric asks "how long since I actually reached this
+# candidate?" and a head-skip IS reaching: the sweep probed, evaluated, decided. (Tier B naysayer,
+# PR #138 round 4.)
+#
+# WHY OTHER DISPOSITIONS DO NOT. `held` / `quarantined-skipped` / `not-reached` all mean the sweep
+# never actually asked the question this tick — a HELD candidate is deliberately withheld by the
+# operator, a quarantined-skipped candidate is deferred until human clear, and a not-reached
+# candidate is one the sweep never got to (K-budget hit, earlier candidate did work). None of them
+# advance the "how long since I actually reached this?" clock. That is the design's Q4 honesty
+# rule and it is load-bearing — the metric only means anything because these DO age past 24h.
+#
+# The value in $State[$Key] may be a hashtable (freshly written this tick) or a PSCustomObject
+# (round-tripped from disk). Dot access to .first_seen_at works on both — same duck-typing pattern
+# as Get-FingerprintHint.
+function Update-EvaluatedTimestamp {
+    param([hashtable]$State, [string]$Key, [datetime]$Now)
+
+    # ConvertFrom-Json auto-parses ISO 8601 strings into DateTime objects. So a first_seen_at read
+    # from disk is a [DateTime], not a [string]. Normalise back to a canonical ISO string on the
+    # way out so downstream readers always receive the same shape regardless of whether the value
+    # came from disk or from an in-memory write earlier this tick.
+    $firstSeen = $null
+    if ($State.ContainsKey($Key) -and $null -ne $State[$Key]) {
+        $priorInstant = ConvertTo-UtcInstant $State[$Key].first_seen_at
+        if ($priorInstant) { $firstSeen = $priorInstant.ToString("o") }
+    }
+    $row = @{ last_evaluated_at = $Now.ToUniversalTime().ToString("o") }
+    if ($firstSeen) { $row.first_seen_at = $firstSeen }
+    $State[$Key] = $row
 }
 
 # --- head-state records ---------------------------------------------------------------------------
@@ -193,6 +351,329 @@ function Test-CanSkip {
     return ($ProbeHead -eq $KnownHead) -and ($CurrentControl -eq $KnownControl)
 }
 
+# --- quarantine ---------------------------------------------------------------------------------
+# A quarantined thread has failed at least once and will not be launched again by this wrapper until
+# a human clears it (deploy/Clear-Quarantine.ps1). Records live in <data_dir>/state/quarantine.json,
+# one entry per `project/thread_id`, alongside heads.json — separate writers, separate concerns; the
+# candidate filter reads both and ANDs the two out-decisions.
+#
+# WHY THIS EXISTS AT ALL — the old wrapper broke the sweep on any non-zero exit. That fail-safe
+# stopped a real failure from being laundered into "everything idle" (right) but did it silently
+# (wrong): the loop simply stopped, every downstream candidate was starved, and nothing announced
+# the state anywhere. The rule now: DECLARE the failure (record + notify), then keep the sweep
+# moving so downstream work still gets to run. Only a failure to write the declaration itself
+# breaks the sweep.
+#
+# WHAT THIS FILE STORES — the minimum needed to (a) explain what broke last time and (b) let a
+# human decide whether to clear. It does NOT store anything used to AUTO-CLEAR: there is no auto
+# clear path (Q3, spec/msg-814). Fields:
+#   state                  quarantined | escalated | stale (derived from first_failure_at)
+#   first_failure_at       ISO 8601, UTC — set once
+#   last_failure_at        ISO 8601, UTC — refreshed if the same fingerprint fails again
+#   consecutive_failures   how many times the quarantine has been re-hit (usually 1: quarantined
+#                          threads are SKIPPED, so a re-hit needs a manual re-run or a probe change)
+#   exit_code              the conductor's exit code at the failure
+#   stop_reason            the parsed `reason=...`, or $null if the run died before that line
+#   failure_fingerprint    { head; control } observed at the failure — see the fingerprint rule
+#   session_log_path       path to today's sweep log, so the tail can be found in context
+#   session_log_tail       last $SessionLogTailLines of the conductor's stdout+stderr for this run
+#
+# FINGERPRINT — deliberately narrow. Its two components are (head, control), which the runner
+# already computes every tick for the head-skip cache. NOTHING that requires reaching outside the
+# runner's own observation surface goes in here — no `git rev`, no `config hash`. That rule is
+# general: fingerprint components are limited to values the runner ALREADY HAS in-hand for its own
+# purposes. Widening the surface always brings one of (a) coupling by overreach, (b) silent
+# coverage-loss on the metric, (c) false positives. This whole record adds exactly zero new probes.
+#
+# HINT USE ONLY — the fingerprint changing has NO scheduling effect. It is displayed in the digest
+# as a hint so the human's eye lands on threads whose input has moved since the failure, but auto
+# clear is NEVER a consequence. The design's Q3 ("解除は人手のみ") is load-bearing; automating it
+# here would collapse two questions ("did the input change" and "is the failure resolved") that the
+# runner cannot distinguish.
+
+function New-QuarantineRecord {
+    param(
+        [string]$FirstFailureAt,
+        [int]$ExitCode,
+        [string]$StopReason,
+        [string]$FailureHead,
+        [string]$FailureControl,
+        [string]$SessionLogPath,
+        [string[]]$SessionLogTail
+    )
+
+    return @{
+        state                = 'quarantined'
+        first_failure_at     = $FirstFailureAt
+        last_failure_at      = $FirstFailureAt
+        consecutive_failures = 1
+        exit_code            = $ExitCode
+        stop_reason          = $StopReason
+        failure_fingerprint  = @{ head = $FailureHead; control = $FailureControl }
+        session_log_path     = $SessionLogPath
+        session_log_tail     = $SessionLogTail
+    }
+}
+
+# Compute the age-derived state (quarantined -> escalated -> stale). The stored `state` field
+# lags this until the sweep observes the transition and fires the notification for it.
+function Get-DerivedQuarantineState {
+    param(
+        [datetime]$FirstFailureAt,
+        [datetime]$Now,
+        [TimeSpan]$EscalatedAfter = $script:QuarantineEscalatedAfter,
+        [TimeSpan]$StaleAfter = $script:QuarantineStaleAfter
+    )
+
+    $age = $Now - $FirstFailureAt
+    if ($age -ge $StaleAfter)      { return 'stale' }
+    if ($age -ge $EscalatedAfter)  { return 'escalated' }
+    return 'quarantined'
+}
+
+# Compare the fingerprint recorded at the failure against the current probe. Returns a short label
+# describing what moved, or $null when nothing has moved. Deliberately names ONLY what the runner
+# actually observes — "新規メッセージあり (head 変化)" / "control 変更あり" — never "input changed"
+# in the abstract. The wider claim would silently over-promise coverage the fingerprint does not
+# have (spec/msg-814 §1, §4). No claim is a legitimate outcome and it means: no head movement and
+# no control change — not "not fixed."
+#
+# $Fingerprint is DELIBERATELY untyped. On the tick a failure occurs it is a native `hashtable`
+# (from New-QuarantineRecord). On every subsequent tick the record is round-tripped through
+# quarantine.json — ConvertFrom-Json parses nested objects into PSCustomObject, NOT hashtable, so a
+# `[hashtable]$Fingerprint` parameter would throw a terminating "Cannot process argument
+# transformation" the moment the daily digest touches an existing quarantine record. Untyped works
+# for both because dot-notation duck-types on either shape. (Tier B naysayer, PR #138 round 2.)
+function Get-FingerprintHint {
+    param(
+        $Fingerprint,
+        [string]$CurrentHead,
+        [string]$CurrentControl
+    )
+
+    if (-not $Fingerprint) { return $null }
+    $storedHead    = $Fingerprint.head
+    $storedControl = $Fingerprint.control
+    $parts = @()
+    if ($storedHead -and $CurrentHead -and $CurrentHead -ne $storedHead) {
+        $parts += "新規メッセージあり (head 変化)"
+    }
+    if ($storedControl -and $CurrentControl -and $CurrentControl -ne $storedControl) {
+        $parts += "control 変更あり"
+    }
+    if ($parts.Count -eq 0) { return $null }
+    return ($parts -join " / ")
+}
+
+# Human-readable duration for the digest. "3d 4h" / "18h" / "45m". Kept deliberately coarse — this
+# is a wall-clock display, not a metric, so seconds are pointless.
+function Format-DurationDigest {
+    param([TimeSpan]$Span)
+    if ($Span.TotalMinutes -lt 1) { return "<1m" }
+    $days = [int][Math]::Floor($Span.TotalDays)
+    $hours = $Span.Hours
+    $minutes = $Span.Minutes
+    if ($days -gt 0) {
+        if ($hours -gt 0) { return "${days}d ${hours}h" }
+        return "${days}d"
+    }
+    if ($Span.TotalHours -ge 1) {
+        if ($minutes -gt 0) { return "${hours}h ${minutes}m" }
+        return "${hours}h"
+    }
+    return "${minutes}m"
+}
+
+# Should the daily-digest clock advance given this Send-Notification result?
+#
+# 'sent'     -> yes, the notification landed and we do not want to re-attempt for 24h.
+# 'skipped'  -> yes, the operator has no webhook configured. Retrying every 5 minutes accomplishes
+#               nothing (the webhook will not appear on its own) and would log-spam the daemon.
+# 'failed'   -> no, the webhook is configured but the POST failed. This is the ONLY case where the
+#               next tick should retry — the whole reason the clock is gated on the result at all.
+#
+# Pulled out as a helper so the "which outcomes are terminal?" decision is testable and lives in
+# one place. If a future refactor adds a fourth outcome, this table is the only line to touch.
+# (Tier B naysayer, PR #138 round 5.)
+function Test-DigestClockAdvances {
+    param([string]$Result)
+    return ($Result -eq 'sent' -or $Result -eq 'skipped')
+}
+
+# The signature Send-NotificationIfChanged uses to dedup the K-budget "systemic cause suspected"
+# alert. Bucketed on the UTC date, NOT on the tick timestamp, because the failure this de-noise
+# addresses is not "same tick, twice" (impossible — the sweep breaks at K) but "adjacent ticks,
+# same underlying wave": during a real systemic outage, tick T fills its K=2 budget and stops; tick
+# T+5min skips the first 2 quarantined threads, fails the next 2, and hits the budget again — and
+# every one of the next 288 ticks does the same. A per-tick timestamp defeats the dedup and turns
+# the day into a Discord flood; a per-day bucket fires ONCE per day of an ongoing wave, then falls
+# silent. If the wave clears and returns days later, the day bucket has moved and the alert re-arms.
+# (Tier B naysayer, PR #138 round 2.)
+function Get-SystemicAlertSignature {
+    param([datetime]$Now, [int]$Count)
+    return "$($Now.ToUniversalTime().ToString('yyyy-MM-dd')):$Count"
+}
+
+# Build the daily digest string. Sent even when both lists are empty — a silent day IS the point,
+# because "no alert" then still means "the channel is alive," which is what the 5h failure
+# specifically lacked (spec/msg-814 §5, §7).
+#
+# The starvation report is pivoted on `$LiveKeys` — the sweep list of the current tick — not on the
+# keys accumulated in `$EvaluatedState`. Two failure modes that pivot fixes:
+#   1. False negatives. A candidate that never launched (permanently `not-reached` behind a K-budget
+#      hit, or held/quarantined on creation) never enters `EvaluatedState` and would silently be
+#      invisible to the metric. That reproduces the exact "suppressed dark area" Q4 forbids.
+#   2. False positives. `EvaluatedState` accumulates keys forever; a folded thread stays in the
+#      file, inevitably ages past the threshold, and spams the digest every day.
+# Iterating over the live sweep list closes both — and it is the *only* metric that meaningfully
+# answers "how long since we actually reached this candidate?", because "this candidate" only exists
+# for the sweep in the first place through the sweep list.
+#
+# Age fallback: when a live key has no `last_evaluated_at` yet (never launched), the wrapper writes
+# `first_seen_at` the first tick the candidate appears, and the age is computed against that. So a
+# newly-added candidate is not "immediately starved" — its 24h clock starts ticking from first
+# sight, which is the earliest moment the metric can honestly say the thread was in scope.
+function New-DailyDigest {
+    param(
+        [hashtable]$QuarantineState,
+        [hashtable]$EvaluatedState,
+        [hashtable]$HeadsByProject,
+        [hashtable]$ControlByProject,
+        [datetime]$Now,
+        [string[]]$LiveKeys = @()
+    )
+
+    # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
+    $escalatedList = @()
+    $quarantinedList = @()
+    $staleList = @()
+    foreach ($key in $QuarantineState.Keys) {
+        $rec = $QuarantineState[$key]
+        $firstAt = ConvertTo-UtcInstant $rec.first_failure_at
+        $derived = Get-DerivedQuarantineState -FirstFailureAt $firstAt -Now $Now
+        $age = Format-DurationDigest -Span ($Now - $firstAt)
+
+        # Extract project id from key ("project/thread_id") to reach the right probe map.
+        $project = ($key -split '/', 2)[0]
+        $thread  = ($key -split '/', 2)[1]
+        $curHead = $null
+        if ($HeadsByProject.ContainsKey($project) -and $null -ne $HeadsByProject[$project]) {
+            $h = $HeadsByProject[$project]
+            if ($h.ContainsKey($thread)) { $curHead = $h[$thread] }
+        }
+        $curControl = $null
+        if ($ControlByProject.ContainsKey($project) -and $null -ne $ControlByProject[$project]) {
+            $curControl = $ControlByProject[$project].desired_state
+        }
+        $hint = Get-FingerprintHint -Fingerprint $rec.failure_fingerprint `
+                                    -CurrentHead $curHead -CurrentControl $curControl
+
+        $line = "  $key   $age"
+        if ($hint) { $line += "   ⚠ $hint" }
+
+        switch ($derived) {
+            'stale'       { $staleList       += $line }
+            'escalated'   { $escalatedList   += $line }
+            default       { $quarantinedList += $line }
+        }
+    }
+
+    # Starvation. Pivoted on $LiveKeys, NOT $EvaluatedState.Keys — the same reason the header of
+    # this function spells out. A live key that is absent from $EvaluatedState (never launched) is
+    # a legitimate starvation candidate; a state key that is not live (folded from the sweep list)
+    # is not, and must not appear here.
+    $starvedList = @()
+    foreach ($key in $LiveKeys) {
+        $entry = if ($EvaluatedState.ContainsKey($key)) { $EvaluatedState[$key] } else { $null }
+        $lastAtRaw = if ($entry) { $entry.last_evaluated_at } else { $null }
+        $firstSeenRaw = if ($entry) { $entry.first_seen_at } else { $null }
+        # Fallback ladder: last_evaluated_at (best), else first_seen_at (candidate has never launched
+        # but was in scope from tick T), else THIS tick (a candidate the sweep just discovered — its
+        # 24h clock starts now, so it is not yet starved). ConvertTo-UtcInstant absorbs both string
+        # (freshly written) and [DateTime] (JSON round-tripped) shapes.
+        $lastAt = ConvertTo-UtcInstant $lastAtRaw
+        $firstSeen = ConvertTo-UtcInstant $firstSeenRaw
+        $ageBase = if ($lastAt) { $lastAt } elseif ($firstSeen) { $firstSeen } else { $Now }
+        $age = $Now - $ageBase
+        if ($age -ge $script:StarvedThreshold) {
+            # A "never evaluated" thread carries a slightly different label so the operator does not
+            # spend cognitive effort deciding whether the entry means "stuck" or "never touched."
+            $suffix = if (-not $lastAtRaw) { "   (未評価)" } else { "" }
+            $starvedList += "  $key   $(Format-DurationDigest -Span $age)$suffix"
+        }
+    }
+
+    $lines = @()
+    $lines += "MindWire 日次ダイジェスト ($(Get-Date -Date $Now.ToLocalTime() -Format 'yyyy-MM-dd HH:mm'))"
+    $lines += ""
+
+    $totalQ = $escalatedList.Count + $quarantinedList.Count + $staleList.Count
+    $lines += "隔離中: $totalQ 件"
+    if ($totalQ -eq 0) {
+        $lines += "  (該当なし)"
+    }
+    else {
+        if ($staleList.Count -gt 0) {
+            $lines += "  [stale] — 直すか、スレッドを畳むか決めよ"
+            $lines += $staleList
+        }
+        if ($escalatedList.Count -gt 0) {
+            $lines += "  [escalated] — 24h 以上経過"
+            $lines += $escalatedList
+        }
+        if ($quarantinedList.Count -gt 0) {
+            $lines += "  [quarantined]"
+            $lines += $quarantinedList
+        }
+    }
+
+    $lines += ""
+    $lines += "飢餓 (24h 以上評価されていない): $($starvedList.Count) 件"
+    if ($starvedList.Count -eq 0) {
+        $lines += "  (該当なし)"
+    }
+    else {
+        $lines += $starvedList
+    }
+
+    $lines += ""
+    $lines += "(0 件でも送信しています — 通知チャネル自体の生存確認を兼ねます。"
+    $lines += " 人間がこのダイジェストを読まない状態はチャネル故障ではなく運用の放棄であり、機械では検知できません。)"
+    return ($lines -join "`n")
+}
+
+# The starvation view. Pivoted on the LIVE sweep candidates ($LiveKeys), not on the keys that
+# happen to have accumulated in $EvaluatedState. See the header of New-DailyDigest for why: pivoting
+# on the state file opens exactly the two failure modes this whole design refuses (silently dropping
+# never-launched candidates, and permanently spamming for folded ones).
+#
+# A live key IS starved when its effective evaluation age (last_evaluated_at, or first_seen_at when
+# never launched) is at least $Threshold. Quarantined threads are INCLUDED — their timestamps are
+# never refreshed while quarantined, so they age past the threshold on their own; the spec is
+# explicit that this metric's honesty depends on the quarantine-induced dark area being visible
+# (msg-814 Q4).
+function Get-StarvedKeys {
+    param(
+        [hashtable]$EvaluatedState,
+        [datetime]$Now,
+        [TimeSpan]$Threshold = $script:StarvedThreshold,
+        [string[]]$LiveKeys = @()
+    )
+    $out = @()
+    foreach ($key in $LiveKeys) {
+        $entry = if ($EvaluatedState.ContainsKey($key)) { $EvaluatedState[$key] } else { $null }
+        $lastAtRaw = if ($entry) { $entry.last_evaluated_at } else { $null }
+        $firstSeenRaw = if ($entry) { $entry.first_seen_at } else { $null }
+        # ConvertTo-UtcInstant handles both string (freshly written) and [DateTime] (JSON round-
+        # tripped) shapes. See its header for why raw [datetime]::Parse on a DateTime is brittle.
+        $lastAt = ConvertTo-UtcInstant $lastAtRaw
+        $firstSeen = ConvertTo-UtcInstant $firstSeenRaw
+        $ageBase = if ($lastAt) { $lastAt } elseif ($firstSeen) { $firstSeen } else { $Now }
+        if (($Now - $ageBase) -ge $Threshold) { $out += $key }
+    }
+    return $out
+}
+
 # --- parse the conductor's own verdict ----------------------------------------------------------
 # The daemon's last word on stdout looks like:
 #   conductor stopped: reason=none rounds=0 forced_naysayer=0 ... last_msg=msg-1919
@@ -234,8 +715,13 @@ function Send-Notification {
 
     Confirm-LogWorthKeeping
     if (-not $notifyWebhook) {
+        # 'skipped' — no webhook configured. Distinct from 'failed' because the operator has
+        # deliberately chosen not to run with Discord alerts, and a retry loop makes no sense: the
+        # webhook will not appear on its own. The digest gate advances its clock on 'skipped' so
+        # a webhook-less run does not permanently flood the log with "sending daily digest" and
+        # "notification skipped" every 5 minutes forever. (Tier B naysayer, PR #138 round 5.)
         Write-Log "notification skipped (MINDWIRE_NOTIFY_DISCORD_WEBHOOK not set)"
-        return
+        return 'skipped'
     }
     try {
         $payload = @{ content = $Message } | ConvertTo-Json -Compress
@@ -243,12 +729,22 @@ function Send-Notification {
             -ContentType 'application/json; charset=utf-8' `
             -Body ([System.Text.Encoding]::UTF8.GetBytes($payload)) `
             -Proxy $notifyProxy -TimeoutSec 30 -ErrorAction Stop
-        Write-Log "notification sent: $Message"
+        # First line only, so a multi-line digest does not spam the log with its own body.
+        $firstLine = ($Message -split "`n", 2)[0]
+        Write-Log "notification sent: $firstLine"
+        return 'sent'
     }
     catch {
-        # Never fail the sweep because the notifier failed — the conductor's work already happened.
+        # 'failed' — webhook configured but the send failed (network, proxy, Discord outage). A
+        # retry on the next tick is the right response, so the digest gate does NOT advance its
+        # clock on this. Never fail the sweep because the notifier failed — the conductor's work
+        # already happened. Same redaction rule as before: scrub the webhook out of any exception
+        # text before it touches the log or a record. Quarantine records / digest lines / this log
+        # line all go through this branch, so no path that touches user data can leak the bearer
+        # secret.
         $reason = "$($_.Exception.Message)".Replace($notifyWebhook, '<webhook-redacted>')
         Write-Log "notification FAILED (non-fatal): $reason"
+        return 'failed'
     }
 }
 
@@ -262,7 +758,13 @@ function Send-NotificationIfChanged {
         Write-Log "notification suppressed (unchanged since last alert: $Key = $Signature)"
         return
     }
-    Send-Notification -Message $Message
+    # $null = drops Send-Notification's status string so it does not leak into the pipeline of
+    # whatever call site invokes Send-NotificationIfChanged. The change record on the state map is
+    # intentional either way — a failed send does not undo the dedup, or a webhook outage would
+    # repeat every 5 minutes forever, retraining the channel into noise. A 'skipped' status (no
+    # webhook) is treated the same: mark the signature so we do not spam the log with skip
+    # messages on every re-attempt. (Endorsed by Tier B naysayer on round 2 of #138.)
+    $null = Send-Notification -Message $Message
     $State[$Key] = $Signature
 }
 
@@ -512,6 +1014,66 @@ try {
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
     }
     $headsState = Get-JsonState -Path $headsStatePath
+    $quarantineState = Get-JsonState -Path $quarantineStatePath
+    $evaluatedState = Get-JsonState -Path $evaluatedStatePath
+    $digestState = Get-JsonState -Path $digestStatePath
+    # Snapshot the keys present at sweep start. Used by Merge-StateForWrite at flush time to
+    # distinguish "operator removed this during the sweep" (must not resurrect) from "sweep never
+    # touched this" (already-agreed value, keep). See Merge-StateForWrite's header for the full
+    # contract.
+    $quarantineOriginalKeys = @($quarantineState.Keys)
+    $headsOriginalKeys = @($headsState.Keys)
+    $nowUtc = [DateTime]::UtcNow
+
+    # Age-driven state transitions on quarantine entries. Run BEFORE the candidate loop so the
+    # transition notification fires even on ticks where nothing else happens (an escalated thread is
+    # by definition one nobody has touched for 24h — we cannot wait for its own launch to notice).
+    foreach ($k in @($quarantineState.Keys)) {
+        $rec = $quarantineState[$k]
+        if (-not $rec.first_failure_at) { continue }
+        $firstAt = ConvertTo-UtcInstant $rec.first_failure_at
+        $derived = Get-DerivedQuarantineState -FirstFailureAt $firstAt -Now $nowUtc
+        if ($rec.state -ne $derived) {
+            $prev = $rec.state
+            $rec.state = $derived
+            $quarantineState[$k] = $rec
+            $age = Format-DurationDigest -Span ($nowUtc - $firstAt)
+            Confirm-LogWorthKeeping
+            Write-Log "quarantine state transition: $k $prev -> $derived (age $age)"
+            $msg = switch ($derived) {
+                'escalated' { "MindWire: 隔離スレッド **$k** が escalated になりました (経過 $age)。ダイジェスト先頭に別掲されます。" }
+                'stale'     { "MindWire: 隔離スレッド **$k** が stale です (経過 $age)。直すか、スレッドを畳むか決めてください。" }
+                default     { $null }
+            }
+            if ($msg) {
+                Send-NotificationIfChanged -State $notifyState -Key "__quarantine_transition__/$k" `
+                    -Signature "${derived}:$($rec.first_failure_at)" -Message $msg
+            }
+        }
+    }
+
+    # The live sweep list, as a bare key list. Passed to the starvation report (which pivots on it,
+    # not on $EvaluatedState.Keys) and used below to prune stale keys and record first-seen times.
+    $liveKeys = @($candidates | ForEach-Object { $_.key })
+
+    # Prune any key that is no longer on the sweep list. Left in place, folded threads sit in the
+    # state file forever and their timestamps eventually age past the threshold — spamming the daily
+    # digest with entries the operator can no longer act on. Pruning is safe: a thread put back on
+    # the list will get a fresh first_seen_at on the very same tick.
+    foreach ($k in @($evaluatedState.Keys)) {
+        if ($liveKeys -notcontains $k) { [void]$evaluatedState.Remove($k) }
+    }
+
+    # Record first-seen for every live candidate that has never entered the file. This is the
+    # timestamp the starvation clock ticks from when the candidate never actually launches (held on
+    # creation, immediately quarantined, or permanently 'not-reached' behind a K-budget hit). Set
+    # BEFORE any per-candidate decision so a held/quarantined-on-creation thread still starts its
+    # clock.
+    foreach ($k in $liveKeys) {
+        if (-not $evaluatedState.ContainsKey($k)) {
+            $evaluatedState[$k] = @{ first_seen_at = $nowUtc.ToString("o") }
+        }
+    }
 
     $inner = Join-Path $PSScriptRoot "run-conductor.ps1"
     $didWork = $false
@@ -519,7 +1081,12 @@ try {
     $launched = 0
     $skipped = 0
     $held = 0
+    $quarantineSkipped = 0     # candidates dropped because already quarantined
+    $newlyQuarantined = 0      # non-zero exits this tick
+    $notReached = 0            # candidates the sweep never got to (K-cap, worked-and-broke)
     $sweepSignature = @()
+    $dispositions = @{}        # key -> "worked" | "no-work" | "head-skipped" | "quarantined-skipped" | "held" | "not-reached"
+    $breakReason = $null       # human-readable reason for a mid-sweep break, or $null if it ran to end
 
     # Stop reasons that need Takahito. Mirrors StopReason in conductor/core.py — `human` plus every
     # `*_to_human` fallback are all "the loop parked on a human", and round_cap / empty_thread are
@@ -550,7 +1117,28 @@ try {
         $control = $controlByProject[$cand.project]
         if (Test-HoldObserved -Control $control) {
             $held++
+            $dispositions[$cand.key] = 'held'
             Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — project HELD (desired=hold, loop observed hold), not launching"
+            continue
+        }
+
+        # Quarantine check — before the head-skip cache. A quarantined thread is not launched by
+        # this wrapper until a human runs Clear-Quarantine. It IS counted toward starvation (the
+        # design's Q4 honesty rule: hiding a suppressed area on the "how long since I actually
+        # evaluated?" metric is exactly the silent-degradation this file exists to end).
+        if ($quarantineState.ContainsKey($cand.key)) {
+            $rec = $quarantineState[$cand.key]
+            $stateLabel = if ($rec.state) { $rec.state } else { 'quarantined' }
+            $ageStr = ""
+            if ($rec.first_failure_at) {
+                try {
+                    $firstAt = ConvertTo-UtcInstant $rec.first_failure_at
+                    $ageStr = " age=$(Format-DurationDigest -Span ($nowUtc - $firstAt))"
+                } catch { }
+            }
+            $quarantineSkipped++
+            $dispositions[$cand.key] = 'quarantined-skipped'
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — [$stateLabel]$ageStr, not launching (Clear-Quarantine to release)"
             continue
         }
 
@@ -568,7 +1156,12 @@ try {
         if (Test-CanSkip -ProbeHead $probeHead -KnownHead $knownHead `
                          -CurrentControl $currentControl -KnownControl $knownControl) {
             $skipped++
+            $dispositions[$cand.key] = 'head-skipped'
             $sweepSignature += "$($cand.key)=$probeHead"
+            # Refresh the starvation clock — a head-skip IS an evaluation. See
+            # Update-EvaluatedTimestamp for why. Without this, a legitimately-idle thread over a
+            # weekend would flag as starved on Monday and flood the digest with healthy threads.
+            Update-EvaluatedTimestamp -State $evaluatedState -Key $cand.key -Now $nowUtc
             Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head unchanged ($probeHead, control $currentControl), not launching"
             continue
         }
@@ -599,6 +1192,75 @@ try {
         }
         Write-Log "$($cand.key) -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"
 
+        # An actual evaluation happened — reset the starvation clock for this thread. Any launched
+        # verdict counts, even a non-zero exit: it still tells us the thread was tried this tick,
+        # which is the metric's meaning ("how long since I actually reached this candidate?").
+        # See Update-EvaluatedTimestamp for the full contract (which dispositions refresh, which do
+        # not, and why); first_seen_at is preserved by the helper.
+        Update-EvaluatedTimestamp -State $evaluatedState -Key $cand.key -Now $nowUtc
+
+        # NON-ZERO EXIT — quarantine, notify, keep going. The old wrapper broke the sweep here
+        # (silent), which was the exact failure mode of the 2026-08-11 5h starvation on threads
+        # BEHIND the broken candidate. The direct cause of that starvation is fixed elsewhere
+        # (#136 / OBL-MERGE-MECHANISM); this branch exists to keep the NEXT unknown breakage from
+        # dying in the same silent way — quarantine declares it, and the sweep continues.
+        if ($code -ne 0) {
+            $dispositions[$cand.key] = 'failed'
+            $tail = @()
+            if ($output.Count -gt 0) {
+                $take = [Math]::Min($SessionLogTailLines, $output.Count)
+                $tail = $output[($output.Count - $take)..($output.Count - 1)]
+            }
+            $nowIso = $nowUtc.ToString("o")
+            $rec = New-QuarantineRecord `
+                -FirstFailureAt $nowIso -ExitCode $code -StopReason $verdict.reason `
+                -FailureHead $probeHead -FailureControl $currentControl `
+                -SessionLogPath $logPath -SessionLogTail $tail
+            $quarantineState[$cand.key] = $rec
+            $newlyQuarantined++
+            Write-Log "quarantined $($cand.key): exit=$code reason=$($verdict.reason) — sweep CONTINUES (signal is the notification, not the stop)"
+
+            # Initial-quarantine notification. Fires once per newly-recorded quarantine. Signature
+            # is the failure fingerprint so a re-quarantine after Clear-Quarantine (which drops the
+            # signature) re-alerts, but a same-tick duplicate is impossible (candidate is skipped
+            # once quarantined, above).
+            Send-NotificationIfChanged -State $notifyState -Key "__quarantine__/$($cand.key)" `
+                -Signature "${nowIso}:${code}:$($verdict.reason):${probeHead}" `
+                -Message ("MindWire: **$($cand.key)** を隔離しました (exit=$code, reason=$($verdict.reason))。" +
+                          "以後この tick からは skip されます。復帰するには " +
+                          "``pwsh deploy/Clear-Quarantine.ps1 -Thread '$($cand.key)' -Reason '...'``。" +
+                          "ダイジェストにも別掲されます。")
+
+            # K-budget short-circuit. Two quarantines in one sweep suggest a shared cause; keep
+            # spending inferences past the second is the exact "keep bleeding" failure mode this
+            # design refuses. The sweep breaks and fires a systemic-cause notification.
+            if ($newlyQuarantined -ge $QuarantineFailureBudget) {
+                Write-Log "quarantine budget K=$QuarantineFailureBudget hit in one sweep — stopping (systemic cause suspected)"
+                # Day-bucketed signature (see Get-SystemicAlertSignature): one alert per UTC day of
+                # an ongoing systemic wave, then silence. A tick-level timestamp here spammed every
+                # 5 minutes — exactly the "retraining the channel into noise" mode this file avoids
+                # elsewhere.
+                Send-NotificationIfChanged -State $notifyState -Key "__quarantine_systemic__" `
+                    -Signature (Get-SystemicAlertSignature -Now $nowUtc -Count $newlyQuarantined) `
+                    -Message ("MindWire: 同一 sweep で K=$QuarantineFailureBudget 件の quarantine が発生しました。" +
+                              "systemic な原因の可能性が高いため、この tick を打ち切ります。" +
+                              "残候補はスキップ (`not-reached`) 扱いで飢餓計測に載ります。")
+                $breakReason = 'k-budget-hit'
+                break
+            }
+            continue
+        }
+        # Fail-safe: no parseable verdict on a zero-exit means we do not actually know whether work
+        # happened. That is a declaration failure — the whole point of the record-on-fail path above
+        # is that we CAN write a declaration. Without a declaration, the old rule still holds:
+        # break, so a genuine "no signal" tick cannot be laundered into a healthy sweep.
+        if ($null -eq $verdict.rounds) {
+            $dispositions[$cand.key] = 'undeclared'
+            Write-Log "no parseable 'conductor stopped:' line — stopping the sweep (unknown state, not idle)"
+            $breakReason = 'undeclared-verdict'
+            break
+        }
+
         # Record the state this head was reached under, not just the head. Written even when
         # $currentControl is $null (an unreadable probe): storing the unknown keeps the next tick
         # failing open rather than silently inheriting a state nobody confirmed.
@@ -607,7 +1269,7 @@ try {
         }
         $sweepSignature += "$($cand.key)=$($verdict.last_msg)"
 
-        if ($code -eq 0 -and $verdict.reason -and $needsHuman.ContainsKey($verdict.reason)) {
+        if ($verdict.reason -and $needsHuman.ContainsKey($verdict.reason)) {
             # Signature carries the reason too, so a thread that changes *how* it is stuck re-alerts
             # even when last_msg has not moved.
             Send-NotificationIfChanged -State $notifyState -Key $cand.key `
@@ -616,39 +1278,119 @@ try {
                           " (reason=$($verdict.reason), rounds=$($verdict.rounds), $($verdict.last_msg))。chatroom を確認してください。")
         }
 
-        # Fail-safe 1: a real breakage must not be laundered into "this thread had no work".
-        if ($code -ne 0) {
-            Write-Log "conductor exited non-zero — stopping the sweep (this is a failure, not an idle thread)"
-            $exitCode = $code
-            break
-        }
-        # Fail-safe 2: no parseable verdict means we do not know whether work happened.
-        if ($null -eq $verdict.rounds) {
-            Write-Log "no parseable 'conductor stopped:' line — stopping the sweep (unknown state, not idle)"
-            break
-        }
         if ($verdict.rounds -gt 0) {
+            $dispositions[$cand.key] = 'worked'
             Write-Log "thread did work (rounds=$($verdict.rounds), reason=$($verdict.reason)) — sweep done"
             $didWork = $true
             break
         }
+        $dispositions[$cand.key] = 'no-work'
         Write-Log "no work (rounds=0, reason=$($verdict.reason)) — advancing to the next candidate"
     }
 
-    Save-JsonState -Path $headsStatePath -State $headsState
+    # Everything the sweep never touched is 'not-reached'. Deliberately NOT rolled into
+    # 'head-skipped': head-skipped means "we asked and the answer was no change"; not-reached means
+    # "we did not ask." Different failure modes, different fixes (candidate order vs. probe gap vs.
+    # sweep break). Not-reached does NOT reset the evaluation timestamp — that is how a permanently
+    # backed-up sweep shows up as starvation instead of "healthy and idle."
+    foreach ($cand in $candidates) {
+        if (-not $dispositions.ContainsKey($cand.key)) {
+            $dispositions[$cand.key] = 'not-reached'
+            $notReached++
+        }
+    }
+    Write-Log ("dispositions: " + (($dispositions.Keys | Sort-Object | ForEach-Object { "$($_)=$($dispositions[$_])" }) -join ', '))
 
-    if ($held -gt 0 -and ($held + $skipped) -eq $candidates.Count) {
+    # Merge-on-write for the two files an operator may edit concurrently (heads.json and
+    # quarantine.json). The merge re-reads disk right before writing, so a mid-sweep
+    # Clear-Quarantine survives the sweep's end-of-tick flush. See Merge-StateForWrite's header.
+    # evaluated.json is written directly — it has no external writer, and the sweep prunes ex-live
+    # keys on it every tick (merge-on-write would resurrect those pruned keys from disk).
+    $mergedHeads = Merge-StateForWrite -Memory $headsState `
+        -OriginalKeys $headsOriginalKeys -DiskPath $headsStatePath
+    Save-JsonState -Path $headsStatePath -State $mergedHeads
+    $mergedQuarantine = Merge-StateForWrite -Memory $quarantineState `
+        -OriginalKeys $quarantineOriginalKeys -DiskPath $quarantineStatePath
+    Save-JsonState -Path $quarantineStatePath -State $mergedQuarantine
+    Save-JsonState -Path $evaluatedStatePath -State $evaluatedState
+
+    # Starvation report. Included in the log every tick that logs anything (an idle tick still
+    # collapses to one line), so the metric is visible without waiting for the digest. The digest is
+    # the "someone WILL see this" channel; the log line is "someone COULD see this in context."
+    # Pivoted on $liveKeys — see New-DailyDigest's header for the two failure modes this closes.
+    $starved = Get-StarvedKeys -EvaluatedState $evaluatedState -Now $nowUtc -LiveKeys $liveKeys
+    if ($starved.Count -gt 0) {
+        Confirm-LogWorthKeeping
+        Write-Log "starved threads (>=$(Format-DurationDigest -Span $StarvedThreshold) since last evaluation): $($starved -join ', ')"
+    }
+
+    # Daily digest. Sent even when both quarantine and starvation lists are empty (spec/msg-814 §5).
+    # A silent day IS the point: "no alert" then still means "the channel is alive," which is what
+    # the 5h failure specifically lacked. Attempted at most once per $DailyDigestInterval.
+    #
+    # The clock advances on 'sent' AND 'skipped' — both are terminal outcomes: 'sent' means the
+    # notification landed, 'skipped' means the operator has no webhook configured, and neither
+    # merits a 5-minute retry. Only 'failed' (webhook configured but the POST failed — network,
+    # proxy, Discord outage) holds the clock back for retry.
+    #
+    # Also gated on $notifyWebhook up front: without a webhook, computing the digest, calling
+    # Confirm-LogWorthKeeping (which promotes the buffered log to disk), and writing the "sending
+    # daily digest" line every 5 minutes for the life of the daemon is nothing but log spam. It
+    # violates the whole point of Write-QuietSummary. So when there is no webhook, the whole block
+    # is silent — the clock still advances so we do not loop, but nothing is computed, logged, or
+    # persisted for a channel nobody is listening to. (Tier B naysayer, PR #138 round 5.)
+    $lastDigestAt = $null
+    if ($digestState.ContainsKey('last_sent_at') -and $digestState['last_sent_at']) {
+        try { $lastDigestAt = (ConvertTo-UtcInstant $digestState['last_sent_at']) } catch { }
+    }
+    $digestDue = ($null -eq $lastDigestAt) -or (($nowUtc - $lastDigestAt) -ge $DailyDigestInterval)
+    if ($digestDue) {
+        if (-not $notifyWebhook) {
+            # No point building or logging a digest for a channel that does not exist. Advance the
+            # clock silently so we do not re-enter this branch until the next full interval.
+            $digestState['last_sent_at'] = $nowUtc.ToString("o")
+            Save-JsonState -Path $digestStatePath -State $digestState
+        }
+        else {
+            $digest = New-DailyDigest -QuarantineState $quarantineState `
+                -EvaluatedState $evaluatedState `
+                -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc `
+                -LiveKeys $liveKeys
+            Confirm-LogWorthKeeping
+            Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved)"
+            $result = Send-Notification -Message $digest
+            # See Test-DigestClockAdvances for the terminal-outcomes contract. 'skipped' here
+            # would be from a webhook that was set at $digestDue evaluation but has since been
+            # unset — very narrow race, but the same reasoning still holds.
+            if (Test-DigestClockAdvances -Result $result) {
+                $digestState['last_sent_at'] = $nowUtc.ToString("o")
+                Save-JsonState -Path $digestStatePath -State $digestState
+            }
+        }
+    }
+
+    # Summary line categories, ranked so the most-informative wording wins. Order matters:
+    # quarantine and K-hit are louder than a plain idle sweep.
+    if ($newlyQuarantined -gt 0) {
+        Confirm-LogWorthKeeping
+        Write-Log "sweep summary: $newlyQuarantined newly quarantined, $quarantineSkipped skipped-as-quarantined, $held held, $skipped head-skipped, $launched launched, $notReached not-reached"
+    }
+    elseif ($held -gt 0 -and ($held + $skipped + $quarantineSkipped) -eq $candidates.Count) {
         # Nothing ran, and at least part of the reason was a deliberate HOLD. Said separately from
         # the line below so the log never describes a withheld loop as an idle one — those need
         # opposite responses from a reader, and only one of them is a problem.
-        Write-QuietSummary "nothing to run ($held/$($candidates.Count) held by loop control, $skipped heads unchanged)"
+        Write-QuietSummary "nothing to run ($held/$($candidates.Count) held by loop control, $skipped heads unchanged, $quarantineSkipped quarantined)"
     }
     elseif ($skipped -eq $candidates.Count) {
         # The steady state at a 5-minute cadence. One line, no notification: by definition nothing
         # changed, so there is nothing new to tell anyone.
         Write-QuietSummary "no thread moved ($skipped/$($candidates.Count) heads unchanged) — nothing to do"
     }
-    elseif (-not $didWork -and $exitCode -eq 0 -and $attempt -eq $candidates.Count -and $launched -gt 0 -and $held -eq 0) {
+    elseif (($skipped + $quarantineSkipped) -eq $candidates.Count -and $quarantineSkipped -gt 0) {
+        # Every live candidate was quarantined; the digest carries the escalation state.
+        Write-QuietSummary "nothing to run ($quarantineSkipped/$($candidates.Count) quarantined, $skipped heads unchanged) — see digest"
+    }
+    elseif (-not $didWork -and $exitCode -eq 0 -and $attempt -eq $candidates.Count -and $launched -gt 0 -and $held -eq 0 -and $quarantineSkipped -eq 0) {
         # Every candidate was settled or blocked on the human: the loop has run out of work and only
         # Takahito can give it more. Keyed on the whole sweep's head set, so a list that is still idle
         # for the same reason stays quiet and only a genuine change re-alerts.
