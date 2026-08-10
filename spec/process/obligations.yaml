@@ -81,3 +81,17 @@ obligations:
     # handing to a human — that "actually reads" is what this obligation binds.
     # See spec/process/README.md §「PR check の未読み放置を塞ぐ (OBL-PRCHECK-READ)」.
     body: "READ THE PR CHECK RUNS BEFORE HANDING TO HUMAN: on a turn that carries a PR, before you emit `NEXT: human`, read that PR's check runs (`gh pr checks <n>` or the JSON `gh pr view <n> --json statusCheckRollup`). If a check is red, fix it. You may escalate to the human with a red check ONLY if one of these two holds and you state which in the reply: (a) the same check is red on the PR **base revision** (this failure is not from your PR — verify by checking out the base locally and re-running the same script; do NOT rely on `gh run list --commit <base_sha>` alone, since a newly added check has no run on base and the query returns empty rather than a verdict); or (b) fixing the failure requires an operation you cannot perform under Tier C (repo settings / branch protection / secrets / anything the allow-list denies). Neither condition being true, do not emit `NEXT: human` while a red PR check stands. The normative treatment of red CI on PR gates is ADR-2026-06-03-16; this obligation carries only the read-and-triage duty, not the gate policy."
+
+  - id: OBL-MERGE-MECHANISM
+    role: implementer
+    # Net-new formulation (no origin — nothing was deleted from source to create it).
+    # The rule existed, but only as a comment in the classifier that maps `gh pr merge`
+    # to GIT_MERGE_TO_MAIN ("develop merges are local self-review; main is Takahito/
+    # Tier C"). The implementer cannot read that comment. Measured 2026-08-09 on
+    # T-slope-extension-dead-mode: told by the naysayer to merge Step 1 to `develop`
+    # — a merge the allow-list explicitly permits — the session reached for
+    # `gh pr merge`, was denied as Tier C, and halted. Every tick relaunched it, and
+    # because a denied session posts nothing, the thread head never moved: five hours
+    # of the sweep starved behind one thread. The constraint was real, correct, and
+    # unreadable by the only party bound by it.
+    body: "HOW TO MERGE (and how not to): `gh pr merge` is classified as a merge-to-main REGARDLESS of the pull request's base branch, so it is always denied and the denial HALTS your session — you will post nothing and the turn is lost. Never invoke it. Where a self-merge is sanctioned for your repository (a `feature/*` branch into `develop`), perform it locally instead: check out the target branch, `git merge <your feature branch>`, then push. Merges into `main` are never yours to make under any mechanism; open the PR, report, and hand to the human — that hand-off IS the merge step for `main`, not a fallback from a failed attempt."
