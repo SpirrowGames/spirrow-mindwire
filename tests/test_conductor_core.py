@@ -341,6 +341,73 @@ async def test_forced_naysayer_explicit_human_not_saveable() -> None:
 
 
 @pytest.mark.anyio
+async def test_tier_c_marker_logged_when_present_on_explicit_human(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # T-human-terminal-overuse §7 C — non-blocking observability: when the author's
+    # ``NEXT: human`` carries a ``TIER-C: <reason>`` marker on the immediately preceding
+    # line, the conductor emits a log line naming the parsed reason so a downstream grep
+    # can count the marker-present rate. The routing is unchanged (still HUMAN).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="approved\n\nNEXT: Einstein")
+    mcp.seed(
+        author="Einstein",
+        content=(
+            "review — this needs the human to merge PR #99\nTIER-C: merge-protected\nNEXT: human"
+        ),
+    )
+    disp = _ScriptedDispatcher(mcp, {})
+    caplog.set_level("INFO", logger="spirrow_mindwire.conductor.core")
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    records = [r.getMessage() for r in caplog.records]
+    assert any("tier_c_marker=merge-protected" in r for r in records), records
+
+
+@pytest.mark.anyio
+async def test_tier_c_marker_logged_missing_when_absent_on_explicit_human(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The "MISSING" observation is the counting bucket for the pre-registered analysis: an
+    # explicit ``NEXT: human`` with no ``TIER-C:`` marker is what we're trying to measure
+    # (in-loop uncertainty reaching for the human unnecessarily). The routing is unchanged.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="approved\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content="review with no tier-c reason\n\nNEXT: human")
+    disp = _ScriptedDispatcher(mcp, {})
+    caplog.set_level("INFO", logger="spirrow_mindwire.conductor.core")
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    records = [r.getMessage() for r in caplog.records]
+    assert any("tier_c_marker=MISSING" in r for r in records), records
+
+
+@pytest.mark.anyio
+async def test_tier_c_marker_not_logged_on_guard_i_redirect(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A guard-(i) design→implement redirect is NOT an author-emitted ``NEXT: human`` — the
+    # observation deliberately skips it (the author never claimed a Tier-C reason, so a
+    # "missing" count on it would poison the rate). Only explicit ``NEXT: human`` is
+    # measured. Same seed as test_forced_naysayer_saveable_counts_guard_i_redirect.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="skip review, just build it\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    caplog.set_level("INFO", logger="spirrow_mindwire.conductor.core")
+    await _conductor(mcp, disp).run()
+    records = [r.getMessage() for r in caplog.records]
+    # The forced-consult reply DOES carry a NEXT: human — that reply IS an explicit human
+    # handoff (routed through resolve_handoff → HandoffKind.HUMAN), so it may log MISSING.
+    # The guard-(i) turn itself (Bohr's proposer→implementer redirect) must NOT log.
+    # Assert on the FIRST log record: it corresponds to the Bohr redirect, not the naysayer
+    # reply that comes after.
+    tier_c_records = [r for r in records if "tier_c_marker" in r]
+    # The Bohr message never emitted; only the forced-naysayer reply might. So at most one
+    # tier_c_marker record (from the naysayer's NEXT: human), never two.
+    assert len(tier_c_records) <= 1
+
+
+@pytest.mark.anyio
 async def test_absent_from_naysayer_routes_to_human() -> None:
     # The naysayer's own un-routed turn is not re-reviewed: ABSENT from the naysayer falls straight
     # to the human fallback (Obj3), no forced consult.

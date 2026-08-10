@@ -24,6 +24,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Final
 
 from ..value_objects import Role
 
@@ -154,6 +155,122 @@ def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
 
 
 # --------------------------------------------------------------------------- #
+# Tier-C reason marker — non-blocking observability for ``NEXT: human`` (T-human-
+# terminal-overuse spec §7). The measurement decision was that ``NEXT: human`` is
+# structurally cheap for the loop to reach for whenever it hits friction, so we
+# don't know from the routing verdict alone how many human-terminal turns are
+# genuine Tier-C escalations versus in-loop uncertainty that should have gone
+# back to the proposer. To find out — WITHOUT gating anything — we ask the
+# author to justify the human handoff with a small structured marker on the
+# line immediately preceding ``NEXT: human``, and count how often it is present
+# and what reason category it names.
+#
+# This block is the counterpart of the emission-side prompt below: the reasons
+# named in the prompt and the ones the regex accepts are one Python enum, so
+# emit and parse cannot drift. The parser is deliberately strict on scope:
+#   - it looks ONLY at the single line immediately before the LAST ``NEXT:
+#     human`` in the body (``n-1``, no blank-line skipping). A wider window
+#     would let a stray "TIER-C: ..." mention earlier in the reply score as a
+#     marker, defeating the count.
+#   - it does not fire for ``NEXT: human`` typed inside a quote/relay (the
+#     LAST-``NEXT:`` rule of :func:`resolve_handoff` already collapses to the
+#     author's real, final handoff).
+#   - a body with no ``NEXT: human`` line at all returns None (not a
+#     "missing marker" — an unrelated observation).
+#
+# Non-blocking by design: nothing in the conductor branches on this parse. The
+# routing continues to flow through :func:`resolve_handoff` unchanged; the
+# marker is logged for pre-registered threshold analysis (see
+# ``spec/process/README.md``) and that is all.
+# --------------------------------------------------------------------------- #
+
+
+class TierCReason(StrEnum):
+    """Structured reason categories for a genuine Tier-C escalation to the human.
+
+    A ``NEXT: human`` handoff without one of these preceding the handoff line is
+    counted as "missing" by :func:`parse_tier_c_marker` — a non-blocking signal that
+    the implementer reached for the human on an in-loop concern that a proposer
+    hand-back would have covered. The enum values are the wire form used in the
+    marker (``TIER-C: <value>``); ``OTHER`` accepts a colon-suffix free text.
+    """
+
+    IRREVERSIBLE = "irreversible"  # a step the loop cannot undo on its own
+    BILLING = "billing"  # spending outside the sandbox / paid API surface
+    SCOPE = "scope"  # widening scope beyond the approved spec
+    MERGE_PROTECTED = "merge-protected"  # a merge to a protected branch (main)
+    RELEASE_CROSS_REPO = "release-cross-repo"  # cross-repo release / publish
+    OTHER = "other"  # free-text escape hatch — must carry a ``:<why>`` suffix
+
+
+# Wire-form values of the fixed-enum reasons (everything except OTHER, which is
+# a ``other:<free text>`` form). Both the regex and the prompt guidance are
+# derived from this tuple so emit and parse share one SOT — the same discipline
+# HUMAN_TOKEN / NONE_TOKEN enforce for the sentinel vocabulary.
+_TIER_C_FIXED_REASONS: Final[tuple[str, ...]] = tuple(
+    r.value for r in TierCReason if r is not TierCReason.OTHER
+)
+
+# The marker line format: ``TIER-C: <reason>`` on the line IMMEDIATELY preceding
+# ``NEXT: human`` (n-1, no blank-line skipping). Non-greedy on the OTHER tail so
+# trailing whitespace is not swallowed into the free-text detail. Case-sensitive
+# on ``TIER-C:`` on purpose — a mixed-case ``tier-c:`` would flag the prompt as
+# unclear (and the pre-registered miss-rate would double-count them either way).
+_TIER_C_MARKER_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\s*TIER-C:\s+(?P<value>"
+    + "|".join(re.escape(r) for r in _TIER_C_FIXED_REASONS)
+    + r"|other:.*?)\s*$"
+)
+
+
+@dataclass(frozen=True)
+class TierCMarker:
+    """A parsed ``TIER-C:`` reason marker preceding a ``NEXT: human`` handoff.
+
+    ``detail`` is the free-text tail after ``other:`` (``None`` for the fixed
+    enum reasons and for a bare ``other:`` with no tail).
+    """
+
+    reason: TierCReason
+    detail: str | None = None
+
+
+def parse_tier_c_marker(body: str) -> TierCMarker | None:
+    """Non-blocking observation: the ``TIER-C:`` marker preceding the LAST ``NEXT: human``.
+
+    Returns the parsed :class:`TierCMarker` when the LAST ``NEXT:`` line in ``body`` resolves
+    to ``human`` AND the line immediately preceding it matches the strict enum. Returns
+    ``None`` in every other case: no ``NEXT:`` line at all, a final ``NEXT:`` that is not
+    ``human`` (an earlier quoted / relayed ``NEXT: human`` must not defeat the author's real
+    final handoff — same "last wins" rule as :func:`resolve_handoff`), the ``NEXT: human`` is
+    the very first line (no ``n-1``), or the preceding line does not match. Callers use this
+    to COUNT "human-terminal turns with vs. without a Tier-C justification" — never to gate
+    anything. See the module-level block above for the design rationale (strict n-1 window,
+    single SOT for reasons, non-blocking by design).
+    """
+    lines = body.splitlines()
+    last_next_idx = -1
+    last_is_human = False
+    for i, line in enumerate(lines):
+        match = _NEXT_LINE_RE.match(line)
+        if match is None:
+            continue
+        name = _name_from_raw(match.group("token").strip())
+        last_next_idx = i
+        last_is_human = name is not None and name.casefold() == HUMAN_TOKEN
+    if not last_is_human or last_next_idx <= 0:
+        return None
+    match = _TIER_C_MARKER_RE.match(lines[last_next_idx - 1])
+    if match is None:
+        return None
+    value = match.group("value")
+    if value.startswith("other:"):
+        detail = value.removeprefix("other:").strip() or None
+        return TierCMarker(reason=TierCReason.OTHER, detail=detail)
+    return TierCMarker(reason=TierCReason(value), detail=None)
+
+
+# --------------------------------------------------------------------------- #
 # Emission side: the NEXT-protocol block injected into the adapter system prompts
 # (PR-2b-1). This is the counterpart of resolve_handoff (the parser) and lives in
 # the same module so the sentinel vocabulary (HUMAN_TOKEN / NONE_TOKEN + persona
@@ -193,8 +310,17 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "As the implementer: when you open or update a develop→main pull request, hand to the "
         f"PR-gate — end your reply with `NEXT: {PR_REVIEW_TOKEN} <owner/repo#n>` (the PR ref) so "
         "the independent naysayer review runs before any human merge. For other work, hand back "
-        "to the proposer for a spec-review (`NEXT: <proposer persona>`); for a Tier-C decision "
-        f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself."
+        f"to the proposer for a spec-review (`NEXT: <proposer persona>`). `NEXT: {HUMAN_TOKEN}` is "
+        "reserved for a Tier-C decision the loop cannot make on its own — a merge to a protected "
+        "branch, an irreversible action, spending outside the sandbox, a widening of scope beyond "
+        "the approved spec, or a cross-repo release. When you use it, put the reason on the line "
+        f"IMMEDIATELY preceding the handoff, in this exact form:\n"
+        f"    TIER-C: <"
+        + "|".join(_TIER_C_FIXED_REASONS)
+        + "|other:<why>>\n"
+        + "In-loop uncertainty — a spec question, a review disposition, a naysayer objection you "
+        "need clarified — is NOT Tier-C: hand back to the proposer instead. You never merge to "
+        "the main branch yourself."
     ),
     Role.NAYSAYER: (
         "As the naysayer: after your critique, hand back to the proposer if your objections need a "
@@ -243,7 +369,10 @@ __all__ = [
     "PR_REVIEW_TOKEN",
     "Handoff",
     "HandoffKind",
+    "TierCMarker",
+    "TierCReason",
     "build_handoff_protocol_block",
     "parse_next_token",
+    "parse_tier_c_marker",
     "resolve_handoff",
 ]

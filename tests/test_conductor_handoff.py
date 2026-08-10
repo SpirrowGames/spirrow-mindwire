@@ -7,8 +7,11 @@ from spirrow_mindwire.conductor.handoff import (
     NONE_TOKEN,
     Handoff,
     HandoffKind,
+    TierCMarker,
+    TierCReason,
     build_handoff_protocol_block,
     parse_next_token,
+    parse_tier_c_marker,
     resolve_handoff,
 )
 from spirrow_mindwire.value_objects import Role
@@ -174,3 +177,127 @@ def test_implementer_block_hands_back_to_proposer_and_never_merges() -> None:
 def test_naysayer_block_is_advisory() -> None:
     block = build_handoff_protocol_block(Role.NAYSAYER)
     assert "advisory, not a veto" in block
+
+
+def test_implementer_block_names_the_tier_c_marker_convention() -> None:
+    # T-human-terminal-overuse: the prompt-side half of the design. The block must (a)
+    # narrow when ``NEXT: human`` is warranted and (b) name the ``TIER-C: <reason>`` marker
+    # convention with the same enum values the parser accepts, so a cooperating implementer
+    # produces the marker the parser measures. Emit and parse read the SAME enum
+    # (_TIER_C_FIXED_REASONS): this pin catches drift between them.
+    block = build_handoff_protocol_block(Role.IMPLEMENTER)
+    assert "TIER-C:" in block
+    for reason in TierCReason:
+        if reason is TierCReason.OTHER:
+            assert "other:" in block  # OTHER carries a ``:<why>`` suffix
+        else:
+            assert reason.value in block
+    # The intent-narrowing sentence pair: in-loop uncertainty routes to the proposer.
+    assert "In-loop uncertainty" in block
+    assert "proposer" in block
+
+
+# --------------------------------------------------------------------------- #
+# parse_tier_c_marker — non-blocking observation (T-human-terminal-overuse §7)
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_tier_c_marker_absent_when_no_next_human() -> None:
+    # No ``NEXT: human`` line → None (not "missing marker"; the observation doesn't apply).
+    assert parse_tier_c_marker("just a design reply\n\nNEXT: Bohr") is None
+    assert parse_tier_c_marker("no handoff at all") is None
+
+
+def test_parse_tier_c_marker_missing_when_no_preceding_line() -> None:
+    # ``NEXT: human`` is the very first line → no n-1 exists → None (= missing).
+    assert parse_tier_c_marker("NEXT: human") is None
+
+
+def test_parse_tier_c_marker_missing_when_preceding_line_is_prose() -> None:
+    body = "some conclusion the implementer wrote\n\nNEXT: human"
+    # Blank line separates the prose from ``NEXT: human``, so n-1 is the blank — no marker.
+    assert parse_tier_c_marker(body) is None
+
+
+def test_parse_tier_c_marker_missing_when_blank_line_separates_marker() -> None:
+    # Strict n-1: a blank line between the marker and ``NEXT: human`` breaks the match
+    # (design choice per Einstein §7-5 — a wider window would let stray TIER-C mentions
+    # earlier in the reply score, defeating the count).
+    body = "reason...\n\nTIER-C: merge-protected\n\nNEXT: human"
+    assert parse_tier_c_marker(body) is None
+
+
+def test_parse_tier_c_marker_recognises_every_fixed_reason() -> None:
+    for reason in (
+        TierCReason.IRREVERSIBLE,
+        TierCReason.BILLING,
+        TierCReason.SCOPE,
+        TierCReason.MERGE_PROTECTED,
+        TierCReason.RELEASE_CROSS_REPO,
+    ):
+        body = f"work is done\nTIER-C: {reason.value}\nNEXT: human"
+        marker = parse_tier_c_marker(body)
+        assert marker == TierCMarker(reason=reason, detail=None)
+
+
+def test_parse_tier_c_marker_other_captures_free_text_detail() -> None:
+    body = (
+        "unexpected environment failure\nTIER-C: other:host clock skew locks the sweep\nNEXT: human"
+    )
+    marker = parse_tier_c_marker(body)
+    assert marker == TierCMarker(reason=TierCReason.OTHER, detail="host clock skew locks the sweep")
+
+
+def test_parse_tier_c_marker_other_with_empty_detail() -> None:
+    # ``other:`` with nothing after is still a match — the enum's escape hatch. Detail is
+    # None (not the empty string) so callers do not have to guard on ``if detail``.
+    body = "prose\nTIER-C: other:\nNEXT: human"
+    marker = parse_tier_c_marker(body)
+    assert marker == TierCMarker(reason=TierCReason.OTHER, detail=None)
+
+
+def test_parse_tier_c_marker_rejects_unknown_reason() -> None:
+    # A reason not in the enum → None (missing), not a false-positive. Strictness is what
+    # keeps the count meaningful (Einstein §7-5).
+    body = "prose\nTIER-C: whatever\nNEXT: human"
+    assert parse_tier_c_marker(body) is None
+
+
+def test_parse_tier_c_marker_rejects_wrong_prefix() -> None:
+    # Case-sensitive on the marker prefix on purpose (a lowercase ``tier-c:`` would
+    # under-count into MISSING, which is the right side to err on).
+    body = "prose\ntier-c: scope\nNEXT: human"
+    assert parse_tier_c_marker(body) is None
+
+
+def test_parse_tier_c_marker_last_next_human_wins() -> None:
+    # Same "last wins" rule as resolve_handoff: an earlier quoted ``NEXT: human`` (e.g.
+    # inside a relay) must not defeat the marker check against the author's final handoff.
+    body = (
+        "quoting a review:\n"
+        "TIER-C: irreversible\n"
+        "NEXT: human\n"
+        "\n"
+        "my reply:\n"
+        "TIER-C: merge-protected\n"
+        "NEXT: human"
+    )
+    marker = parse_tier_c_marker(body)
+    assert marker is not None
+    assert marker.reason is TierCReason.MERGE_PROTECTED
+
+
+def test_parse_tier_c_marker_tolerates_leading_whitespace() -> None:
+    # Indentation on either line does not break the match (real messages often carry
+    # trailing spaces or accidental leading tabs from markdown editors).
+    body = "prose\n  TIER-C: billing  \n  NEXT: human  "
+    marker = parse_tier_c_marker(body)
+    assert marker is not None
+    assert marker.reason is TierCReason.BILLING
+
+
+def test_parse_tier_c_marker_ignores_quoted_next_human_in_body_position() -> None:
+    # A ``NEXT: Bohr`` last-handoff overrides a preceding ``NEXT: human`` — the observation
+    # doesn't apply because the routing verdict is not HUMAN.
+    body = "TIER-C: scope\nNEXT: human\n\nactually, on reflection:\nNEXT: Bohr"
+    assert parse_tier_c_marker(body) is None

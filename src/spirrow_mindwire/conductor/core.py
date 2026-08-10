@@ -75,7 +75,7 @@ from ..value_objects import (
     ThreadRef,
 )
 from .control import BASELINE_CONTROL_STATE, ControlState, LoopControl
-from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, resolve_handoff
+from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, parse_tier_c_marker, resolve_handoff
 
 if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
@@ -376,6 +376,15 @@ class Conductor:
             return self._human_terminal(messages, explicit_human=False)
 
         if handoff.kind is HandoffKind.HUMAN:
+            # Non-blocking observation (T-human-terminal-overuse §7-4 / -5): count how often
+            # an explicit ``NEXT: human`` carries a structured Tier-C reason marker on the
+            # line immediately preceding it. Nothing branches on the result — the routing
+            # continues unchanged; the log line lets a later pre-registered threshold check
+            # (14d / 20 turns / >20% missing & ≥3) decide whether the prompt-side guidance
+            # is winning. Guard-(i) redirects and ABSENT terminals are NOT observed: those
+            # aren't author-emitted ``NEXT: human`` lines, so a "missing" count on them is
+            # meaningless (the author never claimed a Tier-C reason).
+            self._observe_tier_c_marker(messages[-1])
             return self._human_terminal(messages, explicit_human=True)
 
         if handoff.kind is HandoffKind.ROLE:
@@ -460,6 +469,33 @@ class Conductor:
         implementer allow-list's environment-containment stance). Stronger author authentication
         (ADR-11 normalization) is a deferred hardening."""
         return bool(self._human_identity) and author.casefold() == self._human_identity.casefold()
+
+    def _observe_tier_c_marker(self, msg: dict[str, Any]) -> None:
+        """Emit a structured log line naming whether ``msg`` carries a ``TIER-C:`` marker.
+
+        Non-blocking observability for T-human-terminal-overuse (§7 spec, Einstein §7-5
+        endorsement): the marker is teased apart from the author's ``NEXT: human`` line so
+        a later pre-registered analysis (see ``spec/process/README.md`` §「NEXT: human の
+        妥当性計測」) can count "human-terminal turns with vs. without a Tier-C reason".
+        The log key ``tier_c_marker=`` is deliberately fixed so a downstream grep counts
+        it directly; the value is either ``MISSING`` or the reason enum's wire form
+        (``irreversible`` / ``billing`` / ``scope`` / ``merge-protected`` /
+        ``release-cross-repo`` / ``other``). ``other`` marker detail is included in the
+        detail field for context but does not affect the counting bucket.
+        """
+        marker = parse_tier_c_marker(_content(msg))
+        author = _author(msg)
+        msg_id = _msg_id(msg)
+        if marker is None:
+            logger.info("tier_c_marker=MISSING author=%s msg=%s", author, msg_id)
+            return
+        logger.info(
+            "tier_c_marker=%s detail=%s author=%s msg=%s",
+            marker.reason.value,
+            marker.detail or "",
+            author,
+            msg_id,
+        )
 
     def _naysayer_consulted(self, messages: list[dict[str, Any]]) -> bool:
         """Has the naysayer posted since the last ``NEXT: human`` boundary (excl. the latest msg)?

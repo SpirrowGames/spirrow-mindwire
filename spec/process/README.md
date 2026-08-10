@@ -150,6 +150,38 @@ A が非阻止である以上、reader が居ないと advisory が実質沈黙�
 
 ---
 
+## NEXT: human の妥当性計測 (T-human-terminal-overuse §7、2026-08-11 登録)
+
+`NEXT: human` は構造的に安価な逃げ道であり、in-loop uncertainty (proposer に差し戻せば済む spec 質問 / review disposition / naysayer objection) が過剰に人間に流れているのではないか、という実測を得るための **非阻止の観測機構**。設計 = A (prompt 側) + C (計測側) の二本立てで、いずれも `src/spirrow_mindwire/conductor/handoff.py` を SOT とする (obligations.yaml には置かない — routing 実挙動と prompt を同一ファイルに束ねるための境界規則。§7-2 disposition)。
+
+### A — prompt 節 (`build_handoff_protocol_block(Role.IMPLEMENTER)`)
+
+`NEXT: human` を「Tier-C 判定でループ自身が下せないもの」に narrow し、その enum 値 (`irreversible` / `billing` / `scope` / `merge-protected` / `release-cross-repo` / `other:<why>`) を prompt で明示。in-loop uncertainty は proposer 差し戻しであることを対で書く。cooperating な実装者はこの節を読んで下記 marker を吐く。
+
+### C — 計測パーサ (`parse_tier_c_marker`)
+
+`NEXT: human` の **直前1行 (n-1、blank-line skip 無し)** に `^\s*TIER-C:\s+<enum>\s*$` を strict match。enum 一致 = 該当理由でカウント、それ以外 = MISSING でカウント。conductor は `HandoffKind.HUMAN` を route する直前に `_observe_tier_c_marker` を呼び、`tier_c_marker=<value>` の 1 行を `logger.info` する (structured grep 用の固定 key)。
+
+**scope の限定 (Einstein §7-5 追認):**
+
+- 適用対象は **explicit ``NEXT: human`` のみ**。guard-(i) redirect (proposer→implementer で redirect された turn) や ABSENT / Q-A terminal は author が `NEXT: human` を書いていない ∴ marker 有無で数えると分母を汚染する。conductor 側で `handoff.kind is HandoffKind.HUMAN` の分岐でだけ observation を呼ぶことで scope を絞る。
+- 前段の quoted `NEXT: human` (relay 内の引用) は `resolve_handoff` の「last wins」ルールと同じ扱いで **末尾の author 実 handoff にのみ**適用する。
+- パーサは strict n-1: blank line が挟まると MISSING に落ちる。これは仕様通り (window を広げると reply 本文内の TIER-C 言及が誤検知され、count の意味が壊れる)。
+
+### 事前登録した閾値 (Einstein §7-4 追認)
+
+以下を **データを見る前に**登録する (post-hoc justification 封じ)。判定は AND:
+
+- **観測期間**: 14 日以上
+- **観測件数**: `tier_c_marker=` の log 行が 20 件以上
+- **判定条件**: `tier_c_marker=MISSING` の比率が 20% を超え、かつ MISSING の生数が 3 件以上
+
+上記を満たした場合、prompt 敗北のシグナルとして A2 (conductor 側で強制 redirect) や B (測定ターン新設) のスコープ拡張を再検討する。満たさない場合は A の prompt 節が機能していると判定して現状維持。
+
+**このセクション自体が観測結果の一次読み手**: 上記閾値は本 README を SOT とする。ledger.md や CLAUDE.md への転記はしない (SOT 単一化)。閾値変更は ADR / spec-review 経由。
+
+---
+
 ## 受容したリスク (規則で緩和されない事項) — msg-760 記載
 
 環境前提の誤りに対する規則的緩和は本 PR では置いていない (msg-760 で自己申告ラベル案が naysayer と human に撃ち落とされ、取り下げ済み)。**このリスクは規則で塞がず、後段ロール撃墜 + human の事前提示に依存する形で受容している。** msg-761 での human 側の訂正: この受容リスクを負うのは実質的に human (Takahito) 側で、本スレッド内でも既に 2〜3 回発現している。
