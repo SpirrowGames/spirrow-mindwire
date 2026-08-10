@@ -37,7 +37,8 @@ $functions = $ast.FindAll(
 foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
                   'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
                   'Get-SystemicAlertSignature', 'Merge-StateForWrite', 'Get-JsonState',
-                  'Save-JsonState', 'Update-EvaluatedTimestamp') {
+                  'Save-JsonState', 'Update-EvaluatedTimestamp', 'ConvertTo-UtcInstant',
+                  'Test-DigestClockAdvances') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -293,23 +294,63 @@ Check "starvation section excludes a brand-new live thread absent from state" $t
 Check "starvation section excludes an ex-live thread (state file only)" $true `
     ($digest2 -notmatch 'p/T-ex-live')
 
+Write-Host "Test-DigestClockAdvances — sent + skipped are terminal, only failed retries"
+# THE regression this exists to prevent: previously a webhook-less run had Send-Notification
+# return $false on the "not configured" branch, the digest gate held its clock, digestDue stayed
+# true forever, and every 5-min tick spammed 2 log lines. Locking the terminal-outcomes table into
+# this helper means any future edit that flips a case is caught by this test.
+Check "sent -> clock advances" $true (Test-DigestClockAdvances -Result 'sent')
+Check "skipped -> clock advances (no webhook, not spamming the log)" $true `
+    (Test-DigestClockAdvances -Result 'skipped')
+Check "failed -> clock HELD (transient, retry next tick)" $false `
+    (Test-DigestClockAdvances -Result 'failed')
+# Unknown status is treated as non-terminal (do not advance) — safer default.
+Check "unknown status -> clock HELD (fail closed)" $false `
+    (Test-DigestClockAdvances -Result 'weird-future-status')
+
+Write-Host "ConvertTo-UtcInstant — handles both string and [DateTime] inputs uniformly"
+# Naive [datetime]::Parse on a DateTime happens to survive via implicit ToString + Parse-Local +
+# ToUniversalTime cancellation. Under a non-invariant culture or a DateTimeKind change it silently
+# produces off-by-hours ages. The helper takes both shapes and returns the same UTC instant.
+# $expected is built the same way the helper does its final coercion, so the test is truly
+# comparing "does the helper return the same UTC instant regardless of input shape?" rather than
+# accidentally testing timezone-conversion arithmetic.
+$expected = [datetime]::Parse('2026-08-11T12:00:00Z').ToUniversalTime()
+Check "string ISO in -> UTC instant out" $expected (ConvertTo-UtcInstant '2026-08-11T12:00:00Z')
+Check "[DateTime] Local in -> same UTC instant" $expected `
+    (ConvertTo-UtcInstant ([datetime]::Parse('2026-08-11T12:00:00Z')))
+Check "null in -> null out" $null (ConvertTo-UtcInstant $null)
+# The value shape produced by an actual JSON round-trip — this is the case the runner sees on
+# every tick after the first save.
+$rt = (@{ ts = '2026-08-11T12:00:00Z' } | ConvertTo-Json | ConvertFrom-Json).ts
+Check "round-tripped JSON value -> same UTC instant" $expected (ConvertTo-UtcInstant $rt)
+
 Write-Host "Update-EvaluatedTimestamp — refreshes last_evaluated_at, preserves first_seen_at"
 # The whole point of the extraction: every disposition that reached the candidate uses the same
-# pattern. Test that behaviour once here so the per-callsite change is trivial.
+# pattern. Test that behaviour once here so the per-callsite change is trivial. Compare by parsed
+# UTC instant rather than by literal string, so the round-trip through ConvertTo-UtcInstant + ISO
+# formatting is not conflated with textual precision (7-digit fractional seconds are canonical for
+# ToString("o") — that IS the shape the runner writes to disk).
 $state = @{
     'p/T-both'  = @{ first_seen_at = '2026-08-01T00:00:00Z'; last_evaluated_at = '2026-08-05T00:00:00Z' }
     'p/T-first' = @{ first_seen_at = '2026-08-01T00:00:00Z' }   # never launched yet
 }
 $fixed = [datetime]::Parse('2026-08-11T12:00:00Z').ToUniversalTime()
+$aug1 = [datetime]::Parse('2026-08-01T00:00:00Z').ToUniversalTime()
 Update-EvaluatedTimestamp -State $state -Key 'p/T-both' -Now $fixed
-Check "refresh: last_evaluated_at moved to now" '2026-08-11T12:00:00.0000000Z' $state['p/T-both'].last_evaluated_at
-Check "refresh: first_seen_at preserved" '2026-08-01T00:00:00Z' $state['p/T-both'].first_seen_at
+Check "refresh: last_evaluated_at moved to now" $fixed `
+    ([datetime]::Parse($state['p/T-both'].last_evaluated_at).ToUniversalTime())
+Check "refresh: first_seen_at preserved (same instant)" $aug1 `
+    ([datetime]::Parse($state['p/T-both'].first_seen_at).ToUniversalTime())
 Update-EvaluatedTimestamp -State $state -Key 'p/T-first' -Now $fixed
-Check "first launch: last_evaluated_at now set" '2026-08-11T12:00:00.0000000Z' $state['p/T-first'].last_evaluated_at
-Check "first launch: first_seen_at kept" '2026-08-01T00:00:00Z' $state['p/T-first'].first_seen_at
+Check "first launch: last_evaluated_at now set" $fixed `
+    ([datetime]::Parse($state['p/T-first'].last_evaluated_at).ToUniversalTime())
+Check "first launch: first_seen_at kept" $aug1 `
+    ([datetime]::Parse($state['p/T-first'].first_seen_at).ToUniversalTime())
 # Brand-new key: no prior row, no first_seen_at anywhere. Just write last_evaluated_at.
 Update-EvaluatedTimestamp -State $state -Key 'p/T-brand' -Now $fixed
-Check "brand new key: last_evaluated_at set" '2026-08-11T12:00:00.0000000Z' $state['p/T-brand'].last_evaluated_at
+Check "brand new key: last_evaluated_at set" $fixed `
+    ([datetime]::Parse($state['p/T-brand'].last_evaluated_at).ToUniversalTime())
 Check "brand new key: no first_seen_at (nothing to preserve)" $false ($state['p/T-brand'].ContainsKey('first_seen_at'))
 # Round-tripped PSCustomObject — same duck typing concern as Get-FingerprintHint. Here it goes
 # further: ConvertFrom-Json auto-parses ISO 8601 strings into DateTime OBJECTS, so a state entry

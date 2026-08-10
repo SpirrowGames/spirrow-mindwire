@@ -175,6 +175,21 @@ function Save-JsonState {
     [System.IO.File]::WriteAllText($Path, ($State | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# Coerce a JSON-round-tripped timestamp into a UTC [DateTime]. Necessary because ConvertFrom-Json
+# auto-parses ISO 8601 strings into [DateTime] LOCAL objects, so a naive `[datetime]::Parse($v)`
+# on such a value implicitly stringifies via the current culture, parses back, and only "happens
+# to survive" because ToUniversalTime() cancels out Parse's Local-assumption offset. That coupling
+# is brittle: a culture change, a DateTimeKind change, or a future refactor that drops the trailing
+# ToUniversalTime() would silently produce off-by-hours ages in the starvation metric. Centralise
+# the coercion here and stop scattering `[datetime]::Parse` calls across timestamp readers.
+# (Tier B naysayer, PR #138 round 5, weakest remaining point.)
+function ConvertTo-UtcInstant {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    return [datetime]::Parse("$Value").ToUniversalTime()
+}
+
 # Merge-on-write: re-read the file just before writing and preserve any keys the operator removed
 # during the tick. Used for state files where BOTH the sweep and an external tool (Clear-Quarantine)
 # may write during a sweep run — quarantine.json and heads.json.
@@ -250,17 +265,14 @@ function Merge-StateForWrite {
 function Update-EvaluatedTimestamp {
     param([hashtable]$State, [string]$Key, [datetime]$Now)
 
-    # PowerShell's ConvertFrom-Json auto-parses ISO 8601 strings into DateTime objects. So a
-    # first_seen_at read from disk is a [DateTime], not a [string]. Normalise back to a canonical
-    # ISO string on the way out so downstream readers (Get-StarvedKeys, New-DailyDigest) always
-    # receive the same shape regardless of whether the value came from disk or from an in-memory
-    # write earlier this tick. Same reason Get-FingerprintHint stays duck-typed on its input, but
-    # here we can afford to canonicalise on write because we control the whole state file.
+    # ConvertFrom-Json auto-parses ISO 8601 strings into DateTime objects. So a first_seen_at read
+    # from disk is a [DateTime], not a [string]. Normalise back to a canonical ISO string on the
+    # way out so downstream readers always receive the same shape regardless of whether the value
+    # came from disk or from an in-memory write earlier this tick.
     $firstSeen = $null
     if ($State.ContainsKey($Key) -and $null -ne $State[$Key]) {
-        $prior = $State[$Key].first_seen_at
-        if ($prior -is [datetime]) { $firstSeen = $prior.ToUniversalTime().ToString("o") }
-        elseif ($prior) { $firstSeen = "$prior" }
+        $priorInstant = ConvertTo-UtcInstant $State[$Key].first_seen_at
+        if ($priorInstant) { $firstSeen = $priorInstant.ToString("o") }
     }
     $row = @{ last_evaluated_at = $Now.ToUniversalTime().ToString("o") }
     if ($firstSeen) { $row.first_seen_at = $firstSeen }
@@ -472,6 +484,22 @@ function Format-DurationDigest {
     return "${minutes}m"
 }
 
+# Should the daily-digest clock advance given this Send-Notification result?
+#
+# 'sent'     -> yes, the notification landed and we do not want to re-attempt for 24h.
+# 'skipped'  -> yes, the operator has no webhook configured. Retrying every 5 minutes accomplishes
+#               nothing (the webhook will not appear on its own) and would log-spam the daemon.
+# 'failed'   -> no, the webhook is configured but the POST failed. This is the ONLY case where the
+#               next tick should retry — the whole reason the clock is gated on the result at all.
+#
+# Pulled out as a helper so the "which outcomes are terminal?" decision is testable and lives in
+# one place. If a future refactor adds a fourth outcome, this table is the only line to touch.
+# (Tier B naysayer, PR #138 round 5.)
+function Test-DigestClockAdvances {
+    param([string]$Result)
+    return ($Result -eq 'sent' -or $Result -eq 'skipped')
+}
+
 # The signature Send-NotificationIfChanged uses to dedup the K-budget "systemic cause suspected"
 # alert. Bucketed on the UTC date, NOT on the tick timestamp, because the failure this de-noise
 # addresses is not "same tick, twice" (impossible — the sweep breaks at K) but "adjacent ticks,
@@ -521,7 +549,7 @@ function New-DailyDigest {
     $staleList = @()
     foreach ($key in $QuarantineState.Keys) {
         $rec = $QuarantineState[$key]
-        $firstAt = [datetime]::Parse($rec.first_failure_at).ToUniversalTime()
+        $firstAt = ConvertTo-UtcInstant $rec.first_failure_at
         $derived = Get-DerivedQuarantineState -FirstFailureAt $firstAt -Now $Now
         $age = Format-DurationDigest -Span ($Now - $firstAt)
 
@@ -557,19 +585,20 @@ function New-DailyDigest {
     $starvedList = @()
     foreach ($key in $LiveKeys) {
         $entry = if ($EvaluatedState.ContainsKey($key)) { $EvaluatedState[$key] } else { $null }
-        $lastAtStr = if ($entry) { $entry.last_evaluated_at } else { $null }
-        $firstSeenStr = if ($entry) { $entry.first_seen_at } else { $null }
+        $lastAtRaw = if ($entry) { $entry.last_evaluated_at } else { $null }
+        $firstSeenRaw = if ($entry) { $entry.first_seen_at } else { $null }
         # Fallback ladder: last_evaluated_at (best), else first_seen_at (candidate has never launched
         # but was in scope from tick T), else THIS tick (a candidate the sweep just discovered — its
-        # 24h clock starts now, so it is not yet starved).
-        $ageBase = if ($lastAtStr) { [datetime]::Parse($lastAtStr).ToUniversalTime() }
-                   elseif ($firstSeenStr) { [datetime]::Parse($firstSeenStr).ToUniversalTime() }
-                   else { $Now }
+        # 24h clock starts now, so it is not yet starved). ConvertTo-UtcInstant absorbs both string
+        # (freshly written) and [DateTime] (JSON round-tripped) shapes.
+        $lastAt = ConvertTo-UtcInstant $lastAtRaw
+        $firstSeen = ConvertTo-UtcInstant $firstSeenRaw
+        $ageBase = if ($lastAt) { $lastAt } elseif ($firstSeen) { $firstSeen } else { $Now }
         $age = $Now - $ageBase
         if ($age -ge $script:StarvedThreshold) {
             # A "never evaluated" thread carries a slightly different label so the operator does not
             # spend cognitive effort deciding whether the entry means "stuck" or "never touched."
-            $suffix = if (-not $lastAtStr) { "   (未評価)" } else { "" }
+            $suffix = if (-not $lastAtRaw) { "   (未評価)" } else { "" }
             $starvedList += "  $key   $(Format-DurationDigest -Span $age)$suffix"
         }
     }
@@ -633,11 +662,13 @@ function Get-StarvedKeys {
     $out = @()
     foreach ($key in $LiveKeys) {
         $entry = if ($EvaluatedState.ContainsKey($key)) { $EvaluatedState[$key] } else { $null }
-        $lastAtStr = if ($entry) { $entry.last_evaluated_at } else { $null }
-        $firstSeenStr = if ($entry) { $entry.first_seen_at } else { $null }
-        $ageBase = if ($lastAtStr) { [datetime]::Parse($lastAtStr).ToUniversalTime() }
-                   elseif ($firstSeenStr) { [datetime]::Parse($firstSeenStr).ToUniversalTime() }
-                   else { $Now }
+        $lastAtRaw = if ($entry) { $entry.last_evaluated_at } else { $null }
+        $firstSeenRaw = if ($entry) { $entry.first_seen_at } else { $null }
+        # ConvertTo-UtcInstant handles both string (freshly written) and [DateTime] (JSON round-
+        # tripped) shapes. See its header for why raw [datetime]::Parse on a DateTime is brittle.
+        $lastAt = ConvertTo-UtcInstant $lastAtRaw
+        $firstSeen = ConvertTo-UtcInstant $firstSeenRaw
+        $ageBase = if ($lastAt) { $lastAt } elseif ($firstSeen) { $firstSeen } else { $Now }
         if (($Now - $ageBase) -ge $Threshold) { $out += $key }
     }
     return $out
@@ -684,8 +715,13 @@ function Send-Notification {
 
     Confirm-LogWorthKeeping
     if (-not $notifyWebhook) {
+        # 'skipped' — no webhook configured. Distinct from 'failed' because the operator has
+        # deliberately chosen not to run with Discord alerts, and a retry loop makes no sense: the
+        # webhook will not appear on its own. The digest gate advances its clock on 'skipped' so
+        # a webhook-less run does not permanently flood the log with "sending daily digest" and
+        # "notification skipped" every 5 minutes forever. (Tier B naysayer, PR #138 round 5.)
         Write-Log "notification skipped (MINDWIRE_NOTIFY_DISCORD_WEBHOOK not set)"
-        return $false
+        return 'skipped'
     }
     try {
         $payload = @{ content = $Message } | ConvertTo-Json -Compress
@@ -696,16 +732,19 @@ function Send-Notification {
         # First line only, so a multi-line digest does not spam the log with its own body.
         $firstLine = ($Message -split "`n", 2)[0]
         Write-Log "notification sent: $firstLine"
-        return $true
+        return 'sent'
     }
     catch {
-        # Never fail the sweep because the notifier failed — the conductor's work already happened.
-        # Same redaction rule as before: scrub the webhook out of any exception text before it
-        # touches the log or a record. Quarantine records / digest lines / this log line all go
-        # through this branch, so no path that touches user data can leak the bearer secret.
+        # 'failed' — webhook configured but the send failed (network, proxy, Discord outage). A
+        # retry on the next tick is the right response, so the digest gate does NOT advance its
+        # clock on this. Never fail the sweep because the notifier failed — the conductor's work
+        # already happened. Same redaction rule as before: scrub the webhook out of any exception
+        # text before it touches the log or a record. Quarantine records / digest lines / this log
+        # line all go through this branch, so no path that touches user data can leak the bearer
+        # secret.
         $reason = "$($_.Exception.Message)".Replace($notifyWebhook, '<webhook-redacted>')
         Write-Log "notification FAILED (non-fatal): $reason"
-        return $false
+        return 'failed'
     }
 }
 
@@ -719,10 +758,12 @@ function Send-NotificationIfChanged {
         Write-Log "notification suppressed (unchanged since last alert: $Key = $Signature)"
         return
     }
-    # $null = drops Send-Notification's success/fail boolean so it does not leak into the pipeline
-    # of whatever call site invokes Send-NotificationIfChanged. The change record on the state map
-    # is intentional either way — a failed send does not undo the dedup, or a webhook outage would
-    # repeat every 5 minutes forever, retraining the channel into noise.
+    # $null = drops Send-Notification's status string so it does not leak into the pipeline of
+    # whatever call site invokes Send-NotificationIfChanged. The change record on the state map is
+    # intentional either way — a failed send does not undo the dedup, or a webhook outage would
+    # repeat every 5 minutes forever, retraining the channel into noise. A 'skipped' status (no
+    # webhook) is treated the same: mark the signature so we do not spam the log with skip
+    # messages on every re-attempt. (Endorsed by Tier B naysayer on round 2 of #138.)
     $null = Send-Notification -Message $Message
     $State[$Key] = $Signature
 }
@@ -990,7 +1031,7 @@ try {
     foreach ($k in @($quarantineState.Keys)) {
         $rec = $quarantineState[$k]
         if (-not $rec.first_failure_at) { continue }
-        $firstAt = [datetime]::Parse($rec.first_failure_at).ToUniversalTime()
+        $firstAt = ConvertTo-UtcInstant $rec.first_failure_at
         $derived = Get-DerivedQuarantineState -FirstFailureAt $firstAt -Now $nowUtc
         if ($rec.state -ne $derived) {
             $prev = $rec.state
@@ -1091,7 +1132,7 @@ try {
             $ageStr = ""
             if ($rec.first_failure_at) {
                 try {
-                    $firstAt = [datetime]::Parse($rec.first_failure_at).ToUniversalTime()
+                    $firstAt = ConvertTo-UtcInstant $rec.first_failure_at
                     $ageStr = " age=$(Format-DurationDigest -Span ($nowUtc - $firstAt))"
                 } catch { }
             }
@@ -1285,24 +1326,46 @@ try {
 
     # Daily digest. Sent even when both quarantine and starvation lists are empty (spec/msg-814 §5).
     # A silent day IS the point: "no alert" then still means "the channel is alive," which is what
-    # the 5h failure specifically lacked. Attempted at most once per $DailyDigestInterval — a send
-    # failure does NOT bump the "last sent" timestamp so the next tick retries.
+    # the 5h failure specifically lacked. Attempted at most once per $DailyDigestInterval.
+    #
+    # The clock advances on 'sent' AND 'skipped' — both are terminal outcomes: 'sent' means the
+    # notification landed, 'skipped' means the operator has no webhook configured, and neither
+    # merits a 5-minute retry. Only 'failed' (webhook configured but the POST failed — network,
+    # proxy, Discord outage) holds the clock back for retry.
+    #
+    # Also gated on $notifyWebhook up front: without a webhook, computing the digest, calling
+    # Confirm-LogWorthKeeping (which promotes the buffered log to disk), and writing the "sending
+    # daily digest" line every 5 minutes for the life of the daemon is nothing but log spam. It
+    # violates the whole point of Write-QuietSummary. So when there is no webhook, the whole block
+    # is silent — the clock still advances so we do not loop, but nothing is computed, logged, or
+    # persisted for a channel nobody is listening to. (Tier B naysayer, PR #138 round 5.)
     $lastDigestAt = $null
     if ($digestState.ContainsKey('last_sent_at') -and $digestState['last_sent_at']) {
-        try { $lastDigestAt = [datetime]::Parse($digestState['last_sent_at']).ToUniversalTime() } catch { }
+        try { $lastDigestAt = (ConvertTo-UtcInstant $digestState['last_sent_at']) } catch { }
     }
     $digestDue = ($null -eq $lastDigestAt) -or (($nowUtc - $lastDigestAt) -ge $DailyDigestInterval)
     if ($digestDue) {
-        $digest = New-DailyDigest -QuarantineState $quarantineState `
-            -EvaluatedState $evaluatedState `
-            -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc `
-            -LiveKeys $liveKeys
-        Confirm-LogWorthKeeping
-        Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved)"
-        $sent = Send-Notification -Message $digest
-        if ($sent) {
+        if (-not $notifyWebhook) {
+            # No point building or logging a digest for a channel that does not exist. Advance the
+            # clock silently so we do not re-enter this branch until the next full interval.
             $digestState['last_sent_at'] = $nowUtc.ToString("o")
             Save-JsonState -Path $digestStatePath -State $digestState
+        }
+        else {
+            $digest = New-DailyDigest -QuarantineState $quarantineState `
+                -EvaluatedState $evaluatedState `
+                -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc `
+                -LiveKeys $liveKeys
+            Confirm-LogWorthKeeping
+            Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved)"
+            $result = Send-Notification -Message $digest
+            # See Test-DigestClockAdvances for the terminal-outcomes contract. 'skipped' here
+            # would be from a webhook that was set at $digestDue evaluation but has since been
+            # unset — very narrow race, but the same reasoning still holds.
+            if (Test-DigestClockAdvances -Result $result) {
+                $digestState['last_sent_at'] = $nowUtc.ToString("o")
+                Save-JsonState -Path $digestStatePath -State $digestState
+            }
         }
     }
 
