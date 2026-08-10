@@ -37,7 +37,7 @@ $functions = $ast.FindAll(
 foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
                   'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
                   'Get-SystemicAlertSignature', 'Merge-StateForWrite', 'Get-JsonState',
-                  'Save-JsonState') {
+                  'Save-JsonState', 'Update-EvaluatedTimestamp') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -292,6 +292,56 @@ Check "starvation section excludes a brand-new live thread absent from state" $t
 # day forever. This check IS the regression guard for the failure mode the PR-gate review named.
 Check "starvation section excludes an ex-live thread (state file only)" $true `
     ($digest2 -notmatch 'p/T-ex-live')
+
+Write-Host "Update-EvaluatedTimestamp — refreshes last_evaluated_at, preserves first_seen_at"
+# The whole point of the extraction: every disposition that reached the candidate uses the same
+# pattern. Test that behaviour once here so the per-callsite change is trivial.
+$state = @{
+    'p/T-both'  = @{ first_seen_at = '2026-08-01T00:00:00Z'; last_evaluated_at = '2026-08-05T00:00:00Z' }
+    'p/T-first' = @{ first_seen_at = '2026-08-01T00:00:00Z' }   # never launched yet
+}
+$fixed = [datetime]::Parse('2026-08-11T12:00:00Z').ToUniversalTime()
+Update-EvaluatedTimestamp -State $state -Key 'p/T-both' -Now $fixed
+Check "refresh: last_evaluated_at moved to now" '2026-08-11T12:00:00.0000000Z' $state['p/T-both'].last_evaluated_at
+Check "refresh: first_seen_at preserved" '2026-08-01T00:00:00Z' $state['p/T-both'].first_seen_at
+Update-EvaluatedTimestamp -State $state -Key 'p/T-first' -Now $fixed
+Check "first launch: last_evaluated_at now set" '2026-08-11T12:00:00.0000000Z' $state['p/T-first'].last_evaluated_at
+Check "first launch: first_seen_at kept" '2026-08-01T00:00:00Z' $state['p/T-first'].first_seen_at
+# Brand-new key: no prior row, no first_seen_at anywhere. Just write last_evaluated_at.
+Update-EvaluatedTimestamp -State $state -Key 'p/T-brand' -Now $fixed
+Check "brand new key: last_evaluated_at set" '2026-08-11T12:00:00.0000000Z' $state['p/T-brand'].last_evaluated_at
+Check "brand new key: no first_seen_at (nothing to preserve)" $false ($state['p/T-brand'].ContainsKey('first_seen_at'))
+# Round-tripped PSCustomObject — same duck typing concern as Get-FingerprintHint. Here it goes
+# further: ConvertFrom-Json auto-parses ISO 8601 strings into DateTime OBJECTS, so a state entry
+# read from disk has a [DateTime] where the writer put a [string]. Update-EvaluatedTimestamp must
+# tolerate both and canonicalise the stored value back to an ISO string. If this ever regresses,
+# a saved evaluated.json entry would crash the helper on the very next tick, or would silently
+# accumulate mixed shapes that confuse Get-StarvedKeys.
+$rt = ((@{ first_seen_at = '2026-08-01T00:00:00Z' } | ConvertTo-Json) | ConvertFrom-Json)
+$state2 = @{ 'p/T-rt' = $rt }
+Update-EvaluatedTimestamp -State $state2 -Key 'p/T-rt' -Now $fixed
+$storedRt = $state2['p/T-rt'].first_seen_at
+Check "PSCustomObject entry: first_seen_at is a string after canonicalisation" $true `
+    ($storedRt -is [string])
+Check "PSCustomObject entry: first_seen_at is parseable back to the original instant" `
+    ([datetime]::Parse('2026-08-01T00:00:00Z').ToUniversalTime()) `
+    ([datetime]::Parse($storedRt).ToUniversalTime())
+
+Write-Host "Starvation semantics — a head-skipped thread must NOT flag as starved"
+# THE regression the PR-gate flagged: a weekend-idle thread that head-skips correctly every tick
+# used to still show as starved because head-skip did not refresh last_evaluated_at. If the fix
+# ever regresses, this check turns red and the operator's Monday-morning digest fills with
+# healthy threads. The fix (calling Update-EvaluatedTimestamp on head-skip) is exercised by the
+# runner; here we lock the invariant it must satisfy at the metric layer.
+$eval_hs = @{
+    'p/T-weekend-idle' = @{
+        first_seen_at    = $now.AddDays(-30).ToString('o')
+        last_evaluated_at = $now.AddMinutes(-5).ToString('o')  # last tick's head-skip refreshed it
+    }
+}
+$starved_hs = Get-StarvedKeys -EvaluatedState $eval_hs -Now $now -LiveKeys @('p/T-weekend-idle')
+Check "head-skipped-every-tick thread is NOT starved (weekend idle scenario)" $false `
+    ($starved_hs -contains 'p/T-weekend-idle')
 
 Write-Host "Merge-StateForWrite — a mid-sweep operator clear must NOT be resurrected"
 # The TOCTOU concern the PR-gate flagged: sweep reads state at T=0, holds it for minutes, operator

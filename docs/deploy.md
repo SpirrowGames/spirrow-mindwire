@@ -435,12 +435,22 @@ the digest is *the* load-bearing channel — polluting it degrades every entry o
 
 **Starvation metric.** `<data_dir>/state/evaluated.json` records two fields per thread:
 `first_seen_at` (written the first tick a candidate appears on the sweep list, before any per-candidate
-decision) and `last_evaluated_at` (refreshed only when the sweep launched the conductor and got a
-verdict — `worked`, `no-work`, or a non-zero exit). `head-skipped` / `quarantined-skipped` / `held` /
-`not-reached` do **not** refresh either. A candidate whose effective age
+decision) and `last_evaluated_at` (refreshed on every disposition where the sweep actually reached
+the candidate — a launched verdict of `worked` / `no-work` / non-zero exit, **and** a `head-skipped`
+where the sweep probed the head and proved nothing had moved). `quarantined-skipped` /
+`held` / `not-reached` do **not** refresh — the sweep never asked the question for those, and
+that is the whole point of the metric. A candidate whose effective age
 (`last_evaluated_at`, falling back to `first_seen_at`) is ≥24h shows up as `starved` in the digest
 and the log; a never-launched entry carries the `(未評価)` label so an operator's eye lands on it
 distinctly from "stuck after real work."
+
+> A head-skip counts even though nothing was launched, because the metric asks "how long since I
+> actually reached this candidate?" and a head-skip IS reaching: the sweep probes the chatroom,
+> sees the head has not moved (or the control state has not changed), and correctly fast-paths.
+> If a head-skip did *not* refresh, every legitimately-idle thread over a weekend would flag as
+> starved on Monday, the digest would fill with perfectly healthy inactive threads, and the metric
+> would be trained into noise. The distinction that matters is "did the sweep evaluate this?",
+> not "did the sweep launch an inference for this?".
 
 The report is **pivoted on the current live sweep list**, not on the state file's accumulated keys.
 Two failure modes that pivot closes:

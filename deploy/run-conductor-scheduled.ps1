@@ -225,6 +225,48 @@ function Merge-StateForWrite {
     return $out
 }
 
+# Refresh an evaluated.json entry's last_evaluated_at while preserving its first_seen_at. Called
+# from every disposition that ACTUALLY REACHED the candidate — a launched verdict (worked, no-work,
+# non-zero exit) AND a head-skip (the sweep probed the head, proved nothing has moved, and
+# correctly fast-pathed).
+#
+# WHY HEAD-SKIP COUNTS. A chatroom thread being idle for 24h (a weekend) is normal behaviour. If
+# head-skip did NOT refresh, every legitimately-idle thread would flag as `starved` on Monday
+# morning — the starvation section would fill with perfectly healthy inactive threads and the
+# metric would be trained into noise. The metric asks "how long since I actually reached this
+# candidate?" and a head-skip IS reaching: the sweep probed, evaluated, decided. (Tier B naysayer,
+# PR #138 round 4.)
+#
+# WHY OTHER DISPOSITIONS DO NOT. `held` / `quarantined-skipped` / `not-reached` all mean the sweep
+# never actually asked the question this tick — a HELD candidate is deliberately withheld by the
+# operator, a quarantined-skipped candidate is deferred until human clear, and a not-reached
+# candidate is one the sweep never got to (K-budget hit, earlier candidate did work). None of them
+# advance the "how long since I actually reached this?" clock. That is the design's Q4 honesty
+# rule and it is load-bearing — the metric only means anything because these DO age past 24h.
+#
+# The value in $State[$Key] may be a hashtable (freshly written this tick) or a PSCustomObject
+# (round-tripped from disk). Dot access to .first_seen_at works on both — same duck-typing pattern
+# as Get-FingerprintHint.
+function Update-EvaluatedTimestamp {
+    param([hashtable]$State, [string]$Key, [datetime]$Now)
+
+    # PowerShell's ConvertFrom-Json auto-parses ISO 8601 strings into DateTime objects. So a
+    # first_seen_at read from disk is a [DateTime], not a [string]. Normalise back to a canonical
+    # ISO string on the way out so downstream readers (Get-StarvedKeys, New-DailyDigest) always
+    # receive the same shape regardless of whether the value came from disk or from an in-memory
+    # write earlier this tick. Same reason Get-FingerprintHint stays duck-typed on its input, but
+    # here we can afford to canonicalise on write because we control the whole state file.
+    $firstSeen = $null
+    if ($State.ContainsKey($Key) -and $null -ne $State[$Key]) {
+        $prior = $State[$Key].first_seen_at
+        if ($prior -is [datetime]) { $firstSeen = $prior.ToUniversalTime().ToString("o") }
+        elseif ($prior) { $firstSeen = "$prior" }
+    }
+    $row = @{ last_evaluated_at = $Now.ToUniversalTime().ToString("o") }
+    if ($firstSeen) { $row.first_seen_at = $firstSeen }
+    $State[$Key] = $row
+}
+
 # --- head-state records ---------------------------------------------------------------------------
 # A head record is @{ head; control } — the message id the conductor last reported for a thread, AND
 # the project control state it reported it under. Both are needed to decide a skip; see Test-CanSkip.
@@ -1075,6 +1117,10 @@ try {
             $skipped++
             $dispositions[$cand.key] = 'head-skipped'
             $sweepSignature += "$($cand.key)=$probeHead"
+            # Refresh the starvation clock — a head-skip IS an evaluation. See
+            # Update-EvaluatedTimestamp for why. Without this, a legitimately-idle thread over a
+            # weekend would flag as starved on Monday and flood the digest with healthy threads.
+            Update-EvaluatedTimestamp -State $evaluatedState -Key $cand.key -Now $nowUtc
             Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head unchanged ($probeHead, control $currentControl), not launching"
             continue
         }
@@ -1108,13 +1154,9 @@ try {
         # An actual evaluation happened — reset the starvation clock for this thread. Any launched
         # verdict counts, even a non-zero exit: it still tells us the thread was tried this tick,
         # which is the metric's meaning ("how long since I actually reached this candidate?").
-        # first_seen_at is preserved: it records the first tick this key appeared on the sweep list,
-        # which is the fallback the starvation report uses if last_evaluated_at is ever cleared.
-        $firstSeen = $null
-        if ($evaluatedState.ContainsKey($cand.key)) { $firstSeen = $evaluatedState[$cand.key].first_seen_at }
-        $rowUpdate = @{ last_evaluated_at = $nowUtc.ToString("o") }
-        if ($firstSeen) { $rowUpdate.first_seen_at = $firstSeen }
-        $evaluatedState[$cand.key] = $rowUpdate
+        # See Update-EvaluatedTimestamp for the full contract (which dispositions refresh, which do
+        # not, and why); first_seen_at is preserved by the helper.
+        Update-EvaluatedTimestamp -State $evaluatedState -Key $cand.key -Now $nowUtc
 
         # NON-ZERO EXIT — quarantine, notify, keep going. The old wrapper broke the sweep here
         # (silent), which was the exact failure mode of the 2026-08-11 5h starvation on threads
