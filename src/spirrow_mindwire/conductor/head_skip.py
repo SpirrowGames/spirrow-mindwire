@@ -155,6 +155,25 @@ class Record:
     ``CAP`` would then have to migrate the file too. Recomputing on every :func:`decide` call is
     cheaper than the migration risk (Einstein Objection 2, msg-878).
 
+    Two families of fields, deliberately separated (PR #140 Tier B naysayer round 1):
+
+    - **_at_launch** — the observation as of the last LAUNCH decision. Used by :func:`decide` for
+      the ``progressed`` check (a moving nomination or control state relative to the launch
+      baseline resets the backoff counter). Recorded for audit + progression semantics.
+    - **last_observed_** — the observation as of the last EVALUATION (LAUNCH or not — SKIP,
+      DEFER, or a passive re-parse all count). Used by the caller (the CLI) as the cache-hit
+      predicate: if the current tick's head_msg_id equals ``last_observed_head_msg_id``, we
+      already know what the body says (its nomination is in ``last_observed_nomination``) and no
+      re-fetch is needed.
+
+    Splitting the two families is the fix for the round-1 naysayer flaw: without it, a parked
+    (``NEXT: human``) or deferring thread's ``head_msg_id_at_launch`` still points at the LAUNCH
+    baseline and the cache condition ``rec.head_msg_id_at_launch == current_head`` fails on
+    every subsequent tick — the CLI would then re-fetch the body forever, defeating the whole
+    caching purpose. Updating ``head_msg_id_at_launch`` on non-LAUNCH observations would in turn
+    break the progression semantics (we would lose the launch baseline). The two must be
+    separate observations of the same file.
+
     Fields:
       last_launch_at
           Wall-clock UTC of the last LAUNCH decision this module committed for the thread.
@@ -165,9 +184,7 @@ class Record:
           The control state seen at that launch (``run`` / ``supervised`` / ``hold`` / other).
       head_msg_id_at_launch
           The head msg id seen at that launch. Recorded for AUDIT only — never consulted by
-          :func:`decide`. That the head moved without ``progressed`` is the whole point of the
-          degenerate-path fix: head msg-id equality is neither necessary nor sufficient for a
-          skip decision.
+          :func:`decide` and never used as the cache-hit predicate (see ``last_observed_...``).
       launch_attempts
           The number of consecutive "no-progress" LAUNCHes ending at ``last_launch_at``. Reset to
           0 on any LAUNCH where ``progressed`` was True. Used to compute the backoff delay.
@@ -175,6 +192,16 @@ class Record:
           Wall-clock UTC when the sweep last re-parsed the head body. Independent of
           ``last_launch_at`` because the head can be re-observed (edit detection, HEAD_CACHE_TTL
           re-parse) without a launch. Empty when no re-parse has happened yet.
+      last_observed_head_msg_id
+          The head msg id we last **observed** for this thread — refreshed on every evaluation,
+          LAUNCH or not. This is the cache-hit key. Empty when we have never observed one (a
+          record freshly forward-migrated from the pre-observation schema will read empty for
+          one tick, harmlessly forcing a re-fetch that self-heals the field).
+      last_observed_nomination
+          The **normalised** NEXT token we last observed for this thread — refreshed on every
+          evaluation. Used by the caller to synthesise the head body on a cache hit
+          (``NEXT: {last_observed_nomination}`` re-parses to the same token, so :func:`decide`
+          reaches the same verdict without a network fetch).
     """
 
     last_launch_at: datetime | None = None
@@ -183,6 +210,8 @@ class Record:
     head_msg_id_at_launch: str = ""
     launch_attempts: int = 0
     head_observed_at: datetime | None = None
+    last_observed_head_msg_id: str = ""
+    last_observed_nomination: str = ""
 
 
 # --- Parser --------------------------------------------------------------------------------------
@@ -363,6 +392,10 @@ def commit_launch(
     yet backed off" verdict — a tight loop instead of a backoff. Writing before the session start
     means the launch is *reported* even if the session dies mid-flight (test #10).
 
+    A LAUNCH is ALSO an observation, so the ``last_observed_...`` fields are updated to match
+    the ``_at_launch`` values — the cache-hit key on the very next tick is the same head msg id
+    we just launched on, and we already know its nomination without re-fetching.
+
     Only meant to be called when ``verdict.decision is Decision.LAUNCH``. The caller decides
     whether to actually persist (report-mode does not); this helper only constructs the value.
     """
@@ -380,7 +413,67 @@ def commit_launch(
         # Committing a LAUNCH implies we re-parsed the head this tick, so refresh the TTL clock
         # to now (independent of head msg-id).
         head_observed_at=now,
+        # A LAUNCH is also the freshest observation — populate the cache-hit key so subsequent
+        # ticks can reuse the cached parse without a re-fetch.
+        last_observed_head_msg_id=head_msg_id,
+        last_observed_nomination=verdict.token,
     )
+
+
+def commit_observation(
+    *,
+    now: datetime,
+    head_msg_id: str,
+    token: str,
+    record: Record,
+) -> Record:
+    """Update an existing Record for a NON-LAUNCH evaluation (SKIP, DEFER, or a passive re-parse).
+
+    Refreshes exactly the observation-side fields — ``last_observed_head_msg_id``,
+    ``last_observed_nomination``, ``head_observed_at`` — and leaves the launch-baseline fields
+    (``_at_launch`` + ``launch_attempts`` + ``last_launch_at``) untouched. The cache-hit key on
+    the next tick is now the head msg id we just observed, so a parked thread's second tick
+    (after the fetch-that-parked-it) does not re-fetch the same body pointlessly.
+
+    Preserving the launch-baseline is what keeps the backoff / progressed semantics correct — a
+    DEFER that overwrote ``nomination_at_launch`` would make the next tick's ``progressed`` check
+    read against the DEFER'd observation instead of the last actual LAUNCH, and the counter would
+    stop climbing at attempts=1 forever. That mistake was flagged by the Tier B naysayer round 1
+    (PR #140 review) as the reason the observation fields are separate from the launch fields.
+    """
+    return Record(
+        last_launch_at=record.last_launch_at,
+        nomination_at_launch=record.nomination_at_launch,
+        control_at_launch=record.control_at_launch,
+        head_msg_id_at_launch=record.head_msg_id_at_launch,
+        launch_attempts=record.launch_attempts,
+        head_observed_at=now,
+        last_observed_head_msg_id=head_msg_id,
+        last_observed_nomination=token,
+    )
+
+
+def can_reuse_cached_parse(record: Record | None, head_msg_id: str, now: datetime) -> bool:
+    """Is the cached parse in ``record`` still valid for the current ``head_msg_id`` and ``now``?
+
+    Two conditions, both required:
+
+    1. **Cache-hit predicate**: the head msg id we last *observed* (not last *launched*) equals
+       the current head msg id. Any change (a new msg posted since we last looked) invalidates
+       the cache: we must fetch and re-parse.
+    2. **TTL predicate**: the observation is not stale. If :attr:`HEAD_CACHE_TTL` has elapsed
+       since the last observation, an edit-in-place could have replaced the body under the same
+       msg id; the sweep re-fetches to catch it.
+
+    A ``None`` record or an unset ``last_observed_head_msg_id`` fails both: nothing cached.
+    An empty ``head_msg_id`` is treated as unknown — we cannot compare against nothing, so we
+    fetch (fail-open on the observability side).
+    """
+    if record is None or not head_msg_id or not record.last_observed_head_msg_id:
+        return False
+    if record.last_observed_head_msg_id != head_msg_id:
+        return False
+    return not needs_head_reparse(record, now)
 
 
 def needs_head_reparse(record: Record | None, now: datetime) -> bool:
@@ -423,6 +516,8 @@ def record_to_json(record: Record) -> dict[str, Any]:
         "head_msg_id_at_launch": record.head_msg_id_at_launch,
         "launch_attempts": int(record.launch_attempts),
         "head_observed_at": _iso(record.head_observed_at),
+        "last_observed_head_msg_id": record.last_observed_head_msg_id,
+        "last_observed_nomination": record.last_observed_nomination,
     }
 
 
@@ -431,7 +526,9 @@ def record_from_json(data: dict[str, Any] | None) -> Record | None:
 
     A ``None`` input yields ``None`` (the "no record" case). A dict with missing fields yields a
     Record with defaults for the missing fields — this is the forward-compatibility path for a
-    file written by an older version of this module. ISO 8601 timestamps parse via
+    file written by an older version of this module (e.g. an old file with no
+    ``last_observed_head_msg_id`` reads empty for that field, and the CLI's cache-hit predicate
+    fails once, forcing one fetch that then self-heals the field). ISO 8601 timestamps parse via
     :func:`datetime.fromisoformat` (Python 3.11 handles the trailing ``Z`` and ``+00:00``).
     """
     if data is None:
@@ -443,6 +540,8 @@ def record_from_json(data: dict[str, Any] | None) -> Record | None:
         head_msg_id_at_launch=str(data.get("head_msg_id_at_launch") or ""),
         launch_attempts=int(data.get("launch_attempts") or 0),
         head_observed_at=_parse_iso(data.get("head_observed_at")),
+        last_observed_head_msg_id=str(data.get("last_observed_head_msg_id") or ""),
+        last_observed_nomination=str(data.get("last_observed_nomination") or ""),
     )
 
 
@@ -506,7 +605,9 @@ __all__ = [
     "Record",
     "Verdict",
     "_normalize_token",
+    "can_reuse_cached_parse",
     "commit_launch",
+    "commit_observation",
     "decide",
     "needs_head_reparse",
     "parse_head_token",

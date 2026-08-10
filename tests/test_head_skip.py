@@ -29,6 +29,15 @@ The 14 tests here are the finalised list from the spec dispatched into the imple
 14. HEAD_CACHE_TTL: after 60 min a re-parse is required even though the head msg-id is unchanged
     — this is the only automatic recovery path if the "operators post new messages rather than
     edit head" premise is broken.
+15. Cache-hit predicate uses ``last_observed_*`` (observation fields), NOT ``*_at_launch``:
+    a thread that goes SKIP (``NEXT: human``) or DEFER can be re-evaluated on the next tick
+    from cached state alone, without an MCP re-fetch. This is the Tier B naysayer round-1 fix on
+    PR #140 — the previous cache-hit condition compared against the LAUNCH baseline, which for
+    a parked or deferring thread never matched, defeating the caching purpose.
+16. ``commit_observation`` refreshes only the observation fields and leaves the launch baseline
+    (``_at_launch`` + ``launch_attempts`` + ``last_launch_at``) untouched. Overwriting the
+    launch baseline on a non-LAUNCH observation would break the ``progressed`` check on the
+    subsequent LAUNCH — the counter would stop climbing at attempts=1 (also naysayer round-1).
 """
 
 from __future__ import annotations
@@ -45,7 +54,9 @@ from spirrow_mindwire.conductor.head_skip import (
     Decision,
     Record,
     Verdict,
+    can_reuse_cached_parse,
     commit_launch,
+    commit_observation,
     decide,
     needs_head_reparse,
     parse_head_token,
@@ -497,6 +508,10 @@ def test_commit_launch_produces_full_record_for_pre_session_write() -> None:
     assert rec.head_msg_id_at_launch == "msg-42"
     assert rec.launch_attempts == 1
     assert rec.head_observed_at == now  # TTL clock is refreshed on every launch
+    # LAUNCH is also an observation — the cache-hit fields must be populated so the very next
+    # tick can reuse this parse without a fetch (Tier B naysayer round 1, PR #140).
+    assert rec.last_observed_head_msg_id == "msg-42"
+    assert rec.last_observed_nomination == "einstein"
 
     # And the round trip through JSON preserves the whole shape exactly (this is the persistence
     # contract with the sweep wrapper's state file).
@@ -702,3 +717,130 @@ def test_head_cache_ttl_forces_a_reparse_after_60_min() -> None:
         head_observed_at=None,
     )
     assert needs_head_reparse(stale, now) is True
+
+
+# --- 15. cache-hit uses OBSERVATION fields, not LAUNCH baseline ---------------------------------
+
+
+def test_cache_hit_uses_observation_fields_after_a_skip() -> None:
+    """A thread that goes SKIP on ``NEXT: human`` must be re-evaluable from cache next tick.
+
+    Tier B naysayer round 1 (PR #140): the previous cache-hit predicate compared
+    ``rec.head_msg_id_at_launch == current_head``. For a parked or deferring thread,
+    ``head_msg_id_at_launch`` still points at the LAUNCH baseline (an older msg id), so the
+    cache condition failed on every subsequent tick and the CLI re-fetched the body via MCP on
+    every tick forever. Splitting observation from launch state (``last_observed_head_msg_id``
+    tracked separately) fixes this: an operator posting ``NEXT: human`` is observed once, and
+    every subsequent tick with the same head msg id is a cache hit.
+    """
+    now = _T0
+    # Prior state: a launch happened on msg-1 with nomination `bohr`, then an operator posted
+    # msg-2 with `NEXT: human`. commit_observation records the observation without touching the
+    # launch baseline.
+    rec_at_launch = Record(
+        last_launch_at=now - timedelta(minutes=30),
+        nomination_at_launch="bohr",
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-1",
+        launch_attempts=1,
+        head_observed_at=now - timedelta(minutes=30),
+        last_observed_head_msg_id="msg-1",
+        last_observed_nomination="bohr",
+    )
+    # Tick T1: fetch msg-2's body, decide() returns SKIP, CLI calls commit_observation.
+    rec_after_skip = commit_observation(
+        now=now,
+        head_msg_id="msg-2",
+        token="human",
+        record=rec_at_launch,
+    )
+    # The launch baseline must be preserved (progression / backoff semantics rely on it).
+    assert rec_after_skip.last_launch_at == rec_at_launch.last_launch_at
+    assert rec_after_skip.nomination_at_launch == "bohr"
+    assert rec_after_skip.head_msg_id_at_launch == "msg-1"
+    assert rec_after_skip.launch_attempts == 1
+    # The observation fields must now point at msg-2 / human.
+    assert rec_after_skip.last_observed_head_msg_id == "msg-2"
+    assert rec_after_skip.last_observed_nomination == "human"
+    assert rec_after_skip.head_observed_at == now
+
+    # Tick T2: same head msg id, no fetch needed. can_reuse_cached_parse returns True.
+    assert can_reuse_cached_parse(rec_after_skip, "msg-2", now + timedelta(minutes=5)) is True
+
+    # And a different head msg id (msg-3 appeared) invalidates the cache — a fetch IS needed.
+    assert can_reuse_cached_parse(rec_after_skip, "msg-3", now + timedelta(minutes=5)) is False
+
+    # A None record can never hit the cache.
+    assert can_reuse_cached_parse(None, "msg-2", now) is False
+
+    # An empty current head_msg_id can never hit the cache (nothing to compare).
+    assert can_reuse_cached_parse(rec_after_skip, "", now) is False
+
+    # And crucially: even at a cache hit, the TTL still applies. 60+ min after the last
+    # observation, we re-parse regardless (the edit-in-place recovery path).
+    assert can_reuse_cached_parse(rec_after_skip, "msg-2", now + HEAD_CACHE_TTL) is False
+
+
+# --- 16. commit_observation preserves the launch baseline ---------------------------------------
+
+
+def test_commit_observation_preserves_launch_baseline_across_defer_ticks() -> None:
+    """Repeated DEFERs must not corrupt the launch baseline that the backoff counter climbs against.
+
+    Regression: a naive fix to the cache-hit problem might be to update
+    ``head_msg_id_at_launch`` on every observation. That would break the ``progressed`` check —
+    a stuck thread's launch baseline would move to the freshest observation, so the next LAUNCH
+    would see ``progressed == True`` (against a moved baseline it thinks progressed) and reset
+    attempts to 0, halting the backoff climb at attempts=1 forever. That is the second half of
+    the Tier B naysayer round-1 finding: observation and launch state must be independent
+    fields, and non-LAUNCH observations must touch only the observation family.
+    """
+    now = _T0
+    # Prior LAUNCH at t=-30min on msg-1, nomination `bohr`, attempts=3 (mid-staircase).
+    rec = Record(
+        last_launch_at=now - timedelta(minutes=30),
+        nomination_at_launch="bohr",
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-1",
+        launch_attempts=3,
+        head_observed_at=now - timedelta(minutes=30),
+        last_observed_head_msg_id="msg-1",
+        last_observed_nomination="bohr",
+    )
+
+    # Ten DEFER ticks in a row, each with a fresh head msg id (the "spin" scenario). Each tick
+    # sees the head has moved but nomination + control have not; the CLI would call
+    # commit_observation.
+    for i in range(2, 12):
+        rec = commit_observation(
+            now=now + timedelta(minutes=i),
+            head_msg_id=f"msg-{i}",
+            token="bohr",  # unchanged nomination on every tick
+            record=rec,
+        )
+        # Launch baseline UNCHANGED on every observation — this is what preserves the counter.
+        assert rec.head_msg_id_at_launch == "msg-1"
+        assert rec.nomination_at_launch == "bohr"
+        assert rec.launch_attempts == 3
+        assert rec.last_launch_at == _T0 - timedelta(minutes=30)
+        # Observation fields track the freshest head msg id.
+        assert rec.last_observed_head_msg_id == f"msg-{i}"
+        assert rec.last_observed_nomination == "bohr"
+
+    # Now the backoff delay (4 * BASE = 60 min from a fresh series would be CAP-capped, but with
+    # attempts=3 the required delay is 4*BASE = 60min = CAP). After CAP elapses since the last
+    # LAUNCH, the next tick LAUNCHes with progressed=False (nomination is still `bohr`) and the
+    # attempts counter must correctly climb to 4 — NOT reset to 1. That only works because the
+    # launch baseline was preserved across all 10 DEFERs.
+    ready = _T0 - timedelta(minutes=30) + CAP  # last_launch_at + CAP
+    v = decide(
+        now=ready,
+        head_msg_id="msg-99",
+        head_body="content\n\nNEXT: bohr",
+        control_state="run",
+        record=rec,
+    )
+    assert v.decision is Decision.LAUNCH
+    assert v.reason == "backoff-elapsed"  # NOT "progressed" — the baseline is still `bohr`
+    assert v.progressed is False
+    assert v.attempts_after == 4  # climbed to 4, not reset to 1

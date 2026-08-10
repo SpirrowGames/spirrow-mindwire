@@ -56,9 +56,11 @@ from spirrow_mindwire.conductor.head_skip import (
     Decision,
     Record,
     Verdict,
+    can_reuse_cached_parse,
     commit_launch,
+    commit_observation,
     decide,
-    needs_head_reparse,
+    parse_head_token,
     record_from_json,
     record_to_json,
     verdict_to_json,
@@ -171,30 +173,32 @@ async def _decide_all(
         control_state = str(cand.get("control_state") or "")
         rec = new_state.get(thread_id)
 
-        # Decide whether we can reuse the cached parse. The optimisation is: if the head msg-id
-        # is exactly the one we last saw AND the TTL has not elapsed, the body we would fetch is
-        # (by the "operators post new messages rather than edit head" premise) the same body we
-        # already parsed, and its normalised token lives on the record. Skipping the fetch keeps
-        # a steady-state idle tick cheap (~0 MCP calls per already-launched candidate).
+        # Decide whether we can reuse the cached parse. Two conditions (both required) —
+        # ``can_reuse_cached_parse`` bundles them and is the SOLE cache-hit predicate:
+        #   1. cache-hit: ``rec.last_observed_head_msg_id == head_msg_id`` (using the
+        #      OBSERVATION field, not ``head_msg_id_at_launch``, so a parked or deferring
+        #      thread's cache still hits after it was NOT launched — this is the Tier B
+        #      naysayer round-1 fix on PR #140);
+        #   2. TTL: the observation is not older than ``HEAD_CACHE_TTL`` (the edit-in-place
+        #      recovery path).
         head_body: str
         head_fetched: bool
-        if (
-            rec is not None
-            and head_msg_id
-            and rec.head_msg_id_at_launch == head_msg_id
-            and not needs_head_reparse(rec, now)
-        ):
-            # Synthesise a body from the cached token — decide() only reads what parse_head_token
-            # extracts, which is exactly the normalised token. No information is lost.
-            head_body = f"NEXT: {rec.nomination_at_launch}"
+        if can_reuse_cached_parse(rec, head_msg_id, now):
+            # Synthesise a body from the cached NORMALISED token. Round-tripping the same
+            # normalised token through ``parse_head_token`` reproduces the identical token, so
+            # ``decide()`` reaches the same verdict without a network fetch. Type-narrowing:
+            # ``can_reuse_cached_parse`` returns False for a None record, so ``rec`` is present
+            # in this branch.
+            assert rec is not None
+            head_body = f"NEXT: {rec.last_observed_nomination}"
             head_fetched = False
             actual_msg_id = head_msg_id
         else:
             fetched = await _fetch_head_body(mcp, project, thread_id)
             if fetched is None:
-                # Fail-open: an unfetchable body ⇒ UNRESOLVED ⇒ decide() launches. The candidate
-                # keeps its previously-known head_msg_id (from the probe) for reporting; the
-                # decision still routes through the two-stage judgment on the empty token.
+                # Fail-open: an unfetchable body -> UNRESOLVED -> decide() launches. The
+                # candidate keeps its probe-reported head_msg_id for the verdict; the decision
+                # still routes through the two-stage judgment on the empty token.
                 head_body = ""
                 head_fetched = False
                 actual_msg_id = head_msg_id
@@ -223,17 +227,20 @@ async def _decide_all(
                 control_state=control_state,
             )
         elif is_live and rec is not None and head_fetched:
-            # We re-parsed the head body (fetched=True) but did NOT launch — refresh the TTL
-            # clock so the next tick can reuse the cached parse. The rest of the record stays
-            # exactly as it was (we did not launch, so ``last_launch_at`` / ``launch_attempts``
-            # do not move).
-            new_state[thread_id] = Record(
-                last_launch_at=rec.last_launch_at,
-                nomination_at_launch=rec.nomination_at_launch,
-                control_at_launch=rec.control_at_launch,
-                head_msg_id_at_launch=rec.head_msg_id_at_launch,
-                launch_attempts=rec.launch_attempts,
-                head_observed_at=now,
+            # We re-fetched the head body (fetched=True) but did NOT launch — refresh the
+            # OBSERVATION fields so the next tick can reuse this parse without another fetch.
+            # ``commit_observation`` leaves the launch baseline (``_at_launch`` + attempts +
+            # last_launch_at) untouched, preserving the backoff / progressed semantics; only
+            # the observation-side fields (``last_observed_...`` + ``head_observed_at``) move.
+            # This is the crucial half of the naysayer round-1 fix: without it, a parked
+            # thread's second tick would find ``last_observed_head_msg_id`` still stale, cache
+            # miss again, and re-fetch. With it, one fetch per real change plus TTL is the
+            # steady state.
+            new_state[thread_id] = commit_observation(
+                now=now,
+                head_msg_id=actual_msg_id,
+                token=parse_head_token(head_body),
+                record=rec,
             )
 
         payload = verdict_to_json(v)
