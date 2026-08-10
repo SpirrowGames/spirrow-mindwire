@@ -38,6 +38,16 @@ The 14 tests here are the finalised list from the spec dispatched into the imple
     (``_at_launch`` + ``launch_attempts`` + ``last_launch_at``) untouched. Overwriting the
     launch baseline on a non-LAUNCH observation would break the ``progressed`` check on the
     subsequent LAUNCH — the counter would stop climbing at attempts=1 (also naysayer round-1).
+17. ``commit_observation`` accepts ``record=None`` and mints an initial record. A parked thread
+    that has never launched (``NEXT: human`` on the very first evaluation) must still write
+    observation state; without this, ``rec`` stays ``None`` forever and the CLI re-fetches on
+    every tick — the exact "MCP spammer" failure the caching is meant to prevent (Tier B
+    naysayer round 2 on PR #140).
+18. ``commit_launch`` with ``head_fetched=False`` (fail-open LAUNCH on a failed body fetch) MUST
+    NOT populate the cache-hit key with the synthesised empty body. Doing so would poison the
+    cache for HEAD_CACHE_TTL (60 min): subsequent ticks would synthesise ``NEXT: `` and either
+    bypass a real ``NEXT: human`` SKIP or ignore progress under the same head msg id. The
+    observation fields must be preserved from ``prior_record`` (also naysayer round 2).
 """
 
 from __future__ import annotations
@@ -844,3 +854,150 @@ def test_commit_observation_preserves_launch_baseline_across_defer_ticks() -> No
     assert v.reason == "backoff-elapsed"  # NOT "progressed" — the baseline is still `bohr`
     assert v.progressed is False
     assert v.attempts_after == 4  # climbed to 4, not reset to 1
+
+
+# --- 17. commit_observation on record=None mints an initial record ------------------------------
+
+
+def test_commit_observation_mints_initial_record_for_never_launched_thread() -> None:
+    """A parked (``NEXT: human``) thread evaluated for the FIRST time must persist observations.
+
+    Tier B naysayer round 2 (PR #140): the earlier CLI required ``rec is not None`` before
+    calling commit_observation, so a thread whose very first evaluation was a SKIP (never
+    launched, then parked) never had ANY record written. Every subsequent tick found rec=None,
+    cache-miss, re-fetch — the "MCP spammer" failure repeated for never-launched threads.
+
+    Fix: commit_observation(record=None) mints an initial record with only the observation
+    fields populated (no launch baseline, because nothing has launched). Subsequent ticks can
+    cache-hit against that record. If the thread eventually LAUNCHes, commit_launch fills in
+    the launch baseline while the observation stays fresh.
+    """
+    now = _T0
+    rec = commit_observation(now=now, head_msg_id="msg-42", token="human", record=None)
+
+    # Launch baseline: never set — this thread has never actually launched.
+    assert rec.last_launch_at is None
+    assert rec.nomination_at_launch == ""
+    assert rec.control_at_launch == ""
+    assert rec.head_msg_id_at_launch == ""
+    assert rec.launch_attempts == 0
+
+    # Observation fields: populated with the SKIP-time observation, so the cache-hit key works.
+    assert rec.last_observed_head_msg_id == "msg-42"
+    assert rec.last_observed_nomination == "human"
+    assert rec.head_observed_at == now
+
+    # The cache-hit predicate hits on the next tick with the same head msg id.
+    assert can_reuse_cached_parse(rec, "msg-42", now + timedelta(minutes=5)) is True
+
+    # And the JSON round-trip preserves the shape (so the wrapper can persist and re-load it).
+    assert record_from_json(record_to_json(rec)) == rec
+
+
+# --- 18. commit_launch on a failed body fetch must NOT poison the cache -------------------------
+
+
+def test_commit_launch_head_fetched_false_preserves_prior_observation() -> None:
+    """A fail-open LAUNCH (body fetch failed) must not overwrite the cache-hit key.
+
+    Tier B naysayer round 2 (PR #140): the earlier commit_launch unconditionally populated
+    ``last_observed_head_msg_id`` / ``last_observed_nomination`` from the current verdict. On
+    a failed fetch, ``verdict.token`` is empty (synthesised body), so the cache-hit key would
+    get poisoned with an empty token for HEAD_CACHE_TTL (60 min): every subsequent cached tick
+    would synthesise ``NEXT: `` and either (a) bypass a real ``NEXT: human`` SKIP that a
+    successful fetch would have returned, or (b) ignore actual progress hidden behind the
+    same probe-reported msg id.
+
+    Fix: ``commit_launch(..., head_fetched=False, prior_record=...)`` preserves the prior
+    observation fields (or empty if no prior). The next tick therefore cache-misses (if the
+    prior observation was empty) or hits correctly against a REAL previous observation.
+    """
+    now = _T0
+
+    # Case A: no prior record. Failed fetch on a brand-new thread → LAUNCH, but observation
+    # fields must stay empty (no reliable data to cache).
+    v = Verdict(
+        decision=Decision.LAUNCH,
+        reason="no-prior-record",
+        token="",  # synthesised empty body → empty token
+        token_raw=None,
+        progressed=False,
+        attempts_before=0,
+        attempts_after=1,
+        delay=timedelta(0),
+        eligible_at=now,
+    )
+    rec = commit_launch(
+        now=now,
+        head_msg_id="msg-99",
+        verdict=v,
+        control_state="run",
+        head_fetched=False,
+        prior_record=None,
+    )
+    # Launch baseline: correctly reflects the attempt.
+    assert rec.last_launch_at == now
+    assert rec.launch_attempts == 1
+    assert rec.head_msg_id_at_launch == "msg-99"
+    assert rec.nomination_at_launch == ""  # this side records "what we thought at launch"
+    # OBSERVATION fields: NOT populated — the fetch failed, so we do not have a reliable parse.
+    assert rec.last_observed_head_msg_id == ""
+    assert rec.last_observed_nomination == ""
+    assert rec.head_observed_at is None
+    # Cache-miss on the next tick — correctly forces a re-fetch attempt.
+    assert can_reuse_cached_parse(rec, "msg-99", now + timedelta(minutes=5)) is False
+
+    # Case B: prior record with a good observation. Failed fetch → LAUNCH, but observation
+    # fields must be CARRIED FORWARD from the prior, not overwritten with the empty verdict.
+    prior = Record(
+        last_launch_at=now - timedelta(minutes=30),
+        nomination_at_launch="bohr",
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-1",
+        launch_attempts=1,
+        head_observed_at=now - timedelta(minutes=30),
+        last_observed_head_msg_id="msg-1",
+        last_observed_nomination="bohr",
+    )
+    rec_b = commit_launch(
+        now=now,
+        head_msg_id="msg-1",
+        verdict=v,
+        control_state="run",
+        head_fetched=False,
+        prior_record=prior,
+    )
+    # Launch baseline moves forward — this is still a real launch attempt.
+    assert rec_b.last_launch_at == now
+    assert rec_b.launch_attempts == 1
+    # OBSERVATION fields: PRESERVED from prior — the fetch failed, we trust the previous parse.
+    assert rec_b.last_observed_head_msg_id == "msg-1"
+    assert rec_b.last_observed_nomination == "bohr"
+    assert rec_b.head_observed_at == prior.head_observed_at
+    # The prior observation is still valid, so the next tick cache-hits against msg-1.
+    assert can_reuse_cached_parse(rec_b, "msg-1", now + timedelta(minutes=5)) is True
+
+    # Case C: head_fetched=True keeps the pre-existing behaviour — observation is populated
+    # from the current verdict (regression guard against reverting the fix "too far").
+    v_ok = Verdict(
+        decision=Decision.LAUNCH,
+        reason="progressed",
+        token="einstein",
+        token_raw="Einstein",
+        progressed=True,
+        attempts_before=0,
+        attempts_after=1,
+        delay=timedelta(0),
+        eligible_at=now,
+    )
+    rec_c = commit_launch(
+        now=now,
+        head_msg_id="msg-2",
+        verdict=v_ok,
+        control_state="run",
+        head_fetched=True,
+        prior_record=None,
+    )
+    assert rec_c.last_observed_head_msg_id == "msg-2"
+    assert rec_c.last_observed_nomination == "einstein"
+    assert rec_c.head_observed_at == now

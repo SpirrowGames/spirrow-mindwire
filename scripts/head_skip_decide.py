@@ -217,25 +217,35 @@ async def _decide_all(
         # Commit-before-return: for LAUNCH in live mode, the record persists NOW (before the
         # sweep has even received our verdict, let alone acted on it). The sweep may then take
         # minutes to start the conductor and any wall-clock skew between now and that start is
-        # bounded by CAP anyway (the delay for the next attempt); the invariant we care about is
-        # that a launch is counted even if the session then dies (test #10).
+        # bounded by CAP anyway (the delay for the next attempt); the invariant we care about
+        # is that a launch is counted even if the session then dies (test #10).
+        #
+        # Two observation-side subtleties, both enforced by the helpers here (Tier B naysayer
+        # round 2 on PR #140):
+        #
+        #   1. LAUNCH on a failed body fetch (``head_fetched=False``) must NOT populate the
+        #      cache-hit key with the synthesised empty body — that would poison the cache and
+        #      make the next 60 min of ticks synthesise ``NEXT: `` and either bypass a real
+        #      ``NEXT: human`` SKIP or ignore progress. commit_launch preserves the prior
+        #      observation instead when head_fetched is False.
+        #   2. Non-LAUNCH (SKIP / DEFER) on a never-launched thread (``rec is None``) must
+        #      still write an initial record — otherwise every never-launched parked thread
+        #      re-fetches on every tick forever. commit_observation(record=None) mints the
+        #      initial record with only observation fields set.
         if is_live and v.decision is Decision.LAUNCH:
             new_state[thread_id] = commit_launch(
                 now=now,
                 head_msg_id=actual_msg_id,
                 verdict=v,
                 control_state=control_state,
+                head_fetched=head_fetched,
+                prior_record=rec,
             )
-        elif is_live and rec is not None and head_fetched:
-            # We re-fetched the head body (fetched=True) but did NOT launch — refresh the
-            # OBSERVATION fields so the next tick can reuse this parse without another fetch.
-            # ``commit_observation`` leaves the launch baseline (``_at_launch`` + attempts +
-            # last_launch_at) untouched, preserving the backoff / progressed semantics; only
-            # the observation-side fields (``last_observed_...`` + ``head_observed_at``) move.
-            # This is the crucial half of the naysayer round-1 fix: without it, a parked
-            # thread's second tick would find ``last_observed_head_msg_id`` still stale, cache
-            # miss again, and re-fetch. With it, one fetch per real change plus TTL is the
-            # steady state.
+        elif is_live and head_fetched:
+            # We re-fetched the head body but did NOT launch. Refresh the OBSERVATION fields so
+            # the next tick can reuse this parse without another fetch. commit_observation
+            # accepts ``record=None`` and mints an initial record in that case (never-launched
+            # parked thread — otherwise the cache would remain miss forever, per naysayer #2).
             new_state[thread_id] = commit_observation(
                 now=now,
                 head_msg_id=actual_msg_id,

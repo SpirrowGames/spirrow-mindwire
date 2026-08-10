@@ -383,6 +383,8 @@ def commit_launch(
     head_msg_id: str,
     verdict: Verdict,
     control_state: str,
+    head_fetched: bool = True,
+    prior_record: Record | None = None,
 ) -> Record:
     """Build the Record to persist BEFORE actually starting the conductor session.
 
@@ -392,9 +394,17 @@ def commit_launch(
     yet backed off" verdict — a tight loop instead of a backoff. Writing before the session start
     means the launch is *reported* even if the session dies mid-flight (test #10).
 
-    A LAUNCH is ALSO an observation, so the ``last_observed_...`` fields are updated to match
-    the ``_at_launch`` values — the cache-hit key on the very next tick is the same head msg id
-    we just launched on, and we already know its nomination without re-fetching.
+    ``head_fetched`` distinguishes the two LAUNCH paths (Tier B naysayer round 2, PR #140):
+
+    - **``head_fetched=True``** — the body was successfully re-fetched this tick. The
+      observation fields (``last_observed_head_msg_id`` / ``last_observed_nomination``) are
+      populated with the fresh values, so the very next tick can cache-hit without another fetch.
+    - **``head_fetched=False``** — the LAUNCH is fail-open on a **failed** body fetch. The
+      observation fields must NOT be populated with the unreliable current values (writing
+      ``last_observed_nomination=""`` from an empty synthesised body would poison the cache: the
+      next 60 min of ticks would synthesise ``NEXT: `` and either bypass a real ``NEXT: human``
+      SKIP or ignore progress under the same head msg id). Prior observation values are carried
+      forward from ``prior_record`` if present (or empty on a never-observed thread).
 
     Only meant to be called when ``verdict.decision is Decision.LAUNCH``. The caller decides
     whether to actually persist (report-mode does not); this helper only constructs the value.
@@ -404,19 +414,28 @@ def commit_launch(
             f"commit_launch called with non-LAUNCH verdict: {verdict.decision.value!r} "
             "(only LAUNCH commits a new record — DEFER and SKIP leave the record unchanged)"
         )
+    if head_fetched:
+        # The observation this tick is reliable; adopt it as the cache-hit key.
+        obs_head_msg_id = head_msg_id
+        obs_nomination = verdict.token
+        obs_at: datetime | None = now
+    else:
+        # Fail-open LAUNCH on a failed fetch — the observation-side of the record must NOT move
+        # (empty observation would poison the cache for HEAD_CACHE_TTL). Carry forward whatever
+        # the prior record had; if there is no prior record, the observation fields stay empty
+        # and the next tick will cache-miss (correctly) and re-fetch.
+        obs_head_msg_id = prior_record.last_observed_head_msg_id if prior_record else ""
+        obs_nomination = prior_record.last_observed_nomination if prior_record else ""
+        obs_at = prior_record.head_observed_at if prior_record else None
     return Record(
         last_launch_at=now,
         nomination_at_launch=verdict.token,
         control_at_launch=control_state,
         head_msg_id_at_launch=head_msg_id,
         launch_attempts=verdict.attempts_after,
-        # Committing a LAUNCH implies we re-parsed the head this tick, so refresh the TTL clock
-        # to now (independent of head msg-id).
-        head_observed_at=now,
-        # A LAUNCH is also the freshest observation — populate the cache-hit key so subsequent
-        # ticks can reuse the cached parse without a re-fetch.
-        last_observed_head_msg_id=head_msg_id,
-        last_observed_nomination=verdict.token,
+        head_observed_at=obs_at,
+        last_observed_head_msg_id=obs_head_msg_id,
+        last_observed_nomination=obs_nomination,
     )
 
 
@@ -425,22 +444,35 @@ def commit_observation(
     now: datetime,
     head_msg_id: str,
     token: str,
-    record: Record,
+    record: Record | None,
 ) -> Record:
-    """Update an existing Record for a NON-LAUNCH evaluation (SKIP, DEFER, or a passive re-parse).
+    """Update the observation fields for a NON-LAUNCH evaluation (SKIP, DEFER, or passive re-parse).
 
     Refreshes exactly the observation-side fields — ``last_observed_head_msg_id``,
     ``last_observed_nomination``, ``head_observed_at`` — and leaves the launch-baseline fields
-    (``_at_launch`` + ``launch_attempts`` + ``last_launch_at``) untouched. The cache-hit key on
-    the next tick is now the head msg id we just observed, so a parked thread's second tick
-    (after the fetch-that-parked-it) does not re-fetch the same body pointlessly.
+    (``_at_launch`` + ``launch_attempts`` + ``last_launch_at``) untouched.
 
-    Preserving the launch-baseline is what keeps the backoff / progressed semantics correct — a
-    DEFER that overwrote ``nomination_at_launch`` would make the next tick's ``progressed`` check
-    read against the DEFER'd observation instead of the last actual LAUNCH, and the counter would
-    stop climbing at attempts=1 forever. That mistake was flagged by the Tier B naysayer round 1
-    (PR #140 review) as the reason the observation fields are separate from the launch fields.
+    When ``record`` is ``None``, an initial record is minted with empty launch-baseline fields
+    (never-launched thread) and populated observation fields. This handles the parked-and-
+    never-launched case: a thread whose very first evaluation is a SKIP on ``NEXT: human``
+    would otherwise have no persisted state, cache-miss on every subsequent tick, and re-fetch
+    forever — the exact failure that started this fix (Tier B naysayer round 2, PR #140).
+
+    Preserving the launch baseline (when it exists) is what keeps the backoff / progressed
+    semantics correct — a DEFER that overwrote ``nomination_at_launch`` would make the next
+    tick's ``progressed`` check read against the DEFER'd observation instead of the last actual
+    LAUNCH, and the counter would stop climbing at attempts=1 forever. Fixed in round 1.
     """
+    if record is None:
+        # Never-launched thread whose first evaluation is a SKIP or a DEFER. There is no launch
+        # baseline to preserve; write an initial record with only observation fields set. The
+        # next evaluation can cache-hit against these — and if it becomes a LAUNCH, commit_launch
+        # will fill in the launch baseline while the observation stays fresh.
+        return Record(
+            head_observed_at=now,
+            last_observed_head_msg_id=head_msg_id,
+            last_observed_nomination=token,
+        )
     return Record(
         last_launch_at=record.last_launch_at,
         nomination_at_launch=record.nomination_at_launch,
