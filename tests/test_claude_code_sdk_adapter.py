@@ -175,6 +175,44 @@ async def test_spawn_connects_and_returns_idle_handle(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_spawn_binds_options_and_exposes_them_via_source_marker_options(
+    tmp_path: Path,
+) -> None:
+    """Pin the source-marker seam on ``ClaudeCodeSdkAdapter``.
+
+    ``spawn`` must (1) build ``ClaudeAgentOptions`` and hand it to the
+    client factory, and (2) store that same instance on the session so
+    :meth:`ClaudeCodeSdkAdapter.source_marker_options` yields it. If a
+    future refactor drops the local ``options`` binding — the failure mode
+    PR #139 Tier B Finding 1 speculated about — ``spawn`` would either
+    ``NameError`` (running the test) or return ``None`` from the getter,
+    both of which this test catches loudly. The getter's return matches
+    what the client factory received, so the marker the dispatcher
+    derives is guaranteed to describe the SDK's actual options object
+    (msg-834 §2 (a)).
+    """
+    client = _FakeClient([])
+    captured_factory_options: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured_factory_options.append(options)
+        return client
+
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=factory)
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+
+    # 1) The factory received a ClaudeAgentOptions object.
+    assert len(captured_factory_options) == 1
+    factory_options = captured_factory_options[0]
+    assert factory_options is not None
+    # 2) The session's stored options are the SAME instance (identity —
+    # msg-834 §2 (a): input to the marker builder is the SDK's actual
+    # options instance, not a re-declared copy).
+    exposed = adapter.source_marker_options(handle)
+    assert exposed is factory_options
+
+
+@pytest.mark.anyio
 async def test_spawn_failure_raises_spawn_error(tmp_path: Path) -> None:
     client = _FakeClient([], fail_on="connect")
     adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))

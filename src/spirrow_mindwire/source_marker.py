@@ -84,10 +84,22 @@ def _setting_sources_value(options: Any) -> str:
     an empty list vs a non-empty list. Anything else (e.g. a value other
     than ``list`` / ``None``) falls back to ``str(value)`` — the marker's job
     is to reflect the actual option, not to validate it.
+
+    Str-specific guard (PR #139 Tier B Finding 2): a bare string is
+    ``__len__``-able and iterable — without the guard, ``setting_sources="user"``
+    would render as ``user`` (via len=4 → join "+".join over its chars →
+    ``u+s+e+r``). ``ClaudeAgentOptions`` types this as ``list[SettingSource]``
+    at the SDK boundary, but we duck-type at this module boundary, so an
+    unexpected string must be rendered verbatim — not iterated.
     """
     src = getattr(options, "setting_sources", None)
     if src is None:
         return "unset"
+    if isinstance(src, str):
+        # Bare string sneaked in (SDK typing does not allow it, but the
+        # duck-typed boundary here must not silently mangle it into
+        # per-char join). Return verbatim.
+        return src
     try:
         length = len(src)
     except TypeError:

@@ -137,6 +137,27 @@ def test_marker_derived_from_options(
 
 
 # --------------------------------------------------------------------------- #
+# Defensive-typing regression (PR #139 Tier B Finding 2)
+# --------------------------------------------------------------------------- #
+
+
+def test_marker_setting_sources_bare_string_is_not_iterated_per_char() -> None:
+    """A bare string sneaked in as ``setting_sources`` must render verbatim.
+
+    ``ClaudeAgentOptions`` types the field as ``list[SettingSource]`` at
+    the SDK boundary, but this module duck-types at its input. Without the
+    ``isinstance(src, str)`` guard the ``len(src)`` branch would iterate
+    the string per-character and the marker would read
+    ``setting_sources=u+s+e+r`` instead of ``setting_sources=user``. Pin
+    the defensive fallback so a future refactor that removes the guard
+    fails this test loudly (PR #139 Tier B Finding 2, VERIFIED).
+    """
+    marker = render_source_marker(_options(setting_sources="user"))  # type: ignore[arg-type]
+    assert "setting_sources=user" in marker
+    assert "setting_sources=u+s+e+r" not in marker
+
+
+# --------------------------------------------------------------------------- #
 # T-b — marker is independent of the agent's body (msg-834 §2 (b))
 # --------------------------------------------------------------------------- #
 

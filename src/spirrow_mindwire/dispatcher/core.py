@@ -182,9 +182,18 @@ class Dispatcher:
         # ``source_marker_options`` getter. Msg-834 §2 (c): this dispatch
         # module — not any ``adapters/*`` module — imports the marker
         # builder, so the SDK-facing side of the harness stays free of a
-        # marker-generating import. Adapters that do not expose the getter
-        # (fakes / non-SDK adapters) yield ``None``; the body is posted
-        # unchanged for them.
+        # marker-generating import.
+        #
+        # DUCK-TYPED (deliberate, not a formal ``RoleAdapter`` extension):
+        # not every adapter has ``ClaudeAgentOptions`` to expose — e.g.
+        # :class:`~spirrow_mindwire.adapters.naysayer_lexora.NaysayerLexoraAdapter`
+        # is a stateless HTTP client with no SDK-options object, and test
+        # fakes don't need one. Formalising the method on the ``RoleAdapter``
+        # Protocol (ADR-2026-05-21-06 §3.1) would force every adapter to
+        # implement a null getter, which is more coupling than the seam
+        # deserves. Adapters that do not expose the getter yield ``None``
+        # and the body posts unchanged — the marker is opt-in per adapter,
+        # by the presence of the getter.
         options_getter = getattr(session.adapter, "source_marker_options", None)
         options = options_getter(handle) if callable(options_getter) else None
         body = append_source_marker(draft.body, options) if options is not None else draft.body
