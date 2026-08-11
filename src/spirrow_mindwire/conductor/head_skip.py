@@ -403,7 +403,18 @@ def decide(
     delay = _backoff_delay(attempts_next_series)
     ready_at = record.last_launch_at + delay
 
-    if now < ready_at:
+    # Time check is skipped when ``delay == 0`` (i.e. progressed or fresh series). Two reasons,
+    # in order of importance:
+    #   1. **Invariant preservation**: the human-approved "a progressing thread never backs off"
+    #      contract requires that ``progressed=True`` always LAUNCHes with no delay. Without this
+    #      guard, a system-clock backward jump between ticks (e.g. an NTP correction) makes
+    #      ``now < ready_at = last_launch_at + 0 = last_launch_at`` true, and the thread DEFERs
+    #      instead of LAUNCHing — silently violating the invariant until the wall clock catches
+    #      up (Tier B naysayer round 5, PR #140).
+    #   2. **Semantic clarity**: DEFER means "waiting on backoff". A ``delay=0`` DEFER is a
+    #      contradiction in terms — there is no backoff to wait on. Structurally exempting
+    #      this from the time check removes an entire class of self-inconsistent verdicts.
+    if delay > timedelta(0) and now < ready_at:
         return Verdict(
             decision=Decision.DEFER,
             reason="backoff",

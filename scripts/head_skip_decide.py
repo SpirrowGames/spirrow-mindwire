@@ -1,43 +1,67 @@
 """Head-skip nomination-predicate CLI — the sweep's per-tick launch/defer/skip decision.
 
-Called by ``deploy/run-conductor-scheduled.ps1`` once per tick with the sweep's already-probed
-per-candidate ``(head_msg_id, control_state)`` pairs; returns one verdict per candidate. The
-predicate itself lives in :mod:`spirrow_mindwire.conductor.head_skip` — this script is the thin
-wrapper that (a) fetches head bodies only for candidates whose cached nomination cannot be
-reused, (b) applies :func:`spirrow_mindwire.conductor.head_skip.decide`, and (c) persists the
-new state BEFORE any conductor session is started (session-start-before write, msg-878).
+Called by ``deploy/run-conductor-scheduled.ps1`` in a **two-phase protocol** (Tier B naysayer
+round 5, PR #140):
 
-Input (JSON, from ``--candidates`` or stdin):
+**Phase 1 (``decide`` — default mode):** batch-evaluate every candidate for the tick, apply
+:func:`spirrow_mindwire.conductor.head_skip.decide`, emit one JSON verdict per candidate. This
+phase refreshes ONLY the observation-side of the state file (``last_observed_*`` and
+``head_observed_at``) for candidates whose head body was successfully re-fetched — the launch
+baseline (``last_launch_at``, ``launch_attempts``, ``*_at_launch``) is NEVER touched here.
+
+Rationale: the sweep processes at most one candidate per tick ("thread did work — sweep done").
+If ``decide`` batch-committed launch state for every LAUNCH verdict, all-but-the-first-launched
+candidate would be "phantom-launched" — their record would say "we launched" while no session
+was ever started, and next tick would apply backoff to threads that never actually ran. That
+was measured by the naysayer as an exponential-starvation loop for concurrently eligible
+threads. Splitting decide from commit removes the coupling.
+
+**Phase 2 (``commit-launch`` mode):** the sweep, after receiving the ``decide`` verdicts and
+deciding which ONE thread to launch, calls ``commit-launch --payload <json>`` (feeding back the
+``commit_launch_payload`` from the chosen verdict) BEFORE starting the conductor session. This
+records the launch baseline for exactly that thread. Any LAUNCH verdicts the sweep did not act
+on are left with their launch baseline untouched — they stay eligible on the next tick.
+
+Input to ``decide`` (JSON, from ``--candidates`` or stdin):
 
     [
-      {"thread_id": "T-track-b-...", "head_msg_id": "msg-2242", "control_state": "run"},
-      {"thread_id": "T-lod0-...",    "head_msg_id": "msg-1919", "control_state": "run"},
+      {"thread_id": "T-a", "head_msg_id": "msg-2242", "control_state": "run"},
+      {"thread_id": "T-b", "head_msg_id": "msg-1919", "control_state": "run"},
       ...
     ]
 
-Output (JSON, to stdout):
+Output of ``decide`` (JSON, to stdout):
 
     {
-      "mode": "live",
+      "mode": "decide",
       "verdicts": [
-        {"thread_id": "T-track-b-...", "decision": "launch", "reason": "no-prior-record",
-         "token": "bohr", "token_raw": "Bohr", "progressed": false, "delay_seconds": 0.0,
-         "eligible_at": "2026-08-11T12:00:00+00:00", "attempts_before": 0, "attempts_after": 1,
-         "head_msg_id": "msg-2242", "head_fetched": true},
+        {
+          "thread_id": "T-a", "decision": "launch", "reason": "no-prior-record",
+          "token": "bohr", "token_raw": "Bohr", "progressed": false,
+          "delay_seconds": 0.0, "eligible_at": "2026-08-11T12:00:00+00:00",
+          "attempts_before": 0, "attempts_after": 1,
+          "head_msg_id": "msg-2242", "head_fetched": true,
+          "commit_launch_payload": {
+            "thread_id": "T-a", "head_msg_id": "msg-2242",
+            "token": "bohr", "token_raw": "Bohr", "attempts_after": 1,
+            "control_state": "run", "head_fetched": true
+          }
+        },
         ...
       ]
     }
 
-State file: one JSON object keyed by ``thread_id`` (values are Record dicts per
-:func:`~spirrow_mindwire.conductor.head_skip.record_to_json`). Written only in ``--mode live``;
-``--mode report`` prints the same verdicts but touches nothing on disk. The report mode is the
-audit path for a "would-be-launch" dry run (Einstein Objection 2 / Bohr msg-878 §report).
+Input to ``commit-launch`` (``--payload <json>`` argument): exactly the
+``commit_launch_payload`` object from the corresponding decide verdict.
 
-Fail-open contract: if a body fetch fails, the candidate falls through with an UNRESOLVED token
-(reason="unfetchable"); :func:`decide` then LAUNCHes it (no-prior-record or backoff-elapsed)
-rather than SKIPping. This matches the wrapper's other probes (head, control) — every failure
-mode of the optimisation path collapses to "launch anyway", never to "silently park a live
-thread".
+State file: one JSON object keyed by ``thread_id`` (values are Record dicts per
+:func:`~spirrow_mindwire.conductor.head_skip.record_to_json`). Written in both live modes;
+``--mode report`` prints the verdicts but touches nothing on disk.
+
+Fail-open contract: if a body fetch fails, the candidate falls through with an UNRESOLVED
+token; :func:`decide` then LAUNCHes it. The ``commit_launch_payload`` carries
+``head_fetched=False`` so ``commit-launch`` knows to preserve the prior observation rather than
+poisoning the cache with an empty parse (round-2 anti-poison rule).
 """
 
 from __future__ import annotations
@@ -47,7 +71,7 @@ import asyncio
 import json
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +168,32 @@ def _save_state(path: Path, state: dict[str, Record]) -> None:
     os.replace(tmp, path)
 
 
+def _build_commit_launch_payload(
+    *,
+    thread_id: str,
+    head_msg_id: str,
+    verdict: Verdict,
+    control_state: str,
+    head_fetched: bool,
+) -> dict[str, Any]:
+    """The self-describing blob the sweep feeds back to ``commit-launch`` for one thread.
+
+    Includes everything ``commit_launch`` needs — token / token_raw / attempts_after /
+    control_state / head_fetched — plus the thread_id and head_msg_id used as the state-file
+    key. The blob is intentionally self-describing so ``commit-launch`` can be invoked without
+    re-fetching or re-deciding: the sweep already knows what to do, this just records it.
+    """
+    return {
+        "thread_id": thread_id,
+        "head_msg_id": head_msg_id,
+        "token": verdict.token,
+        "token_raw": verdict.token_raw,
+        "attempts_after": int(verdict.attempts_after),
+        "control_state": control_state,
+        "head_fetched": bool(head_fetched),
+    }
+
+
 async def _decide_all(
     *,
     project: str,
@@ -155,9 +205,16 @@ async def _decide_all(
 ) -> tuple[dict[str, Record], list[dict[str, Any]]]:
     """Apply the predicate to every candidate; return the new state + a JSON verdict list.
 
-    The state map is UPDATED in place for LAUNCH decisions (the "session-start-before write"
-    discipline is implemented here: the record is set before we hand the sweep back its verdict,
-    so a wrapper that crashes after reading our stdout still has a persisted attempt count).
+    This is the ``decide`` phase of the two-phase protocol. Launch-baseline state is **NEVER**
+    touched here — the sweep applies it separately via :func:`_apply_commit_launch` for the ONE
+    thread it actually chooses to start (see the module docstring for the phantom-launch
+    scenario this splits closes).
+
+    Observation-side state IS refreshed when the head body was successfully fetched, regardless
+    of the verdict — that fetch is a real observation and caching its result lets the next tick
+    skip the fetch. A LAUNCH candidate that the sweep never actually starts still benefits from
+    the observation refresh (subsequent ticks re-evaluate and cache-hit).
+
     ``mode == "report"`` gets the exact same verdicts but the returned state is unchanged from
     the input (the caller then does not persist it).
     """
@@ -214,38 +271,18 @@ async def _decide_all(
             record=rec,
         )
 
-        # Commit-before-return: for LAUNCH in live mode, the record persists NOW (before the
-        # sweep has even received our verdict, let alone acted on it). The sweep may then take
-        # minutes to start the conductor and any wall-clock skew between now and that start is
-        # bounded by CAP anyway (the delay for the next attempt); the invariant we care about
-        # is that a launch is counted even if the session then dies (test #10).
+        # Observation-only refresh. NEVER touches the launch baseline (that is the
+        # commit-launch phase's job, applied to only ONE thread per tick). Two guards:
         #
-        # Two observation-side subtleties, both enforced by the helpers here (Tier B naysayer
-        # round 2 on PR #140):
-        #
-        #   1. LAUNCH on a failed body fetch (``head_fetched=False``) must NOT populate the
-        #      cache-hit key with the synthesised empty body — that would poison the cache and
-        #      make the next 60 min of ticks synthesise ``NEXT: `` and either bypass a real
-        #      ``NEXT: human`` SKIP or ignore progress. commit_launch preserves the prior
-        #      observation instead when head_fetched is False.
-        #   2. Non-LAUNCH (SKIP / DEFER) on a never-launched thread (``rec is None``) must
-        #      still write an initial record — otherwise every never-launched parked thread
-        #      re-fetches on every tick forever. commit_observation(record=None) mints the
-        #      initial record with only observation fields set.
-        if is_live and v.decision is Decision.LAUNCH:
-            new_state[thread_id] = commit_launch(
-                now=now,
-                head_msg_id=actual_msg_id,
-                verdict=v,
-                control_state=control_state,
-                head_fetched=head_fetched,
-                prior_record=rec,
-            )
-        elif is_live and head_fetched:
-            # We re-fetched the head body but did NOT launch. Refresh the OBSERVATION fields so
-            # the next tick can reuse this parse without another fetch. commit_observation
-            # accepts ``record=None`` and mints an initial record in that case (never-launched
-            # parked thread — otherwise the cache would remain miss forever, per naysayer #2).
+        #   1. head_fetched required: a synthesised empty body (fail-open) is not a real
+        #      observation and must not overwrite the cache. commit_observation writing
+        #      empty here would trip both the round-2 cache-poisoning failure and would
+        #      re-open the round-4 disjunct-3 loop against an empty observation.
+        #   2. rec is None allowed: commit_observation(record=None) mints an initial
+        #      record with only observation fields set — a never-launched parked thread
+        #      whose first evaluation is a SKIP now cache-hits on the next tick
+        #      (naysayer round 2).
+        if is_live and head_fetched:
             new_state[thread_id] = commit_observation(
                 now=now,
                 head_msg_id=actual_msg_id,
@@ -257,40 +294,73 @@ async def _decide_all(
         payload["thread_id"] = thread_id
         payload["head_msg_id"] = actual_msg_id
         payload["head_fetched"] = head_fetched
+        # LAUNCH decisions carry a self-describing commit-launch payload for the sweep to
+        # feed back to ``commit-launch`` if it decides to actually start this thread.
+        if v.decision is Decision.LAUNCH:
+            payload["commit_launch_payload"] = _build_commit_launch_payload(
+                thread_id=thread_id,
+                head_msg_id=actual_msg_id,
+                verdict=v,
+                control_state=control_state,
+                head_fetched=head_fetched,
+            )
         verdicts.append(payload)
 
     return new_state, verdicts
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", required=True)
-    parser.add_argument(
-        "--candidates",
-        default=None,
-        help="path to a JSON file of candidates; omit to read from stdin",
-    )
-    parser.add_argument(
-        "--state-file",
-        required=True,
-        help="path to head_skip.json (JSON object keyed by thread_id)",
-    )
-    parser.add_argument(
-        "--mode",
-        default="live",
-        choices=("live", REPORT_MODE_VALUE),
-        help="live: write state on LAUNCH; report: dry-run (never touch state)",
-    )
-    parser.add_argument(
-        "--url", default=None, help="magickit MCP URL (default: in-code/env default)"
-    )
-    parser.add_argument(
-        "--now-iso",
-        default=None,
-        help="override the current UTC time (ISO 8601); tests only",
-    )
-    args = parser.parse_args()
+def _apply_commit_launch(
+    *,
+    state_path: Path,
+    payload: dict[str, Any],
+    now: datetime,
+) -> Record:
+    """Apply a commit-launch payload to the state file for one thread.
 
+    Called by the sweep AFTER it has received ``decide`` verdicts and chosen the single thread
+    it will start. Writes the launch baseline (``last_launch_at``, ``launch_attempts``, etc.)
+    for exactly that thread. Any other LAUNCH verdicts from the same ``decide`` batch that the
+    sweep did NOT commit will re-evaluate freshly on the next tick — no phantom-launch. Called
+    strictly BEFORE the conductor spawn so a mid-flight kill leaves the attempt counted (the
+    session-start-before write contract, test #10).
+
+    Payload is a plain dict (JSON-safe) exactly as ``decide`` emitted it — the sweep is
+    expected to feed it back verbatim from the corresponding verdict's ``commit_launch_payload``
+    field.
+    """
+    thread_id = str(payload.get("thread_id") or "")
+    if not thread_id:
+        raise ValueError("commit-launch payload missing thread_id")
+    state = _load_state(state_path)
+    prior = state.get(thread_id)
+    verdict = Verdict(
+        decision=Decision.LAUNCH,
+        reason="",  # not used by commit_launch
+        token=str(payload.get("token") or ""),
+        token_raw=payload.get("token_raw"),
+        progressed=False,  # not used by commit_launch
+        attempts_before=0,  # not used by commit_launch
+        attempts_after=int(payload.get("attempts_after") or 0),
+        delay=_ZERO_TIMEDELTA,  # not used by commit_launch
+        eligible_at=None,  # not used by commit_launch
+    )
+    new_record = commit_launch(
+        now=now,
+        head_msg_id=str(payload.get("head_msg_id") or ""),
+        verdict=verdict,
+        control_state=str(payload.get("control_state") or ""),
+        head_fetched=bool(payload.get("head_fetched", True)),
+        prior_record=prior,
+    )
+    state[thread_id] = new_record
+    _save_state(state_path, state)
+    return new_record
+
+
+_ZERO_TIMEDELTA = timedelta(0)
+
+
+def _main_decide(args: argparse.Namespace) -> int:
     # Candidates: file or stdin. Both must be JSON arrays.
     try:
         if args.candidates:
@@ -330,6 +400,94 @@ def main() -> int:
         )
     )
     return 0
+
+
+def _main_commit_launch(args: argparse.Namespace) -> int:
+    # Payload from --payload (inline JSON) or --payload-file. Sweep passes back exactly the
+    # commit_launch_payload sub-object it received in the corresponding decide verdict.
+    try:
+        if args.payload_file:
+            payload_raw = Path(args.payload_file).read_text(encoding="utf-8")
+        else:
+            payload_raw = args.payload or sys.stdin.read()
+        payload = json.loads(payload_raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"head_skip: commit-launch payload unreadable: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(payload, dict):
+        print("head_skip: commit-launch payload must be a JSON object", file=sys.stderr)
+        return 1
+
+    state_path = Path(args.state_file)
+    now = _resolve_now(args.now_iso)
+    try:
+        new_record = _apply_commit_launch(state_path=state_path, payload=payload, now=now)
+    except ValueError as exc:
+        print(f"head_skip: commit-launch failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "mode": "commit-launch",
+                "thread_id": payload.get("thread_id", ""),
+                "record": record_to_json(new_record),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project", default="")
+    parser.add_argument(
+        "--candidates",
+        default=None,
+        help="path to a JSON file of candidates; omit to read from stdin (decide mode only)",
+    )
+    parser.add_argument(
+        "--state-file",
+        required=True,
+        help="path to head_skip.json (JSON object keyed by thread_id)",
+    )
+    parser.add_argument(
+        "--mode",
+        default="decide",
+        choices=("decide", "commit-launch", REPORT_MODE_VALUE),
+        help=(
+            "decide: batch-evaluate, emit verdicts, refresh observation only (never touch "
+            "launch baseline); commit-launch: apply launch baseline for one thread; "
+            "report: dry-run decide (never touch state)"
+        ),
+    )
+    parser.add_argument(
+        "--url", default=None, help="magickit MCP URL (default: in-code/env default)"
+    )
+    parser.add_argument(
+        "--payload",
+        default=None,
+        help="inline JSON payload for commit-launch (alternative: --payload-file or stdin)",
+    )
+    parser.add_argument(
+        "--payload-file",
+        default=None,
+        help="path to a JSON file with the commit-launch payload",
+    )
+    parser.add_argument(
+        "--now-iso",
+        default=None,
+        help="override the current UTC time (ISO 8601); tests only",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "commit-launch":
+        return _main_commit_launch(args)
+    # decide (default) or report
+    if not args.project:
+        print("head_skip: --project is required in decide/report mode", file=sys.stderr)
+        return 1
+    return _main_decide(args)
 
 
 def _resolve_now(override: str | None) -> datetime:

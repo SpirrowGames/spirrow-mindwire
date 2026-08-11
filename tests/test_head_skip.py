@@ -63,6 +63,11 @@ The 14 tests here are the finalised list from the spec dispatched into the imple
     ROUND-2-preserved observation would trip disjunct 3 forever without the ``token != ""``
     guard, spinning at 5-min cadence indefinitely. This is the round-4 fix: the guard makes
     the fail-open path climb the backoff to CAP like any other spin (Tier B naysayer round 4).
+22. Clock skew resilience: a progressed thread (``delay=0``) must LAUNCH regardless of the
+    time check. A system-clock backward jump between ticks (e.g. NTP correction) making
+    ``now < record.last_launch_at`` used to cause a spurious DEFER, silently violating the
+    invariant "a progressing thread never backs off" until the wall clock caught up (Tier B
+    naysayer round 5, weakest-remaining-point).
 """
 
 from __future__ import annotations
@@ -1415,3 +1420,80 @@ def test_park_resume_still_works_after_round_4_guard() -> None:
     assert v.progressed is True
     assert v.decision is Decision.LAUNCH
     assert v.reason == "progressed"
+
+
+# --- 22. clock-skew: progressed always LAUNCHes even if now < last_launch_at --------------------
+
+
+def test_progressed_launches_even_when_wall_clock_skewed_backward() -> None:
+    """A backward system-clock jump must NOT make a progressed thread DEFER.
+
+    Tier B naysayer round 5 (weakest-remaining-point noted after the phantom-launch fix).
+
+    Scenario: LAUNCH lands at wall-clock T=100 (last_launch_at=100). Between ticks, NTP
+    corrects the wall clock backward to T=98. A new nomination arrives at T=98. Old code:
+
+        progressed = True -> attempts_next_series = 0 -> delay = 0
+        ready_at = last_launch_at + 0 = 100
+        now (98) < ready_at (100) -> DEFER   # VIOLATES "progressing thread never backs off"
+
+    Fix: the time check is guarded on ``delay > 0``. When delay is 0 (i.e. progressed or fresh
+    series), the time check is skipped and the verdict is LAUNCH. Self-consistent because a
+    "delay=0 DEFER" is a contradiction in terms.
+    """
+    launch_time = _T0
+    rec = Record(
+        last_launch_at=launch_time,
+        nomination_at_launch="bohr",
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-1",
+        launch_attempts=1,
+        head_observed_at=launch_time,
+        last_observed_head_msg_id="msg-1",
+        last_observed_nomination="bohr",
+    )
+    # Wall clock jumped backward by 2 seconds AND the nomination changed.
+    now_skewed = launch_time - timedelta(seconds=2)
+    v = decide(
+        now=now_skewed,
+        head_msg_id="msg-2",
+        head_body=_body("Einstein"),  # nomination changed -> progressed
+        control_state="run",
+        record=rec,
+    )
+    assert v.progressed is True
+    assert v.decision is Decision.LAUNCH  # NOT DEFER
+    assert v.reason == "progressed"
+    assert v.delay == timedelta(0)
+
+
+def test_backoff_defer_still_defers_when_within_delay_window() -> None:
+    """Regression guard: the clock-skew fix must not turn genuine backoff DEFERs into LAUNCHes.
+
+    The guard is on ``delay > 0`` (not on any looser condition). When delay is nonzero AND the
+    thread hasn't waited long enough, the verdict is still DEFER — exactly the normal spin
+    case. Pin this so a future "simplification" that drops the ``> 0`` and only checks the
+    time isn't silently taken.
+    """
+    launch_time = _T0
+    rec = Record(
+        last_launch_at=launch_time,
+        nomination_at_launch="bohr",
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-1",
+        launch_attempts=1,  # delay = BASE (15 min)
+        head_observed_at=launch_time,
+        last_observed_head_msg_id="msg-1",
+        last_observed_nomination="bohr",
+    )
+    # 30 seconds after launch, same nomination — should DEFER.
+    v = decide(
+        now=launch_time + timedelta(seconds=30),
+        head_msg_id="msg-2",
+        head_body=_body("Bohr"),
+        control_state="run",
+        record=rec,
+    )
+    assert v.decision is Decision.DEFER
+    assert v.progressed is False
+    assert v.delay == BASE
