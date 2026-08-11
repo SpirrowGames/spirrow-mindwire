@@ -635,10 +635,18 @@ _RAW_COARSE: tuple[tuple[re.Pattern[str], Operation], ...] = (
 
 
 def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
-    """Coarse raw-string scan for Tier C verbs (defence-in-depth, deny-only)."""
+    """Coarse raw-string scan for Tier C verbs (defence-in-depth, deny-only).
+
+    Returns a :class:`ClassifiedAction` whose ``match_span`` points to the exact
+    substring the raw regex matched. That span is what the PR-1 denial detail
+    (SPEC-2026-08-11-denial-detail-and-overdeny AC1) uses so a human reading the
+    halt reason can tell whether the match landed inside a heredoc body or the
+    outer command — the two-branch measurement this PR exists to enable.
+    """
     for pattern, op in _RAW_COARSE:
-        if pattern.search(command):
-            return ClassifiedAction(op, detail=command)
+        match = pattern.search(command)
+        if match is not None:
+            return ClassifiedAction(op, detail=command, match_span=match.span())
     return None
 
 
@@ -676,12 +684,22 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
 
     Recursion is bounded by :data:`_MAX_INDIRECTION_DEPTH`; nesting past it fails
     closed (UNKNOWN → deny) rather than risk an unbounded / unanalyzable parse.
+
+    At the OUTER call (``_depth == 0``) the returned action carries observation
+    fields (``raw_command`` / ``heredoc_bodies`` / ``match_span`` / ``corroborated``)
+    populated for PR-1 denial detail (SPEC-2026-08-11-denial-detail-and-overdeny).
+    These do not affect the verdict — they exist so the fail-loud denial reason can
+    embed enough context for the two-branch measurement (structural-only vs.
+    coarse-only vs. both-agree). Inner recursive calls do not populate them (the
+    outer call is where the raw command exists as one contiguous string).
     """
     if _depth > _MAX_INDIRECTION_DEPTH:
-        return ClassifiedAction(Operation.UNKNOWN, detail=command)
+        capped = ClassifiedAction(Operation.UNKNOWN, detail=command)
+        return _annotate_outer(capped, command, coarse=None) if _depth == 0 else capped
     parts = [p.strip() for p in _BASH_SEP.split(command) if p.strip()]
     if not parts:
-        return ClassifiedAction(Operation.EXEC_CODE, detail=command)
+        empty = ClassifiedAction(Operation.EXEC_CODE, detail=command)
+        return _annotate_outer(empty, command, coarse=None) if _depth == 0 else empty
     actions = [_classify_single_bash(p, _depth) for p in parts]
     # Command substitutions ($(...) / backticks) anywhere in the raw command are
     # inner commands too — recurse into each (same classifier, depth-bounded).
@@ -700,13 +718,217 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     # Coarse defence-in-depth floor: only when indirection is present, and only if
     # at least as dangerous as the structural verdict — so it can ADD a denial the
     # tokenizer missed, never downgrade one (see _RAW_COARSE).
+    coarse: ClassifiedAction | None = None
     if _INDIRECTION_RE.search(command):
         coarse = _scan_raw_coarse(command)
         if coarse is not None and _DANGER_RANK.get(coarse.operation, 0) >= _DANGER_RANK.get(
             candidate.operation, 0
         ):
-            return coarse
-    return candidate
+            return _annotate_outer(coarse, command, coarse=coarse) if _depth == 0 else coarse
+    return _annotate_outer(candidate, command, coarse=coarse) if _depth == 0 else candidate
+
+
+def _annotate_outer(
+    action: ClassifiedAction,
+    command: str,
+    *,
+    coarse: ClassifiedAction | None,
+) -> ClassifiedAction:
+    """Fill PR-1 observation fields on the OUTER (depth-0) Bash classification.
+
+    Records the raw command, any heredoc body ranges, the coarse floor's
+    match span (when present and adopted), and the ``corroborated`` label —
+    the four values SPEC-2026-08-11-denial-detail-and-overdeny §3.1 mandates.
+    Observation-only: the caller's ``action.operation`` is preserved verbatim.
+
+    ``corroborated`` semantics: ``structural_and_coarse`` when the coarse floor
+    picked the same Tier C ``operation`` as the structural verdict adopted here;
+    ``coarse_only`` when the coarse floor fired and its verdict replaced a
+    weaker structural verdict; ``structural_only`` when the structural verdict
+    is Tier C but the coarse floor did not fire (or fired at a strictly weaker
+    op); ``unknown`` otherwise (empty command, benign EXEC_CODE, or the coarse
+    gate is closed — nothing to corroborate).
+    """
+    heredocs = _find_heredoc_bodies(command)
+    op = action.operation
+    danger = _DANGER_RANK.get(op, 0)
+    # Non-dangerous verdicts have nothing meaningful to corroborate — Tier A
+    # operations (EXEC_CODE / FS_READ / SEARCH / …) have no deny to explain.
+    if danger < _DANGER_RANK[Operation.GIT_COMMIT]:
+        corroborated = "unknown"
+    elif coarse is None:
+        # The coarse gate never opened (no _INDIRECTION_RE match) OR the floor
+        # fired at a weaker op that was not adopted; either way the verdict came
+        # from the structural pass alone.
+        corroborated = "structural_only"
+    elif action is coarse:
+        # The coarse floor's verdict was returned (its danger >= structural).
+        # Distinguish "coarse only fired here" from "both paths independently
+        # agree" by asking whether ANY structural fragment would surface the
+        # same op on its own (see :func:`_has_direct_tier_c`). Both-agree is the
+        # more optimistic reading, so bias the flag toward coarse-only when the
+        # structural path does not independently corroborate.
+        corroborated = "structural_and_coarse" if _has_direct_tier_c(command, op) else "coarse_only"
+    else:
+        # coarse fired at a weaker / different op than the adopted structural verdict.
+        corroborated = "structural_only"
+    return ClassifiedAction(
+        operation=action.operation,
+        path=action.path,
+        branch=action.branch,
+        source=action.source,
+        target=action.target,
+        force=action.force,
+        detail=action.detail,
+        raw_command=command,
+        heredoc_bodies=heredocs,
+        match_span=action.match_span,
+        corroborated=corroborated,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# heredoc detection (observation-only; SPEC §3.1 D-3)
+# --------------------------------------------------------------------------- #
+
+# Matches a bash heredoc opener: `<<`, optional `-` (strip-tabs form), optional
+# quote, DELIMITER, optional quote. The opener extends to end of line; the body
+# runs from the next line to a line consisting only of the delimiter (with the
+# strip-tabs form allowing leading tabs). We only detect, we do not consume — a
+# malformed heredoc (no close) reports a body that extends to end-of-string, so
+# under-detection is preferred to false claims of "match outside body".
+_HEREDOC_OPENER_RE = re.compile(
+    r"<<(?P<strip>-?)\s*(?P<q>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*)(?P=q)"
+)
+
+
+def _find_heredoc_bodies(command: str) -> tuple[tuple[int, int], ...]:
+    """Find (start, end) spans of bash heredoc bodies in ``command``.
+
+    Body span excludes the opener line and the closing delimiter line. A missing
+    close treats end-of-string as the close (fail-open on detection, which means
+    over-reporting the body region — this is safe because the field is used to
+    read "was the match INSIDE a body?" and over-reporting the body only inflates
+    "yes" counts, not "no" counts, so it cannot hide a match that was actually
+    outside).
+    """
+    bodies: list[tuple[int, int]] = []
+    pos = 0
+    while True:
+        m = _HEREDOC_OPENER_RE.search(command, pos)
+        if m is None:
+            break
+        strip = m.group("strip") == "-"
+        delim = m.group("delim")
+        # Body starts after the opener LINE ends.
+        eol = command.find("\n", m.end())
+        if eol == -1:
+            # opener runs to end-of-string; no body possible.
+            break
+        body_start = eol + 1
+        # Find a line consisting of just the delimiter (optionally leading tabs).
+        # Assemble the pattern outside the f-string so Python 3.11 does not choke
+        # on the escape sequence in the f-string body.
+        leading = "[\t]*" if strip else ""
+        close_re = re.compile("(?m)^" + leading + re.escape(delim) + r"\s*$")
+        cm = close_re.search(command, body_start)
+        body_end = cm.start() if cm is not None else len(command)
+        bodies.append((body_start, body_end))
+        pos = cm.end() if cm is not None else len(command)
+    return tuple(bodies)
+
+
+# --------------------------------------------------------------------------- #
+# Redaction (T1; SPEC §3.4)
+# --------------------------------------------------------------------------- #
+
+# Known token shapes. The list is deliberately kept small and named per source —
+# enumeration is known to leak (SPEC D-5); the trade-off is documented in the PR
+# body's residue section. Order does not matter because substitutions are
+# non-overlapping in practice; each pattern is anchored on its distinctive prefix.
+_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("github_pat", re.compile(r"ghp_[A-Za-z0-9]{36,}")),
+    ("github_fine_pat", re.compile(r"github_pat_[A-Za-z0-9_]{22,}")),
+    ("slack", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")),
+    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace known secret token shapes with ``<REDACTED:<kind>>``.
+
+    Fail-closed on any internal exception: the caller sees ``""`` for the
+    redacted text and MUST treat that as "detail unavailable" rather than
+    print raw ``text``. Enumeration is not exhaustive (SPEC D-5); the residue
+    is intentional and documented in the PR body.
+    """
+    try:
+        for kind, pattern in _SECRET_PATTERNS:
+            text = pattern.sub(f"<REDACTED:{kind}>", text)
+    except Exception:
+        return ""
+    return text
+
+
+def _has_direct_tier_c(command: str, op: Operation) -> bool:
+    """True if the STRUCTURAL classifier would (independently) surface ``op`` on ``command``.
+
+    Best-effort heuristic used by :func:`_annotate_outer` to distinguish
+    ``coarse_only`` from ``structural_and_coarse`` when the coarse floor's
+    verdict was adopted. Mirrors the structural half of :func:`_classify_bash`
+    (split-and-classify + substitution recursion) but omits the coarse floor, so
+    this returns True iff any tokenizable fragment (direct or under ``$(…)`` /
+    backticks) structurally maps to ``op``.
+
+    Failure mode: on tokenizer-defeating input (ANSI-C ``$'…'`` quoting) this
+    returns False even when the raw text obviously carries the verb — matching
+    the structural classifier's own blind spot, which is exactly why the coarse
+    floor exists. The observation then correctly reports ``coarse_only`` (the
+    structural path DID miss it, the floor caught it).
+    """
+    for part in [p.strip() for p in _BASH_SEP.split(command) if p.strip()]:
+        if _classify_single_bash(part).operation is op:
+            return True
+    return any(_has_direct_tier_c(inner, op) for inner in _extract_substitutions(command))
+
+
+def format_denial_detail(action: ClassifiedAction, reason: str, *, tool_name: str = "") -> str:
+    """Compose the full denial reason string for a fail-loud halt (SPEC §3.3).
+
+    Layout is exactly three lines (last two are new in PR-1; existing callers that
+    read only the first line — the Tier C ``forbidden.reason`` — continue to work,
+    AC7):
+
+        <reason>
+        detail: op=<op> corroborated=<v> [match=A..B] [heredoc=A..B,C..D]
+        command: <redacted raw command | (non-bash tool: <tool_name>)>
+
+    Redaction is fail-closed (SPEC D-6): if :func:`_redact_secrets` throws,
+    ``command:`` is replaced by ``(redacted; redaction error)`` and no raw text
+    leaks.
+    """
+    op = action.operation.value
+    detail_parts = [f"op={op}", f"corroborated={action.corroborated}"]
+    if action.match_span is not None:
+        detail_parts.append(f"match={action.match_span[0]}..{action.match_span[1]}")
+    if action.heredoc_bodies:
+        joined = ",".join(f"{s}..{e}" for s, e in action.heredoc_bodies)
+        detail_parts.append(f"heredoc={joined}")
+    detail_line = "detail: " + " ".join(detail_parts)
+
+    if action.raw_command is None:
+        command_line = f"command: (non-bash tool: {tool_name or 'unknown'})"
+    else:
+        try:
+            redacted = _redact_secrets(action.raw_command)
+        except Exception:
+            redacted = ""
+        if redacted == "" and action.raw_command != "":
+            command_line = "command: (redacted; redaction error)"
+        else:
+            command_line = f"command: {redacted}"
+    return f"{reason}\n{detail_line}\n{command_line}"
 
 
 # MCP read operations are POSITIVELY enumerated (§B.2 default-deny): anything not
@@ -883,8 +1105,20 @@ class _AllowlistGuard:
         decision = self._allowlist.check(action)
         if decision.allowed:
             return PermissionResultAllow()
-        self.violations.append(decision)
-        return PermissionResultDeny(message=decision.reason, interrupt=True)
+        # Enrich the deny reason with the PR-1 detail (SPEC §3.3) so the halt's
+        # single visible signal — session.error.message — carries enough context
+        # to tell the two branches apart (structural over-deny vs. genuine Tier C
+        # inside a heredoc). The existing Tier C reason stays the FIRST line of
+        # the string (AC7); appended lines are additive and do not confuse a
+        # caller that reads only line 1.
+        enriched_reason = format_denial_detail(action, decision.reason, tool_name=tool_name)
+        enriched = AllowlistDecision(
+            allowed=decision.allowed,
+            operation=decision.operation,
+            reason=enriched_reason,
+        )
+        self.violations.append(enriched)
+        return PermissionResultDeny(message=enriched_reason, interrupt=True)
 
 
 @dataclass

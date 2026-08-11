@@ -120,6 +120,16 @@ class ClassifiedAction:
 
     Produced by the SDK-tool classifier (``adapters.implementer``); ``check``
     consumes it. ``detail`` carries the raw command / path for messages.
+
+    The last four fields are **observation-only** (spec/design/T-denial-detail-and-overdeny.md
+    §3.1). They record WHY a Bash classification landed where it did — the raw
+    command text, any heredoc body ranges within it, the coarse-floor match span
+    when the floor fires, and the corroboration state between the structural and
+    coarse paths. **They do not change the allow/deny verdict** (D-1 / D-4);
+    they exist so that a fail-loud denial can print enough context for a human
+    to tell the two branches apart (structural over-deny vs. genuine Tier C in
+    a heredoc). All four have default values so every existing caller (tests,
+    other classifiers) constructs a ``ClassifiedAction`` unchanged.
     """
 
     operation: Operation
@@ -129,6 +139,11 @@ class ClassifiedAction:
     target: str | None = None
     force: bool = False
     detail: str = ""
+    # --- PR-1 observation fields (SPEC-2026-08-11-denial-detail-and-overdeny) --- #
+    raw_command: str | None = None
+    heredoc_bodies: tuple[tuple[int, int], ...] = ()
+    match_span: tuple[int, int] | None = None
+    corroborated: str = "unknown"  # structural_and_coarse | structural_only | coarse_only | unknown
 
 
 class AllowlistConfigError(ValueError):

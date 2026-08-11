@@ -939,3 +939,250 @@ def test_default_system_prompt_includes_implementer_handoff_protocol() -> None:
     assert "Conductor handoff protocol" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
     assert "NEXT:" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
     assert "never merge" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
+
+
+# --------------------------------------------------------------------------- #
+# SPEC-2026-08-11-denial-detail-and-overdeny — PR-1 observation
+#
+# These exercise the four observation fields on ``ClassifiedAction`` and the
+# ``format_denial_detail`` reason wrapping. The classifier's verdicts are
+# untouched by this PR (D-1); only the observation surface is new.
+# --------------------------------------------------------------------------- #
+
+
+from spirrow_mindwire.adapters.implementer import (  # noqa: E402  — after top-level tests
+    _find_heredoc_bodies,
+    _redact_secrets,
+    format_denial_detail,
+)
+from spirrow_mindwire.allowlist import AllowlistDecision, ClassifiedAction  # noqa: E402
+
+
+def test_ac3_backward_compat_classifiedaction_default_ctor() -> None:
+    # AC3: ClassifiedAction still constructs with just an Operation — no callers
+    # need to know about the new observation fields.
+    a = ClassifiedAction(Operation.EXEC_CODE)
+    assert a.raw_command is None
+    assert a.heredoc_bodies == ()
+    assert a.match_span is None
+    assert a.corroborated == "unknown"
+
+
+def test_ac6_non_bash_tool_is_unknown() -> None:
+    # AC6: any classification that does not run through the Bash pipeline stays
+    # ``unknown`` — nothing to corroborate against.
+    for name, inp in [
+        ("Write", {"file_path": "x.py"}),
+        ("Read", {"file_path": "x.py"}),
+        ("mcp__github__delete_file", {}),
+    ]:
+        a = classify_tool_call(name, inp)
+        assert a.corroborated == "unknown", name
+        assert a.raw_command is None, name
+
+
+def test_bash_direct_tier_c_is_structural_only() -> None:
+    # Direct `rm -rf x` — no indirection ∴ the coarse gate never opens, verdict
+    # comes from the structural pass alone.
+    a = classify_tool_call("Bash", {"command": "rm -rf x"})
+    assert a.operation is Operation.FS_DELETE
+    assert a.corroborated == "structural_only"
+    assert a.raw_command == "rm -rf x"
+    assert a.match_span is None  # no coarse-floor match (gate closed)
+
+
+def test_bash_wrapped_tier_c_both_paths_agree() -> None:
+    # `bash -c "rm -rf x"` — structural recursion extracts inner ∴ FS_DELETE;
+    # the coarse floor also fires. They agree at FS_DELETE → structural_and_coarse.
+    a = classify_tool_call("Bash", {"command": 'bash -c "rm -rf x"'})
+    assert a.operation is Operation.FS_DELETE
+    assert a.corroborated == "structural_and_coarse"
+    assert a.match_span is not None  # coarse floor recorded WHERE it matched
+
+
+def test_bash_coarse_only_on_ansi_c_quoting() -> None:
+    # ANSI-C $'...' quoting defeats shlex tokenisation, so the structural pass
+    # never surfaces the inner `rm` — only the coarse floor does. This is the
+    # exact "coarse fires alone" case the PR-1 measurement wants to count.
+    a = classify_tool_call("Bash", {"command": "eval $'rm -rf x'"})
+    assert a.operation is Operation.FS_DELETE
+    assert a.corroborated == "coarse_only"
+
+
+def test_bash_benign_verdict_is_unknown() -> None:
+    # A benign EXEC_CODE Bash command has no deny to corroborate. Keep it as
+    # ``unknown`` so PR-1 measurements do not treat "nothing to say" as a
+    # corroboration signal.
+    a = classify_tool_call("Bash", {"command": "pytest -q"})
+    assert a.operation is Operation.EXEC_CODE
+    assert a.corroborated == "unknown"
+
+
+# ---- heredoc detection -------------------------------------------------------
+
+
+def test_find_heredoc_bodies_single_body() -> None:
+    cmd = "cat > f.ps1 << 'EOF'\nline 1\nline 2\nEOF\necho done"
+    bodies = _find_heredoc_bodies(cmd)
+    assert len(bodies) == 1
+    s, e = bodies[0]
+    # Body starts after the opener line and ends just before the closing EOF line.
+    assert cmd[s:e] == "line 1\nline 2\n"
+
+
+def test_find_heredoc_bodies_no_close_reports_to_eof() -> None:
+    # Under-detection is worse than over-reporting: an unclosed heredoc extends
+    # its body to end-of-string, so the reader never mistakes "no body found" for
+    # "match was outside a body".
+    cmd = "cat << EOF\nnever closed\nRemove-Item x"
+    bodies = _find_heredoc_bodies(cmd)
+    assert len(bodies) == 1
+    s, e = bodies[0]
+    assert e == len(cmd)
+    assert "Remove-Item x" in cmd[s:e]
+
+
+def test_find_heredoc_bodies_none_when_absent() -> None:
+    assert _find_heredoc_bodies("echo hi") == ()
+
+
+# ---- AC2: PowerShell fixture (the halted session's failure shape) -----------
+
+
+_PS_HEREDOC = (
+    "cat > tests/Test-SweepQuarantine.ps1 << 'PS1'\n"
+    "$parseErrors | ForEach-Object {\n"
+    '  Write-Host "PARSE ERROR line $($_.Extent.StartLineNumber): $($_.Message)"\n'
+    "}\n"
+    "Check \"fresh (0h) -> quarantined\" 'quarantined' `\n"
+    "$state = Get-Content foo.json\n"
+    "Remove-Item -Recurse -Force $tmpDir\n"
+    "PS1\n"
+)
+
+
+def test_ac2_powershell_heredoc_with_remove_item_records_observation() -> None:
+    # AC2 fixture: `$(` in PowerShell body opens _INDIRECTION_RE; `Remove-Item`
+    # inside the same heredoc fires the coarse floor; the STRUCTURAL classifier
+    # also fires here because ``_BASH_SEP`` splits on ``\n`` regardless of
+    # heredoc context — the Remove-Item line becomes a sibling fragment. That
+    # is itself an interesting finding for PR-1 measurement (both paths cross
+    # heredoc boundaries), so the corroborated value is expected to be
+    # ``structural_and_coarse`` on this input; the PR-1 promise is that the
+    # match_span + heredoc_bodies are recorded so a reader can tell the
+    # match landed INSIDE the heredoc body (AC1).
+    a = classify_tool_call("Bash", {"command": _PS_HEREDOC})
+    assert a.operation is Operation.FS_DELETE
+    assert a.corroborated in ("structural_and_coarse", "coarse_only")
+    assert a.match_span is not None
+    ms, me = a.match_span
+    assert _PS_HEREDOC[ms:me] == "Remove-Item"
+    assert len(a.heredoc_bodies) == 1
+
+
+def test_ac1_match_inside_heredoc_is_machine_readable() -> None:
+    # AC1: the halt reason string carries enough for a reader to tell that the
+    # coarse-floor match fell INSIDE the heredoc body (structural over-deny
+    # candidate) rather than in the outer command (a genuine `rm` on the shell).
+    a = classify_tool_call("Bash", {"command": _PS_HEREDOC})
+    reason = format_denial_detail(a, "test-forbidden-reason")
+    assert reason.splitlines()[0] == "test-forbidden-reason"  # AC7
+    assert f"corroborated={a.corroborated}" in reason
+    assert "match=" in reason and "heredoc=" in reason
+    ms, me = a.match_span  # type: ignore[misc]
+    assert f"match={ms}..{me}" in reason
+    # Machine-read: the match span must fall inside at least one heredoc body span.
+    h_start, h_end = a.heredoc_bodies[0]
+    assert h_start <= ms and me <= h_end, "AC1: match must land inside the heredoc body"
+
+
+# ---- T1 secret redaction (AC4/AC5) ------------------------------------------
+
+
+def test_ac4_ghp_token_redacted() -> None:
+    token = "ghp_" + "A" * 36
+    cmd = f"echo {token} > /tmp/x"
+    a = classify_tool_call("Bash", {"command": cmd})
+    reason = format_denial_detail(a, "test-forbidden-reason")
+    assert token not in reason
+    assert "<REDACTED:github_pat>" in reason
+
+
+@pytest.mark.parametrize(
+    "kind,token",
+    [
+        ("github_pat", "ghp_" + "A" * 36),
+        ("github_fine_pat", "github_pat_" + "A" * 30),
+        ("slack", "xoxb-" + "A" * 20),
+        ("jwt", "eyJabc." + "A" * 10 + "." + "B" * 10),
+        ("aws_access_key", "AKIA" + "A" * 16),
+    ],
+)
+def test_redact_secrets_covers_known_shapes(kind: str, token: str) -> None:
+    text = f"prefix {token} suffix"
+    out = _redact_secrets(text)
+    assert token not in out
+    assert f"<REDACTED:{kind}>" in out
+
+
+def test_ac5_redaction_failure_is_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # AC5: if redaction throws, `command:` does NOT leak the raw text — it says
+    # "(redacted; redaction error)" instead. Simulated by patching the redaction
+    # function to raise; the format helper must catch and refuse to print raw.
+    from spirrow_mindwire.adapters import implementer as impl_mod
+
+    def boom(_text: str) -> str:
+        raise RuntimeError("simulated redaction failure")
+
+    monkeypatch.setattr(impl_mod, "_redact_secrets", boom)
+    cmd = "echo very-secret-thing-do-not-leak > /tmp/x"
+    a = ClassifiedAction(
+        operation=Operation.FS_DELETE,
+        detail=cmd,
+        raw_command=cmd,
+        corroborated="structural_only",
+    )
+    reason = impl_mod.format_denial_detail(a, "test-forbidden-reason")
+    assert "very-secret-thing-do-not-leak" not in reason
+    assert "(redacted; redaction error)" in reason
+
+
+def test_ac7_reason_first_line_is_original() -> None:
+    # AC7: existing callers that read only the first line of the reason (the
+    # original Tier C forbidden.reason) keep working. The new detail is
+    # additive lines below.
+    a = classify_tool_call("Bash", {"command": "rm -rf x"})
+    reason = format_denial_detail(a, "ファイル削除は Tier C (不可逆)。")
+    assert reason.startswith("ファイル削除は Tier C (不可逆)。")
+
+
+def test_non_bash_denial_prints_tool_name_hint() -> None:
+    # A non-Bash denial (e.g. an unknown MCP tool) has no raw_command; the
+    # helper prints the tool_name so the human still knows what was called.
+    a = ClassifiedAction(operation=Operation.UNKNOWN)
+    reason = format_denial_detail(a, "unlisted operation", tool_name="mcp__unknown__frobnicate")
+    assert "command: (non-bash tool: mcp__unknown__frobnicate)" in reason
+    assert "corroborated=unknown" in reason
+
+
+# ---- guard integration: violations carry the enriched reason ---------------
+
+
+@pytest.mark.anyio
+async def test_guard_deny_message_carries_detail(tmp_path: Path) -> None:
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    cmd = 'bash -c "rm -rf x"'
+    res = await guard("Bash", {"command": cmd}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    # The SDK-facing message and the stored violation reason are the enriched
+    # form: line 1 = original Tier C reason, then detail: and command:.
+    assert isinstance(res.message, str)
+    lines = res.message.splitlines()
+    assert len(lines) >= 3
+    assert "detail:" in lines[1]
+    assert "command:" in lines[2]
+    # And the stored decision carries the same enriched text, so downstream
+    # ErrorInfo.message (fed from decision.reason) reads the detail too.
+    stored = guard.violations[-1]
+    assert isinstance(stored, AllowlistDecision)
+    assert stored.reason == res.message
