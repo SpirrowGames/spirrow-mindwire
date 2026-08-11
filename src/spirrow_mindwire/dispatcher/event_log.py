@@ -30,6 +30,7 @@ EVENT_FIELD_POSTED_MSG_ID = "posted_msg_id"
 EVENT_FIELD_IDEMPOTENCY_KEY = "idempotency_key"
 EVENT_FIELD_FAILED_EVENT_ID = "failed_event_id"
 EVENT_FIELD_ERROR = "error"
+EVENT_FIELD_DENIAL = "denial"
 
 EVENT_KIND_REPLY_SENT = "reply.sent"
 EVENT_KIND_DELIVERY_FAILED = "delivery.failed"
@@ -76,24 +77,35 @@ def delivery_failed_event(
     (I3 v2.2 / T26, anchor #6 key constant); ``failed_event_id`` is the failed
     :class:`ChatroomEvent`'s id (distinct from this log entry's own
     ``event_id``).
+
+    ``denial`` is present only when the error carries a structured description of
+    the denied act (``spec/design/T-denial-detail-and-overdeny.md``). It is read by
+    duck-typing rather than by importing the adapter's exception class: the
+    dispatcher must not depend on an adapter, and any future error type that wants
+    to explain itself here only has to expose the same attribute.
     """
+    fields = {
+        EVENT_FIELD_AUTHOR: handle.instance_id,  # I3 v2.2 / T26: author = instance_id
+        EVENT_FIELD_SESSION_ID: handle.session_id,
+        EVENT_FIELD_ADAPTER_ID: handle.adapter_id,
+        EVENT_FIELD_FAILED_EVENT_ID: event.event_id,
+        EVENT_FIELD_ERROR: str(error),
+    }
+    record = getattr(error, "denial_record", None)
+    if record:
+        fields[EVENT_FIELD_DENIAL] = record
     return Event(
         event_id=new_ulid(),
         occurred_at=datetime.now(UTC),
         kind=EVENT_KIND_DELIVERY_FAILED,
-        fields={
-            EVENT_FIELD_AUTHOR: handle.instance_id,  # I3 v2.2 / T26: author = instance_id
-            EVENT_FIELD_SESSION_ID: handle.session_id,
-            EVENT_FIELD_ADAPTER_ID: handle.adapter_id,
-            EVENT_FIELD_FAILED_EVENT_ID: event.event_id,
-            EVENT_FIELD_ERROR: str(error),
-        },
+        fields=fields,
     )
 
 
 __all__ = [
     "EVENT_FIELD_ADAPTER_ID",
     "EVENT_FIELD_AUTHOR",
+    "EVENT_FIELD_DENIAL",
     "EVENT_FIELD_ERROR",
     "EVENT_FIELD_FAILED_EVENT_ID",
     "EVENT_FIELD_IDEMPOTENCY_KEY",
