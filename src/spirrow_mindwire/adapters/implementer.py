@@ -895,6 +895,11 @@ class _Session:
     guard: _AllowlistGuard
     state: SessionState
     last_active_at: datetime
+    # The exact ``ClaudeAgentOptions`` handed to the SDK client on spawn,
+    # kept so :meth:`ImplementerSdkAdapter.source_marker_options` can hand
+    # the same object to the harness (msg-834 §2 (a)). ``Any`` typing on the
+    # dataclass field so an old cached instance without options still loads.
+    options: Any = None
     error: ErrorInfo | None = None
 
 
@@ -1083,8 +1088,9 @@ class ImplementerSdkAdapter:
                 "via Lexora, never api.anthropic.com directly (ADR-07 §2.4 / env spec §4)"
             )
         guard = _AllowlistGuard(self._allowlist)
+        options = self._make_options(guard)
         try:
-            client = self._client_factory(self._make_options(guard))
+            client = self._client_factory(options)
             await client.connect()
         except Exception as exc:
             raise ImplementerSdkSpawnError(
@@ -1107,8 +1113,25 @@ class ImplementerSdkAdapter:
             guard=guard,
             state=SessionState.IDLE,
             last_active_at=now,
+            # Retain the exact ``ClaudeAgentOptions`` object we passed to
+            # the SDK client so the harness can derive the source marker
+            # from it (msg-805 D3 / msg-834 §2 (a)). Never re-declare or
+            # re-read; the marker's SOT is this instance.
+            options=options,
         )
         return handle
+
+    def source_marker_options(self, handle: SessionHandle) -> Any:
+        """Return the ``ClaudeAgentOptions`` for ``handle``, or ``None`` if unknown.
+
+        Public so :mod:`spirrow_mindwire.dispatcher.core` can retrieve the
+        exact options object the SDK client was spawned with and hand it to
+        :func:`spirrow_mindwire.source_marker.render_source_marker`. This
+        adapter file **never** imports the marker builder; the seam is here
+        (msg-834 §2 (c)).
+        """
+        session = self._sessions.get(handle)
+        return None if session is None else session.options
 
     async def deliver_event(self, handle: SessionHandle, event: ChatroomEvent) -> None:
         session = self._sessions.get(handle)

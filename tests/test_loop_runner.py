@@ -419,7 +419,12 @@ async def test_built_loop_dispatches_proposer_reply(tmp_path: Path) -> None:
     assert dispatched == 1
     # The proposer (instance "proposer-1") posted its proposal back to the thread.
     assert chatroom.authors() == ["human", "proposer-1"]
-    assert chatroom.messages()[-1]["content"] == "PROPOSAL: add a write-through cache."
+    posted = chatroom.messages()[-1]["content"]
+    # The dispatcher stamps the harness-derived source marker on the posted body
+    # (msg-805 D3 / msg-834 §2). The agent's proposal is preserved verbatim; the
+    # marker is the trailing HTML-comment line derived from the SDK options.
+    assert posted.startswith("PROPOSAL: add a write-through cache.")
+    assert posted.rstrip().splitlines()[-1].startswith("<!-- source:")
 
 
 @pytest.mark.anyio

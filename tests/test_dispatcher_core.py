@@ -380,7 +380,81 @@ async def test_live_claude_code_adapter_with_dispatcher(tmp_path: Path) -> None:
     await disp.dispatch(handle, _event(msg_id="m1"))
     assert len(gateway.posts) == 1
     assert gateway.posts[0]["author"] == "proposer-1"  # I3 v2.2: author = instance_id
-    assert gateway.posts[0]["body"] == "real reply"
+    # The dispatcher appends the harness-derived source marker to the body
+    # for every SDK-adapter reply (msg-805 D3 / msg-834 §2). The original
+    # agent text is preserved verbatim; the marker is the trailing line.
+    posted_body = gateway.posts[0]["body"]
+    assert posted_body.startswith("real reply")
+    assert posted_body.rstrip().splitlines()[-1].startswith("<!-- source:")
+
+
+# ----- source marker wiring (msg-805 D3 / msg-834 §2) ------------------------ #
+
+
+class _MarkerOptionsAdapter(_ReplyingAdapter):
+    """Replying adapter that also exposes ``source_marker_options`` (the getter
+    the dispatcher looks up via ``getattr`` to derive the harness-side marker).
+
+    Mirrors what the real SDK adapters do — store the options for the session
+    and return them through a public getter — without pulling in the SDK. This
+    is the direct wiring test for msg-834 §2 (b): the dispatcher, not the
+    adapter, produces the marker text.
+    """
+
+    def __init__(self, *, options: Any, reply_body: str = "hello") -> None:
+        super().__init__(reply_body=reply_body)
+        self._options = options
+
+    def source_marker_options(self, handle: SessionHandle) -> Any:
+        _ = handle  # single-session fake; port receives the handle for parity
+        return self._options
+
+
+@pytest.mark.anyio
+async def test_dispatcher_appends_source_marker_when_adapter_exposes_options() -> None:
+    """The dispatcher derives the marker from ``adapter.source_marker_options(handle)``.
+
+    Msg-805 D3 / msg-834 §2 (b): the harness stamps the marker on posting;
+    the adapter's reply body itself is never modified in place, and the
+    marker's text is a function of the options object only. Here the fake
+    adapter yields a ``SimpleNamespace`` with the three SDK-shape attrs and
+    the dispatcher stamps the derived marker as the final line of the
+    posted body — even though the ``ReplyDraft.body`` the adapter emitted
+    contained no marker string.
+    """
+    from types import SimpleNamespace
+
+    options = SimpleNamespace(tools=[], mcp_servers={}, setting_sources=[])
+    adapter = _MarkerOptionsAdapter(options=options, reply_body="agent said this")
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    await disp.dispatch(handle, _event(msg_id="m9"))
+
+    body = gateway.posts[0]["body"]
+    # The adapter's body is preserved verbatim (unedited by the harness) …
+    assert body.startswith("agent said this")
+    # … with the harness-derived marker appended as the final non-empty line.
+    tail = body.rstrip().splitlines()[-1]
+    assert tail == "<!-- source: tools=0 · mcp=0 · setting_sources=empty -->"
+
+
+@pytest.mark.anyio
+async def test_dispatcher_skips_marker_when_adapter_lacks_options_getter() -> None:
+    """An adapter without ``source_marker_options`` posts an unadorned body.
+
+    ``_ReplyingAdapter`` has no options getter, so the dispatcher does not
+    append a marker. This is the compatibility guarantee for test fakes and
+    for any adapter that is not SDK-backed — the marker is opt-in via the
+    getter, not forced by the dispatcher.
+    """
+    adapter = _ReplyingAdapter(reply_body="hello")
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    await disp.dispatch(handle, _event(msg_id="m1"))
+    assert gateway.posts[0]["body"] == "hello"
+    assert "<!-- source:" not in gateway.posts[0]["body"]
 
 
 def test_reply_sent_event_normalizes_missing_model_id() -> None:

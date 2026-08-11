@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from ..ports import AdapterRegistry, RoleAdapter, SpawnContext
+from ..source_marker import append_source_marker
 from ..value_objects import ChatroomEvent, Event, ReplyDraft, Role, SessionHandle, ThreadRef
 from .dedup import DEFAULT_DEDUP_SET_SIZE, EventDedup
 from .event_log import delivery_failed_event, reply_sent_event
@@ -175,10 +176,31 @@ class Dispatcher:
         handle = session.handle
         session.reply_seq += 1
         idempotency_key = f"{handle.session_id}:{session.reply_seq}"  # I5
+        # Harness-stamped source marker (msg-805 D3 / msg-834 §2). Derived
+        # from the ``ClaudeAgentOptions`` object the adapter actually handed
+        # to the SDK, retrieved through the adapter's public
+        # ``source_marker_options`` getter. Msg-834 §2 (c): this dispatch
+        # module — not any ``adapters/*`` module — imports the marker
+        # builder, so the SDK-facing side of the harness stays free of a
+        # marker-generating import.
+        #
+        # DUCK-TYPED (deliberate, not a formal ``RoleAdapter`` extension):
+        # not every adapter has ``ClaudeAgentOptions`` to expose — e.g.
+        # :class:`~spirrow_mindwire.adapters.naysayer_lexora.NaysayerLexoraAdapter`
+        # is a stateless HTTP client with no SDK-options object, and test
+        # fakes don't need one. Formalising the method on the ``RoleAdapter``
+        # Protocol (ADR-2026-05-21-06 §3.1) would force every adapter to
+        # implement a null getter, which is more coupling than the seam
+        # deserves. Adapters that do not expose the getter yield ``None``
+        # and the body posts unchanged — the marker is opt-in per adapter,
+        # by the presence of the getter.
+        options_getter = getattr(session.adapter, "source_marker_options", None)
+        options = options_getter(handle) if callable(options_getter) else None
+        body = append_source_marker(draft.body, options) if options is not None else draft.body
         posted_msg_id = await self._gateway.post_reply(
             handle.thread_ref,
             author=handle.instance_id,  # I3 v2.2 (ADR-06 amendment): author = instance_id
-            body=draft.body,
+            body=body,
             reply_to_msg_id=draft.reply_to_msg_id,
             idempotency_key=idempotency_key,
         )

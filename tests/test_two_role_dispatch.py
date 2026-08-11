@@ -216,9 +216,19 @@ async def test_proposer_then_naysayer_round_trip(tmp_path: Path) -> None:
     assert len(gateway.posts) == 1
     proposal_post = gateway.posts[0]
     assert proposal_post["author"] == "proposer-1"  # I3 v2.2: author = instance_id
-    assert proposal_post["body"] == "We should cache everything forever."
+    # The dispatcher stamps the harness-derived source marker on the body
+    # (msg-805 D3 / msg-834 §2). The agent's proposal is preserved verbatim;
+    # the marker is the trailing HTML-comment line.
+    assert proposal_post["body"].startswith("We should cache everything forever.")
+    assert proposal_post["body"].rstrip().splitlines()[-1].startswith("<!-- source:")
 
-    # 2) proposer's proposal → naysayer: the independent critic responds.
+    # 2) proposer's proposal → naysayer: the independent critic responds. The
+    # relayed body carries the proposal + its harness-appended source marker;
+    # the Lexora-backed naysayer here is a pre-SDK stateless HTTP adapter
+    # (no ``ClaudeAgentOptions`` object), so its post carries no marker —
+    # the dispatcher applies the marker only to adapters that expose
+    # ``source_marker_options`` (see the source-marker wiring tests in
+    # ``tests/test_dispatcher_core.py``).
     await disp.dispatch(
         naysayer,
         _new_message(
