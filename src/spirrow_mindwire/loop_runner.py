@@ -75,9 +75,11 @@ from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .config import MindwireSettings, NaysayerGatingConfig, Stage3LoopConfig, load_settings
+from .denial_record import render_denial
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
     EVENT_FIELD_AUTHOR,
+    EVENT_FIELD_DENIAL,
     EVENT_FIELD_ERROR,
     EVENT_KIND_DELIVERY_FAILED,
 )
@@ -345,14 +347,22 @@ def build_watches(cfg: Stage3LoopConfig) -> tuple[WatchSpec, ...]:
 
 
 async def _log_event_sink(event: Event) -> None:
-    """Observational event-log sink (I7): log reply.sent / delivery.failed."""
+    """Observational event-log sink (I7): log reply.sent / delivery.failed.
+
+    A denial record, when present, is rendered onto the same warning line. That
+    placement is the point: the sweep's quarantine record captures the *wrapper log
+    tail*, so a field that never reaches this line is a field nobody reads when a
+    session halts (``spec/design/T-denial-detail-and-overdeny.md``).
+    """
     author = event.fields.get(EVENT_FIELD_AUTHOR, "?")
     if event.kind == EVENT_KIND_DELIVERY_FAILED:
+        denial = event.fields.get(EVENT_FIELD_DENIAL)
         logger.warning(
-            "loop event %s author=%s error=%s",
+            "loop event %s author=%s error=%s%s",
             event.kind,
             author,
             event.fields.get(EVENT_FIELD_ERROR),
+            f" denial[{render_denial(denial)}]" if isinstance(denial, dict) else "",
         )
     else:
         logger.info("loop event %s author=%s", event.kind, author)

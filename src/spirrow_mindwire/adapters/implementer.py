@@ -60,6 +60,7 @@ from claude_agent_sdk import (
 
 from ..allowlist import Allowlist, AllowlistDecision, ClassifiedAction, Operation, default_allowlist
 from ..conductor.handoff import build_handoff_protocol_block
+from ..denial_record import build_denial_record
 from ..exceptions import (
     AdapterDeliveryError,
     AdapterHaltError,
@@ -182,11 +183,18 @@ class ImplementerSdkDeliveryError(AdapterDeliveryError):
 
 
 class ImplementerAllowlistError(ImplementerSdkDeliveryError):
-    """A tool call was denied by the allow-list → fail-loud halt (ADR-07 §2.3)."""
+    """A tool call was denied by the allow-list → fail-loud halt (ADR-07 §2.3).
+
+    ``denial_record`` carries the structured description of *what was attempted*
+    (``spec/design/T-denial-detail-and-overdeny.md``). It stays optional so the
+    error can still be raised on paths that have a decision but no action; a
+    ``None`` record degrades the log line, it does not break the halt.
+    """
 
     def __init__(self, message: str, *, decision: AllowlistDecision) -> None:
         super().__init__(message)
         self.decision = decision
+        self.denial_record: dict[str, object] | None = None
 
 
 class ImplementerSdkHaltError(AdapterHaltError):
@@ -635,10 +643,17 @@ _RAW_COARSE: tuple[tuple[re.Pattern[str], Operation], ...] = (
 
 
 def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
-    """Coarse raw-string scan for Tier C verbs (defence-in-depth, deny-only)."""
+    """Coarse raw-string scan for Tier C verbs (defence-in-depth, deny-only).
+
+    ``match_offset`` records where the keyword was found. It does not participate in
+    the verdict — it exists so a denial can say *where* in the command the floor
+    matched, which is what distinguishes "the command deletes" from "the command
+    writes a file that mentions deleting".
+    """
     for pattern, op in _RAW_COARSE:
-        if pattern.search(command):
-            return ClassifiedAction(op, detail=command)
+        hit = pattern.search(command)
+        if hit is not None:
+            return ClassifiedAction(op, detail=command, match_offset=hit.start())
     return None
 
 
@@ -700,13 +715,63 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     # Coarse defence-in-depth floor: only when indirection is present, and only if
     # at least as dangerous as the structural verdict — so it can ADD a denial the
     # tokenizer missed, never downgrade one (see _RAW_COARSE).
-    if _INDIRECTION_RE.search(command):
+    gate_open = bool(_INDIRECTION_RE.search(command))
+    if gate_open:
         coarse = _scan_raw_coarse(command)
         if coarse is not None and _DANGER_RANK.get(coarse.operation, 0) >= _DANGER_RANK.get(
             candidate.operation, 0
         ):
-            return coarse
-    return candidate
+            return _with_provenance(coarse, command, candidate, gate_open, _depth)
+    return _with_provenance(candidate, command, candidate, gate_open, _depth)
+
+
+def _with_provenance(
+    chosen: ClassifiedAction,
+    command: str,
+    structural: ClassifiedAction,
+    gate_open: bool,
+    depth: int,
+) -> ClassifiedAction:
+    """Attach provenance to the verdict of a top-level classify (spec A3/A4/A5/A10).
+
+    Returns ``chosen`` untouched at recursion depth > 0: only the outermost call
+    describes "how this command was judged", and stamping inner results would make
+    the reported rule refer to a fragment rather than to the command that was denied.
+
+    Provenance is derived from values the classifier has already computed — nothing
+    here re-runs a matcher or can change ``chosen.operation``.
+    """
+    if depth > 0:
+        return chosen
+    from_floor = chosen is not structural
+    if not from_floor:
+        # No floor verdict to corroborate; the structural pass stands alone.
+        corroborated = "unknown"
+    elif _tokenizer_degraded(command):
+        # The structural pass fell back to a naive split, so "the structure agrees"
+        # is not a claim we can make either way.
+        corroborated = "unknown"
+    else:
+        corroborated = "yes" if structural.operation is chosen.operation else "no"
+    return replace(
+        chosen,
+        rule_id="raw_coarse" if from_floor else "structural",
+        corroborated=corroborated,
+        indirection_gate=gate_open,
+    )
+
+
+def _tokenizer_degraded(command: str) -> bool:
+    """True when ``shlex`` cannot tokenise ``command`` (unbalanced quotes etc.).
+
+    Mirrors the fallback in :func:`_classify_single_bash`; used only to decide
+    whether ``corroborated`` can be asserted, never to classify.
+    """
+    try:
+        shlex.split(command, posix=True)
+    except ValueError:
+        return True
+    return False
 
 
 # MCP read operations are POSITIVELY enumerated (§B.2 default-deny): anything not
@@ -776,7 +841,22 @@ def classify_tool_call(tool_name: str, tool_input: dict[str, Any]) -> Classified
 
     Unknown tools map to :attr:`Operation.UNKNOWN`, which the default-deny
     allow-list rejects (fail-loud).
+
+    Every branch except ``Bash`` decides from the tool name and its declared
+    arguments, so their ``rule_id`` is stamped here; ``Bash`` is the only path that
+    parses free text and it stamps its own (``structural`` vs ``raw_coarse``) inside
+    :func:`_classify_bash`.
     """
+    if tool_name == "Bash":
+        return _classify_bash(str(tool_input.get("command", "")))
+    action = _classify_non_bash(tool_name, tool_input)
+    # `_classify_mcp` stamps its own; everything else here decided from the path /
+    # tool name, so fill that in without clobbering a more specific value.
+    return action if action.rule_id else replace(action, rule_id="path")
+
+
+def _classify_non_bash(tool_name: str, tool_input: dict[str, Any]) -> ClassifiedAction:
+    """Tool-name / argument based classification (everything except ``Bash``)."""
     if tool_name in ("Write", "Edit", "MultiEdit"):
         path = tool_input.get("file_path") or tool_input.get("path")
         return ClassifiedAction(Operation.FS_WRITE, path=path, detail=str(path))
@@ -787,12 +867,10 @@ def classify_tool_call(tool_name: str, tool_input: dict[str, Any]) -> Classified
         return ClassifiedAction(Operation.FS_READ, path=tool_input.get("file_path"))
     if tool_name in ("Glob", "Grep"):
         return ClassifiedAction(Operation.SEARCH, detail=tool_name)
-    if tool_name == "Bash":
-        return _classify_bash(str(tool_input.get("command", "")))
     if tool_name in _BENIGN_BUILTIN_TOOLS:
         return ClassifiedAction(Operation.EXEC_CODE, detail=tool_name)
     if tool_name.startswith("mcp__"):
-        return _classify_mcp(tool_name, tool_input)
+        return replace(_classify_mcp(tool_name, tool_input), rule_id="mcp")
     return ClassifiedAction(Operation.UNKNOWN, detail=tool_name)
 
 
@@ -845,6 +923,11 @@ class _AllowlistGuard:
     def __init__(self, allowlist: Allowlist) -> None:
         self._allowlist = allowlist
         self.violations: list[AllowlistDecision] = []
+        # The action alongside each violation. Kept in step with `violations` (same
+        # index) rather than replacing it, so existing readers of `violations` are
+        # untouched. The decision says which rule fired; only the action knows what
+        # was attempted, and dropping it is the defect this record exists to fix.
+        self.violation_actions: list[ClassifiedAction] = []
 
     def _enrich(self, action: ClassifiedAction) -> ClassifiedAction:
         """Fill an unparsed branch/target from the repo's current branch.
@@ -884,6 +967,7 @@ class _AllowlistGuard:
         if decision.allowed:
             return PermissionResultAllow()
         self.violations.append(decision)
+        self.violation_actions.append(action)
         return PermissionResultDeny(message=decision.reason, interrupt=True)
 
 
@@ -1184,9 +1268,9 @@ class ImplementerSdkAdapter:
                     message=decision.reason,
                     raised_at=datetime.now(UTC),
                 )
-                raise ImplementerAllowlistError(
-                    f"allow-list denied {decision.operation.value}: {decision.reason}",
-                    decision=decision,
+                raise _violation(
+                    decision,
+                    guard.violation_actions[-1] if guard.violation_actions else None,
                 ) from exc
             session.error = ErrorInfo(
                 code="adapter.delivery_failed",
@@ -1236,10 +1320,21 @@ class ImplementerSdkAdapter:
         )
 
 
-def _violation(decision: AllowlistDecision) -> ImplementerAllowlistError:
-    return ImplementerAllowlistError(
+def _violation(
+    decision: AllowlistDecision, action: ClassifiedAction | None = None
+) -> ImplementerAllowlistError:
+    """Build the halt error for a denial, carrying the structured record (spec S3).
+
+    The message text is deliberately **unchanged** — the sink for the record is the
+    `delivery.failed` event's structured fields, so nothing that reads or matches on
+    this string needs to know about the record (spec S1, "sink has fields" branch).
+    """
+    err = ImplementerAllowlistError(
         f"allow-list denied {decision.operation.value}: {decision.reason}", decision=decision
     )
+    if action is not None:
+        err.denial_record = build_denial_record(decision, action)
+    return err
 
 
 __all__ = [
