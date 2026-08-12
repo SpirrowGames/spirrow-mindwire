@@ -120,6 +120,29 @@ class ClassifiedAction:
 
     Produced by the SDK-tool classifier (``adapters.implementer``); ``check``
     consumes it. ``detail`` carries the raw command / path for messages.
+
+    The trailing four fields are *provenance*, not inputs to the verdict: ``check``
+    never reads them, so setting them cannot change an allow/deny outcome. They exist
+    because a denial used to report which rule fired and nothing about the act that
+    tripped it (see ``spec/design/T-denial-detail-and-overdeny.md``):
+
+    ``rule_id``
+        which classifier produced the verdict — ``structural`` / ``raw_coarse`` /
+        ``mcp`` / ``path``. Distinguishing these is the whole diagnostic question:
+        ``raw_coarse`` matches the *raw text*, so it can fire on a command that
+        merely mentions a Tier C verb, while ``structural`` means the command really
+        parsed to that operation.
+    ``corroborated``
+        ``"yes"`` / ``"no"`` / ``"unknown"`` — whether the structural pass
+        independently reached the same danger as the coarse floor. Not a bool: the
+        third state is real (tokenizer degraded, or the floor never ran) and folding
+        it into a bool would invent a certainty we do not have.
+    ``match_offset``
+        index into ``detail`` where the deciding match started; ``-1`` when the
+        verdict carries no offset.
+    ``indirection_gate``
+        whether ``_INDIRECTION_RE`` fired, i.e. whether the coarse floor was even
+        eligible to run.
     """
 
     operation: Operation
@@ -129,6 +152,10 @@ class ClassifiedAction:
     target: str | None = None
     force: bool = False
     detail: str = ""
+    rule_id: str = ""
+    corroborated: str = ""
+    match_offset: int = -1
+    indirection_gate: bool = False
 
 
 class AllowlistConfigError(ValueError):
