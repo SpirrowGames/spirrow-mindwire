@@ -219,6 +219,69 @@ class ReplyDraft:
 
 
 # --------------------------------------------------------------------------- #
+# Preflight attestation (P-1b — msg-953 §2, Tier-C msg-954 §3)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class AttestationRecord:
+    """A server-side **observation** of where a session's inference resolved.
+
+    Epistemically distinct from the source marker, and that distinction is the
+    entire reason it renders on its own line (Tier-C msg-954 §3: "``attest:``
+    を別行に分離 (観測結果は ``source:`` と認識論的地位が違う)"):
+
+    - ``source:`` re-states **how the session was configured**. Every field is
+      a tautology over the options object (:mod:`spirrow_mindwire.source_marker`
+      D1). It can be rendered without asking anything of anyone.
+    - ``attest:`` reports **what a server-side accounting record said** after a
+      preflight request was actually made. It is an observation, it can fail,
+      and it is absent whenever no preflight ran.
+
+    **Never populated from model output.** msg-953 §1.3 measured the reason
+    with server-side ground truth: the same Gemini backend answered "I am part
+    of the Claude model family" under one system prompt and "I am a member of
+    the Gemini model family" under another, while the cost row recorded
+    ``backend: gemini`` in both cases. Self-report is not unstable, it is
+    *steerable* — and we are the ones steering it, via our own
+    ``system_prompt``. The accounting row is the only thing in the loop the
+    model cannot write. **The row wins.**
+
+    ``backend`` and ``expected`` are separate fields on purpose. P-2 fails
+    closed on a mismatch, so a mismatching record should not normally reach a
+    post; rendering both regardless means the line can never be read as
+    "verified" from its shape alone — a reader compares the two values.
+
+    Fields
+    ------
+    tier
+        The model alias requested (``options.model``), e.g. ``naysayer``.
+    backend
+        The backend name the server's own accounting row attributed the
+        request to, e.g. ``gemini``. **Read back from the server, never from
+        the response body.**
+    expected
+        The backend the configuration says ``tier`` should resolve to. The
+        single SOT for this value lives with the naysayer principles (P-2).
+    route
+        The authority (``host:port``) the preflight was sent to — same
+        normalisation as the ``source:`` line's ``route`` field.
+    probe
+        An identifier for the accounting row that was read back (e.g.
+        ``cost-row#5992``), so a human can re-open the same evidence.
+    at
+        When the observation was made. Timezone-aware; rendered in UTC.
+    """
+
+    tier: str
+    backend: str
+    expected: str
+    route: str
+    probe: str
+    at: datetime
+
+
+# --------------------------------------------------------------------------- #
 # §2.5 HealthStatus / ErrorInfo
 # --------------------------------------------------------------------------- #
 
@@ -285,6 +348,7 @@ class Event:
 
 
 __all__ = [
+    "AttestationRecord",
     "Capability",
     "ChatroomEvent",
     "ErrorInfo",

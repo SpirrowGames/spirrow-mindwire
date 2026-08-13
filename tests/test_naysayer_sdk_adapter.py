@@ -256,6 +256,86 @@ async def test_deliver_event_posts_critique(tmp_path: Path) -> None:
     assert (await adapter.health(handle)).state is SessionState.IDLE
 
 
+# --------------------------------------------------------------------------- #
+# P-1c — stop discarding the ResultMessage (msg-953 §2 P-1c, Tier-C msg-954 §3)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_reply_metadata_retains_sdk_session_facts(tmp_path: Path) -> None:
+    """``_drain_reply`` no longer throws the ``ResultMessage`` away.
+
+    Before this change the adapter read ``is_error`` and dropped the rest, so
+    ``session_id`` / ``duration_ms`` / ``num_turns`` never reached the event
+    log and a turn left no operational trace at all (msg-950 §2 / msg-951 §5).
+    """
+    captured: list[ReplyDraft] = []
+    client = _FakeClient([_assistant("critique"), _result()])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, []),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
+    await adapter.deliver_event(handle, _event())
+
+    meta = captured[0].adapter_metadata
+    assert meta["sdk_session_id"] == "test"
+    assert meta["sdk_duration_ms"] == 10
+    assert meta["sdk_num_turns"] == 1
+
+
+@pytest.mark.anyio
+async def test_reply_metadata_never_carries_the_model_echo(tmp_path: Path) -> None:
+    """★ The ``model`` field is deliberately NOT retained.
+
+    Tier-C msg-954 §3: "``.model`` は tier のエコーなので provenance に使わ
+    ない". Lexora answers an Anthropic-compatible request by echoing the tier
+    alias (``"naysayer"``), never the concrete backend model — measured in
+    msg-950 §2. Recording it would put a value that LOOKS like provenance
+    into the event log's ``model_id`` field, which is precisely the overclaim
+    this whole thread exists to remove. The value of P-1c is operational
+    observability, not proof of independence.
+
+    An ``AssistantMessage`` in this fake carries ``model="gemini"``, so a
+    naive "keep everything" implementation would leak exactly the misleading
+    datum. Pinning the absence is the point of this test.
+    """
+    captured: list[ReplyDraft] = []
+    client = _FakeClient([_assistant("critique"), _result()])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, []),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
+    await adapter.deliver_event(handle, _event())
+
+    meta = captured[0].adapter_metadata
+    assert "model" not in meta
+    assert "model_id" not in meta
+    assert "sdk_model" not in meta
+    assert "gemini" not in repr(meta)
+
+
+@pytest.mark.anyio
+async def test_reply_body_is_unchanged_by_result_retention(tmp_path: Path) -> None:
+    """Retaining the ``ResultMessage`` must not alter the posted critique text."""
+    captured: list[ReplyDraft] = []
+    client = _FakeClient([_assistant("a"), _assistant("b"), _result()])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, []),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
+    await adapter.deliver_event(handle, _event())
+    assert captured[0].body == "ab"
+
+
 @pytest.mark.anyio
 async def test_self_post_is_filtered(tmp_path: Path) -> None:
     captured: list[ReplyDraft] = []
