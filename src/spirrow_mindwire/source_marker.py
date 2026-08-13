@@ -46,13 +46,19 @@ never effect claims:
                       observation record).
     route           = the authority (``host:port``) of
                       ``options.env["ANTHROPIC_BASE_URL"]``; "unset" if the
-                      key is absent, "empty" if present but empty. It says
+                      key is absent, "empty" if present but empty,
+                      "redacted" if present but not safely parseable. It says
                       **the session was constructed to send inference to
                       that host:port**; it does NOT say "that host
                       answered". Path / query / userinfo are stripped —
                       partly because they are noise, and partly because a
                       base URL may carry an inline credential and this line
                       lands in a durable, widely-readable chatroom post.
+                      ``route=redacted`` is that guard firing: the value could
+                      not be reduced to an authority without risking printing
+                      the credential, so nothing is printed. It says **a base
+                      URL was set and is malformed**; it does NOT say the
+                      variable was missing (that is ``unset`` / ``empty``).
     tier            = ``options.model``, i.e. the model alias REQUESTED;
                       "unset" if no model kwarg was passed. It does NOT say
                       which backend processed the request. Lexora echoes the
@@ -108,6 +114,11 @@ ATTESTATION_MARKER_SUFFIX = "-->"
 # inlined so the marker and the adapter that sets it are greppable together.
 _BASE_URL_ENV_KEY = "ANTHROPIC_BASE_URL"
 
+# Rendered for ``route`` when the base URL was set but its userinfo boundary
+# could not be resolved (see ``_route_authority``). A reader greps this to find
+# posts made under a malformed — possibly credential-bearing — base URL.
+_ROUTE_REDACTED = "redacted"
+
 # U+00B7 MIDDLE DOT with a single ASCII space on each side. Chosen so the
 # separator does not collide with the ``=`` in a field value; the exact form
 # is what msg-805 quotes ("tools=0 · mcp=0 · setting_sources=unset").
@@ -156,8 +167,12 @@ def _setting_sources_value(options: Any) -> str:
     return "+".join(str(x) for x in src)
 
 
-def _route_authority(raw: str) -> str:
+def _route_authority(raw: str) -> str | None:
     """Reduce a base-URL string to its ``host:port`` authority.
+
+    Returns ``None`` when the userinfo boundary cannot be resolved — see the
+    fail-closed rule below. ``None`` is a third outcome, distinct from the
+    empty string (which means the value reduced to no authority at all).
 
     Hand-rolled rather than :func:`urllib.parse.urlsplit` because the input is
     an operator-supplied env value, not a guaranteed-well-formed URL, and
@@ -167,29 +182,62 @@ def _route_authority(raw: str) -> str:
     would print nothing at all for a value that was in fact configured. The
     reader needs to see what was set, including when it was set wrong.
 
-    The three reductions, in order:
+    The reductions, in order:
 
     1. drop everything up to and including ``://`` (the scheme)
-    2. cut at the first ``/``, ``?`` or ``#`` (path / query / fragment)
-    3. drop everything up to and including the last ``@`` (userinfo)
+    2. split at the first ``/``, ``?`` or ``#`` into authority + tail
+       (path / query / fragment)
+    3. **fail closed if the discarded tail still contains a ``@``**
+    4. drop everything up to and including the last ``@`` (userinfo)
 
-    Step 3 is a **credential guard**, not cosmetics: a base URL of the form
-    ``https://user:token@host/`` would otherwise copy a live secret into a
-    durable chatroom post. Step 3 runs after step 2 so a ``@`` appearing in a
-    path can never be mistaken for a userinfo delimiter.
+    Steps 3-4 are a **credential guard**, not cosmetics: a base URL of the
+    form ``https://user:token@host/`` would otherwise copy a live secret into
+    a durable chatroom post.
+
+    **Why step 3 exists (PR #142 Tier B blocking).** Step 4 alone is only
+    sound when the operator wrote a well-formed URL. A password containing a
+    raw ``/``, ``?`` or ``#`` — a common env-var misconfiguration — moves the
+    userinfo ``@`` past step 2's cut, so the cut lands *inside the credential*
+    and step 4 then finds no ``@`` to remove. Measured on the pre-fix code:
+    ``https://admin:p/assword@api.internal:8443/`` rendered ``admin:p``, i.e.
+    the guard printed the secret it exists to suppress.
+
+    Step 3 detects exactly that class, and does so by construction rather than
+    by heuristic: userinfo is delimited by an ``@`` that necessarily follows
+    the *whole* credential, so if step 2's cut ever lands inside the userinfo,
+    that delimiting ``@`` is necessarily still in the discarded tail. "A ``@``
+    survives in the tail" therefore covers every ordering that can leak.
+
+    The converse does not hold — a genuine ``@`` in a path (
+    ``https://host:8443/path@v2``) produces the same string shape as a
+    password containing ``/``, and nothing in the string distinguishes them.
+    That case is redacted as well. Losing the route display for an unusual but
+    valid URL is the cheaper error: msg-957, "if the parser cannot safely
+    disambiguate the userinfo boundary, it must fail closed or redact
+    aggressively, not silently print the secret."
     """
     value = raw.strip()
     scheme_sep = value.find("://")
     if scheme_sep != -1:
         value = value[scheme_sep + 3 :]
+    tail = ""
     for sep in ("/", "?", "#"):
         idx = value.find(sep)
         if idx != -1:
+            tail += value[idx:]
             value = value[:idx]
+    if "@" in tail:
+        # The cut may have landed inside a credential. Unresolvable → redact.
+        return None
     at = value.rfind("@")
-    if at != -1:
-        value = value[at + 1 :]
-    return value
+    if at == -1:
+        return value
+    value = value[at + 1 :]
+    # Userinfo consumed the entire value (e.g. "https://user:token@"). Do not
+    # return "" — the caller renders that as ``route=empty``, which the legend
+    # reserves as the fingerprint of a MISSING base URL. A credential-bearing
+    # value must not forge that fingerprint.
+    return value or None
 
 
 def _route_field(options: Any) -> str:
@@ -202,6 +250,13 @@ def _route_field(options: Any) -> str:
     when ``MINDWIRE_NAYSAYER_BASE_URL`` is missing, so ``route=empty`` is the
     fingerprint of that specific misconfiguration rather than of an adapter
     that simply never sets the variable.
+
+    ``redacted`` is the third failure value: a base URL was set, but its
+    userinfo boundary could not be resolved, so printing any part of it risked
+    printing a credential (see :func:`_route_authority`). It is deliberately
+    its own token — collapsing it onto ``unset`` or ``empty`` would tell the
+    reader the variable was missing when in fact it was set wrong, and those
+    two states need different repairs.
     """
     env = getattr(options, "env", None)
     if not isinstance(env, dict):
@@ -210,6 +265,8 @@ def _route_field(options: Any) -> str:
     if raw is None:
         return "route=unset"
     authority = _route_authority(str(raw))
+    if authority is None:
+        return f"route={_ROUTE_REDACTED}"
     return f"route={authority}" if authority else "route=empty"
 
 

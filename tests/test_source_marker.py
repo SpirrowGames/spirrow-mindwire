@@ -333,6 +333,124 @@ def test_marker_route_strips_path_query_and_credentials() -> None:
     assert "k=v" not in marker
 
 
+# --------------------------------------------------------------------------- #
+# PR #142 Tier B blocking — the credential guard must not depend on the
+# operator having written a well-formed URL.
+#
+# The guard's original form cut the path/query/fragment BEFORE removing the
+# userinfo, so a password containing a raw "/", "?" or "#" moved the userinfo
+# "@" past the cut point: the cut landed inside the credential and the "@" that
+# would have removed it was thrown away with the tail. Measured on the shipped
+# code: "https://admin:p/assword@api.internal:8443/" rendered "route=admin:p".
+#
+# The detector is exact, not heuristic: userinfo is delimited by an "@" that
+# necessarily follows the whole credential, so if the cut ever lands inside the
+# userinfo, that "@" is necessarily still in the discarded tail. "an @ survives
+# in the tail" therefore covers every ordering that can leak — at the price of
+# also firing on a genuine "@" in a path/query, which is indistinguishable from
+# the leaking shape by construction. That case fails closed (msg-957: "if the
+# parser cannot safely disambiguate the userinfo boundary, it must fail closed
+# or redact aggressively, not silently print the secret").
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # --- ambiguous → redacted ------------------------------------------ #
+        # msg-957's example verbatim: raw "/" inside the password.
+        ("https://admin:p/assword@api.internal:8443/", "route=redacted"),
+        # Same defect via the other two cut characters.
+        ("https://admin:p?assword@api.internal:8443/", "route=redacted"),
+        ("https://admin:p#assword@api.internal:8443/", "route=redacted"),
+        # Raw "/" AND a raw "@" in the password: the old code leaked a middle
+        # slice of the password ("ss"), not merely a prefix.
+        ("https://admin:p@ss/word@api.internal:8443/", "route=redacted"),
+        # A "://" inside the password fools the scheme step as well as the cut.
+        ("https://admin:pa://ss@api.internal:8443/", "route=redacted"),
+        # A genuine "@" in the path is the same string shape as a password
+        # containing "/" — unresolvable, so it fails closed too.
+        ("https://api.internal:8443/path@v2", "route=redacted"),
+        ("https://api.internal:8443/v1?to=a@b", "route=redacted"),
+        # Userinfo consumed the entire value. Rendering "empty" here would
+        # forge the fingerprint the legend reserves for a MISSING
+        # MINDWIRE_NAYSAYER_BASE_URL, so a credential-bearing value must never
+        # collapse onto it.
+        ("https://user:tok@", "route=redacted"),
+        # --- unambiguous → unchanged --------------------------------------- #
+        # No "@" survives the cut, so the authority is knowable. RFC 3986 says
+        # the LAST "@" of the authority delimits userinfo, so a password
+        # containing "@" is still handled exactly.
+        ("https://user:pa@ss@api.internal:8443/v1", "route=api.internal:8443"),
+        # IPv6 literals cannot contain "@", "/", "?" or "#", so the bracketed
+        # host survives both steps with and without userinfo.
+        ("http://[::1]:8443/v1", "route=[::1]:8443"),
+        ("http://user:tok@[::1]:8443/v1", "route=[::1]:8443"),
+        ("https://api.internal:8443/v1", "route=api.internal:8443"),
+    ],
+    ids=(
+        "slash-in-password",
+        "question-in-password",
+        "hash-in-password",
+        "at-and-slash-in-password",
+        "scheme-sep-in-password",
+        "at-in-path",
+        "at-in-query",
+        "userinfo-only",
+        "at-in-password-well-formed",
+        "ipv6",
+        "ipv6-with-userinfo",
+        "plain",
+    ),
+)
+def test_marker_route_fails_closed_when_userinfo_boundary_is_ambiguous(
+    raw: str, expected: str
+) -> None:
+    """A malformed base URL must redact, never print a credential fragment."""
+    assert expected in render_source_marker(_options(env={"ANTHROPIC_BASE_URL": raw}))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "https://admin:Xk9tr0ub4dor/x@api.internal:8443/",
+        "https://admin:Xk9tr0ub4dor?x@api.internal:8443/",
+        "https://admin:Xk9tr0ub4dor#x@api.internal:8443/",
+        "https://admin:Xk9tr0ub4dor@x/y@api.internal:8443/",
+        "https://admin:Xk9tr0ub4dor://x@api.internal:8443/",
+        "https://admin:Xk9tr0ub4dor@api.internal:8443/v1",
+        "admin:Xk9tr0ub4dor@api.internal:8443",
+        "https://admin:Xk9tr0ub4dor@",
+    ],
+    ids=(
+        "slash",
+        "question",
+        "hash",
+        "at-then-slash",
+        "scheme-sep",
+        "well-formed",
+        "schemeless",
+        "userinfo-only",
+    ),
+)
+def test_marker_never_renders_any_part_of_the_password(raw: str) -> None:
+    """The property behind the table: no substring of the secret is ever shown.
+
+    Asserting on the rendered marker rather than on ``_route_authority`` keeps
+    the guarantee at the surface that actually lands in a durable chatroom
+    post. Every prefix of the password is checked, because the shipped defect
+    leaked a *prefix* ("admin:p") and one variant leaked an interior *slice* —
+    an equality assertion against one expected string would have missed both.
+    The password is deliberately spelled with characters absent from the
+    marker's own legend, so a one-character prefix still measures a leak
+    rather than the alphabet.
+    """
+    marker = render_source_marker(_options(env={"ANTHROPIC_BASE_URL": raw}))
+    secret = "Xk9tr0ub4dor"
+    for end in range(1, len(secret) + 1):
+        assert secret[:end] not in marker, f"leaked {secret[:end]!r} via {marker}"
+
+
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
