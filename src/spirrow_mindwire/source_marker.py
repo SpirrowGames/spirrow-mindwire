@@ -352,30 +352,58 @@ def append_source_marker(body: str, options: Any) -> str:
 
 def append_markers(
     body: str,
-    options: Any,
+    options: Any | None,
     attestation: AttestationRecord | None = None,
 ) -> str:
-    """Append the harness marker block: ``source:`` always, ``attest:`` if present.
+    """Append the harness marker block: each line rendered iff its input exists.
 
     The dispatcher's single entry point, so the "marker builder lives in one
     module" condition (msg-834 §2 (a)) still holds with two markers: the caller
     never joins lines itself.
 
-    The attestation goes on the line **directly below** the source marker
-    (single newline, so the two read as one audit block) and only when a record
-    was supplied. ``attestation=None`` returns a result byte-identical to
-    :func:`append_source_marker` — which is what makes P-1 a no-behaviour-change
-    landing: nothing produces an ``AttestationRecord`` until P-2, so no live
-    post grows an ``attest:`` line from this change alone.
+    **The two lines are independent** (T-pr-review-142 msg-960). Either may be
+    absent, and the other still renders:
 
-    "No observation" must render as *nothing*. An empty or partial ``attest:``
-    line would be worse than none at all, because a reader could take its mere
-    presence for verification.
+    - ``options`` present, ``attestation`` absent — today's production shape.
+      Byte-identical to :func:`append_source_marker`, which is what makes P-1 a
+      no-behaviour-change landing: nothing produces an ``AttestationRecord``
+      until P-2, so no live post grows an ``attest:`` line from this alone.
+    - ``options`` absent, ``attestation`` present — an adapter that has a
+      preflight observation but no SDK options object to restate.
+      :class:`~spirrow_mindwire.adapters.naysayer_lexora.NaysayerLexoraAdapter`
+      is exactly that: a stateless HTTP client, and the owner of the
+      ``LexoraClient`` P-2's preflight reuses. Gating the observation on the
+      configuration would have meant proving provenance required first exposing
+      a mockable ``source:`` line — inverting the epistemic separation Tier-C
+      msg-954 §3 introduced these two lines to preserve.
+    - both absent — ``body`` is returned **byte-identical**, untouched, so the
+      dispatcher can call this unconditionally rather than guard the call. The
+      guard is what coupled the two lines in the first place.
+
+    Absence renders as *nothing*, in both directions. A partial ``attest:``
+    line would be worse than none, because a reader could take its mere
+    presence for verification; and an all-``unset`` ``source:`` line
+    synthesised from absent options would be worse still — ``tools=0`` and
+    ``mcp=0`` would assert facts about a configuration that was never read,
+    which is precisely the D1 tautology contract inverted into an invention.
+
+    When both are present the attestation goes on the line **directly below**
+    the source marker (single newline), so the two read as one audit block.
     """
-    stamped = append_source_marker(body, options)
-    if attestation is None:
-        return stamped
-    return f"{stamped}\n{render_attestation_marker(attestation)}"
+    markers = [
+        marker
+        for marker in (
+            render_source_marker(options) if options is not None else None,
+            render_attestation_marker(attestation) if attestation is not None else None,
+        )
+        if marker is not None
+    ]
+    if not markers:
+        return body
+    block = "\n".join(markers)
+    if not body:
+        return block
+    return f"{body.rstrip()}\n\n{block}"
 
 
 __all__ = [

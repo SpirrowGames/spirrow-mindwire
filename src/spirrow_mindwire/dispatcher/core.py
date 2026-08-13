@@ -199,16 +199,22 @@ class Dispatcher:
         # ``attestation_record`` carries the preflight OBSERVATION. It is a
         # separate getter from ``source_marker_options`` for the same reason it
         # renders on a separate line — configuration and observation are
-        # different kinds of claim, and an adapter may well have the first and
-        # not the second. No adapter defines it until P-2, so today this
-        # branch is inert and every post keeps its current shape.
+        # different kinds of claim. No adapter defines it until P-2, so today
+        # this branch is inert and every post keeps its current shape.
+        #
+        # The two getters are looked up INDEPENDENTLY and neither gates the
+        # other (T-pr-review-142 msg-960). An adapter may have either, both, or
+        # neither: ``NaysayerLexoraAdapter`` above has no options object at all,
+        # yet it owns the ``LexoraClient`` that P-2's preflight reuses, so
+        # "record but no options" is the shape P-2 lands on. ``append_markers``
+        # is total over both being ``None`` — it returns the body byte-identical
+        # — so this call is unconditional. An ``if`` here is exactly what
+        # silently discarded the attestation of an options-less adapter before.
         options_getter = getattr(session.adapter, "source_marker_options", None)
         options = options_getter(handle) if callable(options_getter) else None
         attestation_getter = getattr(session.adapter, "attestation_record", None)
         attestation = attestation_getter(handle) if callable(attestation_getter) else None
-        body = (
-            append_markers(draft.body, options, attestation) if options is not None else draft.body
-        )
+        body = append_markers(draft.body, options, attestation)
         posted_msg_id = await self._gateway.post_reply(
             handle.thread_ref,
             author=handle.instance_id,  # I3 v2.2 (ADR-06 amendment): author = instance_id

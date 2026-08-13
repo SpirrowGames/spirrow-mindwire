@@ -552,6 +552,82 @@ async def test_dispatcher_omits_attestation_line_when_record_getter_returns_none
     assert "<!-- attest:" not in gateway.posts[0]["body"]
 
 
+class _AttestationOnlyAdapter(_ReplyingAdapter):
+    """Adapter with ``attestation_record`` and NO ``source_marker_options``.
+
+    Not hypothetical: ``NaysayerLexoraAdapter`` is a stateless HTTP client
+    with no SDK-options object (it defines no options getter — see the
+    dispatcher comment naming it), and it owns the ``LexoraClient`` that
+    P-2's preflight reuses. So this is the shape P-2 produces the moment it
+    hangs a record on the adapter that owns the transport.
+    """
+
+    def __init__(self, *, record: Any, reply_body: str = "hello") -> None:
+        super().__init__(reply_body=reply_body)
+        self._record = record
+
+    def attestation_record(self, handle: SessionHandle) -> Any:
+        _ = handle
+        return self._record
+
+
+@pytest.mark.anyio
+async def test_dispatcher_stamps_attestation_when_adapter_has_no_options_getter() -> None:
+    """The observation renders even with no configuration to render beside it.
+
+    Blocking objection, T-pr-review-142 msg-960: the dispatcher gated the
+    ``attest:`` line on ``options is not None``, so an adapter exposing only
+    ``attestation_record`` had its attestation **silently discarded**. That
+    inverts Tier-C msg-954 §3 — proving provenance would have required first
+    exposing a mockable configuration marker.
+    """
+    from datetime import datetime as _dt
+
+    from spirrow_mindwire.value_objects import AttestationRecord
+
+    record = AttestationRecord(
+        tier="naysayer",
+        backend="gemini",
+        expected="gemini",
+        route="100.79.84.62:8110",
+        probe="cost-row#5992",
+        at=_dt(2026, 8, 13, 0, 23, 48, tzinfo=UTC),
+    )
+    adapter = _AttestationOnlyAdapter(record=record, reply_body="agent said this")
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    await disp.dispatch(handle, _event(msg_id="m13"))
+
+    lines = gateway.posts[0]["body"].rstrip().splitlines()
+    assert lines[0] == "agent said this"
+    assert lines[-1] == (
+        "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
+        "· route=100.79.84.62:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->"
+    )
+    # And no invented configuration line: this adapter has no options at all,
+    # so a ``source:`` line here would be fiction, not a tautology (D1).
+    assert "<!-- source:" not in gateway.posts[0]["body"]
+
+
+@pytest.mark.anyio
+async def test_dispatcher_posts_bare_body_when_adapter_has_neither_getter() -> None:
+    """Both getters absent → the drafted body posts byte-identical.
+
+    Pins the compatibility half of the same change: making the ``attest:``
+    line independent of ``options`` must not start stamping anything on
+    adapters that expose neither getter (every test fake, and every non-SDK
+    adapter today).
+    """
+    adapter = _AttestationOnlyAdapter(record=None, reply_body="agent said this")
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    await disp.dispatch(handle, _event(msg_id="m14"))
+
+    assert gateway.posts[0]["body"] == "agent said this"
+
+
 @pytest.mark.anyio
 async def test_dispatcher_skips_marker_when_adapter_lacks_options_getter() -> None:
     """An adapter without ``source_marker_options`` posts an unadorned body.

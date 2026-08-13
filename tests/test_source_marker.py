@@ -529,6 +529,81 @@ def test_append_markers_omits_attestation_line_when_absent() -> None:
     assert ATTESTATION_MARKER_PREFIX not in append_markers("body", opts, None)
 
 
+# --------------------------------------------------------------------------- #
+# P-1b r2 (T-pr-review-142 msg-960) — the two markers are INDEPENDENT
+#
+# Observation must not need configuration's permission to be rendered. An
+# adapter can have a preflight record and no SDK options object at all —
+# ``NaysayerLexoraAdapter`` is exactly that shape ("a stateless HTTP client
+# with no SDK-options object", per ``dispatcher/core.py``), and it owns the
+# ``LexoraClient`` that P-2's preflight reuses. Coupling the ``attest:`` line
+# to the presence of ``source:`` would mean proving provenance requires first
+# exposing mockable configuration — the epistemic inversion Tier-C msg-954 §3
+# ("認識論的地位が違う") separates the lines to avoid.
+# --------------------------------------------------------------------------- #
+
+
+def test_append_markers_renders_the_attestation_when_options_is_none() -> None:
+    """``options=None`` + a record → the ``attest:`` line still lands.
+
+    The blocking objection in msg-960: an adapter exposing only
+    ``attestation_record`` had its observation silently discarded.
+    """
+    stamped = append_markers("critique body", None, _attestation())
+    lines = stamped.rstrip().splitlines()
+    assert lines[0] == "critique body"
+    assert lines[-1] == render_attestation_marker(_attestation())
+    # Separated from the body by a blank line, exactly like the source marker,
+    # so a markdown viewer renders it as its own (invisible) paragraph.
+    assert stamped == f"critique body\n\n{render_attestation_marker(_attestation())}"
+
+
+def test_append_markers_does_not_fabricate_a_source_line_from_absent_options() -> None:
+    """No options → NO ``source:`` line. Not an all-``unset`` one.
+
+    The trap in the naive fix. ``render_source_marker(None)`` happily returns
+    ``tools=0 · mcp=0 · setting_sources=unset · route=unset · tier=unset`` —
+    which asserts ``tools=0`` and ``mcp=0`` as facts about a session whose
+    configuration was never read. That is a D1 tautology violation: the field
+    would no longer be a restatement of an option value, it would be an
+    invention. Absent configuration must render as *nothing*, for the same
+    reason absent observation does.
+    """
+    stamped = append_markers("critique body", None, _attestation())
+    assert SOURCE_MARKER_PREFIX not in stamped
+    assert "tools=0" not in stamped
+    assert "route=unset" not in stamped
+
+
+def test_append_markers_returns_the_body_untouched_when_there_is_nothing_to_stamp() -> None:
+    """Neither marker available → the body is returned byte-identical.
+
+    Not merely equal-after-``rstrip``: an adapter that opts out of both
+    getters must post exactly the bytes it drafted, trailing whitespace and
+    all. This is the compatibility guarantee that lets the dispatcher call
+    ``append_markers`` unconditionally instead of guarding the call — a guard
+    is what coupled the two markers in the first place.
+    """
+    body = "plain body\n\n"
+    assert append_markers(body, None, None) == body
+    assert append_markers("", None, None) == ""
+
+
+def test_append_markers_stamps_a_lone_attestation_onto_an_empty_body() -> None:
+    """Empty body + record → the marker alone, with no leading blank line."""
+    assert append_markers("", None, _attestation()) == render_attestation_marker(_attestation())
+
+
+def test_append_markers_keeps_both_lines_when_both_inputs_are_present() -> None:
+    """The independence fix must not disturb the both-present ordering."""
+    opts = _options(env={"ANTHROPIC_BASE_URL": "http://100.79.84.62:8110"}, model="naysayer")
+    stamped = append_markers("critique body", opts, _attestation())
+    assert stamped == (
+        f"critique body\n\n{render_source_marker(opts)}\n"
+        f"{render_attestation_marker(_attestation())}"
+    )
+
+
 def test_attestation_marker_is_not_adopted_from_the_body() -> None:
     """D3 for the attestation line: a body-written ``attest:`` is not a stamp.
 
