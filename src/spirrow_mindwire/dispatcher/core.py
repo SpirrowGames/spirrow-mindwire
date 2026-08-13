@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from ..ports import AdapterRegistry, RoleAdapter, SpawnContext
-from ..source_marker import append_source_marker
+from ..source_marker import append_markers
 from ..value_objects import ChatroomEvent, Event, ReplyDraft, Role, SessionHandle, ThreadRef
 from .dedup import DEFAULT_DEDUP_SET_SIZE, EventDedup
 from .event_log import delivery_failed_event, reply_sent_event
@@ -194,9 +194,21 @@ class Dispatcher:
         # deserves. Adapters that do not expose the getter yield ``None``
         # and the body posts unchanged — the marker is opt-in per adapter,
         # by the presence of the getter.
+        #
+        # P-1b (msg-953 §2 / Tier-C msg-954 §3): a second, duck-typed getter
+        # ``attestation_record`` carries the preflight OBSERVATION. It is a
+        # separate getter from ``source_marker_options`` for the same reason it
+        # renders on a separate line — configuration and observation are
+        # different kinds of claim, and an adapter may well have the first and
+        # not the second. No adapter defines it until P-2, so today this
+        # branch is inert and every post keeps its current shape.
         options_getter = getattr(session.adapter, "source_marker_options", None)
         options = options_getter(handle) if callable(options_getter) else None
-        body = append_source_marker(draft.body, options) if options is not None else draft.body
+        attestation_getter = getattr(session.adapter, "attestation_record", None)
+        attestation = attestation_getter(handle) if callable(attestation_getter) else None
+        body = (
+            append_markers(draft.body, options, attestation) if options is not None else draft.body
+        )
         posted_msg_id = await self._gateway.post_reply(
             handle.thread_ref,
             author=handle.instance_id,  # I3 v2.2 (ADR-06 amendment): author = instance_id

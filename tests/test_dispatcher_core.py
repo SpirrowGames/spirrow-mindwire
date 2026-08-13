@@ -435,8 +435,121 @@ async def test_dispatcher_appends_source_marker_when_adapter_exposes_options() -
     # The adapter's body is preserved verbatim (unedited by the harness) …
     assert body.startswith("agent said this")
     # … with the harness-derived marker appended as the final non-empty line.
+    # ``route`` / ``tier`` render as ``unset`` here because this fake's options
+    # carry neither ``env`` nor ``model`` (P-1a, msg-953 §2).
     tail = body.rstrip().splitlines()[-1]
-    assert tail == "<!-- source: tools=0 · mcp=0 · setting_sources=empty -->"
+    assert tail == (
+        "<!-- source: tools=0 · mcp=0 · setting_sources=empty · route=unset · tier=unset -->"
+    )
+
+
+# ----- attestation line wiring (P-1b, Tier-C msg-954 §3) --------------------- #
+
+
+class _AttestingAdapter(_MarkerOptionsAdapter):
+    """Adapter that also exposes ``attestation_record`` — the P-2 seam.
+
+    Duck-typed exactly like ``source_marker_options``: an adapter that has no
+    preflight observation to report simply does not define the getter, and the
+    dispatcher stamps only the ``source:`` line. This is what keeps P-1 a
+    no-behaviour-change landing until P-2 starts producing records.
+    """
+
+    def __init__(self, *, options: Any, record: Any, reply_body: str = "hello") -> None:
+        super().__init__(options=options, reply_body=reply_body)
+        self._record = record
+
+    def attestation_record(self, handle: SessionHandle) -> Any:
+        _ = handle
+        return self._record
+
+
+@pytest.mark.anyio
+async def test_dispatcher_appends_attestation_line_when_adapter_exposes_record() -> None:
+    """The observation lands on its OWN line, below the configuration line.
+
+     Tier-C msg-954 §3: "``attest:`` を別行に分離 (観測結果は ``source:`` と
+     認識論的地位が違う)". The dispatcher — not the adapter — renders both
+    (msg-834 §2 (b) / (c)).
+    """
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from spirrow_mindwire.value_objects import AttestationRecord
+
+    options = SimpleNamespace(
+        tools=[],
+        mcp_servers={},
+        setting_sources=[],
+        env={"ANTHROPIC_BASE_URL": "http://100.79.84.62:8110"},
+        model="naysayer",
+    )
+    record = AttestationRecord(
+        tier="naysayer",
+        backend="gemini",
+        expected="gemini",
+        route="100.79.84.62:8110",
+        probe="cost-row#5992",
+        at=datetime(2026, 8, 13, 0, 23, 48, tzinfo=UTC),
+    )
+    adapter = _AttestingAdapter(options=options, record=record, reply_body="agent said this")
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    await disp.dispatch(handle, _event(msg_id="m10"))
+
+    lines = gateway.posts[0]["body"].rstrip().splitlines()
+    assert lines[0] == "agent said this"
+    assert lines[-2] == (
+        "<!-- source: tools=0 · mcp=0 · setting_sources=empty "
+        "· route=100.79.84.62:8110 · tier=naysayer -->"
+    )
+    assert lines[-1] == (
+        "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
+        "· route=100.79.84.62:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->"
+    )
+
+
+@pytest.mark.anyio
+async def test_dispatcher_omits_attestation_line_when_adapter_has_no_record() -> None:
+    """No getter (today's production shape) → source line only, unchanged.
+
+    Pins the "P-1 changes no behaviour" claim at the wiring level: until P-2
+    lands there is no ``attestation_record`` getter anywhere in ``adapters/``,
+    so no post grows an ``attest:`` line.
+    """
+    from types import SimpleNamespace
+
+    options = SimpleNamespace(tools=[], mcp_servers={}, setting_sources=[])
+    adapter = _MarkerOptionsAdapter(options=options, reply_body="agent said this")
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    await disp.dispatch(handle, _event(msg_id="m11"))
+
+    body = gateway.posts[0]["body"]
+    assert "<!-- attest:" not in body
+    assert body.rstrip().splitlines()[-1].startswith("<!-- source:")
+
+
+@pytest.mark.anyio
+async def test_dispatcher_omits_attestation_line_when_record_getter_returns_none() -> None:
+    """A getter that returns ``None`` (preflight not run) is not an attestation.
+
+    The distinction matters: "no observation" must render as *nothing*, never
+    as an empty or partial ``attest:`` line, which a reader could mistake for
+    a verified one.
+    """
+    from types import SimpleNamespace
+
+    options = SimpleNamespace(tools=[], mcp_servers={}, setting_sources=[])
+    adapter = _AttestingAdapter(options=options, record=None, reply_body="agent said this")
+    gateway = _FakeGateway()
+    disp = Dispatcher(registry=_registry_with(adapter), gateway=gateway)
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    await disp.dispatch(handle, _event(msg_id="m12"))
+
+    assert "<!-- attest:" not in gateway.posts[0]["body"]
 
 
 @pytest.mark.anyio

@@ -197,7 +197,48 @@ def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
     )
 
 
-async def _drain_reply(client: _SdkClient) -> str:
+# Session facts retained from the SDK ``ResultMessage`` (P-1c). Prefixed
+# ``sdk_`` in ``adapter_metadata`` so their provenance — the SDK result object,
+# not the model's prose — is legible at the point of use.
+_RETAINED_RESULT_FIELDS: tuple[str, ...] = ("session_id", "duration_ms", "num_turns")
+
+
+def _session_facts(result: Any) -> dict[str, Any]:
+    """Extract the retained session facts from a ``ResultMessage`` (P-1c).
+
+    **★ ``model`` is deliberately excluded, and that exclusion is the point.**
+    Tier-C msg-954 §3: "``.model`` は tier のエコーなので provenance に使わ
+    ない". Lexora answers an Anthropic-compatible request by echoing back the
+    *tier alias* (``"naysayer"``), never the concrete backend model — measured
+    in msg-950 §2. Retaining it would drop a value that LOOKS like provenance
+    into the event log's ``model_id`` field
+    (:func:`~spirrow_mindwire.dispatcher.event_log.reply_sent_event` reads that
+    key), manufacturing precisely the overclaim this arc exists to remove.
+
+    So: the value of P-1c is **operational observability** — how long the turn
+    took, which SDK session it was, how many turns it burned. It is not, and
+    must not be presented as, evidence of which distribution answered. That
+    evidence can only come from the server side (P-2's accounting-row read-back
+    / P-5's per-request streaming record).
+    """
+    facts: dict[str, Any] = {}
+    for name in _RETAINED_RESULT_FIELDS:
+        value = getattr(result, name, None)
+        if value is not None:
+            facts[f"sdk_{name}"] = value
+    return facts
+
+
+async def _drain_reply(client: _SdkClient) -> tuple[str, Any]:
+    """Drain one SDK response, returning ``(text, ResultMessage)``.
+
+    P-1c (msg-953 §2 / Tier-C msg-954 §3): this used to read ``is_error`` off
+    the ``ResultMessage`` and then **throw the object away**, so a naysayer
+    turn left no ``session_id``, no duration, no turn count — nothing an
+    operator could correlate against anything afterwards. Returning it lets
+    :meth:`NaysayerSdkAdapter.deliver_event` put those facts on the reply's
+    ``adapter_metadata`` (and thus into the ``reply.sent`` event log).
+    """
     chunks: list[str] = []
     final: Any = None
     async for msg in client.receive_response():
@@ -211,7 +252,7 @@ async def _drain_reply(client: _SdkClient) -> str:
         raise RuntimeError("SDK session ended without a ResultMessage")
     if getattr(final, "is_error", False):
         raise RuntimeError(getattr(final, "result", None) or "SDK session reported is_error")
-    return "".join(chunks)
+    return "".join(chunks), final
 
 
 async def _shutdown(client: _SdkClient) -> None:
@@ -352,12 +393,16 @@ class NaysayerSdkAdapter:
         session.state = SessionState.PROCESSING
         try:
             await session.client.query(_build_prompt(event, session.own_role))
-            body = await _drain_reply(session.client)
+            body, result = await _drain_reply(session.client)
             await session.ctx.on_reply(
                 ReplyDraft(
                     body=body,
                     reply_to_msg_id=payload.msg_id,
-                    adapter_metadata={"adapter_id": self.adapter_id},
+                    adapter_metadata={
+                        "adapter_id": self.adapter_id,
+                        # P-1c: session facts, NOT provenance. See _session_facts.
+                        **_session_facts(result),
+                    },
                 )
             )
         except Exception as exc:
