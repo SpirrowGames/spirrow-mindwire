@@ -756,8 +756,14 @@ async def test_carve_out_three_refuses_a_stamp_that_records_a_mismatch() -> None
 
     ``backend != expected`` means the preflight observed the tier resolving
     somewhere other than the independent distribution. P-2 fails closed on that,
-    so the harness never emits such a stamp; the case that reaches here is a
-    hand-copied or hand-edited line, and shape alone must not carry it.
+    so the harness never emits such a stamp; what could reach here is a line
+    whose fields were written by hand, or one from some future harness that
+    stamped a mismatch "informationally" instead of refusing — and shape alone
+    must not carry it.
+
+    Read the narrowness with the next test: this refuses a stamp that *records*
+    a mismatch. It does not refuse a **copied** one, whose two fields agree
+    exactly as they did where it was copied from.
     """
     mcp = _FakeChatroomMcp()
     mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
@@ -768,6 +774,33 @@ async def test_carve_out_three_refuses_a_stamp_that_records_a_mismatch() -> None
     outcome = await _conductor(mcp, disp, control=_FakeControl(ControlState.RUN)).run()
     assert Role.IMPLEMENTER not in [role for role, _ in disp.dispatches]
     assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_carve_out_three_cannot_detect_a_replayed_stamp() -> None:
+    """★ A REAL stamp, reused on a post that was never attested, still opens ③.
+
+    Raised as a naysayer objection against this PR's own docstring
+    (``T-pr-review-144`` msg-973 §1) and it was right: ``backend == expected``
+    cannot see a replay, because both fields travel inside the copied line and
+    still agree there. The stamp below is produced by the **production**
+    renderer — not a hand-typed literal — and then pasted onto a different body,
+    which is precisely the "copied out of another thread" case.
+
+    **This test passing is not a defect**, it is the boundary being stated
+    executably rather than in prose that can drift back into a security claim.
+    Binding a stamp to the message it sits on needs a signature and a key (or a
+    server-side record of which post the harness actually produced); a stricter
+    text check cannot get there.
+    """
+    genuine_stamp = _attested("an older review that really was attested").splitlines()[-1]
+    replayed = f"I ran no preflight for this one.\n\nNEXT: Heisenberg\n\n{genuine_stamp}"
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
+    disp = _design_to_code_dispatcher(mcp, naysayer_reply=replayed)
+    outcome = await _conductor(mcp, disp, control=_FakeControl(ControlState.RUN)).run()
+    assert [role for role, _ in disp.dispatches] == [Role.PROPOSER, Role.NAYSAYER, Role.IMPLEMENTER]
+    assert outcome.stop_reason is StopReason.SETTLED
 
 
 @pytest.mark.anyio

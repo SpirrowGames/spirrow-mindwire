@@ -495,10 +495,22 @@ class Conductor:
         session — the thing the loop's carve-outs are named after ("the *independent* naysayer")
         was never shown to be independent for that post.
 
-        ``backend == expected`` is required as well as well-formedness. P-2 fails closed on a
-        mismatch, so the harness never emits a mismatching stamp; requiring the match here is what
-        stops a *hand-copied* one (a stale line pasted from another thread, a hand-edited value)
-        from reading as an attestation just because it has the right shape.
+        ``backend == expected`` is required as well as well-formedness, and what that buys is
+        narrow enough to be worth stating exactly. It refuses a stamp whose own fields RECORD a
+        mismatch — an observation that the tier resolved somewhere other than the independent
+        distribution. P-2 fails closed before such a record is ever rendered, so the harness does
+        not emit one today; the check is therefore defence in depth against a later change that
+        stamped a mismatch "informationally" instead of refusing, plus a hand-written line that
+        names some other backend.
+
+        It buys **no replay protection**, and an earlier version of this docstring wrongly said it
+        did (naysayer objection, ``T-pr-review-144`` msg-973 §1 — correct, and this is the
+        correction). A stamp copied verbatim out of another thread, another session, or a
+        months-old post satisfies the comparison, because ``backend`` and ``expected`` travel
+        *inside* the copied line and still agree there. Nothing in the marker binds it to the
+        message it sits on — no thread id, no message id, no signature — so nothing here can tell a
+        replay from an original. ``test_carve_out_three_cannot_detect_a_replayed_stamp`` drives
+        exactly that case through the carve-out to the implementer and passes.
 
         ★ **This is noise-reduction, not authentication, and the difference is not a caveat — it is
         the accurate description of what this can do.** The input is a chatroom body, and the

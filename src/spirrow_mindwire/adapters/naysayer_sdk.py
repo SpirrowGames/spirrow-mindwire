@@ -387,6 +387,17 @@ class NaysayerSdkAdapter:
         # connecting is a session nobody will ever ``halt`` — one leaked
         # subprocess per refused spawn.
         #
+        # A transient fault does not reach this fail-closed path on the first
+        # blip. ``attest_backend`` retries transport failures up to
+        # ``PREFLIGHT_ATTEMPTS`` (= 3) with a fresh baseline each time, sized
+        # from the T36 learning that Gemini 502s are frequent and self-resolving
+        # (msg-954 §3; ``test_transient_http_failure_is_retried_and_can_succeed``,
+        # ``test_attempts_are_bounded_at_three``). A backend MISMATCH is the one
+        # thing never retried — it is a verdict, not a transient, and re-rolling
+        # it until the gateway says what we wanted is the same as not checking.
+        # So what propagates from here is a sustained outage or a wrong route,
+        # not a two-second 502.
+        #
         # Fail-closed here means the turn is not posted. It does not mean the
         # loop parks politely: the error propagates out of ``Conductor.run()``
         # and the daemon exits non-zero (verified by reading
