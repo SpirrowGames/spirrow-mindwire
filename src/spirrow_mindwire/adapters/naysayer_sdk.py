@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -50,11 +50,17 @@ from ..exceptions import (
     AdapterSpawnError,
 )
 from ..naysayer.adr_index import build_adr_index_block
-from ..naysayer.principles import NAYSAYER_MODEL_TIER, build_preamble
+from ..naysayer.preflight import PreflightError, attest_backend
+from ..naysayer.principles import (
+    NAYSAYER_EXPECTED_BACKEND,
+    NAYSAYER_MODEL_TIER,
+    build_preamble,
+)
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
 from ..ulid_util import new_ulid
 from ..value_objects import (
+    AttestationRecord,
     Capability,
     ChatroomEvent,
     ErrorInfo,
@@ -141,6 +147,11 @@ class _Session:
     # the dataclass loads without touching the SDK type here (already
     # imported at module scope for the constructor).
     options: Any = None
+    # The preflight OBSERVATION made when this session was spawned (P-2). Kept
+    # per-session, alongside ``options``, because the two are the pair the
+    # dispatcher renders: what the session was configured to do, and what the
+    # gateway's accounting said actually happened when we tried it once.
+    attestation: AttestationRecord | None = None
     error: ErrorInfo | None = None
 
 
@@ -280,6 +291,8 @@ class NaysayerSdkAdapter:
         mcp_servers: dict[str, Any] | None = None,
         extra_env: dict[str, str] | None = None,
         client_factory: Callable[[Any], _SdkClient] | None = None,
+        expected_backend: str = NAYSAYER_EXPECTED_BACKEND,
+        preflight: Callable[[], Awaitable[AttestationRecord]] | None = None,
     ) -> None:
         self._cwd = Path(cwd)
         # Independence (ADR-05 §5): inference MUST route to the naysayer (Gemini)
@@ -307,7 +320,33 @@ class NaysayerSdkAdapter:
         self._mcp_servers = mcp_servers or {}
         self._extra_env = dict(extra_env or {})
         self._client_factory = client_factory or _default_client_factory
+        self._expected_backend = expected_backend
+        # Injectable so tests never touch the network. Unset, the default runs
+        # the real probe against **this adapter's own** inference base URL — not
+        # ``MINDWIRE_LEXORA_URL``, which is a different variable pointing at a
+        # possibly different host. Attesting a host the session will not use
+        # would be an attestation of the wrong thing, stated with the same
+        # confidence as a true one.
+        self._preflight = preflight
         self._sessions: dict[SessionHandle, _Session] = {}
+
+    async def _run_preflight(self) -> AttestationRecord:
+        if self._preflight is not None:
+            return await self._preflight()
+        if not self._model:
+            # Nothing to attest: with no model kwarg the session does not name a
+            # tier, so there is no tier→backend resolution to observe. Refusing
+            # is the honest answer; probing with an empty model would fail with
+            # a confusing gateway error and imply the check ran.
+            raise PreflightError(
+                "cannot attest a session that pins no model tier (model=None): "
+                "there is no tier→backend resolution to observe"
+            )
+        return await attest_backend(
+            base_url=self._inference_base_url,
+            tier=self._model,
+            expected=self._expected_backend,
+        )
 
     def _make_options(self) -> ClaudeAgentOptions:
         env = {"ANTHROPIC_BASE_URL": self._inference_base_url, **self._extra_env}
@@ -335,6 +374,33 @@ class NaysayerSdkAdapter:
                 "the naysayer must route inference via the Lexora Gemini tier, never "
                 "api.anthropic.com directly (ADR-05 §5 independence)"
             )
+        # P-2 (msg-953 §3 / Tier-C msg-954 §3 / msg-965). Until now the check
+        # above was the ONLY thing standing behind ``docs/deploy.md:73``'s claim
+        # that the naysayer "refuses to spawn" without its independent route:
+        # a non-empty string was accepted as proof that the string pointed at
+        # Gemini. This asks the gateway instead — one non-streaming probe, then
+        # its own accounting row read back — and refuses the spawn if the tier
+        # did not resolve to the expected backend.
+        #
+        # Ordered BEFORE the SDK client is constructed and connected. The client
+        # is a real subprocess in production, and a session refused after
+        # connecting is a session nobody will ever ``halt`` — one leaked
+        # subprocess per refused spawn.
+        #
+        # Fail-closed here means the turn is not posted. It does not mean the
+        # loop parks politely: the error propagates out of
+        # ``Conductor.run()`` and the daemon exits (verified by reading
+        # ``loop_runner.run_conductor`` — the call is not wrapped). The next
+        # scheduled run then sees no new message and the existing no-progress
+        # guard is what routes it to a human.
+        try:
+            attestation = await self._run_preflight()
+        except Exception as exc:
+            raise NaysayerSdkSpawnError(
+                f"preflight attestation failed for role {role.value} on thread "
+                f"{thread_ref.thread_id}; refusing to spawn an unattested naysayer "
+                f"session: {exc}"
+            ) from exc
         options = self._make_options()
         try:
             client = self._client_factory(options)
@@ -362,8 +428,28 @@ class NaysayerSdkAdapter:
             # Retain the exact ``ClaudeAgentOptions`` for the harness marker
             # (msg-805 D3 / msg-834 §2 (a)) — never re-read, never re-declared.
             options=options,
+            attestation=attestation,
         )
         return handle
+
+    def attestation_record(self, handle: SessionHandle) -> AttestationRecord | None:
+        """Return the spawn-time attestation for ``handle``, or ``None`` if unknown.
+
+        The duck-typed seam P-1 opened in
+        :meth:`spirrow_mindwire.dispatcher.core.Dispatcher._handle_reply`; this
+        is the first adapter to define it, so the ``attest:`` line starts
+        appearing on naysayer posts with this change.
+
+        **What the line says, exactly.** The observation was made once, at
+        spawn, by a non-streaming probe. Every post in the session carries that
+        same record — it is not re-taken per post, and it does not speak for the
+        streaming turn it is attached to (msg-953 §3 L1). ``at=`` is the
+        observation's timestamp precisely so a reader can see how old it is.
+        Closing the per-turn gap needs streaming request records on the gateway
+        side (P-5, different repo, not done).
+        """
+        session = self._sessions.get(handle)
+        return None if session is None else session.attestation
 
     def source_marker_options(self, handle: SessionHandle) -> Any:
         """Return the ``ClaudeAgentOptions`` for ``handle``, or ``None`` if unknown.

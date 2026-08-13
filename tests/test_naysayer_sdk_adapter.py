@@ -21,9 +21,11 @@ from spirrow_mindwire.adapters.naysayer_sdk import (
     NaysayerSdkSpawnError,
     build_naysayer_system_prompt,
 )
+from spirrow_mindwire.naysayer.preflight import PreflightError
 from spirrow_mindwire.obligations import load_manifest
 from spirrow_mindwire.ports import RoleAdapter, SpawnContext
 from spirrow_mindwire.value_objects import (
+    AttestationRecord,
     Capability,
     ChatroomEvent,
     Event,
@@ -31,6 +33,7 @@ from spirrow_mindwire.value_objects import (
     NewMessagePayload,
     ReplyDraft,
     Role,
+    SessionHandle,
     SessionState,
     ThreadRef,
 )
@@ -228,6 +231,7 @@ async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
         obligations=_OBLIGATIONS,
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, opts),
+        preflight=_preflight_ok(),
     )
     await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
     # Independence: inference is pinned to the Lexora Gemini tier, never api.anthropic.com.
@@ -247,6 +251,7 @@ async def test_deliver_event_posts_critique(tmp_path: Path) -> None:
         obligations=_OBLIGATIONS,
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
+        preflight=_preflight_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event())
@@ -276,6 +281,7 @@ async def test_reply_metadata_retains_sdk_session_facts(tmp_path: Path) -> None:
         obligations=_OBLIGATIONS,
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
+        preflight=_preflight_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event())
@@ -309,6 +315,7 @@ async def test_reply_metadata_never_carries_the_model_echo(tmp_path: Path) -> No
         obligations=_OBLIGATIONS,
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
+        preflight=_preflight_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event())
@@ -330,6 +337,7 @@ async def test_reply_body_is_unchanged_by_result_retention(tmp_path: Path) -> No
         obligations=_OBLIGATIONS,
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
+        preflight=_preflight_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event())
@@ -345,8 +353,255 @@ async def test_self_post_is_filtered(tmp_path: Path) -> None:
         obligations=_OBLIGATIONS,
         inference_base_url=_BASE_URL,
         client_factory=_factory(client, []),
+        preflight=_preflight_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
     await adapter.deliver_event(handle, _event(author="naysayer-1"))  # our own echoed post
     assert captured == []
     assert client.queries == []
+
+
+# --------------------------------------------------------------------------- #
+# P-2 — spawn-time preflight attestation (msg-953 §3 / Tier-C msg-954 §3)
+# --------------------------------------------------------------------------- #
+
+
+def _attestation(*, backend: str = "gemini") -> AttestationRecord:
+    return AttestationRecord(
+        tier="naysayer",
+        backend=backend,
+        expected="gemini",
+        route="lexora.local:8110",
+        probe="cost-row#6032",
+        at=_TS,
+    )
+
+
+def _preflight_ok(calls: list[int] | None = None) -> Callable[[], Any]:
+    async def run() -> AttestationRecord:
+        if calls is not None:
+            calls.append(1)
+        return _attestation()
+
+    return run
+
+
+def _preflight_failing(exc: Exception) -> Callable[[], Any]:
+    async def run() -> AttestationRecord:
+        raise exc
+
+    return run
+
+
+@pytest.mark.anyio
+async def test_spawn_runs_the_preflight_and_retains_the_record(tmp_path: Path) -> None:
+    """The record reaches the dispatcher through the ``attestation_record`` getter.
+
+    That getter is the seam P-1 opened (``dispatcher/core.py`` looks it up
+    duck-typed, independently of ``source_marker_options``). Until now no
+    adapter defined it, so the branch was inert; this is what makes it live.
+    """
+    calls: list[int] = []
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(_FakeClient([_assistant("x"), _result()]), []),
+        preflight=_preflight_ok(calls),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    assert calls == [1]
+    record = adapter.attestation_record(handle)
+    assert record is not None
+    assert record.backend == "gemini"
+
+
+@pytest.mark.anyio
+async def test_spawn_refuses_when_the_preflight_fails(tmp_path: Path) -> None:
+    """★ Fail-closed: no session, therefore no turn, therefore no post.
+
+    ``docs/deploy.md:73`` has always claimed the naysayer "refuses to spawn"
+    without a working independent route; before P-2 the only thing checked was
+    whether the env var was a non-empty string. This is the check that makes the
+    refusal about the route actually resolving to the expected backend.
+    """
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(_FakeClient([_assistant("x"), _result()]), []),
+        preflight=_preflight_failing(PreflightError("backend mismatch: got vllm, expected gemini")),
+    )
+    with pytest.raises(NaysayerSdkSpawnError) as excinfo:
+        await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    assert "backend mismatch" in str(excinfo.value)
+
+
+@pytest.mark.anyio
+async def test_failed_preflight_leaves_no_session_behind(tmp_path: Path) -> None:
+    """A refused spawn must not leave a half-built session the loop could reuse."""
+    client = _FakeClient([_assistant("x"), _result()])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, []),
+        preflight=_preflight_failing(PreflightError("unreachable")),
+    )
+    with pytest.raises(NaysayerSdkSpawnError):
+        await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    assert adapter._sessions == {}
+
+
+@pytest.mark.anyio
+async def test_preflight_runs_before_the_sdk_session_is_connected(tmp_path: Path) -> None:
+    """Order matters: a failing preflight must not leave an SDK subprocess running.
+
+    The SDK client is a real subprocess in production. Connecting first and then
+    refusing would leak one per refused spawn, and ``halt`` is never called for a
+    session that was never returned.
+    """
+    client = _FakeClient([_assistant("x"), _result()])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, []),
+        preflight=_preflight_failing(PreflightError("unreachable")),
+    )
+    with pytest.raises(NaysayerSdkSpawnError):
+        await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    assert client.connected is False
+
+
+@pytest.mark.anyio
+async def test_attestation_record_is_none_for_an_unknown_handle(tmp_path: Path) -> None:
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(_FakeClient([]), []),
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    other = SessionHandle(
+        session_id="01JOTHER",
+        instance_id="naysayer-1",
+        adapter_id="naysayer-sdk",
+        thread_ref=_thread_ref(),
+        role=Role.NAYSAYER,
+        started_at=_TS,
+    )
+    assert adapter.attestation_record(handle) is not None
+    assert adapter.attestation_record(other) is None
+
+
+@pytest.mark.anyio
+async def test_missing_base_url_is_refused_without_burning_a_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cheap check stays first: no URL → refuse without paying for a probe."""
+    monkeypatch.delenv("MINDWIRE_NAYSAYER_BASE_URL", raising=False)
+    calls: list[int] = []
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url="",
+        preflight=_preflight_ok(calls),
+    )
+    with pytest.raises(NaysayerSdkSpawnError):
+        await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    assert calls == []
+
+
+def test_adapters_do_not_import_the_marker_builder() -> None:
+    """msg-834 §2 (c) — including transitively, now that P-2 adds a module.
+
+    ``naysayer/preflight.py`` needs the same credential-guarded route reducer
+    the ``source:`` line uses. Importing it FROM ``source_marker`` would drag the
+    marker builder into the adapter's import graph through the back door, so the
+    reducer was extracted to its own module and both sides import that instead.
+
+    Checked over the parsed import statements, not over the file text: the
+    adapter legitimately *mentions* ``source_marker`` — its getter is called
+    ``source_marker_options`` and its comments discuss the marker at length. A
+    substring check would call that an import and be wrong.
+    """
+    import ast
+
+    import spirrow_mindwire.adapters.naysayer_sdk as sdk_mod
+    import spirrow_mindwire.naysayer.preflight as preflight_mod
+
+    for module in (sdk_mod, preflight_mod):
+        tree = ast.parse(Path(module.__file__ or "").read_text(encoding="utf-8"))
+        imported: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported.append(node.module)
+            elif isinstance(node, ast.Import):
+                imported.extend(alias.name for alias in node.names)
+        offenders = [name for name in imported if name.split(".")[-1] == "source_marker"]
+        assert offenders == [], f"{module.__name__} imports the marker builder: {offenders}"
+
+
+@pytest.mark.anyio
+async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Path) -> None:
+    """★ The real adapter through the real dispatcher, onto a real posted body.
+
+    Every other test here checks one hop. This one checks that the hops are
+    joined: ``NaysayerSdkAdapter`` is the sole ``NAYSAYER_QUALIFIED`` adapter the
+    registry hands the naysayer slot to, so this is the production path, and the
+    thing being pinned is that a naysayer reply now leaves with BOTH lines —
+
+        <!-- source: … route=… tier=… -->   what the session was configured to do
+        <!-- attest: … backend=… -->        what the gateway's ledger said it did
+
+    A unit test on the getter cannot see a dispatcher that fails to call it. The
+    getter existed and returned records for a whole release while nothing read
+    them; that is precisely the defect msg-960 caught, and only an end-to-end
+    assertion would have caught it earlier.
+    """
+    from spirrow_mindwire.dispatcher.core import Dispatcher
+    from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
+
+    class _Gateway:
+        def __init__(self) -> None:
+            self.posts: list[str] = []
+
+        async def post_reply(
+            self,
+            thread_ref: ThreadRef,
+            *,
+            author: str,
+            body: str,
+            reply_to_msg_id: str | None,
+            idempotency_key: str,
+        ) -> str:
+            self.posts.append(body)
+            return "posted-1"
+
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url="http://100.79.84.62:8110",
+        client_factory=_factory(_FakeClient([_assistant("VERDICT: object."), _result()]), []),
+        preflight=_preflight_ok(),
+    )
+    registry = InMemoryAdapterRegistry()
+    registry.register(adapter)
+    gateway = _Gateway()
+    disp = Dispatcher(registry=registry, gateway=gateway)
+
+    handle = await disp.spawn_instance(_thread_ref(), Role.NAYSAYER, "naysayer-1")
+    await disp.dispatch(handle, _event(msg_id="m42"))
+
+    lines = gateway.posts[0].rstrip().splitlines()
+    assert lines[0] == "VERDICT: object."
+    assert lines[-2] == (
+        "<!-- source: tools=0 · mcp=0 · setting_sources=unset "
+        "· route=100.79.84.62:8110 · tier=naysayer -->"
+    )
+    assert lines[-1] == (
+        "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
+        "· route=lexora.local:8110 · probe=cost-row#6032 · at=2026-06-04T00:00:00Z -->"
+    )
