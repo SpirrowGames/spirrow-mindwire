@@ -35,6 +35,11 @@ from spirrow_mindwire.naysayer.preflight import (
     PreflightError,
     attest_backend,
 )
+from spirrow_mindwire.naysayer.principles import (
+    NAYSAYER_EXPECTED_BACKEND,
+    NAYSAYER_MODEL_TIER,
+    NAYSAYER_UPSTREAM_MODEL,
+)
 from spirrow_mindwire.value_objects import AttestationRecord
 
 _ROUTE = "http://100.79.84.62:8110"
@@ -338,6 +343,72 @@ async def test_empty_reply_body_does_not_fail_the_attestation() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# ★ M5 (Tier-C msg-970 §3) — the PRODUCTION constants, exercised in CI
+#
+# Everything above this line drives ``attest_backend`` with the module's own
+# ``_TIER`` / ``_EXPECTED`` literals, so the suite never touches the values the
+# daemon actually spawns with. That gap is what let a mutation of
+# ``NAYSAYER_EXPECTED_BACKEND`` survive 1109 green tests on PR #143.
+#
+# These two tests close it from both sides, and neither is deselected:
+# the ledger row's ``backend`` is the hardcoded value MEASURED off the live
+# gateway (row 6032), never a constant under test, so the assertions cannot go
+# tautological the way the manual smoke test's did.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_production_constants_attest_against_a_live_shaped_row() -> None:
+    """The values the daemon spawns with must attest a row shaped like the real one.
+
+    Mutate ``NAYSAYER_EXPECTED_BACKEND`` to the upstream model id — the tidy-up
+    that looks like de-duplication — and the row saying ``backend: "gemini"``
+    stops matching, ``attest_backend`` raises, and this reds. In production the
+    same mutation reds nothing until the first spawn, where it takes the daemon
+    down and quarantines the candidate.
+    """
+    gateway = _FakeGateway(
+        ledger=[_row(6031, model="light", backend="light")],
+        # Literals, deliberately: this is what the live gateway wrote, not what
+        # the code under test expects it to have written.
+        append_on_call=[[_row(6032, model="naysayer", backend="gemini")]],
+    )
+    record = await attest_backend(
+        base_url=_ROUTE,
+        tier=NAYSAYER_MODEL_TIER,
+        expected=NAYSAYER_EXPECTED_BACKEND,
+        client=gateway,
+        now=lambda: _NOW,
+    )
+    assert record.backend == "gemini"
+    assert record.tier == "naysayer"
+
+
+@pytest.mark.anyio
+async def test_comparing_against_the_upstream_model_id_fails_every_attestation() -> None:
+    """The other bracket: WHY the two constants must stay distinct.
+
+    The row names the backend family. Asking it for the model id asks for a fact
+    it does not carry, so the comparison can never succeed — on any row, for any
+    request. Pinning the consequence here means the reason the values differ is
+    executable, not just a comment someone may delete along with the difference.
+    """
+    gateway = _FakeGateway(
+        ledger=[_row(6031, model="light", backend="light")],
+        append_on_call=[[_row(6032, model="naysayer", backend="gemini")]],
+    )
+    with pytest.raises(PreflightError, match="did not resolve to the expected backend"):
+        await attest_backend(
+            base_url=_ROUTE,
+            tier=NAYSAYER_MODEL_TIER,
+            expected=NAYSAYER_UPSTREAM_MODEL,
+            client=gateway,
+            now=lambda: _NOW,
+            attempts=1,
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Live smoke (skipped in CI: addopts -m "not manual")
 # --------------------------------------------------------------------------- #
 
@@ -348,13 +419,16 @@ async def test_manual_live_preflight_against_the_real_gateway() -> None:
     """Run with ``uv run pytest -m manual -k live_preflight``.
 
     Costs one real naysayer completion and appends one row to the live ledger.
+
+    This test is **deselected in CI** and its ``record.backend ==
+    NAYSAYER_EXPECTED_BACKEND`` assertion is a tautology on success (``_attempt``
+    returns ``expected``), so what it really checks is "the live gateway did not
+    make us raise". That is the right job for a live smoke test and the wrong
+    place to pin a constant — the pin lives above, in
+    ``test_production_constants_attest_against_a_live_shaped_row`` (Tier-C
+    msg-970 §3 / M5).
     """
     import os
-
-    from spirrow_mindwire.naysayer.principles import (
-        NAYSAYER_EXPECTED_BACKEND,
-        NAYSAYER_MODEL_TIER,
-    )
 
     base_url = os.environ.get("MINDWIRE_NAYSAYER_BASE_URL") or "http://localhost:8110"
     record = await attest_backend(

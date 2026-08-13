@@ -70,7 +70,7 @@ Set by `deploy/run-conductor.ps1`; secrets must be supplied externally.
 |---|---|---|
 | `PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8` | no | parent-process UTF-8 (cp932 safety on Windows; T39). Must be set **before** launch — the launcher does this |
 | `MINDWIRE_IMPLEMENTER_BASE_URL` | no | implementer inference (`https://api.anthropic.com`) |
-| `MINDWIRE_NAYSAYER_BASE_URL` | no | design-time naysayer → Lexora `naysayer` tier (Gemini). **Without it the naysayer adapter refuses to spawn** — this is the env that, when unset, silently disables the independent-review leg |
+| `MINDWIRE_NAYSAYER_BASE_URL` | no | design-time naysayer → Lexora `naysayer` tier (Gemini). **Unset, the naysayer adapter refuses to spawn.** Set-but-wrong, it also refuses: since P-2, spawn runs a preflight against *this* URL — one non-streaming probe, then the gateway's own `/stats/costs/recent` row read back — and aborts unless that row attributes the request to the expected backend (`gemini`). Until P-2 only the first half was true, and a non-empty string was taken as proof the string pointed at Gemini. What the preflight attests is the tier→backend resolution **observed at spawn, from this host** — not the routing of each streaming turn that follows (the gateway writes no accounting row for streaming; closing that needs per-request streaming records on the Lexora side, P-5, which is not done) |
 | `MINDWIRE_LEXORA_URL` | no | Tier B PR-gate driver → Lexora |
 | `MINDWIRE_MAGICKIT_MCP_URL` | no | chatroom MCP (defaults to the in-code Tailscale endpoint) |
 | `MINDWIRE_NAYSAYER_GITHUB_TOKEN` | **YES** | spirrowgames-ops PAT (PR diff read + review submit). Provide via a persistent user env var sourced from Vaultwarden; never commit it |
@@ -584,17 +584,30 @@ never automated (D-5: the human's manual merge is the authoritative guard).
 - **Per-step GO (supervised)**: post a Tier-C GO authored as `[conductor].human_identity` (default
   `human`; PR-2b-3 D-1) with `NEXT: <implementer>`. A GO under a relay name (e.g. `Bohr`) does
   **not** fire the carve-out — the flag-1 gap.
-- **Standing autonomy — `DELEGATE` (PR-2b-3 D-4)**: include a standalone `DELEGATE` line in a
-  human-authored message to grant standing design→implement autonomy on the thread (alongside that
-  message's normal `NEXT:`). Then the **independent naysayer's own** proceed-handoff to the
-  implementer advances code with no per-step GO — but only the naysayer (never the proposer) can
-  advance, each iteration is freshly reviewed (reset-on-implementation), the naysayer's escalation
-  (`NEXT: human`) pulls the human back in, and **any** later human message without `DELEGATE`
-  revokes it. `max_rounds` bounds a run regardless.
+- **Standing autonomy — loop control state `run`**: autonomy is a **per-project, latching** state
+  read from conclair at the top of every round (`run` / `supervised` / `hold`), not a marker written
+  into the thread. The per-thread `DELEGATE` line this used to describe **no longer exists** —
+  `conductor/handoff.py` removed it when the control state replaced it. At `run`, the **independent
+  naysayer's own** proceed-handoff to the implementer advances code with no per-step GO — but only
+  the naysayer (never the proposer) can advance, each iteration is freshly reviewed
+  (reset-on-implementation), the naysayer's escalation (`NEXT: human`) pulls the human back in, and
+  the state can be flipped away between rounds. A state that cannot be read is `hold`. `max_rounds`
+  bounds a run regardless.
+  - **Since P-3, that proceed must also carry the harness's `attest:` stamp** — the preflight
+    observation P-2 records at spawn. Un-stamped, the carve-out is not taken and the turn falls
+    through to the human terminal. Same for the Obj2 forced consult: only an attested naysayer post
+    discharges it, so an un-attested segment buys exactly one extra forced consult.
 
-Author trust is the environment trust model (D-3) — the chatroom accepts any author string, so the
-carve-outs are best-effort loop-level gating; the authoritative guard is the human's manual merge.
+Author trust is the environment trust model (D-3) — the chatroom accepts any author string **and any
+body**, so the carve-outs, including the stamp check, are best-effort loop-level gating and
+**noise-reduction rather than an authentication boundary**; the authoritative guard is the human's
+manual merge. A stamp is forgeable by anyone who can post; what it removes is the case where an
+un-attested turn is indistinguishable from an attested one.
 
-The design-time naysayer reaches Gemini via the SDK + Lexora `naysayer` tier (verified by the
-capability test, `T-design-naysayer-gemini-reach`); the only thing that was missing was
-`MINDWIRE_NAYSAYER_BASE_URL` — now set by the launcher.
+The design-time naysayer is configured to reach Gemini via the SDK + Lexora `naysayer` tier, and
+since P-2 each spawn *observes* that resolution rather than assuming it (see
+`MINDWIRE_NAYSAYER_BASE_URL` above). What is established is per-spawn and non-streaming: no
+per-turn proof exists for the streaming turns themselves, because the gateway records no accounting
+row for streaming (P-5, upstream, not done). Earlier wording here cited the
+`T-design-naysayer-gemini-reach` capability test as verification; that test showed reachability, not
+that any given turn was served by Gemini.

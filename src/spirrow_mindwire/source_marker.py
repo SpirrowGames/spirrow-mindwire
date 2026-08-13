@@ -93,7 +93,7 @@ configuration re-statement for an observation.
 
 from __future__ import annotations
 
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any
 
 from .route_authority import ROUTE_REDACTED as _ROUTE_REDACTED
@@ -126,6 +126,15 @@ _BASE_URL_ENV_KEY = "ANTHROPIC_BASE_URL"
 # separator does not collide with the ``=`` in a field value; the exact form
 # is what msg-805 quotes ("tools=0 · mcp=0 · setting_sources=unset").
 _FIELD_SEP = " · "
+
+# The ``attest:`` line's field names and timestamp format, shared by the renderer
+# and :func:`parse_attestation_marker` so the two cannot describe different
+# formats. The parser requires this key set EXACTLY — no more, no fewer — which
+# makes ``test_parse_round_trips_a_rendered_marker`` the drift guard: add a field
+# to the renderer without adding it here and the round-trip reds immediately,
+# rather than every live stamp silently becoming unparseable.
+_ATTESTATION_FIELDS = ("tier", "backend", "expected", "route", "probe", "at")
+_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def _tools_field(options: Any) -> str:
@@ -254,9 +263,73 @@ def render_attestation_marker(record: AttestationRecord) -> str:
         f"expected={record.expected}",
         f"route={record.route}",
         f"probe={record.probe}",
-        f"at={record.at.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        f"at={record.at.astimezone(UTC).strftime(_AT_FORMAT)}",
     )
     return f"{ATTESTATION_MARKER_PREFIX} {_FIELD_SEP.join(parts)} {ATTESTATION_MARKER_SUFFIX}"
+
+
+def parse_attestation_marker(body: str) -> AttestationRecord | None:
+    """Read a harness ``attest:`` stamp back off a posted body, or ``None``.
+
+    The inverse of :func:`render_attestation_marker`, and it lives in this module
+    for that reason: the marker's form is owned here, in both directions. A
+    regex somewhere else would be a second implementation of the same format,
+    free to drift from the renderer — the dual-management shape P-2 extracted
+    :mod:`spirrow_mindwire.route_authority` to avoid.
+
+    **Only the last non-empty line is examined.** That is exactly where
+    :func:`append_markers` puts the stamp, and the restriction is what stops a
+    body that merely *quotes* a marker from reading as a stamped one. Naysayer
+    critiques quote marker lines routinely (this arc's own review turns did), so
+    a whole-body scan would attest posts that were never attested.
+
+    Strict about form, deliberately. Every field the renderer emits must be
+    present, non-empty, and parseable, or the answer is ``None`` — a lenient
+    parser would accept lines the renderer could never have produced, which is
+    the fail-open half of a gate.
+
+    **Not authentication.** A chatroom body is a text field: a hand-written line
+    in this shape parses exactly like a harness stamp. Callers must treat a
+    parsed record as noise-reduction — see
+    :meth:`spirrow_mindwire.conductor.core.Conductor._attested`, which says so at
+    the point of use. Note also that this reads *persisted chatroom text* on a
+    read path; msg-834 §2 (b) constrains the write path (the harness never parses
+    an agent body to BUILD a marker) and is untouched by it.
+
+    ``backend`` vs ``expected`` is **not** judged here. A stamp recording a
+    mismatch parses and reports both values, because "no stamp" and "a stamp
+    saying the route was wrong" are different facts and a reader wants to tell
+    them apart. Refusing the mismatch is the gate's job, not the parser's.
+    """
+    lines = [line for line in body.splitlines() if line.strip()]
+    if not lines:
+        return None
+    line = lines[-1].strip()
+    if not line.startswith(ATTESTATION_MARKER_PREFIX) or not line.endswith(
+        ATTESTATION_MARKER_SUFFIX
+    ):
+        return None
+    inner = line[len(ATTESTATION_MARKER_PREFIX) : -len(ATTESTATION_MARKER_SUFFIX)].strip()
+    fields: dict[str, str] = {}
+    for part in inner.split(_FIELD_SEP):
+        key, sep, value = part.partition("=")
+        if not sep:
+            return None
+        fields[key.strip()] = value.strip()
+    if set(fields) != set(_ATTESTATION_FIELDS) or not all(fields.values()):
+        return None
+    try:
+        at = datetime.strptime(fields["at"], _AT_FORMAT).replace(tzinfo=UTC)
+    except ValueError:
+        return None
+    return AttestationRecord(
+        tier=fields["tier"],
+        backend=fields["backend"],
+        expected=fields["expected"],
+        route=fields["route"],
+        probe=fields["probe"],
+        at=at,
+    )
 
 
 def append_source_marker(body: str, options: Any) -> str:
@@ -347,6 +420,7 @@ __all__ = [
     "SOURCE_MARKER_SUFFIX",
     "append_markers",
     "append_source_marker",
+    "parse_attestation_marker",
     "render_attestation_marker",
     "render_source_marker",
 ]
