@@ -24,6 +24,20 @@ from pathlib import Path
 NAYSAYER_MODEL_TIER = "naysayer"
 NAYSAYER_UPSTREAM_MODEL = "gemini-3.1-pro-preview"
 
+# The value P-2's preflight requires to find in the gateway's own accounting row
+# for a ``naysayer``-tier request (msg-953 §3: "成功条件: ``backend ==
+# expected_backend`` (config 単一 SOT)"). Pinned beside the tier for the same
+# reason N-4 pinned that: one place to change when the independent distribution
+# changes.
+#
+# **Not** the same string as :data:`NAYSAYER_UPSTREAM_MODEL`, and the difference
+# is load-bearing. The cost row's ``backend`` field names the *backend* Lexora
+# routed to (``"gemini"``); the upstream model id (``"gemini-3.1-pro-preview"``)
+# is a finer-grained fact the row does not carry. Comparing against the model id
+# would fail every attestation; comparing against the backend is what the row
+# can actually answer. Measured against the live gateway, row 6032, 2026-08-13.
+NAYSAYER_EXPECTED_BACKEND = "gemini"
+
 _ENV_PRINCIPLES_PATH = "MINDWIRE_NAYSAYER_PRINCIPLES_PATH"
 # principles.py -> naysayer -> spirrow_mindwire -> src -> <repo root>
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -89,6 +103,7 @@ def build_preamble() -> str:
 
 
 __all__ = [
+    "NAYSAYER_EXPECTED_BACKEND",
     "NAYSAYER_MODEL_TIER",
     "NAYSAYER_UPSTREAM_MODEL",
     "PrinciplesError",

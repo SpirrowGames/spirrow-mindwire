@@ -512,11 +512,13 @@ async def test_dispatcher_appends_attestation_line_when_adapter_exposes_record()
 
 @pytest.mark.anyio
 async def test_dispatcher_omits_attestation_line_when_adapter_has_no_record() -> None:
-    """No getter (today's production shape) → source line only, unchanged.
+    """No getter → source line only, unchanged.
 
-    Pins the "P-1 changes no behaviour" claim at the wiring level: until P-2
-    lands there is no ``attestation_record`` getter anywhere in ``adapters/``,
-    so no post grows an ``attest:`` line.
+    Pinned the "P-1 changes no behaviour" claim at the wiring level, when no
+    adapter defined the getter at all. P-2 has since given
+    ``NaysayerSdkAdapter`` one, so this now pins the *other* adapters: the
+    implementer and proposer expose no attestation and must keep posting
+    exactly the shape they posted before either change.
     """
     from types import SimpleNamespace
 

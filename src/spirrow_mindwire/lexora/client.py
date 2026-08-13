@@ -258,6 +258,53 @@ class LexoraClient:
             raise LexoraHTTPError(f"/health: expected a JSON object, got {type(body).__name__}")
         return body
 
+    async def stats_costs_recent(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """``GET /stats/costs/recent`` — the gateway's own per-request accounting rows.
+
+        **Why this read exists (P-2, msg-953 §3).** It is the only place in the
+        system that says which backend a request actually went to, written by
+        the gateway rather than by the model. A row (live shape, read
+        2026-08-13)::
+
+            {"id": 6032, "timestamp": "2026-08-13T04:29:54.899164+00:00",
+             "model": "naysayer", "backend": "gemini",
+             "endpoint": "/v1/chat/completions", "user_id": null,
+             "tokens_input": 2, "tokens_output": 0, "cost_usd": 0.0,
+             "duration_seconds": 1.96, "success": 1}
+
+        ``model`` is the *tier* asked for, ``backend`` is what served it. The
+        rows come back newest-first (``id`` descending, verified live) and the
+        endpoint takes only ``limit`` — there is no server-side filter, so the
+        caller narrows the window itself.
+
+        Deliberately **not** added to the :class:`LexoraChatClient` Protocol:
+        that Protocol describes what the naysayer *adapter* drives, and every
+        existing fake implements it. The preflight declares its own narrower
+        view (``LexoraPreflightClient``) over just the two methods it uses.
+        """
+        try:
+            resp = await self._client.get("/stats/costs/recent", params={"limit": limit})
+        except httpx.TimeoutException as e:
+            # Caught before RequestError (its superclass) so it surfaces as the
+            # retryable subtype — the preflight distinguishes them.
+            raise LexoraTimeoutError(f"GET /stats/costs/recent timed out: {e}") from e
+        except httpx.RequestError as e:
+            raise LexoraHTTPError(f"GET /stats/costs/recent: {e}") from e
+        if resp.status_code >= 400:
+            raise LexoraHTTPError(
+                f"/stats/costs/recent returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise LexoraHTTPError(f"/stats/costs/recent: malformed JSON: {e}") from e
+        if not isinstance(body, list):
+            raise LexoraHTTPError(
+                f"/stats/costs/recent: expected a JSON array, got {type(body).__name__}"
+            )
+        return [row for row in body if isinstance(row, dict)]
+
     async def chat_completion(
         self,
         *,

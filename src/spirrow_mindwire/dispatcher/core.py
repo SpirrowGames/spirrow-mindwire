@@ -199,17 +199,18 @@ class Dispatcher:
         # ``attestation_record`` carries the preflight OBSERVATION. It is a
         # separate getter from ``source_marker_options`` for the same reason it
         # renders on a separate line — configuration and observation are
-        # different kinds of claim. No adapter defines it until P-2, so today
-        # this branch is inert and every post keeps its current shape.
+        # different kinds of claim. Since P-2,
+        # :class:`~spirrow_mindwire.adapters.naysayer_sdk.NaysayerSdkAdapter`
+        # defines it (it has both getters, so a naysayer post carries both
+        # lines); the implementer and proposer define neither, and post exactly
+        # the shape they always did.
         #
         # The two getters are looked up INDEPENDENTLY and neither gates the
-        # other (T-pr-review-142 msg-960). An adapter may have either, both, or
-        # neither: ``NaysayerLexoraAdapter`` above has no options object at all,
-        # yet it owns the ``LexoraClient`` that P-2's preflight reuses, so
-        # "record but no options" is the shape P-2 lands on. ``append_markers``
-        # is total over both being ``None`` — it returns the body byte-identical
-        # — so this call is unconditional. An ``if`` here is exactly what
-        # silently discarded the attestation of an options-less adapter before.
+        # other (T-pr-review-142 msg-960): an adapter may have either, both, or
+        # neither. ``append_markers`` is total over both being ``None`` — it
+        # returns the body byte-identical — so this call is unconditional. An
+        # ``if`` here is exactly what silently discarded the attestation of an
+        # options-less adapter before.
         options_getter = getattr(session.adapter, "source_marker_options", None)
         options = options_getter(handle) if callable(options_getter) else None
         attestation_getter = getattr(session.adapter, "attestation_record", None)

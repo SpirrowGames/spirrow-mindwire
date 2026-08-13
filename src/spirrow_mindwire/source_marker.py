@@ -96,6 +96,8 @@ from __future__ import annotations
 from datetime import UTC
 from typing import Any
 
+from .route_authority import ROUTE_REDACTED as _ROUTE_REDACTED
+from .route_authority import route_authority as _route_authority
 from .value_objects import AttestationRecord
 
 # Marker form is stable and machine-readable. HTML comment wrap so the line
@@ -114,10 +116,11 @@ ATTESTATION_MARKER_SUFFIX = "-->"
 # inlined so the marker and the adapter that sets it are greppable together.
 _BASE_URL_ENV_KEY = "ANTHROPIC_BASE_URL"
 
-# Rendered for ``route`` when the base URL was set but its userinfo boundary
-# could not be resolved (see ``_route_authority``). A reader greps this to find
-# posts made under a malformed — possibly credential-bearing — base URL.
-_ROUTE_REDACTED = "redacted"
+# ``_route_authority`` / ``_ROUTE_REDACTED`` are imported from
+# :mod:`spirrow_mindwire.route_authority`, which is where the credential guard
+# now lives. P-2 gave the ``attest:`` line a ``route`` field derived from the
+# same operator-supplied env value, and one guard shared by both lines is the
+# only shape in which the two cannot drift apart.
 
 # U+00B7 MIDDLE DOT with a single ASCII space on each side. Chosen so the
 # separator does not collide with the ``=`` in a field value; the exact form
@@ -167,79 +170,6 @@ def _setting_sources_value(options: Any) -> str:
     return "+".join(str(x) for x in src)
 
 
-def _route_authority(raw: str) -> str | None:
-    """Reduce a base-URL string to its ``host:port`` authority.
-
-    Returns ``None`` when the userinfo boundary cannot be resolved — see the
-    fail-closed rule below. ``None`` is a third outcome, distinct from the
-    empty string (which means the value reduced to no authority at all).
-
-    Hand-rolled rather than :func:`urllib.parse.urlsplit` because the input is
-    an operator-supplied env value, not a guaranteed-well-formed URL, and
-    ``urlsplit`` mis-parses the most likely malformed case: ``urlsplit`` on a
-    schemeless ``"100.79.84.62:8110"`` yields an empty ``netloc`` (a scheme
-    must start with a letter, so the whole string lands in ``path``) and we
-    would print nothing at all for a value that was in fact configured. The
-    reader needs to see what was set, including when it was set wrong.
-
-    The reductions, in order:
-
-    1. drop everything up to and including ``://`` (the scheme)
-    2. split at the first ``/``, ``?`` or ``#`` into authority + tail
-       (path / query / fragment)
-    3. **fail closed if the discarded tail still contains a ``@``**
-    4. drop everything up to and including the last ``@`` (userinfo)
-
-    Steps 3-4 are a **credential guard**, not cosmetics: a base URL of the
-    form ``https://user:token@host/`` would otherwise copy a live secret into
-    a durable chatroom post.
-
-    **Why step 3 exists (PR #142 Tier B blocking).** Step 4 alone is only
-    sound when the operator wrote a well-formed URL. A password containing a
-    raw ``/``, ``?`` or ``#`` — a common env-var misconfiguration — moves the
-    userinfo ``@`` past step 2's cut, so the cut lands *inside the credential*
-    and step 4 then finds no ``@`` to remove. Measured on the pre-fix code:
-    ``https://admin:p/assword@api.internal:8443/`` rendered ``admin:p``, i.e.
-    the guard printed the secret it exists to suppress.
-
-    Step 3 detects exactly that class, and does so by construction rather than
-    by heuristic: userinfo is delimited by an ``@`` that necessarily follows
-    the *whole* credential, so if step 2's cut ever lands inside the userinfo,
-    that delimiting ``@`` is necessarily still in the discarded tail. "A ``@``
-    survives in the tail" therefore covers every ordering that can leak.
-
-    The converse does not hold — a genuine ``@`` in a path (
-    ``https://host:8443/path@v2``) produces the same string shape as a
-    password containing ``/``, and nothing in the string distinguishes them.
-    That case is redacted as well. Losing the route display for an unusual but
-    valid URL is the cheaper error: msg-957, "if the parser cannot safely
-    disambiguate the userinfo boundary, it must fail closed or redact
-    aggressively, not silently print the secret."
-    """
-    value = raw.strip()
-    scheme_sep = value.find("://")
-    if scheme_sep != -1:
-        value = value[scheme_sep + 3 :]
-    tail = ""
-    for sep in ("/", "?", "#"):
-        idx = value.find(sep)
-        if idx != -1:
-            tail += value[idx:]
-            value = value[:idx]
-    if "@" in tail:
-        # The cut may have landed inside a credential. Unresolvable → redact.
-        return None
-    at = value.rfind("@")
-    if at == -1:
-        return value
-    value = value[at + 1 :]
-    # Userinfo consumed the entire value (e.g. "https://user:token@"). Do not
-    # return "" — the caller renders that as ``route=empty``, which the legend
-    # reserves as the fingerprint of a MISSING base URL. A credential-bearing
-    # value must not forge that fingerprint.
-    return value or None
-
-
 def _route_field(options: Any) -> str:
     """Return the ``route`` field (D1 tautology — see the module legend).
 
@@ -253,7 +183,8 @@ def _route_field(options: Any) -> str:
 
     ``redacted`` is the third failure value: a base URL was set, but its
     userinfo boundary could not be resolved, so printing any part of it risked
-    printing a credential (see :func:`_route_authority`). It is deliberately
+    printing a credential (see
+    :func:`spirrow_mindwire.route_authority.route_authority`). It is deliberately
     its own token — collapsing it onto ``unset`` or ``empty`` would tell the
     reader the variable was missing when in fact it was set wrong, and those
     two states need different repairs.
@@ -364,18 +295,21 @@ def append_markers(
     **The two lines are independent** (T-pr-review-142 msg-960). Either may be
     absent, and the other still renders:
 
-    - ``options`` present, ``attestation`` absent — today's production shape.
-      Byte-identical to :func:`append_source_marker`, which is what makes P-1 a
-      no-behaviour-change landing: nothing produces an ``AttestationRecord``
-      until P-2, so no live post grows an ``attest:`` line from this alone.
+    - ``options`` present, ``attestation`` absent — the implementer and
+      proposer. Byte-identical to :func:`append_source_marker`, which is what
+      made P-1 a no-behaviour-change landing and is what keeps those two
+      adapters' posts unchanged by P-2 as well.
+    - ``options`` present, ``attestation`` present — the naysayer since P-2.
     - ``options`` absent, ``attestation`` present — an adapter that has a
-      preflight observation but no SDK options object to restate.
+      preflight observation but no SDK options object to restate. No production
+      adapter is in this shape today (P-1 expected
       :class:`~spirrow_mindwire.adapters.naysayer_lexora.NaysayerLexoraAdapter`
-      is exactly that: a stateless HTTP client, and the owner of the
-      ``LexoraClient`` P-2's preflight reuses. Gating the observation on the
-      configuration would have meant proving provenance required first exposing
-      a mockable ``source:`` line — inverting the epistemic separation Tier-C
-      msg-954 §3 introduced these two lines to preserve.
+      to be, but that Stage-2 adapter is constructed only in tests — the sole
+      registry naysayer is the SDK one, which has options). The case is
+      supported anyway, because gating the observation on the configuration
+      would mean proving provenance required first exposing a mockable
+      ``source:`` line — inverting the epistemic separation Tier-C msg-954 §3
+      introduced these two lines to preserve.
     - both absent — ``body`` is returned **byte-identical**, untouched, so the
       dispatcher can call this unconditionally rather than guard the call. The
       guard is what coupled the two lines in the first place.
