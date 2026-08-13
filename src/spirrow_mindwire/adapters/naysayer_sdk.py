@@ -388,11 +388,23 @@ class NaysayerSdkAdapter:
         # subprocess per refused spawn.
         #
         # Fail-closed here means the turn is not posted. It does not mean the
-        # loop parks politely: the error propagates out of
-        # ``Conductor.run()`` and the daemon exits (verified by reading
-        # ``loop_runner.run_conductor`` — the call is not wrapped). The next
-        # scheduled run then sees no new message and the existing no-progress
-        # guard is what routes it to a human.
+        # loop parks politely: the error propagates out of ``Conductor.run()``
+        # and the daemon exits non-zero (verified by reading
+        # ``loop_runner.run_conductor`` — the call is not wrapped).
+        #
+        # That exit is DECLARED, not silent. ``deploy/run-conductor-scheduled.ps1``
+        # treats any non-zero exit as a candidate failure: it writes a quarantine
+        # record and pushes a Discord notification, then continues the sweep to
+        # the next candidate (``if ($code -ne 0)`` → ``New-QuarantineRecord``,
+        # re-read 2026-08-13; the wrapper gained this on 2026-08-11 in
+        # T-sweep-failure-isolation). So downstream threads do not starve behind
+        # a failing one, and a human learns about it without reading logs — which
+        # is what makes fail-loud the right choice here rather than a degradation
+        # that would let an un-attested naysayer post (Tier-C msg-970 §2).
+        #
+        # The quarantine holds until a human clears it (``Clear-Quarantine.ps1``);
+        # ticks are 5 minutes apart, so a transient outage that resolves itself
+        # still needs that clear.
         try:
             attestation = await self._run_preflight()
         except Exception as exc:

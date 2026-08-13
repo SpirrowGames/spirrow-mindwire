@@ -37,7 +37,21 @@ state is ``run``, the **independent naysayer's** own proceed-handoff to the impl
 naysayer may advance to code, so the proposer can never bypass an objection, and the next iteration
 needs a fresh naysayer proceed after each implementation (the naysayer's handoff IS the latest
 message, so a stale review cannot carry). The gate never trusts a non-human role assignment
-otherwise (msg-552). This is a structural state machine invariant, not a prompt request: the
+otherwise (msg-552).
+
+**Stamp gate (P-3, Tier-C msg-954 §2 / msg-970).** Both places that ask "has the independent
+naysayer spoken?" — the Obj2 forced consult and carve-out ③ — used to answer from **authorship
+alone**, which says nothing about whether the reviewer was the independent distribution. Since P-2
+the naysayer adapter cannot spawn without a preflight that reads the gateway's own accounting row
+back, and the dispatcher stamps that observation onto the post as the ``attest:`` line, so both
+questions are now asked of the stamp (:meth:`Conductor._attested`). Un-attested, carve-out ③ is not
+taken and the turn falls through to the human terminal — the pre-existing safe path.
+**This is noise-reduction, not authentication**: the chatroom accepts any author with any body, so
+the stamp is forgeable by anyone who can post (the same trust model :meth:`Conductor._is_human`
+already documents for author names). It closes the ordinary un-attested case, not an adversarial
+one, and the authoritative Tier-C guard is still the human's manual ``main`` merge.
+
+This is a structural state machine invariant, not a prompt request: the
 adapters are *also* taught to emit a ``NEXT:`` line
 (:func:`~spirrow_mindwire.conductor.handoff.build_handoff_protocol_block`) so a cooperating loop
 chains, but that prompt is advisory and the guards here are the enforcement.
@@ -66,6 +80,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
 from ..github.client import ReviewEvent, parse_pr_ref
 from ..magickit.client import McpToolCaller
+from ..source_marker import parse_attestation_marker
 from ..value_objects import (
     ChatroomEvent,
     EventType,
@@ -368,7 +383,16 @@ class Conductor:
             # (reset-on-implementation). A naysayer escalation (``NEXT: human``) is not a
             # proceed-handoff and falls through to the human terminal below, so the naysayer keeps
             # its pull-the-human-back-in power at every state.
-            if author_role is self._naysayer_role and self._control_state is ControlState.RUN:
+            #
+            # P-3b (Tier-C msg-954 §2 / msg-970): the proceed must additionally carry the harness's
+            # own preflight stamp (:meth:`_attested`). Un-stamped, the branch is simply not taken
+            # and the turn falls through to ``_human_terminal`` below — the EXISTING safe path, so
+            # this adds no new failure mode, only a narrower door.
+            if (
+                author_role is self._naysayer_role
+                and self._control_state is ControlState.RUN
+                and self._attested(messages[-1])
+            ):
                 assert handoff.identity is not None
                 return handoff.role, handoff.identity, False, False, None
             # guard-(i) redirect is NOT an explicit human handoff: under the cost lever it does not
@@ -461,13 +485,60 @@ class Conductor:
         (ADR-11 normalization) is a deferred hardening."""
         return bool(self._human_identity) and author.casefold() == self._human_identity.casefold()
 
+    def _attested(self, msg: dict[str, Any]) -> bool:
+        """Does ``msg`` carry a well-formed harness attestation stamp (P-3, Tier-C msg-970)?
+
+        Since P-2 the naysayer adapter cannot spawn without a preflight that reads the gateway's
+        own accounting row back, and the dispatcher stamps the resulting
+        :class:`~spirrow_mindwire.value_objects.AttestationRecord` onto the posted body as the
+        ``attest:`` line. So a naysayer post WITHOUT that line was not produced by an attested
+        session — the thing the loop's carve-outs are named after ("the *independent* naysayer")
+        was never shown to be independent for that post.
+
+        ``backend == expected`` is required as well as well-formedness. P-2 fails closed on a
+        mismatch, so the harness never emits a mismatching stamp; requiring the match here is what
+        stops a *hand-copied* one (a stale line pasted from another thread, a hand-edited value)
+        from reading as an attestation just because it has the right shape.
+
+        ★ **This is noise-reduction, not authentication, and the difference is not a caveat — it is
+        the accurate description of what this can do.** The input is a chatroom body, and the
+        chatroom accepts any ``author`` string with any text in it, so a stamp is forgeable by
+        anyone who can post: exactly the trust model :meth:`_is_human` already states for author
+        names. What the check buys is that the ordinary way to be un-attested — a naysayer turn
+        that ran without a preflight, or a post from outside the harness — stops being
+        indistinguishable from an attested one. It does not make a forged gate impossible, and
+        nothing downstream should be written as though it did; the authoritative Tier-C guard
+        remains the human's manual ``main`` merge.
+
+        Only the LAST non-empty line is examined, because that is precisely where
+        :func:`~spirrow_mindwire.source_marker.append_markers` puts the stamp — after the body,
+        always last. Scanning the whole body would count a critique that merely *quotes* a marker
+        (this arc's own review turns did exactly that) as a stamp. Note this reads a persisted
+        chatroom message; msg-834 §2 (b) — "the harness never parses an agent body to *build* a
+        marker" — is a constraint on the write path and is untouched.
+        """
+        record = parse_attestation_marker(_content(msg))
+        return record is not None and record.backend == record.expected
+
     def _naysayer_consulted(self, messages: list[dict[str, Any]]) -> bool:
-        """Has the naysayer posted since the last ``NEXT: human`` boundary (excl. the latest msg)?
+        """Has an ATTESTED naysayer posted since the last ``NEXT: human`` boundary (excl. latest)?
 
         The "current segment" is the run of messages after the most recent prior human handoff (or
         the thread start). A naysayer-authored message anywhere in it means this design has already
         had its independent review, so a fresh ``NEXT: human`` may proceed to the human — preventing
         an endless re-review of every disposition while still guaranteeing at least one consult.
+
+        P-3a (Tier-C msg-954 §2 / msg-970): "naysayer-authored" is no longer sufficient — the post
+        must also carry the harness's attestation stamp (:meth:`_attested`). Authorship alone said
+        nothing about whether the reviewer was the independent distribution; the whole point of Obj2
+        is that the consult be independent, so the marker of independence is what has to be present.
+
+        An un-attested naysayer post therefore does not discharge the obligation and the human
+        terminal forces one consult — the pre-existing Obj2 path, not a new one. The cost is bounded
+        at **one** extra consult per segment: the forced turn runs through the adapter, which cannot
+        spawn without attesting, so its reply carries the stamp and every later check in the segment
+        is satisfied. (And a forced consult never re-fires on the naysayer's own latest message, so
+        the two cannot ping-pong.)
         """
         segment = messages[:-1]  # exclude the latest msg (the one now handing to human)
         boundary = 0
@@ -475,7 +546,8 @@ class Conductor:
             if resolve_handoff(_content(msg), self._roster).kind is HandoffKind.HUMAN:
                 boundary = i + 1
         return any(
-            self._roster_role(_author(msg)) is self._naysayer_role for msg in segment[boundary:]
+            self._roster_role(_author(msg)) is self._naysayer_role and self._attested(msg)
+            for msg in segment[boundary:]
         )
 
     def _roster_role(self, author: str) -> Role | None:
