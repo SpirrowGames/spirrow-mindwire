@@ -137,10 +137,8 @@ def test_renamed_via_origin_moved_from(tmp_path: Path, monkeypatch: pytest.Monke
     The bodies must DIFFER here, or the test proves nothing about origin. The
     two signals in ``_match_rename`` are tried in order — matching origin, then
     identical body — so a fixture whose base and head share a body is matched
-    by the fallback and the origin branch is never reached. (It was written
-    that way originally: deleting the entire origin branch left this test, and
-    the whole 1132-test suite, green. The follow-up review of the tail of
-    PR #135 that no reviewer ever saw caught it by mutation.)
+    by the fallback and the origin branch is never reached: deleting the origin
+    branch outright leaves such a test green.
 
     Differing bodies with an identical origin block leave exactly one branch
     that can produce a RENAMED verdict.
@@ -297,9 +295,8 @@ def test_head_read_defaults_to_the_working_tree(
     ``removed_ids = set(base) - set(head)`` ever reaches the summary, so a test
     with an empty base can assert nothing about the head at all: every head —
     the right one, an empty one, a stale one — produces the identical "No
-    obligation ids disappeared" text. (That was this test's original shape, and
-    it passed with ``_read_head_manifest`` returning ``""``; the follow-up
-    review of the never-reviewed tail of PR #135 caught it by mutation.)
+    obligation ids disappeared" text, and such a test passes even with
+    ``_read_head_manifest`` returning ``""``.
 
     So the base carries two ids and the working tree keeps one of them. The
     surviving id is the probe: it stays out of the findings only if the head
