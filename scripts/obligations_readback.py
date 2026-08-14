@@ -198,7 +198,7 @@ class ObligationsReadbackToolError(RuntimeError):
     Raised for anything that is NOT a "file missing at a valid revision"
     result. Kept separate from :class:`RuntimeError` at the type level so a
     caller (or a test) can assert on the discrimination itself — see
-    ``tests/test_obligations_readback.py::test_unknown_base_ref_is_treated_as_tool_failure``.
+    ``tests/test_obligations_readback.py::test_base_read_unknown_ref_raises_tool_error``.
     """
 
 

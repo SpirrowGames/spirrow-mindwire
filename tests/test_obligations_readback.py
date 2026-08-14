@@ -134,9 +134,16 @@ def test_renamed_id_is_reported_via_body_match(
 def test_renamed_via_origin_moved_from(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Origin (moved_from + original_length) is the strongest rename signal.
 
-    Body may legitimately differ across a rename in edge cases; the origin
-    identity is what carries the moved-clause identity through canary
-    two-double-prime.
+    The bodies must DIFFER here, or the test proves nothing about origin. The
+    two signals in ``_match_rename`` are tried in order — matching origin, then
+    identical body — so a fixture whose base and head share a body is matched
+    by the fallback and the origin branch is never reached. (It was written
+    that way originally: deleting the entire origin branch left this test, and
+    the whole 1132-test suite, green. The follow-up review of the tail of
+    PR #135 that no reviewer ever saw caught it by mutation.)
+
+    Differing bodies with an identical origin block leave exactly one branch
+    that can produce a RENAMED verdict.
     """
     base = dedent(
         """\
@@ -147,7 +154,7 @@ def test_renamed_via_origin_moved_from(tmp_path: Path, monkeypatch: pytest.Monke
             origin:
               moved_from: "some/path::LITERAL"
               original_length: 42
-            body: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            body: "the clause exactly as it was first worded"
         """
     )
     head = dedent(
@@ -159,11 +166,12 @@ def test_renamed_via_origin_moved_from(tmp_path: Path, monkeypatch: pytest.Monke
             origin:
               moved_from: "some/path::LITERAL"
               original_length: 42
-            body: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            body: "the same clause, lightly rephrased in this commit"
         """
     )
     summary = _run(base, head, tmp_path, monkeypatch)
     assert "RENAMED: `OBL-OLD` → `OBL-NEW`" in summary
+    assert "REMOVED: `OBL-OLD`" not in summary
 
 
 def test_malformed_base_manifest_is_reported_as_empty_base(
@@ -285,10 +293,17 @@ def test_head_read_defaults_to_the_working_tree(
     """With no `--head-file` and no `--head-ref` (there IS no `--head-ref`), the
     head comes from the working tree — the same source `_scan_references` walks.
 
-    We assert this by monkey-patching the module's ``_REPO_ROOT`` to a temp
-    directory that carries a manifest, and confirming the summary reflects
-    that manifest without any git subprocess ever running (the base is empty
-    because there is no git repo at the temp root; both sides come from disk).
+    The fixture has to be built so that a *broken* head read is visible. Only
+    ``removed_ids = set(base) - set(head)`` ever reaches the summary, so a test
+    with an empty base can assert nothing about the head at all: every head —
+    the right one, an empty one, a stale one — produces the identical "No
+    obligation ids disappeared" text. (That was this test's original shape, and
+    it passed with ``_read_head_manifest`` returning ``""``; the follow-up
+    review of the never-reviewed tail of PR #135 caught it by mutation.)
+
+    So the base carries two ids and the working tree keeps one of them. The
+    surviving id is the probe: it stays out of the findings only if the head
+    really was read from ``fake_repo``.
     """
     fake_repo = tmp_path / "fake_repo"
     (fake_repo / "spec" / "process").mkdir(parents=True)
@@ -297,9 +312,9 @@ def test_head_read_defaults_to_the_working_tree(
             """\
             version: 1
             obligations:
-              - id: OBL-ONLY-IN-HEAD
+              - id: OBL-SURVIVES-IN-HEAD
                 role: implementer
-                body: "only-in-head"
+                body: "still here"
             """
         ),
         encoding="utf-8",
@@ -308,18 +323,35 @@ def test_head_read_defaults_to_the_working_tree(
     summary_file = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
 
-    # Empty base file (test seam), no `--head-*`: head must come from fake_repo.
-    base_file = tmp_path / "base_empty.yaml"
-    base_file.write_text("version: 1\nobligations: []\n", encoding="utf-8")
+    # Base has both ids; the working tree keeps only OBL-SURVIVES-IN-HEAD.
+    base_file = tmp_path / "base.yaml"
+    base_file.write_text(
+        dedent(
+            """\
+            version: 1
+            obligations:
+              - id: OBL-SURVIVES-IN-HEAD
+                role: implementer
+                body: "still here"
+              - id: OBL-DROPPED-IN-HEAD
+                role: implementer
+                body: "gone"
+            """
+        ),
+        encoding="utf-8",
+    )
 
     exit_code = _MODULE.main(  # type: ignore[attr-defined]
         ["--base-file", str(base_file)]
     )
     assert exit_code == 0
     summary = summary_file.read_text(encoding="utf-8")
-    # Head coming from the working tree of fake_repo means the "added" id is
-    # OBL-ONLY-IN-HEAD; no removed id (base was empty) so the summary is clean.
-    assert "No obligation ids disappeared" in summary
+    # The real drift is reported...
+    assert "REMOVED: `OBL-DROPPED-IN-HEAD`" in summary
+    # ...and this is the load-bearing half: if the head had NOT come from the
+    # working tree it would be empty, and the surviving id would be reported
+    # removed too.
+    assert "OBL-SURVIVES-IN-HEAD" not in summary
 
 
 def test_tool_failure_propagates_nonzero_exit(
