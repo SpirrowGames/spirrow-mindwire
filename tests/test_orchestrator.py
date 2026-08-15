@@ -166,9 +166,16 @@ def _existing_threads(
 
 
 @pytest.mark.anyio
-async def test_fire_pr_review_idempotent_open_on_existing_thread() -> None:
-    # Re-firing the same PR finds its thread already there; conclair's "already exists"
-    # collision (a MagickitMcpError) is swallowed and the critique is still posted (msg-459).
+async def test_a_re_review_posts_into_the_existing_thread_without_reopening_it() -> None:
+    """Re-firing an open PR is the ordinary path, and it costs one read (msg-459 idempotence).
+
+    Resolving the id already proved the thread is there and is this PR's. Opening
+    it anyway -- to be told "already exists", then re-reading the same thread to
+    learn whose it is -- spends three round-trips to relearn the first answer, and
+    makes every re-review indistinguishable from the race the handler exists for.
+    The ``raise_on`` below is what the far end would say if the open were
+    attempted; the point of the test is that it never is.
+    """
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _existing_threads({"T-pr-review-r-7": _thread_payload("o/r#7")})
@@ -182,7 +189,7 @@ async def test_fire_pr_review_idempotent_open_on_existing_thread() -> None:
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
     ref, _outcome = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
     assert ref.thread_id == "T-pr-review-r-7"
-    assert any(name == "chatroom_post_message" for name, _ in mcp.calls)  # posted despite collision
+    assert [name for name, _ in mcp.calls] == ["chatroom_get_thread", "chatroom_post_message"]
 
 
 # ---------- repo-qualified thread ids (T-pr-review-thread-id-not-repo-qualified) ---------- #
@@ -374,6 +381,99 @@ async def test_a_thread_that_appears_between_resolve_and_open_is_not_written_int
     with pytest.raises(ThreadIdCollisionError, match="other/r#9"):
         await orch.fire_pr_review(project="p", pr_ref="o/r#9")
     assert all(name != "chatroom_post_message" for name, _ in mcp.calls)
+
+
+@pytest.mark.anyio
+async def test_a_race_that_opens_this_prs_own_thread_is_still_swallowed() -> None:
+    """The idempotent swallow survives -- for the case it was actually meant for.
+
+    Now that the re-review path skips the open entirely, "already exists" can only
+    mean the id was free when the review started and was taken while it ran. When
+    the taker is another gate for the *same* PR that is still one ledger, and the
+    critique belongs in it. This is the branch that used to be exercised (and its
+    cost hidden) by every ordinary re-review.
+    """
+    threads: dict[str, dict[str, Any]] = {}
+
+    class _SamePrRacingDriver(_FakeDriver):
+        async def review(self, pr: PrRef, *, post_critique: PostCritique) -> PrReviewOutcome:
+            threads["T-pr-review-r-9"] = _thread_payload("o/r#9")  # another gate, same PR
+            return await super().review(pr, post_critique=post_critique)
+
+    mcp = _FakeMcp(
+        results={"chatroom_get_thread": _existing_threads(threads)},
+        raise_on={
+            "chatroom_open_thread": MagickitMcpError(
+                "Thread 'T-pr-review-r-9' already exists in project 'p'"
+            )
+        },
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_SamePrRacingDriver())  # type: ignore[arg-type]
+    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#9")
+    assert ref.thread_id == "T-pr-review-r-9"
+    assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-r-9"
+
+
+@pytest.mark.anyio
+async def test_a_pr_mentioned_further_down_the_thread_is_not_its_subject() -> None:
+    """A thread names its PR in its title and its opening request, not in its replies.
+
+    Scanning every message for the first ref it could find made the subject depend
+    on message order: a critique that happens to mention another PR would redefine
+    what the thread is about, and the gate would then report a collision naming
+    that other PR. "Unidentifiable" blocks the qualified id just the same -- but
+    for the reason that is actually true.
+    """
+    driver = _FakeDriver()
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads(
+                {
+                    "T-pr-review-r-9": {
+                        "thread": {"title": "a human renamed this", "status": "active"},
+                        "messages": [
+                            {"msg_id": "msg-001", "content": "no ref here"},
+                            {"msg_id": "msg-002", "content": "cf. other/elsewhere#3"},
+                        ],
+                    }
+                }
+            )
+        },
+    )
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    with pytest.raises(ThreadIdCollisionError, match="unidentifiable") as excinfo:
+        await orch.fire_pr_review(project="p", pr_ref="o/r#9")
+    assert "other/elsewhere#3" not in str(excinfo.value)
+    assert driver.reviewed == []
+
+
+@pytest.mark.anyio
+async def test_a_thread_whose_title_carries_no_ref_is_identified_by_its_request() -> None:
+    """The title is not the only place a thread names its PR.
+
+    ``fire_pr_review`` takes a caller-supplied title, so a gate can open a thread
+    whose title says nothing about the PR. The review request it posts always
+    does -- and without that fallback the PR's own thread would read back as
+    unidentifiable and its next gate would refuse to touch it.
+    """
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads(
+                {
+                    "T-pr-review-r-7": {
+                        "thread": {"title": "nightly gate", "status": "active"},
+                        "messages": [
+                            {"msg_id": "msg-001", "content": "naysayer review request — PR o/r#7"}
+                        ],
+                    }
+                }
+            )
+        }
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    assert ref.thread_id == "T-pr-review-r-7"
+    assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-r-7"
 
 
 @pytest.mark.anyio

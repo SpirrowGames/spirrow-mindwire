@@ -120,6 +120,25 @@ def _legacy_thread_id(prefix: str, pr: PrRef) -> str:
     return f"{prefix}{pr.number}"
 
 
+@dataclass(frozen=True)
+class _ResolvedThread:
+    """The id this PR's gate writes to, **and whether its thread is already there**.
+
+    ``exists`` is not a convenience. Resolving the id already had to read the far
+    end to prove the id is free or ours, and dropping that answer is what made the
+    ordinary re-review path (an open PR that got another push) open a thread it had
+    just been told was open: a guaranteed "already exists" failure, caught by the
+    collision handler, which then re-read the very same thread to find out whose it
+    was. Three round-trips to relearn what the first one returned, and the race
+    handler standing in for normal control flow — so a genuine race and a re-review
+    became indistinguishable in the logs. Carrying the bit forward leaves the race
+    handler for races.
+    """
+
+    thread_id: str
+    exists: bool
+
+
 class PrReviewOrchestrator:
     """Opens a ``T-pr-review-<repo>-<n>`` thread + drives the naysayer PR-review driver (§A.2)."""
 
@@ -166,7 +185,8 @@ class PrReviewOrchestrator:
         # time: an unusable id should cost nothing, whereas failing after `driver.review` would
         # throw away a paid-for Gemini judgement. Only reads happen here, so the thread itself is
         # still opened lazily (msg-453: no abandoned empty thread on a transient remote error).
-        thread_id = await self._resolve_thread_id(project=project, pr=pr)
+        resolved = await self._resolve_thread_id(project=project, pr=pr)
+        thread_id = resolved.thread_id
         title = title or f"PR review (develop→main) — {pr_ref}"
         propose = (
             f"naysayer review request — develop→main PR {pr_ref}\n\n"
@@ -181,13 +201,17 @@ class PrReviewOrchestrator:
             chatroom_uri=f"magickit://chatroom/thread/{thread_id}",
         )
 
-        opened = False
+        # Nothing to open when resolving already found this PR's thread — the re-review path.
+        # Reading `exists` here is what keeps the "already exists" handler in `_open_thread` a
+        # race handler: it is now reached only when the id was free at resolve time.
+        opened = resolved.exists
 
         async def post_critique(body: str) -> None:
-            # Open the thread LAZILY — only once there is a critique to put in it. The driver
-            # calls this exactly once, after a review is produced. Opening durable chatroom state
-            # up-front (before the fallible Lexora/GitHub calls inside driver.review) would leave
-            # an abandoned empty review thread on every transient remote error (Tier B msg-453).
+            # Open the thread LAZILY — only once there is a critique to put in it, and only if it
+            # is not already there. The driver calls this exactly once, after a review is produced.
+            # Opening durable chatroom state up-front (before the fallible Lexora/GitHub calls
+            # inside driver.review) would leave an abandoned empty review thread on every transient
+            # remote error (Tier B msg-453).
             # Posted as the naysayer; the driver calls this before the GitHub submission.
             nonlocal opened
             if not opened:
@@ -209,7 +233,7 @@ class PrReviewOrchestrator:
         outcome = await self._driver.review(pr, post_critique=post_critique)
         return thread_ref, outcome
 
-    async def _resolve_thread_id(self, *, project: str, pr: PrRef) -> str:
+    async def _resolve_thread_id(self, *, project: str, pr: PrRef) -> _ResolvedThread:
         """Pick the thread id this PR's gate writes to, and prove it is free or ours.
 
         Order matters. The qualified id is the answer unless an *older* thread for
@@ -224,6 +248,10 @@ class PrReviewOrchestrator:
         ours: the qualified id is still free, so the gate continues there rather
         than failing. "Is this id usable" and "is this thread mine" are separate
         questions and only the first one is a reason to stop.
+
+        Both answers are returned (:class:`_ResolvedThread`), because deciding which
+        id to use *is* deciding whether it already holds a thread — and the caller
+        needs that second fact to know whether there is anything left to open.
         """
         qualified = _qualified_thread_id(self._thread_prefix, pr)
         found = await self._thread_subject(project=project, thread_id=qualified)
@@ -233,14 +261,14 @@ class PrReviewOrchestrator:
                     f"thread {qualified!r} in project {project!r} is about {found.label}, "
                     f"not {pr.slug} — refusing to post one PR's review into another's thread"
                 )
-            return qualified
+            return _ResolvedThread(thread_id=qualified, exists=True)
 
         legacy = _legacy_thread_id(self._thread_prefix, pr)
         if legacy != qualified:
             older = await self._thread_subject(project=project, thread_id=legacy)
             if _same_pr(older.pr, pr):
-                return legacy
-        return qualified
+                return _ResolvedThread(thread_id=legacy, exists=True)
+        return _ResolvedThread(thread_id=qualified, exists=False)
 
     async def _thread_subject(self, *, project: str, thread_id: str) -> _ThreadSubject:
         """What is sitting on ``thread_id``: nothing, this PR, or something unnamed.
@@ -249,6 +277,19 @@ class PrReviewOrchestrator:
         that returned **something** describes a thread that exists, so a payload
         this cannot parse is reported as existing-but-unidentified rather than as
         free — guessing "free" there is how an occupied id gets handed to a review.
+
+        Only the title and the **first** message are read as statements of which PR
+        this is. Those are the two the gate itself writes when it opens the thread —
+        the title carries the ref, and so does the review request. Everything after
+        them is critiques and replies, which routinely mention *other* PRs; taking
+        the first ref found anywhere in the transcript let a passing mention decide
+        what the thread is about, with message order picking the winner.
+
+        Both are read rather than just the title, because neither alone is reliable:
+        ``fire_pr_review`` accepts a caller-supplied ``title``, and a title can be
+        edited afterwards — either would strand the PR's own thread as
+        unidentifiable, and at the qualified id that is a hard stop for its next
+        gate.
 
         ``mode="summary"`` keeps the payload small — a colliding id can point at a
         long resolved thread. A summary of a resolved thread carries only its decide
@@ -272,7 +313,7 @@ class PrReviewOrchestrator:
             messages = payload.get("messages")
             if isinstance(messages, list):
                 candidates.extend(
-                    str(m.get("content") or "") for m in messages if isinstance(m, dict)
+                    str(m.get("content") or "") for m in messages[:1] if isinstance(m, dict)
                 )
         for text in candidates:
             # parse_pr_ref accepts both `owner/repo#n` and PR URLs, so a thread opened
@@ -298,6 +339,11 @@ class PrReviewOrchestrator:
         clash would not even have been noisy at the far end. This re-check is not redundant
         with :meth:`_resolve_thread_id`: the review runs between the two, which is ample time
         for another gate to have opened the same thread.
+
+        It is also the *only* way to get here. ``fire_pr_review`` skips the open entirely when
+        resolving found this PR's thread already in place, so "already exists" at this point
+        means the id was free when the review started and is not free now — a real race, not the
+        ordinary re-review of an open PR.
         """
         try:
             await self._mcp.call_tool(
