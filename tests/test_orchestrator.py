@@ -139,20 +139,43 @@ async def test_orchestrator_aclose_closes_driver() -> None:
 
 
 def _thread_payload(pr_ref: str, *, title: str | None = None) -> dict[str, Any]:
-    """What ``chatroom_get_thread`` returns for a review thread the driver opened."""
+    """What ``chatroom_get_thread`` returns for a review thread the driver opened.
+
+    Shaped like conclair's ``ThreadView``: the thread names its opening msg in
+    ``created_by_msg`` (required there -- "the thread's first msg (the propose);
+    it never changes") and every msg carries its ``type``. Both are things the
+    far end always sends and the caller is entitled to use, so a payload without
+    them is not a smaller answer, it is one the server cannot give.
+    """
     return {
         "thread": {
             "title": f"PR review (develop→main) — {pr_ref}" if title is None else title,
             "status": "active",
+            "created_by_msg": "msg-001",
         },
-        "messages": [{"msg_id": "msg-001", "content": f"naysayer review request — PR {pr_ref}"}],
+        "messages": [
+            {
+                "msg_id": "msg-001",
+                "type": "propose",
+                "content": f"naysayer review request — PR {pr_ref}",
+            }
+        ],
     }
 
 
 def _existing_threads(
     threads: dict[str, dict[str, Any]],
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    """A ``chatroom_get_thread`` stub: known ids answer, unknown ids 404 like conclair."""
+    """A ``chatroom_get_thread`` stub: known ids answer, unknown ids 404 like conclair.
+
+    ``mode`` is answered the way conclair answers it (``api/threads.py``): a
+    ``summary`` of a **resolved** thread carries only its ``decide`` msgs, and
+    every other status returns the whole list whatever the mode. The stub reacts
+    to the mode the caller asks for rather than always returning everything --
+    otherwise the caller's choice of mode has no consequence here, and a mode
+    that hides the message the caller depends on can only be discovered in
+    production.
+    """
 
     def _get(arguments: dict[str, Any]) -> dict[str, Any]:
         thread_id = arguments["thread_id"]
@@ -160,7 +183,12 @@ def _existing_threads(
             raise MagickitMcpError(
                 f"Thread '{thread_id}' not found in project '{arguments['project']}'"
             )
-        return threads[thread_id]
+        payload = threads[thread_id]
+        thread: dict[str, Any] = payload.get("thread", {})
+        if arguments.get("mode") != "summary" or thread.get("status") != "resolved":
+            return payload
+        messages: list[dict[str, Any]] = payload.get("messages", [])
+        return {**payload, "messages": [m for m in messages if m.get("type") == "decide"]}
 
     return _get
 
@@ -306,8 +334,15 @@ async def test_an_unidentifiable_thread_on_the_qualified_id_also_fails_before_th
             "chatroom_get_thread": _existing_threads(
                 {
                     "T-pr-review-r-9": {
-                        "thread": {"title": "something a human opened", "status": "resolved"},
-                        "messages": [{"msg_id": "msg-001", "content": "no ref here"}],
+                        "thread": {
+                            "title": "something a human opened",
+                            "status": "resolved",
+                            "created_by_msg": "msg-001",
+                        },
+                        "messages": [
+                            {"msg_id": "msg-001", "type": "propose", "content": "no ref here"},
+                            {"msg_id": "msg-002", "type": "decide", "content": "closing this"},
+                        ],
                     }
                 }
             )
@@ -430,10 +465,18 @@ async def test_a_pr_mentioned_further_down_the_thread_is_not_its_subject() -> No
             "chatroom_get_thread": _existing_threads(
                 {
                     "T-pr-review-r-9": {
-                        "thread": {"title": "a human renamed this", "status": "active"},
+                        "thread": {
+                            "title": "a human renamed this",
+                            "status": "active",
+                            "created_by_msg": "msg-001",
+                        },
                         "messages": [
-                            {"msg_id": "msg-001", "content": "no ref here"},
-                            {"msg_id": "msg-002", "content": "cf. other/elsewhere#3"},
+                            {"msg_id": "msg-001", "type": "propose", "content": "no ref here"},
+                            {
+                                "msg_id": "msg-002",
+                                "type": "report",
+                                "content": "cf. other/elsewhere#3",
+                            },
                         ],
                     }
                 }
@@ -461,9 +504,17 @@ async def test_a_thread_whose_title_carries_no_ref_is_identified_by_its_request(
             "chatroom_get_thread": _existing_threads(
                 {
                     "T-pr-review-r-7": {
-                        "thread": {"title": "nightly gate", "status": "active"},
+                        "thread": {
+                            "title": "nightly gate",
+                            "status": "active",
+                            "created_by_msg": "msg-001",
+                        },
                         "messages": [
-                            {"msg_id": "msg-001", "content": "naysayer review request — PR o/r#7"}
+                            {
+                                "msg_id": "msg-001",
+                                "type": "propose",
+                                "content": "naysayer review request — PR o/r#7",
+                            }
                         ],
                     }
                 }
@@ -474,6 +525,104 @@ async def test_a_thread_whose_title_carries_no_ref_is_identified_by_its_request(
     ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
     assert ref.thread_id == "T-pr-review-r-7"
     assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-r-7"
+
+
+@pytest.mark.anyio
+async def test_a_closing_note_naming_this_pr_does_not_make_the_thread_ours() -> None:
+    """A resolved thread answers with its *closing* note, and closing notes name other PRs.
+
+    Asking for ``mode="summary"`` and then reading whichever message came back
+    first as "the opening request" is only the same thing while the thread is
+    open: conclair filters a resolved thread down to its ``decide`` msgs, so the
+    first (and only) message returned is the note that closed it -- and those say
+    things like "superseded by owner/repo#9" as a matter of habit. When the PR
+    named there is the one being gated, a stranger's thread reads back as this
+    PR's own and the critique is posted into it. Nothing objects: conclair takes
+    a ``report`` into a resolved thread (only ``decide`` is status-gated), so the
+    ledger of a finished review quietly acquires an unrelated PR's verdict.
+
+    The opener is fetched by the id the thread gives for it, so the summary's
+    substitution cannot happen; blocking here is the whole point of the id check.
+    """
+    driver = _FakeDriver()
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads(
+                {
+                    "T-pr-review-r-9": {
+                        "thread": {
+                            "title": "a review someone else already finished",
+                            "status": "resolved",
+                            "created_by_msg": "msg-001",
+                        },
+                        "messages": [
+                            {
+                                "msg_id": "msg-001",
+                                "type": "propose",
+                                "content": "naysayer review request — PR other/elsewhere#3",
+                            },
+                            {
+                                "msg_id": "msg-002",
+                                "type": "decide",
+                                "content": "closing — superseded by o/r#9",
+                            },
+                        ],
+                    }
+                }
+            )
+        }
+    )
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    with pytest.raises(ThreadIdCollisionError, match="other/elsewhere#3"):
+        await orch.fire_pr_review(project="p", pr_ref="o/r#9")
+    assert driver.reviewed == []
+    assert all(name == "chatroom_get_thread" for name, _ in mcp.calls)
+
+
+@pytest.mark.anyio
+async def test_a_resolved_thread_is_still_identified_by_its_opening_request() -> None:
+    """The other direction of the same substitution: a PR locked out of its own ledger.
+
+    Same shape as the test above -- a resolved thread whose title carries no ref,
+    so the messages have to answer -- but here the thread *is* this PR's and its
+    closing note mentions a different one. Reading the summary's first message
+    attributed the thread to that other PR, and the qualified id then refused the
+    PR its own thread on every later gate, permanently and with a reason that was
+    never true.
+    """
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads(
+                {
+                    "T-pr-review-r-7": {
+                        "thread": {
+                            "title": "nightly gate",
+                            "status": "resolved",
+                            "created_by_msg": "msg-001",
+                        },
+                        "messages": [
+                            {
+                                "msg_id": "msg-001",
+                                "type": "propose",
+                                "content": "naysayer review request — PR o/r#7",
+                            },
+                            {
+                                "msg_id": "msg-002",
+                                "type": "decide",
+                                "content": "closing — follow-up lives in other/elsewhere#3",
+                            },
+                        ],
+                    }
+                }
+            )
+        }
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    assert ref.thread_id == "T-pr-review-r-7"
+    assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-r-7"
+    # Resolving found the thread, so there is nothing to open (the re-review path).
+    assert all(name != "chatroom_open_thread" for name, _ in mcp.calls)
 
 
 @pytest.mark.anyio

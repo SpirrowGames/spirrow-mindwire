@@ -278,27 +278,43 @@ class PrReviewOrchestrator:
         this cannot parse is reported as existing-but-unidentified rather than as
         free — guessing "free" there is how an occupied id gets handed to a review.
 
-        Only the title and the **first** message are read as statements of which PR
-        this is. Those are the two the gate itself writes when it opens the thread —
-        the title carries the ref, and so does the review request. Everything after
-        them is critiques and replies, which routinely mention *other* PRs; taking
-        the first ref found anywhere in the transcript let a passing mention decide
-        what the thread is about, with message order picking the winner.
+        Only the title and the thread's **opening** message are read as statements
+        of which PR this is. Those are the two the gate itself writes when it opens
+        the thread — the title carries the ref, and so does the review request.
+        Everything after them is critiques, replies and closing notes, which
+        routinely mention *other* PRs ("closing, superseded by owner/repo#99");
+        letting any of those speak for the thread makes a passing mention decide
+        what the thread is about.
 
         Both are read rather than just the title, because neither alone is reliable:
-        ``fire_pr_review`` accepts a caller-supplied ``title``, and a title can be
-        edited afterwards — either would strand the PR's own thread as
-        unidentifiable, and at the qualified id that is a hard stop for its next
-        gate.
+        ``fire_pr_review`` accepts a caller-supplied ``title``, and a thread on this
+        id may have been opened by something other than the gate — either would
+        strand the PR's own thread as unidentifiable, and at the qualified id that
+        is a hard stop for its next gate.
 
-        ``mode="summary"`` keeps the payload small — a colliding id can point at a
-        long resolved thread. A summary of a resolved thread carries only its decide
-        msg, which is why the title is parsed first: it is present in every mode.
+        The opening message is taken **by the id the thread gives for it**
+        (``created_by_msg``: required, and per the chatroom schema "the thread's
+        first msg (the propose); it never changes"), not by position in
+        ``messages``. Position is not identity: the returned list is filtered by
+        ``mode`` — ``summary`` on a *resolved* thread returns only its ``decide``
+        msgs — so "first element" there is the thread's closing note, i.e. exactly
+        the kind of message excluded above. Asking for the opener by name means a
+        payload that does not contain it yields *no* statement (unidentified, which
+        blocks) rather than the wrong one (misattributed, which either locks a PR
+        out of its own thread or writes its critique into someone else's).
+
+        ``mode="full"`` is therefore requested explicitly: the opener has to be in
+        the payload for the thread to be identifiable at all. The earlier
+        ``"summary"`` was there to keep a long thread's payload small, but conclair
+        filters only when ``status == "resolved"`` — every other state returns the
+        full list regardless — so it shrank nothing on the live path (the gate's own
+        threads are all still open, issue #147) and dropped the one message that
+        matters exactly where it did shrink.
         """
         try:
             payload = await self._mcp.call_tool(
                 "chatroom_get_thread",
-                {"project": project, "thread_id": thread_id, "mode": "summary"},
+                {"project": project, "thread_id": thread_id, "mode": "full"},
             )
         except MagickitMcpError as exc:
             if "not found" in str(exc).lower():
@@ -308,12 +324,18 @@ class PrReviewOrchestrator:
         candidates: list[str] = []
         if isinstance(payload, dict):
             thread = payload.get("thread")
+            opening_msg_id = ""
             if isinstance(thread, dict):
                 candidates.append(str(thread.get("title") or ""))
+                opening_msg_id = str(thread.get("created_by_msg") or "")
             messages = payload.get("messages")
-            if isinstance(messages, list):
+            # No id for the opener means no message speaks for the thread: an unnamed
+            # opener is not grounds for promoting whichever message came back first.
+            if opening_msg_id and isinstance(messages, list):
                 candidates.extend(
-                    str(m.get("content") or "") for m in messages[:1] if isinstance(m, dict)
+                    str(m.get("content") or "")
+                    for m in messages
+                    if isinstance(m, dict) and m.get("msg_id") == opening_msg_id
                 )
         for text in candidates:
             # parse_pr_ref accepts both `owner/repo#n` and PR URLs, so a thread opened
