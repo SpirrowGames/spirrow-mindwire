@@ -278,19 +278,38 @@ class PrReviewOrchestrator:
         this cannot parse is reported as existing-but-unidentified rather than as
         free — guessing "free" there is how an occupied id gets handed to a review.
 
-        Only the title and the thread's **opening** message are read as statements
+        Only the thread's **opening** message and its title are read as statements
         of which PR this is. Those are the two the gate itself writes when it opens
-        the thread — the title carries the ref, and so does the review request.
+        the thread — the review request carries the ref, and so does the title.
         Everything after them is critiques, replies and closing notes, which
         routinely mention *other* PRs ("closing, superseded by owner/repo#99");
         letting any of those speak for the thread makes a passing mention decide
         what the thread is about.
 
-        Both are read rather than just the title, because neither alone is reliable:
-        ``fire_pr_review`` accepts a caller-supplied ``title``, and a thread on this
-        id may have been opened by something other than the gate — either would
-        strand the PR's own thread as unidentifiable, and at the qualified id that
-        is a hard stop for its next gate.
+        The two are **not** peers, and which one that makes authoritative is not a
+        matter of taste. The opening message is fixed at open time and append-only
+        thereafter; the title is caller-supplied (``fire_pr_review`` takes one) and
+        is not part of what identifies the thread. So the opener decides, and the
+        title is read **only when the opener names no PR at all** — never as a
+        competing opinion. Letting the title win over a readable opener meant a
+        caller who passed a title naming some *other* PR ("reviewing the fix for
+        owner/repo#99") locked this PR out of its own ledger for good: every later
+        gate re-read that title, disagreed with itself, and raised
+        :class:`ThreadIdCollisionError` over a thread that was this PR's all along.
+
+        The title is nevertheless still read, because dropping it strands threads
+        that exist right now. Measured over every ``T-pr-review-<n>`` thread in both
+        live gate projects (149 threads: 118 in ``spirrow-voxelworld``, 31 in
+        ``spirrow-mindwire``), **four** name their PR in the title and nowhere else
+        — ``T-pr-review-162/163/164/166``, all opened by hand rather than by this
+        gate, whose opening message says "PR #163" without the ``owner/repo``
+        qualification ``parse_pr_ref`` needs. On the same sweep, **zero** threads
+        have a title and an opener naming *different* PRs, so the ordering above
+        costs nothing today and the fallback is load-bearing today. Those four sit
+        on *legacy* ids, where an unidentifiable thread is not an error but a
+        fall-through to the qualified id: the gate would open a second ledger for a
+        PR that already has one, which is the exact split :func:`_legacy_thread_id`
+        exists to prevent.
 
         The opening message is taken **by the id the thread gives for it**
         (``created_by_msg``: required, and per the chatroom schema "the thread's
@@ -321,29 +340,35 @@ class PrReviewOrchestrator:
                 return _NO_THREAD
             raise
 
-        candidates: list[str] = []
+        title = ""
+        opener = ""
         if isinstance(payload, dict):
             thread = payload.get("thread")
             opening_msg_id = ""
             if isinstance(thread, dict):
-                candidates.append(str(thread.get("title") or ""))
+                title = str(thread.get("title") or "")
                 opening_msg_id = str(thread.get("created_by_msg") or "")
             messages = payload.get("messages")
             # No id for the opener means no message speaks for the thread: an unnamed
             # opener is not grounds for promoting whichever message came back first.
             if opening_msg_id and isinstance(messages, list):
-                candidates.extend(
-                    str(m.get("content") or "")
-                    for m in messages
-                    if isinstance(m, dict) and m.get("msg_id") == opening_msg_id
+                opener = next(
+                    (
+                        str(m.get("content") or "")
+                        for m in messages
+                        if isinstance(m, dict) and m.get("msg_id") == opening_msg_id
+                    ),
+                    "",
                 )
-        for text in candidates:
-            # parse_pr_ref accepts both `owner/repo#n` and PR URLs, so a thread opened
-            # from a URL-shaped ref still compares equal to one opened from a slug.
-            ref = parse_pr_ref(text)
-            if ref is not None:
-                return _ThreadSubject(exists=True, pr=ref)
-        return _ThreadSubject(exists=True, pr=None)
+
+        # parse_pr_ref accepts both `owner/repo#n` and PR URLs, so a thread opened from a
+        # URL-shaped ref still compares equal to one opened from a slug.
+        subject = parse_pr_ref(opener)
+        if subject is None:
+            # Reached only when the opener names no PR at all -- the title recovers a
+            # thread the gate did not open, it never overrules one it did.
+            subject = parse_pr_ref(title)
+        return _ThreadSubject(exists=True, pr=subject)
 
     async def _open_thread(
         self, *, project: str, thread_id: str, title: str, propose: str, pr: PrRef

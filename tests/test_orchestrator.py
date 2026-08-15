@@ -528,6 +528,96 @@ async def test_a_thread_whose_title_carries_no_ref_is_identified_by_its_request(
 
 
 @pytest.mark.anyio
+async def test_a_title_naming_another_pr_does_not_overrule_the_opening_request() -> None:
+    """The title is caller-supplied; the opening request is what the thread was opened as.
+
+    Reading the title first let it win over an opener that disagreed, and the two
+    can disagree because only one of them is fixed at open time: ``fire_pr_review``
+    takes a caller-supplied title, so a gate fired with a title mentioning some
+    other PR ("reviewing the fix for other/elsewhere#99") wrote that PR's ref into
+    the title of *this* PR's thread. Every later gate then re-read the title,
+    disagreed with the request it had itself posted, and refused the PR its own
+    ledger with a ``ThreadIdCollisionError`` naming a PR that had nothing to do
+    with it -- permanently, since nothing ever rewrites the title back.
+    """
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads(
+                {
+                    "T-pr-review-r-7": {
+                        "thread": {
+                            "title": "reviewing the fix for other/elsewhere#99",
+                            "status": "active",
+                            "created_by_msg": "msg-001",
+                        },
+                        "messages": [
+                            {
+                                "msg_id": "msg-001",
+                                "type": "propose",
+                                "content": "naysayer review request — PR o/r#7",
+                            }
+                        ],
+                    }
+                }
+            )
+        }
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    assert ref.thread_id == "T-pr-review-r-7"
+    assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-r-7"
+    # Resolving found this PR's own thread, so there is nothing to open.
+    assert all(name != "chatroom_open_thread" for name, _ in mcp.calls)
+
+
+@pytest.mark.anyio
+async def test_a_thread_whose_request_carries_no_ref_is_identified_by_its_title() -> None:
+    """The mirror case, and the reason the title is read at all rather than dropped.
+
+    Making the opener authoritative invites deleting the title as a source
+    outright -- one source, no ordering, no fallback. It cannot be deleted: four
+    live threads name their PR *only* in the title. All four
+    (``T-pr-review-162/163/164/166`` in ``spirrow-voxelworld``) were opened by hand
+    rather than by this gate, and their opening message says "PR #163" without the
+    ``owner/repo`` qualification :func:`parse_pr_ref` requires -- shaped like the
+    payload below.
+
+    They sit on *legacy* ids, where being unidentifiable is not an error but a
+    fall-through: the gate would decide the old thread is not this PR's, move to
+    the qualified id and open a second ledger for a PR that already has one. That
+    split is precisely what the legacy id exists to prevent, so a re-gate of one of
+    those PRs has to land back on its existing thread.
+    """
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads(
+                {
+                    "T-pr-review-7": {
+                        "thread": {
+                            "title": "PR review (naysayer PR-gate) — o/r#7 (scoped re-gate)",
+                            "status": "active",
+                            "created_by_msg": "msg-001",
+                        },
+                        "messages": [
+                            {
+                                "msg_id": "msg-001",
+                                "type": "propose",
+                                "content": "# naysayer PR-gate — PR #7 @`0b2c565` = RC",
+                            }
+                        ],
+                    }
+                }
+            )
+        }
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    assert ref.thread_id == "T-pr-review-7"
+    assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-7"
+    assert all(name != "chatroom_open_thread" for name, _ in mcp.calls)
+
+
+@pytest.mark.anyio
 async def test_a_closing_note_naming_this_pr_does_not_make_the_thread_ours() -> None:
     """A resolved thread answers with its *closing* note, and closing notes name other PRs.
 
