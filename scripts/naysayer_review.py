@@ -2,8 +2,8 @@
 
 Reuses the production machinery end-to-end — no new review logic here: it builds the
 :class:`~spirrow_mindwire.naysayer.pr_review.NaysayerPrReviewDriver` and drives it through
-:class:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator`, which opens a ``T-pr-review-<n>``
-chatroom thread and then:
+:class:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator`, which opens a
+``T-pr-review-<repo>-<n>`` chatroom thread and then:
 
   1. runs the deterministic CI-gate (ADR-16) — fail-closed when CI is not green,
   2. (if CI green) fetches the PR diff from GitHub **raw** (no curation) and has Lexora's

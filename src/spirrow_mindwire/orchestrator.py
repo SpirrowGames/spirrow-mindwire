@@ -1,8 +1,8 @@
 """PR-review orchestrator — WIRING_ALLOWLIST_SPEC §A.2 (T20 → ADR-19 driver-化).
 
 Event-driven trigger for the naysayer's Tier B gate (ADR-07 §2.2): when a develop→main PR is
-opened, :meth:`PrReviewOrchestrator.fire_pr_review` opens a ``T-pr-review-<n>`` chatroom thread
-carrying the PR ref and **drives the review directly** via
+opened, :meth:`PrReviewOrchestrator.fire_pr_review` opens a ``T-pr-review-<repo>-<n>`` chatroom
+thread carrying the PR ref and **drives the review directly** via
 :class:`~spirrow_mindwire.naysayer.pr_review.NaysayerPrReviewDriver` — it runs the deterministic
 CI-gate, has the independent Gemini judge the diff (Lexora one-shot), posts the critique to the
 thread, and submits the GitHub PR review.
@@ -28,8 +28,53 @@ _DEFAULT_OWNER = "orchestrator"
 _DEFAULT_NAYSAYER_AUTHOR = "naysayer-pr-review"
 
 
+class ThreadIdCollisionError(RuntimeError):
+    """A PR-review thread id is already taken by a *different* PR.
+
+    Raised instead of writing into the other PR's ledger. The gate fails loudly
+    and produces nothing rather than appending a critique to a thread whose title,
+    history and close-predicate belong to something else.
+    """
+
+
+def _qualified_thread_id(prefix: str, pr: PrRef) -> str:
+    """``T-pr-review-<repo>-<n>`` — the repo is *in* the id, not assumed around it.
+
+    The previous id was ``T-pr-review-<n>``, justified in a comment by "the chatroom
+    is per-project, so a PR number is project-unique for a single-repo project — not
+    the case today". That condition stopped holding without anyone noticing: one
+    chatroom project now carries PR-gate threads for four repos, and PR numbers are
+    only unique *within* a repo. Since ``_open_thread`` treats "already exists" as
+    success, the resulting id clash would not have raised — it would have appended
+    one repo's critique to another repo's thread.
+
+    The repo is lower-cased so that the same repo written two ways
+    (``Spirrow-VoxelWorld`` / ``spirrow-voxelworld``) cannot open two ledgers for
+    one PR; GitHub repo names are case-insensitive for identity.
+
+    The owner is deliberately *not* in the id: it would make every id half again as
+    long for a distinction that only bites across organisations. That is a premise
+    too — but unlike the old one it is not left to a comment: two different PRs
+    landing on one id is checked at open time and raises
+    :class:`ThreadIdCollisionError`. If that ever fires for a cross-org repo-name
+    clash, the fix is to extend this function with ``pr.owner``.
+    """
+    return f"{prefix}{pr.repo.lower()}-{pr.number}"
+
+
+def _legacy_thread_id(prefix: str, pr: PrRef) -> str:
+    """``T-pr-review-<n>`` — the pre-qualification id.
+
+    Kept only so a PR whose gate already opened a thread under the old scheme keeps
+    writing to it instead of sprouting a second, disjoint ledger mid-review. It is
+    reused *only* when that thread is verifiably about this same PR. Deletable once
+    no unqualified PR-gate thread is still live.
+    """
+    return f"{prefix}{pr.number}"
+
+
 class PrReviewOrchestrator:
-    """Opens a ``T-pr-review-<n>`` thread + drives the naysayer PR-review driver (§A.2)."""
+    """Opens a ``T-pr-review-<repo>-<n>`` thread + drives the naysayer PR-review driver (§A.2)."""
 
     def __init__(
         self,
@@ -55,7 +100,7 @@ class PrReviewOrchestrator:
     ) -> tuple[ThreadRef, PrReviewOutcome]:
         """Open the review thread for a develop→main PR and drive the naysayer review.
 
-        The thread id is **PR-derived and deterministic** — ``T-pr-review-<pr.number>`` — so there
+        The thread id is **PR-derived and deterministic** — ``T-pr-review-<repo>-<n>`` — so there
         is no max+1 numbering to race (Tier C decide msg-459, resolving the Tier B leak-vs-race
         flip-flop). Returns the thread's :class:`ThreadRef` and the
         :class:`~spirrow_mindwire.naysayer.pr_review.PrReviewOutcome`. Raises ``ValueError`` if
@@ -70,10 +115,11 @@ class PrReviewOrchestrator:
 
         # Deterministic, PR-derived thread id (Tier C decide msg-459): no max+1 numbering, so there
         # is no compute→defer-open TOCTOU window (Tier B round-2 msg-457) and re-firing the same PR
-        # reuses its one thread. pr.number is unique within a repo and the chatroom is per-project,
-        # so this is project-unique for a single-repo project (a multi-repo-in-one-project setup
-        # would need the repo in the id — not the case today).
-        thread_id = f"{self._thread_prefix}{pr.number}"
+        # reuses its one thread. Resolved (and validated) *before* the review runs, not at post
+        # time: an unusable id should cost nothing, whereas failing after `driver.review` would
+        # throw away a paid-for Gemini judgement. Only reads happen here, so the thread itself is
+        # still opened lazily (msg-453: no abandoned empty thread on a transient remote error).
+        thread_id = await self._resolve_thread_id(project=project, pr=pr)
         title = title or f"PR review (develop→main) — {pr_ref}"
         propose = (
             f"naysayer review request — develop→main PR {pr_ref}\n\n"
@@ -94,12 +140,12 @@ class PrReviewOrchestrator:
             # Open the thread LAZILY — only once there is a critique to put in it. The driver
             # calls this exactly once, after a review is produced. Opening durable chatroom state
             # up-front (before the fallible Lexora/GitHub calls inside driver.review) would leave
-            # an abandoned empty T-pr-review-<n> on every transient remote error (Tier B msg-453).
+            # an abandoned empty review thread on every transient remote error (Tier B msg-453).
             # Posted as the naysayer; the driver calls this before the GitHub submission.
             nonlocal opened
             if not opened:
                 await self._open_thread(
-                    project=project, thread_id=thread_id, title=title, propose=propose
+                    project=project, thread_id=thread_id, title=title, propose=propose, pr=pr
                 )
                 opened = True
             await self._mcp.call_tool(
@@ -116,13 +162,86 @@ class PrReviewOrchestrator:
         outcome = await self._driver.review(pr, post_critique=post_critique)
         return thread_ref, outcome
 
-    async def _open_thread(self, *, project: str, thread_id: str, title: str, propose: str) -> None:
+    async def _resolve_thread_id(self, *, project: str, pr: PrRef) -> str:
+        """Pick the thread id this PR's gate writes to, and prove it is free or ours.
+
+        Order matters. The qualified id is the answer unless an *older* thread for
+        this same PR already exists under the pre-qualification scheme, in which
+        case the review continues where it started.
+        """
+        qualified = _qualified_thread_id(self._thread_prefix, pr)
+        subject = await self._thread_subject(project=project, thread_id=qualified)
+        if subject is not None:
+            if subject != pr:
+                raise ThreadIdCollisionError(
+                    f"thread {qualified!r} in project {project!r} is about {subject.slug}, "
+                    f"not {pr.slug} — refusing to post one PR's review into another's thread"
+                )
+            return qualified
+
+        legacy = _legacy_thread_id(self._thread_prefix, pr)
+        if legacy != qualified and (
+            await self._thread_subject(project=project, thread_id=legacy) == pr
+        ):
+            return legacy
+        return qualified
+
+    async def _thread_subject(self, *, project: str, thread_id: str) -> PrRef | None:
+        """Which PR an existing review thread is about; ``None`` if absent or unreadable.
+
+        "Unreadable" (a thread whose title and visible messages carry no PR ref)
+        deliberately collapses into the same answer as "absent" for the *caller's*
+        purposes only in one direction: it is never treated as a match, so an
+        unrecognised thread is never written into and never reused.
+
+        ``mode="summary"`` keeps the payload small — a colliding id can point at a
+        long resolved thread. A summary of a resolved thread carries only its decide
+        msg, which is why the title is parsed first: it is present in every mode.
+        """
+        try:
+            payload = await self._mcp.call_tool(
+                "chatroom_get_thread",
+                {"project": project, "thread_id": thread_id, "mode": "summary"},
+            )
+        except MagickitMcpError as exc:
+            if "not found" in str(exc).lower():
+                return None
+            raise
+
+        if not isinstance(payload, dict):
+            return None
+        thread = payload.get("thread")
+        if not isinstance(thread, dict):
+            return None
+
+        candidates = [str(thread.get("title") or "")]
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            candidates.extend(str(m.get("content") or "") for m in messages if isinstance(m, dict))
+        for text in candidates:
+            # parse_pr_ref accepts both `owner/repo#n` and PR URLs, so a thread opened
+            # from a URL-shaped ref still compares equal to one opened from a slug.
+            ref = parse_pr_ref(text)
+            if ref is not None:
+                return ref
+        return None
+
+    async def _open_thread(
+        self, *, project: str, thread_id: str, title: str, propose: str, pr: PrRef
+    ) -> None:
         """Open the review thread, treating an 'already exists' collision as success (idempotent).
 
-        Re-reviewing the same PR reuses its existing ``T-pr-review-<n>`` thread: conclair rejects a
-        duplicate ``thread_id`` with a ``ChatroomIntegrityError`` ("... already exists in project
-        ...", surfaced here as a :class:`MagickitMcpError`). Only that condition is swallowed — any
+        Re-reviewing the same PR reuses its existing thread: conclair rejects a duplicate
+        ``thread_id`` with a ``ChatroomIntegrityError`` ("... already exists in project ...",
+        surfaced here as a :class:`MagickitMcpError`). Only that condition is swallowed — any
         other open error re-raises (no masking), mirroring the driver's 422→COMMENT fallback.
+
+        The swallow is **conditional on the existing thread being this PR's**. Unconditional,
+        it turned an id clash into a silent write into someone else's ledger; conclair accepts
+        a ``report`` into a ``resolved`` thread (only ``decide`` is status-gated), so the
+        clash would not even have been noisy at the far end. This re-check is not redundant
+        with :meth:`_resolve_thread_id`: the review runs between the two, which is ample time
+        for another gate to have opened the same thread.
         """
         try:
             await self._mcp.call_tool(
@@ -138,7 +257,13 @@ class PrReviewOrchestrator:
             )
         except MagickitMcpError as exc:
             if "already exists" in str(exc).lower():
-                return  # the PR's review thread already exists → reuse it (re-fire is idempotent)
+                subject = await self._thread_subject(project=project, thread_id=thread_id)
+                if subject == pr:
+                    return  # this PR's own thread → re-fire is idempotent
+                raise ThreadIdCollisionError(
+                    f"thread {thread_id!r} in project {project!r} already exists and is about "
+                    f"{subject.slug if subject else 'an unidentifiable PR'}, not {pr.slug}"
+                ) from exc
             raise
 
     async def aclose(self) -> None:
