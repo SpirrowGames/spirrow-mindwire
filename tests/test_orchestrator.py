@@ -46,6 +46,14 @@ class _FakeMcp:
         self.calls.append((name, arguments))
         if name in self._raise_on:
             raise self._raise_on[name]
+        if name == "chatroom_get_thread" and name not in self._results:
+            # A thread nobody programmed is a thread that is not there, and the
+            # far end says so by raising -- it has no success response that omits
+            # the thread. Returning `{}` here made "absent" and "unreadable" look
+            # alike to the caller, which is the confusion under test below.
+            raise MagickitMcpError(
+                f"Thread '{arguments['thread_id']}' not found in project '{arguments['project']}'"
+            )
         result = self._results.get(name, {})
         # A programmed result may be a callable so one fake can answer
         # `chatroom_get_thread` differently per thread_id (which is the whole
@@ -269,6 +277,75 @@ async def test_a_taken_qualified_id_fails_before_the_review_is_paid_for() -> Non
         await orch.fire_pr_review(project="p", pr_ref="o/r#9")
     assert driver.reviewed == []
     assert all(name == "chatroom_get_thread" for name, _ in mcp.calls)
+
+
+@pytest.mark.anyio
+async def test_an_unidentifiable_thread_on_the_qualified_id_also_fails_before_the_review() -> None:
+    """A thread that exists but names no PR occupies the id just the same.
+
+    Reading "cannot tell whose this is" as "nobody's" made the resolve step
+    hand the review an id it could not have: the run then paid for a Gemini
+    judgement and threw it away at open time, which is precisely the cost
+    resolving early exists to avoid. Absent and unreadable are different
+    answers; only the first means free.
+
+    (At the *legacy* id the same thread is merely not ours -- see
+    `test_an_unidentifiable_thread_at_the_legacy_id_is_not_reused`, which
+    proceeds normally. The asymmetry is deliberate.)
+    """
+    driver = _FakeDriver()
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads(
+                {
+                    "T-pr-review-r-9": {
+                        "thread": {"title": "something a human opened", "status": "resolved"},
+                        "messages": [{"msg_id": "msg-001", "content": "no ref here"}],
+                    }
+                }
+            )
+        }
+    )
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    with pytest.raises(ThreadIdCollisionError, match="unidentifiable"):
+        await orch.fire_pr_review(project="p", pr_ref="o/r#9")
+    assert driver.reviewed == []
+    assert all(name == "chatroom_get_thread" for name, _ in mcp.calls)
+
+
+@pytest.mark.anyio
+async def test_the_same_pr_spelled_with_different_case_is_not_a_collision() -> None:
+    """Case-folding the id without case-folding the comparison is a self-collision.
+
+    The id lower-cases the repo, so both spellings land on one thread -- and the
+    chatroom's live titles use both (`Spirrow-VoxelWorld` in the existing gate
+    threads, `spirrow-voxelworld` elsewhere). Comparing the refs exactly would
+    make the gate declare a PR's own thread to be someone else's and refuse to
+    re-fire.
+    """
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads(
+                {
+                    "T-pr-review-spirrow-voxelworld-12": _thread_payload(
+                        "SpirrowGames/Spirrow-VoxelWorld#12"
+                    )
+                }
+            )
+        },
+        raise_on={
+            "chatroom_open_thread": MagickitMcpError(
+                "Thread 'T-pr-review-spirrow-voxelworld-12' already exists in project 'p'"
+            )
+        },
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    ref, _ = await orch.fire_pr_review(project="p", pr_ref="spirrowgames/spirrow-voxelworld#12")
+    assert ref.thread_id == "T-pr-review-spirrow-voxelworld-12"
+    # Reused, not refused: the critique still reaches the thread.
+    assert mcp.args_for("chatroom_post_message")["thread_id"] == (
+        "T-pr-review-spirrow-voxelworld-12"
+    )
 
 
 @pytest.mark.anyio

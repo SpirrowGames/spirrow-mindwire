@@ -18,6 +18,8 @@ chain / a ``scripts/naysayer_review.py`` run / a future PR-event hook).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef, parse_pr_ref
 from .magickit.client import MagickitMcpError, McpToolCaller
 from .naysayer.pr_review import NaysayerPrReviewDriver, PrReviewOutcome
@@ -60,6 +62,51 @@ def _qualified_thread_id(prefix: str, pr: PrRef) -> str:
     clash, the fix is to extend this function with ``pr.owner``.
     """
     return f"{prefix}{pr.repo.lower()}-{pr.number}"
+
+
+@dataclass(frozen=True)
+class _ThreadSubject:
+    """What a lookup at a review-thread id found — **three** answers, not two.
+
+    ``absent`` (nothing there, the id is free), ``about this PR`` (ours, reuse it)
+    and ``exists but says nothing about which PR it is`` are genuinely different
+    facts, and the third is not the first. Collapsing it into "absent" made
+    :meth:`PrReviewOrchestrator._resolve_thread_id` report an occupied id as free,
+    so the clash surfaced only at open time — i.e. after a Gemini review had been
+    produced and paid for, which is exactly what resolving early exists to avoid.
+
+    ``pr is None`` while ``exists`` is true is never treated as a match, so an
+    unrecognised thread is still never written into.
+    """
+
+    exists: bool
+    pr: PrRef | None
+
+    @property
+    def label(self) -> str:
+        """How to name what is sitting on the id, in an error a human reads."""
+        return self.pr.slug if self.pr is not None else "an unidentifiable PR"
+
+
+_NO_THREAD = _ThreadSubject(exists=False, pr=None)
+
+
+def _same_pr(found: PrRef | None, pr: PrRef) -> bool:
+    """Whether a thread's PR ref denotes the same pull request as ``pr``.
+
+    Case-insensitive on owner/repo, because the *id* is built from a lower-cased
+    repo: ``Spirrow-VoxelWorld#12`` and ``spirrow-voxelworld#12`` land on one
+    thread id by construction. Comparing case-sensitively there would report a
+    thread as colliding with itself and turn an idempotent re-fire into a hard
+    failure — and both spellings are in live use in the chatroom's titles.
+    """
+    if found is None:
+        return False
+    return (
+        found.number == pr.number
+        and found.repo.lower() == pr.repo.lower()
+        and found.owner.lower() == pr.owner.lower()
+    )
 
 
 def _legacy_thread_id(prefix: str, pr: PrRef) -> str:
@@ -168,31 +215,40 @@ class PrReviewOrchestrator:
         Order matters. The qualified id is the answer unless an *older* thread for
         this same PR already exists under the pre-qualification scheme, in which
         case the review continues where it started.
+
+        The two ids are judged by different rules, and the difference is the point.
+        At the **qualified** id, anything already there that is not provably this
+        PR's blocks — including a thread that exists but names no PR, because an id
+        under someone else's thread is unusable whether or not we can read who they
+        are. At the **legacy** id, the same unreadable thread merely fails to be
+        ours: the qualified id is still free, so the gate continues there rather
+        than failing. "Is this id usable" and "is this thread mine" are separate
+        questions and only the first one is a reason to stop.
         """
         qualified = _qualified_thread_id(self._thread_prefix, pr)
-        subject = await self._thread_subject(project=project, thread_id=qualified)
-        if subject is not None:
-            if subject != pr:
+        found = await self._thread_subject(project=project, thread_id=qualified)
+        if found.exists:
+            if not _same_pr(found.pr, pr):
                 raise ThreadIdCollisionError(
-                    f"thread {qualified!r} in project {project!r} is about {subject.slug}, "
+                    f"thread {qualified!r} in project {project!r} is about {found.label}, "
                     f"not {pr.slug} — refusing to post one PR's review into another's thread"
                 )
             return qualified
 
         legacy = _legacy_thread_id(self._thread_prefix, pr)
-        if legacy != qualified and (
-            await self._thread_subject(project=project, thread_id=legacy) == pr
-        ):
-            return legacy
+        if legacy != qualified:
+            older = await self._thread_subject(project=project, thread_id=legacy)
+            if _same_pr(older.pr, pr):
+                return legacy
         return qualified
 
-    async def _thread_subject(self, *, project: str, thread_id: str) -> PrRef | None:
-        """Which PR an existing review thread is about; ``None`` if absent or unreadable.
+    async def _thread_subject(self, *, project: str, thread_id: str) -> _ThreadSubject:
+        """What is sitting on ``thread_id``: nothing, this PR, or something unnamed.
 
-        "Unreadable" (a thread whose title and visible messages carry no PR ref)
-        deliberately collapses into the same answer as "absent" for the *caller's*
-        purposes only in one direction: it is never treated as a match, so an
-        unrecognised thread is never written into and never reused.
+        Only an explicit "not found" from the far end counts as *absent*. A call
+        that returned **something** describes a thread that exists, so a payload
+        this cannot parse is reported as existing-but-unidentified rather than as
+        free — guessing "free" there is how an occupied id gets handed to a review.
 
         ``mode="summary"`` keeps the payload small — a colliding id can point at a
         long resolved thread. A summary of a resolved thread carries only its decide
@@ -205,26 +261,26 @@ class PrReviewOrchestrator:
             )
         except MagickitMcpError as exc:
             if "not found" in str(exc).lower():
-                return None
+                return _NO_THREAD
             raise
 
-        if not isinstance(payload, dict):
-            return None
-        thread = payload.get("thread")
-        if not isinstance(thread, dict):
-            return None
-
-        candidates = [str(thread.get("title") or "")]
-        messages = payload.get("messages")
-        if isinstance(messages, list):
-            candidates.extend(str(m.get("content") or "") for m in messages if isinstance(m, dict))
+        candidates: list[str] = []
+        if isinstance(payload, dict):
+            thread = payload.get("thread")
+            if isinstance(thread, dict):
+                candidates.append(str(thread.get("title") or ""))
+            messages = payload.get("messages")
+            if isinstance(messages, list):
+                candidates.extend(
+                    str(m.get("content") or "") for m in messages if isinstance(m, dict)
+                )
         for text in candidates:
             # parse_pr_ref accepts both `owner/repo#n` and PR URLs, so a thread opened
             # from a URL-shaped ref still compares equal to one opened from a slug.
             ref = parse_pr_ref(text)
             if ref is not None:
-                return ref
-        return None
+                return _ThreadSubject(exists=True, pr=ref)
+        return _ThreadSubject(exists=True, pr=None)
 
     async def _open_thread(
         self, *, project: str, thread_id: str, title: str, propose: str, pr: PrRef
@@ -257,12 +313,12 @@ class PrReviewOrchestrator:
             )
         except MagickitMcpError as exc:
             if "already exists" in str(exc).lower():
-                subject = await self._thread_subject(project=project, thread_id=thread_id)
-                if subject == pr:
+                found = await self._thread_subject(project=project, thread_id=thread_id)
+                if _same_pr(found.pr, pr):
                     return  # this PR's own thread → re-fire is idempotent
                 raise ThreadIdCollisionError(
                     f"thread {thread_id!r} in project {project!r} already exists and is about "
-                    f"{subject.slug if subject else 'an unidentifiable PR'}, not {pr.slug}"
+                    f"{found.label}, not {pr.slug}"
                 ) from exc
             raise
 
