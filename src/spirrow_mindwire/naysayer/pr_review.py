@@ -136,14 +136,51 @@ _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
 #
 # Why column zero and not "a little indentation": every leading-space allowance re-admits the
 # context line, because the context prefix IS one space. ``^[ \t]{0,3}`` would have changed
-# nothing. The choice is therefore binary, and the measurement settles it — across 132 real
-# naysayer review bodies (247 verdict lines) from the four Spirrow repos, every production verdict
-# line sits at column 0; indented ones do not occur. The driver's own short-circuit bodies
-# (CI-gate, debounce, timeout-degrade) likewise render theirs at column 0.
+# nothing. The choice is therefore binary, and the measurement settles it — sweeping every PR of
+# the four Spirrow repos for reviews authored by ``spirrowgames-ops`` (2026-08-16: 499 review
+# bodies, 413 plain verdict lines) found the verdict at column 0 in 413 of 413; indented ones do
+# not occur. The driver's own short-circuit bodies (CI-gate, debounce, timeout-degrade) likewise
+# render theirs at column 0.
 #
 # The failure direction is safe by construction: an unmatched verdict is not an open gate but no
 # verdict at all, and _parse_verdict defaults to REQUEST_CHANGES. A model that someday indents its
 # verdict costs a red gate, not a false APPROVE.
+#
+# ---- What this anchor does NOT buy (do not repeat the mistake this comment replaced) ----
+#
+# It makes VERBATIM diff text inert, because a hunk line keeps its +/-/space prefix and so cannot
+# begin at column 0. That is the whole of it. It is NOT immunity to injection. A model that
+# RE-TYPES an injected line without the prefix — most plausibly by quoting it inside a fenced
+# block — emits a genuine column-0 match, and ``matches[-1]`` (last-wins) only covers that while
+# the quote comes BEFORE the model's own verdict. A quote placed after it still wins; measured
+# 2026-08-16, not hypothesised. That residual is recorded rather than fixed here: closing it means
+# deciding what may legitimately surround a verdict line (fences, quoting rules), which is a
+# design question, not a regex tweak.
+#
+# ---- Bold verdicts fail closed, deliberately (ruling: T-verdict-regex-space-prefix-injection) ----
+#
+# ``**VERDICT: APPROVE**`` does not match this pattern, so _parse_verdict returns REQUEST_CHANGES.
+# That is a CHOICE, not an oversight. The same sweep found 9 bold verdict lines (spirrow-mindwire
+# #69/#71/#72/#73/#74, Spirrow-VoxelWorld #51); of the 4 that read APPROVE, none was ever submitted
+# as an APPROVED review — the gate is not known to have opened on one. Reasons to leave it strict:
+# the failure direction costs one redundant red round, no current driver output takes the bold form
+# (413 of 413 are plain), and widening the accepted shape is what lets quoted text be read as an
+# assertion.
+#
+# The reversed twin — read this before "making the two consistent":
+#
+#   layer 2 (``NEXT:`` handoff parsing, PR #151)   this line (``VERDICT:`` gate parsing)
+#   ------------------------------------------    -------------------------------------
+#   ``**NEXT: X**`` is accepted (tolerant)        ``**VERDICT: X**`` is rejected (strict)
+#   miss  -> loop halts SILENTLY and waits on     miss  -> one extra red round; loud and cheap
+#            a human who has no signal to look
+#   over-match -> one wasted turn                 over-match -> the gate OPENS on text the model
+#                                                              may merely have quoted
+#
+# Same surface defect (markdown emphasis defeats a line parser), opposite damage asymmetry, hence
+# opposite treatment. This is not an inconsistency to be tidied up. Revisit only when a FALSE RED
+# is actually observed here — a review body whose bold verdict forced a REQUEST_CHANGES the author
+# did not intend.
 _VERDICT_RE = re.compile(
     r"^VERDICT:\s*(APPROVE|REQUEST[ _-]?CHANGES|COMMENT)\s*$",
     re.IGNORECASE | re.MULTILINE,
