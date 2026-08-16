@@ -123,6 +123,52 @@ def test_resolve_pr_review_ignores_punctuation_against_the_ref() -> None:
     assert comma.token == "acme/widgets#7"
 
 
+class TestTheSentinelMayCarryItsOwnDecoration:
+    """A wrapper may close between the sentinel and its operand (msg-1163 §1, blocking).
+
+    ``_pr-review_`` failed where ``*pr-review*`` and ``` `pr-review` ``` worked, because the
+    sentinel was terminated with ``\\b`` and ``\\b`` is defined by ``\\w``, which counts ``_`` as a
+    word character. The line rule had already moved ``_`` to the decoration side; the terminator
+    had not, so the two disagreed and the directive fell out as ABSENT — a silent stop, which is
+    the failure this whole module exists to prevent.
+    """
+
+    def test_the_sentinel_may_be_wrapped_on_its_own(self) -> None:
+        for line in (
+            "NEXT: _pr-review_ acme/widgets#7",
+            "NEXT: __pr-review__ acme/widgets#7",
+            "NEXT: *pr-review* acme/widgets#7",
+            "NEXT: **pr-review** acme/widgets#7",
+            "NEXT: `pr-review` acme/widgets#7",
+        ):
+            h = resolve_handoff(f"done\n\n{line}", _ROSTER)
+            assert h.kind is HandoffKind.PR_REVIEW, line
+            assert h.token == "acme/widgets#7", line
+
+    def test_the_wrapper_may_close_anywhere_the_author_put_it(self) -> None:
+        # The four spans of one underscore pair over `pr-review <ref>`: sentinel only, ref only,
+        # both, and the whole line with a gloss outside it. All four mean the same handoff.
+        for line in (
+            "NEXT: _pr-review_ acme/widgets#7",
+            "NEXT: pr-review _acme/widgets#7_",
+            "NEXT: _pr-review acme/widgets#7_",
+            "_NEXT: pr-review acme/widgets#7_ — go",
+        ):
+            h = resolve_handoff(f"done\n\n{line}", _ROSTER)
+            assert h.kind is HandoffKind.PR_REVIEW, line
+            assert h.token == "acme/widgets#7", line
+
+    def test_a_longer_word_is_still_not_the_sentinel(self) -> None:
+        # The terminator is looser about `_` and no looser about anything else: a word that merely
+        # STARTS with the sentinel is not the sentinel, in ASCII or beyond it.
+        for line in (
+            "NEXT: pr-reviewing acme/widgets#7",
+            "NEXT: pr-review7 acme/widgets#7",
+            "NEXT: pr-reviewあ acme/widgets#7",
+        ):
+            assert resolve_handoff(f"x\n\n{line}", _ROSTER).kind is HandoffKind.ABSENT, line
+
+
 class TestThePrRefGrammarHasOneOwner:
     """`parse_pr_ref` decides what a PR ref is; this module asks it (msg-1158 blocking / 1159 §2).
 

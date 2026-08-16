@@ -49,6 +49,37 @@ def test_parse_pr_ref_none() -> None:
     assert parse_pr_ref("no pull request here, just chatter") is None
 
 
+def test_parse_pr_ref_ends_at_markdown_emphasis_including_the_underscore() -> None:
+    # Every producer feeding this function writes Markdown, so a marker against the number is
+    # punctuation, not part of the ref. `_` used to be the exception -- `\b` is defined by `\w`
+    # and `\w` counts `_` as a word character -- so an emphasised ref parsed as no ref at all
+    # while every other marker parsed fine (T-handoff-parser-markdown-tolerance msg-1163).
+    for text in (
+        "spirrowgames/spirrow-mindwire#42_",
+        "spirrowgames/spirrow-mindwire#42__",
+        "spirrowgames/spirrow-mindwire#42*",
+        "spirrowgames/spirrow-mindwire#42.",
+        "spirrowgames/spirrow-mindwire#42_ and then some prose",
+    ):
+        assert parse_pr_ref(text) == _PR, text
+
+
+def test_parse_pr_ref_still_refuses_a_number_that_runs_on() -> None:
+    # The end of a ref moved for `_` only. Letters and digits still continue it, so a ref is not
+    # invented out of a longer token (the divergence that retired this grammar's second copy).
+    assert parse_pr_ref("spirrowgames/spirrow-mindwire#42abc") is None
+
+
+def test_parse_pr_ref_refuses_an_underscore_in_the_owner() -> None:
+    # A GitHub login is alphanumerics and hyphens, so `_acme` was never an owner -- but the class
+    # accepted one, and an italicised ref parsed with a repository that does not exist. Callers
+    # already fail safe on None, which is where this now goes. (A repo name may still contain `_`.)
+    assert parse_pr_ref("_spirrowgames/spirrow-mindwire#42") is None
+    assert parse_pr_ref("_spirrowgames/spirrow-mindwire#42_") is None
+    repo_underscore = parse_pr_ref("acme/my_repo#7")
+    assert repo_underscore is not None and repo_underscore.repo == "my_repo"
+
+
 def test_pr_ref_slug() -> None:
     assert _PR.slug == "spirrowgames/spirrow-mindwire#42"
 

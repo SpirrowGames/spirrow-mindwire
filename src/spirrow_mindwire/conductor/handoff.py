@@ -86,6 +86,17 @@ from ..value_objects import Role
 # character moved from "word" to "decoration", and no prose is made of underscores.
 _DECORATION = r"(?:[^\w\n]|_)*"
 
+# The same carve-out, stated for the other end of a word. ``\b`` is defined by ``\w``, and ``\w``
+# counts ``_`` as a word character — the exact character ``_DECORATION`` just moved to the
+# decoration side. So ``\b`` and ``_DECORATION`` disagree about ``_``, and any token this module
+# terminates with ``\b`` re-opens the hole the line rule closed: ``NEXT: _pr-review_ <ref>`` found
+# no boundary between ``pr-review`` and ``_``, failed to match the sentinel, and fell out as ABSENT
+# while ``*pr-review*`` and ``` `pr-review` ``` at the same position routed (msg-1163 §1 / §3).
+# One fact — ``_`` is ``\w`` — had by then opened the same hole in three separate places, so the
+# boundary is written once, here, with the carve-out already applied: "not followed by an
+# alphanumeric". Unicode-aware like ``\w``, so ``pr-reviewing`` and ``pr-reviewあ`` stay refused.
+_NOT_WORD_CONTINUATION = r"(?![^\W_])"
+
 # Decoration is admitted at every position where it can occur, because a wrapper's two halves do
 # not both land in the same place. There are three, and the previous revision handled only the
 # first:
@@ -137,24 +148,29 @@ NONE_TOKEN = "none"
 PR_REVIEW_TOKEN = "pr-review"
 # The sentinel is the word plus an operand: a bare ``NEXT: pr-review`` with nothing after it is not
 # a PR-gate directive at all (it falls through to the participant path and out as ABSENT → human).
-_PR_REVIEW_RE = re.compile(rf"{_DECORATION}{PR_REVIEW_TOKEN}\b(?P<rest>.*)", re.IGNORECASE)
+# Decoration is admitted on BOTH sides of the sentinel word, not just before it: an author who
+# italicises the sentinel alone (``NEXT: _pr-review_ <ref>``) is asking for the gate exactly as
+# much as one who italicises the whole line, and the emphasis close lands between the word and its
+# operand. The terminator is ``_NOT_WORD_CONTINUATION`` rather than ``\b`` for that reason; the
+# closing marker is then just leading decoration on the operand, which the payload rule below eats.
+_PR_REVIEW_RE = re.compile(
+    rf"{_DECORATION}{PR_REVIEW_TOKEN}{_NOT_WORD_CONTINUATION}(?P<rest>.*)", re.IGNORECASE
+)
 # The operand's PAYLOAD: the operand with this module's own decoration removed from either end.
 # This is deliberately not a statement about PR refs — it is the same closed ``_DECORATION``
-# property the line rule uses, applied to the one place the ref route needs it. It is needed
-# because ``_`` is simultaneously a Markdown wrapper and a word character, so the owner's short-ref
-# pattern (which ends at a word boundary) reads some wrappers off the end and not others. Measured
-# against ``parse_pr_ref`` on this head:
+# property the line rule uses, applied to the one place the ref route needs it.
+#
+# What it is for is now only the LEADING end. A ref's trailing wrappers are the owner's business
+# and it handles them; a ref's *opening* wrapper is not, because ``_`` is a legal character in the
+# middle of a repository name and so cannot be skipped by a pattern that has already started
+# matching one. Measured against ``parse_pr_ref`` on this head:
 #
 #     acme/widgets#7**   -> acme/widgets#7      acme/widgets#7.    -> acme/widgets#7
-#     acme/widgets#7_    -> None                _acme/widgets#7_   -> None
+#     acme/widgets#7_    -> acme/widgets#7      _acme/widgets#7    -> None
 #
-# ``_NEXT: pr-review acme/widgets#7_`` is exactly the underscore wrapper `45b767d` lost and this PR
-# restored, so handing the operand over verbatim — the literal reading of msg-1159 §2, "generous
-# に渡して所有者に判断させる" — re-loses it on the PR route while the persona route keeps it.
-# Measured: 56 generated shapes, caught by the differential in
-# ``test_conductor_handoff_migration.py``.
-# Trimming decoration cannot reach into a ref either way: both accepted forms end in a digit,
-# which is a word character.
+# So ``NEXT: pr-review _acme/widgets#7_`` needs the leading ``_`` gone before the owner is asked;
+# with it gone, the owner answers. Trimming cannot reach into a ref: an accepted ref ends in a
+# digit and begins with an alphanumeric, and neither is decoration.
 _OPERAND_PAYLOAD_RE = re.compile(rf"\A{_DECORATION}(?P<payload>.*?){_DECORATION}\Z")
 
 

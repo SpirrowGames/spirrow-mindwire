@@ -38,7 +38,21 @@ _DEFAULT_API_BASE = "https://api.github.com"
 _DEFAULT_TIMEOUT_SECONDS = 60.0
 
 _PR_URL_RE = re.compile(r"github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/(\d+)")
-_PR_SHORT_RE = re.compile(r"\b([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)#(\d+)\b")
+# ``owner/repo#n`` in free text. Two details are load-bearing, and both are about the underscore.
+#
+# The ref ENDS at "not followed by an alphanumeric", not at ``\b``. ``\b`` is defined by ``\w``,
+# and ``\w`` counts ``_`` as a word character, so ``acme/widgets#7_`` — a ref with a Markdown
+# emphasis close against it — parsed as no ref at all, while ``acme/widgets#7*`` and
+# ``acme/widgets#7.`` parsed fine. Every producer feeding this function is an LLM writing Markdown
+# (chatroom messages, thread titles, ``NEXT:`` handoff lines), so a trailing ``_`` is punctuation
+# here, never part of a ref. ``#7abc`` is still refused: letters and digits still continue the ref.
+#
+# The OWNER may not contain ``_``. A GitHub login is alphanumerics and hyphens, so an underscore
+# there was never a real owner name — but the class accepted one, which meant an italicised ref
+# ``_acme/widgets#7`` silently parsed with owner ``_acme`` and would have fired the gate at a
+# repository that does not exist. It now does not match at all, which the callers already treat as
+# "no ref" and fail safe on. (``repo`` keeps ``_``: repository names really do contain it.)
+_PR_SHORT_RE = re.compile(r"\b([A-Za-z0-9.-]+)/([A-Za-z0-9._-]+)#(\d+)(?![^\W_])")
 
 logger = logging.getLogger(__name__)
 
