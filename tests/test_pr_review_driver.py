@@ -31,6 +31,8 @@ from spirrow_mindwire.lexora.client import (
 from spirrow_mindwire.naysayer.pr_review import (
     _DEFAULT_TIMEOUT_SECONDS,
     _MAX_DIFF_CHARS,
+    _PR_REVIEW_SYSTEM_PROMPT,
+    _VERDICT_RE,
     NaysayerPrReviewDriver,
     NaysayerPrReviewError,
     PostCritique,
@@ -633,18 +635,102 @@ def test_parse_verdict_column_zero_still_approves() -> None:
     assert _parse_verdict("no blocking problems\n\nVERDICT: APPROVE") is ReviewEvent.APPROVE
 
 
-def test_driver_self_authored_verdict_bodies_round_trip() -> None:
-    """The driver's own short-circuit bodies must still parse as the verdict they name.
+def test_system_prompt_verdict_exemplar_is_accepted_by_the_parser() -> None:
+    """What the prompt TELLS the model to write must be what the parser accepts.
 
-    ``_ci_gate_response`` / the debounce / the timeout-degrade all render a ``VERDICT:`` line into
-    a body that is posted verbatim. If the anchor were narrowed past what those bodies emit, the
-    gate's own fail-closed paths would stop being readable.
+    The exemplar used to read ``  VERDICT: APPROVE          (no blocking problems)``. Two separate
+    defects, both invisible without this test:
+
+    * the two-space indent — harmless under the old ``^\\s*`` anchor, rejected by the column-zero
+      anchor this change introduced, so narrowing the anchor without touching the prompt would
+      leave the gate refusing the form its own instructions teach;
+    * the trailing parenthetical — ``\\s*$`` ends the verdict line, so the exemplar AS WRITTEN
+      never parsed, before this change or after. De-indenting alone would not have fixed it.
+
+    Hence this asserts on the prompt text itself rather than on a copy: a copy drifts, and a
+    prompt that teaches an unparseable verdict fails closed on every review that obeys it.
+    """
+    exemplars = [
+        line
+        for line in _PR_REVIEW_SYSTEM_PROMPT.splitlines()
+        if line.strip().upper().startswith("VERDICT:")
+    ]
+    assert exemplars, "the system prompt no longer shows a verdict exemplar"
+    for line in exemplars:
+        assert _VERDICT_RE.findall(line), f"prompt teaches a verdict the parser rejects: {line!r}"
+    assert _parse_verdict("\n".join(exemplars[:1])) is ReviewEvent.APPROVE
+
+
+def test_ci_gate_body_verdict_line_is_matched_by_the_anchor() -> None:
+    """The CI-gate body's own ``VERDICT:`` line must actually be MATCHED, not merely defaulted to.
+
+    Asserting ``_parse_verdict(body) is REQUEST_CHANGES`` here would be a tautology: the parser
+    fail-closes to REQUEST_CHANGES, so an anchor narrowed past what this body emits would produce
+    the expected value *by failing to read it*. The assertion must therefore look at the match
+    itself — an unreadable body yields ``[]`` and fails.
     """
     _verdict, body = _ci_gate_response(
         CiStatus(state=CiState.FAILURE, head_sha="deadbeef", failing=["build"]), "acme/widgets#7"
     )
-    assert _parse_verdict(body) is ReviewEvent.REQUEST_CHANGES
-    assert _parse_verdict("prior verdict stands.\n\nVERDICT: APPROVE") is ReviewEvent.APPROVE
+    assert _VERDICT_RE.findall(body) == ["REQUEST_CHANGES"]
+
+
+@pytest.mark.anyio
+async def test_debounce_body_round_trips_an_approve_verdict() -> None:
+    """The debounce body is the ONE self-authored path that can say APPROVE — so parse it.
+
+    Of the driver's short-circuit bodies (CI-gate, round-cap, timeout-degrade, debounce) only this
+    one renders a verdict that is not already the fail-closed default, so it is the only one where
+    ``_parse_verdict`` returning the right answer proves the line was read. Narrow the anchor past
+    what ``_skip_unchanged_response`` emits and this drops to REQUEST_CHANGES.
+
+    The assertion runs against the body actually POSTED (marker appended downstream of the verdict
+    line), not the pre-marker string, because that is the artifact a reader parses.
+    """
+    lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:00Z")],
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.skipped_head_unchanged is True
+    assert outcome.verdict is ReviewEvent.APPROVE
+    assert _parse_verdict(posted[0]) is ReviewEvent.APPROVE
+
+
+@pytest.mark.anyio
+async def test_round_cap_and_timeout_bodies_are_matched_by_the_anchor() -> None:
+    """The remaining self-authored bodies name COMMENT / REQUEST_CHANGES — check the match.
+
+    Both collapse to REQUEST_CHANGES under ``_parse_verdict`` (COMMENT is an objection, and
+    REQUEST_CHANGES is the default), so only the raw match distinguishes "read correctly" from
+    "not read at all".
+    """
+    # Round-cap escalation → VERDICT: COMMENT
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s1", "2026-06-10T00:00:01Z"),
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s2", "2026-06-10T00:00:02Z"),
+        ],
+    )
+    capped, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=_FakeLexora(), github=github, max_review_rounds=2)
+    await driver.review(_pr(), post_critique=post)
+    assert _VERDICT_RE.findall(capped[0]) == ["COMMENT"]
+
+    # Timeout-degrade → VERDICT: REQUEST_CHANGES
+    timed_out, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(raise_exc=LexoraTimeoutError("POST /v1/chat/completions timed out")),
+        github=_FakeGitHub(),
+    )
+    outcome = await driver.review(_pr(), post_critique=post)
+    assert outcome.timed_out is True
+    assert _VERDICT_RE.findall(timed_out[0]) == ["REQUEST_CHANGES"]
 
 
 @pytest.mark.anyio

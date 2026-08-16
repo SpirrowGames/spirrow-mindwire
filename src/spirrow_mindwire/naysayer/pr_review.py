@@ -146,6 +146,14 @@ _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
 # verdict at all, and _parse_verdict defaults to REQUEST_CHANGES. A model that someday indents its
 # verdict costs a red gate, not a false APPROVE.
 #
+# This pattern is coupled to _PR_REVIEW_SYSTEM_PROMPT, which must teach the exact shape accepted
+# here — narrowing one without the other makes the gate refuse the form its own instructions
+# prescribe. The prompt's exemplar was indented two spaces AND carried a trailing parenthetical,
+# so it did not parse under this anchor (the indent) nor under the old ``^\s*`` one (the
+# parenthetical, which ``\s*$`` will not cross). Both are fixed, and
+# test_system_prompt_verdict_exemplar_is_accepted_by_the_parser asserts the prompt text itself
+# against this pattern so the two cannot drift apart again silently.
+#
 # ---- What this anchor does NOT buy (do not repeat the mistake this comment replaced) ----
 #
 # It makes VERBATIM diff text inert, because a hunk line keeps its +/-/space prefix and so cannot
@@ -198,9 +206,17 @@ concrete flaw. Do not fabricate problems and do not pad with generic caveats. \
 If, after a genuine search, you find no blocking problem, say so and name the \
 single weakest remaining point.
 
-End your reply with exactly one verdict line:
-  VERDICT: APPROVE          (no blocking problems)
-  VERDICT: REQUEST_CHANGES  (at least one blocking problem)
+End your reply with exactly one verdict line. It must begin at the start of the line and hold \
+nothing else — no indentation, no bold or backticks, no trailing note. Write exactly one of \
+these two lines, verbatim:
+
+VERDICT: APPROVE
+
+(use this one only if you found no blocking problem), or:
+
+VERDICT: REQUEST_CHANGES
+
+(use this one if you found at least one blocking problem).
 
 Your reply is posted verbatim to the thread and submitted as your GitHub PR \
 review body — reply directly with the review, no preamble.
