@@ -16,6 +16,41 @@ parsing + resolution layer:
 The NEXT vocabulary is the chatroom **identity / persona name** (e.g. ``Bohr`` / ``Heisenberg`` /
 ``Einstein`` / ``human``), not the internal role string; the roster is the persona→role map supplied
 by config, and the conductor authors each reply under the persona name.
+
+Markdown tolerance is **additive, not subtractive** (msg-1129 §3). Two earlier rounds of this
+parser tried to *remove* the decoration an author had written — first at end-of-line, then at word
+edges — and both shipped green tests while the real failing shape stayed broken, because "the set
+of characters to strip" does not close: add ``**`` and ``**,`` arrives; add that and ``**。``
+arrives. So nothing is stripped. Instead each thing we are willing to dispatch is matched by a
+pattern that describes *it*:
+
+- **the line** — a handoff line is one where nothing but decoration surrounds the ``NEXT:``
+  keyword. "Decoration" is defined negatively-but-closed: :data:`_DECORATION` = **no word
+  characters, plus the underscore** (an ordered-list number is the one allowance). That covers
+  ``>``, ``#``, ``-``/``*``/``+``, ``**``, ``_``, ``` ` ```, ``|`` table pipes and the ``→`` a real
+  handoff used (chatroom ``msg-494``) without enumerating any of them, and it still refuses a line
+  of prose that merely mentions ``NEXT:``. Decoration is admitted at all three positions a wrapper
+  can close in — ``**NEXT: X**``, ``**NEXT**: X`` and ``**NEXT:** X`` — because a rule that admits
+  only some of them is another enumeration wearing a closed rule's clothes.
+- **the token** — :data:`_PARTICIPANT_NAME_RE` matches the shape of a participant name, so whatever
+  the author put *after* the name — ``**``, ``,``, ``。``, ``— a gloss`` — is outside the match and
+  therefore falls away for free.
+- **the PR ref** — *not matched here at all*. What counts as a PR reference is owned by
+  :func:`~spirrow_mindwire.github.client.parse_pr_ref`, and this module asks it rather than
+  re-spelling its grammar. The revision before this one did spell it out a second time, with a
+  comment claiming the two "agree by construction"; they already disagreed —
+  ``acme/widgets#7abc`` yielded ``acme/widgets#7`` here and ``None`` there (msg-1158 §5). A second
+  spelling also silently withholds whatever the owner learns later (an enterprise host, a new
+  short-link shape), which is the concrete cost: the gate would keep firing on the owner's *old*
+  vocabulary. So the ``pr-review`` route asks the owner and records the owner's answer.
+
+This tolerance is a **transitional bridge**, not a permanent legacy fallback: Layer 3 will add a
+structured ``next_participant`` field on the message itself, and when that lands this whole regex
+scaffold becomes the compatibility path scheduled for removal, not a coequal parser kept forever.
+
+``tests/data/next_line_corpus.tsv`` pins this against **real** traffic: every distinct
+``NEXT:``-bearing line shape in the live ``spirrow-mindwire`` + ``spirrow-voxelworld`` chatrooms,
+with its expected resolution. Imagined shapes only close imagined holes (msg-1129 §4).
 """
 
 from __future__ import annotations
@@ -25,21 +60,73 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
+from ..github.client import parse_pr_ref
 from ..value_objects import Role
 
 # A handoff line must stand on its own (``^...$`` with MULTILINE). We take the LAST one so a
 # ``NEXT:`` quoted earlier in the body cannot override the author's real, final handoff — the same
-# defence as the naysayer verdict parser.
-_NEXT_LINE_RE = re.compile(r"^\s*NEXT:\s*(?P<token>\S.*?)\s*$", re.MULTILINE)
+# defence as the naysayer verdict parser. That last-wins rule is also what makes the leading
+# tolerance below safe: a permissive line rule matches quoted examples more often, and the real
+# handoff is the one at the bottom.
+#
+# The tolerance rule is stated as a CLOSED property rather than a list of Markdown shells: on a
+# handoff line everything that is not the keyword, the colon or the token is DECORATION, and
+# decoration carries no word meaning. One allowance is carved out for an ordered-list number
+# (``1.`` / ``2)``), whose digits are word characters.
+#
+# ``_DECORATION`` is that property, and it is ``\W`` **plus the underscore**. Python's ``\w``
+# counts ``_`` as a word character, so the plain ``[^\w\n]*`` this module shipped in `45b767d`
+# could not consume a single character of ``_NEXT: Bohr_`` and the whole match failed — a shape the
+# comment right below it advertised as supported, and one the revision before this rewrite had
+# actually handled (msg-1148 §5-4: a regression, not a shortfall).
+#
+# ``\w`` is Unicode-aware here, which is load-bearing: the CJK prose that surrounds most of these
+# handoffs counts as word characters, so a Japanese sentence mentioning the keyword is refused for
+# the same reason an English one is. Carving out ``_`` does not weaken that — ``_`` is the only
+# character moved from "word" to "decoration", and no prose is made of underscores.
+_DECORATION = r"(?:[^\w\n]|_)*"
 
-# The participant name is the leading run before any whitespace or an opening paren (ASCII or
-# fullwidth CJK): real handoffs carry a trailing gloss after the name, and only the name selects the
-# participant. The fullwidth left paren U+FF08 is matched too so a CJK gloss is split off.
-_NAME_SPLIT_RE = re.compile(r"[\s(（]")  # noqa: RUF001 (the fullwidth paren is intentional)
+# The same carve-out, stated for the other end of a word. ``\b`` is defined by ``\w``, and ``\w``
+# counts ``_`` as a word character — the exact character ``_DECORATION`` just moved to the
+# decoration side. So ``\b`` and ``_DECORATION`` disagree about ``_``, and any token this module
+# terminates with ``\b`` re-opens the hole the line rule closed: ``NEXT: _pr-review_ <ref>`` found
+# no boundary between ``pr-review`` and ``_``, failed to match the sentinel, and fell out as ABSENT
+# while ``*pr-review*`` and ``` `pr-review` ``` at the same position routed (msg-1163 §1 / §3).
+# One fact — ``_`` is ``\w`` — had by then opened the same hole in three separate places, so the
+# boundary is written once, here, with the carve-out already applied: "not followed by an
+# alphanumeric". Unicode-aware like ``\w``, so ``pr-reviewing`` and ``pr-reviewあ`` stay refused.
+_NOT_WORD_CONTINUATION = r"(?![^\W_])"
 
-# Trailing punctuation stripped from the parsed name (a stray comma / period after the persona name
-# should not defeat the roster lookup).
-_TRAILING_PUNCT = " \t.,;:!?、。）)"  # noqa: RUF001 (fullwidth/CJK punctuation is intentional)
+# Decoration is admitted at every position where it can occur, because a wrapper's two halves do
+# not both land in the same place. There are three, and the previous revision handled only the
+# first:
+#   1. before the keyword          ``**NEXT: Bohr**``   ``> NEXT: Bohr``   ``→ **NEXT: human**(…)``
+#   2. inside the keyword's shell  ``**NEXT**: Bohr``   ``NEXT : Bohr``  (and the fullwidth colon)
+#   3. between the colon and token ``**NEXT:** Bohr``   ``` `NEXT:` Bohr ```   ``NEXT:** Bohr**``
+# Position 3 is the second axis of the `45b767d` regression and it is NOT the underscore bug: ``*``
+# is not a word character, so widening the character class alone leaves ``**NEXT:** Bohr``
+# unroutable (msg-1148 §5-5 / msg-1150 §1). Position 3 is owned by the TOKEN patterns below rather
+# than by this one, so ``_last_next_raw`` keeps handing both resolution routes the same raw text.
+_NEXT_KEYWORD = "NEXT" + _DECORATION + r"[:：]"  # noqa: RUF001 (fullwidth colon intentional)
+_NEXT_LINE_RE = re.compile(
+    r"^"
+    + _DECORATION
+    + r"(?:\d+[.)]"
+    + _DECORATION
+    + r")?"
+    + _NEXT_KEYWORD
+    + r"\s*(?P<token>\S.*?)\s*$",
+    re.MULTILINE,
+)
+
+# The participant name: one identifier-shaped word, matched at the head of the token past any
+# decoration (position 3 above: the ``**`` of ``**NEXT:** Bohr``, the closing ``` ` ``` of
+# ``` `NEXT:` Bohr ```). Separators are allowed only BETWEEN alphanumerics, never at either end —
+# which is why the leading ``_`` of ``_NEXT:_ Bohr`` is decoration and the trailing ``_`` of
+# ``_NEXT: human_`` falls outside the match, while ``some_bot`` keeps its underscore. Everything
+# after the name (``**``, ``,``, ``。``, ``— a gloss``, a fullwidth parenthetical) is not part of
+# the pattern either, so no list of trailing characters has to be maintained.
+_PARTICIPANT_NAME_RE = re.compile(_DECORATION + r"(?P<name>[A-Za-z0-9]+(?:[_-]+[A-Za-z0-9]+)*)")
 
 # Reserved sentinels (case-insensitive). Not roster participants. Public because they are the
 # single source of truth for the NEXT vocabulary shared by the *parser* (below) and the *emission*
@@ -56,14 +143,35 @@ NONE_TOKEN = "none"
 
 
 # The PR-gate sentinel: ``NEXT: pr-review <owner/repo#n>`` fires the Tier B independent naysayer
-# review on the named PR (PR-2b-2). Unlike a persona handoff, the whole rest of the line is the PR
-# ref (it carries ``/`` and ``#``), so it is parsed off the RAW NEXT line before the name-split.
+# review on the named PR (PR-2b-2). Unlike a persona handoff the target is a PR ref, so it is
+# resolved before the participant-name match.
 PR_REVIEW_TOKEN = "pr-review"
-# The ref is the single non-whitespace token after ``pr-review`` (an ``owner/repo#n`` or a URL —
-# neither contains a space). ``\S+`` (not ``.*?$``) so a trailing gloss an LLM appends, e.g.
-# ``pr-review acme/repo#7 (please review)``, is ignored rather than swallowed into the ref and
-# handed to GitHub as an invalid ref (Tier B PR #103 round 2).
-_PR_REVIEW_RE = re.compile(rf"^{PR_REVIEW_TOKEN}\s+(?P<ref>\S+)", re.IGNORECASE)
+# The sentinel is the word plus an operand: a bare ``NEXT: pr-review`` with nothing after it is not
+# a PR-gate directive at all (it falls through to the participant path and out as ABSENT → human).
+# Decoration is admitted on BOTH sides of the sentinel word, not just before it: an author who
+# italicises the sentinel alone (``NEXT: _pr-review_ <ref>``) is asking for the gate exactly as
+# much as one who italicises the whole line, and the emphasis close lands between the word and its
+# operand. The terminator is ``_NOT_WORD_CONTINUATION`` rather than ``\b`` for that reason; the
+# closing marker is then just leading decoration on the operand, which the payload rule below eats.
+_PR_REVIEW_RE = re.compile(
+    rf"{_DECORATION}{PR_REVIEW_TOKEN}{_NOT_WORD_CONTINUATION}(?P<rest>.*)", re.IGNORECASE
+)
+# The operand's PAYLOAD: the operand with this module's own decoration removed from either end.
+# This is deliberately not a statement about PR refs — it is the same closed ``_DECORATION``
+# property the line rule uses, applied to the one place the ref route needs it.
+#
+# What it is for is now only the LEADING end. A ref's trailing wrappers are the owner's business
+# and it handles them; a ref's *opening* wrapper is not, because ``_`` is a legal character in the
+# middle of a repository name and so cannot be skipped by a pattern that has already started
+# matching one. Measured against ``parse_pr_ref`` on this head:
+#
+#     acme/widgets#7**   -> acme/widgets#7      acme/widgets#7.    -> acme/widgets#7
+#     acme/widgets#7_    -> acme/widgets#7      _acme/widgets#7    -> None
+#
+# So ``NEXT: pr-review _acme/widgets#7_`` needs the leading ``_`` gone before the owner is asked;
+# with it gone, the owner answers. Trimming cannot reach into a ref: an accepted ref ends in a
+# digit and begins with an alphanumeric, and neither is decoration.
+_OPERAND_PAYLOAD_RE = re.compile(rf"\A{_DECORATION}(?P<payload>.*?){_DECORATION}\Z")
 
 
 class HandoffKind(StrEnum):
@@ -81,8 +189,15 @@ class Handoff:
     """The resolved handoff target of a message's final ``NEXT:`` line.
 
     ``identity`` / ``role`` are set only when ``kind is HandoffKind.ROLE`` (``identity`` is the
-    roster's canonical persona name). ``token`` is the raw participant name parsed (observability),
+    roster's canonical persona name). ``token`` is the participant name parsed (observability),
     ``None`` when no ``NEXT:`` line was found at all.
+
+    On the ``PR_REVIEW`` route ``token`` is the **canonical slug** (``owner/repo#n``) whenever
+    :func:`~spirrow_mindwire.github.client.parse_pr_ref` recognised one — including for a PR URL,
+    which it normalises. It is *not* the substring the author typed: this module no longer knows
+    the shape of a ref, so it cannot report where one started and ended, only what the owner of
+    that grammar made of it. When the owner recognised nothing, ``token`` is the raw operand, and
+    the conductor's re-validation (``core.py``, same function) fails safe to the human.
     """
 
     kind: HandoffKind
@@ -92,28 +207,32 @@ class Handoff:
 
 
 def _last_next_raw(body: str) -> str | None:
-    """The raw text of the **last** ``NEXT:`` line (last wins; see module docstring), or ``None``.
+    """The raw text after the keyword on the **last** ``NEXT:`` line, or ``None`` if there is none.
 
-    The ``pr-review <ref>`` PR-gate sentinel needs the whole line (the ref carries ``/`` and ``#``),
-    so resolution works off this raw text and only name-splits for a persona handoff.
+    Raw really is raw: nothing is removed here. The ``pr-review`` route and the persona route both
+    read this same text and each matches its own target out of it, so the two cannot disagree about
+    what the author wrote (msg-1074 §4-1 wanted one owner for the token; making both routes read an
+    unmodified string is a stronger form of that than making both read the same *edited* string).
     """
     matches = _NEXT_LINE_RE.findall(body)
     if not matches:
         return None
-    return str(matches[-1]).strip()
+    return str(matches[-1]).strip() or None
 
 
 def _name_from_raw(raw: str) -> str | None:
-    """The persona name from a raw NEXT token (gloss + trailing punctuation stripped)."""
-    name = _NAME_SPLIT_RE.split(raw, maxsplit=1)[0].strip(_TRAILING_PUNCT)
-    return name or None
+    """The participant name at the head of a raw NEXT token, or ``None`` if there is not one."""
+    match = _PARTICIPANT_NAME_RE.match(raw)
+    return match.group("name") if match is not None else None
 
 
 def parse_next_token(body: str) -> str | None:
     """Return the participant name from the **last** ``NEXT:`` line, or ``None`` if there is none.
 
-    The trailing parenthetical gloss many handoffs carry is stripped — only the leading name is
-    returned (e.g. a name followed by a CJK or ASCII parenthetical gloss yields just the name).
+    Only the name is returned. The gloss most real handoffs carry after it — a parenthetical
+    (ASCII or CJK), an em-dash sentence, a closing ``**`` — is not part of the name pattern and so
+    never reaches the caller. This function deliberately takes no roster: ``head_skip`` depends on
+    being able to read a token for a persona it has never heard of (fail-open on unknown persona).
     """
     raw = _last_next_raw(body)
     return _name_from_raw(raw) if raw is not None else None
@@ -131,13 +250,18 @@ def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
     raw = _last_next_raw(body)
     if raw is None:
         return Handoff(HandoffKind.ABSENT)
-    pr_review = _PR_REVIEW_RE.match(raw)
-    if pr_review is not None:
-        # NEXT: pr-review <owner/repo#n> — the ref is the first non-whitespace token, with trailing
-        # punctuation stripped (as persona names are) so a natural ``...#7.`` / ``...#7,`` does not
-        # reach GitHub as an invalid ref (Tier B PR #103 round 3). The conductor validates it via
-        # parse_pr_ref and fires the synchronous Tier B review (PR-2b-2).
-        return Handoff(HandoffKind.PR_REVIEW, token=pr_review.group("ref").strip(_TRAILING_PUNCT))
+    sentinel = _PR_REVIEW_RE.match(raw)
+    if sentinel is not None and (operand := sentinel.group("rest").strip()):
+        # NEXT: pr-review <owner/repo#n>. This module says where the operand starts and where its
+        # decoration ends; it does not say what a PR ref is. ``parse_pr_ref`` owns that, is
+        # documented to extract one from *free text*, and its answer is recorded verbatim (the
+        # canonical slug), so a ref shape only the owner knows arrives here without an edit.
+        # An operand the owner does not recognise is still the sentinel (the author asked for a
+        # gate) and is carried forward raw; the conductor re-validates with the same function and
+        # fails safe to the human rather than firing (Tier B PR #103 round 4).
+        payload = _OPERAND_PAYLOAD_RE.match(operand)
+        ref = parse_pr_ref(payload.group("payload") if payload is not None else operand)
+        return Handoff(HandoffKind.PR_REVIEW, token=ref.slug if ref is not None else operand)
     token = _name_from_raw(raw)
     if token is None:
         return Handoff(HandoffKind.ABSENT, token=raw)
