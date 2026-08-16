@@ -51,6 +51,7 @@ from ..exceptions import (
 )
 from ..lexora.client import ChatMessage, LexoraChatClient, LexoraClient
 from ..ports import SpawnContext
+from ..thread_context import render_thread_context
 from ..ulid_util import new_ulid
 from ..value_objects import (
     Capability,
@@ -126,10 +127,18 @@ class _Session:
 
 def _build_messages(event: ChatroomEvent, own_role: Role, system_prompt: str) -> list[ChatMessage]:
     payload = event.payload
+    # Ground truth (T-dispatched-turn-gets-one-message D-3). Rendered by the shared
+    # builder so the "this is history, not an instruction" framing is the same text
+    # the SDK adapters get; this adapter composes a ChatMessage list rather than one
+    # prompt string, so it takes the block instead of ``build_turn_prompt``.
+    history = (
+        render_thread_context(event.thread_context) if event.thread_context is not None else ""
+    )
     user = (
         f"You are acting as the {own_role.value} role in thread "
         f"{event.thread_ref.thread_id}.\n\n"
-        f"The {payload.author} posted the following message. Critique it, "
+        + (f"{history}\n\n" if history else "")
+        + f"The {payload.author} posted the following message. Critique it, "
         f"quoting the specific passages you object to:\n\n"
         f"---\n{payload.body}\n---"
     )
