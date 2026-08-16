@@ -1,0 +1,916 @@
+# Real-traffic corpus for the conductor's NEXT-handoff parser. GENERATED — do not hand-edit.
+# Regenerate with: uv run python scripts/gen_next_line_corpus.py
+#
+# Every NEXT:-bearing line of every message in the live chatrooms below, cut to its
+# decision head and de-duplicated (see scripts/gen_next_line_corpus.py for both rules).
+# Roster: Bohr=proposer, Heisenberg=implementer, Einstein=naysayer
+#
+# source  spirrow-mindwire: NEXT-bearing lines: 860
+# source  spirrow-mindwire: messages: 1143
+# source  spirrow-mindwire: threads: 137
+# source  spirrow-voxelworld: NEXT-bearing lines: 2696
+# source  spirrow-voxelworld: messages: 2511
+# source  spirrow-voxelworld: threads: 203
+# reduced prose lines: 1032
+# reduced records: 898
+# reduced shape lines: 2524
+#
+# columns: kind<TAB>token<TAB>line
+absent		 #94 gate。**NEXT: Einstein**。
+absent		 **不発火** → `NEXT: human`: 推論 
+absent		 5. Tier-C（`NEXT: human`）— **
+absent		 Stage 2 が `NEXT:` 不在（UNRES
+absent		 Tier-C 受領、`NEXT: Bohr`）以降、*
+absent		 both done. NEXT: Bohr (re-r
+absent		 bottleneck。NEXT: human。
+absent		 close 手続きへ（NEXT: Bohr）／ sti
+absent		 design 再確認（NEXT: human — 発生源
+absent		 edge も実行: `NEXT: **` / `NEXT:` / `N
+absent		 editor 排他 `NEXT: human`（未応答分
+absent		 explicit ``NEXT: human`` (i.
+absent		 green、then NEXT: Einstein。
+absent		 is ALIVE ⇒ NEXT: human — thi
+absent		 launching `NEXT: human` thre
+absent		 localize → NEXT: Bohr（fix 設
+absent		 localized. NEXT: Bohr.** Reu
+absent		 msg が無い → `NEXT:` が読めない → **`
+absent		 msg-1268 の NEXT: human（次アクショ
+absent		 msg-1776 の NEXT: Bohr を受け、B
+absent		 msg-355)が `NEXT: Bohr` で指名し
+absent		 msg-409 の `NEXT: human` ブロッカ
+absent		 park 解除済で `NEXT: Bohr` 待機中。
+absent		 parse される。`NEXT: human (tier
+absent		 posting a `NEXT: human` stop
+absent		 premise => NEXT: human."
+absent		 r2 APPROVE、NEXT: Bohr）を受理。P
+absent		 ready 相当の `NEXT: human` を co
+absent		 release 報告（NEXT: human）+ Boh
+absent		 reply 末尾が `NEXT: <persona>|huma
+absent		 report → **NEXT: Bohr**（rev
+absent		 report → **NEXT: Bohr**（spe
+absent		 report で **NEXT: Bohr**（pro
+absent		 report で **NEXT: human**（Tak
+absent		 residual で NEXT: Bohr」に該当。t
+absent		 the field. NEXT: Bohr (fix 
+absent		 to output `NEXT: {HUMAN_TOKEN}` ins
+absent		 watertight・NEXT: Bohr）
+absent		 → report（**NEXT: Bohr** で f
+absent		 ∴ 停止スレッド (`NEXT: human`) や D
+absent		 が watch 面、`NEXT:` handoff が tri
+absent		 その報告ターンで **NEXT: human**（cyc
+absent		 で再確認）。∴ 本 `NEXT: human` は**呼
+absent		 に escalate。NEXT: human。**
+absent		 に post して `NEXT:` を指名する**。T2 
+absent		 に report → NEXT: Bohr 再判断。
+absent		 のみ（infra）→ NEXT: Einstein 再発火
+absent		 へ escalate（NEXT: human）。**
+absent		 を localize（NEXT: Bohr）／doub
+absent		 付き ABSENT/`NEXT: human` from
+absent		 大黒穴アーク完結**。NEXT: none。
+absent		 定義**: 停止は `NEXT: human` + ow
+absent		 実装 report, NEXT: Bohr）受け。sp
+absent		# `**NEXT: X**` が 
+absent		## Why NEXT: human
+absent		## 人への依頼(NEXT: human の理由・決
+absent		## 判断点（NEXT: human）
+absent		## 残（NEXT: human 判断）
+absent		#151`） | `**NEXT: X**` | 
+absent		's pending `NEXT:`, or state
+absent		(msg-1732, `NEXT: human`). Th
+absent		) 両方 done。**NEXT: Bohr**（D2 
+absent		)(b) を満たして `NEXT: human` へ渡す行
+absent		)して数値付き報告→**NEXT: Bohr**(clo
+absent		** — 本ターンは `NEXT: human` ゆえ**
+absent		**Next:** PIE A/B (
+absent		**R3 が来たら `NEXT: human` で返す。
+absent		**park 解除の `NEXT:`** を post 
+absent		**park 解除の `NEXT:`** を指名する義務がある。
+absent		**syntax（`NEXT:` の gramm
+absent		**君の `NEXT: human`（msg-
+absent		**最終行**を必ず `NEXT: <PersonaName>` / `
+absent		**現在の指名は `NEXT: Bohr` のまま有
+absent		*: 本 msg は `NEXT: human` だが、*
+absent		*role 名**: `NEXT:` の後ろから、**ros
+absent		*に post して `NEXT:` を指名する（`msg-
+absent		*に post して `NEXT:` を指名する（msg-2
+absent		*に post して `NEXT:` を指名（msg-2
+absent		*（実測値を含む）: `NEXT: Bohr（**ただし
+absent		, and route NEXT: Bohr with 
+absent		- **`NEXT: <role>（ただし今
+absent		- **含む**: `NEXT:` 行の正規化を **1 箇
+absent		- **層 2（`NEXT:` パーサの markd
+absent		- **指名 `NEXT: Bohr` は保持。
+absent		- **既存の `NEXT:` 機構と二重管理にしない** — c
+absent		- `NEXT:` の意味論そのものの再設計（role 
+absent		- 本文の `NEXT:` 解析は **leg
+absent		- 通常完走 → NEXT: Einstein（独立 na
+absent		-2 の状態は不変**（NEXT: human、live 
+absent		-4 blocker. NEXT: human (one 
+absent		-688 parked NEXT:human). My 
+absent		/c3c space (NEXT: Bohr).** I
+absent		03 = human、`NEXT: Bohr`、Draf
+absent		2 APPROVE, `NEXT: human`）への回答
+absent		2. **`NEXT: <role>（ただし…
+absent		2. `NEXT: delegate` の by
+absent		2. 停止トークン: `NEXT: none` / `N
+absent		242 の末尾は **`NEXT: Bohr`** であ
+absent		3 件とも末尾を `NEXT: human` にした。
+absent		3. 撤回が `NEXT: human` のみで取
+absent		387（偽承認のまま `NEXT: human`）も同じ扱
+absent		4. 抽出不能・`NEXT:` 行なし・複数解釈可
+absent		42 body（末尾 `NEXT: Bohr`）を与えて
+absent		7 (my own), NEXT: human; no m
+absent		7 は偽の承認のまま `NEXT: human` を発火*
+absent		7 ターン連続）。**`NEXT: human` を書くタ
+absent		8 の実物 1 行、`*NEXT: human*`、`` 
+absent		8f`）＝ そちらは `NEXT: human` で Ti
+absent		: proposer→`NEXT: human` で当該 
+absent		> **測定ターンの `NEXT:` は要求元に固定する（最低限、`
+absent		> - `NEXT: <role>` では撃
+absent		B（park 解除済、`NEXT: Bohr`）も止まる
+absent		CE` = 「お前の `NEXT:` 行を condu
+absent		CI green → `NEXT: Bohr` → Ei
+absent		CI green → `NEXT: Bohr`（再 G-
+absent		Data below. NEXT: Bohr (feat
+absent		ED + 落下なし**。NEXT: Bohr。
+absent		Einstein の `NEXT: human` を踏み越
+absent		LOD を実測して報告。NEXT: Bohr（fix-f
+absent		PPROVE → 収束。NEXT: human（Tier-
+absent		RED 成立** → `NEXT: Bohr`（reme
+absent		ROVE relay, NEXT: Bohr）受け。未集
+absent		ROVE relay, NEXT: Bohr）受け。本タ
+absent		S_REQUESTED。NEXT: Bohr adjud
+absent		T1 は定義上落ちる）。NEXT: Bohr（reg 再
+absent		TF-8 往復OK）・`NEXT: human`。
+absent		Then NEXT: human — Tak
+absent		` に post し `NEXT:` を指名する義務がある。**T2=
+absent		`: human の `NEXT: human` → ST
+absent		`_route` は `NEXT: human`（明示）の
+absent		ache hit で "NEXT: " を合成、`deci
+absent		ahito に出す。**NEXT: human**。
+absent		ahito 手番のまま（NEXT: human 不変）**
+absent		akahito 判断・`NEXT: human` の中身）
+absent		alified` で `NEXT: Bohr`。
+absent		and merged, NEXT: none」を報告済だ
+absent		apters の末尾 `NEXT:` 行 emiss
+absent		arm 結果を添えて `NEXT: human` で必ず上
+absent		arsing the `NEXT:` line of th
+absent		at) → STOP, NEXT: Bohr (that
+absent		atroom の最新 `NEXT:` を辿って次 role 
+absent		aysayer 名義 `NEXT: implementer` が **
+absent		aysayer 経路）。NEXT: Heisenberg
+absent		ble case) ⇒ NEXT: Bohr to re
+absent		calization; NEXT: Bohr** (re
+absent		ce vectors. NEXT: Bohr** (ex
+absent		cheduler 登録。NEXT: none
+absent		containing `NEXT: pr-review`).
+absent		d spins on `NEXT: bohr` (acc
+absent		d tested `**NEXT: Bohr**— ne
+absent		d は msg-500(NEXT: human)を返し、m
+absent		d-reject → `NEXT: human` 強制**
+absent		d-reject し `NEXT: human` に強制*
+absent		dapter の末尾 `NEXT:` emission**（pro
+absent		ded off to `NEXT: human` to d
+absent		doff line (`NEXT: human（本 pos
+absent		dual を報告し **NEXT: Bohr**。dev
+absent		dual を報告し **NEXT: Bohr**（再診断
+absent		e advisory `NEXT:` instructions (inje
+absent		e harness). NEXT: Bohr (prop
+absent		e turn at **NEXT: human** — T
+absent		e 不可なら STOP→NEXT: human**（[[a
+absent		e 外に触れる。** `NEXT:` の語彙を増やすのは `NEXT
+absent		e-4 endorse＋NEXT: Bohr、§M AD
+absent		e` → **そこで `NEXT: human`**。
+absent		ed thread (`NEXT: human`) or 
+absent		editor 排他の `NEXT: human` が未応答
+absent		en 883/883）。NEXT: Bohr（再スコープ
+absent		en → report（NEXT: Bohr）。
+absent		ent` の条件付き `NEXT: Bohr` が C1
+absent		ent` は条件付き `NEXT: Bohr` で中断し
+absent		er-B 判断ゆえ **NEXT: Bohr**。
+absent		er-C merge（`NEXT: human`）へ。
+absent		er:.*)$`）を `NEXT: human` の直前1
+absent		erg turn の `NEXT:`（spec-review=Bohr 
+absent		ergence**: `NEXT: human`（Tier
+absent		esidual 報告で NEXT: Bohr。green
+absent		esolves`）。`*NEXT: human*` / `
+absent		ession 無し → NEXT: Bohr（証拠 ad
+absent		etirement`（`NEXT: Bohr`）/ `T
+absent		etirement`（`NEXT: Bohr`）と本スレ
+absent		fail-open: `NEXT:` 行が無い / 壊れて
+absent		fail-open: `NEXT:` 行なし / 壊れて
+absent		fra BLOCK → NEXT: human）を受け、h
+absent		fy 経路が無い。∴ `NEXT: human` に伴う 
+absent		g above.\n\nNEXT: Einstein
+absent		g-2439 末尾の `NEXT: human`（Step
+absent		g-2485 の指名（`NEXT: Bohr` × 2）
+absent		gate GREEN、`NEXT: Bohr`)を受けて
+absent		gate GREEN、`NEXT: Bohr`）を受け、
+absent		gate GREEN。`NEXT: Einstein`
+absent		gation 除去で `NEXT: human` 境界が常
+absent		gn review (`NEXT: <naysayer perso
+absent		halt にせず **`NEXT: human` fall
+absent		hatroom から `NEXT:` を含む行を全部抜く**（`sp
+absent		hatroom 最新 `NEXT:` を読む → その 
+absent		he trailing NEXT: line to ch
+absent		hito の自走 GO（NEXT:human の非mer
+absent		hread with `NEXT: human` — co
+absent		human 代理でも、`NEXT:` が停止トークンでなければ指名は生きている。msg-2
+absent		human 案（`NEXT: none (park
+absent		ier-C と判断 → NEXT: human**（Poi
+absent		ime`）。∴ この `NEXT: Bohr` は **
+absent		indwire 側で `NEXT: human`）。
+absent		ine: report（NEXT: Bohr spec-
+absent		ions GREEN. NEXT: Bohr scope
+absent		irement` = `NEXT: Bohr` / `T
+absent		it outputs `NEXT: human`. The
+absent		ity 荒らしゼロ**。NEXT: Bohr（revie
+absent		ive ruling. NEXT: human.
+absent		ivot、結果を報告し NEXT: Bohr で再スコー
+absent		king 0)ゆえ **NEXT: human**(Tie
+absent		le-thread, `NEXT: <role>` dri
+absent		lementer は `NEXT: human` の前に当
+absent		lementer's `NEXT:` following a tra
+absent		lent, so no NEXT: Bohr neede
+absent		ll の指示「末尾に `NEXT: <role>` を置く
+absent		message's ``NEXT: <participant>``
+absent		mory saved. NEXT: human (resu
+absent		mpile(r"^\s*NEXT:\s*(?P<t
+absent		mple, on `**NEXT: Bohr**,`, 
+absent		msg-1176 の `NEXT: human` への回答
+absent		msg-1223 の残 NEXT: human（caden
+absent		msg-1268 の `NEXT: human`（設計完了
+absent		msg-1271 の `NEXT: Bohr` に対応。
+absent		msg-1281 の `NEXT: human`（PR-A
+absent		msg-1293 の `NEXT: human`（F1 t
+absent		msg-1325 の `NEXT: human` に Ta
+absent		msg-1331 の `NEXT: human` に回答:
+absent		msg-1343（NEXT: Bohr）に対応。P
+absent		msg-1353（NEXT: human）への回答:
+absent		msg-1829 の `NEXT: Bohr` を受けて
+absent		msg-1906 で `NEXT: Bohr`（C1 g
+absent		msg-1906 の `NEXT: Bohr` を 13
+absent		msg-1919 が `NEXT: none`（sile
+absent		msg-1997）は `NEXT: human`。**Ti
+absent		msg-2242`, `NEXT: Bohr`, `co
+absent		msg-2297 の `NEXT: Bohr（SOT a
+absent		msg-2321 で `NEXT: human` = **
+absent		msg-2387 の `NEXT: human` は無効な
+absent		msg-2387 の `NEXT: human` を含む）
+absent		msg-2440 の `NEXT: human` に対する
+absent		msg-2488 の `NEXT:` が機械に読めていなかった（私の書式ミ
+absent		msg-949 の `NEXT:` に従い、機構を論じ
+absent		msg-950 の `NEXT:` に従い **E4 
+absent		msg-952 の `NEXT:` に従い設計に戻る。ただし指示
+absent		n decision. NEXT: human (Taka
+absent		n と食い違う証拠なし。NEXT: Bohr（R4 pi
+absent		n)** を起票し **NEXT: Bohr**（ali
+absent		n-authored `NEXT: human` で委譲解
+absent		nd SHIPPED. NEXT: none (thre
+absent		nd issue a `NEXT: human` or `
+absent		nd replied `NEXT: none`.
+absent		ndicated) ⇒ NEXT: Bohr to fi
+absent		no further `NEXT: human` boun
+absent		nt 境界 = 直近 `NEXT: human`、msg-
+absent		nt`（head = `NEXT: Bohr（…いま起こ
+absent		n（review が `NEXT: human` で終わる
+absent		olling for `NEXT:` tokens seque
+absent		or は尽きる** → NEXT: Bohr（残りは 6
+absent		orgets the `NEXT:` line entir
+absent		orgets the `NEXT:` sentinel due t
+absent		ound して提示。**NEXT: human**（相談へ
+absent		port → 再ゲート（NEXT: Einstein、r2）。
+absent		port → 再ゲート（NEXT: Einstein）。
+absent		ppend。末尾必須 `NEXT: <name>|huma
+absent		proposer が `NEXT: human`（desi
+absent		proposer の `NEXT: human`/cont
+absent		r attempts `NEXT: human` (sig
+absent		r の指摘を捌いた後、`NEXT: human` ではなく
+absent		r 諮問必須」は **`NEXT: human` のときだ
+absent		r, rebuild, NEXT:human-for-PIE. Befor
+absent		r-C へ送ってよい（`NEXT: human`）。**
+absent		read の作業は決着、NEXT: none」宣言済み。
+absent		reproduce → NEXT: Bohr)
+absent		resence of `NEXT:` as the t
+absent		rs to emit `NEXT:` could gut O
+absent		rseding the NEXT: line of ms
+absent		se a valid `NEXT: <role>`, it
+absent		sg-1436 で決着（NEXT: none）。**re
+absent		sidual を報告し NEXT: Bohr」。**この
+absent		sly → STOP, NEXT: Bohr/human. Do NO
+absent		ss GREEN.** NEXT: Einstein.
+absent		ssage with `NEXT: human`, the
+absent		ssage with `NEXT: proposer`, doe
+absent		st。うち 1 件は `NEXT: human` 済。**
+absent		s。msg-531 の NEXT: human（billi
+absent		t residual, NEXT: Bohr. Do NO
+absent		t` 実測 head（`NEXT: Bohr（ただし…い
+absent		te/CI green。NEXT: Einstein(必須)。
+absent		tear に再局在**。NEXT: human（drill
+absent		termediate `NEXT: human` SKIP
+absent		thread に記録）。NEXT: Bohr（close
+absent		tiline `^\s*NEXT:` regex in `h
+absent		ting_reply）。NEXT: Bohr
+absent		tly writes `NEXT: human` (an 
+absent		tly writes `NEXT: human` [...
+absent		to develop. NEXT: Bohr.
+absent		turally: a `NEXT:` from you t
+absent		uction via `NEXT: none` is a
+absent		uman 終端（明示 `NEXT: human` **また
+absent		uman: saw a NEXT:-like line 
+absent		uthor | 末尾 `NEXT:` |
+absent		wire 該当 → **NEXT: Bohr**（Tie
+absent		xt_token("**NEXT: Bohr** — n
+absent		yer APPROVE、NEXT: human）への Ta
+absent		yer であり、その `NEXT:` が imple
+absent		ysayer 自身の `NEXT: <implementer>` を h
+absent		| `## NEXT: X` | ✗ 
+absent		| `**NEXT: X**` | 
+absent		| `- NEXT: X` / `*
+absent		| `1. NEXT: X` | ✗ 
+absent		| `> NEXT: X` | ✗ 
+absent		| `| NEXT: X |` | 
+absent		| 書式 | `^\s*NEXT:` にマッチするか |
+absent		§4-1 のみ:** `NEXT:` 行の正規表現緩和。具体的には
+absent		→ P1 完了時の `NEXT: Bohr`(機構を一
+absent		→ 最新 msg の `NEXT: <role>` par
+absent		→ 最新 msg の `NEXT:` parse → rol
+absent		∴ 本 PR は `NEXT:` 語彙も statu
+absent		∴ 本スレッドが `NEXT: human` で止まっ
+absent		、移動は凍結しない。**NEXT: human**
+absent		。Track B は `NEXT: Bohr` で待機中
+absent		。gate クリア → NEXT: human(Tier-
+absent		「本文中に引用された `NEXT:` が本物のハンドオフを上書きしない」ための防御
+absent		から出した（park、`NEXT: none`）。
+absent		が **63 日** `NEXT: human` で停止。
+absent		こで Tier-C / NEXT: human）。
+absent		し）、skill が `NEXT: human` に要求す
+absent		せず escalate。NEXT: Bohr。**
+absent		た（msg-2402、`NEXT: Bohr`）。
+absent		ったからではなく、**`NEXT: human` と書いて
+absent		つ** head の `NEXT:` がループ役でない ⇒ ski
+absent		つまり **誰も末尾 `NEXT:` 行を出さない** → l
+absent		て park 解除の `NEXT:` を指名する」。**同タ
+absent		て「`^[\s*_`]*NEXT:` に緩め、`_TRA
+absent		である。** 貴方は `NEXT: Bohr` で私に判
+absent		できる。これで「手で `NEXT:` を直した」経路は機構
+absent		で再確認が要る点 / `NEXT:` 指名先（実名で）。
+absent		ない parked (`NEXT: human`) スレッ
+absent		ない外部ブロッカー。**NEXT: human**(下記2
+absent		なければ自分で判定せず NEXT: human で inf
+absent		に park 解除済（`NEXT: Bohr`）。C2 
+absent		にかなっている。また `NEXT: human` の沈黙を
+absent		になるため。あちらは `NEXT: human` の Ti
+absent		にも post して `NEXT:` を発火させること。** これ
+absent		に触れていない。** `NEXT: human`
+absent		の explicit `NEXT: human` を、未 
+absent		の msg-2399（`NEXT: human`）で上がっ
+absent		の**最終行**から `NEXT:` 行を取る。
+absent		のスレッドに未解決の `NEXT:` が立っているなら、それを引き
+absent		の状態は**不変**: NEXT: human（live 
+absent		はなく「head の `NEXT:` がループ役を指しているか」である。*
+absent		める → それも違えば NEXT: Bohr 再スコープ
+absent		よいか — 特に **`NEXT: human` の待ちが
+absent		らせる。B5a-2 は NEXT: human のまま並行
+absent		り深い void）**。NEXT: human（Takah
+absent		れていない）。∴ 本 `NEXT: human` は、この
+absent		を close せず、`NEXT: none` の但し書
+absent		を優先すると読むなら `NEXT: human` ＋ Pu
+absent		を先頭**に置く。**`NEXT: human` /「あな
+absent		を逆算するのを拒んで `NEXT: Bohr` で止めた
+absent		ィールドを読み、本文 `NEXT:` より優先する**（不一致
+absent		クラスそのものであり、`NEXT:` パーサのついでに片手間で設計してよい代物ではない。もし (B
+absent		スレに post し `NEXT:` を指名する義務）も**まだ
+absent		ッションは各ゲートの `NEXT:` を読んで停止せず次へ進む(NEXT:
+absent		ドに post して `NEXT:` を指名する**」義務に
+absent		ブロック内部に現れる `NEXT:` 行(例: ブロ
+absent		プのセッションに無く、`NEXT: human` は co
+absent		ョン連続）。**今回 `NEXT:` は human
+absent		レに post して `NEXT:` を指名することで行う。** 「あ
+absent		ントの routing(NEXT: human)
+absent		ージを編集して不正な `NEXT:` を修正した場合、head_
+absent		上、**無人ターンで `NEXT: human` を出した
+absent		主機構（**条件付き `NEXT:` が、条件成立を
+absent		全 gate 結果。**NEXT: Bohr**（fix
+absent		分離実験で両方確定。**NEXT: human**（改善案
+absent		同 msg の末尾が `NEXT: human — vox
+absent		後を採る（引用された `NEXT:` が本物を上書きしない）／`pr-
+absent		成立を誰も監視しない `NEXT:` は永久に発火しない）なので、*
+absent		持たない。推論限界 → NEXT: human**。bra
+absent		救済にならない）。`**NEXT: Bohr**）`（全
+absent		方に post して `NEXT:` を指名**すること
+absent		方に post して `NEXT:` を指名する。** 本タ
+absent		最終化 → その時点で NEXT: Bohr へ。
+absent		査で、**「条件付き `NEXT:` を出したスレッドが、条件成立を
+absent		況が 2 連続）。∴ `NEXT: human` の通知を
+absent		済）。§1 の新事実（`NEXT: human` 発火が 
+absent		無傷（2a506da）。NEXT: human（devel
+absent		無傷（2a506da）。NEXT: human（end-t
+absent		現在の通知は「`NEXT:` が読めず human
+absent		的異議が無ければ **`NEXT: human`**（di
+absent		着」を post し `NEXT:` を指名すること。** 「あ
+absent		着」を post し `NEXT:` を指名する義務を負う**（msg
+absent		着床済（msg-564「NEXT: Bohr」）= re
+absent		票すること（本スレの `NEXT:` には載せない）。P-1〜
+absent		私が書いた「条件付き `NEXT:` は条件成立を誰も監視しないと永久に発火しない」とも同族。
+absent		窓 が残る → これが NEXT: Bohr の論点
+absent		行し、T1〜T6 を `NEXT: human` で上げる
+absent		装 + PR open(NEXT: Einstein)
+absent		該 thread で「`NEXT: human`（=撤回）
+absent		認）。skill は `NEXT: human` に通知の
+absent		読んでおらず、要約と `NEXT:` 行の逐語引用で判定した**（msg
+absent		達は設計どおり** → NEXT: Bohr(defau
+absent		領（msg-423 の NEXT:human に対し）。
+absent		（msg-1070 の NEXT: human への回答）
+absent		（→ Tier-C / NEXT: human）。reme
+absent		（「まだその時ではない、NEXT: Bohr」）を繰り返
+absent		）→ report で NEXT: Bohr（D2 の 
+absent		）、候補順序・優先度、`NEXT:` の意味論と role 
+absent		）とは別で、本提案を `NEXT: human` にする性
+absent		）に戻る。その時点で `NEXT: human` に上げる
+human	human	## NEXT: human — Tak
+human	human	## NEXT: human（Tier-
+human	human	## NEXT: human（理由 = 
+human	human	**NEXT: human** — #
+human	human	**NEXT: human** — §
+human	human	**NEXT: human** — 上
+human	human	**`NEXT: human` と書いて
+human	human	- **`NEXT: human` に対する
+human	human	- `**NEXT: human**。` (
+human	human	1. **`NEXT: human` の到達は
+human	human	> **`NEXT: human` を書いた
+human	human	> `NEXT: human`
+human	human	NEXT: human
+human	human	NEXT: human  (Tak
+human	human	NEXT: human (CI g
+human	human	NEXT: human (D1-D
+human	human	NEXT: human (PIE 
+human	human	NEXT: human (PR #
+human	human	NEXT: human (R2 着
+human	human	NEXT: human (R4-P
+human	human	NEXT: human (T-fo
+human	human	NEXT: human (Taka
+human	human	NEXT: human (Tier
+human	human	NEXT: human (clea
+human	human	NEXT: human (conf
+human	human	NEXT: human (merg
+human	human	NEXT: human (park
+human	human	NEXT: human (pick
+human	human	NEXT: human (reco
+human	human	NEXT: human (rele
+human	human	NEXT: human (resu
+human	human	NEXT: human (the 
+human	human	NEXT: human (上記 1
+human	human	NEXT: human (次ラウン
+human	human	NEXT: human -- Ta
+human	human	NEXT: human — PR 
+human	human	NEXT: human — Ste
+human	human	NEXT: human — T22
+human	human	NEXT: human — vox
+human	human	NEXT: human — デプロ
+human	human	NEXT: human — 上記 
+human	human	NEXT: human — 残 f
+human	human	NEXT: human — 追認し
+human	human	NEXT: human （**Ti
+human	human	NEXT: human （Tier
+human	human	NEXT: human(Takah
+human	human	NEXT: human(Tier-
+human	human	NEXT: human(① fac
+human	human	NEXT: human(次セッショ
+human	human	NEXT: human(残り設計ゲ
+human	human	NEXT: human(破れ fi
+human	human	NEXT: human（#38 m
+human	human	NEXT: human（#39 T
+human	human	NEXT: human（**PR-
+human	human	NEXT: human（**T1〜
+human	human	NEXT: human（**Tak
+human	human	NEXT: human（**Tie
+human	human	NEXT: human（**msg
+human	human	NEXT: human（**① は
+human	human	NEXT: human（**②-b
+human	human	NEXT: human（**判断は
+human	human	NEXT: human（**急ぎで
+human	human	NEXT: human（**残り2
+human	human	NEXT: human（APPRO
+human	human	NEXT: human（P1 着手
+human	human	NEXT: human（PIE フ
+human	human	NEXT: human（PR #3
+human	human	NEXT: human（PR 化 
+human	human	NEXT: human（PR-A2
+human	human	NEXT: human（Q1 最終
+human	human	NEXT: human（R4-P4
+human	human	NEXT: human（Relea
+human	human	NEXT: human（T225 
+human	human	NEXT: human（Takah
+human	human	NEXT: human（Tier-
+human	human	NEXT: human（UE 配線
+human	human	NEXT: human（Voxel
+human	human	NEXT: human（fresh
+human	human	NEXT: human（magic
+human	human	NEXT: human（merge
+human	human	NEXT: human（relea
+human	human	NEXT: human（strea
+human	human	NEXT: human（§4.2 
+human	human	NEXT: human（① F3 
+human	human	NEXT: human（① nay
+human	human	NEXT: human（一区切り。
+human	human	NEXT: human（全7ゲート
+human	human	NEXT: human（変更なし 
+human	human	NEXT: human（本 pos
+human	human	NEXT: human（検証 NG
+human	human	NEXT: human（次フェーズ
+human	human	`NEXT: human`
+human	human	`NEXT: human` + ow
+human	human	| `**NEXT: human** — T
+human	human	| `**NEXT: human**。` |
+human	human	→ **NEXT: human**(Tak
+none	none	**NEXT: none** — 本
+none	none	NEXT: none
+none	none	NEXT: none (Stag
+none	none	NEXT: none(本ゲート決
+none	none	NEXT: none(本スレは索
+none	none	NEXT: none（#96 =
+none	none	NEXT: none（**C1 
+none	none	NEXT: none（**par
+none	none	NEXT: none（**本スレ
+none	none	NEXT: none（24日前に
+none	none	NEXT: none（30日前に
+none	none	NEXT: none（C2 決着
+none	none	NEXT: none（R3 アー
+none	none	NEXT: none（R4-P4
+none	none	NEXT: none（T228 
+none	none	NEXT: none（canon
+none	none	NEXT: none（gate 
+none	none	NEXT: none（park 
+none	none	NEXT: none（park。
+none	none	NEXT: none（resol
+none	none	NEXT: none（この PR
+none	none	NEXT: none（ボールは 
+none	none	NEXT: none（後続は T
+none	none	NEXT: none（本 msg
+none	none	NEXT: none（本 pos
+none	none	NEXT: none（本 thr
+none	none	NEXT: none（本スレッド
+none	none	NEXT: none（本スレ決着
+none	none	NEXT: none（決着。P2
+none	none	NEXT: none（設計フェー
+none	none	| `NEXT: none（本 thr
+pr_review	<owner/repo#n> — the whole ref is the token (not a leading name); the	# NEXT: pr-review <owner/repo#n> — the whole ref is the token (not a leading name); the
+pr_review	<ref>` sentinel → conductor が `fire_pr_review` を**同期発火**（ADR-19 N-1）→ `outcome.verdict` で**直接ルーティング**（APPROVE/COMMENT→human / RC→implementer 直 dispatch、relay event=critique で起こす）。**carve-out ② = verdict 直結（author 非信頼）で再導入** ＝ guard 例外面ゼロ・詐称面ゼロ（msg-552/557 最強実現）。ref は parse_pr_ref で validate+slug 正規化（URL→canonical）。fail-safe 多数（orchestrator None / 不正 ref / 空 relay-id / implementer 不在 → HUMAN）。RC×5 全 fix、round6 APPROVE（"exceptionally solid / no blocking bugs"）。	`NEXT: pr-review <ref>` sentinel → conductor が `fire_pr_review` を**同期発火**（ADR-19 N-1）→ `outcome.verdict` で**直接ルーティング**（APPROVE/COMMENT→human / RC→implementer 直 dispatch、relay event=critique で起こす）。**carve-out ② = verdict 直結（author 非信頼）で再導入** ＝ guard 例外面ゼロ・詐称面ゼロ（msg-552/557 最強実現）。ref は parse_pr_ref で validate+slug 正規化（URL→canonical）。fail-safe 多数（orchestrator None / 不正 ref / 空 relay-id / implementer 不在 → HUMAN）。RC×5 全 fix、round6 APPROVE（"exceptionally solid / no blocking bugs"）。
+pr_review	SpirrowGames/Spirrow-VoxelWorld#178	NEXT: pr-review SpirrowGames/Spirrow-VoxelWorld#178
+pr_review	SpirrowGames/spirrow-mindwire#135	NEXT: pr-review SpirrowGames/spirrow-mindwire#135
+pr_review	SpirrowGames/spirrow-mindwire#137	NEXT: pr-review SpirrowGames/spirrow-mindwire#137
+pr_review	SpirrowGames/spirrow-mindwire#138	NEXT: pr-review SpirrowGames/spirrow-mindwire#138
+pr_review	SpirrowGames/spirrow-mindwire#139	NEXT: pr-review SpirrowGames/spirrow-mindwire#139
+pr_review	SpirrowGames/spirrow-mindwire#140	NEXT: pr-review SpirrowGames/spirrow-mindwire#140
+pr_review	SpirrowGames/spirrow-mindwire#142	NEXT: pr-review SpirrowGames/spirrow-mindwire#142
+pr_review	SpirrowGames/spirrow-mindwire#142	NEXT: pr-review SpirrowGames/spirrow-mindwire#142 （Eins
+pr_review	SpirrowGames/spirrow-mindwire#143	NEXT: pr-review SpirrowGames/spirrow-mindwire#143 （Eins
+pr_review	SpirrowGames/spirrow-mindwire#144	NEXT: pr-review SpirrowGames/spirrow-mindwire#144 （Eins
+pr_review	SpirrowGames/spirrow-mindwire#151	NEXT: pr-review SpirrowGames/spirrow-mindwire#151
+pr_review	acme/widgets#7	- `**NEXT: pr-review acme/widgets#7**, pl
+pr_review	acme/widgets#7	- `**NEXT: pr-review acme/widgets#7**.` →
+pr_review	acme/widgets#7	| `**NEXT: pr-review acme/widgets#7** — p
+role	Bohr	**NEXT: Bohr** — §
+role	Bohr	**NEXT: Bohr** — 裁
+role	Bohr	- `**NEXT: Bohr**, be
+role	Bohr	NEXT: Bohr
+role	Bohr	NEXT: Bohr (Obj1
+role	Bohr	NEXT: Bohr (PR #
+role	Bohr	NEXT: Bohr (R0: 
+role	Bohr	NEXT: Bohr (R1 s
+role	Bohr	NEXT: Bohr (R2-a
+role	Bohr	NEXT: Bohr (cont
+role	Bohr	NEXT: Bohr (land
+role	Bohr	NEXT: Bohr (prop
+role	Bohr	NEXT: Bohr (rout
+role	Bohr	NEXT: Bohr (scop
+role	Bohr	NEXT: Bohr (spec
+role	Bohr	NEXT: Bohr (the 
+role	Bohr	NEXT: Bohr — Gem
+role	Bohr	NEXT: Bohr — R3 
+role	Bohr	NEXT: Bohr — msg
+role	Bohr	NEXT: Bohr — the
+role	Bohr	NEXT: Bohr — ① E
+role	Bohr	NEXT: Bohr — 本スレ
+role	Bohr	NEXT: Bohr(APPRO
+role	Bohr	NEXT: Bohr(P1 実装
+role	Bohr	NEXT: Bohr(PR #5
+role	Bohr	NEXT: Bohr(SOT a
+role	Bohr	NEXT: Bohr(Stage
+role	Bohr	NEXT: Bohr(imple
+role	Bohr	NEXT: Bohr(matri
+role	Bohr	NEXT: Bohr(propo
+role	Bohr	NEXT: Bohr(queue
+role	Bohr	NEXT: Bohr(step1
+role	Bohr	NEXT: Bohr(①+③ を
+role	Bohr	NEXT: Bohr(信頼できる
+role	Bohr	NEXT: Bohr(局在した 
+role	Bohr	NEXT: Bohr(本ターンで
+role	Bohr	NEXT: Bohr(次ターンで
+role	Bohr	NEXT: Bohr→Heise
+role	Bohr	NEXT: Bohr（#43 を
+role	Bohr	NEXT: Bohr（(A) C
+role	Bohr	NEXT: Bohr（**PIE
+role	Bohr	NEXT: Bohr（**adj
+role	Bohr	NEXT: Bohr（**blo
+role	Bohr	NEXT: Bohr（**msg
+role	Bohr	NEXT: Bohr（**§12
+role	Bohr	NEXT: Bohr（**§2 
+role	Bohr	NEXT: Bohr（**§5 
+role	Bohr	NEXT: Bohr（**§6 
+role	Bohr	NEXT: Bohr（**①§7
+role	Bohr	NEXT: Bohr（**①は実
+role	Bohr	NEXT: Bohr（**ただし
+role	Bohr	NEXT: Bohr（**反証条
+role	Bohr	NEXT: Bohr（**枝C/
+role	Bohr	NEXT: Bohr（**枝S-
+role	Bohr	NEXT: Bohr（**枝Z 
+role	Bohr	NEXT: Bohr（**枝β 
+role	Bohr	NEXT: Bohr（3指摘の一
+role	Bohr	NEXT: Bohr（B1a b
+role	Bohr	NEXT: Bohr（B5 pr
+role	Bohr	NEXT: Bohr（B5a-2
+role	Bohr	NEXT: Bohr（D-4 の
+role	Bohr	NEXT: Bohr（E4 は閉
+role	Bohr	NEXT: Bohr（G-spe
+role	Bohr	NEXT: Bohr（GONE 
+role	Bohr	NEXT: Bohr（Gemin
+role	Bohr	NEXT: Bohr（OK ＝ 
+role	Bohr	NEXT: Bohr（P1 実証
+role	Bohr	NEXT: Bohr（P3 sp
+role	Bohr	NEXT: Bohr（P3a の
+role	Bohr	NEXT: Bohr（P4 = 
+role	Bohr	NEXT: Bohr（PIE 開
+role	Bohr	NEXT: Bohr（PR #1
+role	Bohr	NEXT: Bohr（PR #5
+role	Bohr	NEXT: Bohr（PR #6
+role	Bohr	NEXT: Bohr（PR #8
+role	Bohr	NEXT: Bohr（PR #9
+role	Bohr	NEXT: Bohr（R2 pr
+role	Bohr	NEXT: Bohr（R2 スコ
+role	Bohr	NEXT: Bohr（R4-P4
+role	Bohr	NEXT: Bohr（REQUE
+role	Bohr	NEXT: Bohr（Stage
+role	Bohr	NEXT: Bohr（T-pr-
+role	Bohr	NEXT: Bohr（`spir
+role	Bohr	NEXT: Bohr（adjud
+role	Bohr	NEXT: Bohr（clear
+role	Bohr	NEXT: Bohr（conte
+role	Bohr	NEXT: Bohr（devel
+role	Bohr	NEXT: Bohr（edge/
+role	Bohr	NEXT: Bohr（fix の
+role	Bohr	NEXT: Bohr（fresh
+role	Bohr	NEXT: Bohr（msg-1
+role	Bohr	NEXT: Bohr（msg-2
+role	Bohr	NEXT: Bohr（msg-6
+role	Bohr	NEXT: Bohr（objec
+role	Bohr	NEXT: Bohr（propo
+role	Bohr	NEXT: Bohr（root 
+role	Bohr	NEXT: Bohr（round
+role	Bohr	NEXT: Bohr（spec 
+role	Bohr	NEXT: Bohr（windi
+role	Bohr	NEXT: Bohr（§4 の 
+role	Bohr	NEXT: Bohr（§5 の 
+role	Bohr	NEXT: Bohr（§5 の検
+role	Bohr	NEXT: Bohr（§8 手順
+role	Bohr	NEXT: Bohr（① 本ター
+role	Bohr	NEXT: Bohr（①PR #
+role	Bohr	NEXT: Bohr（今夜の r
+role	Bohr	NEXT: Bohr（候補1/2
+role	Bohr	NEXT: Bohr（再 G-s
+role	Bohr	NEXT: Bohr（指名は不変
+role	Bohr	NEXT: Bohr（新規独立タ
+role	Bohr	NEXT: Bohr（本スレの 
+role	Bohr	NEXT: Bohr（本人続行 
+role	Bohr	NEXT: Bohr（本文訂正4
+role	Bohr	NEXT: Bohr（次サイクル
+role	Bohr	NEXT: Bohr（着手 di
+role	Bohr	NEXT: Bohr（要求を設計
+role	Bohr	NEXT: Bohr（設計改訂:
+role	Bohr	| `**NEXT: Bohr** - p
+role	Bohr	| `**NEXT: Bohr** — n
+role	Bohr	| `**NEXT: Bohr**, be
+role	Bohr	| `**NEXT: Bohr**— ne
+role	Bohr	| `NEXT: Bohr`（msg-
+role	Bohr	| `NEXT: Bohr（**ただし
+role	Einstein	**NEXT: Einstein** — #
+role	Einstein	**NEXT: Einstein** — P
+role	Einstein	- `**NEXT: Einstein**: wa
+role	Einstein	NEXT: Einstein
+role	Einstein	NEXT: Einstein (CI g
+role	Einstein	NEXT: Einstein (PR #
+role	Einstein	NEXT: Einstein (PR-g
+role	Einstein	NEXT: Einstein (inde
+role	Einstein	NEXT: Einstein (nays
+role	Einstein	NEXT: Einstein (re-f
+role	Einstein	NEXT: Einstein(CI 再 
+role	Einstein	NEXT: Einstein(PR #4
+role	Einstein	NEXT: Einstein(PR #5
+role	Einstein	NEXT: Einstein(PR #8
+role	Einstein	NEXT: Einstein(独立 na
+role	Einstein	NEXT: Einstein（#164 
+role	Einstein	NEXT: Einstein（#172 
+role	Einstein	NEXT: Einstein（#37 h
+role	Einstein	NEXT: Einstein（**#17
+role	Einstein	NEXT: Einstein（**PR 
+role	Einstein	NEXT: Einstein（**gat
+role	Einstein	NEXT: Einstein（PR #1
+role	Einstein	NEXT: Einstein（PR #3
+role	Einstein	NEXT: Einstein（PR #4
+role	Einstein	NEXT: Einstein（PR #5
+role	Einstein	NEXT: Einstein（PR #6
+role	Einstein	NEXT: Einstein（PR **
+role	Einstein	NEXT: Einstein（PR#15
+role	Einstein	NEXT: Einstein（PR#47
+role	Einstein	NEXT: Einstein（PR-ga
+role	Einstein	NEXT: Einstein（T-T22
+role	Einstein	NEXT: Einstein（Tier 
+role	Einstein	NEXT: Einstein（`#152
+role	Einstein	NEXT: Einstein（`/nay
+role	Einstein	NEXT: Einstein（`92fd
+role	Einstein	NEXT: Einstein（gate 
+role	Einstein	NEXT: Einstein（v0.2 
+role	Einstein	NEXT: Einstein（v0.3 
+role	Einstein	NEXT: Einstein（変更なし。
+role	Einstein	NEXT: Einstein（更新後 P
+role	Einstein	NEXT: Einstein（独立 na
+role	Einstein	NEXT: Einstein（独立セッシ
+role	Einstein	NEXT: Einstein（運用方針ど
+role	Einstein	`NEXT: Einstein`
+role	Einstein	| `**NEXT: Einstein**: wa
+role	Heisenberg	## NEXT: Heisenberg
+role	Heisenberg	## NEXT: Heisenberg — cha
+role	Heisenberg	## NEXT: Heisenberg — pre
+role	Heisenberg	## NEXT: Heisenberg — reb
+role	Heisenberg	## NEXT: Heisenberg — rep
+role	Heisenberg	**NEXT: Heisenberg** — §
+role	Heisenberg	**NEXT: Heisenberg** — ③
+role	Heisenberg	- **NEXT: Heisenberg — Ste
+role	Heisenberg	- `**NEXT: Heisenberg**.`
+role	Heisenberg	NEXT: Heisenberg
+role	Heisenberg	NEXT: Heisenberg (CVar
+role	Heisenberg	NEXT: Heisenberg (Obj1
+role	Heisenberg	NEXT: Heisenberg (P0 c
+role	Heisenberg	NEXT: Heisenberg (P1 =
+role	Heisenberg	NEXT: Heisenberg (P1.5
+role	Heisenberg	NEXT: Heisenberg (PR #
+role	Heisenberg	NEXT: Heisenberg (R2-0
+role	Heisenberg	NEXT: Heisenberg (R2-a
+role	Heisenberg	NEXT: Heisenberg (R4-P
+role	Heisenberg	NEXT: Heisenberg (`Wor
+role	Heisenberg	NEXT: Heisenberg (`r.V
+role	Heisenberg	NEXT: Heisenberg (add 
+role	Heisenberg	NEXT: Heisenberg (appl
+role	Heisenberg	NEXT: Heisenberg (clar
+role	Heisenberg	NEXT: Heisenberg (cvar
+role	Heisenberg	NEXT: Heisenberg (deve
+role	Heisenberg	NEXT: Heisenberg (enum
+role	Heisenberg	NEXT: Heisenberg (fold
+role	Heisenberg	NEXT: Heisenberg (gate
+role	Heisenberg	NEXT: Heisenberg (impl
+role	Heisenberg	NEXT: Heisenberg (meas
+role	Heisenberg	NEXT: Heisenberg (move
+role	Heisenberg	NEXT: Heisenberg (repr
+role	Heisenberg	NEXT: Heisenberg (rest
+role	Heisenberg	NEXT: Heisenberg (sub-
+role	Heisenberg	NEXT: Heisenberg (上記 1
+role	Heisenberg	NEXT: Heisenberg (上記3点
+role	Heisenberg	NEXT: Heisenberg (実装→v
+role	Heisenberg	NEXT: Heisenberg (第一手 
+role	Heisenberg	NEXT: Heisenberg — #17
+role	Heisenberg	NEXT: Heisenberg — #18
+role	Heisenberg	NEXT: Heisenberg — 3a-
+role	Heisenberg	NEXT: Heisenberg — P-A
+role	Heisenberg	NEXT: Heisenberg — bac
+role	Heisenberg	NEXT: Heisenberg — imp
+role	Heisenberg	NEXT: Heisenberg — vox
+role	Heisenberg	NEXT: Heisenberg((3) f
+role	Heisenberg	NEXT: Heisenberg((3b/c
+role	Heisenberg	NEXT: Heisenberg(Objec
+role	Heisenberg	NEXT: Heisenberg(P2 st
+role	Heisenberg	NEXT: Heisenberg(PR #5
+role	Heisenberg	NEXT: Heisenberg(PerCe
+role	Heisenberg	NEXT: Heisenberg(Stage
+role	Heisenberg	NEXT: Heisenberg(repro
+role	Heisenberg	NEXT: Heisenberg(round
+role	Heisenberg	NEXT: Heisenberg(step1
+role	Heisenberg	NEXT: Heisenberg(synth
+role	Heisenberg	NEXT: Heisenberg(上記 T1
+role	Heisenberg	NEXT: Heisenberg(上記 do
+role	Heisenberg	NEXT: Heisenberg(上記改訂 
+role	Heisenberg	NEXT: Heisenberg(同 bra
+role	Heisenberg	NEXT: Heisenberg(本 spe
+role	Heisenberg	NEXT: Heisenberg(現行 qu
+role	Heisenberg	NEXT: Heisenberg（#164 
+role	Heisenberg	NEXT: Heisenberg（#37 b
+role	Heisenberg	NEXT: Heisenberg（(0) d
+role	Heisenberg	NEXT: Heisenberg（(a) E
+role	Heisenberg	NEXT: Heisenberg（**#17
+role	Heisenberg	NEXT: Heisenberg（**Opt
+role	Heisenberg	NEXT: Heisenberg（**P-3
+role	Heisenberg	NEXT: Heisenberg（**P-4
+role	Heisenberg	NEXT: Heisenberg（**PIE
+role	Heisenberg	NEXT: Heisenberg（**PR 
+role	Heisenberg	NEXT: Heisenberg（**PR-
+role	Heisenberg	NEXT: Heisenberg（**Q2 
+role	Heisenberg	NEXT: Heisenberg（**RED
+role	Heisenberg	NEXT: Heisenberg（**arm
+role	Heisenberg	NEXT: Heisenberg（**blo
+role	Heisenberg	NEXT: Heisenberg（**gat
+role	Heisenberg	NEXT: Heisenberg（**msg
+role	Heisenberg	NEXT: Heisenberg（**rev
+role	Heisenberg	NEXT: Heisenberg（**§13
+role	Heisenberg	NEXT: Heisenberg（**§2 
+role	Heisenberg	NEXT: Heisenberg（**§6 
+role	Heisenberg	NEXT: Heisenberg（**①の実
+role	Heisenberg	NEXT: Heisenberg（**この 
+role	Heisenberg	NEXT: Heisenberg（**同一タ
+role	Heisenberg	NEXT: Heisenberg（1→2→3
+role	Heisenberg	NEXT: Heisenberg（B5a =
+role	Heisenberg	NEXT: Heisenberg（BLOCK
+role	Heisenberg	NEXT: Heisenberg（E4 のみ
+role	Heisenberg	NEXT: Heisenberg（E4 を実
+role	Heisenberg	NEXT: Heisenberg（F1 ct
+role	Heisenberg	NEXT: Heisenberg（F1 から
+role	Heisenberg	NEXT: Heisenberg（F1 を 
+role	Heisenberg	NEXT: Heisenberg（F1-F5
+role	Heisenberg	NEXT: Heisenberg（F4 to
+role	Heisenberg	NEXT: Heisenberg（Field
+role	Heisenberg	NEXT: Heisenberg（H1/H2
+role	Heisenberg	NEXT: Heisenberg（Obj1=
+role	Heisenberg	NEXT: Heisenberg（Objec
+role	Heisenberg	NEXT: Heisenberg（P-2 =
+role	Heisenberg	NEXT: Heisenberg（P1 を実
+role	Heisenberg	NEXT: Heisenberg（P2 = 
+role	Heisenberg	NEXT: Heisenberg（P2 st
+role	Heisenberg	NEXT: Heisenberg（P3 st
+role	Heisenberg	NEXT: Heisenberg（PR #1
+role	Heisenberg	NEXT: Heisenberg（PR #5
+role	Heisenberg	NEXT: Heisenberg（PR #6
+role	Heisenberg	NEXT: Heisenberg（PR#15
+role	Heisenberg	NEXT: Heisenberg（PR-2 
+role	Heisenberg	NEXT: Heisenberg（PR-2b
+role	Heisenberg	NEXT: Heisenberg（PR-P2
+role	Heisenberg	NEXT: Heisenberg（PR-R4
+role	Heisenberg	NEXT: Heisenberg（Phase
+role	Heisenberg	NEXT: Heisenberg（R3 ch
+role	Heisenberg	NEXT: Heisenberg（R4-P3
+role	Heisenberg	NEXT: Heisenberg（R4-P4
+role	Heisenberg	NEXT: Heisenberg（REQUE
+role	Heisenberg	NEXT: Heisenberg（Stage
+role	Heisenberg	NEXT: Heisenberg（Stren
+role	Heisenberg	NEXT: Heisenberg（T-T22
+role	Heisenberg	NEXT: Heisenberg（T-c3c
+role	Heisenberg	NEXT: Heisenberg（T-rel
+role	Heisenberg	NEXT: Heisenberg（V1 = 
+role	Heisenberg	NEXT: Heisenberg（`git 
+role	Heisenberg	NEXT: Heisenberg（block
+role	Heisenberg	NEXT: Heisenberg（bulle
+role	Heisenberg	NEXT: Heisenberg（curre
+role	Heisenberg	NEXT: Heisenberg（cvar 
+role	Heisenberg	NEXT: Heisenberg（defus
+role	Heisenberg	NEXT: Heisenberg（devel
+role	Heisenberg	NEXT: Heisenberg（faith
+role	Heisenberg	NEXT: Heisenberg（fix 実
+role	Heisenberg	NEXT: Heisenberg（fix: 
+role	Heisenberg	NEXT: Heisenberg（mined
+role	Heisenberg	NEXT: Heisenberg（msg-2
+role	Heisenberg	NEXT: Heisenberg（msg-8
+role	Heisenberg	NEXT: Heisenberg（new o
+role	Heisenberg	NEXT: Heisenberg（obj-1
+role	Heisenberg	NEXT: Heisenberg（offli
+role	Heisenberg	NEXT: Heisenberg（origi
+role	Heisenberg	NEXT: Heisenberg（produ
+role	Heisenberg	NEXT: Heisenberg（repro
+role	Heisenberg	NEXT: Heisenberg（run()
+role	Heisenberg	NEXT: Heisenberg（simfl
+role	Heisenberg	NEXT: Heisenberg（sub-P
+role	Heisenberg	NEXT: Heisenberg（sub-t
+role	Heisenberg	NEXT: Heisenberg（surfa
+role	Heisenberg	NEXT: Heisenberg（§3-1 
+role	Heisenberg	NEXT: Heisenberg（§4 の 
+role	Heisenberg	NEXT: Heisenberg（§4 の測
+role	Heisenberg	NEXT: Heisenberg（§5 の 
+role	Heisenberg	NEXT: Heisenberg（§7 の 
+role	Heisenberg	NEXT: Heisenberg（①ADDE
+role	Heisenberg	NEXT: Heisenberg（①MINO
+role	Heisenberg	NEXT: Heisenberg（①`git
+role	Heisenberg	NEXT: Heisenberg（この po
+role	Heisenberg	NEXT: Heisenberg（ただし発火
+role	Heisenberg	NEXT: Heisenberg（ただし私の
+role	Heisenberg	NEXT: Heisenberg（上記 1-
+role	Heisenberg	NEXT: Heisenberg（上記 Ge
+role	Heisenberg	NEXT: Heisenberg（上記 de
+role	Heisenberg	NEXT: Heisenberg（上記 mi
+role	Heisenberg	NEXT: Heisenberg（作業スレ 
+role	Heisenberg	NEXT: Heisenberg（実装, T
+role	Heisenberg	NEXT: Heisenberg（実装、fr
+role	Heisenberg	NEXT: Heisenberg（実装枠が空
+role	Heisenberg	NEXT: Heisenberg（実装）
+role	Heisenberg	NEXT: Heisenberg（指摘1 修
+role	Heisenberg	NEXT: Heisenberg（指摘を実コ
+role	Heisenberg	NEXT: Heisenberg（本ターン継
+role	Heisenberg	NEXT: Heisenberg（自分で続け
+role	Heisenberg	| **`**NEXT: Heisenberg** — ③
+role	Heisenberg	| `**NEXT: Heisenberg**.` |

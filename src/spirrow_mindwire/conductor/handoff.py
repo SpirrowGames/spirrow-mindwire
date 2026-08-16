@@ -17,27 +17,33 @@ The NEXT vocabulary is the chatroom **identity / persona name** (e.g. ``Bohr`` /
 ``Einstein`` / ``human``), not the internal role string; the roster is the persona→role map supplied
 by config, and the conductor authors each reply under the persona name.
 
-Parsing is layered:
+Markdown tolerance is **additive, not subtractive** (msg-1129 §3). Two earlier rounds of this
+parser tried to *remove* the decoration an author had written — first at end-of-line, then at word
+edges — and both shipped green tests while the real failing shape stayed broken, because "the set
+of characters to strip" does not close: add ``**`` and ``**,`` arrives; add that and ``**。``
+arrives. So nothing is stripped. Instead each thing we are willing to dispatch is matched by a
+pattern that describes *it*:
 
-- **Layer 1** — the strict "line begins with optional whitespace + ``NEXT: <token>`` + end of
-  line" shape (no Markdown wrapping around it). A well-behaved reply that ends with a bare
-  handoff line hits this and always has.
-- **Layer 2** — Markdown-noise tolerance around the same line: blockquote (``>``), ATX heading
-  (``#``), list bullet (``-``/``*``/``+``/``1.``), and inline emphasis wrappers (``**...**``,
-  ``*...*``, ``_..._``, ``` `...` ```). This is a **transitional bridge**, not a permanent
-  legacy fallback: Layer 3 will add a structured ``next_participant`` field on the message
-  itself, and when that lands the whole regex scaffold (including this tolerance) becomes the
-  compatibility path scheduled for removal, not a coequal parser kept forever.
+- **the line** — a handoff line is one where nothing but decoration precedes the ``NEXT:``
+  keyword. "Decoration" is defined negatively-but-closed: **no word characters** (an ordered-list
+  number is the one allowance). That covers ``>``, ``#``, ``-``/``*``/``+``, ``**``, ``_``,
+  ``` ` ```, ``|`` table pipes and the ``→`` a real handoff used (chatroom ``msg-494``) without
+  enumerating any of them, and it still refuses a line of prose that merely mentions ``NEXT:``.
+- **the token** — :data:`_PR_REVIEW_RE` / :data:`_PR_REF_RE` match a PR ref in exactly the shapes
+  :func:`~spirrow_mindwire.github.client.parse_pr_ref` accepts, and
+  :data:`_PARTICIPANT_NAME_RE` matches the shape of a participant name. Whatever the author put
+  *after* the name — ``**``, ``,``, ``。``, ``— a gloss`` — is outside the match and therefore
+  falls away for free. This is also what protects the payload (Einstein's principle-3 objection):
+  ``#`` and ``_`` are matched as *part of the ref pattern*, so ``owner/my_repo#7`` survives whole
+  because it is the thing being matched, not because a strip was carefully aimed away from it.
 
-  The tolerance is deliberately narrow, and split so that each character has exactly one owner:
-  the *line* shell (``>`` / ``#`` / bullets / the opening emphasis) is absorbed by
-  ``_NEXT_LINE_RE``, because finding the line at all depends on it; the *token's* emphasis
-  (``*`` / ``_`` / ``` ` ```) is removed by :func:`_strip_md_emphasis`, at word edges only,
-  because a closing ``**`` is frequently followed by a gloss and so is not at end-of-line.
-  ``#`` is never in the second set, and an edge-anchored strip cannot reach inside a word, so a
-  ``pr-review owner/repo#7`` ref keeps both its ``#7`` and any ``_`` in an owner/repo name (see
-  ``TestPrReviewPayloadSurvivesMarkdownStripping`` and
-  ``TestNormalisationDoesNotEatPayloadCharacters``).
+This tolerance is a **transitional bridge**, not a permanent legacy fallback: Layer 3 will add a
+structured ``next_participant`` field on the message itself, and when that lands this whole regex
+scaffold becomes the compatibility path scheduled for removal, not a coequal parser kept forever.
+
+``tests/data/next_line_corpus.tsv`` pins this against **real** traffic: every distinct
+``NEXT:``-bearing line shape in the live ``spirrow-mindwire`` + ``spirrow-voxelworld`` chatrooms,
+with its expected resolution. Imagined shapes only close imagined holes (msg-1129 §4).
 """
 
 from __future__ import annotations
@@ -51,87 +57,44 @@ from ..value_objects import Role
 
 # A handoff line must stand on its own (``^...$`` with MULTILINE). We take the LAST one so a
 # ``NEXT:`` quoted earlier in the body cannot override the author's real, final handoff — the same
-# defence as the naysayer verdict parser.
+# defence as the naysayer verdict parser. That last-wins rule is also what makes the leading
+# tolerance below safe: a permissive line rule matches quoted examples more often, and the real
+# handoff is the one at the bottom.
 #
-# Layer 2 — Markdown-noise tolerance (transitional; see module docstring for the sunset plan).
-# An LLM sometimes wraps its final handoff line in a small set of Markdown shell characters:
-#   > NEXT: Bohr        (blockquote)
-#   # NEXT: Bohr        (ATX heading)
-#   - NEXT: Bohr        (list bullet — also `*` / `+`)
-#   **NEXT: Bohr**      (bold wrap — also `*`, `_`, `` ` ``)
-# The tolerance is intentionally narrow — a closed enumeration of Markdown shells that consume
-# characters BEFORE ``NEXT:``, plus the ATX heading close on the line tail. The token's own
-# emphasis close is NOT handled here (it is usually followed by a gloss, so it is not at ``$``);
-# that job belongs to ``_strip_md_emphasis`` below, and splitting it this way keeps each character
-# with exactly one owner.
-# Critically, ``#`` is only stripped as a leading heading marker (``# `` or ``## ``, whitespace
-# required) or as an optional ATX close on the outermost line-tail. It is NEVER stripped from
-# elsewhere on the line — a `pr-review owner/repo#7` ref must survive intact (Einstein's design
-# review, principle 3). The extraction is still a single ``findall`` pass (no RAW-vs-normalised
-# double loop) so "which line is the handoff" has one source of truth.
-_MD_LEADING_SHELL = (
-    r"(?:"
-    r"[>#]+\s+"  # blockquote `>` or ATX heading `#`/`##`/... (whitespace REQUIRED after)
-    r"|[-*+]\s+"  # list bullet (whitespace REQUIRED, so a bold `**...**` is not eaten char-by-char)
-    r"|\d+\.\s+"  # ordered list
-    r")*"
-)
-_MD_INLINE_OPEN = r"(?:\*\*|__|\*|_|`)?"
-# An ATX heading may end with a run of `#` chars separated from the content by whitespace
-# (``## Heading ##``). We tolerate that shape on the *outermost* tail only, and — because
-# whitespace is required — this never touches a `pr-review ...#7` ref (there is no space
-# between `owner/repo` and `#7`).
-_MD_TRAILING_SHELL = r"(?:\s+#+)?\s*"
+# The leading rule is stated as a CLOSED property rather than a list of Markdown shells: on a
+# handoff line, everything before the ``NEXT:`` keyword is decoration, and decoration contains **no
+# word characters**. One allowance is carved out for an ordered-list number (``1.`` / ``2)``),
+# whose digits are word characters. That single rule already covers every shell msg-1076 enumerated
+#   > NEXT: Bohr    # NEXT: Bohr    - NEXT: Bohr    1. NEXT: Bohr    | NEXT: Bohr |
+#   **NEXT: Bohr**  _NEXT: Bohr_    `NEXT: Bohr`
+# plus ones nobody listed — the live chatroom's ``→ **NEXT: human**(…)`` (msg-494) is a real
+# handoff that no enumeration in this thread had reached. It still refuses a sentence that merely
+# mentions the keyword ("…if the human explicitly writes `NEXT: human`, then…"), because prose has
+# word characters in it; ~1,000 such lines in the corpus fixture hold that line.
+#
+# `\w` is Unicode-aware here, which is load-bearing: the CJK prose that surrounds most of these
+# handoffs counts as word characters, so a Japanese sentence mentioning the keyword is refused for
+# the same reason an English one is.
+_NEXT_KEYWORD = r"NEXT[ \t]*[:：]"  # noqa: RUF001 (the fullwidth colon is intentional, msg-1078)
 _NEXT_LINE_RE = re.compile(
-    r"^\s*"
-    + _MD_LEADING_SHELL
-    + _MD_INLINE_OPEN
-    + r"\s*NEXT:\s*(?P<token>\S.*?)\s*"
-    + _MD_TRAILING_SHELL
-    + r"$",
+    r"^[^\w\n]*(?:\d+[.)][^\w\n]*)?" + _NEXT_KEYWORD + r"\s*(?P<token>\S.*?)\s*$",
     re.MULTILINE,
 )
 
-# ★ The emphasis CLOSE cannot live in the line regex, because it is not always at the end of the
-# line. msg-1074 §2 is explicit that this bug fails at BOTH ends and that fixing one leaves it
-# broken ("前を直しても後ろで落ちる。片方だけの修正は無効"), and the line that actually stopped the
-# loop carries a gloss AFTER the closing ``**``:
-#
-#     **NEXT: Heisenberg** — ③ fixture field-fidelity audit（…）に着手する。  # noqa: RUF003
-#
-# Anchoring the close to ``$`` handles ``**NEXT: X**`` but not that shape: the token comes out as
-# ``Heisenberg** — …``, ``_NAME_SPLIT_RE`` cuts it at the space, and the roster is asked for
-# ``Heisenberg**``. So the closing side is owned by exactly ONE normalisation, applied once in
-# :func:`_last_next_raw` — before the ``pr-review`` raw read AND before the name-split, so both
-# resolution paths see the same cleaned text (msg-1074 §4-1: "正規化を 1 箇所に置く").
-#
-# The two owners do not overlap, which is what keeps this from becoming the very "2 箇所を別々に
-# 緩める" failure §4-1 warns about:
-#   - the regex owns the LINE shell    — `>` `#` bullets + the opening emphasis (it must, since
-#     locating the line at all depends on them);
-#   - this normalisation owns the TOKEN's emphasis — `*` `_` `` ` `` only, never `#`.
-#
-# It strips emphasis runs only at WORD EDGES (start/end of the token, or adjacent to whitespace).
-# That is what protects payload characters: `#` is never in the character class at all, so a
-# ``pr-review owner/repo#7`` ref keeps its PR number, and an `_` *inside* a word — ``acme/my_repo``,
-# or an underscored URL — is not at an edge and therefore survives (Einstein's principle-3
-# objection: normalisation must not damage the ref).
-_MD_EMPHASIS_EDGE_RE = re.compile(r"(?<![^\s])[*_`]+|[*_`]+(?![^\s])")
+# Emphasis the author may have put around the TARGET itself rather than around the whole line
+# (``NEXT: **Heisenberg** — go``). It is part of the pattern, not something removed beforehand:
+# there is no strip step in this module any more, and no second extraction pass — ``_NEXT_LINE_RE``
+# is still the single ``findall`` that decides which line is the handoff.
+_MD_EMPHASIS_OPEN = r"[*_`]*"
 
-
-def _strip_md_emphasis(text: str) -> str:
-    """Remove Markdown emphasis runs at word edges, leaving payload characters intact."""
-    return _MD_EMPHASIS_EDGE_RE.sub("", text).strip()
-
-
-# The participant name is the leading run before any whitespace or an opening paren (ASCII or
-# fullwidth CJK): real handoffs carry a trailing gloss after the name, and only the name selects the
-# participant. The fullwidth left paren U+FF08 is matched too so a CJK gloss is split off.
-_NAME_SPLIT_RE = re.compile(r"[\s(（]")  # noqa: RUF001 (the fullwidth paren is intentional)
-
-# Trailing punctuation stripped from the parsed name (a stray comma / period after the persona name
-# should not defeat the roster lookup).
-_TRAILING_PUNCT = " \t.,;:!?、。）)"  # noqa: RUF001 (fullwidth/CJK punctuation is intentional)
+# The participant name: one identifier-shaped word, matched at the head of the token. Separators
+# are allowed only BETWEEN alphanumerics, never at the end — which is why a trailing ``_`` from
+# ``_NEXT: human_`` is outside the match while ``some_bot`` keeps its underscore. Everything after
+# the name (``**``, ``,``, ``。``, ``— a gloss``, a fullwidth parenthetical) is not part of the
+# pattern, so no list of trailing characters has to be maintained.
+_PARTICIPANT_NAME_RE = re.compile(
+    _MD_EMPHASIS_OPEN + r"(?P<name>[A-Za-z0-9]+(?:[_-]+[A-Za-z0-9]+)*)"
+)
 
 # Reserved sentinels (case-insensitive). Not roster participants. Public because they are the
 # single source of truth for the NEXT vocabulary shared by the *parser* (below) and the *emission*
@@ -148,14 +111,23 @@ NONE_TOKEN = "none"
 
 
 # The PR-gate sentinel: ``NEXT: pr-review <owner/repo#n>`` fires the Tier B independent naysayer
-# review on the named PR (PR-2b-2). Unlike a persona handoff, the whole rest of the line is the PR
-# ref (it carries ``/`` and ``#``), so it is parsed off the RAW NEXT line before the name-split.
+# review on the named PR (PR-2b-2). Unlike a persona handoff the target is a PR ref, so it is
+# resolved before the participant-name match.
 PR_REVIEW_TOKEN = "pr-review"
-# The ref is the single non-whitespace token after ``pr-review`` (an ``owner/repo#n`` or a URL —
-# neither contains a space). ``\S+`` (not ``.*?$``) so a trailing gloss an LLM appends, e.g.
-# ``pr-review acme/repo#7 (please review)``, is ignored rather than swallowed into the ref and
-# handed to GitHub as an invalid ref (Tier B PR #103 round 2).
-_PR_REVIEW_RE = re.compile(rf"^{PR_REVIEW_TOKEN}\s+(?P<ref>\S+)", re.IGNORECASE)
+# The sentinel is the word plus an operand: a bare ``NEXT: pr-review`` with nothing after it is not
+# a PR-gate directive at all (it falls through to the participant path and out as ABSENT → human).
+_PR_REVIEW_RE = re.compile(rf"{_MD_EMPHASIS_OPEN}{PR_REVIEW_TOKEN}\b(?P<rest>.*)", re.IGNORECASE)
+# The ref, matched by its own shape rather than as "the next non-whitespace run". These are exactly
+# the two forms :func:`~spirrow_mindwire.github.client.parse_pr_ref` accepts, so the sentinel and
+# the validator agree by construction. Because the pattern says what a ref *is*, anything an author
+# appends to it is outside the match: ``acme/widgets#7**, please gate`` yields ``acme/widgets#7``
+# without a rule about ``*`` or ``,`` existing anywhere in this module. It is also what keeps the
+# payload intact — ``#`` and ``_`` are matched *as part of the ref*, so ``acme/my_repo#7`` and an
+# underscored PR URL survive whole (Einstein's principle-3 objection, msg-1107).
+_PR_REF_RE = re.compile(
+    r"(?:https?://)?(?:[A-Za-z0-9-]+\.)*github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/\d+"
+    r"|[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#\d+"
+)
 
 
 class HandoffKind(StrEnum):
@@ -184,32 +156,32 @@ class Handoff:
 
 
 def _last_next_raw(body: str) -> str | None:
-    """The raw text of the **last** ``NEXT:`` line (last wins; see module docstring), or ``None``.
+    """The raw text after the keyword on the **last** ``NEXT:`` line, or ``None`` if there is none.
 
-    The ``pr-review <ref>`` PR-gate sentinel needs the whole line (the ref carries ``/`` and ``#``),
-    so resolution works off this text and only name-splits for a persona handoff. "Raw" here means
-    *before the name-split*, not *un-normalised*: the Markdown emphasis strip is applied here, once,
-    so the ``pr-review`` path and the persona path cannot disagree about the token (msg-1074 §4-1
-    requires the normalisation to reach the ``pr-review`` route too — otherwise a wrapped ref is
-    handed to GitHub as ``owner/repo#7**``).
+    Raw really is raw: nothing is removed here. The ``pr-review`` route and the persona route both
+    read this same text and each matches its own target out of it, so the two cannot disagree about
+    what the author wrote (msg-1074 §4-1 wanted one owner for the token; making both routes read an
+    unmodified string is a stronger form of that than making both read the same *edited* string).
     """
     matches = _NEXT_LINE_RE.findall(body)
     if not matches:
         return None
-    return _strip_md_emphasis(str(matches[-1])) or None
+    return str(matches[-1]).strip() or None
 
 
 def _name_from_raw(raw: str) -> str | None:
-    """The persona name from a raw NEXT token (gloss + trailing punctuation stripped)."""
-    name = _NAME_SPLIT_RE.split(raw, maxsplit=1)[0].strip(_TRAILING_PUNCT)
-    return name or None
+    """The participant name at the head of a raw NEXT token, or ``None`` if there is not one."""
+    match = _PARTICIPANT_NAME_RE.match(raw)
+    return match.group("name") if match is not None else None
 
 
 def parse_next_token(body: str) -> str | None:
     """Return the participant name from the **last** ``NEXT:`` line, or ``None`` if there is none.
 
-    The trailing parenthetical gloss many handoffs carry is stripped — only the leading name is
-    returned (e.g. a name followed by a CJK or ASCII parenthetical gloss yields just the name).
+    Only the name is returned. The gloss most real handoffs carry after it — a parenthetical
+    (ASCII or CJK), an em-dash sentence, a closing ``**`` — is not part of the name pattern and so
+    never reaches the caller. This function deliberately takes no roster: ``head_skip`` depends on
+    being able to read a token for a persona it has never heard of (fail-open on unknown persona).
     """
     raw = _last_next_raw(body)
     return _name_from_raw(raw) if raw is not None else None
@@ -227,13 +199,16 @@ def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
     raw = _last_next_raw(body)
     if raw is None:
         return Handoff(HandoffKind.ABSENT)
-    pr_review = _PR_REVIEW_RE.match(raw)
-    if pr_review is not None:
-        # NEXT: pr-review <owner/repo#n> — the ref is the first non-whitespace token, with trailing
-        # punctuation stripped (as persona names are) so a natural ``...#7.`` / ``...#7,`` does not
-        # reach GitHub as an invalid ref (Tier B PR #103 round 3). The conductor validates it via
-        # parse_pr_ref and fires the synchronous Tier B review (PR-2b-2).
-        return Handoff(HandoffKind.PR_REVIEW, token=pr_review.group("ref").strip(_TRAILING_PUNCT))
+    sentinel = _PR_REVIEW_RE.match(raw)
+    if sentinel is not None and (operand := sentinel.group("rest").strip()):
+        # NEXT: pr-review <owner/repo#n> — take the ref by its own shape, so whatever the author
+        # wrapped or appended it with is outside the match: ``acme/widgets#7**, please gate``
+        # resolves to ``acme/widgets#7`` with no rule about ``*`` or ``,`` anywhere in this module.
+        # An operand with no ref shape in it is still the sentinel (the author asked for a gate);
+        # the conductor re-validates with parse_pr_ref and fails safe to the human rather than
+        # firing (Tier B PR #103 round 4).
+        ref = _PR_REF_RE.search(operand)
+        return Handoff(HandoffKind.PR_REVIEW, token=ref.group(0) if ref else operand)
     token = _name_from_raw(raw)
     if token is None:
         return Handoff(HandoffKind.ABSENT, token=raw)

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from pathlib import Path
+
 from spirrow_mindwire.conductor.handoff import (
     HUMAN_TOKEN,
     NONE_TOKEN,
@@ -83,23 +86,24 @@ def test_resolve_pr_review_accepts_a_url_ref() -> None:
 
 
 def test_resolve_bare_pr_review_without_ref_falls_through_to_absent() -> None:
-    # "pr-review" with no ref is not the PR-gate sentinel (the regex needs a ref); it falls through
-    # to a roster lookup, which fails → ABSENT (route to human), not a half-formed gate fire.
+    # "pr-review" alone is not the PR-gate sentinel (the sentinel is the word plus an operand); it
+    # falls through to a roster lookup, which fails → ABSENT (route to human), not a half-formed
+    # gate fire.
     h = resolve_handoff("oops\n\nNEXT: pr-review", _ROSTER)
     assert h.kind is HandoffKind.ABSENT
 
 
-def test_resolve_pr_review_strips_trailing_gloss() -> None:
-    # LLMs often append a parenthetical gloss; the ref is the single non-whitespace token, not the
-    # whole remainder of the line — else an invalid ref reaches GitHub (Tier B PR #103 round 2).
+def test_resolve_pr_review_ignores_a_trailing_gloss() -> None:
+    # LLMs often append a parenthetical gloss. The ref pattern matches a ref; the gloss is simply
+    # not one, so it is outside the match (Tier B PR #103 round 2).
     h = resolve_handoff("done\n\nNEXT: pr-review acme/widgets#7 (please review)", _ROSTER)
     assert h.kind is HandoffKind.PR_REVIEW
     assert h.token == "acme/widgets#7"
 
 
-def test_resolve_pr_review_strips_trailing_punctuation() -> None:
-    # A ref directly followed by sentence punctuation (no space) must still resolve cleanly, else an
-    # invalid ``...#7.`` / ``...#7,`` reaches GitHub (Tier B PR #103 round 3).
+def test_resolve_pr_review_ignores_punctuation_against_the_ref() -> None:
+    # A ref directly followed by sentence punctuation (no space) still resolves cleanly: `.` and `,`
+    # are not ref characters, so the match ends at the PR number (Tier B PR #103 round 3).
     dot = resolve_handoff("a\n\nNEXT: pr-review acme/widgets#7.", _ROSTER)
     assert dot.kind is HandoffKind.PR_REVIEW
     assert dot.token == "acme/widgets#7"
@@ -180,45 +184,44 @@ def test_naysayer_block_is_advisory() -> None:
 # Layer-2 Markdown tolerance — the *safety* tests come first.
 #
 # Layer 2 is a transitional bridge: an LLM sometimes wraps its final `NEXT:` line in
-# common Markdown noise (blockquote / heading / list bullet / bold), and the parser
-# tolerates a small, closed set of that noise so a well-formed handoff is not lost.
-# It is explicitly a temporary layer — Layer 3 (a structured `next_participant`
-# field on the message) will supersede it and this scaffolding is to be removed
-# then, NOT kept as a permanent legacy fallback. See the Einstein review that
-# authorised this branch (msg on 2026-08-16; the source design message is not
-# reachable from this repo — see the read-back note in the PR body).
+# Markdown noise, and the parser must still find the handoff. It is explicitly a
+# temporary layer — Layer 3 (a structured `next_participant` field on the message)
+# will supersede it and this scaffolding is to be removed then, NOT kept as a
+# permanent legacy fallback.
 #
-# The order is deliberate: the FIRST tests below pin the invariant that stripping
-# Markdown shell characters (`>` / `#` / `-` / `*` / `+` and the surrounding
-# `**` / `*` / `` ` ``) NEVER damages the payload — most importantly the `#`
-# inside a `pr-review owner/repo#n` ref. This is the concrete bug Einstein
-# flagged in the design review; it is regression-fenced BEFORE any tolerance
-# extension lands, so the tolerance code cannot be written in a way that
-# violates it.
+# The tolerance is ADDITIVE (msg-1129 §3). Two earlier rounds tried to *remove* the
+# decoration and both shipped green while the real shape stayed broken, because the
+# set of characters to remove does not close. Nothing is removed now: each target is
+# matched by a pattern describing that target, so whatever surrounds it is simply
+# outside the match.
+#
+# The order is deliberate: the FIRST tests below pin that the payload survives —
+# most importantly the `#` inside a `pr-review owner/repo#n` ref. Under the additive
+# design that holds for a structural reason, and the tests say which: the `#` and the
+# `_` are matched AS PART OF the ref pattern. They are not spared by a strip that was
+# carefully aimed elsewhere; there is no strip.
 # --------------------------------------------------------------------------- #
 
 
-class TestPrReviewPayloadSurvivesMarkdownStripping:
-    """`#` in `pr-review owner/repo#n` is payload, not Markdown — never strip it."""
+class TestPrReviewPayloadIsMatchedNotSalvaged:
+    """`#` in `pr-review owner/repo#n` is payload — it is part of the ref pattern."""
 
     def test_blockquote_prefixed_pr_review_keeps_the_hash_ref(self) -> None:
-        # `> NEXT: pr-review owner/repo#7` — the blockquote `>` is Markdown shell,
-        # but the `#7` inside the ref is the PR number and must survive intact.
+        # `> NEXT: pr-review owner/repo#7` — the blockquote `>` is outside the ref
+        # pattern, the `#7` is inside it.
         h = resolve_handoff("done\n\n> NEXT: pr-review acme/widgets#7", _ROSTER)
         assert h.kind is HandoffKind.PR_REVIEW
         assert h.token == "acme/widgets#7"
 
     def test_heading_prefixed_pr_review_keeps_the_hash_ref(self) -> None:
-        # `# NEXT: pr-review owner/repo#7` — the leading `#` is an ATX heading marker,
-        # but the `#7` INSIDE the ref must not be stripped along with it. The bug
-        # Einstein flagged is a naive `.strip('#')` on the whole line eating both.
+        # `# NEXT: pr-review owner/repo#7`. The leading `#` and the `#` in the ref are
+        # the same character in two roles; the bug Einstein flagged is a rule about the
+        # character (`.strip('#')`) rather than about the two things it appears in.
         h = resolve_handoff("done\n\n# NEXT: pr-review acme/widgets#7", _ROSTER)
         assert h.kind is HandoffKind.PR_REVIEW
         assert h.token == "acme/widgets#7"
 
     def test_bold_wrapped_pr_review_keeps_the_hash_ref(self) -> None:
-        # `**NEXT: pr-review owner/repo#7**` — bold wrappers on the shell must not
-        # bleed into the ref.
         h = resolve_handoff("done\n\n**NEXT: pr-review acme/widgets#7**", _ROSTER)
         assert h.kind is HandoffKind.PR_REVIEW
         assert h.token == "acme/widgets#7"
@@ -234,11 +237,10 @@ class TestPrReviewPayloadSurvivesMarkdownStripping:
         assert h.kind is HandoffKind.PR_REVIEW
         assert h.token == "acme/widgets#7"
 
-    def test_atx_heading_close_after_ref_is_not_stripped_into_the_ref(self) -> None:
-        # An ATX heading may end with a run of `#` (e.g. `## Heading ##`). The tolerance
-        # layer accepts this as *shell*, but on a `pr-review` line the tail `#` is inside
-        # the ref (the `#7`), and there is no separate closing marker — so the parser
-        # must not synthesise one by eating the trailing `#N` of the ref.
+    def test_atx_heading_close_after_ref_does_not_extend_the_ref(self) -> None:
+        # An ATX heading may end with a run of `#` (`## Heading ##`). A trailing ` #`
+        # is not part of a ref (a ref's `#` is followed by digits and preceded by no
+        # space), so the ref pattern stops before it without a closing-marker rule.
         h = resolve_handoff("y\n\n# NEXT: pr-review acme/widgets#42 #", _ROSTER)
         assert h.kind is HandoffKind.PR_REVIEW
         assert h.token == "acme/widgets#42"
@@ -365,22 +367,28 @@ class TestEmphasisCloseFollowedByGloss:
         assert parse_next_token("NEXT: **Heisenberg** — go") == "Heisenberg"
 
     def test_pr_review_ref_does_not_absorb_the_closing_wrapper(self) -> None:
-        # ★ The Tier-B gate breaker. With the close tolerated only at end-of-line,
-        # a gloss after `**` leaves the ref as `acme/widgets#7**`, which is handed
-        # to GitHub as an invalid ref. The `#7` payload must survive AND the `**`
-        # must not.
+        # A gloss after `**` used to leave the ref as `acme/widgets#7**`.
+        #
+        # CORRECTION to this test's earlier comment (and to msg-1128 §5-3 / msg-1129 §1,
+        # which both inherited the claim): that token is NOT "handed to GitHub as an
+        # invalid ref". `Conductor` re-parses it with `parse_pr_ref` before firing, and
+        # `parse_pr_ref("acme/widgets#7**")` returns the slug `acme/widgets#7` — measured,
+        # not reasoned. So the Tier-B gate was never actually broken by this; what the
+        # dirty token really costs is a `Handoff.token` that does not mean what its
+        # docstring says and a second component silently repairing the first. It is
+        # pinned clean here because the ref is *matched*, not salvaged downstream.
         h = resolve_handoff("**NEXT: pr-review acme/widgets#7** — please gate", _ROSTER)
         assert h.kind is HandoffKind.PR_REVIEW
         assert h.token == "acme/widgets#7"
 
 
-class TestNormalisationDoesNotEatPayloadCharacters:
-    """Emphasis characters are stripped only at word edges — never inside a token."""
+class TestPayloadCharactersAreInsideTheRefPattern:
+    """`_` and `#` are matched as part of the ref, so no rule has to spare them."""
 
     def test_underscore_inside_a_repo_name_survives(self) -> None:
-        # `_` is a Markdown emphasis marker AND a legal character in a repo name /
-        # URL. Stripping it wholesale would corrupt the ref, so the strip is
-        # anchored to word boundaries.
+        # `_` is a Markdown emphasis marker AND a legal character in a repo name / URL.
+        # Under a strip-based parser that collision needs a word-edge rule to arbitrate;
+        # under a match-based one the `_` is simply inside the ref pattern.
         h = resolve_handoff("**NEXT: pr-review acme/my_repo#7**", _ROSTER)
         assert h.kind is HandoffKind.PR_REVIEW
         assert h.token == "acme/my_repo#7"
@@ -399,3 +407,185 @@ class TestNormalisationDoesNotEatPayloadCharacters:
         assert parse_next_token("NEXT: Heisenberg — do the thing") == "Heisenberg"
         assert parse_next_token("NEXT: Heisenberg（実装を進める）") == "Heisenberg"  # noqa: RUF001
         assert resolve_handoff("NEXT: none", _ROSTER).kind is HandoffKind.NONE
+
+
+# --------------------------------------------------------------------------- #
+# Round 2's escape: punctuation attached to the closing wrapper.
+#
+# `c4c66c2` tolerated the emphasis close only where a whitespace followed it, so
+# every shape where an LLM writes ordinary punctuation against the `**` fell out
+# as ABSENT — and on the `pr-review` route it did not even fall out, it carried
+# `acme/widgets#7**` forward. Both were measured on that commit before this
+# rewrite (msg-1128 §5); the table below is that measurement, inverted.
+#
+# These are pinned individually rather than left to the corpus because they are
+# the specific escapes of the previous two rounds. The corpus is what protects
+# against the NEXT escape, which by definition is not in this list.
+# --------------------------------------------------------------------------- #
+
+
+class TestPunctuationAttachedToTheClosingWrapper:
+    """msg-1128 §5: every shape that fell through when the close needed whitespace."""
+
+    def test_comma_against_the_close(self) -> None:
+        assert parse_next_token("**NEXT: Bohr**, because...") == "Bohr"
+
+    def test_full_stop_against_the_close(self) -> None:
+        assert parse_next_token("**NEXT: Heisenberg**.") == "Heisenberg"
+
+    def test_colon_against_the_close(self) -> None:
+        assert parse_next_token("**NEXT: Einstein**: wait") == "Einstein"
+
+    def test_fullwidth_stop_against_the_close(self) -> None:
+        h = resolve_handoff("**NEXT: human**。", _ROSTER)
+        assert h.kind is HandoffKind.HUMAN
+
+    def test_unspaced_emdash_against_the_close(self) -> None:
+        # The naysayer's own example of what the spaced `** — ` gloss test masked.
+        assert parse_next_token("**NEXT: Bohr**— next step") == "Bohr"
+
+    def test_fullwidth_paren_against_the_close(self) -> None:
+        h = resolve_handoff("**NEXT: Bohr**）", _ROSTER)  # noqa: RUF001
+        assert h.kind is HandoffKind.ROLE
+        assert h.identity == "Bohr"
+
+    def test_pr_review_ref_with_punctuation_against_the_close(self) -> None:
+        # The route that did NOT fail loudly: it produced a PR_REVIEW whose token
+        # carried the wrapper. Three shapes, one expectation.
+        for body in (
+            "**NEXT: pr-review acme/widgets#7**, please gate",
+            "**NEXT: pr-review acme/widgets#7**.",
+            "**NEXT: pr-review acme/widgets#7**（gate してほしい）",  # noqa: RUF001
+        ):
+            h = resolve_handoff(body, _ROSTER)
+            assert h.kind is HandoffKind.PR_REVIEW, body
+            assert h.token == "acme/widgets#7", body
+
+
+class TestDecorationBeyondAnyEnumeratedSet:
+    """The leading rule is a property, not a list — shapes nobody enumerated work."""
+
+    def test_arrow_prefix_from_real_traffic(self) -> None:
+        # `spirrow-mindwire` msg-494, a real handoff by the proposer. No round of this
+        # thread listed `→` among the shells to tolerate, and an enumeration never
+        # would have: the point is that it does not need to be listed.
+        h = resolve_handoff(
+            "→ **NEXT: human**(Takahito: ① 256K で override-merge / ② 別値、を判断)。",
+            _ROSTER,
+        )
+        assert h.kind is HandoffKind.HUMAN
+
+    def test_table_row(self) -> None:
+        # msg-1076 listed `| NEXT: X |` as a shape the enumeration did not cover.
+        assert parse_next_token("body\n\n| NEXT: Bohr |") == "Bohr"
+
+    def test_ordered_list_item(self) -> None:
+        # The one word-character allowance in the leading rule.
+        assert parse_next_token("body\n\n1. NEXT: Einstein") == "Einstein"
+        assert parse_next_token("body\n\n2) NEXT: Einstein") == "Einstein"
+
+    def test_fullwidth_colon_and_spaced_colon(self) -> None:
+        # Required by the revised DoD (msg-1078). Recorded honestly: unlike every other
+        # shape here, neither appears even once in the real-traffic corpus — this pair
+        # is carried on the DoD's authority, not on evidence.
+        assert parse_next_token("NEXT： Bohr") == "Bohr"  # noqa: RUF001
+        assert parse_next_token("NEXT : Bohr") == "Bohr"
+
+    def test_a_sentence_that_merely_mentions_the_keyword_is_not_a_handoff(self) -> None:
+        # The other side of the same rule, and the reason it is stated as "no word
+        # characters before the keyword" rather than "anything before the keyword".
+        # Both are real critique lines from the corpus.
+        assert parse_next_token("if the human explicitly writes `NEXT: human`, then") is None
+        assert parse_next_token("スレは引き続き Bohr の番。`NEXT: Bohr` と書けばよい") is None
+
+    def test_capitalised_next_heading_is_not_a_handoff(self) -> None:
+        # `**Next:** PIE A/B (...)` is a real line — a section heading meaning "next
+        # steps", not a handoff. Matching the keyword case-insensitively would take it.
+        assert parse_next_token("**Next:** PIE A/B (launch with the flag)") is None
+
+
+class TestKnownResidualMidLineHandoffs:
+    """Characterisation, NOT an endorsement: a handoff written mid-sentence is lost.
+
+    Ten real handoffs in the corpus end a prose line with the directive
+    (``…私の実装側タスクは完了。NEXT: Bohr``). They resolve to ABSENT — the leading rule
+    requires that nothing but decoration precede the keyword, and a sentence is not
+    decoration. Widening it is NOT in this PR's scope and is not obviously right: the
+    same corpus holds ~1,000 critique lines that quote the directive mid-sentence, and
+    several of those are the LAST such line in their message, so a mid-line rule would
+    dispatch on quoted text. Reported to the proposer with the ten lines rather than
+    decided here. These assertions exist so the residual is visible in the suite
+    instead of being discovered a third time.
+    """
+
+    def test_mid_line_handoff_is_absent(self) -> None:
+        for body in (
+            "スレは引き続き Bohr の番（awaiting_reply）。NEXT: Bohr",  # noqa: RUF001
+            "c2 default-flip cycle is COMPLETE and SHIPPED. NEXT: none (thread settled).",
+            "capability テストが誤前提 revert を防いだ ＝ 判断が正しかった。NEXT: human",  # noqa: RUF001
+        ):
+            assert resolve_handoff(body, _ROSTER).kind is HandoffKind.ABSENT, body
+
+
+# --------------------------------------------------------------------------- #
+# The real-traffic corpus (msg-1129 §4).
+#
+# Rounds 1 and 2 both chose their test shapes by imagining them, and both times the
+# shape that actually broke was the neighbour of the one pinned. So the shapes here
+# are not chosen at all: `tests/data/next_line_corpus.tsv` is every `NEXT:`-bearing
+# line of every message in the live `spirrow-mindwire` + `spirrow-voxelworld`
+# chatrooms (~3.5k lines), cut to its decision head and de-duplicated by
+# `scripts/gen_next_line_corpus.py`. Both the cut and the de-duplication are
+# mechanical, and the generator verifies the cut cannot change an answer.
+#
+# It is a characterisation corpus: prose lines are recorded as ABSENT on purpose.
+# Asserting only that handoffs resolve would have missed the false positive this
+# corpus actually caught — a quoted code comment, `# NEXT: pr-review <owner/repo#n>`,
+# which the previous parser reported as a PR-gate directive.
+# --------------------------------------------------------------------------- #
+
+
+class TestRealTrafficCorpus:
+    """Every distinct NEXT-line shape the two live chatrooms have ever produced."""
+
+    @staticmethod
+    def _records() -> list[tuple[str, str, str]]:
+        path = Path(__file__).parent / "data" / "next_line_corpus.tsv"
+        records = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            kind, token, text = line.split("\t", 2)
+            records.append((kind, token, text))
+        return records
+
+    def test_every_real_line_resolves_as_recorded(self) -> None:
+        mismatches = []
+        for kind, token, text in self._records():
+            handoff = resolve_handoff(text, _ROSTER)
+            actual_token = handoff.token if handoff.kind is not HandoffKind.ABSENT else None
+            if (handoff.kind.value, actual_token or "") != (kind, token):
+                mismatches.append((text, (kind, token), (handoff.kind.value, actual_token)))
+        assert not mismatches, mismatches[:10]
+
+    def test_the_corpus_is_actually_populated(self) -> None:
+        # Guards the assertion above against quietly becoming vacuous — an empty or
+        # truncated fixture would make it pass. The counts are floors, not equalities,
+        # so regenerating against a busier chatroom does not fail the suite.
+        records = self._records()
+        kinds = Counter(kind for kind, _, _ in records)
+        assert len(records) > 500, len(records)
+        assert kinds["role"] > 100, kinds
+        assert kinds["human"] > 20, kinds
+        assert kinds["none"] > 10, kinds
+        assert kinds["pr_review"] > 5, kinds
+        assert kinds["absent"] > 100, kinds  # the prose side, which must NOT resolve
+
+    def test_the_corpus_contains_the_shape_that_stopped_the_loop(self) -> None:
+        # msg-1074 §6-2 wants the real incident string pinned, and it is (verbatim, in
+        # TestEmphasisCloseFollowedByGloss). This checks the corpus independently
+        # carries that shape, i.e. that the harvest really reached the traffic rather
+        # than silently collecting an empty or unrelated slice.
+        texts = [text for _, _, text in self._records()]
+        assert any(t.startswith("**NEXT: Heisenberg**") for t in texts)
+        assert any(t.startswith("→ **NEXT: human**") for t in texts)
