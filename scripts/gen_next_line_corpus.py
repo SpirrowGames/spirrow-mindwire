@@ -21,12 +21,20 @@ shapes matter:
    disagree is kept whole (and reported, because such a line would be evidence against the design).
 2. Lines are de-duplicated. Handoff-shaped lines — the ones the parser must get RIGHT — are kept
    per distinct decision head, i.e. exhaustively over the shapes the chatrooms have produced.
-   Prose lines are all rejected for one reason (a word character precedes the keyword), so they
-   are kept per distinct *short* token head: enough witnesses that the rule cannot be relaxed
-   unnoticed, without spending a reviewer's budget on a thousand restatements of one fact.
+   Prose lines are all rejected for one reason (the parser's line rule refuses them), so they are
+   kept per distinct *short* token head: enough witnesses that the rule cannot be relaxed
+   unnoticed, without spending a reviewer's budget on a thousand restatements of one fact. Which
+   bucket a line lands in is decided by asking the parser (:func:`is_prose`), not by a second
+   spelling of its rule — a second spelling is how a real handoff could be filed as prose and
+   deduplicated away, i.e. how this harvester could bury the evidence it exists to produce.
 
 The counts of what each surviving record stands for are written into the file header, so a reader
 can see the corpus is a projection of ~3.5k real lines rather than a hand-picked list.
+
+What this harvest structurally CANNOT see: a shape the parser used to handle and no longer does.
+Real traffic records what people wrote, never what the code could do, so a capability removed by a
+rewrite leaves no trace here — which is exactly how seven shapes were lost under a green corpus
+(msg-1150 §2). ``tests/test_conductor_handoff_migration.py`` is the mechanism for that half.
 """
 
 from __future__ import annotations
@@ -41,6 +49,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from spirrow_mindwire.conductor.handoff import (  # noqa: E402
+    _NEXT_LINE_RE,
     PR_REVIEW_TOKEN,
     HandoffKind,
     resolve_handoff,
@@ -88,9 +97,17 @@ def expectation(line: str) -> tuple[str, str]:
 
 
 def is_prose(line: str) -> bool:
-    """True when a word character precedes the keyword — a sentence mentioning it, not a handoff."""
-    keyword = _KEYWORD_RE.search(line)
-    return keyword is not None and bool(re.search(r"\w", line[: keyword.start()]))
+    """True when the parser refuses the line outright — a sentence mentioning the keyword.
+
+    This asks the parser's own line rule instead of restating it. The restatement it replaces
+    (``re.search(r"\\w", before_the_keyword)``) had drifted from the rule in the same place the
+    rule itself was wrong: Python's ``\\w`` matches ``_``, so a real ``_NEXT: human_`` handoff
+    would have been read as prose, keyed as one of a thousand interchangeable rejections, and
+    dropped in favour of a shorter sibling — the harvester burying the very evidence it exists to
+    surface (msg-1148 §5-3). A second spelling of a rule is a second place for it to be wrong, so
+    there is now only one.
+    """
+    return _KEYWORD_RE.search(line) is not None and _NEXT_LINE_RE.search(line) is None
 
 
 async def harvest() -> tuple[list[str], Counter[str]]:

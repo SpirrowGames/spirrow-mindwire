@@ -24,11 +24,14 @@ of characters to strip" does not close: add ``**`` and ``**,`` arrives; add that
 arrives. So nothing is stripped. Instead each thing we are willing to dispatch is matched by a
 pattern that describes *it*:
 
-- **the line** — a handoff line is one where nothing but decoration precedes the ``NEXT:``
-  keyword. "Decoration" is defined negatively-but-closed: **no word characters** (an ordered-list
-  number is the one allowance). That covers ``>``, ``#``, ``-``/``*``/``+``, ``**``, ``_``,
-  ``` ` ```, ``|`` table pipes and the ``→`` a real handoff used (chatroom ``msg-494``) without
-  enumerating any of them, and it still refuses a line of prose that merely mentions ``NEXT:``.
+- **the line** — a handoff line is one where nothing but decoration surrounds the ``NEXT:``
+  keyword. "Decoration" is defined negatively-but-closed: :data:`_DECORATION` = **no word
+  characters, plus the underscore** (an ordered-list number is the one allowance). That covers
+  ``>``, ``#``, ``-``/``*``/``+``, ``**``, ``_``, ``` ` ```, ``|`` table pipes and the ``→`` a real
+  handoff used (chatroom ``msg-494``) without enumerating any of them, and it still refuses a line
+  of prose that merely mentions ``NEXT:``. Decoration is admitted at all three positions a wrapper
+  can close in — ``**NEXT: X**``, ``**NEXT**: X`` and ``**NEXT:** X`` — because a rule that admits
+  only some of them is another enumeration wearing a closed rule's clothes.
 - **the token** — :data:`_PR_REVIEW_RE` / :data:`_PR_REF_RE` match a PR ref in exactly the shapes
   :func:`~spirrow_mindwire.github.client.parse_pr_ref` accepts, and
   :data:`_PARTICIPANT_NAME_RE` matches the shape of a participant name. Whatever the author put
@@ -61,40 +64,53 @@ from ..value_objects import Role
 # tolerance below safe: a permissive line rule matches quoted examples more often, and the real
 # handoff is the one at the bottom.
 #
-# The leading rule is stated as a CLOSED property rather than a list of Markdown shells: on a
-# handoff line, everything before the ``NEXT:`` keyword is decoration, and decoration contains **no
-# word characters**. One allowance is carved out for an ordered-list number (``1.`` / ``2)``),
-# whose digits are word characters. That single rule already covers every shell msg-1076 enumerated
-#   > NEXT: Bohr    # NEXT: Bohr    - NEXT: Bohr    1. NEXT: Bohr    | NEXT: Bohr |
-#   **NEXT: Bohr**  _NEXT: Bohr_    `NEXT: Bohr`
-# plus ones nobody listed — the live chatroom's ``→ **NEXT: human**(…)`` (msg-494) is a real
-# handoff that no enumeration in this thread had reached. It still refuses a sentence that merely
-# mentions the keyword ("…if the human explicitly writes `NEXT: human`, then…"), because prose has
-# word characters in it; ~1,000 such lines in the corpus fixture hold that line.
+# The tolerance rule is stated as a CLOSED property rather than a list of Markdown shells: on a
+# handoff line everything that is not the keyword, the colon or the token is DECORATION, and
+# decoration carries no word meaning. One allowance is carved out for an ordered-list number
+# (``1.`` / ``2)``), whose digits are word characters.
 #
-# `\w` is Unicode-aware here, which is load-bearing: the CJK prose that surrounds most of these
+# ``_DECORATION`` is that property, and it is ``\W`` **plus the underscore**. Python's ``\w``
+# counts ``_`` as a word character, so the plain ``[^\w\n]*`` this module shipped in `45b767d`
+# could not consume a single character of ``_NEXT: Bohr_`` and the whole match failed — a shape the
+# comment right below it advertised as supported, and one the revision before this rewrite had
+# actually handled (msg-1148 §5-4: a regression, not a shortfall).
+#
+# ``\w`` is Unicode-aware here, which is load-bearing: the CJK prose that surrounds most of these
 # handoffs counts as word characters, so a Japanese sentence mentioning the keyword is refused for
-# the same reason an English one is.
-_NEXT_KEYWORD = r"NEXT[ \t]*[:：]"  # noqa: RUF001 (the fullwidth colon is intentional, msg-1078)
+# the same reason an English one is. Carving out ``_`` does not weaken that — ``_`` is the only
+# character moved from "word" to "decoration", and no prose is made of underscores.
+_DECORATION = r"(?:[^\w\n]|_)*"
+
+# Decoration is admitted at every position where it can occur, because a wrapper's two halves do
+# not both land in the same place. There are three, and the previous revision handled only the
+# first:
+#   1. before the keyword          ``**NEXT: Bohr**``   ``> NEXT: Bohr``   ``→ **NEXT: human**(…)``
+#   2. inside the keyword's shell  ``**NEXT**: Bohr``   ``NEXT : Bohr``  (and the fullwidth colon)
+#   3. between the colon and token ``**NEXT:** Bohr``   ``` `NEXT:` Bohr ```   ``NEXT:** Bohr**``
+# Position 3 is the second axis of the `45b767d` regression and it is NOT the underscore bug: ``*``
+# is not a word character, so widening the character class alone leaves ``**NEXT:** Bohr``
+# unroutable (msg-1148 §5-5 / msg-1150 §1). Position 3 is owned by the TOKEN patterns below rather
+# than by this one, so ``_last_next_raw`` keeps handing both resolution routes the same raw text.
+_NEXT_KEYWORD = "NEXT" + _DECORATION + r"[:：]"  # noqa: RUF001 (fullwidth colon intentional)
 _NEXT_LINE_RE = re.compile(
-    r"^[^\w\n]*(?:\d+[.)][^\w\n]*)?" + _NEXT_KEYWORD + r"\s*(?P<token>\S.*?)\s*$",
+    r"^"
+    + _DECORATION
+    + r"(?:\d+[.)]"
+    + _DECORATION
+    + r")?"
+    + _NEXT_KEYWORD
+    + r"\s*(?P<token>\S.*?)\s*$",
     re.MULTILINE,
 )
 
-# Emphasis the author may have put around the TARGET itself rather than around the whole line
-# (``NEXT: **Heisenberg** — go``). It is part of the pattern, not something removed beforehand:
-# there is no strip step in this module any more, and no second extraction pass — ``_NEXT_LINE_RE``
-# is still the single ``findall`` that decides which line is the handoff.
-_MD_EMPHASIS_OPEN = r"[*_`]*"
-
-# The participant name: one identifier-shaped word, matched at the head of the token. Separators
-# are allowed only BETWEEN alphanumerics, never at the end — which is why a trailing ``_`` from
-# ``_NEXT: human_`` is outside the match while ``some_bot`` keeps its underscore. Everything after
-# the name (``**``, ``,``, ``。``, ``— a gloss``, a fullwidth parenthetical) is not part of the
-# pattern, so no list of trailing characters has to be maintained.
-_PARTICIPANT_NAME_RE = re.compile(
-    _MD_EMPHASIS_OPEN + r"(?P<name>[A-Za-z0-9]+(?:[_-]+[A-Za-z0-9]+)*)"
-)
+# The participant name: one identifier-shaped word, matched at the head of the token past any
+# decoration (position 3 above: the ``**`` of ``**NEXT:** Bohr``, the closing ``` ` ``` of
+# ``` `NEXT:` Bohr ```). Separators are allowed only BETWEEN alphanumerics, never at either end —
+# which is why the leading ``_`` of ``_NEXT:_ Bohr`` is decoration and the trailing ``_`` of
+# ``_NEXT: human_`` falls outside the match, while ``some_bot`` keeps its underscore. Everything
+# after the name (``**``, ``,``, ``。``, ``— a gloss``, a fullwidth parenthetical) is not part of
+# the pattern either, so no list of trailing characters has to be maintained.
+_PARTICIPANT_NAME_RE = re.compile(_DECORATION + r"(?P<name>[A-Za-z0-9]+(?:[_-]+[A-Za-z0-9]+)*)")
 
 # Reserved sentinels (case-insensitive). Not roster participants. Public because they are the
 # single source of truth for the NEXT vocabulary shared by the *parser* (below) and the *emission*
@@ -116,7 +132,7 @@ NONE_TOKEN = "none"
 PR_REVIEW_TOKEN = "pr-review"
 # The sentinel is the word plus an operand: a bare ``NEXT: pr-review`` with nothing after it is not
 # a PR-gate directive at all (it falls through to the participant path and out as ABSENT → human).
-_PR_REVIEW_RE = re.compile(rf"{_MD_EMPHASIS_OPEN}{PR_REVIEW_TOKEN}\b(?P<rest>.*)", re.IGNORECASE)
+_PR_REVIEW_RE = re.compile(rf"{_DECORATION}{PR_REVIEW_TOKEN}\b(?P<rest>.*)", re.IGNORECASE)
 # The ref, matched by its own shape rather than as "the next non-whitespace run". These are exactly
 # the two forms :func:`~spirrow_mindwire.github.client.parse_pr_ref` accepts, so the sentinel and
 # the validator agree by construction. Because the pattern says what a ref *is*, anything an author

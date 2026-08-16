@@ -285,6 +285,44 @@ class TestPersonaHandoffToleratesMarkdownNoise:
         assert h.kind is HandoffKind.ROLE
         assert h.identity == "Einstein"  # canonical spelling
 
+    def test_underscore_wrapper(self) -> None:
+        # `_` is a WORD character to Python's `re`, so a leading-decoration rule written as
+        # `[^\w\n]*` cannot consume it and the whole line stops matching. This test and the two
+        # below are the three shapes the additive rewrite dropped (msg-1148 §5-4); each is a
+        # documented wrapper that the parser had handled the round before.
+        assert parse_next_token("body\n\n_NEXT: Heisenberg_") == "Heisenberg"
+        assert parse_next_token("body\n\n__NEXT: Einstein__") == "Einstein"
+        assert resolve_handoff("body\n\n_NEXT: human_", _ROSTER).kind is HandoffKind.HUMAN
+
+    def test_wrapper_closed_between_the_keyword_and_the_target(self) -> None:
+        # `**NEXT:** X` — the close lands BETWEEN the colon and the name, so the token starts
+        # `** Heisenberg`. `*` is not a word character, which is why the underscore fix alone
+        # does not reach this one (msg-1148 §5-5: the second axis).
+        assert parse_next_token("body\n\n**NEXT:** Heisenberg") == "Heisenberg"
+        assert parse_next_token("body\n\n*NEXT:* Bohr") == "Bohr"
+        assert parse_next_token("body\n\n`NEXT:` Bohr") == "Bohr"
+        assert parse_next_token("body\n\nNEXT:** Bohr**") == "Bohr"
+
+    def test_wrapper_closed_before_the_colon(self) -> None:
+        # `**NEXT**: X` — bolding the keyword alone, the colon outside. Neither this parser's
+        # predecessors nor this one handled it before; admitting decoration at two of the three
+        # positions a wrapper can close in and not the third is an enumeration pretending to be a
+        # rule, so all three are admitted.
+        assert parse_next_token("body\n\n**NEXT**: Bohr") == "Bohr"
+        assert resolve_handoff("body\n\n_NEXT_: human", _ROSTER).kind is HandoffKind.HUMAN
+
+    def test_underscore_wrapped_pr_review_keeps_its_ref(self) -> None:
+        h = resolve_handoff("body\n\n_NEXT: pr-review acme/widgets#7_", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+
+    def test_prose_is_still_refused_after_the_underscore_carve_out(self) -> None:
+        # Moving `_` from "word character" to "decoration" must not let a sentence through: the
+        # rest of the prose is still word characters, in either script.
+        assert parse_next_token("…if the human writes NEXT: human, then the loop stops") is None
+        assert parse_next_token("snake_case NEXT: Bohr") is None
+        assert parse_next_token("その場合は NEXT: Bohr に渡す") is None
+
 
 class TestLayer2DoesNotDoubleTheExtractionLoop:
     """Structural: the extraction stays a single pass (Einstein review, principle 3).
@@ -323,9 +361,11 @@ class TestLayer2DoesNotDoubleTheExtractionLoop:
 # The emphasis CLOSE is not always the last thing on the line.
 #
 # msg-1074 §2 spelled out that this bug fails twice, and that fixing one end
-# leaves it broken: the line head `**` defeats `^\s*`, AND — even once the head
-# is tolerated — `_NAME_SPLIT_RE` cuts the token at whitespace so the name comes
-# out as `Heisenberg**`, which no roster lookup matches.
+# leaves it broken: the line head `**` defeated `^\s*`, AND — even once the head
+# was tolerated — the token was cut at whitespace so the name came out as
+# `Heisenberg**`, which no roster lookup matches. (Both mechanisms named there are
+# gone: there is no strip step and no name split in the module any more. The
+# shapes stay pinned; the explanation is history, not a description of the code.)
 #
 # Tolerating the close only when it sits at end-of-line fixes `**NEXT: X**` but
 # NOT the shape that actually stopped the loop, because a real handoff line
