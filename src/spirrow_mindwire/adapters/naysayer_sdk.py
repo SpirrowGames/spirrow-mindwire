@@ -58,6 +58,7 @@ from ..naysayer.principles import (
 )
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
+from ..thread_context import build_turn_prompt
 from ..ulid_util import new_ulid
 from ..value_objects import (
     AttestationRecord,
@@ -199,13 +200,7 @@ def build_naysayer_system_prompt(
 
 
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
-    payload = event.payload
-    return (
-        f"You are acting as the {own_role.value} role in thread "
-        f"{event.thread_ref.thread_id}.\n\n"
-        f"New message from {payload.author}:\n\n{payload.body}\n\n"
-        f"Reply to this message in your role."
-    )
+    return build_turn_prompt(event, own_role, "Reply to this message in your role.")
 
 
 # Session facts retained from the SDK ``ResultMessage`` (P-1c). Prefixed
@@ -456,20 +451,35 @@ class NaysayerSdkAdapter:
         return handle
 
     def attestation_record(self, handle: SessionHandle) -> AttestationRecord | None:
-        """Return the spawn-time attestation for ``handle``, or ``None`` if unknown.
+        """Return the attestation for ``handle``'s current turn, or ``None`` if unknown.
 
         The duck-typed seam P-1 opened in
         :meth:`spirrow_mindwire.dispatcher.core.Dispatcher._handle_reply`; this
         is the first adapter to define it, so the ``attest:`` line starts
         appearing on naysayer posts with this change.
 
-        **What the line says, exactly.** The observation was made once, at
-        spawn, by a non-streaming probe. Every post in the session carries that
-        same record — it is not re-taken per post, and it does not speak for the
-        streaming turn it is attached to (msg-953 §3 L1). ``at=`` is the
-        observation's timestamp precisely so a reader can see how old it is.
-        Closing the per-turn gap needs streaming request records on the gateway
-        side (P-5, different repo, not done).
+        **What the line says, exactly.** Since D-2
+        (``T-dispatched-turn-gets-one-message``) the observation is re-taken at the
+        top of every :meth:`deliver_event`, so the record read here — the dispatcher
+        reads it after ``on_reply``, which fires synchronously inside that same
+        ``deliver_event`` — is the one probed for **this** turn. Two consecutive
+        verdicts therefore carry two different ``probe`` values, and a reader who
+        finds the same probe on two posts is looking at a bug rather than at the
+        design.
+
+        It previously said the opposite, and the correction is the point of D-2: the
+        probe used to be taken once at spawn and re-stamped on every post of the
+        session (measured: 39 attested posts, 24 distinct probes, worst case one
+        probe across 5 posts spanning 8m59s), which meant a stamp could not
+        distinguish "each turn was independently attested" from "one turn was, and
+        the rest inherited its evidence".
+
+        **Still not** a claim about the streaming turn itself. The probe is a
+        separate non-streaming request made immediately before it, so it evidences
+        the route and the tier→backend resolution at that instant, not the tokens
+        that came back. ``at=`` is the observation's timestamp precisely so a reader
+        can check the distance. Closing that last gap needs streaming request records
+        on the gateway side (P-5, different repo, not done).
         """
         session = self._sessions.get(handle)
         return None if session is None else session.attestation
@@ -500,6 +510,41 @@ class NaysayerSdkAdapter:
             return
 
         session.state = SessionState.PROCESSING
+        # D-2 (T-dispatched-turn-gets-one-message). Re-attest for THIS turn before
+        # asking the model anything. Until now the probe was taken once, at spawn,
+        # and re-stamped on every post of that session — so the loop measured
+        # independence per *process*, not per verdict, and a stamp said nothing
+        # about the post it sat on beyond "some earlier request on this session
+        # resolved to gemini". Measured on the live corpus (2026-08-16): 39
+        # attested posts carried 24 distinct probes; one probe was stamped on 5
+        # posts spanning 8m59s, so 38% of attested verdicts were evidenced by an
+        # observation made for a different verdict.
+        #
+        # What this buys, exactly: the stamp now records an observation taken
+        # immediately before this turn's inference, on this session's own route.
+        # What it still does NOT buy: proof that the streaming turn itself resolved
+        # to that backend. The probe is a separate non-streaming request; closing
+        # that gap needs streaming request records on the gateway side (P-5,
+        # different repo, not done). "Different probe per post" is a real strengthening
+        # and is not the same claim as "this post's backend".
+        #
+        # Fail-closed, same as spawn: a failed re-attest raises out of deliver_event
+        # BEFORE ``on_reply``, so no unattested verdict is posted. The turn is lost
+        # loudly (conductor run fails → daemon non-zero → quarantine record +
+        # Discord), which is the behaviour spawn already had for the same fault.
+        try:
+            session.attestation = await self._run_preflight()
+        except Exception as exc:
+            session.state = SessionState.FAILED
+            session.error = ErrorInfo(
+                code="adapter.delivery_failed",
+                message=str(exc),
+                raised_at=datetime.now(UTC),
+            )
+            raise NaysayerSdkDeliveryError(
+                f"per-turn preflight attestation failed for session {handle.session_id}; "
+                f"refusing to post an unattested naysayer verdict: {exc}"
+            ) from exc
         try:
             await session.client.query(_build_prompt(event, session.own_role))
             body, result = await _drain_reply(session.client)

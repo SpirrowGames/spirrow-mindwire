@@ -183,11 +183,54 @@ member is a faithful reading of the ADR (which only specifies
 
 
 @dataclass(frozen=True)
+class ThreadContextMessage:
+    """One prior thread message, carried to a dispatched turn as ground truth."""
+
+    msg_id: str
+    author: str
+    body: str
+
+
+@dataclass(frozen=True)
+class ThreadContext:
+    """What the thread looked like when a turn was dispatched (T-dispatched-turn D-3).
+
+    A dispatched role used to receive the triggering message and nothing else, so
+    it could not see the design it was implementing or the decision it was
+    disputing. This carries a **bounded** view of the rest.
+
+    Bounded, not complete: threads reach 188 messages / 807k characters (measured
+    across both live projects, 2026-08-16), so the whole thread cannot travel. The
+    selection policy lives in :mod:`spirrow_mindwire.thread_context`; this type
+    only records what was selected — and, critically, :attr:`omitted_count`, so the
+    renderer can say out loud that the view is partial. A partial thread presented
+    as a complete one is worse than one message, because it reads as sufficient.
+
+    ``opener`` is the thread's ``propose`` message. It is kept unconditionally (it
+    defines the subject) and is exempt from the recent-window budget, so it is
+    ``None`` only when the thread has no message other than the trigger.
+    """
+
+    opener: ThreadContextMessage | None
+    recent: tuple[ThreadContextMessage, ...]
+    omitted_count: int
+    total_count: int
+
+
+@dataclass(frozen=True)
 class ChatroomEvent:
     """An event the dispatcher delivers to an adapter (ADR-06 §2.3).
 
     ``event_id`` is the ULID dedup key (I4); ``occurred_at`` is the ULID-
     derived monotonic timestamp ordering used for per-session FIFO (I9).
+
+    ``thread_context`` (T-dispatched-turn-gets-one-message D-3) is the bounded
+    view of the rest of the thread. It rides on the **event**, not on the spawn,
+    and that placement is load-bearing: the conductor spawns one session per
+    identity and reuses it for every round, while the thread grows each round, so
+    a spawn-time snapshot would be round one's thread forever. ``None`` means no
+    context was supplied (the watcher path) and the prompt renders exactly as it
+    did before this field existed.
     """
 
     event_id: str  # ULID, dedup key
@@ -195,6 +238,7 @@ class ChatroomEvent:
     thread_ref: ThreadRef
     occurred_at: datetime  # iso_z
     payload: EventPayload  # union by event_type
+    thread_context: ThreadContext | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -361,6 +405,8 @@ __all__ = [
     "Role",
     "SessionHandle",
     "SessionState",
+    "ThreadContext",
+    "ThreadContextMessage",
     "ThreadRef",
     "mint_instance_id",
 ]

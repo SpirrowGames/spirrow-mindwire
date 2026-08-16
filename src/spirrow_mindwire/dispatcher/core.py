@@ -222,6 +222,14 @@ class Dispatcher:
             body=body,
             reply_to_msg_id=draft.reply_to_msg_id,
             idempotency_key=idempotency_key,
+            # D-1 (T-dispatched-turn-gets-one-message). The dispatcher has always
+            # known the role — it is on the handle, set at spawn — and has never
+            # passed it, so every autonomous post recorded ``role: null`` and the
+            # I-6 invariant was unarmed for exactly the posts a human never wrote.
+            # Taking it from the handle rather than the draft is deliberate: the
+            # role is the dispatcher's own assignment, not something the adapter
+            # (and hence the model behind it) gets to state about itself.
+            role=handle.role,
         )
         await self._on_event_log(
             reply_sent_event(

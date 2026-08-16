@@ -163,6 +163,28 @@ async def test_fire_pr_review_thread_id_is_pr_derived() -> None:
 
 
 @pytest.mark.anyio
+async def test_fire_pr_review_critique_names_the_naysayer_role() -> None:
+    """D-1 (T-dispatched-turn-gets-one-message): the Tier B verdict must claim its role.
+
+    Measured on the live corpus 2026-08-16: 346/346 ``naysayer-pr-review`` posts
+    recorded ``role: null``. This is the gate's own verdict message -- the one post
+    whose authorship the loop's carve-outs are named after -- so it was the least
+    armed and the most load-bearing at the same time.
+
+    What this test can prove is that the harness *sends* the role. Whether conclair
+    RECORDS it depends on ``naysayer-pr-review`` being a registered identity with
+    ``naysayer`` in its allowed_roles; an unregistered author has the unverified role
+    dropped and the message posted anyway. That half is a magickit-side fact and is
+    verified by reading a posted message back, not here.
+    """
+    mcp = _FakeMcp()
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    post = mcp.args_for("chatroom_post_message")
+    assert post["role"] == Role.NAYSAYER.value
+
+
+@pytest.mark.anyio
 async def test_fire_pr_review_returns_driver_outcome() -> None:
     outcome = PrReviewOutcome(
         verdict=ReviewEvent.REQUEST_CHANGES,

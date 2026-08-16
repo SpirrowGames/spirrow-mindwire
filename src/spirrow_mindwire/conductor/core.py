@@ -81,6 +81,7 @@ from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
 from ..github.client import ReviewEvent, parse_pr_ref
 from ..magickit.client import McpToolCaller
 from ..source_marker import parse_attestation_marker
+from ..thread_context import build_thread_context
 from ..value_objects import (
     ChatroomEvent,
     EventType,
@@ -311,7 +312,7 @@ class Conductor:
                     sessions[self._implementer_identity] = handle
                 # Dispatch the implementer on the RELAY event (the verdict + critique), not its own
                 # pr-review trigger — else it wakes blind to what it must fix (Tier B msg-567 #1).
-                await self._dispatcher.dispatch(handle, self._to_event(relay_msg))
+                await self._dispatcher.dispatch(handle, self._to_event(relay_msg, messages))
                 # Track the relay: a silent implementer leaves the relay as the next latest, so the
                 # no-progress guard stops it (the relay's NEXT is never re-routed).
                 processed_msg_id = relay_msg_id
@@ -337,7 +338,7 @@ class Conductor:
                     self._thread_ref, target_role, target_identity
                 )
                 sessions[target_identity] = handle
-            await self._dispatcher.dispatch(handle, self._to_event(latest))
+            await self._dispatcher.dispatch(handle, self._to_event(latest, messages))
             processed_msg_id = latest_msg_id
         return self._stop(
             self._max_rounds, StopReason.ROUND_CAP, processed_msg_id, forced, forced_saveable
@@ -623,6 +624,14 @@ class Conductor:
                 "msg_type": "report",
                 "author": _PR_GATE_RELAY_AUTHOR,
                 "content": body,
+                # No ``role`` here, deliberately (D-1 sweep, T-dispatched-turn).
+                # The other two harness write paths now supply one; this relay does
+                # not, because it holds no role. It is the conductor restating a
+                # verdict the Tier B driver produced elsewhere, and the honest value
+                # for "which role authored this" is none. Claiming ``naysayer``
+                # because the content came from one would put a role stamp on a post
+                # no reviewer wrote — manufacturing exactly the evidence the I-6
+                # invariant exists to make meaningful.
             },
         )
         return {
@@ -631,7 +640,22 @@ class Conductor:
             "content": body,
         }
 
-    def _to_event(self, msg: dict[str, Any]) -> ChatroomEvent:
+    def _to_event(self, msg: dict[str, Any], messages: list[dict[str, Any]]) -> ChatroomEvent:
+        """Build the event for ``msg``, carrying the thread as ground truth (D-3).
+
+        ``messages`` is this round's freshly-fetched thread. The conductor has always
+        read it — to decide *who* is next — and has never handed it to the role it
+        woke, which is why a dispatched turn could re-ask a question its own thread
+        had already answered (msg-1167 §2).
+
+        The context rides on the **event**, deliberately, not on ``spawn_instance``:
+        :meth:`run` spawns one session per identity and reuses it for every
+        subsequent round, so a spawn-time snapshot would pin round one's thread for
+        the life of the run — the same staleness, one layer down. The event is
+        rebuilt every round, so it is the only carrier that stays current. It also
+        means no Port signature changes: ``thread_context`` is an optional field on a
+        value object every adapter already receives.
+        """
         msg_id = _msg_id(msg)
         return ChatroomEvent(
             # thread-namespaced stable id (mirrors ChatroomWatcher) for the dispatcher's I4 dedup.
@@ -645,6 +669,7 @@ class Conductor:
                 body=_content(msg),
                 parent_msg_id=msg.get("reply_to") or None,
             ),
+            thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
         )
 
     def _stop(

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..value_objects import ThreadRef
+from ..value_objects import Role, ThreadRef
 from .client import MagickitMcpError, McpToolCaller
 
 
@@ -54,6 +54,7 @@ class MagickitChatroomGateway:
         body: str,
         reply_to_msg_id: str | None,
         idempotency_key: str,
+        role: Role | None = None,
     ) -> str:
         # idempotency_key is computed by the dispatcher (I5) but magickit
         # chatroom_post_message has no idempotency field, so it is accepted for
@@ -69,6 +70,19 @@ class MagickitChatroomGateway:
         }
         if reply_to_msg_id is not None:
             arguments["reply_to"] = reply_to_msg_id
+        # D-1 (T-dispatched-turn-gets-one-message). Sent, never silently dropped:
+        # a ``RoleNotAllowed`` from the far end is the gate WORKING (that identity
+        # may not claim that role) and must propagate, not be retried without the
+        # role — retrying without it is disarming the check, not recovering from it.
+        #
+        # One thing this cannot do from here: the chatroom drops an unverified role
+        # for an author with no registered identity, posting the message anyway with
+        # ``role: null``. So the value lands only for authors registered in magickit.
+        # The conductor authors under the roster persona (``Einstein`` …), which is
+        # registered — non-null roles from manual turns by those same names are the
+        # evidence — but a harness-only author would silently record null.
+        if role is not None:
+            arguments["role"] = role.value
         result = await self._mcp.call_tool("chatroom_post_message", arguments)
         return _extract_msg_id(result)
 

@@ -70,6 +70,7 @@ from ..exceptions import (
 from ..naysayer.adr_index import load_adr_index
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
+from ..thread_context import build_turn_prompt
 from ..ulid_util import new_ulid
 from ..value_objects import (
     Capability,
@@ -988,12 +989,8 @@ class _Session:
 
 
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
-    payload = event.payload
-    return (
-        f"You are acting as the {own_role.value} role in thread "
-        f"{event.thread_ref.thread_id}.\n\n"
-        f"New message from {payload.author}:\n\n{payload.body}\n\n"
-        f"Carry out the work in your role, then reply in the thread."
+    return build_turn_prompt(
+        event, own_role, "Carry out the work in your role, then reply in the thread."
     )
 
 

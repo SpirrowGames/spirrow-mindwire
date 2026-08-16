@@ -24,7 +24,7 @@ from typing import Any
 from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef, parse_pr_ref
 from .magickit.client import MagickitMcpError, McpToolCaller
 from .naysayer.pr_review import NaysayerPrReviewDriver, PrReviewOutcome
-from .value_objects import ThreadRef
+from .value_objects import Role, ThreadRef
 
 _DEFAULT_THREAD_PREFIX = "T-pr-review-"
 _DEFAULT_OWNER = "orchestrator"
@@ -297,6 +297,19 @@ class PrReviewOrchestrator:
                     "msg_type": "report",
                     "author": self._naysayer_author,
                     "content": body,
+                    # D-1 (T-dispatched-turn-gets-one-message). This is the Tier B
+                    # verdict — the single most gate-relevant message the harness
+                    # writes — and it recorded ``role: null`` 346 times out of 346
+                    # (live corpus, 2026-08-16). The claim is honest: this body IS
+                    # the independent naysayer's critique, relayed verbatim.
+                    #
+                    # Whether it RECORDS depends on ``self._naysayer_author`` being
+                    # a registered magickit identity with ``naysayer`` in its
+                    # allowed_roles; an unregistered author has its role dropped and
+                    # still posts. So this supplies the value and the registration is
+                    # a magickit-side fact to confirm, not something this repo can
+                    # assert. Read the posted message back to know which happened.
+                    "role": Role.NAYSAYER.value,
                 },
             )
 

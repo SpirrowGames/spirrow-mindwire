@@ -71,6 +71,7 @@ class _FakeGateway:
         body: str,
         reply_to_msg_id: str | None,
         idempotency_key: str,
+        role: Role | None = None,
     ) -> str:
         self.posts.append(
             {

@@ -61,6 +61,7 @@ class _FakeGateway:
         body: str,
         reply_to_msg_id: str | None,
         idempotency_key: str,
+        role: Role | None = None,
     ) -> str:
         self.posts.append({"author": author, "reply_to_msg_id": reply_to_msg_id})
         return f"posted-{len(self.posts)}"

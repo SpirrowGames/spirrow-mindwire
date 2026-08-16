@@ -576,6 +576,7 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
             body: str,
             reply_to_msg_id: str | None,
             idempotency_key: str,
+            role: Role | None = None,
         ) -> str:
             self.posts.append(body)
             return "posted-1"
