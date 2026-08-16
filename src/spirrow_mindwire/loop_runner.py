@@ -30,7 +30,7 @@ embodiment terminal_coding_agent):
   other's messages / ping-pong (``tests/test_phase1_e2e_smoke.py`` docstring).
   Each :class:`~spirrow_mindwire.config.LoopWatchConfig` must therefore name a
   single auto-reply role per thread; the naysayer's PR-review runs on its own
-  ``T-pr-review-<n>`` thread, opened by
+  ``T-pr-review-<repo>-<n>`` thread, opened by
   :class:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator`.
 - **Scope (msg-385 §2)**: this PR is *runner only* — it does not modify any
   core (watcher ``_seen`` / dispatcher routing / adapter reply path). The

@@ -119,8 +119,8 @@ class PrGate(Protocol):
 
     The real :class:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator` satisfies this
     structurally; tests inject a fake. ``fire_pr_review`` runs the review synchronously
-    (CI-gate → Gemini judge → GitHub submit) and posts its critique to the ``T-pr-review-<n>``
-    thread; the conductor routes by the returned verdict.
+    (CI-gate → Gemini judge → GitHub submit) and posts its critique to the
+    ``T-pr-review-<repo>-<n>`` thread; the conductor routes by the returned verdict.
     """
 
     async def fire_pr_review(
@@ -581,11 +581,12 @@ class Conductor:
     async def _fire_pr_gate(self, pr_ref: str) -> tuple[ReviewEvent, dict[str, Any]]:
         """Fire the Tier B naysayer review on ``pr_ref`` and relay its verdict (PR-2b-2).
 
-        Synchronous (ADR-19 N-1): the orchestrator runs the CI-gate + Gemini judge + GitHub submit
-        and posts its critique to the ``T-pr-review-<n>`` thread; here the conductor relays the
-        verdict (with the critique body, so the implementer has its fix context) into the design
-        thread. Returns the verdict and the relay **message**, so the implementer is dispatched on
-        that relay event and sees the critique, not its own pr-review trigger (Tier B msg-567 #1).
+        Synchronous (ADR-19 N-1): the orchestrator runs the CI-gate + Gemini judge + GitHub
+        submit and posts its critique to the ``T-pr-review-<repo>-<n>`` thread; here the
+        conductor relays the verdict (with the critique body, so the implementer has its fix
+        context) into the design thread. Returns the verdict and the relay **message**, so the
+        implementer is dispatched on that relay event and sees the critique, not its own
+        pr-review trigger (Tier B msg-567 #1).
         """
         assert self._orchestrator is not None
         _thread_ref, outcome = await self._orchestrator.fire_pr_review(

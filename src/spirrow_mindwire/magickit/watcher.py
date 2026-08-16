@@ -112,7 +112,7 @@ class ChatroomWatcher:
         """Register a new ``(thread, role)`` after :meth:`start` — spawns its session.
 
         Used by the PR-review orchestrator (T20) to wire a freshly-opened
-        ``T-pr-review-<n>`` thread to the naysayer at runtime. With
+        ``T-pr-review-<repo>-<n>`` thread to the naysayer at runtime. With
         ``baseline=False`` the watch's existing messages (e.g. the orchestrator's
         review-request) ARE dispatched on the next poll, so the naysayer acts on
         the request immediately rather than ignoring it as backlog. A no-op if
