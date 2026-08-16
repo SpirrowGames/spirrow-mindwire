@@ -11,8 +11,9 @@ What stays in **code** (the driver), not the LLM (D-7 / ADR-16):
 
 1. the **L1 CI-gate** (ADR-16 §D-2): a non-green CI short-circuits to REQUEST_CHANGES / COMMENT
    *before* the costly content review — fail-closed (failure / pending / UNKNOWN never APPROVE);
-2. the **injection-safe verdict parsing** (last standalone ``VERDICT:`` line; never APPROVE on a
-   truncated / length-capped review);
+2. the **injection-safe verdict parsing** (last standalone ``VERDICT:`` line, anchored at column
+   zero so no diff hunk line — ``+``, ``-`` *or* the space-prefixed context line — can supply one;
+   never APPROVE on a truncated / length-capped review);
 3. the **T22 GitHub-review submission** as the separate ``spirrowgames-ops`` identity, with the
    same-identity 422 → COMMENT fallback;
 4. the **A-3 two-pass ADR-pointer structure** (spec-thread ``T-pr-gate-adr-index-scope``
@@ -120,15 +121,104 @@ _DEFAULT_REVIEW_LOGIN = "spirrowgames-ops"
 # then permanently, escalate the gate (Copilot + independent naysayer review on PR #113).
 _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
 
-# A verdict must be its own line (``^...$`` with MULTILINE). Diff hunk lines carry a +/-/space
-# prefix, so a ``VERDICT: APPROVE`` *inside the reviewed diff* (prompt injection) never satisfies
-# ``^\s*VERDICT:`` — only a real verdict line the model emits does. We take the LAST such line
-# (the model's final verdict), so an APPROVE quoted earlier cannot flip the gate open.
+# A verdict must be its own line, starting at COLUMN ZERO (``^...$`` with MULTILINE, and no
+# leading-whitespace class after ``^``).
+#
+# The anchor was ``^\s*`` until 2026-08-16, above a comment asserting that a ``VERDICT: APPROVE``
+# *inside the reviewed diff* could never satisfy it because diff hunk lines carry a +/-/space
+# prefix. That was true for ``+`` and ``-`` and FALSE for the third: ``\s`` matches a space, and a
+# unified-diff CONTEXT line is prefixed with exactly one space — the most common line kind in any
+# diff. So the one defence the comment named did not cover the one case that mattered.
+#
+# ``matches[-1]`` (below) does not rescue it: last-wins only helps while the injected copy comes
+# BEFORE the model's real verdict. A model that states its verdict and then quotes the offending
+# hunk — a normal thing for a reviewer to do — puts the injected APPROVE last.
+#
+# Why column zero and not "a little indentation": every leading-space allowance re-admits the
+# context line, because the context prefix IS one space. ``^[ \t]{0,3}`` would have changed
+# nothing. The choice is therefore binary, and the measurement settles it — sweeping every PR of
+# the four Spirrow repos for reviews authored by ``spirrowgames-ops`` (2026-08-16: 499 review
+# bodies, 413 plain verdict lines) found the verdict at column 0 in 413 of 413; indented ones do
+# not occur. The driver's own short-circuit bodies (CI-gate, debounce, timeout-degrade) likewise
+# render theirs at column 0.
+#
+# The failure direction is safe by construction: an unmatched verdict is not an open gate but no
+# verdict at all, and _parse_verdict defaults to REQUEST_CHANGES. A model that someday indents its
+# verdict costs a red gate, not a false APPROVE.
+#
+# This pattern is coupled to _PR_REVIEW_SYSTEM_PROMPT, which must teach the exact shape accepted
+# here — narrowing one without the other makes the gate refuse the form its own instructions
+# prescribe. The prompt's exemplar was indented two spaces AND carried a trailing parenthetical,
+# so it did not parse under this anchor (the indent) nor under the old ``^\s*`` one (the
+# parenthetical, which ``\s*$`` will not cross). Both are fixed, and
+# test_system_prompt_verdict_exemplar_is_accepted_by_the_parser asserts the prompt text itself
+# against this pattern so the two cannot drift apart again silently.
+#
+# ---- What this anchor does NOT buy (do not repeat the mistake this comment replaced) ----
+#
+# It makes VERBATIM diff text inert, because a hunk line keeps its +/-/space prefix and so cannot
+# begin at column 0. That is the whole of it. It is NOT immunity to injection. A model that
+# RE-TYPES an injected line without the prefix — most plausibly by quoting it inside a fenced
+# block — emits a genuine column-0 match, and ``matches[-1]`` (last-wins) only covers that while
+# the quote comes BEFORE the model's own verdict. A quote placed after it still wins; measured
+# 2026-08-16, not hypothesised. That residual is recorded rather than fixed here: closing it means
+# deciding what may legitimately surround a verdict line (fences, quoting rules), which is a
+# design question, not a regex tweak.
+#
+# While it stays open, the one mitigation that IS available is to deny the exploit its string: keep
+# column-0 ``VERDICT: APPROVE`` out of the sources this gate reads and out of the prompt it is
+# given. See the note above _PR_REVIEW_SYSTEM_PROMPT.
+#
+# ---- Bold verdicts fail closed, deliberately (ruling: T-verdict-regex-space-prefix-injection) ----
+#
+# ``**VERDICT: APPROVE**`` does not match this pattern, so _parse_verdict returns REQUEST_CHANGES.
+# That is a CHOICE, not an oversight. The same sweep found 9 bold verdict lines (spirrow-mindwire
+# #69/#71/#72/#73/#74, Spirrow-VoxelWorld #51); of the 4 that read APPROVE, none was ever submitted
+# as an APPROVED review — the gate is not known to have opened on one. Reasons to leave it strict:
+# the failure direction costs one redundant red round, no current driver output takes the bold form
+# (413 of 413 are plain), and widening the accepted shape is what lets quoted text be read as an
+# assertion.
+#
+# The reversed twin — read this before "making the two consistent":
+#
+#   layer 2 (``NEXT:`` handoff parsing, PR #151)   this line (``VERDICT:`` gate parsing)
+#   ------------------------------------------    -------------------------------------
+#   ``**NEXT: X**`` is accepted (tolerant)        ``**VERDICT: X**`` is rejected (strict)
+#   miss  -> loop halts SILENTLY and waits on     miss  -> one extra red round; loud and cheap
+#            a human who has no signal to look
+#   over-match -> one wasted turn                 over-match -> the gate OPENS on text the model
+#                                                              may merely have quoted
+#
+# Same surface defect (markdown emphasis defeats a line parser), opposite damage asymmetry, hence
+# opposite treatment. This is not an inconsistency to be tidied up. Revisit only when a FALSE RED
+# is actually observed here — a review body whose bold verdict forced a REQUEST_CHANGES the author
+# did not intend.
 _VERDICT_RE = re.compile(
-    r"^\s*VERDICT:\s*(APPROVE|REQUEST[ _-]?CHANGES|COMMENT)\s*$",
+    r"^VERDICT:\s*(APPROVE|REQUEST[ _-]?CHANGES|COMMENT)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
+# ---- The exemplar below is REQUEST_CHANGES on purpose. Do not "restore the symmetry". ----
+#
+# There is deliberately no column-0 ``VERDICT: APPROVE`` anywhere in this file — nor anywhere under
+# ``src/``. Such a literal is an exploit string for the residual recorded above _VERDICT_RE (a
+# quote placed AFTER the model's own verdict wins), and it reaches the parser through two channels
+# that both close only by the string not existing:
+#
+#   * this file is reviewed BY this gate, so the literal rides in every diff that touches it, and
+#     re-typing it out of the diff (dropping the +/space prefix) is the ordinary way to discuss it;
+#   * the prompt is handed to the model on every review, so a model that restates its own
+#     instructions emits the line with no diff involved at all.
+#
+# An exemplar teaches the SHAPE of the line, not which conclusion to reach. REQUEST_CHANGES teaches
+# the identical shape under the identical anchor, and if it is ever echoed it lands on the
+# fail-closed side: "quoting this opens the gate" becomes "quoting this turns it red". Measured
+# 2026-08-16 on the previous exemplar: a body reading ``VERDICT: REQUEST_CHANGES`` (the model's
+# own) followed by a quote of the APPROVE exemplar parsed as APPROVE.
+#
+# The APPROVE form is therefore described in prose rather than shown. Pinned by
+# test_no_src_file_teaches_a_column_zero_approve_verdict (scans ``src/`` with _VERDICT_RE itself)
+# and test_quoting_the_prompt_exemplar_cannot_open_the_gate (replays the echo).
 _PR_REVIEW_SYSTEM_PROMPT = """\
 You are the independent naysayer performing adversarial CODE REVIEW of a pull \
 request's diff in a Spirrow MindWire ChatRoom thread. You are a different model \
@@ -141,9 +231,14 @@ concrete flaw. Do not fabricate problems and do not pad with generic caveats. \
 If, after a genuine search, you find no blocking problem, say so and name the \
 single weakest remaining point.
 
-End your reply with exactly one verdict line:
-  VERDICT: APPROVE          (no blocking problems)
-  VERDICT: REQUEST_CHANGES  (at least one blocking problem)
+End your reply with exactly one verdict line, in exactly this form — at the start of the line, \
+holding nothing else (no indentation, no bold or backticks, no trailing note):
+
+VERDICT: REQUEST_CHANGES
+
+Write that line verbatim if you found at least one blocking problem. If, after a genuine search, \
+you found none, write the same line with the single word APPROVE in place of REQUEST_CHANGES. \
+Those two are the only verdicts, and nothing else may appear on the line.
 
 Your reply is posted verbatim to the thread and submitted as your GitHub PR \
 review body — reply directly with the review, no preamble.
@@ -189,8 +284,10 @@ class PrReviewOutcome:
 def _parse_verdict(critique: str) -> ReviewEvent:
     """Extract the verdict; default-safe to REQUEST_CHANGES (never silent approve).
 
-    Takes the **last** standalone ``VERDICT:`` line so an APPROVE quoted earlier (or injected via
-    the reviewed diff) cannot override the model's real verdict.
+    Takes the **last** standalone ``VERDICT:`` line so an APPROVE quoted *earlier* cannot override
+    the model's real verdict. Text injected via the reviewed diff is handled by the anchor rather
+    than by this rule — see ``_VERDICT_RE``, and note that last-wins on its own is no defence when
+    the quote comes after the verdict.
     """
     matches = _VERDICT_RE.findall(critique)
     if not matches:
