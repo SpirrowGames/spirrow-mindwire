@@ -315,3 +315,87 @@ class TestLayer2DoesNotDoubleTheExtractionLoop:
 
         next_line_regexes = [n for n in dir(handoff_mod) if "NEXT_LINE_RE" in n]
         assert len(next_line_regexes) == 1, next_line_regexes
+
+
+# --------------------------------------------------------------------------- #
+# The emphasis CLOSE is not always the last thing on the line.
+#
+# msg-1074 §2 spelled out that this bug fails twice, and that fixing one end
+# leaves it broken: the line head `**` defeats `^\s*`, AND — even once the head
+# is tolerated — `_NAME_SPLIT_RE` cuts the token at whitespace so the name comes
+# out as `Heisenberg**`, which no roster lookup matches.
+#
+# Tolerating the close only when it sits at end-of-line fixes `**NEXT: X**` but
+# NOT the shape that actually stopped the loop, because a real handoff line
+# carries a trailing gloss AFTER the closing `**`:
+#
+#     **NEXT: Heisenberg** — ③ fixture field-fidelity audit（…）に着手する。  # noqa: RUF003
+#
+# That is the verbatim line from `spirrow-voxelworld` msg-2488, the one that
+# produced `exit=0 reason=no_handoff_to_human rounds=0`. msg-1074 §6-2 requires
+# it to be pinned by its real text — "「直したつもり」を防ぐ唯一の機構がこれ".
+# --------------------------------------------------------------------------- #
+
+
+class TestEmphasisCloseFollowedByGloss:
+    """The real incident shape: bold wrapper CLOSED mid-line, gloss after it."""
+
+    def test_msg_2488_verbatim_line_resolves(self) -> None:
+        # The exact body that stopped `T-slope-extension-dead-mode` on 2026-08-15.
+        body = "**NEXT: Heisenberg** — ③ fixture field-fidelity audit（…）に着手する。"  # noqa: RUF001
+        h = resolve_handoff(body, _ROSTER)
+        assert h.kind is HandoffKind.ROLE
+        assert h.identity == "Heisenberg"
+
+    def test_bold_close_then_ascii_gloss(self) -> None:
+        assert parse_next_token("**NEXT: Bohr** - please pick this up") == "Bohr"
+
+    def test_bold_close_then_emdash_gloss(self) -> None:
+        assert parse_next_token("**NEXT: Bohr** — next step") == "Bohr"
+
+    def test_sentinel_with_close_then_gloss(self) -> None:
+        h = resolve_handoff("**NEXT: human** — Tier-C の判断が要る", _ROSTER)
+        assert h.kind is HandoffKind.HUMAN
+
+    def test_inline_code_close_then_gloss(self) -> None:
+        assert parse_next_token("`NEXT: Einstein` — independent review please") == "Einstein"
+
+    def test_emphasis_on_the_name_only(self) -> None:
+        # The wrapper need not surround `NEXT:` — an author may bold just the name.
+        assert parse_next_token("NEXT: **Heisenberg** — go") == "Heisenberg"
+
+    def test_pr_review_ref_does_not_absorb_the_closing_wrapper(self) -> None:
+        # ★ The Tier-B gate breaker. With the close tolerated only at end-of-line,
+        # a gloss after `**` leaves the ref as `acme/widgets#7**`, which is handed
+        # to GitHub as an invalid ref. The `#7` payload must survive AND the `**`
+        # must not.
+        h = resolve_handoff("**NEXT: pr-review acme/widgets#7** — please gate", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+
+
+class TestNormalisationDoesNotEatPayloadCharacters:
+    """Emphasis characters are stripped only at word edges — never inside a token."""
+
+    def test_underscore_inside_a_repo_name_survives(self) -> None:
+        # `_` is a Markdown emphasis marker AND a legal character in a repo name /
+        # URL. Stripping it wholesale would corrupt the ref, so the strip is
+        # anchored to word boundaries.
+        h = resolve_handoff("**NEXT: pr-review acme/my_repo#7**", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/my_repo#7"
+
+    def test_underscored_url_ref_survives(self) -> None:
+        h = resolve_handoff(
+            "**NEXT: pr-review https://github.com/acme/my_repo/pull/7** — gate it",
+            _ROSTER,
+        )
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "https://github.com/acme/my_repo/pull/7"
+
+    def test_bare_forms_are_untouched(self) -> None:
+        # msg-1074 §6-3: prove the pre-existing plain shapes still work.
+        assert parse_next_token("NEXT: Heisenberg") == "Heisenberg"
+        assert parse_next_token("NEXT: Heisenberg — do the thing") == "Heisenberg"
+        assert parse_next_token("NEXT: Heisenberg（実装を進める）") == "Heisenberg"  # noqa: RUF001
+        assert resolve_handoff("NEXT: none", _ROSTER).kind is HandoffKind.NONE

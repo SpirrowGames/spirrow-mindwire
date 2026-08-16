@@ -27,10 +27,17 @@ Parsing is layered:
   ``*...*``, ``_..._``, ``` `...` ```). This is a **transitional bridge**, not a permanent
   legacy fallback: Layer 3 will add a structured ``next_participant`` field on the message
   itself, and when that lands the whole regex scaffold (including this tolerance) becomes the
-  compatibility path scheduled for removal, not a coequal parser kept forever. The tolerance is
-  deliberately narrow — it strips *shell* characters at the very start / very end of the line,
-  never anywhere inside the token — so a ``pr-review owner/repo#7`` ref is never damaged by
-  Markdown stripping (see the test class ``TestPrReviewPayloadSurvivesMarkdownStripping``).
+  compatibility path scheduled for removal, not a coequal parser kept forever.
+
+  The tolerance is deliberately narrow, and split so that each character has exactly one owner:
+  the *line* shell (``>`` / ``#`` / bullets / the opening emphasis) is absorbed by
+  ``_NEXT_LINE_RE``, because finding the line at all depends on it; the *token's* emphasis
+  (``*`` / ``_`` / ``` ` ```) is removed by :func:`_strip_md_emphasis`, at word edges only,
+  because a closing ``**`` is frequently followed by a gloss and so is not at end-of-line.
+  ``#`` is never in the second set, and an edge-anchored strip cannot reach inside a word, so a
+  ``pr-review owner/repo#7`` ref keeps both its ``#7`` and any ``_`` in an owner/repo name (see
+  ``TestPrReviewPayloadSurvivesMarkdownStripping`` and
+  ``TestNormalisationDoesNotEatPayloadCharacters``).
 """
 
 from __future__ import annotations
@@ -53,7 +60,10 @@ from ..value_objects import Role
 #   - NEXT: Bohr        (list bullet — also `*` / `+`)
 #   **NEXT: Bohr**      (bold wrap — also `*`, `_`, `` ` ``)
 # The tolerance is intentionally narrow — a closed enumeration of Markdown shells that consume
-# characters BEFORE ``NEXT:`` and AFTER the token, but never anywhere inside the token itself.
+# characters BEFORE ``NEXT:``, plus the ATX heading close on the line tail. The token's own
+# emphasis close is NOT handled here (it is usually followed by a gloss, so it is not at ``$``);
+# that job belongs to ``_strip_md_emphasis`` below, and splitting it this way keeps each character
+# with exactly one owner.
 # Critically, ``#`` is only stripped as a leading heading marker (``# `` or ``## ``, whitespace
 # required) or as an optional ATX close on the outermost line-tail. It is NEVER stripped from
 # elsewhere on the line — a `pr-review owner/repo#7` ref must survive intact (Einstein's design
@@ -67,7 +77,6 @@ _MD_LEADING_SHELL = (
     r")*"
 )
 _MD_INLINE_OPEN = r"(?:\*\*|__|\*|_|`)?"
-_MD_INLINE_CLOSE = r"(?:\*\*|__|\*|_|`)?"
 # An ATX heading may end with a run of `#` chars separated from the content by whitespace
 # (``## Heading ##``). We tolerate that shape on the *outermost* tail only, and — because
 # whitespace is required — this never touches a `pr-review ...#7` ref (there is no space
@@ -78,11 +87,42 @@ _NEXT_LINE_RE = re.compile(
     + _MD_LEADING_SHELL
     + _MD_INLINE_OPEN
     + r"\s*NEXT:\s*(?P<token>\S.*?)\s*"
-    + _MD_INLINE_CLOSE
     + _MD_TRAILING_SHELL
     + r"$",
     re.MULTILINE,
 )
+
+# ★ The emphasis CLOSE cannot live in the line regex, because it is not always at the end of the
+# line. msg-1074 §2 is explicit that this bug fails at BOTH ends and that fixing one leaves it
+# broken ("前を直しても後ろで落ちる。片方だけの修正は無効"), and the line that actually stopped the
+# loop carries a gloss AFTER the closing ``**``:
+#
+#     **NEXT: Heisenberg** — ③ fixture field-fidelity audit（…）に着手する。  # noqa: RUF003
+#
+# Anchoring the close to ``$`` handles ``**NEXT: X**`` but not that shape: the token comes out as
+# ``Heisenberg** — …``, ``_NAME_SPLIT_RE`` cuts it at the space, and the roster is asked for
+# ``Heisenberg**``. So the closing side is owned by exactly ONE normalisation, applied once in
+# :func:`_last_next_raw` — before the ``pr-review`` raw read AND before the name-split, so both
+# resolution paths see the same cleaned text (msg-1074 §4-1: "正規化を 1 箇所に置く").
+#
+# The two owners do not overlap, which is what keeps this from becoming the very "2 箇所を別々に
+# 緩める" failure §4-1 warns about:
+#   - the regex owns the LINE shell    — `>` `#` bullets + the opening emphasis (it must, since
+#     locating the line at all depends on them);
+#   - this normalisation owns the TOKEN's emphasis — `*` `_` `` ` `` only, never `#`.
+#
+# It strips emphasis runs only at WORD EDGES (start/end of the token, or adjacent to whitespace).
+# That is what protects payload characters: `#` is never in the character class at all, so a
+# ``pr-review owner/repo#7`` ref keeps its PR number, and an `_` *inside* a word — ``acme/my_repo``,
+# or an underscored URL — is not at an edge and therefore survives (Einstein's principle-3
+# objection: normalisation must not damage the ref).
+_MD_EMPHASIS_EDGE_RE = re.compile(r"(?<![^\s])[*_`]+|[*_`]+(?![^\s])")
+
+
+def _strip_md_emphasis(text: str) -> str:
+    """Remove Markdown emphasis runs at word edges, leaving payload characters intact."""
+    return _MD_EMPHASIS_EDGE_RE.sub("", text).strip()
+
 
 # The participant name is the leading run before any whitespace or an opening paren (ASCII or
 # fullwidth CJK): real handoffs carry a trailing gloss after the name, and only the name selects the
@@ -147,12 +187,16 @@ def _last_next_raw(body: str) -> str | None:
     """The raw text of the **last** ``NEXT:`` line (last wins; see module docstring), or ``None``.
 
     The ``pr-review <ref>`` PR-gate sentinel needs the whole line (the ref carries ``/`` and ``#``),
-    so resolution works off this raw text and only name-splits for a persona handoff.
+    so resolution works off this text and only name-splits for a persona handoff. "Raw" here means
+    *before the name-split*, not *un-normalised*: the Markdown emphasis strip is applied here, once,
+    so the ``pr-review`` path and the persona path cannot disagree about the token (msg-1074 §4-1
+    requires the normalisation to reach the ``pr-review`` route too — otherwise a wrapped ref is
+    handed to GitHub as ``owner/repo#7**``).
     """
     matches = _NEXT_LINE_RE.findall(body)
     if not matches:
         return None
-    return str(matches[-1]).strip()
+    return _strip_md_emphasis(str(matches[-1])) or None
 
 
 def _name_from_raw(raw: str) -> str | None:
