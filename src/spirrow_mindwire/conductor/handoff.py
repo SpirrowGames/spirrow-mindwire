@@ -32,13 +32,17 @@ pattern that describes *it*:
   of prose that merely mentions ``NEXT:``. Decoration is admitted at all three positions a wrapper
   can close in — ``**NEXT: X**``, ``**NEXT**: X`` and ``**NEXT:** X`` — because a rule that admits
   only some of them is another enumeration wearing a closed rule's clothes.
-- **the token** — :data:`_PR_REVIEW_RE` / :data:`_PR_REF_RE` match a PR ref in exactly the shapes
-  :func:`~spirrow_mindwire.github.client.parse_pr_ref` accepts, and
-  :data:`_PARTICIPANT_NAME_RE` matches the shape of a participant name. Whatever the author put
-  *after* the name — ``**``, ``,``, ``。``, ``— a gloss`` — is outside the match and therefore
-  falls away for free. This is also what protects the payload (Einstein's principle-3 objection):
-  ``#`` and ``_`` are matched as *part of the ref pattern*, so ``owner/my_repo#7`` survives whole
-  because it is the thing being matched, not because a strip was carefully aimed away from it.
+- **the token** — :data:`_PARTICIPANT_NAME_RE` matches the shape of a participant name, so whatever
+  the author put *after* the name — ``**``, ``,``, ``。``, ``— a gloss`` — is outside the match and
+  therefore falls away for free.
+- **the PR ref** — *not matched here at all*. What counts as a PR reference is owned by
+  :func:`~spirrow_mindwire.github.client.parse_pr_ref`, and this module asks it rather than
+  re-spelling its grammar. The revision before this one did spell it out a second time, with a
+  comment claiming the two "agree by construction"; they already disagreed —
+  ``acme/widgets#7abc`` yielded ``acme/widgets#7`` here and ``None`` there (msg-1158 §5). A second
+  spelling also silently withholds whatever the owner learns later (an enterprise host, a new
+  short-link shape), which is the concrete cost: the gate would keep firing on the owner's *old*
+  vocabulary. So the ``pr-review`` route asks the owner and records the owner's answer.
 
 This tolerance is a **transitional bridge**, not a permanent legacy fallback: Layer 3 will add a
 structured ``next_participant`` field on the message itself, and when that lands this whole regex
@@ -56,6 +60,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
+from ..github.client import parse_pr_ref
 from ..value_objects import Role
 
 # A handoff line must stand on its own (``^...$`` with MULTILINE). We take the LAST one so a
@@ -133,17 +138,24 @@ PR_REVIEW_TOKEN = "pr-review"
 # The sentinel is the word plus an operand: a bare ``NEXT: pr-review`` with nothing after it is not
 # a PR-gate directive at all (it falls through to the participant path and out as ABSENT → human).
 _PR_REVIEW_RE = re.compile(rf"{_DECORATION}{PR_REVIEW_TOKEN}\b(?P<rest>.*)", re.IGNORECASE)
-# The ref, matched by its own shape rather than as "the next non-whitespace run". These are exactly
-# the two forms :func:`~spirrow_mindwire.github.client.parse_pr_ref` accepts, so the sentinel and
-# the validator agree by construction. Because the pattern says what a ref *is*, anything an author
-# appends to it is outside the match: ``acme/widgets#7**, please gate`` yields ``acme/widgets#7``
-# without a rule about ``*`` or ``,`` existing anywhere in this module. It is also what keeps the
-# payload intact — ``#`` and ``_`` are matched *as part of the ref*, so ``acme/my_repo#7`` and an
-# underscored PR URL survive whole (Einstein's principle-3 objection, msg-1107).
-_PR_REF_RE = re.compile(
-    r"(?:https?://)?(?:[A-Za-z0-9-]+\.)*github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/\d+"
-    r"|[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#\d+"
-)
+# The operand's PAYLOAD: the operand with this module's own decoration removed from either end.
+# This is deliberately not a statement about PR refs — it is the same closed ``_DECORATION``
+# property the line rule uses, applied to the one place the ref route needs it. It is needed
+# because ``_`` is simultaneously a Markdown wrapper and a word character, so the owner's short-ref
+# pattern (which ends at a word boundary) reads some wrappers off the end and not others. Measured
+# against ``parse_pr_ref`` on this head:
+#
+#     acme/widgets#7**   -> acme/widgets#7      acme/widgets#7.    -> acme/widgets#7
+#     acme/widgets#7_    -> None                _acme/widgets#7_   -> None
+#
+# ``_NEXT: pr-review acme/widgets#7_`` is exactly the underscore wrapper `45b767d` lost and this PR
+# restored, so handing the operand over verbatim — the literal reading of msg-1159 §2, "generous
+# に渡して所有者に判断させる" — re-loses it on the PR route while the persona route keeps it.
+# Measured: 56 generated shapes, caught by the differential in
+# ``test_conductor_handoff_migration.py``.
+# Trimming decoration cannot reach into a ref either way: both accepted forms end in a digit,
+# which is a word character.
+_OPERAND_PAYLOAD_RE = re.compile(rf"\A{_DECORATION}(?P<payload>.*?){_DECORATION}\Z")
 
 
 class HandoffKind(StrEnum):
@@ -161,8 +173,15 @@ class Handoff:
     """The resolved handoff target of a message's final ``NEXT:`` line.
 
     ``identity`` / ``role`` are set only when ``kind is HandoffKind.ROLE`` (``identity`` is the
-    roster's canonical persona name). ``token`` is the raw participant name parsed (observability),
+    roster's canonical persona name). ``token`` is the participant name parsed (observability),
     ``None`` when no ``NEXT:`` line was found at all.
+
+    On the ``PR_REVIEW`` route ``token`` is the **canonical slug** (``owner/repo#n``) whenever
+    :func:`~spirrow_mindwire.github.client.parse_pr_ref` recognised one — including for a PR URL,
+    which it normalises. It is *not* the substring the author typed: this module no longer knows
+    the shape of a ref, so it cannot report where one started and ended, only what the owner of
+    that grammar made of it. When the owner recognised nothing, ``token`` is the raw operand, and
+    the conductor's re-validation (``core.py``, same function) fails safe to the human.
     """
 
     kind: HandoffKind
@@ -217,14 +236,16 @@ def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
         return Handoff(HandoffKind.ABSENT)
     sentinel = _PR_REVIEW_RE.match(raw)
     if sentinel is not None and (operand := sentinel.group("rest").strip()):
-        # NEXT: pr-review <owner/repo#n> — take the ref by its own shape, so whatever the author
-        # wrapped or appended it with is outside the match: ``acme/widgets#7**, please gate``
-        # resolves to ``acme/widgets#7`` with no rule about ``*`` or ``,`` anywhere in this module.
-        # An operand with no ref shape in it is still the sentinel (the author asked for a gate);
-        # the conductor re-validates with parse_pr_ref and fails safe to the human rather than
-        # firing (Tier B PR #103 round 4).
-        ref = _PR_REF_RE.search(operand)
-        return Handoff(HandoffKind.PR_REVIEW, token=ref.group(0) if ref else operand)
+        # NEXT: pr-review <owner/repo#n>. This module says where the operand starts and where its
+        # decoration ends; it does not say what a PR ref is. ``parse_pr_ref`` owns that, is
+        # documented to extract one from *free text*, and its answer is recorded verbatim (the
+        # canonical slug), so a ref shape only the owner knows arrives here without an edit.
+        # An operand the owner does not recognise is still the sentinel (the author asked for a
+        # gate) and is carried forward raw; the conductor re-validates with the same function and
+        # fails safe to the human rather than firing (Tier B PR #103 round 4).
+        payload = _OPERAND_PAYLOAD_RE.match(operand)
+        ref = parse_pr_ref(payload.group("payload") if payload is not None else operand)
+        return Handoff(HandoffKind.PR_REVIEW, token=ref.slug if ref is not None else operand)
     token = _name_from_raw(raw)
     if token is None:
         return Handoff(HandoffKind.ABSENT, token=raw)

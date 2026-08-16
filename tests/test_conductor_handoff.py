@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from pathlib import Path
 
+import pytest
+
+import spirrow_mindwire.conductor.handoff as handoff_mod
 from spirrow_mindwire.conductor.handoff import (
     HUMAN_TOKEN,
     NONE_TOKEN,
@@ -14,6 +18,7 @@ from spirrow_mindwire.conductor.handoff import (
     parse_next_token,
     resolve_handoff,
 )
+from spirrow_mindwire.github.client import PrRef, parse_pr_ref
 from spirrow_mindwire.value_objects import Role
 
 _ROSTER = {"Bohr": Role.PROPOSER, "Heisenberg": Role.IMPLEMENTER, "Einstein": Role.NAYSAYER}
@@ -79,10 +84,17 @@ def test_resolve_pr_review_case_insensitive_and_strips_surrounding_space() -> No
 
 
 def test_resolve_pr_review_accepts_a_url_ref() -> None:
+    # CHANGED with the delegation (msg-1158 blocking / msg-1159 §2): the token is the owner's
+    # canonical slug, not the URL substring the author typed. This module no longer knows what a
+    # PR ref looks like, so it cannot report where one began and ended — only what `parse_pr_ref`
+    # made of the operand, and that function normalises a URL. The destination is unchanged:
+    # `core.py` already re-parsed this token to `parsed_ref.slug` before firing the gate, so the
+    # PR the gate runs on is byte-identical to what this assertion pinned before.
     url = "https://github.com/acme/widgets/pull/7"
     h = resolve_handoff(f"done\n\nNEXT: pr-review {url}", _ROSTER)
     assert h.kind is HandoffKind.PR_REVIEW
-    assert h.token == url
+    assert h.token == "acme/widgets#7"
+    assert parse_pr_ref(h.token or "") == parse_pr_ref(url)  # same PR, spelled canonically
 
 
 def test_resolve_bare_pr_review_without_ref_falls_through_to_absent() -> None:
@@ -109,6 +121,71 @@ def test_resolve_pr_review_ignores_punctuation_against_the_ref() -> None:
     assert dot.token == "acme/widgets#7"
     comma = resolve_handoff("b\n\nNEXT: pr-review acme/widgets#7, please review now", _ROSTER)
     assert comma.token == "acme/widgets#7"
+
+
+class TestThePrRefGrammarHasOneOwner:
+    """`parse_pr_ref` decides what a PR ref is; this module asks it (msg-1158 blocking / 1159 §2).
+
+    The revision before this one carried a second copy of that grammar, under a comment asserting
+    the two "agree by construction". They already disagreed: `acme/widgets#7abc` resolved to
+    `acme/widgets#7` here and to `None` there (msg-1158 §5). These pin the *ownership*, not the
+    shapes — shapes are exactly what a second spelling gets right until the day it does not.
+    """
+
+    def test_a_ref_shape_only_the_owner_knows_is_routed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The concrete cost of a second spelling is not that today's shapes are wrong, it is that
+        # tomorrow's are withheld: when `parse_pr_ref` learns an enterprise host or a short link,
+        # a copy here has to be edited too or the gate keeps firing on the old vocabulary. So teach
+        # the owner a shape this module has never heard of and require it to arrive unedited.
+        monkeypatch.setattr(
+            handoff_mod,
+            "parse_pr_ref",
+            lambda text: PrRef("acme", "widgets", 7) if "ENTERPRISE" in text else None,
+        )
+        h = resolve_handoff("done\n\nNEXT: pr-review ENTERPRISE-widgets-seven", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+
+    def test_the_sentinel_never_claims_a_ref_the_owner_rejects(self) -> None:
+        # The measured divergence, inverted. The author still asked for a gate (so this is the
+        # sentinel, not ABSENT), but the operand resolves to whatever the owner says about it —
+        # here `None`, which `core.py` turns into a stop at the human rather than a gate fired on
+        # a ref one component invented and the other does not recognise.
+        h = resolve_handoff("x\n\nNEXT: pr-review acme/widgets#7abc", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert parse_pr_ref(h.token or "") is None
+
+    def test_the_two_components_agree_on_every_shape_this_file_pins(self) -> None:
+        # "Agree by construction" was a claim, and claims about two spellings are what failed. It
+        # is now checkable: for every operand shape in this file, what the conductor reports and
+        # what the validator downstream extracts must be the same PR.
+        for operand in (
+            "acme/widgets#7",
+            "acme/widgets#7.",
+            "acme/widgets#7, please review now",
+            "acme/widgets#7 (please review)",
+            "acme/my_repo#7",
+            "acme/widgets#7** — please gate",
+            "https://github.com/acme/my_repo/pull/7",
+            "acme/widgets#7abc",  # the one they used to split on
+            "please gate this",  # no ref at all
+        ):
+            h = resolve_handoff(f"body\n\nNEXT: pr-review {operand}", _ROSTER)
+            assert h.kind is HandoffKind.PR_REVIEW
+            assert parse_pr_ref(h.token or "") == parse_pr_ref(operand), operand
+
+    def test_no_pattern_here_spells_out_a_pr_ref(self) -> None:
+        # A smoke guard in the spirit of the DELEGATE-marker test above: it cannot prove the
+        # grammar is absent, but a re-introduced copy would almost certainly carry one of these
+        # two literals, and the test names what it is guarding so the next author sees the rule.
+        spellings = [
+            name
+            for name, value in vars(handoff_mod).items()
+            if isinstance(value, re.Pattern) and ("pull/" in value.pattern or "#" in value.pattern)
+        ]
+        assert spellings == [], f"{spellings} re-spell a grammar spirrow_mindwire.github owns"
 
 
 # --------------------------------------------------------------------------- #
@@ -434,12 +511,16 @@ class TestPayloadCharactersAreInsideTheRefPattern:
         assert h.token == "acme/my_repo#7"
 
     def test_underscored_url_ref_survives(self) -> None:
+        # The `_` inside `my_repo` is payload and survives; the surrounding `**` and the gloss do
+        # not reach the ref. CHANGED with the delegation: the token is the owner's canonical slug
+        # (see `test_resolve_pr_review_accepts_a_url_ref`), so what this pins is that the
+        # underscore reached the owner intact — `acme/my_repo#7`, not `acme/my`.
         h = resolve_handoff(
             "**NEXT: pr-review https://github.com/acme/my_repo/pull/7** — gate it",
             _ROSTER,
         )
         assert h.kind is HandoffKind.PR_REVIEW
-        assert h.token == "https://github.com/acme/my_repo/pull/7"
+        assert h.token == "acme/my_repo#7"
 
     def test_bare_forms_are_untouched(self) -> None:
         # msg-1074 §6-3: prove the pre-existing plain shapes still work.
