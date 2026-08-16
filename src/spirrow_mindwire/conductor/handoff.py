@@ -16,6 +16,21 @@ parsing + resolution layer:
 The NEXT vocabulary is the chatroom **identity / persona name** (e.g. ``Bohr`` / ``Heisenberg`` /
 ``Einstein`` / ``human``), not the internal role string; the roster is the persona→role map supplied
 by config, and the conductor authors each reply under the persona name.
+
+Parsing is layered:
+
+- **Layer 1** — the strict "line begins with optional whitespace + ``NEXT: <token>`` + end of
+  line" shape (no Markdown wrapping around it). A well-behaved reply that ends with a bare
+  handoff line hits this and always has.
+- **Layer 2** — Markdown-noise tolerance around the same line: blockquote (``>``), ATX heading
+  (``#``), list bullet (``-``/``*``/``+``/``1.``), and inline emphasis wrappers (``**...**``,
+  ``*...*``, ``_..._``, ``` `...` ```). This is a **transitional bridge**, not a permanent
+  legacy fallback: Layer 3 will add a structured ``next_participant`` field on the message
+  itself, and when that lands the whole regex scaffold (including this tolerance) becomes the
+  compatibility path scheduled for removal, not a coequal parser kept forever. The tolerance is
+  deliberately narrow — it strips *shell* characters at the very start / very end of the line,
+  never anywhere inside the token — so a ``pr-review owner/repo#7`` ref is never damaged by
+  Markdown stripping (see the test class ``TestPrReviewPayloadSurvivesMarkdownStripping``).
 """
 
 from __future__ import annotations
@@ -30,7 +45,44 @@ from ..value_objects import Role
 # A handoff line must stand on its own (``^...$`` with MULTILINE). We take the LAST one so a
 # ``NEXT:`` quoted earlier in the body cannot override the author's real, final handoff — the same
 # defence as the naysayer verdict parser.
-_NEXT_LINE_RE = re.compile(r"^\s*NEXT:\s*(?P<token>\S.*?)\s*$", re.MULTILINE)
+#
+# Layer 2 — Markdown-noise tolerance (transitional; see module docstring for the sunset plan).
+# An LLM sometimes wraps its final handoff line in a small set of Markdown shell characters:
+#   > NEXT: Bohr        (blockquote)
+#   # NEXT: Bohr        (ATX heading)
+#   - NEXT: Bohr        (list bullet — also `*` / `+`)
+#   **NEXT: Bohr**      (bold wrap — also `*`, `_`, `` ` ``)
+# The tolerance is intentionally narrow — a closed enumeration of Markdown shells that consume
+# characters BEFORE ``NEXT:`` and AFTER the token, but never anywhere inside the token itself.
+# Critically, ``#`` is only stripped as a leading heading marker (``# `` or ``## ``, whitespace
+# required) or as an optional ATX close on the outermost line-tail. It is NEVER stripped from
+# elsewhere on the line — a `pr-review owner/repo#7` ref must survive intact (Einstein's design
+# review, principle 3). The extraction is still a single ``findall`` pass (no RAW-vs-normalised
+# double loop) so "which line is the handoff" has one source of truth.
+_MD_LEADING_SHELL = (
+    r"(?:"
+    r"[>#]+\s+"  # blockquote `>` or ATX heading `#`/`##`/... (whitespace REQUIRED after)
+    r"|[-*+]\s+"  # list bullet (whitespace REQUIRED, so a bold `**...**` is not eaten char-by-char)
+    r"|\d+\.\s+"  # ordered list
+    r")*"
+)
+_MD_INLINE_OPEN = r"(?:\*\*|__|\*|_|`)?"
+_MD_INLINE_CLOSE = r"(?:\*\*|__|\*|_|`)?"
+# An ATX heading may end with a run of `#` chars separated from the content by whitespace
+# (``## Heading ##``). We tolerate that shape on the *outermost* tail only, and — because
+# whitespace is required — this never touches a `pr-review ...#7` ref (there is no space
+# between `owner/repo` and `#7`).
+_MD_TRAILING_SHELL = r"(?:\s+#+)?\s*"
+_NEXT_LINE_RE = re.compile(
+    r"^\s*"
+    + _MD_LEADING_SHELL
+    + _MD_INLINE_OPEN
+    + r"\s*NEXT:\s*(?P<token>\S.*?)\s*"
+    + _MD_INLINE_CLOSE
+    + _MD_TRAILING_SHELL
+    + r"$",
+    re.MULTILINE,
+)
 
 # The participant name is the leading run before any whitespace or an opening paren (ASCII or
 # fullwidth CJK): real handoffs carry a trailing gloss after the name, and only the name selects the

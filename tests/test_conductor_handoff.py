@@ -174,3 +174,144 @@ def test_implementer_block_hands_back_to_proposer_and_never_merges() -> None:
 def test_naysayer_block_is_advisory() -> None:
     block = build_handoff_protocol_block(Role.NAYSAYER)
     assert "advisory, not a veto" in block
+
+
+# --------------------------------------------------------------------------- #
+# Layer-2 Markdown tolerance — the *safety* tests come first.
+#
+# Layer 2 is a transitional bridge: an LLM sometimes wraps its final `NEXT:` line in
+# common Markdown noise (blockquote / heading / list bullet / bold), and the parser
+# tolerates a small, closed set of that noise so a well-formed handoff is not lost.
+# It is explicitly a temporary layer — Layer 3 (a structured `next_participant`
+# field on the message) will supersede it and this scaffolding is to be removed
+# then, NOT kept as a permanent legacy fallback. See the Einstein review that
+# authorised this branch (msg on 2026-08-16; the source design message is not
+# reachable from this repo — see the read-back note in the PR body).
+#
+# The order is deliberate: the FIRST tests below pin the invariant that stripping
+# Markdown shell characters (`>` / `#` / `-` / `*` / `+` and the surrounding
+# `**` / `*` / `` ` ``) NEVER damages the payload — most importantly the `#`
+# inside a `pr-review owner/repo#n` ref. This is the concrete bug Einstein
+# flagged in the design review; it is regression-fenced BEFORE any tolerance
+# extension lands, so the tolerance code cannot be written in a way that
+# violates it.
+# --------------------------------------------------------------------------- #
+
+
+class TestPrReviewPayloadSurvivesMarkdownStripping:
+    """`#` in `pr-review owner/repo#n` is payload, not Markdown — never strip it."""
+
+    def test_blockquote_prefixed_pr_review_keeps_the_hash_ref(self) -> None:
+        # `> NEXT: pr-review owner/repo#7` — the blockquote `>` is Markdown shell,
+        # but the `#7` inside the ref is the PR number and must survive intact.
+        h = resolve_handoff("done\n\n> NEXT: pr-review acme/widgets#7", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+
+    def test_heading_prefixed_pr_review_keeps_the_hash_ref(self) -> None:
+        # `# NEXT: pr-review owner/repo#7` — the leading `#` is an ATX heading marker,
+        # but the `#7` INSIDE the ref must not be stripped along with it. The bug
+        # Einstein flagged is a naive `.strip('#')` on the whole line eating both.
+        h = resolve_handoff("done\n\n# NEXT: pr-review acme/widgets#7", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+
+    def test_bold_wrapped_pr_review_keeps_the_hash_ref(self) -> None:
+        # `**NEXT: pr-review owner/repo#7**` — bold wrappers on the shell must not
+        # bleed into the ref.
+        h = resolve_handoff("done\n\n**NEXT: pr-review acme/widgets#7**", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+
+    def test_list_bullet_prefixed_pr_review_keeps_the_hash_ref(self) -> None:
+        h = resolve_handoff("done\n\n- NEXT: pr-review acme/widgets#7", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+
+    def test_pr_review_ref_hash_is_never_treated_as_trailing_punct(self) -> None:
+        # Combined stressor: blockquote + bold + list, still no damage to `#7`.
+        h = resolve_handoff("x\n\n> - **NEXT: pr-review acme/widgets#7**", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+
+    def test_atx_heading_close_after_ref_is_not_stripped_into_the_ref(self) -> None:
+        # An ATX heading may end with a run of `#` (e.g. `## Heading ##`). The tolerance
+        # layer accepts this as *shell*, but on a `pr-review` line the tail `#` is inside
+        # the ref (the `#7`), and there is no separate closing marker — so the parser
+        # must not synthesise one by eating the trailing `#N` of the ref.
+        h = resolve_handoff("y\n\n# NEXT: pr-review acme/widgets#42 #", _ROSTER)
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#42"
+
+
+class TestPersonaHandoffToleratesMarkdownNoise:
+    """A single closed set of Markdown wrappers around the NEXT line is tolerated."""
+
+    def test_blockquote_prefix(self) -> None:
+        assert parse_next_token("body\n\n> NEXT: Heisenberg") == "Heisenberg"
+
+    def test_heading_prefix(self) -> None:
+        # `# NEXT: Bohr` (a bare ATX heading) is a common shape when an LLM stresses
+        # its handoff line for emphasis.
+        assert parse_next_token("body\n\n# NEXT: Bohr") == "Bohr"
+
+    def test_list_bullet_prefix(self) -> None:
+        assert parse_next_token("body\n\n- NEXT: Einstein") == "Einstein"
+        assert parse_next_token("body\n\n* NEXT: Einstein") == "Einstein"
+        assert parse_next_token("body\n\n+ NEXT: Einstein") == "Einstein"
+
+    def test_bold_wrapper(self) -> None:
+        assert parse_next_token("body\n\n**NEXT: Heisenberg**") == "Heisenberg"
+
+    def test_italic_wrapper(self) -> None:
+        assert parse_next_token("body\n\n*NEXT: Heisenberg*") == "Heisenberg"
+
+    def test_inline_code_wrapper(self) -> None:
+        # An LLM often quotes its own protocol literally in backticks.
+        assert parse_next_token("body\n\n`NEXT: Heisenberg`") == "Heisenberg"
+
+    def test_stacked_shell_markers_all_stripped(self) -> None:
+        # blockquote + list + bold, still resolves to the persona.
+        assert parse_next_token("body\n\n> - **NEXT: Bohr**") == "Bohr"
+
+    def test_markdown_wrapped_sentinel_still_resolves(self) -> None:
+        assert resolve_handoff("body\n\n> **NEXT: human**", _ROSTER).kind is HandoffKind.HUMAN
+        assert resolve_handoff("body\n\n- `NEXT: none`", _ROSTER).kind is HandoffKind.NONE
+
+    def test_markdown_wrapped_persona_resolves_case_insensitive(self) -> None:
+        h = resolve_handoff("body\n\n**NEXT: einstein**", _ROSTER)
+        assert h.kind is HandoffKind.ROLE
+        assert h.identity == "Einstein"  # canonical spelling
+
+
+class TestLayer2DoesNotDoubleTheExtractionLoop:
+    """Structural: the extraction stays a single pass (Einstein review, principle 3).
+
+    The tolerance for Markdown shell characters must not be implemented by running the
+    NEXT-scan twice (once RAW, once normalised) — that duplication would give two
+    sources of truth for "which line is the handoff" and let them drift. The regex
+    itself absorbs the shell, so a single ``findall`` still selects the last line.
+    """
+
+    def test_last_wins_still_holds_under_markdown_noise(self) -> None:
+        # An earlier bare `NEXT: human` inside a relayed quote must still lose to the
+        # final wrapped handoff — proof the last-wins scan runs once over the whole
+        # body (not once RAW + once normalised, which could pick different winners).
+        body = (
+            "I am relaying a review that ended with\n"
+            "NEXT: human\n"
+            "\n"
+            "...my reply...\n"
+            "> **NEXT: Bohr**"
+        )
+        assert parse_next_token(body) == "Bohr"
+
+    def test_only_one_next_line_regex_is_exported(self) -> None:
+        # A guard against silently introducing a second parser path. If a future
+        # refactor adds `_NEXT_LINE_RE_NORMALISED` next to `_NEXT_LINE_RE`, this
+        # test forces the change to be conscious — the design review specifically
+        # forbade duplicating the extraction loop.
+        import spirrow_mindwire.conductor.handoff as handoff_mod
+
+        next_line_regexes = [n for n in dir(handoff_mod) if "NEXT_LINE_RE" in n]
+        assert len(next_line_regexes) == 1, next_line_regexes
