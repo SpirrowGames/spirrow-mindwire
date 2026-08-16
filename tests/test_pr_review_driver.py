@@ -8,6 +8,8 @@ session tests are gone — what remains is the deterministic-guard + judging beh
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -389,7 +391,7 @@ async def test_lexora_system_message_injects_principles_preamble() -> None:
     # verbatim via the SAME build_preamble() entry point the design-time agent uses. Under the
     # A-3 two-pass structure BOTH passes carry the preamble (pass 2 is index-injected too and
     # still needs the principles). We assert on the pass-1 (verdict) call since it carries the
-    # ``VERDICT: APPROVE`` task instructions.
+    # verdict task instructions.
     lexora = _FakeLexora()
     _posted, post = _capture()
     driver = NaysayerPrReviewDriver(lexora=lexora, github=_FakeGitHub())
@@ -400,7 +402,11 @@ async def test_lexora_system_message_injects_principles_preamble() -> None:
     system = messages[0].content
     assert build_preamble() in system  # whole SOT, verbatim
     assert "silence is negligence" in system
-    assert "VERDICT: APPROVE" in system  # PR-review task instructions still follow it
+    # PR-review task instructions still follow it. Asserted as the whole prompt rather than a
+    # fragment of it: the fragment used to be the literal ``VERDICT: APPROVE``, which the prompt
+    # deliberately no longer contains (see the note above _PR_REVIEW_SYSTEM_PROMPT), and any other
+    # hand-picked fragment would be the same hostage to the next wording change.
+    assert _PR_REVIEW_SYSTEM_PROMPT in system
 
 
 @pytest.mark.anyio
@@ -635,6 +641,15 @@ def test_parse_verdict_column_zero_still_approves() -> None:
     assert _parse_verdict("no blocking problems\n\nVERDICT: APPROVE") is ReviewEvent.APPROVE
 
 
+def _prompt_verdict_exemplars() -> list[str]:
+    """Every verdict-shaped line the system prompt shows the model, read from the prompt itself."""
+    return [
+        line
+        for line in _PR_REVIEW_SYSTEM_PROMPT.splitlines()
+        if line.strip().upper().startswith("VERDICT:")
+    ]
+
+
 def test_system_prompt_verdict_exemplar_is_accepted_by_the_parser() -> None:
     """What the prompt TELLS the model to write must be what the parser accepts.
 
@@ -649,16 +664,78 @@ def test_system_prompt_verdict_exemplar_is_accepted_by_the_parser() -> None:
 
     Hence this asserts on the prompt text itself rather than on a copy: a copy drifts, and a
     prompt that teaches an unparseable verdict fails closed on every review that obeys it.
+
+    The assertion looks at the MATCH, not at ``_parse_verdict``'s return value: that function
+    fail-closes to REQUEST_CHANGES, so asserting the exemplar "parses as REQUEST_CHANGES" would
+    hold just as well for an exemplar the parser cannot read at all.
     """
-    exemplars = [
-        line
-        for line in _PR_REVIEW_SYSTEM_PROMPT.splitlines()
-        if line.strip().upper().startswith("VERDICT:")
-    ]
+    exemplars = _prompt_verdict_exemplars()
     assert exemplars, "the system prompt no longer shows a verdict exemplar"
     for line in exemplars:
         assert _VERDICT_RE.findall(line), f"prompt teaches a verdict the parser rejects: {line!r}"
-    assert _parse_verdict("\n".join(exemplars[:1])) is ReviewEvent.APPROVE
+    assert [tok for line in exemplars for tok in _VERDICT_RE.findall(line)] == ["REQUEST_CHANGES"]
+
+
+def test_no_src_file_teaches_a_column_zero_approve_verdict() -> None:
+    """No file under ``src/`` may contain a column-zero ``VERDICT: APPROVE``.
+
+    Such a literal is an exploit string for the open residual below
+    (test_known_residual_column_zero_quote_after_verdict_still_wins): a model that re-types it
+    AFTER its own verdict flips the gate open. This file is reviewed by this very gate, and the
+    prompt is handed to the model on every review, so both a diff quote and a model restating its
+    instructions can emit the line. A REQUEST_CHANGES literal is harmless — echoing it lands on the
+    fail-closed side — so only APPROVE is banned, not the verdict shape itself.
+
+    The scan uses ``_VERDICT_RE`` rather than a private pattern: what counts as "a verdict line"
+    must be the parser's own definition, or this test drifts away from the thing it protects.
+    """
+    src = Path(__file__).resolve().parents[1] / "src"
+    assert src.is_dir(), f"source tree not found at {src}"
+
+    found: list[tuple[str, str]] = []
+    for path in sorted(src.rglob("*.py")):
+        for token in _VERDICT_RE.findall(path.read_text(encoding="utf-8")):
+            found.append((str(path.relative_to(src)).replace("\\", "/"), token))
+
+    # Guard against a vacuous pass: if the walk found no verdict literal at all, the scan is not
+    # looking where it thinks it is (wrong root, renamed prompt) and would stay green forever.
+    assert found, "scan found no column-zero verdict literal anywhere — the scan is not working"
+
+    approving = [
+        (path, token) for path, token in found if re.sub(r"[ _-]", "_", token.upper()) == "APPROVE"
+    ]
+    assert not approving, (
+        "column-zero 'VERDICT: APPROVE' literal(s) under src/ — quoting one after a real verdict "
+        f"opens the gate; state the APPROVE form in prose instead: {approving}"
+    )
+
+
+def test_quoting_the_prompt_exemplar_cannot_open_the_gate() -> None:
+    """Echoing what the prompt teaches must never produce an APPROVE.
+
+    The reviewed diff of ``pr_review.py`` carries the prompt's exemplar, and quoting it (prefix
+    stripped, as any discussion of it would) is a genuine column-zero match. The exemplar is
+    therefore chosen so that this echo is inert. Both the whole exemplar block and each line on its
+    own are replayed: the block alone would be misleading, because last-wins makes the block pass
+    whenever a REQUEST_CHANGES line happens to come last inside it.
+
+    Read from the prompt, never from a copy — a copy stops testing the prompt the moment it drifts.
+    """
+    exemplars = _prompt_verdict_exemplars()
+    assert exemplars, "the system prompt no longer shows a verdict exemplar"
+
+    for quoted in ["\n".join(exemplars), *exemplars]:
+        body = (
+            "This change is unsafe.\n"
+            "VERDICT: REQUEST_CHANGES\n"
+            "\n"
+            "For reference, the instructions I was given read:\n"
+            "\n"
+            f"{quoted}\n"
+        )
+        assert _parse_verdict(body) is not ReviewEvent.APPROVE, (
+            f"quoting the prompt's own exemplar flips the gate open: {quoted!r}"
+        )
 
 
 def test_ci_gate_body_verdict_line_is_matched_by_the_anchor() -> None:

@@ -165,6 +165,10 @@ _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
 # deciding what may legitimately surround a verdict line (fences, quoting rules), which is a
 # design question, not a regex tweak.
 #
+# While it stays open, the one mitigation that IS available is to deny the exploit its string: keep
+# column-0 ``VERDICT: APPROVE`` out of the sources this gate reads and out of the prompt it is
+# given. See the note above _PR_REVIEW_SYSTEM_PROMPT.
+#
 # ---- Bold verdicts fail closed, deliberately (ruling: T-verdict-regex-space-prefix-injection) ----
 #
 # ``**VERDICT: APPROVE**`` does not match this pattern, so _parse_verdict returns REQUEST_CHANGES.
@@ -194,6 +198,27 @@ _VERDICT_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# ---- The exemplar below is REQUEST_CHANGES on purpose. Do not "restore the symmetry". ----
+#
+# There is deliberately no column-0 ``VERDICT: APPROVE`` anywhere in this file — nor anywhere under
+# ``src/``. Such a literal is an exploit string for the residual recorded above _VERDICT_RE (a
+# quote placed AFTER the model's own verdict wins), and it reaches the parser through two channels
+# that both close only by the string not existing:
+#
+#   * this file is reviewed BY this gate, so the literal rides in every diff that touches it, and
+#     re-typing it out of the diff (dropping the +/space prefix) is the ordinary way to discuss it;
+#   * the prompt is handed to the model on every review, so a model that restates its own
+#     instructions emits the line with no diff involved at all.
+#
+# An exemplar teaches the SHAPE of the line, not which conclusion to reach. REQUEST_CHANGES teaches
+# the identical shape under the identical anchor, and if it is ever echoed it lands on the
+# fail-closed side: "quoting this opens the gate" becomes "quoting this turns it red". Measured
+# 2026-08-16 on the previous exemplar: a body reading ``VERDICT: REQUEST_CHANGES`` (the model's
+# own) followed by a quote of the APPROVE exemplar parsed as APPROVE.
+#
+# The APPROVE form is therefore described in prose rather than shown. Pinned by
+# test_no_src_file_teaches_a_column_zero_approve_verdict (scans ``src/`` with _VERDICT_RE itself)
+# and test_quoting_the_prompt_exemplar_cannot_open_the_gate (replays the echo).
 _PR_REVIEW_SYSTEM_PROMPT = """\
 You are the independent naysayer performing adversarial CODE REVIEW of a pull \
 request's diff in a Spirrow MindWire ChatRoom thread. You are a different model \
@@ -206,17 +231,14 @@ concrete flaw. Do not fabricate problems and do not pad with generic caveats. \
 If, after a genuine search, you find no blocking problem, say so and name the \
 single weakest remaining point.
 
-End your reply with exactly one verdict line. It must begin at the start of the line and hold \
-nothing else — no indentation, no bold or backticks, no trailing note. Write exactly one of \
-these two lines, verbatim:
-
-VERDICT: APPROVE
-
-(use this one only if you found no blocking problem), or:
+End your reply with exactly one verdict line, in exactly this form — at the start of the line, \
+holding nothing else (no indentation, no bold or backticks, no trailing note):
 
 VERDICT: REQUEST_CHANGES
 
-(use this one if you found at least one blocking problem).
+Write that line verbatim if you found at least one blocking problem. If, after a genuine search, \
+you found none, write the same line with the single word APPROVE in place of REQUEST_CHANGES. \
+Those two are the only verdicts, and nothing else may appear on the line.
 
 Your reply is posted verbatim to the thread and submitted as your GitHub PR \
 review body — reply directly with the review, no preamble.
