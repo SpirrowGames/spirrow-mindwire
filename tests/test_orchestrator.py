@@ -30,6 +30,61 @@ from spirrow_mindwire.value_objects import Role, SessionHandle, ThreadRef
 _TS = datetime(2026, 5, 23, tzinfo=UTC)
 
 
+def _error_envelope(error_type: str, message: str, **details: Any) -> dict[str, Any]:
+    """A failed chatroom call, shaped the way the live far end actually answers.
+
+    **Measured, not imagined** (2026-08-16, ``http://100.79.84.62:8117/mcp``, via
+    :class:`StreamableHttpChatroomMcp` — the same client production uses)::
+
+        chatroom_get_thread(thread_id="T-probe-definitely-not-a-thread-20260816")
+        -> {"error_type": "ChatroomNotFoundError",
+            "error": "Thread '...' not found in project 'spirrow-mindwire'",
+            "details": {"project": "...", "thread_id": "..."}}
+
+        chatroom_open_thread(thread_id=<one that exists>)
+        -> {"error_type": "ChatroomIntegrityError",
+            "error": "Thread '...' already exists in project 'spirrow-mindwire'", ...}
+
+        chatroom_post_message(thread_id=<one that does not>)
+        -> {"error_type": "ChatroomNotFoundError", "error": "Thread '...' not found ...", ...}
+
+    All three come back as an ordinary **success** response carrying an error
+    envelope: ``isError`` is not set, so :func:`parse_tool_result` finds JSON and
+    returns it, and nothing raises. This fake said the opposite -- it raised on an
+    unknown id, with a comment asserting "the far end says so by raising" that had
+    never been checked against the far end. Every test here passed against a
+    contract that does not exist, which is why 27 green tests did not notice that
+    the gate refused every PR without a pre-existing ledger thread.
+
+    ``chatroom_open_thread``'s own MCP docstring states the real contract in as
+    many words: *"On success: {...}. On failure: conclair error envelope
+    {"error_type": ...}"*.
+    """
+    return {"error_type": error_type, "error": message, "details": dict(details)}
+
+
+def _not_found(arguments: dict[str, Any]) -> dict[str, Any]:
+    """The envelope conclair returns for a thread id that is not there."""
+    thread_id = arguments["thread_id"]
+    project = arguments["project"]
+    return _error_envelope(
+        "ChatroomNotFoundError",
+        f"Thread '{thread_id}' not found in project '{project}'",
+        project=project,
+        thread_id=thread_id,
+    )
+
+
+def _already_exists(thread_id: str, project: str = "p") -> dict[str, Any]:
+    """The envelope conclair returns when ``chatroom_open_thread`` hits a taken id."""
+    return _error_envelope(
+        "ChatroomIntegrityError",
+        f"Thread '{thread_id}' already exists in project '{project}'",
+        project=project,
+        thread_id=thread_id,
+    )
+
+
 class _FakeMcp:
     """Records call_tool invocations; returns programmed results by tool name."""
 
@@ -45,15 +100,14 @@ class _FakeMcp:
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         self.calls.append((name, arguments))
         if name in self._raise_on:
+            # Reserved for what really does raise: a transport failure, which the
+            # client wraps in MagickitMcpError before any payload exists. A refusal
+            # by conclair is not that -- it arrives as a payload (see _error_envelope).
             raise self._raise_on[name]
         if name == "chatroom_get_thread" and name not in self._results:
-            # A thread nobody programmed is a thread that is not there, and the
-            # far end says so by raising -- it has no success response that omits
-            # the thread. Returning `{}` here made "absent" and "unreadable" look
-            # alike to the caller, which is the confusion under test below.
-            raise MagickitMcpError(
-                f"Thread '{arguments['thread_id']}' not found in project '{arguments['project']}'"
-            )
+            # A thread nobody programmed is a thread that is not there, and the far end
+            # says so with an envelope inside a success response, not by raising.
+            return _not_found(arguments)
         result = self._results.get(name, {})
         # A programmed result may be a callable so one fake can answer
         # `chatroom_get_thread` differently per thread_id (which is the whole
@@ -166,7 +220,11 @@ def _thread_payload(pr_ref: str, *, title: str | None = None) -> dict[str, Any]:
 def _existing_threads(
     threads: dict[str, dict[str, Any]],
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    """A ``chatroom_get_thread`` stub: known ids answer, unknown ids 404 like conclair.
+    """A ``chatroom_get_thread`` stub: known ids answer, unknown ids answer like conclair.
+
+    "Like conclair" used to mean *raising* on an unknown id. It does not: the far
+    end returns a :func:`_error_envelope` inside a success response, and the
+    difference is the whole of the regression this stub failed to catch.
 
     ``mode`` is answered the way conclair answers it (``api/threads.py``): a
     ``summary`` of a **resolved** thread carries only its ``decide`` msgs, and
@@ -180,9 +238,7 @@ def _existing_threads(
     def _get(arguments: dict[str, Any]) -> dict[str, Any]:
         thread_id = arguments["thread_id"]
         if thread_id not in threads:
-            raise MagickitMcpError(
-                f"Thread '{thread_id}' not found in project '{arguments['project']}'"
-            )
+            return _not_found(arguments)
         payload = threads[thread_id]
         thread: dict[str, Any] = payload.get("thread", {})
         if arguments.get("mode") != "summary" or thread.get("status") != "resolved":
@@ -201,17 +257,13 @@ async def test_a_re_review_posts_into_the_existing_thread_without_reopening_it()
     it anyway -- to be told "already exists", then re-reading the same thread to
     learn whose it is -- spends three round-trips to relearn the first answer, and
     makes every re-review indistinguishable from the race the handler exists for.
-    The ``raise_on`` below is what the far end would say if the open were
-    attempted; the point of the test is that it never is.
+    The programmed ``chatroom_open_thread`` refusal below is what the far end would
+    say if the open were attempted; the point of the test is that it never is.
     """
     mcp = _FakeMcp(
         results={
-            "chatroom_get_thread": _existing_threads({"T-pr-review-r-7": _thread_payload("o/r#7")})
-        },
-        raise_on={
-            "chatroom_open_thread": MagickitMcpError(
-                "Thread 'T-pr-review-r-7' already exists in project 'p'"
-            )
+            "chatroom_get_thread": _existing_threads({"T-pr-review-r-7": _thread_payload("o/r#7")}),
+            "chatroom_open_thread": _already_exists("T-pr-review-r-7"),
         },
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
@@ -373,12 +425,8 @@ async def test_the_same_pr_spelled_with_different_case_is_not_a_collision() -> N
                         "SpirrowGames/Spirrow-VoxelWorld#12"
                     )
                 }
-            )
-        },
-        raise_on={
-            "chatroom_open_thread": MagickitMcpError(
-                "Thread 'T-pr-review-spirrow-voxelworld-12' already exists in project 'p'"
-            )
+            ),
+            "chatroom_open_thread": _already_exists("T-pr-review-spirrow-voxelworld-12"),
         },
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
@@ -405,11 +453,9 @@ async def test_a_thread_that_appears_between_resolve_and_open_is_not_written_int
             return await super().review(pr, post_critique=post_critique)
 
     mcp = _FakeMcp(
-        results={"chatroom_get_thread": _existing_threads(threads)},
-        raise_on={
-            "chatroom_open_thread": MagickitMcpError(
-                "Thread 'T-pr-review-r-9' already exists in project 'p'"
-            )
+        results={
+            "chatroom_get_thread": _existing_threads(threads),
+            "chatroom_open_thread": _already_exists("T-pr-review-r-9"),
         },
     )
     orch = PrReviewOrchestrator(mcp, driver=_RacingDriver())  # type: ignore[arg-type]
@@ -436,11 +482,9 @@ async def test_a_race_that_opens_this_prs_own_thread_is_still_swallowed() -> Non
             return await super().review(pr, post_critique=post_critique)
 
     mcp = _FakeMcp(
-        results={"chatroom_get_thread": _existing_threads(threads)},
-        raise_on={
-            "chatroom_open_thread": MagickitMcpError(
-                "Thread 'T-pr-review-r-9' already exists in project 'p'"
-            )
+        results={
+            "chatroom_get_thread": _existing_threads(threads),
+            "chatroom_open_thread": _already_exists("T-pr-review-r-9"),
         },
     )
     orch = PrReviewOrchestrator(mcp, driver=_SamePrRacingDriver())  # type: ignore[arg-type]
@@ -713,6 +757,140 @@ async def test_a_resolved_thread_is_still_identified_by_its_opening_request() ->
     assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-r-7"
     # Resolving found the thread, so there is nothing to open (the re-review path).
     assert all(name != "chatroom_open_thread" for name, _ in mcp.calls)
+
+
+# ---------- conclair reports failure in the payload, not by raising ---------- #
+
+
+@pytest.mark.anyio
+async def test_a_thread_that_is_not_there_is_absent_not_unidentifiable() -> None:
+    """The regression, at the smallest scale it can be pinned.
+
+    ``chatroom_get_thread`` on an id that does not exist answers with an error
+    envelope inside a success response. Read as a thread payload it has no
+    ``"thread"`` key, so the title and the opener are both empty, no PR parses out
+    of either, and the answer is ``exists=True, pr=None`` -- "occupied by something
+    unreadable", the one answer that blocks the qualified id.
+
+    The envelope below is a verbatim copy of what the live server returned on
+    2026-08-16, ``details`` included.
+    """
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": lambda args: {
+                "error_type": "ChatroomNotFoundError",
+                "error": (
+                    "Thread 'T-pr-review-spirrow-magickit-22' not found "
+                    "in project 'spirrow-mindwire'"
+                ),
+                "details": {
+                    "project": "spirrow-mindwire",
+                    "thread_id": "T-pr-review-spirrow-magickit-22",
+                },
+            }
+        }
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    subject = await orch._thread_subject(
+        project="spirrow-mindwire", thread_id="T-pr-review-spirrow-magickit-22"
+    )
+    assert subject.exists is False
+    assert subject.pr is None
+
+
+@pytest.mark.anyio
+async def test_a_pr_with_no_ledger_thread_anywhere_still_gets_gated() -> None:
+    """What the regression actually cost: no *new* PR could be reviewed at all.
+
+    Nothing exists at the qualified id or the legacy one, which is the state of
+    every PR the first time its gate fires. Reading "not there" as "there but
+    unreadable" turned that into a hard refusal before the review ran, so the gate
+    worked only for PRs that already had a ledger thread -- i.e. only for the ones
+    it had already reviewed under the previous scheme. It first fired for real on
+    ``SpirrowGames/spirrow-magickit#22``, whose thread had to be opened by hand
+    before the Tier-B review could be run at all.
+    """
+    mcp = _FakeMcp()  # every chatroom_get_thread answers "not found"
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    ref, _ = await orch.fire_pr_review(
+        project="spirrow-mindwire", pr_ref="SpirrowGames/spirrow-magickit#22"
+    )
+    assert ref.thread_id == "T-pr-review-spirrow-magickit-22"
+    assert driver.reviewed == [PrRef("SpirrowGames", "spirrow-magickit", 22)]
+    opened = mcp.args_for("chatroom_open_thread")
+    assert opened["thread_id"] == "T-pr-review-spirrow-magickit-22"
+    assert mcp.args_for("chatroom_post_message")["thread_id"] == ("T-pr-review-spirrow-magickit-22")
+
+
+@pytest.mark.anyio
+async def test_an_open_that_was_refused_is_not_treated_as_an_open() -> None:
+    """A refused open must not be read as success just because it did not raise.
+
+    Only "already exists" is idempotent. Any other refusal arrives the same way --
+    an envelope in a success response -- so before it was recognised, *every*
+    refusal was swallowed here, and the run went on to post a critique into a
+    thread that had never been created.
+    """
+    mcp = _FakeMcp(
+        results={
+            "chatroom_open_thread": _error_envelope(
+                "ChatroomValidationError",
+                "owner 'orchestrator' is not a registered identity in project 'p'",
+                project="p",
+            )
+        }
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    with pytest.raises(MagickitMcpError, match="ChatroomValidationError"):
+        await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    assert all(name != "chatroom_post_message" for name, _ in mcp.calls)
+
+
+class _SubmittingDriver(_FakeDriver):
+    """Posts the critique, then submits the GitHub review — the real driver's order.
+
+    ``NaysayerPrReviewDriver.review`` awaits ``post_critique`` and *then*
+    ``_submit_review``, deliberately: the human should see the critique even if the
+    submission fails. That ordering is only safe while a failed post is loud.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.submitted = False
+
+    async def review(self, pr: PrRef, *, post_critique: PostCritique) -> PrReviewOutcome:
+        outcome = await super().review(pr, post_critique=post_critique)
+        self.submitted = True
+        return outcome
+
+
+@pytest.mark.anyio
+async def test_a_critique_that_never_reached_the_thread_stops_the_review() -> None:
+    """A refused post must not be reported as a posted critique.
+
+    ``chatroom_post_message`` into a thread that is not there answers with the same
+    kind of envelope as the read (measured 2026-08-16). Read as success, the driver
+    proceeded to submit the GitHub review -- leaving a verdict on the PR with no
+    critique in any ledger, and a run that reported itself clean. The gate's whole
+    value is that the reasoning is on the record next to the verdict.
+    """
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads({"T-pr-review-r-7": _thread_payload("o/r#7")}),
+            "chatroom_post_message": _error_envelope(
+                "ChatroomNotFoundError",
+                "Thread 'T-pr-review-r-7' not found in project 'p'",
+                project="p",
+                thread_id="T-pr-review-r-7",
+            ),
+        }
+    )
+    driver = _SubmittingDriver()
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    with pytest.raises(MagickitMcpError, match="ChatroomNotFoundError"):
+        await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    assert driver.submitted is False
 
 
 @pytest.mark.anyio
