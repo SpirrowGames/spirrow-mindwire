@@ -134,6 +134,21 @@ class CiState(StrEnum):
     UNKNOWN = "unknown"
 
 
+# GraphQL ``StatusState`` → :class:`CiState`, for the fallback read. Only SUCCESS
+# maps to green; ERROR joins FAILURE and EXPECTED joins PENDING (a check that is
+# expected but has not reported is exactly "not confirmed green yet"). Anything
+# absent from this table — including a null rollup — falls to UNKNOWN via the
+# caller's ``.get`` default, so a new enum member added upstream fails closed
+# rather than being silently read as green.
+_GRAPHQL_ROLLUP_STATES: dict[str, CiState] = {
+    "SUCCESS": CiState.SUCCESS,
+    "FAILURE": CiState.FAILURE,
+    "ERROR": CiState.FAILURE,
+    "PENDING": CiState.PENDING,
+    "EXPECTED": CiState.PENDING,
+}
+
+
 @dataclass(frozen=True)
 class CiStatus:
     """CI status for a PR head SHA (ADR-16 L1 / L4)."""
@@ -349,6 +364,82 @@ class GitHubClient:
         return resp.text
 
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
+        """Aggregate CI state for the PR head SHA — REST first, GraphQL as fallback.
+
+        The REST path (:meth:`_fetch_ci_status_rest`) stays primary: it is the only
+        one that can name the *failing* runs, which the REQUEST_CHANGES body cites.
+        The GraphQL rollup is tried only when REST cannot answer (UNKNOWN).
+
+        **Why a fallback exists at all.** Measured 2026-08-17 on
+        ``SpirrowGames/spirrow-mindwire`` (private): ``GET /actions/runs`` returns
+        403 for the review PAT and 404 for a classic ``repo``-scope token, while on
+        the *same* repo with the *same* tokens ``GET /actions/workflows`` (identical
+        ``actions=read``) and ``GET /contents/{path}`` both return 200. Two tokens
+        with different grants failing on the same endpoint set is not a permission
+        gap — the grants are demonstrably live — so widening the review identity
+        does not fix it. GraphQL's ``statusCheckRollup`` answers for the same head
+        SHA with the same token.
+
+        Fail-closed either way (ADR-16 D-1): if both paths are unusable the state
+        stays UNKNOWN and the naysayer withholds APPROVE.
+        """
+        rest = await self._fetch_ci_status_rest(pr)
+        if rest.state is not CiState.UNKNOWN:
+            return rest
+        graph = await self._fetch_ci_status_graphql(pr)
+        # Equally UNKNOWN: keep REST's, which may carry a head_sha GraphQL missed.
+        return rest if graph.state is CiState.UNKNOWN else graph
+
+    async def _fetch_ci_status_graphql(self, pr: PrRef) -> CiStatus:
+        """``statusCheckRollup`` for the PR's head commit (the fallback path).
+
+        Requests **only** the rollup ``state`` and the head SHA. The per-check
+        ``contexts`` are omitted rather than requested-and-ignored: asking for them
+        returns partial data plus a ``FORBIDDEN`` error entry on exactly the private
+        repos this fallback exists for, and a half-error response is a worse thing
+        to parse than one that never asked.
+
+        The cost is real and stated: this path cannot name the failing checks, so
+        :attr:`CiStatus.failing` is always empty here and a FAILURE body says "one
+        or more checks" instead of listing them. The verdict is unaffected.
+        """
+        query = (
+            "query($owner:String!,$name:String!,$number:Int!){"
+            "repository(owner:$owner,name:$name){"
+            "pullRequest(number:$number){headRefOid "
+            "commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}"
+        )
+        variables: dict[str, Any] = {"owner": pr.owner, "name": pr.repo, "number": pr.number}
+        try:
+            resp = await self._client.post(
+                "/graphql", json={"query": query, "variables": variables}
+            )
+        except httpx.RequestError as exc:
+            logger.warning("fetch_ci_status(graphql): %s (fail-closed UNKNOWN)", exc)
+            return CiStatus(state=CiState.UNKNOWN, head_sha=None, failing=[])
+        if resp.status_code >= 400:
+            logger.warning(
+                "fetch_ci_status(graphql): -> %s (fail-closed UNKNOWN)", resp.status_code
+            )
+            return CiStatus(state=CiState.UNKNOWN, head_sha=None, failing=[])
+        try:
+            pull = resp.json()["data"]["repository"]["pullRequest"]
+            head_sha = pull["headRefOid"]
+            nodes = pull["commits"]["nodes"]
+            rollup = nodes[0]["commit"]["statusCheckRollup"] if nodes else None
+            state = rollup["state"] if rollup else None
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            logger.warning("fetch_ci_status(graphql): cannot parse: %s (fail-closed)", exc)
+            return CiStatus(state=CiState.UNKNOWN, head_sha=None, failing=[])
+        # A PR with no checks has a null rollup — "cannot confirm green", the same
+        # answer the REST path gives for a head SHA with no runs.
+        return CiStatus(
+            state=_GRAPHQL_ROLLUP_STATES.get(str(state), CiState.UNKNOWN),
+            head_sha=str(head_sha) if head_sha else None,
+            failing=[],
+        )
+
+    async def _fetch_ci_status_rest(self, pr: PrRef) -> CiStatus:
         """Aggregate the PR head SHA's GitHub Actions CI state (ADR-16 L1 / §D-4).
 
         Two reads: ``GET /pulls/{n}`` for the head SHA, then
@@ -386,8 +477,15 @@ class GitHubClient:
             logger.warning("fetch_ci_status: GET %s failed: %s (fail-closed)", runs_path, exc)
             return CiStatus(state=CiState.UNKNOWN, head_sha=head_sha, failing=[])
         if resp.status_code >= 400:
+            # Deliberately does NOT say "check Actions:read on the token" any more.
+            # It said that, and on 2026-08-17 it cost hours: the review PAT *had*
+            # `Actions: Read-only`, and it was live (`GET /actions/workflows`, the
+            # same permission, returned 200 on the same repo with the same token).
+            # A log line that names one cause for a symptom with several is worse
+            # than one that names none — so this one reports what happened and
+            # leaves the diagnosis to the reader.
             logger.warning(
-                "fetch_ci_status: GET %s -> %s (fail-closed; check Actions:read on the token)",
+                "fetch_ci_status: GET %s -> %s (fail-closed; trying the GraphQL rollup)",
                 runs_path,
                 resp.status_code,
             )
