@@ -410,3 +410,130 @@ async def test_no_token_omits_auth_header(monkeypatch: pytest.MonkeyPatch) -> No
     async with _client(handler, token=None) as client:
         await client.fetch_pr_diff(_PR)
     assert seen["auth"] is None
+
+
+# ---------- fetch_ci_status: GraphQL fallback ----------------------------- #
+#
+# Measured 2026-08-17 on a private repo: `GET /actions/runs` is 403 for the
+# review PAT and 404 for a classic `repo`-scope token, while `GET
+# /actions/workflows` (the same `actions=read`) and `GET /contents/{path}` are
+# 200 for both. Two tokens with different grants failing on the same endpoint
+# set is not a permission gap, so the driver needs a second way to ask.
+
+
+def _ci_handler_with_graphql(
+    *,
+    calls: list[str],
+    head_sha: str = "sha1",
+    runs: list[dict[str, Any]] | None = None,
+    runs_status: int = 200,
+    rollup_state: str | None = "SUCCESS",
+    graphql_status: int = 200,
+    graphql_head: str | None = "gsha",
+) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        calls.append(path)
+        if path.endswith("/graphql"):
+            if graphql_status != 200:
+                return httpx.Response(graphql_status, json={"message": "graphql error"})
+            rollup = None if rollup_state is None else {"state": rollup_state}
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "headRefOid": graphql_head,
+                                "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]},
+                            }
+                        }
+                    }
+                },
+            )
+        if path.endswith(f"/pulls/{_PR.number}"):
+            return httpx.Response(200, json={"head": {"sha": head_sha}})
+        if path.endswith("/actions/runs"):
+            if runs_status != 200:
+                return httpx.Response(runs_status, json={"message": "runs error"})
+            return httpx.Response(200, json={"workflow_runs": runs if runs is not None else []})
+        return httpx.Response(500, json={"message": f"unexpected {path}"})
+
+    return handler
+
+
+@pytest.mark.anyio
+async def test_graphql_fallback_answers_when_rest_is_forbidden() -> None:
+    calls: list[str] = []
+    async with _client(
+        _ci_handler_with_graphql(calls=calls, runs_status=403, rollup_state="SUCCESS")
+    ) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.SUCCESS
+    assert st.head_sha == "gsha"
+    # The fallback cannot name checks; that cost is accepted, not hidden.
+    assert st.failing == []
+    assert any(p.endswith("/graphql") for p in calls)
+
+
+@pytest.mark.anyio
+async def test_rest_success_does_not_consult_graphql() -> None:
+    # REST stays primary: it is the only path that can name failing runs.
+    calls: list[str] = []
+    async with _client(
+        _ci_handler_with_graphql(calls=calls, runs=[_run()], rollup_state="FAILURE")
+    ) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.SUCCESS
+    assert not any(p.endswith("/graphql") for p in calls)
+
+
+@pytest.mark.anyio
+async def test_rest_failure_is_kept_with_its_check_names() -> None:
+    calls: list[str] = []
+    async with _client(
+        _ci_handler_with_graphql(
+            calls=calls, runs=[_run(name="test", conclusion="failure")], rollup_state="SUCCESS"
+        )
+    ) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.FAILURE
+    assert st.failing == ["test"]
+    # A REST answer is never overridden by the fallback — least of all a red one
+    # by a green one.
+    assert not any(p.endswith("/graphql") for p in calls)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("rollup", "expected"),
+    [
+        ("SUCCESS", CiState.SUCCESS),
+        ("FAILURE", CiState.FAILURE),
+        ("ERROR", CiState.FAILURE),
+        ("PENDING", CiState.PENDING),
+        ("EXPECTED", CiState.PENDING),
+        # Unknown / future enum member → fail-closed, never green.
+        ("SOMETHING_NEW", CiState.UNKNOWN),
+        (None, CiState.UNKNOWN),  # null rollup = no checks at all
+    ],
+)
+async def test_graphql_rollup_state_mapping(rollup: str | None, expected: CiState) -> None:
+    calls: list[str] = []
+    async with _client(
+        _ci_handler_with_graphql(calls=calls, runs_status=403, rollup_state=rollup)
+    ) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is expected
+
+
+@pytest.mark.anyio
+async def test_both_paths_unusable_stays_unknown_and_keeps_rest_head_sha() -> None:
+    calls: list[str] = []
+    async with _client(
+        _ci_handler_with_graphql(calls=calls, head_sha="abc", runs_status=403, graphql_status=403)
+    ) as client:
+        st = await client.fetch_ci_status(_PR)
+    assert st.state is CiState.UNKNOWN
+    # REST reached the PR (so it knows the head) even though it could not read runs.
+    assert st.head_sha == "abc"
