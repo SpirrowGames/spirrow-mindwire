@@ -939,3 +939,125 @@ def test_default_system_prompt_includes_implementer_handoff_protocol() -> None:
     assert "Conductor handoff protocol" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
     assert "NEXT:" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
     assert "never merge" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
+
+
+# --------------------------------------------------------------------------- #
+# Quoted-heredoc payloads are DATA, not shell.
+#
+# The system prompt above tells the implementer to write PR bodies and commit
+# messages through a heredoc (`gh pr create --body-file -` "reads the body from
+# stdin, so a heredoc needs no file at all"). Those bodies are Markdown, and
+# Markdown uses backticks — which opened the indirection gate, after which the
+# coarse floor keyword-matched the prose. Measured 2026-08-17: four conductor
+# runs died this way, one of them quoting the human's own instruction NOT to
+# delete a file.
+#
+# The masking rule is shell semantics, not a heuristic: with a QUOTED delimiter
+# (`<<'EOF'`) the shell expands nothing in the body, so backticks and `$(...)`
+# there cannot be indirection. It applies only when the command consuming stdin
+# is a known data sink, so an interpreter (`bash <<'EOF'`) still has its body
+# read as the script it is.
+# --------------------------------------------------------------------------- #
+
+
+def _commit(body: str, *, delim: str = "'EOF'", sink: str = "git commit -F -") -> str:
+    return f"{sink} <<{delim}\n{body}\nEOF"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The two production shapes, verbatim in spirit.
+        "Einstein's message also asks me to `git rm` the spec file. Not doing it.",
+        "Kept per the human's directive (`Step 0 の .md を今 git rm しないこと`).",
+        # A thread name is enough: `-delete\b` matches inside T-fs-delete-path-scope.
+        "restorability belongs to a separate gate (T-fs-delete-path-scope).",
+        # An indented Markdown code block is not a command either.
+        "Example in the docs:\n\n    rm -rf build/\n",
+        # Every other Tier C verb the floor knows, as prose.
+        "Do not `git push --force` here.",
+        "We avoid `git rebase` on shared branches.",
+        "`Remove-Item` is the PowerShell spelling.",
+    ],
+)
+def test_quoted_heredoc_prose_is_not_a_deletion(body: str) -> None:
+    action = classify_tool_call("Bash", {"command": _commit(body)})
+    assert action.operation is Operation.GIT_COMMIT, action
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        "git commit -F -",
+        "git tag -a v1 -F -",
+        "gh pr create --body-file -",
+        "gh pr edit 1 --body-file -",
+        "gh issue comment 1 --body-file -",
+        "make lint && git commit -F -",
+    ],
+)
+def test_masking_applies_to_each_data_sink(sink: str) -> None:
+    action = classify_tool_call(
+        "Bash", {"command": _commit("mentions `rm -rf` in prose", sink=sink)}
+    )
+    assert action.operation is not Operation.FS_DELETE, action
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # The consumer is an interpreter: the body IS the script.
+        "bash <<'EOF'\nrm -rf /tmp/x\nEOF",
+        "sh <<'EOF'\nrm -rf /tmp/x\nEOF",
+        # Unquoted delimiter: the shell expands the body, so it is not inert.
+        "git commit -F - <<EOF\nrm -rf /tmp/x\nEOF",
+        # Not a known sink — unchanged behaviour.
+        "tee out.txt <<'EOF'\nrm -rf /tmp/x\nEOF",
+        # No terminator: we cannot tell where the payload stops.
+        "git commit -F - <<'EOF'\nrm -rf /tmp/x\n",
+        # Outside the body, before and after the heredoc.
+        "git commit -F - <<'EOF'\nprose\nEOF\nrm -rf /tmp/x",
+        "rm -rf /tmp/x && git commit -F - <<'EOF'\nprose\nEOF",
+    ],
+)
+def test_real_deletions_still_denied(cmd: str) -> None:
+    assert classify_tool_call("Bash", {"command": cmd}).operation is Operation.FS_DELETE
+
+
+@pytest.mark.parametrize("cmd", ["git rm foo.txt", "git rm -r foo"])
+def test_known_gap_bare_git_rm_is_not_classified_as_a_deletion(cmd: str) -> None:
+    """PRE-EXISTING and NOT fixed here — pinned so it is visible, not implied.
+
+    ``_classify_git`` has no ``rm`` case, so a bare ``git rm`` is only ever
+    caught by the coarse floor, and the floor only runs when indirection is
+    present. Verified identical on the parent commit: this is not a consequence
+    of the masking above, which never touches a command line.
+
+    The shape of the day this was measured: four conductor runs died on prose
+    that *mentioned* ``git rm``, while ``git rm`` itself passed unclassified.
+    Closing it belongs to the restorability model in
+    ``T-fs-delete-path-scope`` — deciding whether a tracked, committed file is
+    safe to delete is exactly that thread's question, not this one's.
+    """
+    assert classify_tool_call("Bash", {"command": cmd}).operation is not Operation.FS_DELETE
+
+
+def test_surviving_denial_reports_the_real_command_and_offset() -> None:
+    # The mask is length-preserving so a denial that survives it still points at
+    # the true position in the true command — the record must never quote the
+    # masked copy.
+    cmd = "git commit -F - <<'EOF'\nharmless prose\nEOF\nrm -rf /tmp/x"
+    action = classify_tool_call("Bash", {"command": cmd})
+    assert action.operation is Operation.FS_DELETE
+    assert "harmless prose" in action.detail or action.detail in cmd
+
+
+def test_gate_still_opens_so_the_floor_can_see_the_command_line() -> None:
+    # The gate reads the ORIGINAL command and the floor reads the masked one.
+    # Masking the gate as well would shut it here — the only indirection is the
+    # Markdown backtick in the body — and the `git rm` on the command line would
+    # then go unseen, which is a denial the unfixed code did make.
+    cmd = _commit("see `x` for detail", sink="git rm -r foo && git commit -F -")
+    action = classify_tool_call("Bash", {"command": cmd})
+    assert action.indirection_gate is True, action
+    assert action.operation is Operation.FS_DELETE, action

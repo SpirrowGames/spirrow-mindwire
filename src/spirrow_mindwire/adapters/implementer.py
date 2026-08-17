@@ -643,6 +643,97 @@ _RAW_COARSE: tuple[tuple[re.Pattern[str], Operation], ...] = (
 )
 
 
+# Commands whose stdin is DATA, never a script. Deliberately an ALLOW-list of
+# sinks rather than a DENY-list of interpreters, because the two fail in opposite
+# directions: forgetting an interpreter (``perl`` / ``node`` / ``xargs sh``) would
+# hide a real command from the floor, while forgetting a sink only leaves that
+# sink as over-strict as it is today. Only the safe omission is possible here.
+#
+# Matched against the LEADING tokens of the command that owns the heredoc, so
+# ``gh pr create`` does not also license ``gh pr merge``.
+_HEREDOC_DATA_SINKS: tuple[tuple[str, ...], ...] = (
+    ("git", "commit"),
+    ("git", "tag"),
+    ("git", "notes"),
+    ("gh", "pr", "create"),
+    ("gh", "pr", "edit"),
+    ("gh", "pr", "comment"),
+    ("gh", "issue", "create"),
+    ("gh", "issue", "comment"),
+    ("gh", "issue", "edit"),
+    ("gh", "release", "create"),
+)
+
+# A heredoc opener whose delimiter is QUOTED (``<<'EOF'`` / ``<<"EOF"``). The
+# quoting is the load-bearing part, not a stylistic detail: with a quoted
+# delimiter the shell performs **no** expansion inside the body, so ``$(...)`` and
+# backticks there are literal text and cannot be indirection. An UNQUOTED
+# ``<<EOF`` body IS expanded, so it is never masked.
+_QUOTED_HEREDOC_RE = re.compile(r"<<-?\s*(['\"])(?P<delim>[^'\"\s]+)\1")
+
+
+def _heredoc_owner_tokens(prefix: str) -> list[str] | None:
+    """Leading tokens of the command that opens a heredoc, or ``None`` if unknown.
+
+    ``prefix`` is everything before the ``<<`` marker. Only the last segment
+    matters (``make x && git commit -F - <<'EOF'`` is owned by ``git commit``), so
+    the prefix is cut at the last shell separator. Returns ``None`` when the
+    segment cannot be tokenised — the caller then declines to mask, which is the
+    fail-closed direction.
+    """
+    segment = re.split(r"(?:\|\||&&|[;|&])", prefix)[-1]
+    try:
+        return shlex.split(segment, posix=True)
+    except ValueError:
+        return None
+
+
+def _mask_quoted_heredoc_payloads(command: str) -> str:
+    """Blank out quoted-heredoc bodies that are DATA for a known sink.
+
+    Returns ``command`` with those body characters replaced by spaces. Length and
+    newline positions are preserved so ``match_offset`` / ``match_line`` on any
+    surviving denial still point at the real place in the real command.
+
+    This is what separates "the command deletes" from "the command writes a file
+    that mentions deleting" — the distinction :func:`_scan_raw_coarse` was already
+    instrumented to record. Nothing outside a masked body changes, so the command
+    line itself (including the sink invocation and anything after the terminator)
+    is scanned exactly as before.
+
+    Declines to mask — leaving today's behaviour — whenever anything is unclear:
+    an unquoted delimiter, an owner it cannot tokenise, an owner that is not a
+    known data sink, or a body with no terminator line.
+    """
+    out = command
+    for match in _QUOTED_HEREDOC_RE.finditer(command):
+        tokens = _heredoc_owner_tokens(command[: match.start()])
+        if tokens is None:
+            continue
+        if not any(
+            len(tokens) >= len(sink) and tuple(tokens[: len(sink)]) == sink
+            for sink in _HEREDOC_DATA_SINKS
+        ):
+            continue
+        body_start = command.find("\n", match.end())
+        if body_start == -1:
+            continue
+        body_start += 1
+        # ``<<-`` permits leading tabs before the terminator; plain ``<<`` does not.
+        allow_indent = command[match.start() : match.start() + 3].startswith("<<-")
+        terminator = re.compile(
+            (r"^[ \t]*" if allow_indent else r"^") + re.escape(match.group("delim")) + r"[ \t]*$",
+            re.MULTILINE,
+        )
+        end = terminator.search(command, body_start)
+        if end is None:
+            # Unterminated: we cannot tell where the payload stops, so scan it all.
+            continue
+        body = command[body_start : end.start()]
+        out = out[:body_start] + re.sub(r"[^\n]", " ", body) + out[end.start() :]
+    return out
+
+
 def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
     """Coarse raw-string scan for Tier C verbs (defence-in-depth, deny-only).
 
@@ -695,13 +786,22 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     """
     if _depth > _MAX_INDIRECTION_DEPTH:
         return ClassifiedAction(Operation.UNKNOWN, detail=command)
-    parts = [p.strip() for p in _BASH_SEP.split(command) if p.strip()]
+    # A quoted heredoc body bound for a data sink is text the shell hands over
+    # verbatim; it is never executed. Blank it before ANY pass reads it, because
+    # every pass otherwise mis-reads prose as shell: the structural split treats a
+    # body line as its own command, ``_extract_substitutions`` reads a Markdown
+    # code span as command substitution, and the coarse floor keyword-matches the
+    # message text. Masking once here keeps all three consistent. Only at depth 0:
+    # an extracted inner command is already shell, and masking it again could hide
+    # a real command inside a crafted payload.
+    scanned = _mask_quoted_heredoc_payloads(command) if _depth == 0 else command
+    parts = [p.strip() for p in _BASH_SEP.split(scanned) if p.strip()]
     if not parts:
         return ClassifiedAction(Operation.EXEC_CODE, detail=command)
     actions = [_classify_single_bash(p, _depth) for p in parts]
     # Command substitutions ($(...) / backticks) anywhere in the raw command are
     # inner commands too — recurse into each (same classifier, depth-bounded).
-    actions += [_classify_bash(inner, _depth + 1) for inner in _extract_substitutions(command)]
+    actions += [_classify_bash(inner, _depth + 1) for inner in _extract_substitutions(scanned)]
 
     switches_to_main = any(
         a.operation is Operation.EXEC_CODE
@@ -716,12 +816,29 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     # Coarse defence-in-depth floor: only when indirection is present, and only if
     # at least as dangerous as the structural verdict — so it can ADD a denial the
     # tokenizer missed, never downgrade one (see _RAW_COARSE).
+    #
+    # Two separate questions, deliberately not sharing an input:
+    #
+    #   may the floor run?  -> the ORIGINAL command. The gate is an eligibility
+    #       test and the floor can only ADD a denial, so opening it more often is
+    #       the safe direction. Masking it instead cost a real denial: in
+    #       ``git rm -r foo && git commit -F - <<'EOF' ...`x`... EOF`` the only
+    #       indirection is the Markdown backtick in the body, so a masked gate
+    #       shuts and the `git rm` on the command line goes unseen.
+    #   what may it read?   -> the MASKED command, because a quoted heredoc
+    #       payload is data the shell hands to a sink verbatim. Measured
+    #       2026-08-17: reading it killed four conductor runs on commit messages
+    #       that merely *mentioned* deleting — one quoting the human's own
+    #       instruction not to delete.
     gate_open = bool(_INDIRECTION_RE.search(command))
     if gate_open:
-        coarse = _scan_raw_coarse(command)
+        coarse = _scan_raw_coarse(scanned)
         if coarse is not None and _DANGER_RANK.get(coarse.operation, 0) >= _DANGER_RANK.get(
             candidate.operation, 0
         ):
+            # Report the command that ran, not the masked copy the floor read. The
+            # mask is length-preserving, so ``match_offset`` still indexes into it.
+            coarse = replace(coarse, detail=command)
             return _with_provenance(coarse, command, candidate, gate_open, _depth)
     return _with_provenance(candidate, command, candidate, gate_open, _depth)
 
