@@ -706,18 +706,39 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
     known data sink, or a body with no terminator line.
     """
     out = command
-    for match in _QUOTED_HEREDOC_RE.finditer(command):
-        tokens = _heredoc_owner_tokens(command[: match.start()])
-        if tokens is None:
-            continue
-        if not any(
-            len(tokens) >= len(sink) and tuple(tokens[: len(sink)]) == sink
-            for sink in _HEREDOC_DATA_SINKS
-        ):
-            continue
+    pos = 0
+    while True:
+        match = _QUOTED_HEREDOC_RE.search(command, pos)
+        if match is None:
+            return out
+        # A heredoc body is inert text, so anything that LOOKS like an opener
+        # inside one is not an opener. Scanning must therefore be sequential: find
+        # a heredoc, skip past its terminator, and only then look for the next.
+        #
+        # The first version used `finditer` over the whole string and did not do
+        # this. Tier B naysayer on PR #154 supplied the exploit, reproduced here
+        # verbatim before the fix:
+        #
+        #     git commit -F - <<'EOF'
+        #     ; gh pr create <<'echo'
+        #     EOF
+        #     rm -rf /
+        #     echo
+        #
+        # bash ends the heredoc at EOF and then runs `rm -rf /`. The old scan saw
+        # the *literal* `<<'echo'` on line 2 as a second opener, read its prefix
+        # (`; gh pr create`) as a data sink, hunted for a terminator line `echo`,
+        # found the last line — and blanked everything between, `rm -rf /`
+        # included. Since both the structural pass and the coarse floor read the
+        # masked string, the deletion became invisible to the whole classifier.
+        #
+        # Skipping past the terminator is done whether or not the body was
+        # masked: a non-sink heredoc (`bash <<'EOF' ... EOF`) is still a body, and
+        # treating an opener inside it as real would reintroduce the same hole
+        # with the roles reversed.
         body_start = command.find("\n", match.end())
         if body_start == -1:
-            continue
+            return out
         body_start += 1
         # ``<<-`` permits leading tabs before the terminator; plain ``<<`` does not.
         allow_indent = command[match.start() : match.start() + 3].startswith("<<-")
@@ -727,11 +748,22 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
         )
         end = terminator.search(command, body_start)
         if end is None:
-            # Unterminated: we cannot tell where the payload stops, so scan it all.
-            continue
-        body = command[body_start : end.start()]
-        out = out[:body_start] + re.sub(r"[^\n]", " ", body) + out[end.start() :]
-    return out
+            # Unterminated: we cannot tell where this body stops, so we cannot
+            # skip it either. Stop scanning; everything from here stays unmasked
+            # and is read as shell, which is the strict side.
+            return out
+        # The owner is the text between the previous terminator and this opener —
+        # NOT the whole prefix, which would include earlier heredoc bodies and let
+        # their contents supply a sink name.
+        tokens = _heredoc_owner_tokens(command[pos : match.start()])
+        if tokens is not None and any(
+            len(tokens) >= len(sink) and tuple(tokens[: len(sink)]) == sink
+            for sink in _HEREDOC_DATA_SINKS
+        ):
+            body = command[body_start : end.start()]
+            out = out[:body_start] + re.sub(r"[^\n]", " ", body) + out[end.start() :]
+        # Resume AFTER this body whether or not it was masked.
+        pos = end.end()
 
 
 def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
