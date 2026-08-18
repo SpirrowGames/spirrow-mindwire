@@ -1442,12 +1442,19 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     # git commit -m x` were both measured ALLOWED, and a push to `main` walks
     # straight past the Tier C merge gate. (Tier B, PR #158 round 6.)
     #
-    # Which is why the condition is not "is it alone". Denying every chain would
-    # take `git add . && git commit -m x` with it, and that is the loop's most
-    # common command; a gate that stops the ordinary case is a gate that gets
-    # worked around. Instead every OTHER action in the chain has to be one this
-    # module recognises as unable to move HEAD — see :func:`_cannot_move_head`.
-    # An unrecognised step, including any non-git command, is assumed to move it.
+    # Which is why the condition is not "is it alone" for all four. Denying every
+    # chain would take `git add . && git commit -m x` with it — measured, 33
+    # tests, because a heredoc's body and terminator count as separate actions —
+    # and that is the loop's most common command; a gate that stops the ordinary
+    # case is a gate that gets worked around.
+    #
+    # So the two operations THIS PR widens keep the strict form: chained with
+    # anything at all, refused. `git commit` / `git push` instead consult
+    # :func:`_may_switch_branch`, which is a DENYLIST and therefore fail-OPEN for
+    # what it does not name — `make deploy && git push` is allowed, and
+    # `test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen` records
+    # that rather than leaving it to be discovered. It is the exposure
+    # commit/push have carried since they were first branch-scoped.
     #
     # A step that names its own target (`git rebase develop feature/z`, a refspec
     # force-push) never consults HEAD, so chaining does not reach it at all.
@@ -1690,6 +1697,15 @@ def _current_branch(repo_root: Path) -> str | None:
 #: ``branch is None``, so an operation carrying a ``branch_glob`` that is NOT in
 #: this list skips its glob entirely and passes. Nothing static catches that; the
 #: detached-HEAD and non-repo tests are what does.
+#:
+#: ``GIT_MERGE`` is deliberately absent, and its absence has now been raised as a
+#: bypass three times (PR #158 rounds 3, 6, 8) because the reason lives outside
+#: the diff. It is constrained by ``source_glob`` / ``target_glob``, never
+#: ``branch_glob``, and its destination is filled from HEAD by its own branch in
+#: :meth:`_AllowlistGuard._enrich` — which sets ``target``, not ``branch``.
+#: Measured on each of those rounds: ``git merge feature/x`` is denied on
+#: ``main`` and allowed on ``feature/x``. Adding it here would populate a field
+#: its rules never read. See ``test_guard_merge_on_main_denied``.
 _HEAD_ENRICHED_OPERATIONS: tuple[Operation, ...] = (
     Operation.GIT_COMMIT,
     Operation.GIT_PUSH,

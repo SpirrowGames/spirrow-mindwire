@@ -888,6 +888,29 @@ async def test_guard_previous_branch_shorthand_still_names_an_explicit_target(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("branch", "expected_allow"),
+    [("main", False), ("feature/x", True)],
+)
+async def test_guard_merge_on_main_denied(
+    tmp_path: Path, branch: str, expected_allow: bool
+) -> None:
+    """`git merge` is bounded, and not through `branch_glob`.
+
+    Its absence from `_HEAD_ENRICHED_OPERATIONS` has been reported as a bypass
+    three times (PR #158 rounds 3, 6, 8), because the reason lives outside the
+    diff: `git.merge` is constrained by `source_glob` / `target_glob`, and its
+    destination is filled from HEAD by its own branch in `_enrich`, which sets
+    `target` rather than `branch`. This test puts the answer where a reader of
+    the diff can find it.
+    """
+    _init_head(tmp_path, branch)
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git merge feature/x"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow if expected_allow else PermissionResultDeny)
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:
