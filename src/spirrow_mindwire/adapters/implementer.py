@@ -753,7 +753,7 @@ _PLAIN_COMMAND_LINE_RE = re.compile(
 
 # Stepping over a line asserts more than "the next line starts a new command".
 # It also asserts that a sink invocation FURTHER DOWN still means what it says —
-# and a line the scan walks past can rebind the name. Measured (round 12)::
+# and a line the scan walks past can take that away. Measured (round 12)::
 #
 #     git() {
 #     bash
@@ -765,68 +765,62 @@ _PLAIN_COMMAND_LINE_RE = re.compile(
 # Every one of those three lines is ordinary text with balanced quotes, so the
 # scan stepped over all three, recognised the sink, and blanked the body. bash
 # then ran `git commit -F -` as the FUNCTION, which execs `bash`, which inherits
-# stdin — the heredoc — and executes the deletion. The same trick was measured in
-# seven more spellings: `git ()  {`, `function git {`, `PATH=/tmp`,
-# `export PATH=/tmp`, `source f`, `. f`, and `shopt -s expand_aliases` +
-# `alias git=bash`. All eight were masked.
+# stdin — the heredoc — and executes the deletion. Seven more spellings did the
+# same: `git ()  {`, `function git {`, `PATH=/tmp`, `export PATH=/tmp`,
+# `source f`, `. f`, and `shopt -s expand_aliases` + `alias git=bash`.
 #
-# Two positive requirements close the class rather than the instance:
+# The first answer to that was "no ``( ) { }``, and the first word must name an
+# external program, because a subprocess cannot touch the calling shell". The
+# second half of that was wrong, and round 13 said so: a command need not touch
+# the shell to change what the sink does, it can write to the filesystem. The
+# reported route (a `pre-commit` hook eating the heredoc from git's stdin) does
+# NOT reproduce — measured, the hook's stdin is empty and git records the body as
+# the message — but the class is real by another route::
 #
-#   1. no ``( ) { }`` anywhere in the line. Every spelling of a function
-#      definition or a command group needs one, whatever the spacing;
-#   2. the first word must name an EXTERNAL program. A subprocess cannot touch
-#      the calling shell's function table, aliases or PATH, so what it does is
-#      irrelevant here; a shell keyword or builtin can, and a bare ``NAME=value``
-#      is an assignment rather than a command. An unlisted first word is not
-#      judged, it just stops the scan.
+#     cp evil .git/hooks/commit-msg     # the hook is `sh "$1"`
+#     git commit -F - <<'EOF'
+#     touch /tmp/pwned
+#     EOF
+#
+# `commit-msg` is handed the path of the message FILE, and the message is the
+# masked body. Measured: it executes. `git config core.hooksPath /tmp` gets there
+# too, and `git` was on the old list.
+#
+# So the rule is not "external" but "cannot change what the sink does", and only
+# two kinds of line qualify:
+#
+#   * lines that run nothing at all — blank, or a comment;
+#   * a short list of git/gh subcommands that only read or stage, plus a few
+#     inert utilities. Anything that can write a file, change git's
+#     configuration, or change directory is off it, ``cd`` included: a different
+#     working directory is a different repository, with different hooks.
+#
+# ``( ) { }`` stay banned outright — every spelling of a function definition or
+# a command group needs one — and a bare ``NAME=value`` is an assignment, not a
+# command, so it never matches a prefix here.
 _COMPOUND_COMMAND_CHARS = frozenset("(){}")
 
-_STEPPABLE_COMMANDS = frozenset(
-    {
-        # The sink families, so a batch may stage or inspect before it writes.
-        "git",
-        "gh",
-        # Toolchain and shell-adjacent commands this loop actually emits.
-        "uv",
-        "python",
-        "python3",
-        "pytest",
-        "ruff",
-        "mypy",
-        "npm",
-        "npx",
-        "node",
-        "cargo",
-        "go",
-        "dotnet",
-        "make",
-        "pwsh",
-        # Ordinary file and text utilities.
-        "cat",
-        "chmod",
-        "cp",
-        "curl",
-        "date",
-        "diff",
-        "echo",
-        "find",
-        "grep",
-        "head",
-        "jq",
-        "ls",
-        "mkdir",
-        "mv",
-        "printf",
-        "pwd",
-        "sed",
-        "sort",
-        "tail",
-        "tar",
-        "touch",
-        "true",
-        "uniq",
-        "wc",
-    }
+_STEPPABLE_INVOCATIONS: tuple[tuple[str, ...], ...] = (
+    # Staging and inspection, so a batch may prepare before it writes. This is
+    # the false negative round 7 reported, and `git add .` is its example.
+    ("git", "add"),
+    ("git", "status"),
+    ("git", "diff"),
+    ("git", "log"),
+    ("git", "show"),
+    ("git", "rev-parse"),
+    ("git", "ls-files"),
+    ("gh", "pr", "view"),
+    ("gh", "pr", "list"),
+    ("gh", "issue", "view"),
+    ("gh", "issue", "list"),
+    ("gh", "run", "view"),
+    ("gh", "run", "list"),
+    # Inert utilities. `echo` cannot redirect — `>` is not in the charset.
+    ("ls",),
+    ("pwd",),
+    ("echo",),
+    ("true",),
 )
 
 
@@ -856,8 +850,8 @@ def _is_a_plain_command_line(line: str) -> bool:
     Two things have to hold, and the second was learnt the hard way. The line
     must not reach the NEXT line, so that the line after it really does start a
     new command. And it must not change what a sink invocation further down
-    MEANS — see :data:`_STEPPABLE_COMMANDS` for the function-definition bypass
-    that obligation exists to close.
+    MEANS — see :data:`_STEPPABLE_INVOCATIONS` for the bypasses that obligation
+    exists to close.
 
     Needed so the scan can walk PAST an ordinary command — ``git add .`` before
     the commit — and still know that the line after it starts a new command
@@ -896,7 +890,13 @@ def _is_a_plain_command_line(line: str) -> bool:
         tokens = shlex.split(line, posix=True)
     except ValueError:
         return False
-    return not tokens or tokens[0] in _STEPPABLE_COMMANDS
+    if not tokens:
+        # Nothing to run: a blank line, or one that was only a comment.
+        return True
+    return any(
+        len(tokens) >= len(prefix) and tuple(tokens[: len(prefix)]) == prefix
+        for prefix in _STEPPABLE_INVOCATIONS
+    )
 
 
 def _mask_quoted_heredoc_payloads(command: str) -> str:

