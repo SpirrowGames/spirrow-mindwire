@@ -32,7 +32,10 @@ from __future__ import annotations
 
 import pytest
 
-from spirrow_mindwire.adapters.implementer import classify_tool_call
+from spirrow_mindwire.adapters.implementer import (
+    _mask_quoted_heredoc_payloads,
+    classify_tool_call,
+)
 from spirrow_mindwire.allowlist import Operation
 
 DELETION = "rm -rf /tmp/x"
@@ -119,10 +122,27 @@ def test_dash_form_allows_an_indented_terminator() -> None:
             "backtick-spans-the-line",
             "git commit -F - <<'A' ; echo " + BT + "\n" + DELETION + "\n" + BT + "\nsafe\nA",
         ),
+        # 5. A second, fake terminator at the very end. bash stops at the FIRST
+        #    one and runs what follows; a pattern anchored to the end of the
+        #    string could not stop there, so its non-greedy body swallowed the
+        #    real terminator and the deletion behind it.
+        (
+            "second-terminator-at-the-end",
+            "git commit -F - <<'A'\nharmless prose\nA\n" + DELETION + "\nA",
+        ),
     ],
 )
 def test_every_exploit_stays_visible(label: str, cmd: str) -> None:
     assert _verdict(cmd) is Operation.FS_DELETE, label
+
+
+def test_a_command_after_the_first_terminator_means_the_shape_is_not_recognised() -> None:
+    # The rule the last bypass broke: bash ends the body at the FIRST delimiter
+    # line, so what follows is a command — and a command being there is exactly
+    # what disqualifies the shape. Asserted on the mask itself because the
+    # verdict here is dominated by `git commit`, which would hide the point.
+    cmd = "git commit -F - <<'A'\nprose\nA\necho hi\nA"
+    assert _mask_quoted_heredoc_payloads(cmd) == cmd
 
 
 # --- deletions that are plainly shell ------------------------------------- #

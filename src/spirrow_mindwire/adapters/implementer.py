@@ -664,32 +664,16 @@ _HEREDOC_DATA_SINKS: tuple[tuple[str, ...], ...] = (
     ("gh", "release", "create"),
 )
 
-# The ONE command shape whose heredoc body is treated as data: a single data-sink
-# invocation, a single quoted heredoc, and nothing else in the command at all.
+# The opener line of the ONE command shape whose heredoc body is treated as data:
+# a data-sink invocation containing no shell metacharacter at all, then a single
+# quoted heredoc opener, and nothing else on the line.
 #
-# This is a TEMPLATE MATCH, not a parse, and that is the whole point. Four rounds
-# of Tier B review on PR #154 / #156 found five defects in successive attempts to
-# work out where a heredoc body begins — a fake opener inside a body, several
-# openers on one line, a backslash line-continuation, a comment hiding a trailing
-# `&&`, and `$(` inside double quotes. Each fix was correct and each left another
-# construct. bash's line/heredoc interaction is not something this classifier can
-# afford to model, and every wrong model masked live commands, which is the
-# fail-OPEN direction.
-#
-# So the question changed from "where does the body begin?" to "is this the one
-# shape we are sure about?". Everything else is left unmasked, i.e. exactly as
-# strict as before this feature existed. All five exploits fail the template on
-# structure alone: each carries a `;`, an `&&`, a second opener, a continuation
-# or a comment, and the owner charset admits none of those.
-#
-# The owner charset is deliberately narrow — letters, digits, and ``. _ / = -``
-# plus spaces. No `;` `&` `|` `` ` `` `$` `\` `#`, no quotes. A shell
-# metacharacter anywhere before the opener means we do not recognise the shape.
-_SINK_HEREDOC_COMMAND_RE = re.compile(
-    r"^(?P<owner>[A-Za-z0-9 ._/=-]+?)"  # owner: no shell metacharacters at all
-    r"<<-?(?P<q>[\'\"])(?P<delim>\w+)(?P=q)[ \t]*\n"  # one quoted opener, alone on its line
-    r"(?P<body>(?:.*\n)*?)"  # the body, possibly empty
-    r"[ \t]*(?P=delim)[ \t]*$",  # terminator, and the command ends there
+# The owner charset is the guard: letters, digits, spaces and ``. _ / = -``. No
+# ``;`` ``&`` ``|`` backtick ``$`` backslash ``#``, no quotes. Any of those means
+# we do not recognise the shape and mask nothing.
+_SINK_HEREDOC_OPENER_LINE_RE = re.compile(
+    r"^(?P<owner>[A-Za-z0-9 ._/=-]+?)"
+    r"<<(?P<dash>-?)(?P<q>[\'\"])(?P<delim>\w+)(?P=q)[ \t]*$"
 )
 
 
@@ -709,15 +693,32 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
     runs died on messages that merely *mentioned* deleting, one of them quoting
     the human's own instruction not to delete).
 
-    **Only the exact shape is recognised** — see ``_SINK_HEREDOC_COMMAND_RE``.
-    Anything else, including every construct that ever fooled an earlier version,
-    is left alone and read as shell.
+    **Only one command shape is recognised**, and it is checked line by line
+    rather than by a single pattern:
+
+    * line 0 is a data sink plus one quoted opener and nothing else;
+    * the body runs to the **first** line that is exactly the delimiter — the
+      first, because that is where bash ends it;
+    * nothing but whitespace may follow that line, so the command is over.
+
+    Anything else returns ``command`` untouched, i.e. exactly as strict as before
+    this feature existed. That bluntness is the design. Five review rounds found
+    six defects in successively cleverer attempts to locate a heredoc body — a
+    fake opener inside a body, several openers on one line, a backslash
+    continuation, a comment hiding a trailing ``&&``, ``$(`` inside double
+    quotes, and a regex whose end anchor made a non-greedy body swallow the real
+    terminator and the live command after it. Four of the six masked commands
+    bash would run, which is the fail-OPEN direction. The lesson taken is not
+    "model bash better" but "recognise less".
     """
-    match = _SINK_HEREDOC_COMMAND_RE.match(command)
-    if match is None:
+    lines = command.split("\n")
+    if len(lines) < 2:
+        return command
+    opener = _SINK_HEREDOC_OPENER_LINE_RE.match(lines[0])
+    if opener is None:
         return command
     try:
-        tokens = shlex.split(match.group("owner"), posix=True)
+        tokens = shlex.split(opener.group("owner"), posix=True)
     except ValueError:
         return command
     if not any(
@@ -725,9 +726,24 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
         for sink in _HEREDOC_DATA_SINKS
     ):
         return command
-    start, end = match.span("body")
-    body = command[start:end]
-    return command[:start] + re.sub(r"[^\n]", " ", body) + command[end:]
+
+    delim = opener.group("delim")
+    strip_tabs = opener.group("dash") == "-"
+    end = None
+    for index in range(1, len(lines)):
+        line = lines[index]
+        if (line.lstrip("\t") if strip_tabs else line) == delim:
+            end = index
+            break
+    if end is None:
+        # No terminator: we cannot say where the body stops.
+        return command
+    if any(rest.strip() for rest in lines[end + 1 :]):
+        # The command continues past the terminator, so this is not the shape.
+        return command
+
+    masked = [" " * len(line) for line in lines[1:end]]
+    return "\n".join([lines[0], *masked, *lines[end:]])
 
 
 def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
