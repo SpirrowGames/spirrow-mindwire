@@ -291,7 +291,9 @@ def test_a_line_the_scan_cannot_account_for_stops_it() -> None:
         ("substitution", "echo " + DQ + "$(" + DQ),
         ("unclosed-quote", "echo 'x"),
         ("redirect", "echo hi > out"),
-        ("word-initial-hash", "git add . # note"),
+        # A mid-word `#` is not a comment, so the unbalanced quote after it is
+        # real and bash keeps reading past this newline.
+        ("hash-mid-word-then-quote", "git add --title a#b'c"),
     ],
 )
 def test_a_preceding_line_that_may_reach_the_next_one_stops_the_scan(
@@ -301,6 +303,28 @@ def test_a_preceding_line_that_may_reach_the_next_one_stops_the_scan(
     # cannot promise that, so the body after them is left for the floor.
     cmd = before + "\ngit commit -F - <<'A'\n" + DELETION + "\nA"
     assert _verdict(cmd) is Operation.FS_DELETE, label
+
+
+@pytest.mark.parametrize(
+    ("label", "before"),
+    [
+        ("whole-line", "# create the PR"),
+        ("trailing", "git add . # stage everything"),
+        ("apostrophe", "# don't delete the spec"),
+        ("hides-an-operator", "# then run tests && lint"),
+        ("hides-an-opener", "# git commit -F - <<'X'"),
+        ("hides-a-backslash", "# continued " + BS),
+    ],
+)
+def test_a_comment_before_the_sink_is_stepped_over(label: str, before: str) -> None:
+    # Round 11. A comment ends at the newline and nothing in it reaches the next
+    # line — measured for every shape here, including the backslash, which loses
+    # its escaping power inside a comment. The implementer interleaves comments
+    # with its steps, so refusing to step over them left the Markdown body
+    # unmasked and killed the run on the floor.
+    cmd = before + "\ngit commit -F - <<'A'\n" + DELETION + "\nA"
+    assert _mask_quoted_heredoc_payloads(cmd) != cmd, f"{label}: not masked"
+    assert _verdict(cmd) is Operation.GIT_COMMIT, label
 
 
 def test_the_body_ends_at_the_first_terminator_and_the_rest_stays_shell() -> None:

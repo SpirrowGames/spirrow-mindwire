@@ -48,7 +48,14 @@ PREFIXES = [
     ["SINK <<'ZZ'"],  # an opener we do not recognise: the scan must stop here
     ["git add . &&"],
     ["echo 'x"],
+    # Round 11: a comment cannot reach the next line, so these must be stepped
+    # over, not stopped on. Both spellings, plus the ones that look dangerous.
     ["git add . # note"],
+    ["# create the PR"],
+    ["# don't delete"],
+    ["# then run tests && lint"],
+    ["# continued " + BS],
+    ["git add --title a#b'c"],  # mid-word `#`: the quote after it is real
     ["git add . " + BS],
     ["("],  # opens a subshell, so `)` becomes reachable in the opener
     ["{"],

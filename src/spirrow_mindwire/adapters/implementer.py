@@ -777,16 +777,33 @@ def _is_a_plain_command_line(line: str) -> bool:
 
     Needed so the scan can walk PAST an ordinary command — ``git add .`` before
     the commit — and still know that the line after it starts a new command
-    rather than continuing this one. The test is the same conservative one the
-    owner uses: every character is from :data:`_HEREDOC_OWNER_CHARS`, no ``#``
-    begins a word, and quotes balance. That excludes ``\\`` (continuation),
-    ``;`` ``&`` ``|`` (an operator whose right side may be on the next line),
-    ``$`` and backtick (a substitution bash reads across newlines), and ``<``
-    ``>`` (any redirect — so a line bearing a heredoc opener we do NOT recognise
-    can never be walked past as if it were ordinary).
+    rather than continuing this one. Every character of the code must come from
+    :data:`_HEREDOC_OWNER_CHARS` and its quotes must balance. That excludes
+    ``\\`` (continuation), ``;`` ``&`` ``|`` (an operator whose right side may be
+    on the next line), ``$`` and backtick (a substitution bash reads across
+    newlines), and ``<`` ``>`` (any redirect — so a line bearing a heredoc opener
+    we do NOT recognise can never be walked past as if it were ordinary).
+
+    A trailing comment is cut off first, because a comment cannot reach the next
+    line under any circumstance. Measured: ``# note`` before a sink leaves the
+    heredoc body as data, and so do ``# note &&``, ``# git commit -F - <<'X'``
+    and even ``# note \\`` — a backslash loses its power inside a comment. This
+    is the one place the ``#`` rule differs from the opener line, where a comment
+    kills the heredoc and must stop everything.
+
+    Cutting matters for more than comment-only lines: ``shlex`` is handed the raw
+    string, so ``# don't delete`` raises ``No closing quotation`` and ``# note \\``
+    raises ``No escaped character``. Apostrophes in English prose are common
+    enough that leaving them in would keep most of the false negative round 11
+    reported. The cut is made at a word-initial ``#`` only — bash's own rule —
+    so a mid-word ``#`` still leaves any unbalanced quote after it visible to
+    ``shlex``, which is what makes ``--title a#b'c`` stop the scan.
     """
-    if _HASH_BEGINS_A_WORD_RE.search(line):
-        return False
+    comment = _HASH_BEGINS_A_WORD_RE.search(line)
+    if comment is not None:
+        # The match starts at the character BEFORE the `#` (a space, tab or
+        # `)`), and that character is still code, so cut at the `#` itself.
+        line = line[: comment.end() - 1]
     if _PLAIN_COMMAND_LINE_RE.match(line) is None:
         return False
     try:
