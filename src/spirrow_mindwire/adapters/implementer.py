@@ -733,7 +733,16 @@ _SINK_HEREDOC_OPENER_LINE_RE = re.compile(
 # metacharacters (``|`` ``&`` ``;`` ``<`` ``>``) cannot appear: the charset has
 # never admitted them. Measured over every admitted character, in five bash
 # contexts, ``)`` was the only miss.
-_HASH_BEGINS_A_WORD_RE = re.compile(r"(?:^|[ \t()])#")
+#
+# ``(`` is deliberately NOT in this class, though it is a metacharacter too. It
+# cannot open a comment anywhere this pattern is used: the opener line must begin
+# with a sink token, so ``(`` can only land in argument position, where bash
+# raises a syntax error and runs nothing. Adding it "to be safe" cost the round-6
+# fix instead — ``--title "… (#12)"`` contains ``(#``, so every Conventional
+# Commit with an issue ref stopped being masked and went back to killing the
+# conductor. Round 9 caught that, and only caught it because the test payload
+# was made live; ``says git rm`` is inert to the floor and hid the regression.
+_HASH_BEGINS_A_WORD_RE = re.compile(r"(?:^|[ \t)])#")
 
 # An ordinary command line: the same charset as the owner, over the whole line.
 # It is what lets the scan step over ``git add .`` on its way to the commit,

@@ -68,6 +68,12 @@ OPENERS = [
     "SINK ) #<<'A'",
     "SINK ) <<'A'",
     "SINK " + DQ + "x" + DQ + "#<<'A'",
+    # Round 9: `(` is a metacharacter too, but unreachable in argument position,
+    # so treating it as a comment opener only cost the round-6 fix. Both spellings
+    # are here so the claim is measured rather than argued.
+    "SINK (#<<'A'",
+    "SINK a(#<<'A'",
+    "SINK --title " + DQ + "docs (#12)" + DQ + " <<'A'",
     "tee out <<'A'",
     "SINK <<A",  # unquoted delimiter: the body is expanded, so it is not inert
 ]

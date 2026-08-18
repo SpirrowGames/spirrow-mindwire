@@ -141,13 +141,26 @@ def test_a_substitution_in_the_owner_is_declined() -> None:
         ("japanese", "レイアウトの破れを直す"),
     ],
 )
-def test_ordinary_punctuation_in_a_title_is_still_the_shape(label: str, title: str) -> None:
+@pytest.mark.parametrize(
+    ("body_label", "body"),
+    [("deletion", DELETION), ("backtick", "a " + BT + "rm" + BT + " b")],
+)
+def test_ordinary_punctuation_in_a_title_is_still_the_shape(
+    label: str, title: str, body_label: str, body: str
+) -> None:
     # Measured under bash (probe: line 1 = `touch <marker>`): every one of these
     # leaves line 1 as heredoc data, so none of them can move where the body
     # begins and none of them is a reason to decline. Round 6 reported these as
     # broken and it was right.
-    cmd = "gh pr create --title " + DQ + title + DQ + " --body-file - <<'A'\nsays git rm\nA"
-    assert _verdict(cmd) is not Operation.FS_DELETE, label
+    #
+    # The body must be something the floor would actually deny, or this test has
+    # no teeth. It first shipped with `says git rm`, which the floor does not
+    # classify as a deletion (see the known-gap test in
+    # test_implementer_adapter.py), so it passed for two rounds while the round-8
+    # fix silently un-masked every title carrying an issue ref. Round 9 found it.
+    cmd = "gh pr create --title " + DQ + title + DQ + " --body-file - <<'A'\n" + body + "\nA"
+    assert _mask_quoted_heredoc_payloads(cmd) != cmd, f"{label}/{body_label}: not masked"
+    assert _verdict(cmd) is not Operation.FS_DELETE, f"{label}/{body_label}"
 
 
 @pytest.mark.parametrize(
