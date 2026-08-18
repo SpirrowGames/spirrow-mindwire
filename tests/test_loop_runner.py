@@ -282,8 +282,8 @@ def test_the_proposer_can_read_the_repository_it_designs_against() -> None:
     assert set(_PROPOSER_BUILTIN_TOOLS) == {"Read", "Glob", "Grep"}
     proposer = build_proposer(Path("."))
     assert list(proposer._builtin_tools) == list(_PROPOSER_BUILTIN_TOOLS)
-    # Auto-approved: this adapter has no can_use_tool guard, so anything not
-    # named here reaches a permission prompt that no one is present to answer.
+    # Auto-approved because running headless means an un-approved call reaches a
+    # prompt no one can answer. The bound is the guard, asserted separately.
     assert list(proposer._allowed_tools) == list(_PROPOSER_BUILTIN_TOOLS)
 
 

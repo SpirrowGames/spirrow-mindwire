@@ -274,9 +274,11 @@ def _assert_role_resolution(
 # the gated adapter. That was the whole reason the class drops ``EXECUTE_CODE``;
 # reading files was never what it was protecting against.
 #
-# They are auto-approved because there is no ``can_use_tool`` guard on this
-# adapter, so an un-approved call would go to a prompt nobody is there to answer
-# — which is exactly the "permission denied" the proposer reported.
+# They are auto-approved because a call that is not auto-approved goes to an
+# interactive permission prompt, and nobody is there to answer it — which is
+# exactly the "permission denied" the proposer reported. That is a property of
+# running headless, not of whether a guard exists: the ``can_use_tool`` guard
+# injected below still runs on every call, and is where the bound lives.
 _PROPOSER_BUILTIN_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
 
 
