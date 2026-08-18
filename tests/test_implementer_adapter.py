@@ -725,6 +725,16 @@ async def test_guard_rebase_with_an_unrecognised_flag_is_denied(tmp_path: Path) 
         # `-D a b` deletes both and only one fits in `branch`.
         ("delete-many", "git branch -D feature/a main"),
         ("force-after-double-dash", "git branch -f -- main"),
+        # Round 4: git does not require the destructive flag to come first, and
+        # an earlier streaming parse met `-v` while `delete` was still false,
+        # called it a listing, and let git delete `main`. Every case above put
+        # the destructive flag first, which is exactly why they all passed.
+        ("unknown-flag-before-delete", "git branch -v -D main"),
+        ("unknown-long-flag-before-force", "git branch --track -f main origin/main"),
+        # Bundled shorts: measured, `-vD main` and `-Dv main` both delete `main`,
+        # so a bundle has to be read as its letters.
+        ("bundled-verbose-delete", "git branch -vD main"),
+        ("bundled-delete-verbose", "git branch -Dv main"),
         ("delete-after-double-dash", "git branch -D -- main"),
         # A value-taking flag alongside a destructive one: the value would be
         # miscounted as a branch name, so it is refused rather than guessed.
@@ -752,6 +762,7 @@ async def test_guard_destructive_git_branch_on_main_is_denied(
     [
         ("force-move-within-glob", "git branch -f feature/y HEAD"),
         ("delete-within-glob", "git branch -D feature/old"),
+        ("bundled-quiet-delete-within-glob", "git branch -qD feature/old"),
         ("create", "git branch feature/new"),
         ("list", "git branch"),
         ("list-all", "git branch -a"),

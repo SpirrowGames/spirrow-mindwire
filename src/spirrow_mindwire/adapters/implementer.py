@@ -463,6 +463,34 @@ _BRANCH_COMPANION_FLAGS: frozenset[str] = (
 )
 
 
+def _branch_flags_and_positionals(args: list[str]) -> tuple[list[str], list[str]]:
+    """Split ``git branch`` arguments the way git's own option parser does.
+
+    Bundled short options are decomposed: measured, ``git branch -vD main`` and
+    ``git branch -Dv main`` both delete ``main``, so a bundle has to be read as
+    its letters or a destructive one hides inside an innocent-looking token.
+    Everything after ``--`` is a positional, dashes included.
+    """
+    flags: list[str] = []
+    positionals: list[str] = []
+    options_done = False
+    for arg in args:
+        if options_done:
+            positionals.append(arg)
+            continue
+        if arg == "--":
+            options_done = True
+            continue
+        if arg.startswith("--"):
+            flags.append(arg)
+            continue
+        if arg.startswith("-") and len(arg) > 1:
+            flags.extend("-" + letter for letter in arg[1:])
+            continue
+        positionals.append(arg)
+    return flags, positionals
+
+
 def _branch_target(args: list[str]) -> str | None | _Undecidable:
     """Which branch does this ``git branch`` move or destroy?
 
@@ -477,38 +505,31 @@ def _branch_target(args: list[str]) -> str | None | _Undecidable:
     than introduced by the branch-glob widening, but it makes this PR's promise
     ("history rewrites are denied on ``main``") false as written, so it is fixed
     here rather than carried.
-    """
-    positionals: list[str] = []
-    options_done = False
-    index = 0
-    delete = force = False
-    while index < len(args):
-        arg = args[index]
-        if options_done:
-            positionals.append(arg)
-            index += 1
-            continue
-        if arg == "--":
-            options_done = True
-            index += 1
-            continue
-        if arg.startswith("-"):
-            if arg in _BRANCH_MOVE_FLAGS:
-                return _UNDECIDABLE
-            if arg not in _BRANCH_COMPANION_FLAGS:
-                # Either harmless (listing) or value-taking; either way this is
-                # only reached once something destructive is present, and by then
-                # a miscount is a wrong branch name.
-                return _UNDECIDABLE if (delete or force) else None
-            delete = delete or arg in _BRANCH_DELETE_FLAGS
-            force = force or arg in _BRANCH_FORCE_FLAGS
-            index += 1
-            continue
-        positionals.append(arg)
-        index += 1
 
+    **What this command is has to be decided over the WHOLE argument list before
+    any of it is interpreted.** An earlier version decided while walking, so an
+    unrecognised flag standing before the destructive one — ``git branch -v -D
+    main`` — was met while ``delete`` was still false, read as "harmless
+    listing", and returned ``None``. Measured: the guard ALLOWED it and git
+    deleted ``main``. git does not require the destructive flag to come first,
+    so neither may this. (Tier B, PR #158 round 4, which also named the reason
+    the tests missed it: they all put the destructive flag first.)
+    """
+    flags, positionals = _branch_flags_and_positionals(args)
+
+    if any(flag in _BRANCH_MOVE_FLAGS for flag in flags):
+        # Rename and copy name two branches and it is the SECOND that gets
+        # clobbered, which one ``branch`` field cannot express.
+        return _UNDECIDABLE
+    delete = any(flag in _BRANCH_DELETE_FLAGS for flag in flags)
+    force = any(flag in _BRANCH_FORCE_FLAGS for flag in flags)
     if not (delete or force):
         return None
+    if any(flag not in _BRANCH_COMPANION_FLAGS for flag in flags):
+        # Something destructive is present AND something we cannot account for.
+        # An unmodelled flag may take a value, and an unconsumed value looks
+        # exactly like a branch name — the trap ``_rebase_target`` refuses too.
+        return _UNDECIDABLE
     if delete:
         # `-D a b` deletes both, and only one of them fits in `branch`.
         return positionals[0] if len(positionals) == 1 else _UNDECIDABLE
