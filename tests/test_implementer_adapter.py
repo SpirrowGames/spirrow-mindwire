@@ -977,6 +977,26 @@ async def test_guard_the_coarse_floor_cannot_hand_back_a_branchless_rewrite(
 
 
 @pytest.mark.anyio
+async def test_guard_the_reduced_floor_still_outranks_a_permissive_candidate(
+    tmp_path: Path,
+) -> None:
+    """Reducing the floor's finding to UNKNOWN does not let it lose the rank check.
+
+    UNKNOWN is 90 — second only to the Tier C group at 100, and above everything
+    the structural pass would have allowed. Raised as a bypass on the assumption
+    that UNKNOWN defaults to 0 (PR #158 round 11): here the structural pass sees
+    only `fs.write` (20) because the verb is hidden in a dynamic substitution it
+    cannot unroll, and the floor still wins.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    command = 'eval $(echo "git checkout main && git push --force"); echo "benign" > file.txt'
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violation_actions[-1].rule_id == "raw_coarse"
+
+
+@pytest.mark.anyio
 async def test_guard_wrapping_an_allowed_force_push_still_allows_it(tmp_path: Path) -> None:
     """T27's direct == wrapped, kept: the reduction must not deny what the
     direct form allows."""

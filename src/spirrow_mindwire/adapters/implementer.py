@@ -1520,7 +1520,17 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
             # to `feature/x` and was ALLOWED. (Tier B, PR #158 round 10.)
             #
             # UNKNOWN keeps the denial and drops the branch that was never known.
-            # The floor still only ever ADDS a denial.
+            # The floor still only ever ADDS a denial, and that survives the
+            # reduction because UNKNOWN is ranked 90 in :data:`_DANGER_RANK` —
+            # second only to the Tier C group at 100, and above every operation
+            # the structural pass would have allowed (`git.push` 50,
+            # `git.commit` 40, `fs.write` 20, `exec.code` 0). So the `>=` below
+            # still lets the floor win against anything permissive.
+            #
+            # Raised as a bypass on the assumption that UNKNOWN defaults to 0
+            # (PR #158 round 11); measured, the proposed
+            # `eval $(echo "git checkout main && git push --force"); echo x > f`
+            # is denied by this very path, `rule_id=raw_coarse`.
             coarse = ClassifiedAction(Operation.UNKNOWN, detail=coarse.detail)
         if coarse is not None and _DANGER_RANK.get(coarse.operation, 0) >= _DANGER_RANK.get(
             candidate.operation, 0
