@@ -4,7 +4,7 @@ Proves the runner composes the existing Stage 3 components correctly without
 touching any core (watcher / dispatcher / adapter):
 
 - **role resolution**: with the three production adapters registered, the
-  registry routes PROPOSER → text-only ``Stage3ProposerAdapter``, IMPLEMENTER →
+  registry routes PROPOSER → read-only ``Stage3ProposerAdapter``, IMPLEMENTER →
   the allow-list-gated ``ImplementerSdkAdapter``, NAYSAYER → the independent
   design-time ``NaysayerSdkAdapter`` (and *only* it — ADR-05 §5; ADR-19 driver-化
   unify made it the sole registry NAYSAYER, the PR-gate being a driver). This is
@@ -287,6 +287,21 @@ def test_the_proposer_can_read_the_repository_it_designs_against() -> None:
     assert list(proposer._allowed_tools) == list(_PROPOSER_BUILTIN_TOOLS)
 
 
+def test_the_proposer_is_scoped_to_the_repository_it_was_given() -> None:
+    """Exposing a read tool is not approving every path it could name.
+
+    `allowed_tools` auto-approves, and `Read` takes an absolute path, so without
+    a guard the proposer could be talked into quoting a credential file into the
+    chatroom — which leaves this host and reaches an external model. Widening
+    permissions on an isolated box bounds what a deletion costs; it does not
+    bound where a secret travels. (Tier B, PR #157.)
+    """
+    repo = Path("/tmp/some-repo")
+    proposer = build_proposer(repo)
+    assert proposer._path_guard is not None
+    assert proposer._path_guard.root == repo
+
+
 def test_the_proposer_still_cannot_write_or_run_anything() -> None:
     """Reading is the widening; writing and executing are not.
 
@@ -309,7 +324,7 @@ def test_reading_does_not_make_the_proposer_qualify_as_the_implementer() -> None
     assert Capability.EXECUTE_CODE not in Stage3ProposerAdapter.capabilities
 
 
-def test_stage3_proposer_is_text_only() -> None:
+def test_stage3_proposer_capabilities_are_unchanged() -> None:
     caps = Stage3ProposerAdapter.capabilities
     assert Capability.READ_THREAD in caps
     assert Capability.POST_REPLY in caps

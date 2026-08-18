@@ -23,6 +23,7 @@ from spirrow_mindwire.adapters.claude_code_sdk import (
     ClaudeCodeSdkHaltError,
     ClaudeCodeSdkHealthError,
     ClaudeCodeSdkSpawnError,
+    _PathScopeGuard,
 )
 from spirrow_mindwire.ports import RoleAdapter, SpawnContext
 from spirrow_mindwire.value_objects import (
@@ -172,6 +173,109 @@ async def test_spawn_connects_and_returns_idle_handle(tmp_path: Path) -> None:
     hs = await adapter.health(handle)
     assert hs.state is SessionState.IDLE
     assert hs.error is None
+
+
+# --------------------------------------------------------------------------- #
+# _PathScopeGuard: exposure is not approval
+# --------------------------------------------------------------------------- #
+
+
+async def _verdict(guard: _PathScopeGuard, tool: str, tool_input: dict[str, Any]) -> bool:
+    """True when the call is allowed."""
+    result = await guard(tool, tool_input, None)  # type: ignore[arg-type]
+    return type(result).__name__ == "PermissionResultAllow"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("key", ["file_path", "path"])
+async def test_a_read_inside_the_repository_is_allowed(tmp_path: Path, key: str) -> None:
+    inside = tmp_path / "src" / "thing.py"
+    inside.parent.mkdir(parents=True)
+    inside.write_text("x", encoding="utf-8")
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Read", {key: str(inside)}) is True
+    assert guard.denials == []
+
+
+@pytest.mark.anyio
+async def test_a_relative_path_is_resolved_against_the_root(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Read", {"file_path": "a.py"}) is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "target"),
+    [
+        ("absolute-escape", "{parent}/secrets.env"),
+        ("dot-dot-escape", "../secrets.env"),
+        ("nested-dot-dot", "src/../../secrets.env"),
+    ],
+)
+async def test_a_read_outside_the_repository_is_refused(
+    tmp_path: Path, label: str, target: str
+) -> None:
+    """The whole point of the guard. A role whose input is text written by other
+    agents must not be able to quote a credential file back into the chatroom,
+    which is replicated off this host and forwarded to an external model.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (tmp_path / "secrets.env").write_text("TOKEN=1", encoding="utf-8")
+    guard = _PathScopeGuard(root=root)
+    resolved = target.format(parent=tmp_path.as_posix())
+    assert await _verdict(guard, "Read", {"file_path": resolved}) is False, label
+    assert len(guard.denials) == 1
+
+
+@pytest.mark.anyio
+async def test_a_sibling_that_merely_shares_a_prefix_is_refused(tmp_path: Path) -> None:
+    """Why the check is ``is_relative_to`` and not ``startswith``."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    sibling = tmp_path / "repo-secrets"
+    sibling.mkdir()
+    (sibling / "x.env").write_text("TOKEN=1", encoding="utf-8")
+    guard = _PathScopeGuard(root=root)
+    assert await _verdict(guard, "Read", {"file_path": str(sibling / "x.env")}) is False
+
+
+@pytest.mark.anyio
+async def test_a_call_carrying_no_path_is_left_alone(tmp_path: Path) -> None:
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Grep", {"pattern": "def "}) is True
+
+
+@pytest.mark.anyio
+async def test_no_builtins_means_no_guard_to_run(tmp_path: Path) -> None:
+    """Nothing is exposed, so there is nothing to scope."""
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(_FakeClient([])))
+    assert adapter._path_guard is None
+
+
+@pytest.mark.anyio
+async def test_exposing_builtins_installs_the_guard(tmp_path: Path) -> None:
+    """Exposure and approval are separate, and the guard is what re-joins them.
+
+    ``allowed_tools`` auto-approves, so without this the SDK would never ask.
+    """
+    captured: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured.append(options)
+        return _FakeClient([])
+
+    adapter = ClaudeCodeSdkAdapter(
+        cwd=tmp_path,
+        builtin_tools=("Read",),
+        allowed_tools=["Read"],
+        client_factory=factory,
+    )
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    guard = captured[0].can_use_tool
+    assert isinstance(guard, _PathScopeGuard)
+    assert guard.root == tmp_path
 
 
 @pytest.mark.anyio

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -38,8 +38,11 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     TextBlock,
+    ToolPermissionContext,
 )
 
 from ..conductor.handoff import build_handoff_protocol_block
@@ -179,6 +182,65 @@ async def _shutdown(client: _SdkClient) -> None:
     await client.disconnect()
 
 
+# Tool-input keys that name a path, across the read tools this adapter may be
+# given. ``Grep``/``Glob`` call it ``path``; ``Read`` calls it ``file_path``.
+_PATH_INPUT_KEYS: tuple[str, ...] = ("file_path", "path", "notebook_path")
+
+
+@dataclass
+class _PathScopeGuard:
+    """``can_use_tool`` callback: a read may not leave ``root``.
+
+    Exposing a tool is not approving it. Without this, every call the SDK sees
+    is auto-approved by ``allowed_tools`` and ``Read`` takes an absolute path,
+    so a role whose whole input is text written by other agents could be talked
+    into quoting ``~/.aws/credentials`` back into the chatroom — which is
+    replicated off this host and forwarded to an external model. The host being
+    an isolated dev box bounds what a *deletion* can cost; it does not bound
+    where a *credential* can travel. (Tier B, PR #157.)
+
+    Reading outside the repository was never needed for the job this unblocks —
+    checking a claim against the code the thread is about — so the scope costs
+    nothing it was bought for.
+
+    ``Path.resolve()`` on BOTH sides, then ``is_relative_to``. Never
+    ``startswith``: a sibling directory that merely shares a prefix would pass,
+    and a symlink out of the tree would too if only one side were resolved.
+    """
+
+    root: Path
+    denials: list[str] = field(default_factory=list)
+
+    async def __call__(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        root = self.root.resolve()
+        for key in _PATH_INPUT_KEYS:
+            raw = tool_input.get(key)
+            if not isinstance(raw, str) or not raw:
+                continue
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                # Cannot say where it points, so do not let it be read.
+                resolved = None
+            if resolved is None or not resolved.is_relative_to(root):
+                reason = (
+                    f"{tool_name} refused: {raw!r} resolves outside {root} — "
+                    "the proposer may read the repository it designs against, "
+                    "and nothing else"
+                )
+                self.denials.append(reason)
+                return PermissionResultDeny(message=reason, interrupt=True)
+        return PermissionResultAllow()
+
+
 class ClaudeCodeSdkAdapter:
     """RoleAdapter backed by the Claude Agent SDK (ADR-06 §3.1, T11).
 
@@ -207,6 +269,7 @@ class ClaudeCodeSdkAdapter:
         self._cwd = cwd
         self._system_prompt = system_prompt
         self._builtin_tools = list(builtin_tools)
+        self._path_guard = _PathScopeGuard(root=cwd) if self._builtin_tools else None
         self._allowed_tools = allowed_tools or []
         self._mcp_servers = mcp_servers or {}
         self._client_factory = client_factory or _default_client_factory
@@ -230,6 +293,10 @@ class ClaudeCodeSdkAdapter:
             tools=self._builtin_tools,
             allowed_tools=self._allowed_tools,
             mcp_servers=self._mcp_servers,
+            # Exposure is not approval. `allowed_tools` auto-approves, so the
+            # scope check has to be a guard; with no built-ins exposed there is
+            # nothing to scope and this stays None.
+            can_use_tool=self._path_guard,
         )
         try:
             client = self._client_factory(options)
