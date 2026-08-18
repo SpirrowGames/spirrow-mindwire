@@ -1179,6 +1179,49 @@ async def test_guard_a_checkout_is_seen_wherever_it_is_written(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # Piping a script into a shell hides it from the tokenizer, and the
+        # floor's gate did not count that as indirection — so nothing looked.
+        ("piped-into-a-shell", 'echo "git reset --hard" | sh'),
+        # And with a legitimate rank-100 action beside it: the floor names one
+        # operation, and naming the one already understood left the other
+        # unmentioned. Measured ALLOWED. (Tier B, PR #158 round 17.)
+        (
+            "piped-rewrite-beside-an-allowed-force-push",
+            'echo "git reset --hard main" | sh && git push --force origin feature/x',
+        ),
+    ],
+)
+async def test_guard_a_script_piped_into_a_shell_is_still_read(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    """The floor exists for input the tokenizer cannot reach; a pipe is that."""
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", ["git log | head", 'eval "git push --force"'])
+async def test_guard_the_floor_does_not_start_denying_what_it_understands(
+    tmp_path: Path, command: str
+) -> None:
+    """Two ways this could have overreached, both checked.
+
+    A pipe that is not into a shell must not open the gate; and an operation the
+    structural pass already read must not be re-reported blindly by the floor,
+    or `eval "git push --force"` would be refused while the bare form passed.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow), command
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:

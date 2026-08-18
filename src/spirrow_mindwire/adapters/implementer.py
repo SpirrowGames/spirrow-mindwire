@@ -829,7 +829,9 @@ def _classify_single_bash(cmd: str, _depth: int = 0) -> ClassifiedAction:
 # not this regex. The shell branch allows option/arg tokens between the shell and
 # `-c` (``bash --rcfile x -c`` / ``bash -l -c``) so the coarse floor still fires
 # when the inner is tokenizer-defeating (ANSI-C ``$'...'``) — #74 naysayer / Copilot.
-_INDIRECTION_RE = re.compile(r"\b(?:bash|sh|zsh|dash)\b(?:\s+\S+)*?\s+-\w*c\b|\beval\b|\$\(|`")
+_INDIRECTION_RE = re.compile(
+    r"\b(?:bash|sh|zsh|dash)\b(?:\s+\S+)*?\s+-\w*c\b|\|\s*(?:bash|sh|zsh|dash)\b|\beval\b|\$\(|`"
+)
 
 # COARSE defence-in-depth floor (T27). A deliberately broad keyword scan over the
 # raw string, applied ONLY when indirection is present and ONLY to ADD a denial —
@@ -1453,6 +1455,64 @@ def _chain_guarded(actions: list[ClassifiedAction], command: str) -> list[Classi
     return guarded
 
 
+def _coarse_action(
+    command: str, seen: frozenset[Operation], _depth: int = 0
+) -> ClassifiedAction | None:
+    """The defence-in-depth floor's finding, or None when it has nothing to say.
+
+    Factored out because the floor has two jobs that had been collapsed into
+    one. Ranking it against the structural verdict decides what gets REPORTED,
+    and that comparison is right: the floor must never downgrade a more precise
+    finding. But losing that comparison was also making it vanish from
+    ENFORCEMENT, and those are different questions.
+
+    Measured on `feature/x` (Tier B, PR #158 round 17)::
+
+        echo "git reset --hard main" | sh && git push --force origin feature/x
+
+    The structural pass reads `echo`, `sh` and a force-push that names
+    `feature/x` — all allowed, and the force-push ranks 100. The floor sees the
+    hidden rewrite, is reduced to UNKNOWN at 90 for having no branch, loses
+    `90 >= 100`, and disappeared. A legitimate rank-100 action was only possible
+    at all because this PR made `force_push` branch-scoped, so this is exposure
+    the widening created.
+
+    The guard now receives this finding as one more action to check. The floor
+    still only ever ADDS a denial.
+    """
+    if not _INDIRECTION_RE.search(command):
+        return None
+    scanned = _mask_quoted_heredoc_payloads(command) if _depth == 0 else command
+    # Every match, not just the first. `_scan_raw_coarse` reports one — right for
+    # a single reported verdict, and lossy here: with both a rewrite and a
+    # force-push in the text it names one of them, and if that one is what the
+    # structural pass already understood the other is never mentioned. Measured:
+    # `echo "git reset --hard main" | sh && git push --force origin feature/x`
+    # was allowed because the floor named the force-push, which was already seen.
+    coarse = None
+    for pattern, operation in _RAW_COARSE:
+        if operation in seen:
+            # The structural pass already reached this one, with a branch the
+            # floor could not have known. Adding a blind copy of what is already
+            # understood only denies what the direct form allows: `eval "git push
+            # --force"` would be refused while a bare `git push --force` passed,
+            # and T27 requires those to agree. The floor speaks about what the
+            # structural pass did NOT see.
+            continue
+        hit = pattern.search(scanned)
+        if hit is not None:
+            coarse = ClassifiedAction(operation, detail=command, match_offset=hit.start())
+            break
+    if coarse is None:
+        return None
+    if _borrows_ambient_head(coarse):
+        # A regex over an opaque string can name the verb but never the branch,
+        # and `_enrich` would fill that None with whatever is checked out.
+        coarse = ClassifiedAction(Operation.UNKNOWN, detail=coarse.detail)
+    # Report the command that ran, not the masked copy the floor read.
+    return replace(coarse, detail=command)
+
+
 def _bash_actions(command: str, _depth: int = 0) -> list[ClassifiedAction]:
     """Every structural action of one bash command, flattened, before any ranking.
 
@@ -1797,9 +1857,11 @@ def classify_tool_call_actions(
     command = str(tool_input.get("command", ""))
     actions = _bash_actions(command)
     ranked = classify_tool_call(tool_name, tool_input)
-    # The ranked winner carries the provenance stamp and may be the coarse
-    # finding, which is not in the structural list at all.
-    return [ranked, *actions]
+    # The ranked winner carries the provenance stamp. The floor's finding is
+    # added whether or not it won that comparison: ranking decides what to
+    # report, and a finding that lost it was disappearing from enforcement too.
+    coarse = _coarse_action(command, frozenset(a.operation for a in actions))
+    return [ranked, *actions] if coarse is None else [ranked, coarse, *actions]
 
 
 def classify_tool_call(tool_name: str, tool_input: dict[str, Any]) -> ClassifiedAction:
