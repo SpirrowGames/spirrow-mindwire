@@ -1330,8 +1330,6 @@ _DANGER_RANK: dict[Operation, int] = {
 #: ``git`` subcommands that change which branch is checked out, or where a bare
 #: push goes. This is a DENYLIST, and that direction is a deliberate retreat
 #: from the stricter rule tried first — see :func:`_may_switch_branch`.
-_BRANCH_SWITCHING_GIT_SUBCOMMANDS: frozenset[str] = frozenset({"checkout", "switch"})
-_PUSH_RETARGETING_GIT_SUBCOMMANDS: frozenset[str] = frozenset({"config"})
 _BRANCH_UPSTREAM_FLAGS: frozenset[str] = frozenset({"-u", "--set-upstream-to", "--track"})
 
 
@@ -1357,6 +1355,13 @@ def _borrows_ambient_head(action: ClassifiedAction) -> bool:
     if action.operation is Operation.GIT_MERGE:
         return action.target is None
     return action.operation in _HEAD_ENRICHED_OPERATIONS and action.branch is None
+
+
+#: Subcommands that move HEAD or change where a bare push lands, matched on the
+#: parsed subcommand so git's global flags cannot hide them.
+_BRANCH_MOVING_GIT_SUBCOMMANDS: frozenset[str] = frozenset(
+    {"checkout", "switch", "symbolic-ref", "update-ref", "config"}
+)
 
 
 #: Text meaning a later step may no longer trust the checkout.
@@ -1414,7 +1419,28 @@ def _may_switch_branch(action: ClassifiedAction) -> bool:
     # quoting shlex refuses, checkout invisible. Reading fragments as tokens is
     # what let that through (Tier B, PR #158 round 15); a pattern over the text
     # does not care where the fragment was cut.
-    return _SWITCHES_BRANCH_RE.search(action.detail) is not None
+    if _SWITCHES_BRANCH_RE.search(action.detail) is not None:
+        return True
+    # The pattern above anchors the subcommand to `git`, deliberately: widening
+    # it to "anywhere after git" would match `git commit -m "checkout main"` and
+    # deny an ordinary chained commit. But git takes GLOBAL flags before the
+    # subcommand — `git -C . checkout main`, `git -c core.autocrlf=false
+    # checkout main`, `git --no-pager checkout main` — and all three were
+    # measured ALLOWED beside a merge or a push. (Tier B, PR #158 round 22.)
+    #
+    # So the tokens answer that, since `_git_subcommand` already walks past the
+    # global flags and still reports `commit` for the commit-message case. The
+    # pattern stays for fragments the tokenizer cannot read at all.
+    try:
+        tokens = shlex.split(action.detail, posix=True)
+    except ValueError:
+        tokens = action.detail.split()
+    if not tokens or tokens[0] != "git":
+        return False
+    sub, args = _git_subcommand(tokens)
+    if sub in _BRANCH_MOVING_GIT_SUBCOMMANDS:
+        return True
+    return sub == "branch" and any(arg in _BRANCH_UPSTREAM_FLAGS for arg in args)
 
 
 def _chain_guarded(actions: list[ClassifiedAction], command: str) -> list[ClassifiedAction]:

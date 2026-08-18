@@ -1277,6 +1277,52 @@ async def test_guard_reading_head_is_not_moving_it(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # git takes global flags BEFORE the subcommand, and the pattern anchors
+        # the subcommand to `git`. All three measured ALLOWED beside a merge or
+        # a push. (Tier B, PR #158 round 22.)
+        ("dash-C", "git -C . checkout main && git merge feature/y"),
+        ("dash-c", "git -c core.autocrlf=false checkout main && git push"),
+        ("no-pager", "git --no-pager checkout main && git push"),
+        ("global-flag-then-symbolic-ref", "git -C . symbolic-ref HEAD refs/heads/main && git push"),
+    ],
+)
+async def test_guard_a_global_flag_does_not_hide_the_subcommand(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit -m checkout && git push",
+        'git commit -m "switch to main later" && git push',
+    ],
+)
+async def test_guard_a_subcommand_name_inside_a_message_is_not_a_switch(
+    tmp_path: Path, command: str
+) -> None:
+    """Why the pattern stays anchored and the tokens do the widening.
+
+    Matching `checkout` anywhere after `git` would have caught the global-flag
+    forms — and also every commit whose message mentions one, denying an
+    ordinary chained commit. `_git_subcommand` walks past the global flags and
+    still reports `commit` here.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow), command
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:
