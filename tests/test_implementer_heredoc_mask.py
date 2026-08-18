@@ -218,6 +218,59 @@ def test_every_exploit_stays_visible(label: str, cmd: str) -> None:
     assert _verdict(cmd) is Operation.FS_DELETE, label
 
 
+# --- a batch is more than one command ------------------------------------- #
+
+
+def test_an_ordinary_command_may_come_before_the_sink() -> None:
+    # The round-7 false negative: anchoring the opener to line 0 meant a batch
+    # that stages first never matched, and its Markdown body went to the floor.
+    cmd = "git add .\ngit commit -F - <<'A'\nprose mentioning rm -rf\nA"
+    assert _verdict(cmd) is Operation.GIT_COMMIT, cmd
+
+
+def test_every_heredoc_in_a_batch_is_masked_not_just_the_first() -> None:
+    # Open the PR, then comment on the issue, in one call. Both bodies are data.
+    cmd = (
+        "gh pr create --body-file - <<'A'\nsays rm -rf\nA\n"
+        "gh issue comment 1 --body-file - <<'B'\nalso rm -rf\nB"
+    )
+    assert _mask_quoted_heredoc_payloads(cmd) == (
+        "gh pr create --body-file - <<'A'\n           \nA\n"
+        "gh issue comment 1 --body-file - <<'B'\n           \nB"
+    )
+
+
+def test_a_line_the_scan_cannot_account_for_stops_it() -> None:
+    # Why "find any line that matches the template" — the round-7 prescription —
+    # is not safe. Line 1 matches perfectly, but bash ends ZZ's body at line 2
+    # and RUNS line 3 (measured). Because `bash <<'ZZ'` is neither a recognised
+    # opener nor a line that can be stepped over, the scan stops at line 0 and
+    # the deletion stays visible.
+    cmd = "bash <<'ZZ'\ngit commit -F - <<'X'\nZZ\n" + DELETION + "\nX"
+    assert _mask_quoted_heredoc_payloads(cmd) == cmd
+    assert _verdict(cmd) is Operation.FS_DELETE
+
+
+@pytest.mark.parametrize(
+    ("label", "before"),
+    [
+        ("operator", "git add . &&"),
+        ("continuation", "git add . " + BS),
+        ("substitution", "echo " + DQ + "$(" + DQ),
+        ("unclosed-quote", "echo 'x"),
+        ("redirect", "echo hi > out"),
+        ("word-initial-hash", "git add . # note"),
+    ],
+)
+def test_a_preceding_line_that_may_reach_the_next_one_stops_the_scan(
+    label: str, before: str
+) -> None:
+    # Stepping over a line asserts the next line starts a new command. These
+    # cannot promise that, so the body after them is left for the floor.
+    cmd = before + "\ngit commit -F - <<'A'\n" + DELETION + "\nA"
+    assert _verdict(cmd) is Operation.FS_DELETE, label
+
+
 def test_the_body_ends_at_the_first_terminator_and_the_rest_stays_shell() -> None:
     # The rule the last bypass broke, stated on its own. bash ends the body at
     # the FIRST delimiter line; a second one further down is not a terminator

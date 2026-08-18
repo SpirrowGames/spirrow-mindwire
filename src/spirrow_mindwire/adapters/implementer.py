@@ -719,9 +719,40 @@ _SINK_HEREDOC_OPENER_LINE_RE = re.compile(
 # one: the command is left whole for the floor to read.
 _HASH_BEGINS_A_WORD_RE = re.compile(r"(?:^|[ \t])#")
 
+# An ordinary command line: the same charset as the owner, over the whole line.
+# It is what lets the scan step over ``git add .`` on its way to the commit,
+# which is the false negative round 7 reported. Empty lines qualify.
+_PLAIN_COMMAND_LINE_RE = re.compile(
+    r"^[" + re.escape(_HEREDOC_OWNER_CHARS) + _NON_ASCII_RANGE + r"]*$"
+)
+
+
+def _is_a_plain_command_line(line: str) -> bool:
+    """Is this line a whole command, with nothing that reaches the next line?
+
+    Needed so the scan can walk PAST an ordinary command — ``git add .`` before
+    the commit — and still know that the line after it starts a new command
+    rather than continuing this one. The test is the same conservative one the
+    owner uses: every character is from :data:`_HEREDOC_OWNER_CHARS`, no ``#``
+    begins a word, and quotes balance. That excludes ``\\`` (continuation),
+    ``;`` ``&`` ``|`` (an operator whose right side may be on the next line),
+    ``$`` and backtick (a substitution bash reads across newlines), and ``<``
+    ``>`` (any redirect — so a line bearing a heredoc opener we do NOT recognise
+    can never be walked past as if it were ordinary).
+    """
+    if _HASH_BEGINS_A_WORD_RE.search(line):
+        return False
+    if _PLAIN_COMMAND_LINE_RE.match(line) is None:
+        return False
+    try:
+        shlex.split(line, posix=True)
+    except ValueError:
+        return False
+    return True
+
 
 def _mask_quoted_heredoc_payloads(command: str) -> str:
-    """Blank a quoted-heredoc body that is DATA for a known sink.
+    """Blank quoted-heredoc bodies that are DATA for a known sink.
 
     Returns ``command`` with those body characters replaced by spaces. Length and
     newline positions are preserved so ``match_offset`` / ``match_line`` on any
@@ -736,25 +767,44 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
     runs died on messages that merely *mentioned* deleting, one of them quoting
     the human's own instruction not to delete).
 
-    **Only one command shape is recognised**, and it is checked line by line
-    rather than by a single pattern:
+    The scan walks the command line by line and **accounts for every line it
+    passes**, which is the property that makes it safe. At each step the line is
+    one of exactly three things:
 
-    * line 0 is a data sink plus one quoted opener, carrying nothing that could
-      move where the body begins — see :data:`_HEREDOC_OWNER_CHARS`;
-    * the body runs to the **first** line that is exactly the delimiter — the
-      first, because that is where bash ends it, so a second delimiter further
-      down cannot stretch the body over the commands in between;
-    * from that line on, nothing is touched: trailing commands stay shell.
+    * a data sink carrying one quoted opener and nothing that could move where
+      the body begins (:data:`_HEREDOC_OWNER_CHARS`) — its body is blanked up to
+      the **first** line that is exactly the delimiter, because that is where
+      bash ends it, and the scan resumes after that line;
+    * an ordinary whole command (:func:`_is_a_plain_command_line`) — stepped
+      over, so a batch may put ``git add .`` before the commit;
+    * anything else — the scan stops there and leaves the remainder untouched.
 
-    Anything else returns ``command`` untouched, i.e. exactly as strict as before
-    this feature existed. That bluntness is the design. Six review rounds found
-    defect after defect in successively cleverer attempts to locate a heredoc
-    body, and running each one under bash separates them into two kinds:
+    Only bodies are blanked; every other line, before or after, stays shell for
+    the floor to read.
+
+    Accounting is what separates this from "find any line that looks like an
+    opener", which is what the round-7 critique prescribed and what round 1
+    already broke. A line matching the opener template is only an opener if it
+    is at a command position, and it is only at a command position if every line
+    before it was one of the three above. In::
+
+        bash <<'ZZ'
+        git commit -F - <<'X'
+        ZZ
+        rm -rf /tmp/a
+        X
+
+    line 1 matches the template perfectly, but bash ends ``ZZ``'s body at line 2
+    and runs line 3. The unrecognised ``bash <<'ZZ'`` stops the scan, so line 3
+    stays visible; treating line 1 as an opener would blank it.
+
+    Six review rounds found defect after defect in cleverer attempts to locate a
+    heredoc body, and running each under bash separates them into two kinds:
 
     * **three that really do run the line the mask blanked** — a fake opener
       inside a body, a backslash continuation, and a regex whose end anchor let
       a non-greedy body swallow the real terminator and the command behind it.
-      These are fail-OPEN, and they are the reason for the bluntness.
+      These are fail-OPEN, and they are the reason for the conservatism.
     * **the rest, which bash refuses to parse at all** — a trailing ``&&``,
       ``$(`` left open, a bare backtick. Measured: ``bash`` exits 2 and runs
       nothing. Declining these buys no safety over what bash already does; they
@@ -762,50 +812,49 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
       otherwise execute. Saying so keeps the record honest about which of the
       cases in ``tests/test_implementer_heredoc_mask.py`` are load-bearing.
 
-    The lesson taken is not "model bash better" but "recognise less".
+    The lesson taken is not "model bash better" but "recognise less, and never
+    step over a line without knowing what it is".
     """
     lines = command.split("\n")
-    if len(lines) < 2:
-        return command
-    opener = _SINK_HEREDOC_OPENER_LINE_RE.match(lines[0])
-    if opener is None:
-        return command
-    owner = opener.group("owner")
-    if _HASH_BEGINS_A_WORD_RE.search(owner):
-        # A word-initial `#` comments out the rest of the line, opener included,
-        # so what looks like a body is live shell.
-        return command
-    try:
-        tokens = shlex.split(owner, posix=True)
-    except ValueError:
-        return command
-    if not any(
-        len(tokens) >= len(sink) and tuple(tokens[: len(sink)]) == sink
-        for sink in _HEREDOC_DATA_SINKS
-    ):
-        return command
+    out = list(lines)
+    index = 0
+    while index < len(lines):
+        opener = _SINK_HEREDOC_OPENER_LINE_RE.match(lines[index])
+        owner = opener.group("owner") if opener is not None else ""
+        if opener is not None and not _HASH_BEGINS_A_WORD_RE.search(owner):
+            try:
+                tokens = shlex.split(owner, posix=True)
+            except ValueError:
+                tokens = []
+            if any(
+                len(tokens) >= len(sink) and tuple(tokens[: len(sink)]) == sink
+                for sink in _HEREDOC_DATA_SINKS
+            ):
+                delim = opener.group("delim")
+                strip_tabs = opener.group("dash") == "-"
+                end = None
+                for candidate in range(index + 1, len(lines)):
+                    line = lines[candidate]
+                    if (line.lstrip("\t") if strip_tabs else line) == delim:
+                        end = candidate
+                        break
+                if end is None:
+                    # No terminator: we cannot say where this body stops, so we
+                    # stop too and leave the rest of the command as shell.
+                    break
+                for body in range(index + 1, end):
+                    out[body] = " " * len(lines[body])
+                index = end + 1
+                continue
 
-    delim = opener.group("delim")
-    strip_tabs = opener.group("dash") == "-"
-    end = None
-    for index in range(1, len(lines)):
-        line = lines[index]
-        if (line.lstrip("\t") if strip_tabs else line) == delim:
-            end = index
-            break
-    if end is None:
-        # No terminator: we cannot say where the body stops.
-        return command
+        if _is_a_plain_command_line(lines[index]):
+            index += 1
+            continue
 
-    # Whatever follows the terminator is left exactly as it is, and that is the
-    # whole defence against the round-4 exploit rather than a separate rule:
-    # stopping at the FIRST delimiter line is what bash does, so a second one
-    # further down cannot extend the body over the commands in between. Those
-    # commands stay unmasked and the floor still reads them. Refusing to mask at
-    # all when anything follows — the previous behaviour — bought no safety on
-    # top of that and broke ordinary batching (``... EOF`` then ``git push``).
-    masked = [" " * len(line) for line in lines[1:end]]
-    return "\n".join([lines[0], *masked, *lines[end:]])
+        # Not an opener we recognise and not a line we can safely step over.
+        break
+
+    return "\n".join(out)
 
 
 def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
