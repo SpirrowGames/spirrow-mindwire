@@ -242,6 +242,73 @@ async def test_a_sibling_that_merely_shares_a_prefix_is_refused(tmp_path: Path) 
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("raw", ["~/.aws/credentials", "~", "~/../etc/hosts"])
+async def test_a_tilde_path_is_refused(tmp_path: Path, raw: str) -> None:
+    """`Path("~/x").is_absolute()` is False.
+
+    Joining it to the root therefore makes it look contained, while anything
+    that expands `~` downstream reads the real home directory. Measured.
+    (Tier B, PR #157 round 2.)
+    """
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Read", {"file_path": raw}) is False
+
+
+@pytest.mark.anyio
+async def test_a_tilde_inside_a_name_is_still_ordinary(tmp_path: Path) -> None:
+    """The fix must not cost a legitimate filename."""
+    (tmp_path / "a~b.py").write_text("x", encoding="utf-8")
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Read", {"file_path": "a~b.py"}) is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        ("list", ["/etc/shadow"]),
+        ("dict", {"path": "/etc/shadow"}),
+        ("int", 1),
+        ("none", None),
+        ("empty", ""),
+    ],
+)
+async def test_a_path_key_that_is_not_a_usable_path_is_refused(
+    tmp_path: Path, label: str, value: object
+) -> None:
+    """Fail closed on type confusion.
+
+    Skipping a present-but-unexpected value returns allow without ever having
+    checked anything — the one outcome a boundary must not have.
+    """
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Read", {"file_path": value}) is False, label
+    assert len(guard.denials) == 1
+
+
+@pytest.mark.anyio
+async def test_a_glob_pattern_can_escape_and_is_refused(tmp_path: Path) -> None:
+    """`Glob`'s pattern is a path pattern, so it leaves the root like a path.
+
+    Not reported by the review; found while fixing what was.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    guard = _PathScopeGuard(root=root)
+    assert await _verdict(guard, "Glob", {"pattern": "../../*.env"}) is False
+    assert await _verdict(guard, "Glob", {"pattern": "**/*.py"}) is True
+
+
+@pytest.mark.anyio
+async def test_a_grep_regex_is_not_treated_as_a_path(tmp_path: Path) -> None:
+    """`pattern` means a REGEX to `Grep`, and refusing those would cost every
+    ordinary search for no gain."""
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Grep", {"pattern": "a..b"}) is True
+    assert await _verdict(guard, "Grep", {"pattern": "^from .* import"}) is True
+
+
+@pytest.mark.anyio
 async def test_a_call_carrying_no_path_is_left_alone(tmp_path: Path) -> None:
     guard = _PathScopeGuard(root=tmp_path)
     assert await _verdict(guard, "Grep", {"pattern": "def "}) is True

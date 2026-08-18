@@ -186,6 +186,13 @@ async def _shutdown(client: _SdkClient) -> None:
 # given. ``Grep``/``Glob`` call it ``path``; ``Read`` calls it ``file_path``.
 _PATH_INPUT_KEYS: tuple[str, ...] = ("file_path", "path", "notebook_path")
 
+# ``pattern`` means different things per tool, so it cannot go in the list above.
+# For ``Glob`` it is a path pattern and escapes exactly like a path does —
+# measured, ``../../*.env`` leaves the root while ``**/*.py`` does not. For
+# ``Grep`` it is a REGEX, and treating a regex as a path would refuse ordinary
+# searches for no gain.
+_PATH_INPUT_KEYS_BY_TOOL: dict[str, tuple[str, ...]] = {"Glob": ("pattern",)}
+
 
 @dataclass
 class _PathScopeGuard:
@@ -218,27 +225,39 @@ class _PathScopeGuard:
         context: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
         root = self.root.resolve()
-        for key in _PATH_INPUT_KEYS:
-            raw = tool_input.get(key)
-            if not isinstance(raw, str) or not raw:
+        keys = _PATH_INPUT_KEYS + _PATH_INPUT_KEYS_BY_TOOL.get(tool_name, ())
+        for key in keys:
+            if key not in tool_input:
                 continue
-            candidate = Path(raw)
+            raw = tool_input[key]
+            if not isinstance(raw, str) or not raw:
+                # Present but not a path we can read. Skipping it would return
+                # allow without ever checking, so the one thing this must not do
+                # is `continue` (Tier B, PR #157 round 2).
+                return self._refuse(tool_name, raw, f"{key} is not a usable path")
+            # `~` before `is_absolute`: `Path("~/.aws/credentials")` is NOT
+            # absolute, so joining it to the root makes it look contained while
+            # anything that expands `~` downstream reads the real home directory.
+            # Measured both ways; `a~b` is untouched, so no ordinary name is lost.
+            candidate = Path(raw).expanduser()
             if not candidate.is_absolute():
                 candidate = root / candidate
             try:
                 resolved = candidate.resolve()
             except OSError:
                 # Cannot say where it points, so do not let it be read.
-                resolved = None
-            if resolved is None or not resolved.is_relative_to(root):
-                reason = (
-                    f"{tool_name} refused: {raw!r} resolves outside {root} — "
-                    "the proposer may read the repository it designs against, "
-                    "and nothing else"
-                )
-                self.denials.append(reason)
-                return PermissionResultDeny(message=reason, interrupt=True)
+                return self._refuse(tool_name, raw, "the path could not be resolved")
+            if not resolved.is_relative_to(root):
+                return self._refuse(tool_name, raw, f"it resolves outside {root}")
         return PermissionResultAllow()
+
+    def _refuse(self, tool_name: str, raw: object, why: str) -> PermissionResultDeny:
+        reason = (
+            f"{tool_name} refused: {raw!r} — {why}. The proposer may read the "
+            "repository it designs against, and nothing else"
+        )
+        self.denials.append(reason)
+        return PermissionResultDeny(message=reason, interrupt=True)
 
 
 class ClaudeCodeSdkAdapter:
