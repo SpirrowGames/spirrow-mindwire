@@ -696,6 +696,14 @@ _HEREDOC_DATA_SINKS: tuple[tuple[str, ...], ...] = (
 _HEREDOC_OWNER_CHARS = (
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \t._/=-:,+@!%^~*?()[]{}'\"#"
 )
+# The delimiter is any run of characters that is neither whitespace nor a quote.
+# It used to be a word-character run, which has no hyphen, so ``<<'EOF-1'`` and
+# ``<<'EOF-MARKER'`` — both valid, both measured — stopped being recognised and
+# their prose went to the coarse floor. Widening it cannot loosen anything: the
+# terminator has to equal the delimiter exactly, on this side and in bash alike,
+# so admitting more spellings only lets more real heredocs be seen. Quotes are
+# excluded because one would end the opener early, whitespace because bash's own
+# delimiter cannot contain any once the quotes come off. (Tier B, PR #156 r14.)
 _NON_ASCII_RANGE = "\u0080-\U0010ffff"
 """Every code point above ASCII, as one class range. No bash operator lives
 here, so admitting the lot cannot introduce one, and it keeps a Japanese
@@ -703,7 +711,7 @@ commit title from silently falling out of the recognised shape."""
 
 _SINK_HEREDOC_OPENER_LINE_RE = re.compile(
     r"^(?P<owner>[" + re.escape(_HEREDOC_OWNER_CHARS) + _NON_ASCII_RANGE + r"]+?)"
-    r"<<(?P<dash>-?)(?P<q>['\"])(?P<delim>\w+)(?P=q)[ \t]*$"
+    r"<<(?P<dash>-?)(?P<q>['\"])(?P<delim>[^\s'\"]+)(?P=q)[ \t]*$"
 )
 
 # ``#`` is a comment only where it BEGINS a word — bash's own rule, and the whole

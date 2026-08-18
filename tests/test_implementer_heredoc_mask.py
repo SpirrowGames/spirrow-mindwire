@@ -96,6 +96,20 @@ def test_each_data_sink_is_recognised(sink: str) -> None:
     assert _verdict(cmd) is not Operation.FS_DELETE, cmd
 
 
+@pytest.mark.parametrize(
+    "delim",
+    ["EOF", "EOF-1", "EOF-MARKER", "PRBODY_9f3a2c", "MSG.1", "EOF+X"],
+)
+def test_any_ordinary_delimiter_spelling_is_recognised(delim: str) -> None:
+    # Measured under bash: every one of these is a valid quoted delimiter and
+    # its body is data. The pattern used to be a word-character run, which has
+    # no hyphen, so a hyphenated delimiter aborted the mask and sent the prose
+    # to the floor. (Tier B, round 14.)
+    cmd = "git commit -F - <<'" + delim + "'\n" + DELETION + "\n" + delim
+    assert _mask_quoted_heredoc_payloads(cmd) != cmd, delim
+    assert _verdict(cmd) is Operation.GIT_COMMIT, delim
+
+
 def test_dash_form_allows_an_indented_terminator() -> None:
     cmd = "git commit -F - <<-'A'\n\tsays git rm\n\tA"
     assert _verdict(cmd) is Operation.GIT_COMMIT
