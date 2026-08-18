@@ -61,7 +61,7 @@ async def test_a_retargeted_upstream_is_where_the_push_lands(
 ) -> None:
     """The bypass: the local name says `feature/x`, the push writes `main`."""
     repo = _clone_with(tmp_path, push_default=mode, upstream="origin/main")
-    assert _push_destination(repo) == "main"
+    assert _push_destination(repo, "git push --force") == "main"
     guard = _AllowlistGuard(default_allowlist(repo_root=repo))
     res = await guard("Bash", {"command": command}, ToolPermissionContext())
     assert isinstance(res, PermissionResultDeny)
@@ -75,7 +75,7 @@ async def test_same_name_modes_keep_using_the_local_name(
     """`simple` (git's default) and `current` push to the same-named branch, so
     the local name IS the destination and ordinary work must keep passing."""
     repo = _clone_with(tmp_path, push_default=mode, upstream=None)
-    assert _push_destination(repo) == expected
+    assert _push_destination(repo, "git push --force") == expected
     guard = _AllowlistGuard(default_allowlist(repo_root=repo))
     res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
     assert isinstance(res, PermissionResultAllow)
@@ -87,7 +87,7 @@ async def test_an_upstream_inside_the_glob_still_passes(tmp_path: Path) -> None:
     repo = _clone_with(tmp_path, push_default="upstream", upstream=None)
     _run(repo, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
     _run(repo, "branch", "-u", "origin/feature/x")
-    assert _push_destination(repo) == "feature/x"
+    assert _push_destination(repo, "git push --force") == "feature/x"
     guard = _AllowlistGuard(default_allowlist(repo_root=repo))
     res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
     assert isinstance(res, PermissionResultAllow)
@@ -99,7 +99,7 @@ async def test_modes_that_name_no_single_branch_fail_closed(tmp_path: Path, mode
     """`matching` writes every same-named branch and `nothing` refuses; neither
     is one branch, so the predicate declines and the guard denies."""
     repo = _clone_with(tmp_path, push_default=mode, upstream=None)
-    assert _push_destination(repo) is None
+    assert _push_destination(repo, "git push --force") is None
     guard = _AllowlistGuard(default_allowlist(repo_root=repo))
     res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
     assert isinstance(res, PermissionResultDeny)
@@ -118,3 +118,44 @@ async def test_an_explicit_refspec_is_not_second_guessed(tmp_path: Path) -> None
         "Bash", {"command": "git push --force origin main"}, ToolPermissionContext()
     )
     assert isinstance(denied, PermissionResultDeny)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # The query below reads the PERSISTENT config, and an override on the
+        # command line never reaches it. Measured: with `push.default` unset,
+        # a bare `git push --force` is refused by git itself, while
+        # `git -c push.default=upstream push --force` reports `feature/x -> main`
+        # and moves it. (Tier B, PR #158 round 18.)
+        ("dash-c", "git -c push.default=upstream push --force"),
+        # The environment form of the same override. It has to be read off the
+        # RAW command: the classifier strips a leading `NAME=value` prefix, so
+        # by the time the action carries a `detail` the override is gone.
+        (
+            "environment",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default "
+            "GIT_CONFIG_VALUE_0=upstream git push --force",
+        ),
+        # Refused even when the override is harmless: which keys matter is not
+        # something a regex over a command line should be asked to decide.
+        ("unrelated-key", "git -c core.pager=cat push --force"),
+    ],
+)
+async def test_an_inline_config_override_makes_the_destination_undecidable(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    repo = _clone_with(tmp_path, push_default=None, upstream="origin/main")
+    guard = _AllowlistGuard(default_allowlist(repo_root=repo))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+async def test_an_override_on_a_command_that_is_not_a_push_is_ignored(tmp_path: Path) -> None:
+    """Only the push destination depends on that configuration."""
+    repo = _clone_with(tmp_path, push_default=None, upstream=None)
+    guard = _AllowlistGuard(default_allowlist(repo_root=repo))
+    res = await guard("Bash", {"command": "git -c core.pager=cat log"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)

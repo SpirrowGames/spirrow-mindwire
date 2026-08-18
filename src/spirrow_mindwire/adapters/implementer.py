@@ -1926,7 +1926,16 @@ def _git_output(repo_root: Path, args: list[str]) -> str | None:
     return value or None
 
 
-def _push_destination(repo_root: Path) -> str | None:
+#: An inline configuration override — `git -c key=value` or the `GIT_CONFIG_*`
+#: environment form. Either can change where a bare push lands without leaving a
+#: trace in the persistent config the guard reads.
+_GIT_CONFIG_OVERRIDE_RE = re.compile(
+    r"\bgit\b[^\n]*?\s-c\s(?=\S)"  # git -c key=value …
+    r"|\bGIT_CONFIG(?:_COUNT|_KEY_[0-9]+|_VALUE_[0-9]+|_GLOBAL|_SYSTEM|_NOSYSTEM)?\b"
+)
+
+
+def _push_destination(repo_root: Path, command: str) -> str | None:
     """Which remote branch does a bare ``git push`` from here actually write?
 
     NOT the local branch name. Measured end to end: with
@@ -1949,6 +1958,16 @@ def _push_destination(repo_root: Path) -> str | None:
     neither maps to the single branch this predicate returns, so both give None
     and the caller fails closed.
     """
+    if _GIT_CONFIG_OVERRIDE_RE.search(command):
+        # The query below reads the repository's PERSISTENT configuration, and an
+        # override on the command line never reaches it. Measured: with
+        # `push.default` unset (`simple`) and the upstream retargeted to
+        # `origin/main`, a bare `git push --force` is refused by git itself,
+        # while `git -c push.default=upstream push --force` reports
+        # `feature/x -> main` and moves it. The same holds for the `GIT_CONFIG_*`
+        # environment form. Out-of-band state cannot answer for an in-band
+        # override, so it declines. (Tier B, PR #158 round 18.)
+        return None
     mode = _git_output(repo_root, ["config", "--get", "push.default"]) or "simple"
     if mode in ("simple", "current"):
         return _current_branch(repo_root)
@@ -2042,7 +2061,7 @@ class _AllowlistGuard:
         # was attempted, and dropping it is the defect this record exists to fix.
         self.violation_actions: list[ClassifiedAction] = []
 
-    def _enrich(self, action: ClassifiedAction) -> ClassifiedAction:
+    def _enrich(self, action: ClassifiedAction, command: str = "") -> ClassifiedAction:
         """Fill an unparsed branch/target from the repo's current branch.
 
         ``git commit`` / bare ``git push`` carry no branch and ``git merge`` no
@@ -2080,7 +2099,10 @@ class _AllowlistGuard:
             # Everything else here acts on the checkout, so the local name is
             # the answer for those.
             cur = (
-                _push_destination(repo_root)
+                # The RAW command, not `action.detail`: the classifier strips a
+                # leading `NAME=value` environment prefix, which is exactly where
+                # the `GIT_CONFIG_*` form of an override lives.
+                _push_destination(repo_root, command or action.detail)
                 if action.operation in (Operation.GIT_PUSH, Operation.FORCE_PUSH)
                 else _current_branch(repo_root)
             )
@@ -2108,8 +2130,9 @@ class _AllowlistGuard:
         # so an allowed `force_push` written before a denied one used to shadow
         # it entirely (PR #158 round 12). The first denial wins, and the ranked
         # winner is checked first so a denial keeps the report it always had.
+        raw_command = str(tool_input.get("command", "")) if tool_name == "Bash" else ""
         for action in (
-            self._enrich(candidate)
+            self._enrich(candidate, raw_command)
             for candidate in classify_tool_call_actions(tool_name, tool_input)
         ):
             decision = self._allowlist.check(action)
