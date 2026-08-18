@@ -944,6 +944,49 @@ async def test_guard_a_merge_after_a_checkout_cannot_trust_ambient_head(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # Measured ALLOWED before this: the structural pass reached UNKNOWN, and
+        # the coarse floor overwrote it with a branchless HISTORY_REWRITE that
+        # `_enrich` then filled with `feature/x`. (Tier B, PR #158 round 10.)
+        ("wrapped-reset", 'bash -c "git checkout main && git reset --hard HEAD~1"'),
+        ("wrapped-force-push", 'bash -c "git checkout main && git push --force"'),
+        ("eval-wrapped", 'eval "git checkout main && git reset --hard"'),
+        (
+            "written-then-run",
+            'echo "git checkout main && git push --force origin main" > s.sh && bash s.sh',
+        ),
+    ],
+)
+async def test_guard_the_coarse_floor_cannot_hand_back_a_branchless_rewrite(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    """The floor is a regex over an opaque string: it knows the verb, never the branch.
+
+    While `force_push` / `history_rewrite` were unconditional Tier C denials that
+    did not matter — the verb alone decided it. Branch-scoped, a `branch=None`
+    from the floor gets enriched with whatever is checked out and looks safe, so
+    the floor's finding is reduced to UNKNOWN: the denial is kept and the branch
+    that was never known is dropped.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+async def test_guard_wrapping_an_allowed_force_push_still_allows_it(tmp_path: Path) -> None:
+    """T27's direct == wrapped, kept: the reduction must not deny what the
+    direct form allows."""
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": 'eval "git push --force"'}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:

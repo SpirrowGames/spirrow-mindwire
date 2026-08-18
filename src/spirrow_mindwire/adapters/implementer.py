@@ -1508,6 +1508,20 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     gate_open = bool(_INDIRECTION_RE.search(command))
     if gate_open:
         coarse = _scan_raw_coarse(scanned)
+        if coarse is not None and _borrows_ambient_head(coarse):
+            # The floor is a regex over an opaque string: it can name the verb
+            # but never the branch, so it returns `branch=None` and `_enrich`
+            # then fills in whatever happens to be checked out. While these were
+            # unconditional Tier C denials that did not matter — the verb alone
+            # decided it. Branch-scoped, it turns the floor into a bypass:
+            # measured on `bash -c "git checkout main && git reset --hard
+            # HEAD~1"`, the structural pass correctly reached UNKNOWN and the
+            # floor overwrote it with a branchless HISTORY_REWRITE that enriched
+            # to `feature/x` and was ALLOWED. (Tier B, PR #158 round 10.)
+            #
+            # UNKNOWN keeps the denial and drops the branch that was never known.
+            # The floor still only ever ADDS a denial.
+            coarse = ClassifiedAction(Operation.UNKNOWN, detail=coarse.detail)
         if coarse is not None and _DANGER_RANK.get(coarse.operation, 0) >= _DANGER_RANK.get(
             candidate.operation, 0
         ):
