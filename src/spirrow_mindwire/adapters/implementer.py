@@ -717,7 +717,23 @@ _SINK_HEREDOC_OPENER_LINE_RE = re.compile(
 # Whitespace inside quotes is not word separation, so ``--title "a # b"`` is
 # refused here although bash would keep it literal. That direction is the safe
 # one: the command is left whole for the floor to read.
-_HASH_BEGINS_A_WORD_RE = re.compile(r"(?:^|[ \t])#")
+#
+# A word also begins after a METACHARACTER, not only after whitespace, and ``)``
+# is a metacharacter that this charset admits. Round 8 turned that into a real
+# bypass, measured::
+#
+#     (
+#     git commit -F - )#<<'EOF'
+#     rm -rf /tmp/x
+#     EOF
+#
+# bash closes the subshell at ``)``, treats ``#<<'EOF'`` as a comment — so there
+# is no heredoc — and runs the deletion. ``shlex`` splits on whitespace only, so
+# it hands back ``)#`` as one token and the sink prefix still matches. The other
+# metacharacters (``|`` ``&`` ``;`` ``<`` ``>``) cannot appear: the charset has
+# never admitted them. Measured over every admitted character, in five bash
+# contexts, ``)`` was the only miss.
+_HASH_BEGINS_A_WORD_RE = re.compile(r"(?:^|[ \t()])#")
 
 # An ordinary command line: the same charset as the owner, over the whole line.
 # It is what lets the scan step over ``git add .`` on its way to the commit,

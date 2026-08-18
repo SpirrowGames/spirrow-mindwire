@@ -50,6 +50,8 @@ PREFIXES = [
     ["echo 'x"],
     ["git add . # note"],
     ["git add . " + BS],
+    ["("],  # opens a subshell, so `)` becomes reachable in the opener
+    ["{"],
     [PROBE],
 ]
 
@@ -59,6 +61,13 @@ OPENERS = [
     "SINK <<'A' &&",
     "SINK <<'A' ; eval " + BS,
     "SINK # <<'A'",
+    # Round 8, measured: bash closes the subshell at `)`, reads `#<<'A'` as a
+    # comment, and runs the next line. A `#` check that only knew about spaces
+    # masked it. `)` is a metacharacter, so it begins a word just as space does.
+    "SINK )#<<'A'",
+    "SINK ) #<<'A'",
+    "SINK ) <<'A'",
+    "SINK " + DQ + "x" + DQ + "#<<'A'",
     "tee out <<'A'",
     "SINK <<A",  # unquoted delimiter: the body is expanded, so it is not inert
 ]

@@ -240,6 +240,25 @@ def test_every_heredoc_in_a_batch_is_masked_not_just_the_first() -> None:
     )
 
 
+def test_a_hash_after_a_closing_paren_is_a_comment() -> None:
+    # Round 8, and a real fail-open when it was reported. A word begins after a
+    # metacharacter, not only after whitespace, and `)` is one. Measured: bash
+    # closes the subshell at `)`, reads `#<<'EOF'` as a comment — so there is no
+    # heredoc — and runs the deletion. `shlex` splits on whitespace only, so it
+    # returns `)#` as one token and the sink prefix still matched.
+    cmd = "(\ngit commit -F - )#<<'A'\n" + DELETION + "\nA"
+    assert _mask_quoted_heredoc_payloads(cmd) == cmd
+    assert _verdict(cmd) is Operation.FS_DELETE
+
+
+def test_a_subshell_that_really_does_take_the_heredoc_is_still_masked() -> None:
+    # The near neighbour, to show the rule above is about the comment and not
+    # about `)`: here the heredoc genuinely belongs to the closed subshell, so
+    # the body is data and is blanked.
+    cmd = "(\ngit commit -F - ) <<'A'\nsays rm -rf\nA"
+    assert _verdict(cmd) is not Operation.FS_DELETE, cmd
+
+
 def test_a_line_the_scan_cannot_account_for_stops_it() -> None:
     # Why "find any line that matches the template" — the round-7 prescription —
     # is not safe. Line 1 matches perfectly, but bash ends ZZ's body at line 2
