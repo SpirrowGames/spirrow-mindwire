@@ -1007,6 +1007,59 @@ async def test_guard_wrapping_an_allowed_force_push_still_allows_it(tmp_path: Pa
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # Both are force_push at rank 100, and `max` keeps the FIRST — so the
+        # allowed one shadowed the denied one entirely. Measured ALLOWED before
+        # the guard began checking every action. (Tier B, PR #158 round 12.)
+        (
+            "allowed-then-denied",
+            "git push --force origin feature/x && git push --force origin main",
+        ),
+        (
+            "allowed-then-wrapped",
+            'git push --force origin feature/x && bash -c "git push --force origin main"',
+        ),
+        # And with a lower-ranked first action, which always worked — kept so a
+        # regression cannot hide behind the case that was already covered.
+        ("commit-then-denied", "git commit -m x && git push --force origin main"),
+    ],
+)
+async def test_guard_an_allowed_action_cannot_shadow_a_denied_one(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    """Ranking picks what to REPORT; it must not pick what to enforce.
+
+    Two actions can share the top rank while only one would be denied, and ties
+    break by position. While `force_push` was an unconditional Tier C denial it
+    did not matter which one won; branch-scoped, it decides.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+async def test_guard_checking_every_action_does_not_deny_ordinary_batches(
+    tmp_path: Path,
+) -> None:
+    """The other direction: enforcing over all of them must not start refusing
+    the commands the loop actually writes."""
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    for command in (
+        "git add . && git commit -m x",
+        "git add -A && git commit -m x && git push",
+        "git push --force origin feature/x",
+        "git merge feature/x",
+    ):
+        res = await guard("Bash", {"command": command}, ToolPermissionContext())
+        assert isinstance(res, PermissionResultAllow), command
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:

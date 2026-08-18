@@ -1405,6 +1405,24 @@ def _may_switch_branch(action: ClassifiedAction) -> bool:
     return sub == "branch" and any(arg in _BRANCH_UPSTREAM_FLAGS for arg in args)
 
 
+def _bash_actions(command: str, _depth: int = 0) -> list[ClassifiedAction]:
+    """The structural actions of one bash command, before any ranking.
+
+    Shares its split with :func:`_classify_bash` so the two cannot disagree
+    about what the command contains — the enforcement path must see every part
+    the reporting path considered.
+    """
+    if _depth > _MAX_INDIRECTION_DEPTH:
+        return [ClassifiedAction(Operation.UNKNOWN, detail=command)]
+    scanned = _mask_quoted_heredoc_payloads(command) if _depth == 0 else command
+    parts = [p.strip() for p in _BASH_SEP.split(scanned) if p.strip()]
+    if not parts:
+        return [ClassifiedAction(Operation.EXEC_CODE, detail=command)]
+    actions = [_classify_single_bash(p, _depth) for p in parts]
+    actions += [_classify_bash(inner, _depth + 1) for inner in _extract_substitutions(scanned)]
+    return actions
+
+
 def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     """Classify a (possibly compound / wrapped) bash command by its most dangerous part.
 
@@ -1653,6 +1671,36 @@ def _classify_mcp(tool_name: str, tool_input: dict[str, Any]) -> ClassifiedActio
 _BENIGN_BUILTIN_TOOLS = frozenset({"TodoWrite", "BashOutput", "KillShell"})
 
 
+def classify_tool_call_actions(
+    tool_name: str, tool_input: dict[str, Any]
+) -> list[ClassifiedAction]:
+    """Every action a tool call contains, not just its most dangerous one.
+
+    :func:`classify_tool_call` reduces a compound command to one action by
+    danger rank, and ties are broken by position. That is fine for reporting and
+    wrong for enforcement: two actions can share the top rank while only one of
+    them would be denied, and the allowed one wins by being written first.
+    Measured, on ``feature/x``::
+
+        git push --force origin feature/x && git push --force origin main
+
+    was ALLOWED — both are ``force_push`` at rank 100, ``max`` kept the first,
+    and the second went unexamined. While ``force_push`` was an unconditional
+    Tier C denial it did not matter which one won; branch-scoped, it decides.
+
+    So the guard checks all of them and denies if ANY is denied. Reporting still
+    uses the ranked winner. (Tier B, PR #158 round 12.)
+    """
+    if tool_name != "Bash":
+        return [classify_tool_call(tool_name, tool_input)]
+    command = str(tool_input.get("command", ""))
+    actions = _bash_actions(command)
+    ranked = classify_tool_call(tool_name, tool_input)
+    # The ranked winner carries the provenance stamp and may be the coarse
+    # finding, which is not in the structural list at all.
+    return [ranked, *actions]
+
+
 def classify_tool_call(tool_name: str, tool_input: dict[str, Any]) -> ClassifiedAction:
     """Map one SDK tool call to a classified allow-list :class:`ClassifiedAction`.
 
@@ -1831,13 +1879,21 @@ class _AllowlistGuard:
         tool_input: dict[str, Any],
         context: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
-        action = self._enrich(classify_tool_call(tool_name, tool_input))
-        decision = self._allowlist.check(action)
-        if decision.allowed:
-            return PermissionResultAllow()
-        self.violations.append(decision)
-        self.violation_actions.append(action)
-        return PermissionResultDeny(message=decision.reason, interrupt=True)
+        # Every action, not only the ranked winner: ties are broken by position,
+        # so an allowed `force_push` written before a denied one used to shadow
+        # it entirely (PR #158 round 12). The first denial wins, and the ranked
+        # winner is checked first so a denial keeps the report it always had.
+        for action in (
+            self._enrich(candidate)
+            for candidate in classify_tool_call_actions(tool_name, tool_input)
+        ):
+            decision = self._allowlist.check(action)
+            if decision.allowed:
+                continue
+            self.violations.append(decision)
+            self.violation_actions.append(action)
+            return PermissionResultDeny(message=decision.reason, interrupt=True)
+        return PermissionResultAllow()
 
 
 @dataclass
