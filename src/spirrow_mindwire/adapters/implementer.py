@@ -751,6 +751,84 @@ _PLAIN_COMMAND_LINE_RE = re.compile(
     r"^[" + re.escape(_HEREDOC_OWNER_CHARS) + _NON_ASCII_RANGE + r"]*$"
 )
 
+# Stepping over a line asserts more than "the next line starts a new command".
+# It also asserts that a sink invocation FURTHER DOWN still means what it says —
+# and a line the scan walks past can rebind the name. Measured (round 12)::
+#
+#     git() {
+#     bash
+#     }
+#     git commit -F - <<'EOF'
+#     rm -rf /
+#     EOF
+#
+# Every one of those three lines is ordinary text with balanced quotes, so the
+# scan stepped over all three, recognised the sink, and blanked the body. bash
+# then ran `git commit -F -` as the FUNCTION, which execs `bash`, which inherits
+# stdin — the heredoc — and executes the deletion. The same trick was measured in
+# seven more spellings: `git ()  {`, `function git {`, `PATH=/tmp`,
+# `export PATH=/tmp`, `source f`, `. f`, and `shopt -s expand_aliases` +
+# `alias git=bash`. All eight were masked.
+#
+# Two positive requirements close the class rather than the instance:
+#
+#   1. no ``( ) { }`` anywhere in the line. Every spelling of a function
+#      definition or a command group needs one, whatever the spacing;
+#   2. the first word must name an EXTERNAL program. A subprocess cannot touch
+#      the calling shell's function table, aliases or PATH, so what it does is
+#      irrelevant here; a shell keyword or builtin can, and a bare ``NAME=value``
+#      is an assignment rather than a command. An unlisted first word is not
+#      judged, it just stops the scan.
+_COMPOUND_COMMAND_CHARS = frozenset("(){}")
+
+_STEPPABLE_COMMANDS = frozenset(
+    {
+        # The sink families, so a batch may stage or inspect before it writes.
+        "git",
+        "gh",
+        # Toolchain and shell-adjacent commands this loop actually emits.
+        "uv",
+        "python",
+        "python3",
+        "pytest",
+        "ruff",
+        "mypy",
+        "npm",
+        "npx",
+        "node",
+        "cargo",
+        "go",
+        "dotnet",
+        "make",
+        "pwsh",
+        # Ordinary file and text utilities.
+        "cat",
+        "chmod",
+        "cp",
+        "curl",
+        "date",
+        "diff",
+        "echo",
+        "find",
+        "grep",
+        "head",
+        "jq",
+        "ls",
+        "mkdir",
+        "mv",
+        "printf",
+        "pwd",
+        "sed",
+        "sort",
+        "tail",
+        "tar",
+        "touch",
+        "true",
+        "uniq",
+        "wc",
+    }
+)
+
 
 def _without_trailing_cr(line: str) -> str:
     """Drop one trailing ``\\r``, so a CRLF command is read like an LF one.
@@ -773,7 +851,13 @@ def _without_trailing_cr(line: str) -> str:
 
 
 def _is_a_plain_command_line(line: str) -> bool:
-    """Is this line a whole command, with nothing that reaches the next line?
+    """May the scan walk past this line?
+
+    Two things have to hold, and the second was learnt the hard way. The line
+    must not reach the NEXT line, so that the line after it really does start a
+    new command. And it must not change what a sink invocation further down
+    MEANS — see :data:`_STEPPABLE_COMMANDS` for the function-definition bypass
+    that obligation exists to close.
 
     Needed so the scan can walk PAST an ordinary command — ``git add .`` before
     the commit — and still know that the line after it starts a new command
@@ -806,11 +890,13 @@ def _is_a_plain_command_line(line: str) -> bool:
         line = line[: comment.end() - 1]
     if _PLAIN_COMMAND_LINE_RE.match(line) is None:
         return False
+    if _COMPOUND_COMMAND_CHARS.intersection(line):
+        return False
     try:
-        shlex.split(line, posix=True)
+        tokens = shlex.split(line, posix=True)
     except ValueError:
         return False
-    return True
+    return not tokens or tokens[0] in _STEPPABLE_COMMANDS
 
 
 def _mask_quoted_heredoc_payloads(command: str) -> str:
@@ -838,7 +924,8 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
       the **first** line that is exactly the delimiter, because that is where
       bash ends it, and the scan resumes after that line;
     * an ordinary whole command (:func:`_is_a_plain_command_line`) — stepped
-      over, so a batch may put ``git add .`` before the commit;
+      over, so a batch may put ``git add .`` before the commit. "Ordinary" means
+      it neither reaches the next line nor rebinds anything the sink depends on;
     * anything else — the scan stops there and leaves the remainder untouched.
 
     Only bodies are blanked; every other line, before or after, stays shell for

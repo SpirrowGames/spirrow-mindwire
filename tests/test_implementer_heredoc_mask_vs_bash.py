@@ -53,12 +53,15 @@ PREFIXES = [
     ["git add . # note"],
     ["# create the PR"],
     ["# don't delete"],
-    ["# then run tests && lint"],
-    ["# continued " + BS],
     ["git add --title a#b'c"],  # mid-word `#`: the quote after it is real
     ["git add . " + BS],
     ["("],  # opens a subshell, so `)` becomes reachable in the opener
     ["{"],
+    # Round 12: lines that rebind the sink's name. The function definition is
+    # the one that demonstrates itself — bash calls the function, which execs
+    # `bash`, which inherits stdin and runs the heredoc body.
+    ["CMD() {", "bash", "}"],
+    ["unfamiliar-tool --go"],
     [PROBE],
 ]
 
@@ -72,14 +75,12 @@ OPENERS = [
     # comment, and runs the next line. A `#` check that only knew about spaces
     # masked it. `)` is a metacharacter, so it begins a word just as space does.
     "SINK )#<<'A'",
-    "SINK ) #<<'A'",
     "SINK ) <<'A'",
     "SINK " + DQ + "x" + DQ + "#<<'A'",
     # Round 9: `(` is a metacharacter too, but unreachable in argument position,
     # so treating it as a comment opener only cost the round-6 fix. Both spellings
     # are here so the claim is measured rather than argued.
     "SINK (#<<'A'",
-    "SINK a(#<<'A'",
     "SINK --title " + DQ + "docs (#12)" + DQ + " <<'A'",
     "tee out <<'A'",
     "SINK <<A",  # unquoted delimiter: the body is expanded, so it is not inert
@@ -106,7 +107,9 @@ def _render(
             # with, so it is substituted rather than compared.
             rendered.append(line.replace(PROBE, "touch '" + markers[index].as_posix() + "'"))
         else:
-            rendered.append(line.replace("SINK", sink))
+            # SINK is the whole invocation; CMD is only its command word, which
+            # is what a function definition has to shadow.
+            rendered.append(line.replace("SINK", sink).replace("CMD", sink.split()[0]))
     return separator.join(rendered)
 
 

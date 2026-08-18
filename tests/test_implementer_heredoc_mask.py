@@ -264,12 +264,47 @@ def test_a_hash_after_a_closing_paren_is_a_comment() -> None:
     assert _verdict(cmd) is Operation.FS_DELETE
 
 
-def test_a_subshell_that_really_does_take_the_heredoc_is_still_masked() -> None:
-    # The near neighbour, to show the rule above is about the comment and not
-    # about `)`: here the heredoc genuinely belongs to the closed subshell, so
-    # the body is data and is blanked.
+def test_a_subshell_stops_the_scan_even_when_it_really_takes_the_heredoc() -> None:
+    # Here the heredoc genuinely belongs to the closed subshell, so bash treats
+    # the body as data and masking it would be correct. It is not masked anyway:
+    # `(` is a compound-command character, and since round 12 those stop the
+    # scan outright, because a group is one of the ways to rebind a sink name.
+    # A false negative, taken deliberately over parsing compound commands.
     cmd = "(\ngit commit -F - ) <<'A'\nsays rm -rf\nA"
-    assert _verdict(cmd) is not Operation.FS_DELETE, cmd
+    assert _mask_quoted_heredoc_payloads(cmd) == cmd
+
+
+@pytest.mark.parametrize(
+    ("label", "before"),
+    [
+        # Round 12. Each of these rebinds `git`, so the `git commit -F -` below
+        # is no longer a data sink and its "body" is executed. Measured: with
+        # the function definition bash runs the heredoc body, because the
+        # function execs `bash`, which inherits stdin.
+        ("function-definition", "git() {\nbash\n}"),
+        ("function-definition-spaced", "git ()  {\nbash\n}"),
+        ("function-keyword", "function git {\nbash\n}"),
+        ("path-assignment", "PATH=/tmp"),
+        ("exported-path", "export PATH=/tmp"),
+        ("source", "source setup.sh"),
+        ("dot-source", ". setup.sh"),
+        ("alias", "shopt -s expand_aliases\nalias git=bash"),
+    ],
+)
+def test_a_line_that_could_rebind_the_sink_stops_the_scan(label: str, before: str) -> None:
+    # Stepping over a line asserts the sink further down still means what it
+    # says. None of these can promise that, so the body stays visible.
+    cmd = before + "\ngit commit -F - <<'A'\n" + DELETION + "\nA"
+    assert _mask_quoted_heredoc_payloads(cmd) == cmd, label
+    assert _verdict(cmd) is Operation.FS_DELETE, label
+
+
+def test_an_unlisted_command_is_not_judged_only_stepped_around() -> None:
+    # The rule is an allowlist of external programs, not a denylist of dangerous
+    # ones: an unfamiliar first word simply ends the scan, leaving everything
+    # after it as shell for the floor to read.
+    cmd = "unfamiliar-tool --go\ngit commit -F - <<'A'\nprose\nA"
+    assert _mask_quoted_heredoc_payloads(cmd) == cmd
 
 
 def test_a_line_the_scan_cannot_account_for_stops_it() -> None:
