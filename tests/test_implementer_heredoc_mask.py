@@ -1,21 +1,31 @@
-"""Quoted-heredoc masking: the parse must follow bash, not a convenient subset.
+"""Quoted-heredoc masking: one recognised shape, everything else left as shell.
 
 The mask exists because the implementer is told to write commit messages and PR
-bodies through heredocs, those bodies are Markdown, and the classifier was
-reading their prose as shell (PR #154). Getting the *parse* right then took two
-rounds of independent review, and each round found a real defect:
+bodies through a heredoc, those bodies are Markdown, a code span is a backtick,
+and a lone backtick opened the coarse floor over the prose. Measured 2026-08-17:
+four conductor runs died on messages that merely *mentioned* deleting, one of
+them quoting the human's own instruction not to delete a file.
 
-* **#154** scanned with ``finditer`` over the whole command, so an opener-shaped
-  string *inside* a body was treated as a real opener. With its terminator placed
-  after the real one, the masked span swallowed live commands — a full bypass of
-  the classifier.
-* **#156** fixed that with a cursor but assumed one opener per line. bash allows
-  several on a line, with the bodies following in opener order, so the cursor
-  jumped past body A and never saw the ``<<'B'`` opener behind it.
+Getting the *parse* right then failed four times. Each Tier B round found a real
+defect in the attempt to work out where a heredoc body begins:
 
-Both are pinned below as cases. The last test states the invariant they each
-broke *once*, rather than case by case: a Tier C verb in a shell position is
-always seen, and one that sits only inside a masked sink body never is.
+1. a fake opener inside a body, its terminator placed after the real one, so the
+   masked span swallowed live commands (PR #154 — an outright bypass);
+2. several openers on one line, whose bodies follow in opener order, so a cursor
+   that jumped past the first landed behind the second and never masked it;
+3. a backslash line-continuation, which defers the body past the next physical
+   newline — the mask blanked the continued command as if it were data (bypass);
+4. a comment hiding a trailing ``&&``, and ``$(`` inside double quotes — two more
+   ways for the logical line to keep going (bypasses).
+
+Every fix was correct and every one left another construct. So the question
+changed from "where does the body begin?" to "**is this the one shape we are
+sure about?**" — a single data-sink invocation, a single quoted heredoc, and
+nothing else in the command. Anything else is not masked, which is exactly as
+strict as before the feature existed.
+
+All five exploits are kept below as cases: each fails the template on structure
+alone. The final test states the promise as a property rather than a case list.
 """
 
 from __future__ import annotations
@@ -26,62 +36,49 @@ from spirrow_mindwire.adapters.implementer import classify_tool_call
 from spirrow_mindwire.allowlist import Operation
 
 DELETION = "rm -rf /tmp/x"
+BS = chr(92)
+DQ = chr(34)
+BT = chr(96)
 
 
 def _verdict(command: str) -> Operation:
     return classify_tool_call("Bash", {"command": command}).operation
 
 
-# --- the two exploits, kept verbatim ------------------------------------- #
+# --- the shape the mask exists for ---------------------------------------- #
 
 
-def test_fake_opener_inside_a_body_cannot_blank_the_commands_after_it() -> None:
-    # PR #154, from the Tier B naysayer. bash ends the heredoc at the delimiter
-    # and then runs the deletion; the old scan read the literal `<<'echo'` on
-    # line 2 as an opener, found a terminator line `echo` at the very end, and
-    # blanked everything between — the deletion included.
-    cmd = "git commit -F - <<'ZZ'\n; gh pr create <<'echo'\nZZ\nrm -rf /\necho"
-    assert _verdict(cmd) is Operation.FS_DELETE
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Einstein asks me to `git rm` the spec file. Not doing it.",
+        "Kept per the human's directive (`Step 0 の .md を今 git rm しないこと`).",
+        # A thread name is enough: `-delete\b` matches inside T-fs-delete-path-scope.
+        "restorability belongs to a separate gate (T-fs-delete-path-scope).",
+        "Example in the docs:\n\n    rm -rf build/\n",
+        "Do not `git push --force` here.",
+        "`Remove-Item` is the PowerShell spelling.",
+        "",  # an empty body is still a body
+    ],
+)
+def test_prose_in_a_lone_sink_heredoc_is_not_a_command(body: str) -> None:
+    cmd = "git commit -F - <<'A'\n" + body + "\nA"
+    assert _verdict(cmd) is Operation.GIT_COMMIT, cmd
 
 
-def test_fake_sink_opener_inside_a_non_sink_body_is_not_an_opener() -> None:
-    # The mirror image: the outer body is script (bash is no data sink), so a
-    # sink-shaped opener inside it must not be honoured either.
-    cmd = "bash <<'ZZ'\n; git commit -F - <<'X'\nZZ\nrm -rf /tmp/a\nX"
-    assert _verdict(cmd) is Operation.FS_DELETE
-
-
-def test_two_openers_on_one_line_both_get_masked() -> None:
-    # PR #156. Both bodies are prose for data sinks, so neither is shell.
-    cmd = (
-        "git commit -F - <<'A' ; gh pr create --body-file - <<'B'\n"
-        "commit body says rm -rf\nA\npr body says git rm\nB"
-    )
-    assert _verdict(cmd) is Operation.GIT_COMMIT
-
-
-def test_second_opener_on_the_line_is_judged_by_its_own_owner() -> None:
-    # `tee` is not a data sink, so B's body stays shell even though A's is masked.
-    cmd = "git commit -F - <<'A' ; tee out <<'B'\nprose\nA\nrm -rf /tmp/x\nB"
-    assert _verdict(cmd) is Operation.FS_DELETE
-
-
-# --- the parse's own edges ------------------------------------------------ #
-
-
-def test_unterminated_body_stops_the_scan_rather_than_guessing() -> None:
-    # Without a terminator we cannot say where the body ends, so we cannot say
-    # where the shell resumes either. Everything from there stays unmasked.
-    cmd = "git commit -F - <<'A'\nprose\nA\ngit commit -F - <<'B'\nrm -rf /tmp/x"
-    assert _verdict(cmd) is Operation.FS_DELETE
-
-
-def test_a_body_cannot_supply_the_next_openers_owner_name() -> None:
-    # The owner is the text between the previous terminator and this opener. Were
-    # it the whole prefix, the `git commit -F -` written inside A's body would
-    # name a sink and license masking B, which `tee` does not own.
-    cmd = "bash <<'A'\ngit commit -F -\nA\ntee out <<'B'\nrm -rf /tmp/x\nB"
-    assert _verdict(cmd) is Operation.FS_DELETE
+@pytest.mark.parametrize(
+    "sink",
+    [
+        "git commit -F -",
+        "git tag -a v1 -F -",
+        "gh pr create --body-file -",
+        "gh pr edit 1 --body-file -",
+        "gh issue comment 1 --body-file -",
+    ],
+)
+def test_each_data_sink_is_recognised(sink: str) -> None:
+    cmd = sink + " <<'A'\nmentions `rm -rf` in prose\nA"
+    assert _verdict(cmd) is not Operation.FS_DELETE, cmd
 
 
 def test_dash_form_allows_an_indented_terminator() -> None:
@@ -89,88 +86,102 @@ def test_dash_form_allows_an_indented_terminator() -> None:
     assert _verdict(cmd) is Operation.GIT_COMMIT
 
 
-def test_unquoted_delimiter_is_never_masked() -> None:
-    # The shell expands an unquoted heredoc body, so it is not inert.
-    cmd = "git commit -F - <<A\nrm -rf /tmp/x\nA"
-    assert _verdict(cmd) is Operation.FS_DELETE
+# --- every exploit the four review rounds produced ------------------------ #
 
 
-# --- the invariant both defects broke ------------------------------------- #
+@pytest.mark.parametrize(
+    ("label", "cmd"),
+    [
+        # 1. A fake opener inside the body, terminated after the real one.
+        (
+            "fake-opener-in-body",
+            "git commit -F - <<'ZZ'\n; gh pr create <<'echo'\nZZ\nrm -rf /\necho",
+        ),
+        # 1b. Its mirror: a sink-shaped opener inside a body that is real script.
+        (
+            "sink-opener-in-script-body",
+            "bash <<'ZZ'\n; git commit -F - <<'X'\nZZ\nrm -rf /tmp/a\nX",
+        ),
+        # 3. A backslash line-continuation defers the body past the next newline.
+        (
+            "backslash-continuation",
+            "git commit -F - <<'A' ; eval " + BS + "\nrm -rf /\nsafe\nA",
+        ),
+        # 4a. A comment hides the trailing && that keeps the list open.
+        ("comment-hides-and-and", "git commit -F - <<'A' && # c\nrm -rf /\nsafe\nA"),
+        # 4b. `$(` inside double quotes — bash keeps reading the substitution.
+        (
+            "substitution-in-double-quotes",
+            "git commit -F - <<'A' ; echo " + DQ + "$(" + DQ + "\n" + DELETION + "\nsafe\nA",
+        ),
+        ("trailing-and-and", "git commit -F - <<'A' &&\n" + DELETION + "\nsafe\nA"),
+        (
+            "backtick-spans-the-line",
+            "git commit -F - <<'A' ; echo " + BT + "\n" + DELETION + "\n" + BT + "\nsafe\nA",
+        ),
+    ],
+)
+def test_every_exploit_stays_visible(label: str, cmd: str) -> None:
+    assert _verdict(cmd) is Operation.FS_DELETE, label
 
 
-@pytest.mark.parametrize("same_line", [True, False], ids=["one-line", "two-lines"])
-@pytest.mark.parametrize("second_is_sink", [True, False], ids=["sink2", "nonsink2"])
-@pytest.mark.parametrize("where", ["shell-before", "shell-after", "body-1", "body-2"])
-def test_a_deletion_disappears_only_from_inside_a_masked_body(
-    same_line: bool, second_is_sink: bool, where: str
+# --- deletions that are plainly shell ------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("label", "cmd"),
+    [
+        ("after-the-body", "git commit -F - <<'A'\nprose\nA\n" + DELETION),
+        ("before-the-sink", DELETION + "\ngit commit -F - <<'A'\nprose\nA"),
+        ("bare", DELETION),
+        ("interpreter-heredoc", "bash <<'A'\n" + DELETION + "\nA"),
+        # An unquoted delimiter is expanded by the shell, so it is not inert.
+        ("unquoted-delimiter", "git commit -F - <<A\n" + DELETION + "\nA"),
+        ("owner-is-not-a-sink", "tee out <<'A'\n" + DELETION + "\nA"),
+        ("no-terminator", "git commit -F - <<'A'\n" + DELETION),
+    ],
+)
+def test_shell_deletions_are_still_denied(label: str, cmd: str) -> None:
+    assert _verdict(cmd) is Operation.FS_DELETE, label
+
+
+# --- the promise, as a property ------------------------------------------- #
+
+
+@pytest.mark.parametrize("owner", ["git commit -F -", "tee out"], ids=["sink", "nonsink"])
+@pytest.mark.parametrize("where", ["body", "before", "after"])
+@pytest.mark.parametrize(
+    ("extra_on_line", "extra_tail"),
+    [
+        ("", ""),
+        (" ; echo hi", ""),
+        (" && echo hi", ""),
+        (" # note", ""),
+        (" ; gh pr create --body-file - <<'B'", "\nsecond body\nB"),
+    ],
+    ids=["plain", "semicolon", "andand", "comment", "second-heredoc"],
+)
+def test_a_deletion_is_hidden_only_by_the_recognised_shape(
+    owner: str, where: str, extra_on_line: str, extra_tail: str
 ) -> None:
-    """Build a two-heredoc command whose parts are known by construction, drop a
-    deletion into one of them, and assert the only way it stops being visible is
-    by sitting inside a body that a data sink owns.
+    """Hidden if and only if all three hold: the owner is a data sink, the
+    command carries no structure beyond its single heredoc, and the deletion sits
+    in the body.
 
-    This is the property, not a case list: #154 hid a shell-position deletion and
-    #156 failed to hide a sink-body one, and both are single points in this grid.
+    Each of the five defects is one point in this grid. Three of them are an
+    ``extra_on_line`` that an earlier parser tried to interpret instead of
+    declining, and interpreting it wrongly is what hid a live command.
     """
-    second = "gh pr create --body-file -" if second_is_sink else "tee out"
-    body1 = DELETION if where == "body-1" else "prose one"
-    body2 = DELETION if where == "body-2" else "prose two"
-    opener1, opener2 = "git commit -F - <<'A'", second + " <<'B'"
-    if same_line:
-        cmd = opener1 + " ; " + opener2 + "\n" + body1 + "\nA\n" + body2 + "\nB"
-    else:
-        cmd = opener1 + "\n" + body1 + "\nA\n" + opener2 + "\n" + body2 + "\nB"
-    if where == "shell-before":
+    body = DELETION if where == "body" else "prose"
+    cmd = owner + extra_on_line + " <<'A'\n" + body + "\nA" + extra_tail
+    if where == "before":
         cmd = DELETION + "\n" + cmd
-    elif where == "shell-after":
+    elif where == "after":
         cmd = cmd + "\n" + DELETION
 
-    hidden = where == "body-1" or (where == "body-2" and second_is_sink)
+    hidden = owner == "git commit -F -" and extra_on_line == "" and where == "body"
     verdict = _verdict(cmd)
     if hidden:
         assert verdict is not Operation.FS_DELETE, cmd
     else:
         assert verdict is Operation.FS_DELETE, cmd
-
-
-# --- the logical line may not end at the next newline --------------------- #
-#
-# bash defers a heredoc body until the *logical* command line finishes. Several
-# constructs push that past the next physical newline, and a mask that assumes
-# otherwise blanks live shell as if it were inert data — the third defect the
-# gate caught here, and the second outright bypass (Tier B naysayer, PR #156).
-#
-# The response is not a better bash model; three attempts at that produced three
-# holes. It is to recognise the simple shape the mask exists for and decline
-# everything else, which leaves the stricter pre-existing behaviour in place.
-
-BS = chr(92)
-
-
-@pytest.mark.parametrize(
-    ("label", "opener_line"),
-    [
-        ("backslash", "git commit -F - <<'A' ; eval " + BS),
-        ("and-and", "git commit -F - <<'A' &&"),
-        ("open-double-quote", "git commit -F - <<'A' ; echo \"x"),
-        ("open-substitution", "git commit -F - <<'A' ; echo $("),
-        ("open-backtick", "git commit -F - <<'A' ; echo `"),
-    ],
-)
-def test_a_continued_line_masks_nothing(label: str, opener_line: str) -> None:
-    # The deletion sits on the line after the opener — which is still the same
-    # logical line, so bash runs it. It must stay visible.
-    cmd = opener_line + "\n" + DELETION + "\nsafe\nA"
-    assert _verdict(cmd) is Operation.FS_DELETE, label
-
-
-@pytest.mark.parametrize(
-    ("label", "opener_line"),
-    [
-        ("balanced quotes", "git commit -F - <<'A' ; echo \"done\""),
-        ("escaped backslash", "git commit -F - <<'A' ; echo " + BS + BS),
-        ("plain", "git commit -F - <<'A'"),
-    ],
-)
-def test_a_complete_line_still_masks_its_body(label: str, opener_line: str) -> None:
-    cmd = opener_line + "\nsays git rm here\nA"
-    assert _verdict(cmd) is Operation.GIT_COMMIT, label

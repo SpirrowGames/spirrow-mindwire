@@ -664,173 +664,70 @@ _HEREDOC_DATA_SINKS: tuple[tuple[str, ...], ...] = (
     ("gh", "release", "create"),
 )
 
-# A heredoc opener whose delimiter is QUOTED (``<<'EOF'`` / ``<<"EOF"``). The
-# quoting is the load-bearing part, not a stylistic detail: with a quoted
-# delimiter the shell performs **no** expansion inside the body, so ``$(...)`` and
-# backticks there are literal text and cannot be indirection. An UNQUOTED
-# ``<<EOF`` body IS expanded, so it is never masked.
-_QUOTED_HEREDOC_RE = re.compile(r"<<-?\s*(['\"])(?P<delim>[^'\"\s]+)\1")
-
-
-def _heredoc_owner_tokens(prefix: str) -> list[str] | None:
-    """Leading tokens of the command that opens a heredoc, or ``None`` if unknown.
-
-    ``prefix`` is everything before the ``<<`` marker. Only the last segment
-    matters (``make x && git commit -F - <<'EOF'`` is owned by ``git commit``), so
-    the prefix is cut at the last shell separator. Returns ``None`` when the
-    segment cannot be tokenised — the caller then declines to mask, which is the
-    fail-closed direction.
-    """
-    segment = re.split(r"(?:\|\||&&|[;|&])", prefix)[-1]
-    try:
-        return shlex.split(segment, posix=True)
-    except ValueError:
-        return None
-
-
-# Operators that keep a command list open across the newline.
-_LINE_CONTINUES_RE = re.compile(r"(?:&&|\|\||[|&])[ \t]*$")
-
-
-def _is_complete_command_line(text: str) -> bool:
-    """Does the command line certainly END at the newline following ``text``?
-
-    Only ``True`` for the simple form. bash defers a heredoc body until the
-    *logical* line finishes, and several constructs push that past the next
-    physical newline: a trailing backslash, an open quote, an unclosed ``$(`` or
-    backtick, a trailing ``&&`` / ``||`` / ``|`` / ``&``.
-
-    Getting that wrong is not cosmetic. The Tier B naysayer's payload on PR #156:
-
-        git commit -F - <<'A' ; eval \\
-        rm -rf /
-        safe
-        A
-
-    bash joins the continued line, runs ``eval rm -rf /``, and feeds ``safe`` to
-    the commit. A mask that assumed the body began at the next physical newline
-    blanked ``rm -rf /`` as inert data and hid it from every check.
-
-    So this does not try to model bash — three attempts at that produced three
-    holes. It recognises the one shape the mask exists for (``git commit -F -
-    <<'EOF'`` and friends, alone on their line) and refuses everything else,
-    which leaves the stricter pre-existing behaviour in place.
-    """
-    quote: str | None = None
-    depth = 0
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if quote is None:
-            if ch == "\\":
-                i += 2
-                continue
-            if ch in "'\"`":
-                quote = ch
-            elif ch == "$" and text[i + 1 : i + 2] == "(":
-                depth += 1
-                i += 2
-                continue
-            elif ch == ")" and depth:
-                depth -= 1
-        elif quote == "'":
-            if ch == "'":
-                quote = None
-        else:  # " or ` — backslash escapes inside both
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
-        i += 1
-    if i > len(text):
-        # The final backslash consumed the newline: a line continuation.
-        return False
-    if quote is not None or depth:
-        return False
-    return _LINE_CONTINUES_RE.search(text) is None
+# The ONE command shape whose heredoc body is treated as data: a single data-sink
+# invocation, a single quoted heredoc, and nothing else in the command at all.
+#
+# This is a TEMPLATE MATCH, not a parse, and that is the whole point. Four rounds
+# of Tier B review on PR #154 / #156 found five defects in successive attempts to
+# work out where a heredoc body begins — a fake opener inside a body, several
+# openers on one line, a backslash line-continuation, a comment hiding a trailing
+# `&&`, and `$(` inside double quotes. Each fix was correct and each left another
+# construct. bash's line/heredoc interaction is not something this classifier can
+# afford to model, and every wrong model masked live commands, which is the
+# fail-OPEN direction.
+#
+# So the question changed from "where does the body begin?" to "is this the one
+# shape we are sure about?". Everything else is left unmasked, i.e. exactly as
+# strict as before this feature existed. All five exploits fail the template on
+# structure alone: each carries a `;`, an `&&`, a second opener, a continuation
+# or a comment, and the owner charset admits none of those.
+#
+# The owner charset is deliberately narrow — letters, digits, and ``. _ / = -``
+# plus spaces. No `;` `&` `|` `` ` `` `$` `\` `#`, no quotes. A shell
+# metacharacter anywhere before the opener means we do not recognise the shape.
+_SINK_HEREDOC_COMMAND_RE = re.compile(
+    r"^(?P<owner>[A-Za-z0-9 ._/=-]+?)"  # owner: no shell metacharacters at all
+    r"<<-?(?P<q>[\'\"])(?P<delim>\w+)(?P=q)[ \t]*\n"  # one quoted opener, alone on its line
+    r"(?P<body>(?:.*\n)*?)"  # the body, possibly empty
+    r"[ \t]*(?P=delim)[ \t]*$",  # terminator, and the command ends there
+)
 
 
 def _mask_quoted_heredoc_payloads(command: str) -> str:
-    """Blank out quoted-heredoc bodies that are DATA for a known sink.
+    """Blank a quoted-heredoc body that is DATA for a known sink.
 
     Returns ``command`` with those body characters replaced by spaces. Length and
     newline positions are preserved so ``match_offset`` / ``match_line`` on any
     surviving denial still point at the real place in the real command.
 
     This is what separates "the command deletes" from "the command writes a file
-    that mentions deleting" -- the distinction :func:`_scan_raw_coarse` was already
-    instrumented to record. Nothing outside a masked body changes.
+    that mentions deleting" — the distinction :func:`_scan_raw_coarse` was already
+    instrumented to record. It exists because the system prompt tells the
+    implementer to write commit messages and PR bodies through a heredoc, those
+    bodies are Markdown, a Markdown code span is a backtick, and a lone backtick
+    opened the coarse floor over the prose (measured 2026-08-17: four conductor
+    runs died on messages that merely *mentioned* deleting, one of them quoting
+    the human's own instruction not to delete).
 
-    **The parse follows bash, and two rounds of review were needed to get there.**
-
-    1. A body is inert text, so an opener-shaped string *inside* one is not an
-       opener. The first version scanned with ``finditer`` over the whole command
-       and missed that; the Tier B naysayer on PR #154 turned it into a working
-       bypass -- a fake opener inside a body, with its terminator placed after the
-       real one, blanked the live commands in between and hid them from every
-       check. Hence a cursor that resumes past each body.
-    2. bash allows **several openers on one line**, whose bodies then follow in
-       opener order (``git commit -F - <<'A' ; gh pr create --body-file - <<'B'``).
-       A cursor that jumped straight past body A landed *after* the ``<<'B'``
-       opener and never saw it, so B went unmasked (Tier B naysayer, PR #156).
-       Hence: collect every opener on the line first, then consume their bodies in
-       that same order.
-
-    Declines to mask -- leaving the stricter, pre-existing behaviour -- whenever
-    anything is unclear: an unquoted delimiter (the shell expands that body), an
-    owner it cannot tokenise, an owner that is not a known data sink, or a body
-    with no terminator. An unterminated body also stops the scan outright: without
-    its end we cannot say where the shell resumes, so nothing after it is masked.
+    **Only the exact shape is recognised** — see ``_SINK_HEREDOC_COMMAND_RE``.
+    Anything else, including every construct that ever fooled an earlier version,
+    is left alone and read as shell.
     """
-    out = command
-    pos = 0
-    while True:
-        first = _QUOTED_HEREDOC_RE.search(command, pos)
-        if first is None:
-            return out
-        line_end = command.find("\n", first.end())
-        if line_end == -1:
-            # Openers with no following line have no body to blank.
-            return out
-        if not _is_complete_command_line(command[pos:line_end]):
-            # The logical line runs past this newline, so we cannot say where the
-            # bodies begin. Mask nothing further and let the whole remainder be
-            # read as shell — the strict side. See _is_complete_command_line.
-            return out
-
-        # Every opener on this line, in order, each paired with the text that
-        # precedes it -- that text is where its owner command lives.
-        openers: list[tuple[str, re.Match[str]]] = []
-        cursor = pos
-        match: re.Match[str] | None = first
-        while match is not None and match.start() < line_end:
-            openers.append((command[cursor : match.start()], match))
-            cursor = match.end()
-            match = _QUOTED_HEREDOC_RE.search(command, cursor)
-
-        body_pos = line_end + 1
-        for owner_text, opener in openers:
-            # ``<<-`` permits leading tabs before the terminator; plain ``<<`` does not.
-            allow_indent = command[opener.start() : opener.start() + 3].startswith("<<-")
-            terminator = re.compile(
-                (r"^[ 	]*" if allow_indent else r"^")
-                + re.escape(opener.group("delim"))
-                + r"[ 	]*$",
-                re.MULTILINE,
-            )
-            end = terminator.search(command, body_pos)
-            if end is None:
-                return out
-            tokens = _heredoc_owner_tokens(owner_text)
-            if tokens is not None and any(
-                len(tokens) >= len(sink) and tuple(tokens[: len(sink)]) == sink
-                for sink in _HEREDOC_DATA_SINKS
-            ):
-                body = command[body_pos : end.start()]
-                out = out[:body_pos] + re.sub(r"[^\n]", " ", body) + out[end.start() :]
-            body_pos = end.end()
-        pos = body_pos
+    match = _SINK_HEREDOC_COMMAND_RE.match(command)
+    if match is None:
+        return command
+    try:
+        tokens = shlex.split(match.group("owner"), posix=True)
+    except ValueError:
+        return command
+    if not any(
+        len(tokens) >= len(sink) and tuple(tokens[: len(sink)]) == sink
+        for sink in _HEREDOC_DATA_SINKS
+    ):
+        return command
+    start, end = match.span("body")
+    body = command[start:end]
+    return command[:start] + re.sub(r"[^\n]", " ", body) + command[end:]
 
 
 def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
