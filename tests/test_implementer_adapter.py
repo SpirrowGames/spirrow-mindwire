@@ -798,10 +798,20 @@ async def test_guard_ordinary_git_branch_still_runs(
             "retarget-then-force-push",
             "git config push.default upstream && git branch -u origin/main && git push --force",
         ),
-        # Nothing dangerous precedes it, and it is still refused: enumerating
-        # what can move HEAD does not close this, because any step may be a
-        # script that switches branches. The condition is "is it alone".
-        ("harmless-prefix", "git status && git push --force"),
+        # Round 6: the same trap catches every HEAD-enriched operation, not only
+        # the two this PR widened. A push to `main` walks past the Tier C gate.
+        ("checkout-then-push", "git checkout main && git push"),
+        ("checkout-then-commit", "git checkout main && git commit -m x"),
+        ("script-then-force-push", "bash s.sh && git push --force"),
+        # Anything chained with one of the two operations this PR widened is
+        # refused, whether or not it looks dangerous: they are rare enough that
+        # the strict rule costs nothing the implementer cannot split into two
+        # tool calls.
+        ("read-only-prefix-force-push", "git status && git push --force"),
+        ("commit-then-force-push", "git commit -m x && git push --force"),
+        # A rebase that NAMES a branch checks it out first, so it is not
+        # branch-preserving company for what follows.
+        ("explicit-rebase-then-push", "git rebase develop main && git push"),
     ],
 )
 async def test_guard_a_chained_destructive_step_cannot_trust_ambient_head(
@@ -823,8 +833,12 @@ async def test_guard_a_chained_destructive_step_cannot_trust_ambient_head(
         ("alone-force-push", "git push --force"),
         # Names its own target, so it never consults HEAD and chaining is moot.
         ("explicit-target", "git rebase develop feature/z"),
-        # Non-destructive chains are untouched.
-        ("chained-commit", "git add . && git commit -m x"),
+        # The loop's most common command. Denying it would be a gate people
+        # route around, so for commit/push the rule turns on "can this step
+        # switch branches", not "is the destructive step alone".
+        ("stage-then-commit", "git add . && git commit -m x"),
+        ("stage-commit-push", "git add -A && git commit -m x && git push"),
+        ("diff-then-commit", "git diff --staged && git commit -m x"),
     ],
 )
 async def test_guard_a_lone_destructive_step_still_runs(
@@ -834,6 +848,29 @@ async def test_guard_a_lone_destructive_step_still_runs(
     guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
     res = await guard("Bash", {"command": command}, ToolPermissionContext())
     assert isinstance(res, PermissionResultAllow), label
+
+
+@pytest.mark.anyio
+async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
+    tmp_path: Path,
+) -> None:
+    """Records a limit rather than a guarantee, so nobody reads one for the other.
+
+    `_may_switch_branch` is a denylist, so a step it does not recognise passes.
+    `make deploy` can check out `main` inside the Makefile and `git push` then
+    runs there. The stricter rule — refuse any chain whose other steps are not
+    provably branch-preserving — was written and measured: it failed 33 tests,
+    because the classifier splits a heredoc's body and terminator into separate
+    actions, so every `git commit -F - <<'EOF' … EOF` counted as a chain.
+
+    The exposure is the one `git commit` / `git push` have carried since they
+    were first branch-scoped; this PR neither widens nor closes it. The two
+    operations this PR DOES widen get the strict rule, where it costs nothing.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "make deploy && git push"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
 
 
 @pytest.mark.anyio

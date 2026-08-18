@@ -1322,6 +1322,66 @@ _DANGER_RANK: dict[Operation, int] = {
 }
 
 
+#: ``git`` subcommands that change which branch is checked out, or where a bare
+#: push goes. This is a DENYLIST, and that direction is a deliberate retreat
+#: from the stricter rule tried first — see :func:`_may_switch_branch`.
+_BRANCH_SWITCHING_GIT_SUBCOMMANDS: frozenset[str] = frozenset({"checkout", "switch"})
+_PUSH_RETARGETING_GIT_SUBCOMMANDS: frozenset[str] = frozenset({"config"})
+_BRANCH_UPSTREAM_FLAGS: frozenset[str] = frozenset({"-u", "--set-upstream-to", "--track"})
+
+
+def _may_switch_branch(action: ClassifiedAction) -> bool:
+    """Could this step change what a later HEAD-enriched operation targets?
+
+    Recognises ``git checkout`` / ``git switch``, ``git config`` (it can set
+    ``push.default``), ``git branch -u`` / ``--set-upstream-to`` / ``--track``,
+    and a rebase that names a branch, because that checks the named branch out.
+
+    **This is a denylist, and a denylist here is fail-OPEN for anything it does
+    not name** — ``make deploy && git push`` can still check out ``main`` inside
+    the Makefile and this will not see it.
+
+    A stricter rule was written first and measured: refusing any chain whose
+    other steps were not provably branch-preserving. It failed 33 tests, because
+    the classifier splits a heredoc's body and terminator into separate
+    "actions", so every ``git commit -F - <<'EOF' … EOF`` the loop writes counts
+    as a chain and was refused. A gate that stops the loop's most common command
+    is not a gate that ships.
+
+    So the strict rule is kept exactly where it costs nothing —
+    :data:`Operation.HISTORY_REWRITE` and :data:`Operation.FORCE_PUSH`, neither
+    of which carries a heredoc — and commit/push get this weaker one. The
+    residual is stated rather than hidden: it is the same exposure ``git commit``
+    and ``git push`` have carried since they were first branch-scoped, and this
+    PR neither widens nor closes it.
+    """
+    if action.operation is Operation.HISTORY_REWRITE:
+        # A rebase that NAMES a branch checks that branch out first (measured,
+        # PR #158 round 1).
+        return action.branch is not None
+    if action.operation is not Operation.EXEC_CODE:
+        return False
+    detail = action.detail
+    comment = _HASH_BEGINS_A_WORD_RE.search(detail)
+    if comment is not None:
+        # A comment runs nothing, and prose is full of apostrophes and trailing
+        # backslashes that shlex refuses. Without this cut, `# don't delete the
+        # spec` above a commit read as unparseable, and the commit was denied.
+        detail = detail[: comment.end() - 1]
+    if not detail.strip():
+        return False
+    try:
+        tokens = shlex.split(detail, posix=True)
+    except ValueError:
+        return True  # unparseable: assume the worst
+    if len(tokens) < 2 or tokens[0] != "git":
+        return False
+    sub, args = _git_subcommand(tokens)
+    if sub in _BRANCH_SWITCHING_GIT_SUBCOMMANDS or sub in _PUSH_RETARGETING_GIT_SUBCOMMANDS:
+        return True
+    return sub == "branch" and any(arg in _BRANCH_UPSTREAM_FLAGS for arg in args)
+
+
 def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     """Classify a (possibly compound / wrapped) bash command by its most dangerous part.
 
@@ -1378,22 +1438,29 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     # git push --force`, where the tracking change redirects the bare push.
     # (Tier B, PR #158 round 5.)
     #
-    # Enumerating what can move HEAD does not close this: any step may be a
-    # script that switches branches. So the condition is not "which command
-    # precedes it" but "is it alone" — the measured state is only the executed
-    # state when nothing else runs in between. Chained, it is undecidable, and
-    # UNKNOWN sends it to default-deny.
+    # The same trap catches every operation enriched from HEAD, not only the two
+    # this PR widened: `git checkout main && git push` and `git checkout main &&
+    # git commit -m x` were both measured ALLOWED, and a push to `main` walks
+    # straight past the Tier C merge gate. (Tier B, PR #158 round 6.)
     #
-    # This costs nothing the implementer cannot recover: one destructive step per
-    # tool call, and each call measures HEAD fresh. A step that names its own
-    # target (`git rebase develop feature/z`, a refspec force-push) is unaffected,
-    # because it never consults HEAD.
+    # Which is why the condition is not "is it alone". Denying every chain would
+    # take `git add . && git commit -m x` with it, and that is the loop's most
+    # common command; a gate that stops the ordinary case is a gate that gets
+    # worked around. Instead every OTHER action in the chain has to be one this
+    # module recognises as unable to move HEAD — see :func:`_cannot_move_head`.
+    # An unrecognised step, including any non-git command, is assumed to move it.
+    #
+    # A step that names its own target (`git rebase develop feature/z`, a refspec
+    # force-push) never consults HEAD, so chaining does not reach it at all.
     if (
-        len(actions) > 1
-        and candidate.operation in (Operation.HISTORY_REWRITE, Operation.FORCE_PUSH)
+        candidate.operation in _HEAD_ENRICHED_OPERATIONS
         and candidate.branch is None
+        and len(actions) > 1
     ):
-        candidate = ClassifiedAction(Operation.UNKNOWN, detail=command)
+        widened_here = candidate.operation in (Operation.HISTORY_REWRITE, Operation.FORCE_PUSH)
+        others = [a for a in actions if a is not candidate]
+        if widened_here or any(_may_switch_branch(a) for a in others):
+            candidate = ClassifiedAction(Operation.UNKNOWN, detail=command)
 
     # Coarse defence-in-depth floor: only when indirection is present, and only if
     # at least as dangerous as the structural verdict — so it can ADD a denial the
