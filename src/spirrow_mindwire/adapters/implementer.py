@@ -1362,6 +1362,7 @@ def _borrows_ambient_head(action: ClassifiedAction) -> bool:
 #: Text meaning a later step may no longer trust the checkout.
 _SWITCHES_BRANCH_RE = re.compile(
     r"\bgit\s+(?:checkout|switch)\b"  # moves HEAD elsewhere
+    r"|\bgit\s+(?:symbolic-ref|update-ref)\b"
     r"|\bgit\s+config\b"  # can set push.default
     r"|\bgit\s+branch\b[^\n]*(?:\s-u\b|--set-upstream-to|--track)"
 )
@@ -1926,7 +1927,8 @@ def _git_output(repo_root: Path, args: list[str]) -> str | None:
 #: environment form. Either can change where a bare push lands without leaving a
 #: trace in the persistent config the guard reads.
 _GIT_CONFIG_OVERRIDE_RE = re.compile(
-    r"\bgit\b[^\n]*?\s-c\s(?=\S)"  # git -c key=value …
+    r"\bgit\b[^\n]*?\s-c"  # git -c key=value …
+    r"|\bgit\b[^\n]*?\s--config-env"  # value read from the env
     r"|\bGIT_CONFIG(?:_COUNT|_KEY_[0-9]+|_VALUE_[0-9]+|_GLOBAL|_SYSTEM|_NOSYSTEM)?\b"
 )
 

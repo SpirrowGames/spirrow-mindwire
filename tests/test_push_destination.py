@@ -141,6 +141,12 @@ async def test_an_explicit_refspec_is_not_second_guessed(tmp_path: Path) -> None
         # Refused even when the override is harmless: which keys matter is not
         # something a regex over a command line should be asked to decide.
         ("unrelated-key", "git -c core.pager=cat push --force"),
+        # Measured: `--config-env` reads the value from the environment and
+        # reported `feature/x -> main`. (Tier B, PR #158 round 20.)
+        ("config-env", "git --config-env=push.default=MYVAR push --force"),
+        # Attached `-c` is NOT valid git — it prints usage — but matching it
+        # costs nothing and beats depending on which of git's errors save us.
+        ("attached-dash-c", "git -cpush.default=upstream push --force"),
     ],
 )
 async def test_an_inline_config_override_makes_the_destination_undecidable(

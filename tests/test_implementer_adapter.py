@@ -1243,6 +1243,40 @@ async def test_guard_a_real_force_push_does_not_cover_for_a_hidden_one(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # `symbolic-ref` and `update-ref` rewrite HEAD without a checkout, so
+        # the switch pattern never saw them. Measured: `git symbolic-ref HEAD
+        # refs/heads/main` leaves HEAD on `main`, and each of these was ALLOWED.
+        # (Tier B, PR #158 round 20.)
+        ("symbolic-ref-then-push", "git symbolic-ref HEAD refs/heads/main && git push"),
+        ("symbolic-ref-then-commit", "git symbolic-ref HEAD refs/heads/main && git commit -m x"),
+        ("symbolic-ref-then-merge", "git symbolic-ref HEAD refs/heads/main && git merge feature/y"),
+        ("update-ref-then-push", "git update-ref --no-deref HEAD refs/heads/main && git push"),
+    ],
+)
+async def test_guard_head_can_be_moved_without_a_checkout(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+async def test_guard_reading_head_is_not_moving_it(tmp_path: Path) -> None:
+    """`git symbolic-ref HEAD` with no second argument only reports. The pattern
+    is deliberately coarser than that — it costs a denial on a chained read, and
+    nothing else."""
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git symbolic-ref HEAD"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:
