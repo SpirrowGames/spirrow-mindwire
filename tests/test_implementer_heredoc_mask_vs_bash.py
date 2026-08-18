@@ -86,14 +86,56 @@ SUFFIXES = [
 ]
 
 
-def _render(template: list[str], sink: str, markers: list[pathlib.Path]) -> str:
+def _render(
+    template: list[str],
+    sink: str,
+    markers: list[pathlib.Path],
+    separator: str = "\n",
+) -> str:
     rendered = []
     for index, line in enumerate(template):
-        if line == PROBE:
-            rendered.append("touch '" + markers[index].as_posix() + "'")
+        if PROBE in line:
+            # `PROBE` may carry a prefix, e.g. the tab a `<<-` body is indented
+            # with, so it is substituted rather than compared.
+            rendered.append(line.replace(PROBE, "touch '" + markers[index].as_posix() + "'"))
         else:
             rendered.append(line.replace("SINK", sink))
-    return "\n".join(rendered)
+    return separator.join(rendered)
+
+
+def _executed_and_blanked(
+    template: list[str],
+    tmp_path: pathlib.Path,
+    separator: str = "\n",
+) -> list[tuple[int, bool, bool]]:
+    """Run the script under bash, mask it, and report both per PROBE line."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    markers = [tmp_path / f"m{i}" for i in range(len(template))]
+
+    bash_text = _render(template, "true", markers, separator)
+    script = tmp_path / "s.sh"
+    script.write_bytes((bash_text + separator).encode("utf-8"))
+    subprocess.run(
+        ["bash", script.as_posix()],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path.as_posix(),
+        check=False,
+    )
+
+    mask_text = _render(template, "git commit -F -", markers, separator)
+    original = mask_text.split("\n")
+    masked = _mask_quoted_heredoc_payloads(mask_text).split("\n")
+
+    return [
+        (
+            index,
+            markers[index].exists(),
+            masked[index] != original[index] and masked[index].strip() == "",
+        )
+        for index, line in enumerate(template)
+        if PROBE in line
+    ]
 
 
 @pytest.mark.parametrize(
@@ -108,29 +150,72 @@ def test_the_mask_never_blanks_a_line_bash_would_run(
     tmp_path: pathlib.Path,
 ) -> None:
     template = [*prefix, opener, PROBE, "A", *suffix]
-    markers = [tmp_path / f"m{i}" for i in range(len(template))]
-
-    bash_text = _render(template, "true", markers)
-    script = tmp_path / "s.sh"
-    script.write_text(bash_text + "\n", encoding="utf-8", newline="\n")
-    subprocess.run(
-        ["bash", script.as_posix()],
-        capture_output=True,
-        text=True,
-        cwd=tmp_path.as_posix(),
-        check=False,
-    )
-
-    mask_text = _render(template, "git commit -F -", markers)
-    original = mask_text.split("\n")
-    masked = _mask_quoted_heredoc_payloads(mask_text).split("\n")
-
-    for index, line in enumerate(template):
-        if line != PROBE:
-            continue
-        executed = markers[index].exists()
-        blanked = masked[index] != original[index] and masked[index].strip() == ""
+    for index, executed, blanked in _executed_and_blanked(template, tmp_path):
         assert not (executed and blanked), (
             f"line {index} of {template!r} is live shell under bash, "
             f"but the mask blanked it — the coarse floor would never see it"
         )
+
+
+# --- CRLF ------------------------------------------------------------------ #
+#
+# Round 10's one note. Splitting on `\n` leaves a `\r` on every line, which no
+# pattern here admits, so the scan stopped at line 0 and masked nothing. It fails
+# closed — but "closed" means the prose reaches the coarse floor, which is the
+# conductor death this function exists to prevent, arriving silently and only for
+# Windows-authored payloads. Measured on git-bash: a CRLF script parses and the
+# body is data exactly as with LF, so the masking was simply missing.
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        ["SINK <<'A'", PROBE, "A"],
+        ["git add .", "SINK <<'A'", PROBE, "A", "git push"],
+        ["SINK --title " + DQ + "feat(ui): x (#12)" + DQ + " <<'A'", PROBE, "A"],
+        ["SINK <<'A'", PROBE, "A", PROBE],
+        ["SINK <<-'A'", "\t" + PROBE, "\tA"],
+        # And the shapes that must stay refused with CRLF too.
+        ["SINK <<'ZZ'", "SINK <<'A'", "ZZ", PROBE, "A"],
+        ["(", "SINK )#<<'A'", PROBE, "A"],
+        ["SINK <<'A' ; eval " + BS, PROBE, "safe", "A"],
+    ],
+    ids=[
+        "lone-heredoc",
+        "batch",
+        "issue-ref-title",
+        "trailing-command",
+        "dash-form",
+        "unrecognised-outer-heredoc",
+        "paren-comment",
+        "continuation",
+    ],
+)
+@pytest.mark.parametrize("separator", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_crlf_is_read_the_same_way_as_lf(
+    template: list[str], separator: str, tmp_path: pathlib.Path
+) -> None:
+    for index, executed, blanked in _executed_and_blanked(template, tmp_path, separator):
+        assert not (executed and blanked), (
+            f"line {index} of {template!r} with {separator!r} is live shell "
+            f"under bash, but the mask blanked it"
+        )
+
+
+@pytest.mark.parametrize(
+    ("label", "template"),
+    [
+        ("lone-heredoc", ["SINK <<'A'", PROBE, "A"]),
+        ("batch", ["git add .", "SINK <<'A'", PROBE, "A", "git push"]),
+        ("dash-form", ["SINK <<-'A'", "\t" + PROBE, "\tA"]),
+    ],
+)
+def test_a_crlf_body_is_masked_just_as_an_lf_one_is(
+    label: str, template: list[str], tmp_path: pathlib.Path
+) -> None:
+    # The other half: not merely "never fails open" but "still does its job".
+    # Without the `\r` handling every one of these masked nothing at all.
+    lf = _executed_and_blanked(template, tmp_path / "lf", "\n")
+    crlf = _executed_and_blanked(template, tmp_path / "crlf", "\r\n")
+    assert [blanked for _, _, blanked in crlf] == [blanked for _, _, blanked in lf], label
+    assert any(blanked for _, _, blanked in crlf), f"{label}: nothing was masked"

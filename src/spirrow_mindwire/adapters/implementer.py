@@ -752,6 +752,26 @@ _PLAIN_COMMAND_LINE_RE = re.compile(
 )
 
 
+def _without_trailing_cr(line: str) -> str:
+    """Drop one trailing ``\\r``, so a CRLF command is read like an LF one.
+
+    Splitting on ``\\n`` leaves a ``\\r`` at the end of every line of a CRLF
+    payload. ``\\r`` is not in :data:`_HEREDOC_OWNER_CHARS` and both patterns
+    anchor to end-of-string, so without this the scan would stop at line 0 and
+    mask nothing at all. That fails closed — but "closed" here means the prose
+    goes to the coarse floor, which is the conductor death this whole function
+    exists to prevent, arriving silently and only on Windows-authored payloads.
+
+    Stripping it cannot fail OPEN. Measured on git-bash: a CRLF script parses and
+    the heredoc body is data exactly as with LF, so masking it is right. Where a
+    shell instead treats the ``\\r`` as part of the delimiter, the terminator
+    never matches, the heredoc runs to EOF and the script dies on a syntax error
+    — nothing runs, so nothing was hidden. ``\\r`` is not a shell operator in
+    either case, so a line that was a whole command still is one.
+    """
+    return line[:-1] if line.endswith("\r") else line
+
+
 def _is_a_plain_command_line(line: str) -> bool:
     """Is this line a whole command, with nothing that reaches the next line?
 
@@ -844,7 +864,7 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
     out = list(lines)
     index = 0
     while index < len(lines):
-        opener = _SINK_HEREDOC_OPENER_LINE_RE.match(lines[index])
+        opener = _SINK_HEREDOC_OPENER_LINE_RE.match(_without_trailing_cr(lines[index]))
         owner = opener.group("owner") if opener is not None else ""
         if opener is not None and not _HASH_BEGINS_A_WORD_RE.search(owner):
             try:
@@ -859,7 +879,7 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
                 strip_tabs = opener.group("dash") == "-"
                 end = None
                 for candidate in range(index + 1, len(lines)):
-                    line = lines[candidate]
+                    line = _without_trailing_cr(lines[candidate])
                     if (line.lstrip("\t") if strip_tabs else line) == delim:
                         end = candidate
                         break
@@ -868,11 +888,15 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
                     # stop too and leave the rest of the command as shell.
                     break
                 for body in range(index + 1, end):
-                    out[body] = " " * len(lines[body])
+                    # A trailing `\r` is kept so the masked view stays the same
+                    # shape as the command it stands for; every offset a denial
+                    # reports still lands on the real character.
+                    keep_cr = "\r" if lines[body].endswith("\r") else ""
+                    out[body] = " " * (len(lines[body]) - len(keep_cr)) + keep_cr
                 index = end + 1
                 continue
 
-        if _is_a_plain_command_line(lines[index]):
+        if _is_a_plain_command_line(_without_trailing_cr(lines[index])):
             index += 1
             continue
 
