@@ -1060,6 +1060,42 @@ async def test_guard_checking_every_action_does_not_deny_ordinary_batches(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # The force-push names `feature/x`, so it does not borrow HEAD — and it
+        # outranked the bare `reset --hard` beside it, which did. Measured
+        # ALLOWED while the chain check ran only on the ranked winner.
+        # (Tier B, PR #158 round 13.)
+        (
+            "named-target-shields-a-bare-rewrite",
+            "git push --force origin feature/x && git checkout main && git reset --hard HEAD~1",
+        ),
+        (
+            "named-target-shields-a-bare-push",
+            "git push --force origin feature/x && git checkout main && git push",
+        ),
+        (
+            "commit-shields-a-bare-rewrite",
+            "git commit -m x && git checkout main && git reset --hard HEAD~1",
+        ),
+    ],
+)
+async def test_guard_the_chain_check_reaches_every_borrowing_step(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    """Ranking decides what to report; it must not decide what gets checked.
+
+    A step that names its own target is safe on its own terms and was outranking
+    — and so hiding — a step beside it that took its target from the checkout.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:

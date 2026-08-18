@@ -1405,6 +1405,45 @@ def _may_switch_branch(action: ClassifiedAction) -> bool:
     return sub == "branch" and any(arg in _BRANCH_UPSTREAM_FLAGS for arg in args)
 
 
+def _chain_guarded(actions: list[ClassifiedAction], command: str) -> list[ClassifiedAction]:
+    """Refuse EVERY step whose target the rest of the chain could have moved.
+
+    The guard reads `.git/HEAD` when the tool call arrives; the shell runs
+    afterwards. A step that takes its target from the checkout is therefore only
+    as trustworthy as the steps beside it.
+
+    Applied per action rather than to the ranked winner, because ranking is
+    about reporting: a step that names its own target outranks one that does not
+    and then shields it. Measured on `feature/x` (Tier B, PR #158 round 13)::
+
+        git push --force origin feature/x && git checkout main && git reset --hard HEAD~1
+
+    The force-push names `feature/x`, so it does not borrow HEAD and the check
+    was skipped — while the bare `git reset --hard` beside it enriched to
+    `feature/x` and was ALLOWED.
+
+    The two operations this PR widens are refused whenever they are not alone;
+    `git commit` / `git push` / `git merge` are refused only beside a step that
+    :func:`_may_switch_branch` recognises. That split is about cost, not
+    principle — see the note there.
+    """
+    if len(actions) <= 1:
+        return actions
+    guarded: list[ClassifiedAction] = []
+    for action in actions:
+        if _borrows_ambient_head(action):
+            widened_here = action.operation in (
+                Operation.HISTORY_REWRITE,
+                Operation.FORCE_PUSH,
+            )
+            others = [other for other in actions if other is not action]
+            if widened_here or any(_may_switch_branch(other) for other in others):
+                guarded.append(ClassifiedAction(Operation.UNKNOWN, detail=command))
+                continue
+        guarded.append(action)
+    return guarded
+
+
 def _bash_actions(command: str, _depth: int = 0) -> list[ClassifiedAction]:
     """The structural actions of one bash command, before any ranking.
 
@@ -1420,7 +1459,7 @@ def _bash_actions(command: str, _depth: int = 0) -> list[ClassifiedAction]:
         return [ClassifiedAction(Operation.EXEC_CODE, detail=command)]
     actions = [_classify_single_bash(p, _depth) for p in parts]
     actions += [_classify_bash(inner, _depth + 1) for inner in _extract_substitutions(scanned)]
-    return actions
+    return _chain_guarded(actions, command)
 
 
 def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
@@ -1464,7 +1503,13 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     if switches_to_main and any(a.operation is Operation.GIT_MERGE for a in actions):
         candidate = ClassifiedAction(Operation.GIT_MERGE_TO_MAIN, detail=command)
     else:
-        candidate = max(actions, key=lambda a: _DANGER_RANK.get(a.operation, 0))
+        # Guard every step first, then rank: ranking decides what to report, and
+        # a step that names its own target must not outrank — and so hide — one
+        # that borrowed the checkout.
+        candidate = max(
+            _chain_guarded(actions, command),
+            key=lambda a: _DANGER_RANK.get(a.operation, 0),
+        )
 
     # A destructive step whose branch is not on its own command line borrows the
     # ambient HEAD, and the guard reads that HEAD *before* the shell runs. In a
@@ -1500,11 +1545,6 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     #
     # A step that names its own target (`git rebase develop feature/z`, a refspec
     # force-push) never consults HEAD, so chaining does not reach it at all.
-    if _borrows_ambient_head(candidate) and len(actions) > 1:
-        widened_here = candidate.operation in (Operation.HISTORY_REWRITE, Operation.FORCE_PUSH)
-        others = [a for a in actions if a is not candidate]
-        if widened_here or any(_may_switch_branch(a) for a in others):
-            candidate = ClassifiedAction(Operation.UNKNOWN, detail=command)
 
     # Coarse defence-in-depth floor: only when indirection is present, and only if
     # at least as dangerous as the structural verdict — so it can ADD a denial the
