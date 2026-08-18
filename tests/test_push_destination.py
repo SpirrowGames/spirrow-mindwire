@@ -61,7 +61,7 @@ async def test_a_retargeted_upstream_is_where_the_push_lands(
 ) -> None:
     """The bypass: the local name says `feature/x`, the push writes `main`."""
     repo = _clone_with(tmp_path, push_default=mode, upstream="origin/main")
-    assert _push_destination(repo, "git push --force") == "main"
+    assert _push_destination(repo, "git push --force", "git push --force") == "main"
     guard = _AllowlistGuard(default_allowlist(repo_root=repo))
     res = await guard("Bash", {"command": command}, ToolPermissionContext())
     assert isinstance(res, PermissionResultDeny)
@@ -75,7 +75,7 @@ async def test_same_name_modes_keep_using_the_local_name(
     """`simple` (git's default) and `current` push to the same-named branch, so
     the local name IS the destination and ordinary work must keep passing."""
     repo = _clone_with(tmp_path, push_default=mode, upstream=None)
-    assert _push_destination(repo, "git push --force") == expected
+    assert _push_destination(repo, "git push --force", "git push --force") == expected
     guard = _AllowlistGuard(default_allowlist(repo_root=repo))
     res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
     assert isinstance(res, PermissionResultAllow)
@@ -87,7 +87,7 @@ async def test_an_upstream_inside_the_glob_still_passes(tmp_path: Path) -> None:
     repo = _clone_with(tmp_path, push_default="upstream", upstream=None)
     _run(repo, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
     _run(repo, "branch", "-u", "origin/feature/x")
-    assert _push_destination(repo, "git push --force") == "feature/x"
+    assert _push_destination(repo, "git push --force", "git push --force") == "feature/x"
     guard = _AllowlistGuard(default_allowlist(repo_root=repo))
     res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
     assert isinstance(res, PermissionResultAllow)
@@ -99,7 +99,7 @@ async def test_modes_that_name_no_single_branch_fail_closed(tmp_path: Path, mode
     """`matching` writes every same-named branch and `nothing` refuses; neither
     is one branch, so the predicate declines and the guard denies."""
     repo = _clone_with(tmp_path, push_default=mode, upstream=None)
-    assert _push_destination(repo, "git push --force") is None
+    assert _push_destination(repo, "git push --force", "git push --force") is None
     guard = _AllowlistGuard(default_allowlist(repo_root=repo))
     res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
     assert isinstance(res, PermissionResultDeny)
@@ -147,6 +147,12 @@ async def test_an_explicit_refspec_is_not_second_guessed(tmp_path: Path) -> None
         # Attached `-c` is NOT valid git — it prints usage — but matching it
         # costs nothing and beats depending on which of git's errors save us.
         ("attached-dash-c", "git -cpush.default=upstream push --force"),
+        # Quoting and escaping hid the flag from a scan of the raw text — all
+        # three measured `feature/x -> main`. They are read from the token join
+        # instead, where bash quoting is already gone.
+        ("quoted-flag", 'git "-c" push.default=upstream push --force'),
+        ("escaped-flag", "git " + chr(92) + "-c push.default=upstream push --force"),
+        ("quoted-long-flag", 'git "--config-env=push.default=UPSTREAM" push --force'),
     ],
 )
 async def test_an_inline_config_override_makes_the_destination_undecidable(

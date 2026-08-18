@@ -1926,14 +1926,26 @@ def _git_output(repo_root: Path, args: list[str]) -> str | None:
 #: An inline configuration override — `git -c key=value` or the `GIT_CONFIG_*`
 #: environment form. Either can change where a bare push lands without leaving a
 #: trace in the persistent config the guard reads.
-_GIT_CONFIG_OVERRIDE_RE = re.compile(
+#: The FLAG forms of an override, matched against the classifier's token
+#: join — where bash quoting is already gone. Matching the raw text instead
+#: was evaded three ways, all measured retargeting `feature/x -> main`:
+#: ``git "-c" push.default=… push --force``, ``git \\-c push.default=… …``
+#: and ``git "--config-env=push.default=VAR" push --force``.
+#: (Tier B, PR #158 round 21.)
+_GIT_CONFIG_FLAG_RE = re.compile(
     r"\bgit\b[^\n]*?\s-c"  # git -c key=value …
     r"|\bgit\b[^\n]*?\s--config-env"  # value read from the env
-    r"|\bGIT_CONFIG(?:_COUNT|_KEY_[0-9]+|_VALUE_[0-9]+|_GLOBAL|_SYSTEM|_NOSYSTEM)?\b"
+)
+
+#: The ENVIRONMENT form. This one has to be read off the RAW command: the
+#: classifier strips a leading ``NAME=value`` prefix, so it is gone from the
+#: token join by the time an action carries a ``detail``.
+_GIT_CONFIG_ENV_RE = re.compile(
+    r"\bGIT_CONFIG(?:_COUNT|_KEY_[0-9]+|_VALUE_[0-9]+|_GLOBAL|_SYSTEM|_NOSYSTEM)?\b"
 )
 
 
-def _push_destination(repo_root: Path, command: str) -> str | None:
+def _push_destination(repo_root: Path, command: str, detail: str = "") -> str | None:
     """Which remote branch does a bare ``git push`` from here actually write?
 
     NOT the local branch name. Measured end to end: with
@@ -1956,7 +1968,7 @@ def _push_destination(repo_root: Path, command: str) -> str | None:
     neither maps to the single branch this predicate returns, so both give None
     and the caller fails closed.
     """
-    if _GIT_CONFIG_OVERRIDE_RE.search(command):
+    if _GIT_CONFIG_FLAG_RE.search(detail) or _GIT_CONFIG_ENV_RE.search(command):
         # The query below reads the repository's PERSISTENT configuration, and an
         # override on the command line never reaches it. Measured: with
         # `push.default` unset (`simple`) and the upstream retargeted to
@@ -2100,7 +2112,7 @@ class _AllowlistGuard:
                 # The RAW command, not `action.detail`: the classifier strips a
                 # leading `NAME=value` environment prefix, which is exactly where
                 # the `GIT_CONFIG_*` form of an override lives.
-                _push_destination(repo_root, command or action.detail)
+                _push_destination(repo_root, command or action.detail, action.detail)
                 if action.operation in (Operation.GIT_PUSH, Operation.FORCE_PUSH)
                 else _current_branch(repo_root)
             )
