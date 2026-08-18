@@ -20,9 +20,11 @@ defect in the attempt to work out where a heredoc body begins:
 
 Every fix was correct and every one left another construct. So the question
 changed from "where does the body begin?" to "**is this the one shape we are
-sure about?**" — a single data-sink invocation, a single quoted heredoc, and
-nothing else in the command. Anything else is not masked, which is exactly as
-strict as before the feature existed.
+sure about?**" — the command's first line is a data-sink invocation carrying a
+single quoted heredoc opener and nothing else, and the body runs to the first
+line that is exactly the delimiter. Only that body is blanked; anything before
+or after it is left as shell, which is exactly as strict as before the feature
+existed.
 
 All five exploits are kept below as cases: each fails the template on structure
 alone. The final test states the promise as a property rather than a case list.
@@ -89,6 +91,29 @@ def test_dash_form_allows_an_indented_terminator() -> None:
     assert _verdict(cmd) is Operation.GIT_COMMIT
 
 
+def test_a_quoted_flag_on_the_owner_is_ordinary() -> None:
+    # `gh pr create --title "..."` is how the agent actually opens a PR. Quotes
+    # are safe in the owner because it is handed to shlex, which raises on an
+    # unclosed one — the only way a quote could push the line's end past this
+    # newline. (Tier B naysayer, PR #156 round 5.)
+    cmd = "gh pr create --title " + DQ + "Fix bugs" + DQ + " --body-file - <<'A'\nsays git rm\nA"
+    assert _verdict(cmd) is not Operation.FS_DELETE, cmd
+
+
+def test_a_command_after_the_terminator_does_not_prevent_masking() -> None:
+    # Ordinary batching: commit, then push. The body is still data; the trailing
+    # command is still shell and still read by the floor.
+    cmd = "git commit -F - <<'A'\nsays git rm\nA\ngit push"
+    assert _verdict(cmd) is Operation.GIT_PUSH, cmd
+
+
+def test_a_substitution_in_the_owner_is_declined() -> None:
+    # `$` stays out of the owner charset: bash keeps reading an open
+    # substitution across the newline, which would move where the body begins.
+    cmd = "gh pr create --title " + DQ + "$(rm -rf /)" + DQ + " --body-file - <<'A'\nprose\nA"
+    assert _verdict(cmd) is Operation.FS_DELETE, cmd
+
+
 # --- every exploit the four review rounds produced ------------------------ #
 
 
@@ -136,13 +161,14 @@ def test_every_exploit_stays_visible(label: str, cmd: str) -> None:
     assert _verdict(cmd) is Operation.FS_DELETE, label
 
 
-def test_a_command_after_the_first_terminator_means_the_shape_is_not_recognised() -> None:
-    # The rule the last bypass broke: bash ends the body at the FIRST delimiter
-    # line, so what follows is a command — and a command being there is exactly
-    # what disqualifies the shape. Asserted on the mask itself because the
-    # verdict here is dominated by `git commit`, which would hide the point.
+def test_the_body_ends_at_the_first_terminator_and_the_rest_stays_shell() -> None:
+    # The rule the last bypass broke, stated on its own. bash ends the body at
+    # the FIRST delimiter line; a second one further down is not a terminator
+    # and cannot stretch the body over `echo hi`. Asserted on the mask itself,
+    # since the verdict here is dominated by `git commit`, which hides the point:
+    # only `prose` is blanked, and everything from the first `A` on is untouched.
     cmd = "git commit -F - <<'A'\nprose\nA\necho hi\nA"
-    assert _mask_quoted_heredoc_payloads(cmd) == cmd
+    assert _mask_quoted_heredoc_payloads(cmd) == "git commit -F - <<'A'\n     \nA\necho hi\nA"
 
 
 # --- deletions that are plainly shell ------------------------------------- #

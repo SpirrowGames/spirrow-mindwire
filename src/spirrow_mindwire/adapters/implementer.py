@@ -668,12 +668,26 @@ _HEREDOC_DATA_SINKS: tuple[tuple[str, ...], ...] = (
 # a data-sink invocation containing no shell metacharacter at all, then a single
 # quoted heredoc opener, and nothing else on the line.
 #
-# The owner charset is the guard: letters, digits, spaces and ``. _ / = -``. No
-# ``;`` ``&`` ``|`` backtick ``$`` backslash ``#``, no quotes. Any of those means
-# we do not recognise the shape and mask nothing.
+# The owner charset is the guard. Letters, digits, spaces, ``. _ / =``, quotes,
+# and ``-`` (last, so it is a literal). Excluded, and each for a reason:
+#
+#   ``;`` ``&`` ``|`` ``#``  another command, or a comment hiding one, on the
+#                            line whose end we are about to trust;
+#   backslash                a line continuation — the body would start later;
+#   ``$`` backtick           a substitution, which bash keeps reading across the
+#                            newline when it is left open.
+#
+# Quotes ARE admitted (``gh pr create --title "Fix bugs" --body-file - <<'EOF'``
+# is ordinary), and they are safe to admit because the owner is then handed to
+# ``shlex.split(posix=True)``, which raises on an unclosed quote — the one way a
+# quote could push the line's end past this newline. Verified: ``'--title "x'``
+# raises ``No closing quotation``. A quoted metacharacter (``--title "a; b"``) is
+# inert to bash, and anything on line 0 is never masked anyway, so it stays
+# visible to the floor either way. (Tier B naysayer, PR #156 round 5.)
+_HEREDOC_OWNER_CHARS = "A-Za-z0-9 ._/=" + "'" + '"' + "-"
 _SINK_HEREDOC_OPENER_LINE_RE = re.compile(
-    r"^(?P<owner>[A-Za-z0-9 ._/=-]+?)"
-    r"<<(?P<dash>-?)(?P<q>[\'\"])(?P<delim>\w+)(?P=q)[ \t]*$"
+    r"^(?P<owner>[" + _HEREDOC_OWNER_CHARS + r"]+?)"
+    r"<<(?P<dash>-?)(?P<q>['\"])(?P<delim>\w+)(?P=q)[ \t]*$"
 )
 
 
@@ -698,8 +712,9 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
 
     * line 0 is a data sink plus one quoted opener and nothing else;
     * the body runs to the **first** line that is exactly the delimiter — the
-      first, because that is where bash ends it;
-    * nothing but whitespace may follow that line, so the command is over.
+      first, because that is where bash ends it, so a second delimiter further
+      down cannot stretch the body over the commands in between;
+    * from that line on, nothing is touched: trailing commands stay shell.
 
     Anything else returns ``command`` untouched, i.e. exactly as strict as before
     this feature existed. That bluntness is the design. Five review rounds found
@@ -738,10 +753,14 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
     if end is None:
         # No terminator: we cannot say where the body stops.
         return command
-    if any(rest.strip() for rest in lines[end + 1 :]):
-        # The command continues past the terminator, so this is not the shape.
-        return command
 
+    # Whatever follows the terminator is left exactly as it is, and that is the
+    # whole defence against the round-4 exploit rather than a separate rule:
+    # stopping at the FIRST delimiter line is what bash does, so a second one
+    # further down cannot extend the body over the commands in between. Those
+    # commands stay unmasked and the floor still reads them. Refusing to mask at
+    # all when anything follows — the previous behaviour — bought no safety on
+    # top of that and broke ordinary batching (``... EOF`` then ``git push``).
     masked = [" " * len(line) for line in lines[1:end]]
     return "\n".join([lines[0], *masked, *lines[end:]])
 
