@@ -446,6 +446,76 @@ def _rebase_target(args: list[str]) -> str | None | _Undecidable:
     return _UNDECIDABLE
 
 
+#: ``git branch`` flags that move or destroy a ref. Every one of these was
+#: measured against ``main`` from a feature branch, and every one of them landed:
+#: ``-f main HEAD`` moved it, ``-M main`` clobbered it, ``-D main`` deleted it,
+#: ``-m main renamed`` deleted it, ``-C feature/x main`` clobbered it.
+_BRANCH_DELETE_FLAGS: frozenset[str] = frozenset({"-d", "-D", "--delete"})
+_BRANCH_FORCE_FLAGS: frozenset[str] = frozenset({"-f", "--force"})
+#: Rename and copy name TWO branches and it is the SECOND that gets clobbered,
+#: which one ``branch`` field cannot express. Refused rather than half-checked.
+_BRANCH_MOVE_FLAGS: frozenset[str] = frozenset({"-m", "-M", "--move", "-c", "-C", "--copy"})
+#: The only flags that may keep company with a destructive one. Anything else
+#: takes a value we would have to model, and an unmodelled value looks like a
+#: branch name — the same trap ``_rebase_target`` refuses.
+_BRANCH_COMPANION_FLAGS: frozenset[str] = (
+    _BRANCH_DELETE_FLAGS | _BRANCH_FORCE_FLAGS | frozenset({"-q", "--quiet"})
+)
+
+
+def _branch_target(args: list[str]) -> str | None | _Undecidable:
+    """Which branch does this ``git branch`` move or destroy?
+
+    ``None`` means it is not a destructive form at all (listing, creating,
+    configuring) and the caller should leave it as ordinary code execution.
+    A string is the ref that moves or disappears. :data:`_UNDECIDABLE` means
+    refuse.
+
+    ``git branch -f main <commit>`` sets ``main`` to an arbitrary commit, which
+    is a history rewrite by another spelling — and until this landed it
+    classified as ``exec.code`` and ran at Tier A. That is pre-existing rather
+    than introduced by the branch-glob widening, but it makes this PR's promise
+    ("history rewrites are denied on ``main``") false as written, so it is fixed
+    here rather than carried.
+    """
+    positionals: list[str] = []
+    options_done = False
+    index = 0
+    delete = force = False
+    while index < len(args):
+        arg = args[index]
+        if options_done:
+            positionals.append(arg)
+            index += 1
+            continue
+        if arg == "--":
+            options_done = True
+            index += 1
+            continue
+        if arg.startswith("-"):
+            if arg in _BRANCH_MOVE_FLAGS:
+                return _UNDECIDABLE
+            if arg not in _BRANCH_COMPANION_FLAGS:
+                # Either harmless (listing) or value-taking; either way this is
+                # only reached once something destructive is present, and by then
+                # a miscount is a wrong branch name.
+                return _UNDECIDABLE if (delete or force) else None
+            delete = delete or arg in _BRANCH_DELETE_FLAGS
+            force = force or arg in _BRANCH_FORCE_FLAGS
+            index += 1
+            continue
+        positionals.append(arg)
+        index += 1
+
+    if not (delete or force):
+        return None
+    if delete:
+        # `-D a b` deletes both, and only one of them fits in `branch`.
+        return positionals[0] if len(positionals) == 1 else _UNDECIDABLE
+    # `-f <branch> [<start-point>]` — the first name is the ref that moves.
+    return positionals[0] if 1 <= len(positionals) <= 2 else _UNDECIDABLE
+
+
 def _classify_git(tokens: list[str]) -> ClassifiedAction:
     sub, args = _git_subcommand(tokens)
     detail = " ".join(tokens)
@@ -471,6 +541,12 @@ def _classify_git(tokens: list[str]) -> ClassifiedAction:
         # would be cost without a caller. UNKNOWN → default-deny, i.e. exactly
         # the Tier C denial they had before this widening.
         return ClassifiedAction(Operation.UNKNOWN, detail=detail)
+    if sub == "branch":
+        target = _branch_target(args)
+        if isinstance(target, _Undecidable):
+            return ClassifiedAction(Operation.UNKNOWN, detail=detail)
+        if target is not None:
+            return ClassifiedAction(Operation.HISTORY_REWRITE, branch=target, detail=detail)
     if sub == "reset" and "--hard" in args:
         return ClassifiedAction(Operation.HISTORY_REWRITE, detail=detail)
     # Other git subcommands (status/log/diff/add/checkout/switch/fetch/pull/

@@ -711,6 +711,68 @@ async def test_guard_rebase_with_an_unrecognised_flag_is_denied(tmp_path: Path) 
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # Every one measured against `main` from `feature/x`, and every one landed.
+        ("force-move", "git branch -f main HEAD"),
+        ("force-rename-onto-main", "git branch -M main"),
+        ("delete", "git branch -D main"),
+        ("rename-away", "git branch -m main renamed"),
+        # `-C <src> <dst>` clobbers the SECOND name, which one `branch` field
+        # cannot express — so rename and copy are refused outright.
+        ("force-copy-onto-main", "git branch -C feature/x main"),
+        # `-D a b` deletes both and only one fits in `branch`.
+        ("delete-many", "git branch -D feature/a main"),
+        ("force-after-double-dash", "git branch -f -- main"),
+        ("delete-after-double-dash", "git branch -D -- main"),
+        # A value-taking flag alongside a destructive one: the value would be
+        # miscounted as a branch name, so it is refused rather than guessed.
+        ("unmodelled-flag", "git branch -f --contains x main"),
+    ],
+)
+async def test_guard_destructive_git_branch_on_main_is_denied(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    """`git branch -f main <commit>` is a history rewrite by another spelling.
+
+    It classified as `exec.code` and ran at Tier A — pre-existing rather than
+    introduced by the branch-glob widening, but it made this PR's promise
+    ("history rewrites are denied on `main`") false as written.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        ("force-move-within-glob", "git branch -f feature/y HEAD"),
+        ("delete-within-glob", "git branch -D feature/old"),
+        ("create", "git branch feature/new"),
+        ("list", "git branch"),
+        ("list-all", "git branch -a"),
+        ("list-verbose", "git branch -vv"),
+        ("filter-by-merged", "git branch --merged main"),
+        # git: "'-f' is not a valid branch name". After `--` it is a NAME, so
+        # this is a failing creation, not a destructive form — measured, `main`
+        # was untouched. The parser reads it the way git does.
+        ("double-dash-makes-it-a-name", "git branch -- -f main"),
+    ],
+)
+async def test_guard_ordinary_git_branch_still_runs(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow), label
+
+
+@pytest.mark.anyio
 async def test_guard_filter_branch_stays_denied(tmp_path: Path) -> None:
     """`filter-branch` takes rev-list arguments, so any of them can name a branch.
 
