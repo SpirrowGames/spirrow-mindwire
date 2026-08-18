@@ -110,6 +110,68 @@ def test_any_ordinary_delimiter_spelling_is_recognised(delim: str) -> None:
     assert _verdict(cmd) is Operation.GIT_COMMIT, delim
 
 
+@pytest.mark.parametrize(
+    ("label", "opener", "indent"),
+    [
+        ("no-space", "<<'A'", ""),
+        ("one-space", "<< 'A'", ""),
+        ("two-spaces", "<<  'A'", ""),
+        ("dash-no-space", "<<-'A'", chr(9)),
+        ("dash-one-space", "<<- 'A'", chr(9)),
+    ],
+)
+def test_whitespace_between_the_operator_and_the_delimiter(
+    label: str, opener: str, indent: str
+) -> None:
+    # Measured: bash accepts all five. The pattern required the quote to touch
+    # the operator, so `<< 'EOF'` aborted the mask and sent the prose to the
+    # floor. (Tier B, round 15.)
+    cmd = "git commit -F - " + opener + "\n" + indent + DELETION + "\n" + indent + "A"
+    assert _mask_quoted_heredoc_payloads(cmd) != cmd, label
+    assert _verdict(cmd) is Operation.GIT_COMMIT, label
+
+
+@pytest.mark.parametrize(
+    ("label", "owner"),
+    [
+        ("author-email", "git commit -F - --author=" + DQ + "Name <email>" + DQ),
+        (
+            "double-quoted-tag",
+            "gh pr create --title " + DQ + "fix: <Button> layout" + DQ + " --body-file -",
+        ),
+        ("single-quoted-tag", "gh pr create --title 'fix: <Button>' --body-file -"),
+        ("redirect-looking-text", "git commit -F - --author=" + DQ + "a > b" + DQ),
+    ],
+)
+def test_angle_brackets_inside_quotes_are_ordinary(label: str, owner: str) -> None:
+    # Round 15 asked for `<` and `>` back, and it was right about the cost: these
+    # are ordinary flags. They are admitted by QUOTING, not by presence — shlex
+    # with punctuation_chars keeps a quoted bracket inside its word.
+    cmd = owner + " <<'A'\n" + DELETION + "\nA"
+    assert _mask_quoted_heredoc_payloads(cmd) != cmd, label
+    assert _verdict(cmd) is not Operation.FS_DELETE, label
+
+
+@pytest.mark.parametrize(
+    ("label", "cmd"),
+    [
+        # The reason `<` cannot simply be admitted: an unquoted `<<` opens a
+        # SECOND heredoc, and an unquoted delimiter means bash EXPANDS that body.
+        # Measured: the substitution runs, and it sits inside the blanked span.
+        (
+            "second-heredoc-unquoted-delimiter",
+            "git commit -F - <<X <<'A'\n$(rm -rf /tmp/x)\nX\nprose\nA",
+        ),
+        ("second-heredoc-quoted", "git commit -F - <<'X' <<'A'\n" + DELETION + "\nX\nprose\nA"),
+        ("process-substitution", "git commit -F <(rm -rf /tmp/x) <<'A'\nprose\nA"),
+        ("redirect", "git commit -F - > out <<'A'\n" + DELETION + "\nA"),
+        ("heredoc-on-a-stepped-over-line", "git add . <<'X'\n" + DELETION + "\nX"),
+    ],
+)
+def test_an_unquoted_metacharacter_still_stops_the_scan(label: str, cmd: str) -> None:
+    assert _mask_quoted_heredoc_payloads(cmd) == cmd, label
+
+
 def test_dash_form_allows_an_indented_terminator() -> None:
     cmd = "git commit -F - <<-'A'\n\tsays git rm\n\tA"
     assert _verdict(cmd) is Operation.GIT_COMMIT

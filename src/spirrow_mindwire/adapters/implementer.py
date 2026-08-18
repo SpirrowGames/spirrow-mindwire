@@ -694,7 +694,7 @@ _HEREDOC_DATA_SINKS: tuple[tuple[str, ...], ...] = (
 # ``#`` is the one the round-6 critique got wrong, and the measurement is the
 # reason it is handled separately rather than admitted: see below.
 _HEREDOC_OWNER_CHARS = (
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \t._/=-:,+@!%^~*?()[]{}'\"#"
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \t._/=-:,+@!%^~*?()[]{}<>'\"#"
 )
 # The delimiter is any run of characters that is neither whitespace nor a quote.
 # It used to be a word-character run, which has no hyphen, so ``<<'EOF-1'`` and
@@ -711,7 +711,7 @@ commit title from silently falling out of the recognised shape."""
 
 _SINK_HEREDOC_OPENER_LINE_RE = re.compile(
     r"^(?P<owner>[" + re.escape(_HEREDOC_OWNER_CHARS) + _NON_ASCII_RANGE + r"]+?)"
-    r"<<(?P<dash>-?)(?P<q>['\"])(?P<delim>[^\s'\"]+)(?P=q)[ \t]*$"
+    r"<<(?P<dash>-?)[ \t]*(?P<q>['\"])(?P<delim>[^\s'\"]+)(?P=q)[ \t]*$"
 )
 
 # ``#`` is a comment only where it BEGINS a word — bash's own rule, and the whole
@@ -750,6 +750,40 @@ _SINK_HEREDOC_OPENER_LINE_RE = re.compile(
 # Commit with an issue ref stopped being masked and went back to killing the
 # conductor. Round 9 caught that, and only caught it because the test payload
 # was made live; ``says git rm`` is inert to the floor and hid the regression.
+# ``<`` and ``>`` used to be banned from the owner outright, which refused
+# ``--author="Name <email>"`` and ``--title "fix: <Button> layout"`` —
+# ordinary flags whose angle brackets are inside quotes and inert. Round 15 asked
+# for them back, arguing the owner is never masked so nothing in it can hide.
+# That argument does not hold: an unquoted ``<<`` opens a SECOND heredoc, and an
+# unquoted delimiter means bash EXPANDS that body. Measured::
+#
+#     git commit -F - <<X <<'A'
+#     $(rm -rf /tmp/x)
+#     X
+#     prose
+#     A
+#
+# the substitution runs, and it sits inside the span this function blanks.
+#
+# So the question is not whether the character is present but whether it is
+# QUOTED, and shlex answers that instead of reasoning: with ``punctuation_chars``
+# on, an unquoted ``<< < > ( ) ; | &`` comes back as its own token while a quoted
+# one stays inside its word. Verified both ways.
+_SHELL_PUNCTUATION = frozenset("();<>|&")
+
+
+def _has_unquoted_punctuation(text: str) -> bool:
+    """Does an unquoted shell metacharacter appear in ``text``?"""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        # Unbalanced quoting: we cannot say, so say yes.
+        return True
+    return any(token and set(token) <= _SHELL_PUNCTUATION for token in tokens)
+
+
 _HASH_BEGINS_A_WORD_RE = re.compile(r"(?:^|[ \t)])#")
 
 # An ordinary command line: the same charset as the owner, over the whole line.
@@ -894,6 +928,15 @@ def _is_a_plain_command_line(line: str) -> bool:
         return False
     if _COMPOUND_COMMAND_CHARS.intersection(line):
         return False
+    if _has_unquoted_punctuation(line):
+        # A redirect here could be a heredoc we do not recognise, and its body
+        # would be the lines the scan is about to account for. Unlike the same
+        # test on an opener's owner, no exploit was found for this half — the
+        # lines after such a redirect are that heredoc's body, so blanking them
+        # blanks data. It is kept because stepping over a line the scan has not
+        # understood is the mistake every earlier round was made of, not because
+        # a measurement forced it. Stated plainly so nobody reads it as pinned.
+        return False
     try:
         tokens = shlex.split(line, posix=True)
     except ValueError:
@@ -978,7 +1021,11 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
     while index < len(lines):
         opener = _SINK_HEREDOC_OPENER_LINE_RE.match(_without_trailing_cr(lines[index]))
         owner = opener.group("owner") if opener is not None else ""
-        if opener is not None and not _HASH_BEGINS_A_WORD_RE.search(owner):
+        if (
+            opener is not None
+            and not _HASH_BEGINS_A_WORD_RE.search(owner)
+            and not _has_unquoted_punctuation(owner)
+        ):
             try:
                 tokens = shlex.split(owner, posix=True)
             except ValueError:

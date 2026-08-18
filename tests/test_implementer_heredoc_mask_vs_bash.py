@@ -82,6 +82,13 @@ OPENERS = [
     # are here so the claim is measured rather than argued.
     "SINK (#<<'A'",
     "SINK --title " + DQ + "docs (#12)" + DQ + " <<'A'",
+    # Round 15: whitespace before the delimiter is valid bash, and angle
+    # brackets inside quotes are ordinary flags. Unquoted ones are not: a bare
+    # `<<` opens a second heredoc whose body bash expands.
+    "SINK << 'A'",
+    "SINK --author=\"Name <email>\" <<'A'",
+    "SINK <<X <<'A'",
+    "SINK > out <<'A'",
     "tee out <<'A'",
     "SINK <<A",  # unquoted delimiter: the body is expanded, so it is not inert
 ]
