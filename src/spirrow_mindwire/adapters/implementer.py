@@ -1365,6 +1365,36 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     else:
         candidate = max(actions, key=lambda a: _DANGER_RANK.get(a.operation, 0))
 
+    # A destructive step whose branch is not on its own command line borrows the
+    # ambient HEAD, and the guard reads that HEAD *before* the shell runs. In a
+    # chain, an earlier step can move it first:
+    #
+    #     git checkout main && git reset --hard HEAD~1
+    #
+    # measured ALLOWED — validation saw `feature/x`, the script then destroyed
+    # `main`. Same for `git checkout main && git rebase origin/develop`,
+    # `git checkout main && git push --force`, and, without any checkout at all,
+    # `git config push.default upstream && git branch -u origin/main &&
+    # git push --force`, where the tracking change redirects the bare push.
+    # (Tier B, PR #158 round 5.)
+    #
+    # Enumerating what can move HEAD does not close this: any step may be a
+    # script that switches branches. So the condition is not "which command
+    # precedes it" but "is it alone" — the measured state is only the executed
+    # state when nothing else runs in between. Chained, it is undecidable, and
+    # UNKNOWN sends it to default-deny.
+    #
+    # This costs nothing the implementer cannot recover: one destructive step per
+    # tool call, and each call measures HEAD fresh. A step that names its own
+    # target (`git rebase develop feature/z`, a refspec force-push) is unaffected,
+    # because it never consults HEAD.
+    if (
+        len(actions) > 1
+        and candidate.operation in (Operation.HISTORY_REWRITE, Operation.FORCE_PUSH)
+        and candidate.branch is None
+    ):
+        candidate = ClassifiedAction(Operation.UNKNOWN, detail=command)
+
     # Coarse defence-in-depth floor: only when indirection is present, and only if
     # at least as dangerous as the structural verdict — so it can ADD a denial the
     # tokenizer missed, never downgrade one (see _RAW_COARSE).

@@ -784,6 +784,59 @@ async def test_guard_ordinary_git_branch_still_runs(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # Measured ALLOWED before this rule: validation saw `feature/x`, the
+        # script then destroyed `main`.
+        ("checkout-then-reset", "git checkout main && git reset --hard HEAD~1"),
+        ("switch-then-reset", "git switch main && git reset --hard HEAD~1"),
+        ("checkout-then-rebase", "git checkout main && git rebase origin/develop"),
+        ("checkout-then-force-push", "git checkout main && git push --force"),
+        # No checkout at all — the tracking change redirects the bare push.
+        (
+            "retarget-then-force-push",
+            "git config push.default upstream && git branch -u origin/main && git push --force",
+        ),
+        # Nothing dangerous precedes it, and it is still refused: enumerating
+        # what can move HEAD does not close this, because any step may be a
+        # script that switches branches. The condition is "is it alone".
+        ("harmless-prefix", "git status && git push --force"),
+    ],
+)
+async def test_guard_a_chained_destructive_step_cannot_trust_ambient_head(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    """The guard reads HEAD before the shell runs; a chain can move it first."""
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        ("alone-reset", "git reset --hard HEAD~1"),
+        ("alone-rebase", "git rebase origin/develop"),
+        ("alone-force-push", "git push --force"),
+        # Names its own target, so it never consults HEAD and chaining is moot.
+        ("explicit-target", "git rebase develop feature/z"),
+        # Non-destructive chains are untouched.
+        ("chained-commit", "git add . && git commit -m x"),
+    ],
+)
+async def test_guard_a_lone_destructive_step_still_runs(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow), label
+
+
+@pytest.mark.anyio
 async def test_guard_filter_branch_stays_denied(tmp_path: Path) -> None:
     """`filter-branch` takes rev-list arguments, so any of them can name a branch.
 
