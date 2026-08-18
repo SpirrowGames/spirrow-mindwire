@@ -664,32 +664,294 @@ _HEREDOC_DATA_SINKS: tuple[tuple[str, ...], ...] = (
     ("gh", "release", "create"),
 )
 
-# A heredoc opener whose delimiter is QUOTED (``<<'EOF'`` / ``<<"EOF"``). The
-# quoting is the load-bearing part, not a stylistic detail: with a quoted
-# delimiter the shell performs **no** expansion inside the body, so ``$(...)`` and
-# backticks there are literal text and cannot be indirection. An UNQUOTED
-# ``<<EOF`` body IS expanded, so it is never masked.
-_QUOTED_HEREDOC_RE = re.compile(r"<<-?\s*(['\"])(?P<delim>[^'\"\s]+)\1")
+# The opener line of the ONE command shape whose heredoc body is treated as data:
+# a data-sink invocation, then a single quoted heredoc opener, and nothing else.
+#
+# The owner is never masked, so nothing hidden in it can escape the floor. The
+# charset therefore has exactly one job: refuse every character that could move
+# where the body BEGINS, because blanking a line bash would run is the fail-OPEN
+# direction that four earlier rounds fell into. Measured, not reasoned — each
+# shape below was run under bash with ``touch <marker>`` as line 1:
+#
+#   ``\``            a line continuation, so the body starts later;
+#   ``;`` ``&``      a trailing operator leaves the list open, or introduces a
+#   ``|``            second opener whose body comes first;
+#   ``$`` backtick   an unclosed substitution bash keeps reading past the newline;
+#   ``<`` ``>``      process substitution ``<(`` / ``>(``, and ``<<`` itself.
+#
+# Ordinary punctuation is admitted, because it measured inert: ``: , + @ ! % ^ ~
+# * ? ( ) [ ] { }`` all left line 1 as data. So did the naysayer's own example,
+# ``--title "feat(ui): fix layout, update docs (#12)"`` — refusing those broke
+# the feature for Conventional Commits and issue refs, which is what round 6
+# reported. Non-ASCII is admitted for the same reason: no bash operator is
+# non-ASCII, and this loop's commit messages are frequently Japanese.
+#
+# Quotes are admitted because the owner is handed to ``shlex.split(posix=True)``,
+# which raises on an unclosed one — the only way a quote could push the line's
+# end past this newline (verified: ``--title "x`` raises ``No closing quotation``).
+# A quoted metacharacter is inert to bash and stays visible to the floor anyway.
+#
+# ``#`` is the one the round-6 critique got wrong, and the measurement is the
+# reason it is handled separately rather than admitted: see below.
+_HEREDOC_OWNER_CHARS = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \t._/=-:,+@!%^~*?()[]{}<>'\"#"
+)
+# The delimiter is any run of characters that is neither whitespace nor a quote.
+# It used to be a word-character run, which has no hyphen, so ``<<'EOF-1'`` and
+# ``<<'EOF-MARKER'`` — both valid, both measured — stopped being recognised and
+# their prose went to the coarse floor. Widening it cannot loosen anything: the
+# terminator has to equal the delimiter exactly, on this side and in bash alike,
+# so admitting more spellings only lets more real heredocs be seen. Quotes are
+# excluded because one would end the opener early, whitespace because bash's own
+# delimiter cannot contain any once the quotes come off. (Tier B, PR #156 r14.)
+_NON_ASCII_RANGE = "\u0080-\U0010ffff"
+"""Every code point above ASCII, as one class range. No bash operator lives
+here, so admitting the lot cannot introduce one, and it keeps a Japanese
+commit title from silently falling out of the recognised shape."""
+
+_SINK_HEREDOC_OPENER_LINE_RE = re.compile(
+    r"^(?P<owner>[" + re.escape(_HEREDOC_OWNER_CHARS) + _NON_ASCII_RANGE + r"]+?)"
+    r"<<(?P<dash>-?)[ \t]*(?P<q>['\"])(?P<delim>[^\s'\"]+)(?P=q)[ \t]*$"
+)
+
+# ``#`` is a comment only where it BEGINS a word — bash's own rule, and the whole
+# difference between the two halves of the round-6 critique. Mid-word it is an
+# ordinary character (``a#b``, ``"closes (#12)"``), which is the form real PR
+# titles use. At the start of a word it comments out the rest of the line —
+# including the ``<<'A'`` opener — so there is no heredoc at all and every line
+# after it is live shell. Measured: ``true # <<'A'`` runs line 1. Admitting ``#``
+# unconditionally, as round 6 asked, would have masked that line.
+#
+# Whitespace inside quotes is not word separation, so ``--title "a # b"`` is
+# refused here although bash would keep it literal. That direction is the safe
+# one: the command is left whole for the floor to read.
+#
+# A word also begins after a METACHARACTER, not only after whitespace, and ``)``
+# is a metacharacter that this charset admits. Round 8 turned that into a real
+# bypass, measured::
+#
+#     (
+#     git commit -F - )#<<'EOF'
+#     rm -rf /tmp/x
+#     EOF
+#
+# bash closes the subshell at ``)``, treats ``#<<'EOF'`` as a comment — so there
+# is no heredoc — and runs the deletion. ``shlex`` splits on whitespace only, so
+# it hands back ``)#`` as one token and the sink prefix still matches. The other
+# metacharacters (``|`` ``&`` ``;`` ``<`` ``>``) cannot appear: the charset has
+# never admitted them. Measured over every admitted character, in five bash
+# contexts, ``)`` was the only miss.
+#
+# ``(`` is deliberately NOT in this class, though it is a metacharacter too. It
+# cannot open a comment anywhere this pattern is used: the opener line must begin
+# with a sink token, so ``(`` can only land in argument position, where bash
+# raises a syntax error and runs nothing. Adding it "to be safe" cost the round-6
+# fix instead — ``--title "… (#12)"`` contains ``(#``, so every Conventional
+# Commit with an issue ref stopped being masked and went back to killing the
+# conductor. Round 9 caught that, and only caught it because the test payload
+# was made live; ``says git rm`` is inert to the floor and hid the regression.
+# ``<`` and ``>`` used to be banned from the owner outright, which refused
+# ``--author="Name <email>"`` and ``--title "fix: <Button> layout"`` —
+# ordinary flags whose angle brackets are inside quotes and inert. Round 15 asked
+# for them back, arguing the owner is never masked so nothing in it can hide.
+# That argument does not hold: an unquoted ``<<`` opens a SECOND heredoc, and an
+# unquoted delimiter means bash EXPANDS that body. Measured::
+#
+#     git commit -F - <<X <<'A'
+#     $(rm -rf /tmp/x)
+#     X
+#     prose
+#     A
+#
+# the substitution runs, and it sits inside the span this function blanks.
+#
+# So the question is not whether the character is present but whether it is
+# QUOTED, and shlex answers that instead of reasoning: with ``punctuation_chars``
+# on, an unquoted ``<< < > ( ) ; | &`` comes back as its own token while a quoted
+# one stays inside its word. Verified both ways.
+_SHELL_PUNCTUATION = frozenset("();<>|&")
 
 
-def _heredoc_owner_tokens(prefix: str) -> list[str] | None:
-    """Leading tokens of the command that opens a heredoc, or ``None`` if unknown.
-
-    ``prefix`` is everything before the ``<<`` marker. Only the last segment
-    matters (``make x && git commit -F - <<'EOF'`` is owned by ``git commit``), so
-    the prefix is cut at the last shell separator. Returns ``None`` when the
-    segment cannot be tokenised — the caller then declines to mask, which is the
-    fail-closed direction.
-    """
-    segment = re.split(r"(?:\|\||&&|[;|&])", prefix)[-1]
+def _has_unquoted_punctuation(text: str) -> bool:
+    """Does an unquoted shell metacharacter appear in ``text``?"""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
     try:
-        return shlex.split(segment, posix=True)
+        tokens = list(lexer)
     except ValueError:
-        return None
+        # Unbalanced quoting: we cannot say, so say yes.
+        return True
+    return any(token and set(token) <= _SHELL_PUNCTUATION for token in tokens)
+
+
+_HASH_BEGINS_A_WORD_RE = re.compile(r"(?:^|[ \t)])#")
+
+# An ordinary command line: the same charset as the owner, over the whole line.
+# It is what lets the scan step over ``git add .`` on its way to the commit,
+# which is the false negative round 7 reported. Empty lines qualify.
+_PLAIN_COMMAND_LINE_RE = re.compile(
+    r"^[" + re.escape(_HEREDOC_OWNER_CHARS) + _NON_ASCII_RANGE + r"]*$"
+)
+
+# Stepping over a line asserts more than "the next line starts a new command".
+# It also asserts that a sink invocation FURTHER DOWN still means what it says —
+# and a line the scan walks past can take that away. Measured (round 12)::
+#
+#     git() {
+#     bash
+#     }
+#     git commit -F - <<'EOF'
+#     rm -rf /
+#     EOF
+#
+# Every one of those three lines is ordinary text with balanced quotes, so the
+# scan stepped over all three, recognised the sink, and blanked the body. bash
+# then ran `git commit -F -` as the FUNCTION, which execs `bash`, which inherits
+# stdin — the heredoc — and executes the deletion. Seven more spellings did the
+# same: `git ()  {`, `function git {`, `PATH=/tmp`, `export PATH=/tmp`,
+# `source f`, `. f`, and `shopt -s expand_aliases` + `alias git=bash`.
+#
+# The first answer to that was "no ``( ) { }``, and the first word must name an
+# external program, because a subprocess cannot touch the calling shell". The
+# second half of that was wrong, and round 13 said so: a command need not touch
+# the shell to change what the sink does, it can write to the filesystem. The
+# reported route (a `pre-commit` hook eating the heredoc from git's stdin) does
+# NOT reproduce — measured, the hook's stdin is empty and git records the body as
+# the message — but the class is real by another route::
+#
+#     cp evil .git/hooks/commit-msg     # the hook is `sh "$1"`
+#     git commit -F - <<'EOF'
+#     touch /tmp/pwned
+#     EOF
+#
+# `commit-msg` is handed the path of the message FILE, and the message is the
+# masked body. Measured: it executes. `git config core.hooksPath /tmp` gets there
+# too, and `git` was on the old list.
+#
+# So the rule is not "external" but "cannot change what the sink does", and only
+# two kinds of line qualify:
+#
+#   * lines that run nothing at all — blank, or a comment;
+#   * a short list of git/gh subcommands that only read or stage, plus a few
+#     inert utilities. Anything that can write a file, change git's
+#     configuration, or change directory is off it, ``cd`` included: a different
+#     working directory is a different repository, with different hooks.
+#
+# ``( ) { }`` stay banned outright — every spelling of a function definition or
+# a command group needs one — and a bare ``NAME=value`` is an assignment, not a
+# command, so it never matches a prefix here.
+_COMPOUND_COMMAND_CHARS = frozenset("(){}")
+
+_STEPPABLE_INVOCATIONS: tuple[tuple[str, ...], ...] = (
+    # Staging and inspection, so a batch may prepare before it writes. This is
+    # the false negative round 7 reported, and `git add .` is its example.
+    ("git", "add"),
+    ("git", "status"),
+    ("git", "diff"),
+    ("git", "log"),
+    ("git", "show"),
+    ("git", "rev-parse"),
+    ("git", "ls-files"),
+    ("gh", "pr", "view"),
+    ("gh", "pr", "list"),
+    ("gh", "issue", "view"),
+    ("gh", "issue", "list"),
+    ("gh", "run", "view"),
+    ("gh", "run", "list"),
+    # Inert utilities. `echo` cannot redirect — `>` is not in the charset.
+    ("ls",),
+    ("pwd",),
+    ("echo",),
+    ("true",),
+)
+
+
+def _without_trailing_cr(line: str) -> str:
+    """Drop one trailing ``\\r``, so a CRLF command is read like an LF one.
+
+    Splitting on ``\\n`` leaves a ``\\r`` at the end of every line of a CRLF
+    payload. ``\\r`` is not in :data:`_HEREDOC_OWNER_CHARS` and both patterns
+    anchor to end-of-string, so without this the scan would stop at line 0 and
+    mask nothing at all. That fails closed — but "closed" here means the prose
+    goes to the coarse floor, which is the conductor death this whole function
+    exists to prevent, arriving silently and only on Windows-authored payloads.
+
+    Stripping it cannot fail OPEN. Measured on git-bash: a CRLF script parses and
+    the heredoc body is data exactly as with LF, so masking it is right. Where a
+    shell instead treats the ``\\r`` as part of the delimiter, the terminator
+    never matches, the heredoc runs to EOF and the script dies on a syntax error
+    — nothing runs, so nothing was hidden. ``\\r`` is not a shell operator in
+    either case, so a line that was a whole command still is one.
+    """
+    return line[:-1] if line.endswith("\r") else line
+
+
+def _is_a_plain_command_line(line: str) -> bool:
+    """May the scan walk past this line?
+
+    Two things have to hold, and the second was learnt the hard way. The line
+    must not reach the NEXT line, so that the line after it really does start a
+    new command. And it must not change what a sink invocation further down
+    MEANS — see :data:`_STEPPABLE_INVOCATIONS` for the bypasses that obligation
+    exists to close.
+
+    Needed so the scan can walk PAST an ordinary command — ``git add .`` before
+    the commit — and still know that the line after it starts a new command
+    rather than continuing this one. Every character of the code must come from
+    :data:`_HEREDOC_OWNER_CHARS` and its quotes must balance. That excludes
+    ``\\`` (continuation), ``;`` ``&`` ``|`` (an operator whose right side may be
+    on the next line), ``$`` and backtick (a substitution bash reads across
+    newlines), and ``<`` ``>`` (any redirect — so a line bearing a heredoc opener
+    we do NOT recognise can never be walked past as if it were ordinary).
+
+    A trailing comment is cut off first, because a comment cannot reach the next
+    line under any circumstance. Measured: ``# note`` before a sink leaves the
+    heredoc body as data, and so do ``# note &&``, ``# git commit -F - <<'X'``
+    and even ``# note \\`` — a backslash loses its power inside a comment. This
+    is the one place the ``#`` rule differs from the opener line, where a comment
+    kills the heredoc and must stop everything.
+
+    Cutting matters for more than comment-only lines: ``shlex`` is handed the raw
+    string, so ``# don't delete`` raises ``No closing quotation`` and ``# note \\``
+    raises ``No escaped character``. Apostrophes in English prose are common
+    enough that leaving them in would keep most of the false negative round 11
+    reported. The cut is made at a word-initial ``#`` only — bash's own rule —
+    so a mid-word ``#`` still leaves any unbalanced quote after it visible to
+    ``shlex``, which is what makes ``--title a#b'c`` stop the scan.
+    """
+    comment = _HASH_BEGINS_A_WORD_RE.search(line)
+    if comment is not None:
+        # The match starts at the character BEFORE the `#` (a space, tab or
+        # `)`), and that character is still code, so cut at the `#` itself.
+        line = line[: comment.end() - 1]
+    if _PLAIN_COMMAND_LINE_RE.match(line) is None:
+        return False
+    if _COMPOUND_COMMAND_CHARS.intersection(line):
+        return False
+    if _has_unquoted_punctuation(line):
+        # A redirect here could be a heredoc we do not recognise, and its body
+        # would be the lines the scan is about to account for. Unlike the same
+        # test on an opener's owner, no exploit was found for this half — the
+        # lines after such a redirect are that heredoc's body, so blanking them
+        # blanks data. It is kept because stepping over a line the scan has not
+        # understood is the mistake every earlier round was made of, not because
+        # a measurement forced it. Stated plainly so nobody reads it as pinned.
+        return False
+    try:
+        tokens = shlex.split(line, posix=True)
+    except ValueError:
+        return False
+    if not tokens:
+        # Nothing to run: a blank line, or one that was only a comment.
+        return True
+    return any(
+        len(tokens) >= len(prefix) and tuple(tokens[: len(prefix)]) == prefix
+        for prefix in _STEPPABLE_INVOCATIONS
+    )
 
 
 def _mask_quoted_heredoc_payloads(command: str) -> str:
-    """Blank out quoted-heredoc bodies that are DATA for a known sink.
+    """Blank quoted-heredoc bodies that are DATA for a known sink.
 
     Returns ``command`` with those body characters replaced by spaces. Length and
     newline positions are preserved so ``match_offset`` / ``match_line`` on any
@@ -697,41 +959,110 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
 
     This is what separates "the command deletes" from "the command writes a file
     that mentions deleting" — the distinction :func:`_scan_raw_coarse` was already
-    instrumented to record. Nothing outside a masked body changes, so the command
-    line itself (including the sink invocation and anything after the terminator)
-    is scanned exactly as before.
+    instrumented to record. It exists because the system prompt tells the
+    implementer to write commit messages and PR bodies through a heredoc, those
+    bodies are Markdown, a Markdown code span is a backtick, and a lone backtick
+    opened the coarse floor over the prose (measured 2026-08-17: four conductor
+    runs died on messages that merely *mentioned* deleting, one of them quoting
+    the human's own instruction not to delete).
 
-    Declines to mask — leaving today's behaviour — whenever anything is unclear:
-    an unquoted delimiter, an owner it cannot tokenise, an owner that is not a
-    known data sink, or a body with no terminator line.
+    The scan walks the command line by line and **accounts for every line it
+    passes**, which is the property that makes it safe. At each step the line is
+    one of exactly three things:
+
+    * a data sink carrying one quoted opener and nothing that could move where
+      the body begins (:data:`_HEREDOC_OWNER_CHARS`) — its body is blanked up to
+      the **first** line that is exactly the delimiter, because that is where
+      bash ends it, and the scan resumes after that line;
+    * an ordinary whole command (:func:`_is_a_plain_command_line`) — stepped
+      over, so a batch may put ``git add .`` before the commit. "Ordinary" means
+      it neither reaches the next line nor rebinds anything the sink depends on;
+    * anything else — the scan stops there and leaves the remainder untouched.
+
+    Only bodies are blanked; every other line, before or after, stays shell for
+    the floor to read.
+
+    Accounting is what separates this from "find any line that looks like an
+    opener", which is what the round-7 critique prescribed and what round 1
+    already broke. A line matching the opener template is only an opener if it
+    is at a command position, and it is only at a command position if every line
+    before it was one of the three above. In::
+
+        bash <<'ZZ'
+        git commit -F - <<'X'
+        ZZ
+        rm -rf /tmp/a
+        X
+
+    line 1 matches the template perfectly, but bash ends ``ZZ``'s body at line 2
+    and runs line 3. The unrecognised ``bash <<'ZZ'`` stops the scan, so line 3
+    stays visible; treating line 1 as an opener would blank it.
+
+    Six review rounds found defect after defect in cleverer attempts to locate a
+    heredoc body, and running each under bash separates them into two kinds:
+
+    * **three that really do run the line the mask blanked** — a fake opener
+      inside a body, a backslash continuation, and a regex whose end anchor let
+      a non-greedy body swallow the real terminator and the command behind it.
+      These are fail-OPEN, and they are the reason for the conservatism.
+    * **the rest, which bash refuses to parse at all** — a trailing ``&&``,
+      ``$(`` left open, a bare backtick. Measured: ``bash`` exits 2 and runs
+      nothing. Declining these buys no safety over what bash already does; they
+      are declined because the parse is ambiguous, not because a deletion would
+      otherwise execute. Saying so keeps the record honest about which of the
+      cases in ``tests/test_implementer_heredoc_mask.py`` are load-bearing.
+
+    The lesson taken is not "model bash better" but "recognise less, and never
+    step over a line without knowing what it is".
     """
-    out = command
-    for match in _QUOTED_HEREDOC_RE.finditer(command):
-        tokens = _heredoc_owner_tokens(command[: match.start()])
-        if tokens is None:
-            continue
-        if not any(
-            len(tokens) >= len(sink) and tuple(tokens[: len(sink)]) == sink
-            for sink in _HEREDOC_DATA_SINKS
+    lines = command.split("\n")
+    out = list(lines)
+    index = 0
+    while index < len(lines):
+        opener = _SINK_HEREDOC_OPENER_LINE_RE.match(_without_trailing_cr(lines[index]))
+        owner = opener.group("owner") if opener is not None else ""
+        if (
+            opener is not None
+            and not _HASH_BEGINS_A_WORD_RE.search(owner)
+            and not _has_unquoted_punctuation(owner)
         ):
+            try:
+                tokens = shlex.split(owner, posix=True)
+            except ValueError:
+                tokens = []
+            if any(
+                len(tokens) >= len(sink) and tuple(tokens[: len(sink)]) == sink
+                for sink in _HEREDOC_DATA_SINKS
+            ):
+                delim = opener.group("delim")
+                strip_tabs = opener.group("dash") == "-"
+                end = None
+                for candidate in range(index + 1, len(lines)):
+                    line = _without_trailing_cr(lines[candidate])
+                    if (line.lstrip("\t") if strip_tabs else line) == delim:
+                        end = candidate
+                        break
+                if end is None:
+                    # No terminator: we cannot say where this body stops, so we
+                    # stop too and leave the rest of the command as shell.
+                    break
+                for body in range(index + 1, end):
+                    # A trailing `\r` is kept so the masked view stays the same
+                    # shape as the command it stands for; every offset a denial
+                    # reports still lands on the real character.
+                    keep_cr = "\r" if lines[body].endswith("\r") else ""
+                    out[body] = " " * (len(lines[body]) - len(keep_cr)) + keep_cr
+                index = end + 1
+                continue
+
+        if _is_a_plain_command_line(_without_trailing_cr(lines[index])):
+            index += 1
             continue
-        body_start = command.find("\n", match.end())
-        if body_start == -1:
-            continue
-        body_start += 1
-        # ``<<-`` permits leading tabs before the terminator; plain ``<<`` does not.
-        allow_indent = command[match.start() : match.start() + 3].startswith("<<-")
-        terminator = re.compile(
-            (r"^[ \t]*" if allow_indent else r"^") + re.escape(match.group("delim")) + r"[ \t]*$",
-            re.MULTILINE,
-        )
-        end = terminator.search(command, body_start)
-        if end is None:
-            # Unterminated: we cannot tell where the payload stops, so scan it all.
-            continue
-        body = command[body_start : end.start()]
-        out = out[:body_start] + re.sub(r"[^\n]", " ", body) + out[end.start() :]
-    return out
+
+        # Not an opener we recognise and not a line we can safely step over.
+        break
+
+    return "\n".join(out)
 
 
 def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
