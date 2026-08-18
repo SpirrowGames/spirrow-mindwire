@@ -25,6 +25,7 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
+from spirrow_mindwire.adapters import implementer as _implementer
 from spirrow_mindwire.adapters.implementer import (
     _BENIGN_BUILTIN_TOOLS,
     _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT,
@@ -1125,6 +1126,35 @@ async def test_guard_an_inner_command_cannot_hide_a_sibling(
     guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
     res = await guard("Bash", {"command": command}, ToolPermissionContext())
     assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.parametrize("command", ['eval "git push --force"', 'bash -c "git push --force"'])
+def test_reporting_and_enforcement_keep_separate_lists(command: str) -> None:
+    """The ranked report is not built from the flattened enforcement list.
+
+    `_classify_bash` splits and classifies the command itself; `_bash_actions`
+    is the separate, flattened list the guard iterates. Reading them as one
+    function predicts that `_chain_guarded` runs twice over a flattened list,
+    that the strict widened-operation rule then sees a wrapper and its contents
+    as siblings, and that a wrapped force-push is therefore refused while the
+    bare form is allowed — i.e. that T27 is broken. (Tier B, PR #158 round 26.)
+
+    Measured, the wrapper never reaches the ranking list: `_classify_single_bash`
+    has already reduced wrapper-vs-inner to one action, so that list is length 1
+    and `_chain_guarded` returns it untouched. Flattening lives on the other
+    side, where the chain rule is applied per shell level for exactly this
+    reason.
+    """
+    scanned = _implementer._mask_quoted_heredoc_payloads(command)
+    parts = [p.strip() for p in _implementer._BASH_SEP.split(scanned) if p.strip()]
+    ranking_list = [_implementer._classify_single_bash(p, 0) for p in parts]
+    ranking_list += [
+        _implementer._classify_bash(i, 1) for i in _implementer._extract_substitutions(scanned)
+    ]
+
+    assert len(ranking_list) == 1, [a.operation.value for a in ranking_list]
+    assert _implementer._chain_guarded(ranking_list, command) == ranking_list
+    assert _implementer._classify_bash(command).operation is Operation.FORCE_PUSH
 
 
 @pytest.mark.anyio
