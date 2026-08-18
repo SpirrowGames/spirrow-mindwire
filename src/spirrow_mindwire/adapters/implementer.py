@@ -688,6 +688,69 @@ def _heredoc_owner_tokens(prefix: str) -> list[str] | None:
         return None
 
 
+# Operators that keep a command list open across the newline.
+_LINE_CONTINUES_RE = re.compile(r"(?:&&|\|\||[|&])[ \t]*$")
+
+
+def _is_complete_command_line(text: str) -> bool:
+    """Does the command line certainly END at the newline following ``text``?
+
+    Only ``True`` for the simple form. bash defers a heredoc body until the
+    *logical* line finishes, and several constructs push that past the next
+    physical newline: a trailing backslash, an open quote, an unclosed ``$(`` or
+    backtick, a trailing ``&&`` / ``||`` / ``|`` / ``&``.
+
+    Getting that wrong is not cosmetic. The Tier B naysayer's payload on PR #156:
+
+        git commit -F - <<'A' ; eval \\
+        rm -rf /
+        safe
+        A
+
+    bash joins the continued line, runs ``eval rm -rf /``, and feeds ``safe`` to
+    the commit. A mask that assumed the body began at the next physical newline
+    blanked ``rm -rf /`` as inert data and hid it from every check.
+
+    So this does not try to model bash — three attempts at that produced three
+    holes. It recognises the one shape the mask exists for (``git commit -F -
+    <<'EOF'`` and friends, alone on their line) and refuses everything else,
+    which leaves the stricter pre-existing behaviour in place.
+    """
+    quote: str | None = None
+    depth = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote is None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch in "'\"`":
+                quote = ch
+            elif ch == "$" and text[i + 1 : i + 2] == "(":
+                depth += 1
+                i += 2
+                continue
+            elif ch == ")" and depth:
+                depth -= 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+        else:  # " or ` — backslash escapes inside both
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        i += 1
+    if i > len(text):
+        # The final backslash consumed the newline: a line continuation.
+        return False
+    if quote is not None or depth:
+        return False
+    return _LINE_CONTINUES_RE.search(text) is None
+
+
 def _mask_quoted_heredoc_payloads(command: str) -> str:
     """Blank out quoted-heredoc bodies that are DATA for a known sink.
 
@@ -729,6 +792,11 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
         line_end = command.find("\n", first.end())
         if line_end == -1:
             # Openers with no following line have no body to blank.
+            return out
+        if not _is_complete_command_line(command[pos:line_end]):
+            # The logical line runs past this newline, so we cannot say where the
+            # bodies begin. Mask nothing further and let the whole remainder be
+            # read as shell — the strict side. See _is_complete_command_line.
             return out
 
         # Every opener on this line, in order, each paired with the text that

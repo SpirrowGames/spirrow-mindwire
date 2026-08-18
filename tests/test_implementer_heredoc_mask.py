@@ -130,3 +130,47 @@ def test_a_deletion_disappears_only_from_inside_a_masked_body(
         assert verdict is not Operation.FS_DELETE, cmd
     else:
         assert verdict is Operation.FS_DELETE, cmd
+
+
+# --- the logical line may not end at the next newline --------------------- #
+#
+# bash defers a heredoc body until the *logical* command line finishes. Several
+# constructs push that past the next physical newline, and a mask that assumes
+# otherwise blanks live shell as if it were inert data — the third defect the
+# gate caught here, and the second outright bypass (Tier B naysayer, PR #156).
+#
+# The response is not a better bash model; three attempts at that produced three
+# holes. It is to recognise the simple shape the mask exists for and decline
+# everything else, which leaves the stricter pre-existing behaviour in place.
+
+BS = chr(92)
+
+
+@pytest.mark.parametrize(
+    ("label", "opener_line"),
+    [
+        ("backslash", "git commit -F - <<'A' ; eval " + BS),
+        ("and-and", "git commit -F - <<'A' &&"),
+        ("open-double-quote", "git commit -F - <<'A' ; echo \"x"),
+        ("open-substitution", "git commit -F - <<'A' ; echo $("),
+        ("open-backtick", "git commit -F - <<'A' ; echo `"),
+    ],
+)
+def test_a_continued_line_masks_nothing(label: str, opener_line: str) -> None:
+    # The deletion sits on the line after the opener — which is still the same
+    # logical line, so bash runs it. It must stay visible.
+    cmd = opener_line + "\n" + DELETION + "\nsafe\nA"
+    assert _verdict(cmd) is Operation.FS_DELETE, label
+
+
+@pytest.mark.parametrize(
+    ("label", "opener_line"),
+    [
+        ("balanced quotes", "git commit -F - <<'A' ; echo \"done\""),
+        ("escaped backslash", "git commit -F - <<'A' ; echo " + BS + BS),
+        ("plain", "git commit -F - <<'A'"),
+    ],
+)
+def test_a_complete_line_still_masks_its_body(label: str, opener_line: str) -> None:
+    cmd = opener_line + "\nsays git rm here\nA"
+    assert _verdict(cmd) is Operation.GIT_COMMIT, label
