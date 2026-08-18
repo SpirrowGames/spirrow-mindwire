@@ -1142,6 +1142,43 @@ async def test_guard_flattening_keeps_direct_equal_to_wrapped(tmp_path: Path, co
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # Summarised as `exec.code` whose first token is `bash`, so nothing
+        # looked like a switch and the push borrowed `feature/x`. Measured
+        # ALLOWED — and it pushes to `main`. (Tier B, PR #158 round 15.)
+        ("wrapper-hides-the-checkout", 'bash -c "git checkout main" && git push'),
+        (
+            "wrapper-hides-it-from-a-rewrite",
+            'bash -c "git checkout main" && git reset --hard HEAD~1',
+        ),
+        # The splitter cuts on `&&` inside the quotes, so the first part arrives
+        # as the fragment `eval "git checkout main` — first token `eval`, and
+        # shlex refuses its quoting. Tokens cannot read a fragment; text can.
+        (
+            "fragment-hides-the-checkout",
+            'eval "git checkout main && git push --force origin feature/x" && git push',
+        ),
+        ("substitution-hides-the-checkout", "echo $(git checkout main) && git push"),
+    ],
+)
+async def test_guard_a_checkout_is_seen_wherever_it_is_written(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    """A checkout writes `.git/HEAD` on disk, so it reaches every later step.
+
+    Including from inside `bash -c`, and including steps at another level — so
+    the question is asked once over the whole flattened command, not of each
+    sibling's summary.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:

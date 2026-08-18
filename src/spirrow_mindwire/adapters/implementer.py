@@ -1357,6 +1357,14 @@ def _borrows_ambient_head(action: ClassifiedAction) -> bool:
     return action.operation in _HEAD_ENRICHED_OPERATIONS and action.branch is None
 
 
+#: Text meaning a later step may no longer trust the checkout.
+_SWITCHES_BRANCH_RE = re.compile(
+    r"\bgit\s+(?:checkout|switch)\b"  # moves HEAD elsewhere
+    r"|\bgit\s+config\b"  # can set push.default
+    r"|\bgit\s+branch\b[^\n]*(?:\s-u\b|--set-upstream-to|--track)"
+)
+
+
 def _may_switch_branch(action: ClassifiedAction) -> bool:
     """Could this step change what a later HEAD-enriched operation targets?
 
@@ -1396,13 +1404,14 @@ def _may_switch_branch(action: ClassifiedAction) -> bool:
     # behind it. Re-parsing a string that was already parsed only reintroduces
     # quoting bugs; the two leading words are all this needs, and a token
     # containing a space can be neither `git` nor a subcommand.
-    tokens = action.detail.split()
-    if len(tokens) < 2 or tokens[0] != "git":
-        return False
-    sub, args = _git_subcommand(tokens)
-    if sub in _BRANCH_SWITCHING_GIT_SUBCOMMANDS or sub in _PUSH_RETARGETING_GIT_SUBCOMMANDS:
-        return True
-    return sub == "branch" and any(arg in _BRANCH_UPSTREAM_FLAGS for arg in args)
+    # Matched against the text rather than parsed tokens. The splitter cuts on
+    # `&&` with no regard for quoting, so
+    # `eval "git checkout main && git push --force origin feature/x" && git push`
+    # arrives as the fragment `eval "git checkout main` — first token `eval`,
+    # quoting shlex refuses, checkout invisible. Reading fragments as tokens is
+    # what let that through (Tier B, PR #158 round 15); a pattern over the text
+    # does not care where the fragment was cut.
+    return _SWITCHES_BRANCH_RE.search(action.detail) is not None
 
 
 def _chain_guarded(actions: list[ClassifiedAction], command: str) -> list[ClassifiedAction]:
@@ -1492,7 +1501,26 @@ def _bash_actions(command: str, _depth: int = 0) -> list[ClassifiedAction]:
             nested += _bash_actions(inner, _depth + 1)
     for inner in _extract_substitutions(scanned):
         nested += _bash_actions(inner, _depth + 1)
-    return level + nested
+    everything = level + nested
+    # A checkout writes `.git/HEAD` on disk, so it reaches every later step in
+    # the same command — including from inside `bash -c`, and including steps at
+    # other levels. So this question is asked once over the whole command, after
+    # flattening, while the per-level rule above stays per level because a
+    # wrapped command and its contents are one step (T27).
+    #
+    # Asking it of a sibling's summary instead was the round-15 bypass:
+    # `bash -c "git checkout main" && git push` summarised the first part as
+    # `exec.code` whose first token is `bash`, so nothing looked like a switch
+    # and the push borrowed `feature/x` — measured ALLOWED, and it pushes to
+    # `main`.
+    if any(_may_switch_branch(action) for action in everything):
+        everything = [
+            ClassifiedAction(Operation.UNKNOWN, detail=command)
+            if _borrows_ambient_head(action)
+            else action
+            for action in everything
+        ]
+    return everything
 
 
 def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
