@@ -1971,6 +1971,25 @@ _GIT_CONFIG_ENV_RE = re.compile(
 )
 
 
+def _shell_resolved(command: str) -> str:
+    """``command`` with bash's quoting resolved, for patterns that must match a
+    NAME rather than a spelling.
+
+    A raw scan reads what was typed, and bash concatenates before git sees it:
+    ``env GIT_CON"FIG_COUNT"=1 … git push --force`` contains no `GIT_CONFIG`
+    substring at all, yet git receives the variable and — measured — reported
+    `feature/x -> main`. Splitting and rejoining puts the name back together.
+
+    Falls back to erasing the quoting characters when the command cannot be
+    tokenised, which is coarser and errs toward matching. (Tier B, PR #158
+    round 24.)
+    """
+    try:
+        return " ".join(shlex.split(command, posix=True))
+    except ValueError:
+        return command.replace('"', "").replace("'", "").replace(chr(92), "")
+
+
 def _push_destination(repo_root: Path, command: str, detail: str = "") -> str | None:
     """Which remote branch does a bare ``git push`` from here actually write?
 
@@ -1994,7 +2013,7 @@ def _push_destination(repo_root: Path, command: str, detail: str = "") -> str | 
     neither maps to the single branch this predicate returns, so both give None
     and the caller fails closed.
     """
-    if _GIT_CONFIG_FLAG_RE.search(detail) or _GIT_CONFIG_ENV_RE.search(command):
+    if _GIT_CONFIG_FLAG_RE.search(detail) or _GIT_CONFIG_ENV_RE.search(_shell_resolved(command)):
         # The query below reads the repository's PERSISTENT configuration, and an
         # override on the command line never reaches it. Measured: with
         # `push.default` unset (`simple`) and the upstream retargeted to

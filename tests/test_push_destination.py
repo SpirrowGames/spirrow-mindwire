@@ -157,6 +157,14 @@ async def test_an_explicit_refspec_is_not_second_guessed(tmp_path: Path) -> None
         # reported `feature/x -> main`. The pattern now takes any of them.
         # (Tier B, PR #158 round 23.)
         ("config-parameters", "GIT_CONFIG_PARAMETERS='push.default=upstream' git push --force"),
+        # bash concatenates before git sees it, so the raw text contains no
+        # `GIT_CONFIG` substring at all — measured `feature/x -> main`. The scan
+        # reads the resolved command. (Tier B, PR #158 round 24.)
+        (
+            "name-split-across-quotes",
+            'env GIT_CON"FIG_COUNT"=1 GIT_CON"FIG_KEY_0"=push.default '
+            'GIT_CON"FIG_VALUE_0"=upstream git push --force',
+        ),
     ],
 )
 async def test_an_inline_config_override_makes_the_destination_undecidable(
