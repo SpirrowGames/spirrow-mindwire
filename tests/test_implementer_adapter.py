@@ -1323,6 +1323,42 @@ async def test_guard_a_subcommand_name_inside_a_message_is_not_a_switch(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # An `env` prefix does not hide the subcommand: the classifier strips a
+        # leading `NAME=value` / `env` prefix, so the action's detail is plain
+        # `git -C . checkout main` and `_git_subcommand` reads `checkout`.
+        # Raised as a bypass on the assumption that the token check bails at
+        # `tokens[0] == "env"` (PR #158 round 25); measured, it does not.
+        ("env-prefixed-in-a-substitution", "echo $(env git -C . checkout main) && git push"),
+        ("env-prefixed-then-commit", "echo $(env git -C . checkout main) && git commit -m x"),
+        ("env-no-global-flag", "echo $(env git checkout main) && git push"),
+        ("global-flag-in-a-substitution", "echo $(git -C . checkout main) && git merge feature/y"),
+    ],
+)
+async def test_guard_an_env_prefix_does_not_hide_a_switch(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "command",
+    ["echo $(git status) && git push", "echo $(git log --oneline -1) && git commit -m x"],
+)
+async def test_guard_a_read_only_substitution_is_not_a_switch(tmp_path: Path, command: str) -> None:
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow), command
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:
