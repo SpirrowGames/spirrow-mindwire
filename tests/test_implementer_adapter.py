@@ -911,6 +911,39 @@ async def test_guard_merge_on_main_denied(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # `switches_to_main` only matches the literal word, and measured,
+        # `git checkout -` lands on `main` just as well — ALLOWED before this,
+        # and it merged into `main`. (Tier B, PR #158 round 9.)
+        ("previous-branch", "git checkout - && git merge feature/x"),
+        ("previous-branch-switch", "git switch - && git merge feature/x"),
+        ("reflog-shorthand", "git checkout @{-1} && git merge feature/x"),
+        # The literal form, still caught, now by two rules rather than one.
+        ("literal-main", "git checkout main && git merge feature/x"),
+        # Merging into develop is legitimate, but not in a chain that moves the
+        # checkout first: as two tool calls it still works.
+        ("any-checkout", "git checkout develop && git merge feature/x"),
+    ],
+)
+async def test_guard_a_merge_after_a_checkout_cannot_trust_ambient_head(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    """`git merge` takes its destination from HEAD too, through `target`.
+
+    It is bounded by `source_glob` / `target_glob` rather than `branch_glob`,
+    which is why it is not in `_HEAD_ENRICHED_OPERATIONS` — but it borrows the
+    ambient checkout all the same, so it needs the chain check. Two questions,
+    two predicates.
+    """
+    _init_head(tmp_path, "feature/y")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:

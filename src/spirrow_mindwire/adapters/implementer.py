@@ -1333,6 +1333,30 @@ _PUSH_RETARGETING_GIT_SUBCOMMANDS: frozenset[str] = frozenset({"config"})
 _BRANCH_UPSTREAM_FLAGS: frozenset[str] = frozenset({"-u", "--set-upstream-to", "--track"})
 
 
+def _borrows_ambient_head(action: ClassifiedAction) -> bool:
+    """Does this action's target come from the checkout rather than its own words?
+
+    Two questions were being answered by one tuple, and they are not the same
+    question (Tier B, PR #158 round 9):
+
+    * which operations need ``branch`` filled from HEAD — :data:`_HEAD_ENRICHED_OPERATIONS`;
+    * which operations *borrow* the ambient checkout and therefore cannot trust
+      it across a chain — this.
+
+    ``git merge`` belongs to the second and not the first: it is bounded by
+    ``source_glob`` / ``target_glob`` and takes its destination from HEAD through
+    ``target``. Leaving it out of the chain check meant a merge could be pointed
+    somewhere else first. ``git checkout main && git merge feature/x`` was
+    already caught, but only because a regex looks for the literal word — and
+    measured, ``git checkout -`` lands on ``main`` just as well:
+
+        git checkout - && git merge feature/x    -> ALLOWED, merged into main
+    """
+    if action.operation is Operation.GIT_MERGE:
+        return action.target is None
+    return action.operation in _HEAD_ENRICHED_OPERATIONS and action.branch is None
+
+
 def _may_switch_branch(action: ClassifiedAction) -> bool:
     """Could this step change what a later HEAD-enriched operation targets?
 
@@ -1458,11 +1482,7 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     #
     # A step that names its own target (`git rebase develop feature/z`, a refspec
     # force-push) never consults HEAD, so chaining does not reach it at all.
-    if (
-        candidate.operation in _HEAD_ENRICHED_OPERATIONS
-        and candidate.branch is None
-        and len(actions) > 1
-    ):
+    if _borrows_ambient_head(candidate) and len(actions) > 1:
         widened_here = candidate.operation in (Operation.HISTORY_REWRITE, Operation.FORCE_PUSH)
         others = [a for a in actions if a is not candidate]
         if widened_here or any(_may_switch_branch(a) for a in others):
@@ -1698,14 +1718,17 @@ def _current_branch(repo_root: Path) -> str | None:
 #: this list skips its glob entirely and passes. Nothing static catches that; the
 #: detached-HEAD and non-repo tests are what does.
 #:
-#: ``GIT_MERGE`` is deliberately absent, and its absence has now been raised as a
-#: bypass three times (PR #158 rounds 3, 6, 8) because the reason lives outside
-#: the diff. It is constrained by ``source_glob`` / ``target_glob``, never
-#: ``branch_glob``, and its destination is filled from HEAD by its own branch in
-#: :meth:`_AllowlistGuard._enrich` — which sets ``target``, not ``branch``.
-#: Measured on each of those rounds: ``git merge feature/x`` is denied on
-#: ``main`` and allowed on ``feature/x``. Adding it here would populate a field
-#: its rules never read. See ``test_guard_merge_on_main_denied``.
+#: ``GIT_MERGE`` is deliberately absent HERE, because it is bounded by
+#: ``source_glob`` / ``target_glob`` and its destination is filled from HEAD by
+#: its own branch in :meth:`_AllowlistGuard._enrich` — which sets ``target``, not
+#: ``branch``. Adding it would populate a field its rules never read. Measured
+#: repeatedly: ``git merge feature/x`` is denied on ``main`` and allowed on
+#: ``feature/x``. See ``test_guard_merge_on_main_denied``.
+#:
+#: It DOES belong to the other question — "whose target comes from the ambient
+#: checkout" — and that is :func:`_borrows_ambient_head`, a separate predicate
+#: for a separate purpose. Conflating the two left merges out of the chain check
+#: (PR #158 round 9).
 _HEAD_ENRICHED_OPERATIONS: tuple[Operation, ...] = (
     Operation.GIT_COMMIT,
     Operation.GIT_PUSH,
