@@ -224,18 +224,68 @@ def test_github_pr_open_does_not_imply_merge_to_main(tmp_path: Path) -> None:
     "op",
     [
         Operation.GIT_MERGE_TO_MAIN,
-        Operation.FORCE_PUSH,
-        Operation.HISTORY_REWRITE,
         Operation.FS_DELETE,
         Operation.DRIVE_WRITE,
         Operation.EXTERNAL_PUBLISH,
     ],
 )
 def test_tier_c_forbidden_denied_with_reason(tmp_path: Path, op: Operation) -> None:
+    """The four operations that stay unconditionally forbidden regardless of branch.
+
+    ``force_push`` / ``history_rewrite`` used to be here but were moved to
+    branch-scoped Tier A on 2026-08-15 — they are denied on ``main`` (and any
+    branch outside ``feature/*`` / ``develop``) but permitted on a working feature
+    branch. See ``test_force_push_scoped_by_branch`` and
+    ``test_history_rewrite_scoped_by_branch`` below.
+    """
     d = _al(tmp_path).check(ClassifiedAction(op))
     assert d.allowed is False
     assert d.operation is op
     assert d.reason  # a concrete fail-loud reason
+
+
+# --- force_push / history_rewrite: branch-scoped Tier A (2026-08-15) ------- #
+
+
+@pytest.mark.parametrize(
+    ("op", "branch", "allowed"),
+    [
+        # Working branches: allowed — git preserves recovery on any non-main ref
+        # and the human explicitly authorised this widening on 2026-08-15
+        # (T-branch-scoped-implementer-permissions).
+        (Operation.FORCE_PUSH, "feature/x", True),
+        (Operation.FORCE_PUSH, "feature/deep/name", True),
+        (Operation.FORCE_PUSH, "develop", True),
+        (Operation.HISTORY_REWRITE, "feature/x", True),
+        (Operation.HISTORY_REWRITE, "feature/deep/name", True),
+        (Operation.HISTORY_REWRITE, "develop", True),
+        # `main` (the invariant that motivated the branch scope in the first
+        # place) and unrelated branches: denied by branch_glob.
+        (Operation.FORCE_PUSH, "main", False),
+        (Operation.FORCE_PUSH, "release/2026-08", False),
+        (Operation.HISTORY_REWRITE, "main", False),
+        (Operation.HISTORY_REWRITE, "release/2026-08", False),
+    ],
+)
+def test_force_push_and_history_rewrite_scoped_by_branch(
+    tmp_path: Path, op: Operation, branch: str, allowed: bool
+) -> None:
+    d = _al(tmp_path).check(ClassifiedAction(op, branch=branch))
+    assert d.allowed is allowed
+    if not allowed:
+        assert d.reason
+
+
+# A None-branch action reaches the allow-list without a constraint to check,
+# because `_branch_matches(None, ...)` falls through — this is fail-OPEN, and
+# it is deliberate: the *guard* (`_AllowlistGuard._enrich` in adapters/implementer)
+# resolves the current branch from `git rev-parse` and downgrades to UNKNOWN
+# when HEAD is undecidable, which is fail-CLOSED. The assertion that matters
+# lives at the layer that decides — see
+# `test_guard_force_push_undeterminable_branch_fails_closed` and
+# `test_guard_history_rewrite_undeterminable_branch_fails_closed` in
+# test_implementer_adapter.py. Asserting the permissive result here would read as
+# an endorsement of it (identical framing to the git.merge no-target case above).
 
 
 # --- default-deny ---------------------------------------------------------- #
@@ -254,7 +304,10 @@ def test_default_allowlist_has_rules(tmp_path: Path) -> None:
     al = _al(tmp_path)
     # smoke: the packaged §B.3 config loaded with both allow and forbidden rules.
     assert al.check(ClassifiedAction(Operation.EXEC_CODE)).allowed
-    assert al.check(ClassifiedAction(Operation.FORCE_PUSH)).allowed is False
+    # A Tier-C-still-forbidden op (this list shortened on 2026-08-15 when
+    # force_push / history_rewrite became branch-scoped Tier A; ``fs.delete``
+    # is the shortest-lived member left for this smoke test).
+    assert al.check(ClassifiedAction(Operation.FS_DELETE)).allowed is False
 
 
 def test_from_mapping_rejects_non_dict(tmp_path: Path) -> None:

@@ -22,11 +22,16 @@ and **refuses to spawn** if none is configured (no silent fallback to the
 default endpoint).
 
 Enforcement scope (mirrors :mod:`spirrow_mindwire.allowlist`): the hard
-guarantee is that the six Tier C operations are denied. The guard resolves the
-*effective* branch from ``.git/HEAD`` (so a bare ``git push`` / ``git commit`` /
-``git merge`` while on ``main`` is denied, and an undeterminable branch fails
-closed → ``UNKNOWN`` → deny). Shell *indirection* (``bash -c`` / ``eval`` /
-``$(...)`` / backticks) hides the inner command from tokenization, so the inner
+guarantee is that four Tier C operations are denied unconditionally
+(``git.merge_to_main`` / ``fs.delete`` / ``drive.write`` / ``external.publish``),
+and that ``force_push`` / ``history_rewrite`` are denied on any branch outside
+``feature/*`` / ``develop`` (branch-scoped Tier A since 2026-08-15,
+T-branch-scoped-implementer-permissions). The guard resolves the *effective*
+branch from ``.git/HEAD`` (so a bare ``git push`` / ``git commit`` /
+``git merge`` / ``git rebase`` / ``git reset --hard`` while on ``main`` is
+denied, and an undeterminable branch fails closed → ``UNKNOWN`` → deny).
+Shell *indirection* (``bash -c`` / ``eval`` / ``$(...)`` / backticks)
+hides the inner command from tokenization, so the inner
 command is extracted and re-classified through the **same** structural classifier
 (a wrapped Tier C command is judged identically to its direct form — T27), with a
 coarse keyword scan as a defence-in-depth floor for input that defeats the
@@ -1388,9 +1393,40 @@ class _AllowlistGuard:
         push/merge while on ``main`` would otherwise pass (None == "no constraint
         to check"). If the branch can't be determined, downgrade to UNKNOWN so
         ``default: deny`` blocks it (fail-closed).
+
+        ``git rebase`` / ``git reset --hard`` / ``git filter-branch`` (=
+        :attr:`Operation.HISTORY_REWRITE`) mutate the *checked-out* branch and
+        carry no branch argument, so the classifier always emits ``branch=None``;
+        the enrichment fills the HEAD in for them too, or downgrades to UNKNOWN
+        when HEAD is undecidable. Same shape for ``git push --force`` on a bare
+        push (``branch=None`` from the classifier) — a refspec-form force push
+        (``origin main`` / ``+feature/x:main``) already carries the destination
+        via :func:`_push_target_and_force` and enrichment leaves it alone.
+
+        The whole reason this list has to enumerate operations (rather than
+        "fill the branch if any allow rule for this op has a ``branch_glob``")
+        is that the allow-list's ``branch is None`` case is fail-**open**
+        (``allowlist._constraints_pass`` returns ``True, ""`` on None so the
+        commit / push structural rule works with an unparseable command line).
+        An operation whose branch reaches the check as ``None`` therefore
+        SKIPS ``branch_glob`` and slips through. Missing an operation from
+        this enumeration is silent in every static check we have, so the
+        detached-HEAD / non-repo regression tests below are the only guard
+        against a future op being widened via ``branch_glob`` without also
+        being added here (T-branch-scoped-implementer-permissions §6-1).
         """
         repo_root = self._allowlist.repo_root
         if action.operation in (Operation.GIT_COMMIT, Operation.GIT_PUSH) and action.branch is None:
+            cur = _current_branch(repo_root)
+            return (
+                replace(action, operation=Operation.UNKNOWN)
+                if cur is None
+                else replace(action, branch=cur)
+            )
+        if (
+            action.operation in (Operation.HISTORY_REWRITE, Operation.FORCE_PUSH)
+            and action.branch is None
+        ):
             cur = _current_branch(repo_root)
             return (
                 replace(action, operation=Operation.UNKNOWN)

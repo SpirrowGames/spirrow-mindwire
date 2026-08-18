@@ -332,10 +332,32 @@ def test_classify_mcp(name: str, inp: dict[str, Any], expected: Operation) -> No
     assert classify_tool_call(name, inp).operation is expected
 
 
-def test_force_push_command_denied_end_to_end(tmp_path: Path) -> None:
+def test_force_push_to_main_denied_end_to_end(tmp_path: Path) -> None:
+    """`git push --force origin main` still denied — the invariant that survives the widening.
+
+    ``force_push`` was moved from unconditional Tier C to branch-scoped Tier A on 2026-08-15
+    (T-branch-scoped-implementer-permissions). What must not budge is that ``main`` stays
+    off-limits: `_push_target_and_force` surfaces the destination as ``"main"`` so the
+    ``branch_glob`` outside ``feature/*`` / ``develop`` fires and denies.
+    """
+    al = default_allowlist(repo_root=tmp_path)
+    action = classify_tool_call("Bash", {"command": "git push --force origin main"})
+    assert action.operation is Operation.FORCE_PUSH
+    assert action.branch == "main"
+    assert al.check(action).allowed is False
+
+
+def test_force_push_to_feature_allowed_end_to_end(tmp_path: Path) -> None:
+    """`git push --force origin feature/x` now allowed (branch-scoped Tier A, 2026-08-15).
+
+    ``main`` is the line, not the verb — see the docstring of ``allowlist`` and the yaml
+    comment above the ``force_push`` allow rule.
+    """
     al = default_allowlist(repo_root=tmp_path)
     action = classify_tool_call("Bash", {"command": "git push --force origin feature/x"})
-    assert al.check(action).allowed is False
+    assert action.operation is Operation.FORCE_PUSH
+    assert action.branch == "feature/x"
+    assert al.check(action).allowed is True
 
 
 def test_repo_internal_write_allowed_end_to_end(tmp_path: Path) -> None:
@@ -358,11 +380,15 @@ async def test_guard_allows_exec(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_guard_denies_force_push_with_interrupt(tmp_path: Path) -> None:
+async def test_guard_denies_force_push_to_main_with_interrupt(tmp_path: Path) -> None:
+    """Denial still fail-loud (``interrupt=True``) when a force push targets ``main``.
+
+    The refspec surfaces the target as ``"main"`` in the classifier, so this path does
+    not need HEAD enrichment — it is the direct-argument deny. See
+    ``test_guard_force_push_bare_on_main_denied`` below for the enrichment counterpart.
+    """
     guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard(
-        "Bash", {"command": "git push --force origin feature/x"}, ToolPermissionContext()
-    )
+    res = await guard("Bash", {"command": "git push --force origin main"}, ToolPermissionContext())
     assert isinstance(res, PermissionResultDeny)
     assert res.interrupt is True
     assert res.message
@@ -403,6 +429,29 @@ def _init_head(repo_root: Path, branch: str | None) -> None:
             "-m",
             "init",
         ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _init_detached_head(repo_root: Path) -> None:
+    """Make ``repo_root`` a real git repo checked out at a detached HEAD.
+
+    Initialises on ``main``, records the commit sha, then checks that sha out
+    directly so ``git rev-parse --abbrev-ref HEAD`` returns the literal
+    ``HEAD`` (which ``_current_branch`` treats as None → fail-closed).
+    """
+    _init_head(repo_root, "main")
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "-q", "--detach", sha],
         cwd=repo_root,
         check=True,
         capture_output=True,
@@ -479,6 +528,155 @@ async def test_guard_undeterminable_branch_fails_closed(tmp_path: Path) -> None:
     res = await guard("Bash", {"command": "git push"}, ToolPermissionContext())
     assert isinstance(res, PermissionResultDeny)
     assert guard.violations[-1].operation is Operation.UNKNOWN
+
+
+# --------------------------------------------------------------------------- #
+# guard: force_push / history_rewrite branch enrichment
+#
+# `force_push` and `history_rewrite` moved from unconditional Tier C to
+# branch-scoped Tier A on 2026-08-15 (T-branch-scoped-implementer-permissions).
+# The move rests on TWO things happening together — the allow rule with
+# `branch_glob`, AND the enrichment of the current branch from `git rev-parse`.
+# Miss the enrichment and `branch_glob` never fires, because the classifier
+# emits `branch=None` for both operations (rebase mutates HEAD, a bare
+# `git push --force` inherits the checkout).
+#
+# These tests are the ONLY guard against silently missing a new op from the
+# `_enrich` enumeration (a static enum omission produces zero warnings and is
+# invisible to type checks). If a future widening reuses `branch_glob` without
+# also touching `_enrich`, these tests must break — that is what they are for.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_guard_force_push_bare_on_feature_allowed(tmp_path: Path) -> None:
+    """Bare ``git push --force`` on a feature branch — HEAD → ``feature/x`` → allow."""
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
+    assert guard.violations == []
+
+
+@pytest.mark.anyio
+async def test_guard_force_push_bare_on_main_denied(tmp_path: Path) -> None:
+    """Bare ``git push --force`` on ``main`` — HEAD → ``main`` → outside glob → deny.
+
+    The refspec-explicit path was already covered by
+    ``test_guard_denies_force_push_to_main_with_interrupt``; this is the
+    enrichment path, where the classifier emitted ``branch=None`` and the guard
+    filled it in.
+    """
+    _init_head(tmp_path, "main")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violations[-1].operation is Operation.FORCE_PUSH
+
+
+@pytest.mark.anyio
+async def test_guard_force_push_bare_non_repo_fails_closed(tmp_path: Path) -> None:
+    """No repo → HEAD undecidable → UNKNOWN → deny (fail-closed).
+
+    Pinned per msg-1068: a future op widened via ``branch_glob`` without an
+    entry in ``_enrich`` will leave ``branch=None`` on this call and slip
+    through ``_branch_matches``. This test only stays green if
+    ``FORCE_PUSH`` is in the enrichment enumeration.
+    """
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violations[-1].operation is Operation.UNKNOWN
+
+
+@pytest.mark.anyio
+async def test_guard_force_push_bare_detached_head_fails_closed(tmp_path: Path) -> None:
+    """Detached HEAD → ``_current_branch`` returns None → UNKNOWN → deny.
+
+    The other half of the enumeration pin: a real repo, but HEAD is not on a
+    named branch, so enrichment cannot assign one. ``rev-parse --abbrev-ref``
+    prints ``HEAD`` in that state and ``_current_branch`` returns None (which
+    the enrichment downgrades to UNKNOWN → default-deny).
+    """
+    _init_detached_head(tmp_path)
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violations[-1].operation is Operation.UNKNOWN
+
+
+@pytest.mark.anyio
+async def test_guard_rebase_on_feature_allowed(tmp_path: Path) -> None:
+    """``git rebase`` on a feature branch — HEAD → ``feature/x`` → allow.
+
+    The exact call that was previously halting the loop (msg-1056 listed
+    ``spirrow-voxelworld/T-slope-extension-dead-mode`` as denied on
+    ``history_rewrite``). After the widening it now runs.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git rebase origin/develop"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
+    assert guard.violations == []
+
+
+@pytest.mark.anyio
+async def test_guard_rebase_on_main_denied(tmp_path: Path) -> None:
+    """``git rebase`` while on ``main`` — HEAD → ``main`` → outside glob → deny.
+
+    The trap Bohr flagged in msg-1056 §2: ``git rebase`` carries no target
+    argument, so a naïve reading of ``action.branch`` is ``None`` — and
+    ``_branch_matches(None, ...)`` is fail-OPEN. This test only passes because
+    ``_enrich`` fills the branch from HEAD before ``check`` runs.
+    """
+    _init_head(tmp_path, "main")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git rebase origin/develop"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violations[-1].operation is Operation.HISTORY_REWRITE
+
+
+@pytest.mark.anyio
+async def test_guard_history_rewrite_non_repo_fails_closed(tmp_path: Path) -> None:
+    """No repo → HEAD undecidable → UNKNOWN → deny (fail-closed).
+
+    Pin for ``HISTORY_REWRITE`` mirroring the ``FORCE_PUSH`` case above; both
+    must be enumerated in ``_enrich`` for the widening to be safe.
+    """
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git rebase origin/develop"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violations[-1].operation is Operation.UNKNOWN
+
+
+@pytest.mark.anyio
+async def test_guard_history_rewrite_detached_head_fails_closed(tmp_path: Path) -> None:
+    """Detached HEAD → UNKNOWN → deny (fail-closed) for ``git rebase`` too."""
+    _init_detached_head(tmp_path)
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git rebase origin/develop"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violations[-1].operation is Operation.UNKNOWN
+
+
+@pytest.mark.anyio
+async def test_guard_reset_hard_on_feature_allowed(tmp_path: Path) -> None:
+    """``git reset --hard`` classifies as ``HISTORY_REWRITE``; allowed on a feature branch."""
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git reset --hard HEAD~1"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
+    assert guard.violations == []
+
+
+@pytest.mark.anyio
+async def test_guard_reset_hard_on_main_denied(tmp_path: Path) -> None:
+    """``git reset --hard`` while on ``main`` — HEAD → ``main`` → deny."""
+    _init_head(tmp_path, "main")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git reset --hard HEAD~1"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert guard.violations[-1].operation is Operation.HISTORY_REWRITE
 
 
 # --------------------------------------------------------------------------- #
@@ -772,7 +970,10 @@ async def test_deliver_allowlist_violation_fails_loud(tmp_path: Path) -> None:
         inference_base_url="http://lx",
         client_factory=_factory(
             responses=[_assistant("ignored"), _result()],
-            simulate_tool=("Bash", {"command": "git push --force origin feature/x"}),
+            # Force-pushing to ``main`` is still Tier C after 2026-08-15 (only the
+            # branch-scoped feature/develop cases were widened) — this is the
+            # allow-list violation we want the adapter lifecycle to surface fail-loud.
+            simulate_tool=("Bash", {"command": "git push --force origin main"}),
         ),
     )
     handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx(captured))
