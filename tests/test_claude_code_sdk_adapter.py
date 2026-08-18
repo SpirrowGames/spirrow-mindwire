@@ -315,17 +315,26 @@ async def test_a_call_carrying_no_path_is_left_alone(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_no_builtins_means_no_guard_to_run(tmp_path: Path) -> None:
-    """Nothing is exposed, so there is nothing to scope."""
-    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(_FakeClient([])))
-    assert adapter._path_guard is None
+async def test_a_tool_the_guard_cannot_bound_is_refused(tmp_path: Path) -> None:
+    """A guard that waves through what it cannot check is worse than none.
+
+    ``Bash`` names its target in ``command`` and ``WebFetch`` in ``url``; this
+    guard understands neither, so neither may run behind it — rather than being
+    skipped by the key loop and auto-approved. (Tier B, PR #157 round 3.)
+    """
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Bash", {"command": "cat /etc/shadow"}) is False
+    assert await _verdict(guard, "WebFetch", {"url": "https://x/y"}) is False
+    assert await _verdict(guard, "Write", {"file_path": str(tmp_path / "a")}) is False
 
 
 @pytest.mark.anyio
-async def test_exposing_builtins_installs_the_guard(tmp_path: Path) -> None:
-    """Exposure and approval are separate, and the guard is what re-joins them.
+async def test_the_base_adapter_does_not_invent_a_guard(tmp_path: Path) -> None:
+    """Exposing built-ins does not say WHICH bound applies.
 
-    ``allowed_tools`` auto-approves, so without this the SDK would never ask.
+    A filesystem scope is right for a role that only reads the tree and wrong
+    for one reaching an MCP tool whose ``path`` is a URI. The base adapter
+    cannot tell them apart, so it is not asked to; the composition root injects.
     """
     captured: list[Any] = []
 
@@ -340,9 +349,27 @@ async def test_exposing_builtins_installs_the_guard(tmp_path: Path) -> None:
         client_factory=factory,
     )
     await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
-    guard = captured[0].can_use_tool
-    assert isinstance(guard, _PathScopeGuard)
-    assert guard.root == tmp_path
+    assert captured[0].can_use_tool is None
+
+
+@pytest.mark.anyio
+async def test_an_injected_guard_reaches_the_sdk(tmp_path: Path) -> None:
+    captured: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured.append(options)
+        return _FakeClient([])
+
+    guard = _PathScopeGuard(root=tmp_path)
+    adapter = ClaudeCodeSdkAdapter(
+        cwd=tmp_path,
+        builtin_tools=("Read",),
+        can_use_tool=guard,
+        allowed_tools=["Read"],
+        client_factory=factory,
+    )
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    assert captured[0].can_use_tool is guard
 
 
 @pytest.mark.anyio

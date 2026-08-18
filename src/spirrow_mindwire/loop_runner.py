@@ -71,7 +71,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter
+from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter, _PathScopeGuard
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
@@ -286,6 +286,11 @@ def build_proposer(repo_dir: Path) -> Stage3ProposerAdapter:
         cwd=repo_dir,
         builtin_tools=_PROPOSER_BUILTIN_TOOLS,
         allowed_tools=list(_PROPOSER_BUILTIN_TOOLS),
+        # The scope is decided here, where the role is known — the adapter has no
+        # way to tell a filesystem path from an MCP tool's URI-shaped ``path``,
+        # so it is not asked to guess. `allowed_tools` auto-approves, which is
+        # what makes a guard the only place a bound can live.
+        can_use_tool=_PathScopeGuard(root=repo_dir),
     )
 
 

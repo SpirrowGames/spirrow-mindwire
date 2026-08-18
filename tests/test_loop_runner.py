@@ -30,7 +30,7 @@ import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from spirrow_mindwire import loop_runner
-from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkAdapter
+from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkAdapter, _PathScopeGuard
 from spirrow_mindwire.adapters.implementer import ImplementerSdkAdapter
 from spirrow_mindwire.adapters.naysayer_sdk import NaysayerSdkAdapter
 from spirrow_mindwire.conductor import StopReason
@@ -298,8 +298,9 @@ def test_the_proposer_is_scoped_to_the_repository_it_was_given() -> None:
     """
     repo = Path("/tmp/some-repo")
     proposer = build_proposer(repo)
-    assert proposer._path_guard is not None
-    assert proposer._path_guard.root == repo
+    guard = proposer._can_use_tool
+    assert isinstance(guard, _PathScopeGuard)
+    assert guard.root == repo
 
 
 def test_the_proposer_still_cannot_write_or_run_anything() -> None:

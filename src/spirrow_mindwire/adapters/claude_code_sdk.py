@@ -218,12 +218,22 @@ class _PathScopeGuard:
     root: Path
     denials: list[str] = field(default_factory=list)
 
+    #: The tools whose inputs this guard knows how to bound. Anything else is
+    #: refused rather than waved through: a guard that silently allows what it
+    #: cannot check is worse than no guard, because the caller believes there is
+    #: one. ``Bash`` names its target in ``command`` and ``WebFetch`` in ``url``,
+    #: neither of which this understands — so neither may run behind it.
+    #: (Tier B, PR #157 round 3.)
+    scopeable_tools: frozenset[str] = frozenset({"Read", "Glob", "Grep"})
+
     async def __call__(
         self,
         tool_name: str,
         tool_input: dict[str, Any],
         context: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
+        if tool_name not in self.scopeable_tools:
+            return self._refuse(tool_name, tool_name, "this guard cannot bound that tool")
         root = self.root.resolve()
         keys = _PATH_INPUT_KEYS + _PATH_INPUT_KEYS_BY_TOOL.get(tool_name, ())
         for key in keys:
@@ -253,8 +263,8 @@ class _PathScopeGuard:
 
     def _refuse(self, tool_name: str, raw: object, why: str) -> PermissionResultDeny:
         reason = (
-            f"{tool_name} refused: {raw!r} — {why}. The proposer may read the "
-            "repository it designs against, and nothing else"
+            f"{tool_name} refused: {raw!r} — {why}. This session may read "
+            f"{self.root}, and nothing else"
         )
         self.denials.append(reason)
         return PermissionResultDeny(message=reason, interrupt=True)
@@ -281,6 +291,7 @@ class ClaudeCodeSdkAdapter:
         cwd: Path,
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
         builtin_tools: Sequence[str] = (),
+        can_use_tool: Any | None = None,
         allowed_tools: list[str] | None = None,
         mcp_servers: dict[str, Any] | None = None,
         client_factory: Callable[[Any], _SdkClient] | None = None,
@@ -288,7 +299,12 @@ class ClaudeCodeSdkAdapter:
         self._cwd = cwd
         self._system_prompt = system_prompt
         self._builtin_tools = list(builtin_tools)
-        self._path_guard = _PathScopeGuard(root=cwd) if self._builtin_tools else None
+        # Injected, never inferred. Exposing built-ins does not tell this class
+        # WHICH bound applies — a filesystem scope is right for a role that only
+        # reads the tree, and wrong for anything reaching an MCP tool whose
+        # ``path`` is a URI or a JSON pointer. The composition root knows; this
+        # does not. (Tier B, PR #157 round 3.)
+        self._can_use_tool = can_use_tool
         self._allowed_tools = allowed_tools or []
         self._mcp_servers = mcp_servers or {}
         self._client_factory = client_factory or _default_client_factory
@@ -312,10 +328,9 @@ class ClaudeCodeSdkAdapter:
             tools=self._builtin_tools,
             allowed_tools=self._allowed_tools,
             mcp_servers=self._mcp_servers,
-            # Exposure is not approval. `allowed_tools` auto-approves, so the
-            # scope check has to be a guard; with no built-ins exposed there is
-            # nothing to scope and this stays None.
-            can_use_tool=self._path_guard,
+            # Exposure is not approval: `allowed_tools` auto-approves, so any
+            # bound has to be a guard. Which bound is the caller's call.
+            can_use_tool=self._can_use_tool,
         )
         try:
             client = self._client_factory(options)
