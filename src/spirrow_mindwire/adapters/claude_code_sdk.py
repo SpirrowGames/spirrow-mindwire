@@ -184,7 +184,9 @@ async def _shutdown(client: _SdkClient) -> None:
 
 # Tool-input keys that name a path, across the read tools this adapter may be
 # given. ``Grep``/``Glob`` call it ``path``; ``Read`` calls it ``file_path``.
-_PATH_INPUT_KEYS: tuple[str, ...] = ("file_path", "path", "notebook_path")
+# Those two, and nothing anticipated: a key belongs here only once a tool that
+# uses it is in ``scopeable_tools``, and every other tool is refused on sight.
+_PATH_INPUT_KEYS: tuple[str, ...] = ("file_path", "path")
 
 # ``pattern`` means different things per tool, so it cannot go in the list above.
 # For ``Glob`` it is a path pattern and escapes exactly like a path does —
