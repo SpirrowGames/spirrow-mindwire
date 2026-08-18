@@ -153,6 +153,10 @@ async def test_an_explicit_refspec_is_not_second_guessed(tmp_path: Path) -> None
         ("quoted-flag", 'git "-c" push.default=upstream push --force'),
         ("escaped-flag", "git " + chr(92) + "-c push.default=upstream push --force"),
         ("quoted-long-flag", 'git "--config-env=push.default=UPSTREAM" push --force'),
+        # Enumerating the GIT_CONFIG_* names missed this one, and measured it
+        # reported `feature/x -> main`. The pattern now takes any of them.
+        # (Tier B, PR #158 round 23.)
+        ("config-parameters", "GIT_CONFIG_PARAMETERS='push.default=upstream' git push --force"),
     ],
 )
 async def test_an_inline_config_override_makes_the_destination_undecidable(

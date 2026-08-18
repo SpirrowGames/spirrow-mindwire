@@ -1967,7 +1967,7 @@ _GIT_CONFIG_FLAG_RE = re.compile(
 #: classifier strips a leading ``NAME=value`` prefix, so it is gone from the
 #: token join by the time an action carries a ``detail``.
 _GIT_CONFIG_ENV_RE = re.compile(
-    r"\bGIT_CONFIG(?:_COUNT|_KEY_[0-9]+|_VALUE_[0-9]+|_GLOBAL|_SYSTEM|_NOSYSTEM)?\b"
+    r"\bGIT_CONFIG[A-Z0-9_]*\b"  # any of them; enumerating missed _PARAMETERS
 )
 
 
