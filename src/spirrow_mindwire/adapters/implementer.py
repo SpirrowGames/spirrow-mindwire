@@ -1455,62 +1455,58 @@ def _chain_guarded(actions: list[ClassifiedAction], command: str) -> list[Classi
     return guarded
 
 
-def _coarse_action(
-    command: str, seen: frozenset[Operation], _depth: int = 0
-) -> ClassifiedAction | None:
-    """The defence-in-depth floor's finding, or None when it has nothing to say.
+def _coarse_action(command: str, _depth: int = 0) -> ClassifiedAction | None:
+    """The defence-in-depth floor's finding, read from what the structural pass
+    could NOT account for.
 
-    Factored out because the floor has two jobs that had been collapsed into
-    one. Ranking it against the structural verdict decides what gets REPORTED,
-    and that comparison is right: the floor must never downgrade a more precise
-    finding. But losing that comparison was also making it vanish from
-    ENFORCEMENT, and those are different questions.
+    The floor exists for input that defeats the tokenizer, so it is asked only
+    about the parts the tokenizer failed to name: a part whose structural
+    classification came back ``EXEC_CODE`` is a part nobody understood, and that
+    is where a smuggled verb can be hiding.
 
-    Measured on `feature/x` (Tier B, PR #158 round 17)::
+    This replaces a dedup by operation, which was wrong in both directions.
+    Suppressing a finding because the same OPERATION appeared elsewhere let a
+    legitimate action cover for a hidden one — measured
+    (Tier B, PR #158 round 19)::
 
-        echo "git reset --hard main" | sh && git push --force origin feature/x
+        git push --force origin feature/x && echo "git push --force origin main" | sh
 
-    The structural pass reads `echo`, `sh` and a force-push that names
-    `feature/x` — all allowed, and the force-push ranks 100. The floor sees the
-    hidden rewrite, is reduced to UNKNOWN at 90 for having no branch, loses
-    `90 >= 100`, and disappeared. A legitimate rank-100 action was only possible
-    at all because this PR made `force_push` branch-scoped, so this is exposure
-    the widening created.
+    The first part is a real, allowed force-push, so `FORCE_PUSH` was "already
+    seen" and the floor stayed quiet about the second. Reading per part has no
+    such coupling: the first part is named `force_push` and skipped, the second
+    is `exec.code` and gets read.
 
-    The guard now receives this finding as one more action to check. The floor
-    still only ever ADDS a denial.
+    It also keeps T27 without a special case. `eval "git push --force"` is one
+    part that the structural pass DOES name, by recursing into it, so the floor
+    has nothing to add and the wrapped form agrees with the bare one.
+
+    Ranking this finding against the structural verdict decides what gets
+    REPORTED and must never let the floor downgrade a more precise answer; the
+    guard receives it either way, because that is a different question.
     """
     if not _INDIRECTION_RE.search(command):
         return None
     scanned = _mask_quoted_heredoc_payloads(command) if _depth == 0 else command
-    # Every match, not just the first. `_scan_raw_coarse` reports one — right for
-    # a single reported verdict, and lossy here: with both a rewrite and a
-    # force-push in the text it names one of them, and if that one is what the
-    # structural pass already understood the other is never mentioned. Measured:
-    # `echo "git reset --hard main" | sh && git push --force origin feature/x`
-    # was allowed because the floor named the force-push, which was already seen.
-    coarse = None
-    for pattern, operation in _RAW_COARSE:
-        if operation in seen:
-            # The structural pass already reached this one, with a branch the
-            # floor could not have known. Adding a blind copy of what is already
-            # understood only denies what the direct form allows: `eval "git push
-            # --force"` would be refused while a bare `git push --force` passed,
-            # and T27 requires those to agree. The floor speaks about what the
-            # structural pass did NOT see.
+    for part in (p.strip() for p in _BASH_SEP.split(scanned)):
+        if not part:
             continue
-        hit = pattern.search(scanned)
-        if hit is not None:
-            coarse = ClassifiedAction(operation, detail=command, match_offset=hit.start())
-            break
-    if coarse is None:
-        return None
-    if _borrows_ambient_head(coarse):
-        # A regex over an opaque string can name the verb but never the branch,
-        # and `_enrich` would fill that None with whatever is checked out.
-        coarse = ClassifiedAction(Operation.UNKNOWN, detail=coarse.detail)
-    # Report the command that ran, not the masked copy the floor read.
-    return replace(coarse, detail=command)
+        if _classify_single_bash(part, _depth).operation is not Operation.EXEC_CODE:
+            # The structural pass named this part, with a branch the floor could
+            # not have known. A blind copy of what is already understood only
+            # denies what the direct form allows.
+            continue
+        coarse = _scan_raw_coarse(part)
+        if coarse is None:
+            continue
+        if _borrows_ambient_head(coarse):
+            # A regex over an opaque string can name the verb but never the
+            # branch, and `_enrich` would fill that None with whatever is
+            # checked out. UNKNOWN keeps the denial and drops the branch that
+            # was never known.
+            coarse = ClassifiedAction(Operation.UNKNOWN, detail=coarse.detail)
+        # Report the command that ran, not the fragment the floor read.
+        return replace(coarse, detail=command)
+    return None
 
 
 def _bash_actions(command: str, _depth: int = 0) -> list[ClassifiedAction]:
@@ -1860,7 +1856,7 @@ def classify_tool_call_actions(
     # The ranked winner carries the provenance stamp. The floor's finding is
     # added whether or not it won that comparison: ranking decides what to
     # report, and a finding that lost it was disappearing from enforcement too.
-    coarse = _coarse_action(command, frozenset(a.operation for a in actions))
+    coarse = _coarse_action(command)
     return [ranked, *actions] if coarse is None else [ranked, coarse, *actions]
 
 

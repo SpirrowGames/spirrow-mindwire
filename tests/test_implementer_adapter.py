@@ -1222,6 +1222,27 @@ async def test_guard_the_floor_does_not_start_denying_what_it_understands(
 
 
 @pytest.mark.anyio
+async def test_guard_a_real_force_push_does_not_cover_for_a_hidden_one(
+    tmp_path: Path,
+) -> None:
+    """A legitimate action must not silence the floor about a smuggled one.
+
+    The floor used to skip any operation the structural pass had already seen
+    anywhere in the command. Here the first part is a real, allowed force-push,
+    so `force_push` counted as seen and the piped one went unmentioned —
+    measured ALLOWED. (Tier B, PR #158 round 19.)
+
+    Reading per part removes the coupling: the first part is named `force_push`
+    and skipped, the second is `exec.code` — nobody named it — and gets read.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    command = 'git push --force origin feature/x && echo "git push --force origin main" | sh'
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:
