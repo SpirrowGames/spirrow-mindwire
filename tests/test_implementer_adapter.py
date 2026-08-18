@@ -1096,6 +1096,52 @@ async def test_guard_the_chain_check_reaches_every_borrowing_step(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        (
+            "substitution",
+            "echo $(git push --force origin feature/x && git push --force origin main)",
+        ),
+        (
+            "indirection",
+            'bash -c "git push --force origin feature/x && git push --force origin main"',
+        ),
+    ],
+)
+async def test_guard_an_inner_command_cannot_hide_a_sibling(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    """Enforcement flattens what reporting compresses.
+
+    `_classify_bash` reduces a list to one ranked winner, so a decoy inside a
+    substitution or a `bash -c` would carry the whole inner command. These were
+    already denied before the flattening — but only because `_BASH_SEP` splits
+    on `&&` with no regard for quoting or `$(`, so the inner text surfaced as an
+    outer part by accident. Earlier rounds showed that same naivety cutting the
+    other way; safety resting on it is not safety. (Tier B, PR #158 round 14.)
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command", ['eval "git push --force"', 'bash -c "git push --force"'])
+async def test_guard_flattening_keeps_direct_equal_to_wrapped(tmp_path: Path, command: str) -> None:
+    """T27, kept: a wrapped command and its contents are one step, not a chain.
+
+    Counting them as siblings refused these while the bare `git push --force`
+    was allowed. The chain check therefore runs per shell level.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow), command
+
+
+@pytest.mark.anyio
 async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
     tmp_path: Path,
 ) -> None:

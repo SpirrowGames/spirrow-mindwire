@@ -1445,11 +1445,22 @@ def _chain_guarded(actions: list[ClassifiedAction], command: str) -> list[Classi
 
 
 def _bash_actions(command: str, _depth: int = 0) -> list[ClassifiedAction]:
-    """The structural actions of one bash command, before any ranking.
+    """Every structural action of one bash command, flattened, before any ranking.
 
     Shares its split with :func:`_classify_bash` so the two cannot disagree
-    about what the command contains — the enforcement path must see every part
-    the reporting path considered.
+    about what the command contains, and unlike that function it does not
+    collapse anything: an indirection's inner command and a substitution's
+    contents are flattened in rather than reduced to their most dangerous part.
+
+    Reporting wants one action; enforcement wants all of them. Compressing here
+    would let a decoy hide a sibling — the shape round 12 found at the top level
+    (two tied ``force_push``, only the first examined) has an inner-command twin,
+    raised as round 14. That one did NOT reproduce: measured,
+    ``echo $(git push --force origin feature/x && git push --force origin main)``
+    is denied. But it is denied because ``_BASH_SEP`` splits on ``&&`` without
+    regard for quoting or ``$(``, so the inner text surfaces as an outer part by
+    accident. Earlier rounds showed that same naivety cutting the other way, and
+    safety that rests on it is not safety. Flattening makes it deliberate.
     """
     if _depth > _MAX_INDIRECTION_DEPTH:
         return [ClassifiedAction(Operation.UNKNOWN, detail=command)]
@@ -1457,9 +1468,31 @@ def _bash_actions(command: str, _depth: int = 0) -> list[ClassifiedAction]:
     parts = [p.strip() for p in _BASH_SEP.split(scanned) if p.strip()]
     if not parts:
         return [ClassifiedAction(Operation.EXEC_CODE, detail=command)]
-    actions = [_classify_single_bash(p, _depth) for p in parts]
-    actions += [_classify_bash(inner, _depth + 1) for inner in _extract_substitutions(scanned)]
-    return _chain_guarded(actions, command)
+    # The chain check asks "could a SIBLING step have moved the checkout before
+    # this one ran", so it belongs to one shell level. A wrapped command and its
+    # contents are the same step, not two — counting them as siblings refused
+    # `eval "git push --force"` while the bare form was allowed, breaking T27's
+    # direct == wrapped. So each level guards its own parts, and the deeper
+    # levels arrive already guarded by their own recursion.
+    level = _chain_guarded([_classify_single_bash(p, _depth) for p in parts], command)
+
+    # `_classify_single_bash` reduces a wrapped command to the more dangerous of
+    # wrapper vs inner, and `_classify_bash` reduces a list to one ranked winner.
+    # Both are right for reporting and lossy for enforcement, so the inner
+    # commands are flattened in: every action they contain has to reach the
+    # guard, not only the one that ranked highest.
+    nested: list[ClassifiedAction] = []
+    for part in parts:
+        try:
+            part_tokens = shlex.split(part, posix=True)
+        except ValueError:
+            part_tokens = part.split()
+        inner = _indirection_inner(part_tokens)
+        if inner is not None:
+            nested += _bash_actions(inner, _depth + 1)
+    for inner in _extract_substitutions(scanned):
+        nested += _bash_actions(inner, _depth + 1)
+    return level + nested
 
 
 def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
