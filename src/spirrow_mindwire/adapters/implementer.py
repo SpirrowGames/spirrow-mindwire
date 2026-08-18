@@ -427,11 +427,14 @@ def _rebase_target(args: list[str]) -> str | None | _Undecidable:
         if arg == "--onto":
             index += 2  # its value is a commit-ish, not the rewritten branch
             continue
-        if arg.startswith("-"):
+        if arg.startswith("-") and len(arg) > 1:
             if arg not in _REBASE_NO_VALUE_FLAGS:
                 return _UNDECIDABLE
             index += 1
             continue
+        # A bare `-` is git's shorthand for the previous branch, so it is a
+        # positional. Measured: `git rebase -` rebases the current branch and
+        # succeeds; refusing it was a denial with nothing behind it.
         positionals.append(arg)
         index += 1
 
@@ -1361,19 +1364,15 @@ def _may_switch_branch(action: ClassifiedAction) -> bool:
         return action.branch is not None
     if action.operation is not Operation.EXEC_CODE:
         return False
-    detail = action.detail
-    comment = _HASH_BEGINS_A_WORD_RE.search(detail)
-    if comment is not None:
-        # A comment runs nothing, and prose is full of apostrophes and trailing
-        # backslashes that shlex refuses. Without this cut, `# don't delete the
-        # spec` above a commit read as unparseable, and the commit was denied.
-        detail = detail[: comment.end() - 1]
-    if not detail.strip():
-        return False
-    try:
-        tokens = shlex.split(detail, posix=True)
-    except ValueError:
-        return True  # unparseable: assume the worst
+    # Split on whitespace, NOT with shlex. ``detail`` is already the classifier's
+    # token list rejoined with spaces, so its quotes are gone: `git add
+    # "don't.txt"` arrives as `git add don't.txt`, and shlex then refuses the
+    # unbalanced apostrophe. That refusal used to mean "assume the worst" and
+    # denied the `git commit` chained after it — measured, a denial with nothing
+    # behind it. Re-parsing a string that was already parsed only reintroduces
+    # quoting bugs; the two leading words are all this needs, and a token
+    # containing a space can be neither `git` nor a subcommand.
+    tokens = action.detail.split()
     if len(tokens) < 2 or tokens[0] != "git":
         return False
     sub, args = _git_subcommand(tokens)

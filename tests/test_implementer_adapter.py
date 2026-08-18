@@ -51,6 +51,9 @@ from spirrow_mindwire.value_objects import (
     ThreadRef,
 )
 
+#: Quote characters, built rather than escaped, so the strings below stay legible.
+_DQ = chr(34)
+
 _TS = datetime(2026, 5, 23, tzinfo=UTC)
 
 # Loop-readable obligations manifest — required by the implementer adapter now
@@ -848,6 +851,40 @@ async def test_guard_a_lone_destructive_step_still_runs(
     guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
     res = await guard("Bash", {"command": command}, ToolPermissionContext())
     assert isinstance(res, PermissionResultAllow), label
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # `detail` is the classifier's tokens rejoined, so the quotes are gone
+        # and shlex refused the bare apostrophe. That refusal used to deny the
+        # chained commit — a denial with nothing behind it. (Tier B, round 7.)
+        ("apostrophe-in-a-path", "git add " + _DQ + "don't.txt" + _DQ + " && git commit -m x"),
+        ("space-in-a-path", "git add " + _DQ + "a b.txt" + _DQ + " && git commit -m x"),
+        # A bare `-` is git's shorthand for the previous branch: measured,
+        # `git rebase -` succeeds, so refusing it protected nothing.
+        ("previous-branch-shorthand", "git rebase -"),
+    ],
+)
+async def test_guard_quoting_and_shorthand_do_not_cost_a_denial(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow), label
+
+
+@pytest.mark.anyio
+async def test_guard_previous_branch_shorthand_still_names_an_explicit_target(
+    tmp_path: Path,
+) -> None:
+    """`-` is a positional, so a second one is still the branch being rewritten."""
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git rebase - main"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
 
 
 @pytest.mark.anyio
