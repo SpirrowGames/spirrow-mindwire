@@ -660,6 +660,31 @@ async def test_guard_rebase_naming_main_explicitly_is_denied(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        # git stops parsing options at `--`, so these name `main` as <branch>.
+        # Measured: git itself refuses the first two with `fatal: invalid
+        # upstream`, so neither rewrote anything — but the parser agrees with git
+        # rather than relying on which of git's errors happen to save us.
+        ("dash-dash-then-flag", "git rebase -- -i main"),
+        ("dash-dash-then-onto", "git rebase -- --onto main"),
+        # And the one that really does rewrite `main`, measured: 7fec953 ->
+        # 9751652 with HEAD left on `main`.
+        ("dash-dash-then-two", "git rebase -- develop main"),
+        ("dash-dash-after-upstream", "git rebase develop -- main"),
+    ],
+)
+async def test_guard_rebase_after_a_double_dash_is_still_read_as_git_reads_it(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
 async def test_guard_rebase_naming_a_feature_branch_is_allowed(tmp_path: Path) -> None:
     """The other side: an explicit target inside the glob still works."""
     _init_head(tmp_path, "feature/x")

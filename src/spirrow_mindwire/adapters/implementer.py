@@ -403,14 +403,29 @@ def _rebase_target(args: list[str]) -> str | None | _Undecidable:
     costs ``main``.
     """
     positionals: list[str] = []
+    options_done = False
     index = 0
     while index < len(args):
         arg = args[index]
-        if arg == "--onto":
-            index += 2  # its value is a commit-ish, not the rewritten branch
+        if options_done:
+            # git stops parsing options at `--`; everything after it is a
+            # positional even when it starts with a dash. Skipping `--` without
+            # latching that put this parser out of step with git — the desync
+            # Tier B found on PR #158 round 2. Measured, the two shapes it named
+            # (`git rebase -- -i main`, `git rebase -- --onto main`) are refused
+            # by git itself with `fatal: invalid upstream`, so neither rewrote
+            # anything; `git rebase -- develop main` DID rewrite `main`, and was
+            # already denied here. The latch is kept anyway: agreeing with git is
+            # cheaper to hold than an argument about which of its errors save us.
+            positionals.append(arg)
+            index += 1
             continue
         if arg == "--":
+            options_done = True
             index += 1
+            continue
+        if arg == "--onto":
+            index += 2  # its value is a commit-ish, not the rewritten branch
             continue
         if arg.startswith("-"):
             if arg not in _REBASE_NO_VALUE_FLAGS:
@@ -1471,6 +1486,25 @@ def _current_branch(repo_root: Path) -> str | None:
     return branch
 
 
+#: Operations whose branch the command line does not carry, so the guard fills it
+#: from HEAD — or downgrades to ``UNKNOWN`` when HEAD is undecidable.
+#:
+#: One list, not one ``if`` per operation: the lookup, the replacement and the
+#: fail-closed downgrade are the same for all of them, and a maintainer adding a
+#: fifth should not have to pick which copy to extend. (Tier B, PR #158 round 2.)
+#:
+#: Membership is load-bearing. ``allowlist._constraints_pass`` returns True when
+#: ``branch is None``, so an operation carrying a ``branch_glob`` that is NOT in
+#: this list skips its glob entirely and passes. Nothing static catches that; the
+#: detached-HEAD and non-repo tests are what does.
+_HEAD_ENRICHED_OPERATIONS: tuple[Operation, ...] = (
+    Operation.GIT_COMMIT,
+    Operation.GIT_PUSH,
+    Operation.HISTORY_REWRITE,
+    Operation.FORCE_PUSH,
+)
+
+
 class _AllowlistGuard:
     """Per-spawn ``can_use_tool`` callback: classify → enrich → check → allow/deny.
 
@@ -1519,17 +1553,7 @@ class _AllowlistGuard:
         being added here (T-branch-scoped-implementer-permissions §6-1).
         """
         repo_root = self._allowlist.repo_root
-        if action.operation in (Operation.GIT_COMMIT, Operation.GIT_PUSH) and action.branch is None:
-            cur = _current_branch(repo_root)
-            return (
-                replace(action, operation=Operation.UNKNOWN)
-                if cur is None
-                else replace(action, branch=cur)
-            )
-        if (
-            action.operation in (Operation.HISTORY_REWRITE, Operation.FORCE_PUSH)
-            and action.branch is None
-        ):
+        if action.operation in _HEAD_ENRICHED_OPERATIONS and action.branch is None:
             cur = _current_branch(repo_root)
             return (
                 replace(action, operation=Operation.UNKNOWN)
