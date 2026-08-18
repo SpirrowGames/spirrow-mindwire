@@ -337,6 +337,100 @@ def _push_target_and_force(args: list[str]) -> tuple[str | None, bool]:
     return dest, force
 
 
+class _Undecidable:
+    """Sentinel type: this command rewrites something, and we cannot say what."""
+
+
+_UNDECIDABLE = _Undecidable()
+
+#: ``git rebase`` flags that take no value. Anything outside this set — including
+#: every value-taking flag — makes the positional count untrustworthy, because an
+#: unconsumed value looks exactly like a branch name. ``--onto`` is handled
+#: separately since its value must be consumed to count the rest correctly.
+_REBASE_NO_VALUE_FLAGS: frozenset[str] = frozenset(
+    {
+        "-i",
+        "--interactive",
+        "--continue",
+        "--abort",
+        "--skip",
+        "--quit",
+        "--autostash",
+        "--no-autostash",
+        "--autosquash",
+        "--no-autosquash",
+        "--fork-point",
+        "--no-fork-point",
+        "--keep-empty",
+        "--no-keep-empty",
+        "--rebase-merges",
+        "--no-verify",
+        "--verify",
+        "--committer-date-is-author-date",
+        "--ignore-date",
+        "--force-rebase",
+        "-f",
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+        "-n",
+        "--no-stat",
+        "--stat",
+    }
+)
+
+
+def _rebase_target(args: list[str]) -> str | None | _Undecidable:
+    """Which branch does this ``git rebase`` rewrite?
+
+    ``None`` means HEAD, and the guard's enrichment resolves it. A string is an
+    explicitly named branch. :data:`_UNDECIDABLE` means refuse.
+
+    This exists because ``git rebase <upstream> <branch>`` **checks out and
+    rewrites <branch>**, whatever is currently checked out. Measured: on
+    ``feature/x``, ``git rebase develop main`` moved ``main`` and left HEAD on
+    it. Reading every rebase as "targets HEAD" and filling the current branch in
+    therefore let a rewrite of ``main`` borrow ``feature/x``'s permission — the
+    bypass Tier B found on PR #158.
+
+    The refusal is deliberately broad. An unrecognised flag is refused rather
+    than skipped, because a value-taking flag whose value is not consumed looks
+    like a positional: ``git rebase --exec make develop`` would read as two
+    positionals and name ``develop`` as the target while the real target is
+    HEAD, which is fail-OPEN when HEAD is ``main``. Recognising less costs a
+    denial the implementer can work around by writing the simple form; guessing
+    costs ``main``.
+    """
+    positionals: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--onto":
+            index += 2  # its value is a commit-ish, not the rewritten branch
+            continue
+        if arg == "--":
+            index += 1
+            continue
+        if arg.startswith("-"):
+            if arg not in _REBASE_NO_VALUE_FLAGS:
+                return _UNDECIDABLE
+            index += 1
+            continue
+        positionals.append(arg)
+        index += 1
+
+    if len(positionals) <= 1:
+        # `git rebase`, `git rebase --continue`, `git rebase <upstream>`: the
+        # rewritten branch is the checked-out one.
+        return None
+    if len(positionals) == 2:
+        # `git rebase <upstream> <branch>` — the second is checked out and
+        # rewritten.
+        return positionals[1]
+    return _UNDECIDABLE
+
+
 def _classify_git(tokens: list[str]) -> ClassifiedAction:
     sub, args = _git_subcommand(tokens)
     detail = " ".join(tokens)
@@ -351,8 +445,17 @@ def _classify_git(tokens: list[str]) -> ClassifiedAction:
         positional = [a for a in args if not a.startswith("-")]
         source = positional[0] if positional else None
         return ClassifiedAction(Operation.GIT_MERGE, source=source, detail=detail)
-    if sub in ("rebase", "filter-branch", "filter-repo"):
-        return ClassifiedAction(Operation.HISTORY_REWRITE, detail=detail)
+    if sub == "rebase":
+        target = _rebase_target(args)
+        if isinstance(target, _Undecidable):
+            return ClassifiedAction(Operation.UNKNOWN, detail=detail)
+        return ClassifiedAction(Operation.HISTORY_REWRITE, branch=target, detail=detail)
+    if sub in ("filter-branch", "filter-repo"):
+        # Left where it was: these take rev-list arguments, so any of them can
+        # name a branch, and they are rare enough that recognising their shapes
+        # would be cost without a caller. UNKNOWN → default-deny, i.e. exactly
+        # the Tier C denial they had before this widening.
+        return ClassifiedAction(Operation.UNKNOWN, detail=detail)
     if sub == "reset" and "--hard" in args:
         return ClassifiedAction(Operation.HISTORY_REWRITE, detail=detail)
     # Other git subcommands (status/log/diff/add/checkout/switch/fetch/pull/

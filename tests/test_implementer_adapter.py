@@ -108,7 +108,20 @@ def test_classify_fs_write_carries_path() -> None:
         ("git merge feature/x", Operation.GIT_MERGE),
         ("git rebase -i HEAD~2", Operation.HISTORY_REWRITE),
         ("git reset --hard HEAD", Operation.HISTORY_REWRITE),
-        ("git filter-branch --tree-filter true HEAD", Operation.HISTORY_REWRITE),
+        # `filter-branch` / `filter-repo` take rev-list arguments, so any of them
+        # can name a branch and none of them can be told apart from a flag value.
+        # Since PR #158 widened `history_rewrite` to a branch glob, "history
+        # rewrite, target unspecified" would be filled with HEAD and pass on a
+        # feature branch — so the classifier says UNKNOWN and default-deny fires,
+        # the same idiom `_enrich` already uses when HEAD is undecidable.
+        #
+        # The cost is label fidelity: the denial record reads `unknown` for what
+        # is plainly a history rewrite, which is the same category error Bohr
+        # objected to for `_classify_mcp` (T-fs-delete-path-scope msg-1197 §7).
+        # `detail` still carries the command. Taken deliberately: a correct denial
+        # beats an accurate label, and inventing a branch name to keep the label
+        # would put a fiction in the record instead.
+        ("git filter-branch --tree-filter true HEAD", Operation.UNKNOWN),
         ("rm -rf build", Operation.FS_DELETE),
         ("rmdir foo", Operation.FS_DELETE),
         ("npm publish", Operation.EXTERNAL_PUBLISH),
@@ -618,6 +631,75 @@ async def test_guard_rebase_on_feature_allowed(tmp_path: Path) -> None:
     res = await guard("Bash", {"command": "git rebase origin/develop"}, ToolPermissionContext())
     assert isinstance(res, PermissionResultAllow)
     assert guard.violations == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        ("upstream-and-branch", "git rebase develop main"),
+        ("remote-upstream", "git rebase origin/develop main"),
+        ("onto-form", "git rebase --onto develop feature/y main"),
+    ],
+)
+async def test_guard_rebase_naming_main_explicitly_is_denied(
+    tmp_path: Path, label: str, command: str
+) -> None:
+    """``git rebase <upstream> <branch>`` rewrites ``<branch>``, not HEAD.
+
+    Measured: standing on ``feature/x``, ``git rebase develop main`` checked out
+    ``main`` and moved it. Reading every rebase as "targets HEAD" and filling in
+    the current branch therefore let a rewrite of ``main`` borrow a feature
+    branch's permission — the bypass Tier B found on PR #158. The classifier now
+    names the target, so the glob sees ``main`` and refuses.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": command}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny), label
+
+
+@pytest.mark.anyio
+async def test_guard_rebase_naming_a_feature_branch_is_allowed(tmp_path: Path) -> None:
+    """The other side: an explicit target inside the glob still works."""
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git rebase develop feature/z"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
+
+
+@pytest.mark.anyio
+async def test_guard_rebase_with_an_unrecognised_flag_is_denied(tmp_path: Path) -> None:
+    """An unconsumed flag value is indistinguishable from a branch name.
+
+    ``git rebase --exec make develop`` reads as two positionals, which would name
+    ``develop`` as the target while the real target is HEAD — fail-OPEN when HEAD
+    is ``main``. Refusing what we do not recognise costs a denial the implementer
+    can avoid by writing the simple form.
+    """
+    _init_head(tmp_path, "main")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard(
+        "Bash", {"command": "git rebase --exec make develop"}, ToolPermissionContext()
+    )
+    assert isinstance(res, PermissionResultDeny)
+
+
+@pytest.mark.anyio
+async def test_guard_filter_branch_stays_denied(tmp_path: Path) -> None:
+    """`filter-branch` takes rev-list arguments, so any of them can name a branch.
+
+    Recognising those shapes would be cost without a caller, so it keeps the
+    Tier C denial it had before this widening — on a feature branch too.
+    """
+    _init_head(tmp_path, "feature/x")
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard(
+        "Bash",
+        {"command": "git filter-branch --tree-filter true -- main"},
+        ToolPermissionContext(),
+    )
+    assert isinstance(res, PermissionResultDeny)
 
 
 @pytest.mark.anyio
