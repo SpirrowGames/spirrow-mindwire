@@ -175,6 +175,46 @@ async def test_spawn_connects_and_returns_idle_handle(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_builtin_tools_default_to_none_exposed(tmp_path: Path) -> None:
+    """The default stays "no built-ins", so nothing gains hands by accident."""
+    captured: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured.append(options)
+        return _FakeClient([])
+
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=factory)
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    assert list(captured[0].tools) == []
+
+
+@pytest.mark.anyio
+async def test_builtin_tools_are_what_the_sdk_is_asked_to_expose(tmp_path: Path) -> None:
+    """``tools=`` is the exposure list, and it is NOT ``allowed_tools``.
+
+    ``tools=[]`` disables every built-in in the SDK; reading it as "expose only
+    what allowed_tools names" is the mistake that left the implementer with no
+    hands (T37 #1) and the proposer unable to open a file (msg-1197). This pins
+    the two as separate inputs so they cannot be conflated again.
+    """
+    captured: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured.append(options)
+        return _FakeClient([])
+
+    adapter = ClaudeCodeSdkAdapter(
+        cwd=tmp_path,
+        builtin_tools=("Read", "Grep"),
+        allowed_tools=["Read"],
+        client_factory=factory,
+    )
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    assert list(captured[0].tools) == ["Read", "Grep"]
+    assert list(captured[0].allowed_tools) == ["Read"]
+
+
+@pytest.mark.anyio
 async def test_spawn_binds_options_and_exposes_them_via_source_marker_options(
     tmp_path: Path,
 ) -> None:

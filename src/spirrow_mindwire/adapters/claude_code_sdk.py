@@ -28,7 +28,7 @@ Option (i)), never duplicated into ``HealthStatus.details`` (I2).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -81,7 +81,7 @@ as your reply, so reply directly with the message body — no preamble, no \
 tool calls, no meta-commentary.
 """
 
-# In the Stage 3 loop this adapter plays the proposer (the text-only Stage3ProposerAdapter), so it
+# In the Stage 3 loop this adapter plays the proposer (the read-only Stage3ProposerAdapter), so it
 # carries the proposer handoff guidance. The conductor reads the trailing NEXT: line to chain the
 # design loop (PR-2b-1); the block is advisory — the conductor's routing guards are the enforcement.
 _DEFAULT_SYSTEM_PROMPT = f"{_BASE_SYSTEM_PROMPT}\n{build_handoff_protocol_block(Role.PROPOSER)}"
@@ -199,12 +199,14 @@ class ClaudeCodeSdkAdapter:
         *,
         cwd: Path,
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
+        builtin_tools: Sequence[str] = (),
         allowed_tools: list[str] | None = None,
         mcp_servers: dict[str, Any] | None = None,
         client_factory: Callable[[Any], _SdkClient] | None = None,
     ) -> None:
         self._cwd = cwd
         self._system_prompt = system_prompt
+        self._builtin_tools = list(builtin_tools)
         self._allowed_tools = allowed_tools or []
         self._mcp_servers = mcp_servers or {}
         self._client_factory = client_factory or _default_client_factory
@@ -219,7 +221,13 @@ class ClaudeCodeSdkAdapter:
         options = ClaudeAgentOptions(
             cwd=self._cwd,
             system_prompt=self._system_prompt,
-            tools=[],  # fail-closed: only allowed_tools are exposed
+            # ``tools=[]`` DISABLES every built-in (SDK 0.1.77 -> ``--tools ""``).
+            # It is not "expose only what allowed_tools names" — that reading is
+            # what left the implementer with no hands until T37 #1, and it is why
+            # a proposer constructed with the default here can read nothing at
+            # all. The composition root decides what a role may see; the default
+            # stays empty so text-only remains text-only unless asked otherwise.
+            tools=self._builtin_tools,
             allowed_tools=self._allowed_tools,
             mcp_servers=self._mcp_servers,
         )

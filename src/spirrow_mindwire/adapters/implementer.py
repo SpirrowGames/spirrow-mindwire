@@ -5,10 +5,11 @@ implementer on a Claude Agent SDK session **gated by the operation-based
 allow-list** (:mod:`spirrow_mindwire.allowlist`,
 MINDWIRE_STAGE3_WIRING_ALLOWLIST_SPEC §B). Unlike
 :class:`~spirrow_mindwire.adapters.claude_code_sdk.ClaudeCodeSdkAdapter` (the
-proposer, ``tools=[]`` text-only), this adapter lets the SDK session use code /
-git / fs tools — but every tool call passes through a ``can_use_tool`` guard
-that classifies it into an :class:`~spirrow_mindwire.allowlist.Operation` and
-checks the allow-list **before execution**. A denied call is *fail-loud*: the
+proposer, which is given Read/Glob/Grep and nothing else), this adapter lets
+the SDK session use code / git / fs tools — but every tool call passes through
+a ``can_use_tool`` guard that classifies it into an
+:class:`~spirrow_mindwire.allowlist.Operation` and checks the allow-list
+**before execution**. A denied call is *fail-loud*: the
 guard interrupts the turn and the adapter halts the session into ``FAILED``
 (Stage 2 ``fail-loud no-fallback`` inherited, ADR-07 §2.3 / §2.6).
 

@@ -41,10 +41,12 @@ from spirrow_mindwire.config import (
     Stage3LoopConfig,
 )
 from spirrow_mindwire.loop_runner import (
+    _PROPOSER_BUILTIN_TOOLS,
     Stage3Conductor,
     Stage3ProposerAdapter,
     build_conductor,
     build_loop,
+    build_proposer,
     build_registry,
     build_watches,
     run_conductor,
@@ -264,8 +266,47 @@ class _FakeGitHub:
 
 
 # --------------------------------------------------------------------------- #
-# Stage3ProposerAdapter: text-only (drops EXECUTE_CODE)
+# Stage3ProposerAdapter: read-only (drops EXECUTE_CODE)
 # --------------------------------------------------------------------------- #
+
+
+def test_the_proposer_can_read_the_repository_it_designs_against() -> None:
+    """It could not, and that stopped the loop rather than a design.
+
+    On T-fs-delete-path-scope msg-1197 the proposer reported that no read tool
+    was permitted, declined to design a security gate from quoted excerpts, and
+    handed back to a human; the naysayer's review endorsed the refusal. Nothing
+    then moved for a day. Read / Glob / Grep are what "check the claim before
+    designing against it" costs.
+    """
+    assert set(_PROPOSER_BUILTIN_TOOLS) == {"Read", "Glob", "Grep"}
+    proposer = build_proposer(Path("."))
+    assert list(proposer._builtin_tools) == list(_PROPOSER_BUILTIN_TOOLS)
+    # Auto-approved: this adapter has no can_use_tool guard, so anything not
+    # named here reaches a permission prompt that no one is present to answer.
+    assert list(proposer._allowed_tools) == list(_PROPOSER_BUILTIN_TOOLS)
+
+
+def test_the_proposer_still_cannot_write_or_run_anything() -> None:
+    """Reading is the widening; writing and executing are not.
+
+    A proposer that can change the tree is an implementer, and the Stage 3 split
+    puts every such call behind the allow-list-gated adapter.
+    """
+    forbidden = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Task", "WebFetch"}
+    assert forbidden.isdisjoint(set(_PROPOSER_BUILTIN_TOOLS))
+    proposer = build_proposer(Path("."))
+    assert forbidden.isdisjoint(set(proposer._allowed_tools))
+
+
+def test_reading_does_not_make_the_proposer_qualify_as_the_implementer() -> None:
+    """The reason the class drops EXECUTE_CODE, restated as a guard.
+
+    ``capabilities`` is a class attribute and independent of the tool list, so
+    widening the tools cannot make first-qualified hand the IMPLEMENTER slot to
+    the un-gated adapter. That was the whole point of the split.
+    """
+    assert Capability.EXECUTE_CODE not in Stage3ProposerAdapter.capabilities
 
 
 def test_stage3_proposer_is_text_only() -> None:
