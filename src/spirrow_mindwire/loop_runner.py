@@ -48,10 +48,11 @@ Adapter→role routing (a Stage 3 wrinkle): the registry's Phase 1 policy is
 "first qualified". ``ClaudeCodeSdkAdapter`` declares ``EXECUTE_CODE`` (the T16
 dual-use case where one adapter fills both proposer and implementer), so it
 would also win the IMPLEMENTER slot and shadow the allow-list-gated
-``ImplementerSdkAdapter``. We therefore run the proposer as a **text-only**
+``ImplementerSdkAdapter``. We therefore run the proposer as a
 :class:`Stage3ProposerAdapter` that drops ``EXECUTE_CODE`` — which is also the
-correct Stage 3 model (the proposer only proposes; the implementer executes,
-gated). :func:`build_registry` then asserts the resolution fail-loud.
+correct Stage 3 model (the proposer only proposes, and may read to check what it
+proposes against; the implementer executes and writes, gated).
+:func:`build_registry` then asserts the resolution fail-loud.
 
 Secrets / inference endpoints are resolved from the environment by the adapters
 at spawn (``MINDWIRE_IMPLEMENTER_BASE_URL`` / ``MINDWIRE_LEXORA_URL`` /
@@ -70,7 +71,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter
+from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter, _PathScopeGuard
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
@@ -97,11 +98,16 @@ logger = logging.getLogger(__name__)
 
 
 class Stage3ProposerAdapter(ClaudeCodeSdkAdapter):
-    """Text-only proposer for the Stage 3 loop (same model as ``main``).
+    """Read-only proposer for the Stage 3 loop (same model as ``main``).
 
     Identical to :class:`~spirrow_mindwire.adapters.claude_code_sdk.ClaudeCodeSdkAdapter`
-    at runtime (``tools=[]``, text-only), but advertises only
-    ``{READ_THREAD, POST_REPLY}`` — it deliberately **drops** ``EXECUTE_CODE``.
+    at runtime, but advertises only ``{READ_THREAD, POST_REPLY}`` — it
+    deliberately **drops** ``EXECUTE_CODE``.
+
+    It was text-only (``tools=[]``) until it turned out that a proposer which
+    cannot open a file cannot check a claim either; see
+    :data:`_PROPOSER_BUILTIN_TOOLS` for what it may now read and why that does
+    not touch the reasoning below.
 
     Why: the registry's Phase 1 ``qualified_for`` is "first qualified", and the
     base adapter declares ``EXECUTE_CODE`` (T16's dual-use, one adapter filling
@@ -111,8 +117,9 @@ class Stage3ProposerAdapter(ClaudeCodeSdkAdapter):
     first — risking the allow-list-gated implementer being shadowed by an
     un-gated adapter. Dropping ``EXECUTE_CODE`` here makes this adapter qualify
     for PROPOSER only, so the IMPLEMENTER slot resolves unambiguously to the
-    gated adapter. It is also the correct Stage 3 model: the proposer proposes
-    (text); only the implementer executes code, behind the allow-list.
+    gated adapter. It is also the correct Stage 3 model: the proposer proposes;
+    only the implementer executes code or changes the tree, behind the
+    allow-list.
 
     Independence is unaffected: like the base adapter this omits
     ``NAYSAYER_QUALIFIED`` (same model family as ``main``), so it can never fill
@@ -232,7 +239,7 @@ def _assert_role_resolution(
     proposer_candidates = registry.qualified_for(Role.PROPOSER)
     if not proposer_candidates or proposer_candidates[0] is not proposer:
         raise RuntimeError(
-            "PROPOSER slot did not resolve to the text-only proposer adapter "
+            "PROPOSER slot did not resolve to the read-only proposer adapter "
             f"(got {[a.adapter_id for a in proposer_candidates]!r}); register the "
             "proposer first so first-qualified picks it"
         )
@@ -252,9 +259,41 @@ def _assert_role_resolution(
         )
 
 
+# The proposer designs against this repository, so it has to be able to READ it.
+# It could not: the adapter passed ``tools=[]``, which disables every built-in,
+# and the proposer's own turn on T-fs-delete-path-scope (msg-1197) stopped with
+# "read 系 tool の実行権限が下りず、一次照合を一切行えていない" — it declined to
+# design rather than guess, which is right, and then nothing moved. The Einstein
+# review of that turn endorsed the refusal. So the gap is here, not there.
+#
+# Read / Glob / Grep only. No Write, no Edit, no Bash: a proposer that can change
+# the tree is an implementer, and the Stage 3 split says only the implementer
+# executes, behind the allow-list. ``capabilities`` is untouched — it is a class
+# attribute, independent of this list — so PROPOSER stays the only slot this
+# adapter qualifies for and the IMPLEMENTER slot still resolves unambiguously to
+# the gated adapter. That was the whole reason the class drops ``EXECUTE_CODE``;
+# reading files was never what it was protecting against.
+#
+# They are auto-approved because a call that is not auto-approved goes to an
+# interactive permission prompt, and nobody is there to answer it — which is
+# exactly the "permission denied" the proposer reported. That is a property of
+# running headless, not of whether a guard exists: the ``can_use_tool`` guard
+# injected below still runs on every call, and is where the bound lives.
+_PROPOSER_BUILTIN_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
+
+
 def build_proposer(repo_dir: Path) -> Stage3ProposerAdapter:
-    """Text-only proposer (same model family as ``main``)."""
-    return Stage3ProposerAdapter(cwd=repo_dir)
+    """Proposer with read-only access to ``repo_dir`` (same model family as ``main``)."""
+    return Stage3ProposerAdapter(
+        cwd=repo_dir,
+        builtin_tools=_PROPOSER_BUILTIN_TOOLS,
+        allowed_tools=list(_PROPOSER_BUILTIN_TOOLS),
+        # The scope is decided here, where the role is known — the adapter has no
+        # way to tell a filesystem path from an MCP tool's URI-shaped ``path``,
+        # so it is not asked to guess. `allowed_tools` auto-approves, which is
+        # what makes a guard the only place a bound can live.
+        can_use_tool=_PathScopeGuard(root=repo_dir),
+    )
 
 
 def build_implementer(repo_dir: Path, *, obligations: ObligationsManifest) -> ImplementerSdkAdapter:

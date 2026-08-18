@@ -28,8 +28,8 @@ Option (i)), never duplicated into ``HealthStatus.details`` (I2).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -38,8 +38,11 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     TextBlock,
+    ToolPermissionContext,
 )
 
 from ..conductor.handoff import build_handoff_protocol_block
@@ -81,7 +84,7 @@ as your reply, so reply directly with the message body — no preamble, no \
 tool calls, no meta-commentary.
 """
 
-# In the Stage 3 loop this adapter plays the proposer (the text-only Stage3ProposerAdapter), so it
+# In the Stage 3 loop this adapter plays the proposer (the read-only Stage3ProposerAdapter), so it
 # carries the proposer handoff guidance. The conductor reads the trailing NEXT: line to chain the
 # design loop (PR-2b-1); the block is advisory — the conductor's routing guards are the enforcement.
 _DEFAULT_SYSTEM_PROMPT = f"{_BASE_SYSTEM_PROMPT}\n{build_handoff_protocol_block(Role.PROPOSER)}"
@@ -179,6 +182,96 @@ async def _shutdown(client: _SdkClient) -> None:
     await client.disconnect()
 
 
+# Tool-input keys that name a path, across the read tools this adapter may be
+# given. ``Grep``/``Glob`` call it ``path``; ``Read`` calls it ``file_path``.
+# Those two, and nothing anticipated: a key belongs here only once a tool that
+# uses it is in ``scopeable_tools``, and every other tool is refused on sight.
+_PATH_INPUT_KEYS: tuple[str, ...] = ("file_path", "path")
+
+# ``pattern`` means different things per tool, so it cannot go in the list above.
+# For ``Glob`` it is a path pattern and escapes exactly like a path does —
+# measured, ``../../*.env`` leaves the root while ``**/*.py`` does not. For
+# ``Grep`` it is a REGEX, and treating a regex as a path would refuse ordinary
+# searches for no gain.
+_PATH_INPUT_KEYS_BY_TOOL: dict[str, tuple[str, ...]] = {"Glob": ("pattern",)}
+
+
+@dataclass
+class _PathScopeGuard:
+    """``can_use_tool`` callback: a read may not leave ``root``.
+
+    Exposing a tool is not approving it. Without this, every call the SDK sees
+    is auto-approved by ``allowed_tools`` and ``Read`` takes an absolute path,
+    so a role whose whole input is text written by other agents could be talked
+    into quoting ``~/.aws/credentials`` back into the chatroom — which is
+    replicated off this host and forwarded to an external model. The host being
+    an isolated dev box bounds what a *deletion* can cost; it does not bound
+    where a *credential* can travel. (Tier B, PR #157.)
+
+    Reading outside the repository was never needed for the job this unblocks —
+    checking a claim against the code the thread is about — so the scope costs
+    nothing it was bought for.
+
+    ``Path.resolve()`` on BOTH sides, then ``is_relative_to``. Never
+    ``startswith``: a sibling directory that merely shares a prefix would pass,
+    and a symlink out of the tree would too if only one side were resolved.
+    """
+
+    root: Path
+    denials: list[str] = field(default_factory=list)
+
+    #: The tools whose inputs this guard knows how to bound. Anything else is
+    #: refused rather than waved through: a guard that silently allows what it
+    #: cannot check is worse than no guard, because the caller believes there is
+    #: one. ``Bash`` names its target in ``command`` and ``WebFetch`` in ``url``,
+    #: neither of which this understands — so neither may run behind it.
+    #: (Tier B, PR #157 round 3.)
+    scopeable_tools: frozenset[str] = frozenset({"Read", "Glob", "Grep"})
+
+    async def __call__(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if tool_name not in self.scopeable_tools:
+            return self._refuse(tool_name, tool_name, "this guard cannot bound that tool")
+        root = self.root.resolve()
+        keys = _PATH_INPUT_KEYS + _PATH_INPUT_KEYS_BY_TOOL.get(tool_name, ())
+        for key in keys:
+            if key not in tool_input:
+                continue
+            raw = tool_input[key]
+            if not isinstance(raw, str) or not raw:
+                # Present but not a path we can read. Skipping it would return
+                # allow without ever checking, so the one thing this must not do
+                # is `continue` (Tier B, PR #157 round 2).
+                return self._refuse(tool_name, raw, f"{key} is not a usable path")
+            # `~` before `is_absolute`: `Path("~/.aws/credentials")` is NOT
+            # absolute, so joining it to the root makes it look contained while
+            # anything that expands `~` downstream reads the real home directory.
+            # Measured both ways; `a~b` is untouched, so no ordinary name is lost.
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                # Cannot say where it points, so do not let it be read.
+                return self._refuse(tool_name, raw, "the path could not be resolved")
+            if not resolved.is_relative_to(root):
+                return self._refuse(tool_name, raw, f"it resolves outside {root}")
+        return PermissionResultAllow()
+
+    def _refuse(self, tool_name: str, raw: object, why: str) -> PermissionResultDeny:
+        reason = (
+            f"{tool_name} refused: {raw!r} — {why}. This session may read "
+            f"{self.root}, and nothing else"
+        )
+        self.denials.append(reason)
+        return PermissionResultDeny(message=reason, interrupt=True)
+
+
 class ClaudeCodeSdkAdapter:
     """RoleAdapter backed by the Claude Agent SDK (ADR-06 §3.1, T11).
 
@@ -199,12 +292,21 @@ class ClaudeCodeSdkAdapter:
         *,
         cwd: Path,
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
+        builtin_tools: Sequence[str] = (),
+        can_use_tool: Any | None = None,
         allowed_tools: list[str] | None = None,
         mcp_servers: dict[str, Any] | None = None,
         client_factory: Callable[[Any], _SdkClient] | None = None,
     ) -> None:
         self._cwd = cwd
         self._system_prompt = system_prompt
+        self._builtin_tools = list(builtin_tools)
+        # Injected, never inferred. Exposing built-ins does not tell this class
+        # WHICH bound applies — a filesystem scope is right for a role that only
+        # reads the tree, and wrong for anything reaching an MCP tool whose
+        # ``path`` is a URI or a JSON pointer. The composition root knows; this
+        # does not. (Tier B, PR #157 round 3.)
+        self._can_use_tool = can_use_tool
         self._allowed_tools = allowed_tools or []
         self._mcp_servers = mcp_servers or {}
         self._client_factory = client_factory or _default_client_factory
@@ -219,9 +321,18 @@ class ClaudeCodeSdkAdapter:
         options = ClaudeAgentOptions(
             cwd=self._cwd,
             system_prompt=self._system_prompt,
-            tools=[],  # fail-closed: only allowed_tools are exposed
+            # ``tools=[]`` DISABLES every built-in (SDK 0.1.77 -> ``--tools ""``).
+            # It is not "expose only what allowed_tools names" — that reading is
+            # what left the implementer with no hands until T37 #1, and it is why
+            # a proposer constructed with the default here can read nothing at
+            # all. The composition root decides what a role may see; the default
+            # stays empty so text-only remains text-only unless asked otherwise.
+            tools=self._builtin_tools,
             allowed_tools=self._allowed_tools,
             mcp_servers=self._mcp_servers,
+            # Exposure is not approval: `allowed_tools` auto-approves, so any
+            # bound has to be a guard. Which bound is the caller's call.
+            can_use_tool=self._can_use_tool,
         )
         try:
             client = self._client_factory(options)

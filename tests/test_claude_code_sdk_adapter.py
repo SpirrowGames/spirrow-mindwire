@@ -23,6 +23,7 @@ from spirrow_mindwire.adapters.claude_code_sdk import (
     ClaudeCodeSdkHaltError,
     ClaudeCodeSdkHealthError,
     ClaudeCodeSdkSpawnError,
+    _PathScopeGuard,
 )
 from spirrow_mindwire.ports import RoleAdapter, SpawnContext
 from spirrow_mindwire.value_objects import (
@@ -172,6 +173,243 @@ async def test_spawn_connects_and_returns_idle_handle(tmp_path: Path) -> None:
     hs = await adapter.health(handle)
     assert hs.state is SessionState.IDLE
     assert hs.error is None
+
+
+# --------------------------------------------------------------------------- #
+# _PathScopeGuard: exposure is not approval
+# --------------------------------------------------------------------------- #
+
+
+async def _verdict(guard: _PathScopeGuard, tool: str, tool_input: dict[str, Any]) -> bool:
+    """True when the call is allowed."""
+    result = await guard(tool, tool_input, None)  # type: ignore[arg-type]
+    return type(result).__name__ == "PermissionResultAllow"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("key", ["file_path", "path"])
+async def test_a_read_inside_the_repository_is_allowed(tmp_path: Path, key: str) -> None:
+    inside = tmp_path / "src" / "thing.py"
+    inside.parent.mkdir(parents=True)
+    inside.write_text("x", encoding="utf-8")
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Read", {key: str(inside)}) is True
+    assert guard.denials == []
+
+
+@pytest.mark.anyio
+async def test_a_relative_path_is_resolved_against_the_root(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Read", {"file_path": "a.py"}) is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "target"),
+    [
+        ("absolute-escape", "{parent}/secrets.env"),
+        ("dot-dot-escape", "../secrets.env"),
+        ("nested-dot-dot", "src/../../secrets.env"),
+    ],
+)
+async def test_a_read_outside_the_repository_is_refused(
+    tmp_path: Path, label: str, target: str
+) -> None:
+    """The whole point of the guard. A role whose input is text written by other
+    agents must not be able to quote a credential file back into the chatroom,
+    which is replicated off this host and forwarded to an external model.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (tmp_path / "secrets.env").write_text("TOKEN=1", encoding="utf-8")
+    guard = _PathScopeGuard(root=root)
+    resolved = target.format(parent=tmp_path.as_posix())
+    assert await _verdict(guard, "Read", {"file_path": resolved}) is False, label
+    assert len(guard.denials) == 1
+
+
+@pytest.mark.anyio
+async def test_a_sibling_that_merely_shares_a_prefix_is_refused(tmp_path: Path) -> None:
+    """Why the check is ``is_relative_to`` and not ``startswith``."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    sibling = tmp_path / "repo-secrets"
+    sibling.mkdir()
+    (sibling / "x.env").write_text("TOKEN=1", encoding="utf-8")
+    guard = _PathScopeGuard(root=root)
+    assert await _verdict(guard, "Read", {"file_path": str(sibling / "x.env")}) is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("raw", ["~/.aws/credentials", "~", "~/../etc/hosts"])
+async def test_a_tilde_path_is_refused(tmp_path: Path, raw: str) -> None:
+    """`Path("~/x").is_absolute()` is False.
+
+    Joining it to the root therefore makes it look contained, while anything
+    that expands `~` downstream reads the real home directory. Measured.
+    (Tier B, PR #157 round 2.)
+    """
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Read", {"file_path": raw}) is False
+
+
+@pytest.mark.anyio
+async def test_a_tilde_inside_a_name_is_still_ordinary(tmp_path: Path) -> None:
+    """The fix must not cost a legitimate filename."""
+    (tmp_path / "a~b.py").write_text("x", encoding="utf-8")
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Read", {"file_path": "a~b.py"}) is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        ("list", ["/etc/shadow"]),
+        ("dict", {"path": "/etc/shadow"}),
+        ("int", 1),
+        ("none", None),
+        ("empty", ""),
+    ],
+)
+async def test_a_path_key_that_is_not_a_usable_path_is_refused(
+    tmp_path: Path, label: str, value: object
+) -> None:
+    """Fail closed on type confusion.
+
+    Skipping a present-but-unexpected value returns allow without ever having
+    checked anything — the one outcome a boundary must not have.
+    """
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Read", {"file_path": value}) is False, label
+    assert len(guard.denials) == 1
+
+
+@pytest.mark.anyio
+async def test_a_glob_pattern_can_escape_and_is_refused(tmp_path: Path) -> None:
+    """`Glob`'s pattern is a path pattern, so it leaves the root like a path.
+
+    Not reported by the review; found while fixing what was.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    guard = _PathScopeGuard(root=root)
+    assert await _verdict(guard, "Glob", {"pattern": "../../*.env"}) is False
+    assert await _verdict(guard, "Glob", {"pattern": "**/*.py"}) is True
+
+
+@pytest.mark.anyio
+async def test_a_grep_regex_is_not_treated_as_a_path(tmp_path: Path) -> None:
+    """`pattern` means a REGEX to `Grep`, and refusing those would cost every
+    ordinary search for no gain."""
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Grep", {"pattern": "a..b"}) is True
+    assert await _verdict(guard, "Grep", {"pattern": "^from .* import"}) is True
+
+
+@pytest.mark.anyio
+async def test_a_call_carrying_no_path_is_left_alone(tmp_path: Path) -> None:
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Grep", {"pattern": "def "}) is True
+
+
+@pytest.mark.anyio
+async def test_a_tool_the_guard_cannot_bound_is_refused(tmp_path: Path) -> None:
+    """A guard that waves through what it cannot check is worse than none.
+
+    ``Bash`` names its target in ``command`` and ``WebFetch`` in ``url``; this
+    guard understands neither, so neither may run behind it — rather than being
+    skipped by the key loop and auto-approved. (Tier B, PR #157 round 3.)
+    """
+    guard = _PathScopeGuard(root=tmp_path)
+    assert await _verdict(guard, "Bash", {"command": "cat /etc/shadow"}) is False
+    assert await _verdict(guard, "WebFetch", {"url": "https://x/y"}) is False
+    assert await _verdict(guard, "Write", {"file_path": str(tmp_path / "a")}) is False
+
+
+@pytest.mark.anyio
+async def test_the_base_adapter_does_not_invent_a_guard(tmp_path: Path) -> None:
+    """Exposing built-ins does not say WHICH bound applies.
+
+    A filesystem scope is right for a role that only reads the tree and wrong
+    for one reaching an MCP tool whose ``path`` is a URI. The base adapter
+    cannot tell them apart, so it is not asked to; the composition root injects.
+    """
+    captured: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured.append(options)
+        return _FakeClient([])
+
+    adapter = ClaudeCodeSdkAdapter(
+        cwd=tmp_path,
+        builtin_tools=("Read",),
+        allowed_tools=["Read"],
+        client_factory=factory,
+    )
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    assert captured[0].can_use_tool is None
+
+
+@pytest.mark.anyio
+async def test_an_injected_guard_reaches_the_sdk(tmp_path: Path) -> None:
+    captured: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured.append(options)
+        return _FakeClient([])
+
+    guard = _PathScopeGuard(root=tmp_path)
+    adapter = ClaudeCodeSdkAdapter(
+        cwd=tmp_path,
+        builtin_tools=("Read",),
+        can_use_tool=guard,
+        allowed_tools=["Read"],
+        client_factory=factory,
+    )
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    assert captured[0].can_use_tool is guard
+
+
+@pytest.mark.anyio
+async def test_builtin_tools_default_to_none_exposed(tmp_path: Path) -> None:
+    """The default stays "no built-ins", so nothing gains hands by accident."""
+    captured: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured.append(options)
+        return _FakeClient([])
+
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=factory)
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    assert list(captured[0].tools) == []
+
+
+@pytest.mark.anyio
+async def test_builtin_tools_are_what_the_sdk_is_asked_to_expose(tmp_path: Path) -> None:
+    """``tools=`` is the exposure list, and it is NOT ``allowed_tools``.
+
+    ``tools=[]`` disables every built-in in the SDK; reading it as "expose only
+    what allowed_tools names" is the mistake that left the implementer with no
+    hands (T37 #1) and the proposer unable to open a file (msg-1197). This pins
+    the two as separate inputs so they cannot be conflated again.
+    """
+    captured: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured.append(options)
+        return _FakeClient([])
+
+    adapter = ClaudeCodeSdkAdapter(
+        cwd=tmp_path,
+        builtin_tools=("Read", "Grep"),
+        allowed_tools=["Read"],
+        client_factory=factory,
+    )
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    assert list(captured[0].tools) == ["Read", "Grep"]
+    assert list(captured[0].allowed_tools) == ["Read"]
 
 
 @pytest.mark.anyio

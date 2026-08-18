@@ -4,7 +4,7 @@ Proves the runner composes the existing Stage 3 components correctly without
 touching any core (watcher / dispatcher / adapter):
 
 - **role resolution**: with the three production adapters registered, the
-  registry routes PROPOSER → text-only ``Stage3ProposerAdapter``, IMPLEMENTER →
+  registry routes PROPOSER → read-only ``Stage3ProposerAdapter``, IMPLEMENTER →
   the allow-list-gated ``ImplementerSdkAdapter``, NAYSAYER → the independent
   design-time ``NaysayerSdkAdapter`` (and *only* it — ADR-05 §5; ADR-19 driver-化
   unify made it the sole registry NAYSAYER, the PR-gate being a driver). This is
@@ -30,7 +30,7 @@ import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from spirrow_mindwire import loop_runner
-from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkAdapter
+from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkAdapter, _PathScopeGuard
 from spirrow_mindwire.adapters.implementer import ImplementerSdkAdapter
 from spirrow_mindwire.adapters.naysayer_sdk import NaysayerSdkAdapter
 from spirrow_mindwire.conductor import StopReason
@@ -41,10 +41,12 @@ from spirrow_mindwire.config import (
     Stage3LoopConfig,
 )
 from spirrow_mindwire.loop_runner import (
+    _PROPOSER_BUILTIN_TOOLS,
     Stage3Conductor,
     Stage3ProposerAdapter,
     build_conductor,
     build_loop,
+    build_proposer,
     build_registry,
     build_watches,
     run_conductor,
@@ -264,11 +266,66 @@ class _FakeGitHub:
 
 
 # --------------------------------------------------------------------------- #
-# Stage3ProposerAdapter: text-only (drops EXECUTE_CODE)
+# Stage3ProposerAdapter: read-only (drops EXECUTE_CODE)
 # --------------------------------------------------------------------------- #
 
 
-def test_stage3_proposer_is_text_only() -> None:
+def test_the_proposer_can_read_the_repository_it_designs_against() -> None:
+    """It could not, and that stopped the loop rather than a design.
+
+    On T-fs-delete-path-scope msg-1197 the proposer reported that no read tool
+    was permitted, declined to design a security gate from quoted excerpts, and
+    handed back to a human; the naysayer's review endorsed the refusal. Nothing
+    then moved for a day. Read / Glob / Grep are what "check the claim before
+    designing against it" costs.
+    """
+    assert set(_PROPOSER_BUILTIN_TOOLS) == {"Read", "Glob", "Grep"}
+    proposer = build_proposer(Path("."))
+    assert list(proposer._builtin_tools) == list(_PROPOSER_BUILTIN_TOOLS)
+    # Auto-approved because running headless means an un-approved call reaches a
+    # prompt no one can answer. The bound is the guard, asserted separately.
+    assert list(proposer._allowed_tools) == list(_PROPOSER_BUILTIN_TOOLS)
+
+
+def test_the_proposer_is_scoped_to_the_repository_it_was_given() -> None:
+    """Exposing a read tool is not approving every path it could name.
+
+    `allowed_tools` auto-approves, and `Read` takes an absolute path, so without
+    a guard the proposer could be talked into quoting a credential file into the
+    chatroom — which leaves this host and reaches an external model. Widening
+    permissions on an isolated box bounds what a deletion costs; it does not
+    bound where a secret travels. (Tier B, PR #157.)
+    """
+    repo = Path("/tmp/some-repo")
+    proposer = build_proposer(repo)
+    guard = proposer._can_use_tool
+    assert isinstance(guard, _PathScopeGuard)
+    assert guard.root == repo
+
+
+def test_the_proposer_still_cannot_write_or_run_anything() -> None:
+    """Reading is the widening; writing and executing are not.
+
+    A proposer that can change the tree is an implementer, and the Stage 3 split
+    puts every such call behind the allow-list-gated adapter.
+    """
+    forbidden = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Task", "WebFetch"}
+    assert forbidden.isdisjoint(set(_PROPOSER_BUILTIN_TOOLS))
+    proposer = build_proposer(Path("."))
+    assert forbidden.isdisjoint(set(proposer._allowed_tools))
+
+
+def test_reading_does_not_make_the_proposer_qualify_as_the_implementer() -> None:
+    """The reason the class drops EXECUTE_CODE, restated as a guard.
+
+    ``capabilities`` is a class attribute and independent of the tool list, so
+    widening the tools cannot make first-qualified hand the IMPLEMENTER slot to
+    the un-gated adapter. That was the whole point of the split.
+    """
+    assert Capability.EXECUTE_CODE not in Stage3ProposerAdapter.capabilities
+
+
+def test_stage3_proposer_capabilities_are_unchanged() -> None:
     caps = Stage3ProposerAdapter.capabilities
     assert Capability.READ_THREAD in caps
     assert Capability.POST_REPLY in caps
