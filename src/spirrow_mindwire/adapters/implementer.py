@@ -665,30 +665,59 @@ _HEREDOC_DATA_SINKS: tuple[tuple[str, ...], ...] = (
 )
 
 # The opener line of the ONE command shape whose heredoc body is treated as data:
-# a data-sink invocation containing no shell metacharacter at all, then a single
-# quoted heredoc opener, and nothing else on the line.
+# a data-sink invocation, then a single quoted heredoc opener, and nothing else.
 #
-# The owner charset is the guard. Letters, digits, spaces, ``. _ / =``, quotes,
-# and ``-`` (last, so it is a literal). Excluded, and each for a reason:
+# The owner is never masked, so nothing hidden in it can escape the floor. The
+# charset therefore has exactly one job: refuse every character that could move
+# where the body BEGINS, because blanking a line bash would run is the fail-OPEN
+# direction that four earlier rounds fell into. Measured, not reasoned — each
+# shape below was run under bash with ``touch <marker>`` as line 1:
 #
-#   ``;`` ``&`` ``|`` ``#``  another command, or a comment hiding one, on the
-#                            line whose end we are about to trust;
-#   backslash                a line continuation — the body would start later;
-#   ``$`` backtick           a substitution, which bash keeps reading across the
-#                            newline when it is left open.
+#   ``\``            a line continuation, so the body starts later;
+#   ``;`` ``&``      a trailing operator leaves the list open, or introduces a
+#   ``|``            second opener whose body comes first;
+#   ``$`` backtick   an unclosed substitution bash keeps reading past the newline;
+#   ``<`` ``>``      process substitution ``<(`` / ``>(``, and ``<<`` itself.
 #
-# Quotes ARE admitted (``gh pr create --title "Fix bugs" --body-file - <<'EOF'``
-# is ordinary), and they are safe to admit because the owner is then handed to
-# ``shlex.split(posix=True)``, which raises on an unclosed quote — the one way a
-# quote could push the line's end past this newline. Verified: ``'--title "x'``
-# raises ``No closing quotation``. A quoted metacharacter (``--title "a; b"``) is
-# inert to bash, and anything on line 0 is never masked anyway, so it stays
-# visible to the floor either way. (Tier B naysayer, PR #156 round 5.)
-_HEREDOC_OWNER_CHARS = "A-Za-z0-9 ._/=" + "'" + '"' + "-"
+# Ordinary punctuation is admitted, because it measured inert: ``: , + @ ! % ^ ~
+# * ? ( ) [ ] { }`` all left line 1 as data. So did the naysayer's own example,
+# ``--title "feat(ui): fix layout, update docs (#12)"`` — refusing those broke
+# the feature for Conventional Commits and issue refs, which is what round 6
+# reported. Non-ASCII is admitted for the same reason: no bash operator is
+# non-ASCII, and this loop's commit messages are frequently Japanese.
+#
+# Quotes are admitted because the owner is handed to ``shlex.split(posix=True)``,
+# which raises on an unclosed one — the only way a quote could push the line's
+# end past this newline (verified: ``--title "x`` raises ``No closing quotation``).
+# A quoted metacharacter is inert to bash and stays visible to the floor anyway.
+#
+# ``#`` is the one the round-6 critique got wrong, and the measurement is the
+# reason it is handled separately rather than admitted: see below.
+_HEREDOC_OWNER_CHARS = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \t._/=-:,+@!%^~*?()[]{}'\"#"
+)
+_NON_ASCII_RANGE = "\u0080-\U0010ffff"
+"""Every code point above ASCII, as one class range. No bash operator lives
+here, so admitting the lot cannot introduce one, and it keeps a Japanese
+commit title from silently falling out of the recognised shape."""
+
 _SINK_HEREDOC_OPENER_LINE_RE = re.compile(
-    r"^(?P<owner>[" + _HEREDOC_OWNER_CHARS + r"]+?)"
+    r"^(?P<owner>[" + re.escape(_HEREDOC_OWNER_CHARS) + _NON_ASCII_RANGE + r"]+?)"
     r"<<(?P<dash>-?)(?P<q>['\"])(?P<delim>\w+)(?P=q)[ \t]*$"
 )
+
+# ``#`` is a comment only where it BEGINS a word — bash's own rule, and the whole
+# difference between the two halves of the round-6 critique. Mid-word it is an
+# ordinary character (``a#b``, ``"closes (#12)"``), which is the form real PR
+# titles use. At the start of a word it comments out the rest of the line —
+# including the ``<<'A'`` opener — so there is no heredoc at all and every line
+# after it is live shell. Measured: ``true # <<'A'`` runs line 1. Admitting ``#``
+# unconditionally, as round 6 asked, would have masked that line.
+#
+# Whitespace inside quotes is not word separation, so ``--title "a # b"`` is
+# refused here although bash would keep it literal. That direction is the safe
+# one: the command is left whole for the floor to read.
+_HASH_BEGINS_A_WORD_RE = re.compile(r"(?:^|[ \t])#")
 
 
 def _mask_quoted_heredoc_payloads(command: str) -> str:
@@ -710,21 +739,30 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
     **Only one command shape is recognised**, and it is checked line by line
     rather than by a single pattern:
 
-    * line 0 is a data sink plus one quoted opener and nothing else;
+    * line 0 is a data sink plus one quoted opener, carrying nothing that could
+      move where the body begins — see :data:`_HEREDOC_OWNER_CHARS`;
     * the body runs to the **first** line that is exactly the delimiter — the
       first, because that is where bash ends it, so a second delimiter further
       down cannot stretch the body over the commands in between;
     * from that line on, nothing is touched: trailing commands stay shell.
 
     Anything else returns ``command`` untouched, i.e. exactly as strict as before
-    this feature existed. That bluntness is the design. Five review rounds found
-    six defects in successively cleverer attempts to locate a heredoc body — a
-    fake opener inside a body, several openers on one line, a backslash
-    continuation, a comment hiding a trailing ``&&``, ``$(`` inside double
-    quotes, and a regex whose end anchor made a non-greedy body swallow the real
-    terminator and the live command after it. Four of the six masked commands
-    bash would run, which is the fail-OPEN direction. The lesson taken is not
-    "model bash better" but "recognise less".
+    this feature existed. That bluntness is the design. Six review rounds found
+    defect after defect in successively cleverer attempts to locate a heredoc
+    body, and running each one under bash separates them into two kinds:
+
+    * **three that really do run the line the mask blanked** — a fake opener
+      inside a body, a backslash continuation, and a regex whose end anchor let
+      a non-greedy body swallow the real terminator and the command behind it.
+      These are fail-OPEN, and they are the reason for the bluntness.
+    * **the rest, which bash refuses to parse at all** — a trailing ``&&``,
+      ``$(`` left open, a bare backtick. Measured: ``bash`` exits 2 and runs
+      nothing. Declining these buys no safety over what bash already does; they
+      are declined because the parse is ambiguous, not because a deletion would
+      otherwise execute. Saying so keeps the record honest about which of the
+      cases in ``tests/test_implementer_heredoc_mask.py`` are load-bearing.
+
+    The lesson taken is not "model bash better" but "recognise less".
     """
     lines = command.split("\n")
     if len(lines) < 2:
@@ -732,8 +770,13 @@ def _mask_quoted_heredoc_payloads(command: str) -> str:
     opener = _SINK_HEREDOC_OPENER_LINE_RE.match(lines[0])
     if opener is None:
         return command
+    owner = opener.group("owner")
+    if _HASH_BEGINS_A_WORD_RE.search(owner):
+        # A word-initial `#` comments out the rest of the line, opener included,
+        # so what looks like a body is live shell.
+        return command
     try:
-        tokens = shlex.split(opener.group("owner"), posix=True)
+        tokens = shlex.split(owner, posix=True)
     except ValueError:
         return command
     if not any(

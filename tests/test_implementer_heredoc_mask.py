@@ -6,17 +6,28 @@ and a lone backtick opened the coarse floor over the prose. Measured 2026-08-17:
 four conductor runs died on messages that merely *mentioned* deleting, one of
 them quoting the human's own instruction not to delete a file.
 
-Getting the *parse* right then failed four times. Each Tier B round found a real
-defect in the attempt to work out where a heredoc body begins:
+Getting the *parse* right then failed round after round, each Tier B review
+finding another way to be wrong about where a heredoc body begins. Every one of
+those shapes is kept below as a case. Running them under bash — line 1 replaced
+by ``touch <marker>``, sink replaced by ``true`` so nothing short-circuits —
+splits them into two kinds, and the difference is worth stating plainly because
+it says which of these tests are load-bearing:
+
+**Three where bash really runs the line the mask blanked.** These are fail-OPEN
+and they are why the parse was abandoned for a template:
 
 1. a fake opener inside a body, its terminator placed after the real one, so the
-   masked span swallowed live commands (PR #154 — an outright bypass);
-2. several openers on one line, whose bodies follow in opener order, so a cursor
-   that jumped past the first landed behind the second and never masked it;
-3. a backslash line-continuation, which defers the body past the next physical
-   newline — the mask blanked the continued command as if it were data (bypass);
-4. a comment hiding a trailing ``&&``, and ``$(`` inside double quotes — two more
-   ways for the logical line to keep going (bypasses).
+   masked span swallowed live commands (PR #154);
+2. a backslash line-continuation, which defers the body past the next physical
+   newline — the mask blanked the continued command as if it were data;
+3. a second, fake terminator at the end: bash stops at the *first* one, but a
+   pattern anchored to the end of the string could not, so its non-greedy body
+   swallowed the real terminator and the deletion behind it.
+
+**The rest, where bash refuses to parse at all** — a trailing ``&&``, ``$(``
+left open, a bare backtick. Measured: ``bash`` exits 2 and runs nothing, so
+declining them buys no safety over what bash already does. They are declined
+because the parse is ambiguous, not because a deletion would otherwise execute.
 
 Every fix was correct and every one left another construct. So the question
 changed from "where does the body begin?" to "**is this the one shape we are
@@ -26,8 +37,7 @@ line that is exactly the delimiter. Only that body is blanked; anything before
 or after it is left as shell, which is exactly as strict as before the feature
 existed.
 
-All five exploits are kept below as cases: each fails the template on structure
-alone. The final test states the promise as a property rather than a case list.
+The final test states the promise as a property rather than a case list.
 """
 
 from __future__ import annotations
@@ -114,7 +124,51 @@ def test_a_substitution_in_the_owner_is_declined() -> None:
     assert _verdict(cmd) is Operation.FS_DELETE, cmd
 
 
-# --- every exploit the four review rounds produced ------------------------ #
+@pytest.mark.parametrize(
+    ("label", "title"),
+    [
+        # The round-6 critique's own example, then the punctuation it is made of.
+        ("conventional-commit-with-issue-ref", "feat(ui): fix layout, update docs (#12)"),
+        ("colon", "feat: x"),
+        ("comma", "a, b"),
+        ("parens", "wrap (ui) x"),
+        ("hash-mid-word", "closes (#12)"),
+        ("plus-at-bang", "a+b @c !d"),
+        ("brackets-braces", "a[b] {c}"),
+        ("percent-caret-tilde", "50% ^ ~x"),
+        ("star-question", "a* b?"),
+        # This loop's commit messages are frequently Japanese.
+        ("japanese", "レイアウトの破れを直す"),
+    ],
+)
+def test_ordinary_punctuation_in_a_title_is_still_the_shape(label: str, title: str) -> None:
+    # Measured under bash (probe: line 1 = `touch <marker>`): every one of these
+    # leaves line 1 as heredoc data, so none of them can move where the body
+    # begins and none of them is a reason to decline. Round 6 reported these as
+    # broken and it was right.
+    cmd = "gh pr create --title " + DQ + title + DQ + " --body-file - <<'A'\nsays git rm\nA"
+    assert _verdict(cmd) is not Operation.FS_DELETE, label
+
+
+@pytest.mark.parametrize(
+    ("label", "cmd"),
+    [
+        # `#` begins a word, so it comments out the rest of the line — the
+        # opener included. There is then no heredoc and `rm` is live shell.
+        # Measured: `true # <<'A'` runs line 1.
+        ("hash-hides-the-opener", "git commit -F - # <<'A'\n" + DELETION + "\nA"),
+        ("hash-after-a-flag", "git commit -F - -q # <<'A'\n" + DELETION + "\nA"),
+    ],
+)
+def test_a_word_initial_hash_is_declined(label: str, cmd: str) -> None:
+    # The half of the round-6 critique that was wrong: admitting `#`
+    # unconditionally would have masked a live deletion.
+    assert _verdict(cmd) is Operation.FS_DELETE, label
+
+
+# --- every shape the review rounds produced ------------------------------- #
+#
+# MEASURED LIVE: bash runs the blanked line. Load-bearing.
 
 
 @pytest.mark.parametrize(
@@ -135,9 +189,12 @@ def test_a_substitution_in_the_owner_is_declined() -> None:
             "backslash-continuation",
             "git commit -F - <<'A' ; eval " + BS + "\nrm -rf /\nsafe\nA",
         ),
+        # MEASURED UNPARSEABLE: bash exits 2 and runs nothing, so these are
+        # declined for ambiguity, not because a deletion would execute. Kept as
+        # cases so a future relaxation has to face them, but labelled honestly.
         # 4a. A comment hides the trailing && that keeps the list open.
         ("comment-hides-and-and", "git commit -F - <<'A' && # c\nrm -rf /\nsafe\nA"),
-        # 4b. `$(` inside double quotes — bash keeps reading the substitution.
+        # 4b. `$(` left open inside double quotes.
         (
             "substitution-in-double-quotes",
             "git commit -F - <<'A' ; echo " + DQ + "$(" + DQ + "\n" + DELETION + "\nsafe\nA",
