@@ -1845,6 +1845,60 @@ def _classify_non_bash(tool_name: str, tool_input: dict[str, Any]) -> Classified
 # --------------------------------------------------------------------------- #
 
 
+def _git_output(repo_root: Path, args: list[str]) -> str | None:
+    """One trimmed line of git output, or None if git could not answer."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,  # same budget as _current_branch
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _push_destination(repo_root: Path) -> str | None:
+    """Which remote branch does a bare ``git push`` from here actually write?
+
+    NOT the local branch name. Measured end to end: with
+    ``push.default=upstream`` and ``git branch -u origin/main``, a bare
+    ``git push --force`` from ``feature/x`` reported ``feature/x -> main`` and
+    moved the remote ``main``. The guard was reading the local name, saw
+    ``feature/x``, and allowed it — and the two commands can be issued as
+    separate tool calls, so no single command ever looks wrong.
+    (Tier B, PR #158 round 16.)
+
+    ``push.default`` decides, and only two of its modes are answerable here:
+
+    * ``simple`` (git's default) and ``current`` push to the same-named branch,
+      so the local name IS the destination. ``simple`` additionally refuses when
+      the upstream has a different name, which is its own protection.
+    * ``upstream`` / ``tracking`` push to the configured upstream, so that is
+      what has to be read.
+
+    ``matching`` writes every same-named branch at once and ``nothing`` refuses;
+    neither maps to the single branch this predicate returns, so both give None
+    and the caller fails closed.
+    """
+    mode = _git_output(repo_root, ["config", "--get", "push.default"]) or "simple"
+    if mode in ("simple", "current"):
+        return _current_branch(repo_root)
+    if mode in ("upstream", "tracking"):
+        upstream = _git_output(repo_root, ["rev-parse", "--abbrev-ref", "@{u}"])
+        if upstream is None:
+            return None
+        # `origin/main` -> `main`; `origin/feature/x` -> `feature/x`.
+        return upstream.split("/", 1)[1] if "/" in upstream else upstream
+    return None
+
+
 def _current_branch(repo_root: Path) -> str | None:
     """Return the repo's current branch via ``git rev-parse``; None if undeterminable.
 
@@ -1959,7 +2013,15 @@ class _AllowlistGuard:
         """
         repo_root = self._allowlist.repo_root
         if action.operation in _HEAD_ENRICHED_OPERATIONS and action.branch is None:
-            cur = _current_branch(repo_root)
+            # A push writes a REMOTE branch, and which one is not always the
+            # local name — `push.default` and the configured upstream decide.
+            # Everything else here acts on the checkout, so the local name is
+            # the answer for those.
+            cur = (
+                _push_destination(repo_root)
+                if action.operation in (Operation.GIT_PUSH, Operation.FORCE_PUSH)
+                else _current_branch(repo_root)
+            )
             return (
                 replace(action, operation=Operation.UNKNOWN)
                 if cur is None
