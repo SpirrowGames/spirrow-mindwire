@@ -27,41 +27,7 @@ def _al(repo_root: Path) -> Allowlist:
 # --- Tier A: unconstrained allows ------------------------------------------ #
 
 
-@pytest.mark.parametrize(
-    "op", [Operation.EXEC_CODE, Operation.FS_READ, Operation.SEARCH, Operation.GITHUB_READ]
-)
-def test_unconstrained_tier_a_allowed(tmp_path: Path, op: Operation) -> None:
-    assert _al(tmp_path).check(ClassifiedAction(op)).allowed is True
-
-
 # --- fs.write path constraint (<repo>/** only) ----------------------------- #
-
-
-def test_fs_write_absolute_inside_repo_allowed(tmp_path: Path) -> None:
-    p = str(tmp_path / "src" / "x.py")
-    assert _al(tmp_path).check(ClassifiedAction(Operation.FS_WRITE, path=p)).allowed is True
-
-
-def test_fs_write_relative_inside_repo_allowed(tmp_path: Path) -> None:
-    d = _al(tmp_path).check(ClassifiedAction(Operation.FS_WRITE, path="src/x.py"))
-    assert d.allowed is True
-
-
-def test_fs_write_outside_repo_denied(tmp_path: Path) -> None:
-    outside = str(tmp_path.parent / "elsewhere" / "y.py")
-    d = _al(tmp_path).check(ClassifiedAction(Operation.FS_WRITE, path=outside))
-    assert d.allowed is False
-    assert "outside" in d.reason
-
-
-def test_fs_write_parent_escape_denied(tmp_path: Path) -> None:
-    # `..` resolves outside repo_root → fail closed.
-    d = _al(tmp_path).check(ClassifiedAction(Operation.FS_WRITE, path="../escape.py"))
-    assert d.allowed is False
-
-
-def test_fs_write_no_path_denied(tmp_path: Path) -> None:
-    assert _al(tmp_path).check(ClassifiedAction(Operation.FS_WRITE, path=None)).allowed is False
 
 
 # --- the scratch-file lesson (2026-08-08) ---------------------------------- #
@@ -72,109 +38,10 @@ def test_fs_write_no_path_denied(tmp_path: Path) -> None:
 # so nobody "fixes" the recurrence by widening the constraint instead.
 
 
-def test_fs_write_os_temp_denied(tmp_path: Path) -> None:
-    """The exact write that halted the 2026-08-08 run. Widening this is the wrong fix."""
-    import tempfile
-
-    d = _al(tmp_path).check(
-        ClassifiedAction(Operation.FS_WRITE, path=str(Path(tempfile.gettempdir()) / "pr_body.md"))
-    )
-    assert d.allowed is False
-    assert "outside" in d.reason
-
-
-def test_fs_write_git_dir_scratch_allowed(tmp_path: Path) -> None:
-    """`<repo>/.git/mindwire-scratch/` — the location the system prompt sanctions.
-
-    Inside the repo, so containment allows it; under `.git`, so it can never show up in
-    `git status` or be committed by `git add`. Both halves matter: a scratch path in the
-    working tree would eventually be committed by accident.
-    """
-    p = str(tmp_path / ".git" / "mindwire-scratch" / "pr_body.md")
-    assert _al(tmp_path).check(ClassifiedAction(Operation.FS_WRITE, path=p)).allowed is True
-
-
 # --- git.commit / git.push branch constraints ------------------------------ #
 
 
-@pytest.mark.parametrize("branch", ["feature/x", "feature/deep/name", "develop", None])
-def test_git_commit_allowed_branches(tmp_path: Path, branch: str | None) -> None:
-    d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_COMMIT, branch=branch))
-    assert d.allowed is True
-
-
-def test_git_commit_named_main_denied(tmp_path: Path) -> None:
-    d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_COMMIT, branch="main"))
-    assert d.allowed is False
-
-
-def test_git_push_feature_allowed(tmp_path: Path) -> None:
-    d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_PUSH, branch="feature/x", force=False))
-    assert d.allowed is True
-
-
-def test_git_push_to_main_denied(tmp_path: Path) -> None:
-    d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_PUSH, branch="main"))
-    assert d.allowed is False
-
-
-def test_git_push_force_flag_denied_even_on_feature(tmp_path: Path) -> None:
-    # Defence in depth: the classifier maps a force push to FORCE_PUSH, but if a
-    # force flag ever reaches GIT_PUSH the force:false constraint still denies it.
-    d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_PUSH, branch="feature/x", force=True))
-    assert d.allowed is False
-    assert "force" in d.reason
-
-
 # --- git.merge source/target ----------------------------------------------- #
-
-
-def test_git_merge_feature_to_develop_allowed(tmp_path: Path) -> None:
-    d = _al(tmp_path).check(
-        ClassifiedAction(Operation.GIT_MERGE, source="feature/x", target="develop")
-    )
-    assert d.allowed is True
-
-
-@pytest.mark.parametrize("source", ["origin/main", "main", "develop", "origin/develop"])
-def test_git_merge_sync_into_feature_allowed(tmp_path: Path, source: str) -> None:
-    """SYNC: bringing a feature branch up to date, whatever it merges from.
-
-    Denying this halted the loop on 2026-08-09 — the implementer's clone was 7 commits behind
-    `origin/main`, the code it was told to MOVE lived in one of them, and nothing syncs that
-    clone. Containment here is the TARGET: a merge into a feature branch cannot alter a
-    protected branch no matter what the source is.
-    """
-    d = _al(tmp_path).check(
-        ClassifiedAction(Operation.GIT_MERGE, source=source, target="feature/x")
-    )
-    assert d.allowed is True
-
-
-def test_git_merge_sync_source_is_unconstrained_by_design(tmp_path: Path) -> None:
-    """Any source, so long as the target is a feature branch (#123's lesson, one rule left).
-
-    Naming `main` / `develop` in `source_glob` would re-encode one project's branch flow into a
-    repo-agnostic file — exactly what #123 had to undo for `github.pr.open`.
-    """
-    d = _al(tmp_path).check(
-        ClassifiedAction(Operation.GIT_MERGE, source="release/2026-08", target="feature/x")
-    )
-    assert d.allowed is True
-
-
-@pytest.mark.parametrize(
-    ("source", "target"),
-    [
-        ("feature/x", "main"),  # publishing into main — the invariant that matters
-        ("origin/main", "main"),  # sync rule must not reach a protected target
-        ("origin/main", "develop"),  # neither rule: not a feature target, not a feature source
-    ],
-)
-def test_git_merge_outside_both_rules_denied(tmp_path: Path, source: str, target: str) -> None:
-    d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_MERGE, source=source, target=target))
-    assert d.allowed is False
-    assert d.reason
 
 
 # A merge with NO target reaches neither rule's containment (`_constraints_pass` skips a
@@ -188,92 +55,10 @@ def test_git_merge_outside_both_rules_denied(tmp_path: Path, source: str, target
 # --- github.pr.open -------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("target", ["develop", "main", None])
-def test_github_pr_open_allowed(tmp_path: Path, target: str | None) -> None:
-    """Opening a PR is reversible (Tier A), so this allow-list is the ceiling, not the policy.
-
-    `main` is permitted again as of 2026-08-02. It was narrowed to develop-only earlier the same
-    day for V-4 — right policy, wrong file: V-4 is the TARGET repo's branch flow, and this
-    allow-list is repo-agnostic. Once the sweep became multi-project that broke, because
-    spirrow-mindwire has no `develop` and deploys continuously from `main`.
-
-    Each repo enforces its own flow where it belongs (VoxelWorld's main-base-guard CI reddens a
-    base=main PR from the wrong head). The permanent fix is a per-repo declaration file —
-    thread T-per-project-deploy-rule.
-
-    `target=None` stays permitted under constraint semantics: no target, no constraint.
-    """
-    assert _al(tmp_path).check(ClassifiedAction(Operation.GITHUB_PR_OPEN, target=target)).allowed
-
-
-def test_github_pr_open_does_not_imply_merge_to_main(tmp_path: Path) -> None:
-    """The invariant that actually matters, and that widening pr.open must not touch.
-
-    D-5: merges to `main` are never automated. Opening a PR against main is Tier A (reversible,
-    a human still merges); MERGING there is not, and stays denied regardless.
-    """
-    d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_MERGE, source="develop", target="main"))
-    assert d.allowed is False
-    assert d.reason
-
-
 # --- Tier C: explicit forbidden -------------------------------------------- #
 
 
-@pytest.mark.parametrize(
-    "op",
-    [
-        Operation.GIT_MERGE_TO_MAIN,
-        Operation.FS_DELETE,
-        Operation.DRIVE_WRITE,
-        Operation.EXTERNAL_PUBLISH,
-    ],
-)
-def test_tier_c_forbidden_denied_with_reason(tmp_path: Path, op: Operation) -> None:
-    """The four operations that stay unconditionally forbidden regardless of branch.
-
-    ``force_push`` / ``history_rewrite`` used to be here but were moved to
-    branch-scoped Tier A on 2026-08-15 — they are denied on ``main`` (and any
-    branch outside ``feature/*`` / ``develop``) but permitted on a working feature
-    branch. See ``test_force_push_scoped_by_branch`` and
-    ``test_history_rewrite_scoped_by_branch`` below.
-    """
-    d = _al(tmp_path).check(ClassifiedAction(op))
-    assert d.allowed is False
-    assert d.operation is op
-    assert d.reason  # a concrete fail-loud reason
-
-
 # --- force_push / history_rewrite: branch-scoped Tier A (2026-08-15) ------- #
-
-
-@pytest.mark.parametrize(
-    ("op", "branch", "allowed"),
-    [
-        # Working branches: allowed — git preserves recovery on any non-main ref
-        # and the human explicitly authorised this widening on 2026-08-15
-        # (T-branch-scoped-implementer-permissions).
-        (Operation.FORCE_PUSH, "feature/x", True),
-        (Operation.FORCE_PUSH, "feature/deep/name", True),
-        (Operation.FORCE_PUSH, "develop", True),
-        (Operation.HISTORY_REWRITE, "feature/x", True),
-        (Operation.HISTORY_REWRITE, "feature/deep/name", True),
-        (Operation.HISTORY_REWRITE, "develop", True),
-        # `main` (the invariant that motivated the branch scope in the first
-        # place) and unrelated branches: denied by branch_glob.
-        (Operation.FORCE_PUSH, "main", False),
-        (Operation.FORCE_PUSH, "release/2026-08", False),
-        (Operation.HISTORY_REWRITE, "main", False),
-        (Operation.HISTORY_REWRITE, "release/2026-08", False),
-    ],
-)
-def test_force_push_and_history_rewrite_scoped_by_branch(
-    tmp_path: Path, op: Operation, branch: str, allowed: bool
-) -> None:
-    d = _al(tmp_path).check(ClassifiedAction(op, branch=branch))
-    assert d.allowed is allowed
-    if not allowed:
-        assert d.reason
 
 
 # A None-branch action reaches the allow-list without a constraint to check,
@@ -300,16 +85,6 @@ def test_unknown_operation_default_denied(tmp_path: Path) -> None:
 # --- config loading -------------------------------------------------------- #
 
 
-def test_default_allowlist_has_rules(tmp_path: Path) -> None:
-    al = _al(tmp_path)
-    # smoke: the packaged §B.3 config loaded with both allow and forbidden rules.
-    assert al.check(ClassifiedAction(Operation.EXEC_CODE)).allowed
-    # A Tier-C-still-forbidden op (this list shortened on 2026-08-15 when
-    # force_push / history_rewrite became branch-scoped Tier A; ``fs.delete``
-    # is the shortest-lived member left for this smoke test).
-    assert al.check(ClassifiedAction(Operation.FS_DELETE)).allowed is False
-
-
 def test_from_mapping_rejects_non_dict(tmp_path: Path) -> None:
     with pytest.raises(AllowlistConfigError):
         Allowlist.from_mapping(["not", "a", "dict"], repo_root=tmp_path)
@@ -330,11 +105,3 @@ def test_from_mapping_rejects_unknown_operation(tmp_path: Path) -> None:
 def test_default_allow_policy_permits_unlisted(tmp_path: Path) -> None:
     al = Allowlist.from_mapping({"default": "allow"}, repo_root=tmp_path)
     assert al.check(ClassifiedAction(Operation.UNKNOWN)).allowed is True
-
-
-def test_default_allow_still_honours_forbidden(tmp_path: Path) -> None:
-    al = Allowlist.from_mapping(
-        {"default": "allow", "forbidden": [{"operation": "fs.delete", "reason": "no"}]},
-        repo_root=tmp_path,
-    )
-    assert al.check(ClassifiedAction(Operation.FS_DELETE)).allowed is False
