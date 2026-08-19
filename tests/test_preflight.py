@@ -62,6 +62,19 @@ naysayer identified. The parametrized ``test_n1_ruleset_not_active_halts``
 covers ``evaluate`` / ``disabled`` / field-absent / arbitrary-future-value,
 so anything short of literal ``"active"`` fails-closed by construction.
 
+**N-1 addendum-4 memoization pin (msg-1305 naysayer follow-up)**: the
+"N-1 addendum-4" block pins that P1 memoizes the per-``ruleset_id`` verdict
+inside one ``preflight_gate`` call. A single ruleset commonly provides
+multiple required rule types (the production ``guard-default-branch``
+provides all three), and the outer loop over ``_REQUIRED_RULE_TYPES``
+would otherwise fetch ``repos/{o}/{r}/rulesets/{id}`` up to three times
+per repo per daemon start. The tests use a ``_counting_api_caller`` that
+records endpoint hits and asserts exactly one fetch per distinct
+``ruleset_id``. The cache is per-call, not global —
+``test_n1_cache_is_per_call_not_global`` pins that a second
+``preflight_gate`` invocation re-fetches, so a ruleset quietly disabled
+between daemon starts is still caught on the next start (msg-1267 §4).
+
 Every I/O boundary (``git remote`` / ``gh api``) is a Callable injected here,
 so no test touches the real network or the real GitHub API.
 """
@@ -1166,6 +1179,191 @@ def test_n1_bypass_check_only_runs_after_enforcement_check(tmp_path: Path) -> No
     # The bypass value should NOT be surfaced when enforcement wins — the
     # operator has one thing to fix, not two.
     assert "current_user_can_bypass='always'" not in msg
+
+
+# --------------------------------------------------------------------------- #
+# N-1 addendum-4 — msg-1305 naysayer: per-ruleset memoization
+# --------------------------------------------------------------------------- #
+#
+# The production `guard-default-branch` ruleset (id=21017016) provides all
+# three required rule types (`deletion` / `non_fast_forward` /
+# `pull_request`) in a single ruleset. Without memoization, the outer loop
+# over `_REQUIRED_RULE_TYPES` calls `_ruleset_actively_enforces` — and
+# therefore `gh api repos/{o}/{r}/rulesets/{id}` — three times for the same
+# ruleset_id per repo per daemon start. Msg-1305 naysayer flagged this as
+# a 3x quota-burn against the existing dedup-on-remotes optimization.
+#
+# The fix is a per-call `evaluated: dict[int, (ok, reason)]` cache inside
+# `_p1_required_types_covered_by_unbypassable_rulesets`. These tests pin
+# the memoization by counting endpoint calls in the injected api_caller.
+
+
+def _counting_api_caller(responses: dict[str, Any]) -> tuple[Any, dict[str, int]]:
+    """Like ``_fake_api_caller`` but also returns a call-count dict keyed by
+    endpoint. Regressions that lose memoization show up as counts > 1 for
+    the same ``rulesets/{id}`` endpoint.
+    """
+    counts: dict[str, int] = {}
+
+    def _call(endpoint: str) -> Any:
+        counts[endpoint] = counts.get(endpoint, 0) + 1
+        if endpoint not in responses:
+            raise RuntimeError(f"no fake for {endpoint}")
+        return responses[endpoint]
+
+    return _call, counts
+
+
+def test_n1_single_ruleset_providing_all_required_types_fetched_once(
+    tmp_path: Path,
+) -> None:
+    """Production shape: one org ruleset provides all three required rule
+    types. Without memoization, the ruleset endpoint is fetched 3x per repo
+    per daemon start; with memoization, 1x. Pins the fetch count.
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api, counts = _counting_api_caller(_healthy_api())
+    preflight_gate(
+        target,
+        daemon_root=daemon,
+        remote_reader=_fake_remote_reader("https://github.com/SpirrowGames/spirrow-mindwire.git"),
+        api_caller=api,
+    )
+    # The load-bearing assertion: exactly ONE fetch of the ruleset detail
+    # endpoint, not three (one per required rule type).
+    assert counts.get("repos/SpirrowGames/spirrow-mindwire/rulesets/21017016") == 1
+    # Sanity: repo meta and rules-branches endpoints each fetched once too
+    # (they were already deduplicated by construction — not the target of
+    # this test, but a regression in either would surface here).
+    assert counts.get("repos/SpirrowGames/spirrow-mindwire") == 1
+    assert counts.get("repos/SpirrowGames/spirrow-mindwire/rules/branches/main") == 1
+
+
+def test_n1_multiple_rulesets_fetched_once_each(tmp_path: Path) -> None:
+    """When required types come from DIFFERENT ruleset_ids, each ruleset is
+    fetched exactly once — not N times per type it provides.
+
+    Scenario: `deletion` + `non_fast_forward` from ruleset 100 (both types),
+    `pull_request` from ruleset 200. Without memoization, ruleset 100 would
+    be fetched twice (once per type it provides).
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api = _healthy_api()
+    api["repos/SpirrowGames/spirrow-mindwire/rules/branches/main"] = [
+        {
+            "type": "deletion",
+            "ruleset_id": 100,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {
+            "type": "non_fast_forward",
+            "ruleset_id": 100,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {
+            "type": "pull_request",
+            "ruleset_id": 200,
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "spirrow-mindwire",
+        },
+    ]
+    api["repos/SpirrowGames/spirrow-mindwire/rulesets/100"] = {
+        "source_type": "Organization",
+        "source": "SpirrowGames",
+        "enforcement": "active",
+        "current_user_can_bypass": "never",
+    }
+    api["repos/SpirrowGames/spirrow-mindwire/rulesets/200"] = {
+        "source_type": "Repository",
+        "source": "spirrow-mindwire",
+        "enforcement": "active",
+        "current_user_can_bypass": "never",
+    }
+    # Remove the default 21017016 entry (not present in the effective rules
+    # here) so a stray query would raise via the fake.
+    del api["repos/SpirrowGames/spirrow-mindwire/rulesets/21017016"]
+    counting_api, counts = _counting_api_caller(api)
+    preflight_gate(
+        target,
+        daemon_root=daemon,
+        remote_reader=_fake_remote_reader("https://github.com/SpirrowGames/spirrow-mindwire.git"),
+        api_caller=counting_api,
+    )
+    assert counts.get("repos/SpirrowGames/spirrow-mindwire/rulesets/100") == 1
+    assert counts.get("repos/SpirrowGames/spirrow-mindwire/rulesets/200") == 1
+
+
+def test_n1_memoization_preserves_failure_verdict(tmp_path: Path) -> None:
+    """When a ruleset fails the enforcement check, the cached failure
+    verdict must be reused across required types — not silently re-tried
+    (which could mask a transient success and let a broken ruleset satisfy
+    the check by accident). Same failure, same reason, same halt.
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api = _healthy_api()
+    # Ruleset 21017016 provides all 3 required types but is bypassable.
+    api["repos/SpirrowGames/spirrow-mindwire/rulesets/21017016"] = {
+        "source_type": "Organization",
+        "source": "SpirrowGames",
+        "enforcement": "active",
+        "current_user_can_bypass": "always",
+    }
+    counting_api, counts = _counting_api_caller(api)
+    with pytest.raises(PreflightError) as exc:
+        preflight_gate(
+            target,
+            daemon_root=daemon,
+            remote_reader=_fake_remote_reader(
+                "https://github.com/SpirrowGames/spirrow-mindwire.git"
+            ),
+            api_caller=counting_api,
+        )
+    # ONE fetch even in the failure path — the cached (False, reason) is
+    # reused for the second and third required types.
+    assert counts.get("repos/SpirrowGames/spirrow-mindwire/rulesets/21017016") == 1
+    # All three required types surface in the error (each names ruleset
+    # 21017016 as its bypassable-only provider).
+    msg = str(exc.value)
+    assert "deletion" in msg
+    assert "non_fast_forward" in msg
+    assert "pull_request" in msg
+    assert "21017016" in msg
+
+
+def test_n1_cache_is_per_call_not_global(tmp_path: Path) -> None:
+    """The cache lives inside one preflight_gate call — a subsequent call
+    (i.e. next daemon start) must re-fetch. Msg-1267 §4: "no cache" —
+    a ruleset quietly disabled between daemon starts must be caught on
+    the next start.
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api, counts = _counting_api_caller(_healthy_api())
+    # First preflight run
+    preflight_gate(
+        target,
+        daemon_root=daemon,
+        remote_reader=_fake_remote_reader("https://github.com/SpirrowGames/spirrow-mindwire.git"),
+        api_caller=api,
+    )
+    assert counts.get("repos/SpirrowGames/spirrow-mindwire/rulesets/21017016") == 1
+    # Second preflight run must fetch again (fresh cache).
+    preflight_gate(
+        target,
+        daemon_root=daemon,
+        remote_reader=_fake_remote_reader("https://github.com/SpirrowGames/spirrow-mindwire.git"),
+        api_caller=api,
+    )
+    assert counts.get("repos/SpirrowGames/spirrow-mindwire/rulesets/21017016") == 2
 
 
 # --------------------------------------------------------------------------- #

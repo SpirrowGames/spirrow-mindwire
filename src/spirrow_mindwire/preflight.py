@@ -420,6 +420,22 @@ def _p1_required_types_covered_by_unbypassable_rulesets(
        verifiable, unbypassable provider per required type. This also
        prevents over-deny when a strict ruleset coexists with a laxer one:
        the strict one satisfies the check, the lax one is not consulted.
+
+    4. **Per-ruleset memoization** — msg-1305 naysayer finding. A single
+       ruleset commonly provides multiple required rule types at once
+       (the production ``guard-default-branch`` ruleset id=21017016
+       provides all three: ``deletion`` / ``non_fast_forward`` /
+       ``pull_request``). Without memoization, the outer loop over
+       ``_REQUIRED_RULE_TYPES`` would call ``_ruleset_actively_enforces``
+       — and therefore ``gh api repos/{o}/{r}/rulesets/{id}`` — up to
+       three times for the same ``ruleset_id`` per repo per daemon
+       start. The local ``evaluated`` dict caches the ``(ok, reason)``
+       verdict per ``ruleset_id`` for the duration of one call to this
+       function, cutting the redundant fetches to zero. The cache is
+       intentionally NOT persisted across daemon starts (msg-1267 §4:
+       "no cache" — a subsequent daemon run pays the same 1 API call
+       before it acts, so a rule quietly disabled since the last run is
+       caught on the next start).
     """
     # Group rules by type. Skip malformed entries defensively (a str type on
     # a non-string field would break `.get("type")` further down).
@@ -430,6 +446,13 @@ def _p1_required_types_covered_by_unbypassable_rulesets(
         rtype = r.get("type")
         if isinstance(rtype, str):
             by_type.setdefault(rtype, []).append(r)
+
+    # Per-call ruleset verdict cache (msg-1305 naysayer follow-up). Keyed
+    # by ruleset_id — source_type / source are provenance metadata that ride
+    # along with the (ok, reason) tuple only for error-message context; two
+    # rules with the same ruleset_id necessarily have the same source
+    # metadata, so keying on the id is sufficient.
+    evaluated: dict[int, tuple[bool, str]] = {}
 
     problems: list[str] = []
     for rtype in sorted(_REQUIRED_RULE_TYPES):
@@ -465,9 +488,13 @@ def _p1_required_types_covered_by_unbypassable_rulesets(
             rs_id = p["ruleset_id"]
             source_type = p.get("ruleset_source_type")
             source = p.get("ruleset_source")
-            ok, reason = _ruleset_actively_enforces(
-                owner, repo, rs_id, source_type, source, api_caller
-            )
+            cached = evaluated.get(rs_id)
+            if cached is None:
+                cached = _ruleset_actively_enforces(
+                    owner, repo, rs_id, source_type, source, api_caller
+                )
+                evaluated[rs_id] = cached
+            ok, reason = cached
             if ok:
                 satisfied = True
                 break
