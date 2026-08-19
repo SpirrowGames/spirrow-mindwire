@@ -34,7 +34,12 @@ Three checks, in one order so the earliest failure is the loudest:
 * **P0** — the implementer's ``repo_dir`` is not the daemon's own checkout.
   Two different clones. The safety story ("a chained ``git checkout main &&
   git reset --hard`` burns a throwaway clone, reflog restores") stops holding
-  the moment the daemon runs against its own code.
+  the moment the daemon runs against its own code. The check compares BOTH
+  (a) the resolved absolute paths (literal equality) AND (b) the git
+  toplevels (msg-1296 naysayer follow-up): a ``repo_dir`` that is a
+  subdirectory of ``daemon_root`` with no ``.git`` of its own would satisfy
+  (a) — the paths differ — while ``git -C repo_dir <cmd>`` still walks
+  upward and finds the daemon's ``.git``. (b) closes that bypass.
 
 * **P2** — every remote URL in ``repo_dir``'s ``.git/config`` at start is
   under ``https://github.com/SpirrowGames/``. Tier-C decide 2026-08-19
@@ -72,12 +77,38 @@ add|set-url`` mid-session and reject a non-SpirrowGames URL. That
 reintroduces exactly the shell-argument-prediction machinery this whole task
 removed (P2-3: "境界検査が予測に化けるなら option-β は失敗"). Given today's
 measurement — org ruleset covers all 21 SpirrowGames default branches, no
-personal repo on ``takahito-spirrowgames`` — the residual exposure is a push
-to a non-default branch on an org-external repo. Takahito accepted that gap
-on 2026-08-19 rather than restart the prediction problem or block the PR on
-a fine-grained-PAT rollout; if the exposure changes shape (personal repo
-appears, ruleset weakens) the mitigation is option-alpha (a scope-restricted
-``MINDWIRE_GITHUB_TOKEN``), not resurrecting prediction here.
+personal repo on ``takahito-spirrowgames`` — the residual exposure has TWO
+distinct shapes (msg-1296 naysayer follow-up corrected a blind spot in the
+earlier phrasing that named only the first):
+
+  (1) **Dynamic-destination bypass to any branch on an org-external repo.**
+      A ``git remote add`` / ``set-url`` / URL-direct ``git push`` inside a
+      session lands wherever the ``repo`` scope reaches. Today the token
+      cannot reach any external repo it does not already have push access
+      to — but ``takahito-spirrowgames`` could gain a personal repo, or a
+      collaboration invite could arrive, and those would become reachable.
+
+  (2) **Native push to a non-default branch on an ORG-INTERNAL repo.**
+      Removing ``branch_glob`` means the allow-list no longer restricts
+      which branch the loop pushes to. The ``guard-default-branch``
+      GitHub ruleset covers ``~DEFAULT_BRANCH`` only. So the loop can
+      natively push (or force-push) to ``release/*`` / ``production`` /
+      ``gh-pages`` / any non-default branch on a SpirrowGames repo. This
+      is by design of the Tier-C decide (msg-1265 §5 I-1: "main への push
+      ... が拒否されること"): the server-side guarantee is scoped to
+      ``main``, and other branches are governed by PR review workflow and
+      any repo-local rulesets, not by this preflight. If a project needs
+      the loop kept off a non-default branch, add a ruleset (org- or
+      repo-level) covering that branch pattern — a ruleset-addition task,
+      not an implementer-code task.
+
+Takahito accepted both gaps on 2026-08-19 rather than restart the prediction
+problem (would resurrect the machinery this whole task removed — P2-3 explicit
+trigger) or block the PR on a fine-grained-PAT rollout / ruleset expansion.
+If (1) changes shape (personal repo appears, ruleset weakens) the mitigation
+is option-alpha (a scope-restricted ``MINDWIRE_GITHUB_TOKEN``). If (2) needs
+to shrink for a specific repo, add a branch-pattern ruleset covering the
+protected refs; neither mitigation belongs in this file.
 
 **Ruleset endpoint choice — measured 2026-08-19, pinned by tests below.**
 GitHub exposes two endpoints for a ruleset detail:
@@ -151,6 +182,15 @@ ApiCaller = Callable[[str], Any]
 RemoteReader = Callable[[Path], list[tuple[str, str]]]
 """``git -C repo remote -v`` → ``[(remote_name, url), ...]``. Injectable for tests."""
 
+GitToplevel = Callable[[Path], Path | None]
+"""``git -C path rev-parse --show-toplevel`` → resolved toplevel Path, or None
+if the path is not inside any git working tree / git is unavailable / the path
+does not exist. Injectable for tests. Used by P0 to catch the subdirectory
+bypass (msg-1296 naysayer finding): if ``repo_dir`` is nested inside
+``daemon_root``'s git tree without its own ``.git``, git commands executed in
+``repo_dir`` walk upward and find the daemon's ``.git`` — literal path
+inequality is not sufficient to prove the two clones are actually separate."""
+
 
 def preflight_gate(
     repo_dir: Path,
@@ -158,6 +198,7 @@ def preflight_gate(
     daemon_root: Path | None = None,
     api_caller: ApiCaller | None = None,
     remote_reader: RemoteReader | None = None,
+    git_toplevel: GitToplevel | None = None,
 ) -> None:
     """Enforce P0/P1/P2. Raise :class:`PreflightError` on any failure.
 
@@ -180,6 +221,15 @@ def preflight_gate(
       different repo. The P2-2 requirement from msg-1270 (dynamic destination
       coverage) is not implemented; the exposure was accepted on 2026-08-19
       (msg-1274 §1) rather than resurrect the branch-prediction machinery.
+    * That a native push to a **non-default branch on an org-internal repo**
+      (``release/*``, ``production``, ``gh-pages``, etc.) is blocked — the
+      allow-list no longer restricts push branches, and the
+      ``guard-default-branch`` GitHub ruleset covers only ``~DEFAULT_BRANCH``.
+      The loop CAN push (and force-push) to those branches through the
+      legitimate origin remote; the design intent (msg-1265 §5 I-1) scopes
+      the server guarantee to ``main``. See the module docstring "the
+      residual exposure has TWO distinct shapes" block for the msg-1296
+      correction of an earlier phrasing that named only the first shape.
     * That a ``main`` merge via ``gh pr merge`` is blocked here — that
       guarantee lives in the allow-list's ``git.merge_to_main`` forbidden
       route, not in this preflight.
@@ -187,8 +237,9 @@ def preflight_gate(
     daemon_root = daemon_root or Path.cwd()
     api = api_caller or _default_api_caller
     remotes_of = remote_reader or _default_remote_reader
+    toplevel_of = git_toplevel or _default_git_toplevel
 
-    _p0_daemon_checkout_separated(repo_dir, daemon_root)
+    _p0_daemon_checkout_separated(repo_dir, daemon_root, toplevel_of)
     remotes = _p2_remote_urls_under_spirrowgames(repo_dir, remotes_of)
     _p1_default_branch_protected(remotes, api)
     logger.info(
@@ -206,7 +257,9 @@ def preflight_gate(
 # --------------------------------------------------------------------------- #
 
 
-def _p0_daemon_checkout_separated(repo_dir: Path, daemon_root: Path) -> None:
+def _p0_daemon_checkout_separated(
+    repo_dir: Path, daemon_root: Path, git_toplevel: GitToplevel
+) -> None:
     r = repo_dir.resolve()
     d = daemon_root.resolve()
     if r == d:
@@ -219,6 +272,35 @@ def _p0_daemon_checkout_separated(repo_dir: Path, daemon_root: Path) -> None:
             f"own checkout is a self-inflicted wound the loop cannot recover from. "
             f"Point [loop].repo_dir at a dedicated clone (the current production shape: "
             f"C:/workspace/sandbox/<project>-impl)."
+        )
+    # msg-1296 naysayer follow-up: literal path inequality is not enough. If
+    # repo_dir is nested inside daemon_root's git tree without its own .git,
+    # `git -C repo_dir <cmd>` walks up and finds daemon's .git — a
+    # `git reset --hard` or `git clean -fdx` there rewrites the daemon's own
+    # code. Compare the resolved git toplevels so a subdirectory that shares
+    # the daemon's .git still fails P0.
+    #
+    # We ONLY halt when both toplevels are non-None AND equal. Non-None means
+    # git could actually resolve a toplevel for that path; None means either
+    # git is unavailable, the path is not in any git tree, or the path does
+    # not exist. If repo_dir has no toplevel at all, no walk-up is possible
+    # (git in repo_dir would just error), so the shared-.git concern does not
+    # apply — safe to let P1/P2 catch the "not a git repo" case in their own
+    # error messages instead.
+    r_top = git_toplevel(repo_dir)
+    d_top = git_toplevel(daemon_root)
+    if r_top is not None and d_top is not None and r_top == d_top:
+        raise PreflightError(
+            f"preflight P0 failed: implementer's repo_dir ({r}) and daemon's "
+            f"checkout ({d}) are different directories but resolve to the SAME "
+            f"git toplevel ({r_top}). Because repo_dir has no .git of its own, "
+            f"git commands executed there walk upward and find the daemon's "
+            f".git — a `git reset --hard` or `git clean -fdx` in the loop's "
+            f"target repo would rewrite the daemon's own code. Literal path "
+            f"inequality is not a sufficient boundary; the shared git tree is. "
+            f"Point [loop].repo_dir at a directory that has its own `.git` "
+            f"(the current production shape: C:/workspace/sandbox/<project>-impl "
+            f"is a distinct git clone, not a subdirectory of the daemon's tree)."
         )
 
 
@@ -534,8 +616,37 @@ def _default_api_caller(endpoint: str) -> Any:
     return json.loads(proc.stdout)
 
 
+def _default_git_toplevel(path: Path) -> Path | None:
+    """Return the resolved git toplevel for ``path``, or ``None``.
+
+    ``None`` covers every case where a toplevel cannot be established: the
+    path is not inside any git working tree, ``git`` is not on PATH, the path
+    does not exist, or the subprocess fails for any other reason. Callers
+    treat ``None`` as "no shared-``.git`` concern applies" — a path with no
+    git tree cannot walk upward into another repo's ``.git``. See the
+    ``GitToplevel`` type alias for the msg-1296 rationale.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    top = proc.stdout.strip()
+    if not top:
+        return None
+    try:
+        return Path(top).resolve()
+    except OSError:
+        return None
+
+
 __all__ = [
     "ApiCaller",
+    "GitToplevel",
     "PreflightError",
     "RemoteReader",
     "preflight_gate",

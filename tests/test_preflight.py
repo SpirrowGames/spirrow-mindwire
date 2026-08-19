@@ -10,7 +10,11 @@ These pin the invariants that replaced the retired branch-prediction machinery
 
 * **N-2** (P0 — daemon checkout separation): a target repo whose resolved path
   equals the daemon's own checkout halts the daemon. The captive-clone
-  assumption (§7 of the spec) requires them to be distinct.
+  assumption (§7 of the spec) requires them to be distinct. The msg-1296
+  "N-2 addendum" block extends this: a repo_dir that is a *subdirectory* of
+  daemon_root with no ``.git`` of its own also halts, because git commands
+  there walk upward and find the daemon's ``.git``. Literal path inequality
+  is not sufficient; shared git-toplevel is the boundary that matters.
 
 * **N-3** (P2 — remote URL boundary): a target repo whose remote URLs are not
   all under ``https://github.com/SpirrowGames/`` halts the daemon. Positive
@@ -75,6 +79,21 @@ def _fake_remote_reader(*urls: str) -> Any:
         return pairs
 
     return _read
+
+
+def _fake_git_toplevel(mapping: dict[Path, Path | None]) -> Any:
+    """Return a git_toplevel fake that looks each resolved path up in ``mapping``.
+
+    A path not present in the mapping resolves to None — which the P0 code
+    treats as "no git tree, no shared-.git concern applies". This shape lets a
+    test describe exactly which directory shares which git tree without
+    touching the filesystem git state.
+    """
+
+    def _(p: Path) -> Path | None:
+        return mapping.get(p.resolve())
+
+    return _
 
 
 def _fake_api_caller(responses: dict[str, Any]) -> Any:
@@ -191,6 +210,142 @@ def test_n2_repo_root_equal_to_daemon_root_via_resolve_halts(tmp_path: Path) -> 
             ),
             api_caller=_fake_api_caller(_healthy_api()),
         )
+
+
+# --- N-2 addendum — msg-1296 subdirectory bypass fix ---------------------- #
+#
+# Literal path equality does NOT prove two clones are separate. If repo_dir is
+# nested inside daemon_root's git tree without its own .git, git -C repo_dir
+# walks upward and finds the daemon's .git. A `git reset --hard` there
+# rewrites the daemon's own code. P0 now compares BOTH literal paths (the
+# original check, unchanged above) AND the resolved git toplevels (new).
+
+
+def test_n2_repo_root_inside_daemon_git_tree_no_own_git_halts(tmp_path: Path) -> None:
+    """repo_dir is a subdirectory of daemon_root with no .git of its own —
+    git commands there walk up to daemon's .git. P0 must halt.
+
+    This is the exact bypass shape msg-1296 named: `[loop].repo_dir` set to
+    `/opt/mindwire/sandbox`, daemon at `/opt/mindwire`. Literal equality
+    passes (different directories); shared git toplevel does not.
+    """
+    daemon = tmp_path / "opt-mindwire"
+    daemon.mkdir()
+    repo = daemon / "sandbox"
+    repo.mkdir()
+    with pytest.raises(PreflightError) as exc:
+        preflight_gate(
+            repo,
+            daemon_root=daemon,
+            remote_reader=_fake_remote_reader(
+                "https://github.com/SpirrowGames/spirrow-mindwire.git"
+            ),
+            api_caller=_fake_api_caller(_healthy_api()),
+            # repo has no .git → walks up → toplevel is daemon.
+            # daemon is its own .git owner → toplevel is daemon.
+            git_toplevel=_fake_git_toplevel(
+                {repo.resolve(): daemon.resolve(), daemon.resolve(): daemon.resolve()}
+            ),
+        )
+    msg = str(exc.value)
+    assert "P0" in msg
+    assert "same" in msg.lower() and "git toplevel" in msg
+    assert str(daemon.resolve()) in msg
+
+
+def test_n2_repo_root_inside_daemon_dir_but_has_own_git_passes(tmp_path: Path) -> None:
+    """If the subdirectory owns its OWN .git, git commands don't walk up —
+    safe. This is the normal case where an operator legitimately places a
+    dedicated clone under the daemon's directory tree (unusual but not
+    dangerous when the .git boundary is respected).
+    """
+    daemon = tmp_path / "opt-mindwire"
+    daemon.mkdir()
+    repo = daemon / "sandbox"
+    repo.mkdir()
+    preflight_gate(
+        repo,
+        daemon_root=daemon,
+        remote_reader=_fake_remote_reader("https://github.com/SpirrowGames/spirrow-mindwire.git"),
+        api_caller=_fake_api_caller(_healthy_api()),
+        # repo owns its own .git → toplevel is repo itself.
+        # daemon is a different git tree → toplevel is daemon.
+        git_toplevel=_fake_git_toplevel(
+            {repo.resolve(): repo.resolve(), daemon.resolve(): daemon.resolve()}
+        ),
+    )
+
+
+def test_n2_daemon_root_is_not_a_git_repo_at_all_still_ok(tmp_path: Path) -> None:
+    """If daemon_root has no git tree at all (e.g. daemon is pip-installed),
+    the shared-.git concern does not apply — no walk-up can hit a `.git`
+    that isn't there. P0 must pass on the toplevel check.
+    """
+    daemon = tmp_path / "opt-mindwire"
+    daemon.mkdir()
+    repo = tmp_path / "workspace-sandbox-impl"
+    repo.mkdir()
+    preflight_gate(
+        repo,
+        daemon_root=daemon,
+        remote_reader=_fake_remote_reader("https://github.com/SpirrowGames/spirrow-mindwire.git"),
+        api_caller=_fake_api_caller(_healthy_api()),
+        # repo owns its own .git → toplevel is repo. daemon has no git at
+        # all → toplevel None. Different toplevels (None vs repo), no halt.
+        git_toplevel=_fake_git_toplevel({repo.resolve(): repo.resolve(), daemon.resolve(): None}),
+    )
+
+
+def test_n2_repo_root_has_no_git_tree_at_all_still_ok(tmp_path: Path) -> None:
+    """If repo_dir has no git tree in ANY ancestor, no walk-up can happen
+    and P0's toplevel check is satisfied trivially (None left-hand side).
+    A subsequent step (P2 remote read) will fail-closed on its own, so
+    the "not a git repo" case still halts — just not at P0 line-of-code.
+    """
+    daemon = tmp_path / "opt-mindwire"
+    daemon.mkdir()
+    repo = tmp_path / "workspace-sandbox-impl"
+    repo.mkdir()
+
+    # P2 fails-closed via the remote_reader that raises RuntimeError.
+    def _boom(_: Path) -> list[tuple[str, str]]:
+        raise RuntimeError("not a git repo")
+
+    with pytest.raises(PreflightError) as exc:
+        preflight_gate(
+            repo,
+            daemon_root=daemon,
+            remote_reader=_boom,
+            api_caller=_fake_api_caller(_healthy_api()),
+            # Both toplevels are None (neither is a git tree). P0 does NOT
+            # halt on this — the follow-on P2 does, on the reader failure.
+            git_toplevel=_fake_git_toplevel({repo.resolve(): None, daemon.resolve(): None}),
+        )
+    assert "P2" in str(exc.value)
+
+
+def test_n2_deeply_nested_subdir_of_daemon_git_tree_halts(tmp_path: Path) -> None:
+    """The bypass fires at any depth — a repo_dir several levels down still
+    shares the daemon's git toplevel because git walks all the way up.
+    """
+    daemon = tmp_path / "opt-mindwire"
+    daemon.mkdir()
+    nested = daemon / "src" / "spirrow_mindwire" / "adapters"
+    nested.mkdir(parents=True)
+    with pytest.raises(PreflightError) as exc:
+        preflight_gate(
+            nested,
+            daemon_root=daemon,
+            remote_reader=_fake_remote_reader(
+                "https://github.com/SpirrowGames/spirrow-mindwire.git"
+            ),
+            api_caller=_fake_api_caller(_healthy_api()),
+            git_toplevel=_fake_git_toplevel(
+                {nested.resolve(): daemon.resolve(), daemon.resolve(): daemon.resolve()}
+            ),
+        )
+    assert "P0" in str(exc.value)
+    assert "git toplevel" in str(exc.value)
 
 
 # --------------------------------------------------------------------------- #
