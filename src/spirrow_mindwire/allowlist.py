@@ -18,26 +18,68 @@ implementer operation. So the config carries:
 Anything matching neither is denied by ``default: deny`` ("unlisted operation").
 
 Scope of guarantee (read this before trusting it): the allow-list is the
-*loop-level* gate. Its hard guarantee is that four statically-detectable
-Tier C operations (``git.merge_to_main`` / ``fs.delete`` / ``drive.write`` /
-``external.publish``) are denied unconditionally, and that ``force_push`` /
-``history_rewrite`` are denied on any branch outside ``feature/*`` / ``develop``
-— importantly, on ``main``. Branch / path constraints are best-effort over a
-parsed command line, with a runtime HEAD resolver in ``adapters/implementer``
-(``_AllowlistGuard._enrich``) filling the gap for operations that carry no
-branch argument (bare ``git commit`` / ``git push`` / ``git rebase`` /
-``git reset --hard``); an undecidable HEAD downgrades the action to
-``UNKNOWN`` so ``default: deny`` fires. The *blast-radius* containment is the
-**environment** (Tailscale ACL + egress default-deny + scoped credentials,
-ADR-07 §2.4 / env spec) — defence in depth, not this module alone.
+*loop-level* gate. Its **sole** hard guarantee is that one statically-detectable
+Tier C operation — ``git.merge_to_main`` — is denied unconditionally. Every
+other invariant lives outside this module:
 
-The move of ``force_push`` / ``history_rewrite`` from unconditional Tier C to
-branch-scoped Tier A was made under Tier-C approval on 2026-08-15
-(T-branch-scoped-implementer-permissions): the operative predicate is not
-"which verb" but "which branch — everywhere except ``main``, git preserves
-recovery." ``fs.delete`` was deliberately left out of that widening because its
-predicate is the recoverability of the target path, not the ambient HEAD;
-that gets its own gate (T-fs-delete-path-scope).
+* **"no push / force-push / ref-deletion reaches ``main``"** rides on the
+  ``guard-default-branch`` GitHub org ruleset (id=21017016, active across the
+  21 SpirrowGames repos as of 2026-08-19; ``current_user_can_bypass=never`` for
+  the loop identity), which rejects the push at the server, and on the
+  composition-root preflight in ``loop_runner`` (P0/P1/P2), which halts the
+  daemon (SystemExit) if the target repo lacks that protection, if the loop is
+  running against the daemon's own checkout, or if any remote's URL is not
+  under ``https://github.com/SpirrowGames/`` (Tier-C decide 2026-08-19
+  msg-1270, option β).
+
+* **``fs.delete``** used to be a Tier-C forbidden here. It was REMOVED on
+  2026-08-19 (T-drop-branch-prediction-from-allowlist §3) because ``exec.code``
+  is unconstrained ∴ ``python -c "shutil.rmtree(...)"`` was always a way around
+  the check — the classifier's ``fs.delete`` deny was theatre. The real
+  containment is git's history (files are not gone until they leave a commit)
+  and the sandbox filesystem itself. Same measurement retired ``fs.write``'s
+  ``path_glob`` (identical bypass through ``exec.code``): ``fs.write`` is now
+  unconstrained Tier A.
+
+* **``drive.write``** was REMOVED for the opposite reason: it was unreachable.
+  The implementer session runs with ``setting_sources=[]`` /
+  ``strict_mcp_config=True`` and zero MCP tools; there is no Drive credential on
+  this host. Keeping the entry would carry maintenance without carrying
+  enforcement.
+
+* **``external.publish``** was REMOVED because the environment (squid egress
+  default-deny) executes the invariant already: 2026-08-19 measurement showed
+  ``example.com`` / ``hooks.slack.com`` / ``api.telegram.org`` / ``discord.com``
+  all denied at ``CONNECT``, with only ``api.github.com`` allowed through. The
+  classifier's ``external.publish`` deny was a weaker second layer that
+  duplicated the network boundary.
+
+The three removals share one principle (msg-1272 §2, Takahito): a rule that is
+not the actual guarantor of an invariant should not be kept "for insurance",
+because a residual layer skews the next round of judgement — the next design
+sees "we still have a check here" and does not reach for the layer that
+actually holds. Where a check is real (``git.merge_to_main`` — the name-only
+classifier over ``gh pr merge`` / MCP ``merge_pull_request`` still stands
+because the GitHub server rejection is only about *the push*, not about *the
+merge API*; org-external repos where ruleset does not reach are covered here),
+it stays.
+
+The ``branch_glob`` rule key was also REMOVED on 2026-08-19 — the whole
+branch-prediction enforcement path (``_current_branch`` / ``_push_destination`` /
+``_enrich`` / the chain-guard / the destructive-branch classifier) came out of
+``adapters/implementer`` at the same time. Reintroducing ``branch_glob`` as a
+config key would be a silent fail-OPEN today: with no enrichment,
+``_constraints_pass`` would return True for every ``branch is None`` action —
+so the key would look enforcing while enforcing nothing. Removing the code that
+reads the key (rather than "supporting" it in name only) is what makes that
+regression path visibly break at load time instead of silently at run time. The
+same rule applies to ``path_glob`` (only ``fs.write`` used it, and ``fs.write``
+is now unconstrained): keeping the key alive without a consumer is dead
+scaffolding, and ``_parse_allow_rule`` refuses it at load time.
+
+The *blast-radius* containment is the **environment** (Tailscale ACL + egress
+default-deny + scoped credentials + captive clones, ADR-07 §2.4 / env spec) +
+the **GitHub org ruleset** — defence in depth, not this module alone.
 """
 
 from __future__ import annotations
@@ -73,13 +115,17 @@ class Operation(StrEnum):
     GIT_MERGE = "git.merge"
     GITHUB_PR_OPEN = "github.pr.open"
     GITHUB_READ = "github.read"
-    # --- Tier C (forbidden, explicit) ---
-    GIT_MERGE_TO_MAIN = "git.merge_to_main"
     FORCE_PUSH = "force_push"
     HISTORY_REWRITE = "history_rewrite"
-    FS_DELETE = "fs.delete"
-    DRIVE_WRITE = "drive.write"
-    EXTERNAL_PUBLISH = "external.publish"
+    # --- Tier C (forbidden, explicit) ---
+    #
+    # GIT_MERGE_TO_MAIN is the sole remaining Tier-C forbidden operation. The
+    # 2026-08-19 simplification (T-drop-branch-prediction-from-allowlist §3)
+    # removed FS_DELETE / DRIVE_WRITE / EXTERNAL_PUBLISH from the enum entirely,
+    # because each was executed by a stronger layer (the sandbox / MCP absence /
+    # squid egress default-deny respectively) and duplicating the guard here
+    # only skewed future judgement — see the module docstring.
+    GIT_MERGE_TO_MAIN = "git.merge_to_main"
     # --- fallback ---
     UNKNOWN = "unknown"
 
@@ -104,11 +150,27 @@ class AllowlistDecision:
 
 @dataclass(frozen=True)
 class _AllowRule:
-    """A Tier A allow rule: operation + optional constraints (spec §B.3)."""
+    """A Tier A allow rule: operation + optional constraints (spec §B.3).
+
+    ``branch_glob`` and ``path_glob`` were removed on 2026-08-19
+    (T-drop-branch-prediction-from-allowlist §3): the module docstring explains
+    the "no dead scaffolding" principle. With no HEAD enrichment upstream, a
+    reintroduced ``branch_glob`` would silently fail-OPEN on every ``branch is
+    None`` action; with ``fs.write`` unconstrained (the sandbox is what bounds
+    the filesystem, not this file), ``path_glob`` has no consumer either.
+    ``_parse_allow_rule`` refuses both keys at load time (fail-loud) so a
+    config-only reintroduction cannot look enforcing while enforcing nothing.
+
+    ``target_glob`` remains — the current YAML still uses it for
+    ``github.pr.open`` (out of scope for the 2026-08-19 change, msg-1265 §9,
+    and a per-project deploy declaration is the permanent fix rather than a
+    repo-agnostic glob here). ``source_glob`` is unused by the current YAML
+    but the parser still accepts it (a peer of ``target_glob`` at zero
+    marginal cost); if it stays unused across the next iteration it should
+    follow ``path_glob`` out under the same "no dead scaffolding" rule.
+    """
 
     operation: Operation
-    path_glob: str | None = None
-    branch_glob: tuple[str, ...] = ()
     source_glob: tuple[str, ...] = ()
     target_glob: tuple[str, ...] = ()
     force: bool | None = None  # if False, the action's force flag must be falsy
@@ -160,6 +222,10 @@ class ClassifiedAction:
 
     operation: Operation
     path: str | None = None
+    # `branch` is retained on the action even though no rule reads it: denial records
+    # and log lines still surface it when the classifier extracted one from the
+    # command (e.g. `git push --force origin main` — the classifier still names the
+    # branch for provenance, though the enforcement no longer turns on it).
     branch: str | None = None
     source: str | None = None
     target: str | None = None
@@ -180,39 +246,17 @@ class AllowlistConfigError(ValueError):
 # --------------------------------------------------------------------------- #
 
 
-def _branch_matches(branch: str | None, globs: tuple[str, ...]) -> bool:
-    if branch is None:
+def _glob_matches(value: str | None, globs: tuple[str, ...]) -> bool:
+    """True iff ``value`` matches any glob in ``globs``.
+
+    A ``None`` value returns False here — but ``_constraints_pass`` deliberately
+    SKIPS the constraint check when the action field is ``None`` (see the note
+    there). Callers therefore never see the None-> False path except via a
+    truthy ``globs``, and even then only when they have already guarded on None.
+    """
+    if value is None:
         return False
-    return any(fnmatch.fnmatch(branch, g) for g in globs)
-
-
-def _path_within_repo(path: str, repo_root: Path) -> bool:
-    """True iff ``path`` resolves to a location inside ``repo_root``.
-
-    SDK-reported paths may be absolute (cwd == repo_root) or relative; a
-    relative path is anchored at ``repo_root``. ``resolve`` collapses ``..``
-    so an escape (``<repo>/../etc``) lands outside and is rejected. ``..``
-    escapes therefore fail closed.
-    """
-    root = repo_root.resolve()
-    candidate = Path(path)
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    resolved = candidate.resolve()
-    return resolved == root or root in resolved.parents
-
-
-def _match_path_glob(glob: str, path: str, repo_root: Path) -> bool:
-    """Match ``path`` against a config ``path_glob`` (``<repo>`` substituted).
-
-    ``<repo>/**`` (the spec's fs.write constraint) is interpreted as
-    repo-containment rather than literal fnmatch, so any depth under the repo
-    matches and ``..`` escapes fail closed. Other globs fall back to fnmatch.
-    """
-    substituted = glob.replace("<repo>", str(repo_root.resolve()))
-    if substituted.endswith("/**"):
-        return _path_within_repo(path, repo_root)
-    return fnmatch.fnmatch(str(Path(path)), substituted)
+    return any(fnmatch.fnmatch(value, g) for g in globs)
 
 
 # --------------------------------------------------------------------------- #
@@ -284,6 +328,20 @@ class Allowlist:
             raise AllowlistConfigError(f"allow rule must be a mapping with 'operation': {raw!r}")
         op = cls._parse_operation(raw["operation"], context="allow")
 
+        # Fail-loud on removed keys (T-drop-branch-prediction-from-allowlist §3,
+        # 2026-08-19). Silently ignoring either would let a config-only reintroduction
+        # look enforcing while the missing enrichment / constraint code makes it fail-OPEN.
+        for retired in ("branch_glob", "path_glob"):
+            if retired in raw:
+                raise AllowlistConfigError(
+                    f"{retired} was removed on 2026-08-19 "
+                    f"(T-drop-branch-prediction-from-allowlist §3); "
+                    f"the guarantees that used to ride here live outside this module now — "
+                    f"the GitHub org ruleset + composition-root preflight (P0/P1/P2) for the "
+                    f"branch predicate, and the sandbox filesystem for path scope. "
+                    f"See the module docstring. Offending rule: {raw!r}"
+                )
+
         def _tuple(key: str) -> tuple[str, ...]:
             val = raw.get(key)
             if val is None:
@@ -296,8 +354,6 @@ class Allowlist:
 
         return _AllowRule(
             operation=op,
-            path_glob=raw.get("path_glob"),
-            branch_glob=_tuple("branch_glob"),
             source_glob=_tuple("source_glob"),
             target_glob=_tuple("target_glob"),
             force=raw.get("force"),
@@ -351,34 +407,18 @@ class Allowlist:
     def _constraints_pass(self, rule: _AllowRule, action: ClassifiedAction) -> tuple[bool, str]:
         """Check one allow rule's constraints against an action."""
         op = action.operation.value
-        if rule.path_glob is not None:
-            if action.path is None:
-                return False, f"{op}: no path to check against {rule.path_glob!r}"
-            if not _match_path_glob(rule.path_glob, action.path, self._repo_root):
-                return (
-                    False,
-                    f"{op}: path {action.path!r} is outside the allowed "
-                    f"glob {rule.path_glob!r} (fs.write is <repo>/** only)",
-                )
         if rule.force is False and action.force:
             return False, f"{op}: force flag is not allowed (Tier C force_push)"
-        if rule.branch_glob and not _branch_matches(action.branch, rule.branch_glob):
-            # A None branch (could not be parsed) is allowed here: the classifier
-            # upstream emits the explicit forbidden Operation for a main target.
-            # An *explicitly named* branch outside the glob is denied.
-            if action.branch is None:
-                return True, ""
-            return False, f"{op}: branch {action.branch!r} is outside {list(rule.branch_glob)}"
         if (
             rule.source_glob
             and action.source is not None
-            and not _branch_matches(action.source, rule.source_glob)
+            and not _glob_matches(action.source, rule.source_glob)
         ):
             return False, f"{op}: source {action.source!r} is outside {list(rule.source_glob)}"
         if (
             rule.target_glob
             and action.target is not None
-            and not _branch_matches(action.target, rule.target_glob)
+            and not _glob_matches(action.target, rule.target_glob)
         ):
             return False, f"{op}: target {action.target!r} is outside {list(rule.target_glob)}"
         return True, ""

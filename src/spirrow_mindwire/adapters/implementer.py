@@ -21,28 +21,64 @@ directly: it requires an explicit ``inference_base_url`` (or
 and **refuses to spawn** if none is configured (no silent fallback to the
 default endpoint).
 
-Enforcement scope (mirrors :mod:`spirrow_mindwire.allowlist`): the hard
-guarantee is that four Tier C operations are denied unconditionally
-(``git.merge_to_main`` / ``fs.delete`` / ``drive.write`` / ``external.publish``),
-and that ``force_push`` / ``history_rewrite`` are denied on any branch outside
-``feature/*`` / ``develop`` (branch-scoped Tier A since 2026-08-15,
-T-branch-scoped-implementer-permissions). The guard resolves the *effective*
-branch from ``.git/HEAD`` (so a bare ``git push`` / ``git commit`` /
-``git merge`` / ``git rebase`` / ``git reset --hard`` while on ``main`` is
-denied, and an undeterminable branch fails closed → ``UNKNOWN`` → deny).
-Shell *indirection* (``bash -c`` / ``eval`` / ``$(...)`` / backticks)
-hides the inner command from tokenization, so the inner
-command is extracted and re-classified through the **same** structural classifier
-(a wrapped Tier C command is judged identically to its direct form — T27), with a
-coarse keyword scan as a defence-in-depth floor for input that defeats the
-tokenizer. Both remain best-effort over a single command — defence-in-depth, not
-the only line. The blast-radius
-backstops are: (1) the **environment** (Tailscale ACL + egress default-deny +
-scoped token, ADR-07 §2.4 / env spec); and (2) **Takahito's manual merge** — the
-Tier C human pre-GO is the authoritative guard that changes never reach ``main``
-(GitHub main branch protection is a *planned* hardening, env spec §7, deferred on
-the current plan). The loop-level push-to-main / merge-to-main denials here
-reduce noise but do not solely carry that guarantee.
+Enforcement scope (mirrors :mod:`spirrow_mindwire.allowlist`): the sole hard
+guarantee is that ``git.merge_to_main`` is denied unconditionally — the
+classifier routes ``gh pr merge`` / MCP ``merge_pull_request`` here from a
+name match alone (no HEAD read, no base inspection), so the guarantee holds
+regardless of any branch predicate. Every other invariant lives outside this
+classifier — see the :mod:`spirrow_mindwire.allowlist` module docstring for the
+map of what moved where.
+
+The 2026-08-19 simplification (T-drop-branch-prediction-from-allowlist,
+Tier-C decide msg-1272) removed three classes of machinery from this file:
+
+* **branch prediction** — every predicate that used to answer "which branch
+  would this operation touch?": ``_current_branch`` / ``_push_destination`` /
+  ``_enrich`` / ``_rebase_target`` / ``_branch_target`` / ``_may_switch_branch``
+  / the chain-guard / the "checkout-main + merge" classifier special-case are
+  all gone. The invariant "no push / force-push / ref-deletion reaches ``main``"
+  moved to the **GitHub server** (org ruleset ``guard-default-branch``
+  id=21017016 active across the 21 SpirrowGames repos,
+  ``current_user_can_bypass=never`` for the loop identity) + the
+  **composition-root preflight** in :mod:`spirrow_mindwire.loop_runner`
+  (``_preflight_gate`` — P0 daemon-checkout separation, P1 server-rule check,
+  P2 every remote's URL is under ``https://github.com/SpirrowGames/``).
+
+* **``fs.delete`` classification** — the ``_DELETE_CMDS`` scan, the
+  ``FS_DELETE`` raw-coarse pattern, the MCP ``"delete"`` name match. Reason:
+  ``exec.code`` is unconstrained, so ``python -c "shutil.rmtree(...)"`` was
+  always a way around the classifier's ``fs.delete`` deny — the check was
+  theatre and it stopped three threads in one day (msg-1272 §1). The real
+  containment is git history + the sandbox filesystem.
+
+* **``external.publish`` classification** — the ``_PUBLISH_PATTERNS`` scan and
+  the ``gh release`` / ``gh repo delete|archive`` routing in ``_classify_gh``.
+  Reason: squid egress default-deny already rejects
+  ``example.com`` / ``hooks.slack.com`` / ``api.telegram.org`` / ``discord.com``
+  at CONNECT; only ``api.github.com`` passes. The classifier duplicated a
+  stronger boundary. **``drive.write``** went with it (the MCP name match) —
+  ``setting_sources=[]`` + ``strict_mcp_config=True`` + no Drive credentials on
+  this host means it was unreachable, and unreachable rules skew judgement.
+
+The classifier here still names ``FORCE_PUSH`` / ``HISTORY_REWRITE`` /
+``GIT_MERGE`` etc. as OPERATIONS for provenance (a denial record still says
+which verb ran) — but it no longer computes the branch, and it no longer
+carries three ex-Tier-C names that the enum itself no longer defines.
+Confirming a precondition is 1 API call; predicting the branch of a bare push
+under an inline config override and a retargeted upstream is a research
+question.
+
+Shell *indirection* (``bash -c`` / ``eval`` / ``$(...)`` / backticks) hides
+the inner command from tokenization, so the inner command is extracted and
+re-classified through the **same** structural classifier (a wrapped Tier C
+command is judged identically to its direct form — T27), with a coarse
+keyword scan as a defence-in-depth floor for input that defeats the tokenizer.
+Both remain best-effort over a single command — defence-in-depth, not the only
+line. The blast-radius backstops are: (1) the **environment** (Tailscale ACL
++ egress default-deny + scoped token, ADR-07 §2.4 / env spec); (2) the
+composition-root preflight (P0/P1/P2 above); and (3) **Takahito's manual
+merge** — Tier C human pre-GO is the authoritative guard that promotions
+never reach ``main``.
 """
 
 from __future__ import annotations
@@ -51,7 +87,6 @@ import asyncio
 import os
 import re
 import shlex
-import subprocess
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -226,17 +261,13 @@ class ImplementerSdkHealthError(AdapterHealthError):
 # this split is the compound-command catch.
 _BASH_SEP = re.compile(r"&&|\|\||;|\||\n")
 
-_DELETE_CMDS = {"rm", "rmdir", "unlink", "shred", "del", "erase"}
-_PUBLISH_PATTERNS = (
-    ("npm", "publish"),
-    ("yarn", "publish"),
-    ("pnpm", "publish"),
-    ("twine", "upload"),
-    ("poetry", "publish"),
-    ("cargo", "publish"),
-    ("gem", "push"),
-    ("docker", "push"),
-)
+# `_DELETE_CMDS` / `_PUBLISH_PATTERNS` (rm|rmdir|shred|unlink|Remove-Item and
+# npm|yarn|pnpm|poetry|cargo publish, twine upload, gem push, docker push) were
+# deleted on 2026-08-19 (T-drop-branch-prediction-from-allowlist §3, msg-1272 §1):
+# `fs.delete` is retired because `exec.code` bypassed it, and `external.publish`
+# is retired because squid default-deny already stops the destinations that
+# mattered. See the module docstring.
+
 # Leading no-arg launchers that wrap the real command (skip to classify the inner
 # one) — used by _strip_prefixes for the DIRECT path (e.g. `exec rm -rf x`).
 _CMD_PREFIXES = {
@@ -337,210 +368,25 @@ def _push_target_and_force(args: list[str]) -> tuple[str | None, bool]:
     return dest, force
 
 
-class _Undecidable:
-    """Sentinel type: this command rewrites something, and we cannot say what."""
-
-
-_UNDECIDABLE = _Undecidable()
-
-#: ``git rebase`` flags that take no value. Anything outside this set — including
-#: every value-taking flag — makes the positional count untrustworthy, because an
-#: unconsumed value looks exactly like a branch name. ``--onto`` is handled
-#: separately since its value must be consumed to count the rest correctly.
-_REBASE_NO_VALUE_FLAGS: frozenset[str] = frozenset(
-    {
-        "-i",
-        "--interactive",
-        "--continue",
-        "--abort",
-        "--skip",
-        "--quit",
-        "--autostash",
-        "--no-autostash",
-        "--autosquash",
-        "--no-autosquash",
-        "--fork-point",
-        "--no-fork-point",
-        "--keep-empty",
-        "--no-keep-empty",
-        "--rebase-merges",
-        "--no-verify",
-        "--verify",
-        "--committer-date-is-author-date",
-        "--ignore-date",
-        "--force-rebase",
-        "-f",
-        "-q",
-        "--quiet",
-        "-v",
-        "--verbose",
-        "-n",
-        "--no-stat",
-        "--stat",
-    }
-)
-
-
-def _rebase_target(args: list[str]) -> str | None | _Undecidable:
-    """Which branch does this ``git rebase`` rewrite?
-
-    ``None`` means HEAD, and the guard's enrichment resolves it. A string is an
-    explicitly named branch. :data:`_UNDECIDABLE` means refuse.
-
-    This exists because ``git rebase <upstream> <branch>`` **checks out and
-    rewrites <branch>**, whatever is currently checked out. Measured: on
-    ``feature/x``, ``git rebase develop main`` moved ``main`` and left HEAD on
-    it. Reading every rebase as "targets HEAD" and filling the current branch in
-    therefore let a rewrite of ``main`` borrow ``feature/x``'s permission — the
-    bypass Tier B found on PR #158.
-
-    The refusal is deliberately broad. An unrecognised flag is refused rather
-    than skipped, because a value-taking flag whose value is not consumed looks
-    like a positional: ``git rebase --exec make develop`` would read as two
-    positionals and name ``develop`` as the target while the real target is
-    HEAD, which is fail-OPEN when HEAD is ``main``. Recognising less costs a
-    denial the implementer can work around by writing the simple form; guessing
-    costs ``main``.
-    """
-    positionals: list[str] = []
-    options_done = False
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if options_done:
-            # git stops parsing options at `--`; everything after it is a
-            # positional even when it starts with a dash. Skipping `--` without
-            # latching that put this parser out of step with git — the desync
-            # Tier B found on PR #158 round 2. Measured, the two shapes it named
-            # (`git rebase -- -i main`, `git rebase -- --onto main`) are refused
-            # by git itself with `fatal: invalid upstream`, so neither rewrote
-            # anything; `git rebase -- develop main` DID rewrite `main`, and was
-            # already denied here. The latch is kept anyway: agreeing with git is
-            # cheaper to hold than an argument about which of its errors save us.
-            positionals.append(arg)
-            index += 1
-            continue
-        if arg == "--":
-            options_done = True
-            index += 1
-            continue
-        if arg == "--onto":
-            index += 2  # its value is a commit-ish, not the rewritten branch
-            continue
-        if arg.startswith("-") and len(arg) > 1:
-            if arg not in _REBASE_NO_VALUE_FLAGS:
-                return _UNDECIDABLE
-            index += 1
-            continue
-        # A bare `-` is git's shorthand for the previous branch, so it is a
-        # positional. Measured: `git rebase -` rebases the current branch and
-        # succeeds; refusing it was a denial with nothing behind it.
-        positionals.append(arg)
-        index += 1
-
-    if len(positionals) <= 1:
-        # `git rebase`, `git rebase --continue`, `git rebase <upstream>`: the
-        # rewritten branch is the checked-out one.
-        return None
-    if len(positionals) == 2:
-        # `git rebase <upstream> <branch>` — the second is checked out and
-        # rewritten.
-        return positionals[1]
-    return _UNDECIDABLE
-
-
-#: ``git branch`` flags that move or destroy a ref. Every one of these was
-#: measured against ``main`` from a feature branch, and every one of them landed:
-#: ``-f main HEAD`` moved it, ``-M main`` clobbered it, ``-D main`` deleted it,
-#: ``-m main renamed`` deleted it, ``-C feature/x main`` clobbered it.
-_BRANCH_DELETE_FLAGS: frozenset[str] = frozenset({"-d", "-D", "--delete"})
-_BRANCH_FORCE_FLAGS: frozenset[str] = frozenset({"-f", "--force"})
-#: Rename and copy name TWO branches and it is the SECOND that gets clobbered,
-#: which one ``branch`` field cannot express. Refused rather than half-checked.
-_BRANCH_MOVE_FLAGS: frozenset[str] = frozenset({"-m", "-M", "--move", "-c", "-C", "--copy"})
-#: The only flags that may keep company with a destructive one. Anything else
-#: takes a value we would have to model, and an unmodelled value looks like a
-#: branch name — the same trap ``_rebase_target`` refuses.
-_BRANCH_COMPANION_FLAGS: frozenset[str] = (
-    _BRANCH_DELETE_FLAGS | _BRANCH_FORCE_FLAGS | frozenset({"-q", "--quiet"})
-)
-
-
-def _branch_flags_and_positionals(args: list[str]) -> tuple[list[str], list[str]]:
-    """Split ``git branch`` arguments the way git's own option parser does.
-
-    Bundled short options are decomposed: measured, ``git branch -vD main`` and
-    ``git branch -Dv main`` both delete ``main``, so a bundle has to be read as
-    its letters or a destructive one hides inside an innocent-looking token.
-    Everything after ``--`` is a positional, dashes included.
-    """
-    flags: list[str] = []
-    positionals: list[str] = []
-    options_done = False
-    for arg in args:
-        if options_done:
-            positionals.append(arg)
-            continue
-        if arg == "--":
-            options_done = True
-            continue
-        if arg.startswith("--"):
-            flags.append(arg)
-            continue
-        if arg.startswith("-") and len(arg) > 1:
-            flags.extend("-" + letter for letter in arg[1:])
-            continue
-        positionals.append(arg)
-    return flags, positionals
-
-
-def _branch_target(args: list[str]) -> str | None | _Undecidable:
-    """Which branch does this ``git branch`` move or destroy?
-
-    ``None`` means it is not a destructive form at all (listing, creating,
-    configuring) and the caller should leave it as ordinary code execution.
-    A string is the ref that moves or disappears. :data:`_UNDECIDABLE` means
-    refuse.
-
-    ``git branch -f main <commit>`` sets ``main`` to an arbitrary commit, which
-    is a history rewrite by another spelling — and until this landed it
-    classified as ``exec.code`` and ran at Tier A. That is pre-existing rather
-    than introduced by the branch-glob widening, but it makes this PR's promise
-    ("history rewrites are denied on ``main``") false as written, so it is fixed
-    here rather than carried.
-
-    **What this command is has to be decided over the WHOLE argument list before
-    any of it is interpreted.** An earlier version decided while walking, so an
-    unrecognised flag standing before the destructive one — ``git branch -v -D
-    main`` — was met while ``delete`` was still false, read as "harmless
-    listing", and returned ``None``. Measured: the guard ALLOWED it and git
-    deleted ``main``. git does not require the destructive flag to come first,
-    so neither may this. (Tier B, PR #158 round 4, which also named the reason
-    the tests missed it: they all put the destructive flag first.)
-    """
-    flags, positionals = _branch_flags_and_positionals(args)
-
-    if any(flag in _BRANCH_MOVE_FLAGS for flag in flags):
-        # Rename and copy name two branches and it is the SECOND that gets
-        # clobbered, which one ``branch`` field cannot express.
-        return _UNDECIDABLE
-    delete = any(flag in _BRANCH_DELETE_FLAGS for flag in flags)
-    force = any(flag in _BRANCH_FORCE_FLAGS for flag in flags)
-    if not (delete or force):
-        return None
-    if any(flag not in _BRANCH_COMPANION_FLAGS for flag in flags):
-        # Something destructive is present AND something we cannot account for.
-        # An unmodelled flag may take a value, and an unconsumed value looks
-        # exactly like a branch name — the trap ``_rebase_target`` refuses too.
-        return _UNDECIDABLE
-    if delete:
-        # `-D a b` deletes both, and only one of them fits in `branch`.
-        return positionals[0] if len(positionals) == 1 else _UNDECIDABLE
-    # `-f <branch> [<start-point>]` — the first name is the ref that moves.
-    return positionals[0] if 1 <= len(positionals) <= 2 else _UNDECIDABLE
-
-
 def _classify_git(tokens: list[str]) -> ClassifiedAction:
+    """Map a ``git`` subcommand to its allow-list :class:`Operation`.
+
+    Six subcommands produce a Tier-A / Tier-C operation, the rest fall through
+    to ``EXEC_CODE``. Since the 2026-08-19 simplification the classifier no
+    longer computes WHICH branch each of these would touch — ``branch_glob``
+    was removed from the allow-list at the same time, and the "does not touch
+    ``main``" guarantee lives at the GitHub server + composition-root
+    preflight, not on a local predicate. So a rebase / bare ``git reset --hard``
+    / ``git branch -D main`` classifies to the operation it IS (informational,
+    for provenance in denial records) without any attempt to guess the target;
+    all four are Tier A everywhere the preflight P1 passes.
+
+    ``filter-branch`` / ``filter-repo`` stay UNKNOWN — not because they might
+    rewrite ``main`` (a rewrite of ``main`` cannot be pushed anyway, per P1),
+    but because their argument shape (rev-list expressions) is not one this
+    classifier reads at all. UNKNOWN → default-deny keeps the pre-existing
+    behaviour without inventing an argument parser for two rare subcommands.
+    """
     sub, args = _git_subcommand(tokens)
     detail = " ".join(tokens)
     if sub == "push":
@@ -555,22 +401,9 @@ def _classify_git(tokens: list[str]) -> ClassifiedAction:
         source = positional[0] if positional else None
         return ClassifiedAction(Operation.GIT_MERGE, source=source, detail=detail)
     if sub == "rebase":
-        target = _rebase_target(args)
-        if isinstance(target, _Undecidable):
-            return ClassifiedAction(Operation.UNKNOWN, detail=detail)
-        return ClassifiedAction(Operation.HISTORY_REWRITE, branch=target, detail=detail)
+        return ClassifiedAction(Operation.HISTORY_REWRITE, detail=detail)
     if sub in ("filter-branch", "filter-repo"):
-        # Left where it was: these take rev-list arguments, so any of them can
-        # name a branch, and they are rare enough that recognising their shapes
-        # would be cost without a caller. UNKNOWN → default-deny, i.e. exactly
-        # the Tier C denial they had before this widening.
         return ClassifiedAction(Operation.UNKNOWN, detail=detail)
-    if sub == "branch":
-        target = _branch_target(args)
-        if isinstance(target, _Undecidable):
-            return ClassifiedAction(Operation.UNKNOWN, detail=detail)
-        if target is not None:
-            return ClassifiedAction(Operation.HISTORY_REWRITE, branch=target, detail=detail)
     if sub == "reset" and "--hard" in args:
         return ClassifiedAction(Operation.HISTORY_REWRITE, detail=detail)
     # Other git subcommands (status/log/diff/add/checkout/switch/fetch/pull/
@@ -584,20 +417,24 @@ def _classify_gh(tokens: list[str]) -> ClassifiedAction:
     group = rest[0] if rest else None
     sub = rest[1] if len(rest) > 1 else None
     if group == "pr" and sub == "merge":
-        # The implementer never merges PRs (develop merges are local self-review;
-        # main is Takahito/Tier C). A PR merge is a canonical promotion.
+        # The implementer never merges PRs — Tier C stays, and it stays on a name
+        # match alone (base is not read, HEAD is not read). This is the sole
+        # remaining classifier-executed Tier-C guarantee after the 2026-08-19
+        # simplification. The GitHub org ruleset covers pushes (not the merge API)
+        # and covers SpirrowGames repos (not org-external ones), so a name-match
+        # deny here is the only line that covers `gh pr merge` for a repo where
+        # the loop was somehow pointed off-org.
         return ClassifiedAction(Operation.GIT_MERGE_TO_MAIN, detail=detail)
     if group == "pr" and sub in ("create", "new"):
         base = _flag_value(tokens, "--base") or _flag_value(tokens, "-B")
         return ClassifiedAction(Operation.GITHUB_PR_OPEN, target=base, detail=detail)
-    if group == "release" or (group == "repo" and sub in ("delete", "archive")):
-        # `gh release` is treated as publish for ALL subcommands — including reads
-        # (list/view/download). Deliberate over-deny on the safe side; the
-        # _RAW_FORBIDDEN indirection pattern mirrors it so direct == wrapped (T23).
-        return ClassifiedAction(Operation.EXTERNAL_PUBLISH, detail=detail)
+    # `gh release` / `gh repo delete|archive` used to route to EXTERNAL_PUBLISH.
+    # Both branches were removed on 2026-08-19 (T-drop-branch-prediction-from-allowlist
+    # §3): squid egress default-deny and GitHub's own permissions execute the
+    # real invariants. See the module docstring.
     if group == "api" and _gh_api_is_mutation(tokens):
         # A mutating `gh api` (-X/--method write verb, or field flags that make gh
-        # default to POST) bypasses the gh pr/release checks above — e.g.
+        # default to POST) bypasses the gh pr checks above — e.g.
         # `gh api repos/o/r/merges -X PUT` or `... -f base=main`. Legit implementer
         # mutations go via `gh pr create` / MCP create_pull_request, so any raw
         # mutating gh api is UNKNOWN → default-deny (T23). A read (GET / no fields)
@@ -811,11 +648,14 @@ def _classify_single_bash(cmd: str, _depth: int = 0) -> ClassifiedAction:
         return ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
     head = tokens[0]
     base = os.path.basename(head)
-    if base in _DELETE_CMDS or "-delete" in tokens or base == "Remove-Item":
-        return ClassifiedAction(Operation.FS_DELETE, detail=cmd)
-    for prog, sub in _PUBLISH_PATTERNS:
-        if base == prog and sub in tokens:
-            return ClassifiedAction(Operation.EXTERNAL_PUBLISH, detail=cmd)
+    # `rm|rmdir|shred|unlink|Remove-Item|find -delete` and `<pkgmgr> publish` /
+    # `<pkgmgr> push` used to route to FS_DELETE / EXTERNAL_PUBLISH here. Both
+    # branches were removed on 2026-08-19 (T-drop-branch-prediction-from-allowlist
+    # §3, msg-1272 §1) — `exec.code` was always a way around the delete check,
+    # and squid egress default-deny is the actual boundary for publish. Falling
+    # through to EXEC_CODE (Tier A) reflects what the classifier really has to
+    # say now: "this is code executing", not "this is dangerous". See the module
+    # docstring.
     if base == "git":
         return _classify_git(tokens)
     if base == "gh":
@@ -851,21 +691,19 @@ _INDIRECTION_RE = re.compile(
 # ANSI-C `$'gh api ... -XPUT'`) is caught by NEITHER the recursion nor this floor —
 # that residue is out of scope (environment containment + human merge carry it),
 # unlike rm / force-push / publish, which the floor still catches in the raw text.
+# FS_DELETE / EXTERNAL_PUBLISH raw patterns were removed on 2026-08-19
+# (T-drop-branch-prediction-from-allowlist §3): the operations themselves are
+# gone from the enum. The FORCE_PUSH / HISTORY_REWRITE patterns stay because
+# both operations still classify explicitly for provenance (their allow-list
+# rules are unconstrained Tier A now, so the floor's function here is to keep a
+# denial record naming the correct verb rather than to change an allow/deny).
 _RAW_COARSE: tuple[tuple[re.Pattern[str], Operation], ...] = (
-    (re.compile(r"\b(?:rm|rmdir|shred|unlink)\b|-delete\b|\bRemove-Item\b"), Operation.FS_DELETE),
     (
         re.compile(r"\bgit\b.*\bpush\b.*(?:--force\b|--force-with-lease\b|\s-f\b)"),
         Operation.FORCE_PUSH,
     ),
     (re.compile(r"\bgit\b.*\b(?:rebase|filter-branch|filter-repo)\b"), Operation.HISTORY_REWRITE),
     (re.compile(r"\bgit\b.*\breset\b.*--hard\b"), Operation.HISTORY_REWRITE),
-    (
-        re.compile(
-            r"\b(?:npm|yarn|pnpm|poetry|cargo)\s+publish\b"
-            r"|\btwine\s+upload\b|\bgem\s+push\b|\bdocker\s+push\b|\bgh\b.*\brelease\b"
-        ),
-        Operation.EXTERNAL_PUBLISH,
-    ),
 )
 
 
@@ -1307,13 +1145,17 @@ def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
 
 
 # Ranking so a compound command is judged by its most dangerous sub-command.
+# FS_DELETE / DRIVE_WRITE / EXTERNAL_PUBLISH were removed from the enum on
+# 2026-08-19 (T-drop-branch-prediction-from-allowlist §3), so they are gone
+# from this table too. FORCE_PUSH / HISTORY_REWRITE stay at rank 100 for a
+# different reason than before: both are Tier A now, not Tier C, but ranking
+# still picks the more surprising verb when two coexist in one compound so the
+# denial record and log line report the eye-catching one (`force_push …`
+# rather than `git.commit … && force_push …`).
 _DANGER_RANK: dict[Operation, int] = {
     Operation.GIT_MERGE_TO_MAIN: 100,
     Operation.FORCE_PUSH: 100,
     Operation.HISTORY_REWRITE: 100,
-    Operation.FS_DELETE: 100,
-    Operation.DRIVE_WRITE: 100,
-    Operation.EXTERNAL_PUBLISH: 100,
     Operation.UNKNOWN: 90,
     Operation.GIT_PUSH: 50,
     Operation.GIT_MERGE: 50,
@@ -1327,159 +1169,27 @@ _DANGER_RANK: dict[Operation, int] = {
 }
 
 
-#: ``git`` subcommands that change which branch is checked out, or where a bare
-#: push goes. This is a DENYLIST, and that direction is a deliberate retreat
-#: from the stricter rule tried first — see :func:`_may_switch_branch`.
-_BRANCH_UPSTREAM_FLAGS: frozenset[str] = frozenset({"-u", "--set-upstream-to", "--track"})
-
-
-def _borrows_ambient_head(action: ClassifiedAction) -> bool:
-    """Does this action's target come from the checkout rather than its own words?
-
-    Two questions were being answered by one tuple, and they are not the same
-    question (Tier B, PR #158 round 9):
-
-    * which operations need ``branch`` filled from HEAD — :data:`_HEAD_ENRICHED_OPERATIONS`;
-    * which operations *borrow* the ambient checkout and therefore cannot trust
-      it across a chain — this.
-
-    ``git merge`` belongs to the second and not the first: it is bounded by
-    ``source_glob`` / ``target_glob`` and takes its destination from HEAD through
-    ``target``. Leaving it out of the chain check meant a merge could be pointed
-    somewhere else first. ``git checkout main && git merge feature/x`` was
-    already caught, but only because a regex looks for the literal word — and
-    measured, ``git checkout -`` lands on ``main`` just as well:
-
-        git checkout - && git merge feature/x    -> ALLOWED, merged into main
-    """
-    if action.operation is Operation.GIT_MERGE:
-        return action.target is None
-    return action.operation in _HEAD_ENRICHED_OPERATIONS and action.branch is None
-
-
-#: Subcommands that move HEAD or change where a bare push lands, matched on the
-#: parsed subcommand so git's global flags cannot hide them.
-_BRANCH_MOVING_GIT_SUBCOMMANDS: frozenset[str] = frozenset(
-    {"checkout", "switch", "symbolic-ref", "update-ref", "config"}
-)
-
-
-#: Text meaning a later step may no longer trust the checkout.
-_SWITCHES_BRANCH_RE = re.compile(
-    r"\bgit\s+(?:checkout|switch)\b"  # moves HEAD elsewhere
-    r"|\bgit\s+(?:symbolic-ref|update-ref)\b"
-    r"|\bgit\s+config\b"  # can set push.default
-    r"|\bgit\s+branch\b[^\n]*(?:\s-u\b|--set-upstream-to|--track)"
-)
-
-
-def _may_switch_branch(action: ClassifiedAction) -> bool:
-    """Could this step change what a later HEAD-enriched operation targets?
-
-    Recognises ``git checkout`` / ``git switch``, ``git config`` (it can set
-    ``push.default``), ``git branch -u`` / ``--set-upstream-to`` / ``--track``,
-    and a rebase that names a branch, because that checks the named branch out.
-
-    **This is a denylist, and a denylist here is fail-OPEN for anything it does
-    not name** — ``make deploy && git push`` can still check out ``main`` inside
-    the Makefile and this will not see it.
-
-    A stricter rule was written first and measured: refusing any chain whose
-    other steps were not provably branch-preserving. It failed 33 tests, because
-    the classifier splits a heredoc's body and terminator into separate
-    "actions", so every ``git commit -F - <<'EOF' … EOF`` the loop writes counts
-    as a chain and was refused. A gate that stops the loop's most common command
-    is not a gate that ships.
-
-    So the strict rule is kept exactly where it costs nothing —
-    :data:`Operation.HISTORY_REWRITE` and :data:`Operation.FORCE_PUSH`, neither
-    of which carries a heredoc — and commit/push get this weaker one. The
-    residual is stated rather than hidden: it is the same exposure ``git commit``
-    and ``git push`` have carried since they were first branch-scoped, and this
-    PR neither widens nor closes it.
-    """
-    if action.operation is Operation.HISTORY_REWRITE:
-        # A rebase that NAMES a branch checks that branch out first (measured,
-        # PR #158 round 1).
-        return action.branch is not None
-    if action.operation is not Operation.EXEC_CODE:
-        return False
-    # Split on whitespace, NOT with shlex. ``detail`` is already the classifier's
-    # token list rejoined with spaces, so its quotes are gone: `git add
-    # "don't.txt"` arrives as `git add don't.txt`, and shlex then refuses the
-    # unbalanced apostrophe. That refusal used to mean "assume the worst" and
-    # denied the `git commit` chained after it — measured, a denial with nothing
-    # behind it. Re-parsing a string that was already parsed only reintroduces
-    # quoting bugs; the two leading words are all this needs, and a token
-    # containing a space can be neither `git` nor a subcommand.
-    # Matched against the text rather than parsed tokens. The splitter cuts on
-    # `&&` with no regard for quoting, so
-    # `eval "git checkout main && git push --force origin feature/x" && git push`
-    # arrives as the fragment `eval "git checkout main` — first token `eval`,
-    # quoting shlex refuses, checkout invisible. Reading fragments as tokens is
-    # what let that through (Tier B, PR #158 round 15); a pattern over the text
-    # does not care where the fragment was cut.
-    if _SWITCHES_BRANCH_RE.search(action.detail) is not None:
-        return True
-    # The pattern above anchors the subcommand to `git`, deliberately: widening
-    # it to "anywhere after git" would match `git commit -m "checkout main"` and
-    # deny an ordinary chained commit. But git takes GLOBAL flags before the
-    # subcommand — `git -C . checkout main`, `git -c core.autocrlf=false
-    # checkout main`, `git --no-pager checkout main` — and all three were
-    # measured ALLOWED beside a merge or a push. (Tier B, PR #158 round 22.)
-    #
-    # So the tokens answer that, since `_git_subcommand` already walks past the
-    # global flags and still reports `commit` for the commit-message case. The
-    # pattern stays for fragments the tokenizer cannot read at all.
-    try:
-        tokens = shlex.split(action.detail, posix=True)
-    except ValueError:
-        tokens = action.detail.split()
-    if not tokens or tokens[0] != "git":
-        return False
-    sub, args = _git_subcommand(tokens)
-    if sub in _BRANCH_MOVING_GIT_SUBCOMMANDS:
-        return True
-    return sub == "branch" and any(arg in _BRANCH_UPSTREAM_FLAGS for arg in args)
-
-
-def _chain_guarded(actions: list[ClassifiedAction], command: str) -> list[ClassifiedAction]:
-    """Refuse EVERY step whose target the rest of the chain could have moved.
-
-    The guard reads `.git/HEAD` when the tool call arrives; the shell runs
-    afterwards. A step that takes its target from the checkout is therefore only
-    as trustworthy as the steps beside it.
-
-    Applied per action rather than to the ranked winner, because ranking is
-    about reporting: a step that names its own target outranks one that does not
-    and then shields it. Measured on `feature/x` (Tier B, PR #158 round 13)::
-
-        git push --force origin feature/x && git checkout main && git reset --hard HEAD~1
-
-    The force-push names `feature/x`, so it does not borrow HEAD and the check
-    was skipped — while the bare `git reset --hard` beside it enriched to
-    `feature/x` and was ALLOWED.
-
-    The two operations this PR widens are refused whenever they are not alone;
-    `git commit` / `git push` / `git merge` are refused only beside a step that
-    :func:`_may_switch_branch` recognises. That split is about cost, not
-    principle — see the note there.
-    """
-    if len(actions) <= 1:
-        return actions
-    guarded: list[ClassifiedAction] = []
-    for action in actions:
-        if _borrows_ambient_head(action):
-            widened_here = action.operation in (
-                Operation.HISTORY_REWRITE,
-                Operation.FORCE_PUSH,
-            )
-            others = [other for other in actions if other is not action]
-            if widened_here or any(_may_switch_branch(other) for other in others):
-                guarded.append(ClassifiedAction(Operation.UNKNOWN, detail=command))
-                continue
-        guarded.append(action)
-    return guarded
+# Prediction machinery removed 2026-08-19 (T-drop-branch-prediction-from-allowlist):
+# `_borrows_ambient_head` / `_may_switch_branch` / `_chain_guarded` /
+# `_SWITCHES_BRANCH_RE` / `_BRANCH_MOVING_GIT_SUBCOMMANDS` / `_BRANCH_UPSTREAM_FLAGS`
+# all existed to answer "given a chained command whose steps take their target
+# from the ambient HEAD, which branch would each step ACTUALLY touch when the
+# shell runs afterwards?" That prediction problem took 26 rounds of Tier-B review
+# on PR #158 to get approximately right — because it is genuinely hard: an
+# earlier step can change HEAD via `checkout`, `switch`, `symbolic-ref`,
+# `update-ref`, `git config push.default`, `git branch -u`, or by running any
+# Makefile / script that does one of those. The chain-guard was the accumulated
+# defence, and every round added another spelling.
+#
+# The 2026-08-19 simplification moves the guarantee to the two places prediction
+# does not need to reach: the GitHub server rejects a push to `main` regardless
+# of local branch state (org ruleset `guard-default-branch`, id=21017016), and
+# the composition-root preflight (loop_runner._preflight_gate) refuses to spawn
+# a session against a repo where that server-side protection is not in place.
+# So a local `git checkout main && git reset --hard` is now allowed at this
+# layer — it burns the captive clone's `main`, which reflog / next sync
+# restores, and the push to `main` that would export the damage is server-side
+# rejected.
 
 
 def _coarse_action(command: str, _depth: int = 0) -> ClassifiedAction | None:
@@ -1525,12 +1235,6 @@ def _coarse_action(command: str, _depth: int = 0) -> ClassifiedAction | None:
         coarse = _scan_raw_coarse(part)
         if coarse is None:
             continue
-        if _borrows_ambient_head(coarse):
-            # A regex over an opaque string can name the verb but never the
-            # branch, and `_enrich` would fill that None with whatever is
-            # checked out. UNKNOWN keeps the denial and drops the branch that
-            # was never known.
-            coarse = ClassifiedAction(Operation.UNKNOWN, detail=coarse.detail)
         # Report the command that ran, not the fragment the floor read.
         return replace(coarse, detail=command)
     return None
@@ -1560,13 +1264,7 @@ def _bash_actions(command: str, _depth: int = 0) -> list[ClassifiedAction]:
     parts = [p.strip() for p in _BASH_SEP.split(scanned) if p.strip()]
     if not parts:
         return [ClassifiedAction(Operation.EXEC_CODE, detail=command)]
-    # The chain check asks "could a SIBLING step have moved the checkout before
-    # this one ran", so it belongs to one shell level. A wrapped command and its
-    # contents are the same step, not two — counting them as siblings refused
-    # `eval "git push --force"` while the bare form was allowed, breaking T27's
-    # direct == wrapped. So each level guards its own parts, and the deeper
-    # levels arrive already guarded by their own recursion.
-    level = _chain_guarded([_classify_single_bash(p, _depth) for p in parts], command)
+    level = [_classify_single_bash(p, _depth) for p in parts]
 
     # `_classify_single_bash` reduces a wrapped command to the more dangerous of
     # wrapper vs inner, and `_classify_bash` reduces a list to one ranked winner.
@@ -1584,26 +1282,7 @@ def _bash_actions(command: str, _depth: int = 0) -> list[ClassifiedAction]:
             nested += _bash_actions(inner, _depth + 1)
     for inner in _extract_substitutions(scanned):
         nested += _bash_actions(inner, _depth + 1)
-    everything = level + nested
-    # A checkout writes `.git/HEAD` on disk, so it reaches every later step in
-    # the same command — including from inside `bash -c`, and including steps at
-    # other levels. So this question is asked once over the whole command, after
-    # flattening, while the per-level rule above stays per level because a
-    # wrapped command and its contents are one step (T27).
-    #
-    # Asking it of a sibling's summary instead was the round-15 bypass:
-    # `bash -c "git checkout main" && git push` summarised the first part as
-    # `exec.code` whose first token is `bash`, so nothing looked like a switch
-    # and the push borrowed `feature/x` — measured ALLOWED, and it pushes to
-    # `main`.
-    if any(_may_switch_branch(action) for action in everything):
-        everything = [
-            ClassifiedAction(Operation.UNKNOWN, detail=command)
-            if _borrows_ambient_head(action)
-            else action
-            for action in everything
-        ]
-    return everything
+    return level + nested
 
 
 def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
@@ -1612,13 +1291,18 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     Indirection (``bash -c`` / ``eval`` / ``$(...)`` / backticks) is unwound by
     extracting the inner command and recursing through the *same* classifier, so a
     wrapped Tier C command is judged identically to its direct form (T27: direct ==
-    wrapped, one source of truth — no regex mirror to drift out of sync). A
-    one-liner that checks out main then merges (``git checkout main && git merge
-    develop``) is surfaced as ``git.merge_to_main``; cross-tool-call sequences are
-    backed by the push-to-main denial + environment containment.
+    wrapped, one source of truth — no regex mirror to drift out of sync).
 
     Recursion is bounded by :data:`_MAX_INDIRECTION_DEPTH`; nesting past it fails
     closed (UNKNOWN → deny) rather than risk an unbounded / unanalyzable parse.
+
+    Chain-analysis note (2026-08-19): earlier revisions of this function tried to
+    catch ``git checkout main && git merge x`` / ``git checkout main && git push``
+    at the classifier by lifting the compound to ``GIT_MERGE_TO_MAIN`` and by
+    running ``_chain_guarded`` over the flattened action list. Both existed to
+    make a local branch predicate hold across a chain, and both were removed
+    together with the rest of the branch-prediction machinery — the module
+    docstring explains where the guarantee moved to (GitHub server + preflight).
     """
     if _depth > _MAX_INDIRECTION_DEPTH:
         return ClassifiedAction(Operation.UNKNOWN, detail=command)
@@ -1639,56 +1323,7 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     # inner commands too — recurse into each (same classifier, depth-bounded).
     actions += [_classify_bash(inner, _depth + 1) for inner in _extract_substitutions(scanned)]
 
-    switches_to_main = any(
-        a.operation is Operation.EXEC_CODE
-        and re.search(r"\bgit\s+(checkout|switch)\b.*\b(main|master)\b", a.detail)
-        for a in actions
-    )
-    if switches_to_main and any(a.operation is Operation.GIT_MERGE for a in actions):
-        candidate = ClassifiedAction(Operation.GIT_MERGE_TO_MAIN, detail=command)
-    else:
-        # Guard every step first, then rank: ranking decides what to report, and
-        # a step that names its own target must not outrank — and so hide — one
-        # that borrowed the checkout.
-        candidate = max(
-            _chain_guarded(actions, command),
-            key=lambda a: _DANGER_RANK.get(a.operation, 0),
-        )
-
-    # A destructive step whose branch is not on its own command line borrows the
-    # ambient HEAD, and the guard reads that HEAD *before* the shell runs. In a
-    # chain, an earlier step can move it first:
-    #
-    #     git checkout main && git reset --hard HEAD~1
-    #
-    # measured ALLOWED — validation saw `feature/x`, the script then destroyed
-    # `main`. Same for `git checkout main && git rebase origin/develop`,
-    # `git checkout main && git push --force`, and, without any checkout at all,
-    # `git config push.default upstream && git branch -u origin/main &&
-    # git push --force`, where the tracking change redirects the bare push.
-    # (Tier B, PR #158 round 5.)
-    #
-    # The same trap catches every operation enriched from HEAD, not only the two
-    # this PR widened: `git checkout main && git push` and `git checkout main &&
-    # git commit -m x` were both measured ALLOWED, and a push to `main` walks
-    # straight past the Tier C merge gate. (Tier B, PR #158 round 6.)
-    #
-    # Which is why the condition is not "is it alone" for all four. Denying every
-    # chain would take `git add . && git commit -m x` with it — measured, 33
-    # tests, because a heredoc's body and terminator count as separate actions —
-    # and that is the loop's most common command; a gate that stops the ordinary
-    # case is a gate that gets worked around.
-    #
-    # So the two operations THIS PR widens keep the strict form: chained with
-    # anything at all, refused. `git commit` / `git push` instead consult
-    # :func:`_may_switch_branch`, which is a DENYLIST and therefore fail-OPEN for
-    # what it does not name — `make deploy && git push` is allowed, and
-    # `test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen` records
-    # that rather than leaving it to be discovered. It is the exposure
-    # commit/push have carried since they were first branch-scoped.
-    #
-    # A step that names its own target (`git rebase develop feature/z`, a refspec
-    # force-push) never consults HEAD, so chaining does not reach it at all.
+    candidate = max(actions, key=lambda a: _DANGER_RANK.get(a.operation, 0))
 
     # Coarse defence-in-depth floor: only when indirection is present, and only if
     # at least as dangerous as the structural verdict — so it can ADD a denial the
@@ -1710,30 +1345,6 @@ def _classify_bash(command: str, _depth: int = 0) -> ClassifiedAction:
     gate_open = bool(_INDIRECTION_RE.search(command))
     if gate_open:
         coarse = _scan_raw_coarse(scanned)
-        if coarse is not None and _borrows_ambient_head(coarse):
-            # The floor is a regex over an opaque string: it can name the verb
-            # but never the branch, so it returns `branch=None` and `_enrich`
-            # then fills in whatever happens to be checked out. While these were
-            # unconditional Tier C denials that did not matter — the verb alone
-            # decided it. Branch-scoped, it turns the floor into a bypass:
-            # measured on `bash -c "git checkout main && git reset --hard
-            # HEAD~1"`, the structural pass correctly reached UNKNOWN and the
-            # floor overwrote it with a branchless HISTORY_REWRITE that enriched
-            # to `feature/x` and was ALLOWED. (Tier B, PR #158 round 10.)
-            #
-            # UNKNOWN keeps the denial and drops the branch that was never known.
-            # The floor still only ever ADDS a denial, and that survives the
-            # reduction because UNKNOWN is ranked 90 in :data:`_DANGER_RANK` —
-            # second only to the Tier C group at 100, and above every operation
-            # the structural pass would have allowed (`git.push` 50,
-            # `git.commit` 40, `fs.write` 20, `exec.code` 0). So the `>=` below
-            # still lets the floor win against anything permissive.
-            #
-            # Raised as a bypass on the assumption that UNKNOWN defaults to 0
-            # (PR #158 round 11); measured, the proposed
-            # `eval $(echo "git checkout main && git push --force"); echo x > f`
-            # is denied by this very path, `rule_id=raw_coarse`.
-            coarse = ClassifiedAction(Operation.UNKNOWN, detail=coarse.detail)
         if coarse is not None and _DANGER_RANK.get(coarse.operation, 0) >= _DANGER_RANK.get(
             candidate.operation, 0
         ):
@@ -1823,21 +1434,26 @@ _MCP_READ_OPS = frozenset(
 
 def _classify_mcp(tool_name: str, tool_input: dict[str, Any]) -> ClassifiedAction:
     op = tool_name.split("__")[-1].lower()
-    # Dangerous writes first (explicit). "delete" anywhere → fs.delete (deny).
+    # merge_pull_request is the sole Tier-C name match here — the same
+    # `git.merge_to_main` rule the `gh pr merge` branch of `_classify_gh`
+    # enforces, from a name alone (base is not read).
     if "merge_pull_request" in op:
         return ClassifiedAction(Operation.GIT_MERGE_TO_MAIN, detail=tool_name)
     if "create_pull_request" in op:
         return ClassifiedAction(
             Operation.GITHUB_PR_OPEN, target=tool_input.get("base"), detail=tool_name
         )
-    if "delete" in op:
-        return ClassifiedAction(Operation.FS_DELETE, detail=tool_name)
+    # The `"delete" in op` → FS_DELETE and the `smart_*_document` / `drive*` →
+    # DRIVE_WRITE branches were removed on 2026-08-19
+    # (T-drop-branch-prediction-from-allowlist §3): `fs.delete` retired because
+    # of the `exec.code` bypass, `drive.write` retired because the implementer
+    # session has zero MCP tools (`setting_sources=[]` / `strict_mcp_config=True`
+    # / no host Drive credential). Falling through to the positive read whitelist
+    # or UNKNOWN → default-deny is the correct treatment for anything else.
     if "create_or_update_file" in op or "push_files" in op:
         return ClassifiedAction(
             Operation.GIT_PUSH, branch=tool_input.get("branch"), detail=tool_name
         )
-    if "smart_create_document" in op or "smart_update_document" in op or op.startswith("drive"):
-        return ClassifiedAction(Operation.DRIVE_WRITE, detail=tool_name)
     # Reads are a positive whitelist; everything else is UNKNOWN → default-deny.
     if op in _MCP_READ_OPS:
         return ClassifiedAction(Operation.GITHUB_READ, detail=tool_name)
@@ -1928,180 +1544,20 @@ def _classify_non_bash(tool_name: str, tool_input: dict[str, Any]) -> Classified
 # --------------------------------------------------------------------------- #
 # can_use_tool guard
 # --------------------------------------------------------------------------- #
-
-
-def _git_output(repo_root: Path, args: list[str]) -> str | None:
-    """One trimmed line of git output, or None if git could not answer."""
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            timeout=5,  # same budget as _current_branch
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    value = result.stdout.strip()
-    return value or None
-
-
-#: An inline configuration override — `git -c key=value` or the `GIT_CONFIG_*`
-#: environment form. Either can change where a bare push lands without leaving a
-#: trace in the persistent config the guard reads.
-#: The FLAG forms of an override, matched against the classifier's token
-#: join — where bash quoting is already gone. Matching the raw text instead
-#: was evaded three ways, all measured retargeting `feature/x -> main`:
-#: ``git "-c" push.default=… push --force``, ``git \\-c push.default=… …``
-#: and ``git "--config-env=push.default=VAR" push --force``.
-#: (Tier B, PR #158 round 21.)
-_GIT_CONFIG_FLAG_RE = re.compile(
-    r"\bgit\b[^\n]*?\s-c"  # git -c key=value …
-    r"|\bgit\b[^\n]*?\s--config-env"  # value read from the env
-)
-
-#: The ENVIRONMENT form. This one has to be read off the RAW command: the
-#: classifier strips a leading ``NAME=value`` prefix, so it is gone from the
-#: token join by the time an action carries a ``detail``.
-_GIT_CONFIG_ENV_RE = re.compile(
-    r"\bGIT_CONFIG[A-Z0-9_]*\b"  # any of them; enumerating missed _PARAMETERS
-)
-
-
-def _shell_resolved(command: str) -> str:
-    """``command`` with bash's quoting resolved, for patterns that must match a
-    NAME rather than a spelling.
-
-    A raw scan reads what was typed, and bash concatenates before git sees it:
-    ``env GIT_CON"FIG_COUNT"=1 … git push --force`` contains no `GIT_CONFIG`
-    substring at all, yet git receives the variable and — measured — reported
-    `feature/x -> main`. Splitting and rejoining puts the name back together.
-
-    Falls back to erasing the quoting characters when the command cannot be
-    tokenised, which is coarser and errs toward matching. (Tier B, PR #158
-    round 24.)
-    """
-    try:
-        return " ".join(shlex.split(command, posix=True))
-    except ValueError:
-        return command.replace('"', "").replace("'", "").replace(chr(92), "")
-
-
-def _push_destination(repo_root: Path, command: str, detail: str = "") -> str | None:
-    """Which remote branch does a bare ``git push`` from here actually write?
-
-    NOT the local branch name. Measured end to end: with
-    ``push.default=upstream`` and ``git branch -u origin/main``, a bare
-    ``git push --force`` from ``feature/x`` reported ``feature/x -> main`` and
-    moved the remote ``main``. The guard was reading the local name, saw
-    ``feature/x``, and allowed it — and the two commands can be issued as
-    separate tool calls, so no single command ever looks wrong.
-    (Tier B, PR #158 round 16.)
-
-    ``push.default`` decides, and only two of its modes are answerable here:
-
-    * ``simple`` (git's default) and ``current`` push to the same-named branch,
-      so the local name IS the destination. ``simple`` additionally refuses when
-      the upstream has a different name, which is its own protection.
-    * ``upstream`` / ``tracking`` push to the configured upstream, so that is
-      what has to be read.
-
-    ``matching`` writes every same-named branch at once and ``nothing`` refuses;
-    neither maps to the single branch this predicate returns, so both give None
-    and the caller fails closed.
-    """
-    if _GIT_CONFIG_FLAG_RE.search(detail) or _GIT_CONFIG_ENV_RE.search(_shell_resolved(command)):
-        # The query below reads the repository's PERSISTENT configuration, and an
-        # override on the command line never reaches it. Measured: with
-        # `push.default` unset (`simple`) and the upstream retargeted to
-        # `origin/main`, a bare `git push --force` is refused by git itself,
-        # while `git -c push.default=upstream push --force` reports
-        # `feature/x -> main` and moves it. The same holds for the `GIT_CONFIG_*`
-        # environment form. Out-of-band state cannot answer for an in-band
-        # override, so it declines. (Tier B, PR #158 round 18.)
-        return None
-    mode = _git_output(repo_root, ["config", "--get", "push.default"]) or "simple"
-    if mode in ("simple", "current"):
-        return _current_branch(repo_root)
-    if mode in ("upstream", "tracking"):
-        upstream = _git_output(repo_root, ["rev-parse", "--abbrev-ref", "@{u}"])
-        if upstream is None:
-            return None
-        # `origin/main` -> `main`; `origin/feature/x` -> `feature/x`.
-        return upstream.split("/", 1)[1] if "/" in upstream else upstream
-    return None
-
-
-def _current_branch(repo_root: Path) -> str | None:
-    """Return the repo's current branch via ``git rev-parse``; None if undeterminable.
-
-    Uses ``git rev-parse --abbrev-ref HEAD`` rather than reading ``.git/HEAD``
-    directly so it resolves correctly for **worktrees** (``.git`` is a file, not a
-    dir) and **packed-refs**, where a raw ``.git/HEAD`` read would fail and force
-    an over-strict deny (T23). Returns None for a detached HEAD (``rev-parse``
-    prints ``HEAD``), a non-repo, or any git failure — the guard treats None as
-    fail-closed (the action is downgraded to UNKNOWN → deny) rather than letting a
-    missing branch pass a constraint.
-
-    Assumes ``repo_root`` is implementer-managed (its own clone): running ``git``
-    there trusts that repo's ``.git/config`` (aliases / hooks). Acceptable in
-    Phase 1 (self-clone); flagged for later if untrusted repos are ever gated.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    branch = result.stdout.strip()
-    if not branch or branch == "HEAD":  # detached HEAD or empty output
-        return None
-    return branch
-
-
-#: Operations whose branch the command line does not carry, so the guard fills it
-#: from HEAD — or downgrades to ``UNKNOWN`` when HEAD is undecidable.
-#:
-#: One list, not one ``if`` per operation: the lookup, the replacement and the
-#: fail-closed downgrade are the same for all of them, and a maintainer adding a
-#: fifth should not have to pick which copy to extend. (Tier B, PR #158 round 2.)
-#:
-#: Membership is load-bearing. ``allowlist._constraints_pass`` returns True when
-#: ``branch is None``, so an operation carrying a ``branch_glob`` that is NOT in
-#: this list skips its glob entirely and passes. Nothing static catches that; the
-#: detached-HEAD and non-repo tests are what does.
-#:
-#: ``GIT_MERGE`` is deliberately absent HERE, because it is bounded by
-#: ``source_glob`` / ``target_glob`` and its destination is filled from HEAD by
-#: its own branch in :meth:`_AllowlistGuard._enrich` — which sets ``target``, not
-#: ``branch``. Adding it would populate a field its rules never read. Measured
-#: repeatedly: ``git merge feature/x`` is denied on ``main`` and allowed on
-#: ``feature/x``. See ``test_guard_merge_on_main_denied``.
-#:
-#: It DOES belong to the other question — "whose target comes from the ambient
-#: checkout" — and that is :func:`_borrows_ambient_head`, a separate predicate
-#: for a separate purpose. Conflating the two left merges out of the chain check
-#: (PR #158 round 9).
-_HEAD_ENRICHED_OPERATIONS: tuple[Operation, ...] = (
-    Operation.GIT_COMMIT,
-    Operation.GIT_PUSH,
-    Operation.HISTORY_REWRITE,
-    Operation.FORCE_PUSH,
-)
+#
+# The guard was branch-aware until 2026-08-19: it shelled out to git to resolve
+# the checked-out branch (``_current_branch``) and the actual push destination
+# under ``push.default`` + a retargeted upstream (``_push_destination``), so an
+# operation whose branch was not on its command line could still be checked
+# against ``branch_glob``. All of that came out with the branch_glob machinery
+# (T-drop-branch-prediction-from-allowlist) — the module docstring explains
+# where the enforcement moved to. The guard now does one thing: classify each
+# action, hand it to :meth:`Allowlist.check`, and turn a deny into a fail-loud
+# interrupt. No shell-outs, no cached repo state.
 
 
 class _AllowlistGuard:
-    """Per-spawn ``can_use_tool`` callback: classify → enrich → check → allow/deny.
+    """Per-spawn ``can_use_tool`` callback: classify → check → allow/deny.
 
     A deny is recorded (so ``deliver_event`` can fail-loud) and returned with
     ``interrupt=True`` so the SDK aborts the turn immediately.
@@ -2116,65 +1572,6 @@ class _AllowlistGuard:
         # was attempted, and dropping it is the defect this record exists to fix.
         self.violation_actions: list[ClassifiedAction] = []
 
-    def _enrich(self, action: ClassifiedAction, command: str = "") -> ClassifiedAction:
-        """Fill an unparsed branch/target from the repo's current branch.
-
-        ``git commit`` / bare ``git push`` carry no branch and ``git merge`` no
-        target on the command line, but the *effective* branch is the checked-out
-        one. Resolving it from ``.git/HEAD`` closes the fail-open where a commit/
-        push/merge while on ``main`` would otherwise pass (None == "no constraint
-        to check"). If the branch can't be determined, downgrade to UNKNOWN so
-        ``default: deny`` blocks it (fail-closed).
-
-        ``git rebase`` / ``git reset --hard`` / ``git filter-branch`` (=
-        :attr:`Operation.HISTORY_REWRITE`) mutate the *checked-out* branch and
-        carry no branch argument, so the classifier always emits ``branch=None``;
-        the enrichment fills the HEAD in for them too, or downgrades to UNKNOWN
-        when HEAD is undecidable. Same shape for ``git push --force`` on a bare
-        push (``branch=None`` from the classifier) — a refspec-form force push
-        (``origin main`` / ``+feature/x:main``) already carries the destination
-        via :func:`_push_target_and_force` and enrichment leaves it alone.
-
-        The whole reason this list has to enumerate operations (rather than
-        "fill the branch if any allow rule for this op has a ``branch_glob``")
-        is that the allow-list's ``branch is None`` case is fail-**open**
-        (``allowlist._constraints_pass`` returns ``True, ""`` on None so the
-        commit / push structural rule works with an unparseable command line).
-        An operation whose branch reaches the check as ``None`` therefore
-        SKIPS ``branch_glob`` and slips through. Missing an operation from
-        this enumeration is silent in every static check we have, so the
-        detached-HEAD / non-repo regression tests below are the only guard
-        against a future op being widened via ``branch_glob`` without also
-        being added here (T-branch-scoped-implementer-permissions §6-1).
-        """
-        repo_root = self._allowlist.repo_root
-        if action.operation in _HEAD_ENRICHED_OPERATIONS and action.branch is None:
-            # A push writes a REMOTE branch, and which one is not always the
-            # local name — `push.default` and the configured upstream decide.
-            # Everything else here acts on the checkout, so the local name is
-            # the answer for those.
-            cur = (
-                # The RAW command, not `action.detail`: the classifier strips a
-                # leading `NAME=value` environment prefix, which is exactly where
-                # the `GIT_CONFIG_*` form of an override lives.
-                _push_destination(repo_root, command or action.detail, action.detail)
-                if action.operation in (Operation.GIT_PUSH, Operation.FORCE_PUSH)
-                else _current_branch(repo_root)
-            )
-            return (
-                replace(action, operation=Operation.UNKNOWN)
-                if cur is None
-                else replace(action, branch=cur)
-            )
-        if action.operation is Operation.GIT_MERGE and action.target is None:
-            cur = _current_branch(repo_root)
-            return (
-                replace(action, operation=Operation.UNKNOWN)
-                if cur is None
-                else replace(action, target=cur)
-            )
-        return action
-
     async def __call__(
         self,
         tool_name: str,
@@ -2185,11 +1582,7 @@ class _AllowlistGuard:
         # so an allowed `force_push` written before a denied one used to shadow
         # it entirely (PR #158 round 12). The first denial wins, and the ranked
         # winner is checked first so a denial keeps the report it always had.
-        raw_command = str(tool_input.get("command", "")) if tool_name == "Bash" else ""
-        for action in (
-            self._enrich(candidate, raw_command)
-            for candidate in classify_tool_call_actions(tool_name, tool_input)
-        ):
+        for action in classify_tool_call_actions(tool_name, tool_input):
             decision = self._allowlist.check(action)
             if decision.allowed:
                 continue

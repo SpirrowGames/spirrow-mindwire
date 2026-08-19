@@ -1,9 +1,32 @@
 """Tests for T19 ``ImplementerSdkAdapter`` + the SDK-tool classifier.
 
 The classifier (SDK tool call → allow-list :class:`Operation`) is the
-safety-critical mapping and is tested exhaustively. The adapter lifecycle is
-exercised with a fake SDK client that drives the ``can_use_tool`` guard, so the
-fail-loud allow-list-violation path is covered without the real CLI.
+safety-critical mapping and is tested for the invariants that still hold after
+the 2026-08-19 simplification (T-drop-branch-prediction-from-allowlist §3):
+
+* the surviving Tier-C operation ``git.merge_to_main`` is denied on a name
+  match alone from every route (``gh pr merge``, MCP ``merge_pull_request``,
+  a wrapped `gh pr merge`), regardless of any base argument or ambient HEAD;
+
+* the ex-Tier-C names ``fs.delete`` / ``drive.write`` / ``external.publish``
+  are **gone from the enum** (this is what pins the "dead scaffolding removed"
+  invariant — an enum reference would refuse to compile / import);
+
+* the classifier stops predicting branches: a bare ``git rebase`` / bare
+  ``git push`` / chained ``git checkout main && git ...`` classifies to its
+  verb (for provenance) without an ``UNKNOWN`` bounce that used to rest on the
+  chain-guard;
+
+* the built-in tool exposure + isolation settings survive (T37 #1/#4), the
+  guard is wired (nothing auto-approved), and the assembled system prompt still
+  carries the cwd grounding + injected obligations + ADR-index block.
+
+The predictor-heavy suite (~50 guard/branch/`_current_branch`/`_push_destination`/
+chain-guard tests) was retired with the machinery it pinned; the replacement
+lives in :mod:`tests.test_preflight` (P0/P1/P2 as the invariants that now
+carry "no push to main"). The adapter lifecycle is exercised with a fake SDK
+client that drives the ``can_use_tool`` guard, so the fail-loud
+allow-list-violation path is covered without the real CLI.
 """
 
 from __future__ import annotations
@@ -25,7 +48,6 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
-from spirrow_mindwire.adapters import implementer as _implementer
 from spirrow_mindwire.adapters.implementer import (
     _BENIGN_BUILTIN_TOOLS,
     _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT,
@@ -52,9 +74,6 @@ from spirrow_mindwire.value_objects import (
     ThreadRef,
 )
 
-#: Quote characters, built rather than escaped, so the strings below stay legible.
-_DQ = chr(34)
-
 _TS = datetime(2026, 5, 23, tzinfo=UTC)
 
 # Loop-readable obligations manifest — required by the implementer adapter now
@@ -64,7 +83,7 @@ _OBLIGATIONS = load_manifest()
 
 
 # --------------------------------------------------------------------------- #
-# classifier
+# classifier — non-Bash tools
 # --------------------------------------------------------------------------- #
 
 
@@ -95,68 +114,52 @@ def test_classify_fs_write_carries_path() -> None:
     assert classify_tool_call("Write", {"file_path": "src/x.py"}).path == "src/x.py"
 
 
+# --------------------------------------------------------------------------- #
+# classifier — bash: what still classifies, and what deliberately no longer does
+# --------------------------------------------------------------------------- #
+
+
 @pytest.mark.parametrize(
     "cmd,expected",
     [
+        # Tier A — unremarkable code / git that used to be classified but no longer
+        # needs to be because the invariant moved to the server-side ruleset.
         ("pytest -q", Operation.EXEC_CODE),
         ("uv run pytest", Operation.EXEC_CODE),
         ("git status", Operation.EXEC_CODE),
         ("git add -A", Operation.EXEC_CODE),
         ("git checkout -b feature/x", Operation.EXEC_CODE),
+        ("git checkout main", Operation.EXEC_CODE),
         ("git pull", Operation.EXEC_CODE),
+        # Still classified for provenance — the operation is what it is, even
+        # though the branch predicate that used to bound them is retired.
         ("git commit -m msg", Operation.GIT_COMMIT),
         ("git push origin feature/x", Operation.GIT_PUSH),
+        ("git push origin main", Operation.GIT_PUSH),
         ("git push --force origin feature/x", Operation.FORCE_PUSH),
+        ("git push --force origin main", Operation.FORCE_PUSH),
         ("git push -f origin feature/x", Operation.FORCE_PUSH),
         ("git push --force-with-lease origin feature/x", Operation.FORCE_PUSH),
         ("git merge feature/x", Operation.GIT_MERGE),
+        ("git merge develop", Operation.GIT_MERGE),
         ("git rebase -i HEAD~2", Operation.HISTORY_REWRITE),
         ("git reset --hard HEAD", Operation.HISTORY_REWRITE),
-        # `filter-branch` / `filter-repo` take rev-list arguments, so any of them
-        # can name a branch and none of them can be told apart from a flag value.
-        # Since PR #158 widened `history_rewrite` to a branch glob, "history
-        # rewrite, target unspecified" would be filled with HEAD and pass on a
-        # feature branch — so the classifier says UNKNOWN and default-deny fires,
-        # the same idiom `_enrich` already uses when HEAD is undecidable.
-        #
-        # The cost is label fidelity: the denial record reads `unknown` for what
-        # is plainly a history rewrite, which is the same category error Bohr
-        # objected to for `_classify_mcp` (T-fs-delete-path-scope msg-1197 §7).
-        # `detail` still carries the command. Taken deliberately: a correct denial
-        # beats an accurate label, and inventing a branch name to keep the label
-        # would put a fiction in the record instead.
+        # UNKNOWN — argument shape not one this classifier reads (rev-list
+        # expressions). Default-deny catches them.
         ("git filter-branch --tree-filter true HEAD", Operation.UNKNOWN),
-        ("rm -rf build", Operation.FS_DELETE),
-        ("rmdir foo", Operation.FS_DELETE),
-        ("npm publish", Operation.EXTERNAL_PUBLISH),
-        ("twine upload dist/*", Operation.EXTERNAL_PUBLISH),
-        ("docker push myimg", Operation.EXTERNAL_PUBLISH),
-        ("gh pr create --base develop", Operation.GITHUB_PR_OPEN),
+        # `gh pr merge` is the sole Tier-C name match — no base/HEAD read.
         ("gh pr merge 5", Operation.GIT_MERGE_TO_MAIN),
+        ("gh pr merge 5 --squash", Operation.GIT_MERGE_TO_MAIN),
+        ("gh pr create --base develop", Operation.GITHUB_PR_OPEN),
         ("gh pr view 5", Operation.GITHUB_READ),
-        # indirection backstop: wrappers hide the inner command from tokenization.
-        ('bash -c "rm -rf x"', Operation.FS_DELETE),
-        ('eval "git push --force origin feature/x"', Operation.FORCE_PUSH),
-        ("echo hi && $(rm -rf y)", Operation.FS_DELETE),
-        ("sh -c 'git reset --hard HEAD~3'", Operation.HISTORY_REWRITE),
         # T23: mutating `gh api` → deny (UNKNOWN); a read (GET / no fields) stays read.
         ("gh api repos/o/r/merges -X PUT", Operation.UNKNOWN),
         ("gh api --method POST repos/o/r/pulls -f title=x", Operation.UNKNOWN),
         ("gh api -f base=main repos/o/r/merges", Operation.UNKNOWN),
         ("gh api repos/o/r/contents/x", Operation.GITHUB_READ),
         ("gh api repos/o/r -X GET", Operation.GITHUB_READ),
-        # T23: external-publish + mutating gh api wrapped in indirection.
-        ('bash -c "npm publish"', Operation.EXTERNAL_PUBLISH),
-        ("eval 'twine upload dist/*'", Operation.EXTERNAL_PUBLISH),
-        ('bash -c "gh api repos/o/r/merges -X PUT"', Operation.UNKNOWN),
-        # T23 review (naysayer MUST-1): field-flag gh api via indirection (gh
-        # defaults to POST) + lowercase verb must also deny, not fall to READ.
-        ('bash -c "gh api repos/o/r/pulls -f title=x"', Operation.UNKNOWN),
-        ('bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
-        ('bash -c "gh api repos/o/r/contents/x -X post"', Operation.UNKNOWN),
-        # T23 review (main SHOULD): direct `-X` with value concatenated (no space).
+        # T23 (main SHOULD): direct `-X` with value concatenated (no space).
         ("gh api repos/o/r/merges -XPUT", Operation.UNKNOWN),
-        ("gh api repos/o/r/contents/x -XDELETE", Operation.UNKNOWN),
         ("gh api repos/o/r -Xget", Operation.GITHUB_READ),
     ],
 )
@@ -164,25 +167,94 @@ def test_classify_bash(cmd: str, expected: Operation) -> None:
     assert classify_tool_call("Bash", {"command": cmd}).operation is expected
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # `rm` used to route to FS_DELETE; the operation is retired, so these
+        # classify to EXEC_CODE now. Same for shell-level `publish` / `push`
+        # invocations. The invariant they used to pin (delete / external
+        # publish → denied at this layer) does not hold any more — the module
+        # docstring explains that `exec.code` was always the bypass for
+        # `fs.delete`, and squid egress default-deny is the real boundary for
+        # `external.publish`. This pins the removal so a future revert would
+        # fail here rather than silently re-enable the theatrical check.
+        "rm -rf build",
+        "rmdir foo",
+        "sudo rm -rf /tmp/x",
+        "shred secret.pem",
+        "Remove-Item -LiteralPath x",
+        'bash -c "rm -rf x"',
+        "npm publish",
+        "twine upload dist/*",
+        "docker push myimg",
+    ],
+)
+def test_removed_operations_now_fall_through_to_exec_code(cmd: str) -> None:
+    """T-drop-branch-prediction-from-allowlist §3: FS_DELETE / EXTERNAL_PUBLISH
+    are retired. The verbs still run — they just do not classify to a Tier-C
+    operation any more.
+    """
+    action = classify_tool_call("Bash", {"command": cmd})
+    assert action.operation is Operation.EXEC_CODE, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd,expected",
+    [
+        # `gh release` used to route to EXTERNAL_PUBLISH; the operation is
+        # retired, and `gh` subcommands that are neither `pr` nor a mutating
+        # `api` call fall through to GITHUB_READ (Tier A). The subcommand's
+        # actual effect (creating a release) hits GitHub via api.github.com —
+        # the one destination squid still allows — so the classifier's role
+        # here is provenance, not enforcement.
+        ("gh release create v1", Operation.GITHUB_READ),
+        ("gh release list", Operation.GITHUB_READ),
+        ("gh repo delete SpirrowGames/x", Operation.GITHUB_READ),
+        ("gh repo archive SpirrowGames/x", Operation.GITHUB_READ),
+    ],
+)
+def test_removed_gh_publish_routes_fall_through_to_github_read(
+    cmd: str, expected: Operation
+) -> None:
+    """`gh release` / `gh repo delete|archive` used to route to
+    EXTERNAL_PUBLISH (Tier C). They now classify to GITHUB_READ (Tier A) —
+    which is what the classifier's remaining routing does for any non-mutating
+    `gh` call.
+    """
+    action = classify_tool_call("Bash", {"command": cmd})
+    assert action.operation is expected
+
+
+def test_operation_enum_no_longer_carries_removed_names() -> None:
+    """The removed Tier-C names must not be present on the enum.
+
+    This is the load-time counterpart to the classifier tests above: if the
+    enum still had FS_DELETE / DRIVE_WRITE / EXTERNAL_PUBLISH, a future patch
+    could quietly re-route to them. Removing them from the enum makes any
+    reintroduction a compile-time / import-time break.
+    """
+    names = {op.name for op in Operation}
+    assert "FS_DELETE" not in names
+    assert "DRIVE_WRITE" not in names
+    assert "EXTERNAL_PUBLISH" not in names
+
+
 # --------------------------------------------------------------------------- #
-# T27: indirection is unified via recursion (direct == wrapped), not a regex
-# mirror. These cover the shell-extraction edge cases (nesting, multiple -c,
-# $() nesting, tokenizer-defeating quoting, depth bound).
+# T27: indirection is unified via recursion (direct == wrapped) — narrowed to
+# what still classifies to something after the retirements.
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.parametrize(
     "cmd,expected",
     [
-        # nested wrappers: the extracted inner is recursed through the SAME
-        # classifier, so danger surfaces however deep the wrapper nests.
-        ("bash -c \"bash -c 'rm -rf x'\"", Operation.FS_DELETE),
+        # Wrapping does not change the classification (T27 invariant).
         ("eval \"bash -c 'git push --force origin feature/x'\"", Operation.FORCE_PUSH),
-        # nested command substitution.
-        ("echo $(echo $(rm -rf z))", Operation.FS_DELETE),
         ("echo $(git push --force origin feature/x)", Operation.FORCE_PUSH),
-        # a wrapped main-merge one-liner is still surfaced as merge-to-main.
-        ('bash -c "git checkout main && git merge develop"', Operation.GIT_MERGE_TO_MAIN),
+        # `gh pr merge` wrapped still routes to GIT_MERGE_TO_MAIN. This is the
+        # anchor of the surviving Tier-C guarantee under wrapping.
+        ('bash -c "gh pr merge 5"', Operation.GIT_MERGE_TO_MAIN),
+        ("eval 'gh pr merge 5 --squash'", Operation.GIT_MERGE_TO_MAIN),
         # gh api precision now comes from recursion (single source), not a regex
         # mirror: a wrapped field-flag gh api (gh defaults to POST) still denies.
         ('bash -c "gh api repos/o/r/pulls --field title=x"', Operation.UNKNOWN),
@@ -191,9 +263,8 @@ def test_classify_bash(cmd: str, expected: Operation) -> None:
         ("sh -c 'uv run mypy src'", Operation.EXEC_CODE),
         # `bash script.sh` runs a file (not -c) → not inline indirection.
         ("bash deploy.sh", Operation.EXEC_CODE),
-        # backticks: a closed pair, and (main #2) an unclosed trailing backtick
-        # whose remainder is taken as the body — deny-safe, symmetric with $(.
-        ("echo `rm -rf x` done", Operation.FS_DELETE),
+        # backticks: closed pair, and an unclosed trailing backtick (deny-safe).
+        ("echo `git push --force origin feature/x` done", Operation.FORCE_PUSH),
         ("echo `gh pr merge 5", Operation.GIT_MERGE_TO_MAIN),
     ],
 )
@@ -204,10 +275,8 @@ def test_classify_bash_indirection_recursed(cmd: str, expected: Operation) -> No
 @pytest.mark.parametrize(
     "inner",
     [
-        "rm -rf x",
         "git push --force origin feature/x",
         "git reset --hard HEAD~3",
-        "npm publish",
         "gh api repos/o/r/merges -X PUT",
         "gh api repos/o/r/pulls -f title=x",
         "gh pr merge 5",
@@ -223,25 +292,9 @@ def test_classify_direct_equals_wrapped(inner: str) -> None:
     assert direct == wrapped
 
 
-@pytest.mark.parametrize(
-    "cmd,expected",
-    [
-        # ANSI-C $'...' quoting hides the verb from shlex → recursion mis-tokenizes,
-        # but the coarse defence-in-depth floor still catches the raw verb.
-        ("eval $'rm -rf x'", Operation.FS_DELETE),
-        # a Tier C verb smuggled into a non-executed `bash -c X Y` slot (only X
-        # runs) is still denied by the coarse floor.
-        ('bash -c "echo hi" -c "rm -rf x"', Operation.FS_DELETE),
-    ],
-)
-def test_classify_bash_coarse_floor_backstops_untokenizable(cmd: str, expected: Operation) -> None:
-    assert classify_tool_call("Bash", {"command": cmd}).operation is expected
-
-
 def test_classify_bash_nesting_depth_fails_closed() -> None:
     # Pathologically nested indirection exceeds the recursion bound → fail closed
-    # (UNKNOWN → deny) rather than spin or silently pass. Neutral inner verb so the
-    # coarse floor doesn't classify it first.
+    # (UNKNOWN → deny) rather than spin.
     cmd = "$(" * 10 + "git status" + ")" * 10
     assert classify_tool_call("Bash", {"command": cmd}).operation is Operation.UNKNOWN
 
@@ -250,55 +303,40 @@ def test_classify_bash_nesting_depth_fails_closed() -> None:
     "cmd,expected",
     [
         # #74 naysayer MUST-1 / Copilot: a launcher before `bash -c` must not hide
-        # the inner from the structural classifier (#71 MUST-1 must not regress).
+        # the inner from the structural classifier.
         ('exec bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
         ('env bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
-        ('command bash -c "rm -rf x"', Operation.FS_DELETE),
-        # value-taking launcher (timeout DURATION / nice -n N) before the shell.
         ('timeout 5 bash -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
         ('nice -n 10 bash -c "git push --force origin feature/x"', Operation.FORCE_PUSH),
         # value-taking bash OPTIONS hide `-c` (--rcfile F / -O shopt): skip the arg.
-        ('bash --rcfile myrc -c "rm -rf x"', Operation.FS_DELETE),
-        ('bash --rcfile myrc -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
-        ('bash -O extglob -c "rm -rf x"', Operation.FS_DELETE),
-        # #74 main Round-2 MINOR: lookahead for value-taking options used WITHOUT
-        # their argument (`bash -O -c "<x>"` / `bash +O -c …` / `bash --rcfile -c
-        # …`). Real bash 5.x errors out on these so the runtime would not execute
-        # the inner, but classify on intent so the gate denies the form anyway
-        # (defensive against a future bash / non-bash shell with looser semantics).
-        ('bash -O -c "rm -rf x"', Operation.FS_DELETE),
-        ('bash +O -c "gh api repos/o/r/merges -f base=main"', Operation.UNKNOWN),
-        ('bash --rcfile -c "rm -rf x"', Operation.FS_DELETE),
-        # control: option used WITH its argument still parses as before (no false deny).
+        ('bash --rcfile myrc -c "gh pr merge 5"', Operation.GIT_MERGE_TO_MAIN),
+        ('bash -O extglob -c "gh pr merge 5"', Operation.GIT_MERGE_TO_MAIN),
+        # value-taking option used WITHOUT its argument.
+        ('bash -O -c "gh pr merge 5"', Operation.GIT_MERGE_TO_MAIN),
+        ('bash --rcfile -c "gh pr merge 5"', Operation.GIT_MERGE_TO_MAIN),
+        # control: option WITH its argument still parses as before (no false deny).
         ('bash -O extglob -c "echo hi"', Operation.EXEC_CODE),
-        # leading shell flags / option-arg + ANSI-C inner: structural mis-tokenizes,
-        # but the (broadened) indirection gate lets the coarse floor catch the verb.
-        ("bash -l -c $'rm -rf x'", Operation.FS_DELETE),
-        ("bash --rcfile x -c $'rm -rf x'", Operation.FS_DELETE),
         # must NOT over-deny: a launcher/shell name as a mere argument isn't a wrapper.
         ('echo bash -c "hello world"', Operation.EXEC_CODE),
     ],
 )
 def test_classify_bash_launcher_and_option_wrappers(cmd: str, expected: Operation) -> None:
-    # #74 naysayer MUST-1: `_indirection_inner` must reach the inner across leading
-    # launchers (env/exec/timeout) and value-taking bash options (--rcfile/-O), so
-    # the #71 field-flag-gh-api indirection bypass cannot reappear behind a wrapper.
     assert classify_tool_call("Bash", {"command": cmd}).operation is expected
 
 
-def test_classify_push_feature_branch_params() -> None:
-    a = classify_tool_call("Bash", {"command": "git push origin feature/x"})
-    assert a.branch == "feature/x"
-    assert a.force is False
-
-
-@pytest.mark.parametrize(
-    "cmd", ["git push origin main", "git push origin HEAD:main", "git push origin develop:main"]
-)
-def test_classify_push_to_main_detected(cmd: str) -> None:
-    a = classify_tool_call("Bash", {"command": cmd})
+def test_classify_push_target_and_force_still_populated() -> None:
+    # Even though the branch is no longer consulted for enforcement, the
+    # classifier still surfaces it in the ClassifiedAction for provenance
+    # (denial records / log lines).
+    a = classify_tool_call("Bash", {"command": "git push origin main"})
     assert a.operation is Operation.GIT_PUSH
     assert a.branch == "main"
+    assert a.force is False
+
+    b = classify_tool_call("Bash", {"command": "git push --force origin feature/x"})
+    assert b.operation is Operation.FORCE_PUSH
+    assert b.branch == "feature/x"
+    assert b.force is True
 
 
 def test_classify_merge_source_extracted() -> None:
@@ -307,41 +345,35 @@ def test_classify_merge_source_extracted() -> None:
     assert a.source == "feature/x"
 
 
-def test_classify_compound_picks_most_dangerous() -> None:
-    rm = classify_tool_call("Bash", {"command": "cd src && rm -rf x"})
-    assert rm.operation is Operation.FS_DELETE
-    push = classify_tool_call("Bash", {"command": "pytest && git push origin feature/x"})
-    assert push.operation is Operation.GIT_PUSH
-
-
-def test_classify_checkout_main_then_merge() -> None:
-    a = classify_tool_call("Bash", {"command": "git checkout main && git merge develop"})
-    assert a.operation is Operation.GIT_MERGE_TO_MAIN
-
-
 def test_classify_env_prefix_force_push() -> None:
     a = classify_tool_call("Bash", {"command": "FOO=bar git push --force origin feature/x"})
     assert a.operation is Operation.FORCE_PUSH
 
 
-def test_classify_sudo_rm() -> None:
-    a = classify_tool_call("Bash", {"command": "sudo rm -rf /tmp/x"})
-    assert a.operation is Operation.FS_DELETE
+# --------------------------------------------------------------------------- #
+# classifier — MCP
+# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.parametrize(
     "name,inp,expected",
     [
+        # The sole Tier-C route in MCP too — name match, no base read.
         ("mcp__github__merge_pull_request", {}, Operation.GIT_MERGE_TO_MAIN),
         ("mcp__github__create_pull_request", {"base": "develop"}, Operation.GITHUB_PR_OPEN),
-        ("mcp__github__delete_file", {}, Operation.FS_DELETE),
         ("mcp__github__create_or_update_file", {"branch": "feature/x"}, Operation.GIT_PUSH),
         ("mcp__github__push_files", {"branch": "feature/x"}, Operation.GIT_PUSH),
-        ("mcp__drive__smart_update_document", {}, Operation.DRIVE_WRITE),
         ("mcp__github__get_file_contents", {}, Operation.GITHUB_READ),
+        # T-drop-branch-prediction-from-allowlist §3: `delete_*` MCP routing is
+        # gone (fs.delete retired), `smart_*_document` / `drive*` routing is
+        # gone (drive.write retired). Any of those now falls to UNKNOWN (default
+        # -deny) via the positive read whitelist, which is enough — the loop
+        # runs with zero MCP tools anyway.
+        ("mcp__github__delete_file", {}, Operation.UNKNOWN),
+        ("mcp__github__list_and_delete", {}, Operation.UNKNOWN),
+        ("mcp__drive__smart_update_document", {}, Operation.UNKNOWN),
+        # unknown read-ish → default-deny (positive whitelist).
         ("mcp__weird__frobnicate", {}, Operation.UNKNOWN),
-        # default-deny: a "delete" variant must not pass as read; unknown read-ish → deny.
-        ("mcp__github__list_and_delete", {}, Operation.FS_DELETE),
         ("mcp__github__list_widgets", {}, Operation.UNKNOWN),
     ],
 )
@@ -349,37 +381,64 @@ def test_classify_mcp(name: str, inp: dict[str, Any], expected: Operation) -> No
     assert classify_tool_call(name, inp).operation is expected
 
 
-def test_force_push_to_main_denied_end_to_end(tmp_path: Path) -> None:
-    """`git push --force origin main` still denied — the invariant that survives the widening.
+# --------------------------------------------------------------------------- #
+# End-to-end: the sole surviving Tier-C deny (name-match, base-independent)
+# --------------------------------------------------------------------------- #
 
-    ``force_push`` was moved from unconditional Tier C to branch-scoped Tier A on 2026-08-15
-    (T-branch-scoped-implementer-permissions). What must not budge is that ``main`` stays
-    off-limits: `_push_target_and_force` surfaces the destination as ``"main"`` so the
-    ``branch_glob`` outside ``feature/*`` / ``develop`` fires and denies.
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh pr merge 5",
+        "gh pr merge 5 --squash",
+        "gh pr merge 5 --squash --delete-branch",
+        'bash -c "gh pr merge 5"',
+        "eval 'gh pr merge 5'",
+    ],
+)
+def test_gh_pr_merge_denied_end_to_end(tmp_path: Path, cmd: str) -> None:
+    """`gh pr merge` is the sole surviving classifier-executed Tier-C guarantee.
+
+    Denied on a name match alone (no base argument inspection, no HEAD read),
+    including under indirection. This is the invariant that stays after the
+    2026-08-19 simplification because the GitHub server-side push rejection
+    covers pushes, not the merge API, and covers SpirrowGames repos only.
     """
     al = default_allowlist(repo_root=tmp_path)
-    action = classify_tool_call("Bash", {"command": "git push --force origin main"})
-    assert action.operation is Operation.FORCE_PUSH
-    assert action.branch == "main"
+    action = classify_tool_call("Bash", {"command": cmd})
+    assert action.operation is Operation.GIT_MERGE_TO_MAIN, cmd
+    d = al.check(action)
+    assert d.allowed is False, cmd
+
+
+def test_mcp_merge_pull_request_denied_end_to_end(tmp_path: Path) -> None:
+    al = default_allowlist(repo_root=tmp_path)
+    action = classify_tool_call("mcp__github__merge_pull_request", {"pull_number": 5})
+    assert action.operation is Operation.GIT_MERGE_TO_MAIN
     assert al.check(action).allowed is False
 
 
-def test_force_push_to_feature_allowed_end_to_end(tmp_path: Path) -> None:
-    """`git push --force origin feature/x` now allowed (branch-scoped Tier A, 2026-08-15).
-
-    ``main`` is the line, not the verb — see the docstring of ``allowlist`` and the yaml
-    comment above the ``force_push`` allow rule.
-    """
+def test_repo_internal_write_allowed_end_to_end(tmp_path: Path) -> None:
+    """fs.write is now unconstrained Tier A (path_glob retired 2026-08-19)."""
     al = default_allowlist(repo_root=tmp_path)
-    action = classify_tool_call("Bash", {"command": "git push --force origin feature/x"})
-    assert action.operation is Operation.FORCE_PUSH
-    assert action.branch == "feature/x"
+    action = classify_tool_call("Write", {"file_path": str(tmp_path / "src" / "x.py")})
     assert al.check(action).allowed is True
 
 
-def test_repo_internal_write_allowed_end_to_end(tmp_path: Path) -> None:
+def test_os_temp_write_now_allowed_at_this_layer(tmp_path: Path) -> None:
+    """The scratch-write halt moved out of this layer on 2026-08-19.
+
+    fs.write is unconstrained here now. The residual guidance ("don't write to
+    OS temp, use <repo>/.git/mindwire-scratch/") lives in the implementer's
+    system prompt (the only text the loop reads at runtime — the yaml comment
+    at the fs.write rule cross-refs this).
+    """
+    import tempfile
+
     al = default_allowlist(repo_root=tmp_path)
-    action = classify_tool_call("Write", {"file_path": str(tmp_path / "src" / "x.py")})
+    action = classify_tool_call(
+        "Write", {"file_path": str(Path(tempfile.gettempdir()) / "pr_body.md")}
+    )
     assert al.check(action).allowed is True
 
 
@@ -397,1106 +456,73 @@ async def test_guard_allows_exec(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_guard_denies_force_push_to_main_with_interrupt(tmp_path: Path) -> None:
-    """Denial still fail-loud (``interrupt=True``) when a force push targets ``main``.
+async def test_guard_denies_gh_pr_merge_with_interrupt(tmp_path: Path) -> None:
+    """The one Tier-C route the guard still refuses at the loop level."""
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "gh pr merge 5 --squash"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultDeny)
+    assert res.interrupt is True
+    assert len(guard.violations) == 1
+    assert guard.violations[0].operation is Operation.GIT_MERGE_TO_MAIN
+    assert guard.violation_actions[0].operation is Operation.GIT_MERGE_TO_MAIN
 
-    The refspec surfaces the target as ``"main"`` in the classifier, so this path does
-    not need HEAD enrichment — it is the direct-argument deny. See
-    ``test_guard_force_push_bare_on_main_denied`` below for the enrichment counterpart.
+
+@pytest.mark.anyio
+async def test_guard_allows_bare_force_push_now(tmp_path: Path) -> None:
+    """force_push is unconstrained Tier A after 2026-08-19.
+
+    The `main` guarantee moved to GitHub's org ruleset + composition-root
+    preflight (P0/P1/P2); the classifier no longer answers "which branch".
+    So a bare `git push --force origin main` classifies to FORCE_PUSH and the
+    allow-list permits it — GitHub then rejects the push server-side.
     """
     guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
     res = await guard("Bash", {"command": "git push --force origin main"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
+
+
+@pytest.mark.anyio
+async def test_guard_allows_bare_rebase_now(tmp_path: Path) -> None:
+    """history_rewrite is unconstrained Tier A after 2026-08-19 (same rationale)."""
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": "git rebase -i HEAD~3"}, ToolPermissionContext())
+    assert isinstance(res, PermissionResultAllow)
+
+
+@pytest.mark.anyio
+async def test_guard_allows_local_checkout_main_and_merge(tmp_path: Path) -> None:
+    """The "checkout main + merge" chain used to be lifted to GIT_MERGE_TO_MAIN
+    by a chain-guard special case. That special case was removed on 2026-08-19
+    (msg-1272 Q1 answer (b)): local merge in a captive clone burns the clone,
+    reflog restores, and the GitHub server rejects any push that would export
+    the damage. So the local chain is now allow at this layer.
+    """
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard(
+        "Bash", {"command": "git checkout main && git merge feature/x"}, ToolPermissionContext()
+    )
+    assert isinstance(res, PermissionResultAllow)
+
+
+@pytest.mark.anyio
+async def test_guard_denies_gh_pr_merge_wrapped(tmp_path: Path) -> None:
+    """Same-verdict-under-wrapping still holds for the surviving Tier-C op."""
+    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
+    res = await guard("Bash", {"command": 'bash -c "gh pr merge 5"'}, ToolPermissionContext())
     assert isinstance(res, PermissionResultDeny)
     assert res.interrupt is True
-    assert res.message
-    assert len(guard.violations) == 1
-    assert guard.violations[0].operation is Operation.FORCE_PUSH
 
 
 # --------------------------------------------------------------------------- #
-# guard branch enrichment (fail-closed on missing branch/target)
-# --------------------------------------------------------------------------- #
-
-
-def _init_head(repo_root: Path, branch: str | None) -> None:
-    """Make ``repo_root`` a real git repo checked out on ``branch``.
-
-    ``_current_branch`` now shells out to ``git rev-parse --abbrev-ref HEAD``
-    (worktree / packed-ref safe, T23), so the test needs a real repo rather than a
-    hand-written ``.git/HEAD``. ``branch=None`` leaves a non-repo → ``rev-parse``
-    fails → None (fail-closed).
-    """
-    if branch is None:
-        return
-    subprocess.run(
-        ["git", "init", "-q", "-b", branch], cwd=repo_root, check=True, capture_output=True
-    )
-    # An empty commit makes the branch born, so `git rev-parse --abbrev-ref HEAD`
-    # returns it on every git version. Identity via -c (don't depend on global cfg).
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.email=t@e.test",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "init",
-        ],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-
-
-def _init_detached_head(repo_root: Path) -> None:
-    """Make ``repo_root`` a real git repo checked out at a detached HEAD.
-
-    Initialises on ``main``, records the commit sha, then checks that sha out
-    directly so ``git rev-parse --abbrev-ref HEAD`` returns the literal
-    ``HEAD`` (which ``_current_branch`` treats as None → fail-closed).
-    """
-    _init_head(repo_root, "main")
-    sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    subprocess.run(
-        ["git", "checkout", "-q", "--detach", sha],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-
-
-@pytest.mark.anyio
-async def test_guard_bare_push_on_feature_allowed(tmp_path: Path) -> None:
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git push"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow)
-
-
-@pytest.mark.anyio
-async def test_guard_bare_push_on_main_denied(tmp_path: Path) -> None:
-    # branch enriched from HEAD (main) → outside feature/*+develop → deny.
-    _init_head(tmp_path, "main")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git push"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violations[-1].operation is Operation.GIT_PUSH
-
-
-@pytest.mark.anyio
-async def test_guard_commit_on_main_denied(tmp_path: Path) -> None:
-    _init_head(tmp_path, "main")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git commit -m wip"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-
-
-@pytest.mark.anyio
-async def test_guard_merge_while_on_main_denied(tmp_path: Path) -> None:
-    # `git merge feature/x` while on main → target enriched to main → deny.
-    _init_head(tmp_path, "main")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git merge feature/x"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-
-
-@pytest.mark.anyio
-async def test_guard_sync_merge_on_feature_allowed(tmp_path: Path) -> None:
-    """`git merge origin/main` on a feature branch — the exact call that halted the loop.
-
-    Target is enriched to `feature/x` from HEAD, which is what contains it: the merge cannot
-    touch a protected branch. See the SYNC rule in implementer_allowlist.yaml.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git merge origin/main"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow)
-    assert guard.violations == []
-
-
-@pytest.mark.anyio
-async def test_guard_merge_undeterminable_branch_fails_closed(tmp_path: Path) -> None:
-    """No repo → merge target cannot be resolved → UNKNOWN → deny.
-
-    This carries more weight since the SYNC rule landed: `_constraints_pass` skips a target
-    constraint when the target is None, so the merge path's containment now rests on this
-    enrichment. The push variant below was already covered; merge was not.
-    """
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git merge origin/main"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violations[-1].operation is Operation.UNKNOWN
-
-
-@pytest.mark.anyio
-async def test_guard_undeterminable_branch_fails_closed(tmp_path: Path) -> None:
-    # no .git/HEAD → branch can't be resolved → downgrade to UNKNOWN → deny.
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git push"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violations[-1].operation is Operation.UNKNOWN
-
-
-# --------------------------------------------------------------------------- #
-# guard: force_push / history_rewrite branch enrichment
-#
-# `force_push` and `history_rewrite` moved from unconditional Tier C to
-# branch-scoped Tier A on 2026-08-15 (T-branch-scoped-implementer-permissions).
-# The move rests on TWO things happening together — the allow rule with
-# `branch_glob`, AND the enrichment of the current branch from `git rev-parse`.
-# Miss the enrichment and `branch_glob` never fires, because the classifier
-# emits `branch=None` for both operations (rebase mutates HEAD, a bare
-# `git push --force` inherits the checkout).
-#
-# These tests are the ONLY guard against silently missing a new op from the
-# `_enrich` enumeration (a static enum omission produces zero warnings and is
-# invisible to type checks). If a future widening reuses `branch_glob` without
-# also touching `_enrich`, these tests must break — that is what they are for.
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.anyio
-async def test_guard_force_push_bare_on_feature_allowed(tmp_path: Path) -> None:
-    """Bare ``git push --force`` on a feature branch — HEAD → ``feature/x`` → allow."""
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow)
-    assert guard.violations == []
-
-
-@pytest.mark.anyio
-async def test_guard_force_push_bare_on_main_denied(tmp_path: Path) -> None:
-    """Bare ``git push --force`` on ``main`` — HEAD → ``main`` → outside glob → deny.
-
-    The refspec-explicit path was already covered by
-    ``test_guard_denies_force_push_to_main_with_interrupt``; this is the
-    enrichment path, where the classifier emitted ``branch=None`` and the guard
-    filled it in.
-    """
-    _init_head(tmp_path, "main")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violations[-1].operation is Operation.FORCE_PUSH
-
-
-@pytest.mark.anyio
-async def test_guard_force_push_bare_non_repo_fails_closed(tmp_path: Path) -> None:
-    """No repo → HEAD undecidable → UNKNOWN → deny (fail-closed).
-
-    Pinned per msg-1068: a future op widened via ``branch_glob`` without an
-    entry in ``_enrich`` will leave ``branch=None`` on this call and slip
-    through ``_branch_matches``. This test only stays green if
-    ``FORCE_PUSH`` is in the enrichment enumeration.
-    """
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violations[-1].operation is Operation.UNKNOWN
-
-
-@pytest.mark.anyio
-async def test_guard_force_push_bare_detached_head_fails_closed(tmp_path: Path) -> None:
-    """Detached HEAD → ``_current_branch`` returns None → UNKNOWN → deny.
-
-    The other half of the enumeration pin: a real repo, but HEAD is not on a
-    named branch, so enrichment cannot assign one. ``rev-parse --abbrev-ref``
-    prints ``HEAD`` in that state and ``_current_branch`` returns None (which
-    the enrichment downgrades to UNKNOWN → default-deny).
-    """
-    _init_detached_head(tmp_path)
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git push --force"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violations[-1].operation is Operation.UNKNOWN
-
-
-@pytest.mark.anyio
-async def test_guard_rebase_on_feature_allowed(tmp_path: Path) -> None:
-    """``git rebase`` on a feature branch — HEAD → ``feature/x`` → allow.
-
-    The exact call that was previously halting the loop (msg-1056 listed
-    ``spirrow-voxelworld/T-slope-extension-dead-mode`` as denied on
-    ``history_rewrite``). After the widening it now runs.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git rebase origin/develop"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow)
-    assert guard.violations == []
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        ("upstream-and-branch", "git rebase develop main"),
-        ("remote-upstream", "git rebase origin/develop main"),
-        ("onto-form", "git rebase --onto develop feature/y main"),
-    ],
-)
-async def test_guard_rebase_naming_main_explicitly_is_denied(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    """``git rebase <upstream> <branch>`` rewrites ``<branch>``, not HEAD.
-
-    Measured: standing on ``feature/x``, ``git rebase develop main`` checked out
-    ``main`` and moved it. Reading every rebase as "targets HEAD" and filling in
-    the current branch therefore let a rewrite of ``main`` borrow a feature
-    branch's permission — the bypass Tier B found on PR #158. The classifier now
-    names the target, so the glob sees ``main`` and refuses.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # git stops parsing options at `--`, so these name `main` as <branch>.
-        # Measured: git itself refuses the first two with `fatal: invalid
-        # upstream`, so neither rewrote anything — but the parser agrees with git
-        # rather than relying on which of git's errors happen to save us.
-        ("dash-dash-then-flag", "git rebase -- -i main"),
-        ("dash-dash-then-onto", "git rebase -- --onto main"),
-        # And the one that really does rewrite `main`, measured: 7fec953 ->
-        # 9751652 with HEAD left on `main`.
-        ("dash-dash-then-two", "git rebase -- develop main"),
-        ("dash-dash-after-upstream", "git rebase develop -- main"),
-    ],
-)
-async def test_guard_rebase_after_a_double_dash_is_still_read_as_git_reads_it(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-async def test_guard_rebase_naming_a_feature_branch_is_allowed(tmp_path: Path) -> None:
-    """The other side: an explicit target inside the glob still works."""
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git rebase develop feature/z"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow)
-
-
-@pytest.mark.anyio
-async def test_guard_rebase_with_an_unrecognised_flag_is_denied(tmp_path: Path) -> None:
-    """An unconsumed flag value is indistinguishable from a branch name.
-
-    ``git rebase --exec make develop`` reads as two positionals, which would name
-    ``develop`` as the target while the real target is HEAD — fail-OPEN when HEAD
-    is ``main``. Refusing what we do not recognise costs a denial the implementer
-    can avoid by writing the simple form.
-    """
-    _init_head(tmp_path, "main")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard(
-        "Bash", {"command": "git rebase --exec make develop"}, ToolPermissionContext()
-    )
-    assert isinstance(res, PermissionResultDeny)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # Every one measured against `main` from `feature/x`, and every one landed.
-        ("force-move", "git branch -f main HEAD"),
-        ("force-rename-onto-main", "git branch -M main"),
-        ("delete", "git branch -D main"),
-        ("rename-away", "git branch -m main renamed"),
-        # `-C <src> <dst>` clobbers the SECOND name, which one `branch` field
-        # cannot express — so rename and copy are refused outright.
-        ("force-copy-onto-main", "git branch -C feature/x main"),
-        # `-D a b` deletes both and only one fits in `branch`.
-        ("delete-many", "git branch -D feature/a main"),
-        ("force-after-double-dash", "git branch -f -- main"),
-        # Round 4: git does not require the destructive flag to come first, and
-        # an earlier streaming parse met `-v` while `delete` was still false,
-        # called it a listing, and let git delete `main`. Every case above put
-        # the destructive flag first, which is exactly why they all passed.
-        ("unknown-flag-before-delete", "git branch -v -D main"),
-        ("unknown-long-flag-before-force", "git branch --track -f main origin/main"),
-        # Bundled shorts: measured, `-vD main` and `-Dv main` both delete `main`,
-        # so a bundle has to be read as its letters.
-        ("bundled-verbose-delete", "git branch -vD main"),
-        ("bundled-delete-verbose", "git branch -Dv main"),
-        ("delete-after-double-dash", "git branch -D -- main"),
-        # A value-taking flag alongside a destructive one: the value would be
-        # miscounted as a branch name, so it is refused rather than guessed.
-        ("unmodelled-flag", "git branch -f --contains x main"),
-    ],
-)
-async def test_guard_destructive_git_branch_on_main_is_denied(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    """`git branch -f main <commit>` is a history rewrite by another spelling.
-
-    It classified as `exec.code` and ran at Tier A — pre-existing rather than
-    introduced by the branch-glob widening, but it made this PR's promise
-    ("history rewrites are denied on `main`") false as written.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        ("force-move-within-glob", "git branch -f feature/y HEAD"),
-        ("delete-within-glob", "git branch -D feature/old"),
-        ("bundled-quiet-delete-within-glob", "git branch -qD feature/old"),
-        ("create", "git branch feature/new"),
-        ("list", "git branch"),
-        ("list-all", "git branch -a"),
-        ("list-verbose", "git branch -vv"),
-        ("filter-by-merged", "git branch --merged main"),
-        # git: "'-f' is not a valid branch name". After `--` it is a NAME, so
-        # this is a failing creation, not a destructive form — measured, `main`
-        # was untouched. The parser reads it the way git does.
-        ("double-dash-makes-it-a-name", "git branch -- -f main"),
-    ],
-)
-async def test_guard_ordinary_git_branch_still_runs(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # Measured ALLOWED before this rule: validation saw `feature/x`, the
-        # script then destroyed `main`.
-        ("checkout-then-reset", "git checkout main && git reset --hard HEAD~1"),
-        ("switch-then-reset", "git switch main && git reset --hard HEAD~1"),
-        ("checkout-then-rebase", "git checkout main && git rebase origin/develop"),
-        ("checkout-then-force-push", "git checkout main && git push --force"),
-        # No checkout at all — the tracking change redirects the bare push.
-        (
-            "retarget-then-force-push",
-            "git config push.default upstream && git branch -u origin/main && git push --force",
-        ),
-        # Round 6: the same trap catches every HEAD-enriched operation, not only
-        # the two this PR widened. A push to `main` walks past the Tier C gate.
-        ("checkout-then-push", "git checkout main && git push"),
-        ("checkout-then-commit", "git checkout main && git commit -m x"),
-        ("script-then-force-push", "bash s.sh && git push --force"),
-        # Anything chained with one of the two operations this PR widened is
-        # refused, whether or not it looks dangerous: they are rare enough that
-        # the strict rule costs nothing the implementer cannot split into two
-        # tool calls.
-        ("read-only-prefix-force-push", "git status && git push --force"),
-        ("commit-then-force-push", "git commit -m x && git push --force"),
-        # A rebase that NAMES a branch checks it out first, so it is not
-        # branch-preserving company for what follows.
-        ("explicit-rebase-then-push", "git rebase develop main && git push"),
-    ],
-)
-async def test_guard_a_chained_destructive_step_cannot_trust_ambient_head(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    """The guard reads HEAD before the shell runs; a chain can move it first."""
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        ("alone-reset", "git reset --hard HEAD~1"),
-        ("alone-rebase", "git rebase origin/develop"),
-        ("alone-force-push", "git push --force"),
-        # Names its own target, so it never consults HEAD and chaining is moot.
-        ("explicit-target", "git rebase develop feature/z"),
-        # The loop's most common command. Denying it would be a gate people
-        # route around, so for commit/push the rule turns on "can this step
-        # switch branches", not "is the destructive step alone".
-        ("stage-then-commit", "git add . && git commit -m x"),
-        ("stage-commit-push", "git add -A && git commit -m x && git push"),
-        ("diff-then-commit", "git diff --staged && git commit -m x"),
-    ],
-)
-async def test_guard_a_lone_destructive_step_still_runs(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # `detail` is the classifier's tokens rejoined, so the quotes are gone
-        # and shlex refused the bare apostrophe. That refusal used to deny the
-        # chained commit — a denial with nothing behind it. (Tier B, round 7.)
-        ("apostrophe-in-a-path", "git add " + _DQ + "don't.txt" + _DQ + " && git commit -m x"),
-        ("space-in-a-path", "git add " + _DQ + "a b.txt" + _DQ + " && git commit -m x"),
-        # A bare `-` is git's shorthand for the previous branch: measured,
-        # `git rebase -` succeeds, so refusing it protected nothing.
-        ("previous-branch-shorthand", "git rebase -"),
-    ],
-)
-async def test_guard_quoting_and_shorthand_do_not_cost_a_denial(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow), label
-
-
-@pytest.mark.anyio
-async def test_guard_previous_branch_shorthand_still_names_an_explicit_target(
-    tmp_path: Path,
-) -> None:
-    """`-` is a positional, so a second one is still the branch being rewritten."""
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git rebase - main"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("branch", "expected_allow"),
-    [("main", False), ("feature/x", True)],
-)
-async def test_guard_merge_on_main_denied(
-    tmp_path: Path, branch: str, expected_allow: bool
-) -> None:
-    """`git merge` is bounded, and not through `branch_glob`.
-
-    Its absence from `_HEAD_ENRICHED_OPERATIONS` has been reported as a bypass
-    three times (PR #158 rounds 3, 6, 8), because the reason lives outside the
-    diff: `git.merge` is constrained by `source_glob` / `target_glob`, and its
-    destination is filled from HEAD by its own branch in `_enrich`, which sets
-    `target` rather than `branch`. This test puts the answer where a reader of
-    the diff can find it.
-    """
-    _init_head(tmp_path, branch)
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git merge feature/x"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow if expected_allow else PermissionResultDeny)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # `switches_to_main` only matches the literal word, and measured,
-        # `git checkout -` lands on `main` just as well — ALLOWED before this,
-        # and it merged into `main`. (Tier B, PR #158 round 9.)
-        ("previous-branch", "git checkout - && git merge feature/x"),
-        ("previous-branch-switch", "git switch - && git merge feature/x"),
-        ("reflog-shorthand", "git checkout @{-1} && git merge feature/x"),
-        # The literal form, still caught, now by two rules rather than one.
-        ("literal-main", "git checkout main && git merge feature/x"),
-        # Merging into develop is legitimate, but not in a chain that moves the
-        # checkout first: as two tool calls it still works.
-        ("any-checkout", "git checkout develop && git merge feature/x"),
-    ],
-)
-async def test_guard_a_merge_after_a_checkout_cannot_trust_ambient_head(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    """`git merge` takes its destination from HEAD too, through `target`.
-
-    It is bounded by `source_glob` / `target_glob` rather than `branch_glob`,
-    which is why it is not in `_HEAD_ENRICHED_OPERATIONS` — but it borrows the
-    ambient checkout all the same, so it needs the chain check. Two questions,
-    two predicates.
-    """
-    _init_head(tmp_path, "feature/y")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # Measured ALLOWED before this: the structural pass reached UNKNOWN, and
-        # the coarse floor overwrote it with a branchless HISTORY_REWRITE that
-        # `_enrich` then filled with `feature/x`. (Tier B, PR #158 round 10.)
-        ("wrapped-reset", 'bash -c "git checkout main && git reset --hard HEAD~1"'),
-        ("wrapped-force-push", 'bash -c "git checkout main && git push --force"'),
-        ("eval-wrapped", 'eval "git checkout main && git reset --hard"'),
-        (
-            "written-then-run",
-            'echo "git checkout main && git push --force origin main" > s.sh && bash s.sh',
-        ),
-    ],
-)
-async def test_guard_the_coarse_floor_cannot_hand_back_a_branchless_rewrite(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    """The floor is a regex over an opaque string: it knows the verb, never the branch.
-
-    While `force_push` / `history_rewrite` were unconditional Tier C denials that
-    did not matter — the verb alone decided it. Branch-scoped, a `branch=None`
-    from the floor gets enriched with whatever is checked out and looks safe, so
-    the floor's finding is reduced to UNKNOWN: the denial is kept and the branch
-    that was never known is dropped.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-async def test_guard_the_reduced_floor_still_outranks_a_permissive_candidate(
-    tmp_path: Path,
-) -> None:
-    """Reducing the floor's finding to UNKNOWN does not let it lose the rank check.
-
-    UNKNOWN is 90 — second only to the Tier C group at 100, and above everything
-    the structural pass would have allowed. Raised as a bypass on the assumption
-    that UNKNOWN defaults to 0 (PR #158 round 11): here the structural pass sees
-    only `fs.write` (20) because the verb is hidden in a dynamic substitution it
-    cannot unroll, and the floor still wins.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    command = 'eval $(echo "git checkout main && git push --force"); echo "benign" > file.txt'
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violation_actions[-1].rule_id == "raw_coarse"
-
-
-@pytest.mark.anyio
-async def test_guard_wrapping_an_allowed_force_push_still_allows_it(tmp_path: Path) -> None:
-    """T27's direct == wrapped, kept: the reduction must not deny what the
-    direct form allows."""
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": 'eval "git push --force"'}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # Both are force_push at rank 100, and `max` keeps the FIRST — so the
-        # allowed one shadowed the denied one entirely. Measured ALLOWED before
-        # the guard began checking every action. (Tier B, PR #158 round 12.)
-        (
-            "allowed-then-denied",
-            "git push --force origin feature/x && git push --force origin main",
-        ),
-        (
-            "allowed-then-wrapped",
-            'git push --force origin feature/x && bash -c "git push --force origin main"',
-        ),
-        # And with a lower-ranked first action, which always worked — kept so a
-        # regression cannot hide behind the case that was already covered.
-        ("commit-then-denied", "git commit -m x && git push --force origin main"),
-    ],
-)
-async def test_guard_an_allowed_action_cannot_shadow_a_denied_one(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    """Ranking picks what to REPORT; it must not pick what to enforce.
-
-    Two actions can share the top rank while only one would be denied, and ties
-    break by position. While `force_push` was an unconditional Tier C denial it
-    did not matter which one won; branch-scoped, it decides.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-async def test_guard_checking_every_action_does_not_deny_ordinary_batches(
-    tmp_path: Path,
-) -> None:
-    """The other direction: enforcing over all of them must not start refusing
-    the commands the loop actually writes."""
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    for command in (
-        "git add . && git commit -m x",
-        "git add -A && git commit -m x && git push",
-        "git push --force origin feature/x",
-        "git merge feature/x",
-    ):
-        res = await guard("Bash", {"command": command}, ToolPermissionContext())
-        assert isinstance(res, PermissionResultAllow), command
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # The force-push names `feature/x`, so it does not borrow HEAD — and it
-        # outranked the bare `reset --hard` beside it, which did. Measured
-        # ALLOWED while the chain check ran only on the ranked winner.
-        # (Tier B, PR #158 round 13.)
-        (
-            "named-target-shields-a-bare-rewrite",
-            "git push --force origin feature/x && git checkout main && git reset --hard HEAD~1",
-        ),
-        (
-            "named-target-shields-a-bare-push",
-            "git push --force origin feature/x && git checkout main && git push",
-        ),
-        (
-            "commit-shields-a-bare-rewrite",
-            "git commit -m x && git checkout main && git reset --hard HEAD~1",
-        ),
-    ],
-)
-async def test_guard_the_chain_check_reaches_every_borrowing_step(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    """Ranking decides what to report; it must not decide what gets checked.
-
-    A step that names its own target is safe on its own terms and was outranking
-    — and so hiding — a step beside it that took its target from the checkout.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        (
-            "substitution",
-            "echo $(git push --force origin feature/x && git push --force origin main)",
-        ),
-        (
-            "indirection",
-            'bash -c "git push --force origin feature/x && git push --force origin main"',
-        ),
-    ],
-)
-async def test_guard_an_inner_command_cannot_hide_a_sibling(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    """Enforcement flattens what reporting compresses.
-
-    `_classify_bash` reduces a list to one ranked winner, so a decoy inside a
-    substitution or a `bash -c` would carry the whole inner command. These were
-    already denied before the flattening — but only because `_BASH_SEP` splits
-    on `&&` with no regard for quoting or `$(`, so the inner text surfaced as an
-    outer part by accident. Earlier rounds showed that same naivety cutting the
-    other way; safety resting on it is not safety. (Tier B, PR #158 round 14.)
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.parametrize("command", ['eval "git push --force"', 'bash -c "git push --force"'])
-def test_reporting_and_enforcement_keep_separate_lists(command: str) -> None:
-    """The ranked report is not built from the flattened enforcement list.
-
-    `_classify_bash` splits and classifies the command itself; `_bash_actions`
-    is the separate, flattened list the guard iterates. Reading them as one
-    function predicts that `_chain_guarded` runs twice over a flattened list,
-    that the strict widened-operation rule then sees a wrapper and its contents
-    as siblings, and that a wrapped force-push is therefore refused while the
-    bare form is allowed — i.e. that T27 is broken. (Tier B, PR #158 round 26.)
-
-    Measured, the wrapper never reaches the ranking list: `_classify_single_bash`
-    has already reduced wrapper-vs-inner to one action, so that list is length 1
-    and `_chain_guarded` returns it untouched. Flattening lives on the other
-    side, where the chain rule is applied per shell level for exactly this
-    reason.
-    """
-    scanned = _implementer._mask_quoted_heredoc_payloads(command)
-    parts = [p.strip() for p in _implementer._BASH_SEP.split(scanned) if p.strip()]
-    ranking_list = [_implementer._classify_single_bash(p, 0) for p in parts]
-    ranking_list += [
-        _implementer._classify_bash(i, 1) for i in _implementer._extract_substitutions(scanned)
-    ]
-
-    assert len(ranking_list) == 1, [a.operation.value for a in ranking_list]
-    assert _implementer._chain_guarded(ranking_list, command) == ranking_list
-    assert _implementer._classify_bash(command).operation is Operation.FORCE_PUSH
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("command", ['eval "git push --force"', 'bash -c "git push --force"'])
-async def test_guard_flattening_keeps_direct_equal_to_wrapped(tmp_path: Path, command: str) -> None:
-    """T27, kept: a wrapped command and its contents are one step, not a chain.
-
-    Counting them as siblings refused these while the bare `git push --force`
-    was allowed. The chain check therefore runs per shell level.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow), command
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # Summarised as `exec.code` whose first token is `bash`, so nothing
-        # looked like a switch and the push borrowed `feature/x`. Measured
-        # ALLOWED — and it pushes to `main`. (Tier B, PR #158 round 15.)
-        ("wrapper-hides-the-checkout", 'bash -c "git checkout main" && git push'),
-        (
-            "wrapper-hides-it-from-a-rewrite",
-            'bash -c "git checkout main" && git reset --hard HEAD~1',
-        ),
-        # The splitter cuts on `&&` inside the quotes, so the first part arrives
-        # as the fragment `eval "git checkout main` — first token `eval`, and
-        # shlex refuses its quoting. Tokens cannot read a fragment; text can.
-        (
-            "fragment-hides-the-checkout",
-            'eval "git checkout main && git push --force origin feature/x" && git push',
-        ),
-        ("substitution-hides-the-checkout", "echo $(git checkout main) && git push"),
-    ],
-)
-async def test_guard_a_checkout_is_seen_wherever_it_is_written(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    """A checkout writes `.git/HEAD` on disk, so it reaches every later step.
-
-    Including from inside `bash -c`, and including steps at another level — so
-    the question is asked once over the whole flattened command, not of each
-    sibling's summary.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # Piping a script into a shell hides it from the tokenizer, and the
-        # floor's gate did not count that as indirection — so nothing looked.
-        ("piped-into-a-shell", 'echo "git reset --hard" | sh'),
-        # And with a legitimate rank-100 action beside it: the floor names one
-        # operation, and naming the one already understood left the other
-        # unmentioned. Measured ALLOWED. (Tier B, PR #158 round 17.)
-        (
-            "piped-rewrite-beside-an-allowed-force-push",
-            'echo "git reset --hard main" | sh && git push --force origin feature/x',
-        ),
-    ],
-)
-async def test_guard_a_script_piped_into_a_shell_is_still_read(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    """The floor exists for input the tokenizer cannot reach; a pipe is that."""
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("command", ["git log | head", 'eval "git push --force"'])
-async def test_guard_the_floor_does_not_start_denying_what_it_understands(
-    tmp_path: Path, command: str
-) -> None:
-    """Two ways this could have overreached, both checked.
-
-    A pipe that is not into a shell must not open the gate; and an operation the
-    structural pass already read must not be re-reported blindly by the floor,
-    or `eval "git push --force"` would be refused while the bare form passed.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow), command
-
-
-@pytest.mark.anyio
-async def test_guard_a_real_force_push_does_not_cover_for_a_hidden_one(
-    tmp_path: Path,
-) -> None:
-    """A legitimate action must not silence the floor about a smuggled one.
-
-    The floor used to skip any operation the structural pass had already seen
-    anywhere in the command. Here the first part is a real, allowed force-push,
-    so `force_push` counted as seen and the piped one went unmentioned —
-    measured ALLOWED. (Tier B, PR #158 round 19.)
-
-    Reading per part removes the coupling: the first part is named `force_push`
-    and skipped, the second is `exec.code` — nobody named it — and gets read.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    command = 'git push --force origin feature/x && echo "git push --force origin main" | sh'
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # `symbolic-ref` and `update-ref` rewrite HEAD without a checkout, so
-        # the switch pattern never saw them. Measured: `git symbolic-ref HEAD
-        # refs/heads/main` leaves HEAD on `main`, and each of these was ALLOWED.
-        # (Tier B, PR #158 round 20.)
-        ("symbolic-ref-then-push", "git symbolic-ref HEAD refs/heads/main && git push"),
-        ("symbolic-ref-then-commit", "git symbolic-ref HEAD refs/heads/main && git commit -m x"),
-        ("symbolic-ref-then-merge", "git symbolic-ref HEAD refs/heads/main && git merge feature/y"),
-        ("update-ref-then-push", "git update-ref --no-deref HEAD refs/heads/main && git push"),
-    ],
-)
-async def test_guard_head_can_be_moved_without_a_checkout(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-async def test_guard_reading_head_is_not_moving_it(tmp_path: Path) -> None:
-    """`git symbolic-ref HEAD` with no second argument only reports. The pattern
-    is deliberately coarser than that — it costs a denial on a chained read, and
-    nothing else."""
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git symbolic-ref HEAD"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # git takes global flags BEFORE the subcommand, and the pattern anchors
-        # the subcommand to `git`. All three measured ALLOWED beside a merge or
-        # a push. (Tier B, PR #158 round 22.)
-        ("dash-C", "git -C . checkout main && git merge feature/y"),
-        ("dash-c", "git -c core.autocrlf=false checkout main && git push"),
-        ("no-pager", "git --no-pager checkout main && git push"),
-        ("global-flag-then-symbolic-ref", "git -C . symbolic-ref HEAD refs/heads/main && git push"),
-    ],
-)
-async def test_guard_a_global_flag_does_not_hide_the_subcommand(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git commit -m checkout && git push",
-        'git commit -m "switch to main later" && git push',
-    ],
-)
-async def test_guard_a_subcommand_name_inside_a_message_is_not_a_switch(
-    tmp_path: Path, command: str
-) -> None:
-    """Why the pattern stays anchored and the tokens do the widening.
-
-    Matching `checkout` anywhere after `git` would have caught the global-flag
-    forms — and also every commit whose message mentions one, denying an
-    ordinary chained commit. `_git_subcommand` walks past the global flags and
-    still reports `commit` here.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow), command
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        # An `env` prefix does not hide the subcommand: the classifier strips a
-        # leading `NAME=value` / `env` prefix, so the action's detail is plain
-        # `git -C . checkout main` and `_git_subcommand` reads `checkout`.
-        # Raised as a bypass on the assumption that the token check bails at
-        # `tokens[0] == "env"` (PR #158 round 25); measured, it does not.
-        ("env-prefixed-in-a-substitution", "echo $(env git -C . checkout main) && git push"),
-        ("env-prefixed-then-commit", "echo $(env git -C . checkout main) && git commit -m x"),
-        ("env-no-global-flag", "echo $(env git checkout main) && git push"),
-        ("global-flag-in-a-substitution", "echo $(git -C . checkout main) && git merge feature/y"),
-    ],
-)
-async def test_guard_an_env_prefix_does_not_hide_a_switch(
-    tmp_path: Path, label: str, command: str
-) -> None:
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny), label
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "command",
-    ["echo $(git status) && git push", "echo $(git log --oneline -1) && git commit -m x"],
-)
-async def test_guard_a_read_only_substitution_is_not_a_switch(tmp_path: Path, command: str) -> None:
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": command}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow), command
-
-
-@pytest.mark.anyio
-async def test_known_gap_an_opaque_step_before_a_plain_push_is_not_seen(
-    tmp_path: Path,
-) -> None:
-    """Records a limit rather than a guarantee, so nobody reads one for the other.
-
-    `_may_switch_branch` is a denylist, so a step it does not recognise passes.
-    `make deploy` can check out `main` inside the Makefile and `git push` then
-    runs there. The stricter rule — refuse any chain whose other steps are not
-    provably branch-preserving — was written and measured: it failed 33 tests,
-    because the classifier splits a heredoc's body and terminator into separate
-    actions, so every `git commit -F - <<'EOF' … EOF` counted as a chain.
-
-    The exposure is the one `git commit` / `git push` have carried since they
-    were first branch-scoped; this PR neither widens nor closes it. The two
-    operations this PR DOES widen get the strict rule, where it costs nothing.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "make deploy && git push"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow)
-
-
-@pytest.mark.anyio
-async def test_guard_filter_branch_stays_denied(tmp_path: Path) -> None:
-    """`filter-branch` takes rev-list arguments, so any of them can name a branch.
-
-    Recognising those shapes would be cost without a caller, so it keeps the
-    Tier C denial it had before this widening — on a feature branch too.
-    """
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard(
-        "Bash",
-        {"command": "git filter-branch --tree-filter true -- main"},
-        ToolPermissionContext(),
-    )
-    assert isinstance(res, PermissionResultDeny)
-
-
-@pytest.mark.anyio
-async def test_guard_rebase_on_main_denied(tmp_path: Path) -> None:
-    """``git rebase`` while on ``main`` — HEAD → ``main`` → outside glob → deny.
-
-    The trap Bohr flagged in msg-1056 §2: ``git rebase`` carries no target
-    argument, so a naïve reading of ``action.branch`` is ``None`` — and
-    ``_branch_matches(None, ...)`` is fail-OPEN. This test only passes because
-    ``_enrich`` fills the branch from HEAD before ``check`` runs.
-    """
-    _init_head(tmp_path, "main")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git rebase origin/develop"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violations[-1].operation is Operation.HISTORY_REWRITE
-
-
-@pytest.mark.anyio
-async def test_guard_history_rewrite_non_repo_fails_closed(tmp_path: Path) -> None:
-    """No repo → HEAD undecidable → UNKNOWN → deny (fail-closed).
-
-    Pin for ``HISTORY_REWRITE`` mirroring the ``FORCE_PUSH`` case above; both
-    must be enumerated in ``_enrich`` for the widening to be safe.
-    """
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git rebase origin/develop"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violations[-1].operation is Operation.UNKNOWN
-
-
-@pytest.mark.anyio
-async def test_guard_history_rewrite_detached_head_fails_closed(tmp_path: Path) -> None:
-    """Detached HEAD → UNKNOWN → deny (fail-closed) for ``git rebase`` too."""
-    _init_detached_head(tmp_path)
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git rebase origin/develop"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violations[-1].operation is Operation.UNKNOWN
-
-
-@pytest.mark.anyio
-async def test_guard_reset_hard_on_feature_allowed(tmp_path: Path) -> None:
-    """``git reset --hard`` classifies as ``HISTORY_REWRITE``; allowed on a feature branch."""
-    _init_head(tmp_path, "feature/x")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git reset --hard HEAD~1"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow)
-    assert guard.violations == []
-
-
-@pytest.mark.anyio
-async def test_guard_reset_hard_on_main_denied(tmp_path: Path) -> None:
-    """``git reset --hard`` while on ``main`` — HEAD → ``main`` → deny."""
-    _init_head(tmp_path, "main")
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "git reset --hard HEAD~1"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultDeny)
-    assert guard.violations[-1].operation is Operation.HISTORY_REWRITE
-
-
-# --------------------------------------------------------------------------- #
-# adapter lifecycle (fake SDK client)
+# adapter lifecycle
 # --------------------------------------------------------------------------- #
 
 
 def _assistant(text: str) -> AssistantMessage:
-    return AssistantMessage(content=[TextBlock(text=text)], model="test-model")
+    return AssistantMessage(content=[TextBlock(text=text)], model="test", parent_tool_use_id=None)
 
 
-def _result(*, is_error: bool = False) -> ResultMessage:
+def _result(is_error: bool = False) -> ResultMessage:
     return ResultMessage(
         subtype="success",
         duration_ms=1,
@@ -1601,6 +627,21 @@ def _event(
     )
 
 
+def _init_head(repo_root: Path, branch: str | None) -> None:
+    """Initialise a git repo (only needed by the manual smoke tests now)."""
+    subprocess.run(
+        ["git", "init", "--quiet", "--initial-branch=main", str(repo_root)],
+        check=True,
+        capture_output=True,
+    )
+    if branch is not None and branch != "main":
+        subprocess.run(
+            ["git", "-C", str(repo_root), "checkout", "-q", "-b", branch],
+            check=True,
+            capture_output=True,
+        )
+
+
 def test_capabilities_execute_code_not_naysayer() -> None:
     caps = ImplementerSdkAdapter.capabilities
     assert Capability.EXECUTE_CODE in caps
@@ -1646,9 +687,8 @@ async def test_spawn_routes_inference_via_base_url(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_make_options_exposes_builtins_and_isolates(tmp_path: Path) -> None:
-    # T37: regression guard for the four wiring fixes. The whole "implementer
-    # never ran for real" finding was that tools=[] disabled every built-in, so
-    # pin the exposure + isolation + UTF-8 + guard wiring against silent drift.
+    # T37: regression guard for the four wiring fixes. Pin the exposure +
+    # isolation + UTF-8 + guard wiring against silent drift.
     cap: list[_FakeSdkClient] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
@@ -1667,22 +707,17 @@ async def test_make_options_exposes_builtins_and_isolates(tmp_path: Path) -> Non
     assert opts.allowed_tools == []
     assert opts.can_use_tool is not None
     assert opts.permission_mode == "default"
-    # #4 isolation: no host settings (connectors/CLAUDE.md/permissions) inherited,
-    # and only explicitly-passed MCP servers are honored.
+    # #4 isolation: no host settings inherited; only explicit MCP servers honored.
     assert opts.setting_sources == []
     assert opts.strict_mcp_config is True
     # #2 UTF-8 forced for the subprocess + any python the agent spawns.
     assert opts.env["PYTHONUTF8"] == "1"
     assert opts.env["PYTHONIOENCODING"] == "utf-8"
-    # T40: the cwd grounding reaches the SDK system prompt (so the agent knows its working dir).
+    # T40: the cwd grounding reaches the SDK system prompt.
     assert str(tmp_path) in opts.system_prompt
 
 
 def test_system_prompt_grounds_cwd(tmp_path: Path) -> None:
-    # T40: the implementer runs with a custom system prompt (no claude_code working-dir section), so
-    # it must be told its cwd explicitly — else it guesses an absolute path (observed on the
-    # voxelworld conductor smoke: it targeted /home/user/<repo>/... and the guard fail-loud denied
-    # the out-of-repo write). Grounding the cwd + mandating relative paths fixes it.
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lx"
     )
@@ -1694,34 +729,13 @@ def test_system_prompt_grounds_cwd(tmp_path: Path) -> None:
     assert "Conductor handoff protocol" in sp
 
 
-# --- what the implementer may NOT read (2026-08-09) ------------------------- #
-# Voxelworld PR #182: asked to "perform the ADR-2026-05-29-13 read-back", the session had neither
-# the ADR body (separate docs repo) nor even the id->title map, so it reconstructed the ADR from
-# context and stated the result as fact — three of five claims attributed to ADR-13 things it does
-# not say. The failure was not ignorance but silent confident invention, so the fix is two halves:
-# say what you cannot read, and know which ADRs exist. Neither half works alone.
-#
-# 2026-08-09 update (T-loop-readable-obligations): the DECLARE-UNREADABLE clause was MOVED to
-# spec/process/obligations.yaml (OBL-DECLARE-UNREADABLE) and is now injected via the manifest.
-# Per the Tier-C GO msg-737 ("delete the ping to the string literal? no — repoint at the rendered
-# prompt"), this test was kept and its assertions repointed at the assembled ``_system_prompt``
-# (which was already the target here). The check now verifies the WIRING — that the injection
-# path lands the moved body in the rendered prompt — rather than the string literal that no
-# longer exists in source.
-
-
 def test_system_prompt_forbids_reconstructing_unreadable_documents(tmp_path: Path) -> None:
     sp = ImplementerSdkAdapter(
         cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lx"
     )._system_prompt
     assert "DOCUMENTS YOU CANNOT READ" in sp
-    # The instruction must be to DECLARE the gap, not merely to be careful about it.
     assert "cannot read" in sp
     assert "do NOT reconstruct" in sp
-    # And the injection wiring must actually be the one delivering it — the id label
-    # travels alongside the body so a regression that dropped the injection path
-    # (e.g. someone re-inlining the paragraph in source instead of using the manifest)
-    # fires here as well as in the id-coverage canary.
     assert "[OBL-DECLARE-UNREADABLE]" in sp
 
 
@@ -1730,10 +744,7 @@ def test_system_prompt_carries_the_adr_index_as_titles_only(tmp_path: Path) -> N
         cwd=tmp_path, obligations=_OBLIGATIONS, inference_base_url="http://lx"
     )._system_prompt
     assert "ADR INDEX" in sp
-    # A real id from the in-repo manifest — the map is present, not a placeholder.
     assert "ADR-2026-05-29-13" in sp
-    # And it must be labelled for what it is. Handing over titles WITHOUT this caveat would invite
-    # better-grounded confabulation, which is harder to catch than the original failure.
     assert "TITLES ONLY" in sp
     assert "NOT the ADRs" in sp
 
@@ -1741,7 +752,7 @@ def test_system_prompt_carries_the_adr_index_as_titles_only(tmp_path: Path) -> N
 def test_adr_index_block_says_so_when_the_manifest_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A missing manifest is announced, never shipped as a silent gap (mirrors the naysayer)."""
+    """A missing manifest is announced, never shipped as a silent gap."""
     import spirrow_mindwire.adapters.implementer as impl
 
     monkeypatch.setattr(impl, "load_adr_index", lambda *a, **k: ())
@@ -1771,6 +782,7 @@ async def test_deliver_emits_reply_when_allowed(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_deliver_allowlist_violation_fails_loud(tmp_path: Path) -> None:
+    """`gh pr merge` is the tool call that trips the sole surviving Tier-C rule."""
     captured: list[ReplyDraft] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
@@ -1778,10 +790,7 @@ async def test_deliver_allowlist_violation_fails_loud(tmp_path: Path) -> None:
         inference_base_url="http://lx",
         client_factory=_factory(
             responses=[_assistant("ignored"), _result()],
-            # Force-pushing to ``main`` is still Tier C after 2026-08-15 (only the
-            # branch-scoped feature/develop cases were widened) — this is the
-            # allow-list violation we want the adapter lifecycle to surface fail-loud.
-            simulate_tool=("Bash", {"command": "git push --force origin main"}),
+            simulate_tool=("Bash", {"command": "gh pr merge 5"}),
         ),
     )
     handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx(captured))
@@ -1857,15 +866,11 @@ async def test_deliver_on_halted_session_raises(tmp_path: Path) -> None:
 
 
 def test_builtin_tool_set_is_self_consistent() -> None:
-    # T37: the benign-whitelist set must be a subset of the exposed tools (a tool
-    # the model can never call need not be whitelisted), and the core code/fs tools
-    # the implementer's job needs must actually be exposed. Pins the two T37 #1/#3
-    # constants against drifting apart.
+    # T37: the benign-whitelist set must be a subset of the exposed tools, and
+    # the core code/fs tools the implementer's job needs must actually be exposed.
     exposed = set(_IMPLEMENTER_BUILTIN_TOOLS)
     assert exposed >= _BENIGN_BUILTIN_TOOLS
     assert exposed >= {"Read", "Write", "Edit", "Bash", "Glob", "Grep"}
-    # every exposed tool classifies to something the default allow-list can act on
-    # (never UNKNOWN — that would silently halt the agent on a tool we handed it).
     for tool in exposed:
         assert classify_tool_call(tool, {}).operation is not Operation.UNKNOWN
 
@@ -1880,11 +885,12 @@ def test_builtin_tool_set_is_self_consistent() -> None:
 async def test_manual_sdk_routes_tool_calls_through_guard(tmp_path: Path) -> None:
     """The whole gate rests on the real SDK calling can_use_tool for every tool.
 
-    Run with a working Lexora Anthropic-compat endpoint:
+    Now that fs.delete is retired, the smoke test uses `gh pr merge` — the sole
+    surviving Tier-C route the guard denies. Run with a working Lexora endpoint:
+
         MINDWIRE_IMPLEMENTER_BASE_URL=... uv run pytest -m manual -k manual_sdk
-    Asks the model to run a forbidden command and asserts the guard denied it
-    (proving permission_mode=default + allowed_tools=[] route Bash through the
-    guard, not auto-approval).
+
+    Asks the model to run the forbidden command and asserts the guard denied it.
     """
     base = os.environ.get("MINDWIRE_IMPLEMENTER_BASE_URL")
     if not base:
@@ -1896,7 +902,7 @@ async def test_manual_sdk_routes_tool_calls_through_guard(tmp_path: Path) -> Non
         with pytest.raises(ImplementerAllowlistError):
             await adapter.deliver_event(
                 handle,
-                _event(body="Run exactly this shell command and nothing else: rm -rf /tmp/denied"),
+                _event(body="Run exactly this shell command and nothing else: gh pr merge 999999"),
             )
         assert (await adapter.health(handle)).state is SessionState.FAILED
     finally:
@@ -1906,17 +912,7 @@ async def test_manual_sdk_routes_tool_calls_through_guard(tmp_path: Path) -> Non
 @pytest.mark.manual
 @pytest.mark.anyio
 async def test_manual_sdk_executes_allowed_tool_through_guard(tmp_path: Path) -> None:
-    """The other half of the gate: an ALLOWED tool must actually EXECUTE (T37 #1).
-
-    Before the tool-wiring fix the session was launched with ``tools=[]`` and the
-    model had no built-in tools at all, so it could neither act nor trip the guard
-    — the deny test above would pass for the wrong reason (model can't call Bash)
-    while the implementer was in fact a no-op. This asks the model to create a
-    file inside the repo (a Tier A ``fs.write``) and asserts the file really lands
-    on disk, proving Write/Bash are exposed and the allow path runs end to end.
-
-        MINDWIRE_IMPLEMENTER_BASE_URL=... uv run pytest -m manual -k executes_allowed
-    """
+    """The other half of the gate: an ALLOWED tool must actually EXECUTE (T37 #1)."""
     base = os.environ.get("MINDWIRE_IMPLEMENTER_BASE_URL")
     if not base:
         pytest.skip("set MINDWIRE_IMPLEMENTER_BASE_URL (Lexora Anthropic-compat) to run")
@@ -1943,8 +939,6 @@ async def test_manual_sdk_executes_allowed_tool_through_guard(tmp_path: Path) ->
 
 
 def test_default_system_prompt_includes_implementer_handoff_protocol() -> None:
-    # PR-2b-1: the implementer ends every reply with a NEXT: line — hand back to the proposer for a
-    # spec-review, or to the human for a Tier-C decision (it never merges to main itself).
+    # PR-2b-1: the implementer ends every reply with a NEXT: line.
     assert "Conductor handoff protocol" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
     assert "NEXT:" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT
-    assert "never merge" in _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT

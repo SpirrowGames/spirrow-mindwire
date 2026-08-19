@@ -1,12 +1,16 @@
 """Structured record for an allow-list denial — what was attempted, not just which rule fired.
 
 Spec: ``spec/design/T-denial-detail-and-overdeny.md`` (PR-1). Background: on
-2026-08-11 six implementer sessions halted on ``allow-list denied fs.delete`` and
-**no record anywhere said what the session had tried to do**. The classifier holds
-the raw command in :attr:`~spirrow_mindwire.allowlist.ClassifiedAction.detail`, but
-the error message is built from ``decision.reason`` alone — the static Tier-C string
-out of the allow-list YAML. The denial was loud about the *rule* and silent about the
-*act*, which made the halts undiagnosable.
+2026-08-11 six implementer sessions halted on ``allow-list denied fs.delete`` (an
+operation retired from the classifier on 2026-08-19 —
+T-drop-branch-prediction-from-allowlist §3, msg-1272 §1) and **no record anywhere
+said what the session had tried to do**. The classifier holds the raw command in
+:attr:`~spirrow_mindwire.allowlist.ClassifiedAction.detail`, but the error message
+is built from ``decision.reason`` alone — the static Tier-C string out of the
+allow-list YAML. The denial was loud about the *rule* and silent about the *act*,
+which made the halts undiagnosable. The record design here survives the
+``fs.delete`` retirement unchanged, because the diagnostic question ("which act
+tripped this rule") is common to every deny — it is not tied to any one operation.
 
 Two layers, deliberately split by what can fail:
 

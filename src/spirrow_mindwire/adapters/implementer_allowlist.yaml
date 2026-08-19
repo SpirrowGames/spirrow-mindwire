@@ -8,6 +8,87 @@
 #
 # The implementer's world is Tier A (allow) + Tier C (forbidden) only; Tier B
 # (naysayer review) is a post-PR gate, not an implementer operation (§B.2).
+#
+# --- 2026-08-19: allow-list simplified (T-drop-branch-prediction-from-allowlist §3) ---
+#
+# Three changes land together (msg-1272, Takahito Tier-C decide):
+#
+# (1) `branch_glob` is dropped from four operations (`git.commit` / `git.push` /
+#     `history_rewrite` / `force_push`) and `source_glob` / `target_glob` are
+#     dropped from `git.merge`. Until PR #158 the loop-level gate was the SOLE
+#     guarantee that nothing reached `main`; that stopped being true on 2026-08-19
+#     when the `guard-default-branch` org ruleset (id=21017016, enforcement=active)
+#     went live across all 21 SpirrowGames repos with `current_user_can_bypass=never`
+#     for the loop identity. `main` is now protected BY THE SERVER — a push /
+#     force-push / ref-deletion to `main` is rejected by GitHub before it lands,
+#     whether the allow-list would have caught it or not.
+#
+#     So the classifier no longer PREDICTS which branch a bare `git push` /
+#     `git commit` / `git rebase` / `git merge` / `git reset --hard` would touch —
+#     a prediction that took 26 rounds of Tier-B review on PR #158 to get
+#     approximately right, because the question is genuinely hard (a chained
+#     `git checkout main`, a retargeted upstream, an inline `git -c push.default=...`,
+#     `git symbolic-ref HEAD ...`, and so on). The whole prediction machinery
+#     (`_current_branch` / `_push_destination` / `_enrich` / `_rebase_target` /
+#     `_branch_target` / `_borrows_ambient_head` / `_may_switch_branch` / the
+#     chain-guard / the `checkout-main` classifier special case) has been removed
+#     from the enforcement path in `adapters/implementer.py`.
+#
+# (2) `fs.write`'s `<repo>/**` `path_glob` is dropped, and `fs.delete` /
+#     `drive.write` / `external.publish` are dropped from Tier-C forbidden (their
+#     `Operation` enum values and classification paths removed too). The measurement
+#     that forced this (msg-1272 §1):
+#
+#         `fs.delete`         `exec.code` is unconstrained ∴ `python -c
+#                             "shutil.rmtree(...)"` was always a way around — the
+#                             classifier's `fs.delete` deny was theatre, and it
+#                             stopped three threads in one day.
+#         `fs.write` path_glob  same bypass through `exec.code`; and 2026-08-08's
+#                             OS-temp scratch-write halt was already relocated to
+#                             the system prompt's SCRATCH FILES rule (the only place
+#                             the loop actually reads).
+#         `drive.write`       the implementer session runs with `setting_sources=[]`
+#                             / `strict_mcp_config=True` and zero MCP tools; there
+#                             is no Drive credential on this host. Rule was
+#                             unreachable, and unreachable rules skew judgement.
+#         `external.publish`  squid egress default-deny already rejects
+#                             `example.com` / `hooks.slack.com` / `api.telegram.org`
+#                             / `discord.com` at CONNECT; only `api.github.com`
+#                             passes. The classifier duplicated a stronger boundary.
+#
+#     Principle (msg-1272 §2, Takahito): "今要らないものは残さない方がいい" — a
+#     rule that is not the actual guarantor of an invariant skews the next round of
+#     judgement (the next design sees "we still have a check here" and does not
+#     reach for the layer that actually holds). Where a check IS the guarantor
+#     (`git.merge_to_main` for the merge API, which the GitHub push-rejection does
+#     not cover, and org-external repos where the ruleset does not reach), it stays.
+#
+# (3) The replacement for (1) is asymmetric on purpose: predictions are hard, but
+#     confirming a PRECONDITION is easy. The composition root
+#     (`loop_runner._preflight_gate`) checks once per daemon start:
+#
+#       P0  the implementer's `repo_root` is not the daemon's own checkout (§7 of
+#           the spec — Bohr msg-1267 §1 confirmed this holds for today's sweep.json,
+#           but the docstring assumption is now enforced as an invariant, not left
+#           as config discipline).
+#       P1  the target repo's default branch has the three server-side rules
+#           (`deletion` / `non_fast_forward` / `pull_request`) AND the loop's
+#           identity has `current_user_can_bypass=never` on the ruleset.
+#       P2  every remote's URL in the target repo is under
+#           `https://github.com/SpirrowGames/` (Tier-C decide 2026-08-19 msg-1270,
+#           option β: network-boundary enforcement, not credential-scope enforcement
+#           — R-1 measured the loop's PAT is a classic `gho_` OAuth token with
+#           scope `repo`, so credential-scope would need a separate token-issuance
+#           Tier-C).
+#
+#     A failed precondition halts the daemon (SystemExit), never the individual
+#     tool call — the world's premise is broken, not this particular command.
+#
+# `git.merge_to_main` stays Tier C (I-2, D-5) — a canonical `main` merge is never
+# automated regardless of what the local branch predicate would say. That guarantee
+# does not depend on any of the removed prediction machinery — the classifier
+# routes `gh pr merge` / MCP `merge_pull_request` to `GIT_MERGE_TO_MAIN`
+# independent of any base argument.
 version: 1
 default: deny
 
@@ -17,73 +98,32 @@ allow:
   - operation: fs.read
   - operation: search
   - operation: github.read
-  # Repo files only. `<repo>/**` is repo-CONTAINMENT, not literal fnmatch (see
-  # allowlist._match_path_glob), so it already covers scratch files anywhere under the
-  # repo — no extra rule is needed for those, and none should be added.
-  #
-  # This bites in a way worth naming: 2026-08-08, the implementer finished both Step 0
-  # commits and then died opening the PR, because it wrote the PR body to the OS temp
-  # directory out of habit. Nothing here was wrong; the rule was never explained to the
-  # only party bound by it. The fix therefore lives in the implementer's SYSTEM PROMPT
-  # (adapters/implementer.py, "SCRATCH FILES"), which is what that session actually
-  # reads — it runs with `setting_sources=[]` and never sees this file or CLAUDE.md.
-  # Keep the two in step: a constraint stated only here is a constraint the loop cannot obey.
+  # fs.write is unconstrained at this layer as of 2026-08-19 (see header (2)).
+  # `<repo>/**` was here until then, but the same `exec.code` bypass that retired
+  # `fs.delete` retired this too: a `python -c "open('/tmp/x','w')..."` was never
+  # actually stopped, and the residual guarantee (OS-temp writes fail) had already
+  # moved to the SCRATCH FILES rule in the implementer's SYSTEM PROMPT — the only
+  # text the loop actually reads (`setting_sources=[]` means it never sees this
+  # file or CLAUDE.md). Keeping the constraint here alongside would skew judgement
+  # ("the rule is enforced twice") without adding enforcement.
   - operation: fs.write
-    path_glob: "<repo>/**"
+  # git.commit / git.push / force_push / history_rewrite / git.merge are Tier A
+  # UNCONSTRAINED at this layer as of 2026-08-19 (see header (1)). The `main`
+  # guarantee moved to the composition-root preflight (P0/P1/P2) + GitHub server
+  # ruleset.
+  #
+  # `git.push` still carries `force: false` as defence in depth: the classifier
+  # already routes any force flag to FORCE_PUSH, but if a mis-classification ever
+  # emitted GIT_PUSH with `force=true`, this constraint denies it and the
+  # FORCE_PUSH rule below is the correct route. That rule is now Tier A
+  # unconstrained too, so the effect of the routing distinction is provenance
+  # (the denial record says "force_push" rather than "git.push") — not blocking.
   - operation: git.commit
-    branch_glob: ["feature/*", "develop"]
   - operation: git.push
-    branch_glob: ["feature/*", "develop"]
     force: false
-  # Branch-scoped Tier-A widening (T-branch-scoped-implementer-permissions, Tier-C
-  # approval 2026-08-15). `main` is off-limits, everywhere else a repo whose ref is
-  # `feature/*` / `develop` is by construction recoverable — git keeps the history.
-  # Two constraints keep this from opening `main`:
-  #   1. `branch_glob` is set here to `feature/*` / `develop` — exactly the same
-  #      shape as `git.commit` / `git.push` above.
-  #   2. `_AllowlistGuard._enrich` (adapters/implementer.py) resolves the current
-  #      branch from `git rev-parse` for these operations too, because neither
-  #      carries a branch on the command line (rebase mutates HEAD, and a bare
-  #      `git push --force` inherits the checked-out branch). If HEAD cannot be
-  #      resolved (detached / non-repo / git failure), the action is downgraded
-  #      to UNKNOWN and default-deny catches it. The rule of these two lines only
-  #      holds because both halves land together — never widen `history_rewrite` or
-  #      `force_push` without the enrichment, or `_branch_matches(None, ...)` in
-  #      allowlist.py falls through to fail-OPEN.
-  # `fs.delete` was NOT widened here: its risk is not "which branch am I on" but
-  # "is what I am erasing recoverable", and that predicate lives on the target
-  # path, not on the ambient HEAD. It gets its own gate — see T-fs-delete-path-scope.
-  - operation: history_rewrite
-    branch_glob: ["feature/*", "develop"]
   - operation: force_push
-    branch_glob: ["feature/*", "develop"]
-  # Two different operations wear the name `git.merge`, and only one of them was listed.
-  #
-  #   PUBLISH  feature/* -> develop   promotes work. Constrained by BOTH ends.
-  #   SYNC     <anything> -> feature/*  brings a branch up to date. Contained by its TARGET
-  #            alone: a merge into a feature branch cannot alter a protected branch, whatever
-  #            it merges from. The target is the containment; the source does not need one.
-  #
-  # Listing only PUBLISH denied the implementer `git merge origin/main` on its own feature
-  # branch — the ordinary way to get current before working. Measured 2026-08-09: the
-  # implementer's clone was 7 commits behind `origin/main`, the code it had been asked to MOVE
-  # was introduced in one of those commits, and nothing anywhere syncs that clone (#129 syncs
-  # the daemon checkout, not the implementer's). So the task was not merely awkward without
-  # SYNC, it was impossible — and the session halted instead.
-  #
-  # `source_glob: ["*"]` is deliberate, and is the lesson of #123 applied one rule to the left:
-  # naming `main` / `develop` here would re-encode one project's branch flow into a
-  # repo-agnostic file, which is exactly what #123 had to undo for `github.pr.open`. Safety
-  # does not come from the source list — it comes from the target, and from `git.merge_to_main`
-  # staying Tier C below. A merge target is resolved from `.git/HEAD` and fails CLOSED
-  # (UNKNOWN -> deny) when it cannot be determined, so an unparseable checkout does not slip
-  # through either.
-  - operation: git.merge        # PUBLISH: feature/* -> develop self-review merge
-    source_glob: ["feature/*"]
-    target_glob: ["develop"]
-  - operation: git.merge        # SYNC: bring a feature branch up to date
-    source_glob: ["*"]
-    target_glob: ["feature/*"]
+  - operation: history_rewrite
+  - operation: git.merge
   - operation: github.pr.open   # opening a PR is reversible (Tier A)
     # PROVISIONAL (2026-08-02). Restored to ["develop", "main"] after being
     # narrowed to ["develop"] the same day for V-4.
@@ -114,22 +154,20 @@ allow:
     target_glob: ["develop", "main"]
 
 # --- Tier C: forbidden operations (explicit, with fail-loud reasons) ---
-# These are unreachable from the loop; each requires Takahito pre-GO (Tier C).
+# One operation only, as of the 2026-08-19 simplification (see header (2)):
+# `git.merge_to_main` is the sole remaining classifier-executed Tier C guarantee.
+# The classifier routes `gh pr merge` and MCP `merge_pull_request` here from a
+# name match alone (no HEAD read, no base argument inspection, no branch
+# prediction — the name is the verdict), so this rule does NOT depend on any
+# removed prediction machinery. It stays because the GitHub server push
+# rejection covers the push, not the merge API, and covers SpirrowGames repos
+# only — org-external repos would still be reachable via a raw `gh pr merge`
+# without this line.
 #
-# `force_push` and `history_rewrite` used to live here too, and were moved to the
-# `allow` block above with a `branch_glob` that excludes `main` (Tier-C approval
-# 2026-08-15, T-branch-scoped-implementer-permissions). The line the human drew
-# was not "these operations are always dangerous" but "these operations are
-# dangerous ON `main` — everywhere else git already preserves recovery." Keep
-# that framing when reading the list below: what remains here is what stays
-# dangerous regardless of the current branch (a canonical merge, a filesystem
-# deletion, a Drive / external side-effect).
+# `force_push` / `history_rewrite` / `fs.delete` / `drive.write` /
+# `external.publish` used to live here too; they moved out (see header (1)/(2))
+# because a stronger layer executes each invariant already and duplicating the
+# check here only skewed future judgement.
 forbidden:
   - operation: git.merge_to_main
     reason: "main への merge は Tier C (Takahito 事前承認)。loop からは実行不可。"
-  - operation: fs.delete
-    reason: "ファイル削除は Tier C (T-fs-delete-path-scope で path-scoped 化予定)。"
-  - operation: drive.write
-    reason: "Drive canonical 反映は Tier C (main チェーン管轄、implementer scope 外)。"
-  - operation: external.publish
-    reason: "外部副作用 (publish / post / send) は Tier C。"
