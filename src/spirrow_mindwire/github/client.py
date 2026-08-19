@@ -3,14 +3,25 @@
 The PR-review naysayer driver
 (:class:`~spirrow_mindwire.naysayer.pr_review.NaysayerPrReviewDriver`)
 uses this to (1) fetch a PR's unified diff and (2) submit a PR review
-(``APPROVE`` / ``REQUEST_CHANGES``) on the develop→main PR. Auth is a
-**repo-scoped fine-grained token** (env spec §4: Contents R/W + PR R/W).
-The implementer (author) token is resolved from ``MINDWIRE_GITHUB_TOKEN`` /
-``GITHUB_TOKEN`` (:func:`github_token`) = ``takahito-spirrowgames``; the review
-side (proposer + naysayer, shared) uses a *separate* identity
+(``APPROVE`` / ``REQUEST_CHANGES``) on the develop→main PR. The implementer
+(author) token is resolved from ``MINDWIRE_GITHUB_TOKEN`` / ``GITHUB_TOKEN``
+(:func:`github_token`) = ``takahito-spirrowgames``; the review side (proposer +
+naysayer, shared) uses a *separate* identity
 (``MINDWIRE_NAYSAYER_GITHUB_TOKEN``, :func:`naysayer_github_token`) =
 ``spirrowgames-ops`` so its review is author≠approver — GitHub rejects
 approving your own PR (T22).
+
+Auth reality (measured 2026-08-19, R-1 of msg-1269): the implementer token in
+production is a **classic OAuth PAT** (`gho_` prefix, scope `repo`), NOT the
+`repo-scoped fine-grained token` the previous revision of this docstring
+claimed. That drift matters for the design of
+T-drop-branch-prediction-from-allowlist §3: a `repo` scope reaches every repo
+the user can access, so a fine-grained-token-based "reach" bound (P2 option
+"alpha" of msg-1270) is unavailable today; the composition-root preflight
+enforces P2 via `git remote` URL boundary instead (option "beta"), and
+`main` protection is executed by the GitHub org ruleset. If the token is ever
+narrowed to a fine-grained PAT it should be reflected here — measured, not
+inferred.
 
 Error policy mirrors :mod:`spirrow_mindwire.lexora.client` / ``phanthand``:
 clean typed exceptions, **fail-loud** — any non-2xx becomes a
