@@ -14,8 +14,16 @@ These pin the invariants that replaced the retired branch-prediction machinery
 
 * **N-3** (P2 — remote URL boundary): a target repo whose remote URLs are not
   all under ``https://github.com/SpirrowGames/`` halts the daemon. Positive
-  assertion (P2-1); unresolved destination denies (P2-2); no shell-future
-  prediction (P2-3) — this is a pure URL boundary check.
+  assertion (P2-1); unresolved destination at start denies (P2-2 partial —
+  see below); no shell-future prediction (P2-3) — this is a pure URL boundary
+  check on the checkout as it stands right now.
+
+**P2-2 partial coverage (msg-1274 §1)**: P2 reads ``.git/config`` at daemon
+start and rejects a bad remote there, but it does NOT re-check a remote added
+mid-session (``git remote add …``) nor a URL-direct push (``git push
+https://…``). That gap was accepted by Takahito Tier-C rather than reintroduce
+shell-argument prediction (P2-3 trigger). These tests therefore pin the
+start-time snapshot behaviour and NOT dynamic destination coverage.
 
 Every I/O boundary (``git remote`` / ``gh api``) is a Callable injected here,
 so no test touches the real network or the real GitHub API.

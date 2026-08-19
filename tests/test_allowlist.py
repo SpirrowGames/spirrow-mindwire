@@ -17,14 +17,17 @@ T-drop-branch-prediction-from-allowlist §3):
   FORCE_PUSH, not through).
 * ``github.pr.open`` still respects its ``target_glob`` (``develop``/``main``).
   This is out of scope for the 2026-08-19 change (msg-1265 §9) and stays.
-* ``git.merge_to_main`` is the sole Tier-C forbidden — the anchor of the I-2
-  invariant (D-5, "main への merge は自動化しない").
+* ``git.merge_to_main`` and ``external.publish`` are the Tier-C forbidden ops
+  — the anchors of the I-2 invariant (D-5, "main への merge は自動化しない")
+  and msg-1274's restoration of the classifier publish route (the ``api.github.com``
+  destination that squid egress default-deny does not cover).
 * The retired keys (``branch_glob`` / ``path_glob``) are refused fail-loud at
   config load time (``_parse_allow_rule``): a config-only reintroduction cannot
   slip in silently.
-* The retired operations (``FS_DELETE`` / ``DRIVE_WRITE`` / ``EXTERNAL_PUBLISH``)
-  are not present on the :class:`Operation` enum — the removal is a
-  compile-time / import-time break, not a config decision.
+* The retired operations (``FS_DELETE`` / ``DRIVE_WRITE``) are not present on
+  the :class:`Operation` enum — the removal is a compile-time / import-time
+  break, not a config decision. ``EXTERNAL_PUBLISH`` was briefly removed and
+  RESTORED (msg-1274); its enum entry is back and the yaml lists it forbidden.
 """
 
 from __future__ import annotations
@@ -156,16 +159,28 @@ def test_github_pr_open_does_not_imply_merge_to_main(tmp_path: Path) -> None:
     assert al.check(ClassifiedAction(Operation.GIT_MERGE_TO_MAIN)).allowed is False
 
 
-# --- Tier C: only git.merge_to_main remains -------------------------------- #
+# --- Tier C: git.merge_to_main + external.publish (msg-1274 restoration) --- #
 
 
 def test_git_merge_to_main_denied_with_reason(tmp_path: Path) -> None:
-    """The sole surviving Tier-C forbidden. Named regardless of any branch /
-    base predicate (name-only routing in the classifier).
+    """The `gh pr merge` / MCP merge_pull_request name match. Named regardless
+    of any branch / base predicate (name-only routing in the classifier).
     """
     d = _al(tmp_path).check(ClassifiedAction(Operation.GIT_MERGE_TO_MAIN))
     assert d.allowed is False
     assert d.operation is Operation.GIT_MERGE_TO_MAIN
+    assert d.reason
+
+
+def test_external_publish_denied_with_reason(tmp_path: Path) -> None:
+    """Restored by msg-1274 — the classifier IS the guarantor for `gh release`
+    / `gh repo delete|archive` (destination `api.github.com` is the one host
+    squid must allow through, so the network boundary does not cover them).
+    Also covers `<pkgmgr> publish|push` verbs pinned as loop-slip catchers.
+    """
+    d = _al(tmp_path).check(ClassifiedAction(Operation.EXTERNAL_PUBLISH))
+    assert d.allowed is False
+    assert d.operation is Operation.EXTERNAL_PUBLISH
     assert d.reason
 
 
@@ -244,11 +259,15 @@ def test_retired_config_keys_are_refused_at_load(tmp_path: Path, retired_key: st
 def test_retired_operations_are_not_on_the_enum() -> None:
     """N-5's companion: the retired *operations* are gone from the enum, so a
     classifier that tried to emit one would fail at compile / import time.
+    ``EXTERNAL_PUBLISH`` is NOT on this list — it was restored by msg-1274
+    (see the module docstring). Its route is pinned in
+    ``test_implementer_adapter.test_publish_routes_to_external_publish``.
     """
     names = {op.name for op in Operation}
     assert "FS_DELETE" not in names
     assert "DRIVE_WRITE" not in names
-    assert "EXTERNAL_PUBLISH" not in names
+    # Positive assertion for the restored member.
+    assert "EXTERNAL_PUBLISH" in names
 
 
 def test_the_yaml_ships_no_branch_or_path_glob() -> None:

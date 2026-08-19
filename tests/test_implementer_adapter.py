@@ -8,9 +8,12 @@ the 2026-08-19 simplification (T-drop-branch-prediction-from-allowlist §3):
   match alone from every route (``gh pr merge``, MCP ``merge_pull_request``,
   a wrapped `gh pr merge`), regardless of any base argument or ambient HEAD;
 
-* the ex-Tier-C names ``fs.delete`` / ``drive.write`` / ``external.publish``
-  are **gone from the enum** (this is what pins the "dead scaffolding removed"
-  invariant — an enum reference would refuse to compile / import);
+* the ex-Tier-C names ``fs.delete`` / ``drive.write`` are **gone from the enum**
+  (this is what pins the "dead scaffolding removed" invariant — an enum
+  reference would refuse to compile / import). ``external.publish`` was briefly
+  removed and RESTORED (msg-1274) — its enum entry is back, and pinning tests
+  below make sure the ``gh release`` / ``gh repo delete|archive`` route to it
+  is not silently removed again;
 
 * the classifier stops predicting branches: a bare ``git rebase`` / bare
   ``git push`` / chained ``git checkout main && git ...`` classifies to its
@@ -171,72 +174,134 @@ def test_classify_bash(cmd: str, expected: Operation) -> None:
     "cmd",
     [
         # `rm` used to route to FS_DELETE; the operation is retired, so these
-        # classify to EXEC_CODE now. Same for shell-level `publish` / `push`
-        # invocations. The invariant they used to pin (delete / external
-        # publish → denied at this layer) does not hold any more — the module
+        # classify to EXEC_CODE now. The invariant they used to pin
+        # (delete → denied at this layer) does not hold any more — the module
         # docstring explains that `exec.code` was always the bypass for
-        # `fs.delete`, and squid egress default-deny is the real boundary for
-        # `external.publish`. This pins the removal so a future revert would
-        # fail here rather than silently re-enable the theatrical check.
+        # `fs.delete`. This pins the removal so a future revert would fail
+        # here rather than silently re-enable the theatrical check.
         "rm -rf build",
         "rmdir foo",
         "sudo rm -rf /tmp/x",
         "shred secret.pem",
         "Remove-Item -LiteralPath x",
         'bash -c "rm -rf x"',
-        "npm publish",
-        "twine upload dist/*",
-        "docker push myimg",
     ],
 )
 def test_removed_operations_now_fall_through_to_exec_code(cmd: str) -> None:
-    """T-drop-branch-prediction-from-allowlist §3: FS_DELETE / EXTERNAL_PUBLISH
-    are retired. The verbs still run — they just do not classify to a Tier-C
-    operation any more.
+    """T-drop-branch-prediction-from-allowlist §3: FS_DELETE is retired.
+    The verbs still run — they just do not classify to a Tier-C operation
+    any more.
     """
     action = classify_tool_call("Bash", {"command": cmd})
     assert action.operation is Operation.EXEC_CODE, cmd
 
 
 @pytest.mark.parametrize(
-    "cmd,expected",
+    "cmd",
     [
-        # `gh release` used to route to EXTERNAL_PUBLISH; the operation is
-        # retired, and `gh` subcommands that are neither `pr` nor a mutating
-        # `api` call fall through to GITHUB_READ (Tier A). The subcommand's
-        # actual effect (creating a release) hits GitHub via api.github.com —
-        # the one destination squid still allows — so the classifier's role
-        # here is provenance, not enforcement.
-        ("gh release create v1", Operation.GITHUB_READ),
-        ("gh release list", Operation.GITHUB_READ),
-        ("gh repo delete SpirrowGames/x", Operation.GITHUB_READ),
-        ("gh repo archive SpirrowGames/x", Operation.GITHUB_READ),
+        # `gh release` (ALL subcommands, including reads) routes to
+        # EXTERNAL_PUBLISH. Deliberate over-deny on the safe side; the loop
+        # has no reason to `gh release list` and the mistake shape "list first,
+        # then create" is exactly what a `list → view → create` slip looks like.
+        "gh release create v1",
+        "gh release create v1 --title x",
+        "gh release list",
+        "gh release view v1",
+        "gh release download v1",
+        "gh release delete v1",
+        # `gh repo delete|archive` — POST/DELETE/PATCH on api.github.com; squid
+        # allows that host through so the network boundary does not catch these.
+        "gh repo delete SpirrowGames/x",
+        "gh repo archive SpirrowGames/x",
+        # Structural `<pkgmgr> publish|push` verbs — retained for parity with
+        # the raw-coarse floor, even though their destination is not
+        # api.github.com. Ordinary loop-slip verbs the classifier catches
+        # cheaply, msg-1274 restoration.
+        "npm publish",
+        "yarn publish",
+        "pnpm publish",
+        "poetry publish",
+        "cargo publish",
+        "twine upload dist/*",
+        "gem push mygem.gem",
+        "docker push myimg",
+        # Wrapped variants: T23 direct == wrapped. Structural recursion handles
+        # tokenizable forms; the raw-coarse floor covers the tokenizer-defeating
+        # ones. Both routes must reach EXTERNAL_PUBLISH.
+        'bash -c "gh release create v1"',
+        "eval 'gh repo delete SpirrowGames/x'",
+        'bash -c "npm publish"',
     ],
 )
-def test_removed_gh_publish_routes_fall_through_to_github_read(
-    cmd: str, expected: Operation
-) -> None:
-    """`gh release` / `gh repo delete|archive` used to route to
-    EXTERNAL_PUBLISH (Tier C). They now classify to GITHUB_READ (Tier A) —
-    which is what the classifier's remaining routing does for any non-mutating
-    `gh` call.
+def test_publish_routes_to_external_publish(cmd: str) -> None:
+    """msg-1274 restoration: `gh release` / `gh repo delete|archive` / `<pkgmgr>
+    publish|push` classify to EXTERNAL_PUBLISH (Tier C).
+
+    msg-1273 §2 discipline: never invoke the forbidden operation to verify —
+    call the classifier directly. If a future edit removes the routing, THIS
+    test reddens; the loop is never at risk of executing `gh release create`
+    to check that it is denied.
     """
     action = classify_tool_call("Bash", {"command": cmd})
-    assert action.operation is expected
+    assert action.operation is Operation.EXTERNAL_PUBLISH, cmd
+
+
+def test_tokenizer_defeating_publish_still_falls_closed() -> None:
+    """The raw-coarse floor catches a `gh release` smuggled past shlex.
+
+    ANSI-C `$'...'` quoting produces a byte sequence shlex cannot re-parse into
+    tokens, so the structural pass sees nothing to classify. The floor scans
+    the RAW string with `_INDIRECTION_RE` as its gate, so a wrapped tokenizer-
+    defeat still hits EXTERNAL_PUBLISH — direct == wrapped (T23).
+    """
+    cmd = "bash -c $'gh release create v1 --title x'"
+    action = classify_tool_call("Bash", {"command": cmd})
+    assert action.operation is Operation.EXTERNAL_PUBLISH
 
 
 def test_operation_enum_no_longer_carries_removed_names() -> None:
-    """The removed Tier-C names must not be present on the enum.
+    """FS_DELETE / DRIVE_WRITE must not be present on the enum.
 
     This is the load-time counterpart to the classifier tests above: if the
-    enum still had FS_DELETE / DRIVE_WRITE / EXTERNAL_PUBLISH, a future patch
-    could quietly re-route to them. Removing them from the enum makes any
-    reintroduction a compile-time / import-time break.
+    enum still had them, a future patch could quietly re-route. Removing them
+    from the enum makes any reintroduction a compile-time / import-time break.
+    EXTERNAL_PUBLISH is NOT on this list — it was restored by msg-1274; its
+    routing is pinned by `test_publish_routes_to_external_publish` above.
     """
     names = {op.name for op in Operation}
     assert "FS_DELETE" not in names
     assert "DRIVE_WRITE" not in names
-    assert "EXTERNAL_PUBLISH" not in names
+    # Positive assertion for the restored member — the mirror invariant of the
+    # two removals above.
+    assert "EXTERNAL_PUBLISH" in names
+
+
+def test_default_allowlist_forbids_external_publish(tmp_path: Path) -> None:
+    """The packaged YAML lists external.publish as forbidden (Tier C).
+
+    Complements the classifier test: the classifier CAN name EXTERNAL_PUBLISH,
+    and the YAML denies it. If either half is missing, the guardrail is a no-op.
+    Uses `Allowlist.check` on a synthesized ClassifiedAction — never runs the
+    forbidden verb (msg-1273 §2).
+    """
+    from spirrow_mindwire.allowlist import ClassifiedAction
+
+    allowlist = default_allowlist(repo_root=tmp_path)
+    action = ClassifiedAction(operation=Operation.EXTERNAL_PUBLISH, detail="gh release create v1")
+    decision = allowlist.check(action)
+    assert decision.allowed is False
+    assert decision.operation is Operation.EXTERNAL_PUBLISH
+
+
+def test_default_allowlist_forbids_git_merge_to_main(tmp_path: Path) -> None:
+    """Parallel positive assertion for the other surviving Tier-C guardrail."""
+    from spirrow_mindwire.allowlist import ClassifiedAction
+
+    allowlist = default_allowlist(repo_root=tmp_path)
+    action = ClassifiedAction(operation=Operation.GIT_MERGE_TO_MAIN, detail="gh pr merge 5")
+    decision = allowlist.check(action)
+    assert decision.allowed is False
+    assert decision.operation is Operation.GIT_MERGE_TO_MAIN
 
 
 # --------------------------------------------------------------------------- #

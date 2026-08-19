@@ -9,6 +9,16 @@
 # The implementer's world is Tier A (allow) + Tier C (forbidden) only; Tier B
 # (naysayer review) is a post-PR gate, not an implementer operation (§B.2).
 #
+# READ THIS BEFORE TRUSTING ANY RULE HERE: `exec.code` is unconstrained, so this
+# allow-list is a **guardrail against accidents, not a boundary against intent**.
+# Every deny below is trivially bypassable by a determined loop through
+# `python -c "..."` / `bash -c "..."` / a script the loop wrote and then ran.
+# The classifier's job is to catch a slip (obvious verb, obvious spelling), not
+# a targeted evasion. Real containment of intent lives outside this file:
+# sandbox filesystem, credential scope, GitHub org ruleset, squid egress
+# default-deny, Takahito's manual merge. If a rule here purports to be a
+# boundary, it is drift — fix the wording, not the boundary.
+#
 # --- 2026-08-19: allow-list simplified (T-drop-branch-prediction-from-allowlist §3) ---
 #
 # Three changes land together (msg-1272, Takahito Tier-C decide):
@@ -35,9 +45,10 @@
 #     from the enforcement path in `adapters/implementer.py`.
 #
 # (2) `fs.write`'s `<repo>/**` `path_glob` is dropped, and `fs.delete` /
-#     `drive.write` / `external.publish` are dropped from Tier-C forbidden (their
-#     `Operation` enum values and classification paths removed too). The measurement
-#     that forced this (msg-1272 §1):
+#     `drive.write` are dropped from Tier-C forbidden (their `Operation` enum
+#     values and classification paths removed too). `external.publish` was
+#     briefly dropped the same day and RESTORED before this PR landed —
+#     see (2-bis) below. Measurements that forced the removals (msg-1272 §1):
 #
 #         `fs.delete`         `exec.code` is unconstrained ∴ `python -c
 #                             "shutil.rmtree(...)"` was always a way around — the
@@ -51,10 +62,6 @@
 #                             / `strict_mcp_config=True` and zero MCP tools; there
 #                             is no Drive credential on this host. Rule was
 #                             unreachable, and unreachable rules skew judgement.
-#         `external.publish`  squid egress default-deny already rejects
-#                             `example.com` / `hooks.slack.com` / `api.telegram.org`
-#                             / `discord.com` at CONNECT; only `api.github.com`
-#                             passes. The classifier duplicated a stronger boundary.
 #
 #     Principle (msg-1272 §2, Takahito): "今要らないものは残さない方がいい" — a
 #     rule that is not the actual guarantor of an invariant skews the next round of
@@ -62,6 +69,28 @@
 #     reach for the layer that actually holds). Where a check IS the guarantor
 #     (`git.merge_to_main` for the merge API, which the GitHub push-rejection does
 #     not cover, and org-external repos where the ruleset does not reach), it stays.
+#
+# (2-bis) `external.publish` REMOVAL was reverted on 2026-08-19 (msg-1274,
+#     Takahito Tier-C decide) because PR #159's Tier-B naysayer measurement showed
+#     the removal's premise was false. "Squid egress default-deny stops publish"
+#     was inferred from probing example.com / hooks.slack.com / api.telegram.org /
+#     discord.com — none of which is where `gh release create` or
+#     `gh repo archive` send their POST/PATCH. Those endpoints
+#     (`POST /repos/{o}/{r}/releases` / `PATCH /repos/{o}/{r}`) hit
+#     `api.github.com`, which squid MUST allow through for `gh pr create` to work.
+#     Classic PAT scope `repo` grants release-creation and repo-archive permission.
+#     So the classifier IS the guarantor here — the network boundary does not
+#     cover the one host it has to allow. Restored:
+#       * `_classify_gh` routes `gh release` (all subcommands) and
+#         `gh repo delete|archive` to EXTERNAL_PUBLISH;
+#       * `_RAW_COARSE` mirrors it (direct == wrapped, T23) for tokenizer-defeating
+#         wrappers;
+#       * `<pkgmgr> publish` / `<pkgmgr> push` / `twine upload` / `gem push` /
+#         `docker push` structural + raw route to EXTERNAL_PUBLISH too, on the
+#         same reasoning: `api.github.com` is not their destination, but they
+#         are ordinary loop-slip verbs the classifier catches cheaply.
+#     `drive.write` stayed removed — no `gh release`-shaped bypass exists for it
+#     (no MCP, no Drive credential, `api.github.com` is not a Drive endpoint).
 #
 # (3) The replacement for (1) is asymmetric on purpose: predictions are hard, but
 #     confirming a PRECONDITION is easy. The composition root
@@ -154,20 +183,31 @@ allow:
     target_glob: ["develop", "main"]
 
 # --- Tier C: forbidden operations (explicit, with fail-loud reasons) ---
-# One operation only, as of the 2026-08-19 simplification (see header (2)):
-# `git.merge_to_main` is the sole remaining classifier-executed Tier C guarantee.
-# The classifier routes `gh pr merge` and MCP `merge_pull_request` here from a
-# name match alone (no HEAD read, no base argument inspection, no branch
-# prediction — the name is the verdict), so this rule does NOT depend on any
-# removed prediction machinery. It stays because the GitHub server push
-# rejection covers the push, not the merge API, and covers SpirrowGames repos
-# only — org-external repos would still be reachable via a raw `gh pr merge`
-# without this line.
+# Two operations as of msg-1274's restoration (see header (2-bis)). Both fire
+# from a name-only classification (no HEAD read, no base inspection, no branch
+# prediction), so neither depends on the removed prediction machinery:
 #
-# `force_push` / `history_rewrite` / `fs.delete` / `drive.write` /
-# `external.publish` used to live here too; they moved out (see header (1)/(2))
-# because a stronger layer executes each invariant already and duplicating the
-# check here only skewed future judgement.
+#   `git.merge_to_main` — `gh pr merge` / MCP `merge_pull_request`. Stays because
+#       the GitHub server push-rejection covers the push, not the merge API, and
+#       covers SpirrowGames repos only — org-external repos would still be
+#       reachable via a raw `gh pr merge` without this line.
+#   `external.publish`  — `gh release` (all subcommands) / `gh repo delete|archive`
+#       / `<pkgmgr> publish|push` / `twine upload` / `gem push` / `docker push`.
+#       Restored 2026-08-19 (msg-1274) after PR #159's naysayer showed the
+#       "squid stops publish" premise was false for `api.github.com` — the one
+#       host the network boundary has to allow.
+#
+# `force_push` / `history_rewrite` / `fs.delete` / `drive.write` used to live
+# here too; they moved out (see header (1)/(2)) because a stronger layer executes
+# each invariant already and duplicating the check here only skewed future
+# judgement.
 forbidden:
   - operation: git.merge_to_main
     reason: "main への merge は Tier C (Takahito 事前承認)。loop からは実行不可。"
+  - operation: external.publish
+    reason: >-
+      publish (`gh release` / `gh repo delete|archive` / `<pkgmgr> publish|push`)
+      は Tier C。api.github.com は squid egress で allow せざるを得ない
+      (`gh pr create` が要求) ので、network 境界では止まらない。この分類器が
+      guarantor。
+

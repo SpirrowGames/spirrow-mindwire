@@ -21,16 +21,28 @@ directly: it requires an explicit ``inference_base_url`` (or
 and **refuses to spawn** if none is configured (no silent fallback to the
 default endpoint).
 
-Enforcement scope (mirrors :mod:`spirrow_mindwire.allowlist`): the sole hard
-guarantee is that ``git.merge_to_main`` is denied unconditionally — the
-classifier routes ``gh pr merge`` / MCP ``merge_pull_request`` here from a
-name match alone (no HEAD read, no base inspection), so the guarantee holds
-regardless of any branch predicate. Every other invariant lives outside this
-classifier — see the :mod:`spirrow_mindwire.allowlist` module docstring for the
-map of what moved where.
+Enforcement scope (mirrors :mod:`spirrow_mindwire.allowlist`): two hard
+classifier-executed guarantees, both from a **name match alone** (no HEAD
+read, no base inspection, no branch predicate):
+
+* ``git.merge_to_main`` — ``gh pr merge`` / MCP ``merge_pull_request``;
+* ``external.publish``  — ``gh release`` (all subcommands) /
+  ``gh repo delete|archive`` / ``<pkgmgr> publish|push`` /
+  ``twine upload`` / ``gem push`` / ``docker push``.
+
+Both are also **guardrails against accidents, not boundaries against intent**:
+``exec.code`` is unconstrained, so a determined loop can bypass either through
+``python -c`` / ``bash -c`` / a script it wrote. The classifier catches the
+obvious verb in the obvious spelling; real containment of intent lives in the
+sandbox / credential scope / GitHub org ruleset / squid egress default-deny /
+Takahito's manual merge to ``main``.
+
+Every other invariant lives outside this classifier — see the
+:mod:`spirrow_mindwire.allowlist` module docstring for the map of what moved
+where.
 
 The 2026-08-19 simplification (T-drop-branch-prediction-from-allowlist,
-Tier-C decide msg-1272) removed three classes of machinery from this file:
+Tier-C decide msg-1272 / msg-1274) changed this file in three ways:
 
 * **branch prediction** — every predicate that used to answer "which branch
   would this operation touch?": ``_current_branch`` / ``_push_destination`` /
@@ -42,31 +54,37 @@ Tier-C decide msg-1272) removed three classes of machinery from this file:
   ``current_user_can_bypass=never`` for the loop identity) + the
   **composition-root preflight** in :mod:`spirrow_mindwire.loop_runner`
   (``_preflight_gate`` — P0 daemon-checkout separation, P1 server-rule check,
-  P2 every remote's URL is under ``https://github.com/SpirrowGames/``).
+  P2 every remote's URL is under ``https://github.com/SpirrowGames/`` at
+  daemon start; there is no per-turn re-check for a dynamically added remote,
+  see :mod:`spirrow_mindwire.preflight`).
 
-* **``fs.delete`` classification** — the ``_DELETE_CMDS`` scan, the
+* **``fs.delete`` classification removed** — the ``_DELETE_CMDS`` scan, the
   ``FS_DELETE`` raw-coarse pattern, the MCP ``"delete"`` name match. Reason:
   ``exec.code`` is unconstrained, so ``python -c "shutil.rmtree(...)"`` was
   always a way around the classifier's ``fs.delete`` deny — the check was
   theatre and it stopped three threads in one day (msg-1272 §1). The real
-  containment is git history + the sandbox filesystem.
+  containment is git history + the sandbox filesystem. **``drive.write``**
+  was removed on the same reasoning (unreachable — no MCP, no Drive
+  credential); no ``gh release``-shaped bypass exists for it.
 
-* **``external.publish`` classification** — the ``_PUBLISH_PATTERNS`` scan and
-  the ``gh release`` / ``gh repo delete|archive`` routing in ``_classify_gh``.
-  Reason: squid egress default-deny already rejects
-  ``example.com`` / ``hooks.slack.com`` / ``api.telegram.org`` / ``discord.com``
-  at CONNECT; only ``api.github.com`` passes. The classifier duplicated a
-  stronger boundary. **``drive.write``** went with it (the MCP name match) —
-  ``setting_sources=[]`` + ``strict_mcp_config=True`` + no Drive credentials on
-  this host means it was unreachable, and unreachable rules skew judgement.
+* **``external.publish`` classification RESTORED** (msg-1274). The 2026-08-19
+  removal argued "squid egress default-deny is the boundary", but the probe
+  behind that (example.com / Slack / Telegram / Discord) did not include the
+  path ``gh release create`` and ``gh repo archive`` actually take:
+  ``api.github.com``, which squid MUST allow through for ``gh pr create`` to
+  work. Classic PAT scope ``repo`` grants release-creation and
+  repo-archive permission. So this classifier IS the guarantor here — the
+  ``_PUBLISH_PATTERNS`` scan, the ``FS/GH`` raw-coarse pattern, and the
+  ``gh release`` / ``gh repo delete|archive`` routing in ``_classify_gh`` are
+  restored. Direct == wrapped (T23) via the raw-coarse mirror.
 
-The classifier here still names ``FORCE_PUSH`` / ``HISTORY_REWRITE`` /
+The classifier still names ``FORCE_PUSH`` / ``HISTORY_REWRITE`` /
 ``GIT_MERGE`` etc. as OPERATIONS for provenance (a denial record still says
 which verb ran) — but it no longer computes the branch, and it no longer
-carries three ex-Tier-C names that the enum itself no longer defines.
-Confirming a precondition is 1 API call; predicting the branch of a bare push
-under an inline config override and a retargeted upstream is a research
-question.
+carries two ex-Tier-C names (``fs.delete`` / ``drive.write``) that the enum
+itself no longer defines. Confirming a precondition is 1 API call; predicting
+the branch of a bare push under an inline config override and a retargeted
+upstream is a research question.
 
 Shell *indirection* (``bash -c`` / ``eval`` / ``$(...)`` / backticks) hides
 the inner command from tokenization, so the inner command is extracted and
@@ -261,12 +279,26 @@ class ImplementerSdkHealthError(AdapterHealthError):
 # this split is the compound-command catch.
 _BASH_SEP = re.compile(r"&&|\|\||;|\||\n")
 
-# `_DELETE_CMDS` / `_PUBLISH_PATTERNS` (rm|rmdir|shred|unlink|Remove-Item and
-# npm|yarn|pnpm|poetry|cargo publish, twine upload, gem push, docker push) were
-# deleted on 2026-08-19 (T-drop-branch-prediction-from-allowlist §3, msg-1272 §1):
-# `fs.delete` is retired because `exec.code` bypassed it, and `external.publish`
-# is retired because squid default-deny already stops the destinations that
-# mattered. See the module docstring.
+# `_DELETE_CMDS` (rm|rmdir|shred|unlink|Remove-Item / -delete) was deleted on
+# 2026-08-19 (T-drop-branch-prediction-from-allowlist §3, msg-1272 §1):
+# `fs.delete` is retired because `exec.code` bypassed it. See the module
+# docstring.
+#
+# `_PUBLISH_PATTERNS` was briefly removed on the same day and RESTORED on
+# msg-1274 — the removal's premise ("squid default-deny stops publish") did
+# not cover `gh release` / `gh repo archive`, whose destination is
+# `api.github.com` (the one host squid MUST let through for `gh pr create`).
+# See the module docstring §external.publish RESTORED.
+_PUBLISH_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("npm", "publish"),
+    ("yarn", "publish"),
+    ("pnpm", "publish"),
+    ("twine", "upload"),
+    ("poetry", "publish"),
+    ("cargo", "publish"),
+    ("gem", "push"),
+    ("docker", "push"),
+)
 
 # Leading no-arg launchers that wrap the real command (skip to classify the inner
 # one) — used by _strip_prefixes for the DIRECT path (e.g. `exec rm -rf x`).
@@ -428,10 +460,16 @@ def _classify_gh(tokens: list[str]) -> ClassifiedAction:
     if group == "pr" and sub in ("create", "new"):
         base = _flag_value(tokens, "--base") or _flag_value(tokens, "-B")
         return ClassifiedAction(Operation.GITHUB_PR_OPEN, target=base, detail=detail)
-    # `gh release` / `gh repo delete|archive` used to route to EXTERNAL_PUBLISH.
-    # Both branches were removed on 2026-08-19 (T-drop-branch-prediction-from-allowlist
-    # §3): squid egress default-deny and GitHub's own permissions execute the
-    # real invariants. See the module docstring.
+    if group == "release" or (group == "repo" and sub in ("delete", "archive")):
+        # `gh release` is treated as publish for ALL subcommands — including reads
+        # (list/view/download). Deliberate over-deny on the safe side; the
+        # `_RAW_COARSE` indirection pattern mirrors it so direct == wrapped (T23).
+        # Restored msg-1274: removal argued "squid default-deny stops publish"
+        # from a probe that did not cover api.github.com — which squid MUST
+        # allow through for `gh pr create` to work, and which is exactly where
+        # `POST /repos/{o}/{r}/releases` / `PATCH /repos/{o}/{r}` land. So this
+        # classifier IS the guarantor, not a duplicate of a stronger boundary.
+        return ClassifiedAction(Operation.EXTERNAL_PUBLISH, detail=detail)
     if group == "api" and _gh_api_is_mutation(tokens):
         # A mutating `gh api` (-X/--method write verb, or field flags that make gh
         # default to POST) bypasses the gh pr checks above — e.g.
@@ -648,14 +686,21 @@ def _classify_single_bash(cmd: str, _depth: int = 0) -> ClassifiedAction:
         return ClassifiedAction(Operation.EXEC_CODE, detail=cmd)
     head = tokens[0]
     base = os.path.basename(head)
-    # `rm|rmdir|shred|unlink|Remove-Item|find -delete` and `<pkgmgr> publish` /
-    # `<pkgmgr> push` used to route to FS_DELETE / EXTERNAL_PUBLISH here. Both
-    # branches were removed on 2026-08-19 (T-drop-branch-prediction-from-allowlist
-    # §3, msg-1272 §1) — `exec.code` was always a way around the delete check,
-    # and squid egress default-deny is the actual boundary for publish. Falling
-    # through to EXEC_CODE (Tier A) reflects what the classifier really has to
-    # say now: "this is code executing", not "this is dangerous". See the module
-    # docstring.
+    # `rm|rmdir|shred|unlink|Remove-Item|find -delete` used to route to FS_DELETE
+    # here. Removed on 2026-08-19 (T-drop-branch-prediction-from-allowlist §3,
+    # msg-1272 §1) — `exec.code` was always a way around the delete check.
+    # Falling through to EXEC_CODE (Tier A) reflects what the classifier really
+    # has to say now for that verb: "this is code executing", not "this is
+    # dangerous". See the module docstring.
+    #
+    # `<pkgmgr> publish|push` still routes to EXTERNAL_PUBLISH (restored
+    # msg-1274 — module docstring §external.publish RESTORED). These verbs have
+    # no `api.github.com`-shaped bypass on their own but they are ordinary
+    # loop-slip verbs the classifier catches cheaply, so pinning them here keeps
+    # the guardrail consistent with the `gh release` route.
+    for prog, sub in _PUBLISH_PATTERNS:
+        if base == prog and sub in tokens:
+            return ClassifiedAction(Operation.EXTERNAL_PUBLISH, detail=cmd)
     if base == "git":
         return _classify_git(tokens)
     if base == "gh":
@@ -691,12 +736,15 @@ _INDIRECTION_RE = re.compile(
 # ANSI-C `$'gh api ... -XPUT'`) is caught by NEITHER the recursion nor this floor —
 # that residue is out of scope (environment containment + human merge carry it),
 # unlike rm / force-push / publish, which the floor still catches in the raw text.
-# FS_DELETE / EXTERNAL_PUBLISH raw patterns were removed on 2026-08-19
-# (T-drop-branch-prediction-from-allowlist §3): the operations themselves are
-# gone from the enum. The FORCE_PUSH / HISTORY_REWRITE patterns stay because
-# both operations still classify explicitly for provenance (their allow-list
-# rules are unconstrained Tier A now, so the floor's function here is to keep a
-# denial record naming the correct verb rather than to change an allow/deny).
+# The FS_DELETE raw pattern was removed on 2026-08-19
+# (T-drop-branch-prediction-from-allowlist §3): the operation is gone from the
+# enum. The FORCE_PUSH / HISTORY_REWRITE patterns stay because both operations
+# still classify explicitly for provenance (their allow-list rules are
+# unconstrained Tier A now, so the floor's function for those verbs is to keep
+# a denial record naming the correct verb rather than to change an allow/deny).
+# The EXTERNAL_PUBLISH pattern was RESTORED on msg-1274 alongside its structural
+# route — the coarse floor keeps direct == wrapped (T23) so a tokenizer-defeating
+# `bash -c $'gh release create ...'` still fails closed.
 _RAW_COARSE: tuple[tuple[re.Pattern[str], Operation], ...] = (
     (
         re.compile(r"\bgit\b.*\bpush\b.*(?:--force\b|--force-with-lease\b|\s-f\b)"),
@@ -704,6 +752,15 @@ _RAW_COARSE: tuple[tuple[re.Pattern[str], Operation], ...] = (
     ),
     (re.compile(r"\bgit\b.*\b(?:rebase|filter-branch|filter-repo)\b"), Operation.HISTORY_REWRITE),
     (re.compile(r"\bgit\b.*\breset\b.*--hard\b"), Operation.HISTORY_REWRITE),
+    (
+        re.compile(
+            r"\b(?:npm|yarn|pnpm|poetry|cargo)\s+publish\b"
+            r"|\btwine\s+upload\b|\bgem\s+push\b|\bdocker\s+push\b"
+            r"|\bgh\b.*\brelease\b"
+            r"|\bgh\b.*\brepo\b.*\b(?:delete|archive)\b"
+        ),
+        Operation.EXTERNAL_PUBLISH,
+    ),
 )
 
 
@@ -1145,15 +1202,17 @@ def _scan_raw_coarse(command: str) -> ClassifiedAction | None:
 
 
 # Ranking so a compound command is judged by its most dangerous sub-command.
-# FS_DELETE / DRIVE_WRITE / EXTERNAL_PUBLISH were removed from the enum on
-# 2026-08-19 (T-drop-branch-prediction-from-allowlist §3), so they are gone
-# from this table too. FORCE_PUSH / HISTORY_REWRITE stay at rank 100 for a
+# FS_DELETE / DRIVE_WRITE were removed from the enum on 2026-08-19
+# (T-drop-branch-prediction-from-allowlist §3), so they are gone from this
+# table. EXTERNAL_PUBLISH is back at rank 100 after msg-1274 restored it (see
+# the module docstring). FORCE_PUSH / HISTORY_REWRITE stay at rank 100 for a
 # different reason than before: both are Tier A now, not Tier C, but ranking
 # still picks the more surprising verb when two coexist in one compound so the
 # denial record and log line report the eye-catching one (`force_push …`
 # rather than `git.commit … && force_push …`).
 _DANGER_RANK: dict[Operation, int] = {
     Operation.GIT_MERGE_TO_MAIN: 100,
+    Operation.EXTERNAL_PUBLISH: 100,
     Operation.FORCE_PUSH: 100,
     Operation.HISTORY_REWRITE: 100,
     Operation.UNKNOWN: 90,

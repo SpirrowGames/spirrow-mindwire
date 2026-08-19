@@ -18,9 +18,20 @@ implementer operation. So the config carries:
 Anything matching neither is denied by ``default: deny`` ("unlisted operation").
 
 Scope of guarantee (read this before trusting it): the allow-list is the
-*loop-level* gate. Its **sole** hard guarantee is that one statically-detectable
-Tier C operation — ``git.merge_to_main`` — is denied unconditionally. Every
-other invariant lives outside this module:
+*loop-level* gate, and it is a **guardrail against accidents, not a boundary
+against intent** — because ``exec.code`` is unconstrained, any invariant a rule
+here purports to enforce is bypassable by a determined loop through
+``python -c`` / ``bash -c`` / a script file that runs the forbidden verb.
+The classifier's job is to catch a *slip* (the loop reaches for the obvious
+verb in the obvious way), not to withstand a targeted evasion. The real
+containment of intent lives elsewhere: the sandbox, the credential scope,
+the GitHub org ruleset, the network boundary, and Takahito's manual merge to
+``main``.
+
+Its **two** hard classifier-executed guarantees against slips are
+``git.merge_to_main`` and ``external.publish``, both denied unconditionally
+from a name match alone (no HEAD read, no branch inspection). Every other
+invariant lives outside this module:
 
 * **"no push / force-push / ref-deletion reaches ``main``"** rides on the
   ``guard-default-branch`` GitHub org ruleset (id=21017016, active across the
@@ -47,22 +58,38 @@ other invariant lives outside this module:
   this host. Keeping the entry would carry maintenance without carrying
   enforcement.
 
-* **``external.publish``** was REMOVED because the environment (squid egress
-  default-deny) executes the invariant already: 2026-08-19 measurement showed
-  ``example.com`` / ``hooks.slack.com`` / ``api.telegram.org`` / ``discord.com``
-  all denied at ``CONNECT``, with only ``api.github.com`` allowed through. The
-  classifier's ``external.publish`` deny was a weaker second layer that
-  duplicated the network boundary.
+* **``external.publish``** was briefly removed on 2026-08-19 and RESTORED the
+  same day (msg-1274, Takahito Tier-C decide) after PR #159's Tier-B naysayer
+  measurement showed the removal's premise was false. The removal argued
+  "squid egress default-deny is the actual boundary" from a probe of
+  ``example.com`` / ``hooks.slack.com`` / ``api.telegram.org`` /
+  ``discord.com`` — all denied at ``CONNECT``. But ``gh release create`` /
+  ``gh repo archive`` reach ``api.github.com`` (endpoints
+  ``POST /repos/{o}/{r}/releases`` and ``PATCH /repos/{o}/{r}``), which squid
+  MUST allow through for ``gh pr create`` to work. The probe did not measure
+  that path, and "only ``api.github.com`` passes" does NOT imply "publish is
+  stopped" — the publish destination *is* that one allowed host. Classic PAT
+  scope ``repo`` grants release-creation and repo-archive permission. So the
+  classifier route is the actual guarantor here, restored to route
+  ``gh release`` (all subcommands) and ``gh repo delete|archive`` to
+  ``EXTERNAL_PUBLISH``; the raw-coarse mirror (direct == wrapped, T23) is
+  restored alongside it.
 
-The three removals share one principle (msg-1272 §2, Takahito): a rule that is
+* **``drive.write``** stays REMOVED for a reason with no such gap: the
+  implementer session runs with ``setting_sources=[]`` /
+  ``strict_mcp_config=True`` and zero MCP tools; there is no Drive credential
+  on this host; ``api.github.com`` is not a Drive endpoint. The removal
+  rationale ("unreachable, and unreachable rules skew judgement") holds; no
+  ``gh release``-shaped bypass exists for it.
+
+Two removals share one principle (msg-1272 §2, Takahito): a rule that is
 not the actual guarantor of an invariant should not be kept "for insurance",
 because a residual layer skews the next round of judgement — the next design
 sees "we still have a check here" and does not reach for the layer that
-actually holds. Where a check is real (``git.merge_to_main`` — the name-only
-classifier over ``gh pr merge`` / MCP ``merge_pull_request`` still stands
-because the GitHub server rejection is only about *the push*, not about *the
-merge API*; org-external repos where ruleset does not reach are covered here),
-it stays.
+actually holds. Where a check IS the guarantor (``git.merge_to_main`` — the
+name-only classifier over ``gh pr merge`` / MCP ``merge_pull_request`` — and
+``external.publish`` per the restoration above, because the network boundary
+does not cover the one host it must allow), it stays.
 
 The ``branch_glob`` rule key was also REMOVED on 2026-08-19 — the whole
 branch-prediction enforcement path (``_current_branch`` / ``_push_destination`` /
@@ -119,13 +146,20 @@ class Operation(StrEnum):
     HISTORY_REWRITE = "history_rewrite"
     # --- Tier C (forbidden, explicit) ---
     #
-    # GIT_MERGE_TO_MAIN is the sole remaining Tier-C forbidden operation. The
-    # 2026-08-19 simplification (T-drop-branch-prediction-from-allowlist §3)
-    # removed FS_DELETE / DRIVE_WRITE / EXTERNAL_PUBLISH from the enum entirely,
-    # because each was executed by a stronger layer (the sandbox / MCP absence /
-    # squid egress default-deny respectively) and duplicating the guard here
-    # only skewed future judgement — see the module docstring.
+    # Two Tier-C forbidden operations as of msg-1274's restoration:
+    #   GIT_MERGE_TO_MAIN — the `gh pr merge` / MCP merge_pull_request name match.
+    #   EXTERNAL_PUBLISH  — the `gh release` (all subcommands) / `gh repo
+    #                       delete|archive` route + the `<pkgmgr> publish|push`
+    #                       raw pattern. Restored on 2026-08-19 after PR #159's
+    #                       naysayer showed the "squid stops publish" premise
+    #                       was false for the one host squid must allow through
+    #                       (`api.github.com`) — see the module docstring.
+    #
+    # FS_DELETE and DRIVE_WRITE stay removed from the enum (module docstring):
+    # FS_DELETE was theatre against the `exec.code` bypass, DRIVE_WRITE has no
+    # reachable path from this host.
     GIT_MERGE_TO_MAIN = "git.merge_to_main"
+    EXTERNAL_PUBLISH = "external.publish"
     # --- fallback ---
     UNKNOWN = "unknown"
 

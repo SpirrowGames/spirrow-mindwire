@@ -10,6 +10,25 @@ prediction ("which branch would this push touch?") is genuinely hard, but a
 precondition ("does this repo have the server-side protection I'm relying
 on?") is 1 API call.
 
+**Scope of guarantee — READ THIS BEFORE TRUSTING IT** (msg-1274 §1).
+This module is a **start-time precondition check on the checkout as it stands
+right now**, not a per-turn wire-level enforcement:
+
+* **P2 is measured against the ``.git/config`` snapshot at daemon start.** A
+  remote added or repointed *during a session* (``git remote add attacker
+  https://…`` / ``git remote set-url origin …``) is NOT re-checked here. Nor
+  is a raw ``git push https://…/other-repo main`` — the destination URL comes
+  from the command line, not from ``.git/config``. **P2-2 (msg-1270) explicitly
+  demanded coverage of both**; PR #159 does NOT deliver it. See "Explicitly
+  out of scope" below for why.
+
+* **P1 reads GitHub's rules for exactly the repos P2 saw at start.** A remote
+  added later — even one under ``https://github.com/SpirrowGames/`` — is not
+  vetted for ``guard-default-branch`` presence or ``bypass=never``. The
+  "server-side protection" guarantee this module offers is "the repos this
+  checkout is pointed at right now are protected", not "any repo a push might
+  reach is protected".
+
 Three checks, in one order so the earliest failure is the loudest:
 
 * **P0** — the implementer's ``repo_dir`` is not the daemon's own checkout.
@@ -17,11 +36,12 @@ Three checks, in one order so the earliest failure is the loudest:
   git reset --hard`` burns a throwaway clone, reflog restores") stops holding
   the moment the daemon runs against its own code.
 
-* **P2** — every remote URL in ``repo_dir`` is under
-  ``https://github.com/SpirrowGames/``. Tier-C decide 2026-08-19 msg-1270
-  option β: network-boundary enforcement, not credential-scope enforcement.
-  R-1 measured the loop's PAT is a classic ``gho_`` OAuth token with scope
-  ``repo``, so the credential does not itself bound reach — the URL does.
+* **P2** — every remote URL in ``repo_dir``'s ``.git/config`` at start is
+  under ``https://github.com/SpirrowGames/``. Tier-C decide 2026-08-19
+  msg-1270 option β: network-boundary enforcement, not credential-scope
+  enforcement. R-1 measured the loop's PAT is a classic ``gho_`` OAuth token
+  with scope ``repo``, so the credential does not itself bound reach — the
+  URL does, and only for the remotes that existed at start.
 
 * **P1** — the default branch of each remote's repo has the three server-side
   rules (``deletion`` / ``non_fast_forward`` / ``pull_request``) present, AND
@@ -34,6 +54,20 @@ about specific repos, and asking about a repo P2 has already rejected only
 adds a way for a bad-owner probe to fail slower. P0 comes first because it's
 the cheapest and the one whose failure means "your daemon configuration is
 broken, do not proceed", which subsumes both P1 and P2.
+
+**Explicitly out of scope — the P2-2 gap** (msg-1274 §1, Tier-C decide option
+(gamma) = accept-and-document). Full P2-2 coverage would require the
+classifier to parse every ``git push`` destination and every ``git remote
+add|set-url`` mid-session and reject a non-SpirrowGames URL. That
+reintroduces exactly the shell-argument-prediction machinery this whole task
+removed (P2-3: "境界検査が予測に化けるなら option-β は失敗"). Given today's
+measurement — org ruleset covers all 21 SpirrowGames default branches, no
+personal repo on ``takahito-spirrowgames`` — the residual exposure is a push
+to a non-default branch on an org-external repo. Takahito accepted that gap
+on 2026-08-19 rather than restart the prediction problem or block the PR on
+a fine-grained-PAT rollout; if the exposure changes shape (personal repo
+appears, ruleset weakens) the mitigation is option-alpha (a scope-restricted
+``MINDWIRE_GITHUB_TOKEN``), not resurrecting prediction here.
 
 Test-injection: every I/O boundary (``git remote``, ``gh api``) is a
 :class:`Callable` parameter with a subprocess-based default. Tests pass fakes;
@@ -93,9 +127,27 @@ def preflight_gate(
     """Enforce P0/P1/P2. Raise :class:`PreflightError` on any failure.
 
     ``daemon_root`` defaults to :func:`Path.cwd`. The composition root invokes
-    this once per daemon start; there is no per-turn re-check on purpose, but
-    there is no cache either — a subsequent daemon run pays the same 1 API
-    call before it acts. Failure to reach the API is fail-closed (msg-1267 §4).
+    this once per daemon start; there is no per-turn re-check and no cache —
+    a subsequent daemon run pays the same 1 API call before it acts. Failure
+    to reach the API is fail-closed (msg-1267 §4).
+
+    What this call guarantees, precisely (msg-1274 §1):
+
+    * At this instant, ``repo_dir/.git/config`` lists only remotes under
+      ``https://github.com/SpirrowGames/`` (P2 snapshot), and each of those
+      repos has ``guard-default-branch`` active with the loop's identity
+      unable to bypass (P1).
+
+    What this call does NOT guarantee:
+
+    * That a subsequent ``git remote add`` / ``git remote set-url`` / raw
+      ``git push https://…`` inside a session cannot send commits to a
+      different repo. The P2-2 requirement from msg-1270 (dynamic destination
+      coverage) is not implemented; the exposure was accepted on 2026-08-19
+      (msg-1274 §1) rather than resurrect the branch-prediction machinery.
+    * That a ``main`` merge via ``gh pr merge`` is blocked here — that
+      guarantee lives in the allow-list's ``git.merge_to_main`` forbidden
+      route, not in this preflight.
     """
     daemon_root = daemon_root or Path.cwd()
     api = api_caller or _default_api_caller
@@ -105,7 +157,9 @@ def preflight_gate(
     remotes = _p2_remote_urls_under_spirrowgames(repo_dir, remotes_of)
     _p1_default_branch_protected(remotes, api)
     logger.info(
-        "preflight ok: repo_dir=%s daemon_root=%s remotes=%d",
+        "preflight ok (start-time snapshot; no per-turn re-check for dynamic "
+        "remotes / URL-direct pushes — msg-1274 §1): "
+        "repo_dir=%s daemon_root=%s remotes=%d",
         repo_dir,
         daemon_root,
         len(remotes),
