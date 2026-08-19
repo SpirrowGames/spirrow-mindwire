@@ -20,6 +20,17 @@ the 2026-08-19 simplification (T-drop-branch-prediction-from-allowlist §3):
   verb (for provenance) without an ``UNKNOWN`` bounce that used to rest on the
   chain-guard;
 
+* the ``gh`` fall-through is default-deny (msg-1300 naysayer follow-up):
+  after the explicit routes for ``gh pr merge`` / ``gh pr create`` /
+  ``gh release`` / ``gh repo delete|archive`` / ``gh api`` mutation, an
+  unrecognised subcommand returns ``UNKNOWN`` unless it appears in an
+  explicit read/metadata-mutation whitelist. This closes the
+  ``gh repo edit --default-branch <new>`` bypass (which re-targeted the
+  ``~DEFAULT_BRANCH`` server ruleset off ``main``). The whitelist covers
+  the reads the loop actually needs; adjacent dangerous mutations
+  (``gh secret set`` / ``gh gist create`` / ``gh workflow run`` / any
+  ``gh repo`` write) are ``UNKNOWN``;
+
 * the built-in tool exposure + isolation settings survive (T37 #1/#4), the
   guard is wired (nothing auto-approved), and the assembled system prompt still
   carries the cwd grounding + injected obligations + ADR-index block.
@@ -257,6 +268,173 @@ def test_tokenizer_defeating_publish_still_falls_closed() -> None:
     cmd = "bash -c $'gh release create v1 --title x'"
     action = classify_tool_call("Bash", {"command": cmd})
     assert action.operation is Operation.EXTERNAL_PUBLISH
+
+
+# --------------------------------------------------------------------------- #
+# msg-1300 naysayer follow-up — gh fall-through default-deny + read whitelist
+# --------------------------------------------------------------------------- #
+#
+# Before msg-1300, `_classify_gh` fell through to `GITHUB_READ` for any
+# subcommand it did not explicitly recognise. `gh repo edit --default-branch
+# <new>` was the specific bypass named — it re-targets the `~DEFAULT_BRANCH`
+# GitHub ruleset off `main`, then an unrestricted subsequent `git push
+# --force main` succeeds. The fix inverts the fall-through: an explicit
+# whitelist of loop-safe reads / metadata mutations returns `GITHUB_READ`;
+# anything else returns `UNKNOWN` (default-deny).
+#
+# msg-1273 §2 discipline: these tests never invoke `gh` — they call the
+# classifier directly and assert the resulting `Operation`. A regression
+# that re-enabled a bypass reddens this test file, not a live gh call.
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # THE naysayer-named vector — moves the default branch away from
+        # `main`, stripping the ~DEFAULT_BRANCH ruleset off it. Now UNKNOWN.
+        "gh repo edit --default-branch staging",
+        "gh repo edit SpirrowGames/spirrow-mindwire --default-branch staging",
+        # Bare `gh repo edit` even without dangerous flags — the classifier
+        # cannot inspect flags for repo-level mutations, so all `gh repo edit`
+        # invocations are UNKNOWN. If a future task legitimately needs one
+        # variant, it must be added to the whitelist explicitly.
+        "gh repo edit",
+        # Other repo-level mutations that were also silently allowed under
+        # the old fall-through — all now UNKNOWN.
+        "gh repo rename new-name",
+        "gh repo transfer other-owner",
+        "gh repo sync",
+        "gh repo unarchive SpirrowGames/x",
+        "gh repo create new-repo",
+        "gh repo fork SpirrowGames/x",
+        "gh repo set-default owner/repo",
+        # Actions secrets / variables — writing these could wire in a
+        # backdoor for subsequent CI runs.
+        "gh secret set MY_TOKEN",
+        "gh secret remove MY_TOKEN",
+        "gh variable set MY_VAR",
+        # `gh gist create` publishes text to the internet — a real publish
+        # path adjacent to what `EXTERNAL_PUBLISH` covers. Kept as UNKNOWN
+        # rather than routed to EXTERNAL_PUBLISH to keep the routing surface
+        # small (gist is a rarer vector than gh release).
+        "gh gist create secret.txt",
+        "gh gist edit abc123",
+        "gh gist delete abc123",
+        # Workflow trigger — burns CI resources and can ship code by
+        # dispatching a release-workflow.
+        "gh workflow run release.yml",
+        "gh workflow enable deploy.yml",
+        "gh workflow disable deploy.yml",
+        # Run rerun / cancel — mutations to CI state.
+        "gh run rerun 12345",
+        "gh run cancel 12345",
+        # Label / cache writes.
+        "gh label create bug --color ff0000",
+        "gh label delete bug",
+        "gh cache delete abc",
+        # Extension install — arbitrary code load.
+        "gh extension install some-untrusted/extension",
+        # Codespace create/delete — mutations.
+        "gh codespace create --repo owner/repo",
+        "gh codespace delete abc",
+        # Unrecognised group (future GitHub subcommand) — default-deny.
+        "gh some-new-command",
+        "gh some-new-command with args",
+    ],
+)
+def test_gh_unrecognised_or_dangerous_mutation_is_unknown(cmd: str) -> None:
+    """msg-1300 fix — the default-deny fall-through catches unlisted `gh`
+    subcommands. The naysayer-named `gh repo edit --default-branch` vector
+    is here; adjacent repo/secret/gist/workflow mutations are also caught.
+    """
+    action = classify_tool_call("Bash", {"command": cmd})
+    assert action.operation is Operation.UNKNOWN, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # The reads the loop legitimately uses — all whitelisted.
+        "gh pr view 5",
+        "gh pr list",
+        "gh pr diff 5",
+        "gh pr checks 5",
+        "gh pr status",
+        # PR-level metadata mutations the loop uses (body-file updates,
+        # comments) — safe because the loop already owns the PR via the
+        # Tier-A `gh pr create` route.
+        "gh pr edit 5 --body-file /tmp/body.md",
+        "gh pr comment 5 --body-file /tmp/comment.md",
+        "gh pr close 5",
+        "gh pr reopen 5",
+        "gh pr ready 5",
+        # Issue-side symmetric.
+        "gh issue view 12",
+        "gh issue list",
+        "gh issue edit 12 --title x",
+        "gh issue comment 12 --body y",
+        # Repo READS only.
+        "gh repo view SpirrowGames/x",
+        "gh repo list SpirrowGames",
+        "gh repo clone SpirrowGames/x",
+        # CI reads.
+        "gh run view 12345",
+        "gh run list",
+        "gh run watch 12345",
+        "gh workflow view deploy.yml",
+        "gh workflow list",
+        # Auth reads.
+        "gh auth status",
+        "gh auth token",
+        # Search.
+        "gh search prs is:open",
+        "gh search repos SpirrowGames",
+        # Gist reads.
+        "gh gist view abc123",
+        "gh gist list",
+        # Label / config / alias reads.
+        "gh label list",
+        "gh config get editor",
+        "gh alias list",
+        "gh secret list",
+        "gh variable list",
+        # No-sub / help — pass.
+        "gh",
+        "gh --version",
+        "gh --help",
+        "gh pr",
+        "gh version",
+        # gh api reads (mutations already routed to UNKNOWN by the earlier
+        # explicit check — that path is covered in test_classify_bash above).
+        "gh api repos/o/r",
+        "gh api /user",
+    ],
+)
+def test_gh_loop_safe_reads_and_metadata_mutations_pass(cmd: str) -> None:
+    """The whitelist covers the reads (and PR-level metadata mutations) the
+    loop actually needs. If a future edit narrows the whitelist too far,
+    THIS test reddens BEFORE the loop deadlocks on its own workflow.
+    """
+    action = classify_tool_call("Bash", {"command": cmd})
+    assert action.operation is Operation.GITHUB_READ, cmd
+
+
+def test_gh_repo_edit_default_branch_still_denied_via_gh_api(tmp_path: Path) -> None:
+    """The equivalent `gh api` PATCH is caught by the existing mutating-api
+    route (already-existing UNKNOWN). This pins that BOTH the friendly
+    `gh repo edit --default-branch` vector AND the raw `gh api` vector are
+    default-deny — closing the shape symmetrically.
+    """
+    del tmp_path
+    action = classify_tool_call(
+        "Bash",
+        {
+            "command": (
+                "gh api repos/SpirrowGames/spirrow-mindwire -X PATCH -f default_branch=staging"
+            )
+        },
+    )
+    assert action.operation is Operation.UNKNOWN
 
 
 def test_operation_enum_no_longer_carries_removed_names() -> None:

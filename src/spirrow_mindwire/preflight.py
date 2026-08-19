@@ -50,8 +50,15 @@ Three checks, in one order so the earliest failure is the loudest:
 
 * **P1** — the default branch of each remote's repo has the three required
   rule types (``deletion`` / ``non_fast_forward`` / ``pull_request``), AND
-  for each required type at least one ruleset that provides it has
+  for each required type at least one ruleset that provides it is BOTH
+  ``enforcement == "active"`` (not ``evaluate`` / ``disabled``) AND
   ``current_user_can_bypass == "never"`` from the loop identity. The
+  enforcement check is load-bearing (msg-1300 naysayer finding): the
+  ``rules/branches/{b}`` endpoint returns rules from both ``active`` and
+  ``evaluate`` rulesets, so a rule appearing in the response does NOT mean
+  the server will block the write — an ``evaluate``-mode ruleset logs
+  violations without blocking, and would satisfy the earlier bypass-only
+  check while providing no actual protection. The
   provider-to-required-type coupling is load-bearing (msg-1291 naysayer
   finding): checking "types present" and "some ruleset on the branch is
   unbypassable" as independent conditions fails-open when a required type
@@ -458,7 +465,9 @@ def _p1_required_types_covered_by_unbypassable_rulesets(
             rs_id = p["ruleset_id"]
             source_type = p.get("ruleset_source_type")
             source = p.get("ruleset_source")
-            ok, reason = _bypass_never(owner, repo, rs_id, source_type, source, api_caller)
+            ok, reason = _ruleset_actively_enforces(
+                owner, repo, rs_id, source_type, source, api_caller
+            )
             if ok:
                 satisfied = True
                 break
@@ -521,7 +530,7 @@ def _fetch_effective_rules(
     return rules
 
 
-def _bypass_never(
+def _ruleset_actively_enforces(
     owner: str,
     repo: str,
     ruleset_id: int,
@@ -529,10 +538,26 @@ def _bypass_never(
     source: str | None,
     api_caller: ApiCaller,
 ) -> tuple[bool, str]:
-    """Check ``current_user_can_bypass == "never"`` for one ruleset.
+    """Check whether one ruleset actively protects the branch for this identity.
 
-    Returns ``(True, "")`` when the ruleset is unbypassable for the calling
-    identity; ``(False, reason)`` otherwise (fetch failure OR bypass allowed).
+    Returns ``(True, "")`` when BOTH invariants hold, ``(False, reason)``
+    otherwise (fetch failure, non-active enforcement, or bypassable):
+
+    * ``enforcement == "active"`` — GitHub rulesets have three enforcement
+      levels (``active`` / ``evaluate`` / ``disabled``). Only ``active``
+      actually blocks pushes on the server. ``evaluate`` logs violations
+      without blocking; ``disabled`` does nothing. The ``rules/branches/{b}``
+      endpoint returns effective rules from BOTH ``active`` AND ``evaluate``
+      rulesets, so "the rule shows up in effective rules" does NOT mean "the
+      server will block". This check was added msg-1300 after the naysayer
+      pointed out an ``evaluate``-mode ruleset would pass the earlier
+      bypass-only check while providing no actual protection.
+
+    * ``current_user_can_bypass == "never"`` — for the calling identity, the
+      ruleset cannot be overridden. A ruleset with ``bypass="always"`` or
+      ``"pull_requests"`` or the like is bypassable and does not enforce for
+      us.
+
     The caller aggregates per-required-type — msg-1291 naysayer finding fixed
     the earlier one-shot ``raise`` shape, which halted on the first
     bypassable ruleset even when a strict ruleset on the same required type
@@ -560,7 +585,21 @@ def _bypass_never(
             f"routing by source_type — see the module docstring 'Ruleset "
             f"endpoint choice' block."
         )
-    bypass = rs.get("current_user_can_bypass") if isinstance(rs, dict) else None
+    if not isinstance(rs, dict):
+        return False, (
+            f"ruleset {ruleset_id} ({origin}) response was not an object "
+            f"(got {type(rs).__name__}); cannot verify enforcement/bypass."
+        )
+    enforcement = rs.get("enforcement")
+    if enforcement != "active":
+        return False, (
+            f"ruleset {ruleset_id} ({origin}) has enforcement={enforcement!r}; "
+            f"required 'active'. An 'evaluate'-mode ruleset only logs "
+            f"violations — the server does NOT block pushes — so the loop "
+            f"identity would be free to force-push despite the rule appearing "
+            f"in the effective-rules response (msg-1300 naysayer finding)."
+        )
+    bypass = rs.get("current_user_can_bypass")
     if bypass != "never":
         return False, (
             f"ruleset {ruleset_id} ({origin}) has current_user_can_bypass="

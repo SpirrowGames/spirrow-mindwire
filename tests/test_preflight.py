@@ -53,6 +53,15 @@ fail-closed with a migration message; (b) an unrelated bypassable ruleset
 halt the daemon even though no required type depended on it — now ignored.
 Both bugs are proved by unit tests using the injected ``_fake_api_caller``.
 
+**N-1 addendum-3 enforcement pin (msg-1300 naysayer follow-up)**: the
+"N-1 addendum-3" block pins that P1 verifies ``enforcement == "active"``
+in addition to ``current_user_can_bypass == "never"``. An ``evaluate``-mode
+ruleset perfectly satisfies the bypass check but only logs violations
+without actually blocking pushes on the server — the fail-open bug the
+naysayer identified. The parametrized ``test_n1_ruleset_not_active_halts``
+covers ``evaluate`` / ``disabled`` / field-absent / arbitrary-future-value,
+so anything short of literal ``"active"`` fails-closed by construction.
+
 Every I/O boundary (``git remote`` / ``gh api``) is a Callable injected here,
 so no test touches the real network or the real GitHub API.
 """
@@ -153,6 +162,7 @@ def _healthy_api(
             "name": "guard-default-branch",
             "source_type": ruleset_source_type,
             "source": ruleset_source,
+            "enforcement": "active",
             "current_user_can_bypass": "never",
         },
     }
@@ -476,6 +486,7 @@ def test_n1_bypass_not_never_halts(tmp_path: Path) -> None:
     daemon.mkdir()
     api = _healthy_api()
     api["repos/SpirrowGames/spirrow-mindwire/rulesets/21017016"] = {
+        "enforcement": "active",
         "current_user_can_bypass": "always",
     }
     with pytest.raises(PreflightError) as exc:
@@ -576,6 +587,7 @@ def test_n1_non_default_branch_name_still_works(tmp_path: Path) -> None:
         "repos/SpirrowGames/thirdy/rulesets/21017016": {
             "source_type": "Organization",
             "source": "SpirrowGames",
+            "enforcement": "active",
             "current_user_can_bypass": "never",
         },
     }
@@ -654,6 +666,7 @@ def test_n1_bypass_never_error_message_names_source_type(tmp_path: Path) -> None
     daemon.mkdir()
     api = _healthy_api()
     api["repos/SpirrowGames/spirrow-mindwire/rulesets/21017016"] = {
+        "enforcement": "active",
         "current_user_can_bypass": "always",
     }
     with pytest.raises(PreflightError) as exc:
@@ -730,6 +743,7 @@ def test_n1_required_type_only_ruleset_bypassable_halts(tmp_path: Path) -> None:
     ]
     api["repos/SpirrowGames/spirrow-mindwire/rulesets/99"] = {
         "source_type": "Repository",
+        "enforcement": "active",
         "current_user_can_bypass": "always",
     }
     with pytest.raises(PreflightError) as exc:
@@ -957,6 +971,7 @@ def test_n1_required_type_with_mixed_providers_passes_when_one_strict(tmp_path: 
     # unbypassable provider (21017016), so 77 never gets queried.
     api["repos/SpirrowGames/spirrow-mindwire/rulesets/77"] = {
         "source_type": "Repository",
+        "enforcement": "active",
         "current_user_can_bypass": "always",
     }
     preflight_gate(
@@ -1029,6 +1044,7 @@ def test_n1_error_bullets_all_problems_at_once(tmp_path: Path) -> None:
     ]
     api["repos/SpirrowGames/spirrow-mindwire/rulesets/88"] = {
         "source_type": "Repository",
+        "enforcement": "active",
         "current_user_can_bypass": "always",
     }
     with pytest.raises(PreflightError) as exc:
@@ -1050,6 +1066,106 @@ def test_n1_error_bullets_all_problems_at_once(tmp_path: Path) -> None:
     assert "Classic Branch Protection" in msg  # non_fast_forward
     assert "88" in msg  # pull_request bypassable ruleset id
     assert "always" in msg  # bypass value
+
+
+# --------------------------------------------------------------------------- #
+# N-1 addendum-3 — msg-1300 naysayer: enforcement=active must be verified
+# --------------------------------------------------------------------------- #
+#
+# GitHub rulesets have three enforcement levels: `active` (blocks), `evaluate`
+# (logs violations without blocking), `disabled` (does nothing). The
+# `rules/branches/{b}` endpoint returns effective rules from BOTH `active`
+# AND `evaluate` rulesets. So a ruleset in `evaluate` mode:
+#   * appears in the effective-rules response — the required-type check passes
+#   * has current_user_can_bypass="never" — the earlier bypass check passed
+#   * does NOT block server-side — the loop's push succeeds anyway
+# The msg-1300 naysayer finding is exactly this fail-open. The fix requires
+# enforcement="active" alongside bypass="never".
+
+
+@pytest.mark.parametrize("enforcement", ["evaluate", "disabled", None, "unknown-future-value"])
+def test_n1_ruleset_not_active_halts(tmp_path: Path, enforcement: str | None) -> None:
+    """A ruleset in any non-active enforcement mode must halt P1 even when
+    bypass=never — evaluate/disabled rulesets do not actually block pushes
+    on the server. `None` covers the "field absent" case; the arbitrary
+    future value ensures we default-deny anything GitHub might add.
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api = _healthy_api()
+    ruleset: dict[str, Any] = {
+        "source_type": "Organization",
+        "source": "SpirrowGames",
+        "current_user_can_bypass": "never",
+    }
+    if enforcement is not None:
+        ruleset["enforcement"] = enforcement
+    api["repos/SpirrowGames/spirrow-mindwire/rulesets/21017016"] = ruleset
+    with pytest.raises(PreflightError) as exc:
+        preflight_gate(
+            target,
+            daemon_root=daemon,
+            remote_reader=_fake_remote_reader(
+                "https://github.com/SpirrowGames/spirrow-mindwire.git"
+            ),
+            api_caller=_fake_api_caller(api),
+        )
+    msg = str(exc.value)
+    assert "P1" in msg
+    assert "enforcement" in msg
+    assert repr(enforcement) in msg  # names the actual value so operator can act
+    assert "'active'" in msg  # names the expected value
+
+
+def test_n1_ruleset_active_bypass_never_passes(tmp_path: Path) -> None:
+    """Positive counterpart: a ruleset that is BOTH active AND unbypassable
+    passes. This is the production shape measured 2026-08-19 on the org
+    guardrail (see msg-1265 §2).
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    # _healthy_api now defaults to enforcement=active + bypass=never — the
+    # load-bearing pin that a regression flipping either half reddens.
+    preflight_gate(
+        target,
+        daemon_root=daemon,
+        remote_reader=_fake_remote_reader("https://github.com/SpirrowGames/spirrow-mindwire.git"),
+        api_caller=_fake_api_caller(_healthy_api()),
+    )
+
+
+def test_n1_bypass_check_only_runs_after_enforcement_check(tmp_path: Path) -> None:
+    """If a ruleset is both non-active AND bypassable, the error message
+    names the enforcement problem (which is checked first) — the operator's
+    remediation is to activate the ruleset, not to tighten bypass on an
+    inactive rule that isn't blocking anything anyway.
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api = _healthy_api()
+    api["repos/SpirrowGames/spirrow-mindwire/rulesets/21017016"] = {
+        "source_type": "Organization",
+        "source": "SpirrowGames",
+        "enforcement": "evaluate",
+        "current_user_can_bypass": "always",  # also broken, but enforcement wins
+    }
+    with pytest.raises(PreflightError) as exc:
+        preflight_gate(
+            target,
+            daemon_root=daemon,
+            remote_reader=_fake_remote_reader(
+                "https://github.com/SpirrowGames/spirrow-mindwire.git"
+            ),
+            api_caller=_fake_api_caller(api),
+        )
+    msg = str(exc.value)
+    assert "enforcement='evaluate'" in msg
+    # The bypass value should NOT be surfaced when enforcement wins — the
+    # operator has one thing to fix, not two.
+    assert "current_user_can_bypass='always'" not in msg
 
 
 # --------------------------------------------------------------------------- #

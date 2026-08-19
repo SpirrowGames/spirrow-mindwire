@@ -476,10 +476,137 @@ def _classify_gh(tokens: list[str]) -> ClassifiedAction:
         # `gh api repos/o/r/merges -X PUT` or `... -f base=main`. Legit implementer
         # mutations go via `gh pr create` / MCP create_pull_request, so any raw
         # mutating gh api is UNKNOWN → default-deny (T23). A read (GET / no fields)
-        # falls through to GITHUB_READ below.
+        # falls through to the whitelist below.
         return ClassifiedAction(Operation.UNKNOWN, detail=detail)
-    # pr view/list/diff/checks, issue, api GET, etc. → read via the scoped token.
-    return ClassifiedAction(Operation.GITHUB_READ, detail=detail)
+    # msg-1300 naysayer finding: the earlier fall-through to GITHUB_READ was
+    # fail-OPEN for any `gh` subcommand this classifier did not explicitly
+    # recognise. `gh repo edit --default-branch <new_branch>` was the specific
+    # bypass named — it re-targets the `~DEFAULT_BRANCH` GitHub ruleset off
+    # `main`, then a subsequent unrestricted `git push --force main` succeeds.
+    # `gh repo set-default` (sets which local remote is primary), `gh secret
+    # set` (writes CI secrets), and any future GitHub-added subcommand would
+    # equally slip through. The fix is default-deny: an explicit whitelist of
+    # loop-safe reads returns GITHUB_READ; anything else returns UNKNOWN.
+    #
+    # The whitelist includes the mutations the loop legitimately uses on its
+    # OWN pull request (`gh pr edit --body-file`, `gh pr comment`, etc.) —
+    # PR-level metadata is not a security boundary because the loop already
+    # authors the PR via `gh pr create` (which is Tier-A GITHUB_PR_OPEN). It
+    # deliberately EXCLUDES repo-level mutations (`gh repo edit`), Actions
+    # secret/variable writes (`gh secret set`), gist publication (`gh gist
+    # create/edit/delete` — writes public content to the internet), and
+    # workflow triggers (`gh workflow run` — burns CI resources / could ship
+    # code). Anything not enumerated fails-closed by construction — new
+    # GitHub subcommands over time need to be explicitly allowed here rather
+    # than being silently readable.
+    if _gh_is_allowed_read_or_safe_mutation(group, sub):
+        return ClassifiedAction(Operation.GITHUB_READ, detail=detail)
+    return ClassifiedAction(Operation.UNKNOWN, detail=detail)
+
+
+# `gh <group> <sub>` classification whitelist for the fall-through path (see
+# `_classify_gh`'s msg-1300 block). `None` means "any sub is allowed under this
+# group" — used for groups like `gh api` where the "sub" is a URL path, and
+# `gh browse` / `gh status` / `gh version` where there is no meaningful sub.
+# Any group NOT in this table falls to UNKNOWN. Any sub not listed for its
+# group also falls to UNKNOWN.
+_GH_ALLOWED_SUBS: dict[str, frozenset[str] | None] = {
+    # `gh api` reads — mutations are caught by the explicit check above.
+    "api": None,
+    # `gh pr` — reads plus loop-safe metadata mutations. NOT `merge` (routed
+    # to GIT_MERGE_TO_MAIN above) and NOT `create`/`new` (routed to
+    # GITHUB_PR_OPEN above), which are handled by explicit routes.
+    "pr": frozenset(
+        {
+            "view",
+            "list",
+            "diff",
+            "status",
+            "checks",  # reads
+            "edit",
+            "comment",
+            "close",
+            "reopen",
+            "ready",
+            "review",  # loop-safe mutations
+        }
+    ),
+    "issue": frozenset(
+        {
+            "view",
+            "list",
+            "status",  # reads
+            "edit",
+            "comment",
+            "close",
+            "reopen",  # loop-safe mutations
+        }
+    ),
+    # `gh repo` — READS ONLY. `edit`/`set-default`/`rename`/`transfer`/`sync`/
+    # `unarchive`/`create`/`fork` all fall to UNKNOWN. `delete`/`archive` are
+    # explicitly routed to EXTERNAL_PUBLISH above.
+    "repo": frozenset({"view", "list", "clone"}),
+    # CI run reads.
+    "run": frozenset({"view", "list", "watch", "download"}),
+    "workflow": frozenset({"view", "list"}),
+    # Auth reads.
+    "auth": frozenset({"status", "token"}),
+    # Search reads.
+    "search": frozenset({"prs", "issues", "repos", "code", "commits"}),
+    # Gist READS only — `create`/`edit`/`delete` publish public content.
+    "gist": frozenset({"view", "list"}),
+    # Label reads (create/edit/delete fall to UNKNOWN).
+    "label": frozenset({"list", "view"}),
+    # Config / alias / extension list-only.
+    "config": frozenset({"get", "list"}),
+    "alias": frozenset({"list"}),
+    "extension": frozenset({"list", "search"}),
+    "org": frozenset({"list", "view"}),
+    # Actions cache/secret/variable — LIST only. `secret set`/`variable set`
+    # writes CI-side state and belongs in UNKNOWN.
+    "cache": frozenset({"list"}),
+    "secret": frozenset({"list"}),
+    "variable": frozenset({"list"}),
+    # Codespaces read-side. `create`/`delete` are UNKNOWN.
+    "codespace": frozenset({"list", "view", "ssh", "logs", "code"}),
+    # Ruleset reads (added for symmetry with preflight's use of the API).
+    "ruleset": frozenset({"view", "list", "check"}),
+    # Keys reads.
+    "ssh-key": frozenset({"list"}),
+    "gpg-key": frozenset({"list"}),
+    # No-sub / open-URL / version — always allowed.
+    "browse": None,
+    "status": None,
+    "version": None,
+    "help": None,
+}
+
+
+def _gh_is_allowed_read_or_safe_mutation(group: str | None, sub: str | None) -> bool:
+    """Whitelist check for the `_classify_gh` fall-through (msg-1300).
+
+    Returns True if this `gh` invocation is either a known-safe read or a
+    loop-safe metadata mutation (per `_GH_ALLOWED_SUBS`). Returns False
+    otherwise, in which case the caller returns UNKNOWN (default-deny).
+
+    A bare ``gh`` with no group (help / --version at the top level) is
+    allowed. A recognised group with no sub (``gh pr`` → prints help) is
+    allowed. Anything else must match the explicit table.
+    """
+    if group is None:
+        # Bare `gh` / `gh --version` / `gh --help` etc.
+        return True
+    subs = _GH_ALLOWED_SUBS.get(group)
+    if subs is None and group in _GH_ALLOWED_SUBS:
+        # Group is present with value None → all subs allowed.
+        return True
+    if subs is None:
+        # Group not in the table → UNKNOWN.
+        return False
+    if sub is None:
+        # Recognised group, no sub → help output, no state change.
+        return True
+    return sub in subs
 
 
 def _flag_value(tokens: list[str], flag: str) -> str | None:
