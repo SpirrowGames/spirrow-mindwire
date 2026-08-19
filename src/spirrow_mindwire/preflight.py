@@ -43,11 +43,21 @@ Three checks, in one order so the earliest failure is the loudest:
   with scope ``repo``, so the credential does not itself bound reach — the
   URL does, and only for the remotes that existed at start.
 
-* **P1** — the default branch of each remote's repo has the three server-side
-  rules (``deletion`` / ``non_fast_forward`` / ``pull_request``) present, AND
-  the ruleset(s) that provide them have ``current_user_can_bypass == "never"``
-  from the loop identity. "Rules present" is not enough: if the loop can
-  bypass, the rules do not protect it.
+* **P1** — the default branch of each remote's repo has the three required
+  rule types (``deletion`` / ``non_fast_forward`` / ``pull_request``), AND
+  for each required type at least one ruleset that provides it has
+  ``current_user_can_bypass == "never"`` from the loop identity. The
+  provider-to-required-type coupling is load-bearing (msg-1291 naysayer
+  finding): checking "types present" and "some ruleset on the branch is
+  unbypassable" as independent conditions fails-open when a required type
+  is provided only by Classic Branch Protection (which the API returns
+  without ``ruleset_id``, so it satisfies "types present" but is invisible
+  to the ruleset bypass-check), and over-denies when an unrelated
+  bypassable ruleset (e.g. an informational ``commit_message_pattern``) is
+  present on the same branch. "Rules present" is not enough: if the loop
+  can bypass the ruleset that provides the rule, the rule does not protect
+  it — and if a ruleset the loop can bypass provides an entirely different
+  rule, halting on it is over-deny theatre.
 
 The three run in this order because P2 gates P1's *scope*: P1 asks GitHub
 about specific repos, and asking about a repo P2 has already rejected only
@@ -269,34 +279,129 @@ def _p1_default_branch_protected(remotes: list[tuple[str, str]], api_caller: Api
     for (owner, repo), name in unique_repos.items():
         default_branch = _fetch_default_branch(owner, repo, api_caller)
         rules = _fetch_effective_rules(owner, repo, default_branch, api_caller)
+        _p1_required_types_covered_by_unbypassable_rulesets(
+            owner, repo, default_branch, name, rules, api_caller
+        )
 
-        present_types = {r.get("type") for r in rules if isinstance(r, dict)}
-        missing = _REQUIRED_RULE_TYPES - present_types
-        if missing:
-            raise PreflightError(
-                f"preflight P1 failed: {owner}/{repo}@{default_branch} (remote {name!r}) "
-                f"is missing required rule types {sorted(missing)}. "
-                f"GitHub server-side protection is what executes 'no push / force-push / "
-                f"ref-deletion reaches main' after the local prediction machinery was "
-                f"retired on 2026-08-19; without these rules the invariant does not hold."
+
+def _p1_required_types_covered_by_unbypassable_rulesets(
+    owner: str,
+    repo: str,
+    default_branch: str,
+    remote_name: str,
+    rules: list[dict[str, Any]],
+    api_caller: ApiCaller,
+) -> None:
+    """Enforce the P1 invariant on the effective-rules response.
+
+    The invariant (msg-1265 §5 I-1): for the loop's identity, each required
+    rule type on the default branch must be enforced by AT LEAST ONE ruleset
+    that is unbypassable for that identity. This function couples the two
+    halves of the check that used to be independent (msg-1291 naysayer
+    finding):
+
+    1. **Per-required-type provider search** — an earlier draft counted
+       "required type present in the rules list" and "some ruleset on the
+       branch is unbypassable" as separate conditions. That fails-open when
+       a required rule is provided ONLY by Classic Branch Protection (the
+       API returns those without a ``ruleset_id``): "present" was satisfied,
+       but the classic-source rule was skipped when collecting rulesets to
+       bypass-check, so bypass was never verified for it. It also
+       over-denied: an unrelated bypassable ruleset on the branch (e.g.
+       ``commit_message_pattern`` from a repo-local informational ruleset)
+       halted the daemon even though no required rule depended on it. Fixed
+       here by walking ``_REQUIRED_RULE_TYPES`` and, for each, finding the
+       specific ruleset(s) providing it.
+
+    2. **Verifiability rejection** — if a required rule type is provided
+       only by rules lacking ``ruleset_id`` (Classic Branch Protection is
+       the shape the naysayer named), we cannot verify its bypass status
+       via the ``rulesets/{id}`` endpoint. Fail-closed (msg-1265 §5 I-3):
+       the operator is told to migrate to a Repository/Organization
+       Ruleset. We do NOT try to consult
+       ``repos/{o}/{r}/branches/{b}/protection`` here — that endpoint has
+       its own permission requirements and shape, and adding a second
+       verification path would double the failure modes for no gain: the
+       migration is the target state anyway (Repository Rulesets and Org
+       Rulesets supersede Classic Branch Protection in GitHub's roadmap).
+
+    3. **"At least one" not "all"** — GitHub layers rulesets, so if two
+       rulesets both restrict the same operation, the ruleset with the
+       stricter bypass wins at enforcement time. We only need to find ONE
+       verifiable, unbypassable provider per required type. This also
+       prevents over-deny when a strict ruleset coexists with a laxer one:
+       the strict one satisfies the check, the lax one is not consulted.
+    """
+    # Group rules by type. Skip malformed entries defensively (a str type on
+    # a non-string field would break `.get("type")` further down).
+    by_type: dict[str, list[dict[str, Any]]] = {}
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        rtype = r.get("type")
+        if isinstance(rtype, str):
+            by_type.setdefault(rtype, []).append(r)
+
+    problems: list[str] = []
+    for rtype in sorted(_REQUIRED_RULE_TYPES):
+        providers = by_type.get(rtype, [])
+        if not providers:
+            problems.append(
+                f"required rule type {rtype!r} is not present in the effective "
+                f"rules for the default branch — the invariant that 'no push / "
+                f"force-push / ref-deletion reaches main' relies on this rule"
+            )
+            continue
+
+        # Split verifiable (has ruleset_id) from Classic-BP-shaped (no
+        # ruleset_id). `.get("ruleset_id")` returns None for both "field
+        # absent" and "field is null", covering both API shapes.
+        verifiable = [p for p in providers if p.get("ruleset_id") is not None]
+        if not verifiable:
+            problems.append(
+                f"required rule type {rtype!r} has {len(providers)} provider(s), "
+                f"none of which carries a ruleset_id — the shape GitHub returns "
+                f"for Classic Branch Protection. This endpoint cannot verify "
+                f"their bypass status, so the loop identity might still hold "
+                f"admin rights that override them. Migrate the protection for "
+                f"this rule to a Repository Ruleset or an Organization Ruleset "
+                f"with current_user_can_bypass=never — see the module docstring "
+                f"'Ruleset endpoint choice' block for endpoint mechanics"
+            )
+            continue
+
+        reasons: list[str] = []
+        satisfied = False
+        for p in verifiable:
+            rs_id = p["ruleset_id"]
+            source_type = p.get("ruleset_source_type")
+            source = p.get("ruleset_source")
+            ok, reason = _bypass_never(owner, repo, rs_id, source_type, source, api_caller)
+            if ok:
+                satisfied = True
+                break
+            reasons.append(reason)
+        if not satisfied:
+            provider_ids = sorted({p["ruleset_id"] for p in verifiable})
+            problems.append(
+                f"required rule type {rtype!r} has verifiable provider ruleset(s) "
+                f"{provider_ids} but none is unbypassable for the loop identity. "
+                f"Reasons: {reasons}"
             )
 
-        # Collect (ruleset_id, source_type, source) tuples — several rule dicts
-        # may share the same ruleset_id, so dedupe by id but keep the source
-        # metadata for the operator's error message. See the module docstring
-        # "Ruleset endpoint choice" block for why we do NOT route by
-        # source_type to a different endpoint (`orgs/...` requires admin:org
-        # which the loop's classic PAT lacks; `repos/.../rulesets/{id}`
-        # measured 2026-08-19 returns org-source rulesets correctly).
-        ruleset_meta: dict[int, tuple[str | None, str | None]] = {}
-        for r in rules:
-            if isinstance(r, dict) and "ruleset_id" in r:
-                rs_id = r["ruleset_id"]
-                if rs_id not in ruleset_meta:
-                    ruleset_meta[rs_id] = (r.get("ruleset_source_type"), r.get("ruleset_source"))
-        for rs_id in sorted(ruleset_meta):
-            source_type, source = ruleset_meta[rs_id]
-            _assert_bypass_never(owner, repo, rs_id, source_type, source, api_caller)
+    if problems:
+        # One bulleted PreflightError per repo; each bullet names a distinct
+        # problem so the operator can see all of them at once instead of
+        # fixing one and rediscovering the next on the next daemon start.
+        bullets = "\n  - ".join(problems)
+        raise PreflightError(
+            f"preflight P1 failed: {owner}/{repo}@{default_branch} "
+            f"(remote {remote_name!r}) is not adequately server-protected:\n  - "
+            f"{bullets}\n"
+            f"GitHub server-side protection is what executes 'no push / "
+            f"force-push / ref-deletion reaches main' after the local prediction "
+            f"machinery was retired on 2026-08-19."
+        )
 
 
 def _fetch_default_branch(owner: str, repo: str, api_caller: ApiCaller) -> str:
@@ -334,15 +439,22 @@ def _fetch_effective_rules(
     return rules
 
 
-def _assert_bypass_never(
+def _bypass_never(
     owner: str,
     repo: str,
     ruleset_id: int,
     source_type: str | None,
     source: str | None,
     api_caller: ApiCaller,
-) -> None:
-    """Assert ``current_user_can_bypass == "never"`` for one ruleset.
+) -> tuple[bool, str]:
+    """Check ``current_user_can_bypass == "never"`` for one ruleset.
+
+    Returns ``(True, "")`` when the ruleset is unbypassable for the calling
+    identity; ``(False, reason)`` otherwise (fetch failure OR bypass allowed).
+    The caller aggregates per-required-type — msg-1291 naysayer finding fixed
+    the earlier one-shot ``raise`` shape, which halted on the first
+    bypassable ruleset even when a strict ruleset on the same required type
+    also existed.
 
     Always queries the repository endpoint
     (``repos/{owner}/{repo}/rulesets/{ruleset_id}``) regardless of
@@ -350,32 +462,32 @@ def _assert_bypass_never(
     explains why (repo endpoint returns org-source rulesets under ``repo``
     scope; the ``orgs/`` endpoint would require ``admin:org`` which the loop
     token lacks). ``source_type`` and ``source`` come from the
-    ``rules/branches/{b}`` response and are surfaced in log/error messages
-    only, so an operator can distinguish "the org guardrail is broken" from
+    ``rules/branches/{b}`` response and are surfaced in the returned reason
+    string so an operator can distinguish "the org guardrail is broken" from
     "a repo-local ruleset is misconfigured" without re-tracing the code.
     """
     origin = f"source_type={source_type!r} source={source!r}"
     try:
         rs = api_caller(f"repos/{owner}/{repo}/rulesets/{ruleset_id}")
     except Exception as exc:
-        raise PreflightError(
-            f"preflight P1 failed: could not fetch ruleset {ruleset_id} ({origin}) "
-            f"for {owner}/{repo}: {exc}. Fail-closed (msg-1267 §4). If GitHub "
-            f"has tightened the repos/rulesets endpoint to reject Organization-"
-            f"source rulesets, the mitigation is a token upgrade to include "
-            f"admin:org scope + routing by source_type — see the module "
-            f"docstring 'Ruleset endpoint choice' block."
-        ) from exc
+        return False, (
+            f"could not fetch ruleset {ruleset_id} ({origin}): {exc}. "
+            f"Fail-closed (msg-1267 §4). If GitHub has tightened the "
+            f"repos/rulesets endpoint to reject Organization-source rulesets, "
+            f"the mitigation is a token upgrade to include admin:org scope + "
+            f"routing by source_type — see the module docstring 'Ruleset "
+            f"endpoint choice' block."
+        )
     bypass = rs.get("current_user_can_bypass") if isinstance(rs, dict) else None
     if bypass != "never":
-        raise PreflightError(
-            f"preflight P1 failed: ruleset {ruleset_id} ({origin}) on {owner}/{repo} "
-            f"has current_user_can_bypass={bypass!r}; required 'never'. The rules "
-            f"exist but the loop's identity can bypass them → the server-side "
-            f"protection is unreliable, and the daemon must not proceed on an "
-            f"unreliable premise (msg-1265 §5 I-1: '執行者はサーバであってよい' → "
-            f"but only if the server actually executes)."
+        return False, (
+            f"ruleset {ruleset_id} ({origin}) has current_user_can_bypass="
+            f"{bypass!r}; required 'never'. The loop's identity can bypass this "
+            f"ruleset → the server-side protection it provides is unreliable "
+            f"(msg-1265 §5 I-1: '執行者はサーバであってよい' → but only if the "
+            f"server actually executes)."
         )
+    return True, ""
 
 
 # --------------------------------------------------------------------------- #

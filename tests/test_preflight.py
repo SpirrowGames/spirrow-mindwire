@@ -37,6 +37,18 @@ loop's classic PAT (scopes ``gist, read:org, repo, workflow``) lacks
 org-source rulesets under ``repo`` scope. The tests below make that choice
 (and its mitigation-message hint for future GitHub tightening) load-bearing.
 
+**N-1 addendum-2 coupling pins (msg-1291 naysayer follow-up)**: the
+"N-1 addendum-2" block pins that P1 couples each required rule type to the
+specific ruleset(s) providing it, not to "some ruleset on the branch". Fixes
+two independent bugs the earlier draft had: (a) a required type provided
+only by Classic Branch Protection (no ``ruleset_id`` in the API response)
+would pass because "type present" was satisfied while the un-checkable
+classic rule was skipped when collecting rulesets to bypass-check — now
+fail-closed with a migration message; (b) an unrelated bypassable ruleset
+(e.g. informational ``commit_message_pattern``) on the same branch would
+halt the daemon even though no required type depended on it — now ignored.
+Both bugs are proved by unit tests using the injected ``_fake_api_caller``.
+
 Every I/O boundary (``git remote`` / ``gh api``) is a Callable injected here,
 so no test touches the real network or the real GitHub API.
 """
@@ -529,19 +541,18 @@ def test_n1_ruleset_endpoint_unreachable_error_hints_token_upgrade(tmp_path: Pat
     assert "source_type='Organization'" in msg  # the specific origin surfaced
 
 
-def test_n1_multiple_rulesets_each_checked(tmp_path: Path) -> None:
-    """If the effective rules come from more than one ruleset (org + repo, or
-    two repo rulesets), each distinct ruleset_id must be bypass-checked. If
-    any single one has bypass != never the daemon halts, regardless of how the
-    others fare.
+def test_n1_required_type_only_ruleset_bypassable_halts(tmp_path: Path) -> None:
+    """If the sole provider of a required rule type is bypassable, halt.
+
+    Here `pull_request` comes only from a repo-local ruleset (id=99,
+    bypass=always). The other required types come from the org guardrail
+    (bypass=never), so THEY are fine — but the invariant fails because
+    `pull_request` has no unbypassable provider.
     """
     target, daemon = tmp_path / "t", tmp_path / "d"
     target.mkdir()
     daemon.mkdir()
     api = _healthy_api()
-    # Two rulesets covering the branch: the org guardrail (id=21017016, bypass=never)
-    # and an additional repo-local ruleset (id=99, bypass=always) that must be
-    # detected as unreliable.
     api["repos/SpirrowGames/spirrow-mindwire/rules/branches/main"] = [
         {
             "type": "deletion",
@@ -579,6 +590,311 @@ def test_n1_multiple_rulesets_each_checked(tmp_path: Path) -> None:
     assert "99" in msg
     assert "always" in msg
     assert "source_type='Repository'" in msg
+
+
+# --------------------------------------------------------------------------- #
+# N-1 addendum-2 — msg-1291 naysayer follow-up
+# --------------------------------------------------------------------------- #
+#
+# Two decoupling bugs the naysayer flagged in the earlier draft, both fixed
+# by coupling required-type presence to the specific ruleset(s) providing them:
+#
+#   (a) FAIL-OPEN on Classic Branch Protection — a rule provided only via
+#       Classic BP is returned by rules/branches/{b} WITHOUT a `ruleset_id`.
+#       The earlier code counted it as "type present" (satisfying the
+#       required-types check) but skipped it when collecting rulesets to
+#       bypass-check (needs `ruleset_id`). Result: an admin-bypassable
+#       Classic BP could satisfy P1 with bypass never verified.
+#
+#   (b) OVER-DENY on unrelated bypassable ruleset — if the branch has ANY
+#       ruleset that is bypassable (e.g. an informational
+#       `commit_message_pattern`), the earlier code called
+#       _assert_bypass_never on it and halted, even though it does not
+#       provide any required rule type.
+#
+# Both are provable by unit test; live measurement cannot show them because
+# our target repos only have the org guardrail's ruleset-sourced rules.
+
+
+def test_n1_required_type_from_classic_bp_only_halts(tmp_path: Path) -> None:
+    """A required type provided only via Classic Branch Protection (no
+    ruleset_id in the effective-rules response) is REJECTED — the daemon
+    cannot verify its bypass status via this endpoint, and "cannot verify"
+    must not be silently upgraded to "protected" (msg-1265 §5 I-3).
+
+    This test pins the fix for the FAIL-OPEN bug the naysayer named.
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api = _healthy_api()
+    # `deletion` and `non_fast_forward` come from the org guardrail; but
+    # `pull_request` is provided only by a rule dict without any ruleset_id
+    # (the shape GitHub returns for Classic Branch Protection). Under the
+    # earlier code this passed (type present, no ruleset to bypass-check);
+    # under the fix it must halt.
+    api["repos/SpirrowGames/spirrow-mindwire/rules/branches/main"] = [
+        {
+            "type": "deletion",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {
+            "type": "non_fast_forward",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        # Classic BP shape: no ruleset_id field. The invariant demands
+        # explicit rejection because bypass cannot be verified.
+        {"type": "pull_request"},
+    ]
+    with pytest.raises(PreflightError) as exc:
+        preflight_gate(
+            target,
+            daemon_root=daemon,
+            remote_reader=_fake_remote_reader(
+                "https://github.com/SpirrowGames/spirrow-mindwire.git"
+            ),
+            api_caller=_fake_api_caller(api),
+        )
+    msg = str(exc.value)
+    assert "pull_request" in msg
+    assert "Classic Branch Protection" in msg
+    assert "Migrate" in msg or "migrate" in msg
+
+
+def test_n1_required_type_from_classic_bp_only_null_ruleset_id_halts(tmp_path: Path) -> None:
+    """Same as above but the field is explicitly ``null`` instead of absent.
+    Both shapes must fail-closed; ``.get("ruleset_id")`` returns None for
+    both, and the fix must not distinguish them.
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api = _healthy_api()
+    api["repos/SpirrowGames/spirrow-mindwire/rules/branches/main"] = [
+        {
+            "type": "deletion",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {
+            "type": "non_fast_forward",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {"type": "pull_request", "ruleset_id": None},
+    ]
+    with pytest.raises(PreflightError) as exc:
+        preflight_gate(
+            target,
+            daemon_root=daemon,
+            remote_reader=_fake_remote_reader(
+                "https://github.com/SpirrowGames/spirrow-mindwire.git"
+            ),
+            api_caller=_fake_api_caller(api),
+        )
+    msg = str(exc.value)
+    assert "pull_request" in msg
+    assert "Classic Branch Protection" in msg
+
+
+def test_n1_extra_bypassable_unrelated_ruleset_does_not_halt(tmp_path: Path) -> None:
+    """An unrelated bypassable ruleset on the same branch must NOT halt.
+
+    If a repo has, say, an informational `commit_message_pattern` rule from
+    a repo-local ruleset (id=42, bypass=always), that ruleset does not
+    provide any required rule type. The required types are all covered by
+    the unbypassable org guardrail (id=21017016). Preflight must pass.
+
+    This test pins the fix for the OVER-DENY bug the naysayer named. Under
+    the earlier code, `ruleset_meta` collected id=42 and bypass-checked it,
+    seeing "always" and halting.
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api = _healthy_api()
+    api["repos/SpirrowGames/spirrow-mindwire/rules/branches/main"] = [
+        {
+            "type": "deletion",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {
+            "type": "non_fast_forward",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {
+            "type": "pull_request",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        # Unrelated informational ruleset on the same branch, bypassable
+        # for the loop identity. Must NOT be consulted — it does not
+        # provide any required rule type.
+        {
+            "type": "commit_message_pattern",
+            "ruleset_id": 42,
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "spirrow-mindwire",
+        },
+    ]
+    # Deliberately DO NOT add an entry for ruleset 42 — under the fix, we
+    # must never query it. If the fix regresses and calls it, the fake will
+    # raise RuntimeError, which _bypass_never converts to fetch-failure,
+    # which propagates to a P1 halt. Either way the test would red.
+    preflight_gate(
+        target,
+        daemon_root=daemon,
+        remote_reader=_fake_remote_reader("https://github.com/SpirrowGames/spirrow-mindwire.git"),
+        api_caller=_fake_api_caller(api),
+    )
+
+
+def test_n1_required_type_with_mixed_providers_passes_when_one_strict(tmp_path: Path) -> None:
+    """If a required type has TWO providers — one bypassable, one strict —
+    the strict one satisfies the invariant. GitHub layers rulesets, so the
+    stricter one wins at enforcement time. "At least one unbypassable" is
+    the invariant, not "all providers unbypassable".
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api = _healthy_api()
+    api["repos/SpirrowGames/spirrow-mindwire/rules/branches/main"] = [
+        # `deletion` provided by TWO rulesets: strict org guardrail AND
+        # a lax repo-local ruleset. The strict one satisfies the invariant.
+        {
+            "type": "deletion",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {
+            "type": "deletion",
+            "ruleset_id": 77,
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "spirrow-mindwire",
+        },
+        {
+            "type": "non_fast_forward",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {
+            "type": "pull_request",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+    ]
+    # Ruleset 77 is bypassable — but our search stops at the first
+    # unbypassable provider (21017016), so 77 never gets queried.
+    api["repos/SpirrowGames/spirrow-mindwire/rulesets/77"] = {
+        "source_type": "Repository",
+        "current_user_can_bypass": "always",
+    }
+    preflight_gate(
+        target,
+        daemon_root=daemon,
+        remote_reader=_fake_remote_reader("https://github.com/SpirrowGames/spirrow-mindwire.git"),
+        api_caller=_fake_api_caller(api),
+    )
+
+
+def test_n1_required_type_from_both_classic_and_strict_ruleset_passes(tmp_path: Path) -> None:
+    """A required type provided by BOTH Classic BP (no ruleset_id) AND a
+    strict ruleset must pass. The strict ruleset provides an unbypassable
+    verifiable provider; the Classic BP is irrelevant to the invariant
+    once the strict one satisfies it.
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api = _healthy_api()
+    api["repos/SpirrowGames/spirrow-mindwire/rules/branches/main"] = [
+        {"type": "deletion"},  # Classic BP
+        {
+            "type": "deletion",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {
+            "type": "non_fast_forward",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+        {
+            "type": "pull_request",
+            "ruleset_id": 21017016,
+            "ruleset_source_type": "Organization",
+            "ruleset_source": "SpirrowGames",
+        },
+    ]
+    preflight_gate(
+        target,
+        daemon_root=daemon,
+        remote_reader=_fake_remote_reader("https://github.com/SpirrowGames/spirrow-mindwire.git"),
+        api_caller=_fake_api_caller(api),
+    )
+
+
+def test_n1_error_bullets_all_problems_at_once(tmp_path: Path) -> None:
+    """If multiple required types fail for different reasons, the error
+    message must name ALL of them at once — operator sees the full picture
+    on the first halt, not one problem per redeploy.
+    """
+    target, daemon = tmp_path / "t", tmp_path / "d"
+    target.mkdir()
+    daemon.mkdir()
+    api = _healthy_api()
+    api["repos/SpirrowGames/spirrow-mindwire/rules/branches/main"] = [
+        # `deletion` missing entirely
+        # `non_fast_forward` from Classic BP only
+        {"type": "non_fast_forward"},
+        # `pull_request` from a bypassable ruleset only
+        {
+            "type": "pull_request",
+            "ruleset_id": 88,
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "spirrow-mindwire",
+        },
+    ]
+    api["repos/SpirrowGames/spirrow-mindwire/rulesets/88"] = {
+        "source_type": "Repository",
+        "current_user_can_bypass": "always",
+    }
+    with pytest.raises(PreflightError) as exc:
+        preflight_gate(
+            target,
+            daemon_root=daemon,
+            remote_reader=_fake_remote_reader(
+                "https://github.com/SpirrowGames/spirrow-mindwire.git"
+            ),
+            api_caller=_fake_api_caller(api),
+        )
+    msg = str(exc.value)
+    # Every required type gets its own line — no early-return
+    assert "deletion" in msg
+    assert "non_fast_forward" in msg
+    assert "pull_request" in msg
+    # And each gets its own reason
+    assert "not present" in msg  # deletion missing
+    assert "Classic Branch Protection" in msg  # non_fast_forward
+    assert "88" in msg  # pull_request bypassable ruleset id
+    assert "always" in msg  # bypass value
 
 
 # --------------------------------------------------------------------------- #
