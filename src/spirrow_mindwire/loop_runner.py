@@ -92,6 +92,7 @@ from .naysayer.pr_review import NaysayerPrReviewDriver
 from .obligations import ObligationsError, ObligationsManifest, load_manifest
 from .orchestrator import PrReviewOrchestrator
 from .ports import RoleAdapter
+from .preflight import PreflightError, preflight_gate
 from .value_objects import Capability, Event, Role, ThreadRef
 
 logger = logging.getLogger(__name__)
@@ -501,6 +502,13 @@ def build_loop(
 async def run_loop(settings: MindwireSettings) -> None:
     """Build the loop, register its watches, and poll until cancelled.
 
+    Runs the composition-root preflight (:func:`_preflight`) before the loop
+    is built — a P0/P1/P2 failure raises :class:`~spirrow_mindwire.preflight.PreflightError`
+    (``SystemExit``), which the daemon launcher surfaces. The premise the loop
+    relies on (server-side protection of ``main``, a captive clone separate
+    from the daemon's own checkout, remotes under SpirrowGames) has to hold
+    before any adapter is spawned, so preflight comes first.
+
     Each configured watch is added with its own ``baseline`` (so a freshly
     opened task thread can be acted on with ``baseline=False``, while an ongoing
     thread uses the production-safe ``baseline=True``). ``loop.aclose()`` runs in
@@ -509,6 +517,7 @@ async def run_loop(settings: MindwireSettings) -> None:
     msg-381 §E-1; Tier B #93 round-4 for the driver close).
     """
     cfg = settings.loop
+    _preflight(cfg)
     loop = build_loop(settings)
 
     if not cfg.watches:
@@ -611,6 +620,10 @@ def build_conductor(
 async def run_conductor(settings: MindwireSettings) -> ConductorOutcome:
     """Build the conductor, drive the task thread once to a stop condition, and tear it down.
 
+    Like :func:`run_loop`, runs the composition-root preflight
+    (:func:`_preflight`) before the conductor is built — the P0/P1/P2 premise
+    has to hold before any adapter session opens.
+
     The conductor's :meth:`~spirrow_mindwire.conductor.core.Conductor.run` is itself the serial poll
     loop (it re-reads the thread each turn); it returns when a D-4 stop condition is reached
     (``NEXT: human`` Tier-C decision point / ``NEXT: none`` settled / a malformed handoff or
@@ -618,6 +631,7 @@ async def run_conductor(settings: MindwireSettings) -> ConductorOutcome:
     its stop and exits — re-arming after the human responds is an operator / follow-up concern. The
     spawned adapter sessions are closed in ``finally`` so SDK subprocesses don't leak on shutdown.
     """
+    _preflight(settings.loop)
     cond = build_conductor(settings)
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
@@ -640,6 +654,45 @@ async def run_conductor(settings: MindwireSettings) -> ConductorOutcome:
         return outcome
     finally:
         await cond.aclose()
+
+
+def _preflight(cfg: Stage3LoopConfig) -> None:
+    """Run the P0/P1/P2 composition-root preflight — fail-closed on any failure.
+
+    Called from :func:`run_loop` / :func:`run_conductor` before any adapter is
+    built. The invariants it enforces (see :mod:`spirrow_mindwire.preflight` for
+    the design write-up):
+
+    * **P0** — ``repo_dir`` must not be the daemon's own checkout.
+    * **P2** — every remote URL in ``repo_dir`` must be under
+      ``https://github.com/SpirrowGames/``.
+    * **P1** — the default branch of each such repo must have the three
+      server-side rules (``deletion`` / ``non_fast_forward`` / ``pull_request``)
+      AND ``current_user_can_bypass == 'never'`` for the loop's identity.
+
+    Deliberately NOT called from :func:`build_loop` / :func:`build_conductor`,
+    so tests can compose the loop without a live GitHub API — the preflight
+    fires only on the ``run_*`` production path. Configuration errors that
+    ``build_*`` already raises as ``SystemExit`` (``loop.repo_dir`` missing,
+    conductor knobs missing) come first because they precede any preflight
+    concern; a repo_dir the operator did not set has nothing for P0/P2 to
+    check against.
+    """
+    if cfg.repo_dir is None:
+        # `_build_dispatcher` raises SystemExit for this case with a fuller
+        # message; here we defer to it so the operator sees one preflight
+        # failure per issue rather than two overlapping ones.
+        return
+    try:
+        preflight_gate(Path(cfg.repo_dir))
+    except PreflightError:
+        raise
+    except Exception as exc:
+        # Any unexpected exception at this layer is itself a fail-closed event —
+        # the preflight either passes cleanly or halts the daemon.
+        raise PreflightError(
+            f"preflight raised an unexpected exception (fail-closed by design): {exc}"
+        ) from exc
 
 
 def _ensure_utf8_runtime() -> None:
@@ -701,6 +754,7 @@ def main() -> None:
 
 
 __all__ = [
+    "PreflightError",
     "Stage3Conductor",
     "Stage3Loop",
     "Stage3ProposerAdapter",
