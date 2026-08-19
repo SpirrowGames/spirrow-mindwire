@@ -409,9 +409,17 @@ def _classify_git(tokens: list[str]) -> ClassifiedAction:
     was removed from the allow-list at the same time, and the "does not touch
     ``main``" guarantee lives at the GitHub server + composition-root
     preflight, not on a local predicate. So a rebase / bare ``git reset --hard``
-    / ``git branch -D main`` classifies to the operation it IS (informational,
-    for provenance in denial records) without any attempt to guess the target;
-    all four are Tier A everywhere the preflight P1 passes.
+    classifies to the operation it IS (informational, for provenance in denial
+    records) without any attempt to guess the target; both are Tier A everywhere
+    the preflight P1 passes.
+
+    ``git branch`` is deliberately NOT in that set. Reading its flags to decide
+    which ref moves WAS the target-guessing predicate this change removes, and
+    every ``git branch`` form is Tier A now, so it falls through to ``EXEC_CODE``
+    with the other non-Tier-C subcommands. The cost is provenance only — a denial
+    record would read ``exec.code`` — and buying that label back means bringing
+    the flag parser with it. (Tier B, #163: this paragraph used to claim the
+    opposite of what the code does.)
 
     ``filter-branch`` / ``filter-repo`` stay UNKNOWN — not because they might
     rewrite ``main`` (a rewrite of ``main`` cannot be pushed anyway, per P1),
@@ -522,7 +530,11 @@ _GH_ALLOWED_SUBS: dict[str, frozenset[str] | None] = {
             "list",
             "diff",
             "status",
-            "checks",  # reads
+            "checks",
+            # `gh pr checkout` only moves local git state, like `git fetch`
+            # (which is EXEC_CODE). Omitting it from the new default-deny
+            # whitelist narrowed behaviour that `main` allowed. Tier B, #163.
+            "checkout",  # reads
             "edit",
             "comment",
             "close",
@@ -883,8 +895,15 @@ _RAW_COARSE: tuple[tuple[re.Pattern[str], Operation], ...] = (
         re.compile(
             r"\b(?:npm|yarn|pnpm|poetry|cargo)\s+publish\b"
             r"|\btwine\s+upload\b|\bgem\s+push\b|\bdocker\s+push\b"
-            r"|\bgh\b.*\brelease\b"
-            r"|\bgh\b.*\brepo\b.*\b(?:delete|archive)\b"
+            # The gap steps over whole quoted segments but cannot match inside one.
+            # Two Tier-B rounds shaped this. `.*` matched the word anywhere, so a PR
+            # title containing "release" was read as a publish and fail-loud killed
+            # the session. Narrowing the gap to non-quote characters then created the
+            # opposite defect: `gh --repo 'owner/name' release create` aborted at the
+            # first quote and escaped the floor entirely. Both are measured and pinned
+            # in tests/test_gh_publish_floor.py.
+            r"|\bgh\b(?:[^'\"]|'[^']*'|\"[^\"]*\")*\brelease\b"
+            r"|\bgh\b(?:[^'\"]|'[^']*'|\"[^\"]*\")*\brepo\b(?:[^'\"]|'[^']*'|\"[^\"]*\")*\b(?:delete|archive)\b"
         ),
         Operation.EXTERNAL_PUBLISH,
     ),

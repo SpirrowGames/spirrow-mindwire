@@ -283,10 +283,10 @@ class AllowlistConfigError(ValueError):
 def _glob_matches(value: str | None, globs: tuple[str, ...]) -> bool:
     """True iff ``value`` matches any glob in ``globs``.
 
-    A ``None`` value returns False here — but ``_constraints_pass`` deliberately
-    SKIPS the constraint check when the action field is ``None`` (see the note
-    there). Callers therefore never see the None-> False path except via a
-    truthy ``globs``, and even then only when they have already guarded on None.
+    A ``None`` value returns False here. Every call site in ``_constraints_pass``
+    guards on ``is not None`` first, so that path is unreachable from there; it
+    stays because the signature admits ``None``. (Tier B, #163: this used to
+    point at a note in ``_constraints_pass`` that this change deleted.)
     """
     if value is None:
         return False
