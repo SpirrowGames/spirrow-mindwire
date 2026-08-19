@@ -18,13 +18,26 @@ implementer operation. So the config carries:
 Anything matching neither is denied by ``default: deny`` ("unlisted operation").
 
 Scope of guarantee (read this before trusting it): the allow-list is the
-*loop-level* gate. Its hard guarantee is that the six statically-detectable
-Tier C operations (``git.merge_to_main`` / ``force_push`` / ``history_rewrite``
-/ ``fs.delete`` / ``drive.write`` / ``external.publish``) are denied. Branch /
-path constraints on commit/push are best-effort over a parsed command line. The
-*blast-radius* containment is the **environment** (Tailscale ACL + egress
-default-deny + scoped credentials, ADR-07 §2.4 / env spec) — defence in depth,
-not this module alone.
+*loop-level* gate. Its hard guarantee is that four statically-detectable
+Tier C operations (``git.merge_to_main`` / ``fs.delete`` / ``drive.write`` /
+``external.publish``) are denied unconditionally, and that ``force_push`` /
+``history_rewrite`` are denied on any branch outside ``feature/*`` / ``develop``
+— importantly, on ``main``. Branch / path constraints are best-effort over a
+parsed command line, with a runtime HEAD resolver in ``adapters/implementer``
+(``_AllowlistGuard._enrich``) filling the gap for operations that carry no
+branch argument (bare ``git commit`` / ``git push`` / ``git rebase`` /
+``git reset --hard``); an undecidable HEAD downgrades the action to
+``UNKNOWN`` so ``default: deny`` fires. The *blast-radius* containment is the
+**environment** (Tailscale ACL + egress default-deny + scoped credentials,
+ADR-07 §2.4 / env spec) — defence in depth, not this module alone.
+
+The move of ``force_push`` / ``history_rewrite`` from unconditional Tier C to
+branch-scoped Tier A was made under Tier-C approval on 2026-08-15
+(T-branch-scoped-implementer-permissions): the operative predicate is not
+"which verb" but "which branch — everywhere except ``main``, git preserves
+recovery." ``fs.delete`` was deliberately left out of that widening because its
+predicate is the recoverability of the target path, not the ambient HEAD;
+that gets its own gate (T-fs-delete-path-scope).
 """
 
 from __future__ import annotations

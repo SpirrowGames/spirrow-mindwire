@@ -35,6 +35,28 @@ allow:
   - operation: git.push
     branch_glob: ["feature/*", "develop"]
     force: false
+  # Branch-scoped Tier-A widening (T-branch-scoped-implementer-permissions, Tier-C
+  # approval 2026-08-15). `main` is off-limits, everywhere else a repo whose ref is
+  # `feature/*` / `develop` is by construction recoverable — git keeps the history.
+  # Two constraints keep this from opening `main`:
+  #   1. `branch_glob` is set here to `feature/*` / `develop` — exactly the same
+  #      shape as `git.commit` / `git.push` above.
+  #   2. `_AllowlistGuard._enrich` (adapters/implementer.py) resolves the current
+  #      branch from `git rev-parse` for these operations too, because neither
+  #      carries a branch on the command line (rebase mutates HEAD, and a bare
+  #      `git push --force` inherits the checked-out branch). If HEAD cannot be
+  #      resolved (detached / non-repo / git failure), the action is downgraded
+  #      to UNKNOWN and default-deny catches it. The rule of these two lines only
+  #      holds because both halves land together — never widen `history_rewrite` or
+  #      `force_push` without the enrichment, or `_branch_matches(None, ...)` in
+  #      allowlist.py falls through to fail-OPEN.
+  # `fs.delete` was NOT widened here: its risk is not "which branch am I on" but
+  # "is what I am erasing recoverable", and that predicate lives on the target
+  # path, not on the ambient HEAD. It gets its own gate — see T-fs-delete-path-scope.
+  - operation: history_rewrite
+    branch_glob: ["feature/*", "develop"]
+  - operation: force_push
+    branch_glob: ["feature/*", "develop"]
   # Two different operations wear the name `git.merge`, and only one of them was listed.
   #
   #   PUBLISH  feature/* -> develop   promotes work. Constrained by BOTH ends.
@@ -93,15 +115,20 @@ allow:
 
 # --- Tier C: forbidden operations (explicit, with fail-loud reasons) ---
 # These are unreachable from the loop; each requires Takahito pre-GO (Tier C).
+#
+# `force_push` and `history_rewrite` used to live here too, and were moved to the
+# `allow` block above with a `branch_glob` that excludes `main` (Tier-C approval
+# 2026-08-15, T-branch-scoped-implementer-permissions). The line the human drew
+# was not "these operations are always dangerous" but "these operations are
+# dangerous ON `main` — everywhere else git already preserves recovery." Keep
+# that framing when reading the list below: what remains here is what stays
+# dangerous regardless of the current branch (a canonical merge, a filesystem
+# deletion, a Drive / external side-effect).
 forbidden:
   - operation: git.merge_to_main
     reason: "main への merge は Tier C (Takahito 事前承認)。loop からは実行不可。"
-  - operation: force_push
-    reason: "force-push は Tier C (不可逆・履歴破壊リスク)。"
-  - operation: history_rewrite
-    reason: "history rewrite (rebase / reset --hard / filter-branch 等) は Tier C。"
   - operation: fs.delete
-    reason: "ファイル削除は Tier C (不可逆)。"
+    reason: "ファイル削除は Tier C (T-fs-delete-path-scope で path-scoped 化予定)。"
   - operation: drive.write
     reason: "Drive canonical 反映は Tier C (main チェーン管轄、implementer scope 外)。"
   - operation: external.publish

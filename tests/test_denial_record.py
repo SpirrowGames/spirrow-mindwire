@@ -85,17 +85,35 @@ def test_m5_real_delete_is_still_denied() -> None:
 
 
 def test_m6_heredoc_documenting_force_push() -> None:
-    """M6 — same shape as M1 for a different Tier C verb."""
+    """M6 — same shape as M1 for a different Tier C verb.
+
+    The floor no longer wins this one, and that is an improvement rather than a
+    regression. A coarse match for a HEAD-enriched operation is reduced to
+    UNKNOWN (PR #158 round 10), so a branchless finding cannot be enriched into
+    a safe-looking branch — and the structural pass already had the better
+    answer here, because it read the refspec and knows the target is `main`.
+    Still denied, now by the rule that can say why.
+    """
     action = _bash("cat <<'EOF' > doc.md\nrun $(true); git push --force origin main\nEOF")
-    assert action.rule_id == "raw_coarse"
+    assert action.rule_id == "structural"
     assert action.operation is Operation.FORCE_PUSH
+    assert action.branch == "main"
 
 
 def test_m7_heredoc_documenting_history_rewrite() -> None:
-    """M7 — a runbook body mentioning rebase / reset --hard."""
-    action = _bash("cat <<'EOF' > runbook.md\nstep $(1): git reset --hard HEAD~1\nEOF")
+    """M7 — the floor still catches it, and now reports UNKNOWN.
+
+    `git rebase -i HEAD~3` carries no branch, so the floor's finding would be
+    enriched from the ambient HEAD and could pass on a feature branch. It is
+    reduced to UNKNOWN instead: the denial is kept and the branch that was never
+    known is dropped. The cost is label fidelity — the record reads `unknown`
+    for what is plainly a history rewrite — while `detail` still carries the
+    command. Taken deliberately: inventing a branch to keep the label would put
+    a fiction in the record.
+    """
+    action = _bash("cat <<'EOF' > doc.md\nrun $(true); git rebase -i HEAD~3\nEOF")
     assert action.rule_id == "raw_coarse"
-    assert action.operation is Operation.HISTORY_REWRITE
+    assert action.operation is Operation.UNKNOWN
 
 
 def test_m8_wrapped_real_delete_is_still_denied() -> None:
