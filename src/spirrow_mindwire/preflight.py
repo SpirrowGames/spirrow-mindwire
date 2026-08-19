@@ -69,6 +69,31 @@ a fine-grained-PAT rollout; if the exposure changes shape (personal repo
 appears, ruleset weakens) the mitigation is option-alpha (a scope-restricted
 ``MINDWIRE_GITHUB_TOKEN``), not resurrecting prediction here.
 
+**Ruleset endpoint choice — measured 2026-08-19, pinned by tests below.**
+GitHub exposes two endpoints for a ruleset detail:
+
+* ``GET /repos/{owner}/{repo}/rulesets/{id}`` — ``X-Accepted-Oauth-Scopes: repo``
+* ``GET /orgs/{org}/rulesets/{id}`` — ``X-Accepted-Oauth-Scopes: admin:org``
+
+The loop's token (R-1, msg-1269 §2) is a classic OAuth PAT with scopes
+``gist, read:org, repo, workflow`` — it does NOT hold ``admin:org``, so the
+``orgs/`` endpoint returns HTTP 404. However, the ``repos/`` endpoint
+**returns org-source rulesets too** (verified against ``guard-default-branch``
+id=21017016 on ``spirrow-mindwire`` and ``Spirrow-VoxelWorld``, both HTTP 200
+with ``source_type: "Organization"`` and the correct
+``current_user_can_bypass`` field for the calling identity). So P1 uses the
+``repos/`` endpoint for every ruleset regardless of ``ruleset_source_type``.
+
+Routing by ``ruleset_source_type`` to the ``orgs/`` endpoint would break the
+daemon today (every P1 call would 404 on missing ``admin:org``). If GitHub
+tightens the ``repos/`` endpoint later to reject org-source rulesets, P1
+already fails closed at ``test_n1_ruleset_endpoint_unreachable_halts`` — the
+right response would be a token upgrade (grant ``admin:org`` and route by
+source_type), which is a Tier-C operation outside this file's scope. The
+``ruleset_source_type`` value is surfaced in log lines and error messages so
+the operator can distinguish an org-source vs repo-source failure without
+re-tracing the code.
+
 Test-injection: every I/O boundary (``git remote``, ``gh api``) is a
 :class:`Callable` parameter with a subprocess-based default. Tests pass fakes;
 the daemon uses the defaults.
@@ -256,9 +281,22 @@ def _p1_default_branch_protected(remotes: list[tuple[str, str]], api_caller: Api
                 f"retired on 2026-08-19; without these rules the invariant does not hold."
             )
 
-        ruleset_ids = {r["ruleset_id"] for r in rules if isinstance(r, dict) and "ruleset_id" in r}
-        for rs_id in sorted(ruleset_ids):
-            _assert_bypass_never(owner, repo, rs_id, api_caller)
+        # Collect (ruleset_id, source_type, source) tuples — several rule dicts
+        # may share the same ruleset_id, so dedupe by id but keep the source
+        # metadata for the operator's error message. See the module docstring
+        # "Ruleset endpoint choice" block for why we do NOT route by
+        # source_type to a different endpoint (`orgs/...` requires admin:org
+        # which the loop's classic PAT lacks; `repos/.../rulesets/{id}`
+        # measured 2026-08-19 returns org-source rulesets correctly).
+        ruleset_meta: dict[int, tuple[str | None, str | None]] = {}
+        for r in rules:
+            if isinstance(r, dict) and "ruleset_id" in r:
+                rs_id = r["ruleset_id"]
+                if rs_id not in ruleset_meta:
+                    ruleset_meta[rs_id] = (r.get("ruleset_source_type"), r.get("ruleset_source"))
+        for rs_id in sorted(ruleset_meta):
+            source_type, source = ruleset_meta[rs_id]
+            _assert_bypass_never(owner, repo, rs_id, source_type, source, api_caller)
 
 
 def _fetch_default_branch(owner: str, repo: str, api_caller: ApiCaller) -> str:
@@ -296,23 +334,47 @@ def _fetch_effective_rules(
     return rules
 
 
-def _assert_bypass_never(owner: str, repo: str, ruleset_id: int, api_caller: ApiCaller) -> None:
+def _assert_bypass_never(
+    owner: str,
+    repo: str,
+    ruleset_id: int,
+    source_type: str | None,
+    source: str | None,
+    api_caller: ApiCaller,
+) -> None:
+    """Assert ``current_user_can_bypass == "never"`` for one ruleset.
+
+    Always queries the repository endpoint
+    (``repos/{owner}/{repo}/rulesets/{ruleset_id}``) regardless of
+    ``source_type`` — the module docstring "Ruleset endpoint choice" block
+    explains why (repo endpoint returns org-source rulesets under ``repo``
+    scope; the ``orgs/`` endpoint would require ``admin:org`` which the loop
+    token lacks). ``source_type`` and ``source`` come from the
+    ``rules/branches/{b}`` response and are surfaced in log/error messages
+    only, so an operator can distinguish "the org guardrail is broken" from
+    "a repo-local ruleset is misconfigured" without re-tracing the code.
+    """
+    origin = f"source_type={source_type!r} source={source!r}"
     try:
         rs = api_caller(f"repos/{owner}/{repo}/rulesets/{ruleset_id}")
     except Exception as exc:
         raise PreflightError(
-            f"preflight P1 failed: could not fetch ruleset {ruleset_id} for "
-            f"{owner}/{repo}: {exc}. Fail-closed (msg-1267 §4)."
+            f"preflight P1 failed: could not fetch ruleset {ruleset_id} ({origin}) "
+            f"for {owner}/{repo}: {exc}. Fail-closed (msg-1267 §4). If GitHub "
+            f"has tightened the repos/rulesets endpoint to reject Organization-"
+            f"source rulesets, the mitigation is a token upgrade to include "
+            f"admin:org scope + routing by source_type — see the module "
+            f"docstring 'Ruleset endpoint choice' block."
         ) from exc
     bypass = rs.get("current_user_can_bypass") if isinstance(rs, dict) else None
     if bypass != "never":
         raise PreflightError(
-            f"preflight P1 failed: ruleset {ruleset_id} on {owner}/{repo} has "
-            f"current_user_can_bypass={bypass!r}; required 'never'. The rules exist but "
-            f"the loop's identity can bypass them → the server-side protection is "
-            f"unreliable, and the daemon must not proceed on an unreliable premise "
-            f"(msg-1265 §5 I-1: '執行者はサーバであってよい' → but only if the server "
-            f"actually executes)."
+            f"preflight P1 failed: ruleset {ruleset_id} ({origin}) on {owner}/{repo} "
+            f"has current_user_can_bypass={bypass!r}; required 'never'. The rules "
+            f"exist but the loop's identity can bypass them → the server-side "
+            f"protection is unreliable, and the daemon must not proceed on an "
+            f"unreliable premise (msg-1265 §5 I-1: '執行者はサーバであってよい' → "
+            f"but only if the server actually executes)."
         )
 
 
