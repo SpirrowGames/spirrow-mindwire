@@ -41,5 +41,12 @@ desktop.ini
 # MindWire runtime data (never commit)
 spirrow-mindwire-data/
 
+# Per-turn dispatcher-written spec pin (SPEC-2026-08-11-design-spec-delivery D-5).
+# `.mindwire/pin` is written into the working tree by the loop dispatcher, is not
+# tracked, and must not be committed. Keeping the whole `.mindwire/` directory
+# ignored means the pin never appears in `git status --porcelain` and can never
+# ride into a commit by accident.
+.mindwire/
+
 # Visual Studio (local-only IDE state)
 .vs/
