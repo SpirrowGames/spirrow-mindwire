@@ -17,20 +17,15 @@ from typing import Any
 import pytest
 from claude_agent_sdk import (
     AssistantMessage,
-    PermissionResultAllow,
     ResultMessage,
     TextBlock,
-    ToolPermissionContext,
 )
 
 from spirrow_mindwire.adapters.implementer import (
     ImplementerSdkAdapter,
     ImplementerSdkDeliveryError,
     ImplementerSdkSpawnError,
-    _AllowlistGuard,
-    classify_tool_call,
 )
-from spirrow_mindwire.allowlist import Operation, default_allowlist
 from spirrow_mindwire.obligations import load_manifest
 from spirrow_mindwire.ports import RoleAdapter, SpawnContext
 from spirrow_mindwire.value_objects import (
@@ -61,33 +56,6 @@ _OBLIGATIONS = load_manifest()
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(
-    "name,inp,expected",
-    [
-        ("Write", {"file_path": "a.py"}, Operation.FS_WRITE),
-        ("Edit", {"file_path": "a.py"}, Operation.FS_WRITE),
-        ("MultiEdit", {"file_path": "a.py"}, Operation.FS_WRITE),
-        ("NotebookEdit", {"notebook_path": "a.ipynb"}, Operation.FS_WRITE),
-        ("Read", {"file_path": "a.py"}, Operation.FS_READ),
-        ("Glob", {"pattern": "**"}, Operation.SEARCH),
-        ("Grep", {"pattern": "x"}, Operation.SEARCH),
-        # T37 #3: benign built-ins (planning + background-shell mgmt) classify to
-        # EXEC_CODE (Tier A allow), not UNKNOWN — else they halt the agent's first
-        # planning step. Anything with real fs/git/external effect stays explicit.
-        ("TodoWrite", {"todos": []}, Operation.EXEC_CODE),
-        ("BashOutput", {"bash_id": "1"}, Operation.EXEC_CODE),
-        ("KillShell", {"shell_id": "1"}, Operation.EXEC_CODE),
-        ("Frobnicate", {}, Operation.UNKNOWN),
-    ],
-)
-def test_classify_simple_tools(name: str, inp: dict[str, Any], expected: Operation) -> None:
-    assert classify_tool_call(name, inp).operation is expected
-
-
-def test_classify_fs_write_carries_path() -> None:
-    assert classify_tool_call("Write", {"file_path": "src/x.py"}).path == "src/x.py"
-
-
 # --------------------------------------------------------------------------- #
 # T27: indirection is unified via recursion (direct == wrapped), not a regex
 # mirror. These cover the shell-extraction edge cases (nesting, multiple -c,
@@ -95,28 +63,9 @@ def test_classify_fs_write_carries_path() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_classify_merge_source_extracted() -> None:
-    a = classify_tool_call("Bash", {"command": "git merge feature/x"})
-    assert a.operation is Operation.GIT_MERGE
-    assert a.source == "feature/x"
-
-
-def test_classify_env_prefix_force_push() -> None:
-    a = classify_tool_call("Bash", {"command": "FOO=bar git push --force origin feature/x"})
-    assert a.operation is Operation.FORCE_PUSH
-
-
 # --------------------------------------------------------------------------- #
 # guard
 # --------------------------------------------------------------------------- #
-
-
-@pytest.mark.anyio
-async def test_guard_allows_exec(tmp_path: Path) -> None:
-    guard = _AllowlistGuard(default_allowlist(repo_root=tmp_path))
-    res = await guard("Bash", {"command": "pytest"}, ToolPermissionContext())
-    assert isinstance(res, PermissionResultAllow)
-    assert guard.violations == []
 
 
 # --------------------------------------------------------------------------- #
@@ -229,13 +178,10 @@ class _FakeSdkClient:
         options: Any,
         *,
         responses: list[Any],
-        simulate_tool: tuple[str, dict[str, Any]] | None = None,
         fail_on: str | None = None,
     ) -> None:
         self.options = options
-        self._can_use_tool = options.can_use_tool
         self._responses = responses
-        self._simulate_tool = simulate_tool
         self._fail_on = fail_on
         self.connected = False
         self.disconnected = False
@@ -249,9 +195,6 @@ class _FakeSdkClient:
 
     async def query(self, prompt: str) -> None:
         self.queries.append(prompt)
-        if self._simulate_tool is not None:
-            name, inp = self._simulate_tool
-            await self._can_use_tool(name, inp, ToolPermissionContext())
 
     async def receive_response(self) -> AsyncIterator[Any]:
         for message in self._responses:
@@ -267,14 +210,11 @@ class _FakeSdkClient:
 def _factory(
     *,
     responses: list[Any],
-    simulate_tool: tuple[str, dict[str, Any]] | None = None,
     fail_on: str | None = None,
     capture: list[_FakeSdkClient] | None = None,
 ) -> Callable[[Any], _FakeSdkClient]:
     def make(options: Any) -> _FakeSdkClient:
-        client = _FakeSdkClient(
-            options, responses=responses, simulate_tool=simulate_tool, fail_on=fail_on
-        )
+        client = _FakeSdkClient(options, responses=responses, fail_on=fail_on)
         if capture is not None:
             capture.append(client)
         return client
@@ -351,8 +291,11 @@ async def test_spawn_routes_inference_via_base_url(tmp_path: Path) -> None:
     opts = cap[0].options
     # never api.anthropic.com directly: ANTHROPIC_BASE_URL pinned to Lexora.
     assert opts.env["ANTHROPIC_BASE_URL"] == "http://lexora:8110"
-    assert opts.can_use_tool is not None  # the allow-list guard is wired in
-    assert opts.permission_mode == "default"  # NOT bypassPermissions
+    # The per-call allow-list guard was removed on 2026-08-20. With no guard to
+    # ask, "default" would leave a headless session waiting on a prompt nobody
+    # can answer, so the two facts belong together and are pinned together.
+    assert opts.can_use_tool is None
+    assert opts.permission_mode == "bypassPermissions"
     assert handle.role is Role.IMPLEMENTER
 
 
@@ -373,7 +316,7 @@ async def test_spawn_routes_inference_via_base_url(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_deliver_emits_reply_when_allowed(tmp_path: Path) -> None:
+async def test_deliver_emits_reply(tmp_path: Path) -> None:
     captured: list[ReplyDraft] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
@@ -381,7 +324,6 @@ async def test_deliver_emits_reply_when_allowed(tmp_path: Path) -> None:
         inference_base_url="http://lx",
         client_factory=_factory(
             responses=[_assistant("done"), _result()],
-            simulate_tool=("Bash", {"command": "pytest -q"}),
         ),
     )
     handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx(captured))
