@@ -19,7 +19,6 @@ from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
     TextBlock,
-    ToolPermissionContext,
 )
 
 from spirrow_mindwire.adapters.implementer import (
@@ -179,13 +178,10 @@ class _FakeSdkClient:
         options: Any,
         *,
         responses: list[Any],
-        simulate_tool: tuple[str, dict[str, Any]] | None = None,
         fail_on: str | None = None,
     ) -> None:
         self.options = options
-        self._can_use_tool = options.can_use_tool
         self._responses = responses
-        self._simulate_tool = simulate_tool
         self._fail_on = fail_on
         self.connected = False
         self.disconnected = False
@@ -199,9 +195,6 @@ class _FakeSdkClient:
 
     async def query(self, prompt: str) -> None:
         self.queries.append(prompt)
-        if self._simulate_tool is not None:
-            name, inp = self._simulate_tool
-            await self._can_use_tool(name, inp, ToolPermissionContext())
 
     async def receive_response(self) -> AsyncIterator[Any]:
         for message in self._responses:
@@ -217,14 +210,11 @@ class _FakeSdkClient:
 def _factory(
     *,
     responses: list[Any],
-    simulate_tool: tuple[str, dict[str, Any]] | None = None,
     fail_on: str | None = None,
     capture: list[_FakeSdkClient] | None = None,
 ) -> Callable[[Any], _FakeSdkClient]:
     def make(options: Any) -> _FakeSdkClient:
-        client = _FakeSdkClient(
-            options, responses=responses, simulate_tool=simulate_tool, fail_on=fail_on
-        )
+        client = _FakeSdkClient(options, responses=responses, fail_on=fail_on)
         if capture is not None:
             capture.append(client)
         return client
@@ -301,8 +291,11 @@ async def test_spawn_routes_inference_via_base_url(tmp_path: Path) -> None:
     opts = cap[0].options
     # never api.anthropic.com directly: ANTHROPIC_BASE_URL pinned to Lexora.
     assert opts.env["ANTHROPIC_BASE_URL"] == "http://lexora:8110"
-    assert opts.can_use_tool is not None  # the allow-list guard is wired in
-    assert opts.permission_mode == "default"  # NOT bypassPermissions
+    # The per-call allow-list guard was removed on 2026-08-20. With no guard to
+    # ask, "default" would leave a headless session waiting on a prompt nobody
+    # can answer, so the two facts belong together and are pinned together.
+    assert opts.can_use_tool is None
+    assert opts.permission_mode == "bypassPermissions"
     assert handle.role is Role.IMPLEMENTER
 
 
@@ -323,7 +316,7 @@ async def test_spawn_routes_inference_via_base_url(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_deliver_emits_reply_when_allowed(tmp_path: Path) -> None:
+async def test_deliver_emits_reply(tmp_path: Path) -> None:
     captured: list[ReplyDraft] = []
     adapter = ImplementerSdkAdapter(
         cwd=tmp_path,
@@ -331,7 +324,6 @@ async def test_deliver_emits_reply_when_allowed(tmp_path: Path) -> None:
         inference_base_url="http://lx",
         client_factory=_factory(
             responses=[_assistant("done"), _result()],
-            simulate_tool=("Bash", {"command": "pytest -q"}),
         ),
     )
     handle = await adapter.spawn(_thread_ref(), Role.IMPLEMENTER, _ctx(captured))
