@@ -103,6 +103,12 @@ $quarantineStatePath = Join-Path $dataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
 $evaluatedStatePath = Join-Path $dataDir "state\evaluated.json"
 $digestStatePath = Join-Path $dataDir "state\digest.json"
+# Composer cache (T-decision-request-composer S2). One row per parked thread key,
+# keyed by the same "project/thread_id" the notified.json / heads.json use so a
+# reader can cross-reference by eye. The row carries the last composer envelope
+# (question + options) and its signature; the wrapper reuses it when the
+# signature has not changed (I-3: ≤1 composer call per reason:last_msg stop).
+$pendingDecisionsPath = Join-Path $dataDir "state\pending-decisions.json"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
@@ -768,6 +774,371 @@ function Send-NotificationIfChanged {
     $State[$Key] = $Signature
 }
 
+# --- decision-request composer (T-decision-request-composer S2) ---------------------------------
+# Turns the current bare "the loop is waiting on Takahito" ping into a self-contained question by
+# invoking `mindwire-compose-decision` on every NEW human-terminal stop, then caching the result in
+# pending-decisions.json so a re-notify or a dashboard read (S6' / S5') never re-fires the composer.
+#
+# Two invariants this block is on the hook for:
+#   I-2 — a broken composer NEVER sinks the notification. Every failure mode below (missing repo,
+#         CLI usage error, timeout, non-zero exit, unparseable stdout) falls through to a $null
+#         envelope, and the caller's raw ping fires exactly as it did before this block existed.
+#         Silence-on-failure is the failure mode the whole thread was opened to end (msg-1370 §1).
+#   I-3 — the composer is invoked ONCE per (project/thread_id, signature) stop. The dedup is done
+#         BEFORE the CLI is invoked, by consulting pending-decisions.json: same signature => cached
+#         envelope, no CLI call. That is what makes the composer affordable at a 5-minute cadence
+#         (measured 08-20: the same signature straddled several ticks; naive dispatch would burn
+#         one inference per tick).
+#
+# The pending-decisions.json shape is defined by DecisionRequestEnvelope.to_json (see
+# src/spirrow_mindwire/decision_request/value_objects.py) — the wrapper never writes fields the
+# Python side does not know about, so a reader can trust the shape end-to-end. The wrapper wraps
+# each envelope in a row {signature; envelope; cached_at} so a future addition (renotify_count for
+# S6', last_notified_at) can grow on the row without touching the envelope itself.
+
+# The Discord notification budget. 2000 is the Discord single-message limit; the truncation ladder
+# below reserves a small margin for the tail marker so the ladder cannot itself overflow.
+$DecisionMessageDiscordBudget = 1950
+
+# Bounded tail for the composer input (I-4). S2 does not fetch the tail bodies — the stub does not
+# need them and S3 lands the tail-fetching path with the real composer. Keeping the bound here (as
+# opposed to inlined in Get-DecisionEnvelope) means the config lever is in one place when S3 wires
+# it in.
+$DecisionComposerTailLimit = 5
+
+# How long the wrapper waits for the CLI. 30s is generous for the stub (measured <1s) and gives S3's
+# LLM-backed composer a workable ceiling. On timeout the wrapper KILLS the process and returns $null
+# — I-2 says a stuck composer must never delay the raw ping.
+$DecisionComposerTimeoutSeconds = 30
+
+# The default composer backend when the env var is unset. S1/S2 ships 'stub'; S3 will ship
+# 'claude-code' and flip the default from a config change, not a code edit.
+$DecisionComposerBackend = if ($env:MINDWIRE_DECISION_COMPOSER_BACKEND) {
+    $env:MINDWIRE_DECISION_COMPOSER_BACKEND
+} else { 'stub' }
+
+# The persona label the composer records into the envelope (I-5: MUST NOT be one of the design
+# roster names Bohr / Heisenberg / Einstein). The Python side has its own default; this only makes
+# the identity a config knob on the deploy side.
+$DecisionComposerIdentity = if ($env:MINDWIRE_DECISION_COMPOSER_IDENTITY) {
+    $env:MINDWIRE_DECISION_COMPOSER_IDENTITY
+} else { 'Composer' }
+
+# Dashboard base URL for D-29 (the link always survives the truncation ladder). Read from env with
+# the Tailscale-visible default from Takahito's §11.1 measurement — an operator relocating the
+# dashboard sets MINDWIRE_DECISION_DASHBOARD_URL and every link updates without touching the format
+# code. Path composition (`/dashboard/decisions/<project>/<thread>`) is the single call in
+# Format-DecisionMessage — a URL-shape change is one edit, not a search across the wrapper.
+$DecisionDashboardBaseUrl = if ($env:MINDWIRE_DECISION_DASHBOARD_URL) {
+    $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
+} else { 'https://sg-ai-server-01.taile861db.ts.net:8443' }
+
+# Invoke the CLI with the input JSON on stdin, return @{ ok; envelope; error }. This is the seam
+# tests override: replacing the function with a stub lets the wiring be exercised without spawning
+# uv. On success `ok=$true` and `envelope` holds the parsed hash; on any failure `ok=$false` and
+# `error` describes what happened (used for logging only — the caller falls back to the raw ping
+# either way per I-2).
+function Invoke-ComposerCli {
+    param(
+        [string]$InputJson,
+        [string]$Backend = $DecisionComposerBackend,
+        [string]$Identity = $DecisionComposerIdentity,
+        [int]$TimeoutSeconds = $DecisionComposerTimeoutSeconds
+    )
+
+    if (-not (Test-Path -LiteralPath $repoRoot)) {
+        return @{ ok = $false; envelope = $null; error = "repo root not found: $repoRoot" }
+    }
+
+    # System.Diagnostics.Process for real stdio streams. `& uv run ... < $tmp` in PowerShell buffers
+    # stdout across the venv sync and prints occasional progress lines to stderr, which turn the
+    # parse below into guesswork. A raw Process gives clean separated streams and a hard kill on
+    # timeout — the composer runs unattended, so a stuck process must not hold the sweep back.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'uv'
+    $psi.Arguments = "run mindwire-compose-decision --backend $Backend --identity `"$Identity`""
+    $psi.WorkingDirectory = $repoRoot
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    # UTF-8 both ways — the input carries Japanese and the CLI output is also UTF-8.
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+
+    $proc = $null
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+    }
+    catch {
+        return @{ ok = $false; envelope = $null; error = "cannot start uv: $($_.Exception.Message)" }
+    }
+    try {
+        # StandardInput needs an explicit UTF-8 write; the default writer would honour the console's
+        # code page, which is usually not UTF-8 on Windows.
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $bytes = $utf8.GetBytes($InputJson)
+        $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $proc.StandardInput.BaseStream.Flush()
+        $proc.StandardInput.Close()
+
+        # Read the streams in tasks so the process cannot deadlock on a full stderr pipe.
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        if (-not $proc.WaitForExit([int]([TimeSpan]::FromSeconds($TimeoutSeconds).TotalMilliseconds))) {
+            try { $proc.Kill() } catch { }
+            return @{ ok = $false; envelope = $null; error = "composer CLI timed out after ${TimeoutSeconds}s" }
+        }
+
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+
+        if ($proc.ExitCode -ne 0) {
+            $tail = if ($stderr) { ($stderr -split "`r?`n" | Select-Object -Last 5) -join ' | ' } else { '<no stderr>' }
+            return @{ ok = $false; envelope = $null;
+                error = "composer CLI exit=$($proc.ExitCode) stderr=$tail" }
+        }
+
+        # The CLI writes exactly one JSON object on stdout on the ok path. uv may print progress on
+        # stderr while syncing the environment — that noise stays out of the parse because we only
+        # look at stdout.
+        $line = ($stdout -split "`r?`n" | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+        if (-not $line) {
+            return @{ ok = $false; envelope = $null; error = "composer CLI produced no JSON on stdout" }
+        }
+        try {
+            $envelope = $line | ConvertFrom-Json
+            return @{ ok = $true; envelope = $envelope; error = $null }
+        }
+        catch {
+            return @{ ok = $false; envelope = $null; error = "composer CLI output not JSON: $($_.Exception.Message)" }
+        }
+    }
+    finally {
+        if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch { } }
+        if ($proc) { $proc.Dispose() }
+    }
+}
+
+# Build the JSON payload the CLI expects. Extracted so tests can compare a real payload against a
+# known-good literal without spawning the CLI itself.
+function New-ComposerInputJson {
+    param(
+        [string]$Project,
+        [string]$ThreadId,
+        [string]$LastMsgId,
+        [string]$StopReason,
+        [int]$Rounds,
+        [string]$ThreadTitle = '',
+        [int]$TailRequested = 0,
+        [int]$TotalMessages = 0,
+        [array]$Tail = @()
+    )
+    $payload = @{
+        schema_version = 1
+        project        = $Project
+        thread_id      = $ThreadId
+        last_msg_id    = $LastMsgId
+        stop_reason    = $StopReason
+        rounds         = $Rounds
+        thread_title   = $ThreadTitle
+        tail_requested = $TailRequested
+        total_messages = $TotalMessages
+        tail           = @($Tail)
+    }
+    return ($payload | ConvertTo-Json -Depth 6 -Compress)
+}
+
+# The pending-decisions cache. Same JSON shape as heads.json / notified.json, keyed by the sweep's
+# "project/thread_id" key. Rows carry {signature; envelope; cached_at}. On a corrupt file
+# Get-JsonState logs and returns an empty map — the composer will fire fresh, one signature at most
+# once per (project/thread_id, signature), so a lost cache costs at most one extra CLI call per
+# parked thread and self-heals on the next tick.
+function Get-CachedDecision {
+    param([hashtable]$State, [string]$Key, [string]$Signature)
+
+    if (-not $State.ContainsKey($Key)) { return $null }
+    $row = $State[$Key]
+    if ($null -eq $row) { return $null }
+    # Duck-type on either shape (freshly written hashtable vs. JSON-loaded PSCustomObject).
+    if ($row -is [hashtable]) {
+        $rowSig = $row['signature']
+        $rowEnv = $row['envelope']
+    }
+    else {
+        $rowSig = $row.signature
+        $rowEnv = $row.envelope
+    }
+    if ($rowSig -ne $Signature) { return $null }
+    return $rowEnv
+}
+
+# Compose (or return the cached envelope for) one stop. Returns the parsed envelope hash on
+# success, or $null on any failure — including a CLI usage error — so the caller falls back to the
+# raw ping. Two side effects: writes a fresh row into $State on a successful compose (and only
+# then, so a broken composer never pollutes the cache), and logs one line per outcome so A-3 is
+# observable in the log.
+function Get-DecisionEnvelope {
+    param(
+        [hashtable]$State,
+        [string]$Key,
+        [string]$Project,
+        [string]$ThreadId,
+        [string]$Signature,
+        [string]$LastMsgId,
+        [string]$StopReason,
+        [int]$Rounds,
+        [string]$ThreadTitle = ''
+    )
+
+    # I-3 dedup: same signature -> reuse the cache. This is the ONLY branch that must not fire the
+    # CLI; every other branch (missing row / different signature) proceeds to compose. Logged so the
+    # dedup is visible in the sweep log (A-3 verification).
+    $cached = Get-CachedDecision -State $State -Key $Key -Signature $Signature
+    if ($null -ne $cached) {
+        Write-Log "composer reuse: $Key signature=$Signature (cache hit — no CLI call)"
+        return $cached
+    }
+
+    $inputJson = New-ComposerInputJson `
+        -Project $Project -ThreadId $ThreadId -LastMsgId $LastMsgId `
+        -StopReason $StopReason -Rounds $Rounds -ThreadTitle $ThreadTitle `
+        -TailRequested $DecisionComposerTailLimit -TotalMessages 0 -Tail @()
+
+    $result = Invoke-ComposerCli -InputJson $inputJson `
+        -Backend $DecisionComposerBackend -Identity $DecisionComposerIdentity `
+        -TimeoutSeconds $DecisionComposerTimeoutSeconds
+    if (-not $result.ok) {
+        # I-2: never let a composer failure delay or block the raw ping. Log the failure so it is
+        # visible in the sweep log, do NOT cache the failure (a future S6' renotify would keep
+        # replaying the failed envelope forever), and return $null. The caller falls back to the
+        # bare "you have a decision to make" body.
+        Write-Log "composer failed: $Key signature=$Signature — $($result.error) — raw ping will fire"
+        return $null
+    }
+
+    # Cache the fresh envelope. Log with the composer_status so A-3 (dedup) and A-2 (composer
+    # broken but envelope reported non-ok) are distinguishable in the log.
+    $envelope = $result.envelope
+    $status = if ($envelope.PSObject.Properties.Name -contains 'composer_status') { $envelope.composer_status } else { '<unknown>' }
+    Write-Log "composer fire: $Key signature=$Signature status=$status"
+    $State[$Key] = @{
+        signature = $Signature
+        envelope  = $envelope
+        cached_at = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    return $envelope
+}
+
+# Compose the Discord message body from an envelope + the raw "someone is waiting" context. The
+# ladder (D-9 msg-1373 / D-29 msg-1384) reserves a background block (header + dashboard link) that
+# is ALWAYS present — a truncated message that lost its link would tell an operator to go look at
+# nothing in particular, which is worse than the pre-composer ping. Everything else falls off in
+# reverse priority order: unknowns first, then recommendation reason, then option gains/losses,
+# then option labels, then finally the question — the last thing to drop, followed by a "詳細は
+# chatroom" marker. In the extreme failure case the caller falls back to the raw ping entirely.
+function Format-DecisionMessage {
+    param(
+        [string]$Project,
+        [string]$ThreadId,
+        [string]$StopReason,
+        [int]$Rounds,
+        [string]$LastMsgId,
+        [string]$RawFallback,
+        $Envelope = $null,
+        [int]$Budget = $DecisionMessageDiscordBudget
+    )
+
+    # Background: 2 lines the ladder never touches (D-29). A truncated form without them collapses
+    # to the raw ping in the caller — we do NOT render a headerless body.
+    $encodedProject = [uri]::EscapeDataString($Project)
+    $encodedThread = [uri]::EscapeDataString($ThreadId)
+    $link = "$DecisionDashboardBaseUrl/dashboard/decisions/$encodedProject/$encodedThread"
+    $header = "MindWire: **$ThreadId** ($Project) — 判断待ち (reason=$StopReason, rounds=$Rounds, $LastMsgId)"
+    $background = "$header`n$link"
+
+    if (-not $Envelope) { return $null }   # caller falls back to $RawFallback
+    $status = if ($Envelope.PSObject.Properties.Name -contains 'composer_status') { $Envelope.composer_status } else { $null }
+    if ($status -ne 'ok') { return $null } # non-ok envelope carries no question — fall back to raw ping
+
+    $output = if ($Envelope.PSObject.Properties.Name -contains 'output') { $Envelope.output } else { $null }
+    if (-not $output) { return $null }
+
+    $question = if ($output.PSObject.Properties.Name -contains 'question') { $output.question } else { '' }
+    if (-not $question) { return $null }
+
+    # Build layered slices. Each slice is a string; we try to append them in priority order and
+    # stop when the next one would exceed the budget. The tail marker is only added if at least one
+    # slice was dropped.
+    $slices = New-Object System.Collections.Generic.List[string]
+    $slices.Add("`n$question")
+
+    $options = @()
+    if ($output.PSObject.Properties.Name -contains 'options') { $options = @($output.options) }
+
+    if ($options.Count -gt 0) {
+        # Option labels only — the cheap slice.
+        $labelLines = @('選択肢:')
+        foreach ($o in $options) { $labelLines += "  $($o.id): $($o.label)" }
+        $slices.Add("`n" + ($labelLines -join "`n"))
+
+        # Gains / losses — richer slice, dropped one below labels.
+        $gainLossLines = @()
+        foreach ($o in $options) {
+            if ($o.gain) { $gainLossLines += "  $($o.id) 得: $($o.gain)" }
+            if ($o.loss) { $gainLossLines += "  $($o.id) 失: $($o.loss)" }
+        }
+        if ($gainLossLines.Count -gt 0) {
+            $slices.Add("`n" + ($gainLossLines -join "`n"))
+        }
+    }
+
+    $recommendation = if ($output.PSObject.Properties.Name -contains 'recommendation') { $output.recommendation } else { $null }
+    $recReason = if ($output.PSObject.Properties.Name -contains 'recommendation_reason') { $output.recommendation_reason } else { $null }
+    if ($recommendation -and $recReason) {
+        $slices.Add("`n推奨: $recommendation — $recReason")
+    }
+
+    $unknowns = @()
+    if ($output.PSObject.Properties.Name -contains 'unknowns') { $unknowns = @($output.unknowns) }
+    if ($unknowns.Count -gt 0) {
+        $unknownLines = @('未確認:')
+        foreach ($u in $unknowns) { $unknownLines += "  - $u" }
+        $slices.Add("`n" + ($unknownLines -join "`n"))
+    }
+
+    # Ladder: keep the background, then try to append slices in the DROP order (recommendation
+    # reason / unknowns / gains-losses / labels / question) from LAST to FIRST — we walk the
+    # priority list forward from the question and stop appending as soon as one does not fit. That
+    # way "question" is the first slice we try and "unknowns" is the last; if unknowns don't fit
+    # we drop unknowns, if gains/losses don't fit we drop both, and so on.
+    $body = $background
+    $tailMarker = "`n… 詳細は chatroom を参照してください。"
+    $tailMarkerLen = $tailMarker.Length
+    $droppedAny = $false
+    foreach ($slice in $slices) {
+        # Reserve space for the tail marker in case a LATER slice is dropped. If nothing gets
+        # dropped we strip the reservation.
+        $projected = $body + $slice
+        if ($projected.Length + $tailMarkerLen -le $Budget) {
+            $body = $projected
+        }
+        else {
+            $droppedAny = $true
+            break
+        }
+    }
+    if ($droppedAny) {
+        # If even the header+link+question doesn't fit... only slot the tail marker and return the
+        # background; the caller can decide whether to fall back to the raw ping when we return
+        # something too small. In practice a 1950-char budget swallows the header + link + a normal
+        # question line, so this is a defensive branch, not a common one.
+        $body = $body + $tailMarker
+    }
+    return $body
+}
+
 # --- the sweep list (config, NOT code) -----------------------------------------------------------
 # Each candidate is a (project, thread_id, repo_dir) triple. Two reasons it is a file and not a
 # literal in this script:
@@ -957,6 +1328,13 @@ try {
     # Loaded before the deploy step, which already needs it to dedupe its own alerts.
     $notifyState = Get-JsonState -Path $notifyStatePath
 
+    # Composer cache (T-decision-request-composer S2). Loaded up front for the same reason as
+    # $notifyState — the human-terminal branch inside the candidate loop reads and writes it, and a
+    # corrupt file collapses to an empty map (see Get-JsonState). An empty map costs at most one
+    # fresh composer call per parked thread this tick and self-heals; a missing pending-decisions
+    # file is not a fatal condition.
+    $pendingDecisionsState = Get-JsonState -Path $pendingDecisionsPath
+
     # Deploy first, so a tick either updates the code or uses it — never both. When the pull moves
     # HEAD this tick STOPS: the wrapper was parsed from the old file at startup while
     # run-conductor.ps1 would be read from disk after the pull, and a sweep spanning two versions is
@@ -972,6 +1350,7 @@ try {
                 -Message ("MindWire: main を取り込みました（$($sync.from) → $($sync.to)、$($sync.commits) commit$depsNote）。" +
                           "この tick は起動せず、次の tick から新しいコードで動きます。")
             Save-JsonState -Path $notifyStatePath -State $notifyState
+            Save-JsonState -Path $pendingDecisionsPath -State $pendingDecisionsState
             Write-Log "not launching this tick — the next one runs entirely on the new code"
             return
         }
@@ -1272,10 +1651,27 @@ try {
         if ($verdict.reason -and $needsHuman.ContainsKey($verdict.reason)) {
             # Signature carries the reason too, so a thread that changes *how* it is stuck re-alerts
             # even when last_msg has not moved.
+            $sig = "$($verdict.reason):$($verdict.last_msg)"
+
+            # T-decision-request-composer S2: fold in an enriched question (with options + a
+            # dashboard link) when the composer can produce one; fall back to the raw ping on any
+            # failure (I-2). Get-DecisionEnvelope enforces I-3 by caching per signature — a same-
+            # signature repeat tick reuses the cached envelope and never invokes the CLI.
+            $rawFallback = ("MindWire: **$thread** ($($cand.project)) — " +
+                            $needsHuman[$verdict.reason] +
+                            " (reason=$($verdict.reason), rounds=$($verdict.rounds), $($verdict.last_msg))。" +
+                            "chatroom を確認してください。")
+            $envelope = Get-DecisionEnvelope -State $pendingDecisionsState `
+                -Key $cand.key -Project $cand.project -ThreadId $thread `
+                -Signature $sig -LastMsgId $verdict.last_msg `
+                -StopReason $verdict.reason -Rounds $verdict.rounds
+            $enriched = Format-DecisionMessage -Project $cand.project -ThreadId $thread `
+                -StopReason $verdict.reason -Rounds $verdict.rounds `
+                -LastMsgId $verdict.last_msg -RawFallback $rawFallback -Envelope $envelope
+            $message = if ($enriched) { $enriched } else { $rawFallback }
+
             Send-NotificationIfChanged -State $notifyState -Key $cand.key `
-                -Signature "$($verdict.reason):$($verdict.last_msg)" `
-                -Message ("MindWire: **$thread** ($($cand.project)) — " + $needsHuman[$verdict.reason] +
-                          " (reason=$($verdict.reason), rounds=$($verdict.rounds), $($verdict.last_msg))。chatroom を確認してください。")
+                -Signature $sig -Message $message
         }
 
         if ($verdict.rounds -gt 0) {
@@ -1401,6 +1797,7 @@ try {
     }
 
     Save-JsonState -Path $notifyStatePath -State $notifyState
+    Save-JsonState -Path $pendingDecisionsPath -State $pendingDecisionsState
 }
 catch {
     $exitCode = 1

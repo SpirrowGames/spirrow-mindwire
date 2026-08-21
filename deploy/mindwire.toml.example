@@ -7,6 +7,15 @@
 # the adapters at spawn (see deploy/run-conductor.ps1): MINDWIRE_IMPLEMENTER_BASE_URL,
 # MINDWIRE_NAYSAYER_BASE_URL, MINDWIRE_LEXORA_URL, MINDWIRE_NAYSAYER_GITHUB_TOKEN,
 # MINDWIRE_MAGICKIT_MCP_URL (the last defaults to the in-code Tailscale endpoint).
+#
+# The T-decision-request-composer S2 wiring reads three env vars, all optional (in-code defaults
+# apply otherwise, and the deploy still works with none of them set):
+#   MINDWIRE_DECISION_COMPOSER_BACKEND  = 'stub' (default) | 'claude-code' (added in S3)
+#   MINDWIRE_DECISION_COMPOSER_IDENTITY = 'Composer' (default; MUST NOT be Bohr / Heisenberg /
+#                                          Einstein — the I-5 role-independence rule)
+#   MINDWIRE_DECISION_DASHBOARD_URL     = base URL of the Magickit dashboard used in the Discord
+#                                          alert's D-29 link. Default:
+#                                          https://sg-ai-server-01.taile861db.ts.net:8443
 
 schema_version = 1
 
