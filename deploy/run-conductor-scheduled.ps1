@@ -876,10 +876,16 @@ $DecisionMessageDiscordBudget = 1950
 # it in.
 $DecisionComposerTailLimit = 5
 
-# How long the wrapper waits for the CLI. 30s is generous for the stub (measured <1s) and gives S3's
+# How long the wrapper waits for the CLI. 60s is generous for the stub (measured <1s) and gives S3's
 # LLM-backed composer a workable ceiling. On timeout the wrapper KILLS the process and returns $null
 # — I-2 says a stuck composer must never delay the raw ping.
-$DecisionComposerTimeoutSeconds = 30
+#
+# D-45 (Tier-C msg §25.2): originally 30s. Raised to 60s after A-18 measured 33,812 ms end-to-end on
+# a live parked thread (tail 6 msgs / 21,026 chars). Composer failure fails-open through I-2, so the
+# ceiling only bounds how long the wrapper waits before falling back to the raw ping — measured
+# 8-11h human response latency dwarfs the extra 30s. The three sites (this constant, the Python
+# DEFAULT_TIMEOUT_SECONDS, and the CLI's --timeout-seconds default) MUST stay in sync.
+$DecisionComposerTimeoutSeconds = 60
 
 # The default composer backend when the env var is unset. S1/S2 ships 'stub'; S3 will ship
 # 'claude-code' and flip the default from a config change, not a code edit.
@@ -913,7 +919,8 @@ function Invoke-ComposerCli {
         [string]$InputJson,
         [string]$Backend = $DecisionComposerBackend,
         [string]$Identity = $DecisionComposerIdentity,
-        [int]$TimeoutSeconds = $DecisionComposerTimeoutSeconds
+        [int]$TimeoutSeconds = $DecisionComposerTimeoutSeconds,
+        [int]$TailCount = 0
     )
 
     if (-not (Test-Path -LiteralPath $repoRoot)) {
@@ -926,7 +933,13 @@ function Invoke-ComposerCli {
     # timeout — the composer runs unattended, so a stuck process must not hold the sweep back.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'uv'
-    $psi.Arguments = "run mindwire-compose-decision --backend $Backend --identity `"$Identity`""
+    # S3 spec D-38: pass --tail N when the caller asks for it (currently: only the claude-code
+    # backend does). The stub backend explicitly leaves TailCount=0 so its existing behaviour
+    # (payload tail is what the CLI sees) is untouched. Kept as a caller-supplied parameter rather
+    # than an in-function branch on $Backend so the seam stays testable without threading the
+    # backend through Format-DecisionMessage etc.
+    $tailArg = if ($TailCount -gt 0) { " --tail $TailCount" } else { '' }
+    $psi.Arguments = "run mindwire-compose-decision --backend $Backend --identity `"$Identity`"$tailArg"
     $psi.WorkingDirectory = $repoRoot
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
@@ -1076,9 +1089,15 @@ function Get-DecisionEnvelope {
         -StopReason $StopReason -Rounds $Rounds -ThreadTitle $ThreadTitle `
         -TailRequested $DecisionComposerTailLimit -TotalMessages 0 -Tail @()
 
+    # S3 spec D-38: only claude-code fetches the tail via chatroom_get_thread (Python side, per
+    # D-36). The stub keeps its empty-payload path unchanged. If a future backend also wants a
+    # fetched tail, add it here — the CLI's --tail flag is the single shared knob.
+    $tailForBackend = if ($DecisionComposerBackend -eq 'claude-code') { $DecisionComposerTailLimit } else { 0 }
+
     $result = Invoke-ComposerCli -InputJson $inputJson `
         -Backend $DecisionComposerBackend -Identity $DecisionComposerIdentity `
-        -TimeoutSeconds $DecisionComposerTimeoutSeconds
+        -TimeoutSeconds $DecisionComposerTimeoutSeconds `
+        -TailCount $tailForBackend
     if (-not $result.ok) {
         # I-2: never let a composer failure delay or block the raw ping. Log the failure so it is
         # visible in the sweep log, do NOT cache the failure (a future S6' renotify would keep

@@ -60,11 +60,21 @@ foreach ($name in $needed) {
 
 # The wrapper's Invoke-ComposerCli is what we override for A-2 / A-3 without ever running uv.
 # The counter records how many times the composer was actually shelled out to.
+# S3: also records the TailCount so we can assert Get-DecisionEnvelope passes it correctly
+# when the backend is claude-code (D-38 pipe).
 $script:composerCallCount = 0
 $script:composerReturn = $null
+$script:composerLastCall = $null
 function Invoke-ComposerCli {
-    param([string]$InputJson, [string]$Backend, [string]$Identity, [int]$TimeoutSeconds)
+    param([string]$InputJson, [string]$Backend, [string]$Identity, [int]$TimeoutSeconds, [int]$TailCount = 0)
     $script:composerCallCount++
+    $script:composerLastCall = @{
+        InputJson = $InputJson
+        Backend = $Backend
+        Identity = $Identity
+        TimeoutSeconds = $TimeoutSeconds
+        TailCount = $TailCount
+    }
     return $script:composerReturn
 }
 
@@ -245,6 +255,43 @@ $env = Get-CachedDecision -State $state -Key 'p/T-a' -Signature 'human:msg-2'
 CheckTrue 'signature mismatch is a miss' ($null -eq $env)
 $env = Get-CachedDecision -State $state -Key 'not-there' -Signature 'human:msg-1'
 CheckTrue 'absent key is a miss' ($null -eq $env)
+
+# ===============================================================================================
+# S3 (D-38): --tail N is passed to Invoke-ComposerCli only when the backend fetches tail
+# ===============================================================================================
+#
+# Coverage:
+#   * claude-code backend → -TailCount = $DecisionComposerTailLimit (5)
+#   * stub backend        → -TailCount = 0 (unchanged S2 behaviour, payload tail is what CLI sees)
+#
+# Rationale: D-38 says "tail は Python 側で取り、子には文字列として渡す" — the tail-fetch is the
+# CLI's job, but the WRAPPER decides whether the current backend wants a fetch. Only claude-code
+# does today; a future backend that wants a fetch adds itself to the branch in Get-DecisionEnvelope.
+
+Write-Host ''
+Write-Host 'Get-DecisionEnvelope — S3 (D-38): claude-code backend triggers --tail passthrough'
+$state = @{}
+$script:composerCallCount = 0
+$script:composerLastCall = $null
+$script:composerReturn = @{ ok = $true; envelope = $fakeOkEnvelope; error = $null }
+$script:DecisionComposerBackend = 'claude-code'
+$null = Get-DecisionEnvelope -State $state -Key 'p/T-s3-a' -Project 'p' -ThreadId 'T-s3-a' `
+    -Signature 'human:msg-1' -LastMsgId 'msg-1' -StopReason 'human' -Rounds 3
+Check 'claude-code TailCount == DecisionComposerTailLimit (5)' 5 $script:composerLastCall.TailCount
+Check 'claude-code backend name is passed through' 'claude-code' $script:composerLastCall.Backend
+
+Write-Host 'Get-DecisionEnvelope — S3: stub backend keeps -TailCount = 0 (S2 backward-compat)'
+$state = @{}
+$script:composerCallCount = 0
+$script:composerLastCall = $null
+$script:composerReturn = @{ ok = $true; envelope = $fakeOkEnvelope; error = $null }
+$script:DecisionComposerBackend = 'stub'
+$null = Get-DecisionEnvelope -State $state -Key 'p/T-s3-b' -Project 'p' -ThreadId 'T-s3-b' `
+    -Signature 'human:msg-1' -LastMsgId 'msg-1' -StopReason 'human' -Rounds 3
+Check 'stub TailCount == 0' 0 $script:composerLastCall.TailCount
+
+# Restore for the S4 tests below.
+$script:DecisionComposerBackend = 'stub'
 
 # ===============================================================================================
 # S4 (D-32): 判断待ち digest section
