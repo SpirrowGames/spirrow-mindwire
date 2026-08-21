@@ -546,9 +546,7 @@ function New-DailyDigest {
         [hashtable]$HeadsByProject,
         [hashtable]$ControlByProject,
         [datetime]$Now,
-        [string[]]$LiveKeys = @(),
-        [array]$HumanParked = @(),
-        [hashtable]$PendingDecisionsState = @{}
+        [string[]]$LiveKeys = @()
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -632,47 +630,6 @@ function New-DailyDigest {
         if ($quarantinedList.Count -gt 0) {
             $lines += "  [quarantined]"
             $lines += $quarantinedList
-        }
-    }
-
-    $lines += ""
-    # 判断待ち — T-decision-request-composer S4 (msg-1370 §0 欠陥 2 / A-4). Included even when
-    # 0 件, for the same "silent day is the point" reason as 飢餓 (msg-814 §5). The count and the
-    # keys come from the sweep-side poll (D-23), so this section restores from a deleted
-    # pending-decisions.json — the cache would only enrich the row with the composed question.
-    $lines += "判断待ち: $($HumanParked.Count) 件"
-    if ($HumanParked.Count -eq 0) {
-        $lines += "  (該当なし)"
-    }
-    else {
-        foreach ($p in $HumanParked) {
-            # Enrich the row from the composed-question cache when the same signature is in
-            # pending-decisions.json. When it is not (A-14: cache deleted, cache stale, composer
-            # broken), the row still shows the key and reason — nothing goes silent.
-            $sig = "$($p.reason):$($p.head)"
-            $questionSnippet = $null
-            if ($PendingDecisionsState.ContainsKey($p.key)) {
-                $row = $PendingDecisionsState[$p.key]
-                # Duck-type on either shape (freshly written hashtable vs. JSON-loaded PSCustomObject).
-                if ($row -is [hashtable]) { $rowSig = $row['signature']; $env = $row['envelope'] }
-                else { $rowSig = $row.signature; $env = $row.envelope }
-                if ($rowSig -eq $sig -and $env) {
-                    $status = if ($env.PSObject.Properties.Name -contains 'composer_status') { $env.composer_status } else { $null }
-                    $output = if ($env.PSObject.Properties.Name -contains 'output') { $env.output } else { $null }
-                    if ($status -eq 'ok' -and $output) {
-                        $q = if ($output.PSObject.Properties.Name -contains 'question') { $output.question } else { $null }
-                        if ($q) {
-                            # Keep the digest one-line-per-row readable: cap the snippet at 80 chars
-                            # and never let a newline in the question wrap the digest layout.
-                            $flat = ($q -replace "`r?`n", ' ').Trim()
-                            if ($flat.Length -gt 80) { $flat = $flat.Substring(0, 79) + '…' }
-                            $questionSnippet = $flat
-                        }
-                    }
-                }
-            }
-            $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
-            $lines += "  $($p.key)   [$($p.reason)]$suffix"
         }
     }
 
@@ -1180,85 +1137,6 @@ function Format-DecisionMessage {
         $body = $body + $tailMarker
     }
     return $body
-}
-
-# T-decision-request-composer S4: which sweep candidates are currently parked on a human decision?
-#
-# D-23 puts the SOT of "is thread X parked?" on POLLING — not on pending-decisions.json, which is
-# only the cache of the composed question. This function is the poll: it iterates the sweep
-# candidates and returns those whose most-recent recorded stop reason is human-terminal AND whose
-# recorded head still matches the current probe head. Pending-decisions.json is not consulted here,
-# so deleting it does not blank the digest section (A-14 — the section restores from this poll on
-# the next tick).
-#
-# WHY notified.json is the source. Every human-terminal branch of the candidate loop above calls
-# Send-NotificationIfChanged with a signature "<reason>:<head>". That signature IS the "the sweep
-# last saw this thread parked here" record — it is written exactly when parking is observed, and
-# it holds the reason too, so we can filter to human-terminal without re-running the conductor.
-# The head cross-check against heads.json protects against a stale signature: if the thread has
-# moved past the parked head, we DON'T know it is still parked (a naysayer might have posted, the
-# next handoff might not be human), so we deliberately EXCLUDE it. False-negative is better than
-# a lie — a thread that has moved but is still parked shows up on the next launch.
-#
-# Failure modes are deliberately narrow: an unrecognised signature is skipped (never crashes the
-# digest). A missing head probe entry is treated as unknown-and-therefore-not-included.
-#
-# D-24' unresolved item 2: the magickit-side ops dashboard has its own block-axis judgment. When
-# the S5' work integrates them, the SOT should live in one place — either magickit exposes the
-# judgment via an API mindwire consumes, or the judgment code is shared across the repo boundary.
-# Until that lands, this mindwire-side poll is the digest's own source, and any per-tick
-# disagreement with the dashboard is a known gap to close, NOT a fresh feature.
-#
-# Returns an array of PSCustomObjects: { key; project; thread_id; reason; head; parked_since }.
-# parked_since is the notify-state signature's write time when readable, else $null.
-function Get-HumanParkedCandidates {
-    param(
-        [array]$Candidates,
-        [hashtable]$NotifyState,
-        [hashtable]$HeadsByProject,
-        [hashtable]$NeedsHuman
-    )
-
-    $out = @()
-    foreach ($cand in $Candidates) {
-        if (-not $NotifyState.ContainsKey($cand.key)) { continue }
-        $sig = "$($NotifyState[$cand.key])"
-        if (-not $sig) { continue }
-        # signatures are "<reason>:<head>" for candidate keys; other __keys use different shapes
-        # (e.g. __quarantine__/..., __all_idle__). Candidate keys are never __-prefixed, so this
-        # branch is safe: the ':' split just gives us one part when no colon exists, which we
-        # then skip.
-        $parts = $sig -split ':', 2
-        if ($parts.Count -ne 2) { continue }
-        $reason = $parts[0]
-        $sigHead = $parts[1]
-        if (-not $NeedsHuman.ContainsKey($reason)) { continue }
-
-        # Head cross-check: only report parked when the current probe head matches the signature's
-        # head. When we cannot read the probe, treat as UNKNOWN-and-parked (fail closed on the
-        # "still parked" side, so an outage does not silently blank the digest count). This is the
-        # opposite direction from the head-skip cache (which fails open into a launch) — different
-        # question, different safe answer.
-        $probeHead = $null
-        if ($HeadsByProject.ContainsKey($cand.project) -and $null -ne $HeadsByProject[$cand.project]) {
-            $h = $HeadsByProject[$cand.project]
-            if ($h.ContainsKey($cand.thread_id)) { $probeHead = $h[$cand.thread_id] }
-        }
-        if ($probeHead -and $probeHead -ne $sigHead) {
-            # Head has moved past what we notified on — cannot claim it is still parked.
-            continue
-        }
-
-        $out += [PSCustomObject]@{
-            key          = $cand.key
-            project      = $cand.project
-            thread_id    = $cand.thread_id
-            reason       = $reason
-            head         = $sigHead
-            parked_since = $null   # notify-state does not currently record write time; S6' will add it
-        }
-    }
-    return $out
 }
 
 # --- the sweep list (config, NOT code) -----------------------------------------------------------
@@ -1842,22 +1720,6 @@ try {
         Write-Log "starved threads (>=$(Format-DurationDigest -Span $StarvedThreshold) since last evaluation): $($starved -join ', ')"
     }
 
-    # Human-parked poll (T-decision-request-composer S4 / D-23). Computed here so BOTH the log and
-    # the digest see the same list. The scope is the sweep candidates only (msg-1379 §10.4: "全
-    # project 全スレッドを舐めない") — the count carries an implicit upper bound of $candidates.Count.
-    $humanParked = @(Get-HumanParkedCandidates -Candidates $candidates `
-        -NotifyState $notifyState -HeadsByProject $headsByProject -NeedsHuman $needsHuman)
-    if ($humanParked.Count -gt 0) {
-        Confirm-LogWorthKeeping
-        $summary = ($humanParked | ForEach-Object { "$($_.key)/$($_.reason)" }) -join ', '
-        Write-Log "human-parked ($($humanParked.Count) of $($candidates.Count) candidates polled): $summary"
-    }
-    else {
-        # A single log line even at zero, so the poll's own liveness is visible in the log — the
-        # digest section is the same idea (0 件 is still an entry, not silence).
-        Write-Log "human-parked (0 of $($candidates.Count) candidates polled)"
-    }
-
     # Daily digest. Sent even when both quarantine and starvation lists are empty (spec/msg-814 §5).
     # A silent day IS the point: "no alert" then still means "the channel is alive," which is what
     # the 5h failure specifically lacked. Attempted at most once per $DailyDigestInterval.
@@ -1889,8 +1751,7 @@ try {
             $digest = New-DailyDigest -QuarantineState $quarantineState `
                 -EvaluatedState $evaluatedState `
                 -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc `
-                -LiveKeys $liveKeys `
-                -HumanParked $humanParked -PendingDecisionsState $pendingDecisionsState
+                -LiveKeys $liveKeys
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved)"
             $result = Send-Notification -Message $digest

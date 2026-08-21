@@ -42,13 +42,6 @@ $needed = @(
     'Get-DecisionEnvelope',
     'Format-DecisionMessage',
     'New-ComposerInputJson',
-    'Get-HumanParkedCandidates',
-    'New-DailyDigest',
-    'Format-DurationDigest',
-    'Get-DerivedQuarantineState',
-    'Get-FingerprintHint',
-    'ConvertTo-UtcInstant',
-    'Get-StarvedKeys',
     'Get-JsonState',
     'Save-JsonState'
 )
@@ -76,10 +69,6 @@ $script:DecisionComposerTimeoutSeconds = 5
 $script:DecisionComposerTailLimit = 5
 $script:DecisionMessageDiscordBudget = 1950
 $script:DecisionDashboardBaseUrl = 'https://example.invalid'
-# Thresholds New-DailyDigest reaches through the script scope.
-$script:StarvedThreshold = [TimeSpan]::FromHours(24)
-$script:QuarantineEscalatedAfter = [TimeSpan]::FromHours(24)
-$script:QuarantineStaleAfter = [TimeSpan]::FromDays(7)
 
 $script:failures = 0
 function Check {
@@ -249,112 +238,6 @@ $env = Get-CachedDecision -State $state -Key 'p/T-a' -Signature 'human:msg-2'
 CheckTrue 'signature mismatch is a miss' ($null -eq $env)
 $env = Get-CachedDecision -State $state -Key 'not-there' -Signature 'human:msg-1'
 CheckTrue 'absent key is a miss' ($null -eq $env)
-
-# --- S4: Get-HumanParkedCandidates + digest section --------------------------------------------
-Write-Host ''
-Write-Host 'Get-HumanParkedCandidates — polls the sweep-side notified state (D-23)'
-$candidates = @(
-    [PSCustomObject]@{ key = 'p1/T-parked'; project = 'p1'; thread_id = 'T-parked'; repo_dir = 'x' },
-    [PSCustomObject]@{ key = 'p1/T-moved';  project = 'p1'; thread_id = 'T-moved';  repo_dir = 'x' },
-    [PSCustomObject]@{ key = 'p1/T-idle';   project = 'p1'; thread_id = 'T-idle';   repo_dir = 'x' },
-    [PSCustomObject]@{ key = 'p1/T-notseen'; project = 'p1'; thread_id = 'T-notseen'; repo_dir = 'x' }
-)
-$notify = @{
-    'p1/T-parked' = 'human:msg-100'
-    'p1/T-moved'  = 'human:msg-50'         # head has moved to msg-51 -> excluded
-    'p1/T-idle'   = 'none:msg-200'         # not a human-terminal reason -> excluded
-    '__all_idle__' = 'sig-does-not-matter' # non-candidate key -> not confused for a candidate
-    # p1/T-notseen: no entry -> excluded
-}
-$heads = @{
-    'p1' = @{ 'T-parked' = 'msg-100'; 'T-moved' = 'msg-51'; 'T-idle' = 'msg-200'; 'T-notseen' = 'msg-1' }
-}
-$needsHuman = @{ 'human' = 'x'; 'no_progress_to_human' = 'x'; 'round_cap' = 'x' }
-$parked = @(Get-HumanParkedCandidates -Candidates $candidates `
-    -NotifyState $notify -HeadsByProject $heads -NeedsHuman $needsHuman)
-Check 'exactly one candidate reported parked' 1 $parked.Count
-Check 'the parked candidate is T-parked' 'p1/T-parked' $parked[0].key
-Check 'parked candidate carries its reason' 'human' $parked[0].reason
-
-Write-Host 'Get-HumanParkedCandidates — head-probe outage keeps the candidate reported (fail closed on the parked side)'
-$headsMissing = @{ 'p1' = @{ 'T-moved' = 'msg-51'; 'T-idle' = 'msg-200' } }   # T-parked absent
-$parked = @(Get-HumanParkedCandidates -Candidates $candidates `
-    -NotifyState $notify -HeadsByProject $headsMissing -NeedsHuman $needsHuman)
-$parkedKeys = ($parked | ForEach-Object { $_.key })
-CheckTrue 'T-parked still reported when probe head unknown' ($parkedKeys -contains 'p1/T-parked')
-
-Write-Host 'Get-HumanParkedCandidates — non-candidate keys in notified state are ignored'
-$candidatesOnly = @([PSCustomObject]@{ key = 'p1/T-parked'; project = 'p1'; thread_id = 'T-parked'; repo_dir = 'x' })
-$notifyWithNoise = @{
-    'p1/T-parked'  = 'human:msg-100'
-    '__quarantine__/p1/T-quar' = 'foo'
-    '__all_idle__' = 'sig|sig'
-}
-$parked = @(Get-HumanParkedCandidates -Candidates $candidatesOnly `
-    -NotifyState $notifyWithNoise -HeadsByProject $heads -NeedsHuman $needsHuman)
-Check 'noise keys not confused for parked candidates' 1 $parked.Count
-
-# --- Digest section: 判断待ち renders (A-4) and restores from a deleted cache (A-14) ------------
-Write-Host ''
-Write-Host 'New-DailyDigest — 判断待ち section renders when N > 0 and restores from a deleted cache (A-4 / A-14)'
-$now = [datetime]::UtcNow
-# Cache is empty (simulating a deleted pending-decisions.json). The section should still list the
-# candidate, with "(問い未生成)" instead of a snippet — no silent 0.
-$digest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
-    -HeadsByProject $heads -ControlByProject @{} `
-    -Now $now -LiveKeys @('p1/T-parked') `
-    -HumanParked @([PSCustomObject]@{ key = 'p1/T-parked'; project = 'p1'; thread_id = 'T-parked'; reason = 'human'; head = 'msg-100'; parked_since = $null }) `
-    -PendingDecisionsState @{}
-CheckTrue '判断待ち header names 1 件' ($digest -match '判断待ち: 1 件') $digest
-CheckTrue '判断待ち row names the parked key' ($digest -match 'p1/T-parked') $digest
-CheckTrue 'row shows placeholder when the cache is empty (A-14)' ($digest -match '\(問い未生成\)') $digest
-
-Write-Host 'New-DailyDigest — 判断待ち section is emitted at 0 件 too (msg-1370 §4)'
-$digest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
-    -HeadsByProject $heads -ControlByProject @{} `
-    -Now $now -LiveKeys @('p1/T-parked') `
-    -HumanParked @() -PendingDecisionsState @{}
-CheckTrue '0 件 is not silent' ($digest -match '判断待ち: 0 件') $digest
-CheckTrue '0 件 keeps the (該当なし) marker' ($digest -match '判断待ち: 0 件[\r\n]+  \(該当なし\)') $digest
-
-Write-Host 'New-DailyDigest — a fresh cache enriches the row with the question snippet'
-$pending = @{}
-$pending['p1/T-parked'] = @{
-    signature = 'human:msg-100'
-    envelope  = [PSCustomObject]@{
-        composer_status = 'ok'
-        output          = [PSCustomObject]@{
-            question              = 'Should we ship option A or option B?'
-            options               = @()
-            recommendation        = $null
-            recommendation_reason = $null
-            unknowns              = @()
-        }
-    }
-    cached_at = $now.ToString('o')
-}
-$digest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
-    -HeadsByProject $heads -ControlByProject @{} `
-    -Now $now -LiveKeys @('p1/T-parked') `
-    -HumanParked @([PSCustomObject]@{ key = 'p1/T-parked'; project = 'p1'; thread_id = 'T-parked'; reason = 'human'; head = 'msg-100'; parked_since = $null }) `
-    -PendingDecisionsState $pending
-CheckTrue 'question snippet renders on cache hit' ($digest -match 'Should we ship option A or option B\?') $digest
-CheckTrue 'no (問い未生成) when the cache is populated' (-not ($digest -match '\(問い未生成\)')) $digest
-
-Write-Host 'New-DailyDigest — stale cache (different signature) falls back to the placeholder'
-$pending = @{}
-$pending['p1/T-parked'] = @{
-    signature = 'human:msg-99'   # differs from the parked head
-    envelope  = [PSCustomObject]@{ composer_status = 'ok'; output = [PSCustomObject]@{ question = 'old' } }
-    cached_at = $now.ToString('o')
-}
-$digest = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
-    -HeadsByProject $heads -ControlByProject @{} `
-    -Now $now -LiveKeys @('p1/T-parked') `
-    -HumanParked @([PSCustomObject]@{ key = 'p1/T-parked'; project = 'p1'; thread_id = 'T-parked'; reason = 'human'; head = 'msg-100'; parked_since = $null }) `
-    -PendingDecisionsState $pending
-CheckTrue 'stale cache row does NOT bleed into the section' ($digest -match '\(問い未生成\)') $digest
-CheckTrue 'stale question text does NOT appear' (-not ($digest -match 'old')) $digest
 
 Write-Host ''
 if ($script:failures -gt 0) {
