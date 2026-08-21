@@ -480,6 +480,23 @@ class ClaudeCodeComposer:
             # If the deploy uses `claude login` instead, this is absent
             # and the CLI reads its own credential file — that is fine.
             "ANTHROPIC_API_KEY",
+            # D-44 (Tier-C msg §24): the sg-ai-server-01 deploy host has
+            # NO direct egress — the ONLY route to api.anthropic.com is
+            # through the squid proxy exported via HTTP_PROXY / HTTPS_PROXY
+            # (with NO_PROXY carrying the LAN exceptions). Dropping these
+            # makes `claude -p` fail INSIDE the CLI with
+            # ``terminal_reason:"api_error"`` and ``duration_api_ms:0`` —
+            # the API call never leaves the box. That failure fails-open
+            # through I-2 to the raw ping, so nothing screams: composer
+            # silently produces no questions in production while CI stays
+            # green (the whole class is stub-only). D-37's intent is to
+            # scrub ROLE CONTEXT and TOOLS, not the network egress route —
+            # a proxy is neither. Case-insensitive membership handles the
+            # POSIX lowercase forms (http_proxy / https_proxy / no_proxy)
+            # transparently.
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
         }
         env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
         # DELIBERATELY not propagating PYTHONIOENCODING (D-43 principle).

@@ -86,6 +86,20 @@ PR, cannot query anything — the "does not decide" guarantee is structural.
   Windows' own CreateProcess subsystems. The allowed KEYS are kept in
   their original OS case for the child, so a native tool sees the same
   environment shape it always does.
+- **Proxy environment (D-44 — Tier-C msg §24)**: `HTTP_PROXY`,
+  `HTTPS_PROXY`, and `NO_PROXY` are on the allowlist. On the
+  sg-ai-server-01 deploy host, the ONLY route out of the box to
+  `api.anthropic.com` is through a squid proxy exported via these three
+  variables. Without them the child `claude -p` fails INSIDE the CLI
+  with `terminal_reason:"api_error"` and `duration_api_ms:0` (the API
+  call never leaves the machine); that failure fails-open through I-2
+  to the raw ping, so nothing screams and the composer silently
+  produces no questions in production while CI stays green (§14-shape
+  bug: stub-only tests cannot see it). D-37's intent is to strip ROLE
+  CONTEXT and TOOLS — a proxy is neither role context nor a tool, it
+  is an egress route, so preserving it does not weaken the neutrality
+  argument. Case-insensitive membership picks up the POSIX lowercase
+  forms (`http_proxy` / `https_proxy` / `no_proxy`) as well.
 - `argv_digest` recorded to `envelope.extras.argv_digest`
   (`sha256(" ".join(argv))[:16]`), so an operator can retroactively confirm
   "yes, that stop ran under the neutral setup, not with role context leaked
@@ -318,6 +332,25 @@ Also additive:
   across two same-signature reads" check.
 - **A-4**: unchanged from S4.
 - **A-5**: `bash .mindwire-gate` green.
+- **A-18** (Tier-C msg §24 — added post-#169-review): a real chatroom
+  parked-`NEXT: human` thread is fed to `--backend claude-code` on the
+  deploy host, and the resulting envelope carries `composer_status=ok`,
+  a non-empty `question`, and `options.length >= 2`. **Stub envelopes
+  do not substitute.** This exists because §14 (Windows cp932 mojibake)
+  and D-44 (proxy scrub) are both bugs the CI-stub path is structurally
+  blind to; A-18 is the acceptance gate that runs the actual backend
+  end-to-end. Additionally, `envelope.extras.duration_ms` is recorded
+  so the 30-second `DEFAULT_TIMEOUT_SECONDS` ceiling has real data
+  behind it — Tier-C msg §24.5 explicitly reserved raising the ceiling
+  to itself, so an implementer who sees the real run brush against 30 s
+  reports it and does NOT bump the constant unilaterally.
+
+**A-18 execution constraint**: A-18 requires the `claude` CLI and network
+egress to `api.anthropic.com`. It CANNOT be run from a mindwire-impl
+implementer session (no `claude` binary, no chatroom API access). It is
+run on the deploy host, from the parked scheduler, and its result is
+posted to the thread and pasted into the PR body before merge. Not
+gated in CI.
 
 **F-1 rubric** (msg-1405 §19.4 restated for future S3-observability post-merge):
 

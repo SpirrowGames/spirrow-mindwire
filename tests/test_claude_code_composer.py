@@ -359,6 +359,65 @@ class TestD37NeutralEnvironment:
         assert "MINDWIRE_ROLE_HINT" not in child_env
         assert "PYTHONIOENCODING" not in child_env
 
+    def test_env_allowlist_preserves_proxy_variables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D-44 (Tier-C msg §24): the sg-ai-server-01 deploy host reaches
+        api.anthropic.com ONLY through a squid proxy exported via
+        ``HTTP_PROXY`` / ``HTTPS_PROXY`` / ``NO_PROXY``. If the scrub
+        drops them, the child ``claude -p`` fails inside the CLI with
+        ``terminal_reason:"api_error"`` and ``duration_api_ms:0`` (the
+        API call never leaves the box), which fails-open through I-2 to
+        the raw ping — the composer silently produces no questions in
+        production while the CI stub path keeps passing green. This test
+        is the pin that prevents the D-44 fix from being unintentionally
+        reverted.
+
+        Includes both uppercase (POSIX server + Windows exports) and
+        lowercase (``http_proxy`` etc — POSIX convention many tools honour)
+        forms; case-insensitive allowlist membership must catch both.
+        """
+        import os
+
+        fake_environ = {
+            "PATH": "/usr/bin:/bin",
+            "HTTP_PROXY": "http://squid.internal:3128",
+            "HTTPS_PROXY": "http://squid.internal:3128",
+            "NO_PROXY": "localhost,127.0.0.1,.internal",
+            # Lowercase POSIX conventions — case-insensitive membership
+            # must accept these too (the CLI's underlying HTTP stack
+            # honours the lowercase forms).
+            "http_proxy": "http://squid.internal:3128",
+            "https_proxy": "http://squid.internal:3128",
+            "no_proxy": "localhost,127.0.0.1,.internal",
+            # And an unrelated MINDWIRE_* that MUST still be stripped —
+            # widening the allowlist for proxies must not accidentally
+            # let role context through.
+            "MINDWIRE_ROLE_HINT": "Bohr",
+        }
+        monkeypatch.setattr(os, "environ", fake_environ)
+
+        runner = FakeRunner(result=SubprocessResult(0, _cli_json_bytes(), b""))
+        composer = ClaudeCodeComposer(runner=runner)
+        composer.compose(_sample_request())
+
+        child_env = runner.calls[0].env
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+            assert key in child_env, (
+                f"{key} was stripped from the child env — the deploy host cannot "
+                f"reach api.anthropic.com without it. child_env keys: "
+                f"{sorted(child_env.keys())}"
+            )
+        for key in ("http_proxy", "https_proxy", "no_proxy"):
+            assert key in child_env, (
+                f"lowercase {key} was stripped — POSIX convention allows "
+                f"either case; case-insensitive allowlist must catch both. "
+                f"child_env keys: {sorted(child_env.keys())}"
+            )
+        # Values survived verbatim.
+        assert child_env["HTTPS_PROXY"] == "http://squid.internal:3128"
+        assert child_env["NO_PROXY"] == "localhost,127.0.0.1,.internal"
+        # Widening the allowlist did not weaken the deny side.
+        assert "MINDWIRE_ROLE_HINT" not in child_env
+
     def test_argv_digest_is_16_hex_chars_and_stable(self) -> None:
         # The digest lets an operator retroactively confirm "did we launch
         # under the neutral setup?" A stable digest across runs of the same
