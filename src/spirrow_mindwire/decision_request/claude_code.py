@@ -263,6 +263,23 @@ class ClaudeCodeComposer:
         argv_digest = self._digest_argv(argv)
         env = self._make_child_env()
 
+        # Record baseline extras BEFORE spawning the child, so every failure
+        # branch below — including subprocess.TimeoutExpired and
+        # FileNotFoundError (which SKIP the whole post-runner block) — still
+        # surfaces the argv digest and neutral-cwd fingerprint in the envelope.
+        # This is what makes A-3 diagnostics ("did that timed-out call actually
+        # launch under the neutral setup?") answerable from the envelope alone
+        # without re-running the composer. Placing the assignment AFTER the
+        # runner call was a bug caught by the pr-gate on PR #169 — the timeout
+        # and spawn-failure paths would have lost the fingerprint precisely
+        # when it is most needed.
+        self.last_extras = {
+            "backend": "claude-code",
+            "argv_digest": argv_digest,
+            "prompt_version": PROMPT_VERSION,
+            "cwd": self._cwd,
+        }
+
         try:
             result = self._runner(
                 argv=argv,
@@ -288,15 +305,6 @@ class ClaudeCodeComposer:
         # character in a diagnostic message is still readable.
         stdout_text = result.stdout.decode("utf-8", errors="replace")
         stderr_text = result.stderr.decode("utf-8", errors="replace")
-
-        # Record baseline extras BEFORE potential raises below, so an
-        # exception path still shows what we tried to launch.
-        self.last_extras = {
-            "backend": "claude-code",
-            "argv_digest": argv_digest,
-            "prompt_version": PROMPT_VERSION,
-            "cwd": self._cwd,
-        }
 
         if result.returncode != 0:
             stderr_tail = stderr_text.strip().splitlines()[-5:]

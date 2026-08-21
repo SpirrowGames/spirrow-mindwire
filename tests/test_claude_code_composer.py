@@ -685,6 +685,55 @@ class TestComposeOnceIntegration:
         # (exit fired first). This is the correct partial state.
         assert "model" not in env.extras
 
+    def test_timeout_envelope_still_carries_baseline_extras(self) -> None:
+        """Regression pin — the pr-gate on PR #169 caught this.
+
+        The comment in ``compose()`` says "record baseline extras BEFORE
+        potential raises". Before this fix, the assignment was placed
+        *after* ``self._runner()``, so a ``subprocess.TimeoutExpired``
+        (which the runner call raises up out of the ``try``) would skip
+        the assignment entirely — the envelope would come back with an
+        empty ``extras`` dict for the exact stop where you most want to
+        know "did that timed-out call actually launch under the neutral
+        setup?". The previous non-zero-exit test did not catch this
+        because non-zero exit is a normal return from the runner and
+        the raise happens further down.
+        """
+        runner = FakeRunner(raise_exc=subprocess.TimeoutExpired(cmd=["claude"], timeout=30))
+        composer = ClaudeCodeComposer(runner=runner, cwd="/tmp", timeout_seconds=30)
+
+        env = compose_once(composer, _sample_request())
+
+        assert env.composer_status is ComposerStatus.TIMEOUT
+        assert env.output is None
+        # Baseline extras survived the raise — these are the four keys
+        # populated before the runner call.
+        assert env.extras["backend"] == "claude-code"
+        assert env.extras["prompt_version"] == PROMPT_VERSION
+        assert env.extras["cwd"] == "/tmp"
+        assert len(env.extras["argv_digest"]) == 16
+        # Telemetry that requires the child's JSON is absent (never got parsed).
+        assert "model" not in env.extras
+
+    def test_spawn_failure_envelope_still_carries_baseline_extras(self) -> None:
+        """Companion pin to the timeout test — same failure shape, different
+        exception class. FileNotFoundError from a missing ``claude`` binary
+        MUST leave the argv digest / cwd / prompt version in the envelope so
+        an operator can see "the launch fingerprint was correct — the binary
+        was the problem, not our isolation".
+        """
+        runner = FakeRunner(raise_exc=FileNotFoundError(2, "no such file", "claude"))
+        composer = ClaudeCodeComposer(runner=runner, cwd="/tmp", cli_path="claude-does-not-exist")
+
+        env = compose_once(composer, _sample_request())
+
+        assert env.composer_status is ComposerStatus.ERROR
+        assert env.output is None
+        assert env.extras["backend"] == "claude-code"
+        assert env.extras["prompt_version"] == PROMPT_VERSION
+        assert env.extras["cwd"] == "/tmp"
+        assert len(env.extras["argv_digest"]) == 16
+
 
 # --------------------------------------------------------------------------- #
 # Free-standing helper coverage (docstring-driven contracts)
