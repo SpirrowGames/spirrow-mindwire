@@ -132,6 +132,90 @@ def test_role_handoff_is_not_parked(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["errors"] == []
 
 
+def test_empty_roster_never_raises_for_any_handoff_shape() -> None:
+    """Direct source-level pin on the empty-roster invariant (Einstein's msg-1393 concern).
+
+    Load-bearing: this CLI calls ``resolve_handoff(body, {})`` on the working assumption that a
+    role handoff (``NEXT: Bohr``, ``NEXT: pr-review …``, ``NEXT: totally-unknown``, etc.) with
+    an empty roster falls through to :attr:`HandoffKind.ABSENT` **without raising**. If a future
+    refactor of ``handoff.py`` or ``_roster_lookup`` breaks that assumption, the per-candidate
+    fallback in ``_poll`` would either crash the whole poll (whole digest section blanks) or
+    log the role handoff as a spurious fetch error (permanent phantom entry under 取得失敗).
+
+    Both failure modes would degrade the ``判断待ち`` section without an obvious signal. Rather
+    than *only* leaning on the ``_poll``-level integration test (`test_role_handoff_is_not_parked`)
+    which would silently keep passing if the underlying resolver started raising and our
+    catch-all swallowed it, we pin the invariant directly on the resolver. Two guarantees hold
+    together, one at each layer.
+    """
+    # A load-bearing sample: every non-HUMAN shape that could plausibly appear at the last
+    # message of a sweep candidate. Empty roster on every call — the mode this CLI operates in.
+    from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
+
+    role_shapes = [
+        "NEXT: Bohr",
+        "NEXT: Einstein",
+        "NEXT: heisenberg",  # lowercase
+        "NEXT: totally-unknown-persona",
+        "**NEXT: Bohr**",  # decorated (last-wins still applies)
+        "> NEXT: Bohr",  # quoted
+        "reply text\n\nNEXT: Bohr — with a gloss",
+    ]
+    for body in role_shapes:
+        result = resolve_handoff(body, {})
+        assert result.kind is HandoffKind.ABSENT, (
+            f"empty roster on {body!r} should degrade to ABSENT, got {result.kind.name}"
+        )
+
+    # ``none`` is a reserved sentinel — it resolves BEFORE the roster, so an empty roster does
+    # not change its outcome. Included so a regression that starts routing NONE through the
+    # roster (breaking the resolution order) is caught here too.
+    assert resolve_handoff("NEXT: none", {}).kind is HandoffKind.NONE
+
+    # ``human`` is the positive control. Same reservation — resolved before roster lookup —
+    # so an empty roster must still resolve to HUMAN. This is the specific case parked_humans.py
+    # depends on; if this ever fails, this whole file's premise is wrong.
+    assert resolve_handoff("NEXT: human", {}).kind is HandoffKind.HUMAN
+
+
+def test_role_handoff_leaves_errors_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Einstein's msg-1393 concern (2): a role handoff must NOT inflate ``errors[]``.
+
+    A role handoff is a live loop, not a fetch failure. If we accidentally recorded it in
+    ``errors`` — e.g. because the resolver started raising and our per-candidate catch swept
+    the exception into a phantom error row — the digest would show a permanent ``取得失敗``
+    line for a thread that is actually running normally. This test verifies the negative:
+    across a mixed candidate list (parked human + several role handoffs + a genuinely broken
+    fetch), only the genuinely broken fetch lands in ``errors``.
+    """
+    _patch_mcp(
+        monkeypatch,
+        {
+            "T-parked": ("msg-1", "some prose\n\nNEXT: human"),
+            "T-role-a": ("msg-2", "NEXT: Bohr"),
+            "T-role-b": ("msg-3", "NEXT: Einstein"),
+            "T-none": ("msg-4", "NEXT: none"),
+            "T-broken": MagickitMcpError("real fetch failure"),
+        },
+    )
+    result = asyncio.run(
+        _MODULE._poll(  # type: ignore[attr-defined]
+            project="test",
+            candidates=[
+                {"thread_id": "T-parked", "head_msg_id": "msg-1"},
+                {"thread_id": "T-role-a", "head_msg_id": "msg-2"},
+                {"thread_id": "T-role-b", "head_msg_id": "msg-3"},
+                {"thread_id": "T-none", "head_msg_id": "msg-4"},
+                {"thread_id": "T-broken", "head_msg_id": "msg-5"},
+            ],
+            url=None,
+        )
+    )
+    assert [p["thread_id"] for p in result["parked"]] == ["T-parked"]
+    # Only the real fetch failure — the three role/none handoffs are NOT phantom errors.
+    assert [e["thread_id"] for e in result["errors"]] == ["T-broken"]
+
+
 def test_none_and_absent_and_pr_review_are_not_parked(monkeypatch: pytest.MonkeyPatch) -> None:
     """``NEXT: none``, no ``NEXT:`` at all, and ``NEXT: pr-review <ref>`` are not human parking."""
     _patch_mcp(
