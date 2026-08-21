@@ -422,7 +422,15 @@ class ClaudeCodeComposer:
         ]
 
     def _digest_argv(self, argv: list[str]) -> str:
-        """First 16 hex chars of sha256(joined argv).
+        """First 16 hex chars of ``sha256(" ".join(argv))``.
+
+        Separator is a plain space, matching the spec exactly
+        ``spec/slices/S3-claude-code-composer.md`` §D-37: the SOT names
+        the join string so an operator can reproduce the digest by hand
+        with a shell-level ``echo -n "$argv" | sha256sum | head -c 16``.
+        Using a null byte was tempting for argv-boundary unambiguity, but
+        that convenience is not the SOT's concern — reproducibility from
+        the documented recipe is (naysayer PR-gate on PR #169).
 
         Recorded to extras so an operator can retro-check "was this launch
         actually the neutral one, or did a persona flag leak in?" without
@@ -430,7 +438,7 @@ class ClaudeCodeComposer:
         because uniqueness across a handful of launches is enough for the
         diagnostic — this is not a security-grade fingerprint.
         """
-        joined = "\x00".join(argv).encode("utf-8")
+        joined = " ".join(argv).encode("utf-8")
         return hashlib.sha256(joined).hexdigest()[:16]
 
     def _make_child_env(self) -> dict[str, str]:
@@ -442,6 +450,14 @@ class ClaudeCodeComposer:
         drops MINDWIRE_* and any inherited PYTHONIOENCODING (D-43: we
         do not want an env variable to be what makes the encoding work,
         which would silently break under a different caller).
+
+        Case-insensitive on the KEY only: Windows preserves whatever case
+        an environment variable was created with (``Path``, ``SystemRoot``,
+        ``AppData``, etc.). A case-sensitive membership check would silently
+        strip ``Path`` on Windows — the child would then be launched without
+        PATH and every ``subprocess.run(argv[0])`` would ``FileNotFoundError``.
+        Dropping ``SystemRoot`` breaks CreateProcess's own crypto/networking
+        subsystems. The naysayer PR-gate on PR #169 caught this.
         """
         allowed = {
             "PATH",
@@ -457,7 +473,7 @@ class ClaudeCodeComposer:
             # and the CLI reads its own credential file — that is fine.
             "ANTHROPIC_API_KEY",
         }
-        env = {k: v for k, v in os.environ.items() if k in allowed}
+        env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
         # DELIBERATELY not propagating PYTHONIOENCODING (D-43 principle).
         return env
 

@@ -292,8 +292,72 @@ class TestD37NeutralEnvironment:
         assert "PYTHONIOENCODING" not in child_env, (
             "PYTHONIOENCODING leaked — D-43 says encoding is structural, not env-driven"
         )
-        # Sanity: PATH did survive (or the child could not find `claude`).
-        assert "PATH" in child_env
+        # Sanity: PATH survives under its OS-native casing (or the child could
+        # not find ``claude``). Check case-insensitively — Windows preserves
+        # the casing an env var was created with, so uppercase-only membership
+        # is not sufficient on that platform.
+        assert any(k.upper() == "PATH" for k in child_env), (
+            "PATH did not survive the scrub — child cannot find `claude`. "
+            f"child_env keys: {sorted(child_env.keys())}"
+        )
+
+    def test_env_allowlist_is_case_insensitive_on_the_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression pin — the naysayer PR-gate on PR #169 caught this.
+
+        Some environments (WSL bridges, PyPy, embedded Python, and some
+        older CPython on Windows) can yield ``os.environ.items()`` with
+        keys in their OS-native case (``Path``, ``SystemRoot``,
+        ``AppData``, ...) rather than uppercased. A case-sensitive
+        membership check against an uppercase-only allowlist would then
+        silently strip those keys — no PATH → ``FileNotFoundError`` on
+        the child spawn, no SystemRoot → CreateProcess crypto/networking
+        breakage on Windows.
+
+        CPython 3.12 on Windows normalises ``os.environ`` keys to
+        uppercase at set time, so we cannot exercise this via
+        ``monkeypatch.setenv`` on the CI runner directly. Instead we
+        replace ``os.environ`` on the module wholesale with a plain dict
+        that yields mixed-case keys, and assert the allowlist survives
+        them regardless.
+        """
+        import os
+
+        # A plain dict — .items() yields exactly what we put in, at the
+        # case we put it. This is what non-CPython-Windows Pythons can
+        # produce.
+        fake_environ = {
+            "Path": r"C:\Windows\System32;C:\Users\test",
+            "SystemRoot": r"C:\Windows",
+            "AppData": r"C:\Users\test\AppData\Roaming",
+            "MINDWIRE_ROLE_HINT": "Bohr",  # must still be stripped
+            "PYTHONIOENCODING": "utf-8",  # must still be stripped (D-43)
+        }
+        monkeypatch.setattr(os, "environ", fake_environ)
+
+        runner = FakeRunner(result=SubprocessResult(0, _cli_json_bytes(), b""))
+        composer = ClaudeCodeComposer(runner=runner)
+        composer.compose(_sample_request())
+
+        child_env = runner.calls[0].env
+        # Mixed-case allowed keys survived under their ORIGINAL casing — the
+        # child expects them exactly as the parent had them.
+        assert "Path" in child_env, (
+            f"mixed-case 'Path' was stripped — Windows deploy would break. "
+            f"child_env keys: {sorted(child_env.keys())}"
+        )
+        assert "SystemRoot" in child_env, (
+            f"mixed-case 'SystemRoot' was stripped — CreateProcess would break. "
+            f"child_env keys: {sorted(child_env.keys())}"
+        )
+        assert "AppData" in child_env
+        # Value round-tripped verbatim.
+        assert child_env["Path"] == r"C:\Windows\System32;C:\Users\test"
+        # Denied keys still denied (case-insensitive membership must not weaken
+        # the block list side).
+        assert "MINDWIRE_ROLE_HINT" not in child_env
+        assert "PYTHONIOENCODING" not in child_env
 
     def test_argv_digest_is_16_hex_chars_and_stable(self) -> None:
         # The digest lets an operator retroactively confirm "did we launch
@@ -309,6 +373,26 @@ class TestD37NeutralEnvironment:
 
         assert c1.last_extras["argv_digest"] == c2.last_extras["argv_digest"], (
             "argv_digest changed across two identical launches — someone injected non-determinism"
+        )
+
+    def test_argv_digest_uses_space_join_matching_the_spec(self) -> None:
+        """Regression pin — spec §D-37 names the join formula literally as
+        ``sha256(" ".join(argv))[:16]``. The naysayer PR-gate on PR #169
+        caught an earlier implementation that used ``\\x00`` as the
+        separator; deviating from the SOT means an operator who tried to
+        reproduce the digest with a shell one-liner would get a different
+        answer. This test locks in the space separator.
+        """
+        import hashlib
+
+        runner = FakeRunner(result=SubprocessResult(0, _cli_json_bytes(), b""))
+        composer = ClaudeCodeComposer(runner=runner, cwd="/tmp")
+        composer.compose(_sample_request())
+
+        argv = runner.calls[0].argv
+        expected = hashlib.sha256(" ".join(argv).encode("utf-8")).hexdigest()[:16]
+        assert composer.last_extras["argv_digest"] == expected, (
+            "argv_digest formula deviated from spec §D-37 (must be sha256(' '.join(argv))[:16])."
         )
 
 

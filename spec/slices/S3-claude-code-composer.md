@@ -77,11 +77,20 @@ PR, cannot query anything — the "does not decide" guarantee is structural.
   role's persona instructions, which erases the one reason case B was picked
   (an independent, neutral author).
 - `env` scrubbed to a minimal PATH — no `MINDWIRE_*` variables and no
-  `ANTHROPIC_*` toggles are propagated blindly.
+  `ANTHROPIC_*` toggles are propagated blindly. Membership check against
+  the allowlist is **case-insensitive on the key** because some
+  environments (non-CPython Pythons, WSL bridges) yield `os.environ`
+  keys in their OS-native case (`Path`, `SystemRoot`, `AppData` on
+  Windows); a case-sensitive check against an uppercase allowlist would
+  silently strip those and the child would fail to spawn or lose
+  Windows' own CreateProcess subsystems. The allowed KEYS are kept in
+  their original OS case for the child, so a native tool sees the same
+  environment shape it always does.
 - `argv_digest` recorded to `envelope.extras.argv_digest`
   (`sha256(" ".join(argv))[:16]`), so an operator can retroactively confirm
   "yes, that stop ran under the neutral setup, not with role context leaked
-  in".
+  in". The separator is a literal space so the digest is reproducible by
+  hand: `echo -n "$argv" | sha256sum | head -c 16`.
 
 ## D-38 — tail is fetched Python-side and passed to the child as text
 
