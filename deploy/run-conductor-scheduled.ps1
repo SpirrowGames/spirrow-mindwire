@@ -876,10 +876,16 @@ $DecisionMessageDiscordBudget = 1950
 # it in.
 $DecisionComposerTailLimit = 5
 
-# How long the wrapper waits for the CLI. 30s is generous for the stub (measured <1s) and gives S3's
+# How long the wrapper waits for the CLI. 60s is generous for the stub (measured <1s) and gives S3's
 # LLM-backed composer a workable ceiling. On timeout the wrapper KILLS the process and returns $null
 # — I-2 says a stuck composer must never delay the raw ping.
-$DecisionComposerTimeoutSeconds = 30
+#
+# D-45 (Tier-C msg §25.2): originally 30s. Raised to 60s after A-18 measured 33,812 ms end-to-end on
+# a live parked thread (tail 6 msgs / 21,026 chars). Composer failure fails-open through I-2, so the
+# ceiling only bounds how long the wrapper waits before falling back to the raw ping — measured
+# 8-11h human response latency dwarfs the extra 30s. The three sites (this constant, the Python
+# DEFAULT_TIMEOUT_SECONDS, and the CLI's --timeout-seconds default) MUST stay in sync.
+$DecisionComposerTimeoutSeconds = 60
 
 # The default composer backend when the env var is unset. S1/S2 ships 'stub'; S3 will ship
 # 'claude-code' and flip the default from a config change, not a code edit.

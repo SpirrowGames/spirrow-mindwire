@@ -54,8 +54,9 @@ no re-use across stops. I-3 already bounds invocation to one per
 constraint and complicates the failure modes (a stuck daemon, a leaked session,
 a state race between two stops).
 
-Concretely: `subprocess.run(..., timeout=…)`. The 30-second wall clock ceiling
+Concretely: `subprocess.run(..., timeout=…)`. The 60-second wall clock ceiling
 is inherited from S2 (`$DecisionComposerTimeoutSeconds`) — no new constant.
+(D-45 raised the ceiling from 30 s; see the D-45 note below.)
 
 ## D-36 — the child gets no tools
 
@@ -198,7 +199,7 @@ still exits 0 and the wrapper falls back to the raw ping. Specifically:
 
 | Failure mode                                                   | Envelope status           |
 |----------------------------------------------------------------|---------------------------|
-| `subprocess.TimeoutExpired` at the 30 s ceiling                | `TIMEOUT`                 |
+| `subprocess.TimeoutExpired` at the 60 s ceiling (see D-45)     | `TIMEOUT`                 |
 | Non-zero `returncode`                                          | `ERROR`                   |
 | `FileNotFoundError` (claude CLI missing)                       | `ERROR`                   |
 | stdout not valid JSON                                          | `ERROR`                   |
@@ -261,6 +262,43 @@ follows §14.3's rule: **no `capsys`**. It hands a fixed byte sequence
 containing multi-byte UTF-8 (the same Japanese phrase §14 used to trigger
 the bug) directly to a fake runner and asserts the composer round-trips
 the string byte-identically.
+
+## D-45 — wall-clock ceiling raised 30 s → 60 s (Tier-C msg §25.2)
+
+The original ceiling was 30 s, derived from S2's stub (measured <1 s) and
+what looked like a comfortable margin for an LLM call. A-18 (§25.1)
+measured the real end-to-end elapsed at **33,812 ms** on a live parked
+thread (`spirrow-voxelworld/T-T227-P0-spec-kickoff`, tail 6 msgs /
+21,026 chars). 30 s would time out on real inputs while staying green on
+stub tests — exactly the CI-blind failure mode §14 / D-44 exhibit.
+
+Decision (Tier-C msg §25.2):
+
+1. Raise the ceiling in **all three sites** to 60 s. They MUST match:
+   - `DEFAULT_TIMEOUT_SECONDS` in `src/spirrow_mindwire/decision_request/claude_code.py`
+   - `$DecisionComposerTimeoutSeconds` in `deploy/run-conductor-scheduled.ps1`
+   - `--timeout-seconds` default in `src/spirrow_mindwire/decision_request/cli.py`
+     (currently sourced from `DEFAULT_TIMEOUT_SECONDS` at import time — do
+     not hard-code a second literal).
+2. **Do NOT trim the tail** to buy latency. A-18 confirms the 21 KB input
+   produces a high-quality question (F-1 rubric satisfied). Trading
+   quality for latency defeats the reason case B (independent composer)
+   was chosen over case A.
+3. Cost: composer failure adds up to 60 s of notification delay before I-2
+   fires the raw ping. Human response latency is 8-11 h (msg-1370 §1). The
+   extra 30 s is negligible against that background.
+4. **If 60 s starts brushing** on a future measurement, do NOT raise the
+   ceiling further unilaterally. Report to Tier-C — the tail cap may need
+   to be lowered instead, and that is a Tier-C trade-off (Bohr's original
+   D-5 chose 60 s under the same logic; going above it changes the
+   trade-off's shape).
+
+Test coverage: existing unit tests pin `timeout_seconds=30` explicitly in
+the two D-41 timeout cases; those constants are arbitrary test doubles
+and do NOT track the default. Adding a pin on the default itself would
+make every future ceiling change a two-file edit for no diagnostic gain;
+the three-site synchronization requirement above is the invariant that
+matters, and the D-45 note in each site is its documentation.
 
 ## Extras (envelope) — the full list S3 populates
 
@@ -340,10 +378,19 @@ Also additive:
   and D-44 (proxy scrub) are both bugs the CI-stub path is structurally
   blind to; A-18 is the acceptance gate that runs the actual backend
   end-to-end. Additionally, `envelope.extras.duration_ms` is recorded
-  so the 30-second `DEFAULT_TIMEOUT_SECONDS` ceiling has real data
-  behind it — Tier-C msg §24.5 explicitly reserved raising the ceiling
-  to itself, so an implementer who sees the real run brush against 30 s
-  reports it and does NOT bump the constant unilaterally.
+  so the wall-clock ceiling (`DEFAULT_TIMEOUT_SECONDS`) has real data
+  behind it. Tier-C msg §24.5 reserved raising the ceiling to itself;
+  §25.2 executed that reservation (see D-45) — an implementer who sees
+  the real run brush against the current ceiling still reports it and
+  does NOT bump the constant unilaterally.
+  - **A-18 pass on record** (Tier-C msg §25.1, 2026-08-21): input
+    `spirrow-voxelworld/T-T227-P0-spec-kickoff` (msg-2511, tail 6 /
+    21,026 chars) → `composer_status=ok`, `error=None`, `tail_used=6`,
+    `omitted_count=54`, stdout pure-ASCII (D-33 also confirmed). Real
+    elapsed = **33,812 ms**. Question and 3 options (A/B/C) with
+    per-option gain/loss, recommendation A cites the actual thread
+    (msg-2510 §0), F-1 rubric satisfied, 7 explicit unknowns. This
+    result is the evidence base for D-45.
 
 **A-18 execution constraint**: A-18 requires the `claude` CLI and network
 egress to `api.anthropic.com`. It CANNOT be run from a mindwire-impl

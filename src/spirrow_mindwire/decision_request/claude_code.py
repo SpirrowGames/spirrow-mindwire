@@ -70,13 +70,25 @@ resolvable ``claude`` on PATH, and a hard-coded path here would silently
 diverge from what an operator sees when they run the same command by hand.
 """
 
-DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_TIMEOUT_SECONDS = 60
 """Wall-clock ceiling for one child invocation.
 
-Matches the S2 wrapper's ``$DecisionComposerTimeoutSeconds`` (also 30 s).
+Matches the S2 wrapper's ``$DecisionComposerTimeoutSeconds`` (also 60 s).
 The number is not duplicated in the wrapper's config — the wrapper passes
 its own value in explicitly. This is the fallback for callers who did not
 plumb one through (tests, ad-hoc).
+
+**D-45 (Tier-C msg §25.2)**: originally 30 s. Raised to 60 s after A-18
+measured the real end-to-end elapsed at **33,812 ms** on a live parked
+thread (``spirrow-voxelworld/T-T227-P0-spec-kickoff``, tail 6 msgs /
+21,026 chars). 30 s would have tripped the timeout on real inputs while
+staying green on stub tests. Tail was **not** trimmed to buy time: §25.1
+records the 21 KB input producing a high-quality question (F-1 rubric
+satisfied), and trading quality for latency defeats the purpose of case B.
+The extra 30 s of ceiling costs at most 60 s of notification delay on
+composer failure, negligible against the measured 8-11 h human response
+latency (I-2 fallback still fires the raw ping; ceiling only bounds how
+long the wrapper waits before falling back).
 """
 
 PROMPT_VERSION = "1"
