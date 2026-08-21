@@ -546,7 +546,23 @@ function New-DailyDigest {
         [hashtable]$HeadsByProject,
         [hashtable]$ControlByProject,
         [datetime]$Now,
-        [string[]]$LiveKeys = @()
+        [string[]]$LiveKeys = @(),
+        # T-decision-request-composer S4 (D-32).
+        # $HumanParked is an array of PSCustomObjects: { key; project; thread_id; head_msg_id }.
+        # Its judgment comes from ``scripts/parked_humans.py`` (D-32: re-uses
+        # ``spirrow_mindwire.conductor.handoff.resolve_handoff`` — the single owner of the ``NEXT:``
+        # grammar). NEVER computed inside this function; passed in so the log line above the digest
+        # and the digest section itself see the exact same list.
+        # $PendingDecisionsState is the composed-question cache (S2), consulted ONLY to enrich the
+        # row with the composer's question when a matching signature is present. A missing cache
+        # entry leaves the row's placeholder "(問い未生成)" — A-14 (the section survives a wiped
+        # cache; only the enrichment degrades).
+        [array]$HumanParked = @(),
+        [hashtable]$PendingDecisionsState = @{},
+        # $ParkedPollErrors is the errors[] list from scripts/parked_humans.py (per-candidate fetch
+        # failures). Rendered as "取得失敗: N 件" under the 判断待ち section so an outage does not
+        # silently under-report; the section itself never disappears (I-2 "黙って劣化しない").
+        [array]$ParkedPollErrors = @()
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -630,6 +646,60 @@ function New-DailyDigest {
         if ($quarantinedList.Count -gt 0) {
             $lines += "  [quarantined]"
             $lines += $quarantinedList
+        }
+    }
+
+    # 判断待ち — T-decision-request-composer S4 (msg-1370 §0 defect 2 / §4 / A-4; D-32 for the
+    # grammar-ownership rule). Emitted even at 0 件, mirroring the "silent day is the point"
+    # contract of 飢餓 (msg-814 §5). The count and the row order come from $HumanParked, which is
+    # itself the output of scripts/parked_humans.py — so this section restores fully from a wiped
+    # pending-decisions.json (A-14); the cache only enriches the row with the composer's question.
+    $lines += ""
+    $lines += "判断待ち: $($HumanParked.Count) 件"
+    if ($HumanParked.Count -eq 0) {
+        $lines += "  (該当なし)"
+    }
+    else {
+        foreach ($p in $HumanParked) {
+            $key = $p.key
+            $head = $p.head_msg_id
+            # Look up the composer question by (key, signature = "human:<head>"). Any other
+            # signature shape came from a different reason and does not match this row — the
+            # cache row is intentionally strict on signature equality (S2 A-3).
+            $sig = "human:$head"
+            $questionSnippet = $null
+            if ($PendingDecisionsState.ContainsKey($key)) {
+                $row = $PendingDecisionsState[$key]
+                if ($row -is [hashtable]) { $rowSig = $row['signature']; $env = $row['envelope'] }
+                else { $rowSig = $row.signature; $env = $row.envelope }
+                if ($rowSig -eq $sig -and $env) {
+                    $status = if ($env.PSObject.Properties.Name -contains 'composer_status') { $env.composer_status } else { $null }
+                    $output = if ($env.PSObject.Properties.Name -contains 'output') { $env.output } else { $null }
+                    if ($status -eq 'ok' -and $output) {
+                        $q = if ($output.PSObject.Properties.Name -contains 'question') { $output.question } else { $null }
+                        if ($q) {
+                            # One-line-per-row readability: cap at 80 chars, flatten any
+                            # embedded newlines, so a multi-line composed question cannot wrap
+                            # the digest layout.
+                            $flat = ($q -replace "`r?`n", ' ').Trim()
+                            if ($flat.Length -gt 80) { $flat = $flat.Substring(0, 79) + '…' }
+                            $questionSnippet = $flat
+                        }
+                    }
+                }
+            }
+            $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
+            $lines += "  $key   [$head]$suffix"
+        }
+    }
+    # Fetch-error surface (I-2 "黙って劣化しない"). When scripts/parked_humans.py could not read
+    # some threads' bodies, the section stays but the count above under-reports. Say so out loud.
+    if ($ParkedPollErrors.Count -gt 0) {
+        $lines += "  取得失敗: $($ParkedPollErrors.Count) 件（判断待ちに含まれていない可能性あり）"
+        foreach ($e in $ParkedPollErrors) {
+            $tid = if ($e.PSObject.Properties.Name -contains 'thread_id') { $e.thread_id } else { $e['thread_id'] }
+            $reason = if ($e.PSObject.Properties.Name -contains 'reason') { $e.reason } else { $e['reason'] }
+            $lines += "    $tid — $reason"
         }
     }
 
@@ -1252,6 +1322,113 @@ function Invoke-HeadProbe {
     }
 }
 
+# --- parked-humans probe (T-decision-request-composer S4 / D-32) --------------------------------
+# Poll the sweep candidates and return the subset currently parked on a human decision. Delegates
+# to ``scripts/parked_humans.py``, which re-uses the ``spirrow_mindwire.conductor.handoff``
+# parser (msg-1391 §13.2 / §13.3 for the D-32 grammar-ownership rule): a previous S4 (commit
+# 31a0373, since reverted) derived parking from notified.json signatures — a *derived* record,
+# not a judgment — and Einstein correctly rejected it as a D-24' violation. This wrapper's
+# ONLY job is to shell out; the parking answer is produced Python-side, by the module that owns
+# the ``NEXT:`` grammar. There is NO regex in this file.
+#
+# Input: list of candidates for one project ($Project + array of @{ thread_id; head_msg_id }).
+# Output: a hashtable @{ parked = [...]; errors = [...]; polled = <int> } — order-preserved from
+# the input. Each parked entry has { thread_id; head_msg_id; token }. A whole-poll failure
+# (script missing, non-zero exit, unparseable JSON) is treated as fail-CLOSED on the parked side:
+# no parked entries, but an error row so the digest never silently blanks. This is opposite to
+# Invoke-HeadProbe's fail-OPEN — same as msg-1391 §13.3 (different question, different safe
+# answer).
+function Invoke-ParkedHumansProbe {
+    param(
+        [string]$Project,
+        [array]$Candidates,
+        [hashtable]$HeadsByProject
+    )
+
+    $empty = @{ parked = @(); errors = @(); polled = 0 }
+
+    $probe = Join-Path $repoRoot "scripts\parked_humans.py"
+    if (-not (Test-Path -LiteralPath $probe)) {
+        Write-Log "parked-humans probe not found at $probe — treating as no-parked (fail-closed, digest under-reports)"
+        return $empty
+    }
+
+    # Build the per-project candidate list. head_msg_id comes from the head probe when we have
+    # it; empty string when the probe did not report the thread (parked_humans.py skips the
+    # cross-check in that case and trusts the fetched head). All-or-nothing: an empty candidate
+    # list means "no work for this project" and the probe returns polled=0 immediately.
+    $projectCands = @($Candidates | Where-Object { $_.project -eq $Project })
+    if ($projectCands.Count -eq 0) { return $empty }
+
+    $heads = if ($HeadsByProject.ContainsKey($Project)) { $HeadsByProject[$Project] } else { $null }
+    $items = @()
+    foreach ($c in $projectCands) {
+        $hid = ''
+        if ($null -ne $heads -and $heads.ContainsKey($c.thread_id)) { $hid = "$($heads[$c.thread_id])" }
+        $items += @{ thread_id = "$($c.thread_id)"; head_msg_id = $hid }
+    }
+    $payload = @{ candidates = $items } | ConvertTo-Json -Depth 5 -Compress
+
+    try {
+        Push-Location $repoRoot
+        try {
+            # Same invocation pattern as Invoke-HeadProbe: run under `uv run` from the repo root
+            # so the module import resolves against this checkout's environment.
+            $raw = $payload | & uv run python $probe --project $Project 2>&1
+            $code = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+    }
+    catch {
+        Write-Log "parked-humans probe [$Project] threw ($($_.Exception.Message)) — treating as no-parked (fail-closed)"
+        return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = "invocation failed: $($_.Exception.Message)" }); polled = 0 }
+    }
+
+    if ($code -ne 0) {
+        $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
+        Write-Log "parked-humans probe [$Project] exited $code — treating as no-parked. Output: $tail"
+        return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = "exit=${code}: $tail" }); polled = 0 }
+    }
+
+    $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+    if (-not $json) {
+        Write-Log "parked-humans probe [$Project] produced no JSON — treating as no-parked"
+        return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = 'no JSON on stdout' }); polled = 0 }
+    }
+
+    try {
+        $obj = $json | ConvertFrom-Json
+    }
+    catch {
+        Write-Log "parked-humans probe [$Project] JSON unparseable ($($_.Exception.Message)) — treating as no-parked"
+        return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = 'JSON unparseable' }); polled = 0 }
+    }
+
+    # Convert each parked entry into a wrapper-side record. Add the composite key
+    # ("project/thread_id") the digest and log line index by, so the downstream code does not
+    # have to reconstruct it.
+    $parkedOut = @()
+    foreach ($p in @($obj.parked)) {
+        $parkedOut += [PSCustomObject]@{
+            key         = "$Project/$($p.thread_id)"
+            project     = $Project
+            thread_id   = "$($p.thread_id)"
+            head_msg_id = "$($p.head_msg_id)"
+            token       = "$($p.token)"
+        }
+    }
+    $errorsOut = @()
+    foreach ($e in @($obj.errors)) {
+        $errorsOut += [PSCustomObject]@{
+            project   = $Project
+            thread_id = "$($e.thread_id)"
+            reason    = "$($e.reason)"
+        }
+    }
+    $polled = if ($obj.PSObject.Properties.Name -contains 'polled') { [int]$obj.polled } else { $projectCands.Count }
+    return @{ parked = $parkedOut; errors = $errorsOut; polled = $polled }
+}
+
 # --- loop control probe --------------------------------------------------------------------------
 # Returns the project's desired control state ("run" / "supervised" / "hold"), or $null when it
 # could not be read. $null means UNKNOWN and the caller launches anyway.
@@ -1720,6 +1897,39 @@ try {
         Write-Log "starved threads (>=$(Format-DurationDigest -Span $StarvedThreshold) since last evaluation): $($starved -join ', ')"
     }
 
+    # T-decision-request-composer S4 (D-32). Poll for threads currently parked on a human
+    # decision, once per distinct project, and aggregate. Same order as the sweep candidate list
+    # (per-project runs preserve order internally). The result feeds BOTH the log line below and
+    # the digest section, so the two never disagree.
+    #
+    # The parking answer comes from scripts/parked_humans.py, which re-uses the conductor's own
+    # ``NEXT:`` parser (:mod:`spirrow_mindwire.conductor.handoff`) — the wrapper does NOT
+    # re-spell that grammar. See Invoke-ParkedHumansProbe's header for the D-32 rationale.
+    $humanParked = @()
+    $parkedPollErrors = @()
+    $parkedPolled = 0
+    foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
+        $probe = Invoke-ParkedHumansProbe -Project $proj -Candidates $candidates -HeadsByProject $headsByProject
+        $humanParked      += @($probe.parked)
+        $parkedPollErrors += @($probe.errors)
+        $parkedPolled     += [int]$probe.polled
+    }
+    # One log line every tick — msg-1370 §I-4 ("何件にしたか記録すること"). Includes the
+    # per-project fetch error count so an outage is visible in the wrapper's log without
+    # waiting for the digest.
+    if ($humanParked.Count -gt 0 -or $parkedPollErrors.Count -gt 0) {
+        Confirm-LogWorthKeeping
+        $summary = if ($humanParked.Count -gt 0) {
+            ($humanParked | ForEach-Object { "$($_.key)" }) -join ', '
+        } else { '(none)' }
+        Write-Log "human-parked ($($humanParked.Count) of $parkedPolled candidates polled, $($parkedPollErrors.Count) fetch error(s)): $summary"
+    }
+    else {
+        # 0 件 still gets one line so the poll's own liveness is visible in the log (same idea
+        # as the 0 件 digest section — silent-day-is-the-point).
+        Write-Log "human-parked (0 of $parkedPolled candidates polled)"
+    }
+
     # Daily digest. Sent even when both quarantine and starvation lists are empty (spec/msg-814 §5).
     # A silent day IS the point: "no alert" then still means "the channel is alive," which is what
     # the 5h failure specifically lacked. Attempted at most once per $DailyDigestInterval.
@@ -1751,7 +1961,9 @@ try {
             $digest = New-DailyDigest -QuarantineState $quarantineState `
                 -EvaluatedState $evaluatedState `
                 -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc `
-                -LiveKeys $liveKeys
+                -LiveKeys $liveKeys `
+                -HumanParked $humanParked -PendingDecisionsState $pendingDecisionsState `
+                -ParkedPollErrors $parkedPollErrors
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved)"
             $result = Send-Notification -Message $digest

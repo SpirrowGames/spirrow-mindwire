@@ -43,7 +43,14 @@ $needed = @(
     'Format-DecisionMessage',
     'New-ComposerInputJson',
     'Get-JsonState',
-    'Save-JsonState'
+    'Save-JsonState',
+    # S4 (D-32): the digest section renderer + a stub-able Invoke-ParkedHumansProbe wrapper so
+    # the digest-side tests below never shell out to `uv run python scripts/parked_humans.py`.
+    'New-DailyDigest',
+    'Get-FingerprintHint',
+    'Get-DerivedQuarantineState',
+    'Format-DurationDigest',
+    'ConvertTo-UtcInstant'
 )
 foreach ($name in $needed) {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
@@ -238,6 +245,185 @@ $env = Get-CachedDecision -State $state -Key 'p/T-a' -Signature 'human:msg-2'
 CheckTrue 'signature mismatch is a miss' ($null -eq $env)
 $env = Get-CachedDecision -State $state -Key 'not-there' -Signature 'human:msg-1'
 CheckTrue 'absent key is a miss' ($null -eq $env)
+
+# ===============================================================================================
+# S4 (D-32): 判断待ち digest section
+# ===============================================================================================
+#
+# Coverage:
+#   * A-4          — the section is emitted at N=0 (silent-day contract) and at N>0.
+#   * A-14         — a wiped composed-question cache leaves the row + count intact and only
+#                    degrades the enrichment to the "(問い未生成)" placeholder.
+#   * Enrichment   — a cache row with a matching signature ("human:<head>") folds the composer's
+#                    question into the row (truncated to 80 chars, newlines flattened).
+#   * Signature    — a cache row whose signature does NOT match the parked head degrades to the
+#     strictness    placeholder (S2 A-3's "one CLI call per signature" contract is what makes this
+#                    safe — an older signature is stale, not a match).
+#   * Fetch errors — a non-empty $ParkedPollErrors renders as "取得失敗: N 件" so an outage is
+#                    visible under the section (I-2 "黙って劣化しない"), and the section itself
+#                    never disappears.
+
+# $script:StarvedThreshold is read by New-DailyDigest indirectly via Get-StarvedKeys. Set it here
+# so the digest can render a starvation section (no live keys, so it will be 0 件 anyway).
+$script:StarvedThreshold = [TimeSpan]::FromHours(24)
+
+$script:nowUtc = [DateTime]::Parse('2026-08-21T02:00:00Z', $null, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+
+function Get-DigestSection {
+    param([string]$Digest, [string]$Header)
+    # A digest section starts with a header line ("判断待ち: N 件") and runs to the next blank
+    # line. Used by the tests below so they read only the relevant slice, not the whole message.
+    $lines = $Digest -split "`n"
+    $out = @()
+    $inSection = $false
+    foreach ($ln in $lines) {
+        if ($ln -like "$Header*") { $inSection = $true; $out += $ln; continue }
+        if ($inSection) {
+            if ($ln -eq '' -or $ln -match '^[^\s]') {
+                if ($ln -eq '') { break }
+                # Next section header — end of ours.
+                if ($ln -notlike '  *') { break }
+            }
+            $out += $ln
+        }
+    }
+    return ($out -join "`n")
+}
+
+# --- A-4: 0 件 still emits the section ---------------------------------------------------------
+Write-Host ''
+Write-Host 'New-DailyDigest — 判断待ち: 0 件 still emits the section (A-4)'
+$digest0 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $script:nowUtc -LiveKeys @() `
+    -HumanParked @() -PendingDecisionsState @{} -ParkedPollErrors @()
+$section = Get-DigestSection -Digest $digest0 -Header '判断待ち:'
+CheckTrue '判断待ち header present at 0 件' ($section -match '判断待ち: 0 件') $section
+CheckTrue '該当なし marker present at 0 件' ($section -match '該当なし') $section
+CheckTrue 'no 取得失敗 line when there are no fetch errors' (-not ($section -match '取得失敗')) $section
+
+# --- N>0 with no cache: (問い未生成) placeholder (A-14) ----------------------------------------
+Write-Host ''
+Write-Host 'New-DailyDigest — 判断待ち: N>0 with an empty cache renders (問い未生成) placeholder (A-14)'
+$parked1 = @(
+    [PSCustomObject]@{ key = 'p/T-a'; project = 'p'; thread_id = 'T-a'; head_msg_id = 'msg-100' }
+)
+$digest1 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $script:nowUtc -LiveKeys @() `
+    -HumanParked $parked1 -PendingDecisionsState @{} -ParkedPollErrors @()
+$section = Get-DigestSection -Digest $digest1 -Header '判断待ち:'
+CheckTrue '判断待ち: 1 件 shown' ($section -match '判断待ち: 1 件') $section
+CheckTrue 'row lists the key' ($section -match 'p/T-a') $section
+CheckTrue 'row lists the head msg id' ($section -match '\[msg-100\]') $section
+CheckTrue 'placeholder present when cache is empty' ($section -match '\(問い未生成\)') $section
+
+# --- N>0 with a matching cache row: question is enriched onto the row --------------------------
+Write-Host ''
+Write-Host 'New-DailyDigest — matching cache row folds the question snippet onto the row'
+$cacheOk = @{}
+$cacheOk['p/T-a'] = @{
+    signature = 'human:msg-100'
+    envelope  = [PSCustomObject]@{
+        composer_status = 'ok'
+        output          = [PSCustomObject]@{
+            question = 'Should we adopt approach A or B?'
+        }
+    }
+}
+$digest2 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $script:nowUtc -LiveKeys @() `
+    -HumanParked $parked1 -PendingDecisionsState $cacheOk -ParkedPollErrors @()
+$section = Get-DigestSection -Digest $digest2 -Header '判断待ち:'
+CheckTrue 'question snippet renders on the row' ($section -match 'Should we adopt approach A or B') $section
+CheckTrue 'no placeholder when the question was folded in' (-not ($section -match '\(問い未生成\)')) $section
+
+# --- Signature strictness: mismatched signature degrades to the placeholder ---------------------
+Write-Host ''
+Write-Host 'New-DailyDigest — cache row for a DIFFERENT signature degrades to (問い未生成)'
+$cacheStale = @{}
+$cacheStale['p/T-a'] = @{
+    signature = 'human:msg-99'    # stale — thread head has advanced to msg-100
+    envelope  = [PSCustomObject]@{
+        composer_status = 'ok'
+        output          = [PSCustomObject]@{ question = 'STALE QUESTION' }
+    }
+}
+$digest3 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $script:nowUtc -LiveKeys @() `
+    -HumanParked $parked1 -PendingDecisionsState $cacheStale -ParkedPollErrors @()
+$section = Get-DigestSection -Digest $digest3 -Header '判断待ち:'
+CheckTrue 'placeholder shown when cache row is stale (signature mismatch)' ($section -match '\(問い未生成\)') $section
+CheckTrue 'stale question is NOT rendered onto the row' (-not ($section -match 'STALE QUESTION')) $section
+
+# --- Enrichment is strict on composer_status too -----------------------------------------------
+Write-Host ''
+Write-Host 'New-DailyDigest — a non-ok cache row (composer failed) does NOT enrich the row'
+$cacheFail = @{}
+$cacheFail['p/T-a'] = @{
+    signature = 'human:msg-100'
+    envelope  = [PSCustomObject]@{
+        composer_status = 'error'
+        output          = $null
+        error           = 'CLI timeout'
+    }
+}
+$digest4 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $script:nowUtc -LiveKeys @() `
+    -HumanParked $parked1 -PendingDecisionsState $cacheFail -ParkedPollErrors @()
+$section = Get-DigestSection -Digest $digest4 -Header '判断待ち:'
+CheckTrue 'placeholder shown when composer failed' ($section -match '\(問い未生成\)') $section
+CheckTrue 'error text is NOT rendered on the row' (-not ($section -match 'CLI timeout')) $section
+
+# --- Multi-line / very long question: flattened + truncated -----------------------------------
+Write-Host ''
+Write-Host 'New-DailyDigest — a multi-line, long question is flattened and truncated at 80 chars'
+$cacheLong = @{}
+$cacheLong['p/T-a'] = @{
+    signature = 'human:msg-100'
+    envelope  = [PSCustomObject]@{
+        composer_status = 'ok'
+        output          = [PSCustomObject]@{ question = "line one`nline two`n$( 'x' * 200 )" }
+    }
+}
+$digest5 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $script:nowUtc -LiveKeys @() `
+    -HumanParked $parked1 -PendingDecisionsState $cacheLong -ParkedPollErrors @()
+$section = Get-DigestSection -Digest $digest5 -Header '判断待ち:'
+CheckTrue 'multi-line question is flattened (no bare newlines inside the row snippet)' `
+    ($section -notmatch "line one`nline two") $section
+CheckTrue 'truncation marker (…) present on long question' ($section -match '…') $section
+
+# --- Fetch-error surface: I-2 "黙って劣化しない" ------------------------------------------------
+Write-Host ''
+Write-Host 'New-DailyDigest — fetch errors render as "取得失敗: N 件" under the section'
+$errors = @(
+    [PSCustomObject]@{ thread_id = 'T-b'; reason = 'chatroom_get_thread failed: connection refused' }
+)
+$digestErr = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $script:nowUtc -LiveKeys @() `
+    -HumanParked @() -PendingDecisionsState @{} -ParkedPollErrors $errors
+$section = Get-DigestSection -Digest $digestErr -Header '判断待ち:'
+CheckTrue 'section still present when the parked list is empty but there are errors' `
+    ($section -match '判断待ち: 0 件') $section
+CheckTrue '取得失敗: N 件 line is present' ($section -match '取得失敗: 1 件') $section
+CheckTrue 'the failing thread id is listed' ($section -match 'T-b') $section
+CheckTrue 'the failure reason is listed' ($section -match 'connection refused') $section
+
+# --- Multiple parked entries: order + separate rows --------------------------------------------
+Write-Host ''
+Write-Host 'New-DailyDigest — multiple parked entries render as separate rows in input order'
+$parkedMulti = @(
+    [PSCustomObject]@{ key = 'p1/T-a'; project = 'p1'; thread_id = 'T-a'; head_msg_id = 'msg-1' }
+    [PSCustomObject]@{ key = 'p2/T-b'; project = 'p2'; thread_id = 'T-b'; head_msg_id = 'msg-2' }
+)
+$digestMulti = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $script:nowUtc -LiveKeys @() `
+    -HumanParked $parkedMulti -PendingDecisionsState @{} -ParkedPollErrors @()
+$section = Get-DigestSection -Digest $digestMulti -Header '判断待ち:'
+CheckTrue '判断待ち: 2 件 shown' ($section -match '判断待ち: 2 件') $section
+CheckTrue 'first row present' ($section -match 'p1/T-a') $section
+CheckTrue 'second row present' ($section -match 'p2/T-b') $section
+CheckTrue 'input order preserved (p1 before p2)' `
+    ($section.IndexOf('p1/T-a') -lt $section.IndexOf('p2/T-b')) $section
 
 Write-Host ''
 if ($script:failures -gt 0) {
