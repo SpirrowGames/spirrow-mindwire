@@ -913,7 +913,8 @@ function Invoke-ComposerCli {
         [string]$InputJson,
         [string]$Backend = $DecisionComposerBackend,
         [string]$Identity = $DecisionComposerIdentity,
-        [int]$TimeoutSeconds = $DecisionComposerTimeoutSeconds
+        [int]$TimeoutSeconds = $DecisionComposerTimeoutSeconds,
+        [int]$TailCount = 0
     )
 
     if (-not (Test-Path -LiteralPath $repoRoot)) {
@@ -926,7 +927,13 @@ function Invoke-ComposerCli {
     # timeout — the composer runs unattended, so a stuck process must not hold the sweep back.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'uv'
-    $psi.Arguments = "run mindwire-compose-decision --backend $Backend --identity `"$Identity`""
+    # S3 spec D-38: pass --tail N when the caller asks for it (currently: only the claude-code
+    # backend does). The stub backend explicitly leaves TailCount=0 so its existing behaviour
+    # (payload tail is what the CLI sees) is untouched. Kept as a caller-supplied parameter rather
+    # than an in-function branch on $Backend so the seam stays testable without threading the
+    # backend through Format-DecisionMessage etc.
+    $tailArg = if ($TailCount -gt 0) { " --tail $TailCount" } else { '' }
+    $psi.Arguments = "run mindwire-compose-decision --backend $Backend --identity `"$Identity`"$tailArg"
     $psi.WorkingDirectory = $repoRoot
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
@@ -1076,9 +1083,15 @@ function Get-DecisionEnvelope {
         -StopReason $StopReason -Rounds $Rounds -ThreadTitle $ThreadTitle `
         -TailRequested $DecisionComposerTailLimit -TotalMessages 0 -Tail @()
 
+    # S3 spec D-38: only claude-code fetches the tail via chatroom_get_thread (Python side, per
+    # D-36). The stub keeps its empty-payload path unchanged. If a future backend also wants a
+    # fetched tail, add it here — the CLI's --tail flag is the single shared knob.
+    $tailForBackend = if ($DecisionComposerBackend -eq 'claude-code') { $DecisionComposerTailLimit } else { 0 }
+
     $result = Invoke-ComposerCli -InputJson $inputJson `
         -Backend $DecisionComposerBackend -Identity $DecisionComposerIdentity `
-        -TimeoutSeconds $DecisionComposerTimeoutSeconds
+        -TimeoutSeconds $DecisionComposerTimeoutSeconds `
+        -TailCount $tailForBackend
     if (-not $result.ok) {
         # I-2: never let a composer failure delay or block the raw ping. Log the failure so it is
         # visible in the sweep log, do NOT cache the failure (a future S6' renotify would keep

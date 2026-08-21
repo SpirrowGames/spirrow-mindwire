@@ -612,3 +612,198 @@ def test_direct_exception_raise_shape_is_a_decision_composer_error() -> None:
 
     assert issubclass(DecisionComposerTimeoutError, DecisionComposerError)
     assert issubclass(DecisionComposerEmptyError, DecisionComposerError)
+
+
+# --------------------------------------------------------------------------- #
+# S3 CLI wiring — --backend claude-code + --tail N fetch
+# --------------------------------------------------------------------------- #
+#
+# These exercise the CLI seams S3 adds. They do NOT spawn the real ``claude``
+# binary: the composer's ``runner`` is a fake, and the CLI's ``DEFAULT_TAIL_FETCHER``
+# is monkey-patched to a synchronous coroutine.
+
+
+class TestCliClaudeCodeBackend:
+    def _payload(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "project": "spirrow-voxelworld",
+            "thread_id": "T-slope-extension-dead-mode",
+            "last_msg_id": "msg-2582",
+            "stop_reason": "human",
+            "rounds": 3,
+            "thread_title": "slope extension dead mode",
+            "tail_requested": 0,
+            "total_messages": 0,
+            "tail": [],
+        }
+
+    def _fake_composer_cli_bytes(self) -> bytes:
+        """Bytes a real ``claude`` CLI would emit under ``--output-format json``."""
+        composer_payload = {
+            "question": "案 A と案 B のどちらを採るか?",
+            "options": [
+                {"id": "A", "label": "採用する", "gain": "問いが届く", "loss": "コスト増"},
+                {"id": "B", "label": "見送る", "gain": "コストゼロ", "loss": "問いが届かない"},
+            ],
+            "recommendation": "A",
+            "recommendation_reason": "msg-2582 の実測遅延を根拠に",
+            "unknowns": ["夜間停止頻度の実測"],
+        }
+        cli_payload = {
+            "result": json.dumps(composer_payload, ensure_ascii=False),
+            "duration_ms": 12345,
+            "total_cost_usd": 0.021,
+            "num_turns": 1,
+            "model": "claude-3-5-sonnet-20241022",
+        }
+        return json.dumps(cli_payload, ensure_ascii=False).encode("utf-8")
+
+    def test_backend_claude_code_writes_ok_envelope_with_extras(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Inject a fake runner into ClaudeCodeComposer by monkey-patching the
+        # default runner used when a composer is constructed without ``runner=``.
+        from spirrow_mindwire.decision_request import claude_code as cc_mod
+        from spirrow_mindwire.decision_request.claude_code import SubprocessResult
+
+        def fake_default_runner(**_: object) -> SubprocessResult:
+            return SubprocessResult(0, self._fake_composer_cli_bytes(), b"")
+
+        monkeypatch.setattr(cc_mod, "_default_runner", fake_default_runner)
+
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(self._payload())))
+        rc = main(["--backend", "claude-code", "--identity", "Composer"])
+        assert rc == 0
+        row = json.loads(capsys.readouterr().out)
+        assert row["composer_status"] == "ok"
+        assert row["identity_used"] == "Composer"
+        assert row["extras"]["backend"] == "claude-code"
+        assert row["extras"]["model"] == "claude-3-5-sonnet-20241022"
+        assert row["extras"]["duration_ms"] == "12345"
+        assert row["extras"]["prompt_version"]  # PROMPT_VERSION populated
+
+    def test_tail_n_replaces_payload_tail_via_fetcher(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Fake the tail fetcher so we never hit the network. It returns 3
+        # messages, one of them longer than the body cap so we can assert
+        # ``tail_truncated == "true"``.
+        from spirrow_mindwire.decision_request import claude_code as cc_mod
+        from spirrow_mindwire.decision_request import cli as cli_mod
+        from spirrow_mindwire.decision_request.claude_code import SubprocessResult
+
+        async def fake_fetch(
+            project: str, thread_id: str, count: int, body_cap: int
+        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+            assert project == "spirrow-voxelworld"
+            assert thread_id == "T-slope-extension-dead-mode"
+            assert count == 3
+            assert body_cap == 100
+            bodies = [
+                "short body",
+                "medium body " * 3,
+                "x" * 250,  # exceeds body_cap=100 => truncated
+            ]
+
+            def _cap(text: str) -> str:
+                return text[:body_cap] + ("… (省略)" if len(text) > body_cap else "")
+
+            msgs = tuple(
+                ThreadTailMessage(msg_id=f"msg-{i}", author=f"a-{i}", body=_cap(b))
+                for i, b in enumerate(bodies)
+            )
+            total_chars = sum(len(m.body) for m in msgs)
+            return msgs, 42, total_chars, True
+
+        monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", fake_fetch)
+
+        def fake_default_runner(**_: object) -> SubprocessResult:
+            return SubprocessResult(0, self._fake_composer_cli_bytes(), b"")
+
+        monkeypatch.setattr(cc_mod, "_default_runner", fake_default_runner)
+
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(self._payload())))
+        rc = main(
+            [
+                "--backend",
+                "claude-code",
+                "--tail",
+                "3",
+                "--body-cap",
+                "100",
+            ]
+        )
+        assert rc == 0
+        row = json.loads(capsys.readouterr().out)
+        assert row["composer_status"] == "ok"
+        # tail_requested reflects --tail N (D-38).
+        assert row["tail_requested"] == 3
+        # total_messages was updated from the fetch.
+        assert row["omitted_count"] >= 0  # 42 - 3 = 39, but at least non-negative
+        # Fetch telemetry in extras.
+        assert row["extras"]["tail_count"] == "3"
+        assert row["extras"]["tail_truncated"] == "true"
+        # Composer telemetry also present.
+        assert row["extras"]["backend"] == "claude-code"
+
+    def test_tail_n_fetch_failure_is_recorded_but_does_not_sink_the_envelope(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # I-2 at the tail-fetch layer: a chatroom outage must not stop the
+        # composer path. We fall back to the payload tail (which is empty
+        # here), record the failure in extras, and let the composer proceed.
+        from spirrow_mindwire.decision_request import claude_code as cc_mod
+        from spirrow_mindwire.decision_request import cli as cli_mod
+        from spirrow_mindwire.decision_request.claude_code import SubprocessResult
+
+        async def failing_fetch(
+            *_args: object, **_kwargs: object
+        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+            raise RuntimeError("chatroom is on fire")
+
+        monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", failing_fetch)
+
+        def fake_default_runner(**_: object) -> SubprocessResult:
+            return SubprocessResult(0, self._fake_composer_cli_bytes(), b"")
+
+        monkeypatch.setattr(cc_mod, "_default_runner", fake_default_runner)
+
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(self._payload())))
+        rc = main(["--backend", "claude-code", "--tail", "5"])
+        assert rc == 0
+        row = json.loads(capsys.readouterr().out)
+        # The composer still ran (empty tail is legal).
+        assert row["composer_status"] == "ok"
+        # Fetch failure surfaced in extras (visible degradation, I-2).
+        assert row["extras"]["tail_fetch_error"].startswith("RuntimeError:")
+
+    def test_zero_tail_default_keeps_payload_tail_untouched(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # S2 backward-compat: --tail 0 (the default) means "use payload tail
+        # as-is" — the fetcher is NEVER called. Pin this so a future refactor
+        # cannot silently start fetching for the stub path.
+        from spirrow_mindwire.decision_request import cli as cli_mod
+
+        async def must_not_be_called(
+            *_args: object, **_kwargs: object
+        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+            pytest.fail("--tail 0 must not call the fetcher")
+
+        monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", must_not_be_called)
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(self._payload())))
+        rc = main(["--backend", "stub"])
+        assert rc == 0
+        row = json.loads(capsys.readouterr().out)
+        assert row["composer_status"] == "ok"
+        # No tail_count key when fetch did not run.
+        assert "tail_count" not in row["extras"]

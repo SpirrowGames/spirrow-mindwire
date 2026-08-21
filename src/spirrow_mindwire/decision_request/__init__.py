@@ -31,6 +31,7 @@ The CLI entry point (``mindwire-compose-decision``) lives in
 
 from __future__ import annotations
 
+from .claude_code import DEFAULT_COMPOSER_IDENTITY, PROMPT_VERSION, ClaudeCodeComposer
 from .exceptions import (
     DecisionComposerEmptyError,
     DecisionComposerError,
@@ -48,6 +49,9 @@ from .value_objects import (
 )
 
 __all__ = [
+    "DEFAULT_COMPOSER_IDENTITY",
+    "PROMPT_VERSION",
+    "ClaudeCodeComposer",
     "ComposerStatus",
     "DecisionComposerEmptyError",
     "DecisionComposerError",
