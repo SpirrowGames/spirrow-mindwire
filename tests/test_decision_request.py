@@ -544,6 +544,44 @@ class TestCliMain:
         row = json.loads(capsys.readouterr().out)
         assert row["identity_used"] == "Composer"
 
+    def test_cli_stdout_is_ascii_only_pins_d33(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D-33 (msg-1394 §14.3): the JSON written to stdout is pure ASCII.
+
+        A NON-``capsys`` test on purpose. ``capsys`` captures at the io layer where the
+        encoding is unconditionally UTF-8, so the previous ``ensure_ascii=False`` regression
+        looked correct in every existing CLI test (msg-1394 §14.2). The invariant we actually
+        care about is a property of the string the CLI writes: if it is ASCII-only, encoding
+        it to any ASCII-superset (cp932, UTF-8, cp1252, latin-1, …) produces byte-identical
+        output — which is exactly what makes the wrapper's UTF-8 read side robust to the
+        deploy host's Windows console code page (cp932). ``StubComposer.compose`` emits
+        Japanese in ``question`` and ``unknowns``; without D-33 the string this test captures
+        contains those characters verbatim and ``.isascii()`` returns ``False``. With D-33,
+        json.dumps emits ``\\uXXXX`` escapes and every byte is ASCII.
+        """
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(self._payload())))
+        # StringIO captures the string BEFORE any encoding step, so ``.isascii()`` on it
+        # is a direct test of ``ensure_ascii=True`` at the ``json.dump`` call site.
+        captured = StringIO()
+        monkeypatch.setattr("sys.stdout", captured)
+        rc = main(["--backend", "stub"])
+        assert rc == 0
+        emitted = captured.getvalue()
+        # Sanity: the stub really did emit its Japanese payload — otherwise the assertion
+        # below would be trivially true. The parsed envelope still round-trips.
+        row = json.loads(emitted)
+        assert "停止しました" in row["output"]["question"], (
+            "stub composer output no longer contains Japanese — this test's premise is "
+            "invalid; pick a different Japanese-bearing field to gate on"
+        )
+        assert emitted.isascii(), (
+            "stdout JSON contains non-ASCII characters — D-33 (msg-1394 §14.3) "
+            "requires ensure_ascii=True at cli.py's json.dump call. The failure mode "
+            "this pin prevents: on the deploy host (Windows, cp932 console) the child's "
+            "stdout encoder mojibakes the payload while the JSON structure characters "
+            "remain valid, so the wrapper sees a parseable envelope with garbled "
+            f"question text. First 200 chars of the offending output: {emitted[:200]!r}"
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Protocol conformance (a duck-typed protocol test)

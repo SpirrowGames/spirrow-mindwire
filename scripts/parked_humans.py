@@ -217,7 +217,12 @@ def main() -> int:
         print(f"parked_humans: poll failed: {exc}", file=sys.stderr)
         return 1
 
-    print(json.dumps(result, ensure_ascii=False))
+    # D-33 (msg-1394 §14.3): stdout JSON is ASCII-only. Current outputs contain ``thread_id``,
+    # ``msg-id``, and the reserved token ``"human"`` — all ASCII — but ``errors[].reason`` embeds
+    # ``str(exc)`` (see ``_poll``), and a Japanese exception message would leak into stdout under
+    # the Windows-console cp932 default. ``ensure_ascii=True`` emits ``\uXXXX`` escapes so the
+    # byte stream is invariant across code pages, matching the wrapper's UTF-8 read side.
+    print(json.dumps(result, ensure_ascii=True))
     return 0
 
 

@@ -290,7 +290,15 @@ def main(argv: list[str] | None = None) -> int:
     request = _parse_input(raw)
     composer = _build_composer(args.backend, args.identity)
     envelope = compose_once(composer, request)
-    json.dump(envelope.to_json(), sys.stdout, ensure_ascii=False)
+    # D-33 (msg-1394 §14.3): stdout JSON is ASCII-only. The wrapper reads this pipe as UTF-8,
+    # but on Windows the child's ``sys.stdout`` encoding is inherited from the console code page
+    # (cp932 on the deploy host) and there is no exception path when the two disagree — the
+    # JSON structure characters happen to be ASCII either way, so ``json.loads`` succeeds and
+    # only the Japanese payload is silently mojibake'd. ``ensure_ascii=True`` (the json default)
+    # emits ``\uXXXX`` escapes, which are byte-equivalent under any single-byte-ASCII-compatible
+    # encoding. This is the structural fix (msg-1394 §14.3); do NOT rely on PYTHONIOENCODING —
+    # that closes the hole only for callers who remember to set it.
+    json.dump(envelope.to_json(), sys.stdout, ensure_ascii=True)
     sys.stdout.write("\n")
     return 0
 

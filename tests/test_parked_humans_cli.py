@@ -25,6 +25,7 @@ import importlib.util
 import json
 import sys
 from collections.abc import Mapping
+from io import StringIO as _StringIO
 from pathlib import Path
 
 import pytest
@@ -606,3 +607,65 @@ def test_cli_main_handles_empty_input(
     assert rc == 0
     result = json.loads(capsys.readouterr().out)
     assert result == {"project": "test", "polled": 0, "parked": [], "errors": []}
+
+
+def test_cli_stdout_is_ascii_only_pins_d33(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-33 (msg-1394 §14.3): the JSON written to stdout is pure ASCII.
+
+    NON-``capsys`` on purpose — same reasoning as its sibling in ``test_decision_request.py``.
+    ``capsys`` captures at the UTF-8 io layer and hid the previous ``ensure_ascii=False`` bug
+    (msg-1394 §14.2).
+
+    Current output fields (``thread_id``, ``head_msg_id``, ``token="human"``) are all ASCII by
+    construction, but ``errors[].reason`` embeds ``str(exc)`` (see :func:`_poll` at
+    ``scripts/parked_humans.py`` around the ``errors.append(...)`` sites). A real chatroom
+    outage with a Japanese-titled thread, or any future exception raising Japanese text, would
+    leak non-ASCII into stdout under the deploy host's cp932 console. This test simulates that
+    by making the MCP fetch raise ``MagickitMcpError`` with a Japanese message and pins that
+    the resulting stdout string is ASCII-only (i.e. json.dumps emits ``\\uXXXX`` escapes).
+    """
+    input_path = tmp_path / "candidates.json"
+    input_path.write_text(
+        json.dumps({"candidates": [{"thread_id": "T-broken", "head_msg_id": "msg-1"}]}),
+        encoding="utf-8",
+    )
+    _patch_mcp(
+        monkeypatch,
+        {
+            # A Japanese exception message models the realistic failure mode: the fetch path
+            # can propagate a title or excerpt in Japanese, or a Japanese error from magickit.
+            "T-broken": MagickitMcpError("スレッドが壊れている"),
+        },
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["parked_humans.py", "--project", "test", "--input", str(input_path)]
+    )
+
+    captured = _StringIO()
+    monkeypatch.setattr(sys, "stdout", captured)
+    rc = _MODULE.main()  # type: ignore[attr-defined]
+    assert rc == 0
+
+    emitted = captured.getvalue()
+    # Sanity: the Japanese-bearing error really did reach the payload — otherwise
+    # ``.isascii()`` is trivially true.
+    row = json.loads(emitted)
+    assert row["errors"], "test premise invalid: no error was recorded"
+    # ``ensure_ascii=True`` renders 'スレッド...' inside the JSON string,
+    # so the decoded reason contains the original Japanese text end-to-end.
+    assert "スレッドが壊れている" in row["errors"][0]["reason"], (
+        "test premise invalid: exception message no longer flows into errors[].reason; "
+        "pick a different Japanese-bearing field to gate on"
+    )
+    assert emitted.isascii(), (
+        "parked_humans stdout JSON contains non-ASCII characters — D-33 (msg-1394 §14.3) "
+        "requires ensure_ascii=True at scripts/parked_humans.py's json.dumps call. This "
+        "gate exists because the deploy host reads this pipe as UTF-8 while the child's "
+        "own stdout encoder is cp932 (Windows console default); a non-ASCII byte in this "
+        "output would arrive at the wrapper mojibake'd yet structurally valid, causing "
+        "the digest's 取得失敗 rows to display gibberish for real outages. First 200 "
+        f"chars of the offending output: {emitted[:200]!r}"
+    )
