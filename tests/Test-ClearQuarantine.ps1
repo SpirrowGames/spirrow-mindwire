@@ -4,9 +4,13 @@
 # So this script IS the clear mechanism, and every wrong answer here is a slow, invisible
 # degradation of the whole quarantine story:
 #   - forgetting to append to history throws away the -Reason data the design specifically wants;
-#   - forgetting to drop the heads.json entry means the next tick head-skips the freshly cleared
-#     thread back to the head it was quarantined under — the clear silently no-ops;
 #   - silently clearing a thread that was not quarantined trains the operator to trust a mistype.
+#
+# The old third failure mode ("forgetting to drop the heads.json entry means the next tick head-
+# skips the freshly cleared thread back to the head it was quarantined under") is gone with
+# heads.json itself (T-sweep-intake-and-quarantine-stalls Bohr msg-1432 §W-2). Under the new
+# head-skip nomination predicate a cleared thread's launch is timed by backoff (CAP=60 min), not
+# by head equality, so the "silent re-skip" failure this file used to pin is no longer reachable.
 #
 # The fixture is a data dir built from scratch in a temp directory — never this checkout's own
 # state dir, which would corrupt live daemon state.
@@ -35,7 +39,6 @@ function New-DataFixture {
     $dataDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mindwire-clearq-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path (Join-Path $dataDir "state") -Force | Out-Null
     $qPath = Join-Path $dataDir "state\quarantine.json"
-    $hPath = Join-Path $dataDir "state\heads.json"
     $qState = @{
         'proj/T-broken' = @{
             state = 'quarantined'; first_failure_at = '2026-08-10T00:00:00Z'
@@ -54,10 +57,6 @@ function New-DataFixture {
     }
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($qPath, ($qState | ConvertTo-Json -Depth 5), $utf8NoBom)
-    [System.IO.File]::WriteAllText($hPath, (@{
-        'proj/T-broken' = @{ head = 'msg-100'; control = 'run' }
-        'proj/T-other'  = @{ head = 'msg-200'; control = 'run' }
-    } | ConvertTo-Json -Depth 5), $utf8NoBom)
     return $dataDir
 }
 
@@ -85,12 +84,13 @@ try {
     Check "history entry records the reason" 'PR #999 fixed it' $hist[0].reason
     Check "history entry preserves the failed exit code" 1 $hist[0].record.exit_code
 
-    $h = (Get-Content -LiteralPath (Join-Path $dataDir "state\heads.json") -Raw -Encoding utf8) | ConvertFrom-Json
-    $hkeys = @($h.PSObject.Properties.Name)
-    # The point: dropping this stops the next tick head-skipping straight back to the same head
-    # the failure was recorded under. Without it, the clear silently no-ops.
-    Check "head-skip cache entry for cleared thread dropped" $false ($hkeys -contains 'proj/T-broken')
-    Check "head-skip cache entry for sibling preserved" $true ($hkeys -contains 'proj/T-other')
+    # Clear-Quarantine must not touch state/heads.json (it does not exist anymore under the new
+    # head-skip predicate — msg-1432 §W-2) nor state/head_skip.json (single-writer, owned by
+    # scripts/head_skip_decide.py). Assert the script did not create either file behind our back.
+    $legacyHeads = Join-Path $dataDir "state\heads.json"
+    Check "Clear-Quarantine does not create state/heads.json" $false (Test-Path -LiteralPath $legacyHeads)
+    $headSkip = Join-Path $dataDir "state\head_skip.json"
+    Check "Clear-Quarantine does not create state/head_skip.json" $false (Test-Path -LiteralPath $headSkip)
 }
 finally { Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction SilentlyContinue }
 

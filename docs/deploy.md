@@ -186,9 +186,10 @@ The reason is not tidiness. The venv holds an **editable** install, so the worki
 running module — there is no build or copy step to lag behind an edit. A daemon pointed at the
 checkout a human works in therefore executes whatever is on disk at each tick, mid-edit and all.
 Measured 2026-08-07, while two PRs were being written against that shared checkout: four ticks ran
-work-in-progress code, one of them a version deliberately broken for a negative test, and
-`state/heads.json` was rewritten several times in two mutually unreadable schemas. Nothing broke —
-but only because every path involved fails open. That is luck plus fail-open design, not isolation.
+work-in-progress code, one of them a version deliberately broken for a negative test, and the
+sweep's per-thread state file was rewritten several times in two mutually unreadable schemas.
+Nothing broke — but only because every path involved fails open. That is luck plus fail-open
+design, not isolation.
 
 Setting it up:
 
@@ -313,26 +314,42 @@ single message body (~1 s for all threads at once). If a thread's head equals th
 conductor reported last time, the conductor would resolve the same handoff and reach the same stop —
 so it is not launched at all.
 
-**The head alone is not enough to say "same stop".** Two inputs decide where a round lands, and the
-cache is keyed on both: the thread's head message *and* the project's loop control state. At an
-unchanged head, a naysayer→implementer handoff stops at the human gate under `hold` / `supervised`
-but dispatches the implementer under `run` (carve-out ③). So `state/heads.json` stores a pair per
-thread:
+**The head alone is not enough to say "same stop".** Two inputs decide where a round lands, and an
+earlier iteration of this predicate keyed a skip cache on both: the thread's head message *and*
+the project's loop control state (`state/heads.json`, entry per thread). At an unchanged head, a
+naysayer→implementer handoff stops at the human gate under `hold` / `supervised` but dispatches
+the implementer under `run` (carve-out ③).
 
-```json
-{"spirrow-voxelworld/T-lod0-sliver-shards": {"head": "msg-2172", "control": "run"}}
-```
+That head-equality predicate has been retired (T-sweep-intake-and-quarantine-stalls, Bohr
+msg-1428〜msg-1432). Measured 2026-08-11, it burned inferences on a `T-track-b-seam-octree-
+retirement`-shaped spin — head kept moving, nomination and control were unchanged, the equality
+check said "not the same head" and launched every tick with nothing to show for it. Worse, the
+starved candidates behind the spin were structurally invisible from the log. Its replacement is
+**a nomination-target predicate** implemented as `scripts/head_skip_decide.py` + the module
+`src/spirrow_mindwire/conductor/head_skip.py`:
 
-and a thread is skipped only when **both** match. Anything unknown — an unreadable control probe, a
-thread the head probe did not report, a record written before control was tracked — fails open into
-a launch.
+- **Stage 1 (stop tokens).** `token ∈ {none, human}` → SKIP. The set is closed at import time
+  and cannot silently expand.
+- **Stage 2 (time judgment).** Otherwise LAUNCH or DEFER (never SKIP). Exponential backoff on
+  no-progress LAUNCHes, capped at CAP=60 min.
+- **Head msg-id is audit-only.** A head that moves under an unchanged nomination + control does
+  NOT count as progress — the exact spec-degeneracy that motivated the rewrite.
+- **Fail-open on the fetch path.** A body-fetch failure yields UNRESOLVED which LAUNCHes; the
+  synthetic empty observation is not cached (round-2 anti-poisoning rule inside the module).
 
-> Without the control half, releasing a project from `hold` never took effect: every thread kept its
-> old head, so every thread was skipped, forever, while the log reported
-> `no thread moved (9/9 heads unchanged) — nothing to do` at exit 0. Measured 2026-08-06 — the same
-> line that means "healthy and idle" also meant "nothing can ever run", and nothing distinguished
-> them. Entries written before the upgrade are bare strings; they read as unknown control and cost
-> one launch each, once. `tests/Test-SweepHeadCache.ps1` (run by `.mindwire-gate`) guards the rule.
+The wrapper's role is now purely a caller: one `--mode decide` batch per project at the top of
+the tick, then `--mode commit-launch` per candidate the wrapper actually spawns, BEFORE the
+spawn. The CLI owns `<data_dir>/state/head_skip.json` (single writer, atomic replace). Anywhere
+the wrapper cannot reach the CLI — interpreter absent, decide crashed, output not parseable,
+non-zero exit — the tick aborts with `exit 1` (fail-closed): if `decide` is broken then
+`commit-launch` is broken too, and spawning conductors that will not be recorded would bypass
+the backoff CAP entirely. `tests/Test-SweepHeadCache.ps1` (run by `.mindwire-gate`) guards the
+wiring; the two-stage judgment itself is guarded by `tests/test_head_skip.py`.
+
+The old `state/heads.json` is gone with its predicate. Its readers, writer, and merge-on-write
+were removed in the same commit as the wire (Bohr msg-1432 §W-2 explicit: no conditions, no
+back-up copy). An operator upgrading past the change can safely delete any leftover
+`state/heads.json` on disk — it is no longer read.
 
 Measured on a 6-candidate list:
 
@@ -370,14 +387,15 @@ forever.
 |---|---|
 | `<data_dir>/logs/conductor-YYYY-MM-DD.log` | sweep log. Detail is buffered and only committed when a tick actually does something — an idle tick collapses to one line, which is what keeps a 5-minute cadence readable |
 | `<data_dir>/logs/clock-YYYY-MM-DD.log` | clock-sync log |
-| `<data_dir>/state/heads.json` | last head message id observed per thread — the skip decision above |
+| `<data_dir>/state/head_skip.json` | per-thread head-skip predicate record (nomination-target, launch attempts, cached observation) — the skip decision above. Single writer: `scripts/head_skip_decide.py`; atomic replace |
 | `<data_dir>/state/notified.json` | last alert fired per thread, for de-duplication |
 | `<data_dir>/state/quarantine.json` | quarantined threads — one entry per `project/thread_id`; see *Quarantine and daily digest* |
 | `<data_dir>/state/quarantine-history.json` | append-only clear log; every `Clear-Quarantine` writes its `-Reason` here |
 | `<data_dir>/state/evaluated.json` | `first_seen_at` + `last_evaluated_at` per **live** thread; the starvation metric pivots on the current sweep list and prunes ex-live keys |
 | `<data_dir>/state/digest.json` | `last_sent_at` of the daily digest — one send per 24h max |
 
-Deleting `heads.json` costs one full bootstrap sweep; `notified.json` at most one duplicate alert.
+Deleting `head_skip.json` costs one full bootstrap sweep (every thread launches once, no
+backoff); `notified.json` at most one duplicate alert.
 Deleting `quarantine.json` **un-quarantines every thread silently** — do not do it as a shortcut for
 `Clear-Quarantine`; the history file exists precisely so cleared-with-reason and cleared-without-
 context are not confusable later. Deleting `evaluated.json` resets the starvation clock (harmless,
@@ -494,17 +512,17 @@ pwsh deploy/Clear-Quarantine.ps1 -Thread 'spirrow-mindwire/T-foo-bar' -Reason 'r
 
 The `-Reason` is required and is appended to `state/quarantine-history.json` — this text is the
 first-hand data for whether the quarantine judgement was over-sensitive (`Clear-Quarantine`
-frequency is the signal, `-Reason` is the payload). Clearing also drops the `heads.json` entry for
-the thread, so the next tick launches instead of head-skipping to the same head that was
-quarantined under.
+frequency is the signal, `-Reason` is the payload). Clearing does not touch `state/head_skip.json`:
+the new predicate times a cleared thread by backoff (capped at 60 min), not head equality, so the
+"silent re-skip" failure the old `heads.json` drop guarded against is no longer reachable.
 
 **Running Clear-Quarantine while the sweep is running is safe.** A single tick reads its state
 files once at start and holds them in memory for the whole run (measured minutes on a real
 AI-driven candidate). Without care, that stale in-memory map would silently overwrite the
 operator's disk write at end-of-tick and resurrect the entry — the sort of failure the whole
-quarantine story exists to end. So the sweep uses **merge-on-write**: at flush time it re-reads
-`quarantine.json` and `heads.json` from disk, and any key the operator removed during the tick
-stays removed. New adds from the sweep still land, age-driven state transitions still land; only
+quarantine story exists to end. So the sweep uses **merge-on-write on `quarantine.json`**: at flush
+time it re-reads the file from disk, and any key the operator removed during the tick stays
+removed. New adds from the sweep still land, age-driven state transitions still land; only
 operator-cleared entries survive the merge. This narrows the race from "the whole tick" to
 "between the re-read and the write" (sub-millisecond). Closing that residual window would take a
 file lock, and a multi-minute sweep holding a lock would block the operator for that entire time,

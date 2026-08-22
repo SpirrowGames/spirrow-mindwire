@@ -1,17 +1,29 @@
-# Regression guard for the sweep's head-skip cache (deploy/run-conductor-scheduled.ps1).
+# Regression guard for the sweep's head-skip nomination-predicate WIRING
+# (deploy/run-conductor-scheduled.ps1). The two-stage judgment itself lives in
+# scripts/head_skip_decide.py and src/spirrow_mindwire/conductor/head_skip.py — pytest reaches
+# both. This file targets the seam the PowerShell wrapper adds around them, because a broken
+# wire is the failure mode msg-1181 §F-3 measured in production: the predicate was written and
+# tested, but the wrapper never called it and nobody noticed for 6 days.
 #
-# Why this file exists at all: the skip decision is the one place in the wrapper where being wrong is
-# INVISIBLE. A cache that skips too little costs a cheap launch and says so in the log; a cache that
-# skips too much parks live threads forever while reporting `no thread moved … nothing to do` at
-# exit 0. That happened — measured 2026-08-06, 15+ minutes after both projects were released from
-# `hold`, indistinguishable from a healthy idle loop until someone read `observed_state` by hand.
+# What is covered here (post-msg-1430 §W-1 / §W-2):
+#   1. The deleted symbols are actually deleted. `Test-CanSkip`, `Get-HeadRecord`, and the
+#      `$headsStatePath` variable must be absent from the sweep script — a rename or accidental
+#      re-introduction would revive the "head equality → skip" predicate the module retired.
+#   2. Nothing in the checkout still references state/heads.json. That file is deleted with its
+#      readers/writers (msg-1432 §W-2 explicit: no conditions, no residual mirror), so a grep
+#      hit anywhere is a wiring bug — either a code path was missed or a doc line will teach
+#      the next reader that heads.json is still authoritative.
+#   3. The new wiring helpers (`Invoke-HeadSkipDecide` / `Invoke-HeadSkipCommitLaunch` /
+#      `Get-HeadSkipMode`) exist and parse. If any is renamed, the AST scan below fails
+#      loudly — a caller depends on those exact names.
+#   4. `Get-ConductorVerdict` still parses `last_msg=None` as an absence, not a head called
+#      "None". This one is unrelated to the head-skip rewire but was covered in the previous
+#      test file — its regression would still ship a silent bug, so it stays.
 #
-# The wrapper is PowerShell, so pytest cannot reach it. Rather than leave the decision untested (or
-# leave the checks in a scratch file nobody runs), this is wired into `.mindwire-gate` — the single
-# SOT that CI and the loop's own implementer both execute.
-#
-# The functions are lifted out of the script's AST instead of dot-sourced, because dot-sourcing would
-# run the sweep: probe the chatroom, rewrite mindwire.toml and launch the conductor.
+# What is NOT covered here (deliberately): the two-stage judgment (`stop-token` set, backoff
+# math, park→resume detector, HEAD_CACHE_TTL). That is all in tests/test_head_skip.py under
+# pytest — one place, one owner, not scattered across a PS harness that lifts functions out of
+# the wrapper's AST.
 
 $ErrorActionPreference = "Stop"
 
@@ -31,10 +43,10 @@ function Write-Log { param([string]$Message) }
 
 $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
-foreach ($name in 'Get-HeadRecord', 'Test-CanSkip', 'Get-ConductorVerdict', 'Get-JsonState', 'Save-JsonState') {
-    $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
-    if (-not $fn) { throw "function not found in sweep script: $name" }
-    Invoke-Expression $fn.Extent.Text
+
+function Get-FunctionAst {
+    param([string]$Name)
+    return ($functions | Where-Object { $_.Name -eq $Name } | Select-Object -First 1)
 }
 
 $script:failures = 0
@@ -49,76 +61,87 @@ function Check {
     }
 }
 
-Write-Host "Test-CanSkip — a skip needs BOTH an unchanged head and an unchanged control state"
-# The regression itself: at an unchanged head, a naysayer->implementer handoff stops at the human
-# gate under hold/supervised but dispatches under `run` (carve-out (3), conductor/core.py). Keying on
-# the head alone skips exactly the threads a release from `hold` was meant to start.
-Check "same head + same control -> skip" $true `
-    (Test-CanSkip -ProbeHead 'msg-1' -KnownHead 'msg-1' -CurrentControl 'run' -KnownControl 'run')
-Check "same head + hold -> run must LAUNCH" $false `
-    (Test-CanSkip -ProbeHead 'msg-1' -KnownHead 'msg-1' -CurrentControl 'run' -KnownControl 'hold')
-Check "same head + run -> supervised must LAUNCH" $false `
-    (Test-CanSkip -ProbeHead 'msg-1' -KnownHead 'msg-1' -CurrentControl 'supervised' -KnownControl 'run')
-Check "head moved + same control must LAUNCH" $false `
-    (Test-CanSkip -ProbeHead 'msg-2' -KnownHead 'msg-1' -CurrentControl 'run' -KnownControl 'run')
+Write-Host "W-1 — the retired equality predicate is GONE (msg-1428/1430 §W-1)"
+# The old head-equality skip was the exact bug the head-skip module was written to end. Keeping
+# even a dead-code copy of `Test-CanSkip` would let a future reader wire it back by accident;
+# the frozen spec is explicit that revert is via `git revert`, not a flag.
+Check "Test-CanSkip is absent" $null (Get-FunctionAst -Name 'Test-CanSkip')
+Check "Get-HeadRecord is absent" $null (Get-FunctionAst -Name 'Get-HeadRecord')
 
-Write-Host "Test-CanSkip — every unknown fails OPEN into a launch"
-Check "control probe gap" $false `
-    (Test-CanSkip -ProbeHead 'msg-1' -KnownHead 'msg-1' -CurrentControl $null -KnownControl 'run')
-Check "record predates control tracking" $false `
-    (Test-CanSkip -ProbeHead 'msg-1' -KnownHead 'msg-1' -CurrentControl 'run' -KnownControl $null)
-Check "head probe gap" $false `
-    (Test-CanSkip -ProbeHead $null -KnownHead 'msg-1' -CurrentControl 'run' -KnownControl 'run')
-Check "thread never run before" $false `
-    (Test-CanSkip -ProbeHead 'msg-1' -KnownHead $null -CurrentControl 'run' -KnownControl 'run')
+Write-Host "W-2 — the wrapper's AST contains no LIVE references to heads.json / headsState (msg-1432 §W-2)"
+# Msg-1432's requirement: readers / writers / merge-on-write / path def / load are ALL removed as
+# one atomic change. Comments that document the removal are welcome — they teach the next reader
+# not to re-add the state file. What we forbid is executable code that still refers to the deleted
+# names: an unused variable reference, a Join-Path expression building the old path, a call site
+# that survived the edit. Those are the wiring bugs the AST scan pins.
+$forbiddenVars = @('headsState', 'headsStatePath', 'headsOriginalKeys', 'mergedHeads')
+$varRefs = $ast.FindAll(
+    { param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)
+$badVars = @()
+foreach ($v in $varRefs) {
+    if ($forbiddenVars -contains $v.VariablePath.UserPath) { $badVars += $v.VariablePath.UserPath }
+}
+if ($badVars.Count -gt 0) {
+    $script:failures++
+    Write-Host "  FAIL  sweep AST still uses forbidden variables: $($badVars -join ', ')"
+}
+else {
+    Write-Host "  PASS  no live sweep-AST references to $($forbiddenVars -join ' / ')"
+}
+# The old path literal, in either separator style. Belongs only to comments now; a StringConstant
+# in the AST would mean the path is still being computed somewhere.
+$stringConsts = $ast.FindAll(
+    { param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true)
+$badPaths = @($stringConsts | Where-Object { $_.Value -match 'heads\.json$' })
+if ($badPaths.Count -gt 0) {
+    $script:failures++
+    Write-Host "  FAIL  sweep AST still contains the literal path 'heads.json': $($badPaths | ForEach-Object { $_.Value }) -join ', ')"
+}
+else {
+    Write-Host "  PASS  no live 'heads.json' path literals in sweep AST"
+}
 
-Write-Host "Get-HeadRecord — reads both the current shape and pre-upgrade bare strings"
-$legacy = @{ 'p/t' = 'msg-9' }
-$r = Get-HeadRecord -State $legacy -Key 'p/t'
-Check "legacy string yields its head" 'msg-9' $r.head
-Check "legacy string yields unknown control" $null $r.control
-$r = Get-HeadRecord -State @{} -Key 'absent'
-Check "absent key yields unknown head" $null $r.head
-Check "absent key yields unknown control" $null $r.control
+Write-Host "W-2 — the CLI wiring helpers exist under their contract names"
+# The three PS helpers callers depend on. Renaming any of them without updating its call site
+# is a silent contract break; keep the names pinned here.
+Check "Invoke-HeadSkipDecide exists" $true ($null -ne (Get-FunctionAst -Name 'Invoke-HeadSkipDecide'))
+Check "Invoke-HeadSkipCommitLaunch exists" $true ($null -ne (Get-FunctionAst -Name 'Invoke-HeadSkipCommitLaunch'))
+Check "Get-HeadSkipMode exists" $true ($null -ne (Get-FunctionAst -Name 'Get-HeadSkipMode'))
+
+Write-Host "Get-HeadSkipMode — env var routes to CLI mode, unknowns fall back to 'decide'"
+$fn = Get-FunctionAst -Name 'Get-HeadSkipMode'
+Invoke-Expression $fn.Extent.Text
+# Save + restore the caller's env in case the harness itself runs with the var set.
+$origMode = $env:MINDWIRE_HEADSKIP_MODE
+try {
+    $env:MINDWIRE_HEADSKIP_MODE = $null
+    Check "unset -> decide" 'decide' (Get-HeadSkipMode)
+    $env:MINDWIRE_HEADSKIP_MODE = 'decide'
+    Check "explicit decide -> decide" 'decide' (Get-HeadSkipMode)
+    $env:MINDWIRE_HEADSKIP_MODE = 'report'
+    Check "report -> report (dry-run)" 'report' (Get-HeadSkipMode)
+    $env:MINDWIRE_HEADSKIP_MODE = 'garbage'
+    Check "unknown value falls back to decide (not to a silent no-op)" 'decide' (Get-HeadSkipMode)
+}
+finally {
+    if ($null -eq $origMode) { Remove-Item Env:\MINDWIRE_HEADSKIP_MODE -ErrorAction SilentlyContinue }
+    else { $env:MINDWIRE_HEADSKIP_MODE = $origMode }
+}
 
 Write-Host "Get-ConductorVerdict — 'last_msg=None' is absence, not a head called 'None'"
+# Unchanged carry-over from the prior test suite. The wrapper's own verdict parsing still owns
+# this rule regardless of what happens on the head-skip side.
+foreach ($name in 'Get-ConductorVerdict', 'Get-JsonState', 'Save-JsonState') {
+    $fn = Get-FunctionAst -Name $name
+    if (-not $fn) { throw "function not found in sweep script: $name" }
+    Invoke-Expression $fn.Extent.Text
+}
 $v = Get-ConductorVerdict -Output @('conductor stopped: reason=hold rounds=0 forced_naysayer=0 last_msg=None')
 Check "None becomes null" $null $v.last_msg
 Check "reason still parsed" 'hold' $v.reason
 $v = Get-ConductorVerdict -Output @('conductor stopped: reason=human rounds=17 forced_naysayer=0 last_msg=msg-2167')
 Check "real id parsed" 'msg-2167' $v.last_msg
 Check "rounds parsed" 17 $v.rounds
-
-Write-Host "state file round-trip — a record survives save/load, and a mixed file is readable"
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mindwire-headstate-" + [guid]::NewGuid().ToString('N') + ".json")
-try {
-    $state = @{}
-    $state['proj/T-a'] = @{ head = 'msg-100'; control = 'run' }
-    $state['proj/T-b'] = @{ head = 'msg-200'; control = $null }   # written when the probe was unreadable
-    Save-JsonState -Path $tmp -State $state
-    $loaded = Get-JsonState -Path $tmp
-    $a = Get-HeadRecord -State $loaded -Key 'proj/T-a'
-    Check "round-trip head" 'msg-100' $a.head
-    Check "round-trip control" 'run' $a.control
-    $b = Get-HeadRecord -State $loaded -Key 'proj/T-b'
-    Check "round-trip keeps an unknown control unknown" $null $b.control
-}
-finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force } }
-
-# The upgrade tick: a state file written by the previous version, read by this one.
-$tmp2 = Join-Path ([System.IO.Path]::GetTempPath()) ("mindwire-headstate-" + [guid]::NewGuid().ToString('N') + ".json")
-try {
-    '{"proj/T-old":"msg-705","proj/T-new":{"head":"msg-2167","control":"run"}}' |
-        Set-Content -LiteralPath $tmp2 -Encoding utf8
-    $loaded = Get-JsonState -Path $tmp2
-    $old = Get-HeadRecord -State $loaded -Key 'proj/T-old'
-    Check "mixed file: legacy head" 'msg-705' $old.head
-    Check "mixed file: legacy control unknown" $null $old.control
-    $new = Get-HeadRecord -State $loaded -Key 'proj/T-new'
-    Check "mixed file: new head" 'msg-2167' $new.head
-    Check "mixed file: new control" 'run' $new.control
-}
-finally { if (Test-Path -LiteralPath $tmp2) { Remove-Item -LiteralPath $tmp2 -Force } }
 
 Write-Host ""
 if ($script:failures -gt 0) {

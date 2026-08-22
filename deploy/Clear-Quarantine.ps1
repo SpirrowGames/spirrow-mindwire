@@ -7,15 +7,20 @@
 # collapse into a question the runner cannot distinguish, and the whole quarantine story would slip
 # back into the same silent-degradation failure mode this design exists to end.
 #
-# So a clear is a human act. This script is that act, and it does three things:
+# So a clear is a human act. This script is that act, and it does two things:
 #   1. removes the entry from state/quarantine.json (so the next sweep tries the thread again),
 #   2. appends the removed entry — plus the operator's `-Reason` and the timestamp — to
 #      state/quarantine-history.json (append-only; never rewritten, never truncated), because
 #      "why did you clear it?" is the primary data on whether the quarantine judgement was
-#      over-sensitive, and
-#   3. drops the head-skip cache entry for that thread — otherwise the next tick would look at an
-#      unchanged head and skip the launch we JUST said should happen (the whole point of clearing
-#      is to give the thread another chance to run).
+#      over-sensitive.
+#
+# Old third step (drop the state/heads.json entry so the head cache doesn't re-skip) is gone with
+# heads.json itself (T-sweep-intake-and-quarantine-stalls Bohr msg-1432 §W-2). Under the new
+# head-skip nomination predicate the "same head, same routing → SKIP" equality is not a state,
+# so a cleared thread does not re-skip on unchanged head. The new predicate can still DEFER on
+# backoff — up to CAP=60 min — for a thread whose nomination has not moved since its last (now-
+# quarantined) LAUNCH; that DEFER is under the starvation floor (24h), so the operator's cleared
+# thread cannot silently starve behind it.
 #
 # Not idempotent by design: clearing a thread that is not quarantined is an error, so the operator
 # does not silently no-op when they mistype the key.
@@ -48,7 +53,6 @@ $ErrorActionPreference = "Stop"
 
 $quarantineStatePath = Join-Path $DataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $DataDir "state\quarantine-history.json"
-$headsStatePath = Join-Path $DataDir "state\heads.json"
 
 if (-not (Test-Path -LiteralPath $quarantineStatePath)) {
     throw "no quarantine state file at $quarantineStatePath — nothing to clear (the sweep has not written one yet, or the data dir is wrong)"
@@ -101,22 +105,12 @@ $history += $entry
 # outside reader; making it always an array closes that surprise once.
 [System.IO.File]::WriteAllText($quarantineHistoryPath, (ConvertTo-Json -InputObject $history -Depth 6 -AsArray), $utf8NoBom)
 
-# Also drop the head-skip cache entry. Otherwise the next tick would see the current head match the
-# quarantined-time head and skip the launch — which defeats the point of clearing (the clear IS the
-# request to try again). The head-skip cache will regenerate on the next successful launch.
-if (Test-Path -LiteralPath $headsStatePath) {
-    $hraw = Get-Content -LiteralPath $headsStatePath -Raw -Encoding utf8
-    if ($hraw.Trim()) {
-        $hobj = $hraw | ConvertFrom-Json
-        $hstate = @{}
-        foreach ($p in $hobj.PSObject.Properties) { $hstate[$p.Name] = $p.Value }
-        if ($hstate.ContainsKey($Thread)) {
-            $hstate.Remove($Thread)
-            [System.IO.File]::WriteAllText($headsStatePath, ($hstate | ConvertTo-Json -Depth 5), $utf8NoBom)
-            Write-Host "head-skip cache entry for $Thread dropped — next tick will launch."
-        }
-    }
-}
+# Nothing to do for the head-skip state file. state/head_skip.json is owned by the CLI (single
+# writer, atomic replace) and its schema records a per-thread Record rather than a head/control
+# pair. A cleared thread with a prior record and unchanged nomination will DEFER on backoff for
+# up to CAP=60 min under the new predicate — still far under the 24h starvation threshold, so it
+# cannot silently starve behind the clear (msg-1432 §W-2). Editing head_skip.json from here would
+# be a second writer for a single-writer file; the frozen spec is explicit that we do not.
 
 Write-Host "cleared: $Thread"
 Write-Host "reason:  $Reason"

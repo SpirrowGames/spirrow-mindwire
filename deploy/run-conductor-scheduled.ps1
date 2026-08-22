@@ -97,14 +97,20 @@ $configPath = Join-Path $dataDir "config\mindwire.toml"
 $logDir = Join-Path $dataDir "logs"
 $logPath = Join-Path $logDir ("conductor-" + (Get-Date -Format "yyyy-MM-dd") + ".log")
 $notifyStatePath = Join-Path $dataDir "state\notified.json"
-$headsStatePath = Join-Path $dataDir "state\heads.json"
+# State file for the head-skip nomination predicate (scripts/head_skip_decide.py, PR #140).
+# See T-sweep-intake-and-quarantine-stalls Bohr msg-1430 §W-2 for the wiring contract: the CLI
+# owns the file's shape (thread_id-keyed JSON object of Record dicts), the atomic write, and
+# the corrupt/missing → empty semantics. The wrapper is a caller, never a co-writer. This
+# supersedes the old $headsStatePath (state\heads.json) — that file is deleted, its readers/
+# writers/merge-on-write have been removed as one atomic change (Bohr msg-1432 §W-2 update).
+$headSkipStatePath = Join-Path $dataDir "state\head_skip.json"
 $sweepConfigPath = Join-Path $dataDir "config\sweep.json"
 $quarantineStatePath = Join-Path $dataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
 $evaluatedStatePath = Join-Path $dataDir "state\evaluated.json"
 $digestStatePath = Join-Path $dataDir "state\digest.json"
 # Composer cache (T-decision-request-composer S2). One row per parked thread key,
-# keyed by the same "project/thread_id" the notified.json / heads.json use so a
+# keyed by the same "project/thread_id" the notified.json / evaluated.json use so a
 # reader can cross-reference by eye. The row carries the last composer envelope
 # (question + options) and its signature; the wrapper reuses it when the
 # signature has not changed (I-3: ≤1 composer call per reason:last_msg stop).
@@ -197,8 +203,10 @@ function ConvertTo-UtcInstant {
 }
 
 # Merge-on-write: re-read the file just before writing and preserve any keys the operator removed
-# during the tick. Used for state files where BOTH the sweep and an external tool (Clear-Quarantine)
-# may write during a sweep run — quarantine.json and heads.json.
+# during the tick. Used for the quarantine.json state file, where BOTH the sweep and an external
+# tool (Clear-Quarantine) may write during a sweep run. (The head-skip state file
+# state\head_skip.json is written exclusively by the CLI, so it does not need this treatment; the
+# old state\heads.json that shared this discipline is gone — see msg-1432 §W-2.)
 #
 # WHY IT EXISTS. A tick reads its state files once at start and holds them in memory for the whole
 # sweep (measured minutes on a real AI-driven candidate). If an operator runs Clear-Quarantine
@@ -247,23 +255,27 @@ function Merge-StateForWrite {
 }
 
 # Refresh an evaluated.json entry's last_evaluated_at while preserving its first_seen_at. Called
-# from every disposition that ACTUALLY REACHED the candidate — a launched verdict (worked, no-work,
-# non-zero exit) AND a head-skip (the sweep probed the head, proved nothing has moved, and
-# correctly fast-pathed).
+# from every disposition that ACTUALLY REACHED the candidate — i.e. every candidate that received
+# a decide() verdict this tick (LAUNCH, DEFER, or SKIP) — plus the launched thread's own
+# post-verdict tick where the head_skip predicate's decision was consulted.
 #
-# WHY HEAD-SKIP COUNTS. A chatroom thread being idle for 24h (a weekend) is normal behaviour. If
-# head-skip did NOT refresh, every legitimately-idle thread would flag as `starved` on Monday
-# morning — the starvation section would fill with perfectly healthy inactive threads and the
-# metric would be trained into noise. The metric asks "how long since I actually reached this
-# candidate?" and a head-skip IS reaching: the sweep probed, evaluated, decided. (Tier B naysayer,
-# PR #138 round 4.)
+# W-2c (Bohr msg-1432): every decide verdict is an evaluation. That includes LAUNCHes the sweep
+# actually spawned, LAUNCH verdicts the sweep did NOT act on (because the K-budget capped or an
+# earlier candidate did work), DEFERs (backoff timing check happened), and SKIPs (Stage-1
+# stop-token judgment happened). All of them mean "the sweep asked its question about this
+# candidate this tick" — which is what this metric measures. This supersedes the old
+# head-cache-match branch (Test-CanSkip) — that branch is gone, and the new predicate's
+# SKIP/DEFER verdicts stand in for it (msg-1432 §W-2c; forbidden not to update: a chain-cutoff
+# thread stuck on NEXT: NotAPersona SKIPs every tick under the new predicate and would otherwise
+# be structurally invisible to starvation).
 #
 # WHY OTHER DISPOSITIONS DO NOT. `held` / `quarantined-skipped` / `not-reached` all mean the sweep
 # never actually asked the question this tick — a HELD candidate is deliberately withheld by the
-# operator, a quarantined-skipped candidate is deferred until human clear, and a not-reached
-# candidate is one the sweep never got to (K-budget hit, earlier candidate did work). None of them
-# advance the "how long since I actually reached this?" clock. That is the design's Q4 honesty
-# rule and it is load-bearing — the metric only means anything because these DO age past 24h.
+# operator (and never even reaches the decide batch), a quarantined-skipped candidate is deferred
+# until human clear (excluded from decide by the wrapper), and a not-reached candidate is one the
+# sweep never got to (K-budget hit, earlier candidate did work). None of them advance the "how
+# long since I actually reached this?" clock. That is the design's Q4 honesty rule and it is
+# load-bearing — the metric only means anything because these DO age past 24h.
 #
 # The value in $State[$Key] may be a hashtable (freshly written this tick) or a PSCustomObject
 # (round-tripped from disk). Dot access to .first_seen_at works on both — same duck-typing pattern
@@ -283,29 +295,6 @@ function Update-EvaluatedTimestamp {
     $row = @{ last_evaluated_at = $Now.ToUniversalTime().ToString("o") }
     if ($firstSeen) { $row.first_seen_at = $firstSeen }
     $State[$Key] = $row
-}
-
-# --- head-state records ---------------------------------------------------------------------------
-# A head record is @{ head; control } — the message id the conductor last reported for a thread, AND
-# the project control state it reported it under. Both are needed to decide a skip; see Test-CanSkip.
-#
-# Entries written before this became a pair are bare strings. Those are read as control = $null,
-# which never matches a live state, so a pre-upgrade state file costs one launch per thread and then
-# self-heals into the new shape. That is deliberately the fail-open direction: the alternative
-# (assume the old head was recorded under the current state) would reproduce the very bug this
-# record exists to fix, once, silently, on the upgrade tick.
-function Get-HeadRecord {
-    param([hashtable]$State, [string]$Key)
-
-    $empty = @{ head = $null; control = $null }
-    if (-not $State.ContainsKey($Key)) { return $empty }
-    $value = $State[$Key]
-    if ($null -eq $value) { return $empty }
-    if ($value -is [string]) { return @{ head = $value; control = $null } }
-    return @{
-        head    = if ($value.PSObject.Properties.Name -contains 'head') { $value.head } else { $null }
-        control = if ($value.PSObject.Properties.Name -contains 'control') { $value.control } else { $null }
-    }
 }
 
 # May a held project's launch be optimised away this tick?
@@ -332,36 +321,168 @@ function Test-HoldObserved {
     return ($Control.observed_state -eq 'hold')
 }
 
-# The skip rule, stated in one place because getting it wrong is invisible.
+# --- head-skip nomination predicate wiring (T-sweep-intake-and-quarantine-stalls) ---------------
 #
-# A thread may be skipped only when we can show the conductor would reach the SAME stop it reached
-# last time. Two inputs decide that stop, not one:
+# The skip rule now lives inside scripts/head_skip_decide.py (module: head_skip.py). The wrapper's
+# only job is to feed the CLI a candidate batch (thread_id / head_msg_id / control_state), read
+# back the verdicts, and act on them. See Bohr msg-1430 §W-2 for the frozen contract; the key
+# points restated here (source-of-truth = the CLI):
 #
-#   1. the thread's head message — does the same handoff still sit at the end of the thread?
-#   2. the project's loop control state — does that handoff still ROUTE the same way?
-#
-# (2) is not redundant. At an unchanged head, a naysayer→implementer handoff stops at the human gate
-# under `hold`/`supervised` but dispatches the implementer under `run` (carve-out ③, conductor/
-# core.py). Keying the cache on the head alone therefore skips forever exactly the threads a release
-# from `hold` was meant to start, while the log reports a healthy `no thread moved … nothing to do`
-# at exit 0 — measured 2026-08-06, 15+ minutes, indistinguishable from an idle loop.
-#
-# Anything unknown ($null) fails OPEN into a launch: an unreadable control probe, a thread the head
-# probe did not report, a never-run thread, a pre-upgrade record. One cheap run beats a silent park,
-# which is the same stance the rest of this wrapper takes.
-function Test-CanSkip {
-    param([string]$ProbeHead, [string]$KnownHead, [string]$CurrentControl, [string]$KnownControl)
+#   - The CLI owns the state file at $headSkipStatePath. The wrapper does NOT read or write it.
+#   - The atomicity of the write, the "corrupt or missing → empty" recovery, and the head-body
+#     re-fetch on cache miss are all inside the CLI.
+#   - The wrapper calls in TWO PHASES: `--mode decide` once at the start of the tick over ALL
+#     the eligible candidates of one project (batch), then `--mode commit-launch` per candidate
+#     it actually chooses to spawn, BEFORE the spawn. LAUNCH verdicts the wrapper does not act
+#     on are left uncommitted — that is what prevents the "phantom-launched" starvation loop
+#     the CLI's docstring calls out.
+#   - Failure classification is two-layered (msg-1430 §W-3):
+#       * candidate-data errors (a body fetch that fails for a single thread) are handled INSIDE
+#         the CLI and returned as an UNRESOLVED-token LAUNCH — the wrapper does nothing.
+#       * SYSTEMIC failures (interpreter missing, decide.py itself crashes, output not parseable,
+#         non-zero exit) FAIL CLOSED: the wrapper `throw`s, the catch above sets $exitCode=1,
+#         and the tick aborts without persisting anything. Rationale: if `decide` is broken then
+#         `commit-launch` is broken too (same interpreter, same module), so a fail-open LAUNCH
+#         would spawn conductors without ever recording their launches — bypassing the backoff
+#         CAP entirely and reproducing the exponential-launch spiral #140 was written to fix.
+#         The cost of the fail-closed direction is that a persistently-broken decide silences
+#         every candidate at once — the digest's flooding starvation section is the signal.
 
-    if (-not $ProbeHead -or -not $KnownHead) { return $false }
-    if (-not $CurrentControl -or -not $KnownControl) { return $false }
-    return ($ProbeHead -eq $KnownHead) -and ($CurrentControl -eq $KnownControl)
+# Invoke `head_skip_decide.py --mode decide` for one project. Returns:
+#   @{
+#       ok       = $true / $false
+#       verdicts = @{ thread_id -> verdict-hashtable } on success, @{} on failure
+#       error    = $null on success, or a diagnostic string on failure
+#   }
+# A returned `ok=$false` is a SYSTEMIC failure — the caller must fail-closed on it (W-3 layer 2).
+function Invoke-HeadSkipDecide {
+    param(
+        [string]$Project,
+        [array]$Candidates,
+        [string]$StateFilePath,
+        [string]$Mode = 'decide'
+    )
+
+    $decideScript = Join-Path $repoRoot "scripts\head_skip_decide.py"
+    if (-not (Test-Path -LiteralPath $decideScript)) {
+        return @{ ok = $false; verdicts = @{}; error = "head_skip_decide.py not found at $decideScript" }
+    }
+
+    # Build the JSON array of candidates. Empty / null head_msg_id and control_state are legal —
+    # the CLI treats them as "unknown" and fails open in the fetch / progression checks.
+    $items = @()
+    foreach ($c in $Candidates) {
+        $hid = if ($null -ne $c.head_msg_id) { "$($c.head_msg_id)" } else { "" }
+        $ctl = if ($null -ne $c.control_state) { "$($c.control_state)" } else { "" }
+        $items += @{
+            thread_id     = "$($c.thread_id)"
+            head_msg_id   = $hid
+            control_state = $ctl
+        }
+    }
+    $payload = ConvertTo-Json -InputObject @($items) -Depth 4 -Compress
+
+    try {
+        Push-Location $repoRoot
+        try {
+            # Same invocation pattern as Invoke-HeadProbe / Invoke-ParkedHumansProbe: run under
+            # `uv run python` from the repo root so the module import resolves against this
+            # checkout. Reusing the same interpreter path is deliberate (msg-1430 §W-3 tail): if
+            # a future refactor needs a different python it needs to touch one place, not two,
+            # so there is never a version where `decide` and `commit-launch` disagree on runtime.
+            $raw = $payload | & uv run python $decideScript `
+                --project $Project --state-file $StateFilePath --mode $Mode 2>&1
+            $code = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+    }
+    catch {
+        return @{ ok = $false; verdicts = @{}; error = "head_skip decide invocation failed: $($_.Exception.Message)" }
+    }
+
+    if ($code -ne 0) {
+        $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
+        return @{ ok = $false; verdicts = @{}; error = "head_skip decide exited ${code}: $tail" }
+    }
+
+    $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+    if (-not $json) {
+        return @{ ok = $false; verdicts = @{}; error = "head_skip decide produced no JSON on stdout" }
+    }
+
+    try {
+        $obj = $json | ConvertFrom-Json
+    }
+    catch {
+        return @{ ok = $false; verdicts = @{}; error = "head_skip decide output not JSON: $($_.Exception.Message)" }
+    }
+
+    $verdictMap = @{}
+    if ($obj -and $obj.PSObject.Properties.Name -contains 'verdicts') {
+        foreach ($v in @($obj.verdicts)) {
+            $tid = "$($v.thread_id)"
+            if ($tid) { $verdictMap[$tid] = $v }
+        }
+    }
+    return @{ ok = $true; verdicts = $verdictMap; error = $null }
+}
+
+# Invoke `head_skip_decide.py --mode commit-launch --payload <payload>` for one thread. Returns:
+#   @{ ok = $true / $false; error = $null / diagnostic }
+# Called BEFORE spawning the conductor session for the chosen candidate — that is the
+# "session-start-before write" contract that survives a forced kill (head_skip.py docstring).
+function Invoke-HeadSkipCommitLaunch {
+    param(
+        $Payload,
+        [string]$StateFilePath
+    )
+
+    $decideScript = Join-Path $repoRoot "scripts\head_skip_decide.py"
+    if (-not (Test-Path -LiteralPath $decideScript)) {
+        return @{ ok = $false; error = "head_skip_decide.py not found at $decideScript" }
+    }
+    if ($null -eq $Payload) {
+        return @{ ok = $false; error = "commit-launch payload is null" }
+    }
+    $payloadJson = ConvertTo-Json -InputObject $Payload -Depth 6 -Compress
+
+    try {
+        Push-Location $repoRoot
+        try {
+            $raw = & uv run python $decideScript `
+                --state-file $StateFilePath --mode commit-launch --payload $payloadJson 2>&1
+            $code = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+    }
+    catch {
+        return @{ ok = $false; error = "head_skip commit-launch invocation failed: $($_.Exception.Message)" }
+    }
+    if ($code -ne 0) {
+        $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
+        return @{ ok = $false; error = "head_skip commit-launch exited ${code}: $tail" }
+    }
+    return @{ ok = $true; error = $null }
+}
+
+# Read the head-skip mode from the environment. Named after the CLI's REPORT_MODE_ENV constant
+# so a `git grep MINDWIRE_HEADSKIP_MODE` finds both sides. Values: "decide" (default) or
+# "report" (dry-run: the CLI computes verdicts but writes nothing on disk, and the wrapper does
+# not commit-launch or spawn — the operator's pre-wire measurement tool per msg-1430 §W-5).
+function Get-HeadSkipMode {
+    $m = $env:MINDWIRE_HEADSKIP_MODE
+    if (-not $m) { return 'decide' }
+    if ($m -eq 'report' -or $m -eq 'decide') { return $m }
+    Write-Log "MINDWIRE_HEADSKIP_MODE=$m is not a recognised mode; falling back to 'decide'"
+    return 'decide'
 }
 
 # --- quarantine ---------------------------------------------------------------------------------
 # A quarantined thread has failed at least once and will not be launched again by this wrapper until
 # a human clears it (deploy/Clear-Quarantine.ps1). Records live in <data_dir>/state/quarantine.json,
-# one entry per `project/thread_id`, alongside heads.json — separate writers, separate concerns; the
-# candidate filter reads both and ANDs the two out-decisions.
+# one entry per `project/thread_id`. The head-skip state file $headSkipStatePath is separate —
+# different owner (the CLI), different concern (nomination-predicate observation), different life
+# cycle. The candidate filter reads both and excludes a candidate that lands on either one.
 #
 # WHY THIS EXISTS AT ALL — the old wrapper broke the sweep on any non-zero exit. That fail-safe
 # stopped a real failure from being laundered into "everything idle" (right) but did it silently
@@ -1033,7 +1154,7 @@ function New-ComposerInputJson {
     return ($payload | ConvertTo-Json -Depth 6 -Compress)
 }
 
-# The pending-decisions cache. Same JSON shape as heads.json / notified.json, keyed by the sweep's
+# The pending-decisions cache. Same JSON shape as notified.json / evaluated.json, keyed by the sweep's
 # "project/thread_id" key. Rows carry {signature; envelope; cached_at}. On a corrupt file
 # Get-JsonState logs and returns an empty map — the composer will fire fresh, one signature at most
 # once per (project/thread_id, signature), so a lost cache costs at most one extra CLI call per
@@ -1588,17 +1709,78 @@ try {
         $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
     }
-    $headsState = Get-JsonState -Path $headsStatePath
     $quarantineState = Get-JsonState -Path $quarantineStatePath
     $evaluatedState = Get-JsonState -Path $evaluatedStatePath
     $digestState = Get-JsonState -Path $digestStatePath
     # Snapshot the keys present at sweep start. Used by Merge-StateForWrite at flush time to
     # distinguish "operator removed this during the sweep" (must not resurrect) from "sweep never
     # touched this" (already-agreed value, keep). See Merge-StateForWrite's header for the full
-    # contract.
+    # contract. Only quarantine.json needs this — the head-skip state file has a single writer
+    # (scripts/head_skip_decide.py) and is never edited by an operator during a sweep.
     $quarantineOriginalKeys = @($quarantineState.Keys)
-    $headsOriginalKeys = @($headsState.Keys)
     $nowUtc = [DateTime]::UtcNow
+
+    # --- head-skip decide batch (Bohr msg-1430 §W-2) --------------------------------------------
+    # One `--mode decide` invocation per project, over the candidates that have NOT already been
+    # excluded by hold / quarantine. Held projects (the ones the loop has acknowledged) do not
+    # need a decide at all — every candidate on them is dropped in the candidate loop below.
+    # Verdicts are collected into a single map keyed by the "$project/$thread_id" sweep key so
+    # the candidate loop can look one up without knowing which project it came from.
+    #
+    # W-3 layer 2: an `ok=$false` return is a SYSTEMIC failure (interpreter missing, decide
+    # crashed, output not JSON). It THROWS out of the try{} above, which lands in the wrapper's
+    # top-level catch → $exitCode=1 → tick aborts with no state writes. If `decide` is broken,
+    # `commit-launch` is broken too (same interpreter, same module), and spawning a conductor
+    # anyway would launch without recording — bypassing backoff entirely.
+    #
+    # W-2c: every candidate that got a decide verdict this tick (LAUNCH / DEFER / SKIP) is
+    # counted as an evaluation for the starvation clock. Refreshed in a dedicated pass below,
+    # before the launch loop, so a candidate that we then choose NOT to spawn (a DEFER, or a
+    # LAUNCH-verdict candidate that arrives after the tick's first LAUNCH) still has its clock
+    # updated. Without W-2c, the new SKIP verdicts (stop-token = human / none) would be
+    # structurally invisible to the starvation metric and re-play msg-1427 §1's 12-hour silence
+    # on the metric layer.
+    $headSkipMode = Get-HeadSkipMode
+    $decideVerdicts = @{}
+    foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
+        $projControl = $controlByProject[$proj]
+        if (Test-HoldObserved -Control $projControl) { continue }
+        $projHeads = $headsByProject[$proj]
+        $projCands = @($candidates | Where-Object { $_.project -eq $proj })
+        # Exclude anything already quarantined — the wrapper does not launch it either way, and
+        # asking `decide` about it would mint an observation-only record for a thread we will
+        # not launch. Better to leave the CLI's state untouched for a thread we are not driving.
+        $eligible = @()
+        foreach ($c in $projCands) {
+            if ($quarantineState.ContainsKey($c.key)) { continue }
+            $hid = if ($null -ne $projHeads -and $projHeads.ContainsKey($c.thread_id)) { "$($projHeads[$c.thread_id])" } else { "" }
+            $ctl = if ($null -ne $projControl) { "$($projControl.desired_state)" } else { "" }
+            $eligible += @{ thread_id = $c.thread_id; head_msg_id = $hid; control_state = $ctl }
+        }
+        if ($eligible.Count -eq 0) { continue }
+        $decideResult = Invoke-HeadSkipDecide -Project $proj -Candidates $eligible `
+            -StateFilePath $headSkipStatePath -Mode $headSkipMode
+        if (-not $decideResult.ok) {
+            # W-3 layer 2 — fail closed. Any non-zero exit / crash / parse failure lands here.
+            Confirm-LogWorthKeeping
+            Write-Log "head_skip decide FAILED for project $proj — $($decideResult.error)"
+            throw ("head_skip decide systemic failure on project '$proj': $($decideResult.error). " +
+                   "The tick is aborted (fail-closed per Bohr msg-1430 §W-3): a broken decide " +
+                   "implies a broken commit-launch, and launching conductors without recording " +
+                   "them would bypass the backoff CAP.")
+        }
+        foreach ($tid in $decideResult.verdicts.Keys) {
+            $decideVerdicts["$proj/$tid"] = $decideResult.verdicts[$tid]
+        }
+    }
+
+    # W-2c: refresh the starvation clock for every candidate that received a decide verdict.
+    # See Update-EvaluatedTimestamp's header for the full "which dispositions count as evaluated"
+    # rule. Doing this BEFORE the launch loop guarantees a DEFER'd or SKIPped candidate cannot
+    # slip through — even if a break earlier in the loop stops the sweep short.
+    foreach ($k in $decideVerdicts.Keys) {
+        Update-EvaluatedTimestamp -State $evaluatedState -Key $k -Now $nowUtc
+    }
 
     # Age-driven state transitions on quarantine entries. Run BEFORE the candidate loop so the
     # transition notification fires even on ticks where nothing else happens (an escalated thread is
@@ -1719,36 +1901,77 @@ try {
 
         $heads = $headsByProject[$cand.project]
         $probeHead = if ($null -ne $heads -and $heads.ContainsKey($thread)) { $heads[$thread] } else { $null }
-        $record = Get-HeadRecord -State $headsState -Key $cand.key
-        $knownHead = $record.head
-        $knownControl = $record.control
         # $null when the control probe could not read the state — unknown, so nothing is skipped.
         $currentControl = if ($null -ne $control) { $control.desired_state } else { $null }
 
-        # The whole point: same head AND same routing means the conductor would resolve the same
-        # handoff and reach the same stop, so do not pay for the launch. See Test-CanSkip for why
-        # both halves are load-bearing and why every unknown fails open.
-        if (Test-CanSkip -ProbeHead $probeHead -KnownHead $knownHead `
-                         -CurrentControl $currentControl -KnownControl $knownControl) {
+        # --- head-skip nomination-predicate verdict lookup (Bohr msg-1430 §W-2) ------------------
+        # The batch decide call above populated $decideVerdicts for every non-held, non-quarantined
+        # candidate. Its verdict per key is the sole authority for LAUNCH / DEFER / SKIP; the
+        # old Test-CanSkip is gone. See head_skip.py for the two-stage judgment (Stage 1 =
+        # stop tokens {none, human} → SKIP; Stage 2 = LAUNCH or DEFER, never SKIP).
+        $v = if ($decideVerdicts.ContainsKey($cand.key)) { $decideVerdicts[$cand.key] } else { $null }
+        if ($null -eq $v) {
+            # No verdict for a candidate that was not held / quarantined is a wiring bug —
+            # decide's contract is: every eligible candidate we sent, we receive a verdict for.
+            # Fail closed rather than silently launch (which would bypass backoff on subsequent
+            # ticks: no verdict this tick means no commit-launch, so the record is missing for
+            # the next).
+            throw "head_skip decide returned no verdict for $($cand.key) — sweep aborted (contract violation)"
+        }
+        $decision = "$($v.decision)"
+
+        if ($decision -eq 'skip') {
             $skipped++
             $dispositions[$cand.key] = 'head-skipped'
             $sweepSignature += "$($cand.key)=$probeHead"
-            # Refresh the starvation clock — a head-skip IS an evaluation. See
-            # Update-EvaluatedTimestamp for why. Without this, a legitimately-idle thread over a
-            # weekend would flag as starved on Monday and flood the digest with healthy threads.
-            Update-EvaluatedTimestamp -State $evaluatedState -Key $cand.key -Now $nowUtc
-            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head unchanged ($probeHead, control $currentControl), not launching"
+            # No Update-EvaluatedTimestamp here — the batch pass above (W-2c) already refreshed
+            # every decide-visited candidate's clock. Repeating it would be a no-op but the
+            # duplication would be a lie: it would suggest the refresh depends on the disposition,
+            # which is the exact confusion the batch refresh exists to end.
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head_skip SKIP (stop-token: $($v.token), head $probeHead), not launching"
+            continue
+        }
+        if ($decision -eq 'defer') {
+            $skipped++     # counted as "skipped" for the summary — same operator meaning: "not launching this tick"
+            $dispositions[$cand.key] = 'head-deferred'
+            # No Update-EvaluatedTimestamp for the same reason as SKIP above (W-2c batch refresh).
+            $delaySec = if ($v.PSObject.Properties.Name -contains 'delay_seconds') { [int]$v.delay_seconds } else { 0 }
+            $eligibleAt = if ($v.PSObject.Properties.Name -contains 'eligible_at') { $v.eligible_at } else { '' }
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head_skip DEFER (attempts=$($v.attempts_before), delay=${delaySec}s, eligible_at=$eligibleAt), not launching"
+            continue
+        }
+        # decision must be 'launch' — anything else is a contract violation.
+        if ($decision -ne 'launch') {
+            throw "head_skip decide returned unexpected decision '$decision' for $($cand.key)"
+        }
+        # Report mode: dry-run. The CLI touched no state, so we must not commit-launch or spawn.
+        # This is how an operator measures "what would come out of a wire commit" per msg-1430 §W-5.
+        if ($headSkipMode -eq 'report') {
+            $dispositions[$cand.key] = 'report-launch'
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head_skip LAUNCH (report mode: not spawning, token=$($v.token))"
             continue
         }
 
         Confirm-LogWorthKeeping
-        $why = if (-not $probeHead) { "head unknown (probe gap) — failing open" }
-               elseif (-not $knownHead) { "no recorded head yet" }
-               elseif ($probeHead -ne $knownHead) { "head moved $knownHead -> $probeHead" }
-               elseif (-not $currentControl) { "control unknown (probe gap) — failing open" }
-               elseif (-not $knownControl) { "head $probeHead recorded before control was tracked — re-running once" }
-               else { "control changed $knownControl -> $currentControl at head $probeHead — same head can route differently" }
-        Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) ($why) ---"
+        Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) (head_skip LAUNCH, reason=$($v.reason), token=$($v.token)) ---"
+        # commit-launch BEFORE spawn: the "session-start-before write" contract that survives a
+        # forced kill (head_skip.py docstring, test #10). The record is written with
+        # attempts_after=v.attempts_after so the backoff floor applies to any retry, even one after
+        # a mid-flight OS-level kill.
+        $commitPayload = if ($v.PSObject.Properties.Name -contains 'commit_launch_payload') { $v.commit_launch_payload } else { $null }
+        if ($null -eq $commitPayload) {
+            throw "head_skip decide returned a LAUNCH verdict without a commit_launch_payload for $($cand.key)"
+        }
+        $commitResult = Invoke-HeadSkipCommitLaunch -Payload $commitPayload -StateFilePath $headSkipStatePath
+        if (-not $commitResult.ok) {
+            # Systemic failure of the same class as decide fail-close: if commit-launch is broken
+            # then decide is broken too, so we must abort the tick rather than spawn a conductor
+            # that will not be recorded.
+            Write-Log "head_skip commit-launch FAILED for $($cand.key) — $($commitResult.error)"
+            throw ("head_skip commit-launch systemic failure on $($cand.key): $($commitResult.error). " +
+                   "The tick is aborted (fail-closed per Bohr msg-1430 §W-3).")
+        }
+
         # All three must move together: the daemon reads the thread from [conductor] but the project
         # and the implementer's clone from [loop], so a stale [loop] would drive the right thread
         # against the wrong repo.
@@ -1767,12 +1990,9 @@ try {
         }
         Write-Log "$($cand.key) -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"
 
-        # An actual evaluation happened — reset the starvation clock for this thread. Any launched
-        # verdict counts, even a non-zero exit: it still tells us the thread was tried this tick,
-        # which is the metric's meaning ("how long since I actually reached this candidate?").
-        # See Update-EvaluatedTimestamp for the full contract (which dispositions refresh, which do
-        # not, and why); first_seen_at is preserved by the helper.
-        Update-EvaluatedTimestamp -State $evaluatedState -Key $cand.key -Now $nowUtc
+        # Note: the batch W-2c refresh above already advanced the starvation clock for every
+        # decide-visited candidate (including this one), so there is no per-launch refresh here.
+        # first_seen_at is preserved by Update-EvaluatedTimestamp.
 
         # NON-ZERO EXIT — quarantine, notify, keep going. The old wrapper broke the sweep here
         # (silent), which was the exact failure mode of the 2026-08-11 5h starvation on threads
@@ -1836,12 +2056,12 @@ try {
             break
         }
 
-        # Record the state this head was reached under, not just the head. Written even when
-        # $currentControl is $null (an unreadable probe): storing the unknown keeps the next tick
-        # failing open rather than silently inheriting a state nobody confirmed.
-        if ($verdict.last_msg) {
-            $headsState[$cand.key] = @{ head = $verdict.last_msg; control = $currentControl }
-        }
+        # The head-skip state file (state\head_skip.json) is written exclusively by the CLI's
+        # `--mode commit-launch` call above — the wrapper does NOT double-write it here. Under the
+        # new predicate a candidate's launch record is committed BEFORE spawn (and only for
+        # candidates the wrapper actually chose to spawn); a "phantom-launched" record for a
+        # candidate we did not act on would reproduce the exponential-starvation loop #140 was
+        # written to fix. See head_skip_decide.py's docstring for the two-phase protocol.
         $sweepSignature += "$($cand.key)=$($verdict.last_msg)"
 
         if ($verdict.reason -and $needsHuman.ContainsKey($verdict.reason)) {
@@ -1893,14 +2113,13 @@ try {
     }
     Write-Log ("dispositions: " + (($dispositions.Keys | Sort-Object | ForEach-Object { "$($_)=$($dispositions[$_])" }) -join ', '))
 
-    # Merge-on-write for the two files an operator may edit concurrently (heads.json and
-    # quarantine.json). The merge re-reads disk right before writing, so a mid-sweep
-    # Clear-Quarantine survives the sweep's end-of-tick flush. See Merge-StateForWrite's header.
-    # evaluated.json is written directly — it has no external writer, and the sweep prunes ex-live
-    # keys on it every tick (merge-on-write would resurrect those pruned keys from disk).
-    $mergedHeads = Merge-StateForWrite -Memory $headsState `
-        -OriginalKeys $headsOriginalKeys -DiskPath $headsStatePath
-    Save-JsonState -Path $headsStatePath -State $mergedHeads
+    # Merge-on-write for quarantine.json — the one state file an operator may edit concurrently
+    # with the sweep (via Clear-Quarantine). The merge re-reads disk right before writing, so a
+    # mid-sweep Clear-Quarantine survives the sweep's end-of-tick flush. See Merge-StateForWrite's
+    # header. evaluated.json is written directly — it has no external writer, and the sweep prunes
+    # ex-live keys on it every tick (merge-on-write would resurrect those pruned keys from disk).
+    # head_skip.json is not written here at all — its only writer is scripts/head_skip_decide.py
+    # (owned atomicity per msg-1430 §W-2), so any concurrency question is answered on the CLI side.
     $mergedQuarantine = Merge-StateForWrite -Memory $quarantineState `
         -OriginalKeys $quarantineOriginalKeys -DiskPath $quarantineStatePath
     Save-JsonState -Path $quarantineStatePath -State $mergedQuarantine

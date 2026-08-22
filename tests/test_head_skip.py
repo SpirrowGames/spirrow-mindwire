@@ -1497,3 +1497,60 @@ def test_backoff_defer_still_defers_when_within_delay_window() -> None:
     assert v.decision is Decision.DEFER
     assert v.progressed is False
     assert v.delay == BASE
+
+
+# --- W-4: head_msg_id is audit-only, never consulted by decide -----------------------------------
+
+
+def test_head_msg_id_is_audit_only_and_never_changes_the_verdict() -> None:
+    """Same (``head_body``, ``control_state``, ``record``) with a different ``head_msg_id``
+    → identical verdict.
+
+    ``head_skip.py`` module docstring: "Head msg-id changes ALONE do NOT count as progress …
+    The head msg-id is still recorded (``head_msg_id_at_launch``) for **audit only**; **it is
+    never consulted by** :func:`decide`." That claim is guarded by tests #2, #5 and #13 today,
+    but each pins it on a specific scenario (stop-token / spin / null-record). None of them
+    would fail if a future refactor added an ``if head_msg_id != record.head_msg_id_at_launch:
+    return LAUNCH`` branch to the Stage-2 progressed check — the closed-set invariant it exists
+    to pin has no witness pointing at the audit-only property directly.
+
+    This test is that witness. It runs ``decide`` twice with identical inputs *except* the
+    ``head_msg_id`` value, and asserts the two verdicts are field-for-field equal — including
+    ``decision``, ``reason``, ``progressed``, ``attempts_after`` and ``delay``. W-4 pin
+    (Bohr msg-1428 §W-4, msg-1430 §W-4).
+    """
+    now = _T0
+    rec = Record(
+        last_launch_at=now - timedelta(minutes=1),
+        nomination_at_launch="bohr",
+        control_at_launch="run",
+        head_msg_id_at_launch="msg-1",
+        launch_attempts=1,
+        head_observed_at=now - timedelta(minutes=1),
+        last_observed_head_msg_id="msg-1",
+        last_observed_nomination="bohr",
+    )
+    body = _body("Bohr")
+    control = "run"
+
+    v_a = decide(
+        now=now,
+        head_msg_id="msg-1",
+        head_body=body,
+        control_state=control,
+        record=rec,
+    )
+    v_b = decide(
+        now=now,
+        head_msg_id="msg-42-completely-different",
+        head_body=body,
+        control_state=control,
+        record=rec,
+    )
+
+    assert v_a == v_b, (
+        "head_msg_id must be audit-only: two decide() calls that differ only in head_msg_id "
+        "must return field-for-field identical verdicts. If this fails, a code change has made "
+        "the decision depend on head_msg_id — that reverts the spec-degeneracy fix this module "
+        "was written for (head moves, nomination + control unchanged = LAUNCH forever)."
+    )
