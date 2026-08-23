@@ -25,8 +25,16 @@
 # adding a new StopReason to conductor/core.py without updating this map a LOUD failure at
 # the notification surface instead of a silent regression back to "判断待ち" — the whole
 # problem this file exists to end.
-
-$ErrorActionPreference = 'Stop'
+#
+# NO TOP-LEVEL SIDE EFFECTS: this file is dot-sourced by both the runner and the tests, so
+# any assignment at script scope here would mutate the caller's scope. Do NOT set
+# $ErrorActionPreference here (PR-gate finding on #172): the runner already declares its own
+# preference at deploy/run-conductor-scheduled.ps1 L58, tests declare theirs at the top of
+# each test file, and the functions below use only hashtable lookups and string concatenation
+# — operations whose failure modes are already terminating regardless of the preference.
+# If a future function here ever adds a non-terminating call that MUST hard-fail, wrap that
+# call in its own `try / catch { throw }` scoped to the function body, do not lift the
+# preference into script scope.
 
 function Get-StopReasonPhraseMap {
     # KEY SET = the sweep's notification predicate (see file header note 1).

@@ -33,9 +33,22 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $libPath = Join-Path $repoRoot 'deploy/lib/StopReason.ps1'
 if (-not (Test-Path -LiteralPath $libPath)) { throw "StopReason.ps1 not found: $libPath" }
 
+# --- PR-gate #172 regression pin: dot-sourcing the lib MUST NOT mutate caller scope ------
+# PR-gate flagged an earlier revision that set `$ErrorActionPreference = 'Stop'` at script
+# scope inside deploy/lib/StopReason.ps1, which is a side effect of dot-sourcing — it
+# overwrites the caller's preference silently. The lib is documented as pure. Pin the
+# invariant here by measuring $ErrorActionPreference BEFORE and AFTER the dot-source and
+# asserting it is unchanged, with the caller's preference deliberately set to a NON-Stop
+# value so a re-added `$ErrorActionPreference = 'Stop'` in the lib would flip it and fail.
+$prevErrorAction = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$eapBefore = $ErrorActionPreference
+. $libPath
+$eapAfter = $ErrorActionPreference
+$ErrorActionPreference = $prevErrorAction   # restore for the rest of the test
+
 # The library is a pure-function file — dot-sourcing it has no side effects (unlike
 # run-conductor-scheduled.ps1, which launches a sweep on load).
-. $libPath
 
 $script:failures = 0
 function Check {
@@ -54,6 +67,13 @@ function CheckTrue {
     $script:failures++
     Write-Host ('  FAIL  {0}{1}' -f $Name, $(if ($Detail) { " — $Detail" } else { '' }))
 }
+
+# ---------------------------------------------------------------------------------------
+# PR-gate #172 regression pin (measured above): the dot-source did not mutate the
+# caller's $ErrorActionPreference. Reported here so a failure is a clearly-named check.
+# ---------------------------------------------------------------------------------------
+Write-Host 'PR-gate #172 regression — dot-sourcing deploy/lib/StopReason.ps1 does not mutate $ErrorActionPreference'
+Check 'caller $ErrorActionPreference is unchanged after dot-source' $eapBefore $eapAfter
 
 # ---------------------------------------------------------------------------------------
 # Preconditions on the map itself — the tests below trust these.
