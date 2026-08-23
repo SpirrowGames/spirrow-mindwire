@@ -37,6 +37,14 @@ function Write-Log { param([string]$Message) }
 # lifted functions callable without dragging in the whole logging module.
 function Confirm-LogWorthKeeping { }
 
+# The wrapper dot-sources deploy/lib/StopReason.ps1 at load time — Format-DecisionMessage calls
+# New-NotificationHeader from that file. Pull it in here BEFORE we AST-lift the wrapper's
+# functions so the lifted body's call resolves. Safe to dot-source directly: the lib is pure
+# functions, no side effects (unlike run-conductor-scheduled.ps1 itself).
+$stopReasonLib = Join-Path $repoRoot 'deploy/lib/StopReason.ps1'
+if (-not (Test-Path -LiteralPath $stopReasonLib)) { throw "StopReason lib not found: $stopReasonLib" }
+. $stopReasonLib
+
 # Bring in the exact functions the sweep uses. Dot-sourcing would launch the sweep; parsing the
 # AST and invoking just the function definitions keeps this test hermetic.
 $functions = $ast.FindAll(

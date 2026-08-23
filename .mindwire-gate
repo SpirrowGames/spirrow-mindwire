@@ -16,4 +16,5 @@ pwsh -NoProfile -File tests/Test-SweepQuarantine.ps1
 pwsh -NoProfile -File tests/Test-ClearQuarantine.ps1
 pwsh -NoProfile -File tests/Test-SyncRepo.ps1
 pwsh -NoProfile -File tests/Test-DecisionComposerWiring.ps1
+pwsh -NoProfile -File tests/Test-StopReasonPhrase.ps1
 uv run pytest
