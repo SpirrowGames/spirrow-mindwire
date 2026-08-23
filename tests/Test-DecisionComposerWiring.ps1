@@ -56,6 +56,7 @@ $needed = @(
     'Format-DurationDigest',
     'ConvertTo-UtcInstant',
     # T-decision-material-push (msg-1445 §W-2 / §W-3): the material-push wiring.
+    'Get-EnvelopeField',
     'New-DecisionLink',
     'New-MaterialUrl',
     'Get-ComposerReadHead',
@@ -545,7 +546,38 @@ function Reset-MaterialSpy {
     $script:callOrder.Clear()
 }
 
+# --- Get-EnvelopeField — duck-types every shape production or tests can build ------------------
+# Regression pin for PR #171 pre-merge review: `.PSObject.Properties.Name` on a hashtable returns
+# the hashtable OBJECT's properties (Count / Keys / …), NOT its stored keys. Any reader that
+# forgot to branch on IDictionary would silently drop every material field for a hashtable
+# envelope. Get-EnvelopeField is the one place that branch lives; every caller in
+# Push-DecisionMaterial / Get-ComposerReadHead goes through it.
+Write-Host 'Get-EnvelopeField — duck-types hashtable, ordered dict, and PSCustomObject'
+$dictHash = @{ question = 'q?'; options = @(1, 2, 3) }
+Check 'hashtable: existing key' 'q?' (Get-EnvelopeField -Object $dictHash -Name 'question')
+CheckTrue 'hashtable: missing key -> $null' ($null -eq (Get-EnvelopeField -Object $dictHash -Name 'nope'))
+Check 'hashtable: value that is a null still returned as null (absent-vs-null)' `
+    3 ((Get-EnvelopeField -Object $dictHash -Name 'options').Count)
+
+$dictOrdered = [ordered]@{ question = 'q?'; head_msg_id = 'msg-1' }
+Check 'ordered dict: existing key' 'msg-1' (Get-EnvelopeField -Object $dictOrdered -Name 'head_msg_id')
+CheckTrue 'ordered dict: missing key -> $null' ($null -eq (Get-EnvelopeField -Object $dictOrdered -Name 'nope'))
+
+$pso = [PSCustomObject]@{ question = 'q?'; extras = [PSCustomObject]@{ head_msg_id_read = 'msg-42' } }
+Check 'PSCustomObject: existing property' 'q?' (Get-EnvelopeField -Object $pso -Name 'question')
+Check 'PSCustomObject: nested property (via caller)' 'msg-42' `
+    (Get-EnvelopeField -Object (Get-EnvelopeField -Object $pso -Name 'extras') -Name 'head_msg_id_read')
+CheckTrue 'null object -> $null (no crash)' ($null -eq (Get-EnvelopeField -Object $null -Name 'question'))
+
+# The specific regression: a hashtable's `.PSObject.Properties.Name` includes Count / Keys / …
+# NOT its stored keys. Get-EnvelopeField must NOT return anything for those.
+CheckTrue 'hashtable: PSObject property name (Count) is NOT confused for a stored key' `
+    ($null -eq (Get-EnvelopeField -Object $dictHash -Name 'Count'))
+CheckTrue 'hashtable: PSObject property name (Keys) is NOT confused for a stored key' `
+    ($null -eq (Get-EnvelopeField -Object $dictHash -Name 'Keys'))
+
 # --- URL builders share base + encoding (I-17 pin below the caller layer) ----------------------
+Write-Host ''
 Write-Host 'New-DecisionLink / New-MaterialUrl — share base URL and percent-encoding'
 $link = New-DecisionLink -Project 'p 1' -ThreadId 'T/a?x'
 $mUrl = New-MaterialUrl -Project 'p 1' -ThreadId 'T/a?x'
@@ -740,6 +772,69 @@ Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
     -StopReason 'human' -Rounds 2 -RawFallback 'raw ping'
 Check 'no head_msg_id_read: PUT was NOT called (fallback to last_msg_id is forbidden)' 0 $script:materialCallCount
 Check 'no head_msg_id_read: notification still fired' 1 $script:notificationCallCount
+
+# ---------- regression: hashtable envelope + hashtable output + hashtable options -------------
+# PR #171 pre-merge review flagged this specific hole: an earlier version of Push-DecisionMaterial
+# duck-typed the ENVELOPE but not the OUTPUT or the OPTION elements, so a hashtable-authored
+# envelope (or a future refactor that switched the cache shape) would ship a PUT body carrying
+# only { head_msg_id, signature, composer_status } and silently drop question / options /
+# recommendation / gain / loss / unknowns.
+#
+# Pin: with an all-hashtable envelope, every material field appears in the PUT body byte-identical
+# to the equivalent PSCustomObject envelope.
+Write-Host ''
+Write-Host 'Send-HumanParkAlert — hashtable envelope + hashtable output + hashtable options: all fields survive to the PUT body'
+$hashOptions = @(
+    @{ id = 'A'; label = 'first';  gain = 'gain-A'; loss = 'loss-A' },
+    @{ id = 'B'; label = 'second'; gain = 'gain-B'; loss = 'loss-B' }
+)
+$hashOutput = @{
+    question              = 'H: Adopt A or B?'
+    options               = $hashOptions
+    recommendation        = 'A'
+    recommendation_reason = 'because reasons'
+    unknowns              = @('unk-h1', 'unk-h2')
+}
+$hashEnvelope = @{
+    composer_status = 'ok'
+    signature       = 'human:msg-h1'
+    extras          = @{ head_msg_id_read = 'msg-hhh'; tail_count = '3' }
+    output          = $hashOutput
+}
+
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $hashEnvelope; error = $null }
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-hash' -Project 'p' -ThreadId 'T-hash' `
+    -Signature 'human:msg-h1' -LastMsgId 'msg-hhh' `
+    -StopReason 'human' -Rounds 3 -RawFallback 'raw ping'
+
+Check 'hashtable envelope: PUT fired once (composer_status=ok read correctly)' 1 $script:materialCallCount
+Check 'hashtable envelope: notification fired once' 1 $script:notificationCallCount
+
+$sentBody = $script:materialLastCall.BodyJson | ConvertFrom-Json
+Check 'hashtable envelope: head_msg_id survives' 'msg-hhh' $sentBody.head_msg_id
+Check 'hashtable envelope: question survives (was silently dropped before the fix)' `
+    'H: Adopt A or B?' $sentBody.question
+Check 'hashtable envelope: recommendation survives' 'A' $sentBody.recommendation
+Check 'hashtable envelope: recommendation_reason survives' 'because reasons' $sentBody.recommendation_reason
+CheckTrue 'hashtable envelope: unknowns is a 2-element array' `
+    (@($sentBody.unknowns).Count -eq 2) `
+    ("unknowns=" + ($sentBody.unknowns | ConvertTo-Json -Compress))
+CheckTrue 'hashtable envelope: options is a 2-element array' `
+    (@($sentBody.options).Count -eq 2) `
+    ("options.Count=" + @($sentBody.options).Count)
+Check 'hashtable envelope: options[0].id survives' 'A' @($sentBody.options)[0].id
+Check 'hashtable envelope: options[0].label survives' 'first' @($sentBody.options)[0].label
+Check 'hashtable envelope: options[0].gain survives (was defaulted to "" before the fix)' `
+    'gain-A' @($sentBody.options)[0].gain
+Check 'hashtable envelope: options[0].loss survives (was defaulted to "" before the fix)' `
+    'loss-A' @($sentBody.options)[0].loss
+Check 'hashtable envelope: options[1].gain survives' 'gain-B' @($sentBody.options)[1].gain
+Check 'hashtable envelope: options[1].loss survives' 'loss-B' @($sentBody.options)[1].loss
 
 # ---------- (e) I-17: PUT URL and link body share {project}/{thread_id} -----------------------
 Write-Host ''

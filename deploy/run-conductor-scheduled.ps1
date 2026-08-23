@@ -1143,6 +1143,28 @@ function Invoke-MaterialPut {
     }
 }
 
+# Read one named field off an envelope-shaped object, returning $null on absence. Handles BOTH the
+# JSON-loaded shape (PSCustomObject; all wrapper-facing production envelopes come from
+# `ConvertFrom-Json` in Invoke-ComposerCli) AND the freshly-written / test-authored shape
+# (hashtable or [ordered]@{}). The two shapes are exchangeable in the sweep — a value written into
+# a state map as a hashtable and later re-read from disk comes back as a PSCustomObject — so any
+# reader that only understands one of them silently drops fields for the other. That drop is exactly
+# the bug PR #171 pre-merge review flagged: `.PSObject.Properties.Name` on a hashtable returns
+# ["Count","IsFixedSize","IsReadOnly","Keys","SyncRoot",…] (properties of the hashtable OBJECT, not
+# its keys), so a `-contains 'question'` check on a hashtable envelope returns $false and the PUT
+# body ships without the material fields. `IDictionary` covers both `[hashtable]` and
+# `[System.Collections.Specialized.OrderedDictionary]` (`[ordered]@{}`).
+function Get-EnvelopeField {
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $null
+    }
+    if ($Object.PSObject.Properties.Name -contains $Name) { return $Object.$Name }
+    return $null
+}
+
 # Extract the head msg id the composer *actually read* (see cli.py: `extras.head_msg_id_read`).
 # Duck-types both the freshly-written hashtable shape and the JSON-loaded PSCustomObject shape,
 # same as Get-CachedDecision.
@@ -1153,22 +1175,8 @@ function Invoke-MaterialPut {
 # read" would defeat the receiver's freshness check.
 function Get-ComposerReadHead {
     param($Envelope)
-    if ($null -eq $Envelope) { return $null }
-    $extras = $null
-    if ($Envelope -is [hashtable]) {
-        $extras = $Envelope['extras']
-    }
-    else {
-        if ($Envelope.PSObject.Properties.Name -contains 'extras') { $extras = $Envelope.extras }
-    }
-    if ($null -eq $extras) { return $null }
-    $val = $null
-    if ($extras -is [hashtable]) {
-        if ($extras.ContainsKey('head_msg_id_read')) { $val = $extras['head_msg_id_read'] }
-    }
-    else {
-        if ($extras.PSObject.Properties.Name -contains 'head_msg_id_read') { $val = $extras.head_msg_id_read }
-    }
+    $extras = Get-EnvelopeField -Object $Envelope -Name 'extras'
+    $val = Get-EnvelopeField -Object $extras -Name 'head_msg_id_read'
     if (-not $val) { return $null }
     return "$val"
 }
@@ -1208,13 +1216,13 @@ function Push-DecisionMaterial {
         return $null
     }
 
-    $status = $null
-    if ($Envelope -is [hashtable]) {
-        if ($Envelope.ContainsKey('composer_status')) { $status = "$($Envelope['composer_status'])" }
-    }
-    else {
-        if ($Envelope.PSObject.Properties.Name -contains 'composer_status') { $status = "$($Envelope.composer_status)" }
-    }
+    # Every field access below goes through Get-EnvelopeField so a hashtable envelope (from a
+    # freshly-written cache row) is read identically to a PSCustomObject envelope (from a JSON
+    # round-trip). Reading these with `.PSObject.Properties.Name` on a hashtable silently returns
+    # $false for every material key — PR #171 pre-merge review flagged exactly that regression on
+    # this function's earlier version.
+    $status = Get-EnvelopeField -Object $Envelope -Name 'composer_status'
+    $status = if ($null -ne $status) { "$status" } else { $null }
     # DM-6: magickit's S5 slice §1.3 says a `composer_status != "ok"` PUT is rejected with 400 and
     # no partial save. Sending it produces a guaranteed 400 that does nothing useful. Skip cleanly.
     if ($status -and $status -ne 'ok') {
@@ -1235,13 +1243,7 @@ function Push-DecisionMaterial {
 
     # Build the PUT body. Follows magickit's S5 slice §1.1 field table verbatim. All fields except
     # head_msg_id are optional; we send whatever the envelope carries.
-    $output = $null
-    if ($Envelope -is [hashtable]) {
-        if ($Envelope.ContainsKey('output')) { $output = $Envelope['output'] }
-    }
-    else {
-        if ($Envelope.PSObject.Properties.Name -contains 'output') { $output = $Envelope.output }
-    }
+    $output = Get-EnvelopeField -Object $Envelope -Name 'output'
 
     $body = [ordered]@{
         head_msg_id     = $head
@@ -1249,25 +1251,30 @@ function Push-DecisionMaterial {
         composer_status = 'ok'
     }
     if ($null -ne $output) {
-        $question = $null
-        $options = @()
-        $recommendation = $null
-        $recommendationReason = $null
-        $unknowns = @()
-        if ($output.PSObject.Properties.Name -contains 'question') { $question = $output.question }
-        if ($output.PSObject.Properties.Name -contains 'options' -and $null -ne $output.options) { $options = @($output.options) }
-        if ($output.PSObject.Properties.Name -contains 'recommendation') { $recommendation = $output.recommendation }
-        if ($output.PSObject.Properties.Name -contains 'recommendation_reason') { $recommendationReason = $output.recommendation_reason }
-        if ($output.PSObject.Properties.Name -contains 'unknowns' -and $null -ne $output.unknowns) { $unknowns = @($output.unknowns) }
+        $question             = Get-EnvelopeField -Object $output -Name 'question'
+        $rawOptions           = Get-EnvelopeField -Object $output -Name 'options'
+        $recommendation       = Get-EnvelopeField -Object $output -Name 'recommendation'
+        $recommendationReason = Get-EnvelopeField -Object $output -Name 'recommendation_reason'
+        $rawUnknowns          = Get-EnvelopeField -Object $output -Name 'unknowns'
+
+        $options = if ($null -eq $rawOptions) { @() } else { @($rawOptions) }
+        $unknowns = if ($null -eq $rawUnknowns) { @() } else { @($rawUnknowns) }
 
         if ($question) { $body['question'] = "$question" }
         if ($options.Count -gt 0) {
             $body['options'] = @($options | ForEach-Object {
+                # Same duck-typing dance for each option element — a hashtable-authored envelope
+                # will have hashtable options too, and stripping gain / loss to '' silently would
+                # let J-fresh render option cards without the trade-off text the operator needs.
+                $optId    = Get-EnvelopeField -Object $_ -Name 'id'
+                $optLabel = Get-EnvelopeField -Object $_ -Name 'label'
+                $optGain  = Get-EnvelopeField -Object $_ -Name 'gain'
+                $optLoss  = Get-EnvelopeField -Object $_ -Name 'loss'
                 [ordered]@{
-                    id    = "$($_.id)"
-                    label = "$($_.label)"
-                    gain  = if ($_.PSObject.Properties.Name -contains 'gain' -and $null -ne $_.gain) { "$($_.gain)" } else { '' }
-                    loss  = if ($_.PSObject.Properties.Name -contains 'loss' -and $null -ne $_.loss) { "$($_.loss)" } else { '' }
+                    id    = "$optId"
+                    label = "$optLabel"
+                    gain  = if ($null -ne $optGain) { "$optGain" } else { '' }
+                    loss  = if ($null -ne $optLoss) { "$optLoss" } else { '' }
                 }
             })
         }
