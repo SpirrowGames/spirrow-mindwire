@@ -1245,56 +1245,70 @@ function Push-DecisionMaterial {
     # head_msg_id are optional; we send whatever the envelope carries.
     $output = Get-EnvelopeField -Object $Envelope -Name 'output'
 
+    # DM-6 second half (msg-1445 §DM-6): "composer_status != ok / output 無しには PUT しない".
+    # The Python-side value-object validator refuses to construct a DecisionRequestEnvelope with
+    # composer_status=ok AND output=None (see value_objects.py post_init), so this branch fires
+    # ONLY on a pathologically shaped envelope (hand-edit, corrupt JSON re-read, future-refactor
+    # bug). Sending it anyway would either land on the receiver as a valid empty material
+    # (making the page render J-fresh with an empty prompt, worse than J-absent) or produce a
+    # 400 the sweep would then re-generate on every parked-thread tick until the signature
+    # advances. DM-6's headline explicitly rules it out — the wrapper enforces both halves, not
+    # just the composer_status half.
+    if ($null -eq $output) {
+        Confirm-LogWorthKeeping
+        Write-Log "material push skipped: $Key — envelope に output が無い (composer_status=ok だが output=null) ∴ 材料を送らない"
+        return $null
+    }
+
+    # $output is guaranteed non-null here by the DM-6 guard above.
+    $question             = Get-EnvelopeField -Object $output -Name 'question'
+    $rawOptions           = Get-EnvelopeField -Object $output -Name 'options'
+    $recommendation       = Get-EnvelopeField -Object $output -Name 'recommendation'
+    $recommendationReason = Get-EnvelopeField -Object $output -Name 'recommendation_reason'
+    $rawUnknowns          = Get-EnvelopeField -Object $output -Name 'unknowns'
+
+    $options = if ($null -eq $rawOptions) { @() } else { @($rawOptions) }
+    $unknowns = if ($null -eq $rawUnknowns) { @() } else { @($rawUnknowns) }
+
     $body = [ordered]@{
         head_msg_id     = $head
         signature       = $Signature
         composer_status = 'ok'
     }
-    if ($null -ne $output) {
-        $question             = Get-EnvelopeField -Object $output -Name 'question'
-        $rawOptions           = Get-EnvelopeField -Object $output -Name 'options'
-        $recommendation       = Get-EnvelopeField -Object $output -Name 'recommendation'
-        $recommendationReason = Get-EnvelopeField -Object $output -Name 'recommendation_reason'
-        $rawUnknowns          = Get-EnvelopeField -Object $output -Name 'unknowns'
-
-        $options = if ($null -eq $rawOptions) { @() } else { @($rawOptions) }
-        $unknowns = if ($null -eq $rawUnknowns) { @() } else { @($rawUnknowns) }
-
-        # PR #171 pre-merge review round 2: the guard here must NOT use `if ($x)`. PowerShell
-        # evaluates the string literal `"0"` as $false under implicit boolean cast, so a composer
-        # output where `question` or `recommendation` or `recommendation_reason` equals "0"
-        # would be silently DROPPED from the PUT body — J-fresh would render an empty question,
-        # or the recommendation card would vanish. `[string]::IsNullOrEmpty` treats "0" as a
-        # non-empty string, which is what "present" actually means here. The Python composer's
-        # own validator (`DecisionRequestOutput`) rejects empty / whitespace-only questions and
-        # requires a non-empty reason when there is a recommendation, so we cannot silently lose
-        # those on the wire.
-        #
-        # Note: `if (-not $head)` above is intentionally left alone — msg ids in this repo carry
-        # the "msg-" prefix (e.g. "msg-2702"), so the string "0" is not a reachable value for a
-        # head msg id. The trap applies where a payload string could plausibly BE "0".
-        if (-not [string]::IsNullOrEmpty($question)) { $body['question'] = "$question" }
-        if ($options.Count -gt 0) {
-            $body['options'] = @($options | ForEach-Object {
-                # Same duck-typing dance for each option element — a hashtable-authored envelope
-                # will have hashtable options too, and stripping gain / loss to '' silently would
-                # let J-fresh render option cards without the trade-off text the operator needs.
-                $optId    = Get-EnvelopeField -Object $_ -Name 'id'
-                $optLabel = Get-EnvelopeField -Object $_ -Name 'label'
-                $optGain  = Get-EnvelopeField -Object $_ -Name 'gain'
-                $optLoss  = Get-EnvelopeField -Object $_ -Name 'loss'
-                [ordered]@{
-                    id    = "$optId"
-                    label = "$optLabel"
-                    gain  = if ($null -ne $optGain) { "$optGain" } else { '' }
-                    loss  = if ($null -ne $optLoss) { "$optLoss" } else { '' }
-                }
-            })
-        }
-        if (-not [string]::IsNullOrEmpty($recommendation)) { $body['recommendation'] = "$recommendation" }
-        if (-not [string]::IsNullOrEmpty($recommendationReason)) { $body['recommendation_reason'] = "$recommendationReason" }
-        if ($unknowns.Count -gt 0) { $body['unknowns'] = @($unknowns | ForEach-Object { "$_" }) }
+    # PR #171 pre-merge review round 2: the guard here must NOT use `if ($x)`. PowerShell
+    # evaluates the string literal `"0"` as $false under implicit boolean cast, so a composer
+    # output where `question` or `recommendation` or `recommendation_reason` equals "0"
+    # would be silently DROPPED from the PUT body — J-fresh would render an empty question,
+    # or the recommendation card would vanish. `[string]::IsNullOrEmpty` treats "0" as a
+    # non-empty string, which is what "present" actually means here. The Python composer's
+    # own validator (`DecisionRequestOutput`) rejects empty / whitespace-only questions and
+    # requires a non-empty reason when there is a recommendation, so we cannot silently lose
+    # those on the wire.
+    #
+    # Note: `if (-not $head)` above is intentionally left alone — msg ids in this repo carry
+    # the "msg-" prefix (e.g. "msg-2702"), so the string "0" is not a reachable value for a
+    # head msg id. The trap applies where a payload string could plausibly BE "0".
+    if (-not [string]::IsNullOrEmpty($question)) { $body['question'] = "$question" }
+    if ($options.Count -gt 0) {
+        $body['options'] = @($options | ForEach-Object {
+            # Same duck-typing dance for each option element — a hashtable-authored envelope
+            # will have hashtable options too, and stripping gain / loss to '' silently would
+            # let J-fresh render option cards without the trade-off text the operator needs.
+            $optId    = Get-EnvelopeField -Object $_ -Name 'id'
+            $optLabel = Get-EnvelopeField -Object $_ -Name 'label'
+            $optGain  = Get-EnvelopeField -Object $_ -Name 'gain'
+            $optLoss  = Get-EnvelopeField -Object $_ -Name 'loss'
+            [ordered]@{
+                id    = "$optId"
+                label = "$optLabel"
+                gain  = if ($null -ne $optGain) { "$optGain" } else { '' }
+                loss  = if ($null -ne $optLoss) { "$optLoss" } else { '' }
+            }
+        })
     }
+    if (-not [string]::IsNullOrEmpty($recommendation)) { $body['recommendation'] = "$recommendation" }
+    if (-not [string]::IsNullOrEmpty($recommendationReason)) { $body['recommendation_reason'] = "$recommendationReason" }
+    if ($unknowns.Count -gt 0) { $body['unknowns'] = @($unknowns | ForEach-Object { "$_" }) }
 
     $bodyJson = $body | ConvertTo-Json -Depth 6 -Compress
     $url = New-MaterialUrl -Project $Project -ThreadId $ThreadId

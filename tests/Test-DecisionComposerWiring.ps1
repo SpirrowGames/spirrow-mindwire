@@ -921,6 +921,39 @@ CheckTrue 'empty-string recommendation -> absent from PUT body' `
 CheckTrue 'empty-string recommendation_reason -> absent from PUT body' `
     (-not ($sentEmpty.PSObject.Properties.Name -contains 'recommendation_reason')) $sentEmpty
 
+# ---------- DM-6 second half: composer_status=ok + output=null skips the PUT --------------
+# PR #171 pre-merge review round 3: the DM-6 headline says "composer_status != ok OR output
+# 無しには PUT しない". The earlier version enforced only the composer_status half and would
+# happily ship { head_msg_id, signature, composer_status: "ok" } when output was null —
+# either landing as a valid-empty material on the receiver (worse than J-absent) or bouncing
+# back a 400 that would repeat every parked-thread tick until the signature advanced. This
+# envelope shape is pathological (Python's DecisionRequestEnvelope validator refuses to
+# construct composer_status=ok + output=None), but the wrapper is downstream of that
+# validator and must not assume it.
+Write-Host ''
+Write-Host 'Send-HumanParkAlert — composer_status=ok + output=null skips the PUT (DM-6 second half)'
+$nullOutputEnvelope = [PSCustomObject]@{
+    composer_status = 'ok'
+    signature       = 'human:msg-n'
+    extras          = [PSCustomObject]@{ head_msg_id_read = 'msg-nnn' }
+    output          = $null
+}
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $nullOutputEnvelope; error = $null }
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-null-output' -Project 'p' -ThreadId 'T-null-output' `
+    -Signature 'human:msg-n' -LastMsgId 'msg-nnn' `
+    -StopReason 'human' -Rounds 1 -RawFallback 'raw ping for null-output'
+Check 'null output: PUT was NOT called (DM-6 second half)' 0 $script:materialCallCount
+Check 'null output: notification still fired (fail-open per D-34)' 1 $script:notificationCallCount
+# Because Format-DecisionMessage returns $null on non-ok / missing output as well, the
+# notification body should fall back to the raw ping. Same behaviour as the composer_status
+# != ok case above.
+Check 'null output: notification body is the raw fallback' 'raw ping for null-output' $script:notificationLastMessage
+
 # ---------- (e) I-17: PUT URL and link body share {project}/{thread_id} -----------------------
 Write-Host ''
 Write-Host '(e) Send-HumanParkAlert — PUT URL and notification body link share {project}/{thread_id}'

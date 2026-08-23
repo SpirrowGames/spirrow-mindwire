@@ -175,6 +175,7 @@ repo の D 系列 D-35〜D-45 と衝突しないため、Bohr msg-1445 §0 で
 | 例外 | `material push FAILED (non-fatal): {key} head={head} — {型}: {message} — 通知は継続` |
 | head 不明 | `material push skipped: {key} — composer が読んだ head が不明 (extras.head_msg_id_read 無し) ∴ 材料を送らない (ページは J-absent)` |
 | 非 ok | `material push skipped: {key} — composer_status={status} ∴ 材料なし` |
+| output 無し (DM-6 second half) | `material push skipped: {key} — envelope に output が無い (composer_status=ok だが output=null) ∴ 材料を送らない` |
 
 **失敗枝でも `Confirm-LogWorthKeeping` を明示的に呼ぶ**。呼ばないと、
 バッファされたまま捨てられる tick があり得る (= 沈黙)。本ループが
