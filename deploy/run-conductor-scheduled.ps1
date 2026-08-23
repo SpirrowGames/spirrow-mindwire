@@ -117,6 +117,13 @@ $digestStatePath = Join-Path $dataDir "state\digest.json"
 $pendingDecisionsPath = Join-Path $dataDir "state\pending-decisions.json"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
+# --- library dot-sources -------------------------------------------------------------------------
+# Small, PURE helpers that both this runner and its tests need. Kept out of this file because this
+# file cannot be dot-sourced by a test — reading it launches the sweep (see the try/catch/finally
+# at the bottom). Extracted per Bohr msg-1466 D-3 / Einstein msg-1467 §3-A4: the extracted file is
+# the testability seam, not a refactor.
+. (Join-Path $PSScriptRoot 'lib/StopReason.ps1')
+
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
 # --- logging ------------------------------------------------------------------------------------
@@ -1587,7 +1594,11 @@ function Format-DecisionMessage {
     # PUT target is built with (New-DecisionLink / New-MaterialUrl share $DecisionDashboardBaseUrl
     # and the same EscapeDataString call). Do NOT re-build the link inline here.
     $link = New-DecisionLink -Project $Project -ThreadId $ThreadId
-    $header = "MindWire: **$ThreadId** ($Project) — 判断待ち (reason=$StopReason, rounds=$Rounds, $LastMsgId)"
+    # Header phrasing per T-park-alert-says-judgement-when-it-is-a-fault msg-1465 §2: pick the
+    # phrase for the actual stop reason from the SOT map in deploy/lib/StopReason.ps1 instead of
+    # the fixed "判断待ち" literal. Every other field on this line is preserved byte-for-byte.
+    $header = New-NotificationHeader -ThreadId $ThreadId -Project $Project `
+        -StopReason $StopReason -Rounds $Rounds -LastMsgId $LastMsgId
     $background = "$header`n$link"
 
     if (-not $Envelope) { return $null }   # caller falls back to $RawFallback
@@ -2225,13 +2236,12 @@ try {
     #
     # Do NOT narrow this to `reason -eq 'human'`: measured 2026-08-02, the first live sweep produced
     # `no_progress_to_human`, which such a check silently drops.
-    $needsHuman = @{
-        'human'                = "あなたの判断待ちで停止しました"
-        'no_handoff_to_human'  = "NEXT: が読めず human に fallback して停止しました"
-        'no_progress_to_human' = "dispatch した role が何も投稿せず停止しました"
-        'round_cap'            = "ラウンド上限で停止しました（暴走バックストップ発動）"
-        'empty_thread'         = "スレッドにメッセージがありません（優先リストの指定ミスの可能性）"
-    }
+    #
+    # The map (both the KEY SET, used below as the notification predicate, and the VALUES, used in
+    # the raw-ping fallback body a few lines down) is the SOT in deploy/lib/StopReason.ps1. The
+    # header of the ENRICHED notification (Format-DecisionMessage's $header) reads through the same
+    # SOT via New-NotificationHeader — see T-park-alert-says-judgement-when-it-is-a-fault msg-1465.
+    $needsHuman = Get-StopReasonPhraseMap
 
     foreach ($cand in $candidates) {
         $attempt++
