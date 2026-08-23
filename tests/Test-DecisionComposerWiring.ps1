@@ -836,6 +836,91 @@ Check 'hashtable envelope: options[0].loss survives (was defaulted to "" before 
 Check 'hashtable envelope: options[1].gain survives' 'gain-B' @($sentBody.options)[1].gain
 Check 'hashtable envelope: options[1].loss survives' 'loss-B' @($sentBody.options)[1].loss
 
+# ---------- regression: PowerShell "0"-as-false trap on payload strings -----------------------
+# PR #171 pre-merge review round 2 flagged that `if ($x)` is unsafe on user-visible payload
+# strings — PowerShell evaluates the string literal "0" as $false. A composer output where
+# question / recommendation / recommendation_reason equals "0" would be silently dropped from
+# the PUT body under an implicit-cast guard. The `[string]::IsNullOrEmpty` guard treats "0" as
+# a present-non-empty value, which is what "carry it to the receiver" actually means.
+#
+# The pin below sends "0" through every payload string field the wrapper gates on and asserts
+# each one lands in the PUT body verbatim.
+Write-Host ''
+Write-Host 'Send-HumanParkAlert — payload strings equal to "0" survive to the PUT body (PS truthy-cast trap)'
+$zeroStringEnvelope = [PSCustomObject]@{
+    composer_status = 'ok'
+    signature       = 'human:msg-z'
+    extras          = [PSCustomObject]@{ head_msg_id_read = 'msg-zzz' }
+    output          = [PSCustomObject]@{
+        question              = '0'
+        options               = @(
+            [PSCustomObject]@{ id = 'A'; label = '0'; gain = '0'; loss = '0' }
+        )
+        recommendation        = 'A'
+        recommendation_reason = '0'
+        unknowns              = @('0', 'unk')
+    }
+}
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $zeroStringEnvelope; error = $null }
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-zero' -Project 'p' -ThreadId 'T-zero' `
+    -Signature 'human:msg-z' -LastMsgId 'msg-zzz' `
+    -StopReason 'human' -Rounds 1 -RawFallback 'raw ping'
+Check 'zero-string envelope: PUT fired once' 1 $script:materialCallCount
+$sentZero = $script:materialLastCall.BodyJson | ConvertFrom-Json
+Check 'question="0" survives (was silently dropped by if($question) before the fix)' `
+    '0' $sentZero.question
+Check 'recommendation_reason="0" survives' '0' $sentZero.recommendation_reason
+# recommendation is currently constrained to A-Z by the Python validator, but the wrapper is
+# downstream of the envelope shape; ship whatever the envelope claims.
+Check 'recommendation="A" survives (control)' 'A' $sentZero.recommendation
+# The option and unknowns "0" values were already null-guarded before the fix, so they were
+# never affected by the truthy-cast trap. Pinning them here for regression-safety.
+Check 'option label="0" survives' '0' @($sentZero.options)[0].label
+Check 'option gain="0" survives' '0' @($sentZero.options)[0].gain
+Check 'option loss="0" survives' '0' @($sentZero.options)[0].loss
+CheckTrue 'unknowns=["0","unk"] survives with the "0" entry intact' `
+    ((@($sentZero.unknowns).Count -eq 2) -and (@($sentZero.unknowns)[0] -eq '0')) `
+    ("unknowns=" + ($sentZero.unknowns | ConvertTo-Json -Compress))
+
+# Empty-string ≠ "0": pin that the guard still drops truly-empty strings (or absent fields),
+# because sending `question: ""` to magickit would render a J-fresh page with an empty prompt.
+Write-Host ''
+Write-Host 'Send-HumanParkAlert — payload strings equal to "" are DROPPED (present-non-empty guard)'
+$emptyStringEnvelope = [PSCustomObject]@{
+    composer_status = 'ok'
+    signature       = 'human:msg-e'
+    extras          = [PSCustomObject]@{ head_msg_id_read = 'msg-eee' }
+    output          = [PSCustomObject]@{
+        question              = ''
+        options               = @()
+        recommendation        = ''
+        recommendation_reason = ''
+        unknowns              = @()
+    }
+}
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $emptyStringEnvelope; error = $null }
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-empty' -Project 'p' -ThreadId 'T-empty' `
+    -Signature 'human:msg-e' -LastMsgId 'msg-eee' `
+    -StopReason 'human' -Rounds 1 -RawFallback 'raw ping'
+$sentEmpty = $script:materialLastCall.BodyJson | ConvertFrom-Json
+CheckTrue 'empty-string question -> absent from PUT body' `
+    (-not ($sentEmpty.PSObject.Properties.Name -contains 'question')) `
+    ('question was carried: ' + ($sentEmpty | ConvertTo-Json -Compress))
+CheckTrue 'empty-string recommendation -> absent from PUT body' `
+    (-not ($sentEmpty.PSObject.Properties.Name -contains 'recommendation')) $sentEmpty
+CheckTrue 'empty-string recommendation_reason -> absent from PUT body' `
+    (-not ($sentEmpty.PSObject.Properties.Name -contains 'recommendation_reason')) $sentEmpty
+
 # ---------- (e) I-17: PUT URL and link body share {project}/{thread_id} -----------------------
 Write-Host ''
 Write-Host '(e) Send-HumanParkAlert — PUT URL and notification body link share {project}/{thread_id}'

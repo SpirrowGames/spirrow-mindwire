@@ -1260,7 +1260,20 @@ function Push-DecisionMaterial {
         $options = if ($null -eq $rawOptions) { @() } else { @($rawOptions) }
         $unknowns = if ($null -eq $rawUnknowns) { @() } else { @($rawUnknowns) }
 
-        if ($question) { $body['question'] = "$question" }
+        # PR #171 pre-merge review round 2: the guard here must NOT use `if ($x)`. PowerShell
+        # evaluates the string literal `"0"` as $false under implicit boolean cast, so a composer
+        # output where `question` or `recommendation` or `recommendation_reason` equals "0"
+        # would be silently DROPPED from the PUT body — J-fresh would render an empty question,
+        # or the recommendation card would vanish. `[string]::IsNullOrEmpty` treats "0" as a
+        # non-empty string, which is what "present" actually means here. The Python composer's
+        # own validator (`DecisionRequestOutput`) rejects empty / whitespace-only questions and
+        # requires a non-empty reason when there is a recommendation, so we cannot silently lose
+        # those on the wire.
+        #
+        # Note: `if (-not $head)` above is intentionally left alone — msg ids in this repo carry
+        # the "msg-" prefix (e.g. "msg-2702"), so the string "0" is not a reachable value for a
+        # head msg id. The trap applies where a payload string could plausibly BE "0".
+        if (-not [string]::IsNullOrEmpty($question)) { $body['question'] = "$question" }
         if ($options.Count -gt 0) {
             $body['options'] = @($options | ForEach-Object {
                 # Same duck-typing dance for each option element — a hashtable-authored envelope
@@ -1278,8 +1291,8 @@ function Push-DecisionMaterial {
                 }
             })
         }
-        if ($recommendation) { $body['recommendation'] = "$recommendation" }
-        if ($recommendationReason) { $body['recommendation_reason'] = "$recommendationReason" }
+        if (-not [string]::IsNullOrEmpty($recommendation)) { $body['recommendation'] = "$recommendation" }
+        if (-not [string]::IsNullOrEmpty($recommendationReason)) { $body['recommendation_reason'] = "$recommendationReason" }
         if ($unknowns.Count -gt 0) { $body['unknowns'] = @($unknowns | ForEach-Object { "$_" }) }
     }
 
