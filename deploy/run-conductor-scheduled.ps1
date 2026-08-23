@@ -945,13 +945,23 @@ function Send-Notification {
     }
 }
 
+# The dedup predicate the notification path consults. Extracted from Send-NotificationIfChanged so
+# the material-push path (T-decision-material-push §DM-3, msg-1445) can consult the SAME predicate
+# — a same-signature repeat tick must not fire the PUT any more than it fires the notification. Two
+# independent predicates would drift; there is only one truth about "have we already alerted on this
+# signature", so there is only one function that answers it.
+function Test-NotificationSuppressed {
+    param([hashtable]$State, [string]$Key, [string]$Signature)
+    return ($State.ContainsKey($Key) -and $State[$Key] -eq $Signature)
+}
+
 # A thread parked on `NEXT: human` stays parked until Takahito acts, and the sweep re-reads it on
 # every tick. Without this, one unattended weekend would fire the same alert repeatedly and the
 # channel would be trained into noise. Fires only when $Signature differs from the last alert.
 function Send-NotificationIfChanged {
     param([hashtable]$State, [string]$Key, [string]$Signature, [string]$Message)
 
-    if ($State.ContainsKey($Key) -and $State[$Key] -eq $Signature) {
+    if (Test-NotificationSuppressed -State $State -Key $Key -Signature $Signature) {
         Write-Log "notification suppressed (unchanged since last alert: $Key = $Signature)"
         return
     }
@@ -1024,11 +1034,322 @@ $DecisionComposerIdentity = if ($env:MINDWIRE_DECISION_COMPOSER_IDENTITY) {
 # Dashboard base URL for D-29 (the link always survives the truncation ladder). Read from env with
 # the Tailscale-visible default from Takahito's §11.1 measurement — an operator relocating the
 # dashboard sets MINDWIRE_DECISION_DASHBOARD_URL and every link updates without touching the format
-# code. Path composition (`/dashboard/decisions/<project>/<thread>`) is the single call in
-# Format-DecisionMessage — a URL-shape change is one edit, not a search across the wrapper.
+# code. Path composition (`/dashboard/decisions/<project>/<thread>` for the human link,
+# `/v1/decisions/<project>/<thread>/material` for the magickit PUT) lives in New-DecisionLink /
+# New-MaterialUrl below — a URL-shape change is one edit in one place, not a search across the
+# wrapper.
 $DecisionDashboardBaseUrl = if ($env:MINDWIRE_DECISION_DASHBOARD_URL) {
     $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
 } else { 'https://sg-ai-server-01.taile861db.ts.net:8443' }
+
+# --- decision-material push (T-decision-material-push, msg-1445) -------------------------------
+# The material push (mindwire composer → magickit `/v1/decisions/.../material`) shares a base URL,
+# a {project}/{thread_id} encoding, and a dedup predicate with the human-facing Discord link. The
+# functions below hold I-17: the link in the notification and the PUT target are BUILT FROM THE SAME
+# VARIABLES, in one place. A second independent assembly would let the human open page X while the
+# material lands at Y and the page correctly shows "material absent" — the exact split the composer
+# was written to close.
+#
+# Wire measurements from sg-tomtebo-01 (M-1, msg-1445 §6):
+#   * Invoke-WebRequest → https://sg-ai-server-01.taile861db.ts.net:8443/... returns 404 in ~190 ms
+#     with the wire proxy DISABLED (the tailnet cert validates under the default TLS handler and
+#     pwsh has outbound permission for that host).
+#   * With `-Proxy http://127.0.0.1:3128` the same request is refused by squid (403). Do NOT
+#     thread the notification proxy in here.
+# ∴ -TimeoutSec 10 is >50× the observed RTT, and the request goes direct.
+#
+# The push is fail-open (D-34, msg-1443 §3): every failure — HTTP 4xx/5xx, TLS, DNS, connect refused,
+# timeout — writes ONE log line and returns to the caller. The notification then fires REGARDLESS
+# of the PUT's fate. A material-side outage must not turn into a notification-side outage; that
+# would trade an easy-to-see problem (dashboard says "material not stored") for the exact problem
+# the composer exists to end (nobody knows they are being asked).
+
+# How long the wrapper waits for the material PUT. Kept small (10 s) because a slow PUT would delay
+# the notification that follows; the notification is the "someone is being asked" signal and must
+# not wait on the material store. Measured RTT (M-1): ~190 ms round trip for a fresh connection —
+# a ceiling of 10 s allows for a 50× stall before the wrapper gives up and moves on. If a live
+# measurement ever comes back over 2 s, that is the signal that the assumption behind this constant
+# is wrong; raise the alarm before raising the ceiling.
+$DecisionMaterialTimeoutSeconds = 10
+
+# Build the URL a human will open in Discord. Same {project}/{thread_id} encoding as the PUT target;
+# see New-MaterialUrl. The single source of truth for the D-29 dashboard link.
+function New-DecisionLink {
+    param([string]$Project, [string]$ThreadId)
+    $encodedProject = [uri]::EscapeDataString($Project)
+    $encodedThread = [uri]::EscapeDataString($ThreadId)
+    return "$DecisionDashboardBaseUrl/dashboard/decisions/$encodedProject/$encodedThread"
+}
+
+# Build the URL the wrapper PUTs the material to. Uses the SAME base URL and the SAME
+# EscapeDataString call as New-DecisionLink; the two must never diverge (I-17). If a future
+# environment splits the material API off onto a different host, the split is one variable
+# (add a `$DecisionMaterialBaseUrl` env override here), not two independent assemblies.
+function New-MaterialUrl {
+    param([string]$Project, [string]$ThreadId)
+    $encodedProject = [uri]::EscapeDataString($Project)
+    $encodedThread = [uri]::EscapeDataString($ThreadId)
+    return "$DecisionDashboardBaseUrl/v1/decisions/$encodedProject/$encodedThread/material"
+}
+
+# The SEAM the tests override. Isolated for the same reason Invoke-ComposerCli is: a real HTTP
+# request cannot run inside pytest / Test-DecisionComposerWiring, and reaching for the network from
+# inside the higher-level Push-DecisionMaterial would make its unit-test coverage impossible.
+#
+# Return shape mirrors the composer's: `@{ ok=$bool; status=$int|$null; body=$string|$null;
+# elapsed_ms=$int; error=$string|$null }`. Never throws — the caller (Push-DecisionMaterial) is
+# fail-open by design, and any exception escaping this seam is a wiring bug, not a runtime failure
+# the caller should handle.
+function Invoke-MaterialPut {
+    param(
+        [string]$Url,
+        [string]$BodyJson,
+        [int]$TimeoutSec = $DecisionMaterialTimeoutSeconds
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        # UTF-8 bytes on purpose: the body carries Japanese and .NET's default encoding on this host
+        # is not UTF-8. Same pattern as Send-Notification below.
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($BodyJson)
+        # -SkipHttpErrorCheck so a 4xx / 5xx returns a response object instead of throwing — the
+        # caller wants to log the status code, not a "The remote server returned an error" wrapper.
+        # Not routed through $notifyProxy: M-1 confirmed the tailnet host is reachable directly and
+        # squid denies the tunnel. Keep this call OUT of the notification proxy path.
+        $resp = Invoke-WebRequest -Uri $Url -Method Put `
+            -ContentType 'application/json; charset=utf-8' `
+            -Body $bytes -TimeoutSec $TimeoutSec `
+            -SkipHttpErrorCheck -ErrorAction Stop
+        $sw.Stop()
+        $status = [int]$resp.StatusCode
+        $body = if ($resp.Content) { "$($resp.Content)" } else { '' }
+        $ok = ($status -ge 200 -and $status -lt 300)
+        return @{
+            ok = $ok
+            status = $status
+            body = $body
+            elapsed_ms = [int]$sw.ElapsedMilliseconds
+            error = if ($ok) { $null } else { "HTTP $status" }
+        }
+    }
+    catch {
+        $sw.Stop()
+        return @{
+            ok = $false
+            status = $null
+            body = $null
+            elapsed_ms = [int]$sw.ElapsedMilliseconds
+            error = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
+        }
+    }
+}
+
+# Read one named field off an envelope-shaped object, returning $null on absence. Handles BOTH the
+# JSON-loaded shape (PSCustomObject; all wrapper-facing production envelopes come from
+# `ConvertFrom-Json` in Invoke-ComposerCli) AND the freshly-written / test-authored shape
+# (hashtable or [ordered]@{}). The two shapes are exchangeable in the sweep — a value written into
+# a state map as a hashtable and later re-read from disk comes back as a PSCustomObject — so any
+# reader that only understands one of them silently drops fields for the other. That drop is exactly
+# the bug PR #171 pre-merge review flagged: `.PSObject.Properties.Name` on a hashtable returns
+# ["Count","IsFixedSize","IsReadOnly","Keys","SyncRoot",…] (properties of the hashtable OBJECT, not
+# its keys), so a `-contains 'question'` check on a hashtable envelope returns $false and the PUT
+# body ships without the material fields. `IDictionary` covers both `[hashtable]` and
+# `[System.Collections.Specialized.OrderedDictionary]` (`[ordered]@{}`).
+function Get-EnvelopeField {
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $null
+    }
+    if ($Object.PSObject.Properties.Name -contains $Name) { return $Object.$Name }
+    return $null
+}
+
+# Extract the head msg id the composer *actually read* (see cli.py: `extras.head_msg_id_read`).
+# Duck-types both the freshly-written hashtable shape and the JSON-loaded PSCustomObject shape,
+# same as Get-CachedDecision.
+#
+# DM-4 forbids fallback to `last_msg_id` (which is the conductor stop line, not what the composer
+# read). If `head_msg_id_read` is missing, this returns $null and the caller (Push-DecisionMaterial)
+# SKIPS the PUT — "material absent" (J-absent) is the safe display, "read from something we did not
+# read" would defeat the receiver's freshness check.
+function Get-ComposerReadHead {
+    param($Envelope)
+    $extras = Get-EnvelopeField -Object $Envelope -Name 'extras'
+    $val = Get-EnvelopeField -Object $extras -Name 'head_msg_id_read'
+    if (-not $val) { return $null }
+    return "$val"
+}
+
+# Push the composer's material to magickit's `/v1/decisions/{project}/{thread_id}/material`.
+# Never throws, never blocks the notification path. Returns the raw Invoke-MaterialPut result for
+# the test seam; the caller ignores the return value in production (D-34: the notification body
+# does NOT branch on the PUT's fate).
+#
+# Log lines (DM-5, msg-1445 §3): every branch produces exactly one line and calls Confirm-
+# LogWorthKeeping so nothing gets dropped by the idle-tick collapse. Textually pinned so an
+# operator grep can tell success from a skip from a failure.
+function Push-DecisionMaterial {
+    param(
+        [hashtable]$NotifyState,
+        [string]$Key,
+        [string]$Signature,
+        [string]$Project,
+        [string]$ThreadId,
+        $Envelope
+    )
+
+    # DM-3: same dedup predicate as the notification. A same-signature repeat tick must not
+    # re-fire the PUT any more than it re-fires the notification. Without this gate a driven-by-
+    # tick 5-minute cadence would hammer the receiver with an unbounded PUT stream on every parked
+    # thread — the YAGNI-rejected "retry queue" fallen in through the back door.
+    if (Test-NotificationSuppressed -State $NotifyState -Key $Key -Signature $Signature) {
+        # Silent-by-design: the same tick will also suppress the notification below, and we already
+        # logged this same signature once. Adding another line would double the log volume on every
+        # parked-thread tick.
+        return $null
+    }
+
+    if ($null -eq $Envelope) {
+        # No composer output at all — the wrapper will fire the raw ping. Do not PUT; there is
+        # nothing to PUT.
+        return $null
+    }
+
+    # Every field access below goes through Get-EnvelopeField so a hashtable envelope (from a
+    # freshly-written cache row) is read identically to a PSCustomObject envelope (from a JSON
+    # round-trip). Reading these with `.PSObject.Properties.Name` on a hashtable silently returns
+    # $false for every material key — PR #171 pre-merge review flagged exactly that regression on
+    # this function's earlier version.
+    $status = Get-EnvelopeField -Object $Envelope -Name 'composer_status'
+    $status = if ($null -ne $status) { "$status" } else { $null }
+    # DM-6: magickit's S5 slice §1.3 says a `composer_status != "ok"` PUT is rejected with 400 and
+    # no partial save. Sending it produces a guaranteed 400 that does nothing useful. Skip cleanly.
+    if ($status -and $status -ne 'ok') {
+        Confirm-LogWorthKeeping
+        Write-Log "material push skipped: $Key — composer_status=$status ∴ 材料なし"
+        return $null
+    }
+
+    # DM-4 (I-16): the head msg id must be the one the composer *actually read*. If missing (e.g.
+    # tail_fetch_error path), skip — do NOT fall back to `last_msg_id` (that would claim a head the
+    # composer never observed, which the receiver cannot detect).
+    $head = Get-ComposerReadHead -Envelope $Envelope
+    if (-not $head) {
+        Confirm-LogWorthKeeping
+        Write-Log "material push skipped: $Key — composer が読んだ head が不明 (extras.head_msg_id_read 無し) ∴ 材料を送らない (ページは J-absent)"
+        return $null
+    }
+
+    # Build the PUT body. Follows magickit's S5 slice §1.1 field table verbatim. All fields except
+    # head_msg_id are optional; we send whatever the envelope carries.
+    $output = Get-EnvelopeField -Object $Envelope -Name 'output'
+
+    # DM-6 second half (msg-1445 §DM-6): "composer_status != ok / output 無しには PUT しない".
+    # The Python-side value-object validator refuses to construct a DecisionRequestEnvelope with
+    # composer_status=ok AND output=None (see value_objects.py post_init), so this branch fires
+    # ONLY on a pathologically shaped envelope (hand-edit, corrupt JSON re-read, future-refactor
+    # bug). Sending it anyway would either land on the receiver as a valid empty material
+    # (making the page render J-fresh with an empty prompt, worse than J-absent) or produce a
+    # 400 the sweep would then re-generate on every parked-thread tick until the signature
+    # advances. DM-6's headline explicitly rules it out — the wrapper enforces both halves, not
+    # just the composer_status half.
+    if ($null -eq $output) {
+        Confirm-LogWorthKeeping
+        Write-Log "material push skipped: $Key — envelope に output が無い (composer_status=ok だが output=null) ∴ 材料を送らない"
+        return $null
+    }
+
+    # $output is guaranteed non-null here by the DM-6 guard above.
+    $question             = Get-EnvelopeField -Object $output -Name 'question'
+    $rawOptions           = Get-EnvelopeField -Object $output -Name 'options'
+    $recommendation       = Get-EnvelopeField -Object $output -Name 'recommendation'
+    $recommendationReason = Get-EnvelopeField -Object $output -Name 'recommendation_reason'
+    $rawUnknowns          = Get-EnvelopeField -Object $output -Name 'unknowns'
+
+    $options = if ($null -eq $rawOptions) { @() } else { @($rawOptions) }
+    $unknowns = if ($null -eq $rawUnknowns) { @() } else { @($rawUnknowns) }
+
+    $body = [ordered]@{
+        head_msg_id     = $head
+        signature       = $Signature
+        composer_status = 'ok'
+    }
+    # PR #171 pre-merge review round 2: the guard here must NOT use `if ($x)`. PowerShell
+    # evaluates the string literal `"0"` as $false under implicit boolean cast, so a composer
+    # output where `question` or `recommendation` or `recommendation_reason` equals "0"
+    # would be silently DROPPED from the PUT body — J-fresh would render an empty question,
+    # or the recommendation card would vanish. `[string]::IsNullOrEmpty` treats "0" as a
+    # non-empty string, which is what "present" actually means here. The Python composer's
+    # own validator (`DecisionRequestOutput`) rejects empty / whitespace-only questions and
+    # requires a non-empty reason when there is a recommendation, so we cannot silently lose
+    # those on the wire.
+    #
+    # Note: `if (-not $head)` above is intentionally left alone — msg ids in this repo carry
+    # the "msg-" prefix (e.g. "msg-2702"), so the string "0" is not a reachable value for a
+    # head msg id. The trap applies where a payload string could plausibly BE "0".
+    if (-not [string]::IsNullOrEmpty($question)) { $body['question'] = "$question" }
+    if ($options.Count -gt 0) {
+        $body['options'] = @($options | ForEach-Object {
+            # Same duck-typing dance for each option element — a hashtable-authored envelope
+            # will have hashtable options too, and stripping gain / loss to '' silently would
+            # let J-fresh render option cards without the trade-off text the operator needs.
+            $optId    = Get-EnvelopeField -Object $_ -Name 'id'
+            $optLabel = Get-EnvelopeField -Object $_ -Name 'label'
+            $optGain  = Get-EnvelopeField -Object $_ -Name 'gain'
+            $optLoss  = Get-EnvelopeField -Object $_ -Name 'loss'
+            [ordered]@{
+                id    = "$optId"
+                label = "$optLabel"
+                gain  = if ($null -ne $optGain) { "$optGain" } else { '' }
+                loss  = if ($null -ne $optLoss) { "$optLoss" } else { '' }
+            }
+        })
+    }
+    if (-not [string]::IsNullOrEmpty($recommendation)) { $body['recommendation'] = "$recommendation" }
+    if (-not [string]::IsNullOrEmpty($recommendationReason)) { $body['recommendation_reason'] = "$recommendationReason" }
+    if ($unknowns.Count -gt 0) { $body['unknowns'] = @($unknowns | ForEach-Object { "$_" }) }
+
+    $bodyJson = $body | ConvertTo-Json -Depth 6 -Compress
+    $url = New-MaterialUrl -Project $Project -ThreadId $ThreadId
+    $link = New-DecisionLink -Project $Project -ThreadId $ThreadId
+
+    # Belt and braces (msg-1445 §DM-5): Invoke-MaterialPut already promises never to throw, but the
+    # caller catches too so a wiring bug in the seam cannot sink the notification path. Fail-open
+    # is the whole point of D-34; a single try-catch here is the physical barrier that makes it so.
+    try {
+        $result = Invoke-MaterialPut -Url $url -BodyJson $bodyJson
+    }
+    catch {
+        $result = @{
+            ok = $false; status = $null; body = $null; elapsed_ms = 0
+            error = "unhandled from Invoke-MaterialPut: $($_.Exception.GetType().Name): $($_.Exception.Message)"
+        }
+    }
+    Confirm-LogWorthKeeping
+    if ($result.ok) {
+        $replaced = 'unknown'
+        if ($result.body) {
+            try {
+                $parsed = $result.body | ConvertFrom-Json -ErrorAction Stop
+                if ($parsed.PSObject.Properties.Name -contains 'replaced') { $replaced = "$($parsed.replaced)" }
+            }
+            catch { }
+        }
+        Write-Log "material push: $Key head=$head replaced=$replaced ($($result.elapsed_ms) ms) url=$url link=$link"
+    }
+    elseif ($result.status) {
+        $bodySnippet = if ($result.body) {
+            $flat = ($result.body -replace "\s+", ' ').Trim()
+            if ($flat.Length -gt 120) { $flat.Substring(0, 120) + '…' } else { $flat }
+        } else { '<no body>' }
+        Write-Log "material push FAILED (non-fatal): $Key head=$head — HTTP $($result.status) $bodySnippet — 通知は継続"
+    }
+    else {
+        Write-Log "material push FAILED (non-fatal): $Key head=$head — $($result.error) — 通知は継続"
+    }
+    return $result
+}
 
 # Invoke the CLI with the input JSON on stdin, return @{ ok; envelope; error }. This is the seam
 # tests override: replacing the function with a stub lets the wiring be exercised without spawning
@@ -1262,9 +1583,10 @@ function Format-DecisionMessage {
 
     # Background: 2 lines the ladder never touches (D-29). A truncated form without them collapses
     # to the raw ping in the caller — we do NOT render a headerless body.
-    $encodedProject = [uri]::EscapeDataString($Project)
-    $encodedThread = [uri]::EscapeDataString($ThreadId)
-    $link = "$DecisionDashboardBaseUrl/dashboard/decisions/$encodedProject/$encodedThread"
+    # I-17 (T-decision-material-push §DM-2): the link is built by the SAME function the material
+    # PUT target is built with (New-DecisionLink / New-MaterialUrl share $DecisionDashboardBaseUrl
+    # and the same EscapeDataString call). Do NOT re-build the link inline here.
+    $link = New-DecisionLink -Project $Project -ThreadId $ThreadId
     $header = "MindWire: **$ThreadId** ($Project) — 判断待ち (reason=$StopReason, rounds=$Rounds, $LastMsgId)"
     $background = "$header`n$link"
 
@@ -1347,6 +1669,57 @@ function Format-DecisionMessage {
         $body = $body + $tailMarker
     }
     return $body
+}
+
+# The full "the loop is parked on a human decision" sequence, extracted from the sweep tick so the
+# order (material PUT → notification) and the fail-open behaviour (a broken PUT never suppresses
+# the notification) are testable in isolation (msg-1445 §5 / W-3). Inlined, this sequence is
+# unreachable from the AST-lift test harness — the only way to pin that the PUT precedes the
+# notification and that the notification body is 1 character identical whether the PUT threw or
+# returned 4xx or 5xx is to make the sequence a named function.
+#
+# Contract (msg-1443 §3 D-34 / msg-1445 §DM-1 / §DM-5):
+#   1. Compose (or reuse the cached) envelope for this ({Key}, {Signature}).
+#   2. Push the material to magickit — non-blocking, fail-open, its result is ignored.
+#   3. Format the Discord body from the envelope. If enrichment fails for any reason, use the
+#      $RawFallback the caller built.
+#   4. Send-NotificationIfChanged: the caller sees exactly the body the enrichment produced,
+#      whether the PUT succeeded, failed, or was skipped for freshness.
+#
+# The dedup on step 2 is `Test-NotificationSuppressed` (the SAME predicate step 4 consults) —
+# without it the PUT would fire on every 5-minute tick against a driven-by-human-response wait,
+# which is the "無設計の再試行" msg-1445 §DM-3 rules out.
+function Send-HumanParkAlert {
+    param(
+        [hashtable]$PendingDecisionsState,
+        [hashtable]$NotifyState,
+        [string]$Key,
+        [string]$Project,
+        [string]$ThreadId,
+        [string]$Signature,
+        [string]$LastMsgId,
+        [string]$StopReason,
+        [int]$Rounds,
+        [string]$RawFallback
+    )
+
+    $envelope = Get-DecisionEnvelope -State $PendingDecisionsState `
+        -Key $Key -Project $Project -ThreadId $ThreadId `
+        -Signature $Signature -LastMsgId $LastMsgId `
+        -StopReason $StopReason -Rounds $Rounds
+
+    # STEP 2 (D-34: ①→②) — material PUT BEFORE the notification. Its failure is logged and
+    # discarded; the notification body below does NOT branch on it.
+    $null = Push-DecisionMaterial -NotifyState $NotifyState -Key $Key -Signature $Signature `
+        -Project $Project -ThreadId $ThreadId -Envelope $envelope
+
+    $enriched = Format-DecisionMessage -Project $Project -ThreadId $ThreadId `
+        -StopReason $StopReason -Rounds $Rounds `
+        -LastMsgId $LastMsgId -RawFallback $RawFallback -Envelope $envelope
+    $message = if ($enriched) { $enriched } else { $RawFallback }
+
+    Send-NotificationIfChanged -State $NotifyState -Key $Key `
+        -Signature $Signature -Message $message
 }
 
 # --- the sweep list (config, NOT code) -----------------------------------------------------------
@@ -2069,25 +2442,22 @@ try {
             # even when last_msg has not moved.
             $sig = "$($verdict.reason):$($verdict.last_msg)"
 
-            # T-decision-request-composer S2: fold in an enriched question (with options + a
-            # dashboard link) when the composer can produce one; fall back to the raw ping on any
-            # failure (I-2). Get-DecisionEnvelope enforces I-3 by caching per signature — a same-
-            # signature repeat tick reuses the cached envelope and never invokes the CLI.
+            # T-decision-request-composer S2 + T-decision-material-push (msg-1445 §W-3): the whole
+            # "the loop is parked on a human decision" sequence is one call. Send-HumanParkAlert
+            # owns the order (material PUT → notification) and the fail-open guarantees; keeping
+            # the sequence a named function is what makes the two invariants testable in isolation
+            # (the AST-lift harness in Test-DecisionComposerWiring.ps1 cannot reach code inlined
+            # inside the sweep body).
             $rawFallback = ("MindWire: **$thread** ($($cand.project)) — " +
                             $needsHuman[$verdict.reason] +
                             " (reason=$($verdict.reason), rounds=$($verdict.rounds), $($verdict.last_msg))。" +
                             "chatroom を確認してください。")
-            $envelope = Get-DecisionEnvelope -State $pendingDecisionsState `
-                -Key $cand.key -Project $cand.project -ThreadId $thread `
+            Send-HumanParkAlert -PendingDecisionsState $pendingDecisionsState `
+                -NotifyState $notifyState -Key $cand.key `
+                -Project $cand.project -ThreadId $thread `
                 -Signature $sig -LastMsgId $verdict.last_msg `
-                -StopReason $verdict.reason -Rounds $verdict.rounds
-            $enriched = Format-DecisionMessage -Project $cand.project -ThreadId $thread `
                 -StopReason $verdict.reason -Rounds $verdict.rounds `
-                -LastMsgId $verdict.last_msg -RawFallback $rawFallback -Envelope $envelope
-            $message = if ($enriched) { $enriched } else { $rawFallback }
-
-            Send-NotificationIfChanged -State $notifyState -Key $cand.key `
-                -Signature $sig -Message $message
+                -RawFallback $rawFallback
         }
 
         if ($verdict.rounds -gt 0) {

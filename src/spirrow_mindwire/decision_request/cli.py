@@ -569,6 +569,24 @@ def main(argv: list[str] | None = None) -> int:
             fetch_extras["tail_count"] = str(len(fetched_tail))
             fetch_extras["tail_chars"] = str(total_chars)
             fetch_extras["tail_truncated"] = "true" if any_truncated else "false"
+            # I-16 (T-decision-material-push msg-1445 §DM-4): record the head
+            # message id the composer *actually read* — chatroom_get_thread in
+            # mode="full" returns messages in msg_id-ascending order, so the
+            # tail's last element is the thread head at the moment of the
+            # fetch. The wrapper's material push reads this key ONLY (never
+            # falls back to ``last_msg_id``, which is the conductor stop line,
+            # not what the composer read; using it would let the composer
+            # claim a head it never observed, and the receiving side cannot
+            # detect the lie).
+            #
+            # A defensive empty-list check keeps a well-behaved fetcher that
+            # somehow returned an empty tuple without raising (unlikely but
+            # possible) from crashing the composer with IndexError — DM-4's
+            # rule is "if the composer did not read a head, do not send one",
+            # not "crash and take the notification path down with us"
+            # (Einstein msg-1446 §1).
+            if fetched_tail:
+                fetch_extras["head_msg_id_read"] = fetched_tail[-1].msg_id
 
     composer = _build_composer(
         args.backend,
