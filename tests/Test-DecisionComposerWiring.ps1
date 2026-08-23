@@ -32,6 +32,10 @@ if ($parseErrors) {
 
 # Silence the wrapper's own Write-Log so the test output stays readable.
 function Write-Log { param([string]$Message) }
+# Confirm-LogWorthKeeping is called by the material-push branches to flush the buffered log; the
+# wrapper's real implementation touches module-scope state we do not lift. A no-op keeps the
+# lifted functions callable without dragging in the whole logging module.
+function Confirm-LogWorthKeeping { }
 
 # Bring in the exact functions the sweep uses. Dot-sourcing would launch the sweep; parsing the
 # AST and invoking just the function definitions keeps this test hermetic.
@@ -50,7 +54,15 @@ $needed = @(
     'Get-FingerprintHint',
     'Get-DerivedQuarantineState',
     'Format-DurationDigest',
-    'ConvertTo-UtcInstant'
+    'ConvertTo-UtcInstant',
+    # T-decision-material-push (msg-1445 §W-2 / §W-3): the material-push wiring.
+    'New-DecisionLink',
+    'New-MaterialUrl',
+    'Get-ComposerReadHead',
+    'Push-DecisionMaterial',
+    'Test-NotificationSuppressed',
+    'Send-NotificationIfChanged',
+    'Send-HumanParkAlert'
 )
 foreach ($name in $needed) {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
@@ -471,6 +483,282 @@ CheckTrue 'first row present' ($section -match 'p1/T-a') $section
 CheckTrue 'second row present' ($section -match 'p2/T-b') $section
 CheckTrue 'input order preserved (p1 before p2)' `
     ($section.IndexOf('p1/T-a') -lt $section.IndexOf('p2/T-b')) $section
+
+# ===============================================================================================
+# T-decision-material-push (msg-1443 §3 / msg-1445 §W-2 / §W-3 / §5): material PUT is wired,
+# ordered before the notification, fail-open, gated on the SAME dedup predicate, and shares
+# {project}/{thread_id} with the human-facing link (I-17).
+# ===============================================================================================
+#
+# Coverage (msg-1445 §5):
+#   (a) order       — Push-DecisionMaterial is called BEFORE Send-Notification (D-34 ①→②)
+#   (b) fail-open   — a throwing / 4xx / 5xx Invoke-MaterialPut leaves the notification body
+#                     one-character-identical to the PUT-success body (D-34)
+#   (c) gate same   — same-signature repeat tick fires neither PUT nor notification (DM-3)
+#   (d) non-ok      — composer_status != "ok" skips the PUT; the raw ping still fires (DM-6)
+#   (e) I-17        — the URL Invoke-MaterialPut receives shares {project}/{thread_id} with the
+#                     link the notification body carries
+#
+# Auxiliary pins:
+#   * head absent  — extras.head_msg_id_read missing => PUT is skipped (DM-4 / I-16)
+#   * URL builders — New-DecisionLink and New-MaterialUrl share $DecisionDashboardBaseUrl and
+#                    percent-encode the same way (I-17 at the layer below Format-DecisionMessage)
+#   * Get-ComposerReadHead — duck-types both hashtable and PSCustomObject envelopes
+
+Write-Host ''
+Write-Host '--- T-decision-material-push ---'
+
+# Fake seams. Both mirror the composer's { ok; ... } shape convention.
+# The order log records the sequence of side-effecting calls so the "order" check is unambiguous
+# even under a future refactor that changed the order without changing the count.
+$script:materialCallCount = 0
+$script:materialLastCall = $null
+$script:materialReturn = @{ ok = $true; status = 200; body = '{"stored":true,"replaced":false}'; elapsed_ms = 42; error = $null }
+$script:materialThrow = $null
+$script:notificationCallCount = 0
+$script:notificationLastMessage = $null
+$script:callOrder = New-Object System.Collections.Generic.List[string]
+
+function Invoke-MaterialPut {
+    param([string]$Url, [string]$BodyJson, [int]$TimeoutSec = 10)
+    $script:materialCallCount++
+    $script:materialLastCall = @{ Url = $Url; BodyJson = $BodyJson; TimeoutSec = $TimeoutSec }
+    $script:callOrder.Add('material')
+    if ($script:materialThrow) { throw $script:materialThrow }
+    return $script:materialReturn
+}
+
+function Send-Notification {
+    param([string]$Message)
+    $script:notificationCallCount++
+    $script:notificationLastMessage = $Message
+    $script:callOrder.Add('notification')
+    return 'sent'
+}
+
+function Reset-MaterialSpy {
+    $script:materialCallCount = 0
+    $script:materialLastCall = $null
+    $script:materialThrow = $null
+    $script:notificationCallCount = 0
+    $script:notificationLastMessage = $null
+    $script:callOrder.Clear()
+}
+
+# --- URL builders share base + encoding (I-17 pin below the caller layer) ----------------------
+Write-Host 'New-DecisionLink / New-MaterialUrl — share base URL and percent-encoding'
+$link = New-DecisionLink -Project 'p 1' -ThreadId 'T/a?x'
+$mUrl = New-MaterialUrl -Project 'p 1' -ThreadId 'T/a?x'
+CheckTrue 'link uses the dashboard base' ($link.StartsWith('https://example.invalid/dashboard/decisions/')) $link
+CheckTrue 'material URL uses the dashboard base' ($mUrl.StartsWith('https://example.invalid/v1/decisions/')) $mUrl
+CheckTrue 'link percent-encodes the project' ($link -match 'p%201') $link
+CheckTrue 'material URL percent-encodes the project (same encoding as link)' ($mUrl -match 'p%201') $mUrl
+CheckTrue 'link percent-encodes the thread id' ($link -match 'T%2Fa%3Fx') $link
+CheckTrue 'material URL percent-encodes the thread id (same encoding as link)' ($mUrl -match 'T%2Fa%3Fx') $mUrl
+CheckTrue 'material URL ends in /material' ($mUrl.EndsWith('/material')) $mUrl
+
+# --- Get-ComposerReadHead — duck-types both shapes --------------------------------------------
+Write-Host ''
+Write-Host 'Get-ComposerReadHead — duck-types hashtable and PSCustomObject envelopes'
+$envHash = @{ composer_status = 'ok'; extras = @{ head_msg_id_read = 'msg-9001' } }
+Check 'hashtable envelope, hashtable extras' 'msg-9001' (Get-ComposerReadHead -Envelope $envHash)
+$envPso = [PSCustomObject]@{
+    composer_status = 'ok'
+    extras          = [PSCustomObject]@{ head_msg_id_read = 'msg-9002' }
+}
+Check 'PSCustomObject envelope, PSCustomObject extras' 'msg-9002' (Get-ComposerReadHead -Envelope $envPso)
+$envNoExtras = [PSCustomObject]@{ composer_status = 'ok' }
+CheckTrue 'no extras -> $null' ($null -eq (Get-ComposerReadHead -Envelope $envNoExtras))
+$envNoKey = [PSCustomObject]@{ composer_status = 'ok'; extras = [PSCustomObject]@{ tail_count = '3' } }
+CheckTrue 'extras present but head_msg_id_read absent -> $null' ($null -eq (Get-ComposerReadHead -Envelope $envNoKey))
+CheckTrue 'null envelope -> $null' ($null -eq (Get-ComposerReadHead -Envelope $null))
+
+# --- Fixture: an ok envelope carrying a composer-read head ------------------------------------
+$freshEnvelope = [PSCustomObject]@{
+    composer_status = 'ok'
+    signature       = 'human:msg-1'
+    extras          = [PSCustomObject]@{
+        head_msg_id_read = 'msg-777'
+        tail_count       = '3'
+    }
+    output          = [PSCustomObject]@{
+        question              = 'Adopt A or B?'
+        options               = @(
+            [PSCustomObject]@{ id = 'A'; label = 'first'; gain = 'gg'; loss = 'll' }
+        )
+        recommendation        = 'A'
+        recommendation_reason = 'because'
+        unknowns              = @('unk-1')
+    }
+}
+
+# ---------- (a) order: material PUT precedes the notification ---------------------------------
+Write-Host ''
+Write-Host '(a) Send-HumanParkAlert — material PUT is called BEFORE Send-Notification (D-34 order)'
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $freshEnvelope; error = $null }
+$script:DecisionComposerBackend = 'claude-code'
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-order' -Project 'p' -ThreadId 'T-order' `
+    -Signature 'human:msg-1' -LastMsgId 'msg-777' `
+    -StopReason 'human' -Rounds 3 `
+    -RawFallback 'raw ping'
+Check 'material PUT fired once' 1 $script:materialCallCount
+Check 'notification fired once' 1 $script:notificationCallCount
+CheckTrue 'material precedes notification in the call log' `
+    (($script:callOrder.IndexOf('material')) -lt ($script:callOrder.IndexOf('notification'))) `
+    ("callOrder=[" + ($script:callOrder -join ',') + "]")
+
+# The body Push-DecisionMaterial sent includes the composer-read head (I-16 wire-side pin).
+$sentBody = $script:materialLastCall.BodyJson | ConvertFrom-Json
+Check 'PUT body carries composer-read head_msg_id' 'msg-777' $sentBody.head_msg_id
+Check 'PUT body carries the signature (magickit stores it opaquely)' 'human:msg-1' $sentBody.signature
+Check 'PUT body carries composer_status=ok' 'ok' $sentBody.composer_status
+Check 'PUT body carries the question' 'Adopt A or B?' $sentBody.question
+
+# --------- (b) fail-open: a throwing / 4xx / 5xx PUT does NOT change the notification --------
+Write-Host ''
+Write-Host '(b) Send-HumanParkAlert — a throwing PUT is fail-open: notification body unchanged'
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $freshEnvelope; error = $null }
+# Baseline: capture the body the notification receives when the PUT succeeds.
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-ok' -Project 'p' -ThreadId 'T-ok' `
+    -Signature 'human:msg-1' -LastMsgId 'msg-777' `
+    -StopReason 'human' -Rounds 3 -RawFallback 'raw ping'
+$msgWithOkPut = $script:notificationLastMessage
+
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $freshEnvelope; error = $null }
+$script:materialThrow = 'simulated tls handshake failure'
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-throw' -Project 'p' -ThreadId 'T-throw' `
+    -Signature 'human:msg-1' -LastMsgId 'msg-777' `
+    -StopReason 'human' -Rounds 3 -RawFallback 'raw ping'
+Check 'throwing PUT: notification still fired exactly once' 1 $script:notificationCallCount
+
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $freshEnvelope; error = $null }
+$script:materialReturn = @{ ok = $false; status = 500; body = 'server exploded'; elapsed_ms = 12; error = 'HTTP 500' }
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-500' -Project 'p' -ThreadId 'T-500' `
+    -Signature 'human:msg-1' -LastMsgId 'msg-777' `
+    -StopReason 'human' -Rounds 3 -RawFallback 'raw ping'
+Check '500 PUT: notification still fired exactly once' 1 $script:notificationCallCount
+# The body is scoped by {ThreadId}/{Project} in Format-DecisionMessage, so a comparison against
+# the baseline needs to be per-thread; compare by replacing the thread id in the failing body
+# with the OK's thread id so the only difference should be the enrichment (which is 0).
+$normalizedFailBody = ($script:notificationLastMessage `
+    -replace 'T-500', 'T-ok' `
+    -replace [regex]::Escape('/T-500'), '/T-ok')
+CheckTrue 'fail-open: notification body is character-identical to the OK-PUT baseline' `
+    ($normalizedFailBody -eq $msgWithOkPut) `
+    ("ok=[$msgWithOkPut] fail=[$normalizedFailBody]")
+
+# Reset the fake back to success for the tests below.
+$script:materialReturn = @{ ok = $true; status = 200; body = '{"stored":true,"replaced":false}'; elapsed_ms = 42; error = $null }
+
+# ---------- (c) gate: same-signature repeat tick fires neither PUT nor notification -----------
+Write-Host ''
+Write-Host '(c) Send-HumanParkAlert — same signature: neither PUT nor notification (DM-3)'
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $freshEnvelope; error = $null }
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-gate' -Project 'p' -ThreadId 'T-gate' `
+    -Signature 'human:msg-1' -LastMsgId 'msg-777' `
+    -StopReason 'human' -Rounds 3 -RawFallback 'raw ping'
+Check 'first tick: PUT fired once' 1 $script:materialCallCount
+Check 'first tick: notification fired once' 1 $script:notificationCallCount
+
+# Same signature, second tick.
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-gate' -Project 'p' -ThreadId 'T-gate' `
+    -Signature 'human:msg-1' -LastMsgId 'msg-777' `
+    -StopReason 'human' -Rounds 3 -RawFallback 'raw ping'
+Check 'second same-signature tick: PUT count STILL 1 (DM-3 gate held)' 1 $script:materialCallCount
+Check 'second same-signature tick: notification count STILL 1' 1 $script:notificationCallCount
+
+# ---------- (d) non-ok composer_status: PUT skipped, notification fires -----------------------
+Write-Host ''
+Write-Host '(d) Send-HumanParkAlert — composer_status != "ok" skips PUT; raw ping fires (DM-6)'
+$errorEnvelope = [PSCustomObject]@{
+    composer_status = 'error'
+    extras          = [PSCustomObject]@{ head_msg_id_read = 'msg-777' }
+    output          = $null
+    error           = 'simulated composer timeout'
+}
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $errorEnvelope; error = $null }
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-nonok' -Project 'p' -ThreadId 'T-nonok' `
+    -Signature 'human:msg-2' -LastMsgId 'msg-777' `
+    -StopReason 'human' -Rounds 4 -RawFallback 'raw ping for T-nonok'
+Check 'non-ok envelope: PUT was NOT called' 0 $script:materialCallCount
+Check 'non-ok envelope: notification still fired (raw ping fell through)' 1 $script:notificationCallCount
+Check 'non-ok envelope: notification body is the raw fallback' 'raw ping for T-nonok' $script:notificationLastMessage
+
+# ---------- extras.head_msg_id_read missing: PUT skipped (DM-4 / I-16) ------------------------
+Write-Host ''
+Write-Host 'Send-HumanParkAlert — missing extras.head_msg_id_read skips PUT (DM-4 / I-16)'
+$noHeadEnvelope = [PSCustomObject]@{
+    composer_status = 'ok'
+    extras          = [PSCustomObject]@{ tail_fetch_error = 'chatroom outage' }
+    output          = [PSCustomObject]@{
+        question              = 'q?'
+        options               = @()
+        recommendation        = $null
+        recommendation_reason = $null
+        unknowns              = @()
+    }
+}
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $noHeadEnvelope; error = $null }
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'p/T-nohead' -Project 'p' -ThreadId 'T-nohead' `
+    -Signature 'human:msg-3' -LastMsgId 'msg-999' `
+    -StopReason 'human' -Rounds 2 -RawFallback 'raw ping'
+Check 'no head_msg_id_read: PUT was NOT called (fallback to last_msg_id is forbidden)' 0 $script:materialCallCount
+Check 'no head_msg_id_read: notification still fired' 1 $script:notificationCallCount
+
+# ---------- (e) I-17: PUT URL and link body share {project}/{thread_id} -----------------------
+Write-Host ''
+Write-Host '(e) Send-HumanParkAlert — PUT URL and notification body link share {project}/{thread_id}'
+Reset-MaterialSpy
+$pending = @{}
+$notified = @{}
+$script:composerCallCount = 0
+$script:composerReturn = @{ ok = $true; envelope = $freshEnvelope; error = $null }
+Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+    -Key 'proj-x/T-share' -Project 'proj-x' -ThreadId 'T-share' `
+    -Signature 'human:msg-5' -LastMsgId 'msg-777' `
+    -StopReason 'human' -Rounds 3 -RawFallback 'raw ping'
+$putUrl = $script:materialLastCall.Url
+$notifBody = $script:notificationLastMessage
+CheckTrue 'PUT URL contains {project}=proj-x' ($putUrl -match '/decisions/proj-x/') $putUrl
+CheckTrue 'PUT URL contains {thread_id}=T-share' ($putUrl -match '/proj-x/T-share/') $putUrl
+CheckTrue 'notification body contains the SAME {project}/{thread_id} in its link' `
+    ($notifBody -match 'dashboard/decisions/proj-x/T-share') $notifBody
 
 Write-Host ''
 if ($script:failures -gt 0) {

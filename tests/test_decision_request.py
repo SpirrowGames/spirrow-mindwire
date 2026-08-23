@@ -807,3 +807,133 @@ class TestCliClaudeCodeBackend:
         assert row["composer_status"] == "ok"
         # No tail_count key when fetch did not run.
         assert "tail_count" not in row["extras"]
+
+    # --------------------------------------------------------------------- #
+    # I-16 pin (T-decision-material-push msg-1443 §3 / msg-1445 §DM-4)
+    # --------------------------------------------------------------------- #
+    #
+    # The wrapper's material push reads envelope.extras["head_msg_id_read"]
+    # AND ONLY THAT KEY to decide the head_msg_id it sends to magickit. Two
+    # invariants must hold on the CLI side:
+    #
+    #   (a) When the fetcher returns a non-empty tail, the key is present
+    #       and equals the msg_id of the LAST element (chatroom_get_thread
+    #       in mode="full" returns messages in msg_id-ascending order, so
+    #       the tail's last element IS the thread head at the moment of
+    #       the fetch — the SOT the composer actually read).
+    #   (b) When the fetch raises OR returns an empty tuple, the key is
+    #       ABSENT — never falls back to last_msg_id (the conductor stop
+    #       line, not what the composer read). This is what the wrapper
+    #       depends on to skip the PUT and produce J-absent instead of
+    #       claiming a fresh head the composer never observed. The
+    #       receiver cannot detect that lie, so the pin lives here.
+
+    def test_head_msg_id_read_is_the_last_fetched_msg_id(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from spirrow_mindwire.decision_request import claude_code as cc_mod
+        from spirrow_mindwire.decision_request import cli as cli_mod
+        from spirrow_mindwire.decision_request.claude_code import SubprocessResult
+
+        async def fake_fetch(
+            project: str, thread_id: str, count: int, body_cap: int
+        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+            # Ascending msg_id order — the head is msg-2702, the last
+            # element. Any tuple order regression would flip this pin.
+            msgs = (
+                ThreadTailMessage(msg_id="msg-2700", author="a", body="b0"),
+                ThreadTailMessage(msg_id="msg-2701", author="b", body="b1"),
+                ThreadTailMessage(msg_id="msg-2702", author="c", body="b2"),
+            )
+            return msgs, 42, sum(len(m.body) for m in msgs), False
+
+        monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", fake_fetch)
+        monkeypatch.setattr(
+            cc_mod,
+            "_default_runner",
+            lambda **_: SubprocessResult(0, self._fake_composer_cli_bytes(), b""),
+        )
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(self._payload())))
+
+        rc = main(["--backend", "claude-code", "--tail", "3"])
+        assert rc == 0
+        row = json.loads(capsys.readouterr().out)
+        assert row["composer_status"] == "ok"
+        # I-16: the head the composer read is the LAST fetched msg_id, not
+        # the payload's last_msg_id. The payload sets last_msg_id="msg-2582"
+        # (see _payload), so a regression that copies last_msg_id in place
+        # would silently ship the wrong head — this assertion is what
+        # forces the read-time value to travel to the wrapper.
+        assert row["extras"]["head_msg_id_read"] == "msg-2702"
+        assert row["last_msg_id"] == "msg-2582"
+
+    def test_head_msg_id_read_absent_when_fetch_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from spirrow_mindwire.decision_request import claude_code as cc_mod
+        from spirrow_mindwire.decision_request import cli as cli_mod
+        from spirrow_mindwire.decision_request.claude_code import SubprocessResult
+
+        async def failing_fetch(
+            *_args: object, **_kwargs: object
+        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+            raise RuntimeError("chatroom outage")
+
+        monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", failing_fetch)
+        monkeypatch.setattr(
+            cc_mod,
+            "_default_runner",
+            lambda **_: SubprocessResult(0, self._fake_composer_cli_bytes(), b""),
+        )
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(self._payload())))
+        rc = main(["--backend", "claude-code", "--tail", "5"])
+        assert rc == 0
+        row = json.loads(capsys.readouterr().out)
+        # The composer ran (empty tail is legal) and the failure surfaced.
+        assert row["composer_status"] == "ok"
+        assert row["extras"]["tail_fetch_error"].startswith("RuntimeError:")
+        # The KEY MUST BE ABSENT. Not "empty string", not "None" — absent.
+        # The wrapper reads only this key; if it were present-but-empty a
+        # defensive check downstream would still let the wrong head slip
+        # through under a future refactor. The pin here is the strongest
+        # form the CLI can offer.
+        assert "head_msg_id_read" not in row["extras"]
+
+    def test_head_msg_id_read_absent_when_fetch_returns_empty_tuple(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Defensive branch (Einstein msg-1446 §1): a well-behaved fetcher
+        # that returned an EMPTY tuple without raising must not crash the
+        # composer with IndexError, and must not write a bogus head. The
+        # composer path continues; the key stays absent for the same reason
+        # as the fetch-failure case above.
+        from spirrow_mindwire.decision_request import claude_code as cc_mod
+        from spirrow_mindwire.decision_request import cli as cli_mod
+        from spirrow_mindwire.decision_request.claude_code import SubprocessResult
+
+        async def empty_fetch(
+            *_args: object, **_kwargs: object
+        ) -> tuple[tuple[ThreadTailMessage, ...], int, int, bool]:
+            return (), 0, 0, False
+
+        monkeypatch.setattr(cli_mod, "DEFAULT_TAIL_FETCHER", empty_fetch)
+        monkeypatch.setattr(
+            cc_mod,
+            "_default_runner",
+            lambda **_: SubprocessResult(0, self._fake_composer_cli_bytes(), b""),
+        )
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(self._payload())))
+        rc = main(["--backend", "claude-code", "--tail", "5"])
+        assert rc == 0
+        row = json.loads(capsys.readouterr().out)
+        assert row["composer_status"] == "ok"
+        # tail_count telemetry is written (fetch did not raise), but the
+        # head-read key is not — no head was actually read.
+        assert row["extras"]["tail_count"] == "0"
+        assert "head_msg_id_read" not in row["extras"]
