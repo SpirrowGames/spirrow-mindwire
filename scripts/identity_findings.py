@@ -1,0 +1,376 @@
+"""Read-only findings for the T-role-null-must-become-impossible read half.
+
+Answers the four measurements Bohr's DoD (msg-1487 §8, msg-1491 §4, msg-1493 §6) requires
+before the write half can supply values to ``upsert_identity``:
+
+  1. Author enumeration — every author that has posted in the given projects since the
+     cutoff (default: PR #153's merge commit, per msg-1487 §4).
+  2. Per-author observed role set — the set of ``role`` values the identity has actually
+     supplied on messages in scope.
+  3. ADR-11 normalisation collisions — raw author spellings that collapse to one canonical
+     key. Reported, not resolved (msg-1487 §6 point 1: "**衝突は登録せず報告**").
+  4. Derived ``(allowed_roles, residual)`` per classified identity, computed by
+     :func:`~spirrow_mindwire.identity.derive_allowed_and_residual` — the "by construction"
+     derivation Einstein required in msg-1492.
+
+The script is READ-ONLY. It never posts, never marks read, never touches the identity
+store. It is the "測る" half of msg-1491 §4's read/write split — always executable, does
+not depend on the readiness lock.
+
+Output shape (stdout JSON):
+
+    {
+      "scope": {
+        "projects": ["spirrow-mindwire", "spirrow-voxelworld"],
+        "since_created_at": "2026-08-17T00:00:00Z",
+        "since_msg_id": null,
+        "classification_path": "spec/identity/legitimate_roles.yaml"
+      },
+      "authors": [
+        {
+          "raw_name": "naysayer-pr-review",
+          "normalized_key": "naysayer-pr-review",
+          "post_count": 12,
+          "observed_roles": ["naysayer", null],
+          "classification": {
+            "known": true,
+            "kind": "participant",
+            "legitimate": ["naysayer"]
+          },
+          "derivation": {
+            "allowed_roles": ["naysayer"],
+            "residual": []
+          }
+        },
+        ...
+      ],
+      "unclassified_authors": ["some-new-author"],
+      "collisions": {"foo-bar": ["foo-bar", "Foo_Bar"]},
+      "totals": {
+        "threads_scanned": 341,
+        "messages_scanned": 6879,
+        "messages_in_scope": 512,
+        "classified_authors": 4,
+        "unclassified_authors": 1,
+        "authors_with_residual": 0
+      }
+    }
+
+Exit codes:
+
+  0 — findings produced (the JSON above is on stdout, even if there are unclassified
+      authors or non-empty residuals — those are outcomes, not errors)
+  1 — the script itself failed (transport dead, classification file unreadable, etc.)
+
+Non-empty ``unclassified_authors`` or ``collisions`` or ``authors_with_residual > 0`` is
+the SIGNAL that the write half MUST NOT proceed until each is resolved — msg-1493 §5:
+"登録済み and 理由付き保留 together cover the scope, and 無説明残余 = 0". This script
+does not enforce that; it produces the evidence.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from collections import defaultdict
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from spirrow_mindwire.identity import (
+    ClassificationError,
+    IdentityCollisionError,
+    LegitimateRolesFile,
+    default_classification_path,
+    derive_allowed_and_residual,
+    find_collisions,
+    load_legitimate_roles,
+    normalize_identity_key,
+)
+from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
+
+# PR #153 (`13618e9`, `feat: conductor supplies role...`) merged 2026-08-17 in
+# `spirrow-mindwire`. Bohr's msg-1487 §4 pins the scope to "deploy 以降に post した author"
+# and this is the deploy in question. Anything older is history — msg-1179 §6 point 2's
+# "履歴は null のまま残す" carry-forward.
+_DEFAULT_SINCE = "2026-08-17T00:00:00+00:00"
+_DEFAULT_PROJECTS = ("spirrow-mindwire", "spirrow-voxelworld")
+
+
+async def _list_threads(mcp: StreamableHttpChatroomMcp, project: str) -> list[dict[str, Any]]:
+    """Enumerate every thread in ``project``, paging through ``chatroom_list_threads``.
+
+    Same paging shape as ``scripts/gen_next_line_corpus.py`` — a stopping condition based
+    on both an empty page and the ``total`` field, whichever comes first, so a transient
+    off-by-one in one field does not silently truncate.
+    """
+    threads: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        page: Any = await mcp.call_tool(
+            "chatroom_list_threads", {"project": project, "limit": 200, "offset": offset}
+        )
+        if not isinstance(page, dict):
+            break
+        items = page.get("items") or []
+        if not isinstance(items, list) or not items:
+            break
+        threads.extend(item for item in items if isinstance(item, dict))
+        offset += len(items)
+        total = page.get("total")
+        if isinstance(total, int) and offset >= total:
+            break
+    return threads
+
+
+async def _fetch_thread_messages(
+    mcp: StreamableHttpChatroomMcp, project: str, thread_id: str
+) -> list[dict[str, Any]]:
+    """Return the full message list for ``thread_id``. Raises :class:`MagickitMcpError`."""
+    body: Any = await mcp.call_tool(
+        "chatroom_get_thread",
+        {"project": project, "thread_id": thread_id, "mode": "full"},
+    )
+    if not isinstance(body, dict):
+        return []
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return []
+    return [m for m in messages if isinstance(m, dict)]
+
+
+def _in_scope(msg: dict[str, Any], since_iso: str, since_msg_id: str | None) -> bool:
+    """Whether ``msg`` is at or after the caller-supplied cutoff.
+
+    Two cutoff modes, tried in order:
+
+      * ``since_msg_id`` (chatroom-native): a lex compare on ``msg-NNNN`` strings works
+        because the padding is fixed and the ids are monotonic per chatroom project. When
+        the caller supplies this AND the message id compares less than the cutoff, drop.
+      * ``since_iso``: parse ``created_at`` and compare against the cutoff timestamp. A
+        message whose ``created_at`` is unparseable is treated as in-scope (fail-open on
+        the read side — we would rather over-include than silently drop an unreadable
+        message that the write half then never sees a finding about).
+
+    Both filters are AND-ed when both are supplied.
+    """
+    if since_msg_id:
+        this_id = str(msg.get("msg_id") or "")
+        if this_id and this_id < since_msg_id:
+            return False
+    created_at = msg.get("created_at")
+    if not isinstance(created_at, str) or not created_at:
+        return True
+    try:
+        # chatroom timestamps are ISO 8601 with a `Z` suffix; ``fromisoformat`` accepts
+        # `+00:00` but not `Z` on Python <3.11, so normalise first.
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    try:
+        cutoff = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+    except ValueError:
+        # An unparseable cutoff argument is a caller bug; treat as "no cutoff" so the
+        # script still runs and produces something the operator can react to.
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=UTC)
+    return parsed >= cutoff
+
+
+def _summarise(
+    author_role_counts: dict[str, dict[str | None, int]],
+    classification: LegitimateRolesFile,
+) -> tuple[list[dict[str, Any]], list[str], int]:
+    """Fold the observation into the per-author output shape + list unclassified names.
+
+    Returns ``(authors_entries, unclassified_raw_names, authors_with_residual_count)``.
+    """
+    entries: list[dict[str, Any]] = []
+    unclassified: list[str] = []
+    residual_count = 0
+    for raw_name in sorted(author_role_counts):
+        role_counts = author_role_counts[raw_name]
+        key = normalize_identity_key(raw_name)
+        classification_entry = classification.by_key(key)
+        observed_roles: list[str] = sorted(r for r in role_counts if isinstance(r, str))
+        post_count = sum(role_counts.values())
+        entry: dict[str, Any] = {
+            "raw_name": raw_name,
+            "normalized_key": key,
+            "post_count": post_count,
+            "observed_roles": observed_roles,
+            "role_counts": {(r if r is not None else "<null>"): n for r, n in role_counts.items()},
+        }
+        if classification_entry is None:
+            unclassified.append(raw_name)
+            entry["classification"] = {"known": False}
+        else:
+            derivation = derive_allowed_and_residual(
+                observed_roles, classification_entry.legitimate
+            )
+            if derivation.residual:
+                residual_count += 1
+            entry["classification"] = {
+                "known": True,
+                "kind": classification_entry.kind,
+                "legitimate": sorted(classification_entry.legitimate),
+                "primary_source": classification_entry.primary_source,
+            }
+            entry["derivation"] = {
+                "allowed_roles": sorted(derivation.allowed_roles),
+                "residual": sorted(derivation.residual),
+            }
+        entries.append(entry)
+    return entries, unclassified, residual_count
+
+
+async def _measure(
+    projects: Iterable[str],
+    since_iso: str,
+    since_msg_id: str | None,
+    url: str | None,
+    classification: LegitimateRolesFile,
+) -> dict[str, Any]:
+    mcp = StreamableHttpChatroomMcp(url)
+    author_role_counts: dict[str, dict[str | None, int]] = defaultdict(lambda: defaultdict(int))
+    threads_scanned = 0
+    messages_scanned = 0
+    messages_in_scope = 0
+    errors: list[dict[str, str]] = []
+
+    for project in projects:
+        threads = await _list_threads(mcp, project)
+        threads_scanned += len(threads)
+        for thread in threads:
+            thread_id = str(thread.get("thread_id") or "")
+            if not thread_id:
+                continue
+            try:
+                messages = await _fetch_thread_messages(mcp, project, thread_id)
+            except MagickitMcpError as exc:
+                errors.append(
+                    {
+                        "project": project,
+                        "thread_id": thread_id,
+                        "reason": f"chatroom_get_thread failed: {exc}",
+                    }
+                )
+                continue
+            for message in messages:
+                messages_scanned += 1
+                if not _in_scope(message, since_iso, since_msg_id):
+                    continue
+                messages_in_scope += 1
+                author = message.get("author")
+                if not isinstance(author, str) or not author.strip():
+                    continue
+                role_raw = message.get("role")
+                role_key: str | None = role_raw if isinstance(role_raw, str) and role_raw else None
+                author_role_counts[author][role_key] += 1
+
+    plain_counts = {a: dict(rc) for a, rc in author_role_counts.items()}
+    entries, unclassified, residual_count = _summarise(plain_counts, classification)
+    collisions = find_collisions(plain_counts.keys())
+
+    return {
+        "scope": {
+            "projects": list(projects),
+            "since_created_at": since_iso,
+            "since_msg_id": since_msg_id,
+            "classification_path": str(default_classification_path()),
+        },
+        "authors": entries,
+        "unclassified_authors": unclassified,
+        "collisions": collisions,
+        "errors": errors,
+        "totals": {
+            "threads_scanned": threads_scanned,
+            "messages_scanned": messages_scanned,
+            "messages_in_scope": messages_in_scope,
+            "classified_authors": len(entries) - len(unclassified),
+            "unclassified_authors": len(unclassified),
+            "authors_with_residual": residual_count,
+            "collision_groups": len(collisions),
+        },
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--project",
+        action="append",
+        default=None,
+        help=(
+            "project id (repeatable). Defaults to spirrow-mindwire + spirrow-voxelworld "
+            "(the live gate projects at deploy time)."
+        ),
+    )
+    parser.add_argument(
+        "--since-created-at",
+        default=_DEFAULT_SINCE,
+        help=(
+            "ISO-8601 cutoff; only messages with created_at >= this are counted. "
+            f"Default: {_DEFAULT_SINCE} (PR #153 merge)."
+        ),
+    )
+    parser.add_argument(
+        "--since-msg-id",
+        default=None,
+        help=(
+            "Optional msg-id cutoff. When set, messages with msg_id < this are dropped "
+            "(applied in addition to --since-created-at)."
+        ),
+    )
+    parser.add_argument(
+        "--classification",
+        type=Path,
+        default=None,
+        help=(
+            "Path to legitimate_roles.yaml. Default: spec/identity/legitimate_roles.yaml "
+            "at the repo root."
+        ),
+    )
+    parser.add_argument(
+        "--url", default=None, help="magickit MCP URL (default: in-code/env default)"
+    )
+    args = parser.parse_args()
+
+    classification_path = args.classification or default_classification_path()
+    try:
+        classification = load_legitimate_roles(classification_path)
+    except (ClassificationError, IdentityCollisionError, OSError) as exc:
+        print(f"identity_findings: classification unreadable: {exc}", file=sys.stderr)
+        return 1
+
+    projects = tuple(args.project) if args.project else _DEFAULT_PROJECTS
+    try:
+        result = asyncio.run(
+            _measure(
+                projects=projects,
+                since_iso=args.since_created_at,
+                since_msg_id=args.since_msg_id,
+                url=args.url,
+                classification=classification,
+            )
+        )
+    except Exception as exc:
+        # Whole-run failure: transport dead, asyncio setup broke, etc. Different from a
+        # per-thread fetch failure (which is recorded in `errors` and does not exit).
+        print(f"identity_findings: measurement failed: {exc}", file=sys.stderr)
+        return 1
+
+    # ensure_ascii=True so a Japanese exception message that got into `errors[].reason`
+    # cannot break a Windows cp932 stdout — same rule as parked_humans.py D-33 note.
+    print(json.dumps(result, ensure_ascii=True, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
