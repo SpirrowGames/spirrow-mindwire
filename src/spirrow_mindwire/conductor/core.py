@@ -401,6 +401,19 @@ class Conductor:
             return self._human_terminal(messages, explicit_human=False)
 
         if handoff.kind is HandoffKind.HUMAN:
+            # C (T-human-terminal-overuse msg-890 §3): record the TIER-C: <label> the author put
+            # on the line above their `NEXT: human` — presence and absence both. This is the
+            # calibration input for the pre-registered A2 threshold (>20% ∧ ≥3 uncalled explicit
+            # human terminals from proposer disposition turns, in a 14-day / 20-turn window,
+            # msg-890 §2). NON-BLOCKING by design: nothing about the routing changes on the tag's
+            # presence, absence, or value — if it did the calibrator would be destroying its own
+            # calibration (missing labels would stop being observable).
+            logger.info(
+                "conductor human terminal: author=%s author_role=%s tier_c_label=%s",
+                _author(messages[-1]),
+                author_role.value if author_role is not None else None,
+                handoff.tier_c_label,
+            )
             return self._human_terminal(messages, explicit_human=True)
 
         if handoff.kind is HandoffKind.ROLE:

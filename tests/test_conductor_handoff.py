@@ -12,6 +12,7 @@ import spirrow_mindwire.conductor.handoff as handoff_mod
 from spirrow_mindwire.conductor.handoff import (
     HUMAN_TOKEN,
     NONE_TOKEN,
+    TIER_C_LABELS,
     Handoff,
     HandoffKind,
     build_handoff_protocol_block,
@@ -292,6 +293,47 @@ def test_proposer_block_forbids_direct_implementer_handoff() -> None:
     assert "Do NOT hand a design straight to the implementer" in block
 
 
+def test_proposer_block_hands_back_to_naysayer_after_disposition() -> None:
+    # A (T-human-terminal-overuse, msg-890 §1): the proposer's post-disposition handoff goes to
+    # the NAYSAYER, not to the human. This is what unlocks carve-out ③ (the naysayer's own proceed
+    # is the only path to autonomous implementation) for a design the proposer has finished
+    # answering objections on. If the guidance ever regresses to pointing at `human` here, the
+    # observed defect (msg-882 §実測1: 85.8% of stops are on `human`, mostly non-judgement) comes
+    # straight back — this pins the fix in words.
+    block = build_handoff_protocol_block(Role.PROPOSER)
+    assert "hand BACK to the naysayer" in block
+    # And the reason the redirect is safe: the proposer never advances a design to code itself.
+    assert "only the naysayer may advance a design to code" in block
+
+
+def test_proposer_block_is_control_state_agnostic() -> None:
+    # Bohr msg-890 §1: the proposer's guidance is written to be true under any loop control state
+    # (`run` / `supervised` / `hold`), so the proposer never has to know what state the loop is
+    # in — state-dependent branching is closed inside the conductor. This test pins that the
+    # proposer's block does not name any of the control-state vocabulary; if it did, the text
+    # would go stale the moment loop control changed. Naysayer guidance IS state-aware (existing)
+    # and is explicitly out of scope; only the proposer block is asserted here.
+    block = build_handoff_protocol_block(Role.PROPOSER)
+    for state_word in ("`run`", "`hold`", "`supervised`", "autonomously"):
+        assert state_word not in block, (
+            f"proposer guidance leaked control state vocabulary: {state_word!r}"
+        )
+
+
+def test_proposer_block_teaches_tier_c_syntax_and_enum() -> None:
+    # C (msg-890 §3): the proposer's block documents the `TIER-C: <label>` syntax and lists the
+    # enum, so a cooperating proposer can name the class of Tier-C decision it is asking for. The
+    # tag itself is non-blocking (see the parser tests below), but the guidance has to spell the
+    # syntax somewhere or the tag is invisible to the author. This lives with the proposer because
+    # explicit-human handoffs from disposition turns are the dominant class msg-882 counted.
+    block = build_handoff_protocol_block(Role.PROPOSER)
+    assert "TIER-C:" in block
+    for label in TIER_C_LABELS:
+        assert f"`{label}`" in block, f"enum label {label!r} missing from proposer guidance"
+    assert "other:<one-line reason>" in block
+    assert "does NOT redefine" in block  # calibration-not-definition mantra kept in the text
+
+
 def test_implementer_block_hands_back_to_proposer_and_never_merges() -> None:
     block = build_handoff_protocol_block(Role.IMPLEMENTER)
     assert "proposer" in block
@@ -301,6 +343,125 @@ def test_implementer_block_hands_back_to_proposer_and_never_merges() -> None:
 def test_naysayer_block_is_advisory() -> None:
     block = build_handoff_protocol_block(Role.NAYSAYER)
     assert "advisory, not a veto" in block
+
+
+# --------------------------------------------------------------------------- #
+# C — TIER-C: <label> look-back parse (msg-890 §3, Einstein msg-891 §4)
+#
+# Both sides of the measurement are exercised: presence records the label, absence records None.
+# NON-BLOCKING is the load-bearing property — the `Handoff.kind` on the human terminal is HUMAN
+# whether or not the tag is there; the tag NEVER changes the routing decision. If it did, the
+# calibrator would destroy its own calibration (missing labels would stop being observable).
+# --------------------------------------------------------------------------- #
+
+
+class TestTierCLabelLookback:
+    """`TIER-C: <label>` on line n-1 of the LAST `NEXT: human`, else None."""
+
+    def test_records_enum_label_from_the_line_above_next_human(self) -> None:
+        body = "body\n\nTIER-C: merge-protected\nNEXT: human"
+        h = resolve_handoff(body, _ROSTER)
+        assert h.kind is HandoffKind.HUMAN
+        assert h.tier_c_label == "merge-protected"
+
+    def test_case_of_label_is_normalised_but_reason_of_other_is_preserved(self) -> None:
+        # `SCOPE` and `scope` are the same label for aggregation, but the reason text on an
+        # `other:` label carries information the observer wrote — preserve its case.
+        h = resolve_handoff("TIER-C: SCOPE\nNEXT: human", _ROSTER)
+        assert h.tier_c_label == "scope"
+        h = resolve_handoff("TIER-C: other: Redistribute Weekly Budget\nNEXT: human", _ROSTER)
+        assert h.tier_c_label == "other:Redistribute Weekly Budget"
+
+    def test_all_enum_labels_parse(self) -> None:
+        # Guard against a rename of the enum silently dropping one label from parse (a shape the
+        # test-per-label pattern would miss because tests are per-label written by the author who
+        # knew the current list).
+        for label in TIER_C_LABELS:
+            h = resolve_handoff(f"TIER-C: {label}\nNEXT: human", _ROSTER)
+            assert h.tier_c_label == label, label
+
+    def test_absence_of_tier_c_line_records_none_and_does_not_reject(self) -> None:
+        # The load-bearing non-blocking property: no tag, still HUMAN, tag is None.
+        h = resolve_handoff("just a body\n\nNEXT: human", _ROSTER)
+        assert h.kind is HandoffKind.HUMAN
+        assert h.tier_c_label is None
+
+    def test_unknown_label_is_treated_as_absent_not_as_reject(self) -> None:
+        # A label that is not in the closed enum and does not begin with `other:` is silently
+        # ignored — we record its absence, not a syntax error. Rejecting would block, which is
+        # explicitly out of scope for v1 (msg-890 §3: 非ブロッキング).
+        h = resolve_handoff("TIER-C: fabricated-label\nNEXT: human", _ROSTER)
+        assert h.kind is HandoffKind.HUMAN
+        assert h.tier_c_label is None
+
+    def test_blank_line_between_tier_c_and_next_defeats_the_lookback(self) -> None:
+        # Einstein msg-891 §4 pinned the lookback to line n-1 (strict adjacency). A blank line
+        # makes the label's home ambiguous — we take that as "no label" rather than scanning
+        # backwards. Loose scanning would false-positive on quoted TIER-C: text elsewhere in the
+        # reply, and would corrupt the very measurement this parser exists to enable.
+        h = resolve_handoff("TIER-C: scope\n\nNEXT: human", _ROSTER)
+        assert h.kind is HandoffKind.HUMAN
+        assert h.tier_c_label is None
+
+    def test_last_next_human_wins_over_earlier_tier_c_label(self) -> None:
+        # If an earlier quoted `NEXT: human` had a TIER-C: line above it and the REAL final
+        # handoff does not, we record None. The tag belongs to the FINAL handoff — same
+        # last-wins rule the NEXT: parser uses, applied to the label lookback.
+        body = (
+            "I am quoting an earlier decision that read:\n"
+            "TIER-C: billing\n"
+            "NEXT: human\n"
+            "\n"
+            "...my reply...\n"
+            "NEXT: human"
+        )
+        h = resolve_handoff(body, _ROSTER)
+        assert h.kind is HandoffKind.HUMAN
+        assert h.tier_c_label is None
+
+    def test_tier_c_line_without_a_next_human_line_at_all_does_not_leak(self) -> None:
+        # A TIER-C: line with no NEXT: line at all resolves to ABSENT (no handoff), and the tag
+        # is NOT smuggled onto the ABSENT handoff. v1 explicitly parses tags only for HUMAN.
+        h = resolve_handoff("TIER-C: scope\n(nothing else)", _ROSTER)
+        assert h.kind is HandoffKind.ABSENT
+        assert h.tier_c_label is None
+
+    def test_role_handoff_carries_no_tier_c_label_even_when_line_is_present(self) -> None:
+        # If someone writes TIER-C: above a ROLE handoff, we do not record it. In v1 the tag is a
+        # measurement of explicit HUMAN terminals only (msg-890 §3), so ROLE / PR_REVIEW / NONE
+        # stay clean.
+        h = resolve_handoff("TIER-C: scope\nNEXT: Heisenberg", _ROSTER)
+        assert h.kind is HandoffKind.ROLE
+        assert h.tier_c_label is None
+
+    def test_tier_c_line_is_case_insensitive_at_the_keyword(self) -> None:
+        # `tier-c:` / `Tier-C:` / `TIER-C:` all mean the same to the parser — the author's shift
+        # key is not part of the enum vocabulary.
+        for keyword in ("TIER-C:", "tier-c:", "Tier-C:"):
+            h = resolve_handoff(f"{keyword} scope\nNEXT: human", _ROSTER)
+            assert h.tier_c_label == "scope", keyword
+
+    def test_whitespace_after_the_keyword_is_optional(self) -> None:
+        # Gemini PR-gate critique on #173: requiring `\s+` after `TIER-C:` silently misclassifies
+        # `TIER-C:scope` (no space) as ABSENT, corrupting the calibration denominator. Zero, one,
+        # or many spaces between the colon and the label MUST all resolve to the same tag —
+        # otherwise the "missing label" baseline is inflated by every unspaced author, and A2's
+        # pre-registered threshold (>20% missing) reads a phantom signal.
+        for spacing in ("", " ", "  ", "\t"):
+            body = f"TIER-C:{spacing}scope\nNEXT: human"
+            h = resolve_handoff(body, _ROSTER)
+            assert h.tier_c_label == "scope", repr(spacing)
+        # `other:` label similarly: the space between `TIER-C:` and `other:` is also optional.
+        h = resolve_handoff("TIER-C:other:reason\nNEXT: human", _ROSTER)
+        assert h.tier_c_label == "other:reason"
+
+    def test_missing_colon_after_tier_c_still_does_not_match(self) -> None:
+        # The relaxation to `\s*` narrows only the whitespace requirement, not the colon
+        # requirement. `TIER-Cscope` (missing colon entirely) must still be treated as ABSENT so
+        # a stray typo does not silently mint a label from the following word.
+        h = resolve_handoff("TIER-Cscope\nNEXT: human", _ROSTER)
+        assert h.kind is HandoffKind.HUMAN
+        assert h.tier_c_label is None
 
 
 # --------------------------------------------------------------------------- #
