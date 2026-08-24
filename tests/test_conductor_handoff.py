@@ -441,6 +441,28 @@ class TestTierCLabelLookback:
             h = resolve_handoff(f"{keyword} scope\nNEXT: human", _ROSTER)
             assert h.tier_c_label == "scope", keyword
 
+    def test_whitespace_after_the_keyword_is_optional(self) -> None:
+        # Gemini PR-gate critique on #173: requiring `\s+` after `TIER-C:` silently misclassifies
+        # `TIER-C:scope` (no space) as ABSENT, corrupting the calibration denominator. Zero, one,
+        # or many spaces between the colon and the label MUST all resolve to the same tag —
+        # otherwise the "missing label" baseline is inflated by every unspaced author, and A2's
+        # pre-registered threshold (>20% missing) reads a phantom signal.
+        for spacing in ("", " ", "  ", "\t"):
+            body = f"TIER-C:{spacing}scope\nNEXT: human"
+            h = resolve_handoff(body, _ROSTER)
+            assert h.tier_c_label == "scope", repr(spacing)
+        # `other:` label similarly: the space between `TIER-C:` and `other:` is also optional.
+        h = resolve_handoff("TIER-C:other:reason\nNEXT: human", _ROSTER)
+        assert h.tier_c_label == "other:reason"
+
+    def test_missing_colon_after_tier_c_still_does_not_match(self) -> None:
+        # The relaxation to `\s*` narrows only the whitespace requirement, not the colon
+        # requirement. `TIER-Cscope` (missing colon entirely) must still be treated as ABSENT so
+        # a stray typo does not silently mint a label from the following word.
+        h = resolve_handoff("TIER-Cscope\nNEXT: human", _ROSTER)
+        assert h.kind is HandoffKind.HUMAN
+        assert h.tier_c_label is None
+
 
 # --------------------------------------------------------------------------- #
 # Layer-2 Markdown tolerance — the *safety* tests come first.

@@ -218,8 +218,17 @@ TIER_C_LABELS: tuple[str, ...] = (
 # `other:` and the reason is optional (`other:Foo` and `other: Foo` normalise to the same tag),
 # but the reason itself is required — an empty `other:` would defeat the point of naming a novel
 # type, so it does not match at all and is recorded as absent.
+#
+# Whitespace between the ``TIER-C:`` keyword and the label is ALSO optional (`\s*`, not `\s+`):
+# `TIER-C:scope` and `TIER-C: scope` normalise to the same tag. Requiring a space here would
+# silently misclassify the unspaced form as ABSENT and inflate the "missing label" baseline —
+# and because this whole parser is non-blocking by design, the failure would be silent. That is
+# the exact shape of corruption the calibration must not admit (Gemini PR-gate critique on #173:
+# "silently misclassifying `TIER-C:scope` as an absent tag corrupts the observation data").
+# The colon is still required (`TIER-Cscope` does not match) — only the whitespace after it is
+# relaxed.
 _TIER_C_LABEL_RE = re.compile(
-    r"\A\s*TIER-C:\s+"
+    r"\A\s*TIER-C:\s*"
     r"(?P<label>" + "|".join(re.escape(lbl) for lbl in TIER_C_LABELS) + r"|other:\s*\S[^\r\n]*?)"
     r"\s*\Z",
     re.IGNORECASE,
