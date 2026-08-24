@@ -184,6 +184,48 @@ class HandoffKind(StrEnum):
     ABSENT = "absent"  # no parseable NEXT (missing / unknown participant) → human fallback (Obj3)
 
 
+# ---- C (T-human-terminal-overuse, human GO msg after Einstein ACCEPT msg-891) ---------------- #
+# TIER-C: <label> — a **non-blocking measurement tag** the author may place on the line
+# immediately above their `NEXT: human`, so the conductor can record what CLASS of Tier-C decision
+# each explicit human terminal claims to be about. v1 is a calibrator, not a definition: the
+# labels below are the CATEGORIES OBSERVED SO FAR in the 11-turn sample msg-882 counted (a
+# release, a merge, a scope grow), rounded up by Bohr's msg-890 §3 enumeration. They will change
+# as the sample grows and MUST NOT be read as an authoritative Tier-C ontology.
+#
+# The measurement is enabled by MEASURING BOTH SIDES: presence is recorded, absence is recorded,
+# neither is redirected or rejected. If we blocked on missing labels we would lose the very
+# denominator A2's threshold (Bohr msg-890 §2 pre-registration: >20% ∧ ≥3 in a 14-day / 20-turn
+# window) needs to fire on — the calibrator would be destroying its own calibration.
+#
+# `other:<one-line reason>` is a VISIBLE GAP, not an escape hatch. If it dominates the observed
+# distribution that is the readable signal that the closed enum below is wrong. Refusing `other:`
+# would force silent mis-classification into whichever closed label was closest, and the
+# observation would be corrupted at exactly the moment the enum's insufficiency became evident.
+#
+# Placement rule: `handoff.py`, NOT `obligations.yaml` (human msg §1: "両方 `handoff.py`"). This
+# tag is parsed by the conductor's routing, so it lives with the routing — same defence Bohr made
+# in msg-890 §1 for placing the revised proposer guidance here rather than in obligations. Adding
+# a net-new entry to obligations.yaml is explicitly out of scope for this change.
+TIER_C_LABELS: tuple[str, ...] = (
+    "irreversible",
+    "billing",
+    "scope",
+    "merge-protected",
+    "release-cross-repo",
+)
+# `other:<reason>` is admitted separately (its reason text is free-form). Enum alternatives are
+# joined into a single non-capturing alternation; case is folded on match. Whitespace between
+# `other:` and the reason is optional (`other:Foo` and `other: Foo` normalise to the same tag),
+# but the reason itself is required — an empty `other:` would defeat the point of naming a novel
+# type, so it does not match at all and is recorded as absent.
+_TIER_C_LABEL_RE = re.compile(
+    r"\A\s*TIER-C:\s+"
+    r"(?P<label>" + "|".join(re.escape(lbl) for lbl in TIER_C_LABELS) + r"|other:\s*\S[^\r\n]*?)"
+    r"\s*\Z",
+    re.IGNORECASE,
+)
+
+
 @dataclass(frozen=True)
 class Handoff:
     """The resolved handoff target of a message's final ``NEXT:`` line.
@@ -198,12 +240,20 @@ class Handoff:
     the shape of a ref, so it cannot report where one started and ended, only what the owner of
     that grammar made of it. When the owner recognised nothing, ``token`` is the raw operand, and
     the conductor's re-validation (``core.py``, same function) fails safe to the human.
+
+    ``tier_c_label`` is the **calibration tag** parsed off the line immediately above the final
+    ``NEXT: human`` (C, msg-890 §3): the enum value from :data:`TIER_C_LABELS`, or a raw
+    ``other:<reason>`` string, or ``None`` when no such line was written OR the handoff was not
+    ``HUMAN``. It is NON-BLOCKING — the conductor records its presence/absence and the turn
+    otherwise routes exactly as it would without the tag. This field is a measurement label; it
+    is NOT the definition of what Tier-C IS (that stays owned by ADR/Tier-C decides).
     """
 
     kind: HandoffKind
     identity: str | None = None
     role: Role | None = None
     token: str | None = None
+    tier_c_label: str | None = None
 
 
 def _last_next_raw(body: str) -> str | None:
@@ -218,6 +268,47 @@ def _last_next_raw(body: str) -> str | None:
     if not matches:
         return None
     return str(matches[-1]).strip() or None
+
+
+def _tier_c_label_above_last_next(body: str) -> str | None:
+    """``TIER-C: <label>`` on the line above the **last** ``NEXT:`` line, or ``None``.
+
+    C (msg-890 §3 / Einstein msg-891 §4): the look-back is limited to line ``n-1`` where line ``n``
+    is the final ``NEXT:``. This is deliberately narrow — a broader window (skipping blank lines,
+    scanning the whole body) would false-positive on quoted TIER-C: text elsewhere in the reply,
+    and the point of this measurement is that BOTH sides (presence AND absence) are recorded
+    accurately.
+
+    The label is casefolded to canonical form (``"scope"`` regardless of ``"SCOPE:"`` / ``"Scope:"``
+    on the wire) so aggregation is stable. For ``other:<reason>`` the reason text keeps its case,
+    but leading whitespace on the reason is trimmed.
+
+    Non-blocking: this function returns ``None`` on any of {no last ``NEXT:``, no preceding line,
+    the preceding line does not match the closed enum}. None of those cases changes what
+    :func:`resolve_handoff` reports for :attr:`Handoff.kind` — the tag is additive observability
+    only.
+    """
+    matches = list(_NEXT_LINE_RE.finditer(body))
+    if not matches:
+        return None
+    last_next_start = matches[-1].start()
+    if last_next_start == 0:
+        return None
+    # The ``^`` of the last NEXT: line sits at ``last_next_start``; the previous line's ``\n``
+    # is at ``last_next_start - 1`` (if the file starts at 0, MULTILINE's ``^`` also matches
+    # position 0, which we already excluded above).
+    prev_line_end = last_next_start - 1  # exclusive of the delimiting \n
+    prev_line_start = body.rfind("\n", 0, prev_line_end) + 1  # rfind returns -1 → 0
+    prev_line = body[prev_line_start:prev_line_end]
+    match = _TIER_C_LABEL_RE.match(prev_line)
+    if match is None:
+        return None
+    label = match.group("label")
+    # `other:<reason>` — preserve reason case, trim inner leading whitespace after the colon.
+    lowered = label.lower()
+    if lowered.startswith("other:"):
+        return "other:" + label[len("other:") :].lstrip()
+    return lowered
 
 
 def _name_from_raw(raw: str) -> str | None:
@@ -267,7 +358,13 @@ def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
         return Handoff(HandoffKind.ABSENT, token=raw)
     folded = token.casefold()
     if folded == HUMAN_TOKEN:
-        return Handoff(HandoffKind.HUMAN, token=token)
+        # C (msg-890 §3): look 1 line above the final NEXT: for a TIER-C: <label> and attach it
+        # as a non-blocking measurement tag. Absence is also observable — Handoff.tier_c_label
+        # simply stays None. This is intentionally parsed ONLY on the HUMAN terminal: the ROLE /
+        # PR_REVIEW / NONE / ABSENT paths do not carry a Tier-C claim in v1.
+        return Handoff(
+            HandoffKind.HUMAN, token=token, tier_c_label=_tier_c_label_above_last_next(body)
+        )
     if folded == NONE_TOKEN:
         return Handoff(HandoffKind.NONE, token=token)
     match = _roster_lookup(roster, token)
@@ -305,13 +402,36 @@ The handoff line is part of your verbatim reply, not meta-commentary: write it \
 out literally (for example `NEXT: {HUMAN_TOKEN}`) and put nothing after it."""
 
 _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
+    # A (T-human-terminal-overuse, human GO msg after Einstein ACCEPT msg-891): after you
+    # DISPOSITION the naysayer's objections, hand BACK to the naysayer — not to the human. The
+    # naysayer is the one who decides whether the design proceeds; the conductor then either
+    # builds it directly (control state `run` + attested proceed → carve-out ③) or routes that
+    # `go` to the human (any other state), so this proposer text stays TRUE in every state and
+    # never has to be re-conditioned on the loop control state (Bohr msg-890 §1: "proposer は
+    # `run` / `supervised` / `hold` のいずれでも同じ振る舞いをすればよく、状態を知る必要がない").
+    #
+    # The previous text ("a design must clear an independent naysayer review AND a human Tier-C
+    # decision before implementation, so … hand to `human`") was not merely a nudge in the wrong
+    # direction: with `control=run` it was strictly FALSE (carve-out ③ removes the per-step human
+    # Tier-C from that path). Its removal is not a heuristic tune — it is deleting a claim that
+    # contradicted the routing code. The independence-preserving property is kept in words too:
+    # only the naysayer may advance a design to code (Einstein msg-601 Fix-1); a NEXT: from the
+    # proposer to the implementer is structurally redirected by guard (i) in `core.py`.
     Role.PROPOSER: (
         "As the proposer: after you propose or revise a design, hand to the independent naysayer "
-        "for a design review (`NEXT: <naysayer persona>`). Do NOT hand a design straight to the "
-        "implementer — a design must clear an independent naysayer review and a human Tier-C "
-        f"decision before implementation, so when it is ready for that decision hand to "
-        f"`{HUMAN_TOKEN}`. (The conductor enforces this structurally: a `NEXT:` from you to the "
-        "implementer is redirected to the human.)"
+        "for a design review (`NEXT: <naysayer persona>`). After you have dispositioned the "
+        "naysayer's objections, hand BACK to the naysayer — not to the human. The naysayer "
+        "decides whether the design proceeds; the conductor then either builds it directly or "
+        "routes that go to the human, depending on this project's loop control state. Do NOT "
+        "hand a design straight to the implementer — only the naysayer may advance a design to "
+        "code, so that you cannot bypass its objections (the conductor structurally redirects "
+        f"such a handoff). Hand to `{HUMAN_TOKEN}` only for a decision that is genuinely Tier-C, "
+        "and name the type on the line above your handoff, e.g.:\n\n"
+        "    TIER-C: scope\n"
+        f"    NEXT: {HUMAN_TOKEN}\n\n"
+        f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` / `other:<one-line reason>`. This is "
+        "a calibration tag the conductor records so we can tell judgement-Tier-C apart from "
+        "routing-artefact Tier-C; it does NOT redefine what Tier-C is."
     ),
     Role.IMPLEMENTER: (
         "As the implementer: when you open or update a develop→main pull request, hand to the "
@@ -365,6 +485,7 @@ __all__ = [
     "HUMAN_TOKEN",
     "NONE_TOKEN",
     "PR_REVIEW_TOKEN",
+    "TIER_C_LABELS",
     "Handoff",
     "HandoffKind",
     "build_handoff_protocol_block",
