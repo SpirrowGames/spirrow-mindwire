@@ -42,11 +42,11 @@ items:
 
 ## §1 前提（実測値。推測で補わないこと）
 
-以下は実測値である（初出は 2026-08-11。以後の再測は各行の出典欄に計測者と日付を記す）。本仕様はこれらに依存する。**行ごとに計測者を明記する** — proposer は `Read` / `Glob` / `Grep` で repo を読めるが `Bash` を持たない ∴ git に問い合わせる計測（blob sha ／到達性／作業ツリー状態）は implementer からしか来ない（E-1 / D-25′）。実装時に事実が違っていた場合、仕様ではなく事実が正しい。停止して報告せよ。
+以下は実測値である（初出は 2026-08-11。以後の再測は各行の出典欄に計測者と日付を記す）。本仕様はこれらに依存する。**行ごとに計測者を明記する** — proposer のツール面は **dispatch 経路によって異なる**。自律ループの `build_proposer` 経路では `Read` / `Glob` / `Grep` のみで `Bash` を持たない（E-1）が、`/mindwire-turn` による手動セッション経路では `Bash` を持つ（2026-08-24、proposer 自身が本経路で `git rev-parse` を実行し本書の base blob を実測。**この行はその実測によって書き換わった**）。∴ 「git に問い合わせる計測は implementer からしか来ない」は**偽**であり、計測者欄が要る理由は役割ではなく**経路が可変であること**そのものである。なお D-25′ が base 照合を implementer に課す理由は「proposer が測れないから」ではない — **測る対象は implementer の作業ツリーの状態**であり、それは実装する当人にしか見えないからである。実装時に事実が違っていた場合、仕様ではなく事実が正しい。停止して報告せよ。
 
 | id | 事実 | 出典 / 計測者 |
 |---|---|---|
-| E-1 | proposer の capability は `{READ_THREAD, POST_REPLY}` の 2 つのみで、`EXECUTE_CODE` を持たない。**書き込み系ツールは無い**（`Write` / `Edit` / `Bash` いずれも不在）∴ ファイルを書けず、commit も PR 作成もできない。**ただし読める**: `_PROPOSER_BUILTIN_TOOLS = ("Read", "Glob", "Grep")` が `cwd=repo_dir` ＋ `can_use_tool=_PathScopeGuard(root=repo_dir)` で渡される | 実査 — `906cb58`（`origin/main` の祖先）, `src/spirrow_mindwire/loop_runner.py` の `Stage3ProposerAdapter` / `_PROPOSER_BUILTIN_TOOLS` / `build_proposer`（Bohr, 2026-08-24）。r3 の `tools=[] の text-only` は 2026-08-11 時点では真だったが `906cb58`（08-18）で偽になった |
+| E-1 | **自律ループ経路（`build_proposer`）における** proposer の capability は `{READ_THREAD, POST_REPLY}` の 2 つのみで、`EXECUTE_CODE` を持たない。**この経路では書き込み系ツールが無い**（`Write` / `Edit` / `Bash` いずれも不在）∴ ファイルを書けず、commit も PR 作成もできない。**ただし読める**: `_PROPOSER_BUILTIN_TOOLS = ("Read", "Glob", "Grep")` が `cwd=repo_dir` ＋ `can_use_tool=_PathScopeGuard(root=repo_dir)` で渡される。**本行は adapter の構成であって role の普遍的性質ではない** — `/mindwire-turn` による手動 Claude Code セッションで同じ role を演じる場合は `Bash` を含む完全なツール面を持つ（行 45） | 実査 — `dd07135`, `src/spirrow_mindwire/loop_runner.py` 行 281 `_PROPOSER_BUILTIN_TOOLS` ／ 行 284-295 `build_proposer`（Bohr, 2026-08-24 再確認）。手動セッション経路で `Bash` が在ることは同日 proposer が `git rev-parse` の実行成功で実証（Bohr, 2026-08-24）。r3 の `tools=[] の text-only` は 2026-08-11 時点では真だったが `906cb58`（08-18）で偽になった |
 | E-2 | proposer から `EXECUTE_CODE` を落としてあるのは意図された設計。registry の `qualified_for` は「first qualified」であり、base adapter（`ClaudeCodeSdkAdapter`）が `EXECUTE_CODE` を宣言している ∴ 両方を registry に入れると IMPLEMENTER スロットが登録順で決まってしまう。`Stage3ProposerAdapter` が `EXECUTE_CODE` を落とすことで PROPOSER にのみ qualify し、IMPLEMENTER スロットが `ImplementerSdkAdapter` に一意に解決する。**r3 の「現に稼働している implementer は allow-list の後ろにある」は 2026-08-20 以降 偽である**（E-12） | 実査 — `9be0c81`, `src/spirrow_mindwire/loop_runner.py` の `Stage3ProposerAdapter` docstring（Bohr, 2026-08-24）。r3 が挙げていた出典 `adapters/claude_code_sdk.py` docstring には現在この記述が無い |
 | E-3 | implementer / naysayer のみツールを持つ | 同上 — human |
 | E-4 | **implementer と naysayer は CLAUDE.md を読まない**（implementer は `setting_sources=[]`）。proposer のみ読む | ループ設定 — human |
@@ -84,7 +84,7 @@ U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれ�
   human が本文を運ぶのは **spec 1 本につき 1 回**、運ぶのは要約ではなくバイト列である。**手順 3 の byte 一致は本設計が買っている検証可能性の本体であり、他の目的（診断の静音化・体裁の統一等）のために売り渡してはならない。**
 - **D-3（payload の自己完結）** implementer に渡す payload は、参照ではなく本文でなければならない（E-5）。「§4 を見よ」「前回の合意どおり」の類は payload として無効である。要約ラベルでの代置も無効である。自己完結性の単位は **payload（＝ manifest 1 本）**であって item ではない。
 - **D-4（payload の収縮）** 2 ターン目以降の implementer は `.mindwire/pin` と `origin/main` から仕様を読む ∴ 人手のリレーは実装ターン数に比例せず、payload は sha 1 個に縮む。なお pin は repo 境界を越えない（D-22）。他 repo を対象とする item は本機構では扱わず、対象 repo 自身の spec として発行する。
-- **D-5（pin は tracked にしない）** `.mindwire/pin` は dispatcher が working tree に書く untracked ファイルであり、commit しない。`.mindwire/` を両 repo の `.gitignore` に入れ、commit へ混入しない状態を作る（E-10 を承知の上で、voxelworld 側に増える tracked な変更は `.gitignore` の 1 行のみとする）。
+- **D-5（pin は tracked にしない）** `.mindwire/pin` は dispatcher が working tree に書く untracked ファイルであり、commit しない。**本 spec が `.gitignore` に `.mindwire/` を入れるのは `spirrow-mindwire` のみである**（I-4）。E-10 のとおり同じ pin ファイルは spirrow-voxelworld のクローンにも現れるが、**本 spec はその repo の `.gitignore` を変更しない** — spec はそれが置かれている repo に対してのみ authoritative であり（D-22）、それを行う item であった I-5 は同じ理由で withdrawn である（D-23）。∴ voxelworld 側で pin が untracked のまま `git status` に現れることは本 spec の**既知の未解決残渣**であり、隠さずここに記す。閉じるのは voxelworld 自身の spec である（§6）。
 - **D-6（fail-closed 解決）** pin の解決は fail-closed である。判定不能はすべて `NO-PIN` に落とす。特に detached HEAD（`git rev-parse --abbrev-ref HEAD` が `HEAD` を返す／失敗する）は例外を投げずに `NO-PIN` とする。これは「例外を握り潰す」のではなく「判定不能 = pin 無し」として明示的に扱う、という意味である。
 - **D-7（branch スコープ）** pin は `branch` フィールドを持ち、現在の HEAD ブランチ名との**完全一致**でのみ有効。ワイルドカード・前方一致・正規表現は導入しない。不一致の pin は**存在しないものとして扱う**（`NO-PIN`）。
 - **D-8（obligations の置き場）** `OBL-SPEC-*` は `spec/process/obligations.yaml` に置く。Python の文字列リテラルに直書きしない。3 件はいずれも net-new であり、**`origin` ブロックを付けない**（付けると canary ②″ を構造的にすり抜ける）。
@@ -381,7 +381,7 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 - **A-10** `main` に merge されていない commit を指す pin では、fetch 後も `NO-PIN(COMMIT_UNREACHABLE)` を報告する。A-9 の `FETCH_UNAVAILABLE` と同一コードに畳まれていない。
 - **A-11** item に obligation を追加した manifest に対し、`verify.py --json` の `items[].obligations` が root ∪ item を出力する。item 側から root の obligation を削除する手段がスキーマ上存在しない。
 - **A-12** **I-2 が `main` に merge された直後の `main` 上で `verify.py` を実行すると、error 0・warning 0 である**（D-21: 恒久 warning を出さない）。
-- **A-13** `.gitignore` に `.mindwire/` が入っており、`.mindwire/pin` を置いた状態で `git status --porcelain` にそれが現れない。spirrow-mindwire と spirrow-voxelworld の両方で成立する。
+- **A-13** `spirrow-mindwire` の `.gitignore` に `.mindwire/` が入っており、`.mindwire/pin` を置いた状態で `git status --porcelain` にそれが現れない（I-4）。**本条件は本 repo に閉じる** — 他 repo での成立を本仕様の受け入れ条件にしない（D-5 / D-22。それを担っていた I-5 は withdrawn — D-23）。
 - **A-14** 本 manifest が `spec/design/T-design-spec-delivery.md` として存在し、`verify.py` の V-1〜V-8 および V-11 / V-12 を error 0 で通過する（自己適用）。
 - **A-15** §1.1 の ADR 参照（番号・表題・内容）が実在と一致することを確認し、結果を PR 本文に書く。**一致しない場合は修正せず停止して報告する**（D-17）。
 - **A-16** `after` に相当する依存フィールドが front-matter スキーマにも `verify.py` にも存在しない（D-15）。
@@ -393,6 +393,7 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 - **A-22** item に `status: withdrawn` ＋ `withdrawn_reason` を書いた manifest が V-1〜V-8 を error 0 で通過し、`verify.py --json` の当該 item がその状態を出力する。`withdrawn_reason` を落とすと V-5 が error を出す。
 - **A-23** `target_repo` を実在の remote basename と異なる値にすると V-11 が error を出す。`origin` remote を持たない作業コピーでは V-11 が error を出さず info を 1 件出し、exit code は 0 のままである。
 - **A-24** item 側に `target_repo` を書くと V-12 が error を出す（D-22 の回帰防止）。
+- **A-25** 本 manifest の本文（決定・スキーマ・受け入れ条件）のいずれにも、`spirrow-mindwire` 以外の repo に対して作業・状態変更を**要求する**記述が無い（D-22）。実測の記述（E-6 / E-10）と、withdrawn item がなぜ消えたかの記録（I-5 / D-23）は要求ではない ∴ 本条件に反しない。V-11 / V-12 は front-matter の `target_repo` しか見ず、散文でこの規律が破れることを機械では検出できない — 本条件はその穴を人手の検査で塞ぐものであり、A-15 / A-17 と同じ種類の受け入れ条件である。
 
 ## §8 運用（順序の SOT は `items` の列挙順 — D-15）
 
