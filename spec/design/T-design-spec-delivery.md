@@ -25,7 +25,8 @@ items:
     paths: [".gitignore"]
   - id: I-5
     title: ".mindwire/ を gitignore (spirrow-voxelworld)"
-    target_repo: spirrow-voxelworld
+    status: withdrawn
+    withdrawn_reason: "D-22 違反。spec は自らが置かれている repo に対してのみ authoritative であり、pin は repo 境界を越えられない（pin は local object DB を引くため、spirrow-mindwire の commit は spirrow-voxelworld に存在しない）。item 側の target_repo は D-22 により表現不能になったため意図的に削除した（消し忘れではない — §6 を見よ）。voxelworld 側の .gitignore が必要になった時点で、voxelworld 自身の spec として発行すること。"
     paths: [".gitignore"]
 ---
 
@@ -37,16 +38,16 @@ items:
 
 論拠・検討経緯は thread に残す。本文は**決定項目（id 付き）・スキーマ・受け入れ条件**に限る。
 
-決定 id は本文書内で振り直している。thread 側 id との対応: thread D-1（分量規律）= 本書 D-1、thread D-2（著者と配送）= 本書 D-2（全面改訂）、thread D-4（payload は sha 1 個に縮む）= 本書 D-4。他は本書で新規に振ったもので、thread の同名 id とは対応しない。
+決定 id は本文書内で振り直している。thread 側 id との対応: thread D-1（分量規律）= 本書 D-1、thread D-2（著者と配送）= 本書 D-2（全面改訂）、thread D-4（payload は sha 1 個に縮む）= 本書 D-4。他は本書で新規に振ったもので、thread の同名 id とは対応しない。**`D-25′` の `′` は id の一部である**（本書に `D-25` は無い。スレッド上でこの決定が一度改訂された経緯の表記をそのまま保っており、書き換えると thread 側の全参照が切れる — D-30）。
 
 ## §1 前提（実測値。推測で補わないこと）
 
-以下は 2026-08-11 の計測結果である。本仕様はこれらに依存する。**proposer は text-only であり、proposer 自身はこれらを計測していない**（∴ 計測者を明記する）。実装時に事実が違っていた場合、仕様ではなく事実が正しい。停止して報告せよ。
+以下は実測値である（初出は 2026-08-11。以後の再測は各行の出典欄に計測者と日付を記す）。本仕様はこれらに依存する。**行ごとに計測者を明記する** — proposer は `Read` / `Glob` / `Grep` で repo を読めるが `Bash` を持たない ∴ git に問い合わせる計測（blob sha ／到達性／作業ツリー状態）は implementer からしか来ない（E-1 / D-25′）。実装時に事実が違っていた場合、仕様ではなく事実が正しい。停止して報告せよ。
 
 | id | 事実 | 出典 / 計測者 |
 |---|---|---|
 | E-1 | proposer の capability は `{READ_THREAD, POST_REPLY}` の 2 つのみで、`EXECUTE_CODE` を持たない。**書き込み系ツールは無い**（`Write` / `Edit` / `Bash` いずれも不在）∴ ファイルを書けず、commit も PR 作成もできない。**ただし読める**: `_PROPOSER_BUILTIN_TOOLS = ("Read", "Glob", "Grep")` が `cwd=repo_dir` ＋ `can_use_tool=_PathScopeGuard(root=repo_dir)` で渡される | 実査 — `906cb58`（`origin/main` の祖先）, `src/spirrow_mindwire/loop_runner.py` の `Stage3ProposerAdapter` / `_PROPOSER_BUILTIN_TOOLS` / `build_proposer`（Bohr, 2026-08-24）。r3 の `tools=[] の text-only` は 2026-08-11 時点では真だったが `906cb58`（08-18）で偽になった |
-| E-2 | proposer から `EXECUTE_CODE` を落としてあるのは意図された設計。両方を registry に入れると IMPLEMENTER スロットが allow-list ゲート付きの implementer ではなく素通しのアダプタに解決されてしまうため、それを避けている。**現に稼働している implementer は allow-list の後ろにある** | `adapters/claude_code_sdk.py` docstring — human |
+| E-2 | proposer から `EXECUTE_CODE` を落としてあるのは意図された設計。registry の `qualified_for` は「first qualified」であり、base adapter（`ClaudeCodeSdkAdapter`）が `EXECUTE_CODE` を宣言している ∴ 両方を registry に入れると IMPLEMENTER スロットが登録順で決まってしまう。`Stage3ProposerAdapter` が `EXECUTE_CODE` を落とすことで PROPOSER にのみ qualify し、IMPLEMENTER スロットが `ImplementerSdkAdapter` に一意に解決する。**r3 の「現に稼働している implementer は allow-list の後ろにある」は 2026-08-20 以降 偽である**（E-12） | 実査 — `9be0c81`, `src/spirrow_mindwire/loop_runner.py` の `Stage3ProposerAdapter` docstring（Bohr, 2026-08-24）。r3 が挙げていた出典 `adapters/claude_code_sdk.py` docstring には現在この記述が無い |
 | E-3 | implementer / naysayer のみツールを持つ | 同上 — human |
 | E-4 | **implementer と naysayer は CLAUDE.md を読まない**（implementer は `setting_sources=[]`）。proposer のみ読む | ループ設定 — human |
 | E-5 | implementer に渡るのは新着 msg 1 本の body のみ。スレッド履歴は渡らない | watcher 実装 — human |
@@ -55,13 +56,12 @@ items:
 | E-8 | `gh pr merge` は base に関わらず Tier C 拒否となり implementer セッションを halt させる | `OBL-MERGE-MECHANISM` / PR #136 — human |
 | E-9 | `OBL-DECLARE-UNREADABLE` は `origin.moved_from` を持つ逐語移設 entry で、canary が `len(body) == origin.original_length`（現在 795）を検査している | `spec/process/obligations.yaml` / PR #135 — human |
 | E-10 | `.mindwire/pin` は spirrow-voxelworld のクローンにも現れる（implementer は両プロジェクトで同じ prompt 経路を通る） | 実測 — human |
-| E-11 | `spec/process/obligations.yaml` の entry スキーマは `{id, applies_to, trigger, body}` の 4 キー | 実査 — Einstein |
+| E-11 | `spec/process/obligations.yaml` の entry スキーマは `{id, role, body, origin?}`。`role` は**単一文字列**で `src/spirrow_mindwire/obligations.py` の `_MANIFEST_ROLES`（`implementer` / `naysayer` の 2 値）に照合される。`applies_to` / `trigger` は**認識されないキー**であり、未知の role や不正な `origin` は `ObligationsError`（composition root で `SystemExit`）になる | 実査 — `origin/main` = `72339ee`, `spec/process/obligations.yaml` ＋ `src/spirrow_mindwire/obligations.py`（Heisenberg, msg-1356）。`9be0c81` で再確認（Bohr, 2026-08-24）。r3 の E-11 は `{id, applies_to, trigger, body}` を主張していたが誤り。実査ラベルを持ちながら sha を欠いていたため、書かれた時点で照合できなかった（D-29 の根拠事例） |
+| E-12 | implementer の tool surface は `_IMPLEMENTER_BUILTIN_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell", "Glob", "Grep", "TodoWrite")` であり **`Bash` を含む**。per-call の `can_use_tool` allow-list は 2026-08-20 に撤去された ∴ `git fetch` を拒める gate は存在しない。不変条件は agent の外（GitHub org ruleset `guard-default-branch` ／ `spirrow_mindwire.preflight` の P0-P2 ／ egress proxy の allow-list ／ implementer の clone が使い捨てであること）が担う | 実査 — `9be0c81`, `src/spirrow_mindwire/adapters/implementer.py` の `_IMPLEMENTER_BUILTIN_TOOLS` ＋ module docstring。撤去は `#165` `773ee24` / `#166` `72339ee`、いずれも本ブランチの祖先（Heisenberg, msg-1547。Bohr 再確認 2026-08-24） |
 
-**未検証（前提に使ってはならない項目）**
+**未検証（前提に使ってはならない項目）: 現在 0 件。**
 
-| id | 未検証事項 | 扱い |
-|---|---|---|
-| U-1 | implementer の allow-list に Bash ないし `git fetch` が含まれるか。**E-2 から導出してはならない** — E-2 は allow-list の有無を述べた行であり、その中身を述べていない | 含まれない場合、§3 手順 8 の refresh は失敗し `NO-PIN(FETCH_UNAVAILABLE)` に落ちる（fail-closed ∴ 安全側に壊れる）。肯定側（ローカル `origin/main` から到達可能）はネットワーク不要のまま通る ∴ **設計の分岐条件ではない**。着地時に A-9 で観測し、結果を PR 本文に記録する |
+U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれるか）は 2026-08-24 に解消した。allow-list そのものが 2026-08-20 に撤去されており、問いの前提が消えている（E-12）。∴ §3 手順 8 の分岐と reason code は変更しない — `NO-PIN(FETCH_UNAVAILABLE)` は `--no-fetch` と実ネットワーク障害という 2 経路で到達可能なままであり、到達不能な死枝にはならない（A-9）。
 
 **E-4 の帰結（規範）: 「CLAUDE.md に書いてあるから implementer が従う」という設計を書いてはならない。** implementer に効かせたい規約は `spec/process/obligations.yaml` か、本 manifest 本文のいずれかに置く。
 
@@ -83,7 +83,7 @@ items:
   6. human の Tier-C ＝ その spec PR を merge する。merge が承認である。
   human が本文を運ぶのは **spec 1 本につき 1 回**、運ぶのは要約ではなくバイト列である。**手順 3 の byte 一致は本設計が買っている検証可能性の本体であり、他の目的（診断の静音化・体裁の統一等）のために売り渡してはならない。**
 - **D-3（payload の自己完結）** implementer に渡す payload は、参照ではなく本文でなければならない（E-5）。「§4 を見よ」「前回の合意どおり」の類は payload として無効である。要約ラベルでの代置も無効である。自己完結性の単位は **payload（＝ manifest 1 本）**であって item ではない。
-- **D-4（payload の収縮）** 2 ターン目以降の implementer は `.mindwire/pin` と `origin/main` から仕様を読む ∴ 人手のリレーは実装ターン数に比例せず、payload は sha 1 個に縮む。
+- **D-4（payload の収縮）** 2 ターン目以降の implementer は `.mindwire/pin` と `origin/main` から仕様を読む ∴ 人手のリレーは実装ターン数に比例せず、payload は sha 1 個に縮む。なお pin は repo 境界を越えない（D-22）。他 repo を対象とする item は本機構では扱わず、対象 repo 自身の spec として発行する。
 - **D-5（pin は tracked にしない）** `.mindwire/pin` は dispatcher が working tree に書く untracked ファイルであり、commit しない。`.mindwire/` を両 repo の `.gitignore` に入れ、commit へ混入しない状態を作る（E-10 を承知の上で、voxelworld 側に増える tracked な変更は `.gitignore` の 1 行のみとする）。
 - **D-6（fail-closed 解決）** pin の解決は fail-closed である。判定不能はすべて `NO-PIN` に落とす。特に detached HEAD（`git rev-parse --abbrev-ref HEAD` が `HEAD` を返す／失敗する）は例外を投げずに `NO-PIN` とする。これは「例外を握り潰す」のではなく「判定不能 = pin 無し」として明示的に扱う、という意味である。
 - **D-7（branch スコープ）** pin は `branch` フィールドを持ち、現在の HEAD ブランチ名との**完全一致**でのみ有効。ワイルドカード・前方一致・正規表現は導入しない。不一致の pin は**存在しないものとして扱う**（`NO-PIN`）。
@@ -91,7 +91,7 @@ items:
 - **D-9（OBL-DECLARE-UNREADABLE は改訂しない）** E-9 の逐語移設 entry には触れない。unreadable 宣言義務の trigger 拡張分は `OBL-SPEC-PIN` の body 側に書く（§4-1 末尾）。逐語移設 entry を net-new の都合で動かすと、その entry が守っている不変条件の意味が薄まる。
 - **D-10（verify.py は gate ではない）** `verify.py` は診断ツールであり、CI gate にしない。`main` 上での検出は **warning** に降格し、exit code に影響させない。
 - **D-11（G-4 は機構ではなく規律）** E-6 により、`main` への直接 push 禁止・required check・admin バイパス禁止のいずれも機構として設定できない。∴ 本仕様はマージを機構で強制しない。本仕様は**マージ手順に一切触れない**。implementer に `gh pr merge` を実行させる記述を、本仕様およびその実装から出してはならない（E-8: セッションが halt する）。PR を開くところまでが implementer の仕事であり、merge は human の Tier-C である。
-- **D-12（bootstrap は NO-PIN で始まる）** I-1 と I-2 は、pin 機構がまだ存在しない状態で実行される ∴ その 2 ターンは `NO-PIN` であり、payload は D-2 経路の msg 本文そのものである。これは違反ではなく設計どおりの挙動であり、receipt は `NO-PIN` と書くのが正しい。
+- **D-12（bootstrap は NO-PIN で始まる）** I-1 と I-2 は、pin 機構がまだ存在しない状態で実行される ∴ その 2 ターンは `NO-PIN` であり、payload は D-2 経路の msg 本文そのものである。これは違反ではなく設計どおりの挙動であり、receipt は `NO-PIN` と書くのが正しい。なお pin は repo 境界を越えない（D-22）。他 repo を対象とする item は本機構では扱わず、対象 repo 自身の spec として発行する。
 - **D-13（第一号実運用対象）** pin つき dispatch の第一号実運用対象は **`T-pr-gate-adr-index-scope`** とする（`T-loop-readable-obligations` は PR #135 で完了・close 済みのため対象から外す）。
 - **D-14（到達性判定と遅延 fetch）** pin の `commit` が `origin/main` から到達可能であることを確認する。この検査は「pin が指す spec は human が merge したものである」を機械的に担保する唯一の経路であり、E-6 で branch protection が使えない以上これを外さない。ネットワーク規律は次のとおり:
   - **肯定側は fetch しない。** ローカルの `origin/main` から到達可能なら `RESOLVED` に進む（古い `origin/main` の祖先である commit は、より新しい `origin/main` の祖先でもある ∴ 肯定判定は陳腐化しない。main が force-push で書き換えられないことを前提とする。これは E-6 により機構では守れない ∴ D-11 と同じく規律である）。
@@ -106,6 +106,46 @@ items:
 - **D-19（manifest は merge 後 immutable）** merge 済み manifest を書き換えない。訂正・改訂は**新しい spec を起こし `supersedes` で繋ぐ**。唯一の例外は `status: withdrawn` への変更であり、その場合も元のバイト列は merge commit（`git show <merge-commit>:<path>`）から復元でき、D-2 手順 5 の突き合わせは失われない。
 - **D-20（supersession は派生）** X が superseded であることは「他の manifest Y の `supersedes` に X が載っている」ことと同値である ∴ X 側に状態を書かず、X のファイルを書き換えない。`verify.py` は派生した関係を報告する。
 - **D-21（診断は常態で鳴らない）** 定常状態で恒久的に warning を出す診断を設計しない。常に鳴っている警告は警告ではなく、本当に見るべきものを隠す。main 上の常態は **warning 0** である（A-12）。
+- **D-22（1 spec = 1 target repo）** spec ファイルは、それが置かれている repo に対してのみ authoritative である。`target_repo` はそのファイルを収める repo と一致しなければならず（`verify.py` の V-11 が照合する）、item 側で上書きできない（V-12）。N repo に跨る設計は N 本の spec になり、共通の `design_id`（スレッド id）と、名前だけの `siblings` で結ぶ。sibling は pin で結ばない（結べない — pin は local object DB を引くため、他 repo の commit はそこに無い）。列挙は人間向けであって解決機構ではない。棄却した代替 3 案（cross-repo だけ `NO-PIN` ＋全文インライン／spec blob の vendor 複製／対象 repo から他 repo の object を fetch）の論拠は thread に残す（D-1）。
+- **D-23（I-5 は withdrawn にする）** I-5 は D-22 違反 ∴ item 側 `status: withdrawn` ＋ `withdrawn_reason` とする。削除しないのは、なぜ消えたかが残る方が将来の再提案を防ぐからである。D-18 が enum に `withdrawn` を残したのはこの用途である。
+- **D-24（`NO-PIN` を 2 クラスに割る）**
+  - **ABSENT** — dispatch に pin が無い。D-12 のブートストラップ窓（spec が `main` に未着）に限り sanctioned であり、message body のみで作業してよい。
+  - **FAULT** — pin は発行されたが解決しなかった（`REPO_MISMATCH` / `COMMIT_UNREACHABLE` / `BLOB_UNREADABLE`、§3 の fallback を尽くした後）∴ 停止して報告する。**message body で作業を続行してはならない。**
+  - 根拠: 「pin が出ているのに解決しない」は上流の故障であって、劣化運転してよい状態ではない。body で続行するのは本スレッドの起点となった失敗そのものである。
+- **D-25′（改訂の運び方 — base-hash ＋ 構造アンカー ＋ NEW のみ）** proposer の改訂は対象ファイルの blob sha（`base`）を名指す。implementer は編集前に照合し、一致しなければ `BASE_MISMATCH` で停止する。これが陳腐化検査であり、逐語 byte を 1 文字も要さない。
+  - **照合は 2 段**（U-3）: ① `git status --porcelain -- <path>` が空であること ② `git rev-parse HEAD:<path>` が `base` と一致すること。**作業ツリーのハッシュ化（`git hash-object`）を使わない** ∴ `core.autocrlf` / clean-smudge filter の影響を受けず、偽 `BASE_MISMATCH` が起きない。
+  - `git rev-parse HEAD:<path>` が `fatal: path ... does not exist in 'HEAD'` で失敗した場合は、それ自体を「大規模 drift」条件とみなし D-27-b に直行する。anchor ファイル自体が消えている ∴ diff を取る対象が無い。
+  - **位置は逐語引用ではなく構造アンカーで指す**（§見出し／item id／decision id／evidence id／行番号）。短い識別子であり、LLM が壊しにくく、文書内で一意である。
+  - **逐語なのは NEW だけ。** 新しい規範文はどこかから来るしかない ∴ 不可避。ただし NEW は小さく保ち、全文を再発行しない。
+  - 適用後、implementer は**適用後の blob sha を報告する**。それが次の改訂の `base` になる。
+  - review 側の義務も同じ形である。「対象ブロックを逐語引用せよ」ではなく「読んだファイルの sha ＋ 位置（§／id／行番号）を述べよ」。レビュアにも打ち直しをさせない。
+  - これは逐語 OLD block による置換より強い。OLD block は patch 対象ブロックの一致しか見ないが、base-hash はファイル全体の一致を見る ∴ patch 対象外の場所に起きた drift も捕まる。しかも LLM の打ち直し量はゼロである。
+- **D-26（委譲境界）**
+  - **変換は委譲可。** ただし規則側が ①決定的な変換規則 ②変換後も意味が保存されること ③保存できない箇所が出たら停止して報告（`TRANSFORM_AMBIGUOUS`）— の 3 点を備えること。
+  - **規範テキストの起草は委譲不可。** proposer が NEW block として逐語で出す。implementer が自分の言葉で書き直せば、以後の implementer はその言い換えに従う ∴ その瞬間 implementer は proposer になっている。
+  - **human dispatch は「決定 ＋ その決定の対象 byte」を運んでよい。「純粋なデータ転送」は運ばせない。** 承認は、承認対象の文面を伴ってはじめて承認である ∴ 前者まで禁じると Tier-C 承認そのものが不可能になる。
+- **D-27（CAS 敗者の回復）** D-25′ は楽観的並行制御（compare-and-swap）であり、`base` が lock である。同一 spec に 2 つの改訂が並走すれば後着が必ず負ける。負けること自体は正しい（盲目上書きを防ぐ）。implementer は `BASE_MISMATCH` で停止する際、報告に以下を含める:
+  1. **実際の sha**（`git rev-parse HEAD:<path>`）。
+  2. **anchor ごとの存否と現在行範囲** — proposer が指定した各構造 anchor について `present@L120-L134` ／ `absent` を列挙。
+  3. **`git diff <base> <actual>` の出力**（ファイル全文ではない）。**path limiter を付けてはならない** — blob 同士の diff では git が拒否する（blob は path metadata を持たないため）。ヘッダは `a/<base>` `b/<actual>` になり **path が出ない** ∴ **報告本文に path を別記すること**。行番号と文脈は正しく出る。
+  4. handoff は proposer 宛て。
+  - 全文でなく diff なのは、proposer が必要としているのが「新しいファイル」ではなく「何が変わったか」だからである。diff のサイズは drift に比例し、かつ機械生成物であって LLM が作文しない。anchor が消えた場合も diff に写る ∴ 別機構は不要である。
+  - **上限**: diff が局所的でない場合（anchor が総崩れ／変更が spec 全体に及ぶ）は貼らずに D-27-b に回す。
+- **D-27-b（統治エスカレーション）** anchor が総崩れになるような drift、または対象ファイル自体が消えている場合、implementer は proposer ではなく **human に Tier-C としてエスカレーション**する。これは「同一の spec ファイルに 2 つの権威が同時に書いた」ことを意味し、D-19 と D-25′ が禁じている状態が実際に起きたということである ∴ テキストを運んで辻褄を合わせる問題ではない。問うのは「この spec の所有権はどちらの改訂系列にあるか」であり、human が運ぶのは決定であってテキストではない。決定後、敗者側の改訂は破棄し、新しい `base` から起案し直す。
+- **D-28（obligations エントリは on-disk schema に従う）** エントリは `{id, role, body, origin?}` である。`role` は**単一文字列**で `_MANIFEST_ROLES` allow-list に照合される（E-11）∴
+  - 複数 role に係る義務は role ごとに別エントリにする（id を role 接尾で分ける）。`applies_to` は使わない。
+  - `trigger` キーは存在しない ∴ 発動条件は `body` の第一文に書く。書式で代替し、キーを捏造しない。**認識されないキーは loader が黙って捨てる** ∴ 書けば情報が消える。
+  - `origin` は逐語移設専用の予約ブロックである（`moved_from` ＋ `original_length` が必須で、`len(body) == original_length` を canary が強制する）。net-new のエントリには付けない — 付ければ「移設した」という偽の主張になり、canary の意味を薄める（D-8 / A-1）。
+- **D-29（実査は pin されていなければ実査ではない）** `実査` と記された evidence 行は commit sha ＋ path（＋読み取りコマンド）を必ず伴う。伴わない行は evidence ではなく主張として扱う。根拠: E-11 は実査ラベルを持ちながら誤っていた。sha があれば、書いた時点で照合可能だった。実査ラベルは自己検証しない。
+- **D-30（決定 id は再利用も再割当もしない）** 一度この文書に書かれた決定 id は、意味を変えない。新しい決定には未使用の id を与える。既存 id を新しい決定に振り直すと、その id を記憶している読み手・thread・レビューが**気づかないまま別の規則を読む** — バイト列としては正しく、参照としても解決する ∴ `BASE_MISMATCH` も `verify.py` も検出できない、唯一検出不能な種類の drift になる。追記位置は末尾であり、番号順と論理順は一致しなくてよい。
+
+### §2.1 検査されていないもの（過大申告しない）
+
+以下は機械検査できない。緩和はあるが、検査ではない。
+
+1. **チャット msg を経由するテキストの転記忠実性。** 該当するのは ①proposer が出す NEW block ②D-27 の recovery diff。期待 hash を誰も先に計算できない ∴ 原理的に不可能である。緩和は 2 つだけ — NEW を小さく保つこと、PR diff を naysayer が message と突き合わせること。後者は人／エージェントによる比較であって機械検査ではない。
+2. **ADR 本文。** A-15 は id ＋ title までしか照合できない。naysayer も implementer も ADR 本文を読めない（bodies は Drive にあり、inference 時に不可視）∴ ADR との整合は title 推論に留まる。
+3. **spec が世界について述べた主張の真偽。** E-11 と E-2 がこれである。D-29 で「書いた時点で照合可能」までは下げられるが、消えない。最終防波堤は §1 の「実装時に事実が違っていた場合、仕様ではなく事実が正しい。停止して報告せよ」＋ implementer の停止であり、これは実際に 2 度作動した（E-11 は loader が落ちる前に、E-2 は merge 前に捕まった）。
 
 ## §3 `.mindwire/pin` schema
 
@@ -166,14 +206,13 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 
 ## §4 obligation 本文
 
-`spec/process/obligations.yaml` に **3 件を net-new として追加**する（D-8: `origin` ブロックを付けない）。キーは既存スキーマ `{id, applies_to, trigger, body}` に一致している（E-11）。
+`spec/process/obligations.yaml` に **3 件を net-new として追加**する（D-8: `origin` ブロックを付けない）。キーは on-disk スキーマ `{id, role, body}` に一致している（E-11 / D-28）。`applies_to` / `trigger` は loader が**認識しないキー**であり、書いても黙って捨てられる ∴ 使わない。
 
 ### §4-1 `OBL-SPEC-PIN`
 
 ```yaml
 - id: OBL-SPEC-PIN
-  applies_to: [implementer]
-  trigger: "Every turn, before any other work."
+  role: implementer
   body: |
     Before you do anything else on a turn, look for `.mindwire/pin` at the
     repository root and resolve it exactly as the spec delivery manifest
@@ -232,11 +271,10 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 
 ```yaml
 - id: OBL-SPEC-RECEIPT
-  applies_to: [implementer]
-  trigger: "Any reply in which you performed, or attempted, implementation work."
+  role: implementer
   body: |
-    Open every reply that performs implementation work with a receipt naming
-    what you actually read this turn, on one line:
+    Open every reply in which you performed, or attempted, implementation work
+    with a receipt naming what you actually read this turn, on one line:
 
       SPEC <spec_id> <blob_sha first 12> <path> (pin: RESOLVED)
 
@@ -258,17 +296,17 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 
 ```yaml
 - id: OBL-SPEC-SCOPE-CLOSURE
-  applies_to: [implementer]
-  trigger: "Any turn performed under a resolved specification."
+  role: implementer
   body: |
-    The specification's `items` are the whole of your mandate for the turn. Do
-    not change files outside the paths an item declares, do not act in a
-    repository no item names, and do not add work that no item declares,
-    however obviously necessary it looks. If the declared scope cannot be
-    completed without work outside it, stop and report the gap — the item id,
-    the work you believe is missing, and why — and let the proposer amend the
-    specification. An amendment costs one turn; an undeclared change costs the
-    reviewer their ability to review.
+    On any turn performed under a resolved specification, the specification's
+    `items` are the whole of your mandate for the turn. Do not change files
+    outside the paths an item declares, do not act in a repository no item
+    names, and do not add work that no item declares, however obviously
+    necessary it looks. If the declared scope cannot be completed without work
+    outside it, stop and report the gap — the item id, the work you believe is
+    missing, and why — and let the proposer amend the specification. An
+    amendment costs one turn; an undeclared change costs the reviewer their
+    ability to review.
 
     Close the scope explicitly before you finish. State, per item id, done or
     not-done with the reason, and confirm that the diff touches nothing outside
@@ -298,12 +336,14 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 | V-2 | ファイル名が `<thread>.md` と一致。`spec_id` が全 manifest 間で一意 | error |
 | V-3 | `status` ∈ {`active`, `withdrawn`}、`canary` ∈ {`required`, `not-applicable`}（D-18: `proposed` / `superseded` は不正値） | error |
 | V-4 | `supersedes` の各要素が実在の `spec_id` を指し、自分自身を指していない（D-20 により相手側 `status` は検査しない） | error |
-| V-5 | `items`: `id` が manifest 内で一意、`id`/`title`/`paths` が存在する（依存グラフ・循環の検査は行わない — D-15） | error |
+| V-5 | `items`: `id` が manifest 内で一意、`id`/`title`/`paths` が存在する。item 側 `status` があれば `active` \| `withdrawn` のいずれかであり、`withdrawn` なら非空の `withdrawn_reason` を伴う（依存グラフ・循環の検査は行わない — D-15） | error |
 | V-6 | 継承解決（§6）後、各 item が `target_repo`/`base_branch`/`canary` を持つ。暗黙の大域既定値は無く、解決できない欠落は error | error |
 | V-7 | 各 item の有効 obligation 集合を **root ∪ item** として解決し、出力に含める（D-16。item 側は追加のみ ∴ 欠落検査は不要） | info |
 | V-8 | 解決された obligation id が `spec/process/obligations.yaml` に実在する | error |
 | V-9 | pin 解決（§3 手順 1〜11）を実行し、`RESOLVED` または `NO-PIN(<reason>)` を報告する。`NO-PIN` 自体は error ではない | info |
 | V-10 | 現在ブランチが `main` のとき、`status: withdrawn` の manifest、または他 manifest の `supersedes` に載っている（＝派生 superseded、D-20）manifest を報告する。**新たな pin の対象にしてはならない文書である**ことの注意喚起であり、gate ではない | **warning**（D-10 / D-21。exit code に影響させない） |
+| V-11 | manifest 直下の `target_repo` が `git remote get-url origin` の basename（末尾 `.git` を除く）と一致する（D-22）。`origin` remote が存在しない作業コピーでは本検査を行わず info を 1 件出す（診断ツールは環境で落ちない — D-10） | error |
+| V-12 | 上書き不可フィールド（`spec_id` / `thread` / `supersedes` / `target_repo`）が item 側に現れない（§6） | error |
 
 ### 出力
 - 既定: 1 行 1 件、`LEVEL CHECK TARGET: message`（例: `ERROR V-8 SPEC-2026-08-11-design-spec-delivery I-3: unknown obligation OBL-SPEC-TYPO`）
@@ -320,8 +360,9 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 
 - **継承される（item 側で省略可）**: `target_repo` / `base_branch` / `canary`。省略時は manifest 直下の値をそのまま採る。
 - **item 必須（継承されない）**: `id` / `title` / `paths`。
-- **上書き可**: `target_repo` / `base_branch` / `canary`。item 側に書けばその item にのみ適用される（例: I-5 は `target_repo: spirrow-voxelworld`）。
-- **上書き不可（manifest 直下のみ・item 側に書けば error）**: `spec_id` / `thread` / `status` / `supersedes`。
+- **上書き可**: `base_branch` / `canary`。item 側に書けばその item にのみ適用される。**`target_repo` は上書きできない**（D-22: spec はそれが置かれている repo に対してのみ authoritative であり、pin は repo 境界を越えられない）。他 repo を対象とする item は本 manifest では表現せず、対象 repo 自身の spec として発行する。
+- **上書き不可（manifest 直下のみ・item 側に書けば error — V-12）**: `spec_id` / `thread` / `supersedes` / `target_repo`。
+- **item 側 `status`（任意）**: manifest 直下の `status` の上書きではなく、**item 固有の独立フィールド**である。enum は文書側と同じ `active` / `withdrawn` で、既定は `active`。`withdrawn` の item は mandate から外れ、dispatch 対象にならず、実行順（D-15）から飛ばされる。`withdrawn` の item は `withdrawn_reason`（非空文字列）を必須とする（V-5）。
 - **`obligations` は union**（D-16）: item の有効集合 ＝ **manifest 直下 ∪ item 直下**。item 側の記述は追加のみで、削除は表現できない。item 側の全列挙は要求しない。解決後の集合は `verify.py --json` の `items[].obligations` に出る ∴ 有効集合を知るのに手作業の再構成は要らない。
 - **順序**: `items` の列挙順が実行順である（D-15）。依存フィールドは持たない。
 - **暗黙の大域既定値を持たない。** manifest 直下にも item 側にも無い継承対象フィールドは error であり、実装が「妥当そうな値」で埋めてはならない（D-6 と同じ fail-closed 方針）。
@@ -336,12 +377,12 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 - **A-6** pin の `branch` を現在ブランチと異なる値にすると `NO-PIN(BRANCH_MISMATCH)` を報告する。pin の内容が他の点で正しくてもよい。
 - **A-7** pin の `blob_sha` を 1 文字変えると `NO-PIN(SHA_MISMATCH)` を報告する。
 - **A-8** すべて正しい pin では `RESOLVED` を報告し、`spec_id` と `blob_sha` を出力に含む。到達可能な commit に対して fetch を実行しない（肯定側はネットワーク不要 — D-14）。
-- **A-9** `origin/main` が古い状態で正しい pin を置くと、1 回の fetch を経て `RESOLVED` になる。`--no-fetch` を付けた同じ状況では `NO-PIN(FETCH_UNAVAILABLE)` を報告する。**この際、implementer の環境で `git fetch` が実際に実行可能かを観測し、結果を PR 本文に記録する**（U-1 の解消。実行不可と判明しても仕様は変更不要 — 肯定側は動く）。
+- **A-9** `origin/main` が古い状態で正しい pin を置くと、1 回の fetch を経て `RESOLVED` になる。`--no-fetch` を付けた同じ状況では `NO-PIN(FETCH_UNAVAILABLE)` を報告する（U-1 は E-12 で解消済 ∴ 観測義務は消費された。`FETCH_UNAVAILABLE` は `--no-fetch` と実ネットワーク障害の 2 経路で到達する）。
 - **A-10** `main` に merge されていない commit を指す pin では、fetch 後も `NO-PIN(COMMIT_UNREACHABLE)` を報告する。A-9 の `FETCH_UNAVAILABLE` と同一コードに畳まれていない。
 - **A-11** item に obligation を追加した manifest に対し、`verify.py --json` の `items[].obligations` が root ∪ item を出力する。item 側から root の obligation を削除する手段がスキーマ上存在しない。
 - **A-12** **I-2 が `main` に merge された直後の `main` 上で `verify.py` を実行すると、error 0・warning 0 である**（D-21: 恒久 warning を出さない）。
 - **A-13** `.gitignore` に `.mindwire/` が入っており、`.mindwire/pin` を置いた状態で `git status --porcelain` にそれが現れない。spirrow-mindwire と spirrow-voxelworld の両方で成立する。
-- **A-14** 本 manifest が `spec/design/T-design-spec-delivery.md` として存在し、`verify.py` の V-1〜V-8 を error 0 で通過する（自己適用）。
+- **A-14** 本 manifest が `spec/design/T-design-spec-delivery.md` として存在し、`verify.py` の V-1〜V-8 および V-11 / V-12 を error 0 で通過する（自己適用）。
 - **A-15** §1.1 の ADR 参照（番号・表題・内容）が実在と一致することを確認し、結果を PR 本文に書く。**一致しない場合は修正せず停止して報告する**（D-17）。
 - **A-16** `after` に相当する依存フィールドが front-matter スキーマにも `verify.py` にも存在しない（D-15）。
 - **A-17** 本仕様の実装差分のどこにも `gh pr merge` を implementer に実行させる記述・コード・手順が無い（D-11 / E-8）。
@@ -349,6 +390,9 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 - **A-19** `status: withdrawn` の manifest、または他 manifest から `supersedes` されている manifest を `main` 上に置くと V-10 が warning を出し、exit code は 0 のままである。
 - **A-20** front-matter に `status: proposed` または `status: superseded` を書くと V-3 が error を出す（D-18 の回帰防止）。
 - **A-21** `main` に merge 済みの manifest の本文が、chatroom に投稿された msg 本文と byte 単位で一致する（D-2 手順 3・D-19）。
+- **A-22** item に `status: withdrawn` ＋ `withdrawn_reason` を書いた manifest が V-1〜V-8 を error 0 で通過し、`verify.py --json` の当該 item がその状態を出力する。`withdrawn_reason` を落とすと V-5 が error を出す。
+- **A-23** `target_repo` を実在の remote basename と異なる値にすると V-11 が error を出す。`origin` remote を持たない作業コピーでは V-11 が error を出さず info を 1 件出し、exit code は 0 のままである。
+- **A-24** item 側に `target_repo` を書くと V-12 が error を出す（D-22 の回帰防止）。
 
 ## §8 運用（順序の SOT は `items` の列挙順 — D-15）
 
