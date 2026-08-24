@@ -32,6 +32,20 @@ Assembled from what remains readable in-window:
   mirror). Adopted here.
 - **msg-1370 §0 Tier-C `NEXT: human` continuation**: Takahito's msg-1400 §16
   and msg-1403 §17 accepted these as binding. Tier-C msg (parent thread head).
+- **msg-1442 §28** — Bohr's v2 prompt design (D-46 rev2 / D-47 / D-48 rev2 /
+  D-49 / D-50 rev2 / D-51 / D-52). Adopted here.
+- **msg-1441** — Einstein's naysayer objections (three points on the v2
+  draft: rule-3 branch structure, character-count regression, garden-path
+  sentences). Response in msg-1442 §28 folds two in full, addresses the third
+  by adding D-52 (independent-sentence rule) rather than a schema key.
+- **msg-1461** — Tier-C GO on the v2 prompt design and the URL-material
+  requirement (§3 of that message, folded into D-53).
+- **msg-1462 §29 / msg-1464 §30** — Bohr's D-53 rev2 (URL rule with a
+  lexical trigger). msg-1464 §30 supersedes §29 for D-53's specific rule
+  text.
+- **msg-1463** — Einstein's objection to D-53's original ontological
+  trigger; folded into D-53 rev2 (msg-1464 §30).
+- **msg-1461** (second reference) — Tier-C GO on D-53 rev2 and freeze.
 
 What is **not** available:
 
@@ -145,7 +159,9 @@ Same disease, different vector.
 retrospective can bind output quality to a prompt revision without archaeology.
 
 **System-prompt properties** (the property list is normative; the concrete
-wording is the implementation's):
+wording is the implementation's — the v1 prompt property list, kept for
+historical reference; the v2 revision layers D-46 rev2 through D-53 rev2 on
+top of these five, described in §D-46..§D-53 below):
 
 1. You do not decide. You phrase.
 2. At least 2 options, each with `id`, `label`, `gain`, `loss`.
@@ -155,6 +171,276 @@ wording is the implementation's):
 4. Unknowns are declared as unknown. Do not fill.
 5. Output is JSON only, matching the specified schema. Prose outside JSON
    is a violation.
+
+## D-46 rev2 — internal thread labels are restated on first use (msg-1442 §28.2)
+
+**Problem this closes**: the v1 prompt let the model use thread-internal
+labels (`D-0`, `F-1-C`, `CF-1`, phase names, slice ids, gate names) as if
+the reader already knew what they meant. The Discord reader has NOT read
+the thread; those labels arrive as opaque tokens. msg-1461 §2's before
+example — "D-0 調査を候補 A (`FFieldRegularizeParams`) を対象として続行しますか…"
+— is the concrete failure.
+
+**Rule (verbatim intent — implementer adapts wording to the existing prompt's
+numbering; D-50 rev2 forbids verbatim copy)**: the first time the model
+uses a label that only carries meaning inside the thread, it MUST take one
+of these two branches, chosen by what the tail actually says:
+
+- **(a)** the tail states what the label refers to → restate it in plain
+  words alongside the label.
+- **(b)** the tail does NOT state what the label refers to → say only how
+  the thread USES the label, note that the thread never defines it, and
+  add the label to `unknowns`.
+
+**Why the branch is in the rule, not in a separate safety net (Einstein
+msg-1441 #1)**: an affirmative imperative ("explain the label") will
+overrule a distant negative constraint ("do not invent"). The uncertainty
+allowance MUST live in the same rule as the explanation imperative,
+because LLMs prioritise nearby action verbs over distant prohibitions.
+The forced (a)/(b) branch removes the option to invent.
+
+**Why rule 3 and rule 4 (D-46 rev2 and D-51) share the same shape**: the
+same failure mode applies to code identifiers (§D-51 below). Both use the
+identical (a)/(b) branch so the model sees one pattern rather than two
+different mechanisms.
+
+## D-47 — "hallucinating is worse than jargon" — rationale note (msg-1442 §28.2)
+
+**Position**: this is NOT an independent safety-net rule. It is a
+rationale sentence embedded in the prompt near D-46 rev2 / D-51 (spec
+§D-51) that names the trade-off. Enforcement is done by the (a)/(b)
+branches; D-47 exists so a model that reads the rules and asks "why?"
+sees the answer nearby (LLMs are known to comply better with rules
+paired with immediate rationale). The v1 iteration placed D-47 as a
+standalone Hard Rule; that positioning failed by Einstein's mechanism
+(msg-1441 #1) because the "explain it" imperative in rules 3 and 4
+sat between "explain" and the distant "do not invent". Fold, don't
+stack.
+
+## D-48 rev2 — no character-count targets (msg-1442 §28.3)
+
+**Problem this closes**: v1's original v2 draft carried a "~600 characters
+for question, ~120 for label" soft budget. Einstein msg-1441 #2 flagged
+that any numeric character target is read by LLMs as a compression
+mandate — the model will drop the very explanations D-46 rev2 / D-51
+were introduced to protect, because it is easier to hit a character
+target by summarising than by prioritising a qualitative rule.
+
+**Rule**: the prompt states "there is no length limit and no length
+target". The rationale that survives in the prompt is:
+"understandability beats brevity". The physical Discord budget
+(`$DecisionMessageDiscordBudget`, currently 1950) is enforced downstream
+in the wrapper's truncation ladder — the model does not need to know it.
+
+**What is NOT dropped**: a sentence-count floor and a soft sentence
+ceiling. `question` has "at least 2 sentences" and "around 6 sentences
+is usually enough". Rationale (msg-1442 §28.3): brevity pressure operates
+on characters WITHIN a sentence (jargon buys characters, not sentences).
+A sentence-count floor pushes in the opposite direction — it cannot
+reward compression. A minimum of 2 sentences is also the direct
+opposite of the v1 "one-line question" wording; removing it entirely
+would leave room to regress to "1 line" behaviour.
+
+**Ceiling is soft and self-releasing**: the ceiling ("around 6 sentences
+is usually enough") is paired with an explicit release valve — "if you
+are past that, check … but do NOT delete an explanation to get under
+it." The floor is what enforces D-48 rev2; the ceiling is a comfort
+hint that must never be enforced by deleting an explanation.
+
+**Registered cost (msg-1442 §28.3)**: output length rises; the risk of
+brushing the `DEFAULT_TIMEOUT_SECONDS` ceiling (A-20) and the risk of
+Discord truncation (A-21 rev2) both rise. This is the explicit trade-off
+of §7 (understandability > brevity). Do not restore a character target
+by the back door.
+
+## D-49 — sha256 pin of the prompt text tied to `PROMPT_VERSION` (msg-1442 §28.6)
+
+**Problem this closes**: `prompt_version` in `envelope.extras` is a
+runtime observability invariant. A retrospective that groups by
+`prompt_version` is only usable if the version string and the prompt
+text remain bound. A silent edit to the prompt text without a version
+bump would poison every downstream analysis.
+
+**Implementation**: the module carries a `PROMPT_DIGEST_V2` constant
+alongside `PROMPT_VERSION`. Its value is
+`sha256(_SYSTEM_PROMPT.encode('utf-8')).hexdigest()`. A single test
+(`TestPromptDigestPin` in `tests/test_claude_code_composer.py`) asserts
+the pin. Updating the prompt requires a coordinated edit:
+`PROMPT_VERSION` bumps, `PROMPT_DIGEST_V2` (or a next-version constant)
+recomputed, in the SAME commit.
+
+**Why this pin is not "just an arbitrary constant"** (msg-1441 endorsement
+of D-49 mechanism): the pinned rejected v1 timeout constant was arbitrary
+because timeout is a measurement, not an invariant. `prompt_version` IS
+an invariant, because its whole reason for existing in extras is that
+downstream analysis relies on its stability. Pinning the digest protects
+the invariant.
+
+**What this pin explicitly does NOT do**: it does not assert any content.
+Text-based assertions on prompt content (e.g. "the word `explain` appears
+in rule 3") would be false comfort (msg-1442 §28.6) — the stub backend
+never exercises the real LLM, and no test at this layer can verify
+whether the model actually complies with a prompt rule. The pin is the
+only new test introduced with the v2 revision.
+
+## D-50 rev2 — schema keys and copy discipline (msg-1442 §28.4.1, msg-1464 §30)
+
+**Split into three parts, because the original D-50 argument was
+over-broad**:
+
+1. **Renaming or deleting a schema key is prohibited.** The wrapper
+   parses envelopes against the S1 shape; a removed or renamed key
+   produces a parse failure that fails-open to the raw ping (I-2) —
+   silent functional loss, exactly the failure mode §14 exhibited.
+2. **Adding a schema key is deferred for v2.** Not because it is
+   necessarily fatal (whether the parser tolerates unknown keys is
+   unverified, and D-50 rev2 does not require it to be verified), but
+   because: (i) today's reader-facing surfaces are the Discord message
+   and `pending-decisions.json`; the Discord formatter is unaware of a
+   new key, so any content placed in one would not reach the reader
+   who receives the notification; (ii) magickit's decision page is
+   in-flight (`T-decision-page`), and coupling a schema change to that
+   in-flight design introduces cross-repo entanglement that S3's PR
+   is explicitly not scoped for (§Non-goals).
+3. **Verbatim copy of the msg-1442 §28.5 or msg-1464 §30.2 prompt
+   fragments is prohibited.** The composer's own wording carries the
+   same function; a verbatim paste treats the specifying messages as
+   the SOT, which contradicts §Provenance and D-34 (this spec file is
+   the SOT). The functional match is what binds; the wording is the
+   implementation's.
+
+**Reconsideration trigger (msg-1442 §28.4.4)**: if A-19 rev2 fails with
+reason (ii) — "the explanations are there but the sentences are too
+tangled to follow" — the inline-explanation approach itself is at its
+limit, and the correct next step is a `glossary` field with the Discord
+formatter and magickit's decision page updated in coordination. That
+scope change is a Tier-C call, not a further prompt iteration.
+
+## D-51 — code identifiers on first use are grounded from the tail or marked as unknown (msg-1442 §28.2)
+
+**Problem this closes**: the v1 prompt allowed the model to name a code
+identifier (`FFieldRegularizeParams`) without ever saying what the
+identifier does. The Discord reader saw a bare identifier and could
+not tell whether the composer knew what it was or was guessing.
+
+**Rule (verbatim intent — implementer adapts to the prompt's numbering
+scheme, D-50 rev2 §3)**: the first time the model uses a code identifier
+(type, function, flag, filename), it MUST take one of these two
+branches, chosen by what the tail actually contains:
+
+- **(a)** the tail states what the identifier does → say what it does,
+  in plain words, next to the identifier.
+- **(b)** the tail does NOT state what the identifier does → name how
+  the thread USES the identifier, mark the gap in the same sentence,
+  and add the identifier to `unknowns`.
+
+**The prompt must also state that the model has not seen the code**, so
+that (b) is understood as the ordinary case, not a failure mode.
+Writing (a) when only (b) is supported is the worst outcome under
+these rules: the reader cannot distinguish an inspection from a guess.
+
+**Same-shape justification**: D-46 rev2 (thread labels) and D-51 (code
+identifiers) intentionally share the (a)/(b) shape, so the model sees
+one pattern rather than two. Einstein #1 (msg-1441) flagged the label
+side; the code-identifier side has the same failure mechanism and takes
+the same fix.
+
+## D-52 — explanations live in their own sentences (msg-1442 §28.4.3)
+
+**Problem this closes**: D-50 rev2 §2 keeps explanations inline (no
+`glossary` key). Einstein #3 (msg-1441) warned that inline restatements
+tend to be injected via em-dashes and parentheticals, producing
+garden-path sentences that are just as unreadable as the original
+jargon, only in a different way.
+
+**Rule**: each explanation goes in its own short sentence. Dashes,
+brackets, and parentheses MUST NOT be used to stack a definition
+inside an outer sentence. One idea per sentence. The prompt carries
+a WRONG example (nested definitions) and a RIGHT example (separated
+sentences) so the model has a concrete anchor.
+
+**Interaction with D-48 rev2**: D-52 costs sentences — the prompt
+states this explicitly ("explaining costs sentences, not clauses.
+Spend the sentences"). A sentence-count cap that penalises D-52 would
+partially undo it, which is why D-48 rev2 states the ceiling as a
+comfort hint with a release valve rather than a hard cap.
+
+**Interaction with D-53 rev2 (see §D-53 below)**: D-52 says the last
+sentence of `question` is the question itself. D-53 rev2 (a) appends
+a URL to the end of the question. The URL is not a sentence, so
+attaching it to the final sentence (space-separated) does not violate
+"one idea per sentence" or "the last sentence is the question". This
+is an application-time convention, NOT a change to D-52.
+
+## D-53 rev2 — carry a URL when the tail supplies one; never fabricate (msg-1464 §30)
+
+**Problem this closes**: msg-1461 §3 records that a merge request for
+"PR #171" arrived with no repository identifier and no URL. The
+recipient had to search for it. The decision material is missing its
+target's location.
+
+**Trigger (lexical, not ontological — Einstein msg-1463)**: this rule
+applies ONLY when the decision target is a pull request, an issue, a
+ticket, or a dashboard. It does NOT apply to source files, functions,
+design choices, scope calls, or schedules. The trigger is closed to
+that four-item list on purpose: most decisions in this project are
+about source files or design choices, and the rule was originally
+written with "a file" among the triggering examples. Einstein predicted
+(msg-1463) that a broader ontological trigger would fire on every
+codebase discussion and inject "the thread never gives the full link"
+noise into `question` and `unknowns` on the majority of stops. The
+list is narrow so silence is the default outcome; when in doubt, do
+not fire.
+
+**Rule (verbatim intent)** for a triggering decision target:
+
+- **(a)** the tail contains the FULL url starting with `https://` →
+  copy it EXACTLY, character for character. Place it at the end of the
+  final sentence of `question`, preceded by a single space, with
+  NOTHING attached after it (no closing bracket, no period, no comma).
+  Do not wrap it in brackets or markdown. Do not shorten it. Do not
+  "fix" it.
+- **(b)** the tail names it only by number or short reference (`#171`,
+  `PR 171`, `issue 42`) and gives NO full url → write the reference
+  exactly as it appears, state in the same sentence that the thread
+  never gives the full link, and add the reference to `unknowns`.
+- **NEVER build a url from a number.** The composer does not know
+  which repository or which host owns the number. A fabricated url
+  opens something, and the reader believes it is the right thing.
+  That is worse than giving no link at all.
+
+**Silence otherwise (D-53.6 rev2)**: for decisions outside the four-item
+list, or triggering decisions where the tail contains no reference at
+all, the prompt says NOTHING about links. Do not add "no url" to
+`unknowns`. Do not mention that a link is absent. This is what makes
+Einstein #3's "meta-noise" prediction not fire.
+
+**Placement (D-53.4 / D-53.5)**: the URL lives at the end of the final
+question sentence in `question`. No new schema key is added (D-50 rev2
+§2). No URL is placed in `options[].label` / `gain` / `loss` (repeats
+would consume the Discord budget for no additional information).
+
+**Format (D-53.2)**: bare absolute URL, `https://...`, no markdown
+brackets. Rationale: markdown auto-linking in Discord is not
+guaranteed by the current wrapper, and a bare URL is the widest-support
+form that both Discord and any later decision-page renderer can link
+against.
+
+**Reserved list (msg-1464 §30.5)**: the trigger list excludes `commit`
+and `file` deliberately. Both can have URLs, but neither has appeared
+as a decision target in this thread's measured history, so including
+them would raise the misfire rate without raising the hit rate. If a
+future stop makes a commit the actual decision target, adding it is a
+one-word prompt edit with a `PROMPT_VERSION` bump.
+
+## Prompt-version bump policy (D-49 corollary)
+
+Every prompt-text edit is a two-line change: `PROMPT_VERSION` moves and
+`PROMPT_DIGEST_V<N>` gets a new value (either the same-versioned
+constant updated, or a new-versioned constant added alongside a new
+`TestPromptDigestPin` case). Do the edits in the SAME commit as the
+prompt text change. A prompt edit committed without a digest bump is
+what the D-49 pin exists to reject.
 
 **User-prompt shape**:
 
@@ -391,6 +677,53 @@ Also additive:
     per-option gain/loss, recommendation A cites the actual thread
     (msg-2510 §0), F-1 rubric satisfied, 7 explicit unknowns. This
     result is the evidence base for D-45.
+- **A-19 rev2** (msg-1442 §28.6, endorsed msg-1461 §2): a real parked
+  `NEXT: human` stop is composed twice — once with `PROMPT_VERSION=1`
+  and once with `PROMPT_VERSION=2` — and both outputs are shown to the
+  human judge (Takahito, per msg-1461 §2). The judgement is qualitative:
+  can the reader tell from the after-version what is being asked,
+  without opening the thread? Fail-diagnosis is REQUIRED — the human
+  returns not only the labels/identifiers they could not follow, but
+  the distinction between **(i)** unfamiliar terms and **(ii)** terms
+  are explained but the sentences are too tangled to follow. (i) and
+  (ii) have opposite fixes (msg-1442 §28.4.4 / D-50 rev2 reconsideration
+  trigger). If A-19 rev2 fails with reason (ii), do not iterate the
+  prompt further — the correct next step is a `glossary` field, which
+  is a Tier-C scope call. **Baseline for after-comparison** (msg-1461
+  §2, 2026-08-22): the v1 real run produced
+  "D-0 調査を候補 A (`FFieldRegularizeParams`) を対象として続行しますか…"
+  and the concrete complaint was "D-0 が何なのかが分からない" /
+  "`FFieldRegularizeParams` が何なのかわからない". The v2 run is
+  compared against that.
+  - Not gated in CI. Runs on the deploy host end-to-end.
+- **A-20** (msg-1442 §28.6): `envelope.extras.duration_ms` is reported.
+  Baseline is 40,213 ms (Tier-C §2, 2026-08-22). The v2 prompt removed
+  the character-count target, so output length rises and elapsed is
+  expected to rise. If a timeout fires under v2, do NOT raise
+  `DEFAULT_TIMEOUT_SECONDS` unilaterally (see D-45 clause 4 and
+  msg-1442 §26.2 / §28.6). Report the distribution to Tier-C instead.
+- **A-21 rev2** (msg-1442 §28.6, msg-1461 §3, msg-1464 §30.3): the real
+  Discord message body from a triggering stop is captured and inspected
+  against the `$DecisionMessageDiscordBudget` (1950 chars). Three
+  observations are recorded:
+  1. Did the question survive?
+  2. Did the option labels survive?
+  3. If the decision target was a triggering type (D-53 rev2) AND the
+     tail contained a full URL, did that URL survive? If the decision
+     target was NOT a triggering type OR the tail had no URL, this
+     item is recorded as "not applicable" (silence is the correct
+     D-53.6 rev2 outcome, and a missing "not applicable" note is
+     indistinguishable from a URL that was truncated away).
+  **Also record what was NOT survived** (msg-1464 §30.3): Einstein
+  msg-1463's minor observation predicts URL may be safer than option
+  labels because it lives on `question` (which prints first). If
+  labels dropped while URL survived, that is the material for R-4
+  (truncation-ladder design) and evidence the R-5 concern (URL
+  disappears silently) was over-weighted. Do not alter the truncation
+  ladder based on A-21 alone — feed R-4 with the observation.
+- **A-22** (msg-1442 §28.6, §28.7 renumbered): `bash .mindwire-gate`
+  green. This is what "A-5" (§5 of msg-1370) referred to; renumbered
+  in the v2 acceptance set for clarity.
 
 **A-18 execution constraint**: A-18 requires the `claude` CLI and network
 egress to `api.anthropic.com`. It CANNOT be run from a mindwire-impl
@@ -438,7 +771,16 @@ Coverage:
    at `body_cap` when a body exceeds it, and both cap markers and the
    `--- msg-<id> by <author> ---` separators appear.
 6. Prompt version — `PROMPT_VERSION` constant is a module-level string
-   ("1"), and the extras key `prompt_version` reports its value verbatim.
+   ("2" as of the v2 revision), and the extras key `prompt_version`
+   reports its value verbatim.
+6a. **Prompt digest pin (D-49)** — `TestPromptDigestPin` computes
+    `sha256(_SYSTEM_PROMPT.encode('utf-8')).hexdigest()` and asserts it
+    equals `PROMPT_DIGEST_V2`. This is the ONLY new test introduced by
+    the v2 revision (msg-1442 §28.6). Content-oriented assertions on
+    the prompt text are DELIBERATELY not added: the stub backend does
+    not exercise the real LLM, so any test at this layer that claimed
+    to verify prompt compliance would be a false comfort (§28.6, §14
+    / §24 same-shape principle).
 7. `compose_once` propagates `last_extras` to envelope.extras when the
    composer has that attribute (duck-typed); envelopes from
    `StubComposer` remain empty extras.
