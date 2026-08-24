@@ -45,7 +45,7 @@ items:
 
 | id | 事実 | 出典 / 計測者 |
 |---|---|---|
-| E-1 | proposer の capability は `{READ_THREAD, POST_REPLY}` の 2 つのみ。実行時 `tools=[]` の text-only セッション。**proposer はファイルを書けず、commit も PR 作成もできない** | `src/spirrow_mindwire/loop_runner.py` (`Stage3ProposerAdapter`) / `adapters/claude_code_sdk.py` — human |
+| E-1 | proposer の capability は `{READ_THREAD, POST_REPLY}` の 2 つのみで、`EXECUTE_CODE` を持たない。**書き込み系ツールは無い**（`Write` / `Edit` / `Bash` いずれも不在）∴ ファイルを書けず、commit も PR 作成もできない。**ただし読める**: `_PROPOSER_BUILTIN_TOOLS = ("Read", "Glob", "Grep")` が `cwd=repo_dir` ＋ `can_use_tool=_PathScopeGuard(root=repo_dir)` で渡される | 実査 — `906cb58`（`origin/main` の祖先）, `src/spirrow_mindwire/loop_runner.py` の `Stage3ProposerAdapter` / `_PROPOSER_BUILTIN_TOOLS` / `build_proposer`（Bohr, 2026-08-24）。r3 の `tools=[] の text-only` は 2026-08-11 時点では真だったが `906cb58`（08-18）で偽になった |
 | E-2 | proposer から `EXECUTE_CODE` を落としてあるのは意図された設計。両方を registry に入れると IMPLEMENTER スロットが allow-list ゲート付きの implementer ではなく素通しのアダプタに解決されてしまうため、それを避けている。**現に稼働している implementer は allow-list の後ろにある** | `adapters/claude_code_sdk.py` docstring — human |
 | E-3 | implementer / naysayer のみツールを持つ | 同上 — human |
 | E-4 | **implementer と naysayer は CLAUDE.md を読まない**（implementer は `setting_sources=[]`）。proposer のみ読む | ループ設定 — human |
@@ -67,7 +67,7 @@ items:
 
 ### §1.1 規範根拠（要検証引用）
 
-本設計は **ADR-2026-05-23-07（Stage 3 Autonomy Gating / implementer 安全設計）** の要請を実装に落とすものであり、E-1〜E-3 の capability 分離はこの ADR に由来する。
+本設計は **ADR-2026-05-23-07 — Stage 3 Autonomy Gating + Implementer 安全設計** の要請を実装に落とすものであり、E-1〜E-3 の capability 分離はこの ADR に由来する。
 
 **この引用は proposer が検証していない**（E-1 により ADR を読めない）。出典は Einstein の実査申告（2026-08-11）である。**A-15 で着地時に検証すること。番号・表題・内容のいずれかが実在と食い違う場合、実装者は黙って修正せず、停止して報告せよ** — 誤った参照を静かに正しくすると、誤りがどこで混入したかが失われる。
 
