@@ -123,3 +123,54 @@ def test_parse_tool_result_all_invalid_json_raises_magickit_error() -> None:
     # Invalid JSON surfaces as MagickitMcpError, not a raw JSONDecodeError.
     with pytest.raises(MagickitMcpError):
         parse_tool_result(_FakeToolResult(content=[_FakeTextBlock("not json")]))
+
+
+# --------------------------------------------------------------------------- #
+# T-error-envelope-read-as-data DoD #1: parse_tool_result elevates a conclair
+# error envelope to MagickitMcpError at the client boundary, so no caller has
+# to remember to check for one (msg-1115 §4).
+# --------------------------------------------------------------------------- #
+
+# The envelopes below are verbatim from the live server on 2026-08-16 (see
+# tests/test_orchestrator.py::_error_envelope). Elevating them here is the
+# single source of truth the msg-1496 refactor pinned; a change to the
+# envelope shape will break these tests before it silently breaks callers.
+
+_LIVE_NOT_FOUND: dict[str, Any] = {
+    "error_type": "ChatroomNotFoundError",
+    "error": "Thread 'T-pr-review-spirrow-magickit-22' not found in project 'spirrow-mindwire'",
+    "details": {
+        "project": "spirrow-mindwire",
+        "thread_id": "T-pr-review-spirrow-magickit-22",
+    },
+}
+
+
+def test_parse_tool_result_elevates_envelope_from_structured_content() -> None:
+    with pytest.raises(MagickitMcpError, match="ChatroomNotFoundError"):
+        parse_tool_result(_FakeToolResult(structured=_LIVE_NOT_FOUND))
+
+
+def test_parse_tool_result_elevates_envelope_from_text_block() -> None:
+    import json
+
+    with pytest.raises(MagickitMcpError, match="ChatroomNotFoundError"):
+        parse_tool_result(_FakeToolResult(content=[_FakeTextBlock(json.dumps(_LIVE_NOT_FOUND))]))
+
+
+def test_parse_tool_result_error_message_includes_the_far_end_reason() -> None:
+    # DoD #4.4 (msg-1496): the warning at the report_observed call site must be
+    # able to show ``error_type`` and the message; that requires the elevation
+    # to carry both, not just the class name.
+    with pytest.raises(MagickitMcpError) as excinfo:
+        parse_tool_result(_FakeToolResult(structured=_LIVE_NOT_FOUND))
+    text = str(excinfo.value)
+    assert "ChatroomNotFoundError" in text
+    assert "T-pr-review-spirrow-magickit-22" in text
+
+
+def test_parse_tool_result_lets_a_payload_with_no_error_type_pass_through() -> None:
+    # Only ``error_type`` sets the envelope apart from an ordinary payload —
+    # a domain field that merely mentions the word "error" is not one.
+    payload = {"thread": {"title": "x"}, "messages": []}
+    assert parse_tool_result(_FakeToolResult(structured=payload)) == payload

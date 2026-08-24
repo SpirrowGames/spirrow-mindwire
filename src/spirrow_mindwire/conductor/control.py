@@ -35,7 +35,7 @@ import logging
 from enum import StrEnum
 from typing import Any, Protocol
 
-from ..magickit.client import McpToolCaller
+from ..magickit.client import MagickitMcpError, McpToolCaller
 
 logger = logging.getLogger(__name__)
 
@@ -168,12 +168,22 @@ class LoopControlReader:
         """
         if state is self._last_reported:
             return
+        # msg-1496 §4: the catch is narrow (``MagickitMcpError`` only — a
+        # transport failure or the client's envelope elevation, both wrap into
+        # that one class; ``except Exception`` would drink programming errors
+        # here and put the "silent success" hole msg-1115 §3 objected to right
+        # back in). It wraps ONLY the report call — same reason ``read`` above
+        # has its own separate try (§4.2: the get's fail-safe catch and this
+        # swallow must not share a try). ``_last_reported`` is not touched on
+        # the failure branch — DoD (b) pins that the next round re-sends the
+        # same value, so the docstring's "retried on the next round" is
+        # literally true.
         try:
             await self._mcp.call_tool(
                 _TOOL_REPORT_OBSERVED,
                 {"project": self._project, "state": state.value, "actor": self._actor},
             )
-        except Exception as exc:
+        except MagickitMcpError as exc:
             logger.warning(
                 "loop control: %s failed for project %r (%s) — the dashboard will show a stale "
                 "observed value; continuing on %s",

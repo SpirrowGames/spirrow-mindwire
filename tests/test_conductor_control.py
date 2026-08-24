@@ -23,10 +23,20 @@ from spirrow_mindwire.conductor.control import (
     LoopControlReader,
     parse_control_payload,
 )
+from spirrow_mindwire.magickit.client import MagickitMcpError, raise_if_envelope
 
 
 class _FakeMcp:
-    """Records calls; returns a scripted result or raises a scripted error per tool."""
+    """Records calls; returns a scripted result or raises a scripted error per tool.
+
+    Mimics the *client boundary*, not the raw transport. A scripted payload
+    shaped like a conclair error envelope is elevated to
+    :class:`MagickitMcpError` here via :func:`raise_if_envelope`, exactly the
+    way :class:`~spirrow_mindwire.magickit.client.StreamableHttpChatroomMcp`
+    does in production — so a fake that returns the measured envelope shape
+    (T-error-envelope-read-as-data DoD #3) drives the same code path a real
+    server does.
+    """
 
     def __init__(self, results: dict[str, Any] | None = None) -> None:
         self._results = results or {}
@@ -37,6 +47,7 @@ class _FakeMcp:
         result = self._results.get(name)
         if isinstance(result, Exception):
             raise result
+        raise_if_envelope(result)
         return result
 
 
@@ -128,6 +139,28 @@ async def test_read_fails_safe_on_a_transport_error() -> None:
     assert await LoopControlReader(mcp, project="p").read() is ControlState.HOLD
 
 
+@pytest.mark.anyio
+async def test_read_fails_safe_when_the_call_returns_an_error_envelope() -> None:
+    """Row 2 of msg-1115 §1, re-checked at the elevation boundary.
+
+    The client now elevates a conclair error envelope to
+    :class:`MagickitMcpError` at the transport, so ``read``'s wide catch
+    (``except Exception``) rescues it and produces the same ``hold`` as any
+    other unreadable state — the pre-elevation behaviour (``parse_control_payload``
+    failing safe on a payload with no ``desired_state``) lands at the same
+    ``hold`` too, so this refactor **must not** change what row 2 does. Pinned
+    against a verbatim envelope so a future narrowing of the ``read`` catch
+    cannot silently regress the fail-safe direction.
+    """
+    envelope = {
+        "error_type": "ChatroomUnavailableError",
+        "error": "project 'p' has no loop_control row",
+        "details": {"project": "p"},
+    }
+    mcp = _FakeMcp({"loop_control_get": envelope})
+    assert await LoopControlReader(mcp, project="p").read() is FAILSAFE_CONTROL_STATE
+
+
 # --------------------------------------------------------------------------- #
 # LoopControlReader.report_observed
 # --------------------------------------------------------------------------- #
@@ -151,11 +184,109 @@ async def test_report_observed_swallows_failures_and_retries_next_time() -> None
     # Observability must never stop the loop — the run's decision is already made. And because the
     # de-dup marker only advances on success, a dropped report is retried rather than lost, so the
     # dashboard converges instead of showing a stale value forever.
-    mcp = _FakeMcp({"loop_control_report_observed": TimeoutError("slow")})
+    #
+    # The exception type is ``MagickitMcpError`` deliberately: the production client wraps every
+    # transport failure (``TimeoutError``, ``ConnectionError``, …) into that class before returning,
+    # so a fake that raised the raw ``TimeoutError`` was testing a state the caller cannot see.
+    # Under msg-1496 §4.1's narrow catch (``MagickitMcpError`` only, no bare ``except Exception``),
+    # the older fake would leak the wrapped-away exception; using the class production actually
+    # produces is the correct simulation.
+    mcp = _FakeMcp({"loop_control_report_observed": MagickitMcpError("transport slow")})
     reader = LoopControlReader(mcp, project="p")
     await reader.report_observed(ControlState.HOLD)  # must not raise
     await reader.report_observed(ControlState.HOLD)
     assert len(mcp.calls) == 2
+
+
+@pytest.mark.anyio
+async def test_report_observed_swallows_an_error_envelope_and_does_not_advance() -> None:
+    """DoD #4 (a): the envelope must not escape the call site, and the marker must not advance.
+
+    ``report_observed`` used to run under ``except Exception``, so an envelope
+    returned as a "success" payload flowed through silently and
+    ``_last_reported`` advanced as if the write had landed — a docstring saying
+    "advances only on success" with an implementation that could not tell the
+    two apart. Under the elevation (T-error-envelope-read-as-data DoD #1) the
+    envelope becomes :class:`MagickitMcpError`; the narrow catch keeps the call
+    site quiet but only for real refusals, and *never* moves the marker.
+    """
+    envelope = {
+        "error_type": "ChatroomNotFoundError",
+        "error": "loop_control row for project 'p' not found",
+        "details": {"project": "p"},
+    }
+    mcp = _FakeMcp({"loop_control_report_observed": envelope})
+    reader = LoopControlReader(mcp, project="p")
+
+    await reader.report_observed(ControlState.HOLD)  # must not raise
+
+    assert reader._last_reported is None  # the marker did not advance
+    assert [name for name, _ in mcp.calls] == ["loop_control_report_observed"]
+
+
+@pytest.mark.anyio
+async def test_report_observed_retries_the_same_value_next_round_after_failure() -> None:
+    """DoD #4 (b): pin the docstring's "retried on the next round" literally.
+
+    Round 1 fails with an envelope-elevated :class:`MagickitMcpError`; round 2
+    is programmed to succeed (empty dict is not an envelope). The second
+    ``report_observed`` for the *same* state must therefore go through — which
+    is only true if ``_last_reported`` was NOT advanced by round 1. If a later
+    edit "helpfully" moves ``_last_reported`` on the failure path (which is
+    exactly the change msg-1496 §4.3 exists to forbid), round 2 will short-
+    circuit on the ``if state is self._last_reported`` guard and this test will
+    catch it.
+    """
+
+    class _EnvelopeThenOk:
+        """First call raises via the envelope elevation, second call succeeds."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+            self._first = True
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            self.calls.append((name, arguments))
+            if self._first:
+                self._first = False
+                raise_if_envelope(
+                    {
+                        "error_type": "ChatroomUnavailableError",
+                        "error": "chatroom down",
+                        "details": {"project": arguments["project"]},
+                    }
+                )
+            return {}
+
+    mcp = _EnvelopeThenOk()
+    reader = LoopControlReader(mcp, project="p")
+
+    await reader.report_observed(ControlState.HOLD)  # round 1: silently dropped
+    await reader.report_observed(ControlState.HOLD)  # round 2: goes through
+
+    # Two attempts, both for the same state — the retry the docstring promises.
+    assert len(mcp.calls) == 2
+    assert [args["state"] for _, args in mcp.calls] == ["hold", "hold"]
+    assert reader._last_reported is ControlState.HOLD  # advanced by round 2, not round 1
+
+
+@pytest.mark.anyio
+async def test_report_observed_lets_programming_errors_propagate() -> None:
+    """msg-1496 §4.1: the narrow catch refuses to drink ``Exception``.
+
+    A programming bug (``TypeError`` from a mis-shaped argument list, say) is
+    exactly what an ``except Exception`` here would swallow silently — and the
+    silent-success hole msg-1115 §3 objected to is what it takes to grow back.
+    Pin that anything that is not a ``MagickitMcpError`` escapes.
+    """
+
+    class _RaisesTypeError:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            raise TypeError("argument bug")
+
+    reader = LoopControlReader(_RaisesTypeError(), project="p")
+    with pytest.raises(TypeError):
+        await reader.report_observed(ControlState.HOLD)
 
 
 @pytest.mark.anyio
