@@ -1,7 +1,7 @@
 # Identity classification — primary-source read for the "role null must become impossible" epic
 
 - **thread**: `T-role-null-must-become-impossible` (spirrow-mindwire chatroom)
-- **spec source**: Bohr's msg-1179 §5, msg-1487 §5, msg-1493 §2 (`allowed_roles := observed ∩ legitimate`)
+- **spec source**: Bohr's msg-1179 §5, msg-1484 §5, msg-1493 §2 as corrected by msg-1585 §3 (`allowed_roles := legitimate`)
 - **Tier-C**: approved 2026-08-24 (msg-1521 "Approve as-is; implement the read/write split PR now")
 - **scope**: this file is the **read half's** §5 deliverable — classify each identity name this repo
   writes with, from **primary sources in this repo**, so a subsequent write half (in the identity
@@ -20,18 +20,30 @@ the code that writes each post. That code is here, and this file is that read.
 
 ## The rule the classification feeds
 
-From msg-1493 §2 (the design settled here):
+From msg-1493 §2 **as corrected by msg-1585 §3** (the correction is the operative form):
 
-> `allowed_roles := 実測供給 role ∩ legitimate(§5 分類)`
+> `allowed_roles := legitimate(§5 分類)`
+> `residual := observed \ legitimate`
+> `unused := legitimate \ observed`
 
-Two inputs. **Observed** is a live-corpus fact (what has this identity ever posted). **Legitimate**
-is this file (what may this identity honestly claim). The intersection is what a future
-`upsert_identity` call MUST supply; the residual (`observed \ legitimate`) is exactly the evidence
-of I-6-style fabrication the epic exists to surface (msg-1493 §3).
+**Legitimate** is this file (what may this identity honestly claim) and it alone decides the
+entitlement — `allowed_roles` is what a future `upsert_identity` call MUST supply. **Observed** is
+a live-corpus fact (what this identity has actually claimed since the cutoff) and it is *not* an
+input to the entitlement: it feeds the two report-only sets. `residual` is exactly the evidence of
+I-6-style fabrication the epic exists to surface (msg-1493 §3); `unused` is a right held but not
+exercised.
+
+msg-1493 §2's original `observed ∩ legitimate` is **withdrawn**. `chatroom_post_message` drops the
+role of an author with no registered identity and records `null`, so `observed ⊆ allowed_roles`
+already holds for every recorded role: the intersection could only ever *narrow* an existing
+entitlement, never grant one. For an identity that is not yet registered — precisely the ones the
+write half exists to register — `observed = ∅` is a certainty, so the intersection derived
+`allowed_roles = ∅` for every one of them and the msg-1489 §4 biconditional then classified them as
+machinery. Registration could not bootstrap (msg-1585 §1).
 
 `legitimate = ∅` is the honest value for a **machine**; a subsequent `upsert_identity` MUST leave
-`allowed_roles = []` (msg-1487 §2, Einstein endorsed msg-1488) and `independence_class = null`
-(msg-1487 §4, Einstein endorsed msg-1488).
+`allowed_roles = []` (msg-1484 §2, Einstein endorsed msg-1485) and `independence_class = null`
+(msg-1487 §4; its constituent §2 / §3 endorsed by Einstein msg-1488).
 
 ## The four identity names this repo writes
 
@@ -103,14 +115,14 @@ Under Bohr's msg-1179 §5 wording (this identity classified as participant means
 supplied, not erased"): `naysayer-pr-review` IS the identity of the independent-distribution
 naysayer that produces the Tier-B verdict. `legitimate = {naysayer}`. Recording this identity as
 machinery (`allowed_roles = []`) would erase the attestation of the most gate-relevant post the
-harness writes — which Bohr's msg-1487 §5 forbids explicitly: "**`naysayer-pr-review` が
+harness writes — which Bohr's msg-1484 §5 forbids explicitly: "**`naysayer-pr-review` が
 participant なら `[]` にしてはならない。それは Tier-B gate の verdict を「機械の発言」として
 記録することになり、§3 と逆向きの捏造になる。**"
 
 **Consequence for the write half**: `upsert_identity("naysayer-pr-review",
 allowed_roles=["naysayer"], independence_class=<the value the T15 gradient assigns to a Gemini
 tier participant>)`. The `independence_class` value MUST be non-null (the bidirectional invariant
-of msg-1487 §3 requires `allowed_roles ≠ ∅ ⟺ independence_class ≠ null`). This repo does not own
+of msg-1487 §3 / msg-1489 §4 requires `allowed_roles ≠ ∅ ⟺ independence_class ≠ null`). This repo does not own
 the `independence_class` enum's SoT (ADR-2026-05-31-15); the write-half implementer must consult
 the T15 gradient by primary source before selecting a value.
 
@@ -129,8 +141,8 @@ under this name and no post's role stamp is ever set for it — it is a thread-m
 harness stamps to identify who *opened* the ledger, not who authored anything.
 
 **Consequence for the write half**: `upsert_identity("orchestrator", allowed_roles=[],
-independence_class=null)`. Under msg-1487 §3's bidirectional invariant, both sides are set to
-their absence values together.
+independence_class=null)`. Under the msg-1487 §3 / msg-1489 §4 bidirectional invariant, both
+sides are set to their absence values together.
 
 The 258/258 null count from PR #153's commit message (`orchestrator: 258/258 null`) refers to
 `role` values on posts credited to this name — but grep shows no post site here. Those 258 posts
@@ -180,12 +192,13 @@ independence_class=null)`. The 26/26 null count (PR #153 commit message) is hone
 
 ## What this classification does NOT decide
 
-- **`allowed_roles` for `naysayer-pr-review` on the live server today.** The design's §2
-  derivation is `observed ∩ legitimate`, and *observed* is a live-corpus fact this file cannot
-  contain — `scripts/identity_findings.py` produces it. If the live corpus for
-  `naysayer-pr-review` shows only `naysayer` (as this classification predicts), the intersection
-  is `{naysayer}`. If it shows anything else, the residual is a finding for the write half to
-  reason about, per msg-1493 §3.
+- **NOT this: `allowed_roles` for `naysayer-pr-review`.** This file decides it, and the value is
+  `{naysayer}` — under the msg-1585 §3 correction the entitlement is `legitimate` and nothing
+  else. What this file cannot contain is the *live-corpus* half: `residual`
+  (`observed \ legitimate` — roles it has claimed but may not) and `unused`
+  (`legitimate \ observed` — the entitlement it has not exercised). Both come from
+  `scripts/identity_findings.py`. A non-empty `residual` is a finding the write half must reason
+  about before registering (msg-1493 §3); a non-empty `unused` is reported and gates nothing.
 - **`independence_class`'s exact value for `naysayer-pr-review`.** The T15 gradient (ADR-2026-05-31-15)
   is the SoT for that enum and lives in a repo this implementer cannot read (per
   `OBL-DECLARE-UNREADABLE`). Any value assigned here without reading T15 would be a guess.
@@ -199,7 +212,8 @@ independence_class=null)`. The 26/26 null count (PR #153 commit message) is hone
 | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
 | msg-1179 §5: implementer classifies each identity by primary-source read, records reasoning     | Yes — three sections above, one per identity, each with quoted primary source                          |
 | msg-1179 §5: three classified, "not all-machine by default"                                     | Yes — `naysayer-pr-review` = participant, other two = machine, with the divergence explained          |
-| msg-1487 §2 / msg-1488: machinery uses `allowed_roles = ∅`, not a fabricated enum member         | Yes — the "consequence for the write half" bullets say `allowed_roles=[]` for both machine identities  |
-| msg-1487 §5: `naysayer-pr-review` as participant means role MUST be supplied, not erased        | Yes — that exact quote is cited under `naysayer-pr-review`'s section                                   |
-| msg-1493 §2: `allowed_roles := observed ∩ legitimate`                                           | Deferred to `scripts/identity_findings.py` (this file supplies `legitimate`; observed is a live read) |
+| msg-1484 §2 / msg-1485: machinery uses `allowed_roles = ∅`, not a fabricated enum member         | Yes — the "consequence for the write half" bullets say `allowed_roles=[]` for both machine identities  |
+| msg-1484 §5: `naysayer-pr-review` as participant means role MUST be supplied, not erased        | Yes — that exact quote is cited under `naysayer-pr-review`'s section                                   |
+| msg-1493 §2 as corrected by msg-1585 §3: `allowed_roles := legitimate`                          | Yes — decided here; `legitimate` IS the entitlement, no live read needed to fix it                     |
 | msg-1493 §3: residual ≠ ∅ ⇒ surface as finding, do NOT silently drop                            | Deferred to `scripts/identity_findings.py`                                                             |
+| msg-1585 §3: `unused = legitimate \\ observed` reported, blast radius zero, outside the lock     | Deferred to `scripts/identity_findings.py` (`derivation.unused`, `totals.authors_with_unused`)         |

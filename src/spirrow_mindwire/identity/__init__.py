@@ -10,8 +10,10 @@ Two responsibilities, kept small:
 
 - :mod:`.classification` — loads :file:`spec/identity/legitimate_roles.yaml` (the
   machine-readable form of :doc:`docs/identity-classification.md`) and derives
-  ``allowed_roles = observed ∩ legitimate`` and ``residual = observed \\ legitimate``
-  per identity, exactly as msg-1493 §2 / §3 specifies.
+  ``allowed_roles = legitimate``, ``residual = observed \\ legitimate`` and
+  ``unused = legitimate \\ observed`` per identity, exactly as msg-1493 §2 / §3
+  specifies once corrected by msg-1585 §3 (the observation feeds the two report
+  sets, never the entitlement).
 
 Neither module talks to the identity store — that is a magickit MCP surface this
 repo does not own. Both modules are pure so ``scripts/identity_findings.py``

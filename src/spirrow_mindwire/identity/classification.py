@@ -8,17 +8,22 @@ Two entry points:
   ADR-11 — a classification file where two entries collide would silently
   drop one).
 
-- :func:`derive_allowed_and_residual` implements msg-1493 §2 / §3 for one
-  identity: given the observed role set (a live-corpus fact from
-  ``scripts/identity_findings.py``) and the loaded classification, return
-  ``(allowed_roles, residual)``. This is the "by construction" derivation
-  Einstein required in msg-1492: the caller never proposes values; it hands
-  the observation to this function and receives the derived pair.
+- :func:`derive_allowed_and_residual` implements msg-1493 §2 / §3 **as
+  corrected by msg-1585 §3** (the Bohr post that follows msg-1536 in
+  ``T-role-null-must-become-impossible``): given the observed role set (a
+  live-corpus fact from ``scripts/identity_findings.py``) and the loaded
+  classification, return ``(allowed_roles, residual, unused)``. msg-1493 §2's
+  intersection ``observed ∩ legitimate`` is **withdrawn** — it could only ever
+  narrow an entitlement, never grant one, so an identity that is not yet
+  registered (whose claimed roles are therefore dropped to ``null``) could
+  never bootstrap out of ``observed = ∅``. This is still the "by construction"
+  derivation Einstein required in msg-1492: the caller never proposes values;
+  it hands the observation to this function and receives the derived triple.
 
 Neither entry point knows about the identity store. The write half calls this
 same function to compute what to supply to ``upsert_identity``; the read half
 calls it to build findings. One derivation, two callers — msg-1493 §2's "**規
-則は 2 本にならず 1 本のまま**".
+則は 2 本にならない**".
 """
 
 from __future__ import annotations
@@ -155,12 +160,12 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
     if kind == "machine" and legitimate:
         raise ClassificationError(
             f"{path}: identities[{index}] kind=machine requires legitimate=[] "
-            f"(machinery has no honest role claim; msg-1487 §2)"
+            f"(machinery has no honest role claim; msg-1484 §2)"
         )
     if kind == "participant" and not legitimate:
         raise ClassificationError(
             f"{path}: identities[{index}] kind=participant requires len(legitimate) >= 1 "
-            f"(a participant with no honest role would erase attestation; msg-1487 §5)"
+            f"(a participant with no honest role would erase attestation; msg-1484 §5)"
         )
     if not isinstance(primary_source, str) or not primary_source.strip():
         raise ClassificationError(
@@ -181,38 +186,50 @@ def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:
 
 @dataclass(frozen=True)
 class DerivationResult:
-    """The output of msg-1493 §2 / §3 for one identity.
+    """The output of msg-1493 §2 / §3 as corrected by msg-1585 §3.
 
     Attributes:
-      allowed_roles: ``observed ∩ legitimate``. What the write half MUST
-        supply to ``upsert_identity`` — never a value the caller proposed
-        (msg-1492 Einstein: "by construction").
+      allowed_roles: ``legitimate`` itself — the entitlement the classification
+        grants. The observation is **not an input to this field**. This is what
+        the write half MUST supply to ``upsert_identity``, and it is still
+        never a value the caller proposed (msg-1492 Einstein: "by
+        construction") — it comes from the reviewed YAML.
       residual: ``observed \\ legitimate``. Roles the identity has actually
-        claimed but is not entitled to. Non-empty ⇒ fabrication evidence,
-        surfaced as a finding (msg-1493 §3); the identity may still be
-        registered but only under the "write set" lock (msg-1491 §3).
+        claimed but is not entitled to — fabrication evidence. Non-empty ⇒
+        surfaced as a finding (msg-1493 §3), and registering that identity sits
+        inside the write-set lock because its posts start being rejected.
+      unused: ``legitimate \\ observed``. Rights the identity holds but has not
+        exercised since the cutoff — what the withdrawn intersection was
+        silently discarding. Blast radius is **zero** (allowing a role nobody
+        uses rejects nothing) ⇒ ``unused ≠ ∅`` is **outside** the lock and is
+        reported only (msg-1585 §3).
     """
 
     allowed_roles: frozenset[str]
     residual: frozenset[str]
+    unused: frozenset[str]
 
 
 def derive_allowed_and_residual(
     observed: Iterable[str], legitimate: Iterable[str]
 ) -> DerivationResult:
-    """Return ``(observed ∩ legitimate, observed \\ legitimate)`` for one identity.
+    """Return ``(legitimate, observed \\ legitimate, legitimate \\ observed)``.
 
     ``observed`` is the role set the identity has actually claimed on posts
-    since the deploy cutoff (msg-1487 §4 scope); ``legitimate`` comes from the
+    since the deploy cutoff (msg-1484 §4 scope); ``legitimate`` comes from the
     classification file. Both are already role strings (not enums) — the
     detector's join is on the ``message.role`` VALUE column, so the caller
     normalises to the string form once at query time and this function stays
     string-typed.
 
-    An empty ``observed`` returns ``(∅, ∅)``: the identity has posted nothing
-    since deploy, so there is nothing to intersect and nothing residual. That
-    is the correct value for the write half to supply for an identity that
-    exists in the classification but has not been used since the cutoff.
+    An empty ``observed`` returns ``allowed_roles = legitimate``. The
+    observation is not an input to the entitlement; it is the input to
+    ``residual`` / ``unused``. An identity that is not yet registered has every
+    role it claims **dropped** by ``chatroom_post_message`` (an unverified role
+    is recorded as ``null``), so ``observed = ∅`` is not an accident but a
+    certainty for exactly the identities the write half exists to register —
+    under the withdrawn intersection, registration could never bootstrap
+    (msg-1585 §1 / §3).
 
     ``legitimate`` may be empty (a machine identity per the YAML): then
     ``allowed_roles = ∅`` regardless of ``observed``, and every observed role
@@ -223,8 +240,9 @@ def derive_allowed_and_residual(
     observed_set = frozenset(observed)
     legitimate_set = frozenset(legitimate)
     return DerivationResult(
-        allowed_roles=observed_set & legitimate_set,
+        allowed_roles=legitimate_set,
         residual=observed_set - legitimate_set,
+        unused=legitimate_set - observed_set,
     )
 
 

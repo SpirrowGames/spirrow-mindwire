@@ -67,7 +67,7 @@ per-post via a query on the identity store. So no code path here would notice a 
 
 ## Detector query spec — `message.role × identity.allowed_roles` join
 
-From msg-1487 §3, the 2×2 (plus one) truth table this detector reports counts for:
+From msg-1484 §3, the 2×2 (plus one) truth table this detector reports counts for:
 
 | identity                          | `message.role`         | judgement          |
 | --------------------------------- | ---------------------- | ------------------ |
@@ -97,16 +97,16 @@ read of the identity store's `allowed_roles` is enough to compute the five-way j
 so the read half here is not blocking on the identity-store read tool: whoever runs the detector
 combines the two halves.
 
-### Scope-bounded cutoff (msg-1487 §4)
+### Scope-bounded cutoff (msg-1484 §4)
 
-Bohr's msg-1487 §4 pinned the range:
+Bohr's msg-1484 §4 pinned the range:
 
 > **範囲は「deploy 以降に post した author」に限る**（過去に存在した全 identity ではない。
 > **測れる集合に閉じる**）。
 
 `deploy` here = PR #153's merge commit `13618e9` (2026-08-17). The script's `--since` defaults
 to that timestamp; overrideable so a re-measurement after a later fix can re-scope. Anything
-before the cutoff is ignored — the historical `null`s stay honest (msg-1179 §6 point 2, msg-1493
+before the cutoff is ignored — the historical `null`s stay honest (msg-1179 §6 point 2, msg-1487
 §7's "履歴 backfill は依然禁止" carry-forward).
 
 ## Requirement-vs-artifact table
@@ -116,5 +116,5 @@ before the cutoff is ignored — the historical `null`s stay honest (msg-1179 §
 | msg-1489 §1: enumerate readers of `independence_class` in this repo                             | Yes — zero readers (enumeration + method)                                                              |
 | msg-1489 §1: fix broken readers before writing null, do NOT let a brittle reader veto the model | Vacuous here (no readers). The rule is restated so a future reader gets added to a repo bound by it.   |
 | msg-1491 §3: readiness lock = "null-非対応の読み手が 0 件"                                       | Vacuously satisfied for this repo. Not satisfied by definition for external repos not read here.      |
-| msg-1487 §3: detector reports the 5-way judgement                                               | Spec here + inputs half via `scripts/identity_findings.py`; the join runs where identity records live |
-| msg-1487 §4: scope = "deploy 以降に post した author", not "全 identity"                         | Yes — the script defaults `--since` to PR #153's merge commit; live-corpus scope-bounded              |
+| msg-1484 §3: detector reports the 5-way judgement                                               | Spec here + inputs half via `scripts/identity_findings.py`; the join runs where identity records live |
+| msg-1484 §4: scope = "deploy 以降に post した author", not "全 identity"                         | Yes — the script defaults `--since` to PR #153's merge commit; live-corpus scope-bounded              |

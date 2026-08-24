@@ -1,17 +1,18 @@
 """Read-only findings for the T-role-null-must-become-impossible read half.
 
-Answers the four measurements Bohr's DoD (msg-1487 §8, msg-1491 §4, msg-1493 §6) requires
+Answers the four measurements Bohr's DoD (msg-1487 §8, msg-1491 §6, msg-1493 §6) requires
 before the write half can supply values to ``upsert_identity``:
 
   1. Author enumeration — every author that has posted in the given projects since the
-     cutoff (default: PR #153's merge commit, per msg-1487 §4).
+     cutoff (default: PR #153's merge commit, per msg-1484 §4).
   2. Per-author observed role set — the set of ``role`` values the identity has actually
      supplied on messages in scope.
   3. ADR-11 normalisation collisions — raw author spellings that collapse to one canonical
      key. Reported, not resolved (msg-1487 §6 point 1: "**衝突は登録せず報告**").
-  4. Derived ``(allowed_roles, residual)`` per classified identity, computed by
+  4. Derived ``(allowed_roles, residual, unused)`` per classified identity, computed by
      :func:`~spirrow_mindwire.identity.derive_allowed_and_residual` — the "by construction"
-     derivation Einstein required in msg-1492.
+     derivation Einstein required in msg-1492, in the msg-1585 §3 corrected form
+     (``allowed_roles = legitimate``; the observation feeds ``residual`` / ``unused`` only).
 
 The script is READ-ONLY. It never posts, never marks read, never touches the identity
 store. It is the "測る" half of msg-1491 §4's read/write split — always executable, does
@@ -31,30 +32,42 @@ Output shape (stdout JSON):
           "raw_name": "naysayer-pr-review",
           "normalized_key": "naysayer-pr-review",
           "post_count": 12,
-          "observed_roles": ["naysayer", null],
+          "observed_roles": ["naysayer"],
+          "role_counts": [{"role": "naysayer", "count": 11}, {"role": null, "count": 1}],
           "classification": {
             "known": true,
             "kind": "participant",
-            "legitimate": ["naysayer"]
+            "legitimate": ["naysayer"],
+            "primary_source": "src/spirrow_mindwire/orchestrator.py::..."
           },
           "derivation": {
             "allowed_roles": ["naysayer"],
-            "residual": []
+            "residual": [],
+            "unused": []
           }
         },
         ...
       ],
       "unclassified_authors": ["some-new-author"],
       "collisions": {"foo-bar": ["foo-bar", "Foo_Bar"]},
+      "errors": [],
       "totals": {
         "threads_scanned": 341,
         "messages_scanned": 6879,
         "messages_in_scope": 512,
         "classified_authors": 4,
         "unclassified_authors": 1,
-        "authors_with_residual": 0
+        "authors_with_residual": 0,
+        "authors_with_unused": 0,
+        "collision_groups": 0
       }
     }
+
+``observed_roles`` lists only the roles the identity actually CLAIMED: a ``null`` role is
+the absence of a claim, not a role named "null", so it is excluded there and counted in
+``role_counts`` instead (where ``"role": null`` is JSON's own null, never a sentinel
+string — a sentinel would collide with a literal ``"<null>"`` role in the corpus and
+silently merge two counts).
 
 Exit codes:
 
@@ -63,7 +76,8 @@ Exit codes:
   1 — the script itself failed (transport dead, classification file unreadable, etc.)
 
 Non-empty ``unclassified_authors`` or ``collisions`` or ``authors_with_residual > 0`` is
-the SIGNAL that the write half MUST NOT proceed until each is resolved — msg-1493 §5:
+the SIGNAL that the write half MUST NOT proceed until each is resolved (``authors_with_unused``
+is NOT such a signal — see :func:`_summarise`) — msg-1493 §5:
 "登録済み and 理由付き保留 together cover the scope, and 無説明残余 = 0". This script
 does not enforce that; it produces the evidence.
 """
@@ -93,7 +107,7 @@ from spirrow_mindwire.identity import (
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
 # PR #153 (`13618e9`, `feat: conductor supplies role...`) merged 2026-08-17 in
-# `spirrow-mindwire`. Bohr's msg-1487 §4 pins the scope to "deploy 以降に post した author"
+# `spirrow-mindwire`. Bohr's msg-1484 §4 pins the scope to "deploy 以降に post した author"
 # and this is the deploy in question. Anything older is history — msg-1179 §6 point 2's
 # "履歴は null のまま残す" carry-forward.
 _DEFAULT_SINCE = "2026-08-17T00:00:00+00:00"
@@ -186,14 +200,28 @@ def _in_scope(msg: dict[str, Any], since_iso: str, since_msg_id: str | None) -> 
 def _summarise(
     author_role_counts: dict[str, dict[str | None, int]],
     classification: LegitimateRolesFile,
-) -> tuple[list[dict[str, Any]], list[str], int]:
+) -> tuple[list[dict[str, Any]], list[str], int, int]:
     """Fold the observation into the per-author output shape + list unclassified names.
 
-    Returns ``(authors_entries, unclassified_raw_names, authors_with_residual_count)``.
+    Returns ``(authors_entries, unclassified_raw_names, authors_with_residual_count,
+    authors_with_unused_count)``.
+
+    ``role_counts`` is emitted as a LIST of ``{"role": <str|null>, "count": n}`` objects,
+    not a dict. A dict needs a string key, and any sentinel chosen for the null role
+    (``"<null>"`` or otherwise) can also occur as a literal role string in the corpus —
+    the two would collapse onto one key and one count would silently overwrite the other,
+    leaving ``post_count != sum(role_counts)`` in the JSON with no error raised. JSON has a
+    real null; use it and the collision class disappears.
+
+    ``observed_roles`` (str-only) is deliberately NOT the same filter: a null role is the
+    absence of a claim, not a role, so it must not reach the derivation. A literal
+    ``"<null>"`` string role IS a claim, stays in ``observed_roles``, and therefore shows up
+    in ``residual`` — the fabrication evidence surfaces either way.
     """
     entries: list[dict[str, Any]] = []
     unclassified: list[str] = []
     residual_count = 0
+    unused_count = 0
     for raw_name in sorted(author_role_counts):
         role_counts = author_role_counts[raw_name]
         key = normalize_identity_key(raw_name)
@@ -205,7 +233,10 @@ def _summarise(
             "normalized_key": key,
             "post_count": post_count,
             "observed_roles": observed_roles,
-            "role_counts": {(r if r is not None else "<null>"): n for r, n in role_counts.items()},
+            "role_counts": [
+                {"role": r, "count": n}
+                for r, n in sorted(role_counts.items(), key=lambda kv: (kv[0] is None, kv[0] or ""))
+            ],
         }
         if classification_entry is None:
             unclassified.append(raw_name)
@@ -216,6 +247,8 @@ def _summarise(
             )
             if derivation.residual:
                 residual_count += 1
+            if derivation.unused:
+                unused_count += 1
             entry["classification"] = {
                 "known": True,
                 "kind": classification_entry.kind,
@@ -225,9 +258,10 @@ def _summarise(
             entry["derivation"] = {
                 "allowed_roles": sorted(derivation.allowed_roles),
                 "residual": sorted(derivation.residual),
+                "unused": sorted(derivation.unused),
             }
         entries.append(entry)
-    return entries, unclassified, residual_count
+    return entries, unclassified, residual_count, unused_count
 
 
 async def _measure(
@@ -275,7 +309,7 @@ async def _measure(
                 author_role_counts[author][role_key] += 1
 
     plain_counts = {a: dict(rc) for a, rc in author_role_counts.items()}
-    entries, unclassified, residual_count = _summarise(plain_counts, classification)
+    entries, unclassified, residual_count, unused_count = _summarise(plain_counts, classification)
     collisions = find_collisions(plain_counts.keys())
 
     return {
@@ -296,6 +330,13 @@ async def _measure(
             "classified_authors": len(entries) - len(unclassified),
             "unclassified_authors": len(unclassified),
             "authors_with_residual": residual_count,
+            # NOT a lock, despite reading as the twin of `authors_with_residual`.
+            # `residual != ∅` means the identity claimed a role it may not claim, and
+            # registering it starts REJECTING those posts — live blast radius, inside
+            # the write set. `unused != ∅` means it simply has not exercised a right it
+            # holds; allowing a role nobody uses rejects nothing, so the blast radius is
+            # zero and this number never gates the write half (msg-1585 §3).
+            "authors_with_unused": unused_count,
             "collision_groups": len(collisions),
         },
     }

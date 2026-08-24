@@ -1,12 +1,15 @@
 # Machine-readable form of the §5 classification from docs/identity-classification.md.
 #
 # Read by scripts/identity_findings.py to compute
-#   allowed_roles = observed ∩ legitimate
-#   residual      = observed \ legitimate
-# (msg-1493 §2 / §3).
+#   allowed_roles = legitimate            <- the entitlement; the observation is NOT an input
+#   residual      = observed \ legitimate  <- fabrication evidence (inside the write-set lock)
+#   unused        = legitimate \ observed  <- right held but not exercised (report only)
+# (msg-1493 §2 / §3, as corrected by msg-1585 §3: the original `observed ∩ legitimate` could only
+# narrow an entitlement, never grant one, so an unregistered identity — whose claimed roles are
+# dropped to null — could never bootstrap out of `observed = ∅`.)
 #
-# `legitimate: []` (an empty list) is the honest value for a **machine** identity — msg-1487 §2
-# (Einstein endorsed msg-1488). It is NOT a stand-in for "unknown" — an identity that has not
+# `legitimate: []` (an empty list) is the honest value for a **machine** identity — msg-1484 §2
+# (Einstein endorsed msg-1485). It is NOT a stand-in for "unknown" — an identity that has not
 # been classified must not appear in this file at all, and the findings script MUST list it as
 # an unclassified author for a human to classify before the write half runs.
 #
@@ -43,7 +46,7 @@ identities:
       verbatim. The orchestrator's own code comment (lines 302-311) states: "The claim is
       honest: this body IS the independent naysayer's critique, relayed verbatim." Marking
       this as machinery would erase attestation on the Tier-B verdict — the very post the
-      I-6 invariant exists to protect. msg-1487 §5 forbids that explicitly.
+      I-6 invariant exists to protect. msg-1484 §5 forbids that explicitly.
 
   - name: orchestrator
     kind: machine

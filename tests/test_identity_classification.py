@@ -3,8 +3,9 @@
 Covers three surfaces:
 
   1. YAML load + validation (the shape rules + invariants from the YAML header).
-  2. The msg-1493 §2 / §3 derivation (``allowed_roles = observed ∩ legitimate``,
-     ``residual = observed \\ legitimate``).
+  2. The msg-1493 §2 / §3 derivation as corrected by msg-1585 §3
+     (``allowed_roles = legitimate``, ``residual = observed \\ legitimate``,
+     ``unused = legitimate \\ observed``).
   3. The shipped :file:`spec/identity/legitimate_roles.yaml` — a smoke test that
      the actual file loads cleanly + contains the four identities the doc names.
 
@@ -196,6 +197,7 @@ class TestDerivation:
         result = derive_allowed_and_residual({"naysayer"}, {"naysayer"})
         assert result.allowed_roles == frozenset({"naysayer"})
         assert result.residual == frozenset()
+        assert result.unused == frozenset()
 
     def test_machine_with_no_observed_roles_returns_all_empty(self) -> None:
         # An identity classified as machine with `legitimate=[]` and no observation
@@ -203,6 +205,7 @@ class TestDerivation:
         result = derive_allowed_and_residual([], [])
         assert result.allowed_roles == frozenset()
         assert result.residual == frozenset()
+        assert result.unused == frozenset()
 
     def test_machine_that_has_claimed_a_role_puts_that_role_in_residual(self) -> None:
         # msg-1493 §3: a machine that has posted with a role stamped is exactly the
@@ -211,14 +214,35 @@ class TestDerivation:
         result = derive_allowed_and_residual({"naysayer", "reviewer"}, [])
         assert result.allowed_roles == frozenset()
         assert result.residual == frozenset({"naysayer", "reviewer"})
+        assert result.unused == frozenset()
 
-    def test_observation_narrower_than_legitimate_yields_narrower_allowed(self) -> None:
+    def test_legitimate_role_never_observed_is_still_allowed_and_reported_unused(
+        self,
+    ) -> None:
         # An identity classified as legitimate for roles X and Y that has only ever
-        # posted as X gets allowed_roles = {X} — msg-1493 §2 forbids "guess" values.
-        # This is why "by construction": the intersection with the observation.
+        # posted as X keeps BOTH: the classification grants the entitlement, the
+        # observation does not ration it. Y is reported as `unused` — a right held
+        # but not exercised, blast radius zero (msg-1585 §3).
         result = derive_allowed_and_residual({"naysayer"}, {"naysayer", "reviewer"})
+        assert result.allowed_roles == frozenset({"naysayer", "reviewer"})
+        assert result.residual == frozenset()
+        assert result.unused == frozenset({"reviewer"})
+
+    def test_participant_with_no_observed_roles_still_gets_full_entitlement(self) -> None:
+        """An unregistered participant must bootstrap out of ``observed = ∅``.
+
+        ``chatroom_post_message`` DROPS the role of an author with no registered
+        identity and records ``null`` ⇒ for exactly the identities the write half
+        exists to register, ``observed = ∅`` is a certainty, not an accident.
+        Under the withdrawn intersection every such participant derived
+        ``allowed_roles = ∅``, which the msg-1489 §4 bidirectional invariant then
+        turns into ``independence_class = null`` — registering a participant as
+        machinery. Regression pin for msg-1585 §1.
+        """
+        result = derive_allowed_and_residual([], {"naysayer"})
         assert result.allowed_roles == frozenset({"naysayer"})
         assert result.residual == frozenset()
+        assert result.unused == frozenset({"naysayer"})
 
     def test_partial_overlap_yields_both_sides_nonempty(self) -> None:
         # Legitimate for {X}, observed {X, Y} ⇒ allowed = {X}, residual = {Y}. The
@@ -227,6 +251,7 @@ class TestDerivation:
         result = derive_allowed_and_residual({"naysayer", "reviewer"}, {"naysayer"})
         assert result.allowed_roles == frozenset({"naysayer"})
         assert result.residual == frozenset({"reviewer"})
+        assert result.unused == frozenset()
 
 
 class TestShippedFile:
@@ -249,3 +274,22 @@ class TestShippedFile:
             assert entry is not None
             assert entry.kind == "machine"
             assert entry.legitimate == frozenset()
+
+    def test_kind_decides_the_bidirectional_side_without_any_traffic(self) -> None:
+        """`kind` alone fixes which side of the msg-1489 §4 biconditional applies.
+
+        The YAML's two invariants (machine ⇒ ``legitimate = []``; participant ⇒
+        ``len(legitimate) >= 1``) plus ``allowed_roles := legitimate`` mean the
+        answer to "does this identity get ``independence_class``?" is decided by
+        the classification alone — with ``observed = []`` supplied here, i.e.
+        with no traffic at all. Under the withdrawn intersection the answer
+        depended on whether the corpus happened to cover the roles. DoD 19
+        (msg-1585 §8).
+        """
+        loaded = load_legitimate_roles(default_classification_path())
+        for entry in loaded.entries:
+            derived = derive_allowed_and_residual([], entry.legitimate)
+            allowed = sorted(derived.allowed_roles)
+            assert (entry.kind == "participant") == (derived.allowed_roles != frozenset()), (
+                f"{entry.name!r}: kind={entry.kind} but allowed_roles={allowed}"
+            )
