@@ -270,7 +270,16 @@ async def _measure(
     since_msg_id: str | None,
     url: str | None,
     classification: LegitimateRolesFile,
+    classification_path: Path,
 ) -> dict[str, Any]:
+    """Measure the corpus and emit the findings JSON.
+
+    ``classification_path`` is the path ``main()`` actually resolved and loaded
+    ``classification`` from — NOT re-derived here. Re-deriving it would make the
+    artifact name the default tree path even on a ``--classification`` override run,
+    i.e. the JSON would misreport the input its own numbers came from and the finding
+    would not be reproducible from what it claims to have read.
+    """
     mcp = StreamableHttpChatroomMcp(url)
     author_role_counts: dict[str, dict[str | None, int]] = defaultdict(lambda: defaultdict(int))
     threads_scanned = 0
@@ -317,7 +326,7 @@ async def _measure(
             "projects": list(projects),
             "since_created_at": since_iso,
             "since_msg_id": since_msg_id,
-            "classification_path": str(default_classification_path()),
+            "classification_path": str(classification_path),
         },
         "authors": entries,
         "unclassified_authors": unclassified,
@@ -399,6 +408,7 @@ def main() -> int:
                 since_msg_id=args.since_msg_id,
                 url=args.url,
                 classification=classification,
+                classification_path=classification_path,
             )
         )
     except Exception as exc:

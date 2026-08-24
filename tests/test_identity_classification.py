@@ -67,15 +67,22 @@ identities:
         assert relay.kind == "machine"
         assert relay.legitimate == frozenset()
 
-    def test_by_key_uses_normalised_key(self, tmp_path: Path) -> None:
-        # The entry is written with hyphens; the by_key lookup with underscores must
-        # still find it — the normalisation is applied at both ends.
+    def test_by_key_matches_on_the_normalised_entry_name(self, tmp_path: Path) -> None:
+        """``by_key`` normalises the ENTRY name, not the query.
+
+        The normalisation is one-sided, and this pins which side. The YAML entry is
+        written in a non-canonical spelling (``PR Gate Relay``); loading canonicalises
+        it to ``pr-gate-relay``, so a lookup by the canonical key finds it. The query
+        string is used verbatim — a caller that hands over a raw, un-normalised
+        spelling gets ``None``, which is why every real caller
+        (``scripts/identity_findings.py``) normalises before it asks.
+        """
         path = _write_yaml(
             tmp_path,
             """
 version: 1
 identities:
-  - name: pr-gate-relay
+  - name: PR Gate Relay
     kind: machine
     legitimate: []
     primary_source: "x"
@@ -83,9 +90,21 @@ identities:
 """.strip(),
         )
         loaded = load_legitimate_roles(path)
-        # The classification file writes hyphens; the caller may query with a
-        # differently-spelled raw string.
-        assert loaded.by_key("pr-gate-relay") is not None
+
+        # The raw spelling is preserved for quoting; the key is the canonical form.
+        (entry,) = loaded.entries
+        assert entry.name == "PR Gate Relay"
+        assert entry.key == "pr-gate-relay"
+
+        # Querying by the canonical key finds the non-canonically-spelled entry.
+        assert loaded.by_key("pr-gate-relay") is entry
+
+        # ...and the query side is NOT normalised. These all normalise to
+        # "pr-gate-relay", but by_key compares verbatim, so they miss. This is the
+        # contract the caller has to honour — asserting it here means a future change
+        # that starts normalising the query cannot land silently.
+        assert loaded.by_key("PR Gate Relay") is None
+        assert loaded.by_key("pr_gate_relay") is None
 
     def test_missing_version_rejected(self, tmp_path: Path) -> None:
         path = _write_yaml(tmp_path, "identities: []")
