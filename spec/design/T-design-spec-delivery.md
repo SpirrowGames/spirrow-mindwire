@@ -51,7 +51,7 @@ items:
 | E-3 | implementer / naysayer のみツールを持つ | 同上 — human |
 | E-4 | **implementer と naysayer は CLAUDE.md を読まない**（implementer は `setting_sources=[]`）。proposer のみ読む | ループ設定 — human |
 | E-5 | implementer に渡るのは新着 msg 1 本の body のみ。スレッド履歴は渡らない | watcher 実装 — human |
-| E-6 | branch protection は両 repo で使用不可（403 / GitHub Pro 不採用）∴ required check・admin merge バイパス禁止・`main` 直接 push 禁止のいずれも設定できない | 実測 — human |
+| E-6 | repo 単位の classic branch protection は両 repo とも未設定である（`GET /repos/<owner>/<repo>/branches/main/protection` は **404**。r7 以前の本行が書いていた 403 は誤りである）。**ただし Organization ruleset が両 repo の `main` に現に効いている** — `SpirrowGames` の `ruleset_id=21017016` が `pull_request`（PR 必須・approving review 1 件・team reviewer 指定・`require_extra_approval_for_unattributed_changes: true`）／`non_fast_forward`／`deletion` を強制する ∴ **`main` への直接 push 禁止と force-push 禁止は機構として現に設定されている**。required status check は本 ruleset に含まれず現時点で未設定だが、「設定できない」ことの根拠は無い。**bypass actor の構成は未計測である**（`admin:org` スコープを持たない token では ruleset 詳細が読めない）∴ admin バイパスの可否は本行では主張しない。機構で強制できないのは「merge を実行する主体が human であること」だけである — ruleset は主体の種別を区別しない | 実測 — `gh api repos/SpirrowGames/spirrow-mindwire/rules/branches/main` ＋ 同 `spirrow-voxelworld`（Einstein msg-1569 ／ Heisenberg msg-1581 ／ Bohr 2026-08-24 の 3 者が独立に同一結果）。r3〜r7 の「両 repo で使用不可（403 / GitHub Pro 不採用）」は誤りだが、ruleset がいつ入ったかは本行では特定していない |
 | E-7 | `spirrow-mindwire` に `develop` は無い。PR は `feature/*` → `main`。マージは常に人間 | 実測 — human |
 | E-8 | `gh pr merge` は base に関わらず Tier C 拒否となり implementer セッションを halt させる | `OBL-MERGE-MECHANISM` / PR #136 — human |
 | E-9 | `OBL-DECLARE-UNREADABLE` は `origin.moved_from` を持つ逐語移設 entry で、canary が `len(body) == origin.original_length`（現在 795）を検査している | `spec/process/obligations.yaml` / PR #135 — human |
@@ -90,11 +90,11 @@ U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれ�
 - **D-8（obligations の置き場）** `OBL-SPEC-*` は `spec/process/obligations.yaml` に置く。Python の文字列リテラルに直書きしない。3 件はいずれも net-new であり、**`origin` ブロックを付けない**（付けると canary ②″ を構造的にすり抜ける）。
 - **D-9（OBL-DECLARE-UNREADABLE は改訂しない）** E-9 の逐語移設 entry には触れない。unreadable 宣言義務の trigger 拡張分は `OBL-SPEC-PIN` の body 側に書く（§4-1 末尾）。逐語移設 entry を net-new の都合で動かすと、その entry が守っている不変条件の意味が薄まる。
 - **D-10（verify.py は gate ではない）** `verify.py` は診断ツールであり、CI gate にしない。`main` 上での検出は **warning** に降格し、exit code に影響させない。
-- **D-11（G-4 は機構ではなく規律）** E-6 により、`main` への直接 push 禁止・required check・admin バイパス禁止のいずれも機構として設定できない。∴ 本仕様はマージを機構で強制しない。本仕様は**マージ手順に一切触れない**。implementer に `gh pr merge` を実行させる記述を、本仕様およびその実装から出してはならない（E-8: セッションが halt する）。PR を開くところまでが implementer の仕事であり、merge は human の Tier-C である。
+- **D-11（G-4 は機構ではなく規律）** E-6 のとおり Organization ruleset が `main` への直接 push と force-push を機構として拒否している。**しかし「merge を実行する主体が human であること」だけは ruleset が区別できない** ∴ その一点は規律で担保する。そして本仕様はマージを機構で強制しない — 本仕様は**マージ手順に一切触れない**。implementer に `gh pr merge` を実行させる記述を、本仕様およびその実装から出してはならない（E-8: セッションが halt する）。PR を開くところまでが implementer の仕事であり、merge は human の Tier-C である。
 - **D-12（bootstrap は NO-PIN で始まる）** I-1 と I-2 は、pin 機構がまだ存在しない状態で実行される ∴ その 2 ターンは `NO-PIN` であり、payload は D-2 経路の msg 本文そのものである。これは違反ではなく設計どおりの挙動であり、receipt は `NO-PIN` と書くのが正しい。なお pin は repo 境界を越えない（D-22）。他 repo を対象とする item は本機構では扱わず、対象 repo 自身の spec として発行する。
 - **D-13（第一号実運用対象）** pin つき dispatch の第一号実運用対象は **`T-pr-gate-adr-index-scope`** とする（`T-loop-readable-obligations` は PR #135 で完了・close 済みのため対象から外す）。
-- **D-14（到達性判定と遅延 fetch）** pin の `commit` が `origin/main` から到達可能であることを確認する。この検査は「pin が指す spec は human が merge したものである」を機械的に担保する唯一の経路であり、E-6 で branch protection が使えない以上これを外さない。ネットワーク規律は次のとおり:
-  - **肯定側は fetch しない。** ローカルの `origin/main` から到達可能なら `RESOLVED` に進む（古い `origin/main` の祖先である commit は、より新しい `origin/main` の祖先でもある ∴ 肯定判定は陳腐化しない。main が force-push で書き換えられないことを前提とする。これは E-6 により機構では守れない ∴ D-11 と同じく規律である）。
+- **D-14（到達性判定と遅延 fetch）** pin の `commit` が `origin/main` から到達可能であることを確認する。この検査は「pin が指す spec は human が merge したものである」を機械的に担保する唯一の経路である。E-6 の ruleset は PR を経由することまでは強制するが**主体が human であることは強制しない** ∴ この検査を外さない。ネットワーク規律は次のとおり:
+  - **肯定側は fetch しない。** ローカルの `origin/main` から到達可能なら `RESOLVED` に進む（古い `origin/main` の祖先である commit は、より新しい `origin/main` の祖先でもある ∴ 肯定判定は陳腐化しない。main が force-push で書き換えられないことを前提とする。**この前提は Organization ruleset の `non_fast_forward` が機構として守っている**（E-6）— r7 以前の本行は「E-6 により機構では守れない ∴ D-11 と同じく規律である」と書いていたが、それは過小申告であった）。
   - **否定側でのみ、1 回だけ** `git fetch origin main` を試み、再判定する。連続再試行はしない。
   - fetch が失敗・不可の場合は `NO-PIN(FETCH_UNAVAILABLE)`。fetch 後もなお到達不能なら `NO-PIN(COMMIT_UNREACHABLE)`。**この 2 つを同じコードに畳まない** — 前者は「クローンが main を見られない」、後者は「未 merge の commit を pin した」であり、直す相手も直し方も異なる。
 - **D-15（順序の SOT は items の列挙順）** item 間の依存グラフ機構は持たない。`after` 相当のフィールドを導入せず、`verify.py` に循環検査も置かない。dispatch するのは人間であり 1 ターンに 1 つの item id が渡るだけで、自動シーケンサは存在しない ∴ **front-matter の `items` 列挙順が実行順であり、それが順序の唯一の記述である**。§8 は順序を再宣言せず、item でない段のみを述べる。
@@ -145,7 +145,7 @@ U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれ�
 
 1. **チャット msg を経由するテキストの転記忠実性。** 該当するのは ①proposer が出す NEW block ②D-27 の recovery diff。期待 hash を誰も先に計算できない ∴ 原理的に不可能である。緩和は 2 つだけ — NEW を小さく保つこと、PR diff を naysayer が message と突き合わせること。後者は人／エージェントによる比較であって機械検査ではない。
 2. **ADR 本文。** A-15 は id ＋ title までしか照合できない。naysayer も implementer も ADR 本文を読めない（bodies は Drive にあり、inference 時に不可視）∴ ADR との整合は title 推論に留まる。
-3. **spec が世界について述べた主張の真偽。** E-11 と E-2 がこれである。D-29 で「書いた時点で照合可能」までは下げられるが、消えない。最終防波堤は §1 の「実装時に事実が違っていた場合、仕様ではなく事実が正しい。停止して報告せよ」＋ implementer の停止であり、これは実際に 2 度作動した（E-11 は loader が落ちる前に、E-2 は merge 前に捕まった）。
+3. **spec が世界について述べた主張の真偽。** E-11 / E-2 / E-6 がこれである。D-29 で「書いた時点で照合可能」までは下げられるが、消えない。最終防波堤は §1 の「実装時に事実が違っていた場合、仕様ではなく事実が正しい。停止して報告せよ」＋ implementer の停止であり、これは実際に **3 度**作動した（E-11 は loader が落ちる前に、E-2 は merge 前に、E-6 は naysayer の独立 probe ＋ implementer の停止によって merge 前に捕まった）。
 
 ## §3 `.mindwire/pin` schema
 
@@ -386,14 +386,14 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 - **A-15** §1.1 の ADR 参照（番号・表題・内容）が実在と一致することを確認し、結果を PR 本文に書く。**一致しない場合は修正せず停止して報告する**（D-17）。
 - **A-16** `after` に相当する依存フィールドが front-matter スキーマにも `verify.py` にも存在しない（D-15）。
 - **A-17** 本仕様の実装差分のどこにも `gh pr merge` を implementer に実行させる記述・コード・手順が無い（D-11 / E-8）。
-- **A-18** 実装 PR で canary が緑である（`canary: required`）。
+- **A-18** 実装 PR で canary が緑である（`canary: required`）。**`canary` の値が持つ効果は本条件の適用可否だけである** — `not-applicable` の item は本条件の対象外になり、それ以外にこの値を読む consumer は本仕様に無い。実体の canary は obligations loader が `origin` ブロックを持つ entry に対して常に強制するものであり（E-9）、front-matter の値では止まらないし始まらない。
 - **A-19** `status: withdrawn` の manifest、または他 manifest から `supersedes` されている manifest を `main` 上に置くと V-10 が warning を出し、exit code は 0 のままである。
 - **A-20** front-matter に `status: proposed` または `status: superseded` を書くと V-3 が error を出す（D-18 の回帰防止）。
 - **A-21** `main` に merge 済みの manifest の本文が、chatroom に投稿された msg 本文と byte 単位で一致する（D-2 手順 3・D-19）。
 - **A-22** item に `status: withdrawn` ＋ `withdrawn_reason` を書いた manifest が V-1〜V-8 を error 0 で通過し、`verify.py --json` の当該 item がその状態を出力する。`withdrawn_reason` を落とすと V-5 が error を出す。
 - **A-23** `target_repo` を実在の remote basename と異なる値にすると V-11 が error を出す。`origin` remote を持たない作業コピーでは V-11 が error を出さず info を 1 件出し、exit code は 0 のままである。
 - **A-24** item 側に `target_repo` を書くと V-12 が error を出す（D-22 の回帰防止）。
-- **A-25** 本 manifest の本文（決定・スキーマ・受け入れ条件）のいずれにも、`spirrow-mindwire` 以外の repo に対して作業・状態変更を**要求する**記述が無い（D-22）。実測の記述（E-6 / E-10）と、withdrawn item がなぜ消えたかの記録（I-5 / D-23）は要求ではない ∴ 本条件に反しない。V-11 / V-12 は front-matter の `target_repo` しか見ず、散文でこの規律が破れることを機械では検出できない — 本条件はその穴を人手の検査で塞ぐものであり、A-15 / A-17 と同じ種類の受け入れ条件である。
+- **A-25** 本 manifest の**本文（決定・スキーマ・受け入れ条件）および front-matter（`items` の `id` / `title` / `paths` / `withdrawn_reason` を含む全フィールド）**のいずれにも、`spirrow-mindwire` 以外の repo に対して作業・状態変更を**要求する**記述が無い（D-22）。**front-matter を明示的に含めるのは、dispatch されるのが item だからである** — cross-repo mandate を機械が実際に運べる唯一の面がそこであり、I-5 が現にそうだった（I-4 と I-5 は `paths` が同一で、両者を分けていたのは `title` の散文だけである）。V-11 / V-12 は manifest 直下の `target_repo` しか見ず、item の散文は素通りする。実測の記述（E-6 / E-10）と、withdrawn item がなぜ消えたかの記録（I-5 / D-23）は要求ではない ∴ 本条件に反しない。散文でこの規律が破れることは機械では検出できない — 本条件はその穴を人手の検査で塞ぐものであり、A-15 / A-17 と同じ種類の受け入れ条件である。
 
 ## §8 運用（順序の SOT は `items` の列挙順 — D-15）
 
@@ -403,5 +403,5 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 - **I-2 の merge が Tier-C である。** human は本文を一字も変えずに merge する（D-2 手順 3）。merge した時点で本 manifest は `origin/main` 上に存在し、pin から参照可能になる。**merge 前後で `status` を書き換えない**（D-18: merge 済みか否かは git が知っている）。
 - **merge 後、本 manifest は immutable である**（D-19）。訂正・改訂は新しい spec を起こし `supersedes` で繋ぐ。古い側のファイルは書き換えない（D-20）。
 - **I-3 以降は pin つき dispatch で実行する。** ここから receipt は `RESOLVED` になる。
-- 各 item の PR は `feature/*` → 当該 item の `base_branch`（E-7）。**merge は常に human（Tier-C）**であり、E-6 により機構では強制できない ∴ 規律である（D-11）。
+- 各 item の PR は `feature/*` → 当該 item の `base_branch`（E-7）。**merge は常に human（Tier-C）**であり、E-6 の ruleset は PR を経由することまでしか強制しない（主体が human であることは強制しない）∴ 規律である（D-11）。
 - pin つき dispatch の第一号実運用対象は **`T-pr-gate-adr-index-scope`**（D-13）。
