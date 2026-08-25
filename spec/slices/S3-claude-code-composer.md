@@ -261,13 +261,17 @@ runtime observability invariant. A retrospective that groups by
 text remain bound. A silent edit to the prompt text without a version
 bump would poison every downstream analysis.
 
-**Implementation**: the module carries a `PROMPT_DIGEST_V2` constant
-alongside `PROMPT_VERSION`. Its value is
-`sha256(_SYSTEM_PROMPT.encode('utf-8')).hexdigest()`. A single test
-(`TestPromptDigestPin` in `tests/test_claude_code_composer.py`) asserts
-the pin. Updating the prompt requires a coordinated edit:
-`PROMPT_VERSION` bumps, `PROMPT_DIGEST_V2` (or a next-version constant)
-recomputed, in the SAME commit.
+**Implementation**: the module carries a `PROMPT_DIGESTS` mapping from
+version string to the sha256 of the prompt text that shipped under that
+version, alongside `PROMPT_VERSION`. Each value is
+`sha256(_SYSTEM_PROMPT.encode('utf-8')).hexdigest()` as of its version.
+A single test (`TestPromptDigestPin` in
+`tests/test_claude_code_composer.py`) asserts two things: that
+`PROMPT_VERSION` has a row, and that the LIVE prompt text hashes to that
+row's value. The test only ever hashes the one prompt text the module
+actually exports, so it stays correct at every version WITHOUT retaining
+historical prompt strings — the history lives in the mapping as data,
+not as accumulated tests.
 
 **Why this pin is not "just an arbitrary constant"** (msg-1441 endorsement
 of D-49 mechanism): the pinned rejected v1 timeout constant was arbitrary
@@ -435,12 +439,25 @@ one-word prompt edit with a `PROMPT_VERSION` bump.
 
 ## Prompt-version bump policy (D-49 corollary)
 
-Every prompt-text edit is a two-line change: `PROMPT_VERSION` moves and
-`PROMPT_DIGEST_V<N>` gets a new value (either the same-versioned
-constant updated, or a new-versioned constant added alongside a new
-`TestPromptDigestPin` case). Do the edits in the SAME commit as the
-prompt text change. A prompt edit committed without a digest bump is
-what the D-49 pin exists to reject.
+Bumping is a three-edit change, all in the SAME commit as the prompt-text
+edit: the prompt text changes, `PROMPT_VERSION` moves to the new version,
+and a NEW row `"<new version>": "<new digest>"` is added to
+`PROMPT_DIGESTS`. The number of tests does not change — there is exactly
+one `TestPromptDigestPin` case, at every version, and it always reads
+`PROMPT_DIGESTS[PROMPT_VERSION]`. A prompt edit committed without a
+digest row is what the D-49 pin exists to reject.
+
+**Existing rows are never edited (D-54).** That rule is what "do not
+silently update the pin's expected value" means operationally: rewriting
+a row in place is how a text edit gets laundered without a version bump.
+Adding a row is always safe; changing one is always suspect, and it is
+the one thing a reviewer should look for in a diff of this mapping.
+
+**Known limit — convention, not mechanism.** No test detects a rewritten
+row; that needs a comparison against git history, which nothing in the
+suite does. The mapping makes the violation visible in a diff, it does
+not make it impossible. Mechanising it is deliberately OUT OF SCOPE for
+the v2 revision (D-54 follow-up).
 
 **User-prompt shape**:
 
@@ -772,11 +789,15 @@ Coverage:
    `--- msg-<id> by <author> ---` separators appear.
 6. Prompt version — `PROMPT_VERSION` constant is a module-level string
    ("2" as of the v2 revision), and the extras key `prompt_version`
-   reports its value verbatim.
-6a. **Prompt digest pin (D-49)** — `TestPromptDigestPin` computes
+   reports its value verbatim. The test asserts the SHAPE of the value,
+   not the literal "2", so a future bump does not break it.
+6a. **Prompt digest pin (D-49, maintenance rule D-54)** —
+    `TestPromptDigestPin` asserts `PROMPT_VERSION` has a row in
+    `PROMPT_DIGESTS`, then computes
     `sha256(_SYSTEM_PROMPT.encode('utf-8')).hexdigest()` and asserts it
-    equals `PROMPT_DIGEST_V2`. This is the ONLY new test introduced by
-    the v2 revision (msg-1442 §28.6). Content-oriented assertions on
+    equals `PROMPT_DIGESTS[PROMPT_VERSION]`. This is the ONLY new test
+    introduced by the v2 revision (msg-1442 §28.6) and it remains a
+    single test at every future version. Content-oriented assertions on
     the prompt text are DELIBERATELY not added: the stub backend does
     not exercise the real LLM, so any test at this layer that claimed
     to verify prompt compliance would be a false comfort (§28.6, §14

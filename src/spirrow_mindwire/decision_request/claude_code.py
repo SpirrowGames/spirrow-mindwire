@@ -43,6 +43,7 @@ import json
 import os
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -116,21 +117,32 @@ sha256 digest tied to this version string; see
 :mod:`tests.test_claude_code_composer` ``TestPromptDigestPin``.
 """
 
-PROMPT_DIGEST_V2 = "4b7a8119a514a14ec9728440958149accf9ff5173457cc9aa438932af59859c4"
-"""sha256(:data:`_SYSTEM_PROMPT`.encode('utf-8'))[:64] for
-``PROMPT_VERSION == "2"``.
+PROMPT_DIGESTS: Mapping[str, str] = {
+    "2": "4b7a8119a514a14ec9728440958149accf9ff5173457cc9aa438932af59859c4",
+}
+"""Version string -> ``sha256(_SYSTEM_PROMPT.encode('utf-8')).hexdigest()``
+of the prompt text that shipped under that version.
 
 **D-49**: `prompt_version` is a runtime observability invariant — the
 extras key is only useful for retrospective if the version string and
 the prompt text stay bound. A silent edit that changes the text without
 bumping the version would poison every retrospective downstream. This
-constant plus its regression test in
+mapping plus its regression test in
 :mod:`tests.test_claude_code_composer` (``TestPromptDigestPin``) is the
 minimum enforcement of the bond. Recomputing:
 ``python -c "import hashlib; from spirrow_mindwire.decision_request.claude_code
 import _SYSTEM_PROMPT; print(hashlib.sha256(_SYSTEM_PROMPT.encode('utf-8')).hexdigest())"``.
-Update this constant when (and only when) :data:`PROMPT_VERSION` is
-bumped in the same commit.
+
+**D-54 — maintenance rule.** A version bump ADDS a row here and moves
+:data:`PROMPT_VERSION` to match, in the SAME commit as the prompt-text
+edit. **Existing rows are never edited.** Rewriting a row in place is
+how a text edit gets laundered without a version bump; adding a row is
+always safe, changing one is always suspect, and that distinction is
+what a reviewer should look for in a diff of this mapping. The single
+``TestPromptDigestPin`` case reads ``PROMPT_DIGESTS[PROMPT_VERSION]``,
+so it stays correct at every version and is never duplicated per
+version. Note this convention is diff-visible but NOT test-enforced —
+detecting a rewritten row needs git history, which no test here reads.
 """
 
 _INTERNAL_TAIL_BODY_HARD_CEILING = 10_000
@@ -893,7 +905,7 @@ __all__ = [
     "DEFAULT_CLAUDE_CLI",
     "DEFAULT_COMPOSER_IDENTITY",
     "DEFAULT_TIMEOUT_SECONDS",
-    "PROMPT_DIGEST_V2",
+    "PROMPT_DIGESTS",
     "PROMPT_VERSION",
     "ClaudeCodeComposer",
     "SubprocessResult",
