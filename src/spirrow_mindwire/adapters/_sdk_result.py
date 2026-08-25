@@ -128,13 +128,29 @@ class SdkIsErrorSignal(RuntimeError):  # noqa: N818 — "Signal" names its role
         super().__init__(detail.get("message") or "SDK session reported is_error")
 
 
+# Sentinel returned by :func:`_raw_field` when the ``getattr`` on a field
+# raised. Distinct from ``None`` / ``""`` / any user value so
+# :func:`_pick_reason` can distinguish "the field was empty" from "the field
+# could not be read". A bare ``None`` would collapse the two into the same axis
+# — the very pattern this whole thread is fixing.
+_CAPTURE_ERROR_SENTINEL: Any = object()
+
+# Small scalar containers are dumped verbatim (bounded per-element) so the
+# marker line actually carries the reason a real SDK ``errors=["…"]`` put
+# there, instead of the useless ``list(len=1)`` summary. Larger or non-scalar
+# containers still fall back to ``type(len=N)``.
+_SMALL_LIST_ELEM_LIMIT = 8
+
+
 def _summarize_value(value: Any) -> Any:
     """Reduce ``value`` to a JSON-safe, length-bounded summary.
 
-    Scalars pass through (with strings truncated). Containers are reported by
-    ``type(len=...)`` — never dumped in full, so an unexpectedly large
-    ``permission_denials`` list (or a debugging blob attached in a future SDK)
-    cannot balloon the marker line.
+    Small lists / tuples of scalars are preserved element-wise (bounded), so a
+    real ``errors=["Anthropic returned 429"]`` reaches the marker as text
+    rather than as the opaque ``list(len=1)``. Larger containers, or
+    containers of non-scalars, fall back to ``type(len=N)`` — the marker line
+    is capped by the per-field length limit above, so an unexpectedly large
+    ``permission_denials`` blob cannot balloon it.
     """
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -142,63 +158,114 @@ def _summarize_value(value: Any) -> Any:
         if len(value) <= _FIELD_VALUE_MAX_LEN:
             return value
         return value[:_FIELD_VALUE_MAX_LEN] + f"…(+{len(value) - _FIELD_VALUE_MAX_LEN}ch)"
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (list, tuple)):
+        # Preserve small scalar containers verbatim so a real ``errors=[…]``
+        # message actually reaches the marker (PR #181 round 3: the earlier
+        # unconditional ``type(len=N)`` summary hid the very reason text this
+        # whole thread exists to preserve). Non-scalar or long lists still
+        # fall back to the length-only summary — bounded is bounded.
+        if len(value) <= _SMALL_LIST_ELEM_LIMIT and all(
+            v is None or isinstance(v, (bool, int, float, str)) for v in value
+        ):
+            return [_summarize_value(v) for v in value]
+        return f"{type(value).__name__}(len={len(value)})"
+    if isinstance(value, (set, frozenset)):
         return f"{type(value).__name__}(len={len(value)})"
     if isinstance(value, dict):
         return f"dict(len={len(value)})"
     return f"{type(value).__name__}(repr_omitted)"
 
 
-def _capture_field(final: Any, name: str) -> Any:
-    """``getattr``-then-summarize with per-field fail-safe (§1-3).
+def _raw_field(final: Any, name: str) -> Any:
+    """``getattr`` with per-field fail-safe.
 
-    A property on ``final`` that raises when accessed would otherwise blow up
-    the whole capture. The per-field except records the exception type so the
-    marker distinguishes "field returned nothing" from "field raised".
+    Returns the raw value when the read succeeds (including ``None``, empty
+    string, empty container — all legitimate values callers need to
+    distinguish), or :data:`_CAPTURE_ERROR_SENTINEL` when the attribute access
+    itself raised. The sentinel is intentionally NOT ``None``: collapsing "the
+    field was absent" onto "the read raised" is the pattern this thread is
+    fixing, so it must not silently reappear inside the helper.
     """
     try:
-        value = getattr(final, name, None)
-    except Exception as exc:
-        return {"capture_failed": type(exc).__name__}
+        return getattr(final, name, None)
+    except Exception:
+        return _CAPTURE_ERROR_SENTINEL
+
+
+def _summarize_safely(value: Any) -> Any:
+    """Summarize with per-field fail-safe. Distinguishes read-failure and
+    summarize-failure so a reader of ``captured_fields`` can tell them apart.
+    """
+    if value is _CAPTURE_ERROR_SENTINEL:
+        return {"capture_failed": True}
     try:
         return _summarize_value(value)
     except Exception as exc:
         return {"summarize_failed": type(exc).__name__}
 
 
-def _capture_known(final: Any) -> dict[str, Any]:
-    """Capture the known-field slice — session facts + reason candidates."""
-    captured: dict[str, Any] = {}
+def _capture_known(final: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return ``(raw, summary)`` for the known-field slice.
+
+    Two dicts, same keys, same order. The RAW dict is consumed by
+    :func:`_pick_reason` for emptiness tests — an empty list must remain an
+    empty list at that point, not a ``"list(len=0)"`` string that
+    :func:`_pick_reason` cannot recognise as empty (PR #181 round 3 defect).
+    The SUMMARY dict feeds ``captured_fields`` in the marker, so it is
+    length-bounded and JSON-safe.
+    """
+    raw: dict[str, Any] = {}
+    summary: dict[str, Any] = {}
     for name in (*_SESSION_FACT_FIELDS, *_KNOWN_REASON_FIELDS):
-        captured[name] = _capture_field(final, name)
-    return captured
+        value = _raw_field(final, name)
+        raw[name] = value
+        summary[name] = _summarize_safely(value)
+    return raw, summary
 
 
-def _pick_reason(captured: dict[str, Any]) -> tuple[str, str]:
-    """Compute ``(reason_source, message)`` from the captured known fields.
+def _is_empty_reason_value(value: Any) -> bool:
+    """True when ``value`` carries no reason and must be skipped.
+
+    Deliberately explicit rather than a bare ``if not value`` — ``0`` and
+    ``False`` are legitimate reason-carrying values (a real
+    ``api_error_status=0`` from some gateways, hypothetical boolean fields on
+    a future SDK) and a bare truthiness check would eat them. The sentinel
+    is treated as empty because "could not read" is not a reason we can
+    report on this axis; it shows up in ``captured_fields`` as
+    ``capture_failed: true`` so a reader still sees it.
+    """
+    if value is None or value is _CAPTURE_ERROR_SENTINEL:
+        return True
+    if isinstance(value, str) and not value:
+        return True
+    return isinstance(value, (list, tuple, set, frozenset, dict)) and not value
+
+
+def _pick_reason(raw: dict[str, Any], summary: dict[str, Any]) -> tuple[str, str]:
+    """Compute ``(reason_source, message)`` from RAW values, formatted from summary.
 
     ``result`` wins if it carries a non-empty string. Otherwise the first
-    other known field whose captured value is not ``None`` and not the empty
-    string is named as ``field:<name>``. If none carry anything, returns
-    ``("absent", <constant explanation>)``.
+    known field whose RAW value passes :func:`_is_empty_reason_value` is named
+    as ``field:<name>``, using its SUMMARY for the marker message so bounds
+    are enforced.
+
+    Using summary for the emptiness check was the round-2 defect: an
+    ``errors=[]`` becomes the string ``"list(len=0)"`` under summarisation,
+    which is non-empty, so it was incorrectly picked as the reason —
+    shadowing any trailing reason-carrying field (e.g. ``api_error_status``).
+    Fixed here by branching on RAW.
     """
-    result = captured.get("result")
+    result = raw.get("result")
     if isinstance(result, str) and result:
         return "result", result
 
     for name in _KNOWN_REASON_FIELDS:
         if name == "result":
             continue
-        value = captured.get(name)
-        # Explicit skip conditions rather than a bare falsy check: 0 is a
-        # legitimate ``api_error_status`` value in the wild for some gateways,
-        # and ``False`` should never surface here anyway (none of the known
-        # fields are bool-typed on the current SDK).
-        if value is None:
+        value = raw.get(name)
+        if _is_empty_reason_value(value):
             continue
-        if isinstance(value, str) and not value:
-            continue
-        return f"field:{name}", f"SDK is_error; {name}={value!r}"
+        return f"field:{name}", f"SDK is_error; {name}={summary.get(name)!r}"
 
     return (
         "absent",
@@ -207,6 +274,17 @@ def _pick_reason(captured: dict[str, Any]) -> tuple[str, str]:
             "fields captured, none carried a reason"
         ),
     )
+
+
+def _capture_field(final: Any, name: str) -> Any:
+    """Back-compat single-field capture used by :func:`_absent_dump`.
+
+    :func:`_absent_dump` records ``{name: summary}`` per field; the reflection
+    dump is display-only, so it does not care about raw-vs-summary the way
+    :func:`_pick_reason` does. Keeping this helper avoids duplicating the
+    getattr-then-summarize pattern inside the dump.
+    """
+    return _summarize_safely(_raw_field(final, name))
 
 
 def _absent_dump(final: Any) -> dict[str, Any]:
@@ -289,12 +367,12 @@ def capture_is_error_detail(final: Any) -> dict[str, Any]:
     legitimate outcome, not a crash.
     """
     try:
-        captured = _capture_known(final)
-        reason_source, message = _pick_reason(captured)
+        raw, summary = _capture_known(final)
+        reason_source, message = _pick_reason(raw, summary)
         detail: dict[str, Any] = {
             "reason_source": reason_source,
             "message": message,
-            "captured_fields": captured,
+            "captured_fields": summary,
         }
         if reason_source == "absent":
             detail["absent_dump"] = _absent_dump(final)

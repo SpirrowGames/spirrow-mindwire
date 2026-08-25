@@ -128,7 +128,7 @@ def test_reason_source_capture_failed_is_a_distinct_value(monkeypatch: pytest.Mo
     """
     from spirrow_mindwire.adapters import _sdk_result
 
-    def _explode(_final: Any) -> dict[str, Any]:
+    def _explode(_final: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         raise RuntimeError("simulated capture pipeline failure")
 
     monkeypatch.setattr(_sdk_result, "_capture_known", _explode)
@@ -172,16 +172,89 @@ def test_long_string_values_are_truncated() -> None:
     assert captured_result.endswith("ch)")  # truncation footer
 
 
-def test_container_values_are_summarised_not_dumped() -> None:
+def test_large_container_values_are_summarised_not_dumped() -> None:
     final = _FakeResultMessage(
         result=None,
         errors=[f"err-{i}" for i in range(200)],
     )
     detail = capture_is_error_detail(final)
-    # errors is a container so it is reported as ``list(len=200)``, not dumped.
+    # A long errors list stays as ``list(len=200)`` so the marker line cannot
+    # balloon the tail window.
     assert detail["captured_fields"]["errors"] == "list(len=200)"
     # And the picker still recognises it as non-empty, so it drives reason_source.
     assert detail["reason_source"] == "field:errors"
+
+
+def test_small_scalar_list_preserves_contents_so_the_message_carries_the_reason() -> None:
+    """A small ``errors=["…"]`` reaches the marker as text, not as ``list(len=1)``.
+
+    The pre-round-3 code summarised every list as ``type(len=N)`` which meant
+    the very reason text the SDK put on this field got thrown away in favour
+    of an opaque length string. Real SDK ``errors`` lists carry short human
+    strings; preserving them bounded is what makes ``field:errors`` actually
+    useful as a reason surface.
+    """
+    final = _FakeResultMessage(
+        result=None,
+        errors=["Anthropic returned 429 rate limit"],
+    )
+    detail = capture_is_error_detail(final)
+    assert detail["captured_fields"]["errors"] == ["Anthropic returned 429 rate limit"]
+    assert detail["reason_source"] == "field:errors"
+    assert "429 rate limit" in detail["message"]
+
+
+# --------------------------------------------------------------------------- #
+# PR #181 round 3 regression — an EMPTY container must not shadow a real
+# reason on a later field (the naysayer's "list(len=0)" defect).
+# --------------------------------------------------------------------------- #
+
+
+def test_empty_container_is_not_treated_as_a_reason() -> None:
+    """An ``errors=[]`` must NOT be picked as ``field:errors``.
+
+    The round-2 defect was: ``_pick_reason`` inspected the summarised value
+    (which was the string ``"list(len=0)"`` for an empty list), and since a
+    non-empty string looks like "there is a reason", the picker returned
+    ``("field:errors", "SDK is_error; errors='list(len=0)'")``. That is a
+    reason string that carries no reason — the exact defect this whole thread
+    exists to remove.
+
+    The fix is to inspect the RAW value (an empty list is empty). Pin here so
+    a future refactor cannot re-collapse raw and summary.
+    """
+    final = _FakeResultMessage(
+        result=None,
+        errors=[],
+        api_error_status=429,  # the real reason, on a later field
+    )
+    detail = capture_is_error_detail(final)
+    assert detail["reason_source"] == "field:api_error_status"
+    assert "429" in detail["message"]
+
+
+def test_empty_containers_alone_reach_absent() -> None:
+    """When every known field is empty (including empty containers), we land
+    at ``absent``, not at a phony ``field:<name>`` picked off a length string.
+    """
+    final = _FakeResultMessage(
+        result=None,
+        errors=[],
+        permission_denials=[],
+    )
+    detail = capture_is_error_detail(final)
+    assert detail["reason_source"] == "absent"
+    assert "none carried a reason" in detail["message"]
+
+
+def test_zero_api_error_status_is_still_treated_as_a_reason() -> None:
+    """``api_error_status=0`` (unusual but observed on some gateways) is a
+    reason. The empty-container fix must not extend to zero/False.
+    """
+    final = _FakeResultMessage(result=None, api_error_status=0)
+    detail = capture_is_error_detail(final)
+    assert detail["reason_source"] == "field:api_error_status"
+    assert "0" in detail["message"]
 
 
 # --------------------------------------------------------------------------- #
