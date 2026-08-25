@@ -159,12 +159,20 @@ async def _fetch_thread_messages(
 def _parse_cutoff(since_iso: str) -> datetime:
     """Parse the caller-supplied cutoff string into an aware :class:`datetime`.
 
-    Raises :class:`ValueError` with a caller-facing message on failure. Meant to be
-    called once, in ``main()`` — a typo in ``--since-created-at`` is a caller bug that
-    must fail fast BEFORE any network I/O, not silently in the per-message hot loop
-    (a per-message fallback there would emit no error and scan the entire project
-    history under a typo like ``--since-created-at=2026/08/17``).
+    Raises :class:`ValueError` with a caller-facing message on failure — including
+    the ``None`` / empty / non-string cases (argparse's ``default=_DEFAULT_SINCE``
+    means ``args.since_created_at`` is always a non-empty str via the CLI, but a
+    programmatic caller could still pass ``None``; converting that to a
+    ``ValueError`` keeps the failure class consistent with the docstring contract
+    instead of leaking an ``AttributeError`` from ``.replace()``).
+
+    Meant to be called once, in ``main()`` — a typo in ``--since-created-at`` is
+    a caller bug that must fail fast BEFORE any network I/O, not silently in the
+    per-message hot loop (a per-message fallback there would emit no error and
+    scan the entire project history under a typo like ``--since-created-at=2026/08/17``).
     """
+    if not isinstance(since_iso, str) or not since_iso:
+        raise ValueError(f"since_iso must be a non-empty str, got {since_iso!r}")
     # chatroom timestamps are ISO 8601 with a `Z` suffix; ``fromisoformat`` accepts
     # `+00:00` but not `Z` on Python <3.11, so normalise first.
     parsed = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))

@@ -174,12 +174,23 @@ def test_default_run_still_names_the_default_path(monkeypatch: pytest.MonkeyPatc
 
 
 class _CutoffCheckMcp:
-    """Fake that returns TWO messages: one before the cutoff, one after.
+    """Fake that returns TWO messages straddling the cutoff, with DIFFERENT authors.
 
-    The cutoff logic must drop the pre-cutoff one. If ``_in_scope`` is bypassed
-    (e.g. because the fake used ``timestamp`` instead of ``created_at`` and hit
-    the missing-field fail-open), BOTH messages end up counted — that is what
-    this pin refuses.
+    The distinct authors matter. ``_summarise`` aggregates by author, so a
+    same-author pair would collapse to a single ``post_count=1`` entry
+    regardless of WHICH message actually survived — the test would pass
+    identically whether ``_in_scope`` returned True for the pre-cutoff or the
+    post-cutoff message. Two authors make the survivor's raw name the
+    artifact-visible signal, so the direction of the comparison is pinned.
+
+    Failure modes the test now discriminates:
+
+      * ``_in_scope`` unconditionally True (the original bug) — both authors
+        appear, ``messages_in_scope == 2``.
+      * ``_in_scope`` reversed (``parsed < cutoff`` or ``<=`` instead of ``>=``)
+        — ``messages_in_scope == 1`` but ``pre-cutoff-author`` is the survivor
+        rather than ``post-cutoff-author``.
+      * ``_in_scope`` correct — only ``post-cutoff-author`` present.
     """
 
     async def call_tool(self, name: str, params: dict[str, Any]) -> Any:
@@ -192,13 +203,13 @@ class _CutoffCheckMcp:
             "messages": [
                 {
                     "msg_id": "msg-0001",
-                    "author": "naysayer-pr-review",
+                    "author": "pre-cutoff-author",
                     "role": "naysayer",
                     "created_at": "2026-08-10T00:00:00+00:00",  # BEFORE cutoff
                 },
                 {
                     "msg_id": "msg-9999",
-                    "author": "naysayer-pr-review",
+                    "author": "post-cutoff-author",
                     "role": "naysayer",
                     "created_at": "2026-08-20T00:00:00+00:00",  # AFTER cutoff
                 },
@@ -207,12 +218,22 @@ class _CutoffCheckMcp:
 
 
 def test_in_scope_actually_drops_pre_cutoff_messages(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The cutoff is really applied — not silently bypassed by a missing field.
+    """The cutoff is really applied — and it drops the RIGHT message.
 
-    Regression pin for the round-4 finding: the fake used ``timestamp`` and thus
-    left ``created_at`` missing, so ``_in_scope`` returned True unconditionally
-    and the test passed for the wrong reason. This pin uses ``created_at`` on
-    two messages straddling the cutoff and asserts that exactly one survives.
+    Regression pin for the round-4 gate (T-pr-review-spirrow-mindwire-174):
+
+      1. Original blocker: the fake used ``timestamp`` and left ``created_at``
+         missing, so ``_in_scope`` hit its fail-open branch and the cutoff was
+         silently bypassed. Renaming the field alone is not enough — a test
+         that says "one message survived" while unable to say WHICH must be
+         written to fail on a reversed comparison too. Otherwise a future
+         regression that flipped ``>=`` to ``<`` would pass this test
+         identically to the correct implementation, and the pin would provide
+         false confidence.
+
+      2. The fake uses distinct authors so the survivor is artifact-visible
+         (``_summarise`` aggregates by author; msg-ids are lost). The
+         assertion on the ``authors`` set is the direction pin.
     """
     monkeypatch.setattr(_MODULE, "StreamableHttpChatroomMcp", lambda *_a, **_kw: _CutoffCheckMcp())
 
@@ -231,9 +252,18 @@ def test_in_scope_actually_drops_pre_cutoff_messages(monkeypatch: pytest.MonkeyP
 
     assert result["totals"]["messages_scanned"] == 2
     assert result["totals"]["messages_in_scope"] == 1
-    # The one that survived is the post-cutoff one.
-    naysayer_entry = next(e for e in result["authors"] if e["raw_name"] == "naysayer-pr-review")
-    assert naysayer_entry["post_count"] == 1
+
+    # Direction pin: the POST-cutoff author is present, the PRE-cutoff one is
+    # not. A reversed comparison (``parsed < cutoff`` or ``<=``) would still
+    # keep exactly one message, but it would be the wrong one — and THAT is
+    # what this assertion refuses.
+    author_names = {e["raw_name"] for e in result["authors"]}
+    assert author_names == {"post-cutoff-author"}, (
+        f"expected only the post-cutoff author to survive; got {author_names!r} "
+        f"— either the cutoff comparison is reversed or both messages are in scope"
+    )
+    survivor = next(e for e in result["authors"] if e["raw_name"] == "post-cutoff-author")
+    assert survivor["post_count"] == 1
 
 
 def test_typo_in_since_created_at_fails_fast_before_network(
@@ -296,3 +326,16 @@ def test_parse_cutoff_rejects_non_iso_string() -> None:
     """
     with pytest.raises(ValueError):
         _MODULE._parse_cutoff("2026/08/17")
+
+
+def test_parse_cutoff_rejects_none_and_empty_string() -> None:
+    """``None`` / ``""`` / non-string inputs raise :class:`ValueError`, not ``AttributeError``.
+
+    The docstring contract is "raises :class:`ValueError` on failure", so a
+    programmatic caller passing ``None`` (say, because argparse's default was
+    later changed to ``None``) must still hit the same failure class rather
+    than crashing with ``AttributeError`` from ``.replace()`` on a non-string.
+    """
+    for bad in (None, "", 0, 20260817):
+        with pytest.raises(ValueError):
+            _MODULE._parse_cutoff(bad)
