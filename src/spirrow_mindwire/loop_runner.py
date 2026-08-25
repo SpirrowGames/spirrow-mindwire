@@ -750,19 +750,42 @@ def main() -> None:
         logger.info("stage3 loop interrupted; shut down cleanly")
     except BaseException as exc:
         # Exit-time SDK-error marker (T-sdk-is-error-loses-the-reason S-6,
-        # second copy). The adapter already emitted an identical marker at the
-        # raise site — this re-emission is the belt to that suspender: it makes
-        # the marker the LAST line stdout carries, so the 50-line
-        # ``session_log_tail`` window PowerShell captures cannot push it out
-        # even if the SDK subprocess's teardown prints anything afterwards.
-        # Two writes with the same JSON payload are unambiguous — a reader
-        # sees the same ``sdk_error_detail=...`` twice, not two different
-        # stories. If the exception did not wrap an ``SdkIsErrorSignal`` the
-        # walker returns ``None`` and this block is a no-op.
+        # second copy). Sequenced carefully because Python's default
+        # ``sys.excepthook`` writes the traceback to stderr AFTER the except
+        # block returns, and the wrapper's capture (``deploy/run-conductor-scheduled.ps1``:
+        # ``$output = (& $inner *>&1) | …``) merges stderr into the same stream
+        # it feeds into ``session_log_tail``. A plain ``raise`` here would let a
+        # multi-frame async traceback (an ``SdkIsErrorSignal`` wrapped in
+        # ``ClaudeCodeSdkDeliveryError`` inside ``asyncio.run`` easily spans
+        # 30+ lines — the very shape observed in ``quarantine.json`` today)
+        # push our marker out of the 50-line tail window, exactly the
+        # regression the second copy exists to prevent. (PR #181 naysayer
+        # review; the raise-site copy is the "belt", this is the "suspenders".)
+        #
+        # Fix: for the ``SdkIsErrorSignal`` case, PRINT the traceback ourselves
+        # to stdout (same stream the marker uses, so their in-stream order is
+        # deterministic — writes to two different pipes race for merge slots,
+        # writes to the same pipe do not), THEN emit the marker, THEN exit
+        # non-zero via ``sys.exit`` — whose ``SystemExit`` the default
+        # excepthook special-cases NOT to print. So the marker is provably the
+        # last thing on stdout, and the traceback is preserved above it.
+        #
+        # For any OTHER exception the block is a no-op — the plain ``raise``
+        # keeps existing behaviour unchanged.
         sig = find_sdk_error_signal(exc)
-        if sig is not None:
-            emit_sdk_error_marker(sig.detail)
-        raise
+        if sig is None:
+            raise
+        import traceback
+
+        traceback.print_exception(exc, file=sys.stdout)
+        sys.stdout.flush()
+        emit_sdk_error_marker(sig.detail)
+        sys.stdout.flush()
+        # SystemExit with an int argument bypasses the default excepthook's
+        # traceback print, so nothing more lands on stderr after the marker.
+        # Exit code stays 1 to match the pre-change behaviour the wrapper's
+        # ``if ($code -ne 0)`` branch relies on.
+        sys.exit(1)
 
 
 __all__ = [
