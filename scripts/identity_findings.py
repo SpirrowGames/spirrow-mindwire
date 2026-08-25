@@ -156,7 +156,24 @@ async def _fetch_thread_messages(
     return [m for m in messages if isinstance(m, dict)]
 
 
-def _in_scope(msg: dict[str, Any], since_iso: str, since_msg_id: str | None) -> bool:
+def _parse_cutoff(since_iso: str) -> datetime:
+    """Parse the caller-supplied cutoff string into an aware :class:`datetime`.
+
+    Raises :class:`ValueError` with a caller-facing message on failure. Meant to be
+    called once, in ``main()`` — a typo in ``--since-created-at`` is a caller bug that
+    must fail fast BEFORE any network I/O, not silently in the per-message hot loop
+    (a per-message fallback there would emit no error and scan the entire project
+    history under a typo like ``--since-created-at=2026/08/17``).
+    """
+    # chatroom timestamps are ISO 8601 with a `Z` suffix; ``fromisoformat`` accepts
+    # `+00:00` but not `Z` on Python <3.11, so normalise first.
+    parsed = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _in_scope(msg: dict[str, Any], cutoff: datetime, since_msg_id: str | None) -> bool:
     """Whether ``msg`` is at or after the caller-supplied cutoff.
 
     Two cutoff modes, tried in order:
@@ -164,10 +181,13 @@ def _in_scope(msg: dict[str, Any], since_iso: str, since_msg_id: str | None) -> 
       * ``since_msg_id`` (chatroom-native): a lex compare on ``msg-NNNN`` strings works
         because the padding is fixed and the ids are monotonic per chatroom project. When
         the caller supplies this AND the message id compares less than the cutoff, drop.
-      * ``since_iso``: parse ``created_at`` and compare against the cutoff timestamp. A
-        message whose ``created_at`` is unparseable is treated as in-scope (fail-open on
-        the read side — we would rather over-include than silently drop an unreadable
-        message that the write half then never sees a finding about).
+      * ``cutoff``: an aware :class:`datetime` (parsed once in ``main()`` — see
+        :func:`_parse_cutoff`). Compared against the message's ``created_at``. A
+        message whose ``created_at`` is missing or unparseable is treated as in-scope
+        (fail-open on the read side — we would rather over-include than silently drop
+        an unreadable message that the write half then never sees a finding about).
+        The CALLER's cutoff, however, must have been parsed already; a caller-bug
+        typo is not permitted to reach this function.
 
     Both filters are AND-ed when both are supplied.
     """
@@ -184,16 +204,8 @@ def _in_scope(msg: dict[str, Any], since_iso: str, since_msg_id: str | None) -> 
         parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
     except ValueError:
         return True
-    try:
-        cutoff = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
-    except ValueError:
-        # An unparseable cutoff argument is a caller bug; treat as "no cutoff" so the
-        # script still runs and produces something the operator can react to.
-        return True
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    if cutoff.tzinfo is None:
-        cutoff = cutoff.replace(tzinfo=UTC)
     return parsed >= cutoff
 
 
@@ -267,12 +279,18 @@ def _summarise(
 async def _measure(
     projects: Iterable[str],
     since_iso: str,
+    since_cutoff: datetime,
     since_msg_id: str | None,
     url: str | None,
     classification: LegitimateRolesFile,
     classification_path: Path,
 ) -> dict[str, Any]:
     """Measure the corpus and emit the findings JSON.
+
+    ``since_iso`` is the ORIGINAL caller-supplied string (used only for the ``scope``
+    block so the artifact records what the caller actually typed); ``since_cutoff`` is
+    the parsed :class:`datetime` :func:`_in_scope` compares against. Both come from
+    ``main()`` — do not re-parse ``since_iso`` here or in the hot loop.
 
     ``classification_path`` is the path ``main()`` actually resolved and loaded
     ``classification`` from — NOT re-derived here. Re-deriving it would make the
@@ -307,7 +325,7 @@ async def _measure(
                 continue
             for message in messages:
                 messages_scanned += 1
-                if not _in_scope(message, since_iso, since_msg_id):
+                if not _in_scope(message, since_cutoff, since_msg_id):
                     continue
                 messages_in_scope += 1
                 author = message.get("author")
@@ -399,12 +417,28 @@ def main() -> int:
         print(f"identity_findings: classification unreadable: {exc}", file=sys.stderr)
         return 1
 
+    # Parse the cutoff ONCE, fail-fast before any network I/O. A typo in this CLI
+    # argument (e.g. ``--since-created-at=2026/08/17``) must abort, not silently
+    # promote the run to "no cutoff" and scan the whole project history — the read
+    # half's fail-open policy is per-message (unreadable ``created_at`` in the
+    # corpus), not for the caller's own arguments.
+    try:
+        since_cutoff = _parse_cutoff(args.since_created_at)
+    except ValueError as exc:
+        print(
+            f"identity_findings: --since-created-at is not ISO 8601: "
+            f"{args.since_created_at!r} ({exc})",
+            file=sys.stderr,
+        )
+        return 2
+
     projects = tuple(args.project) if args.project else _DEFAULT_PROJECTS
     try:
         result = asyncio.run(
             _measure(
                 projects=projects,
                 since_iso=args.since_created_at,
+                since_cutoff=since_cutoff,
                 since_msg_id=args.since_msg_id,
                 url=args.url,
                 classification=classification,
