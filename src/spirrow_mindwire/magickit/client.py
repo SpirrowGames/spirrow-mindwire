@@ -23,8 +23,9 @@ import json
 import os
 from typing import Any, Protocol
 
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+import httpx
+from mcp import ClientSession, McpError
+from mcp.client.streamable_http import StreamableHTTPError, streamablehttp_client
 
 _DEFAULT_MAGICKIT_MCP_URL = "http://100.79.84.62:8117/mcp"
 """Default local no-auth magickit MCP endpoint (Tailscale). Env-overridable; not to be hardcoded."""
@@ -50,8 +51,8 @@ class McpToolCaller(Protocol):
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any: ...
 
 
-def envelope_error(payload: Any) -> str | None:
-    """The failure described by a chatroom payload, or ``None`` if it is not one.
+def is_envelope(payload: Any) -> bool:
+    """``True`` iff ``payload`` looks like a chatroom **error envelope** (§3 detection rule).
 
     conclair does not raise when a chatroom call is refused. It answers with an
     ordinary **success** response whose body is an error envelope::
@@ -66,25 +67,111 @@ def envelope_error(payload: Any) -> str | None:
     *"On success: {...}. On failure: conclair error envelope {...}"* -- so the
     contract every caller was written against never existed.
 
-    Detection is by ``error_type`` -- a fact the far end states -- rather than
-    by an expected key being absent, which is how "absent" once became
-    "unidentifiable" in the ``PrReviewOrchestrator`` regression (#150). Living
-    here in the client rather than at any one call site means the seventh
-    caller in the future cannot re-open the same hole by omission.
+    **The detection is deliberately loose** — any top-level ``error_type: <str>``
+    is treated as an envelope. This is msg-1685 §1's decision, not accident. Two
+    error directions are possible:
 
-    Public because :class:`McpToolCaller` fakes in the test suite must be able
-    to mimic what :func:`parse_tool_result` does with an envelope -- otherwise
-    a fake that returns a raw envelope dict to a caller papers over the very
-    regression this refactor exists to close (msg-1115 §5 DoD #3 / #150's
-    "27 tests green against a contract that does not exist").
+    - *False positive* (a legitimate success payload happens to include a top-level
+      string ``error_type``): raises :class:`MagickitMcpError` at the call site;
+      the exception carries the payload's top-level key list (see
+      :func:`raise_if_envelope`) so the schema collision is diagnosable from a
+      single log line.
+    - *False negative* (a real envelope whose shape drifts away from
+      ``error_type``, or a stricter detector "helpfully" rejecting a well-formed
+      envelope): flows through as a success, silently — the exact failure mode
+      msg-1115 §2 called worst (empty thread lists / silent zero-id posts / a
+      stale dashboard, none leaving a trace).
+
+    Between diagnosable-crash and silent-drop the choice is diagnosable-crash,
+    so the detector stays loose. Narrowing it (requiring ``error`` too, or an
+    absent success key, etc.) trades a rare false positive for a class of silent
+    failure this refactor exists to close — do not do it.
+
+    **Switch point for a transport-level `isError`**: if conclair ever grows a
+    genuine transport ``isError`` flag on the envelope (parity with the MCP
+    ``CallToolResult.isError`` bit :func:`parse_tool_result` already honours),
+    that flag becomes the primary detector and this function's body reduces to
+    "trust the flag". Change happens in one place — here — precisely because the
+    detection has always been centralised at the client boundary.
     """
     if not isinstance(payload, dict):
-        return None
+        return False
     error_type = payload.get("error_type")
-    if not isinstance(error_type, str) or not error_type:
+    return isinstance(error_type, str) and bool(error_type)
+
+
+# §3 constants. Names, not magic numbers, so a future edit that thinks it is
+# "just relaxing the cap" reads what it is undoing (values must not leak
+# unbounded into an exception message — Einstein's msg-1687 concern).
+_ELEVATION_VALUE_LIMIT = 200
+"""Max characters of ``error_type`` / ``error`` retained in the elevation
+exception message. §3.4."""
+
+_ELEVATION_TRUNCATION_MARKER = "…[truncated]"
+"""Appended after a truncated value so a reader knows the log line is not the
+whole story. §3.4."""
+
+
+def _elevation_snippet(payload: dict[str, Any], key: str) -> str | None:
+    """The truncated string value of ``payload[key]``, or ``None`` if not a string.
+
+    Per §3.2-3.4: only string values of ``error_type`` and ``error`` are ever
+    admitted to the elevation message; anything non-string produces ``None`` and
+    the value is omitted entirely (its key still appears in the key list —
+    diagnostics come from *shape*, not from stringifying arbitrary payload
+    values). This is the single formatting site referenced by §3's "the
+    exception's constructor decides what may be shown" — the ``report_observed``
+    warning stringifies the exception, it does not re-derive values from the
+    payload, so this cap governs every log line downstream.
+    """
+    raw = payload.get(key)
+    if not isinstance(raw, str):
         return None
-    message = payload.get("error")
-    return f"{error_type}: {message}" if isinstance(message, str) and message else error_type
+    if len(raw) <= _ELEVATION_VALUE_LIMIT:
+        return raw
+    return raw[:_ELEVATION_VALUE_LIMIT] + _ELEVATION_TRUNCATION_MARKER
+
+
+def _elevation_message(payload: Any) -> str:
+    """Compose the :class:`MagickitMcpError` message for an elevated envelope.
+
+    The message is bounded by construction (§3 rules): a sorted list of the
+    payload's top-level key names (bare names, no recursion, no values), plus
+    the truncated string values of ``error_type`` and ``error`` when — and only
+    when — they are strings. **No other key's value is ever included** — this
+    is what msg-1688 §5's "no ``repr(payload)`` / ``json.dumps(payload)``"
+    forbids in one place, so no second formatter can grow that habit anywhere
+    downstream.
+
+    Callers pass raw ``payload`` (not ``dict``) so that a mis-shaped input still
+    yields *some* diagnostic message rather than an ``AttributeError`` — the
+    only path through :func:`raise_if_envelope` goes through :func:`is_envelope`
+    which has already narrowed to ``dict`` in practice, but the fallback keeps
+    an accidental direct call from raising an unrelated exception type.
+    """
+    if not isinstance(payload, dict):
+        return f"magickit tool returned an error envelope: {type(payload).__name__} payload"
+    keys = sorted(payload.keys())
+    parts = [f"keys={keys}"]
+    type_snippet = _elevation_snippet(payload, "error_type")
+    if type_snippet is not None:
+        parts.append(f"error_type={type_snippet!r}")
+    err_snippet = _elevation_snippet(payload, "error")
+    if err_snippet is not None:
+        parts.append(f"error={err_snippet!r}")
+    return "magickit tool returned an error envelope: " + " ".join(parts)
+
+
+def envelope_error(payload: Any) -> str | None:
+    """Back-compat shim: the elevation message iff ``payload`` is an envelope, else ``None``.
+
+    Kept because several tests introspect the string form of the elevation.
+    New code should call :func:`raise_if_envelope` or read
+    :func:`_elevation_message` directly.
+    """
+    if not is_envelope(payload):
+        return None
+    return _elevation_message(payload)
 
 
 def raise_if_envelope(payload: Any) -> None:
@@ -97,10 +184,17 @@ def raise_if_envelope(payload: Any) -> None:
     function is what the DoD #3 rule "the fake is raised from the measured
     envelope shape" means in code -- there is no second, drifting definition
     of "envelope" for tests to fall out of sync with.
+
+    The exception message is constructed by :func:`_elevation_message` under
+    msg-1688 §3's rules (top-level key names, plus ``error_type`` / ``error``
+    string values truncated at :data:`_ELEVATION_VALUE_LIMIT`, and nothing
+    else). Formatting lives on the exception-construction side so downstream
+    log sites — notably ``LoopControlReader.report_observed`` — stringify the
+    exception rather than re-format the payload, keeping the value-safety
+    rule in one place.
     """
-    failure = envelope_error(payload)
-    if failure is not None:
-        raise MagickitMcpError(f"magickit tool returned an error envelope: {failure}")
+    if is_envelope(payload):
+        raise MagickitMcpError(_elevation_message(payload))
 
 
 def parse_tool_result(result: Any) -> Any:
@@ -155,29 +249,101 @@ def _first_json_block(result: Any) -> Any:
     return _MISSING
 
 
+# msg-1685 §2: the responsibility for wrapping a transport failure into
+# :class:`MagickitMcpError` sits with :meth:`StreamableHttpChatroomMcp.call_tool`
+# (not the ``report_observed`` catch, which stays a plain ``except
+# MagickitMcpError``). The list is name-catched — deliberately not ``except
+# Exception`` — so a programming bug (``TypeError`` from a mis-shaped call,
+# ``KeyError`` from a typo, …) propagates rather than being silently converted
+# to an "MCP failure". If a genuine transport error class leaks through this
+# tuple in production, the fix is here — extend the tuple — not to widen the
+# call-site catch. The order constraint (msg-1685 §2 last bullet) is that any
+# tuple extension lands with the failing test in the same PR.
+#
+# Coverage of the enumerated classes:
+#   - ``httpx.HTTPError``      → connect / read / status / timeout / DNS
+#     (parent of ``ConnectError``, ``ReadError``, ``TimeoutException``,
+#     ``HTTPStatusError``, ``NetworkError``, …).
+#   - ``OSError``              → socket-level / filesystem-adjacent transport
+#     faults that surface below httpx (e.g. broken pipe).
+#   - ``TimeoutError``         → the Py 3.11 builtin (``asyncio.TimeoutError``
+#     aliases it); anyio's cancellation-based timeouts land here.
+#   - ``json.JSONDecodeError`` → non-JSON body that slips past the mcp
+#     transport into user code (``parse_tool_result`` also handles bad JSON in
+#     content blocks, but a top-level decode failure at the transport is a
+#     different edge and worth being explicit).
+#   - ``McpError``             → mcp protocol-level error (server returned a
+#     JSON-RPC error object).
+#   - ``StreamableHTTPError``  → mcp transport-level error (streamable-http
+#     specific).
+_TRANSPORT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    httpx.HTTPError,
+    OSError,
+    TimeoutError,
+    json.JSONDecodeError,
+    McpError,
+    StreamableHTTPError,
+)
+
+
+def _wrap_transport_error(name: str, exc: BaseException) -> MagickitMcpError:
+    """Uniform :class:`MagickitMcpError` from a transport-class ``exc``.
+
+    Includes the exception class name so a log reader can tell "timeout" apart
+    from "connection refused" without opening the traceback. ``from exc``
+    preserves the chain for tracebacks; the string form stays short.
+    """
+    return MagickitMcpError(f"magickit MCP call {name!r} failed: {type(exc).__name__}: {exc}")
+
+
 class StreamableHttpChatroomMcp:
     """:class:`McpToolCaller` over the ``mcp`` Streamable HTTP transport.
 
     Connects per call (Phase 1; low volume). A persistent session is a
     Phase 2 optimization. **Real network I/O — covered by the ``-m manual``
     smoke test, not CI.**
+
+    Overriding :meth:`_call_mcp` in a subclass is the seam the DoD #3 transport
+    contract tests use to inject each named exception class; production
+    :meth:`call_tool` is what verifies each of those is wrapped into
+    :class:`MagickitMcpError`.
     """
 
     def __init__(self, url: str | None = None) -> None:
         self._url = url if url is not None else magickit_mcp_url()
 
+    async def _call_mcp(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Open a transport, initialise a session, invoke the tool, return the raw result.
+
+        Extracted from :meth:`call_tool` so the tuple of caught exception classes
+        in :meth:`call_tool` is the *only* place transport-vs-programming errors
+        are distinguished. Tests inject failures by overriding this method
+        rather than by monkey-patching the ``mcp`` package.
+        """
+        async with (
+            streamablehttp_client(self._url) as (read, write, _),
+            ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+            return await session.call_tool(name, arguments)
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        # ``except*`` is used deliberately (not a bare ``except``): the mcp
+        # streamable-http transport uses anyio task groups internally, so a raw
+        # transport failure may reach us wrapped in an :class:`ExceptionGroup`
+        # rather than as itself. ``except*`` matches both cases uniformly. A
+        # non-transport exception (``TypeError``, ``KeyError``, …) inside the
+        # group propagates as an :class:`ExceptionGroup` — not swallowed, and
+        # still recognisable as a programming bug by the runtime — which is
+        # exactly the "programming errors escape" invariant msg-1685 §2
+        # required. :class:`MagickitMcpError` raised by :func:`parse_tool_result`
+        # below the try (envelope elevation / ``isError``) is out of scope
+        # here and propagates unchanged.
         try:
-            async with (
-                streamablehttp_client(self._url) as (read, write, _),
-                ClientSession(read, write) as session,
-            ):
-                await session.initialize()
-                result = await session.call_tool(name, arguments)
-        except MagickitMcpError:
-            raise
-        except Exception as exc:
-            raise MagickitMcpError(f"magickit MCP call {name!r} failed: {exc}") from exc
+            result = await self._call_mcp(name, arguments)
+        except* _TRANSPORT_EXCEPTIONS as group:
+            first = next(iter(group.exceptions))
+            raise _wrap_transport_error(name, first) from first
         return parse_tool_result(result)
 
 
@@ -186,6 +352,7 @@ __all__ = [
     "McpToolCaller",
     "StreamableHttpChatroomMcp",
     "envelope_error",
+    "is_envelope",
     "magickit_mcp_url",
     "parse_tool_result",
     "raise_if_envelope",
