@@ -689,10 +689,6 @@ class TestD38UserPrompt:
 
 
 class TestPromptVersion:
-    def test_prompt_version_is_a_module_level_string(self) -> None:
-        assert isinstance(PROMPT_VERSION, str)
-        assert PROMPT_VERSION
-
     def test_last_extras_reports_the_prompt_version_verbatim(self) -> None:
         runner = FakeRunner(result=SubprocessResult(0, _cli_json_bytes(), b""))
         composer = ClaudeCodeComposer(runner=runner)

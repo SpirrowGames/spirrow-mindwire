@@ -787,21 +787,44 @@ Coverage:
 5. D-38 tail rendering — user prompt contains every tail body, capped
    at `body_cap` when a body exceeds it, and both cap markers and the
    `--- msg-<id> by <author> ---` separators appear.
-6. Prompt version — `PROMPT_VERSION` constant is a module-level string
-   ("2" as of the v2 revision), and the extras key `prompt_version`
-   reports its value verbatim. The test asserts the SHAPE of the value,
-   not the literal "2", so a future bump does not break it.
+6. Prompt version — `PROMPT_VERSION` is a module-level string ("2" as of
+   the v2 revision) and the extras key `prompt_version` reports its
+   value verbatim. There is deliberately NO standalone shape test for
+   this constant (D-54 rev2): it is strictly subsumed, twice over.
+   Statically, `PROMPT_DIGESTS` is annotated `Mapping[str, str]`, so
+   under mypy strict a non-`str` version is a type error at the indexing
+   site in `TestPromptDigestPin` — caught before any test runs.
+   Dynamically, any value that is not one of the mapping's keys —
+   including `""` and a value with stray whitespace — fails that test's
+   membership assertion.
+
+   Be precise about what that assertion proves: it proves
+   `PROMPT_VERSION` EQUALS a key of `PROMPT_DIGESTS`. It does NOT prove
+   the value is an instance of `str`; that holds only because every key
+   is a `str`, which is what the annotation fixes. **The
+   `Mapping[str, str]` annotation is therefore load-bearing and must not
+   be weakened to `dict`, `Mapping[Any, str]` or an unannotated literal.**
+   Weakening it removes the static half of the net silently, leaving
+   nothing that names the constant's type.
+
+   The verbatim-reporting half of this criterion is enforced by the
+   extras tests, not by any assertion on the constant's shape, and is
+   unaffected by the v2 revision.
+
 6a. **Prompt digest pin (D-49, maintenance rule D-54)** —
     `TestPromptDigestPin` asserts `PROMPT_VERSION` has a row in
     `PROMPT_DIGESTS`, then computes
     `sha256(_SYSTEM_PROMPT.encode('utf-8')).hexdigest()` and asserts it
     equals `PROMPT_DIGESTS[PROMPT_VERSION]`. This is the ONLY new test
     introduced by the v2 revision (msg-1442 §28.6) and it remains a
-    single test at every future version. Content-oriented assertions on
-    the prompt text are DELIBERATELY not added: the stub backend does
-    not exercise the real LLM, so any test at this layer that claimed
-    to verify prompt compliance would be a false comfort (§28.6, §14
-    / §24 same-shape principle).
+    single test at every future version. The suite count is net
+    unchanged: the shape test that previously guarded `PROMPT_VERSION`
+    was REMOVED in the same change as strictly subsumed (see 6) — it was
+    not lost. Content-oriented assertions on the prompt text are
+    DELIBERATELY not added: the stub backend does not exercise the real
+    LLM, so any test at this layer that claimed to verify prompt
+    compliance would be a false comfort (§28.6, §14 / §24 same-shape
+    principle).
 7. `compose_once` propagates `last_extras` to envelope.extras when the
    composer has that attribute (duck-typed); envelopes from
    `StubComposer` remain empty extras.
