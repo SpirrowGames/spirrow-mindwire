@@ -91,7 +91,7 @@ U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれ�
 - **D-9（OBL-DECLARE-UNREADABLE は改訂しない）** E-9 の逐語移設 entry には触れない。unreadable 宣言義務の trigger 拡張分は `OBL-SPEC-PIN` の body 側に書く（§4-1 末尾）。逐語移設 entry を net-new の都合で動かすと、その entry が守っている不変条件の意味が薄まる。
 - **D-10（verify.py は gate ではない）** `verify.py` は診断ツールであり、CI gate にしない。`main` 上での検出は **warning** に降格し、exit code に影響させない。
 - **D-11（G-4 は機構ではなく規律）** E-6 のとおり Organization ruleset が `main` への直接 push と force-push を機構として拒否している。**しかし「merge を実行する主体が human であること」だけは ruleset が区別できない** ∴ その一点は規律で担保する。そして本仕様はマージを機構で強制しない — 本仕様は**マージ手順に一切触れない**。implementer に `gh pr merge` を実行させる記述を、本仕様およびその実装から出してはならない（E-8: セッションが halt する）。PR を開くところまでが implementer の仕事であり、merge は human の Tier-C である。
-- **D-12（bootstrap は NO-PIN で始まる）** I-1 と I-2 は、pin 機構がまだ存在しない状態で実行される ∴ その 2 ターンは `NO-PIN` であり、payload は D-2 経路の msg 本文そのものである。これは違反ではなく設計どおりの挙動であり、receipt は `NO-PIN` と書くのが正しい。なお pin は repo 境界を越えない（D-22）。他 repo を対象とする item は本機構では扱わず、対象 repo 自身の spec として発行する。
+- **D-12（bootstrap は NO-PIN で始まる）** I-1 と I-2 は、pin 機構がまだ存在しない状態で実行される ∴ その 2 ターンは `NO-PIN` であり、payload は D-2 経路の msg 本文そのものである。これは違反ではなく設計どおりの挙動である。**その 2 ターンの reason code は `ABSENT` であり（§3 手順 1）、receipt は素の `NO-PIN` ではなく §4-2 の書式で書く — `NO-PIN/<reason code>` の code は省略できない。** `ABSENT` は続行が sanctioned な唯一の code である ∴ §4-2 が並べる 2 形のうち続行側を書く（D-24）。なお pin は repo 境界を越えない（D-22）。他 repo を対象とする item は本機構では扱わず、対象 repo 自身の spec として発行する。
 - **D-13（第一号実運用対象）** pin つき dispatch の第一号実運用対象は **`T-pr-gate-adr-index-scope`** とする（`T-loop-readable-obligations` は PR #135 で完了・close 済みのため対象から外す）。
 - **D-14（到達性判定と遅延 fetch）** pin の `commit` が `origin/main` から到達可能であることを確認する。この検査は「pin が指す spec は human が merge したものである」を機械的に担保する唯一の経路である。E-6 の ruleset は PR を経由することまでは強制するが**主体が human であることは強制しない** ∴ この検査を外さない。ネットワーク規律は次のとおり:
   - **肯定側は fetch しない。** ローカルの `origin/main` から到達可能なら `RESOLVED` に進む（古い `origin/main` の祖先である commit は、より新しい `origin/main` の祖先でもある ∴ 肯定判定は陳腐化しない。main が force-push で書き換えられないことを前提とする。**この前提は Organization ruleset の `non_fast_forward` が機構として守っている**（E-6）— r7 以前の本行は「E-6 により機構では守れない ∴ D-11 と同じく規律である」と書いていたが、それは過小申告であった）。
@@ -453,9 +453,9 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 
 本節は item でない段のみを述べる。
 
-- **I-1 と I-2 は `NO-PIN` ターンである**（D-12）。pin 機構がまだ存在しないため、payload は D-2 経路で運ばれた本文書の本文そのものであり、receipt は `NO-PIN` と書くのが正しい。
+- **I-1 と I-2 は `NO-PIN` ターンである**（D-12）。pin 機構がまだ存在しないため、payload は D-2 経路で運ばれた本文書の本文そのものであり、reason code は `ABSENT` である（§3 手順 1）。**receipt は素の `NO-PIN` ではなく §4-2 の書式で書く** — `NO-PIN/<reason code>` の code は省略できず、`ABSENT` は続行側の形である（D-24）。
 - **I-2 の merge が Tier-C である。** human は本文を一字も変えずに merge する（D-2 手順 3）。merge した時点で本 manifest は `origin/main` 上に存在し、pin から参照可能になる。**merge 前後で `status` を書き換えない**（D-18: merge 済みか否かは git が知っている）。
 - **merge 後、本 manifest は immutable である**（D-19）。訂正・改訂は新しい spec を起こし `supersedes` で繋ぐ。古い側のファイルは書き換えない（D-20）。
-- **I-3 以降は pin つき dispatch で実行する。** ここから receipt は `RESOLVED` になる。
+- **I-3 以降は pin つき dispatch で実行する。** ここから pin の状態は `RESOLVED` になり、receipt は §4-2 の `RESOLVED` 形で書く — 素の `RESOLVED` ではなく、`spec_id` ／ `blob_sha` 先頭 12 ／ `path` を伴う 1 行である。
 - 各 item の PR は `feature/*` → 当該 item の `base_branch`（E-7）。**merge は常に human（Tier-C）**であり、E-6 の ruleset は PR を経由することまでしか強制しない（主体が human であることは強制しない）∴ 規律である（D-11）。
 - pin つき dispatch の第一号実運用対象は **`T-pr-gate-adr-index-scope`**（D-13）。
