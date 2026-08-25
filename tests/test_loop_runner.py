@@ -51,6 +51,7 @@ from spirrow_mindwire.loop_runner import (
     build_watches,
     run_conductor,
 )
+from spirrow_mindwire.magickit.client import MagickitMcpError
 from spirrow_mindwire.magickit.watcher import WatchSpec
 from spirrow_mindwire.naysayer.pr_review import NaysayerPrReviewDriver
 from spirrow_mindwire.obligations import load_manifest
@@ -130,7 +131,13 @@ class _FakeMcp:
             return {"msg": {"msg_id": msg_id}}
         if name in ("loop_control_get", "loop_control_report_observed"):
             if self._control_state is None:
-                raise ConnectionError(f"{name}: control plane unreachable")
+                # Production wraps every transport failure into ``MagickitMcpError`` at the client
+                # boundary (``StreamableHttpChatroomMcp.call_tool``), so a fake that raises the raw
+                # underlying ``ConnectionError`` puts a class no caller can catch on the wire.
+                # Under msg-1496 §4.1's narrow catch, the older ``ConnectionError`` fake leaked out
+                # of ``report_observed``; using the class production actually produces keeps the
+                # simulation faithful without hiding the failure.
+                raise MagickitMcpError(f"{name}: control plane unreachable")
             if name == "loop_control_get":
                 return {"desired_state": self._control_state, "configured": True}
             self.observed.append(str(arguments["state"]))

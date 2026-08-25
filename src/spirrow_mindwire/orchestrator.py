@@ -19,7 +19,6 @@ chain / a ``scripts/naysayer_review.py`` run / a future PR-event hook).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef, parse_pr_ref
 from .magickit.client import MagickitMcpError, McpToolCaller
@@ -38,42 +37,6 @@ class ThreadIdCollisionError(RuntimeError):
     and produces nothing rather than appending a critique to a thread whose title,
     history and close-predicate belong to something else.
     """
-
-
-def _envelope_error(payload: Any) -> str | None:
-    """The failure described by a chatroom payload, or ``None`` if it is not one.
-
-    conclair does not raise when a chatroom call is refused. It answers with an
-    ordinary **success** response whose body is an error envelope::
-
-        {"error_type": "ChatroomNotFoundError",
-         "error": "Thread 'T-pr-review-spirrow-magickit-22' not found in project '...'",
-         "details": {"project": "...", "thread_id": "..."}}
-
-    ``isError`` is not set, so :func:`~spirrow_mindwire.magickit.client.parse_tool_result`
-    finds JSON, returns it, and every ``except MagickitMcpError`` below is simply
-    never reached. ``chatroom_open_thread``'s own MCP docstring says as much --
-    *"On success: {...}. On failure: conclair error envelope {...}"* -- so the
-    contract those handlers were written against never existed.
-
-    What that cost, measured on the live server (2026-08-16): a thread that is
-    **not there** came back as a payload without a ``"thread"`` key, which
-    :meth:`PrReviewOrchestrator._thread_subject` read as "exists, but names no PR"
-    -- the one answer that blocks. So the gate refused every PR that did not
-    already own a ledger thread, which is every *new* PR. It first fired on
-    ``spirrow-magickit#22`` and had to be worked around by hand.
-
-    Detection is by ``error_type`` rather than by the absence of an expected key:
-    "this call failed" is a fact the far end states, and inferring it from a
-    missing field is how "absent" became "unidentifiable" in the first place.
-    """
-    if not isinstance(payload, dict):
-        return None
-    error_type = payload.get("error_type")
-    if not isinstance(error_type, str) or not error_type:
-        return None
-    message = payload.get("error")
-    return f"{error_type}: {message}" if isinstance(message, str) and message else error_type
 
 
 def _qualified_thread_id(prefix: str, pr: PrRef) -> str:
@@ -194,38 +157,11 @@ class PrReviewOrchestrator:
         self._thread_prefix = thread_prefix
         self._naysayer_author = naysayer_author
 
-    async def _call(self, name: str, arguments: dict[str, Any]) -> Any:
-        """Call one chatroom tool, raising :class:`MagickitMcpError` if it was refused.
-
-        Every chatroom call this class makes goes through here, so "the far end
-        raises when it says no" -- which the handlers in :meth:`_thread_subject` and
-        :meth:`_open_thread` are written against, and which :func:`_envelope_error`
-        shows is not true of the transport -- becomes true at this boundary.
-
-        The scope is deliberately this class and not the client. Six other call
-        sites read the same envelopes as successes (two in ``conductor/core``, two
-        in ``conductor/control``, one each in ``magickit/watcher`` and
-        ``magickit/gateway``) and raising there changes six behaviours at once; that
-        is its own change, and it should be reviewed by a working gate rather than
-        merged past a broken one. Nothing outside :class:`PrReviewOrchestrator`
-        moves here.
-
-        All three of this class's calls are wrapped, not just the read that was
-        failing. Fixing only :meth:`_thread_subject` makes :meth:`_open_thread`
-        reachable for the first time since the envelope was introduced -- and on the
-        same measurement, ``chatroom_open_thread`` and ``chatroom_post_message``
-        answer a refusal with an envelope too. A failed open would then be read as
-        success, the critique posted into a thread that does not exist would be read
-        as success as well, and the driver would go on to submit the GitHub review:
-        a verdict on the PR with no ledger entry anywhere, reported as a clean run.
-        That trades today's loud failure for a silent one on the branch the fix
-        re-opens, so the read and the two writes are corrected together.
-        """
-        payload = await self._mcp.call_tool(name, arguments)
-        failure = _envelope_error(payload)
-        if failure is not None:
-            raise MagickitMcpError(f"magickit tool {name!r} failed: {failure}")
-        return payload
+    # The class-local ``_call`` helper #150 added is gone: envelope→exception now
+    # lives one layer down in :func:`~spirrow_mindwire.magickit.client.parse_tool_result`
+    # (T-error-envelope-read-as-data DoD #2). Keeping a duplicate here after the
+    # boundary raise would mean two places to maintain the same contract and one of
+    # them silently going stale — the exact pattern msg-1115 §4 asked to remove.
 
     async def fire_pr_review(
         self,
@@ -289,7 +225,7 @@ class PrReviewOrchestrator:
                     project=project, thread_id=thread_id, title=title, propose=propose, pr=pr
                 )
                 opened = True
-            await self._call(
+            await self._mcp.call_tool(
                 "chatroom_post_message",
                 {
                     "project": project,
@@ -365,9 +301,9 @@ class PrReviewOrchestrator:
         found" in an error envelope carried by a *successful* response, so the
         ``except`` below never ran and every absent thread arrived here as a payload
         with no ``"thread"`` key — i.e. as the unidentified answer, which blocks. The
-        gate therefore refused every PR that did not already own a ledger thread.
-        :meth:`_call` now turns that envelope into the exception this was always
-        written for; see :func:`_envelope_error` for the measurement.
+        gate therefore refused every PR that did not already own a ledger thread. The
+        client's :func:`~spirrow_mindwire.magickit.client.parse_tool_result` now
+        turns that envelope into the exception this was always written for.
 
         Only the thread's **opening** message and its title are read as statements
         of which PR this is. Those are the two the gate itself writes when it opens
@@ -422,7 +358,7 @@ class PrReviewOrchestrator:
         matters exactly where it did shrink.
         """
         try:
-            payload = await self._call(
+            payload = await self._mcp.call_tool(
                 "chatroom_get_thread",
                 {"project": project, "thread_id": thread_id, "mode": "full"},
             )
@@ -468,11 +404,12 @@ class PrReviewOrchestrator:
 
         Re-reviewing the same PR reuses its existing thread: conclair rejects a duplicate
         ``thread_id`` with a ``ChatroomIntegrityError`` ("... already exists in project ...",
-        returned as an error envelope and surfaced here as a :class:`MagickitMcpError` by
-        :meth:`_call`). Only that condition is swallowed — any other open error re-raises
-        (no masking), mirroring the driver's 422→COMMENT fallback. Before :meth:`_call` the
-        envelope was read as a successful open, so *every* refusal was swallowed, including
-        the ones this is careful to re-raise.
+        returned as an error envelope and surfaced by
+        :func:`~spirrow_mindwire.magickit.client.parse_tool_result` as a
+        :class:`MagickitMcpError`). Only that condition is swallowed — any other open error
+        re-raises (no masking), mirroring the driver's 422→COMMENT fallback. Before the client
+        raised on the envelope the refusal was read as a successful open, so *every* refusal
+        was swallowed, including the ones this is careful to re-raise.
 
         The swallow is **conditional on the existing thread being this PR's**. Unconditional,
         it turned an id clash into a silent write into someone else's ledger; conclair accepts
@@ -487,7 +424,7 @@ class PrReviewOrchestrator:
         ordinary re-review of an open PR.
         """
         try:
-            await self._call(
+            await self._mcp.call_tool(
                 "chatroom_open_thread",
                 {
                     "project": project,

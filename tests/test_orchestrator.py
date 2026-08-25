@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent, ReviewInfo
-from spirrow_mindwire.magickit.client import MagickitMcpError
+from spirrow_mindwire.magickit.client import MagickitMcpError, raise_if_envelope
 from spirrow_mindwire.magickit.watcher import ChatroomWatcher, WatchSpec
 from spirrow_mindwire.naysayer.pr_review import PostCritique, PrReviewOutcome
 from spirrow_mindwire.orchestrator import (
@@ -86,7 +86,17 @@ def _already_exists(thread_id: str, project: str = "p") -> dict[str, Any]:
 
 
 class _FakeMcp:
-    """Records call_tool invocations; returns programmed results by tool name."""
+    """Records call_tool invocations; returns programmed results by tool name.
+
+    Mimics the *client boundary*, not the raw transport. Production goes
+    :class:`StreamableHttpChatroomMcp.call_tool` → :func:`parse_tool_result` →
+    :func:`raise_if_envelope`, so any scripted payload shaped like a conclair
+    error envelope is elevated to :class:`MagickitMcpError` **here**, before
+    the caller sees it — otherwise the fake advertises a contract the live
+    server does not (the exact regression #150 shipped past). Explicit
+    ``raise_on`` still exists for transport failures, which occur before a
+    payload exists at all.
+    """
 
     def __init__(
         self,
@@ -106,13 +116,17 @@ class _FakeMcp:
             raise self._raise_on[name]
         if name == "chatroom_get_thread" and name not in self._results:
             # A thread nobody programmed is a thread that is not there, and the far end
-            # says so with an envelope inside a success response, not by raising.
-            return _not_found(arguments)
-        result = self._results.get(name, {})
-        # A programmed result may be a callable so one fake can answer
-        # `chatroom_get_thread` differently per thread_id (which is the whole
-        # point of the collision tests below).
-        return result(arguments) if callable(result) else result
+            # says so with an envelope inside a success response — which the client
+            # then elevates to MagickitMcpError before the caller sees it.
+            payload = _not_found(arguments)
+        else:
+            result = self._results.get(name, {})
+            # A programmed result may be a callable so one fake can answer
+            # `chatroom_get_thread` differently per thread_id (which is the whole
+            # point of the collision tests below).
+            payload = result(arguments) if callable(result) else result
+        raise_if_envelope(payload)
+        return payload
 
     def args_for(self, name: str) -> dict[str, Any]:
         return next(args for n, args in self.calls if n == name)

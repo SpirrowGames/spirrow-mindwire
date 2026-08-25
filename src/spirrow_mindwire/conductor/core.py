@@ -581,6 +581,17 @@ class Conductor:
         return _roster_role(self._roster, author)
 
     async def _fetch_messages(self) -> list[dict[str, Any]]:
+        # T-error-envelope-read-as-data (msg-1115 §2): a refused read used to
+        # come back as an error envelope inside a nominally-successful response,
+        # ``result.get("messages", [])`` yielded ``[]``, ``run`` saw an empty
+        # thread and stopped on :attr:`StopReason.EMPTY` with no trace of the
+        # refusal. The client now elevates the envelope to
+        # :class:`MagickitMcpError` (parse_tool_result), so a refusal surfaces
+        # as an exception at ``call_tool`` and cannot be mistaken for "no
+        # messages yet". The ``isinstance(result, dict)`` defence below is kept
+        # for a *different* class of bug (a well-formed but oddly-shaped
+        # response); the envelope path used to hide inside it and no longer
+        # does.
         result = await self._mcp.call_tool(
             "chatroom_get_thread",
             {

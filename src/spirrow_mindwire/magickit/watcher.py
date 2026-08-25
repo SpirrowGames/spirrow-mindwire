@@ -142,6 +142,16 @@ class ChatroomWatcher:
         return dispatched
 
     async def _fetch_messages(self, watch: WatchSpec) -> list[Any]:
+        # T-error-envelope-read-as-data (msg-1115 §1 row 6): a refused read
+        # used to arrive as an error envelope inside a nominally-successful
+        # response, ``result.get("messages", [])`` yielded ``[]``, and the poll
+        # ran to completion having dispatched nothing — a broken transport
+        # indistinguishable from a quiet thread. The client now elevates the
+        # envelope to :class:`MagickitMcpError` at ``parse_tool_result``, so a
+        # refusal raises here and :meth:`run`'s ``except Exception`` logs it
+        # and continues (the whole point of that swallow — a transient chatroom
+        # read error must not kill the watcher). The ``isinstance`` defence is
+        # kept for a *different* class of bug.
         result = await self._mcp.call_tool(
             "chatroom_get_thread",
             {

@@ -18,6 +18,7 @@ from spirrow_mindwire.conductor.core import Conductor, ConductorDispatcher, Stop
 from spirrow_mindwire.dispatcher.core import Dispatcher
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
 from spirrow_mindwire.github.client import CiState, ReviewEvent
+from spirrow_mindwire.magickit.client import MagickitMcpError, raise_if_envelope
 from spirrow_mindwire.magickit.gateway import MagickitChatroomGateway
 from spirrow_mindwire.naysayer.pr_review import PrReviewOutcome
 from spirrow_mindwire.ports import SpawnContext
@@ -1173,6 +1174,63 @@ class _ScriptedAdapter:
 
     async def health(self, handle: SessionHandle) -> HealthStatus:
         return HealthStatus(state=SessionState.IDLE, last_active_at=_TS, error=None, details={})
+
+
+# --------------------------------------------------------------------------- #
+# T-error-envelope-read-as-data DoD #3: _fetch_messages raises on a refusal,
+# rather than presenting a broken read as an empty thread (msg-1115 §2 row 4).
+# --------------------------------------------------------------------------- #
+
+
+class _EnvelopeOnGetThreadMcp:
+    """A chatroom whose ``chatroom_get_thread`` refuses with a verbatim envelope.
+
+    The envelope shape is the one measured against the live server on
+    2026-08-16 (see :func:`_error_envelope` in tests/test_orchestrator.py);
+    running it through :func:`raise_if_envelope` mirrors production, where
+    :func:`~spirrow_mindwire.magickit.client.parse_tool_result` performs the
+    elevation before returning. DoD #3 requires the fake be built from the
+    measured shape rather than a hand-imagined "exception on unknown id",
+    which is exactly the fiction #150 shipped past.
+    """
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        if name == "chatroom_get_thread":
+            raise_if_envelope(
+                {
+                    "error_type": "ChatroomNotFoundError",
+                    "error": ("Thread 'T-cond' not found in project 'spirrow-mindwire'"),
+                    "details": {
+                        "project": arguments["project"],
+                        "thread_id": arguments["thread_id"],
+                    },
+                }
+            )
+        raise AssertionError(f"unexpected tool {name!r}")  # pragma: no cover
+
+
+@pytest.mark.anyio
+async def test_fetch_messages_raises_on_error_envelope_instead_of_returning_empty() -> None:
+    """Row 4 of msg-1115 §1: an envelope must not disguise as an empty thread.
+
+    Before elevation, ``result.get("messages", [])`` yielded ``[]`` on any
+    envelope-shaped response, ``run`` saw a thread with no messages and
+    stopped on :attr:`StopReason.EMPTY` — a stop indistinguishable from a
+    quiet thread. Under elevation the client raises, so the conductor's own
+    ``run`` propagates the failure to its caller (the daemon) rather than
+    reporting an all-green EMPTY it never actually observed.
+    """
+    disp = _ScriptedDispatcher(_FakeChatroomMcp(), {})
+    conductor = Conductor(
+        mcp=_EnvelopeOnGetThreadMcp(),
+        dispatcher=disp,
+        thread_ref=_thread_ref(),
+        roster=_ROSTER,
+        naysayer_identity="Einstein",
+    )
+    with pytest.raises(MagickitMcpError, match="ChatroomNotFoundError"):
+        await conductor.run()
+    assert disp.dispatches == []  # no round proceeded past the failed read
 
 
 @pytest.mark.anyio
