@@ -109,13 +109,17 @@ U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれ�
 - **D-22（1 spec = 1 target repo）** spec ファイルは、それが置かれている repo に対してのみ authoritative である。`target_repo` はそのファイルを収める repo と一致しなければならず（`verify.py` の V-11 が照合する）、item 側で上書きできない（V-12）。N repo に跨る設計は N 本の spec になり、共通の `design_id`（スレッド id）と、名前だけの `siblings` で結ぶ。sibling は pin で結ばない（結べない — pin は local object DB を引くため、他 repo の commit はそこに無い）。列挙は人間向けであって解決機構ではない。棄却した代替 3 案（cross-repo だけ `NO-PIN` ＋全文インライン／spec blob の vendor 複製／対象 repo から他 repo の object を fetch）の論拠は thread に残す（D-1）。
 - **D-23（I-5 は withdrawn にする）** I-5 は D-22 違反 ∴ item 側 `status: withdrawn` ＋ `withdrawn_reason` とする。削除しないのは、なぜ消えたかが残る方が将来の再提案を防ぐからである。D-18 が enum に `withdrawn` を残したのはこの用途である。
 - **D-24（`NO-PIN` を 2 クラスに割る — 分割は §3 の 11 code 全体を覆う）**
-  - **ABSENT** — `.mindwire/pin` が存在しない（§3 手順 1）。**ABSENT クラスに属するのはこの 1 code のみである。** D-12 のブートストラップ窓（spec が `main` に未着）に限り sanctioned であり、message body のみで作業してよい。**窓の外で `ABSENT` を引いた場合は sanctioned ではない** ∴ FAULT と同じく停止して報告する。
+  - **ABSENT** — `.mindwire/pin` が存在しない（§3 手順 1）。**ABSENT クラスに属するのはこの 1 code のみである。** D-12 のブートストラップ窓（spec が `main` に未着）はこの code で運ばれる ∴ 窓の中では sanctioned であり、message body のみで作業してよい。
+  - **`ABSENT` は bootstrap 窓の外を gate しない。** 窓の内と外は agent の作業ツリーから区別できない ∴ 義務文は `ABSENT` を「message body で続行してよい唯一の code」として**無条件に**符号化しており（§4-1 body ¶3）、A-26 はその一意性を釘付けにしている。これが本機構の実挙動であり、本決定はそれを言い換えない。**dispatcher が pin を書き忘れたターンは、窓の中のターンと同じ経路で続行する。**
+  - **なぜ gate できないか（根）。** **untracked ファイルの不在は、作業ツリーの内側から反証できない。**「pin は一度も発行されなかった」と「発行すべき者が書き忘れた」は、agent に見える範囲で**バイト単位に同一の痕跡**しか残さない。他の 10 code は「pin という物証」から推論されるが、`ABSENT` だけは物証を持たない。∴ **repo の状態から窓を推定する解法の一族は全滅する。** 例えば「本 manifest が `origin/main` に在るか」は判定できるが、E-10（同じ pin ファイルは他 repo のクローンにも現れる）と §4-1 body の `a repository that does not carry that document changes none of your duties here` により、本書を永久に持たない repo では述語が恒偽になり、**窓が恒久的に開いたままになる** — 判定可能だが誤りである。窓を閉じる材料は repo 側ではなく、**pin を書く側（チャネル）**に置くしかない。
+  - **補償統制は §4-2 であり、gate ではない。** `OBL-SPEC-RECEIPT` は実装作業を行った／試みたすべてのターンの冒頭に receipt を強制する ∴ 窓外の `ABSENT` も毎回 `SPEC (pin: NO-PIN/ABSENT) — worked from message body only` として**出力の 1 行目に現れる**。性質は「**常に検出され、決して阻止されない**」である。残余リスクは「その 1 行を読む者が要る」ことであって、「誰も知らない」ことではない。**この行を静音化してはならない** — 静音化した瞬間、本決定の譲歩は無言の穴に変わる。
+  - **硬化は本書の外で行う。** 根を断つのは「dispatcher が**常に** pin を書く（bootstrap ターンには `commit` ／ `blob_sha` を持たない bootstrap 形の pin を書く）」形であり、`ABSENT` が常に停止に落ちる。これは pin schema の増設と受け入れ条件を伴う ∴ 本書には取り込まず、thread `T-spec-pin-hardening-and-id-audit` で別 spec として起案する（D-19: 本書は merge 後 immutable ∴ 訂正は新しい spec を起こす）。**代替として「message body に bootstrap-override フラグを置く」形は採らない** — 判定材料を、pin 機構が不信としている当の経路に載せることになり、フラグは何とも照合できないからである。**その spec が着地するまで、窓外 `ABSENT` は止まらない。**
   - **FAULT** — pin は発行されたが解決しなかった。**残り 10 code のすべて**（`PARSE_ERROR` / `SCHEMA_VERSION` / `MISSING_FIELD` / `DETACHED_HEAD` / `BRANCH_MISMATCH` / `REPO_MISMATCH` / `FETCH_UNAVAILABLE` / `COMMIT_UNREACHABLE` / `BLOB_UNREADABLE` / `SHA_MISMATCH`、§3 の fallback を尽くした後）∴ 停止して報告する。**message body で作業を続行してはならない。**
   - **分割は全域かつ排他である。** §3 に新しい reason code が追加された場合、それは既定で FAULT に属する。ABSENT に code を足すには本決定を改訂しなければならない（fail-closed — D-6）。この既定を置くのは、code 追加のたびに義務文の列挙が黙って陳腐化する経路を塞ぐためである。
   - `BRANCH_MISMATCH` について D-7 が言う「存在しないものとして扱う」は**解決手順の話**（その pin を仕様として採用しない）であって、クラス分けの話ではない。他ブランチ宛ての pin が作業ツリーに在ること自体が dispatcher 側の故障である ∴ FAULT である。
   - 根拠: 「pin が出ているのに解決しない」は上流の故障であって、劣化運転してよい状態ではない。body で続行するのは本スレッドの起点となった失敗そのものである。
 - **D-25′（改訂の運び方 — base-hash ＋ 構造アンカー ＋ NEW のみ）** proposer の改訂は対象ファイルの blob sha（`base`）を名指す。implementer は編集前に照合し、一致しなければ `BASE_MISMATCH` で停止する。これが陳腐化検査であり、逐語 byte を 1 文字も要さない。
-  - **照合は 2 段**（U-3）: ① `git status --porcelain -- <path>` が空であること ② `git rev-parse HEAD:<path>` が `base` と一致すること。**作業ツリーのハッシュ化（`git hash-object`）を使わない** ∴ `core.autocrlf` / clean-smudge filter の影響を受けず、偽 `BASE_MISMATCH` が起きない。
+  - **照合は 2 段**: ① `git status --porcelain -- <path>` が空であること ② `git rev-parse HEAD:<path>` が `base` と一致すること。**作業ツリーのハッシュ化（`git hash-object`）を使わない** ∴ `core.autocrlf` / clean-smudge filter の影響を受けず、偽 `BASE_MISMATCH` が起きない。
   - `git rev-parse HEAD:<path>` が `fatal: path ... does not exist in 'HEAD'` で失敗した場合は、それ自体を「大規模 drift」条件とみなし D-27-b に直行する。anchor ファイル自体が消えている ∴ diff を取る対象が無い。
   - **位置は逐語引用ではなく構造アンカーで指す**（§見出し／item id／decision id／evidence id／行番号）。短い識別子であり、LLM が壊しにくく、文書内で一意である。
   - **逐語なのは NEW だけ。** 新しい規範文はどこかから来るしかない ∴ 不可避。ただし NEW は小さく保ち、全文を再発行しない。
@@ -152,6 +156,7 @@ U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれ�
 1. **チャット msg を経由するテキストの転記忠実性。** 該当するのは ①proposer が出す NEW block ②D-27 の recovery diff。期待 hash を誰も先に計算できない ∴ 原理的に不可能である。緩和は 2 つだけ — NEW を小さく保つこと、PR diff を naysayer が message と突き合わせること。後者は人／エージェントによる比較であって機械検査ではない。
 2. **ADR 本文。** A-15 は id ＋ title までしか照合できない。naysayer も implementer も ADR 本文を読めない（bodies は Drive にあり、inference 時に不可視）∴ ADR との整合は title 推論に留まる。
 3. **spec が世界について述べた主張の真偽。** E-11 / E-2 / E-6 がこれである。D-29 で「書いた時点で照合可能」までは下げられるが、消えない。最終防波堤は §1 の「実装時に事実が違っていた場合、仕様ではなく事実が正しい。停止して報告せよ」＋ implementer の停止であり、これは実際に **3 度**作動した（E-11 は loader が落ちる前に、E-2 は merge 前に、E-6 は naysayer の独立 probe ＋ implementer の停止によって merge 前に捕まった）。
+4. **ブートストラップ窓の内側と外側の区別。** 窓の外で `ABSENT` を引いたターンは、本機構では止まらない。根・実挙動・補償統制（§4-2 の receipt — **常に検出し、決して阻止しない**）は D-24 に書いた。本節に再掲を置かず 1 行だけ挙げるのは、これが本節の一覧から漏れると「検査されていないもの」の申告が不完全になるからである。
 
 ## §3 `.mindwire/pin` schema
 
