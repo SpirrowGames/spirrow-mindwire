@@ -84,6 +84,24 @@ $QuarantineEscalatedAfter = [TimeSpan]::FromHours(24)
 $QuarantineStaleAfter     = [TimeSpan]::FromDays(7)
 $StarvedThreshold         = [TimeSpan]::FromHours(24)
 
+# --- exclusive-resource lease (T-exclusive-resource-lease-queue) --------------------------------
+#   $LeaseIdleTtl              = 2h
+#     Wall-clock time since `last_progress_at` beyond which an idle holder is eligible for revoke.
+#     Policy call — no measurement; msg-1187 §5-4. Bounds the "parked but still holding the
+#     editor" case (msg-923 §1: Einstein's NEXT: human went 6+ days unnoticed). Held ticks pause
+#     this clock (msg-1183 D-6'c) so a legitimately-long PIE turn is not preempted.
+#   $LeaseIdleEvaluations      = 6
+#     Number of consecutive tick classifications of `parked` before the wall-clock TTL is even
+#     checked. Six is 30 min at the 5-min sweep cadence — long enough that a one-off transient
+#     (a stray SKIP verdict from a fetch flake) cannot expire a live lease. Policy call
+#     (msg-1187 §5-4). BOTH gates must fire for expiry (msg-1183 D-6'b: "死" と "飢え" の分離).
+#   v1 is SCHEDULING, not enforcement (msg-1185 §3-3, msg-1187 §5-3). Revoke restarts the
+#   resource on reclaim (Grant-Lease → operator; probe-driven reclaim → runner), but the old
+#   session can restart the editor itself. Guarantee is "does not SILENTLY collide", not "does
+#   not collide".
+$LeaseIdleTtl             = [TimeSpan]::FromHours(2)
+$LeaseIdleEvaluations     = 6
+
 # Digest cadence and how many lines of session tail we keep with a quarantine record. These ARE
 # derived from the four above (digest is daily because escalation is daily) but stated here to keep
 # the whole tuning surface in one section.
@@ -115,6 +133,12 @@ $digestStatePath = Join-Path $dataDir "state\digest.json"
 # (question + options) and its signature; the wrapper reuses it when the
 # signature has not changed (I-3: ≤1 composer call per reason:last_msg stop).
 $pendingDecisionsPath = Join-Path $dataDir "state\pending-decisions.json"
+# Exclusive-resource lease + queue state (T-exclusive-resource-lease-queue msg-1183 D-2).
+# Same layer as quarantine.json / evaluated.json / notified.json — one file, one owner
+# (this wrapper + deploy/Grant-Lease.ps1), merged-on-write against operator concurrency.
+# Phase 1 lives on the wrapper host; Phase 2 conclair promotion is deferred until the
+# conditions in msg-1183 D-2 (a-c) are met.
+$leasesStatePath = Join-Path $dataDir "state\leases.json"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 # --- library dot-sources -------------------------------------------------------------------------
@@ -123,6 +147,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # at the bottom). Extracted per Bohr msg-1466 D-3 / Einstein msg-1467 §3-A4: the extracted file is
 # the testability seam, not a refactor.
 . (Join-Path $PSScriptRoot 'lib/StopReason.ps1')
+# T-exclusive-resource-lease-queue: pure lease/queue helpers (no top-level side effects — same
+# discipline as StopReason.ps1). Dot-sourced here so the sweep body can use them, and dot-sourced
+# by tests/Test-Lease.ps1 so their contract is pinnable in isolation.
+. (Join-Path $PSScriptRoot 'lib/Lease.ps1')
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
@@ -690,7 +718,13 @@ function New-DailyDigest {
         # $ParkedPollErrors is the errors[] list from scripts/parked_humans.py (per-candidate fetch
         # failures). Rendered as "取得失敗: N 件" under the 判断待ち section so an outage does not
         # silently under-report; the section itself never disappears (I-2 "黙って劣化しない").
-        [array]$ParkedPollErrors = @()
+        [array]$ParkedPollErrors = @(),
+        # T-exclusive-resource-lease-queue msg-1185 §3-1. The lease section is a READ of
+        # leases.json rendered as a snapshot of "who holds what, who waits, who was reclaimed."
+        # Emitted even at 0 leases (silent-day-is-the-point) — its absence would let a stalled
+        # queue disappear from the operator's daily surface exactly the way msg-923's original
+        # failure ("Einstein's editor NEXT: human went unnoticed") did.
+        [hashtable]$LeasesState = @{}
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -839,6 +873,20 @@ function New-DailyDigest {
     else {
         $lines += $starvedList
     }
+
+    # 排他リソース lease 節 (T-exclusive-resource-lease-queue msg-1185 §3-1). Rendered from
+    # leases.json — who holds each resource, its age, who is queued, and any recent reclaim.
+    # Emitted at 0 leases too (silent-day-is-the-point). Get-LeaseSummaryLines lives in
+    # deploy/lib/Lease.ps1 and takes Format-DurationDigest as a scriptblock because the digest
+    # helper is defined in this file and Lease.ps1 must remain runner-independent for the tests.
+    $lines += ""
+    $leaseCount = $LeasesState.Count
+    $lines += "排他リソース lease: $leaseCount 件"
+    $lines += (Get-LeaseSummaryLines -LeasesState $LeasesState -Now $Now `
+                                     -FormatDuration { param($span) Format-DurationDigest -Span $span })
+    # Known-limits reminder (msg-1185 §3-3). Kept in every digest so the operator does not have
+    # to remember which invariant v1 guarantees.
+    $lines += "  (v1 は scheduling — reclaim 後も旧セッションが自力で editor を再起動する筋は残る。保証は「静かに衝突しない」)"
 
     $lines += ""
     $lines += "(0 件でも送信しています — 通知チャネル自体の生存確認を兼ねます。"
@@ -1764,10 +1812,22 @@ function Get-SweepCandidates {
         foreach ($f in 'project', 'thread_id', 'repo_dir') {
             if (-not $c.$f) { throw "sweep config entry missing '$f': $($c | ConvertTo-Json -Compress)" }
         }
+        # `requires` is optional. It lists exclusive-resource lease names the candidate needs
+        # before it may launch (T-exclusive-resource-lease-queue). A missing key or an empty
+        # array means "no lease required — always eligible". No enum validation at this layer:
+        # the runner does not know the full resource universe (v1 knows only `editor`, future
+        # ticks may add `runner` / `bridge-55557` / `repo:mindwire-impl` / DDC); an operator-
+        # editable list is allowed to name a resource the mechanism ignores today and reads
+        # tomorrow (msg-1180 D-1).
+        $requires = @()
+        if ($null -ne $c.requires) {
+            foreach ($r in @($c.requires)) { if ("$r".Trim()) { $requires += "$r".Trim() } }
+        }
         $out += [pscustomobject]@{
             project   = $c.project
             thread_id = $c.thread_id
             repo_dir  = $c.repo_dir
+            requires  = $requires
             key       = "$($c.project)/$($c.thread_id)"   # state key: thread ids are only unique per project
         }
     }
@@ -2096,11 +2156,19 @@ try {
     $quarantineState = Get-JsonState -Path $quarantineStatePath
     $evaluatedState = Get-JsonState -Path $evaluatedStatePath
     $digestState = Get-JsonState -Path $digestStatePath
+    # T-exclusive-resource-lease-queue: leases.json is on the same merge-on-write layer as
+    # quarantine.json — deploy/Grant-Lease.ps1 may write it during a sweep. Snapshot its keys
+    # at start so Merge-StateForWrite can distinguish operator removal from "sweep never
+    # touched." Round-tripped values come back as PSCustomObject; normalise to hashtables so the
+    # rest of the sweep body only ever sees one shape.
+    $leasesState = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $leasesStatePath)
+    $leasesOriginalKeys = @($leasesState.Keys)
     # Snapshot the keys present at sweep start. Used by Merge-StateForWrite at flush time to
     # distinguish "operator removed this during the sweep" (must not resurrect) from "sweep never
     # touched this" (already-agreed value, keep). See Merge-StateForWrite's header for the full
-    # contract. Only quarantine.json needs this — the head-skip state file has a single writer
-    # (scripts/head_skip_decide.py) and is never edited by an operator during a sweep.
+    # contract. Only quarantine.json and leases.json need this — the head-skip state file has a
+    # single writer (scripts/head_skip_decide.py) and is never edited by an operator during a
+    # sweep.
     $quarantineOriginalKeys = @($quarantineState.Keys)
     $nowUtc = [DateTime]::UtcNow
 
@@ -2166,6 +2234,66 @@ try {
         Update-EvaluatedTimestamp -State $evaluatedState -Key $k -Now $nowUtc
     }
 
+    # --- lease liveness probe (T-exclusive-resource-lease-queue msg-1185 §1 / §2) ---------------
+    # Out-of-band probe: one classification per resource whose lease has a holder. Runs BEFORE
+    # the candidate loop so a same-tick grant is visible to it; O(1) per resource ∴ break-driven
+    # starvation of the holder cannot happen (msg-1185 §1). This block ONLY writes leases.json
+    # (msg-1187 §2, msg-1185 §2-b: two clocks — a lease probe touching evaluated.json would mask
+    # true starvation, so it must not). Every other side effect (disposition, evaluated,
+    # notified) belongs to the candidate loop.
+    #
+    # W-2c already refreshed the evaluated clock for every decide-visited candidate; this probe
+    # answers a different question ("is the holder dead or just parked?") from a different
+    # clock ($idle_evaluations + $last_progress_at). See lib/Lease.ps1 for the classification
+    # trichotomy (progress / parked / neutral) and Bohr msg-1185 §2-c for why the parked-vs-
+    # starved distinction reuses the decide verdict rather than inventing a new predicate.
+    $sweepOrderKeys = @($candidates | ForEach-Object { $_.key })
+    foreach ($resource in @($leasesState.Keys)) {
+        $lease = ConvertTo-LeaseHashtable -Lease $leasesState[$resource]
+        $leasesState[$resource] = $lease
+        $holderKey = "$($lease['holder'])"
+        if ([string]::IsNullOrEmpty($holderKey)) { continue }   # free lease; nothing to probe
+
+        # Look up the holder's project-scoped context. Everything read here is already in memory.
+        $holderProj = ($holderKey -split '/', 2)[0]
+        $isHeld = Test-HoldObserved -Control $controlByProject[$holderProj]
+        $isQuarantined = $quarantineState.ContainsKey($holderKey)
+        $isOnSweep = ($sweepOrderKeys -contains $holderKey)
+        $holderVerdict = if ($decideVerdicts.ContainsKey($holderKey)) { $decideVerdicts[$holderKey] } else { $null }
+
+        $classification = Get-LeaseHolderClassification -HolderKey $holderKey `
+            -IsHeld $isHeld -IsQuarantined $isQuarantined -IsOnSweep $isOnSweep -Verdict $holderVerdict
+        Update-LeaseFromClassification -Lease $lease -Classification $classification -Now $nowUtc
+
+        # Two-phase revoke: an eligible lease is marked expiring THIS tick; the promotion lands
+        # NEXT tick's probe (msg-1183 D-6'd). Pinned leases are TTL-immune (D-7).
+        if (Test-LeaseExpiring -Lease $lease -IdleEvaluationsMin $LeaseIdleEvaluations `
+                               -IdleTtl $LeaseIdleTtl -Now $nowUtc) {
+            $promotion = Invoke-LeasePromotion -Lease $lease -Now $nowUtc `
+                                               -SweepOrderKeys $sweepOrderKeys -Reason 'idle'
+            if ($promotion.action -ne 'noop') {
+                Confirm-LogWorthKeeping
+                switch ($promotion.action) {
+                    'marked-expiring' {
+                        Write-Log "lease [$resource] marked expiring — holder=$($promotion.previous_holder), next tick promotes"
+                    }
+                    'promoted' {
+                        Write-Log "lease [$resource] promoted: $($promotion.previous_holder) -> $($promotion.new_holder) (reclaim required — old session's editor MAY still exist)"
+                        Send-NotificationIfChanged -State $notifyState -Key "__lease_reclaim__/$resource" `
+                            -Signature "$($promotion.previous_holder)->$($promotion.new_holder)@$(($nowUtc.ToString('o')))" `
+                            -Message ("MindWire: lease **$resource** を回収しました。" +
+                                      "旧: $($promotion.previous_holder) → 新: $($promotion.new_holder)。" +
+                                      "reclaim_required — 新側は使用前にリソースの再起動が必要です " +
+                                      "(v1 は scheduling で enforcement ではないため、旧側が自力で起動する可能性は残ります)。")
+                    }
+                    'released' {
+                        Write-Log "lease [$resource] released (no waiter): previous holder=$($promotion.previous_holder)"
+                    }
+                }
+            }
+        }
+    }
+
     # Age-driven state transitions on quarantine entries. Run BEFORE the candidate loop so the
     # transition notification fires even on ticks where nothing else happens (an escalated thread is
     # by definition one nobody has touched for 24h — we cannot wait for its own launch to notice).
@@ -2226,7 +2354,7 @@ try {
     $newlyQuarantined = 0      # non-zero exits this tick
     $notReached = 0            # candidates the sweep never got to (K-cap, worked-and-broke)
     $sweepSignature = @()
-    $dispositions = @{}        # key -> "worked" | "no-work" | "head-skipped" | "quarantined-skipped" | "held" | "not-reached"
+    $dispositions = @{}        # key -> "worked" | "no-work" | "head-skipped" | "head-deferred" | "quarantined-skipped" | "held" | "lease-waiting" | "not-reached" | "failed" | "undeclared" | "report-launch"
     $breakReason = $null       # human-readable reason for a mid-sweep break, or $null if it ran to end
 
     # Stop reasons that need Takahito. Mirrors StopReason in conductor/core.py — `human` plus every
@@ -2353,6 +2481,48 @@ try {
             Write-Log "head_skip commit-launch FAILED for $($cand.key) — $($commitResult.error)"
             throw ("head_skip commit-launch systemic failure on $($cand.key): $($commitResult.error). " +
                    "The tick is aborted (fail-closed per Bohr msg-1430 §W-3).")
+        }
+
+        # --- exclusive-resource lease check (T-exclusive-resource-lease-queue msg-1180 D-1/D-3)
+        # The candidate has passed all other filters and would launch. If it declares any
+        # `requires:` in sweep.json, check the lease state ONE resource at a time. Held or
+        # unlocked → acquire + fall through to launch. Held by someone else → disposition
+        # `lease-waiting`, enqueue FIFO, continue (does NOT consume a launch slot — msg-1183
+        # §3, msg-1185 §3 rescue: lease-waiting is `continue`, not `break`).
+        #
+        # We deliberately do this AFTER commit-launch. commit-launch is idempotent per tick
+        # (the head_skip record was already updated for this decide verdict); a wait now leaves
+        # the record in a consistent state (launch was decided, but not physically performed)
+        # and the next tick will re-decide from the same head. The alternative — check leases
+        # BEFORE commit-launch — would risk skipping the commit for a waiter forever, since
+        # commit-launch is what feeds the backoff clock, and a permanently-waiting candidate
+        # would never advance its backoff counter (a different starvation footprint).
+        if ($cand.requires -and $cand.requires.Count -gt 0) {
+            $leaseCheck = Test-LeaseAvailableFor -LeasesState $leasesState `
+                                                 -CandidateKey $cand.key -Requires $cand.requires
+            if ($leaseCheck.status -eq 'waiting') {
+                $skipped++
+                $dispositions[$cand.key] = 'lease-waiting'
+                foreach ($resource in $leaseCheck.waitOn) {
+                    Register-LeaseWaiter -LeasesState $leasesState -Resource $resource `
+                                         -WaiterKey $cand.key -Now $nowUtc
+                }
+                $blockingList = @()
+                foreach ($resource in $leaseCheck.waitOn) {
+                    $blockingList += "${resource}=$($leaseCheck.holders[$resource])"
+                }
+                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — lease-waiting on [$($blockingList -join ', ')], enqueued, not launching"
+                continue
+            }
+            # Available — acquire every required resource that this candidate does not already
+            # hold. Idempotent for the self-holds; for the free ones, this is the "session-start-
+            # before-write" contract adapted to leases (msg-1183 §W-3-style: the record shows
+            # acquisition BEFORE launch, so an OS-level kill mid-launch leaves the lease
+            # committed rather than a phantom launch with a free lease).
+            foreach ($resource in $cand.requires) {
+                Invoke-LeaseAcquire -LeasesState $leasesState -Resource $resource `
+                                    -CandidateKey $cand.key -Now $nowUtc
+            }
         }
 
         # All three must move together: the daemon reads the thread from [conductor] but the project
@@ -2500,9 +2670,15 @@ try {
     # ex-live keys on it every tick (merge-on-write would resurrect those pruned keys from disk).
     # head_skip.json is not written here at all — its only writer is scripts/head_skip_decide.py
     # (owned atomicity per msg-1430 §W-2), so any concurrency question is answered on the CLI side.
+    #
+    # leases.json shares quarantine.json's discipline — deploy/Grant-Lease.ps1 may edit it during
+    # a sweep (pin, grant, clear), so the same merge-on-write rules apply (msg-1187 §2).
     $mergedQuarantine = Merge-StateForWrite -Memory $quarantineState `
         -OriginalKeys $quarantineOriginalKeys -DiskPath $quarantineStatePath
     Save-JsonState -Path $quarantineStatePath -State $mergedQuarantine
+    $mergedLeases = Merge-StateForWrite -Memory $leasesState `
+        -OriginalKeys $leasesOriginalKeys -DiskPath $leasesStatePath
+    Save-JsonState -Path $leasesStatePath -State $mergedLeases
     Save-JsonState -Path $evaluatedStatePath -State $evaluatedState
 
     # Starvation report. Included in the log every tick that logs anything (an idle tick still
@@ -2581,7 +2757,8 @@ try {
                 -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc `
                 -LiveKeys $liveKeys `
                 -HumanParked $humanParked -PendingDecisionsState $pendingDecisionsState `
-                -ParkedPollErrors $parkedPollErrors
+                -ParkedPollErrors $parkedPollErrors `
+                -LeasesState $leasesState
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved)"
             $result = Send-Notification -Message $digest

@@ -44,6 +44,12 @@ function Confirm-LogWorthKeeping { }
 $stopReasonLib = Join-Path $repoRoot 'deploy/lib/StopReason.ps1'
 if (-not (Test-Path -LiteralPath $stopReasonLib)) { throw "StopReason lib not found: $stopReasonLib" }
 . $stopReasonLib
+# Same reason for deploy/lib/Lease.ps1: New-DailyDigest calls Get-LeaseSummaryLines from that
+# file for the 排他リソース lease section (T-exclusive-resource-lease-queue). Pure functions,
+# no side effects — safe to dot-source.
+$leaseLib = Join-Path $repoRoot 'deploy/lib/Lease.ps1'
+if (-not (Test-Path -LiteralPath $leaseLib)) { throw "Lease lib not found: $leaseLib" }
+. $leaseLib
 
 # Bring in the exact functions the sweep uses. Dot-sourcing would launch the sweep; parsing the
 # AST and invoking just the function definitions keeps this test hermetic.

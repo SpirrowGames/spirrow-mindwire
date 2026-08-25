@@ -32,6 +32,12 @@ $script:StarvedThreshold         = [TimeSpan]::FromHours(24)
 # Get-JsonState / Write-Log stubs so the lifts stay self-contained.
 function Write-Log { param([string]$Message) }
 
+# New-DailyDigest reaches into deploy/lib/Lease.ps1 (Get-LeaseSummaryLines) for the lease
+# section. Same discipline as StopReason.ps1 — the lib is pure (no top-level side effects), so
+# dot-sourcing it here is safe and keeps the digest lift self-contained without pulling in the
+# rest of the wrapper.
+. (Join-Path $repoRoot "deploy/lib/Lease.ps1")
+
 $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
