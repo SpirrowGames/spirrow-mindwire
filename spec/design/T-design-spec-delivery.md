@@ -95,7 +95,7 @@ U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれ�
 - **D-13（第一号実運用対象）** pin つき dispatch の第一号実運用対象は **`T-pr-gate-adr-index-scope`** とする（`T-loop-readable-obligations` は PR #135 で完了・close 済みのため対象から外す）。
 - **D-14（到達性判定と遅延 fetch）** pin の `commit` が `origin/main` から到達可能であることを確認する。この検査は「pin が指す spec は human が merge したものである」を機械的に担保する唯一の経路である。E-6 の ruleset は PR を経由することまでは強制するが**主体が human であることは強制しない** ∴ この検査を外さない。ネットワーク規律は次のとおり:
   - **肯定側は fetch しない。** ローカルの `origin/main` から到達可能なら `RESOLVED` に進む（古い `origin/main` の祖先である commit は、より新しい `origin/main` の祖先でもある ∴ 肯定判定は陳腐化しない。main が force-push で書き換えられないことを前提とする。**この前提は Organization ruleset の `non_fast_forward` が機構として守っている**（E-6）— r7 以前の本行は「E-6 により機構では守れない ∴ D-11 と同じく規律である」と書いていたが、それは過小申告であった）。
-  - **否定側でのみ、1 回だけ** `git fetch origin main` を試み、再判定する。連続再試行はしない。
+  - **否定側でのみ、1 回だけ** `git fetch origin +refs/heads/main:refs/remotes/origin/main` を試み、再判定する。連続再試行はしない。refspec を明示するのは、remote-tracking ref が更新されるか否かを `remote.<name>.fetch` の設定に依存させないためである（設定済みの clone では bare の `git fetch origin main` と挙動が一致することを実測した。2026-08-25）。
   - fetch が失敗・不可の場合は `NO-PIN(FETCH_UNAVAILABLE)`。fetch 後もなお到達不能なら `NO-PIN(COMMIT_UNREACHABLE)`。**この 2 つを同じコードに畳まない** — 前者は「クローンが main を見られない」、後者は「未 merge の commit を pin した」であり、直す相手も直し方も異なる。
 - **D-15（順序の SOT は items の列挙順）** item 間の依存グラフ機構は持たない。`after` 相当のフィールドを導入せず、`verify.py` に循環検査も置かない。dispatch するのは人間であり 1 ターンに 1 つの item id が渡るだけで、自動シーケンサは存在しない ∴ **front-matter の `items` 列挙順が実行順であり、それが順序の唯一の記述である**。§8 は順序を再宣言せず、item でない段のみを述べる。
 - **D-16（obligations は union）** 有効な obligation 集合は **manifest 直下 ∪ item 直下**である。item 側の記述は**追加のみ**であり、削除は仕様上表現できない。item に全列挙を強制しない（自己完結性の単位は payload であって item ではない — D-3）。
@@ -192,7 +192,7 @@ pinned_by: human
 7. 現在 repo 名 ≠ `repo` → `NO-PIN(REPO_MISMATCH)`
 8. 到達性（D-14）:
    - `git merge-base --is-ancestor <commit> origin/main` が真 → 次へ（**fetch しない**）
-   - 偽、または `origin/main` ref が無い → `git fetch origin main` を**1 回だけ**試みる
+   - 偽、または `origin/main` ref が無い → `git fetch origin +refs/heads/main:refs/remotes/origin/main` を**1 回だけ**試みる
      - fetch 失敗／実行不可 → `NO-PIN(FETCH_UNAVAILABLE)`
      - fetch 成功、再判定して真 → 次へ
      - fetch 成功、再判定して偽 → `NO-PIN(COMMIT_UNREACHABLE)`
@@ -229,13 +229,14 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
     Reachability has one network rule. If the pinned commit is already an
     ancestor of your local `origin/main`, accept it and fetch nothing. Only if
     it is not — or if you have no `origin/main` ref at all — run `git fetch
-    origin main` exactly once and judge again. If that fetch fails or is
-    unavailable to you, the verdict is NO-PIN/FETCH_UNAVAILABLE: you could not
-    determine the answer. If the fetch succeeds and the commit is still not
-    reachable, the verdict is NO-PIN/COMMIT_UNREACHABLE: the pin names a commit
-    that is not on `main`, which usually means the specification was never
-    merged. Report whichever code you got; they have different causes and
-    different fixes, and collapsing them costs the reader the diagnosis.
+    origin +refs/heads/main:refs/remotes/origin/main` exactly once and judge
+    again. If that fetch fails or is unavailable to you, the verdict is
+    NO-PIN/FETCH_UNAVAILABLE: you could not determine the answer. If the fetch
+    succeeds and the commit is still not reachable, the verdict is
+    NO-PIN/COMMIT_UNREACHABLE: the pin names a commit that is not on `main`,
+    which usually means the specification was never merged. Report whichever
+    code you got; they have different causes and different fixes, and
+    collapsing them costs the reader the diagnosis.
 
     NO-PIN is a state to report, not an obstacle to route around. Say NO-PIN in
     your reply with its reason code, and treat the message body you were given
@@ -319,7 +320,7 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 
 **位置**: `spec/design/verify.py`。**起動**: `python spec/design/verify.py [--repo-root PATH] [--json] [--pin-only] [--no-fetch]`。
 
-**ネットワーク**: §3 手順 8 の否定側で `git fetch origin main` を最大 1 回だけ実行する。それ以外のネットワークアクセスは無い。`--no-fetch` を付けた場合は fetch を試みず、否定側は `NO-PIN(FETCH_UNAVAILABLE)` として報告する（決定的な診断実行用）。
+**ネットワーク**: §3 手順 8 の否定側で `git fetch origin +refs/heads/main:refs/remotes/origin/main` を最大 1 回だけ実行する。それ以外のネットワークアクセスは無い。`--no-fetch` を付けた場合は fetch を試みず、否定側は `NO-PIN(FETCH_UNAVAILABLE)` として報告する（決定的な診断実行用）。
 
 ### 入力
 - repo root（既定: `git rev-parse --show-toplevel`）
