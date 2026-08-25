@@ -2463,40 +2463,24 @@ try {
             continue
         }
 
-        Confirm-LogWorthKeeping
-        Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) (head_skip LAUNCH, reason=$($v.reason), token=$($v.token)) ---"
-        # commit-launch BEFORE spawn: the "session-start-before write" contract that survives a
-        # forced kill (head_skip.py docstring, test #10). The record is written with
-        # attempts_after=v.attempts_after so the backoff floor applies to any retry, even one after
-        # a mid-flight OS-level kill.
-        $commitPayload = if ($v.PSObject.Properties.Name -contains 'commit_launch_payload') { $v.commit_launch_payload } else { $null }
-        if ($null -eq $commitPayload) {
-            throw "head_skip decide returned a LAUNCH verdict without a commit_launch_payload for $($cand.key)"
-        }
-        $commitResult = Invoke-HeadSkipCommitLaunch -Payload $commitPayload -StateFilePath $headSkipStatePath
-        if (-not $commitResult.ok) {
-            # Systemic failure of the same class as decide fail-close: if commit-launch is broken
-            # then decide is broken too, so we must abort the tick rather than spawn a conductor
-            # that will not be recorded.
-            Write-Log "head_skip commit-launch FAILED for $($cand.key) — $($commitResult.error)"
-            throw ("head_skip commit-launch systemic failure on $($cand.key): $($commitResult.error). " +
-                   "The tick is aborted (fail-closed per Bohr msg-1430 §W-3).")
-        }
-
         # --- exclusive-resource lease check (T-exclusive-resource-lease-queue msg-1180 D-1/D-3)
-        # The candidate has passed all other filters and would launch. If it declares any
-        # `requires:` in sweep.json, check the lease state ONE resource at a time. Held or
-        # unlocked → acquire + fall through to launch. Held by someone else → disposition
-        # `lease-waiting`, enqueue FIFO, continue (does NOT consume a launch slot — msg-1183
-        # §3, msg-1185 §3 rescue: lease-waiting is `continue`, not `break`).
-        #
-        # We deliberately do this AFTER commit-launch. commit-launch is idempotent per tick
-        # (the head_skip record was already updated for this decide verdict); a wait now leaves
-        # the record in a consistent state (launch was decided, but not physically performed)
-        # and the next tick will re-decide from the same head. The alternative — check leases
-        # BEFORE commit-launch — would risk skipping the commit for a waiter forever, since
-        # commit-launch is what feeds the backoff clock, and a permanently-waiting candidate
-        # would never advance its backoff counter (a different starvation footprint).
+        # Runs BEFORE Invoke-HeadSkipCommitLaunch. The order is load-bearing (Einstein
+        # msg-1738 objection): head_skip.py's docstring is explicit that "any LAUNCH verdicts
+        # the sweep did not act on are left with their launch baseline untouched — they stay
+        # eligible on the next tick." Calling commit-launch first and then bailing on a
+        # lease-waiting is a two-phase-contract violation whose visible symptom is that the
+        # waiter's next decide sees token == nomination_at_launch (progressed=False),
+        # accumulates backoff, and can sit in DEFER for up to CAP=60 min AFTER the lease frees
+        # (head_skip.py L119 CAP=60min). Doing the lease check first means:
+        #   - If we bail (lease-waiting), commit-launch is NEVER called for this verdict.
+        #     head_skip's record stays put; next tick re-decides from the same head and either
+        #     LAUNCHes again (no baseline drift → no backoff) or holds the same DEFER (no new
+        #     attempt consumed). A granted waiter therefore LAUNCHes on the very next tick
+        #     after the grant, not up to 60 min later.
+        #   - If we launch, commit-launch fires exactly once for a verdict we ACT on — which
+        #     is what the two-phase protocol contract says.
+        # A launch slot is not consumed here (`continue`, not `break`) — msg-1183 §3, msg-1185
+        # §3-rescue: lease-waiting cannot delay unrelated candidates further down the sweep.
         if ($cand.requires -and $cand.requires.Count -gt 0) {
             $leaseCheck = Test-LeaseAvailableFor -LeasesState $leasesState `
                                                  -CandidateKey $cand.key -Requires $cand.requires
@@ -2511,18 +2495,43 @@ try {
                 foreach ($resource in $leaseCheck.waitOn) {
                     $blockingList += "${resource}=$($leaseCheck.holders[$resource])"
                 }
-                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — lease-waiting on [$($blockingList -join ', ')], enqueued, not launching"
+                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — lease-waiting on [$($blockingList -join ', ')], enqueued, not launching (commit-launch NOT called — baseline preserved so grant wakes on the next tick)"
                 continue
             }
+        }
+
+        Confirm-LogWorthKeeping
+        Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) (head_skip LAUNCH, reason=$($v.reason), token=$($v.token)) ---"
+        # commit-launch BEFORE spawn: the "session-start-before write" contract that survives a
+        # forced kill (head_skip.py docstring, test #10). The record is written with
+        # attempts_after=v.attempts_after so the backoff floor applies to any retry, even one after
+        # a mid-flight OS-level kill. Order: lease-acquired before commit-launch (mirrors the
+        # lease's own "commit acquire before spawn" contract — an OS-level kill between acquire
+        # and spawn leaves the lease held and head_skip record NOT bumped, which matches the
+        # two-phase protocol's "don't record a launch you did not perform").
+        if ($cand.requires -and $cand.requires.Count -gt 0) {
             # Available — acquire every required resource that this candidate does not already
-            # hold. Idempotent for the self-holds; for the free ones, this is the "session-start-
-            # before-write" contract adapted to leases (msg-1183 §W-3-style: the record shows
-            # acquisition BEFORE launch, so an OS-level kill mid-launch leaves the lease
+            # hold. Idempotent for the self-holds; for the free ones, this is the "session-
+            # start-before-write" contract adapted to leases (msg-1183 §W-3-style: the record
+            # shows acquisition BEFORE launch, so an OS-level kill mid-launch leaves the lease
             # committed rather than a phantom launch with a free lease).
             foreach ($resource in $cand.requires) {
                 Invoke-LeaseAcquire -LeasesState $leasesState -Resource $resource `
                                     -CandidateKey $cand.key -Now $nowUtc
             }
+        }
+        $commitPayload = if ($v.PSObject.Properties.Name -contains 'commit_launch_payload') { $v.commit_launch_payload } else { $null }
+        if ($null -eq $commitPayload) {
+            throw "head_skip decide returned a LAUNCH verdict without a commit_launch_payload for $($cand.key)"
+        }
+        $commitResult = Invoke-HeadSkipCommitLaunch -Payload $commitPayload -StateFilePath $headSkipStatePath
+        if (-not $commitResult.ok) {
+            # Systemic failure of the same class as decide fail-close: if commit-launch is broken
+            # then decide is broken too, so we must abort the tick rather than spawn a conductor
+            # that will not be recorded.
+            Write-Log "head_skip commit-launch FAILED for $($cand.key) — $($commitResult.error)"
+            throw ("head_skip commit-launch systemic failure on $($cand.key): $($commitResult.error). " +
+                   "The tick is aborted (fail-closed per Bohr msg-1430 §W-3).")
         }
 
         # All three must move together: the daemon reads the thread from [conductor] but the project

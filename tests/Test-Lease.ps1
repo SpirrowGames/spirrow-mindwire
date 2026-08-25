@@ -307,6 +307,53 @@ foreach ($c in $commandAsts) {
 }
 CheckTrue "New-DailyDigest is called with -LeasesState" $digestCallHasLeases
 
+# --- 9. Wrapper AST wiring — commit-launch order (Einstein msg-1738 objection) -------------------
+#
+# The lease-waiting bail must NOT be reached through Invoke-HeadSkipCommitLaunch. head_skip.py's
+# module docstring is explicit: "LAUNCH verdicts the sweep did not act on are left with their
+# launch baseline untouched — they stay eligible on the next tick." Calling commit-launch and
+# THEN bailing on lease-waiting sets nomination_at_launch to the current nomination, so next
+# tick's decide sees progressed=False, applies backoff (BASE=15min up to CAP=60min), and the
+# waiter cannot wake for up to CAP AFTER the grant. Placing the lease check BEFORE
+# commit-launch keeps the head_skip record untouched for a waiter and matches head_skip's
+# two-phase contract. This test scans the wrapper's sweep body and pins the source order.
+Write-Host "Wrapper AST wiring — lease-waiting bail is BEFORE Invoke-HeadSkipCommitLaunch (contract with head_skip.py two-phase protocol)"
+
+# Find every CommandAst reference to Invoke-HeadSkipCommitLaunch and every StringConstant
+# 'lease-waiting'. The lease-waiting bail must come STRICTLY BEFORE the commit-launch call.
+$commitCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Invoke-HeadSkipCommitLaunch'
+    }, $true))
+$leaseWaitingLiterals = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+        $n.Value -eq 'lease-waiting'
+    }, $true))
+
+if ($commitCalls.Count -eq 0) {
+    $script:failures++
+    Write-Host "  FAIL  Invoke-HeadSkipCommitLaunch call not found — wiring gone?"
+}
+elseif ($leaseWaitingLiterals.Count -eq 0) {
+    $script:failures++
+    Write-Host "  FAIL  'lease-waiting' string literal not found — bail branch gone?"
+}
+else {
+    # Pick the FIRST call site of commit-launch and the assignment of the 'lease-waiting'
+    # disposition (there may be others in comments; we look for the assignment).
+    $firstCommitLine = ($commitCalls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+    $firstWaitingLine = ($leaseWaitingLiterals | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+    if ($firstWaitingLine -lt $firstCommitLine) {
+        Write-Host "  PASS  lease-waiting (line $firstWaitingLine) precedes Invoke-HeadSkipCommitLaunch (line $firstCommitLine)"
+    }
+    else {
+        $script:failures++
+        Write-Host "  FAIL  Invoke-HeadSkipCommitLaunch (line $firstCommitLine) precedes lease-waiting bail (line $firstWaitingLine) — commit-launch will fire for a waiter, feeding backoff and delaying grant-wake by up to CAP=60min (head_skip.py L119)"
+    }
+}
+
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "lease gate: all checks passed"
