@@ -140,6 +140,10 @@ U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれ�
   - `origin` は逐語移設専用の予約ブロックである（`moved_from` ＋ `original_length` が必須で、`len(body) == original_length` を canary が強制する）。net-new のエントリには付けない — 付ければ「移設した」という偽の主張になり、canary の意味を薄める（D-8 / A-1）。
 - **D-29（実査は pin されていなければ実査ではない）** `実査` と記された evidence 行は commit sha ＋ path（＋読み取りコマンド）を必ず伴う。伴わない行は evidence ではなく主張として扱う。根拠: E-11 は実査ラベルを持ちながら誤っていた。sha があれば、書いた時点で照合可能だった。実査ラベルは自己検証しない。
 - **D-30（決定 id は再利用も再割当もしない）** 一度この文書に書かれた決定 id は、意味を変えない。新しい決定には未使用の id を与える。既存 id を新しい決定に振り直すと、その id を記憶している読み手・thread・レビューが**気づかないまま別の規則を読む** — バイト列としては正しく、参照としても解決する ∴ `BASE_MISMATCH` も `verify.py` も検出できない、唯一検出不能な種類の drift になる。追記位置は末尾であり、番号順と論理順は一致しなくてよい。
+- **D-31（義務文が §3 を再掲するのは意図である。参照への置換は採らない）** `OBL-SPEC-PIN` の body は §3 の規則を再掲する。これは Principle 2（二重管理）に対する意図的な例外であり、代償は A-29 / V-13 の機械照合で払う。「body から規則を削り、`spec/design/T-design-spec-delivery.md` を読めと書く」単一化案を採らない理由は 2 つある。
+  - **届く経路が違う。** 義務文は system prompt からのみ agent に届き、その prompt は **daemon 自身の checkout** から render される。一方 agent の作業ツリーは `repo_dir` であり、preflight P0 が「`repo_dir` は daemon 自身の checkout であってはならない」を強制する ∴ **義務文の出所と agent が読めるファイル木は常に別物である**。cwd 相対の `spec/design/…` は対象 repo が `spirrow-mindwire` でなければ存在せず（D-22 は N repo を明示的に想定している）、参照はそこで宙に浮く。
+  - **信頼の向きが逆転する。** pin 機構が在る理由は作業ツリーのコピーを信じられないことであり、§3 手順 6〜10 はまさにそれを検査している。その検査規則自体を作業ツリーから読ませれば、作業ツリーを書ける者が「作業ツリーを信じてよいか」の判定規則を書けることになる。**規則は被検査対象と同じ経路で来てはならない。**
+  - ∴ body が単独で決めきらねばならないのは **結果に対する挙動**（A-26）と **code の綴り**（A-29）であって、手順の逐条ではない。手順の正本は §3 である。body に手順の要約を置くのは「prompt だけで pin を解けるようにする」ためではなく、「prompt だけで、解けなかったときに正しく止まれるようにする」ためである。
 
 ### §2.1 検査されていないもの（過大申告しない）
 
@@ -161,7 +165,7 @@ U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれ�
 | `repo` | str | ✔ | `git remote get-url origin` の basename から `.git` を除いたもの |
 | `branch` | str | ✔ | この pin が有効なブランチ名（完全一致、D-7） |
 | `path` | str | ✔ | repo root 相対の manifest パス |
-| `blob_sha` | str | ✔ | manifest 内容の `git hash-object` 値。40 桁小文字 hex |
+| `blob_sha` | str | ✔ | manifest blob の sha。`git rev-parse <commit>:<path>` が返す値であり、内容をハッシュ化して得るものではない（D-25′ / D-31）。40 桁小文字 hex |
 | `commit` | str | ✔ | その blob を含む commit。`origin/main` から到達可能であること。40 桁小文字 hex |
 | `pinned_at` | str | ✔ | RFC3339 UTC（例 `2026-08-11T09:30:00Z`） |
 | `pinned_by` | str | ✔ | 自由記述（例 `human`） |
@@ -198,9 +202,9 @@ pinned_by: human
      - fetch 失敗／実行不可 → `NO-PIN(FETCH_UNAVAILABLE)`
      - fetch 成功、再判定して真 → 次へ
      - fetch 成功、再判定して偽 → `NO-PIN(COMMIT_UNREACHABLE)`
-9. `git show <commit>:<path>` が失敗 → `NO-PIN(BLOB_UNREADABLE)`
-10. 取得内容の `git hash-object` ≠ `blob_sha` → `NO-PIN(SHA_MISMATCH)`
-11. すべて通過 → `RESOLVED`。取得した内容がそのターンの仕様である。
+9. `git rev-parse <commit>:<path>` が失敗 → `NO-PIN(BLOB_UNREADABLE)`
+10. その値 ≠ `blob_sha` → `NO-PIN(SHA_MISMATCH)`
+11. すべて通過 → `git cat-file blob <commit>:<path>` で内容を読む。読めなければ `NO-PIN(BLOB_UNREADABLE)`。読めた内容がそのターンの仕様であり、状態は `RESOLVED` である。
 
 reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VERSION` / `MISSING_FIELD` / `DETACHED_HEAD` / `BRANCH_MISMATCH` / `REPO_MISMATCH` / `FETCH_UNAVAILABLE` / `COMMIT_UNREACHABLE` / `BLOB_UNREADABLE` / `SHA_MISMATCH`）。receipt（§4-2）はこの code をそのまま書く。
 
@@ -218,15 +222,25 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
   body: |
     Before you do anything else on a turn, look for `.mindwire/pin` at the
     repository root and resolve it exactly as the spec delivery manifest
-    specifies. Resolution is fail-closed: an absent file, a parse error, an
-    unknown schema_version, a missing or malformed required field, a branch
-    that does not equal `git rev-parse --abbrev-ref HEAD` (a detached HEAD
-    reports `HEAD` or fails, and is therefore never a match), a repo name that
-    does not match, a pinned commit you cannot confirm is reachable from
-    `origin/main`, a blob you cannot read, or a content hash that does not
-    equal `blob_sha` — every one of these resolves to NO-PIN with the
-    corresponding reason code. Do not raise, do not retry with a guess, and do
-    not repair the pin.
+    specifies. That manifest is SPEC-2026-08-11-design-spec-delivery, on
+    thread T-design-spec-delivery, and where the repository you are working
+    in carries it you may read the full procedure there. You are not required
+    to: this obligation on its own decides what you do with every outcome,
+    and a repository that does not carry that document changes none of your
+    duties here. Resolution is fail-closed, and every way it can fail has one
+    reason code, spelled exactly as written here. No `.mindwire/pin` file at
+    all is ABSENT. A YAML parse failure is PARSE_ERROR. A schema_version
+    other than 1 is SCHEMA_VERSION. A required field that is missing or
+    malformed is MISSING_FIELD. A `git rev-parse --abbrev-ref HEAD` that
+    answers `HEAD`, fails, or comes back empty is DETACHED_HEAD. A current
+    branch that does not equal the pin's `branch` is BRANCH_MISMATCH. A repo
+    name that does not match is REPO_MISMATCH. A fetch you could not run is
+    FETCH_UNAVAILABLE. A pinned commit you cannot confirm is reachable from
+    `origin/main` is COMMIT_UNREACHABLE. A blob you cannot read is
+    BLOB_UNREADABLE. A blob whose sha is not `blob_sha` is SHA_MISMATCH.
+    Those eleven are the whole list. Report the code with that spelling; do
+    not invent one, do not abbreviate one, and do not translate one. Do not
+    raise, do not retry with a guess, and do not repair the pin.
 
     Reachability has one network rule. If the pinned commit is already an
     ancestor of your local `origin/main`, accept it and fetch nothing. Only if
@@ -373,6 +387,7 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 | V-10 | 現在ブランチが `main` のとき、`status: withdrawn` の manifest、または他 manifest の `supersedes` に載っている（＝派生 superseded、D-20）manifest を報告する。**新たな pin の対象にしてはならない文書である**ことの注意喚起であり、gate ではない | **warning**（D-10 / D-21。exit code に影響させない） |
 | V-11 | manifest 直下の `target_repo` が `git remote get-url origin` の basename（末尾 `.git` を除く）と一致する（D-22）。`origin` remote が存在しない作業コピーでは本検査を行わず info を 1 件出す（診断ツールは環境で落ちない — D-10） | error |
 | V-12 | 上書き不可フィールド（`spec_id` / `thread` / `supersedes` / `target_repo`）が item 側に現れない（§6） | error |
+| V-13 | `spec/process/obligations.yaml` に `OBL-SPEC-PIN` が**在るとき**、§3 末尾が列挙する 11 の reason code すべてがその body に**逐語で**出現する（A-29 の機械化）。entry 自体の不在は V-8 が既に error にする ∴ ここでは重ねて報告しない。両者は同一 repo に在る ∴ 照合可能であり、§3 と義務文の drift はここで赤くなる | error |
 
 ### 出力
 - 既定: 1 行 1 件、`LEVEL CHECK TARGET: message`（例: `ERROR V-8 SPEC-2026-08-11-design-spec-delivery I-3: unknown obligation OBL-SPEC-TYPO`）
@@ -426,6 +441,7 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 - **A-26** `OBL-SPEC-PIN` の body だけを読んで、§3 の 11 reason code すべてについて「停止するか、message body で続行してよいか」が一意に決まる。続行してよいのは `ABSENT` の 1 code のみであり、残り 10 code はすべて停止である（D-24）。11 code のどれを当てても判断が未定義にならないこと。**回帰防止**: `REPO_MISMATCH` は D-24 が FAULT と名指ししながら義務文の停止列挙から漏れていた（r11 で検出）。
 - **A-27** `I-4` を実行した状態（`.gitignore` に `.mindwire/` があり、`.mindwire/pin` が `git status --porcelain` に現れない — A-13）が `OBL-SPEC-PIN` の負の制約に**違反しない**ことが、body の文面だけから判断できる。**根拠**: `git check-ignore -v .mindwire/pin` は `.mindwire/` 規則が pin ファイル自体を無視すると報告する（実測 2026-08-25）∴「ディレクトリを ignore しただけで pin は ignore していない」という読みは成立せず、body 側で明示的に許す必要がある。
 - **A-28** `OBL-SPEC-RECEIPT` の body だけを読んで、pin が解決しなかったターンの receipt が 2 形あることが分かり、どちらを書くかが「そのターンで実際に message body から作業したか否か」で一意に決まる。停止したターンに `worked from message body only` を書かせる読みが成立しないこと。**回帰防止**: r11 が `OBL-SPEC-PIN` で `NO-PIN` を `ABSENT` と 10 個の FAULT に割った際、receipt 側は単一形のまま残り、FAULT で停止した agent に「message body のみから作業した」と申告させていた＝D-24 が禁じた当の行為を自己申告させる形であった。**分類そのものは `OBL-SPEC-RECEIPT` に複製しない** — どの code がどちらのクラスかは `OBL-SPEC-PIN`（A-26）が唯一の正本であり、receipt 側には実行結果と一致させることだけを課す（複製がこの drift を生んだ）。
+- **A-29** §3 末尾が列挙する 11 の reason code が、`OBL-SPEC-PIN` の body に**逐語で**（同じ綴りで）出現する。`verify.py` の V-13 がこれを検査する（entry 不在時は V-8 の領分 ∴ V-13 は沈黙する — I-1 未実行の窓で二重報告しないため）。**根拠**: 義務文は system prompt からしか agent に届かず、agent が receipt に書く値は §4-2 の `NO-PIN/<reason code>` にそのまま入る（§3 末尾「receipt はこの code をそのまま書く」）∴ 綴りが body に無ければ agent は発明するしかなく、A-26 の「11 code すべてについて一意に決まる」は綴れない code について空虚になる。**回帰防止**: r13 時点の実測では body に逐語で在る code は 11 中 5（`ABSENT` / `FETCH_UNAVAILABLE` / `COMMIT_UNREACHABLE` / `BLOB_UNREADABLE` / `SHA_MISMATCH`）のみで、残り 6（`PARSE_ERROR` / `SCHEMA_VERSION` / `MISSING_FIELD` / `DETACHED_HEAD` / `BRANCH_MISMATCH` / `REPO_MISMATCH`）は英語散文でしか書かれていなかった。**§3 と body の二重管理は機械照合で釘付けにすることで許す** — body 側を削って文書参照に置き換える単一化は D-31 の理由で採らない。
 
 ## §8 運用（順序の SOT は `items` の列挙順 — D-15）
 
