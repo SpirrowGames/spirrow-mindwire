@@ -71,6 +71,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
+from .adapters._sdk_result import emit_sdk_error_marker, find_sdk_error_signal
 from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter, _PathScopeGuard
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
@@ -747,6 +748,21 @@ def main() -> None:
             asyncio.run(run_loop(settings))
     except KeyboardInterrupt:
         logger.info("stage3 loop interrupted; shut down cleanly")
+    except BaseException as exc:
+        # Exit-time SDK-error marker (T-sdk-is-error-loses-the-reason S-6,
+        # second copy). The adapter already emitted an identical marker at the
+        # raise site — this re-emission is the belt to that suspender: it makes
+        # the marker the LAST line stdout carries, so the 50-line
+        # ``session_log_tail`` window PowerShell captures cannot push it out
+        # even if the SDK subprocess's teardown prints anything afterwards.
+        # Two writes with the same JSON payload are unambiguous — a reader
+        # sees the same ``sdk_error_detail=...`` twice, not two different
+        # stories. If the exception did not wrap an ``SdkIsErrorSignal`` the
+        # walker returns ``None`` and this block is a no-op.
+        sig = find_sdk_error_signal(exc)
+        if sig is not None:
+            emit_sdk_error_marker(sig.detail)
+        raise
 
 
 __all__ = [

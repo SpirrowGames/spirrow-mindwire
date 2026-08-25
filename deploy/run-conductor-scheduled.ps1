@@ -599,6 +599,44 @@ function Get-FingerprintHint {
     return ($parts -join " / ")
 }
 
+# Build a repro_hint string from a quarantine record's existing fields
+# (T-sdk-is-error-loses-the-reason D-6 / S-8). NEVER accepts a new probe input:
+# the whole regularity the design leans on is "runner uses only what it already
+# has in hand for its own purposes" (see the FINGERPRINT rule in the record
+# docblock). What was missing was DRAWING — the head / control / log path values
+# were there, but nothing composed them into something a human could paste into
+# a terminal.
+#
+# Deliberately named `repro_hint` not `repro`: the H2 (systematic) judgement
+# means "same failure twice", NOT "deterministic under these conditions".
+# Overclaiming determinism here is the exact overclaim the wider design refuses.
+#
+# $Fingerprint is untyped for the same reason Get-FingerprintHint's is untyped —
+# it may be a native hashtable (fresh) or a PSCustomObject (JSON round-tripped).
+function Get-QuarantineReproHint {
+    param(
+        $Fingerprint,
+        [string]$SessionLogPath,
+        [string]$Key
+    )
+
+    if (-not $Fingerprint) { return $null }
+    $head    = $Fingerprint.head
+    $control = $Fingerprint.control
+    # Both components must be present for the line to be useful; a partial hint
+    # would suggest the runner has a repro command it does not have.
+    if (-not $head -or -not $control) { return $null }
+
+    # Wall-clock ISO 8601 timestamp is deliberately absent — the record already
+    # carries first_failure_at / last_failure_at, and duplicating them in the
+    # hint invites drift when they refresh.
+    $line = "repro-hint: $Key で head=$head control=$control のとき失敗"
+    if ($SessionLogPath) {
+        $line += " — ログ: $SessionLogPath"
+    }
+    return $line
+}
+
 # Human-readable duration for the digest. "3d 4h" / "18h" / "45m". Kept deliberately coarse — this
 # is a wall-clock display, not a metric, so seconds are pointless.
 function Format-DurationDigest {
@@ -717,9 +755,18 @@ function New-DailyDigest {
         }
         $hint = Get-FingerprintHint -Fingerprint $rec.failure_fingerprint `
                                     -CurrentHead $curHead -CurrentControl $curControl
+        # T-sdk-is-error-loses-the-reason S-8: a repro_hint from record-fields
+        # only (fingerprint + session_log_path). Suffixed to the same line as
+        # the age / movement-hint so the digest keeps its one-line-per-entry
+        # shape, but appended only when the fields the hint needs are actually
+        # present — a partial line ("head=None") would be worse than none.
+        $reproHint = Get-QuarantineReproHint -Fingerprint $rec.failure_fingerprint `
+                                             -SessionLogPath $rec.session_log_path `
+                                             -Key $key
 
         $line = "  $key   $age"
         if ($hint) { $line += "   ⚠ $hint" }
+        if ($reproHint) { $line += "`n    $reproHint" }
 
         switch ($derived) {
             'stale'       { $staleList       += $line }
@@ -2402,12 +2449,17 @@ try {
             # is the failure fingerprint so a re-quarantine after Clear-Quarantine (which drops the
             # signature) re-alerts, but a same-tick duplicate is impossible (candidate is skipped
             # once quarantined, above).
+            $reproHint = Get-QuarantineReproHint -Fingerprint $rec.failure_fingerprint `
+                                                 -SessionLogPath $rec.session_log_path `
+                                                 -Key $cand.key
+            $notificationBody = "MindWire: **$($cand.key)** を隔離しました (exit=$code, reason=$($verdict.reason))。" +
+                                "以後この tick からは skip されます。復帰するには " +
+                                "``pwsh deploy/Clear-Quarantine.ps1 -Thread '$($cand.key)' -Reason '...'``。" +
+                                "ダイジェストにも別掲されます。"
+            if ($reproHint) { $notificationBody += "`n$reproHint" }
             Send-NotificationIfChanged -State $notifyState -Key "__quarantine__/$($cand.key)" `
                 -Signature "${nowIso}:${code}:$($verdict.reason):${probeHead}" `
-                -Message ("MindWire: **$($cand.key)** を隔離しました (exit=$code, reason=$($verdict.reason))。" +
-                          "以後この tick からは skip されます。復帰するには " +
-                          "``pwsh deploy/Clear-Quarantine.ps1 -Thread '$($cand.key)' -Reason '...'``。" +
-                          "ダイジェストにも別掲されます。")
+                -Message $notificationBody
 
             # K-budget short-circuit. Two quarantines in one sweep suggest a shared cause; keep
             # spending inferences past the second is the exact "keep bleeding" failure mode this

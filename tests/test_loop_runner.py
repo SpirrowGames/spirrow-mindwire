@@ -832,3 +832,75 @@ def test_ensure_utf8_runtime_respects_explicit_override(monkeypatch: pytest.Monk
     monkeypatch.setenv("PYTHONUTF8", "0")
     loop_runner._ensure_utf8_runtime()
     assert os.environ["PYTHONUTF8"] == "0"
+
+
+# --------------------------------------------------------------------------- #
+# T-sdk-is-error-loses-the-reason S-6 — exit-time marker re-emission
+# --------------------------------------------------------------------------- #
+
+
+def test_main_reemits_sdk_error_marker_on_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When the run raises with an ``SdkIsErrorSignal`` in the chain, ``main``
+    re-emits the marker at exit so it is the LAST line stdout carries.
+
+    The raise-site copy has already been emitted by the adapter, but between
+    the raise and process exit the SDK subprocess's teardown can add more
+    lines. The 50-line ``session_log_tail`` window PowerShell captures is not
+    infinite: pushing the marker to the end guarantees it stays inside it in
+    the ordinary exit path.
+    """
+    from spirrow_mindwire.adapters._sdk_result import SdkIsErrorSignal
+
+    signal_detail = {
+        "reason_source": "result",
+        "message": "429 rate limit",
+        "captured_fields": {"session_id": "exit-test-sid"},
+    }
+
+    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+        try:
+            raise SdkIsErrorSignal(signal_detail)
+        except SdkIsErrorSignal as sig:
+            # This mirrors what deliver_event does — wraps the signal in the
+            # adapter's typed delivery error while preserving the __cause__.
+            raise RuntimeError("wrapped delivery failure") from sig
+
+    monkeypatch.setattr(loop_runner, "run_conductor", _fake_run_conductor)
+    monkeypatch.setattr(loop_runner, "load_settings", lambda: MindwireSettings())
+    monkeypatch.setattr("sys.argv", ["mindwire-loop", "--mode", "conductor"])
+
+    with pytest.raises(RuntimeError):
+        loop_runner.main()
+
+    out = capsys.readouterr().out
+    # The marker is on stdout and carries the same detail the signal held.
+    assert "sdk_error_detail=" in out
+    assert "exit-test-sid" in out
+    # And it is the LAST non-empty stdout line — a subsequent teardown line
+    # (which this test does not simulate) would come from a spawned subprocess
+    # anyway; the point is that the runner itself does not print anything AFTER
+    # the marker.
+    last_nonempty = [line for line in out.splitlines() if line.strip()][-1]
+    assert last_nonempty.startswith("sdk_error_detail=")
+
+
+def test_main_does_nothing_extra_when_the_error_has_no_sdk_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The exit handler is a no-op when the failure was not an SDK is_error."""
+
+    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+        raise RuntimeError("unrelated crash")
+
+    monkeypatch.setattr(loop_runner, "run_conductor", _fake_run_conductor)
+    monkeypatch.setattr(loop_runner, "load_settings", lambda: MindwireSettings())
+    monkeypatch.setattr("sys.argv", ["mindwire-loop", "--mode", "conductor"])
+
+    with pytest.raises(RuntimeError):
+        loop_runner.main()
+
+    assert "sdk_error_detail=" not in capsys.readouterr().out

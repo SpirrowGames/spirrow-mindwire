@@ -73,6 +73,11 @@ from ..value_objects import (
     SessionState,
     ThreadRef,
 )
+from ._sdk_result import (
+    SdkIsErrorSignal,
+    capture_is_error_detail,
+    emit_sdk_error_marker,
+)
 
 _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
     {SessionState.HALTING, SessionState.HALTED, SessionState.FAILED}
@@ -257,7 +262,14 @@ async def _drain_reply(client: _SdkClient) -> tuple[str, Any]:
     if final is None:
         raise RuntimeError("SDK session ended without a ResultMessage")
     if getattr(final, "is_error", False):
-        raise RuntimeError(getattr(final, "result", None) or "SDK session reported is_error")
+        # Same structured capture as claude_code_sdk's drain
+        # (T-sdk-is-error-loses-the-reason). Fixing only one adapter would let
+        # naysayer failures — the most expensive kind to lose because they burn
+        # the paid Lexora/Gemini tier — continue disappearing behind the
+        # pre-change constant string.
+        detail = capture_is_error_detail(final)
+        emit_sdk_error_marker(detail)
+        raise SdkIsErrorSignal(detail)
     return "".join(chunks), final
 
 
@@ -545,9 +557,35 @@ class NaysayerSdkAdapter:
                 f"per-turn preflight attestation failed for session {handle.session_id}; "
                 f"refusing to post an unattested naysayer verdict: {exc}"
             ) from exc
+        # Three-way ErrorInfo.code split — same reasoning as
+        # ClaudeCodeSdkAdapter.deliver_event (T-sdk-is-error-loses-the-reason
+        # D-3(c)): SDK is_error, on_reply raised, and everything else each
+        # need a different next hand from the operator.
         try:
             await session.client.query(_build_prompt(event, session.own_role))
             body, result = await _drain_reply(session.client)
+        except SdkIsErrorSignal as sig:
+            session.state = SessionState.FAILED
+            session.error = ErrorInfo(
+                code="adapter.sdk_is_error",
+                message=str(sig),
+                raised_at=datetime.now(UTC),
+            )
+            raise NaysayerSdkDeliveryError(
+                f"deliver_event failed for session {handle.session_id}: {sig}"
+            ) from sig
+        except Exception as exc:
+            session.state = SessionState.FAILED
+            session.error = ErrorInfo(
+                code="adapter.delivery_failed",
+                message=str(exc),
+                raised_at=datetime.now(UTC),
+            )
+            raise NaysayerSdkDeliveryError(
+                f"deliver_event failed for session {handle.session_id}: {exc}"
+            ) from exc
+
+        try:
             await session.ctx.on_reply(
                 ReplyDraft(
                     body=body,
@@ -562,7 +600,7 @@ class NaysayerSdkAdapter:
         except Exception as exc:
             session.state = SessionState.FAILED
             session.error = ErrorInfo(
-                code="adapter.delivery_failed",
+                code="adapter.on_reply_failed",
                 message=str(exc),
                 raised_at=datetime.now(UTC),
             )
