@@ -4,9 +4,9 @@ Two entry points:
 
 - :func:`load_legitimate_roles` reads the YAML, validates the shape, applies
   the ADR-11 normalisation to every identity name, and rejects the file on
-  either a schema violation or a collision (the "strict-by-default" side of
-  ADR-11 — a classification file where two entries collide would silently
-  drop one).
+  either a schema violation or a collision — exact-duplicate ``name`` and
+  ADR-11 near-duplicate alike (the "strict-by-default" side of ADR-11 — a
+  classification file where two entries collide would silently drop one).
 
 - :func:`derive_allowed_and_residual` implements msg-1493 §2 / §3 **as
   corrected by msg-1585 §3** (the Bohr post that follows msg-1536 in
@@ -28,7 +28,7 @@ calls it to build findings. One derivation, two callers — msg-1493 §2's "**�
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,12 +104,19 @@ def load_legitimate_roles(path: Path) -> LegitimateRolesFile:
     """Read, validate, and normalise the classification YAML.
 
     Raises :class:`ClassificationError` for a schema violation
-    (missing/unknown fields, wrong types, kind-vs-legitimate mismatch) and
-    :class:`IdentityCollisionError` for an ADR-11 injectivity violation
-    across the file's identity names (two entries whose ``name`` normalises
-    to one key). Both are hard stops rather than warnings — a classification
-    file that has silently merged two identities is worse than no
-    classification, because it looks authoritative.
+    (missing/unknown fields, wrong types, kind-vs-legitimate mismatch, or two
+    entries with a byte-identical ``name`` — :func:`_reject_duplicate_names`)
+    and :class:`IdentityCollisionError` for an ADR-11 injectivity violation
+    across the file's identity names (two DIFFERENT spellings whose ``name``
+    normalises to one key). Both are hard stops rather than warnings — a
+    classification file that has silently merged two identities is worse than
+    no classification, because it looks authoritative.
+
+    The two duplicate checks are distinct and run in that order.
+    :func:`~.normalize.find_collisions` folds byte-identical raw strings by
+    design, so it is structurally blind to an exact duplicate; the exact-name
+    check therefore cannot be delegated to it and must run first, so the file
+    that has both defects reports the more specific one.
     """
     raw_text = path.read_text(encoding="utf-8")
     try:
@@ -130,11 +137,50 @@ def load_legitimate_roles(path: Path) -> LegitimateRolesFile:
     for i, raw in enumerate(raw_entries):
         entries.append(_parse_entry(raw, i, path))
 
+    _reject_duplicate_names(entries, path)
+
     collisions = find_collisions(entry.name for entry in entries)
     if collisions:
         raise IdentityCollisionError(collisions)
 
     return LegitimateRolesFile(version=version, entries=tuple(entries))
+
+
+def _reject_duplicate_names(entries: Sequence[ClassificationEntry], path: Path) -> None:
+    """Reject two entries that share a byte-identical ``name``.
+
+    :func:`~.normalize.find_collisions` deliberately skips a raw string it has
+    already recorded under the same key (``if raw in seen[key]: continue``), so
+    a file that writes one ``name`` twice reaches it as
+    ``["pr-gate-relay", "pr-gate-relay"]`` and comes back ``{}`` — no collision,
+    no exception. That fold is correct for the caller it was written for (a
+    live corpus, where one author string seen a thousand times is one identity,
+    not a thousand collisions) and wrong here, because a file is not a corpus:
+    two blocks bearing one ``name`` are two rows claiming one identity, and
+    :meth:`LegitimateRolesFile.by_key` returns the first while the second
+    vanishes — typically the copy-paste accident whose second block carries a
+    different ``kind`` / ``legitimate``. Exact duplication is thus the one way
+    past this loader's promise that a silently merged classification is a hard
+    stop, which is why the check lives here instead of in ``find_collisions``
+    (changing the fold would break the corpus caller's meaning of "collision").
+
+    Reported as a :class:`ClassificationError` — a schema violation — rather
+    than :class:`~.normalize.IdentityCollisionError`, because the defect does
+    not depend on the ADR-11 rule at all: the file would be broken with no
+    normalisation whatsoever. ``IdentityCollisionError`` stays what its message
+    says it is, an ADR-11 injectivity violation between two DIFFERENT spellings
+    that the normalisation collapses onto one key.
+    """
+    first_seen: dict[str, int] = {}
+    for index, entry in enumerate(entries):
+        previous = first_seen.get(entry.name)
+        if previous is not None:
+            raise ClassificationError(
+                f"{path}: identities[{index}].name duplicates identities[{previous}].name "
+                f"({entry.name!r}) — each identity must appear exactly once; by_key() would "
+                f"return the earlier entry and silently drop this one"
+            )
+        first_seen[entry.name] = index
 
 
 def _parse_entry(raw: Any, index: int, path: Path) -> ClassificationEntry:

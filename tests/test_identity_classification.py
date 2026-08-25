@@ -210,6 +210,62 @@ identities:
         with pytest.raises(IdentityCollisionError):
             load_legitimate_roles(path)
 
+    def test_exact_duplicate_name_rejected(self, tmp_path: Path) -> None:
+        # find_collisions() folds byte-identical raw strings by design (its
+        # live-corpus caller needs that fold), so the ADR-11 injectivity gate is
+        # structurally blind to this file: without the loader's own exact-name
+        # check it loads clean, by_key("pr-gate-relay") returns the machine row,
+        # and the participant row below it — the copy-paste accident that
+        # changed kind/legitimate — is silently dropped. The loader's docstring
+        # promises a hard stop, so the duplicate must raise, not merge.
+        path = _write_yaml(
+            tmp_path,
+            """
+version: 1
+identities:
+  - name: pr-gate-relay
+    kind: machine
+    legitimate: []
+    primary_source: "x"
+    reason: "y"
+  - name: pr-gate-relay
+    kind: participant
+    legitimate: ["naysayer"]
+    primary_source: "x"
+    reason: "y"
+""".strip(),
+        )
+        with pytest.raises(ClassificationError, match=r"identities\[1\].name duplicates"):
+            load_legitimate_roles(path)
+
+    def test_byte_identical_duplicate_blocks_rejected_not_deduplicated(
+        self, tmp_path: Path
+    ) -> None:
+        # The wholly identical copy-paste is the tempting one to tolerate ("both
+        # rows say the same thing, just keep one"). The loader does not: it has
+        # no way to tell an accidental paste from an edit that was meant to
+        # change the second row and did not, and quietly collapsing rows is the
+        # silent merge the strict-by-default rule exists to forbid.
+        path = _write_yaml(
+            tmp_path,
+            """
+version: 1
+identities:
+  - name: naysayer-pr-review
+    kind: participant
+    legitimate: ["naysayer"]
+    primary_source: "x"
+    reason: "y"
+  - name: naysayer-pr-review
+    kind: participant
+    legitimate: ["naysayer"]
+    primary_source: "x"
+    reason: "y"
+""".strip(),
+        )
+        with pytest.raises(ClassificationError, match="each identity must appear exactly once"):
+            load_legitimate_roles(path)
+
 
 class TestDerivation:
     def test_all_observed_legitimate_returns_full_allowed_and_empty_residual(self) -> None:
