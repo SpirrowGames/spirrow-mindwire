@@ -290,22 +290,35 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
   role: implementer
   body: |
     Open every reply in which you performed, or attempted, implementation work
-    with a receipt naming what you actually read this turn, on one line:
+    with a receipt naming what you actually read this turn, on one line. A turn
+    you stopped on because the pin did not resolve is an attempted turn and
+    needs one too:
 
       SPEC <spec_id> <blob_sha first 12> <path> (pin: RESOLVED)
 
-    or, when the pin did not resolve:
+    or, when the pin did not resolve and OBL-SPEC-PIN let you go on:
 
       SPEC (pin: NO-PIN/<reason code>) — worked from message body only
 
-    Follow it with the item ids from the specification you acted on. The
-    receipt reports what you read, not what you believe to be true: if you
-    worked from the message body alone, it says NO-PIN and names no sha, and
-    that is a correct receipt, not a confession. A reply that does work without
-    a receipt is incomplete. A receipt naming a sha you did not read in this
-    turn is a false statement about your own execution, and is worse than no
-    receipt at all — it is the one claim in your output that no reviewer can
-    check against the diff, so it is the one claim you must not get wrong.
+    or, when the pin did not resolve and OBL-SPEC-PIN made you stop:
+
+      SPEC (pin: NO-PIN/<reason code>) — halted, no work from message body
+
+    OBL-SPEC-PIN decides which of those two you are in, and this obligation
+    asks only that the line you print match what you actually did. Never print
+    the worked-from-message-body form after stopping: it would claim you did
+    the one thing that obligation forbade, and a receipt confessing a violation
+    you did not commit is as false as one hiding a violation you did.
+
+    Follow a receipt you worked under with the item ids from the specification
+    you acted on; after a halt there are none, so name what you were asked to
+    do and which code stopped you instead. The receipt reports what you read,
+    not what you believe to be true: naming no sha is a correct receipt, not a
+    confession. A reply that does work without a receipt is incomplete. A
+    receipt naming a sha you did not read in this turn is a false statement
+    about your own execution, and is worse than no receipt at all — it is the
+    one claim in your output that no reviewer can check against the diff, so it
+    is the one claim you must not get wrong.
 ```
 
 ### §4-3 `OBL-SPEC-SCOPE-CLOSURE`
@@ -412,6 +425,7 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 - **A-25** 本 manifest の**本文（決定・スキーマ・受け入れ条件）および front-matter（`items` の `id` / `title` / `paths` / `withdrawn_reason` を含む全フィールド）**のいずれにも、`spirrow-mindwire` 以外の repo に対して作業・状態変更を**要求する**記述が無い（D-22）。**front-matter を明示的に含めるのは、dispatch されるのが item だからである** — cross-repo mandate を機械が実際に運べる唯一の面がそこであり、I-5 が現にそうだった（I-4 と I-5 は `paths` が同一で、両者を分けていたのは `title` の散文だけである）。V-11 / V-12 は manifest 直下の `target_repo` しか見ず、item の散文は素通りする。実測の記述（E-6 / E-10）と、withdrawn item がなぜ消えたかの記録（I-5 / D-23）は要求ではない ∴ 本条件に反しない。散文でこの規律が破れることは機械では検出できない — 本条件はその穴を人手の検査で塞ぐものであり、A-15 / A-17 と同じ種類の受け入れ条件である。
 - **A-26** `OBL-SPEC-PIN` の body だけを読んで、§3 の 11 reason code すべてについて「停止するか、message body で続行してよいか」が一意に決まる。続行してよいのは `ABSENT` の 1 code のみであり、残り 10 code はすべて停止である（D-24）。11 code のどれを当てても判断が未定義にならないこと。**回帰防止**: `REPO_MISMATCH` は D-24 が FAULT と名指ししながら義務文の停止列挙から漏れていた（r11 で検出）。
 - **A-27** `I-4` を実行した状態（`.gitignore` に `.mindwire/` があり、`.mindwire/pin` が `git status --porcelain` に現れない — A-13）が `OBL-SPEC-PIN` の負の制約に**違反しない**ことが、body の文面だけから判断できる。**根拠**: `git check-ignore -v .mindwire/pin` は `.mindwire/` 規則が pin ファイル自体を無視すると報告する（実測 2026-08-25）∴「ディレクトリを ignore しただけで pin は ignore していない」という読みは成立せず、body 側で明示的に許す必要がある。
+- **A-28** `OBL-SPEC-RECEIPT` の body だけを読んで、pin が解決しなかったターンの receipt が 2 形あることが分かり、どちらを書くかが「そのターンで実際に message body から作業したか否か」で一意に決まる。停止したターンに `worked from message body only` を書かせる読みが成立しないこと。**回帰防止**: r11 が `OBL-SPEC-PIN` で `NO-PIN` を `ABSENT` と 10 個の FAULT に割った際、receipt 側は単一形のまま残り、FAULT で停止した agent に「message body のみから作業した」と申告させていた＝D-24 が禁じた当の行為を自己申告させる形であった。**分類そのものは `OBL-SPEC-RECEIPT` に複製しない** — どの code がどちらのクラスかは `OBL-SPEC-PIN`（A-26）が唯一の正本であり、receipt 側には実行結果と一致させることだけを課す（複製がこの drift を生んだ）。
 
 ## §8 運用（順序の SOT は `items` の列挙順 — D-15）
 
