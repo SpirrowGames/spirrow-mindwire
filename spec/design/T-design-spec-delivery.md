@@ -108,9 +108,11 @@ U-1（implementer の allow-list に `Bash` ないし `git fetch` が含まれ�
 - **D-21（診断は常態で鳴らない）** 定常状態で恒久的に warning を出す診断を設計しない。常に鳴っている警告は警告ではなく、本当に見るべきものを隠す。main 上の常態は **warning 0** である（A-12）。
 - **D-22（1 spec = 1 target repo）** spec ファイルは、それが置かれている repo に対してのみ authoritative である。`target_repo` はそのファイルを収める repo と一致しなければならず（`verify.py` の V-11 が照合する）、item 側で上書きできない（V-12）。N repo に跨る設計は N 本の spec になり、共通の `design_id`（スレッド id）と、名前だけの `siblings` で結ぶ。sibling は pin で結ばない（結べない — pin は local object DB を引くため、他 repo の commit はそこに無い）。列挙は人間向けであって解決機構ではない。棄却した代替 3 案（cross-repo だけ `NO-PIN` ＋全文インライン／spec blob の vendor 複製／対象 repo から他 repo の object を fetch）の論拠は thread に残す（D-1）。
 - **D-23（I-5 は withdrawn にする）** I-5 は D-22 違反 ∴ item 側 `status: withdrawn` ＋ `withdrawn_reason` とする。削除しないのは、なぜ消えたかが残る方が将来の再提案を防ぐからである。D-18 が enum に `withdrawn` を残したのはこの用途である。
-- **D-24（`NO-PIN` を 2 クラスに割る）**
-  - **ABSENT** — dispatch に pin が無い。D-12 のブートストラップ窓（spec が `main` に未着）に限り sanctioned であり、message body のみで作業してよい。
-  - **FAULT** — pin は発行されたが解決しなかった（`REPO_MISMATCH` / `COMMIT_UNREACHABLE` / `BLOB_UNREADABLE`、§3 の fallback を尽くした後）∴ 停止して報告する。**message body で作業を続行してはならない。**
+- **D-24（`NO-PIN` を 2 クラスに割る — 分割は §3 の 11 code 全体を覆う）**
+  - **ABSENT** — `.mindwire/pin` が存在しない（§3 手順 1）。**ABSENT クラスに属するのはこの 1 code のみである。** D-12 のブートストラップ窓（spec が `main` に未着）に限り sanctioned であり、message body のみで作業してよい。**窓の外で `ABSENT` を引いた場合は sanctioned ではない** ∴ FAULT と同じく停止して報告する。
+  - **FAULT** — pin は発行されたが解決しなかった。**残り 10 code のすべて**（`PARSE_ERROR` / `SCHEMA_VERSION` / `MISSING_FIELD` / `DETACHED_HEAD` / `BRANCH_MISMATCH` / `REPO_MISMATCH` / `FETCH_UNAVAILABLE` / `COMMIT_UNREACHABLE` / `BLOB_UNREADABLE` / `SHA_MISMATCH`、§3 の fallback を尽くした後）∴ 停止して報告する。**message body で作業を続行してはならない。**
+  - **分割は全域かつ排他である。** §3 に新しい reason code が追加された場合、それは既定で FAULT に属する。ABSENT に code を足すには本決定を改訂しなければならない（fail-closed — D-6）。この既定を置くのは、code 追加のたびに義務文の列挙が黙って陳腐化する経路を塞ぐためである。
+  - `BRANCH_MISMATCH` について D-7 が言う「存在しないものとして扱う」は**解決手順の話**（その pin を仕様として採用しない）であって、クラス分けの話ではない。他ブランチ宛ての pin が作業ツリーに在ること自体が dispatcher 側の故障である ∴ FAULT である。
   - 根拠: 「pin が出ているのに解決しない」は上流の故障であって、劣化運転してよい状態ではない。body で続行するのは本スレッドの起点となった失敗そのものである。
 - **D-25′（改訂の運び方 — base-hash ＋ 構造アンカー ＋ NEW のみ）** proposer の改訂は対象ファイルの blob sha（`base`）を名指す。implementer は編集前に照合し、一致しなければ `BASE_MISMATCH` で停止する。これが陳腐化検査であり、逐語 byte を 1 文字も要さない。
   - **照合は 2 段**（U-3）: ① `git status --porcelain -- <path>` が空であること ② `git rev-parse HEAD:<path>` が `base` と一致すること。**作業ツリーのハッシュ化（`git hash-object`）を使わない** ∴ `core.autocrlf` / clean-smudge filter の影響を受けず、偽 `BASE_MISMATCH` が起きない。
@@ -239,32 +241,45 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
     collapsing them costs the reader the diagnosis.
 
     NO-PIN is a state to report, not an obstacle to route around. Say NO-PIN in
-    your reply with its reason code, and treat the message body you were given
-    as the only specification you have for this turn. Do not reconstruct,
-    infer, or recall specification content you cannot read in this turn: a
-    remembered spec and a read spec are indistinguishable in your own output
-    and distinguishable to no one else. If the message body alone does not
-    contain enough to act on, stop and say what is missing.
+    your reply with its reason code. What you may do after that depends on the
+    code, and there are exactly two classes. ABSENT — there is no
+    `.mindwire/pin` file at all — is the only code under which you may proceed
+    on the message body, and only because no pin was ever issued for you to
+    lose. Every other code means a pin was issued and did not resolve. That is
+    an upstream fault, not a degraded mode you may run in: stop, report the
+    code, and do not carry out the turn's work from the message body. Do not
+    reconstruct, infer, or recall specification content you cannot read in this
+    turn: a remembered spec and a read spec are indistinguishable in your own
+    output and distinguishable to no one else. When you are proceeding under
+    ABSENT and the message body alone does not contain enough to act on, stop
+    and say what is missing.
 
-    Never delete `.mindwire/pin`. Do not delete, rename, move, truncate,
-    rewrite, or gitignore it, and do not include it in any cleanup, tidying, or
-    formatting change. If it looks stale, wrong, or inconsistent with the work
-    you were asked to do, report that and stop; the pin is written by the
-    dispatcher and is not yours to correct.
+    Never delete `.mindwire/pin`. Do not delete, rename, move, truncate, or
+    rewrite it, and do not include it in any cleanup, tidying, or formatting
+    change. Keeping `.mindwire/` out of version control is not covered by that
+    prohibition: when an item of the governing specification declares the
+    change, adding `.mindwire/` to `.gitignore` is required work, and it leaves
+    the pin file itself untouched on disk. What this paragraph forbids is
+    making the pin go away or changing what it says — not making it untracked.
+    If it looks stale, wrong, or inconsistent with the work you were asked to
+    do, report that and stop; the pin is written by the dispatcher and is not
+    yours to correct.
 
     When the pin resolves, the pinned document is the specification for the
     turn. The message body may narrow what you are asked to do within that
     document, but it may not silently contradict it. If it does, stop and
     report the contradiction, naming both sides; do not choose one and proceed.
 
-    If you cannot read the pinned document — reasons BLOB_UNREADABLE,
-    COMMIT_UNREACHABLE, FETCH_UNAVAILABLE, or SHA_MISMATCH — declare it
-    unreadable in the same form OBL-DECLARE-UNREADABLE requires for the sources
-    it names, and stop there. Reading that entry for the declaration form is
-    part of this obligation.
+    Four faults mean you could not read the pinned document at all —
+    BLOB_UNREADABLE, COMMIT_UNREACHABLE, FETCH_UNAVAILABLE, and SHA_MISMATCH.
+    For those, your report must also declare the document unreadable in the
+    same form OBL-DECLARE-UNREADABLE requires for the sources it names, and
+    reading that entry for the declaration form is part of this obligation.
+    This is the list of codes that need the extra declaration. It is not the
+    list of codes that make you stop: you stop on every code except ABSENT.
 ```
 
-本 body の `Never delete ...` の段落は、本設計 §1 の負の制約の**逐語**である。実装時に改稿してはならない。
+本 body の `Never delete ...` 段落は、本 manifest が定める負の制約そのものである。**§4-1 のこの本文が唯一の正本であり**、本書の他節に原文があるわけではない（r11 以前の本行は「本設計 §1 の負の制約の逐語」と書いていたが、§1 にその原文は存在しない — 宙に浮いた参照であった。§0 のとおり本書は自己完結する ∴ 本書内で解決しない参照を残さない）。実装時に改稿してはならず、`obligations.yaml` には逐語で載せること（A-2）。
 
 末尾段落は D-9 の帰結であり、`OBL-DECLARE-UNREADABLE` の body には**一切触れない**ことでその entry の `origin.original_length`（E-9）を保つ。
 
@@ -395,6 +410,8 @@ reason code は上記 11 種で閉じる（`ABSENT` / `PARSE_ERROR` / `SCHEMA_VE
 - **A-23** `target_repo` を実在の remote basename と異なる値にすると V-11 が error を出す。`origin` remote を持たない作業コピーでは V-11 が error を出さず info を 1 件出し、exit code は 0 のままである。
 - **A-24** item 側に `target_repo` を書くと V-12 が error を出す（D-22 の回帰防止）。
 - **A-25** 本 manifest の**本文（決定・スキーマ・受け入れ条件）および front-matter（`items` の `id` / `title` / `paths` / `withdrawn_reason` を含む全フィールド）**のいずれにも、`spirrow-mindwire` 以外の repo に対して作業・状態変更を**要求する**記述が無い（D-22）。**front-matter を明示的に含めるのは、dispatch されるのが item だからである** — cross-repo mandate を機械が実際に運べる唯一の面がそこであり、I-5 が現にそうだった（I-4 と I-5 は `paths` が同一で、両者を分けていたのは `title` の散文だけである）。V-11 / V-12 は manifest 直下の `target_repo` しか見ず、item の散文は素通りする。実測の記述（E-6 / E-10）と、withdrawn item がなぜ消えたかの記録（I-5 / D-23）は要求ではない ∴ 本条件に反しない。散文でこの規律が破れることは機械では検出できない — 本条件はその穴を人手の検査で塞ぐものであり、A-15 / A-17 と同じ種類の受け入れ条件である。
+- **A-26** `OBL-SPEC-PIN` の body だけを読んで、§3 の 11 reason code すべてについて「停止するか、message body で続行してよいか」が一意に決まる。続行してよいのは `ABSENT` の 1 code のみであり、残り 10 code はすべて停止である（D-24）。11 code のどれを当てても判断が未定義にならないこと。**回帰防止**: `REPO_MISMATCH` は D-24 が FAULT と名指ししながら義務文の停止列挙から漏れていた（r11 で検出）。
+- **A-27** `I-4` を実行した状態（`.gitignore` に `.mindwire/` があり、`.mindwire/pin` が `git status --porcelain` に現れない — A-13）が `OBL-SPEC-PIN` の負の制約に**違反しない**ことが、body の文面だけから判断できる。**根拠**: `git check-ignore -v .mindwire/pin` は `.mindwire/` 規則が pin ファイル自体を無視すると報告する（実測 2026-08-25）∴「ディレクトリを ignore しただけで pin は ignore していない」という読みは成立せず、body 側で明示的に許す必要がある。
 
 ## §8 運用（順序の SOT は `items` の列挙順 — D-15）
 
