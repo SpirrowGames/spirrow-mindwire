@@ -426,15 +426,106 @@ async def test_call_tool_wraps_builtin_timeout_error() -> None:
 
 @pytest.mark.anyio
 async def test_call_tool_unwraps_transport_error_inside_exception_group() -> None:
-    """anyio task groups (used by the mcp streamable-http transport) may wrap a
-    transport failure in an :class:`ExceptionGroup`. The ``except*`` in
-    ``call_tool`` unwraps it so callers see the same :class:`MagickitMcpError`
-    they would for a bare raise.
+    """anyio task groups (used by the mcp streamable-http transport) wrap
+    internal failures in an :class:`ExceptionGroup`. ``call_tool`` splits the
+    group on the transport tuple and re-raises a bare :class:`MagickitMcpError`
+    so the ``LoopControlReader.report_observed`` bare ``except MagickitMcpError``
+    matches — the design point of msg-1685 §2.
     """
     inner = httpx.ConnectError("cannot connect")
     group = ExceptionGroup("mcp transport", [inner])
     with pytest.raises(MagickitMcpError, match="ConnectError"):
         await _RaisingMcp(group).call_tool("x", {})
+
+
+@pytest.mark.anyio
+async def test_call_tool_wraps_transport_error_as_a_bare_magickit_mcp_error() -> None:
+    """PR-gate #178 regression: raising a wrap from *inside* an ``except*`` block
+    bundles it back into an :class:`ExceptionGroup`, which the caller's plain
+    ``except MagickitMcpError`` will NOT match. This test does not rely on
+    ``pytest.raises`` for the match — it inspects ``type(exc)`` directly, so a
+    future edit that re-introduces ``except*`` (or otherwise lets a group escape)
+    fails here even if the naïve match would pass.
+
+    The invariant, in one sentence: what the caller catches must be a bare
+    :class:`MagickitMcpError`, not any subclass or wrapping of it.
+    """
+
+    async def _catch(mcp: _RaisingMcp) -> BaseException:
+        try:
+            await mcp.call_tool("x", {})
+        except BaseException as exc:
+            return exc
+        pytest.fail("call_tool did not raise")
+
+    # 1. Bare transport exception (not in a group).
+    bare_exc = await _catch(_RaisingMcp(httpx.ConnectError("nope")))
+    assert type(bare_exc) is MagickitMcpError, (
+        f"expected a bare MagickitMcpError, got {type(bare_exc).__name__}: {bare_exc!r}"
+    )
+
+    # 2. Transport exception wrapped in an anyio-style ExceptionGroup (the
+    #    production case: the mcp streamable-http transport uses
+    #    ``anyio.create_task_group`` internally, which wraps its inner failure
+    #    in an :class:`ExceptionGroup` on exit).
+    group_exc = await _catch(
+        _RaisingMcp(ExceptionGroup("mcp task group", [httpx.ConnectError("nope")]))
+    )
+    assert type(group_exc) is MagickitMcpError, (
+        "expected a bare MagickitMcpError from a transport-only group, "
+        f"got {type(group_exc).__name__}: {group_exc!r}"
+    )
+
+    # 3. Nested groups (a group inside a group) — still bare wrap at the top.
+    nested = ExceptionGroup("outer", [ExceptionGroup("inner", [httpx.ConnectError("nope")])])
+    nested_exc = await _catch(_RaisingMcp(nested))
+    assert type(nested_exc) is MagickitMcpError, (
+        "expected a bare MagickitMcpError from a nested transport-only group, "
+        f"got {type(nested_exc).__name__}: {nested_exc!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_call_tool_surfaces_transport_and_programming_side_by_side_in_mixed_group() -> None:
+    """If an anyio task group ends with BOTH a transport failure and a
+    programming bug in different tasks, the wrap must remain visible (the
+    caller's ``except MagickitMcpError`` at least gets a fair chance) AND
+    the programming error must not disappear (msg-1685 §2 — programming
+    errors escape). The two are surfaced as siblings in a new group.
+    """
+    mixed = ExceptionGroup(
+        "mcp task group",
+        [httpx.ConnectError("nope"), TypeError("bug in caller args")],
+    )
+    with pytest.raises(BaseExceptionGroup) as excinfo:
+        await _RaisingMcp(mixed).call_tool("x", {})
+    # Both the wrap and the remainder are reachable.
+    flat: list[BaseException] = []
+
+    def _walk(e: BaseException) -> None:
+        if isinstance(e, BaseExceptionGroup):
+            for x in e.exceptions:
+                _walk(x)
+        else:
+            flat.append(e)
+
+    _walk(excinfo.value)
+    kinds = {type(e).__name__ for e in flat}
+    assert "MagickitMcpError" in kinds, f"transport wrap disappeared: {kinds}"
+    assert "TypeError" in kinds, f"programming error disappeared: {kinds}"
+
+
+@pytest.mark.anyio
+async def test_call_tool_lets_group_of_pure_programming_errors_escape_as_group() -> None:
+    """A group with no transport members is re-raised as-is — the runtime's
+    "programming errors escape" invariant holds even under grouping.
+    """
+    group = ExceptionGroup("pure bugs", [TypeError("a"), KeyError("b")])
+    with pytest.raises(BaseExceptionGroup) as excinfo:
+        await _RaisingMcp(group).call_tool("x", {})
+    # No MagickitMcpError should have been introduced.
+    kinds = {type(e).__name__ for e in excinfo.value.exceptions}
+    assert "MagickitMcpError" not in kinds
 
 
 @pytest.mark.anyio

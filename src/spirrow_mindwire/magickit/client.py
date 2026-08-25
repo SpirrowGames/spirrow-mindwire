@@ -296,6 +296,19 @@ def _wrap_transport_error(name: str, exc: BaseException) -> MagickitMcpError:
     return MagickitMcpError(f"magickit MCP call {name!r} failed: {type(exc).__name__}: {exc}")
 
 
+def _first_leaf(exc: BaseException) -> BaseException:
+    """The first non-group exception reached by peeling any nested groups.
+
+    ``ExceptionGroup.split`` returns a matched sub-group whose leaves can
+    themselves be groups (mcp / anyio nest a task-group's inner failure in a
+    per-connection outer group). Peeling to a leaf gives the wrap a concrete
+    class name — ``ConnectError`` rather than ``ExceptionGroup``.
+    """
+    while isinstance(exc, BaseExceptionGroup):
+        exc = next(iter(exc.exceptions))
+    return exc
+
+
 class StreamableHttpChatroomMcp:
     """:class:`McpToolCaller` over the ``mcp`` Streamable HTTP transport.
 
@@ -328,22 +341,49 @@ class StreamableHttpChatroomMcp:
             return await session.call_tool(name, arguments)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        # ``except*`` is used deliberately (not a bare ``except``): the mcp
-        # streamable-http transport uses anyio task groups internally, so a raw
-        # transport failure may reach us wrapped in an :class:`ExceptionGroup`
-        # rather than as itself. ``except*`` matches both cases uniformly. A
-        # non-transport exception (``TypeError``, ``KeyError``, …) inside the
-        # group propagates as an :class:`ExceptionGroup` — not swallowed, and
-        # still recognisable as a programming bug by the runtime — which is
-        # exactly the "programming errors escape" invariant msg-1685 §2
-        # required. :class:`MagickitMcpError` raised by :func:`parse_tool_result`
-        # below the try (envelope elevation / ``isError``) is out of scope
-        # here and propagates unchanged.
+        # Two catch clauses — deliberately not ``except*`` — because we must
+        # hand the caller (``LoopControlReader.report_observed``, whose narrow
+        # ``except MagickitMcpError`` is the whole design of msg-1685 §2) a
+        # **bare** :class:`MagickitMcpError`, not one bundled inside an
+        # :class:`ExceptionGroup`. PR-gate on #178 flagged this: raising from
+        # inside an ``except*`` clause can bundle the newly raised exception
+        # back into a group alongside any unmatched siblings, defeating the
+        # bare-catch contract at the call site. A regular ``except`` block
+        # does not have that behaviour, so the ``raise`` here is guaranteed
+        # bare — pinned by ``test_call_tool_wraps_transport_error_as_a_bare_magickit_mcp_error``.
+        #
+        # * Bare transport exception  → ``except _TRANSPORT_EXCEPTIONS`` → bare wrap.
+        # * ``ExceptionGroup`` containing only transport exceptions (the mcp
+        #   / anyio task-group case; the mcp streamable-http transport wraps
+        #   internal failures in ``anyio.create_task_group``) → the group
+        #   handler splits on ``_TRANSPORT_EXCEPTIONS``, peels to a leaf, and
+        #   re-raises a bare wrap.
+        # * ``ExceptionGroup`` mixing transport + non-transport → the group
+        #   handler surfaces both: the wrap AND the non-transport remainder,
+        #   as a new group. Programming errors stay visible (not silently
+        #   converted to an "MCP failure" — the invariant msg-1685 §2 asked
+        #   for) while the transport failure is still recognisable.
+        # * ``ExceptionGroup`` with no transport exceptions → re-raised as-is
+        #   (pure programming errors escape).
+        # * Bare programming error → uncaught, propagates as-is.
         try:
             result = await self._call_mcp(name, arguments)
-        except* _TRANSPORT_EXCEPTIONS as group:
-            first = next(iter(group.exceptions))
-            raise _wrap_transport_error(name, first) from first
+        except _TRANSPORT_EXCEPTIONS as exc:
+            raise _wrap_transport_error(name, exc) from exc
+        except BaseExceptionGroup as group:
+            transport_part, remainder = group.split(_TRANSPORT_EXCEPTIONS)
+            if transport_part is None:
+                raise  # no transport exceptions in the group — pure programming errors
+            first = _first_leaf(transport_part)
+            wrapped = _wrap_transport_error(name, first)
+            if remainder is None:
+                raise wrapped from first  # bare MagickitMcpError to the caller
+            # Transport + non-transport siblings: keep the wrap visible next
+            # to the programming-error remainder so neither disappears.
+            raise BaseExceptionGroup(
+                "magickit call: transport failure alongside non-transport error",
+                [wrapped, remainder],
+            ) from first
         return parse_tool_result(result)
 
 
