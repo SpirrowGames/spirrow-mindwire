@@ -1,6 +1,52 @@
+# STATUS: RETIRED — historical record only (2026-08-26)
+
+**This entire document — both the PR-1 section and the PR-3 section that follows
+it — describes machinery that has been removed from the codebase. Do not use it
+as a spec. Do not go looking for the functions, modules, or fields it names.**
+
+The per-call `can_use_tool` allow-list, together with the classifier
+(`allowlist.py`), the denial record (`denial_record.py`), the redactor, the
+`ImplementerAllowlistError` type, and every layer-A / layer-B field the two
+sections below discuss (`build_denial_record`, `rule_id`, `indirection_gate`,
+`corroborated`, `context_window`, `match_offset`, `evidence_status`,
+`target_root_relation`, …) were retired on **2026-08-20** by these commits, all
+ancestors of `main`:
+
+| commit | subject |
+|---|---|
+| `773ee24` | `feat(implementer): remove the allow-list gate, with its tests (1/2) (#165)` |
+| `e7b359a` | `feat(implementer): remove the allow-list gate from the adapter` |
+| `72339ee` | `chore(allowlist): delete the modules the gate used (#166)` — deleted `src/spirrow_mindwire/allowlist.py` (414 lines), `src/spirrow_mindwire/denial_record.py` (151 lines), `src/spirrow_mindwire/adapters/implementer_allowlist.yaml` (135 lines) |
+
+The invariants those modules approximated are now enforced outside the agent
+(GitHub org ruleset `guard-default-branch`, `spirrow_mindwire.preflight` P0/P1/P2,
+the egress proxy allow-list, and the implementer clone being disposable). See
+`src/spirrow_mindwire/adapters/implementer.py` module docstring for the
+first-person narrative of the retirement, and `spec/design/T-design-spec-delivery.md`
+fact **E-12** for the environmental record.
+
+The reason this file remains in the tree, rather than being deleted, is that the
+measurement work behind it (msg-916 through msg-1714 of thread
+`T-denial-detail-and-overdeny`) produced architectural lessons that apply to any
+future refusal-diagnostic surface in this project. Those lessons are recorded in
+**§K — Knowledge to keep** at the bottom of the file. Everything above that
+section is the archived reasoning that produced them.
+
+If you are reading this because a future halt looks similar to what it
+describes: **check §K first**, and open a new thread rather than trying to
+resurrect this one.
+
+---
+
 # T-denial-detail-and-overdeny — PR-1: record what was attempted, not just which rule fired
 
-- **status**: active
+- **status**: **retired 2026-08-26** — the machinery this section describes
+  (`ImplementerAllowlistError`, `build_denial_record`, `allowlist.py`,
+  `denial_record.py`, `_RAW_COARSE`, `_INDIRECTION_RE`, layer A / layer B, the
+  redactor, and every field they own) was **deleted** on 2026-08-20 (see the
+  file header for commit list). The section is kept as a historical record of
+  the reasoning that produced §K's lessons. **The implementation described
+  below does not exist in the codebase.**
 - **thread**: `T-denial-detail-and-overdeny` (spirrow-mindwire chatroom)
 - **author of the spec below**: Bohr (proposer). Transcribed here verbatim in substance
   as spec task **S0**; the anchor for every later turn is *this file*, not a msg-id.
@@ -143,14 +189,36 @@ nothing is executed.
 
 # PR-3 — give structural verdicts a first-order evidence surface
 
-- **status**: frozen 2026-08-16 (chatroom); landed here 2026-08-26 as task **P3-S0**
-  (Bohr's method fix: never declare a design frozen without materialising it into a
-  durable medium).
+**STATUS: RETIRED — do not implement (2026-08-26)**
+
+**Retirement decided**: Bohr, msg-1714, on Heisenberg's P3-S1 halt report
+(msg-1713). Endorsed by Einstein (msg following msg-1714).
+
+**Why retired**: the substrate PR-3 was designed to extend — the per-call
+`can_use_tool` allow-list, `build_denial_record`, `ClassifiedAction`,
+`_RAW_COARSE`, `_INDIRECTION_RE`, layer A / layer B, the redactor, and the
+`denial[...]` log line — was **deleted on 2026-08-20** by commits `773ee24` /
+`e7b359a` / `72339ee` (see file header for details). The `rule_id='structural'`
+halts PR-3 was designed to make readable **cannot occur anymore**, because the
+classifier that produced them is gone.
+
+**Do not resurrect this spec.** msg-1714 explicitly rejects the option of
+retargeting PR-3 at whatever refusal surfaces exist today (org-ruleset /
+`preflight` / egress proxy): those surfaces have **zero halt observations**
+attached to them and **have not been checked** for a diagnostic gap. Designing
+against unmeasured targets was rejected by the same discipline (`P3-N3`) this
+spec used to defer strike counters. See **§K** (Knowledge to keep) at the
+bottom of the file for the architectural lessons this line of work produced,
+and **§T** (Trigger retargeting) for what the resume conditions were rewritten
+to name.
+
+- **status**: **retired 2026-08-26** — spec landed for the historical record only
 - **author of the spec below**: Bohr (proposer). Transcribed verbatim from msg-1711.
 - **cleared by**: independent naysayer (Einstein, msg-1139 category-error correction
   + endorsement of `evidence_status.present`, redact-then-truncate order, and
   substrate-check-then-halt discipline).
-- **Tier-C**: approved 2026-08-16 (msg-1138 — implementation start).
+- **Tier-C history**: approved 2026-08-16 (msg-1138 — implementation start);
+  **retired 2026-08-26** (msg-1714).
 - **anchor from this point on**: this file, not any msg-id.
 
 > Source: msg-948 §2 (freeze) + msg-947 (Einstein: drop D2a, take D2b, drop D3) +
@@ -428,7 +496,7 @@ exactly what §4 forbids. The implementer therefore stops.
 
 ## Handback
 
-Bohr's call. The observed choices are, in the language the proposer already
+Bohr's call. The observed choices were, in the language the proposer already
 uses in msg-948 §3 for deferrals with triggers:
 
 1. **Withdraw PR-3.** The failure mode PR-3 was designed to diagnose no
@@ -444,4 +512,126 @@ uses in msg-948 §3 for deferrals with triggers:
    architecture and why. A new spec section can supersede it once the
    proposer decides between (1) and (2).
 
-The implementer takes none of these choices. `NEXT: Bohr`.
+**Bohr's decision (msg-1714)**: **option 1 (withdraw), executed in the form of
+option 3 (freeze as historical record)**. Option 2 was rejected on the same
+YAGNI grounds this spec used to defer strike counters: the candidate targets
+(org-ruleset / `preflight` / egress proxy) have zero halt observations and have
+not been checked for a diagnostic gap. Endorsed by Einstein (msg following
+msg-1714).
+
+---
+
+# §K — Knowledge to keep (measurement outcomes that outlive the substrate)
+
+The implementation described above is gone. **These four lessons are what six
+lost sessions and two shipped PRs paid for.** They are architectural, not
+allow-list-specific, and they apply to any future refusal-diagnostic surface
+in this project. Do not re-learn them by re-running the same failure.
+
+> Anchored in msg-1714 §6. Cross-references below point at chatroom messages so
+> a future reader can walk back the evidence trail if the details matter.
+
+## K-1. A regex floor on the raw text of a command classifies "writing about deletion" as "performing a deletion"
+
+If a future guard runs a regex over an entire raw command string looking for a
+dangerous verb (`rm` / `Remove-Item` / `unlink` / etc.), it will fire on that
+verb wherever it appears — inside a heredoc body, inside a doc string, inside
+a commit message. This was measured directly by fixtures **M1 / M6 / M7** of
+this spec (see the PR-1 section above) against the retired classifier, and
+confirms Bohr's initial hypothesis after msg-916.
+
+**Rule**: a raw-text floor that has no way to distinguish "verb executed" from
+"verb quoted" trades under-deny safety for a halt every time an implementer
+edits a document that discusses the guarded operation. In the case that was
+measured, this trade cost multiple sessions.
+
+## K-2. Diagnostic vocabulary keyed off a control detail collapses on every path that lacks that detail
+
+PR-1 attached its evidence surface (`match_offset`, `context_window`,
+`corroborated`) to a byte offset produced by the regex path. The structural
+classifier had no such offset, so on structural verdicts **all three fields
+went null at once**. The reader could tell the session had halted but not
+what for. Measured on 2026-08-15 (msg-945) after PR-1 shipped.
+
+**Rule**: attach diagnostic fields to the **outcome** of a verdict, not to the
+**mechanism** that produced it. A diagnostic keyed off a mechanism-specific
+control detail is nothing but a probe for that mechanism. Any other rule class
+lacking that detail becomes invisible.
+
+## K-3. Collapsing "not applicable by design" with "attempted and failed" into a single value is what makes a session non-diagnosable
+
+`corroborated='unknown'` in PR-1 meant two different things — the coarse floor
+was not eligible (vacuous truth) *or* the floor ran but returned nothing
+(measurement failure). Six sessions were lost before this ambiguity was even
+identified; PR-3's `P3-D1` (`evidence_status` with `not_applicable_for_rule_class`
+distinct from `lookup_failed`) was designed as the fix and never landed.
+
+**Rule**: any diagnostic enum must keep "vacuous" and "failed" as separate
+values from the first version. Compressing them saves one bit and loses the
+question the field exists to answer.
+
+## K-4. Redact then truncate, never the other way around
+
+Truncating a string first and then redacting the truncated result splits a
+secret across the cut. If the secret was 40 characters and the cut left only
+20, the redactor's boundary conditions (`\b`, `_HIGH_ENTROPY {32,}`) no longer
+match and the residue is emitted in the clear. This was flagged by Einstein as
+the Tier-B residue on PR-1 (msg-944) and encoded as `P3-D2b-5` / `P3-T3` in
+PR-3 before retirement (msg-1712 confirmed it as the correct discipline).
+
+**Rule**: **redact, then truncate.** The reverse order looks harmless because
+the tests pass on non-boundary inputs. It is the boundary case (the secret
+sitting exactly on the truncation line) that leaks, and adding a fixture for
+that exact boundary is what fixes the tests.
+
+## Aggregate rule (all four): what "measured before designing" means here
+
+Every lesson above was learned by running an experiment against the machinery
+in production. K-1 was measured by fixture, K-2 by the first structural halt
+after PR-1 shipped, K-3 by counting the sessions the collapse had cost, K-4 by
+a token dropped on a truncation boundary. **None of the four are hypotheses;
+all four were rejected as hypotheses first and only survived after the
+measurement went against the intuition.** Any future refusal-diagnostic
+surface in this project inherits the discipline as well as the lessons: design
+what is being measured before designing what the guard does with the
+measurement.
+
+---
+
+# §T — Trigger retargeting (R4)
+
+**All triggers previously written into this file are void.** Bohr, msg-1714 §7.
+The reason is mechanical: PR-3's triggers named "this thread" as the return
+address for follow-up work, and the instruments they depended on
+(`indirection_gate`, `evidence_status`, the `denial[...]` telemetry) do not
+exist anymore. **A trigger with a nonexistent instrument or a closed thread as
+its destination is not a trigger; it is a paragraph.**
+
+## What is invalidated
+
+| trigger from the retired sections | why invalid now |
+|---|---|
+| **msg-948 §3 / §P3-8 row 1** — "floor-only 非致命化 / strike counter / 閾値 2, resumed on first `indirection_gate=True` halt observation" | the `indirection_gate` field, the floor, and the halt path that emitted them are all deleted (file header commits `773ee24` / `e7b359a` / `72339ee`). There is nothing to observe |
+| **msg-948 §3 / §P3-8 row 2** — "D3 (structural sub-id split), resumed on first halt where operation + target could not decide" | the structural classifier is deleted. There are no structural verdicts to sub-divide |
+| **msg-1138 §3 / §P3-8 row 3** — "non-allowlist guard diagnostic surface, resumed on second observation of the same class, destination = this thread" | this thread is closed with PR-3 retired. The `denial[...]` telemetry it was to be grafted onto does not exist. The destination is invalid |
+
+## Replacement trigger (one, narrow)
+
+| trigger | destination | constraints |
+|---|---|---|
+| First observation of a halt / quarantine under the **current** architecture that leaves **zero diagnostic lines** in the log — meaning a reader of the log alone cannot name what refused the action and why | **A new thread**, not this one | (a) the new thread's first task must be **investigation, not design**: read the current refusal surfaces (org-ruleset, `preflight` P0/P1/P2, egress proxy allow-list, MCP server refusals, whatever exists then) to establish whether a diagnostic gap actually exists on the path that halted, before any spec is drafted. **No design before observation is confirmed to reach the unexamined stage** (msg-946 §1 method). (b) **Do not restore PR-1's denial telemetry.** That machinery is deleted and the invariants it approximated are enforced outside the agent now; grafting a new telemetry surface onto it is not available. (c) Einstein's category separation (msg-1139) is still in force: an *authorization failure* and a *domain invariant violation* do not share a diagnostic pipeline. |
+
+## What this section is not
+
+- **Not a spec** for the new thread. It names a resume condition, not a design.
+  Following msg-948 §3's discipline: "the deployed instrument is the trigger, no
+  new ledger is created" — here that means the log itself is the trigger, and
+  the new thread's investigation phase is what turns an observation into a
+  design brief (if it turns out one is needed at all).
+- **Not a promise** that a new thread will be opened. The trigger fires on
+  observation, not on a schedule.
+- **Not a re-opening** of the retired PR-3. If a diagnostic surface is
+  eventually needed for the current substrate, the fields, the sink, and the
+  invariants are the new thread's to redesign. `evidence_status` /
+  `target_root_relation` / the layer-A/B split — none of that carries over
+  automatically. `§K`'s lessons carry; the fields do not.
