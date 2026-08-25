@@ -1,0 +1,82 @@
+# Machine-readable form of the §5 classification from docs/identity-classification.md.
+#
+# Read by scripts/identity_findings.py to compute
+#   allowed_roles = legitimate            <- the entitlement; the observation is NOT an input
+#   residual      = observed \ legitimate  <- fabrication evidence (inside the write-set lock)
+#   unused        = legitimate \ observed  <- right held but not exercised (report only)
+# (msg-1493 §2 / §3, as corrected by msg-1585 §3: the original `observed ∩ legitimate` could only
+# narrow an entitlement, never grant one, so an unregistered identity — whose claimed roles are
+# dropped to null — could never bootstrap out of `observed = ∅`.)
+#
+# `legitimate: []` (an empty list) is the honest value for a **machine** identity — msg-1484 §2
+# (Einstein endorsed msg-1485). It is NOT a stand-in for "unknown" — an identity that has not
+# been classified must not appear in this file at all, and the findings script MUST list it as
+# an unclassified author for a human to classify before the write half runs.
+#
+# Each entry cites the primary source it was decided from (a code line in this repo, or a
+# module docstring), so a reader can verify the classification without walking the whole spec
+# thread. The SoT for classification prose is docs/identity-classification.md; this file is
+# the derived, machine-consumable form.
+#
+# Schema (v1):
+#   identities:
+#     - name:        the identity_name as it appears in code (raw form; ADR-11 normalisation
+#                    is applied at query time by identity/normalize.py)
+#       kind:        "participant" | "machine"
+#       legitimate:  list[str] — the roles this identity may honestly claim.
+#                    kind=machine MUST have legitimate=[] (invariant per docs).
+#                    kind=participant MUST have len(legitimate) >= 1 (invariant).
+#       primary_source:  one-line pointer, "path::symbol" or "path::§heading"
+#       reason:      short prose justification, cross-referenced to the doc
+#
+# Only the three chatroom-post identities are enumerated. `spirrowgames-ops` is a GitHub
+# identity (not a chatroom author) and is out of scope. `conductor-probe` is defined by its
+# module docstring to never write, so it appears with kind=machine for completeness only.
+
+version: 1
+
+identities:
+  - name: naysayer-pr-review
+    kind: participant
+    legitimate: ["naysayer"]
+    primary_source: "src/spirrow_mindwire/orchestrator.py::PrReviewOrchestrator.post_critique"
+    reason: >-
+      The `body` argument is the return value of NaysayerPrReviewDriver.review — the
+      independent naysayer's critique produced by a Lexora one-shot to Gemini, relayed
+      verbatim. The orchestrator's own code comment (lines 302-311) states: "The claim is
+      honest: this body IS the independent naysayer's critique, relayed verbatim." Marking
+      this as machinery would erase attestation on the Tier-B verdict — the very post the
+      I-6 invariant exists to protect. msg-1484 §5 forbids that explicitly.
+
+  - name: orchestrator
+    kind: machine
+    legitimate: []
+    primary_source: "src/spirrow_mindwire/orchestrator.py::_DEFAULT_OWNER"
+    reason: >-
+      Used only as the thread-metadata `owner` on chatroom_open_thread calls, never as an
+      `author` on any chatroom_post_message. No LLM speaks under this name; it is a label
+      for who opened the ledger, not who authored anything.
+
+  - name: pr-gate-relay
+    kind: machine
+    legitimate: []
+    primary_source: "src/spirrow_mindwire/conductor/core.py::_PR_GATE_RELAY_AUTHOR"
+    reason: >-
+      The relay's own code comment (lines 627-634) states: "It is the conductor restating
+      a verdict the Tier B driver produced elsewhere, and the honest value for 'which
+      role authored this' is none. Claiming `naysayer` because the content came from one
+      would put a role stamp on a post no reviewer wrote — manufacturing exactly the
+      evidence the I-6 invariant exists to make meaningful." The relay's body is the
+      conductor's own framing wrapping the driver's outcome, not the naysayer's verbatim
+      critique.
+
+  - name: conductor-probe
+    kind: machine
+    legitimate: []
+    primary_source: "scripts/thread_heads.py::DEFAULT_IDENTITY"
+    reason: >-
+      Module docstring: "A dedicated identity that never posts and never marks read keeps
+      every thread unread, hence listed. Nothing here calls chatroom_mark_read; keep it
+      that way or this probe goes blind." Defined by contract not to write; listed for
+      completeness so a live-corpus finding of a post authored by this name would surface
+      as an unexpected write (residual) rather than be silently absorbed.
