@@ -17,7 +17,10 @@ Coverage matches the "Testing (unit + regression pins)" section of
 5.  D-38: user prompt renders every tail body with proper separators and
     respects the internal hard ceiling.
 6.  Prompt version: ``PROMPT_VERSION`` is a module-level string and
-    ``last_extras["prompt_version"]`` reports its value verbatim.
+    ``last_extras["prompt_version"]`` reports its value verbatim. D-49
+    also pins ``sha256(_SYSTEM_PROMPT)`` to
+    ``PROMPT_DIGESTS[PROMPT_VERSION]`` so a silent text edit cannot skip
+    a version bump.
 7.  ``compose_once`` propagates ``last_extras`` into ``envelope.extras``.
 
 Every test uses a fake runner — none of these spawn the real
@@ -44,7 +47,9 @@ from spirrow_mindwire.decision_request import (
     ThreadTailMessage,
 )
 from spirrow_mindwire.decision_request.claude_code import (
+    _SYSTEM_PROMPT,
     DEFAULT_COMPOSER_IDENTITY,
+    PROMPT_DIGESTS,
     PROMPT_VERSION,
     SubprocessResult,
     _extract_result_text,
@@ -684,15 +689,57 @@ class TestD38UserPrompt:
 
 
 class TestPromptVersion:
-    def test_prompt_version_is_a_module_level_string(self) -> None:
-        assert isinstance(PROMPT_VERSION, str)
-        assert PROMPT_VERSION == "1"
-
     def test_last_extras_reports_the_prompt_version_verbatim(self) -> None:
         runner = FakeRunner(result=SubprocessResult(0, _cli_json_bytes(), b""))
         composer = ClaudeCodeComposer(runner=runner)
         composer.compose(_sample_request())
         assert composer.last_extras["prompt_version"] == PROMPT_VERSION
+
+
+# --------------------------------------------------------------------------- #
+# 6b. Prompt digest pin (D-49)
+# --------------------------------------------------------------------------- #
+
+
+class TestPromptDigestPin:
+    """D-49 — pin ``sha256(_SYSTEM_PROMPT)`` to the string version.
+
+    ``prompt_version`` is a runtime observability invariant: the extras key
+    is useful for a retrospective only if the version string and the
+    prompt text stay bound to each other. Without this pin, an edit to
+    the prompt text without bumping :data:`PROMPT_VERSION` would silently
+    poison every downstream analysis that groups by prompt_version. This
+    test is the only new test introduced with the v2 revision (msg-1442
+    §28.6, endorsed msg-1461 §1) — read-side assertions on prompt content
+    are DELIBERATELY not written (§28.6: they would be a false comfort,
+    because the stub backend does not exercise the real LLM and cannot
+    verify prompt compliance in any case).
+
+    Bumping (D-54): in the SAME commit as the prompt-text edit, move
+    :data:`PROMPT_VERSION` to the new version and ADD a row for it to
+    :data:`PROMPT_DIGESTS`. Do NOT edit an existing row, and do NOT add
+    a second test — this one case reads
+    ``PROMPT_DIGESTS[PROMPT_VERSION]`` and is therefore correct at every
+    version. The pin does not care what the prompt says, only that a
+    text change and a version bump happen together.
+    """
+
+    def test_current_prompt_text_matches_its_pinned_digest(self) -> None:
+        import hashlib
+
+        assert PROMPT_VERSION in PROMPT_DIGESTS, (
+            f"PROMPT_VERSION is {PROMPT_VERSION!r} but PROMPT_DIGESTS has "
+            "no row for it. A version bump ADDS a row; it never edits an "
+            "existing one."
+        )
+        actual = hashlib.sha256(_SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+        assert actual == PROMPT_DIGESTS[PROMPT_VERSION], (
+            "The system prompt has drifted from the digest pinned for "
+            f"version {PROMPT_VERSION!r}. If the edit was intentional, "
+            "bump PROMPT_VERSION and ADD a new row to PROMPT_DIGESTS in "
+            "the same commit as the text change — do not rewrite the "
+            "existing row. If it was not, revert the prompt edit."
+        )
 
 
 # --------------------------------------------------------------------------- #
