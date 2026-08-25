@@ -12,7 +12,7 @@ from __future__ import annotations
 import io
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -255,6 +255,155 @@ def test_zero_api_error_status_is_still_treated_as_a_reason() -> None:
     detail = capture_is_error_detail(final)
     assert detail["reason_source"] == "field:api_error_status"
     assert "0" in detail["message"]
+
+
+# --------------------------------------------------------------------------- #
+# PR #181 round 4 regressions — three separate objections from the PR-gate
+# review, each pinned so a future refactor cannot reintroduce the same defect.
+# --------------------------------------------------------------------------- #
+
+
+def test_non_string_result_falls_through_to_field_result_not_absent() -> None:
+    """A non-string ``result`` (dict / list from a future SDK) must surface
+    as ``field:result``, not vanish into ``absent``.
+
+    Earlier the ``_pick_reason`` loop explicitly skipped ``result`` because
+    the fast-path had already handled it, so a ``result={"code": "…"}``
+    (the fast-path's ``isinstance(str)`` gate rejects) fell out of every
+    branch and reached ``absent`` — the actual reason on the field was
+    dropped entirely. Fixed by removing the loop's skip; ``result`` is a
+    legitimate general fallback candidate. (PR #181 round 4, objection 2.)
+    """
+
+    # Non-dataclass here so this test stays independent of ``_FakeResultMessage``'s
+    # frozen schema, and to prove the SDK not being a dataclass is not what
+    # gates this behaviour.
+    class _NonStringResult:
+        subtype = ""
+        duration_ms = 0
+        duration_api_ms = 0
+        is_error = True
+        num_turns = 0
+        session_id = ""
+        stop_reason = None
+        errors = None
+        api_error_status = None
+        permission_denials = None
+        # ClassVar to avoid RUF012 — this stub is read as a class-level
+        # constant; the helper only reads the attribute, never mutates it.
+        result: ClassVar[dict[str, str]] = {"code": "rate_limit", "message": "gateway rejected"}
+        model = None
+
+    detail = capture_is_error_detail(_NonStringResult())
+    assert detail["reason_source"] == "field:result"
+    # Small-scalar-dict preservation means the actual content is in the
+    # message, not the opaque ``dict(len=2)`` that the earlier summariser
+    # produced. A reader can see WHAT the SDK put on the field.
+    assert "rate_limit" in detail["message"]
+    assert "gateway rejected" in detail["message"]
+
+
+def test_small_scalar_dict_preserves_contents_in_captured_fields() -> None:
+    """Analogous to the scalar-list case: a small ``{str: scalar}`` dict is
+    preserved verbatim in ``captured_fields`` so the reason text reaches the
+    marker instead of getting flattened to ``dict(len=N)``.
+    """
+
+    class _F:
+        subtype = ""
+        duration_ms = 0
+        duration_api_ms = 0
+        is_error = True
+        num_turns = 0
+        session_id = ""
+        stop_reason = None
+        errors = None
+        api_error_status = None
+        permission_denials = None
+        result: ClassVar[dict[str, Any]] = {"code": "auth", "attempt": 3}
+        model = None
+
+    detail = capture_is_error_detail(_F())
+    result_summary = detail["captured_fields"]["result"]
+    assert isinstance(result_summary, dict)
+    assert result_summary == {"code": "auth", "attempt": 3}
+
+
+def test_large_dict_still_summarised_not_dumped() -> None:
+    """Analogous to the large-list case: the bound on scalar-dict preservation
+    only kicks in for small dicts. A big dict still gets ``dict(len=N)`` so
+    the marker line cannot balloon.
+    """
+
+    class _F:
+        subtype = ""
+        duration_ms = 0
+        duration_api_ms = 0
+        is_error = True
+        num_turns = 0
+        session_id = ""
+        stop_reason = None
+        errors = None
+        api_error_status = None
+        permission_denials = None
+        result: ClassVar[dict[str, int]] = {f"k{i}": i for i in range(20)}
+        model = None
+
+    detail = capture_is_error_detail(_F())
+    assert detail["captured_fields"]["result"] == "dict(len=20)"
+
+
+def test_absent_dump_survives_a_broken_property() -> None:
+    """A property that raises must not destroy the entire reflection dump.
+
+    Objection 1 from PR #181 round 4: the ``dir()`` fallback path filtered
+    names with ``callable(getattr(final, n, None))`` — a bare ``getattr`` that
+    only catches ``AttributeError``. A property raising ``RuntimeError`` /
+    ``ValueError`` (highly likely on a broken SDK object, which is the exact
+    input the reflection dump exists for) propagated out of the list
+    comprehension, the outer ``except`` caught it, and the entire dump
+    collapsed to ``{}``. The evidence for ``absent`` was destroyed by the
+    very defect the reflection existed to surface.
+
+    Fix pinned here: an individual raising property keeps its name in the
+    enumeration so it lands in the fields dump as ``capture_failed: true``,
+    and OTHER fields still get dumped normally.
+    """
+
+    class _WithHostileProperty:
+        __slots__ = ()  # no vars() → forces the dir() path
+
+        is_error = True
+        subtype = ""
+        stop_reason = None
+        result = None
+        errors = None
+        api_error_status = None
+        permission_denials = None
+        session_id = "hostile-sid"
+        duration_ms = 42
+        num_turns = 1
+
+        @property
+        def some_hostile_property(self) -> str:
+            raise RuntimeError("this property always raises")
+
+    detail = capture_is_error_detail(_WithHostileProperty())
+    # Landing at absent is correct here — every known reason field is empty.
+    assert detail["reason_source"] == "absent"
+    dump = detail["absent_dump"]
+    # The dump was NOT destroyed by the hostile property.
+    assert dump["introspection"] == "dir"
+    fields = dump["fields"]
+    assert fields, f"absent_dump.fields is empty — hostile property destroyed it: {dump!r}"
+    # Session facts on the object are still captured normally.
+    assert fields.get("session_id") == "hostile-sid"
+    assert fields.get("duration_ms") == 42
+    # And the hostile property itself surfaces as capture_failed — not silently
+    # dropped, so a reader can see WHERE the object misbehaves.
+    hostile = fields.get("some_hostile_property")
+    assert isinstance(hostile, dict), f"expected capture_failed dict, got {hostile!r}"
+    assert hostile.get("capture_failed") is True
 
 
 # --------------------------------------------------------------------------- #

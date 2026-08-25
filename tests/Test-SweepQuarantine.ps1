@@ -255,6 +255,34 @@ Check "escalated entry carries the head-change hint" $true ($digest -match 'T-es
 Check "fresh entry has NO hint (nothing changed)" $true ($digest -notmatch 'T-fresh.*新規メッセージあり')
 Check "digest never uses the deleted 'input changed' wording (§4)" $true ($digest -notmatch '入力変化')
 
+Write-Host "New-DailyDigest — repro_hint appears on a continuation line, not on the entry line"
+# T-sdk-is-error-loses-the-reason S-8 (PR #181 round 4): the repro-hint is
+# rendered on its own indented continuation line. Earlier the comment above
+# the render site CLAIMED "one-line-per-entry" while the code emitted a hard
+# newline — reconciled in favour of the newline (the hint content is 100+
+# chars including the log path, so on-line wrapping is unreadable). Pin the
+# actual behaviour so a future edit to either the comment or the code brings
+# them back in sync intentionally, not by accident.
+$qHint = @{
+    'p/T-repro' = @{
+        state = 'quarantined'
+        first_failure_at = $now.AddHours(-2).ToString('o')
+        failure_fingerprint = @{ head = 'msg-99'; control = 'run' }
+        session_log_path = 'C:/logs/conductor-2026-08-11.log'
+    }
+}
+$digest = New-DailyDigest -QuarantineState $qHint -EvaluatedState @{} `
+    -HeadsByProject @{ p = @{ 'T-repro' = 'msg-99' } } `
+    -ControlByProject @{ p = [pscustomobject]@{ desired_state = 'run' } } `
+    -Now $now -LiveKeys @('p/T-repro')
+Check "digest contains a repro-hint line" $true ($digest -match 'repro-hint:.*p/T-repro.*head=msg-99')
+Check "repro-hint is on its OWN line (preceded by a newline + indent)" $true `
+    ($digest -match "`n    repro-hint:")
+# And the entry itself remains recognisable — the newline is BETWEEN the entry line and the hint,
+# not IN the middle of the entry line.
+Check "entry line for the key is intact above the repro-hint" $true `
+    ($digest -match '  p/T-repro   \d')
+
 Write-Host "New-DailyDigest — survives a real quarantine.json round-trip"
 # The failure path the previous test suite did not exercise: build a quarantine map the way the
 # sweep sees it on any tick AFTER the failure tick, i.e. with PSCustomObject values. Without the

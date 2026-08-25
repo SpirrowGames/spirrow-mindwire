@@ -756,10 +756,20 @@ function New-DailyDigest {
         $hint = Get-FingerprintHint -Fingerprint $rec.failure_fingerprint `
                                     -CurrentHead $curHead -CurrentControl $curControl
         # T-sdk-is-error-loses-the-reason S-8: a repro_hint from record-fields
-        # only (fingerprint + session_log_path). Suffixed to the same line as
-        # the age / movement-hint so the digest keeps its one-line-per-entry
-        # shape, but appended only when the fields the hint needs are actually
-        # present — a partial line ("head=None") would be worse than none.
+        # only (fingerprint + session_log_path). Rendered on its OWN
+        # continuation line, indented, rather than suffixed to the entry line —
+        # measured, the full hint string ("$key で head=$head control=$control
+        # のとき失敗 — ログ: $path") is 100–150 chars including the path, and
+        # jamming it after the age + movement-hint makes the entry line wrap
+        # inside a Discord embed / terminal digest to the point of being
+        # unreadable. The digest's structure remains "one entry per record"
+        # (never two records interleaved), it just gains a second line per
+        # entry when there is a repro-hint to show. Only appended when the
+        # fields the hint needs are actually present — a partial line
+        # ("head=None") would be worse than none. (PR #181 round 4 naysayer
+        # review: earlier the comment CLAIMED one-line while the code emitted
+        # a newline; reconciled here in favour of the newline, which is what
+        # the content actually needs.)
         $reproHint = Get-QuarantineReproHint -Fingerprint $rec.failure_fingerprint `
                                              -SessionLogPath $rec.session_log_path `
                                              -Key $key

@@ -172,6 +172,16 @@ def _summarize_value(value: Any) -> Any:
     if isinstance(value, (set, frozenset)):
         return f"{type(value).__name__}(len={len(value)})"
     if isinstance(value, dict):
+        # Same reasoning as the list branch above (PR #181 round 4): a
+        # non-string ``result={"code": …, "message": …}`` — plausible on a
+        # future SDK version — deserves to reach the marker as the actual dict
+        # contents, not as the opaque ``dict(len=2)`` that renders no reason
+        # text. Bounded by size AND by the scalar-only key/value predicate.
+        if len(value) <= _SMALL_LIST_ELEM_LIMIT and all(
+            isinstance(k, str) and (v is None or isinstance(v, (bool, int, float, str)))
+            for k, v in value.items()
+        ):
+            return {k: _summarize_value(v) for k, v in value.items()}
         return f"dict(len={len(value)})"
     return f"{type(value).__name__}(repr_omitted)"
 
@@ -244,24 +254,33 @@ def _is_empty_reason_value(value: Any) -> bool:
 def _pick_reason(raw: dict[str, Any], summary: dict[str, Any]) -> tuple[str, str]:
     """Compute ``(reason_source, message)`` from RAW values, formatted from summary.
 
-    ``result`` wins if it carries a non-empty string. Otherwise the first
-    known field whose RAW value passes :func:`_is_empty_reason_value` is named
-    as ``field:<name>``, using its SUMMARY for the marker message so bounds
-    are enforced.
+    Precedence:
 
-    Using summary for the emptiness check was the round-2 defect: an
-    ``errors=[]`` becomes the string ``"list(len=0)"`` under summarisation,
-    which is non-empty, so it was incorrectly picked as the reason —
-    shadowing any trailing reason-carrying field (e.g. ``api_error_status``).
-    Fixed here by branching on RAW.
+    1. ``result`` as a non-empty string → ``reason_source="result"`` and the
+       verbatim string as the message. This is the ordinary happy path — the
+       SDK put its reason text on this field.
+
+    2. Any known field (including ``result``) whose RAW value is not empty
+       (per :func:`_is_empty_reason_value`) → ``field:<name>``, message
+       formatted from the SUMMARY so bounds are enforced.
+
+    3. Everything empty → ``absent`` with the sentence explaining that N
+       fields were captured and none carried a reason.
+
+    Note the deliberate difference between step 1 and step 2: step 1 fires ONLY
+    for non-empty strings on ``result`` (the common case), but if ``result``
+    holds a non-string non-empty value (dict / list — plausible on a future
+    SDK version) the loop in step 2 STILL considers it. An earlier version
+    skipped ``result`` in the loop (having "already handled it" in step 1),
+    which silently dropped non-string ``result`` values into ``absent`` — the
+    reason vanished into the very shadow this whole thread exists to remove.
+    (PR #181 round 4 naysayer review.)
     """
     result = raw.get("result")
     if isinstance(result, str) and result:
         return "result", result
 
     for name in _KNOWN_REASON_FIELDS:
-        if name == "result":
-            continue
         value = raw.get(name)
         if _is_empty_reason_value(value):
             continue
@@ -314,12 +333,33 @@ def _absent_dump(final: Any) -> dict[str, Any]:
             except Exception:
                 names = None
         if names is None:
+            # ``dir()`` never raises; per-name ``getattr`` can (a property whose
+            # getter raises RuntimeError / ValueError is likely on a broken SDK
+            # object, which is *exactly* the input this branch is here for).
+            # An earlier version used a bare ``getattr(final, n, None)`` inside
+            # this list comprehension — a single hostile property raised out of
+            # the comprehension, the outer except caught it, and the ENTIRE
+            # dump collapsed to ``{}``: the reflection evidence for ``absent``
+            # was destroyed by the very defect the reflection existed to
+            # surface. (PR #181 round 4 naysayer review.)
+            #
+            # Fix: each ``getattr`` is wrapped. A raising property KEEPS its
+            # name in ``names`` — so its failure surfaces later in the fields
+            # dump as ``capture_failed: true`` via ``_capture_field`` rather
+            # than silently disappearing. Only names whose value is
+            # unambiguously callable are excluded here.
+            def _keep(name: str) -> bool:
+                if name.startswith("_"):
+                    return False
+                try:
+                    value = getattr(final, name)
+                except Exception:
+                    # Property raised; include so its failure is visible.
+                    return True
+                return not callable(value)
+
             try:
-                names = [
-                    n
-                    for n in dir(final)
-                    if not n.startswith("_") and not callable(getattr(final, n, None))
-                ]
+                names = [n for n in dir(final) if _keep(n)]
                 introspection = "dir"
             except Exception:
                 names = []
