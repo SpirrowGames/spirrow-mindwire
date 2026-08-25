@@ -379,11 +379,30 @@ class StreamableHttpChatroomMcp:
             if remainder is None:
                 raise wrapped from first  # bare MagickitMcpError to the caller
             # Transport + non-transport siblings: keep the wrap visible next
-            # to the programming-error remainder so neither disappears.
+            # to the programming-error remainder so neither disappears. Two
+            # subtleties (PR-gate on #178 flagged both):
+            #
+            # 1. ``wrapped.__cause__ = first`` **must be set explicitly**.
+            #    ``_wrap_transport_error`` just constructs the exception, so
+            #    without this the wrap has no cause chain — the traceback link
+            #    to the underlying transport failure would be severed. The
+            #    single-transport branch above gets this via ``raise wrapped
+            #    from first``; here the wrap goes into a list rather than
+            #    being raised, so the same chain must be set by hand.
+            # 2. The group is raised ``from group`` (the *caught* group), not
+            #    ``from first``. Chaining to ``first`` would say "the whole
+            #    new group was caused by the transport error", which is false
+            #    — the programming-bug remainder is a sibling task failure,
+            #    not a downstream effect. Chaining to ``group`` (the original
+            #    caught container) correctly says "this new group is a
+            #    repackaging of the one we caught". The ``from`` form is
+            #    required by ruff B904; ``from None`` would suppress the
+            #    caught context, which we want to keep.
+            wrapped.__cause__ = first
             raise BaseExceptionGroup(
                 "magickit call: transport failure alongside non-transport error",
                 [wrapped, remainder],
-            ) from first
+            ) from group
         return parse_tool_result(result)
 
 

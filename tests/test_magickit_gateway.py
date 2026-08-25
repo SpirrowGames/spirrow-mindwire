@@ -516,6 +516,72 @@ async def test_call_tool_surfaces_transport_and_programming_side_by_side_in_mixe
 
 
 @pytest.mark.anyio
+async def test_call_tool_mixed_group_attaches_cause_to_wrap_not_to_group() -> None:
+    """PR-gate #178 (round 2) regression: two traceback bugs in the mixed-group path.
+
+    Bug 1 — **the wrap loses its cause**. Constructing the ``MagickitMcpError``
+    with ``_wrap_transport_error`` and putting it in a list gives it no
+    ``__cause__``, severing the traceback chain to the underlying transport
+    exception. The fix explicitly sets ``wrapped.__cause__ = first``.
+
+    Bug 2 — **the group gets a false cause**. ``raise <group> from first``
+    attaches the transport exception as the group's ``__cause__``, which
+    falsely asserts that every sibling (including programming bugs) was
+    caused by the transport failure. Since programming bugs and transport
+    failures are unrelated task-group sibling errors, the group must have
+    no ``__cause__`` pointing to ``first``.
+    """
+    transport_exc = httpx.ConnectError("nope")
+    bug_exc = TypeError("bug in caller args")
+    mixed = ExceptionGroup("mcp task group", [transport_exc, bug_exc])
+
+    with pytest.raises(BaseExceptionGroup) as excinfo:
+        await _RaisingMcp(mixed).call_tool("x", {})
+
+    group = excinfo.value
+
+    # Bug 2 pin: the group itself must not falsely name the transport error
+    # as its cause — the programming bug is a sibling, not a downstream effect.
+    assert group.__cause__ is not transport_exc, (
+        "the mixed group should not carry the transport exception as its __cause__ "
+        "(that would falsely assert the programming bug was caused by the transport failure)"
+    )
+
+    # Bug 1 pin: find the wrap and verify it kept the traceback chain.
+    wraps = [e for e in group.exceptions if isinstance(e, MagickitMcpError)]
+    assert len(wraps) == 1, f"expected exactly one wrap in the group, got {wraps!r}"
+    wrap = wraps[0]
+    assert wrap.__cause__ is transport_exc, (
+        "the wrap must chain back to the transport exception via __cause__ "
+        f"(got __cause__={wrap.__cause__!r})"
+    )
+
+
+@pytest.mark.anyio
+async def test_call_tool_single_transport_wrap_chains_to_the_transport_error() -> None:
+    """Sibling of the mixed-group traceback test — the same ``__cause__`` rule
+    must hold on the (much more common) single-transport path too.
+
+    Both call sites in ``call_tool`` (the bare ``except _TRANSPORT_EXCEPTIONS``
+    and the single-transport branch of the ``except BaseExceptionGroup``) use
+    ``raise wrapped from first``, so the invariant is pinned uniformly.
+    """
+    # Bare transport case.
+    bare = httpx.ConnectError("nope")
+    with pytest.raises(MagickitMcpError) as excinfo:
+        await _RaisingMcp(bare).call_tool("x", {})
+    assert excinfo.value.__cause__ is bare
+
+    # Group-with-only-transport case.
+    grouped_inner = httpx.ConnectError("nope-grouped")
+    group = ExceptionGroup("mcp task group", [grouped_inner])
+    with pytest.raises(MagickitMcpError) as excinfo2:
+        await _RaisingMcp(group).call_tool("x", {})
+    # The leaf peeled from the group is the same object we put in — chain to it.
+    assert excinfo2.value.__cause__ is grouped_inner
+
+
+@pytest.mark.anyio
 async def test_call_tool_lets_group_of_pure_programming_errors_escape_as_group() -> None:
     """A group with no transport members is re-raised as-is — the runtime's
     "programming errors escape" invariant holds even under grouping.
