@@ -2255,10 +2255,51 @@ try {
     # trichotomy (progress / parked / neutral) and Bohr msg-1185 §2-c for why the parked-vs-
     # starved distinction reuses the decide verdict rather than inventing a new predicate.
     $sweepOrderKeys = @($candidates | ForEach-Object { $_.key })
+    # Per-tick map: candidate-key -> array of resources it currently declares in sweep.json.
+    # Used by the queue scrub below to detect a waiter that dropped a resource from its
+    # `requires` between enqueue and this tick (config change). Built once per tick from the
+    # already-parsed candidate list.
+    $candidateRequires = @{}
+    foreach ($c in $candidates) {
+        $req = @()
+        if ($c.PSObject.Properties['requires'] -and $c.requires) { $req = @($c.requires) }
+        $candidateRequires[$c.key] = $req
+    }
     foreach ($resource in @($leasesState.Keys)) {
         # $leasesState was normalised at load (line ~2164); do NOT re-normalise per-resource
         # here (msg-1802 blocker #2). Trust the boundary.
         $lease = $leasesState[$resource]
+
+        # Queue scrub (msg-1875 blocker). A waiter enqueued on tick N can become un-launchable
+        # by tick N+K: quarantined (non-zero exit), removed from sweep.json (thread folded), or
+        # its `requires` array edited to drop this resource. If left in the queue, that dead
+        # waiter would be handed back by Get-NextLeaseWaiter as the next promotion target,
+        # hold the resource idle for the full LeaseIdleTtl (2h) before Test-LeaseExpiring's
+        # dual predicate fires, and starve every valid waiter behind it — the "silent parked"
+        # failure mode the mechanism was built to end. Held is intentionally NOT scrubbed:
+        # held is a transient operator-imposed pause (mirrors D-6'c's held-is-progress for a
+        # holder, and preserves the "operator's intent survives" property).
+        # Scrub BEFORE any promotion (grant-from-empty below, or Invoke-LeasePromotion further
+        # down) so no dead waiter ever gets promoted.
+        $eligibleWaiters = @()
+        if ($lease.ContainsKey('queue') -and $null -ne $lease['queue']) {
+            foreach ($item in @($lease['queue'])) {
+                $k = if ($item -is [hashtable]) { $item['key'] } else { $item.key }
+                if (-not $k) { continue }
+                $onSweep = ($sweepOrderKeys -contains $k)
+                $isQ = $quarantineState.ContainsKey($k)
+                $req = if ($candidateRequires.ContainsKey($k)) { @($candidateRequires[$k]) } else { @() }
+                if ($onSweep -and (-not $isQ) -and ($req -contains $resource)) {
+                    $eligibleWaiters += $k
+                }
+            }
+        }
+        $droppedWaiters = Remove-IneligibleLeaseWaiters -Lease $lease -EligibleKeys $eligibleWaiters
+        foreach ($rk in $droppedWaiters) {
+            Confirm-LogWorthKeeping
+            Write-Log "lease [$resource] queue scrub: dropped ineligible waiter $rk (not on sweep OR quarantined OR no longer declares requires: $resource)"
+        }
+
         $holderKey = "$($lease['holder'])"
         if ([string]::IsNullOrEmpty($holderKey)) {
             # Empty holder — but if waiters are queued, we MUST drain the FIFO head here

@@ -197,6 +197,61 @@ Check "remaining entry is w2" 'p/T-w2' $lease['queue'][0].key
 Remove-LeaseWaiter -Lease $lease -WaiterKey 'p/T-not-there'   # no-op on absent
 Check "remove of absent key is a no-op" 1 $lease['queue'].Count
 
+# msg-1875 blocker: Remove-IneligibleLeaseWaiters scrubs waiters that became un-launchable
+# between enqueue and this tick. If left in queue, they'd get promoted, hold the lease idle
+# for the full LeaseIdleTtl (2h) — the "silent parked" failure the mechanism was built to end.
+Write-Host "Remove-IneligibleLeaseWaiters — scrub dead waiters before promotion (msg-1875 blocker)"
+
+$lease = @{
+    queue = @(
+        @{ key = 'p/T-a'; waiting_since = '2026-08-26T05:00:00Z' },
+        @{ key = 'p/T-b'; waiting_since = '2026-08-26T05:01:00Z' },
+        @{ key = 'p/T-c'; waiting_since = '2026-08-26T05:02:00Z' },
+        @{ key = 'p/T-d'; waiting_since = '2026-08-26T05:03:00Z' }
+    )
+}
+# Eligible set: only p/T-a and p/T-c. p/T-b was quarantined; p/T-d dropped requires.
+$dropped = Remove-IneligibleLeaseWaiters -Lease $lease -EligibleKeys @('p/T-a', 'p/T-c')
+Check "scrub: 2 waiters dropped" 2 $dropped.Count
+Check "scrub: dropped includes p/T-b" $true ($dropped -contains 'p/T-b')
+Check "scrub: dropped includes p/T-d" $true ($dropped -contains 'p/T-d')
+Check "scrub: eligible waiters remain (count)" 2 $lease['queue'].Count
+Check "scrub: FIFO order preserved (a still before c)" 'p/T-a' $lease['queue'][0].key
+Check "scrub: c is second" 'p/T-c' $lease['queue'][1].key
+
+# Idempotent when everyone is eligible.
+$lease = @{ queue = @( @{ key = 'p/T-a'; waiting_since = 'x' }, @{ key = 'p/T-b'; waiting_since = 'y' } ) }
+$dropped = Remove-IneligibleLeaseWaiters -Lease $lease -EligibleKeys @('p/T-a', 'p/T-b')
+Check "scrub (all eligible): dropped is empty" 0 $dropped.Count
+Check "scrub (all eligible): queue untouched" 2 $lease['queue'].Count
+
+# All-ineligible: queue becomes empty.
+$lease = @{ queue = @( @{ key = 'p/T-a'; waiting_since = 'x' } ) }
+$dropped = Remove-IneligibleLeaseWaiters -Lease $lease -EligibleKeys @()
+Check "scrub (none eligible): all dropped" 1 $dropped.Count
+Check "scrub (none eligible): queue is empty" 0 $lease['queue'].Count
+
+# Empty queue: no-op, no output.
+$lease = @{ queue = @() }
+$dropped = Remove-IneligibleLeaseWaiters -Lease $lease -EligibleKeys @('p/T-x')
+Check "scrub (empty queue): no dropped" 0 $dropped.Count
+
+# Missing queue key: no-op.
+$lease = @{}
+$dropped = Remove-IneligibleLeaseWaiters -Lease $lease -EligibleKeys @('p/T-x')
+Check "scrub (no queue key): no dropped" 0 $dropped.Count
+
+# After scrub, Get-NextLeaseWaiter picks from remaining eligibles only.
+$lease = @{
+    queue = @(
+        @{ key = 'p/T-dead'; waiting_since = '2026-08-26T04:00:00Z' },   # earliest but ineligible
+        @{ key = 'p/T-live'; waiting_since = '2026-08-26T05:00:00Z' }
+    )
+}
+Remove-IneligibleLeaseWaiters -Lease $lease -EligibleKeys @('p/T-live') | Out-Null
+$nextAfterScrub = Get-NextLeaseWaiter -Lease $lease -SweepOrderKeys @('p/T-live')
+Check "scrub -> next waiter is the surviving live one, NOT the dropped-earliest" 'p/T-live' $nextAfterScrub
+
 # --- 5. Get-NextLeaseWaiter — FIFO + sweep tiebreak ---------------------------------------------
 Write-Host "Get-NextLeaseWaiter — FIFO on waiting_since, sweep order as tiebreak"
 
@@ -379,7 +434,10 @@ $mustCall = @(
     'ConvertTo-LeasesStateHashtable',
     # msg-1852 blocker fix: probe drains queued waiters into an empty lease before the
     # candidate loop can snipe past FIFO.
-    'Invoke-LeaseGrantFromEmpty'
+    'Invoke-LeaseGrantFromEmpty',
+    # msg-1875 blocker fix: probe scrubs the queue of quarantined / off-sweep / dropped-
+    # requires waiters before any promotion decision, so no dead waiter is ever promoted.
+    'Remove-IneligibleLeaseWaiters'
 )
 foreach ($fn in $mustCall) {
     $found = $commandNames -contains $fn
@@ -714,6 +772,60 @@ else {
     else {
         $script:failures++
         Write-Host "  FAIL  Test-LeaseAvailableFor (line $firstAvailableLine) precedes Invoke-LeaseGrantFromEmpty (line $firstGrantLine) — first candidate snipes past FIFO before drain runs"
+    }
+}
+
+# --- 14. Wrapper AST wiring — queue scrub runs BEFORE any promotion (msg-1875 blocker) -----------
+#
+# Regression pin: Remove-IneligibleLeaseWaiters must precede BOTH Invoke-LeaseGrantFromEmpty
+# (empty-holder drain) and Invoke-LeasePromotion (Phase 2 revoke). If a future refactor moves
+# the scrub after either promotion path, the dead waiter is promoted first and holds the lease
+# idle for up to LeaseIdleTtl (2h). This is a semantic-adjacency invariant that the source
+# order encodes; a source-order test is the cheapest way to keep it honest (same lesson as
+# rounds 2/4/5 for commit-launch, merger snapshot, and grant-from-empty).
+Write-Host "Wrapper AST wiring — Remove-IneligibleLeaseWaiters precedes Invoke-LeaseGrantFromEmpty AND Invoke-LeasePromotion (msg-1875 blocker)"
+
+$scrubCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Remove-IneligibleLeaseWaiters'
+    }, $true))
+$grantFromEmptyCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Invoke-LeaseGrantFromEmpty'
+    }, $true))
+$promotionCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Invoke-LeasePromotion'
+    }, $true))
+
+if ($scrubCalls.Count -eq 0) {
+    $script:failures++
+    Write-Host "  FAIL  Remove-IneligibleLeaseWaiters call not found — scrub wiring gone?"
+}
+else {
+    $firstScrubLine = ($scrubCalls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+    if ($grantFromEmptyCalls.Count -gt 0) {
+        $firstGrantLine = ($grantFromEmptyCalls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+        if ($firstScrubLine -lt $firstGrantLine) {
+            Write-Host "  PASS  Remove-IneligibleLeaseWaiters (line $firstScrubLine) precedes Invoke-LeaseGrantFromEmpty (line $firstGrantLine)"
+        }
+        else {
+            $script:failures++
+            Write-Host "  FAIL  Invoke-LeaseGrantFromEmpty (line $firstGrantLine) precedes scrub (line $firstScrubLine) — dead waiter would be promoted from empty lease"
+        }
+    }
+    if ($promotionCalls.Count -gt 0) {
+        $firstPromotionLine = ($promotionCalls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+        if ($firstScrubLine -lt $firstPromotionLine) {
+            Write-Host "  PASS  Remove-IneligibleLeaseWaiters (line $firstScrubLine) precedes Invoke-LeasePromotion (line $firstPromotionLine)"
+        }
+        else {
+            $script:failures++
+            Write-Host "  FAIL  Invoke-LeasePromotion (line $firstPromotionLine) precedes scrub (line $firstScrubLine) — dead waiter would be promoted from revoked holder"
+        }
     }
 }
 

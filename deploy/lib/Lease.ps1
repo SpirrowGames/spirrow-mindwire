@@ -483,6 +483,73 @@ function Invoke-LeasePromotion {
     return $result
 }
 
+function Remove-IneligibleLeaseWaiters {
+    <#
+    .SYNOPSIS
+        Scrub a lease's queue of waiters that are no longer eligible for the resource. Called
+        by the probe at the top of each per-resource iteration BEFORE any promotion decision,
+        so a promoted waiter is guaranteed to be a currently-launchable candidate.
+
+    .DESCRIPTION
+        WHY THIS EXISTS (msg-1875 blocker). A waiter enters a queue when it declares `requires:
+        [R]` in sweep.json and R is held by someone else. Between that enqueue and eventual
+        promotion, the waiter can become un-launchable in three ways:
+          1. Quarantined (non-zero exit on a launch) — the candidate loop will skip it until
+             an operator runs Clear-Quarantine.
+          2. Removed from sweep.json entirely (thread folded, config change).
+          3. `requires:` list edited to drop R (config change).
+        If the queue is not scrubbed, `Get-NextLeaseWaiter` will hand any of these back as the
+        promotion target. The probe classifies the promoted holder as `parked` (quarantined or
+        off-sweep is `parked` per Get-LeaseHolderClassification) and starts incrementing
+        `idle_evaluations` — but the wall-clock half of the dual predicate is measured from the
+        promotion time. That means the resource stays held by a dead candidate for the full
+        `LeaseIdleTtl` (2h) before revocation, silently starving every valid waiter behind it.
+        This IS the "silent parked" failure the mechanism exists to end. Scrubbing before
+        promotion is the fix — a candidate that cannot launch this tick has no business being
+        the next promotion target.
+
+        Held is NOT scrubbed. Held is a transient operator-imposed pause that lifts on the
+        operator's own timeline; keeping a held waiter in queue mirrors the probe's treatment
+        of a held holder as `progress` (D-6'c) and preserves the "operator's intent survives
+        the tick" property throughout the mechanism.
+
+    .PARAMETER Lease
+        The per-resource lease hashtable. Its `queue` is mutated in place.
+
+    .PARAMETER EligibleKeys
+        The set of "$project/$thread_id" keys still eligible for THIS resource this tick.
+        Waiters whose key is not in this set are removed. The caller computes the set (the
+        wrapper joins sweep-order keys, quarantine-not-membership, and per-candidate `requires`
+        containing this resource).
+
+    .OUTPUTS
+        The array of keys that were removed. An empty array means the queue was already clean.
+        Callers can iterate this to log a per-waiter audit line.
+    #>
+    param(
+        [hashtable]$Lease,
+        [string[]]$EligibleKeys
+    )
+    if ($null -eq $Lease) { return @() }
+    if (-not $Lease.ContainsKey('queue') -or $null -eq $Lease['queue']) { return @() }
+    if ($null -eq $EligibleKeys) { $EligibleKeys = @() }
+
+    $droppedKeys = @()
+    $newQueue = @()
+    foreach ($item in @($Lease['queue'])) {
+        $k = if ($item -is [hashtable]) { $item['key'] } else { $item.key }
+        if (-not $k) { continue }   # malformed entry — drop silently
+        if ($EligibleKeys -contains $k) {
+            $newQueue += $item
+        }
+        else {
+            $droppedKeys += $k
+        }
+    }
+    $Lease['queue'] = $newQueue
+    return @($droppedKeys)
+}
+
 function Invoke-LeaseGrantFromEmpty {
     <#
     .SYNOPSIS
