@@ -374,31 +374,50 @@ class StreamableHttpChatroomMcp:
             transport_part, remainder = group.split(_TRANSPORT_EXCEPTIONS)
             if transport_part is None:
                 raise  # no transport exceptions in the group — pure programming errors
-            first = _first_leaf(transport_part)
-            wrapped = _wrap_transport_error(name, first)
+            # ``_first_leaf`` is used ONLY for the message string (so the wrap
+            # says ``ConnectError`` rather than ``ExceptionGroup``); the
+            # exception chain uses ``transport_part`` so every matched sibling
+            # is preserved. PR-gate on #178 round 3 flagged this: chaining to
+            # a single leaf silently drops any other transport failures that
+            # split matched into the same sub-group (e.g. a task group whose
+            # two failed tasks both raise transport errors — only one appeared
+            # in the traceback under the old code). ``transport_part`` is
+            # guaranteed to be a ``BaseExceptionGroup`` by ``group.split``.
+            first_leaf = _first_leaf(transport_part)
+            wrapped = _wrap_transport_error(name, first_leaf)
             if remainder is None:
-                raise wrapped from first  # bare MagickitMcpError to the caller
-            # Transport + non-transport siblings: keep the wrap visible next
-            # to the programming-error remainder so neither disappears. Two
-            # subtleties (PR-gate on #178 flagged both):
+                # Bare MagickitMcpError to the caller (``LoopControlReader``'s
+                # ``except MagickitMcpError`` — msg-1685 §2 — matches this).
+                # Chain to ``transport_part`` so any additional sibling
+                # transport failures survive in ``__cause__.exceptions``.
+                raise wrapped from transport_part
+            # Transport + non-transport siblings: surface BOTH — the wrap
+            # (transport story) and the programming-error remainder (invariant
+            # msg-1685 §2 asked for: programming errors escape). Three
+            # subtleties (PR-gate on #178 flagged all three across rounds 2-3):
             #
-            # 1. ``wrapped.__cause__ = first`` **must be set explicitly**.
-            #    ``_wrap_transport_error`` just constructs the exception, so
-            #    without this the wrap has no cause chain — the traceback link
-            #    to the underlying transport failure would be severed. The
-            #    single-transport branch above gets this via ``raise wrapped
-            #    from first``; here the wrap goes into a list rather than
-            #    being raised, so the same chain must be set by hand.
-            # 2. The group is raised ``from group`` (the *caught* group), not
-            #    ``from first``. Chaining to ``first`` would say "the whole
-            #    new group was caused by the transport error", which is false
-            #    — the programming-bug remainder is a sibling task failure,
-            #    not a downstream effect. Chaining to ``group`` (the original
-            #    caught container) correctly says "this new group is a
-            #    repackaging of the one we caught". The ``from`` form is
-            #    required by ruff B904; ``from None`` would suppress the
-            #    caught context, which we want to keep.
-            wrapped.__cause__ = first
+            # 1. ``wrapped.__cause__ = transport_part`` **must be set
+            #    explicitly**. ``_wrap_transport_error`` just constructs the
+            #    exception, so without this the wrap has no cause chain — the
+            #    traceback link to the underlying transport failure(s) would
+            #    be severed. The single-transport branch above gets this via
+            #    ``raise wrapped from transport_part``; here the wrap goes
+            #    into a list rather than being raised, so the same chain must
+            #    be set by hand.
+            # 2. The wrap chains to ``transport_part`` (the *sub-group* of
+            #    matched transport exceptions), NOT to ``first_leaf`` alone.
+            #    Chaining to a leaf would drop any other transport siblings
+            #    that matched — the exact regression PR-gate round 3 pinned.
+            #    All matched leaves survive via ``transport_part.exceptions``.
+            # 3. The outer group is raised ``from group`` (the *caught* group),
+            #    not ``from first_leaf``. Chaining to a leaf would falsely
+            #    assert every sibling (including the programming bug) was
+            #    caused by that one transport error. Chaining to ``group``
+            #    (the original caught container) correctly says "this new
+            #    group is a repackaging of the one we caught". The ``from``
+            #    form is required by ruff B904; ``from None`` would suppress
+            #    the caught context, which we want to keep.
+            wrapped.__cause__ = transport_part
             raise BaseExceptionGroup(
                 "magickit call: transport failure alongside non-transport error",
                 [wrapped, remainder],

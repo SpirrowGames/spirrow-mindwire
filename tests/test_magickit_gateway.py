@@ -517,43 +517,82 @@ async def test_call_tool_surfaces_transport_and_programming_side_by_side_in_mixe
 
 @pytest.mark.anyio
 async def test_call_tool_mixed_group_attaches_cause_to_wrap_not_to_group() -> None:
-    """PR-gate #178 (round 2) regression: two traceback bugs in the mixed-group path.
+    """PR-gate #178 (rounds 2 & 3) regression: traceback bugs in the mixed-group path.
 
-    Bug 1 — **the wrap loses its cause**. Constructing the ``MagickitMcpError``
-    with ``_wrap_transport_error`` and putting it in a list gives it no
-    ``__cause__``, severing the traceback chain to the underlying transport
-    exception. The fix explicitly sets ``wrapped.__cause__ = first``.
+    Round 2 — bug A: **the wrap lost its cause.** Constructing the
+    ``MagickitMcpError`` with ``_wrap_transport_error`` and putting it in a
+    list gave it no ``__cause__``, severing the traceback chain to the
+    underlying transport failure. Fixed by setting ``wrapped.__cause__``
+    explicitly.
 
-    Bug 2 — **the group gets a false cause**. ``raise <group> from first``
-    attaches the transport exception as the group's ``__cause__``, which
-    falsely asserts that every sibling (including programming bugs) was
-    caused by the transport failure. Since programming bugs and transport
-    failures are unrelated task-group sibling errors, the group must have
-    no ``__cause__`` pointing to ``first``.
+    Round 2 — bug B: **the group got a false cause.** ``raise <group> from
+    first_leaf`` attached the transport exception as the group's
+    ``__cause__``, falsely asserting every sibling (including the
+    programming bug) was caused by the transport failure. Fixed by chaining
+    the outer group ``from group`` (the original caught container).
+
+    Round 3 — bug C: **sibling transport exceptions were silently dropped.**
+    Chaining the wrap to ``first_leaf`` alone lost any other transport
+    failures that ``split()`` had matched into the same sub-group. Fixed by
+    chaining ``wrapped.__cause__`` to ``transport_part`` (the whole sub-group
+    of matched transport exceptions), not to a single leaf.
     """
-    transport_exc = httpx.ConnectError("nope")
+    transport_a = httpx.ConnectError("first-transport")
+    transport_b = httpx.ReadTimeout("second-transport")
     bug_exc = TypeError("bug in caller args")
-    mixed = ExceptionGroup("mcp task group", [transport_exc, bug_exc])
+    # Two transport siblings plus a programming bug — enough to exercise all
+    # three regressions in one test. If we had only one transport exception,
+    # bug C would be invisible (transport_part.exceptions would contain
+    # exactly that leaf, so "chain to leaf" and "chain to group containing
+    # only that leaf" would look identical).
+    mixed = ExceptionGroup("mcp task group", [transport_a, transport_b, bug_exc])
 
     with pytest.raises(BaseExceptionGroup) as excinfo:
         await _RaisingMcp(mixed).call_tool("x", {})
 
     group = excinfo.value
 
-    # Bug 2 pin: the group itself must not falsely name the transport error
-    # as its cause — the programming bug is a sibling, not a downstream effect.
-    assert group.__cause__ is not transport_exc, (
-        "the mixed group should not carry the transport exception as its __cause__ "
+    # Bug B pin: the outer group must not falsely name a transport leaf as
+    # its cause — the programming bug is a sibling, not a downstream effect.
+    assert group.__cause__ is not transport_a, (
+        "the mixed group should not carry a transport leaf as its __cause__ "
         "(that would falsely assert the programming bug was caused by the transport failure)"
     )
+    assert group.__cause__ is not transport_b, (
+        "the mixed group should not carry a transport leaf as its __cause__"
+    )
 
-    # Bug 1 pin: find the wrap and verify it kept the traceback chain.
+    # Bug A pin: find the wrap and verify it kept a traceback chain at all.
     wraps = [e for e in group.exceptions if isinstance(e, MagickitMcpError)]
     assert len(wraps) == 1, f"expected exactly one wrap in the group, got {wraps!r}"
     wrap = wraps[0]
-    assert wrap.__cause__ is transport_exc, (
-        "the wrap must chain back to the transport exception via __cause__ "
-        f"(got __cause__={wrap.__cause__!r})"
+    assert wrap.__cause__ is not None, (
+        "the wrap must have a __cause__ set (Bug A: _wrap_transport_error does "
+        "not set __cause__ implicitly, so the mixed-group branch must set it by hand)"
+    )
+
+    # Bug C pin: the wrap's cause must preserve every matched transport
+    # exception, not just the first leaf. ``transport_part`` from ``group.split``
+    # is a BaseExceptionGroup containing both transport_a and transport_b.
+    assert isinstance(wrap.__cause__, BaseExceptionGroup), (
+        "the wrap must chain to the transport sub-group (so all matched siblings "
+        f"survive), not to a single leaf (got __cause__={wrap.__cause__!r})"
+    )
+    cause_leaves = list(wrap.__cause__.exceptions)
+    assert transport_a in cause_leaves, (
+        f"first transport sibling missing from wrap.__cause__: {cause_leaves!r}"
+    )
+    assert transport_b in cause_leaves, (
+        "second transport sibling silently dropped from wrap.__cause__ — "
+        "this is the Bug C regression (chain to leaf instead of transport_part). "
+        f"Got: {cause_leaves!r}"
+    )
+    # Negative: no programming bugs should have leaked into the cause chain
+    # (they are siblings in the outer group, not a downstream effect of the
+    # transport failure).
+    assert bug_exc not in cause_leaves, (
+        "the programming bug should NOT be in wrap.__cause__ (it's a sibling task "
+        "failure, surfaced separately in the outer group)"
     )
 
 
@@ -562,23 +601,76 @@ async def test_call_tool_single_transport_wrap_chains_to_the_transport_error() -
     """Sibling of the mixed-group traceback test — the same ``__cause__`` rule
     must hold on the (much more common) single-transport path too.
 
-    Both call sites in ``call_tool`` (the bare ``except _TRANSPORT_EXCEPTIONS``
-    and the single-transport branch of the ``except BaseExceptionGroup``) use
-    ``raise wrapped from first``, so the invariant is pinned uniformly.
+    - ``except _TRANSPORT_EXCEPTIONS as exc`` branch: ``raise wrap from exc``
+      — the cause IS the bare transport exception (no group involved).
+    - ``except BaseExceptionGroup`` transport-only branch: ``raise wrap from
+      transport_part`` — the cause is the sub-group so every matched sibling
+      is preserved (PR-gate #178 round 3).
     """
-    # Bare transport case.
+    # Bare transport case — the wrap's __cause__ is the bare exception itself.
     bare = httpx.ConnectError("nope")
     with pytest.raises(MagickitMcpError) as excinfo:
         await _RaisingMcp(bare).call_tool("x", {})
     assert excinfo.value.__cause__ is bare
 
-    # Group-with-only-transport case.
+    # Group-with-only-transport case — the wrap's __cause__ is the
+    # transport sub-group (containing the leaf), not the leaf itself.
+    # Round 3: chaining to the leaf would drop any additional matched siblings
+    # (see ``test_call_tool_transport_only_group_preserves_all_sibling_transports``).
     grouped_inner = httpx.ConnectError("nope-grouped")
     group = ExceptionGroup("mcp task group", [grouped_inner])
     with pytest.raises(MagickitMcpError) as excinfo2:
         await _RaisingMcp(group).call_tool("x", {})
-    # The leaf peeled from the group is the same object we put in — chain to it.
-    assert excinfo2.value.__cause__ is grouped_inner
+    cause = excinfo2.value.__cause__
+    assert isinstance(cause, BaseExceptionGroup), (
+        f"expected __cause__ to be the transport sub-group, got {cause!r}"
+    )
+    assert grouped_inner in cause.exceptions, (
+        f"transport leaf missing from wrap.__cause__.exceptions: {list(cause.exceptions)!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_call_tool_transport_only_group_preserves_all_sibling_transports() -> None:
+    """PR-gate #178 (round 3) regression: with multiple transport siblings in
+    the same ``ExceptionGroup``, the wrap must chain to the WHOLE
+    ``transport_part``, not to the first peeled leaf.
+
+    Under the round-2 code (``raise wrapped from first_leaf`` /
+    ``wrapped.__cause__ = first``) the second sibling silently disappeared
+    from the traceback — the exact silent-drop failure class this whole
+    thread exists to close.
+
+    Scenario: anyio task group where two concurrent tasks both fail with
+    transport-class exceptions (e.g. connect error AND read timeout on
+    parallel sub-requests). The wrap must let a log reader see both.
+    """
+    first_transport = httpx.ConnectError("first-connect")
+    second_transport = httpx.ReadTimeout("second-timeout")
+    group = ExceptionGroup("mcp task group", [first_transport, second_transport])
+
+    with pytest.raises(MagickitMcpError) as excinfo:
+        await _RaisingMcp(group).call_tool("x", {})
+
+    wrap = excinfo.value
+    # Still bare (the msg-1685 §2 contract) — the caller's `except
+    # MagickitMcpError` at the call site must match, even under multi-sibling.
+    assert type(wrap) is MagickitMcpError, (
+        f"expected a bare MagickitMcpError, got {type(wrap).__name__}: {wrap!r}"
+    )
+    # The cause is the transport sub-group, containing BOTH leaves.
+    cause = wrap.__cause__
+    assert isinstance(cause, BaseExceptionGroup), (
+        f"expected __cause__ to be the transport sub-group, got {cause!r}"
+    )
+    leaves = list(cause.exceptions)
+    assert first_transport in leaves, (
+        f"first transport sibling missing from wrap.__cause__: {leaves!r}"
+    )
+    assert second_transport in leaves, (
+        "second transport sibling silently dropped — this is the round-3 "
+        f"regression (chain to leaf instead of transport_part). Got: {leaves!r}"
+    )
 
 
 @pytest.mark.anyio
