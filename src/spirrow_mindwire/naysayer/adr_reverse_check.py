@@ -23,13 +23,17 @@ Fixture exclusion — occurrence-unit, not id-unit
 ------------------------------------------------
 Two test files carry synthetic ADR ids by design (they are testing the ADR machinery
 itself) and would trigger this check with false positives: ``tests/test_adr_index_gen.py``
-uses ``ADR-2026-01-01-1`` as a rendering fixture, and ``tests/test_pr_review_adr_pointers.py``
-uses ``ADR-9999-99-99-99`` as a made-up-id fixture. Excluding those two files at the
-*occurrence* level is safe; excluding ``ADR-9999-99-99-99`` (or ``ADR-2026-01-01-1``)
-at the *id* level would silently miss the same id if it ever appeared in production
-code. The distinction is deliberate: fixture ids are fixture ids because of where they
-sit, not because of what they look like (Bohr §4 in msg-913). This module also skips
-its own test file for the same reason.
+uses the placeholder id ``2026-01-01-1`` (an "ADR-"-prefixed literal that is not a real
+ADR) as a rendering fixture, and ``tests/test_pr_review_adr_pointers.py`` uses the
+made-up id ``9999-99-99-99`` for its unknown-id fixtures. Excluding those two files at
+the *occurrence* level is safe; excluding those ids at the *id* level would silently
+miss the same id if it ever appeared in production code — fixture ids are fixture ids
+because of where they sit, not because of what they look like (Bohr §4 in msg-913).
+This module also skips its own test file and its own source for the same reason: the
+paired test's failure-message sample carries real-looking ids, and this module's own
+prose describes fixture ids as bare tokens ``2026-01-01-1`` / ``9999-99-99-99``
+(written here without the ``ADR-`` prefix so the check does not scan its own
+documentation as citations).
 
 The manifest file (``spec/adr_index.yaml``) is excluded because it is the *index*
 itself, not a citation of it. Failing on the index would make ``cited ⊆ index``
@@ -63,9 +67,9 @@ ADR_ID_RE = re.compile(r"ADR-\d{4}-\d{2}-\d{2}-\d+")
 # the same id appearing elsewhere is not silently pardoned.
 _FIXTURE_FILES: frozenset[str] = frozenset(
     {
-        # Fixture: ADR-2026-01-01-1 as a render_manifest input.
+        # Fixture: 2026-01-01-1 as a render_manifest input.
         "tests/test_adr_index_gen.py",
-        # Fixture: ADR-9999-99-99-99 as a made-up-id used across several review tests.
+        # Fixture: 9999-99-99-99 as a made-up id used across several review tests.
         "tests/test_pr_review_adr_pointers.py",
         # This module's own paired test — the failure-message sample it prints back
         # contains real-looking ids and must not itself trigger the check.
