@@ -2260,7 +2260,40 @@ try {
         # here (msg-1802 blocker #2). Trust the boundary.
         $lease = $leasesState[$resource]
         $holderKey = "$($lease['holder'])"
-        if ([string]::IsNullOrEmpty($holderKey)) { continue }   # free lease; nothing to probe
+        if ([string]::IsNullOrEmpty($holderKey)) {
+            # Empty holder — but if waiters are queued, we MUST drain the FIFO head here
+            # BEFORE the candidate loop, otherwise any candidate that arrives (regardless of
+            # whether it was queued) will find the lease `available` in Test-LeaseAvailableFor
+            # and snipe it via Invoke-LeaseAcquire, cutting past waiters that have been queued
+            # for hours. That is exactly what happens after Grant-Lease.ps1 -Clear on a lease
+            # that had waiters: the Clear branch leaves `holder=null, queue=[W1, W2],
+            # reclaim_required=true` on disk, and without this drain the FIFO promise
+            # (msg-1183 D-3) is violated. (msg-1852 blocker.)
+            $queueItems = if ($lease.ContainsKey('queue')) { @($lease['queue']) } else { @() }
+            if ($queueItems.Count -gt 0) {
+                $grant = Invoke-LeaseGrantFromEmpty -Lease $lease -Now $nowUtc `
+                                                    -SweepOrderKeys $sweepOrderKeys
+                if ($grant.action -eq 'granted-from-empty') {
+                    Confirm-LogWorthKeeping
+                    Write-Log "lease [$resource] granted-from-empty: -> $($grant.new_holder) (empty-with-queue drain; reclaim_required=$($grant.reclaim_required))"
+                    if ($grant.reclaim_required) {
+                        # The empty state carried reclaim duty (operator -Clear, or a race).
+                        # This is the same operator-visible failure mode as the dirty-acquire
+                        # path in the candidate loop (msg-1757 blocker #2 fix), so reuse the
+                        # same notification key so the digest / operator inbox story stays
+                        # single-channel for "someone inherited reclaim duty."
+                        Send-NotificationIfChanged -State $notifyState -Key "__lease_reclaim_acquire__/$resource" `
+                            -Signature "$($grant.reclaimed_from)->$($grant.new_holder)@$(($nowUtc.ToString('o')))" `
+                            -Message ("MindWire: lease **$resource** の FIFO を drain して waiter に付与しました " +
+                                      "(前回 release / operator -Clear の際に waiter が残っていました)。" +
+                                      "旧: $($grant.reclaimed_from) → 新: $($grant.new_holder)。" +
+                                      "reclaim_required — 新側は使用前にリソースの再起動が必要です " +
+                                      "(v1 は scheduling で enforcement ではないため、旧側が自力で起動する可能性は残ります)。")
+                    }
+                }
+            }
+            continue
+        }   # free lease; nothing to probe
 
         # Look up the holder's project-scoped context. Everything read here is already in memory.
         $holderProj = ($holderKey -split '/', 2)[0]

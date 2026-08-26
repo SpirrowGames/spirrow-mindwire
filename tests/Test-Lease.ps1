@@ -249,6 +249,64 @@ Check "phase 2: generation bumped" 3 $lease['generation']
 CheckFalse "phase 2: expiring flag cleared" ([bool]$lease['expiring'])
 Check "phase 2: queue empty (promoted waiter dequeued)" 0 $lease['queue'].Count
 
+# msg-1852 blocker: Invoke-LeaseGrantFromEmpty drains a queued waiter into an empty lease
+# (the state Grant-Lease.ps1 -Clear leaves when waiters were already registered). Without this,
+# any candidate arriving after the clear snipes the free lease past the FIFO queue.
+Write-Host "Invoke-LeaseGrantFromEmpty — FIFO drain on empty-holder + non-empty queue (msg-1852 blocker)"
+
+# --- happy path: empty lease with waiters + reclaim_required=true (operator -Clear left this) ---
+$lease = @{
+    holder            = $null
+    generation        = 7
+    pinned            = $false
+    expiring          = $false
+    reclaim_required  = $true
+    reclaimed_from    = 'p/T-cleared'
+    revoked_at        = '2026-08-25T00:00:00Z'
+    revoked_reason    = 'operator-clear: PIE crashed'
+    queue = @(
+        @{ key = 'p/T-w1'; waiting_since = $now.AddMinutes(-30).ToUniversalTime().ToString("o") },
+        @{ key = 'p/T-w2'; waiting_since = $now.AddMinutes(-10).ToUniversalTime().ToString("o") }
+    )
+}
+$grant = Invoke-LeaseGrantFromEmpty -Lease $lease -Now $now -SweepOrderKeys @('p/T-w1', 'p/T-w2')
+Check "grant-from-empty: action = granted-from-empty" 'granted-from-empty' $grant.action
+Check "grant-from-empty: FIFO head (earliest waiting_since) wins" 'p/T-w1' $grant.new_holder
+Check "grant-from-empty: lease.holder set to promoted waiter" 'p/T-w1' $lease['holder']
+Check "grant-from-empty: generation bumped" 8 $lease['generation']
+CheckTrue "grant-from-empty: reclaim_required preserved on new holder" ([bool]$lease['reclaim_required'])
+Check "grant-from-empty: reclaimed_from preserved" 'p/T-cleared' $lease['reclaimed_from']
+Check "grant-from-empty: revoked_at cleared (that annotated the INTO-empty transition)" $null $lease['revoked_at']
+Check "grant-from-empty: revoked_reason cleared" $null $lease['revoked_reason']
+Check "grant-from-empty: dequeued only the promoted waiter" 1 $lease['queue'].Count
+Check "grant-from-empty: remaining waiter is w2" 'p/T-w2' $lease['queue'][0].key
+Check "grant-from-empty: caller sees reclaim_required=true for notification decision" $true $grant.reclaim_required
+
+# --- edge: empty lease with empty queue -> noop, nothing to grant ---
+$lease = @{ holder = $null; generation = 5; queue = @() }
+$grant = Invoke-LeaseGrantFromEmpty -Lease $lease -Now $now -SweepOrderKeys @()
+Check "grant-from-empty (empty queue): action = noop" 'noop' $grant.action
+Check "grant-from-empty (empty queue): holder stays null" $null $lease['holder']
+Check "grant-from-empty (empty queue): generation NOT bumped" 5 $lease['generation']
+
+# --- edge: reclaim_required NOT set on the empty record -> new holder does NOT inherit it ---
+$lease = @{
+    holder = $null; generation = 3; pinned = $false; expiring = $false
+    reclaim_required = $false
+    queue = @( @{ key = 'p/T-w1'; waiting_since = $now.AddMinutes(-5).ToUniversalTime().ToString("o") } )
+}
+$grant = Invoke-LeaseGrantFromEmpty -Lease $lease -Now $now -SweepOrderKeys @('p/T-w1')
+Check "grant-from-empty (clean release): action = granted-from-empty" 'granted-from-empty' $grant.action
+CheckFalse "grant-from-empty (clean release): reclaim_required stays false" ([bool]$lease['reclaim_required'])
+Check "grant-from-empty (clean release): caller signal reclaim_required=false" $false $grant.reclaim_required
+
+# --- no-steal invariant: called on a lease with an actual holder -> throw ---
+$lease = @{ holder = 'p/T-live'; queue = @( @{ key = 'p/T-w1'; waiting_since = $now.ToUniversalTime().ToString("o") } ) }
+$threw = $false
+try { Invoke-LeaseGrantFromEmpty -Lease $lease -Now $now -SweepOrderKeys @() }
+catch { $threw = $true }
+CheckTrue "grant-from-empty on non-empty holder: throws (no accidental steal)" $threw
+
 # Promotion with no waiter -> release (holder gone, generation still bumps, reclaim_required set).
 $lease = @{
     holder = 'p/T-old'
@@ -318,7 +376,10 @@ $mustCall = @(
     'Update-LeaseFromClassification',
     'Test-LeaseExpiring',
     'Test-LeaseAvailableFor',
-    'ConvertTo-LeasesStateHashtable'
+    'ConvertTo-LeasesStateHashtable',
+    # msg-1852 blocker fix: probe drains queued waiters into an empty lease before the
+    # candidate loop can snipe past FIFO.
+    'Invoke-LeaseGrantFromEmpty'
 )
 foreach ($fn in $mustCall) {
     $found = $commandNames -contains $fn
@@ -615,6 +676,46 @@ foreach ($c in $genericMergeCalls) {
     }
 }
 CheckFalse "leases.json is NOT passed to the generic Merge-StateForWrite" $leasesFedToGeneric
+
+# --- 13. Wrapper AST wiring — empty-with-queue drain runs in the probe (msg-1852 blocker) --------
+#
+# Regression pin: the drain must happen in the OUT-OF-BAND probe (before the candidate loop),
+# not in the candidate loop itself. If a future refactor moves Invoke-LeaseGrantFromEmpty into
+# the candidate loop, the very FIRST candidate evaluated for the resource (whether it was
+# queued or not) will still snipe the lease before the drain runs — the FIFO promise (msg-1183
+# D-3) is only honoured if the drain precedes ANY candidate-loop lease decision.
+Write-Host "Wrapper AST wiring — Invoke-LeaseGrantFromEmpty runs in the probe, BEFORE Test-LeaseAvailableFor (msg-1852 blocker)"
+
+$grantFromEmptyCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Invoke-LeaseGrantFromEmpty'
+    }, $true))
+$availableCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Test-LeaseAvailableFor'
+    }, $true))
+
+if ($grantFromEmptyCalls.Count -eq 0) {
+    $script:failures++
+    Write-Host "  FAIL  Invoke-LeaseGrantFromEmpty call not found in wrapper — drain wiring gone?"
+}
+elseif ($availableCalls.Count -eq 0) {
+    $script:failures++
+    Write-Host "  FAIL  Test-LeaseAvailableFor call not found — candidate-loop lease gate gone?"
+}
+else {
+    $firstGrantLine = ($grantFromEmptyCalls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+    $firstAvailableLine = ($availableCalls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+    if ($firstGrantLine -lt $firstAvailableLine) {
+        Write-Host "  PASS  Invoke-LeaseGrantFromEmpty (line $firstGrantLine) precedes Test-LeaseAvailableFor (line $firstAvailableLine) — probe drains queue before candidate loop"
+    }
+    else {
+        $script:failures++
+        Write-Host "  FAIL  Test-LeaseAvailableFor (line $firstAvailableLine) precedes Invoke-LeaseGrantFromEmpty (line $firstGrantLine) — first candidate snipes past FIFO before drain runs"
+    }
+}
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }

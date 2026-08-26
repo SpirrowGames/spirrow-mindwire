@@ -483,6 +483,105 @@ function Invoke-LeasePromotion {
     return $result
 }
 
+function Invoke-LeaseGrantFromEmpty {
+    <#
+    .SYNOPSIS
+        Promote the FIFO waiter into an already-empty lease. Fills the gap where a lease has no
+        holder but a non-empty queue — a state produced by `Grant-Lease.ps1 -Clear` when waiters
+        were already registered, or (in theory) by any future path that frees a lease without
+        draining its queue.
+
+    .DESCRIPTION
+        WHY THIS FUNCTION EXISTS (msg-1852 blocker). `Invoke-LeasePromotion` handles the flow
+        "revoke a live holder → promote from queue" (two-phase: mark expiring, then promote).
+        `Invoke-LeaseAcquire` handles the flow "candidate arrives, lease is free, take it." What
+        was MISSING was the flow "lease is already free, but waiters are queued, promote them
+        so the next candidate that arrives does not snipe past FIFO." The probe was skipping
+        every empty-holder resource with `continue`, so the queue never drained, and the first
+        candidate that arrived acquired the lease directly via Invoke-LeaseAcquire — silently
+        cutting in front of anyone who had been waiting for hours.
+
+        The fix is to run this from the out-of-band probe BEFORE its empty-holder skip. If a
+        resource has no holder but a non-empty queue, drain the head of the queue into the
+        holder slot; the next candidate loop will see the promoted holder and either self-hold
+        (if it is the promoted waiter) or lease-wait (if it is not).
+
+    .PARAMETER Lease
+        The per-resource lease hashtable. Precondition: `$Lease['holder']` is null or empty.
+        Contract violation (non-empty holder) is treated as a wiring bug — the caller must
+        gate this on `[string]::IsNullOrEmpty($holderKey)` before calling. Same "no accidental
+        steal" invariant as Invoke-LeaseAcquire.
+
+    .PARAMETER Now
+        UTC tick timestamp.
+
+    .PARAMETER SweepOrderKeys
+        Sweep-order key list for the FIFO tiebreak, as with Invoke-LeasePromotion.
+
+    .OUTPUTS
+        A hashtable with:
+          - action              : 'granted-from-empty' | 'noop'
+          - new_holder          : the promoted waiter's key (only on 'granted-from-empty')
+          - reclaim_required    : $true if the previous empty state carried reclaim duty
+                                  (Grant-Lease.ps1 -Clear sets this); the caller decides whether
+                                  to fire the dirty-acquire notification based on this bit
+          - reclaimed_from      : as preserved from the empty record (may be $null)
+    #>
+    param(
+        [hashtable]$Lease,
+        [datetime]$Now,
+        [string[]]$SweepOrderKeys = @()
+    )
+    $result = @{ action = 'noop'; new_holder = $null; reclaim_required = $false; reclaimed_from = $null }
+    if ($null -eq $Lease) { return $result }
+    $holder = "$($Lease['holder'])"
+    if (-not [string]::IsNullOrEmpty($holder)) {
+        throw "Invoke-LeaseGrantFromEmpty called on a lease with holder '$holder' — caller must gate on empty holder"
+    }
+    $nextKey = Get-NextLeaseWaiter -Lease $Lease -SweepOrderKeys $SweepOrderKeys
+    if (-not $nextKey) { return $result }   # nothing queued; nothing to do
+
+    # Preserve reclaim duty across the transition. If the empty state was produced by
+    # Grant-Lease.ps1 -Clear (which sets reclaim_required=true because the cleared session may
+    # still physically hold the resource) or by any other empty-with-reclaim path, the new
+    # holder inherits the duty. Reading these before we mutate the record so the caller can
+    # decide whether to fire the __lease_reclaim_acquire__ notification.
+    $priorReclaim = $Lease.ContainsKey('reclaim_required') -and [bool]$Lease['reclaim_required']
+    $priorReclaimedFrom = if ($Lease.ContainsKey('reclaimed_from')) { "$($Lease['reclaimed_from'])" } else { '' }
+    $priorGen = 1
+    if ($Lease.ContainsKey('generation') -and $null -ne $Lease['generation']) {
+        $priorGen = [int]$Lease['generation']
+    }
+
+    $remaining = @($Lease['queue'] | Where-Object {
+        $k = if ($_ -is [hashtable]) { $_['key'] } else { $_.key }
+        $k -ne $nextKey
+    })
+    $nowIso = $Now.ToUniversalTime().ToString("o")
+    $Lease['holder']            = $nextKey
+    $Lease['acquired_at']       = $nowIso
+    $Lease['last_progress_at']  = $nowIso
+    $Lease['idle_evaluations']  = 0
+    $Lease['generation']        = $priorGen + 1
+    $Lease['pinned']            = $false
+    $Lease['expiring']          = $false
+    # Preserve reclaim_required and reclaimed_from from the empty state — the new holder must
+    # bounce the resource before use if the previous empty state carried that flag.
+    $Lease['reclaim_required']  = $priorReclaim
+    if ($priorReclaimedFrom) { $Lease['reclaimed_from'] = $priorReclaimedFrom }
+    # Clear the transient revoke annotations — those described the transition INTO the empty
+    # state, not the transition OUT of it. `reclaim_required` above carries whatever the
+    # operator's Clear-reason intent was; the raw text of that reason belongs to that write.
+    $Lease['revoked_at']        = $null
+    $Lease['revoked_reason']    = $null
+    $Lease['queue']             = $remaining
+    $result.action = 'granted-from-empty'
+    $result.new_holder = $nextKey
+    $result.reclaim_required = $priorReclaim
+    $result.reclaimed_from = $priorReclaimedFrom
+    return $result
+}
+
 function Test-LeaseAvailableFor {
     <#
     .SYNOPSIS
