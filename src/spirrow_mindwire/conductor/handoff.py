@@ -256,6 +256,15 @@ class Handoff:
     ``HUMAN``. It is NON-BLOCKING — the conductor records its presence/absence and the turn
     otherwise routes exactly as it would without the tag. This field is a measurement label; it
     is NOT the definition of what Tier-C IS (that stays owned by ADR/Tier-C decides).
+
+    ``field_mismatch`` records the Layer-3 disagreement between a structured ``next_participant``
+    field on the message envelope and the body's own ``NEXT:`` line (Bohr msg-179 §3-1 row 5):
+    when both are present and they resolve to DIFFERENT targets, this Handoff carries
+    ``kind=HUMAN`` (safety valve: escalate that turn to the human) with ``field_mismatch`` set so
+    the conductor can record the divergence as an observability event without a second parser
+    (§3-2: the lint is exactly "did the fallback resolver disagree with the field?" — same
+    resolver on both sides). ``mismatch_body_token`` carries the body's parsed target (the token
+    the fallback would have gone to) so the mismatch event names what the two sides said.
     """
 
     kind: HandoffKind
@@ -263,6 +272,8 @@ class Handoff:
     role: Role | None = None
     token: str | None = None
     tier_c_label: str | None = None
+    field_mismatch: bool = False
+    mismatch_body_token: str | None = None
 
 
 def _last_next_raw(body: str) -> str | None:
@@ -338,7 +349,12 @@ def parse_next_token(body: str) -> str | None:
     return _name_from_raw(raw) if raw is not None else None
 
 
-def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
+def resolve_handoff(
+    body: str,
+    roster: Mapping[str, Role],
+    *,
+    next_participant: str | None = None,
+) -> Handoff:
     """Parse + resolve the latest ``NEXT:`` directive against the identity→role ``roster``.
 
     Resolution order: the ``pr-review <ref>`` PR-gate sentinel (PR-2b-2) first, then the reserved
@@ -346,7 +362,45 @@ def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
     missing ``NEXT:`` line, the empty token, or a non-participant name all resolve to
     :attr:`HandoffKind.ABSENT` — the conductor treats every ABSENT as "route to human" (Obj3 / D-4)
     so a malformed handoff flags a human rather than silently stranding the thread.
+
+    **Layer 3 — the structured ``next_participant`` envelope field (Bohr msg-179 §3):** when the
+    caller passes a non-empty ``next_participant``, the field is the source of truth for routing
+    and the body's ``NEXT:`` line is used only as a **lint** against it — same resolver, no second
+    parser (§3-2). The 5 quadrants of ``(field, body)`` and their outcomes:
+
+    ==============  ==============  ================================  =============================
+    field           body            routing                           side-effect
+    ==============  ==============  ================================  =============================
+    None            no NEXT         ABSENT (fallback)                  —
+    None            NEXT present    follow body (fallback)             —
+    present         no NEXT         follow field                       — (**quiet normal path**)
+    present         NEXT agrees     follow field                       —
+    present         NEXT disagrees  escalate: kind=HUMAN               ``field_mismatch=True``
+    ==============  ==============  ================================  =============================
+
+    Row 3 is msg-1438's silent quadrant: a judgement-page decide carries the field but no ``NEXT:``
+    in the body, and the fallback resolver returns ABSENT. Without this wiring the consumer sees
+    the field-null-and-body-absent case and stops on ``NO_HANDOFF`` even though the field named a
+    target — the exact silent 2-day stall this module now closes.
+
+    A field value that itself fails to resolve (unknown persona, empty after trim, non-token
+    junk) is treated as though it disagreed with the body: the return is ``kind=HUMAN`` with
+    ``field_mismatch=True`` so the divergence is loud rather than a silent drop. The write side
+    (`chatroom_post_message`) is responsible for rejecting such fields with
+    ``NextParticipantUnknownError`` — this read-side treatment is the fail-safe for the case a
+    bad field slipped past validation (§3-3's escape hatch is "drop the field and re-send", which
+    a mismatch-to-human turn asks the human to do).
     """
+    body_handoff = _resolve_body(body, roster)
+    field_value = next_participant.strip() if next_participant is not None else ""
+    if not field_value:
+        return body_handoff
+    field_handoff = _resolve_field(field_value, roster)
+    return _reconcile(field_handoff, body_handoff)
+
+
+def _resolve_body(body: str, roster: Mapping[str, Role]) -> Handoff:
+    """The body-only resolution — the pre-Layer-3 path, factored out for reuse by the lint."""
     raw = _last_next_raw(body)
     if raw is None:
         return Handoff(HandoffKind.ABSENT)
@@ -381,6 +435,74 @@ def resolve_handoff(body: str, roster: Mapping[str, Role]) -> Handoff:
         return Handoff(HandoffKind.ABSENT, token=token)
     identity, role = match
     return Handoff(HandoffKind.ROLE, identity=identity, role=role, token=token)
+
+
+def _resolve_field(field_value: str, roster: Mapping[str, Role]) -> Handoff:
+    """Resolve the raw ``next_participant`` field value.
+
+    The field is a plain participant name or reserved sentinel — a body-line NEXT: keyword is
+    not part of its shape (the field IS the decision). We reuse the same participant/sentinel
+    matching the body path uses, so field and body speak the same vocabulary and cannot disagree
+    on what a "valid participant" is; the field just skips the ``NEXT:``-line scaffolding.
+    """
+    token = _name_from_raw(field_value)
+    if token is None:
+        return Handoff(HandoffKind.ABSENT, token=field_value)
+    folded = token.casefold()
+    if folded == HUMAN_TOKEN:
+        # No tier_c_label on the field route: the calibration tag is a body-only annotation
+        # (msg-890 §3 reads it off the line above the NEXT:). A field-driven HUMAN records its
+        # class through the mismatch event or through absence, not through a body scan.
+        return Handoff(HandoffKind.HUMAN, token=token)
+    if folded == NONE_TOKEN:
+        return Handoff(HandoffKind.NONE, token=token)
+    match = _roster_lookup(roster, token)
+    if match is None:
+        return Handoff(HandoffKind.ABSENT, token=token)
+    identity, role = match
+    return Handoff(HandoffKind.ROLE, identity=identity, role=role, token=token)
+
+
+def _reconcile(field_handoff: Handoff, body_handoff: Handoff) -> Handoff:
+    """Merge a field-derived Handoff with the body-derived Handoff per §3-1 rows 3-5.
+
+    - Body ABSENT ⇒ field wins quietly (row 3: the silent quadrant that stalled msg-1438).
+    - Same target on both sides ⇒ field wins quietly (row 4).
+    - Different targets ⇒ escalate the turn to the human with ``field_mismatch=True`` (row 5). The
+      body's target is preserved as ``mismatch_body_token`` so the caller's event names both sides.
+    - Field itself unresolvable ⇒ same escalation (a bad field survived write-side validation, or
+      was posted by a client that skipped it; making it loud here is the fail-safe).
+    """
+    if field_handoff.kind is HandoffKind.ABSENT:
+        return Handoff(
+            HandoffKind.HUMAN,
+            token=field_handoff.token,
+            field_mismatch=True,
+            mismatch_body_token=body_handoff.token,
+        )
+    if body_handoff.kind is HandoffKind.ABSENT:
+        return field_handoff
+    if _same_target(field_handoff, body_handoff):
+        return field_handoff
+    return Handoff(
+        HandoffKind.HUMAN,
+        token=field_handoff.token,
+        field_mismatch=True,
+        mismatch_body_token=body_handoff.token,
+    )
+
+
+def _same_target(a: Handoff, b: Handoff) -> bool:
+    """Do two Handoffs point at the same actor? Only used to decide "field agrees with body"."""
+    if a.kind is not b.kind:
+        return False
+    if a.kind is HandoffKind.ROLE:
+        # identity is the canonical persona name; both went through the same roster lookup so
+        # they will be byte-identical when they agree.
+        return a.identity == b.identity
+    if a.kind is HandoffKind.PR_REVIEW:
+        return a.token == b.token
+    return True  # HUMAN / NONE — the kind IS the target
 
 
 # --------------------------------------------------------------------------- #

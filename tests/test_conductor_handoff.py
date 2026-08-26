@@ -465,6 +465,174 @@ class TestTierCLabelLookback:
 
 
 # --------------------------------------------------------------------------- #
+# Layer 3 — the structured ``next_participant`` envelope field (Bohr msg-179 §3).
+#
+# The field is the source of truth for routing when it is present; the body's ``NEXT:`` line is
+# kept only as a **lint** against it (§3-2: same resolver, no second parser). Five quadrants:
+#
+#   1. field=None,     body no NEXT       → ABSENT  (pre-Layer-3 fallback)
+#   2. field=None,     body has NEXT      → follow body  (pre-Layer-3 fallback)
+#   3. field=<target>, body no NEXT       → follow field, NO event  ← msg-1438's silent quadrant
+#   4. field=<target>, body agrees        → follow field, NO event
+#   5. field=<target>, body disagrees     → HUMAN + field_mismatch=True (safety valve)
+#
+# Row 3 is the exact quadrant that stalled the loop for 2 days: a judgement-page decide carried
+# ``next_participant: "human"`` but wrote no ``NEXT:`` line in the body. The consumer resolved
+# ABSENT and stopped on NO_HANDOFF while the field named a target. This section pins that quadrant
+# closed, plus §6's regression guard (a field-bearing msg cannot yield NO_HANDOFF).
+# --------------------------------------------------------------------------- #
+
+
+class TestNextParticipantFieldConsumer:
+    """The 5 quadrants of `(field, body)` from Bohr msg-179 §3-1, and the §6 invariant."""
+
+    def test_row1_no_field_no_body_next_is_absent(self) -> None:
+        # Pre-Layer-3 fallback preserved: no field, no body NEXT → ABSENT (routes to human via
+        # the conductor's Obj3 path, not by this resolver).
+        h = resolve_handoff("just a body\nno handoff at all", _ROSTER)
+        assert h.kind is HandoffKind.ABSENT
+        assert h.field_mismatch is False
+        assert h.mismatch_body_token is None
+
+    def test_row2_no_field_body_next_follows_body(self) -> None:
+        # Pre-Layer-3 fallback: no field, body has NEXT → follow the body. Backward compatible
+        # for every caller that has not started passing the envelope field yet.
+        h = resolve_handoff("thinking...\n\nNEXT: Bohr", _ROSTER)
+        assert h.kind is HandoffKind.ROLE
+        assert h.identity == "Bohr"
+        assert h.field_mismatch is False
+
+    def test_row2_explicit_none_field_is_treated_as_absent_field(self) -> None:
+        # A magickit that ships `next_participant: null` states the same fact as omitting the key
+        # entirely. Empty / whitespace-only strings are treated the same way (the sender did not
+        # name anyone). All fall through to body-only resolution — the pre-Layer-3 path.
+        body = "reply\n\nNEXT: Bohr"
+        for empty in (None, "", "   ", "\n"):
+            h = resolve_handoff(body, _ROSTER, next_participant=empty)
+            assert h.kind is HandoffKind.ROLE, repr(empty)
+            assert h.identity == "Bohr", repr(empty)
+            assert h.field_mismatch is False, repr(empty)
+
+    def test_row3_field_present_body_absent_follows_field_quietly(self) -> None:
+        # msg-1438's silent quadrant: judgement-page decide carries the field but no body NEXT.
+        # This must route to the field's target WITHOUT firing a mismatch event - the field is
+        # authoritative and the body has nothing to disagree with. This row is a *normal* path
+        # (§3-1 rows 3: field-present + body-absent is spec'd as normal, not an escalation).
+        body = "approved for implementation."
+        h = resolve_handoff(body, _ROSTER, next_participant="human")
+        assert h.kind is HandoffKind.HUMAN
+        assert h.field_mismatch is False
+        assert h.mismatch_body_token is None
+
+    def test_row3_field_routes_a_persona_when_body_has_no_next(self) -> None:
+        # Same row 3 but with a persona field: the judgement page selected a specific participant,
+        # the body carries no NEXT: line, and the routing follows the field silently.
+        h = resolve_handoff("nothing to add.", _ROSTER, next_participant="Einstein")
+        assert h.kind is HandoffKind.ROLE
+        assert h.identity == "Einstein"
+        assert h.role is Role.NAYSAYER
+        assert h.field_mismatch is False
+
+    def test_row4_field_and_body_agree_follows_field_quietly(self) -> None:
+        # The cooperative case: an author wrote a NEXT: line AND set the field, and they agree.
+        # No event, no mismatch — the field wins (both sides say the same thing anyway).
+        h = resolve_handoff("reply\n\nNEXT: Bohr", _ROSTER, next_participant="Bohr")
+        assert h.kind is HandoffKind.ROLE
+        assert h.identity == "Bohr"
+        assert h.field_mismatch is False
+
+    def test_row4_agreement_is_case_insensitive_on_the_identity(self) -> None:
+        # Roster lookup canonicalises `einstein` → `Einstein` on both sides, so agreement is
+        # measured post-canonicalisation. This matters because the field may come from a form
+        # (already canonical) while the body was hand-typed (may be lowercased).
+        h = resolve_handoff("reply\n\nNEXT: einstein", _ROSTER, next_participant="Einstein")
+        assert h.kind is HandoffKind.ROLE
+        assert h.identity == "Einstein"
+        assert h.field_mismatch is False
+
+    def test_row4_human_sentinel_agreement(self) -> None:
+        h = resolve_handoff("done\n\nNEXT: human", _ROSTER, next_participant="human")
+        assert h.kind is HandoffKind.HUMAN
+        assert h.field_mismatch is False
+
+    def test_row5_mismatch_escalates_to_human_with_mismatch_flag(self) -> None:
+        # The safety valve: field says Einstein, body says Bohr. Neither wins the routing — the
+        # turn is escalated to the human and the divergence is flagged so the conductor can log
+        # it as observability. The `token` records what the FIELD said (the authoritative
+        # decision on the wire), `mismatch_body_token` records what the body's fallback would
+        # have routed to.
+        h = resolve_handoff("reply\n\nNEXT: Bohr", _ROSTER, next_participant="Einstein")
+        assert h.kind is HandoffKind.HUMAN
+        assert h.field_mismatch is True
+        assert h.token == "Einstein"
+        assert h.mismatch_body_token == "Bohr"
+
+    def test_row5_mismatch_body_pr_review_vs_field_persona(self) -> None:
+        # A body pr-review sentinel and a field persona are different targets → mismatch → human.
+        h = resolve_handoff(
+            "opened it\n\nNEXT: pr-review acme/widgets#7",
+            _ROSTER,
+            next_participant="Bohr",
+        )
+        assert h.kind is HandoffKind.HUMAN
+        assert h.field_mismatch is True
+        assert h.token == "Bohr"
+        assert h.mismatch_body_token == "acme/widgets#7"
+
+    def test_row5_field_pointing_at_unknown_participant_escalates(self) -> None:
+        # A field value that fails to resolve to any known participant (unknown token / not a
+        # sentinel) is treated as a mismatch: escalate to human. The write side is supposed to
+        # reject such a field with NextParticipantUnknownError; making the read side loud is the
+        # fail-safe for the case a bad field slipped past write-side validation (§3-3 escape hatch
+        # is "drop field and re-send", which a mismatch-to-human turn asks the human to do).
+        h = resolve_handoff("done\n\nNEXT: Bohr", _ROSTER, next_participant="Schrodinger")
+        assert h.kind is HandoffKind.HUMAN
+        assert h.field_mismatch is True
+        assert h.token == "Schrodinger"
+        assert h.mismatch_body_token == "Bohr"
+
+    def test_row5_disagreement_between_sentinels_escalates(self) -> None:
+        # Body says NEXT: none (settled), field says human. The kinds differ, so this is a
+        # mismatch: escalate to human with the flag set.
+        h = resolve_handoff("done\n\nNEXT: none", _ROSTER, next_participant="human")
+        assert h.kind is HandoffKind.HUMAN
+        assert h.field_mismatch is True
+        assert h.mismatch_body_token == "none"
+
+    def test_no_second_grammar_is_introduced_for_the_lint(self) -> None:
+        # §3-2: "lint は新しい文法を持たない — フォールバックの resolver をそのまま使う". The lint's
+        # question is exactly "would the body-only resolver have routed to a different target?",
+        # so the two sides read the same vocabulary. This test pins that the field resolves via
+        # the SAME name / sentinel matching the body uses: casefold on sentinels, roster lookup
+        # on personas, ABSENT on unknowns.
+        # Body-only resolution of "Einstein":
+        body_only = resolve_handoff("NEXT: Einstein", _ROSTER)
+        # Field-only resolution of "Einstein" (empty body):
+        field_only = resolve_handoff("no next line", _ROSTER, next_participant="Einstein")
+        assert body_only.kind is field_only.kind
+        assert body_only.identity == field_only.identity
+        assert body_only.role is field_only.role
+
+    def test_body_only_resolve_is_backward_compatible(self) -> None:
+        # Every pre-Layer-3 call site that passes no next_participant must see identical output
+        # to before this change. Signature widened with a keyword-only default; the body-only
+        # branch is byte-identical to the old function.
+        # A sampling of pre-Layer-3 cases:
+        for body, expected_kind in (
+            ("NEXT: Bohr", HandoffKind.ROLE),
+            ("NEXT: human", HandoffKind.HUMAN),
+            ("NEXT: none", HandoffKind.NONE),
+            ("NEXT: pr-review acme/widgets#7", HandoffKind.PR_REVIEW),
+            ("no handoff", HandoffKind.ABSENT),
+            ("NEXT: Schrodinger", HandoffKind.ABSENT),
+        ):
+            h = resolve_handoff(body, _ROSTER)
+            assert h.kind is expected_kind, body
+            assert h.field_mismatch is False, body
+            assert h.mismatch_body_token is None, body
+
+
+# --------------------------------------------------------------------------- #
 # Layer-2 Markdown tolerance — the *safety* tests come first.
 #
 # Layer 2 is a transitional bridge: an LLM sometimes wraps its final `NEXT:` line in

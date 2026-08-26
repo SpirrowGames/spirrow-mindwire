@@ -86,17 +86,21 @@ class _FakeChatroomMcp:
         self._counter = 0
         self.posts: list[dict[str, Any]] = []
 
-    def seed(self, *, author: str, content: str) -> None:
+    def seed(self, *, author: str, content: str, next_participant: str | None = None) -> None:
         self._counter += 1
-        self._messages.append(
-            {
-                "msg_id": f"m{self._counter}",
-                "author": author,
-                "content": content,
-                "reply_to": None,
-                "timestamp": "2026-06-07T00:00:00Z",
-            }
-        )
+        msg: dict[str, Any] = {
+            "msg_id": f"m{self._counter}",
+            "author": author,
+            "content": content,
+            "reply_to": None,
+            "timestamp": "2026-06-07T00:00:00Z",
+        }
+        # Layer 3: magickit ships the structured envelope field on each message dict when the
+        # sender wrote one (Bohr msg-179 §3). Fixtures reproduce that shape by including the
+        # key exactly when the test names one; omitting it mirrors the pre-Layer-3 wire.
+        if next_participant is not None:
+            msg["next_participant"] = next_participant
+        self._messages.append(msg)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "chatroom_get_thread":
@@ -1261,3 +1265,181 @@ async def test_integration_real_dispatcher_round_trip() -> None:
     post = mcp.posts[0]
     assert post["author"] == "Einstein"  # I3 v2.2: author = instance_id (the persona name)
     assert "independent critique" in post["content"]
+
+
+# --------------------------------------------------------------------------- #
+# Layer 3 — the structured ``next_participant`` envelope field consumer
+# (Bohr msg-179 §3 / §6, T-handoff-field-consumer-wiring). msg-1438 stalled the loop for 2
+# days because a judgement-page decide carried the field but wrote no ``NEXT:`` line in the
+# body — the fallback resolver returned ABSENT and the conductor stopped on NO_HANDOFF. This
+# section pins the 5-quadrant truth table at the conductor level (the resolver-level unit
+# tests live in test_conductor_handoff.py) and the §6 regression guard (a field-bearing msg
+# can never yield NO_HANDOFF).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_field_routes_when_body_has_no_next_line_msg1438_regression() -> None:
+    # §3-1 row 3, the msg-1438 quadrant: `next_participant: "Einstein"` is present, the body
+    # has no NEXT: line at all. Pre-Layer-3 this stopped on NO_HANDOFF; post-Layer-3 the field
+    # is authoritative and the naysayer dispatches quietly. NO forced consult, NO event - this
+    # is a normal path (§3-1: field-present + body-absent is spec'd as the normal quadrant, not
+    # an escalation).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(
+        author="Bohr",
+        content="design ready (dashboard-driven, so no NEXT line in body)",
+        next_participant="Einstein",
+    )
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["critique\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert disp.dispatches[0][0] is Role.NAYSAYER  # field's target actually dispatched
+    assert disp.spawns == [(Role.NAYSAYER, "Einstein")]
+    assert outcome.forced_naysayer_turns == 0  # explicit field target, not a forced consult
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_field_human_from_dashboard_stops_at_human_without_forcing() -> None:
+    # The exact msg-1438 shape: a judgement-page decide with `next_participant: "human"` and
+    # no body NEXT: line. The conductor must recognise the field, stop at the human, and NOT
+    # force a naysayer consult on the human's own message (mirrors the human-author carve-out).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(
+        author="human",
+        content="approved, please pause here",
+        next_participant="human",
+    )
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.forced_naysayer_turns == 0
+    assert disp.dispatches == []
+
+
+@pytest.mark.anyio
+async def test_field_and_body_agree_route_by_field_no_event() -> None:
+    # §3-1 row 4: the cooperative case. Field says Einstein, body ends with NEXT: Einstein.
+    # No event, no mismatch — the field wins (both sides say the same thing).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(
+        author="Bohr",
+        content="design ready\n\nNEXT: Einstein",
+        next_participant="Einstein",
+    )
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["critique\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert disp.dispatches[0][0] is Role.NAYSAYER
+    assert outcome.forced_naysayer_turns == 0
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_field_and_body_disagree_escalates_to_human(caplog: pytest.LogCaptureFixture) -> None:
+    # §3-1 row 5: field says Einstein, body says Bohr. Neither wins the routing — the turn is
+    # escalated to the human WITH an observability event (a WARNING log naming both sides). Then
+    # Obj2 forces a naysayer consult since the segment has no prior naysayer post — the
+    # human-terminal path handles the mismatch just like any other explicit-human terminal.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(
+        author="Bohr",
+        content="reply\n\nNEXT: Bohr",
+        next_participant="Einstein",
+    )
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    with caplog.at_level("WARNING", logger="spirrow_mindwire.conductor.core"):
+        outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    # Mismatch is logged loudly so the divergence is observable (§3-1: "event 記録"). We assert
+    # that both sides of the disagreement are named in the log record, so the observation is
+    # actionable — not that the log format is stable byte-for-byte.
+    mismatch_records = [r for r in caplog.records if "mismatch" in r.getMessage().casefold()]
+    assert mismatch_records, "expected a mismatch WARNING to be logged"
+    combined = " ".join(r.getMessage() for r in mismatch_records)
+    assert "Einstein" in combined  # what the field said
+    assert "Bohr" in combined  # what the body would have routed to
+
+
+@pytest.mark.anyio
+async def test_field_unknown_participant_escalates_to_human() -> None:
+    # A field value that fails to resolve (unknown persona) is treated as a mismatch: escalate
+    # to human. Write-side validation should reject it (NextParticipantUnknownError, §3-3), but
+    # if a bad field slipped past, the read side surfaces the disagreement loudly instead of
+    # falling back to the body silently.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(
+        author="Bohr",
+        content="design\n\nNEXT: Bohr",
+        next_participant="Schrodinger",
+    )
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert all(role is not Role.IMPLEMENTER for role, _ in disp.dispatches)
+
+
+@pytest.mark.anyio
+async def test_absent_field_is_pre_layer3_body_only_backward_compatible() -> None:
+    # A message with no `next_participant` key must resolve exactly as before. This is the
+    # boundary condition that keeps every earlier test in this file valid without change.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")  # no field
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["critique\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert disp.dispatches[0][0] is Role.NAYSAYER
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_field_bearing_message_can_never_stop_on_no_handoff_bohr_msg179_section6() -> None:
+    # Bohr msg-179 §6 invariant: "a message that carries a non-null next_participant CANNOT
+    # yield a `no_handoff` verdict." This is the structural regression guard: exhaustively try
+    # the shapes that used to stop on NO_HANDOFF (unroutable body, empty body, unknown-persona
+    # body) with a field of every valid kind (persona / human / none). None of them may stop on
+    # NO_HANDOFF. This branch is unreachable when the field is set, and the test pins it that
+    # way against a future refactor.
+    stop_reasons: list[StopReason] = []
+    for body in (
+        "content without any NEXT line",
+        "   ",
+        "NEXT: Schrodinger",  # unknown persona body — used to be ABSENT
+        "reply\n\nNEXT: Bohr",  # agrees with a field=Bohr, disagrees with others
+    ):
+        for field in ("Bohr", "Einstein", "human", "none"):
+            mcp = _FakeChatroomMcp()
+            mcp.seed(author="Bohr", content=body, next_participant=field)
+            disp = _ScriptedDispatcher(
+                mcp,
+                {
+                    Role.NAYSAYER: [f"forced review of {field}\n\nNEXT: human"],
+                    Role.PROPOSER: [f"acknowledged {field}\n\nNEXT: none"],
+                },
+            )
+            outcome = await _conductor(mcp, disp).run()
+            stop_reasons.append(outcome.stop_reason)
+            assert outcome.stop_reason is not StopReason.NO_HANDOFF, (
+                f"§6 invariant broken: NO_HANDOFF on body={body!r} field={field!r}"
+            )
+    # And every stop reason is one of the deliberately-terminating kinds — not NO_HANDOFF.
+    assert set(stop_reasons).isdisjoint({StopReason.NO_HANDOFF})
+
+
+@pytest.mark.anyio
+async def test_past_field_human_boundary_terminates_the_naysayer_segment() -> None:
+    # `_naysayer_consulted` scans history for prior human boundaries so a fresh NEXT: human
+    # after a review does not force a second review in the same segment. That boundary logic
+    # must recognise a past message that terminated with `next_participant: "human"` even when
+    # its body carried no NEXT line — symmetric with the routing above (Bohr msg-179 §3-2:
+    # same resolver both sides). The setup below plants a Bohr-authored past boundary via
+    # field-only (no body NEXT), a naysayer review, and a Bohr disposition to human. If the
+    # boundary is honoured, the segment starts AFTER the past field-human, the naysayer's
+    # review counts as the segment consult, and no second forced consult fires.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="proceed", next_participant="human")  # past boundary
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("review\n\nNEXT: Bohr"))
+    mcp.seed(author="Bohr", content="disposition\n\nNEXT: human")
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.forced_naysayer_turns == 0  # segment naysayer counts; no second consult

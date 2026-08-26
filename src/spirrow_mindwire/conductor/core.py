@@ -274,7 +274,30 @@ class Conductor:
                     round_index, StopReason.NO_PROGRESS, latest_msg_id, forced, forced_saveable
                 )
 
-            handoff = resolve_handoff(_content(latest), self._roster)
+            handoff = resolve_handoff(
+                _content(latest),
+                self._roster,
+                # Layer 3 (Bohr msg-179 §3): the structured envelope field wins over the body's
+                # ``NEXT:`` line, and the body is used only as a lint against it (§3-2 — same
+                # resolver, no second parser). msg-1438's silent 2-day stall was exactly the case
+                # a judgement-page decide carried this field but no ``NEXT:`` line; without this
+                # read the conductor stopped on NO_HANDOFF. Absent field ⇒ backward-compatible
+                # body-only routing (rows 1-2 of §3-1's truth table).
+                next_participant=_next_participant(latest),
+            )
+            # Row 5 of §3-1: the field and the body disagree. The Handoff has been rewritten to
+            # HUMAN (safety valve) and carries the divergence so we can log it as observability
+            # BEFORE the routing decision below acts on the escalated kind. Recording is loud and
+            # non-blocking — the turn still terminates at the human this round, exactly what the
+            # truth table requires.
+            if handoff.field_mismatch:
+                logger.warning(
+                    "conductor next_participant field/body mismatch: msg=%s "
+                    "field=%r body_target=%r → escalating to human",
+                    latest_msg_id,
+                    handoff.token,
+                    handoff.mismatch_body_token,
+                )
 
             # PR-gate (PR-2b-2): ``NEXT: pr-review <ref>`` fires the Tier B independent naysayer
             # review synchronously (ADR-19 N-1) and routes by the *verdict* — not by any parsed NEXT
@@ -323,6 +346,20 @@ class Conductor:
             )
             if target_role is None:
                 assert stop_reason is not None  # _route always sets a reason when it stops
+                # Bohr msg-179 §6 invariant: a message that carries a non-null next_participant
+                # field cannot stop the conductor on NO_HANDOFF. The Layer-3 resolver rewrites
+                # every field-bearing case into ROLE / HUMAN / NONE / PR_REVIEW (mismatch and
+                # unresolvable-field both go to HUMAN with field_mismatch=True), so a
+                # NO_HANDOFF here implies the field was None / empty — the pre-Layer-3 path.
+                # This branch is structurally unreachable when the field is set; the assertion
+                # pins it that way so a future refactor of the resolver cannot silently re-open
+                # msg-1438's 2-day silent stall (§3-1 row 3).
+                assert not (
+                    stop_reason is StopReason.NO_HANDOFF and _next_participant(latest) is not None
+                ), (
+                    f"§6 invariant broken: NO_HANDOFF on msg with next_participant set "
+                    f"(msg={latest_msg_id!r}, field={_next_participant(latest)!r})"
+                )
                 return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
             if is_forced:
                 forced += 1
@@ -569,7 +606,15 @@ class Conductor:
         segment = messages[:-1]  # exclude the latest msg (the one now handing to human)
         boundary = 0
         for i, msg in enumerate(segment):
-            if resolve_handoff(_content(msg), self._roster).kind is HandoffKind.HUMAN:
+            # Layer 3: a past message that ended a segment with ``next_participant: human`` (with
+            # or without a matching body NEXT: line) is a segment boundary just as a body ``NEXT:
+            # human`` is. Passing the field here keeps the boundary rule symmetric with the
+            # latest-message routing above — both sides read the same field via the same resolver
+            # (Bohr msg-179 §3-2).
+            past = resolve_handoff(
+                _content(msg), self._roster, next_participant=_next_participant(msg)
+            )
+            if past.kind is HandoffKind.HUMAN:
                 boundary = i + 1
         return any(
             self._roster_role(_author(msg)) is self._naysayer_role and self._attested(msg)
@@ -741,6 +786,26 @@ def _author(msg: dict[str, Any]) -> str:
 
 def _content(msg: dict[str, Any]) -> str:
     return str(msg.get("content", ""))
+
+
+def _next_participant(msg: dict[str, Any]) -> str | None:
+    """The structured ``next_participant`` envelope field on ``msg``, or ``None``.
+
+    Layer 3 (Bohr msg-179 §3): ``next_participant`` is a top-level field on the message shipped
+    by ``chatroom_get_thread`` in the second segment of the roll-out. Reads that carry it are
+    routed by the FIELD (with the body's ``NEXT:`` line kept only as a lint); reads that do not
+    fall through to body-only resolution — the pre-Layer-3 behaviour.
+
+    An explicitly-null field is treated the same as an absent one (a magickit that ships the key
+    with a null value has stated the same fact as omitting it: the sender did not name a target).
+    Non-string values are ignored defensively: the JSON contract says "string or null", but a bad
+    downstream must never crash the read — the field is dropped and the body's ``NEXT:`` line
+    stays authoritative (which is what the field's absence already meant).
+    """
+    value = msg.get("next_participant")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def _roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
