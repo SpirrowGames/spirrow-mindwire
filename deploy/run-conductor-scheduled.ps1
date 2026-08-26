@@ -2515,9 +2515,44 @@ try {
             # start-before-write" contract adapted to leases (msg-1183 §W-3-style: the record
             # shows acquisition BEFORE launch, so an OS-level kill mid-launch leaves the lease
             # committed rather than a phantom launch with a free lease).
+            #
+            # Dirty-acquire detection (msg-1757 blocker #2, 2026-08-26 PR-gate): if the record
+            # was in the "released with reclaim_required=true" state (Invoke-LeasePromotion's
+            # 'released' branch — a Phase-2 promotion that found the queue empty), then acquiring
+            # it here means the CURRENT candidate inherits reclaim duty for a resource the OLD
+            # holder's session may still physically hold. The 'released' branch fires no
+            # notification (no new holder to name yet), so without a signal at THIS point the
+            # operator has no warning and the wrapper heads into launch — the exact silent
+            # collision this mechanism exists to prevent. Sample the flag BEFORE acquire because
+            # Invoke-LeaseAcquire preserves it but the record is easier to reason about while
+            # its `holder` is still empty.
+            $dirtyAcquires = @()
+            foreach ($resource in $cand.requires) {
+                if (-not $leasesState.ContainsKey($resource)) { continue }
+                $existing = ConvertTo-LeaseHashtable -Lease $leasesState[$resource]
+                if ($null -eq $existing) { continue }
+                $priorHolder = "$($existing['holder'])"
+                $reclaimFlag = $existing.ContainsKey('reclaim_required') -and [bool]$existing['reclaim_required']
+                if ([string]::IsNullOrEmpty($priorHolder) -and $reclaimFlag) {
+                    $dirtyAcquires += [pscustomobject]@{
+                        Resource       = $resource
+                        ReclaimedFrom  = if ($existing.ContainsKey('reclaimed_from')) { "$($existing['reclaimed_from'])" } else { '' }
+                        RevokedReason  = if ($existing.ContainsKey('revoked_reason')) { "$($existing['revoked_reason'])" } else { 'idle' }
+                    }
+                }
+            }
             foreach ($resource in $cand.requires) {
                 Invoke-LeaseAcquire -LeasesState $leasesState -Resource $resource `
                                     -CandidateKey $cand.key -Now $nowUtc
+            }
+            foreach ($dirty in $dirtyAcquires) {
+                Send-NotificationIfChanged -State $notifyState -Key "__lease_reclaim_acquire__/$($dirty.Resource)" `
+                    -Signature "$($dirty.ReclaimedFrom)->$($cand.key)@$(($nowUtc.ToString('o')))" `
+                    -Message ("MindWire: lease **$($dirty.Resource)** を再取得しました " +
+                              "(前回 release 時に waiter が居なかったため通知が飛ばず、reclaim_required が持ち越されていました)。" +
+                              "旧: $($dirty.ReclaimedFrom) → 新: $($cand.key) (reason=$($dirty.RevokedReason))。" +
+                              "reclaim_required — 新側は使用前にリソースの再起動が必要です " +
+                              "(v1 は scheduling で enforcement ではないため、旧側が自力で起動する可能性は残ります)。")
             }
         }
         $commitPayload = if ($v.PSObject.Properties.Name -contains 'commit_launch_payload') { $v.commit_launch_payload } else { $null }

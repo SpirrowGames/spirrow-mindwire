@@ -153,6 +153,19 @@ function Update-LeaseFromClassification {
         'progress' {
             $Lease['idle_evaluations'] = 0
             $Lease['last_progress_at'] = $nowIso
+            # Cancel any pending Phase-1 revocation intent. A holder that resumed progress this
+            # tick pre-empts the mark-expiring done on a previous tick — the two-phase revoke
+            # contract (msg-1183 D-6'd) is that Phase 1 gives the holder ONE tick to come back;
+            # if we do not clear `expiring` here, that flag becomes permanent the moment it is
+            # first set, and a later idle sequence would find Test-LeaseExpiring true AND
+            # `expiring=true`, so Invoke-LeasePromotion jumps straight to Phase 2 on the first
+            # eligible tick — the exact 1-tick pre-emption window the design guarantees is
+            # bypassed. Reported as msg-1757 blocker #1 (2026-08-26 PR-gate). `revoked_at` and
+            # `revoked_reason` are stale audit at that point (they described the CANCELLED
+            # revocation, not the new one Phase 1 will record next time), so clear them too.
+            $Lease['expiring']       = $false
+            $Lease['revoked_at']     = $null
+            $Lease['revoked_reason'] = $null
         }
         'parked' {
             $prior = 0

@@ -106,6 +106,46 @@ Update-LeaseFromClassification -Lease $lease -Classification 'neutral' -Now $now
 Check "neutral does not change idle_evaluations" 3 $lease['idle_evaluations']
 Check "neutral does not change last_progress_at" '2020-01-01T00:00:00Z' $lease['last_progress_at']
 
+# msg-1757 blocker #1 regression: progress MUST clear a stale expiring flag left over from a
+# prior Phase-1 mark. If it does not, a later idle sequence jumps straight to Phase 2 promotion
+# and bypasses the 1-tick pre-emption window guaranteed by D-6'd (msg-1183).
+$lease = @{
+    idle_evaluations = 6
+    last_progress_at = '2020-01-01T00:00:00Z'
+    expiring         = $true
+    revoked_at       = '2026-08-25T00:00:00Z'
+    revoked_reason   = 'idle'
+}
+Update-LeaseFromClassification -Lease $lease -Classification 'progress' -Now $now
+CheckFalse "progress clears stale expiring flag (msg-1757 blocker #1)" ([bool]$lease['expiring'])
+Check "progress clears stale revoked_at" $null $lease['revoked_at']
+Check "progress clears stale revoked_reason" $null $lease['revoked_reason']
+
+# Composite scenario: Phase 1 marks expiring; probe next tick sees progress; a THIRD tick with
+# expiring conditions again must land in Phase 1, not Phase 2 (promotion).
+$farPast = $now.AddHours(-3).ToUniversalTime().ToString("o")
+$lease = @{
+    holder           = 'p/T-old'
+    generation       = 2
+    pinned           = $false
+    expiring         = $true
+    revoked_at       = '2026-08-25T00:00:00Z'
+    revoked_reason   = 'idle'
+    idle_evaluations = 6
+    last_progress_at = $farPast
+    queue            = @( @{ key = 'p/T-new'; waiting_since = $now.AddMinutes(-1).ToUniversalTime().ToString("o") } )
+}
+# Holder resumes progress: probe classifies as 'progress'.
+Update-LeaseFromClassification -Lease $lease -Classification 'progress' -Now $now
+CheckFalse "post-progress: expiring flag cleared" ([bool]$lease['expiring'])
+# Simulate the holder going idle again for two ticks.
+$lease['last_progress_at'] = $farPast
+$lease['idle_evaluations'] = 6
+$phase1Again = Invoke-LeasePromotion -Lease $lease -Now $now -SweepOrderKeys @('p/T-new') -Reason 'idle'
+Check "post-progress -> re-idle: next promotion attempt is Phase 1 (marked-expiring), NOT Phase 2" `
+    'marked-expiring' $phase1Again.action
+Check "post-progress -> re-idle: holder still the old one after Phase 1" 'p/T-old' $lease['holder']
+
 # --- 3. Test-LeaseExpiring — dual predicate (msg-1183 D-6'b) -------------------------------------
 Write-Host "Test-LeaseExpiring — BOTH idle_evaluations AND wall-clock, pin immune"
 
@@ -351,6 +391,63 @@ else {
     else {
         $script:failures++
         Write-Host "  FAIL  Invoke-HeadSkipCommitLaunch (line $firstCommitLine) precedes lease-waiting bail (line $firstWaitingLine) — commit-launch will fire for a waiter, feeding backoff and delaying grant-wake by up to CAP=60min (head_skip.py L119)"
+    }
+}
+
+# --- 10. Wrapper AST wiring — dirty-acquire notification (msg-1757 blocker #2) -------------------
+#
+# When the probe's 'released' branch fires (Phase-2 promotion with an empty queue), the lease
+# record is left with `reclaim_required=true` and no `holder`. Invoke-LeaseAcquire preserves the
+# flag on the next candidate that acquires. Without an explicit notification at THAT acquire,
+# the operator has no warning that the incoming session is inheriting reclaim duty. Pin two
+# things in the wrapper: the operator-visible notification key exists, and the dirty-detection
+# gate happens BEFORE Invoke-LeaseAcquire mutates the record (otherwise we would sample a
+# fabricated post-acquire state).
+Write-Host "Wrapper AST wiring — dirty-acquire notification (msg-1757 blocker #2)"
+
+# The notification key is built as "__lease_reclaim_acquire__/$($dirty.Resource)" — an expandable
+# string, so it lives in the wrapper's source as ExpandableStringExpressionAst rather than
+# StringConstantExpressionAst. Scan both, and match on the fixed prefix embedded in either.
+$hasDirtyKeyConst = @($stringConsts | Where-Object {
+    $_.Value -is [string] -and $_.Value.StartsWith('__lease_reclaim_acquire__')
+}).Count -gt 0
+$expandableStrings = @($ast.FindAll(
+    { param($n) $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true))
+$hasDirtyKeyExpandable = @($expandableStrings | Where-Object {
+    $_.Value -is [string] -and $_.Value.Contains('__lease_reclaim_acquire__')
+}).Count -gt 0
+CheckTrue "wrapper emits the '__lease_reclaim_acquire__' notification key" ($hasDirtyKeyConst -or $hasDirtyKeyExpandable)
+
+# The dirty detection needs to see the record BEFORE Invoke-LeaseAcquire mutates `holder`.
+# That means somewhere in the wrapper source, a 'reclaim_required' string reference must appear
+# BEFORE at least one Invoke-LeaseAcquire call site in the candidate-loop flow. If a future
+# refactor moves the sampling to after the acquire, the sampled `reclaim_required` will still
+# be true (Invoke-LeaseAcquire preserves it), but the `holder` check that gates the sampling
+# will misfire and every self-hold re-acquire would fire the notification — annoying and wrong.
+# Pin the source order.
+$acquireCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Invoke-LeaseAcquire'
+    }, $true))
+$reclaimRefs = @($stringConsts | Where-Object { $_.Value -eq 'reclaim_required' })
+if ($acquireCalls.Count -eq 0) {
+    $script:failures++
+    Write-Host "  FAIL  Invoke-LeaseAcquire call not found — acquire wiring gone?"
+}
+elseif ($reclaimRefs.Count -eq 0) {
+    $script:failures++
+    Write-Host "  FAIL  'reclaim_required' string reference not found — dirty-detection branch gone?"
+}
+else {
+    $firstAcquireLine = ($acquireCalls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+    $firstReclaimLine = ($reclaimRefs | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+    if ($firstReclaimLine -lt $firstAcquireLine) {
+        Write-Host "  PASS  reclaim_required sampled (line $firstReclaimLine) BEFORE first Invoke-LeaseAcquire (line $firstAcquireLine)"
+    }
+    else {
+        $script:failures++
+        Write-Host "  FAIL  Invoke-LeaseAcquire (line $firstAcquireLine) precedes reclaim_required sampling (line $firstReclaimLine) — dirty detection will misfire on self-hold re-acquires"
     }
 }
 
