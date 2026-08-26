@@ -451,6 +451,171 @@ else {
     }
 }
 
+# --- 11. Merge-LeasesStateForWrite — operator write mid-sweep survives (msg-1802 blocker #1) ----
+#
+# leases.json's top-level key is the resource name. The sweep's probe mutates that key at tick
+# start (last_progress_at, idle_evaluations, expiring). If an operator runs Grant-Lease.ps1
+# mid-sweep and writes a new holder for the same key to disk, the generic Merge-StateForWrite
+# (which merges at top-level key granularity and lets memory win on collision) would silently
+# destroy the operator's Tier-C override. Merge-LeasesStateForWrite uses per-resource
+# `generation` as an optimistic-concurrency token to detect the external write.
+Write-Host "Merge-LeasesStateForWrite — operator write mid-sweep survives (msg-1802 blocker #1)"
+
+# Fresh temp fixture (never this checkout's own state dir).
+$fixtureDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mindwire-lease-merge-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
+$fixturePath = Join-Path $fixtureDir 'leases.json'
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Save-FixtureLeases {
+    param([string]$Path, [hashtable]$State)
+    [System.IO.File]::WriteAllText($Path, ($State | ConvertTo-Json -Depth 5), $utf8NoBom)
+}
+
+try {
+    # --- scenario A: no external write. Sweep memory wins; probe's last_progress_at persists ---
+    $diskA = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; last_progress_at = '2026-08-25T00:00:00Z'; idle_evaluations = 0; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskA
+    $memoryA = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGens = Get-LeaseGenerations -LeasesState $memoryA
+    $memoryA['editor']['last_progress_at'] = '2026-08-26T05:00:00Z'  # probe updated the clock
+    $mergedA = Merge-LeasesStateForWrite -Memory $memoryA -OriginalGenerations $originalGens -DiskPath $fixturePath
+    Check "no-external-write: probe update survives" '2026-08-26T05:00:00Z' $mergedA['editor'].last_progress_at
+    Check "no-external-write: generation unchanged" 5 $mergedA['editor'].generation
+
+    # --- scenario B: operator write mid-sweep (bumped generation). Disk wins entirely; memory
+    # discarded for that resource. This is THE bug fix.
+    $diskB0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; last_progress_at = '2026-08-25T00:00:00Z'; idle_evaluations = 0; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskB0
+    $memoryB = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGens = Get-LeaseGenerations -LeasesState $memoryB
+    # Sweep touches memory (last_progress_at bump), does NOT bump generation.
+    $memoryB['editor']['last_progress_at'] = '2026-08-26T05:00:00Z'
+    # Meanwhile operator (Grant-Lease.ps1) rewrote disk: new holder, generation bumped to 6.
+    $diskB1 = @{
+        editor = @{ holder = 'p/T-b'; generation = 6; last_progress_at = '2026-08-26T04:59:00Z'; idle_evaluations = 0; queue = @(); revoked_reason = 'operator-grant: emergency' }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskB1
+    $mergedB = Merge-LeasesStateForWrite -Memory $memoryB -OriginalGenerations $originalGens -DiskPath $fixturePath
+    Check "operator-write: disk holder wins over sweep memory" 'p/T-b' $mergedB['editor'].holder
+    Check "operator-write: disk generation wins" 6 $mergedB['editor'].generation
+    Check "operator-write: disk revoked_reason preserved" 'operator-grant: emergency' $mergedB['editor'].revoked_reason
+
+    # --- scenario C: sweep did an acquire (bumped generation) with no operator write. Memory wins.
+    $diskC0 = @{
+        editor = @{ holder = $null; generation = 5; last_progress_at = $null; idle_evaluations = 0; queue = @(); reclaim_required = $true; reclaimed_from = 'p/T-a' }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskC0
+    $memoryC = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGens = Get-LeaseGenerations -LeasesState $memoryC
+    Invoke-LeaseAcquire -LeasesState $memoryC -Resource 'editor' -CandidateKey 'p/T-b' -Now $now
+    # Disk unchanged (nobody else wrote).
+    $mergedC = Merge-LeasesStateForWrite -Memory $memoryC -OriginalGenerations $originalGens -DiskPath $fixturePath
+    Check "no-collision + sweep-acquire: memory holder wins" 'p/T-b' $mergedC['editor'].holder
+    Check "no-collision + sweep-acquire: memory bumped generation wins" 6 $mergedC['editor'].generation
+
+    # --- scenario D: resource on disk that the sweep never read. Preserved from disk.
+    $diskD = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; queue = @() }
+        runner = @{ holder = 'p/T-x'; generation = 3; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskD
+    # Simulate a sweep that only knew about `editor` at start (runner added by operator later).
+    $memoryD = @{ editor = @{ holder = 'p/T-a'; generation = 5; queue = @() } }
+    $originalGensD = @{ editor = 5 }
+    $mergedD = Merge-LeasesStateForWrite -Memory $memoryD -OriginalGenerations $originalGensD -DiskPath $fixturePath
+    Check "disk-only resource: preserved" 'p/T-x' $mergedD['runner'].holder
+    Check "disk-only resource: generation preserved" 3 $mergedD['runner'].generation
+
+    # --- scenario E: Get-LeaseGenerations edge cases ---
+    $gens = Get-LeaseGenerations -LeasesState @{}
+    Check "Get-LeaseGenerations: empty map -> empty" 0 $gens.Keys.Count
+    $gens = Get-LeaseGenerations -LeasesState @{ editor = @{ generation = 7 }; runner = @{ } }
+    Check "Get-LeaseGenerations: editor gen extracted" 7 $gens['editor']
+    Check "Get-LeaseGenerations: missing generation -> 0" 0 $gens['runner']
+}
+finally {
+    Remove-Item -LiteralPath $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- 12. Wrapper AST wiring — the LEASE merger is used, not the generic one (msg-1802 #1) -------
+#
+# Regression pin: a future refactor must not silently swap Merge-LeasesStateForWrite back to
+# Merge-StateForWrite for leases.json. The specific failure that hides behind that swap is a
+# silent operator-grant destruction — no exception, no log, just the wrong value on disk.
+Write-Host "Wrapper AST wiring — Merge-LeasesStateForWrite (not Merge-StateForWrite) merges leases.json"
+
+$mergeLeaseCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Merge-LeasesStateForWrite'
+    }, $true))
+CheckTrue "wrapper calls Merge-LeasesStateForWrite" ($mergeLeaseCalls.Count -ge 1)
+
+# Pin that the argument threaded through -Memory is $leasesState (the normalised in-memory map)
+# and -OriginalGenerations receives a snapshot variable. The variable name is soft-pinned to
+# `$leasesOriginalGenerations` to guarantee the snapshot is taken (not omitted or defaulted).
+$hasGenerationsParam = $false
+foreach ($c in $mergeLeaseCalls) {
+    foreach ($el in $c.CommandElements) {
+        if ($el -is [System.Management.Automation.Language.CommandParameterAst] -and $el.ParameterName -eq 'OriginalGenerations') {
+            $hasGenerationsParam = $true; break
+        }
+    }
+}
+CheckTrue "Merge-LeasesStateForWrite called with -OriginalGenerations (snapshot threaded through)" $hasGenerationsParam
+
+$leaseGensSnapshotCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Get-LeaseGenerations'
+    }, $true))
+CheckTrue "wrapper calls Get-LeaseGenerations (snapshot at sweep start)" ($leaseGensSnapshotCalls.Count -ge 1)
+
+# Pin the order: Get-LeaseGenerations snapshot must precede the first Invoke-LeasePromotion /
+# Invoke-LeaseAcquire call (either of which can bump generation). If someone re-orders the
+# snapshot to run AFTER a mutation, the OriginalGenerations map will contain the post-mutation
+# value, the merger will see disk_gen == snapshot_gen even after an operator write, and the
+# concurrency-detection breaks silently.
+$firstSnapshotLine = ($leaseGensSnapshotCalls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+$mutatingCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        ($n.CommandElements[0].Extent.Text -eq 'Invoke-LeasePromotion' -or
+         $n.CommandElements[0].Extent.Text -eq 'Invoke-LeaseAcquire')
+    }, $true))
+if ($mutatingCalls.Count -gt 0) {
+    $firstMutationLine = ($mutatingCalls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+    if ($firstSnapshotLine -lt $firstMutationLine) {
+        Write-Host "  PASS  Get-LeaseGenerations snapshot (line $firstSnapshotLine) precedes first Invoke-Lease{Promotion|Acquire} (line $firstMutationLine)"
+    }
+    else {
+        $script:failures++
+        Write-Host "  FAIL  snapshot (line $firstSnapshotLine) runs AFTER first Invoke-Lease{Promotion|Acquire} (line $firstMutationLine) — operator-write detection is broken"
+    }
+}
+
+# Also pin that leases.json is NOT handed to the generic Merge-StateForWrite anymore (the fix).
+$genericMergeCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Merge-StateForWrite'
+    }, $true))
+$leasesFedToGeneric = $false
+foreach ($c in $genericMergeCalls) {
+    foreach ($el in $c.CommandElements) {
+        # Look for `-DiskPath $leasesStatePath` on any generic-merge call.
+        if ($el -is [System.Management.Automation.Language.VariableExpressionAst] -and $el.VariablePath.UserPath -eq 'leasesStatePath') {
+            $leasesFedToGeneric = $true; break
+        }
+    }
+}
+CheckFalse "leases.json is NOT passed to the generic Merge-StateForWrite" $leasesFedToGeneric
+
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "lease gate: all checks passed"

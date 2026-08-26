@@ -23,13 +23,16 @@
 # and vice versa" cycle is not possible. Adding a second resource is where this analysis becomes
 # non-trivial — that is called out in msg-1180 §3 as a v2 concern and NOT solved here.
 #
-# MERGE-ON-WRITE (msg-1187 §2). This script writes leases.json directly. The sweep uses
-# Merge-StateForWrite when it flushes at end-of-tick, which re-reads disk right before writing
-# and preserves any keys this script changed during the sweep. The window this script does NOT
-# close is the reverse: if THIS script re-reads leases.json before the sweep flushes, our write
-# reflects a stale state. That window is < 1 ms (sweeps take minutes, our read-modify-write is
-# sub-second), matches the accepted operational tradeoff in Merge-StateForWrite's header, and is
-# not a file-lock problem worth solving with a file lock.
+# MERGE-ON-WRITE (msg-1187 §2, msg-1802 blocker #1 correction). This script writes leases.json
+# directly. The sweep uses Merge-LeasesStateForWrite (NOT the generic Merge-StateForWrite —
+# that would silently destroy our write, since sweep memory would win on collision at the
+# `editor` top-level key). Merge-LeasesStateForWrite compares per-resource `generation` before
+# and after; because this script bumps `generation` on every Grant / Clear, the sweep sees the
+# generation moved and lets disk (this script's write) win. The reverse race remains: if THIS
+# script re-reads leases.json AFTER the sweep flushes, we operate on stale state — but that
+# read-modify-write window is sub-second, well below the tick length, and closing it fully
+# would require a real file lock (see Merge-StateForWrite W:255-257 for why that trade is
+# refused).
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium', DefaultParameterSetName = 'Grant')]
 param(
@@ -104,7 +107,8 @@ switch ($PSCmdlet.ParameterSetName) {
             if ($lease.ContainsKey('generation') -and $null -ne $lease['generation']) {
                 $priorGen = [int]$lease['generation']
             }
-            $queue = if ($lease.ContainsKey('queue')) { @($lease['queue']) } else { @() }
+            # Queue is mutated in place by Remove-LeaseWaiter below; there is no need to pull it
+            # out into a local (msg-1802 blocker #3 — that local was a dead assignment).
             $nowIso = $nowUtc.ToUniversalTime().ToString("o")
             $lease['holder']            = $To
             $lease['acquired_at']       = $nowIso

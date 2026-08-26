@@ -564,15 +564,13 @@ function Invoke-LeaseAcquire {
         $LeasesState[$Resource] = New-LeaseRecord -Holder $CandidateKey -Now $Now -Generation 1
         return
     }
+    # Precondition: callers normalise the state at the trust boundary. The wrapper runs
+    # ConvertTo-LeasesStateHashtable at load; Grant-Lease.ps1 does the same after reading disk;
+    # tests build hashtables directly. Re-normalising here (msg-1802 blocker #2) is dead code
+    # that also fails to normalise `queue` items, so its "defense in depth" is a lie — drop it
+    # and trust the boundary. Same reason the candidate loop's redundant ConvertTo-* call was
+    # stripped.
     $lease = $LeasesState[$Resource]
-    # Normalise PSCustomObject → hashtable so mutation works uniformly. Round-tripped JSON comes
-    # back as PSCustomObject, but our probe / mutation code expects hashtable semantics.
-    if ($lease -isnot [hashtable]) {
-        $normalised = @{}
-        foreach ($p in $lease.PSObject.Properties) { $normalised[$p.Name] = $p.Value }
-        $lease = $normalised
-        $LeasesState[$Resource] = $lease
-    }
     $currentHolder = "$($lease['holder'])"
     if ($currentHolder -eq $CandidateKey) {
         # Already held by this candidate — keep the record; the probe will refresh the clocks.
@@ -638,14 +636,9 @@ function Register-LeaseWaiter {
             queue             = @()
         }
     }
-    $lease = $LeasesState[$Resource]
-    if ($lease -isnot [hashtable]) {
-        $normalised = @{}
-        foreach ($p in $lease.PSObject.Properties) { $normalised[$p.Name] = $p.Value }
-        $lease = $normalised
-        $LeasesState[$Resource] = $lease
-    }
-    Add-LeaseWaiter -Lease $lease -WaiterKey $WaiterKey -Now $Now
+    # See Invoke-LeaseAcquire above — normalisation is the caller's boundary responsibility
+    # (msg-1802 blocker #2). Do NOT re-invent it inline here.
+    Add-LeaseWaiter -Lease $LeasesState[$Resource] -WaiterKey $WaiterKey -Now $Now
 }
 
 function ConvertTo-LeaseHashtable {
@@ -686,6 +679,139 @@ function ConvertTo-LeasesStateHashtable {
         $LeasesState[$k] = ConvertTo-LeaseHashtable -Lease $LeasesState[$k]
     }
     return $LeasesState
+}
+
+function Get-LeaseGenerations {
+    <#
+    .SYNOPSIS
+        Snapshot the per-resource `generation` counter of a leases-state map. Used at sweep
+        start so Merge-LeasesStateForWrite can detect an external write (operator running
+        Grant-Lease.ps1 mid-sweep) at flush time.
+
+    .PARAMETER LeasesState
+        A leases.json map, ideally already normalised via ConvertTo-LeasesStateHashtable.
+        Un-normalised entries are tolerated (both hashtable and PSCustomObject shapes) so this
+        can be called on the raw disk read too.
+
+    .OUTPUTS
+        A hashtable: resource-name -> [int] generation.
+    #>
+    param([hashtable]$LeasesState)
+    $out = @{}
+    if ($null -eq $LeasesState) { return $out }
+    foreach ($k in @($LeasesState.Keys)) {
+        $lease = $LeasesState[$k]
+        if ($null -eq $lease) { continue }
+        $gen = 0
+        if ($lease -is [hashtable]) {
+            if ($lease.ContainsKey('generation') -and $null -ne $lease['generation']) { $gen = [int]$lease['generation'] }
+        }
+        else {
+            $prop = $lease.PSObject.Properties['generation']
+            if ($prop -and $null -ne $prop.Value) { $gen = [int]$prop.Value }
+        }
+        $out[$k] = $gen
+    }
+    return $out
+}
+
+function Merge-LeasesStateForWrite {
+    <#
+    .SYNOPSIS
+        Lease-specific merge-on-write. Same operational purpose as the wrapper's
+        Merge-StateForWrite (narrow the race between the sweep's tick-long in-memory hold and an
+        operator running Grant-Lease.ps1 mid-sweep), but with the correct collision rule for
+        leases.json.
+
+    .DESCRIPTION
+        WHY THIS EXISTS AND WHY THE GENERIC MERGER IS WRONG FOR THIS FILE. The generic
+        Merge-StateForWrite merges at the top-level key boundary and lets in-memory win on any
+        key present at sweep start. That is correct for quarantine.json — its top-level keys are
+        thread IDs, and an operator running Clear-Quarantine touches a different thread than the
+        one the sweep is quarantining, so the collision is structural rather than semantic.
+
+        leases.json is different. Its top-level keys are RESOURCE names — "editor" is one key.
+        The sweep's probe mutates that key at tick start (last_progress_at, idle_evaluations,
+        expiring). An operator running `Grant-Lease.ps1 -Resource editor -To B` mid-sweep writes
+        a new holder to that SAME key on disk. Under the generic merger, sweep memory wins on
+        collision — the operator's Tier-C override is silently destroyed. (msg-1802 blocker #1.)
+
+        The fix uses the per-lease `generation` counter as an optimistic-concurrency token.
+        Every writer that changes a lease semantically bumps `generation` — Invoke-LeaseAcquire,
+        Invoke-LeasePromotion (promoted/released), and Grant-Lease.ps1 (grant/clear) all bump.
+        The sweep's probe DOES NOT bump (it only touches the lease clock). So at flush time:
+
+          - If disk's generation for a resource EQUALS the snapshot we took at sweep start, no
+            external write has landed against that resource this tick — memory wins (write
+            through the sweep's clock updates and any acquire/promote it did).
+          - If disk's generation is DIFFERENT (higher — it never decreases), an external writer
+            landed a change against fresher state than ours. Their write is a Tier-C human
+            decision. Disk wins for that resource: leave the disk value in $out, discard memory.
+          - A resource present on disk but not in memory (rare — sweep never adds keys the
+            wrapper did not read at start) is preserved from disk.
+
+        THE WINDOW WE DO NOT CLOSE. This narrows the race from "tick duration" (minutes) to
+        "the gap between our re-read and our write" (sub-millisecond) — same operational trade
+        as Merge-StateForWrite's header describes for quarantine. A full file lock is not the
+        right answer for a multi-minute sweep (see Merge-StateForWrite W:255-257).
+
+    .PARAMETER Memory
+        The sweep's in-memory leases-state map.
+
+    .PARAMETER OriginalGenerations
+        The `generation` snapshot taken at sweep start via Get-LeaseGenerations.
+
+    .PARAMETER DiskPath
+        Path to leases.json. Re-read RIGHT BEFORE the write so operator changes during the
+        sweep are visible.
+    #>
+    param(
+        [hashtable]$Memory,
+        [hashtable]$OriginalGenerations,
+        [string]$DiskPath
+    )
+    if ($null -eq $Memory)              { $Memory = @{} }
+    if ($null -eq $OriginalGenerations) { $OriginalGenerations = @{} }
+
+    # Re-read disk. Use the same primitive the wrapper uses so the shape and error behaviour
+    # match Merge-StateForWrite exactly (a corrupt state file falls back to empty rather than
+    # aborting the flush — the sweep must not fail closed for a JSON syntax hiccup).
+    $current = Get-JsonState -Path $DiskPath
+    $currentGens = Get-LeaseGenerations -LeasesState $current
+
+    $out = @{}
+    foreach ($k in @($current.Keys)) { $out[$k] = $current[$k] }
+
+    foreach ($resource in @($Memory.Keys)) {
+        $priorGen = if ($OriginalGenerations.ContainsKey($resource)) { [int]$OriginalGenerations[$resource] } else { -1 }
+        $diskGen  = if ($currentGens.ContainsKey($resource))         { [int]$currentGens[$resource]         } else { -1 }
+        if ($current.ContainsKey($resource) -and $diskGen -ne $priorGen) {
+            # External writer landed on this resource during the sweep — keep disk (already in $out).
+            continue
+        }
+        # No collision (or the resource is new-in-memory) — write memory's version through.
+        $out[$resource] = $Memory[$resource]
+    }
+    return $out
+}
+
+function Get-JsonState {
+    # Fallback shim: if the caller has NOT dot-sourced the wrapper (e.g. Test-Lease.ps1), we need
+    # a Get-JsonState of our own so Merge-LeasesStateForWrite is testable in isolation. When the
+    # wrapper IS dot-sourced first, its Get-JsonState wins by shadowing (both are just plain
+    # functions — the later definition takes over the name). Keep the shape and error behaviour
+    # identical to the wrapper's implementation at run-conductor-scheduled.ps1:200.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @{} }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+        if (-not $raw.Trim()) { return @{} }
+        $obj = $raw | ConvertFrom-Json
+        $map = @{}
+        foreach ($p in $obj.PSObject.Properties) { $map[$p.Name] = $p.Value }
+        return $map
+    }
+    catch { return @{} }
 }
 
 function Get-LeaseSummaryLines {

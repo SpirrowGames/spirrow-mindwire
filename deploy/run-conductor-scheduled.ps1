@@ -2156,13 +2156,20 @@ try {
     $quarantineState = Get-JsonState -Path $quarantineStatePath
     $evaluatedState = Get-JsonState -Path $evaluatedStatePath
     $digestState = Get-JsonState -Path $digestStatePath
-    # T-exclusive-resource-lease-queue: leases.json is on the same merge-on-write layer as
-    # quarantine.json — deploy/Grant-Lease.ps1 may write it during a sweep. Snapshot its keys
-    # at start so Merge-StateForWrite can distinguish operator removal from "sweep never
-    # touched." Round-tripped values come back as PSCustomObject; normalise to hashtables so the
-    # rest of the sweep body only ever sees one shape.
+    # T-exclusive-resource-lease-queue: leases.json is on its OWN merge-on-write layer
+    # (Merge-LeasesStateForWrite in lib/Lease.ps1). The generic Merge-StateForWrite would be
+    # WRONG here — its top-level-key merge lets the sweep's in-memory copy win on any resource
+    # present at sweep start, which silently destroys an operator's mid-sweep
+    # `Grant-Lease.ps1 -Resource editor -To B` because the sweep's probe touched the same
+    # `editor` key. See Merge-LeasesStateForWrite's header for the full rationale (msg-1802
+    # blocker #1). To detect the external write we snapshot per-resource `generation` here at
+    # sweep start; the merger compares that to disk's current generation right before flushing
+    # and lets disk win on any resource whose generation moved (only writers that legitimately
+    # change ownership bump generation — the sweep's probe does not).
+    # Round-tripped values come back as PSCustomObject; normalise to hashtables so the rest of
+    # the sweep body only ever sees one shape.
     $leasesState = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $leasesStatePath)
-    $leasesOriginalKeys = @($leasesState.Keys)
+    $leasesOriginalGenerations = Get-LeaseGenerations -LeasesState $leasesState
     # Snapshot the keys present at sweep start. Used by Merge-StateForWrite at flush time to
     # distinguish "operator removed this during the sweep" (must not resurrect) from "sweep never
     # touched this" (already-agreed value, keep). See Merge-StateForWrite's header for the full
@@ -2249,8 +2256,9 @@ try {
     # starved distinction reuses the decide verdict rather than inventing a new predicate.
     $sweepOrderKeys = @($candidates | ForEach-Object { $_.key })
     foreach ($resource in @($leasesState.Keys)) {
-        $lease = ConvertTo-LeaseHashtable -Lease $leasesState[$resource]
-        $leasesState[$resource] = $lease
+        # $leasesState was normalised at load (line ~2164); do NOT re-normalise per-resource
+        # here (msg-1802 blocker #2). Trust the boundary.
+        $lease = $leasesState[$resource]
         $holderKey = "$($lease['holder'])"
         if ([string]::IsNullOrEmpty($holderKey)) { continue }   # free lease; nothing to probe
 
@@ -2529,7 +2537,9 @@ try {
             $dirtyAcquires = @()
             foreach ($resource in $cand.requires) {
                 if (-not $leasesState.ContainsKey($resource)) { continue }
-                $existing = ConvertTo-LeaseHashtable -Lease $leasesState[$resource]
+                # $leasesState was normalised at load (line ~2164); trust the boundary
+                # (msg-1802 blocker #2). Do NOT re-normalise here.
+                $existing = $leasesState[$resource]
                 if ($null -eq $existing) { continue }
                 $priorHolder = "$($existing['holder'])"
                 $reclaimFlag = $existing.ContainsKey('reclaim_required') -and [bool]$existing['reclaim_required']
@@ -2715,13 +2725,17 @@ try {
     # head_skip.json is not written here at all — its only writer is scripts/head_skip_decide.py
     # (owned atomicity per msg-1430 §W-2), so any concurrency question is answered on the CLI side.
     #
-    # leases.json shares quarantine.json's discipline — deploy/Grant-Lease.ps1 may edit it during
-    # a sweep (pin, grant, clear), so the same merge-on-write rules apply (msg-1187 §2).
+    # leases.json shares the operational shape (mid-sweep operator write) but uses a DIFFERENT
+    # merge rule (Merge-LeasesStateForWrite in lib/Lease.ps1). The generic Merge-StateForWrite's
+    # "memory wins on key present at sweep start" is a data-loss bug for leases.json — see the
+    # snapshot comment near line 2159 and the merger's header for the full argument (msg-1802
+    # blocker #1). The lease merger uses per-resource `generation` as an optimistic-concurrency
+    # token: disk wins on any resource whose generation moved during the tick.
     $mergedQuarantine = Merge-StateForWrite -Memory $quarantineState `
         -OriginalKeys $quarantineOriginalKeys -DiskPath $quarantineStatePath
     Save-JsonState -Path $quarantineStatePath -State $mergedQuarantine
-    $mergedLeases = Merge-StateForWrite -Memory $leasesState `
-        -OriginalKeys $leasesOriginalKeys -DiskPath $leasesStatePath
+    $mergedLeases = Merge-LeasesStateForWrite -Memory $leasesState `
+        -OriginalGenerations $leasesOriginalGenerations -DiskPath $leasesStatePath
     Save-JsonState -Path $leasesStatePath -State $mergedLeases
     Save-JsonState -Path $evaluatedStatePath -State $evaluatedState
 
