@@ -1358,14 +1358,27 @@ async def test_field_and_body_disagree_escalates_to_human(caplog: pytest.LogCapt
     combined = " ".join(r.getMessage() for r in mismatch_records)
     assert "Einstein" in combined  # what the field said
     assert "Bohr" in combined  # what the body would have routed to
+    # T-reconcile-field-mismatch-flag-overloaded: the reason code is on the log line too, so a
+    # human reader (and a programmatic one) can tell target divergence apart from an unresolvable
+    # field without re-deriving it from the raw tokens. Both sides resolved here, so the reason
+    # is target_divergence, not field_unresolvable.
+    assert "target_divergence" in combined
+    assert "field_unresolvable" not in combined
 
 
 @pytest.mark.anyio
-async def test_field_unknown_participant_escalates_to_human() -> None:
-    # A field value that fails to resolve (unknown persona) is treated as a mismatch: escalate
-    # to human. Write-side validation should reject it (NextParticipantUnknownError, §3-3), but
+async def test_field_unknown_participant_escalates_to_human(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A field value that fails to resolve (unknown persona) is treated as an escalation: route to
+    # human. Write-side validation should reject it (NextParticipantUnknownError, §3-3), but
     # if a bad field slipped past, the read side surfaces the disagreement loudly instead of
     # falling back to the body silently.
+    #
+    # T-reconcile-field-mismatch-flag-overloaded: pin that the WARNING log names THIS case as
+    # `reason=field_unresolvable` — the same escalation as the row-5 divergence test above, but a
+    # DIFFERENT cause, and a dashboard that counts them together (as PR #184's ``field_mismatch``
+    # bool forced) cannot tell them apart. Same routing verdict, different reason label.
     mcp = _FakeChatroomMcp()
     mcp.seed(
         author="Bohr",
@@ -1373,9 +1386,16 @@ async def test_field_unknown_participant_escalates_to_human() -> None:
         next_participant="Schrodinger",
     )
     disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
-    outcome = await _conductor(mcp, disp).run()
+    with caplog.at_level("WARNING", logger="spirrow_mindwire.conductor.core"):
+        outcome = await _conductor(mcp, disp).run()
     assert outcome.stop_reason is StopReason.HUMAN
     assert all(role is not Role.IMPLEMENTER for role, _ in disp.dispatches)
+    mismatch_records = [r for r in caplog.records if "mismatch" in r.getMessage().casefold()]
+    assert mismatch_records, "expected a mismatch WARNING to be logged"
+    combined = " ".join(r.getMessage() for r in mismatch_records)
+    assert "Schrodinger" in combined  # what the (unresolvable) field said
+    assert "field_unresolvable" in combined
+    assert "target_divergence" not in combined  # this is NOT a divergence — it is a bad field
 
 
 @pytest.mark.anyio
