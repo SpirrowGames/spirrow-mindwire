@@ -35,6 +35,7 @@ function Write-Log { param([string]$Message) }
 $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
+                  'Get-QuarantineReproHint',
                   'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
                   'Get-SystemicAlertSignature', 'Merge-StateForWrite', 'Get-JsonState',
                   'Save-JsonState', 'Update-EvaluatedTimestamp', 'ConvertTo-UtcInstant',
@@ -120,6 +121,39 @@ Check "current control unknown -> no control hint" $null `
 Check "stored control unknown -> no control hint" '新規メッセージあり (head 変化)' `
     (Get-FingerprintHint -Fingerprint @{ head = 'msg-1'; control = $null } `
                          -CurrentHead 'msg-2' -CurrentControl 'run')
+
+Write-Host "Get-QuarantineReproHint — composes a hint from record fields only, never a new probe"
+# T-sdk-is-error-loses-the-reason D-6 / S-8: the runner already has (head, control, log_path)
+# in-hand at record-write time; the hint just draws them into something a human can paste. It
+# must NOT accept a new external input, must NOT overclaim determinism ("repro_hint", not
+# "repro"), and must fail-safe to $null when a piece is missing.
+$hint = Get-QuarantineReproHint `
+    -Fingerprint @{ head = 'msg-100'; control = 'run' } `
+    -SessionLogPath 'C:/logs/conductor-2026-08-11.log' `
+    -Key 'spirrow-mindwire/T-foo'
+Check "hint names head" $true ($hint -like '*head=msg-100*')
+Check "hint names control" $true ($hint -like '*control=run*')
+Check "hint names the log path" $true ($hint -like '*C:/logs/conductor-2026-08-11.log*')
+Check "hint uses the key so grep finds it" $true ($hint -like '*spirrow-mindwire/T-foo*')
+# D-6 explicitly forbids the ``repro`` name — the H2 (systematic) judgement means "same failure
+# twice", not "deterministic". A rendered ``repro:`` line would silently overclaim.
+Check "hint uses the 'repro-hint' label (not 'repro')" $true ($hint -like 'repro-hint:*')
+
+# Fail-safes — a missing piece drops the hint entirely rather than showing "head=None".
+Check "no fingerprint -> null" $null `
+    (Get-QuarantineReproHint -Fingerprint $null -SessionLogPath 'x' -Key 'k')
+Check "missing head -> null" $null `
+    (Get-QuarantineReproHint -Fingerprint @{ head = ''; control = 'run' } -SessionLogPath 'x' -Key 'k')
+Check "missing control -> null" $null `
+    (Get-QuarantineReproHint -Fingerprint @{ head = 'msg-1'; control = '' } -SessionLogPath 'x' -Key 'k')
+
+# The JSON round-trip regression — every record older than the current tick reads as PSCustomObject,
+# never hashtable. If the function ever declared ``[hashtable]$Fingerprint`` it would blow up on the
+# very first quarantine older than one tick. Get-FingerprintHint's own tests cover the same shape;
+# repeat here to pin this function under the same regularity.
+$fpPSObj = [pscustomobject]@{ head = 'msg-99'; control = 'run' }
+$hintPS = Get-QuarantineReproHint -Fingerprint $fpPSObj -SessionLogPath 'x' -Key 'k'
+Check "PSCustomObject fingerprint survives" $true ($hintPS -like '*head=msg-99*')
 
 Write-Host "New-QuarantineRecord — the failure fingerprint is exactly (head, control), nothing more"
 $rec = New-QuarantineRecord -FirstFailureAt '2026-08-11T00:00:00Z' -ExitCode 2 `
@@ -220,6 +254,34 @@ Check "digest carries the stale wording change" $true ($digest -match '直すか
 Check "escalated entry carries the head-change hint" $true ($digest -match 'T-escalated.*新規メッセージあり')
 Check "fresh entry has NO hint (nothing changed)" $true ($digest -notmatch 'T-fresh.*新規メッセージあり')
 Check "digest never uses the deleted 'input changed' wording (§4)" $true ($digest -notmatch '入力変化')
+
+Write-Host "New-DailyDigest — repro_hint appears on a continuation line, not on the entry line"
+# T-sdk-is-error-loses-the-reason S-8 (PR #181 round 4): the repro-hint is
+# rendered on its own indented continuation line. Earlier the comment above
+# the render site CLAIMED "one-line-per-entry" while the code emitted a hard
+# newline — reconciled in favour of the newline (the hint content is 100+
+# chars including the log path, so on-line wrapping is unreadable). Pin the
+# actual behaviour so a future edit to either the comment or the code brings
+# them back in sync intentionally, not by accident.
+$qHint = @{
+    'p/T-repro' = @{
+        state = 'quarantined'
+        first_failure_at = $now.AddHours(-2).ToString('o')
+        failure_fingerprint = @{ head = 'msg-99'; control = 'run' }
+        session_log_path = 'C:/logs/conductor-2026-08-11.log'
+    }
+}
+$digest = New-DailyDigest -QuarantineState $qHint -EvaluatedState @{} `
+    -HeadsByProject @{ p = @{ 'T-repro' = 'msg-99' } } `
+    -ControlByProject @{ p = [pscustomobject]@{ desired_state = 'run' } } `
+    -Now $now -LiveKeys @('p/T-repro')
+Check "digest contains a repro-hint line" $true ($digest -match 'repro-hint:.*p/T-repro.*head=msg-99')
+Check "repro-hint is on its OWN line (preceded by a newline + indent)" $true `
+    ($digest -match "`n    repro-hint:")
+# And the entry itself remains recognisable — the newline is BETWEEN the entry line and the hint,
+# not IN the middle of the entry line.
+Check "entry line for the key is intact above the repro-hint" $true `
+    ($digest -match '  p/T-repro   \d')
 
 Write-Host "New-DailyDigest — survives a real quarantine.json round-trip"
 # The failure path the previous test suite did not exercise: build a quarantine map the way the

@@ -832,3 +832,111 @@ def test_ensure_utf8_runtime_respects_explicit_override(monkeypatch: pytest.Monk
     monkeypatch.setenv("PYTHONUTF8", "0")
     loop_runner._ensure_utf8_runtime()
     assert os.environ["PYTHONUTF8"] == "0"
+
+
+# --------------------------------------------------------------------------- #
+# T-sdk-is-error-loses-the-reason S-6 — exit-time marker re-emission
+# --------------------------------------------------------------------------- #
+
+
+def test_main_reemits_sdk_error_marker_on_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When the run raises with an ``SdkIsErrorSignal`` in the chain, ``main``
+    prints the traceback THEN emits the marker as the last stdout line, then
+    exits non-zero via ``SystemExit``.
+
+    The naive earlier version just re-emitted the marker and re-raised — that
+    let Python's default ``sys.excepthook`` write a 30-plus-line traceback to
+    stderr AFTER the marker, which PowerShell's ``*>&1`` merged capture then
+    dropped into the tail window and pushed the marker out. See PR #181
+    naysayer review; this test pins the fix so a future refactor cannot
+    silently regress it.
+    """
+    from spirrow_mindwire.adapters._sdk_result import SdkIsErrorSignal
+
+    signal_detail = {
+        "reason_source": "result",
+        "message": "429 rate limit",
+        "captured_fields": {"session_id": "exit-test-sid"},
+    }
+
+    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+        try:
+            raise SdkIsErrorSignal(signal_detail)
+        except SdkIsErrorSignal as sig:
+            # Mirrors what ``deliver_event`` does — wraps the signal in the
+            # adapter's typed delivery error while preserving ``__cause__``, so
+            # the ``find_sdk_error_signal`` walker has to actually walk.
+            raise RuntimeError("wrapped delivery failure") from sig
+
+    monkeypatch.setattr(loop_runner, "run_conductor", _fake_run_conductor)
+    monkeypatch.setattr(loop_runner, "load_settings", lambda: MindwireSettings())
+    monkeypatch.setattr("sys.argv", ["mindwire-loop", "--mode", "conductor"])
+
+    # ``main`` now exits via ``SystemExit(1)`` instead of re-raising, so the
+    # default excepthook does NOT print the traceback AFTER our marker. The
+    # exit code stays 1 so the wrapper's ``if ($code -ne 0)`` branch is
+    # unchanged.
+    with pytest.raises(SystemExit) as excinfo:
+        loop_runner.main()
+    assert excinfo.value.code == 1
+
+    out = capsys.readouterr().out
+    # 1) Marker is present and carries the signal's detail.
+    assert "sdk_error_detail=" in out
+    assert "exit-test-sid" in out
+
+    # 2) The traceback was printed BEFORE the marker (not swallowed). Without
+    # this the exit-time write would be silent about what actually happened,
+    # which would trade one silent-degradation defect for another.
+    assert "Traceback" in out
+    assert "wrapped delivery failure" in out
+
+    # 3) The marker is the LAST non-empty line on stdout. This is what the
+    # ``session_log_tail`` window depends on to keep the marker inside its
+    # 50-line horizon — the exact regression PR #181 review identified.
+    nonempty = [line for line in out.splitlines() if line.strip()]
+    marker_indices = [i for i, line in enumerate(nonempty) if line.startswith("sdk_error_detail=")]
+    assert marker_indices, "no marker line found on stdout"
+    assert marker_indices[-1] == len(nonempty) - 1, (
+        "marker is not the LAST non-empty stdout line — traceback / other output "
+        "leaked after it, exactly the regression the fix exists to prevent. "
+        f"Last three lines: {nonempty[-3:]}"
+    )
+
+    # 4) Every traceback line appears BEFORE the marker in the stream — since
+    # the wrapper merges via ``*>&1``, an in-stream ordering assertion pins
+    # the merge order too (both writes are to the same file descriptor).
+    marker_index = marker_indices[-1]
+    traceback_indices = [i for i, line in enumerate(nonempty) if "Traceback" in line]
+    assert all(i < marker_index for i in traceback_indices), (
+        "a Traceback line appeared AFTER the marker — the fix's ordering invariant is broken."
+    )
+
+
+def test_main_does_nothing_extra_when_the_error_has_no_sdk_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The exit handler is a no-op when the failure was not an SDK is_error.
+
+    Crucially, the fix for the sdk_is_error case (traceback-then-marker-then-
+    ``sys.exit``) must NOT extend to unrelated exceptions. An unrelated
+    ``RuntimeError`` must still propagate unchanged so a future default-hook
+    surface (Python 3.14 tracebacks, IDE integrations, etc.) does not lose
+    fidelity for the 99 % case that has nothing to do with the SDK.
+    """
+
+    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+        raise RuntimeError("unrelated crash")
+
+    monkeypatch.setattr(loop_runner, "run_conductor", _fake_run_conductor)
+    monkeypatch.setattr(loop_runner, "load_settings", lambda: MindwireSettings())
+    monkeypatch.setattr("sys.argv", ["mindwire-loop", "--mode", "conductor"])
+
+    with pytest.raises(RuntimeError):
+        loop_runner.main()
+
+    assert "sdk_error_detail=" not in capsys.readouterr().out

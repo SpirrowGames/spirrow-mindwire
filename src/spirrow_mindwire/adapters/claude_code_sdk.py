@@ -67,6 +67,11 @@ from ..value_objects import (
     SessionState,
     ThreadRef,
 )
+from ._sdk_result import (
+    SdkIsErrorSignal,
+    capture_is_error_detail,
+    emit_sdk_error_marker,
+)
 
 # A session that is halting or terminal (ADR-06 §4 I8). For these states
 # halt() is an idempotent no-op, and deliver_event is rejected (no query()
@@ -155,8 +160,18 @@ def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
 async def _drain_reply(client: _SdkClient) -> str:
     """Drain one SDK response, returning the concatenated assistant text.
 
-    Raises ``RuntimeError`` if the SDK reports ``is_error`` on its
-    ``ResultMessage`` (mapped to a Port exception by the caller).
+    Raises :class:`~._sdk_result.SdkIsErrorSignal` when the SDK reports
+    ``is_error`` on its ``ResultMessage`` — a subclass of ``RuntimeError`` that
+    carries the full structured capture on ``.detail`` and emits the stdout
+    marker at raise time (T-sdk-is-error-loses-the-reason).
+
+    Raises plain ``RuntimeError`` for the other protocol violations (no
+    ``ResultMessage`` at all): those did not lose reason text — the message
+    itself IS the reason — so the special-purpose signal type is not warranted.
+
+    The caller in :meth:`ClaudeCodeSdkAdapter.deliver_event` picks the
+    ``ErrorInfo.code`` off the exception type (``adapter.sdk_is_error`` vs
+    ``adapter.delivery_failed``).
     """
     chunks: list[str] = []
     final: Any = None
@@ -172,7 +187,18 @@ async def _drain_reply(client: _SdkClient) -> str:
         # silent empty reply, so deliver_event can mark the session FAILED.
         raise RuntimeError("SDK session ended without a ResultMessage")
     if getattr(final, "is_error", False):
-        raise RuntimeError(getattr(final, "result", None) or "SDK session reported is_error")
+        # Structured capture (S-1..S-4). ``capture_is_error_detail`` picks
+        # ``reason_source`` from ``final``'s known fields — the pre-change
+        # ``or "SDK session reported is_error"`` collapsed "result was empty"
+        # into "we did not look".
+        detail = capture_is_error_detail(final)
+        # Raise-site marker (S-6, first of two copies). Emitting here means a
+        # subsequent hard kill of the conductor still leaves the marker in the
+        # log; the second copy at ``loop_runner.main`` guarantees it also
+        # survives the 50-line ``session_log_tail`` window in the ordinary
+        # exit path.
+        emit_sdk_error_marker(detail)
+        raise SdkIsErrorSignal(detail)
     return "".join(chunks)
 
 
@@ -401,11 +427,45 @@ class ClaudeCodeSdkAdapter:
             return
 
         session.state = SessionState.PROCESSING
+        # Two separate try/excepts (T-sdk-is-error-loses-the-reason D-3(c)):
+        # ``adapter.sdk_is_error`` (SDK returned an is_error ResultMessage),
+        # ``adapter.on_reply_failed`` (the dispatcher's on_reply callback raised)
+        # and ``adapter.delivery_failed`` (the general catch-all — query() blew
+        # up, receive_response() disconnected, etc.) each need a different
+        # ``next hand``, and the pre-change single-code catch collapsed all
+        # three onto the general code. The three-way split lives here rather
+        # than in a shared helper because the wrapping ``ClaudeCodeSdkDeliveryError``
+        # is class-specific and the ``on_reply`` seam is only present in the
+        # adapter, not the drain.
         try:
             await session.client.query(_build_prompt(event, session.own_role))
             body = await _drain_reply(session.client)
-            # on_reply is inside the try: a raising dispatcher callback must not
-            # leave the session stuck in PROCESSING — it transitions to FAILED.
+        except SdkIsErrorSignal as sig:
+            session.state = SessionState.FAILED
+            session.error = ErrorInfo(
+                code="adapter.sdk_is_error",
+                message=str(sig),
+                raised_at=datetime.now(UTC),
+            )
+            raise ClaudeCodeSdkDeliveryError(
+                f"deliver_event failed for session {handle.session_id}: {sig}"
+            ) from sig
+        except Exception as exc:
+            session.state = SessionState.FAILED
+            session.error = ErrorInfo(
+                code="adapter.delivery_failed",
+                message=str(exc),
+                raised_at=datetime.now(UTC),
+            )
+            raise ClaudeCodeSdkDeliveryError(
+                f"deliver_event failed for session {handle.session_id}: {exc}"
+            ) from exc
+
+        # on_reply outside the SDK-drain try but still inside a try — the
+        # pre-change comment ("on_reply is inside the try: a raising dispatcher
+        # callback must not leave the session stuck in PROCESSING") is still
+        # load-bearing; the split only teaches it a different error code.
+        try:
             await session.ctx.on_reply(
                 ReplyDraft(
                     body=body,
@@ -416,7 +476,7 @@ class ClaudeCodeSdkAdapter:
         except Exception as exc:
             session.state = SessionState.FAILED
             session.error = ErrorInfo(
-                code="adapter.delivery_failed",
+                code="adapter.on_reply_failed",
                 message=str(exc),
                 raised_at=datetime.now(UTC),
             )

@@ -18,6 +18,7 @@ from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from spirrow_mindwire.adapters.naysayer_sdk import (
     NaysayerSdkAdapter,
+    NaysayerSdkDeliveryError,
     NaysayerSdkSpawnError,
     build_naysayer_system_prompt,
 )
@@ -542,6 +543,91 @@ def test_adapters_do_not_import_the_marker_builder() -> None:
                 imported.extend(alias.name for alias in node.names)
         offenders = [name for name in imported if name.split(".")[-1] == "source_marker"]
         assert offenders == [], f"{module.__name__} imports the marker builder: {offenders}"
+
+
+# --------------------------------------------------------------------------- #
+# T-sdk-is-error-loses-the-reason — the naysayer side of the same fix
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_naysayer_sdk_is_error_carries_the_reason_and_the_specific_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Naysayer turns are the most expensive to lose — they burn paid Lexora tier.
+
+    Fixing only ``claude_code_sdk`` would leave the very failure category with
+    the largest per-incident cost still opaque. This asserts the naysayer path
+    also emits the structured marker AND uses ``adapter.sdk_is_error`` as its
+    ``ErrorInfo.code``.
+    """
+    err_result = ResultMessage(
+        subtype="error_during_execution",
+        duration_ms=250,
+        duration_api_ms=200,
+        is_error=True,
+        num_turns=1,
+        session_id="nay-sid",
+        stop_reason=None,
+        result="Gemini backend returned 500",
+    )
+    client = _FakeClient([_assistant("started"), err_result])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, []),
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    with pytest.raises(NaysayerSdkDeliveryError) as excinfo:
+        await adapter.deliver_event(handle, _event())
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.sdk_is_error"
+    assert "Gemini backend returned 500" in hs.error.message
+    assert "Gemini backend returned 500" in str(excinfo.value)
+
+    out = capsys.readouterr().out
+    assert "sdk_error_detail=" in out
+    assert '"reason_source": "result"' in out
+
+
+@pytest.mark.anyio
+async def test_naysayer_on_reply_failure_uses_the_on_reply_code(tmp_path: Path) -> None:
+    """The dispatcher callback raising is a separate branch from an SDK failure."""
+
+    async def on_reply(_draft: ReplyDraft) -> None:
+        raise RuntimeError("magickit post failed")
+
+    async def on_event_log(_event: Event) -> None:
+        return None
+
+    ctx = SpawnContext(
+        on_reply=on_reply,
+        on_event_log=on_event_log,
+        own_role=Role.NAYSAYER,
+        own_instance_id="naysayer-1",
+    )
+    client = _FakeClient([_assistant("VERDICT: object."), _result()])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(client, []),
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, ctx)
+    with pytest.raises(NaysayerSdkDeliveryError):
+        await adapter.deliver_event(handle, _event())
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    # Distinct from ``adapter.sdk_is_error`` and from ``adapter.delivery_failed``:
+    # the operator's next hand is "look at the chatroom post path", not "look at
+    # the SDK stream".
+    assert hs.error.code == "adapter.on_reply_failed"
 
 
 @pytest.mark.anyio

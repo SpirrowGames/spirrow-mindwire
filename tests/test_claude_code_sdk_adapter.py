@@ -616,7 +616,10 @@ async def test_deliver_on_reply_failure_marks_failed(tmp_path: Path) -> None:
     hs = await adapter.health(handle)
     assert hs.state is SessionState.FAILED
     assert hs.error is not None
-    assert hs.error.code == "adapter.delivery_failed"
+    # T-sdk-is-error-loses-the-reason D-3(c): the on_reply failure code is
+    # its own branch, not the generic ``adapter.delivery_failed`` — a dispatcher
+    # callback that raised needs a different next hand from an SDK stream error.
+    assert hs.error.code == "adapter.on_reply_failed"
 
 
 @pytest.mark.anyio
@@ -659,3 +662,101 @@ def test_default_system_prompt_includes_proposer_handoff_protocol() -> None:
     assert "Conductor handoff protocol" in _DEFAULT_SYSTEM_PROMPT
     assert "NEXT:" in _DEFAULT_SYSTEM_PROMPT
     assert "Do NOT hand a design straight to the implementer" in _DEFAULT_SYSTEM_PROMPT
+
+
+# --------------------------------------------------------------------------- #
+# T-sdk-is-error-loses-the-reason — SDK is_error carries a distinct code
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_sdk_is_error_uses_the_is_error_code_and_carries_the_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SDK ``is_error=True`` → ``adapter.sdk_is_error``, and the reason survives.
+
+    Before T-sdk-is-error-loses-the-reason the drain raised ``RuntimeError``
+    with either ``final.result`` OR the constant ``"SDK session reported
+    is_error"``, and the code was collapsed to ``adapter.delivery_failed`` —
+    identical to a query() blowup. Two symptoms with two different next hands
+    landed on one label.
+
+    This asserts both parts of the fix: the code differentiates, and the raise
+    site emits a structured stdout marker that the quarantine wrapper picks up
+    in ``session_log_tail``.
+    """
+    client = _FakeClient([_assistant("partial"), _result(is_error=True, result="429 rate limit")])
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    with pytest.raises(ClaudeCodeSdkDeliveryError) as excinfo:
+        await adapter.deliver_event(handle, _event())
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.sdk_is_error"
+    # The reason survives — the wrapping error message and error.message both
+    # include what ``result`` carried, not the pre-change constant string.
+    assert "429 rate limit" in hs.error.message
+    assert "429 rate limit" in str(excinfo.value)
+
+    # Structured marker on stdout (S-6, raise-site emission). The wrapper reads
+    # child stdout to build ``session_log_tail``, so the presence of the marker
+    # here is what makes the quarantine record carry the detail.
+    captured = capsys.readouterr()
+    assert "sdk_error_detail=" in captured.out
+    assert '"reason_source": "result"' in captured.out
+    assert "429 rate limit" in captured.out
+
+
+@pytest.mark.anyio
+async def test_sdk_is_error_absent_reason_is_captured_as_absent_not_defaulted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When every known reason field is empty the record says so — with evidence.
+
+    This is the case that motivated the whole thread: an ``is_error=True``
+    ResultMessage with no ``result`` text produced the constant string
+    ``"SDK session reported is_error"``, and quarantine had no way to tell that
+    from a case where the reason WAS there but got thrown away.
+
+    ``reason_source="absent"`` now says "we looked at N known fields, none
+    carried a reason" AND attaches the reflection dump so a reader can widen
+    the known list from actual evidence.
+    """
+    # Every reason-candidate known field is None/empty — constructed directly
+    # rather than through the ``_result`` helper (which populates ``subtype`` /
+    # ``stop_reason`` for the success path). This is the pattern the actual
+    # observed failure at 2026-08-25T14:20:07Z fell into: an ``is_error=True``
+    # message with no accompanying text on any known field.
+    empty_error_msg = ResultMessage(
+        subtype="",
+        duration_ms=10,
+        duration_api_ms=10,
+        is_error=True,
+        num_turns=1,
+        session_id="empty-sid",
+        stop_reason=None,
+        result=None,
+        errors=None,
+        api_error_status=None,
+        permission_denials=None,
+    )
+    client = _FakeClient([_assistant("partial"), empty_error_msg])
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    with pytest.raises(ClaudeCodeSdkDeliveryError):
+        await adapter.deliver_event(handle, _event())
+    hs = await adapter.health(handle)
+    assert hs.error is not None
+    assert hs.error.code == "adapter.sdk_is_error"
+
+    captured = capsys.readouterr()
+    assert "sdk_error_detail=" in captured.out
+    assert '"reason_source": "absent"' in captured.out
+    assert "absent_dump" in captured.out
+    # The failure message names the state ("N known reason fields captured,
+    # none carried a reason") so ``absent`` and "we did not look" are legibly
+    # different outcomes. The pre-change constant appeared regardless of which
+    # of the two had happened, and this asserts we no longer reach for it.
+    assert "SDK session reported is_error" not in hs.error.message
+    assert "none carried a reason" in hs.error.message
