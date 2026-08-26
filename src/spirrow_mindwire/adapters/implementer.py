@@ -253,9 +253,9 @@ def _adr_index_block() -> str:
     So this block, and the "DOCUMENTS YOU CANNOT READ" rule in the system prompt, are halves of one
     fix and neither works alone. The map alone would be **worse than nothing**: a title is a
     summary, and inviting an agent to reason outward from a summary as if it were the document
-    reproduces exactly what ADR-2026-05-29-13 warns against — only now the confabulation is better
-    grounded and therefore harder to catch. The rule alone leaves it unable to say even which ADR
-    it cannot read.
+    reproduces exactly the silent confident invention OBL-DECLARE-UNREADABLE exists to prevent —
+    only now the confabulation is better grounded and therefore harder to catch. The rule alone
+    leaves it unable to say even which ADR it cannot read.
 
     Source is the same in-repo manifest the naysayer uses (``spec/adr_index.yaml``); nothing is
     duplicated. An unloadable manifest says so out loud rather than shipping a silent gap.
