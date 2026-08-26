@@ -2320,11 +2320,16 @@ try {
                     if ($grant.reclaim_required) {
                         # The empty state carried reclaim duty (operator -Clear, or a race).
                         # This is the same operator-visible failure mode as the dirty-acquire
-                        # path in the candidate loop (msg-1757 blocker #2 fix), so reuse the
-                        # same notification key so the digest / operator inbox story stays
-                        # single-channel for "someone inherited reclaim duty."
+                        # path in the candidate loop (msg-1757 blocker #2 fix) and the probe's
+                        # end-of-iteration reclaim check (msg-1876 blocker), so reuse the same
+                        # notification key so the digest / operator inbox story stays
+                        # single-channel for "someone inherited reclaim duty." Signature is
+                        # unified to "$holder@$gen" across all three fires so cross-tick dedup
+                        # works: this fire's stored signature will match the probe's next-tick
+                        # signature and prevent re-notification.
+                        $newHolderGen = if ($lease.ContainsKey('generation') -and $null -ne $lease['generation']) { [int]$lease['generation'] } else { 0 }
                         Send-NotificationIfChanged -State $notifyState -Key "__lease_reclaim_acquire__/$resource" `
-                            -Signature "$($grant.reclaimed_from)->$($grant.new_holder)@$(($nowUtc.ToString('o')))" `
+                            -Signature "$($grant.new_holder)@$newHolderGen" `
                             -Message ("MindWire: lease **$resource** の FIFO を drain して waiter に付与しました " +
                                       "(前回 release / operator -Clear の際に waiter が残っていました)。" +
                                       "旧: $($grant.reclaimed_from) → 新: $($grant.new_holder)。" +
@@ -2372,6 +2377,35 @@ try {
                         Write-Log "lease [$resource] released (no waiter): previous holder=$($promotion.previous_holder)"
                     }
                 }
+            }
+        }
+
+        # Reclaim-inheritance notification (msg-1876 blocker). Fires exactly once per fresh
+        # (holder, generation) tuple where reclaim_required=true — Send-NotificationIfChanged
+        # dedupes on -Signature within a -Key, and both `holder` and `generation` are stable
+        # across ticks for a given inheritance event. Catches specifically the operator-Grant-
+        # into-empty case (Grant-Lease.ps1 -Grant on a lease whose prior state was
+        # `holder=null, reclaim_required=true` from a preceding -Clear) — the candidate-loop
+        # dirty-detection (round 3 fix) cannot see it because by the time the candidate is
+        # evaluated the holder is already set, and the empty-with-queue drain (round 5) only
+        # runs on empty-holder + non-empty queue. This probe-level fire is the catch-all: any
+        # live holder with reclaim_required=true gets an operator notification, once, no
+        # matter which write path put them there. The signature "$holder@$gen" is intentionally
+        # unified with the round-3 and round-5 fires so cross-tick dedup works — a candidate
+        # that got notified via the acquire path this tick will NOT get re-notified by the
+        # probe on the next tick.
+        $curHolder = "$($lease['holder'])"
+        if (-not [string]::IsNullOrEmpty($curHolder)) {
+            $curReclaim = $lease.ContainsKey('reclaim_required') -and [bool]$lease['reclaim_required']
+            if ($curReclaim) {
+                $curGen = if ($lease.ContainsKey('generation') -and $null -ne $lease['generation']) { [int]$lease['generation'] } else { 0 }
+                $curFrom = if ($lease.ContainsKey('reclaimed_from')) { "$($lease['reclaimed_from'])" } else { '' }
+                $fromLabel = if ($curFrom) { $curFrom } else { '<unknown>' }
+                Send-NotificationIfChanged -State $notifyState -Key "__lease_reclaim_acquire__/$resource" `
+                    -Signature "$curHolder@$curGen" `
+                    -Message ("MindWire: lease **$resource** は **$curHolder** が reclaim_required=true で保持しています " +
+                              "(inherited from ${fromLabel})。使用前にリソースの再起動が必要です " +
+                              "(v1 は scheduling で enforcement ではないため、旧側が自力で起動する可能性は残ります)。")
             }
         }
     }
@@ -2630,8 +2664,12 @@ try {
                                     -CandidateKey $cand.key -Now $nowUtc
             }
             foreach ($dirty in $dirtyAcquires) {
+                # Signature unified with the probe's end-of-iteration reclaim check and the
+                # empty-with-queue drain fire (msg-1876 blocker): "$holder@$gen" so a candidate
+                # notified here does NOT get re-notified by the probe on the next tick.
+                $acquiredGen = if ($leasesState[$dirty.Resource].ContainsKey('generation') -and $null -ne $leasesState[$dirty.Resource]['generation']) { [int]$leasesState[$dirty.Resource]['generation'] } else { 0 }
                 Send-NotificationIfChanged -State $notifyState -Key "__lease_reclaim_acquire__/$($dirty.Resource)" `
-                    -Signature "$($dirty.ReclaimedFrom)->$($cand.key)@$(($nowUtc.ToString('o')))" `
+                    -Signature "$($cand.key)@$acquiredGen" `
                     -Message ("MindWire: lease **$($dirty.Resource)** を再取得しました " +
                               "(前回 release 時に waiter が居なかったため通知が飛ばず、reclaim_required が持ち越されていました)。" +
                               "旧: $($dirty.ReclaimedFrom) → 新: $($cand.key) (reason=$($dirty.RevokedReason))。" +

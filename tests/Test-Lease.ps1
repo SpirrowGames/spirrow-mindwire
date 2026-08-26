@@ -829,6 +829,155 @@ else {
     }
 }
 
+# --- 15. Grant-Lease.ps1 preserves reclaim_required on empty-state grant (msg-1876 blocker) -----
+#
+# End-to-end test: invoke the real Grant-Lease.ps1 script against a temp fixture and check that
+# a -Grant on a lease whose prior state was `holder=null, reclaim_required=true` (produced by a
+# preceding -Clear) does NOT silently erase the flag. Erasure would fire the new holder blindly
+# on top of a physically-lingering session — the exact silent-collision this mechanism exists
+# to end. Same fixture pattern as Test-ClearQuarantine.ps1 (temp dir + shell out).
+Write-Host "Grant-Lease.ps1 — preserve reclaim_required across empty-state grant (msg-1876 blocker)"
+
+$grantScript = Join-Path $repoRoot "deploy/Grant-Lease.ps1"
+if (-not (Test-Path -LiteralPath $grantScript)) { throw "Grant-Lease.ps1 not found: $grantScript" }
+
+# Parse-check up front so a syntax break falls out here rather than through a shell-exit code.
+$parseErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseFile($grantScript, [ref]$null, [ref]$parseErrors)
+if ($parseErrors) {
+    $parseErrors | ForEach-Object { Write-Host "PARSE ERROR line $($_.Extent.StartLineNumber): $($_.Message)" }
+    throw "deploy/Grant-Lease.ps1 does not parse"
+}
+
+$fixtureDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mindwire-grant-lease-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path (Join-Path $fixtureDir 'state') -Force | Out-Null
+$fixtureLeases = Join-Path $fixtureDir 'state\leases.json'
+$utf8NoBomLocal = New-Object System.Text.UTF8Encoding($false)
+
+function Save-FixtureLeasesGL {
+    param([string]$Path, [hashtable]$State)
+    [System.IO.File]::WriteAllText($Path, ($State | ConvertTo-Json -Depth 5), $utf8NoBomLocal)
+}
+function Load-FixtureLeasesGL {
+    param([string]$Path)
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+    $obj = $raw | ConvertFrom-Json
+    $map = @{}
+    foreach ($p in $obj.PSObject.Properties) { $map[$p.Name] = $p.Value }
+    return $map
+}
+
+try {
+    # --- scenario A: prior state is empty-with-reclaim from a Clear. Grant must preserve. -------
+    Save-FixtureLeasesGL -Path $fixtureLeases -State @{
+        editor = @{
+            holder = $null; acquired_at = $null; last_progress_at = $null
+            idle_evaluations = 0; generation = 7; pinned = $false; expiring = $false
+            reclaimed_from = 'p/T-crashed-holder'; reclaim_required = $true
+            revoked_at = '2026-08-25T00:00:00Z'; revoked_reason = 'operator-clear: PIE crashed'
+            queue = @()
+        }
+    }
+    $env:MINDWIRE_PATHS__DATA_DIR = $fixtureDir
+    try {
+        $grantOutput = & pwsh -NoProfile -File $grantScript -Resource 'editor' -To 'p/T-new-owner' -Reason 'A/B test' -Confirm:$false *>&1
+    }
+    finally {
+        Remove-Item Env:\MINDWIRE_PATHS__DATA_DIR -ErrorAction SilentlyContinue
+    }
+    if ($LASTEXITCODE -ne 0) {
+        $script:failures++
+        Write-Host "  FAIL  Grant-Lease.ps1 exited non-zero: $LASTEXITCODE"
+        $grantOutput | ForEach-Object { Write-Host "    $_" }
+    }
+    $post = Load-FixtureLeasesGL -Path $fixtureLeases
+    Check "empty-state grant: new holder recorded" 'p/T-new-owner' "$($post['editor'].holder)"
+    CheckTrue "empty-state grant: reclaim_required PRESERVED (msg-1876 blocker)" ([bool]$post['editor'].reclaim_required)
+    Check "empty-state grant: reclaimed_from PRESERVED (prior Clear's audit)" 'p/T-crashed-holder' "$($post['editor'].reclaimed_from)"
+    Check "empty-state grant: generation bumped from 7" 8 ([int]$post['editor'].generation)
+    Check "empty-state grant: revoked_reason updated to operator-grant" $true (("$($post['editor'].revoked_reason)").StartsWith('operator-grant:'))
+    # Console output must carry the inherited-reclaim warning so the operator sees it at
+    # command time — the operator-inbox notification is fired by the next sweep probe.
+    $hasWarning = @($grantOutput | Where-Object { "$_" -match 'reclaim_required=true' }).Count -gt 0
+    CheckTrue "empty-state grant: console WARNING surfaces inherited reclaim duty" $hasWarning
+
+    # --- scenario B: prior state is a live different holder. Standard reclaim (unchanged behavior).
+    Save-FixtureLeasesGL -Path $fixtureLeases -State @{
+        editor = @{
+            holder = 'p/T-live'; acquired_at = '2026-08-26T00:00:00Z'; last_progress_at = '2026-08-26T00:00:00Z'
+            idle_evaluations = 0; generation = 3; pinned = $false; expiring = $false
+            reclaimed_from = $null; reclaim_required = $false
+            revoked_at = $null; revoked_reason = $null
+            queue = @()
+        }
+    }
+    $env:MINDWIRE_PATHS__DATA_DIR = $fixtureDir
+    try {
+        & pwsh -NoProfile -File $grantScript -Resource 'editor' -To 'p/T-forced' -Reason 'operator override' -Confirm:$false *>&1 | Out-Null
+    }
+    finally {
+        Remove-Item Env:\MINDWIRE_PATHS__DATA_DIR -ErrorAction SilentlyContinue
+    }
+    $post = Load-FixtureLeasesGL -Path $fixtureLeases
+    Check "live-overwrite grant: new holder recorded" 'p/T-forced' "$($post['editor'].holder)"
+    CheckTrue "live-overwrite grant: reclaim_required = true (msg-1183 D-6'e, unchanged)" ([bool]$post['editor'].reclaim_required)
+    Check "live-overwrite grant: reclaimed_from records prior live holder" 'p/T-live' "$($post['editor'].reclaimed_from)"
+
+    # --- scenario C: prior state is clean (no reclaim owed). Grant into empty must NOT invent one.
+    Save-FixtureLeasesGL -Path $fixtureLeases -State @{
+        editor = @{
+            holder = $null; acquired_at = $null; last_progress_at = $null
+            idle_evaluations = 0; generation = 2; pinned = $false; expiring = $false
+            reclaimed_from = $null; reclaim_required = $false
+            revoked_at = $null; revoked_reason = $null
+            queue = @()
+        }
+    }
+    $env:MINDWIRE_PATHS__DATA_DIR = $fixtureDir
+    try {
+        & pwsh -NoProfile -File $grantScript -Resource 'editor' -To 'p/T-first' -Reason 'fresh assignment' -Confirm:$false *>&1 | Out-Null
+    }
+    finally {
+        Remove-Item Env:\MINDWIRE_PATHS__DATA_DIR -ErrorAction SilentlyContinue
+    }
+    $post = Load-FixtureLeasesGL -Path $fixtureLeases
+    Check "clean-empty grant: new holder recorded" 'p/T-first' "$($post['editor'].holder)"
+    CheckFalse "clean-empty grant: reclaim_required stays false (no prior duty to inherit)" ([bool]$post['editor'].reclaim_required)
+}
+finally {
+    Remove-Item -LiteralPath $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- 16. Wrapper AST wiring — probe-level reclaim notification (msg-1876 blocker) ----------------
+#
+# The msg-1876 blocker cannot be caught by the candidate-loop dirty-detection (which only fires
+# on empty priorHolder). The probe-level fire must exist and must appear in a location that runs
+# per-resource inside the probe loop, so an operator-Grant-into-empty-state gets picked up on
+# the very next tick even though at candidate-eval time the holder is already set.
+Write-Host "Wrapper AST wiring — probe-level reclaim notification for post-operator-Grant (msg-1876 blocker)"
+
+# All Send-NotificationIfChanged call sites that fire __lease_reclaim_acquire__/*.
+$allExpandable = @($ast.FindAll(
+    { param($n) $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true))
+$reclaimAcquireKeys = @($allExpandable | Where-Object {
+    $_.Value -is [string] -and $_.Value.Contains('__lease_reclaim_acquire__')
+})
+CheckTrue "wrapper still emits __lease_reclaim_acquire__ (probe + candidate-loop paths)" ($reclaimAcquireKeys.Count -ge 2)
+
+# Cross-tick dedup requires the signature to include only stable fields (holder + generation),
+# not $nowUtc. A `nowUtc.ToString('o')` in the signature of any __lease_reclaim_acquire__ fire
+# would silently break dedup — every tick with reclaim_required=true would re-notify. Pin the
+# absence of tick-varying signatures on these fires. Scan the wrapper source lines with
+# 'lease_reclaim_acquire' for any that also contain 'nowUtc.ToString'.
+$wrapperText = Get-Content -LiteralPath $sweepScript -Raw
+$reclaimAcquireLineRegions = [regex]::Matches(
+    $wrapperText,
+    '__lease_reclaim_acquire__[\s\S]{0,600}?ToUniversalTime|Send-NotificationIfChanged[^\n]*__lease_reclaim_acquire__[\s\S]{0,600}?nowUtc\.ToString',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+# We want NONE — every __lease_reclaim_acquire__ fire's signature should use "$holder@$gen"
+# style, no time-varying material.
+Check "no __lease_reclaim_acquire__ signature uses tick-varying nowUtc.ToString (cross-tick dedup)" 0 $reclaimAcquireLineRegions.Count
+
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "lease gate: all checks passed"

@@ -9,7 +9,12 @@
 #   1. A HUMAN OVERRIDE. Takahito can decide "I want the editor on Thread X right now, regardless
 #      of the queue" — msg-923 requirements: "Tier-C の割当を上書きできる（人が明示的に「今はこ
 #      のスレ」と言えば機構がそれに従う）". Pre-mechanism this was a hand-written line in a Tier-C
-#      decision message; this script is the machine equivalent.
+#      decision message; this script is the machine equivalent. Terminology note: this file
+#      names the invoker "operator" (revoked_reason prefixes `operator-grant:` / `operator-clear:`)
+#      because that's the operational lane — the ADR-2026-05-29-10 `role` layer separately
+#      names the identity ("human"); I have not read that ADR's body (index/title only) so I
+#      cannot rule out a terminology-drift concern. Non-blocking naysayer pointer (msg-1876),
+#      recorded for a follow-up if the ADR text demands the rename.
 #
 #   2. A PIN. A grant that MUST NOT be auto-reclaimed even after idle TTL — a legitimately long
 #      PIE turn where the holder is deliberately paused. msg-1183 D-7. The lease's `pinned=true`
@@ -117,16 +122,35 @@ switch ($PSCmdlet.ParameterSetName) {
             $lease['generation']        = $priorGen + 1
             $lease['pinned']            = [bool]$Pin.IsPresent
             $lease['expiring']          = $false
-            # An operator grant while another holder had it: mark reclaim_required — the new
-            # holder still has to bounce the resource before use (msg-1183 D-6'e). This mirrors
-            # the automated revoke path so there is one contract for "you just took a lease
-            # from someone else."
+            # Reclaim-duty policy on a grant (msg-1876 blocker correction):
+            #   - Overwriting a LIVE different holder → new holder inherits reclaim duty
+            #     (msg-1183 D-6'e). This mirrors the automated revoke path so there is one
+            #     contract for "you just took a lease from someone else."
+            #   - Empty-holder grant (previous -Clear or Phase-2 'released' left the record
+            #     with holder=null AND reclaim_required=true) → PRESERVE the prior flag +
+            #     `reclaimed_from`. Erasing them would fire a new holder blindly on top of
+            #     the physically-lingering session — the exact silent collision this
+            #     mechanism exists to end. Mirrors Invoke-LeaseGrantFromEmpty's semantics
+            #     (lib/Lease.ps1 round 5).
+            #   - Same-holder re-grant (idempotent) → preserve existing state; the operator's
+            #     re-grant does not cancel prior reclaim duty.
+            $inheritedDirty = $false
+            $inheritedFrom = $null
             if ($priorHolder -and $priorHolder -ne $To) {
                 $lease['reclaimed_from']   = $priorHolder
                 $lease['reclaim_required'] = $true
+                $inheritedDirty = $true
+                $inheritedFrom = $priorHolder
             }
             else {
-                $lease['reclaim_required'] = $false
+                # Do NOT touch reclaim_required / reclaimed_from — preserve whatever was there
+                # (true from a prior -Clear, or false from a clean state). Fall back to false
+                # only if the record was hand-edited to omit the field entirely.
+                if (-not $lease.ContainsKey('reclaim_required')) { $lease['reclaim_required'] = $false }
+                if ($lease.ContainsKey('reclaim_required') -and [bool]$lease['reclaim_required']) {
+                    $inheritedDirty = $true
+                    $inheritedFrom = if ($lease.ContainsKey('reclaimed_from')) { "$($lease['reclaimed_from'])" } else { '' }
+                }
             }
             $lease['revoked_at']        = $nowIso
             $lease['revoked_reason']    = "operator-grant: $Reason"
@@ -137,8 +161,17 @@ switch ($PSCmdlet.ParameterSetName) {
 
         $mode = if ($Pin) { 'pinned' } else { 'unpinned' }
         Write-Host "granted:  $Resource -> $To ($mode)"
-        if ($priorHolder -and $priorHolder -ne $To) {
-            Write-Host "reclaimed from: $priorHolder (reclaim_required=true — new holder must restart the resource before use)"
+        if ($inheritedDirty) {
+            # Immediate console warning at operator time — the wrapper's next-tick probe will
+            # also fire an operator-inbox notification (dedup key __lease_reclaim_acquire__/
+            # <resource>, signature "$holder@$generation"), but the operator running this
+            # script sees the console line first. Two paths, one narrative: "reclaim duty
+            # inherited from <someone>." (msg-1876 blocker: preserve + surface.)
+            $fromLabel = if ($inheritedFrom) { $inheritedFrom } else { '<unknown — no reclaimed_from on record>' }
+            Write-Warning ("WARNING: lease $Resource carried reclaim_required=true into this grant " +
+                          "(inherited from $fromLabel). $To MUST restart the physical resource " +
+                          "(e.g. the editor / bridge session) before use — v1 is scheduling only, " +
+                          "so a lingering old session is not killed by this script.")
         }
     }
     'Clear' {
