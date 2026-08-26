@@ -36,13 +36,17 @@
 #     "reclaimed_from":    null,       # who the current holder took the lease from (audit)
 #     "reclaimed_at":      null,       # WHEN the current reclamation happened  (permanent audit)
 #     "reclaimed_reason":  null,       # WHY  the current reclamation happened  (permanent audit,
-#                                      #   e.g. "operator-clear: PIE crashed", "operator-grant:
+#                                      #   e.g. "human-clear: PIE crashed", "human-grant:
 #                                      #   emergency", or "idle" for the automatic TTL path).
 #                                      #   PAIRED WITH `reclaimed_from`. Set on every write that
-#                                      #   changes ownership (promotion/release/operator-grant/
-#                                      #   operator-clear); NEVER touched by transient state-machine
+#                                      #   changes ownership (promotion/release/human-grant/
+#                                      #   human-clear); NEVER touched by transient state-machine
 #                                      #   transitions (progress-clear-of-expiring, empty-drain,
 #                                      #   idempotent self-acquire). The digest reads this.
+#                                      #   The `human-*` prefixes name the `human` role from the
+#                                      #   role registry (ADR-2026-05-29-10) rather than the
+#                                      #   invented `operator` lane the earlier rounds used —
+#                                      #   msg-2072 correction.
 #     "reclaim_required":  false,      # new holder MUST restart the resource before use
 #     "revoked_at":        null,       # transient Phase-1 intent (mark-expiring) — see below
 #     "revoked_reason":    null,       # transient Phase-1 intent — CLEARED on progress, on Phase-2
@@ -290,11 +294,13 @@ function New-LeaseRecord {
 
     .PARAMETER ReclaimedReason
         Free-text audit paired with `ReclaimedFrom`. Callers set this to describe WHY the
-        reclamation happened ("operator-clear: PIE crashed", "operator-grant: emergency", or
-        "idle" for the automatic TTL path). Read by the digest (Get-LeaseSummaryLines).
-        Separate from `revoked_reason` on purpose (see file-header split rationale, msg-1900):
-        this field is PERMANENT audit; `revoked_reason` is TRANSIENT Phase-1 intent that gets
-        cleared on progress. Default $null.
+        reclamation happened ("human-clear: PIE crashed", "human-grant: emergency", or
+        "idle" for the automatic TTL path). The `human-*` prefixes name the `human` role from
+        the role registry (ADR-2026-05-29-10) — the actor that invokes Grant-Lease.ps1 — rather
+        than an invented `operator` category (msg-2072 correction).
+        Read by the digest (Get-LeaseSummaryLines). Separate from `revoked_reason` on purpose
+        (see file-header split rationale, msg-1900): this field is PERMANENT audit;
+        `revoked_reason` is TRANSIENT Phase-1 intent that gets cleared on progress. Default $null.
 
     .PARAMETER Queue
         The current queue array to preserve (or $null for empty).

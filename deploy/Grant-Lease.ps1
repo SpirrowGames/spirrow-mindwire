@@ -1,30 +1,33 @@
 #!/usr/bin/env pwsh
-# deploy/Grant-Lease.ps1 — operator override for the exclusive-resource lease + queue
+# deploy/Grant-Lease.ps1 — human Tier-C override for the exclusive-resource lease + queue
 # (T-exclusive-resource-lease-queue, msg-1183 D-7).
 #
 # WHY THIS SCRIPT EXISTS. The sweep grants leases automatically (FIFO from the queue, msg-1183
 # D-3) and reclaims them from a starved holder after $LeaseIdleTtl (msg-1183 D-6', msg-1187
 # §5-4). Those two paths cover the common case. What they don't cover:
 #
-#   1. A HUMAN OVERRIDE. Takahito can decide "I want the editor on Thread X right now, regardless
-#      of the queue" — msg-923 requirements: "Tier-C の割当を上書きできる（人が明示的に「今はこ
-#      のスレ」と言えば機構がそれに従う）". Pre-mechanism this was a hand-written line in a Tier-C
-#      decision message; this script is the machine equivalent.
+#   1. A HUMAN TIER-C OVERRIDE. Takahito can decide "I want the editor on Thread X right now,
+#      regardless of the queue" — msg-923 requirements: "Tier-C の割当を上書きできる（人が明示的に
+#      「今はこのスレ」と言えば機構がそれに従う）". Pre-mechanism this was a hand-written line in
+#      a Tier-C decision message; this script is the machine equivalent.
 #
-#      TERMINOLOGY NOTE (unresolved, msg-1876 + msg-1877 non-blocking pointers). This file
-#      names the invocation lane "operator" (revoked_reason prefixes `operator-grant:` /
-#      `operator-clear:`). Two ADRs are relevant but I have not read either body (index/title
-#      only, per OBL-DECLARE-UNREADABLE + OBL-ADR-CITATION-WEIGHT):
-#        - ADR-2026-05-29-10 (role registry).
-#        - ADR-2026-05-27-09 (4-layer identity model: identity_name / independence_class /
-#          role / embodiment as orthogonal layers).
-#      The msg-1877 naysayer correctly flagged that my previous rewrite of this note conflated
-#      identity and role by calling "human" "the identity" — treating them as one layer when
-#      the ADR-27-09 title explicitly separates them. The correct cross-check therefore has
-#      TWO independent questions: (a) does the role layer forbid "operator" as a distinct role
-#      value; (b) does the identity_name layer forbid it as a distinct identity value. Without
-#      the ADR bodies I cannot answer either, so I record both as open follow-ups rather than
-#      guess — an incomplete report is better than a confident wrong one.
+#      TERMINOLOGY (msg-2072 correction, superseding rounds 7-8 defer). The actor here is the
+#      `human` role — one of the seven roles the role-registry ADR (ADR-2026-05-29-10) names in
+#      its index title: `proposer / reviewer / implementer / integrator / dogfooder / naysayer
+#      / human`. Rounds 7-8 of this PR review speculatively invented an `operator` lane and
+#      wrote it into audit prefixes (`operator-grant:` / `operator-clear:`). msg-2072 (Einstein)
+#      correctly flagged that as a rogue 8th role that silently fractures the identity model —
+#      the ADR-INDEX title's enumeration is title-content I CAN read, and OBL-ADR-CITATION-WEIGHT's
+#      "titles are not requirements" rule does not license inventing new identity categories
+#      when the title explicitly enumerates the space. Round 15 (msg-2072 fix): audit prefixes
+#      changed to `human-grant:` / `human-clear:`; this header speaks of "the human" invoking
+#      the script rather than "the operator". The ADR-2026-05-27-09 4-layer identity model
+#      (identity_name / independence_class / role / embodiment as orthogonal layers) is still
+#      unreadable to me; I therefore restrict my claim to the role layer only — this script is
+#      invoked by the `human` role — and make no claim about how that role maps onto the other
+#      three layers. The invocation LANE (operator's typing at a shell prompt vs. an automated
+#      MCP call) is a runtime detail; the ROLE (`human`) is what the identity model cares about
+#      and is what appears in audit strings that outlive the invocation.
 #
 #   2. A PIN. A grant that MUST NOT be auto-reclaimed even after idle TTL — a legitimately long
 #      PIE turn where the holder is deliberately paused. msg-1183 D-7. The lease's `pinned=true`
@@ -155,7 +158,7 @@ switch ($PSCmdlet.ParameterSetName) {
             if ($priorHolder -and $priorHolder -ne $To) {
                 $lease['reclaimed_from']    = $priorHolder
                 $lease['reclaimed_at']      = $nowIso
-                $lease['reclaimed_reason']  = "operator-grant: $Reason"
+                $lease['reclaimed_reason']  = "human-grant: $Reason"
                 $lease['reclaim_required']  = $true
                 $inheritedDirty = $true
                 $inheritedFrom = $priorHolder
@@ -216,13 +219,13 @@ switch ($PSCmdlet.ParameterSetName) {
         $lease['pinned']            = $false
         $lease['expiring']          = $false
         # PERMANENT audit paired with `reclaimed_from`. `reclaimed_reason` is what the digest
-        # reads — its narrative ("operator-clear: <op-provided text>") survives any subsequent
+        # reads — its narrative ("human-clear: <op-provided text>") survives any subsequent
         # state-machine transition (progress, drain-from-empty, self-hold re-acquire) that
         # would otherwise clear a transient field. See lib/Lease.ps1 file-header split
         # rationale (msg-1900).
         $lease['reclaimed_from']    = $priorHolder
         $lease['reclaimed_at']      = $nowIso
-        $lease['reclaimed_reason']  = "operator-clear: $Reason"
+        $lease['reclaimed_reason']  = "human-clear: $Reason"
         $lease['reclaim_required']  = $true
         # `revoked_*` are TRANSIENT Phase-1 intent (msg-1900 split). An operator Clear
         # supersedes any pending Phase-1 intent from an earlier probe cycle, so clear them.

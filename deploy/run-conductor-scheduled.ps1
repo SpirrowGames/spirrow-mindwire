@@ -2698,10 +2698,11 @@ try {
                         Resource       = $requiredResource
                         ReclaimedFrom  = if ($existing.ContainsKey('reclaimed_from')) { "$($existing['reclaimed_from'])" } else { '' }
                         # msg-1900 split: prefer the PERMANENT `reclaimed_reason` (paired with
-                        # reclaimed_from; carries operator-clear / operator-grant text). Fall
-                        # back to legacy `revoked_reason` for one release cycle in case any
-                        # on-disk record still has the old shape. Final fallback 'idle' matches
-                        # the digest's default.
+                        # reclaimed_from; carries human-clear / human-grant text — msg-2072
+                        # renamed the prefixes from the invented `operator-*` back to the
+                        # ADR-registered `human` role). Fall back to legacy `revoked_reason`
+                        # for on-disk records written before the msg-1900 split. Final fallback
+                        # 'idle' matches the digest's default.
                         RevokedReason  = if ($existing.ContainsKey('reclaimed_reason') -and $existing['reclaimed_reason']) { "$($existing['reclaimed_reason'])" }
                                          elseif ($existing.ContainsKey('revoked_reason') -and $existing['revoked_reason']) { "$($existing['revoked_reason'])" }
                                          else { 'idle' }
