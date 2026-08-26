@@ -2470,7 +2470,7 @@ try {
     $newlyQuarantined = 0      # non-zero exits this tick
     $notReached = 0            # candidates the sweep never got to (K-cap, worked-and-broke)
     $sweepSignature = @()
-    $dispositions = @{}        # key -> "worked" | "no-work" | "head-skipped" | "head-deferred" | "quarantined-skipped" | "held" | "lease-waiting" | "not-reached" | "failed" | "undeclared" | "report-launch"
+    $dispositions = @{}        # key -> "worked" | "no-work" | "head-skipped" | "head-deferred" | "quarantined-skipped" | "held" | "lease-waiting" | "lease-lost" | "not-reached" | "failed" | "undeclared" | "report-launch"
     $breakReason = $null       # human-readable reason for a mid-sweep break, or $null if it ran to end
 
     # Stop reasons that need Takahito. Mirrors StopReason in conductor/core.py — `human` plus every
@@ -2675,6 +2675,53 @@ try {
                               "旧: $($dirty.ReclaimedFrom) → 新: $($cand.key) (reason=$($dirty.RevokedReason))。" +
                               "reclaim_required — 新側は使用前にリソースの再起動が必要です " +
                               "(v1 は scheduling で enforcement ではないため、旧側が自力で起動する可能性は残ります)。")
+            }
+
+            # DURABILITY: persist the acquire (plus any earlier probe mutations for this
+            # resource) to disk BEFORE spawning. Rationale (msg-1877 blocker): Invoke-LeaseAcquire
+            # mutates $leasesState in memory only. The end-of-tick flush (line ~2743) is many
+            # minutes after the spawn returns. If the sweep is OS-killed after the spawn started
+            # a physical editor session but before end-of-tick flush, leases.json on disk still
+            # shows the pre-tick state — a free lease — and next tick another candidate finds
+            # it free and boots a second editor session over the first. That is the exact silent
+            # collision this whole mechanism was built to prevent. The pre-spawn flush closes the
+            # window: the acquire is durable on disk before commit-launch and before spawn.
+            #
+            # Uses the same generation-based optimistic-concurrency merger as end-of-tick, so a
+            # concurrent operator Grant mid-sweep is not clobbered — instead, the merger lets
+            # disk win for the affected resource (round 4 semantics), and the re-check below
+            # detects the override and bails without spawning.
+            $preSpawnMerged = Merge-LeasesStateForWrite -Memory $leasesState `
+                -OriginalGenerations $leasesOriginalGenerations -DiskPath $leasesStatePath
+            Save-JsonState -Path $leasesStatePath -State $preSpawnMerged
+            # Adopt the merged state as our new baseline: if operator wrote during the acquire
+            # window, we now believe what the merger settled on. Refresh $leasesOriginalGenerations
+            # too so the end-of-tick merge does not re-detect the same generation moves.
+            $leasesState = ConvertTo-LeasesStateHashtable $preSpawnMerged
+            $leasesOriginalGenerations = Get-LeaseGenerations -LeasesState $leasesState
+
+            # Re-check: did OUR acquire actually land on disk for every required resource?
+            # If a concurrent operator Grant mid-sweep won the generation race for any of
+            # them, the merger just replaced our in-memory holder with the operator's choice.
+            # Spawning in that state would collide with the operator's chosen holder on the
+            # same physical resource — the very failure the durability flush was meant to
+            # prevent. Bail with a distinct disposition; head_skip's baseline is NOT bumped
+            # because we have not called Invoke-HeadSkipCommitLaunch yet, so this candidate
+            # stays eligible on the next tick without accumulating backoff (same rationale
+            # as the lease-waiting bail, round 2 §9).
+            $stolenList = @()
+            foreach ($resource in $cand.requires) {
+                $curHolder = if ($leasesState.ContainsKey($resource) -and $null -ne $leasesState[$resource]) { "$($leasesState[$resource]['holder'])" } else { '' }
+                if ($curHolder -ne $cand.key) {
+                    $stolenList += "${resource}=$curHolder"
+                }
+            }
+            if ($stolenList.Count -gt 0) {
+                Confirm-LogWorthKeeping
+                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — lease lost to concurrent operator write on [$($stolenList -join ', ')], not launching (commit-launch NOT called — baseline preserved so next tick re-evaluates cleanly)"
+                $dispositions[$cand.key] = 'lease-lost'
+                $skipped++
+                continue
             }
         }
         $commitPayload = if ($v.PSObject.Properties.Name -contains 'commit_launch_payload') { $v.commit_launch_payload } else { $null }

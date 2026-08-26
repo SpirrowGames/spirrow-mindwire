@@ -978,6 +978,72 @@ $reclaimAcquireLineRegions = [regex]::Matches(
 # style, no time-varying material.
 Check "no __lease_reclaim_acquire__ signature uses tick-varying nowUtc.ToString (cross-tick dedup)" 0 $reclaimAcquireLineRegions.Count
 
+# --- 17. Wrapper AST wiring — pre-spawn lease durability flush (msg-1877 blocker) ---------------
+#
+# Regression pin: Invoke-LeaseAcquire only mutates $leasesState in memory. Without a durable
+# flush BEFORE Invoke-HeadSkipCommitLaunch (and BEFORE the actual spawn), an OS-level kill
+# after a physical session started but before end-of-tick would leave leases.json on disk
+# without our holder — next tick another candidate finds the lease free and boots a second
+# session over the first. This test pins that (a) Merge-LeasesStateForWrite is called at
+# LEAST TWICE (mid-candidate-loop pre-spawn + end-of-tick), (b) at least one of those calls
+# appears at a source line BEFORE the first Invoke-HeadSkipCommitLaunch call site (the
+# pre-spawn one), and (c) the 'lease-lost' disposition string exists so the bail-on-override
+# path is present in the source.
+Write-Host "Wrapper AST wiring — pre-spawn lease durability flush precedes commit-launch (msg-1877 blocker)"
+
+$mergeLeaseCalls2 = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Merge-LeasesStateForWrite'
+    }, $true))
+CheckTrue "wrapper calls Merge-LeasesStateForWrite at least twice (pre-spawn + end-of-tick)" ($mergeLeaseCalls2.Count -ge 2)
+
+$commitLaunchCalls2 = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Invoke-HeadSkipCommitLaunch'
+    }, $true))
+if ($mergeLeaseCalls2.Count -eq 0 -or $commitLaunchCalls2.Count -eq 0) {
+    $script:failures++
+    Write-Host "  FAIL  either Merge-LeasesStateForWrite or Invoke-HeadSkipCommitLaunch call missing"
+}
+else {
+    $firstCommitLine2 = ($commitLaunchCalls2 | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]
+    $mergesBeforeCommit = @($mergeLeaseCalls2 | Where-Object { $_.Extent.StartLineNumber -lt $firstCommitLine2 })
+    if ($mergesBeforeCommit.Count -ge 1) {
+        Write-Host "  PASS  at least one Merge-LeasesStateForWrite (line $($mergesBeforeCommit[0].Extent.StartLineNumber)) precedes Invoke-HeadSkipCommitLaunch (line $firstCommitLine2) — pre-spawn flush wired"
+    }
+    else {
+        $script:failures++
+        Write-Host "  FAIL  no Merge-LeasesStateForWrite call precedes Invoke-HeadSkipCommitLaunch — lease acquire is not durably flushed before spawn"
+    }
+}
+
+# The lease-lost disposition is the observable trace of an operator-override bail. Pin its
+# presence so a future refactor cannot silently drop the bail branch (which would spawn even
+# after our acquire was overridden mid-sweep — the exact silent collision).
+$leaseLostLiterals = @($stringConsts | Where-Object { $_.Value -eq 'lease-lost' })
+CheckTrue "wrapper has the 'lease-lost' disposition string (operator-override bail wired)" ($leaseLostLiterals.Count -ge 1)
+
+# Also require Save-JsonState with -Path referencing $leasesStatePath to appear before the
+# first commit-launch. This closes a loophole where someone merges but forgets to save.
+$saveJsonCalls = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Save-JsonState'
+    }, $true))
+$preSpawnSaveFound = $false
+foreach ($c in $saveJsonCalls) {
+    if ($c.Extent.StartLineNumber -ge $firstCommitLine2) { continue }
+    foreach ($el in $c.CommandElements) {
+        if ($el -is [System.Management.Automation.Language.VariableExpressionAst] -and $el.VariablePath.UserPath -eq 'leasesStatePath') {
+            $preSpawnSaveFound = $true; break
+        }
+    }
+    if ($preSpawnSaveFound) { break }
+}
+CheckTrue "Save-JsonState -Path \$leasesStatePath appears before Invoke-HeadSkipCommitLaunch (durable flush persisted)" $preSpawnSaveFound
+
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "lease gate: all checks passed"
