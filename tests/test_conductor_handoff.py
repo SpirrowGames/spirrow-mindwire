@@ -15,6 +15,7 @@ from spirrow_mindwire.conductor.handoff import (
     TIER_C_LABELS,
     Handoff,
     HandoffKind,
+    MismatchReason,
     build_handoff_protocol_block,
     parse_next_token,
     resolve_handoff,
@@ -474,7 +475,12 @@ class TestTierCLabelLookback:
 #   2. field=None,     body has NEXT      → follow body  (pre-Layer-3 fallback)
 #   3. field=<target>, body no NEXT       → follow field, NO event  ← msg-1438's silent quadrant
 #   4. field=<target>, body agrees        → follow field, NO event
-#   5. field=<target>, body disagrees     → HUMAN + field_mismatch=True (safety valve)
+#   5. field=<target>, body disagrees     → HUMAN + mismatch_reason=TARGET_DIVERGENCE (safety valve)
+#
+# T-reconcile-field-mismatch-flag-overloaded (naysayer msg-1788 "Weakest point"): the escalation
+# in row 5 shares its routing verdict with the field-unresolvable safety-valve below, but the
+# CAUSE differs — split into two reason codes on ``Handoff.mismatch_reason`` so a programmatic
+# consumer can tell them apart without duplicating the resolver. The tests below pin both codes.
 #
 # Row 3 is the exact quadrant that stalled the loop for 2 days: a judgement-page decide carried
 # ``next_participant: "human"`` but wrote no ``NEXT:`` line in the body. The consumer resolved
@@ -491,7 +497,7 @@ class TestNextParticipantFieldConsumer:
         # the conductor's Obj3 path, not by this resolver).
         h = resolve_handoff("just a body\nno handoff at all", _ROSTER)
         assert h.kind is HandoffKind.ABSENT
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
         assert h.mismatch_body_token is None
 
     def test_row2_no_field_body_next_follows_body(self) -> None:
@@ -500,7 +506,7 @@ class TestNextParticipantFieldConsumer:
         h = resolve_handoff("thinking...\n\nNEXT: Bohr", _ROSTER)
         assert h.kind is HandoffKind.ROLE
         assert h.identity == "Bohr"
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
 
     def test_row2_explicit_none_field_is_treated_as_absent_field(self) -> None:
         # A magickit that ships `next_participant: null` states the same fact as omitting the key
@@ -511,7 +517,7 @@ class TestNextParticipantFieldConsumer:
             h = resolve_handoff(body, _ROSTER, next_participant=empty)
             assert h.kind is HandoffKind.ROLE, repr(empty)
             assert h.identity == "Bohr", repr(empty)
-            assert h.field_mismatch is False, repr(empty)
+            assert h.mismatch_reason is None, repr(empty)
 
     def test_row3_field_present_body_absent_follows_field_quietly(self) -> None:
         # msg-1438's silent quadrant: judgement-page decide carries the field but no body NEXT.
@@ -521,7 +527,7 @@ class TestNextParticipantFieldConsumer:
         body = "approved for implementation."
         h = resolve_handoff(body, _ROSTER, next_participant="human")
         assert h.kind is HandoffKind.HUMAN
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
         assert h.mismatch_body_token is None
 
     def test_row3_field_routes_a_persona_when_body_has_no_next(self) -> None:
@@ -531,7 +537,7 @@ class TestNextParticipantFieldConsumer:
         assert h.kind is HandoffKind.ROLE
         assert h.identity == "Einstein"
         assert h.role is Role.NAYSAYER
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
 
     def test_row4_field_and_body_agree_follows_field_quietly(self) -> None:
         # The cooperative case: an author wrote a NEXT: line AND set the field, and they agree.
@@ -539,7 +545,7 @@ class TestNextParticipantFieldConsumer:
         h = resolve_handoff("reply\n\nNEXT: Bohr", _ROSTER, next_participant="Bohr")
         assert h.kind is HandoffKind.ROLE
         assert h.identity == "Bohr"
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
 
     def test_row4_agreement_is_case_insensitive_on_the_identity(self) -> None:
         # Roster lookup canonicalises `einstein` → `Einstein` on both sides, so agreement is
@@ -548,56 +554,94 @@ class TestNextParticipantFieldConsumer:
         h = resolve_handoff("reply\n\nNEXT: einstein", _ROSTER, next_participant="Einstein")
         assert h.kind is HandoffKind.ROLE
         assert h.identity == "Einstein"
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
 
     def test_row4_human_sentinel_agreement(self) -> None:
         h = resolve_handoff("done\n\nNEXT: human", _ROSTER, next_participant="human")
         assert h.kind is HandoffKind.HUMAN
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
 
-    def test_row5_mismatch_escalates_to_human_with_mismatch_flag(self) -> None:
+    def test_row5_mismatch_escalates_to_human_with_target_divergence_reason(self) -> None:
         # The safety valve: field says Einstein, body says Bohr. Neither wins the routing — the
         # turn is escalated to the human and the divergence is flagged so the conductor can log
         # it as observability. The `token` records what the FIELD said (the authoritative
         # decision on the wire), `mismatch_body_token` records what the body's fallback would
-        # have routed to.
+        # have routed to. Both sides RESOLVED — the reason is TARGET_DIVERGENCE, not the
+        # field-unresolvable code, so a programmatic consumer that counts "writer drift" reads
+        # exactly this case and no other.
         h = resolve_handoff("reply\n\nNEXT: Bohr", _ROSTER, next_participant="Einstein")
         assert h.kind is HandoffKind.HUMAN
-        assert h.field_mismatch is True
+        assert h.mismatch_reason is MismatchReason.TARGET_DIVERGENCE
         assert h.token == "Einstein"
         assert h.mismatch_body_token == "Bohr"
 
     def test_row5_mismatch_body_pr_review_vs_field_persona(self) -> None:
         # A body pr-review sentinel and a field persona are different targets → mismatch → human.
+        # Both sides resolved cleanly, so the reason is TARGET_DIVERGENCE.
         h = resolve_handoff(
             "opened it\n\nNEXT: pr-review acme/widgets#7",
             _ROSTER,
             next_participant="Bohr",
         )
         assert h.kind is HandoffKind.HUMAN
-        assert h.field_mismatch is True
+        assert h.mismatch_reason is MismatchReason.TARGET_DIVERGENCE
         assert h.token == "Bohr"
         assert h.mismatch_body_token == "acme/widgets#7"
 
-    def test_row5_field_pointing_at_unknown_participant_escalates(self) -> None:
+    def test_row5_field_pointing_at_unknown_participant_escalates_as_unresolvable(self) -> None:
         # A field value that fails to resolve to any known participant (unknown token / not a
-        # sentinel) is treated as a mismatch: escalate to human. The write side is supposed to
+        # sentinel) is treated as an escalation: route to human. The write side is supposed to
         # reject such a field with NextParticipantUnknownError; making the read side loud is the
         # fail-safe for the case a bad field slipped past write-side validation (§3-3 escape hatch
         # is "drop field and re-send", which a mismatch-to-human turn asks the human to do).
+        #
+        # T-reconcile-field-mismatch-flag-overloaded: this is FIELD_UNRESOLVABLE, NOT
+        # TARGET_DIVERGENCE — the remedy is on the write side (a missing NextParticipantUnknownError
+        # rejection), not the writer's target choice. The two used to share the ``field_mismatch``
+        # bool in PR #184, which meant a dashboard counting "writer named two things" also counted
+        # "writer sent garbage" and could not tell them apart. Splitting the reason fixes that.
         h = resolve_handoff("done\n\nNEXT: Bohr", _ROSTER, next_participant="Schrodinger")
         assert h.kind is HandoffKind.HUMAN
-        assert h.field_mismatch is True
+        assert h.mismatch_reason is MismatchReason.FIELD_UNRESOLVABLE
         assert h.token == "Schrodinger"
         assert h.mismatch_body_token == "Bohr"
 
+    def test_field_unresolvable_fires_even_when_body_is_also_absent(self) -> None:
+        # §3 of Bohr's revised design: the ABSENT-field branch fires regardless of whether the
+        # body resolved or not (the branch checks only ``field_handoff.kind is ABSENT``). Pin
+        # both sub-cases: body resolved AND body absent both escalate under the same reason code,
+        # because the CAUSE (write-side garbage in the field) is the same.
+        with_body = resolve_handoff("done\n\nNEXT: Bohr", _ROSTER, next_participant="Schrodinger")
+        assert with_body.mismatch_reason is MismatchReason.FIELD_UNRESOLVABLE
+        assert with_body.mismatch_body_token == "Bohr"
+
+        no_body = resolve_handoff("no next line", _ROSTER, next_participant="Schrodinger")
+        assert no_body.kind is HandoffKind.HUMAN
+        assert no_body.mismatch_reason is MismatchReason.FIELD_UNRESOLVABLE
+        assert no_body.mismatch_body_token is None  # body's fallback resolved to ABSENT (no token)
+
     def test_row5_disagreement_between_sentinels_escalates(self) -> None:
         # Body says NEXT: none (settled), field says human. The kinds differ, so this is a
-        # mismatch: escalate to human with the flag set.
+        # mismatch: escalate to human. Both sides resolved to valid targets, so the reason is
+        # TARGET_DIVERGENCE.
         h = resolve_handoff("done\n\nNEXT: none", _ROSTER, next_participant="human")
         assert h.kind is HandoffKind.HUMAN
-        assert h.field_mismatch is True
+        assert h.mismatch_reason is MismatchReason.TARGET_DIVERGENCE
         assert h.mismatch_body_token == "none"
+
+    def test_every_mismatch_branch_still_routes_to_human(self) -> None:
+        # Regression pin: the whole point of splitting the reason is that ROUTING is unchanged.
+        # No matter which reason code fires, both branches must return kind=HUMAN — the
+        # observability changes, the safety valve does not. This test would fail loudly if a
+        # future edit repurposed one branch to route somewhere else.
+        divergence = resolve_handoff("reply\n\nNEXT: Bohr", _ROSTER, next_participant="Einstein")
+        unresolvable = resolve_handoff(
+            "done\n\nNEXT: Bohr", _ROSTER, next_participant="Schrodinger"
+        )
+        assert divergence.kind is HandoffKind.HUMAN
+        assert unresolvable.kind is HandoffKind.HUMAN
+        # And the reasons are actually distinct — if they weren't, the split is a no-op.
+        assert divergence.mismatch_reason is not unresolvable.mismatch_reason
 
     def test_no_second_grammar_is_introduced_for_the_lint(self) -> None:
         # §3-2: "lint は新しい文法を持たない — フォールバックの resolver をそのまま使う". The lint's
@@ -628,7 +672,7 @@ class TestNextParticipantFieldConsumer:
         ):
             h = resolve_handoff(body, _ROSTER)
             assert h.kind is expected_kind, body
-            assert h.field_mismatch is False, body
+            assert h.mismatch_reason is None, body
             assert h.mismatch_body_token is None, body
 
 
@@ -656,7 +700,7 @@ class TestNextParticipantFieldPrReviewSentinel:
         )
         assert h.kind is HandoffKind.PR_REVIEW
         assert h.token == "acme/widgets#7"
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
         assert h.mismatch_body_token is None
 
     def test_field_pr_review_accepts_a_pr_url_and_normalises_to_the_slug(self) -> None:
@@ -678,19 +722,19 @@ class TestNextParticipantFieldPrReviewSentinel:
         )
         assert h.kind is HandoffKind.PR_REVIEW
         assert h.token == "acme/widgets#7"
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
 
     def test_field_pr_review_disagrees_with_body_pr_review_on_different_ref(self) -> None:
         # Row 5, PR-gate variant: both sides asked for the gate but named different PRs. This is
         # a genuine divergence (someone typed the wrong number in one place) → escalate to human
-        # with the flag set, and record what BOTH sides said so the divergence is loud.
+        # with TARGET_DIVERGENCE, and record what BOTH sides said so the divergence is loud.
         h = resolve_handoff(
             "opened it.\n\nNEXT: pr-review acme/widgets#8",
             _ROSTER,
             next_participant="pr-review acme/widgets#7",
         )
         assert h.kind is HandoffKind.HUMAN
-        assert h.field_mismatch is True
+        assert h.mismatch_reason is MismatchReason.TARGET_DIVERGENCE
         assert h.token == "acme/widgets#7"
         assert h.mismatch_body_token == "acme/widgets#8"
 
@@ -698,14 +742,15 @@ class TestNextParticipantFieldPrReviewSentinel:
         # Row 5, mixed kinds: field says gate this PR, body says hand to Bohr. Different
         # targets → escalate. Mirror of test_row5_mismatch_body_pr_review_vs_field_persona
         # (which pinned the reverse: body pr-review vs field persona) so both directions are
-        # symmetric under §3-2 (the same resolver on both sides).
+        # symmetric under §3-2 (the same resolver on both sides). Both sides resolved, so the
+        # reason is TARGET_DIVERGENCE.
         h = resolve_handoff(
             "reply.\n\nNEXT: Bohr",
             _ROSTER,
             next_participant="pr-review acme/widgets#7",
         )
         assert h.kind is HandoffKind.HUMAN
-        assert h.field_mismatch is True
+        assert h.mismatch_reason is MismatchReason.TARGET_DIVERGENCE
         assert h.token == "acme/widgets#7"
         assert h.mismatch_body_token == "Bohr"
 
@@ -715,18 +760,19 @@ class TestNextParticipantFieldPrReviewSentinel:
         # escalation before the fix.
         h = resolve_handoff("", _ROSTER, next_participant="pr-review acme/widgets#7")
         assert h.kind is HandoffKind.PR_REVIEW
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
 
     def test_field_pr_review_bare_word_without_operand_is_absent(self) -> None:
         # Symmetric with the body path: ``pr-review`` alone is not the sentinel. The body path
         # falls through to the participant matcher, which sees it as an unknown persona and
         # returns ABSENT. On the field side we do the same, which _reconcile then turns into
-        # a row-5 mismatch (safety valve) — the sender wrote a partial directive and we do
-        # NOT silently swallow it.
+        # a FIELD_UNRESOLVABLE escalation (safety valve) — the sender wrote a partial directive
+        # and we do NOT silently swallow it. Reason is FIELD_UNRESOLVABLE, not TARGET_DIVERGENCE,
+        # because the FIELD side is what failed to resolve — the same distinction the
+        # ``Schrodinger`` case above depends on.
         h = resolve_handoff("", _ROSTER, next_participant="pr-review")
-        # Field resolved to ABSENT → row-5 escalation with field_mismatch=True.
         assert h.kind is HandoffKind.HUMAN
-        assert h.field_mismatch is True
+        assert h.mismatch_reason is MismatchReason.FIELD_UNRESOLVABLE
 
     def test_field_pr_review_with_unparseable_ref_carries_operand_forward(self) -> None:
         # Symmetric with the body path: the sender asked for a gate; the ref is unparseable to
@@ -737,7 +783,7 @@ class TestNextParticipantFieldPrReviewSentinel:
         h = resolve_handoff("", _ROSTER, next_participant="pr-review not-a-real-ref")
         assert h.kind is HandoffKind.PR_REVIEW
         assert h.token == "not-a-real-ref"
-        assert h.field_mismatch is False
+        assert h.mismatch_reason is None
 
     def test_field_pr_review_vocabulary_matches_body(self) -> None:
         # §3-2 pin: "lint は新しい文法を持たない". A field ``pr-review <ref>`` and a body

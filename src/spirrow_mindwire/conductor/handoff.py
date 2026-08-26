@@ -184,6 +184,37 @@ class HandoffKind(StrEnum):
     ABSENT = "absent"  # no parseable NEXT (missing / unknown participant) → human fallback (Obj3)
 
 
+class MismatchReason(StrEnum):
+    """Why a Layer-3 field/body reconciliation escalated to ``HandoffKind.HUMAN``.
+
+    This is the split of the overloaded ``field_mismatch`` bool that the merged #184 shipped
+    (naysayer msg-1788 "Weakest point" / T-reconcile-field-mismatch-flag-overloaded). Both cases
+    make the same **routing** decision — escalate to the human — but their **causes** and
+    **remedies** are different, so a programmatic consumer (dashboard / alert / metric) that
+    reads only this field cannot conflate them into one number:
+
+    - ``TARGET_DIVERGENCE`` — Layer-3 §3-1 row 5. The field AND the body both resolved to a
+      valid target, but the two targets differ. This is a genuine **write-side drift**: two
+      places in the same message named different next actors, and the one measuring it wants
+      to see this counted (dashboard = "how often does the writer disagree with itself?").
+    - ``FIELD_UNRESOLVABLE`` — the field itself resolved to :attr:`HandoffKind.ABSENT`
+      (unknown persona, garbage like ``Schrodinger``, empty-after-trim junk that survived
+      write-side validation). The remedy is on the **write side**, not the writer's choice.
+      A dashboard that mixes this into "target_divergence" is measuring a bug in a different
+      component; the write-side validation gap (``NextParticipantUnknownError`` should have
+      caught it) is what needs fixing.
+
+    A programmatic consumer reads :attr:`Handoff.mismatch_reason` directly. The WARNING log
+    also carries this as ``reason=<name>`` so a human reader gets the same distinction from
+    a single log line without having to re-derive it from the raw tokens (which would mean
+    duplicating the resolver on the reader side and drifting from this module the moment
+    it changes).
+    """
+
+    TARGET_DIVERGENCE = "target_divergence"  # both sides resolved, they named different targets
+    FIELD_UNRESOLVABLE = "field_unresolvable"  # field value did not resolve to any known target
+
+
 # ---- C (T-human-terminal-overuse, human GO msg after Einstein ACCEPT msg-891) ---------------- #
 # TIER-C: <label> — a **non-blocking measurement tag** the author may place on the line
 # immediately above their `NEXT: human`, so the conductor can record what CLASS of Tier-C decision
@@ -257,14 +288,22 @@ class Handoff:
     otherwise routes exactly as it would without the tag. This field is a measurement label; it
     is NOT the definition of what Tier-C IS (that stays owned by ADR/Tier-C decides).
 
-    ``field_mismatch`` records the Layer-3 disagreement between a structured ``next_participant``
-    field on the message envelope and the body's own ``NEXT:`` line (Bohr msg-179 §3-1 row 5):
-    when both are present and they resolve to DIFFERENT targets, this Handoff carries
-    ``kind=HUMAN`` (safety valve: escalate that turn to the human) with ``field_mismatch`` set so
-    the conductor can record the divergence as an observability event without a second parser
-    (§3-2: the lint is exactly "did the fallback resolver disagree with the field?" — same
-    resolver on both sides). ``mismatch_body_token`` carries the body's parsed target (the token
-    the fallback would have gone to) so the mismatch event names what the two sides said.
+    ``mismatch_reason`` records **why** a Layer-3 field/body reconciliation escalated to
+    :attr:`HandoffKind.HUMAN` (Bohr msg-179 §3-1 row 5, and the ABSENT-field fail-safe).
+    ``None`` on every non-escalated path; otherwise a :class:`MismatchReason` value. The
+    two reasons — target divergence vs. an unresolvable field — make the same routing
+    decision (escalate that turn to the human, safety valve) but come from different
+    causes and take different remedies, so a programmatic consumer reads them apart from
+    this field rather than re-deriving the distinction from the raw tokens
+    (T-reconcile-field-mismatch-flag-overloaded: PR #184's ``field_mismatch`` bool
+    conflated them, forcing any reader to duplicate the resolver to tell them apart).
+
+    ``mismatch_body_token`` carries the body's parsed target (the token the fallback would
+    have gone to) so the mismatch event names what the two sides said. It is ``None``
+    outside a mismatch escalation. Its cross-field consistency with ``mismatch_reason`` /
+    ``token`` is intentionally NOT enforced by the type: the invariant is inherited from
+    #184 and left as-is here (the scope of this change is the reason-code split, not the
+    surrounding token invariants — see PR body §「非目標」).
     """
 
     kind: HandoffKind
@@ -272,7 +311,7 @@ class Handoff:
     role: Role | None = None
     token: str | None = None
     tier_c_label: str | None = None
-    field_mismatch: bool = False
+    mismatch_reason: MismatchReason | None = None
     mismatch_body_token: str | None = None
 
 
@@ -368,15 +407,15 @@ def resolve_handoff(
     and the body's ``NEXT:`` line is used only as a **lint** against it — same resolver, no second
     parser (§3-2). The 5 quadrants of ``(field, body)`` and their outcomes:
 
-    ==============  ==============  ================================  =============================
-    field           body            routing                           side-effect
-    ==============  ==============  ================================  =============================
-    None            no NEXT         ABSENT (fallback)                  —
-    None            NEXT present    follow body (fallback)             —
-    present         no NEXT         follow field                       — (**quiet normal path**)
-    present         NEXT agrees     follow field                       —
-    present         NEXT disagrees  escalate: kind=HUMAN               ``field_mismatch=True``
-    ==============  ==============  ================================  =============================
+    ==============  ==============  ==============================  =========================
+    field           body            routing                         side-effect
+    ==============  ==============  ==============================  =========================
+    None            no NEXT         ABSENT (fallback)                —
+    None            NEXT present    follow body (fallback)           —
+    present         no NEXT         follow field                     — (**quiet normal path**)
+    present         NEXT agrees     follow field                     —
+    present         NEXT disagrees  escalate: kind=HUMAN             ``TARGET_DIVERGENCE``
+    ==============  ==============  ==============================  =========================
 
     Row 3 is msg-1438's silent quadrant: a judgement-page decide carries the field but no ``NEXT:``
     in the body, and the fallback resolver returns ABSENT. Without this wiring the consumer sees
@@ -384,12 +423,14 @@ def resolve_handoff(
     target — the exact silent 2-day stall this module now closes.
 
     A field value that itself fails to resolve (unknown persona, empty after trim, non-token
-    junk) is treated as though it disagreed with the body: the return is ``kind=HUMAN`` with
-    ``field_mismatch=True`` so the divergence is loud rather than a silent drop. The write side
-    (`chatroom_post_message`) is responsible for rejecting such fields with
+    junk) is treated as an escalation too: the return is ``kind=HUMAN`` with
+    ``mismatch_reason=FIELD_UNRESOLVABLE`` so the divergence is loud rather than a silent drop.
+    The write side (`chatroom_post_message`) is responsible for rejecting such fields with
     ``NextParticipantUnknownError`` — this read-side treatment is the fail-safe for the case a
     bad field slipped past validation (§3-3's escape hatch is "drop the field and re-send", which
-    a mismatch-to-human turn asks the human to do).
+    a mismatch-to-human turn asks the human to do). The two reason codes share the routing
+    verdict but not the cause: a programmatic consumer reads :attr:`Handoff.mismatch_reason` to
+    tell them apart without duplicating this resolver.
     """
     body_handoff = _resolve_body(body, roster)
     field_value = next_participant.strip() if next_participant is not None else ""
@@ -498,16 +539,27 @@ def _reconcile(field_handoff: Handoff, body_handoff: Handoff) -> Handoff:
 
     - Body ABSENT ⇒ field wins quietly (row 3: the silent quadrant that stalled msg-1438).
     - Same target on both sides ⇒ field wins quietly (row 4).
-    - Different targets ⇒ escalate the turn to the human with ``field_mismatch=True`` (row 5). The
-      body's target is preserved as ``mismatch_body_token`` so the caller's event names both sides.
-    - Field itself unresolvable ⇒ same escalation (a bad field survived write-side validation, or
+    - Different targets ⇒ escalate the turn to the human with
+      ``mismatch_reason=TARGET_DIVERGENCE`` (row 5). The body's target is preserved as
+      ``mismatch_body_token`` so the caller's event names both sides.
+    - Field itself unresolvable ⇒ same escalation, but with
+      ``mismatch_reason=FIELD_UNRESOLVABLE`` (a bad field survived write-side validation, or
       was posted by a client that skipped it; making it loud here is the fail-safe).
+
+    T-reconcile-field-mismatch-flag-overloaded (naysayer msg-1788 "Weakest point"): the two
+    escalations share the routing verdict (HUMAN) but come from different causes and take
+    different remedies. Merging them under a single ``field_mismatch=True`` bool (as PR #184
+    shipped) made any programmatic consumer duplicate the resolver to tell them apart — every
+    dashboard that counts "target divergence" would silently inflate by every unresolvable-field
+    event too. Splitting the reason into :class:`MismatchReason` puts one bit back that the
+    branch structure here already had (this function KNOWS which branch it took) but was
+    collapsing on the way out.
     """
     if field_handoff.kind is HandoffKind.ABSENT:
         return Handoff(
             HandoffKind.HUMAN,
             token=field_handoff.token,
-            field_mismatch=True,
+            mismatch_reason=MismatchReason.FIELD_UNRESOLVABLE,
             mismatch_body_token=body_handoff.token,
         )
     if body_handoff.kind is HandoffKind.ABSENT:
@@ -517,7 +569,7 @@ def _reconcile(field_handoff: Handoff, body_handoff: Handoff) -> Handoff:
     return Handoff(
         HandoffKind.HUMAN,
         token=field_handoff.token,
-        field_mismatch=True,
+        mismatch_reason=MismatchReason.TARGET_DIVERGENCE,
         mismatch_body_token=body_handoff.token,
     )
 
@@ -649,6 +701,7 @@ __all__ = [
     "TIER_C_LABELS",
     "Handoff",
     "HandoffKind",
+    "MismatchReason",
     "build_handoff_protocol_block",
     "parse_next_token",
     "resolve_handoff",

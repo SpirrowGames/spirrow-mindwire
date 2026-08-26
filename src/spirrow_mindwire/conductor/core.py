@@ -290,11 +290,18 @@ class Conductor:
             # BEFORE the routing decision below acts on the escalated kind. Recording is loud and
             # non-blocking — the turn still terminates at the human this round, exactly what the
             # truth table requires.
-            if handoff.field_mismatch:
+            #
+            # T-reconcile-field-mismatch-flag-overloaded: the reason is split into two codes so
+            # this log line is self-describing on its own (a human reader tells "the writer named
+            # two different targets" apart from "the writer put garbage in the field" without
+            # re-deriving it from the raw tokens, and a programmatic consumer counts them apart
+            # without duplicating :mod:`.handoff`'s resolver). Same escalation, different cause.
+            if handoff.mismatch_reason is not None:
                 logger.warning(
-                    "conductor next_participant field/body mismatch: msg=%s "
+                    "conductor next_participant field/body mismatch: msg=%s reason=%s "
                     "field=%r body_target=%r → escalating to human",
                     latest_msg_id,
+                    handoff.mismatch_reason.value,
                     handoff.token,
                     handoff.mismatch_body_token,
                 )
@@ -348,12 +355,12 @@ class Conductor:
                 assert stop_reason is not None  # _route always sets a reason when it stops
                 # Bohr msg-179 §6 invariant: a message that carries a non-null next_participant
                 # field cannot stop the conductor on NO_HANDOFF. The Layer-3 resolver rewrites
-                # every field-bearing case into ROLE / HUMAN / NONE / PR_REVIEW (mismatch and
-                # unresolvable-field both go to HUMAN with field_mismatch=True), so a
-                # NO_HANDOFF here implies the field was None / empty — the pre-Layer-3 path.
-                # This branch is structurally unreachable when the field is set; the assertion
-                # pins it that way so a future refactor of the resolver cannot silently re-open
-                # msg-1438's 2-day silent stall (§3-1 row 3).
+                # every field-bearing case into ROLE / HUMAN / NONE / PR_REVIEW (target
+                # divergence and unresolvable-field both go to HUMAN with a set
+                # ``mismatch_reason``), so a NO_HANDOFF here implies the field was None / empty —
+                # the pre-Layer-3 path. This branch is structurally unreachable when the field is
+                # set; the assertion pins it that way so a future refactor of the resolver cannot
+                # silently re-open msg-1438's 2-day silent stall (§3-1 row 3).
                 assert not (
                     stop_reason is StopReason.NO_HANDOFF and _next_participant(latest) is not None
                 ), (
