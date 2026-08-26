@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard
 
 import httpx
 from mcp import ClientSession, McpError
@@ -51,7 +51,7 @@ class McpToolCaller(Protocol):
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any: ...
 
 
-def is_envelope(payload: Any) -> bool:
+def is_envelope(payload: Any) -> TypeGuard[dict[str, Any]]:
     """``True`` iff ``payload`` looks like a chatroom **error envelope** (§3 detection rule).
 
     conclair does not raise when a chatroom call is refused. It answers with an
@@ -132,7 +132,7 @@ def _elevation_snippet(payload: dict[str, Any], key: str) -> str | None:
     return raw[:_ELEVATION_VALUE_LIMIT] + _ELEVATION_TRUNCATION_MARKER
 
 
-def _elevation_message(payload: Any) -> str:
+def _elevation_message(payload: dict[str, Any]) -> str:
     """Compose the :class:`MagickitMcpError` message for an elevated envelope.
 
     The message is bounded by construction (§3 rules): a sorted list of the
@@ -143,14 +143,15 @@ def _elevation_message(payload: Any) -> str:
     forbids in one place, so no second formatter can grow that habit anywhere
     downstream.
 
-    Callers pass raw ``payload`` (not ``dict``) so that a mis-shaped input still
-    yields *some* diagnostic message rather than an ``AttributeError`` — the
-    only path through :func:`raise_if_envelope` goes through :func:`is_envelope`
-    which has already narrowed to ``dict`` in practice, but the fallback keeps
-    an accidental direct call from raising an unrelated exception type.
+    Precondition: ``payload`` is a dict. The only caller, :func:`raise_if_envelope`,
+    goes through :func:`is_envelope` which returns ``True`` only for dicts —
+    so a mis-shaped input is impossible on the live path. The type is stated
+    strictly and no runtime check exists: a stray direct call with a non-dict
+    is a caller-side bug that should surface as an ``AttributeError``, not be
+    papered over with a message that falsely calls a bare ``int`` (etc.) an
+    "error envelope" (PR-gate on #178 round 4 — the speculative fallback
+    that used to live here violated YAGNI and produced misleading output).
     """
-    if not isinstance(payload, dict):
-        return f"magickit tool returned an error envelope: {type(payload).__name__} payload"
     keys = sorted(payload.keys())
     parts = [f"keys={keys}"]
     type_snippet = _elevation_snippet(payload, "error_type")
@@ -160,18 +161,6 @@ def _elevation_message(payload: Any) -> str:
     if err_snippet is not None:
         parts.append(f"error={err_snippet!r}")
     return "magickit tool returned an error envelope: " + " ".join(parts)
-
-
-def envelope_error(payload: Any) -> str | None:
-    """Back-compat shim: the elevation message iff ``payload`` is an envelope, else ``None``.
-
-    Kept because several tests introspect the string form of the elevation.
-    New code should call :func:`raise_if_envelope` or read
-    :func:`_elevation_message` directly.
-    """
-    if not is_envelope(payload):
-        return None
-    return _elevation_message(payload)
 
 
 def raise_if_envelope(payload: Any) -> None:
@@ -204,8 +193,9 @@ def parse_tool_result(result: Any) -> Any:
     text content block. Raises :class:`MagickitMcpError` on a tool error --
     either an explicit ``isError`` from the transport or a conclair **error
     envelope** returned inside a nominally-successful response (see
-    :func:`_envelope_error`). Pure (duck-typed) so it is unit-testable without
-    a live server.
+    :func:`is_envelope` for the detection rule, :func:`raise_if_envelope` for
+    the elevation). Pure (duck-typed) so it is unit-testable without a live
+    server.
 
     Elevating the envelope at this one boundary is what msg-1115 §4 asked for:
     the six call sites that read envelopes as successes (silent empty lists,
@@ -429,7 +419,6 @@ __all__ = [
     "MagickitMcpError",
     "McpToolCaller",
     "StreamableHttpChatroomMcp",
-    "envelope_error",
     "is_envelope",
     "magickit_mcp_url",
     "parse_tool_result",
