@@ -51,7 +51,7 @@ class McpToolCaller(Protocol):
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any: ...
 
 
-def is_envelope(payload: Any) -> TypeGuard[dict[str, Any]]:
+def is_envelope(payload: Any) -> TypeGuard[dict[object, Any]]:
     """``True`` iff ``payload`` looks like a chatroom **error envelope** (§3 detection rule).
 
     conclair does not raise when a chatroom call is refused. It answers with an
@@ -85,7 +85,15 @@ def is_envelope(payload: Any) -> TypeGuard[dict[str, Any]]:
     Between diagnosable-crash and silent-drop the choice is diagnosable-crash,
     so the detector stays loose. Narrowing it (requiring ``error`` too, or an
     absent success key, etc.) trades a rare false positive for a class of silent
-    failure this refactor exists to close — do not do it.
+    failure this refactor exists to close — do not do it. **In particular, the
+    detector does NOT require every key to be a ``str``** even though live JSON
+    payloads have string keys only: an envelope whose top-level dict happens to
+    carry a stray non-string key (a test mock, a hand-built fake, a future
+    schema drift) still elevates. Tightening the key-type check here would
+    reintroduce exactly the silent-drop failure mode the loose detection exists
+    to prevent (PR-gate on #178 round 6 — msg-1792 §3). The type of the
+    tolerance lives here; the *cost* of the tolerance — that ``_elevation_message``
+    must be total over ``dict[object, Any]`` — is paid there.
 
     **Switch point for a transport-level `isError`**: if conclair ever grows a
     genuine transport ``isError`` flag on the envelope (parity with the MCP
@@ -102,18 +110,45 @@ def is_envelope(payload: Any) -> TypeGuard[dict[str, Any]]:
 
 # §3 constants. Names, not magic numbers, so a future edit that thinks it is
 # "just relaxing the cap" reads what it is undoing (values must not leak
-# unbounded into an exception message — Einstein's msg-1687 concern).
+# unbounded into an exception message — Einstein's msg-1687 concern). The same
+# cap governs both value snippets and key names (PR-gate on #178 round 6):
+# a payload with a 10KB key would otherwise defeat the bounded-by-construction
+# claim just as much as a 10KB ``error`` value would.
 _ELEVATION_VALUE_LIMIT = 200
-"""Max characters of ``error_type`` / ``error`` retained in the elevation
-exception message. §3.4."""
+"""Max characters of any single admitted string in the elevation exception
+message: ``error_type`` / ``error`` values (§3.4) AND top-level key names
+(round-6 bound). The claim that the message is bounded by construction rests
+on this cap applying uniformly to every string that reaches the output."""
 
 _ELEVATION_TRUNCATION_MARKER = "…[truncated]"
 """Appended after a truncated value so a reader knows the log line is not the
 whole story. §3.4."""
 
 
-def _elevation_snippet(payload: dict[str, Any], key: str) -> str | None:
-    """The truncated string value of ``payload[key]``, or ``None`` if not a string.
+def _bounded_str(value: object) -> str:
+    """Stringify ``value`` and truncate to :data:`_ELEVATION_VALUE_LIMIT`.
+
+    Total over ``object`` by design — every Python object has a ``__str__`` and
+    this helper's job is to make key-name and value stringification uniformly
+    safe for the elevation message. No ``try/except`` around ``str()`` on
+    purpose: msg-1792 §4 forbids adding a branch to defend against a caller
+    whose ``__str__`` itself raises (that is a caller-side programming bug and
+    should surface as one, per the round-4 YAGNI rule that removed the
+    ``isinstance(payload, dict)`` fallback). What this helper DOES do is turn
+    ``_elevation_message`` from a partial function (crashes on non-``str``
+    keys) into a total one (accepts any dict), which is msg-1792 §2's
+    total-vs-defensive distinction: making a partial function total across its
+    already-reachable domain is not the same as adding a branch for an
+    unreachable state.
+    """
+    text = str(value)
+    if len(text) <= _ELEVATION_VALUE_LIMIT:
+        return text
+    return text[:_ELEVATION_VALUE_LIMIT] + _ELEVATION_TRUNCATION_MARKER
+
+
+def _elevation_snippet(payload: dict[object, Any], key: str) -> str | None:
+    """The bounded string value of ``payload[key]``, or ``None`` if not a string.
 
     Per §3.2-3.4: only string values of ``error_type`` and ``error`` are ever
     admitted to the elevation message; anything non-string produces ``None`` and
@@ -122,26 +157,51 @@ def _elevation_snippet(payload: dict[str, Any], key: str) -> str | None:
     values). This is the single formatting site referenced by §3's "the
     exception's constructor decides what may be shown" — the ``report_observed``
     warning stringifies the exception, it does not re-derive values from the
-    payload, so this cap governs every log line downstream.
+    payload, so this cap governs every log line downstream. Truncation is
+    delegated to :func:`_bounded_str` so key names (below) and values share the
+    same cap definition.
     """
     raw = payload.get(key)
     if not isinstance(raw, str):
         return None
-    if len(raw) <= _ELEVATION_VALUE_LIMIT:
-        return raw
-    return raw[:_ELEVATION_VALUE_LIMIT] + _ELEVATION_TRUNCATION_MARKER
+    return _bounded_str(raw)
 
 
-def _elevation_message(payload: dict[str, Any]) -> str:
+def _elevation_message(payload: dict[object, Any]) -> str:
     """Compose the :class:`MagickitMcpError` message for an elevated envelope.
 
-    The message is bounded by construction (§3 rules): a sorted list of the
-    payload's top-level key names (bare names, no recursion, no values), plus
-    the truncated string values of ``error_type`` and ``error`` when — and only
+    The message is bounded by construction (§3 rules + round-6 amendment): a
+    sorted list of the payload's top-level key names (each stringified and
+    truncated at :data:`_ELEVATION_VALUE_LIMIT`, no recursion, no values), plus
+    the bounded string values of ``error_type`` and ``error`` when — and only
     when — they are strings. **No other key's value is ever included** — this
     is what msg-1688 §5's "no ``repr(payload)`` / ``json.dumps(payload)``"
     forbids in one place, so no second formatter can grow that habit anywhere
     downstream.
+
+    **Total over ``dict[object, Any]``** — every key is passed through
+    :func:`_bounded_str` (which is total over ``object``) before sorting, so a
+    payload whose top-level dict happens to carry a non-string key (mixed key
+    types, an ``int``, whatever) still produces a diagnostic message rather
+    than a ``TypeError`` from ``sorted()``. This matters because
+    :func:`is_envelope` deliberately does not require string keys (msg-1792 §3:
+    tightening the detector would trade a benign format-time crash for a
+    silent-drop hole this refactor exists to close), so the tolerance has to
+    live here at the formatter. PR-gate on #178 round 6 pinned the hole:
+    without this the ``TypeError`` propagates from ``parse_tool_result`` through
+    ``call_tool``, and ``LoopControlReader.read`` (whose ``except Exception``
+    catches everything) converts it into a silent fail-safe ``hold`` — the
+    exact "silent success made worse" failure mode msg-1115 §2 named as the
+    class this whole thread exists to close (verified empirically against
+    ``LoopControlReader.read`` before this change).
+
+    **Accepted degeneracy**: after stringification, a payload containing both
+    ``1`` (int) and ``"1"`` (str) as keys would render as ``["1", "1"]`` — the
+    two are indistinguishable in the diagnostic key list. This is a diagnostic
+    string, not a payload-preserving serialisation; the loss carries no cost
+    against the message's purpose (naming which keys were present in the shape
+    that tripped the detector). Documented so a future reader does not
+    re-discover it as a "defect" and add a branch to disambiguate.
 
     Precondition: ``payload`` is a dict. The only caller, :func:`raise_if_envelope`,
     goes through :func:`is_envelope` which returns ``True`` only for dicts —
@@ -152,7 +212,7 @@ def _elevation_message(payload: dict[str, Any]) -> str:
     "error envelope" (PR-gate on #178 round 4 — the speculative fallback
     that used to live here violated YAGNI and produced misleading output).
     """
-    keys = sorted(payload.keys())
+    keys = sorted(_bounded_str(k) for k in payload)
     parts = [f"keys={keys}"]
     type_snippet = _elevation_snippet(payload, "error_type")
     if type_snippet is not None:

@@ -295,6 +295,147 @@ def test_dod2c_elevation_message_truncates_error_and_error_type_at_200_chars() -
     assert len(text) < 700, f"elevation message unexpectedly long: len={len(text)}"
 
 
+def test_dod2d_elevation_message_is_total_over_mixed_key_types() -> None:
+    """PR-gate on #178 round 6 (msg-1792 §1): the formatter must not raise on
+    an envelope whose top-level dict happens to carry a non-``str`` key.
+
+    Before the fix, ``sorted(payload.keys())`` inside ``_elevation_message``
+    raised ``TypeError: '<' not supported between instances of 'int' and 'str'``
+    on a payload like ``{"error_type": ..., 1: ...}``. That ``TypeError`` then
+    propagated out of ``call_tool`` and — critically — was caught by
+    :class:`LoopControlReader`'s ``except Exception`` in ``read()``, which
+    converted it into a silent fail-safe ``hold`` whose log line named
+    formatter internals rather than the envelope that had actually arrived.
+    The formatter is a diagnostic tool; a diagnostic tool that crashes its
+    caller during diagnosis is the failure mode this thread exists to close
+    (msg-1115 §2's "silent success made worse"), so *this* is the pin that
+    keeps ``_elevation_message`` total on any dict.
+
+    Positive: the diagnostic message is produced and carries ``error_type``.
+    Reachability: :func:`is_envelope` still accepts the mixed-key dict — the
+    tolerance lives in the detector (msg-1792 §3), the cost is paid here.
+    """
+    from spirrow_mindwire.magickit.client import is_envelope
+
+    payload: dict[Any, Any] = {
+        "error_type": "SomeError",
+        "error": "explanation",
+        1: "int_key_context",
+        (): "tuple_key_context",
+    }
+    # Detector reachability: msg-1792 §3 keeps ``is_envelope`` loose on purpose.
+    assert is_envelope(payload) is True
+
+    exc = _elevate_payload(payload)
+    text = str(exc)
+    # The formatter produced its normal diagnostic (not a TypeError, not an
+    # AttributeError, not a masked hold): ``error_type`` value survives.
+    assert "SomeError" in text, f"error_type value missing from diagnostic: {text!r}"
+
+
+def test_dod2d_elevation_message_omits_non_str_key_values_from_mixed_keys() -> None:
+    """PR-gate on #178 round 6 (msg-1792 §6 negative pin): making the formatter
+    total over mixed-key dicts must not become a licence to dump the *values*
+    at non-envelope keys.
+
+    A "helpful" future edit that tries to render ``int`` / ``tuple`` key
+    contents into the message must fail this test — same negative-assert style
+    as :func:`test_dod2b_elevation_message_never_dumps_values_from_non_string_or_extra_keys`.
+    Only ``error_type`` / ``error`` string values are ever admitted; other
+    keys contribute names only (and now those names are stringified +
+    truncated), never their values.
+    """
+    payload: dict[Any, Any] = {
+        "error_type": "SomeError",
+        "error": "explanation",
+        1: _SENTINEL_NOT_TO_LEAK,  # int key, sentinel value must not appear
+        (): _SENTINEL_NESTED,  # tuple key, sentinel value must not appear
+    }
+    exc = _elevate_payload(payload)
+    text = str(exc)
+    assert _SENTINEL_NOT_TO_LEAK not in text, (
+        f"int-keyed value leaked into elevation message: {text!r}"
+    )
+    assert _SENTINEL_NESTED not in text, (
+        f"tuple-keyed value leaked into elevation message: {text!r}"
+    )
+
+
+def test_dod2d_elevation_message_truncates_long_key_names() -> None:
+    """PR-gate on #178 round 6 (msg-1792 §5(b)): the "bounded by construction"
+    claim in :func:`_elevation_message`'s docstring must be true of key names
+    too, not just of ``error_type`` / ``error`` values.
+
+    A payload with a single 10KB top-level key name would otherwise defeat the
+    log-bloat protection Einstein pinned on the values (msg-1687). Einstein's
+    round-6 mandate strips the option of merely documenting the gap — the cap
+    must apply uniformly.
+    """
+    from spirrow_mindwire.magickit.client import _ELEVATION_VALUE_LIMIT
+
+    big_key = "K" * 10_000
+    payload = {
+        "error_type": "SomeError",
+        big_key: "context",
+    }
+    exc = _elevate_payload(payload)
+    text = str(exc)
+    # The 10KB key must not appear intact.
+    assert big_key not in text, "key name was not truncated"
+    # And the whole message stays bounded (same length constraint style as
+    # the value-truncation test — small multiple of the cap, not a hard-coded
+    # exact length).
+    assert len(text) < 4 * _ELEVATION_VALUE_LIMIT, (
+        f"elevation message unexpectedly long: len={len(text)}"
+    )
+
+
+def test_dod2d_report_observed_survives_mixed_key_envelope(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """PR-gate on #178 round 6 (msg-1792 §1 second half): before the fix, an
+    envelope with mixed key types crashed ``report_observed`` with an
+    *unhandled* ``TypeError`` (that method's catch is narrowly
+    ``except MagickitMcpError`` per msg-1685 §2, so a ``TypeError`` from the
+    formatter escaped and could kill the loop).
+
+    This test pins that the entire round-trip — envelope arrives, formatter
+    turns it into a bounded diagnostic, ``report_observed`` catches the
+    resulting ``MagickitMcpError``, logs a stale-dashboard warning, returns
+    normally — completes without raising, on a mixed-key input.
+    """
+    import logging
+
+    from spirrow_mindwire.conductor.control import ControlState, LoopControlReader
+    from spirrow_mindwire.magickit.client import raise_if_envelope
+
+    class _MixedKeyEnvelopeMcp:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            raise_if_envelope(
+                {
+                    "error_type": "ChatroomWriteFailed",
+                    "error": "storage backend refused the write",
+                    1: "surprise int-keyed sibling",
+                }
+            )
+
+    async def _run() -> None:
+        reader = LoopControlReader(_MixedKeyEnvelopeMcp(), project="p")
+        await reader.report_observed(ControlState.HOLD)  # must not raise
+
+    with caplog.at_level(logging.WARNING, logger="spirrow_mindwire.conductor.control"):
+        import anyio
+
+        anyio.run(_run)
+    log_text = "\n".join(rec.getMessage() for rec in caplog.records)
+    # The envelope's diagnostic reached the log (formatter was total, wrap
+    # was caught by the narrow ``except MagickitMcpError``).
+    assert "ChatroomWriteFailed" in log_text
+    # And the stale-dashboard warning fired (report_observed's narrow catch
+    # ran; no TypeError escaped).
+    assert "stale" in log_text, f"expected stale-dashboard warning; got {log_text!r}"
+
+
 def test_dod2_report_observed_warning_stringifies_the_exception_not_the_payload(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
