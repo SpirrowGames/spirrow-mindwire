@@ -2270,15 +2270,21 @@ try {
         # here (msg-1802 blocker #2). Trust the boundary.
         $lease = $leasesState[$resource]
 
-        # Queue scrub (msg-1875 blocker). A waiter enqueued on tick N can become un-launchable
-        # by tick N+K: quarantined (non-zero exit), removed from sweep.json (thread folded), or
-        # its `requires` array edited to drop this resource. If left in the queue, that dead
-        # waiter would be handed back by Get-NextLeaseWaiter as the next promotion target,
-        # hold the resource idle for the full LeaseIdleTtl (2h) before Test-LeaseExpiring's
-        # dual predicate fires, and starve every valid waiter behind it — the "silent parked"
-        # failure mode the mechanism was built to end. Held is intentionally NOT scrubbed:
-        # held is a transient operator-imposed pause (mirrors D-6'c's held-is-progress for a
-        # holder, and preserves the "operator's intent survives" property).
+        # Queue scrub (msg-1875 + msg-1932 blockers). A waiter enqueued on tick N can become
+        # un-launchable by tick N+K in four distinct ways:
+        #   (a) quarantined (non-zero exit) — msg-1875
+        #   (b) removed from sweep.json entirely (thread folded) — msg-1875
+        #   (c) its `requires` array edited to drop this resource — msg-1875
+        #   (d) decide verdict became SKIP (Stage-1 stop-token: NEXT: human / NEXT: none) — msg-1932
+        # If left in the queue, ANY of these dead waiters would be handed back by
+        # Get-NextLeaseWaiter as the next promotion target, hold the resource idle for the full
+        # LeaseIdleTtl (2h) before Test-LeaseExpiring's dual predicate fires, and starve every
+        # valid waiter behind it — the "silent parked" failure mode the mechanism was built to
+        # end. HELD is intentionally NOT scrubbed: held is a transient operator-imposed pause
+        # (mirrors D-6'c's held-is-progress for a holder, and preserves the "operator's intent
+        # survives" property). The SKIP filter below uses `$decideVerdicts.ContainsKey` as a
+        # gate, which is $false for held candidates (they're skipped by the decide loop at
+        # line ~2205), so this correctly preserves held-in-queue.
         # Scrub BEFORE any promotion (grant-from-empty below, or Invoke-LeasePromotion further
         # down) so no dead waiter ever gets promoted.
         $eligibleWaiters = @()
@@ -2289,7 +2295,25 @@ try {
                 $onSweep = ($sweepOrderKeys -contains $k)
                 $isQ = $quarantineState.ContainsKey($k)
                 $req = if ($candidateRequires.ContainsKey($k)) { @($candidateRequires[$k]) } else { @() }
-                if ($onSweep -and (-not $isQ) -and ($req -contains $resource)) {
+                # msg-1932 fix: also scrub SKIP-verdict waiters. A waiter whose decide verdict
+                # this tick is `skip` (Stage-1 stop-token: NEXT: human / NEXT: none) is just as
+                # un-launchable as a quarantined candidate — if promoted, it would hold the
+                # lease idle for LeaseIdleTtl (2h) before revocation kicks in, silently starving
+                # every valid waiter behind it. Same "silent parked" failure the whole scrub
+                # exists to prevent (msg-1875).
+                #
+                # HELD is intentionally NOT scrubbed. Held candidates have their project's
+                # control in HOLD state, so the decide loop at line ~2205 skips them entirely
+                # and $decideVerdicts does NOT contain their key. `verdictIsSkip` evaluates to
+                # $false for them via the ContainsKey guard, preserving the round-6 invariant
+                # "operator's transient pause preserves queue placement" (mirrors D-6'c's
+                # held-is-progress treatment on the holder side).
+                $verdictIsSkip = $false
+                if ($decideVerdicts.ContainsKey($k) -and $null -ne $decideVerdicts[$k]) {
+                    $decision = "$($decideVerdicts[$k].decision)".ToLowerInvariant()
+                    if ($decision -eq 'skip') { $verdictIsSkip = $true }
+                }
+                if ($onSweep -and (-not $isQ) -and (-not $verdictIsSkip) -and ($req -contains $resource)) {
                     $eligibleWaiters += $k
                 }
             }
@@ -2297,7 +2321,7 @@ try {
         $droppedWaiters = Remove-IneligibleLeaseWaiters -Lease $lease -EligibleKeys $eligibleWaiters
         foreach ($rk in $droppedWaiters) {
             Confirm-LogWorthKeeping
-            Write-Log "lease [$resource] queue scrub: dropped ineligible waiter $rk (not on sweep OR quarantined OR no longer declares requires: $resource)"
+            Write-Log "lease [$resource] queue scrub: dropped ineligible waiter $rk (not on sweep OR quarantined OR SKIP verdict OR no longer declares requires: $resource)"
         }
 
         $holderKey = "$($lease['holder'])"

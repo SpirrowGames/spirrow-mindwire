@@ -1124,6 +1124,47 @@ foreach ($c in $saveJsonCalls) {
 }
 CheckTrue "Save-JsonState -Path \$leasesStatePath appears before Invoke-HeadSkipCommitLaunch (durable flush persisted)" $preSpawnSaveFound
 
+# --- 18. Wrapper AST wiring — scrub eligibility excludes SKIP verdicts (msg-1932 blocker) --------
+#
+# Regression pin: the queue scrub must exclude waiters whose decide verdict is `skip` (Stage-1
+# stop-token: NEXT: human / NEXT: none). A SKIP-verdict waiter is just as un-launchable as a
+# quarantined candidate; promoting one holds the lease idle for LeaseIdleTtl (2h) — the exact
+# "silent parked" failure the scrub exists to prevent. The check must live in the wrapper's
+# eligibility computation (not the pure helper Remove-IneligibleLeaseWaiters, which takes an
+# eligible-keys array and doesn't know about verdict shape).
+Write-Host "Wrapper AST wiring — scrub eligibility excludes SKIP verdicts (msg-1932 blocker)"
+
+$wrapperSourceText = Get-Content -LiteralPath $sweepScript -Raw
+
+# The scrub block is the one that populates $eligibleWaiters. Verify the eligibility check
+# references $decideVerdicts (the source of the SKIP verdict) inside the same block that
+# feeds Remove-IneligibleLeaseWaiters.
+$scrubBlockPattern = [regex]::Escape('$eligibleWaiters = @()') + '[\s\S]*?' + [regex]::Escape('Remove-IneligibleLeaseWaiters')
+$scrubBlockMatch = [regex]::Match($wrapperSourceText, $scrubBlockPattern)
+if (-not $scrubBlockMatch.Success) {
+    $script:failures++
+    Write-Host "  FAIL  could not locate the wrapper scrub block ($eligibleWaiters = @() ... Remove-IneligibleLeaseWaiters)"
+}
+else {
+    $scrubBlockSrc = $scrubBlockMatch.Value
+    $hasVerdictRef = $scrubBlockSrc -match '\$decideVerdicts'
+    CheckTrue "scrub eligibility block references \$decideVerdicts (SKIP-verdict source)" $hasVerdictRef
+    $hasSkipCheck = $scrubBlockSrc -match "'skip'"
+    CheckTrue "scrub eligibility block explicitly checks for 'skip' verdict" $hasSkipCheck
+    # Sanity: the block still respects on-sweep, not-quarantined, still-requires — the round-6 checks.
+    $hasOnSweep = $scrubBlockSrc -match '\$onSweep' -or $scrubBlockSrc -match 'sweepOrderKeys'
+    $hasQuarantine = $scrubBlockSrc -match '\$isQ' -or $scrubBlockSrc -match 'quarantineState'
+    $hasRequires = $scrubBlockSrc -match '\$req\s' -or $scrubBlockSrc -match 'candidateRequires'
+    CheckTrue "scrub eligibility block still respects on-sweep (round-6 invariant preserved)" $hasOnSweep
+    CheckTrue "scrub eligibility block still respects not-quarantined (round-6 invariant preserved)" $hasQuarantine
+    CheckTrue "scrub eligibility block still respects still-requires-this-resource (round-6 invariant preserved)" $hasRequires
+    # HELD invariant: `$decideVerdicts.ContainsKey($k)` must be gated so a missing verdict (held
+    # candidates are skipped by the decide loop and have NO verdict this tick) does NOT scrub the
+    # waiter. Look for the ContainsKey pattern on decideVerdicts within the block.
+    $hasContainsKeyGate = $scrubBlockSrc -match '\$decideVerdicts\.ContainsKey'
+    CheckTrue "scrub eligibility block gates on \$decideVerdicts.ContainsKey (held candidates preserved: they have no verdict)" $hasContainsKeyGate
+}
+
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "lease gate: all checks passed"
