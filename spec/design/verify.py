@@ -61,10 +61,50 @@ _REQUIRED_MANIFEST_KEYS: dict[str, type | tuple[type, ...]] = {
     "items": list,
 }
 
-# §6 — inheritable fields (item may omit; manifest root supplies default).
+# §6 tripartite model of item-level fields.  Each item-level field has TWO
+# independent properties, and each of the three sets below captures ONE
+# property.  Do not conflate them.
+#
+#   inherited=YES  -> item may OMIT the field; V-6 falls back to the root
+#                     value and errors iff neither side supplies it.
+#   overridable=YES -> item MAY declare the field; when it does, that value
+#                      applies to that item only.  V-12 is silent.
+#   overridable=NO  -> item must NOT declare the field; V-12 errors if it
+#                      does.  Root supplies the only legal value.
+#
+# Per-field decomposition (spec §6 lines 411 / 413 / 414):
+#
+#   field          inherited   overridable    lives in
+#   -----------    ---------   -----------    -----------------------------
+#   target_repo    YES         NO (D-22)      _INHERITED_ITEM_FIELDS
+#                                              + _ROOT_ONLY_ITEM_FIELDS
+#   base_branch    YES         YES            _INHERITED_ITEM_FIELDS
+#                                              + _OVERRIDABLE_ITEM_FIELDS
+#   canary         YES         YES            _INHERITED_ITEM_FIELDS
+#                                              + _OVERRIDABLE_ITEM_FIELDS
+#   spec_id        n/a         NO             _ROOT_ONLY_ITEM_FIELDS
+#   thread         n/a         NO             _ROOT_ONLY_ITEM_FIELDS
+#   supersedes     n/a         NO             _ROOT_ONLY_ITEM_FIELDS
+#
+# `target_repo` intentionally appears in BOTH _INHERITED_ITEM_FIELDS and
+# _ROOT_ONLY_ITEM_FIELDS.  That is not a contradiction: the spec (D-22)
+# defines it as "inherited-but-not-overridable" -- item must not declare
+# it (V-12), yet V-6 still checks that root supplies it and reports the
+# failure with per-item context when root is missing it.
+
+# §6 line 411 — fields V-6 must resolve for each item (item may omit;
+# resolution falls back to manifest root).
 _INHERITED_ITEM_FIELDS: tuple[str, ...] = ("target_repo", "base_branch", "canary")
 
-# §6 — fields that must appear only at manifest root (V-12).
+# §6 line 413 — fields the item MAY declare to override root for that item
+# only.  Not currently consumed by a check (item-side declaration is silently
+# honored by _resolved_item_field for these two fields); kept as documentation
+# of the tripartite model and to catch drift if the spec adds more overridable
+# fields.
+_OVERRIDABLE_ITEM_FIELDS: tuple[str, ...] = ("base_branch", "canary")
+
+# §6 line 414 — fields V-12 must reject when an item declares them.  Root is
+# the only legal home.
 _ROOT_ONLY_ITEM_FIELDS: tuple[str, ...] = (
     "spec_id",
     "thread",
@@ -612,7 +652,17 @@ def _check_v5(manifest: Manifest) -> list[Finding]:
 
 
 def _resolved_item_field(manifest: Manifest, item: dict[str, Any], field: str) -> Any:
-    """§6 inheritance: item overrides root when present; otherwise inherits."""
+    """§6 resolution: return the item value if present, else the root value.
+
+    For fields in _OVERRIDABLE_ITEM_FIELDS (``base_branch`` / ``canary``) the
+    item value is a legal override.  For ``target_repo`` the item value is
+    illegal — V-12 will independently error on it — but we still return it
+    here so V-6 can report "resolved" from the item's own (illegal) value
+    without double-reporting a resolution failure on top of the V-12 error.
+    For fields in _ROOT_ONLY_ITEM_FIELDS that are not also inherited (``spec_id``
+    / ``thread`` / ``supersedes``) this function is not called by V-6 at all;
+    those fields have no item-level notion of resolution.
+    """
 
     if field in item:
         return item[field]
