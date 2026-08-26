@@ -1230,6 +1230,52 @@ $lease = @{ holder = $null; generation = 5; queue = @() }
 $result = Invoke-LeaseReleaseHold -Lease $lease -CandidateKey 'p/T-us' -Now $now
 Check "release-hold: empty-holder lease is a noop" 'noop-not-holder' $result.action
 
+# msg-2020 blocker: cross-tick self-hold rollback must set reclaim_required=true so the next
+# acquirer bounces the physical resource before use. Without this, a session that outlives
+# the tick collides silently on the next acquire (violates msg-923 "silently does not collide").
+Write-Host "Invoke-LeaseReleaseHold — cross-tick self-hold sets reclaim (msg-2020 blocker)"
+
+# Case 5: -SetReclaimRequired flag on a cross-tick self-hold rollback.
+$lease = @{
+    holder            = 'p/T-us'
+    acquired_at       = '2026-08-25T00:00:00Z'   # yesterday — cross-tick hold
+    last_progress_at  = '2026-08-25T00:00:00Z'
+    idle_evaluations  = 0
+    generation        = 4
+    expiring          = $false
+    reclaimed_from    = 'p/T-prior'
+    reclaimed_at      = '2026-08-24T00:00:00Z'
+    reclaimed_reason  = 'operator-clear: earlier reason'
+    reclaim_required  = $false
+    revoked_at        = $null
+    revoked_reason    = $null
+    queue             = @()
+}
+$result = Invoke-LeaseReleaseHold -Lease $lease -CandidateKey 'p/T-us' -Now $now -SetReclaimRequired
+Check "release-hold (cross-tick): action = released-hold" 'released-hold' $result.action
+Check "release-hold (cross-tick): holder removed" $false ($lease.ContainsKey('holder'))
+CheckTrue "release-hold (cross-tick): reclaim_required SET to true (msg-2020 fix)" ([bool]$lease['reclaim_required'])
+Check "release-hold (cross-tick): reclaimed_from OVERWRITTEN to the candidate that held" 'p/T-us' $lease['reclaimed_from']
+CheckTrue "release-hold (cross-tick): reclaimed_reason OVERWRITTEN to describe the rollback" ("$($lease['reclaimed_reason'])".StartsWith('rollback-of-cross-tick-hold:'))
+Check "release-hold (cross-tick): generation bumped" 5 $lease['generation']
+
+# Case 6: without -SetReclaimRequired (fresh-acquire rollback) — permanent audit preserved.
+$lease = @{
+    holder            = 'p/T-us'
+    acquired_at       = '2026-08-25T00:00:00Z'
+    generation        = 4
+    expiring          = $false
+    reclaimed_from    = 'p/T-prior'
+    reclaimed_at      = '2026-08-24T00:00:00Z'
+    reclaimed_reason  = 'operator-clear: earlier reason'
+    reclaim_required  = $false
+    queue             = @()
+}
+$result = Invoke-LeaseReleaseHold -Lease $lease -CandidateKey 'p/T-us' -Now $now
+Check "release-hold (fresh-acquire, no flag): reclaim_required stays false" $false ([bool]$lease['reclaim_required'])
+Check "release-hold (fresh-acquire): reclaimed_from PRESERVED (msg-1900 semantics)" 'p/T-prior' $lease['reclaimed_from']
+Check "release-hold (fresh-acquire): reclaimed_reason PRESERVED" 'operator-clear: earlier reason' $lease['reclaimed_reason']
+
 # --- 20. Wrapper AST wiring — lease-lost bail rolls back partial acquires (msg-1955 blocker) -----
 #
 # Regression pin: the `lease-lost` bail branch MUST call Invoke-LeaseReleaseHold on the
@@ -1316,6 +1362,54 @@ else {
 $grantSrcText = Get-Content -LiteralPath $grantScript -Raw
 $hasManualThrow = $grantSrcText -match '-To is required for a grant'
 CheckFalse "manual '-To is required' throw guard removed (PowerShell native binding wins)" $hasManualThrow
+
+# --- 22. Wrapper AST wiring — cross-tick self-hold rollback sets reclaim (msg-2020 blocker) -----
+#
+# Regression pin: the wrapper must snapshot pre-acquire holders and use that snapshot to pass
+# -SetReclaimRequired to Invoke-LeaseReleaseHold when the pre-acquire holder was already the
+# candidate. Without this signal a cross-tick-held lease is released clean and the next
+# acquirer boots on top of the still-live physical session — violates the "silently does not
+# collide" contract (msg-923, msg-1187 §5-3).
+Write-Host "Wrapper AST wiring — cross-tick self-hold rollback sets reclaim (msg-2020 blocker)"
+
+$wrapperText3 = Get-Content -LiteralPath $sweepScript -Raw
+
+# The wrapper must construct $preAcquireHolders BEFORE calling Invoke-LeaseAcquire in the
+# candidate loop. Verify the assignment appears at a line before the first Invoke-LeaseAcquire
+# inside the requires-block.
+$hasSnapshotVar = $wrapperText3 -match '\$preAcquireHolders\s*=\s*@\{\}'
+CheckTrue "wrapper declares \$preAcquireHolders snapshot" $hasSnapshotVar
+
+# The rollback loop must reference $preAcquireHolders to compute the cross-tick-self-hold
+# signal (comparing preAcquireHolders[$resource] against $cand.key).
+$hasSnapshotReferenceInRollback = $wrapperText3 -match '\$preAcquireHolders\[\$resource\]\s*-eq\s*\$cand\.key'
+CheckTrue "wrapper rollback compares preAcquireHolders[\$resource] against candidate key" $hasSnapshotReferenceInRollback
+
+# Invoke-LeaseReleaseHold call must include -SetReclaimRequired parameter (bound to the
+# computed cross-tick signal). Without this, cross-tick holds release clean and silently
+# collide on next acquire.
+$hasSetReclaimParam = $wrapperText3 -match 'Invoke-LeaseReleaseHold[\s\S]{0,300}?-SetReclaimRequired'
+CheckTrue "wrapper Invoke-LeaseReleaseHold call includes -SetReclaimRequired parameter" $hasSetReclaimParam
+
+# Source order: the snapshot assignment must precede the first Invoke-LeaseAcquire call in
+# the wrapper. Otherwise the "snapshot" captures the post-mutation state (holder is already
+# the candidate for the self-hold fast path AND for the fresh-acquire path — the two become
+# indistinguishable).
+$snapshotIdx = $wrapperText3.IndexOf('$preAcquireHolders = @{}')
+$firstAcquireIdx = -1
+# Only match Invoke-LeaseAcquire inside the candidate-loop requires block, not the acquire
+# probes elsewhere. The candidate-loop block contains "$cand.requires" nearby.
+$acquireMatches = [regex]::Matches($wrapperText3, 'foreach \(\$resource in \$cand\.requires\)[\s\S]{0,200}?Invoke-LeaseAcquire')
+if ($acquireMatches.Count -gt 0) {
+    $firstAcquireIdx = $acquireMatches[0].Index
+}
+if ($snapshotIdx -ge 0 -and $firstAcquireIdx -ge 0 -and $snapshotIdx -lt $firstAcquireIdx) {
+    Write-Host "  PASS  \$preAcquireHolders snapshot (offset $snapshotIdx) precedes first candidate-loop Invoke-LeaseAcquire (offset $firstAcquireIdx)"
+}
+else {
+    $script:failures++
+    Write-Host "  FAIL  snapshot (offset $snapshotIdx) does NOT precede first candidate-loop Invoke-LeaseAcquire (offset $firstAcquireIdx) — cross-tick detection breaks"
+}
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }

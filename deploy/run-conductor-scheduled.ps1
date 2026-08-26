@@ -2690,6 +2690,17 @@ try {
                     }
                 }
             }
+            # Snapshot holders BEFORE the acquire loop (msg-2020 blocker). Used by the
+            # rollback path in the lease-lost bail below to distinguish a cross-tick self-hold
+            # (holder was $cand.key before this tick — a physical session may still be
+            # running) from a fresh acquire this tick (holder was empty or someone else's).
+            # A cross-tick self-hold rollback must set reclaim_required=true on the released
+            # record so the next acquirer bounces the physical resource; a fresh acquire
+            # rollback should not (no session ever started, no reclaim duty).
+            $preAcquireHolders = @{}
+            foreach ($resource in $cand.requires) {
+                $preAcquireHolders[$resource] = if ($leasesState.ContainsKey($resource) -and $null -ne $leasesState[$resource]) { "$($leasesState[$resource]['holder'])" } else { '' }
+            }
             foreach ($resource in $cand.requires) {
                 Invoke-LeaseAcquire -LeasesState $leasesState -Resource $resource `
                                     -CandidateKey $cand.key -Now $nowUtc
@@ -2762,10 +2773,22 @@ try {
                 # Invoke-LeaseReleaseHold is idempotent w.r.t. operator override — it's a no-op
                 # on resources where the operator's grant won the merge race (holder != us), so
                 # we can safely enumerate the full $cand.requires without pre-filtering.
+                #
+                # CROSS-TICK SELF-HOLD (msg-2020 blocker). A resource whose pre-acquire holder
+                # was already $cand.key means we held it across ticks — a physical session may
+                # still be running on it. Rolling back cleanly (holder=null, no reclaim flag)
+                # would let the next acquirer boot on top of the live session — the exact
+                # "silent collision" msg-923 forbids. Pass -SetReclaimRequired so the release
+                # writes reclaim_required=true + reclaimed_reason describing the rollback;
+                # the next acquirer's dirty-detection (round 3, §10) fires the notification
+                # and the operator bounces the physical resource before use. Freshly-acquired-
+                # this-tick resources (holder was empty or someone else's pre-acquire) had no
+                # session on them, so no reclaim duty to set.
                 foreach ($resource in $cand.requires) {
                     if (-not $leasesState.ContainsKey($resource)) { continue }
                     if ($null -eq $leasesState[$resource]) { continue }
-                    Invoke-LeaseReleaseHold -Lease $leasesState[$resource] -CandidateKey $cand.key -Now $nowUtc | Out-Null
+                    $wasCrossTickSelfHold = ($preAcquireHolders[$resource] -eq $cand.key)
+                    Invoke-LeaseReleaseHold -Lease $leasesState[$resource] -CandidateKey $cand.key -Now $nowUtc -SetReclaimRequired:$wasCrossTickSelfHold | Out-Null
                 }
                 # SECOND FLUSH: make the roll-back durable on disk BEFORE we continue past this
                 # candidate. Without this, the rolled-back acquire only exists in memory —

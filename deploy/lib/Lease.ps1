@@ -810,6 +810,19 @@ function Invoke-LeaseReleaseHold {
         UTC tick timestamp — used for the generation bump so downstream mergers see a semantic
         state change (round 4 optimistic-concurrency contract).
 
+    .PARAMETER SetReclaimRequired
+        Rollback of a lease we held across ticks (a live physical session may still exist).
+        When $true, sets `reclaim_required = $true` and rewrites `reclaimed_*` to describe
+        THIS release event so the next acquirer sees the flag, fires the
+        __lease_reclaim_acquire__ notification, and bounces the physical resource before use.
+        Preserves the "silently does not collide" contract (msg-923, msg-1187 §5-3) for the
+        specific edge case where we rolled back a self-hold whose session may still be
+        running — flagged by msg-2020 (previous naysayer round 12) as a gap in strict
+        reclaim propagation. The caller (wrapper's lease-lost rollback loop) determines
+        "cross-tick self-hold" by comparing the pre-acquire holder snapshot to $CandidateKey.
+        Default $false: freshly-acquired-this-tick resources have no live session, so no
+        reclaim duty to set.
+
     .OUTPUTS
         A hashtable with:
           - action  : 'released-hold' | 'noop-not-holder'
@@ -817,7 +830,8 @@ function Invoke-LeaseReleaseHold {
     param(
         [hashtable]$Lease,
         [string]$CandidateKey,
-        [datetime]$Now
+        [datetime]$Now,
+        [switch]$SetReclaimRequired
     )
     if ($null -eq $Lease) { return @{ action = 'noop-not-holder' } }
     $currentHolder = "$($Lease['holder'])"
@@ -836,16 +850,30 @@ function Invoke-LeaseReleaseHold {
     # generation so the end-of-tick merger sees this as a semantic write (in case a concurrent
     # operator write arrives after our roll-back — they'd still compete via the generation
     # comparison in Merge-LeasesStateForWrite).
+    $nowIso = $Now.ToUniversalTime().ToString("o")
     $Lease.Remove('holder') | Out-Null
     $Lease['acquired_at']       = $null
     $Lease['last_progress_at']  = $null
     $Lease['idle_evaluations']  = 0
     $Lease['generation']        = $priorGen + 1
     $Lease['expiring']          = $false
-    # Preserve reclaimed_from / reclaimed_at / reclaimed_reason / reclaim_required verbatim.
-    # These describe the LAST transition of ownership before ours (the ones we inherited on
-    # acquire — from a prior release or operator -Clear) — unrelated to our roll-back, so the
-    # digest still shows the true reclaim narrative.
+    if ($SetReclaimRequired) {
+        # Cross-tick self-hold rollback: we held this lease across ticks so a physical session
+        # may still be running. Overwrite `reclaimed_*` to describe THIS release; the next
+        # acquirer will see reclaim_required=true, fire the __lease_reclaim_acquire__
+        # notification, and bounce the physical resource before use. Without this branch the
+        # next acquirer sees the record as clean (round 11 rollback semantics) and boots
+        # blindly on top of the still-live session — msg-2020's flagged gap in the "silently
+        # does not collide" contract (msg-923 core, msg-1187 §5-3).
+        $Lease['reclaimed_from']    = $CandidateKey
+        $Lease['reclaimed_at']      = $nowIso
+        $Lease['reclaimed_reason']  = "rollback-of-cross-tick-hold: $CandidateKey lost race on a sibling required resource; physical session may still be live"
+        $Lease['reclaim_required']  = $true
+    }
+    # else: preserve reclaimed_from / reclaimed_at / reclaimed_reason / reclaim_required
+    # verbatim. These describe the LAST transition of ownership before ours (the ones we
+    # inherited on acquire — from a prior release or operator -Clear) — unrelated to our
+    # roll-back, so the digest still shows the true reclaim narrative.
     # Clear TRANSIENT Phase-1 markers if any leaked in.
     $Lease['revoked_at']        = $null
     $Lease['revoked_reason']    = $null
