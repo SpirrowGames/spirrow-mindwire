@@ -124,6 +124,28 @@ _ELEVATION_TRUNCATION_MARKER = "…[truncated]"
 """Appended after a truncated value so a reader knows the log line is not the
 whole story. §3.4."""
 
+_ELEVATION_KEY_LIMIT = 20
+"""Max number of top-level key names enumerated in the elevation exception
+message (PR-gate on #178 round 7). Real error envelopes carry 2-5 top-level
+keys, so 20 sits an order of magnitude above the observed shape while still
+capping a pathological drift (10 000-key payload) at bytes rather than
+kilobytes of log line. **Load-bearing property is not the exact value**:
+what matters is that the message length has a finite upper bound expressible
+from the three constants (see :func:`_elevation_message`)."""
+
+_ELEVATION_REPR_EXPANSION_MAX = 10
+"""Worst-case per-character expansion of Python's :func:`repr` for a ``str``.
+
+CPython escapes non-printable code points as ``\\UXXXXXXXX`` (10 characters
+for one input character — reached, in practice, only by tag characters and
+private-use points on the supplementary planes; ordinary control chars use
+``\\xNN`` = 4, and Unicode noncharacters in the BMP use ``\\uXXXX`` = 6).
+Named here so the upper-bound formula on the elevation message length is
+computable — and so the test at DoD #4 does not tacitly assume the tighter
+factor of 4 that a payload of alphanumeric characters would demonstrate
+(Einstein's PR-gate #178 round 8 mandate: the worst-case test must trigger
+maximum ``repr`` expansion, not merely typical expansion)."""
+
 
 def _bounded_str(value: object) -> str:
     """Stringify ``value`` and truncate to :data:`_ELEVATION_VALUE_LIMIT`.
@@ -170,14 +192,48 @@ def _elevation_snippet(payload: dict[object, Any], key: str) -> str | None:
 def _elevation_message(payload: dict[object, Any]) -> str:
     """Compose the :class:`MagickitMcpError` message for an elevated envelope.
 
-    The message is bounded by construction (§3 rules + round-6 amendment): a
-    sorted list of the payload's top-level key names (each stringified and
-    truncated at :data:`_ELEVATION_VALUE_LIMIT`, no recursion, no values), plus
-    the bounded string values of ``error_type`` and ``error`` when — and only
-    when — they are strings. **No other key's value is ever included** — this
-    is what msg-1688 §5's "no ``repr(payload)`` / ``json.dumps(payload)``"
-    forbids in one place, so no second formatter can grow that habit anywhere
-    downstream.
+    The message is bounded by construction — the length has a closed-form upper
+    bound computable from three constants:
+
+    - :data:`_ELEVATION_KEY_LIMIT` (K) caps how many top-level key names are
+      enumerated,
+    - :data:`_ELEVATION_VALUE_LIMIT` (LIMIT) caps each stringified key name and
+      each admitted value snippet, and
+    - :data:`_ELEVATION_REPR_EXPANSION_MAX` (EXP) covers Python ``repr``
+      escape expansion, so the bound survives payloads whose strings contain
+      control characters or Unicode noncharacters.
+
+    The shape of that bound is ``O((K + 2) · LIMIT · EXP)``: at most K key
+    names each of at most ``LIMIT · EXP + O(1)`` characters after ``repr``,
+    plus two value snippets (``error_type`` and ``error``) with the same
+    per-item cap, plus a constant framing overhead. The **exact coefficients**
+    are the responsibility of the test at DoD #4 — the docstring states the
+    shape (so anyone reading it can see what changes the constants), the test
+    computes the coefficients from the constants and asserts on the actual
+    ``len(_elevation_message(...))`` for a worst-case payload. Duplicating an
+    exact formula here would recreate the "docstring drift" failure class this
+    round exists to close (msg-1804 §1: `_elevation_message`'s previous
+    "bounded by construction" claim was silent on key count).
+
+    **Content**: the sorted list of the payload's top-level key names (each
+    stringified via :func:`_bounded_str` and sliced to K, no recursion, no
+    values), plus the total count ``len(payload)`` (always emitted — so a
+    reader compares it against the enumerated key count to see whether the
+    slice truncated), plus the bounded string values of ``error_type`` and
+    ``error`` when — and only when — they are strings. **No other key's value
+    is ever included** — this is what msg-1688 §5's "no ``repr(payload)`` /
+    ``json.dumps(payload)``" forbids in one place, so no second formatter can
+    grow that habit anywhere downstream.
+
+    **Branch-free slicing** (msg-1804 §2): the key list is always sliced,
+    even for payloads with fewer than K keys — so the "sliced" flag is
+    carried by ``total`` (the true count) diverging from ``len(keys)``, not
+    by a conditional marker. Adding an ``if len(keys) > K: ...`` branch would
+    reintroduce the round-4 speculative-branch pattern (a code path that fires
+    only in an edge case, easily forgotten by the next edit). The trade is
+    that a payload with fewer than K keys still shows a redundant ``total=N``
+    for readers who could count ``len(keys)`` themselves; the cost is 8-15
+    characters against the win of never having a conditional format.
 
     **Total over ``dict[object, Any]``** — every key is passed through
     :func:`_bounded_str` (which is total over ``object``) before sorting, so a
@@ -203,6 +259,13 @@ def _elevation_message(payload: dict[object, Any]) -> str:
     that tripped the detector). Documented so a future reader does not
     re-discover it as a "defect" and add a branch to disambiguate.
 
+    **No priority for particular keys** (msg-1804 §5): ``error_type`` and
+    ``error`` values are already emitted as their own labelled parts, so the
+    round-7 concern that the alphabetically-first-K slice might drop the
+    "important" key is moot — those values survive independently of the key
+    list. Adding a "keep these keys first" branch would violate the
+    branch-free rule above without adding diagnostic value.
+
     Precondition: ``payload`` is a dict. The only caller, :func:`raise_if_envelope`,
     goes through :func:`is_envelope` which returns ``True`` only for dicts —
     so a mis-shaped input is impossible on the live path. The type is stated
@@ -212,8 +275,12 @@ def _elevation_message(payload: dict[object, Any]) -> str:
     "error envelope" (PR-gate on #178 round 4 — the speculative fallback
     that used to live here violated YAGNI and produced misleading output).
     """
-    keys = sorted(_bounded_str(k) for k in payload)
-    parts = [f"keys={keys}"]
+    sorted_keys = sorted(_bounded_str(k) for k in payload)
+    # Always slice: msg-1804 §2's branch-free rule. For payloads with fewer
+    # than _ELEVATION_KEY_LIMIT keys the slice is a no-op; readers detect
+    # truncation by comparing ``total`` against ``len(shown_keys)``.
+    shown_keys = sorted_keys[:_ELEVATION_KEY_LIMIT]
+    parts = [f"total={len(payload)}", f"keys={shown_keys}"]
     type_snippet = _elevation_snippet(payload, "error_type")
     if type_snippet is not None:
         parts.append(f"error_type={type_snippet!r}")

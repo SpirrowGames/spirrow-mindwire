@@ -436,6 +436,196 @@ def test_dod2d_report_observed_survives_mixed_key_envelope(
     assert "stale" in log_text, f"expected stale-dashboard warning; got {log_text!r}"
 
 
+def _max_elevation_message_length() -> int:
+    """Compute the closed-form upper bound on :func:`_elevation_message` length.
+
+    PR-gate on #178 round 8 (msg-1804 §3): the docstring gives the *shape* of
+    the bound (``O((K+2) · LIMIT · EXP)``); this helper realises the exact
+    coefficients from the three constants so a future edit that raises
+    :data:`_ELEVATION_KEY_LIMIT`, :data:`_ELEVATION_VALUE_LIMIT`, or
+    :data:`_ELEVATION_REPR_EXPANSION_MAX` recomputes the bound automatically —
+    no test-side number to forget to update (msg-1804 §3-3).
+
+    Breakdown per Python's ``repr`` for a ``str`` inside an f-string:
+
+    - Each stringified value is at most ``LIMIT`` chars of arbitrary content
+      plus the fixed-length ``_ELEVATION_TRUNCATION_MARKER`` when truncation
+      fires. The arbitrary-content prefix can expand up to ``EXP`` chars per
+      character under ``repr`` (Einstein's round-8 mandate: the marker itself
+      is printable, so it takes marker-length chars after ``repr``).
+    - ``repr('...')`` adds 2 quote characters.
+    - List repr adds ``[``, ``]`` and ``, `` between items.
+    - The ``parts`` in :func:`_elevation_message` are joined with a single
+      space; the leading ``"magickit tool ..."`` is a fixed string.
+    - ``total=`` is bounded by the digit count of any Python-buildable dict
+      size — 30 digits is comfortably above the ~19 digits an ``int`` needs
+      for a machine's addressable-memory ceiling.
+    """
+    from spirrow_mindwire.magickit.client import (
+        _ELEVATION_KEY_LIMIT,
+        _ELEVATION_REPR_EXPANSION_MAX,
+        _ELEVATION_TRUNCATION_MARKER,
+        _ELEVATION_VALUE_LIMIT,
+    )
+
+    marker_len = len(_ELEVATION_TRUNCATION_MARKER)
+    # Per-item after repr: 2 quote chars + arbitrary body (LIMIT chars, each
+    # expanded at most EXP times by repr) + the printable truncation marker.
+    per_item = 2 + _ELEVATION_VALUE_LIMIT * _ELEVATION_REPR_EXPANSION_MAX + marker_len
+    # List repr of K items: 2 brackets + K items + (K-1) separators ", ".
+    list_repr = 2 + _ELEVATION_KEY_LIMIT * per_item + max(0, _ELEVATION_KEY_LIMIT - 1) * 2
+    prefix_len = len("magickit tool returned an error envelope: ")
+    total_part = len("total=") + 30  # 30 digits — comfortably above any real len(dict)
+    keys_part = len("keys=") + list_repr
+    type_part = len("error_type=") + per_item
+    err_part = len("error=") + per_item
+    # 3 space separators between the four parts.
+    return prefix_len + total_part + 1 + keys_part + 1 + type_part + 1 + err_part
+
+
+def test_dod3_elevation_message_length_within_computed_upper_bound() -> None:
+    """PR-gate on #178 round 8 (msg-1804 §6-4 + Einstein's escape-expansion
+    mandate): a worst-case payload's elevation message must fit under the
+    formula computed from the constants.
+
+    "Worst case" here means Einstein's round-8 clarification (the test must
+    actually trigger maximum ``repr`` expansion — a payload of alphanumeric
+    characters would prove a falsely-tight bound):
+
+    - Payload has more keys than :data:`_ELEVATION_KEY_LIMIT` (so slicing must
+      kick in),
+    - Each key name is longer than :data:`_ELEVATION_VALUE_LIMIT` (so
+      :func:`_bounded_str` truncation fires per key),
+    - Every character is a supplementary-plane non-printable
+      (``\\U000e0001`` — a tag character; ``repr`` expands each to 10 chars,
+      matching :data:`_ELEVATION_REPR_EXPANSION_MAX`),
+    - ``error_type`` and ``error`` values are similarly maximal.
+
+    If any of those knobs changes — cap the values, tighten the escape max,
+    add another key-list part — the bound recomputes automatically because
+    :func:`_max_elevation_message_length` derives everything from the three
+    constants (msg-1804 §3-3: no dual-managed magic number).
+
+    Regression note (msg-1804 §6-8): before this round the message length was
+    unbounded in the number of keys — 10 000 keys produced a ~100 KB string.
+    A test with the same worst-case would have blown past *any* fixed upper
+    bound; this test's own value falls under the recomputed bound only
+    because :data:`_ELEVATION_KEY_LIMIT` now caps the key count.
+    """
+    from spirrow_mindwire.magickit.client import (
+        _ELEVATION_KEY_LIMIT,
+        _ELEVATION_VALUE_LIMIT,
+    )
+
+    # Einstein's mandate: use a character with maximum repr expansion.
+    # \U000e0001 is a tag character on Plane 14 — not printable, so repr
+    # emits \UXXXXXXXX (10 chars for 1 input char).
+    worst_char = "\U000e0001"
+    long_string = worst_char * (_ELEVATION_VALUE_LIMIT + 50)  # trips truncation
+
+    # Payload with (K + 50) keys — exceeds the key cap so slicing engages.
+    payload: dict[Any, Any] = {"error_type": long_string, "error": long_string}
+    for i in range(_ELEVATION_KEY_LIMIT + 50):
+        # Each key name is itself longer than LIMIT + built from the worst char,
+        # so key-name truncation and repr expansion both fire.
+        payload[f"{long_string}_{i:03d}"] = "value_ignored_by_formatter"
+
+    exc = _elevate_payload(payload)
+    actual = len(str(exc))
+    upper = _max_elevation_message_length()
+    assert actual <= upper, (
+        f"elevation message exceeded the computed upper bound: "
+        f"actual={actual} upper={upper} (K={_ELEVATION_KEY_LIMIT}, "
+        f"LIMIT={_ELEVATION_VALUE_LIMIT})"
+    )
+
+
+def test_dod3_elevation_message_truthfulness_10000_keys() -> None:
+    """PR-gate on #178 round 8 (msg-1804 §6-5): the enumerated key list is
+    truncated to :data:`_ELEVATION_KEY_LIMIT`, but the ``total=`` field must
+    still name the *true* payload key count.
+
+    The message body must satisfy two invariants regardless of payload size:
+    (i) ``total=<real-count>`` is present verbatim so an operator can read
+    the drift back from the log line, and (ii) the enumerated key list holds
+    at most :data:`_ELEVATION_KEY_LIMIT` items. Pinning both together is what
+    turns the branch-free slice (msg-1804 §2) from an invisible cap into an
+    audit trail: a reader compares the two numbers and knows "the log shows
+    20 keys of the 10 002 that arrived".
+    """
+    import ast
+
+    from spirrow_mindwire.magickit.client import _ELEVATION_KEY_LIMIT
+
+    payload: dict[Any, Any] = {"error_type": "X", "error": "y"}
+    for i in range(10_000):
+        payload[f"k{i:05d}"] = "v"
+    exc = _elevate_payload(payload)
+    text = str(exc)
+    # (i) the true total appears verbatim.
+    assert f"total={len(payload)}" in text, (
+        f"true total ({len(payload)}) missing from elevation message: {text!r}"
+    )
+    # (ii) enumerated key list is at most K items.
+    keys_marker = " keys="
+    ktype_marker = " error_type="
+    start = text.index(keys_marker) + len(keys_marker)
+    end = text.index(ktype_marker, start)
+    shown_keys = ast.literal_eval(text[start:end])
+    assert isinstance(shown_keys, list)
+    assert len(shown_keys) <= _ELEVATION_KEY_LIMIT, (
+        f"enumerated key list exceeded K={_ELEVATION_KEY_LIMIT}: len(shown)={len(shown_keys)}"
+    )
+
+
+def test_dod3_elevation_message_omits_values_of_dropped_keys() -> None:
+    """PR-gate on #178 round 8 (msg-1804 §6-6): capping the enumerated key
+    list must not become a licence to smuggle dropped keys' *values* into the
+    message elsewhere.
+
+    Same negative-assert style as
+    :func:`test_dod2b_elevation_message_never_dumps_values_from_non_string_or_extra_keys`
+    and :func:`test_dod2d_elevation_message_omits_non_str_key_values_from_mixed_keys`.
+    A future "helpful" edit that appends ``... plus N dropped keys with
+    values [...]`` to the message must fail this test.
+    """
+    from spirrow_mindwire.magickit.client import _ELEVATION_KEY_LIMIT
+
+    payload: dict[Any, Any] = {"error_type": "SomeError", "error": "explanation"}
+    # Add K + 50 keys, all with sentinel values. The sentinels for keys that
+    # end up sliced OUT must not appear anywhere in the message.
+    for i in range(_ELEVATION_KEY_LIMIT + 50):
+        payload[f"extra_{i:03d}"] = f"{_SENTINEL_NOT_TO_LEAK}_{i:03d}"
+    exc = _elevate_payload(payload)
+    text = str(exc)
+    # The sentinel prefix must not appear anywhere — none of the extra keys'
+    # values are admitted to the message, regardless of whether their name
+    # made the sorted-K slice.
+    assert _SENTINEL_NOT_TO_LEAK not in text, (
+        f"a dropped-key value leaked into elevation message: {text!r}"
+    )
+
+
+def test_dod3_elevation_message_is_deterministic_across_insertion_orders() -> None:
+    """PR-gate on #178 round 8 (msg-1804 §6-7): two payloads with the same
+    content but different insertion order must produce the same elevation
+    message.
+
+    Determinism follows from ``sorted(...)`` in the formatter, so this test
+    passes against the pre-round-8 code as well (msg-1804 §6-8 caveat: this
+    is a current-state pin, not a regression pin — pinned here so a future
+    edit that "helpfully" preserves insertion order for readability
+    reintroduces the non-determinism problem this bound cannot describe).
+    """
+    a: dict[Any, Any] = {"error_type": "E", "error": "why"}
+    b: dict[Any, Any] = {"error": "why", "error_type": "E"}
+    for i in range(30):  # exceeds K, so the slice matters
+        a[f"k{i:02d}"] = i
+    for i in reversed(range(30)):
+        b[f"k{i:02d}"] = i
+    assert str(_elevate_payload(a)) == str(_elevate_payload(b))
+
+
 def test_dod2_report_observed_warning_stringifies_the_exception_not_the_payload(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
