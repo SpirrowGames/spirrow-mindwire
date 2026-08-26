@@ -632,6 +632,124 @@ class TestNextParticipantFieldConsumer:
             assert h.mismatch_body_token is None, body
 
 
+class TestNextParticipantFieldPrReviewSentinel:
+    """The `pr-review <ref>` sentinel on the FIELD side (msg-#184 PR-gate REQUEST_CHANGES fix).
+
+    §3-2 forbids a second grammar for the lint, and the docstring in ``core.py`` promises the
+    Layer-3 resolver rewrites every field-bearing case into ROLE / HUMAN / NONE / PR_REVIEW.
+    Missing the `pr-review` sentinel on the field side breaks the field-driven PR-gate
+    (ADR-19 N-1): a field of ``pr-review acme/widgets#7`` falls out of every persona branch,
+    resolves to ABSENT, is seen as a mismatch by ``_reconcile``, and escalates to the human —
+    silently disabling the synchronous Tier B review whenever the envelope field is the
+    authoritative handoff. These tests pin that the field side speaks the same PR-gate
+    vocabulary as the body side.
+    """
+
+    def test_field_pr_review_with_body_absent_dispatches_the_gate(self) -> None:
+        # Row 3, PR-gate variant: judgement-page decide sets next_participant to a pr-review
+        # directive, body has no NEXT: line. This must route to PR_REVIEW quietly — the exact
+        # normal-path guarantee msg-1438 was about, but for the gate-firing quadrant.
+        h = resolve_handoff(
+            "opened the PR.",
+            _ROSTER,
+            next_participant="pr-review acme/widgets#7",
+        )
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+        assert h.field_mismatch is False
+        assert h.mismatch_body_token is None
+
+    def test_field_pr_review_accepts_a_pr_url_and_normalises_to_the_slug(self) -> None:
+        # Same normalisation the body path gets for free from parse_pr_ref: a raw URL in the
+        # field arrives here as the canonical owner/repo#n slug. Symmetric with body_only.
+        url = "https://github.com/acme/widgets/pull/7"
+        h = resolve_handoff("done.", _ROSTER, next_participant=f"pr-review {url}")
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+
+    def test_field_pr_review_agrees_with_body_pr_review_no_mismatch(self) -> None:
+        # Row 4, PR-gate variant: both sides asked for the gate on the same ref → route quietly,
+        # no mismatch event. _same_target already compares by canonical slug so both sides
+        # agree post-normalisation even if they typed different shapes of the same ref.
+        h = resolve_handoff(
+            "opened it.\n\nNEXT: pr-review acme/widgets#7",
+            _ROSTER,
+            next_participant="pr-review acme/widgets#7",
+        )
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "acme/widgets#7"
+        assert h.field_mismatch is False
+
+    def test_field_pr_review_disagrees_with_body_pr_review_on_different_ref(self) -> None:
+        # Row 5, PR-gate variant: both sides asked for the gate but named different PRs. This is
+        # a genuine divergence (someone typed the wrong number in one place) → escalate to human
+        # with the flag set, and record what BOTH sides said so the divergence is loud.
+        h = resolve_handoff(
+            "opened it.\n\nNEXT: pr-review acme/widgets#8",
+            _ROSTER,
+            next_participant="pr-review acme/widgets#7",
+        )
+        assert h.kind is HandoffKind.HUMAN
+        assert h.field_mismatch is True
+        assert h.token == "acme/widgets#7"
+        assert h.mismatch_body_token == "acme/widgets#8"
+
+    def test_field_pr_review_disagrees_with_body_persona_escalates(self) -> None:
+        # Row 5, mixed kinds: field says gate this PR, body says hand to Bohr. Different
+        # targets → escalate. Mirror of test_row5_mismatch_body_pr_review_vs_field_persona
+        # (which pinned the reverse: body pr-review vs field persona) so both directions are
+        # symmetric under §3-2 (the same resolver on both sides).
+        h = resolve_handoff(
+            "reply.\n\nNEXT: Bohr",
+            _ROSTER,
+            next_participant="pr-review acme/widgets#7",
+        )
+        assert h.kind is HandoffKind.HUMAN
+        assert h.field_mismatch is True
+        assert h.token == "acme/widgets#7"
+        assert h.mismatch_body_token == "Bohr"
+
+    def test_field_pr_review_agrees_when_body_has_no_next(self) -> None:
+        # Row 3 restated: body absent must NOT be reported as a mismatch, even for pr-review.
+        # This is the exact silent quadrant the sentinel-omission bug turned into a HUMAN
+        # escalation before the fix.
+        h = resolve_handoff("", _ROSTER, next_participant="pr-review acme/widgets#7")
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.field_mismatch is False
+
+    def test_field_pr_review_bare_word_without_operand_is_absent(self) -> None:
+        # Symmetric with the body path: ``pr-review`` alone is not the sentinel. The body path
+        # falls through to the participant matcher, which sees it as an unknown persona and
+        # returns ABSENT. On the field side we do the same, which _reconcile then turns into
+        # a row-5 mismatch (safety valve) — the sender wrote a partial directive and we do
+        # NOT silently swallow it.
+        h = resolve_handoff("", _ROSTER, next_participant="pr-review")
+        # Field resolved to ABSENT → row-5 escalation with field_mismatch=True.
+        assert h.kind is HandoffKind.HUMAN
+        assert h.field_mismatch is True
+
+    def test_field_pr_review_with_unparseable_ref_carries_operand_forward(self) -> None:
+        # Symmetric with the body path: the sender asked for a gate; the ref is unparseable to
+        # parse_pr_ref. Carry the raw operand forward as the token so the conductor's
+        # re-validation in core.py fails safe to the human (Tier B PR #103 round 4). The route
+        # still resolves to PR_REVIEW here — this side of the boundary does not shape-check
+        # PR refs, that is parse_pr_ref's job (msg-1158 §5).
+        h = resolve_handoff("", _ROSTER, next_participant="pr-review not-a-real-ref")
+        assert h.kind is HandoffKind.PR_REVIEW
+        assert h.token == "not-a-real-ref"
+        assert h.field_mismatch is False
+
+    def test_field_pr_review_vocabulary_matches_body(self) -> None:
+        # §3-2 pin: "lint は新しい文法を持たない". A field ``pr-review <ref>`` and a body
+        # ``NEXT: pr-review <ref>`` must resolve to the SAME Handoff — kind, token, and
+        # everything else. The one lit-up difference is that the body-side sees `NEXT:` text
+        # (which the field never had); post-resolution the two are indistinguishable.
+        body_only = resolve_handoff("NEXT: pr-review acme/widgets#7", _ROSTER)
+        field_only = resolve_handoff("", _ROSTER, next_participant="pr-review acme/widgets#7")
+        assert body_only.kind is field_only.kind
+        assert body_only.token == field_only.token
+
+
 # --------------------------------------------------------------------------- #
 # Layer-2 Markdown tolerance — the *safety* tests come first.
 #

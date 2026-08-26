@@ -440,11 +440,41 @@ def _resolve_body(body: str, roster: Mapping[str, Role]) -> Handoff:
 def _resolve_field(field_value: str, roster: Mapping[str, Role]) -> Handoff:
     """Resolve the raw ``next_participant`` field value.
 
-    The field is a plain participant name or reserved sentinel — a body-line NEXT: keyword is
-    not part of its shape (the field IS the decision). We reuse the same participant/sentinel
-    matching the body path uses, so field and body speak the same vocabulary and cannot disagree
-    on what a "valid participant" is; the field just skips the ``NEXT:``-line scaffolding.
+    The field vocabulary is the SAME as the body's — sentinels + persona name — because §3-2
+    forbids a second grammar for the lint (that is what makes the mismatch check well-defined:
+    "would the fallback resolver have routed differently?"). Concretely, the field admits
+    every shape the body's NEXT-token admits:
+
+    - the reserved ``human`` / ``none`` sentinels (case-insensitive),
+    - a persona name looked up on the roster (case-insensitive), and
+    - the ``pr-review <owner/repo#n>`` PR-gate sentinel (PR-2b-2) — the same word plus operand
+      the body path matches, resolved by the same :func:`~parse_pr_ref` owner of the ref grammar.
+
+    The field just skips the ``NEXT:``-line scaffolding: the value IS the decision, so there is
+    no keyword to strip off the front. Everything else — sentinel matching, roster lookup,
+    ref parsing — is byte-identical to :func:`_resolve_body` so the two sides cannot disagree
+    on what a "valid participant" is. The write side (`chatroom_post_message`) enforces the
+    same vocabulary with :class:`NextParticipantUnknownError`; this read-side resolution is the
+    fail-safe when a bad field slipped past that validation (§3-3's escape hatch is "drop the
+    field and re-send", which the row-5 escalation asks the human to do).
+
+    Missing the ``pr-review`` sentinel on this side would break the field-driven PR-gate
+    (ADR-19 N-1): a field of ``pr-review acme/widgets#7`` would fall out of every branch
+    below, resolve to ABSENT, be seen as a field/body mismatch by :func:`_reconcile`, and
+    escalate to the human — silently disabling the synchronous Tier B review whenever the
+    envelope field is the authoritative handoff. So the sentinel is matched here just as it
+    is on the body path, using the same ``_PR_REVIEW_RE`` + ``parse_pr_ref`` pair.
     """
+    sentinel = _PR_REVIEW_RE.match(field_value)
+    if sentinel is not None and (operand := sentinel.group("rest").strip()):
+        # Same trim + delegate as the body path: this module knows where the operand starts and
+        # where its leading decoration ends; ``parse_pr_ref`` owns what a PR ref IS. An operand
+        # the owner does not recognise is still the sentinel (the sender asked for a gate) and
+        # is carried forward raw; the conductor's re-validation in ``core.py`` (same function)
+        # then fails safe to the human rather than firing the gate on an unparseable ref.
+        payload = _OPERAND_PAYLOAD_RE.match(operand)
+        ref = parse_pr_ref(payload.group("payload") if payload is not None else operand)
+        return Handoff(HandoffKind.PR_REVIEW, token=ref.slug if ref is not None else operand)
     token = _name_from_raw(field_value)
     if token is None:
         return Handoff(HandoffKind.ABSENT, token=field_value)
