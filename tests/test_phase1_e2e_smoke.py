@@ -3,8 +3,10 @@
 Proves the **assembled Phase 1 stack** runs a full proposer → naysayer →
 proposer(revise+decide) → implementer cycle end-to-end, in-process and with
 no real models / network, against the ADR-2026-05-21-06 §8 acceptance
-criteria and the ADR-2026-05-21-04 Phase 0/1 completion bar ("複数 thread 並走
-しても人間スキップ可能" — minimal human input).
+criteria and the Phase 0/1 completion bar from the 2026-05-21-04 ADR
+(a spirrow-docs link stub; not in the in-repo ADR index because §M covers
+identity norms only — see spec/adr_index.yaml comment): "複数 thread 並走
+しても人間スキップ可能" — minimal human input.
 
 What is real here (the point of a composition smoke): the
 :class:`~spirrow_mindwire.dispatcher.core.Dispatcher`, the

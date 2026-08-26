@@ -36,10 +36,22 @@ version: 1
 obligations:
   - id: OBL-DECLARE-UNREADABLE
     role: implementer
-    origin:
-      moved_from: "src/spirrow_mindwire/adapters/implementer.py::_BASE_IMPLEMENTER_SYSTEM_PROMPT"
-      original_length: 795
-    body: "DOCUMENTS YOU CANNOT READ: you have this repository and this thread, and that is all. ADR bodies live in a separate docs repository you cannot reach, and you do not have CLAUDE.md. When a task asks you to check your work against a document whose text you cannot see, do NOT reconstruct what it probably says — say plainly \"I cannot read <doc>'s text, so I have not verified against it\", then verify everything you CAN and report that. An incomplete report is always better than a confident wrong one: stating the limit is what lets a human close the gap, while a plausible invention closes the subject and is believed. This applies to ADR titles too — a title is a summary, and reasoning outward from a summary as if it were the document is the exact mistake ADR-2026-05-29-13 exists to prevent."
+    # Was a verbatim-move entry (origin: implementer.py::_BASE_IMPLEMENTER_SYSTEM_PROMPT,
+    # original_length: 795); the `origin` block was DROPPED in T-adr-index-dangling-references
+    # when the body's closing phrase was rewritten to remove a bare ADR-2026-05-29-13
+    # anchor (a normative pointer at an ADR whose text lives outside this repo and is
+    # unreadable from the loop host — the exact failure mode that thread was born from).
+    # The rewrite changed the character length, so `moved_from` can no longer honestly
+    # claim byte-for-byte identity with the source literal. Bumping `original_length`
+    # to the new length was rejected on purpose: bumping keeps the `moved_from` claim
+    # standing while the invariant that policed it silently redefines itself — the
+    # same structural failure PR #135 Tier B Finding 1 caught in a different guise.
+    # Dropping `origin` outright classifies this entry as net-new formulation (the
+    # runtime rule now lives here as its own SOT) and preserves 795 as the historical
+    # source-length record (documentary provenance, not integrity — the entry no
+    # longer has any drift check of its own; whether integrity should be reintroduced
+    # for every entry uniformly is a step 4 candidate deferred to a later PR).
+    body: "DOCUMENTS YOU CANNOT READ: you have this repository and this thread, and that is all. ADR bodies live in a separate docs repository you cannot reach, and you do not have CLAUDE.md. When a task asks you to check your work against a document whose text you cannot see, do NOT reconstruct what it probably says — say plainly \"I cannot read <doc>'s text, so I have not verified against it\", then verify everything you CAN and report that. An incomplete report is always better than a confident wrong one: stating the limit is what lets a human close the gap, while a plausible invention closes the subject and is believed. This applies to ADR titles too — a title is a summary, and reasoning outward from a summary as if it were the document is the exact mistake this rule exists to prevent."
 
   - id: OBL-VERDICT-CONSTRAINT
     role: naysayer
@@ -66,7 +78,7 @@ obligations:
 
   - id: OBL-READBACK-ENTRY
     role: implementer
-    # Net-new English formulation of the ADR-2026-05-29-13 §N.1.3 spirit — no `origin`.
+    # Net-new English formulation of the pre-move CLAUDE.md §N.1.3 spirit — no `origin`.
     # The pre-move CLAUDE.md §N.1.3 was a Japanese numbered list (「入口チェック
     # (実装着手前)」) whose structure and phrasing do not survive a straight port to
     # a prompt-injected obligation body. A prior revision of this file falsely
@@ -77,16 +89,24 @@ obligations:
     # on PR #135 (Finding 1) called this out. Correct classification: net-new
     # formulation. The Japanese source rationale remains in
     # `spec/process/README.md` §「提案の核 — spec read-back」 for context.
-    body: "READ-BACK AT ENTRY (ADR-2026-05-29-13 §N.1.3): before you begin work on a task that names a proposer decide-msg, an ADR, a schema change, or an existing spec you claim to preserve, re-read the specifying message(s) as your primary source. Do not act from a summary of them (yours or the harness's) — a summary is lossy at exactly the field-level detail that a spec turns on (enum values, invariants, boundary conditions, the difference between \"preserve\" and \"extend\"). In your first reply, name the msg-ids you read and quote the concrete requirements you took from them. If a required document is unreadable to you, satisfy OBL-DECLARE-UNREADABLE instead of guessing."
+    # T-adr-index-dangling-references: the body opener used to name
+    # "ADR-2026-05-29-13 §N.1.3" as the rationale anchor; that ADR body lives
+    # outside this repo and is unreadable from the loop host, so the anchor was
+    # rewritten to point at the readable README section instead (spec/process/
+    # README.md §「提案の核」). Same fix pattern in OBL-READBACK-EXIT below.
+    body: "READ-BACK AT ENTRY (rationale in spec/process/README.md §「提案の核 — spec read-back」): before you begin work on a task that names a proposer decide-msg, an ADR, a schema change, or an existing spec you claim to preserve, re-read the specifying message(s) as your primary source. Do not act from a summary of them (yours or the harness's) — a summary is lossy at exactly the field-level detail that a spec turns on (enum values, invariants, boundary conditions, the difference between \"preserve\" and \"extend\"). In your first reply, name the msg-ids you read and quote the concrete requirements you took from them. If a required document is unreadable to you, satisfy OBL-DECLARE-UNREADABLE instead of guessing."
 
   - id: OBL-READBACK-EXIT
     role: implementer
-    # Net-new English formulation of the ADR-2026-05-29-13 §N.1.4 spirit — no `origin`.
+    # Net-new English formulation of the pre-move CLAUDE.md §N.1.4 spirit — no `origin`.
     # Same rationale as OBL-READBACK-ENTRY above: the pre-move CLAUDE.md §N.1.4
     # was a Japanese numbered list, not a prose obligation body; declaring it a
     # verbatim move + faking `original_length` to the English body's length
     # would falsify the invariant. Tier B naysayer on PR #135 (Finding 1).
-    body: "READ-BACK AT EXIT (ADR-2026-05-29-13 §N.1.4): before you hand the work back, open the same specifying message(s) again and build a requirement-by-requirement table — one row per bulletable requirement in the spec, each row marked \"reflected\" (with a code/PR pointer) or \"not reflected\" (with the reason). Assemble the table from the spec text, not from memory of what you did. Include the table in the PR body. A completion without this table is not a completion; if the spec is unreadable to you, satisfy OBL-DECLARE-UNREADABLE and state which rows you could not construct."
+    # T-adr-index-dangling-references: same rewrite as ENTRY — the body opener
+    # used to name "ADR-2026-05-29-13 §N.1.4"; the readable-text anchor lives at
+    # spec/process/README.md §「提案の核 — spec read-back」.
+    body: "READ-BACK AT EXIT (rationale in spec/process/README.md §「提案の核 — spec read-back」): before you hand the work back, open the same specifying message(s) again and build a requirement-by-requirement table — one row per bulletable requirement in the spec, each row marked \"reflected\" (with a code/PR pointer) or \"not reflected\" (with the reason). Assemble the table from the spec text, not from memory of what you did. Include the table in the PR body. A completion without this table is not a completion; if the spec is unreadable to you, satisfy OBL-DECLARE-UNREADABLE and state which rows you could not construct."
 
   - id: OBL-PRCHECK-READ
     role: implementer
@@ -97,6 +117,23 @@ obligations:
     # handing to a human — that "actually reads" is what this obligation binds.
     # See spec/process/README.md §「PR check の未読み放置を塞ぐ (OBL-PRCHECK-READ)」.
     body: "READ THE PR CHECK RUNS BEFORE HANDING TO HUMAN: on a turn that carries a PR, before you emit `NEXT: human`, read that PR's check runs (`gh pr checks <n>` or the JSON `gh pr view <n> --json statusCheckRollup`). If a check is red, fix it. You may escalate to the human with a red check ONLY if one of these two holds and you state which in the reply: (a) the same check is red on the PR **base revision** (this failure is not from your PR — verify by checking out the base locally and re-running the same script; do NOT rely on `gh run list --commit <base_sha>` alone, since a newly added check has no run on base and the query returns empty rather than a verdict); or (b) fixing the failure requires an operation you cannot perform under Tier C (repo settings / branch protection / secrets / anything the allow-list denies). Neither condition being true, do not emit `NEXT: human` while a red PR check stands. The normative treatment of red CI on PR gates is ADR-2026-06-03-16; this obligation carries only the read-and-triage duty, not the gate policy."
+
+  - id: OBL-ADR-CITATION-WEIGHT
+    role: implementer
+    # Net-new formulation (no origin — nothing was deleted from source to create it).
+    # T-adr-index-dangling-references: the sub-thread that made this obligation
+    # necessary — an implementer told to comply with "ADR-2026-05-29-13" was left
+    # with an id, a title, and no readable body, and had no rule to invoke to say
+    # "a bare number is not authority". OBL-DECLARE-UNREADABLE covers the general
+    # "declare what you cannot read" duty; this obligation names the specific case
+    # for ADR-by-number citations, so a bare number cannot be treated as a
+    # normative source without accompanying readable text. Its mechanical mate is
+    # the reverse check in `spirrow_mindwire.naysayer.adr_reverse_check`: that
+    # check ensures every ADR id token in tracked repo text at least resolves in
+    # the naysayer index — but a thread can hand the loop a bare number over the
+    # wire that the reverse check never sees, and THIS obligation is what binds
+    # the loop's response to that arrival.
+    body: "BARE ADR NUMBERS ARE NOT NORMATIVE CITATIONS: when a task, thread, or spec asks you to comply with an ADR by number, treat the number as an identifier — not as a normative source you have read. The ADR bodies live in a separate docs repository you cannot reach, and the id + title map you have is a summary of the ADR, not its text. If the citation is meant to bind your work, the binding text must accompany the citation (a verbatim clause quoted into the thread, or a pointer to a file in this repository whose text you can read). If it does not, do not reconstruct what the ADR probably says: satisfy OBL-DECLARE-UNREADABLE, name the id you were given, ask for the relevant clause to be quoted, and continue on what you CAN verify."
 
   - id: OBL-MERGE-MECHANISM
     role: implementer

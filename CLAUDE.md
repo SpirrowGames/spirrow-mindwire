@@ -29,7 +29,7 @@
 | ADR-2026-05-29-13 | 実装着手前 spec read-back チェックリスト (実装 = `spec/process/obligations.yaml` の `OBL-READBACK-ENTRY` / `OBL-READBACK-EXIT`、背景 = `spec/process/README.md`) | T-implementer-spec-readback-checklist |
 | ADR-2026-05-31-15 | independence-class グラデーション化 + 「2 協調 1 独立」配置 (ADR-09/T28 の independence_class レイヤーを二値→グラデーションに補強、別訓練分布 naysayer の規範根拠、N-1/C-2 トレードオフ併記、§0 順序) | T-T15-poc-h-phase1-kickoff |
 
-注: ADR-2026-05-31-14 (T15 ガワ方式撤回。旧 §M 参照番号 ADR-2026-05-27-08 を実体化・置換) は identity 規範定義ではないため §M 対象外 (UI 自動化手段選定 ADR)。develop repo に実体あり。
+注: ADR-2026-05-31-14 (T15 ガワ方式撤回。旧 §M 参照番号 2026-05-27-08 [この番号の ADR は実体化されず欠番、置換後の ADR-2026-05-31-14 に統合] を置換) は identity 規範定義ではないため §M 対象外 (UI 自動化手段選定 ADR)。develop repo に実体あり。
 注: 上表 ADR-09 (T28) / ADR-10〜13 は §M 参照名のみで develop repo に文書実体が未作成のものを含む (実体化は別タスク = §M 棚卸し PR、ADR-2026-05-31-15 と ADR-2026-05-31-14 の 2 本のみ本バッチで実体化済)。
 
 ADR 本体は spirrow-docs リポジトリで管理。本 CLAUDE.md からは参照のみで、ADR の規範定義を本ファイルに転載しないこと (F-04 / F-07 系の分散症状を回避)。
