@@ -2748,8 +2748,40 @@ try {
                 }
             }
             if ($stolenList.Count -gt 0) {
+                # HOLD-AND-WAIT AVOIDANCE (msg-1955 blocker). When `requires` is an array and only
+                # SOME resources were stolen by a concurrent operator write, the merger left the
+                # ones we won durably held by us on disk. Bailing without releasing them causes a
+                # classic hold-and-wait deadlock: next tick we sit in `lease-waiting` for the
+                # stolen resource while STILL holding the won ones, blocking every other candidate
+                # that needs any of them for the full LeaseIdleTtl (2h) until TTL revocation. The
+                # mechanism's design contract is "all-or-nothing" acquire (Test-LeaseAvailableFor
+                # returns 'available' only when EVERY required resource is free); the same
+                # atomicity must apply to bail. Roll back every resource we managed to acquire
+                # for this candidate BEFORE the disposition write and the flush below.
+                #
+                # Invoke-LeaseReleaseHold is idempotent w.r.t. operator override — it's a no-op
+                # on resources where the operator's grant won the merge race (holder != us), so
+                # we can safely enumerate the full $cand.requires without pre-filtering.
+                foreach ($resource in $cand.requires) {
+                    if (-not $leasesState.ContainsKey($resource)) { continue }
+                    if ($null -eq $leasesState[$resource]) { continue }
+                    Invoke-LeaseReleaseHold -Lease $leasesState[$resource] -CandidateKey $cand.key -Now $nowUtc | Out-Null
+                }
+                # SECOND FLUSH: make the roll-back durable on disk BEFORE we continue past this
+                # candidate. Without this, the rolled-back acquire only exists in memory —
+                # end-of-tick flush would still make it durable eventually, but if the sweep is
+                # OS-killed between here and end-of-tick (the same durability failure round 8
+                # closed for launch), the pre-spawn flush's write of "us as holder" is what
+                # survives on disk. Same generation merger; the release bumps generation so a
+                # subsequent operator write is still detected via optimistic concurrency.
+                $rollbackMerged = Merge-LeasesStateForWrite -Memory $leasesState `
+                    -OriginalGenerations $leasesOriginalGenerations -DiskPath $leasesStatePath
+                Save-JsonState -Path $leasesStatePath -State $rollbackMerged
+                $leasesState = ConvertTo-LeasesStateHashtable $rollbackMerged
+                $leasesOriginalGenerations = Get-LeaseGenerations -LeasesState $leasesState
+
                 Confirm-LogWorthKeeping
-                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — lease lost to concurrent operator write on [$($stolenList -join ', ')], not launching (commit-launch NOT called — baseline preserved so next tick re-evaluates cleanly)"
+                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — lease lost to concurrent operator write on [$($stolenList -join ', ')], not launching (commit-launch NOT called — baseline preserved so next tick re-evaluates cleanly; won leases rolled back via Invoke-LeaseReleaseHold to avoid hold-and-wait)"
                 $dispositions[$cand.key] = 'lease-lost'
                 $skipped++
                 continue

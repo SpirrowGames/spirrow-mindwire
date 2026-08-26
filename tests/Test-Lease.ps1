@@ -462,7 +462,11 @@ $mustCall = @(
     'Invoke-LeaseGrantFromEmpty',
     # msg-1875 blocker fix: probe scrubs the queue of quarantined / off-sweep / dropped-
     # requires waiters before any promotion decision, so no dead waiter is ever promoted.
-    'Remove-IneligibleLeaseWaiters'
+    'Remove-IneligibleLeaseWaiters',
+    # msg-1955 blocker fix: partial-acquire rollback on the lease-lost bail so a candidate
+    # that lost the race on one required resource does not durably hold the others (hold-and-
+    # wait deadlock avoidance).
+    'Invoke-LeaseReleaseHold'
 )
 foreach ($fn in $mustCall) {
     $found = $commandNames -contains $fn
@@ -1164,6 +1168,154 @@ else {
     $hasContainsKeyGate = $scrubBlockSrc -match '\$decideVerdicts\.ContainsKey'
     CheckTrue "scrub eligibility block gates on \$decideVerdicts.ContainsKey (held candidates preserved: they have no verdict)" $hasContainsKeyGate
 }
+
+# --- 19. Invoke-LeaseReleaseHold — roll back a partial acquire (msg-1955 blocker) ----------------
+#
+# Ensures the hold-and-wait avoidance primitive behaves correctly:
+#   1. Releases when we're the holder — resets holder-side clocks, bumps generation, PRESERVES
+#      the permanent audit trio (reclaimed_from / reclaimed_at / reclaimed_reason).
+#   2. No-op when we're NOT the holder (idempotent w.r.t. operator override — the caller
+#      enumerates all $cand.requires without pre-filtering).
+#   3. Queue stays intact — a rollback doesn't drop waiters that had queued while we briefly held.
+Write-Host "Invoke-LeaseReleaseHold — release only-when-holder, preserve permanent audit (msg-1955 blocker)"
+
+# Case 1: we're the holder → released, generation bumped, permanent audit preserved.
+$lease = @{
+    holder            = 'p/T-us'
+    acquired_at       = '2026-08-26T05:00:00Z'
+    last_progress_at  = '2026-08-26T05:00:00Z'
+    idle_evaluations  = 3
+    generation        = 7
+    expiring          = $true
+    reclaimed_from    = 'p/T-crashed'
+    reclaimed_at      = '2026-08-25T00:00:00Z'
+    reclaimed_reason  = 'operator-clear: PIE crashed'
+    reclaim_required  = $true
+    revoked_at        = '2026-08-26T04:59:00Z'
+    revoked_reason    = 'idle'
+    queue             = @( @{ key = 'p/T-w1'; waiting_since = '2026-08-26T04:00:00Z' } )
+}
+$result = Invoke-LeaseReleaseHold -Lease $lease -CandidateKey 'p/T-us' -Now $now
+Check "release-hold: action = released-hold when we hold" 'released-hold' $result.action
+Check "release-hold: holder key removed" $false ($lease.ContainsKey('holder'))
+Check "release-hold: acquired_at cleared" $null $lease['acquired_at']
+Check "release-hold: last_progress_at cleared" $null $lease['last_progress_at']
+Check "release-hold: idle_evaluations reset to 0" 0 $lease['idle_evaluations']
+Check "release-hold: generation bumped (semantic write for merger)" 8 $lease['generation']
+CheckFalse "release-hold: expiring flag cleared" ([bool]$lease['expiring'])
+# The permanent audit trio survives — this is the msg-1900 invariant carried forward.
+Check "release-hold: reclaimed_from PRESERVED" 'p/T-crashed' $lease['reclaimed_from']
+Check "release-hold: reclaimed_at PRESERVED" '2026-08-25T00:00:00Z' $lease['reclaimed_at']
+Check "release-hold: reclaimed_reason PRESERVED" 'operator-clear: PIE crashed' $lease['reclaimed_reason']
+CheckTrue "release-hold: reclaim_required PRESERVED" ([bool]$lease['reclaim_required'])
+# Transient Phase-1 fields cleared.
+Check "release-hold: revoked_at cleared (TRANSIENT)" $null $lease['revoked_at']
+Check "release-hold: revoked_reason cleared (TRANSIENT)" $null $lease['revoked_reason']
+# Queue survives — waiters that queued while we held are preserved for the next promotion.
+Check "release-hold: queue preserved (waiter count)" 1 $lease['queue'].Count
+
+# Case 2: operator's grant won → we're NOT the holder → no-op.
+$lease = @{ holder = 'p/T-operator-chose'; generation = 9; queue = @() }
+$result = Invoke-LeaseReleaseHold -Lease $lease -CandidateKey 'p/T-us' -Now $now
+Check "release-hold: action = noop-not-holder when someone else holds" 'noop-not-holder' $result.action
+Check "release-hold (not-holder): holder unchanged" 'p/T-operator-chose' $lease['holder']
+Check "release-hold (not-holder): generation unchanged" 9 $lease['generation']
+
+# Case 3: null lease (defensive) → noop.
+$result = Invoke-LeaseReleaseHold -Lease $null -CandidateKey 'p/T-us' -Now $now
+Check "release-hold: null lease is a safe noop" 'noop-not-holder' $result.action
+
+# Case 4: empty-holder lease (freshly released) → noop.
+$lease = @{ holder = $null; generation = 5; queue = @() }
+$result = Invoke-LeaseReleaseHold -Lease $lease -CandidateKey 'p/T-us' -Now $now
+Check "release-hold: empty-holder lease is a noop" 'noop-not-holder' $result.action
+
+# --- 20. Wrapper AST wiring — lease-lost bail rolls back partial acquires (msg-1955 blocker) -----
+#
+# Regression pin: the `lease-lost` bail branch MUST call Invoke-LeaseReleaseHold on the
+# won resources before `continue`, otherwise multi-resource candidates cause hold-and-wait
+# deadlocks. Also verify a SECOND Merge-LeasesStateForWrite call follows the release (to make
+# the rollback durable on disk before we walk away from the candidate).
+Write-Host "Wrapper AST wiring — lease-lost bail rolls back won leases (msg-1955 blocker)"
+
+$mustCallReleaseHold = @($ast.FindAll(
+    { param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.CommandElements[0].Extent.Text -eq 'Invoke-LeaseReleaseHold'
+    }, $true))
+CheckTrue "wrapper calls Invoke-LeaseReleaseHold" ($mustCallReleaseHold.Count -ge 1)
+
+# The release must appear at a source line that is INSIDE the lease-lost bail branch. We
+# encode that as: Invoke-LeaseReleaseHold is bracketed by (a) the 'lease-lost' disposition
+# string (which lives in the bail branch) and (b) the second Merge-LeasesStateForWrite call
+# used to persist the rollback. Verify the source-order: release call precedes the log line
+# / disposition write, and a Merge call sits between the release and the `continue`.
+$wrapperText2 = Get-Content -LiteralPath $sweepScript -Raw
+$bailRegionPattern = [regex]::Escape('$stolenList.Count -gt 0') + '[\s\S]*?' + [regex]::Escape("'lease-lost'")
+$bailRegionMatch = [regex]::Match($wrapperText2, $bailRegionPattern)
+if (-not $bailRegionMatch.Success) {
+    $script:failures++
+    Write-Host "  FAIL  could not locate the lease-lost bail region ($stolenList.Count -gt 0 ... 'lease-lost')"
+}
+else {
+    $bailRegionSrc = $bailRegionMatch.Value
+    $hasReleaseInBail = $bailRegionSrc -match 'Invoke-LeaseReleaseHold'
+    CheckTrue "lease-lost bail region contains Invoke-LeaseReleaseHold (rollback wired)" $hasReleaseInBail
+    # A second Merge-LeasesStateForWrite must appear inside the bail branch to persist the
+    # rollback. Match at least one Merge- call in the bail region.
+    $hasMergeInBail = $bailRegionSrc -match 'Merge-LeasesStateForWrite'
+    CheckTrue "lease-lost bail region contains a Merge-LeasesStateForWrite call (rollback flushed)" $hasMergeInBail
+    # And Save-JsonState too — merging without saving is the msg-1877 loophole.
+    $hasSaveInBail = $bailRegionSrc -match 'Save-JsonState'
+    CheckTrue "lease-lost bail region contains a Save-JsonState call (rollback durable)" $hasSaveInBail
+}
+
+# --- 21. Grant-Lease.ps1 AST — -To is Mandatory in the Grant parameter set (msg-1955 blocker) ----
+#
+# Regression pin: -To must be Mandatory=$true in the Grant parameter set. Manual `throw`
+# fallbacks break PowerShell's native interactive prompt.
+Write-Host "Grant-Lease.ps1 AST — -To parameter is Mandatory in Grant set (msg-1955 blocker)"
+
+$grantAst = [System.Management.Automation.Language.Parser]::ParseFile($grantScript, [ref]$null, [ref]$null)
+$paramAsts = @($grantAst.FindAll(
+    { param($n) $n -is [System.Management.Automation.Language.ParameterAst] }, $true))
+$toParam = @($paramAsts | Where-Object { $_.Name.VariablePath.UserPath -eq 'To' })
+if ($toParam.Count -eq 0) {
+    $script:failures++
+    Write-Host "  FAIL  -To parameter not found in Grant-Lease.ps1"
+}
+else {
+    # Find the Parameter attribute whose ParameterSetName is 'Grant' and check Mandatory.
+    $grantSetIsMandatory = $false
+    foreach ($attr in $toParam[0].Attributes) {
+        if ($attr -isnot [System.Management.Automation.Language.AttributeAst]) { continue }
+        if ($attr.TypeName.Name -ne 'Parameter') { continue }
+        $isGrantSet = $false
+        $isMandatory = $false
+        foreach ($named in $attr.NamedArguments) {
+            if ($named.ArgumentName -eq 'ParameterSetName') {
+                $val = "$($named.Argument.Extent.Text)".Trim("'", '"')
+                if ($val -eq 'Grant') { $isGrantSet = $true }
+            }
+            if ($named.ArgumentName -eq 'Mandatory') {
+                # ArgumentName-only (Mandatory switch) means true; explicit value is $true / $false.
+                if ($named.ExpressionOmitted) { $isMandatory = $true }
+                else {
+                    $argText = "$($named.Argument.Extent.Text)".Trim()
+                    if ($argText -match '\$true') { $isMandatory = $true }
+                }
+            }
+        }
+        if ($isGrantSet -and $isMandatory) { $grantSetIsMandatory = $true; break }
+    }
+    CheckTrue "-To has Mandatory=`$true in the Grant parameter set" $grantSetIsMandatory
+}
+
+# Also verify the old manual throw fallback is gone. `-To is required for a grant` was the
+# error string in the removed guard.
+$grantSrcText = Get-Content -LiteralPath $grantScript -Raw
+$hasManualThrow = $grantSrcText -match '-To is required for a grant'
+CheckFalse "manual '-To is required' throw guard removed (PowerShell native binding wins)" $hasManualThrow
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }

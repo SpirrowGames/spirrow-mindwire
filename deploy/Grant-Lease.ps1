@@ -57,8 +57,14 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Resource,
 
-    # State key of the new holder: "project/thread_id". Required for -Grant, ignored for -Clear.
-    [Parameter(Mandatory = $false, ParameterSetName = 'Grant')]
+    # State key of the new holder: "project/thread_id". Mandatory for -Grant so PowerShell's
+    # native parameter binding interactively prompts for it when missing on the command line.
+    # msg-1955 correction: previously $false with a manual `throw` fallback, which broke
+    # PowerShell's interactive prompt (the operator would get a stack-trace instead of a
+    # readable prompt). `Mandatory = $true` uses the shell's native prompt / non-interactive
+    # error path, which is what the caller expects.
+    [Parameter(Mandatory = $true, ParameterSetName = 'Grant')]
+    [ValidateNotNullOrEmpty()]
     [ValidatePattern('^[^/]+/[^/]+$')]
     [string]$To,
 
@@ -107,7 +113,8 @@ $nowUtc = [DateTime]::UtcNow
 
 switch ($PSCmdlet.ParameterSetName) {
     'Grant' {
-        if (-not $To) { throw "-To is required for a grant" }
+        # -To is now Mandatory=$true (msg-1955); the manual `throw` fallback was removed. If
+        # PowerShell reaches this branch, $To is guaranteed non-empty and pattern-valid.
         $lease = if ($state.ContainsKey($Resource)) { $state[$Resource] } else { $null }
         $priorHolder = if ($lease) { "$($lease['holder'])" } else { $null }
 
