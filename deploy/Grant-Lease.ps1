@@ -135,35 +135,39 @@ switch ($PSCmdlet.ParameterSetName) {
             # Reclaim-duty policy on a grant (msg-1876 blocker correction):
             #   - Overwriting a LIVE different holder → new holder inherits reclaim duty
             #     (msg-1183 D-6'e). This mirrors the automated revoke path so there is one
-            #     contract for "you just took a lease from someone else."
+            #     contract for "you just took a lease from someone else." Write BOTH
+            #     `reclaimed_from` and `reclaimed_reason` (permanent audit, msg-1900 split).
             #   - Empty-holder grant (previous -Clear or Phase-2 'released' left the record
             #     with holder=null AND reclaim_required=true) → PRESERVE the prior flag +
-            #     `reclaimed_from`. Erasing them would fire a new holder blindly on top of
-            #     the physically-lingering session — the exact silent collision this
-            #     mechanism exists to end. Mirrors Invoke-LeaseGrantFromEmpty's semantics
-            #     (lib/Lease.ps1 round 5).
-            #   - Same-holder re-grant (idempotent) → preserve existing state; the operator's
-            #     re-grant does not cancel prior reclaim duty.
+            #     `reclaimed_from` + `reclaimed_reason`. Erasing them would fire a new holder
+            #     blindly on top of the physically-lingering session AND lose the operator's
+            #     original Clear-reason narrative in the digest (msg-1876 + msg-1900).
+            #   - Same-holder re-grant (idempotent) → preserve existing state.
             $inheritedDirty = $false
             $inheritedFrom = $null
             if ($priorHolder -and $priorHolder -ne $To) {
-                $lease['reclaimed_from']   = $priorHolder
-                $lease['reclaim_required'] = $true
+                $lease['reclaimed_from']    = $priorHolder
+                $lease['reclaimed_at']      = $nowIso
+                $lease['reclaimed_reason']  = "operator-grant: $Reason"
+                $lease['reclaim_required']  = $true
                 $inheritedDirty = $true
                 $inheritedFrom = $priorHolder
             }
             else {
-                # Do NOT touch reclaim_required / reclaimed_from — preserve whatever was there
-                # (true from a prior -Clear, or false from a clean state). Fall back to false
-                # only if the record was hand-edited to omit the field entirely.
+                # Do NOT touch reclaim_required / reclaimed_from / reclaimed_reason — preserve
+                # whatever was there (true from a prior -Clear, or false from a clean state).
+                # Fall back to false only if the record was hand-edited to omit the field.
                 if (-not $lease.ContainsKey('reclaim_required')) { $lease['reclaim_required'] = $false }
                 if ($lease.ContainsKey('reclaim_required') -and [bool]$lease['reclaim_required']) {
                     $inheritedDirty = $true
                     $inheritedFrom = if ($lease.ContainsKey('reclaimed_from')) { "$($lease['reclaimed_from'])" } else { '' }
                 }
             }
-            $lease['revoked_at']        = $nowIso
-            $lease['revoked_reason']    = "operator-grant: $Reason"
+            # `revoked_*` are TRANSIENT Phase-1 intent (msg-1900 split). A fresh operator grant
+            # supersedes any pending Phase-1 intent from an earlier probe cycle, so clear them.
+            # The audit trail lives in `reclaimed_*` above, not here.
+            $lease['revoked_at']        = $null
+            $lease['revoked_reason']    = $null
             # Dequeue the new holder (if they were waiting).
             Remove-LeaseWaiter -Lease $lease -WaiterKey $To
             $state[$Resource] = $lease
@@ -204,10 +208,19 @@ switch ($PSCmdlet.ParameterSetName) {
         $lease['generation']        = $priorGen + 1
         $lease['pinned']            = $false
         $lease['expiring']          = $false
+        # PERMANENT audit paired with `reclaimed_from`. `reclaimed_reason` is what the digest
+        # reads — its narrative ("operator-clear: <op-provided text>") survives any subsequent
+        # state-machine transition (progress, drain-from-empty, self-hold re-acquire) that
+        # would otherwise clear a transient field. See lib/Lease.ps1 file-header split
+        # rationale (msg-1900).
         $lease['reclaimed_from']    = $priorHolder
+        $lease['reclaimed_at']      = $nowIso
+        $lease['reclaimed_reason']  = "operator-clear: $Reason"
         $lease['reclaim_required']  = $true
-        $lease['revoked_at']        = $nowIso
-        $lease['revoked_reason']    = "operator-clear: $Reason"
+        # `revoked_*` are TRANSIENT Phase-1 intent (msg-1900 split). An operator Clear
+        # supersedes any pending Phase-1 intent from an earlier probe cycle, so clear them.
+        $lease['revoked_at']        = $null
+        $lease['revoked_reason']    = $null
         $state[$Resource] = $lease
 
         Write-Host "cleared:  $Resource (prior holder: $priorHolder)"

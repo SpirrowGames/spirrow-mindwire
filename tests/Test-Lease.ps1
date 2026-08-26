@@ -115,11 +115,21 @@ $lease = @{
     expiring         = $true
     revoked_at       = '2026-08-25T00:00:00Z'
     revoked_reason   = 'idle'
+    # msg-1900 blocker: PERMANENT audit fields must survive progress. Set them here on the
+    # fixture so we can verify the split.
+    reclaimed_from   = 'p/T-prior'
+    reclaimed_at     = '2026-08-24T00:00:00Z'
+    reclaimed_reason = 'operator-clear: PIE crashed'
 }
 Update-LeaseFromClassification -Lease $lease -Classification 'progress' -Now $now
 CheckFalse "progress clears stale expiring flag (msg-1757 blocker #1)" ([bool]$lease['expiring'])
-Check "progress clears stale revoked_at" $null $lease['revoked_at']
-Check "progress clears stale revoked_reason" $null $lease['revoked_reason']
+Check "progress clears stale revoked_at (TRANSIENT Phase-1 intent)" $null $lease['revoked_at']
+Check "progress clears stale revoked_reason (TRANSIENT Phase-1 intent)" $null $lease['revoked_reason']
+# msg-1900 blocker: PERMANENT audit fields must NOT be cleared by progress. If they were, the
+# digest would render 'idle' instead of the operator's Tier-C Clear-reason.
+Check "progress PRESERVES reclaimed_from (msg-1900: permanent audit)" 'p/T-prior' $lease['reclaimed_from']
+Check "progress PRESERVES reclaimed_at (msg-1900: permanent audit)" '2026-08-24T00:00:00Z' $lease['reclaimed_at']
+Check "progress PRESERVES reclaimed_reason (msg-1900: permanent audit)" 'operator-clear: PIE crashed' $lease['reclaimed_reason']
 
 # Composite scenario: Phase 1 marks expiring; probe next tick sees progress; a THIRD tick with
 # expiring conditions again must land in Phase 1, not Phase 2 (promotion).
@@ -303,6 +313,11 @@ CheckTrue "phase 2: reclaim_required is true (msg-1183 D-6'e)" ([bool]$lease['re
 Check "phase 2: generation bumped" 3 $lease['generation']
 CheckFalse "phase 2: expiring flag cleared" ([bool]$lease['expiring'])
 Check "phase 2: queue empty (promoted waiter dequeued)" 0 $lease['queue'].Count
+# msg-1900 blocker: Phase-2 promotion writes PERMANENT audit (reclaimed_reason) and CLEARS
+# transient Phase-1 fields (revoked_*). Digest reads reclaimed_reason.
+Check "phase 2: reclaimed_reason set to Reason ('idle')" 'idle' $lease['reclaimed_reason']
+Check "phase 2: revoked_at cleared (Phase-1 intent fulfilled)" $null $lease['revoked_at']
+Check "phase 2: revoked_reason cleared (Phase-1 intent fulfilled)" $null $lease['revoked_reason']
 
 # msg-1852 blocker: Invoke-LeaseGrantFromEmpty drains a queued waiter into an empty lease
 # (the state Grant-Lease.ps1 -Clear leaves when waiters were already registered). Without this,
@@ -310,6 +325,10 @@ Check "phase 2: queue empty (promoted waiter dequeued)" 0 $lease['queue'].Count
 Write-Host "Invoke-LeaseGrantFromEmpty — FIFO drain on empty-holder + non-empty queue (msg-1852 blocker)"
 
 # --- happy path: empty lease with waiters + reclaim_required=true (operator -Clear left this) ---
+# msg-1900 blocker: the operator's Clear-reason lives in `reclaimed_reason` (permanent audit
+# paired with `reclaimed_from`), NOT in `revoked_reason` (transient Phase-1 intent).
+# `revoked_*` are intentionally stale/noise here to prove the drain clears them without
+# touching the permanent audit.
 $lease = @{
     holder            = $null
     generation        = 7
@@ -317,8 +336,10 @@ $lease = @{
     expiring          = $false
     reclaim_required  = $true
     reclaimed_from    = 'p/T-cleared'
-    revoked_at        = '2026-08-25T00:00:00Z'
-    revoked_reason    = 'operator-clear: PIE crashed'
+    reclaimed_at      = '2026-08-25T00:00:00Z'
+    reclaimed_reason  = 'operator-clear: PIE crashed'
+    revoked_at        = '2026-08-25T12:00:00Z'
+    revoked_reason    = 'idle'
     queue = @(
         @{ key = 'p/T-w1'; waiting_since = $now.AddMinutes(-30).ToUniversalTime().ToString("o") },
         @{ key = 'p/T-w2'; waiting_since = $now.AddMinutes(-10).ToUniversalTime().ToString("o") }
@@ -331,11 +352,15 @@ Check "grant-from-empty: lease.holder set to promoted waiter" 'p/T-w1' $lease['h
 Check "grant-from-empty: generation bumped" 8 $lease['generation']
 CheckTrue "grant-from-empty: reclaim_required preserved on new holder" ([bool]$lease['reclaim_required'])
 Check "grant-from-empty: reclaimed_from preserved" 'p/T-cleared' $lease['reclaimed_from']
-Check "grant-from-empty: revoked_at cleared (that annotated the INTO-empty transition)" $null $lease['revoked_at']
-Check "grant-from-empty: revoked_reason cleared" $null $lease['revoked_reason']
+# msg-1900 blocker: PERMANENT audit survives the drain. Digest reads `reclaimed_reason`, so
+# losing it here would silently overwrite operator's Clear-reason with 'idle' in the digest.
+Check "grant-from-empty: reclaimed_reason PRESERVED (msg-1900 blocker)" 'operator-clear: PIE crashed' $lease['reclaimed_reason']
+Check "grant-from-empty: revoked_at cleared (TRANSIENT Phase-1 intent no longer applies)" $null $lease['revoked_at']
+Check "grant-from-empty: revoked_reason cleared (TRANSIENT Phase-1 intent no longer applies)" $null $lease['revoked_reason']
 Check "grant-from-empty: dequeued only the promoted waiter" 1 $lease['queue'].Count
 Check "grant-from-empty: remaining waiter is w2" 'p/T-w2' $lease['queue'][0].key
 Check "grant-from-empty: caller sees reclaim_required=true for notification decision" $true $grant.reclaim_required
+Check "grant-from-empty: caller sees reclaimed_reason for digest / notification" 'operator-clear: PIE crashed' $grant.reclaimed_reason
 
 # --- edge: empty lease with empty queue -> noop, nothing to grant ---
 $lease = @{ holder = $null; generation = 5; queue = @() }
@@ -616,13 +641,13 @@ try {
     $memoryB['editor']['last_progress_at'] = '2026-08-26T05:00:00Z'
     # Meanwhile operator (Grant-Lease.ps1) rewrote disk: new holder, generation bumped to 6.
     $diskB1 = @{
-        editor = @{ holder = 'p/T-b'; generation = 6; last_progress_at = '2026-08-26T04:59:00Z'; idle_evaluations = 0; queue = @(); revoked_reason = 'operator-grant: emergency' }
+        editor = @{ holder = 'p/T-b'; generation = 6; last_progress_at = '2026-08-26T04:59:00Z'; idle_evaluations = 0; queue = @(); reclaimed_reason = 'operator-grant: emergency' }
     }
     Save-FixtureLeases -Path $fixturePath -State $diskB1
     $mergedB = Merge-LeasesStateForWrite -Memory $memoryB -OriginalGenerations $originalGens -DiskPath $fixturePath
     Check "operator-write: disk holder wins over sweep memory" 'p/T-b' $mergedB['editor'].holder
     Check "operator-write: disk generation wins" 6 $mergedB['editor'].generation
-    Check "operator-write: disk revoked_reason preserved" 'operator-grant: emergency' $mergedB['editor'].revoked_reason
+    Check "operator-write: disk reclaimed_reason preserved (msg-1900 audit split)" 'operator-grant: emergency' $mergedB['editor'].reclaimed_reason
 
     # --- scenario C: sweep did an acquire (bumped generation) with no operator write. Memory wins.
     $diskC0 = @{
@@ -869,12 +894,18 @@ function Load-FixtureLeasesGL {
 
 try {
     # --- scenario A: prior state is empty-with-reclaim from a Clear. Grant must preserve. -------
+    # msg-1900 blocker: the operator's Clear-reason ("PIE crashed") lives in `reclaimed_reason`
+    # (permanent audit) not `revoked_reason` (transient Phase-1 intent). This fixture reflects
+    # the post-round-9 shape: `reclaimed_reason` is set, `revoked_*` are null.
     Save-FixtureLeasesGL -Path $fixtureLeases -State @{
         editor = @{
             holder = $null; acquired_at = $null; last_progress_at = $null
             idle_evaluations = 0; generation = 7; pinned = $false; expiring = $false
-            reclaimed_from = 'p/T-crashed-holder'; reclaim_required = $true
-            revoked_at = '2026-08-25T00:00:00Z'; revoked_reason = 'operator-clear: PIE crashed'
+            reclaimed_from = 'p/T-crashed-holder'
+            reclaimed_at = '2026-08-25T00:00:00Z'
+            reclaimed_reason = 'operator-clear: PIE crashed'
+            reclaim_required = $true
+            revoked_at = $null; revoked_reason = $null
             queue = @()
         }
     }
@@ -894,8 +925,11 @@ try {
     Check "empty-state grant: new holder recorded" 'p/T-new-owner' "$($post['editor'].holder)"
     CheckTrue "empty-state grant: reclaim_required PRESERVED (msg-1876 blocker)" ([bool]$post['editor'].reclaim_required)
     Check "empty-state grant: reclaimed_from PRESERVED (prior Clear's audit)" 'p/T-crashed-holder' "$($post['editor'].reclaimed_from)"
+    # msg-1900 blocker: reclaimed_reason PRESERVED across the empty-state grant. If overwritten
+    # (as the round-8 code did into revoked_reason then cleared on progress), the digest would
+    # eventually show 'idle' instead of the operator's Clear narrative.
+    Check "empty-state grant: reclaimed_reason PRESERVED (msg-1900 blocker)" 'operator-clear: PIE crashed' "$($post['editor'].reclaimed_reason)"
     Check "empty-state grant: generation bumped from 7" 8 ([int]$post['editor'].generation)
-    Check "empty-state grant: revoked_reason updated to operator-grant" $true (("$($post['editor'].revoked_reason)").StartsWith('operator-grant:'))
     # Console output must carry the inherited-reclaim warning so the operator sees it at
     # command time — the operator-inbox notification is fired by the next sweep probe.
     $hasWarning = @($grantOutput | Where-Object { "$_" -match 'reclaim_required=true' }).Count -gt 0
@@ -906,7 +940,7 @@ try {
         editor = @{
             holder = 'p/T-live'; acquired_at = '2026-08-26T00:00:00Z'; last_progress_at = '2026-08-26T00:00:00Z'
             idle_evaluations = 0; generation = 3; pinned = $false; expiring = $false
-            reclaimed_from = $null; reclaim_required = $false
+            reclaimed_from = $null; reclaimed_at = $null; reclaimed_reason = $null; reclaim_required = $false
             revoked_at = $null; revoked_reason = $null
             queue = @()
         }
@@ -922,13 +956,15 @@ try {
     Check "live-overwrite grant: new holder recorded" 'p/T-forced' "$($post['editor'].holder)"
     CheckTrue "live-overwrite grant: reclaim_required = true (msg-1183 D-6'e, unchanged)" ([bool]$post['editor'].reclaim_required)
     Check "live-overwrite grant: reclaimed_from records prior live holder" 'p/T-live' "$($post['editor'].reclaimed_from)"
+    # msg-1900 blocker: live-overwrite grant writes reclaimed_reason with the operator's reason.
+    Check "live-overwrite grant: reclaimed_reason = 'operator-grant: <reason>'" 'operator-grant: operator override' "$($post['editor'].reclaimed_reason)"
 
     # --- scenario C: prior state is clean (no reclaim owed). Grant into empty must NOT invent one.
     Save-FixtureLeasesGL -Path $fixtureLeases -State @{
         editor = @{
             holder = $null; acquired_at = $null; last_progress_at = $null
             idle_evaluations = 0; generation = 2; pinned = $false; expiring = $false
-            reclaimed_from = $null; reclaim_required = $false
+            reclaimed_from = $null; reclaimed_at = $null; reclaimed_reason = $null; reclaim_required = $false
             revoked_at = $null; revoked_reason = $null
             queue = @()
         }
@@ -943,6 +979,50 @@ try {
     $post = Load-FixtureLeasesGL -Path $fixtureLeases
     Check "clean-empty grant: new holder recorded" 'p/T-first' "$($post['editor'].holder)"
     CheckFalse "clean-empty grant: reclaim_required stays false (no prior duty to inherit)" ([bool]$post['editor'].reclaim_required)
+    # msg-1900 blocker: reclaimed_reason stays null when no reclaim happened.
+    Check "clean-empty grant: reclaimed_reason stays null (no invented duty audit)" $null $post['editor'].reclaimed_reason
+
+    # --- scenario D (NEW, msg-1900 blocker regression): Clear then Grant then progress must not
+    # lose the operator's Clear-reason from the digest. This is the exact end-to-end failure the
+    # naysayer described in msg-1900. Uses Get-LeaseSummaryLines directly against the final state.
+    Save-FixtureLeasesGL -Path $fixtureLeases -State @{
+        editor = @{
+            holder = 'p/T-old-owner'; acquired_at = '2026-08-25T00:00:00Z'; last_progress_at = '2026-08-25T00:00:00Z'
+            idle_evaluations = 0; generation = 1; pinned = $false; expiring = $false
+            reclaimed_from = $null; reclaimed_at = $null; reclaimed_reason = $null; reclaim_required = $false
+            revoked_at = $null; revoked_reason = $null
+            queue = @()
+        }
+    }
+    # Operator clears with a specific reason.
+    $env:MINDWIRE_PATHS__DATA_DIR = $fixtureDir
+    try {
+        & pwsh -NoProfile -File $grantScript -Resource 'editor' -Clear -Reason 'PIE crashed' -Confirm:$false *>&1 | Out-Null
+        # Then grants to a new holder.
+        & pwsh -NoProfile -File $grantScript -Resource 'editor' -To 'p/T-inheritor' -Reason 'emergency' -Confirm:$false *>&1 | Out-Null
+    }
+    finally {
+        Remove-Item Env:\MINDWIRE_PATHS__DATA_DIR -ErrorAction SilentlyContinue
+    }
+    $post = Load-FixtureLeasesGL -Path $fixtureLeases
+    # After Clear -> Grant, reclaimed_from is preserved from Clear (p/T-old-owner), reclaimed_reason
+    # is the Clear-reason (operator-clear: PIE crashed) because the Grant preserved it (msg-1900).
+    Check "Clear→Grant sequence: reclaimed_from preserved (from Clear)" 'p/T-old-owner' "$($post['editor'].reclaimed_from)"
+    Check "Clear→Grant sequence: reclaimed_reason PRESERVED as operator-clear text (msg-1900 blocker)" 'operator-clear: PIE crashed' "$($post['editor'].reclaimed_reason)"
+    # Simulate progress on the new holder (probe would classify as progress). Update-LeaseFromClassification
+    # must NOT clear the reclaimed_reason.
+    $stateMap = @{}
+    foreach ($k in $post.Keys) {
+        $lease = @{}
+        foreach ($p in $post[$k].PSObject.Properties) { $lease[$p.Name] = $p.Value }
+        $stateMap[$k] = $lease
+    }
+    Update-LeaseFromClassification -Lease $stateMap['editor'] -Classification 'progress' -Now $now
+    Check "Clear→Grant→progress: reclaimed_reason STILL preserved (msg-1900 core regression)" 'operator-clear: PIE crashed' $stateMap['editor']['reclaimed_reason']
+    # Digest render must show the operator's Clear-reason, not the hardcoded 'idle' fallback.
+    $digestLines = Get-LeaseSummaryLines -LeasesState $stateMap -Now $now.AddHours(1) -FormatDuration { param($s) "$($s.TotalMinutes)m" }
+    $reclaimLine = $digestLines | Where-Object { $_ -match 'reclaimed:' } | Select-Object -First 1
+    CheckTrue "Clear→Grant→progress→digest: reclaim line renders operator-clear reason, NOT 'idle' (msg-1900 end-to-end)" ($reclaimLine -match 'operator-clear: PIE crashed')
 }
 finally {
     Remove-Item -LiteralPath $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue

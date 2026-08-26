@@ -34,9 +34,21 @@
 #     "pinned":            false,
 #     "expiring":          false,      # tick T: marked; tick T+1: promoted (two-phase revoke)
 #     "reclaimed_from":    null,       # who the current holder took the lease from (audit)
+#     "reclaimed_at":      null,       # WHEN the current reclamation happened  (permanent audit)
+#     "reclaimed_reason":  null,       # WHY  the current reclamation happened  (permanent audit,
+#                                      #   e.g. "operator-clear: PIE crashed", "operator-grant:
+#                                      #   emergency", or "idle" for the automatic TTL path).
+#                                      #   PAIRED WITH `reclaimed_from`. Set on every write that
+#                                      #   changes ownership (promotion/release/operator-grant/
+#                                      #   operator-clear); NEVER touched by transient state-machine
+#                                      #   transitions (progress-clear-of-expiring, empty-drain,
+#                                      #   idempotent self-acquire). The digest reads this.
 #     "reclaim_required":  false,      # new holder MUST restart the resource before use
-#     "revoked_at":        null,
-#     "revoked_reason":    null,
+#     "revoked_at":        null,       # transient Phase-1 intent (mark-expiring) — see below
+#     "revoked_reason":    null,       # transient Phase-1 intent — CLEARED on progress, on Phase-2
+#                                      #   promotion/release, on operator grant/clear, on grant-
+#                                      #   from-empty. Do NOT rely on this for audit; use
+#                                      #   reclaimed_reason.
 #     "queue": [
 #       {"key": "spirrow-mindwire/T-x", "waiting_since": "2026-08-26T04:30:00.0000000Z"}
 #     ]
@@ -46,6 +58,31 @@
 # ABSENT resource key = no holder, empty queue. Do NOT create empty stub entries — a resource that
 # has never been leased leaves no trace in the file. This keeps the file readable by eye when
 # every lease is free (the common case).
+#
+# --- revoked_* vs reclaimed_* separation (msg-1900 blocker fix) ---------------------------------
+# BEFORE this split, `revoked_at` / `revoked_reason` served two conflicting purposes:
+#   (a) transient Phase-1 revocation intent (`Update-LeaseFromClassification 'progress'` cleared
+#       them so a holder that pre-empted its own revocation reset cleanly);
+#   (b) permanent historical audit paired with `reclaimed_from` (the digest renders it as
+#       "reclaimed: <from> → <to> (reason=...)" so the operator's intent survives on the display).
+# The two collide directly. If an operator ran `Grant-Lease.ps1 -Clear -Reason "PIE crashed"`, the
+# reason was written into `revoked_reason` under (b). On the NEXT tick, once someone drained the
+# queue or the record entered progress, (a) fired and cleared it — but `reclaimed_from` remained
+# populated forever, so the digest fell back to the hardcoded 'idle' and the operator's Tier-C
+# audit trail was silently overwritten with a false automated-timeout narrative.
+#
+# The fix: split into two independent fields.
+#   - `revoked_at` / `revoked_reason` = TRANSIENT Phase-1 intent only. Cleared aggressively on
+#     progress, on Phase-2 promotion/release (its purpose was served), on empty-drain (any prior
+#     intent no longer applies to the new holder), on operator grant/clear (a fresh write
+#     supersedes any pending intent).
+#   - `reclaimed_at` / `reclaimed_reason` = PERMANENT audit paired with `reclaimed_from`. Set on
+#     every write that changes ownership. NEVER cleared by transient state-machine transitions.
+#     The digest reads THIS.
+# Every write that changes `reclaimed_from` (Invoke-LeasePromotion Phase-2, Invoke-LeaseAcquire
+# on new holder, Grant-Lease.ps1 -Grant/-Clear) also writes `reclaimed_reason`. Writes that
+# preserve `reclaimed_from` (Invoke-LeaseGrantFromEmpty, operator empty-state re-grant) also
+# preserve `reclaimed_reason` — the two travel together.
 
 # --- probe classifications ----------------------------------------------------------------------
 # `progress` — holder made progress this tick, OR is currently running (held), OR its verdict is
@@ -251,6 +288,14 @@ function New-LeaseRecord {
     .PARAMETER Pinned
         $true for an operator-pinned grant (TTL-immune). Default $false.
 
+    .PARAMETER ReclaimedReason
+        Free-text audit paired with `ReclaimedFrom`. Callers set this to describe WHY the
+        reclamation happened ("operator-clear: PIE crashed", "operator-grant: emergency", or
+        "idle" for the automatic TTL path). Read by the digest (Get-LeaseSummaryLines).
+        Separate from `revoked_reason` on purpose (see file-header split rationale, msg-1900):
+        this field is PERMANENT audit; `revoked_reason` is TRANSIENT Phase-1 intent that gets
+        cleared on progress. Default $null.
+
     .PARAMETER Queue
         The current queue array to preserve (or $null for empty).
     #>
@@ -261,6 +306,7 @@ function New-LeaseRecord {
         [string]$ReclaimedFrom = $null,
         [bool]$ReclaimRequired = $false,
         [bool]$Pinned = $false,
+        [string]$ReclaimedReason = $null,
         [array]$Queue = $null
     )
     $nowIso = $Now.ToUniversalTime().ToString("o")
@@ -273,6 +319,8 @@ function New-LeaseRecord {
         pinned            = $Pinned
         expiring          = $false
         reclaimed_from    = $ReclaimedFrom
+        reclaimed_at      = if ($ReclaimedFrom) { $nowIso } else { $null }
+        reclaimed_reason  = $ReclaimedReason
         reclaim_required  = $ReclaimRequired
         revoked_at        = $null
         revoked_reason    = $null
@@ -404,7 +452,10 @@ function Invoke-LeasePromotion {
         As Get-NextLeaseWaiter.
 
     .PARAMETER Reason
-        Free-text stored in `revoked_reason` on the old holder's terminal snapshot.
+        Free-text audit stored in `reclaimed_reason` (permanent, paired with `reclaimed_from`)
+        on Phase-2 promotion or release, and in `revoked_reason` (transient Phase-1 intent) on
+        Phase 1 mark-expiring. See the file-header revoked_* vs reclaimed_* rationale for why
+        the two fields are separate (msg-1900). Default 'idle' — the automatic TTL path.
 
     .OUTPUTS
         A hashtable with:
@@ -443,8 +494,13 @@ function Invoke-LeasePromotion {
         $priorGen = [int]$Lease['generation']
     }
 
+    $nowIso = $Now.ToUniversalTime().ToString("o")
+
     if (-not $nextKey) {
         # No waiter — release the lease entirely so the next arriving candidate can acquire.
+        # Phase-2 write: `reclaimed_*` (PERMANENT audit paired with `reclaimed_from`) captures
+        # the operator-visible narrative; `revoked_*` (TRANSIENT Phase-1 intent) is now cleared
+        # because Phase 1's intent has been fulfilled (msg-1900 split rationale in file header).
         $Lease.Remove('holder')
         $Lease['acquired_at']       = $null
         $Lease['last_progress_at']  = $null
@@ -453,9 +509,11 @@ function Invoke-LeasePromotion {
         $Lease['pinned']            = $false
         $Lease['expiring']          = $false
         $Lease['reclaimed_from']    = $oldHolder
+        $Lease['reclaimed_at']      = $nowIso
+        $Lease['reclaimed_reason']  = $Reason
         $Lease['reclaim_required']  = $true
-        $Lease['revoked_at']        = $Now.ToUniversalTime().ToString("o")
-        $Lease['revoked_reason']    = $Reason
+        $Lease['revoked_at']        = $null
+        $Lease['revoked_reason']    = $null
         # Queue stays as-is (empty by definition here).
         $result.action = 'released'
         return $result
@@ -467,16 +525,18 @@ function Invoke-LeasePromotion {
         $k -ne $nextKey
     })
     $Lease['holder']            = $nextKey
-    $Lease['acquired_at']       = $Now.ToUniversalTime().ToString("o")
-    $Lease['last_progress_at']  = $Now.ToUniversalTime().ToString("o")
+    $Lease['acquired_at']       = $nowIso
+    $Lease['last_progress_at']  = $nowIso
     $Lease['idle_evaluations']  = 0
     $Lease['generation']        = $priorGen + 1
     $Lease['pinned']            = $false
     $Lease['expiring']          = $false
     $Lease['reclaimed_from']    = $oldHolder
+    $Lease['reclaimed_at']      = $nowIso
+    $Lease['reclaimed_reason']  = $Reason
     $Lease['reclaim_required']  = $true
-    $Lease['revoked_at']        = $Now.ToUniversalTime().ToString("o")
-    $Lease['revoked_reason']    = $Reason
+    $Lease['revoked_at']        = $null
+    $Lease['revoked_reason']    = $null
     $Lease['queue']             = $remaining
     $result.action = 'promoted'
     $result.new_holder = $nextKey
@@ -593,13 +653,16 @@ function Invoke-LeaseGrantFromEmpty {
                                   (Grant-Lease.ps1 -Clear sets this); the caller decides whether
                                   to fire the dirty-acquire notification based on this bit
           - reclaimed_from      : as preserved from the empty record (may be $null)
+          - reclaimed_reason    : as preserved from the empty record (may be $null) — the
+                                  operator's Clear-reason (or Phase-2 release's 'idle') survives
+                                  to the new holder's audit trail (msg-1900 blocker)
     #>
     param(
         [hashtable]$Lease,
         [datetime]$Now,
         [string[]]$SweepOrderKeys = @()
     )
-    $result = @{ action = 'noop'; new_holder = $null; reclaim_required = $false; reclaimed_from = $null }
+    $result = @{ action = 'noop'; new_holder = $null; reclaim_required = $false; reclaimed_from = $null; reclaimed_reason = $null }
     if ($null -eq $Lease) { return $result }
     $holder = "$($Lease['holder'])"
     if (-not [string]::IsNullOrEmpty($holder)) {
@@ -615,6 +678,12 @@ function Invoke-LeaseGrantFromEmpty {
     # decide whether to fire the __lease_reclaim_acquire__ notification.
     $priorReclaim = $Lease.ContainsKey('reclaim_required') -and [bool]$Lease['reclaim_required']
     $priorReclaimedFrom = if ($Lease.ContainsKey('reclaimed_from')) { "$($Lease['reclaimed_from'])" } else { '' }
+    # msg-1900 fix: `reclaimed_reason` is the PERMANENT audit paired with `reclaimed_from`. It
+    # carries the operator's Clear-reason text ("PIE crashed"), or the Phase-2 release's 'idle',
+    # or a prior Grant's reason. Preserve it verbatim across the drain — the digest reads this
+    # to render the "reclaimed: <from> → <to> (reason=...)" line, and losing it here would
+    # overwrite the operator's Tier-C audit with the hardcoded 'idle' fallback.
+    $priorReclaimedReason = if ($Lease.ContainsKey('reclaimed_reason')) { "$($Lease['reclaimed_reason'])" } else { '' }
     $priorGen = 1
     if ($Lease.ContainsKey('generation') -and $null -ne $Lease['generation']) {
         $priorGen = [int]$Lease['generation']
@@ -632,13 +701,17 @@ function Invoke-LeaseGrantFromEmpty {
     $Lease['generation']        = $priorGen + 1
     $Lease['pinned']            = $false
     $Lease['expiring']          = $false
-    # Preserve reclaim_required and reclaimed_from from the empty state — the new holder must
-    # bounce the resource before use if the previous empty state carried that flag.
+    # Preserve reclaim_required, reclaimed_from, and reclaimed_reason from the empty state.
+    # The new holder must bounce the resource before use if the previous empty state carried
+    # reclaim_required=true; the digest surfaces reclaimed_reason so the operator's audit
+    # trail travels alongside the reclaim duty (msg-1900).
     $Lease['reclaim_required']  = $priorReclaim
     if ($priorReclaimedFrom) { $Lease['reclaimed_from'] = $priorReclaimedFrom }
-    # Clear the transient revoke annotations — those described the transition INTO the empty
-    # state, not the transition OUT of it. `reclaim_required` above carries whatever the
-    # operator's Clear-reason intent was; the raw text of that reason belongs to that write.
+    if ($priorReclaimedReason) { $Lease['reclaimed_reason'] = $priorReclaimedReason }
+    # Clear the TRANSIENT Phase-1 revocation annotations — they no longer describe anything.
+    # The PERMANENT reclaimed_* fields above carry whatever audit the operator wrote; the
+    # Phase-1 revoked_* fields were about a different (now-fulfilled) intent and would be
+    # stale noise if left over on the new holder's record. (msg-1900 split rationale.)
     $Lease['revoked_at']        = $null
     $Lease['revoked_reason']    = $null
     $Lease['queue']             = $remaining
@@ -646,6 +719,7 @@ function Invoke-LeaseGrantFromEmpty {
     $result.new_holder = $nextKey
     $result.reclaim_required = $priorReclaim
     $result.reclaimed_from = $priorReclaimedFrom
+    $result.reclaimed_reason = $priorReclaimedReason
     return $result
 }
 
@@ -763,7 +837,11 @@ function Invoke-LeaseAcquire {
     $lease['generation']        = $priorGen + 1
     $lease['pinned']            = $false
     $lease['expiring']          = $false
-    # `reclaim_required` and `reclaimed_from` are preserved from the prior release.
+    # `reclaim_required`, `reclaimed_from`, and `reclaimed_reason` are preserved from the
+    # prior release — they are the PERMANENT audit trail of what happened last (the release's
+    # 'idle' or an operator's Clear-reason). Clearing `revoked_*` is safe because those are
+    # TRANSIENT Phase-1 revocation intent that no longer applies to a fresh acquire (msg-1900
+    # split rationale in file header).
     $lease['revoked_at']        = $null
     $lease['revoked_reason']    = $null
     # Dequeue this key if present (self-waiters can occur if a candidate was queued then the
@@ -796,6 +874,8 @@ function Register-LeaseWaiter {
             pinned            = $false
             expiring          = $false
             reclaimed_from    = $null
+            reclaimed_at      = $null
+            reclaimed_reason  = $null
             reclaim_required  = $false
             revoked_at        = $null
             revoked_reason    = $null
@@ -1045,9 +1125,17 @@ function Get-LeaseSummaryLines {
         }
         # If a reclaim just happened, surface it: msg-1185 §3-1 "reclaimed: <old> → <new> (reason=...)"
         if ($lease.ContainsKey('reclaimed_from') -and $lease['reclaimed_from']) {
-            $reason = if ($lease.ContainsKey('revoked_reason') -and $lease['revoked_reason']) {
+            # msg-1900 fix: read the PERMANENT `reclaimed_reason` field first — that's the
+            # audit trail paired with `reclaimed_from` and preserved across state-machine
+            # transitions. Fall back to `revoked_reason` only for backward-compat with
+            # records written before the split, then to 'idle' as the final default.
+            $reason = if ($lease.ContainsKey('reclaimed_reason') -and $lease['reclaimed_reason']) {
+                "$($lease['reclaimed_reason'])"
+            }
+            elseif ($lease.ContainsKey('revoked_reason') -and $lease['revoked_reason']) {
                 "$($lease['revoked_reason'])"
-            } else { 'idle' }
+            }
+            else { 'idle' }
             $lines += "    reclaimed: $($lease['reclaimed_from']) → ${holder} (reason=${reason})"
         }
     }
