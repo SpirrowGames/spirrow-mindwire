@@ -1812,16 +1812,31 @@ function Get-SweepCandidates {
         foreach ($f in 'project', 'thread_id', 'repo_dir') {
             if (-not $c.$f) { throw "sweep config entry missing '$f': $($c | ConvertTo-Json -Compress)" }
         }
-        # `requires` is optional. It lists exclusive-resource lease names the candidate needs
-        # before it may launch (T-exclusive-resource-lease-queue). A missing key or an empty
-        # array means "no lease required — always eligible". No enum validation at this layer:
-        # the runner does not know the full resource universe (v1 knows only `editor`, future
-        # ticks may add `runner` / `bridge-55557` / `repo:mindwire-impl` / DDC); an operator-
-        # editable list is allowed to name a resource the mechanism ignores today and reads
-        # tomorrow (msg-1180 D-1).
-        $requires = @()
+        # `requires` is optional. It names ONE exclusive-resource lease the candidate needs
+        # before it may launch (T-exclusive-resource-lease-queue, msg-1180 D-1). A missing
+        # key or an empty string means "no lease required — always eligible". No enum
+        # validation at this layer: the runner does not know the full resource universe
+        # (v1 knows only `editor`, future ticks may add `runner` / `bridge-55557` / etc.);
+        # an operator-editable name is allowed to name a resource the mechanism ignores
+        # today and reads tomorrow.
+        #
+        # SINGLE STRING, NOT ARRAY (msg-2038 YAGNI correction). The design permits arbitrary
+        # resource names (msg-1180 D-1 "resource-name generalisation"), NOT multi-resource
+        # per candidate. Making `requires` an array in v1 was speculative future-proofing
+        # that opened a permanent hold-and-wait deadlock via async promotion: if candidate A
+        # requires [X, Y], gets promoted to X-holder while Y is still held elsewhere, A
+        # bails with lease-waiting for Y — but A's decide verdict remains LAUNCH so
+        # Get-LeaseHolderClassification maps to `progress` and resets A's TTL clock forever
+        # while A holds X. Reject array inputs so this cannot happen. Multi-resource
+        # coordination (needs proper deadlock avoidance analysis) is a v2 concern.
+        $requires = ''
         if ($null -ne $c.requires) {
-            foreach ($r in @($c.requires)) { if ("$r".Trim()) { $requires += "$r".Trim() } }
+            if ($c.requires -is [array] -or $c.requires -is [System.Collections.IList]) {
+                throw ("sweep config entry '$($c.project)/$($c.thread_id)': `requires` must be a single string, not an array. " +
+                       "v1 supports at most one required resource per candidate. Multi-resource acquisition is a v2 concern " +
+                       "(see Grant-Lease.ps1 header + msg-2038): array form permits hold-and-wait deadlocks via async promotion.")
+            }
+            $requires = "$($c.requires)".Trim()
         }
         $out += [pscustomobject]@{
             project   = $c.project
@@ -2255,14 +2270,14 @@ try {
     # trichotomy (progress / parked / neutral) and Bohr msg-1185 §2-c for why the parked-vs-
     # starved distinction reuses the decide verdict rather than inventing a new predicate.
     $sweepOrderKeys = @($candidates | ForEach-Object { $_.key })
-    # Per-tick map: candidate-key -> array of resources it currently declares in sweep.json.
-    # Used by the queue scrub below to detect a waiter that dropped a resource from its
-    # `requires` between enqueue and this tick (config change). Built once per tick from the
-    # already-parsed candidate list.
+    # Per-tick map: candidate-key -> the (single) resource string it currently declares in
+    # sweep.json (empty string if no `requires`). Used by the queue scrub below to detect a
+    # waiter that dropped the resource from its `requires` between enqueue and this tick
+    # (config change). Built once per tick from the already-parsed candidate list.
+    # msg-2038: `requires` is a single string, not an array (see Get-SweepCandidates).
     $candidateRequires = @{}
     foreach ($c in $candidates) {
-        $req = @()
-        if ($c.PSObject.Properties['requires'] -and $c.requires) { $req = @($c.requires) }
+        $req = if ($c.PSObject.Properties['requires'] -and $c.requires) { "$($c.requires)" } else { '' }
         $candidateRequires[$c.key] = $req
     }
     foreach ($resource in @($leasesState.Keys)) {
@@ -2274,7 +2289,7 @@ try {
         # un-launchable by tick N+K in four distinct ways:
         #   (a) quarantined (non-zero exit) — msg-1875
         #   (b) removed from sweep.json entirely (thread folded) — msg-1875
-        #   (c) its `requires` array edited to drop this resource — msg-1875
+        #   (c) its `requires` (single string) edited to a different / empty value — msg-1875 (msg-2038 shape)
         #   (d) decide verdict became SKIP (Stage-1 stop-token: NEXT: human / NEXT: none) — msg-1932
         # If left in the queue, ANY of these dead waiters would be handed back by
         # Get-NextLeaseWaiter as the next promotion target, hold the resource idle for the full
@@ -2294,7 +2309,9 @@ try {
                 if (-not $k) { continue }
                 $onSweep = ($sweepOrderKeys -contains $k)
                 $isQ = $quarantineState.ContainsKey($k)
-                $req = if ($candidateRequires.ContainsKey($k)) { @($candidateRequires[$k]) } else { @() }
+                # msg-2038: `requires` is now a single string, not an array. The waiter is
+                # still eligible for THIS resource iff its (single) required string equals it.
+                $req = if ($candidateRequires.ContainsKey($k)) { "$($candidateRequires[$k])" } else { '' }
                 # msg-1932 fix: also scrub SKIP-verdict waiters. A waiter whose decide verdict
                 # this tick is `skip` (Stage-1 stop-token: NEXT: human / NEXT: none) is just as
                 # un-launchable as a quarantined candidate — if promoted, it would hold the
@@ -2313,7 +2330,7 @@ try {
                     $decision = "$($decideVerdicts[$k].decision)".ToLowerInvariant()
                     if ($decision -eq 'skip') { $verdictIsSkip = $true }
                 }
-                if ($onSweep -and (-not $isQ) -and (-not $verdictIsSkip) -and ($req -contains $resource)) {
+                if ($onSweep -and (-not $isQ) -and (-not $verdictIsSkip) -and ($req -eq $resource)) {
                     $eligibleWaiters += $k
                 }
             }
@@ -2621,21 +2638,19 @@ try {
         #     is what the two-phase protocol contract says.
         # A launch slot is not consumed here (`continue`, not `break`) — msg-1183 §3, msg-1185
         # §3-rescue: lease-waiting cannot delay unrelated candidates further down the sweep.
-        if ($cand.requires -and $cand.requires.Count -gt 0) {
+        if ($cand.requires) {
+            # msg-2038: v1 requires exactly one resource per candidate (see Get-SweepCandidates).
+            # Test-LeaseAvailableFor still takes an array in its signature so v2 can generalise
+            # without touching the lib API, but the wrapper wraps the single string in @(...).
             $leaseCheck = Test-LeaseAvailableFor -LeasesState $leasesState `
-                                                 -CandidateKey $cand.key -Requires $cand.requires
+                                                 -CandidateKey $cand.key -Requires @($cand.requires)
             if ($leaseCheck.status -eq 'waiting') {
                 $skipped++
                 $dispositions[$cand.key] = 'lease-waiting'
-                foreach ($resource in $leaseCheck.waitOn) {
-                    Register-LeaseWaiter -LeasesState $leasesState -Resource $resource `
-                                         -WaiterKey $cand.key -Now $nowUtc
-                }
-                $blockingList = @()
-                foreach ($resource in $leaseCheck.waitOn) {
-                    $blockingList += "${resource}=$($leaseCheck.holders[$resource])"
-                }
-                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — lease-waiting on [$($blockingList -join ', ')], enqueued, not launching (commit-launch NOT called — baseline preserved so grant wakes on the next tick)"
+                Register-LeaseWaiter -LeasesState $leasesState -Resource $cand.requires `
+                                     -WaiterKey $cand.key -Now $nowUtc
+                $holderName = if ($leaseCheck.holders.ContainsKey($cand.requires)) { $leaseCheck.holders[$cand.requires] } else { '<unknown>' }
+                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — lease-waiting on [$($cand.requires)=${holderName}], enqueued, not launching (commit-launch NOT called — baseline preserved so grant wakes on the next tick)"
                 continue
             }
         }
@@ -2649,12 +2664,17 @@ try {
         # lease's own "commit acquire before spawn" contract — an OS-level kill between acquire
         # and spawn leaves the lease held and head_skip record NOT bumped, which matches the
         # two-phase protocol's "don't record a launch you did not perform").
-        if ($cand.requires -and $cand.requires.Count -gt 0) {
-            # Available — acquire every required resource that this candidate does not already
-            # hold. Idempotent for the self-holds; for the free ones, this is the "session-
-            # start-before-write" contract adapted to leases (msg-1183 §W-3-style: the record
-            # shows acquisition BEFORE launch, so an OS-level kill mid-launch leaves the lease
-            # committed rather than a phantom launch with a free lease).
+        if ($cand.requires) {
+            # msg-2038: single required resource per candidate. Multi-resource would need proper
+            # deadlock-avoidance analysis (holding R1 while waiting for R2 is a permanent
+            # hold-and-wait under Get-LeaseHolderClassification's LAUNCH→progress mapping)
+            # and is deliberately deferred to v2 (Grant-Lease.ps1 header, sweep.json.example).
+            $requiredResource = $cand.requires
+            # Available — acquire the required resource. Idempotent for self-hold; for a
+            # freshly-empty resource, this is the "session-start-before-write" contract
+            # adapted to leases (the record shows acquisition BEFORE launch, so an OS-level
+            # kill mid-launch leaves the lease committed rather than a phantom launch with
+            # a free lease — pre-spawn flush below makes it durable).
             #
             # Dirty-acquire detection (msg-1757 blocker #2, 2026-08-26 PR-gate): if the record
             # was in the "released with reclaim_required=true" state (Invoke-LeasePromotion's
@@ -2666,18 +2686,16 @@ try {
             # collision this mechanism exists to prevent. Sample the flag BEFORE acquire because
             # Invoke-LeaseAcquire preserves it but the record is easier to reason about while
             # its `holder` is still empty.
-            $dirtyAcquires = @()
-            foreach ($resource in $cand.requires) {
-                if (-not $leasesState.ContainsKey($resource)) { continue }
+            $dirtyAcquire = $null
+            if ($leasesState.ContainsKey($requiredResource) -and $null -ne $leasesState[$requiredResource]) {
                 # $leasesState was normalised at load (line ~2164); trust the boundary
                 # (msg-1802 blocker #2). Do NOT re-normalise here.
-                $existing = $leasesState[$resource]
-                if ($null -eq $existing) { continue }
+                $existing = $leasesState[$requiredResource]
                 $priorHolder = "$($existing['holder'])"
                 $reclaimFlag = $existing.ContainsKey('reclaim_required') -and [bool]$existing['reclaim_required']
                 if ([string]::IsNullOrEmpty($priorHolder) -and $reclaimFlag) {
-                    $dirtyAcquires += [pscustomobject]@{
-                        Resource       = $resource
+                    $dirtyAcquire = [pscustomobject]@{
+                        Resource       = $requiredResource
                         ReclaimedFrom  = if ($existing.ContainsKey('reclaimed_from')) { "$($existing['reclaimed_from'])" } else { '' }
                         # msg-1900 split: prefer the PERMANENT `reclaimed_reason` (paired with
                         # reclaimed_from; carries operator-clear / operator-grant text). Fall
@@ -2690,44 +2708,31 @@ try {
                     }
                 }
             }
-            # Snapshot holders BEFORE the acquire loop (msg-2020 blocker). Used by the
-            # rollback path in the lease-lost bail below to distinguish a cross-tick self-hold
-            # (holder was $cand.key before this tick — a physical session may still be
-            # running) from a fresh acquire this tick (holder was empty or someone else's).
-            # A cross-tick self-hold rollback must set reclaim_required=true on the released
-            # record so the next acquirer bounces the physical resource; a fresh acquire
-            # rollback should not (no session ever started, no reclaim duty).
-            $preAcquireHolders = @{}
-            foreach ($resource in $cand.requires) {
-                $preAcquireHolders[$resource] = if ($leasesState.ContainsKey($resource) -and $null -ne $leasesState[$resource]) { "$($leasesState[$resource]['holder'])" } else { '' }
-            }
-            foreach ($resource in $cand.requires) {
-                Invoke-LeaseAcquire -LeasesState $leasesState -Resource $resource `
-                                    -CandidateKey $cand.key -Now $nowUtc
-            }
-            foreach ($dirty in $dirtyAcquires) {
+            Invoke-LeaseAcquire -LeasesState $leasesState -Resource $requiredResource `
+                                -CandidateKey $cand.key -Now $nowUtc
+            if ($null -ne $dirtyAcquire) {
                 # Signature unified with the probe's end-of-iteration reclaim check and the
                 # empty-with-queue drain fire (msg-1876 blocker): "$holder@$gen" so a candidate
                 # notified here does NOT get re-notified by the probe on the next tick.
-                $acquiredGen = if ($leasesState[$dirty.Resource].ContainsKey('generation') -and $null -ne $leasesState[$dirty.Resource]['generation']) { [int]$leasesState[$dirty.Resource]['generation'] } else { 0 }
-                Send-NotificationIfChanged -State $notifyState -Key "__lease_reclaim_acquire__/$($dirty.Resource)" `
+                $acquiredGen = if ($leasesState[$dirtyAcquire.Resource].ContainsKey('generation') -and $null -ne $leasesState[$dirtyAcquire.Resource]['generation']) { [int]$leasesState[$dirtyAcquire.Resource]['generation'] } else { 0 }
+                Send-NotificationIfChanged -State $notifyState -Key "__lease_reclaim_acquire__/$($dirtyAcquire.Resource)" `
                     -Signature "$($cand.key)@$acquiredGen" `
-                    -Message ("MindWire: lease **$($dirty.Resource)** を再取得しました " +
+                    -Message ("MindWire: lease **$($dirtyAcquire.Resource)** を再取得しました " +
                               "(前回 release 時に waiter が居なかったため通知が飛ばず、reclaim_required が持ち越されていました)。" +
-                              "旧: $($dirty.ReclaimedFrom) → 新: $($cand.key) (reason=$($dirty.RevokedReason))。" +
+                              "旧: $($dirtyAcquire.ReclaimedFrom) → 新: $($cand.key) (reason=$($dirtyAcquire.RevokedReason))。" +
                               "reclaim_required — 新側は使用前にリソースの再起動が必要です " +
                               "(v1 は scheduling で enforcement ではないため、旧側が自力で起動する可能性は残ります)。")
             }
 
             # DURABILITY: persist the acquire (plus any earlier probe mutations for this
             # resource) to disk BEFORE spawning. Rationale (msg-1877 blocker): Invoke-LeaseAcquire
-            # mutates $leasesState in memory only. The end-of-tick flush (line ~2743) is many
-            # minutes after the spawn returns. If the sweep is OS-killed after the spawn started
-            # a physical editor session but before end-of-tick flush, leases.json on disk still
-            # shows the pre-tick state — a free lease — and next tick another candidate finds
-            # it free and boots a second editor session over the first. That is the exact silent
-            # collision this whole mechanism was built to prevent. The pre-spawn flush closes the
-            # window: the acquire is durable on disk before commit-launch and before spawn.
+            # mutates $leasesState in memory only. The end-of-tick flush is many minutes after
+            # the spawn returns. If the sweep is OS-killed after the spawn started a physical
+            # editor session but before end-of-tick flush, leases.json on disk still shows the
+            # pre-tick state — a free lease — and next tick another candidate finds it free and
+            # boots a second editor session over the first. That is the exact silent collision
+            # this whole mechanism was built to prevent. The pre-spawn flush closes the window:
+            # the acquire is durable on disk before commit-launch and before spawn.
             #
             # Uses the same generation-based optimistic-concurrency merger as end-of-tick, so a
             # concurrent operator Grant mid-sweep is not clobbered — instead, the merger lets
@@ -2742,69 +2747,28 @@ try {
             $leasesState = ConvertTo-LeasesStateHashtable $preSpawnMerged
             $leasesOriginalGenerations = Get-LeaseGenerations -LeasesState $leasesState
 
-            # Re-check: did OUR acquire actually land on disk for every required resource?
-            # If a concurrent operator Grant mid-sweep won the generation race for any of
-            # them, the merger just replaced our in-memory holder with the operator's choice.
-            # Spawning in that state would collide with the operator's chosen holder on the
-            # same physical resource — the very failure the durability flush was meant to
+            # Re-check: did OUR acquire actually land on disk for the required resource?
+            # If a concurrent operator Grant mid-sweep won the generation race, the merger
+            # just replaced our in-memory holder with the operator's choice. Spawning in
+            # that state would collide with the operator's chosen holder on the same
+            # physical resource — the very failure the durability flush was meant to
             # prevent. Bail with a distinct disposition; head_skip's baseline is NOT bumped
             # because we have not called Invoke-HeadSkipCommitLaunch yet, so this candidate
             # stays eligible on the next tick without accumulating backoff (same rationale
             # as the lease-waiting bail, round 2 §9).
-            $stolenList = @()
-            foreach ($resource in $cand.requires) {
-                $curHolder = if ($leasesState.ContainsKey($resource) -and $null -ne $leasesState[$resource]) { "$($leasesState[$resource]['holder'])" } else { '' }
-                if ($curHolder -ne $cand.key) {
-                    $stolenList += "${resource}=$curHolder"
-                }
-            }
-            if ($stolenList.Count -gt 0) {
-                # HOLD-AND-WAIT AVOIDANCE (msg-1955 blocker). When `requires` is an array and only
-                # SOME resources were stolen by a concurrent operator write, the merger left the
-                # ones we won durably held by us on disk. Bailing without releasing them causes a
-                # classic hold-and-wait deadlock: next tick we sit in `lease-waiting` for the
-                # stolen resource while STILL holding the won ones, blocking every other candidate
-                # that needs any of them for the full LeaseIdleTtl (2h) until TTL revocation. The
-                # mechanism's design contract is "all-or-nothing" acquire (Test-LeaseAvailableFor
-                # returns 'available' only when EVERY required resource is free); the same
-                # atomicity must apply to bail. Roll back every resource we managed to acquire
-                # for this candidate BEFORE the disposition write and the flush below.
-                #
-                # Invoke-LeaseReleaseHold is idempotent w.r.t. operator override — it's a no-op
-                # on resources where the operator's grant won the merge race (holder != us), so
-                # we can safely enumerate the full $cand.requires without pre-filtering.
-                #
-                # CROSS-TICK SELF-HOLD (msg-2020 blocker). A resource whose pre-acquire holder
-                # was already $cand.key means we held it across ticks — a physical session may
-                # still be running on it. Rolling back cleanly (holder=null, no reclaim flag)
-                # would let the next acquirer boot on top of the live session — the exact
-                # "silent collision" msg-923 forbids. Pass -SetReclaimRequired so the release
-                # writes reclaim_required=true + reclaimed_reason describing the rollback;
-                # the next acquirer's dirty-detection (round 3, §10) fires the notification
-                # and the operator bounces the physical resource before use. Freshly-acquired-
-                # this-tick resources (holder was empty or someone else's pre-acquire) had no
-                # session on them, so no reclaim duty to set.
-                foreach ($resource in $cand.requires) {
-                    if (-not $leasesState.ContainsKey($resource)) { continue }
-                    if ($null -eq $leasesState[$resource]) { continue }
-                    $wasCrossTickSelfHold = ($preAcquireHolders[$resource] -eq $cand.key)
-                    Invoke-LeaseReleaseHold -Lease $leasesState[$resource] -CandidateKey $cand.key -Now $nowUtc -SetReclaimRequired:$wasCrossTickSelfHold | Out-Null
-                }
-                # SECOND FLUSH: make the roll-back durable on disk BEFORE we continue past this
-                # candidate. Without this, the rolled-back acquire only exists in memory —
-                # end-of-tick flush would still make it durable eventually, but if the sweep is
-                # OS-killed between here and end-of-tick (the same durability failure round 8
-                # closed for launch), the pre-spawn flush's write of "us as holder" is what
-                # survives on disk. Same generation merger; the release bumps generation so a
-                # subsequent operator write is still detected via optimistic concurrency.
-                $rollbackMerged = Merge-LeasesStateForWrite -Memory $leasesState `
-                    -OriginalGenerations $leasesOriginalGenerations -DiskPath $leasesStatePath
-                Save-JsonState -Path $leasesStatePath -State $rollbackMerged
-                $leasesState = ConvertTo-LeasesStateHashtable $rollbackMerged
-                $leasesOriginalGenerations = Get-LeaseGenerations -LeasesState $leasesState
-
+            #
+            # SINGLE-RESOURCE ONLY (msg-2038 correction). Prior rounds 11-12 built rollback
+            # machinery (Invoke-LeaseReleaseHold + secondary flush + preAcquireHolders
+            # snapshot) to prevent hold-and-wait when a multi-resource candidate won some
+            # required resources but lost others mid-flush. With single-resource `requires`
+            # there IS no partial-acquire case: either we won this one resource or the
+            # operator did. If we lost, we hold nothing on disk (our memory acquire was
+            # discarded by the merger when the operator's higher generation won). Nothing
+            # to roll back. The `lease-lost` bail is a simple `continue`.
+            $curHolder = if ($leasesState.ContainsKey($requiredResource) -and $null -ne $leasesState[$requiredResource]) { "$($leasesState[$requiredResource]['holder'])" } else { '' }
+            if ($curHolder -ne $cand.key) {
                 Confirm-LogWorthKeeping
-                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — lease lost to concurrent operator write on [$($stolenList -join ', ')], not launching (commit-launch NOT called — baseline preserved so next tick re-evaluates cleanly; won leases rolled back via Invoke-LeaseReleaseHold to avoid hold-and-wait)"
+                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — lease lost to concurrent operator write on [${requiredResource}=${curHolder}], not launching (commit-launch NOT called — baseline preserved so next tick re-evaluates cleanly)"
                 $dispositions[$cand.key] = 'lease-lost'
                 $skipped++
                 continue

@@ -774,112 +774,16 @@ function Test-LeaseAvailableFor {
     return @{ status = $status; holders = $holders; waitOn = $waitOn }
 }
 
-function Invoke-LeaseReleaseHold {
-    <#
-    .SYNOPSIS
-        Release a lease we successfully acquired but decided NOT to launch on. Used to roll back
-        a partial acquire when a multi-resource candidate lost the race on one required resource
-        (msg-1955 blocker: hold-and-wait deadlock avoidance).
-
-    .DESCRIPTION
-        WHY THIS FUNCTION EXISTS (msg-1955 blocker). `requires` is an array in the sweep.json
-        schema (msg-1180 D-1). A candidate that requires more than one resource acquires each
-        in memory sequentially, then the wrapper does a pre-spawn Merge+Save (round 8, msg-1877).
-        If a concurrent operator Grant stole ONE required resource but not the others, the
-        merger lets disk win for the stolen one — but our acquire on the OTHER resources is
-        durably written to disk. Without rollback, we'd hold those resources indefinitely
-        without launching (we bail via `lease-lost` disposition), causing:
-          - Hold-and-wait deadlock: next tick we sit in `lease-waiting` for the stolen one
-            while STILL holding the won ones, blocking every other candidate that wants any
-            of them for the full LeaseIdleTtl (2h) before revocation kicks in.
-          - Violates the mechanism's "all-or-nothing" acquire contract (Test-LeaseAvailableFor
-            returns 'available' only if EVERY required resource is free).
-        The fix is to release ANY resource we managed to acquire before bailing.
-
-    .PARAMETER Lease
-        The per-resource lease hashtable. Idempotent w.r.t. operator override — if we're not
-        the current holder (the operator's grant won the merge race), this function is a
-        no-op. This makes the caller safe to invoke on every $cand.requires resource without
-        pre-filtering, matching how the round-8 durability re-check enumerates.
-
-    .PARAMETER CandidateKey
-        The candidate whose acquire is being rolled back. Only released if the current holder
-        matches.
-
-    .PARAMETER Now
-        UTC tick timestamp — used for the generation bump so downstream mergers see a semantic
-        state change (round 4 optimistic-concurrency contract).
-
-    .PARAMETER SetReclaimRequired
-        Rollback of a lease we held across ticks (a live physical session may still exist).
-        When $true, sets `reclaim_required = $true` and rewrites `reclaimed_*` to describe
-        THIS release event so the next acquirer sees the flag, fires the
-        __lease_reclaim_acquire__ notification, and bounces the physical resource before use.
-        Preserves the "silently does not collide" contract (msg-923, msg-1187 §5-3) for the
-        specific edge case where we rolled back a self-hold whose session may still be
-        running — flagged by msg-2020 (previous naysayer round 12) as a gap in strict
-        reclaim propagation. The caller (wrapper's lease-lost rollback loop) determines
-        "cross-tick self-hold" by comparing the pre-acquire holder snapshot to $CandidateKey.
-        Default $false: freshly-acquired-this-tick resources have no live session, so no
-        reclaim duty to set.
-
-    .OUTPUTS
-        A hashtable with:
-          - action  : 'released-hold' | 'noop-not-holder'
-    #>
-    param(
-        [hashtable]$Lease,
-        [string]$CandidateKey,
-        [datetime]$Now,
-        [switch]$SetReclaimRequired
-    )
-    if ($null -eq $Lease) { return @{ action = 'noop-not-holder' } }
-    $currentHolder = "$($Lease['holder'])"
-    if ($currentHolder -ne $CandidateKey) {
-        # Either the operator's grant won the merge race for this resource (so we never held
-        # it durably), or the caller invoked us on a resource we didn't acquire. Either way,
-        # nothing to release.
-        return @{ action = 'noop-not-holder' }
-    }
-    $priorGen = 1
-    if ($Lease.ContainsKey('generation') -and $null -ne $Lease['generation']) {
-        $priorGen = [int]$Lease['generation']
-    }
-    # Release: back to empty-holder state, preserving all PERMANENT audit fields (reclaimed_*,
-    # reclaim_required, queue) that describe the record's history before OUR acquire. Bump
-    # generation so the end-of-tick merger sees this as a semantic write (in case a concurrent
-    # operator write arrives after our roll-back — they'd still compete via the generation
-    # comparison in Merge-LeasesStateForWrite).
-    $nowIso = $Now.ToUniversalTime().ToString("o")
-    $Lease.Remove('holder') | Out-Null
-    $Lease['acquired_at']       = $null
-    $Lease['last_progress_at']  = $null
-    $Lease['idle_evaluations']  = 0
-    $Lease['generation']        = $priorGen + 1
-    $Lease['expiring']          = $false
-    if ($SetReclaimRequired) {
-        # Cross-tick self-hold rollback: we held this lease across ticks so a physical session
-        # may still be running. Overwrite `reclaimed_*` to describe THIS release; the next
-        # acquirer will see reclaim_required=true, fire the __lease_reclaim_acquire__
-        # notification, and bounce the physical resource before use. Without this branch the
-        # next acquirer sees the record as clean (round 11 rollback semantics) and boots
-        # blindly on top of the still-live session — msg-2020's flagged gap in the "silently
-        # does not collide" contract (msg-923 core, msg-1187 §5-3).
-        $Lease['reclaimed_from']    = $CandidateKey
-        $Lease['reclaimed_at']      = $nowIso
-        $Lease['reclaimed_reason']  = "rollback-of-cross-tick-hold: $CandidateKey lost race on a sibling required resource; physical session may still be live"
-        $Lease['reclaim_required']  = $true
-    }
-    # else: preserve reclaimed_from / reclaimed_at / reclaimed_reason / reclaim_required
-    # verbatim. These describe the LAST transition of ownership before ours (the ones we
-    # inherited on acquire — from a prior release or operator -Clear) — unrelated to our
-    # roll-back, so the digest still shows the true reclaim narrative.
-    # Clear TRANSIENT Phase-1 markers if any leaked in.
-    $Lease['revoked_at']        = $null
-    $Lease['revoked_reason']    = $null
-    # Queue stays as-is.
-    return @{ action = 'released-hold' }
-}
+# msg-2038 (round 13 correction): `Invoke-LeaseReleaseHold` was DELETED. It was introduced in
+# rounds 11-12 (msg-1955 + msg-2020) to roll back a partial acquire when a multi-resource
+# candidate lost the race on one required resource. That entire multi-resource support path
+# was speculative future-proofing (Get-SweepCandidates now REJECTS array-form `requires`);
+# v1 is one-resource-per-candidate, so partial acquires cannot occur, so there is nothing
+# to roll back. Deleting the helper eliminates dead code AND closes the async-promotion
+# hold-and-wait bug the array form enabled (a candidate promoted for R1 while enqueued for
+# R2 would return LAUNCH → Get-LeaseHolderClassification 'progress' → TTL never fires;
+# R1 held indefinitely). Multi-resource coordination + rollback must be redesigned holistically
+# in v2 with proper deadlock avoidance — not bolted onto a single-resource state machine.
 
 function Invoke-LeaseAcquire {
     <#
