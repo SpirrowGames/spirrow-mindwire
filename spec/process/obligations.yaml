@@ -148,3 +148,151 @@ obligations:
     # of the sweep starved behind one thread. The constraint was real, correct, and
     # unreadable by the only party bound by it.
     body: "HOW TO MERGE (and how not to): `gh pr merge` is classified as a merge-to-main REGARDLESS of the pull request's base branch, so it is always denied and the denial HALTS your session — you will post nothing and the turn is lost. Never invoke it. Where a self-merge is sanctioned for your repository (a `feature/*` branch into `develop`), perform it locally instead: check out the target branch, `git merge <your feature branch>`, then push. Merges into `main` are never yours to make under any mechanism; open the PR, report, and hand to the human — that hand-off IS the merge step for `main`, not a fallback from a failed attempt."
+
+  - id: OBL-SPEC-PIN
+    role: implementer
+    # Net-new formulation (no origin — nothing was deleted from source to create it).
+    # Issued by SPEC-2026-08-11-design-spec-delivery §4-1 and required to appear
+    # verbatim (A-2 of that spec). §4-1 is the sole authoritative copy of the
+    # negative constraint in the "Never delete `.mindwire/pin`" paragraph; A-29
+    # additionally requires the eleven pin-resolution reason codes to appear here
+    # spelled exactly as §3 lists them, and verify.py V-13 machine-checks the drift.
+    # This obligation integrates with OBL-READBACK-ENTRY and OBL-READBACK-EXIT
+    # rather than replacing them: read-back binds every implementer turn to its
+    # specifying message(s); OBL-SPEC-PIN adds the additional discipline that when
+    # a `.mindwire/pin` file is present at the repository root, the pinned document
+    # is the specification for the turn and its outcome-code decides whether the
+    # turn may proceed on the message body at all.
+    body: |
+      Before you do anything else on a turn, look for `.mindwire/pin` at the
+      repository root and resolve it exactly as the spec delivery manifest
+      specifies. That manifest is SPEC-2026-08-11-design-spec-delivery, on
+      thread T-design-spec-delivery, and where the repository you are working
+      in carries it you may read the full procedure there. You are not required
+      to: this obligation on its own decides what you do with every outcome,
+      and a repository that does not carry that document changes none of your
+      duties here. Resolution is fail-closed, and every way it can fail has one
+      reason code, spelled exactly as written here. No `.mindwire/pin` file at
+      all is ABSENT. A YAML parse failure is PARSE_ERROR. A schema_version
+      other than 1 is SCHEMA_VERSION. A required field that is missing or
+      malformed is MISSING_FIELD. A `git rev-parse --abbrev-ref HEAD` that
+      answers `HEAD`, fails, or comes back empty is DETACHED_HEAD. A current
+      branch that does not equal the pin's `branch` is BRANCH_MISMATCH. A repo
+      name that does not match is REPO_MISMATCH. A fetch you could not run is
+      FETCH_UNAVAILABLE. A pinned commit you cannot confirm is reachable from
+      `origin/main` is COMMIT_UNREACHABLE. A blob you cannot read is
+      BLOB_UNREADABLE. A blob whose sha is not `blob_sha` is SHA_MISMATCH.
+      Those eleven are the whole list. Report the code with that spelling; do
+      not invent one, do not abbreviate one, and do not translate one. Do not
+      raise, do not retry with a guess, and do not repair the pin.
+
+      Reachability has one network rule. If the pinned commit is already an
+      ancestor of your local `origin/main`, accept it and fetch nothing. Only if
+      it is not — or if you have no `origin/main` ref at all — run `git fetch
+      origin +refs/heads/main:refs/remotes/origin/main` exactly once and judge
+      again. If that fetch fails or is unavailable to you, the verdict is
+      NO-PIN/FETCH_UNAVAILABLE: you could not determine the answer. If the fetch
+      succeeds and the commit is still not reachable, the verdict is
+      NO-PIN/COMMIT_UNREACHABLE: the pin names a commit that is not on `main`,
+      which usually means the specification was never merged. Report whichever
+      code you got; they have different causes and different fixes, and
+      collapsing them costs the reader the diagnosis.
+
+      NO-PIN is a state to report, not an obstacle to route around. Say NO-PIN in
+      your reply with its reason code. What you may do after that depends on the
+      code, and there are exactly two classes. ABSENT — there is no
+      `.mindwire/pin` file at all — is the only code under which you may proceed
+      on the message body, and only because no pin was ever issued for you to
+      lose. Every other code means a pin was issued and did not resolve. That is
+      an upstream fault, not a degraded mode you may run in: stop, report the
+      code, and do not carry out the turn's work from the message body. Do not
+      reconstruct, infer, or recall specification content you cannot read in this
+      turn: a remembered spec and a read spec are indistinguishable in your own
+      output and distinguishable to no one else. When you are proceeding under
+      ABSENT and the message body alone does not contain enough to act on, stop
+      and say what is missing.
+
+      Never delete `.mindwire/pin`. Do not delete, rename, move, truncate, or
+      rewrite it, and do not include it in any cleanup, tidying, or formatting
+      change. Keeping `.mindwire/` out of version control is not covered by that
+      prohibition: when an item of the governing specification declares the
+      change, adding `.mindwire/` to `.gitignore` is required work, and it leaves
+      the pin file itself untouched on disk. What this paragraph forbids is
+      making the pin go away or changing what it says — not making it untracked.
+      If it looks stale, wrong, or inconsistent with the work you were asked to
+      do, report that and stop; the pin is written by the dispatcher and is not
+      yours to correct.
+
+      When the pin resolves, the pinned document is the specification for the
+      turn. The message body may narrow what you are asked to do within that
+      document, but it may not silently contradict it. If it does, stop and
+      report the contradiction, naming both sides; do not choose one and proceed.
+
+      Four faults mean you could not read the pinned document at all —
+      BLOB_UNREADABLE, COMMIT_UNREACHABLE, FETCH_UNAVAILABLE, and SHA_MISMATCH.
+      For those, your report must also declare the document unreadable in the
+      same form OBL-DECLARE-UNREADABLE requires for the sources it names, and
+      reading that entry for the declaration form is part of this obligation.
+      This is the list of codes that need the extra declaration. It is not the
+      list of codes that make you stop: you stop on every code except ABSENT.
+
+  - id: OBL-SPEC-RECEIPT
+    role: implementer
+    # Net-new formulation (no origin). Issued by SPEC-2026-08-11-design-spec-delivery
+    # §4-2. Reports what the agent actually read on the turn; the receipt line is
+    # OBL-SPEC-PIN's compensating control for the ABSENT window (D-24 of that spec —
+    # "always detected, never obstructed"). Do not silence this line.
+    body: |
+      Open every reply in which you performed, or attempted, implementation work
+      with a receipt naming what you actually read this turn, on one line. A turn
+      you stopped on because the pin did not resolve is an attempted turn and
+      needs one too:
+
+        SPEC <spec_id> <blob_sha first 12> <path> (pin: RESOLVED)
+
+      or, when the pin did not resolve and OBL-SPEC-PIN let you go on:
+
+        SPEC (pin: NO-PIN/<reason code>) — worked from message body only
+
+      or, when the pin did not resolve and OBL-SPEC-PIN made you stop:
+
+        SPEC (pin: NO-PIN/<reason code>) — halted, no work from message body
+
+      OBL-SPEC-PIN decides which of those two you are in, and this obligation
+      asks only that the line you print match what you actually did. Never print
+      the worked-from-message-body form after stopping: it would claim you did
+      the one thing that obligation forbade, and a receipt confessing a violation
+      you did not commit is as false as one hiding a violation you did.
+
+      Follow a receipt you worked under with the item ids from the specification
+      you acted on; after a halt there are none, so name what you were asked to
+      do and which code stopped you instead. The receipt reports what you read,
+      not what you believe to be true: naming no sha is a correct receipt, not a
+      confession. A reply that does work without a receipt is incomplete. A
+      receipt naming a sha you did not read in this turn is a false statement
+      about your own execution, and is worse than no receipt at all — it is the
+      one claim in your output that no reviewer can check against the diff, so it
+      is the one claim you must not get wrong.
+
+  - id: OBL-SPEC-SCOPE-CLOSURE
+    role: implementer
+    # Net-new formulation (no origin). Issued by SPEC-2026-08-11-design-spec-delivery
+    # §4-3. Silent expansion and silent omission share one failure mode: the
+    # reviewer's picture of what happened is wrong. This obligation binds the
+    # implementer to close scope explicitly, per item id, before finishing.
+    body: |
+      On any turn performed under a resolved specification, the specification's
+      `items` are the whole of your mandate for the turn. Do not change files
+      outside the paths an item declares, do not act in a repository no item
+      names, and do not add work that no item declares, however obviously
+      necessary it looks. If the declared scope cannot be completed without work
+      outside it, stop and report the gap — the item id, the work you believe is
+      missing, and why — and let the proposer amend the specification. An
+      amendment costs one turn; an undeclared change costs the reviewer their
+      ability to review.
+
+      Close the scope explicitly before you finish. State, per item id, done or
+      not-done with the reason, and confirm that the diff touches nothing outside
+      the declared paths. Silent expansion and silent omission are the same
+      failure: in both cases the reviewer's picture of what happened is wrong,
+      and in this loop the reviewer is the only defence there is.

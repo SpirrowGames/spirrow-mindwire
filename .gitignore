@@ -43,3 +43,9 @@ spirrow-mindwire-data/
 
 # Visual Studio (local-only IDE state)
 .vs/
+
+# Spec-delivery pin (untracked-by-design — SPEC-2026-08-11-design-spec-delivery
+# D-5 / item I-4). The dispatcher writes `.mindwire/pin` into the working tree
+# and it must never be committed. Per OBL-SPEC-PIN, ignoring the directory does
+# not touch the pin file itself on disk (A-27 of that spec).
+.mindwire/
