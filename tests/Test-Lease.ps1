@@ -675,7 +675,11 @@ Write-Host ""
 Write-Host "Test-LeaseAvailableFor + Invoke-LeaseAcquire — the candidate-loop gate"
 
 $state = @{}
-$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-a' -Requires @('editor')
+# NOTE (msg-2185): Requires is now a SINGLE STRING, not an array. PowerShell's parameter binding
+# used to accept `@('editor')` and silently coerce it, which read as "supports multi-resource" —
+# a false contract the state machine cannot honour. The type is now `[string]$Requires`, so
+# tests pass 'editor' directly.
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-a' -Requires 'editor'
 Check "empty state: available" 'available' $check.status
 
 # Acquire on empty state creates the record.
@@ -684,14 +688,16 @@ Check "acquire creates the record" 'p/T-a' $state['editor']['holder']
 Check "acquire generation is 1" 1 $state['editor']['generation']
 
 # Second candidate needs the same lease -> waiting.
-$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-b' -Requires @('editor')
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-b' -Requires 'editor'
 Check "second candidate: waiting" 'waiting' $check.status
 Check "waiting: waitOn names the resource" 'editor' $check.waitOn[0]
 Check "waiting: holders reports the current one" 'p/T-a' $check.holders['editor']
+Check "waiting: waitOn has exactly one element (single-resource contract)" 1 $check.waitOn.Count
 
 # Same candidate re-checking its own lease -> available (self-hold).
-$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-a' -Requires @('editor')
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-a' -Requires 'editor'
 Check "self-hold: available" 'available' $check.status
+Check "self-hold: waitOn is empty" 0 $check.waitOn.Count
 
 # Idempotent re-acquire on self-hold: bumps generation? no — record kept, clocks refresh separately.
 $genBefore = $state['editor']['generation']
@@ -704,9 +710,37 @@ try { Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey '
 catch { $threw = $true }
 CheckTrue "acquire on foreign lease refuses (throws)" $threw
 
-# Requires with zero elements -> trivially available (v1 candidate loop passes an array of 0 or 1).
-$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @()
-Check "empty requires: available" 'available' $check.status
+# Empty string / null Requires -> trivially available (candidate declared nothing to require).
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires ''
+Check "empty-string Requires: available" 'available' $check.status
+Check "empty-string Requires: waitOn is empty" 0 $check.waitOn.Count
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires $null
+Check "null Requires: available" 'available' $check.status
+Check "null Requires: waitOn is empty" 0 $check.waitOn.Count
+
+# msg-2185 pin: the API signature enforces single-resource intent. The parameter type is now
+# `[string]$Requires` at the function signature, so a caller who statically types their variable
+# as `[string[]]` and passes it directly gets a type error at strict-mode call sites — the
+# false-multi-resource signal the naysayer's R2 objected to is GONE from the API surface. This is
+# a documentation contract as much as a runtime one: an IDE showing the signature will not
+# advertise array support.
+#
+# Runtime caveat (pin the behaviour honestly, not the assumption). PowerShell's parameter binder
+# STILL coerces a runtime-typed multi-element array into a string by joining with spaces (e.g.
+# `@('editor','runner')` → `'editor runner'`). It does not throw. Our function then looks up
+# "editor runner" as a resource name, finds no such lease, and returns 'available' — a harmless
+# no-op, NOT the partial-acquire hang the naysayer described. The hang required a state machine
+# that iterated over multiple resources, which we no longer have (single-resource by type). So
+# the silent coercion produces safe wrong-answer ('available' for a non-existent resource) but
+# the caller cannot proceed to a multi-acquire because Invoke-LeaseAcquire takes ONE resource
+# only. Pin the actual behaviour so a future refactor cannot silently change it.
+$multiCoerced = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor','runner')
+Check "runtime coercion pin: multi-element array is joined by pwsh, treated as nonsense resource" `
+    'available' $multiCoerced.status
+Check "runtime coercion pin: no lease is reported as held" 0 $multiCoerced.holders.Count
+# A 1-element array coerces cleanly to its scalar — this is a documented pwsh convenience.
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor')
+Check "single-element array coerces to string (backward-compat)" 'waiting' $check.status
 
 # Acquire after a release preserves reclaim_required + reclaimed_from + reclaimed_reason —
 # these are the PERMANENT audit trail the new holder inherits.

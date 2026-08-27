@@ -464,10 +464,10 @@ function Test-LeaseAvailableFor {
         respect to leases. Returns one of:
           - 'available' : the required resource is free OR already held by this candidate; the
                           candidate may launch. The caller must then call Invoke-LeaseAcquire on
-                          the free one BEFORE launch, so the record shows the acquisition
-                          before the session starts (a killed acquire+launch survives as a
-                          committed lease, not a phantom launch — same reasoning as head_skip's
-                          "session-start-before-write" contract).
+                          it BEFORE launch, so the record shows the acquisition before the
+                          session starts (a killed acquire+launch survives as a committed lease,
+                          not a phantom launch — same reasoning as head_skip's "session-start-
+                          before-write" contract).
           - 'waiting'   : the required resource is held by someone else and NOT this candidate.
                           The candidate must NOT launch; disposition `lease-waiting`. The caller
                           SHOULD call Register-LeaseWaiter to queue.
@@ -477,6 +477,24 @@ function Test-LeaseAvailableFor {
         needs proper deadlock avoidance — bolting it onto a single-resource state machine is what
         rounds 11-12 tried and had to be reverted.
 
+        THE `Requires` PARAMETER IS A SINGLE STRING, ON PURPOSE (msg-2185 blocker fix). Earlier
+        the parameter was typed `[string[]]` with an internal foreach loop, which read cleanly
+        as "supports multi-resource" — an invitation the state machine cannot honour (Invoke-
+        LeaseAcquire takes ONE resource, there is no transactional rollback for a multi-acquire
+        sequence, and a caller that thought this predicate supported multi-resource would call
+        acquire multiple times and hang on the partial-acquire the moment two of the resources
+        were held by different threads).
+
+        Runtime caveat. PowerShell's parameter binder DOES silently coerce a runtime-typed
+        multi-element array to a joined string (`@('editor','runner')` → `'editor runner'`), so
+        the type is not a hard-runtime rejection. What it IS is an API-surface signal: a caller
+        reading the function's signature sees `[string]`, so they do not construct a call
+        thinking they can request multi-resource. If a runtime array does sneak through, our
+        code looks up the joined nonsense name as a resource, finds nothing, and returns
+        'available' — a harmless no-op, NOT a partial-acquire hang, because Invoke-LeaseAcquire
+        (single-resource) is the only path to actually take a lease. The signature is the
+        contract; the runtime behaviour is documented under §9 tests as a pin.
+
     .PARAMETER LeasesState
         The full leases.json map: resource-name -> lease hashtable.
 
@@ -484,32 +502,41 @@ function Test-LeaseAvailableFor {
         The "$project/$thread_id" key of the candidate.
 
     .PARAMETER Requires
-        Array of resource names the candidate declares in sweep.json's `requires`. v1 will only
-        ever pass zero or one element; the array-typed parameter is kept for the internal loop's
-        clarity (0-element = 'available' trivially).
+        The single resource name the candidate declares in sweep.json's `requires`. Empty
+        string or `$null` means the candidate declares no requires and is trivially available.
+        Multi-resource candidates are NOT supported in v1; do NOT construct this parameter as
+        an array (the type prevents it) — see the SYNOPSIS msg-2185 note.
 
     .OUTPUTS
         A hashtable @{
           status   = 'available' | 'waiting'
           holders  = @{ resource -> current-holder-key } for resources that are held (any holder)
-          waitOn   = [string[]] resources this candidate is waiting on
+          waitOn   = [string[]] resources this candidate is waiting on (0 or 1 element in v1).
+                     Kept as an array so the caller can uniformly `.Count`-test rather than
+                     null-check a scalar; the array wraps a single-resource verdict, it does
+                     NOT signal multi-resource support.
         }
     #>
     param(
         [hashtable]$LeasesState,
         [string]$CandidateKey,
-        [string[]]$Requires
+        [string]$Requires
     )
     $holders = @{}
     $waitOn = @()
-    foreach ($resource in $Requires) {
-        if (-not $LeasesState.ContainsKey($resource)) { continue }
-        $lease = $LeasesState[$resource]
-        if ($null -eq $lease) { continue }
-        $h = if ($lease -is [hashtable]) { $lease['holder'] } else { $lease.holder }
-        if ([string]::IsNullOrEmpty("$h")) { continue }
-        $holders[$resource] = "$h"
-        if ("$h" -ne $CandidateKey) { $waitOn += $resource }
+    # Empty / null Requires: the candidate declared nothing to require. Trivially available.
+    if (-not [string]::IsNullOrEmpty($Requires)) {
+        $resource = $Requires
+        if ($LeasesState.ContainsKey($resource)) {
+            $lease = $LeasesState[$resource]
+            if ($null -ne $lease) {
+                $h = if ($lease -is [hashtable]) { $lease['holder'] } else { $lease.holder }
+                if (-not [string]::IsNullOrEmpty("$h")) {
+                    $holders[$resource] = "$h"
+                    if ("$h" -ne $CandidateKey) { $waitOn += $resource }
+                }
+            }
+        }
     }
     $status = if ($waitOn.Count -eq 0) { 'available' } else { 'waiting' }
     return @{ status = $status; holders = $holders; waitOn = $waitOn }
