@@ -439,6 +439,15 @@ function Get-LeaseSummaryLines {
     }
     foreach ($name in $names) {
         $lease = ConvertTo-LeaseHashtable -Lease $LeasesState[$name]
+        # Null-lease guard (msg-2124 blocker follow-on). An operator hand-editing leases.json can
+        # leave `"editor": null` as a placeholder. Get-JsonState round-trips that as $null;
+        # ConvertTo-LeaseHashtable propagates the $null upward, and PowerShell will raise a
+        # RuntimeException on the very next `.ContainsKey()` call — aborting the whole digest
+        # render. Same failure class as the R2 [int]/[bool] casts: a corrupt scalar takes the
+        # sweep down with it. Skip the entry (it renders nothing) rather than fail closed. The
+        # merger already treats a null lease as "no data" via the null-guard in
+        # Get-LeaseGenerations, so the two behaviours are consistent.
+        if ($null -eq $lease) { continue }
         $holder = if ($lease.ContainsKey('holder')) { "$($lease['holder'])" } else { '' }
         $pinned = $lease.ContainsKey('pinned') -and (& $coerceBool $lease['pinned'])
         $expiring = $lease.ContainsKey('expiring') -and (& $coerceBool $lease['expiring'])

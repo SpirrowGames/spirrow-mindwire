@@ -361,6 +361,50 @@ $stateBoolReal = @{ editor = @{ holder = 'p/T-b'; pinned = $true; queue = @() } 
 $linesBoolReal = Get-LeaseSummaryLines -LeasesState $stateBoolReal -Now $digestNow -FormatDuration $format
 CheckTrue "real $true still renders as [pinned]" (($linesBoolReal -join "`n") -match '\[pinned\]')
 
+# msg-2124 blocker: a null lease record (operator hand-edit leaves `"editor": null` as a
+# placeholder) round-trips through ConvertTo-LeaseHashtable as $null. The old code called
+# $lease.ContainsKey('holder') on $null, raising a RuntimeException and aborting the whole
+# digest render. Fix: null-guard skips the entry entirely — corrupt cell renders nothing
+# rather than taking the whole digest down (same failure class as the R2 [int]/[bool] casts,
+# same failure-open response).
+$stateNullLease = @{
+    editor = $null
+    runner = @{ holder = 'p/T-x'; queue = @() }
+}
+$threwNull = $false
+$linesNull = $null
+try {
+    $linesNull = Get-LeaseSummaryLines -LeasesState $stateNullLease -Now $digestNow -FormatDuration $format
+}
+catch { $threwNull = $true }
+CheckFalse "null lease record does NOT abort Get-LeaseSummaryLines" $threwNull
+if (-not $threwNull) {
+    $joinedNull = ($linesNull -join "`n")
+    # The healthy lease still renders — one bad entry must not silence the rest of the digest.
+    CheckTrue  "sibling healthy lease still renders around a null entry" ($joinedNull -match 'runner: p/T-x')
+    # The null-valued key is skipped rather than rendered as garbage.
+    CheckFalse "null-valued key does not appear in the digest at all"     ($joinedNull -match 'editor:')
+}
+
+# Also the fully-null state (someone truncated the file to `{}` with only null values, or
+# passed an all-null map from a corrupt disk read): the empty-state fallback should still run
+# because no live entries render.
+$stateAllNull = @{ editor = $null; runner = $null }
+$threwAllNull = $false
+$linesAllNull = $null
+try {
+    $linesAllNull = @(Get-LeaseSummaryLines -LeasesState $stateAllNull -Now $digestNow -FormatDuration $format)
+}
+catch { $threwAllNull = $true }
+CheckFalse "all-null state does NOT abort Get-LeaseSummaryLines" $threwAllNull
+if (-not $threwAllNull) {
+    # Two null entries produce zero live lines. The current design does NOT fall back to the
+    # "(該当なし)" empty-state line in this case — that line is only rendered when the map is
+    # keyless. Two null entries render as two skipped iterations, so the return is empty.
+    # Test that assertion literally: no lines are emitted rather than crashing.
+    Check "all-null state produces no rendered lines" 0 $linesAllNull.Count
+}
+
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "lease gate: all checks passed"
