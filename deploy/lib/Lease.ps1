@@ -303,6 +303,13 @@ function Merge-LeasesStateForWrite {
             stale memory. The current condition tests generation mismatch alone.
           - A resource present on disk but not in memory (rare — sweep never adds keys the
             wrapper did not read at start) is preserved from disk.
+          - A resource the sweep held at tick start (present in $OriginalGenerations) but has
+            REMOVED from memory this tick is the mirror of case (b): the sweep freed the lease
+            and drained its queue, and the schema commits to no empty stub entries. A second
+            pass, run after the Memory-keys loop, honours the deletion — .Remove()s the key from
+            $out — unless the disk generation has advanced (an external writer landed
+            concurrently), in which case the external write wins on the same generation tie-
+            break rule as the mutation path.
 
         THE WINDOW WE DO NOT CLOSE. This narrows the race from "tick duration" (minutes) to
         "the gap between our re-read and our write" (sub-millisecond) — same operational trade
@@ -361,6 +368,38 @@ function Merge-LeasesStateForWrite {
         # first lands on disk.
         $out[$resource] = $Memory[$resource]
     }
+
+    # Sweep-side deletion (msg-2131 blocker). The schema commits: "ABSENT resource key = no
+    # holder, empty queue. Do NOT create empty stub entries." When the sweep frees a lease and
+    # drains its queue (TTL expiry that promotes no waiter, operator-Clear followed by empty
+    # queue, etc.), the caller is required to REMOVE the key from its in-memory map — not to
+    # leave a stub. That deletion has to persist through the merger.
+    #
+    # The Memory-keys loop above cannot detect it: a deleted key is absent from Memory.Keys and
+    # so is never iterated. Without this second pass, $out silently keeps the old disk state and
+    # the sweep's deletion is dropped — the mirror of the R1 (external-deletion) bug.
+    #
+    # Rule: for every key the sweep saw at tick start (present in $OriginalGenerations) that is
+    # now absent from Memory,
+    #   - if disk's generation is unchanged (no external write), honour the sweep's deletion —
+    #     .Remove() from $out.
+    #   - if disk's generation has advanced (an external writer landed), external wins — leave
+    #     whatever the disk copy-through put in $out. Same tie-break rule as the mutation path.
+    #   - if the resource is also absent from disk now (external deleter also dropped it), $out
+    #     never had it, and .Remove() on an absent key is a no-op — the operator and the sweep
+    #     agree, and the key stays absent.
+    foreach ($resource in @($OriginalGenerations.Keys)) {
+        if ($Memory.ContainsKey($resource)) { continue }   # handled by the Memory-keys loop
+        $priorGen = [int]$OriginalGenerations[$resource]
+        $diskGen  = if ($currentGens.ContainsKey($resource)) { [int]$currentGens[$resource] } else { -1 }
+        if ($diskGen -eq $priorGen) {
+            # No external write during the sweep — the sweep's deletion is authoritative.
+            $out.Remove($resource) | Out-Null
+        }
+        # else: external writer landed; disk value is already in $out (or absent from $out if
+        # they also deleted). Leave whichever is there.
+    }
+
     return $out
 }
 

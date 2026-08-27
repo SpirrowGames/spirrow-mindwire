@@ -119,10 +119,12 @@ Check "ConvertTo-LeaseHashtable idempotent: holder preserved" 'p/T-a' $again['ho
 # uses per-resource `generation` as an optimistic-concurrency token to detect the external write.
 #
 # Scenario C ("sweep did an acquire and wins") requires Invoke-LeaseAcquire, which lands in PR 2;
-# that scenario is added to this section when PR 2 lands. A/B/D/E/F cover the merger's own logic
-# in isolation and are complete without any other function. Scenario F is the msg-2103 regression
-# guard for external deletion mid-sweep — the original condition silently resurrected deleted
-# leases from stale memory and this test would have caught it on the first run.
+# that scenario is added to this section when PR 2 lands. A/B/D/E/F/G/H cover the merger's own
+# logic in isolation and are complete without any other function.
+#   - F: msg-2103 external deletion mid-sweep (the merger must not resurrect the deleted key).
+#   - G: msg-2114 corrupt-scalar fall-back (a hand-edit typo must not abort the flush).
+#   - H: msg-2131 sweep-side deletion (mirror of F — a sweep-freed lease with an empty queue
+#     must not be silently resurrected from stale disk state).
 Write-Host "Merge-LeasesStateForWrite — operator write mid-sweep survives (msg-1802 blocker #1)"
 
 # Fresh temp fixture (never this checkout's own state dir).
@@ -221,6 +223,67 @@ try {
     Check "deletion + new-in-memory: deleted key stays absent" $false $mergedFp.ContainsKey('editor')
     Check "deletion + new-in-memory: fresh key writes through" 'p/T-x' $mergedFp['runner'].holder
     Check "deletion + new-in-memory: fresh key generation preserved" 1 $mergedFp['runner'].generation
+
+    # --- scenario H: SWEEP-side deletion (msg-2131 blocker). The mirror of scenario F. The
+    # schema commits: "ABSENT resource key = no holder, empty queue. Do NOT create empty stub
+    # entries." When the sweep frees a lease and drains its queue, the caller REMOVES the key
+    # from its in-memory map. Without a second pass in the merger, that deletion is invisible
+    # (Memory.Keys no longer contains it, and $out was seeded from disk which still has it) —
+    # so the flush silently resurrects the old lease from stale disk state.
+    $diskH0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; last_progress_at = '2026-08-25T00:00:00Z'; idle_evaluations = 0; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskH0
+    $memoryH = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensH = Get-LeaseGenerations -LeasesState $memoryH
+    # Sweep freed the lease (TTL expiry, no waiter to promote) and dropped the stub, per schema.
+    $memoryH.Remove('editor') | Out-Null
+    # Disk unchanged (no external write).
+    $mergedH = Merge-LeasesStateForWrite -Memory $memoryH -OriginalGenerations $originalGensH -DiskPath $fixturePath
+    Check "sweep-deletion (uncontested): key must be ABSENT from merged" $false $mergedH.ContainsKey('editor')
+    Check "sweep-deletion (uncontested): merged has no other stray keys"  0 $mergedH.Keys.Count
+
+    # --- scenario H': sweep-side deletion COLLIDES with concurrent external write. External
+    # write wins on the same generation tie-break as the mutation path — the sweep's deletion
+    # is dropped in favour of the operator's Tier-C decision.
+    $diskHp0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskHp0
+    $memoryHp = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensHp = Get-LeaseGenerations -LeasesState $memoryHp
+    # Sweep decided to free 'editor' and dropped the stub.
+    $memoryHp.Remove('editor') | Out-Null
+    # Meanwhile operator ran Grant-Lease.ps1 -To p/T-c and bumped disk to gen 6.
+    $diskHp1 = @{
+        editor = @{ holder = 'p/T-c'; generation = 6; queue = @(); reclaimed_reason = 'human-grant: urgent' }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskHp1
+    $mergedHp = Merge-LeasesStateForWrite -Memory $memoryHp -OriginalGenerations $originalGensHp -DiskPath $fixturePath
+    Check "sweep-deletion vs operator-write: operator wins" 'p/T-c' $mergedHp['editor'].holder
+    Check "sweep-deletion vs operator-write: operator generation wins" 6 $mergedHp['editor'].generation
+
+    # --- scenario H'': sweep-side deletion AND external deletion of the same key. Both parties
+    # agree; the key must stay absent. Also confirms that .Remove() on an absent $out entry is
+    # harmless (no throw).
+    $diskHpp0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskHpp0
+    $memoryHpp = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensHpp = Get-LeaseGenerations -LeasesState $memoryHpp
+    $memoryHpp.Remove('editor') | Out-Null      # sweep also freed
+    Save-FixtureLeases -Path $fixturePath -State @{}  # operator also cleared
+    $threwHpp = $false
+    $mergedHpp = $null
+    try {
+        $mergedHpp = Merge-LeasesStateForWrite -Memory $memoryHpp -OriginalGenerations $originalGensHpp -DiskPath $fixturePath
+    }
+    catch { $threwHpp = $true }
+    CheckFalse "sweep+external deletion agreement: does NOT throw" $threwHpp
+    if (-not $threwHpp) {
+        Check "sweep+external deletion agreement: key absent" $false $mergedHpp.ContainsKey('editor')
+    }
 
     # --- scenario E: Get-LeaseGenerations edge cases ---
     $gens = Get-LeaseGenerations -LeasesState @{}
