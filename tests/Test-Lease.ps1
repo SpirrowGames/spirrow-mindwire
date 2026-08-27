@@ -718,29 +718,75 @@ $check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requi
 Check "null Requires: available" 'available' $check.status
 Check "null Requires: waitOn is empty" 0 $check.waitOn.Count
 
-# msg-2185 pin: the API signature enforces single-resource intent. The parameter type is now
-# `[string]$Requires` at the function signature, so a caller who statically types their variable
-# as `[string[]]` and passes it directly gets a type error at strict-mode call sites — the
-# false-multi-resource signal the naysayer's R2 objected to is GONE from the API surface. This is
-# a documentation contract as much as a runtime one: an IDE showing the signature will not
-# advertise array support.
+# msg-2189 blocker fix pin. A multi-element array is NOT harmless coercion — it is a silent
+# fail-open lock bypass. The R2 tests I wrote claimed the pwsh-joined 'editor runner' phantom
+# resource returned 'available' safely (because Invoke-LeaseAcquire is single-arg so the caller
+# can't multi-acquire). The R3 naysayer correctly pointed out this was wrong: 'available' is a
+# LAUNCH-AUTHORISATION signal, so returning it for a malformed multi-resource request tells the
+# caller "go ahead, launch" while the real 'editor' and 'runner' leases stay UNCLAIMED. Another
+# candidate then correctly requests 'editor', sees it free, acquires, and launches — mutual
+# exclusion collapse, dressed up as graceful degradation. The fix is fail-closed: the function
+# THROWS on multi-element arrays, refusing to produce a verdict.
 #
-# Runtime caveat (pin the behaviour honestly, not the assumption). PowerShell's parameter binder
-# STILL coerces a runtime-typed multi-element array into a string by joining with spaces (e.g.
-# `@('editor','runner')` → `'editor runner'`). It does not throw. Our function then looks up
-# "editor runner" as a resource name, finds no such lease, and returns 'available' — a harmless
-# no-op, NOT the partial-acquire hang the naysayer described. The hang required a state machine
-# that iterated over multiple resources, which we no longer have (single-resource by type). So
-# the silent coercion produces safe wrong-answer ('available' for a non-existent resource) but
-# the caller cannot proceed to a multi-acquire because Invoke-LeaseAcquire takes ONE resource
-# only. Pin the actual behaviour so a future refactor cannot silently change it.
-$multiCoerced = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor','runner')
-Check "runtime coercion pin: multi-element array is joined by pwsh, treated as nonsense resource" `
-    'available' $multiCoerced.status
-Check "runtime coercion pin: no lease is reported as held" 0 $multiCoerced.holders.Count
-# A 1-element array coerces cleanly to its scalar — this is a documented pwsh convenience.
+# Runtime caveat that the R2 pin GOT WRONG (kept here as a historical note so a future reader
+# does not repeat the mistake): pwsh's `[string]` parameter binder silently joins multi-element
+# arrays with a space (`@('a','b')` → `'a b'`). We can no longer trust the type-level signal to
+# enforce the contract at runtime — the entry validation below is what does. This is why the
+# parameter is UNTYPED at the signature level and validated by hand inside the function.
+$threwMulti = $false
+try {
+    Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor','runner')
+}
+catch { $threwMulti = $true }
+CheckTrue "msg-2189: multi-element -Requires array THROWS (fail-closed on multi-resource)" $threwMulti
+# Also confirm 3+ element arrays throw (not just 2).
+$threwThree = $false
+try {
+    Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor','runner','gpu')
+}
+catch { $threwThree = $true }
+CheckTrue "msg-2189: 3-element -Requires array THROWS" $threwThree
+# Wrong types (hashtable, integer) also throw — the entry validation is exhaustive.
+$threwHash = $false
+try {
+    Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @{ editor = 'x' }
+}
+catch { $threwHash = $true }
+CheckTrue "msg-2189: hashtable -Requires THROWS (type is not string/array)" $threwHash
+$threwInt = $false
+try {
+    Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires 42
+}
+catch { $threwInt = $true }
+CheckTrue "msg-2189: integer -Requires THROWS" $threwInt
+
+# Single-element array still coerces to its scalar — the documented pwsh convenience the R2
+# tests already relied on. This is preserved BY DESIGN in the entry validation (see msg-2189
+# rationale in the SYNOPSIS: a 1-element array is a common pwsh idiom, and rejecting it would
+# be paranoid over-restriction without adding any safety).
 $check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor')
-Check "single-element array coerces to string (backward-compat)" 'waiting' $check.status
+Check "single-element array coerces to string (backward-compat preserved)" 'waiting' $check.status
+Check "single-element array: waitOn has exactly one element" 1 $check.waitOn.Count
+# Empty array is the same as null / empty string.
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @()
+Check "empty array -Requires: available" 'available' $check.status
+
+# Regression pin: the R2 test that WAS wrong. If a future refactor re-introduces silent joining
+# ('available' for a coerced nonsense name), the naysayer's R3 failure mode returns. Explicitly
+# assert the OPPOSITE of R2's claim: the multi-array MUST NOT return 'available' — it must throw.
+# (This is a dual formulation of the throw check above; keeping both makes the intent obvious to
+# a future refactor reader who might grep either phrase.)
+$didNotReturnAvailable = $false
+try {
+    $verdict = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor','runner')
+    # If we reach here without an exception, the fix regressed — record the wrong behaviour.
+    $didNotReturnAvailable = ($verdict.status -ne 'available')
+}
+catch {
+    # Exception is the correct behaviour — the fix is holding.
+    $didNotReturnAvailable = $true
+}
+CheckTrue "msg-2189 (R2 regression pin): multi-element array MUST NOT return 'available'" $didNotReturnAvailable
 
 # Acquire after a release preserves reclaim_required + reclaimed_from + reclaimed_reason —
 # these are the PERMANENT audit trail the new holder inherits.

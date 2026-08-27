@@ -477,23 +477,28 @@ function Test-LeaseAvailableFor {
         needs proper deadlock avoidance — bolting it onto a single-resource state machine is what
         rounds 11-12 tried and had to be reverted.
 
-        THE `Requires` PARAMETER IS A SINGLE STRING, ON PURPOSE (msg-2185 blocker fix). Earlier
-        the parameter was typed `[string[]]` with an internal foreach loop, which read cleanly
-        as "supports multi-resource" — an invitation the state machine cannot honour (Invoke-
-        LeaseAcquire takes ONE resource, there is no transactional rollback for a multi-acquire
-        sequence, and a caller that thought this predicate supported multi-resource would call
-        acquire multiple times and hang on the partial-acquire the moment two of the resources
-        were held by different threads).
+        SINGLE-RESOURCE, FAIL-CLOSED (msg-2185 → msg-2189 blocker fixes). Earlier the parameter
+        was typed `[string[]]` with an internal foreach loop; msg-2185 collapsed the signature to
+        `[string]` intending the type to act as a single-resource signal. That was insufficient.
+        PowerShell's parameter binder silently coerces a runtime `@('editor','runner')` into
+        `'editor runner'` before the function sees it, so the type is not a hard-runtime
+        rejection. The R2 pin claimed that was a "harmless no-op" because the joined nonsense
+        name matched no lease and returned 'available'. That claim was wrong: 'available' is a
+        LAUNCH-AUTHORISATION signal to the caller, so silently returning 'available' for a
+        malformed multi-resource request tells the caller "go ahead, launch" while the real
+        `editor` and `runner` leases remain UNCLAIMED. Another candidate that then correctly
+        requested `'editor'` would see it free, acquire, and launch — TWO candidates now
+        operating on the same exclusive resource. That IS mutual-exclusion collapse, dressed up
+        as a graceful degradation.
 
-        Runtime caveat. PowerShell's parameter binder DOES silently coerce a runtime-typed
-        multi-element array to a joined string (`@('editor','runner')` → `'editor runner'`), so
-        the type is not a hard-runtime rejection. What it IS is an API-surface signal: a caller
-        reading the function's signature sees `[string]`, so they do not construct a call
-        thinking they can request multi-resource. If a runtime array does sneak through, our
-        code looks up the joined nonsense name as a resource, finds nothing, and returns
-        'available' — a harmless no-op, NOT a partial-acquire hang, because Invoke-LeaseAcquire
-        (single-resource) is the only path to actually take a lease. The signature is the
-        contract; the runtime behaviour is documented under §9 tests as a pin.
+        The fix (msg-2189): accept `$Requires` as an untyped parameter and validate its actual
+        runtime shape at entry. If it is an array with 2+ elements, THROW — do not silently
+        joining-coerce, do not return 'available'. Single-element arrays coerce cleanly to their
+        scalar (a documented pwsh convenience the R2 tests already relied on and this fix
+        preserves). Anything not a string, array, or null is a type error. Fail-closed is the
+        right posture here: a malformed callsite must be VISIBLE to the caller (as an exception
+        they cannot swallow silently), not hidden behind a phantom 'available'. The type
+        signature is no longer the contract; the entry validation IS.
 
     .PARAMETER LeasesState
         The full leases.json map: resource-name -> lease hashtable.
@@ -503,9 +508,10 @@ function Test-LeaseAvailableFor {
 
     .PARAMETER Requires
         The single resource name the candidate declares in sweep.json's `requires`. Empty
-        string or `$null` means the candidate declares no requires and is trivially available.
-        Multi-resource candidates are NOT supported in v1; do NOT construct this parameter as
-        an array (the type prevents it) — see the SYNOPSIS msg-2185 note.
+        string / `$null` / an empty array means the candidate declares no requires and is
+        trivially available. A one-element array is accepted as a documented convenience (pwsh
+        callers commonly type `@('editor')` where a single string is the API truth). A multi-
+        element array THROWS — see the SYNOPSIS msg-2189 note.
 
     .OUTPUTS
         A hashtable @{
@@ -516,17 +522,71 @@ function Test-LeaseAvailableFor {
                      null-check a scalar; the array wraps a single-resource verdict, it does
                      NOT signal multi-resource support.
         }
+
+        A malformed `-Requires` argument (multi-element array, wrong type) THROWS a
+        RuntimeException — the function does NOT return a verdict in that case. Callers must
+        not swallow the exception silently; the whole point of failing closed is to make the
+        misuse visible to the caller (msg-2189 blocker fix).
     #>
     param(
         [hashtable]$LeasesState,
         [string]$CandidateKey,
-        [string]$Requires
+        # UNTYPED on purpose — see .SYNOPSIS msg-2189. A `[string]` parameter would let pwsh
+        # silently join a multi-element array into a nonsense string before the validation
+        # below could see it. The runtime type check is the real single-resource enforcement.
+        $Requires
     )
+
+    # ENTRY VALIDATION (msg-2189 blocker fix). Normalise `$Requires` to a single scalar string
+    # OR throw on malformed input. Do this BEFORE any lease lookup so the caller's misuse cannot
+    # produce a phantom 'available' verdict.
+    $requiresStr = $null
+    if ($null -eq $Requires) {
+        $requiresStr = ''
+    }
+    elseif ($Requires -is [string]) {
+        $requiresStr = $Requires
+    }
+    elseif ($Requires -is [array]) {
+        if ($Requires.Count -eq 0) {
+            # `@()` is a legitimate "no requires" — same as null / empty string.
+            $requiresStr = ''
+        }
+        elseif ($Requires.Count -eq 1) {
+            # `@('editor')` is the documented convenience: one-element array coerces to its
+            # scalar. Callers that write `@('x')` are common in pwsh; rejecting them would
+            # break the R2 tests without adding safety.
+            $only = $Requires[0]
+            if ($null -eq $only) {
+                $requiresStr = ''
+            }
+            elseif ($only -is [string]) {
+                $requiresStr = $only
+            }
+            else {
+                throw "Test-LeaseAvailableFor: -Requires single-element array must contain a string, got [$($only.GetType().Name)] (msg-2189: single-resource contract)"
+            }
+        }
+        else {
+            # THE msg-2189 BLOCKER FIX. A caller passed `@('editor', 'runner', ...)` — the state
+            # machine is strictly single-resource (msg-2038; Invoke-LeaseAcquire takes ONE
+            # resource, no transactional rollback exists, rounds 11-12 tried and had to be
+            # reverted). Returning 'available' for the coerced 'editor runner' phantom name
+            # would authorise a launch that never actually claims the real leases — mutual
+            # exclusion collapse. Throw so the caller sees the misuse.
+            throw "Test-LeaseAvailableFor: -Requires must be a single resource, got a $($Requires.Count)-element array — multi-resource is not supported (msg-2189: single-resource contract, msg-2038 correction)"
+        }
+    }
+    else {
+        throw "Test-LeaseAvailableFor: -Requires must be a string or single-element array, got [$($Requires.GetType().FullName)] (msg-2189: single-resource contract)"
+    }
+
     $holders = @{}
     $waitOn = @()
-    # Empty / null Requires: the candidate declared nothing to require. Trivially available.
-    if (-not [string]::IsNullOrEmpty($Requires)) {
-        $resource = $Requires
+    # Empty Requires (from null / '' / @() / @($null)): the candidate declared nothing to
+    # require. Trivially available.
+    if (-not [string]::IsNullOrEmpty($requiresStr)) {
+        $resource = $requiresStr
         if ($LeasesState.ContainsKey($resource)) {
             $lease = $LeasesState[$resource]
             if ($null -ne $lease) {
