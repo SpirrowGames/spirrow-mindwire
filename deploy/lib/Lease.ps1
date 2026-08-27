@@ -272,9 +272,20 @@ function Merge-LeasesStateForWrite {
           - If disk's generation for a resource EQUALS the snapshot we took at sweep start, no
             external write has landed against that resource this tick — memory wins (write
             through the sweep's clock updates and any acquire/promote it did).
-          - If disk's generation is DIFFERENT (higher — it never decreases), an external writer
-            landed a change against fresher state than ours. Their write is a Tier-C human
-            decision. Disk wins for that resource: leave the disk value in $out, discard memory.
+          - If disk's generation is DIFFERENT, an external writer landed a change against fresher
+            state than ours. Their write is a Tier-C human decision. Disk wins for that resource:
+            leave whatever is (or is not) in $out, discard memory. Two shapes of "different" both
+            resolve this way:
+              (a) mutation — the key is still on disk with a bumped generation (e.g. operator ran
+                  `Grant-Lease.ps1 -To`). The disk value is already in $out from the copy-through.
+              (b) DELETION — the operator emptied the lease AND cleared the queue, so per the
+                  schema (file header) the key is absent. $currentGens does not have the resource,
+                  so its diskGen is -1 while priorGen is still the pre-sweep value — still a
+                  mismatch. $out has no entry to leave alone; the key correctly stays absent,
+                  matching the operator's intent.
+            The read `if ($current.ContainsKey($resource) -and $diskGen -ne $priorGen)` that this
+            file used to carry silently missed case (b) and resurrected the deleted lease from
+            stale memory. The current condition tests generation mismatch alone.
           - A resource present on disk but not in memory (rare — sweep never adds keys the
             wrapper did not read at start) is preserved from disk.
 
@@ -313,11 +324,26 @@ function Merge-LeasesStateForWrite {
     foreach ($resource in @($Memory.Keys)) {
         $priorGen = if ($OriginalGenerations.ContainsKey($resource)) { [int]$OriginalGenerations[$resource] } else { -1 }
         $diskGen  = if ($currentGens.ContainsKey($resource))         { [int]$currentGens[$resource]         } else { -1 }
-        if ($current.ContainsKey($resource) -and $diskGen -ne $priorGen) {
-            # External writer landed on this resource during the sweep — keep disk (already in $out).
+        if ($diskGen -ne $priorGen) {
+            # External writer landed on this resource during the sweep. Two shapes both surface as
+            # a generation mismatch:
+            #   (a) mutation — disk still has the key, with a bumped generation (operator ran
+            #       Grant-Lease.ps1 -To / -Clear-that-keeps-a-record). The disk value is already in
+            #       $out from the copy-through above.
+            #   (b) DELETION — disk no longer has the key at all. The schema (file header) makes
+            #       an absent key equivalent to a freed lease with an empty queue, so an operator
+            #       Clear that empties both may legitimately remove the key. In that case
+            #       $currentGens does not have the resource, so $diskGen is -1 while $priorGen is
+            #       the pre-sweep value (e.g. 5) — still a mismatch, still "external writer wins",
+            #       but $out has no entry to leave alone. `continue`ing here correctly leaves the
+            #       key absent from $out — which is the operator's intent.
+            # Without dropping the earlier `$current.ContainsKey($resource)` guard, case (b) would
+            # fall through and silently resurrect the deleted lease from stale memory.
             continue
         }
-        # No collision (or the resource is new-in-memory) — write memory's version through.
+        # No collision (or the resource is new-in-memory: priorGen == diskGen == -1) — write
+        # memory's version through. If memory added a new resource this tick, this is where it
+        # first lands on disk.
         $out[$resource] = $Memory[$resource]
     }
     return $out

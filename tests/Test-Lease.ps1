@@ -117,8 +117,10 @@ Check "ConvertTo-LeaseHashtable idempotent: holder preserved" 'p/T-a' $again['ho
 # uses per-resource `generation` as an optimistic-concurrency token to detect the external write.
 #
 # Scenario C ("sweep did an acquire and wins") requires Invoke-LeaseAcquire, which lands in PR 2;
-# that scenario is added to this section when PR 2 lands. A/B/D/E cover the merger's own logic in
-# isolation and are complete without any other function.
+# that scenario is added to this section when PR 2 lands. A/B/D/E/F cover the merger's own logic
+# in isolation and are complete without any other function. Scenario F is the msg-2103 regression
+# guard for external deletion mid-sweep — the original condition silently resurrected deleted
+# leases from stale memory and this test would have caught it on the first run.
 Write-Host "Merge-LeasesStateForWrite — operator write mid-sweep survives (msg-1802 blocker #1)"
 
 # Fresh temp fixture (never this checkout's own state dir).
@@ -177,6 +179,46 @@ try {
     $mergedD = Merge-LeasesStateForWrite -Memory $memoryD -OriginalGenerations $originalGensD -DiskPath $fixturePath
     Check "disk-only resource: preserved" 'p/T-x' $mergedD['runner'].holder
     Check "disk-only resource: generation preserved" 3 $mergedD['runner'].generation
+
+    # --- scenario F: operator DELETION mid-sweep (msg-2103 blocker). The schema treats an
+    # absent key as "no holder, empty queue" — an operator that empties both may legitimately
+    # remove the key entirely. The merger must NOT resurrect it from stale memory. The bug the
+    # earlier `$current.ContainsKey($resource) -and $diskGen -ne $priorGen` condition hid was
+    # exactly this: no key on disk meant the mismatch check was skipped and memory silently
+    # won, reversing the operator's -Clear. Fix: mismatch alone decides; deletion produces
+    # diskGen=-1 vs a live priorGen, which is a mismatch, and the key correctly stays absent.
+    $diskF0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; last_progress_at = '2026-08-25T00:00:00Z'; idle_evaluations = 0; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskF0
+    $memoryF = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensF = Get-LeaseGenerations -LeasesState $memoryF
+    # Sweep touches memory (probe clock bump).
+    $memoryF['editor']['last_progress_at'] = '2026-08-26T05:00:00Z'
+    # Operator ran Grant-Lease.ps1 -Clear, emptied the queue, and removed the key entirely.
+    Save-FixtureLeases -Path $fixturePath -State @{}
+    $mergedF = Merge-LeasesStateForWrite -Memory $memoryF -OriginalGenerations $originalGensF -DiskPath $fixturePath
+    Check "operator-deletion: resurrected key must be ABSENT (schema: absent = free)" $false $mergedF.ContainsKey('editor')
+    Check "operator-deletion: merged state has no other resurrected keys either"      0      $mergedF.Keys.Count
+
+    # --- scenario F': deletion + concurrent memory-added new resource. The deletion is honoured
+    # (editor stays absent) AND a truly-new-in-memory key (runner) writes through. This proves
+    # the "new-in-memory" case (priorGen=-1, diskGen=-1) is not accidentally routed through the
+    # deletion branch.
+    $diskFp0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskFp0
+    $memoryFp = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensFp = Get-LeaseGenerations -LeasesState $memoryFp
+    # Sweep this tick: acquired the fresh 'runner' resource for the first time.
+    $memoryFp['runner'] = @{ holder = 'p/T-x'; generation = 1; queue = @() }
+    # Operator deleted 'editor' mid-sweep.
+    Save-FixtureLeases -Path $fixturePath -State @{}
+    $mergedFp = Merge-LeasesStateForWrite -Memory $memoryFp -OriginalGenerations $originalGensFp -DiskPath $fixturePath
+    Check "deletion + new-in-memory: deleted key stays absent" $false $mergedFp.ContainsKey('editor')
+    Check "deletion + new-in-memory: fresh key writes through" 'p/T-x' $mergedFp['runner'].holder
+    Check "deletion + new-in-memory: fresh key generation preserved" 1 $mergedFp['runner'].generation
 
     # --- scenario E: Get-LeaseGenerations edge cases ---
     $gens = Get-LeaseGenerations -LeasesState @{}
