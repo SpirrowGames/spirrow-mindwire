@@ -1,17 +1,29 @@
 # Regression guard for the exclusive-resource lease + queue (T-exclusive-resource-lease-queue,
 # msg-1180 / 1183 / 1185 / 1187 design; msg-1188 Tier-C approval).
 #
-# What THIS PR covers (T-exclusive-resource-lease-queue PR 1 / 4 — state & persistence):
+# What THIS PR covers (T-exclusive-resource-lease-queue PR 2 / 4 — acquire / classification /
+# reader collapse; PR 1 landed state & persistence):
 #   1. Merge-LeasesStateForWrite — the operator-write-mid-sweep survival semantics (per-resource
-#      `generation` as an optimistic-concurrency token). This is the msg-1802 blocker fix, rebased
-#      onto the split PR chain (Takahito msg-2098 §3): PR 1 lands the record shape, the merge
-#      rule, and Get-JsonState / Get-LeaseSummaryLines. Nothing here is wired into the sweep yet;
-#      wiring lands in PR 4.
+#      `generation` as an optimistic-concurrency token). This is the msg-1802 blocker fix.
+#   2. Get-LeaseHolderClassification — the four cases (progress / parked / neutral) it must
+#      produce for the current wrapper's decide verdicts + held/quarantined/absent inputs.
+#      This is the ONE predicate the whole design's correctness turns on (msg-1187 §4 (ii)).
+#   3. Update-LeaseFromClassification — 'progress' resets + clears TRANSIENT Phase-1 fields but
+#      preserves PERMANENT audit; 'parked' increments; 'neutral' no-op.
+#   4. Test-LeaseExpiring — DUAL predicate (idle_evaluations AND wall-clock); pin is TTL-immune.
+#   5. Add-LeaseWaiter / Remove-LeaseWaiter — idempotent enqueue, no duplication.
+#   6. Test-LeaseAvailableFor + Invoke-LeaseAcquire — the candidate-loop gate, self-hold is
+#      available, no accidental steal throws.
+#   7. Register-LeaseWaiter — creates the resource record if absent, enqueues.
+#   8. Read-JsonStateWithShape / Get-JsonState shape guard / Save-CorruptedStateBackup — the
+#      reader collapse (msg-2172 Tier-C, 2026-08-28). ROOT array / scalar JSON now returns empty
+#      rather than leaking Count/Length/... metadata as fake resource keys. The 2026-08-28
+#      measurement (archived at .git/mindwire-scratch/array-shape-probe-v2.ps1) confirmed the
+#      pre-fix vector was a permanent one-way corruption; these tests pin the fixes.
 #
-# Sections for probe classification (Get-LeaseHolderClassification / Update-LeaseFromClassification
-# / Test-LeaseExpiring / Test-LeaseAvailableFor / Invoke-LeaseAcquire) will be added in PR 2. Queue
-# sections (Add/Remove waiter, Get-NextLeaseWaiter, Invoke-LeasePromotion, scrub, empty-drain,
-# Register-LeaseWaiter) will be added in PR 3. Wrapper AST checks land in PR 4 with the wiring.
+# Queue sections (Get-NextLeaseWaiter, Invoke-LeasePromotion, Remove-IneligibleLeaseWaiters,
+# Invoke-LeaseGrantFromEmpty) will be added in PR 3. Wrapper AST checks land in PR 4 with the
+# state-machine wiring.
 
 $ErrorActionPreference = "Stop"
 
@@ -466,6 +478,408 @@ if (-not $threwAllNull) {
     # keyless. Two null entries render as two skipped iterations, so the return is empty.
     # Test that assertion literally: no lines are emitted rather than crashing.
     Check "all-null state produces no rendered lines" 0 $linesAllNull.Count
+}
+
+# --- 5. Get-LeaseHolderClassification -----------------------------------------------------------
+Write-Host ""
+Write-Host "Get-LeaseHolderClassification — progress / parked / neutral trichotomy"
+
+function New-Verdict { param([string]$Decision) return [pscustomobject]@{ decision = $Decision } }
+
+# Held pauses the TTL clock (msg-1183 D-6'c).
+Check "held holder -> progress (keeps lease alive)" 'progress' `
+    (Get-LeaseHolderClassification -HolderKey 'p/T-a' -IsHeld $true -IsQuarantined $false -IsOnSweep $true -Verdict $null)
+Check "held + LAUNCH verdict -> still progress" 'progress' `
+    (Get-LeaseHolderClassification -HolderKey 'p/T-a' -IsHeld $true -IsQuarantined $false -IsOnSweep $true -Verdict (New-Verdict 'launch'))
+
+# Removed from sweep list = definitely won't run.
+Check "not on sweep -> parked" 'parked' `
+    (Get-LeaseHolderClassification -HolderKey 'p/T-a' -IsHeld $false -IsQuarantined $false -IsOnSweep $false -Verdict $null)
+
+# Quarantined = wrapper-side stopped.
+Check "quarantined -> parked" 'parked' `
+    (Get-LeaseHolderClassification -HolderKey 'p/T-a' -IsHeld $false -IsQuarantined $true -IsOnSweep $true -Verdict $null)
+
+# The core decide-verdict mapping (msg-1185 §2-c).
+Check "SKIP verdict -> parked (stop-token: NEXT: none/human)" 'parked' `
+    (Get-LeaseHolderClassification -HolderKey 'p/T-a' -IsHeld $false -IsQuarantined $false -IsOnSweep $true -Verdict (New-Verdict 'skip'))
+Check "LAUNCH verdict -> progress (about to run)" 'progress' `
+    (Get-LeaseHolderClassification -HolderKey 'p/T-a' -IsHeld $false -IsQuarantined $false -IsOnSweep $true -Verdict (New-Verdict 'launch'))
+Check "DEFER verdict -> neutral (backoff, not parking)" 'neutral' `
+    (Get-LeaseHolderClassification -HolderKey 'p/T-a' -IsHeld $false -IsQuarantined $false -IsOnSweep $true -Verdict (New-Verdict 'defer'))
+
+# Missing verdict when on sweep and not held/quarantined = wiring bug in caller; be conservative.
+Check "no verdict + on sweep + not held/qtn -> neutral (fail-safe)" 'neutral' `
+    (Get-LeaseHolderClassification -HolderKey 'p/T-a' -IsHeld $false -IsQuarantined $false -IsOnSweep $true -Verdict $null)
+
+# Unknown decision — degrades to neutral (do no harm) rather than throwing.
+Check "unknown verdict -> neutral (do no harm)" 'neutral' `
+    (Get-LeaseHolderClassification -HolderKey 'p/T-a' -IsHeld $false -IsQuarantined $false -IsOnSweep $true -Verdict (New-Verdict 'something-unexpected'))
+
+# --- 6. Update-LeaseFromClassification -----------------------------------------------------------
+Write-Host ""
+Write-Host "Update-LeaseFromClassification — parked increments, progress resets, neutral no-op"
+
+$now2 = [DateTime]::Parse('2026-08-28T00:00:00Z').ToUniversalTime()
+
+$lease = @{ idle_evaluations = 3; last_progress_at = '2020-01-01T00:00:00Z' }
+Update-LeaseFromClassification -Lease $lease -Classification 'progress' -Now $now2
+Check "progress resets idle_evaluations to 0" 0 $lease['idle_evaluations']
+CheckTrue "progress updates last_progress_at" ([bool]("$($lease['last_progress_at'])" -match '^20\d\d'))
+
+$lease = @{ idle_evaluations = 3; last_progress_at = '2020-01-01T00:00:00Z' }
+Update-LeaseFromClassification -Lease $lease -Classification 'parked' -Now $now2
+Check "parked increments idle_evaluations" 4 $lease['idle_evaluations']
+Check "parked does NOT update last_progress_at" '2020-01-01T00:00:00Z' $lease['last_progress_at']
+
+$lease = @{ idle_evaluations = 3; last_progress_at = '2020-01-01T00:00:00Z' }
+Update-LeaseFromClassification -Lease $lease -Classification 'neutral' -Now $now2
+Check "neutral does not change idle_evaluations" 3 $lease['idle_evaluations']
+Check "neutral does not change last_progress_at" '2020-01-01T00:00:00Z' $lease['last_progress_at']
+
+# msg-1757 blocker #1 regression: progress MUST clear a stale expiring flag left over from a
+# prior Phase-1 mark. If it does not, a later idle sequence jumps straight to Phase 2 promotion
+# and bypasses the 1-tick pre-emption window guaranteed by D-6'd (msg-1183).
+$lease = @{
+    idle_evaluations = 6
+    last_progress_at = '2020-01-01T00:00:00Z'
+    expiring         = $true
+    revoked_at       = '2026-08-25T00:00:00Z'
+    revoked_reason   = 'idle'
+    # msg-1900 blocker: PERMANENT audit fields must survive progress. Set them here on the
+    # fixture so we can verify the split.
+    reclaimed_from   = 'p/T-prior'
+    reclaimed_at     = '2026-08-24T00:00:00Z'
+    reclaimed_reason = 'human-clear: PIE crashed'
+}
+Update-LeaseFromClassification -Lease $lease -Classification 'progress' -Now $now2
+CheckFalse "progress clears stale expiring flag (msg-1757 blocker #1)" ([bool]$lease['expiring'])
+Check "progress clears stale revoked_at (TRANSIENT Phase-1 intent)" $null $lease['revoked_at']
+Check "progress clears stale revoked_reason (TRANSIENT Phase-1 intent)" $null $lease['revoked_reason']
+# msg-1900 blocker: PERMANENT audit fields must NOT be cleared by progress. If they were, the
+# digest would render 'idle' instead of the operator's Tier-C Clear-reason.
+Check "progress PRESERVES reclaimed_from (msg-1900: permanent audit)" 'p/T-prior' $lease['reclaimed_from']
+Check "progress PRESERVES reclaimed_at (msg-1900: permanent audit)" '2026-08-24T00:00:00Z' $lease['reclaimed_at']
+Check "progress PRESERVES reclaimed_reason (msg-1900: permanent audit)" 'human-clear: PIE crashed' $lease['reclaimed_reason']
+
+# Null lease is a no-op (defensive against upstream normalisation bugs).
+$prior = @{ idle_evaluations = 5 }
+Update-LeaseFromClassification -Lease $null -Classification 'parked' -Now $now2
+Check "null lease: no-op, does not throw" 5 $prior['idle_evaluations']
+
+# --- 7. Test-LeaseExpiring — dual predicate (msg-1183 D-6'b) -------------------------------------
+Write-Host ""
+Write-Host "Test-LeaseExpiring — BOTH idle_evaluations AND wall-clock, pin immune"
+
+$farPast = $now2.AddHours(-3).ToUniversalTime().ToString("o")
+$recent  = $now2.AddMinutes(-10).ToUniversalTime().ToString("o")
+
+# Both gates open, not pinned -> expiring.
+$lease = @{ holder = 'p/T-a'; idle_evaluations = 6; last_progress_at = $farPast; pinned = $false }
+CheckTrue "6 idle + 3h wall + not-pinned -> expiring" `
+    (Test-LeaseExpiring -Lease $lease -IdleEvaluationsMin 6 -IdleTtl ([TimeSpan]::FromHours(2)) -Now $now2)
+
+# Idle count below threshold -> NOT expiring (split-brain guard: both gates required).
+$lease = @{ holder = 'p/T-a'; idle_evaluations = 5; last_progress_at = $farPast; pinned = $false }
+CheckFalse "5 idle + 3h wall (idle below min) -> NOT expiring" `
+    (Test-LeaseExpiring -Lease $lease -IdleEvaluationsMin 6 -IdleTtl ([TimeSpan]::FromHours(2)) -Now $now2)
+
+# Wall-clock too recent -> NOT expiring (dual predicate again).
+$lease = @{ holder = 'p/T-a'; idle_evaluations = 10; last_progress_at = $recent; pinned = $false }
+CheckFalse "10 idle + 10m wall (wall too short) -> NOT expiring" `
+    (Test-LeaseExpiring -Lease $lease -IdleEvaluationsMin 6 -IdleTtl ([TimeSpan]::FromHours(2)) -Now $now2)
+
+# Pinned -> immune regardless (msg-1183 D-7).
+$lease = @{ holder = 'p/T-a'; idle_evaluations = 100; last_progress_at = $farPast; pinned = $true }
+CheckFalse "pinned lease is TTL-immune even at high idle + long wall" `
+    (Test-LeaseExpiring -Lease $lease -IdleEvaluationsMin 6 -IdleTtl ([TimeSpan]::FromHours(2)) -Now $now2)
+
+# Missing last_progress_at -> not expiring (fresh acquire with no probe yet).
+$lease = @{ holder = 'p/T-a'; idle_evaluations = 100; pinned = $false }
+CheckFalse "no last_progress_at -> not expiring (freshly acquired)" `
+    (Test-LeaseExpiring -Lease $lease -IdleEvaluationsMin 6 -IdleTtl ([TimeSpan]::FromHours(2)) -Now $now2)
+
+# No holder -> not expiring (empty leases don't expire; they wait for grant-from-empty in PR 3).
+$lease = @{ holder = $null; idle_evaluations = 100; last_progress_at = $farPast; pinned = $false }
+CheckFalse "no holder -> not expiring (free lease has nothing to expire)" `
+    (Test-LeaseExpiring -Lease $lease -IdleEvaluationsMin 6 -IdleTtl ([TimeSpan]::FromHours(2)) -Now $now2)
+
+# Null lease -> not expiring (defensive).
+CheckFalse "null lease -> not expiring (defensive)" `
+    (Test-LeaseExpiring -Lease $null -IdleEvaluationsMin 6 -IdleTtl ([TimeSpan]::FromHours(2)) -Now $now2)
+
+# --- 8. Add/Remove-LeaseWaiter — idempotent enqueue ---------------------------------------------
+Write-Host ""
+Write-Host "Add/Remove-LeaseWaiter — idempotent enqueue, no duplication"
+
+$lease = @{ queue = @() }
+Add-LeaseWaiter -Lease $lease -WaiterKey 'p/T-w1' -Now $now2
+Add-LeaseWaiter -Lease $lease -WaiterKey 'p/T-w2' -Now $now2.AddSeconds(1)
+Add-LeaseWaiter -Lease $lease -WaiterKey 'p/T-w1' -Now $now2.AddSeconds(2)   # duplicate — must NOT add again
+Check "duplicate enqueue is idempotent" 2 $lease['queue'].Count
+
+# Wrap in @() — a Where-Object that returns exactly one item collapses to the item itself, and
+# indexing into a lone hashtable with [0] yields $null.
+$firstWaitingSince = (@($lease['queue'] | Where-Object { $_.key -eq 'p/T-w1' })[0]).waiting_since
+Check "first enqueue's waiting_since is NOT refreshed by a re-enqueue" $now2.ToUniversalTime().ToString("o") $firstWaitingSince
+
+Remove-LeaseWaiter -Lease $lease -WaiterKey 'p/T-w1'
+Check "remove drops the entry" 1 $lease['queue'].Count
+Check "remaining entry is w2" 'p/T-w2' $lease['queue'][0].key
+Remove-LeaseWaiter -Lease $lease -WaiterKey 'p/T-not-there'   # no-op on absent
+Check "remove of absent key is a no-op" 1 $lease['queue'].Count
+
+# Missing queue key on the lease: Add creates it, Remove is a no-op.
+$lease = @{}
+Add-LeaseWaiter -Lease $lease -WaiterKey 'p/T-w1' -Now $now2
+Check "Add on missing queue: creates the queue" 1 $lease['queue'].Count
+$lease = @{}
+Remove-LeaseWaiter -Lease $lease -WaiterKey 'p/T-w1'
+CheckFalse "Remove on missing queue: no-op (does not add a queue key)" ($lease.ContainsKey('queue'))
+
+# --- 9. Test-LeaseAvailableFor + Invoke-LeaseAcquire ---------------------------------------------
+Write-Host ""
+Write-Host "Test-LeaseAvailableFor + Invoke-LeaseAcquire — the candidate-loop gate"
+
+$state = @{}
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-a' -Requires @('editor')
+Check "empty state: available" 'available' $check.status
+
+# Acquire on empty state creates the record.
+Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-a' -Now $now2
+Check "acquire creates the record" 'p/T-a' $state['editor']['holder']
+Check "acquire generation is 1" 1 $state['editor']['generation']
+
+# Second candidate needs the same lease -> waiting.
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-b' -Requires @('editor')
+Check "second candidate: waiting" 'waiting' $check.status
+Check "waiting: waitOn names the resource" 'editor' $check.waitOn[0]
+Check "waiting: holders reports the current one" 'p/T-a' $check.holders['editor']
+
+# Same candidate re-checking its own lease -> available (self-hold).
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-a' -Requires @('editor')
+Check "self-hold: available" 'available' $check.status
+
+# Idempotent re-acquire on self-hold: bumps generation? no — record kept, clocks refresh separately.
+$genBefore = $state['editor']['generation']
+Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-a' -Now $now2.AddMinutes(5)
+Check "acquire on self-hold: generation unchanged (idempotent)" $genBefore $state['editor']['generation']
+
+# Invoke-LeaseAcquire on a foreign lease throws (no-steal invariant).
+$threw = $false
+try { Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-b' -Now $now2 }
+catch { $threw = $true }
+CheckTrue "acquire on foreign lease refuses (throws)" $threw
+
+# Requires with zero elements -> trivially available (v1 candidate loop passes an array of 0 or 1).
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @()
+Check "empty requires: available" 'available' $check.status
+
+# Acquire after a release preserves reclaim_required + reclaimed_from + reclaimed_reason —
+# these are the PERMANENT audit trail the new holder inherits.
+$state = @{
+    editor = @{
+        holder            = $null
+        acquired_at       = $null
+        last_progress_at  = $null
+        idle_evaluations  = 0
+        generation        = 4
+        pinned            = $false
+        expiring          = $false
+        reclaimed_from    = 'p/T-cleared'
+        reclaimed_at      = '2026-08-27T00:00:00Z'
+        reclaimed_reason  = 'human-clear: PIE crashed'
+        reclaim_required  = $true
+        revoked_at        = '2026-08-27T01:00:00Z'
+        revoked_reason    = 'idle'
+        queue             = @()
+    }
+}
+Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-new' -Now $now2
+Check "acquire-after-release: holder is new" 'p/T-new' $state['editor']['holder']
+Check "acquire-after-release: generation bumped" 5 $state['editor']['generation']
+CheckTrue "acquire-after-release: reclaim_required PRESERVED (new holder inherits duty)" ([bool]$state['editor']['reclaim_required'])
+Check "acquire-after-release: reclaimed_from PRESERVED (audit)" 'p/T-cleared' $state['editor']['reclaimed_from']
+Check "acquire-after-release: reclaimed_reason PRESERVED (audit)" 'human-clear: PIE crashed' $state['editor']['reclaimed_reason']
+Check "acquire-after-release: revoked_at cleared (TRANSIENT Phase-1)" $null $state['editor']['revoked_at']
+Check "acquire-after-release: revoked_reason cleared (TRANSIENT Phase-1)" $null $state['editor']['revoked_reason']
+
+# Acquire dequeues self-waiter (a candidate that was queued when the lease was held then races
+# in to acquire on the same tick the lease was freed must not stay in its own queue).
+$state = @{
+    editor = @{
+        holder = $null; generation = 1; queue = @( @{ key = 'p/T-a'; waiting_since = $now2.ToUniversalTime().ToString("o") } )
+    }
+}
+Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-a' -Now $now2
+Check "acquire on lease with self in queue: queue emptied" 0 $state['editor']['queue'].Count
+
+# --- 10. Register-LeaseWaiter — creates the record + enqueues ------------------------------------
+Write-Host ""
+Write-Host "Register-LeaseWaiter — creates the resource record if absent, then enqueues"
+
+$state = @{}
+Register-LeaseWaiter -LeasesState $state -Resource 'runner' -WaiterKey 'p/T-x' -Now $now2
+Check "Register-LeaseWaiter creates the resource record" 1 $state['runner']['queue'].Count
+Check "Register-LeaseWaiter leaves holder empty" $null $state['runner']['holder']
+Check "Register-LeaseWaiter generation starts at 0" 0 $state['runner']['generation']
+
+# Idempotent — a second Register on the same key does not duplicate the queue entry.
+Register-LeaseWaiter -LeasesState $state -Resource 'runner' -WaiterKey 'p/T-x' -Now $now2.AddMinutes(5)
+Check "Register-LeaseWaiter is idempotent" 1 $state['runner']['queue'].Count
+
+# Register on a resource with a live holder just enqueues (does not overwrite).
+$state = @{ editor = @{ holder = 'p/T-a'; queue = @() } }
+Register-LeaseWaiter -LeasesState $state -Resource 'editor' -WaiterKey 'p/T-b' -Now $now2
+Check "Register on live holder: holder preserved" 'p/T-a' $state['editor']['holder']
+Check "Register on live holder: waiter enqueued" 1 $state['editor']['queue'].Count
+
+# --- 11. Read-JsonStateWithShape + Get-JsonState shape guard (msg-2172 reader collapse) ---------
+Write-Host ""
+Write-Host "Read-JsonStateWithShape / Get-JsonState — shape guard (msg-2172)"
+
+# Setup: a scratch dir under $env:TEMP so tests do not touch the sweep's real state files.
+$tmpDir = Join-Path $env:TEMP ("Lease-shape-guard-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+
+try {
+    $shapePath = Join-Path $tmpDir 'shape.json'
+
+    # Case 'missing': path does not exist.
+    if (Test-Path -LiteralPath $shapePath) { Remove-Item -LiteralPath $shapePath }
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "missing file: shape = 'missing'" 'missing' $r.shape
+    Check "missing file: state is empty" 0 $r.state.Count
+
+    # Case 'empty': blank / whitespace file.
+    Set-Content -LiteralPath $shapePath -Value '   ' -Encoding utf8
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "blank file: shape = 'empty'" 'empty' $r.shape
+    Check "blank file: state is empty" 0 $r.state.Count
+
+    # Case 'empty' via JSON `[]` (ConvertFrom-Json returns $null).
+    Set-Content -LiteralPath $shapePath -Value '[]' -Encoding utf8
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "empty JSON array []: shape = 'empty'" 'empty' $r.shape
+    Check "empty JSON array []: state is empty" 0 $r.state.Count
+
+    # Case 'object': a real JSON object round-trips normally.
+    Set-Content -LiteralPath $shapePath -Value '{"editor":"x","runner":"y"}' -Encoding utf8
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "JSON object: shape = 'object'" 'object' $r.shape
+    Check "JSON object: two keys survive" 2 $r.state.Count
+    Check "JSON object: editor value round-trips" 'x' $r.state['editor']
+
+    # Case 'array': multi-element array root. THIS IS THE CORRUPTION CASE.
+    # BEFORE the guard, this leaked Count/IsFixedSize/IsReadOnly/IsSynchronized/Length/LongLength/
+    # Rank/SyncRoot as top-level "resource" keys. The guard rejects it and returns empty.
+    Set-Content -LiteralPath $shapePath -Value '[{"editor":"x"},{"foo":"y"}]' -Encoding utf8
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "root array (multi-element): shape = 'array'" 'array' $r.shape
+    Check "root array: state is empty (no metadata leaked)" 0 $r.state.Count
+    # Pin the metadata-leak keys explicitly — a regression that reintroduces them would show up
+    # as ANY of these appearing in the map. Naming them literally documents the leak class.
+    foreach ($leakedKey in @('Count','IsFixedSize','IsReadOnly','IsSynchronized','Length','LongLength','Rank','SyncRoot')) {
+        CheckFalse "root array: '$leakedKey' NOT in state (metadata leak pinned)" $r.state.ContainsKey($leakedKey)
+    }
+
+    # Case 'array': scalar-only array root.
+    Set-Content -LiteralPath $shapePath -Value '["editor","runner"]' -Encoding utf8
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "root array (scalars): shape = 'array'" 'array' $r.shape
+    Check "root array (scalars): state is empty" 0 $r.state.Count
+
+    # Case 'scalar': root string. BEFORE the guard, this leaked `Length` (System.String.Length).
+    # This is what pwsh 7's ConvertFrom-Json returns wrapped in a PSObject shell that answers
+    # `-is [PSCustomObject]` as $true — hence the .GetType()-based check in the shape guard.
+    Set-Content -LiteralPath $shapePath -Value '"just a string"' -Encoding utf8
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "root string: shape = 'scalar'" 'scalar' $r.shape
+    Check "root string: state is empty (no Length leak)" 0 $r.state.Count
+    CheckFalse "root string: 'Length' NOT in state (System.String.Length leak pinned)" $r.state.ContainsKey('Length')
+
+    # Case 'scalar': root number and root boolean.
+    Set-Content -LiteralPath $shapePath -Value '42' -Encoding utf8
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "root number: shape = 'scalar'" 'scalar' $r.shape
+    Check "root number: state is empty" 0 $r.state.Count
+    Set-Content -LiteralPath $shapePath -Value 'true' -Encoding utf8
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "root boolean: shape = 'scalar'" 'scalar' $r.shape
+    Check "root boolean: state is empty" 0 $r.state.Count
+
+    # Case 'parse-error': broken JSON. Empty state, error message populated.
+    Set-Content -LiteralPath $shapePath -Value '{not valid json' -Encoding utf8
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "parse error: shape = 'parse-error'" 'parse-error' $r.shape
+    Check "parse error: state is empty" 0 $r.state.Count
+    CheckTrue "parse error: error message is populated" ([bool]$r.error)
+
+    # PowerShell 7 unwraps a SINGLE-element array containing an object to just the object. That
+    # happens BEFORE our type check, so a lone `[{"editor":"x"}]` legitimately reaches the
+    # object branch. Pin that as an intentional behaviour — it is safe (no metadata to leak in
+    # this specific shape) even though it does not match a strict "root must be `{...}`" reader.
+    # Documenting the split prevents a future reader from "fixing" it into a false positive.
+    Set-Content -LiteralPath $shapePath -Value '[{"editor":"y"}]' -Encoding utf8
+    $r = Read-JsonStateWithShape -Path $shapePath
+    Check "single-element array (pwsh 7 unwrap): shape = 'object'" 'object' $r.shape
+    Check "single-element array: state has editor" 'y' $r.state['editor']
+
+    # Get-JsonState wraps Read-JsonStateWithShape and discards the verdict for backward-compat.
+    # Its keys must NEVER include metadata (that IS the fix's contract for every existing caller
+    # that reads notify.json / quarantine.json / etc.).
+    Set-Content -LiteralPath $shapePath -Value '[{"a":1},{"b":2}]' -Encoding utf8
+    $s = Get-JsonState -Path $shapePath
+    Check "Get-JsonState on root array: empty (canonical fix)" 0 $s.Count
+    foreach ($leakedKey in @('Count','Length','LongLength','SyncRoot','Rank','IsFixedSize','IsReadOnly','IsSynchronized')) {
+        CheckFalse "Get-JsonState on root array: '$leakedKey' NOT present" $s.ContainsKey($leakedKey)
+    }
+    Set-Content -LiteralPath $shapePath -Value '"corrupted"' -Encoding utf8
+    $s = Get-JsonState -Path $shapePath
+    Check "Get-JsonState on root string: empty" 0 $s.Count
+    CheckFalse "Get-JsonState on root string: 'Length' NOT present" $s.ContainsKey('Length')
+
+    # END-TO-END: read → Merge-LeasesStateForWrite → verify no metadata reaches the merged map.
+    # This is what the 2026-08-28 measurement exercised on live disk; pinning it here catches a
+    # future reader-refactor that reintroduces the leak past the merger.
+    $leasesLive = Join-Path $tmpDir 'leases.json'
+    Set-Content -LiteralPath $leasesLive -Value '[{"editor":"y"},{"foo":"z"}]' -Encoding utf8
+    $merged = Merge-LeasesStateForWrite -Memory @{} -OriginalGenerations @{} -DiskPath $leasesLive
+    Check "end-to-end: merged has no leaked metadata keys" 0 $merged.Count
+}
+finally {
+    Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- 12. Save-CorruptedStateBackup — .bad-<utc> rename side effect (msg-1916 §2 design) ---------
+Write-Host ""
+Write-Host "Save-CorruptedStateBackup — rename corrupt file aside so the next flush cannot overwrite it"
+
+$tmpDir = Join-Path $env:TEMP ("Lease-backup-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+
+try {
+    # Happy path: rename to .bad-<UTC-stamp>. The stamp is deterministic in shape (YYYY-MM-DDTHH-mm-ssZ).
+    $badPath = Join-Path $tmpDir 'leases.json'
+    Set-Content -LiteralPath $badPath -Value '[{"editor":"x"}]' -Encoding utf8
+    $renamed = Save-CorruptedStateBackup -Path $badPath
+    CheckTrue "backup: returns the renamed path (not null)" ([bool]$renamed)
+    CheckTrue "backup: renamed path matches .bad-<utc> template" `
+        ([bool]("$renamed" -match '\.bad-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$'))
+    CheckFalse "backup: original path is gone" (Test-Path -LiteralPath $badPath)
+    CheckTrue "backup: renamed path exists on disk" (Test-Path -LiteralPath $renamed)
+
+    # Contents preserved — the operator's forensic trail is intact.
+    $preserved = Get-Content -LiteralPath $renamed -Raw
+    Check "backup: original bytes preserved" '[{"editor":"x"}]' ($preserved.Trim())
+
+    # Missing file: no-op, returns $null (race with an external delete).
+    $absent = Join-Path $tmpDir 'never-existed.json'
+    $result = Save-CorruptedStateBackup -Path $absent
+    Check "backup on missing file: returns null (no-op)" $null $result
+}
+finally {
+    Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ""

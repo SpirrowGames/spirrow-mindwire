@@ -32,12 +32,19 @@ $script:StarvedThreshold         = [TimeSpan]::FromHours(24)
 # Get-JsonState / Write-Log stubs so the lifts stay self-contained.
 function Write-Log { param([string]$Message) }
 
+# Get-JsonState now lives in deploy/lib/Lease.ps1 (msg-2172 reader collapse) — dot-source it here
+# so the lifted wrapper functions that call Get-JsonState (e.g. Merge-StateForWrite) resolve. Lease
+# lib is pure functions with no top-level side effects, same as StopReason.ps1's discipline.
+$leaseLib = Join-Path $repoRoot 'deploy/lib/Lease.ps1'
+if (-not (Test-Path -LiteralPath $leaseLib)) { throw "Lease lib not found: $leaseLib" }
+. $leaseLib
+
 $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
                   'Get-QuarantineReproHint',
                   'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
-                  'Get-SystemicAlertSignature', 'Merge-StateForWrite', 'Get-JsonState',
+                  'Get-SystemicAlertSignature', 'Merge-StateForWrite',
                   'Save-JsonState', 'Update-EvaluatedTimestamp', 'ConvertTo-UtcInstant',
                   'Test-DigestClockAdvances') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1

@@ -131,7 +131,11 @@ finally {
 Write-Host "Get-ConductorVerdict — 'last_msg=None' is absence, not a head called 'None'"
 # Unchanged carry-over from the prior test suite. The wrapper's own verdict parsing still owns
 # this rule regardless of what happens on the head-skip side.
-foreach ($name in 'Get-ConductorVerdict', 'Get-JsonState', 'Save-JsonState') {
+# NOTE (msg-2172 reader collapse): Get-JsonState was previously lifted here too — but it now
+# lives in deploy/lib/Lease.ps1, not in the sweep script's AST. Get-ConductorVerdict is a pure
+# text parse and never touched Get-JsonState anyway; the drop is safe. Save-JsonState still lives
+# in the wrapper and is lifted for the same reason as before.
+foreach ($name in 'Get-ConductorVerdict', 'Save-JsonState') {
     $fn = Get-FunctionAst -Name $name
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text

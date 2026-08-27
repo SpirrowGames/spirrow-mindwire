@@ -123,6 +123,14 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # at the bottom). Extracted per Bohr msg-1466 D-3 / Einstein msg-1467 §3-A4: the extracted file is
 # the testability seam, not a refactor.
 . (Join-Path $PSScriptRoot 'lib/StopReason.ps1')
+# Lease.ps1 owns the canonical Get-JsonState (msg-2172 reader collapse). The wrapper's inline
+# reader that used to live at line ~172 is gone; dot-sourcing here brings Get-JsonState into the
+# wrapper's script scope. Order matters: Write-Log is defined further down and Get-JsonState's
+# opportunistic log-through calls Write-Log if resolvable — but since Write-Log is a function
+# (not a variable), PowerShell resolves it at CALL time via Get-Command, so the dot-source order
+# above the Write-Log definition is safe. The wrapper's LEASE state-machine is still inert (the
+# candidate-loop gate lands in PR 4); what activates in PR 2 is the READER half of Lease.ps1.
+. (Join-Path $PSScriptRoot 'lib/Lease.ps1')
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
@@ -169,23 +177,14 @@ function Write-QuietSummary {
 }
 
 # --- small JSON state files ---------------------------------------------------------------------
-function Get-JsonState {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return @{} }
-    try {
-        $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
-        if (-not $raw.Trim()) { return @{} }
-        $obj = $raw | ConvertFrom-Json
-        $map = @{}
-        foreach ($p in $obj.PSObject.Properties) { $map[$p.Name] = $p.Value }
-        return $map
-    }
-    catch {
-        # Corrupt state must not block the sweep; worst case is one duplicate alert / one extra run.
-        Write-Log "state file unreadable ($Path): $($_.Exception.Message) — treating as empty"
-        return @{}
-    }
-}
+# Get-JsonState was collapsed into deploy/lib/Lease.ps1 (msg-2172 Tier-C, 2026-08-28). The
+# canonical reader lives there — it added a JSON-root shape guard (root arrays / scalars now
+# return empty rather than leaking Count/Length/... metadata as fake resource keys, which the
+# 2026-08-28 measurement confirmed was a permanent one-way corruption vector) and an
+# opportunistic log-through that fires the "state file unreadable — treating as empty" line
+# through Write-Log when it resolves in the caller's scope. Save-CorruptedStateBackup, the
+# `.bad-<utc>` rename side effect, is a Lease.ps1 helper the flush caller invokes; PR 4 wires
+# it into the leases.json flush path.
 
 function Save-JsonState {
     param([string]$Path, [hashtable]$State)
