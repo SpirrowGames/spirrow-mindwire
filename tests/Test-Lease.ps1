@@ -31,6 +31,8 @@ function Check {
         Write-Host ("  FAIL  {0} — expected '{1}', got '{2}'" -f $Name, $Expected, $Actual)
     }
 }
+function CheckFalse { param([string]$Name, $Actual) Check -Name $Name -Expected $false -Actual ([bool]$Actual) }
+function CheckTrue  { param([string]$Name, $Actual) Check -Name $Name -Expected $true  -Actual ([bool]$Actual) }
 
 # --- 1. New-LeaseRecord — the record shape callers rely on --------------------------------------
 Write-Host "New-LeaseRecord — field defaults, reclaimed_at pairing, queue preservation"
@@ -226,6 +228,49 @@ try {
     $gens = Get-LeaseGenerations -LeasesState @{ editor = @{ generation = 7 }; runner = @{ } }
     Check "Get-LeaseGenerations: editor gen extracted" 7 $gens['editor']
     Check "Get-LeaseGenerations: missing generation -> 0" 0 $gens['runner']
+
+    # --- scenario G: corrupt generation values (msg-2114 blocker). The Get-JsonState header
+    # commits to "a corrupt state file falls back to empty rather than aborting the flush — the
+    # sweep must not fail closed for a JSON syntax hiccup". ConvertFrom-Json accepts values that
+    # are structurally valid JSON but semantically wrong for the schema — an operator hand-edit
+    # can leave `"generation": ""` or `"generation": "pending"`. A hard `[int]` cast raises a
+    # RuntimeException, which bubbles out of Merge-LeasesStateForWrite and aborts the flush.
+    # Fix: -as [int] returns $null instead of throwing, and the fallback of 0 lets the merger
+    # continue.
+    $corruptCases = @(
+        @{ label = "empty string"; value = '' }
+        @{ label = "non-numeric string"; value = 'pending' }
+        @{ label = "hashtable"; value = @{ nested = 'bad' } }
+        @{ label = "array"; value = @(1, 2) }
+    )
+    foreach ($case in $corruptCases) {
+        $gensC = $null
+        $threw = $false
+        try {
+            $gensC = Get-LeaseGenerations -LeasesState @{ editor = @{ generation = $case.value } }
+        }
+        catch { $threw = $true }
+        CheckFalse "Get-LeaseGenerations: corrupt generation ($($case.label)) does NOT throw" $threw
+        if (-not $threw) {
+            Check "Get-LeaseGenerations: corrupt generation ($($case.label)) falls back to 0" 0 $gensC['editor']
+        }
+    }
+
+    # And the end-to-end path: corrupt disk value must not abort the flush.
+    $diskG = @{
+        editor = @{ holder = 'p/T-a'; generation = 'pending'; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskG
+    $memoryG = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensG = Get-LeaseGenerations -LeasesState $memoryG
+    $memoryG['editor']['last_progress_at'] = '2026-08-27T00:00:00Z'
+    $mergedG = $null
+    $threwG = $false
+    try {
+        $mergedG = Merge-LeasesStateForWrite -Memory $memoryG -OriginalGenerations $originalGensG -DiskPath $fixturePath
+    }
+    catch { $threwG = $true }
+    CheckFalse "Merge-LeasesStateForWrite: corrupt disk generation does NOT abort flush" $threwG
 }
 finally {
     Remove-Item -LiteralPath $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -285,6 +330,36 @@ $state2 = @{
 }
 $lines = Get-LeaseSummaryLines -LeasesState $state2 -Now $digestNow -FormatDuration $format
 Check "reclaimed_reason preferred over revoked_reason" $true (($lines -join "`n") -match 'reason=human-clear: crash')
+
+# msg-2114 blocker follow-on: bool coercion must not fall for the [bool]"false" -> $true trap.
+# PowerShell's [bool] cast on strings is length-based ("false" is non-empty ∴ truthy), so an
+# operator hand-editing leases.json with `"pinned": "false"` used to render `[pinned]` on the
+# digest. The safe helper accepts only real booleans and recognised string values; anything
+# else falls back to $false so a corrupt cell stays blank rather than lying.
+$stateBool = @{
+    editor = @{ holder = 'p/T-b'; pinned = 'false'; expiring = 'false'; reclaim_required = 'false'; queue = @() }
+    runner = @{ holder = 'p/T-c'; pinned = 'true';  expiring = 'true';  reclaim_required = 'true';  queue = @() }
+    third  = @{ holder = 'p/T-d'; pinned = 'garbage'; expiring = 'nope'; reclaim_required = ''; queue = @() }
+}
+$linesBool = Get-LeaseSummaryLines -LeasesState $stateBool -Now $digestNow -FormatDuration $format
+$joinedBool = ($linesBool -join "`n")
+# The string literals `"true"` / `"false"` in JSON round-trip to strings, not booleans. Ensure
+# per-lease flag rendering respects the strings' meaning, not their length.
+CheckFalse "string 'false' does NOT render as [pinned] (was the [bool] cast bug)" ($joinedBool -match 'editor:.*\[.*pinned.*\]')
+CheckFalse "string 'false' does NOT render as [expiring]"                          ($joinedBool -match 'editor:.*\[.*expiring.*\]')
+CheckFalse "string 'false' does NOT render as [reclaim-required]"                  ($joinedBool -match 'editor:.*\[.*reclaim-required.*\]')
+CheckTrue  "string 'true'  DOES render as [pinned]"           ($joinedBool -match 'runner:.*\[.*pinned.*\]')
+CheckTrue  "string 'true'  DOES render as [expiring]"         ($joinedBool -match 'runner:.*\[.*expiring.*\]')
+CheckTrue  "string 'true'  DOES render as [reclaim-required]" ($joinedBool -match 'runner:.*\[.*reclaim-required.*\]')
+# Un-parseable strings fall back to $false (the safe default: silent-blank is better than a
+# false-positive flag that misleads the operator).
+CheckFalse "string 'garbage' falls back to false (pinned stays off)"   ($joinedBool -match 'third:.*\[.*pinned.*\]')
+CheckFalse "string 'nope' falls back to false (expiring stays off)"    ($joinedBool -match 'third:.*\[.*expiring.*\]')
+CheckFalse "empty string falls back to false (reclaim-required off)"   ($joinedBool -match 'third:.*\[.*reclaim-required.*\]')
+# Real booleans still round-trip correctly (regression pin for the happy path).
+$stateBoolReal = @{ editor = @{ holder = 'p/T-b'; pinned = $true; queue = @() } }
+$linesBoolReal = Get-LeaseSummaryLines -LeasesState $stateBoolReal -Now $digestNow -FormatDuration $format
+CheckTrue "real $true still renders as [pinned]" (($linesBoolReal -join "`n") -match '\[pinned\]')
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }

@@ -223,6 +223,16 @@ function Get-LeaseGenerations {
 
     .OUTPUTS
         A hashtable: resource-name -> [int] generation.
+
+    .NOTES
+        Cast safety. An operator hand-editing leases.json may leave `generation` as a string
+        (`"generation": ""`, `"generation": "pending"`) — structurally valid JSON that
+        ConvertFrom-Json accepts, but a hard `[int]$value` cast would raise a RuntimeException
+        and bubble out of Merge-LeasesStateForWrite, aborting the flush. That directly violates
+        the "corrupt state does not fail closed" invariant Get-JsonState's header commits to.
+        We use `-as [int]` instead, which returns $null on any un-parseable value; the fallback
+        is 0, treated the same as "generation not recorded", which lets the merger fall through
+        to its normal collision detection instead of collapsing the sweep.
     #>
     param([hashtable]$LeasesState)
     $out = @{}
@@ -231,12 +241,17 @@ function Get-LeaseGenerations {
         $lease = $LeasesState[$k]
         if ($null -eq $lease) { continue }
         $gen = 0
+        $rawGen = $null
         if ($lease -is [hashtable]) {
-            if ($lease.ContainsKey('generation') -and $null -ne $lease['generation']) { $gen = [int]$lease['generation'] }
+            if ($lease.ContainsKey('generation')) { $rawGen = $lease['generation'] }
         }
         else {
             $prop = $lease.PSObject.Properties['generation']
-            if ($prop -and $null -ne $prop.Value) { $gen = [int]$prop.Value }
+            if ($prop) { $rawGen = $prop.Value }
+        }
+        if ($null -ne $rawGen) {
+            $parsed = $rawGen -as [int]
+            if ($null -ne $parsed) { $gen = $parsed }
         }
         $out[$k] = $gen
     }
@@ -398,12 +413,36 @@ function Get-LeaseSummaryLines {
         $lines += "  (該当なし)"
         return $lines
     }
+    # Cast safety (msg-2114 blocker follow-on to the [int] fix in Get-LeaseGenerations). A plain
+    # `[bool]$value` promotes any non-empty string — including the literal `"false"` — to $true,
+    # because PowerShell's [bool] cast is length-based on strings. If an operator hand-edited
+    # leases.json with `"pinned": "false"`, the digest would render `[pinned]` for a lease that
+    # is not pinned; worse, `"pinned": "true"` and `"pinned": "false"` become indistinguishable
+    # on the display. The fix accepts only real booleans as true and interprets recognised
+    # string values ("true"/"yes"/"1", "false"/"no"/"0", case-insensitive). Anything else falls
+    # back to $false — the safe default (a stray flag stays off; the operator sees the wrong
+    # cell being blank rather than being lied to about its state).
+    $coerceBool = {
+        param($v)
+        if ($null -eq $v) { return $false }
+        if ($v -is [bool]) { return [bool]$v }
+        if ($v -is [string]) {
+            $s = $v.Trim().ToLowerInvariant()
+            if ($s -in @('true','yes','1'))  { return $true }
+            if ($s -in @('false','no','0','')) { return $false }
+            return $false
+        }
+        # Numbers: 0 -> false, non-zero -> true. Anything else (arrays, hashtables) -> false.
+        $n = $v -as [int]
+        if ($null -ne $n) { return ($n -ne 0) }
+        return $false
+    }
     foreach ($name in $names) {
         $lease = ConvertTo-LeaseHashtable -Lease $LeasesState[$name]
         $holder = if ($lease.ContainsKey('holder')) { "$($lease['holder'])" } else { '' }
-        $pinned = $lease.ContainsKey('pinned') -and [bool]$lease['pinned']
-        $expiring = $lease.ContainsKey('expiring') -and [bool]$lease['expiring']
-        $reclaimRequired = $lease.ContainsKey('reclaim_required') -and [bool]$lease['reclaim_required']
+        $pinned = $lease.ContainsKey('pinned') -and (& $coerceBool $lease['pinned'])
+        $expiring = $lease.ContainsKey('expiring') -and (& $coerceBool $lease['expiring'])
+        $reclaimRequired = $lease.ContainsKey('reclaim_required') -and (& $coerceBool $lease['reclaim_required'])
         $queue = if ($lease.ContainsKey('queue')) { @($lease['queue']) } else { @() }
         $queueKeys = @()
         foreach ($w in $queue) {
