@@ -157,8 +157,9 @@ _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
 # render theirs at column 0.
 #
 # The failure direction is safe by construction: an unmatched verdict is not an open gate but no
-# verdict at all, and _parse_verdict defaults to REQUEST_CHANGES. A model that someday indents its
-# verdict costs a red gate, not a false APPROVE.
+# verdict at all, and _parse_model_verdict returns UNPARSEABLE which decide_verdict maps to a
+# fail-closed REQUEST_CHANGES gate. A model that someday indents its verdict costs a red gate,
+# not a false APPROVE.
 #
 # This pattern is coupled to _PR_REVIEW_SYSTEM_PROMPT, which must teach the exact shape accepted
 # here — narrowing one without the other makes the gate refuse the form its own instructions
@@ -185,7 +186,8 @@ _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
 #
 # ---- Bold verdicts fail closed, deliberately (ruling: T-verdict-regex-space-prefix-injection) ----
 #
-# ``**VERDICT: APPROVE**`` does not match this pattern, so _parse_verdict returns REQUEST_CHANGES.
+# ``**VERDICT: APPROVE**`` does not match this pattern, so _parse_model_verdict returns
+# UNPARSEABLE and decide_verdict maps that to a fail-closed REQUEST_CHANGES gate.
 # That is a CHOICE, not an oversight. The same sweep found 9 bold verdict lines (spirrow-mindwire
 # #69/#71/#72/#73/#74, Spirrow-VoxelWorld #51); of the 4 that read APPROVE, none was ever submitted
 # as an APPROVED review — the gate is not known to have opened on one. Reasons to leave it strict:
@@ -295,33 +297,6 @@ class PrReviewOutcome:
     adr_pointer_selection: AdrPointerSelection | None = None
 
 
-def _parse_verdict(critique: str) -> ReviewEvent:
-    """Extract the verdict; default-safe to REQUEST_CHANGES (never silent approve).
-
-    Kept as a 2-way projection over :func:`_parse_model_verdict` — the injection-safe
-    parse (last standalone ``VERDICT:`` line at column zero, see ``_VERDICT_RE``) lives
-    ONCE in ``_parse_model_verdict``; this function just collapses UNPARSEABLE and
-    REQUEST_CHANGES to the fail-closed :class:`ReviewEvent.REQUEST_CHANGES` the pre-
-    existing parser-primitive tests pin. That collapse is the whole reason the two
-    signatures exist: the notice path needs the three-way distinction; the ordinary
-    "did the model say APPROVE?" question is two-way.
-
-    ``_resolve_verdict`` used to sit next to this function as a truncation-aware wrapper.
-    It was removed by T-gate-silently-suppresses-approve-on-truncated-diff review round 2
-    (PR #186, pr-gate finding msg-1879): the gate/notice path now consumes
-    :func:`decide_verdict`, which unifies model verdict + gate verdict + suppression fact
-    in one call — keeping a second wrapper here duplicated the truncation rule in two
-    places and made ``_resolve_verdict``'s "thin wrapper" docstring false.
-    """
-    mv = _parse_model_verdict(critique)
-    if mv is ModelVerdict.APPROVE:
-        return ReviewEvent.APPROVE
-    # UNPARSEABLE / REQUEST_CHANGES → objection (gate stays closed). This mirrors the
-    # pre-refactor fail-safe collapse; the gate/notice path keeps the distinction on
-    # ``VerdictDecision.model_verdict`` (see :func:`decide_verdict`).
-    return ReviewEvent.REQUEST_CHANGES
-
-
 # ─── T-gate-silently-suppresses-approve-on-truncated-diff ────────────────────────────
 # Model verdict, gate verdict, and the gate NOTICE that makes them audible.
 #
@@ -357,13 +332,19 @@ class ModelVerdict(Enum):
 
 
 def _parse_model_verdict(critique: str) -> ModelVerdict:
-    """Extract the model's stated verdict, distinguishing UNPARSEABLE from REQUEST_CHANGES.
+    """Extract the model's stated verdict; three-way (APPROVE / REQUEST_CHANGES / UNPARSEABLE).
 
-    Mirrors :func:`_parse_verdict` (same regex, same last-wins rule against decoy-APPROVE
-    injection — see the :data:`_VERDICT_RE` block for the anchor rationale), but returns
-    the three-way :class:`ModelVerdict` instead of the two-way :class:`ReviewEvent`. This
-    is the ONLY place the raw critique is inspected on the notice path — the rest of the
-    pipeline consumes :class:`VerdictDecision`.
+    The injection-safe parse (last standalone ``VERDICT:`` line at column zero — see the
+    :data:`_VERDICT_RE` block for the anchor rationale, and note that last-wins on its own
+    is no defence when a quote comes after the verdict) lives here as the ONE source. Every
+    production caller consumes this through :class:`VerdictDecision` via :func:`decide_verdict`
+    — no separate two-way projection exists anymore (round-5 PR-gate finding on PR #186
+    msg-1890 removed the dead ``_parse_verdict`` wrapper along with its callers).
+
+    UNPARSEABLE is a first-class return value, not a silent collapse to REQUEST_CHANGES:
+    "the model wrote an unreadable verdict" and "the model wrote a REQUEST_CHANGES" are
+    different facts that the gate notice header must report honestly (see the
+    :class:`ModelVerdict` docstring for why the three-way distinction matters).
     """
     matches = _VERDICT_RE.findall(critique)
     if not matches:
@@ -416,10 +397,11 @@ def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) 
     elif mv is ModelVerdict.APPROVE:
         gv = ReviewEvent.APPROVE
     else:
-        # UNPARSEABLE or REQUEST_CHANGES → gate stays closed (mirrors _parse_verdict's
-        # default-safe collapse). This is the ONE case where UNPARSEABLE and RC still
-        # look the same to the gate; the distinction survives on ``model_verdict`` for
-        # the notice, so the record does not lie about which one was written.
+        # UNPARSEABLE or REQUEST_CHANGES → gate stays closed (fail-safe collapse of the
+        # two non-APPROVE model verdicts to a single gate verdict). This is the ONE case
+        # where UNPARSEABLE and RC still look the same to the gate; the distinction
+        # survives on ``model_verdict`` for the notice, so the record does not lie about
+        # which one was written.
         gv = ReviewEvent.REQUEST_CHANGES
     return VerdictDecision(
         model_verdict=mv, gate_verdict=gv, view=view, finish_reason=finish_reason
