@@ -496,14 +496,14 @@ def render_gate_notice(decision: VerdictDecision) -> str:
         lines.append(
             "> **Review truncated by the model's output-token cap.** The critique below "
             "was cut off before the model finished writing it (finish_reason=length). "
-            "Findings above may be incomplete."
+            "Findings below may be incomplete."
         )
     if fire_c:
         lines.append(">")
         lines.append(f"> {_MARKER_C_SUPPRESSED}")
         lines.append(
             "> **Verdict suppressed by the gate.** The model wrote `VERDICT: APPROVE` "
-            "but the gate posted `REQUEST_CHANGES` because the review above is partial "
+            "but the gate posted `REQUEST_CHANGES` because the review below is partial "
             "(see the note(s) above); a review of a partial diff / partial output "
             "cannot open the gate."
         )

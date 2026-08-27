@@ -1370,6 +1370,47 @@ def test_gate_notice_never_contradicts_across_coexisting_notes() -> None:
     assert "not a DIFF-size issue" not in notice_b
 
 
+def test_gate_notice_prose_matches_prepended_layout() -> None:
+    """Directional references in the notice must match its prepended position.
+
+    Round-7 PR-gate finding (msg-1893): the notice is prepended to the review
+    body (msg-1872 D-4 / ``test_gate_notice_at_body_head_when_suppressed``),
+    but two prose sentences pointed at the model's critique as if it were
+    ABOVE the notice — "Findings above may be incomplete" in B-len and
+    "the review above is partial" in C-suppressed. Since the notice sits at
+    the absolute top of the body, "above" points at nothing; the critique is
+    BELOW. This test pins the corrected direction.
+
+    "the note(s) above" in C-suppressed is a SIBLING reference (A / B-diff /
+    B-len render before C within the notice block) and remains correct.
+    """
+    # Force every note that carries a critique-direction reference to fire:
+    # B-diff (truncation) → A also fires when in_headroom, B-len (finish_reason=length),
+    # and C-suppressed (APPROVE → REQUEST_CHANGES).
+    view = _make_view(_MAX_DIFF_CHARS + 1)
+    decision = decide_verdict(
+        "no blocking problems\n\nVERDICT: APPROVE",
+        view=view,
+        finish_reason="length",
+    )
+    notice = render_gate_notice(decision)
+    assert _MARKER_B_DIFF in notice
+    assert _MARKER_B_LEN in notice
+    assert _MARKER_C_SUPPRESSED in notice
+
+    # The critique is BELOW the notice, so any direction pointing to it must
+    # say "below", not "above".
+    assert "Findings below may be incomplete" in notice
+    assert "the review below is partial" in notice
+    assert "Findings above may be incomplete" not in notice
+    assert "the review above is partial" not in notice
+
+    # Sibling reference within the notice block is still correct — A / B-diff /
+    # B-len render before C, so "the note(s) above" is a valid intra-block
+    # reference and must remain.
+    assert "see the note(s) above" in notice
+
+
 def test_model_verdict_distinguishes_unparseable() -> None:
     """The three-way ``ModelVerdict`` — UNPARSEABLE is not silently collapsed to RC.
 
