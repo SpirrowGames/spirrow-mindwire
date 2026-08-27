@@ -738,8 +738,9 @@ Check "Register on live holder: waiter enqueued" 1 $state['editor']['queue'].Cou
 Write-Host ""
 Write-Host "Read-JsonStateWithShape / Get-JsonState — shape guard (msg-2172)"
 
-# Setup: a scratch dir under $env:TEMP so tests do not touch the sweep's real state files.
-$tmpDir = Join-Path $env:TEMP ("Lease-shape-guard-" + [guid]::NewGuid().ToString('N'))
+# Setup: a scratch dir under [System.IO.Path]::GetTempPath() (portable across pwsh 7 on Windows +
+# Linux CI runners; $env:TEMP is Windows-only and returns $null on Linux, which breaks Join-Path).
+$tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("Lease-shape-guard-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
 try {
@@ -855,7 +856,7 @@ finally {
 Write-Host ""
 Write-Host "Save-CorruptedStateBackup — rename corrupt file aside so the next flush cannot overwrite it"
 
-$tmpDir = Join-Path $env:TEMP ("Lease-backup-" + [guid]::NewGuid().ToString('N'))
+$tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("Lease-backup-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
 try {
