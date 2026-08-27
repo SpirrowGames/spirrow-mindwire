@@ -1197,6 +1197,48 @@ async def test_gate_notice_relay_and_github_receive_same_body() -> None:
 
 
 @pytest.mark.anyio
+async def test_make_diff_view_is_called_exactly_once_per_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard — the driver must not recompute the DiffView downstream.
+
+    Round-3 PR-gate finding on PR #186 (msg-1885): an earlier draft correctly
+    captured the view at the fetch site but then still passed the RAW ``diff``
+    into ``_build_messages`` / ``_build_pass2_messages``, which each re-invoked
+    ``_make_diff_view`` internally. Truncation ran three times per review; the
+    top-of-``review()`` comment claimed "the raw len(diff) does not survive
+    past this line" and it did. This test spies on the module-level
+    ``_make_diff_view`` and pins the call count at exactly one per review — a
+    future regression that reintroduces per-builder truncation flips the count
+    and reds the test.
+    """
+    import spirrow_mindwire.naysayer.pr_review as pr_review_module
+
+    call_count = 0
+    real_make_view = pr_review_module._make_diff_view
+
+    def counting_make_view(diff: str) -> pr_review_module.DiffView:
+        nonlocal call_count
+        call_count += 1
+        return real_make_view(diff)
+
+    monkeypatch.setattr(pr_review_module, "_make_diff_view", counting_make_view)
+
+    # A truncated diff exercises every downstream site that could re-truncate.
+    github = _FakeGitHub(diff="x" * (_MAX_DIFF_CHARS + 100))
+    lexora = _FakeLexora(content="no blocking problems\n\nVERDICT: APPROVE")
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    await driver.review(_pr(), post_critique=post)
+
+    assert call_count == 1, (
+        f"expected _make_diff_view to be called exactly once per review; "
+        f"got {call_count} — a downstream site is re-truncating the diff "
+        "(dual-management regression)"
+    )
+
+
+@pytest.mark.anyio
 async def test_gate_notice_at_body_head_when_suppressed() -> None:
     """The gate notice is PREPENDED (msg-1872 D-4), not appended.
 

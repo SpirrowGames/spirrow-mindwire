@@ -605,8 +605,17 @@ def _make_diff_view(diff: str) -> DiffView:
     )
 
 
-def _build_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
+def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
     """Pass-1 (verdict) messages — the SINGLE entry point for the pass-1 system prompt.
+
+    ``text`` is the ALREADY-TRUNCATED diff body (i.e. ``DiffView.text``): truncation is
+    performed ONCE at the fetch site via :func:`_make_diff_view` and threaded down as the
+    view's ``.text``. This function does not re-invoke :func:`_make_diff_view` — doing so
+    would run the truncation twice for the same review (a dual-management error the round-
+    3 PR-gate review of PR #186 caught: the raw ``diff`` string was still surviving into
+    the message builders alongside the ``view``, so both were computing the truncation
+    independently). Tests can pass a plain short string here — that string is treated as
+    already-truncated text, the same contract the production driver honours.
 
     Tests import this to construct the exact system message the driver sends, so any
     later drift between "what the test asserts on" and "what the driver actually sends"
@@ -615,7 +624,6 @@ def _build_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
     agent uses, so a one-place edit to ``spec/NAYSAYER_PRINCIPLES.md`` propagates to
     both surfaces (fail-loud: a missing/blank SOT raises).
     """
-    text = _make_diff_view(diff).text
     system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
@@ -628,14 +636,15 @@ def _build_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
     ]
 
 
-def _build_pass2_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
+def _build_pass2_messages(text: str, pr_slug: str) -> list[ChatMessage]:
     """Pass-2 (ADR-pointer) messages — the sibling entry point for the pass-2 prompt.
 
-    Delegates to :func:`build_pr_review_pass2_messages` after applying the same diff
-    truncation cap as pass 1: pass 2 sees the same evidence pass 1 sees, so a pointer
-    emitted against a truncated hunk was at least judged from the same view.
+    ``text`` is the ALREADY-TRUNCATED diff body — same contract as :func:`_build_messages`
+    (see its docstring). Because both passes are handed the same ``DiffView.text`` by the
+    driver, pass 2 sees exactly the evidence pass 1 sees; a pointer emitted against a
+    truncated hunk was at least judged from the same view.
     """
-    return build_pr_review_pass2_messages(_make_diff_view(diff).text, pr_slug)
+    return build_pr_review_pass2_messages(text, pr_slug)
 
 
 # The pass-2 (ADR-pointer collection) call gets its OWN, shorter timeout so a wedged
@@ -851,9 +860,12 @@ class NaysayerPrReviewDriver:
         # CI green → content review (Lexora). Fail-closed: an unreachable GitHub raises here.
         diff = await self._github.fetch_pr_diff(pr)
         # Capture the pre-truncation view ONCE, at the fetch site, so ``original_chars`` and
-        # the truncated ``text`` the model actually sees are paired forever. Everything
-        # downstream (verdict, gate notice) reads from ``view`` — the raw len(diff) does not
-        # survive past this line (T-gate-silently-suppresses-approve-on-truncated-diff).
+        # the truncated ``text`` the model actually sees are paired forever. Every downstream
+        # consumer (message builders, both Lexora passes, verdict resolution, gate notice)
+        # reads from ``view`` — the raw ``diff`` local is not passed further and the message
+        # builders take ``view.text`` rather than the raw diff, so the truncation is computed
+        # ONCE and never recomputed (T-gate-silently-suppresses-approve-on-truncated-diff,
+        # round-3 PR-gate finding on PR #186 corrected the earlier draft that recomputed).
         view = _make_diff_view(diff)
         truncated = view.truncated
 
@@ -863,7 +875,7 @@ class NaysayerPrReviewDriver:
         # verdict token from pass 2's return value). Both fire against the SAME diff at the SAME
         # commit, so a reviewer can trust the ADR pointer section corresponds to the same
         # evidence the verdict was formed on.
-        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(diff, pr.slug)
+        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(view, pr.slug)
 
         if isinstance(pass1_result, LexoraTimeoutError):
             # M2 (T34): pass 1 did not finish within the client timeout. Degrade to fail-closed
@@ -932,9 +944,14 @@ class NaysayerPrReviewDriver:
         )
 
     async def _run_two_passes(
-        self, diff: str, pr_slug: str
+        self, view: DiffView, pr_slug: str
     ) -> tuple[Any, AdrPointerSelection, str]:
         """Execute pass 1 + pass 2 concurrently, return their (typed) outcomes.
+
+        ``view`` is the :class:`DiffView` produced ONCE at the fetch site by
+        :func:`_make_diff_view`. Both passes read ``view.text`` — the raw diff string
+        does not reach this method, so the truncation cannot be recomputed here (round-3
+        PR-gate finding on PR #186). Same view = same evidence for both passes.
 
         Returns a triple:
 
@@ -950,10 +967,10 @@ class NaysayerPrReviewDriver:
         """
         pass1_task = self._lexora.chat_completion(
             model=self._model,
-            messages=_build_messages(diff, pr_slug),
+            messages=_build_messages(view.text, pr_slug),
             max_tokens=self._max_tokens,
         )
-        pass2_task = self._collect_adr_pointers(diff, pr_slug)
+        pass2_task = self._collect_adr_pointers(view.text, pr_slug)
         # ``return_exceptions=True`` isolates the two passes: pass 2's exception must never
         # reach the caller (fail-open), and pass 1's exception is inspected below so the
         # LexoraTimeoutError → degrade path is preserved while other exceptions still
@@ -969,9 +986,12 @@ class NaysayerPrReviewDriver:
         return pass1_outcome, pass2_selection, pass2_raw
 
     async def _collect_adr_pointers(
-        self, diff: str, pr_slug: str
+        self, text: str, pr_slug: str
     ) -> tuple[AdrPointerSelection, str]:
         """Run pass 2 → M1'/M2 pipeline. Returns (selection, raw_content).
+
+        ``text`` is the ALREADY-TRUNCATED ``DiffView.text`` — same evidence pass 1 sees,
+        same contract as :func:`_build_pass2_messages` (see its docstring).
 
         Applies :data:`_ADR_POINTER_TIMEOUT_SECONDS` as the pass-2 budget via
         ``asyncio.wait_for``: a wedged pass 2 cannot exceed this budget even if the Lexora
@@ -983,7 +1003,7 @@ class NaysayerPrReviewDriver:
             completion = await asyncio.wait_for(
                 self._lexora.chat_completion(
                     model=self._model,
-                    messages=_build_pass2_messages(diff, pr_slug),
+                    messages=_build_pass2_messages(text, pr_slug),
                     max_tokens=_ADR_POINTER_MAX_TOKENS,
                 ),
                 timeout=_ADR_POINTER_TIMEOUT_SECONDS,
