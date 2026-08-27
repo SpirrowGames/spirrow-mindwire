@@ -149,6 +149,18 @@ obligations:
     # unreadable by the only party bound by it.
     body: "HOW TO MERGE (and how not to): `gh pr merge` is classified as a merge-to-main REGARDLESS of the pull request's base branch, so it is always denied and the denial HALTS your session — you will post nothing and the turn is lost. Never invoke it. Where a self-merge is sanctioned for your repository (a `feature/*` branch into `develop`), perform it locally instead: check out the target branch, `git merge <your feature branch>`, then push. Merges into `main` are never yours to make under any mechanism; open the PR, report, and hand to the human — that hand-off IS the merge step for `main`, not a fallback from a failed attempt."
 
+  - id: OBL-NO-POLLUTING-PR-HEADER
+    role: implementer
+    # Net-new formulation (no origin). Records the INTENT that the naysayer PR-gate notice
+    # (``<!-- mindwire:gate-notice v1 -->``) is a rarely-fired signal, not a permanent header:
+    # every new "always-on" block someone adds above the critique erodes its distinguishability
+    # and eventually returns the system to the silence T-gate-silently-suppresses-approve-
+    # on-truncated-diff was written to end. Mechanical enforcement lives in
+    # test_gate_notice_absent_when_all_quiet in tests/test_pr_review_driver.py — a caller
+    # that stamps an unconditional header on the naysayer critique reds that test, and the
+    # test is the executable expression of this obligation.
+    body: "NO POLLUTING THE PR-GATE HEADER: do not add unconditional or high-frequency headers/banners above the naysayer PR-review critique; the gate-notice sentinel exists to be RARE and NOTICED. Enforced by test_gate_notice_absent_when_all_quiet in tests/test_pr_review_driver.py."
+
   - id: OBL-SPEC-PIN
     role: implementer
     # Net-new formulation (no origin — nothing was deleted from source to create it).

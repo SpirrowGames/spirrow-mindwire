@@ -47,6 +47,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from ..github.client import (
@@ -109,6 +110,19 @@ _DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_TIMEOUT_MARG
 # force-RC. The truncate-then-never-APPROVE path is KEPT as the safety valve: a diff too big to see
 # in one shot force-RCs rather than rubber-stamping on a partial view.
 _MAX_DIFF_CHARS = 150_000
+
+# Fraction of ``_MAX_DIFF_CHARS`` at which the gate STARTS warning the human that the reviewability
+# cliff is approaching (T-gate-silently-suppresses-approve-on-truncated-diff). Chosen as a RATIO,
+# not an absolute margin: an absolute value ties the warning band to the current cap size (so a
+# future revisit of ``_MAX_DIFF_CHARS`` would silently invalidate the warning discipline); a ratio
+# survives cap changes with its meaning intact. 0.8 leaves two full rounds of typical growth
+# (msg-1872 measured ~10-15k/round on #182) inside the warning band before the cliff — enough
+# lead time to split the PR while it still parses cleanly, which is not enough at a one-round
+# margin (splitting is not a one-round activity, so a one-round warning is essentially "you have
+# already lost"). This is a one-sample calibration and it may change; that is why the reason is
+# recorded here rather than left implicit.
+_DIFF_WARN_RATIO = 0.8
+_DIFF_WARN_THRESHOLD = int(_MAX_DIFF_CHARS * _DIFF_WARN_RATIO)
 
 # T22: the GitHub login the naysayer submits reviews under (= the review-side identity). The
 # debounce counts only reviews by this login (other reviewers — Copilot, the author — are ignored).
@@ -300,12 +314,228 @@ def _parse_verdict(critique: str) -> ReviewEvent:
 
 
 def _resolve_verdict(critique: str, *, truncated: bool, finish_reason: str | None) -> ReviewEvent:
-    """Verdict, but never APPROVE on a partial review (truncated diff / length cap)."""
+    """Verdict, but never APPROVE on a partial review (truncated diff / length cap).
+
+    Preserved as a thin wrapper around :func:`decide_verdict` so external callers /
+    tests that pinned the "gate never APPROVEs a partial review" invariant on this
+    function continue to see the same behaviour. All new call sites should use
+    :func:`decide_verdict` directly — it returns the full :class:`VerdictDecision`
+    (model verdict + gate verdict + suppression fact) that the gate notice needs.
+    """
     if truncated or finish_reason == "length":
         # The model did not see (or could not finish reviewing) the whole diff — approving a
         # partial review would be an unsafe gate. Force an objection.
         return ReviewEvent.REQUEST_CHANGES
     return _parse_verdict(critique)
+
+
+# ─── T-gate-silently-suppresses-approve-on-truncated-diff ────────────────────────────
+# Model verdict, gate verdict, and the gate NOTICE that makes them audible.
+#
+# Before this change: the gate's own decision (force-RC on a partial review) was invisible
+# — the GitHub review body carried the model's ``VERDICT: APPROVE`` verbatim while the
+# review state was ``CHANGES_REQUESTED``, and no channel said why. Measured on #182 (msg-
+# 1871): R10 and R12 both wrote APPROVE and both were recorded RC; the seven rounds
+# between them were spent by the implementer chasing non-existent findings. This block
+# is the record layer that makes that history impossible to repeat.
+#
+# The single design rule that pays for the complexity: MODEL FACT and GATE FACT live at
+# the same call site. ``VerdictDecision`` holds both plus the DiffView they were resolved
+# against; ``render_gate_notice`` reads from that one object; the driver stamps the notice
+# onto the same body that goes to both the chatroom relay and the GitHub review. No
+# second source of truth, no reparse, no chance for the two channels to disagree.
+# ─────────────────────────────────────────────────────────────────────────────────────
+
+
+class ModelVerdict(Enum):
+    """The verdict the MODEL stated (independent of what the gate decides to post).
+
+    ``UNPARSEABLE`` is a first-class value, not a silent collapse into ``REQUEST_CHANGES``:
+    when the two are indistinguishable, "the model said RC" and "the model said something
+    the parser could not read" get the same notice, and the C-suppressed clause would
+    then have to name overrides that never happened. The three-way distinction lets
+    :attr:`VerdictDecision.suppressed` name precisely one thing — APPROVE overridden to
+    RC — and lets the notice header state the model's actual answer honestly.
+    """
+
+    APPROVE = "APPROVE"
+    REQUEST_CHANGES = "REQUEST_CHANGES"
+    UNPARSEABLE = "unparseable"
+
+
+def _parse_model_verdict(critique: str) -> ModelVerdict:
+    """Extract the model's stated verdict, distinguishing UNPARSEABLE from REQUEST_CHANGES.
+
+    Mirrors :func:`_parse_verdict` (same regex, same last-wins rule against decoy-APPROVE
+    injection — see the :data:`_VERDICT_RE` block for the anchor rationale), but returns
+    the three-way :class:`ModelVerdict` instead of the two-way :class:`ReviewEvent`. This
+    is the ONLY place the raw critique is inspected on the notice path — the rest of the
+    pipeline consumes :class:`VerdictDecision`.
+    """
+    matches = _VERDICT_RE.findall(critique)
+    if not matches:
+        return ModelVerdict.UNPARSEABLE
+    token = re.sub(r"[ _-]", "_", matches[-1].upper())
+    if token == "APPROVE":
+        return ModelVerdict.APPROVE
+    # COMMENT / REQUEST_CHANGES / anything else the model wrote → same "objection" bucket.
+    return ModelVerdict.REQUEST_CHANGES
+
+
+@dataclass(frozen=True)
+class VerdictDecision:
+    """The full verdict picture of a single review — model side, gate side, and the diff view.
+
+    ``gate_verdict`` is what actually gets posted to GitHub. ``model_verdict`` is what the
+    model wrote in the critique. :attr:`suppressed` is precisely one thing: the model said
+    APPROVE and the gate posted REQUEST_CHANGES anyway (the case msg-1871 is about).
+    Every other mismatch (model=UNPARSEABLE gate=RC, model=RC gate=RC, ...) is not
+    "suppression" and does not fire the C-suppressed notice — see the naysayer's O-1 in
+    msg-1873 for why conflating them makes the notice itself dishonest.
+    """
+
+    model_verdict: ModelVerdict
+    gate_verdict: ReviewEvent
+    view: DiffView
+    finish_reason: str | None
+
+    @property
+    def suppressed(self) -> bool:
+        return (
+            self.model_verdict is ModelVerdict.APPROVE
+            and self.gate_verdict is ReviewEvent.REQUEST_CHANGES
+        )
+
+
+def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) -> VerdictDecision:
+    """Compute the model verdict, gate verdict, and pack them with the DiffView.
+
+    The gate verdict here reproduces :func:`_resolve_verdict` exactly (test 9's oracle
+    equivalence pins this at 24 combinations of model / truncated / finish_reason) — the
+    goal of this change is to make the existing behaviour AUDIBLE, not to change it. See
+    msg-1874 §9 "参照実装をテスト内に置く".
+    """
+    mv = _parse_model_verdict(critique)
+    if view.truncated or finish_reason == "length":
+        gv = ReviewEvent.REQUEST_CHANGES
+    elif mv is ModelVerdict.APPROVE:
+        gv = ReviewEvent.APPROVE
+    else:
+        # UNPARSEABLE or REQUEST_CHANGES → gate stays closed (mirrors _parse_verdict's
+        # default-safe collapse). This is the ONE case where UNPARSEABLE and RC still
+        # look the same to the gate; the distinction survives on ``model_verdict`` for
+        # the notice, so the record does not lie about which one was written.
+        gv = ReviewEvent.REQUEST_CHANGES
+    return VerdictDecision(
+        model_verdict=mv, gate_verdict=gv, view=view, finish_reason=finish_reason
+    )
+
+
+# Machine-readable markers. The unique sentinel + one marker per note lets an auditor grep
+# the corpus for exactly the rounds a given note fired, without depending on the prose (which
+# will change) or on which words happen to be shared between notes. msg-1876 §"同じ規律
+# を当てたら、もう 1 件出た" — the prior draft used the word "split" as the B-diff key and
+# collided with A-headroom, which also urges splitting; markers close that class of bug.
+_GATE_NOTICE_SENTINEL = "<!-- mindwire:gate-notice v1 -->"
+_MARKER_A_HEADROOM = "<!-- mindwire:note A-headroom -->"
+_MARKER_B_DIFF = "<!-- mindwire:note B-diff -->"
+_MARKER_B_LEN = "<!-- mindwire:note B-len -->"
+_MARKER_C_SUPPRESSED = "<!-- mindwire:note C-suppressed -->"
+
+
+def _model_verdict_label(mv: ModelVerdict) -> str:
+    return mv.value
+
+
+def _gate_verdict_label(gv: ReviewEvent) -> str:
+    return gv.value.upper()
+
+
+def render_gate_notice(decision: VerdictDecision) -> str:
+    """Render the gate-notice markdown block for ``decision``, or "" when quiet.
+
+    Returns ``""`` (no sentinel, no markers) when all three axes are quiet:
+    ``original_chars < warn_threshold``, ``finish_reason != "length"``, not suppressed.
+    Otherwise returns the sentinel + a block containing the model/gate verdict header and
+    one blockquoted note per fired condition (A-headroom / B-diff / B-len / C-suppressed).
+
+    The block is designed to be PREPENDED to the critique (msg-1872 D-4 rationale): a
+    reader who saw ``CHANGES_REQUESTED`` in the review state needs the reason at the top,
+    not buried after a long critique whose last line may itself be truncated by the same
+    length cap the notice is reporting.
+    """
+    view = decision.view
+    fire_a = view.in_headroom and not view.truncated
+    fire_b_diff = view.truncated
+    fire_b_len = decision.finish_reason == "length"
+    fire_c = decision.suppressed
+    if not (fire_a or fire_b_diff or fire_b_len or fire_c):
+        return ""
+
+    lines: list[str] = [_GATE_NOTICE_SENTINEL]
+    lines.append("> **GATE NOTICE**")
+    lines.append(
+        f"> model verdict: {_model_verdict_label(decision.model_verdict)}"
+        f"   gate verdict: {_gate_verdict_label(decision.gate_verdict)}"
+    )
+    if fire_a:
+        remaining = view.limit - view.original_chars
+        pct = round(100.0 * view.original_chars / view.limit) if view.limit else 0
+        lines.append(">")
+        lines.append(f"> {_MARKER_A_HEADROOM}")
+        lines.append(
+            f"> **Approaching the diff limit.** This diff is {view.original_chars:,} of "
+            f"the {view.limit:,} chars the gate can read ({pct}%; {remaining:,} left). "
+            f"Once it crosses, reviews go partial and the gate force-posts "
+            f"REQUEST_CHANGES regardless of findings — APPROVE becomes unreachable until "
+            f"the PR is split. **Split now, while it can still pass.**"
+        )
+    if fire_b_diff:
+        unread = view.original_chars - view.limit
+        pct = round(100.0 * unread / view.original_chars) if view.original_chars else 0
+        lines.append(">")
+        lines.append(f"> {_MARKER_B_DIFF}")
+        lines.append(
+            f"> **Partial review — diff exceeded the review cap.** This diff is "
+            f"{view.original_chars:,} chars; the gate reads at most {view.limit:,}. "
+            f"{unread:,} chars ({pct}%) were never sent to the model. Findings and "
+            f"endorsements below cover only the first {view.limit:,} chars — silence "
+            f"about the remainder is not approval. **No number of further rounds will "
+            f"produce APPROVE while the diff exceeds {view.limit:,} chars. Split the PR.**"
+        )
+    if fire_b_len:
+        lines.append(">")
+        lines.append(f"> {_MARKER_B_LEN}")
+        lines.append(
+            "> **Review truncated by the model's output-token cap.** The critique below "
+            "was cut off before the model finished writing it (finish_reason=length). "
+            "This is a REVIEW-length issue, not a DIFF-size issue — splitting the PR "
+            "would not help. Findings so far may be incomplete."
+        )
+    if fire_c:
+        lines.append(">")
+        lines.append(f"> {_MARKER_C_SUPPRESSED}")
+        lines.append(
+            "> **Verdict suppressed by the gate.** The model wrote `VERDICT: APPROVE` "
+            "but the gate posted `REQUEST_CHANGES` because the review above is partial "
+            "(see the note(s) above); a review of a partial diff / partial output "
+            "cannot open the gate."
+        )
+    return "\n".join(lines)
+
+
+def prepend_gate_notice(body: str, decision: VerdictDecision) -> str:
+    """Return ``body`` with the gate notice prepended (or unchanged when the notice is empty).
+
+    Idempotent-shaped: called exactly once per review body, before both ``post_critique``
+    (chatroom relay) and ``_submit_review`` (GitHub) — same body, same rendered notice,
+    so the two channels cannot show different pictures. The blank line between notice and
+    body prevents the critique's first line from being absorbed into the block quote.
+    """
+    notice = render_gate_notice(decision)
+    if not notice:
+        return body
+    return f"{notice}\n\n{body}"
 
 
 def _ci_gate_response(ci: CiStatus, pr_slug: str) -> tuple[ReviewEvent, str]:
@@ -335,10 +565,49 @@ def _ci_gate_response(ci: CiStatus, pr_slug: str) -> tuple[ReviewEvent, str]:
     )
 
 
-def _truncate_diff(diff: str) -> str:
-    if len(diff) > _MAX_DIFF_CHARS:
-        return diff[:_MAX_DIFF_CHARS] + "\n\n[diff truncated]"
-    return diff
+@dataclass(frozen=True)
+class DiffView:
+    """The pre-truncation facts about a diff, paired with the text the model sees.
+
+    Introduced by T-gate-silently-suppresses-approve-on-truncated-diff so that
+    ``original_chars`` (the length BEFORE truncation) is captured at the same call site
+    that produces ``text`` — every consumer of one is holding the other, and the gate
+    notice's numbers cannot silently drift from the messages the model was sent.
+    """
+
+    text: str
+    original_chars: int
+    limit: int
+    warn_threshold: int
+
+    @property
+    def truncated(self) -> bool:
+        # Boundary: original_chars == limit is NOT truncated (the last-char-fit case). The
+        # 24-case matrix in the tests pins both sides of this.
+        return self.original_chars > self.limit
+
+    @property
+    def in_headroom(self) -> bool:
+        # In the [warn_threshold, limit] band: the "close to the cliff, but the review is
+        # still whole" state. Mutually exclusive with ``truncated`` by construction.
+        return self.warn_threshold <= self.original_chars <= self.limit
+
+
+def _make_diff_view(diff: str) -> DiffView:
+    """Truncate ``diff`` to the review cap and pair the result with the pre-cap length.
+
+    Replaces the bare ``str``-returning ``_truncate_diff``: an earlier design lost
+    ``original_chars`` on the way to the verdict-resolution site, and the gate notice
+    could not honestly say "51,829 chars were never sent to the model" from a truncated
+    string alone. Here the length is captured BEFORE truncation, at the same call.
+    """
+    text = diff[:_MAX_DIFF_CHARS] + "\n\n[diff truncated]" if len(diff) > _MAX_DIFF_CHARS else diff
+    return DiffView(
+        text=text,
+        original_chars=len(diff),
+        limit=_MAX_DIFF_CHARS,
+        warn_threshold=_DIFF_WARN_THRESHOLD,
+    )
 
 
 def _build_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
@@ -351,12 +620,12 @@ def _build_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
     agent uses, so a one-place edit to ``spec/NAYSAYER_PRINCIPLES.md`` propagates to
     both surfaces (fail-loud: a missing/blank SOT raises).
     """
-    diff = _truncate_diff(diff)
+    text = _make_diff_view(diff).text
     system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
         f"specific hunks you object to, and end with your VERDICT line.\n\n"
-        f"```diff\n{diff}\n```"
+        f"```diff\n{text}\n```"
     )
     return [
         ChatMessage(role="system", content=system),
@@ -371,7 +640,7 @@ def _build_pass2_messages(diff: str, pr_slug: str) -> list[ChatMessage]:
     truncation cap as pass 1: pass 2 sees the same evidence pass 1 sees, so a pointer
     emitted against a truncated hunk was at least judged from the same view.
     """
-    return build_pr_review_pass2_messages(_truncate_diff(diff), pr_slug)
+    return build_pr_review_pass2_messages(_make_diff_view(diff).text, pr_slug)
 
 
 # The pass-2 (ADR-pointer collection) call gets its OWN, shorter timeout so a wedged
@@ -586,7 +855,12 @@ class NaysayerPrReviewDriver:
 
         # CI green → content review (Lexora). Fail-closed: an unreachable GitHub raises here.
         diff = await self._github.fetch_pr_diff(pr)
-        truncated = len(diff) > _MAX_DIFF_CHARS
+        # Capture the pre-truncation view ONCE, at the fetch site, so ``original_chars`` and
+        # the truncated ``text`` the model actually sees are paired forever. Everything
+        # downstream (verdict, gate notice) reads from ``view`` — the raw len(diff) does not
+        # survive past this line (T-gate-silently-suppresses-approve-on-truncated-diff).
+        view = _make_diff_view(diff)
+        truncated = view.truncated
 
         # A-3 two-pass structure (msg-692 §1): run pass 1 (verdict) and pass 2 (ADR-pointer
         # collection) in parallel. Pass 1 = judge; pass 2 = index-injected hint collection whose
@@ -624,10 +898,20 @@ class NaysayerPrReviewDriver:
                 f"naysayer returned empty review (finish_reason={completion.finish_reason!r}) "
                 f"for {pr.slug}; refusing to post/submit empty"
             )
-        # Never APPROVE a review the model could not fully see (truncated diff / token cap).
-        verdict = _resolve_verdict(
-            body, truncated=truncated, finish_reason=completion.finish_reason
-        )
+        # Compute the FULL decision (model verdict + gate verdict + suppression fact) from
+        # one call: this is the ONLY site the raw critique is parsed on the notice path, and
+        # the same ``decision`` feeds both the ``verdict`` posted to GitHub and the notice
+        # prepended to the body — the two cannot drift. ``verdict`` remains equal to what
+        # ``_resolve_verdict(body, truncated=..., finish_reason=...)`` returned before this
+        # change (test_gate_verdict_matches_oracle pins the 24-case equivalence).
+        decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
+        verdict = decision.gate_verdict
+        # Prepend the gate notice BEFORE the ADR-pointer marker is appended: the notice sits
+        # at the head of the body so a reader who sees ``CHANGES_REQUESTED`` in the review
+        # state finds the reason at the top of the critique, not after a possibly-truncated
+        # tail (msg-1872 D-4). The notice is "" when no axis fired, in which case body is
+        # returned unchanged (msg-1876 invariant 6: no marker → no sentinel).
+        body = prepend_gate_notice(body, decision)
         # Stamp the ADR-pointer section + marker onto the body BEFORE posting / submitting, so
         # the chat-room copy, the GitHub review, and the outcome all carry the same rendered
         # body (the marker is the final line — the driver relies on that fixed position).

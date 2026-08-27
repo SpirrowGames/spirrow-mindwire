@@ -32,15 +32,25 @@ from spirrow_mindwire.lexora.client import (
 )
 from spirrow_mindwire.naysayer.pr_review import (
     _DEFAULT_TIMEOUT_SECONDS,
+    _DIFF_WARN_THRESHOLD,
+    _GATE_NOTICE_SENTINEL,
+    _MARKER_A_HEADROOM,
+    _MARKER_B_DIFF,
+    _MARKER_B_LEN,
+    _MARKER_C_SUPPRESSED,
     _MAX_DIFF_CHARS,
     _PR_REVIEW_SYSTEM_PROMPT,
     _VERDICT_RE,
+    DiffView,
+    ModelVerdict,
     NaysayerPrReviewDriver,
     NaysayerPrReviewError,
     PostCritique,
     _ci_gate_response,
     _parse_verdict,
     _resolve_verdict,
+    decide_verdict,
+    render_gate_notice,
 )
 from spirrow_mindwire.naysayer.principles import build_preamble, principles_version
 
@@ -980,3 +990,335 @@ async def test_driver_explicit_github_token_wins(monkeypatch: pytest.MonkeyPatch
         assert driver._github._token == "explicit-tok"
     finally:
         await driver.aclose()
+
+
+# =========================================================================== #
+# T-gate-silently-suppresses-approve-on-truncated-diff — the gate notice tests
+#
+# Structure: the 24-case matrix (invariant 9's oracle equivalence + axis
+# invariants 1-5) is one @parametrize; the block-level invariants (6, 7, 8) are
+# separate targeted tests. The design lives in msg-1876 §"改訂後の不変条件"
+# — each test names the invariant it pins.
+# =========================================================================== #
+
+
+def _oracle_gate_verdict(mv: ModelVerdict, *, truncated: bool, finish_reason: str) -> ReviewEvent:
+    """Reference implementation of the pre-change ``_resolve_verdict`` (3 lines).
+
+    Placed inside the test module deliberately (msg-1874 §Q5 "参照実装をテスト内
+    に置く"): the invariant "the gate verdict did not change" is asserted as a
+    machine-checkable equivalence to a re-stated reference, not as a prose claim.
+    """
+    if truncated or finish_reason == "length":
+        return ReviewEvent.REQUEST_CHANGES
+    if mv is ModelVerdict.APPROVE:
+        return ReviewEvent.APPROVE
+    return ReviewEvent.REQUEST_CHANGES
+
+
+def _make_view(original_chars: int) -> DiffView:
+    """Construct a DiffView at the given pre-truncation length (text irrelevant here)."""
+    return DiffView(
+        text="",  # text is not exercised by the notice-rendering tests
+        original_chars=original_chars,
+        limit=_MAX_DIFF_CHARS,
+        warn_threshold=_DIFF_WARN_THRESHOLD,
+    )
+
+
+def _critique_with_verdict(mv: ModelVerdict) -> str:
+    if mv is ModelVerdict.APPROVE:
+        return "no blocking problems\n\nVERDICT: APPROVE"
+    if mv is ModelVerdict.REQUEST_CHANGES:
+        return "line 3 is wrong\n\nVERDICT: REQUEST_CHANGES"
+    return "some prose without a verdict line"  # UNPARSEABLE
+
+
+# 24-case matrix: original_chars x finish_reason x model_verdict. Boundary points
+# chosen per msg-1876: warn-1 / warn / limit / limit+1. Every case names the
+# expected notice-firing set (axis invariants 1-5) AND the expected gate verdict
+# (invariant 9, oracle equivalence).
+_BOUNDARY_CHARS = {
+    "warn_minus_1": _DIFF_WARN_THRESHOLD - 1,
+    "warn": _DIFF_WARN_THRESHOLD,
+    "limit": _MAX_DIFF_CHARS,
+    "limit_plus_1": _MAX_DIFF_CHARS + 1,
+}
+
+
+@pytest.mark.parametrize("boundary_name", list(_BOUNDARY_CHARS.keys()))
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.parametrize("model_verdict", list(ModelVerdict))
+def test_decide_verdict_matrix_axes_and_oracle(
+    boundary_name: str, finish_reason: str, model_verdict: ModelVerdict
+) -> None:
+    """The 24-case matrix — pins every axis invariant + oracle equivalence in one place.
+
+    Invariants pinned (msg-1876 numbering):
+      1. warn_threshold <= original_chars <= limit ⟺ A-headroom fires
+      2. original_chars > limit  ⟺ B-diff fires
+      3. A-headroom / B-diff mutually exclusive
+      4. finish_reason == "length" ⟺ B-len fires
+      5. suppressed = (model==APPROVE and gate==RC) ⟺ C-suppressed fires
+      9. gate_verdict equals the reference implementation
+    """
+    original_chars = _BOUNDARY_CHARS[boundary_name]
+    view = _make_view(original_chars)
+    critique = _critique_with_verdict(model_verdict)
+
+    decision = decide_verdict(critique, view=view, finish_reason=finish_reason)
+    notice = render_gate_notice(decision)
+
+    # Invariant 9 — gate verdict is unchanged from the pre-change implementation.
+    expected_gate = _oracle_gate_verdict(
+        model_verdict, truncated=view.truncated, finish_reason=finish_reason
+    )
+    assert decision.gate_verdict is expected_gate
+
+    # Axis invariants — each note fires iff its own condition, independent of the
+    # others (msg-1876 §"O-3 受諾 — 私の誤りの型を先に名指しする").
+    expected_a = view.in_headroom and not view.truncated  # (1) ∧ ¬(2)
+    expected_b_diff = view.truncated  # (2)
+    expected_b_len = finish_reason == "length"  # (4)
+    expected_c = decision.suppressed  # (5)
+
+    assert (_MARKER_A_HEADROOM in notice) is expected_a
+    assert (_MARKER_B_DIFF in notice) is expected_b_diff
+    assert (_MARKER_B_LEN in notice) is expected_b_len
+    assert (_MARKER_C_SUPPRESSED in notice) is expected_c
+
+    # Invariant 3 — A and B-diff cannot both fire (same-scalar band split).
+    assert not (expected_a and expected_b_diff)
+
+
+def test_gate_notice_absent_when_all_quiet() -> None:
+    """Invariant 6 (⟹): all axes quiet ⟹ no sentinel and no markers.
+
+    ALSO the executable expression of OBL-NO-POLLUTING-PR-HEADER — a caller that
+    unconditionally stamps a header on the naysayer critique reds this test.
+    """
+    view = _make_view(_DIFF_WARN_THRESHOLD - 1)  # below warn band
+    decision = decide_verdict("all good\n\nVERDICT: APPROVE", view=view, finish_reason="stop")
+    notice = render_gate_notice(decision)
+    assert notice == ""
+    assert _GATE_NOTICE_SENTINEL not in notice
+    for marker in (
+        _MARKER_A_HEADROOM,
+        _MARKER_B_DIFF,
+        _MARKER_B_LEN,
+        _MARKER_C_SUPPRESSED,
+    ):
+        assert marker not in notice
+
+
+def test_gate_notice_sentinel_iff_any_marker() -> None:
+    """Invariant 6 (both directions) — sentinel present ⟺ at least one marker present.
+
+    Sweep the 24-case matrix in one test so the invariant is asserted as a
+    biconditional, not two independent implications.
+    """
+    for boundary_name, chars in _BOUNDARY_CHARS.items():
+        for finish_reason in ("stop", "length"):
+            for mv in ModelVerdict:
+                view = _make_view(chars)
+                decision = decide_verdict(
+                    _critique_with_verdict(mv), view=view, finish_reason=finish_reason
+                )
+                notice = render_gate_notice(decision)
+                any_marker = any(
+                    m in notice
+                    for m in (
+                        _MARKER_A_HEADROOM,
+                        _MARKER_B_DIFF,
+                        _MARKER_B_LEN,
+                        _MARKER_C_SUPPRESSED,
+                    )
+                )
+                has_sentinel = _GATE_NOTICE_SENTINEL in notice
+                assert has_sentinel == any_marker, (
+                    f"sentinel/any-marker biconditional broken: "
+                    f"boundary={boundary_name!r} finish_reason={finish_reason!r} "
+                    f"model_verdict={mv!r} — "
+                    f"sentinel={has_sentinel} any_marker={any_marker}"
+                )
+
+
+def test_gate_notice_header_lines_present_exactly_once() -> None:
+    """Invariant 7 — when sentinel fires, the model/gate verdict lines are present exactly once.
+
+    The header ("model verdict: … gate verdict: …") is owned by the block, not by
+    any individual note (msg-1876 §"注記ブロックの構造を確定する"): even when
+    A + B-len + C all fire, the verdicts must appear once and only once.
+    """
+    view = _make_view(_DIFF_WARN_THRESHOLD)  # warn band → A fires
+    # length + APPROVE → also B-len + C. Three notes coexist.
+    decision = decide_verdict(
+        "no blocking problems\n\nVERDICT: APPROVE",
+        view=view,
+        finish_reason="length",
+    )
+    notice = render_gate_notice(decision)
+    assert _MARKER_A_HEADROOM in notice
+    assert _MARKER_B_LEN in notice
+    assert _MARKER_C_SUPPRESSED in notice
+    # Exactly one occurrence of each labelled verdict line.
+    assert notice.count("model verdict:") == 1
+    assert notice.count("gate verdict:") == 1
+
+
+@pytest.mark.anyio
+async def test_gate_notice_relay_and_github_receive_same_body() -> None:
+    """Invariant 8 — chatroom relay (post_critique) and GitHub review carry the same body.
+
+    Both go through ``prepend_gate_notice(body, decision)`` at the same call site
+    in ``driver.review``. This test wires the driver end-to-end and asserts on the
+    two channels' outputs being byte-identical.
+    """
+    # A truncated diff + model APPROVE → suppression path (B-diff + C-suppressed).
+    github = _FakeGitHub(diff="x" * (_MAX_DIFF_CHARS + 100))
+    lexora = _FakeLexora(content="no blocking problems\n\nVERDICT: APPROVE")
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    await driver.review(_pr(), post_critique=post)
+    assert len(posted) == 1
+    relay_body = posted[0]
+    assert len(github.submitted) == 1
+    _pr_arg, _event, github_body = github.submitted[0]
+    assert relay_body == github_body
+
+
+@pytest.mark.anyio
+async def test_gate_notice_at_body_head_when_suppressed() -> None:
+    """The gate notice is PREPENDED (msg-1872 D-4), not appended.
+
+    Guards against a future "put it at the tail" regression: the notice's job is
+    to be read BEFORE the critique when a reader lands on the review from a
+    CHANGES_REQUESTED state.
+    """
+    github = _FakeGitHub(diff="x" * (_MAX_DIFF_CHARS + 100))
+    lexora = _FakeLexora(content="no blocking problems\n\nVERDICT: APPROVE")
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    await driver.review(_pr(), post_critique=post)
+
+    body = posted[0]
+    assert body.startswith(_GATE_NOTICE_SENTINEL)
+    # And the marker sentinel comes BEFORE the model's own verdict line.
+    assert body.index(_GATE_NOTICE_SENTINEL) < body.index("VERDICT: APPROVE")
+
+
+@pytest.mark.anyio
+async def test_gate_notice_carries_verdict_and_split_directive_when_truncated() -> None:
+    """Truncated diff (B-diff) fires → notice states both verdicts AND the split directive.
+
+    Pins the two textual pieces msg-1872 §6-1 identified as the missing pieces
+    when the naysayer was silent on #182: (a) BOTH the model verdict and the
+    gate verdict must be visible in one place, and (b) the notice must state
+    the futility ("split the PR") so the implementer does not pursue further
+    rounds.
+    """
+    github = _FakeGitHub(diff="x" * (_MAX_DIFF_CHARS + 1))
+    lexora = _FakeLexora(content="no blocking problems\n\nVERDICT: APPROVE")
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    body = posted[0]
+    assert "model verdict: APPROVE" in body
+    assert "gate verdict: REQUEST_CHANGES" in body
+    assert "Split the PR" in body  # B-diff futility clause
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES  # gate unchanged
+
+
+@pytest.mark.anyio
+async def test_gate_notice_length_cap_does_not_advise_split() -> None:
+    """finish_reason==length WITHOUT truncation → B-len fires and MUST NOT say "split".
+
+    msg-1876 §"B 節の分離": B-len is an OUTPUT-length issue and splitting the
+    PR would not help — the prior draft's "split" indication on this path was
+    a self-generated false directive (the exact class of noise this thread
+    was written to remove).
+    """
+    github = _FakeGitHub(diff="small diff")  # well under the warn threshold
+    lexora = _FakeLexora(
+        content="no blocking problems\n\nVERDICT: APPROVE",
+        finish_reason="length",
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    await driver.review(_pr(), post_critique=post)
+
+    body = posted[0]
+    assert _MARKER_B_LEN in body
+    assert _MARKER_B_DIFF not in body
+    assert _MARKER_A_HEADROOM not in body
+    # The B-diff and A-headroom DIRECTIVES ("Split the PR" / "Split now") must not
+    # appear when only B-len is firing — those directives are B-diff / A-headroom
+    # copy, not B-len copy. The word "split" itself DOES appear in the B-len text
+    # ("splitting the PR would not help") — that is the anti-directive, and the
+    # invariant this test pins is the absence of the actual imperatives, not the
+    # absence of the substring "split".
+    assert "Split the PR" not in body
+    assert "Split now" not in body
+
+
+def test_model_verdict_distinguishes_unparseable() -> None:
+    """The three-way ``ModelVerdict`` — UNPARSEABLE is not silently collapsed to RC.
+
+    Preserves the naysayer's O-1 in msg-1873: if the parser cannot read a verdict,
+    the notice states that as "unparseable", NOT as "the model said RC". The
+    C-suppressed clause fires only on APPROVE→RC (never on UNPARSEABLE→RC).
+    """
+    view = _make_view(_MAX_DIFF_CHARS + 1)  # truncated so the gate force-RCs
+    decision = decide_verdict(
+        "some prose without a verdict line at all",
+        view=view,
+        finish_reason="stop",
+    )
+    assert decision.model_verdict is ModelVerdict.UNPARSEABLE
+    assert decision.gate_verdict is ReviewEvent.REQUEST_CHANGES
+    assert decision.suppressed is False  # UNPARSEABLE → RC is NOT suppression
+    notice = render_gate_notice(decision)
+    assert _MARKER_B_DIFF in notice
+    assert _MARKER_C_SUPPRESSED not in notice
+    assert "model verdict: unparseable" in notice
+
+
+def test_diff_view_boundary_at_limit_is_not_truncated() -> None:
+    """``original_chars == limit`` is A-headroom, NOT B-diff.
+
+    Pins the specific boundary msg-1876 test row "limit x stop x APPROVE" makes
+    explicit: exactly at the cap the diff still fit, so the review is whole and
+    the gate can APPROVE — the notice fires A-headroom only.
+    """
+    view = _make_view(_MAX_DIFF_CHARS)
+    assert view.truncated is False
+    assert view.in_headroom is True
+    decision = decide_verdict(
+        "no blocking problems\n\nVERDICT: APPROVE", view=view, finish_reason="stop"
+    )
+    assert decision.gate_verdict is ReviewEvent.APPROVE  # force-RC does NOT fire
+    notice = render_gate_notice(decision)
+    assert _MARKER_A_HEADROOM in notice
+    assert _MARKER_B_DIFF not in notice
+    assert _MARKER_C_SUPPRESSED not in notice
+
+
+def test_verdict_decision_is_immutable() -> None:
+    """``VerdictDecision`` / ``DiffView`` are frozen — no mutation after construction.
+
+    The gate notice reads from ``decision`` after it has been packed; making the
+    dataclass mutable would allow a downstream caller to change what the notice
+    reports vs what was posted, reintroducing the record/behaviour drift this
+    change exists to end.
+    """
+    import dataclasses
+
+    view = _make_view(_MAX_DIFF_CHARS + 1)
+    decision = decide_verdict(
+        "no blocking problems\n\nVERDICT: APPROVE", view=view, finish_reason="stop"
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        decision.model_verdict = ModelVerdict.REQUEST_CHANGES  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        view.original_chars = 42  # type: ignore[misc]
