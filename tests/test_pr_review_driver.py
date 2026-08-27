@@ -1297,13 +1297,18 @@ async def test_gate_notice_carries_verdict_and_split_directive_when_truncated() 
 
 
 @pytest.mark.anyio
-async def test_gate_notice_length_cap_does_not_advise_split() -> None:
-    """finish_reason==length WITHOUT truncation → B-len fires and MUST NOT say "split".
+async def test_gate_notice_length_cap_alone_does_not_advise_split() -> None:
+    """finish_reason==length WITHOUT truncation → B-len fires and no split directive appears.
 
-    msg-1876 §"B 節の分離": B-len is an OUTPUT-length issue and splitting the
-    PR would not help — the prior draft's "split" indication on this path was
-    a self-generated false directive (the exact class of noise this thread
-    was written to remove).
+    msg-1876 §"B 節の分離": B-len is an OUTPUT-length issue; the split directives
+    ("Split the PR" / "Split now") belong to B-diff / A-headroom and must not
+    appear when neither of those notes fires. The prior draft solved this by
+    having B-len say "splitting would not help" — round-6 PR-gate finding
+    (msg-1893) exposed that as a cross-axis claim that CONTRADICTS the split
+    directive when A / B-diff coexists with B-len. This test now checks the
+    strict property (no split directive when only B-len fires), and the
+    coexistence case is checked by
+    ``test_gate_notice_never_contradicts_across_coexisting_notes`` below.
     """
     github = _FakeGitHub(diff="small diff")  # well under the warn threshold
     lexora = _FakeLexora(
@@ -1318,14 +1323,51 @@ async def test_gate_notice_length_cap_does_not_advise_split() -> None:
     assert _MARKER_B_LEN in body
     assert _MARKER_B_DIFF not in body
     assert _MARKER_A_HEADROOM not in body
-    # The B-diff and A-headroom DIRECTIVES ("Split the PR" / "Split now") must not
-    # appear when only B-len is firing — those directives are B-diff / A-headroom
-    # copy, not B-len copy. The word "split" itself DOES appear in the B-len text
-    # ("splitting the PR would not help") — that is the anti-directive, and the
-    # invariant this test pins is the absence of the actual imperatives, not the
-    # absence of the substring "split".
+    # No split directive of any kind — B-len does not carry one and neither
+    # sibling note is firing.
     assert "Split the PR" not in body
     assert "Split now" not in body
+    # The B-len text no longer makes cross-axis claims about diff size at all
+    # (round-6 PR-gate finding msg-1893). "would not help" was the offending
+    # phrase; it must not appear regardless of which sibling notes fire.
+    assert "would not help" not in body
+
+
+def test_gate_notice_never_contradicts_across_coexisting_notes() -> None:
+    """Cross-axis contradiction guard — round-6 PR-gate finding (msg-1893).
+
+    When A-headroom or B-diff fire ALONGSIDE B-len, the notice must not
+    simultaneously carry a "Split the PR" / "Split now" directive AND a claim
+    that splitting is unhelpful or unnecessary. The prior B-len text asserted
+    "This is a REVIEW-length issue, not a DIFF-size issue — splitting the PR
+    would not help." — factually correct when B-len fired alone; a direct
+    contradiction of the sibling directive when A-headroom or B-diff was firing
+    concurrently.
+
+    Sweep the two coexistence cases the naysayer named and assert absence of
+    the anti-directive phrases in the rendered notice.
+    """
+    critique = "no blocking problems\n\nVERDICT: APPROVE"
+
+    # Case 1: A-headroom + B-len (warn-band diff, model hit output cap).
+    view_a = _make_view(_DIFF_WARN_THRESHOLD)
+    decision_a = decide_verdict(critique, view=view_a, finish_reason="length")
+    notice_a = render_gate_notice(decision_a)
+    assert _MARKER_A_HEADROOM in notice_a
+    assert _MARKER_B_LEN in notice_a
+    assert "Split now" in notice_a  # A-headroom's directive stands
+    assert "would not help" not in notice_a  # no cross-axis contradiction
+    assert "not a DIFF-size issue" not in notice_a  # nor its assertion form
+
+    # Case 2: B-diff + B-len (over-cap diff, model also hit output cap).
+    view_b = _make_view(_MAX_DIFF_CHARS + 1)
+    decision_b = decide_verdict(critique, view=view_b, finish_reason="length")
+    notice_b = render_gate_notice(decision_b)
+    assert _MARKER_B_DIFF in notice_b
+    assert _MARKER_B_LEN in notice_b
+    assert "Split the PR" in notice_b  # B-diff's directive stands
+    assert "would not help" not in notice_b
+    assert "not a DIFF-size issue" not in notice_b
 
 
 def test_model_verdict_distinguishes_unparseable() -> None:

@@ -481,13 +481,22 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             f"produce APPROVE while the diff exceeds {view.limit:,} chars. Split the PR.**"
         )
     if fire_b_len:
+        # STRICTLY ON THE OUTPUT AXIS. This note may only describe what happened to the
+        # model's response — never make claims about the DIFF-size axis (A-headroom / B-diff).
+        # An earlier draft said "This is a REVIEW-length issue, not a DIFF-size issue —
+        # splitting the PR would not help.", which was factually true when B-len fired
+        # alone but a direct contradiction of the split directive when A-headroom or
+        # B-diff fired alongside it (round-6 PR-gate finding on PR #186 msg-1893). Same
+        # discipline as Bohr's msg-1876 §O-3 for invariants: a note may only assert
+        # about its own axis. If the reader needs to know whether a diff-size problem
+        # ALSO exists, the presence or absence of A-headroom / B-diff answers that —
+        # this note does not.
         lines.append(">")
         lines.append(f"> {_MARKER_B_LEN}")
         lines.append(
             "> **Review truncated by the model's output-token cap.** The critique below "
             "was cut off before the model finished writing it (finish_reason=length). "
-            "This is a REVIEW-length issue, not a DIFF-size issue — splitting the PR "
-            "would not help. Findings so far may be incomplete."
+            "Findings above may be incomplete."
         )
     if fire_c:
         lines.append(">")
