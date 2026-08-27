@@ -1,0 +1,474 @@
+# Regression guard for the exclusive-resource lease + queue (T-exclusive-resource-lease-queue,
+# msg-1180 / 1183 / 1185 / 1187 design; msg-1188 Tier-C approval).
+#
+# What THIS PR covers (T-exclusive-resource-lease-queue PR 1 / 4 — state & persistence):
+#   1. Merge-LeasesStateForWrite — the operator-write-mid-sweep survival semantics (per-resource
+#      `generation` as an optimistic-concurrency token). This is the msg-1802 blocker fix, rebased
+#      onto the split PR chain (Takahito msg-2098 §3): PR 1 lands the record shape, the merge
+#      rule, and Get-JsonState / Get-LeaseSummaryLines. Nothing here is wired into the sweep yet;
+#      wiring lands in PR 4.
+#
+# Sections for probe classification (Get-LeaseHolderClassification / Update-LeaseFromClassification
+# / Test-LeaseExpiring / Test-LeaseAvailableFor / Invoke-LeaseAcquire) will be added in PR 2. Queue
+# sections (Add/Remove waiter, Get-NextLeaseWaiter, Invoke-LeasePromotion, scrub, empty-drain,
+# Register-LeaseWaiter) will be added in PR 3. Wrapper AST checks land in PR 4 with the wiring.
+
+$ErrorActionPreference = "Stop"
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$leaseLib = Join-Path $repoRoot "deploy/lib/Lease.ps1"
+
+if (-not (Test-Path -LiteralPath $leaseLib)) { throw "Lease lib not found: $leaseLib" }
+
+. $leaseLib
+
+$script:failures = 0
+function Check {
+    param([string]$Name, $Expected, $Actual)
+    if ($Expected -eq $Actual) { Write-Host ("  PASS  {0}" -f $Name) }
+    else {
+        $script:failures++
+        Write-Host ("  FAIL  {0} — expected '{1}', got '{2}'" -f $Name, $Expected, $Actual)
+    }
+}
+function CheckFalse { param([string]$Name, $Actual) Check -Name $Name -Expected $false -Actual ([bool]$Actual) }
+function CheckTrue  { param([string]$Name, $Actual) Check -Name $Name -Expected $true  -Actual ([bool]$Actual) }
+
+# --- 1. New-LeaseRecord — the record shape callers rely on --------------------------------------
+Write-Host "New-LeaseRecord — field defaults, reclaimed_at pairing, queue preservation"
+
+$now = [datetime]::Parse('2026-08-27T00:00:00Z').ToUniversalTime()
+
+# Fresh acquire on a free lease (no prior holder).
+$rec = New-LeaseRecord -Holder 'p/T-a' -Now $now
+Check "fresh: holder set"                'p/T-a' $rec.holder
+Check "fresh: generation defaults to 1"  1       $rec.generation
+Check "fresh: idle_evaluations=0"        0       $rec.idle_evaluations
+Check "fresh: expiring=false"            $false  $rec.expiring
+Check "fresh: pinned=false"              $false  $rec.pinned
+Check "fresh: reclaim_required=false"    $false  $rec.reclaim_required
+# reclaimed_from is a [string] param, so $null-default coerces to '' on binding — that is the
+# on-disk shape too (empty string round-trips as empty). What matters for the digest is that
+# it's falsy (no prior holder recorded); the digest treats '' the same as $null via `if`.
+Check "fresh: reclaimed_from empty"      ''      $rec.reclaimed_from
+Check "fresh: reclaimed_at=null (no reclamation happened)" $null $rec.reclaimed_at
+Check "fresh: reclaimed_reason empty"    ''      $rec.reclaimed_reason
+Check "fresh: revoked_at=null"           $null   $rec.revoked_at
+Check "fresh: revoked_reason=null"       $null   $rec.revoked_reason
+Check "fresh: queue empty"               0       $rec.queue.Count
+
+# Promotion from queue (reclaimed_from set → reclaimed_at MUST be paired).
+$rec2 = New-LeaseRecord -Holder 'p/T-b' -Now $now -Generation 6 `
+    -ReclaimedFrom 'p/T-a' -ReclaimRequired $true `
+    -ReclaimedReason 'human-clear: PIE crashed'
+Check "promoted: holder set"                        'p/T-b' $rec2.holder
+Check "promoted: generation as passed"              6       $rec2.generation
+Check "promoted: reclaimed_from paired"             'p/T-a' $rec2.reclaimed_from
+Check "promoted: reclaimed_at paired with reclaimed_from" $rec2.acquired_at $rec2.reclaimed_at
+Check "promoted: reclaimed_reason preserved"        'human-clear: PIE crashed' $rec2.reclaimed_reason
+Check "promoted: reclaim_required=true"             $true   $rec2.reclaim_required
+
+# Queue preservation.
+$q = @(@{ key = 'p/T-c'; waiting_since = '2026-08-26T00:00:00Z' })
+$rec3 = New-LeaseRecord -Holder 'p/T-b' -Now $now -Queue $q
+Check "queue preserved on new record" 1 $rec3.queue.Count
+Check "queue element key preserved"   'p/T-c' $rec3.queue[0].key
+
+# Pinned grant (operator TTL-immune).
+$rec4 = New-LeaseRecord -Holder 'p/T-x' -Now $now -Pinned $true
+Check "pinned: pinned=true" $true $rec4.pinned
+
+
+# --- 2. ConvertTo-LeaseHashtable / ConvertTo-LeasesStateHashtable — JSON round-trip normalisation
+Write-Host "ConvertTo-Lease*Hashtable — PSCustomObject from disk is normalised to hashtables"
+
+# Simulate what Get-JsonState returns for a lease record with a queue (PSCustomObject through
+# ConvertFrom-Json; the queue is an array of PSCustomObjects too).
+$raw = @'
+{
+  "editor": {
+    "holder": "p/T-a",
+    "generation": 4,
+    "queue": [
+      {"key": "p/T-b", "waiting_since": "2026-08-26T00:00:00Z"}
+    ]
+  }
+}
+'@
+$obj = $raw | ConvertFrom-Json
+$map = @{}
+foreach ($p in $obj.PSObject.Properties) { $map[$p.Name] = $p.Value }
+$norm = ConvertTo-LeasesStateHashtable $map
+Check "top-level entry normalised to hashtable" $true ($norm['editor'] -is [hashtable])
+Check "queue entries normalised to hashtable"   $true ($norm['editor']['queue'][0] -is [hashtable])
+Check "queue key preserved through normalisation" 'p/T-b' $norm['editor']['queue'][0]['key']
+
+# Idempotence: passing an already-hashtable through returns the same shape.
+$again = ConvertTo-LeaseHashtable -Lease $norm['editor']
+Check "ConvertTo-LeaseHashtable is idempotent" $true ($again -is [hashtable])
+Check "ConvertTo-LeaseHashtable idempotent: holder preserved" 'p/T-a' $again['holder']
+
+
+# --- 3. Merge-LeasesStateForWrite — operator write mid-sweep survives (msg-1802 blocker #1) -----
+#
+# leases.json's top-level key is the resource name. When wiring lands (PR 4), the sweep's probe
+# will mutate that key at tick start (last_progress_at, idle_evaluations, expiring). If an
+# operator runs Grant-Lease.ps1 mid-sweep and writes a new holder for the same key to disk, the
+# generic Merge-StateForWrite (which merges at top-level key granularity and lets memory win on
+# collision) would silently destroy the operator's Tier-C override. Merge-LeasesStateForWrite
+# uses per-resource `generation` as an optimistic-concurrency token to detect the external write.
+#
+# Scenario C ("sweep did an acquire and wins") requires Invoke-LeaseAcquire, which lands in PR 2;
+# that scenario is added to this section when PR 2 lands. A/B/D/E/F/G/H cover the merger's own
+# logic in isolation and are complete without any other function.
+#   - F: msg-2103 external deletion mid-sweep (the merger must not resurrect the deleted key).
+#   - G: msg-2114 corrupt-scalar fall-back (a hand-edit typo must not abort the flush).
+#   - H: msg-2131 sweep-side deletion (mirror of F — a sweep-freed lease with an empty queue
+#     must not be silently resurrected from stale disk state).
+Write-Host "Merge-LeasesStateForWrite — operator write mid-sweep survives (msg-1802 blocker #1)"
+
+# Fresh temp fixture (never this checkout's own state dir).
+$fixtureDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mindwire-lease-merge-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
+$fixturePath = Join-Path $fixtureDir 'leases.json'
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Save-FixtureLeases {
+    param([string]$Path, [hashtable]$State)
+    [System.IO.File]::WriteAllText($Path, ($State | ConvertTo-Json -Depth 5), $utf8NoBom)
+}
+
+try {
+    # --- scenario A: no external write. Sweep memory wins; probe's last_progress_at persists ---
+    $diskA = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; last_progress_at = '2026-08-25T00:00:00Z'; idle_evaluations = 0; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskA
+    $memoryA = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGens = Get-LeaseGenerations -LeasesState $memoryA
+    $memoryA['editor']['last_progress_at'] = '2026-08-26T05:00:00Z'  # probe updated the clock
+    $mergedA = Merge-LeasesStateForWrite -Memory $memoryA -OriginalGenerations $originalGens -DiskPath $fixturePath
+    Check "no-external-write: probe update survives" '2026-08-26T05:00:00Z' $mergedA['editor'].last_progress_at
+    Check "no-external-write: generation unchanged" 5 $mergedA['editor'].generation
+
+    # --- scenario B: operator write mid-sweep (bumped generation). Disk wins entirely; memory
+    # discarded for that resource. This is THE bug fix.
+    $diskB0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; last_progress_at = '2026-08-25T00:00:00Z'; idle_evaluations = 0; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskB0
+    $memoryB = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGens = Get-LeaseGenerations -LeasesState $memoryB
+    # Sweep touches memory (last_progress_at bump), does NOT bump generation.
+    $memoryB['editor']['last_progress_at'] = '2026-08-26T05:00:00Z'
+    # Meanwhile operator (Grant-Lease.ps1) rewrote disk: new holder, generation bumped to 6.
+    $diskB1 = @{
+        editor = @{ holder = 'p/T-b'; generation = 6; last_progress_at = '2026-08-26T04:59:00Z'; idle_evaluations = 0; queue = @(); reclaimed_reason = 'human-grant: emergency' }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskB1
+    $mergedB = Merge-LeasesStateForWrite -Memory $memoryB -OriginalGenerations $originalGens -DiskPath $fixturePath
+    Check "operator-write: disk holder wins over sweep memory" 'p/T-b' $mergedB['editor'].holder
+    Check "operator-write: disk generation wins" 6 $mergedB['editor'].generation
+    Check "operator-write: disk reclaimed_reason preserved (msg-1900 audit split)" 'human-grant: emergency' $mergedB['editor'].reclaimed_reason
+
+    # --- scenario D: resource on disk that the sweep never read. Preserved from disk.
+    $diskD = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; queue = @() }
+        runner = @{ holder = 'p/T-x'; generation = 3; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskD
+    # Simulate a sweep that only knew about `editor` at start (runner added by operator later).
+    $memoryD = @{ editor = @{ holder = 'p/T-a'; generation = 5; queue = @() } }
+    $originalGensD = @{ editor = 5 }
+    $mergedD = Merge-LeasesStateForWrite -Memory $memoryD -OriginalGenerations $originalGensD -DiskPath $fixturePath
+    Check "disk-only resource: preserved" 'p/T-x' $mergedD['runner'].holder
+    Check "disk-only resource: generation preserved" 3 $mergedD['runner'].generation
+
+    # --- scenario F: operator DELETION mid-sweep (msg-2103 blocker). The schema treats an
+    # absent key as "no holder, empty queue" — an operator that empties both may legitimately
+    # remove the key entirely. The merger must NOT resurrect it from stale memory. The bug the
+    # earlier `$current.ContainsKey($resource) -and $diskGen -ne $priorGen` condition hid was
+    # exactly this: no key on disk meant the mismatch check was skipped and memory silently
+    # won, reversing the operator's -Clear. Fix: mismatch alone decides; deletion produces
+    # diskGen=-1 vs a live priorGen, which is a mismatch, and the key correctly stays absent.
+    $diskF0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; last_progress_at = '2026-08-25T00:00:00Z'; idle_evaluations = 0; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskF0
+    $memoryF = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensF = Get-LeaseGenerations -LeasesState $memoryF
+    # Sweep touches memory (probe clock bump).
+    $memoryF['editor']['last_progress_at'] = '2026-08-26T05:00:00Z'
+    # Operator ran Grant-Lease.ps1 -Clear, emptied the queue, and removed the key entirely.
+    Save-FixtureLeases -Path $fixturePath -State @{}
+    $mergedF = Merge-LeasesStateForWrite -Memory $memoryF -OriginalGenerations $originalGensF -DiskPath $fixturePath
+    Check "operator-deletion: resurrected key must be ABSENT (schema: absent = free)" $false $mergedF.ContainsKey('editor')
+    Check "operator-deletion: merged state has no other resurrected keys either"      0      $mergedF.Keys.Count
+
+    # --- scenario F': deletion + concurrent memory-added new resource. The deletion is honoured
+    # (editor stays absent) AND a truly-new-in-memory key (runner) writes through. This proves
+    # the "new-in-memory" case (priorGen=-1, diskGen=-1) is not accidentally routed through the
+    # deletion branch.
+    $diskFp0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskFp0
+    $memoryFp = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensFp = Get-LeaseGenerations -LeasesState $memoryFp
+    # Sweep this tick: acquired the fresh 'runner' resource for the first time.
+    $memoryFp['runner'] = @{ holder = 'p/T-x'; generation = 1; queue = @() }
+    # Operator deleted 'editor' mid-sweep.
+    Save-FixtureLeases -Path $fixturePath -State @{}
+    $mergedFp = Merge-LeasesStateForWrite -Memory $memoryFp -OriginalGenerations $originalGensFp -DiskPath $fixturePath
+    Check "deletion + new-in-memory: deleted key stays absent" $false $mergedFp.ContainsKey('editor')
+    Check "deletion + new-in-memory: fresh key writes through" 'p/T-x' $mergedFp['runner'].holder
+    Check "deletion + new-in-memory: fresh key generation preserved" 1 $mergedFp['runner'].generation
+
+    # --- scenario H: SWEEP-side deletion (msg-2131 blocker). The mirror of scenario F. The
+    # schema commits: "ABSENT resource key = no holder, empty queue. Do NOT create empty stub
+    # entries." When the sweep frees a lease and drains its queue, the caller REMOVES the key
+    # from its in-memory map. Without a second pass in the merger, that deletion is invisible
+    # (Memory.Keys no longer contains it, and $out was seeded from disk which still has it) —
+    # so the flush silently resurrects the old lease from stale disk state.
+    $diskH0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; last_progress_at = '2026-08-25T00:00:00Z'; idle_evaluations = 0; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskH0
+    $memoryH = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensH = Get-LeaseGenerations -LeasesState $memoryH
+    # Sweep freed the lease (TTL expiry, no waiter to promote) and dropped the stub, per schema.
+    $memoryH.Remove('editor') | Out-Null
+    # Disk unchanged (no external write).
+    $mergedH = Merge-LeasesStateForWrite -Memory $memoryH -OriginalGenerations $originalGensH -DiskPath $fixturePath
+    Check "sweep-deletion (uncontested): key must be ABSENT from merged" $false $mergedH.ContainsKey('editor')
+    Check "sweep-deletion (uncontested): merged has no other stray keys"  0 $mergedH.Keys.Count
+
+    # --- scenario H': sweep-side deletion COLLIDES with concurrent external write. External
+    # write wins on the same generation tie-break as the mutation path — the sweep's deletion
+    # is dropped in favour of the operator's Tier-C decision.
+    $diskHp0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskHp0
+    $memoryHp = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensHp = Get-LeaseGenerations -LeasesState $memoryHp
+    # Sweep decided to free 'editor' and dropped the stub.
+    $memoryHp.Remove('editor') | Out-Null
+    # Meanwhile operator ran Grant-Lease.ps1 -To p/T-c and bumped disk to gen 6.
+    $diskHp1 = @{
+        editor = @{ holder = 'p/T-c'; generation = 6; queue = @(); reclaimed_reason = 'human-grant: urgent' }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskHp1
+    $mergedHp = Merge-LeasesStateForWrite -Memory $memoryHp -OriginalGenerations $originalGensHp -DiskPath $fixturePath
+    Check "sweep-deletion vs operator-write: operator wins" 'p/T-c' $mergedHp['editor'].holder
+    Check "sweep-deletion vs operator-write: operator generation wins" 6 $mergedHp['editor'].generation
+
+    # --- scenario H'': sweep-side deletion AND external deletion of the same key. Both parties
+    # agree; the key must stay absent. Also confirms that .Remove() on an absent $out entry is
+    # harmless (no throw).
+    $diskHpp0 = @{
+        editor = @{ holder = 'p/T-a'; generation = 5; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskHpp0
+    $memoryHpp = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensHpp = Get-LeaseGenerations -LeasesState $memoryHpp
+    $memoryHpp.Remove('editor') | Out-Null      # sweep also freed
+    Save-FixtureLeases -Path $fixturePath -State @{}  # operator also cleared
+    $threwHpp = $false
+    $mergedHpp = $null
+    try {
+        $mergedHpp = Merge-LeasesStateForWrite -Memory $memoryHpp -OriginalGenerations $originalGensHpp -DiskPath $fixturePath
+    }
+    catch { $threwHpp = $true }
+    CheckFalse "sweep+external deletion agreement: does NOT throw" $threwHpp
+    if (-not $threwHpp) {
+        Check "sweep+external deletion agreement: key absent" $false $mergedHpp.ContainsKey('editor')
+    }
+
+    # --- scenario E: Get-LeaseGenerations edge cases ---
+    $gens = Get-LeaseGenerations -LeasesState @{}
+    Check "Get-LeaseGenerations: empty map -> empty" 0 $gens.Keys.Count
+    $gens = Get-LeaseGenerations -LeasesState @{ editor = @{ generation = 7 }; runner = @{ } }
+    Check "Get-LeaseGenerations: editor gen extracted" 7 $gens['editor']
+    Check "Get-LeaseGenerations: missing generation -> 0" 0 $gens['runner']
+
+    # --- scenario G: corrupt generation values (msg-2114 blocker). The Get-JsonState header
+    # commits to "a corrupt state file falls back to empty rather than aborting the flush — the
+    # sweep must not fail closed for a JSON syntax hiccup". ConvertFrom-Json accepts values that
+    # are structurally valid JSON but semantically wrong for the schema — an operator hand-edit
+    # can leave `"generation": ""` or `"generation": "pending"`. A hard `[int]` cast raises a
+    # RuntimeException, which bubbles out of Merge-LeasesStateForWrite and aborts the flush.
+    # Fix: -as [int] returns $null instead of throwing, and the fallback of 0 lets the merger
+    # continue.
+    $corruptCases = @(
+        @{ label = "empty string"; value = '' }
+        @{ label = "non-numeric string"; value = 'pending' }
+        @{ label = "hashtable"; value = @{ nested = 'bad' } }
+        @{ label = "array"; value = @(1, 2) }
+    )
+    foreach ($case in $corruptCases) {
+        $gensC = $null
+        $threw = $false
+        try {
+            $gensC = Get-LeaseGenerations -LeasesState @{ editor = @{ generation = $case.value } }
+        }
+        catch { $threw = $true }
+        CheckFalse "Get-LeaseGenerations: corrupt generation ($($case.label)) does NOT throw" $threw
+        if (-not $threw) {
+            Check "Get-LeaseGenerations: corrupt generation ($($case.label)) falls back to 0" 0 $gensC['editor']
+        }
+    }
+
+    # And the end-to-end path: corrupt disk value must not abort the flush.
+    $diskG = @{
+        editor = @{ holder = 'p/T-a'; generation = 'pending'; queue = @() }
+    }
+    Save-FixtureLeases -Path $fixturePath -State $diskG
+    $memoryG = ConvertTo-LeasesStateHashtable (Get-JsonState -Path $fixturePath)
+    $originalGensG = Get-LeaseGenerations -LeasesState $memoryG
+    $memoryG['editor']['last_progress_at'] = '2026-08-27T00:00:00Z'
+    $mergedG = $null
+    $threwG = $false
+    try {
+        $mergedG = Merge-LeasesStateForWrite -Memory $memoryG -OriginalGenerations $originalGensG -DiskPath $fixturePath
+    }
+    catch { $threwG = $true }
+    CheckFalse "Merge-LeasesStateForWrite: corrupt disk generation does NOT abort flush" $threwG
+}
+finally {
+    Remove-Item -LiteralPath $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+
+# --- 4. Get-LeaseSummaryLines — digest render (msg-1185 §3-1 + msg-1900 audit split) ------------
+Write-Host "Get-LeaseSummaryLines — digest render for the daily-digest lease section"
+
+$format = { param($ts) "{0:0}min" -f $ts.TotalMinutes }
+$digestNow = [datetime]::Parse('2026-08-27T00:00:00Z').ToUniversalTime()
+
+# Empty state — the digest still speaks (silent-day-is-the-point, msg-814 §5). The wrapper
+# writes non-ASCII into that line, so we assert the SHAPE (exactly one line, indented) rather
+# than the literal bytes — the shape is what the daily-digest layout depends on, and it lets
+# this file stay ASCII across Windows console codepages.
+$lines = @(Get-LeaseSummaryLines -LeasesState @{} -Now $digestNow -FormatDuration $format)
+Check "empty state produces exactly one summary line" 1 $lines.Count
+Check "empty state line is indented (digest layout)"  $true ($lines[0].StartsWith('  '))
+
+# One free lease + one held-and-queued.
+$state = @{
+    editor = @{
+        holder = 'p/T-b'
+        acquired_at = '2026-08-26T23:00:00Z'
+        pinned = $false
+        expiring = $false
+        reclaim_required = $true
+        reclaimed_from = 'p/T-a'
+        reclaimed_reason = 'human-clear: PIE crashed'
+        queue = @(@{ key = 'p/T-c'; waiting_since = '2026-08-26T23:30:00Z' })
+    }
+    runner = @{
+        holder = ''
+        queue = @()
+    }
+}
+$lines = Get-LeaseSummaryLines -LeasesState $state -Now $digestNow -FormatDuration $format
+$joined = ($lines -join "`n")
+
+Check "held lease renders holder + age (60min)"        $true ($joined -match 'editor: p/T-b .*60min')
+Check "reclaim-required flag surfaces"                 $true ($joined -match '\[reclaim-required\]')
+Check "queue line lists waiter key"                    $true ($joined -match 'queue: p/T-c')
+Check "reclaimed line uses reclaimed_reason (msg-1900)" $true ($joined -match 'reclaimed: p/T-a .* p/T-b \(reason=human-clear: PIE crashed\)')
+Check "free lease renders (free)"                      $true ($joined -match 'runner: \(free\)')
+
+# msg-1900 audit split: when reclaimed_reason is present, it is preferred over revoked_reason
+# (which is transient Phase-1 intent and may have been overwritten).
+$state2 = @{
+    editor = @{
+        holder = 'p/T-b'
+        reclaimed_from = 'p/T-a'
+        reclaimed_reason = 'human-clear: crash'
+        revoked_reason = 'idle'
+        queue = @()
+    }
+}
+$lines = Get-LeaseSummaryLines -LeasesState $state2 -Now $digestNow -FormatDuration $format
+Check "reclaimed_reason preferred over revoked_reason" $true (($lines -join "`n") -match 'reason=human-clear: crash')
+
+# msg-2114 blocker follow-on: bool coercion must not fall for the [bool]"false" -> $true trap.
+# PowerShell's [bool] cast on strings is length-based ("false" is non-empty ∴ truthy), so an
+# operator hand-editing leases.json with `"pinned": "false"` used to render `[pinned]` on the
+# digest. The safe helper accepts only real booleans and recognised string values; anything
+# else falls back to $false so a corrupt cell stays blank rather than lying.
+$stateBool = @{
+    editor = @{ holder = 'p/T-b'; pinned = 'false'; expiring = 'false'; reclaim_required = 'false'; queue = @() }
+    runner = @{ holder = 'p/T-c'; pinned = 'true';  expiring = 'true';  reclaim_required = 'true';  queue = @() }
+    third  = @{ holder = 'p/T-d'; pinned = 'garbage'; expiring = 'nope'; reclaim_required = ''; queue = @() }
+}
+$linesBool = Get-LeaseSummaryLines -LeasesState $stateBool -Now $digestNow -FormatDuration $format
+$joinedBool = ($linesBool -join "`n")
+# The string literals `"true"` / `"false"` in JSON round-trip to strings, not booleans. Ensure
+# per-lease flag rendering respects the strings' meaning, not their length.
+CheckFalse "string 'false' does NOT render as [pinned] (was the [bool] cast bug)" ($joinedBool -match 'editor:.*\[.*pinned.*\]')
+CheckFalse "string 'false' does NOT render as [expiring]"                          ($joinedBool -match 'editor:.*\[.*expiring.*\]')
+CheckFalse "string 'false' does NOT render as [reclaim-required]"                  ($joinedBool -match 'editor:.*\[.*reclaim-required.*\]')
+CheckTrue  "string 'true'  DOES render as [pinned]"           ($joinedBool -match 'runner:.*\[.*pinned.*\]')
+CheckTrue  "string 'true'  DOES render as [expiring]"         ($joinedBool -match 'runner:.*\[.*expiring.*\]')
+CheckTrue  "string 'true'  DOES render as [reclaim-required]" ($joinedBool -match 'runner:.*\[.*reclaim-required.*\]')
+# Un-parseable strings fall back to $false (the safe default: silent-blank is better than a
+# false-positive flag that misleads the operator).
+CheckFalse "string 'garbage' falls back to false (pinned stays off)"   ($joinedBool -match 'third:.*\[.*pinned.*\]')
+CheckFalse "string 'nope' falls back to false (expiring stays off)"    ($joinedBool -match 'third:.*\[.*expiring.*\]')
+CheckFalse "empty string falls back to false (reclaim-required off)"   ($joinedBool -match 'third:.*\[.*reclaim-required.*\]')
+# Real booleans still round-trip correctly (regression pin for the happy path).
+$stateBoolReal = @{ editor = @{ holder = 'p/T-b'; pinned = $true; queue = @() } }
+$linesBoolReal = Get-LeaseSummaryLines -LeasesState $stateBoolReal -Now $digestNow -FormatDuration $format
+CheckTrue "real $true still renders as [pinned]" (($linesBoolReal -join "`n") -match '\[pinned\]')
+
+# msg-2124 blocker: a null lease record (operator hand-edit leaves `"editor": null` as a
+# placeholder) round-trips through ConvertTo-LeaseHashtable as $null. The old code called
+# $lease.ContainsKey('holder') on $null, raising a RuntimeException and aborting the whole
+# digest render. Fix: null-guard skips the entry entirely — corrupt cell renders nothing
+# rather than taking the whole digest down (same failure class as the R2 [int]/[bool] casts,
+# same failure-open response).
+$stateNullLease = @{
+    editor = $null
+    runner = @{ holder = 'p/T-x'; queue = @() }
+}
+$threwNull = $false
+$linesNull = $null
+try {
+    $linesNull = Get-LeaseSummaryLines -LeasesState $stateNullLease -Now $digestNow -FormatDuration $format
+}
+catch { $threwNull = $true }
+CheckFalse "null lease record does NOT abort Get-LeaseSummaryLines" $threwNull
+if (-not $threwNull) {
+    $joinedNull = ($linesNull -join "`n")
+    # The healthy lease still renders — one bad entry must not silence the rest of the digest.
+    CheckTrue  "sibling healthy lease still renders around a null entry" ($joinedNull -match 'runner: p/T-x')
+    # The null-valued key is skipped rather than rendered as garbage.
+    CheckFalse "null-valued key does not appear in the digest at all"     ($joinedNull -match 'editor:')
+}
+
+# Also the fully-null state (someone truncated the file to `{}` with only null values, or
+# passed an all-null map from a corrupt disk read): the empty-state fallback should still run
+# because no live entries render.
+$stateAllNull = @{ editor = $null; runner = $null }
+$threwAllNull = $false
+$linesAllNull = $null
+try {
+    $linesAllNull = @(Get-LeaseSummaryLines -LeasesState $stateAllNull -Now $digestNow -FormatDuration $format)
+}
+catch { $threwAllNull = $true }
+CheckFalse "all-null state does NOT abort Get-LeaseSummaryLines" $threwAllNull
+if (-not $threwAllNull) {
+    # Two null entries produce zero live lines. The current design does NOT fall back to the
+    # "(該当なし)" empty-state line in this case — that line is only rendered when the map is
+    # keyless. Two null entries render as two skipped iterations, so the return is empty.
+    # Test that assertion literally: no lines are emitted rather than crashing.
+    Check "all-null state produces no rendered lines" 0 $linesAllNull.Count
+}
+
+Write-Host ""
+if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }
+Write-Host "lease gate: all checks passed"
+exit 0
