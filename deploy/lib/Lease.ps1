@@ -381,24 +381,45 @@ function New-LeaseRecord {
 function Add-LeaseWaiter {
     <#
     .SYNOPSIS
-        Append a waiter to a lease's queue in FIFO order, or refresh its `waiting_since` if it
-        is already there (an idempotent enqueue — a waiter that shows up every 5 min must not
-        multiply in the queue).
+        Append a waiter to a lease's queue in append order. Idempotent: a waiter that is
+        already in the queue is left untouched — the record is not duplicated, and its
+        original `waiting_since` is PRESERVED (NOT refreshed).
+
+    .DESCRIPTION
+        Why waiting_since is preserved on a re-enqueue (this IS the contract):
+          The sweep tick runs every ~5 min. If a candidate declares `requires: editor` and the
+          lease is held, the wrapper calls Register-LeaseWaiter → Add-LeaseWaiter on it every
+          tick until the lease frees. Refreshing `waiting_since` on those repeat calls would
+          reset the wait clock every 5 min, so the waiter that arrived first would never age
+          past a fresher one — grant-time FIFO (msg-1183 D-3) collapses to "the last one to
+          re-attempt wins". The idempotent-with-preserve behaviour is what makes "waiting_since
+          FIFO" a real ordering rather than sweep-tick noise. The regression test §8
+          ("first enqueue's waiting_since is NOT refreshed") pins this literally.
 
         NOTE: msg-1183 D-3 says grant is waiting-time FIFO, sweep order is the tiebreak. The
         tiebreak resolves at grant time (Get-NextLeaseWaiter, PR 3), not here — this function
-        only preserves append order.
+        only preserves append order and the `waiting_since` of pre-existing entries.
 
     .PARAMETER Lease
-        The per-resource lease hashtable. Mutated in place; created with an empty holder if
-        called on a resource whose lease record does not exist yet — the caller decides whether
-        that is legal (see Register-LeaseWaiter which wraps the check).
+        The per-resource lease hashtable. Mutated in place; a missing `queue` key is
+        initialised to an empty array. Callers that need the resource RECORD to exist first
+        (rather than just the queue slot) should use Register-LeaseWaiter, which wraps this
+        function.
 
     .PARAMETER WaiterKey
         The waiter's "$project/$thread_id" key.
 
     .PARAMETER Now
-        The tick's UTC timestamp; used only when this is a fresh enqueue.
+        The tick's UTC timestamp; used ONLY when this is a fresh enqueue. Ignored on the
+        idempotent-repeat branch — see the discussion above.
+
+    .NOTES
+        Fixed in PR-gate R1 (msg-2181): the prior SYNOPSIS falsely claimed "or refresh its
+        `waiting_since` if it is already there", which directly contradicted the code and
+        the test. Docstrings on this file are normative (they carry design invariants that
+        callers rely on), so a wrong SYNOPSIS is a real contract break — a later refactor
+        reading the docstring as truth could add a `waiting_since` refresh and silently
+        break FIFO. The naysayer was right to block on this.
     #>
     param(
         [hashtable]$Lease,
@@ -409,7 +430,10 @@ function Add-LeaseWaiter {
     $existing = @($Lease['queue'])
     foreach ($w in $existing) {
         $k = if ($w -is [hashtable]) { $w['key'] } else { $w.key }
-        if ($k -eq $WaiterKey) { return }   # already queued; do not refresh `waiting_since`
+        # Already queued: return WITHOUT touching `waiting_since` — this is the FIFO-preserving
+        # branch the SYNOPSIS above documents. Refreshing would reset the wait clock every ~5-min
+        # sweep tick and collapse FIFO to "last re-attempt wins" (msg-2181 blocker fix).
+        if ($k -eq $WaiterKey) { return }
     }
     $Lease['queue'] = @($existing + @(@{
         key           = $WaiterKey

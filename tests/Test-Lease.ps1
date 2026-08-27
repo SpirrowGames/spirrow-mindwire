@@ -637,6 +637,39 @@ $lease = @{}
 Remove-LeaseWaiter -Lease $lease -WaiterKey 'p/T-w1'
 CheckFalse "Remove on missing queue: no-op (does not add a queue key)" ($lease.ContainsKey('queue'))
 
+# msg-2181 pin: the FIFO consequence of the docstring's "waiting_since preserved on re-enqueue"
+# promise. Enqueue A first, B second; then re-enqueue A many times with progressively fresher
+# timestamps (this simulates the ~5-min sweep tick spamming Register-LeaseWaiter → Add-LeaseWaiter
+# on a candidate that keeps declaring `requires: editor` while the lease is held). If a future
+# refactor "helpfully" refreshed `waiting_since` on the idempotent branch, A's timestamp would
+# leapfrog B's every 5 min and grant-time FIFO (msg-1183 D-3) would collapse to "last re-attempt
+# wins" — the exact failure mode the naysayer's R1 objection warned about. Pin the invariant here
+# where Get-NextLeaseWaiter is not yet available (that lands in PR 3): sort keys on waiting_since
+# and confirm A remains ordered before B despite the re-enqueue storm.
+$lease = @{ queue = @() }
+$tsA = $now2
+$tsB = $now2.AddSeconds(30)
+Add-LeaseWaiter -Lease $lease -WaiterKey 'p/T-A' -Now $tsA
+Add-LeaseWaiter -Lease $lease -WaiterKey 'p/T-B' -Now $tsB
+# Spam re-enqueues of A with fresher and fresher timestamps.
+foreach ($minsLater in 5, 10, 15, 20, 25) {
+    Add-LeaseWaiter -Lease $lease -WaiterKey 'p/T-A' -Now $tsA.AddMinutes($minsLater)
+}
+Check "FIFO pin: 2 waiters after re-enqueue storm (no duplicates)" 2 $lease['queue'].Count
+$aSince = (@($lease['queue'] | Where-Object { $_.key -eq 'p/T-A' })[0]).waiting_since
+$bSince = (@($lease['queue'] | Where-Object { $_.key -eq 'p/T-B' })[0]).waiting_since
+Check "FIFO pin: A's waiting_since is EXACTLY the original (msg-2181 blocker)" `
+    $tsA.ToUniversalTime().ToString("o") $aSince
+Check "FIFO pin: B's waiting_since is EXACTLY the original" `
+    $tsB.ToUniversalTime().ToString("o") $bSince
+# The load-bearing relation: A remains ordered before B on waiting_since. If the docstring
+# claim were false (refresh on re-enqueue), A's timestamp would be $tsA.AddMinutes(25) — LATER
+# than B's — and this check would fail. This is the check that catches a hypothetical
+# regression the naysayer's R1 flagged.
+$aInstant = [datetime]::Parse($aSince).ToUniversalTime()
+$bInstant = [datetime]::Parse($bSince).ToUniversalTime()
+CheckTrue "FIFO pin: A remains ordered BEFORE B on waiting_since (collapse-guard)" ($aInstant -lt $bInstant)
+
 # --- 9. Test-LeaseAvailableFor + Invoke-LeaseAcquire ---------------------------------------------
 Write-Host ""
 Write-Host "Test-LeaseAvailableFor + Invoke-LeaseAcquire — the candidate-loop gate"
