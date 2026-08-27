@@ -86,7 +86,7 @@ _DEFAULT_MODEL = NAYSAYER_MODEL_TIER  # N-4: pinned in one place (naysayer.princ
 # Gemini 3.1 Pro (the current naysayer tier) is a reasoning model with a 1M+ token context: its
 # reasoning tokens count against the OUTPUT budget, so a real review of a large diff spends a big
 # slice on reasoning before emitting the critique + VERDICT line. The old 16000 ran out mid-review
-# on big PRs (finish_reason=length, which _resolve_verdict then forces to REQUEST_CHANGES — a false
+# on big PRs (finish_reason=length, which decide_verdict then forces to REQUEST_CHANGES — a false
 # RC); 32000 leaves room for reasoning plus a complete critique (connector-relay confirmed ~30k is
 # enough in practice).
 _DEFAULT_MAX_TOKENS = 32000
@@ -100,7 +100,7 @@ _DEFAULT_MAX_TOKENS = 32000
 _CLIENT_TIMEOUT_MARGIN_SECONDS = 60.0
 _DEFAULT_TIMEOUT_SECONDS = LEXORA_BACKEND_TIMEOUT_SECONDS + _CLIENT_TIMEOUT_MARGIN_SECONDS
 # The REVIEWABILITY gate, not a context-capacity limit: this is the largest RAW diff the naysayer
-# fully reviews and can therefore APPROVE. Beyond it the diff is truncated, and _resolve_verdict
+# fully reviews and can therefore APPROVE. Beyond it the diff is truncated, and decide_verdict
 # force-RCs a truncated review ("too big to review thoroughly in one shot — split the PR"). So the
 # cap defines "small enough to review rigorously in a single pass", NOT "small enough to fit the
 # model's context". The old 60_000 chars (~15-20k tokens) was below real PRs (e.g. #93 ~127k chars),
@@ -298,35 +298,28 @@ class PrReviewOutcome:
 def _parse_verdict(critique: str) -> ReviewEvent:
     """Extract the verdict; default-safe to REQUEST_CHANGES (never silent approve).
 
-    Takes the **last** standalone ``VERDICT:`` line so an APPROVE quoted *earlier* cannot override
-    the model's real verdict. Text injected via the reviewed diff is handled by the anchor rather
-    than by this rule — see ``_VERDICT_RE``, and note that last-wins on its own is no defence when
-    the quote comes after the verdict.
+    Kept as a 2-way projection over :func:`_parse_model_verdict` — the injection-safe
+    parse (last standalone ``VERDICT:`` line at column zero, see ``_VERDICT_RE``) lives
+    ONCE in ``_parse_model_verdict``; this function just collapses UNPARSEABLE and
+    REQUEST_CHANGES to the fail-closed :class:`ReviewEvent.REQUEST_CHANGES` the pre-
+    existing parser-primitive tests pin. That collapse is the whole reason the two
+    signatures exist: the notice path needs the three-way distinction; the ordinary
+    "did the model say APPROVE?" question is two-way.
+
+    ``_resolve_verdict`` used to sit next to this function as a truncation-aware wrapper.
+    It was removed by T-gate-silently-suppresses-approve-on-truncated-diff review round 2
+    (PR #186, pr-gate finding msg-1879): the gate/notice path now consumes
+    :func:`decide_verdict`, which unifies model verdict + gate verdict + suppression fact
+    in one call — keeping a second wrapper here duplicated the truncation rule in two
+    places and made ``_resolve_verdict``'s "thin wrapper" docstring false.
     """
-    matches = _VERDICT_RE.findall(critique)
-    if not matches:
-        return ReviewEvent.REQUEST_CHANGES
-    token = re.sub(r"[ _-]", "_", matches[-1].upper())
-    if token == "APPROVE":
+    mv = _parse_model_verdict(critique)
+    if mv is ModelVerdict.APPROVE:
         return ReviewEvent.APPROVE
-    # COMMENT / REQUEST_CHANGES / anything else → objection (gate stays closed).
+    # UNPARSEABLE / REQUEST_CHANGES → objection (gate stays closed). This mirrors the
+    # pre-refactor fail-safe collapse; the gate/notice path keeps the distinction on
+    # ``VerdictDecision.model_verdict`` (see :func:`decide_verdict`).
     return ReviewEvent.REQUEST_CHANGES
-
-
-def _resolve_verdict(critique: str, *, truncated: bool, finish_reason: str | None) -> ReviewEvent:
-    """Verdict, but never APPROVE on a partial review (truncated diff / length cap).
-
-    Preserved as a thin wrapper around :func:`decide_verdict` so external callers /
-    tests that pinned the "gate never APPROVEs a partial review" invariant on this
-    function continue to see the same behaviour. All new call sites should use
-    :func:`decide_verdict` directly — it returns the full :class:`VerdictDecision`
-    (model verdict + gate verdict + suppression fact) that the gate notice needs.
-    """
-    if truncated or finish_reason == "length":
-        # The model did not see (or could not finish reviewing) the whole diff — approving a
-        # partial review would be an unsafe gate. Force an objection.
-        return ReviewEvent.REQUEST_CHANGES
-    return _parse_verdict(critique)
 
 
 # ─── T-gate-silently-suppresses-approve-on-truncated-diff ────────────────────────────
@@ -410,10 +403,12 @@ class VerdictDecision:
 def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) -> VerdictDecision:
     """Compute the model verdict, gate verdict, and pack them with the DiffView.
 
-    The gate verdict here reproduces :func:`_resolve_verdict` exactly (test 9's oracle
-    equivalence pins this at 24 combinations of model / truncated / finish_reason) — the
-    goal of this change is to make the existing behaviour AUDIBLE, not to change it. See
-    msg-1874 §9 "参照実装をテスト内に置く".
+    The gate-verdict rule here — "force-RC on any partial review; otherwise mirror the
+    model verdict" — is the same rule the pre-change ``_resolve_verdict`` implemented,
+    now the SINGLE authoritative statement of it (test 9's oracle equivalence pins the
+    24 combinations of model / truncated / finish_reason). The goal of this change is
+    to make the existing behaviour AUDIBLE, not to change it. See msg-1874 §9 "参照
+    実装をテスト内に置く".
     """
     mv = _parse_model_verdict(critique)
     if view.truncated or finish_reason == "length":
@@ -901,9 +896,10 @@ class NaysayerPrReviewDriver:
         # Compute the FULL decision (model verdict + gate verdict + suppression fact) from
         # one call: this is the ONLY site the raw critique is parsed on the notice path, and
         # the same ``decision`` feeds both the ``verdict`` posted to GitHub and the notice
-        # prepended to the body — the two cannot drift. ``verdict`` remains equal to what
-        # ``_resolve_verdict(body, truncated=..., finish_reason=...)`` returned before this
-        # change (test_gate_verdict_matches_oracle pins the 24-case equivalence).
+        # prepended to the body — the two cannot drift. ``verdict`` matches the pre-change
+        # gate rule (force-RC on any partial review) at all 24 combinations of the input
+        # matrix — see ``_oracle_gate_verdict`` in tests/test_pr_review_driver.py, which
+        # re-states the rule as a 3-line reference and asserts equivalence.
         decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
         verdict = decision.gate_verdict
         # Prepend the gate notice BEFORE the ADR-pointer marker is appended: the notice sits

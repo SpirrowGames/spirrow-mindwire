@@ -13,8 +13,8 @@ scope-clarified fresh re-review limited to: "is the change ITSELF sound to land?
 Invariants preserved (naysayer discipline):
 - the diff is fetched RAW from GitHub and passed UNTOUCHED (no curation),
 - the verdict is the independent model's (Gemini ``naysayer`` tier), parsed with the SAME
-  injection-safe ``_resolve_verdict`` (last standalone VERDICT line; never APPROVE on a
-  truncated / length-capped / timed-out review),
+  injection-safe :func:`~spirrow_mindwire.naysayer.pr_review.decide_verdict` (last
+  standalone VERDICT line; never APPROVE on a truncated / length-capped / timed-out review),
 - the L1 CI-gate runs first (fail-closed),
 - the GitHub review is submitted as the SEPARATE ``spirrowgames-ops`` identity,
 - the caller does NOT edit the verdict — the scope is framing context, not a verdict hint.
@@ -48,10 +48,10 @@ from spirrow_mindwire.lexora.client import (
 from spirrow_mindwire.naysayer.pr_review import (
     _DEFAULT_MAX_TOKENS,
     _DEFAULT_TIMEOUT_SECONDS,
-    _MAX_DIFF_CHARS,
     _PR_REVIEW_SYSTEM_PROMPT,
     _ci_gate_response,
-    _resolve_verdict,
+    _make_diff_view,
+    decide_verdict,
 )
 from spirrow_mindwire.naysayer.principles import (
     NAYSAYER_MODEL_TIER,
@@ -64,9 +64,12 @@ if _reconfigure is not None:
     _reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
-def _build_messages(diff: str, pr_slug: str, scope: str) -> list[ChatMessage]:
-    if len(diff) > _MAX_DIFF_CHARS:
-        diff = diff[:_MAX_DIFF_CHARS] + "\n\n[diff truncated]"
+def _build_messages(text: str, pr_slug: str, scope: str) -> list[ChatMessage]:
+    """Build the scoped-review messages from a (possibly truncated) diff ``text``.
+
+    Truncation is done by the caller via :func:`_make_diff_view` so the pre-truncation
+    length is captured for the gate-notice path — this function only formats.
+    """
     system = f"{build_preamble()}\n\n{_PR_REVIEW_SYSTEM_PROMPT}"
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
@@ -74,7 +77,7 @@ def _build_messages(diff: str, pr_slug: str, scope: str) -> list[ChatMessage]:
         f"=== BINDING SCOPE FOR THIS REVIEW (set by the proposer; adjudicated) ===\n"
         f"{scope}\n"
         f"=== END SCOPE ===\n\n"
-        f"```diff\n{diff}\n```"
+        f"```diff\n{text}\n```"
     )
     return [
         ChatMessage(role="system", content=system),
@@ -108,15 +111,16 @@ async def main() -> None:
             return
 
         diff = await github.fetch_pr_diff(pr)
-        truncated = len(diff) > _MAX_DIFF_CHARS
+        view = _make_diff_view(diff)
         print(
-            f"[scoped-naysayer] CI green, diff={len(diff)} chars (truncated={truncated}); "
-            f"firing {NAYSAYER_MODEL_TIER} (Gemini, billed) with scope context ..."
+            f"[scoped-naysayer] CI green, diff={view.original_chars} chars "
+            f"(truncated={view.truncated}); firing {NAYSAYER_MODEL_TIER} "
+            f"(Gemini, billed) with scope context ..."
         )
         try:
             completion = await lexora.chat_completion(
                 model=NAYSAYER_MODEL_TIER,
-                messages=_build_messages(diff, pr.slug, scope),
+                messages=_build_messages(view.text, pr.slug, scope),
                 max_tokens=_DEFAULT_MAX_TOKENS,
             )
         except LexoraTimeoutError as exc:
@@ -131,9 +135,8 @@ async def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(4)
-        verdict = _resolve_verdict(
-            body, truncated=truncated, finish_reason=completion.finish_reason
-        )
+        decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
+        verdict = decision.gate_verdict
 
         print("\n===== GEMINI VERDICT (verbatim) =====")
         print(body)

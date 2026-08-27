@@ -48,7 +48,6 @@ from spirrow_mindwire.naysayer.pr_review import (
     PostCritique,
     _ci_gate_response,
     _parse_verdict,
-    _resolve_verdict,
     decide_verdict,
     render_gate_notice,
 )
@@ -900,18 +899,28 @@ def test_parse_verdict_missing_defaults_request_changes() -> None:
     assert _parse_verdict("no verdict line here") is ReviewEvent.REQUEST_CHANGES
 
 
-def test_resolve_verdict_truncated_forces_request_changes() -> None:
-    assert (
-        _resolve_verdict("VERDICT: APPROVE", truncated=True, finish_reason="stop")
-        is ReviewEvent.REQUEST_CHANGES
+def test_decide_verdict_truncated_forces_request_changes() -> None:
+    """A truncated diff force-RCs a model APPROVE (safety invariant, no notice-path plumbing)."""
+    view = DiffView(
+        text="",
+        original_chars=_MAX_DIFF_CHARS + 1,
+        limit=_MAX_DIFF_CHARS,
+        warn_threshold=_DIFF_WARN_THRESHOLD,
     )
+    decision = decide_verdict("VERDICT: APPROVE", view=view, finish_reason="stop")
+    assert decision.gate_verdict is ReviewEvent.REQUEST_CHANGES
 
 
-def test_resolve_verdict_length_forces_request_changes() -> None:
-    assert (
-        _resolve_verdict("VERDICT: APPROVE", truncated=False, finish_reason="length")
-        is ReviewEvent.REQUEST_CHANGES
+def test_decide_verdict_length_forces_request_changes() -> None:
+    """``finish_reason == "length"`` force-RCs a model APPROVE (output cap; not truncation)."""
+    view = DiffView(
+        text="",
+        original_chars=1,
+        limit=_MAX_DIFF_CHARS,
+        warn_threshold=_DIFF_WARN_THRESHOLD,
     )
+    decision = decide_verdict("VERDICT: APPROVE", view=view, finish_reason="length")
+    assert decision.gate_verdict is ReviewEvent.REQUEST_CHANGES
 
 
 @pytest.mark.anyio
