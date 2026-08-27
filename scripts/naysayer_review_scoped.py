@@ -17,7 +17,14 @@ Invariants preserved (naysayer discipline):
   standalone VERDICT line; never APPROVE on a truncated / length-capped / timed-out review),
 - the L1 CI-gate runs first (fail-closed),
 - the GitHub review is submitted as the SEPARATE ``spirrowgames-ops`` identity,
-- the caller does NOT edit the verdict — the scope is framing context, not a verdict hint.
+- the caller does NOT edit the verdict — the scope is framing context, not a verdict hint,
+- when the gate suppresses the model verdict (truncated / length-capped review), the
+  posted body is prepended with the gate-notice block via the SAME
+  :func:`~spirrow_mindwire.naysayer.pr_review.prepend_gate_notice` the production driver
+  uses — so the CLI output and the GitHub review body show why the state disagrees with
+  the model's stated verdict, instead of leaving the reader with a raw ``VERDICT: APPROVE``
+  under a ``CHANGES_REQUESTED`` state (round-4 PR-gate finding on PR #186 msg-1887, the
+  silent-suppression bug this whole thread was written to end).
 
 Run::
 
@@ -52,6 +59,7 @@ from spirrow_mindwire.naysayer.pr_review import (
     _ci_gate_response,
     _make_diff_view,
     decide_verdict,
+    prepend_gate_notice,
 )
 from spirrow_mindwire.naysayer.principles import (
     NAYSAYER_MODEL_TIER,
@@ -137,12 +145,30 @@ async def main() -> None:
             sys.exit(4)
         decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
         verdict = decision.gate_verdict
+        # Prepend the gate notice via the SAME function the production driver uses. When the
+        # gate silently overrides an APPROVE (truncation / length cap), the posted body carries
+        # the notice explaining the mismatch; when nothing was suppressed and the diff was fully
+        # reviewed, ``prepend_gate_notice`` returns ``body`` unchanged (invariant 6 in
+        # tests/test_pr_review_driver.py). This closes the round-4 finding: without this step,
+        # the CLI stdout and the GitHub review body both showed ``VERDICT: APPROVE`` while the
+        # script quietly submitted REQUEST_CHANGES — the exact symptom this thread was born to
+        # fix (msg-1871 §3).
+        posted_body = prepend_gate_notice(body, decision)
 
+        # The "verbatim" section preserves the model's original words (Bohr msg-1872 §8:
+        # "証拠を消して見た目を整えるのは沈黙の別形態である"). The "POSTED TO GITHUB" section
+        # shows the reader the exact bytes that will hit both channels, so a mismatch between
+        # what the model said and what the gate posts is visible without leaving the terminal.
         print("\n===== GEMINI VERDICT (verbatim) =====")
         print(body)
         print("===== END GEMINI VERDICT =====")
+        if posted_body != body:
+            print("\n===== POSTED TO GITHUB (gate notice prepended) =====")
+            print(posted_body)
+            print("===== END POSTED =====")
         print(
-            f"\n[scoped-naysayer] parsed verdict={verdict.value}  "
+            f"\n[scoped-naysayer] model verdict={decision.model_verdict.value}  "
+            f"gate verdict={verdict.value}  suppressed={decision.suppressed}  "
             f"finish_reason={completion.finish_reason!r}  "
             f"model={completion.model or NAYSAYER_MODEL_TIER}  "
             f"principles_version={principles_version()}  head={ci.head_sha}"
@@ -152,11 +178,11 @@ async def main() -> None:
             print("[scoped-naysayer] --no-submit: skipping GitHub review submission")
             return
         try:
-            await github.submit_review(pr, event=verdict, body=body)
+            await github.submit_review(pr, event=verdict, body=posted_body)
             print(f"[scoped-naysayer] GitHub review submitted as spirrowgames-ops: {verdict.value}")
         except GitHubHTTPError as exc:
             if exc.status_code == 422 and "own pull request" in str(exc).lower():
-                await github.submit_review(pr, event=ReviewEvent.COMMENT, body=body)
+                await github.submit_review(pr, event=ReviewEvent.COMMENT, body=posted_body)
                 print("[scoped-naysayer] 422 own-PR → submitted as COMMENT (verdict in body)")
             else:
                 raise
