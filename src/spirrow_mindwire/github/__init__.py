@@ -8,9 +8,16 @@ from .client import (
     GitHubHTTPError,
     GitHubReviewClient,
     PrRef,
+    Retryability,
     ReviewEvent,
+    Scope,
+    classify_http_error,
     github_token,
     parse_pr_ref,
+)
+from .reviews import (
+    LandedState,
+    landed,
 )
 
 __all__ = [
@@ -18,8 +25,13 @@ __all__ = [
     "GitHubError",
     "GitHubHTTPError",
     "GitHubReviewClient",
+    "LandedState",
     "PrRef",
+    "Retryability",
     "ReviewEvent",
+    "Scope",
+    "classify_http_error",
     "github_token",
+    "landed",
     "parse_pr_ref",
 ]

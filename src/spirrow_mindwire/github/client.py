@@ -281,11 +281,29 @@ class GitHubHTTPError(GitHubError):
 
     Fail-loud (ADR-07 §2.6): a failed fetch/submit surfaces here rather than
     degrading silently, so the naysayer adapter can fail-closed halt.
+
+    ``retry_after`` and ``rate_limited`` carry the header-derived hints the
+    classifier (:func:`classify_http_error`, T-gate-review-submit-failure-handling
+    D-1) needs to tell secondary-rate-limit 403s apart from permission 403s: a
+    403 with ``Retry-After`` or exhausted ``x-ratelimit-remaining`` is
+    retryable, a plain 403 is not. Both default to their neutral values
+    (``None`` / ``False``) so the many call sites that construct this without
+    header context stay unchanged; the writer wraps that populate them are
+    added at the submit path.
     """
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+        rate_limited: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after = retry_after
+        self.rate_limited = rate_limited
 
 
 class GitHubReviewClient(Protocol):
@@ -300,6 +318,8 @@ class GitHubReviewClient(Protocol):
     async def submit_review(
         self, pr: PrRef, *, event: ReviewEvent, body: str
     ) -> dict[str, Any]: ...
+
+    async def probe_identity(self) -> int: ...
 
     async def aclose(self) -> None: ...
 
@@ -552,7 +572,13 @@ class GitHubClient:
         return out
 
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
-        """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event."""
+        """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event.
+
+        On non-2xx the raised :class:`GitHubHTTPError` carries the header-derived
+        ``retry_after`` and ``rate_limited`` fields (D-1) so the caller's classifier
+        can tell a secondary-rate-limit 403 apart from a permission 403 without
+        re-parsing the response.
+        """
         path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
         try:
             resp = await self._client.post(path, json={"event": event.value, "body": body})
@@ -562,12 +588,36 @@ class GitHubClient:
             raise GitHubHTTPError(
                 f"POST {path} (review) returned {resp.status_code}: {_error_detail(resp)}",
                 status_code=resp.status_code,
+                retry_after=_retry_after_seconds(resp),
+                rate_limited=_is_rate_limited(resp),
             )
         try:
             body_json = resp.json()
         except ValueError as exc:
             raise GitHubHTTPError(f"POST {path} (review): malformed JSON: {exc}") from exc
         return body_json if isinstance(body_json, dict) else {"raw": body_json}
+
+    async def probe_identity(self) -> int:
+        """``GET /user`` — one call to answer "does this credential still speak to GitHub".
+
+        Returns the HTTP status code (200 on success, 401 on a dead token, 403 on
+        a suspended one, etc.). Never raises: a transport-level failure returns 0
+        so the caller can distinguish "GitHub said no" (a real answer, one of the
+        4xx codes) from "we could not ask" (an unknown, code 0). D-1's scope-
+        determination path treats status 200 as "credential lives → the terminal
+        we just saw was TARGET-scoped", 401 as
+        :class:`Scope.ENVIRONMENT_CREDENTIAL`, and 0 as :class:`Scope.UNKNOWN`
+        (fail-safe: never quarantine on an unknown scope).
+
+        This is the ONE additional network call the design commits to, and it
+        fires only when a submit has already returned a TERMINAL classification.
+        Normal-path cost is zero.
+        """
+        try:
+            resp = await self._client.get("/user")
+        except httpx.RequestError:
+            return 0
+        return int(resp.status_code)
 
 
 def _error_detail(resp: httpx.Response) -> str:
@@ -581,6 +631,106 @@ def _error_detail(resp: httpx.Response) -> str:
     return str(body)[:500]
 
 
+def _retry_after_seconds(resp: httpx.Response) -> float | None:
+    """Parse ``Retry-After`` (delta-seconds; the HTTP-date form is not emitted by GitHub).
+
+    Returns ``None`` when absent or unparseable. GitHub's rate-limit response uses
+    the delta-seconds form for the secondary rate limit; the HTTP-date form is
+    permitted by RFC 9110 but not observed here, and treating an unparseable value
+    as "no hint" is the same fail-safe direction as no header at all.
+    """
+    raw = resp.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return float(raw.strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+def _is_rate_limited(resp: httpx.Response) -> bool:
+    """Return ``True`` when the response indicates a GitHub rate-limit exhaustion.
+
+    Two signals count as "rate limited":
+
+    - ``x-ratelimit-remaining: 0`` (primary rate limit exhausted, common on 403)
+    - a truthy ``Retry-After`` header (secondary rate limit / throttle)
+
+    Either alone is enough. This is the fact D-1 uses to tell a throttled 403
+    (retryable) from a permission-denied 403 (terminal), so it must NOT be
+    driven off the status code alone.
+    """
+    remaining = resp.headers.get("x-ratelimit-remaining")
+    if remaining is not None and remaining.strip() == "0":
+        return True
+    return _retry_after_seconds(resp) is not None
+
+
+class Retryability(StrEnum):
+    """Whether a :class:`GitHubHTTPError` will plausibly succeed on a later attempt.
+
+    ``RETRYABLE`` = transient (network, 5xx, 429, throttled 403). ``TERMINAL`` =
+    the same request will produce the same outcome without external intervention
+    (permission-denied 401/403, 404, 422). This is the ONE axis D-1's static
+    table decides; the ``scope`` axis (environment vs target) is decided later
+    by a probe when — and only when — the outcome is TERMINAL.
+    """
+
+    RETRYABLE = "retryable"
+    TERMINAL = "terminal"
+
+
+def classify_http_error(exc: GitHubHTTPError) -> Retryability:
+    """Map a :class:`GitHubHTTPError` to :class:`Retryability`.
+
+    The one axis D-1's static table decides. Rules:
+
+    - ``status_code is None`` (transport-layer :class:`httpx.RequestError`) → RETRYABLE
+    - 429 → RETRYABLE (rate limit; ``Retry-After`` respected upstream)
+    - 5xx → RETRYABLE
+    - 403 with ``rate_limited`` set → RETRYABLE (secondary rate limit)
+    - anything else (401 / 403 without rate-limit hint / 404 / 422 / 4xx) → TERMINAL
+
+    Deliberately narrow: RETRYABLE means "the same call may succeed on a later
+    try"; it does NOT decide whether to actually retry (that is D-6's budget) or
+    whether the failure is thread-scoped (that is D-1's ``scope`` probe). A
+    caller that sees TERMINAL should stop the retry loop and hand to the scope
+    probe / D-7 abort path.
+    """
+    status = exc.status_code
+    if status is None:
+        return Retryability.RETRYABLE
+    if status == 429:
+        return Retryability.RETRYABLE
+    if 500 <= status < 600:
+        return Retryability.RETRYABLE
+    if status == 403 and exc.rate_limited:
+        return Retryability.RETRYABLE
+    return Retryability.TERMINAL
+
+
+class Scope(StrEnum):
+    """Whether a terminal HTTP failure belongs to the environment or the target.
+
+    ``ENVIRONMENT`` = the fault does not belong to *this* thread — the token is
+    dead, or the repo is unreachable, and the same fault will greet every other
+    thread the credential touches. Quarantining a thread for this is a false
+    attribution (D-4). ``TARGET`` = the fault belongs to this specific PR (422
+    same-identity, 404 for a deleted PR, permission gap on this repo only).
+
+    ``UNKNOWN`` is the fail-safe: reserved for when the scope probe itself could
+    not run (network / another 5xx). Callers must NOT collapse UNKNOWN into
+    either concrete value — quarantining an UNKNOWN would silently expand
+    ENVIRONMENT into a thread-fault (T22 false attribution), and treating
+    UNKNOWN as ENVIRONMENT would silently suppress a genuine TARGET fault.
+    """
+
+    ENVIRONMENT_CREDENTIAL = "environment/credential"
+    ENVIRONMENT_PERMISSION = "environment/permission"
+    TARGET = "target"
+    UNKNOWN = "unknown"
+
+
 __all__ = [
     "CiState",
     "CiStatus",
@@ -589,8 +739,11 @@ __all__ = [
     "GitHubHTTPError",
     "GitHubReviewClient",
     "PrRef",
+    "Retryability",
     "ReviewEvent",
     "ReviewInfo",
+    "Scope",
+    "classify_http_error",
     "github_token",
     "naysayer_github_token",
     "parse_pr_ref",

@@ -994,6 +994,9 @@ class _FakeGitHubCi:
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    async def probe_identity(self) -> int:
+        raise NotImplementedError
+
     async def aclose(self) -> None:
         return None
 

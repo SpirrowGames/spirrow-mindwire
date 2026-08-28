@@ -268,6 +268,9 @@ class _FakeGitHub:
     async def submit_review(self, pr: Any, *, event: Any, body: str) -> Any:
         raise AssertionError("not called")
 
+    async def probe_identity(self) -> int:
+        raise AssertionError("not called")
+
     async def aclose(self) -> None:
         self.closed = True
 

@@ -17,9 +17,11 @@ from spirrow_mindwire.github.client import (
     GitHubClient,
     GitHubHTTPError,
     PrRef,
+    Retryability,
     ReviewEvent,
     _derive_ci_state,
     _required_workflows_from_env,
+    classify_http_error,
     github_token,
     naysayer_github_token,
     parse_pr_ref,
@@ -537,3 +539,157 @@ async def test_both_paths_unusable_stays_unknown_and_keeps_rest_head_sha() -> No
     assert st.state is CiState.UNKNOWN
     # REST reached the PR (so it knows the head) even though it could not read runs.
     assert st.head_sha == "abc"
+
+
+# ---------- D-1: error classification (T-gate-review-submit-failure-handling) ----------
+
+
+def test_classify_transport_error_is_retryable() -> None:
+    # ``status_code is None`` = the httpx.RequestError branch (connection reset,
+    # dns failure, TLS handshake, ...). All of these can succeed on a retry.
+    exc = GitHubHTTPError("POST /… (review): ConnectError()", status_code=None)
+    assert classify_http_error(exc) is Retryability.RETRYABLE
+
+
+def test_classify_5xx_is_retryable() -> None:
+    for status in (500, 502, 503, 504):
+        exc = GitHubHTTPError("POST /… (review) returned 5xx", status_code=status)
+        assert classify_http_error(exc) is Retryability.RETRYABLE
+
+
+def test_classify_429_is_retryable() -> None:
+    exc = GitHubHTTPError("POST /… (review) returned 429", status_code=429, retry_after=30.0)
+    assert classify_http_error(exc) is Retryability.RETRYABLE
+
+
+def test_classify_403_with_rate_limit_hint_is_retryable() -> None:
+    # Secondary rate limit: 403 that CAN succeed later. The hint distinguishes it
+    # from a permission 403 (below), which will NOT succeed on retry.
+    exc = GitHubHTTPError("POST /… returned 403", status_code=403, rate_limited=True)
+    assert classify_http_error(exc) is Retryability.RETRYABLE
+
+
+def test_classify_403_without_rate_limit_hint_is_terminal() -> None:
+    # Plain 403 = permission denied. Retrying will keep saying 403; the caller
+    # must escalate to the scope probe (D-1) instead of burning attempts.
+    exc = GitHubHTTPError("POST /… returned 403", status_code=403, rate_limited=False)
+    assert classify_http_error(exc) is Retryability.TERMINAL
+
+
+def test_classify_401_is_terminal() -> None:
+    exc = GitHubHTTPError("POST /… returned 401: Bad credentials", status_code=401)
+    assert classify_http_error(exc) is Retryability.TERMINAL
+
+
+def test_classify_404_is_terminal() -> None:
+    exc = GitHubHTTPError("POST /… returned 404", status_code=404)
+    assert classify_http_error(exc) is Retryability.TERMINAL
+
+
+def test_classify_422_is_terminal() -> None:
+    # Same-identity 422 is handled by a COMMENT fallback at the driver seam; the
+    # classifier itself just needs to say "not retryable". Any deeper meaning
+    # (fallback vs escalate) belongs to the caller, not the static table.
+    exc = GitHubHTTPError("POST /… returned 422", status_code=422)
+    assert classify_http_error(exc) is Retryability.TERMINAL
+
+
+def test_github_http_error_defaults_are_neutral() -> None:
+    # A caller that constructs GitHubHTTPError without header context (the many
+    # existing raise-sites for reads / GraphQL) must not accidentally look like
+    # a rate-limited request. Defaults preserve the pre-change semantics.
+    exc = GitHubHTTPError("something", status_code=500)
+    assert exc.retry_after is None
+    assert exc.rate_limited is False
+
+
+# ---------- D-1 retry-hint header parsing on submit_review ----------
+
+
+def _submit_handler(*, status: int, headers: dict[str, str] | None = None) -> Any:
+    body = b'{"message": "boom"}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path.endswith("/reviews")
+        return httpx.Response(status, content=body, headers=headers or {})
+
+    return handler
+
+
+@pytest.mark.anyio
+async def test_submit_review_populates_retry_after_from_header() -> None:
+    async with _client(_submit_handler(status=429, headers={"Retry-After": "30"})) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x")
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.retry_after == 30.0
+    assert excinfo.value.rate_limited is True
+
+
+@pytest.mark.anyio
+async def test_submit_review_populates_rate_limited_from_remaining_zero() -> None:
+    # A 403 with `x-ratelimit-remaining: 0` is the primary rate limit shape.
+    # Retry-After may or may not be present; `rate_limited` must still be True.
+    async with _client(
+        _submit_handler(status=403, headers={"x-ratelimit-remaining": "0"})
+    ) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x")
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.rate_limited is True
+    assert classify_http_error(excinfo.value) is Retryability.RETRYABLE
+
+
+@pytest.mark.anyio
+async def test_submit_review_permission_403_is_not_rate_limited() -> None:
+    async with _client(_submit_handler(status=403)) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x")
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.rate_limited is False
+    assert classify_http_error(excinfo.value) is Retryability.TERMINAL
+
+
+@pytest.mark.anyio
+async def test_submit_review_401_carries_no_retry_hint() -> None:
+    async with _client(_submit_handler(status=401)) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x")
+    assert excinfo.value.status_code == 401
+    assert excinfo.value.retry_after is None
+    assert excinfo.value.rate_limited is False
+
+
+# ---------- probe_identity() (scope probe payload) ----------
+
+
+def _probe_handler(*, status: int) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/user"
+        return httpx.Response(status, content=b'{"login": "x"}')
+
+    return handler
+
+
+@pytest.mark.anyio
+async def test_probe_identity_returns_200_when_credential_lives() -> None:
+    async with _client(_probe_handler(status=200)) as client:
+        assert await client.probe_identity() == 200
+
+
+@pytest.mark.anyio
+async def test_probe_identity_returns_401_when_credential_dead() -> None:
+    async with _client(_probe_handler(status=401)) as client:
+        assert await client.probe_identity() == 401
+
+
+@pytest.mark.anyio
+async def test_probe_identity_returns_zero_on_transport_failure() -> None:
+    # 0 is the "we could not ask" sentinel — distinct from any HTTP status.
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("dns")
+
+    async with _client(handler) as client:
+        assert await client.probe_identity() == 0

@@ -61,6 +61,7 @@ from ..github.client import (
     ReviewInfo,
     naysayer_github_token,
 )
+from ..github.reviews import LandedState, landed
 from ..lexora.client import (
     LEXORA_BACKEND_TIMEOUT_SECONDS,
     ChatMessage,
@@ -1077,11 +1078,27 @@ class NaysayerPrReviewDriver:
 
         Returns ``None`` (→ proceed to a full review) when the head SHA is unknown, there is no
         prior verdict review, or the latest verdict review was against a different commit.
+
+        The head-match check is delegated to :func:`~spirrow_mindwire.github.reviews.landed`
+        (T-gate-review-submit-failure-handling DESIGN v3 §2 — ONE definition, three sites); the
+        prior-verdict pick that selects WHICH verdict to reuse still runs here because the shape
+        of that decision (reuse APPROVE vs reuse REQUEST_CHANGES) is domain policy, not the
+        shared "is anything landed" predicate.
         """
         if ci.head_sha is None:
             return None
+        head_landed = landed(
+            prior,
+            head_sha=ci.head_sha,
+            login=self._review_login,
+            states=_VERDICT_STATES,
+        )
+        if head_landed is not LandedState.LANDED:
+            return None
         latest = self._latest_verdict_review(prior)
         if latest is None or latest.commit_id != ci.head_sha:
+            # Guarded by the LANDED check above, but keeps the local invariant explicit —
+            # a landed review at this head is what selects the verdict text to reuse.
             return None
         verdict = ReviewEvent.APPROVE if latest.state == "APPROVED" else ReviewEvent.REQUEST_CHANGES
         body = (

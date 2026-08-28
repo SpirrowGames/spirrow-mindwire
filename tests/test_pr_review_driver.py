@@ -126,6 +126,9 @@ class _FakeGitHub:
         self.submitted.append((pr, event, body))
         return {"id": 1, "state": event.value}
 
+    async def probe_identity(self) -> int:
+        return 200
+
     async def aclose(self) -> None:
         return None
 
