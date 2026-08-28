@@ -2187,8 +2187,23 @@ try {
     # alert thread is open by the time the first candidate on a fresh project actually gets picked up.
     # Fail-open by design (Invoke-GateBootstrapTick swallows every kind of local failure and returns
     # $null): a broken alert-opener must not stop the main sweep, which is what actually runs conductors.
+    #
+    # Filter out candidates without a usable `repo_dir` BEFORE they reach the tick. This is
+    # defence-in-depth: `Get-SweepCandidates` already `throw`s on `-not $c.$f` for the required
+    # fields (which rejects `$null` and `""`), but PowerShell's truthy check does not catch
+    # whitespace-only strings like `" "`. If such a value ever slipped through, the empty/whitespace
+    # `-RepoDir` would reach `gate_bootstrap_tick.py`, `argparse` would parse it into `Path("")`, and
+    # `Path("") / ".mindwire-gate"` would resolve against the CURRENT working directory — which is
+    # `$repoRoot` (this MindWire host repo) because `Invoke-GateBootstrapTick` wraps the call in
+    # `Push-Location $repoRoot`. That would falsely report `DECLARED` for every affected candidate
+    # and fire spurious `close_alert` MCP traffic on every tick. `IsNullOrWhiteSpace` closes both
+    # the whitespace hole here and, redundantly, the null/empty one that `Get-SweepCandidates`
+    # already covered. The Python side of the same defence lives in `inspect_gate`, which returns
+    # `UNUSABLE` on an empty/whitespace `repo_dir` — see the T-new-project-gate-bootstrap PR-gate
+    # review of PR #192 for the full attack path.
     $gateBootstrapPairs = @{}
     foreach ($c in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($c.repo_dir)) { continue }
         $pairKey = "$($c.project)::$($c.repo_dir)"
         if (-not $gateBootstrapPairs.ContainsKey($pairKey)) {
             $gateBootstrapPairs[$pairKey] = @{ project = $c.project; repo_dir = $c.repo_dir }
