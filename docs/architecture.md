@@ -455,6 +455,8 @@ Stage 3 は **対象リポジトリのルートに `.mindwire-*` を置き、 Mi
 
 2 本目 (デプロイ / ブランチ方針の宣言) は `T-per-project-deploy-rule` で設計中。 **背景**: 「どのブランチへ PR を開いてよいか」はプロジェクトごとに異なる (voxelworld = リリーストレイン / MindWire 自身 = main から継続デプロイ) ∴ MindWire の repo 非依存な allowlist に書くべきものではない。
 
+**新規プロジェクトの bootstrap** (`T-new-project-gate-bootstrap`): `.mindwire-gate` を宣言していないプロジェクトは、 human が気づいて手で足す運用ではなく、 **sweeper が述語で自動発報する**。 実装は `src/spirrow_mindwire/gate_bootstrap.py` (predicate + open/close) + `scripts/gate_bootstrap_tick.py` (per-project CLI) + `deploy/run-conductor-scheduled.ps1` の per-tick invocation。 開いたスレッド `T-gate-bootstrap-<project>` は **system alert** であって設計提案ではない (msg-1967 N-5-B): sweeper が発報し、 述語が偽に転じた次の tick で sweeper 自身が取り下げる。 中身 (`.mindwire-gate` 本体) は implementer が repo を読んで書き、 PR-gate + human merge を通す。
+
 ### 8bis.6 §1 の設計原則との関係
 
 原則 8 (外部システム連携はコアから完全分離) は **Stage 3 では成立していない**。 chatroom は magickit の MCP であり、 `magickit/` は Connector 層ではなくコアに同居する。 これは Phase 0 の原則を破ったというより、 **Stage 3 が原則 8 の想定しなかった軸 (AI 同士の多者ループ) に伸びた**結果である。 原則 8 を Stage 3 に遡及適用するか否かは未決 (§9 参照)。
