@@ -1817,8 +1817,21 @@ function Get-SweepCandidates {
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
     $out = @()
     foreach ($c in @($raw.candidates)) {
+        # Reject `$null`, `""`, AND whitespace-only strings uniformly and loudly. PowerShell's `-not`
+        # operator handles the first two but treats `" "` as truthy, which would silently pass a bad
+        # value downstream. `IsNullOrWhiteSpace` closes that hole here — at the single validation
+        # point — so every consumer of a candidate can trust that all three required fields are
+        # non-blank. This is the load-bearing check for the CWD-probing attack path the T-new-
+        # project-gate-bootstrap PR-gate identified on PR #192: an empty/whitespace `repo_dir` that
+        # reached `gate_bootstrap_tick.py` would resolve `Path("") / ".mindwire-gate"` against the
+        # sweep's CWD (this MindWire host repo) and falsely report `DECLARED`. The Python side of
+        # the same defence lives in `inspect_gate`, which returns `UNUSABLE` for a non-absolute
+        # `repo_dir` regardless of caller — but this upstream check is what makes the failure mode
+        # uniform: a broken sweep config halts the sweep, it does not silently skip candidates.
         foreach ($f in 'project', 'thread_id', 'repo_dir') {
-            if (-not $c.$f) { throw "sweep config entry missing '$f': $($c | ConvertTo-Json -Compress)" }
+            if ([string]::IsNullOrWhiteSpace([string]$c.$f)) {
+                throw "sweep config entry missing or blank '$f': $($c | ConvertTo-Json -Compress)"
+            }
         }
         $out += [pscustomobject]@{
             project   = $c.project
@@ -2188,22 +2201,15 @@ try {
     # Fail-open by design (Invoke-GateBootstrapTick swallows every kind of local failure and returns
     # $null): a broken alert-opener must not stop the main sweep, which is what actually runs conductors.
     #
-    # Filter out candidates without a usable `repo_dir` BEFORE they reach the tick. This is
-    # defence-in-depth: `Get-SweepCandidates` already `throw`s on `-not $c.$f` for the required
-    # fields (which rejects `$null` and `""`), but PowerShell's truthy check does not catch
-    # whitespace-only strings like `" "`. If such a value ever slipped through, the empty/whitespace
-    # `-RepoDir` would reach `gate_bootstrap_tick.py`, `argparse` would parse it into `Path("")`, and
-    # `Path("") / ".mindwire-gate"` would resolve against the CURRENT working directory — which is
-    # `$repoRoot` (this MindWire host repo) because `Invoke-GateBootstrapTick` wraps the call in
-    # `Push-Location $repoRoot`. That would falsely report `DECLARED` for every affected candidate
-    # and fire spurious `close_alert` MCP traffic on every tick. `IsNullOrWhiteSpace` closes both
-    # the whitespace hole here and, redundantly, the null/empty one that `Get-SweepCandidates`
-    # already covered. The Python side of the same defence lives in `inspect_gate`, which returns
-    # `UNUSABLE` on an empty/whitespace `repo_dir` — see the T-new-project-gate-bootstrap PR-gate
-    # review of PR #192 for the full attack path.
+    # `repo_dir` is guaranteed non-blank here because `Get-SweepCandidates` validates every required
+    # field with `IsNullOrWhiteSpace` and `throw`s loudly on the first offender. That is the single
+    # validation point for sweep-config well-formedness; do NOT add a silent `continue` here to
+    # tolerate what should have been rejected upstream — a broken config must halt the sweep, not
+    # cause candidates to vanish without a log line. The Python side (`inspect_gate`) redundantly
+    # returns `UNUSABLE` on a non-absolute `repo_dir`, which is the actual last line of defence
+    # against the CWD-probing attack path the PR-gate identified on PR #192.
     $gateBootstrapPairs = @{}
     foreach ($c in $candidates) {
-        if ([string]::IsNullOrWhiteSpace($c.repo_dir)) { continue }
         $pairKey = "$($c.project)::$($c.repo_dir)"
         if (-not $gateBootstrapPairs.ContainsKey($pairKey)) {
             $gateBootstrapPairs[$pairKey] = @{ project = $c.project; repo_dir = $c.repo_dir }
