@@ -2077,6 +2077,58 @@ function Invoke-RepoSync {
     }
 }
 
+# --- gate-bootstrap tick -------------------------------------------------------------------------
+# For each distinct (project, repo_dir) in the sweep list, delegate to
+# scripts/gate_bootstrap_tick.py — the LLM-free predicate that opens
+# `T-gate-bootstrap-<project>` idempotently when `.mindwire-gate` is not declared,
+# and takes it back down (also idempotently) once it is.
+#
+# The full design lives in the chatroom thread `T-new-project-gate-bootstrap`
+# (msg-1962 request; msg-1963/1965/1967 design; msg-1964/1966/1968 naysayer);
+# see the module docstring on `src/spirrow_mindwire/gate_bootstrap.py` for the
+# summary.
+#
+# Fail-open on the SWEEP. A broken gate-bootstrap tick MUST NOT stop the main sweep — the
+# alert-opener is a nice-to-have; the sweep itself is load-bearing. Non-zero exits from the
+# probe are logged and the loop moves on. This matches Invoke-ControlProbe's fail-open contract
+# for the same reason: the main sweep is what actually runs conductors.
+function Invoke-GateBootstrapTick {
+    param([string]$Project, [string]$RepoDir)
+
+    $probe = Join-Path $repoRoot "scripts\gate_bootstrap_tick.py"
+    if (-not (Test-Path -LiteralPath $probe)) {
+        Write-Log "gate-bootstrap probe not found at $probe — skipping (alert-opener is best-effort)"
+        return $null
+    }
+    try {
+        Push-Location $repoRoot
+        try {
+            $raw = & uv run python $probe --project $Project --repo-dir $RepoDir 2>&1
+            $code = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+
+        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        if (-not $json) {
+            Write-Log "gate-bootstrap [$Project]: no JSON on stdout (exit=$code) — failing open"
+            return $null
+        }
+        $obj = $json | ConvertFrom-Json
+        if ($code -ne 0) {
+            # Non-zero is a magickit failure (open / close). Log the reason; the next tick retries.
+            Write-Log "gate-bootstrap [$Project]: status=$($obj.status) action=$($obj.action) error=$($obj.error)"
+        }
+        else {
+            Write-Log "gate-bootstrap [$Project]: status=$($obj.status) action=$($obj.action) reason=$($obj.reason)"
+        }
+        return $obj
+    }
+    catch {
+        Write-Log "gate-bootstrap [$Project] failed ($($_.Exception.Message)) — sweep continues (fail-open)"
+        return $null
+    }
+}
+
 # --- run ---------------------------------------------------------------------------------------
 $exitCode = 0
 try {
@@ -2130,6 +2182,21 @@ try {
 
     $candidates = Get-SweepCandidates -Path $sweepConfigPath
     Write-Log "sweep list ($($candidates.Count) candidates from $sweepConfigPath): $(($candidates | ForEach-Object { $_.key }) -join ', ')"
+
+    # Gate-bootstrap tick, once per distinct (project, repo_dir). Runs BEFORE the main sweep so the
+    # alert thread is open by the time the first candidate on a fresh project actually gets picked up.
+    # Fail-open by design (Invoke-GateBootstrapTick swallows every kind of local failure and returns
+    # $null): a broken alert-opener must not stop the main sweep, which is what actually runs conductors.
+    $gateBootstrapPairs = @{}
+    foreach ($c in $candidates) {
+        $pairKey = "$($c.project)::$($c.repo_dir)"
+        if (-not $gateBootstrapPairs.ContainsKey($pairKey)) {
+            $gateBootstrapPairs[$pairKey] = @{ project = $c.project; repo_dir = $c.repo_dir }
+        }
+    }
+    foreach ($pair in $gateBootstrapPairs.Values) {
+        [void](Invoke-GateBootstrapTick -Project $pair.project -RepoDir $pair.repo_dir)
+    }
 
     # One probe per distinct project, not per candidate — the probe returns every thread of a project
     # in a single call, so N candidates in one project still cost one call.
