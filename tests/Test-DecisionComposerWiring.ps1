@@ -44,6 +44,11 @@ function Confirm-LogWorthKeeping { }
 $stopReasonLib = Join-Path $repoRoot 'deploy/lib/StopReason.ps1'
 if (-not (Test-Path -LiteralPath $stopReasonLib)) { throw "StopReason lib not found: $stopReasonLib" }
 . $stopReasonLib
+# Get-JsonState now lives in deploy/lib/Lease.ps1 (msg-2172 reader collapse). Same discipline as
+# StopReason.ps1: pure functions, no top-level side effects, safe to dot-source into the test.
+$leaseLib = Join-Path $repoRoot 'deploy/lib/Lease.ps1'
+if (-not (Test-Path -LiteralPath $leaseLib)) { throw "Lease lib not found: $leaseLib" }
+. $leaseLib
 
 # Bring in the exact functions the sweep uses. Dot-sourcing would launch the sweep; parsing the
 # AST and invoking just the function definitions keeps this test hermetic.
@@ -54,7 +59,8 @@ $needed = @(
     'Get-DecisionEnvelope',
     'Format-DecisionMessage',
     'New-ComposerInputJson',
-    'Get-JsonState',
+    # Get-JsonState was previously listed here; the reader collapse (msg-2172) moved it into
+    # deploy/lib/Lease.ps1, dot-sourced above. Lifting from the wrapper AST would now fail.
     'Save-JsonState',
     # S4 (D-32): the digest section renderer + a stub-able Invoke-ParkedHumansProbe wrapper so
     # the digest-side tests below never shell out to `uv run python scripts/parked_humans.py`.

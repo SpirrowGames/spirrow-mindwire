@@ -88,17 +88,226 @@
 # preserve `reclaimed_from` (Invoke-LeaseGrantFromEmpty, operator empty-state re-grant) also
 # preserve `reclaimed_reason` — the two travel together.
 #
-# --- what THIS PR ships (T-exclusive-resource-lease-queue PR 1 / 4) -----------------------------
-# THIS FILE, IN THIS PR, IS INERT. The lease block is not called from the sweep wrapper yet — the
-# wiring lands in a later PR. What ships here is the persistence contract only:
-#   - the record shape (New-LeaseRecord),
-#   - the on-disk read (Get-JsonState) and the digest render (Get-LeaseSummaryLines),
-#   - the merge rule that lets an operator's mid-sweep write beat the sweep's in-memory hold
-#     (Merge-LeasesStateForWrite, with per-resource `generation` as an optimistic-concurrency
-#     token — the msg-1802 fix rebased onto a fresh, split PR).
-# The state-machine functions the header comments reference (Invoke-LeaseAcquire,
-# Invoke-LeasePromotion, Grant-Lease.ps1, etc.) are named here so the fields' contracts read as
-# a coherent whole; they land in the next PRs and activate the mechanism in PR 4.
+# --- what THIS PR ships (T-exclusive-resource-lease-queue PR 2 / 4) -----------------------------
+# THIS FILE'S state machine IS STILL INERT — the sweep wrapper does not yet consult
+# Test-LeaseAvailableFor before launching a candidate. That wiring lands in PR 4. What ships in
+# PR 2 on top of PR 1's persistence contract is:
+#   - the holder-classification predicate (Get-LeaseHolderClassification, msg-1187 §4(ii): the
+#     ONE predicate the whole design's correctness turns on) and its state-machine update
+#     (Update-LeaseFromClassification), plus the dual expiry predicate (Test-LeaseExpiring);
+#   - the candidate-loop gate (Test-LeaseAvailableFor + Invoke-LeaseAcquire), including the
+#     "self-hold is available" branch and the "no accidental steal" throw that keep acquire
+#     from having to know the queue state;
+#   - the enqueue primitives (Add-LeaseWaiter / Remove-LeaseWaiter / Register-LeaseWaiter):
+#     idempotent append with waiting_since preservation, and the create-record-then-append
+#     for a never-leased resource.
+# Promotion / grant-from-empty / scrub still live in PR 3, and the wrapper AST wiring + the
+# probe activation land in PR 4.
+#
+# THE READER COLLAPSE (msg-2151 measurement + msg-2172 Tier-C, 2026-08-28). Get-JsonState is now
+# the CANONICAL state-file reader for the whole runner. The wrapper's previous inline
+# Get-JsonState is gone; the wrapper dot-sources this file and calls THIS function for every
+# state-file read (notify.json, pending-decisions.json, quarantine.json, evaluated.json,
+# digest.json, head_skip.json, and leases.json when PR 4 wires it). The collapse eliminates the
+# duplicate-reader-drift risk called out in R2/R3 PR-gate reviews AND lets the shape guard added
+# here protect every state file the sweep reads. Rationale in Bohr msg-1916 §3: the header
+# previously claimed "behaviourally identical to the wrapper's inline reader"; keeping two
+# readers just to make that claim true was bureaucratic negligence — collapsing to one makes the
+# claim moot.
+#
+# THE SHAPE GUARD (msg-2151 measurement, Bohr msg-1916 §1 / §2, Einstein msg-1915 endorse). Root
+# JSON arrays (`[{"editor":"x"},{"foo":"y"}]`) and root scalars (`"just a string"`) round-trip
+# through the old reader as OBJECTS with array/string metadata keys (Count, IsFixedSize, Length,
+# LongLength, Rank, ...). Those keys landed on disk on the next flush and were then read back on
+# the NEXT tick as "resources" — a one-way corruption vector one operator typo could open
+# permanently. The 2026-08-28 measurement confirmed permanent landing for multi-element arrays,
+# scalar arrays, and root strings (cases B/D/E of `.git/mindwire-scratch/array-shape-probe-v2.ps1`,
+# archived alongside this PR). The guard now returns empty for any non-PSCustomObject root, so
+# no metadata leaks into the memory map. The `.bad-<utc>` backup (Save-CorruptedStateBackup) is
+# the paired side effect: the flush caller renames the offending file before overwriting it,
+# preserving the operator's forensic trail rather than converting a typo into a silent deletion.
+# The Read-JsonStateWithShape helper exposes the shape verdict to that caller without a second
+# file read; Get-JsonState is a thin wrapper that discards the verdict for backward-compat.
+# --- probe classifications ----------------------------------------------------------------------
+# `progress` — holder made progress this tick, OR is currently running (held), OR its verdict is
+#              LAUNCH (about to run) — reset `idle_evaluations`, update `last_progress_at`.
+# `parked`   — holder definitely will not run this tick regardless of any lease action: verdict is
+#              SKIP (Stage 1 stop-token: NEXT: none / NEXT: human), OR holder is quarantined, OR
+#              holder was removed from sweep.json entirely. Increment `idle_evaluations`.
+# `neutral`  — holder is DEFERred (backoff, will launch soon) — do NOT increment, do NOT reset.
+#              This is Bohr msg-1183 §2-c's "wrapper-side starvation" case for the current
+#              wrapper: the decision to skip is time-based, not lease-based, and the holder will
+#              reach LAUNCH on its own without any lease intervention. Treating DEFER as parked
+#              would revive the split-brain Einstein msg-1182 raised.
+#
+# The parked / progress / neutral trichotomy is exhaustive under the current wrapper's decide
+# verdicts + held/quarantined filters. If a fourth disposition is ever added, THIS FUNCTION
+# is the one place that must be updated — leaving a case unhandled here reproduces the exact
+# "silent parked" failure mode the design exists to end.
+
+function Get-LeaseHolderClassification {
+    <#
+    .SYNOPSIS
+        Classify the current holder's activity this tick as progress / parked / neutral.
+
+    .PARAMETER HolderKey
+        The "$project/$thread_id" state key of the current lease holder.
+
+    .PARAMETER IsHeld
+        $true when the holder's project is currently under an acknowledged operator hold. Held
+        pauses the TTL (msg-1183 D-6'c: a legitimately long PIE turn is head-unchanged but held,
+        and must not be reclaimed for wall-clock starvation).
+
+    .PARAMETER IsQuarantined
+        $true when the holder is in quarantine.json. A quarantined holder is parked (definitely
+        will not run) — matches SKIP in the "counts toward idle" rule.
+
+    .PARAMETER IsOnSweep
+        $true when the holder is still present in the current sweep.json list. A holder that has
+        been removed from sweep.json entirely is parked (will never be evaluated again).
+
+    .PARAMETER Verdict
+        The head-skip decide verdict object for the holder this tick, or $null when there is no
+        verdict (holder is held or quarantined or absent). Only the `.decision` field is read here.
+
+    .OUTPUTS
+        A string: 'progress', 'parked', or 'neutral'.
+    #>
+    param(
+        [string]$HolderKey,
+        [bool]$IsHeld,
+        [bool]$IsQuarantined,
+        [bool]$IsOnSweep,
+        $Verdict
+    )
+
+    # Held keeps the lease alive without moving anything — msg-1183 D-6'c. A held holder is not
+    # parked (the operator has deliberately paused it) and not progressing (nothing is running),
+    # but for lease TTL purposes it must not be reclaimed. Treated as progress: the TTL clock is
+    # reset every tick the holder is held.
+    if ($IsHeld) { return 'progress' }
+
+    # Removed from the sweep list entirely: the holder cannot make progress and will never be
+    # evaluated again. Same category as quarantined.
+    if (-not $IsOnSweep) { return 'parked' }
+
+    # Quarantined holder: wrapper-side stopped, cannot progress until Clear-Quarantine.
+    if ($IsQuarantined) { return 'parked' }
+
+    # No verdict for a candidate that is on the sweep, not held, not quarantined is a wiring bug
+    # in the caller (every eligible candidate gets a decide verdict per the wrapper's W-2c
+    # contract). Return neutral to keep the lease alive rather than incorrectly reclaiming.
+    if ($null -eq $Verdict) { return 'neutral' }
+
+    $decision = "$($Verdict.decision)".ToLowerInvariant()
+    if ($decision -eq 'skip')   { return 'parked' }
+    if ($decision -eq 'launch') { return 'progress' }
+    if ($decision -eq 'defer')  { return 'neutral' }
+
+    # Unknown decision — a contract violation is the caller's concern, not the lease's.
+    return 'neutral'
+}
+
+function Update-LeaseFromClassification {
+    <#
+    .SYNOPSIS
+        Mutate a lease record in place based on a probe classification. Pure w.r.t. leases.json;
+        does not touch evaluated.json (msg-1185 §2-b: two clocks, never crossed).
+
+    .PARAMETER Lease
+        The per-resource lease hashtable (see schema notes at file head). Mutated in place.
+
+    .PARAMETER Classification
+        One of 'progress' / 'parked' / 'neutral' from Get-LeaseHolderClassification.
+
+    .PARAMETER Now
+        The tick's UTC timestamp. Same value used for every mutation this tick.
+    #>
+    param(
+        [hashtable]$Lease,
+        [string]$Classification,
+        [datetime]$Now
+    )
+    if ($null -eq $Lease) { return }
+    $nowIso = $Now.ToUniversalTime().ToString("o")
+    switch ($Classification) {
+        'progress' {
+            $Lease['idle_evaluations'] = 0
+            $Lease['last_progress_at'] = $nowIso
+            # Cancel any pending Phase-1 revocation intent. A holder that resumed progress this
+            # tick pre-empts the mark-expiring done on a previous tick — the two-phase revoke
+            # contract (msg-1183 D-6'd) is that Phase 1 gives the holder ONE tick to come back;
+            # if we do not clear `expiring` here, that flag becomes permanent the moment it is
+            # first set, and a later idle sequence would find Test-LeaseExpiring true AND
+            # `expiring=true`, so Invoke-LeasePromotion jumps straight to Phase 2 on the first
+            # eligible tick — the exact 1-tick pre-emption window the design guarantees is
+            # bypassed. Reported as msg-1757 blocker #1 (2026-08-26 PR-gate). `revoked_at` and
+            # `revoked_reason` are stale audit at that point (they described the CANCELLED
+            # revocation, not the new one Phase 1 will record next time), so clear them too.
+            # `reclaimed_*` are PERMANENT audit (msg-1900 split) and MUST NOT be cleared here —
+            # progress is a transient state-machine transition, not an ownership change.
+            $Lease['expiring']       = $false
+            $Lease['revoked_at']     = $null
+            $Lease['revoked_reason'] = $null
+        }
+        'parked' {
+            $prior = 0
+            if ($Lease.ContainsKey('idle_evaluations') -and $null -ne $Lease['idle_evaluations']) {
+                $prior = [int]$Lease['idle_evaluations']
+            }
+            $Lease['idle_evaluations'] = $prior + 1
+        }
+        # 'neutral' — deliberately do nothing. Backoff isn't parking.
+    }
+}
+
+function Test-LeaseExpiring {
+    <#
+    .SYNOPSIS
+        Whether a lease has reached the expiry predicate (msg-1183 D-6' dual predicate:
+        `idle_evaluations >= LeaseIdleEvaluations` AND wall-clock since `last_progress_at` >
+        `LeaseIdleTtl`). A pinned lease NEVER expires (msg-1183 D-7).
+
+    .PARAMETER Lease
+        The per-resource lease hashtable.
+
+    .PARAMETER IdleEvaluationsMin
+        Threshold count of consecutive parked probes.
+
+    .PARAMETER IdleTtl
+        Wall-clock TimeSpan since last_progress_at that must be exceeded.
+
+    .PARAMETER Now
+        The tick's UTC timestamp.
+
+    .OUTPUTS
+        $true when the lease is eligible for revocation this tick.
+    #>
+    param(
+        [hashtable]$Lease,
+        [int]$IdleEvaluationsMin,
+        [TimeSpan]$IdleTtl,
+        [datetime]$Now
+    )
+    if ($null -eq $Lease) { return $false }
+    if (-not $Lease.ContainsKey('holder') -or [string]::IsNullOrEmpty("$($Lease['holder'])")) { return $false }
+    if ($Lease['pinned']) { return $false }
+
+    $ideCount = 0
+    if ($Lease.ContainsKey('idle_evaluations') -and $null -ne $Lease['idle_evaluations']) {
+        $ideCount = [int]$Lease['idle_evaluations']
+    }
+    if ($ideCount -lt $IdleEvaluationsMin) { return $false }
+
+    $lastProgress = $null
+    if ($Lease.ContainsKey('last_progress_at') -and $Lease['last_progress_at']) {
+        try { $lastProgress = [datetime]::Parse("$($Lease['last_progress_at'])").ToUniversalTime() } catch { $lastProgress = $null }
+    }
+    # No last_progress_at recorded (freshly-acquired lease with no probe yet): not expiring.
+    if ($null -eq $lastProgress) { return $false }
+    return (($Now - $lastProgress) -gt $IdleTtl)
+}
+
 function New-LeaseRecord {
     <#
     .SYNOPSIS
@@ -167,6 +376,343 @@ function New-LeaseRecord {
     }
     if ($null -ne $Queue) { $record['queue'] = @($Queue) }
     return $record
+}
+
+function Add-LeaseWaiter {
+    <#
+    .SYNOPSIS
+        Append a waiter to a lease's queue in append order. Idempotent: a waiter that is
+        already in the queue is left untouched — the record is not duplicated, and its
+        original `waiting_since` is PRESERVED (NOT refreshed).
+
+    .DESCRIPTION
+        Why waiting_since is preserved on a re-enqueue (this IS the contract):
+          The sweep tick runs every ~5 min. If a candidate declares `requires: editor` and the
+          lease is held, the wrapper calls Register-LeaseWaiter → Add-LeaseWaiter on it every
+          tick until the lease frees. Refreshing `waiting_since` on those repeat calls would
+          reset the wait clock every 5 min, so the waiter that arrived first would never age
+          past a fresher one — grant-time FIFO (msg-1183 D-3) collapses to "the last one to
+          re-attempt wins". The idempotent-with-preserve behaviour is what makes "waiting_since
+          FIFO" a real ordering rather than sweep-tick noise. The regression test §8
+          ("first enqueue's waiting_since is NOT refreshed") pins this literally.
+
+        NOTE: msg-1183 D-3 says grant is waiting-time FIFO, sweep order is the tiebreak. The
+        tiebreak resolves at grant time (Get-NextLeaseWaiter, PR 3), not here — this function
+        only preserves append order and the `waiting_since` of pre-existing entries.
+
+    .PARAMETER Lease
+        The per-resource lease hashtable. Mutated in place; a missing `queue` key is
+        initialised to an empty array. Callers that need the resource RECORD to exist first
+        (rather than just the queue slot) should use Register-LeaseWaiter, which wraps this
+        function.
+
+    .PARAMETER WaiterKey
+        The waiter's "$project/$thread_id" key.
+
+    .PARAMETER Now
+        The tick's UTC timestamp; used ONLY when this is a fresh enqueue. Ignored on the
+        idempotent-repeat branch — see the discussion above.
+
+    .NOTES
+        Fixed in PR-gate R1 (msg-2181): the prior SYNOPSIS falsely claimed "or refresh its
+        `waiting_since` if it is already there", which directly contradicted the code and
+        the test. Docstrings on this file are normative (they carry design invariants that
+        callers rely on), so a wrong SYNOPSIS is a real contract break — a later refactor
+        reading the docstring as truth could add a `waiting_since` refresh and silently
+        break FIFO. The naysayer was right to block on this.
+    #>
+    param(
+        [hashtable]$Lease,
+        [string]$WaiterKey,
+        [datetime]$Now
+    )
+    if (-not $Lease.ContainsKey('queue') -or $null -eq $Lease['queue']) { $Lease['queue'] = @() }
+    $existing = @($Lease['queue'])
+    foreach ($w in $existing) {
+        $k = if ($w -is [hashtable]) { $w['key'] } else { $w.key }
+        # Already queued: return WITHOUT touching `waiting_since` — this is the FIFO-preserving
+        # branch the SYNOPSIS above documents. Refreshing would reset the wait clock every ~5-min
+        # sweep tick and collapse FIFO to "last re-attempt wins" (msg-2181 blocker fix).
+        if ($k -eq $WaiterKey) { return }
+    }
+    $Lease['queue'] = @($existing + @(@{
+        key           = $WaiterKey
+        waiting_since = $Now.ToUniversalTime().ToString("o")
+    }))
+}
+
+function Remove-LeaseWaiter {
+    <#
+    .SYNOPSIS
+        Remove a waiter from a lease's queue by key. No-op if absent.
+    #>
+    param(
+        [hashtable]$Lease,
+        [string]$WaiterKey
+    )
+    if (-not $Lease.ContainsKey('queue') -or $null -eq $Lease['queue']) { return }
+    $Lease['queue'] = @($Lease['queue'] | Where-Object {
+        $k = if ($_ -is [hashtable]) { $_['key'] } else { $_.key }
+        $k -ne $WaiterKey
+    })
+}
+
+function Test-LeaseAvailableFor {
+    <#
+    .SYNOPSIS
+        Given a candidate that requires a resource, decide whether it may launch this tick with
+        respect to leases. Returns one of:
+          - 'available' : the required resource is free OR already held by this candidate; the
+                          candidate may launch. The caller must then call Invoke-LeaseAcquire on
+                          it BEFORE launch, so the record shows the acquisition before the
+                          session starts (a killed acquire+launch survives as a committed lease,
+                          not a phantom launch — same reasoning as head_skip's "session-start-
+                          before-write" contract).
+          - 'waiting'   : the required resource is held by someone else and NOT this candidate.
+                          The candidate must NOT launch; disposition `lease-waiting`. The caller
+                          SHOULD call Register-LeaseWaiter to queue.
+
+        v1 is single-resource per candidate (msg-2038 correction: sweep.json's `requires` is a
+        single string, not an array). Multi-resource coordination + rollback is v2 work that
+        needs proper deadlock avoidance — bolting it onto a single-resource state machine is what
+        rounds 11-12 tried and had to be reverted.
+
+        SINGLE-RESOURCE, FAIL-CLOSED (msg-2185 → msg-2189 blocker fixes). Earlier the parameter
+        was typed `[string[]]` with an internal foreach loop; msg-2185 collapsed the signature to
+        `[string]` intending the type to act as a single-resource signal. That was insufficient.
+        PowerShell's parameter binder silently coerces a runtime `@('editor','runner')` into
+        `'editor runner'` before the function sees it, so the type is not a hard-runtime
+        rejection. The R2 pin claimed that was a "harmless no-op" because the joined nonsense
+        name matched no lease and returned 'available'. That claim was wrong: 'available' is a
+        LAUNCH-AUTHORISATION signal to the caller, so silently returning 'available' for a
+        malformed multi-resource request tells the caller "go ahead, launch" while the real
+        `editor` and `runner` leases remain UNCLAIMED. Another candidate that then correctly
+        requested `'editor'` would see it free, acquire, and launch — TWO candidates now
+        operating on the same exclusive resource. That IS mutual-exclusion collapse, dressed up
+        as a graceful degradation.
+
+        The fix (msg-2189): accept `$Requires` as an untyped parameter and validate its actual
+        runtime shape at entry. If it is an array with 2+ elements, THROW — do not silently
+        joining-coerce, do not return 'available'. Single-element arrays coerce cleanly to their
+        scalar (a documented pwsh convenience the R2 tests already relied on and this fix
+        preserves). Anything not a string, array, or null is a type error. Fail-closed is the
+        right posture here: a malformed callsite must be VISIBLE to the caller (as an exception
+        they cannot swallow silently), not hidden behind a phantom 'available'. The type
+        signature is no longer the contract; the entry validation IS.
+
+    .PARAMETER LeasesState
+        The full leases.json map: resource-name -> lease hashtable.
+
+    .PARAMETER CandidateKey
+        The "$project/$thread_id" key of the candidate.
+
+    .PARAMETER Requires
+        The single resource name the candidate declares in sweep.json's `requires`. Empty
+        string / `$null` / an empty array means the candidate declares no requires and is
+        trivially available. A one-element array is accepted as a documented convenience (pwsh
+        callers commonly type `@('editor')` where a single string is the API truth). A multi-
+        element array THROWS — see the SYNOPSIS msg-2189 note.
+
+    .OUTPUTS
+        A hashtable @{
+          status   = 'available' | 'waiting'
+          holders  = @{ resource -> current-holder-key } for resources that are held (any holder)
+          waitOn   = [string[]] resources this candidate is waiting on (0 or 1 element in v1).
+                     Kept as an array so the caller can uniformly `.Count`-test rather than
+                     null-check a scalar; the array wraps a single-resource verdict, it does
+                     NOT signal multi-resource support.
+        }
+
+        A malformed `-Requires` argument (multi-element array, wrong type) THROWS a
+        RuntimeException — the function does NOT return a verdict in that case. Callers must
+        not swallow the exception silently; the whole point of failing closed is to make the
+        misuse visible to the caller (msg-2189 blocker fix).
+    #>
+    param(
+        [hashtable]$LeasesState,
+        [string]$CandidateKey,
+        # UNTYPED on purpose — see .SYNOPSIS msg-2189. A `[string]` parameter would let pwsh
+        # silently join a multi-element array into a nonsense string before the validation
+        # below could see it. The runtime type check is the real single-resource enforcement.
+        $Requires
+    )
+
+    # ENTRY VALIDATION (msg-2189 blocker fix). Normalise `$Requires` to a single scalar string
+    # OR throw on malformed input. Do this BEFORE any lease lookup so the caller's misuse cannot
+    # produce a phantom 'available' verdict.
+    $requiresStr = $null
+    if ($null -eq $Requires) {
+        $requiresStr = ''
+    }
+    elseif ($Requires -is [string]) {
+        $requiresStr = $Requires
+    }
+    elseif ($Requires -is [array]) {
+        if ($Requires.Count -eq 0) {
+            # `@()` is a legitimate "no requires" — same as null / empty string.
+            $requiresStr = ''
+        }
+        elseif ($Requires.Count -eq 1) {
+            # `@('editor')` is the documented convenience: one-element array coerces to its
+            # scalar. Callers that write `@('x')` are common in pwsh; rejecting them would
+            # break the R2 tests without adding safety.
+            $only = $Requires[0]
+            if ($null -eq $only) {
+                $requiresStr = ''
+            }
+            elseif ($only -is [string]) {
+                $requiresStr = $only
+            }
+            else {
+                throw "Test-LeaseAvailableFor: -Requires single-element array must contain a string, got [$($only.GetType().Name)] (msg-2189: single-resource contract)"
+            }
+        }
+        else {
+            # THE msg-2189 BLOCKER FIX. A caller passed `@('editor', 'runner', ...)` — the state
+            # machine is strictly single-resource (msg-2038; Invoke-LeaseAcquire takes ONE
+            # resource, no transactional rollback exists, rounds 11-12 tried and had to be
+            # reverted). Returning 'available' for the coerced 'editor runner' phantom name
+            # would authorise a launch that never actually claims the real leases — mutual
+            # exclusion collapse. Throw so the caller sees the misuse.
+            throw "Test-LeaseAvailableFor: -Requires must be a single resource, got a $($Requires.Count)-element array — multi-resource is not supported (msg-2189: single-resource contract, msg-2038 correction)"
+        }
+    }
+    else {
+        throw "Test-LeaseAvailableFor: -Requires must be a string or single-element array, got [$($Requires.GetType().FullName)] (msg-2189: single-resource contract)"
+    }
+
+    $holders = @{}
+    $waitOn = @()
+    # Empty Requires (from null / '' / @() / @($null)): the candidate declared nothing to
+    # require. Trivially available.
+    if (-not [string]::IsNullOrEmpty($requiresStr)) {
+        $resource = $requiresStr
+        if ($LeasesState.ContainsKey($resource)) {
+            $lease = $LeasesState[$resource]
+            if ($null -ne $lease) {
+                $h = if ($lease -is [hashtable]) { $lease['holder'] } else { $lease.holder }
+                if (-not [string]::IsNullOrEmpty("$h")) {
+                    $holders[$resource] = "$h"
+                    if ("$h" -ne $CandidateKey) { $waitOn += $resource }
+                }
+            }
+        }
+    }
+    $status = if ($waitOn.Count -eq 0) { 'available' } else { 'waiting' }
+    return @{ status = $status; holders = $holders; waitOn = $waitOn }
+}
+
+function Invoke-LeaseAcquire {
+    <#
+    .SYNOPSIS
+        Acquire a free lease for a candidate. Precondition: the caller has verified via
+        Test-LeaseAvailableFor that the lease is free (no holder) or already held by this
+        candidate. Mutates LeasesState in place.
+
+    .PARAMETER LeasesState
+        The full leases.json map. Mutated in place — a resource that had no entry gets one.
+
+    .PARAMETER Resource
+        Resource name.
+
+    .PARAMETER CandidateKey
+        The "$project/$thread_id" acquiring the lease.
+
+    .PARAMETER Now
+        UTC tick timestamp.
+    #>
+    param(
+        [hashtable]$LeasesState,
+        [string]$Resource,
+        [string]$CandidateKey,
+        [datetime]$Now
+    )
+    if (-not $LeasesState.ContainsKey($Resource) -or $null -eq $LeasesState[$Resource]) {
+        # Cold start — no record ever existed. Generation begins at 1.
+        $LeasesState[$Resource] = New-LeaseRecord -Holder $CandidateKey -Now $Now -Generation 1
+        return
+    }
+    # Precondition: callers normalise the state at the trust boundary. The wrapper runs
+    # ConvertTo-LeasesStateHashtable at load; Grant-Lease.ps1 does the same after reading disk;
+    # tests build hashtables directly. Re-normalising here (msg-1802 blocker #2) is dead code
+    # that also fails to normalise `queue` items, so its "defense in depth" is a lie — drop it
+    # and trust the boundary. Same reason the candidate loop's redundant ConvertTo-* call was
+    # stripped.
+    $lease = $LeasesState[$Resource]
+    $currentHolder = "$($lease['holder'])"
+    if ($currentHolder -eq $CandidateKey) {
+        # Already held by this candidate — keep the record; the probe will refresh the clocks.
+        # This branch is what makes acquire safe to call on every tick the holder is running.
+        return
+    }
+    if (-not [string]::IsNullOrEmpty($currentHolder)) {
+        # Called with a non-free lease. Caller violated the precondition — treat as a wiring
+        # bug rather than silently overwriting. This is the "no accidental steal" guarantee.
+        throw "Invoke-LeaseAcquire on '$Resource' held by '$currentHolder' — refusing to overwrite (call Test-LeaseAvailableFor first)"
+    }
+    # Reuse the record — preserve `queue` and bump generation. On a fresh acquire after a
+    # release, `reclaim_required` from the release survives (the new holder inherits the duty
+    # to restart the resource).
+    $priorGen = 1
+    if ($lease.ContainsKey('generation') -and $null -ne $lease['generation']) {
+        $priorGen = [int]$lease['generation']
+    }
+    $nowIso = $Now.ToUniversalTime().ToString("o")
+    $lease['holder']            = $CandidateKey
+    $lease['acquired_at']       = $nowIso
+    $lease['last_progress_at']  = $nowIso
+    $lease['idle_evaluations']  = 0
+    $lease['generation']        = $priorGen + 1
+    $lease['pinned']            = $false
+    $lease['expiring']          = $false
+    # `reclaim_required`, `reclaimed_from`, and `reclaimed_reason` are preserved from the
+    # prior release — they are the PERMANENT audit trail of what happened last (the release's
+    # 'idle' or an operator's Clear-reason). Clearing `revoked_*` is safe because those are
+    # TRANSIENT Phase-1 revocation intent that no longer applies to a fresh acquire (msg-1900
+    # split rationale in file header).
+    $lease['revoked_at']        = $null
+    $lease['revoked_reason']    = $null
+    # Dequeue this key if present (self-waiters can occur if a candidate was queued then the
+    # lease freed up on the same tick).
+    Remove-LeaseWaiter -Lease $lease -WaiterKey $CandidateKey
+}
+
+function Register-LeaseWaiter {
+    <#
+    .SYNOPSIS
+        Enqueue a waiter for a resource. Creates the resource record if absent (rare — happens
+        when a candidate declares `requires: foo` for a resource nobody has ever held).
+        Idempotent per Add-LeaseWaiter's contract.
+    #>
+    param(
+        [hashtable]$LeasesState,
+        [string]$Resource,
+        [string]$WaiterKey,
+        [datetime]$Now
+    )
+    if (-not $LeasesState.ContainsKey($Resource) -or $null -eq $LeasesState[$Resource]) {
+        # A wait on a resource that has never been leased: create a bare record with no holder
+        # so the queue has a place to live. The next candidate to acquire will populate it.
+        $LeasesState[$Resource] = @{
+            holder            = $null
+            acquired_at       = $null
+            last_progress_at  = $null
+            idle_evaluations  = 0
+            generation        = 0
+            pinned            = $false
+            expiring          = $false
+            reclaimed_from    = $null
+            reclaimed_at      = $null
+            reclaimed_reason  = $null
+            reclaim_required  = $false
+            revoked_at        = $null
+            revoked_reason    = $null
+            queue             = @()
+        }
+    }
+    # See Invoke-LeaseAcquire above — normalisation is the caller's boundary responsibility
+    # (msg-1802 blocker #2). Do NOT re-invent it inline here.
+    Add-LeaseWaiter -Lease $LeasesState[$Resource] -WaiterKey $WaiterKey -Now $Now
 }
 
 function ConvertTo-LeaseHashtable {
@@ -403,23 +949,191 @@ function Merge-LeasesStateForWrite {
     return $out
 }
 
-function Get-JsonState {
-    # Fallback shim: if the caller has NOT dot-sourced the wrapper (e.g. Test-Lease.ps1), we need
-    # a Get-JsonState of our own so Merge-LeasesStateForWrite is testable in isolation. When the
-    # wrapper IS dot-sourced first, its Get-JsonState wins by shadowing (both are just plain
-    # functions — the later definition takes over the name). Keep the shape and error behaviour
-    # identical to the wrapper's implementation at run-conductor-scheduled.ps1:200.
+function Read-JsonStateWithShape {
+    <#
+    .SYNOPSIS
+        Canonical state-file reader — returns both the parsed map AND a shape verdict, so the
+        flush caller can decide whether to back up a bad file before overwriting it. Used by
+        Get-JsonState (which discards the verdict for backward-compat) and by any caller that
+        wants to know WHY the map came back empty.
+
+    .DESCRIPTION
+        WHY THE SHAPE VERDICT EXISTS. `ConvertFrom-Json` accepts three root kinds — objects,
+        arrays, and scalars. The old reader walked `.PSObject.Properties` on any of them, which
+        for an array root yielded array metadata (Count, IsFixedSize, IsReadOnly, IsSynchronized,
+        Length, LongLength, Rank, SyncRoot) as if they were resource names, and for a string root
+        yielded `Length`. The 2026-08-28 measurement (msg-2151 §1, archived at
+        `.git/mindwire-scratch/array-shape-probe-v2.ps1`) confirmed these metadata keys land on
+        disk after a flush and are then read back as resources on the NEXT tick — a one-way
+        corruption vector triggered by a single operator typo (e.g. wrapping the file in a JSON
+        array). Reviewer's phrasing (msg-1912 weakest-point): "fails open safely enough to not
+        block the pipeline"; Bohr msg-1916 §1's correction: "tick 単位では fail-open、tick を跨ぐと
+        one-way corruption". The shape guard rejects array / scalar roots up front — empty state,
+        no metadata leak, no permanent poison — and the flush caller uses the shape verdict to
+        decide whether to rename the offending file to `.bad-<utc>` before its own write
+        overwrites the evidence.
+
+        THE SIDE-EFFECT BOUNDARY (PR-gate R2/R3 endorse: pure verdicts). This function reads
+        only; the rename is Save-CorruptedStateBackup, invoked by the flush path (Bohr msg-1916
+        §1 design: "reader は「shape/parse で reject した」という事実を戻り値で伝えるだけにし、
+        rename は呼び出し側（flush path）が行う"; Einstein msg-1917 endorse). Wiring the backup
+        into Merge-LeasesStateForWrite would collapse the "one file, one owner" property that
+        R2/R3 explicitly endorsed.
+
+    .OUTPUTS
+        A hashtable @{ state = @{...}; shape = 'missing'|'empty'|'object'|'array'|'scalar'|'parse-error'; error = $null|<msg> }.
+        Shape values:
+          - 'missing'      : the path does not exist. state = @{}.
+          - 'empty'        : the file exists but is blank / whitespace, OR ConvertFrom-Json
+                             returned $null (empty JSON array `[]`). state = @{}.
+          - 'object'       : root is a JSON object → normalised to hashtable. state = the map.
+          - 'array'        : root is a JSON array (multi-element or scalar). state = @{}.
+                             THE CORRUPTION CASE — caller MUST back up.
+          - 'scalar'       : root is a JSON string / number / boolean. state = @{}.
+                             THE CORRUPTION CASE — caller MUST back up.
+          - 'parse-error'  : ConvertFrom-Json threw. state = @{}, error = exception message.
+                             AMBIGUOUS: could be a partial write in flight, could be operator
+                             mid-edit, could be genuine corruption. The flush caller's policy
+                             (msg-1916 §2) is to back up here too, on the same "do not convert a
+                             weird file into a deleted file" grounds.
+    #>
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return @{} }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @{ state = @{}; shape = 'missing'; error = $null }
+    }
     try {
         $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
-        if (-not $raw.Trim()) { return @{} }
+        if (-not $raw.Trim()) {
+            return @{ state = @{}; shape = 'empty'; error = $null }
+        }
         $obj = $raw | ConvertFrom-Json
-        $map = @{}
-        foreach ($p in $obj.PSObject.Properties) { $map[$p.Name] = $p.Value }
-        return $map
+        if ($null -eq $obj) {
+            # `[]` parses successfully to $null in PowerShell 7. Treat as empty rather than array
+            # — there is no metadata to leak, and no forensic value in preserving `[]` alone.
+            return @{ state = @{}; shape = 'empty'; error = $null }
+        }
+        # Type discrimination MUST NOT go through `-is [PSCustomObject]` here. ConvertFrom-Json
+        # wraps every scalar return in a PSObject shell for pipeline semantics, and PowerShell's
+        # `-is [PSCustomObject]` matches that shell — so `("str" | ConvertFrom-Json) -is
+        # [PSCustomObject]` is $true and a root JSON string `"foo"` would slip through the object
+        # branch, whose Property-walk then picks up System.String.Length as a "resource" named
+        # `Length`. The 2026-08-28 measurement caught this on case E. Use `.GetType()` on the
+        # unwrapped object instead — a JSON `{}` root returns a PSCustomObject VALUE (that IS
+        # the unwrapped type) while a JSON `"foo"` root returns a String VALUE.
+        $actualType = $obj.GetType()
+        if ($actualType -eq [System.Management.Automation.PSCustomObject]) {
+            $map = @{}
+            foreach ($p in $obj.PSObject.Properties) { $map[$p.Name] = $p.Value }
+            return @{ state = $map; shape = 'object'; error = $null }
+        }
+        # PowerShell's ConvertFrom-Json unwraps single-element arrays to their inner element on
+        # 7.x, so a lone `[{"editor":"x"}]` reaches the PSCustomObject branch above rather than
+        # this one. Multi-element arrays and scalar-arrays land here (System.Object[]).
+        if ($actualType.IsArray -or $obj -is [System.Collections.IList]) {
+            return @{ state = @{}; shape = 'array'; error = $null }
+        }
+        # Root strings / numbers / booleans — anything left is a scalar.
+        return @{ state = @{}; shape = 'scalar'; error = $null }
     }
-    catch { return @{} }
+    catch {
+        return @{ state = @{}; shape = 'parse-error'; error = $_.Exception.Message }
+    }
+}
+
+function Get-JsonState {
+    <#
+    .SYNOPSIS
+        Canonical state-file reader for the scheduled sweep. Returns a hashtable map of the
+        top-level JSON object at `-Path`, or an empty map on any read failure (missing / empty /
+        parse error / bad shape).
+
+    .DESCRIPTION
+        HISTORY. Before 2026-08-28 this function was a fallback shim that Test-Lease.ps1 needed
+        because the wrapper's inline reader (`run-conductor-scheduled.ps1:200`) was the live one.
+        The reader collapse ordered by msg-2172 replaces that wrapper reader with a dot-source of
+        this file, so THIS function is now the canonical reader for every state file the sweep
+        reads (notify.json, pending-decisions.json, quarantine.json, evaluated.json, digest.json,
+        head_skip.json, and — once PR 4 wires it — leases.json). The parity comment the earlier
+        rounds carried is retired: there is only one reader now.
+
+        WHAT CHANGED WITH THE COLLAPSE. Two behaviours were folded in:
+          - Shape guard (Read-JsonStateWithShape docstring for the full rationale): array and
+            scalar JSON roots now return empty rather than leaking metadata keys.
+          - Wrapper-side logging: when a call to Write-Log resolves in the caller's scope, the
+            function emits a one-line log entry on parse errors / bad shapes so operators still
+            see the "state file unreadable — treating as empty" signal the wrapper had. Test-
+            Lease.ps1 has no Write-Log; the Get-Command probe stays silent in that case.
+
+    .PARAMETER Path
+        Absolute or repo-relative path to a UTF-8 JSON file.
+
+    .OUTPUTS
+        A hashtable. Empty on any read failure or bad shape.
+
+    .NOTES
+        The `.bad-<utc>` file rename (Save-CorruptedStateBackup) is a SEPARATE side effect,
+        invoked by the flush caller after inspecting the shape via Read-JsonStateWithShape.
+        This function stays pure so it is safe to call from anywhere (probes, digests, tests).
+    #>
+    param([string]$Path)
+    $r = Read-JsonStateWithShape -Path $Path
+    if ($r.shape -in @('array', 'scalar', 'parse-error')) {
+        # Opportunistic log-through: when the caller's scope has a Write-Log function (the
+        # wrapper does; Test-Lease.ps1 does not), surface the reason we returned empty.
+        # Otherwise silent — the caller opted out of logging by not defining it.
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+            $reason = if ($r.shape -eq 'parse-error') {
+                "parse error: $($r.error)"
+            } else {
+                "root is a JSON $($r.shape), not an object"
+            }
+            Write-Log "state file unreadable ($Path): $reason — treating as empty"
+        }
+    }
+    return $r.state
+}
+
+function Save-CorruptedStateBackup {
+    <#
+    .SYNOPSIS
+        Rename a corrupt state file to `<Path>.bad-<utc>` so the next flush cannot overwrite it.
+        Called by the flush path AFTER Read-JsonStateWithShape reports a shape in
+        {array, scalar, parse-error} — the three cases where the operator's file is preserved
+        as forensic evidence rather than silently destroyed.
+
+    .DESCRIPTION
+        WHY THIS EXISTS. The shape guard alone prevents metadata keys from leaking into the
+        merged state map (the corruption vector). But the sweep flushes memory to the same path
+        on the next write, and memory is empty for that resource, so the operator's original
+        typo — the evidence — is silently overwritten with a clean `{}`. That converts a
+        recoverable operator typo into an irrecoverable silent deletion, and produces the same
+        "we ate your Tier-C edit" failure class R1/R4 were written to end. The rename gives the
+        operator a name they can grep for (`leases.json.bad-2026-08-28T04-15-32Z`) and gives the
+        sweep a clean disk to start from.
+
+        WHY THIS ISN'T IN THE READER (Bohr msg-1916 §1 design boundary; Einstein msg-1917
+        endorse). Read-JsonStateWithShape reports the verdict; the rename is a side effect on a
+        different file (and creates a new one). Doing the rename inside the reader would violate
+        the "pure mechanism, one owner" boundary R2/R3 explicitly endorsed. The flush caller (in
+        PR 4, when the wrapper is wired) inspects the shape and invokes this before its own
+        write.
+
+    .PARAMETER Path
+        The state file to rename.
+
+    .OUTPUTS
+        The renamed path on success (a String), or $null when the file was already gone (nothing
+        to preserve — a race with an external delete, harmless to no-op).
+    #>
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    # Filename-safe UTC stamp — colons are invalid in Windows filenames, and file managers show
+    # T/Z/- fine. The stamp resolves to the second, which is enough for forensic pairing (the
+    # sweep runs on a 5-minute cadence — sub-second collisions cannot happen).
+    $stamp = [datetime]::UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ")
+    $badPath = "$Path.bad-$stamp"
+    Move-Item -LiteralPath $Path -Destination $badPath
+    return $badPath
 }
 
 function Get-LeaseSummaryLines {
