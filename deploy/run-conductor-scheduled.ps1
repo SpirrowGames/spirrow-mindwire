@@ -1841,11 +1841,22 @@ function Get-SweepCandidates {
         # gate-bootstrap PR-gate identified this asymmetry: if the goal is uniform failure modes,
         # the PowerShell side must enforce the same absolute-path contract the Python side does,
         # so a broken config `throw`s from `Get-SweepCandidates` instead of quietly disappearing
-        # into the fail-closed Python branch. `IsPathRooted` matches the reviewer's suggestion and
-        # accepts both `C:/…` and `C:\…` (the `sweep.json.example` uses forward slashes).
-        if (-not [System.IO.Path]::IsPathRooted([string]$c.repo_dir)) {
-            throw ("sweep config entry has relative 'repo_dir': $($c | ConvertTo-Json -Compress) " +
-                   "— use an absolute path (see deploy/sweep.json.example).")
+        # into the fail-closed Python branch.
+        #
+        # `IsPathFullyQualified` is the correct predicate here (not `IsPathRooted`, which the
+        # earlier revision used): `IsPathRooted` returns `$true` for drive-relative paths like
+        # `C:foo` (drive but no root) and root-relative paths like `\foo` (root but no drive),
+        # both of which Python's `pathlib.PureWindowsPath.is_absolute()` correctly rejects.
+        # Managing the same "must be absolute" rule with two different definitions is exactly the
+        # dual-management asymmetry the PR-gate flagged (2026-08-29 review #3). Empirically
+        # verified on pwsh 7 / .NET on the daemon host: `IsPathFullyQualified` returns `False`
+        # for `'C:foo'`, `'\relative\path'`, `''`, `' '`, `'./relative'` — matching Python
+        # `PureWindowsPath.is_absolute()` for each. The shebang (`#!/usr/bin/env pwsh`) and the
+        # Task Scheduler invocation both pin PowerShell 7+, where `IsPathFullyQualified` is
+        # available (added in .NET Core 2.1).
+        if (-not [System.IO.Path]::IsPathFullyQualified([string]$c.repo_dir)) {
+            throw ("sweep config entry has non-absolute 'repo_dir': $($c | ConvertTo-Json -Compress) " +
+                   "— use a fully-qualified absolute path (see deploy/sweep.json.example).")
         }
         $out += [pscustomobject]@{
             project   = $c.project
@@ -2215,15 +2226,16 @@ try {
     # Fail-open by design (Invoke-GateBootstrapTick swallows every kind of local failure and returns
     # $null): a broken alert-opener must not stop the main sweep, which is what actually runs conductors.
     #
-    # `repo_dir` is guaranteed non-blank AND absolute here because `Get-SweepCandidates` validates
-    # every required field with `IsNullOrWhiteSpace` and then applies `IsPathRooted` to `repo_dir`
-    # specifically — both `throw` loudly on the first offender. That is the single validation point
-    # for sweep-config well-formedness; do NOT add a silent `continue` here to tolerate what should
-    # have been rejected upstream — a broken config must halt the sweep, not cause candidates to
-    # vanish without a log line. The Python side (`inspect_gate`) redundantly returns `UNUSABLE` on
-    # a non-absolute `repo_dir`, which is the last line of defence against the CWD-probing attack
-    # path the PR-gate identified on PR #192, but that path now cannot be reached from a
-    # sweep-driven caller because `Get-SweepCandidates` halts loudly first.
+    # `repo_dir` is guaranteed non-blank AND fully-qualified absolute here because
+    # `Get-SweepCandidates` validates every required field with `IsNullOrWhiteSpace` and then
+    # applies `IsPathFullyQualified` to `repo_dir` specifically — both `throw` loudly on the first
+    # offender. That is the single validation point for sweep-config well-formedness; do NOT add a
+    # silent `continue` here to tolerate what should have been rejected upstream — a broken config
+    # must halt the sweep, not cause candidates to vanish without a log line. The PowerShell
+    # `IsPathFullyQualified` and Python `PureWindowsPath.is_absolute()` predicates were verified
+    # to agree on the same set of accepted paths, so a sweep-driven caller cannot reach Python's
+    # fail-closed `UNUSABLE` branch — that branch is now only reachable by non-sweep callers (test
+    # harness, ad-hoc CLI use), which is what the Python-side defence is for.
     $gateBootstrapPairs = @{}
     foreach ($c in $candidates) {
         $pairKey = "$($c.project)::$($c.repo_dir)"
