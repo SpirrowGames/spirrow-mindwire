@@ -1833,6 +1833,20 @@ function Get-SweepCandidates {
                 throw "sweep config entry missing or blank '$f': $($c | ConvertTo-Json -Compress)"
             }
         }
+        # `repo_dir` MUST be an absolute path — this is the contract documented in
+        # `deploy/sweep.json.example` ("repo_dir is the implementer's own CLONE for that project").
+        # A relative value like `"some/relative/path"` would pass the blank check above and reach
+        # `gate_bootstrap_tick.py`, where `inspect_gate` correctly returns `UNUSABLE` — but a
+        # UNUSABLE verdict is a silent SKIP of that candidate, not a loud halt. The T-new-project-
+        # gate-bootstrap PR-gate identified this asymmetry: if the goal is uniform failure modes,
+        # the PowerShell side must enforce the same absolute-path contract the Python side does,
+        # so a broken config `throw`s from `Get-SweepCandidates` instead of quietly disappearing
+        # into the fail-closed Python branch. `IsPathRooted` matches the reviewer's suggestion and
+        # accepts both `C:/…` and `C:\…` (the `sweep.json.example` uses forward slashes).
+        if (-not [System.IO.Path]::IsPathRooted([string]$c.repo_dir)) {
+            throw ("sweep config entry has relative 'repo_dir': $($c | ConvertTo-Json -Compress) " +
+                   "— use an absolute path (see deploy/sweep.json.example).")
+        }
         $out += [pscustomobject]@{
             project   = $c.project
             thread_id = $c.thread_id
@@ -2201,13 +2215,15 @@ try {
     # Fail-open by design (Invoke-GateBootstrapTick swallows every kind of local failure and returns
     # $null): a broken alert-opener must not stop the main sweep, which is what actually runs conductors.
     #
-    # `repo_dir` is guaranteed non-blank here because `Get-SweepCandidates` validates every required
-    # field with `IsNullOrWhiteSpace` and `throw`s loudly on the first offender. That is the single
-    # validation point for sweep-config well-formedness; do NOT add a silent `continue` here to
-    # tolerate what should have been rejected upstream — a broken config must halt the sweep, not
-    # cause candidates to vanish without a log line. The Python side (`inspect_gate`) redundantly
-    # returns `UNUSABLE` on a non-absolute `repo_dir`, which is the actual last line of defence
-    # against the CWD-probing attack path the PR-gate identified on PR #192.
+    # `repo_dir` is guaranteed non-blank AND absolute here because `Get-SweepCandidates` validates
+    # every required field with `IsNullOrWhiteSpace` and then applies `IsPathRooted` to `repo_dir`
+    # specifically — both `throw` loudly on the first offender. That is the single validation point
+    # for sweep-config well-formedness; do NOT add a silent `continue` here to tolerate what should
+    # have been rejected upstream — a broken config must halt the sweep, not cause candidates to
+    # vanish without a log line. The Python side (`inspect_gate`) redundantly returns `UNUSABLE` on
+    # a non-absolute `repo_dir`, which is the last line of defence against the CWD-probing attack
+    # path the PR-gate identified on PR #192, but that path now cannot be reached from a
+    # sweep-driven caller because `Get-SweepCandidates` halts loudly first.
     $gateBootstrapPairs = @{}
     foreach ($c in $candidates) {
         $pairKey = "$($c.project)::$($c.repo_dir)"
