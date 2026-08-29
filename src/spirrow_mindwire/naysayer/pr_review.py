@@ -235,6 +235,35 @@ _VERDICT_RE = re.compile(
 # The APPROVE form is therefore described in prose rather than shown. Pinned by
 # test_no_src_file_teaches_a_column_zero_approve_verdict (scans ``src/`` with _VERDICT_RE itself)
 # and test_quoting_the_prompt_exemplar_cannot_open_the_gate (replays the echo).
+#
+# ---- RC-side advisory affordance (T-naysayer-blocking-bar-undefined Stage 0, msg-1923..1930) ----
+#
+# The prompt below now names "blocking" (the property that forces REQUEST_CHANGES) and gives the
+# reviewer a place to record NON-blocking observations (nits) alongside blocking objections. This
+# closes an asymmetry Bohr diagnosed on the same thread that produced this change: the previous
+# prompt had a non-blocking slot only on the APPROVE side ("name the single weakest remaining
+# point"), so the ONLY place a reviewer could record a nit was inside an APPROVE body — and the
+# moment a nit was weighed as material, the reviewer had no shape in which to say "one blocking
+# problem, plus three nits", so the pressure went straight to REQUEST_CHANGES. Measured on PR #186
+# rounds 6 and 7 (msg-1923 §1): the same class of 1-2-line prose defect landed on opposite sides
+# of the verdict in adjacent rounds. This is the Stage 0 half of the response (D-3 in msg-1926 /
+# msg-1930 §4): purely additive prompt formatting, NO change to verdict semantics — the gate still
+# posts REQUEST_CHANGES iff the model wrote it, and the advisory section (if any) is prose that
+# rides in the body next to the blocking objections. The Stage 1 half (per-objection ``class`` +
+# code-side ``VERDICT`` derivation) is the Tier-C decision that follows this one — a bump of
+# ``spec/NAYSAYER_PRINCIPLES.md`` ``version: 1 → 2`` — and is deliberately NOT done here.
+#
+# What this affordance does NOT do, and why the wording is careful:
+#
+#   * No "blocking" / "advisory" enum is introduced in the prompt beyond the existing 6-item list of
+#     what qualifies as "the real problems" (correctness / edge / security / invariant / untested /
+#     regression). Fixing the taxonomy is Stage 1's job; anticipating it here would either fossilise
+#     a wording that Stage 1 revisits or (worse) drift from whatever Stage 1 settles on.
+#   * No new column-0 ``VERDICT:`` line. The exemplar remains the single REQUEST_CHANGES line, so
+#     test_system_prompt_verdict_exemplar_is_accepted_by_the_parser stays green and neither the
+#     column-0 APPROVE ban nor the quoted-echo defence introduced above is weakened.
+#   * "You may additionally" — permissive, not mandatory. A blocking objection alone still counts
+#     as a complete review; the affordance exists to remove pressure, not to add a checklist item.
 _PR_REVIEW_SYSTEM_PROMPT = """\
 You are the independent naysayer performing adversarial CODE REVIEW of a pull \
 request's diff in a Spirrow MindWire ChatRoom thread. You are a different model \
@@ -242,10 +271,18 @@ from the implementer. Assume the change is flawed until proven otherwise and \
 find the real problems: correctness bugs, missing edge cases, security issues, \
 broken invariants, untested behaviour, and regressions.
 
-For every objection, quote the specific hunk/line you object to and explain the \
-concrete flaw. Do not fabricate problems and do not pad with generic caveats. \
-If, after a genuine search, you find no blocking problem, say so and name the \
-single weakest remaining point.
+For every blocking objection, quote the specific hunk/line you object to and \
+explain the concrete flaw. Do not fabricate problems and do not pad with generic \
+caveats. A blocking problem is one whose fix the implementer must make before \
+merge — the six kinds named above (correctness bugs, missing edge cases, \
+security issues, broken invariants, untested behaviour, regressions). If, after \
+a genuine search, you find no blocking problem, say so and name the single \
+weakest remaining point. If you find at least one blocking problem, you may \
+additionally record non-blocking observations (nits — naming, docs, minor \
+legibility, speculative concerns) under a clearly separate heading such as \
+"Advisory (non-blocking)"; those observations do not change the verdict, and \
+recording them there means noticing a nit does not force you to inflate it into \
+a blocking objection.
 
 End your reply with exactly one verdict line, in exactly this form — at the start of the line, \
 holding nothing else (no indentation, no bold or backticks, no trailing note):
@@ -254,7 +291,8 @@ VERDICT: REQUEST_CHANGES
 
 Write that line verbatim if you found at least one blocking problem. If, after a genuine search, \
 you found none, write the same line with the single word APPROVE in place of REQUEST_CHANGES. \
-Those two are the only verdicts, and nothing else may appear on the line.
+Those two are the only verdicts, and nothing else may appear on the line. Non-blocking advisory \
+observations, if any, belong in the body ABOVE this line — never on the verdict line itself.
 
 Your reply is posted verbatim to the thread and submitted as your GitHub PR \
 review body — reply directly with the review, no preamble.
