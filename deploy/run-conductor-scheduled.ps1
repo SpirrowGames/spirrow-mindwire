@@ -1817,8 +1817,46 @@ function Get-SweepCandidates {
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
     $out = @()
     foreach ($c in @($raw.candidates)) {
+        # Reject `$null`, `""`, AND whitespace-only strings uniformly and loudly. PowerShell's `-not`
+        # operator handles the first two but treats `" "` as truthy, which would silently pass a bad
+        # value downstream. `IsNullOrWhiteSpace` closes that hole here — at the single validation
+        # point — so every consumer of a candidate can trust that all three required fields are
+        # non-blank. This is the load-bearing check for the CWD-probing attack path the T-new-
+        # project-gate-bootstrap PR-gate identified on PR #192: an empty/whitespace `repo_dir` that
+        # reached `gate_bootstrap_tick.py` would resolve `Path("") / ".mindwire-gate"` against the
+        # sweep's CWD (this MindWire host repo) and falsely report `DECLARED`. The Python side of
+        # the same defence lives in `inspect_gate`, which returns `UNUSABLE` for a non-absolute
+        # `repo_dir` regardless of caller — but this upstream check is what makes the failure mode
+        # uniform: a broken sweep config halts the sweep, it does not silently skip candidates.
         foreach ($f in 'project', 'thread_id', 'repo_dir') {
-            if (-not $c.$f) { throw "sweep config entry missing '$f': $($c | ConvertTo-Json -Compress)" }
+            if ([string]::IsNullOrWhiteSpace([string]$c.$f)) {
+                throw "sweep config entry missing or blank '$f': $($c | ConvertTo-Json -Compress)"
+            }
+        }
+        # `repo_dir` MUST be an absolute path — this is the contract documented in
+        # `deploy/sweep.json.example` ("repo_dir is the implementer's own CLONE for that project").
+        # A relative value like `"some/relative/path"` would pass the blank check above and reach
+        # `gate_bootstrap_tick.py`, where `inspect_gate` correctly returns `UNUSABLE` — but a
+        # UNUSABLE verdict is a silent SKIP of that candidate, not a loud halt. The T-new-project-
+        # gate-bootstrap PR-gate identified this asymmetry: if the goal is uniform failure modes,
+        # the PowerShell side must enforce the same absolute-path contract the Python side does,
+        # so a broken config `throw`s from `Get-SweepCandidates` instead of quietly disappearing
+        # into the fail-closed Python branch.
+        #
+        # `IsPathFullyQualified` is the correct predicate here (not `IsPathRooted`, which the
+        # earlier revision used): `IsPathRooted` returns `$true` for drive-relative paths like
+        # `C:foo` (drive but no root) and root-relative paths like `\foo` (root but no drive),
+        # both of which Python's `pathlib.PureWindowsPath.is_absolute()` correctly rejects.
+        # Managing the same "must be absolute" rule with two different definitions is exactly the
+        # dual-management asymmetry the PR-gate flagged (2026-08-29 review #3). Empirically
+        # verified on pwsh 7 / .NET on the daemon host: `IsPathFullyQualified` returns `False`
+        # for `'C:foo'`, `'\relative\path'`, `''`, `' '`, `'./relative'` — matching Python
+        # `PureWindowsPath.is_absolute()` for each. The shebang (`#!/usr/bin/env pwsh`) and the
+        # Task Scheduler invocation both pin PowerShell 7+, where `IsPathFullyQualified` is
+        # available (added in .NET Core 2.1).
+        if (-not [System.IO.Path]::IsPathFullyQualified([string]$c.repo_dir)) {
+            throw ("sweep config entry has non-absolute 'repo_dir': $($c | ConvertTo-Json -Compress) " +
+                   "— use a fully-qualified absolute path (see deploy/sweep.json.example).")
         }
         $out += [pscustomobject]@{
             project   = $c.project
@@ -2187,6 +2225,17 @@ try {
     # alert thread is open by the time the first candidate on a fresh project actually gets picked up.
     # Fail-open by design (Invoke-GateBootstrapTick swallows every kind of local failure and returns
     # $null): a broken alert-opener must not stop the main sweep, which is what actually runs conductors.
+    #
+    # `repo_dir` is guaranteed non-blank AND fully-qualified absolute here because
+    # `Get-SweepCandidates` validates every required field with `IsNullOrWhiteSpace` and then
+    # applies `IsPathFullyQualified` to `repo_dir` specifically — both `throw` loudly on the first
+    # offender. That is the single validation point for sweep-config well-formedness; do NOT add a
+    # silent `continue` here to tolerate what should have been rejected upstream — a broken config
+    # must halt the sweep, not cause candidates to vanish without a log line. The PowerShell
+    # `IsPathFullyQualified` and Python `PureWindowsPath.is_absolute()` predicates were verified
+    # to agree on the same set of accepted paths, so a sweep-driven caller cannot reach Python's
+    # fail-closed `UNUSABLE` branch — that branch is now only reachable by non-sweep callers (test
+    # harness, ad-hoc CLI use), which is what the Python-side defence is for.
     $gateBootstrapPairs = @{}
     foreach ($c in $candidates) {
         $pairKey = "$($c.project)::$($c.repo_dir)"

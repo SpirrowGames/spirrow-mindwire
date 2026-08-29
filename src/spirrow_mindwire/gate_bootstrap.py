@@ -180,9 +180,13 @@ class GateStatus(StrEnum):
 
     UNUSABLE = "unusable"
     """
-    ``repo_dir`` is absent, not a git repository at all, or otherwise
-    unreadable. Fail-closed: log only, no alert. This is a sweep-config
-    problem, not an onboarding one (msg-1963 D-6).
+    ``repo_dir`` is not an absolute path (empty, whitespace-only, relative,
+    or otherwise ambiguous), is absent from disk, is not a git repository,
+    or is otherwise unreadable. Fail-closed: log only, no alert. This is a
+    sweep-config problem, not an onboarding one (msg-1963 D-6). The
+    non-absolute branch was added after the PR-gate review of PR #192
+    identified a CWD-fallback attack path: ``Path("") / ".mindwire-gate"``
+    silently probes the caller's current working directory.
     """
 
 
@@ -267,6 +271,12 @@ def inspect_gate(
 
     Branches, in the order they are evaluated:
 
+    0. ``repo_dir`` is not an absolute path (empty, whitespace-only, ``.``,
+       relative) ⇒ :attr:`GateStatus.UNUSABLE` (fail-closed, log only).
+       Refuses to probe the caller's current working directory — added
+       after the PR-gate review of PR #192 identified that
+       ``Path("") / ".mindwire-gate"`` normalises to a relative
+       ``.mindwire-gate`` and silently resolves against CWD.
     1. ``.mindwire-gate`` in the working tree ⇒ :attr:`GateStatus.DECLARED`
        (nothing to do).
     2. Not in the working tree and ``repo_dir`` is not a git working tree ⇒
@@ -285,6 +295,39 @@ def inspect_gate(
     (msg-1964 N-1 / msg-1965 correction).
     """
     git = git or _GitRunner()
+
+    # Reject any non-absolute ``repo_dir`` up front. This is the load-bearing
+    # defence identified by the PR-gate review of PR #192. Without it, an
+    # empty ``--repo-dir`` from the sweep wrapper (``$c.repo_dir`` coerced to
+    # ``""`` by PowerShell) parses through ``argparse``'s ``type=Path`` into
+    # ``Path("")``, which normalises to ``Path(".")`` — a RELATIVE path.
+    # Then ``Path(".") / ".mindwire-gate"`` is the bare relative
+    # ``.mindwire-gate``, and ``.is_file()`` below silently resolves it
+    # against the caller's current working directory. In production the
+    # sweep wraps the tick in ``Push-Location $repoRoot``, so CWD is the
+    # MindWire host repo, which HAS a gate — every candidate with a broken
+    # ``repo_dir`` would falsely report DECLARED and fire spurious
+    # ``close_alert`` MCP traffic on every tick.
+    #
+    # The sweep contract is absolute paths (see ``sweep.json.example``).
+    # A relative path is either a broken sweep entry or a hostile caller;
+    # in both cases the correct verdict is UNUSABLE (fail-closed, log only —
+    # msg-1963 D-6). The PowerShell wrapper filters
+    # ``[string]::IsNullOrWhiteSpace($c.repo_dir)`` for the same reason,
+    # but the Python side must be safe against ANY caller.
+    if not repo_dir.is_absolute():
+        return RepoInspection(
+            project=project,
+            repo_dir=repo_dir,
+            status=GateStatus.UNUSABLE,
+            upstream_ref=None,
+            reason=(
+                f"repo_dir {str(repo_dir)!r} is not an absolute path — "
+                "sweep-config problem, refusing to probe the current working "
+                "directory; alert suppressed"
+            ),
+        )
+
     gate_path = repo_dir / ".mindwire-gate"
     if gate_path.is_file():
         return RepoInspection(

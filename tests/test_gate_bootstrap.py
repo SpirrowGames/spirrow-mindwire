@@ -125,6 +125,78 @@ def test_inspect_gate_unusable_when_repo_dir_absent(tmp_path: Path) -> None:
     assert not should_alert(result.status)
 
 
+def test_inspect_gate_unusable_when_repo_dir_is_empty_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Branch 0 (UNUSABLE): an empty ``repo_dir`` is fail-closed BEFORE the CWD probe.
+
+    Pins the PR-gate fix for PR #192. ``argparse`` parses an empty ``--repo-dir``
+    into ``Path("")`` which normalises to ``Path(".")`` — a RELATIVE path.
+    Without the ``is_absolute()`` pre-branch, ``Path(".") / ".mindwire-gate"``
+    would be the bare relative ``.mindwire-gate`` and ``.is_file()`` would
+    silently resolve it against the current working directory. In production
+    the sweep wrapper wraps the tick in ``Push-Location $repoRoot``, so the
+    CWD is the MindWire host repo — which HAS a gate — and every candidate
+    with a broken ``repo_dir`` would falsely report DECLARED and fire
+    spurious ``close_alert`` traffic on every tick.
+
+    This test reproduces that condition: it changes CWD into a directory that
+    contains ``.mindwire-gate``, then calls ``inspect_gate`` with an empty
+    ``repo_dir``. Without the fix, the result would be DECLARED. With the
+    fix, it is UNUSABLE.
+    """
+    (tmp_path / ".mindwire-gate").write_text("#!/usr/bin/env bash\nexit 0\n")
+    monkeypatch.chdir(tmp_path)
+    result = inspect_gate("spirrow-example", Path(""))
+    assert result.status == GateStatus.UNUSABLE
+    assert not should_alert(result.status)
+    # Reason must name the actual cause so the operator sees why in the log.
+    assert "absolute" in result.reason.lower()
+
+
+def test_inspect_gate_unusable_when_repo_dir_is_whitespace_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Branch 0 (UNUSABLE): a whitespace-only ``repo_dir`` also fails closed.
+
+    The PowerShell wrapper's ``[string]::IsNullOrWhiteSpace`` catches this
+    upstream, but the Python side must ALSO defend — the PowerShell filter is
+    defence-in-depth, and the Python side is the load-bearing rejection. A
+    caller that passes ``Path(" ")`` (a whitespace-only string) bypasses
+    PowerShell's ``-not`` truthy check (which only catches ``""`` / ``$null``)
+    and would otherwise hit the same CWD-probe attack path as the empty
+    string. ``Path(" ")`` on Windows normalises to a relative path, so the
+    ``is_absolute()`` pre-branch catches it too.
+    """
+    (tmp_path / ".mindwire-gate").write_text("#!/usr/bin/env bash\nexit 0\n")
+    monkeypatch.chdir(tmp_path)
+    result = inspect_gate("spirrow-example", Path("   "))
+    assert result.status == GateStatus.UNUSABLE
+    assert not should_alert(result.status)
+
+
+def test_inspect_gate_unusable_when_repo_dir_is_relative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Branch 0 (UNUSABLE): a relative ``repo_dir`` (even one that exists) is refused.
+
+    The sweep contract is absolute paths (``sweep.json.example``). A caller
+    that passes a relative path — even ``some-repo`` when that directory
+    exists under CWD — is either broken or hostile; the CWD-relative attack
+    path is the same as the empty-string case. UNUSABLE is the correct
+    verdict.
+    """
+    # Set up a plausible-looking relative repo in the CWD, to prove that
+    # the check refuses it on principle rather than because the target is
+    # broken.
+    real_repo = tmp_path / "some-repo"
+    _init_repo(real_repo)
+    monkeypatch.chdir(tmp_path)
+    result = inspect_gate("spirrow-example", Path("some-repo"))
+    assert result.status == GateStatus.UNUSABLE
+    assert not should_alert(result.status)
+
+
 def test_inspect_gate_unusable_when_not_a_git_repo(tmp_path: Path) -> None:
     """Branch 2 (UNUSABLE): a directory that is not a git tree is UNUSABLE too.
 
@@ -433,6 +505,39 @@ async def test_cli_run_tick_new_repo_opens_alert(tmp_path: Path) -> None:
     args = fake.args_for("chatroom_open_thread")
     assert args["thread_id"] == "T-gate-bootstrap-spirrow-newborn"
     assert set(args["tags"]) == set(ALERT_TAGS)
+
+
+@pytest.mark.anyio
+async def test_cli_run_tick_empty_repo_dir_makes_no_mcp_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty ``repo_dir`` → UNUSABLE → the tick makes ZERO MCP calls.
+
+    The regression this pins is the PR-gate finding on PR #192: without the
+    inspect_gate defence, an empty ``repo_dir`` would be silently classified
+    as DECLARED (because the CWD, wrapped by ``Push-Location $repoRoot``,
+    contains the host repo's own ``.mindwire-gate``), and the tick would
+    fire ``chatroom_close_thread`` on every candidate on every tick. Here we
+    place a gate in the CWD deliberately to reproduce the attack condition,
+    then assert the fake MCP records NO calls at all.
+    """
+    (tmp_path / ".mindwire-gate").write_text("#!/usr/bin/env bash\nexit 0\n")
+    monkeypatch.chdir(tmp_path)
+    fake = _FakeMcp()
+    exit_code, out = await _CLI._run_tick(
+        "spirrow-example",
+        Path(""),
+        owner=DEFAULT_SWEEPER_OWNER,
+        mcp_url=None,
+        merge_commit_sha=None,
+        mcp_factory=lambda _url: fake,
+    )
+    assert exit_code == 0
+    assert out["status"] == GateStatus.UNUSABLE.value
+    assert out["action"] == "no_action"
+    assert out["thread_id"] is None
+    # The load-bearing assertion: no MCP traffic at all.
+    assert fake.calls == []
 
 
 def test_cli_main_reports_unusable_and_exits_zero(tmp_path: Path, capsys: Any) -> None:
