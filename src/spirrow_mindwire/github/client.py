@@ -570,15 +570,49 @@ class GitHubClient:
         return body_json if isinstance(body_json, dict) else {"raw": body_json}
 
 
+def _error_element(element: object) -> str:
+    """One entry of GitHub's ``errors`` array as text — entries are strings OR objects."""
+    if isinstance(element, str):
+        return element.strip()
+    if isinstance(element, dict):
+        for key in ("message", "code"):
+            value = element.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
 def _error_detail(resp: httpx.Response) -> str:
-    """Best-effort extraction of a GitHub ``{"message": ...}`` error string."""
+    """Best-effort extraction of a GitHub error string — ``message`` AND ``errors``.
+
+    GitHub puts the GENERIC reason in ``message`` and the DISCRIMINATING one in ``errors``.
+    The same-identity review refusal is the case that matters here::
+
+        {"message": "Unprocessable Entity",
+         "errors": ["Review Can not request changes on your own pull request"],
+         "status": "422"}
+
+    Returning ``message`` alone therefore threw away the only text a caller can branch on,
+    which made :meth:`NaysayerPrReviewDriver._submit_review`'s COMMENT backstop **dead code**:
+    it matches on ``"own pull request"``, a string that could never reach the exception. The
+    unit test for that backstop stayed green only because it fabricated the message itself.
+    Measured on PR #194 head 054eeaf, 2026-08-29 (thread ``T-pr-review-spirrow-mindwire-194``
+    msg-2037): the verdict leg raised, the fallback did not fire, and the driver exited 1.
+
+    So ``errors`` is appended whenever present. Deliberately NOT truncated on this branch —
+    the discriminating entry can be last, and cutting it would restore the original bug.
+    """
     try:
         body = resp.json()
     except ValueError:
         return resp.text[:500]
-    if isinstance(body, dict) and "message" in body:
-        return str(body["message"])
-    return str(body)[:500]
+    if not (isinstance(body, dict) and "message" in body):
+        return str(body)[:500]
+    detail = str(body["message"])
+    raw_errors = body.get("errors")
+    entries = raw_errors if isinstance(raw_errors, list) else []
+    extras = [text for text in (_error_element(e) for e in entries) if text]
+    return f"{detail}: {'; '.join(extras)}" if extras else detail
 
 
 __all__ = [

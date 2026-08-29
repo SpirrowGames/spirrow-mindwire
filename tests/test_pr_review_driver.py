@@ -58,6 +58,7 @@ from spirrow_mindwire.naysayer.pr_review import (
 )
 from spirrow_mindwire.naysayer.pr_review_adr_pointers import (
     build_pr_review_pass1_system_prompt,
+    strip_wrapping_fences,
 )
 from spirrow_mindwire.naysayer.principles import (
     build_preamble,
@@ -1005,9 +1006,22 @@ async def test_finish_reason_length_forces_request_changes() -> None:
 
 @pytest.mark.anyio
 async def test_same_identity_422_falls_back_to_comment() -> None:
+    """The driver half of the same-identity fallback.
+
+    The message below is the string ``GitHubClient.submit_review`` really raises, formatted by
+    ``_error_detail``: generic ``message`` + the ``errors`` entry that carries the phrase this
+    branch matches. It used to read ``"Can not request changes on your own pull request"`` —
+    a message the transport could not produce, because ``_error_detail`` dropped ``errors``.
+    The fake therefore asserted the fallback worked while the real path could never reach it
+    (measured on PR #194, 2026-08-29). The transport half is pinned by
+    ``test_same_identity_422_carries_the_discriminating_error_text`` in test_github_client.py;
+    neither test is worth anything without the other.
+    """
     github = _FakeGitHub(
         submit_exc=GitHubHTTPError(
-            "Can not request changes on your own pull request", status_code=422
+            "POST /repos/o/r/pulls/1/reviews (review) returned 422: Unprocessable Entity: "
+            "Review Can not request changes on your own pull request",
+            status_code=422,
         )
     )
     posted, post = _capture()
@@ -1629,6 +1643,32 @@ def test_objection_block_survives_a_code_fence() -> None:
     assert len(report.advisory) == 1
 
 
+def test_objection_block_parses_with_a_closing_fence_off_the_end() -> None:
+    """The PR #194 advisory, pinned: a closing fence that is not at ``$`` survives the strip.
+
+    ``_FENCE_RE``'s trailing branch is ``$``-anchored, so when the fenced array is followed by
+    anything — the VERDICT line, trailing prose — the closing fence is NOT removed and stays in
+    the payload. Asserted here rather than left as a reviewer's inference: ``raw_decode`` stops
+    at the end of the array, so everything after it (fence included) is simply never read.
+
+    This is not a hypothetical shape. It is what every fenced block already looks like, because
+    the objection block sits ABOVE the verdict line by construction — so the "unstripped closing
+    fence" case is the NORMAL case for this consumer, not an edge one.
+    """
+    payload = (
+        f'```json\n[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "x"}}]\n```'
+    )
+    critique = _critique_with_objections(ModelVerdict.APPROVE, payload)
+    after_marker = critique.split(_OBJECTIONS_SENTINEL)[-1]
+    # Test premise: the closing fence really is mid-payload here, not at the end.
+    assert not strip_wrapping_fences(after_marker).endswith("```")
+    assert "```" in strip_wrapping_fences(after_marker)
+
+    report = parse_objections(critique)
+    assert report.status is ObjectionParse.OK
+    assert len(report.advisory) == 1
+
+
 def test_objection_block_last_wins_at_column_zero() -> None:
     """The marker is read at column zero, last-wins — the ``_VERDICT_RE`` discipline.
 
@@ -1749,6 +1789,6 @@ def test_gate_notice_divergence_axis() -> None:
             _critique_with_objections(ModelVerdict.APPROVE, None), view=view, finish_reason="stop"
         )
     )
-    assert _MARKER_D_DIVERGENCE in notice
+    assert _MARKER_D_DIVERGENCE in unreadable
     assert f"`{ObjectionParse.MISSING.value}`" in unreadable
     assert "fail-closed" in unreadable

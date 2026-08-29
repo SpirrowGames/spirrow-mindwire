@@ -1461,10 +1461,20 @@ class NaysayerPrReviewDriver:
 
         GitHub forbids a formal APPROVE / REQUEST_CHANGES on your *own* PR. T22 provisions the
         naysayer a distinct identity (``MINDWIRE_NAYSAYER_GITHUB_TOKEN`` = ``spirrowgames-ops``) so
-        the formal verdict goes through. This COMMENT fallback remains a backstop for the window
-        before that token is provisioned (the naysayer then shares the author identity and the
-        verdict event 422s): we re-submit the same body as a COMMENT so the verdict (in the body)
-        is still recorded, rather than fail-closed-halting on a credential-config issue.
+        the formal verdict goes through. This COMMENT fallback backstops the two ways the two
+        identities can still coincide: (a) the window before that token is provisioned, and
+        (b) — measured on PR #194, 2026-08-29 — a PR **opened by** ``spirrowgames-ops``, which
+        collides from the other end and is not fixed by any token change. We re-submit the same
+        body as a COMMENT so the verdict (in the body) is still recorded, rather than fail-closed-
+        halting on a credential-config issue.
+
+        A COMMENT is NOT a formal verdict: it applies no ``CHANGES_REQUESTED`` block and
+        ``_latest_verdict_review`` does not see it. Case (b) therefore degrades the gate to
+        advisory for the whole life of that PR — the fix is to re-open the PR under the author
+        identity, not to lean on this fallback.
+
+        Until 2026-08-29 this fallback was dead code: it branches on text that
+        :func:`~spirrow_mindwire.github.client._error_detail` dropped. See that docstring.
         """
         try:
             await self._github.submit_review(pr, event=verdict, body=body)
