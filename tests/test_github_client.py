@@ -197,6 +197,67 @@ async def test_submit_review_non_2xx_fail_loud() -> None:
     assert exc.value.status_code == 422
 
 
+@pytest.mark.anyio
+async def test_same_identity_422_carries_the_discriminating_error_text() -> None:
+    """★ The ``errors`` array must survive into the exception text (measured, PR #194).
+
+    This is the half of the same-identity fallback that was missing. The driver's COMMENT
+    backstop branches on ``"own pull request"``, but GitHub puts that phrase in ``errors``
+    while ``message`` is the generic ``"Unprocessable Entity"`` — so before this test the
+    backstop could never fire on the real transport, and its own unit test stayed green only
+    because it fabricated the exception message.
+
+    The payload below is copied verbatim from the live 422 on
+    ``POST /repos/SpirrowGames/spirrow-mindwire/pulls/194/reviews`` (2026-08-29), so the
+    string this asserts on is the one GitHub actually sends, not one we invented.
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={
+                "message": "Unprocessable Entity",
+                "errors": ["Review Can not request changes on your own pull request"],
+                "status": "422",
+            },
+        )
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError) as exc:
+            await client.submit_review(_PR, event=ReviewEvent.REQUEST_CHANGES, body="nope")
+    assert exc.value.status_code == 422
+    # The exact predicate NaysayerPrReviewDriver._submit_review evaluates.
+    assert "own pull request" in str(exc.value).lower()
+
+
+@pytest.mark.anyio
+async def test_error_detail_reads_object_shaped_errors_entries() -> None:
+    """GitHub's ``errors`` entries are sometimes objects, not strings — both must render."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={
+                "message": "Validation Failed",
+                "errors": [
+                    {"resource": "PullRequest", "code": "custom", "message": "No commits between"},
+                    "plain string entry",
+                    {"resource": "PullRequest", "code": "invalid"},
+                    {"unrecognised": "shape"},
+                ],
+            },
+        )
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError) as exc:
+            await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="ok")
+    detail = str(exc.value)
+    assert "No commits between" in detail  # object with a message
+    assert "plain string entry" in detail  # bare string
+    assert "invalid" in detail  # object falling back to code
+    assert "Validation Failed" in detail  # the generic message is still there
+
+
 # ---------- fetch_ci_status (ADR-16 L1, Actions API) ---------------------- #
 
 
