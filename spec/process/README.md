@@ -72,7 +72,12 @@ fail-open を設計するとき、**「degradation を宣言する」ことで�
 
 適用: 「これを誰が、いつ読むか」を問う。真実を含むだけの artifact より、**読み手のいる経路** (通知 / CI failure / 人が開くファイル) を選ぶ。報告が文書なら限界は**冒頭**に置く (脚注ではなく) — `T-slope-extension-dead-mode` msg-2111 が監査報告の不完全性を冒頭要件にしたのはこの理由。
 
-**`spec/NAYSAYER_PRINCIPLES.md` には意図的に足していない**: あの SOT は全 naysayer 呼び出しに逐語注入され、短いことで機能する。既知 5 件は個別に機構で塞がれており、ループは隣接する推論に独立到達できることが実測されている ∴ 原則リストを薄めるコストに見合わない。
+**`spec/NAYSAYER_PRINCIPLES.md` に足すもの / 足さないもの** (2026-08-29 精緻化、`T-naysayer-blocking-bar-undefined` msg-2033 §0 V-3(b)): あの SOT は全 naysayer 呼び出しに逐語注入され、**短いことで機能する** ∴ 8000 bytes の上限を同ファイル自身に規律として置いてある。
+
+- **一般的な工学教訓は足さない** (本節がそれ)。既知 5 件は個別に機構で塞がれており、ループは隣接する推論に独立到達できることが実測されている ∴ 原則リストを薄めるコストに見合わない。
+- **naysayer 自身の出力契約は足す**。objection の class 語彙 (`objection_classes`) と blocking の線引きがそれで、v2 で足した。根拠: 独立到達しないことが 2 リポジトリで実測されている (mindwire #186 R6/R7 = 同規模の指摘が隣接ラウンドで APPROVE / RC に割れた、spirrow-verimend#3 R3 = 実行時に誤らない指摘が RC になった)。**逐語注入先そのものが唯一の読み手である**種類の規約は、他のどこに置いても届かない。
+
+上限を超える改訂は、上限を上げるのではなく何かを削って収めること。
 
 **併せて置き場所の注意**: `CLAUDE.md` に書いた規約が縛るのは **人間だけ**である。implementer は `setting_sources=[]` (SDK 隔離、credential 面の対策) で走り `CLAUDE.md` を読まない。naysayer の system prompt も preamble + role + ADR 索引 + handoff で本書を含まない。**ループに効かせたい規約は、ループが実際に読む場所 (`./obligations.yaml`) に置くこと** — 本規律を再形式化したのが `OBL-READBACK-*` であり、そのために本 README の pointer から `./obligations.yaml` が SOT である旨を明示している。
 

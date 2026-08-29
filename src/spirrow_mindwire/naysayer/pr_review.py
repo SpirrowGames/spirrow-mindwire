@@ -43,9 +43,10 @@ GitHub submission never depend on pass 2 succeeding.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -76,9 +77,15 @@ from .pr_review_adr_pointers import (
     build_pr_review_pass2_messages,
     load_manifest_ids,
     select_adr_pointers,
+    strip_wrapping_fences,
     unavailable_log_line,
 )
-from .principles import NAYSAYER_MODEL_TIER, principles_version
+from .principles import (
+    NAYSAYER_MODEL_TIER,
+    PrinciplesError,
+    objection_classes,
+    principles_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -236,7 +243,36 @@ _VERDICT_RE = re.compile(
 # test_no_src_file_teaches_a_column_zero_approve_verdict (scans ``src/`` with _VERDICT_RE itself)
 # and test_quoting_the_prompt_exemplar_cannot_open_the_gate (replays the echo).
 #
-# ---- RC-side advisory affordance (T-naysayer-blocking-bar-undefined Stage 0, msg-1923..1930) ----
+# ---- Objection classes (T-naysayer-blocking-bar-undefined Stage 1, msg-2031 / msg-2033) ----
+#
+# SUPERSEDES the Stage 0 affordance (PR #188, merged as 043d3b9) that this same paragraph used to
+# describe. Stage 0 gave the reviewer a prose slot for non-blocking observations; Stage 1 replaces
+# that slot with a NAMED class per objection, taken from the ``objection_classes`` map in the
+# principles frontmatter, plus a machine-readable block the driver parses. The Stage 0 wording is
+# not kept alongside it — two ways to say "this one is a nit" is the dual-management defect the
+# class system exists to remove.
+#
+# Three properties of the wording below are load-bearing:
+#
+#   * It does NOT enumerate the class names. ``build_preamble()`` already injects the frontmatter
+#     verbatim into this same system prompt, so an enumeration here would be a second copy of the
+#     enum that can drift from the SOT. The absence is pinned by
+#     ``test_no_src_file_duplicates_the_objection_class_vocabulary``.
+#   * Its objection-block exemplar uses PLACEHOLDER class names, not real ones. The exemplar is
+#     handed to the model on every review, so a model restating its instructions emits it; a
+#     placeholder parses as ``UNKNOWN``, which :func:`derive_verdict` counts as blocking. The echo
+#     therefore lands on the fail-closed side — the same reasoning that makes the VERDICT exemplar
+#     a REQUEST_CHANGES (see the note above _PR_REVIEW_SYSTEM_PROMPT).
+#   * It adds NO new column-0 ``VERDICT:`` line, so the column-0 APPROVE ban and the quoted-echo
+#     defence are untouched.
+#
+# What Stage 1 deliberately does NOT do: change any verdict. The parsed block feeds
+# ``VerdictDecision.derived_verdict``, which no gate path reads (see the SHADOW note there).
+#
+# The problem this addresses (Bohr, msg-1923 §1): "blocking" had no definition anywhere, so the
+# same class of 1-2-line prose defect landed on opposite sides of the verdict in adjacent rounds
+# of one PR (#186 R6 = APPROVE, R7 = REQUEST_CHANGES), and a third case in another repository
+# (spirrow-verimend#3 R3) cost the loop a round for a defect that misleads nobody at runtime.
 #
 # The prompt below now names "blocking" (the property that forces REQUEST_CHANGES) and gives the
 # reviewer a place to record NON-blocking observations (nits) alongside blocking objections. This
@@ -268,21 +304,36 @@ _PR_REVIEW_SYSTEM_PROMPT = """\
 You are the independent naysayer performing adversarial CODE REVIEW of a pull \
 request's diff in a Spirrow MindWire ChatRoom thread. You are a different model \
 from the implementer. Assume the change is flawed until proven otherwise and \
-find the real problems: correctness bugs, missing edge cases, security issues, \
-broken invariants, untested behaviour, and regressions.
+find the real problems.
 
-For every blocking objection, quote the specific hunk/line you object to and \
-explain the concrete flaw. Do not fabricate problems and do not pad with generic \
-caveats. A blocking problem is one whose fix the implementer must make before \
-merge — the six kinds named above (correctness bugs, missing edge cases, \
-security issues, broken invariants, untested behaviour, regressions). If, after \
-a genuine search, you find no blocking problem, say so and name the single \
-weakest remaining point. If you find at least one blocking problem, you may \
-additionally record non-blocking observations (nits — naming, docs, minor \
-legibility, speculative concerns) under a clearly separate heading such as \
-"Advisory (non-blocking)"; those observations do not change the verdict, and \
-recording them there means noticing a nit does not force you to inflate it into \
-a blocking objection.
+What kinds of problem exist, and which of them force a change before merge, are \
+defined by the `objection_classes` map in the frontmatter of the naysayer \
+principles above. That map is the only list of class names; this prompt does not \
+repeat it. A class with `blocks: true` is one whose fix the implementer must \
+make before merge, and its `evidence:` line states what you must be able to say \
+to raise it — if you cannot say that, you have not established a blocking \
+objection. A class with `blocks: false` is a real observation that does not \
+force a change before merge; record those too, so that noticing one never \
+pressures you into inflating it into a blocking objection.
+
+For every objection, quote the specific hunk/line you object to and explain the \
+concrete flaw. Do not fabricate problems and do not pad with generic caveats. \
+If, after a genuine search, you find no blocking problem, say so and name the \
+single weakest remaining point.
+
+Then, at the very END of your reply and immediately BEFORE the verdict line, \
+emit exactly one machine-readable objection block: the marker below at the \
+start of its own line, followed by a single JSON array — no code fence, no \
+prose between them.
+
+<!-- mindwire:objections v1 -->
+[{"class": "<a class name from objection_classes>", "where": "path:line", \
+"evidence": "<what that class's evidence: line asks for>"}]
+
+One element per objection you stated above, in the same order; `[]` if you \
+stated none. Every objection you made in prose must appear, and the block must \
+not add any you did not make. The block records what you already wrote — it \
+does not replace the prose, and nothing in it changes the verdict line below.
 
 End your reply with exactly one verdict line, in exactly this form — at the start of the line, \
 holding nothing else (no indentation, no bold or backticks, no trailing note):
@@ -394,6 +445,196 @@ def _parse_model_verdict(critique: str) -> ModelVerdict:
     return ModelVerdict.REQUEST_CHANGES
 
 
+# ─── Objection classes (T-naysayer-blocking-bar-undefined Stage 1) ───────────────────
+#
+# The model tags each objection with a class from the ``objection_classes`` map in the
+# principles frontmatter and emits them as one JSON array in a marked block at the end of
+# its reply. This module parses that block and DERIVES a verdict from it —
+# ``derived_verdict`` — which is recorded and reported but never posted.
+#
+# **The Stage 1 safety property, stated once so it cannot be lost:** ``derived_verdict``
+# does not appear in ``decide_verdict``'s ``gate_verdict`` computation. Whatever this
+# parser does — mis-parses, is fed an injected block, crashes on nothing at all — the
+# verdict submitted to GitHub is bit-identical to the pre-Stage-1 behaviour. The robustness
+# of this parser is the thing being MEASURED, not something the gate depends on yet
+# (msg-2033 §J-3). Reversing that is Stage 2, a separate Tier-C decision whose stated
+# pre-conditions include an independent review of this parser's injection surface.
+_OBJECTIONS_SENTINEL = "<!-- mindwire:objections v1 -->"
+
+# Anchored at COLUMN ZERO, last-wins — the same discipline (and the same limits) as
+# :data:`_VERDICT_RE`; read that block before widening this one. A unified-diff line carries a
+# ``+``/``-``/space prefix, so a VERBATIM quote of this file's own diff (which necessarily
+# contains the sentinel literal) cannot satisfy the anchor. The residual is identical too: a
+# model that RE-TYPES the marker without the prefix produces a genuine match, and last-wins only
+# helps while the re-typed copy precedes the model's own block. In Stage 1 that residual costs
+# nothing (nothing is posted from it); it is precisely why Stage 2's stated pre-conditions
+# include an independent review of this surface.
+_OBJECTIONS_SENTINEL_RE = re.compile(rf"^{re.escape(_OBJECTIONS_SENTINEL)}\s*$", re.MULTILINE)
+
+
+class ObjectionParse(Enum):
+    """How the objection block of one critique read. Every value is recorded, none is fatal.
+
+    ``UNKNOWN`` and ``NO_EVIDENCE`` are element-level facts promoted to the report so the
+    gate notice can name what happened; ``MISSING`` covers both "no marker" and "the array
+    would not parse", because the derivation treats them identically (fail-closed) and a
+    finer split would suggest the two are handled differently when they are not.
+    """
+
+    OK = "ok"
+    EMPTY = "empty"
+    MISSING = "missing"
+    UNKNOWN = "unknown-class"
+    NO_EVIDENCE = "no-evidence"
+
+
+@dataclass(frozen=True)
+class Objection:
+    """One element of the model's objection block, resolved against the class vocabulary."""
+
+    objection_class: str
+    where: str
+    evidence: str
+    known: bool  # the class name is in ``objection_classes()``
+    blocks: bool  # counts toward the derived REQUEST_CHANGES
+
+
+@dataclass(frozen=True)
+class ObjectionReport:
+    """The parse of one critique's objection block."""
+
+    status: ObjectionParse
+    objections: tuple[Objection, ...] = ()
+    unknown_classes: tuple[str, ...] = ()
+
+    @property
+    def blocking(self) -> tuple[Objection, ...]:
+        return tuple(o for o in self.objections if o.blocks)
+
+    @property
+    def advisory(self) -> tuple[Objection, ...]:
+        return tuple(o for o in self.objections if not o.blocks)
+
+    def counts_by_class(self) -> Mapping[str, int]:
+        counts: dict[str, int] = {}
+        for o in self.objections:
+            counts[o.objection_class] = counts.get(o.objection_class, 0) + 1
+        return counts
+
+    def counts_label(self) -> str:
+        counts = self.counts_by_class()
+        return ", ".join(f"{name}={counts[name]}" for name in sorted(counts)) or "none"
+
+
+def _missing_report() -> ObjectionReport:
+    return ObjectionReport(status=ObjectionParse.MISSING)
+
+
+def parse_objections(critique: str) -> ObjectionReport:
+    """Parse the objection block out of ``critique``. Never raises.
+
+    Five outcomes, all recorded, none of which changes what the gate posts:
+
+    ``OK``           marker present, array parsed, every class known and evidenced.
+    ``EMPTY``        the array is ``[]`` — a legal statement that nothing was objected to.
+    ``MISSING``      no column-zero marker, or the payload after it is not a JSON array.
+    ``UNKNOWN``      some element names a class outside the vocabulary.
+    ``NO_EVIDENCE``  some blocking element carries no evidence.
+
+    ``NO_EVIDENCE`` deliberately does NOT demote the objection to advisory. Demotion would be
+    fail-open, and worse, it would make "write no evidence" the cheapest way to soften a
+    verdict — inverting the evidence obligation the class system is built on (msg-2033 §J-3).
+
+    Malformed ELEMENTS inside a well-formed array (not an object, missing ``class``) are
+    counted as unknown-class rather than dropped: silently discarding an element the model
+    wrote is the one behaviour that could make the derived verdict quieter than the prose.
+    """
+    matches = list(_OBJECTIONS_SENTINEL_RE.finditer(critique))
+    if not matches:
+        return _missing_report()
+    payload = strip_wrapping_fences(critique[matches[-1].end() :])
+    start = payload.find("[")
+    if start < 0:
+        return _missing_report()
+    try:
+        # ``raw_decode`` stops at the end of the array, so the verdict line (and any prose)
+        # that follows the block is simply not consumed — no need to guess where it ends.
+        parsed, _ = json.JSONDecoder().raw_decode(payload, start)
+    except ValueError:
+        return _missing_report()
+    if not isinstance(parsed, list):
+        return _missing_report()
+    if not parsed:
+        return ObjectionReport(status=ObjectionParse.EMPTY)
+
+    try:
+        vocabulary = objection_classes()
+    except PrinciplesError:  # pragma: no cover - unreachable in practice, see below
+        # A malformed SOT has already taken this call down: ``build_preamble()`` reads the
+        # same file to assemble the system prompt, long before any critique exists to parse.
+        # Narrow on purpose — swallowing every exception here would hide a real bug in this
+        # parser behind a fail-closed status that looks like a badly-behaved model.
+        return _missing_report()
+
+    objections: list[Objection] = []
+    unknown: list[str] = []
+    no_evidence = False
+    for element in parsed:
+        raw_class = element.get("class") if isinstance(element, dict) else None
+        name = raw_class.strip() if isinstance(raw_class, str) else ""
+        where = str(element.get("where", "")) if isinstance(element, dict) else ""
+        evidence = str(element.get("evidence", "")) if isinstance(element, dict) else ""
+        entry = vocabulary.get(name)
+        if entry is None:
+            unknown.append(name or repr(element)[:80])
+            objections.append(
+                Objection(
+                    objection_class=name or "<malformed>",
+                    where=where,
+                    evidence=evidence,
+                    known=False,
+                    blocks=True,
+                )
+            )
+            continue
+        if entry.blocks and not evidence.strip():
+            no_evidence = True
+        objections.append(
+            Objection(
+                objection_class=name,
+                where=where,
+                evidence=evidence,
+                known=True,
+                blocks=entry.blocks,
+            )
+        )
+
+    if unknown:
+        status = ObjectionParse.UNKNOWN
+    elif no_evidence:
+        status = ObjectionParse.NO_EVIDENCE
+    else:
+        status = ObjectionParse.OK
+    return ObjectionReport(
+        status=status, objections=tuple(objections), unknown_classes=tuple(unknown)
+    )
+
+
+def derive_verdict(report: ObjectionReport) -> ReviewEvent:
+    """The verdict the class vocabulary implies: RC iff any objection blocks (fail-closed).
+
+    ``MISSING`` derives REQUEST_CHANGES (D-7b): a review whose machine-readable half could
+    not be read is not evidence of "no blocking objection". Unknown classes count as blocking
+    for the same reason, and an unevidenced blocking objection stays blocking (see
+    :func:`parse_objections`).
+
+    SHADOW: no caller posts this. See the block above :data:`_OBJECTIONS_SENTINEL`.
+    """
+    if report.status is ObjectionParse.MISSING:
+        return ReviewEvent.REQUEST_CHANGES
+    return ReviewEvent.REQUEST_CHANGES if report.blocking else ReviewEvent.APPROVE
+
+
 @dataclass(frozen=True)
 class VerdictDecision:
     """The full verdict picture of a single review — model side, gate side, and the diff view.
@@ -410,6 +651,28 @@ class VerdictDecision:
     gate_verdict: ReviewEvent
     view: DiffView
     finish_reason: str | None
+    # Stage 1 SHADOW pair. ``objections`` is the parse of the model's machine-readable block;
+    # ``derived_verdict`` is what the class vocabulary implies. NEITHER is read by
+    # ``gate_verdict`` above — grep this file: the only consumers are ``render_gate_notice``
+    # (the D-divergence note) and the structured log line. Defaults keep them optional for the
+    # short-circuit paths that construct no block at all.
+    objections: ObjectionReport = ObjectionReport(status=ObjectionParse.MISSING)
+    derived_verdict: ReviewEvent = ReviewEvent.REQUEST_CHANGES
+
+    @property
+    def diverged(self) -> bool:
+        """The derived verdict disagrees with what the gate posted, or the block was unusable.
+
+        Both halves matter for the shadow measurement: a disagreement is the signal the
+        derivation is being calibrated on, and an unusable block is the reason a
+        disagreement might be spurious. Reporting only the first would let a systematically
+        unreadable block look like a systematically wrong derivation.
+        """
+        return self.derived_verdict is not self.gate_verdict or self.objections.status in (
+            ObjectionParse.MISSING,
+            ObjectionParse.UNKNOWN,
+            ObjectionParse.NO_EVIDENCE,
+        )
 
     @property
     def suppressed(self) -> bool:
@@ -441,8 +704,16 @@ def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) 
         # survives on ``model_verdict`` for the notice, so the record does not lie about
         # which one was written.
         gv = ReviewEvent.REQUEST_CHANGES
+    # SHADOW (Stage 1). Computed AFTER ``gv`` and never fed back into it — the two statements
+    # above are the whole of the gate rule and this change adds nothing to them.
+    report = parse_objections(critique)
     return VerdictDecision(
-        model_verdict=mv, gate_verdict=gv, view=view, finish_reason=finish_reason
+        model_verdict=mv,
+        gate_verdict=gv,
+        view=view,
+        finish_reason=finish_reason,
+        objections=report,
+        derived_verdict=derive_verdict(report),
     )
 
 
@@ -456,6 +727,7 @@ _MARKER_A_HEADROOM = "<!-- mindwire:note A-headroom -->"
 _MARKER_B_DIFF = "<!-- mindwire:note B-diff -->"
 _MARKER_B_LEN = "<!-- mindwire:note B-len -->"
 _MARKER_C_SUPPRESSED = "<!-- mindwire:note C-suppressed -->"
+_MARKER_D_DIVERGENCE = "<!-- mindwire:note D-divergence -->"
 
 
 def _model_verdict_label(mv: ModelVerdict) -> str:
@@ -484,7 +756,8 @@ def render_gate_notice(decision: VerdictDecision) -> str:
     fire_b_diff = view.truncated
     fire_b_len = decision.finish_reason == "length"
     fire_c = decision.suppressed
-    if not (fire_a or fire_b_diff or fire_b_len or fire_c):
+    fire_d = decision.diverged
+    if not (fire_a or fire_b_diff or fire_b_len or fire_c or fire_d):
         return ""
 
     lines: list[str] = [_GATE_NOTICE_SENTINEL]
@@ -545,7 +818,60 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             "(see the note(s) above); a review of a partial diff / partial output "
             "cannot open the gate."
         )
+    if fire_d:
+        # Rider 1 (msg-2031) put in a channel that has readers. ``spec/process/README.md``
+        # (fail-open 宣言先, 旧 §N.3) says a degradation announced only to a log is an
+        # announcement to nobody — measured: a correctly-declared ADR-index fail-open sat
+        # unread for five weeks in review-artifact prose. So the divergence rides in the body
+        # that is posted to the chatroom AND submitted as the GitHub review, next to the
+        # verdict it is about. The classed objections themselves need no new store: the model
+        # wrote them into this same body, which both channels already carry verbatim.
+        report = decision.objections
+        lines.append(">")
+        lines.append(f"> {_MARKER_D_DIVERGENCE}")
+        lines.append(
+            f"> **Objection-class shadow (measurement only — nothing here changed the "
+            f"verdict).** authored: {_model_verdict_label(decision.model_verdict)}   "
+            f"posted: {_gate_verdict_label(decision.gate_verdict)}   derived from classes: "
+            f"{_gate_verdict_label(decision.derived_verdict)}. Block parse: "
+            f"`{report.status.value}`; {len(report.blocking)} blocking / "
+            f"{len(report.advisory)} advisory; by class: {report.counts_label()}."
+        )
+        if report.unknown_classes:
+            lines.append(
+                f"> Class names outside `objection_classes`: "
+                f"{', '.join(sorted(set(report.unknown_classes)))} (counted as blocking)."
+            )
+        if report.status is ObjectionParse.MISSING:
+            lines.append(
+                "> No readable objection block was found, so the derived side defaults to "
+                "REQUEST_CHANGES (fail-closed). This says nothing about the review above."
+            )
     return "\n".join(lines)
+
+
+def _log_objections(pr_slug: str, head_sha: str | None, decision: VerdictDecision) -> None:
+    """One structured line per review — the AUXILIARY channel for the shadow (J-4 (iii)).
+
+    Auxiliary, not the record: the gate notice above is where a reader finds this. A log line
+    is what ``spec/process/README.md`` (旧 §N.3) measured as unread, so it is here for grepping
+    a corpus of runs, never as the place a divergence is announced.
+    """
+    report = decision.objections
+    logger.info(
+        "naysayer objections %s (head %s): parse=%s blocking=%d advisory=%d by_class=%s "
+        "authored=%s posted=%s derived=%s diverged=%s",
+        pr_slug,
+        head_sha or "?",
+        report.status.value,
+        len(report.blocking),
+        len(report.advisory),
+        report.counts_label(),
+        _model_verdict_label(decision.model_verdict),
+        _gate_verdict_label(decision.gate_verdict),
+        _gate_verdict_label(decision.derived_verdict),
+        decision.diverged,
+    )
 
 
 def prepend_gate_notice(body: str, decision: VerdictDecision) -> str:
@@ -943,6 +1269,7 @@ class NaysayerPrReviewDriver:
         # re-states the rule as a 3-line reference and asserts equivalence.
         decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
         verdict = decision.gate_verdict
+        _log_objections(pr.slug, ci.head_sha, decision)
         # Prepend the gate notice BEFORE the ADR-pointer marker is appended: the notice sits
         # at the head of the body so a reader who sees ``CHANGES_REQUESTED`` in the review
         # state finds the reason at the top of the critique, not after a possibly-truncated

@@ -295,10 +295,14 @@ def build_pr_review_pass2_messages(
 # violation shape, cheap to normalise before the parse-fail bounce). We do NOT
 # treat this normalisation as a filter step counted toward ``dropped``: it only
 # rescues a syntactically-valid array that was wrapped, and never invents pointers.
+#
+# Public (was ``_strip_wrapping``) because pass 1's objection-block parser hits the exact
+# same model behaviour — a JSON payload the prompt asked for unfenced, returned fenced.
+# One normalisation, two readers: writing a second one is how the two would drift.
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?|\n?\s*```\s*$", re.IGNORECASE)
 
 
-def _strip_wrapping(raw: str) -> str:
+def strip_wrapping_fences(raw: str) -> str:
     stripped = raw.strip()
     # Strip a single leading + trailing code fence pair, if present.
     stripped = _FENCE_RE.sub("", stripped)
@@ -344,7 +348,7 @@ def select_adr_pointers(raw_content: str, manifest_ids: frozenset[str]) -> AdrPo
             measured_bytes=measured_bytes,
         )
 
-    body = _strip_wrapping(raw_content)
+    body = strip_wrapping_fences(raw_content)
     try:
         parsed = json.loads(body)
     except (json.JSONDecodeError, ValueError):

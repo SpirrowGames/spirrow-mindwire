@@ -38,20 +38,33 @@ from spirrow_mindwire.naysayer.pr_review import (
     _MARKER_B_DIFF,
     _MARKER_B_LEN,
     _MARKER_C_SUPPRESSED,
+    _MARKER_D_DIVERGENCE,
     _MAX_DIFF_CHARS,
+    _OBJECTIONS_SENTINEL,
     _PR_REVIEW_SYSTEM_PROMPT,
     _VERDICT_RE,
     DiffView,
     ModelVerdict,
     NaysayerPrReviewDriver,
     NaysayerPrReviewError,
+    ObjectionParse,
     PostCritique,
     _ci_gate_response,
     _parse_model_verdict,
     decide_verdict,
+    derive_verdict,
+    parse_objections,
     render_gate_notice,
 )
-from spirrow_mindwire.naysayer.principles import build_preamble, principles_version
+from spirrow_mindwire.naysayer.pr_review_adr_pointers import (
+    build_pr_review_pass1_system_prompt,
+)
+from spirrow_mindwire.naysayer.principles import (
+    build_preamble,
+    objection_classes,
+    principles_path,
+    principles_version,
+)
 
 
 class _FakeLexora:
@@ -690,7 +703,7 @@ def test_system_prompt_verdict_exemplar_is_accepted_by_the_parser() -> None:
 
 
 def test_no_src_file_teaches_a_column_zero_approve_verdict() -> None:
-    """No file under ``src/`` may contain a column-zero ``VERDICT: APPROVE``.
+    """No injected text may contain a column-zero ``VERDICT: APPROVE`` — ``src/`` **and the SOT**.
 
     Such a literal is an exploit string for the open residual below
     (test_known_residual_column_zero_quote_after_verdict_still_wins): a model that re-types it
@@ -699,16 +712,31 @@ def test_no_src_file_teaches_a_column_zero_approve_verdict() -> None:
     instructions can emit the line. A REQUEST_CHANGES literal is harmless — echoing it lands on the
     fail-closed side — so only APPROVE is banned, not the verdict shape itself.
 
+    ``spec/NAYSAYER_PRINCIPLES.md`` joined the scan with v2 (msg-2033 J-1(c)/J-6-4). It is
+    injected VERBATIM into this same system prompt by ``build_preamble()``, so it reaches the
+    model through the identical channel as the Python prompt literal — the ban was always about
+    that channel, and scanning only ``src/*.py`` was an accident of where the text used to live.
+    v1 had no verdict line anywhere in it; v2 adds worked examples, which is exactly the edit that
+    would introduce one. The document states the same rule about itself, in prose, for its authors.
+
     The scan uses ``_VERDICT_RE`` rather than a private pattern: what counts as "a verdict line"
     must be the parser's own definition, or this test drifts away from the thing it protects.
     """
     src = Path(__file__).resolve().parents[1] / "src"
     assert src.is_dir(), f"source tree not found at {src}"
+    sot = principles_path()
+    assert sot.is_file(), f"principles SOT not found at {sot}"
+
+    scanned: list[tuple[str, str]] = [(str(sot), sot.read_text(encoding="utf-8"))]
+    scanned += [
+        (str(path.relative_to(src)).replace("\\", "/"), path.read_text(encoding="utf-8"))
+        for path in sorted(src.rglob("*.py"))
+    ]
 
     found: list[tuple[str, str]] = []
-    for path in sorted(src.rglob("*.py")):
-        for token in _VERDICT_RE.findall(path.read_text(encoding="utf-8")):
-            found.append((str(path.relative_to(src)).replace("\\", "/"), token))
+    for label, text in scanned:
+        for token in _VERDICT_RE.findall(text):
+            found.append((label, token))
 
     # Guard against a vacuous pass: if the walk found no verdict literal at all, the scan is not
     # looking where it thinks it is (wrong root, renamed prompt) and would stay green forever.
@@ -718,8 +746,9 @@ def test_no_src_file_teaches_a_column_zero_approve_verdict() -> None:
         (path, token) for path, token in found if re.sub(r"[ _-]", "_", token.upper()) == "APPROVE"
     ]
     assert not approving, (
-        "column-zero 'VERDICT: APPROVE' literal(s) under src/ — quoting one after a real verdict "
-        f"opens the gate; state the APPROVE form in prose instead: {approving}"
+        "column-zero 'VERDICT: APPROVE' literal(s) in text injected into the review prompt — "
+        "quoting one after a real verdict opens the gate; state the APPROVE form in prose "
+        f"instead: {approving}"
     )
 
 
@@ -1122,7 +1151,13 @@ def test_gate_notice_absent_when_all_quiet() -> None:
     unconditionally stamps a header on the naysayer critique reds this test.
     """
     view = _make_view(_DIFF_WARN_THRESHOLD - 1)  # below warn band
-    decision = decide_verdict("all good\n\nVERDICT: APPROVE", view=view, finish_reason="stop")
+    # The objection block is part of "quiet" from v2 on: an APPROVE whose block says "no
+    # objections" is the fully-agreeing case. A critique with NO block is not quiet — the
+    # derived side then defaults to RC (fail-closed) and D-divergence fires, which is the
+    # measurement working, not a regression. See test_gate_notice_divergence_axis.
+    decision = decide_verdict(
+        _critique_with_objections(ModelVerdict.APPROVE, "[]"), view=view, finish_reason="stop"
+    )
     notice = render_gate_notice(decision)
     assert notice == ""
     assert _GATE_NOTICE_SENTINEL not in notice
@@ -1131,6 +1166,7 @@ def test_gate_notice_absent_when_all_quiet() -> None:
         _MARKER_B_DIFF,
         _MARKER_B_LEN,
         _MARKER_C_SUPPRESSED,
+        _MARKER_D_DIVERGENCE,
     ):
         assert marker not in notice
 
@@ -1156,6 +1192,7 @@ def test_gate_notice_sentinel_iff_any_marker() -> None:
                         _MARKER_B_DIFF,
                         _MARKER_B_LEN,
                         _MARKER_C_SUPPRESSED,
+                        _MARKER_D_DIVERGENCE,
                     )
                 )
                 has_sentinel = _GATE_NOTICE_SENTINEL in notice
@@ -1471,3 +1508,247 @@ def test_verdict_decision_is_immutable() -> None:
         decision.model_verdict = ModelVerdict.REQUEST_CHANGES  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         view.original_chars = 42  # type: ignore[misc]
+
+
+# =========================================================================== #
+# Objection classes — Stage 1 SHADOW (T-naysayer-blocking-bar-undefined).
+#
+# The verdict the gate posts does not change in Stage 1. That is the single
+# property everything below is built around: the derivation is measured, not
+# obeyed. ``test_objection_shadow_never_moves_the_gate_verdict`` is the one that
+# would have to go red before any of this could affect a PR.
+# =========================================================================== #
+
+
+def _blocking_class() -> str:
+    return next(name for name, entry in objection_classes().items() if entry.blocks)
+
+
+def _advisory_class() -> str:
+    return next(name for name, entry in objection_classes().items() if not entry.blocks)
+
+
+def _objection_block(payload: str) -> str:
+    return f"{_OBJECTIONS_SENTINEL}\n{payload}"
+
+
+def _critique_with_objections(mv: ModelVerdict, payload: str | None) -> str:
+    """A critique carrying an objection block (or none when ``payload`` is None)."""
+    prose = _critique_with_verdict(mv)
+    if payload is None:
+        return prose
+    head, _, verdict_line = prose.rpartition("\n\n")
+    if not head:  # UNPARSEABLE case: no verdict line to sit before
+        return f"{prose}\n\n{_objection_block(payload)}"
+    return f"{head}\n\n{_objection_block(payload)}\n\n{verdict_line}"
+
+
+def test_parse_objections_reads_a_well_formed_block() -> None:
+    """The happy path: classes resolved against the SOT, blocking/advisory split from it."""
+    payload = (
+        f'[{{"class": "{_blocking_class()}", "where": "src/x.py:42", "evidence": "n is 0"}},'
+        f' {{"class": "{_advisory_class()}", "where": "src/y.py:7", "evidence": "reads oddly"}}]'
+    )
+    report = parse_objections(_critique_with_objections(ModelVerdict.REQUEST_CHANGES, payload))
+    assert report.status is ObjectionParse.OK
+    assert len(report.blocking) == 1
+    assert len(report.advisory) == 1
+    assert report.blocking[0].where == "src/x.py:42"
+
+
+@pytest.mark.parametrize(
+    ("label", "payload", "expected_status", "expected_derived"),
+    [
+        (
+            "ok-blocking",
+            '[{"class": "%s", "where": "a.py:1", "evidence": "n is 0"}]',
+            ObjectionParse.OK,
+            ReviewEvent.REQUEST_CHANGES,
+        ),
+        (
+            "ok-advisory-only",
+            '[{"class": "%s", "where": "a.py:1", "evidence": "reads oddly"}]',
+            ObjectionParse.OK,
+            ReviewEvent.APPROVE,
+        ),
+        ("empty", "[]", ObjectionParse.EMPTY, ReviewEvent.APPROVE),
+        ("missing-block", None, ObjectionParse.MISSING, ReviewEvent.REQUEST_CHANGES),
+        ("unparseable-payload", "{not json", ObjectionParse.MISSING, ReviewEvent.REQUEST_CHANGES),
+        (
+            "unknown-class",
+            '[{"class": "vibes", "where": "a.py:1", "evidence": "hmm"}]',
+            ObjectionParse.UNKNOWN,
+            ReviewEvent.REQUEST_CHANGES,
+        ),
+        (
+            "blocking-without-evidence",
+            '[{"class": "%s", "where": "a.py:1", "evidence": "   "}]',
+            ObjectionParse.NO_EVIDENCE,
+            ReviewEvent.REQUEST_CHANGES,
+        ),
+    ],
+)
+def test_objection_parse_branches_and_derived_verdict(
+    label: str,
+    payload: str | None,
+    expected_status: ObjectionParse,
+    expected_derived: ReviewEvent,
+) -> None:
+    """All five parse branches, each pinned to the verdict it derives (msg-2033 J-3 / J-6-5).
+
+    Two of these are deliberate fail-CLOSED choices, and the label names which:
+
+    * ``missing-block`` / ``unparseable-payload`` derive REQUEST_CHANGES (D-7b). "I could not
+      read the machine-readable half" is not evidence that nothing blocks.
+    * ``blocking-without-evidence`` stays BLOCKING rather than being demoted to advisory.
+      Demotion would be fail-open and would make omitting evidence the cheapest way to soften a
+      verdict — inverting the obligation the class system rests on.
+
+    ``unknown-class`` counts the element as blocking for the same reason: an unrecognised name
+    is an unknown quantity, and the safe reading of an unknown quantity is that it matters.
+    """
+    if payload is not None and "%s" in payload:
+        cls = _advisory_class() if label == "ok-advisory-only" else _blocking_class()
+        payload = payload % cls
+    report = parse_objections(_critique_with_objections(ModelVerdict.REQUEST_CHANGES, payload))
+    assert report.status is expected_status, label
+    assert derive_verdict(report) is expected_derived, label
+
+
+def test_objection_block_survives_a_code_fence() -> None:
+    """A fenced payload still parses — the same model behaviour pass 2 already normalises.
+
+    The prompt asks for a bare array; models fence JSON anyway. Reusing pass 2's fence helper
+    rather than writing a second one is the point: two normalisations would drift.
+    """
+    payload = (
+        f'```json\n[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "x"}}]\n```'
+    )
+    report = parse_objections(_critique_with_objections(ModelVerdict.APPROVE, payload))
+    assert report.status is ObjectionParse.OK
+    assert len(report.advisory) == 1
+
+
+def test_objection_block_last_wins_at_column_zero() -> None:
+    """The marker is read at column zero, last-wins — the ``_VERDICT_RE`` discipline.
+
+    A verbatim diff quote keeps its ``+``/``-``/space prefix, so a block quoted OUT of the
+    reviewed diff cannot be picked up. Pinned here because this file's own diff necessarily
+    carries the marker literal on every review of it.
+    """
+    quoted_from_a_diff = f' {_OBJECTIONS_SENTINEL}\n [{{"class": "vibes"}}]'
+    real = f'{_OBJECTIONS_SENTINEL}\n[{{"class": "{_advisory_class()}", "evidence": "x"}}]'
+    body = f"prose\n{quoted_from_a_diff}\nmore prose\n{real}\n\nVERDICT: APPROVE"
+    report = parse_objections(body)
+    assert report.status is ObjectionParse.OK
+    assert not report.unknown_classes
+
+
+def test_quoting_the_prompt_objection_exemplar_is_fail_closed() -> None:
+    """Echoing the prompt's own objection exemplar must not soften the derived verdict.
+
+    The exemplar is handed to the model on every review, so a model restating its instructions
+    emits it verbatim — the same channel that forced the VERDICT exemplar to be REQUEST_CHANGES.
+    The exemplar's class names are PLACEHOLDERS, so an echo parses as ``UNKNOWN`` and derives
+    REQUEST_CHANGES. Were the exemplar to use a real advisory class, an echo placed after the
+    model's own block would derive APPROVE out of thin air.
+    """
+    report = parse_objections(_PR_REVIEW_SYSTEM_PROMPT)
+    assert report.status is ObjectionParse.UNKNOWN
+    assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+
+def test_prompt_defers_the_class_vocabulary_to_the_injected_sot() -> None:
+    """The prompt must POINT at ``objection_classes``, never restate the names (J-5).
+
+    ``build_preamble()`` already injects the frontmatter verbatim into the same system prompt,
+    so an enumeration here would be a second copy of the enum. The pass-1 assembly is asserted
+    too, because "the SOT is injected" is what makes the pointer resolvable at all.
+    """
+    assert "objection_classes" in _PR_REVIEW_SYSTEM_PROMPT
+    for name in objection_classes():
+        assert f'"{name}"' not in _PR_REVIEW_SYSTEM_PROMPT, (
+            f"the prompt names the class {name!r}; the vocabulary lives in the frontmatter"
+        )
+    system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
+    assert "objection_classes:" in system  # the frontmatter really is in the same prompt
+
+
+@pytest.mark.parametrize("boundary_name", list(_BOUNDARY_CHARS.keys()))
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.parametrize("model_verdict", list(ModelVerdict))
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,  # no block at all (what every pre-Stage-1 critique looks like)
+        "[]",
+        '[{"class": "%s", "where": "a.py:1", "evidence": "n is 0"}]',  # blocking
+        '[{"class": "%s", "where": "a.py:1", "evidence": "reads oddly"}]',  # advisory
+        "{not json",  # broken block
+        '[{"class": "vibes"}]',  # unknown class
+    ],
+)
+def test_objection_shadow_never_moves_the_gate_verdict(
+    boundary_name: str, finish_reason: str, model_verdict: ModelVerdict, payload: str | None
+) -> None:
+    """★ The Stage 1 invariant (J-6-6): no objection block changes what the gate posts.
+
+    Swept over the same 24-case matrix as ``test_decide_verdict_matrix_axes_and_oracle`` and
+    asserted against the SAME reference implementation of the pre-change rule, so "the gate
+    verdict did not change" is a machine-checkable equivalence rather than a prose claim. The
+    payloads deliberately include a well-formed blocking block on an APPROVE critique (the case
+    where a Stage 2 enforcement WOULD move the verdict) and a broken block (the case where a
+    fragile parser would).
+
+    When this test goes red, the shadow has stopped being a shadow.
+    """
+    if payload is not None and "%s" in payload:
+        payload = payload % (_blocking_class() if "n is 0" in payload else _advisory_class())
+    view = _make_view(_BOUNDARY_CHARS[boundary_name])
+    critique = _critique_with_objections(model_verdict, payload)
+
+    decision = decide_verdict(critique, view=view, finish_reason=finish_reason)
+
+    assert decision.gate_verdict is _oracle_gate_verdict(
+        model_verdict, truncated=view.truncated, finish_reason=finish_reason
+    )
+    # The model verdict is read from the prose, not from the block — inserting a block must
+    # not disturb the parse the gate actually uses.
+    assert decision.model_verdict is model_verdict
+
+
+def test_gate_notice_divergence_axis() -> None:
+    """D-divergence fires exactly when the derived side disagrees or could not be read (J-6-7).
+
+    Three cases, one per reason the note exists:
+
+    * agreement (advisory-only block, model APPROVE, clean diff) → silent;
+    * disagreement (blocking block under a model APPROVE) → fires, and says both verdicts;
+    * unreadable block → fires, and says the derived side defaulted.
+    """
+    view = _make_view(_DIFF_WARN_THRESHOLD - 1)  # keep every other axis quiet
+
+    agreeing = _critique_with_objections(
+        ModelVerdict.APPROVE,
+        f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "reads oddly"}}]',
+    )
+    quiet = render_gate_notice(decide_verdict(agreeing, view=view, finish_reason="stop"))
+    assert quiet == ""
+
+    disagreeing = _critique_with_objections(
+        ModelVerdict.APPROVE,
+        f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]',
+    )
+    notice = render_gate_notice(decide_verdict(disagreeing, view=view, finish_reason="stop"))
+    assert _MARKER_D_DIVERGENCE in notice
+    assert "derived from classes: REQUEST_CHANGES" in notice
+    assert "measurement only" in notice
+
+    unreadable = render_gate_notice(
+        decide_verdict(
+            _critique_with_objections(ModelVerdict.APPROVE, None), view=view, finish_reason="stop"
+        )
+    )
+    assert _MARKER_D_DIVERGENCE in notice
+    assert f"`{ObjectionParse.MISSING.value}`" in unreadable
+    assert "fail-closed" in unreadable
