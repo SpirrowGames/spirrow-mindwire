@@ -46,6 +46,7 @@ from spirrow_mindwire.adapters.naysayer_sdk import (
     NaysayerSdkAdapter,
     build_naysayer_system_prompt,
 )
+from spirrow_mindwire.naysayer.pr_review import _build_messages, _build_pass2_messages
 from spirrow_mindwire.obligations import (
     ObligationsManifest,
     default_manifest_path,
@@ -208,3 +209,86 @@ def test_loader_produces_an_immutable_manifest() -> None:
 
         with __import__("pytest").raises(dataclasses.FrozenInstanceError):
             o.body = "tampered"  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# negative tripwire — the PR-gate messages carry NO obligation body/id.
+#
+# This is the executable declaration that the Tier B PR-gate face is NOT a
+# delivery destination for `spec/process/obligations.yaml`. Only the
+# design-time naysayer face (`build_naysayer_system_prompt`) renders the
+# manifest into a prompt — the PR-gate's pass-1 messages come out of
+# `naysayer/pr_review.py::_build_messages` (the SINGLE production entry
+# point that constructs the ChatMessages actually sent to Lexora on the
+# verdict pass), and `_build_pass2_messages` for the pointer pass; neither
+# calls `render_role_obligations` anywhere on that path (verified 2026-08-30
+# in T-obligations-not-reaching-pr-gate — a full-history pickaxe on the two
+# PR-gate prompt modules for "OBL-" and for verbatim obligation body fragments
+# returned zero commits: this face has never carried any obligation body).
+#
+# CHOICE OF UNIT-UNDER-TEST — assert on `_build_messages` (and its pass-2
+# sibling), NOT on the helper `build_pr_review_pass1_system_prompt` from
+# `pr_review_adr_pointers.py`. That helper is one of the parts the driver
+# uses today; a future edit could bypass the helper and wire
+# `render_role_obligations` directly into `_build_messages`, and testing
+# only the helper would leave that leak invisible. `_build_messages` /
+# `_build_pass2_messages` are the actual production entry points — testing
+# THEIR output is what pins "no manifest body reaches the PR-gate", however
+# the internal construction changes.
+#
+# SCOPE — this test is a WIRING tripwire, not an INTENT detector.
+# It fails only when a body/id from the manifest actually appears in the
+# rendered PR-gate messages. It does NOT detect that a newly added
+# `role: naysayer` obligation was meant to reach the PR-gate: adding an entry
+# to `spec/process/obligations.yaml` without also wiring the PR-gate builder
+# to `render_role_obligations` leaves this test green. There is no machine
+# detector for intent-side face-mismatch — see
+# `spec/process/README.md` §「`./obligations.yaml` の配送範囲は naysayer
+# の片面 (design-time) だけである」and specifically its §「意図の申告を
+# 検出する機械は存在しない」. If you are adding a route for a PR-gate
+# obligation, you must edit BOTH this test (positive assertion of the new
+# body appearing in the PR-gate messages) AND the PR-gate builder — a green
+# CI on an obligations-only change is not proof of delivery.
+# --------------------------------------------------------------------------- #
+
+
+def test_pr_gate_pass1_prompt_carries_no_obligation_body() -> None:
+    """The PR-gate pass-1 messages (as produced by
+    `naysayer.pr_review._build_messages` — the SINGLE production entry point
+    for the verdict pass) contain no obligation body or id from the
+    loop-readable manifest — for any role.
+
+    Asserts on ALL entries in the manifest (not just `role: naysayer`) so that
+    if `_MANIFEST_ROLES` is ever extended (e.g. a `proposer` face) this test
+    will still hold the PR-gate face empty until the wiring is explicitly
+    added. The wiring change is what should red this test, at which point the
+    author must edit here to declare which entries the PR-gate is now
+    delivering (positive assertion), together with the builder change.
+
+    Also asserts on `_build_pass2_messages` output — the pointer pass is
+    structurally quarantined from the verdict (see
+    `pr_review_adr_pointers.py`), but leakage of an obligation body into
+    its system prompt would still constitute delivery to the PR-gate face
+    and must red this test.
+    """
+    manifest = load_manifest()
+    # Concatenate the system + user text from BOTH production entry points.
+    # A dummy diff / slug is enough — the manifest bodies must not appear
+    # anywhere in what the driver actually hands to Lexora, regardless of
+    # which ChatMessage carries them.
+    pass1 = _build_messages("dummy-diff", "owner/repo#0")
+    pass2 = _build_pass2_messages("dummy-diff", "owner/repo#0")
+    rendered = "\n".join(msg.content for msg in (*pass1, *pass2))
+    for obligation in manifest.obligations:
+        assert obligation.body not in rendered, (
+            f"obligation {obligation.id!r} body appears in the PR-gate messages "
+            "(pass-1 `_build_messages` or pass-2 `_build_pass2_messages`) — this "
+            "face has never been a manifest delivery destination; if you are "
+            "adding routing on purpose, edit this test to a positive assertion in the "
+            "same commit and see spec/process/README.md §「`./obligations.yaml` の"
+            "配送範囲は naysayer の片面 (design-time) だけである」"
+        )
+        assert f"[{obligation.id}]" not in rendered, (
+            f"obligation id label [{obligation.id}] appears in the PR-gate messages "
+            "— same rule as the body assertion above"
+        )

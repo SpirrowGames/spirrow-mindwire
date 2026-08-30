@@ -55,6 +55,20 @@ obligations:
 
   - id: OBL-VERDICT-CONSTRAINT
     role: naysayer
+    # Delivery scope: design-time naysayer face ONLY. This entry is NOT delivered
+    # to the Tier B PR-gate face (`naysayer/pr_review.py`), and NOT delivering it
+    # is intentional. Rationale (T-obligations-not-reaching-pr-gate, 2026-08-30):
+    # the PR-gate's output is defined as a CI-side blocking verdict
+    # (`docs/architecture.md` §8bis.4), so "you are advisory, not a veto"
+    # — while literally true (the human retains final merge authority) —
+    # produces a calibration gradient that pushes the PR-gate's verdict toward
+    # APPROVE on that face. Origin is design-time (`_NAYSAYER_ROLE_PROMPT`), and
+    # verdict-safety on the PR-gate face is guarded by the review pipeline itself
+    # (spec/NAYSAYER_PRINCIPLES.md objection classes, ADR index scope, etc.),
+    # not by this clause. See spec/process/README.md §「`./obligations.yaml`
+    # の配送範囲は naysayer の片面 (design-time) だけである」.
+    # DO NOT touch `body:` or `origin:` — canary two-double-prime pins length=64
+    # (the loader also enforces this at load time).
     origin:
       moved_from: "src/spirrow_mindwire/adapters/naysayer_sdk.py::_NAYSAYER_ROLE_PROMPT"
       original_length: 64
@@ -74,6 +88,22 @@ obligations:
     # The clause lives here rather than in `_NAYSAYER_ROLE_PROMPT` because the
     # manifest exists precisely so that a constraint the loop reads is one
     # artifact, not one string per adapter.
+    #
+    # Delivery scope: design-time naysayer face ONLY. This entry is NOT delivered
+    # to the Tier B PR-gate face, and NOT delivering it is intentional
+    # (T-obligations-not-reaching-pr-gate, 2026-08-30): the body is self-scoped
+    # to design threads by its own opening line ("DESIGN-GATE PROCEED IS NOT
+    # MERGE AUTHORIZATION") and its guidance ("when you end a design-time turn
+    # by handing to the implementer" / "say that it is ready for the PR gate
+    # and hand to the human"). Injecting it into the PR-gate would create a
+    # self-referential instruction telling the PR-gate to hand off to the
+    # PR-gate; further, the failure mode the clause exists to prevent (an
+    # advisory design comment being misread as merge authorization) is not
+    # structurally reachable from the PR-gate, whose output IS a review
+    # submitted against the PR's head sha — the very artifact this clause
+    # names as one of the two things that DO authorize a merge. See
+    # spec/process/README.md §「`./obligations.yaml` の配送範囲は naysayer
+    # の片面 (design-time) だけである」.
     body: "DESIGN-GATE PROCEED IS NOT MERGE AUTHORIZATION (ADR-2026-06-03-17 D-5, \"consultation, not approval\"): when you end a design-time turn by handing to the implementer, the only thing you authorize is forward motion into code work. You do not authorize a merge, and no phrasing of yours can — \"clear to land\", \"ship it\", \"approved\", \"LGTM\" all mean exactly \"code work may proceed\" when they appear in a design thread, and you should expect to be read literally by someone who wants to merge. A merge is authorized by two things a design thread cannot contain: a PR-gate artifact — a GitHub review submitted against that pull request's exact head sha — and the human's own decision. If the work looks ready to land, say that it is ready for the PR gate and hand to the human; do not write a sentence that a reader could mistake for the authorization itself."
 
   - id: OBL-READBACK-ENTRY
