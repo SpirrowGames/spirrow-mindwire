@@ -548,7 +548,10 @@ function Send-Notification {
     $script:notificationCallCount++
     $script:notificationLastMessage = $Message
     $script:callOrder.Add('notification')
-    return 'sent'
+    # T-digest-exceeds-discord-limit-and-is-dropped D-5: post-refactor Send-Notification returns a
+    # classified hashtable so Send-NotificationIfChanged can decide whether to record the
+    # signature (deterministic-payload → skip). Stub returns the success shape.
+    return @{ status = 'sent'; class = 'ok'; http_status = 200; error = $null }
 }
 
 function Reset-MaterialSpy {
