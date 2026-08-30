@@ -46,6 +46,7 @@ import asyncio
 import json
 import logging
 import re
+import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -267,7 +268,7 @@ _VERDICT_RE = re.compile(
 # not kept alongside it — two ways to say "this one is a nit" is the dual-management defect the
 # class system exists to remove.
 #
-# Three properties of the wording below are load-bearing:
+# FOUR properties of the wording below are load-bearing:
 #
 #   * It does NOT enumerate the class names. ``build_preamble()`` already injects the frontmatter
 #     verbatim into this same system prompt, so an enumeration here would be a second copy of the
@@ -275,11 +276,18 @@ _VERDICT_RE = re.compile(
 #     ``test_no_src_file_duplicates_the_objection_class_vocabulary``.
 #   * Its objection-block exemplar uses PLACEHOLDER class names, not real ones. The exemplar is
 #     handed to the model on every review, so a model restating its instructions emits it; a
-#     placeholder parses as ``UNKNOWN``, which :func:`derive_verdict` counts as blocking. The echo
-#     therefore lands on the fail-closed side — the same reasoning that makes the VERDICT exemplar
-#     a REQUEST_CHANGES (see the note above _PR_REVIEW_SYSTEM_PROMPT).
+#     placeholder parses as ``UNKNOWN``, which :func:`derive_verdict` counts as blocking. Under
+#     the nonce hardening below the echo now lands on the fail-closed side one step earlier — the
+#     literal ``nonce=NONCE`` in the exemplar never matches the per-review nonce — but the
+#     placeholder is kept anyway so a hypothetical exemplar-with-nonce echo (whatever channel
+#     might one day introduce one) still parses as UNKNOWN. Same reasoning that makes the VERDICT
+#     exemplar a REQUEST_CHANGES (see the note above _PR_REVIEW_SYSTEM_PROMPT).
 #   * It adds NO new column-0 ``VERDICT:`` line, so the column-0 APPROVE ban and the quoted-echo
 #     defence are untouched.
+#   * Its exemplar payload is a NON-EMPTY placeholder array, never ``[]``. A live-nonce ``[]``
+#     exemplar would echo-parse as APPROVE (fail-open direct route); a placeholder-class array
+#     under a placeholder-nonce marker fails at TWO independent gates. The redundancy is the
+#     point — either alone would suffice, both together survive the mistake of dropping one.
 #
 # What Stage 1 deliberately does NOT do: change any verdict. The parsed block feeds
 # ``VerdictDecision.derived_verdict``, which no gate path reads (see the SHADOW note there).
@@ -339,16 +347,21 @@ single weakest remaining point.
 Then, at the very END of your reply and immediately BEFORE the verdict line, \
 emit exactly one machine-readable objection block: the marker below at the \
 start of its own line, followed by a single JSON array — no code fence, no \
-prose between them.
+prose between them. The marker carries a per-review nonce delivered in a \
+paragraph below this prompt; replace the literal `NONCE` in the marker with \
+that value verbatim. Emitting the marker without the substitution, or with any \
+other value, causes the driver to treat the block as absent (fail-closed).
 
-<!-- mindwire:objections v1 -->
+<!-- mindwire:objections v1 nonce=NONCE -->
 [{"class": "<a class name from objection_classes>", "where": "path:line", \
 "evidence": "<what that class's evidence: line asks for>"}]
 
 One element per objection you stated above, in the same order; `[]` if you \
 stated none. Every objection you made in prose must appear, and the block must \
-not add any you did not make. The block records what you already wrote — it \
-does not replace the prose, and nothing in it changes the verdict line below.
+not add any you did not make. Emit exactly ONE such block, ever — two blocks \
+carrying the substituted nonce cause the driver to treat the review as \
+ambiguous. The block records what you already wrote — it does not replace the \
+prose, and nothing in it changes the verdict line below.
 
 End your reply with exactly one verdict line, in exactly this form — at the start of the line, \
 holding nothing else (no indentation, no bold or backticks, no trailing note):
@@ -474,61 +487,158 @@ def _parse_model_verdict(critique: str) -> ModelVerdict:
 # of this parser is the thing being MEASURED, not something the gate depends on yet
 # (msg-2033 §J-3). Reversing that is Stage 2, a separate Tier-C decision whose stated
 # pre-conditions include an independent review of this parser's injection surface.
-_OBJECTIONS_SENTINEL = "<!-- mindwire:objections v1 -->"
+#
+# ── Nonce hardening + D-1 retirement (Stage 1.5-R, msg-2214 / msg-2216) ───────────────
+#
+# BEFORE (Stage 1, #195): sentinel was ``<!-- mindwire:objections v1 -->`` and the parser
+# picked one match by position (last-wins). Einstein's rider-3 review (msg-2089) proved that
+# weaponises a model FORMAT-FAILURE: an attacker embeds the sentinel plus ``[]`` in the diff,
+# the model quotes the diff verbatim while forming its critique but omits its own trailing
+# block on a format slip, and last-wins hands the empty attacker block to the parser →
+# derived APPROVE. Under Stage 2 that would open the gate on request.
+#
+# INTERIM (#198, 7a48c6f): D-1 = "two or more column-zero markers → MISSING" (strict-single
+# wall). Closed one path but not the one Einstein found — an attacker marker plus a MISSING
+# model block is one marker, which D-1 lets through — and re-fired on the ordinary case
+# where our own diff (which necessarily contains the sentinel literal) is legitimately
+# quoted alongside the model's real block (Bohr msg-2214 §1, Q1 3-row table).
+#
+# NOW (Stage 1.5-R): the wall is the NONCE. The parser recognises exactly one shape as
+# authoritative — a column-zero marker whose ``nonce=`` attribute equals a per-invocation
+# hex string generated by the driver and delivered to the model in the same system message.
+# An attacker who cannot see the nonce cannot forge one; a model that emits a nonce-less
+# marker (whether echoing the exemplar, quoting a diff, or format-slipping its own value)
+# produces an inert copy which does not authorise anything. TWO or more authoritative
+# markers derive AMBIGUOUS → REQUEST_CHANGES (fail-closed): the parser refuses to guess
+# which to trust, and a determined attacker who coerces the model into emitting a second
+# authoritative block gets an RC (i.e. the round loops without merging), not a false
+# APPROVE. The round cap (2026-08-28 enforce) bounds the coercion.
+#
+# D-1 (the positional wall) is RETIRED. It survives as a diagnosis counter
+# (``markers_seen``): the number of column-zero marker-shaped strings the parser noticed,
+# regardless of authority. This is the "wall as counter, not gate" step of msg-2214 §1 —
+# the observability is kept, the fail-closed behaviour on our-own-legitimate-quote is
+# removed. Trade recorded in msg-2216 §1: this is a fail-open-DIRECTION move (an
+# authoritative 1 alongside foreign 1 now derives OK rather than MISSING) that is closed by
+# the nonce's cryptographic authority; MISSING trigger in msg-2090 §7 is now
+# "authoritative-side dominant", not "any-marker-count dominant".
+#
+# D-3 (strict bracket placement) is PRESERVED. The nonce authorises the marker but says
+# nothing about the payload that follows it (msg-2214 §2 Q2). An authoritative marker plus
+# a non-adjacent ``[]`` further down is a fail-open path only D-3 closes, so it stays — as
+# a MISSING branch with ``missing_reason=payload_not_adjacent``, not as a separate parse
+# code (the derivation reads only ``parse``; the reason is diagnosis).
+_OBJECTIONS_SENTINEL_PREFIX = "<!-- mindwire:objections v1"
 
-# Anchored at COLUMN ZERO. A unified-diff line carries a ``+``/``-``/space prefix, so a VERBATIM
-# quote of this file's own diff (which necessarily contains the sentinel literal) cannot satisfy
-# the anchor. The residual is real: a model that RE-TYPES the marker without the prefix produces
-# a genuine match. This is the exploit surface :data:`_VERDICT_RE`'s own last-wins discipline is
-# still exposed to (pending on ``T-verdict-echo-after-real-verdict``); this parser diverges by
-# design (see :func:`parse_objections` D-1 note). In Stage 1 the residual costs nothing (nothing
-# is posted from it); the rider-3 review (T-rider3-objection-parser-injection-surface) closes
-# the parser side of the reversal's pre-conditions.
-_OBJECTIONS_SENTINEL_RE = re.compile(rf"^{re.escape(_OBJECTIONS_SENTINEL)}\s*$", re.MULTILINE)
+# Number of random BYTES from ``secrets.token_hex``; the emitted nonce is 2x this many hex
+# characters. 16 hex chars = 64 bits of entropy — well beyond what an attacker in a single
+# review round can guess (they cannot iterate: the nonce is regenerated per invocation and
+# never persisted), and short enough that the marker fits on one line comfortably.
+_NONCE_HEX_BYTES = 8
+_NONCE_HEX_CHARS = _NONCE_HEX_BYTES * 2
+
+# Loose column-zero capture of ANY ``<!-- mindwire:objections v1 ... -->`` line. The capture
+# group is the raw attribute string BETWEEN the fixed prefix and the closing ``-->``. Post-
+# capture judgement (see :func:`parse_objections`) decides whether the captured attrs are:
+#
+#   * AUTHORITATIVE — attrs canonical-form ``nonce=<live>`` exactly (after strip);
+#   * FORMAT_SLIP  — attrs contain the live nonce as a substring but the canonical form does
+#                    not hold (``nonce: X``, ``nonce="X"``, missing separator, extra attrs);
+#   * FOREIGN      — attrs neither canonical nor contain the live nonce (a diff quote of the
+#                    exemplar, a stale nonce from a previous review, an attacker's guess).
+#
+# The regex intentionally uses ``[^\n]*?`` (not ``.*?``) so a marker cannot span lines — the
+# authority check would otherwise have to re-split attrs on newlines. Trailing whitespace
+# after ``-->`` up to end-of-line is tolerated (matches the marker exemplar in the prompt).
+#
+# msg-2216 §4 (gate advisory on #201): a regex that ONLY accepts the canonical
+# ``\s+nonce=[A-Za-z0-9]+`` inside would miss ordinary format-slip shapes (``nonce: X`` /
+# ``nonce="X"``) — they would fail to match at all and be misfiled as ``no_marker``
+# baseline. The reader of Layer D telemetry would then see a decline in the format_slip
+# counter that only reflects the regex being too tight. The loose ``[^\n]*?`` capture with
+# post-capture classification is what closes that misattribution.
+_OBJECTIONS_SENTINEL_ANY_RE = re.compile(
+    rf"^{re.escape(_OBJECTIONS_SENTINEL_PREFIX)}([^\n]*?)-->[^\n]*$",
+    re.MULTILINE,
+)
+
+
+def _generate_objection_nonce() -> str:
+    """Return a fresh per-review nonce (hex, :data:`_NONCE_HEX_CHARS` chars).
+
+    Generated by :func:`secrets.token_hex` for cryptographic unpredictability. Never
+    persisted, never re-used across invocations, never derived from PR-visible inputs
+    (head sha, PR number, time): a nonce an attacker could compute is not a nonce.
+    """
+    return secrets.token_hex(_NONCE_HEX_BYTES)
 
 
 class ObjectionParse(Enum):
     """How the objection block of one critique read. Every value is recorded, none is fatal.
 
     ``UNKNOWN`` and ``NO_EVIDENCE`` are element-level facts promoted to the report so the
-    gate notice can name what happened; ``MISSING`` covers both "no marker" and "the array
-    would not parse", because the derivation treats them identically (fail-closed) and a
-    finer split would suggest the two are handled differently when they are not.
+    gate notice can name what happened; ``MISSING`` covers "no authoritative marker" plus
+    "authoritative marker but the payload cannot be read" because the derivation treats
+    them identically (fail-closed).
 
     A **sub-reason** for ``MISSING`` is carried separately on :class:`ObjectionReport`
     (``missing_reason``), never on this enum: the derivation MUST be blind to it (all
     ``MISSING`` variants derive REQUEST_CHANGES) but the shadow measurement MUST see it
-    (rider 2 needs to tell "D-1 over-fired" from "D-3 over-fired" from "the model wrote
-    no block at all"). Splitting the enum would leak the distinction into the derivation
-    path; hanging it off the report keeps derivation single-valued and measurement rich.
+    (rider 2 needs to tell "the model wrote nothing" from "the model format-slipped its
+    nonce" from "an authoritative marker's payload was not adjacent"). Splitting the enum
+    would leak the distinction into the derivation path; hanging it off the report keeps
+    derivation single-valued and measurement rich.
+
+    ``AMBIGUOUS`` is the "two or more authoritative markers" shape. Under Stage 1 this
+    matters because a determined attacker can coerce the model into emitting a second
+    authoritative block via an instruction hidden in the diff — the parser refuses to
+    guess which to trust, and the derivation is REQUEST_CHANGES (fail-closed).
     """
 
     OK = "ok"
     EMPTY = "empty"
     MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
     UNKNOWN = "unknown-class"
     NO_EVIDENCE = "no-evidence"
 
 
 class ObjectionMissingReason(Enum):
-    """Sub-reason attached to a :class:`ObjectionParse.MISSING` report (rider 3, msg-2130 §3).
+    """Sub-reason attached to a :class:`ObjectionParse.MISSING` report (msg-2216 §2).
 
     Every value derives REQUEST_CHANGES identically — the derivation reads
     :class:`ObjectionParse.MISSING` and stops. This enum exists so the shadow log line
     and the D-divergence notice can name *which* MISSING cause fired, without which
-    ``parse=missing`` is a black box that folds three independent signals into one.
+    ``parse=missing`` is a black box that folds several independent signals into one.
 
-    The two counters rider 2 was asked to instrument (msg-2130 §3) map to
-    :attr:`MULTI_MARKER` (D-1 fired) and :attr:`PROSE_BETWEEN` (D-3 fired). The other
-    values distinguish the pre-existing MISSING causes so a rise in either counter can
-    be told apart from a rise in the baseline ``no_marker`` / ``bad_json`` cases.
+    **Precedence** (msg-2216 §2 table). Because the parse contract is single-valued, the
+    reasons are partitioned by whether an authoritative marker was found:
+
+    * ``authoritative == 1`` (payload-side failures):
+      ``PAYLOAD_NOT_ADJACENT`` > ``PAYLOAD_UNPARSEABLE``.
+    * ``authoritative == 0`` (marker-side failures, top precedence first):
+      ``FORMAT_SLIP`` > ``FOREIGN_MARKER`` > ``NO_MARKER``.
+
+    ``FORMAT_SLIP`` wins over ``FOREIGN_MARKER`` because it is the value that most directly
+    answers the Layer-D question ("did the output contract land?") and is the rarer signal —
+    ``FOREIGN_MARKER`` is the daily case (every naysayer PR quotes the sentinel literal
+    from the diff) and would drown the headline. The information does not vanish: the raw
+    counters (``markers_seen`` / ``foreign_markers`` / ``format_slips``) are kept on
+    :class:`ObjectionReport`, so a mixed report reads ``missing_reason=format_slip`` in the
+    headline and ``foreign_markers=1 format_slips=1`` in the counters — no information is
+    lost, only summarised.
+
+    The pre-integration ``MULTI_MARKER`` (D-1 fired) reason is gone; D-1 has retired and
+    the raw count is now the ``markers_seen`` counter (msg-2216 §1). ``PROSE_BETWEEN`` is
+    renamed to ``PAYLOAD_NOT_ADJACENT`` because D-3 fires equally on prose or on a leading
+    non-``[`` payload — the old name suggested only the first case.
     """
 
-    NO_MARKER = "no-marker"  # zero column-zero markers (baseline: no block written)
-    MULTI_MARKER = "multi-marker"  # D-1 fired: two or more column-zero markers
-    PROSE_BETWEEN = "prose-between"  # D-3 fired: payload does not start with ``[``
-    BAD_JSON = "bad-json"  # ``raw_decode`` raised on the payload
-    NOT_A_LIST = "not-a-list"  # top-level JSON value was not a list
+    NO_MARKER = "no-marker"  # markers_seen == 0
+    FOREIGN_MARKER = "foreign-marker"  # authoritative 0, foreign >= 1 (nonce-less / stale)
+    FORMAT_SLIP = "format-slip"  # authoritative 0, format-slips >= 1 (live nonce, wrong form)
+    PAYLOAD_NOT_ADJACENT = "payload-not-adjacent"  # authoritative 1, D-3 fired
+    PAYLOAD_UNPARSEABLE = "payload-unparseable"  # authoritative 1, array won't decode / not a list
     PRINCIPLES_ERROR = "principles-error"  # vocabulary load failed (unreachable in practice)
 
 
@@ -550,12 +660,39 @@ class ObjectionReport:
     ``missing_reason`` is set iff ``status is ObjectionParse.MISSING``. See
     :class:`ObjectionMissingReason` for why the sub-reason lives here rather than being
     baked into the ``status`` enum.
+
+    Three diagnosis counters (msg-2216 §3-(a)) record the marker landscape independent of
+    the parse verdict. They are **never** read by :func:`derive_verdict`:
+
+    * ``markers_seen`` — every column-zero marker-shaped line the loose regex noticed,
+      regardless of authority. This is the retired D-1 wall, kept as a counter (msg-2216
+      §1) so a rise in "raw markers per review" is still observable when the wall would
+      have been the alarm.
+    * ``foreign_markers`` — the subset of ``markers_seen`` whose attrs neither match the
+      canonical form nor contain the live nonce as a substring. Cause of origin: diff
+      quotes, prompt exemplars, stale nonces, attacker guesses. Ordinary background noise
+      on any naysayer-face PR.
+    * ``format_slips`` — the subset of ``markers_seen`` whose attrs contain the live
+      nonce but not in canonical form (``nonce: X`` / ``nonce="X"`` / extra attrs / etc.).
+      Because the live nonce is unguessable to a diff-time attacker, this counter is
+      **attributable to our own model's output-contract failure** — that is the reason
+      the two counters are split (msg-2216 §3-(a)). The one residual is msg-2216 §3-(b):
+      a prompt-injection could nudge the model into a live-nonce format-slip, so the
+      counter is not 100%-model-only in the presence of a hostile diff — it stays
+      fail-closed (still MISSING, still RC), only the Layer-D read has that caveat.
+
+    ``markers_seen == foreign_markers + format_slips + (1 if authoritative else 0)`` when
+    exactly one authoritative marker exists; the ambiguous case (>1 authoritative) is not
+    parsed as OK/MISSING so the identity is not asserted there.
     """
 
     status: ObjectionParse
     objections: tuple[Objection, ...] = ()
     unknown_classes: tuple[str, ...] = ()
     missing_reason: ObjectionMissingReason | None = None
+    markers_seen: int = 0
+    foreign_markers: int = 0
+    format_slips: int = 0
 
     @property
     def blocking(self) -> tuple[Objection, ...]:
@@ -576,124 +713,154 @@ class ObjectionReport:
         return ", ".join(f"{name}={counts[name]}" for name in sorted(counts)) or "none"
 
 
-def _missing_report(reason: ObjectionMissingReason) -> ObjectionReport:
-    """Construct a MISSING report tagged with its sub-reason (rider-3 msg-2130 §3).
+def _classify_marker(attrs: str, expected_nonce: str) -> str:
+    """Return one of ``"authoritative"`` / ``"format_slip"`` / ``"foreign"`` for one marker.
 
-    The ``reason`` argument is required — a call without one would produce a MISSING report
-    whose cause is unknowable, which is precisely the black-box the instrumentation exists
-    to eliminate. All MISSING cases still derive REQUEST_CHANGES (:func:`derive_verdict`
-    only looks at ``status``); the reason surfaces on the shadow log line and the
-    D-divergence gate notice.
+    ``attrs`` is the loose capture between ``<!-- mindwire:objections v1`` and ``-->``.
+    Authority requires the CANONICAL form ``nonce=<expected>`` after ``.strip()`` — no
+    whitespace, no quotes, no additional attributes; the exact-string comparison is what
+    makes an attacker's guessed form (``nonce="<expected>"``, ``nonce: <expected>``) fail
+    the wall. That same comparison lets those shapes be classified as ``format_slip`` when
+    they nevertheless CONTAIN the live nonce as a substring — which is the reason we do
+    the substring check before falling back to ``foreign``. See :func:`parse_objections`
+    for the precedence rules that consume this classification.
     """
-    return ObjectionReport(status=ObjectionParse.MISSING, missing_reason=reason)
+    stripped = attrs.strip()
+    if stripped == f"nonce={expected_nonce}":
+        return "authoritative"
+    if expected_nonce and expected_nonce in attrs:
+        return "format_slip"
+    return "foreign"
 
 
-def parse_objections(critique: str) -> ObjectionReport:
-    """Parse the objection block out of ``critique``. Never raises.
+def parse_objections(critique: str, *, expected_nonce: str) -> ObjectionReport:
+    """Parse the objection block out of ``critique`` against ``expected_nonce``. Never raises.
 
-    Five outcomes, all recorded, none of which changes what the gate posts:
+    A block is AUTHORITATIVE only if its column-zero marker's attrs equal
+    ``nonce=<expected_nonce>`` verbatim (after ``.strip()``). Every other column-zero
+    marker (no ``nonce=`` at all, a different value, a non-canonical form of the live
+    value) is inert; the pre-Stage-1.5 positional / last-wins / D-1 rules are all gone —
+    one shape wins by identity, not position.
 
-    ``OK``           marker present, array parsed, every class known and evidenced.
-    ``EMPTY``        the array is ``[]`` — a legal statement that nothing was objected to.
-    ``MISSING``      no column-zero marker, more than one column-zero marker, or the payload
-                     after the marker does not begin with a JSON array.
-    ``UNKNOWN``      some element names a class outside the vocabulary.
-    ``NO_EVIDENCE``  some blocking element carries no evidence.
+    Six outcomes, all recorded, none of which changes what the gate posts:
 
-    ``NO_EVIDENCE`` deliberately does NOT demote the objection to advisory. Demotion would be
-    fail-open, and worse, it would make "write no evidence" the cheapest way to soften a
-    verdict — inverting the evidence obligation the class system is built on (msg-2033 §J-3).
+    ``OK``           exactly one authoritative marker, adjacent array parsed, every class
+                     known and evidenced.
+    ``EMPTY``        exactly one authoritative marker whose adjacent array is ``[]`` — a
+                     legal statement that nothing was objected to.
+    ``MISSING``      zero authoritative markers, OR one authoritative marker whose payload
+                     is not adjacent (D-3) or does not decode as a list. The precise cause
+                     is surfaced on ``missing_reason`` (see :class:`ObjectionMissingReason`
+                     for the precedence table).
+    ``AMBIGUOUS``    two or more authoritative markers. The parser refuses to guess which
+                     is the "real" one; the derivation is REQUEST_CHANGES (fail-closed).
+    ``UNKNOWN``      the authoritative array named a class outside the vocabulary.
+    ``NO_EVIDENCE``  the authoritative array carried a blocking element without evidence.
+
+    ``NO_EVIDENCE`` deliberately does NOT demote the objection to advisory. Demotion would
+    be fail-open, and worse, it would make "write no evidence" the cheapest way to soften
+    a verdict — inverting the evidence obligation the class system is built on (msg-2033
+    §J-3).
 
     Malformed ELEMENTS inside a well-formed array (not an object, missing ``class``) are
     counted as unknown-class rather than dropped: silently discarding an element the model
     wrote is the one behaviour that could make the derived verdict quieter than the prose.
 
-    **D-1 (strict-single sentinel, rider-3 msg-2072 / msg-2073).** Two or more column-zero
-    markers in one critique derive MISSING — not "last-wins", not "concatenate all". Last-wins
-    is bypassable by a re-typed copy placed AFTER the model's own block (the same residual
-    :data:`_VERDICT_RE` still carries), and concatenation lets an attacker (or the model's own
-    verbosity) *add* blocking objections at will, which is a new denial-of-service surface
-    aimed straight at the reversed gate. MISSING derives REQUEST_CHANGES, which is fail-closed
-    and *loud*: the reason is named in the report, so a human can see what happened. The
-    accepted side-effect: a PR touching this file whose reviewer re-types the marker at
-    column zero self-jams into RC. The override path is human, which is the right shape for
-    a rare deadlock caused by discussing the parser inside the parser's own gate.
+    **D-1 retirement (msg-2216 §1).** The old "two-plus column-zero markers → MISSING"
+    wall is gone. It was closing an attack surface the nonce now closes cryptographically
+    (any marker whose ``nonce=`` does not equal the live value is inert). It was also
+    firing on the ordinary case: a PR touching this file legitimately quotes the sentinel
+    in its diff, so ``markers_seen >= 2`` was the norm rather than the alarm. The raw
+    count survives on :attr:`ObjectionReport.markers_seen` as a counter — the wall is now
+    ONE tick of a graph rather than a boolean.
 
-    **D-3 (strict bracket placement, rider-3 msg-2072).** After fence-stripping, the payload's
-    first non-whitespace character must be ``[`` — no prose in between. This closes an
-    F-a-direction window (msg-2074 §1): a scan-forward ``find("[")`` would silently anchor to
-    a benign or malicious empty array further down (``Here are my objections: []`` etc.),
-    discarding the model's real block. Failing this trips MISSING → RC, which is loud and
-    fail-closed. The reliability cost (models that lead with a short sentence get their
-    objection block dropped) is Stage-1 shadow-measurable before the reversal.
+    **D-3 (strict bracket placement) is preserved (msg-2216 §2).** After fence-stripping
+    plus a leading-whitespace strip, the payload's first char must be ``[``. This closes
+    the F-a-direction window a scan-forward ``find("[")`` would open: an authoritative
+    marker followed by prose then a stray ``[]`` further down would silently derive
+    APPROVE, discarding the model's real objections. The nonce authorises the marker but
+    says nothing about the payload — D-3 stays as the only wall between marker and JSON.
+    Failing D-3 trips MISSING with ``missing_reason=payload_not_adjacent``.
 
-    **D-5 (explicit whitespace handling, rider-3 msg-2130 §2 / gate advisory on #198).** The
-    D-3 check runs ``.lstrip()`` on the payload IN THIS FUNCTION rather than trusting
-    :func:`strip_wrapping_fences` to have trimmed it. Two reasons: (a) the pre-D-5 code was
-    correct only by accident — ``payload.startswith("[")`` worked because the helper happens
-    to call ``.strip()`` even when no fence is present, so a future optimisation limiting the
-    helper to "mutate only when a fence exists" would silently break D-3 by turning every
-    ``\\n[...]`` payload into MISSING; (b) D-5 is a REINFORCEMENT of D-3, not a relaxation
-    (whitespace cannot carry an injected payload nor construct a false array, so the receiving
-    language is the same). The load-bearing wall is now self-sufficient. Pinned by
-    :func:`test_v2_fence_less_payload_with_leading_newline_is_accepted` and
-    :func:`test_d5_payload_starts_after_leading_whitespace_independent_of_helper`.
+    **AMBIGUOUS = fail-closed under coercion.** A determined attacker who coerces the
+    model into emitting a second AUTHORITATIVE marker (via an instruction hidden in the
+    diff) gets ``AMBIGUOUS`` → REQUEST_CHANGES, not a false APPROVE. This is a residual
+    (an RC-jam is denial of forward progress) but not an integrity failure; the round cap
+    bounds the coercion loop. Recorded in msg-2214 §1 rather than closed here.
 
-    **What is NOT done here.** D-2-prime (a non-regression floor on ``gate_verdict``: the derived
-    read may never lower the gate below the pre-Stage-1 baseline) is a Stage-2 constraint on
-    :func:`decide_verdict`, not a parser change; ``derived_verdict`` does not participate in
-    ``gate_verdict`` yet (see the SHADOW note above :data:`_OBJECTIONS_SENTINEL`), so wiring
-    D-2-prime is premature until the reversal is on the table. R-4 (unify the two parsers' anchor
-    strategy, or justify the divergence, before the reversal) is discharged by the D-1 note
-    above and the divergence back-reference at :data:`_VERDICT_RE` (msg-2130 §1): the objection
-    parser is deliberately strict-single, ``_VERDICT_RE`` remains last-wins for the reasons on
-    ``T-verdict-echo-after-real-verdict``, and the divergence is named on BOTH sides rather
-    than left implicit. V-1 (verify the array-terminator method): confirmed by inspection —
-    ``raw_decode`` stops at the end of the JSON value, so anything after ``]`` is structurally
-    invisible to this parser (matching the note next to the ``raw_decode`` call below); no
-    code change is needed.
-
-    **MISSING sub-reasons (rider-3 msg-2130 §3).** Every MISSING return path carries an
-    :class:`ObjectionMissingReason` so the shadow log line and the D-divergence notice can
-    distinguish which cause fired (``multi_marker`` = D-1, ``prose_between`` = D-3,
-    ``no_marker`` / ``bad_json`` / ``not_a_list`` = pre-existing causes). This is the
-    instrumentation rider 2 needs to tell "D-1/D-3 over-fired" from "the model wrote nothing".
+    **What is NOT done here.** D-2-prime (a non-regression floor on ``gate_verdict``: the
+    derived read may never lower the gate below the pre-Stage-1 baseline) is a Stage-2
+    constraint on :func:`decide_verdict`, not a parser change; ``derived_verdict`` does
+    not participate in ``gate_verdict`` yet (see the SHADOW note above), so wiring
+    D-2-prime is premature until the reversal is on the table.
     """
-    matches = list(_OBJECTIONS_SENTINEL_RE.finditer(critique))
-    if not matches:
-        # Baseline: the model wrote no column-zero marker at all. Same fail-closed outcome
-        # as MULTI_MARKER, but a different signal for shadow measurement.
-        return _missing_report(ObjectionMissingReason.NO_MARKER)
-    if len(matches) > 1:
-        # D-1: two-plus markers derive MISSING → REQUEST_CHANGES. The question "which match
-        # wins?" is deleted rather than answered — see the docstring above for why last-wins
-        # and concatenate-all were both rejected.
-        return _missing_report(ObjectionMissingReason.MULTI_MARKER)
-    payload = strip_wrapping_fences(critique[matches[0].end() :])
-    # D-5: ``.lstrip()`` here in the parser, so the D-3 check does not depend on
-    # ``strip_wrapping_fences`` incidentally trimming leading whitespace. See the docstring
-    # for the coupling this breaks. Whitespace-only leaders are fine — they carry no payload.
-    if not payload.lstrip().startswith("["):
-        # D-3: no scan-forward. If the payload's first non-whitespace char is not ``[``,
-        # fall through to MISSING rather than anchor to some later ``[`` in the prose.
-        return _missing_report(ObjectionMissingReason.PROSE_BETWEEN)
-    # D-3/D-5: raw_decode wants to start at the ``[``, so consume the leading whitespace
-    # we just verified. The strip is safe because D-3 has already established that the
-    # first non-whitespace char is ``[``.
-    payload = payload.lstrip()
+    all_matches = list(_OBJECTIONS_SENTINEL_ANY_RE.finditer(critique))
+    markers_seen = len(all_matches)
+    classified = [_classify_marker(m.group(1), expected_nonce) for m in all_matches]
+    authoritative_idxs = [i for i, kind in enumerate(classified) if kind == "authoritative"]
+    foreign_markers = sum(1 for kind in classified if kind == "foreign")
+    format_slips = sum(1 for kind in classified if kind == "format_slip")
+    diagnosis = {
+        "markers_seen": markers_seen,
+        "foreign_markers": foreign_markers,
+        "format_slips": format_slips,
+    }
+
+    def _report(
+        status: ObjectionParse,
+        *,
+        objections: tuple[Objection, ...] = (),
+        unknown_classes: tuple[str, ...] = (),
+        missing_reason: ObjectionMissingReason | None = None,
+    ) -> ObjectionReport:
+        return ObjectionReport(
+            status=status,
+            objections=objections,
+            unknown_classes=unknown_classes,
+            missing_reason=missing_reason,
+            **diagnosis,
+        )
+
+    def _missing(reason: ObjectionMissingReason) -> ObjectionReport:
+        return _report(ObjectionParse.MISSING, missing_reason=reason)
+
+    if len(authoritative_idxs) >= 2:
+        # msg-2216 §5-(a): >= 2 authoritative markers → AMBIGUOUS. This is the branch that
+        # changes the derivation (RC), so it is a first-class parse status rather than a
+        # missing_reason.
+        return _report(ObjectionParse.AMBIGUOUS)
+    if not authoritative_idxs:
+        # msg-2216 §2 precedence (marker-side, authoritative == 0):
+        # FORMAT_SLIP > FOREIGN_MARKER > NO_MARKER.
+        if format_slips:
+            return _missing(ObjectionMissingReason.FORMAT_SLIP)
+        if foreign_markers:
+            return _missing(ObjectionMissingReason.FOREIGN_MARKER)
+        return _missing(ObjectionMissingReason.NO_MARKER)
+
+    # Exactly one authoritative marker: parse the payload adjacent to it.
+    match = all_matches[authoritative_idxs[0]]
+    payload = strip_wrapping_fences(critique[match.end() :])
+    # D-3/D-5: the lstrip here in the parser is what makes the ``[`` check independent of
+    # ``strip_wrapping_fences`` (which happens to strip too, incidentally — a future
+    # optimisation to that helper must not silently break this parser). The strip is safe
+    # because we branch on the first non-whitespace char below.
+    payload_lstripped = payload.lstrip()
+    if not payload_lstripped.startswith("["):
+        # D-3: no scan-forward. An authoritative marker followed by prose then ``[]``
+        # further down would silently derive APPROVE under the old ``find("[")`` code;
+        # the wall stays and reads as ``missing_reason=payload_not_adjacent``.
+        return _missing(ObjectionMissingReason.PAYLOAD_NOT_ADJACENT)
     try:
-        # ``raw_decode`` stops at the end of the array, so the verdict line (and any prose)
-        # that follows the block is simply not consumed — no need to guess where it ends.
-        # V-1 (rider-3 msg-2074): this is what makes trailing text after ``]`` structurally
-        # invisible to the parser, which is why D-4 ("no trailing text allowed") was dropped
-        # rather than turned into a code change (msg-2130 §3).
-        parsed, _ = json.JSONDecoder().raw_decode(payload)
+        # ``raw_decode`` stops at the end of the array, so the verdict line (and any
+        # prose) that follows the block is simply not consumed.
+        parsed, _ = json.JSONDecoder().raw_decode(payload_lstripped)
     except ValueError:
-        return _missing_report(ObjectionMissingReason.BAD_JSON)
+        return _missing(ObjectionMissingReason.PAYLOAD_UNPARSEABLE)
     if not isinstance(parsed, list):
-        return _missing_report(ObjectionMissingReason.NOT_A_LIST)
+        return _missing(ObjectionMissingReason.PAYLOAD_UNPARSEABLE)
     if not parsed:
-        return ObjectionReport(status=ObjectionParse.EMPTY)
+        return _report(ObjectionParse.EMPTY)
 
     try:
         vocabulary = objection_classes()
@@ -702,7 +869,7 @@ def parse_objections(critique: str) -> ObjectionReport:
         # same file to assemble the system prompt, long before any critique exists to parse.
         # Narrow on purpose — swallowing every exception here would hide a real bug in this
         # parser behind a fail-closed status that looks like a badly-behaved model.
-        return _missing_report(ObjectionMissingReason.PRINCIPLES_ERROR)
+        return _missing(ObjectionMissingReason.PRINCIPLES_ERROR)
 
     objections: list[Objection] = []
     unknown: list[str] = []
@@ -743,22 +910,28 @@ def parse_objections(critique: str) -> ObjectionReport:
         status = ObjectionParse.NO_EVIDENCE
     else:
         status = ObjectionParse.OK
-    return ObjectionReport(
-        status=status, objections=tuple(objections), unknown_classes=tuple(unknown)
-    )
+    return _report(status, objections=tuple(objections), unknown_classes=tuple(unknown))
 
 
 def derive_verdict(report: ObjectionReport) -> ReviewEvent:
     """The verdict the class vocabulary implies: RC iff any objection blocks (fail-closed).
 
-    ``MISSING`` derives REQUEST_CHANGES (D-7b): a review whose machine-readable half could
-    not be read is not evidence of "no blocking objection". Unknown classes count as blocking
-    for the same reason, and an unevidenced blocking objection stays blocking (see
-    :func:`parse_objections`).
+    ``MISSING`` and ``AMBIGUOUS`` derive REQUEST_CHANGES: a review whose machine-readable
+    half could not be read (MISSING = no authoritative marker, or the payload cannot be
+    parsed) or could not be trusted (AMBIGUOUS = two authoritative markers, no rule to
+    pick between them) is not evidence of "no blocking objection". Unknown classes count
+    as blocking for the same reason, and an unevidenced blocking objection stays blocking
+    (see :func:`parse_objections`).
 
-    SHADOW: no caller posts this. See the block above :data:`_OBJECTIONS_SENTINEL`.
+    **Invariant (msg-2216 §3 principle 1):** this function reads only ``report.status`` and
+    the ``blocking`` projection derived from ``report.objections``. It does NOT read
+    ``missing_reason``, ``markers_seen``, ``foreign_markers``, or ``format_slips``. Those
+    fields are diagnosis, not derivation; property-testing that the derived verdict is
+    invariant when they vary independently is the machine-checkable form of this rule.
+
+    SHADOW: no caller posts this. See the block above :data:`_OBJECTIONS_SENTINEL_PREFIX`.
     """
-    if report.status is ObjectionParse.MISSING:
+    if report.status in (ObjectionParse.MISSING, ObjectionParse.AMBIGUOUS):
         return ReviewEvent.REQUEST_CHANGES
     return ReviewEvent.REQUEST_CHANGES if report.blocking else ReviewEvent.APPROVE
 
@@ -795,9 +968,16 @@ class VerdictDecision:
         derivation is being calibrated on, and an unusable block is the reason a
         disagreement might be spurious. Reporting only the first would let a systematically
         unreadable block look like a systematically wrong derivation.
+
+        ``AMBIGUOUS`` (two authoritative markers) is included because it is a parser-level
+        contract failure — the model was told to emit exactly one — and the reader needs
+        to see it for the same reason they need to see MISSING: an ambiguous block that
+        derives RC is not the derivation calibrating correctly, it is the parser refusing
+        to guess.
         """
         return self.derived_verdict is not self.gate_verdict or self.objections.status in (
             ObjectionParse.MISSING,
+            ObjectionParse.AMBIGUOUS,
             ObjectionParse.UNKNOWN,
             ObjectionParse.NO_EVIDENCE,
         )
@@ -810,7 +990,13 @@ class VerdictDecision:
         )
 
 
-def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) -> VerdictDecision:
+def decide_verdict(
+    critique: str,
+    *,
+    view: DiffView,
+    finish_reason: str | None,
+    expected_nonce: str,
+) -> VerdictDecision:
     """Compute the model verdict, gate verdict, and pack them with the DiffView.
 
     The gate-verdict rule here — "force-RC on any partial review; otherwise mirror the
@@ -819,6 +1005,14 @@ def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) 
     24 combinations of model / truncated / finish_reason). The goal of this change is
     to make the existing behaviour AUDIBLE, not to change it. See msg-1874 §9 "参照
     実装をテスト内に置く".
+
+    ``expected_nonce`` threads through to :func:`parse_objections`; the same nonce the
+    DRIVER delivered to the model in the system prompt must reach the parser here, or
+    every authoritative block would fail to match and every review would derive
+    REQUEST_CHANGES. The parameter is required (not defaulted) because a silent default
+    would be a security regression — the whole point of the nonce is that it is unique
+    per invocation, and a caller that could not name one has no business calling the
+    parser.
     """
     mv = _parse_model_verdict(critique)
     if view.truncated or finish_reason == "length":
@@ -834,7 +1028,7 @@ def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) 
         gv = ReviewEvent.REQUEST_CHANGES
     # SHADOW (Stage 1). Computed AFTER ``gv`` and never fed back into it — the two statements
     # above are the whole of the gate rule and this change adds nothing to them.
-    report = parse_objections(critique)
+    report = parse_objections(critique, expected_nonce=expected_nonce)
     return VerdictDecision(
         model_verdict=mv,
         gate_verdict=gv,
@@ -971,8 +1165,11 @@ def render_gate_notice(decision: VerdictDecision) -> str:
                 f"{', '.join(sorted(set(report.unknown_classes)))} (counted as blocking)."
             )
         if report.status is ObjectionParse.MISSING:
-            # msg-2130 §3: name the sub-cause so a reader of the review body can tell
-            # "the model wrote no block" (baseline) from "D-1/D-3 fired" (parser hardening).
+            # msg-2216 §2: name the sub-cause so a reader of the review body can tell "the
+            # model wrote no block" (NO_MARKER baseline) from "our own diff quoted the
+            # sentinel" (FOREIGN_MARKER, ordinary) from "our own model format-slipped"
+            # (FORMAT_SLIP, attributable output-contract failure) from "the model wrote an
+            # authoritative block but the payload is malformed" (PAYLOAD_*, D-3 / decode).
             reason_label = (
                 report.missing_reason.value if report.missing_reason is not None else "unknown"
             )
@@ -981,6 +1178,36 @@ def render_gate_notice(decision: VerdictDecision) -> str:
                 f"so the derived side defaults to REQUEST_CHANGES (fail-closed). This says "
                 f"nothing about the review above."
             )
+            if report.missing_reason is ObjectionMissingReason.FORMAT_SLIP:
+                # msg-2216 §3-(b) residual: the format_slip counter is model-attributable in
+                # the common case but not literally so — a hostile diff could inject
+                # instructions that push the model to a live-nonce format-slip. Fail-closed
+                # is unaffected (it stays MISSING → RC); only the Layer-D reading of the
+                # counter needs the caveat. Recorded here so a reader who lands on the
+                # posted body sees the same caveat the dossier does.
+                lines.append(
+                    "> `format_slip` is our own model's output-contract failure in the "
+                    "common case (the live nonce is unguessable), but a prompt-injection "
+                    "path could nudge the model into a live-nonce format-slip — the "
+                    "fail-closed direction is unchanged, only the diagnostic reading has "
+                    "that caveat."
+                )
+        elif report.status is ObjectionParse.AMBIGUOUS:
+            # msg-2216 §5-(a): two-plus authoritative markers → AMBIGUOUS. Under the
+            # nonce discipline this is a coerced case (the model was told to emit exactly
+            # one), so name it in the notice rather than folding it into MISSING.
+            lines.append(
+                "> Two or more authoritative objection blocks were present. The parser "
+                "refuses to guess which one to trust, so the derived side defaults to "
+                "REQUEST_CHANGES (fail-closed). This says nothing about the review above."
+            )
+        # NOTE: ``report.markers_seen``, ``report.foreign_markers``, ``report.format_slips``
+        # are DELIBERATELY NOT rendered here. Einstein's rider-3 objection (msg-2091 §3),
+        # reaffirmed in msg-2216 §3-(a): the ``<!-- mindwire:objections v1 ... -->`` string
+        # appears in every diff that touches this file, and the parser correctly ignoring
+        # nonce-less strings is the mechanism working as intended, not an event worth
+        # alerting the human about on every review. The counters ride in the structured
+        # log line only — see ``_log_objections``.
     return "\n".join(lines)
 
 
@@ -991,18 +1218,29 @@ def _log_objections(pr_slug: str, head_sha: str | None, decision: VerdictDecisio
     is what ``spec/process/README.md`` (旧 §N.3) measured as unread, so it is here for grepping
     a corpus of runs, never as the place a divergence is announced.
 
-    The ``missing_reason=`` field (rider-3 msg-2130 §3) breaks ``parse=missing`` out into
-    its five sub-causes (``no-marker`` / ``multi-marker`` / ``prose-between`` / ``bad-json`` /
-    ``not-a-list``). Without it, a spike in ``parse=missing`` cannot be triaged: three
-    independent signals — the model wrote nothing (baseline), D-1 fired (multi-marker), D-3
-    fired (prose-between) — all collapse to the same string. The field is ``-`` when
-    ``status != MISSING``, so the log line stays grep-friendly.
+    The ``missing_reason=`` field (msg-2216 §2) breaks ``parse=missing`` out into its five
+    sub-causes (``no-marker`` / ``foreign-marker`` / ``format-slip`` / ``payload-not-adjacent``
+    / ``payload-unparseable``). Without it, a spike in ``parse=missing`` cannot be triaged:
+    several independent signals (the model wrote nothing, our own diff quoted the sentinel,
+    our own model format-slipped, an authoritative marker's payload was mis-shaped) all
+    collapse to the same string.
+
+    The three diagnosis counters (``markers_seen`` / ``foreign_markers`` / ``format_slips``,
+    msg-2216 §3-(a)) ride here and ONLY here — they are the raw observations behind
+    ``missing_reason``, kept out of the PR-facing notice per Einstein's OverScope objection
+    (msg-2091 §3) so a naysayer-face PR does not draw an "attackers noticed" alert every
+    time its own sentinel literal rides through the diff. ``foreign_markers`` is the daily
+    background; ``format_slips`` is attributable to our own model's output-contract failure
+    in the common case (msg-2216 §3-(a) — the live nonce is unguessable), with the
+    prompt-injection residual recorded in msg-2216 §3-(b). Splitting the two lets Layer D
+    tell "we have background noise" from "our output contract is not landing".
     """
     report = decision.objections
     missing_reason = report.missing_reason.value if report.missing_reason is not None else "-"
     logger.info(
         "naysayer objections %s (head %s): parse=%s missing_reason=%s blocking=%d advisory=%d "
-        "by_class=%s authored=%s posted=%s derived=%s diverged=%s",
+        "by_class=%s markers_seen=%d foreign_markers=%d format_slips=%d authored=%s posted=%s "
+        "derived=%s diverged=%s",
         pr_slug,
         head_sha or "?",
         report.status.value,
@@ -1010,6 +1248,9 @@ def _log_objections(pr_slug: str, head_sha: str | None, decision: VerdictDecisio
         len(report.blocking),
         len(report.advisory),
         report.counts_label(),
+        report.markers_seen,
+        report.foreign_markers,
+        report.format_slips,
         _model_verdict_label(decision.model_verdict),
         _gate_verdict_label(decision.gate_verdict),
         _gate_verdict_label(decision.derived_verdict),
@@ -1103,7 +1344,7 @@ def _make_diff_view(diff: str) -> DiffView:
     )
 
 
-def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
+def _build_messages(text: str, pr_slug: str, *, nonce: str) -> list[ChatMessage]:
     """Pass-1 (verdict) messages — the SINGLE entry point for the pass-1 system prompt.
 
     ``text`` is the ALREADY-TRUNCATED diff body (i.e. ``DiffView.text``): truncation is
@@ -1115,6 +1356,12 @@ def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
     independently). Tests can pass a plain short string here — that string is treated as
     already-truncated text, the same contract the production driver honours.
 
+    ``nonce`` is the per-invocation objection-block nonce generated by
+    :func:`_generate_objection_nonce`. It is REQUIRED (not defaulted) so a caller cannot
+    accidentally construct pass-1 messages that promise the model a nonce and then fail to
+    deliver one — the exemplar in the prompt shows ``nonce=NONCE`` and this argument is
+    what tells the model what value to substitute for the literal ``NONCE``.
+
     Tests import this to construct the exact system message the driver sends, so any
     later drift between "what the test asserts on" and "what the driver actually sends"
     fails a test (T1 anti-tautology). ADR-17 D-1: the 5-principles SOT is injected
@@ -1122,7 +1369,9 @@ def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
     agent uses, so a one-place edit to ``spec/NAYSAYER_PRINCIPLES.md`` propagates to
     both surfaces (fail-loud: a missing/blank SOT raises).
     """
-    system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
+    system = build_pr_review_pass1_system_prompt(
+        verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT, nonce=nonce
+    )
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
         f"specific hunks you object to, and end with your VERDICT line.\n\n"
@@ -1367,13 +1616,21 @@ class NaysayerPrReviewDriver:
         view = _make_diff_view(diff)
         truncated = view.truncated
 
+        # Per-invocation objection-block nonce. Generated ONCE per ``review()`` call, threaded
+        # into both the pass-1 prompt (so the model knows what to substitute for the ``NONCE``
+        # literal in the marker exemplar) and the parser (so it recognises exactly one shape as
+        # authoritative). Never persisted; every retry / re-fire is a new ``review()`` call and
+        # gets a fresh nonce. See the block above :data:`_OBJECTIONS_SENTINEL_PREFIX`.
+        nonce = _generate_objection_nonce()
         # A-3 two-pass structure (msg-692 §1): run pass 1 (verdict) and pass 2 (ADR-pointer
         # collection) in parallel. Pass 1 = judge; pass 2 = index-injected hint collection whose
         # output cannot alter the verdict (structural guarantee — the driver never reads a
         # verdict token from pass 2's return value). Both fire against the SAME diff at the SAME
         # commit, so a reviewer can trust the ADR pointer section corresponds to the same
         # evidence the verdict was formed on.
-        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(view, pr.slug)
+        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(
+            view, pr.slug, nonce=nonce
+        )
 
         if isinstance(pass1_result, LexoraTimeoutError):
             # T-infra-failure-posts-empty-rc: pass 1 did not finish within the client timeout.
@@ -1413,7 +1670,12 @@ class NaysayerPrReviewDriver:
         # gate rule (force-RC on any partial review) at all 24 combinations of the input
         # matrix — see ``_oracle_gate_verdict`` in tests/test_pr_review_driver.py, which
         # re-states the rule as a 3-line reference and asserts equivalence.
-        decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
+        decision = decide_verdict(
+            body,
+            view=view,
+            finish_reason=completion.finish_reason,
+            expected_nonce=nonce,
+        )
         verdict = decision.gate_verdict
         _log_objections(pr.slug, ci.head_sha, decision)
         # Prepend the gate notice BEFORE the ADR-pointer marker is appended: the notice sits
@@ -1446,7 +1708,7 @@ class NaysayerPrReviewDriver:
         )
 
     async def _run_two_passes(
-        self, view: DiffView, pr_slug: str
+        self, view: DiffView, pr_slug: str, *, nonce: str
     ) -> tuple[Any, AdrPointerSelection, str]:
         """Execute pass 1 + pass 2 concurrently, return their (typed) outcomes.
 
@@ -1454,6 +1716,12 @@ class NaysayerPrReviewDriver:
         :func:`_make_diff_view`. Both passes read ``view.text`` — the raw diff string
         does not reach this method, so the truncation cannot be recomputed here (round-3
         PR-gate finding on PR #186). Same view = same evidence for both passes.
+
+        ``nonce`` reaches ONLY pass 1: the objection-block marker rides in the pass-1
+        verdict reply, and pass 2's JSON-only ADR-pointer reply carries no such block.
+        Threaded explicitly rather than looked up via an instance attribute so the nonce's
+        one-per-invocation lifetime is visible at every call site — the block above
+        :data:`_OBJECTIONS_SENTINEL_PREFIX` is the source-of-truth on that lifetime.
 
         Returns a triple:
 
@@ -1469,7 +1737,7 @@ class NaysayerPrReviewDriver:
         """
         pass1_task = self._lexora.chat_completion(
             model=self._model,
-            messages=_build_messages(view.text, pr_slug),
+            messages=_build_messages(view.text, pr_slug, nonce=nonce),
             max_tokens=self._max_tokens,
         )
         pass2_task = self._collect_adr_pointers(view.text, pr_slug)

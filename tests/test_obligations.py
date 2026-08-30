@@ -276,7 +276,7 @@ def test_pr_gate_pass1_prompt_carries_no_obligation_body() -> None:
     # A dummy diff / slug is enough — the manifest bodies must not appear
     # anywhere in what the driver actually hands to Lexora, regardless of
     # which ChatMessage carries them.
-    pass1 = _build_messages("dummy-diff", "owner/repo#0")
+    pass1 = _build_messages("dummy-diff", "owner/repo#0", nonce="0123456789abcdef")
     pass2 = _build_pass2_messages("dummy-diff", "owner/repo#0")
     rendered = "\n".join(msg.content for msg in (*pass1, *pass2))
     for obligation in manifest.obligations:

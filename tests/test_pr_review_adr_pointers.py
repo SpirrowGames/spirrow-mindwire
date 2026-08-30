@@ -185,7 +185,7 @@ def test_t1_pass1_and_pass2_messages_have_single_production_entry_points() -> No
     # T1: both prompts are built by a SINGLE production entry point tests can call, so any
     # divergence between "what a test asserts on" and "what the driver actually sends" fails a
     # test. The driver itself imports these — no duplicate assembly in the driver body.
-    pass1 = _build_messages("diff --git a/x b/x\n+added", "owner/repo#1")
+    pass1 = _build_messages("diff --git a/x b/x\n+added", "owner/repo#1", nonce="0123456789abcdef")
     assert pass1[0].role == "system"
     assert pass1[1].role == "user"
     pass2 = _build_pass2_messages("diff --git a/x b/x\n+added", "owner/repo#1")
@@ -209,7 +209,7 @@ def test_t2_pass1_prompt_does_not_carry_the_adr_index_block() -> None:
     expected_slice = "cannot search for an ADR you do not know exists"
     assert expected_slice in built_block  # sanity: block itself is well-formed
 
-    pass1_system = _build_messages("diff", "owner/repo#1")[0].content
+    pass1_system = _build_messages("diff", "owner/repo#1", nonce="0123456789abcdef")[0].content
     assert expected_slice not in pass1_system
     # Also: no ADR id at all — pass 1 must be strictly index-less.
     assert "ADR-2026-06-04-19" not in pass1_system
@@ -230,7 +230,7 @@ def test_t3_pass1_prompt_carries_the_m1_self_declaration_stub() -> None:
     # The pass-1 self-declaration (msg-692 §3 endorses source-side self-declaration for BOTH
     # passes): the pass-1 prompt says explicitly that it is not given the ADR index. Imported
     # from the module constant — no re-hardcoded text.
-    pass1_system = _build_messages("diff", "owner/repo#1")[0].content
+    pass1_system = _build_messages("diff", "owner/repo#1", nonce="0123456789abcdef")[0].content
     assert PASS_1_ADR_INDEX_SELF_DECLARATION in pass1_system
 
 
@@ -244,7 +244,7 @@ def test_t4_index_asymmetry_pass1_excludes_pass2_and_designtime_include() -> Non
     # assertion, so a silent one-sided drift is caught.
     from spirrow_mindwire.obligations import load_manifest
 
-    pass1_system = _build_messages("diff", "owner/repo#1")[0].content
+    pass1_system = _build_messages("diff", "owner/repo#1", nonce="0123456789abcdef")[0].content
     pass2_system = _build_pass2_messages("diff", "owner/repo#1")[0].content
     designtime_system = build_naysayer_system_prompt(obligations=load_manifest())
 
@@ -708,9 +708,23 @@ def test_append_marker_places_marker_as_final_non_empty_line() -> None:
 def test_pass1_builder_returns_only_prompt_no_side_effects() -> None:
     # Sanity: build_pr_review_pass1_system_prompt is a pure builder, so a test can construct
     # exactly what the driver constructs by passing the same verdict_task_prompt.
-    p1 = build_pr_review_pass1_system_prompt(verdict_task_prompt="TASK")
+    p1 = build_pr_review_pass1_system_prompt(verdict_task_prompt="TASK", nonce="0123456789abcdef")
     assert "TASK" in p1
     assert PASS_1_ADR_INDEX_SELF_DECLARATION in p1
+    # The nonce is delivered inside a paragraph the pass-1 exemplar tells the model to look
+    # for — the builder's contract requires that value to reach the system message.
+    assert "0123456789abcdef" in p1
+
+
+def test_pass1_system_prompt_builder_requires_a_nonce() -> None:
+    """A pass-1 system message that promises the model a nonce paragraph must not be
+    constructible without one. This is the rider-3 finding on PR #201 (Einstein
+    msg-2092): defaulting ``nonce`` to ``None`` let a caller build a self-contradictory
+    prompt (instruction present, delivery absent). The required-kwarg contract pins the
+    fix at the type level.
+    """
+    with pytest.raises(TypeError):
+        build_pr_review_pass1_system_prompt(verdict_task_prompt="TASK")  # type: ignore[call-arg]
 
 
 def test_pass2_builder_uses_tmp_path_manifest_when_provided(tmp_path: Path) -> None:
