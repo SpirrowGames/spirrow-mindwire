@@ -2210,7 +2210,9 @@ def test_prompt_defers_the_class_vocabulary_to_the_injected_sot() -> None:
             f"the prompt names the class {name!r}; the vocabulary lives in the frontmatter"
         )
     system = build_pr_review_pass1_system_prompt(
-        verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT, nonce=_TEST_NONCE
+        verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT,
+        nonce=_TEST_NONCE,
+        sentinel_prefix=_OBJECTIONS_SENTINEL_PREFIX,
     )
     assert "objection_classes:" in system  # the frontmatter really is in the same prompt
 
@@ -2551,36 +2553,59 @@ async def test_review_generates_a_fresh_nonce_per_call() -> None:
     assert n1 != n2, "two review() calls produced the same objection-block nonce"
 
 
-def test_same_line_marker_and_array_fails_closed_as_no_marker() -> None:
-    """Rider-3 gate finding on PR #206 (correctness on msg-2261): the marker regex tail must
-    only accept horizontal whitespace after ``-->``, NOT arbitrary text.
+def test_same_line_marker_and_array_parses_ok() -> None:
+    """Gate finding on the msg-2270 head (correctness): a marker followed on the SAME
+    line by a valid JSON array must parse OK — D-3 is the wall that judges adjacency,
+    not the marker regex.
 
-    Under the pre-fix ``[^\\n]*$`` tail, the regex would silently consume anything the
-    model wrote on the marker line — including a same-line JSON array — and then the
-    downstream ``critique[match.end():]`` slice would start at the newline, hand the
-    parser prose from the next line, and derive
-    ``MISSING(payload_not_adjacent | payload_unparseable)``. That reason is a lie:
-    there WAS a marker and its payload WAS adjacent — the parser just discarded it.
+    Two earlier tail shapes were tried and rejected under gate review of PR #206:
 
-    The narrow ``[ \\t]*$`` tail refuses to match a marker line that carries anything
-    other than whitespace after ``-->``. The same-line shape then fails as a MARKER
-    shape (``markers_seen == 0`` → ``NO_MARKER``), not as a PAYLOAD shape, so the
-    Layer-D reader sees an honest missing_reason. Same-line format remains fail-closed
-    (still MISSING → REQUEST_CHANGES), but for the true cause.
+    * ``[^\\n]*$`` (original) silently swallowed anything after ``-->`` and reported
+      ``payload_not_adjacent`` / ``payload_unparseable`` — a lie: the parser HAD seen
+      the array and discarded it (msg-2261).
+    * ``[ \\t]*$`` (first-round fix) made the marker fail to match at all, so a
+      same-line array was reported as ``no_marker`` (still fail-closed but on a false
+      premise: there WAS a marker) and the payload was thrown away.
+
+    With NO tail anchor, ``match.end()`` sits exactly one char past ``-->``, the
+    payload slice starts with the same-line whitespace + ``[``, and
+    ``payload.lstrip().startswith("[")`` accepts it. Same-line marker+array is a
+    valid shape the model may legitimately choose; the marker regex only LOCATES the
+    marker, and D-3 alone judges whether the payload is adjacent.
     """
     payload = f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "x"}}]'
-    same_line = f"prose\n{_authoritative_marker()} {payload}\n\nVERDICT: REQUEST_CHANGES"
+    same_line = f"prose\n{_authoritative_marker()} {payload}\n\nVERDICT: APPROVE"
     report = parse_objections(same_line, expected_nonce=_TEST_NONCE)
-    assert report.status is ObjectionParse.MISSING, (
-        f"same-line marker+array must fail-closed; got {report.status.value}"
+    assert report.status is ObjectionParse.OK, (
+        f"same-line marker+array must parse OK; got {report.status.value} "
+        f"(missing_reason={report.missing_reason})"
     )
-    assert report.missing_reason is ObjectionMissingReason.NO_MARKER, (
-        "the narrow tail must report the true cause (NO_MARKER — the shape is not "
-        f"canonical), not a payload-side lie; got {report.missing_reason}"
+    assert len(report.advisory) == 1
+    assert report.blocking == ()
+    assert report.markers_seen == 1
+    assert derive_verdict(report) is ReviewEvent.APPROVE
+
+
+def test_same_line_marker_and_prose_derives_payload_not_adjacent() -> None:
+    """The counterpart to same-line-array: a same-line marker followed by PROSE (not an
+    array) must NOT be accepted — D-3 catches it and reports
+    ``missing_reason=payload_not_adjacent``.
+
+    Together with :func:`test_same_line_marker_and_array_parses_ok`, this pins the
+    division of responsibility introduced under the msg-2270 head gate finding: the
+    marker regex only LOCATES the marker; D-3 alone (``payload.lstrip().startswith("[")``)
+    judges whether the payload is adjacent. A later refactor that reintroduced a tail
+    anchor on the regex would either lose the OK case (previous test) or lose this
+    fail-closed case (moving the wall from D-3 back into the regex silently), so both
+    directions are held.
+    """
+    same_line_prose = f"prose\n{_authoritative_marker()} some junk here\n\nVERDICT: REQUEST_CHANGES"
+    report = parse_objections(same_line_prose, expected_nonce=_TEST_NONCE)
+    assert report.status is ObjectionParse.MISSING
+    assert report.missing_reason is ObjectionMissingReason.PAYLOAD_NOT_ADJACENT, (
+        f"D-3 must fire on same-line prose (not array); got {report.missing_reason}"
     )
-    assert report.markers_seen == 0, (
-        "a marker line with a same-line array must not be counted as a marker at all"
-    )
+    assert report.markers_seen == 1, "the marker is still located and counted"
     assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
 
 

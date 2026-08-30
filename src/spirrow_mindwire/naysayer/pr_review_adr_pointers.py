@@ -246,7 +246,9 @@ class AdrPointerSelection:
 # --- Prompt builders (T1/T4-supporting entry points) ---------------------------------- #
 
 
-def build_pr_review_pass1_system_prompt(*, verdict_task_prompt: str, nonce: str) -> str:
+def build_pr_review_pass1_system_prompt(
+    *, verdict_task_prompt: str, nonce: str, sentinel_prefix: str
+) -> str:
     """Assemble the pass-1 (verdict) system prompt from its production parts.
 
     This is the SINGLE entry point tests use to construct the exact system message
@@ -274,7 +276,21 @@ def build_pr_review_pass1_system_prompt(*, verdict_task_prompt: str, nonce: str)
     rather than generated here because the DRIVER owns the nonce's lifecycle:
     the same value must reach both the prompt and the parser, and generating it
     here would divorce the two.
+
+    ``sentinel_prefix`` is the driver-owned marker prefix (``_OBJECTIONS_SENTINEL_PREFIX``
+    in :mod:`~spirrow_mindwire.naysayer.pr_review`) that the parser uses to recognise
+    a column-zero objection marker. It is passed in for the SAME anti-cyclic reason
+    ``verdict_task_prompt`` is: this module cannot import the driver, and the sentinel
+    prefix is a driver-side constant. Threading it through here (rather than
+    hardcoding the ``<!-- mindwire:objections v1 ... -->`` literal into the delivery
+    paragraph) eliminates the dual-management drift risk the pass-1 gate on the
+    msg-2270 head raised: if the protocol ever bumps to ``v2``, the parser and the
+    prompt would silently diverge across two files, and the parser would stop
+    recognising the very marker the prompt still tells the model to emit. Required
+    (not defaulted) for the same reason as ``nonce``: silent defaults would restore
+    the drift risk this parameter exists to close.
     """
+    marker_exemplar = f"{sentinel_prefix} nonce=NONCE -->"
     return "\n\n".join(
         [
             build_preamble(),
@@ -282,7 +298,7 @@ def build_pr_review_pass1_system_prompt(*, verdict_task_prompt: str, nonce: str)
             "PER-REVIEW NONCE for the objection-block marker: `"
             f"{nonce}"
             "`.\n\nThe exemplar above shows the marker as "
-            "`<!-- mindwire:objections v1 nonce=NONCE -->`. In your reply, replace the literal "
+            f"`{marker_exemplar}`. In your reply, replace the literal "
             f"string `NONCE` in that marker with `{nonce}` — verbatim, no whitespace, no quotes. "
             "Any other value (including the placeholder `NONCE`, or no `nonce=` at all) is not "
             "authoritative, and the driver treats a block with such a marker as absent.",

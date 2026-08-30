@@ -548,20 +548,32 @@ _NONCE_HEX_CHARS = _NONCE_HEX_BYTES * 2
 #                    exemplar, a stale nonce from a previous review, an attacker's guess).
 #
 # The regex intentionally uses ``[^\n]*?`` (not ``.*?``) so a marker cannot span lines — the
-# authority check would otherwise have to re-split attrs on newlines. After ``-->`` only
-# horizontal whitespace (spaces, tabs) up to end-of-line is tolerated — NOT arbitrary text.
-# The distinction matters: :func:`parse_objections` slices the payload starting at
-# ``match.end()``, so anything the regex consumes on the marker line is stripped from the
-# payload it hands to the JSON decoder. A broad tail like ``[^\n]*$`` (the pre-fix shape)
-# would silently swallow anything the model wrote on the marker line — including a same-
-# line JSON array (``<!-- ... nonce=<live> --> [{...}]``) — and then report
-# ``missing_reason=payload_not_adjacent`` / ``payload_unparseable``, which is a lie: the
-# parser DID see a marker's payload, it just discarded it. The narrow ``[ \t]*$`` tail
-# refuses to match a marker line that carries anything other than whitespace after
-# ``-->``, so the same-line shape fails-closed AS a shape failure (``markers_seen=0`` →
-# ``no_marker``) rather than being mislabelled as a payload failure. Layer-D readers
-# depend on the missing_reason being truthful about what the parser actually saw.
-# Rider-3 gate finding on PR #206 (correctness on msg-2261) supplied this correction.
+# authority check would otherwise have to re-split attrs on newlines. There is NO tail
+# anchor after ``-->``: ``match.end()`` sits exactly one character past ``-->``, so the
+# payload slice ``critique[match.end():]`` starts with whatever the model wrote next —
+# whether that is a newline (own-line marker → array on the next line), a single space
+# (same-line marker+array: ``<!-- ... nonce=<live> --> [{...}]``), or trailing content.
+# D-3 is the wall that judges the payload's first non-whitespace character; the regex's
+# job is only to LOCATE the marker, not to constrain what follows.
+#
+# Two earlier tail shapes were rejected under gate review of PR #206:
+#
+# * ``[^\n]*$`` (the original) silently consumed anything on the marker line — including
+#   a same-line JSON array — because it moves ``match.end()`` to end-of-line. The parser
+#   then read the NEXT line as the payload and reported a payload-side failure
+#   (``payload_not_adjacent`` / ``payload_unparseable``), which was a lie: the parser had
+#   seen the array and discarded it (msg-2261).
+# * ``[ \t]*$`` (first-round fix, msg-2270) failed to match at all when a marker was
+#   followed by any non-whitespace on the same line, so a same-line marker+array was
+#   reported as ``no_marker`` (still fail-closed, but on a false premise: there WAS a
+#   marker) and the payload was thrown away (gate finding under msg-2270 head).
+#
+# Dropping the tail anchor entirely puts the responsibility for payload adjacency exactly
+# where D-3 already lives: on ``payload.lstrip().startswith("[")``. Same-line valid
+# payload → D-3 passes and the block parses OK. Same-line prose then array → D-3 fails
+# with ``payload_not_adjacent`` (fail-closed on the true cause). Trailing whitespace on
+# the marker line → parsed OK (the lstrip skips it). This is the shape the gate on the
+# msg-2270 head asked for.
 #
 # msg-2216 §4 (gate advisory on #201): a regex that ONLY accepts the canonical
 # ``\s+nonce=[A-Za-z0-9]+`` inside would miss ordinary format-slip shapes (``nonce: X`` /
@@ -570,7 +582,7 @@ _NONCE_HEX_CHARS = _NONCE_HEX_BYTES * 2
 # counter that only reflects the regex being too tight. The loose ``[^\n]*?`` capture with
 # post-capture classification is what closes that misattribution.
 _OBJECTIONS_SENTINEL_ANY_RE = re.compile(
-    rf"^{re.escape(_OBJECTIONS_SENTINEL_PREFIX)}([^\n]*?)-->[ \t]*$",
+    rf"^{re.escape(_OBJECTIONS_SENTINEL_PREFIX)}([^\n]*?)-->",
     re.MULTILINE,
 )
 
@@ -1422,7 +1434,9 @@ def _build_messages(text: str, pr_slug: str, *, nonce: str) -> list[ChatMessage]
     """
     _validate_nonce(nonce)
     system = build_pr_review_pass1_system_prompt(
-        verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT, nonce=nonce
+        verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT,
+        nonce=nonce,
+        sentinel_prefix=_OBJECTIONS_SENTINEL_PREFIX,
     )
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "

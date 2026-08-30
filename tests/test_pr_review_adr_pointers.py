@@ -708,12 +708,21 @@ def test_append_marker_places_marker_as_final_non_empty_line() -> None:
 def test_pass1_builder_returns_only_prompt_no_side_effects() -> None:
     # Sanity: build_pr_review_pass1_system_prompt is a pure builder, so a test can construct
     # exactly what the driver constructs by passing the same verdict_task_prompt.
-    p1 = build_pr_review_pass1_system_prompt(verdict_task_prompt="TASK", nonce="0123456789abcdef")
+    p1 = build_pr_review_pass1_system_prompt(
+        verdict_task_prompt="TASK",
+        nonce="0123456789abcdef",
+        sentinel_prefix="<!-- mindwire:objections vX",
+    )
     assert "TASK" in p1
     assert PASS_1_ADR_INDEX_SELF_DECLARATION in p1
     # The nonce is delivered inside a paragraph the pass-1 exemplar tells the model to look
     # for — the builder's contract requires that value to reach the system message.
     assert "0123456789abcdef" in p1
+    # The sentinel prefix is threaded through and appears in the marker exemplar the
+    # delivery paragraph uses — a test caller can plant a fixture prefix and see it
+    # substituted (pinning the anti-dual-management contract added under msg-2270 head
+    # gate: no builder-side hardcode of the driver-side sentinel literal).
+    assert "<!-- mindwire:objections vX nonce=NONCE -->" in p1
 
 
 def test_pass1_system_prompt_builder_requires_a_nonce() -> None:
@@ -724,7 +733,21 @@ def test_pass1_system_prompt_builder_requires_a_nonce() -> None:
     fix at the type level.
     """
     with pytest.raises(TypeError):
-        build_pr_review_pass1_system_prompt(verdict_task_prompt="TASK")  # type: ignore[call-arg]
+        build_pr_review_pass1_system_prompt(  # type: ignore[call-arg]
+            verdict_task_prompt="TASK", sentinel_prefix="<!-- mindwire:objections v1"
+        )
+
+
+def test_pass1_system_prompt_builder_requires_a_sentinel_prefix() -> None:
+    """The builder must not accept a defaulted sentinel prefix: the whole point of
+    threading the driver-side ``_OBJECTIONS_SENTINEL_PREFIX`` through is to remove
+    dual-management of the marker literal. A silent default would let a caller
+    reintroduce the drift risk this parameter closes (gate finding on msg-2270 head).
+    """
+    with pytest.raises(TypeError):
+        build_pr_review_pass1_system_prompt(  # type: ignore[call-arg]
+            verdict_task_prompt="TASK", nonce="0123456789abcdef"
+        )
 
 
 def test_pass2_builder_uses_tmp_path_manifest_when_provided(tmp_path: Path) -> None:
