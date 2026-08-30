@@ -90,6 +90,21 @@ $StarvedThreshold         = [TimeSpan]::FromHours(24)
 $DailyDigestInterval  = [TimeSpan]::FromHours(24)
 $SessionLogTailLines  = 50
 
+# T-digest-exceeds-discord-limit-and-is-dropped D-1: the digest renderer owns a fixed payload budget,
+# so the delivered message length is DECOUPLED from the queue length. 3,500 is well under the
+# `content` 2,000 hard limit AND under the `embed.description` 4,096 limit, giving room for either
+# transport. This is not a "how big can Discord take?" number — Discord's actual limits may change;
+# the invariant this constant defends is "the renderer emits ≤ this many characters, and any excess
+# collapses to `+N 件` rather than to a 400". (Bohr msg-2099 §0 / D-1 — msg-2013 sent 63 sequential
+# 400s because the ONLY defense was "hope the queue stays short.")
+$DigestBudget = 3500
+
+# T-digest-exceeds-discord-limit-and-is-dropped D-6 / §4 (msg-2106): the daily digest is period-gated,
+# not interval-gated. Runs once per LOCAL day at or after this wall-clock time — that is the promise
+# the phone-side reader has ("my 09:00 digest"). Time drift (24h clock walking off) is impossible
+# because the gate is "period ≠ last_sent_period AND local ≥ this time", not "elapsed ≥ 24h".
+$DailyDigestDeliveryTime = [TimeSpan]::FromHours(9)
+
 # --- paths -------------------------------------------------------------------------------------
 # mindwire-loop reads <data_dir>/config/mindwire.toml; honour the same env var run-conductor.ps1 does.
 $dataDir = if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } else { Join-Path $HOME "spirrow-mindwire-data" }
@@ -109,6 +124,13 @@ $quarantineStatePath = Join-Path $dataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
 $evaluatedStatePath = Join-Path $dataDir "state\evaluated.json"
 $digestStatePath = Join-Path $dataDir "state\digest.json"
+# T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): notify-health carries just enough to
+# derive the ⚠ line ("full digest is X periods overdue") from a single field — last_full_success_period.
+# Deliberately does NOT carry a `consecutive_failures` counter (Einstein msg-2102 §1 → Bohr msg-2103):
+# an unstored value cannot be miscleared by a degraded delivery, so the state minimisation IS the fix.
+# Remaining fields (last_attempt_at / last_error / last_error_class) are DIAGNOSTIC ONLY — the ⚠ predicate
+# consults ONLY the period id (D-6 predicate-discipline).
+$notifyHealthPath = Join-Path $dataDir "state\notify-health.json"
 # Composer cache (T-decision-request-composer S2). One row per parked thread key,
 # keyed by the same "project/thread_id" the notified.json / evaluated.json use so a
 # reader can cross-reference by eye. The row carries the last composer envelope
@@ -655,20 +677,102 @@ function Format-DurationDigest {
     return "${minutes}m"
 }
 
-# Should the daily-digest clock advance given this Send-Notification result?
+# Result classifier for a Send-Notification return. Two questions come out of one shape so the two
+# never diverge:
+#   - Test-DigestDelivered: did anything land in the channel this tick? (full OR degraded)
+#     If yes, `last_sent_period` advances → cadence gate closes for the period.
+#   - Test-DigestFullSuccess: did the FULL digest land? (only 'sent' with class 'ok')
+#     If yes, `last_full_success_period` advances → ⚠ predicate clears.
 #
-# 'sent'     -> yes, the notification landed and we do not want to re-attempt for 24h.
-# 'skipped'  -> yes, the operator has no webhook configured. Retrying every 5 minutes accomplishes
-#               nothing (the webhook will not appear on its own) and would log-spam the daemon.
-# 'failed'   -> no, the webhook is configured but the POST failed. This is the ONLY case where the
-#               next tick should retry — the whole reason the clock is gated on the result at all.
+# 'skipped' (no webhook) is treated as delivery: the operator has deliberately no channel, so
+# retrying every 5 minutes accomplishes nothing (the webhook will not appear on its own) and would
+# log-spam the daemon. But 'skipped' is NOT a full success — a channel that does not exist has not
+# been informed, so the ⚠ clock keeps ticking regardless. This distinction is only visible to a
+# future operator who wires a webhook in mid-flight, at which point they SHOULD see the ⚠.
+# (T-digest-exceeds-discord-limit-and-is-dropped D-6, replaces the older Test-DigestClockAdvances
+# which only had one question and answered both wrong once degraded delivery entered the picture.)
+function Test-DigestDelivered {
+    param($Result)
+    if ($Result -is [hashtable]) { $status = $Result['status'] } else { $status = $Result }
+    return ($status -eq 'sent' -or $status -eq 'skipped' -or $status -eq 'degraded')
+}
+function Test-DigestFullSuccess {
+    param($Result)
+    if ($Result -is [hashtable]) {
+        return ($Result['status'] -eq 'sent' -and $Result['class'] -eq 'ok')
+    }
+    return ($Result -eq 'sent')
+}
+
+# T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106 §3, msg-2104): the digest cadence
+# is per-PERIOD, not per-interval. A period id is a wall-clock local date string; the predicate
+# "period P ≠ period Q" is jitter-immune because a 5-minute tick offset does not cross a date
+# boundary. This is the whole point of the shift from `last_sent_at` (a timestamp) to
+# `last_sent_period` (a discrete id) — the jitter tolerance that Einstein msg-2104 proposed as a
+# fudge constant becomes structurally unnecessary.
 #
-# Pulled out as a helper so the "which outcomes are terminal?" decision is testable and lives in
-# one place. If a future refactor adds a fourth outcome, this table is the only line to touch.
-# (Tier B naysayer, PR #138 round 5.)
-function Test-DigestClockAdvances {
-    param([string]$Result)
-    return ($Result -eq 'sent' -or $Result -eq 'skipped')
+# The period id is the LOCAL calendar day (yyyy-MM-dd). "Local" means the machine running the
+# scheduler; that is the same clock Takahito reads on his phone at breakfast, which is the
+# consumer this digest is FOR.
+function Get-DigestPeriod {
+    param([datetime]$Now)
+    # Get-Date .ToLocalTime() gives us a DateTime with Kind=Local. Format as ISO date.
+    return $Now.ToLocalTime().ToString('yyyy-MM-dd')
+}
+
+# Are we AT or PAST today's delivery time? Period-gated cadence has two parts (msg-2106 §4): the
+# period must be new AND the local wall clock must be ≥ configured delivery time. Without the second
+# check, a period boundary at midnight (23:58 send + 00:03 tick) would double-send.
+function Test-DigestDeliveryDue {
+    param([datetime]$Now, [TimeSpan]$DeliveryTime)
+    $local = $Now.ToLocalTime()
+    return $local.TimeOfDay -ge $DeliveryTime
+}
+
+# Compute the "periods missed since last full success" from health state. Returns 0 when the last
+# full success was in the current or previous period (healthy jitter) or when no history exists
+# (initial state — do not alarm on first run).
+#
+# Uses date arithmetic on the parsed period ids so daylight-savings transitions do not skew the
+# count. The predicate is "the number of local calendar days elapsed", which is the same thing an
+# operator counts on a wall calendar; no time-difference math is involved.
+function Get-DigestPeriodsMissed {
+    param([string]$CurrentPeriod, [string]$LastFullSuccessPeriod)
+    if (-not $LastFullSuccessPeriod) { return 0 }
+    try {
+        $cur = [datetime]::ParseExact($CurrentPeriod, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        $last = [datetime]::ParseExact($LastFullSuccessPeriod, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    } catch { return 0 }
+    $delta = ($cur - $last).Days
+    if ($delta -le 1) { return 0 }  # 1 = healthy (today's send follows yesterday's success)
+    return ($delta - 1)             # 2 = missed 1, 4 = missed 3, ...
+}
+
+# T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): the ⚠ line is DERIVED from
+# `last_full_success_period`. No stored counter, no threshold constant — just "period arithmetic
+# says N days without a full delivery, and N ≥ 2". The predicate discipline (D-6) forbids
+# consulting `last_attempt_at` / `last_error*` here: those are display-only, and letting them
+# influence the predicate would recreate the "cleared by a transient recovery" bug Einstein
+# msg-2102 §2 found in the earlier draft.
+function Get-DigestHealthWarning {
+    param([hashtable]$Health, [string]$CurrentPeriod)
+    $lastFull = $null
+    if ($Health -and $Health.ContainsKey('last_full_success_period')) { $lastFull = $Health['last_full_success_period'] }
+    $missed = Get-DigestPeriodsMissed -CurrentPeriod $CurrentPeriod -LastFullSuccessPeriod $lastFull
+    if ($missed -lt 1) { return $null }
+    $errClass = $null
+    if ($Health -and $Health.ContainsKey('last_error_class')) { $errClass = $Health['last_error_class'] }
+    $errSuffix = if ($errClass) { " / 直近: $errClass" } else { '' }
+    return "⚠ フル digest が $missed 期間配送できていません（最後の成功 $lastFull$errSuffix）"
+}
+
+# T-digest-exceeds-discord-limit-and-is-dropped D-2 (msg-2099): the fallback message the operator
+# sees when the full digest hits a deterministic-payload rejection. Fixed length, self-describing,
+# and honest about what happened: the point is that a DEGRADED delivery is still a delivery, and
+# the operator reading it should be told "the mechanism is broken, not the queue".
+function New-DegradedDigestMessage {
+    param([int]$WaitingCount, [string]$CurrentPeriod)
+    return "MindWire 日次ダイジェスト ($CurrentPeriod) — フル本文の組み立てに失敗しました（$WaitingCount 件待機中）。chatroom を確認してください。"
 }
 
 # The signature Send-NotificationIfChanged uses to dedup the K-budget "systemic cause suspected"
@@ -727,18 +831,35 @@ function New-DailyDigest {
         # $ParkedPollErrors is the errors[] list from scripts/parked_humans.py (per-candidate fetch
         # failures). Rendered as "取得失敗: N 件" under the 判断待ち section so an outage does not
         # silently under-report; the section itself never disappears (I-2 "黙って劣化しない").
-        [array]$ParkedPollErrors = @()
+        [array]$ParkedPollErrors = @(),
+        # T-digest-exceeds-discord-limit-and-is-dropped D-1 (msg-2099): budget in characters.
+        # 0 or omitted = unbounded (legacy callers). When > 0, per-section entry lists are truncated
+        # (oldest-first is preserved) and a `+N 件` marker records the exact number dropped, so the
+        # header count is always the true total. If the fixed overhead alone exceeds the budget,
+        # the digest is emitted anyway (its overhead is small and self-consistent); a caller that
+        # cannot afford even the overhead should call New-DegradedDigestMessage directly.
+        [int]$Budget = 0,
+        # T-digest-exceeds-discord-limit-and-is-dropped D-6: the ⚠ line derived from
+        # notify-health.json. Prepended above the header when set — non-null iff the last full
+        # success is ≥ 2 periods old. Never affects the dedup signature: msg-2101 D-7 forbids
+        # letting rendering-side ephemera reach any suppression predicate.
+        [string]$HealthWarning = $null
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
+    # Age (seconds since first_failure_at) is carried alongside each line so the renderer can sort
+    # oldest-first — msg-2099 D-1: truncation must drop what is LEAST likely to have been forgotten.
     $escalatedList = @()
     $quarantinedList = @()
     $staleList = @()
+    $oldestQuarantineAge = $null
     foreach ($key in $QuarantineState.Keys) {
         $rec = $QuarantineState[$key]
         $firstAt = ConvertTo-UtcInstant $rec.first_failure_at
         $derived = Get-DerivedQuarantineState -FirstFailureAt $firstAt -Now $Now
-        $age = Format-DurationDigest -Span ($Now - $firstAt)
+        $ageSpan = ($Now - $firstAt)
+        if ($null -eq $oldestQuarantineAge -or $ageSpan -gt $oldestQuarantineAge) { $oldestQuarantineAge = $ageSpan }
+        $age = Format-DurationDigest -Span $ageSpan
 
         # Extract project id from key ("project/thread_id") to reach the right probe map.
         $project = ($key -split '/', 2)[0]
@@ -777,10 +898,15 @@ function New-DailyDigest {
         if ($hint) { $line += "   ⚠ $hint" }
         if ($reproHint) { $line += "`n    $reproHint" }
 
+        # Carry the age-in-seconds beside the line so the sort step can order oldest-first without
+        # re-parsing formatted durations. PSCustomObject with .Line and .AgeSeconds so the sort key
+        # is unambiguous even if a formatted string happens to contain digits (unlikely, but the
+        # explicit numeric key is honest about what "oldest first" means).
+        $entry = [PSCustomObject]@{ Line = $line; AgeSeconds = [int64]$ageSpan.TotalSeconds }
         switch ($derived) {
-            'stale'       { $staleList       += $line }
-            'escalated'   { $escalatedList   += $line }
-            default       { $quarantinedList += $line }
+            'stale'       { $staleList       += $entry }
+            'escalated'   { $escalatedList   += $entry }
+            default       { $quarantinedList += $entry }
         }
     }
 
@@ -805,31 +931,110 @@ function New-DailyDigest {
             # A "never evaluated" thread carries a slightly different label so the operator does not
             # spend cognitive effort deciding whether the entry means "stuck" or "never touched."
             $suffix = if (-not $lastAtRaw) { "   (未評価)" } else { "" }
-            $starvedList += "  $key   $(Format-DurationDigest -Span $age)$suffix"
+            $starvedLine = "  $key   $(Format-DurationDigest -Span $age)$suffix"
+            $starvedList += [PSCustomObject]@{ Line = $starvedLine; AgeSeconds = [int64]$age.TotalSeconds }
         }
     }
 
+    # Sort each section oldest-first (largest AgeSeconds first) — msg-2099 D-1: what's most likely
+    # to have been forgotten goes first, and truncation drops the newest.
+    $staleList       = @($staleList       | Sort-Object -Property AgeSeconds -Descending)
+    $escalatedList   = @($escalatedList   | Sort-Object -Property AgeSeconds -Descending)
+    $quarantinedList = @($quarantinedList | Sort-Object -Property AgeSeconds -Descending)
+    $starvedList     = @($starvedList     | Sort-Object -Property AgeSeconds -Descending)
+
+    # Build the compact summary line first (msg-2099 D-1: "1 行目で行動が決まる — 件数と最古の
+    # 待ち日数"). Emitted even when both sections are 0 so the format is stable across empty and
+    # non-empty days.
+    $totalQ = $escalatedList.Count + $quarantinedList.Count + $staleList.Count
+    $oldestQuarantineDays = if ($oldestQuarantineAge) { [int]($oldestQuarantineAge.TotalDays) } else { 0 }
+    $summary = "human-parked $($HumanParked.Count) / 隔離 $totalQ / 飢餓 $($starvedList.Count) / 最古 ${oldestQuarantineDays}d"
+
     $lines = @()
+    # T-digest-exceeds-discord-limit-and-is-dropped D-6: ⚠ line ABOVE the header when set. Prepending
+    # rather than appending because the mobile reader sees the first ~2 lines in the notification
+    # preview, and the whole point of the ⚠ is that the operator sees it without opening.
+    if ($HealthWarning) { $lines += $HealthWarning }
     $lines += "MindWire 日次ダイジェスト ($(Get-Date -Date $Now.ToLocalTime() -Format 'yyyy-MM-dd HH:mm'))"
+    $lines += $summary
     $lines += ""
 
-    $totalQ = $escalatedList.Count + $quarantinedList.Count + $staleList.Count
+    # T-digest-exceeds-discord-limit-and-is-dropped D-1: emit-with-budget helper. When $Budget is 0
+    # every list is emitted in full (legacy behaviour, preserves existing tests). When $Budget > 0,
+    # each section is truncated so the ENTIRE output stays ≤ budget; the count in the header stays
+    # correct because it is computed from the full list before truncation.
+    #
+    # Budget accounting has TWO reserves so nothing after a truncation can push the total over:
+    #   * $overflowMarker = the "+N 件（省略）" line that MAY follow a truncated section.
+    #   * $trailingReserve = every line the renderer WILL emit after any given section — headers of
+    #     the sections that come later, and the invariant footer at the bottom. Without this the
+    #     first section could consume everything and later sections would push the total over.
+    # The trailing content is emitted verbatim in the block below, so its size is exactly counted;
+    # a future edit that adds/removes content there must also update these constants. Guarded by
+    # tests/Test-SweepDigest.ps1 (the 200-entry check will fail loudly if the actual total exceeds
+    # budget for any reason).
+    $overflowMarker = 60
+    # Trailing content estimate (in characters, generous):
+    #   - 判断待ち header + fetch-error rows       : ~ 80
+    #   - 飢餓 header + entries (bounded by _AddSectionEntries call)
+    #   - blank line + 3-line footer               : ~200
+    # Sum ~= 280; use 400 for safety margin. If the bounded renderer's total ever creeps over
+    # $Budget, tighten this by measuring the actual emitted trailing content and subtracting.
+    $trailingReserve = 400
+    $currentLen = ($lines -join "`n").Length
+    function _AddSectionEntries {
+        param([array]$Entries, [int]$MaxLen, [int]$Reserve, [ref]$RunningLen)
+        # Returns @(linesToEmit, droppedCount). Adds newline+entry pairs from $Entries in order,
+        # stopping when adding the NEXT line would push (RunningLen + line + Reserve) past MaxLen.
+        $out = @()
+        $dropped = 0
+        for ($i = 0; $i -lt $Entries.Count; $i++) {
+            $entry = $Entries[$i]
+            $line = if ($entry -is [PSCustomObject] -and $entry.PSObject.Properties.Name -contains 'Line') { $entry.Line } else { [string]$entry }
+            # +1 for the newline that will join this line to whatever came before.
+            $cost = 1 + $line.Length
+            if ($MaxLen -gt 0 -and ($RunningLen.Value + $cost + $Reserve) -gt $MaxLen) {
+                $dropped = $Entries.Count - $i
+                break
+            }
+            $out += $line
+            $RunningLen.Value += $cost
+        }
+        return @{ Emitted = $out; Dropped = $dropped }
+    }
+
     $lines += "隔離中: $totalQ 件"
     if ($totalQ -eq 0) {
         $lines += "  (該当なし)"
     }
     else {
+        # Sections in order of urgency: stale (7d+) → escalated (24h+) → quarantined (fresh). The
+        # order was already this in the legacy renderer; the change is only that within each
+        # section, entries are oldest-first (see the sort step above).
+        # $totalReserve = overflow marker + everything the renderer WILL still emit after this
+        # section (see the block comment above for the count). Passed to every section emitter so
+        # a later section is never starved by an earlier one that consumed the entire budget.
+        $totalReserve = $overflowMarker + $trailingReserve
         if ($staleList.Count -gt 0) {
             $lines += "  [stale] — 直すか、スレッドを畳むか決めよ"
-            $lines += $staleList
+            $runLen = [ref]($lines -join "`n").Length
+            $result = _AddSectionEntries -Entries $staleList -MaxLen $Budget -Reserve $totalReserve -RunningLen $runLen
+            $lines += $result.Emitted
+            if ($result.Dropped -gt 0) { $lines += "  +$($result.Dropped) 件（省略）" }
         }
         if ($escalatedList.Count -gt 0) {
             $lines += "  [escalated] — 24h 以上経過"
-            $lines += $escalatedList
+            $runLen = [ref]($lines -join "`n").Length
+            $result = _AddSectionEntries -Entries $escalatedList -MaxLen $Budget -Reserve $totalReserve -RunningLen $runLen
+            $lines += $result.Emitted
+            if ($result.Dropped -gt 0) { $lines += "  +$($result.Dropped) 件（省略）" }
         }
         if ($quarantinedList.Count -gt 0) {
             $lines += "  [quarantined]"
-            $lines += $quarantinedList
+            $runLen = [ref]($lines -join "`n").Length
+            $result = _AddSectionEntries -Entries $quarantinedList -MaxLen $Budget -Reserve $totalReserve -RunningLen $runLen
+            $lines += $result.Emitted
+            if ($result.Dropped -gt 0) { $lines += "  +$($result.Dropped) 件（省略）" }
         }
     }
 
@@ -844,6 +1049,10 @@ function New-DailyDigest {
         $lines += "  (該当なし)"
     }
     else {
+        # Pre-build all rows into an entry list so the budget helper can operate uniformly. Row
+        # order is preserved (msg-1370's caller-owned order — this renderer does not resort
+        # human-parked; only quarantine sections are sorted oldest-first here).
+        $parkedEntries = @()
         foreach ($p in $HumanParked) {
             $key = $p.key
             $head = $p.head_msg_id
@@ -873,8 +1082,13 @@ function New-DailyDigest {
                 }
             }
             $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
-            $lines += "  $key   [$head]$suffix"
+            $parkedEntries += [PSCustomObject]@{ Line = "  $key   [$head]$suffix"; AgeSeconds = 0 }
         }
+        # 判断待ち section: 飢餓 + footer remain after this. Reserve marker + trailing.
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $parkedEntries -MaxLen $Budget -Reserve ($overflowMarker + $trailingReserve) -RunningLen $runLen
+        $lines += $result.Emitted
+        if ($result.Dropped -gt 0) { $lines += "  +$($result.Dropped) 件（省略）" }
     }
     # Fetch-error surface (I-2 "黙って劣化しない"). When scripts/parked_humans.py could not read
     # some threads' bodies, the section stays but the count above under-reports. Say so out loud.
@@ -893,7 +1107,12 @@ function New-DailyDigest {
         $lines += "  (該当なし)"
     }
     else {
-        $lines += $starvedList
+        # 飢餓 is the LAST list-emitting section. Only the footer remains, so reserve only marker
+        # + a smaller trailing (footer ~200 alone).
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $starvedList -MaxLen $Budget -Reserve ($overflowMarker + 250) -RunningLen $runLen
+        $lines += $result.Emitted
+        if ($result.Dropped -gt 0) { $lines += "  +$($result.Dropped) 件（省略）" }
     }
 
     $lines += ""
@@ -970,6 +1189,47 @@ function Get-ConductorVerdict {
 $notifyWebhook = [Environment]::GetEnvironmentVariable('MINDWIRE_NOTIFY_DISCORD_WEBHOOK', 'User')
 $notifyProxy = if ($env:MINDWIRE_NOTIFY_PROXY) { $env:MINDWIRE_NOTIFY_PROXY } else { "http://127.0.0.1:3128" }
 
+# T-digest-exceeds-discord-limit-and-is-dropped D-5 (msg-2099): the CONSUMPTION contract for a
+# failure class is defined by this thread — the STATUS→CLASS mapping is not. That mapping's proper
+# home is T-gate-review-submit-failure-handling; while it lands, the inline switch below is the
+# provisional table with the caveat spelled out here so a reader knows to check the other thread
+# once it merges (and to update `provisional=$true` → `$false` in one place).
+#
+# Three classes are meaningful to the caller:
+#   - deterministic-payload: the request itself was rejected by the peer. Retrying with the SAME
+#     payload will fail the SAME way. Only path that can succeed is a SMALLER payload → degraded
+#     fallback (D-2). Digest cadence: mark last_sent_period so we do not spam, do NOT mark
+#     last_full_success_period so ⚠ stays lit.
+#   - deterministic-permanent: the webhook itself is gone (401/403/404). Retrying anything to this
+#     URL will fail the same way. Do NOT send a second POST (that is the whole point of "permanent").
+#     Digest cadence: mark last_sent_period (webhook-less days should not spam either).
+#   - transient: network flake, proxy hiccup, Discord outage, or a rate-limit. Retryable on the
+#     next tick. This is the ONLY class where digest cadence should hold its clock.
+#   - unknown: fail-safe = transient (D-5). If we cannot tell, assume it might resolve on retry.
+function Get-NotificationFailureClass {
+    param([int]$HttpStatus, [string]$ExceptionMessage)
+    # Payload-derived rejections. 400 is the exact failure msg-2013 measured 63 times in 3 days.
+    # 413 (Payload Too Large) is included even though Discord returns 400 for oversize `content` —
+    # some intermediaries (proxies, WAFs) translate one into the other, and both mean the same thing
+    # to the caller: sending SMALLER is the only way through.
+    if ($HttpStatus -eq 400 -or $HttpStatus -eq 413) { return 'deterministic-payload' }
+    # Webhook itself is gone. 401 (bad token) / 403 (forbidden) / 404 (webhook deleted from the
+    # Discord side) all mean "this URL will never accept your POST"; retrying with a smaller
+    # payload will not help, so degraded fallback is skipped.
+    if ($HttpStatus -eq 401 -or $HttpStatus -eq 403 -or $HttpStatus -eq 404) { return 'deterministic-permanent' }
+    # 429 is 4xx but transient — the whole point of the class is that its taxonomy is not "status
+    # code >= 400" but "same POST retries succeed". This is exactly why D-5 refuses to define the
+    # taxonomy inline: too many rules and only one place they can drift out of sync.
+    if ($HttpStatus -eq 429) { return 'transient' }
+    # 5xx: server-side, retryable.
+    if ($HttpStatus -ge 500 -and $HttpStatus -lt 600) { return 'transient' }
+    # No status code at all: network / DNS / proxy. Retryable.
+    if ($HttpStatus -eq 0) { return 'transient' }
+    # Unknown 4xx that wasn't caught above — safest default is transient (D-5, fail-safe = do the
+    # thing that already worked, per #138 round 2's rationale for the outage case).
+    return 'transient'
+}
+
 function Send-Notification {
     param([string]$Message)
 
@@ -981,7 +1241,7 @@ function Send-Notification {
         # a webhook-less run does not permanently flood the log with "sending daily digest" and
         # "notification skipped" every 5 minutes forever. (Tier B naysayer, PR #138 round 5.)
         Write-Log "notification skipped (MINDWIRE_NOTIFY_DISCORD_WEBHOOK not set)"
-        return 'skipped'
+        return @{ status = 'skipped'; class = 'no-webhook'; http_status = 0; error = $null }
     }
     try {
         $payload = @{ content = $Message } | ConvertTo-Json -Compress
@@ -992,19 +1252,25 @@ function Send-Notification {
         # First line only, so a multi-line digest does not spam the log with its own body.
         $firstLine = ($Message -split "`n", 2)[0]
         Write-Log "notification sent: $firstLine"
-        return 'sent'
+        return @{ status = 'sent'; class = 'ok'; http_status = 200; error = $null }
     }
     catch {
-        # 'failed' — webhook configured but the send failed (network, proxy, Discord outage). A
-        # retry on the next tick is the right response, so the digest gate does NOT advance its
-        # clock on this. Never fail the sweep because the notifier failed — the conductor's work
-        # already happened. Same redaction rule as before: scrub the webhook out of any exception
-        # text before it touches the log or a record. Quarantine records / digest lines / this log
-        # line all go through this branch, so no path that touches user data can leak the bearer
-        # secret.
+        # 'failed' — webhook configured but the send failed. NEVER fail the sweep because the
+        # notifier failed — the conductor's work already happened. Redaction: scrub the webhook
+        # out of any exception text before it touches the log or a record. Quarantine records /
+        # digest lines / this log line all go through this branch, so no path that touches user
+        # data can leak the bearer secret.
         $reason = "$($_.Exception.Message)".Replace($notifyWebhook, '<webhook-redacted>')
-        Write-Log "notification FAILED (non-fatal): $reason"
-        return 'failed'
+        # Extract the HTTP status from the exception if the response object survived. 0 = no status
+        # (network / DNS / proxy failure). See Get-NotificationFailureClass for the taxonomy.
+        $httpStatus = 0
+        $resp = $_.Exception.Response
+        if ($null -ne $resp) {
+            try { $httpStatus = [int]$resp.StatusCode } catch { $httpStatus = 0 }
+        }
+        $class = Get-NotificationFailureClass -HttpStatus $httpStatus -ExceptionMessage $reason
+        Write-Log "notification FAILED (non-fatal, class=$class, http=$httpStatus): $reason"
+        return @{ status = 'failed'; class = $class; http_status = $httpStatus; error = $reason }
     }
 }
 
@@ -1028,14 +1294,28 @@ function Send-NotificationIfChanged {
         Write-Log "notification suppressed (unchanged since last alert: $Key = $Signature)"
         return
     }
-    # $null = drops Send-Notification's status string so it does not leak into the pipeline of
-    # whatever call site invokes Send-NotificationIfChanged. The change record on the state map is
-    # intentional either way — a failed send does not undo the dedup, or a webhook outage would
-    # repeat every 5 minutes forever, retraining the channel into noise. A 'skipped' status (no
-    # webhook) is treated the same: mark the signature so we do not spam the log with skip
-    # messages on every re-attempt. (Endorsed by Tier B naysayer on round 2 of #138.)
-    $null = Send-Notification -Message $Message
-    $State[$Key] = $Signature
+    # The dedup record is intentional on 'sent' / 'skipped' / 'transient failure' — a failed send
+    # does NOT undo the dedup, or a webhook outage would repeat every 5 minutes forever, retraining
+    # the channel into noise. A 'skipped' status (no webhook) is treated the same: mark the
+    # signature so we do not spam the log with skip messages on every re-attempt.
+    # (Endorsed by Tier B naysayer on round 2 of #138.)
+    #
+    # T-digest-exceeds-discord-limit-and-is-dropped D-3 (msg-2099, msg-2101): the ONLY exception
+    # is a deterministic-payload failure (400/413). That is msg-2013 §3(b) — the alert was never
+    # delivered, but the signature was recorded, so the same alert was suppressed 257 times after.
+    # 4xx-payload is deterministic (same POST → same 400) so retrying with the same message helps
+    # nothing; but a NEW alert with a DIFFERENT signature (a different parked-thread reason) has
+    # a real chance of being small enough to land. Not recording the failed signature lets that
+    # next alert try, without letting the same-signature retry loop that #138 R2 was closing.
+    # transient (429/5xx/network) still records — #138 R2's reasoning is unchanged and this thread
+    # deliberately does not relitigate it.
+    $result = Send-Notification -Message $Message
+    $shouldRecord = $true
+    if ($result -is [hashtable] -and $result['status'] -eq 'failed' -and $result['class'] -eq 'deterministic-payload') {
+        $shouldRecord = $false
+        Write-Log "notification signature NOT recorded (deterministic-payload failure — same-signature retry will fail the same way; a different-signature alert may still land)"
+    }
+    if ($shouldRecord) { $State[$Key] = $Signature }
 }
 
 # --- decision-request composer (T-decision-request-composer S2) ---------------------------------
@@ -2727,48 +3007,103 @@ try {
 
     # Daily digest. Sent even when both quarantine and starvation lists are empty (spec/msg-814 §5).
     # A silent day IS the point: "no alert" then still means "the channel is alive," which is what
-    # the 5h failure specifically lacked. Attempted at most once per $DailyDigestInterval.
+    # the 5h failure specifically lacked.
     #
-    # The clock advances on 'sent' AND 'skipped' — both are terminal outcomes: 'sent' means the
-    # notification landed, 'skipped' means the operator has no webhook configured, and neither
-    # merits a 5-minute retry. Only 'failed' (webhook configured but the POST failed — network,
-    # proxy, Discord outage) holds the clock back for retry.
+    # T-digest-exceeds-discord-limit-and-is-dropped (msg-2099 through msg-2106): cadence is
+    # PERIOD-gated, not interval-gated. Two predicates must both hold:
+    #   (a) $currentPeriod ≠ $digestState['last_sent_period'] — the digest has not landed today yet
+    #   (b) local wall clock ≥ $DailyDigestDeliveryTime — the operator's delivery time has arrived
     #
-    # Also gated on $notifyWebhook up front: without a webhook, computing the digest, calling
-    # Confirm-LogWorthKeeping (which promotes the buffered log to disk), and writing the "sending
-    # daily digest" line every 5 minutes for the life of the daemon is nothing but log spam. It
-    # violates the whole point of Write-QuietSummary. So when there is no webhook, the whole block
-    # is silent — the clock still advances so we do not loop, but nothing is computed, logged, or
-    # persisted for a channel nobody is listening to. (Tier B naysayer, PR #138 round 5.)
-    $lastDigestAt = $null
-    if ($digestState.ContainsKey('last_sent_at') -and $digestState['last_sent_at']) {
-        try { $lastDigestAt = (ConvertTo-UtcInstant $digestState['last_sent_at']) } catch { }
+    # Why period + delivery-time instead of "24h since last send" (msg-2106 §4):
+    #   * "24h since last send" drifts forward a few minutes per day (any tick jitter, any run-time
+    #     variance). Weeks later the send has walked into 3am, defeating the point of a phone
+    #     notification.
+    #   * "24h since last send" also double-sends around a period boundary: 23:58 send → 00:03 tick
+    #     is still <24h from delivery time, but "period ≠ last_sent_period AND local ≥ delivery"
+    #     correctly refuses to re-send.
+    # Period + delivery-time drops both by CONSTRUCTION — no jitter constant, no drift math.
+    #
+    # Webhook-less runs (msg-2106 D-3 preservation of #138 R5): still advance last_sent_period so
+    # the loop does not re-enter this branch every 5 minutes. But `last_full_success_period` is NOT
+    # advanced — a channel that does not exist has not been informed, and the ⚠ predicate is
+    # deliberately blind to whether the reason is "no webhook" or "webhook 400s" (both mean the
+    # human has not gotten the digest).
+    $currentPeriod = Get-DigestPeriod -Now $nowUtc
+    $lastSentPeriod = $null
+    if ($digestState.ContainsKey('last_sent_period') -and $digestState['last_sent_period']) {
+        $lastSentPeriod = [string]$digestState['last_sent_period']
     }
-    $digestDue = ($null -eq $lastDigestAt) -or (($nowUtc - $lastDigestAt) -ge $DailyDigestInterval)
+    $deliveryDue = Test-DigestDeliveryDue -Now $nowUtc -DeliveryTime $DailyDigestDeliveryTime
+    $digestDue = ($lastSentPeriod -ne $currentPeriod) -and $deliveryDue
     if ($digestDue) {
+        # Load notify-health for ⚠ derivation (D-6). Missing file = empty hashtable (state files
+        # are corrupt-tolerant per Get-JsonState). Never fails the sweep on health-file trouble.
+        $notifyHealth = Get-JsonState -Path $notifyHealthPath
+        if ($null -eq $notifyHealth) { $notifyHealth = @{} }
         if (-not $notifyWebhook) {
             # No point building or logging a digest for a channel that does not exist. Advance the
-            # clock silently so we do not re-enter this branch until the next full interval.
-            $digestState['last_sent_at'] = $nowUtc.ToString("o")
+            # sent-period so we do not re-enter this branch until tomorrow, but leave
+            # last_full_success_period alone: a webhook-less day is not a healthy day for the
+            # human-consumer perspective. When the operator eventually wires a webhook, the ⚠ shows
+            # correctly how many days went unreported.
+            $digestState['last_sent_period'] = $currentPeriod
             Save-JsonState -Path $digestStatePath -State $digestState
         }
         else {
+            $healthWarning = Get-DigestHealthWarning -Health $notifyHealth -CurrentPeriod $currentPeriod
             $digest = New-DailyDigest -QuarantineState $quarantineState `
                 -EvaluatedState $evaluatedState `
                 -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc `
                 -LiveKeys $liveKeys `
                 -HumanParked $humanParked -PendingDecisionsState $pendingDecisionsState `
-                -ParkedPollErrors $parkedPollErrors
+                -ParkedPollErrors $parkedPollErrors `
+                -Budget $DigestBudget `
+                -HealthWarning $healthWarning
             Confirm-LogWorthKeeping
-            Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved)"
+            Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest
-            # See Test-DigestClockAdvances for the terminal-outcomes contract. 'skipped' here
-            # would be from a webhook that was set at $digestDue evaluation but has since been
-            # unset — very narrow race, but the same reasoning still holds.
-            if (Test-DigestClockAdvances -Result $result) {
-                $digestState['last_sent_at'] = $nowUtc.ToString("o")
+
+            # Diagnostic fields (D-6 predicate discipline: recorded but NEVER consulted by the ⚠
+            # predicate). Written on every attempt regardless of outcome.
+            $notifyHealth['last_attempt_at'] = $nowUtc.ToString("o")
+            if ($result -is [hashtable]) {
+                $notifyHealth['last_error'] = $result['error']
+                $notifyHealth['last_error_class'] = $result['class']
+            }
+
+            # T-digest-exceeds-discord-limit-and-is-dropped D-2 (msg-2099): on a
+            # deterministic-payload rejection, immediately try a fixed-length degraded message.
+            # NOT on deterministic-permanent (401/403/404 → the webhook is dead, a second POST
+            # will fail the same way) and NOT on transient (429/5xx/network → the retry belongs
+            # to the next tick, not this one).
+            if ($result -is [hashtable] -and $result['status'] -eq 'failed' -and $result['class'] -eq 'deterministic-payload') {
+                $degradedMessage = New-DegradedDigestMessage `
+                    -WaitingCount ($humanParked.Count + $quarantineState.Count) `
+                    -CurrentPeriod $currentPeriod
+                Write-Log "digest full payload rejected (400/413) — attempting degraded fallback ($($degradedMessage.Length) chars)"
+                $degradedResult = Send-Notification -Message $degradedMessage
+                # Roll the degraded outcome into the same $result so the branch below can consume
+                # one shape. The degraded delivery is what actually landed (or did not).
+                if ($degradedResult -is [hashtable] -and $degradedResult['status'] -eq 'sent') {
+                    $result = @{ status = 'degraded'; class = 'ok'; http_status = 200; error = "full-payload rejected, degraded landed" }
+                }
+                # else: leave $result at the original failure — degraded also failed, do not
+                # advance last_sent_period (the tick was fully-lost).
+            }
+
+            # Cadence advance: any DELIVERED outcome (sent full, sent degraded, or skipped-no-webhook)
+            # closes the period. A pure failure holds the clock so the NEXT tick retries.
+            if (Test-DigestDelivered -Result $result) {
+                $digestState['last_sent_period'] = $currentPeriod
                 Save-JsonState -Path $digestStatePath -State $digestState
             }
+            # ⚠ advance: only a FULL success (status=sent, class=ok) clears the ⚠. A degraded
+            # delivery satisfies cadence but not health — the operator was NOT told the queue
+            # contents, so ⚠ must stay lit until a full digest lands.
+            if (Test-DigestFullSuccess -Result $result) {
+                $notifyHealth['last_full_success_period'] = $currentPeriod
+            }
+            Save-JsonState -Path $notifyHealthPath -State $notifyHealth
         }
     }
 
