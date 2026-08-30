@@ -47,6 +47,7 @@ from spirrow_mindwire.naysayer.pr_review import (
     ModelVerdict,
     NaysayerPrReviewDriver,
     NaysayerPrReviewError,
+    ObjectionMissingReason,
     ObjectionParse,
     PostCritique,
     _ci_gate_response,
@@ -1823,6 +1824,239 @@ def test_objection_block_prose_then_empty_array_derives_missing_not_approve() ->
     report = parse_objections(body)
     assert report.status is ObjectionParse.MISSING
     assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+
+def test_v2_fence_less_payload_with_leading_newline_is_accepted() -> None:
+    """V-2 (rider-3 msg-2130 §2). Fence-less payload whose first byte after the marker is a
+    newline still parses OK.
+
+    This is the shape ``_objection_block(payload)`` produces (``f"{MARKER}\\n{payload}"``),
+    which is what every non-fenced parse test in this module has been implicitly relying on.
+    Pinned here as its OWN acceptance test with a docstring that names the load-bearing
+    property, so a future "optimise ``strip_wrapping_fences`` to only mutate when a fence is
+    present" refactor shows up as a RED build here rather than as a silent regression that
+    turns every ``\\n[...]`` payload into MISSING. That silent-optimisation risk is the
+    advisory the naysayer raised on PR #198, and D-5 (see the next test) is the code-side
+    close of it.
+    """
+    payload = f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "x"}}]'
+    # Deliberately construct the critique so a NEWLINE, not a space, separates marker and array.
+    body = f"no blocking problems\n\n{_OBJECTIONS_SENTINEL}\n{payload}\n\nVERDICT: APPROVE"
+    report = parse_objections(body)
+    assert report.status is ObjectionParse.OK, (
+        f"fence-less newline-start payload should parse OK; got {report.status.value} "
+        f"(missing_reason={report.missing_reason})"
+    )
+    assert len(report.advisory) == 1
+    assert report.missing_reason is None
+
+
+def test_d5_payload_starts_after_leading_whitespace_independent_of_helper() -> None:
+    """D-5 (rider-3 msg-2130 §2). The D-3 check tolerates leading whitespace on its own,
+    without relying on ``strip_wrapping_fences`` to trim.
+
+    Constructs a payload with leading whitespace of every ordinary kind (newline, space, tab,
+    combined) and asserts each parses OK. The point is not that whitespace *should* be there
+    — the prompt asks for a bare array — but that D-3's "first non-whitespace char is ``[``"
+    invariant must hold in the parser itself, so a future change to the fence helper cannot
+    silently make ``\\n[...]`` land on MISSING.
+
+    Complements :func:`test_v2_fence_less_payload_with_leading_newline_is_accepted` (which
+    pins the exact shape today's tests use) by sweeping the whitespace surface.
+    """
+    payload_json = f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "x"}}]'
+    for label, leading in (
+        ("newline", "\n"),
+        ("space", " "),
+        ("tab", "\t"),
+        ("mixed", "\n \t\n"),
+        ("empty", ""),
+    ):
+        body = (
+            f"no blocking problems\n\n"
+            f"{_OBJECTIONS_SENTINEL}\n"
+            f"{leading}{payload_json}\n\n"
+            "VERDICT: APPROVE"
+        )
+        report = parse_objections(body)
+        assert report.status is ObjectionParse.OK, (
+            f"leading whitespace {label!r} should not trip MISSING; got "
+            f"{report.status.value} missing_reason={report.missing_reason}"
+        )
+        assert report.missing_reason is None, label
+
+
+def test_missing_reason_covers_five_disjoint_causes() -> None:
+    """Instrumentation (rider-3 msg-2130 §3). Each MISSING cause carries a distinct
+    ``missing_reason``, and OK / EMPTY carry none.
+
+    Without this, ``parse=missing`` collapses three independent signals — the model wrote
+    no marker (baseline), D-1 fired (multi-marker), D-3 fired (prose-between) — into one
+    string, and rider 2 cannot tell "the parser is over-firing" from "the prompt is being
+    ignored". The other two MISSING causes (``bad-json`` / ``not-a-list``) are the
+    pre-existing malformed-payload path; splitting them out lets a shift in either counter
+    be told apart from the D-1/D-3 counters.
+    """
+    blocking_payload = (
+        f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
+    )
+    advisory_payload = (
+        f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "reads oddly"}}]'
+    )
+
+    # NO_MARKER: no column-zero marker anywhere.
+    no_marker = "no blocking problems\n\nVERDICT: APPROVE"
+    report = parse_objections(no_marker)
+    assert report.status is ObjectionParse.MISSING
+    assert report.missing_reason is ObjectionMissingReason.NO_MARKER
+
+    # MULTI_MARKER: two column-zero markers (D-1).
+    multi = (
+        f"{_OBJECTIONS_SENTINEL}\n{advisory_payload}\n\nprose\n\n"
+        f"{_OBJECTIONS_SENTINEL}\n{blocking_payload}\n\nVERDICT: REQUEST_CHANGES"
+    )
+    report = parse_objections(multi)
+    assert report.status is ObjectionParse.MISSING
+    assert report.missing_reason is ObjectionMissingReason.MULTI_MARKER
+
+    # PROSE_BETWEEN: marker + prose + array (D-3).
+    prose_between = (
+        f"{_OBJECTIONS_SENTINEL}\n"
+        "Here are my objections:\n\n"
+        f"{blocking_payload}\n\nVERDICT: REQUEST_CHANGES"
+    )
+    report = parse_objections(prose_between)
+    assert report.status is ObjectionParse.MISSING
+    assert report.missing_reason is ObjectionMissingReason.PROSE_BETWEEN
+
+    # BAD_JSON: marker + payload that does not parse.
+    bad_json = f"{_OBJECTIONS_SENTINEL}\n[not valid json\n\nVERDICT: REQUEST_CHANGES"
+    report = parse_objections(bad_json)
+    assert report.status is ObjectionParse.MISSING
+    assert report.missing_reason is ObjectionMissingReason.BAD_JSON
+
+    # NOT_A_LIST would need a top-level JSON value that starts with `[` but is not a list.
+    # Any `[…]` that raw_decode accepts IS a list, so exercising this branch requires a
+    # payload whose `[` opens a non-list construct — which raw_decode rejects instead, so
+    # the branch is unreachable via valid JSON. Rather than fake it, we verify the enum
+    # value exists and is distinct from the others.
+    assert ObjectionMissingReason.NOT_A_LIST not in (
+        ObjectionMissingReason.NO_MARKER,
+        ObjectionMissingReason.MULTI_MARKER,
+        ObjectionMissingReason.PROSE_BETWEEN,
+        ObjectionMissingReason.BAD_JSON,
+    )
+
+    # OK / EMPTY carry no missing_reason (the field is None iff status is not MISSING).
+    ok = _critique_with_objections(ModelVerdict.REQUEST_CHANGES, blocking_payload)
+    assert parse_objections(ok).missing_reason is None
+    empty = _critique_with_objections(ModelVerdict.APPROVE, "[]")
+    assert parse_objections(empty).missing_reason is None
+
+
+def test_missing_reason_appears_in_shadow_log_line(caplog: pytest.LogCaptureFixture) -> None:
+    """Instrumentation (rider-3 msg-2130 §3). ``_log_objections`` includes ``missing_reason=``
+    so a grep-over-a-corpus reader can count D-1 and D-3 firings separately from the baseline
+    ``no-marker`` case.
+
+    Without this, the log line's ``parse=missing`` field would tell rider 2 nothing about
+    whether D-1 or D-3 is over-firing — which is exactly the black-box msg-2130 §3 names as
+    the reason the counters must land BEFORE Stage 2 flips (per rider 2's shadow read).
+    """
+    import logging
+
+    from spirrow_mindwire.naysayer.pr_review import _log_objections
+
+    view = _make_view(_DIFF_WARN_THRESHOLD - 1)
+    # Build one decision per missing cause; assert the log line carries the sub-reason.
+    cases = {
+        "no-marker": "no blocking problems\n\nVERDICT: APPROVE",
+        "multi-marker": (
+            f"{_OBJECTIONS_SENTINEL}\n[]\n\nprose\n\n{_OBJECTIONS_SENTINEL}\n[]\n\nVERDICT: APPROVE"
+        ),
+        "prose-between": (
+            f"{_OBJECTIONS_SENTINEL}\nHere are my objections:\n[]\n\nVERDICT: APPROVE"
+        ),
+        "bad-json": f"{_OBJECTIONS_SENTINEL}\n[not json\n\nVERDICT: APPROVE",
+    }
+    for expected_reason, body in cases.items():
+        decision = decide_verdict(body, view=view, finish_reason="stop")
+        with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+            caplog.clear()
+            _log_objections("owner/repo#1", "deadbeef", decision)
+        # The log line carries ``parse=missing`` and ``missing_reason=<reason>`` for each case.
+        joined = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "parse=missing" in joined, expected_reason
+        assert f"missing_reason={expected_reason}" in joined, expected_reason
+
+    # Sanity: an OK case emits ``missing_reason=-`` so the field stays grep-friendly (no gap).
+    ok_body = _critique_with_objections(
+        ModelVerdict.APPROVE,
+        f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "x"}}]',
+    )
+    decision = decide_verdict(ok_body, view=view, finish_reason="stop")
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.naysayer.pr_review"):
+        caplog.clear()
+        _log_objections("owner/repo#1", "deadbeef", decision)
+    joined = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "parse=ok" in joined
+    assert "missing_reason=-" in joined
+
+
+def test_missing_reason_labels_appear_in_the_d_divergence_notice() -> None:
+    """Instrumentation (rider-3 msg-2130 §3). The D-divergence gate notice names the sub-cause
+    of a MISSING so a reader of the posted review body sees WHICH MISSING fired.
+
+    The log line lives for grep-a-corpus reads; the notice lives in the review body that both
+    the chatroom and GitHub receive, and rider 2 reads the shadow through it. If the notice
+    still said "no readable objection block was found" with no further detail, rider 2 would
+    have to correlate every review to its log line to tell the three sub-causes apart.
+    """
+    view = _make_view(_DIFF_WARN_THRESHOLD - 1)
+    for expected_reason, body in (
+        (
+            "prose-between",
+            f"{_OBJECTIONS_SENTINEL}\nHere are my objections:\n[]\n\nVERDICT: APPROVE",
+        ),
+        (
+            "multi-marker",
+            f"{_OBJECTIONS_SENTINEL}\n[]\n\nprose\n\n"
+            f"{_OBJECTIONS_SENTINEL}\n[]\n\nVERDICT: APPROVE",
+        ),
+    ):
+        decision = decide_verdict(body, view=view, finish_reason="stop")
+        notice = render_gate_notice(decision)
+        assert _MARKER_D_DIVERGENCE in notice, expected_reason
+        assert f"missing_reason={expected_reason}" in notice, expected_reason
+
+
+def test_r4a_verdict_re_carries_a_back_reference_to_the_divergence() -> None:
+    """R-4a (rider-3 msg-2130 §1). The ``_VERDICT_RE`` definition point names the divergence
+    from :func:`parse_objections`'s strict-single stance.
+
+    R-4 (msg-2072 §5) was discharged via the "explicit justification" branch. Rider 3 msg-2130
+    §1 tightened it to require the justification to be reachable from BOTH sides of the
+    divergence: a reader arriving at ``_VERDICT_RE`` who is unaware of the objection parser
+    would otherwise try to "make them consistent" by touching this regex, preempting the
+    decide of ``T-verdict-echo-after-real-verdict``. The comment on THIS side must therefore
+    exist (asserted here) and must be DESCRIPTIVE — it names the pending thread, not a
+    preferred outcome.
+    """
+    src = Path("src/spirrow_mindwire/naysayer/pr_review.py").read_text(encoding="utf-8")
+    idx = src.index("_VERDICT_RE = re.compile(")
+    # Look 2000 chars back from the definition for the divergence back-reference.
+    window = src[max(0, idx - 2000) : idx]
+    assert "parse_objections" in window, (
+        "R-4a: the _VERDICT_RE comment block must reference parse_objections"
+    )
+    assert "T-verdict-echo-after-real-verdict" in window, (
+        "R-4a: the comment must name the pending thread so a reader knows the "
+        "decide is elsewhere, not to be preempted here"
+    )
+    assert "strict-single" in window, (
+        "R-4a: the comment must state HOW the two parsers diverge (strict-single vs "
+        "last-wins), otherwise 'divergence' is unlocatable"
+    )
 
 
 def test_quoting_the_prompt_objection_exemplar_is_fail_closed() -> None:
