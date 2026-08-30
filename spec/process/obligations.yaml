@@ -294,39 +294,51 @@ obligations:
     # reply_to msg-1967) ended with 「上記の『実行時エラー回避のための carve-out
     # 実装』を obligation に加えることを条件として、この設計はコード作業に進む
     # 準備ができている」 — the obligation therefore had to enter this file before
-    # the design's execution paths could be probed. Bohr's msg-2084 §5(1) directed
-    # that the 「追加すべき義務」 clause enter verbatim rather than paraphrased, so
-    # the loop reads exactly what was reviewed.
+    # the design's execution paths could be probed.
     #
-    # Antecedent context (Einstein's 処方, preserved here to keep the body's
-    # 「その場合」 self-referential rather than dangling): if the sweeper's
-    # chatroom_close_thread call is rejected by 事前ロールチェック — i.e. by the
-    # closeable_roles gate evaluated BEFORE the owner check — then giving the
-    # sweeper an ADR-2026-05-29-10 role would be an ADR-10 hack. The mandated
-    # alternative is a structural carve-out on the magickit side of
-    # chatroom_close_thread: exempt the role check when the target thread
-    # carries the `system-alert` tag AND the caller is the thread's own owner.
+    # Bohr's msg-2084 §5(1) directed the split reflected below: the 「追加すべき
+    # 義務」 clause enters the body verbatim (below), and Einstein's 処方 sentence —
+    # which frames the addressee and the antecedent — enters this rationale block
+    # verbatim (immediately following). The body's opening 「その場合、…」 refers to
+    # the antecedent of that 処方 sentence; the referent is preserved in the
+    # rationale here rather than repeated in the body.
     #
-    # Trigger and content are both in the body. The 前件 ("sweeper is rejected
-    # by 事前ロールチェック") can only be observed at
-    # T-new-project-gate-bootstrap S-4 (the synthetic-thread probe defined in
-    # Bohr msg-2084 §4), because identity_findings / chatroom_get_identity
-    # tools do not exist (verified by Heisenberg msg-2083 S-1b⑤ — all three
-    # candidate probes returned "Unknown tool") and a not-found short-circuit
-    # keeps the gate from firing on synthetic-only calls. ∴ this entry must be
-    # present at S-4 execution time, not merely at the eventual magickit
-    # carve-out's landing.
+    # Einstein's 処方 (verbatim, msg-1968):
+    #
+    #   「実装者は「コードを確認する」だけでなく、「もし事前ロールチェックが存在して
+    #    sweeper が弾かれる事実が確認された場合」の具体的な是正措置を義務付けられ
+    #    なければならない。」
+    #
+    # Trigger-field note (answers Bohr msg-2087 §2(e)): this manifest schema has
+    # no separate `trigger` field. Every entry is unconditionally injected into
+    # the corresponding role's system prompt on every turn; a conditional
+    # obligation carries its antecedent as prose within the entry's rationale
+    # and body. When the antecedent is not observed, the entry asks nothing of
+    # the implementer at read time. This entry is such a conditional: the body
+    # says "in that case, do X"; if X has not been triggered, the implementer
+    # reads the entry and moves on. There is no field to gate the injection on
+    # and no field to omit — the conditional lives in the prose.
+    #
+    # Where the antecedent becomes observable is not this entry's business —
+    # it is the design's business (T-new-project-gate-bootstrap S-4 probe,
+    # per Bohr msg-2084 §4). The obligation only encodes what the implementer
+    # must do IF the antecedent is observed; whether/where it fires is
+    # entirely outside this file's concern. An earlier version of this
+    # rationale asserted where the antecedent could be observed and made an
+    # internally contradictory claim about the S-4 probe's precheck
+    # short-circuit — removed here because the observability of the
+    # antecedent is the S-4 design's responsibility, not this obligation's.
     #
     # The prescribed carve-out lives cross-repo: the code change is in the
     # magickit chatroom_close_thread implementation, not in mindwire. This
     # obligation only names the addressee (the implementer) and the exception
     # predicate; the implementer executes it by opening a magickit PR when
-    # the 前件 is confirmed.
+    # the antecedent is confirmed observed.
     #
     # Source: T-new-project-gate-bootstrap msg-1968 (Einstein, naysayer,
     # 2026-08-28T09:59:31Z, reply_to msg-1967). The msg-1968 verbatim is
     # cited in the T-new-project-gate-bootstrap thread by Heisenberg msg-2083.
-    body: "実装者は「コードを確認する」だけでなく、「もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合」の具体的な是正措置を義務付けられなければならない。追加すべき義務: 「その場合、ADR-10 のロールを sweeper に付与して誤魔化すのではなく、PR-gate の carve-out と同様に、`chatroom_close_thread` 側に『`system-alert` タグを持ち、かつ owner 自身によるクローズである場合はロールチェックを免除する』という構造的な carve-out（例外経路）をコードとして追加実装すること。」"
+    body: "その場合、ADR-10 のロールを sweeper に付与して誤魔化すのではなく、PR-gate の carve-out と同様に、`chatroom_close_thread` 側に『`system-alert` タグを持ち、かつ owner 自身によるクローズである場合はロールチェックを免除する』という構造的な carve-out（例外経路）をコードとして追加実装すること。"
 
   - id: OBL-SPEC-SCOPE-CLOSURE
     role: implementer
