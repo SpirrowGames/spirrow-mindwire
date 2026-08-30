@@ -461,14 +461,14 @@ def _parse_model_verdict(critique: str) -> ModelVerdict:
 # pre-conditions include an independent review of this parser's injection surface.
 _OBJECTIONS_SENTINEL = "<!-- mindwire:objections v1 -->"
 
-# Anchored at COLUMN ZERO, last-wins — the same discipline (and the same limits) as
-# :data:`_VERDICT_RE`; read that block before widening this one. A unified-diff line carries a
-# ``+``/``-``/space prefix, so a VERBATIM quote of this file's own diff (which necessarily
-# contains the sentinel literal) cannot satisfy the anchor. The residual is identical too: a
-# model that RE-TYPES the marker without the prefix produces a genuine match, and last-wins only
-# helps while the re-typed copy precedes the model's own block. In Stage 1 that residual costs
-# nothing (nothing is posted from it); it is precisely why Stage 2's stated pre-conditions
-# include an independent review of this surface.
+# Anchored at COLUMN ZERO. A unified-diff line carries a ``+``/``-``/space prefix, so a VERBATIM
+# quote of this file's own diff (which necessarily contains the sentinel literal) cannot satisfy
+# the anchor. The residual is real: a model that RE-TYPES the marker without the prefix produces
+# a genuine match. This is the exploit surface :data:`_VERDICT_RE`'s own last-wins discipline is
+# still exposed to (pending on ``T-verdict-echo-after-real-verdict``); this parser diverges by
+# design (see :func:`parse_objections` D-1 note). In Stage 1 the residual costs nothing (nothing
+# is posted from it); the rider-3 review (T-rider3-objection-parser-injection-surface) closes
+# the parser side of the reversal's pre-conditions.
 _OBJECTIONS_SENTINEL_RE = re.compile(rf"^{re.escape(_OBJECTIONS_SENTINEL)}\s*$", re.MULTILINE)
 
 
@@ -537,7 +537,8 @@ def parse_objections(critique: str) -> ObjectionReport:
 
     ``OK``           marker present, array parsed, every class known and evidenced.
     ``EMPTY``        the array is ``[]`` — a legal statement that nothing was objected to.
-    ``MISSING``      no column-zero marker, or the payload after it is not a JSON array.
+    ``MISSING``      no column-zero marker, more than one column-zero marker, or the payload
+                     after the marker does not begin with a JSON array.
     ``UNKNOWN``      some element names a class outside the vocabulary.
     ``NO_EVIDENCE``  some blocking element carries no evidence.
 
@@ -548,18 +549,60 @@ def parse_objections(critique: str) -> ObjectionReport:
     Malformed ELEMENTS inside a well-formed array (not an object, missing ``class``) are
     counted as unknown-class rather than dropped: silently discarding an element the model
     wrote is the one behaviour that could make the derived verdict quieter than the prose.
+
+    **D-1 (strict-single sentinel, rider-3 msg-2072 / msg-2073).** Two or more column-zero
+    markers in one critique derive MISSING — not "last-wins", not "concatenate all". Last-wins
+    is bypassable by a re-typed copy placed AFTER the model's own block (the same residual
+    :data:`_VERDICT_RE` still carries), and concatenation lets an attacker (or the model's own
+    verbosity) *add* blocking objections at will, which is a new denial-of-service surface
+    aimed straight at the reversed gate. MISSING derives REQUEST_CHANGES, which is fail-closed
+    and *loud*: the reason is named in the report, so a human can see what happened. The
+    accepted side-effect: a PR touching this file whose reviewer re-types the marker at
+    column zero self-jams into RC. The override path is human, which is the right shape for
+    a rare deadlock caused by discussing the parser inside the parser's own gate.
+
+    **D-3 (strict bracket placement, rider-3 msg-2072).** After fence-stripping, the payload
+    must *begin* with ``[`` — no prose in between. ``strip_wrapping_fences`` already trims
+    surrounding whitespace, so ``payload.startswith("[")`` covers "first non-whitespace char
+    is ``[``". This closes an F-a-direction window (msg-2074 §1): a scan-forward ``find("[")``
+    would silently anchor to a benign or malicious empty array further down (``Here are my
+    objections: []`` etc.), discarding the model's real block. Failing to start with ``[``
+    trips MISSING → RC, which is loud and fail-closed. The reliability cost (models that lead
+    with a short sentence get their objection block dropped) is Stage-1 shadow-measurable
+    before the reversal.
+
+    **What is NOT done here.** D-2-prime (a non-regression floor on ``gate_verdict``: the derived
+    read may never lower the gate below the pre-Stage-1 baseline) is a Stage-2 constraint on
+    :func:`decide_verdict`, not a parser change; ``derived_verdict`` does not participate in
+    ``gate_verdict`` yet (see the SHADOW note above :data:`_OBJECTIONS_SENTINEL`), so wiring
+    D-2-prime is premature until the reversal is on the table. R-4 (unify the two parsers' anchor
+    strategy, or justify the divergence, before the reversal) is discharged by the D-1 note
+    above: the objection parser is deliberately strict-single, ``_VERDICT_RE`` remains
+    last-wins for the reasons on ``T-verdict-echo-after-real-verdict``, and the divergence is
+    named here rather than left implicit. V-1 (verify the array-terminator method): confirmed
+    by inspection — ``raw_decode`` stops at the end of the JSON value, so anything after ``]``
+    is structurally invisible to this parser (matching the note next to the ``raw_decode``
+    call below); no code change is needed.
     """
     matches = list(_OBJECTIONS_SENTINEL_RE.finditer(critique))
-    if not matches:
+    if len(matches) != 1:
+        # D-1: zero markers OR two-plus markers both derive MISSING → REQUEST_CHANGES. The
+        # question "which match wins?" is deleted rather than answered — see the docstring
+        # above for why last-wins and concatenate-all were both rejected.
         return _missing_report()
-    payload = strip_wrapping_fences(critique[matches[-1].end() :])
-    start = payload.find("[")
-    if start < 0:
+    payload = strip_wrapping_fences(critique[matches[0].end() :])
+    if not payload.startswith("["):
+        # D-3: no scan-forward. If the payload does not begin with ``[`` after fence-stripping,
+        # fall through to MISSING rather than anchor to some later ``[`` in the prose — see
+        # the docstring above for the F-a rationale.
         return _missing_report()
     try:
         # ``raw_decode`` stops at the end of the array, so the verdict line (and any prose)
         # that follows the block is simply not consumed — no need to guess where it ends.
-        parsed, _ = json.JSONDecoder().raw_decode(payload, start)
+        # V-1 (rider-3 msg-2074): this is what makes trailing text after ``]`` structurally
+        # invisible to the parser, which is why D-4 ("no trailing text allowed") stayed as
+        # a shadow-measurable candidate rather than a code change.
+        parsed, _ = json.JSONDecoder().raw_decode(payload)
     except ValueError:
         return _missing_report()
     if not isinstance(parsed, list):
