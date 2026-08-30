@@ -978,6 +978,26 @@ async def test_pr_gate_approve_stops_at_human() -> None:
 
 
 @pytest.mark.anyio
+async def test_pr_gate_comment_stops_at_human_without_dispatch() -> None:
+    # T-infra-failure-posts-empty-rc §6 test 3: a COMMENT verdict (from the timeout-degrade path
+    # or the round-cap escalation) must NOT wake the implementer — the gate did not reach a fix
+    # request, so there is no critique for the implementer to act on. The conductor's non-RC
+    # branch (conductor/core.py:330-336) stops at the human on any non-REQUEST_CHANGES verdict;
+    # this test pins the COMMENT face of that branch so a future refactor that adds COMMENT to
+    # the dispatch predicate is caught here before it can drive the implementer against an
+    # empty body again.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(ReviewEvent.COMMENT)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()
+    assert gate.fired == ["acme/widgets#7"]
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches == []  # no implementer dispatch on COMMENT
+    assert mcp.posts[-1]["author"] == "pr-gate-relay"  # the verdict relay is still posted
+
+
+@pytest.mark.anyio
 async def test_pr_gate_request_changes_dispatches_implementer_then_reapprove() -> None:
     # REQUEST_CHANGES → the implementer is dispatched to fix (carve-out ②: verdict-driven, so
     # guard (i) is never consulted and no design-time naysayer is forced). The implementer re-emits
