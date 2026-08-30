@@ -1,0 +1,98 @@
+{
+  "_comment": [
+    "PR-review sweep — per-project tables for the Phase 0/1/2 sweeper of",
+    "T-pr-review-threads-outlive-their-prs. Copy to <data_dir>/config/pr_review_sweep.json",
+    "and edit. Consumed by scripts/pr_review_sweep_phase0.py (Phase 0 read-only sweep) and",
+    "scripts/pr_review_sweep_phase1.py (Phase 1 A/B split, added once the ledger's can_close()",
+    "lands in a follow-up PR).",
+    "",
+    "This file carries two tables. Both are declarative repository FACTS (per-project data",
+    "the operator provides once, not runtime tuning) and share this file because a single",
+    "operator/audit action fills them together for a new project — separating them would",
+    "let one arrive without the other and silently degrade the sweep.",
+    "",
+    "----------------------------------------------------------------------------",
+    "Table 1 — projects[].thread_prefix_to_repo",
+    "  Design ref: msg-2162 field ③ (the explicit thread_id → owner/repo mapping",
+    "  that S0 needs to resolve a PR from a T-pr-review-* thread).",
+    "",
+    "  Why explicit: T-pr-review-<repo-slug>-<n> LOOKS parseable, but <repo-slug>",
+    "  is a chatroom-side project slug (e.g. 'spirrow-mindwire'), not the GitHub",
+    "  owner/repo tuple ('spirrowgames/spirrow-mindwire') the API needs. The map",
+    "  is finite (one entry per project the sweep watches) and stable, so the",
+    "  sweep must not guess. If a project is missing, the sweep must not fabricate",
+    "  the mapping — S0 returns skip (no verdict) for that thread and the operator",
+    "  is expected to add the entry.",
+    "",
+    "----------------------------------------------------------------------------",
+    "Table 2 — projects[].gate_active_since",
+    "  Design ref: msg-2174 R-39 (per-project gate-activation date used to split",
+    "  B_gate from B_legacy) and msg-2177 R-42(1) (co-located here with Table 1).",
+    "",
+    "  A PR whose review-condition-false B was terminated (merged) BEFORE",
+    "  gate_active_since is B_legacy, not B_gate: no upstream defect can be",
+    "  inferred because the gate did not exist at the time. On or after this",
+    "  date, the same shape is B_gate and escalates.",
+    "",
+    "  Two constraints, both fail-closed:",
+    "",
+    "    1. justification is REQUIRED and must be substantive — a PR number,",
+    "       commit SHA, thread msg-id, or configuration change that establishes",
+    "       WHEN the gate first ran against merges in this repo. Placeholders",
+    "       ('推定', 'unknown', '') are rejected at load time. If you cannot",
+    "       write a justification, leave both fields absent — the sweep will",
+    "       treat this project as UNDETERMINED for the B_gate/B_legacy split",
+    "       only when a review-condition-false B is actually observed",
+    "       (msg-2177 R-41: lazy evaluation).",
+    "",
+    "    2. The date is an inclusive lower bound: terminal_at >= date → B_gate.",
+    "       No clock-skew margin applies here (msg-2174 R-39: the date is",
+    "       month-grained; the minute-grained skew that R-21's margin covers",
+    "       does not affect this boundary).",
+    "",
+    "  UNDETERMINED handling — a project observed to have >=1 review-condition-",
+    "  false B but with gate_active_since absent — is REPORTED but never fills",
+    "  B_gate or B_legacy on its own (msg-2179 R-47: state-only report, no",
+    "  thread_id list, no split-attempt counts). The sweeper judgment for A",
+    "  (A >= 5 → Phase 2) is UNAFFECTED — it does not reference gate_active_since",
+    "  (msg-2177 R-41: the two verdicts are independent).",
+    "",
+    "----------------------------------------------------------------------------",
+    "Populating this file: the operator is expected to write both tables from",
+    "repository history — GitHub org for Table 1, PR/commit/setting-change search",
+    "for Table 2. Neither value is derivable from the sweep's own input; that",
+    "is the whole reason they live in a config file and not in code.",
+    "",
+    "Values below are illustrative only; they are NOT the production values for",
+    "these projects. Every deployment must edit them."
+  ],
+  "schema_version": 1,
+  "projects": [
+    {
+      "project": "spirrow-mindwire",
+      "thread_prefix_to_repo": {
+        "T-pr-review-spirrow-mindwire-": {
+          "owner": "spirrowgames",
+          "repo": "spirrow-mindwire"
+        }
+      },
+      "gate_active_since": {
+        "date": "",
+        "justification": ""
+      }
+    },
+    {
+      "project": "spirrow-magickit",
+      "thread_prefix_to_repo": {
+        "T-pr-review-spirrow-magickit-": {
+          "owner": "spirrowgames",
+          "repo": "spirrow-magickit"
+        }
+      },
+      "gate_active_since": {
+        "date": "",
+        "justification": ""
+      }
+    }
+  ]
+}
