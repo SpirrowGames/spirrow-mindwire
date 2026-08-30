@@ -79,7 +79,7 @@ fail-open を設計するとき、**「degradation を宣言する」ことで�
 
 上限を超える改訂は、上限を上げるのではなく何かを削って収めること。
 
-**併せて置き場所の注意**: `CLAUDE.md` に書いた規約が縛るのは **人間だけ**である。implementer は `setting_sources=[]` (SDK 隔離、credential 面の対策) で走り `CLAUDE.md` を読まない。design-time naysayer の system prompt は preamble + role + **obligations** + ADR 索引 + handoff で構成される (現物は `src/spirrow_mindwire/adapters/naysayer_sdk.py::build_naysayer_system_prompt`) — 本書 (`CLAUDE.md`) は含まないが、`./obligations.yaml` は含まれる。**ループに効かせたい規約は、ループが実際に読む場所 (`./obligations.yaml`) に置くこと** — 本規律を再形式化したのが `OBL-READBACK-*` であり、そのために本 README の pointer から `./obligations.yaml` が SOT である旨を明示している。ただしその配送範囲は naysayer の一方の面 (design-time) だけである — 次節参照。
+**併せて置き場所の注意**: `CLAUDE.md` に書いた規約が縛るのは **人間だけ**である。implementer は `setting_sources=[]` (SDK 隔離、credential 面の対策) で走り `CLAUDE.md` を読まない。design-time naysayer の system prompt は preamble + role + **obligations** + ADR 索引 + handoff で構成される (現物は `src/spirrow_mindwire/adapters/naysayer_sdk.py::build_naysayer_system_prompt`) — `CLAUDE.md` は含まないが、`./obligations.yaml` は含まれる。**ループに効かせたい規約は、ループが実際に読む場所 (`./obligations.yaml`) に置くこと** — 本規律を再形式化したのが `OBL-READBACK-*` であり、そのために本 README の pointer から `./obligations.yaml` が SOT である旨を明示している。ただしその配送範囲は naysayer の一方の面 (design-time) だけである — 次節参照。
 
 ---
 
