@@ -84,10 +84,12 @@ $QuarantineEscalatedAfter = [TimeSpan]::FromHours(24)
 $QuarantineStaleAfter     = [TimeSpan]::FromDays(7)
 $StarvedThreshold         = [TimeSpan]::FromHours(24)
 
-# Digest cadence and how many lines of session tail we keep with a quarantine record. These ARE
-# derived from the four above (digest is daily because escalation is daily) but stated here to keep
-# the whole tuning surface in one section.
-$DailyDigestInterval  = [TimeSpan]::FromHours(24)
+# Session-log tail length kept with a quarantine record. Kept here to keep the whole tuning
+# surface in one section.
+# (Historical note: $DailyDigestInterval = 24h used to live here alongside SessionLogTailLines.
+# T-digest-exceeds-discord-limit-and-is-dropped D-6/§4 replaced interval-gating with period-gating
+# (see $DailyDigestDeliveryTime below), retiring the constant. PR-gate round 3 caught it as dead
+# code and it was removed here.)
 $SessionLogTailLines  = 50
 
 # T-digest-exceeds-discord-limit-and-is-dropped D-1: the digest renderer owns a fixed payload budget,
@@ -740,6 +742,34 @@ function Test-DigestFullSuccess {
     return ($Result -eq 'sent')
 }
 
+# T-digest-exceeds-discord-limit-and-is-dropped D-2: combine the full-digest send result with
+# the (optional) degraded-fallback send result into the single result that drives cadence and
+# health decisions downstream.
+#
+# The rule is tight:
+#   * No degraded attempt (fallback was not triggered) → pass-through the full result.
+#   * Degraded landed (status='sent') → emit `{status='degraded'; class='ok'}` so
+#     Test-DigestFullSuccess stays false (the operator got the fallback, not the queue) while
+#     Test-DigestDelivered advances cadence.
+#   * Degraded also failed → USE the degraded's actual result. This is the crux: its `class`
+#     (transient vs deterministic-*) is what the cadence predicate needs. PR-gate round 3 caught
+#     the earlier revision preserving the ORIGINAL `deterministic-payload` on degraded-transient-
+#     failure, which Test-DigestDelivered treats as non-retryable, silently advancing cadence
+#     and abandoning what was actually a retryable delivery.
+#
+# Extracted so the transformation is testable in isolation — tests/Test-SweepDigest.ps1's
+# "PR-gate regression" block pins the four combinations. If a future edit ever collapses this
+# back to inline code that discards the degraded class, the pinned tests fail loudly.
+function Resolve-DigestSendResult {
+    param($FullResult, $DegradedResult = $null)
+    if ($null -eq $DegradedResult) { return $FullResult }
+    if ($DegradedResult -is [hashtable] -and $DegradedResult['status'] -eq 'sent') {
+        $httpStatus = if ($DegradedResult.ContainsKey('http_status')) { $DegradedResult['http_status'] } else { 200 }
+        return @{ status = 'degraded'; class = 'ok'; http_status = $httpStatus; error = 'full-payload rejected, degraded landed' }
+    }
+    return $DegradedResult
+}
+
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106 §3, msg-2104): the digest cadence
 # is per-PERIOD, not per-interval. A period id is a wall-clock local date string; the predicate
 # "period P ≠ period Q" is jitter-immune because a 5-minute tick offset does not cross a date
@@ -1128,13 +1158,26 @@ function New-DailyDigest {
     }
     # Fetch-error surface (I-2 "黙って劣化しない"). When scripts/parked_humans.py could not read
     # some threads' bodies, the section stays but the count above under-reports. Say so out loud.
+    #
+    # PR-gate review round 2 (2026-08-30): the per-row loop was unconditional, so a spike of ~20+
+    # fetch errors could push the total past $Budget and trigger the exact Discord 400 this PR
+    # exists to prevent. Route the row list through _AddSectionEntries so the same budget
+    # discipline that governs every other row-emitting section governs this one too. The count-line
+    # (single, small, informational) stays unconditional — the operator needs to see "取得失敗: N"
+    # even if the individual rows had to be dropped for budget.
     if ($ParkedPollErrors.Count -gt 0) {
         $lines += "  取得失敗: $($ParkedPollErrors.Count) 件（判断待ちに含まれていない可能性あり）"
+        $errorEntries = @()
         foreach ($e in $ParkedPollErrors) {
             $tid = if ($e.PSObject.Properties.Name -contains 'thread_id') { $e.thread_id } else { $e['thread_id'] }
             $reason = if ($e.PSObject.Properties.Name -contains 'reason') { $e.reason } else { $e['reason'] }
-            $lines += "    $tid — $reason"
+            $errorEntries += [PSCustomObject]@{ Line = "    $tid — $reason"; AgeSeconds = 0 }
         }
+        # 飢餓 + footer still to come; reserve marker + trailing.
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $errorEntries -MaxLen $Budget -Reserve ($overflowMarker + $trailingReserve) -RunningLen $runLen
+        $lines += $result.Emitted
+        if ($result.Dropped -gt 0) { $lines += "    +$($result.Dropped) 件（省略）" }
     }
 
     $lines += ""
@@ -3112,21 +3155,25 @@ try {
             # NOT on deterministic-permanent (401/403/404 → the webhook is dead, a second POST
             # will fail the same way — Test-DigestDelivered still advances cadence, no spam) and
             # NOT on transient (429/5xx/network → the retry belongs to the next tick).
+            #
+            # Whatever the degraded attempt returns, its ACTUAL outcome must drive the cadence
+            # decision — PR-gate review round 2 (2026-08-30) caught the earlier version dropping
+            # the degraded's failure CLASS: if degraded also failed but transiently (503, network
+            # flake), the earlier code preserved the ORIGINAL `deterministic-payload` result,
+            # which Test-DigestDelivered treats as non-retryable, silently advancing cadence and
+            # abandoning what was actually a retryable delivery. Now the whole `$result` is
+            # replaced by the degraded's real return, with only the success case renamed to
+            # `degraded/ok` so Test-DigestFullSuccess stays false (the human was not told the
+            # queue contents).
             if ($result -is [hashtable] -and $result['status'] -eq 'failed' -and $result['class'] -eq 'deterministic-payload') {
                 $degradedMessage = New-DegradedDigestMessage `
                     -WaitingCount ($humanParked.Count + $quarantineState.Count) `
                     -CurrentPeriod $currentPeriod
                 Write-Log "digest full payload rejected (400/413) — attempting degraded fallback ($($degradedMessage.Length) chars)"
                 $degradedResult = Send-Notification -Message $degradedMessage
-                # Roll the degraded outcome into the same $result so the branch below can consume
-                # one shape. The degraded delivery is what actually landed (or did not).
-                if ($degradedResult -is [hashtable] -and $degradedResult['status'] -eq 'sent') {
-                    $result = @{ status = 'degraded'; class = 'ok'; http_status = 200; error = "full-payload rejected, degraded landed" }
-                }
-                # else: leave $result at the original failure. Test-DigestDelivered treats
-                # deterministic-payload (both full AND degraded failed) as cadence-advancing to
-                # prevent 5-minute spam of a message that will keep failing. The tick was
-                # fully-lost from the human's perspective but the sweep does not spam.
+                # Combine into the single result that drives cadence/health decisions below.
+                # See Resolve-DigestSendResult's docstring for the four combinations.
+                $result = Resolve-DigestSendResult -FullResult $result -DegradedResult $degradedResult
             }
 
             # Cadence advance: any DELIVERED outcome (sent full, sent degraded, skipped-no-webhook)

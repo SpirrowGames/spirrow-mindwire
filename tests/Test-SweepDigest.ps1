@@ -71,8 +71,10 @@ foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-Fin
                   'Get-DigestPeriod', 'Test-DigestDeliveryDue',
                   'Get-DigestPeriodsMissed', 'Get-DigestHealthWarning',
                   'New-DegradedDigestMessage', 'Get-NotificationFailureClass',
-                  # For the PR-gate regression block below (alert-path spam-loop pin).
-                  'Test-NotificationSuppressed', 'Send-NotificationIfChanged') {
+                  # For the PR-gate regression block below (alert-path spam-loop pin,
+                  # degraded-fallback class-propagation pin).
+                  'Test-NotificationSuppressed', 'Send-NotificationIfChanged',
+                  'Resolve-DigestSendResult') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -371,6 +373,81 @@ Check "spam-loop #2: failed(deterministic-payload, both attempts failed) advance
 # its whole reason to exist.
 Check "spam-loop #2 complement: failed(transient) HOLDS cadence (retry next tick)" $false `
     (Test-DigestDelivered -Result @{ status='failed'; class='transient'; http_status=503 })
+
+# =============================================================================================
+# PR-GATE REGRESSION BLOCK (round 3) — 2026-08-30 review of PR #203 found two more issues.
+# =============================================================================================
+Write-Host ""
+Write-Host "PR-gate regression (2026-08-30, round 3): degraded-fallback class propagation"
+
+# --- Round 3, item 1: degraded-fallback class propagation --------------------------------------
+# Reproducer: the FULL digest 400s (deterministic-payload); the degraded fallback also fails but
+# TRANSIENTLY (503 / network flake). The earlier revision kept `$result` pointed at the
+# ORIGINAL deterministic-payload failure — which Test-DigestDelivered treats as non-retryable —
+# silently advancing cadence and abandoning what was actually a retryable delivery. THE fix:
+# Resolve-DigestSendResult replaces the caller's $result with the degraded's ACTUAL result on
+# any non-success, so its class drives the cadence decision.
+$fullPayloadFail = @{ status='failed'; class='deterministic-payload'; http_status=400; error='content too long' }
+$degradedTransient = @{ status='failed'; class='transient'; http_status=503; error='service unavailable' }
+$degradedSent = @{ status='sent'; class='ok'; http_status=200; error=$null }
+$degradedPermanent = @{ status='failed'; class='deterministic-permanent'; http_status=404; error='webhook gone' }
+$degradedPayload = @{ status='failed'; class='deterministic-payload'; http_status=400; error='even degraded 400d' }
+
+# Case A: no degraded attempt (fallback not triggered) → pass-through.
+$rA = Resolve-DigestSendResult -FullResult $fullPayloadFail -DegradedResult $null
+Check "resolver: no degraded -> pass-through class" 'deterministic-payload' $rA['class']
+
+# Case B: degraded landed → rename status to 'degraded', class 'ok'; Test-DigestFullSuccess stays false.
+$rB = Resolve-DigestSendResult -FullResult $fullPayloadFail -DegradedResult $degradedSent
+Check "resolver: degraded sent -> status renamed to 'degraded'" 'degraded' $rB['status']
+Check "resolver: degraded sent -> class ok" 'ok' $rB['class']
+Check "resolver: degraded sent -> delivered? YES" $true (Test-DigestDelivered -Result $rB)
+Check "resolver: degraded sent -> full success? NO (queue not shown)" $false (Test-DigestFullSuccess -Result $rB)
+
+# Case C (THE fix): degraded failed transiently → preserve TRANSIENT class → cadence HOLDS.
+$rC = Resolve-DigestSendResult -FullResult $fullPayloadFail -DegradedResult $degradedTransient
+Check "resolver: degraded transient -> class preserved (transient, NOT the original payload)" `
+    'transient' $rC['class']
+Check "resolver: degraded transient -> delivered? NO (cadence must HOLD for retry — the fix)" `
+    $false (Test-DigestDelivered -Result $rC)
+
+# Case D: degraded failed permanently → preserve permanent → cadence advances (webhook dead).
+$rD = Resolve-DigestSendResult -FullResult $fullPayloadFail -DegradedResult $degradedPermanent
+Check "resolver: degraded permanent -> class preserved (deterministic-permanent)" `
+    'deterministic-permanent' $rD['class']
+Check "resolver: degraded permanent -> delivered? YES (webhook dead, no spam)" `
+    $true (Test-DigestDelivered -Result $rD)
+
+# Case E: degraded also 400d (theoretically impossible for a fixed short message; defensive).
+$rE = Resolve-DigestSendResult -FullResult $fullPayloadFail -DegradedResult $degradedPayload
+Check "resolver: degraded also 400 -> class preserved (deterministic-payload)" `
+    'deterministic-payload' $rE['class']
+Check "resolver: degraded also 400 -> delivered? YES (defensive spam-avoidance)" `
+    $true (Test-DigestDelivered -Result $rE)
+
+# --- Round 3, item 2: $ParkedPollErrors must respect the budget --------------------------------
+# Reproducer: a candidate-server outage generates a spike of fetch errors (20+). The earlier
+# revision appended each row unconditionally, blowing past $Budget and reintroducing the exact
+# Discord 400 this PR was fixing. THE fix: route the row list through _AddSectionEntries so the
+# same budget discipline governs it.
+Write-Host ""
+Write-Host "PR-gate regression (2026-08-30, round 3): ParkedPollErrors respects budget"
+
+$errorSpike = @()
+for ($i = 0; $i -lt 100; $i++) {
+    $errorSpike += [PSCustomObject]@{
+        thread_id = ("spirrow-voxelworld/T-parked-{0:D3}-fetch-error-with-long-detail" -f $i)
+        reason = 'HTTP 503 upstream server temporarily unavailable — retrying next tick'
+    }
+}
+$digest_errspike = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $now -LiveKeys @() `
+    -HumanParked @() -ParkedPollErrors $errorSpike `
+    -Budget 3500
+CheckTrue "100-entry ParkedPollErrors spike still fits within budget" ($digest_errspike.Length -le 3500) $digest_errspike.Length
+CheckTrue "count line still names the true total (100)" ($digest_errspike -match '取得失敗: 100 件') $digest_errspike.Substring(0, [Math]::Min(400, $digest_errspike.Length))
+CheckTrue "budget-forced truncation surfaces via `+N 件（省略）` under the fetch-error section" `
+    ($digest_errspike -match '\+\d+ 件（省略）') $digest_errspike
 
 if ($script:failures -gt 0) {
     Write-Host ""
