@@ -1669,12 +1669,16 @@ def test_objection_block_parses_with_a_closing_fence_off_the_end() -> None:
     assert len(report.advisory) == 1
 
 
-def test_objection_block_last_wins_at_column_zero() -> None:
-    """The marker is read at column zero, last-wins — the ``_VERDICT_RE`` discipline.
+def test_objection_block_diff_quoted_marker_does_not_count() -> None:
+    """The marker is read at column zero. A verbatim diff quote keeps its ``+``/``-``/space
+    prefix, so a block quoted OUT of the reviewed diff cannot be picked up as a match — the
+    real block that follows is the ONE match the parser sees, and D-1 is satisfied.
 
-    A verbatim diff quote keeps its ``+``/``-``/space prefix, so a block quoted OUT of the
-    reviewed diff cannot be picked up. Pinned here because this file's own diff necessarily
-    carries the marker literal on every review of it.
+    Pinned here because this file's own diff necessarily carries the marker literal on every
+    review of it. Regression: the pre-D-1 code accepted "last-wins" for two column-zero
+    matches; this test now exists to say the surviving discipline is "one match at column
+    zero, exactly", NOT to say the last of several wins (see
+    :func:`test_objection_block_two_column_zero_markers_derive_missing`).
     """
     quoted_from_a_diff = f' {_OBJECTIONS_SENTINEL}\n [{{"class": "vibes"}}]'
     real = f'{_OBJECTIONS_SENTINEL}\n[{{"class": "{_advisory_class()}", "evidence": "x"}}]'
@@ -1682,6 +1686,77 @@ def test_objection_block_last_wins_at_column_zero() -> None:
     report = parse_objections(body)
     assert report.status is ObjectionParse.OK
     assert not report.unknown_classes
+
+
+def test_objection_block_two_column_zero_markers_derive_missing() -> None:
+    """D-1 (rider-3 msg-2072). Two markers at column zero → MISSING → REQUEST_CHANGES.
+
+    The re-typed-marker residual (a model that drops the ``+``/space diff prefix and quotes
+    the marker in column zero) can no longer bypass the parser via a trailing copy: strict-
+    single deletes the "which match wins?" question rather than answering it. Both directions
+    are asserted here — a copy BEFORE the real block, and a copy AFTER — because either would
+    have anchored under the old last-wins rule.
+    """
+    real_payload = f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "x"}}]'
+    injected_payload = '[{"class": "vibes"}]'
+    for label, body in (
+        (
+            "injection-before-real",
+            f"{_OBJECTIONS_SENTINEL}\n{injected_payload}\n\nprose\n\n"
+            f"{_OBJECTIONS_SENTINEL}\n{real_payload}\n\nVERDICT: APPROVE",
+        ),
+        (
+            "injection-after-real",
+            f"{_OBJECTIONS_SENTINEL}\n{real_payload}\n\nprose\n\n"
+            f"{_OBJECTIONS_SENTINEL}\n{injected_payload}\n\nVERDICT: APPROVE",
+        ),
+    ):
+        report = parse_objections(body)
+        assert report.status is ObjectionParse.MISSING, label
+        assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES, label
+
+
+def test_objection_block_prose_before_the_array_derives_missing() -> None:
+    """D-3 (rider-3 msg-2072). After fence-stripping, prose between the marker and the ``[``
+    → MISSING → REQUEST_CHANGES.
+
+    The pre-D-3 code used ``payload.find("[")`` and would scan forward past prose to anchor
+    to the first bracket. That is an F-a-direction (silent false-APPROVE) window: a benign
+    ``Here are my objections: []`` sentence between the marker and the model's real block
+    would parse the empty array and derive APPROVE, discarding the real objections. D-3
+    replaces the scan with ``startswith("[")`` (equivalent to first-non-whitespace check
+    because ``strip_wrapping_fences`` trims surrounding whitespace).
+    """
+    prose_then_array = (
+        f"{_OBJECTIONS_SENTINEL}\n"
+        "Here are my objections:\n\n"
+        f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
+        "\n\nVERDICT: REQUEST_CHANGES"
+    )
+    report = parse_objections(prose_then_array)
+    assert report.status is ObjectionParse.MISSING
+    assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+
+def test_objection_block_prose_then_empty_array_derives_missing_not_approve() -> None:
+    """D-3, F-a direction pinned by example. Under the pre-D-3 ``find("[")`` code, a marker
+    followed by prose that happens to contain ``[]`` would silently derive APPROVE out of a
+    stray empty array — even when the model wrote a genuine blocking objection later. D-3
+    forces this into MISSING (which derives RC), so the F-a exploit does not exist here.
+
+    This is the concrete case msg-2074 §3 named when it upgraded Einstein's "endorsed / no
+    action" on the payload anchor. Kept as a separate test because its point is about the
+    DIRECTION of the failure (would-have-been APPROVE → now RC), not just about MISSING.
+    """
+    body = (
+        f"{_OBJECTIONS_SENTINEL}\n"
+        "Note: [] means none.\n\n"
+        f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
+        "\n\nVERDICT: REQUEST_CHANGES"
+    )
+    report = parse_objections(body)
+    assert report.status is ObjectionParse.MISSING
+    assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
 
 
 def test_quoting_the_prompt_objection_exemplar_is_fail_closed() -> None:
