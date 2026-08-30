@@ -102,9 +102,10 @@ class LexoraTimeoutError(LexoraHTTPError):
     A **subclass** of :class:`LexoraHTTPError`, so existing ``except LexoraHTTPError`` handlers
     stay backward-compatible (a timeout is still an HTTP-layer failure). It is broken out so a
     caller that wants to treat a timeout differently — e.g. the naysayer PR-review driver, which
-    degrades a timed-out review to a fail-closed REQUEST_CHANGES instead of crashing the pipeline —
-    can catch it *specifically* (``except LexoraTimeoutError``) ahead of the generic handler. Other
-    transport failures (connect / read errors, etc.) remain plain :class:`LexoraHTTPError`.
+    degrades a timed-out review to a COMMENT-hold addressed to the human (T-infra-failure-posts-
+    empty-rc) instead of crashing the pipeline — can catch it *specifically* (``except
+    LexoraTimeoutError``) ahead of the generic handler. Other transport failures (connect / read
+    errors, etc.) remain plain :class:`LexoraHTTPError`.
     """
 
 
@@ -329,7 +330,8 @@ class LexoraClient:
         except httpx.TimeoutException as e:
             # TimeoutException is a subclass of RequestError, so it must be caught FIRST to wrap
             # it as the (sub)typed LexoraTimeoutError. The naysayer driver catches this specifically
-            # to degrade a timed-out review to a fail-closed REQUEST_CHANGES instead of crashing.
+            # to degrade a timed-out review to a COMMENT-hold addressed to the human
+            # (T-infra-failure-posts-empty-rc) instead of crashing.
             raise LexoraTimeoutError(f"POST /v1/chat/completions ({model}) timed out: {e}") from e
         except httpx.RequestError as e:
             raise LexoraHTTPError(f"POST /v1/chat/completions ({model}): {e}") from e

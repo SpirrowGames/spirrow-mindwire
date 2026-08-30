@@ -541,10 +541,14 @@ async def test_github_submit_failure_after_post_fails_loud() -> None:
 
 
 @pytest.mark.anyio
-async def test_lexora_timeout_degrades_to_request_changes_not_raise() -> None:
-    # M4 (i): a LexoraTimeoutError from the content review must NOT crash the pipeline. It degrades
-    # to a fail-closed REQUEST_CHANGES via the same post_critique + GitHub submit path, and the
-    # outcome records timed_out=True.
+async def test_lexora_timeout_degrades_to_comment_not_raise() -> None:
+    # T-infra-failure-posts-empty-rc: a LexoraTimeoutError from the content review must NOT crash
+    # the pipeline. Prior behaviour was a fail-closed REQUEST_CHANGES; new behaviour is a COMMENT-
+    # hold addressed to the human. A gate that did not finish has no critique for the implementer
+    # to act on — an empty RC used to spawn the implementer against a body carrying no fix. The
+    # conductor's non-RC branch (see conductor/core.py:330-336) stops at StopReason.HUMAN on any
+    # non-REQUEST_CHANGES verdict, so switching this posting to COMMENT is sufficient and no
+    # conductor change is required. The outcome still records timed_out=True.
     lexora = _FakeLexora(raise_exc=LexoraTimeoutError("POST /v1/chat/completions timed out"))
     github = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha-to", []))
     posted, post = _capture()
@@ -561,15 +565,77 @@ async def test_lexora_timeout_degrades_to_request_changes_not_raise() -> None:
     # The body is generic about the timeout (no specific seconds number): a DI'd Lexora may carry a
     # different timeout than the driver default, so the body must not assert a concrete value.
     assert "timeout" in posted[0].lower()
-    assert "VERDICT: REQUEST_CHANGES" in posted[0]
+    assert "VERDICT: COMMENT" in posted[0]
+    # The old body carried a "Split the PR into smaller diffs or retry" line — an INSTRUCTION to
+    # the implementer. That directive was the ignition source for the empty-RC dispatch this
+    # change is closing; it must not come back. Pinned here so a future edit that reintroduces
+    # implementer-facing wording on the timeout path fails a test.
+    assert "Split the PR" not in posted[0]
+    # The body is human-addressed: it says explicitly that this posting is not a fix request and
+    # that the PR was not approved. Pin the two load-bearing sentences so a re-word that drops
+    # either one fails a test — those are the semantics the conductor relies on when it stops at
+    # the human instead of dispatching the implementer.
+    body_lower = posted[0].lower()
+    assert "not a fix request" in body_lower
+    assert "not been approved" in body_lower
     assert len(github.submitted) == 1
     _pr_arg, event, _body = github.submitted[0]
-    assert event is ReviewEvent.REQUEST_CHANGES  # GitHub review submitted as RC
-    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+    assert event is ReviewEvent.COMMENT  # GitHub review submitted as COMMENT (not RC)
+    assert outcome.verdict is ReviewEvent.COMMENT
     assert outcome.timed_out is True
     assert outcome.model == "naysayer"  # model telemetry preserved on the timeout-degrade path
     assert outcome.head_sha == "sha-to"  # CI head SHA still recorded
     assert outcome.ci_state is CiState.SUCCESS
+
+
+@pytest.mark.anyio
+async def test_lexora_timeout_degrade_does_not_calcify_as_head_verdict() -> None:
+    # T-infra-failure-posts-empty-rc F-5: the timeout-degrade posting must NOT be picked up by
+    # ``_latest_verdict_review`` as the head's standing verdict on the next fire.
+    #
+    # A COMMENT review is not in ``_VERDICT_STATES`` (which is ("APPROVED", "CHANGES_REQUESTED")),
+    # so ``_skip_unchanged_response`` skips over it and the next fire runs a real review instead
+    # of re-serving the timeout body. This test simulates that second fire: a prior naysayer
+    # ``COMMENTED`` review against the CURRENT head plus ``skip_if_head_unchanged=True`` must
+    # still call the model. If someone ever adds ``COMMENTED`` to ``_VERDICT_STATES`` or changes
+    # this path to submit RC again, that COMMENTED prior would satisfy the skip predicate and
+    # freeze the false posting as the standing verdict for the head — this test fails first.
+    lexora = _FakeLexora(content="looks fine\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            # The prior timeout-degrade posting: naysayer login, COMMENTED, against the same head.
+            ReviewInfo("spirrowgames-ops", "COMMENTED", "headsha", "2026-06-10T00:00:01Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    # The skip did NOT fire on the COMMENTED prior — the full review ran (pass 1 + pass 2).
+    assert lexora.calls != []
+    assert outcome.skipped_head_unchanged is False
+    # And this second fire's verdict is the model's own, not the calcified timeout body.
+    assert outcome.verdict is ReviewEvent.APPROVE
+
+
+@pytest.mark.anyio
+async def test_ci_failure_verdict_still_request_changes() -> None:
+    # T-infra-failure-posts-empty-rc §3 boundary: only the pass-1 timeout path changes verdict.
+    # A CI FAILURE carries actionable content (the failing check names) and must remain
+    # ``REQUEST_CHANGES`` — the driver's L1 CI-gate short-circuits to RC with a "CI is failing"
+    # body, and the objection-class discipline classifies that as implementer-actionable.
+    lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.FAILURE, "sha-red", ["build", "typecheck"]),
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+    assert outcome.ci_gated is True
+    assert [event for _, event, _ in github.submitted] == [ReviewEvent.REQUEST_CHANGES]
 
 
 @pytest.mark.anyio
@@ -824,12 +890,12 @@ async def test_debounce_body_round_trips_an_approve_verdict() -> None:
 
 @pytest.mark.anyio
 async def test_round_cap_and_timeout_bodies_are_matched_by_the_anchor() -> None:
-    """The remaining self-authored bodies name COMMENT / REQUEST_CHANGES — check the match.
+    """The remaining self-authored bodies name COMMENT — check the match.
 
-    Both collapse to ``ModelVerdict.REQUEST_CHANGES`` (COMMENT is a non-APPROVE model
-    verdict, ``REQUEST_CHANGES`` is one directly) — indistinguishable from the parser's
-    return value alone, so only the raw match distinguishes "read correctly" from "not
-    read at all".
+    After T-infra-failure-posts-empty-rc the timeout-degrade body carries ``VERDICT:
+    COMMENT`` (was ``VERDICT: REQUEST_CHANGES``); the round-cap body has always been
+    ``VERDICT: COMMENT``. Both collapse to a non-APPROVE model verdict, so only the raw
+    match distinguishes "read correctly" from "not read at all".
     """
     # Round-cap escalation → VERDICT: COMMENT
     github = _FakeGitHub(
@@ -844,7 +910,7 @@ async def test_round_cap_and_timeout_bodies_are_matched_by_the_anchor() -> None:
     await driver.review(_pr(), post_critique=post)
     assert _VERDICT_RE.findall(capped[0]) == ["COMMENT"]
 
-    # Timeout-degrade → VERDICT: REQUEST_CHANGES
+    # Timeout-degrade → VERDICT: COMMENT (T-infra-failure-posts-empty-rc)
     timed_out, post = _capture()
     driver = NaysayerPrReviewDriver(
         lexora=_FakeLexora(raise_exc=LexoraTimeoutError("POST /v1/chat/completions timed out")),
@@ -852,7 +918,7 @@ async def test_round_cap_and_timeout_bodies_are_matched_by_the_anchor() -> None:
     )
     outcome = await driver.review(_pr(), post_critique=post)
     assert outcome.timed_out is True
-    assert _VERDICT_RE.findall(timed_out[0]) == ["REQUEST_CHANGES"]
+    assert _VERDICT_RE.findall(timed_out[0]) == ["COMMENT"]
 
 
 @pytest.mark.anyio

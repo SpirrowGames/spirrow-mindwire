@@ -100,8 +100,9 @@ _DEFAULT_MAX_TOKENS = 32000
 # M3 (T34): the CLIENT timeout must be backend + margin so the client always outlives the backend:
 # the backend therefore surfaces its result (completion / partial / error) as the response, and we
 # never time out *before* it does (the old equal-900s tie could lose that race, producing a
-# client-side TimeoutException with no backend answer). On a genuine timeout the driver degrades to
-# a fail-closed REQUEST_CHANGES (M2), so the margin is about *who reports the timeout*, not safety.
+# client-side TimeoutException with no backend answer). On a genuine timeout the driver degrades
+# to a COMMENT-hold addressed to the human (T-infra-failure-posts-empty-rc, see
+# :meth:`_degrade_on_timeout`); the margin is about *who reports the timeout*, not safety.
 # The backend fact (900s) is the SINGLE source of truth in ``lexora/client.py`` — imported here as
 # ``LEXORA_BACKEND_TIMEOUT_SECONDS`` rather than re-hardcoded, so the two files cannot drift.
 _CLIENT_TIMEOUT_MARGIN_SECONDS = 60.0
@@ -1276,9 +1277,12 @@ class NaysayerPrReviewDriver:
         pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(view, pr.slug)
 
         if isinstance(pass1_result, LexoraTimeoutError):
-            # M2 (T34): pass 1 did not finish within the client timeout. Degrade to fail-closed
-            # REQUEST_CHANGES via the same post_critique + _submit_review path, rather than
-            # letting the timeout propagate and crash the pipeline. Pass 2's own outcome
+            # T-infra-failure-posts-empty-rc: pass 1 did not finish within the client timeout.
+            # Degrade to a COMMENT-hold (addressed to the human) via the same post_critique +
+            # _submit_review path, rather than letting the timeout propagate and crash the
+            # pipeline. COMMENT (not REQUEST_CHANGES): the gate did not reach a verdict, and
+            # an empty RC would trigger the conductor to spawn the implementer against a body
+            # that carries no fix — see :meth:`_degrade_on_timeout`. Pass 2's own outcome
             # (whatever it was — usually also unavailable when Lexora is wedged) is stamped on
             # the marker of the degrade body, keeping the marker invariant intact.
             return await self._degrade_on_timeout(
@@ -1425,33 +1429,58 @@ class NaysayerPrReviewDriver:
         would_skip_head_unchanged: bool = False,
         would_cap: bool = False,
     ) -> PrReviewOutcome:
-        """M2 (T34): a timed-out Lexora review → fail-closed REQUEST_CHANGES (never a silent pass).
+        """T-infra-failure-posts-empty-rc: a timed-out Lexora review → COMMENT-hold + human stop.
 
-        Mirrors the truncated-review path: post an explanatory critique, submit a REQUEST_CHANGES
-        review, and return the :class:`PrReviewOutcome` with ``timed_out=True`` so the timeout is
-        observable to the caller. The default verdict (REQUEST_CHANGES) keeps the gate on the same
-        safe side as a length-capped / truncated review; whether a transient timeout should instead
-        be a COMMENT-hold is the open question Q left for the naysayer / Tier-C (msg-503).
+        A pass-1 client timeout is an INFRA failure — the gate itself did not complete, so no
+        verdict was reached. Post an explanatory critique addressed to the HUMAN, submit a
+        ``COMMENT`` review (not ``REQUEST_CHANGES``), and return with ``timed_out=True`` so the
+        timeout is observable. ``REQUEST_CHANGES`` was the previous choice; the failure mode it
+        produced — the conductor spawning the implementer on an empty relay with nothing to fix
+        — was worse than the fail-closed asymmetry it bought (T-infra-failure-posts-empty-rc §1).
+
+        The judging rule this path now follows is the one already applied elsewhere in this
+        module: ``REQUEST_CHANGES`` is a fix signal, so it is reserved for reviews whose body
+        carries implementer-actionable content (a failing CI check, an objection block, a
+        parseable critique). Reviews where the gate itself could not finish (CI UNKNOWN in
+        :func:`_ci_gate_response`; the round-cap escalation above; this timeout path) post a
+        ``COMMENT`` and let the conductor's non-RC branch stop at the human. No new conductor
+        wiring is required — the routing at ``conductor/core.py`` already treats non-RC verdicts
+        as ``StopReason.HUMAN``.
+
+        ``COMMENT`` is not one of ``_VERDICT_STATES``, so the ``skip_if_head_unchanged`` reuse
+        path (:meth:`_latest_verdict_review`) cannot pick this posting up as the "already
+        reviewed this head" verdict; a timeout body will not calcify as the head's standing
+        verdict and be re-served on subsequent fires.
 
         The pass-2 selection (may be a real outcome if pass 2 finished before pass 1 timed out,
         or ``call-failed`` if it too failed) is stamped on the marker so the timeout-degrade
         body carries the marker like every other body — the marker invariant does not weaken
         on the safe-degrade path.
         """
+        head = ci.head_sha or "?"
         body = (
-            f"The naysayer review for {pr.slug} exceeded the configured Lexora client timeout and "
-            f"did not complete. A review that could not finish is treated as not-approved "
-            f"(fail-closed), the same as a truncated/length-capped review: an unfinished review "
-            f"must never APPROVE. Split the PR into smaller diffs or retry.\n\n"
-            f"VERDICT: REQUEST_CHANGES"
+            # 1. This is NOT a fix request — do not push a "fix" on the strength of this post.
+            f"This is not a fix request. Do not push a change on the strength of this posting: "
+            f"the naysayer gate for {pr.slug} did not reach a verdict, so there is no critique to "
+            f"answer.\n\n"
+            # 2. What failed (client timeout / head SHA).
+            f"What happened: the naysayer's pass-1 review call exceeded the configured Lexora "
+            f"client timeout against head {head} and did not complete.\n\n"
+            # 3. No verdict was reached ∴ this PR has NOT been approved by the gate.
+            f"No verdict was reached. This PR has not been approved by the naysayer gate; do not "
+            f"merge on the strength of this review.\n\n"
+            # 4. Addressed to the human: re-fire the gate, or adjudicate.
+            f"Addressed to the human: re-fire the gate against the current head, or adjudicate "
+            f"this PR directly (Tier-C).\n\n"
+            f"VERDICT: COMMENT"
         )
         selection = pass2_selection if pass2_selection is not None else _not_attempted_selection()
         _log_pass2(pr.slug, selection, pass2_raw)
         body = append_marker(body, selection)
         await post_critique(body)
-        await self._submit_review(pr, ReviewEvent.REQUEST_CHANGES, body)
+        await self._submit_review(pr, ReviewEvent.COMMENT, body)
         return PrReviewOutcome(
-            verdict=ReviewEvent.REQUEST_CHANGES,
+            verdict=ReviewEvent.COMMENT,
             body=body,
             ci_state=ci.state,
             head_sha=ci.head_sha,
