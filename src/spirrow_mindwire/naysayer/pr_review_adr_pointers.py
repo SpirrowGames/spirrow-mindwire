@@ -246,7 +246,9 @@ class AdrPointerSelection:
 # --- Prompt builders (T1/T4-supporting entry points) ---------------------------------- #
 
 
-def build_pr_review_pass1_system_prompt(*, verdict_task_prompt: str) -> str:
+def build_pr_review_pass1_system_prompt(
+    *, verdict_task_prompt: str, nonce: str | None = None
+) -> str:
     """Assemble the pass-1 (verdict) system prompt from its production parts.
 
     This is the SINGLE entry point tests use to construct the exact system message
@@ -259,8 +261,29 @@ def build_pr_review_pass1_system_prompt(*, verdict_task_prompt: str) -> str:
     (``_PR_REVIEW_SYSTEM_PROMPT`` in :mod:`spirrow_mindwire.naysayer.pr_review`);
     it is passed in rather than imported so this module has no cyclic dependency
     on the driver module.
+
+    ``nonce`` is the per-invocation hex string the driver generates for the
+    objection-block marker. When provided, a dedicated delivery paragraph is spliced
+    IN BETWEEN the verdict task prompt (which shows the exemplar ``nonce=NONCE``
+    placeholder) and the ADR-index self-declaration, so the model reads the
+    per-invocation value AFTER the exemplar it is meant to fill in. Passed as an
+    argument rather than generated here because the DRIVER owns lifecycle: the
+    same nonce must reach both the prompt and the parser, and generating it here
+    would divorce the two.
     """
-    return f"{build_preamble()}\n\n{verdict_task_prompt}\n\n{PASS_1_ADR_INDEX_SELF_DECLARATION}"
+    parts = [build_preamble(), verdict_task_prompt]
+    if nonce is not None:
+        parts.append(
+            "PER-REVIEW NONCE for the objection-block marker: `"
+            f"{nonce}"
+            "`.\n\nThe exemplar above shows the marker as "
+            "`<!-- mindwire:objections v1 nonce=NONCE -->`. In your reply, replace the literal "
+            f"string `NONCE` in that marker with `{nonce}` — verbatim, no whitespace, no quotes. "
+            "Any other value (including the placeholder `NONCE`, or no `nonce=` at all) is not "
+            "authoritative, and the driver treats a block with such a marker as absent."
+        )
+    parts.append(PASS_1_ADR_INDEX_SELF_DECLARATION)
+    return "\n\n".join(parts)
 
 
 def build_pr_review_pass2_messages(

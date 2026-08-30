@@ -46,6 +46,7 @@ import asyncio
 import json
 import logging
 import re
+import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -252,7 +253,7 @@ _VERDICT_RE = re.compile(
 # not kept alongside it — two ways to say "this one is a nit" is the dual-management defect the
 # class system exists to remove.
 #
-# Three properties of the wording below are load-bearing:
+# FOUR properties of the wording below are load-bearing:
 #
 #   * It does NOT enumerate the class names. ``build_preamble()`` already injects the frontmatter
 #     verbatim into this same system prompt, so an enumeration here would be a second copy of the
@@ -260,11 +261,18 @@ _VERDICT_RE = re.compile(
 #     ``test_no_src_file_duplicates_the_objection_class_vocabulary``.
 #   * Its objection-block exemplar uses PLACEHOLDER class names, not real ones. The exemplar is
 #     handed to the model on every review, so a model restating its instructions emits it; a
-#     placeholder parses as ``UNKNOWN``, which :func:`derive_verdict` counts as blocking. The echo
-#     therefore lands on the fail-closed side — the same reasoning that makes the VERDICT exemplar
-#     a REQUEST_CHANGES (see the note above _PR_REVIEW_SYSTEM_PROMPT).
+#     placeholder parses as ``UNKNOWN``, which :func:`derive_verdict` counts as blocking. Under the
+#     nonce hardening below the echo now lands on the fail-closed side one step earlier — the
+#     literal ``nonce=NONCE`` in the exemplar never matches the per-review nonce — but the
+#     placeholder is kept anyway so a hypothetical exemplar-with-nonce echo (whatever channel might
+#     one day introduce one) still parses as UNKNOWN. Same reasoning that makes the VERDICT
+#     exemplar a REQUEST_CHANGES (see the note above _PR_REVIEW_SYSTEM_PROMPT).
 #   * It adds NO new column-0 ``VERDICT:`` line, so the column-0 APPROVE ban and the quoted-echo
 #     defence are untouched.
+#   * Its exemplar payload is a NON-EMPTY placeholder array, never ``[]``. A live-nonce ``[]``
+#     exemplar would echo-parse as APPROVE (fail-open direct route); a placeholder-class array
+#     under a placeholder-nonce marker fails at TWO independent gates. The redundancy is the
+#     point — either alone would suffice, both together survive the mistake of dropping one.
 #
 # What Stage 1 deliberately does NOT do: change any verdict. The parsed block feeds
 # ``VerdictDecision.derived_verdict``, which no gate path reads (see the SHADOW note there).
@@ -324,16 +332,21 @@ single weakest remaining point.
 Then, at the very END of your reply and immediately BEFORE the verdict line, \
 emit exactly one machine-readable objection block: the marker below at the \
 start of its own line, followed by a single JSON array — no code fence, no \
-prose between them.
+prose between them. The marker carries a per-review nonce delivered in a \
+paragraph below this prompt; replace the literal `NONCE` in the marker with that \
+value verbatim. Emitting the marker without the substitution, or with any other \
+value, causes the driver to treat the block as absent (fail-closed).
 
-<!-- mindwire:objections v1 -->
+<!-- mindwire:objections v1 nonce=NONCE -->
 [{"class": "<a class name from objection_classes>", "where": "path:line", \
 "evidence": "<what that class's evidence: line asks for>"}]
 
 One element per objection you stated above, in the same order; `[]` if you \
 stated none. Every objection you made in prose must appear, and the block must \
-not add any you did not make. The block records what you already wrote — it \
-does not replace the prose, and nothing in it changes the verdict line below.
+not add any you did not make. Emit exactly ONE such block, ever — two blocks \
+carrying the substituted nonce cause the driver to treat the review as \
+ambiguous. The block records what you already wrote — it does not replace the \
+prose, and nothing in it changes the verdict line below.
 
 End your reply with exactly one verdict line, in exactly this form — at the start of the line, \
 holding nothing else (no indentation, no bold or backticks, no trailing note):
@@ -459,31 +472,104 @@ def _parse_model_verdict(critique: str) -> ModelVerdict:
 # of this parser is the thing being MEASURED, not something the gate depends on yet
 # (msg-2033 §J-3). Reversing that is Stage 2, a separate Tier-C decision whose stated
 # pre-conditions include an independent review of this parser's injection surface.
-_OBJECTIONS_SENTINEL = "<!-- mindwire:objections v1 -->"
+# ── Nonce hardening (T-naysayer-blocking-bar-undefined Stage 1.5, msg-2088 / msg-2090) ──
+#
+# The Stage-1 sentinel was ``<!-- mindwire:objections v1 -->`` and the parser used
+# last-wins to pick a single authoritative block. Einstein's rider-3 review (msg-2089)
+# found that this weaponises a model FORMAT-FAILURE: an attacker embeds the sentinel plus
+# ``[]`` in the diff or a raw string, the model quotes the diff verbatim while forming its
+# critique but omits its own trailing block on a format slip, and last-wins hands the
+# empty attacker block to the parser — deriving APPROVE. Under Stage 2 that would open the
+# gate on request. Under Stage 1 nothing is posted, so no incident is possible yet; the
+# fix lands here BEFORE the shadow collection starts because changing the output contract
+# invalidates any samples measured under the old one (msg-2090 §2).
+#
+# The fix is smaller in mechanism than what it replaces: last-wins is REMOVED. The parser
+# now recognises exactly one shape as authoritative — a column-zero sentinel whose ``nonce=``
+# field equals a per-invocation hex string generated by the driver and delivered to the
+# model in the same system message. The exemplar in the prompt carries the LITERAL
+# ``nonce=NONCE`` (never the live value), so a model that recites its instructions emits a
+# non-matching nonce which the parser treats as absent (fail-closed → REQUEST_CHANGES). An
+# attacker who cannot see the nonce cannot forge one; a model format-failure with no
+# authoritative block reads as MISSING rather than as an attacker's ``[]``.
+#
+# Ambiguity is treated the same way: two or more authoritative markers in one reply mean
+# the model violated the "emit exactly one" contract, and the parser refuses to guess
+# which one to trust — the derivation is REQUEST_CHANGES (fail-closed). A determined
+# attacker can still coerce the model into emitting a second authoritative block through
+# an instruction hidden in the diff, but the outcome is an RC (i.e. the round loops
+# without merging), not a false APPROVE, and the round cap (2026-08-28 enforce) bounds
+# the coercion. Recorded rather than closed here — this residual is precisely what makes
+# Stage 2's rider-3 pre-condition a live obligation rather than a formality.
+#
+# What is NOT closed by the nonce alone, so it stays in the residuals section: a
+# non-authoritative ``nonce=`` sentinel (either literally ``NONCE`` or a wrong hex value)
+# is CONFUSABLE with a benign MISSING at the derivation layer — both derive RC. The
+# ``spoof_candidates`` counter below is the ONLY channel that distinguishes them; without
+# it, real attack attempts would be invisible in an ocean of ordinary format failures.
+# Einstein's PR-facing objection (msg-2091 §3) declined putting this in the D-divergence
+# note itself as OverScope — the sentinel string appears in every diff that touches this
+# file, and the parser correctly ignoring nonce-less strings is the mechanism working as
+# intended, not an event worth alerting the human about on every review. It rides in the
+# structured log line only. Bohr's §5-(5) rider-3 pre-condition covers the assurance side.
+_OBJECTIONS_SENTINEL_PREFIX = "<!-- mindwire:objections v1"
 
-# Anchored at COLUMN ZERO, last-wins — the same discipline (and the same limits) as
-# :data:`_VERDICT_RE`; read that block before widening this one. A unified-diff line carries a
-# ``+``/``-``/space prefix, so a VERBATIM quote of this file's own diff (which necessarily
-# contains the sentinel literal) cannot satisfy the anchor. The residual is identical too: a
-# model that RE-TYPES the marker without the prefix produces a genuine match, and last-wins only
-# helps while the re-typed copy precedes the model's own block. In Stage 1 that residual costs
-# nothing (nothing is posted from it); it is precisely why Stage 2's stated pre-conditions
-# include an independent review of this surface.
-_OBJECTIONS_SENTINEL_RE = re.compile(rf"^{re.escape(_OBJECTIONS_SENTINEL)}\s*$", re.MULTILINE)
+# Number of random BYTES from ``secrets.token_hex``; the emitted nonce is 2x this many hex
+# characters. 16 hex chars = 64 bits of entropy — well beyond what an attacker in a single
+# review round can guess (they cannot iterate: the nonce is regenerated per invocation and
+# never persisted), and short enough that the marker fits on one line comfortably.
+_NONCE_HEX_BYTES = 8
+_NONCE_HEX_CHARS = _NONCE_HEX_BYTES * 2
+
+# Matches ANY column-zero objections marker — with or without a ``nonce=`` field, and with
+# any hex-ish nonce value. Used for TWO things and one thing only:
+#   (a) filter to matches whose captured group equals the per-invocation nonce (those are
+#       the authoritative markers; everything else is inert);
+#   (b) count the non-authoritative markers as ``spoof_candidates`` for the structured log.
+#
+# The nonce group intentionally allows any of ``A-Za-z0-9`` (rather than strict lowercase
+# hex) so a model that upper-cases the nonce, or an attacker who guesses at the format, is
+# still SEEN by the parser and counted — the authoritative filter then rejects it on the
+# exact-string comparison. Read: the regex answers "does this look like a marker at all";
+# the string comparison answers "is this OUR marker".
+_OBJECTIONS_SENTINEL_ANY_RE = re.compile(
+    r"^<!-- mindwire:objections v1(?:\s+nonce=([A-Za-z0-9]+))?\s*-->\s*$",
+    re.MULTILINE,
+)
+
+
+def _generate_objection_nonce() -> str:
+    """Return a fresh per-review nonce (hex, :data:`_NONCE_HEX_CHARS` chars).
+
+    Generated by :func:`secrets.token_hex` for cryptographic unpredictability. Never
+    persisted, never re-used across invocations, never derived from PR-visible inputs
+    (head sha, PR number, time): a nonce an attacker could compute is not a nonce.
+    """
+    return secrets.token_hex(_NONCE_HEX_BYTES)
 
 
 class ObjectionParse(Enum):
     """How the objection block of one critique read. Every value is recorded, none is fatal.
 
     ``UNKNOWN`` and ``NO_EVIDENCE`` are element-level facts promoted to the report so the
-    gate notice can name what happened; ``MISSING`` covers both "no marker" and "the array
-    would not parse", because the derivation treats them identically (fail-closed) and a
-    finer split would suggest the two are handled differently when they are not.
+    gate notice can name what happened; ``MISSING`` covers "no authoritative marker" (which
+    includes "no marker at all", "marker with the wrong nonce", and "authoritative marker
+    but the array would not parse") because the derivation treats them identically
+    (fail-closed) and a finer split would suggest the four are handled differently when
+    they are not. The non-authoritative shapes are distinguished from the true-absence
+    shape only by :attr:`ObjectionReport.spoof_candidates`, which rides in the log — see
+    the block above :data:`_OBJECTIONS_SENTINEL_PREFIX`.
+
+    ``AMBIGUOUS`` is the "two or more authoritative markers" shape. Under Stage 1 this
+    matters because a determined attacker can coerce the model into emitting a second
+    authoritative block via an instruction hidden in the diff — the parser refuses to
+    guess which to trust, and the derivation is REQUEST_CHANGES.
     """
 
     OK = "ok"
     EMPTY = "empty"
     MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
     UNKNOWN = "unknown-class"
     NO_EVIDENCE = "no-evidence"
 
@@ -501,11 +587,22 @@ class Objection:
 
 @dataclass(frozen=True)
 class ObjectionReport:
-    """The parse of one critique's objection block."""
+    """The parse of one critique's objection block.
+
+    ``spoof_candidates`` is the count of column-zero objection markers in the critique whose
+    ``nonce=`` field did NOT equal the per-invocation nonce (or was absent). It is a raw
+    observation, not a verdict input: the derivation ignores it entirely. The only reason
+    the field exists is that MISSING due to true absence and MISSING due to a nonce-less
+    injection are otherwise indistinguishable at the log/notice layer, and losing the
+    distinction makes real attack attempts invisible in an ocean of ordinary format
+    failures. See the block above :data:`_OBJECTIONS_SENTINEL_PREFIX` for why this only
+    rides in the log, not the PR-facing notice (Einstein, msg-2091 §3).
+    """
 
     status: ObjectionParse
     objections: tuple[Objection, ...] = ()
     unknown_classes: tuple[str, ...] = ()
+    spoof_candidates: int = 0
 
     @property
     def blocking(self) -> tuple[Objection, ...]:
@@ -526,20 +623,30 @@ class ObjectionReport:
         return ", ".join(f"{name}={counts[name]}" for name in sorted(counts)) or "none"
 
 
-def _missing_report() -> ObjectionReport:
-    return ObjectionReport(status=ObjectionParse.MISSING)
+def _missing_report(*, spoof_candidates: int = 0) -> ObjectionReport:
+    return ObjectionReport(status=ObjectionParse.MISSING, spoof_candidates=spoof_candidates)
 
 
-def parse_objections(critique: str) -> ObjectionReport:
-    """Parse the objection block out of ``critique``. Never raises.
+def parse_objections(critique: str, *, expected_nonce: str) -> ObjectionReport:
+    """Parse the objection block out of ``critique`` against ``expected_nonce``. Never raises.
 
-    Five outcomes, all recorded, none of which changes what the gate posts:
+    A block is AUTHORITATIVE only if its column-zero marker carries ``nonce=<expected_nonce>``
+    verbatim. Every other column-zero marker (no ``nonce=`` at all, or a different value) is
+    inert and counts toward :attr:`ObjectionReport.spoof_candidates`. The Stage-1 last-wins
+    rule is REMOVED — one shape wins by identity, not position.
 
-    ``OK``           marker present, array parsed, every class known and evidenced.
-    ``EMPTY``        the array is ``[]`` — a legal statement that nothing was objected to.
-    ``MISSING``      no column-zero marker, or the payload after it is not a JSON array.
-    ``UNKNOWN``      some element names a class outside the vocabulary.
-    ``NO_EVIDENCE``  some blocking element carries no evidence.
+    Six outcomes, all recorded, none of which changes what the gate posts:
+
+    ``OK``           one authoritative marker, array parsed, every class known and evidenced.
+    ``EMPTY``        one authoritative marker with an empty array — a legal statement that
+                     nothing was objected to.
+    ``MISSING``      zero authoritative markers, OR the payload after the one authoritative
+                     marker is not a JSON array. ``spoof_candidates`` on the returned report
+                     names how many non-authoritative markers were nevertheless present.
+    ``AMBIGUOUS``    two or more authoritative markers. The parser refuses to guess which is
+                     the "real" one; the derivation is REQUEST_CHANGES (fail-closed).
+    ``UNKNOWN``      the authoritative array named a class outside the vocabulary.
+    ``NO_EVIDENCE``  the authoritative array carried a blocking element without evidence.
 
     ``NO_EVIDENCE`` deliberately does NOT demote the objection to advisory. Demotion would be
     fail-open, and worse, it would make "write no evidence" the cheapest way to soften a
@@ -549,23 +656,27 @@ def parse_objections(critique: str) -> ObjectionReport:
     counted as unknown-class rather than dropped: silently discarding an element the model
     wrote is the one behaviour that could make the derived verdict quieter than the prose.
     """
-    matches = list(_OBJECTIONS_SENTINEL_RE.finditer(critique))
-    if not matches:
-        return _missing_report()
-    payload = strip_wrapping_fences(critique[matches[-1].end() :])
+    all_matches = list(_OBJECTIONS_SENTINEL_ANY_RE.finditer(critique))
+    authoritative = [m for m in all_matches if m.group(1) == expected_nonce]
+    spoof_candidates = len(all_matches) - len(authoritative)
+    if len(authoritative) == 0:
+        return _missing_report(spoof_candidates=spoof_candidates)
+    if len(authoritative) >= 2:
+        return ObjectionReport(status=ObjectionParse.AMBIGUOUS, spoof_candidates=spoof_candidates)
+    payload = strip_wrapping_fences(critique[authoritative[0].end() :])
     start = payload.find("[")
     if start < 0:
-        return _missing_report()
+        return _missing_report(spoof_candidates=spoof_candidates)
     try:
         # ``raw_decode`` stops at the end of the array, so the verdict line (and any prose)
         # that follows the block is simply not consumed — no need to guess where it ends.
         parsed, _ = json.JSONDecoder().raw_decode(payload, start)
     except ValueError:
-        return _missing_report()
+        return _missing_report(spoof_candidates=spoof_candidates)
     if not isinstance(parsed, list):
-        return _missing_report()
+        return _missing_report(spoof_candidates=spoof_candidates)
     if not parsed:
-        return ObjectionReport(status=ObjectionParse.EMPTY)
+        return ObjectionReport(status=ObjectionParse.EMPTY, spoof_candidates=spoof_candidates)
 
     try:
         vocabulary = objection_classes()
@@ -616,21 +727,25 @@ def parse_objections(critique: str) -> ObjectionReport:
     else:
         status = ObjectionParse.OK
     return ObjectionReport(
-        status=status, objections=tuple(objections), unknown_classes=tuple(unknown)
+        status=status,
+        objections=tuple(objections),
+        unknown_classes=tuple(unknown),
+        spoof_candidates=spoof_candidates,
     )
 
 
 def derive_verdict(report: ObjectionReport) -> ReviewEvent:
     """The verdict the class vocabulary implies: RC iff any objection blocks (fail-closed).
 
-    ``MISSING`` derives REQUEST_CHANGES (D-7b): a review whose machine-readable half could
-    not be read is not evidence of "no blocking objection". Unknown classes count as blocking
-    for the same reason, and an unevidenced blocking objection stays blocking (see
-    :func:`parse_objections`).
+    ``MISSING`` and ``AMBIGUOUS`` derive REQUEST_CHANGES: a review whose machine-readable
+    half could not be read (MISSING = no authoritative marker) or could not be trusted
+    (AMBIGUOUS = two authoritative markers, no rule to pick between them) is not evidence
+    of "no blocking objection". Unknown classes count as blocking for the same reason, and
+    an unevidenced blocking objection stays blocking (see :func:`parse_objections`).
 
-    SHADOW: no caller posts this. See the block above :data:`_OBJECTIONS_SENTINEL`.
+    SHADOW: no caller posts this. See the block above :data:`_OBJECTIONS_SENTINEL_PREFIX`.
     """
-    if report.status is ObjectionParse.MISSING:
+    if report.status in (ObjectionParse.MISSING, ObjectionParse.AMBIGUOUS):
         return ReviewEvent.REQUEST_CHANGES
     return ReviewEvent.REQUEST_CHANGES if report.blocking else ReviewEvent.APPROVE
 
@@ -667,9 +782,15 @@ class VerdictDecision:
         derivation is being calibrated on, and an unusable block is the reason a
         disagreement might be spurious. Reporting only the first would let a systematically
         unreadable block look like a systematically wrong derivation.
+
+        ``AMBIGUOUS`` (two authoritative markers) is included because it is a parser-level
+        contract failure — the model was told to emit exactly one — and the reader needs to
+        see it for the same reason they need to see MISSING: an ambiguous block that derives
+        RC is not the derivation calibrating correctly, it is the parser refusing to guess.
         """
         return self.derived_verdict is not self.gate_verdict or self.objections.status in (
             ObjectionParse.MISSING,
+            ObjectionParse.AMBIGUOUS,
             ObjectionParse.UNKNOWN,
             ObjectionParse.NO_EVIDENCE,
         )
@@ -682,7 +803,13 @@ class VerdictDecision:
         )
 
 
-def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) -> VerdictDecision:
+def decide_verdict(
+    critique: str,
+    *,
+    view: DiffView,
+    finish_reason: str | None,
+    expected_nonce: str,
+) -> VerdictDecision:
     """Compute the model verdict, gate verdict, and pack them with the DiffView.
 
     The gate-verdict rule here — "force-RC on any partial review; otherwise mirror the
@@ -691,6 +818,14 @@ def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) 
     24 combinations of model / truncated / finish_reason). The goal of this change is
     to make the existing behaviour AUDIBLE, not to change it. See msg-1874 §9 "参照
     実装をテスト内に置く".
+
+    ``expected_nonce`` threads through to :func:`parse_objections`; the same nonce the
+    DRIVER delivered to the model in the system prompt must reach the parser here, or
+    every authoritative block would fail to match and every review would derive
+    REQUEST_CHANGES. The parameter is required (not defaulted) because a silent default
+    would be a security regression — the whole point of the nonce is that it is unique
+    per invocation, and a caller that could not name one has no business calling the
+    parser.
     """
     mv = _parse_model_verdict(critique)
     if view.truncated or finish_reason == "length":
@@ -706,7 +841,7 @@ def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) 
         gv = ReviewEvent.REQUEST_CHANGES
     # SHADOW (Stage 1). Computed AFTER ``gv`` and never fed back into it — the two statements
     # above are the whole of the gate rule and this change adds nothing to them.
-    report = parse_objections(critique)
+    report = parse_objections(critique, expected_nonce=expected_nonce)
     return VerdictDecision(
         model_verdict=mv,
         gate_verdict=gv,
@@ -844,9 +979,22 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             )
         if report.status is ObjectionParse.MISSING:
             lines.append(
-                "> No readable objection block was found, so the derived side defaults to "
+                "> No authoritative objection block was found (either the marker was absent "
+                "or its nonce did not match this review's), so the derived side defaults to "
                 "REQUEST_CHANGES (fail-closed). This says nothing about the review above."
             )
+        elif report.status is ObjectionParse.AMBIGUOUS:
+            lines.append(
+                "> Two or more authoritative objection blocks were present. The parser "
+                "refuses to guess which one to trust, so the derived side defaults to "
+                "REQUEST_CHANGES (fail-closed). This says nothing about the review above."
+            )
+        # NOTE: ``report.spoof_candidates`` is DELIBERATELY NOT rendered here. Einstein's
+        # rider-3 objection (msg-2091 §3): the ``<!-- mindwire:objections v1 ... -->`` string
+        # appears in every diff that touches this file, and the parser correctly ignoring
+        # nonce-less strings is the mechanism working as intended, not an event worth
+        # alerting the human about on every review. It rides in the structured log line
+        # only — see ``_log_objections``.
     return "\n".join(lines)
 
 
@@ -856,17 +1004,24 @@ def _log_objections(pr_slug: str, head_sha: str | None, decision: VerdictDecisio
     Auxiliary, not the record: the gate notice above is where a reader finds this. A log line
     is what ``spec/process/README.md`` (旧 §N.3) measured as unread, so it is here for grepping
     a corpus of runs, never as the place a divergence is announced.
+
+    ``spoof_candidates`` rides in this line and ONLY in this line (msg-2091 §3): it names the
+    count of column-zero objection markers whose ``nonce=`` did not match the per-invocation
+    nonce, and is the sole channel that distinguishes a real attack attempt from an ordinary
+    format failure. Not on the PR notice (Einstein's OverScope objection) — noise on every
+    diff that touches this file — but retained here as the diagnosis the corpus needs.
     """
     report = decision.objections
     logger.info(
         "naysayer objections %s (head %s): parse=%s blocking=%d advisory=%d by_class=%s "
-        "authored=%s posted=%s derived=%s diverged=%s",
+        "spoof_candidates=%d authored=%s posted=%s derived=%s diverged=%s",
         pr_slug,
         head_sha or "?",
         report.status.value,
         len(report.blocking),
         len(report.advisory),
         report.counts_label(),
+        report.spoof_candidates,
         _model_verdict_label(decision.model_verdict),
         _gate_verdict_label(decision.gate_verdict),
         _gate_verdict_label(decision.derived_verdict),
@@ -960,7 +1115,7 @@ def _make_diff_view(diff: str) -> DiffView:
     )
 
 
-def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
+def _build_messages(text: str, pr_slug: str, *, nonce: str) -> list[ChatMessage]:
     """Pass-1 (verdict) messages — the SINGLE entry point for the pass-1 system prompt.
 
     ``text`` is the ALREADY-TRUNCATED diff body (i.e. ``DiffView.text``): truncation is
@@ -972,6 +1127,12 @@ def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
     independently). Tests can pass a plain short string here — that string is treated as
     already-truncated text, the same contract the production driver honours.
 
+    ``nonce`` is the per-invocation objection-block nonce generated by
+    :func:`_generate_objection_nonce`. It is REQUIRED (not defaulted) so a caller cannot
+    accidentally construct pass-1 messages that promise the model a nonce and then fail to
+    deliver one — the exemplar in the prompt shows ``nonce=NONCE`` and this argument is
+    what tells the model what value to substitute for the literal ``NONCE``.
+
     Tests import this to construct the exact system message the driver sends, so any
     later drift between "what the test asserts on" and "what the driver actually sends"
     fails a test (T1 anti-tautology). ADR-17 D-1: the 5-principles SOT is injected
@@ -979,7 +1140,9 @@ def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
     agent uses, so a one-place edit to ``spec/NAYSAYER_PRINCIPLES.md`` propagates to
     both surfaces (fail-loud: a missing/blank SOT raises).
     """
-    system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
+    system = build_pr_review_pass1_system_prompt(
+        verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT, nonce=nonce
+    )
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
         f"specific hunks you object to, and end with your VERDICT line.\n\n"
@@ -1224,13 +1387,21 @@ class NaysayerPrReviewDriver:
         view = _make_diff_view(diff)
         truncated = view.truncated
 
+        # Per-invocation objection-block nonce. Generated ONCE per ``review()`` call, threaded
+        # into both the pass-1 prompt (so the model knows what to substitute for the ``NONCE``
+        # literal in the marker exemplar) and the parser (so it recognises exactly one shape as
+        # authoritative). Never persisted; every retry / re-fire is a new ``review()`` call and
+        # gets a fresh nonce. See the block above :data:`_OBJECTIONS_SENTINEL_PREFIX`.
+        nonce = _generate_objection_nonce()
         # A-3 two-pass structure (msg-692 §1): run pass 1 (verdict) and pass 2 (ADR-pointer
         # collection) in parallel. Pass 1 = judge; pass 2 = index-injected hint collection whose
         # output cannot alter the verdict (structural guarantee — the driver never reads a
         # verdict token from pass 2's return value). Both fire against the SAME diff at the SAME
         # commit, so a reviewer can trust the ADR pointer section corresponds to the same
         # evidence the verdict was formed on.
-        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(view, pr.slug)
+        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(
+            view, pr.slug, nonce=nonce
+        )
 
         if isinstance(pass1_result, LexoraTimeoutError):
             # M2 (T34): pass 1 did not finish within the client timeout. Degrade to fail-closed
@@ -1267,7 +1438,12 @@ class NaysayerPrReviewDriver:
         # gate rule (force-RC on any partial review) at all 24 combinations of the input
         # matrix — see ``_oracle_gate_verdict`` in tests/test_pr_review_driver.py, which
         # re-states the rule as a 3-line reference and asserts equivalence.
-        decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
+        decision = decide_verdict(
+            body,
+            view=view,
+            finish_reason=completion.finish_reason,
+            expected_nonce=nonce,
+        )
         verdict = decision.gate_verdict
         _log_objections(pr.slug, ci.head_sha, decision)
         # Prepend the gate notice BEFORE the ADR-pointer marker is appended: the notice sits
@@ -1300,7 +1476,7 @@ class NaysayerPrReviewDriver:
         )
 
     async def _run_two_passes(
-        self, view: DiffView, pr_slug: str
+        self, view: DiffView, pr_slug: str, *, nonce: str
     ) -> tuple[Any, AdrPointerSelection, str]:
         """Execute pass 1 + pass 2 concurrently, return their (typed) outcomes.
 
@@ -1308,6 +1484,12 @@ class NaysayerPrReviewDriver:
         :func:`_make_diff_view`. Both passes read ``view.text`` — the raw diff string
         does not reach this method, so the truncation cannot be recomputed here (round-3
         PR-gate finding on PR #186). Same view = same evidence for both passes.
+
+        ``nonce`` reaches ONLY pass 1: the objection-block marker rides in the pass-1
+        verdict reply, and pass 2's JSON-only ADR-pointer reply carries no such block.
+        Threaded explicitly rather than looked up via an instance attribute so the nonce's
+        one-per-invocation lifetime is visible at every call site — the block above
+        :data:`_OBJECTIONS_SENTINEL_PREFIX` is the source-of-truth on that lifetime.
 
         Returns a triple:
 
@@ -1323,7 +1505,7 @@ class NaysayerPrReviewDriver:
         """
         pass1_task = self._lexora.chat_completion(
             model=self._model,
-            messages=_build_messages(view.text, pr_slug),
+            messages=_build_messages(view.text, pr_slug, nonce=nonce),
             max_tokens=self._max_tokens,
         )
         pass2_task = self._collect_adr_pointers(view.text, pr_slug)

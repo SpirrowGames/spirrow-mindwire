@@ -57,13 +57,16 @@ from spirrow_mindwire.naysayer.pr_review import (
     _DEFAULT_TIMEOUT_SECONDS,
     _PR_REVIEW_SYSTEM_PROMPT,
     _ci_gate_response,
+    _generate_objection_nonce,
     _make_diff_view,
     decide_verdict,
     prepend_gate_notice,
 )
+from spirrow_mindwire.naysayer.pr_review_adr_pointers import (
+    build_pr_review_pass1_system_prompt,
+)
 from spirrow_mindwire.naysayer.principles import (
     NAYSAYER_MODEL_TIER,
-    build_preamble,
     principles_version,
 )
 
@@ -72,13 +75,19 @@ if _reconfigure is not None:
     _reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
-def _build_messages(text: str, pr_slug: str, scope: str) -> list[ChatMessage]:
+def _build_messages(text: str, pr_slug: str, scope: str, *, nonce: str) -> list[ChatMessage]:
     """Build the scoped-review messages from a (possibly truncated) diff ``text``.
 
     Truncation is done by the caller via :func:`_make_diff_view` so the pre-truncation
     length is captured for the gate-notice path — this function only formats.
+
+    ``nonce`` is the per-invocation objection-block nonce; the assembly is delegated to
+    :func:`build_pr_review_pass1_system_prompt` so this script gets the exact same
+    delivery paragraph the driver uses (single source of truth for the nonce contract).
     """
-    system = f"{build_preamble()}\n\n{_PR_REVIEW_SYSTEM_PROMPT}"
+    system = build_pr_review_pass1_system_prompt(
+        verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT, nonce=nonce
+    )
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
         f"specific hunks you object to, and end with your VERDICT line.\n\n"
@@ -125,10 +134,11 @@ async def main() -> None:
             f"(truncated={view.truncated}); firing {NAYSAYER_MODEL_TIER} "
             f"(Gemini, billed) with scope context ..."
         )
+        nonce = _generate_objection_nonce()
         try:
             completion = await lexora.chat_completion(
                 model=NAYSAYER_MODEL_TIER,
-                messages=_build_messages(view.text, pr.slug, scope),
+                messages=_build_messages(view.text, pr.slug, scope, nonce=nonce),
                 max_tokens=_DEFAULT_MAX_TOKENS,
             )
         except LexoraTimeoutError as exc:
@@ -143,7 +153,12 @@ async def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(4)
-        decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
+        decision = decide_verdict(
+            body,
+            view=view,
+            finish_reason=completion.finish_reason,
+            expected_nonce=nonce,
+        )
         verdict = decision.gate_verdict
         # Prepend the gate notice via the SAME function the production driver uses. When the
         # gate silently overrides an APPROVE (truncation / length cap), the posted body carries
