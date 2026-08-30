@@ -359,57 +359,155 @@ async def test_open_alert_reraises_other_envelopes() -> None:
 # --- close_alert ----------------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
-async def test_close_alert_closes_by_thread_id_with_owner_only() -> None:
-    """Close call carries owner, no role. Fact-sync, not a judgement (msg-1967 N-5-B).
+def _thread_summary_ok(project: str, thread_id: str) -> dict[str, Any]:
+    """Minimal shape a ``chatroom_get_thread(mode='summary')`` OK returns.
 
-    Pins the semantic form: the sweeper opened this thread and the sweeper
-    takes it down; the payload does NOT claim ``closeable_role``. Any role
-    field would be the exact ADR-10 hack the design rejects (msg-1965 N-4).
+    Verified against the live magickit schema in T-new-project-gate-bootstrap
+    msg-2083 (Heisenberg S-1b probe): a summary hit returns a dict with keys
+    ``thread``, ``messages``, ``mode``, ``digest``. Only the fact that the
+    call succeeded matters to ``_alert_thread_exists`` — the payload content
+    is irrelevant to the precheck's boolean answer.
     """
-    mcp = _FakeMcp(results={"chatroom_close_thread": {"ok": True}})
-    result = await close_alert(
-        mcp,
-        project="spirrow-verimend",
-        merge_commit_sha="deadbeef",
-    )
-    assert result == CloseResult(thread_id="T-gate-bootstrap-spirrow-verimend", was_open=True)
-    args = mcp.args_for("chatroom_close_thread")
-    assert args["thread_id"] == "T-gate-bootstrap-spirrow-verimend"
-    assert args["owner"] == DEFAULT_SWEEPER_OWNER
-    # Explicit assertion: no role claim.
-    assert "role" not in args
-    assert "closeable_role" not in args
-    # merge_commit_sha lands in the decide body (evidence for the fact-sync).
-    assert "deadbeef" in args["decide_content"]
+    return {
+        "thread": {"project": project, "thread_id": thread_id},
+        "messages": [],
+        "mode": "summary",
+        "digest": None,
+    }
 
 
 @pytest.mark.anyio
-async def test_close_alert_swallows_not_found_as_already_closed() -> None:
-    """A thread that is not there is already in the desired end-state (msg-1963 D-4)."""
+async def test_close_alert_prechecks_then_closes_with_current_schema() -> None:
+    """Close path: precheck confirms thread exists, then close is called with the
+    contract magickit's ``chatroom_close_thread`` actually requires.
+
+    Pins T-new-project-gate-bootstrap S-3b (Heisenberg msg-2083 §Bonus, Bohr
+    msg-2084 §5(2)): the payload uses ``author`` (not ``owner``),
+    ``summary_content`` (not ``decide_content``), and ``embodiment`` (required
+    at ADR-2026-05-29-12's mandatory-on-state-transition boundary since close
+    emits a decide msg). ``tags`` carries both ``system-alert`` and
+    ``gate-bootstrap`` — the former is the tag msg-1968's carve-out predicate
+    names for the eventual role-check exemption, and emitting it now ensures
+    the predicate fires when the magickit-side carve-out lands.
+
+    Also pins the semantic form (msg-1967 N-5-B, msg-1965 N-4): no ``role`` /
+    ``closeable_role`` claim — the sweeper does not have a role and never
+    invents one to bypass the gate.
+    """
+    project = "spirrow-verimend"
+    thread_id = "T-gate-bootstrap-spirrow-verimend"
     mcp = _FakeMcp(
         results={
-            "chatroom_close_thread": _error_envelope(
-                "ChatroomNotFoundError", "Thread 'T-gate-bootstrap-x' not found in project 'x'"
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id),
+            "chatroom_close_thread": {"ok": True},
+        }
+    )
+    result = await close_alert(
+        mcp,
+        project=project,
+        merge_commit_sha="deadbeef",
+    )
+    assert result == CloseResult(thread_id=thread_id, was_open=True)
+
+    precheck_args = mcp.args_for("chatroom_get_thread")
+    assert precheck_args == {"project": project, "thread_id": thread_id, "mode": "summary"}
+
+    args = mcp.args_for("chatroom_close_thread")
+    assert args["project"] == project
+    assert args["thread_id"] == thread_id
+    # New contract (verified against live magickit in msg-2083 S-1b bonus).
+    assert args["author"] == DEFAULT_SWEEPER_OWNER
+    assert "summary_content" in args
+    assert args["embodiment"] == "unknown"
+    # Tags include ``system-alert`` (msg-1968 carve-out predicate) alongside
+    # ``gate-bootstrap`` — matches what open_alert already commits to.
+    assert set(args["tags"]) == set(ALERT_TAGS)
+    assert "system-alert" in args["tags"]
+    # merge_commit_sha lands in the summary body (evidence for the fact-sync).
+    assert "deadbeef" in args["summary_content"]
+    # Old field names (the msg-2024 mismatch) MUST NOT appear.
+    assert "owner" not in args
+    assert "decide_content" not in args
+    # No role claim (msg-1965 N-4, msg-1967 N-5-B).
+    assert "role" not in args
+    assert "closeable_role" not in args
+
+
+@pytest.mark.anyio
+async def test_close_alert_precheck_not_found_makes_no_close_call() -> None:
+    """A thread that is not there is already in the desired end-state (msg-1963 D-4)
+    AND — new in S-3b — the close call is never issued.
+
+    Pins Bohr msg-2027 §設計側の指摘 (ii) / msg-2084 §5(2)(ii) — the "呼ばない"
+    behaviour that eliminates the write-shaped call every 5 minutes for the
+    3 DECLARED projects that never had a T-gate-bootstrap-* thread opened
+    (msg-2024 measurement: 153 close_refused/day). The precheck returns
+    ``False`` and close_alert exits without touching ``chatroom_close_thread``.
+    """
+    project = "x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _error_envelope(
+                "ChatroomNotFoundError",
+                "Thread 'T-gate-bootstrap-x' not found in project 'x'",
             ),
         }
     )
-    result = await close_alert(mcp, project="x")
+    result = await close_alert(mcp, project=project)
     assert result == CloseResult(thread_id="T-gate-bootstrap-x", was_open=False)
+    # Load-bearing: the write-shaped call was never issued.
+    close_calls = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
+    assert close_calls == []
 
 
 @pytest.mark.anyio
 async def test_close_alert_swallows_already_resolved_as_already_closed() -> None:
-    """A thread already closed by a human is also the desired end-state."""
+    """A thread already closed between the precheck and the close call still
+    lands in the desired end-state.
+
+    Race window is narrow but real: precheck says the thread exists, and by
+    the time close_thread issues, a human (or a parallel tick) has already
+    closed it. Same idempotent no-op contract as before, only now the
+    envelope arrives at the close boundary rather than at the (removed)
+    unconditional-close boundary.
+    """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
     mcp = _FakeMcp(
         results={
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id),
             "chatroom_close_thread": _error_envelope(
                 "ChatroomIntegrityError", "Thread already resolved"
             ),
         }
     )
-    result = await close_alert(mcp, project="x")
-    assert result == CloseResult(thread_id="T-gate-bootstrap-x", was_open=False)
+    result = await close_alert(mcp, project=project)
+    assert result == CloseResult(thread_id=thread_id, was_open=False)
+
+
+@pytest.mark.anyio
+async def test_close_alert_swallows_race_not_found_at_close_boundary() -> None:
+    """If the thread disappears between the precheck and the close call
+    (race), the not-found envelope from close_thread is still swallowed.
+
+    Kept as a distinct test from the precheck-not-found path because the
+    envelope arrives at a different call-site now — the current code has
+    two independent not-found swallows (one at the precheck, one at the
+    close boundary) and both need to hold for the idempotent contract to
+    survive concurrent operators.
+    """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id),
+            "chatroom_close_thread": _error_envelope(
+                "ChatroomNotFoundError", "Thread 'T-gate-bootstrap-x' not found in project 'x'"
+            ),
+        }
+    )
+    result = await close_alert(mcp, project=project)
+    assert result == CloseResult(thread_id=thread_id, was_open=False)
 
 
 @pytest.mark.anyio
@@ -422,9 +520,16 @@ async def test_close_alert_raises_close_refused_on_role_check_denial() -> None:
     server-side carve-out (``system-alert`` tag + owner-close permits close)
     can be added upstream. Never inventing a role on the sweeper is the
     design's non-negotiable (msg-1965 N-4).
+
+    With S-3b's precheck in place, this envelope now arrives at the close
+    call after the precheck confirms the thread is present — the surfacing
+    contract is unchanged.
     """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
     mcp = _FakeMcp(
         results={
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id),
             "chatroom_close_thread": _error_envelope(
                 "ChatroomPermissionError",
                 "closeable_roles check failed: 'orchestrator' lacks required role",
@@ -432,7 +537,7 @@ async def test_close_alert_raises_close_refused_on_role_check_denial() -> None:
         }
     )
     with pytest.raises(GateBootstrapCloseError, match="closeable_roles"):
-        await close_alert(mcp, project="x")
+        await close_alert(mcp, project=project)
 
 
 # --- CLI wrapper (scripts/gate_bootstrap_tick.py) -----------------------------------------------
@@ -456,16 +561,25 @@ _CLI = _load_cli_module()
 
 @pytest.mark.anyio
 async def test_cli_run_tick_declared_calls_close_only(tmp_path: Path) -> None:
-    """DECLARED → the tick attempts (idempotent) close of the alert thread.
+    """DECLARED → precheck confirms thread exists, then close is issued once.
 
-    Pins the closing side of msg-1963 D-4: the same predicate opens and closes
-    this alert. When DECLARED, the tick tries to take the thread down; if it
-    was never open, ``already_closed`` folds it to a nop.
+    Pins the closing side of msg-1963 D-4 through S-3b: when DECLARED, the
+    tick asks whether the alert thread is present (read), and only if it is
+    does it issue ``chatroom_close_thread`` (write). Same idempotency
+    contract as before, tighter execution semantics — Bohr msg-2027 §設計
+    側の指摘 (ii): 「閉じる対象が無いなら呼ばない」.
     """
+    project = "spirrow-example"
+    thread_id = "T-gate-bootstrap-spirrow-example"
     (tmp_path / ".mindwire-gate").write_text("#!/usr/bin/env bash\nexit 0\n")
-    fake = _FakeMcp(results={"chatroom_close_thread": {"ok": True}})
+    fake = _FakeMcp(
+        results={
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id),
+            "chatroom_close_thread": {"ok": True},
+        }
+    )
     exit_code, out = await _CLI._run_tick(
-        "spirrow-example",
+        project,
         tmp_path,
         owner=DEFAULT_SWEEPER_OWNER,
         mcp_url=None,
@@ -475,10 +589,68 @@ async def test_cli_run_tick_declared_calls_close_only(tmp_path: Path) -> None:
     assert exit_code == 0
     assert out["status"] == GateStatus.DECLARED.value
     assert out["action"] == "closed"
-    assert out["thread_id"] == "T-gate-bootstrap-spirrow-example"
+    assert out["thread_id"] == thread_id
+    # Precheck: one read against the exact thread id, mode='summary'.
+    assert fake.args_for("chatroom_get_thread") == {
+        "project": project,
+        "thread_id": thread_id,
+        "mode": "summary",
+    }
     args = fake.args_for("chatroom_close_thread")
-    assert args["owner"] == DEFAULT_SWEEPER_OWNER
+    # New contract (S-3b). The old {owner, decide_content} shape would
+    # never have reached the tool; this asserts the fix positively.
+    assert args["author"] == DEFAULT_SWEEPER_OWNER
+    assert "summary_content" in args
+    assert args["embodiment"] == "unknown"
+    assert "system-alert" in args["tags"]
+    assert "owner" not in args
+    assert "decide_content" not in args
     assert "role" not in args
+
+
+@pytest.mark.anyio
+async def test_cli_run_tick_declared_skips_close_when_alert_thread_absent(
+    tmp_path: Path,
+) -> None:
+    """DECLARED but no alert thread was ever opened → tick issues NO write.
+
+    Pins the fix for the msg-2024 measurement: three DECLARED projects with
+    no T-gate-bootstrap-<project> thread ever opened were still issuing
+    ``chatroom_close_thread`` on every tick, 153 close_refused/day. After
+    S-3b, the precheck says "not found" and no write is issued; the tick
+    still reports ``already_closed`` because from the mechanism's point of
+    view the desired end-state (thread not open) is already the case
+    (msg-1963 D-4).
+    """
+    project = "spirrow-example"
+    thread_id = "T-gate-bootstrap-spirrow-example"
+    (tmp_path / ".mindwire-gate").write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake = _FakeMcp(
+        results={
+            "chatroom_get_thread": _error_envelope(
+                "ChatroomNotFoundError",
+                f"Thread {thread_id!r} not found in project {project!r}",
+            ),
+        }
+    )
+    exit_code, out = await _CLI._run_tick(
+        project,
+        tmp_path,
+        owner=DEFAULT_SWEEPER_OWNER,
+        mcp_url=None,
+        merge_commit_sha=None,
+        mcp_factory=lambda _url: fake,
+    )
+    assert exit_code == 0
+    assert out["status"] == GateStatus.DECLARED.value
+    assert out["action"] == "already_closed"
+    assert out["thread_id"] == thread_id
+    # Load-bearing: NO write-shaped call was issued.
+    close_calls = [name for name, _ in fake.calls if name == "chatroom_close_thread"]
+    assert close_calls == []
+    # And exactly one read-shaped precheck was made.
+    read_calls = [name for name, _ in fake.calls if name == "chatroom_get_thread"]
+    assert read_calls == ["chatroom_get_thread"]
 
 
 @pytest.mark.anyio

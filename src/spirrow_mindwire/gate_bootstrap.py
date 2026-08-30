@@ -469,6 +469,62 @@ async def open_alert(
     return OpenResult(thread_id=thread_id, already_exists=False)
 
 
+# The sweeper's honest ``embodiment`` self-declaration for the ``decide`` msg
+# that ``chatroom_close_thread`` emits (embodiment is required at that boundary
+# by ADR-2026-05-29-12's mandatory-on-state-transition rule, verified against
+# the live magickit schema in T-new-project-gate-bootstrap msg-2083; humans are
+# exempt but the sweeper is not human). This is a scheduled Python script — it
+# is not a terminal coding agent, not a web chat client, and not any of the
+# other named embodiments in the ADR-12 enum. Writing one of those named values
+# would make the audit ledger say something false about who acted. ``unknown``
+# is what the ADR-12 enum uses when no name applies (T-new-project-gate-bootstrap
+# Bohr msg-2084 §5(2) recommends this value on the same reasoning). If a
+# scheduled-script embodiment name is added to the enum later, replace here.
+_SWEEPER_EMBODIMENT = "unknown"
+
+
+async def _alert_thread_exists(
+    mcp: McpToolCaller,
+    *,
+    project: str,
+    thread_id: str,
+) -> bool:
+    """Cheap read-side precheck: does the sweeper's alert thread exist?
+
+    Reads ``chatroom_get_thread`` (``mode='summary'``) — one MCP round-trip
+    against a read-shaped tool. Returns ``True`` if the thread is present,
+    ``False`` if magickit reports it as not found. Any other envelope
+    re-raises unchanged so the caller sees genuine transport / permission
+    faults instead of swallowing them here.
+
+    Split from :func:`close_alert` so ``close_alert`` never issues a
+    write-shaped request against a thread that does not exist (T-new-
+    project-gate-bootstrap msg-2027 §設計側の指摘 (ii): 「閉じる対象が
+    無いなら呼ばない」). Before this precheck, DECLARED projects with no
+    T-gate-bootstrap-<project> thread ever opened would still issue
+    ``chatroom_close_thread`` on every tick — 153 close_refused/day in
+    the measurement window of msg-2024 — and rely on the not-found
+    swallow at the close boundary. That works but leaves a write-shaped
+    call in the ledger every 5 minutes for a state that could be read.
+
+    Cost balance is neutral or slightly better: the previous behaviour
+    was one write per tick (close → not-found → swallow); this is one
+    read per tick (get_thread → not-found). In the exists-and-close case
+    it costs one extra read, which fires at most once per gate-lifecycle
+    transition per project — rare enough to not be worth optimising.
+    """
+    try:
+        await mcp.call_tool(
+            "chatroom_get_thread",
+            {"project": project, "thread_id": thread_id, "mode": "summary"},
+        )
+    except MagickitMcpError as exc:
+        if "not found" in str(exc).lower():
+            return False
+        raise
+    return True
+
+
 async def close_alert(
     mcp: McpToolCaller,
     *,
@@ -484,27 +540,51 @@ async def close_alert(
     thread and the sweeper takes it down; no ``closeable_role`` is claimed
     because the sweeper does not have one and has no business inventing one.
 
-    ``merge_commit_sha``, if known, is written into the ``decide_content`` as
+    ``merge_commit_sha``, if known, is written into ``summary_content`` as
     the concrete evidence the predicate flipped ("gate is now declared, sha
     ``<...>``"). Not required — the mechanism works without it — but including
     it makes the close self-explanatory in the ledger.
 
-    Swallowed envelopes (idempotent no-op):
-      * "not found" — the thread was never opened / has already been deleted.
-      * "already resolved" / "already closed" — the thread has already been
-        taken down (a human closed it manually, or a previous tick did).
+    Structure of this call (T-new-project-gate-bootstrap S-3b, verified
+    against the live magickit schema in Heisenberg msg-2083):
+
+    1. **Precheck** via :func:`_alert_thread_exists`. If the thread was never
+       opened for this project, return ``CloseResult(was_open=False)``
+       immediately without any write-shaped call — msg-2027 §設計側の指摘 (ii)
+       (「閉じる対象が無いなら呼ばない」). This is the fix for the msg-2024
+       measurement (153 close_refused/day against threads that never existed).
+    2. **Close call**. Payload uses magickit's current
+       ``chatroom_close_thread`` schema: ``author`` (not ``owner``),
+       ``summary_content`` (not ``decide_content``), and ``embodiment``
+       (required by ADR-2026-05-29-12 mandatory-on-state-transition, since
+       the close emits a ``decide`` msg). ``tags`` carries both
+       ``system-alert`` and ``gate-bootstrap`` — this is the tag msg-1968's
+       carve-out predicate names for the eventual magickit-side role-check
+       exemption ("`system-alert` タグを持ち、かつ owner 自身によるクローズ
+       である場合はロールチェックを免除する"), and emitting it now means
+       the predicate will actually fire when the carve-out lands rather than
+       silently missing it.
+
+    Swallowed envelopes at the close call (idempotent no-op):
+      * "already resolved" / "already closed" — the thread was taken down
+        between the precheck and the close (a human closed it, or a race).
+      * "not found" — same, if the thread disappeared in the race window.
 
     Any other envelope raises :class:`GateBootstrapCloseError` (the payload
     is preserved via chained exception) so a permission fault surfaces loudly
     rather than being read as success — the msg-1968 obligation surfaces here.
     """
     thread_id = thread_id_for(project)
-    decide = _format_close_decide(project=project, merge_commit_sha=merge_commit_sha)
+    if not await _alert_thread_exists(mcp, project=project, thread_id=thread_id):
+        return CloseResult(thread_id=thread_id, was_open=False)
+    summary = _format_close_decide(project=project, merge_commit_sha=merge_commit_sha)
     payload: dict[str, Any] = {
         "project": project,
         "thread_id": thread_id,
-        "owner": owner,
-        "decide_content": decide,
+        "author": owner,
+        "summary_content": summary,
+        "embodiment": _SWEEPER_EMBODIMENT,
+        "tags": list(ALERT_TAGS),
     }
     try:
         await mcp.call_tool("chatroom_close_thread", payload)
