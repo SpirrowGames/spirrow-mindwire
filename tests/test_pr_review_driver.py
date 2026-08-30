@@ -2003,31 +2003,61 @@ def test_missing_reason_appears_in_shadow_log_line(caplog: pytest.LogCaptureFixt
     assert "missing_reason=-" in joined
 
 
-def test_missing_reason_labels_appear_in_the_d_divergence_notice() -> None:
-    """Instrumentation (rider-3 msg-2130 §3). The D-divergence gate notice names the sub-cause
-    of a MISSING so a reader of the posted review body sees WHICH MISSING fired.
+def test_d_divergence_notice_never_names_the_missing_sub_reason() -> None:
+    """Security pin (rider-3 msg-2212 §1 / msg-2213). The D-divergence notice MUST NOT
+    surface the ``missing_reason`` sub-cause of a MISSING parse.
 
-    The log line lives for grep-a-corpus reads; the notice lives in the review body that both
-    the chatroom and GitHub receive, and rider 2 reads the shadow through it. If the notice
-    still said "no readable objection block was found" with no further detail, rider 2 would
-    have to correlate every review to its log line to tell the three sub-causes apart.
+    The notice ships in the review body that both the chatroom and GitHub receive, which is
+    readable to the model whose diff is under review. Naming which of D-1 / D-3 / no-marker /
+    bad-json fired hands that model — or an attacker whose exploit is in the diff — a
+    per-attempt oracle: "D-1 fired → collapse to one marker"; "D-3 fired → drop the leading
+    prose"; iterate until the block parses clean. Msg-2212 upgraded this from an advisory
+    to a BLOCKING security defect; msg-2213 directed the fix as "confine the sub-cause to
+    the shadow log". Rider 2 still gets the sub-cause: it rides on ``_log_objections``,
+    which is not returned to the reviewed revision.
+
+    The prior test that pinned the opposite invariant (missing_reason MUST appear in the
+    notice) has been retired by the same messages. The invariant this test now pins is the
+    stronger one: the four sub-reason strings must not appear ANYWHERE in the notice, not
+    just be absent from the specific "no readable objection block" sentence — a well-meaning
+    future edit that adds "(the parser hit multi-marker)" elsewhere in the notice would
+    re-open the same oracle and must red-build here.
     """
     view = _make_view(_DIFF_WARN_THRESHOLD - 1)
-    for expected_reason, body in (
-        (
-            "prose-between",
-            f"{_OBJECTIONS_SENTINEL}\nHere are my objections:\n[]\n\nVERDICT: APPROVE",
+    forbidden_substrings = (
+        "missing_reason",
+        # The five sub-cause strings themselves (from ObjectionMissingReason.value):
+        "no-marker",
+        "multi-marker",
+        "prose-between",
+        "bad-json",
+        "not-a-list",
+    )
+    cases = {
+        "prose-between": (
+            f"{_OBJECTIONS_SENTINEL}\nHere are my objections:\n[]\n\nVERDICT: APPROVE"
         ),
-        (
-            "multi-marker",
-            f"{_OBJECTIONS_SENTINEL}\n[]\n\nprose\n\n"
-            f"{_OBJECTIONS_SENTINEL}\n[]\n\nVERDICT: APPROVE",
+        "multi-marker": (
+            f"{_OBJECTIONS_SENTINEL}\n[]\n\nprose\n\n{_OBJECTIONS_SENTINEL}\n[]\n\nVERDICT: APPROVE"
         ),
-    ):
+        "no-marker": "no blocking problems\n\nVERDICT: APPROVE",
+        "bad-json": f"{_OBJECTIONS_SENTINEL}\n[not json\n\nVERDICT: APPROVE",
+    }
+    for label, body in cases.items():
         decision = decide_verdict(body, view=view, finish_reason="stop")
         notice = render_gate_notice(decision)
-        assert _MARKER_D_DIVERGENCE in notice, expected_reason
-        assert f"missing_reason={expected_reason}" in notice, expected_reason
+        # The notice DOES still name that the block was missing — that fact is not the
+        # oracle, only the specific sub-cause is. So the D-divergence marker must be present
+        # (this is the code path we are checking) and it must still say the derived side
+        # fell to REQUEST_CHANGES.
+        assert _MARKER_D_DIVERGENCE in notice, label
+        assert "No readable objection block was found" in notice, label
+        assert "REQUEST_CHANGES" in notice, label
+        for forbidden in forbidden_substrings:
+            assert forbidden not in notice, (
+                f"case={label!r}: notice leaks {forbidden!r}, which is the oracle "
+                f"msg-2212 §1 / msg-2213 said must be confined to the shadow log"
+            )
 
 
 def test_r4a_verdict_re_carries_a_back_reference_to_the_divergence() -> None:
