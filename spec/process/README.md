@@ -97,7 +97,7 @@ manifest の書式・読込 API・不変条件 (verbatim 長さ保持 = canary �
 
 ## `./obligations.yaml` の配送範囲は naysayer の片面 (design-time) だけである (2026-08-30、T-obligations-not-reaching-pr-gate)
 
-**前節の「ループが実際に読む場所」規律は、宛先を粒く見せる。実際の配送はもっと細かい。** naysayer は 2 面あり (実体・出力の性質ともに異なる)、`./obligations.yaml` の `role: naysayer` エントリが届くのはそのうちの **design-time 面 (`src/spirrow_mindwire/adapters/naysayer_sdk.py`) だけ**である。両面の記述は `docs/architecture.md` §8bis.4 (`### 8bis.4 naysayer は 2 面あり、 worldview が異なる`) が SOT。
+**前節の「ループが実際に読む場所」規律は、宛先を粗く見せる。実際の配送はもっと細かい。** naysayer は 2 面あり (実体・出力の性質ともに異なる)、`./obligations.yaml` の `role: naysayer` エントリが届くのはそのうちの **design-time 面 (`src/spirrow_mindwire/adapters/naysayer_sdk.py`) だけ**である。両面の記述は `docs/architecture.md` §8bis.4 (`### 8bis.4 naysayer は 2 面あり、 worldview が異なる`) が SOT。
 
 ### 事実の宣言 (配送 topology)
 
