@@ -570,12 +570,35 @@ async def close_alert(
         between the precheck and the close (a human closed it, or a race).
       * "not found" — same, if the thread disappeared in the race window.
 
-    Any other envelope raises :class:`GateBootstrapCloseError` (the payload
-    is preserved via chained exception) so a permission fault surfaces loudly
-    rather than being read as success — the msg-1968 obligation surfaces here.
+    Swallowed envelope at the precheck call (idempotent no-op):
+      * "not found" — no thread was ever opened for this project; the
+        desired end-state is already the case.
+
+    Any other envelope — at either the precheck OR the close boundary —
+    raises :class:`GateBootstrapCloseError` (the payload is preserved via
+    chained exception) so a permission fault surfaces loudly rather than
+    being read as success. Both boundaries must satisfy this invariant, or
+    a read-side permission fault at the precheck would silently propagate
+    as ``MagickitMcpError`` and every alert would fail closed without
+    reaching the msg-1968 obligation's failure surface. This is the fix
+    for the PR-gate objection on PR #200 (invariant class) and Bohr's
+    msg-2087 §3(3) blocking question: not-found vs. genuine fault must
+    be discriminated at the precheck, and only not-found is swallowed —
+    every other envelope surfaces loudly, matching the close-boundary
+    contract.
     """
     thread_id = thread_id_for(project)
-    if not await _alert_thread_exists(mcp, project=project, thread_id=thread_id):
+    try:
+        thread_exists = await _alert_thread_exists(mcp, project=project, thread_id=thread_id)
+    except MagickitMcpError as exc:
+        # Any non-"not found" envelope at the read boundary is a genuine
+        # fault (permission / transport / auth). Surface it loudly through
+        # the same exception class the close boundary uses, so the operator
+        # sees ONE failure surface across the whole close_alert contract.
+        raise GateBootstrapCloseError(
+            f"chatroom_get_thread precheck refused for {thread_id!r} in project {project!r}: {exc}"
+        ) from exc
+    if not thread_exists:
         return CloseResult(thread_id=thread_id, was_open=False)
     summary = _format_close_decide(project=project, merge_commit_sha=merge_commit_sha)
     payload: dict[str, Any] = {

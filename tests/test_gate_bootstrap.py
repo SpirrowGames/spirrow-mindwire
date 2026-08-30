@@ -511,6 +511,49 @@ async def test_close_alert_swallows_race_not_found_at_close_boundary() -> None:
 
 
 @pytest.mark.anyio
+async def test_close_alert_raises_close_refused_on_precheck_permission_fault() -> None:
+    """A permission-shaped envelope at the *precheck* boundary surfaces loudly
+    as GateBootstrapCloseError — same contract as the close boundary.
+
+    Pins the fix for the PR-gate blocking objection on PR #200 (invariant
+    class) and Bohr msg-2087 §3(3): the invariant that
+    ``close_alert``'s docstring asserts — "any other envelope raises
+    :class:`GateBootstrapCloseError`" — must hold across BOTH the read
+    (precheck) and the write (close) boundaries. The prior implementation
+    caught permission faults only at the write boundary; a read-side fault
+    from ``chatroom_get_thread`` would leak an unwrapped ``MagickitMcpError``
+    and the close_alert contract would silently break. That leak would also
+    look identical in the operator log to a benign "no thread here" answer,
+    so every alert would fail closed without ever reaching the msg-1968
+    obligation's failure surface. Discriminated by the same "not found" check
+    that ``_alert_thread_exists`` already uses to swallow the benign case.
+    """
+    project = "x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _error_envelope(
+                "ChatroomPermissionError",
+                "read access denied: 'orchestrator' lacks required role",
+            ),
+        }
+    )
+    with pytest.raises(GateBootstrapCloseError, match="precheck refused"):
+        await close_alert(mcp, project=project)
+    # Load-bearing: because the precheck raised, the write-shaped call was never
+    # issued — the invariant does not weaken to "close_thread only".
+    close_calls = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
+    assert close_calls == []
+    # And the wrapped exception carries the original envelope via __cause__ so
+    # the operator can read the underlying error type — same shape as the
+    # close-boundary wrap below.
+    try:
+        await close_alert(mcp, project=project)
+    except GateBootstrapCloseError as wrapped:
+        assert isinstance(wrapped.__cause__, MagickitMcpError)
+        assert "read access denied" in str(wrapped.__cause__)
+
+
+@pytest.mark.anyio
 async def test_close_alert_raises_close_refused_on_role_check_denial() -> None:
     """A permission-shaped envelope surfaces loudly as GateBootstrapCloseError.
 
