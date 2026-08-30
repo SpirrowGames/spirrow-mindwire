@@ -70,7 +70,9 @@ foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-Fin
                   'Test-DigestDelivered', 'Test-DigestFullSuccess',
                   'Get-DigestPeriod', 'Test-DigestDeliveryDue',
                   'Get-DigestPeriodsMissed', 'Get-DigestHealthWarning',
-                  'New-DegradedDigestMessage', 'Get-NotificationFailureClass') {
+                  'New-DegradedDigestMessage', 'Get-NotificationFailureClass',
+                  # For the PR-gate regression block below (alert-path spam-loop pin).
+                  'Test-NotificationSuppressed', 'Send-NotificationIfChanged') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -316,6 +318,59 @@ CheckTrue "summary line names human-parked count" ($digest_summary -match 'human
 CheckTrue "summary line names 隔離 count" ($digest_summary -match '隔離 2') $digest_summary
 CheckTrue "summary line names 最古 (oldest waiting days) — 6d matches the T-old-1 age" `
     ($digest_summary -match '最古 6d') $digest_summary
+
+# =============================================================================================
+# PR-GATE REGRESSION BLOCK — 2026-08-30 naysayer review of PR #203 found two spam loops in the
+# first revision. Both are pinned here so a future edit that reintroduces them fails loudly.
+# =============================================================================================
+Write-Host ""
+Write-Host "PR-gate regression (2026-08-30): the two spam loops must stay closed"
+
+# --- Spam loop #1: alert-path deterministic-payload retry loop ---------------------------------
+# Reproducer: a systemic alert with signature S fires; Send-Notification returns 400. If
+# Send-NotificationIfChanged SKIPS recording the signature (as the first PR revision did), the
+# next 5-minute tick generates the same alert with the same S, dedup check passes (nothing
+# recorded), sends again, 400 again — forever. THE fix is: record on every outcome. The dedup map
+# is keyed by $Key (thread id), NOT by $Signature: a DIFFERENT signature for the same key
+# already bypasses the check because `$State[$Key] -eq $Signature` is false when signatures
+# differ, so recording the failed signature never blocks a new-signature alert.
+$state = @{}
+$key = 'p/T-spam-loop'
+$sig1 = 'human:msg-A'
+$script:sentMessages = @()
+# Stub Send-Notification to return the 400/payload class the first PR revision was skipping on.
+function global:Send-Notification { param([string]$Message) $script:sentMessages += $Message; return @{ status='failed'; class='deterministic-payload'; http_status=400; error='bad' } }
+Send-NotificationIfChanged -State $state -Key $key -Signature $sig1 -Message 'alert body #1'
+$countAfterFirstFailure = $script:sentMessages.Count
+Send-NotificationIfChanged -State $state -Key $key -Signature $sig1 -Message 'alert body #2 (identical sig)'
+$countAfterSecondCall = $script:sentMessages.Count
+Check "spam-loop #1: SAME signature after 400 -> suppressed on 2nd call (no 2nd POST)" `
+    $countAfterFirstFailure $countAfterSecondCall
+CheckTrue "spam-loop #1: state was recorded so Test-NotificationSuppressed returns true" `
+    (Test-NotificationSuppressed -State $state -Key $key -Signature $sig1)
+# DIFFERENT signature for the SAME key still tries — this is what recording the failed signature
+# preserves (contra the first PR revision's rationale that skipping was needed to unblock new sigs).
+$sig2 = 'human:msg-B'
+Send-NotificationIfChanged -State $state -Key $key -Signature $sig2 -Message 'alert body #3 (new sig)'
+Check "spam-loop #1: DIFFERENT signature for same key still POSTs (new-sig delivery preserved)" `
+    ($countAfterSecondCall + 1) $script:sentMessages.Count
+Remove-Item Function:\Send-Notification -ErrorAction SilentlyContinue
+
+# --- Spam loop #2: digest-path deterministic-permanent 404 loop --------------------------------
+# Reproducer: the webhook was deleted from Discord side. Send-Notification returns
+# {status=failed, class=deterministic-permanent, http_status=404}. If Test-DigestDelivered
+# inspects ONLY $status (as the first PR revision did), it returns false → last_sent_period is
+# NOT advanced → next 5-min tick sees "digest due", POSTs again, 404 again — forever, for the
+# rest of the day. THE fix: Test-DigestDelivered inspects $class too, and returns true for any
+# non-retryable failure class (permanent OR payload-after-degraded-also-failed).
+Check "spam-loop #2: failed(deterministic-permanent) advances cadence (no 404 spam)" $true `
+    (Test-DigestDelivered -Result @{ status='failed'; class='deterministic-permanent'; http_status=404 })
+Check "spam-loop #2: failed(deterministic-payload, both attempts failed) advances cadence" $true `
+    (Test-DigestDelivered -Result @{ status='failed'; class='deterministic-payload'; http_status=400 })
+# And the necessary complement: transient IS held (retry next tick), or the cadence gate loses
+# its whole reason to exist.
+Check "spam-loop #2 complement: failed(transient) HOLDS cadence (retry next tick)" $false `
+    (Test-DigestDelivered -Result @{ status='failed'; class='transient'; http_status=503 })
 
 if ($script:failures -gt 0) {
     Write-Host ""

@@ -679,22 +679,58 @@ function Format-DurationDigest {
 
 # Result classifier for a Send-Notification return. Two questions come out of one shape so the two
 # never diverge:
-#   - Test-DigestDelivered: did anything land in the channel this tick? (full OR degraded)
+#   - Test-DigestDelivered: should the cadence gate advance for this period? (i.e., "retrying THIS
+#     period cannot help — either something landed or nothing WILL land")
 #     If yes, `last_sent_period` advances → cadence gate closes for the period.
 #   - Test-DigestFullSuccess: did the FULL digest land? (only 'sent' with class 'ok')
 #     If yes, `last_full_success_period` advances → ⚠ predicate clears.
 #
-# 'skipped' (no webhook) is treated as delivery: the operator has deliberately no channel, so
-# retrying every 5 minutes accomplishes nothing (the webhook will not appear on its own) and would
-# log-spam the daemon. But 'skipped' is NOT a full success — a channel that does not exist has not
-# been informed, so the ⚠ clock keeps ticking regardless. This distinction is only visible to a
-# future operator who wires a webhook in mid-flight, at which point they SHOULD see the ⚠.
-# (T-digest-exceeds-discord-limit-and-is-dropped D-6, replaces the older Test-DigestClockAdvances
-# which only had one question and answered both wrong once degraded delivery entered the picture.)
+# Cadence-advancing outcomes:
+#   * sent(ok)              — the full digest landed.
+#   * degraded(ok)          — the fixed-length fallback landed after a full 400.
+#   * skipped(no-webhook)   — the operator has deliberately no channel; retrying every 5 minutes
+#                             accomplishes nothing and would log-spam the daemon.
+#   * failed(deterministic-permanent) — the webhook is gone (401/403/404). PR-gate review
+#                             (2026-08-30): my Get-NotificationFailureClass docstring literally
+#                             said "Do NOT send a second POST" for this class, but the earlier
+#                             predicate ignored $class and refused to advance, spamming 404s every
+#                             5 minutes for the rest of the day. Advance the period so the
+#                             next-tick check sees "already sent" and stops.
+#   * failed(deterministic-payload) — only reached when the FULL digest 400s AND the degraded
+#                             fallback ALSO 400s. Retrying the same tick will fail the same way;
+#                             advance to prevent spam. (This branch is defensive — the degraded
+#                             message is fixed and small; if it 400s, something more fundamental
+#                             is broken and 5-minute spam does not help.)
+#
+# Held (returns $false):
+#   * failed(transient)     — network / 5xx / 429 / unknown. The next tick has a real chance to
+#                             succeed; this is the WHOLE reason the cadence gate exists.
+#
+# `skipped` and every non-transient failure count for cadence but NOT for full-success — the human
+# was not informed, so ⚠ must keep ticking. This distinction is what surfaces "wired the webhook
+# but Discord side keeps 400ing" without the operator having to guess.
+#
+# (T-digest-exceeds-discord-limit-and-is-dropped D-6; replaces the older Test-DigestClockAdvances.
+# PR-gate naysayer 2026-08-30 caught that the earlier version of THIS function inspected $status
+# only and mis-held cadence on non-retryable failures.)
 function Test-DigestDelivered {
     param($Result)
-    if ($Result -is [hashtable]) { $status = $Result['status'] } else { $status = $Result }
-    return ($status -eq 'sent' -or $status -eq 'skipped' -or $status -eq 'degraded')
+    if ($Result -is [hashtable]) {
+        $status = $Result['status']
+        $class = $Result['class']
+    } else {
+        $status = $Result
+        $class = $null
+    }
+    if ($status -eq 'sent' -or $status -eq 'skipped' -or $status -eq 'degraded') { return $true }
+    # A non-retryable failure class still advances cadence — the whole point of "non-retryable" is
+    # that a 2nd POST this tick, or a 3rd POST 5 minutes later, is guaranteed to fail the same way.
+    # Held would mean spam. Advanced means "we tried once, we know it won't work, don't try again
+    # until tomorrow"; ⚠ still lights up because Test-DigestFullSuccess is separate.
+    if ($status -eq 'failed' -and ($class -eq 'deterministic-permanent' -or $class -eq 'deterministic-payload')) {
+        return $true
+    }
+    return $false
 }
 function Test-DigestFullSuccess {
     param($Result)
@@ -1294,28 +1330,28 @@ function Send-NotificationIfChanged {
         Write-Log "notification suppressed (unchanged since last alert: $Key = $Signature)"
         return
     }
-    # The dedup record is intentional on 'sent' / 'skipped' / 'transient failure' — a failed send
-    # does NOT undo the dedup, or a webhook outage would repeat every 5 minutes forever, retraining
-    # the channel into noise. A 'skipped' status (no webhook) is treated the same: mark the
-    # signature so we do not spam the log with skip messages on every re-attempt.
+    # The dedup record is intentional on every outcome (sent / skipped / any failure class). A
+    # failed send does NOT undo the dedup, or a webhook outage would repeat every 5 minutes forever,
+    # retraining the channel into noise. A 'skipped' status (no webhook) is treated the same: mark
+    # the signature so we do not spam the log with skip messages on every re-attempt.
     # (Endorsed by Tier B naysayer on round 2 of #138.)
     #
-    # T-digest-exceeds-discord-limit-and-is-dropped D-3 (msg-2099, msg-2101): the ONLY exception
-    # is a deterministic-payload failure (400/413). That is msg-2013 §3(b) — the alert was never
-    # delivered, but the signature was recorded, so the same alert was suppressed 257 times after.
-    # 4xx-payload is deterministic (same POST → same 400) so retrying with the same message helps
-    # nothing; but a NEW alert with a DIFFERENT signature (a different parked-thread reason) has
-    # a real chance of being small enough to land. Not recording the failed signature lets that
-    # next alert try, without letting the same-signature retry loop that #138 R2 was closing.
-    # transient (429/5xx/network) still records — #138 R2's reasoning is unchanged and this thread
-    # deliberately does not relitigate it.
-    $result = Send-Notification -Message $Message
-    $shouldRecord = $true
-    if ($result -is [hashtable] -and $result['status'] -eq 'failed' -and $result['class'] -eq 'deterministic-payload') {
-        $shouldRecord = $false
-        Write-Log "notification signature NOT recorded (deterministic-payload failure — same-signature retry will fail the same way; a different-signature alert may still land)"
-    }
-    if ($shouldRecord) { $State[$Key] = $Signature }
+    # T-digest-exceeds-discord-limit-and-is-dropped: an earlier revision of this PR skipped
+    # recording on `deterministic-payload` (400/413) failures, chasing the letter of msg-2099 D-3.
+    # That was wrong and the PR-gate naysayer caught it (2026-08-30): the dedup MAP IS KEYED BY
+    # $Key (the thread id), not by $Signature. A DIFFERENT signature for the SAME key already
+    # bypasses the check naturally — `Test-NotificationSuppressed` returns false when the recorded
+    # $State[$Key] does not equal the new $Signature — so recording the failed signature never
+    # blocks a new-signature alert from firing. Skipping the record produced the exact spam loop
+    # this path exists to prevent: same alert, same signature, 400 every 5 minutes, forever.
+    #
+    # The msg-2013 §3(b) concern ("永久に失われる") that D-3 was addressing is already covered by
+    # msg-2099 D-4: the digest is a state sync and re-lists every currently-waiting thread daily,
+    # so a "lost" delta alert re-surfaces in the digest regardless of what notified.json records.
+    # ∴ ALWAYS record. D-3 is superseded on this specific point; the letter of D-3 predicted an
+    # asymmetry that the map-shape does not actually create. (msg-2013 → msg-2099 → PR-gate review.)
+    $null = Send-Notification -Message $Message
+    $State[$Key] = $Signature
 }
 
 # --- decision-request composer (T-decision-request-composer S2) ---------------------------------
@@ -3074,8 +3110,8 @@ try {
             # T-digest-exceeds-discord-limit-and-is-dropped D-2 (msg-2099): on a
             # deterministic-payload rejection, immediately try a fixed-length degraded message.
             # NOT on deterministic-permanent (401/403/404 → the webhook is dead, a second POST
-            # will fail the same way) and NOT on transient (429/5xx/network → the retry belongs
-            # to the next tick, not this one).
+            # will fail the same way — Test-DigestDelivered still advances cadence, no spam) and
+            # NOT on transient (429/5xx/network → the retry belongs to the next tick).
             if ($result -is [hashtable] -and $result['status'] -eq 'failed' -and $result['class'] -eq 'deterministic-payload') {
                 $degradedMessage = New-DegradedDigestMessage `
                     -WaitingCount ($humanParked.Count + $quarantineState.Count) `
@@ -3087,12 +3123,17 @@ try {
                 if ($degradedResult -is [hashtable] -and $degradedResult['status'] -eq 'sent') {
                     $result = @{ status = 'degraded'; class = 'ok'; http_status = 200; error = "full-payload rejected, degraded landed" }
                 }
-                # else: leave $result at the original failure — degraded also failed, do not
-                # advance last_sent_period (the tick was fully-lost).
+                # else: leave $result at the original failure. Test-DigestDelivered treats
+                # deterministic-payload (both full AND degraded failed) as cadence-advancing to
+                # prevent 5-minute spam of a message that will keep failing. The tick was
+                # fully-lost from the human's perspective but the sweep does not spam.
             }
 
-            # Cadence advance: any DELIVERED outcome (sent full, sent degraded, or skipped-no-webhook)
-            # closes the period. A pure failure holds the clock so the NEXT tick retries.
+            # Cadence advance: any DELIVERED outcome (sent full, sent degraded, skipped-no-webhook)
+            # OR any non-retryable failure (deterministic-permanent when the webhook is dead;
+            # deterministic-payload when even the degraded fallback failed) closes the period.
+            # ONLY a transient failure holds the clock so the NEXT tick retries. See
+            # Test-DigestDelivered's docstring for the full table.
             if (Test-DigestDelivered -Result $result) {
                 $digestState['last_sent_period'] = $currentPeriod
                 Save-JsonState -Path $digestStatePath -State $digestState

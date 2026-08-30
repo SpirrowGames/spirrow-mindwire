@@ -379,6 +379,12 @@ Write-Host "Test-DigestDelivered / Test-DigestFullSuccess — the two questions 
 # delivery satisfies cadence (mark the period sent) but NOT health (⚠ must stay up until a
 # FULL delivery lands). Locking BOTH tables into helpers means any future edit that flips
 # a case is caught here.
+#
+# The predicate is "should cadence advance?" — i.e., "is any further retry THIS period guaranteed
+# not to help?". YES for delivery, YES for non-retryable failure (webhook dead — a 2nd POST 5 min
+# later fails the same way, and holding the clock spams the log and Discord). NO only for
+# transient failure, where the next tick has a real chance. (PR-gate naysayer 2026-08-30 caught
+# that an earlier version of this predicate held cadence on 404, spamming for the rest of the day.)
 Check "sent(ok) delivered? -> yes" $true (Test-DigestDelivered -Result @{ status='sent'; class='ok' })
 Check "sent(ok) full success? -> yes" $true (Test-DigestFullSuccess -Result @{ status='sent'; class='ok' })
 
@@ -390,18 +396,35 @@ Check "skipped(no-webhook) delivered? -> yes (no retry loop on missing webhook)"
 Check "skipped(no-webhook) full success? -> NO (no channel means no informed operator)" $false `
     (Test-DigestFullSuccess -Result @{ status='skipped'; class='no-webhook' })
 
-Check "failed(transient) delivered? -> no (retry next tick)" $false `
+Check "failed(transient) delivered? -> NO (retry next tick)" $false `
     (Test-DigestDelivered -Result @{ status='failed'; class='transient' })
-Check "failed(payload) delivered? -> no (needs degraded fallback first)" $false `
-    (Test-DigestDelivered -Result @{ status='failed'; class='deterministic-payload' })
-Check "failed(permanent) delivered? -> no" $false `
-    (Test-DigestDelivered -Result @{ status='failed'; class='deterministic-permanent' })
+Check "failed(transient) full success? -> NO" $false `
+    (Test-DigestFullSuccess -Result @{ status='failed'; class='transient' })
 
-# Legacy string-form still handled — Send-NotificationIfChanged historically dropped the return via
-# $null=, but a future refactor may pass the string on. The helper accepts both shapes without
-# needing every caller to be a hashtable-producer on day one.
+# CRITICAL: non-retryable failures MUST advance cadence. Held would mean the digest cadence spams
+# a POST every 5 minutes for the rest of the day (404 → 404 → 404 → …). This is the exact spam
+# loop the PR-gate naysayer flagged in the first revision of this file. Full-success stays false
+# so ⚠ lights up on tomorrow's digest.
+Check "failed(deterministic-permanent, e.g. 404) delivered? -> YES (webhook dead; do not spam)" $true `
+    (Test-DigestDelivered -Result @{ status='failed'; class='deterministic-permanent' })
+Check "failed(deterministic-permanent) full success? -> NO (channel not informed)" $false `
+    (Test-DigestFullSuccess -Result @{ status='failed'; class='deterministic-permanent' })
+
+# deterministic-payload only reaches this predicate when the FULL digest 400s AND degraded ALSO
+# 400s (defensive — the degraded is fixed and small; this branch is theoretically unreachable but
+# the predicate must still be safe if it is). Retry cannot help; advance cadence.
+Check "failed(deterministic-payload, degraded also failed) delivered? -> YES (do not spam 400s)" $true `
+    (Test-DigestDelivered -Result @{ status='failed'; class='deterministic-payload' })
+Check "failed(deterministic-payload) full success? -> NO" $false `
+    (Test-DigestFullSuccess -Result @{ status='failed'; class='deterministic-payload' })
+
+# Legacy string-form still handled — Send-NotificationIfChanged historically dropped the return
+# via $null=, but a future refactor may pass the string on. Under the string form there is no
+# class, so 'failed' has to be held (fail-safe = retry, in case it was transient — this is the
+# ONLY safe default when class is unknown).
 Check "string 'sent' delivered? -> yes" $true (Test-DigestDelivered -Result 'sent')
-Check "string 'failed' delivered? -> no" $false (Test-DigestDelivered -Result 'failed')
+Check "string 'failed' delivered? -> no (unknown class; fail-safe hold for retry)" $false `
+    (Test-DigestDelivered -Result 'failed')
 
 Write-Host "ConvertTo-UtcInstant — handles both string and [DateTime] inputs uniformly"
 # Naive [datetime]::Parse on a DateTime happens to survive via implicit ToString + Parse-Local +
