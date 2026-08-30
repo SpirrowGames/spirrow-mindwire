@@ -548,8 +548,20 @@ _NONCE_HEX_CHARS = _NONCE_HEX_BYTES * 2
 #                    exemplar, a stale nonce from a previous review, an attacker's guess).
 #
 # The regex intentionally uses ``[^\n]*?`` (not ``.*?``) so a marker cannot span lines — the
-# authority check would otherwise have to re-split attrs on newlines. Trailing whitespace
-# after ``-->`` up to end-of-line is tolerated (matches the marker exemplar in the prompt).
+# authority check would otherwise have to re-split attrs on newlines. After ``-->`` only
+# horizontal whitespace (spaces, tabs) up to end-of-line is tolerated — NOT arbitrary text.
+# The distinction matters: :func:`parse_objections` slices the payload starting at
+# ``match.end()``, so anything the regex consumes on the marker line is stripped from the
+# payload it hands to the JSON decoder. A broad tail like ``[^\n]*$`` (the pre-fix shape)
+# would silently swallow anything the model wrote on the marker line — including a same-
+# line JSON array (``<!-- ... nonce=<live> --> [{...}]``) — and then report
+# ``missing_reason=payload_not_adjacent`` / ``payload_unparseable``, which is a lie: the
+# parser DID see a marker's payload, it just discarded it. The narrow ``[ \t]*$`` tail
+# refuses to match a marker line that carries anything other than whitespace after
+# ``-->``, so the same-line shape fails-closed AS a shape failure (``markers_seen=0`` →
+# ``no_marker``) rather than being mislabelled as a payload failure. Layer-D readers
+# depend on the missing_reason being truthful about what the parser actually saw.
+# Rider-3 gate finding on PR #206 (correctness on msg-2261) supplied this correction.
 #
 # msg-2216 §4 (gate advisory on #201): a regex that ONLY accepts the canonical
 # ``\s+nonce=[A-Za-z0-9]+`` inside would miss ordinary format-slip shapes (``nonce: X`` /
@@ -558,7 +570,7 @@ _NONCE_HEX_CHARS = _NONCE_HEX_BYTES * 2
 # counter that only reflects the regex being too tight. The loose ``[^\n]*?`` capture with
 # post-capture classification is what closes that misattribution.
 _OBJECTIONS_SENTINEL_ANY_RE = re.compile(
-    rf"^{re.escape(_OBJECTIONS_SENTINEL_PREFIX)}([^\n]*?)-->[^\n]*$",
+    rf"^{re.escape(_OBJECTIONS_SENTINEL_PREFIX)}([^\n]*?)-->[ \t]*$",
     re.MULTILINE,
 )
 
@@ -571,6 +583,41 @@ def _generate_objection_nonce() -> str:
     (head sha, PR number, time): a nonce an attacker could compute is not a nonce.
     """
     return secrets.token_hex(_NONCE_HEX_BYTES)
+
+
+# Format contract for a well-formed nonce: exactly ``_NONCE_HEX_CHARS`` lowercase hex chars,
+# i.e. what :func:`_generate_objection_nonce` produces. Used by :func:`_validate_nonce` to
+# reject empty / constant / placeholder nonces at every API boundary that carries one.
+_NONCE_SHAPE_RE = re.compile(rf"^[0-9a-f]{{{_NONCE_HEX_CHARS}}}$")
+
+
+def _validate_nonce(nonce: str) -> None:
+    """Reject empty / constant / placeholder nonces at construction (msg-2216 §5-(c) T-i).
+
+    Raises :class:`ValueError` if ``nonce`` is not exactly ``_NONCE_HEX_CHARS`` lowercase
+    hex characters — i.e. not what :func:`_generate_objection_nonce` produces.
+
+    This closes the residual msg-2228 §2-(b) named: an empty nonce would collapse the
+    canonical authority form ``f"nonce={expected_nonce}"`` to ``"nonce="``, so any diff
+    quote of the bare sentinel would suddenly become authoritative (D-1's retirement
+    presumed the nonce made prefix-match irrelevant); and simultaneously, since the empty
+    string is a substring of any attribute string, every foreign marker would misclassify
+    as ``format_slip``. Both are silent security failures — the check that catches them
+    is at the boundary where the nonce enters the parser, not inside every downstream.
+
+    Enforcing the FULL hex-length shape (not merely non-empty) additionally rejects two
+    predictable-constant shapes the exemplar text makes tempting: the literal
+    ``"NONCE"`` (the placeholder in the prompt exemplar, which a mis-wired caller could
+    substitute) and any short debug value. The generator is the sole production source,
+    so this validation cannot fire on any lived path — its job is to make an off-path
+    caller LOUD rather than silent. Trades a defence-in-depth check for the retired D-1
+    positional wall (msg-2214 §1, "性質を test で pin する" — this is one of the four).
+    """
+    if not _NONCE_SHAPE_RE.fullmatch(nonce):
+        raise ValueError(
+            f"objection-block nonce must be exactly {_NONCE_HEX_CHARS} lowercase hex chars "
+            f"(the shape _generate_objection_nonce produces); got {nonce!r}"
+        )
 
 
 class ObjectionParse(Enum):
@@ -794,6 +841,7 @@ def parse_objections(critique: str, *, expected_nonce: str) -> ObjectionReport:
     not participate in ``gate_verdict`` yet (see the SHADOW note above), so wiring
     D-2-prime is premature until the reversal is on the table.
     """
+    _validate_nonce(expected_nonce)
     all_matches = list(_OBJECTIONS_SENTINEL_ANY_RE.finditer(critique))
     markers_seen = len(all_matches)
     classified = [_classify_marker(m.group(1), expected_nonce) for m in all_matches]
@@ -1360,7 +1408,10 @@ def _build_messages(text: str, pr_slug: str, *, nonce: str) -> list[ChatMessage]
     :func:`_generate_objection_nonce`. It is REQUIRED (not defaulted) so a caller cannot
     accidentally construct pass-1 messages that promise the model a nonce and then fail to
     deliver one — the exemplar in the prompt shows ``nonce=NONCE`` and this argument is
-    what tells the model what value to substitute for the literal ``NONCE``.
+    what tells the model what value to substitute for the literal ``NONCE``. The value is
+    additionally passed through :func:`_validate_nonce` (msg-2216 §5-(c) T-i) so that an
+    empty / placeholder / short debug value is rejected at prompt-construction time rather
+    than reaching the model (where it would silently degrade authority to prefix-match).
 
     Tests import this to construct the exact system message the driver sends, so any
     later drift between "what the test asserts on" and "what the driver actually sends"
@@ -1369,6 +1420,7 @@ def _build_messages(text: str, pr_slug: str, *, nonce: str) -> list[ChatMessage]
     agent uses, so a one-place edit to ``spec/NAYSAYER_PRINCIPLES.md`` propagates to
     both surfaces (fail-loud: a missing/blank SOT raises).
     """
+    _validate_nonce(nonce)
     system = build_pr_review_pass1_system_prompt(
         verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT, nonce=nonce
     )

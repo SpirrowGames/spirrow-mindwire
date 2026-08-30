@@ -2549,3 +2549,117 @@ async def test_review_generates_a_fresh_nonce_per_call() -> None:
 
     n1, n2 = _extract_nonce(pass1_systems[0]), _extract_nonce(pass1_systems[1])
     assert n1 != n2, "two review() calls produced the same objection-block nonce"
+
+
+def test_same_line_marker_and_array_fails_closed_as_no_marker() -> None:
+    """Rider-3 gate finding on PR #206 (correctness on msg-2261): the marker regex tail must
+    only accept horizontal whitespace after ``-->``, NOT arbitrary text.
+
+    Under the pre-fix ``[^\\n]*$`` tail, the regex would silently consume anything the
+    model wrote on the marker line — including a same-line JSON array — and then the
+    downstream ``critique[match.end():]`` slice would start at the newline, hand the
+    parser prose from the next line, and derive
+    ``MISSING(payload_not_adjacent | payload_unparseable)``. That reason is a lie:
+    there WAS a marker and its payload WAS adjacent — the parser just discarded it.
+
+    The narrow ``[ \\t]*$`` tail refuses to match a marker line that carries anything
+    other than whitespace after ``-->``. The same-line shape then fails as a MARKER
+    shape (``markers_seen == 0`` → ``NO_MARKER``), not as a PAYLOAD shape, so the
+    Layer-D reader sees an honest missing_reason. Same-line format remains fail-closed
+    (still MISSING → REQUEST_CHANGES), but for the true cause.
+    """
+    payload = f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "x"}}]'
+    same_line = f"prose\n{_authoritative_marker()} {payload}\n\nVERDICT: REQUEST_CHANGES"
+    report = parse_objections(same_line, expected_nonce=_TEST_NONCE)
+    assert report.status is ObjectionParse.MISSING, (
+        f"same-line marker+array must fail-closed; got {report.status.value}"
+    )
+    assert report.missing_reason is ObjectionMissingReason.NO_MARKER, (
+        "the narrow tail must report the true cause (NO_MARKER — the shape is not "
+        f"canonical), not a payload-side lie; got {report.missing_reason}"
+    )
+    assert report.markers_seen == 0, (
+        "a marker line with a same-line array must not be counted as a marker at all"
+    )
+    assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+
+def test_missing_reason_precedence_format_slip_beats_foreign_marker() -> None:
+    """T-d (msg-2216 §5-(c)). A mixed marker landscape — one foreign, one format_slip,
+    zero authoritative — must report ``missing_reason=FORMAT_SLIP`` (not FOREIGN_MARKER)
+    and record both counters truthfully.
+
+    Precedence is the machine-checkable half of msg-2216 §2's design decision: when
+    ``authoritative == 0`` and both a format_slip (live nonce, wrong form — attributable
+    to our own model's output-contract failure) and a foreign marker (nonce-less or
+    stale — ordinary diff-quote noise) are present, ``FORMAT_SLIP`` wins because it is
+    the value that directly answers the Layer-D question. Enum docstring + the marker-
+    side ladder cover the INPUTS to the rule; this test covers the RULE itself, so a
+    later refactor that quietly reverses the precedence goes red instead of silent.
+
+    Also asserts the counters carry the whole picture (``foreign_markers=1 ∧
+    format_slips=1``): a headline is a summary, and the counters keep the underlying
+    facts recoverable — no information is lost when the enum is single-valued.
+    """
+    # A foreign marker (no nonce at all — the diff-quote shape).
+    foreign = f"{_OBJECTIONS_SENTINEL_PREFIX} -->"
+    # A format-slip marker: attrs contain the live nonce but not in the canonical form
+    # (a stray colon and space, which the substring check catches but the exact-equality
+    # authority check rejects).
+    format_slip = f"{_OBJECTIONS_SENTINEL_PREFIX} nonce: {_TEST_NONCE} -->"
+    body = f"prose\n{foreign}\nmore prose\n{format_slip}\n\nVERDICT: REQUEST_CHANGES"
+    report = parse_objections(body, expected_nonce=_TEST_NONCE)
+    assert report.status is ObjectionParse.MISSING
+    assert report.missing_reason is ObjectionMissingReason.FORMAT_SLIP, (
+        "precedence rule (msg-2216 §2): FORMAT_SLIP must beat FOREIGN_MARKER; got "
+        f"{report.missing_reason}"
+    )
+    assert report.markers_seen == 2
+    assert report.foreign_markers == 1, "the foreign marker must still be counted"
+    assert report.format_slips == 1, "the format-slip marker must still be counted"
+
+
+@pytest.mark.parametrize(
+    "bad_nonce",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("NONCE", id="prompt-exemplar-placeholder"),
+        pytest.param("00000000", id="short-debug-value"),
+        pytest.param("abc", id="way-too-short"),
+        pytest.param("abcdef0123456789abcdef", id="too-long"),
+        pytest.param("ABCDEF0123456789", id="uppercase-hex-rejected"),
+        pytest.param("gggggggggggggggg", id="non-hex-letters"),
+    ],
+)
+def test_ill_formed_nonce_rejected_at_construction(bad_nonce: str) -> None:
+    """T-i (iv) (msg-2216 §5-(c), msg-2228 §2-(b)). Empty / placeholder / short debug /
+    non-hex nonces are rejected at API boundaries, not silently trusted.
+
+    This is the fourth of the four properties msg-2214 §1 lists as the retirement price
+    for D-1 (the positional wall the nonce replaced). Both boundaries that carry the
+    nonce enforce the check:
+
+    * :func:`parse_objections` (the parser) — an empty nonce would collapse the canonical
+      authority string ``f"nonce={expected_nonce}"`` to ``"nonce="``, silently promoting
+      any diff quote of the bare sentinel to authoritative; simultaneously, since the
+      empty string is a substring of any attrs, every foreign marker would misclassify
+      as ``format_slip``. Both are silent security failures.
+    * :func:`_build_messages` (the driver-side prompt builder) — delivering an
+      ill-formed nonce to the model would either put the wrong value in the exemplar
+      substitution or (for placeholder ``NONCE``) collapse the exemplar's literal into
+      the "live" slot, causing every well-formed model output to fail authority.
+
+    ``_generate_objection_nonce`` is the sole production source and always emits a
+    16-lowercase-hex string, so this validation cannot fire on any lived path — its job
+    is to make an off-path caller LOUD rather than silent. Parametrised over the shapes
+    an off-path caller might plausibly hand in.
+    """
+    view = _make_view(len("diff"))
+    # Parser boundary.
+    with pytest.raises(ValueError, match="nonce"):
+        parse_objections("body", expected_nonce=bad_nonce)
+    with pytest.raises(ValueError, match="nonce"):
+        decide_verdict("body", view=view, finish_reason="stop", expected_nonce=bad_nonce)
+    # Driver-side prompt-builder boundary.
+    with pytest.raises(ValueError, match="nonce"):
+        _build_messages("diff", "acme/widgets#1", nonce=bad_nonce)
