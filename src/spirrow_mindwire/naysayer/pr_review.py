@@ -217,6 +217,20 @@ _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
 # opposite treatment. This is not an inconsistency to be tidied up. Revisit only when a FALSE RED
 # is actually observed here — a review body whose bold verdict forced a REQUEST_CHANGES the author
 # did not intend.
+#
+# ---- Divergence back-reference (R-4a, rider-3 msg-2130 §1) -------------------------------------
+# This regex is used with a LAST-WINS anchor (see ``_parse_model_verdict``: ``matches[-1]``).
+# The objection-block parser next to it (:func:`parse_objections`) uses STRICT-SINGLE (D-1):
+# two column-zero markers derive MISSING rather than picking one. The two parsers therefore
+# disagree on how to react to a column-zero echo — deliberately.
+#
+# Whether the last-wins discipline here should follow the objection parser to strict-single is
+# an open question under ``T-verdict-echo-after-real-verdict`` (msg-1979); rider 3 (msg-2072 §5,
+# discharge in msg-2130 §1) chose the "explicit-justification" branch of R-4 rather than the
+# "unify" branch, so the divergence is named on BOTH sides — here and in ``parse_objections`` —
+# to keep a future reader from making it consistent by touching this line prematurely. This note
+# is DESCRIPTIVE: it records that a decision is pending, not which way it should go.
+# ------------------------------------------------------------------------------------------------
 _VERDICT_RE = re.compile(
     r"^VERDICT:\s*(APPROVE|REQUEST[ _-]?CHANGES|COMMENT)\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -480,6 +494,13 @@ class ObjectionParse(Enum):
     gate notice can name what happened; ``MISSING`` covers both "no marker" and "the array
     would not parse", because the derivation treats them identically (fail-closed) and a
     finer split would suggest the two are handled differently when they are not.
+
+    A **sub-reason** for ``MISSING`` is carried separately on :class:`ObjectionReport`
+    (``missing_reason``), never on this enum: the derivation MUST be blind to it (all
+    ``MISSING`` variants derive REQUEST_CHANGES) but the shadow measurement MUST see it
+    (rider 2 needs to tell "D-1 over-fired" from "D-3 over-fired" from "the model wrote
+    no block at all"). Splitting the enum would leak the distinction into the derivation
+    path; hanging it off the report keeps derivation single-valued and measurement rich.
     """
 
     OK = "ok"
@@ -487,6 +508,28 @@ class ObjectionParse(Enum):
     MISSING = "missing"
     UNKNOWN = "unknown-class"
     NO_EVIDENCE = "no-evidence"
+
+
+class ObjectionMissingReason(Enum):
+    """Sub-reason attached to a :class:`ObjectionParse.MISSING` report (rider 3, msg-2130 §3).
+
+    Every value derives REQUEST_CHANGES identically — the derivation reads
+    :class:`ObjectionParse.MISSING` and stops. This enum exists so the shadow log line
+    and the D-divergence notice can name *which* MISSING cause fired, without which
+    ``parse=missing`` is a black box that folds three independent signals into one.
+
+    The two counters rider 2 was asked to instrument (msg-2130 §3) map to
+    :attr:`MULTI_MARKER` (D-1 fired) and :attr:`PROSE_BETWEEN` (D-3 fired). The other
+    values distinguish the pre-existing MISSING causes so a rise in either counter can
+    be told apart from a rise in the baseline ``no_marker`` / ``bad_json`` cases.
+    """
+
+    NO_MARKER = "no-marker"  # zero column-zero markers (baseline: no block written)
+    MULTI_MARKER = "multi-marker"  # D-1 fired: two or more column-zero markers
+    PROSE_BETWEEN = "prose-between"  # D-3 fired: payload does not start with ``[``
+    BAD_JSON = "bad-json"  # ``raw_decode`` raised on the payload
+    NOT_A_LIST = "not-a-list"  # top-level JSON value was not a list
+    PRINCIPLES_ERROR = "principles-error"  # vocabulary load failed (unreachable in practice)
 
 
 @dataclass(frozen=True)
@@ -502,11 +545,17 @@ class Objection:
 
 @dataclass(frozen=True)
 class ObjectionReport:
-    """The parse of one critique's objection block."""
+    """The parse of one critique's objection block.
+
+    ``missing_reason`` is set iff ``status is ObjectionParse.MISSING``. See
+    :class:`ObjectionMissingReason` for why the sub-reason lives here rather than being
+    baked into the ``status`` enum.
+    """
 
     status: ObjectionParse
     objections: tuple[Objection, ...] = ()
     unknown_classes: tuple[str, ...] = ()
+    missing_reason: ObjectionMissingReason | None = None
 
     @property
     def blocking(self) -> tuple[Objection, ...]:
@@ -527,8 +576,16 @@ class ObjectionReport:
         return ", ".join(f"{name}={counts[name]}" for name in sorted(counts)) or "none"
 
 
-def _missing_report() -> ObjectionReport:
-    return ObjectionReport(status=ObjectionParse.MISSING)
+def _missing_report(reason: ObjectionMissingReason) -> ObjectionReport:
+    """Construct a MISSING report tagged with its sub-reason (rider-3 msg-2130 §3).
+
+    The ``reason`` argument is required — a call without one would produce a MISSING report
+    whose cause is unknowable, which is precisely the black-box the instrumentation exists
+    to eliminate. All MISSING cases still derive REQUEST_CHANGES (:func:`derive_verdict`
+    only looks at ``status``); the reason surfaces on the shadow log line and the
+    D-divergence gate notice.
+    """
+    return ObjectionReport(status=ObjectionParse.MISSING, missing_reason=reason)
 
 
 def parse_objections(critique: str) -> ObjectionReport:
@@ -562,15 +619,25 @@ def parse_objections(critique: str) -> ObjectionReport:
     column zero self-jams into RC. The override path is human, which is the right shape for
     a rare deadlock caused by discussing the parser inside the parser's own gate.
 
-    **D-3 (strict bracket placement, rider-3 msg-2072).** After fence-stripping, the payload
-    must *begin* with ``[`` — no prose in between. ``strip_wrapping_fences`` already trims
-    surrounding whitespace, so ``payload.startswith("[")`` covers "first non-whitespace char
-    is ``[``". This closes an F-a-direction window (msg-2074 §1): a scan-forward ``find("[")``
-    would silently anchor to a benign or malicious empty array further down (``Here are my
-    objections: []`` etc.), discarding the model's real block. Failing to start with ``[``
-    trips MISSING → RC, which is loud and fail-closed. The reliability cost (models that lead
-    with a short sentence get their objection block dropped) is Stage-1 shadow-measurable
-    before the reversal.
+    **D-3 (strict bracket placement, rider-3 msg-2072).** After fence-stripping, the payload's
+    first non-whitespace character must be ``[`` — no prose in between. This closes an
+    F-a-direction window (msg-2074 §1): a scan-forward ``find("[")`` would silently anchor to
+    a benign or malicious empty array further down (``Here are my objections: []`` etc.),
+    discarding the model's real block. Failing this trips MISSING → RC, which is loud and
+    fail-closed. The reliability cost (models that lead with a short sentence get their
+    objection block dropped) is Stage-1 shadow-measurable before the reversal.
+
+    **D-5 (explicit whitespace handling, rider-3 msg-2130 §2 / gate advisory on #198).** The
+    D-3 check runs ``.lstrip()`` on the payload IN THIS FUNCTION rather than trusting
+    :func:`strip_wrapping_fences` to have trimmed it. Two reasons: (a) the pre-D-5 code was
+    correct only by accident — ``payload.startswith("[")`` worked because the helper happens
+    to call ``.strip()`` even when no fence is present, so a future optimisation limiting the
+    helper to "mutate only when a fence exists" would silently break D-3 by turning every
+    ``\\n[...]`` payload into MISSING; (b) D-5 is a REINFORCEMENT of D-3, not a relaxation
+    (whitespace cannot carry an injected payload nor construct a false array, so the receiving
+    language is the same). The load-bearing wall is now self-sufficient. Pinned by
+    :func:`test_v2_fence_less_payload_with_leading_newline_is_accepted` and
+    :func:`test_d5_payload_starts_after_leading_whitespace_independent_of_helper`.
 
     **What is NOT done here.** D-2-prime (a non-regression floor on ``gate_verdict``: the derived
     read may never lower the gate below the pre-Stage-1 baseline) is a Stage-2 constraint on
@@ -578,36 +645,53 @@ def parse_objections(critique: str) -> ObjectionReport:
     ``gate_verdict`` yet (see the SHADOW note above :data:`_OBJECTIONS_SENTINEL`), so wiring
     D-2-prime is premature until the reversal is on the table. R-4 (unify the two parsers' anchor
     strategy, or justify the divergence, before the reversal) is discharged by the D-1 note
-    above: the objection parser is deliberately strict-single, ``_VERDICT_RE`` remains
-    last-wins for the reasons on ``T-verdict-echo-after-real-verdict``, and the divergence is
-    named here rather than left implicit. V-1 (verify the array-terminator method): confirmed
-    by inspection — ``raw_decode`` stops at the end of the JSON value, so anything after ``]``
-    is structurally invisible to this parser (matching the note next to the ``raw_decode``
-    call below); no code change is needed.
+    above and the divergence back-reference at :data:`_VERDICT_RE` (msg-2130 §1): the objection
+    parser is deliberately strict-single, ``_VERDICT_RE`` remains last-wins for the reasons on
+    ``T-verdict-echo-after-real-verdict``, and the divergence is named on BOTH sides rather
+    than left implicit. V-1 (verify the array-terminator method): confirmed by inspection —
+    ``raw_decode`` stops at the end of the JSON value, so anything after ``]`` is structurally
+    invisible to this parser (matching the note next to the ``raw_decode`` call below); no
+    code change is needed.
+
+    **MISSING sub-reasons (rider-3 msg-2130 §3).** Every MISSING return path carries an
+    :class:`ObjectionMissingReason` so the shadow log line and the D-divergence notice can
+    distinguish which cause fired (``multi_marker`` = D-1, ``prose_between`` = D-3,
+    ``no_marker`` / ``bad_json`` / ``not_a_list`` = pre-existing causes). This is the
+    instrumentation rider 2 needs to tell "D-1/D-3 over-fired" from "the model wrote nothing".
     """
     matches = list(_OBJECTIONS_SENTINEL_RE.finditer(critique))
-    if len(matches) != 1:
-        # D-1: zero markers OR two-plus markers both derive MISSING → REQUEST_CHANGES. The
-        # question "which match wins?" is deleted rather than answered — see the docstring
-        # above for why last-wins and concatenate-all were both rejected.
-        return _missing_report()
+    if not matches:
+        # Baseline: the model wrote no column-zero marker at all. Same fail-closed outcome
+        # as MULTI_MARKER, but a different signal for shadow measurement.
+        return _missing_report(ObjectionMissingReason.NO_MARKER)
+    if len(matches) > 1:
+        # D-1: two-plus markers derive MISSING → REQUEST_CHANGES. The question "which match
+        # wins?" is deleted rather than answered — see the docstring above for why last-wins
+        # and concatenate-all were both rejected.
+        return _missing_report(ObjectionMissingReason.MULTI_MARKER)
     payload = strip_wrapping_fences(critique[matches[0].end() :])
-    if not payload.startswith("["):
-        # D-3: no scan-forward. If the payload does not begin with ``[`` after fence-stripping,
-        # fall through to MISSING rather than anchor to some later ``[`` in the prose — see
-        # the docstring above for the F-a rationale.
-        return _missing_report()
+    # D-5: ``.lstrip()`` here in the parser, so the D-3 check does not depend on
+    # ``strip_wrapping_fences`` incidentally trimming leading whitespace. See the docstring
+    # for the coupling this breaks. Whitespace-only leaders are fine — they carry no payload.
+    if not payload.lstrip().startswith("["):
+        # D-3: no scan-forward. If the payload's first non-whitespace char is not ``[``,
+        # fall through to MISSING rather than anchor to some later ``[`` in the prose.
+        return _missing_report(ObjectionMissingReason.PROSE_BETWEEN)
+    # D-3/D-5: raw_decode wants to start at the ``[``, so consume the leading whitespace
+    # we just verified. The strip is safe because D-3 has already established that the
+    # first non-whitespace char is ``[``.
+    payload = payload.lstrip()
     try:
         # ``raw_decode`` stops at the end of the array, so the verdict line (and any prose)
         # that follows the block is simply not consumed — no need to guess where it ends.
         # V-1 (rider-3 msg-2074): this is what makes trailing text after ``]`` structurally
-        # invisible to the parser, which is why D-4 ("no trailing text allowed") stayed as
-        # a shadow-measurable candidate rather than a code change.
+        # invisible to the parser, which is why D-4 ("no trailing text allowed") was dropped
+        # rather than turned into a code change (msg-2130 §3).
         parsed, _ = json.JSONDecoder().raw_decode(payload)
     except ValueError:
-        return _missing_report()
+        return _missing_report(ObjectionMissingReason.BAD_JSON)
     if not isinstance(parsed, list):
-        return _missing_report()
+        return _missing_report(ObjectionMissingReason.NOT_A_LIST)
     if not parsed:
         return ObjectionReport(status=ObjectionParse.EMPTY)
 
@@ -618,7 +702,7 @@ def parse_objections(critique: str) -> ObjectionReport:
         # same file to assemble the system prompt, long before any critique exists to parse.
         # Narrow on purpose — swallowing every exception here would hide a real bug in this
         # parser behind a fail-closed status that looks like a badly-behaved model.
-        return _missing_report()
+        return _missing_report(ObjectionMissingReason.PRINCIPLES_ERROR)
 
     objections: list[Objection] = []
     unknown: list[str] = []
@@ -887,9 +971,15 @@ def render_gate_notice(decision: VerdictDecision) -> str:
                 f"{', '.join(sorted(set(report.unknown_classes)))} (counted as blocking)."
             )
         if report.status is ObjectionParse.MISSING:
+            # msg-2130 §3: name the sub-cause so a reader of the review body can tell
+            # "the model wrote no block" (baseline) from "D-1/D-3 fired" (parser hardening).
+            reason_label = (
+                report.missing_reason.value if report.missing_reason is not None else "unknown"
+            )
             lines.append(
-                "> No readable objection block was found, so the derived side defaults to "
-                "REQUEST_CHANGES (fail-closed). This says nothing about the review above."
+                f"> No readable objection block was found (`missing_reason={reason_label}`), "
+                f"so the derived side defaults to REQUEST_CHANGES (fail-closed). This says "
+                f"nothing about the review above."
             )
     return "\n".join(lines)
 
@@ -900,14 +990,23 @@ def _log_objections(pr_slug: str, head_sha: str | None, decision: VerdictDecisio
     Auxiliary, not the record: the gate notice above is where a reader finds this. A log line
     is what ``spec/process/README.md`` (旧 §N.3) measured as unread, so it is here for grepping
     a corpus of runs, never as the place a divergence is announced.
+
+    The ``missing_reason=`` field (rider-3 msg-2130 §3) breaks ``parse=missing`` out into
+    its five sub-causes (``no-marker`` / ``multi-marker`` / ``prose-between`` / ``bad-json`` /
+    ``not-a-list``). Without it, a spike in ``parse=missing`` cannot be triaged: three
+    independent signals — the model wrote nothing (baseline), D-1 fired (multi-marker), D-3
+    fired (prose-between) — all collapse to the same string. The field is ``-`` when
+    ``status != MISSING``, so the log line stays grep-friendly.
     """
     report = decision.objections
+    missing_reason = report.missing_reason.value if report.missing_reason is not None else "-"
     logger.info(
-        "naysayer objections %s (head %s): parse=%s blocking=%d advisory=%d by_class=%s "
-        "authored=%s posted=%s derived=%s diverged=%s",
+        "naysayer objections %s (head %s): parse=%s missing_reason=%s blocking=%d advisory=%d "
+        "by_class=%s authored=%s posted=%s derived=%s diverged=%s",
         pr_slug,
         head_sha or "?",
         report.status.value,
+        missing_reason,
         len(report.blocking),
         len(report.advisory),
         report.counts_label(),
