@@ -46,7 +46,14 @@ foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-Fin
                   'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
                   'Get-SystemicAlertSignature', 'Merge-StateForWrite',
                   'Save-JsonState', 'Update-EvaluatedTimestamp', 'ConvertTo-UtcInstant',
-                  'Test-DigestClockAdvances') {
+                  # T-digest-exceeds-discord-limit-and-is-dropped (msg-2099..2106): Test-DigestClockAdvances
+                  # is retired in favour of the two-question split (delivered vs. full-success), so
+                  # cadence and health advance separately. See the two Check blocks below and the
+                  # dedicated Test-SweepDigest.ps1 for the full DoD suite.
+                  'Test-DigestDelivered', 'Test-DigestFullSuccess',
+                  'Get-DigestPeriod', 'Test-DigestDeliveryDue',
+                  'Get-DigestPeriodsMissed', 'Get-DigestHealthWarning',
+                  'New-DegradedDigestMessage', 'Get-NotificationFailureClass') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -363,19 +370,38 @@ Check "starvation section excludes a brand-new live thread absent from state" $t
 Check "starvation section excludes an ex-live thread (state file only)" $true `
     ($digest2 -notmatch 'p/T-ex-live')
 
-Write-Host "Test-DigestClockAdvances — sent + skipped are terminal, only failed retries"
+Write-Host "Test-DigestDelivered / Test-DigestFullSuccess — the two questions after msg-2106"
 # THE regression this exists to prevent: previously a webhook-less run had Send-Notification
 # return $false on the "not configured" branch, the digest gate held its clock, digestDue stayed
-# true forever, and every 5-min tick spammed 2 log lines. Locking the terminal-outcomes table into
-# this helper means any future edit that flips a case is caught by this test.
-Check "sent -> clock advances" $true (Test-DigestClockAdvances -Result 'sent')
-Check "skipped -> clock advances (no webhook, not spamming the log)" $true `
-    (Test-DigestClockAdvances -Result 'skipped')
-Check "failed -> clock HELD (transient, retry next tick)" $false `
-    (Test-DigestClockAdvances -Result 'failed')
-# Unknown status is treated as non-terminal (do not advance) — safer default.
-Check "unknown status -> clock HELD (fail closed)" $false `
-    (Test-DigestClockAdvances -Result 'weird-future-status')
+# true forever, and every 5-min tick spammed 2 log lines.
+#
+# msg-2106 split the single "should the clock advance?" question into two, because degraded
+# delivery satisfies cadence (mark the period sent) but NOT health (⚠ must stay up until a
+# FULL delivery lands). Locking BOTH tables into helpers means any future edit that flips
+# a case is caught here.
+Check "sent(ok) delivered? -> yes" $true (Test-DigestDelivered -Result @{ status='sent'; class='ok' })
+Check "sent(ok) full success? -> yes" $true (Test-DigestFullSuccess -Result @{ status='sent'; class='ok' })
+
+Check "degraded delivered? -> yes (cadence satisfied)" $true (Test-DigestDelivered -Result @{ status='degraded'; class='ok' })
+Check "degraded full success? -> NO (⚠ still lit)" $false (Test-DigestFullSuccess -Result @{ status='degraded'; class='ok' })
+
+Check "skipped(no-webhook) delivered? -> yes (no retry loop on missing webhook)" $true `
+    (Test-DigestDelivered -Result @{ status='skipped'; class='no-webhook' })
+Check "skipped(no-webhook) full success? -> NO (no channel means no informed operator)" $false `
+    (Test-DigestFullSuccess -Result @{ status='skipped'; class='no-webhook' })
+
+Check "failed(transient) delivered? -> no (retry next tick)" $false `
+    (Test-DigestDelivered -Result @{ status='failed'; class='transient' })
+Check "failed(payload) delivered? -> no (needs degraded fallback first)" $false `
+    (Test-DigestDelivered -Result @{ status='failed'; class='deterministic-payload' })
+Check "failed(permanent) delivered? -> no" $false `
+    (Test-DigestDelivered -Result @{ status='failed'; class='deterministic-permanent' })
+
+# Legacy string-form still handled — Send-NotificationIfChanged historically dropped the return via
+# $null=, but a future refactor may pass the string on. The helper accepts both shapes without
+# needing every caller to be a hashtable-producer on day one.
+Check "string 'sent' delivered? -> yes" $true (Test-DigestDelivered -Result 'sent')
+Check "string 'failed' delivered? -> no" $false (Test-DigestDelivered -Result 'failed')
 
 Write-Host "ConvertTo-UtcInstant — handles both string and [DateTime] inputs uniformly"
 # Naive [datetime]::Parse on a DateTime happens to survive via implicit ToString + Parse-Local +
