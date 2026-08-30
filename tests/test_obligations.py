@@ -46,6 +46,10 @@ from spirrow_mindwire.adapters.naysayer_sdk import (
     NaysayerSdkAdapter,
     build_naysayer_system_prompt,
 )
+from spirrow_mindwire.naysayer.pr_review import _PR_REVIEW_SYSTEM_PROMPT
+from spirrow_mindwire.naysayer.pr_review_adr_pointers import (
+    build_pr_review_pass1_system_prompt,
+)
 from spirrow_mindwire.obligations import (
     ObligationsManifest,
     default_manifest_path,
@@ -208,3 +212,59 @@ def test_loader_produces_an_immutable_manifest() -> None:
 
         with __import__("pytest").raises(dataclasses.FrozenInstanceError):
             o.body = "tampered"  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# negative tripwire — the PR-gate pass-1 prompt carries NO obligation body/id.
+#
+# This is the executable declaration that the Tier B PR-gate face is NOT a
+# delivery destination for `spec/process/obligations.yaml`. Only the
+# design-time naysayer face (`build_naysayer_system_prompt`) renders the
+# manifest into a prompt — the PR-gate's pass-1 prompt is preamble +
+# _PR_REVIEW_SYSTEM_PROMPT + PASS_1_ADR_INDEX_SELF_DECLARATION only, with no
+# call to `render_role_obligations` anywhere on that path (verified 2026-08-30
+# in T-obligations-not-reaching-pr-gate — a full-history pickaxe on the two
+# PR-gate prompt modules for "OBL-" and for verbatim obligation body fragments
+# returned zero commits: this face has never carried any obligation body).
+#
+# SCOPE — this test is a WIRING tripwire, not an INTENT detector.
+# It fails only when a body/id from the manifest actually appears in the
+# rendered PR-gate pass-1 prompt. It does NOT detect that a newly added
+# `role: naysayer` obligation was meant to reach the PR-gate: adding an entry
+# to `spec/process/obligations.yaml` without also wiring the PR-gate builder
+# to `render_role_obligations` leaves this test green. There is no machine
+# detector for intent-side face-mismatch — see
+# `spec/process/README.md` §「`./obligations.yaml` の配送範囲は naysayer
+# の片面 (design-time) だけである」and specifically its §「意図の申告を
+# 検出する機械は存在しない」. If you are adding a route for a PR-gate
+# obligation, you must edit BOTH this test (positive assertion of the new
+# body appearing in the PR-gate prompt) AND the PR-gate builder — a green
+# CI on an obligations-only change is not proof of delivery.
+# --------------------------------------------------------------------------- #
+
+
+def test_pr_gate_pass1_prompt_carries_no_obligation_body() -> None:
+    """The PR-gate pass-1 system prompt contains no obligation body or id from
+    the loop-readable manifest — for any role.
+
+    Asserts on ALL entries in the manifest (not just `role: naysayer`) so that
+    if `_MANIFEST_ROLES` is ever extended (e.g. a `proposer` face) this test
+    will still hold the PR-gate face empty until the wiring is explicitly
+    added. The wiring change is what should red this test, at which point the
+    author must edit here to declare which entries the PR-gate is now
+    delivering (positive assertion), together with the builder change.
+    """
+    manifest = load_manifest()
+    rendered = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
+    for obligation in manifest.obligations:
+        assert obligation.body not in rendered, (
+            f"obligation {obligation.id!r} body appears in the PR-gate pass-1 prompt "
+            "— this face has never been a manifest delivery destination; if you are "
+            "adding routing on purpose, edit this test to a positive assertion in the "
+            "same commit and see spec/process/README.md §「`./obligations.yaml` の"
+            "配送範囲は naysayer の片面 (design-time) だけである」"
+        )
+        assert f"[{obligation.id}]" not in rendered, (
+            f"obligation id label [{obligation.id}] appears in the PR-gate pass-1 "
+            "prompt — same rule as the body assertion above"
+        )
