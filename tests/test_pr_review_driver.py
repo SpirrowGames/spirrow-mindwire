@@ -1833,7 +1833,9 @@ def test_prompt_defers_the_class_vocabulary_to_the_injected_sot() -> None:
         assert f'"{name}"' not in _PR_REVIEW_SYSTEM_PROMPT, (
             f"the prompt names the class {name!r}; the vocabulary lives in the frontmatter"
         )
-    system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
+    system = build_pr_review_pass1_system_prompt(
+        verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT, nonce=_TEST_NONCE
+    )
     assert "objection_classes:" in system  # the frontmatter really is in the same prompt
 
 
@@ -1900,6 +1902,23 @@ def test_pass1_system_prompt_delivers_the_live_nonce() -> None:
     # And the exemplar's literal ``nonce=NONCE`` is still shown so the model knows what to
     # substitute for — dropping this would leave a nonce delivery paragraph with no referent.
     assert "nonce=NONCE" in system
+
+
+def test_pass1_system_prompt_builder_requires_a_nonce() -> None:
+    """``nonce`` is a required kwarg — a missing one raises TypeError, not silently omits.
+
+    Rider-3 finding on PR #201 (naysayer, correctness, msg-2092 §1): with ``nonce`` defaulted
+    to ``None`` the builder would drop the delivery paragraph but the ``verdict_task_prompt``
+    still hardcodes an instruction to look for it, producing a self-contradictory system
+    message. The signature-level fix is the pin: an omission is a TypeError at call time,
+    which no code path (production or test) can produce a green result under.
+
+    Asserted at the call, not the signature: an inspection of ``inspect.signature`` would
+    still pass if a caller wrapped the builder with a default of its own, which is the shape
+    the rider-3 finding actually cared about.
+    """
+    with pytest.raises(TypeError):
+        build_pr_review_pass1_system_prompt(verdict_task_prompt="TASK")  # type: ignore[call-arg]
 
 
 def test_nonce_generator_produces_the_expected_shape() -> None:

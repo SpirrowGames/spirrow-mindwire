@@ -532,8 +532,14 @@ _NONCE_HEX_CHARS = _NONCE_HEX_BYTES * 2
 # still SEEN by the parser and counted — the authoritative filter then rejects it on the
 # exact-string comparison. Read: the regex answers "does this look like a marker at all";
 # the string comparison answers "is this OUR marker".
+#
+# The prefix literal is built from :data:`_OBJECTIONS_SENTINEL_PREFIX` rather than repeated
+# inline, so a future change to the marker's fixed shape (its version bump, a rename) is a
+# one-place edit and this regex, the log line's diagnostic, and any tests that reason about
+# the prefix cannot silently drift apart. Rider-3 finding on PR #201 (naysayer, structure)
+# supplied the observation that a bare-inline literal here left the constant as dead code.
 _OBJECTIONS_SENTINEL_ANY_RE = re.compile(
-    r"^<!-- mindwire:objections v1(?:\s+nonce=([A-Za-z0-9]+))?\s*-->\s*$",
+    rf"^{re.escape(_OBJECTIONS_SENTINEL_PREFIX)}(?:\s+nonce=([A-Za-z0-9]+))?\s*-->\s*$",
     re.MULTILINE,
 )
 

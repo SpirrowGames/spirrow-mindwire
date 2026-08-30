@@ -707,7 +707,9 @@ def test_append_marker_places_marker_as_final_non_empty_line() -> None:
 def test_pass1_builder_returns_only_prompt_no_side_effects() -> None:
     # Sanity: build_pr_review_pass1_system_prompt is a pure builder, so a test can construct
     # exactly what the driver constructs by passing the same verdict_task_prompt.
-    p1 = build_pr_review_pass1_system_prompt(verdict_task_prompt="TASK")
+    # ``nonce`` is a required kwarg (msg-2092 rider-3 finding): a builder call without one
+    # would produce a self-contradictory system prompt.
+    p1 = build_pr_review_pass1_system_prompt(verdict_task_prompt="TASK", nonce="0123456789abcdef")
     assert "TASK" in p1
     assert PASS_1_ADR_INDEX_SELF_DECLARATION in p1
 
