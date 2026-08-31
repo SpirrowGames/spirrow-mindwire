@@ -2003,31 +2003,124 @@ def test_missing_reason_appears_in_shadow_log_line(caplog: pytest.LogCaptureFixt
     assert "missing_reason=-" in joined
 
 
-def test_missing_reason_labels_appear_in_the_d_divergence_notice() -> None:
-    """Instrumentation (rider-3 msg-2130 §3). The D-divergence gate notice names the sub-cause
-    of a MISSING so a reader of the posted review body sees WHICH MISSING fired.
+def test_d_divergence_notice_never_names_the_missing_sub_reason() -> None:
+    """Security pin (rider-3 msg-2212 §1 / msg-2213). The D-divergence notice MUST NOT
+    surface the ``missing_reason`` sub-cause of a MISSING parse.
 
-    The log line lives for grep-a-corpus reads; the notice lives in the review body that both
-    the chatroom and GitHub receive, and rider 2 reads the shadow through it. If the notice
-    still said "no readable objection block was found" with no further detail, rider 2 would
-    have to correlate every review to its log line to tell the three sub-causes apart.
+    The notice ships in the review body that both the chatroom and GitHub receive, which is
+    readable to the model whose diff is under review. Naming which of D-1 / D-3 / no-marker /
+    bad-json fired hands that model — or an attacker whose exploit is in the diff — a
+    per-attempt oracle: "D-1 fired → collapse to one marker"; "D-3 fired → drop the leading
+    prose"; iterate until the block parses clean. Msg-2212 upgraded this from an advisory
+    to a BLOCKING security defect; msg-2213 directed the fix as "confine the sub-cause to
+    the shadow log". Rider 2 still gets the sub-cause: it rides on ``_log_objections``,
+    which is not returned to the reviewed revision.
+
+    The prior test that pinned the opposite invariant (missing_reason MUST appear in the
+    notice) has been retired by the same messages. The invariant this test now pins is the
+    stronger one: the five sub-reason strings must not appear ANYWHERE in the notice, not
+    just be absent from the specific "no readable objection block" sentence — a well-meaning
+    future edit that adds "(the parser hit multi-marker)" elsewhere in the notice would
+    re-open the same oracle and must red-build here.
+
+    The pin is EXHAUSTIVE over ``forbidden_substrings``, and does so BY CONSTRUCTION rather
+    than by hand-maintained enumeration: ``forbidden_substrings`` is derived at test-run
+    time from ``ObjectionMissingReason`` itself, so adding a new enum value automatically
+    forbids it in the notice — and renaming an existing value automatically updates what
+    the test looks for. This closes the drift failure mode msg-2271 named as the
+    ``correctness`` block on the round-1 fix (a hand-maintained list only pinned the enum
+    for ``NOT_A_LIST``; the other four were vulnerable to a rename that would
+    ``false-pass`` the loop). msg-2262 (PR #207 round-1 gate finding) had named the
+    prior version's ``untested`` defect on ``not-a-list``; msg-2271 broadened that to
+    "the same protection must cover the whole enum, not just one value".
+
+    Every enum value is exercised by at least one decision (four reachable via real
+    critique bodies; two — ``NOT_A_LIST`` and ``PRINCIPLES_ERROR`` — synthesized via
+    ``dataclasses.replace``, both being structurally unreachable from a critique body
+    the current parser accepts). The loop below checks the notice against every forbidden
+    substring for every decision, so the coverage matrix is
+    ``len(enum) * (len(enum) + 1)``.
     """
+    from dataclasses import replace
+
+    from spirrow_mindwire.naysayer.pr_review import ObjectionReport, VerdictDecision
+
     view = _make_view(_DIFF_WARN_THRESHOLD - 1)
-    for expected_reason, body in (
-        (
-            "prose-between",
-            f"{_OBJECTIONS_SENTINEL}\nHere are my objections:\n[]\n\nVERDICT: APPROVE",
+    # Enum-derived: the forbidden list stays in lock-step with the enum by construction,
+    # not by hand-maintenance. Adding a value adds a check; renaming a value updates the
+    # check. This is msg-2271's directly proposed remediation for the round-1 correctness
+    # defect ("後者なら「列挙の更新漏れ」という失敗モード自体が消えます").
+    forbidden_substrings: tuple[str, ...] = (
+        "missing_reason",
+        *(e.value for e in ObjectionMissingReason),
+    )
+    # Four causes are reachable from a real critique body; drive them through
+    # ``parse_objections`` the way the driver does. Keys are the enum ``.value`` strings
+    # so the "every enum value has a decision" assertion below is a plain set-equality.
+    input_cases = {
+        ObjectionMissingReason.PROSE_BETWEEN.value: (
+            f"{_OBJECTIONS_SENTINEL}\nHere are my objections:\n[]\n\nVERDICT: APPROVE"
         ),
-        (
-            "multi-marker",
-            f"{_OBJECTIONS_SENTINEL}\n[]\n\nprose\n\n"
-            f"{_OBJECTIONS_SENTINEL}\n[]\n\nVERDICT: APPROVE",
+        ObjectionMissingReason.MULTI_MARKER.value: (
+            f"{_OBJECTIONS_SENTINEL}\n[]\n\nprose\n\n{_OBJECTIONS_SENTINEL}\n[]\n\nVERDICT: APPROVE"
         ),
+        ObjectionMissingReason.NO_MARKER.value: "no blocking problems\n\nVERDICT: APPROVE",
+        ObjectionMissingReason.BAD_JSON.value: (
+            f"{_OBJECTIONS_SENTINEL}\n[not json\n\nVERDICT: APPROVE"
+        ),
+    }
+    decisions: dict[str, VerdictDecision] = {
+        label: decide_verdict(body, view=view, finish_reason="stop")
+        for label, body in input_cases.items()
+    }
+    # ``NOT_A_LIST`` and ``PRINCIPLES_ERROR`` CANNOT be reached from any critique body the
+    # parser accepts today: ``parse_objections`` only calls ``raw_decode`` after D-3 has
+    # confirmed the payload's first non-whitespace char is ``[``, so ``parsed`` is always
+    # a list; and ``principles_error`` fires only if the vocabulary load itself raises,
+    # which the runtime doesn't do in a well-formed workspace. But the security invariant
+    # the notice must uphold is stronger than what the parser can produce today: a future
+    # relaxation of D-3 that made these reachable must not thereby leak a sub-cause
+    # oracle through the posted notice. Synthesize the decisions directly rather than
+    # fake inputs that structurally cannot exist. Any MISSING seed will do — swap the
+    # ``missing_reason`` field via ``dataclasses.replace`` (both dataclasses are frozen;
+    # see ``test_verdict_decision_is_immutable``) so the constructed decisions exercise
+    # the same ``render_gate_notice`` MISSING branch the other cases do.
+    seed = decisions[ObjectionMissingReason.BAD_JSON.value]
+    for synthetic_reason in (
+        ObjectionMissingReason.NOT_A_LIST,
+        ObjectionMissingReason.PRINCIPLES_ERROR,
     ):
-        decision = decide_verdict(body, view=view, finish_reason="stop")
+        report: ObjectionReport = replace(seed.objections, missing_reason=synthetic_reason)
+        decisions[synthetic_reason.value] = replace(seed, objections=report)
+    # Belt-and-braces: (a) every enum value has a decision exercising it (the coverage
+    # invariant msg-2271 flagged as missing for the non-NOT_A_LIST values), and (b) every
+    # decision still carries MISSING (we only meant to swap the sub-reason, not the
+    # status). The set-equality on (a) means "add a new enum value → the loop below
+    # red-builds because there is no matching decision", closing the drift path from the
+    # opposite direction.
+    assert set(decisions) == {e.value for e in ObjectionMissingReason}, (
+        "coverage: every ObjectionMissingReason value must have a decision — a new "
+        "enum value without a matching case would leave that value unexercised"
+    )
+    for label, decision in decisions.items():
+        assert decision.objections.status is ObjectionParse.MISSING, label
+        assert decision.objections.missing_reason is not None, label
+        assert decision.objections.missing_reason.value == label, label
+
+    for label, decision in decisions.items():
         notice = render_gate_notice(decision)
-        assert _MARKER_D_DIVERGENCE in notice, expected_reason
-        assert f"missing_reason={expected_reason}" in notice, expected_reason
+        # The notice DOES still name that the block was missing — that fact is not the
+        # oracle, only the specific sub-cause is. So the D-divergence marker must be present
+        # (this is the code path we are checking) and it must still say the derived side
+        # fell to REQUEST_CHANGES.
+        assert _MARKER_D_DIVERGENCE in notice, label
+        assert "No readable objection block was found" in notice, label
+        assert "REQUEST_CHANGES" in notice, label
+        for forbidden in forbidden_substrings:
+            assert forbidden not in notice, (
+                f"case={label!r}: notice leaks {forbidden!r}, which is the oracle "
+                f"msg-2212 §1 / msg-2213 said must be confined to the shadow log"
+            )
 
 
 def test_r4a_verdict_re_carries_a_back_reference_to_the_divergence() -> None:

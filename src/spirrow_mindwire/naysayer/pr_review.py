@@ -515,8 +515,15 @@ class ObjectionMissingReason(Enum):
 
     Every value derives REQUEST_CHANGES identically — the derivation reads
     :class:`ObjectionParse.MISSING` and stops. This enum exists so the shadow log line
-    and the D-divergence notice can name *which* MISSING cause fired, without which
-    ``parse=missing`` is a black box that folds three independent signals into one.
+    can name *which* MISSING cause fired, without which ``parse=missing`` is a black
+    box that folds the enum's sub-causes (currently six: ``no-marker`` / ``multi-marker``
+    / ``prose-between`` / ``bad-json`` / ``not-a-list`` / ``principles-error``) into one.
+    **It is NOT surfaced on the posted D-divergence notice** (msg-2212 §1 / msg-2213):
+    the notice is readable to the model whose diff is under review, and naming which
+    parser wall it tripped gives that model (or an attacker whose exploit is in the
+    diff) a per-attempt oracle to hill-climb. Rider 2 reads the sub-cause off the log
+    line, which lives in the operator-side channel and is not returned to the reviewed
+    revision.
 
     The two counters rider 2 was asked to instrument (msg-2130 §3) map to
     :attr:`MULTI_MARKER` (D-1 fired) and :attr:`PROSE_BETWEEN` (D-3 fired). The other
@@ -582,8 +589,9 @@ def _missing_report(reason: ObjectionMissingReason) -> ObjectionReport:
     The ``reason`` argument is required — a call without one would produce a MISSING report
     whose cause is unknowable, which is precisely the black-box the instrumentation exists
     to eliminate. All MISSING cases still derive REQUEST_CHANGES (:func:`derive_verdict`
-    only looks at ``status``); the reason surfaces on the shadow log line and the
-    D-divergence gate notice.
+    only looks at ``status``); the reason surfaces on the shadow log line ONLY, never on
+    the posted D-divergence notice (msg-2212 §1 / msg-2213: naming the sub-cause in the
+    review body hands the reviewed revision an oracle to hill-climb against).
     """
     return ObjectionReport(status=ObjectionParse.MISSING, missing_reason=reason)
 
@@ -971,15 +979,19 @@ def render_gate_notice(decision: VerdictDecision) -> str:
                 f"{', '.join(sorted(set(report.unknown_classes)))} (counted as blocking)."
             )
         if report.status is ObjectionParse.MISSING:
-            # msg-2130 §3: name the sub-cause so a reader of the review body can tell
-            # "the model wrote no block" (baseline) from "D-1/D-3 fired" (parser hardening).
-            reason_label = (
-                report.missing_reason.value if report.missing_reason is not None else "unknown"
-            )
+            # msg-2212 §1 / msg-2213: the sub-cause (``missing_reason``) is deliberately NOT
+            # named in the posted notice. Naming which of D-1 / D-3 / no-marker / bad-json
+            # fired hands the model — or an attacker whose diff is under review — a per-attempt
+            # oracle they can hill-climb against ("D-1 fired → collapse to one marker"; "D-3
+            # fired → drop the leading prose") until the block parses clean. In Stage 1 this
+            # is shadow so the F-a-direction risk is bounded, but the reversal PR is the
+            # payoff for this same oracle. Rider 2 still gets the sub-cause: it rides on
+            # :func:`_log_objections` below, which is not posted anywhere the reviewed
+            # revision can read. Pinned by
+            # :func:`test_d_divergence_notice_never_names_the_missing_sub_reason`.
             lines.append(
-                f"> No readable objection block was found (`missing_reason={reason_label}`), "
-                f"so the derived side defaults to REQUEST_CHANGES (fail-closed). This says "
-                f"nothing about the review above."
+                "> No readable objection block was found, so the derived side defaults to "
+                "REQUEST_CHANGES (fail-closed). This says nothing about the review above."
             )
     return "\n".join(lines)
 
