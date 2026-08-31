@@ -808,3 +808,182 @@ def test_file_state_store_cleans_up_temp_on_replace_failure(tmp_path: Path) -> N
     # No stale tmp files under the state dir.
     leftover = list(path.parent.glob("*.tmp"))
     assert leftover == [], f"orphan temp files after failed save: {leftover}"
+
+
+# --- PR-gate #209 blocking round-3 regression: TOCTOU during await ----------------------------
+
+
+@pytest.mark.anyio
+async def test_concurrent_tick_updates_survive_our_post_await(tmp_path: Path) -> None:
+    """PR #209 gate blocking (round 3): lost-update during ``await mcp.call_tool``.
+
+    Before this fix, ``on_close_failure`` loaded the shared state file
+    once at the beginning, awaited the network call to ``mcp.call_tool``
+    (yielding to the event loop), then wrote its stale in-memory
+    ``state`` back — silently erasing any concurrent tick's updates
+    that landed on the shared file during the await window.
+
+    This test makes the race concrete with a real ``FileFailureStateStore``
+    backed by ``tmp_path``:
+
+      1. Pre-populate the state file with a bystander project
+         (``spirrow-mindwire``) so we can distinguish "we lost nothing"
+         from "the file happened to be empty anyway".
+      2. Program the MCP fake so that its ``call_tool`` — which runs
+         inside our ``await`` — writes to the very same state file,
+         adding a THIRD project's records (mimicking a concurrent tick
+         for ``spirrow-voxelworld``).
+      3. Drive ``on_close_failure`` for ``spirrow-verimend`` and assert
+         the FINAL on-disk state contains:
+           * our project's episode with ``reported_at`` set (post ok),
+           * the concurrent tick's records (they must not be erased),
+           * and the pre-existing bystander (unchanged).
+
+    A regression that reuses the pre-await snapshot for the
+    mark-reported save fails assertion (2) — the concurrent tick's
+    ``spirrow-voxelworld`` records get silently erased. That is
+    precisely the lost-update bug this fix closes.
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    store = FileFailureStateStore(path)
+    store.save(
+        _State(
+            floors={
+                "spirrow-mindwire": RateLimitFloor(
+                    project="spirrow-mindwire",
+                    last_attempt_at="2026-08-30T00:00:00+00:00",
+                ),
+            }
+        )
+    )
+
+    concurrent_tick_ran = {"done": False}
+
+    def _simulate_concurrent_tick(name: str, args: dict[str, Any]) -> Any:
+        # This runs inside our ``await mcp.call_tool``. Simulate a
+        # sibling tick for a DIFFERENT project by loading the current
+        # on-disk state (which now has our write-ahead save from
+        # step 3), adding a third project's records, and saving.
+        concurrent_state = store.load()
+        concurrent_state.floors["spirrow-voxelworld"] = RateLimitFloor(
+            project="spirrow-voxelworld",
+            last_attempt_at="2026-08-31T00:05:00+00:00",
+        )
+        concurrent_state.episodes["spirrow-voxelworld"] = FailureEpisode(
+            project="spirrow-voxelworld",
+            thread_id=thread_id_for("spirrow-voxelworld"),
+            signature="GateBootstrapCloseError",
+            first_seen_at="2026-08-31T00:05:00+00:00",
+            reported_at="2026-08-31T00:05:00+00:00",
+        )
+        store.save(concurrent_state)
+        concurrent_tick_ran["done"] = True
+        return {"msg": {"msg_id": "msg-fake-concurrent"}}
+
+    mcp = _RecordingMcp(post_outcome=_simulate_concurrent_tick)
+    vis = CloseFailureVisibility(store)
+
+    report = await vis.on_close_failure(
+        mcp,
+        project="spirrow-verimend",
+        thread_id=thread_id_for("spirrow-verimend"),
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("close refusal"),
+    )
+
+    # Sanity checks.
+    assert concurrent_tick_ran["done"], "the concurrent-tick simulator did not fire"
+    assert report.action == "posted"
+
+    # Load the final on-disk state.
+    final = store.load()
+
+    # (1) Our own project's episode must have reported_at set (post ok).
+    assert "spirrow-verimend" in final.episodes
+    verimend_episode = final.episodes["spirrow-verimend"]
+    assert verimend_episode.reported_at is not None
+    assert "spirrow-verimend" in final.floors
+
+    # (2) THE load-bearing assertion: the concurrent tick's project
+    # records must survive. A regression will fail this — the pre-await
+    # snapshot save at step 5 does not know about ``spirrow-voxelworld``
+    # and blindly writes a state that does not contain it.
+    assert "spirrow-voxelworld" in final.floors, (
+        "concurrent tick's floor for spirrow-voxelworld was erased by our "
+        "stale-state save — this is the PR #209 gate round-3 TOCTOU bug"
+    )
+    assert "spirrow-voxelworld" in final.episodes, (
+        "concurrent tick's episode for spirrow-voxelworld was erased by our "
+        "stale-state save — this is the PR #209 gate round-3 TOCTOU bug"
+    )
+    voxel_episode = final.episodes["spirrow-voxelworld"]
+    assert voxel_episode.reported_at == "2026-08-31T00:05:00+00:00"
+
+    # (3) Pre-existing bystander must also survive (unchanged floor).
+    assert "spirrow-mindwire" in final.floors
+    assert final.floors["spirrow-mindwire"].last_attempt_at == "2026-08-30T00:00:00+00:00"
+
+
+@pytest.mark.anyio
+async def test_post_success_when_reload_after_await_fails(tmp_path: Path) -> None:
+    """If the post-await reload fails, do NOT lose the "posted" verdict.
+
+    The post itself succeeded — the operator's alert-thread got the
+    report. The mechanism only failed to persist the ``reported_at``
+    mark. The floor entry from step 3 already blocks the next 24h, so
+    dedup at the coarse level still works. Reporting this as
+    ``state_read_failed`` would be misleading (a post DID land) and
+    reporting it as ``post_failed`` would falsify the observable
+    outcome.
+
+    The action stays ``posted``; the ``reason`` string names the
+    reload failure so the operator can see why the mark did not land.
+    """
+    # Real store on disk, then swap its ``load`` for a failing one only
+    # for the post-await reload phase.
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    store = FileFailureStateStore(path)
+
+    load_call_count = {"n": 0}
+    original_load = store.load
+
+    def flaky_load() -> _State:
+        load_call_count["n"] += 1
+        # First two loads (initial + write-ahead reload) succeed.
+        # The third load (post-await reload) fails, simulating a
+        # transient FS glitch that happens to strike right after the
+        # network call.
+        #
+        # Note: current implementation makes only two ``load()`` calls
+        # per on_close_failure (initial and post-await). ``n == 2`` is
+        # the post-await one under that implementation.
+        if load_call_count["n"] >= 2:
+            raise OSError("simulated transient read failure after post")
+        return original_load()
+
+    # Type: ignore because we're rebinding a method for the test only.
+    store.load = flaky_load  # type: ignore[method-assign]
+
+    mcp = _RecordingMcp()
+    vis = CloseFailureVisibility(store)
+
+    report = await vis.on_close_failure(
+        mcp,
+        project="spirrow-verimend",
+        thread_id=thread_id_for("spirrow-verimend"),
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("close refusal"),
+    )
+
+    # Post did land — action must be "posted", NOT state_read_failed.
+    assert report.action == "posted", (
+        f"a successful post must be reported as 'posted' even if the "
+        f"reported_at mark cannot be persisted; got action={report.action!r} "
+        f"reason={report.reason!r}"
+    )
+    # The reason must name the reload failure so the operator can
+    # diagnose without opening the state file.
+    assert "reported_at mark could not be persisted" in report.reason
+    assert "floor from" in report.reason  # cites the still-effective 24h floor
+    # And the post itself was really attempted.
+    assert len(mcp.post_calls()) == 1

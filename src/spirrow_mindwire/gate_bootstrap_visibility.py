@@ -124,6 +124,27 @@ Invariants this module MUST NOT violate (raise on any):
   fresh-install case) is allowed to produce empty state; every other
   read or parse failure is propagated so the caller can decline to
   post AND decline to save.
+- **The pre-await ``state`` snapshot must not be reused after the
+  network call.** Any save that follows an ``await`` on the MCP
+  transport MUST reload the state file first, mutate ONLY this
+  project's fields on the fresh copy, and save. Reusing the pre-await
+  snapshot silently erases any concurrent tick's updates to other
+  projects that landed during the await — the PR #209 gate blocking
+  (round 3) TOCTOU defect. Pinned by
+  ``test_concurrent_tick_updates_survive_our_post_await``.
+
+**Concurrency profile.** The module targets Level-2 concurrency
+(different projects executing concurrently across processes). Level 3
+(same project executing concurrently) is prevented at the sweep-wrapper
+level: ``deploy/run-conductor-scheduled.ps1`` runs at most one
+subprocess per project per tick via a sequential ``foreach``, and no
+in-tick concurrency exists inside a single subprocess. The
+reload-before-save invariant above closes the observable Python-level
+race (the ``await`` window). The tight synchronous window between load
+and save inside the write-ahead phase is not closed here — closing it
+would require OS-level file locking or per-project files, either of
+which is a separate design item — but is not observable under the
+current sweep architecture.
 
 The module is deliberately transport-shaped: it talks to the same
 ``McpToolCaller`` abstraction the rest of the codebase uses, so a fake for
@@ -633,6 +654,36 @@ class CloseFailureVisibility:
             )
 
         # 5. Post succeeded → mark reported_at.
+        #
+        # RE-LOAD state before mutating and saving. The ``await`` on
+        # step 4 yielded to the event loop; any concurrent tick (for a
+        # DIFFERENT project) that ran its own on_close_failure or
+        # on_close_success during our await will have committed its
+        # updates to the shared state file. Writing back our stale
+        # pre-await ``state`` here would silently erase those updates —
+        # the PR #209 gate blocking (round 3) this commit addresses.
+        # The bug is a classic TOCTOU / lost-update: our ``state``
+        # variable was correct at step 3's save but is a stale snapshot
+        # by the time step 5's save runs.
+        #
+        # Concurrency profile this fix DOES and DOES NOT close (kept
+        # honest so a future reader knows what still bites):
+        #
+        # * CLOSED (this fix): different-project concurrent updates
+        #   landing during THIS tick's ``await mcp.call_tool``. The
+        #   observable Python-level race that a subprocess-level test
+        #   can even exercise. The naysayer's specific blocking
+        #   scenario.
+        # * NOT CLOSED: two writers racing at the tight window between
+        #   load and save WITHIN the write-ahead phase (steps 1-3). The
+        #   load-modify-save pattern here is not atomic under concurrent
+        #   writers — closing it would require OS-level file locking or
+        #   per-project files (either would be a separate design item).
+        #   The sweep wrapper today serializes per-project subprocess
+        #   launches (deploy/run-conductor-scheduled.ps1's foreach), so
+        #   this race is not observable in production.
+        # * NOT CLOSED: same-project concurrent execution. Also
+        #   prevented by the sweep wrapper's per-project serialization.
         reported_episode = FailureEpisode(
             project=episode.project,
             thread_id=episode.thread_id,
@@ -640,12 +691,33 @@ class CloseFailureVisibility:
             first_seen_at=episode.first_seen_at,
             reported_at=now_iso,
         )
+        try:
+            state = self._store.load()
+        except (OSError, json.JSONDecodeError):
+            # Post DID succeed. We cannot safely persist the reported_at
+            # mark because we cannot read the current state (and blindly
+            # saving would either lose concurrent updates or paint over
+            # a corrupt file — see FileFailureStateStore.load contract).
+            # The floor written at step 3 already blocks the next 24h so
+            # no spam results. Report as posted with a diagnostic note
+            # so the operator can see why the mark did not land.
+            return VisibilityReport(
+                action="posted",
+                reason=(
+                    f"failure report posted to {thread_id} for signature "
+                    f"{signature!r} (reported_at mark could not be persisted "
+                    "— state re-read after network call failed; floor from "
+                    "step 3 still blocks next 24h)"
+                ),
+                episode=reported_episode,
+            )
         state.episodes[project] = reported_episode
-        # Loss of the reported_at mark is a benign failure: the floor entry
-        # already blocks the next 24h of attempts, so no spam results.
-        # Worst case: one extra report after the 24h window if the write
-        # eventually recovers but this specific mark did not persist.
-        # Acceptable per the module docstring's stated trade-offs.
+        # Loss of the reported_at mark on the save side is a benign
+        # failure: the floor entry from step 3 already blocks the next
+        # 24h of attempts, so no spam results. Worst case: one extra
+        # report after the 24h window if the write eventually recovers
+        # but this specific mark did not persist. Acceptable per the
+        # module docstring's stated trade-offs.
         with contextlib.suppress(OSError):
             self._store.save(state)
         return VisibilityReport(
