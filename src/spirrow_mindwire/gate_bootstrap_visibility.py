@@ -116,6 +116,14 @@ Invariants this module MUST NOT violate (raise on any):
 - **At most one post attempt per tick per project.** Retries are not
   permitted.
 - **At most one post attempt per 24 hours per project** (write-ahead floor).
+- **A read failure must never trigger a save.** Silently returning
+  "empty state" on a read error and then persisting it would erase every
+  OTHER project's floor and episode records — the "swallowed OSError
+  makes on_close_failure's fail-closed guard dead code" defect the PR-gate
+  on PR #209 caught (blocking #2). Only ``FileNotFoundError`` (the
+  fresh-install case) is allowed to produce empty state; every other
+  read or parse failure is propagated so the caller can decline to
+  post AND decline to save.
 
 The module is deliberately transport-shaped: it talks to the same
 ``McpToolCaller`` abstraction the rest of the codebase uses, so a fake for
@@ -129,6 +137,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -231,7 +240,8 @@ class VisibilityReport:
 
     Fields:
       * ``action`` — one of ``"posted"``, ``"floor_blocked"``,
-        ``"dedup_blocked"``, ``"state_write_failed"``, ``"post_failed"``.
+        ``"dedup_blocked"``, ``"state_read_failed"``,
+        ``"state_write_failed"``, ``"post_failed"``.
       * ``reason`` — human-readable summary. Machine consumers key on
         ``action``; ``reason`` is for the log reader.
       * ``episode`` — the episode record after the call, if any. Included
@@ -284,11 +294,32 @@ class FileFailureStateStore:
     """Production :class:`FailureStateStore` — one JSON file under ``<data_dir>/state/``.
 
     Atomic rewrite via ``write text → os.replace``: the state either was the
-    old version or the new version, never a half-written mix. A read that
-    finds the file missing returns empty state (the fresh-install case);
-    a read that finds the file present but unparseable also returns empty
-    state and logs — the alternative (raise) would break the tick, which
-    the module docstring explicitly forbids.
+    old version or the new version, never a half-written mix.
+
+    **Load semantics (PR #209 gate-feedback fix — blocking #2):** ONLY
+    ``FileNotFoundError`` is treated as "start empty" (the fresh-install
+    case). Every other read or parse failure is PROPAGATED to the caller
+    (:meth:`CloseFailureVisibility.on_close_failure`) so it can honour the
+    fail-closed rule. Swallowing ``OSError`` here would make the
+    ``except OSError`` guard in ``on_close_failure`` dead code, and — worse
+    — a swallowed read failure returning an empty ``_State()`` would then
+    be re-saved as an empty file, silently erasing every OTHER project's
+    floor and episode records. Do not restore the previous silent
+    fallback.
+
+    ``json.JSONDecodeError`` and "top-level not a dict" are also
+    propagated (as errors) for the same reason: a corrupt file must not
+    be treated as "no file" during write-back, because the write-back
+    would then paint over the corruption with a partial view.
+
+    **Save atomicity (PR #209 gate-feedback fix — advisory #3):**
+    Written to a unique per-process temp file via
+    :func:`tempfile.NamedTemporaryFile` in the same directory, then
+    ``os.replace``-d. A hard-coded ``.tmp`` sibling would race any
+    concurrent tick that happens to run against the same install
+    (the tick is currently invoked once per project by the sweep
+    wrapper, which is sequential today — but the atomic-write contract
+    should not assume that).
     """
 
     def __init__(self, path: Path) -> None:
@@ -298,33 +329,55 @@ class FileFailureStateStore:
         try:
             raw = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
+            # The ONLY safe empty-state case: no file has ever been
+            # written for this install. Every other read failure means
+            # "there is state on disk that I cannot see", which is not
+            # the same thing.
             return _State()
-        except OSError:
-            # A read error IS a state loss for this tick. The design
-            # docstring's fail-closed clause applies to WRITE failures (do
-            # not post if we cannot rate-limit); a read failure means we
-            # cannot see the floor, so we must fall back to the same
-            # fail-closed behaviour on the write side later. Returning
-            # empty state is the ONLY safe option here — see the write-path
-            # comment in CloseFailureVisibility.on_close_failure.
-            return _State()
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return _State()
+        # Any other OSError (PermissionError, transient FS glitch, etc.)
+        # propagates. See class docstring.
+        data = json.loads(raw)
         if not isinstance(data, dict):
-            return _State()
+            # Corrupt top-level shape → treat as a read failure, not as
+            # empty state (see class docstring). Raising JSONDecodeError
+            # lines up with what ``on_close_failure`` already catches.
+            raise json.JSONDecodeError(
+                "gate_bootstrap_failure.json top level is not a JSON object",
+                raw,
+                0,
+            )
         return _decode_state(data)
 
     def save(self, state: _State) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        # Write to a temp sibling then atomic-rename so a mid-write crash
-        # leaves the old file intact. The rename is atomic on Windows for
-        # same-directory targets (via os.replace, which uses MoveFileExW
-        # with MOVEFILE_REPLACE_EXISTING).
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp.write_text(_encode_state(state), encoding="utf-8")
-        os.replace(tmp, self._path)
+        # Unique per-write temp file in the same directory, then
+        # os.replace to become the target atomically. A statically
+        # named ``.tmp`` sibling would race a concurrent tick and
+        # produce a corrupt file (PR-gate advisory #3 on PR #209).
+        # ``delete=False`` because we hand ownership to ``os.replace``.
+        # ``dir=`` keeps the temp on the same filesystem so
+        # ``os.replace`` is a rename, not a cross-filesystem copy.
+        encoded = _encode_state(state)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=str(self._path.parent),
+            prefix=self._path.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as fd:
+            tmp_path = Path(fd.name)
+            fd.write(encoded)
+        try:
+            os.replace(tmp_path, self._path)
+        except Exception:
+            # Clean up the orphaned temp file on any failure between
+            # write and replace, so a repeated write failure does not
+            # accumulate stale tmp files forever.
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+            raise
 
 
 def _decode_state(data: Mapping[str, Any]) -> _State:
@@ -411,10 +464,16 @@ class CloseFailureVisibility:
         """D-2''' Rule 1: positive observation that the alert is not open → clear episode.
 
         Does NOT touch the floor (Rule 2). The absence of a raise here is
-        deliberate — a state write failure at this point simply means the
+        deliberate — a state failure at this point simply means the
         (now-obsolete) episode entry lingers, and the next tick will
         overwrite it. Compared to raising, that is the strictly less-bad
         failure mode.
+
+        Also catches ``json.JSONDecodeError`` (widened after PR #209 gate
+        blocking #2 — ``FileFailureStateStore.load`` no longer swallows
+        it, so this call site has to). Same reasoning as ``on_close_failure``:
+        a corrupt state file is a state we cannot reason about, and the
+        safe response is to do nothing, not to overwrite it.
         """
         try:
             state = self._store.load()
@@ -423,7 +482,7 @@ class CloseFailureVisibility:
                 return
             del state.episodes[project]
             self._store.save(state)
-        except OSError:
+        except (OSError, json.JSONDecodeError):
             return
 
     async def on_close_failure(
@@ -454,14 +513,29 @@ class CloseFailureVisibility:
 
         try:
             state = self._store.load()
-        except OSError:
-            # A read failure means we cannot see the floor — the fail-closed
-            # rule (module docstring §Evaluation order step 3) applies: do
-            # NOT post if we cannot rate-limit. Log-only fall-back is what
-            # the tick's outer log line already gives us.
+        except (OSError, json.JSONDecodeError) as read_exc:
+            # A read failure means we cannot see the floor — the
+            # fail-closed rule (module docstring §Evaluation order
+            # step 3) applies: do NOT post if we cannot rate-limit,
+            # AND do NOT save (a save from empty state would silently
+            # erase every OTHER project's floor and episode records —
+            # PR-gate blocking #2 on PR #209).
+            #
+            # This ``except`` is now REACHABLE (previously
+            # ``FileFailureStateStore.load`` swallowed OSError and
+            # returned empty ``_State()``, making this block dead
+            # code). ``JSONDecodeError`` is included because the load
+            # path now propagates a corrupt file as a read failure for
+            # the same reason: "corrupt file" and "no file" must not
+            # collapse into the same code path, or the save would
+            # paint over the corruption with a partial view.
             return VisibilityReport(
-                action="state_write_failed",
-                reason="state read failed; refusing to post without a rate-limit floor",
+                action="state_read_failed",
+                reason=(
+                    f"state read failed ({type(read_exc).__name__}: {read_exc}); "
+                    "refusing to post without a rate-limit floor and refusing "
+                    "to save (would erase other projects' state)"
+                ),
             )
 
         # 1. Floor (project-only key, signature-independent). See module
@@ -621,10 +695,23 @@ def _format_visibility_report(*, project: str, thread_id: str, exc: BaseExceptio
         "was refused.\n\n"
         "This is a machine notice, not a design proposal. Details:\n\n"
         f"    {message}\n\n"
-        "The sweeper will not attempt to close this thread again for "
-        "24 hours (rate-limit floor). If the underlying cause is a "
-        "policy refusal (role registry, closeable_roles), fix it upstream "
-        "and the next successful close will clear the failure state. "
+        "**What is and is not rate-limited (read this carefully — the "
+        "prior version of this notice got it wrong; see PR #209 gate "
+        "feedback):**\n\n"
+        "- **The close attempt itself is NOT rate-limited.** The sweeper "
+        "continues to call `close_alert` on THIS thread on every "
+        "5-minute tick. The moment the underlying cause is fixed "
+        "upstream, the next tick will close this thread and no further "
+        "action is required — do NOT wait 24 hours.\n"
+        "- **Only THIS report is rate-limited.** The visibility "
+        "mechanism will not re-post the same failure notice into this "
+        "thread for 24 hours, even if the same close_alert refusal "
+        "recurs on every intervening tick. So a stale-looking absence "
+        'of new reports here means "nothing NEW to say", not '
+        '"nothing to try".\n\n'
+        "If the underlying cause is a policy refusal (role registry, "
+        "closeable_roles), fix it upstream and the next tick will "
+        "succeed and clear the failure state. "
         "Design ref: chatroom thread "
         "`T-gate-bootstrap-close-refused-and-tick-crash`."
     )

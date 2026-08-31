@@ -577,3 +577,234 @@ def test_file_state_store_roundtrips(tmp_path: Path) -> None:
     read_back = store.load()
     assert read_back.episodes == state.episodes
     assert read_back.floors == state.floors
+
+
+# --- PR-gate #209 blocking #1 regression: failure-report prose accuracy ------------------------
+
+
+@pytest.mark.anyio
+async def test_failure_report_does_not_claim_close_will_wait_24h() -> None:
+    """Regression for PR #209 gate blocking #1: the report must not lie about close cadence.
+
+    The pre-fix prose said:
+
+        "The sweeper will not attempt to close this thread again for
+        24 hours (rate-limit floor)."
+
+    That is false. The sweeper attempts ``close_alert`` on EVERY 5-minute
+    tick; only the visibility REPORT is rate-limited. Operators who read
+    the pre-fix prose could wait 24 hours after fixing an upstream policy
+    issue rather than realising the next tick will close the thread.
+
+    This test drives one failure through the visibility mechanism, reads
+    the exact body posted to ``chatroom_post_message``, and pins:
+      * the body MUST NOT contain the exact misleading sentence, and
+      * the body MUST explicitly say the close attempt itself is not
+        rate-limited (positive claim, not just absence of the wrong one —
+        without this the next well-meaning refactor could just delete the
+        sentence and lose the correction).
+    """
+    store = _MemoryStore()
+    now = _clock(datetime(2026, 8, 31, 0, 0, tzinfo=UTC))
+    vis = CloseFailureVisibility(store, now=now)
+    mcp = _RecordingMcp()
+
+    report = await vis.on_close_failure(
+        mcp,
+        project="spirrow-verimend",
+        thread_id=thread_id_for("spirrow-verimend"),
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("closeable_roles check failed"),
+    )
+    assert report.action == "posted"
+    posts = mcp.post_calls()
+    assert len(posts) == 1
+    body = posts[0][1]["content"]
+    # The exact misleading sentence must be gone.
+    assert "will not attempt to close this thread again for" not in body
+    # And the correct semantics must be stated positively.
+    assert "close attempt itself is NOT rate-limited" in body
+    assert "every 5-minute tick" in body
+
+
+# --- PR-gate #209 blocking #2 regression: read failure must fail-closed and preserve state -----
+
+
+@pytest.mark.anyio
+async def test_read_failure_fails_closed_and_preserves_other_projects_state(tmp_path: Path) -> None:
+    """Regression for PR #209 gate blocking #2: a transient read failure must NOT erase state.
+
+    The pre-fix ``FileFailureStateStore.load`` swallowed ``OSError`` and
+    returned an empty ``_State()``. The downstream ``on_close_failure``'s
+    ``except OSError`` guard was therefore dead code: the "empty state"
+    return would pass the floor/dedup checks and then ``save()`` would
+    persist a state file containing ONLY the current project's floor,
+    silently erasing every other project's records.
+
+    This test:
+      1. Pre-populates a state file with two projects' records
+         (``spirrow-verimend`` = the caller, plus ``spirrow-magickit``
+         = the innocent bystander).
+      2. Substitutes a store whose ``load`` raises ``OSError`` (mimicking
+         a transient FS glitch).
+      3. Drives ``on_close_failure`` for ``spirrow-verimend`` — asserts
+         action is ``state_read_failed``, no post is attempted, and
+         critically, no ``save`` was called (which would have erased
+         the bystander).
+    """
+    # Pre-populate real disk state so we have concrete "before" evidence
+    # that a subsequent bug would erase.
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    real_store = FileFailureStateStore(path)
+    real_store.save(
+        _State(
+            episodes={
+                "spirrow-magickit": FailureEpisode(
+                    project="spirrow-magickit",
+                    thread_id=thread_id_for("spirrow-magickit"),
+                    signature="GateBootstrapCloseError",
+                    first_seen_at="2026-08-30T00:00:00+00:00",
+                    reported_at="2026-08-30T00:00:00+00:00",
+                ),
+            },
+            floors={
+                "spirrow-magickit": RateLimitFloor(
+                    project="spirrow-magickit",
+                    last_attempt_at="2026-08-30T00:00:00+00:00",
+                ),
+            },
+        )
+    )
+    pre_bytes = path.read_bytes()
+
+    # A store that fakes a transient read failure.
+    reading_store = _MemoryStore()
+    reading_store.raise_on_load = OSError("simulated transient FS read glitch")
+    vis = CloseFailureVisibility(reading_store)
+    mcp = _RecordingMcp()
+
+    report = await vis.on_close_failure(
+        mcp,
+        project="spirrow-verimend",
+        thread_id=thread_id_for("spirrow-verimend"),
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("close refusal"),
+    )
+
+    # The fail-closed guard must fire.
+    assert report.action == "state_read_failed"
+    # Load-bearing side-effect assertions:
+    # (a) no post was attempted (nothing to rate-limit against),
+    assert mcp.post_calls() == []
+    # (b) no save was attempted (the bystander's state would be erased),
+    assert reading_store.save_calls == 0
+    # (c) and — belt AND braces — the on-disk file we would have
+    # actually saved to (if the visibility used the real store) is
+    # bit-for-bit unchanged. This is the "did we erase the bystander"
+    # observable that the pre-fix code would have violated.
+    assert path.read_bytes() == pre_bytes
+
+
+def test_file_state_store_load_propagates_os_error(tmp_path: Path) -> None:
+    """PR #209 blocking #2 (store level): OSError from read is NOT swallowed.
+
+    Companion to the integration test above. Pins the contract at the
+    store boundary: only ``FileNotFoundError`` yields empty state; every
+    other read failure propagates. A regression that re-introduces the
+    silent-swallow would fail this test AND the integration test — kept
+    separate so a future ``on_close_failure`` refactor cannot mask a
+    store-level regression by accident.
+    """
+    # A directory (not a file) at the target path makes ``read_text``
+    # raise ``IsADirectoryError`` on POSIX / ``PermissionError`` on
+    # Windows — both are subclasses of ``OSError`` and must propagate.
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    path.mkdir()  # will make read_text fail with OSError
+    store = FileFailureStateStore(path)
+    with pytest.raises(OSError):
+        store.load()
+
+
+def test_file_state_store_load_propagates_json_decode_error(tmp_path: Path) -> None:
+    """PR #209 blocking #2 (store level): corrupt JSON is NOT swallowed to empty.
+
+    A file present but garbage must NOT be indistinguishable from a
+    fresh install. If it were, ``on_close_failure`` would happily
+    ``save()`` a partial view over the corruption, losing every other
+    project's floor and episode records (same failure mode as the
+    OSError case).
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("not valid json {{{", encoding="utf-8")
+    store = FileFailureStateStore(path)
+    with pytest.raises(json.JSONDecodeError):
+        store.load()
+
+
+# --- PR-gate #209 advisory #3 regression: atomic save must use a unique temp file --------------
+
+
+def test_file_state_store_save_uses_unique_temp_file(tmp_path: Path) -> None:
+    """PR #209 gate advisory #3: no static ``.tmp`` sibling — must use unique names.
+
+    A statically-named ``<name>.tmp`` sibling would race a concurrent tick
+    and produce a corrupt file mid-``os.replace``. This test drives a
+    ``save`` that fails on the ``os.replace`` step (by holding the
+    target open) and asserts the temp file used was NOT the static
+    ``<name>.tmp`` name — verifying the ``tempfile.NamedTemporaryFile``
+    contract at the boundary.
+
+    Implementation: monkey-patch ``os.replace`` to record the temp path
+    it was called with. Any name other than the static static-``.tmp``
+    passes; the same static ``.tmp`` name every call would fail this.
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    store = FileFailureStateStore(path)
+
+    seen_temp_paths: list[str] = []
+    real_replace = os.replace
+
+    def spy_replace(src: Any, dst: Any) -> None:
+        seen_temp_paths.append(str(src))
+        real_replace(src, dst)
+
+    import unittest.mock
+
+    empty_state = _State()
+    with unittest.mock.patch("os.replace", side_effect=spy_replace):
+        store.save(empty_state)
+        store.save(empty_state)
+
+    assert len(seen_temp_paths) == 2
+    # Two saves must not share a temp file name (else concurrent
+    # saves would corrupt each other).
+    assert seen_temp_paths[0] != seen_temp_paths[1], (
+        f"static temp file name is a race condition — got same tmp both times: {seen_temp_paths[0]}"
+    )
+    # And neither may be the naive ``<name>.tmp`` sibling.
+    naive = str(path.with_suffix(path.suffix + ".tmp"))
+    assert naive not in seen_temp_paths
+
+
+def test_file_state_store_cleans_up_temp_on_replace_failure(tmp_path: Path) -> None:
+    """A failed ``os.replace`` must not leave orphan tmp files behind.
+
+    Kept minimal — the cleanup itself is not load-bearing, but a
+    repeated failure would otherwise pile up temp files across days.
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    store = FileFailureStateStore(path)
+
+    import unittest.mock
+
+    with (
+        unittest.mock.patch("os.replace", side_effect=OSError("simulated replace failure")),
+        pytest.raises(OSError),
+    ):
+        store.save(_State())
+
+    # No stale tmp files under the state dir.
+    leftover = list(path.parent.glob("*.tmp"))
+    assert leftover == [], f"orphan temp files after failed save: {leftover}"
