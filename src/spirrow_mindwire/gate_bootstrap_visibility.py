@@ -123,7 +123,14 @@ Invariants this module MUST NOT violate (raise on any):
   on PR #209 caught (blocking #2). Only ``FileNotFoundError`` (the
   fresh-install case) is allowed to produce empty state; every other
   read or parse failure is propagated so the caller can decline to
-  post AND decline to save.
+  post AND decline to save. The full exception set the callers must
+  swallow lives in :data:`_STATE_READ_ERRORS` — do NOT rewrite the
+  ``except`` clauses to name specific classes; use the tuple. The
+  PR-gate on PR #209 (round 4) flagged the exact failure that a
+  hand-written catch missed: ``UnicodeDecodeError`` inherits from
+  ``ValueError`` (NOT from ``OSError``), and reading a state file
+  whose bytes are not valid UTF-8 raised it straight through the
+  ``except (OSError, json.JSONDecodeError)`` guard and into the tick.
 - **The pre-await ``state`` snapshot must not be reused after the
   network call.** Any save that follows an ``await`` on the MCP
   transport MUST reload the state file first, mutate ONLY this
@@ -174,6 +181,40 @@ from .magickit.client import McpToolCaller
 # 試みない". The test at ``test_floor_holds_across_failing_posts`` computes
 # 24h / 5min = 288 ticks from this value and asserts exactly one attempt.
 FAILURE_REPORT_FLOOR = timedelta(hours=24)
+
+# All exception classes a state read can raise, as one tuple. Centralised so
+# a future addition (a store variant that talks to a network filesystem, a
+# new corruption mode) lands in ONE place and every ``except`` site picks it
+# up. Kept as a module-level constant precisely because scattering the tuple
+# across three call sites is how the PR #209 gate round-4 defect happened:
+# ``UnicodeDecodeError`` was missing from every one of them because the
+# catches were written by hand from an incomplete mental model of what
+# ``read_text`` and ``json.loads`` can raise.
+#
+# Members and why each one belongs:
+#   * ``OSError`` — filesystem failures (PermissionError, IsADirectoryError,
+#     transient network-FS glitches). Read cannot even complete.
+#   * ``UnicodeDecodeError`` — file bytes present but not valid UTF-8
+#     (an OS-level crash mid-write, manual tampering, disk corruption).
+#     Inherits from ``UnicodeError`` → ``ValueError`` — NOT from ``OSError``
+#     — which is why a plain ``except OSError`` did NOT catch it and the
+#     PR-gate flagged it as a "never raise" invariant violation
+#     (round 4 blocking on PR #209).
+#   * ``json.JSONDecodeError`` — bytes decoded successfully but the payload
+#     is not valid JSON, or the top-level shape is not a JSON object
+#     (see the raise in ``FileFailureStateStore.load``).
+#
+# All three mean "the store cannot present readable state right now" and
+# collapse into the same fail-closed behaviour at the caller: refuse to
+# post and refuse to save. Do NOT widen this to ``Exception`` — a
+# programming bug in ``_decode_state`` must still surface as a real crash,
+# because silencing it here would exactly re-create the F-1 pattern this
+# whole PR exists to close.
+_STATE_READ_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    UnicodeDecodeError,
+    json.JSONDecodeError,
+)
 
 # The magickit post-message tool the failure report is sent through. Named
 # separately from the ``report`` msg_type so an mcp caller substitution in
@@ -490,11 +531,13 @@ class CloseFailureVisibility:
         overwrite it. Compared to raising, that is the strictly less-bad
         failure mode.
 
-        Also catches ``json.JSONDecodeError`` (widened after PR #209 gate
-        blocking #2 — ``FileFailureStateStore.load`` no longer swallows
-        it, so this call site has to). Same reasoning as ``on_close_failure``:
-        a corrupt state file is a state we cannot reason about, and the
-        safe response is to do nothing, not to overwrite it.
+        Catches every state-read failure via :data:`_STATE_READ_ERRORS`
+        (includes ``UnicodeDecodeError`` since PR #209 gate round-4 —
+        invalid UTF-8 bytes on disk must not crash the tick from what is
+        supposed to be a best-effort visibility side channel). Same
+        reasoning as ``on_close_failure``: a corrupt state file is a
+        state we cannot reason about, and the safe response is to do
+        nothing, not to overwrite it.
         """
         try:
             state = self._store.load()
@@ -503,7 +546,7 @@ class CloseFailureVisibility:
                 return
             del state.episodes[project]
             self._store.save(state)
-        except (OSError, json.JSONDecodeError):
+        except _STATE_READ_ERRORS:
             return
 
     async def on_close_failure(
@@ -534,7 +577,7 @@ class CloseFailureVisibility:
 
         try:
             state = self._store.load()
-        except (OSError, json.JSONDecodeError) as read_exc:
+        except _STATE_READ_ERRORS as read_exc:
             # A read failure means we cannot see the floor — the
             # fail-closed rule (module docstring §Evaluation order
             # step 3) applies: do NOT post if we cannot rate-limit,
@@ -545,11 +588,18 @@ class CloseFailureVisibility:
             # This ``except`` is now REACHABLE (previously
             # ``FileFailureStateStore.load`` swallowed OSError and
             # returned empty ``_State()``, making this block dead
-            # code). ``JSONDecodeError`` is included because the load
-            # path now propagates a corrupt file as a read failure for
-            # the same reason: "corrupt file" and "no file" must not
-            # collapse into the same code path, or the save would
-            # paint over the corruption with a partial view.
+            # code). ``JSONDecodeError`` was added in PR-gate round 2
+            # because the load path now propagates a corrupt file as a
+            # read failure for the same reason: "corrupt file" and
+            # "no file" must not collapse into the same code path, or
+            # the save would paint over the corruption with a partial
+            # view. ``UnicodeDecodeError`` was added in PR-gate round 4
+            # because it inherits from ``ValueError`` (not ``OSError``)
+            # and so bypassed the earlier catch — invalid UTF-8 bytes
+            # on disk would crash the tick from what is meant to be a
+            # best-effort side channel. All three are collapsed into
+            # :data:`_STATE_READ_ERRORS`; extend the tuple, not this
+            # ``except`` clause.
             return VisibilityReport(
                 action="state_read_failed",
                 reason=(
@@ -693,7 +743,7 @@ class CloseFailureVisibility:
         )
         try:
             state = self._store.load()
-        except (OSError, json.JSONDecodeError):
+        except _STATE_READ_ERRORS:
             # Post DID succeed. We cannot safely persist the reported_at
             # mark because we cannot read the current state (and blindly
             # saving would either lose concurrent updates or paint over

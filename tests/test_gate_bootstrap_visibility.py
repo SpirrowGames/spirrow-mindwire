@@ -743,6 +743,29 @@ def test_file_state_store_load_propagates_json_decode_error(tmp_path: Path) -> N
         store.load()
 
 
+def test_file_state_store_load_propagates_unicode_decode_error(tmp_path: Path) -> None:
+    """PR #209 blocking (round 4, store level): invalid UTF-8 bytes propagate.
+
+    A state file whose bytes are not valid UTF-8 (an OS-level crash
+    mid-write, manual tampering, disk corruption) must raise
+    ``UnicodeDecodeError`` out of ``load()`` — the same shape as the
+    OSError / JSONDecodeError propagation. This is the store-level pin
+    for the invariant checked at the visibility-integration level by
+    ``test_visibility_survives_unicode_decode_error_in_state_file``.
+
+    Bytes ``\\xff\\xfe...`` are chosen because ``\\xff`` is illegal as a
+    UTF-8 start byte, so ``read_text(encoding="utf-8")`` fails
+    immediately with ``UnicodeDecodeError`` — the exact class the
+    PR-gate flagged as bypassing ``except OSError``.
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe not valid utf-8 bytes")
+    store = FileFailureStateStore(path)
+    with pytest.raises(UnicodeDecodeError):
+        store.load()
+
+
 # --- PR-gate #209 advisory #3 regression: atomic save must use a unique temp file --------------
 
 
@@ -987,3 +1010,104 @@ async def test_post_success_when_reload_after_await_fails(tmp_path: Path) -> Non
     assert "floor from" in report.reason  # cites the still-effective 24h floor
     # And the post itself was really attempted.
     assert len(mcp.post_calls()) == 1
+
+
+# --- PR-gate #209 blocking round-4 regression: UnicodeDecodeError never raises to caller ------
+
+
+@pytest.mark.anyio
+async def test_visibility_survives_unicode_decode_error_in_state_file(tmp_path: Path) -> None:
+    """PR #209 gate round-4 blocking: invalid UTF-8 in state file must NOT crash the tick.
+
+    The module docstring pins as an invariant: "The visibility path
+    never raises to its caller." Before this fix, the ``except``
+    clauses in ``on_close_failure`` / ``on_close_success`` named
+    ``(OSError, json.JSONDecodeError)`` — neither of which catches
+    ``UnicodeDecodeError`` (which inherits from ``ValueError``, not
+    ``OSError``). A state file with invalid UTF-8 bytes therefore
+    raised ``UnicodeDecodeError`` straight out of the visibility
+    module and up to the tick's top-level guard, crashing the
+    (best-effort) side channel.
+
+    This test writes an invalid-UTF-8 state file to disk, then drives
+    ``on_close_failure`` through a real ``FileFailureStateStore`` and
+    asserts:
+
+      1. no exception propagates out of ``on_close_failure``;
+      2. the returned ``action`` is ``state_read_failed``
+         (the same fail-closed verdict as the OSError /
+         JSONDecodeError cases — the caller shouldn't need to know
+         which sub-class of read-failure occurred);
+      3. no post attempt is made (fail-closed);
+      4. the invalid-UTF-8 state file is bit-for-bit unchanged (the
+         mechanism refuses to save because refusing-to-post means
+         refusing to record an attempt).
+
+    Assertion (4) is the load-bearing one — a regression that
+    "helpfully" swallowed the ``UnicodeDecodeError`` and then saved
+    empty state would overwrite the (corrupted-but-present) file with
+    a partial view, silently erasing whatever data was there.
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    # Invalid UTF-8: 0xff is illegal as a UTF-8 start byte.
+    pre_bytes = b"\xff\xfe some invalid utf-8 bytes"
+    path.write_bytes(pre_bytes)
+
+    store = FileFailureStateStore(path)
+    mcp = _RecordingMcp()
+    vis = CloseFailureVisibility(store)
+
+    # (1) Must not raise. If it did, this line would propagate the
+    # exception and fail the test with a traceback instead of an
+    # assertion — either way the invariant would be visibly broken.
+    report = await vis.on_close_failure(
+        mcp,
+        project="spirrow-verimend",
+        thread_id=thread_id_for("spirrow-verimend"),
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("close refusal"),
+    )
+
+    # (2) The verdict is fail-closed on the read error.
+    assert report.action == "state_read_failed", (
+        f"expected state_read_failed on invalid-UTF-8 state file; "
+        f"got action={report.action!r} reason={report.reason!r}"
+    )
+    # And the reason names the class so the operator can diagnose.
+    assert "UnicodeDecodeError" in report.reason
+
+    # (3) No post attempted (fail-closed: cannot rate-limit ⇒ do not send).
+    assert mcp.post_calls() == []
+
+    # (4) THE load-bearing invariant: the corrupt file is unchanged.
+    # A regression that "helpfully" swallowed UnicodeDecodeError and
+    # then saved empty state would replace these bytes with a JSON
+    # object — this assertion catches that class of erasure.
+    assert path.read_bytes() == pre_bytes
+
+
+@pytest.mark.anyio
+async def test_on_close_success_survives_unicode_decode_error_in_state_file(tmp_path: Path) -> None:
+    """The synchronous counterpart to the on_close_failure test above.
+
+    ``on_close_success`` also swallows read failures — but it takes no
+    ``exc`` argument and has a smaller failure surface, so this test
+    is minimal: prove that the same invalid-UTF-8 state file does not
+    raise out of ``on_close_success`` either. Regression form matches
+    the async test to make the two paths visibly symmetric.
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe invalid utf-8")
+
+    store = FileFailureStateStore(path)
+    vis = CloseFailureVisibility(store)
+
+    # Must not raise.
+    vis.on_close_success(
+        project="spirrow-verimend",
+        thread_id=thread_id_for("spirrow-verimend"),
+    )
+    # File is unchanged (no partial overwrite).
+    assert path.read_bytes() == b"\xff\xfe invalid utf-8"
