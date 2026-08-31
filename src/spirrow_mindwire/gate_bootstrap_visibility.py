@@ -182,6 +182,29 @@ from .magickit.client import McpToolCaller
 # 24h / 5min = 288 ticks from this value and asserts exactly one attempt.
 FAILURE_REPORT_FLOOR = timedelta(hours=24)
 
+
+class StateFileMalformedError(ValueError):
+    """The state file was parseable as JSON but is semantically malformed.
+
+    Distinct from :class:`json.JSONDecodeError` (which is raised by the
+    JSON parser itself) so a reader can tell "the bytes are not JSON"
+    from "the JSON has valid syntax but the schema is wrong". Both
+    collapse to the same fail-closed behaviour at the caller (see
+    :data:`_STATE_READ_ERRORS`), but the operator diagnosing a state
+    file needs the distinction.
+
+    Introduced in the PR #209 gate round 5 blocking #2 fix: the earlier
+    ``_decode_state`` silently skipped malformed entries via
+    ``contextlib.suppress(KeyError, TypeError)``. On the next save that
+    partial view would be written back and the malformed data
+    permanently erased — the exact "paint over corruption" failure the
+    :class:`FileFailureStateStore` docstring explicitly forbids.
+    Raising this error propagates to the caller, which fails closed
+    (refuses to post AND refuses to save), preserving the file on disk
+    for a human to inspect.
+    """
+
+
 # All exception classes a state read can raise, as one tuple. Centralised so
 # a future addition (a store variant that talks to a network filesystem, a
 # new corruption mode) lands in ONE place and every ``except`` site picks it
@@ -203,17 +226,28 @@ FAILURE_REPORT_FLOOR = timedelta(hours=24)
 #   * ``json.JSONDecodeError`` — bytes decoded successfully but the payload
 #     is not valid JSON, or the top-level shape is not a JSON object
 #     (see the raise in ``FileFailureStateStore.load``).
+#   * :class:`StateFileMalformedError` — JSON parsed but the schema is
+#     wrong: a required field missing, a value of the wrong type, an
+#     ``episodes`` value that is not a JSON object, etc. Distinct from
+#     ``JSONDecodeError`` so a reader can tell "not JSON" from "wrong
+#     schema", but collapses to the same fail-closed handling. Added
+#     in PR #209 gate round 5 blocking #2 — the earlier
+#     ``_decode_state`` swallowed schema drift via
+#     ``contextlib.suppress(KeyError, TypeError)`` and the next save
+#     would erase the malformed data.
 #
-# All three mean "the store cannot present readable state right now" and
+# All four mean "the store cannot present readable state right now" and
 # collapse into the same fail-closed behaviour at the caller: refuse to
 # post and refuse to save. Do NOT widen this to ``Exception`` — a
-# programming bug in ``_decode_state`` must still surface as a real crash,
-# because silencing it here would exactly re-create the F-1 pattern this
-# whole PR exists to close.
+# programming bug in ``_decode_state`` (e.g. an ``AttributeError`` from
+# a code path that assumes an attribute that doesn't exist) must still
+# surface as a real crash, because silencing it here would exactly
+# re-create the F-1 pattern this whole PR exists to close.
 _STATE_READ_ERRORS: tuple[type[BaseException], ...] = (
     OSError,
     UnicodeDecodeError,
     json.JSONDecodeError,
+    StateFileMalformedError,
 )
 
 # The magickit post-message tool the failure report is sent through. Named
@@ -369,10 +403,18 @@ class FileFailureStateStore:
     floor and episode records. Do not restore the previous silent
     fallback.
 
-    ``json.JSONDecodeError`` and "top-level not a dict" are also
-    propagated (as errors) for the same reason: a corrupt file must not
-    be treated as "no file" during write-back, because the write-back
-    would then paint over the corruption with a partial view.
+    ``json.JSONDecodeError``, "top-level not a dict", AND
+    :class:`StateFileMalformedError` (raised by :func:`_decode_state`
+    on schema drift — missing required key, wrong value type, an
+    ``episodes`` value that is not a JSON object, etc.) are also
+    propagated for the same reason: a corrupt file must not be treated
+    as "no file" during write-back, because the write-back would then
+    paint over the corruption with a partial view. PR #209 gate round
+    5 blocking #2 caught the exact silent-drop failure that motivated
+    ``StateFileMalformedError``: the earlier ``_decode_state`` used
+    ``contextlib.suppress(KeyError, TypeError)`` around each entry and
+    quietly omitted malformed ones, and the next save erased them
+    permanently.
 
     **Save atomicity (PR #209 gate-feedback fix — advisory #3):**
     Written to a unique per-process temp file via
@@ -382,6 +424,18 @@ class FileFailureStateStore:
     (the tick is currently invoked once per project by the sweep
     wrapper, which is sequential today — but the atomic-write contract
     should not assume that).
+
+    **Cleanup on ANY save-path failure (PR #209 gate round 5 blocking
+    #1):** the try/except in :meth:`save` spans the entire tempfile
+    lifecycle — creation, ``fd.write``, close on exit from the
+    ``with`` block, AND ``os.replace``. An earlier version wrapped
+    only ``os.replace``, so a mid-``fd.write`` failure (disk full,
+    quota exceeded) left an orphan ``.tmp`` behind that
+    ``delete=False`` never cleaned up. The current implementation
+    catches ``BaseException`` (not just ``Exception``) so
+    ``KeyboardInterrupt`` and ``SystemExit`` also trigger cleanup —
+    leaving a stale temp file on Ctrl-C would accumulate across
+    operator sessions.
     """
 
     def __init__(self, path: Path) -> None:
@@ -419,35 +473,97 @@ class FileFailureStateStore:
         # ``delete=False`` because we hand ownership to ``os.replace``.
         # ``dir=`` keeps the temp on the same filesystem so
         # ``os.replace`` is a rename, not a cross-filesystem copy.
+        #
+        # Cleanup scope (PR #209 gate round 5 blocking #1): the
+        # try/except spans the ENTIRE tempfile lifecycle — creation,
+        # ``fd.write``, close on exit from the ``with`` block, and the
+        # subsequent ``os.replace``. An earlier version wrapped only
+        # ``os.replace`` in try/except, so a mid-write ``OSError``
+        # (disk full, quota exceeded, filesystem going read-only) left
+        # the temp file on disk with ``delete=False`` and no cleanup
+        # ever ran. ``tmp_path`` is threaded via a local so we can
+        # unlink it regardless of which step raised — including a
+        # ``NamedTemporaryFile`` call that succeeds in creating the
+        # file but whose returned wrapper never enters the ``with``
+        # block (would require an interpreter-level bug, but the
+        # ``if tmp_path is not None`` guard costs nothing).
         encoded = _encode_state(state)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="",
-            dir=str(self._path.parent),
-            prefix=self._path.name + ".",
-            suffix=".tmp",
-            delete=False,
-        ) as fd:
-            tmp_path = Path(fd.name)
-            fd.write(encoded)
+        tmp_path: Path | None = None
         try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="",
+                dir=str(self._path.parent),
+                prefix=self._path.name + ".",
+                suffix=".tmp",
+                delete=False,
+            ) as fd:
+                tmp_path = Path(fd.name)
+                fd.write(encoded)
+            # File is now closed. Rename it into place.
             os.replace(tmp_path, self._path)
-        except Exception:
-            # Clean up the orphaned temp file on any failure between
-            # write and replace, so a repeated write failure does not
-            # accumulate stale tmp files forever.
-            with contextlib.suppress(OSError):
-                tmp_path.unlink()
+        except BaseException:
+            # Any failure — inside the ``with`` (write / close /
+            # tempfile creation) or on ``os.replace`` — must unlink
+            # the temp file if one was created, then propagate. Do
+            # NOT swallow the underlying exception. ``BaseException``
+            # (rather than ``Exception``) so that KeyboardInterrupt
+            # and SystemExit ALSO trigger cleanup — leaving a stale
+            # temp file on Ctrl-C would accumulate across operator
+            # sessions.
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
             raise
 
 
 def _decode_state(data: Mapping[str, Any]) -> _State:
+    """Decode the whole state document — raise on ANY schema drift.
+
+    The earlier version used ``contextlib.suppress(KeyError, TypeError)``
+    around each entry decode, which silently dropped malformed entries.
+    On the next :meth:`FileFailureStateStore.save` call that partial
+    view would be written back and the malformed data permanently
+    erased — the exact "paint over corruption" failure the store
+    docstring forbids. PR #209 gate round 5 blocking #2 caught it.
+
+    Fix: any deviation from the expected schema — missing required key,
+    wrong value type, wrong container type — raises
+    :class:`StateFileMalformedError`, which is in
+    :data:`_STATE_READ_ERRORS` and so causes the caller to fail closed
+    (refuse to post AND refuse to save). The corrupt file stays on
+    disk for a human to inspect.
+
+    Empty state remains valid: ``{"episodes": {}, "floors": {}}`` (or
+    missing keys, since we default to ``{}``) is a legitimate
+    fresh-install shape. What is NOT tolerated is a present-but-broken
+    entry inside those maps.
+    """
+    episodes = _decode_episodes(data.get("episodes", {}))
+    floors = _decode_floors(data.get("floors", {}))
+    return _State(episodes=episodes, floors=floors)
+
+
+def _decode_episodes(raw: Any) -> dict[str, FailureEpisode]:
+    """Decode the ``episodes`` section — raise on ANY schema drift.
+
+    See :func:`_decode_state` for the "why not silently drop" rationale.
+    """
+    if not isinstance(raw, Mapping):
+        raise StateFileMalformedError(f"'episodes' is not a JSON object (got {type(raw).__name__})")
     episodes: dict[str, FailureEpisode] = {}
-    for project, entry in (data.get("episodes") or {}).items():
-        if not isinstance(project, str) or not isinstance(entry, Mapping):
-            continue
-        with contextlib.suppress(KeyError, TypeError):
+    for project, entry in raw.items():
+        if not isinstance(project, str):
+            raise StateFileMalformedError(
+                f"episode key {project!r} is not a string (got {type(project).__name__})"
+            )
+        if not isinstance(entry, Mapping):
+            raise StateFileMalformedError(
+                f"episode entry for project {project!r} is not a JSON object "
+                f"(got {type(entry).__name__})"
+            )
+        try:
             episodes[project] = FailureEpisode(
                 project=project,
                 thread_id=str(entry["thread_id"]),
@@ -457,16 +573,43 @@ def _decode_state(data: Mapping[str, Any]) -> _State:
                     str(entry["reported_at"]) if entry.get("reported_at") is not None else None
                 ),
             )
+        except (KeyError, TypeError) as exc:
+            raise StateFileMalformedError(
+                f"episode entry for project {project!r} is malformed ({type(exc).__name__}: {exc})"
+            ) from exc
+    return episodes
+
+
+def _decode_floors(raw: Any) -> dict[str, RateLimitFloor]:
+    """Decode the ``floors`` section — raise on ANY schema drift.
+
+    Symmetric to :func:`_decode_episodes`. Separate function per
+    section keeps the error messages precise about which top-level key
+    the drift is under.
+    """
+    if not isinstance(raw, Mapping):
+        raise StateFileMalformedError(f"'floors' is not a JSON object (got {type(raw).__name__})")
     floors: dict[str, RateLimitFloor] = {}
-    for project, entry in (data.get("floors") or {}).items():
-        if not isinstance(project, str) or not isinstance(entry, Mapping):
-            continue
-        with contextlib.suppress(KeyError, TypeError):
+    for project, entry in raw.items():
+        if not isinstance(project, str):
+            raise StateFileMalformedError(
+                f"floor key {project!r} is not a string (got {type(project).__name__})"
+            )
+        if not isinstance(entry, Mapping):
+            raise StateFileMalformedError(
+                f"floor entry for project {project!r} is not a JSON object "
+                f"(got {type(entry).__name__})"
+            )
+        try:
             floors[project] = RateLimitFloor(
                 project=project,
                 last_attempt_at=str(entry["last_attempt_at"]),
             )
-    return _State(episodes=episodes, floors=floors)
+        except (KeyError, TypeError) as exc:
+            raise StateFileMalformedError(
+                f"floor entry for project {project!r} is malformed ({type(exc).__name__}: {exc})"
+            ) from exc
+    return floors
 
 
 def _encode_state(state: _State) -> str:
@@ -859,6 +1002,7 @@ __all__ = [
     "FailureStateStore",
     "FileFailureStateStore",
     "RateLimitFloor",
+    "StateFileMalformedError",
     "VisibilityReport",
     "visibility_state_path",
 ]

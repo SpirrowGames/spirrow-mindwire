@@ -63,6 +63,7 @@ from spirrow_mindwire.gate_bootstrap_visibility import (
     FailureEpisode,
     FileFailureStateStore,
     RateLimitFloor,
+    StateFileMalformedError,
     _State,
 )
 
@@ -1111,3 +1112,245 @@ async def test_on_close_success_survives_unicode_decode_error_in_state_file(tmp_
     )
     # File is unchanged (no partial overwrite).
     assert path.read_bytes() == b"\xff\xfe invalid utf-8"
+
+
+# --- PR-gate #209 blocking round-5 #1 regression: mid-write failure must not leak tmp ---------
+
+
+def test_file_state_store_cleans_up_temp_on_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #209 gate round-5 blocking #1: fd.write failure inside the ``with`` block.
+
+    Before this fix, the ``try/except`` in :meth:`FileFailureStateStore.save`
+    wrapped ONLY the ``os.replace`` call. If ``fd.write`` raised inside
+    the ``NamedTemporaryFile(...)`` ``with`` block (disk full, quota,
+    filesystem going read-only), the exception propagated out — past
+    the cleanup code — leaving an orphan ``.tmp`` file on disk that
+    ``delete=False`` never removed. The existing
+    ``test_file_state_store_cleans_up_temp_on_replace_failure`` did not
+    catch this because it only mocked ``os.replace``.
+
+    This test intercepts ``NamedTemporaryFile`` to create a REAL temp
+    file (so we can verify cleanup on disk) but wraps its ``.write``
+    method to raise ``OSError``, mimicking a mid-write disk failure.
+    The load-bearing assertion is that after the exception, no
+    ``.tmp`` files remain in the state directory.
+    """
+    import tempfile as tempfile_mod
+
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    store = FileFailureStateStore(path)
+
+    real_ntf = tempfile_mod.NamedTemporaryFile
+    created_paths: list[Path] = []
+
+    def failing_write(_data: str) -> int:
+        raise OSError("simulated disk-full during write")
+
+    def failing_ntf(*args: Any, **kwargs: Any) -> Any:
+        fd = real_ntf(*args, **kwargs)
+        created_paths.append(Path(fd.name))
+        # Assigning to fd.write replaces the bound method on this
+        # instance only; other tests / production code paths that use
+        # NamedTemporaryFile are unaffected. ``type: ignore`` covers
+        # the whole assignment — mypy's overloaded ``write`` signature
+        # disagrees with our simple ``str -> int`` shape (which is all
+        # we exercise here), and the ``method-assign`` code alone
+        # doesn't cover the shape mismatch.
+        fd.write = failing_write  # type: ignore[assignment,method-assign]
+        return fd
+
+    monkeypatch.setattr(tempfile_mod, "NamedTemporaryFile", failing_ntf)
+
+    with pytest.raises(OSError, match="simulated disk-full"):
+        store.save(_State())
+
+    # Load-bearing assertions:
+    assert created_paths, (
+        "test setup: NamedTemporaryFile was not called; the test is not "
+        "exercising the code path it claims to"
+    )
+    # (1) Every tmp path that was created has been unlinked by the
+    #     cleanup block. A regression that reintroduced the narrow
+    #     wrapping around ``os.replace`` alone would fail this: the
+    #     tmp file would still exist because the exception propagated
+    #     before the cleanup code was reached.
+    for p in created_paths:
+        assert not p.exists(), (
+            f"orphan temp file after write failure: {p} — the try/except in "
+            f"FileFailureStateStore.save does not cover fd.write "
+            f"(PR #209 round-5 blocking #1 regression)"
+        )
+    # (2) Belt AND braces: no .tmp under the state dir at all.
+    leftover = list(path.parent.glob("*.tmp"))
+    assert leftover == [], f"orphan .tmp files remain: {leftover}"
+
+
+# --- PR-gate #209 blocking round-5 #2 regression: malformed entries must NOT be silently dropped
+
+
+def test_file_state_store_load_raises_on_malformed_episode_entry(tmp_path: Path) -> None:
+    """PR #209 gate round-5 blocking #2 (store level): malformed entry propagates.
+
+    Before this fix, ``_decode_state`` wrapped each entry construction
+    in ``contextlib.suppress(KeyError, TypeError)`` and silently
+    dropped malformed entries. If ``load()`` returned a partial view
+    and the caller then ``save()``-ed, the dropped entry would be
+    permanently erased — the "paint over corruption" failure the
+    ``FileFailureStateStore`` docstring explicitly forbids.
+
+    This test writes a state file with a well-formed bystander entry
+    PLUS a malformed episode (missing the required ``thread_id`` key)
+    and asserts that ``load()`` raises :class:`StateFileMalformedError`.
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    # Well-formed bystander + malformed target (missing thread_id).
+    path.write_text(
+        json.dumps(
+            {
+                "episodes": {
+                    "spirrow-magickit": {
+                        "thread_id": "T-gate-bootstrap-spirrow-magickit",
+                        "signature": "GateBootstrapCloseError",
+                        "first_seen_at": "2026-08-30T00:00:00+00:00",
+                        "reported_at": "2026-08-30T00:00:00+00:00",
+                    },
+                    "spirrow-verimend": {
+                        # thread_id INTENTIONALLY missing — schema drift.
+                        "signature": "GateBootstrapCloseError",
+                        "first_seen_at": "2026-08-31T00:00:00+00:00",
+                    },
+                },
+                "floors": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = FileFailureStateStore(path)
+    with pytest.raises(StateFileMalformedError, match="thread_id"):
+        store.load()
+
+
+def test_file_state_store_load_raises_on_malformed_floor_entry(tmp_path: Path) -> None:
+    """PR #209 gate round-5 blocking #2 (store level, floors section).
+
+    Symmetric to the episode test above but drives the ``floors``
+    branch of ``_decode_state``. Kept as a separate test so a future
+    refactor cannot accidentally regress one section while the other
+    stays green.
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "episodes": {},
+                "floors": {
+                    "spirrow-verimend": {
+                        # last_attempt_at INTENTIONALLY missing.
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = FileFailureStateStore(path)
+    with pytest.raises(StateFileMalformedError, match="last_attempt_at"):
+        store.load()
+
+
+def test_file_state_store_load_raises_on_non_object_episodes_section(tmp_path: Path) -> None:
+    """Container-level schema drift: ``episodes`` is a list, not a dict.
+
+    Kept because the section-container check is a distinct branch
+    from the per-entry check above. A regression that drops the
+    ``isinstance(..., Mapping)`` guard would fail this test with
+    an ``AttributeError`` (list has no ``.items()``) instead of the
+    expected fail-closed ``StateFileMalformedError``.
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"episodes": ["not", "a", "dict"], "floors": {}}),
+        encoding="utf-8",
+    )
+    store = FileFailureStateStore(path)
+    with pytest.raises(StateFileMalformedError, match="episodes"):
+        store.load()
+
+
+@pytest.mark.anyio
+async def test_malformed_entry_does_not_erase_state_file(tmp_path: Path) -> None:
+    """PR #209 gate round-5 blocking #2 (integration): fail-closed preserves corrupt bytes.
+
+    The store-level tests above pin that ``load()`` propagates
+    :class:`StateFileMalformedError`. This test drives the full
+    integration: with a state file whose bytes ARE valid JSON but
+    contain a malformed episode entry, ``on_close_failure`` must
+    return ``state_read_failed`` AND leave the on-disk bytes unchanged.
+
+    A regression that reintroduced ``contextlib.suppress(KeyError,
+    TypeError)`` in ``_decode_state`` would fail this test in a
+    specific way: ``load()`` returns a partial view (well-formed
+    entries only), ``on_close_failure`` passes the floor/dedup checks
+    against that partial view, and the subsequent write-ahead
+    ``save()`` writes the partial view back — erasing the malformed
+    entry permanently. The on-disk bytes-equal assertion catches
+    that exactly.
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    pre_bytes = json.dumps(
+        {
+            "episodes": {
+                "spirrow-magickit": {
+                    "thread_id": "T-gate-bootstrap-spirrow-magickit",
+                    "signature": "GateBootstrapCloseError",
+                    "first_seen_at": "2026-08-30T00:00:00+00:00",
+                    "reported_at": "2026-08-30T00:00:00+00:00",
+                },
+                "spirrow-corrupted": {
+                    # Malformed on purpose.
+                    "signature": "GateBootstrapCloseError",
+                },
+            },
+            "floors": {
+                "spirrow-magickit": {
+                    "last_attempt_at": "2026-08-30T00:00:00+00:00",
+                },
+            },
+        }
+    ).encode("utf-8")
+    path.write_bytes(pre_bytes)
+
+    store = FileFailureStateStore(path)
+    mcp = _RecordingMcp()
+    vis = CloseFailureVisibility(store)
+
+    report = await vis.on_close_failure(
+        mcp,
+        project="spirrow-verimend",
+        thread_id=thread_id_for("spirrow-verimend"),
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("close refusal"),
+    )
+
+    # Fail-closed verdict.
+    assert report.action == "state_read_failed"
+    assert "StateFileMalformedError" in report.reason
+    # No post attempted (fail-closed).
+    assert mcp.post_calls() == []
+    # THE load-bearing assertion: file is BIT-FOR-BIT unchanged.
+    # A regression that silently dropped ``spirrow-corrupted`` and
+    # then saved would either (a) rewrite the file with only the
+    # well-formed entries or (b) write our new floor plus the
+    # well-formed entries — either way ``path.read_bytes()`` would
+    # differ from ``pre_bytes``.
+    assert path.read_bytes() == pre_bytes, (
+        "on-disk state was modified after a malformed-entry read failure — "
+        "the fail-closed contract requires the corrupt file to be preserved "
+        "for a human to inspect (PR #209 round-5 blocking #2 regression)"
+    )
