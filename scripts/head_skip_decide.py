@@ -91,6 +91,22 @@ from spirrow_mindwire.conductor.head_skip import (
 )
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
+# Windows consoles default to legacy codepages (e.g. cp932) that cannot encode
+# non-ASCII characters this script's stderr messages carry (state-file parse
+# errors quote raw path bytes; head_skip reasons may contain em dashes).
+# Reconfigure the streams so print() cannot raise. The machine-read JSON on
+# stdout is separately hardened by ``ensure_ascii=True`` below (see per-call
+# comments): reconfigure alone is not sufficient because
+# ``errors="backslashreplace"`` emits astral characters as ``\Uxxxxxxxx`` -
+# not a JSON escape and would defeat the sweep wrapper's ``ConvertFrom-Json``.
+# See scripts/dogfood_smoke.py:42-45 for the same pattern.
+_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if _reconfigure is not None:
+    _reconfigure(encoding="utf-8", errors="backslashreplace")
+_reconfigure_err = getattr(sys.stderr, "reconfigure", None)
+if _reconfigure_err is not None:
+    _reconfigure_err(encoding="utf-8", errors="backslashreplace")
+
 
 async def _fetch_head_body(
     mcp: StreamableHttpChatroomMcp, project: str, thread_id: str
@@ -396,7 +412,12 @@ def _main_decide(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {"mode": args.mode, "verdicts": verdicts},
-            ensure_ascii=False,
+            # Machine-read output: emit ASCII-only so the sweep wrapper's
+            # ``ConvertFrom-Json`` can decode it under any stdout encoding.
+            # msg-2292 D-3: ``errors="backslashreplace"`` on the stream is
+            # not sufficient (produces ``\Uxxxxxxxx`` for astral chars,
+            # which is not a JSON string escape).
+            ensure_ascii=True,
         )
     )
     return 0
@@ -432,7 +453,9 @@ def _main_commit_launch(args: argparse.Namespace) -> int:
                 "thread_id": payload.get("thread_id", ""),
                 "record": record_to_json(new_record),
             },
-            ensure_ascii=False,
+            # Machine-read output — see comment on the decide-mode print
+            # above (msg-2292 D-3).
+            ensure_ascii=True,
         )
     )
     return 0

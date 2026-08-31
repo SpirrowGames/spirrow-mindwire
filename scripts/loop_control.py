@@ -32,6 +32,20 @@ from typing import Any
 
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
+# Windows consoles default to legacy codepages (e.g. cp932) that cannot encode
+# non-ASCII characters that may appear in the ``observed_state`` field or the
+# exception message on the stderr fail-open path. Reconfigure so print()
+# cannot raise. The machine-read JSON on stdout is separately hardened by
+# ``ensure_ascii=True`` below (msg-2292 D-3 — reconfigure alone emits
+# ``\Uxxxxxxxx`` for astral chars, which is not a JSON escape). See
+# scripts/dogfood_smoke.py:42-45 for the same pattern.
+_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if _reconfigure is not None:
+    _reconfigure(encoding="utf-8", errors="backslashreplace")
+_reconfigure_err = getattr(sys.stderr, "reconfigure", None)
+if _reconfigure_err is not None:
+    _reconfigure_err(encoding="utf-8", errors="backslashreplace")
+
 
 async def fetch_control(project: str, url: str | None) -> dict[str, Any]:
     mcp = StreamableHttpChatroomMcp(url)
@@ -61,7 +75,10 @@ def main() -> int:
         print(f"loop_control: probe failed: {exc}", file=sys.stderr)
         return 1
 
-    print(json.dumps(state, ensure_ascii=False))
+    # Machine-read JSON: emit ASCII-only so the sweep wrapper's
+    # ``ConvertFrom-Json`` can decode it under any stdout encoding
+    # (msg-2292 D-3).
+    print(json.dumps(state, ensure_ascii=True))
     return 0
 
 
