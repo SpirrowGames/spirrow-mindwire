@@ -2023,69 +2023,91 @@ def test_d_divergence_notice_never_names_the_missing_sub_reason() -> None:
     future edit that adds "(the parser hit multi-marker)" elsewhere in the notice would
     re-open the same oracle and must red-build here.
 
-    The pin is EXHAUSTIVE over ``forbidden_substrings``: each of the five sub-cause values
-    of :class:`ObjectionMissingReason` (``no-marker`` / ``multi-marker`` / ``prose-between``
-    / ``bad-json`` / ``not-a-list``) is exercised by at least one case, so a future change
-    that renames one enum value without updating the notice-render code (or vice versa)
-    would slip past a coverage gap. This exhaustiveness is what msg-2262 (PR #207 gate
-    finding) named as the ``untested`` defect on the prior version of the test.
+    The pin is EXHAUSTIVE over ``forbidden_substrings``, and does so BY CONSTRUCTION rather
+    than by hand-maintained enumeration: ``forbidden_substrings`` is derived at test-run
+    time from ``ObjectionMissingReason`` itself, so adding a new enum value automatically
+    forbids it in the notice — and renaming an existing value automatically updates what
+    the test looks for. This closes the drift failure mode msg-2271 named as the
+    ``correctness`` block on the round-1 fix (a hand-maintained list only pinned the enum
+    for ``NOT_A_LIST``; the other four were vulnerable to a rename that would
+    ``false-pass`` the loop). msg-2262 (PR #207 round-1 gate finding) had named the
+    prior version's ``untested`` defect on ``not-a-list``; msg-2271 broadened that to
+    "the same protection must cover the whole enum, not just one value".
+
+    Every enum value is exercised by at least one decision (four reachable via real
+    critique bodies; two — ``NOT_A_LIST`` and ``PRINCIPLES_ERROR`` — synthesized via
+    ``dataclasses.replace``, both being structurally unreachable from a critique body
+    the current parser accepts). The loop below checks the notice against every forbidden
+    substring for every decision, so the coverage matrix is
+    ``len(enum) * (len(enum) + 1)``.
     """
     from dataclasses import replace
 
     from spirrow_mindwire.naysayer.pr_review import ObjectionReport, VerdictDecision
 
     view = _make_view(_DIFF_WARN_THRESHOLD - 1)
-    forbidden_substrings = (
+    # Enum-derived: the forbidden list stays in lock-step with the enum by construction,
+    # not by hand-maintenance. Adding a value adds a check; renaming a value updates the
+    # check. This is msg-2271's directly proposed remediation for the round-1 correctness
+    # defect ("後者なら「列挙の更新漏れ」という失敗モード自体が消えます").
+    forbidden_substrings: tuple[str, ...] = (
         "missing_reason",
-        # The five sub-cause strings themselves (from ObjectionMissingReason.value):
-        "no-marker",
-        "multi-marker",
-        "prose-between",
-        "bad-json",
-        "not-a-list",
+        *(e.value for e in ObjectionMissingReason),
     )
     # Four causes are reachable from a real critique body; drive them through
-    # ``parse_objections`` the way the driver does.
+    # ``parse_objections`` the way the driver does. Keys are the enum ``.value`` strings
+    # so the "every enum value has a decision" assertion below is a plain set-equality.
     input_cases = {
-        "prose-between": (
+        ObjectionMissingReason.PROSE_BETWEEN.value: (
             f"{_OBJECTIONS_SENTINEL}\nHere are my objections:\n[]\n\nVERDICT: APPROVE"
         ),
-        "multi-marker": (
+        ObjectionMissingReason.MULTI_MARKER.value: (
             f"{_OBJECTIONS_SENTINEL}\n[]\n\nprose\n\n{_OBJECTIONS_SENTINEL}\n[]\n\nVERDICT: APPROVE"
         ),
-        "no-marker": "no blocking problems\n\nVERDICT: APPROVE",
-        "bad-json": f"{_OBJECTIONS_SENTINEL}\n[not json\n\nVERDICT: APPROVE",
+        ObjectionMissingReason.NO_MARKER.value: "no blocking problems\n\nVERDICT: APPROVE",
+        ObjectionMissingReason.BAD_JSON.value: (
+            f"{_OBJECTIONS_SENTINEL}\n[not json\n\nVERDICT: APPROVE"
+        ),
     }
     decisions: dict[str, VerdictDecision] = {
         label: decide_verdict(body, view=view, finish_reason="stop")
         for label, body in input_cases.items()
     }
-    # ``not-a-list`` is the fifth cause and CANNOT be reached from any critique body the
+    # ``NOT_A_LIST`` and ``PRINCIPLES_ERROR`` CANNOT be reached from any critique body the
     # parser accepts today: ``parse_objections`` only calls ``raw_decode`` after D-3 has
     # confirmed the payload's first non-whitespace char is ``[``, so ``parsed`` is always
-    # a list — ``test_missing_reason_covers_five_disjoint_causes`` documents the same
-    # observation on the parser side. But the security invariant the notice must uphold
-    # is stronger than what the parser can produce today: a future relaxation of D-3 that
-    # made ``NOT_A_LIST`` reachable must not thereby leak a sub-cause oracle through the
-    # posted notice. Synthesize the decision directly rather than fake a valid-JSON input
-    # that structurally cannot exist. Any MISSING seed will do — swap the ``missing_reason``
-    # field via ``dataclasses.replace`` (both dataclasses are frozen; see
-    # ``test_verdict_decision_is_immutable``) so the constructed decision exercises the
-    # same ``render_gate_notice`` MISSING branch the other cases do.
-    seed = decisions["bad-json"]
-    not_a_list_report: ObjectionReport = replace(
-        seed.objections, missing_reason=ObjectionMissingReason.NOT_A_LIST
+    # a list; and ``principles_error`` fires only if the vocabulary load itself raises,
+    # which the runtime doesn't do in a well-formed workspace. But the security invariant
+    # the notice must uphold is stronger than what the parser can produce today: a future
+    # relaxation of D-3 that made these reachable must not thereby leak a sub-cause
+    # oracle through the posted notice. Synthesize the decisions directly rather than
+    # fake inputs that structurally cannot exist. Any MISSING seed will do — swap the
+    # ``missing_reason`` field via ``dataclasses.replace`` (both dataclasses are frozen;
+    # see ``test_verdict_decision_is_immutable``) so the constructed decisions exercise
+    # the same ``render_gate_notice`` MISSING branch the other cases do.
+    seed = decisions[ObjectionMissingReason.BAD_JSON.value]
+    for synthetic_reason in (
+        ObjectionMissingReason.NOT_A_LIST,
+        ObjectionMissingReason.PRINCIPLES_ERROR,
+    ):
+        report: ObjectionReport = replace(seed.objections, missing_reason=synthetic_reason)
+        decisions[synthetic_reason.value] = replace(seed, objections=report)
+    # Belt-and-braces: (a) every enum value has a decision exercising it (the coverage
+    # invariant msg-2271 flagged as missing for the non-NOT_A_LIST values), and (b) every
+    # decision still carries MISSING (we only meant to swap the sub-reason, not the
+    # status). The set-equality on (a) means "add a new enum value → the loop below
+    # red-builds because there is no matching decision", closing the drift path from the
+    # opposite direction.
+    assert set(decisions) == {e.value for e in ObjectionMissingReason}, (
+        "coverage: every ObjectionMissingReason value must have a decision — a new "
+        "enum value without a matching case would leave that value unexercised"
     )
-    decisions["not-a-list"] = replace(seed, objections=not_a_list_report)
-    # Belt-and-braces: the synthetic decision must still carry MISSING (we only meant to
-    # swap the sub-reason, not the parse status), and the enum value must be exactly the
-    # string listed in ``forbidden_substrings`` — a rename of the enum without updating the
-    # list would silently pass the loop below.
-    assert decisions["not-a-list"].objections.status is ObjectionParse.MISSING
-    assert ObjectionMissingReason.NOT_A_LIST.value == "not-a-list"
-
     for label, decision in decisions.items():
         assert decision.objections.status is ObjectionParse.MISSING, label
+        assert decision.objections.missing_reason is not None, label
+        assert decision.objections.missing_reason.value == label, label
+
+    for label, decision in decisions.items():
         notice = render_gate_notice(decision)
         # The notice DOES still name that the block was missing — that fact is not the
         # oracle, only the specific sub-cause is. So the D-divergence marker must be present

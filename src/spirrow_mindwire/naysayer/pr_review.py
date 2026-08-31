@@ -515,13 +515,15 @@ class ObjectionMissingReason(Enum):
 
     Every value derives REQUEST_CHANGES identically — the derivation reads
     :class:`ObjectionParse.MISSING` and stops. This enum exists so the shadow log line
-    can name *which* MISSING cause fired, without which ``parse=missing`` is a black box
-    that folds three independent signals into one. **It is NOT surfaced on the posted
-    D-divergence notice** (msg-2212 §1 / msg-2213): the notice is readable to the model
-    whose diff is under review, and naming which parser wall it tripped gives that model
-    (or an attacker whose exploit is in the diff) a per-attempt oracle to hill-climb.
-    Rider 2 reads the sub-cause off the log line, which lives in the operator-side
-    channel and is not returned to the reviewed revision.
+    can name *which* MISSING cause fired, without which ``parse=missing`` is a black
+    box that folds the enum's sub-causes (currently six: ``no-marker`` / ``multi-marker``
+    / ``prose-between`` / ``bad-json`` / ``not-a-list`` / ``principles-error``) into one.
+    **It is NOT surfaced on the posted D-divergence notice** (msg-2212 §1 / msg-2213):
+    the notice is readable to the model whose diff is under review, and naming which
+    parser wall it tripped gives that model (or an attacker whose exploit is in the
+    diff) a per-attempt oracle to hill-climb. Rider 2 reads the sub-cause off the log
+    line, which lives in the operator-side channel and is not returned to the reviewed
+    revision.
 
     The two counters rider 2 was asked to instrument (msg-2130 §3) map to
     :attr:`MULTI_MARKER` (D-1 fired) and :attr:`PROSE_BETWEEN` (D-3 fired). The other
