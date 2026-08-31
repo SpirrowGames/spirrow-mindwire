@@ -32,19 +32,22 @@ from typing import Any
 
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
-# Windows consoles default to legacy codepages (e.g. cp932) that cannot encode
-# non-ASCII characters that may appear in the ``observed_state`` field or the
-# exception message on the stderr fail-open path. Reconfigure so print()
-# cannot raise. The machine-read JSON on stdout is separately hardened by
-# ``ensure_ascii=True`` below (msg-2292 D-3 — reconfigure alone emits
-# ``\Uxxxxxxxx`` for astral chars, which is not a JSON escape). See
-# scripts/dogfood_smoke.py:42-45 for the same pattern.
-_reconfigure = getattr(sys.stdout, "reconfigure", None)
-if _reconfigure is not None:
-    _reconfigure(encoding="utf-8", errors="backslashreplace")
+# Windows stdout defaults to a legacy codepage (e.g. cp932). The machine-read
+# JSON on stdout uses ``ensure_ascii=True`` below, so stdout is guaranteed
+# ASCII-only — no reconfiguration needed, and any reconfiguration to UTF-8
+# would in fact corrupt the operator's console by writing raw UTF-8 bytes
+# into a cp932 read path (PR #210 gate round-2).
+#
+# stderr is a separate concern: the fail-open ``print`` at line 75 may carry
+# an exception message with native text (a wrapped MCP payload, a localized
+# error string). Setting ``errors="backslashreplace"`` — WITHOUT overriding
+# the encoding — makes stderr incapable of raising while preserving native
+# console readability. The ``getattr`` guard exists because ``reconfigure``
+# is a ``TextIOWrapper`` method; see ``scripts/dogfood_smoke.py`` for the
+# same probe convention.
 _reconfigure_err = getattr(sys.stderr, "reconfigure", None)
 if _reconfigure_err is not None:
-    _reconfigure_err(encoding="utf-8", errors="backslashreplace")
+    _reconfigure_err(errors="backslashreplace")
 
 
 async def fetch_control(project: str, url: str | None) -> dict[str, Any]:

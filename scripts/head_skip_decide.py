@@ -91,21 +91,23 @@ from spirrow_mindwire.conductor.head_skip import (
 )
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
-# Windows consoles default to legacy codepages (e.g. cp932) that cannot encode
-# non-ASCII characters this script's stderr messages carry (state-file parse
-# errors quote raw path bytes; head_skip reasons may contain em dashes).
-# Reconfigure the streams so print() cannot raise. The machine-read JSON on
-# stdout is separately hardened by ``ensure_ascii=True`` below (see per-call
-# comments): reconfigure alone is not sufficient because
-# ``errors="backslashreplace"`` emits astral characters as ``\Uxxxxxxxx`` -
-# not a JSON escape and would defeat the sweep wrapper's ``ConvertFrom-Json``.
-# See scripts/dogfood_smoke.py:42-45 for the same pattern.
-_reconfigure = getattr(sys.stdout, "reconfigure", None)
-if _reconfigure is not None:
-    _reconfigure(encoding="utf-8", errors="backslashreplace")
+# Windows stdout defaults to a legacy codepage (e.g. cp932). The machine-read
+# JSON on stdout uses ``ensure_ascii=True`` on every ``json.dumps`` call, so
+# stdout is guaranteed ASCII-only — no reconfiguration needed, and any
+# reconfiguration to UTF-8 would in fact corrupt the operator's console by
+# writing raw UTF-8 bytes into a cp932 read path (PR #210 gate round-2).
+#
+# stderr is a separate concern: state-file parse errors quote raw path bytes,
+# head_skip reasons may contain em dashes, and a wrapped exception message may
+# carry native text. Setting ``errors="backslashreplace"`` — WITHOUT
+# overriding the encoding — makes ``print(..., file=sys.stderr)`` incapable of
+# raising while preserving the console's native readability for anything
+# encodable (Japanese path components stay legible in a cp932 console). The
+# ``getattr`` guard exists because ``reconfigure`` is a ``TextIOWrapper``
+# method; see ``scripts/dogfood_smoke.py`` for the same probe convention.
 _reconfigure_err = getattr(sys.stderr, "reconfigure", None)
 if _reconfigure_err is not None:
-    _reconfigure_err(encoding="utf-8", errors="backslashreplace")
+    _reconfigure_err(errors="backslashreplace")
 
 
 async def _fetch_head_body(

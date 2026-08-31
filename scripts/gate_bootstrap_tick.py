@@ -67,24 +67,31 @@ from spirrow_mindwire.magickit.client import (
     StreamableHttpChatroomMcp,
 )
 
-# Windows consoles default to legacy codepages (e.g. cp932) that cannot encode
-# non-ASCII characters that this script's ``reason`` field carries in the
-# ``MISSING`` / ``NEW_REPO`` / error branches (em dash from module strings).
-# Reconfigure covers stderr's traceback + any incidental print for a human
-# reader; the machine-read JSON on stdout is separately hardened by emitting
-# ``ensure_ascii=True`` below (see comment on the ``print`` calls). Both
-# defences matter: reconfigure alone is not sufficient because
-# ``errors="backslashreplace"`` emits astral characters as ``\Uxxxxxxxx``
-# (8 hex digits), which is not a JSON string escape and would defeat the
-# wrapper's ``ConvertFrom-Json``. Kept ``getattr``-guarded to satisfy mypy
-# (``reconfigure`` is a ``TextIOWrapper``-only method); the pattern is copied
-# verbatim from ``dogfood_smoke.py`` / ``naysayer_review.py`` / ``naysayer_review_scoped.py``.
-_reconfigure = getattr(sys.stdout, "reconfigure", None)
-if _reconfigure is not None:
-    _reconfigure(encoding="utf-8", errors="backslashreplace")
+# stdout on Windows defaults to a legacy codepage (e.g. cp932) that cannot
+# encode the U+2014 em dash carried in the ``MISSING`` / ``NEW_REPO`` / error
+# branch ``reason`` strings. The load-bearing fix is ``ensure_ascii=True`` on
+# every ``json.dumps`` call that writes to stdout (see the two ``print`` call
+# sites in ``main``): that emits pure ASCII (astral chars as ``\uXXXX``
+# surrogate pairs), which encodes safely under any terminal codepage AND
+# parses under PowerShell's ``ConvertFrom-Json``. No stdout reconfiguration
+# is needed — reconfiguring the stream to UTF-8 would in fact defeat the
+# operator's console by writing raw UTF-8 bytes into a cp932 read path,
+# rendering any encodable native text as mojibake (PR #210 gate round-2).
+#
+# stderr is a separate concern. The tick prints human-readable diagnostics
+# (``print(f"gate_bootstrap_tick: unhandled error: {exc!r}", file=sys.stderr)``
+# below) and Python's default traceback also lands there. An exception ``repr``
+# is normally ASCII, but a localized file path or a wrapped MCP payload can
+# carry native text that would crash a raw cp932 write. Setting
+# ``errors="backslashreplace"`` — WITHOUT overriding the encoding — leaves
+# encodable text untouched (Japanese in a path stays readable in the cp932
+# console) and escapes only the characters that would otherwise raise. The
+# ``getattr`` guard exists because ``reconfigure`` is a ``TextIOWrapper``
+# method and mypy needs the runtime probe; the same convention lives in
+# ``scripts/dogfood_smoke.py`` etc.
 _reconfigure_err = getattr(sys.stderr, "reconfigure", None)
 if _reconfigure_err is not None:
-    _reconfigure_err(encoding="utf-8", errors="backslashreplace")
+    _reconfigure_err(errors="backslashreplace")
 
 
 async def _run_tick(
@@ -204,17 +211,15 @@ def main(argv: list[str] | None = None) -> int:
         # The stdout is the wrapper's parse target; the stderr line is the
         # human-readable "why". Both are needed: the wrapper still gets a
         # JSON object with an error field, and the operator sees the trace.
-        # ``ensure_ascii=True`` is deliberate here (and on the success-path
-        # ``print`` below): the wrapper reads this line with
-        # ``ConvertFrom-Json``, and PowerShell's parser cannot decode
-        # ``\Uxxxxxxxx`` (8 hex digits) — which is what
-        # ``sys.stdout.reconfigure(errors="backslashreplace")`` would emit
-        # for an astral-plane code point in ``reason``. Making the JSON
-        # itself ASCII-safe removes any dependency on the stream encoding
-        # (msg-2292 D-3 endorsement: JSON standard supports ``\uXXXX`` and
-        # surrogate pairs only; ``ensure_ascii=True`` is the only robust
-        # guarantee for a machine-read JSON line over a stream with an
-        # unknown or legacy encoding).
+        # ``ensure_ascii=True`` is the load-bearing fix here (and on the
+        # success-path ``print`` below): the JSON becomes pure ASCII, which
+        # (a) encodes safely under any terminal codepage — including cp932,
+        # the branch that broke msg-2290 — and (b) parses cleanly under
+        # PowerShell's ``ConvertFrom-Json``, which is JSON-strict and rejects
+        # anything outside the ``\uXXXX`` escape (surrogate pairs included).
+        # No stream reconfiguration is used to defend stdout: it would only
+        # add a second, redundant defence AND corrupt the operator's console
+        # by writing raw UTF-8 bytes into a cp932 reader.
         print(
             json.dumps(
                 {
