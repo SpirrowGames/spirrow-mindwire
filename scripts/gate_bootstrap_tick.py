@@ -61,6 +61,11 @@ from spirrow_mindwire.gate_bootstrap import (
     should_alert,
     thread_id_for,
 )
+from spirrow_mindwire.gate_bootstrap_visibility import (
+    CloseFailureVisibility,
+    FileFailureStateStore,
+    visibility_state_path,
+)
 from spirrow_mindwire.magickit.client import (
     MagickitMcpError,
     McpToolCaller,
@@ -102,11 +107,21 @@ async def _run_tick(
     mcp_url: str | None,
     merge_commit_sha: str | None,
     mcp_factory: Any = None,
+    visibility: CloseFailureVisibility | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Do one tick's work for one project. Returns (exit_code, output_object).
 
     Split from ``main`` so tests can drive it against a fake ``McpToolCaller``
     without going through the CLI.
+
+    ``visibility`` is the D-2 close-failure visibility mechanism (see
+    :mod:`spirrow_mindwire.gate_bootstrap_visibility`). It is called ONLY on
+    the close path: an ``open_alert`` failure cannot use this mechanism
+    because the alert thread it would post into does not exist yet (Einstein
+    msg-2298 correctness objection; msg-2301 D-2'''' acceptance — the boundary
+    is scoped by the physical invariant "the failure itself guarantees the
+    existence of the reporting target"). Tests inject a fake; production
+    picks up the default in :func:`main`.
     """
     inspection = inspect_gate(project, repo_dir)
     out: dict[str, Any] = {
@@ -134,6 +149,13 @@ async def _run_tick(
     out["thread_id"] = thread_id
 
     if should_alert(inspection.status):
+        # Open-side is deliberately OUTSIDE the D-2 visibility mechanism.
+        # See :mod:`spirrow_mindwire.gate_bootstrap_visibility` module
+        # docstring and the guard in
+        # :meth:`CloseFailureVisibility.on_close_failure` — an ``open_alert``
+        # failure means the reporting target does not exist, so posting a
+        # failure report into it would either target a vacuum or defeat the
+        # rate-limiter's asymmetric-clear rule (msg-2301 D-2'''').
         try:
             result = await open_alert(mcp, project=project, owner=owner)
         except MagickitMcpError as exc:
@@ -144,6 +166,12 @@ async def _run_tick(
 
     # DECLARED / STALE_WORKTREE — attempt idempotent close. Not-found /
     # already-resolved envelopes fold into ``already_closed`` (was_open=False).
+    #
+    # D-2''' Rule 1 (positive-observation clear): a successful close (was_open
+    # true or false) means the alert thread is not open, which is exactly
+    # the world-state the sweeper wanted. The visibility mechanism clears
+    # the episode on that observation — the failure state is a description
+    # of the WORLD, not of our actions (msg-2297).
     try:
         result = await close_alert(
             mcp, project=project, owner=owner, merge_commit_sha=merge_commit_sha
@@ -153,10 +181,36 @@ async def _run_tick(
         # the operator sees this on the next tick's log, not never.
         out["action"] = "close_refused"
         out["error"] = str(exc)
+        # D-2''': post a bounded failure report into the alert thread. The
+        # visibility instance MUST NOT raise (it swallows everything into the
+        # ``error`` field of its result) — see its module docstring for the
+        # unconditional-non-raise invariant.
+        if visibility is not None:
+            report = await visibility.on_close_failure(
+                mcp,
+                project=project,
+                thread_id=thread_id,
+                owner=owner,
+                exc=exc,
+            )
+            out["visibility"] = report.as_dict()
         return 1, out
     except MagickitMcpError as exc:
         out["error"] = f"close_alert transport failure: {exc}"
+        if visibility is not None:
+            report = await visibility.on_close_failure(
+                mcp,
+                project=project,
+                thread_id=thread_id,
+                owner=owner,
+                exc=exc,
+            )
+            out["visibility"] = report.as_dict()
         return 1, out
+    # Successful close (whether the thread was open or already resolved) is a
+    # positive observation that the alert is not open — clear any episode.
+    if visibility is not None:
+        visibility.on_close_success(project=project, thread_id=thread_id)
     out["action"] = "closed" if result.was_open else "already_closed"
     return 0, out
 
@@ -197,6 +251,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    visibility = CloseFailureVisibility(FileFailureStateStore(visibility_state_path()))
     try:
         exit_code, out = asyncio.run(
             _run_tick(
@@ -205,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                 owner=args.owner,
                 mcp_url=args.url,
                 merge_commit_sha=args.merge_commit_sha,
+                visibility=visibility,
             )
         )
     except Exception as exc:  # top-level guard — the sweep must not hang on us
