@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from types import TracebackType
 from typing import Any, Protocol
+from urllib.parse import quote
 
 import httpx
 
@@ -348,20 +349,91 @@ class GitHubClient:
         await self._client.aclose()
 
     async def fetch_pr_diff(self, pr: PrRef) -> str:
-        """``GET /repos/{owner}/{repo}/pulls/{n}`` as a unified diff."""
-        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
+        """PR diff via a three-dot ``compare`` — the same view a human sees on GitHub.
+
+        Two reads (fail-loud on either):
+
+        1. ``GET /repos/{owner}/{repo}/pulls/{n}`` (JSON) — learn the PR's ``base.ref``
+           (branch name, resolved fresh each call) and ``head.sha`` (the specific
+           commit we then compare against).
+        2. ``GET /repos/{owner}/{repo}/compare/{base_ref}...{head_sha}`` with
+           ``Accept: application/vnd.github.v3.diff`` — the three-dot form asks
+           GitHub for the diff from the **merge base** of ``base_ref`` and
+           ``head_sha`` to ``head_sha``.
+
+        Why not ``GET /pulls/{n}`` in diff form (the endpoint this method used
+        to hit): that endpoint diffs against the ``base.sha`` snapshotted **at PR
+        creation time**, not the current base head. If the base moved forward
+        with commits that are also ancestors of ``head_sha`` (a stacked PR whose
+        parent has landed; a branch that pulled ``develop`` in; the empty-merge
+        workaround that this fix retires), the returned diff carries all the
+        already-merged code as if it belonged to this PR. A measured example
+        (``SpirrowGames/spirrow-lexora#10``, 2026-08-31): the pulls/{n} diff
+        was 183,288 chars; the true PR was 86,585 — the 53% excess was PR #9,
+        which the same gate had already APPROVED and merged. The gate would
+        then object to code that no longer belongs to the PR it is reviewing,
+        and any cap on the diff would fire on the union rather than the PR
+        itself. See ``spec/design/T-gate-reads-stale-base-diff.md`` for the
+        end-to-end reasoning; the short of it is that ``compare`` computes
+        against the current merge base, so already-landed ancestors drop out.
+
+        Both reads raise :class:`GitHubHTTPError` on failure (no fallback to the
+        old endpoint): the old failure mode was **silent** (a wrong-but-parseable
+        diff), which is exactly what fail-loud is meant to preclude. An
+        unreachable / non-2xx response is loud, and that is the trade.
+        """
+        # Step 1 — read metadata for base.ref and head.sha. Same JSON we already
+        # read on the CI path (see :meth:`_fetch_ci_status_rest`).
+        meta_path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
         try:
-            resp = await self._client.get(
-                path, headers={"Accept": "application/vnd.github.v3.diff"}
-            )
+            resp = await self._client.get(meta_path)
         except httpx.RequestError as exc:
-            raise GitHubHTTPError(f"GET {path} (diff): {exc}") from exc
+            raise GitHubHTTPError(f"GET {meta_path} (pr meta): {exc}") from exc
         if resp.status_code >= 400:
             raise GitHubHTTPError(
-                f"GET {path} (diff) returned {resp.status_code}: {_error_detail(resp)}",
+                f"GET {meta_path} (pr meta) returned {resp.status_code}: {_error_detail(resp)}",
                 status_code=resp.status_code,
             )
-        return resp.text
+        try:
+            payload = resp.json()
+            base_ref = str(payload["base"]["ref"])
+            head_sha = str(payload["head"]["sha"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise GitHubHTTPError(f"GET {meta_path} (pr meta): malformed response: {exc}") from exc
+        if not base_ref or not head_sha:
+            raise GitHubHTTPError(f"GET {meta_path} (pr meta): missing base.ref or head.sha")
+
+        # Step 2 — three-dot compare. `base_ref` is URL-encoded because a
+        # feature-branch name may contain `/` (e.g. `feature/stacked`); leaving
+        # a raw slash in the path segment routes to a different endpoint and
+        # returns 404. Head is a hex SHA and needs no encoding, but the same
+        # `quote` call is harmless on it.
+        base_seg = quote(base_ref, safe="")
+        head_seg = quote(head_sha, safe="")
+        compare_path = f"/repos/{pr.owner}/{pr.repo}/compare/{base_seg}...{head_seg}"
+        try:
+            resp = await self._client.get(
+                compare_path, headers={"Accept": "application/vnd.github.v3.diff"}
+            )
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {compare_path} (diff): {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {compare_path} (diff) returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        diff = resp.text
+        # D-8: log the compare parameters and resulting size so a reader can
+        # cross-check the input the gate is about to judge. Not a body field —
+        # the review body format is fixed by other tests and this log is
+        # deliberately out-of-band.
+        logger.info(
+            "fetch_pr_diff: compare %s...%s -> %d chars",
+            base_ref,
+            head_sha[:12],
+            len(diff),
+        )
+        return diff
 
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
         """Aggregate CI state for the PR head SHA — REST first, GraphQL as fallback.
