@@ -129,36 +129,204 @@ def test_naysayer_token_falls_back_to_shared_until_provisioned(
 
 
 # ---------- fetch_pr_diff ------------------------------------------------- #
+#
+# The diff comes from a three-dot `compare/{base_ref}...{head_sha}` -- NOT from
+# `pulls/{n}` in diff form. That old endpoint diffs against the base SHA
+# snapshotted at PR creation time, which for stacked PRs / PRs that have pulled
+# base in bleeds already-merged code into the gate's input (measured on
+# spirrow-lexora#10: 53% excess = PR #9 code the same gate had already APPROVED).
+# See spec/design/T-gate-reads-stale-base-diff.md.
+
+
+def _pr_meta_handler(
+    *,
+    base_ref: str = "main",
+    head_sha: str = "c4c107b",
+    diff_text: str = "diff --git a/x b/x\n+added",
+    diff_status: int = 200,
+    diff_headers: dict[str, str] | None = None,
+    calls: list[tuple[str, str, str | None]] | None = None,
+) -> Any:
+    """Serve pulls/{n} (JSON meta) and compare/{base}...{head} (diff)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        accept = request.headers.get("accept")
+        auth = request.headers.get("authorization")
+        if calls is not None:
+            calls.append((request.method, path, accept))
+        if path.endswith(f"/pulls/{_PR.number}"):
+            return httpx.Response(
+                200,
+                json={"base": {"ref": base_ref}, "head": {"sha": head_sha}},
+                headers={"x-auth-echo": auth or ""},
+            )
+        if "/compare/" in path:
+            resp_headers = {"x-auth-echo": auth or ""}
+            if diff_headers:
+                resp_headers.update(diff_headers)
+            if diff_status != 200:
+                return httpx.Response(
+                    diff_status, json={"message": "compare error"}, headers=resp_headers
+                )
+            return httpx.Response(diff_status, text=diff_text, headers=resp_headers)
+        return httpx.Response(500, json={"message": f"unexpected {path}"})
+
+    return handler
 
 
 @pytest.mark.anyio
-async def test_fetch_pr_diff_returns_text() -> None:
-    seen: dict[str, Any] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        seen["accept"] = request.headers.get("accept")
-        seen["auth"] = request.headers.get("authorization")
-        return httpx.Response(200, text="diff --git a/x b/x\n+added")
-
+async def test_fetch_pr_diff_uses_three_dot_compare() -> None:
+    # AC-1 / AC-2: the diff request is `compare/{base_ref}...{head_sha}` with
+    # the diff Accept, and both segments come from the meta read (change the
+    # meta payload -> the compare URL follows).
+    calls: list[tuple[str, str, str | None]] = []
+    handler = _pr_meta_handler(base_ref="develop", head_sha="c4c107b", calls=calls)
     async with _client(handler) as client:
         diff = await client.fetch_pr_diff(_PR)
     assert "diff --git" in diff
-    assert seen["path"] == "/repos/spirrowgames/spirrow-mindwire/pulls/42"
-    assert seen["accept"] == "application/vnd.github.v3.diff"
-    assert seen["auth"] == "Bearer tok"
+    # Two requests, in the meta-first-then-compare order.
+    assert len(calls) == 2
+    assert calls[0][1] == "/repos/spirrowgames/spirrow-mindwire/pulls/42"
+    assert calls[0][0] == "GET"
+    compare_method, compare_path, compare_accept = calls[1]
+    assert compare_method == "GET"
+    assert compare_path == "/repos/spirrowgames/spirrow-mindwire/compare/develop...c4c107b"
+    assert compare_accept == "application/vnd.github.v3.diff"
 
 
 @pytest.mark.anyio
-async def test_fetch_pr_diff_non_2xx_fail_loud() -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"message": "Not Found"})
+async def test_fetch_pr_diff_base_ref_follows_meta() -> None:
+    # AC-2 (second half): if the meta reports a different base branch, the
+    # compare URL tracks it -- there is no pinned base sha in this code path.
+    calls: list[tuple[str, str, str | None]] = []
+    handler = _pr_meta_handler(base_ref="main", head_sha="deadbeef1234", calls=calls)
+    async with _client(handler) as client:
+        await client.fetch_pr_diff(_PR)
+    assert calls[1][1] == "/repos/spirrowgames/spirrow-mindwire/compare/main...deadbeef1234"
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_diff_url_encodes_base_ref_with_slash() -> None:
+    # Advisory from Einstein: a `feature/stacked` branch name must not route
+    # to a different endpoint. Slash is encoded as %2F. httpx decodes the .path
+    # attribute back to `/`, so we assert on .raw_path (bytes) which keeps the
+    # wire form — that is what a real GitHub sees and dispatches on.
+    raw_paths: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw_paths.append(request.url.raw_path)
+        if request.url.path.endswith(f"/pulls/{_PR.number}"):
+            return httpx.Response(
+                200, json={"base": {"ref": "feature/stacked"}, "head": {"sha": "abc123"}}
+            )
+        return httpx.Response(200, text="diff")
+
+    async with _client(handler) as client:
+        await client.fetch_pr_diff(_PR)
+    assert (
+        raw_paths[1] == b"/repos/spirrowgames/spirrow-mindwire/compare/feature%2Fstacked...abc123"
+    )
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_diff_meta_404_fails_loud_without_compare() -> None:
+    # AC-3: meta non-2xx -> GitHubHTTPError, and no compare request is made
+    # (nothing to compare against).
+    calls: list[tuple[str, str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path, request.headers.get("accept")))
+        if request.url.path.endswith(f"/pulls/{_PR.number}"):
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(500, text="should not be called")
 
     async with _client(handler) as client:
         with pytest.raises(GitHubHTTPError) as exc:
             await client.fetch_pr_diff(_PR)
     assert exc.value.status_code == 404
     assert "Not Found" in str(exc.value)
+    assert len(calls) == 1
+    assert "/compare/" not in calls[0][1]
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_diff_meta_missing_base_ref_fails_loud() -> None:
+    # AC-3: meta shape is wrong (base.ref absent) -> raise; do not fall back.
+    calls: list[tuple[str, str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path, request.headers.get("accept")))
+        # `head.sha` present but `base` empty -> base.ref lookup fails.
+        return httpx.Response(200, json={"base": {}, "head": {"sha": "abc"}})
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError):
+            await client.fetch_pr_diff(_PR)
+    assert len(calls) == 1
+    assert "/compare/" not in calls[0][1]
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_diff_meta_missing_head_sha_fails_loud() -> None:
+    # AC-3: meta shape is wrong (head.sha absent) -> raise; do not fall back.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"base": {"ref": "main"}, "head": {}})
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError):
+            await client.fetch_pr_diff(_PR)
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_diff_compare_non_2xx_fails_loud() -> None:
+    # AC-4: compare non-2xx (e.g. 404 base branch deleted, 406 diff too large)
+    # -> GitHubHTTPError.
+    handler = _pr_meta_handler(diff_status=404)
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError) as exc:
+            await client.fetch_pr_diff(_PR)
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_diff_never_reads_pulls_diff_endpoint() -> None:
+    # AC-4 regression guard for D-4 (no fallback): the old endpoint --
+    # GET /pulls/{n} with the diff Accept -- must never be requested. If the
+    # implementation ever regresses to the stale-base path, the diff Accept
+    # will appear on the pulls/{n} URL and this test catches it.
+    calls: list[tuple[str, str, str | None]] = []
+    handler = _pr_meta_handler(calls=calls)
+    async with _client(handler) as client:
+        await client.fetch_pr_diff(_PR)
+    for method, path, accept in calls:
+        pulls_diff = (
+            path.endswith(f"/pulls/{_PR.number}") and accept == "application/vnd.github.v3.diff"
+        )
+        assert not pulls_diff, (
+            f"regressed to the pre-fix endpoint: {method} {path} with diff Accept "
+            "-- the stale-base diff is exactly what T-gate-reads-stale-base-diff retires"
+        )
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_diff_sends_auth_and_diff_accept_on_compare() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith(f"/pulls/{_PR.number}"):
+            return httpx.Response(200, json={"base": {"ref": "main"}, "head": {"sha": "abc"}})
+        if "/compare/" in path:
+            seen["accept"] = request.headers.get("accept")
+            seen["auth"] = request.headers.get("authorization")
+            return httpx.Response(200, text="diff --git a/x b/x\n+added")
+        return httpx.Response(500)
+
+    async with _client(handler) as client:
+        await client.fetch_pr_diff(_PR)
+    assert seen["accept"] == "application/vnd.github.v3.diff"
+    assert seen["auth"] == "Bearer tok"
 
 
 # ---------- submit_review ------------------------------------------------- #
@@ -462,15 +630,18 @@ async def test_fetch_ci_status_pulls_404_fail_closed() -> None:
 async def test_no_token_omits_auth_header(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINDWIRE_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    seen: dict[str, Any] = {}
+    seen: dict[str, Any] = {"auths": []}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["auth"] = request.headers.get("authorization")
+        seen["auths"].append(request.headers.get("authorization"))
+        if request.url.path.endswith(f"/pulls/{_PR.number}"):
+            return httpx.Response(200, json={"base": {"ref": "main"}, "head": {"sha": "abc"}})
         return httpx.Response(200, text="diff")
 
     async with _client(handler, token=None) as client:
         await client.fetch_pr_diff(_PR)
-    assert seen["auth"] is None
+    # Both the meta read and the compare read must go out unauthenticated.
+    assert seen["auths"] == [None, None]
 
 
 # ---------- fetch_ci_status: GraphQL fallback ----------------------------- #
