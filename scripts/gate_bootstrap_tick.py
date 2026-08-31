@@ -67,6 +67,25 @@ from spirrow_mindwire.magickit.client import (
     StreamableHttpChatroomMcp,
 )
 
+# Windows consoles default to legacy codepages (e.g. cp932) that cannot encode
+# non-ASCII characters that this script's ``reason`` field carries in the
+# ``MISSING`` / ``NEW_REPO`` / error branches (em dash from module strings).
+# Reconfigure covers stderr's traceback + any incidental print for a human
+# reader; the machine-read JSON on stdout is separately hardened by emitting
+# ``ensure_ascii=True`` below (see comment on the ``print`` calls). Both
+# defences matter: reconfigure alone is not sufficient because
+# ``errors="backslashreplace"`` emits astral characters as ``\Uxxxxxxxx``
+# (8 hex digits), which is not a JSON string escape and would defeat the
+# wrapper's ``ConvertFrom-Json``. Kept ``getattr``-guarded to satisfy mypy
+# (``reconfigure`` is a ``TextIOWrapper``-only method); the pattern is copied
+# verbatim from ``dogfood_smoke.py`` / ``naysayer_review.py`` / ``naysayer_review_scoped.py``.
+_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if _reconfigure is not None:
+    _reconfigure(encoding="utf-8", errors="backslashreplace")
+_reconfigure_err = getattr(sys.stderr, "reconfigure", None)
+if _reconfigure_err is not None:
+    _reconfigure_err(encoding="utf-8", errors="backslashreplace")
+
 
 async def _run_tick(
     project: str,
@@ -185,6 +204,17 @@ def main(argv: list[str] | None = None) -> int:
         # The stdout is the wrapper's parse target; the stderr line is the
         # human-readable "why". Both are needed: the wrapper still gets a
         # JSON object with an error field, and the operator sees the trace.
+        # ``ensure_ascii=True`` is deliberate here (and on the success-path
+        # ``print`` below): the wrapper reads this line with
+        # ``ConvertFrom-Json``, and PowerShell's parser cannot decode
+        # ``\Uxxxxxxxx`` (8 hex digits) — which is what
+        # ``sys.stdout.reconfigure(errors="backslashreplace")`` would emit
+        # for an astral-plane code point in ``reason``. Making the JSON
+        # itself ASCII-safe removes any dependency on the stream encoding
+        # (msg-2292 D-3 endorsement: JSON standard supports ``\uXXXX`` and
+        # surrogate pairs only; ``ensure_ascii=True`` is the only robust
+        # guarantee for a machine-read JSON line over a stream with an
+        # unknown or legacy encoding).
         print(
             json.dumps(
                 {
@@ -197,13 +227,14 @@ def main(argv: list[str] | None = None) -> int:
                     "thread_id": None,
                     "error": str(exc),
                 },
-                ensure_ascii=False,
+                ensure_ascii=True,
             )
         )
         print(f"gate_bootstrap_tick: unhandled error: {exc!r}", file=sys.stderr)
         return 1
 
-    print(json.dumps(out, ensure_ascii=False))
+    # See the crash-path comment above for why ``ensure_ascii=True`` here.
+    print(json.dumps(out, ensure_ascii=True))
     return exit_code
 
 
