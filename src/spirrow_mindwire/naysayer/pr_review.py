@@ -71,6 +71,7 @@ from ..lexora.client import (
     LexoraTimeoutError,
 )
 from .pr_review_adr_pointers import (
+    MARKER_EXEMPLAR_PLACEHOLDER,
     AdrPointerSelection,
     append_marker,
     available_log_line,
@@ -323,7 +324,16 @@ _VERDICT_RE = re.compile(
 #     column-0 APPROVE ban nor the quoted-echo defence introduced above is weakened.
 #   * "You may additionally" — permissive, not mandatory. A blocking objection alone still counts
 #     as a complete review; the affordance exists to remove pressure, not to add a checklist item.
-_PR_REVIEW_SYSTEM_PROMPT = """\
+# The literal marker exemplar (line beginning ``<!-- mindwire:objections v1 nonce=NONCE -->``)
+# is NOT hardcoded here — the string below carries :data:`MARKER_EXEMPLAR_PLACEHOLDER`
+# at its position, and :func:`build_pr_review_pass1_system_prompt` substitutes it with
+# ``f"{_OBJECTIONS_SENTINEL_PREFIX} nonce=NONCE -->"`` before the assembled prompt reaches
+# the model. This is what closes the msg-2274 head gate finding: a template hardcode of
+# ``v1`` would silently diverge from the driver-side sentinel prefix if the protocol ever
+# bumped to ``v2`` (the delivery paragraph already substituted, but the template exemplar
+# did not — so the prompt showed one version and the parser recognised another). The
+# placeholder makes the exemplar single-sourced from the same constant the parser reads.
+_PR_REVIEW_SYSTEM_PROMPT = f"""\
 You are the independent naysayer performing adversarial CODE REVIEW of a pull \
 request's diff in a Spirrow MindWire ChatRoom thread. You are a different model \
 from the implementer. Assume the change is flawed until proven otherwise and \
@@ -352,9 +362,9 @@ paragraph below this prompt; replace the literal `NONCE` in the marker with \
 that value verbatim. Emitting the marker without the substitution, or with any \
 other value, causes the driver to treat the block as absent (fail-closed).
 
-<!-- mindwire:objections v1 nonce=NONCE -->
-[{"class": "<a class name from objection_classes>", "where": "path:line", \
-"evidence": "<what that class's evidence: line asks for>"}]
+{MARKER_EXEMPLAR_PLACEHOLDER}
+[{{"class": "<a class name from objection_classes>", "where": "path:line", \
+"evidence": "<what that class's evidence: line asks for>"}}]
 
 One element per objection you stated above, in the same order; `[]` if you \
 stated none. Every objection you made in prose must appear, and the block must \

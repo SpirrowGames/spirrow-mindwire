@@ -47,6 +47,7 @@ from spirrow_mindwire.naysayer.pr_review import (
 )
 from spirrow_mindwire.naysayer.pr_review_adr_pointers import (
     ADR_POINTER_SYSTEM_TASK_PROMPT,
+    MARKER_EXEMPLAR_PLACEHOLDER,
     MARKER_PREFIX,
     MARKER_UNAVAILABLE,
     MAX_POINTER_PAYLOAD_BYTES,
@@ -709,7 +710,7 @@ def test_pass1_builder_returns_only_prompt_no_side_effects() -> None:
     # Sanity: build_pr_review_pass1_system_prompt is a pure builder, so a test can construct
     # exactly what the driver constructs by passing the same verdict_task_prompt.
     p1 = build_pr_review_pass1_system_prompt(
-        verdict_task_prompt="TASK",
+        verdict_task_prompt=f"TASK {MARKER_EXEMPLAR_PLACEHOLDER} END",
         nonce="0123456789abcdef",
         sentinel_prefix="<!-- mindwire:objections vX",
     )
@@ -723,6 +724,11 @@ def test_pass1_builder_returns_only_prompt_no_side_effects() -> None:
     # substituted (pinning the anti-dual-management contract added under msg-2270 head
     # gate: no builder-side hardcode of the driver-side sentinel literal).
     assert "<!-- mindwire:objections vX nonce=NONCE -->" in p1
+    # And the SAME fixture prefix appears in the template-side exemplar too, because
+    # the builder substitutes MARKER_EXEMPLAR_PLACEHOLDER in the verdict_task_prompt
+    # with the same derived marker — pinning the msg-2274 head gate finding closure
+    # (a template-side hardcode of ``v1`` would drift when the parser bumps to ``v2``).
+    assert MARKER_EXEMPLAR_PLACEHOLDER not in p1
 
 
 def test_pass1_system_prompt_builder_requires_a_nonce() -> None:
@@ -734,7 +740,8 @@ def test_pass1_system_prompt_builder_requires_a_nonce() -> None:
     """
     with pytest.raises(TypeError):
         build_pr_review_pass1_system_prompt(  # type: ignore[call-arg]
-            verdict_task_prompt="TASK", sentinel_prefix="<!-- mindwire:objections v1"
+            verdict_task_prompt=f"TASK {MARKER_EXEMPLAR_PLACEHOLDER}",
+            sentinel_prefix="<!-- mindwire:objections v1",
         )
 
 
@@ -746,7 +753,29 @@ def test_pass1_system_prompt_builder_requires_a_sentinel_prefix() -> None:
     """
     with pytest.raises(TypeError):
         build_pr_review_pass1_system_prompt(  # type: ignore[call-arg]
-            verdict_task_prompt="TASK", nonce="0123456789abcdef"
+            verdict_task_prompt=f"TASK {MARKER_EXEMPLAR_PLACEHOLDER}",
+            nonce="0123456789abcdef",
+        )
+
+
+def test_pass1_system_prompt_builder_rejects_verdict_task_prompt_missing_placeholder() -> None:
+    """A verdict-task prompt that does not carry :data:`MARKER_EXEMPLAR_PLACEHOLDER`
+    must be fail-loud, not silently pass through.
+
+    This pins the msg-2274 head gate finding closure at the type / runtime level:
+    the whole point of threading ``sentinel_prefix`` through the builder was to
+    remove dual-management of the marker literal. If a caller supplied a template
+    that hardcoded ``<!-- mindwire:objections v1 nonce=NONCE -->`` directly (instead
+    of putting the placeholder there), the builder had no way to substitute — and
+    the template would silently diverge from the parser the next time the sentinel
+    bumped to ``v2``. Raising ValueError makes any such caller impossible to write
+    unnoticed.
+    """
+    with pytest.raises(ValueError, match="MARKER_EXEMPLAR_PLACEHOLDER"):
+        build_pr_review_pass1_system_prompt(
+            verdict_task_prompt="a task prompt with no placeholder",
+            nonce="0123456789abcdef",
+            sentinel_prefix="<!-- mindwire:objections v1",
         )
 
 

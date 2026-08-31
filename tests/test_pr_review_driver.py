@@ -61,6 +61,7 @@ from spirrow_mindwire.naysayer.pr_review import (
     render_gate_notice,
 )
 from spirrow_mindwire.naysayer.pr_review_adr_pointers import (
+    MARKER_EXEMPLAR_PLACEHOLDER,
     build_pr_review_pass1_system_prompt,
     strip_wrapping_fences,
 )
@@ -432,8 +433,16 @@ async def test_lexora_system_message_injects_principles_preamble() -> None:
     # PR-review task instructions still follow it. Asserted as the whole prompt rather than a
     # fragment of it: the fragment used to be the literal ``VERDICT: APPROVE``, which the prompt
     # deliberately no longer contains (see the note above _PR_REVIEW_SYSTEM_PROMPT), and any other
-    # hand-picked fragment would be the same hostage to the next wording change.
-    assert _PR_REVIEW_SYSTEM_PROMPT in system
+    # hand-picked fragment would be the same hostage to the next wording change. The template
+    # holds MARKER_EXEMPLAR_PLACEHOLDER at the marker-exemplar position (msg-2274 head gate
+    # finding closure — no v1 hardcode in the template); the builder substitutes it with the
+    # driver-side sentinel prefix, so we compare the substituted template to what the driver
+    # actually sent.
+    expected_task_prompt = _PR_REVIEW_SYSTEM_PROMPT.replace(
+        MARKER_EXEMPLAR_PLACEHOLDER,
+        f"{_OBJECTIONS_SENTINEL_PREFIX} nonce=NONCE -->",
+    )
+    assert expected_task_prompt in system
 
 
 @pytest.mark.anyio
@@ -2181,20 +2190,67 @@ def test_r4a_verdict_re_carries_a_back_reference_to_the_divergence() -> None:
 def test_quoting_the_prompt_objection_exemplar_is_fail_closed() -> None:
     """Echoing the prompt's own objection exemplar must not soften the derived verdict.
 
-    The exemplar is handed to the model on every review, so a model restating its instructions
-    emits it verbatim — the same channel that forced the VERDICT exemplar to be REQUEST_CHANGES.
-    The exemplar's class names are PLACEHOLDERS, so an echo parses as ``UNKNOWN`` and derives
-    REQUEST_CHANGES. Were the exemplar to use a real advisory class, an echo placed after the
-    model's own block would derive APPROVE out of thin air.
+    The ASSEMBLED prompt (what the model actually sees) is handed to the model on every
+    review, so a model restating its instructions emits it verbatim — the same channel
+    that forced the VERDICT exemplar to be REQUEST_CHANGES. The exemplar's class names
+    are PLACEHOLDERS, so an echo parses as ``UNKNOWN`` and derives REQUEST_CHANGES. Were
+    the exemplar to use a real advisory class, an echo placed after the model's own
+    block would derive APPROVE out of thin air.
+
+    We parse the ASSEMBLED prompt (via :func:`build_pr_review_pass1_system_prompt`)
+    rather than the raw ``_PR_REVIEW_SYSTEM_PROMPT`` template, because since the
+    msg-2274 gate finding the template holds a placeholder rather than a literal
+    marker line — the actual exemplar is only substituted in at build time. What the
+    model can echo back IS the assembled prompt, so that is the input this test must
+    exercise.
     """
-    # The exemplar carries the literal ``nonce=NONCE`` (a placeholder), which is neither
-    # canonical against any live hex nonce nor a substring of it — so the exemplar echo
-    # is classified as ``foreign`` and derives MISSING, one step earlier on the
-    # fail-closed side than the pre-nonce UNKNOWN classification. Same result: the derived
-    # verdict is REQUEST_CHANGES.
-    report = parse_objections(_PR_REVIEW_SYSTEM_PROMPT, expected_nonce=_TEST_NONCE)
+    system = build_pr_review_pass1_system_prompt(
+        verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT,
+        nonce=_TEST_NONCE,
+        sentinel_prefix=_OBJECTIONS_SENTINEL_PREFIX,
+    )
+    # The exemplar in the assembled prompt carries the literal ``nonce=NONCE`` (a
+    # placeholder telling the model to substitute), which is neither canonical against
+    # any live hex nonce nor a substring of it — so the exemplar echo is classified as
+    # ``foreign`` and derives MISSING, one step earlier on the fail-closed side than
+    # the pre-nonce UNKNOWN classification. Same result: the derived verdict is
+    # REQUEST_CHANGES.
+    report = parse_objections(system, expected_nonce=_TEST_NONCE)
     assert report.status is ObjectionParse.MISSING
     assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+
+def test_verdict_task_prompt_holds_placeholder_not_hardcoded_sentinel_literal() -> None:
+    """The verdict-task template must carry :data:`MARKER_EXEMPLAR_PLACEHOLDER` at the
+    marker-exemplar position — NOT a hardcoded ``<!-- mindwire:objections v1 ... -->``
+    literal.
+
+    This pins the msg-2274 head gate finding closure at the template level: hardcoding
+    the exemplar would reintroduce the dual-management drift between parser and prompt
+    that the placeholder exists to close. If the driver's ``_OBJECTIONS_SENTINEL_PREFIX``
+    later bumps to ``v2``, the prompt exemplar must follow automatically — the way the
+    template pins this is by holding a placeholder, not a versioned literal.
+
+    Verified two ways: (a) the placeholder appears at least once in the raw template,
+    (b) building the assembled prompt with a FIXTURE sentinel prefix produces zero
+    occurrences of the driver-side ``v1`` marker (proving the template's exemplar is
+    substituted from ``sentinel_prefix``, not carried through as a hardcode).
+    """
+    # (a) template carries the placeholder.
+    assert MARKER_EXEMPLAR_PLACEHOLDER in _PR_REVIEW_SYSTEM_PROMPT
+    # And carries NO hardcoded sentinel exemplar literal.
+    assert "<!-- mindwire:objections v1 nonce=NONCE -->" not in _PR_REVIEW_SYSTEM_PROMPT
+    # (b) assembled prompt with a fixture prefix contains ONLY the fixture-derived
+    # marker, no driver-side ``v1`` leak.
+    system = build_pr_review_pass1_system_prompt(
+        verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT,
+        nonce=_TEST_NONCE,
+        sentinel_prefix="<!-- mindwire:objections vFIXTURE",
+    )
+    assert "<!-- mindwire:objections vFIXTURE nonce=NONCE -->" in system
+    assert "<!-- mindwire:objections v1" not in system
+    # The placeholder itself must be fully consumed by the substitution.
+    assert MARKER_EXEMPLAR_PLACEHOLDER not in system
 
 
 def test_prompt_defers_the_class_vocabulary_to_the_injected_sot() -> None:

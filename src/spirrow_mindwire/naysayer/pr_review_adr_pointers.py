@@ -166,6 +166,22 @@ MARKER_UNAVAILABLE = f"{MARKER_PREFIX} unavailable"
 
 # --- Pass 2 prompt (M1 self-declaration — code-side constant, tests import) ----------- #
 
+# Placeholder string the pass-1 verdict-task prompt (`_PR_REVIEW_SYSTEM_PROMPT` in
+# :mod:`~spirrow_mindwire.naysayer.pr_review`) uses to mark the position of the
+# objection-marker exemplar. :func:`build_pr_review_pass1_system_prompt` substitutes
+# it with ``f"{sentinel_prefix} nonce=NONCE -->"`` before returning the assembled
+# prompt, so the exemplar the model sees is always derived from the same driver-side
+# `_OBJECTIONS_SENTINEL_PREFIX` the parser recognises — no cross-file drift can slip
+# in (gate finding on msg-2274 head under PR #206: dual-management of the sentinel
+# literal still existed inside the verdict-task prompt itself even though the
+# delivery paragraph already substituted). The literal chosen is deliberately not a
+# valid marker or JSON prefix, so a template that forgets to include it will land
+# somewhere obvious rather than degrade silently. This module owns the constant so
+# both :mod:`~spirrow_mindwire.naysayer.pr_review` (which embeds it in its template)
+# and this module (which substitutes it) reference one source of truth without
+# introducing a cyclic import.
+MARKER_EXEMPLAR_PLACEHOLDER = "__MINDWIRE_MARKER_EXEMPLAR__"
+
 # The pass-2 system-prompt task instructions. Kept intentionally rigid: the ONLY
 # permitted output shape is a JSON array of pointer records. Any other output is
 # discarded downstream (see :func:`select_adr_pointers`), and prompt compliance is
@@ -281,20 +297,36 @@ def build_pr_review_pass1_system_prompt(
     in :mod:`~spirrow_mindwire.naysayer.pr_review`) that the parser uses to recognise
     a column-zero objection marker. It is passed in for the SAME anti-cyclic reason
     ``verdict_task_prompt`` is: this module cannot import the driver, and the sentinel
-    prefix is a driver-side constant. Threading it through here (rather than
-    hardcoding the ``<!-- mindwire:objections v1 ... -->`` literal into the delivery
-    paragraph) eliminates the dual-management drift risk the pass-1 gate on the
-    msg-2270 head raised: if the protocol ever bumps to ``v2``, the parser and the
-    prompt would silently diverge across two files, and the parser would stop
-    recognising the very marker the prompt still tells the model to emit. Required
-    (not defaulted) for the same reason as ``nonce``: silent defaults would restore
-    the drift risk this parameter exists to close.
+    prefix is a driver-side constant. The verdict-task prompt is REQUIRED to contain
+    :data:`MARKER_EXEMPLAR_PLACEHOLDER` at the position where the objection-marker
+    exemplar belongs; the builder substitutes it with ``f"{sentinel_prefix} nonce=NONCE
+    -->"`` before returning, so the exemplar in the assembled prompt is always derived
+    from the same driver-side ``_OBJECTIONS_SENTINEL_PREFIX`` the parser recognises.
+    An absent placeholder is a fail-loud :class:`ValueError`: the whole point of
+    threading ``sentinel_prefix`` through is to remove dual-management of the marker
+    literal, and a template that hardcodes the exemplar would silently reintroduce the
+    drift the placeholder exists to close (gate finding on msg-2274 head raised
+    exactly this: the delivery paragraph was already substituting, but the template
+    exemplar itself was still hardcoded to ``v1``). Required (not defaulted) for the
+    same reason as ``nonce``: silent defaults would restore the drift risk this
+    parameter exists to close.
     """
     marker_exemplar = f"{sentinel_prefix} nonce=NONCE -->"
+    if MARKER_EXEMPLAR_PLACEHOLDER not in verdict_task_prompt:
+        raise ValueError(
+            "verdict_task_prompt must contain MARKER_EXEMPLAR_PLACEHOLDER "
+            f"({MARKER_EXEMPLAR_PLACEHOLDER!r}) at the position where the objection-marker "
+            "exemplar belongs; the builder substitutes it with the driver-side sentinel_prefix "
+            "so both the template exemplar and the delivery paragraph derive from one source "
+            "(anti-dual-management, gate finding on msg-2274 head)."
+        )
+    substituted_task_prompt = verdict_task_prompt.replace(
+        MARKER_EXEMPLAR_PLACEHOLDER, marker_exemplar
+    )
     return "\n\n".join(
         [
             build_preamble(),
-            verdict_task_prompt,
+            substituted_task_prompt,
             "PER-REVIEW NONCE for the objection-block marker: `"
             f"{nonce}"
             "`.\n\nThe exemplar above shows the marker as "
@@ -580,6 +612,7 @@ def load_manifest_ids(repo_root: Path | None = None) -> frozenset[str]:
 
 __all__ = [
     "ADR_POINTER_SYSTEM_TASK_PROMPT",
+    "MARKER_EXEMPLAR_PLACEHOLDER",
     "MARKER_PREFIX",
     "MARKER_UNAVAILABLE",
     "MAX_POINTERS",
