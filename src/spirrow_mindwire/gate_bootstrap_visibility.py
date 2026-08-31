@@ -112,7 +112,12 @@ Invariants this module MUST NOT violate (raise on any):
   this module (state persist, post refusal, network drop) is captured into
   a :class:`VisibilityReport` and returned. The tick loop treats visibility
   as a best-effort side channel; a broken visibility must not break the
-  tick.
+  tick. This covers not only exceptions raised by the store / MCP call
+  but also arithmetic between values recovered from disk and
+  ``datetime.now(UTC)`` — see :func:`_parse_iso`'s naive-rejection
+  branch, which the PR #209 gate round 6 blocking added after a
+  timezone-naive timestamp on disk was found to escape as
+  ``TypeError`` through the floor check.
 - **At most one post attempt per tick per project.** Retries are not
   permitted.
 - **At most one post attempt per 24 hours per project** (write-ahead floor).
@@ -985,14 +990,46 @@ def _format_visibility_report(*, project: str, thread_id: str, exc: BaseExceptio
 def _parse_iso(text: str) -> datetime | None:
     """Parse a UTC ISO-8601 timestamp, tolerating both ``Z`` and offset forms.
 
-    Returns ``None`` on malformed input rather than raising — the caller
-    treats a missing floor timestamp as "no floor", which is the same as
-    the fresh-install case.
+    Returns ``None`` when the input is one of:
+
+    * not parseable as ISO-8601, OR
+    * parses to a timezone-**naive** ``datetime`` (no offset, no ``Z``).
+
+    The naive-rejection is load-bearing (PR #209 gate round 6 blocking):
+    the only caller subtracts the result from ``datetime.now(UTC)`` (an
+    aware datetime), and naive-minus-aware raises
+    ``TypeError: can't subtract offset-naive and offset-aware datetimes``.
+    That exception is not part of :data:`_STATE_READ_ERRORS` and would
+    therefore escape the visibility path, violating the module's
+    "never raise" invariant. The threat is manual tampering / a legacy
+    tool writing an offset-less timestamp — the module docstring
+    already names manual tampering as an expected failure mode (which
+    is why we tolerate ``UnicodeDecodeError`` on read), so the same
+    principle applies here: the input is not trusted; treat it as
+    "no floor" and continue.
+
+    Semantic consequence of the None-for-naive branch: a naive
+    timestamp in the state file is treated as if there were no floor
+    for that project — the caller falls through to the write-ahead
+    phase, which overwrites the project's floor entry with a fresh
+    aware timestamp. Other projects' entries in the same file are
+    untouched, so no cross-project data loss occurs. A stronger
+    fail-closed variant (raise :class:`StateFileMalformedError` from
+    ``_decode_state`` at load time) would preserve the naive entry
+    for a human to inspect, but the minimum change needed to satisfy
+    the never-raise invariant is this one line — and the operator-
+    typed-naive-timestamp case is expected to be extraordinarily
+    rare, so the cheaper fix wins.
     """
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        # Naive datetime — refuse to return it. See docstring for the
+        # subtraction-TypeError rationale.
+        return None
+    return parsed
 
 
 __all__ = [

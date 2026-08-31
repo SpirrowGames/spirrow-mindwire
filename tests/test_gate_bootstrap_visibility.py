@@ -1354,3 +1354,93 @@ async def test_malformed_entry_does_not_erase_state_file(tmp_path: Path) -> None
         "the fail-closed contract requires the corrupt file to be preserved "
         "for a human to inspect (PR #209 round-5 blocking #2 regression)"
     )
+
+
+# --- PR-gate #209 blocking round-6 regression: naive timestamps must not crash the tick -------
+
+
+@pytest.mark.anyio
+async def test_visibility_survives_naive_timestamp_in_state_file(tmp_path: Path) -> None:
+    """PR #209 gate round-6 blocking: naive-datetime in state file must NOT raise TypeError.
+
+    The floor check subtracts ``_parse_iso(floor_entry.last_attempt_at)``
+    from ``datetime.now(UTC)`` (an aware datetime). If ``_parse_iso``
+    returned a timezone-naive datetime — as happens when an operator
+    manually edits ``gate_bootstrap_failure.json`` and writes an ISO
+    string without timezone info, e.g. ``"2026-08-31T12:00:00"`` —
+    the subtraction raises ``TypeError`` (empirically verified:
+    ``datetime.now(UTC) - datetime.fromisoformat("2026-08-31T12:00:00")``
+    → ``TypeError: can't subtract offset-naive and offset-aware datetimes``).
+
+    That TypeError is NOT in ``_STATE_READ_ERRORS`` and would escape
+    the visibility path, violating the module's "never raise"
+    invariant — the same class of failure the round-4 UnicodeDecodeError
+    fix closed at the read boundary, now at the arithmetic boundary.
+
+    Fix: ``_parse_iso`` now returns ``None`` for naive datetimes.
+    The caller's ``if last_attempt is not None`` guard already
+    treats ``None`` as "no floor", so the mechanism falls through
+    to the write-ahead phase and overwrites the naive entry with a
+    fresh aware one on the next post — recovering gracefully from
+    the tampered state.
+
+    This test writes a state file with a naive-timestamp floor and
+    asserts:
+      1. no exception propagates from ``on_close_failure``;
+      2. the action is a valid post-cycle verdict (``posted`` or
+         ``post_failed``, NOT a crash);
+      3. the FLOOR was replaced with a fresh aware timestamp
+         (proof the naive value did not survive to cause a future
+         crash).
+    """
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    # Naive ISO timestamp — no timezone, no ``Z``. Legal ISO-8601 but
+    # produces a naive ``datetime`` from ``fromisoformat``.
+    path.write_text(
+        json.dumps(
+            {
+                "episodes": {},
+                "floors": {
+                    "spirrow-verimend": {
+                        "last_attempt_at": "2026-08-31T12:00:00",  # NAIVE
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = FileFailureStateStore(path)
+    mcp = _RecordingMcp()
+    vis = CloseFailureVisibility(store)
+
+    # Must not raise. Pre-fix code raised TypeError from the floor
+    # check subtraction; this call would have propagated straight out.
+    report = await vis.on_close_failure(
+        mcp,
+        project="spirrow-verimend",
+        thread_id=thread_id_for("spirrow-verimend"),
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("close refusal"),
+    )
+
+    # Any valid post-cycle verdict is acceptable — the invariant is
+    # simply that we did NOT raise. In practice the naive floor is
+    # treated as absent, so the mechanism proceeds through write-ahead
+    # and post.
+    assert report.action in {"posted", "post_failed"}, (
+        f"expected a valid post-cycle verdict; got {report.action!r} reason={report.reason!r}"
+    )
+
+    # And the naive floor was replaced with an aware one, so a future
+    # tick will not re-trip the same bug.
+    final = store.load()
+    assert "spirrow-verimend" in final.floors
+    replaced = final.floors["spirrow-verimend"].last_attempt_at
+    # Aware ISO-8601 always ends with an explicit offset ("+00:00")
+    # or "Z"; naive never does. This is a structural check that the
+    # replacement is not itself naive.
+    assert "+" in replaced or replaced.endswith("Z"), (
+        f"naive floor was not replaced with an aware one on write-ahead: {replaced!r}"
+    )
