@@ -483,6 +483,62 @@ async def open_alert(
 _SWEEPER_EMBODIMENT = "unknown"
 
 
+# Structural discriminator for the benign "thread does not exist" envelope.
+#
+# Rationale (T-new-project-gate-bootstrap Bohr msg-2139 §5, PR-gate on head
+# 9b023fe): magickit has ONE Python exception class — ``MagickitMcpError`` —
+# not typed subclasses per envelope kind (verified in magickit/client.py:40;
+# there is no ``ChatroomNotFoundError`` or ``ChatroomPermissionError`` Python
+# class). The only structural signal available to the caller is the envelope's
+# ``error_type`` field, which ``_elevation_message`` embeds verbatim in the
+# exception's ``str`` as ``error_type='<Name>'`` (client.py:286, formed by
+# ``f"error_type={type_snippet!r}"`` where ``type_snippet`` is the ``str``
+# value of the payload's ``error_type`` key).
+#
+# The prior discriminator was ``"not found" in str(exc).lower()`` — a
+# natural-language substring in the envelope's free-form ``error`` field. That
+# substring is not machine-owned: a genuine ``ChatroomPermissionError`` whose
+# text says "role 'orchestrator' not found in closeable_roles", or a
+# transport error mentioning a project name like ``spirrow-not-found``, would
+# match. The naysayer's PR-gate finding on head 9b023fe pinned exactly this
+# hazard, and Bohr §5's "(b) 文字列弁別 → 型弁別に替えられるなら替える"
+# asks for a structural match.
+#
+# The substring below matches the machine-owned enum tag as ``_elevation_message``
+# writes it, not the natural-language ``error`` text. ``ChatroomNotFoundError``
+# is 20 characters, well below the 200-char ``_ELEVATION_VALUE_LIMIT`` truncation
+# threshold, so the substring is guaranteed to appear in full for a real not-found
+# envelope. Any envelope whose ``error_type`` is anything else (e.g.
+# ``ChatroomPermissionError``) will not match, so the surfacing invariant holds
+# even when the free-form ``error`` text happens to contain "not found".
+#
+# The two swallows — precheck (:func:`_alert_thread_exists`) and close-boundary
+# race (:func:`close_alert`) — share this one predicate on purpose (Bohr §5's
+# "併せて 1 点: 二つの swallow が二つの述語を持つと片方だけが直る形の
+# divergence を作る"). Any future change to the discriminator affects both
+# boundaries by construction. The already-exists / already-resolved swallows
+# at :func:`open_alert` / :func:`close_alert`'s close boundary use a separate
+# free-form substring; those are unaffected by this rationale and left as-is
+# because their misclassification hazard is different (already-* semantics
+# cannot masquerade as a benign no-op the way not-found can — they either
+# succeed as idempotent or surface as an unrelated failure the operator has to
+# see anyway).
+_ENVELOPE_NOT_FOUND_MARKER = "error_type='ChatroomNotFoundError'"
+
+
+def _is_thread_not_found_envelope(exc: MagickitMcpError) -> bool:
+    """``True`` iff ``exc`` carries the benign ``ChatroomNotFoundError`` envelope tag.
+
+    Structural discriminator — matches the machine-owned ``error_type``
+    field verbatim as embedded by :func:`_elevation_message`, NOT a
+    substring in the envelope's free-form ``error`` text. Docstring of
+    :data:`_ENVELOPE_NOT_FOUND_MARKER` carries the full rationale; both
+    swallows in this module route through this one call so they cannot
+    drift apart.
+    """
+    return _ENVELOPE_NOT_FOUND_MARKER in str(exc)
+
+
 async def _alert_thread_exists(
     mcp: McpToolCaller,
     *,
@@ -519,7 +575,14 @@ async def _alert_thread_exists(
             {"project": project, "thread_id": thread_id, "mode": "summary"},
         )
     except MagickitMcpError as exc:
-        if "not found" in str(exc).lower():
+        # Structural discriminator (Bohr msg-2139 §5 / PR-gate 9b023fe):
+        # match the envelope's machine-owned ``error_type`` tag, NOT a
+        # substring in the free-form ``error`` text. A permission fault
+        # whose text happens to contain "not found" (e.g. "role X not
+        # found in closeable_roles") must surface as GateBootstrapCloseError,
+        # not be silently swallowed as absent. See
+        # :data:`_ENVELOPE_NOT_FOUND_MARKER` for the full rationale.
+        if _is_thread_not_found_envelope(exc):
             return False
         raise
     return True
@@ -580,12 +643,26 @@ async def close_alert(
     being read as success. Both boundaries must satisfy this invariant, or
     a read-side permission fault at the precheck would silently propagate
     as ``MagickitMcpError`` and every alert would fail closed without
-    reaching the msg-1968 obligation's failure surface. This is the fix
-    for the PR-gate objection on PR #200 (invariant class) and Bohr's
-    msg-2087 §3(3) blocking question: not-found vs. genuine fault must
-    be discriminated at the precheck, and only not-found is swallowed —
-    every other envelope surfaces loudly, matching the close-boundary
-    contract.
+    reaching the msg-1968 obligation's failure surface.
+
+    The not-found swallow is discriminated **structurally** —
+    :func:`_is_thread_not_found_envelope` matches the envelope's machine-owned
+    ``error_type='ChatroomNotFoundError'`` tag as embedded by
+    :func:`~spirrow_mindwire.magickit.client._elevation_message`, NOT the
+    natural-language "not found" substring in the envelope's free-form
+    ``error`` text. This is the fix for the PR-gate objection on head
+    9b023fe (Bohr msg-2139 §5): a genuine ``ChatroomPermissionError`` whose
+    text says "role 'orchestrator' not found in closeable_roles", or a
+    transport error mentioning a project name containing "not-found", would
+    have matched the old ``"not found" in str(exc).lower()`` predicate and
+    been silently swallowed as absent. The structural marker cannot be
+    forged by any envelope whose ``error_type`` is anything other than
+    ``ChatroomNotFoundError``, so the surfacing invariant holds even under
+    adversarial free-form ``error`` text.
+
+    Both boundaries route through the same
+    :func:`_is_thread_not_found_envelope` call — one predicate, two
+    swallows, no divergence hazard (Bohr §5 併せて 1 点).
     """
     thread_id = thread_id_for(project)
     try:
@@ -612,9 +689,17 @@ async def close_alert(
     try:
         await mcp.call_tool("chatroom_close_thread", payload)
     except MagickitMcpError as exc:
-        message = str(exc).lower()
-        if "not found" in message:
+        # not-found: shares the SAME structural discriminator as the precheck
+        # (Bohr msg-2139 §5 "併せて 1 点"). Both boundaries route through
+        # :func:`_is_thread_not_found_envelope`; any future change to the
+        # matcher affects both by construction.
+        if _is_thread_not_found_envelope(exc):
             return CloseResult(thread_id=thread_id, was_open=False)
+        # already-* is a distinct free-form substring — its misclassification
+        # hazard is different (see :data:`_ENVELOPE_NOT_FOUND_MARKER` docstring):
+        # unlike "not found", an "already resolved" text cannot be plausibly
+        # emitted by an unrelated permission or transport fault.
+        message = str(exc).lower()
         if "already resolved" in message or "already closed" in message:
             return CloseResult(thread_id=thread_id, was_open=False)
         raise GateBootstrapCloseError(

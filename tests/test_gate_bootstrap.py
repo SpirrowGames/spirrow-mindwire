@@ -583,6 +583,141 @@ async def test_close_alert_raises_close_refused_on_role_check_denial() -> None:
         await close_alert(mcp, project=project)
 
 
+@pytest.mark.anyio
+async def test_precheck_not_swallowed_when_permission_error_text_contains_not_found() -> None:
+    """Adversarial mock — a permission fault whose free-form ``error`` text
+    happens to contain the phrase "not found" must NOT be swallowed as absent.
+
+    Pins the fix for Bohr msg-2139 §5 (the "受諾条件 (a) 型弁別である" path
+    with an adversarial mock) and the naysayer's PR-gate objection on head
+    9b023fe: the prior discriminator ``"not found" in str(exc).lower()`` was
+    a natural-language substring in the envelope's free-form ``error`` text.
+    A genuine ``ChatroomPermissionError`` whose text says "role 'orchestrator'
+    not found in closeable_roles" would have matched — and been silently
+    classified as a benign not-found response, violating the surfacing
+    invariant. The fixed discriminator matches the machine-owned
+    ``error_type='ChatroomNotFoundError'`` tag as embedded by
+    ``_elevation_message``, so this adversarial envelope surfaces as
+    ``GateBootstrapCloseError`` even though its text contains "not found".
+
+    Test independence from the naysayer's specific example: the mock message
+    text was picked to include "not found" precisely to falsify the old
+    string-based discriminator. If this test passes, the discrimination is
+    demonstrably structural, not textual.
+    """
+    project = "x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _error_envelope(
+                "ChatroomPermissionError",
+                "read access denied: role 'orchestrator' not found in closeable_roles",
+            ),
+        }
+    )
+    with pytest.raises(GateBootstrapCloseError, match="precheck refused"):
+        await close_alert(mcp, project=project)
+    close_calls = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
+    assert close_calls == []
+
+
+@pytest.mark.anyio
+async def test_close_boundary_not_swallowed_when_permission_error_text_contains_not_found() -> None:
+    """Sibling of the precheck adversarial test at the *close* boundary.
+
+    The close-boundary swallow uses the SAME structural discriminator as the
+    precheck (Bohr msg-2139 §5 併せて 1 点: 二つの swallow が二つの述語を
+    持つと片方だけが直る形の divergence を作る). This test proves both
+    boundaries reject the same adversarial input, so any future change to
+    the discriminator affects both by construction.
+    """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id),
+            "chatroom_close_thread": _error_envelope(
+                "ChatroomPermissionError",
+                "closeable_roles check failed: role 'orchestrator' not found in project role registry",  # noqa: E501
+            ),
+        }
+    )
+    with pytest.raises(GateBootstrapCloseError, match="closeable_roles"):
+        await close_alert(mcp, project=project)
+
+
+def test_envelope_not_found_marker_matches_real_elevated_envelope() -> None:
+    """Belt-and-braces coupling test: the structural marker in gate_bootstrap
+    matches what :func:`raise_if_envelope` actually produces for a real
+    ``ChatroomNotFoundError`` envelope.
+
+    Guards against silent drift in ``_elevation_message``'s format
+    (magickit/client.py:284-289). If the format ever changes such that
+    ``error_type='ChatroomNotFoundError'`` is no longer a substring of the
+    elevated message, this test fails loudly rather than letting the
+    discriminator quietly stop matching (which would classify every
+    ChatroomNotFoundError as a genuine fault and start surfacing them all as
+    GateBootstrapCloseError — the opposite kind of regression, still bad).
+    """
+    from spirrow_mindwire.gate_bootstrap import (
+        _ENVELOPE_NOT_FOUND_MARKER,
+        _is_thread_not_found_envelope,
+    )
+
+    envelope = _error_envelope(
+        "ChatroomNotFoundError",
+        "Thread 'T-gate-bootstrap-x' not found in project 'x'",
+    )
+    try:
+        raise_if_envelope(envelope)
+    except MagickitMcpError as exc:
+        assert _ENVELOPE_NOT_FOUND_MARKER in str(exc), (
+            f"marker {_ENVELOPE_NOT_FOUND_MARKER!r} not found in elevated "
+            f"message {str(exc)!r} — did _elevation_message's format change?"
+        )
+        assert _is_thread_not_found_envelope(exc) is True
+    else:
+        pytest.fail("raise_if_envelope did not raise on a real not-found envelope")
+
+
+@pytest.mark.anyio
+async def test_close_alert_precheck_and_close_share_one_not_found_predicate() -> None:
+    """Property-style pin (Bohr msg-2139 §5 併せて 1 点): the precheck's
+    not-found swallow and the close-boundary's not-found swallow are one
+    predicate, not two — any envelope classified as not-found at one
+    boundary is classified the same way at the other.
+
+    Tests both classifications directly via ``_is_thread_not_found_envelope``,
+    so a future refactor that splits the two swallows into two predicates
+    would fail here loudly rather than diverge silently.
+    """
+    from spirrow_mindwire.gate_bootstrap import _is_thread_not_found_envelope
+
+    # A real not-found envelope: matches.
+    not_found = MagickitMcpError(
+        "magickit tool returned an error envelope: total=3 "
+        "keys=['details', 'error', 'error_type'] "
+        "error_type='ChatroomNotFoundError' "
+        "error=\"Thread 'x' not found in project 'x'\""
+    )
+    assert _is_thread_not_found_envelope(not_found) is True
+
+    # A permission fault whose free-form text contains "not found": does NOT match.
+    perm_containing_not_found = MagickitMcpError(
+        "magickit tool returned an error envelope: total=3 "
+        "keys=['details', 'error', 'error_type'] "
+        "error_type='ChatroomPermissionError' "
+        "error=\"role 'orchestrator' not found in closeable_roles\""
+    )
+    assert _is_thread_not_found_envelope(perm_containing_not_found) is False
+
+    # A transport error mentioning "not-found" in a project name: does NOT match.
+    transport_with_not_found_project = MagickitMcpError(
+        "magickit MCP call 'chatroom_get_thread' failed: "
+        "ConnectionError: could not reach project 'spirrow-not-found-x'"
+    )
+    assert _is_thread_not_found_envelope(transport_with_not_found_project) is False
+
+
 # --- CLI wrapper (scripts/gate_bootstrap_tick.py) -----------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
