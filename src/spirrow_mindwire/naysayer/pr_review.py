@@ -929,10 +929,15 @@ def parse_objections(critique: str, *, expected_nonce: str) -> ObjectionReport:
     try:
         # ``raw_decode`` stops at the end of the array, so the verdict line (and any
         # prose) that follows the block is simply not consumed.
-        parsed, _ = json.JSONDecoder().raw_decode(payload_lstripped)
+        parsed, consumed = json.JSONDecoder().raw_decode(payload_lstripped)
     except ValueError:
         return _missing(ObjectionMissingReason.PAYLOAD_UNPARSEABLE)
     if not isinstance(parsed, list):
+        return _missing(ObjectionMissingReason.PAYLOAD_UNPARSEABLE)
+    # Trailing-list defense (security, msg-2361): a decoy array before the real one
+    # would silently APPROVE via raw_decode's trailing-text tolerance. Reject any
+    # remainder whose first non-whitespace is ``[`` — one marker, one list.
+    if payload_lstripped[consumed:].lstrip().startswith("["):
         return _missing(ObjectionMissingReason.PAYLOAD_UNPARSEABLE)
     if not parsed:
         return _report(ObjectionParse.EMPTY)
