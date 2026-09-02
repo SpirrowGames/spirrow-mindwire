@@ -38,6 +38,28 @@ Residual hole (a) (msg-954 §6) is handled by *not depending on it*: the live
 fallback is impossible. The preflight reads no configuration at all — it
 observes the backend afresh every time, which is why a fallback that served the
 probe would surface as a mismatching row and fail the spawn.
+
+**Two columns, two jobs — do not conflate them** (T-preflight-row-selector-
+reads-wrong-column). Step 1 *selects* our probe's row out of concurrent traffic;
+step 2 *judges* it. Selection reads ``tier``, which carries the alias we asked
+for (``"naysayer"``) and is therefore the column that answers "is this row
+mine?". Judgement reads ``backend``, which names the route the gateway chose and
+is the column the model cannot write. Selecting on an echo of our own request is
+sound precisely because it decides nothing: were ``tier`` selection to go wrong
+the attempt fails closed, and no amount of a right ``tier`` can make a wrong
+``backend`` pass. Measured 2026-09-02 on the live ledger: a ``tier="heavy"``
+request was served by ``backend="deep"`` — the two columns genuinely disagree,
+which is what makes ``backend`` evidence and ``tier`` merely an address.
+
+This used to read ``model``, and was correct when written (#143, 2026-08-13):
+the gateway then echoed the requested alias into ``model`` and had no ``tier``
+column at all. On 2026-09-01T00:23Z Lexora added ``tier`` and changed ``model``
+to mean the resolved upstream model id (``"gemini-3.1-pro-preview"``). The cut
+is exact — ledger ids ≤8282 carry the old shape, ≥8283 the new, with no
+interleaving — so **no row of the old shape has been written since**, and no
+backward-compatible branch is carried here: a branch whose condition can never
+again be true is a dead limb that still has to be maintained and reasoned about.
+The consequence of that deletion is pinned by a test, so re-adding one reds.
 """
 
 from __future__ import annotations
@@ -88,6 +110,13 @@ class PreflightError(RuntimeError):
     them into a taxonomy would invite a caller to treat some as recoverable,
     which is the failure this class exists to prevent. The distinguishing detail
     goes in the message.
+
+    That last sentence is load-bearing and is why the 2026-09-01 outage is
+    answered here with *wording* rather than a new exception class: "the gateway
+    wrote no row" and "rows were written but our selector matched none of them"
+    are different facts about the world and must be told apart by a reader, but
+    they are the same fact operationally (the route was not proven) and must not
+    be told apart by a caller.
     """
 
 
@@ -138,6 +167,26 @@ def _max_row_id(rows: list[dict[str, Any]]) -> int:
     return max((_row_id(row) for row in rows), default=0)
 
 
+def _observed_shape(rows: list[dict[str, Any]]) -> str:
+    """Describe rows we could not select from, for the failure message.
+
+    A **bounded projection**, never ``{row!r}``. The column set is the whole
+    diagnostic — it is what names a schema change in one line — and the first
+    row's ``tier``/``model``/``backend`` triple shows what the selector was
+    handed. Dumping whole rows would put every present and future column
+    (``user_id`` today, anything at all tomorrow) into an exception that is
+    quoted verbatim into durable chatroom posts, which is the same leak the
+    route reducer exists to prevent.
+    """
+    keys = sorted({key for row in rows for key in row})
+    first = rows[0]
+    return (
+        f"observed columns {keys!r}; first row above baseline: "
+        f"id={first.get('id')!r} tier={first.get('tier')!r} "
+        f"model={first.get('model')!r} backend={first.get('backend')!r}"
+    )
+
+
 async def _attempt(
     client: LexoraPreflightClient,
     *,
@@ -159,17 +208,39 @@ async def _attempt(
         max_tokens=PREFLIGHT_MAX_TOKENS,
     )
     rows = await client.stats_costs_recent(limit=_RECENT_LIMIT)
-    candidates = [row for row in rows if _row_id(row) > baseline and row.get("model") == tier]
+    # Sorted once here so ``candidates`` inherits id order: the probe id joins
+    # them in that order, and ``_observed_shape`` reports the *earliest* row
+    # above the baseline rather than whichever end the endpoint happened to
+    # return first.
+    above = sorted((row for row in rows if _row_id(row) > baseline), key=_row_id)
+    # ``tier``, not ``model`` — see "Two columns, two jobs" in the module
+    # docstring. ``model`` names the resolved upstream model id since
+    # 2026-09-01T00:23Z and no longer identifies the requester.
+    candidates = [row for row in above if row.get("tier") == tier]
     if not candidates:
+        if not above:
+            raise PreflightError(
+                f"no accounting row at all appeared after the preflight probe "
+                f"(baseline id {baseline}); a 2xx response is not evidence of routing"
+            )
+        # Distinct on purpose. The previous wording said no row appeared for our
+        # tier, which in 2026-09-01's schema change was **false**: the rows were
+        # there, billed and routed, and only our selector missed them. A message
+        # that accuses the gateway sends the reader to a gateway that is healthy,
+        # and the reader stops. This one accuses *this host* and shows the shape
+        # it could not read, which is the difference between a 46-hour outage and
+        # a one-line diagnosis.
         raise PreflightError(
-            f"no accounting row for tier {tier!r} appeared after the preflight probe "
-            f"(baseline id {baseline}); a 2xx response is not evidence of routing"
+            f"{len(above)} accounting row(s) appeared after the preflight probe "
+            f"(baseline id {baseline}) but none carries tier {tier!r}: this host's "
+            f"row selector and the gateway's row shape disagree — the probe was "
+            f"served and billed, so this is not evidence about routing. "
+            f"{_observed_shape(above)}"
         )
     # ``success`` is NOT filtered on. A failed row still records which backend
     # the gateway handed the request to, and if a fallback ever served the probe
     # the extra row is precisely the evidence that would reveal it. Dropping
     # unsuccessful rows would drop the evidence.
-    candidates.sort(key=_row_id)
     backends = {str(row.get("backend")) for row in candidates}
     if backends != {expected}:
         # Includes the single-mismatch case and the "candidates disagree" case
