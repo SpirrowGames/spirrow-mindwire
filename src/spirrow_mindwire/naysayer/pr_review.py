@@ -596,6 +596,58 @@ def _missing_report(reason: ObjectionMissingReason) -> ObjectionReport:
     return ObjectionReport(status=ObjectionParse.MISSING, missing_reason=reason)
 
 
+# Deepest bracket nesting :func:`parse_objections` will hand to ``raw_decode``. Well under
+# CPython's recursion limit (empirically ``raw_decode("[" * 200)`` still returns ValueError,
+# ``"[" * 1000`` raises RecursionError), and orders of magnitude above any real objection
+# block: the schema is a flat list of flat objects, so honest payloads nest 2 deep.
+_MAX_PAYLOAD_NESTING = 100
+
+
+def _nesting_exceeds(text: str, limit: int = _MAX_PAYLOAD_NESTING) -> bool:
+    """Cheap pre-scan: could any suffix of ``text`` nest brackets deeper than ``limit``?
+
+    **Bound, not catch (msg-2385 §5).** ``json``'s decoder recurses per open bracket, so a
+    payload of a thousand ``[`` raises ``RecursionError`` — which is a ``BaseException``, not
+    a ``ValueError``, so it escapes :func:`parse_objections`'s ``except ValueError`` and
+    breaks the "Never raises" contract in that function's docstring. Catching it is not a
+    fix: at the moment ``RecursionError`` fires the stack is already exhausted, so the
+    handler itself can re-raise. Rejecting over-deep input *before* the decoder sees it is
+    deterministic and pinnable.
+
+    A second, sharper reason, measured rather than argued: widening the two
+    ``except ValueError`` clauses to ``except (ValueError, RecursionError)`` makes the D-7
+    loop treat an over-deep chained payload as "this bracket did not open a list" and step
+    past it, so the critique parses ``EMPTY`` and derives **APPROVE**. The catch does not
+    merely fail to restore "Never raises"; at the loop's call site it converts a crash into
+    a false APPROVE — the one outcome this parser exists to make impossible.
+
+    Two deliberate conservatisms, both fail-closed (MISSING → REQUEST_CHANGES, never
+    APPROVE), which is the direction msg-2385 §2's F invariant permits:
+
+    * **Brackets inside JSON strings are counted.** Tracking string state would make the
+      scan agree exactly with the decoder, but disagreeing only ever over-rejects. An
+      honest ``evidence`` string holding 100 unbalanced brackets does not occur.
+    * **Every suffix is bounded, not just the whole string.** ``depth - floor`` measures the
+      rise from the lowest point seen so far, so it upper-bounds the local depth of a scan
+      started at ANY offset. The trailing-list loop calls ``raw_decode`` at every ``[`` in
+      the remainder, so one scan of the whole payload covers all of those starts; bounding
+      each slice separately would re-read the tail once per ``[`` and reintroduce the
+      O(N^2) shape (measured at 1.2 s worst case, msg-2388 E-5) for no extra safety.
+    """
+    depth = 0
+    floor = 0
+    for ch in text:
+        if ch in "[{":
+            depth += 1
+            if depth - floor > limit:
+                return True
+        elif ch in "]}":
+            depth -= 1
+            if depth < floor:
+                floor = depth
+    return False
+
+
 def parse_objections(critique: str) -> ObjectionReport:
     """Parse the objection block out of ``critique``. Never raises.
 
@@ -603,8 +655,10 @@ def parse_objections(critique: str) -> ObjectionReport:
 
     ``OK``           marker present, array parsed, every class known and evidenced.
     ``EMPTY``        the array is ``[]`` — a legal statement that nothing was objected to.
-    ``MISSING``      no column-zero marker, more than one column-zero marker, or the payload
-                     after the marker does not begin with a JSON array.
+    ``MISSING``      no column-zero marker, more than one column-zero marker, the payload
+                     after the marker does not begin with a JSON array, a SECOND array is
+                     chained behind the first (D-7), or the payload nests deeper than
+                     :data:`_MAX_PAYLOAD_NESTING` (D-6).
     ``UNKNOWN``      some element names a class outside the vocabulary.
     ``NO_EVIDENCE``  some blocking element carries no evidence.
 
@@ -646,6 +700,29 @@ def parse_objections(critique: str) -> ObjectionReport:
     language is the same). The load-bearing wall is now self-sufficient. Pinned by
     :func:`test_v2_fence_less_payload_with_leading_newline_is_accepted` and
     :func:`test_d5_payload_starts_after_leading_whitespace_independent_of_helper`.
+
+    **D-6 (depth bound before the decoder, msg-2380 / msg-2385 §5 / msg-2388 E-5).** "Never
+    raises" above was false on ``main``: ``json``'s decoder recurses per open bracket, so a
+    payload of a thousand ``[`` leaked ``RecursionError`` — a ``BaseException``, so the
+    ``except ValueError`` below never saw it — and took the whole review call down with it,
+    since :func:`decide_verdict` calls this function unconditionally. Unlike the D-7 window
+    below, this one is NOT shadow-only: the crash is real today. Fixed by bounding the input
+    rather than catching the error; :func:`_nesting_exceeds` carries both reasons and the
+    single-scan/two-call-sites argument.
+
+    **D-7 (trailing-list defense, msg-2361 / msg-2363, ported here by msg-2397 §9).** V-1's
+    property — ``raw_decode`` stops at the first ``]``, so trailing text is structurally
+    invisible — is also an injection surface. A critique that writes a decoy ``[]`` right
+    after the marker and its REAL blocking array underneath parses ``EMPTY`` and derives
+    APPROVE. Both the chained variant and the prose-separated variant were measured open on
+    ``main``. So the remainder is scanned: any ``[`` in it that begins a NON-EMPTY JSON list
+    means a chained block, and the parse is refused (a chained ``[]`` cannot hide an objection,
+    and ``[]`` in prose is ordinary — see the narrowing note at the loop). This does NOT
+    contradict V-1 — trailing text is still not *consumed*; it is now *inspected*, and its
+    presence disqualifies the block rather
+    than being selected as the payload (selecting the later array is the fail-open ``find("[")``
+    shape D-3 already rejected). D-4 stays dropped: arbitrary prose after the block is still
+    fine, only a chained ARRAY is refused.
 
     **What is NOT done here.** D-2-prime (a non-regression floor on ``gate_verdict``: the derived
     read may never lower the gate below the pre-Stage-1 baseline) is a Stage-2 constraint on
@@ -689,17 +766,59 @@ def parse_objections(critique: str) -> ObjectionReport:
     # we just verified. The strip is safe because D-3 has already established that the
     # first non-whitespace char is ``[``.
     payload = payload.lstrip()
+    if _nesting_exceeds(payload):
+        # D-6. ONE scan, both ``raw_decode`` call sites (msg-2397 M7). It runs on the whole
+        # payload, and :func:`_nesting_exceeds` bounds the local depth of EVERY suffix, so it
+        # covers the primary decode below AND every re-entry the D-7 loop makes at
+        # ``rest[bracket:]`` — ``rest`` is a slice of this same string. A second scan before
+        # the loop would be provably unreachable, i.e. dead code no negative control can turn
+        # red; the two-site coverage is pinned by behaviour instead, one test per call site.
+        return _missing_report(ObjectionMissingReason.BAD_JSON)
     try:
         # ``raw_decode`` stops at the end of the array, so the verdict line (and any prose)
         # that follows the block is simply not consumed — no need to guess where it ends.
         # V-1 (rider-3 msg-2074): this is what makes trailing text after ``]`` structurally
         # invisible to the parser, which is why D-4 ("no trailing text allowed") was dropped
         # rather than turned into a code change (msg-2130 §3).
-        parsed, _ = json.JSONDecoder().raw_decode(payload)
+        parsed, consumed = json.JSONDecoder().raw_decode(payload)
     except ValueError:
         return _missing_report(ObjectionMissingReason.BAD_JSON)
     if not isinstance(parsed, list):
         return _missing_report(ObjectionMissingReason.NOT_A_LIST)
+    # D-7: V-1's blindness to trailing text is what an injector exploits. If any ``[`` in the
+    # unconsumed remainder begins a NON-EMPTY JSON list, a second block is chained behind the
+    # first and the whole parse is refused. Refusing is fail-closed (MISSING → RC) and cannot
+    # be used to soften a verdict, which is why "reject" beats "pick the later array".
+    #
+    # Why non-empty and not any list (a deliberate narrowing of the #206 R5/R6 shape, which
+    # refuses every chained list). The attack is "show the parser a benign array, show the
+    # human the real one", so it only works if the LATER array is the more damning of the two.
+    # A chained ``[]`` is never more damning than what precedes it: if the first array blocks,
+    # the parse already derives RC; if it does not, an empty second array adds no hidden
+    # objection. So refusing on ``[]`` buys no attack coverage — and it costs a great deal,
+    # because ``[]`` in prose is ordinary. The gate's own system prompt says "``[]`` if you
+    # stated none", so the broad form derives MISSING for any critique that echoes its own
+    # instructions, which ``test_quoting_the_prompt_objection_exemplar_is_fail_closed`` catches
+    # on this very file. False RC is permitted (msg-2385 §2, F) but not free: this parser's
+    # output is the shadow measurement rider 2 is calibrating, and a defense that fires on
+    # ordinary critiques saturates the very signal it is instrumenting.
+    #
+    # ``bad_json`` rather than a new ``ObjectionMissingReason`` member: this is the shape #206
+    # lands as ``payload_unparseable`` (which merges ``bad-json`` and ``not-a-list``), so
+    # reusing the existing member keeps this backport free of an enum change #206 would
+    # immediately rename, and off the enum-derived exhaustive pin in
+    # ``test_missing_reason_never_leaks_into_the_posted_notice``.
+    rest = payload[consumed:]
+    probe = 0
+    while (bracket := rest.find("[", probe)) >= 0:
+        try:
+            chained, _ = json.JSONDecoder().raw_decode(rest[bracket:])
+        except ValueError:
+            probe = bracket + 1
+            continue
+        if isinstance(chained, list) and chained:
+            return _missing_report(ObjectionMissingReason.BAD_JSON)
+        probe = bracket + 1
     if not parsed:
         return ObjectionReport(status=ObjectionParse.EMPTY)
 

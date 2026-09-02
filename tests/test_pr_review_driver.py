@@ -8,6 +8,7 @@ session tests are gone — what remains is the deterministic-guard + judging beh
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ from spirrow_mindwire.naysayer.pr_review import (
     _MARKER_C_SUPPRESSED,
     _MARKER_D_DIVERGENCE,
     _MAX_DIFF_CHARS,
+    _MAX_PAYLOAD_NESTING,
     _OBJECTIONS_SENTINEL,
     _PR_REVIEW_SYSTEM_PROMPT,
     _VERDICT_RE,
@@ -51,6 +53,7 @@ from spirrow_mindwire.naysayer.pr_review import (
     ObjectionParse,
     PostCritique,
     _ci_gate_response,
+    _nesting_exceeds,
     _parse_model_verdict,
     decide_verdict,
     derive_verdict,
@@ -1952,6 +1955,161 @@ def test_missing_reason_covers_five_disjoint_causes() -> None:
     assert parse_objections(ok).missing_reason is None
     empty = _critique_with_objections(ModelVerdict.APPROVE, "[]")
     assert parse_objections(empty).missing_reason is None
+
+
+def test_d7_chained_array_after_a_decoy_empty_block_is_refused() -> None:
+    """D-7. A decoy ``[]`` followed by the model's REAL blocking array derives RC, not APPROVE.
+
+    This is the window msg-2388 E-2b measured open on ``main``. ``raw_decode`` stops at the
+    first ``]`` (V-1), so a critique whose block opens with ``[]`` parses EMPTY and the
+    blocking objections written directly underneath are structurally invisible — the derived
+    verdict says APPROVE while the prose says the opposite. Both spellings are pinned: the
+    chained array on the next line, and the same array with prose between the two (that
+    variant does not depend on the marker regex's tail anchor, so it survives the anchor
+    change #206 makes and must be closed here, ahead of it).
+
+    NEGATIVE CONTROL (msg-2397 M6), run before this test was written: with the D-7 loop
+    deleted and everything else intact, both bodies parse ``EMPTY`` -> derived APPROVE. The
+    loop is what moves them, not the D-6 bound landing alongside it.
+    """
+    blocking = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
+    bodies = {
+        "chained": f"{_OBJECTIONS_SENTINEL}\n[]\n{blocking}\n\nVERDICT: APPROVE",
+        "prose-separated": (
+            f"{_OBJECTIONS_SENTINEL}\n[]\n\nand here is the real block:\n\n"
+            f"{blocking}\n\nVERDICT: APPROVE"
+        ),
+    }
+    for label, body in bodies.items():
+        report = parse_objections(body)
+        assert report.status is ObjectionParse.MISSING, (
+            f"{label}: a chained array must not read as EMPTY; got {report.status.value}"
+        )
+        assert report.missing_reason is ObjectionMissingReason.BAD_JSON, label
+        assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES, label
+
+
+def test_d7_does_not_fire_on_honest_blocks_or_on_trailing_prose() -> None:
+    """D-7 is fail-closed but not indiscriminate: the shapes the gate sees every day still pass.
+
+    The failure mode a "reject anything suspicious" defense invites is false RC on the
+    ordinary cases, which would make the derived read useless as a measurement (rider 2 reads
+    the divergence between derived and posted; a defense that fires constantly saturates it).
+    Trailing prose after the block is explicitly still legal — D-4 stayed dropped. Only a
+    chained ARRAY is refused, and a bracket in trailing prose that does not open a valid JSON
+    list is not one.
+    """
+    blocking = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
+    ok_cases = {
+        "blocking + verdict line": (
+            f"{_OBJECTIONS_SENTINEL}\n{blocking}\n\nVERDICT: REQUEST_CHANGES"
+        ),
+        "blocking + trailing prose": (
+            f"{_OBJECTIONS_SENTINEL}\n{blocking}\n\nsee also pr_review.py "
+            "[line 42] for context\n\nVERDICT: REQUEST_CHANGES"
+        ),
+        "blocking + unparseable bracket in prose": (
+            f"{_OBJECTIONS_SENTINEL}\n{blocking}\n\nnote the [not json literal\n\n"
+            "VERDICT: REQUEST_CHANGES"
+        ),
+        # The narrowing. A chained EMPTY list is not a hidden block, and ``[]`` in prose is
+        # ordinary — the gate's own system prompt writes "``[]`` if you stated none", which is
+        # why the un-narrowed shape reds
+        # ``test_quoting_the_prompt_objection_exemplar_is_fail_closed`` on this very file.
+        "blocking + a bare [] in trailing prose": (
+            f"{_OBJECTIONS_SENTINEL}\n{blocking}\n\nwrite `[]` if you stated none\n\n"
+            "VERDICT: REQUEST_CHANGES"
+        ),
+    }
+    for label, body in ok_cases.items():
+        report = parse_objections(body)
+        assert report.status is ObjectionParse.OK, (
+            f"{label}: D-7 must not fire here; got {report.status.value} "
+            f"missing_reason={report.missing_reason}"
+        )
+    empty_cases = {
+        "honest empty block": f"{_OBJECTIONS_SENTINEL}\n[]\n\nVERDICT: APPROVE",
+        # Two empty arrays chain nothing: whatever the second one is, it names no objection
+        # the first one hid. Refusing here would buy no attack coverage — see the narrowing
+        # note in ``parse_objections``.
+        "empty block + a chained empty list": (
+            f"{_OBJECTIONS_SENTINEL}\n[]\n\nand `[]` again\n\nVERDICT: APPROVE"
+        ),
+    }
+    for label, body in empty_cases.items():
+        report = parse_objections(body)
+        assert report.status is ObjectionParse.EMPTY, (
+            f"{label}: an honest empty block must still derive APPROVE — D-7 refuses a "
+            f"chained NON-EMPTY array, not an empty one; got {report.status.value} "
+            f"missing_reason={report.missing_reason}"
+        )
+        assert derive_verdict(report) is ReviewEvent.APPROVE, label
+
+
+def test_d6_depth_bound_keeps_the_never_raises_contract_at_both_decode_sites() -> None:
+    """D-6 (msg-2380, msg-2397 M7). Over-deep payloads derive MISSING instead of crashing.
+
+    :func:`parse_objections` documents "Never raises" and :func:`decide_verdict` calls it
+    unconditionally, so an escaping exception takes down the whole review — this one is a
+    live production defect on ``main``, not a shadow-path one. ``json``'s decoder recurses
+    per open bracket and raises ``RecursionError``, which is a ``BaseException`` and so is
+    not caught by the ``except ValueError`` around it.
+
+    There are TWO ``raw_decode`` call sites — the primary parse and the D-7 loop's re-entry
+    at ``rest[bracket:]`` — and M7 requires both to be covered. They are covered by ONE
+    pre-scan, because :func:`_nesting_exceeds` bounds the local depth of every suffix of the
+    string it is given and ``rest`` is a slice of that same string. A second scan before the
+    loop would be unreachable code, so the two-site coverage is pinned here by behaviour: the
+    second body below reaches the loop (its primary parse succeeds on ``[]``) and is the
+    input that crashes at the loop's call site.
+
+    NEGATIVE CONTROL (msg-2397 M6), run before this test was written: with the D-6 scan
+    disabled and the D-7 loop left in place, the first body raises ``RecursionError`` at
+    ``parsed, consumed = ...raw_decode(payload)`` and the second at
+    ``chained, _ = ...raw_decode(rest[bracket:])`` — distinct call sites, distinct
+    tracebacks. Both are green here only because of the bound.
+    """
+    deep = "[" * 5000
+    bodies = {
+        "site 1: primary decode": f"{_OBJECTIONS_SENTINEL}\n{deep}",
+        "site 2: D-7 loop re-entry": f"{_OBJECTIONS_SENTINEL}\n[]\n{deep}",
+    }
+    for label, body in bodies.items():
+        report = parse_objections(body)  # must not raise
+        assert report.status is ObjectionParse.MISSING, label
+        assert report.missing_reason is ObjectionMissingReason.BAD_JSON, label
+        assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES, label
+
+
+def test_d6_bound_is_a_bound_not_a_catch_and_leaves_real_payloads_alone() -> None:
+    """D-6's threshold sits between "any honest block" and "the decoder's recursion limit".
+
+    Two properties, both load-bearing. (a) The bound rejects BEFORE the decoder runs — pinned
+    by the ``at_limit`` case, which is well-formed JSON the decoder would happily accept at
+    depth ``_MAX_PAYLOAD_NESTING`` and still parses, versus ``over_limit`` one level deeper
+    which is refused without the decoder ever seeing it. A ``try/except RecursionError``
+    implementation could not tell those apart, because the decoder does not raise at either
+    depth. (b) Objection blocks of the real schema (a flat list of flat objects, depth 2)
+    are nowhere near the threshold.
+    """
+    at_limit = "[" * _MAX_PAYLOAD_NESTING + "]" * _MAX_PAYLOAD_NESTING
+    over_limit = "[" * (_MAX_PAYLOAD_NESTING + 1) + "]" * (_MAX_PAYLOAD_NESTING + 1)
+    # Sanity: both are valid JSON as far as the decoder is concerned. The difference the
+    # test detects is the bound's, not the decoder's.
+    assert isinstance(json.loads(at_limit), list)
+    assert isinstance(json.loads(over_limit), list)
+
+    report = parse_objections(f"{_OBJECTIONS_SENTINEL}\n{at_limit}\n\nVERDICT: APPROVE")
+    assert report.status is ObjectionParse.UNKNOWN, (
+        "a payload exactly at the bound must still reach the decoder; the nested list is "
+        "not a valid objection element, which is why the status is UNKNOWN and not MISSING"
+    )
+    report = parse_objections(f"{_OBJECTIONS_SENTINEL}\n{over_limit}\n\nVERDICT: APPROVE")
+    assert report.status is ObjectionParse.MISSING
+    assert report.missing_reason is ObjectionMissingReason.BAD_JSON
+
+    real = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
+    assert not _nesting_exceeds(real), "the real objection schema must clear the bound"
 
 
 def test_missing_reason_appears_in_shadow_log_line(caplog: pytest.LogCaptureFixture) -> None:
