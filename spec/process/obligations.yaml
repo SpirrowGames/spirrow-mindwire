@@ -296,12 +296,35 @@ obligations:
     # 準備ができている」 — the obligation therefore had to enter this file before
     # the design's execution paths could be probed.
     #
-    # Bohr's msg-2084 §5(1) directed the split reflected below: the 「追加すべき
-    # 義務」 clause enters the body verbatim (below), and Einstein's 処方 sentence —
-    # which frames the addressee and the antecedent — enters this rationale block
-    # verbatim (immediately following). The body's opening 「その場合、…」 refers to
-    # the antecedent of that 処方 sentence; the referent is preserved in the
-    # rationale here rather than repeated in the body.
+    # Bohr's msg-2084 §5(1) originally directed a split — the 「追加すべき義務」
+    # clause into the body, Einstein's 処方 sentence into this rationale block —
+    # and that split cut the obligation's antecedent out of the injected string:
+    # YAML loaders discard `#` comments, so the toolchain that injects this entry
+    # reads only `id` / `role` / `body` (msg-2207). Bohr withdrew that instruction
+    # in msg-2387 §1 as an error in his own spec, and §4 replaced it.
+    #
+    # The body below therefore carries TWO verbatim spans of msg-1968, in order:
+    # first the antecedent 「もし事前ロールチェックが存在して sweeper が弾かれる
+    # 事実が確認された場合」 — which Einstein himself delimited with 「」 inside
+    # his 処方 sentence, so it is extractable verbatim WITHOUT the surrounding
+    # meta-commentary — then the 「追加すべき義務」 clause. That is a widening of
+    # the verbatim span, not a paraphrase, so msg-2084 §5(1)(b) (verbatim, no
+    # paraphrase) still holds. The seam reads 「…場合、その場合、…」, which is
+    # redundant; msg-2387 §4(1) allows a less redundant cut only where a single
+    # verbatim sentence of the original carries the antecedent, and no such
+    # sentence exists here (the only one that does is the meta-framed 処方
+    # sentence quoted below), so the redundancy is kept rather than smoothed by
+    # words that are not Einstein's.
+    #
+    # What belongs in the span is decided by ROLE, not by length (msg-2387 §5):
+    # in = everything the implementer needs in order to comply, the antecedent
+    # included; out = discussion they do not need in order to comply (another
+    # role's meta-commentary, thread history, rationale). Round 1 (msg-2111 §2)
+    # shortened this span to strip meta-commentary and took the antecedent with
+    # it; round 2 (msg-2207) put the antecedent back. Both remain satisfied only
+    # because the two are separated by role, not by how much text is quoted.
+    # The standing test: delete every comment in this entry — is the obligation
+    # still complete and unambiguous?
     #
     # Einstein's 処方 (verbatim, msg-1968):
     #
@@ -312,12 +335,18 @@ obligations:
     # Trigger-field note (answers Bohr msg-2087 §2(e)): this manifest schema has
     # no separate `trigger` field. Every entry is unconditionally injected into
     # the corresponding role's system prompt on every turn; a conditional
-    # obligation carries its antecedent as prose within the entry's rationale
-    # and body. When the antecedent is not observed, the entry asks nothing of
-    # the implementer at read time. This entry is such a conditional: the body
-    # says "in that case, do X"; if X has not been triggered, the implementer
-    # reads the entry and moves on. There is no field to gate the injection on
-    # and no field to omit — the conditional lives in the prose.
+    # obligation must carry its antecedent as prose inside its own `body`, since
+    # that is the only field the injection path renders. When the antecedent is
+    # not observed, the entry asks nothing of the implementer at read time. This
+    # entry is such a conditional: the body says "if <antecedent>, then do X";
+    # if the antecedent has not been observed, the implementer reads the entry
+    # and moves on. There is no field to gate the injection on and no field to
+    # omit — the conditional lives in the prose, which is precisely why the
+    # prose has to be in `body`. Note that this paragraph previously recorded
+    # the same thing as a property that already held ("carries its antecedent
+    # … within the entry's rationale and body"), and it did not hold: a property
+    # written as a description is checked by nobody. It is now a requirement,
+    # and it is checked — see the Enforced-by line at the end of this comment.
     #
     # Where the antecedent becomes observable is not this entry's business —
     # it is the design's business (T-new-project-gate-bootstrap S-4 probe,
@@ -338,7 +367,12 @@ obligations:
     # Source: T-new-project-gate-bootstrap msg-1968 (Einstein, naysayer,
     # 2026-08-28T09:59:31Z, reply_to msg-1967). The msg-1968 verbatim is
     # cited in the T-new-project-gate-bootstrap thread by Heisenberg msg-2083.
-    body: "その場合、ADR-10 のロールを sweeper に付与して誤魔化すのではなく、PR-gate の carve-out と同様に、`chatroom_close_thread` 側に『`system-alert` タグを持ち、かつ owner 自身によるクローズである場合はロールチェックを免除する』という構造的な carve-out（例外経路）をコードとして追加実装すること。"
+    #
+    # Enforced by test_obl_gate_bootstrap_close_carveout_body_carries_its_antecedent
+    # in tests/test_obligations.py — it reads the antecedent out of the rendered
+    # implementer system prompt, i.e. out of the string production actually
+    # injects, so moving the antecedent back into a comment reds the gate.
+    body: "もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合、その場合、ADR-10 のロールを sweeper に付与して誤魔化すのではなく、PR-gate の carve-out と同様に、`chatroom_close_thread` 側に『`system-alert` タグを持ち、かつ owner 自身によるクローズである場合はロールチェックを免除する』という構造的な carve-out（例外経路）をコードとして追加実装すること。"
 
   - id: OBL-SPEC-SCOPE-CLOSURE
     role: implementer

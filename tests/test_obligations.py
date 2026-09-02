@@ -1,7 +1,7 @@
 """Canaries and pointer-existence guard for the loop-readable obligations manifest.
 
-Two canaries + one grep, no skip conditions. Together they enforce the invariants
-the Tier-C GO msg-737 nailed down:
+Two canaries + one INV-C guard + one grep, no skip conditions. Together they
+enforce the invariants the Tier-C GO msg-737 nailed down:
 
 - **two-prime** wiring: the *rendered* system prompt each adapter assembles from a manifest
   contains that manifest's body verbatim. This is the "prompt builder receives the
@@ -13,6 +13,11 @@ the Tier-C GO msg-737 nailed down:
   well-meaning "cleanup" that shortens or reflows the moved body reds this canary
   rather than silently drifting the loop's actual instruction away from what was
   reviewed.
+- **INV-C** (consumer-visible placement, msg-2387 §3): a conditional obligation's
+  antecedent reaches the *rendered* implementer prompt, and the meta-commentary
+  round 1 stripped stays out of it. Both halves in one test because the two
+  findings on that entry pulled in opposite directions and a guard on either
+  half alone lets the other regress.
 
 Canary ① (a hardcoded ``_EXPECTED_IDS_BY_ROLE`` shadow list of manifest ids in
 this module) was **removed** on the naysayer round-3 finding: production code
@@ -142,6 +147,79 @@ def test_canary_2_double_prime_moved_bodies_preserve_original_length() -> None:
             f"origin.original_length {obligation.origin.original_length} — restore the "
             f"verbatim text moved from {obligation.origin.moved_from!r}, or bump the "
             "recorded length in the same commit and expect it to be discussed in PR review"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# INV-C (consumer-visible placement) — a conditional obligation's antecedent must
+# survive into the string production actually injects.
+#
+# msg-2207 (PR-gate on #199) found the antecedent of
+# OBL-GATE-BOOTSTRAP-CLOSE-CARVEOUT living only in a YAML `#` comment. YAML
+# loaders discard comments, so the injected `body` began "その場合、" — an anaphor
+# whose referent had been dropped on the way to the reader. Bohr msg-2387 §1(3)
+# traced the miss to having *recorded* self-containment as a property that
+# already held rather than *requiring* it: "a property written as a description
+# is checked by nobody". §6(1) therefore makes it a check, and specifies that
+# the check read the production injection path rather than re-parsing the YAML
+# in the test — re-implementing the loader would measure a string no consumer
+# ever sees, which is the same class of fault as the one being fixed.
+# --------------------------------------------------------------------------- #
+
+
+def test_obl_gate_bootstrap_close_carveout_body_carries_its_antecedent(
+    tmp_path: Path,
+) -> None:
+    """The antecedent reaches the implementer's *rendered system prompt*, and the
+    meta-commentary round 1 removed stays out of it.
+
+    Both halves are asserted together on purpose. The two findings on this entry
+    pulled in opposite directions — round 1 (msg-2111 §2) said the span was too
+    wide and carried Einstein's meta-commentary, round 2 (msg-2207) said it was
+    too narrow and had lost the antecedent — so a guard on either half alone
+    leaves the other free to regress on the next edit. msg-2387 §5: the span is
+    decided by role, not by length.
+
+    The assertion is on ``adapter._system_prompt`` built from ``load_manifest()``
+    with no path argument, i.e. the in-repo manifest that production loads, put
+    through the same renderer production uses. Nothing here re-implements
+    ``yaml.safe_load``.
+    """
+    manifest = load_manifest()
+    adapter = ImplementerSdkAdapter(
+        cwd=tmp_path, obligations=manifest, inference_base_url="http://lx"
+    )
+    rendered = adapter._system_prompt
+
+    assert "[OBL-GATE-BOOTSTRAP-CLOSE-CARVEOUT]" in rendered, (
+        "OBL-GATE-BOOTSTRAP-CLOSE-CARVEOUT is not in the rendered implementer prompt "
+        "at all — the entry was removed or its role changed"
+    )
+
+    # Positive half (msg-2387 §6(1)): the antecedent, verbatim from Einstein
+    # msg-1968, where Einstein delimited it with 「」 inside his 処方 sentence.
+    antecedent = "もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合"
+    assert antecedent in rendered, (
+        "the antecedent of OBL-GATE-BOOTSTRAP-CLOSE-CARVEOUT is not in the rendered "
+        "implementer system prompt. A YAML `#` comment is not a place an obligation's "
+        "antecedent can live: the loader discards comments, so the implementer is "
+        "handed a bare 「その場合、」 with no referent (msg-2207). Put the antecedent "
+        "back in `body`."
+    )
+
+    # Negative half (msg-2387 §5): the framing clause of Einstein's 処方 sentence is
+    # commentary *about* the obligation, not part of it, and round 1 was right to
+    # strip it. Anchored on that specific clause rather than on a general
+    # "no meta-commentary" heuristic, which would be unfalsifiable here.
+    for meta_fragment in (
+        "実装者は「コードを確認する」だけでなく",
+        "義務付けられなければならない",
+    ):
+        assert meta_fragment not in rendered, (
+            f"Einstein's meta-commentary {meta_fragment!r} is back in the rendered "
+            "implementer prompt — round 1 (msg-2111 §2) removed it. Widening the span "
+            "to restore the antecedent must not drag the framing clause back in; the "
+            "antecedent is separately quotable because msg-1968 delimits it with 「」."
         )
 
 
