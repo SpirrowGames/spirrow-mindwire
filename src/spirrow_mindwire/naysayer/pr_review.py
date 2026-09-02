@@ -1251,15 +1251,8 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             # :func:`_log_objections` below, which is not posted anywhere the reviewed
             # revision can read. Pinned by
             # :func:`test_d_divergence_notice_never_names_the_missing_sub_reason`.
-            #
-            # OPEN SPEC CONFLICT (deferred to Bohr / proposer): msg-2216 §2 asked for the
-            # sub-cause AND §3-(b) asked for a FORMAT_SLIP-specific residual caveat to
-            # appear in this notice. Both are in direct conflict with #207 (landed on main
-            # 2026-08-30, based on Einstein msg-2212 §1 BLOCKING + Takahito msg-2213
-            # directive). This resolution honors the landed security invariant and defers
-            # the two Stage 1.5-R notice items for adjudication. The rest of Stage 1.5-R
-            # (nonce hardening, D-1 retirement, AMBIGUOUS state, new enum values, log-line
-            # surfacing of missing_reason) is unaffected.
+            # (msg-2216 §2 / §3-(b) asked for the opposite; resolution defers those to
+            # Bohr — see merge commit d09ce9d body and #206 PR body for full context.)
             lines.append(
                 "> No readable objection block was found, so the derived side defaults to "
                 "REQUEST_CHANGES (fail-closed). This says nothing about the review above."

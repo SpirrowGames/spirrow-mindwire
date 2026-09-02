@@ -2089,43 +2089,22 @@ def test_missing_reason_appears_in_shadow_log_line(caplog: pytest.LogCaptureFixt
 
 def test_d_divergence_notice_never_names_the_missing_sub_reason() -> None:
     """Security pin (rider-3 msg-2212 §1 / msg-2213 / PR #207). The D-divergence notice MUST
-    NOT surface the ``missing_reason`` sub-cause of a MISSING parse.
+    NOT surface the ``missing_reason`` sub-cause of a MISSING parse — naming which wall
+    fired hands the reviewed revision a per-attempt oracle to hill-climb against. Rider 2
+    reads the sub-cause off ``_log_objections`` instead.
 
-    The notice ships in the review body that both the chatroom and GitHub receive, which is
-    readable to the model whose diff is under review. Naming which of D-3 / no-marker /
-    foreign-marker / format-slip / payload-* fired hands that model — or an attacker whose
-    exploit is in the diff — a per-attempt oracle: "payload-not-adjacent fired → drop the
-    leading prose"; iterate until the block parses clean. Msg-2212 upgraded this from an
-    advisory to a BLOCKING security defect; msg-2213 directed the fix as "confine the
-    sub-cause to the shadow log"; #207 landed the fix on ``main``. Rider 2 still gets the
-    sub-cause: it rides on ``_log_objections``, which is not returned to the reviewed
-    revision.
+    The invariant is exhaustive over ``forbidden_substrings`` by CONSTRUCTION (not
+    hand-maintenance): the list is derived at test-run from ``ObjectionMissingReason`` so
+    adding or renaming an enum value auto-updates what is forbidden. Stage 1.5-R renamed
+    most values (D-1 retired, ``PAYLOAD_NOT_ADJACENT`` / ``PAYLOAD_UNPARSEABLE`` /
+    ``FOREIGN_MARKER`` / ``FORMAT_SLIP`` added); the enum-derived form auto-adapts.
 
-    The invariant is EXHAUSTIVE over ``forbidden_substrings``, and does so BY CONSTRUCTION
-    rather than by hand-maintained enumeration: ``forbidden_substrings`` is derived at
-    test-run time from ``ObjectionMissingReason`` itself, so adding a new enum value
-    automatically forbids it in the notice — and renaming an existing value automatically
-    updates what the test looks for.
+    Every enum value is exercised: five via real critique bodies through
+    :func:`decide_verdict`, one (``PRINCIPLES_ERROR``) synthesised via
+    ``dataclasses.replace`` because vocabulary load does not fail in a well-formed workspace.
 
-    Stage 1.5-R renamed the enum entries (D-1 retired → ``MULTI_MARKER`` removed;
-    ``PROSE_BETWEEN`` → ``PAYLOAD_NOT_ADJACENT``; ``NOT_A_LIST``/``BAD_JSON`` unified into
-    ``PAYLOAD_UNPARSEABLE``; new ``FOREIGN_MARKER`` / ``FORMAT_SLIP`` added). The
-    enum-derived form of this pin auto-adapts to the new set — the security invariant is
-    identical, only the specific sub-cause strings it forbids have changed.
-
-    Every enum value is exercised by at least one decision: five reachable via real
-    critique bodies through :func:`decide_verdict`; one (``PRINCIPLES_ERROR``) synthesised
-    via ``dataclasses.replace`` because the vocabulary load does not fail in a well-formed
-    workspace. The loop below checks the notice against every forbidden substring for
-    every decision.
-
-    OPEN SPEC CONFLICT (deferred to Bohr / proposer): msg-2216 §2 (the source spec for
-    this stage) asked for the sub-cause to appear in the notice; §3-(b) asked for a
-    FORMAT_SLIP-specific caveat naming ``format-slip`` in the notice. Both are in direct
-    conflict with #207 (this security pin). The Stage 1.5-R rebase resolves toward the
-    landed security invariant and defers the two notice items for adjudication. The rest
-    of Stage 1.5-R (nonce hardening, D-1 retirement, AMBIGUOUS state, new enum values,
-    log-line surfacing of missing_reason) is unaffected.
+    OPEN SPEC CONFLICT (msg-2216 §2 / §3-(b) asked for the opposite; deferred to Bohr —
+    see merge commit d09ce9d body and #206 PR body).
     """
     from dataclasses import replace
 
@@ -2162,15 +2141,9 @@ def test_d_divergence_notice_never_names_the_missing_sub_reason() -> None:
         label: decide_verdict(body, view=view, finish_reason="stop", expected_nonce=_TEST_NONCE)
         for label, body in input_cases.items()
     }
-    # ``PRINCIPLES_ERROR`` CANNOT be reached from any critique body the parser accepts today:
-    # it fires only if the vocabulary load itself raises, which the runtime doesn't do in a
-    # well-formed workspace. But the security invariant the notice must uphold is stronger
-    # than what the parser can produce today: a future path that made this reachable must
-    # not thereby leak a sub-cause oracle through the posted notice. Synthesize the decision
-    # directly rather than fake inputs that structurally cannot exist. Any MISSING seed will
-    # do — swap the ``missing_reason`` field via ``dataclasses.replace`` (both dataclasses
-    # are frozen) so the constructed decision exercises the same ``render_gate_notice``
-    # MISSING branch the other cases do.
+    # ``PRINCIPLES_ERROR`` is not reachable from any critique body today (vocabulary load
+    # doesn't fail in a well-formed workspace). Synthesize via ``dataclasses.replace`` so a
+    # future path that makes it reachable cannot leak the sub-cause through the notice.
     seed = decisions[ObjectionMissingReason.NO_MARKER.value]
     for synthetic_reason in (ObjectionMissingReason.PRINCIPLES_ERROR,):
         report: ObjectionReport = replace(seed.objections, missing_reason=synthetic_reason)
