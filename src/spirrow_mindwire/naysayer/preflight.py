@@ -223,19 +223,35 @@ async def _attempt(
                 f"no accounting row at all appeared after the preflight probe "
                 f"(baseline id {baseline}); a 2xx response is not evidence of routing"
             )
-        # Distinct on purpose. The previous wording said no row appeared for our
-        # tier, which in 2026-09-01's schema change was **false**: the rows were
-        # there, billed and routed, and only our selector missed them. A message
-        # that accuses the gateway sends the reader to a gateway that is healthy,
-        # and the reader stops. This one accuses *this host* and shows the shape
-        # it could not read, which is the difference between a 46-hour outage and
-        # a one-line diagnosis.
+        # Two states reach this line and the observation does not separate
+        # them: our probe's row is one of ``above`` and this selector cannot
+        # identify it, or our probe's row is not in this window at all and
+        # ``above`` is somebody else's traffic. The split is exhaustive — the
+        # row either is or is not in the set we just read — and nothing here
+        # decides it: the ``ChatCompletion`` carries no key that joins it to a
+        # row, and the row carries no field naming its requester (``user_id``
+        # is ``None`` on every row this gateway writes). So the message names
+        # both and asserts neither.
+        #
+        # It used to assert the first as fact ("the gateway's row shape
+        # disagree — the probe was served and billed"). Under the ``light``
+        # traffic that runs here continuously that is simply false, and
+        # "billed" was circular besides: the billing record *is* the row we
+        # are reporting we could not find, and this module's own docstring
+        # records 42 served turns that left zero rows. Naming a cause the
+        # observation does not determine is the same error the pre-#213
+        # wording made — only with the accusation pointed the other way.
+        # Which party is blamed was never the bug. Asserting past the evidence
+        # was.
         raise PreflightError(
             f"{len(above)} accounting row(s) appeared after the preflight probe "
-            f"(baseline id {baseline}) but none carries tier {tier!r}: this host's "
-            f"row selector and the gateway's row shape disagree — the probe was "
-            f"served and billed, so this is not evidence about routing. "
-            f"{_observed_shape(above)}"
+            f"(baseline id {baseline}) but none carries tier {tier!r}. The probe "
+            f"was served — the completion returned — but a 2xx response is not "
+            f"evidence of routing. This observation does not say which of two "
+            f"states produced it: our row is among these and this host's "
+            f"selector cannot identify it, or our row is not in this window at "
+            f"all and these belong to other traffic. Either way the route is "
+            f"unproven. {_observed_shape(above)}"
         )
     # ``success`` is NOT filtered on. A failed row still records which backend
     # the gateway handed the request to, and if a fallback ever served the probe

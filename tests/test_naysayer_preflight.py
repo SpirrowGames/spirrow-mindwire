@@ -102,16 +102,27 @@ def _light_row(row_id: int) -> dict[str, Any]:
 
 
 def _old_shape_row(row_id: int) -> dict[str, Any]:
-    """A row in the **pre-2026-09-01** shape: no ``tier`` column, ``model`` = alias.
+    """A row written **before** 2026-09-01T00:23Z, as the endpoint renders it today.
 
-    Verbatim the shape of live row 6032 (2026-08-13). The gateway has not
-    written one since id 8282, so this exists only to hold the deletion of the
-    backward-compatible branch in place: a selector that still falls back to
-    ``model`` would accept this row, and the test that feeds it would go green.
+    ``model`` carries the requested alias. That is the pre-switch shape and it
+    is what a resurrected ``model`` fallback would match, so this fixture holds
+    the deletion of the backward-compatible branch in place: such a selector
+    would accept this row, and the test that feeds it would go green.
+
+    ``tier`` and ``pricing_known`` are ``None``, **not absent** — measured
+    2026-09-03 over ``/stats/costs/recent?limit=1000`` (ids 7778-8777, a window
+    that spans the 8282/8283 cut). All 1000 rows carry an identical 13-key set,
+    the 505 pre-switch rows included, because the endpoint renders every row it
+    returns in the *current* schema; live row 7778 comes back as
+    ``{"model": "naysayer", "backend": "gemini", "tier": None,
+    "pricing_known": None, ...}``. **This gateway has no key-absent drift
+    signature to produce.** An earlier revision of this fixture deleted the two
+    keys, which taught the suite a failure mode production cannot reach — the
+    same fake-agrees-with-code-and-neither-agrees-with-the-world defect the
+    whole PR is about, reintroduced in the fixture written to fix it.
     """
-    row = _row(row_id, model=_TIER)
-    del row["tier"]
-    del row["pricing_known"]
+    row = _row(row_id, tier=None, model=_TIER)
+    row["pricing_known"] = None
     return row
 
 
@@ -377,18 +388,26 @@ async def test_the_outage_ledger_attests_with_concurrent_other_tier_traffic() ->
 async def test_the_pre_schema_change_row_shape_is_not_matched() -> None:
     """★ No backward-compatible branch — and the deletion is held here.
 
-    A row with no ``tier`` column and ``model == "naysayer"`` is the shape the
+    A row with ``tier`` null and ``model == "naysayer"`` is the shape the
     gateway last wrote at ledger id 8282 and has not written since. Accepting it
     would mean carrying a branch whose condition can never again be true. If
     anyone re-adds a ``model`` fallback, this test goes green-to-red the moment
     the fallback starts matching, which is the only warning the deletion gets.
+
+    What is asserted is that the row was **seen and rejected**, not that it was
+    absent — i.e. the attempt reached the missed branch. The message may not be
+    asked to explain *why* the row is unselectable: that is the very claim the
+    branch is forbidden to make (see the raise, and the standing test below).
     """
     gateway = _FakeGateway(
         append_on_call=[[_old_shape_row(8283)], [_old_shape_row(8284)], [_old_shape_row(8285)]]
     )
     with pytest.raises(PreflightError) as excinfo:
         await _attest(gateway)
-    assert "row selector and the gateway's row shape disagree" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "1 accounting row(s) appeared" in message
+    assert "none carries tier 'naysayer'" in message
+    assert "no accounting row at all" not in message
 
 
 # --------------------------------------------------------------------------- #
@@ -417,10 +436,18 @@ async def test_a_gateway_that_wrote_no_row_at_all_says_exactly_that() -> None:
 async def test_rows_the_selector_missed_are_reported_with_their_shape() -> None:
     """★ The one-line diagnosis the outage did not get.
 
-    When rows are present but unselectable, the message must say so, count them,
-    blame this host rather than the gateway, and show the shape it could not
-    read — the column set (which names a schema change outright) and the first
-    row's tier/model/backend.
+    When rows are present but none is selectable, the message must say so,
+    count them, name the baseline it counted from, and show the shape it could
+    not read — the column set (which names a schema change outright) and the
+    first row's tier/model/backend. Those are all *observations*, true whichever
+    of the branch's two states we are actually in.
+
+    It must **not** say why, and this test no longer asks it to. It used to
+    require "this host's row selector and the gateway's row shape disagree" and
+    "the probe was served and billed" — both false in the state this fixture
+    actually builds, where every row above the baseline is well-formed ``light``
+    traffic and our own row was simply never written. The test was requiring the
+    falsehood.
     """
     gateway = _FakeGateway(
         ledger=[_light_row(8752)],
@@ -436,8 +463,7 @@ async def test_rows_the_selector_missed_are_reported_with_their_shape() -> None:
 
     assert "2 accounting row(s) appeared" in message
     assert "none carries tier 'naysayer'" in message
-    assert "this host's row selector and the gateway's row shape disagree" in message
-    assert "the probe was served and billed" in message
+    assert "baseline id 8756" in message
     # The shape, bounded: columns plus the first row's identifying triple.
     assert "'tier'" in message and "'model'" in message and "'backend'" in message
     # The third attempt's rows: the reported shape belongs to the attempt that
@@ -446,6 +472,75 @@ async def test_rows_the_selector_missed_are_reported_with_their_shape() -> None:
     assert "tier='light'" in message
     assert "model='Qwen3.8-27B'" in message
     assert "backend='light'" in message
+
+
+@pytest.mark.anyio
+async def test_the_missed_branch_asserts_nothing_the_observation_does_not_show() -> None:
+    """★ THE STANDING TEST (msg-2400 C-3). An invariant, not a wording.
+
+    The missed branch is reachable from two states and cannot tell them apart:
+    our row is among the rows above the baseline and the selector cannot
+    identify it, or our row is not there at all and those rows are other
+    traffic. Nothing the caller holds decides which — there is no key joining a
+    ``ChatCompletion`` to a ledger row. So the branch must assert **neither**.
+
+    That is pinned twice, because either half alone is weak:
+
+    (1) *Negative, wording-keyed.* In the no-drift world — our row never
+        written, every row above the baseline well-formed ``light`` traffic —
+        the message must not claim a shape disagreement and must not claim our
+        probe's row was billed. Both are false in this world. **This is the
+        assertion that is RED against 2ceb2fc**, whose message asserted both.
+        It can only ban phrasings already thought of, hence (2).
+
+    (2) *Structural.* The prose is byte-identical across both worlds; only the
+        bounded ``_observed_shape`` projection may differ (the row counts and
+        baselines are held equal here so nothing else can). A world-specific
+        claim cannot be added without a discriminator, and a discriminator
+        would break this equality. msg-2400 §4 measured that no such
+        discriminator exists: the gate proposed ``"tier" not in keys``, and all
+        1000 rows in a window spanning the schema cut carry the ``tier`` key.
+
+    Note what is deliberately *not* banned: the bare words "schema" or "drift".
+    C-1 requires the message to **name** both candidate explanations, and one
+    of them is drift. Banning the topic would forbid the wording C-1 mandates.
+    What is banned is the assertive form. The gap between "asserts X" and
+    "mentions X as one of two possibilities" is not decidable by substring, and
+    (2) is what covers it.
+    """
+    # Same ids, same counts, same baselines in both worlds — so any difference
+    # in the prose can only have come from a claim about the world.
+    attempts = [(9001, 9002), (9003, 9004), (9005, 9006)]
+
+    # World A: our row was never written. These rows are other tiers', and
+    # perfectly well-formed — there is no drift here to diagnose.
+    no_drift = _FakeGateway(append_on_call=[[_light_row(a), _light_row(b)] for a, b in attempts])
+    with pytest.raises(PreflightError) as world_a:
+        await _attest(no_drift)
+    message = str(world_a.value)
+
+    for claim in (
+        "row shape disagree",
+        "shapes disagree",
+        "served and billed",
+        "was billed",
+        "were billed",
+    ):
+        assert claim not in message, f"asserts {claim!r}, which is false in this world"
+
+    # World B: our row IS above the baseline, but its tier moved out from under
+    # the selector. This is the drift the other explanation names.
+    drifted = _FakeGateway(
+        append_on_call=[[_row(a, tier="naysayer-v2"), _light_row(b)] for a, b in attempts]
+    )
+    with pytest.raises(PreflightError) as world_b:
+        await _attest(drifted)
+
+    marker = "observed columns"
+    assert marker in message and marker in str(world_b.value)
+    assert message.split(marker)[0] == str(world_b.value).split(marker)[0]
+    # ...and the projection, which is observation, does differ between them.
+    assert message.split(marker)[1] != str(world_b.value).split(marker)[1]
 
 
 @pytest.mark.anyio
@@ -469,7 +564,7 @@ async def test_only_the_last_attempt_s_failure_reaches_the_caller() -> None:
     with pytest.raises(PreflightError) as excinfo:
         await _attest(gateway)
     assert "no accounting row at all appeared" in str(excinfo.value)
-    assert "row selector and the gateway's row shape disagree" not in str(excinfo.value)
+    assert "none carries tier" not in str(excinfo.value)
 
 
 @pytest.mark.anyio
@@ -494,6 +589,11 @@ async def test_the_two_empty_candidate_failures_do_not_share_a_message() -> None
     assert str(empty.value) != str(missed.value)
     # The empty case may say nothing appeared; the other case must not.
     assert "no accounting row at all" not in str(missed.value)
+    # What the missed branch owes the reader, all of it observation: how many
+    # rows it saw, the baseline it counted from, and their shape.
+    assert "1 accounting row(s) appeared" in str(missed.value)
+    assert "baseline id 6033" in str(missed.value)
+    assert "observed columns" in str(missed.value)
 
 
 @pytest.mark.anyio
