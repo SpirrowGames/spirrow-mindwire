@@ -316,6 +316,110 @@ obligations:
       one claim in your output that no reviewer can check against the diff, so it
       is the one claim you must not get wrong.
 
+  - id: OBL-GATE-BOOTSTRAP-CLOSE-CARVEOUT
+    role: implementer
+    # Net-new formulation (no origin — nothing was deleted from source to create it).
+    # Issued as the hard condition attached to T-new-project-gate-bootstrap's
+    # conditional design approval: Einstein msg-1968 (naysayer, 2026-08-28T09:59:31Z,
+    # reply_to msg-1967) ended with 「上記の『実行時エラー回避のための carve-out
+    # 実装』を obligation に加えることを条件として、この設計はコード作業に進む
+    # 準備ができている」 — the obligation therefore had to enter this file before
+    # the design's execution paths could be probed.
+    #
+    # Bohr's msg-2084 §5(1) originally directed a split — the 「追加すべき義務」
+    # clause into the body, Einstein's 処方 sentence into this rationale block —
+    # and that split cut the obligation's antecedent out of the injected string:
+    # YAML loaders discard `#` comments, so the toolchain that injects this entry
+    # reads only `id` / `role` / `body` (msg-2207). Bohr withdrew that instruction
+    # in msg-2387 §1 as an error in his own spec, and §4 replaced it.
+    #
+    # The body below opens with ONE demarcated line that is NOT verbatim — the
+    # proposer's supplement naming where the carve-out lands (msg-2392 §4) — and
+    # then carries TWO verbatim spans of msg-1968, in order: first the antecedent
+    # 「もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合」
+    # — which Einstein himself delimited with 「」 inside his 処方 sentence, so it
+    # is extractable verbatim WITHOUT the surrounding meta-commentary — then the
+    # 「追加すべき義務」 clause. The supplement sits OUTSIDE both spans and labels
+    # itself as non-verbatim in the body's own text, so a reader of the injected
+    # string can tell quotation from supplement without this comment. Nothing
+    # inside a span is edited: that is a widening of the verbatim span plus an
+    # external annotation, not a paraphrase, so msg-2084 §5(1)(b) (verbatim, no
+    # paraphrase) still holds. The seam reads 「…場合、その場合、…」, which is
+    # redundant; msg-2387 §4(1) allows a less redundant cut only where a single
+    # verbatim sentence of the original carries the antecedent, and no such
+    # sentence exists here (the only one that does is the meta-framed 処方
+    # sentence quoted below), so the redundancy is kept rather than smoothed by
+    # words that are not Einstein's. msg-2392 §6(a) upheld that on review:
+    # smoothing edits the INSIDE of a span, which is a different operation from
+    # appending a demarcated supplement outside one, and only the latter is
+    # allowed here.
+    #
+    # What belongs in the span is decided by ROLE, not by length (msg-2387 §5):
+    # in = everything the implementer needs in order to comply, the antecedent
+    # included; out = discussion they do not need in order to comply (another
+    # role's meta-commentary, thread history, rationale). Round 1 (msg-2111 §2)
+    # shortened this span to strip meta-commentary and took the antecedent with
+    # it; round 2 (msg-2207) put the antecedent back. Both remain satisfied only
+    # because the two are separated by role, not by how much text is quoted.
+    # The standing test: delete every comment in this entry — is the obligation
+    # still complete and unambiguous?
+    #
+    # Einstein's 処方 (verbatim, msg-1968):
+    #
+    #   「実装者は「コードを確認する」だけでなく、「もし事前ロールチェックが存在して
+    #    sweeper が弾かれる事実が確認された場合」の具体的な是正措置を義務付けられ
+    #    なければならない。」
+    #
+    # Trigger-field note (answers Bohr msg-2087 §2(e)): this manifest schema has
+    # no separate `trigger` field. Every entry is unconditionally injected into
+    # the corresponding role's system prompt on every turn; a conditional
+    # obligation must carry its antecedent as prose inside its own `body`, since
+    # that is the only field the injection path renders. When the antecedent is
+    # not observed, the entry asks nothing of the implementer at read time. This
+    # entry is such a conditional: the body says "if <antecedent>, then do X";
+    # if the antecedent has not been observed, the implementer reads the entry
+    # and moves on. There is no field to gate the injection on and no field to
+    # omit — the conditional lives in the prose, which is precisely why the
+    # prose has to be in `body`. Note that this paragraph previously recorded
+    # the same thing as a property that already held ("carries its antecedent
+    # … within the entry's rationale and body"), and it did not hold: a property
+    # written as a description is checked by nobody. It is now a requirement,
+    # and it is checked — see the Enforced-by line at the end of this comment.
+    #
+    # Where the antecedent becomes observable is not this entry's business —
+    # it is the design's business (T-new-project-gate-bootstrap S-4 probe,
+    # per Bohr msg-2084 §4). The obligation only encodes what the implementer
+    # must do IF the antecedent is observed; whether/where it fires is
+    # entirely outside this file's concern. An earlier version of this
+    # rationale asserted where the antecedent could be observed and made an
+    # internally contradictory claim about the S-4 probe's precheck
+    # short-circuit — removed here because the observability of the
+    # antecedent is the S-4 design's responsibility, not this obligation's.
+    #
+    # The cross-repo landing site is stated in `body` itself (round 3: PR-gate
+    # msg-2391, proposer ruling msg-2392 §4). It is deliberately NOT restated
+    # here — the same fact in two places drifts, and this comment paragraph is
+    # precisely where that fact was hiding from the loader when round 3 was
+    # raised.
+    #
+    # Source: T-new-project-gate-bootstrap msg-1968 (Einstein, naysayer,
+    # 2026-08-28T09:59:31Z, reply_to msg-1967). The msg-1968 verbatim is
+    # cited in the T-new-project-gate-bootstrap thread by Heisenberg msg-2083.
+    #
+    # Enforced by test_obl_gate_bootstrap_close_carveout_body_carries_its_antecedent
+    # in tests/test_obligations.py — it slices THIS entry's own injected block out
+    # of the rendered implementer system prompt (its id header up to the next
+    # entry's header) and asserts against that slice, never against the whole
+    # prompt. Whole-prompt `in` is not a check here: the prompt already contains
+    # "magickit" via the ADR index line for ADR-2026-06-04-18, so a whole-prompt
+    # search for the landing site was true before this fix existed (measured —
+    # msg-2392 §2). Moving the antecedent back into a comment, dragging
+    # Einstein's framing clause back in, or dropping the landing site each red
+    # the gate.
+    body: |
+      【実装先 — proposer 補足（Einstein の逐語ではない）】この carve-out のコードは magickit リポジトリのサーバ側 `chatroom_close_thread` 実装に入る。mindwire リポジトリの側に実装先は無く、履行は magickit に PR を立てることである。
+      【以下 Einstein msg-1968 逐語】もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合、その場合、ADR-10 のロールを sweeper に付与して誤魔化すのではなく、PR-gate の carve-out と同様に、`chatroom_close_thread` 側に『`system-alert` タグを持ち、かつ owner 自身によるクローズである場合はロールチェックを免除する』という構造的な carve-out（例外経路）をコードとして追加実装すること。
+
   - id: OBL-SPEC-SCOPE-CLOSURE
     role: implementer
     # Net-new formulation (no origin). Issued by SPEC-2026-08-11-design-spec-delivery
