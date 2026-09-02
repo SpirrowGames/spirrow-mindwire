@@ -12,7 +12,7 @@
     "let one arrive without the other and silently degrade the sweep.",
     "",
     "----------------------------------------------------------------------------",
-    "Table 1 — projects[].thread_prefix_to_repo",
+    "Table 1 — projects[].{thread_prefix, owner, repo}",
     "  Design ref: msg-2162 field ③ (the explicit thread_id → owner/repo mapping",
     "  that S0 needs to resolve a PR from a T-pr-review-* thread).",
     "",
@@ -23,6 +23,13 @@
     "  sweep must not guess. If a project is missing, the sweep must not fabricate",
     "  the mapping — S0 returns skip (no verdict) for that thread and the operator",
     "  is expected to add the entry.",
+    "",
+    "  Shape: each project entry carries thread_prefix / owner / repo as SIBLING",
+    "  fields (msg-2181 review, structural advisory). An earlier draft wrapped",
+    "  owner/repo inside a single-key thread_prefix_to_repo dict, which forced the",
+    "  operator to keep the project slug synchronized across three sites (project",
+    "  field, dict key, inner repo field) despite the mapping being strictly 1:1.",
+    "  Flat siblings collapse that to a single write per site.",
     "",
     "----------------------------------------------------------------------------",
     "Table 2 — projects[].gate_active_since",
@@ -40,7 +47,8 @@
     "       commit SHA, thread msg-id, or configuration change that establishes",
     "       WHEN the gate first ran against merges in this repo. Placeholders",
     "       ('推定', 'unknown', '') are rejected at load time. If you cannot",
-    "       write a justification, leave both fields absent — the sweep will",
+    "       write a justification, OMIT THE gate_active_since KEY ENTIRELY (see",
+    "       the spirrow-magickit entry below for the shape) — the sweep will",
     "       treat this project as UNDETERMINED for the B_gate/B_legacy split",
     "       only when a review-condition-false B is actually observed",
     "       (msg-2177 R-41: lazy evaluation).",
@@ -64,35 +72,30 @@
     "is the whole reason they live in a config file and not in code.",
     "",
     "Values below are illustrative only; they are NOT the production values for",
-    "these projects. Every deployment must edit them."
+    "these projects. Every deployment must edit them. The two entries below",
+    "deliberately show BOTH valid shapes of Table 2: spirrow-mindwire carries a",
+    "populated gate_active_since (the operator knew the activation date and had",
+    "evidence to cite); spirrow-magickit OMITS the key entirely (the operator",
+    "did not know the date — the sweep will lazily report UNDETERMINED only if",
+    "a review-condition-false B actually surfaces there)."
   ],
   "schema_version": 1,
   "projects": [
     {
       "project": "spirrow-mindwire",
-      "thread_prefix_to_repo": {
-        "T-pr-review-spirrow-mindwire-": {
-          "owner": "spirrowgames",
-          "repo": "spirrow-mindwire"
-        }
-      },
+      "thread_prefix": "T-pr-review-spirrow-mindwire-",
+      "owner": "spirrowgames",
+      "repo": "spirrow-mindwire",
       "gate_active_since": {
-        "date": "",
-        "justification": ""
+        "date": "2025-01-15",
+        "justification": "PR #123 (illustrative): first merge on which pr_gate_ledger recorded a can_close() eligibility check for this repo"
       }
     },
     {
       "project": "spirrow-magickit",
-      "thread_prefix_to_repo": {
-        "T-pr-review-spirrow-magickit-": {
-          "owner": "spirrowgames",
-          "repo": "spirrow-magickit"
-        }
-      },
-      "gate_active_since": {
-        "date": "",
-        "justification": ""
-      }
+      "thread_prefix": "T-pr-review-spirrow-magickit-",
+      "owner": "spirrowgames",
+      "repo": "spirrow-magickit"
     }
   ]
 }
