@@ -934,11 +934,19 @@ def parse_objections(critique: str, *, expected_nonce: str) -> ObjectionReport:
         return _missing(ObjectionMissingReason.PAYLOAD_UNPARSEABLE)
     if not isinstance(parsed, list):
         return _missing(ObjectionMissingReason.PAYLOAD_UNPARSEABLE)
-    # Trailing-list defense (security, msg-2361): a decoy array before the real one
-    # would silently APPROVE via raw_decode's trailing-text tolerance. Reject any
-    # remainder whose first non-whitespace is ``[`` — one marker, one list.
-    if payload_lstripped[consumed:].lstrip().startswith("["):
-        return _missing(ObjectionMissingReason.PAYLOAD_UNPARSEABLE)
+    # Trailing-list defense (msg-2361 + bypass-fix): scan every ``[`` in the remainder;
+    # if any yields a valid JSON list, a chained payload is hidden — reject.
+    _rest = payload_lstripped[consumed:]
+    _p = 0
+    while (_b := _rest.find("[", _p)) >= 0:
+        try:
+            _v, _ = json.JSONDecoder().raw_decode(_rest[_b:])
+        except ValueError:
+            _p = _b + 1
+            continue
+        if isinstance(_v, list):
+            return _missing(ObjectionMissingReason.PAYLOAD_UNPARSEABLE)
+        _p = _b + 1
     if not parsed:
         return _report(ObjectionParse.EMPTY)
 
