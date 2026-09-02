@@ -677,8 +677,13 @@ class ObjectionMissingReason(Enum):
 
     Every value derives REQUEST_CHANGES identically — the derivation reads
     :class:`ObjectionParse.MISSING` and stops. This enum exists so the shadow log line
-    and the D-divergence notice can name *which* MISSING cause fired, without which
-    ``parse=missing`` is a black box that folds several independent signals into one.
+    can name *which* MISSING cause fired, without which ``parse=missing`` is a black box
+    that folds several independent signals into one. **It is NOT surfaced on the posted
+    D-divergence notice** (msg-2212 §1 / msg-2213 / PR #207): the notice is readable to
+    the model whose diff is under review, and naming which parser wall it tripped gives
+    that model (or an attacker whose exploit is in the diff) a per-attempt oracle to
+    hill-climb. Rider 2 reads the sub-cause off the log line, which lives in the
+    operator-side channel and is not returned to the reviewed revision.
 
     **Precedence** (msg-2216 §2 table). Because the parse contract is single-valued, the
     reasons are partitioned by whether an authoritative marker was found:
@@ -1235,33 +1240,30 @@ def render_gate_notice(decision: VerdictDecision) -> str:
                 f"{', '.join(sorted(set(report.unknown_classes)))} (counted as blocking)."
             )
         if report.status is ObjectionParse.MISSING:
-            # msg-2216 §2: name the sub-cause so a reader of the review body can tell "the
-            # model wrote no block" (NO_MARKER baseline) from "our own diff quoted the
-            # sentinel" (FOREIGN_MARKER, ordinary) from "our own model format-slipped"
-            # (FORMAT_SLIP, attributable output-contract failure) from "the model wrote an
-            # authoritative block but the payload is malformed" (PAYLOAD_*, D-3 / decode).
-            reason_label = (
-                report.missing_reason.value if report.missing_reason is not None else "unknown"
-            )
+            # msg-2212 §1 / msg-2213 / PR #207: the sub-cause (``missing_reason``) is
+            # deliberately NOT named in the posted notice. Naming which of D-3 / no-marker
+            # / foreign-marker / format-slip / payload-* fired hands the model — or an
+            # attacker whose diff is under review — a per-attempt oracle they can
+            # hill-climb against ("payload-not-adjacent fired → drop the leading prose"),
+            # until the block parses clean. In Stage 1 this is shadow so the
+            # F-a-direction risk is bounded, but the reversal PR is the payoff for the
+            # same oracle. Rider 2 still gets the sub-cause: it rides on
+            # :func:`_log_objections` below, which is not posted anywhere the reviewed
+            # revision can read. Pinned by
+            # :func:`test_d_divergence_notice_never_names_the_missing_sub_reason`.
+            #
+            # OPEN SPEC CONFLICT (deferred to Bohr / proposer): msg-2216 §2 asked for the
+            # sub-cause AND §3-(b) asked for a FORMAT_SLIP-specific residual caveat to
+            # appear in this notice. Both are in direct conflict with #207 (landed on main
+            # 2026-08-30, based on Einstein msg-2212 §1 BLOCKING + Takahito msg-2213
+            # directive). This resolution honors the landed security invariant and defers
+            # the two Stage 1.5-R notice items for adjudication. The rest of Stage 1.5-R
+            # (nonce hardening, D-1 retirement, AMBIGUOUS state, new enum values, log-line
+            # surfacing of missing_reason) is unaffected.
             lines.append(
-                f"> No readable objection block was found (`missing_reason={reason_label}`), "
-                f"so the derived side defaults to REQUEST_CHANGES (fail-closed). This says "
-                f"nothing about the review above."
+                "> No readable objection block was found, so the derived side defaults to "
+                "REQUEST_CHANGES (fail-closed). This says nothing about the review above."
             )
-            if report.missing_reason is ObjectionMissingReason.FORMAT_SLIP:
-                # msg-2216 §3-(b) residual: the format_slip counter is model-attributable in
-                # the common case but not literally so — a hostile diff could inject
-                # instructions that push the model to a live-nonce format-slip. Fail-closed
-                # is unaffected (it stays MISSING → RC); only the Layer-D reading of the
-                # counter needs the caveat. Recorded here so a reader who lands on the
-                # posted body sees the same caveat the dossier does.
-                lines.append(
-                    "> `format_slip` is our own model's output-contract failure in the "
-                    "common case (the live nonce is unguessable), but a prompt-injection "
-                    "path could nudge the model into a live-nonce format-slip — the "
-                    "fail-closed direction is unchanged, only the diagnostic reading has "
-                    "that caveat."
-                )
         elif report.status is ObjectionParse.AMBIGUOUS:
             # msg-2216 §5-(a): two-plus authoritative markers → AMBIGUOUS. Under the
             # nonce discipline this is a coerced case (the model was told to emit exactly

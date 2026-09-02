@@ -91,6 +91,24 @@ from spirrow_mindwire.conductor.head_skip import (
 )
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
+# Windows stdout defaults to a legacy codepage (e.g. cp932). The machine-read
+# JSON on stdout uses ``ensure_ascii=True`` on every ``json.dumps`` call, so
+# stdout is guaranteed ASCII-only — no reconfiguration needed, and any
+# reconfiguration to UTF-8 would in fact corrupt the operator's console by
+# writing raw UTF-8 bytes into a cp932 read path (PR #210 gate round-2).
+#
+# stderr is a separate concern: state-file parse errors quote raw path bytes,
+# head_skip reasons may contain em dashes, and a wrapped exception message may
+# carry native text. Setting ``errors="backslashreplace"`` — WITHOUT
+# overriding the encoding — makes ``print(..., file=sys.stderr)`` incapable of
+# raising while preserving the console's native readability for anything
+# encodable (Japanese path components stay legible in a cp932 console). The
+# ``getattr`` guard exists because ``reconfigure`` is a ``TextIOWrapper``
+# method; see ``scripts/dogfood_smoke.py`` for the same probe convention.
+_reconfigure_err = getattr(sys.stderr, "reconfigure", None)
+if _reconfigure_err is not None:
+    _reconfigure_err(errors="backslashreplace")
+
 
 async def _fetch_head_body(
     mcp: StreamableHttpChatroomMcp, project: str, thread_id: str
@@ -396,7 +414,12 @@ def _main_decide(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {"mode": args.mode, "verdicts": verdicts},
-            ensure_ascii=False,
+            # Machine-read output: emit ASCII-only so the sweep wrapper's
+            # ``ConvertFrom-Json`` can decode it under any stdout encoding.
+            # msg-2292 D-3: ``errors="backslashreplace"`` on the stream is
+            # not sufficient (produces ``\Uxxxxxxxx`` for astral chars,
+            # which is not a JSON string escape).
+            ensure_ascii=True,
         )
     )
     return 0
@@ -432,7 +455,9 @@ def _main_commit_launch(args: argparse.Namespace) -> int:
                 "thread_id": payload.get("thread_id", ""),
                 "record": record_to_json(new_record),
             },
-            ensure_ascii=False,
+            # Machine-read output — see comment on the decide-mode print
+            # above (msg-2292 D-3).
+            ensure_ascii=True,
         )
     )
     return 0

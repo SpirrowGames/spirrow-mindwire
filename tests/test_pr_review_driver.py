@@ -2087,35 +2087,122 @@ def test_missing_reason_appears_in_shadow_log_line(caplog: pytest.LogCaptureFixt
     assert "missing_reason=-" in joined
 
 
-def test_missing_reason_labels_appear_in_the_d_divergence_notice() -> None:
-    """Instrumentation (msg-2216 §2). The D-divergence gate notice names the sub-cause of
-    a MISSING so a reader of the posted review body sees WHICH MISSING fired.
+def test_d_divergence_notice_never_names_the_missing_sub_reason() -> None:
+    """Security pin (rider-3 msg-2212 §1 / msg-2213 / PR #207). The D-divergence notice MUST
+    NOT surface the ``missing_reason`` sub-cause of a MISSING parse.
 
-    The log line lives for grep-a-corpus reads; the notice lives in the review body that
-    both the chatroom and GitHub receive, and rider 2 reads the shadow through it. If the
-    notice still said "no readable objection block was found" with no further detail,
-    rider 2 would have to correlate every review to its log line to tell the sub-causes
-    apart.
+    The notice ships in the review body that both the chatroom and GitHub receive, which is
+    readable to the model whose diff is under review. Naming which of D-3 / no-marker /
+    foreign-marker / format-slip / payload-* fired hands that model — or an attacker whose
+    exploit is in the diff — a per-attempt oracle: "payload-not-adjacent fired → drop the
+    leading prose"; iterate until the block parses clean. Msg-2212 upgraded this from an
+    advisory to a BLOCKING security defect; msg-2213 directed the fix as "confine the
+    sub-cause to the shadow log"; #207 landed the fix on ``main``. Rider 2 still gets the
+    sub-cause: it rides on ``_log_objections``, which is not returned to the reviewed
+    revision.
+
+    The invariant is EXHAUSTIVE over ``forbidden_substrings``, and does so BY CONSTRUCTION
+    rather than by hand-maintained enumeration: ``forbidden_substrings`` is derived at
+    test-run time from ``ObjectionMissingReason`` itself, so adding a new enum value
+    automatically forbids it in the notice — and renaming an existing value automatically
+    updates what the test looks for.
+
+    Stage 1.5-R renamed the enum entries (D-1 retired → ``MULTI_MARKER`` removed;
+    ``PROSE_BETWEEN`` → ``PAYLOAD_NOT_ADJACENT``; ``NOT_A_LIST``/``BAD_JSON`` unified into
+    ``PAYLOAD_UNPARSEABLE``; new ``FOREIGN_MARKER`` / ``FORMAT_SLIP`` added). The
+    enum-derived form of this pin auto-adapts to the new set — the security invariant is
+    identical, only the specific sub-cause strings it forbids have changed.
+
+    Every enum value is exercised by at least one decision: five reachable via real
+    critique bodies through :func:`decide_verdict`; one (``PRINCIPLES_ERROR``) synthesised
+    via ``dataclasses.replace`` because the vocabulary load does not fail in a well-formed
+    workspace. The loop below checks the notice against every forbidden substring for
+    every decision.
+
+    OPEN SPEC CONFLICT (deferred to Bohr / proposer): msg-2216 §2 (the source spec for
+    this stage) asked for the sub-cause to appear in the notice; §3-(b) asked for a
+    FORMAT_SLIP-specific caveat naming ``format-slip`` in the notice. Both are in direct
+    conflict with #207 (this security pin). The Stage 1.5-R rebase resolves toward the
+    landed security invariant and defers the two notice items for adjudication. The rest
+    of Stage 1.5-R (nonce hardening, D-1 retirement, AMBIGUOUS state, new enum values,
+    log-line surfacing of missing_reason) is unaffected.
     """
+    from dataclasses import replace
+
+    from spirrow_mindwire.naysayer.pr_review import ObjectionReport, VerdictDecision
+
     view = _make_view(_DIFF_WARN_THRESHOLD - 1)
-    for expected_reason, body in (
-        (
-            "payload-not-adjacent",
-            f"{_authoritative_marker()}\nHere are my objections:\n[]\n\nVERDICT: APPROVE",
+    # Enum-derived: the forbidden list stays in lock-step with the enum by construction,
+    # not by hand-maintenance. Adding a value adds a check; renaming a value updates the
+    # check. This is msg-2271's directly proposed remediation for the round-1 correctness
+    # defect ("後者なら「列挙の更新漏れ」という失敗モード自体が消えます").
+    forbidden_substrings: tuple[str, ...] = (
+        "missing_reason",
+        *(e.value for e in ObjectionMissingReason),
+    )
+    # Five causes are reachable from a real critique body; drive them through
+    # ``parse_objections`` the way the driver does. Keys are the enum ``.value`` strings
+    # so the "every enum value has a decision" assertion below is a plain set-equality.
+    input_cases = {
+        ObjectionMissingReason.NO_MARKER.value: "no blocking problems\n\nVERDICT: APPROVE",
+        ObjectionMissingReason.FOREIGN_MARKER.value: (
+            f"{_OBJECTIONS_SENTINEL_PREFIX} -->\n[]\n\nVERDICT: APPROVE"
         ),
-        (
-            "foreign-marker",
-            f"{_OBJECTIONS_SENTINEL_PREFIX} -->\n[]\n\nVERDICT: APPROVE",
+        ObjectionMissingReason.FORMAT_SLIP.value: (
+            f'{_OBJECTIONS_SENTINEL_PREFIX} nonce="{_TEST_NONCE}" -->\n[]\n\nVERDICT: APPROVE'
         ),
-        (
-            "format-slip",
-            f'{_OBJECTIONS_SENTINEL_PREFIX} nonce="{_TEST_NONCE}" -->\n[]\n\nVERDICT: APPROVE',
+        ObjectionMissingReason.PAYLOAD_NOT_ADJACENT.value: (
+            f"{_authoritative_marker()}\nHere are my objections:\n[]\n\nVERDICT: APPROVE"
         ),
-    ):
-        decision = decide_verdict(body, view=view, finish_reason="stop", expected_nonce=_TEST_NONCE)
+        ObjectionMissingReason.PAYLOAD_UNPARSEABLE.value: (
+            f"{_authoritative_marker()}\n[not json\n\nVERDICT: APPROVE"
+        ),
+    }
+    decisions: dict[str, VerdictDecision] = {
+        label: decide_verdict(body, view=view, finish_reason="stop", expected_nonce=_TEST_NONCE)
+        for label, body in input_cases.items()
+    }
+    # ``PRINCIPLES_ERROR`` CANNOT be reached from any critique body the parser accepts today:
+    # it fires only if the vocabulary load itself raises, which the runtime doesn't do in a
+    # well-formed workspace. But the security invariant the notice must uphold is stronger
+    # than what the parser can produce today: a future path that made this reachable must
+    # not thereby leak a sub-cause oracle through the posted notice. Synthesize the decision
+    # directly rather than fake inputs that structurally cannot exist. Any MISSING seed will
+    # do — swap the ``missing_reason`` field via ``dataclasses.replace`` (both dataclasses
+    # are frozen) so the constructed decision exercises the same ``render_gate_notice``
+    # MISSING branch the other cases do.
+    seed = decisions[ObjectionMissingReason.NO_MARKER.value]
+    for synthetic_reason in (ObjectionMissingReason.PRINCIPLES_ERROR,):
+        report: ObjectionReport = replace(seed.objections, missing_reason=synthetic_reason)
+        decisions[synthetic_reason.value] = replace(seed, objections=report)
+    # Belt-and-braces: (a) every enum value has a decision exercising it, and (b) every
+    # decision still carries MISSING (we only meant to swap the sub-reason, not the status).
+    # The set-equality on (a) means "add a new enum value → the loop below red-builds
+    # because there is no matching decision", closing the drift path from the opposite
+    # direction.
+    assert set(decisions) == {e.value for e in ObjectionMissingReason}, (
+        "coverage: every ObjectionMissingReason value must have a decision — a new "
+        "enum value without a matching case would leave that value unexercised"
+    )
+    for label, decision in decisions.items():
+        assert decision.objections.status is ObjectionParse.MISSING, label
+        assert decision.objections.missing_reason is not None, label
+        assert decision.objections.missing_reason.value == label, label
+
+    for label, decision in decisions.items():
         notice = render_gate_notice(decision)
-        assert _MARKER_D_DIVERGENCE in notice, expected_reason
-        assert f"missing_reason={expected_reason}" in notice, expected_reason
+        # The notice DOES still name that the block was missing — that fact is not the
+        # oracle, only the specific sub-cause is. So the D-divergence marker must be present
+        # (this is the code path we are checking) and it must still say the derived side
+        # fell to REQUEST_CHANGES.
+        assert _MARKER_D_DIVERGENCE in notice, label
+        assert "No readable objection block was found" in notice, label
+        assert "REQUEST_CHANGES" in notice, label
+        for forbidden in forbidden_substrings:
+            assert forbidden not in notice, (
+                f"case={label!r}: notice leaks {forbidden!r}, which is the oracle "
+                f"msg-2212 §1 / msg-2213 / #207 said must be confined to the shadow log"
+            )
 
 
 def test_ambiguous_label_appears_in_the_d_divergence_notice() -> None:
@@ -2124,7 +2211,10 @@ def test_ambiguous_label_appears_in_the_d_divergence_notice() -> None:
 
     A separate test from the missing_reason sweep because AMBIGUOUS is its own parse status
     (the derivation reads the parse code directly), not a MISSING sub-reason — the two
-    branches render different prose in the notice and need pinning independently.
+    branches render different prose in the notice and need pinning independently. AMBIGUOUS
+    naming ("two or more authoritative objection blocks were present") does not contain any
+    ``missing_reason`` sub-cause substring so it does not conflict with the security pin in
+    :func:`test_d_divergence_notice_never_names_the_missing_sub_reason`.
     """
     view = _make_view(_DIFF_WARN_THRESHOLD - 1)
     body = (
@@ -2136,26 +2226,6 @@ def test_ambiguous_label_appears_in_the_d_divergence_notice() -> None:
     assert _MARKER_D_DIVERGENCE in notice
     assert "authoritative objection blocks" in notice
     assert "refuses to guess" in notice
-
-
-def test_format_slip_notice_names_the_residual() -> None:
-    """T-b follow-up (msg-2216 §3-(b) residual). When ``missing_reason=format_slip`` fires,
-    the D-divergence notice states the prompt-injection residual so a Layer-D reader does
-    not treat the counter as 100 % model-attributable.
-
-    ``format_slips`` is our own model's output-contract failure in the common case (the
-    live nonce is unguessable to a diff-time attacker), but a prompt-injection path could
-    nudge the model into a live-nonce format-slip. The fail-closed direction is unchanged
-    (still MISSING → RC); only the diagnostic reading needs the caveat, and the caveat
-    lives here so a reader who lands on the posted body sees it too.
-    """
-    view = _make_view(_DIFF_WARN_THRESHOLD - 1)
-    body = f'{_OBJECTIONS_SENTINEL_PREFIX} nonce="{_TEST_NONCE}" -->\n[]\n\nVERDICT: APPROVE'
-    decision = decide_verdict(body, view=view, finish_reason="stop", expected_nonce=_TEST_NONCE)
-    notice = render_gate_notice(decision)
-    assert _MARKER_D_DIVERGENCE in notice
-    assert "missing_reason=format-slip" in notice
-    assert "prompt-injection path could nudge" in notice
 
 
 def test_r4a_verdict_re_carries_a_back_reference_to_the_divergence() -> None:
