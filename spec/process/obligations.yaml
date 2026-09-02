@@ -303,18 +303,26 @@ obligations:
     # reads only `id` / `role` / `body` (msg-2207). Bohr withdrew that instruction
     # in msg-2387 §1 as an error in his own spec, and §4 replaced it.
     #
-    # The body below therefore carries TWO verbatim spans of msg-1968, in order:
-    # first the antecedent 「もし事前ロールチェックが存在して sweeper が弾かれる
-    # 事実が確認された場合」 — which Einstein himself delimited with 「」 inside
-    # his 処方 sentence, so it is extractable verbatim WITHOUT the surrounding
-    # meta-commentary — then the 「追加すべき義務」 clause. That is a widening of
-    # the verbatim span, not a paraphrase, so msg-2084 §5(1)(b) (verbatim, no
+    # The body below opens with ONE demarcated line that is NOT verbatim — the
+    # proposer's supplement naming where the carve-out lands (msg-2392 §4) — and
+    # then carries TWO verbatim spans of msg-1968, in order: first the antecedent
+    # 「もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合」
+    # — which Einstein himself delimited with 「」 inside his 処方 sentence, so it
+    # is extractable verbatim WITHOUT the surrounding meta-commentary — then the
+    # 「追加すべき義務」 clause. The supplement sits OUTSIDE both spans and labels
+    # itself as non-verbatim in the body's own text, so a reader of the injected
+    # string can tell quotation from supplement without this comment. Nothing
+    # inside a span is edited: that is a widening of the verbatim span plus an
+    # external annotation, not a paraphrase, so msg-2084 §5(1)(b) (verbatim, no
     # paraphrase) still holds. The seam reads 「…場合、その場合、…」, which is
     # redundant; msg-2387 §4(1) allows a less redundant cut only where a single
     # verbatim sentence of the original carries the antecedent, and no such
     # sentence exists here (the only one that does is the meta-framed 処方
     # sentence quoted below), so the redundancy is kept rather than smoothed by
-    # words that are not Einstein's.
+    # words that are not Einstein's. msg-2392 §6(a) upheld that on review:
+    # smoothing edits the INSIDE of a span, which is a different operation from
+    # appending a demarcated supplement outside one, and only the latter is
+    # allowed here.
     #
     # What belongs in the span is decided by ROLE, not by length (msg-2387 §5):
     # in = everything the implementer needs in order to comply, the antecedent
@@ -358,21 +366,29 @@ obligations:
     # short-circuit — removed here because the observability of the
     # antecedent is the S-4 design's responsibility, not this obligation's.
     #
-    # The prescribed carve-out lives cross-repo: the code change is in the
-    # magickit chatroom_close_thread implementation, not in mindwire. This
-    # obligation only names the addressee (the implementer) and the exception
-    # predicate; the implementer executes it by opening a magickit PR when
-    # the antecedent is confirmed observed.
+    # The cross-repo landing site is stated in `body` itself (round 3: PR-gate
+    # msg-2391, proposer ruling msg-2392 §4). It is deliberately NOT restated
+    # here — the same fact in two places drifts, and this comment paragraph is
+    # precisely where that fact was hiding from the loader when round 3 was
+    # raised.
     #
     # Source: T-new-project-gate-bootstrap msg-1968 (Einstein, naysayer,
     # 2026-08-28T09:59:31Z, reply_to msg-1967). The msg-1968 verbatim is
     # cited in the T-new-project-gate-bootstrap thread by Heisenberg msg-2083.
     #
     # Enforced by test_obl_gate_bootstrap_close_carveout_body_carries_its_antecedent
-    # in tests/test_obligations.py — it reads the antecedent out of the rendered
-    # implementer system prompt, i.e. out of the string production actually
-    # injects, so moving the antecedent back into a comment reds the gate.
-    body: "もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合、その場合、ADR-10 のロールを sweeper に付与して誤魔化すのではなく、PR-gate の carve-out と同様に、`chatroom_close_thread` 側に『`system-alert` タグを持ち、かつ owner 自身によるクローズである場合はロールチェックを免除する』という構造的な carve-out（例外経路）をコードとして追加実装すること。"
+    # in tests/test_obligations.py — it slices THIS entry's own injected block out
+    # of the rendered implementer system prompt (its id header up to the next
+    # entry's header) and asserts against that slice, never against the whole
+    # prompt. Whole-prompt `in` is not a check here: the prompt already contains
+    # "magickit" via the ADR index line for ADR-2026-06-04-18, so a whole-prompt
+    # search for the landing site was true before this fix existed (measured —
+    # msg-2392 §2). Moving the antecedent back into a comment, dragging
+    # Einstein's framing clause back in, or dropping the landing site each red
+    # the gate.
+    body: |
+      【実装先 — proposer 補足（Einstein の逐語ではない）】この carve-out のコードは magickit リポジトリのサーバ側 `chatroom_close_thread` 実装に入る。mindwire リポジトリの側に実装先は無く、履行は magickit に PR を立てることである。
+      【以下 Einstein msg-1968 逐語】もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合、その場合、ADR-10 のロールを sweeper に付与して誤魔化すのではなく、PR-gate の carve-out と同様に、`chatroom_close_thread` 側に『`system-alert` タグを持ち、かつ owner 自身によるクローズである場合はロールチェックを免除する』という構造的な carve-out（例外経路）をコードとして追加実装すること。
 
   - id: OBL-SPEC-SCOPE-CLOSURE
     role: implementer
