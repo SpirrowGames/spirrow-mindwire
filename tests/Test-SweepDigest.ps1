@@ -13,13 +13,14 @@
 #        transient (429/5xx/network) preserves the #138 R2 behavior of recording
 #   D-5  status-code taxonomy: 400/413 → deterministic-payload, 401/403/404 → deterministic-permanent,
 #        429/5xx/network → transient, unknown → transient (fail-safe)
-#   D-6  notify-health carries only last_full_success_period; ⚠ is a DERIVED predicate over period
-#        arithmetic, not a stored counter (Einstein msg-2102: unstored state cannot be miscleared)
+#   D-6  notify-health carries only period-typed fields (last_full_success_period plus, since E-4,
+#        first_attempt_period); ⚠ is a DERIVED predicate over period arithmetic, not a stored
+#        counter (Einstein msg-2102: unstored state cannot be miscleared)
 #   D-7  alert-path signature is semantic ("human:msg-2662") not payload-hash — regression-pinned so
 #        a future refactor that rehashes the rendered body is caught (msg-2101)
 #
 # The full DoD list (msg-2106):
-#   1  200-entry synthetic set renders ≤ 3,500 chars with correct total
+#   1  200-entry synthetic set renders within the shipped budget with correct total
 #   2  400 forced → degraded delivered, retry within same period stops
 #   3  401/403 forced → NO second POST, health recorded, alert-path NOT recorded
 #   4  429 classified as transient (#138 R2 record preserved)
@@ -52,8 +53,24 @@ if ($parseErrors) {
 $script:QuarantineEscalatedAfter = [TimeSpan]::FromHours(24)
 $script:QuarantineStaleAfter     = [TimeSpan]::FromDays(7)
 $script:StarvedThreshold         = [TimeSpan]::FromHours(24)
-$script:DigestBudget             = 3500
 $script:DailyDigestDeliveryTime  = [TimeSpan]::FromHours(9)
+
+# $DigestBudget is READ FROM the script under test, never restated here (Einstein msg-2396 E-2,
+# Bohr msg-2401 §3-1). The regression that motivates the parse is not "the number was wrong" but
+# "this harness kept its own copy of the number": this line said 3500 and so did
+# deploy/run-conductor-scheduled.ps1:102, so when production's value was wrong the suite could only
+# prove the wrong value was self-consistent with itself. 1663 checks passed green on 2026-09-01 and
+# 09-02 while every real digest was rejected 400. A literal here can drift from production; a parse
+# cannot. Every budget assertion below compares against THIS value, and the one assertion that
+# validates the value itself lives in the transport block further down.
+$budgetAssignments = $ast.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+    $n.Left.VariablePath.UserPath -eq 'DigestBudget' }, $true)
+if ($budgetAssignments.Count -ne 1) {
+    throw "expected exactly one `$DigestBudget assignment in the sweep script, found $($budgetAssignments.Count)"
+}
+$script:DigestBudget = [int]$budgetAssignments[0].Right.Extent.Text
 
 function Write-Log { param([string]$Message) }
 
@@ -166,11 +183,39 @@ Check "7 days ago last success -> 6 periods missed" `
 Check "malformed period id -> 0 (fail-open on unparseable input)" `
     0 (Get-DigestPeriodsMissed -CurrentPeriod 'garbage' -LastFullSuccessPeriod '2026-08-22')
 
+# E-4 (Einstein msg-2396, accepted whole by Bohr msg-2401 §5) — "never succeeded" is NOT "first run".
+#
+# The measured failure: live state/notify-health.json carried last_error / last_error_class /
+# last_attempt_at and no last_full_success_period at all, because that key is written only on a full
+# success and there had not been one since #203 landed. The rule "no success record -> return 0"
+# then read the total absence of success as a healthy first run, so the ⚠ stayed dark for exactly
+# the state it exists to announce. A success record is an EDGE; "has never succeeded" is a LEVEL,
+# and a level cannot be derived from an edge record alone. first_attempt_period supplies the
+# missing lower bound: it says when the failing started, without any time-typed field entering the
+# predicate (D-6 predicate discipline is preserved — every input here is a period id).
+Check "never succeeded, first attempt is TODAY -> 0 (the attempt is still in flight)" `
+    0 (Get-DigestPeriodsMissed -CurrentPeriod '2026-08-29' -LastFullSuccessPeriod $null -FirstAttemptPeriod '2026-08-29')
+Check "never succeeded, first attempt YESTERDAY -> 1 (yesterday's attempt failed and nobody was told)" `
+    1 (Get-DigestPeriodsMissed -CurrentPeriod '2026-08-29' -LastFullSuccessPeriod $null -FirstAttemptPeriod '2026-08-28')
+Check "never succeeded since 2026-08-26 -> 3 (the live #203 regression shape)" `
+    3 (Get-DigestPeriodsMissed -CurrentPeriod '2026-08-29' -LastFullSuccessPeriod $null -FirstAttemptPeriod '2026-08-26')
+# The two branches differ by one for the same delta, and that is the point: on the success branch
+# the boundary period DELIVERED, on this branch it FAILED. Pinned side by side so a future
+# "simplification" that collapses them has to argue with this line.
+Check "same delta, success branch -> 0 while never-succeeded branch -> 1" `
+    0 (Get-DigestPeriodsMissed -CurrentPeriod '2026-08-29' -LastFullSuccessPeriod '2026-08-28' -FirstAttemptPeriod '2026-08-28')
+Check "a recorded success WINS over first_attempt_period (the stronger evidence)" `
+    0 (Get-DigestPeriodsMissed -CurrentPeriod '2026-08-29' -LastFullSuccessPeriod '2026-08-28' -FirstAttemptPeriod '2026-01-01')
+Check "neither field -> 0 (genuinely nothing has been attempted yet)" `
+    0 (Get-DigestPeriodsMissed -CurrentPeriod '2026-08-29' -LastFullSuccessPeriod $null -FirstAttemptPeriod $null)
+Check "malformed first_attempt_period -> 0 (corrupt state must not take the sweep down)" `
+    0 (Get-DigestPeriodsMissed -CurrentPeriod '2026-08-29' -LastFullSuccessPeriod $null -FirstAttemptPeriod 'garbage')
+
 # =============================================================================================
 # D-6 / DoD 8, 9 — ⚠ derivation from period arithmetic
 # =============================================================================================
 Write-Host ""
-Write-Host "Get-DigestHealthWarning — ⚠ is DERIVED from last_full_success_period, not a stored flag"
+Write-Host "Get-DigestHealthWarning — ⚠ is DERIVED from the period fields, not a stored flag"
 
 $healthFresh = @{ last_full_success_period = '2026-08-28'; last_error_class = $null; last_attempt_at = '2026-08-29T09:00:00Z' }
 $healthMissed3 = @{ last_full_success_period = '2026-08-26'; last_error_class = 'deterministic-payload'; last_attempt_at = '2026-08-29T09:00:00Z' }
@@ -191,6 +236,30 @@ CheckTrue "next period after recovery -> warning gone" ($null -eq $warnRecovered
 # The empty-state case must be safe — no crash on first-ever run.
 $warnEmpty = Get-DigestHealthWarning -Health $healthEmpty -CurrentPeriod '2026-08-29'
 CheckTrue "empty health (first ever run) -> NO warning" ($null -eq $warnEmpty) $warnEmpty
+
+# E-4 at the warning level. $healthNeverSucceeded is the LIVE shape measured on
+# state/notify-health.json during the #203 regression, plus the first_attempt_period this change
+# adds: three days of 400s and not one full delivery.
+$healthNeverSucceeded = @{
+    first_attempt_period = '2026-08-26'
+    last_error_class = 'deterministic-payload'
+    last_error = 'Response status code does not indicate success: 400 (Bad Request).'
+    last_attempt_at = '2026-08-29T00:00:15.4356674Z'
+}
+$warnNever = Get-DigestHealthWarning -Health $healthNeverSucceeded -CurrentPeriod '2026-08-29'
+CheckTrue "never-succeeded state -> warning emitted (the fail-open E-4 reported)" ($null -ne $warnNever) $warnNever
+CheckTrue "never-succeeded warning says 一度も, not a fabricated last-success date" `
+    ($warnNever -match '一度も') $warnNever
+CheckTrue "never-succeeded warning counts the periods (3)" ($warnNever -match '3 期間') $warnNever
+CheckTrue "never-succeeded warning names when the failing started" ($warnNever -match '2026-08-26') $warnNever
+# The old wording interpolated an absent last-success into "（最後の成功 ）". Whatever the wording
+# becomes, it must never render an empty date as though it were one.
+CheckTrue "never-succeeded warning does NOT render an empty 最後の成功 field" `
+    ($warnNever -notmatch '最後の成功\s*[）)]') $warnNever
+# And the state that motivated the whole pin: first_attempt_period absent AND no success recorded
+# is still treated as a first run, because in that state we genuinely cannot tell.
+$warnUnknown = Get-DigestHealthWarning -Health @{ last_error_class = 'deterministic-payload' } -CurrentPeriod '2026-08-29'
+CheckTrue "no period history at all -> still NO warning (nothing has been attempted)" ($null -eq $warnUnknown) $warnUnknown
 
 # D-6 predicate discipline: the ⚠ predicate MUST NOT consult diagnostic fields. Verify by proving
 # that a state whose diagnostic fields say "just failed" but whose period says "still healthy" does
@@ -222,10 +291,51 @@ CheckTrue "degraded message directs the operator to chatroom (D-1: URL is auxili
     ($degraded_500 -match 'chatroom') $degraded_500
 
 # =============================================================================================
+# E-2 (Einstein msg-2396 / Bohr msg-2401 §3) — the budget must be legal for the transport the
+# digest actually ships on. This block is the one place that judges the VALUE of $DigestBudget;
+# every other budget check in this file only asks "does the render fit the value we ship".
+#
+# What went wrong without it: the constant was chosen at 3,500 for `embed.description` (4,096),
+# the transport move to embeds never happened, and the sender kept posting `content` (2,000). No
+# check anywhere compared the budget to the limit of the transport in use, so the arithmetic error
+# survived in a comment ("3,500 is well under the `content` 2,000 hard limit") and in the shipped
+# constant, through a full PR-gate review, for four days of daily 400s.
+# =============================================================================================
+Write-Host ""
+Write-Host "E-2 — shipped digest budget is legal for the transport the sender actually uses"
+
+$sweepText = Get-Content -Raw -LiteralPath $sweepScript
+
+# Discord's hard limit for a single message's `content` field.
+$DiscordContentHardLimit = 2000
+
+CheckTrue "the sender posts the digest as Discord ``content`` (the field whose limit is $DiscordContentHardLimit)" `
+    ($sweepText -match '@\{\s*content\s*=\s*\$Message\s*\}') 'Send-Notification payload shape'
+CheckTrue "shipped `$DigestBudget ($($script:DigestBudget)) is within the ``content`` hard limit ($DiscordContentHardLimit)" `
+    ($script:DigestBudget -le $DiscordContentHardLimit) $script:DigestBudget
+# Both Discord budgets in the wrapper answer to the same limit. Pinned together so raising one
+# without the other is visible: they were 3500 and 1950 for the same 2,000-char field.
+$decisionBudgetAssignments = $ast.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+    $n.Left.VariablePath.UserPath -eq 'DecisionMessageDiscordBudget' }, $true)
+CheckTrue "`$DecisionMessageDiscordBudget is also within the ``content`` hard limit" `
+    ($decisionBudgetAssignments.Count -eq 1 -and [int]$decisionBudgetAssignments[0].Right.Extent.Text -le $DiscordContentHardLimit) `
+    $(if ($decisionBudgetAssignments.Count -eq 1) { $decisionBudgetAssignments[0].Right.Extent.Text } else { "assignments=$($decisionBudgetAssignments.Count)" })
+
+# E-4's field needs a WRITER, not just a reader. This thread has now shipped three fields whose
+# consumer existed while nothing supplied a value (`next_participant`, `last_full_success_period`,
+# and the quarantine error class — Bohr msg-2401 §5 E-6 counts them). A reader-only field reads as
+# "healthy" forever, which is the precise shape of the fail-open E-4 reports.
+CheckTrue "``first_attempt_period`` has exactly one writer in the sweep script" `
+    (([regex]::Matches($sweepText, "\`$notifyHealth\['first_attempt_period'\]\s*=")).Count -eq 1) `
+    ([regex]::Matches($sweepText, "\`$notifyHealth\['first_attempt_period'\]\s*=")).Count
+
+# =============================================================================================
 # D-1 / DoD 1 — bounded renderer under a large synthetic waiting set stays ≤ budget with correct totals
 # =============================================================================================
 Write-Host ""
-Write-Host "New-DailyDigest -Budget — 200-entry synthetic waiting set stays under 3,500 chars with correct total (DoD 1)"
+Write-Host "New-DailyDigest -Budget — 200-entry synthetic waiting set stays under the shipped budget with correct total (DoD 1)"
 
 $now = [datetime]::Parse('2026-08-29T15:00:00Z').ToUniversalTime()
 
@@ -243,9 +353,9 @@ for ($i = 0; $i -lt 200; $i++) {
 
 $digest = New-DailyDigest -QuarantineState $bigQ -EvaluatedState @{} `
     -HeadsByProject @{} -ControlByProject @{} -Now $now -LiveKeys @() `
-    -Budget 3500
+    -Budget $script:DigestBudget
 
-CheckTrue "200-entry digest fits within budget (≤ 3,500 chars)" ($digest.Length -le 3500) $digest.Length
+CheckTrue "200-entry digest fits within the shipped budget (≤ $($script:DigestBudget) chars)" ($digest.Length -le $script:DigestBudget) $digest.Length
 CheckTrue "digest carries the correct total (200, NOT the truncated count)" ($digest -match '隔離中: 200 件') $digest.Substring(0, [Math]::Min(300, $digest.Length))
 CheckTrue "digest emits the +N 件 marker so the reader knows something was omitted" ($digest -match '\+\d+ 件（省略）') $digest
 CheckTrue "oldest entry is present (age-descending sort → oldest survives truncation)" `
@@ -267,8 +377,8 @@ for ($i = 0; $i -lt 50; $i++) {
 }
 $digest2 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
     -HeadsByProject @{} -ControlByProject @{} -Now $now -LiveKeys @() `
-    -HumanParked $bigParked -Budget 3500
-CheckTrue "50-entry parked digest fits within budget" ($digest2.Length -le 3500) $digest2.Length
+    -HumanParked $bigParked -Budget $script:DigestBudget
+CheckTrue "50-entry parked digest fits within budget" ($digest2.Length -le $script:DigestBudget) $digest2.Length
 CheckTrue "digest carries the correct human-parked total" ($digest2 -match '判断待ち: 50 件') $digest2.Substring(0, [Math]::Min(300, $digest2.Length))
 
 Write-Host "New-DailyDigest -Budget = 0 — legacy callers (unbounded) still work"
@@ -443,8 +553,8 @@ for ($i = 0; $i -lt 100; $i++) {
 $digest_errspike = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
     -HeadsByProject @{} -ControlByProject @{} -Now $now -LiveKeys @() `
     -HumanParked @() -ParkedPollErrors $errorSpike `
-    -Budget 3500
-CheckTrue "100-entry ParkedPollErrors spike still fits within budget" ($digest_errspike.Length -le 3500) $digest_errspike.Length
+    -Budget $script:DigestBudget
+CheckTrue "100-entry ParkedPollErrors spike still fits within budget" ($digest_errspike.Length -le $script:DigestBudget) $digest_errspike.Length
 CheckTrue "count line still names the true total (100)" ($digest_errspike -match '取得失敗: 100 件') $digest_errspike.Substring(0, [Math]::Min(400, $digest_errspike.Length))
 CheckTrue "budget-forced truncation surfaces via `+N 件（省略）` under the fetch-error section" `
     ($digest_errspike -match '\+\d+ 件（省略）') $digest_errspike
