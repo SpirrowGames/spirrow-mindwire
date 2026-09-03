@@ -117,14 +117,20 @@ def test_allowed_reads_pass_through() -> None:
 def _sweep(
     threads: list[dict[str, Any]], events: list[dict[str, Any]], state: PrState
 ) -> tuple[_RecordingMcp, list[Any]]:
-    inner = _RecordingMcp(threads=threads, events=events)
-    entry = ProjectEntry(project="p", owner="o", repo="r")
-    pairs = asyncio.run(
-        _MODULE._sweep_project(
-            _MODULE.ReadOnlyMcp(inner), _FakeGitHub(state), entry, timedelta(seconds=300)
-        )
-    )
+    inner, pairs, _excluded, _github = _sweep_full(threads, events, state)
     return inner, pairs
+
+
+def _sweep_full(
+    threads: list[dict[str, Any]], events: list[dict[str, Any]], state: PrState
+) -> tuple[_RecordingMcp, list[Any], list[Any], _FakeGitHub]:
+    inner = _RecordingMcp(threads=threads, events=events)
+    github = _FakeGitHub(state)
+    entry = ProjectEntry(project="p", owner="o", repo="r")
+    pairs, excluded = asyncio.run(
+        _MODULE._sweep_project(_MODULE.ReadOnlyMcp(inner), github, entry, timedelta(seconds=300))
+    )
+    return inner, pairs, excluded, github
 
 
 def _closed_state() -> PrState:
@@ -172,11 +178,45 @@ def test_non_pr_review_threads_are_ignored() -> None:
 
 
 def test_no_thread_body_is_fetched_when_limb_two_cannot_change_the_answer() -> None:
-    """(ii) is only consulted when the thread is in a liveness status and (i) holds."""
+    """(ii) is only consulted when the thread is in a liveness status and (i) holds.
+
+    ``parked`` and not ``resolved``: since msg-2422 §3.3 a resolved thread never reaches
+    this code at all, so it would pass this assertion for the wrong reason.
+    """
     inner, _ = _sweep(
-        [{"thread_id": "T-pr-review-p-7", "status": "resolved"}], [_event(60)], _closed_state()
+        [{"thread_id": "T-pr-review-p-7", "status": "parked"}], [_event(60)], _closed_state()
     )
     assert not [name for name, _ in inner.calls if name == "chatroom_get_thread"]
+
+
+# ------------------------------------------------------------------------------ S-pre
+
+
+@pytest.mark.parametrize("status", ["resolved", "superseded", "", "archived"])
+def test_an_out_of_scope_thread_costs_no_github_call_and_no_event_query(status: str) -> None:
+    """S-pre runs before S0 in the I/O too (msg-2422 §3.3), not only in the predicate."""
+    inner, pairs, excluded, github = _sweep_full(
+        [{"thread_id": "T-pr-review-p-7", "status": status}], [_event(60)], _closed_state()
+    )
+    assert pairs == []
+    assert github.asked == []
+    assert not [name for name, _ in inner.calls if name == "chatroom_list_events"]
+    assert [(e.thread_id, e.status) for e in excluded] == [("T-pr-review-p-7", status)]
+
+
+def test_an_excluded_thread_is_reported_rather_than_dropped() -> None:
+    """A silent exclusion is indistinguishable from a thread the sweep never saw."""
+    _inner, pairs, excluded, _github = _sweep_full(
+        [
+            {"thread_id": "T-pr-review-p-7", "status": "active"},
+            {"thread_id": "T-pr-review-p-8", "status": "resolved"},
+        ],
+        [_event(60)],
+        _closed_state(),
+    )
+    assert [f.thread_id for f, _pr in pairs] == ["T-pr-review-p-7"]
+    assert [e.thread_id for e in excluded] == ["T-pr-review-p-8"]
+    assert excluded[0].reason == "out-of-scope-finished"
 
 
 def test_the_thread_body_is_fetched_when_limb_two_matters() -> None:

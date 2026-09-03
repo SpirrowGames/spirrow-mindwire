@@ -2,9 +2,10 @@
 
 Phase 0 only. The sweep's three phases are staged deliberately (msg-2155 D-8):
 
-* **Phase 0** — write-zero measurement. Runs S0 (is the PR terminal?) and S1 (is the
-  thread still in use?), and reports the size of ``a_union_b`` — the set of threads that
-  are neither live nor attached to a live PR. Its whole output is a go/no-go number.
+* **Phase 0** — write-zero measurement. Runs S-pre (is this thread in the sweep's
+  population at all?), then S0 (is the PR terminal?) and S1 (is the thread still in
+  use?), and reports the size of ``a_union_b`` — the set of threads that are neither
+  live nor attached to a live PR. Its whole output is a go/no-go number.
 * **Phase 1** — the A/B split, which needs the ledger's ``can_close()`` predicate and
   therefore a different repository. Not in this package yet.
 * **Phase 2** — the actual close. Irreversible, gated behind both earlier phases.
@@ -31,13 +32,16 @@ from .phase0 import (
     PROVISIONAL_MARGIN_SECONDS,
     Bucket,
     Classification,
+    Excluded,
     Phase0Report,
     ThreadFacts,
     Verdict,
     build_report,
     classify,
+    intake_exclusion_reason,
     measurement_offsets_seconds,
     sensitivity_table,
+    split_intake,
 )
 
 __all__ = [
@@ -45,6 +49,7 @@ __all__ = [
     "PROVISIONAL_MARGIN_SECONDS",
     "Bucket",
     "Classification",
+    "Excluded",
     "GateActiveSince",
     "Phase0Report",
     "ProjectEntry",
@@ -54,9 +59,11 @@ __all__ = [
     "Verdict",
     "build_report",
     "classify",
+    "intake_exclusion_reason",
     "load_sweep_config",
     "measurement_offsets_seconds",
     "parse_sweep_config",
     "sensitivity_table",
+    "split_intake",
     "thread_prefix_for",
 ]
