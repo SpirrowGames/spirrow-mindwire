@@ -1889,6 +1889,77 @@ def test_d5_payload_starts_after_leading_whitespace_independent_of_helper() -> N
         assert report.missing_reason is None, label
 
 
+def test_marker_regex_is_a_positioner_only_d3_still_catches_non_adjacent_payload() -> None:
+    """gamma-2 pin A (msg-2478 §4.2 / msg-2521 §2.1). Retiring the marker regex's tail anchor does
+    NOT remove adjacency-checking — D-3 in :func:`parse_objections` is still the sole owner of
+    "is the payload right after the marker?" and still fail-closes when it is not.
+
+    The pre-gamma regex carried ``\\s*$`` and forced the marker to sit alone on its line. That was
+    a payload-shape check masquerading as a positioner (see the block above
+    :data:`_OBJECTIONS_SENTINEL_RE`); a refactor that tightened the regex could silently take
+    over adjacency from D-3 without any test moving. This pin exists so that a hypothetical
+    "widen the positioner to allow N junk chars, but let it fall through to D-3" round CANNOT
+    silently regress into "let junk chars through AS the payload": D-3's fail-closed exit on
+    non-``[`` payload is still what stops it.
+
+    Positive: with the tail anchor RETIRED, a critique whose marker is followed on the same
+    line by non-payload text (``<!-- ... --> chatter\\n[real block]``) still derives MISSING
+    via D-3, because the payload immediately after the marker begins with a space then
+    ``chatter\\n``, not ``[``. The block a naysayer wrote further down is NOT selected — that
+    would be the F-a-direction ``find("[")`` scan D-3 already rejected.
+
+    Complement: :func:`test_marker_regex_positioner_only_reds_if_the_tail_anchor_is_reintroduced`
+    covers the other direction (reintroducing the anchor reds a legitimate same-line placement).
+    """
+    real = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
+    body = (
+        f"{_OBJECTIONS_SENTINEL} some incidental chatter after the marker\n"
+        f"{real}\n\nVERDICT: REQUEST_CHANGES"
+    )
+    report = parse_objections(body)
+    assert report.status is ObjectionParse.MISSING, (
+        "the marker's positioner matched, but the payload immediately after the marker begins "
+        "with ' some incidental chatter\\n' — not '[' — so D-3 must fail-close; got "
+        f"{report.status.value} missing_reason={report.missing_reason}"
+    )
+    assert report.missing_reason is ObjectionMissingReason.PROSE_BETWEEN, (
+        "D-3 is the wall that fired; if this reads BAD_JSON or NO_MARKER the positioner has "
+        "quietly taken over adjacency from D-3 (or the regex stopped matching at all)"
+    )
+    assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+
+def test_marker_regex_positioner_only_reds_if_the_tail_anchor_is_reintroduced() -> None:
+    """gamma-2 pin B (msg-2478 §4.2 / msg-2521 §2.1). The other direction of the responsibility
+    boundary: a legitimate same-line marker+block (``<!-- ... --> [{...}]``) parses OK under
+    the positioner-only regex, and reintroducing the ``\\s*$`` tail anchor reds this test.
+
+    Why this shape is legitimate: the prompt asks for the block on its own line, but a model
+    that puts the marker and its (bare, well-formed, single-element) array on the same line
+    has satisfied the parser's REAL invariants — column-zero position (D-1) and payload-
+    adjacency (D-3). The pre-gamma tail anchor rejected such a critique at the positioner without
+    ever showing D-3 the payload, sending it to NO_MARKER despite the payload being present
+    and well-formed. Fail-closed, but for a reason (positioner shape) that had nothing to do
+    with the safety property (adjacency) the anchor was mistaken for.
+
+    NEGATIVE CONTROL. If a future refactor restores the tail anchor
+    (``re.compile(rf"^{re.escape(...)}\\s*$", re.MULTILINE)``), the regex no longer matches
+    this critique's marker, :func:`parse_objections` returns MISSING/NO_MARKER instead of OK,
+    and this assertion goes RED. That is the pin: any move that quietly re-couples positioner
+    to adjacency shows up as a red build here.
+    """
+    payload = f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "x"}}]'
+    body = f"{_OBJECTIONS_SENTINEL} {payload}\n\nVERDICT: APPROVE"
+    report = parse_objections(body)
+    assert report.status is ObjectionParse.OK, (
+        "same-line marker+block parses OK under the positioner-only regex; if this went to "
+        f"MISSING the tail anchor may have been reintroduced. got {report.status.value} "
+        f"missing_reason={report.missing_reason}"
+    )
+    assert report.missing_reason is None
+    assert derive_verdict(report) is ReviewEvent.APPROVE
+
+
 def test_missing_reason_covers_five_disjoint_causes() -> None:
     """Instrumentation (rider-3 msg-2130 §3). Each MISSING cause carries a distinct
     ``missing_reason``, and OK / EMPTY carry none.
@@ -2196,10 +2267,75 @@ def test_d7_scans_the_remainder_only_when_the_primary_read_derives_approve() -> 
     APPROVE, so the window is open and the scan must run. Implementing the guard as "empty
     primary only" reds that case and nothing else.
 
-    NEGATIVE CONTROL (msg-2397 M6), run before this test was written: with the scan restored to
-    the unconditional form, ONLY the first case below (blocking primary) goes red — the
-    advisory-only case and the empty-primary attack case stay green under both shapes, which is
-    what makes "no attack coverage was traded away" falsifiable rather than asserted.
+    **gamma-3 (msg-2521 §3, msg-2523).** ``report.blocking`` is WIDER than "the model named a
+    blocking class": ``_chains_another_block``'s docstring (``pr_review.py:695-702``) names
+    FOUR shapes that each set ``blocks=True`` in the primary and therefore skip the scan —
+    (A) an unknown class, including a misspelling; (B) a non-dict element; (C) a dict with no
+    ``class`` key; (D) a known blocking class carrying no evidence. Before gamma-3, the pin above
+    (blocking / advisory / empty) covered NEITHER edge — the two "malformed" pins
+    ``test_d7_refuses_a_chained_array_that_claims_a_class_but_little_else`` (`:2120`) and
+    ``test_objection_element_that_is_not_a_dict_is_unknown_class`` pinned those shapes as
+    inputs to ``parse_objections`` (was the parser strict enough on the chained side; did the
+    unknown branch mark ``blocks=True``), not the property this test is about (do those
+    ``blocks=True`` shapes IN PRIMARY POSITION halt the D-7 scan). The four legs below add
+    that leg, one row per shape, in the same test rather than four new tests because the
+    claim is one — "D-7 is primary-aware" — and the sensitivity of each leg is what has to be
+    independent, not the test the leg lives in.
+
+    PER-LEG NEGATIVE CONTROL MATRIX (msg-2523 §3). ``report.blocking`` is populated at
+    exactly two sites in :func:`parse_objections`:
+
+    * **site 1**, ``pr_review.py:1048`` — the unknown branch's ``blocks=True``. Reached by
+      A (misspelled class → ``entry = vocabulary.get(name) is None``), B (non-dict element →
+      ``raw_class is None`` → ``name = ""`` → same lookup miss), and C (class-less dict →
+      same). The three legs share one emission point; the docstring's use of "each set
+      ``blocks=True``" describes the outcome, not the branching.
+    * **site 2**, ``pr_review.py:1060`` — the known branch's ``blocks=entry.blocks``. Reached
+      by D (known blocking class → ``entry.blocks`` is True; the ``no_evidence`` bookkeeping
+      above it does NOT demote the objection, precisely so "write no evidence" cannot become
+      the cheapest way to soften a verdict).
+
+    Matrix (chained real block placed after each primary; assertion = ``status`` +
+    ``len(blocking)`` — NOT ``derive_verdict``, see below):
+
+    ==========================================  ===  ===  ===  ===
+    mutation                                     A    B    C    D
+    ==========================================  ===  ===  ===  ===
+    site 1: ``blocks=True`` → False              OPEN OPEN OPEN closed
+    site 2: ``blocks=entry.blocks`` → False      closed closed closed OPEN
+    ==========================================  ===  ===  ===  ===
+
+    Each column has at least one row marked OPEN — the sensitivity condition (msg-2523 §3.2).
+    A and C share site 1 with B not because the pin is loose but because the code has one
+    emission point for all three (msg-2523 §5 records that "if a mutation opens the same
+    leg two ways, that is a code fact, not a lax test").
+
+    WHY THE ASSERTION IS ``status`` + ``len(blocking)``, NOT ``derive_verdict``. Under either
+    mutation ``derive_verdict`` stays REQUEST_CHANGES via the D-7 fallback: the primary loses
+    ``blocks=1`` → ``report.blocking`` is empty → D-7 scan RUNS on the remainder → chained
+    real block is found → ``_missing_report(BAD_JSON)`` → RC. Two different code paths deliver
+    the same RC, so ``derive_verdict`` is a false witness for whether the SCAN was skipped
+    (msg-2523 §4). ``status`` distinguishes them (``unknown-class`` / ``no-evidence`` for the
+    skip path; ``missing`` + ``BAD_JSON`` for the fallback), and ``len(blocking) == 1`` names
+    the primary carried the block.
+
+    HOW THE FOUR LEGS ARE ASSERTED. All four are evaluated before anything is asserted (as
+    with :func:`test_d7_refuses_a_chained_array_that_claims_a_class_but_little_else` above),
+    so the failure text names each leg that opened rather than short-circuiting on the first.
+    The status-value expectation is per-leg (A/B/C read ``unknown-class``; D reads
+    ``no-evidence``); ``len(blocking) == 1`` is asserted for every leg.
+
+    NEGATIVE CONTROL (msg-2397 M6, msg-2523 §3), run before this test was written: with the
+    scan restored to the unconditional form, ONLY the first case below (blocking primary,
+    quoting) goes red — the advisory-only case and the empty-primary attack case stay green
+    under both shapes, which is what makes "no attack coverage was traded away" falsifiable
+    rather than asserted. With the site-1 mutation applied (``blocks=True`` → False in the
+    unknown branch) the A/B/C legs go red (``status`` moves from ``unknown-class`` to
+    ``missing``, ``len(blocking)`` from 1 to 0) and the D leg stays green. With the site-2
+    mutation applied (``blocks=entry.blocks`` → False in the known branch) the D leg goes
+    red and the A/B/C legs stay green. Two mutations, each named at
+    ``pr_review.py:1048`` / ``pr_review.py:1060`` — the two emission points the docstring
+    describes are the two the pin exercises.
     """
     real = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
     advisory = f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "reads oddly"}}]'
@@ -2240,6 +2376,64 @@ def test_d7_scans_the_remainder_only_when_the_primary_read_derives_approve() -> 
     )
     assert report.missing_reason is ObjectionMissingReason.BAD_JSON
     assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+    # gamma-3 legs. Each of the FOUR shapes that ``_chains_another_block``'s docstring names as
+    # setting ``blocks=True`` in the primary must halt the D-7 scan when placed in primary
+    # position with a chained real block below. Evaluated as a batch so failure text names
+    # every leg that opened (per-leg matrix, msg-2523 §3.4).
+    real_blocking_name = _blocking_class()
+    misspelled_class = real_blocking_name[:3] + real_blocking_name[4:]  # one char deleted
+    assert misspelled_class != real_blocking_name and misspelled_class not in objection_classes(), (
+        "this fixture needs a near-miss of a real class that is NOT itself known"
+    )
+    gamma3_legs = {
+        # A: unknown class (misspelling). Site 1 emission (pr_review.py:1048).
+        "A misspelled class": (
+            f'[{{"class": "{misspelled_class}", "where": "a.py:1", "evidence": "n=0"}}]',
+            ObjectionParse.UNKNOWN,
+        ),
+        # B: non-dict element. Site 1 (raw_class=None → name="" → vocabulary lookup miss).
+        "B non-dict element": ('["just a string"]', ObjectionParse.UNKNOWN),
+        # C: dict with no class key. Site 1 (raw_class=None → name="" → lookup miss).
+        "C dict with no class key": (
+            '[{"where": "a.py:1", "evidence": "n=0"}]',
+            ObjectionParse.UNKNOWN,
+        ),
+        # D: known blocking class carrying no evidence. Site 2 emission (pr_review.py:1060);
+        # the ``no_evidence`` bookkeeping upgrades status to NO_EVIDENCE but leaves blocks=True.
+        "D blocking class no evidence": (
+            f'[{{"class": "{real_blocking_name}", "where": "a.py:1"}}]',
+            ObjectionParse.NO_EVIDENCE,
+        ),
+    }
+    opened: list[str] = []
+    for label, (primary, expected_status) in gamma3_legs.items():
+        body = (
+            f"{_OBJECTIONS_SENTINEL}\n{primary}\n\nand the real block:\n\n{real}"
+            "\n\nVERDICT: APPROVE"
+        )
+        report = parse_objections(body)
+        # The two witnesses that distinguish "scan skipped" from "scan ran and caught it".
+        # derive_verdict is REQUEST_CHANGES either way and is a false witness here.
+        if report.status is not expected_status:
+            opened.append(
+                f"{label}: expected status={expected_status.value}, got status="
+                f"{report.status.value} (missing_reason="
+                f"{report.missing_reason.value if report.missing_reason else '-'})"
+            )
+            continue
+        if len(report.blocking) != 1:
+            opened.append(f"{label}: expected len(blocking)=1, got {len(report.blocking)}")
+            continue
+        # derive_verdict is still asserted so a change to derive_verdict that broke the
+        # fail-closed floor would surface, but it is NOT the discriminating witness above.
+        if derive_verdict(report) is not ReviewEvent.REQUEST_CHANGES:
+            opened.append(f"{label}: derive_verdict lost RC")
+    assert not opened, (
+        "each of these primaries sets blocks=True in the parser, so the D-7 scan must skip and "
+        "the primary read (unknown-class or no-evidence) must be preserved; the "
+        f"following leg(s) opened: {'; '.join(opened)}"
+    )
 
 
 def test_d6_depth_bound_keeps_the_never_raises_contract_at_both_decode_sites() -> None:
