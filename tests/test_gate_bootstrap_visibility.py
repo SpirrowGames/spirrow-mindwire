@@ -72,6 +72,7 @@ from spirrow_mindwire.gate_bootstrap_visibility import (
     FileFailureStateStore,
     RateLimitFloor,
     StateFileMalformedError,
+    _parse_iso,
     _State,
 )
 
@@ -1290,6 +1291,15 @@ def test_file_state_store_load_raises_on_non_object_episodes_section(tmp_path: P
         store.load()
 
 
+def test_file_state_store_load_raises_on_non_object_top_level(tmp_path: Path) -> None:
+    """Valid JSON whose top level is not an object. Gate msg-2449 objection 1."""
+    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps([]), encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError, match="top level"):
+        FileFailureStateStore(path).load()
+
+
 @pytest.mark.anyio
 async def test_malformed_entry_does_not_erase_state_file(tmp_path: Path) -> None:
     """PR #209 gate round-5 blocking #2 (integration): fail-closed preserves corrupt bytes.
@@ -1452,6 +1462,11 @@ async def test_visibility_survives_naive_timestamp_in_state_file(tmp_path: Path)
     assert "+" in replaced or replaced.endswith("Z"), (
         f"naive floor was not replaced with an aware one on write-ahead: {replaced!r}"
     )
+
+
+def test_parse_iso_returns_none_on_unparseable_text() -> None:
+    """The ValueError arm, not the naive arm above. Gate msg-2449 objection 2."""
+    assert _parse_iso("not-a-date") is None
 
 
 # --- The precheck boundary (PR #200) x the visibility hook ---------------------------------------
