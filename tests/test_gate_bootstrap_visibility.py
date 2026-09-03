@@ -36,6 +36,14 @@ Extra: Test 6-b **open failure never touches visibility state**
 (Einstein msg-2298 blocking; msg-2301 D-2'''' mechanical constraint) — pins
 the scoping. Not one of the six per se, but the module docstring §Scope
 Is Close-Only turns on it.
+
+Extra, added when this branch was rebased onto a main that already
+carried PR #200: two tests at the end of this file pin the interaction
+between #200's read-side precheck and this hook (Einstein msg-2326
+correction #2). The long comment above them states which of the two cases
+is a no-op and which reports, and why — do not shorten it to "see the
+tests", because the answer differs per case and the reasoning is what
+makes the difference legible.
 """
 
 from __future__ import annotations
@@ -1444,3 +1452,183 @@ async def test_visibility_survives_naive_timestamp_in_state_file(tmp_path: Path)
     assert "+" in replaced or replaced.endswith("Z"), (
         f"naive floor was not replaced with an aware one on write-ahead: {replaced!r}"
     )
+
+
+# --- The precheck boundary (PR #200) x the visibility hook ---------------------------------------
+#
+# These two tests exist because PR #200 landed AFTER this branch was first
+# written and changed the shape of what ``close_alert`` can raise. Einstein
+# msg-2326 correction #2 made one invariant binding on this rewire:
+#
+#   "the visibility hook must exclusively wrap the network boundary
+#    (await mcp.call_tool), physically beneath any prechecks. A rejected
+#    close is a no-op, not a crash."
+#
+# Read against #200 as merged, that invariant splits into two cases with
+# DIFFERENT answers, and only measuring the merged code tells them apart:
+#
+#   (a) the nominal precheck skip — the alert thread was never opened, so
+#       ``_alert_thread_exists`` returns False and ``close_alert`` RETURNS
+#       ``CloseResult(was_open=False)``. It does not raise. The false-positive
+#       class Einstein named therefore cannot occur through the exception
+#       path at all; it is structurally absent rather than defended against.
+#       Test A pins that, because nothing else does and a future change that
+#       made absence raise would silently create the class.
+#
+#   (b) a genuine read-boundary fault — a non-not-found envelope from
+#       ``chatroom_get_thread``, wrapped into ``GateBootstrapCloseError``.
+#       This one DOES report, deliberately. #200's own docstring states the
+#       intent verbatim ("so the operator sees ONE failure surface across the
+#       whole close_alert contract") and the independent gate on #200
+#       endorsed exactly that unification. A permission fault on the read is
+#       not nominal domain logic, so reporting it is not the pollution
+#       Einstein was guarding against.
+#
+# Case (b) is also where the msg-2301 D-2'''' scoping rule gets its narrowest
+# reading. The rule excludes ``open_alert`` because there the reporting target
+# PROVABLY does not exist yet. A read-boundary fault leaves existence merely
+# UNKNOWN, and if the report lands nowhere the post failure is swallowed and
+# the write-ahead floor still bounds it to one attempt per project per 24h.
+# Unknown-existence is therefore not the same class as proven-absence, and is
+# not excluded.
+
+
+def _envelope_error(error_type: str, message: str) -> Any:
+    """Build the exception ``raise_if_envelope`` would raise for this envelope.
+
+    Constructed directly rather than round-tripped through the client so the
+    test states which ``error_type`` it means; #200's discriminator reads that
+    field and nothing else.
+    """
+    from spirrow_mindwire.magickit.client import MagickitMcpError
+
+    return MagickitMcpError(message, error_type=error_type)
+
+
+class _PrecheckMcp:
+    """Fake whose ``chatroom_get_thread`` raises a caller-chosen envelope."""
+
+    def __init__(self, precheck_error: BaseException) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._precheck_error = precheck_error
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        self.calls.append((name, dict(arguments)))
+        if name == "chatroom_get_thread":
+            raise self._precheck_error
+        return {"msg": {"msg_id": "msg-fake"}}
+
+
+def _load_tick_cli() -> Any:
+    """Load ``scripts/gate_bootstrap_tick.py`` as a module (not on the import path)."""
+    spec = importlib.util.spec_from_file_location(
+        "_gate_bootstrap_visibility_precheck_cli", _SCRIPT_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _declared_repo(tmp_path: Path) -> Path:
+    """A repo dir that ``inspect_gate`` classifies DECLARED (routes to the close path)."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / ".mindwire-gate").write_text("#!/usr/bin/env bash\nexit 0\n")
+    return repo_dir
+
+
+@pytest.mark.anyio
+async def test_precheck_absent_thread_is_a_no_op_not_a_failure(tmp_path: Path) -> None:
+    """Nominal precheck skip -> no failure report, no post, no state file.
+
+    Einstein msg-2326 correction #2, discharged against #200 as merged. The
+    alert thread was never opened; ``_alert_thread_exists`` sees the benign
+    ``ChatroomNotFoundError`` envelope and ``close_alert`` returns
+    ``was_open=False`` without raising and without a write-shaped call.
+
+    Asserted on side-effect absence rather than on mock call counts, for the
+    same reason ``test_visibility_is_close_only`` does: the state file is the
+    artifact, and an intermediate wrapper cannot fake its absence.
+    """
+    cli = _load_tick_cli()
+    repo_dir = _declared_repo(tmp_path)
+
+    state_file = tmp_path / "state" / "gate_bootstrap_failure.json"
+    vis = cli.CloseFailureVisibility(cli.FileFailureStateStore(state_file))
+    mcp = _PrecheckMcp(
+        _envelope_error(
+            "ChatroomNotFoundError",
+            "Thread 'T-gate-bootstrap-spirrow-example' not found in project 'spirrow-example'",
+        )
+    )
+
+    exit_code, out = await cli._run_tick(
+        "spirrow-example",
+        repo_dir,
+        owner=DEFAULT_SWEEPER_OWNER,
+        mcp_url=None,
+        merge_commit_sha=None,
+        mcp_factory=lambda _url: mcp,
+        visibility=vis,
+    )
+
+    # The load-bearing assertion first, so a regression names the invariant it
+    # broke rather than the exit code that happens to move with it.
+    assert "visibility" not in out, (
+        f"a nominal precheck skip produced a visibility report - the false-positive "
+        f"class Einstein msg-2326 #2 named; report={out.get('visibility')!r}"
+    )
+    assert not state_file.exists(), (
+        f"a nominal precheck skip wrote visibility state; path={state_file}"
+    )
+    assert not any(name == "chatroom_post_message" for name, _ in mcp.calls)
+    # And no write-shaped close was attempted either (#200's own contract).
+    assert not any(name == "chatroom_close_thread" for name, _ in mcp.calls)
+    assert exit_code == 0
+    assert out["action"] == "already_closed"
+
+
+@pytest.mark.anyio
+async def test_precheck_read_fault_reports_through_the_unified_surface(tmp_path: Path) -> None:
+    """A genuine read-boundary fault DOES report - deliberately, not by omission.
+
+    #200 wraps a non-not-found precheck envelope into
+    ``GateBootstrapCloseError`` precisely so the operator sees one failure
+    surface for the whole ``close_alert`` contract. That decision was endorsed
+    by the independent gate on #200 and is not re-litigated here; this test
+    pins it so that narrowing the hook to the write boundary later becomes a
+    visible, named change rather than a silent regression of #200's intent.
+    """
+    cli = _load_tick_cli()
+    repo_dir = _declared_repo(tmp_path)
+
+    state_file = tmp_path / "state" / "gate_bootstrap_failure.json"
+    vis = cli.CloseFailureVisibility(cli.FileFailureStateStore(state_file))
+    mcp = _PrecheckMcp(
+        _envelope_error(
+            "ChatroomPermissionError",
+            "read access denied for 'orchestrator'",
+        )
+    )
+
+    exit_code, out = await cli._run_tick(
+        "spirrow-example",
+        repo_dir,
+        owner=DEFAULT_SWEEPER_OWNER,
+        mcp_url=None,
+        merge_commit_sha=None,
+        mcp_factory=lambda _url: mcp,
+        visibility=vis,
+    )
+
+    assert exit_code == 1
+    assert out["action"] == "close_refused"
+    assert out["visibility"]["action"] == "posted", (
+        f"a read-boundary permission fault did not reach the operator; "
+        f"visibility={out.get('visibility')!r}"
+    )
+    posts = [args for name, args in mcp.calls if name == "chatroom_post_message"]
+    assert len(posts) == 1
+    assert posts[0]["thread_id"] == "T-gate-bootstrap-spirrow-example"

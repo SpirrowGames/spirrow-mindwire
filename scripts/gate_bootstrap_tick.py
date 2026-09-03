@@ -172,6 +172,36 @@ async def _run_tick(
     # the world-state the sweeper wanted. The visibility mechanism clears
     # the episode on that observation — the failure state is a description
     # of the WORLD, not of our actions (msg-2297).
+    #
+    # Since PR #200, ``close_alert`` opens with a read-side precheck, and that
+    # splits what reaches the ``except`` blocks below into two cases with
+    # different answers (Einstein msg-2326 correction #2, discharged here
+    # against #200 as merged rather than against the shape this branch was
+    # first written for):
+    #
+    #   * The alert thread was never opened. The precheck classifies the
+    #     benign ``ChatroomNotFoundError`` envelope and ``close_alert``
+    #     RETURNS ``was_open=False`` — it does not raise, and no write-shaped
+    #     call is issued. So the "every valid precheck skip gets recorded as a
+    #     failure" pollution Einstein named cannot occur through this path at
+    #     all: it is structurally absent, not defended against. The tick falls
+    #     through to ``on_close_success``, whose Rule 1 clear is correct here
+    #     for the same reason it is correct for a human close — a read that
+    #     observes absence is a positive observation that the alert is closed.
+    #     Pinned by ``test_precheck_absent_thread_is_a_no_op_not_a_failure``.
+    #
+    #   * A genuine read-boundary fault (any other envelope) is wrapped into
+    #     ``GateBootstrapCloseError`` by #200 and DOES report, deliberately.
+    #     #200's docstring states the intent verbatim — "so the operator sees
+    #     ONE failure surface across the whole close_alert contract" — and the
+    #     independent gate on #200 endorsed that unification. A permission
+    #     fault on the read is not nominal domain logic. The msg-2301 D-2''''
+    #     scoping rule does not exclude it either: that rule excludes
+    #     ``open_alert`` because there the reporting target PROVABLY does not
+    #     exist yet, whereas a read fault leaves existence merely UNKNOWN, and
+    #     a report that lands nowhere is swallowed and still floor-bounded to
+    #     one attempt per project per 24h. Pinned by
+    #     ``test_precheck_read_fault_reports_through_the_unified_surface``.
     try:
         result = await close_alert(
             mcp, project=project, owner=owner, merge_commit_sha=merge_commit_sha
