@@ -28,6 +28,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from types import TracebackType
 from typing import Any, Protocol
@@ -156,6 +157,47 @@ class CiStatus:
     state: CiState
     head_sha: str | None
     failing: list[str]  # names of failing workflow runs (for the REQUEST_CHANGES body)
+
+
+class PrResolution(StrEnum):
+    """Whether — and how — a PR reference resolved (PR-review sweep S0, msg-2151 D-6).
+
+    The distinction that matters is between a **definite** answer and **no answer**.
+    ``NOT_FOUND`` is definite: GitHub says this PR does not exist, so the sweep's
+    thread→repo mapping is wrong or the PR is gone, and that is a fact to report.
+    ``UNRESOLVABLE`` is the absence of an answer — a 5xx, a rate limit, a dead socket,
+    or an auth failure — and the sweep must then neither close nor report, because
+    both would be a verdict pronounced on data it never read (D-7, fail-open).
+
+    Collapsing the two is the failure this enum exists to prevent: it would turn every
+    transient outage into a permanent-looking debt entry.
+    """
+
+    OPEN = "open"
+    CLOSED = "closed"
+    NOT_FOUND = "not_found"
+    UNRESOLVABLE = "unresolvable"
+
+
+@dataclass(frozen=True)
+class PrState:
+    """Terminality facts for one PR, as S0 needs them.
+
+    ``closed_at`` is the terminal time for BOTH merged and merely-closed PRs: GitHub
+    sets it whenever ``state == "closed"``, and a merged PR is a closed one with
+    ``merged == true``. Branching on ``merged_at`` vs ``closed_at`` was an earlier
+    draft's unnecessary complication (msg-2151).
+    """
+
+    ref: PrRef
+    resolution: PrResolution
+    closed_at: datetime | None = None
+    merged: bool = False
+    head_sha: str | None = None
+
+    @property
+    def slug(self) -> str:
+        return self.ref.slug
 
 
 @dataclass(frozen=True)
@@ -502,6 +544,67 @@ class GitHubClient:
             _required_workflows_from_env(),
         )
 
+    async def fetch_pr_state(self, pr: PrRef) -> PrState:
+        """``GET /repos/{owner}/{repo}/pulls/{n}`` → terminality facts for the sweep's S0.
+
+        Fail direction is neither the fail-loud of :meth:`fetch_pr_diff` nor the
+        fail-soft ``[]`` of :meth:`fetch_pr_reviews`. It is a third thing, because the
+        caller must be able to tell "GitHub says no such PR" from "GitHub did not
+        answer" — the first is a finding, the second must produce no verdict at all.
+        So every failure is returned as a :class:`PrResolution`, not raised:
+
+        * ``404``                                        -> ``NOT_FOUND`` (definite)
+        * any other non-2xx, incl. 401 / 403 / 429 / 5xx -> ``UNRESOLVABLE``
+        * network error, malformed JSON                  -> ``UNRESOLVABLE``
+
+        403 is grouped with the indeterminates on purpose. GitHub serves both "rate
+        limited" and "you cannot see this repo" as 403, and neither is evidence that
+        the PR is absent; reading a permissions problem as ``NOT_FOUND`` would file
+        every unreadable-repo thread as a debt.
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
+        try:
+            resp = await self._client.get(path)
+        except httpx.RequestError as exc:
+            logger.warning("fetch_pr_state: GET %s failed: %s (unresolvable)", path, exc)
+            return PrState(ref=pr, resolution=PrResolution.UNRESOLVABLE)
+        if resp.status_code == 404:
+            return PrState(ref=pr, resolution=PrResolution.NOT_FOUND)
+        if resp.status_code >= 400:
+            logger.warning(
+                "fetch_pr_state: GET %s -> %s (unresolvable): %s",
+                path,
+                resp.status_code,
+                _error_detail(resp),
+            )
+            return PrState(ref=pr, resolution=PrResolution.UNRESOLVABLE)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            logger.warning("fetch_pr_state: malformed JSON: %s (unresolvable)", exc)
+            return PrState(ref=pr, resolution=PrResolution.UNRESOLVABLE)
+        if not isinstance(payload, dict):
+            return PrState(ref=pr, resolution=PrResolution.UNRESOLVABLE)
+
+        state = str(payload.get("state") or "").lower()
+        head = payload.get("head")
+        head_sha = str(head.get("sha")) if isinstance(head, dict) and head.get("sha") else None
+        if state == "open":
+            return PrState(ref=pr, resolution=PrResolution.OPEN, head_sha=head_sha)
+        if state != "closed":
+            # A third state would mean the API contract moved under us. Refusing to
+            # guess is the same rule as the 403 case above.
+            logger.warning("fetch_pr_state: %s has unknown state %r", pr.slug, state)
+            return PrState(ref=pr, resolution=PrResolution.UNRESOLVABLE)
+
+        return PrState(
+            ref=pr,
+            resolution=PrResolution.CLOSED,
+            closed_at=_parse_github_timestamp(payload.get("closed_at")),
+            merged=bool(payload.get("merged")),
+            head_sha=head_sha,
+        )
+
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
         """``GET /repos/{owner}/{repo}/pulls/{n}/reviews`` → submitted reviews (paginated).
 
@@ -570,6 +673,22 @@ class GitHubClient:
         return body_json if isinstance(body_json, dict) else {"raw": body_json}
 
 
+def _parse_github_timestamp(raw: object) -> datetime | None:
+    """GitHub's ``2026-08-30T01:02:03Z`` → an aware :class:`datetime`, or ``None``.
+
+    Returns ``None`` rather than raising on anything unparseable: the sweep's caller
+    already treats a missing terminal time as "cannot classify", which is the same
+    safe outcome, and a malformed timestamp on one PR must not abort the whole run.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("unparseable GitHub timestamp %r", raw)
+        return None
+
+
 def _error_element(element: object) -> str:
     """One entry of GitHub's ``errors`` array as text — entries are strings OR objects."""
     if isinstance(element, str):
@@ -623,6 +742,8 @@ __all__ = [
     "GitHubHTTPError",
     "GitHubReviewClient",
     "PrRef",
+    "PrResolution",
+    "PrState",
     "ReviewEvent",
     "ReviewInfo",
     "github_token",
