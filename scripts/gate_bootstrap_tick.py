@@ -242,6 +242,17 @@ async def _run_tick(
     if visibility is not None:
         visibility.on_close_success(project=project, thread_id=thread_id)
     out["action"] = "closed" if result.was_open else "already_closed"
+    # T-gate-bootstrap-close-retried-on-resolved-thread S-3 (Bohr msg-2460 §6
+    # item 1): when the precheck (or the post-refusal read-back) observed
+    # that the thread was already ``resolved``, surface the observed
+    # ``resolved_by_msg`` in the JSON output. The operator's incident-report
+    # frame is exactly "who resolved the thread" (msg-2456 §2 named ``msg-429``
+    # as the ground truth), so exposing it here turns the tick's log line
+    # from "we closed it (or already closed)" into a self-explaining record.
+    # ``None`` when the thread never existed or when we did the close
+    # ourselves — leave the key absent in those cases to keep the JSON small.
+    if result.resolved_by_msg is not None:
+        out["resolved_by_msg"] = result.resolved_by_msg
     return 0, out
 
 

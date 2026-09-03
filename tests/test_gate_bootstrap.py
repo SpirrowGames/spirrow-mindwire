@@ -319,37 +319,155 @@ async def test_open_alert_opens_fixed_thread_id_with_alert_tags() -> None:
 
 
 @pytest.mark.anyio
-async def test_open_alert_swallows_already_exists_as_success() -> None:
-    """Second (or Nth) open: ``already exists`` envelope folds to ``already_exists=True``.
+async def test_open_alert_returns_already_exists_when_readback_sees_active_thread() -> None:
+    """Second (or Nth) open: refusal + read-back showing ``status='active'`` folds
+    to ``already_exists=True``.
 
-    Pins msg-1963 D-4 — the fixed thread_id IS the idempotency key. A second
-    open in the project's lifetime is the expected call, not a bug.
+    Pins msg-1963 D-4 (the fixed thread_id IS the idempotency key) via
+    T-gate-bootstrap-close-retried-on-resolved-thread S-4-prime (Bohr msg-2460 §2).
+    The measured error_type for a duplicate open is deliberately NOT included
+    in the fake — the design does not read it. What decides is the observed
+    world state via ``_read_thread_reading_or_none``.
+
+    The fake's ``chatroom_open_thread`` error_type is
+    ``ChatroomIntegrityError``, which matches origin/main's fixture pin but is
+    NOT itself a measured value in this codebase — it is preserved for the
+    regression contract that this test's predecessor pinned (Bohr msg-2460
+    §5: "テストが測定値のふりをしていないか"). If the server ever emits a
+    different error_type here, this test still passes because the discriminator
+    is now the read-back's ``status`` field, not the error_type.
     """
+    project = "spirrow-verimend"
+    thread_id = "T-gate-bootstrap-spirrow-verimend"
     mcp = _FakeMcp(
         results={
             "chatroom_open_thread": _error_envelope(
                 "ChatroomIntegrityError",
-                "Thread 'T-gate-bootstrap-spirrow-verimend' already exists in project 'x'",
+                f"Thread {thread_id!r} already exists in project {project!r}",
+            ),
+            # Read-back after refusal MUST see an active thread. Any other
+            # status ("resolved" / "parked" / unknown) would raise — see the
+            # sibling tests below.
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id, status="active"),
+        }
+    )
+    result = await open_alert(mcp, project=project)
+    assert result == OpenResult(thread_id=thread_id, already_exists=True)
+    # Load-bearing: the read-back was actually issued.
+    reads = [name for name, _ in mcp.calls if name == "chatroom_get_thread"]
+    assert reads == ["chatroom_get_thread"]
+
+
+@pytest.mark.anyio
+async def test_open_alert_accepts_awaiting_reply_as_target_reached() -> None:
+    """``status == "awaiting_reply"`` also means the alert is up and visible.
+
+    Pins T-gate-bootstrap-close-retried-on-resolved-thread S-4-prime (Bohr msg-2460
+    §2): both ``active`` and ``awaiting_reply`` are the target statuses for
+    ``open_alert`` because the goal is "an alert a reader would see", and both
+    values satisfy that. Same result as the ``active`` case above.
+    """
+    project = "spirrow-verimend"
+    thread_id = "T-gate-bootstrap-spirrow-verimend"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_open_thread": _error_envelope(
+                "ChatroomIntegrityError",
+                f"Thread {thread_id!r} already exists",
+            ),
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id, status="awaiting_reply"),
+        }
+    )
+    result = await open_alert(mcp, project=project)
+    assert result == OpenResult(thread_id=thread_id, already_exists=True)
+
+
+@pytest.mark.anyio
+async def test_open_alert_raises_when_readback_sees_resolved_thread() -> None:
+    """N-4 (Bohr msg-2460 §5): open refusal + read-back showing ``status='resolved'``
+    MUST raise. It MUST NOT return ``already_exists=True``.
+
+    This is Einstein msg-2459 correctness blocking pinned as a regression test.
+    The prior implementation would have folded any "existence" observation into
+    ``already_exists=True``, hiding the fact that the alert is NOT up — it was
+    up and got resolved, and the fixed thread_id cannot host a second life-cycle
+    (Bohr msg-2460 §3, recorded as a scope-boundaried defect). The raise
+    message must name that condition so the operator sees why.
+
+    A regression that reintroduces "existence-based" acceptance of the target
+    state would fail this test.
+    """
+    project = "spirrow-verimend"
+    thread_id = "T-gate-bootstrap-spirrow-verimend"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_open_thread": _error_envelope(
+                "ChatroomIntegrityError",
+                f"Thread {thread_id!r} already exists",
+            ),
+            "chatroom_get_thread": _thread_summary_ok(
+                project, thread_id, status="resolved", resolved_by_msg="msg-429"
             ),
         }
     )
-    result = await open_alert(mcp, project="spirrow-verimend")
-    assert result == OpenResult(thread_id="T-gate-bootstrap-spirrow-verimend", already_exists=True)
+    with pytest.raises(MagickitMcpError) as excinfo:
+        await open_alert(mcp, project=project)
+    # The raise must NAME the observed state so the operator can distinguish
+    # "target unreached" from "transport failure" from "unknown".
+    assert "state=resolved" in str(excinfo.value)
+    assert "msg-429" in str(excinfo.value)
+    # And the message must NAME the scope-boundaried defect so the next reader
+    # does not have to re-derive that the fixed thread_id blocks re-open.
+    assert "fixed thread_id" in str(excinfo.value)
+
+
+@pytest.mark.anyio
+async def test_open_alert_raises_when_readback_status_is_absent() -> None:
+    """N-6 (Bohr msg-2460 §5): open refusal + read-back showing the thread is
+    absent MUST raise.
+
+    An open refusal followed by an "absent" observation is contradictory
+    (we just tried to open — the target should exist if we succeeded, and if
+    the refusal was real, the thread must exist for our refusal to make sense).
+    The safe direction is raise (fail-closed).
+    """
+    project = "spirrow-verimend"
+    thread_id = "T-gate-bootstrap-spirrow-verimend"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_open_thread": _error_envelope(
+                "ChatroomIntegrityError",
+                f"Thread {thread_id!r} already exists",
+            ),
+            # Read-back itself refuses with not-found; ``_read_thread_reading_or_none``
+            # returns None on ANY read failure (never inspects the exception).
+            "chatroom_get_thread": _error_envelope(
+                "ChatroomNotFoundError",
+                f"Thread {thread_id!r} not found",
+            ),
+        }
+    )
+    with pytest.raises(MagickitMcpError) as excinfo:
+        await open_alert(mcp, project=project)
+    assert "state=unavailable" in str(excinfo.value)
 
 
 @pytest.mark.anyio
 async def test_open_alert_reraises_other_envelopes() -> None:
-    """Any envelope other than ``already exists`` re-raises unchanged.
+    """Any refusal whose read-back cannot confirm the target state re-raises.
 
-    Pins msg-1963 D-6 open-side fail-closed rule: swallow only the deliberate
-    collision. Everything else is a genuine failure the operator must see; the
-    next tick retries (idempotent).
+    Pins msg-1963 D-6 open-side fail-closed rule via S-4-prime: only the deliberate
+    collision (refusal + read-back showing target state reached) is swallowed;
+    everything else surfaces. The next tick retries (idempotent).
     """
     mcp = _FakeMcp(
         results={
             "chatroom_open_thread": _error_envelope(
                 "ChatroomAuthError", "not authorised to open thread"
             ),
+            # Read-back returns an unshaped payload — treated as OPEN with
+            # status=None, which is NOT in {active, awaiting_reply} → raise.
+            "chatroom_get_thread": {},
         }
     )
     with pytest.raises(MagickitMcpError, match="ChatroomAuthError"):
@@ -359,21 +477,63 @@ async def test_open_alert_reraises_other_envelopes() -> None:
 # --- close_alert ----------------------------------------------------------------------------------
 
 
-def _thread_summary_ok(project: str, thread_id: str) -> dict[str, Any]:
+def _thread_summary_ok(
+    project: str,
+    thread_id: str,
+    *,
+    status: str | None = None,
+    resolved_by_msg: str | None = None,
+) -> dict[str, Any]:
     """Minimal shape a ``chatroom_get_thread(mode='summary')`` OK returns.
 
     Verified against the live magickit schema in T-new-project-gate-bootstrap
     msg-2083 (Heisenberg S-1b probe): a summary hit returns a dict with keys
-    ``thread``, ``messages``, ``mode``, ``digest``. Only the fact that the
-    call succeeded matters to ``_alert_thread_exists`` — the payload content
-    is irrelevant to the precheck's boolean answer.
+    ``thread``, ``messages``, ``mode``, ``digest``.
+
+    ``status`` (T-gate-bootstrap-close-retried-on-resolved-thread S-3): the
+    ``thread.status`` field the precheck / read-back now reads. Kept optional
+    for backwards compatibility with tests that only care that the call
+    succeeded (those tests treat "no status" as OPEN with ``status=None``,
+    which is what the new ``_classify_reading`` produces — the safe direction:
+    a malformed payload is not silently classified as "resolved").
+
+    ``resolved_by_msg`` populates ``thread.resolved_by_msg`` — the field the
+    incident report (Bohr msg-2456 §2) named as the ground truth for
+    "who resolved the thread". Only populated when ``status='resolved'``.
     """
+    thread: dict[str, Any] = {"project": project, "thread_id": thread_id}
+    if status is not None:
+        thread["status"] = status
+    if resolved_by_msg is not None:
+        thread["resolved_by_msg"] = resolved_by_msg
     return {
-        "thread": {"project": project, "thread_id": thread_id},
+        "thread": thread,
         "messages": [],
         "mode": "summary",
         "digest": None,
     }
+
+
+class _SequencedResult:
+    """Return a different result each call to the same tool name.
+
+    Used to fake state that changes between the precheck (first
+    ``chatroom_get_thread``) and the post-refusal read-back (second
+    ``chatroom_get_thread``) — the race/TOCTOU scenarios.
+    """
+
+    def __init__(self, results: list[Any]) -> None:
+        self._results = list(results)
+        self._index = 0
+
+    def __call__(self, _arguments: dict[str, Any]) -> Any:
+        if self._index >= len(self._results):
+            raise AssertionError(
+                f"_SequencedResult exhausted: {len(self._results)} results scripted"
+            )
+        result = self._results[self._index]
+        self._index += 1
+        return result
 
 
 @pytest.mark.anyio
@@ -461,53 +621,167 @@ async def test_close_alert_precheck_not_found_makes_no_close_call() -> None:
 
 
 @pytest.mark.anyio
-async def test_close_alert_swallows_already_resolved_as_already_closed() -> None:
-    """A thread already closed between the precheck and the close call still
-    lands in the desired end-state.
+async def test_close_alert_precheck_resolved_skips_close_entirely() -> None:
+    """Bohr msg-2460 §6 item 1 (the direct fix for L-B in the incident report):
+    if the precheck sees the thread is ALREADY ``resolved``, close_alert
+    returns immediately WITHOUT issuing ``chatroom_close_thread``.
 
-    Race window is narrow but real: precheck says the thread exists, and by
-    the time close_thread issues, a human (or a parallel tick) has already
-    closed it. Same idempotent no-op contract as before, only now the
-    envelope arrives at the close boundary rather than at the (removed)
-    unconditional-close boundary.
+    Pins the 338/day close_refused traffic elimination the incident report
+    named (Bohr msg-2456 §1). Prior behaviour: the two-value precheck saw
+    "exists" and issued a doomed close on every tick. New behaviour: the
+    three-value precheck sees ``RESOLVED`` and skips.
+
+    Load-bearing assertion pair: NO write-shaped call AND the
+    ``resolved_by_msg`` observation surfaces on the ``CloseResult`` so the
+    tick's log line can carry it (msg-2456 §2 named ``msg-429`` as the
+    ground truth for the incident).
     """
-    project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    project = "spirrow-playproof"
+    thread_id = "T-gate-bootstrap-spirrow-playproof"
     mcp = _FakeMcp(
         results={
-            "chatroom_get_thread": _thread_summary_ok(project, thread_id),
-            "chatroom_close_thread": _error_envelope(
-                "ChatroomIntegrityError", "Thread already resolved"
+            "chatroom_get_thread": _thread_summary_ok(
+                project, thread_id, status="resolved", resolved_by_msg="msg-429"
             ),
         }
     )
     result = await close_alert(mcp, project=project)
-    assert result == CloseResult(thread_id=thread_id, was_open=False)
+    assert result == CloseResult(thread_id=thread_id, was_open=False, resolved_by_msg="msg-429")
+    # Load-bearing: NO write-shaped call was issued.
+    close_calls = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
+    assert close_calls == []
+    # Exactly one read (the precheck) — no second read either, because we
+    # returned before any refusal.
+    reads = [name for name, _ in mcp.calls if name == "chatroom_get_thread"]
+    assert reads == ["chatroom_get_thread"]
 
 
 @pytest.mark.anyio
-async def test_close_alert_swallows_race_not_found_at_close_boundary() -> None:
-    """If the thread disappears between the precheck and the close call
-    (race), the not-found envelope from close_thread is still swallowed.
+async def test_close_alert_precheck_resolved_without_resolved_by_msg_surfaces_none() -> None:
+    """A ``resolved`` thread without a ``resolved_by_msg`` field still swallows.
 
-    Kept as a distinct test from the precheck-not-found path because the
-    envelope arrives at a different call-site now — the current code has
-    two independent not-found swallows (one at the precheck, one at the
-    close boundary) and both need to hold for the idempotent contract to
-    survive concurrent operators.
+    ``resolved_by_msg`` is exposed for the log; its absence is diagnostic
+    information, not a failure. Pins the safe direction: the observed
+    ``status='resolved'`` alone determines the swallow.
     """
     project = "x"
     thread_id = "T-gate-bootstrap-x"
     mcp = _FakeMcp(
         results={
-            "chatroom_get_thread": _thread_summary_ok(project, thread_id),
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id, status="resolved"),
+        }
+    )
+    result = await close_alert(mcp, project=project)
+    assert result == CloseResult(thread_id=thread_id, was_open=False, resolved_by_msg=None)
+
+
+@pytest.mark.anyio
+async def test_close_alert_race_resolved_between_precheck_and_close_swallows() -> None:
+    """TOCTOU: precheck sees ``active``, close is refused, read-back sees
+    ``resolved`` → swallow (DoD #4).
+
+    Two ``chatroom_get_thread`` calls happen in this scenario, and each sees
+    a different state (``active`` first, ``resolved`` second — the parallel
+    operator resolved it in between). The refusal from ``close_thread`` is
+    NOT inspected; only the read-back's observation of ``status='resolved'``
+    decides the swallow. This is Bohr msg-2458 §2 as adopted after Einstein
+    msg-2457's invariant blocking.
+    """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _SequencedResult(
+                [
+                    _thread_summary_ok(project, thread_id, status="active"),
+                    _thread_summary_ok(
+                        project, thread_id, status="resolved", resolved_by_msg="msg-777"
+                    ),
+                ]
+            ),
+            # Note: the error_type here is intentionally NOT
+            # 'ChatroomStateError' — the design does not inspect it.
             "chatroom_close_thread": _error_envelope(
-                "ChatroomNotFoundError", "Thread 'T-gate-bootstrap-x' not found in project 'x'"
+                "SomeArbitraryClassifier",
+                "close refused because a human resolved it first",
             ),
         }
     )
     result = await close_alert(mcp, project=project)
-    assert result == CloseResult(thread_id=thread_id, was_open=False)
+    assert result == CloseResult(thread_id=thread_id, was_open=False, resolved_by_msg="msg-777")
+    # Load-bearing: two reads happened (precheck + recheck) and one close.
+    reads = [name for name, _ in mcp.calls if name == "chatroom_get_thread"]
+    assert reads == ["chatroom_get_thread", "chatroom_get_thread"]
+    closes = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
+    assert closes == ["chatroom_close_thread"]
+
+
+@pytest.mark.anyio
+async def test_close_alert_raises_when_recheck_sees_active_after_refusal() -> None:
+    """DoD #2 (widening-is-bounded): close refused + read-back sees a state that
+    is NOT ``resolved`` MUST raise. Proves the swallow does not degrade into
+    "swallow every close refusal that has a live thread on the other side".
+
+    A regression that mis-scoped the recheck predicate (e.g. "swallow if any
+    reading succeeds") would fail this test.
+    """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id, status="active"),
+            "chatroom_close_thread": _error_envelope(
+                "ChatroomPermissionError",
+                "closeable_roles check failed",
+            ),
+        }
+    )
+    with pytest.raises(GateBootstrapCloseError) as excinfo:
+        await close_alert(mcp, project=project)
+    # The raise must NAME the observed post-refusal state so the operator can
+    # distinguish "target unreached" (this test) from "target reached but
+    # refusal fired" (which is impossible — read-back returning 'resolved'
+    # swallows the refusal by contract).
+    assert "state=open" in str(excinfo.value)
+    assert "'active'" in str(excinfo.value)
+
+
+@pytest.mark.anyio
+async def test_close_alert_raises_when_recheck_cannot_confirm_state_after_refusal() -> None:
+    """Race variant: precheck sees ``active``, close is refused, read-back
+    itself refuses (any envelope) → raise.
+
+    This inverts the origin/main behaviour which swallowed a not-found
+    envelope at the close boundary. Under the new design (Bohr msg-2460 §3),
+    absence cannot be positively observed at the read-back — the only way to
+    observe it would be to re-introduce the exact ``error_type`` filter this
+    thread was opened to remove. The safe direction is raise; the next tick's
+    precheck re-classifies to ABSENT and the state self-heals in 1 loud line.
+    """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _SequencedResult(
+                [
+                    _thread_summary_ok(project, thread_id, status="active"),
+                    # Second read (the recheck) refuses with not-found. The
+                    # design does not swallow this — see docstring.
+                    _error_envelope(
+                        "ChatroomNotFoundError",
+                        f"Thread {thread_id!r} not found in project {project!r}",
+                    ),
+                ]
+            ),
+            "chatroom_close_thread": _error_envelope(
+                "SomeArbitraryClassifier",
+                "close refused because the thread disappeared under us",
+            ),
+        }
+    )
+    with pytest.raises(GateBootstrapCloseError) as excinfo:
+        await close_alert(mcp, project=project)
+    assert "state=unavailable" in str(excinfo.value)
 
 
 @pytest.mark.anyio
@@ -526,7 +800,7 @@ async def test_close_alert_raises_close_refused_on_precheck_permission_fault() -
     look identical in the operator log to a benign "no thread here" answer,
     so every alert would fail closed without ever reaching the msg-1968
     obligation's failure surface. Discriminated by the same "not found" check
-    that ``_alert_thread_exists`` already uses to swallow the benign case.
+    that ``_alert_thread_state`` uses to classify the benign ABSENT case.
     """
     project = "x"
     mcp = _FakeMcp(
@@ -761,25 +1035,40 @@ def test_discriminator_rejects_prose_matches_and_non_envelope_failures() -> None
 
 
 @pytest.mark.anyio
-async def test_close_alert_precheck_and_close_share_one_not_found_predicate() -> None:
-    """Both swallows are one predicate, not two (Bohr msg-2139 §5 併せて 1 点).
+async def test_close_alert_precheck_and_close_boundaries_both_surface_the_forgery() -> None:
+    """Both boundaries reject the forged permission envelope, though for
+    DIFFERENT structural reasons after S-2-prime.
 
-    Exercised end-to-end through :func:`close_alert` rather than by calling the
-    predicate twice: the same forged envelope is served at the read boundary in
-    one half and at the write boundary in the other, and both must surface as
-    :class:`GateBootstrapCloseError`. A future refactor that splits the two
-    swallows into two predicates and fixes only one fails here.
+    Under origin/main this was "one predicate, two swallows". Under the new
+    design (Bohr msg-2460 §6): the precheck STILL uses
+    :func:`_is_thread_not_found_envelope` (the ONE remaining envelope-name
+    classification site — see its docstring); the close boundary NO LONGER
+    uses it (post-refusal read-back replaces the swallow entirely). The test
+    survives the refactor because the *outcome* — GateBootstrapCloseError at
+    either boundary — is preserved, even as the mechanism at each has
+    diverged. That divergence is deliberate (msg-2460 §6 item 4: the two
+    swallows have different target-state predicates: RESOLVED vs OPEN read
+    payload).
     """
     forged = _error_envelope(
         "ChatroomPermissionError",
         "Project access denied: error_type='ChatroomNotFoundError'",
     )
 
+    # Precheck boundary: forged permission fault at the read → surfaces via
+    # ``_is_thread_not_found_envelope`` returning False → re-raise → wrap.
     at_precheck = _FakeMcp(results={"chatroom_get_thread": forged})
     with pytest.raises(GateBootstrapCloseError, match="precheck refused"):
         await close_alert(at_precheck, project="x")
     assert [name for name, _ in at_precheck.calls] == ["chatroom_get_thread"]
 
+    # Close boundary: precheck succeeds → close is issued → close fails →
+    # read-back runs (second chatroom_get_thread call) → observed status is
+    # None (no ``status`` field on ``_thread_summary_ok`` here) → NOT
+    # ``resolved`` → raise. Note we intentionally hit the same programmed
+    # ``chatroom_get_thread`` result for BOTH the precheck and the recheck;
+    # both see the same OPEN reading, which is what should happen under
+    # this fake.
     at_close = _FakeMcp(
         results={
             "chatroom_get_thread": _thread_summary_ok("x", "T-gate-bootstrap-x"),
@@ -788,6 +1077,159 @@ async def test_close_alert_precheck_and_close_share_one_not_found_predicate() ->
     )
     with pytest.raises(GateBootstrapCloseError, match="chatroom_close_thread refused"):
         await close_alert(at_close, project="x")
+
+
+# --- N-1..N-6 (S-2-prime / S-4-prime regression pins) -------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_close_alert_swallows_when_random_error_type_and_readback_sees_resolved() -> None:
+    """N-1 (the name-drift immunity test — the design's core invariant).
+
+    The whole point of S-2-prime (Bohr msg-2458 §2 as adopted after Einstein
+    msg-2457 invariant blocking) is that the close-refusal swallow does NOT
+    depend on the ``error_type`` string. This test proves it: the fake serves
+    a completely made-up ``error_type='ZZZUnknownFuture'`` at the close
+    refusal, but the read-back sees ``status='resolved'`` — the swallow MUST
+    still fire.
+
+    A regression that reintroduces a name-based filter at the entry of the
+    refusal branch (e.g. ``if exc.error_type == "ChatroomStateError": swallow``)
+    would fail this test. That is the failure Einstein msg-2457 named as
+    "設計原則を自ら破壊している".
+
+    Bohr msg-2460 §6 DoD N-1: "このテストが無いと、将来誰かが「安価な絞り
+    込み」を復活させても全テストが通ってしまう。本スレッドの争点そのもの
+    を固定する回帰テストなので、DoD の筆頭に置く。"
+    """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _SequencedResult(
+                [
+                    _thread_summary_ok(project, thread_id, status="active"),
+                    _thread_summary_ok(
+                        project, thread_id, status="resolved", resolved_by_msg="msg-99"
+                    ),
+                ]
+            ),
+            # Deliberately not a known error_type. The design must not depend
+            # on this string at all.
+            "chatroom_close_thread": _error_envelope(
+                "ZZZUnknownFuture",
+                "some far-future refusal reason nobody has measured",
+            ),
+        }
+    )
+    result = await close_alert(mcp, project=project)
+    assert result == CloseResult(thread_id=thread_id, was_open=False, resolved_by_msg="msg-99")
+
+
+@pytest.mark.anyio
+async def test_close_alert_readback_runs_regardless_of_error_type() -> None:
+    """N-2 (Bohr msg-2460 §6 DoD): the read-back must not be gated by any
+    error_type filter — every ``MagickitMcpError`` at the close boundary
+    triggers a read-back.
+
+    Complements N-1: N-1 proves the swallow FIRES on an unknown error_type
+    when the world reached the target state. N-2 proves the read-back is
+    UNCONDITIONALLY entered on any refusal — no shortcut path exists that
+    skips the recheck based on a name comparison.
+
+    Exercised by scripting three refusals with different error_types and
+    verifying that each drives the same number of read-back calls.
+    """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
+
+    async def _run_one(refusal_error_type: str) -> _FakeMcp:
+        mcp = _FakeMcp(
+            results={
+                "chatroom_get_thread": _SequencedResult(
+                    [
+                        _thread_summary_ok(project, thread_id, status="active"),
+                        _thread_summary_ok(
+                            project, thread_id, status="resolved", resolved_by_msg="msg-99"
+                        ),
+                    ]
+                ),
+                "chatroom_close_thread": _error_envelope(
+                    refusal_error_type, "arbitrary refusal reason"
+                ),
+            }
+        )
+        result = await close_alert(mcp, project=project)
+        assert result.was_open is False
+        return mcp
+
+    for error_type in ("ChatroomStateError", "ChatroomPermissionError", "TotallyMadeUp"):
+        mcp = await _run_one(error_type)
+        # Two reads: the precheck AND the post-refusal read-back. Load-bearing.
+        reads = [name for name, _ in mcp.calls if name == "chatroom_get_thread"]
+        assert reads == ["chatroom_get_thread", "chatroom_get_thread"], (
+            f"error_type={error_type!r} skipped the read-back — a hidden name-filter has reappeared"
+        )
+
+
+@pytest.mark.anyio
+async def test_close_alert_readback_failure_at_recheck_boundary_raises() -> None:
+    """N-3 (Bohr msg-2460 §6 DoD): if the post-refusal read-back itself fails
+    (any envelope, transport, malformed) the caller RAISES — fail-closed.
+
+    ``_read_thread_reading_or_none`` returns ``None`` on any read failure by
+    design; the caller must interpret ``None`` as "state cannot be confirmed"
+    and raise. Silent swallowing would re-introduce the "wrote a swallow
+    against something we cannot see" bug family.
+    """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _SequencedResult(
+                [
+                    _thread_summary_ok(project, thread_id, status="active"),
+                    # Recheck refuses with a permission fault (any envelope
+                    # would do — the design does not distinguish).
+                    _error_envelope(
+                        "ChatroomPermissionError",
+                        "readback denied",
+                    ),
+                ]
+            ),
+            "chatroom_close_thread": _error_envelope(
+                "ChatroomStateError",
+                "Cannot close thread 'T-gate-bootstrap-x' in status='resolved'",
+            ),
+        }
+    )
+    with pytest.raises(GateBootstrapCloseError) as excinfo:
+        await close_alert(mcp, project=project)
+    assert "state=unavailable" in str(excinfo.value)
+
+
+@pytest.mark.anyio
+async def test_close_alert_precheck_open_status_active_proceeds_to_close() -> None:
+    """N-5 companion (positive control): if the precheck sees a live thread
+    that is NOT ``resolved``, the close IS issued.
+
+    Not a bug-pin per se — this is the ordinary path — but it is load-bearing
+    that the tri-state precheck did not accidentally collapse "OPEN" into
+    "skip" as well. Without this control, N-3 could pass on a broken
+    implementation that never issues the close.
+    """
+    project = "x"
+    thread_id = "T-gate-bootstrap-x"
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _thread_summary_ok(project, thread_id, status="active"),
+            "chatroom_close_thread": {"ok": True},
+        }
+    )
+    result = await close_alert(mcp, project=project)
+    assert result == CloseResult(thread_id=thread_id, was_open=True, resolved_by_msg=None)
+    closes = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
+    assert closes == ["chatroom_close_thread"]
 
 
 # --- CLI wrapper (scripts/gate_bootstrap_tick.py) -----------------------------------------------
@@ -856,6 +1298,54 @@ async def test_cli_run_tick_declared_calls_close_only(tmp_path: Path) -> None:
     assert "owner" not in args
     assert "decide_content" not in args
     assert "role" not in args
+
+
+@pytest.mark.anyio
+async def test_cli_run_tick_declared_skips_close_when_precheck_sees_resolved(
+    tmp_path: Path,
+) -> None:
+    """DECLARED but the alert thread is ALREADY resolved → tick issues NO write
+    AND surfaces ``resolved_by_msg`` in the JSON output.
+
+    This is the direct external-facing end of the incident report (Bohr
+    msg-2456 §1): the 338/day close_refused traffic on playproof / lexora
+    stops here. Under origin/main, the two-value precheck saw "exists" and
+    issued a doomed close on every tick; under S-3, the three-value precheck
+    sees ``RESOLVED`` and skips.
+
+    The ``resolved_by_msg`` surfacing is what turns the log line from opaque
+    ("we closed it — or thought we did") into self-explaining ("thread was
+    already resolved by ``msg-429``" — the exact form the incident report
+    §2 named as the ground truth).
+    """
+    project = "spirrow-playproof"
+    thread_id = "T-gate-bootstrap-spirrow-playproof"
+    (tmp_path / ".mindwire-gate").write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake = _FakeMcp(
+        results={
+            "chatroom_get_thread": _thread_summary_ok(
+                project, thread_id, status="resolved", resolved_by_msg="msg-429"
+            ),
+        }
+    )
+    exit_code, out = await _CLI._run_tick(
+        project,
+        tmp_path,
+        owner=DEFAULT_SWEEPER_OWNER,
+        mcp_url=None,
+        merge_commit_sha=None,
+        mcp_factory=lambda _url: fake,
+    )
+    assert exit_code == 0
+    assert out["status"] == GateStatus.DECLARED.value
+    assert out["action"] == "already_closed"
+    assert out["thread_id"] == thread_id
+    # Load-bearing: NO write-shaped call was issued (the L-B fix).
+    close_calls = [name for name, _ in fake.calls if name == "chatroom_close_thread"]
+    assert close_calls == []
+    # And the observed ``resolved_by_msg`` surfaces on the tick's JSON output
+    # so the operator sees WHO resolved the thread (msg-2456 §2 ground truth).
+    assert out["resolved_by_msg"] == "msg-429"
 
 
 @pytest.mark.anyio
