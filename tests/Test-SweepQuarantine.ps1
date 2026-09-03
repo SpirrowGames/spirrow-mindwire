@@ -41,7 +41,8 @@ if (-not (Test-Path -LiteralPath $leaseLib)) { throw "Lease lib not found: $leas
 
 $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
-foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
+foreach ($name in 'New-QuarantineRecord', 'Get-FailureClass',
+                  'Get-DerivedQuarantineState', 'Get-FingerprintHint',
                   'Get-QuarantineReproHint',
                   'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
                   'Get-SystemicAlertSignature', 'Merge-StateForWrite',
@@ -587,6 +588,35 @@ try {
 finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
 
 Write-Host ""
+# T-stalled-pr-has-no-detector Deliverable 6 — the failure_class field must survive
+# round trips and default to 'unknown' when not supplied. Both branches matter:
+#   * default: existing callers (nothing named the parameter) still write the field
+#     so downstream group-by never sees a missing key.
+#   * populated: a caller that classified the tail can pass the resolved label and
+#     it lands on the record unchanged (byte-for-byte, no PSCustomObject rewrite).
+Write-Host "New-QuarantineRecord — failure_class field (T-stalled-pr-has-no-detector D-6)"
+$rec1 = New-QuarantineRecord -FirstFailureAt '2026-09-03T10:00:00Z' -ExitCode 1 `
+    -StopReason 'reason=eod' -FailureHead 'msg-1' -FailureControl 'run' `
+    -SessionLogPath 'C:\logs\a.log' -SessionLogTail @('one','two')
+Check "default failure_class is 'unknown'" 'unknown' $rec1['failure_class']
+
+$rec2 = New-QuarantineRecord -FirstFailureAt '2026-09-03T10:00:00Z' -ExitCode 1 `
+    -StopReason 'reason=eod' -FailureHead 'msg-1' -FailureControl 'run' `
+    -SessionLogPath 'C:\logs\a.log' -SessionLogTail @('one','two') `
+    -FailureClass 'sdk-error-during-execution'
+Check "explicit failure_class is preserved" 'sdk-error-during-execution' $rec2['failure_class']
+
+# Round-trip test — the field must survive the same JSON path failure_fingerprint does.
+$rt = ($rec2 | ConvertTo-Json -Depth 5) | ConvertFrom-Json
+Check "failure_class survives JSON round-trip" 'sdk-error-during-execution' $rt.failure_class
+
+# Get-FailureClass — no tail means unknown, no subprocess spawned. This is the branch
+# the sweep hits when the failure produced no captured output (msg-2354 §1 M-2's
+# "last_msg 空" case), so it MUST return quickly and MUST NOT surface an exception.
+Write-Host "Get-FailureClass — empty tail returns 'unknown' without spawning python"
+Check "empty tail -> unknown" 'unknown' (Get-FailureClass -SessionLogTail @())
+Check "null tail -> unknown" 'unknown' (Get-FailureClass -SessionLogTail $null)
+
 if ($script:failures -gt 0) {
     Write-Host "sweep quarantine: $($script:failures) check(s) FAILED"
     exit 1

@@ -573,7 +573,20 @@ function New-QuarantineRecord {
         [string]$FailureHead,
         [string]$FailureControl,
         [string]$SessionLogPath,
-        [string[]]$SessionLogTail
+        [string[]]$SessionLogTail,
+        # T-stalled-pr-has-no-detector Deliverable 6 (msg-2470 §4 / msg-2354 §1 M-2):
+        # ``failure_fingerprint`` is ``{head, control}`` and every entry is unique per
+        # occurrence, so a digest group-by on it produces "every entry in its own bin"
+        # (Einstein E-6, and Bohr confirms in msg-2470 §4). The error class buried in
+        # ``session_log_tail`` is the field the operator actually needs to group on,
+        # so we extract it at quarantine time and persist it as a first-class field.
+        #
+        # The classifier's SOT is ``src/spirrow_mindwire/stall_ledger/failure_class.py``
+        # (single place to add a new signature). ``Get-FailureClass`` below invokes it.
+        # Optional so all existing callers (the tests lift this function's AST directly
+        # and call it with the old signature) keep working with an ``unknown`` default;
+        # the sweep passes the resolved value explicitly.
+        [string]$FailureClass = 'unknown'
     )
 
     return @{
@@ -584,8 +597,49 @@ function New-QuarantineRecord {
         exit_code            = $ExitCode
         stop_reason          = $StopReason
         failure_fingerprint  = @{ head = $FailureHead; control = $FailureControl }
+        failure_class        = $FailureClass
         session_log_path     = $SessionLogPath
         session_log_tail     = $SessionLogTail
+    }
+}
+
+# T-stalled-pr-has-no-detector Deliverable 6 wire-up. Extracts the failure class from
+# the session log tail by invoking the Python classifier over stdin. The classifier's
+# rules (which regex catches which error label) are the single SOT so a new signature
+# added there flows to both the persisted field and any digest side that groups on it.
+#
+# Failure-mode contract: this wrapper NEVER breaks the sweep. If ``uv``/``python`` is
+# missing, the classifier crashes, or the child returns a nonzero exit, we return
+# ``unknown`` — same value the ``New-QuarantineRecord`` default uses. The quarantine
+# record is far too important to withhold because a subprocess broke; the ledger's
+# noisiness invariant covers the ``unknown`` case with a distinct group in the digest.
+function Get-FailureClass {
+    param(
+        [string[]]$SessionLogTail,
+        [string]$RepoRoot = $PSScriptRoot
+    )
+
+    if (-not $SessionLogTail -or $SessionLogTail.Count -eq 0) { return 'unknown' }
+
+    $blob = ($SessionLogTail -join "`n")
+
+    try {
+        # ``uv run`` is the repo's convention for invoking a package in the managed venv;
+        # `.mindwire-gate` uses the same. Passing the tail via stdin (not argv) keeps the
+        # command line short and avoids any escaping surprise with quotes / backticks.
+        $output = $blob | uv run --quiet python -m spirrow_mindwire.stall_ledger 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $output) { return 'unknown' }
+        # The CLI prints ONE line — the label. Any surplus (stderr already suppressed
+        # above) is ignored; taking `[0]` guards against a stray blank line.
+        $label = if ($output -is [array]) { $output[0] } else { $output }
+        $label = "$label".Trim()
+        if (-not $label) { return 'unknown' }
+        return $label
+    } catch {
+        # Absolutely fatal failures (uv missing, venv broken, python crash) still fall
+        # through to the ledger-preserving ``unknown`` — this function is on the hot
+        # path of the sweep's failure branch and must never itself become a new failure.
+        return 'unknown'
     }
 }
 
@@ -3072,10 +3126,16 @@ try {
                 $tail = $output[($output.Count - $take)..($output.Count - 1)]
             }
             $nowIso = $nowUtc.ToString("o")
+            # T-stalled-pr-has-no-detector Deliverable 6: extract failure_class from the
+            # tail BEFORE constructing the record so it lands as a first-class field.
+            # Get-FailureClass never raises — a broken subprocess still yields 'unknown'
+            # — so this call cannot be the reason a quarantine is silently skipped.
+            $failureClass = Get-FailureClass -SessionLogTail $tail
             $rec = New-QuarantineRecord `
                 -FirstFailureAt $nowIso -ExitCode $code -StopReason $verdict.reason `
                 -FailureHead $probeHead -FailureControl $currentControl `
-                -SessionLogPath $logPath -SessionLogTail $tail
+                -SessionLogPath $logPath -SessionLogTail $tail `
+                -FailureClass $failureClass
             $quarantineState[$cand.key] = $rec
             $newlyQuarantined++
             Write-Log "quarantined $($cand.key): exit=$code reason=$($verdict.reason) — sweep CONTINUES (signal is the notification, not the stop)"
