@@ -1080,43 +1080,203 @@ function New-DailyDigest {
     # each section is truncated so the ENTIRE output stays ≤ budget; the count in the header stays
     # correct because it is computed from the full list before truncation.
     #
-    # Budget accounting has TWO reserves so nothing after a truncation can push the total over:
-    #   * $overflowMarker = the "+N 件（省略）" line that MAY follow a truncated section.
-    #   * $trailingReserve = every line the renderer WILL emit after any given section — headers of
-    #     the sections that come later, and the invariant footer at the bottom. Without this the
-    #     first section could consume everything and later sections would push the total over.
-    # The trailing content is emitted verbatim in the block below, so its size is exactly counted;
-    # a future edit that adds/removes content there must also update these constants. Guarded by
-    # tests/Test-SweepDigest.ps1 (the 200-entry check will fail loudly if the actual total exceeds
-    # budget for any reason).
-    $overflowMarker = 60
-    # Trailing content estimate (in characters, generous):
-    #   - 判断待ち header + fetch-error rows       : ~ 80
-    #   - 飢餓 header + entries (bounded by _AddSectionEntries call)
-    #   - blank line + 3-line footer               : ~200
-    # Sum ~= 280; use 400 for safety margin. If the bounded renderer's total ever creeps over
-    # $Budget, tighten this by measuring the actual emitted trailing content and subtracting.
-    $trailingReserve = 400
-    $currentLen = ($lines -join "`n").Length
+    # F-1 (msg-2418 §4-4 / msg-2436 §4) — PER-SECTION ROW FLOOR. What the earlier accounting got
+    # wrong, and why the fix is a computation rather than a bigger constant:
+    #
+    #   The former reserve was two constants — $overflowMarker = 60 and $trailingReserve = 400,
+    #   the latter documented as "判断待ち header + fetch-error rows : ~80". It reserved the
+    #   HEADERS of the later sections and none of their ROWS. So the first row-emitting section
+    #   was allowed to eat the budget down to (Budget - 460) and every later section then found
+    #   ~0 characters left. Every later section still printed its header and its true count, then
+    #   a bare "+N 件（省略）" — a correct-looking section with nothing in it.
+    #
+    #   Measured on production, not derived: the digest delivered 2026-09-03 10:50 (payload 1735
+    #   chars, the first full delivery since 08-30) rendered 4 of 21 判断待ち rows and 1 of 3 飢餓
+    #   rows. On 09-02, with 12 quarantine entries instead of 3, the same renderer rendered 0 of
+    #   21 判断待ち rows. The visible row count of a section is therefore a DECREASING FUNCTION OF
+    #   THE PRECEDING SECTIONS' LOAD, not a constant — which also means an unrelated edit to an
+    #   earlier section's line length silently changes how much of the human's decision queue is
+    #   visible. That is not a property to manage by tuning; it is the defect.
+    #
+    #   The fix: every row-emitting section declares a FLOOR of one row that no earlier section
+    #   may consume. An earlier section's reserve is therefore not an estimate but the exact
+    #   character cost of "every later section reduced to its floor" — headers, one row each,
+    #   their overflow markers, and the footer — computed HERE, at render time, from the real
+    #   lists. Both constants are retired rather than retuned: a constant cannot know that a
+    #   later section is empty (it over-reserves) nor that its first row is 170 characters wide
+    #   (it under-reserves, which is what starved 判断待ち). Keeping either one alongside the
+    #   computation would be the same double-bookkeeping this thread already closed once in E-2,
+    #   where the test harness kept its own copy of $DigestBudget.
+    #
+    #   The upper bound is unchanged and still absolute: $digest.Length ≤ $Budget. The floor is
+    #   satisfiable for every input where one row per non-empty section fits at all; when even
+    #   that does not fit, the renderer says so in the section instead of quietly printing none
+    #   (msg-2436 §4 item 4).
+
+    function _EntryLine {
+        param($Entry)
+        if ($Entry -is [PSCustomObject] -and $Entry.PSObject.Properties.Name -contains 'Line') { return $Entry.Line }
+        return [string]$Entry
+    }
+    # The "+N 件（省略）" line has exactly one home so the budget arithmetic below measures the
+    # same string the renderer emits. $FloorUnmet is the msg-2436 §4 item-4 case: the section had
+    # rows and not one of them fit, which must be visible rather than silent.
+    function _SectionOverflowLine {
+        param([string]$Indent, [int]$Count, [bool]$FloorUnmet = $false)
+        if ($FloorUnmet) { return "$Indent+$Count 件（省略 — 予算不足で 0 行）" }
+        return "$Indent+$Count 件（省略）"
+    }
+    function _LinesCost {
+        param([array]$Lines)
+        $n = 0
+        foreach ($l in $Lines) { $n += 1 + ([string]$l).Length }
+        return $n
+    }
+    # The floor cost of a row-emitting section: its first row (entries are already ordered so that
+    # index 0 is the one that matters most) plus the widest line the section can append after it.
+    # Summed, not maxed, because that is exactly the test _AddSectionEntries applies at index 0 —
+    # the two have to agree or the floor is only reserved on paper.
+    function _SectionFloorCost {
+        param([array]$Entries, [string]$Indent)
+        if ($Entries.Count -eq 0) { return 0 }
+        $row = 1 + (_EntryLine $Entries[0]).Length
+        $marker = 1 + (_SectionOverflowLine -Indent $Indent -Count $Entries.Count -FloorUnmet $true).Length
+        return $row + $marker
+    }
     function _AddSectionEntries {
-        param([array]$Entries, [int]$MaxLen, [int]$Reserve, [ref]$RunningLen)
-        # Returns @(linesToEmit, droppedCount). Adds newline+entry pairs from $Entries in order,
-        # stopping when adding the NEXT line would push (RunningLen + line + Reserve) past MaxLen.
+        param([array]$Entries, [int]$MaxLen, [int]$Reserve, [ref]$RunningLen, [string]$Indent = '  ')
+        # Returns @{ Emitted; Dropped; FloorUnmet }. Adds newline+entry pairs from $Entries in
+        # order, stopping when the NEXT line plus the line this section would itself append plus
+        # $Reserve (the floor-inclusive cost of everything still to come) would pass $MaxLen.
         $out = @()
         $dropped = 0
+        # Width of each line this section can append after its rows. Measured from the same
+        # formatter the renderer emits, so the reserve equals the emission exactly — the old flat
+        # 60 was a bound, and a bound leaves slack that is indistinguishable from starvation.
+        $plainWidth = 1 + (_SectionOverflowLine -Indent $Indent -Count $Entries.Count -FloorUnmet $false).Length
+        $unmetWidth = 1 + (_SectionOverflowLine -Indent $Indent -Count $Entries.Count -FloorUnmet $true).Length
         for ($i = 0; $i -lt $Entries.Count; $i++) {
-            $entry = $Entries[$i]
-            $line = if ($entry -is [PSCustomObject] -and $entry.PSObject.Properties.Name -contains 'Line') { $entry.Line } else { [string]$entry }
+            $line = _EntryLine $Entries[$i]
             # +1 for the newline that will join this line to whatever came before.
             $cost = 1 + $line.Length
-            if ($MaxLen -gt 0 -and ($RunningLen.Value + $cost + $Reserve) -gt $MaxLen) {
+            # What this section can still append, by position: at index 0 the alternative branch is
+            # the floor-unmet line (the widest); after that only the plain marker is reachable; and
+            # emitting the LAST entry appends nothing at all.
+            $append = if ($i -eq 0) { $unmetWidth } elseif ($i -lt $Entries.Count - 1) { $plainWidth } else { 0 }
+            if ($MaxLen -gt 0 -and ($RunningLen.Value + $cost + $append + $Reserve) -gt $MaxLen) {
                 $dropped = $Entries.Count - $i
                 break
             }
             $out += $line
             $RunningLen.Value += $cost
         }
-        return @{ Emitted = $out; Dropped = $dropped }
+        return @{ Emitted = $out; Dropped = $dropped; FloorUnmet = ($Entries.Count -gt 0 -and $out.Count -eq 0) }
+    }
+    # One call site for "emit the rows, then whatever line the truncation needs", so no section can
+    # drift into reporting its overflow differently from the others.
+    function _SectionOverflowLines {
+        param($Result, [string]$Indent)
+        if ($Result.Dropped -le 0) { return @() }
+        return @(_SectionOverflowLine -Indent $Indent -Count $Result.Dropped -FloorUnmet ([bool]$Result.FloorUnmet))
+    }
+
+    # ---- every row list is built BEFORE anything is emitted -------------------------------------
+    # The reserve ladder below has to know the width of the FIRST row of every later section, so
+    # the rows cannot be built lazily inside their own emit blocks any more. Building them here
+    # changes no row content; it only moves construction ahead of the first budget decision.
+
+    # 判断待ち rows — T-decision-request-composer S4 (msg-1370 §0 defect 2 / §4 / A-4; D-32 for the
+    # grammar-ownership rule). Row order is preserved (msg-1370's caller-owned order — this
+    # renderer does not resort human-parked; only quarantine sections are sorted oldest-first).
+    # The count and the row order come from $HumanParked, which is itself the output of
+    # scripts/parked_humans.py — so this section restores fully from a wiped pending-decisions.json
+    # (A-14); the cache only enriches the row with the composer's question.
+    $parkedEntries = @()
+    foreach ($p in $HumanParked) {
+        $key = $p.key
+        $head = $p.head_msg_id
+        # Look up the composer question by (key, signature = "human:<head>"). Any other
+        # signature shape came from a different reason and does not match this row — the
+        # cache row is intentionally strict on signature equality (S2 A-3).
+        $sig = "human:$head"
+        $questionSnippet = $null
+        if ($PendingDecisionsState.ContainsKey($key)) {
+            $row = $PendingDecisionsState[$key]
+            if ($row -is [hashtable]) { $rowSig = $row['signature']; $env = $row['envelope'] }
+            else { $rowSig = $row.signature; $env = $row.envelope }
+            if ($rowSig -eq $sig -and $env) {
+                $status = if ($env.PSObject.Properties.Name -contains 'composer_status') { $env.composer_status } else { $null }
+                $output = if ($env.PSObject.Properties.Name -contains 'output') { $env.output } else { $null }
+                if ($status -eq 'ok' -and $output) {
+                    $q = if ($output.PSObject.Properties.Name -contains 'question') { $output.question } else { $null }
+                    if ($q) {
+                        # One-line-per-row readability: cap at 80 chars, flatten any
+                        # embedded newlines, so a multi-line composed question cannot wrap
+                        # the digest layout.
+                        $flat = ($q -replace "`r?`n", ' ').Trim()
+                        if ($flat.Length -gt 80) { $flat = $flat.Substring(0, 79) + '…' }
+                        $questionSnippet = $flat
+                    }
+                }
+            }
+        }
+        $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
+        $parkedEntries += [PSCustomObject]@{ Line = "  $key   [$head]$suffix"; AgeSeconds = 0 }
+    }
+
+    # 取得失敗 rows (I-2 "黙って劣化しない").
+    $errorEntries = @()
+    foreach ($e in $ParkedPollErrors) {
+        $tid = if ($e.PSObject.Properties.Name -contains 'thread_id') { $e.thread_id } else { $e['thread_id'] }
+        $reason = if ($e.PSObject.Properties.Name -contains 'reason') { $e.reason } else { $e['reason'] }
+        $errorEntries += [PSCustomObject]@{ Line = "    $tid — $reason"; AgeSeconds = 0 }
+    }
+
+    # ---- the fixed text of every later section, named once and emitted from the same variable ---
+    # These are the lines the renderer WILL emit whatever the budget does, so their cost is known
+    # exactly. Emitting them from the same variables the ladder measures is what makes the reserve
+    # a measurement instead of the former "~80 / ~200, call it 400" estimate.
+    $staleHeadLine = "  [stale] — 直すか、スレッドを畳むか決めよ"
+    $escHeadLine   = "  [escalated] — 24h 以上経過"
+    $quarHeadLine  = "  [quarantined]"
+
+    $parkedHeadLines = @("", "判断待ち: $($HumanParked.Count) 件")
+    if ($HumanParked.Count -eq 0) { $parkedHeadLines += "  (該当なし)" }
+
+    # The count-line stays unconditional (PR-gate review round 2, 2026-08-30): the operator needs
+    # to see "取得失敗: N" even when the individual rows had to be dropped for budget.
+    $fetchErrHeadLines = @()
+    if ($ParkedPollErrors.Count -gt 0) {
+        $fetchErrHeadLines = @("  取得失敗: $($ParkedPollErrors.Count) 件（判断待ちに含まれていない可能性あり）")
+    }
+
+    $starvedHeadLines = @("", "飢餓 (24h 以上評価されていない): $($starvedList.Count) 件")
+    if ($starvedList.Count -eq 0) { $starvedHeadLines += "  (該当なし)" }
+
+    $footerLines = @(
+        ""
+        "(0 件でも送信しています — 通知チャネル自体の生存確認を兼ねます。"
+        " 人間がこのダイジェストを読まない状態はチャネル故障ではなく運用の放棄であり、機械では検知できません。)"
+    )
+
+    # ---- the reserve ladder ----------------------------------------------------------------------
+    # Read bottom-up. Each value is the exact number of characters the renderer will still emit
+    # after the named section, with every later row-emitting section reduced to its floor. Passed
+    # as -Reserve so a section physically cannot consume a later section's floor.
+    $reserveAfterStarved  = _LinesCost $footerLines
+    $reserveAfterFetchErr = (_LinesCost $starvedHeadLines) +
+                            (_SectionFloorCost -Entries $starvedList -Indent '  ') + $reserveAfterStarved
+    $reserveAfterParked   = (_LinesCost $fetchErrHeadLines) +
+                            (_SectionFloorCost -Entries $errorEntries -Indent '    ') + $reserveAfterFetchErr
+    $reserveAfterQuar     = (_LinesCost $parkedHeadLines) +
+                            (_SectionFloorCost -Entries $parkedEntries -Indent '  ') + $reserveAfterParked
+    $reserveAfterEsc      = $reserveAfterQuar
+    if ($quarantinedList.Count -gt 0) {
+        $reserveAfterEsc += (_LinesCost @($quarHeadLine)) + (_SectionFloorCost -Entries $quarantinedList -Indent '  ')
+    }
+    $reserveAfterStale    = $reserveAfterEsc
+    if ($escalatedList.Count -gt 0) {
+        $reserveAfterStale += (_LinesCost @($escHeadLine)) + (_SectionFloorCost -Entries $escalatedList -Indent '  ')
     }
 
     $lines += "隔離中: $totalQ 件"
@@ -1126,127 +1286,68 @@ function New-DailyDigest {
     else {
         # Sections in order of urgency: stale (7d+) → escalated (24h+) → quarantined (fresh). The
         # order was already this in the legacy renderer; the change is only that within each
-        # section, entries are oldest-first (see the sort step above).
-        # $totalReserve = overflow marker + everything the renderer WILL still emit after this
-        # section (see the block comment above for the count). Passed to every section emitter so
-        # a later section is never starved by an earlier one that consumed the entire budget.
-        $totalReserve = $overflowMarker + $trailingReserve
+        # section, entries are oldest-first (see the sort step above). msg-2436 §4 item 3: the
+        # floor changes who is guaranteed a row, NOT who gets the surplus — the surplus is still
+        # handed out greedily in this same urgency order.
         if ($staleList.Count -gt 0) {
-            $lines += "  [stale] — 直すか、スレッドを畳むか決めよ"
+            $lines += $staleHeadLine
             $runLen = [ref]($lines -join "`n").Length
-            $result = _AddSectionEntries -Entries $staleList -MaxLen $Budget -Reserve $totalReserve -RunningLen $runLen
+            $result = _AddSectionEntries -Entries $staleList -MaxLen $Budget -Reserve $reserveAfterStale -RunningLen $runLen
             $lines += $result.Emitted
-            if ($result.Dropped -gt 0) { $lines += "  +$($result.Dropped) 件（省略）" }
+            $lines += _SectionOverflowLines -Result $result -Indent '  '
         }
         if ($escalatedList.Count -gt 0) {
-            $lines += "  [escalated] — 24h 以上経過"
+            $lines += $escHeadLine
             $runLen = [ref]($lines -join "`n").Length
-            $result = _AddSectionEntries -Entries $escalatedList -MaxLen $Budget -Reserve $totalReserve -RunningLen $runLen
+            $result = _AddSectionEntries -Entries $escalatedList -MaxLen $Budget -Reserve $reserveAfterEsc -RunningLen $runLen
             $lines += $result.Emitted
-            if ($result.Dropped -gt 0) { $lines += "  +$($result.Dropped) 件（省略）" }
+            $lines += _SectionOverflowLines -Result $result -Indent '  '
         }
         if ($quarantinedList.Count -gt 0) {
-            $lines += "  [quarantined]"
+            $lines += $quarHeadLine
             $runLen = [ref]($lines -join "`n").Length
-            $result = _AddSectionEntries -Entries $quarantinedList -MaxLen $Budget -Reserve $totalReserve -RunningLen $runLen
+            $result = _AddSectionEntries -Entries $quarantinedList -MaxLen $Budget -Reserve $reserveAfterQuar -RunningLen $runLen
             $lines += $result.Emitted
-            if ($result.Dropped -gt 0) { $lines += "  +$($result.Dropped) 件（省略）" }
+            $lines += _SectionOverflowLines -Result $result -Indent '  '
         }
     }
 
-    # 判断待ち — T-decision-request-composer S4 (msg-1370 §0 defect 2 / §4 / A-4; D-32 for the
-    # grammar-ownership rule). Emitted even at 0 件, mirroring the "silent day is the point"
-    # contract of 飢餓 (msg-814 §5). The count and the row order come from $HumanParked, which is
-    # itself the output of scripts/parked_humans.py — so this section restores fully from a wiped
-    # pending-decisions.json (A-14); the cache only enriches the row with the composer's question.
-    $lines += ""
-    $lines += "判断待ち: $($HumanParked.Count) 件"
-    if ($HumanParked.Count -eq 0) {
-        $lines += "  (該当なし)"
-    }
-    else {
-        # Pre-build all rows into an entry list so the budget helper can operate uniformly. Row
-        # order is preserved (msg-1370's caller-owned order — this renderer does not resort
-        # human-parked; only quarantine sections are sorted oldest-first here).
-        $parkedEntries = @()
-        foreach ($p in $HumanParked) {
-            $key = $p.key
-            $head = $p.head_msg_id
-            # Look up the composer question by (key, signature = "human:<head>"). Any other
-            # signature shape came from a different reason and does not match this row — the
-            # cache row is intentionally strict on signature equality (S2 A-3).
-            $sig = "human:$head"
-            $questionSnippet = $null
-            if ($PendingDecisionsState.ContainsKey($key)) {
-                $row = $PendingDecisionsState[$key]
-                if ($row -is [hashtable]) { $rowSig = $row['signature']; $env = $row['envelope'] }
-                else { $rowSig = $row.signature; $env = $row.envelope }
-                if ($rowSig -eq $sig -and $env) {
-                    $status = if ($env.PSObject.Properties.Name -contains 'composer_status') { $env.composer_status } else { $null }
-                    $output = if ($env.PSObject.Properties.Name -contains 'output') { $env.output } else { $null }
-                    if ($status -eq 'ok' -and $output) {
-                        $q = if ($output.PSObject.Properties.Name -contains 'question') { $output.question } else { $null }
-                        if ($q) {
-                            # One-line-per-row readability: cap at 80 chars, flatten any
-                            # embedded newlines, so a multi-line composed question cannot wrap
-                            # the digest layout.
-                            $flat = ($q -replace "`r?`n", ' ').Trim()
-                            if ($flat.Length -gt 80) { $flat = $flat.Substring(0, 79) + '…' }
-                            $questionSnippet = $flat
-                        }
-                    }
-                }
-            }
-            $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
-            $parkedEntries += [PSCustomObject]@{ Line = "  $key   [$head]$suffix"; AgeSeconds = 0 }
-        }
-        # 判断待ち section: 飢餓 + footer remain after this. Reserve marker + trailing.
+    # 判断待ち — emitted even at 0 件, mirroring the "silent day is the point" contract of 飢餓
+    # (msg-814 §5). Rows were built above; only the emission happens here.
+    $lines += $parkedHeadLines
+    if ($HumanParked.Count -gt 0) {
         $runLen = [ref]($lines -join "`n").Length
-        $result = _AddSectionEntries -Entries $parkedEntries -MaxLen $Budget -Reserve ($overflowMarker + $trailingReserve) -RunningLen $runLen
+        $result = _AddSectionEntries -Entries $parkedEntries -MaxLen $Budget -Reserve $reserveAfterParked -RunningLen $runLen
         $lines += $result.Emitted
-        if ($result.Dropped -gt 0) { $lines += "  +$($result.Dropped) 件（省略）" }
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
     # Fetch-error surface (I-2 "黙って劣化しない"). When scripts/parked_humans.py could not read
     # some threads' bodies, the section stays but the count above under-reports. Say so out loud.
     #
     # PR-gate review round 2 (2026-08-30): the per-row loop was unconditional, so a spike of ~20+
-    # fetch errors could push the total past $Budget and trigger the exact Discord 400 this PR
-    # exists to prevent. Route the row list through _AddSectionEntries so the same budget
-    # discipline that governs every other row-emitting section governs this one too. The count-line
-    # (single, small, informational) stays unconditional — the operator needs to see "取得失敗: N"
-    # even if the individual rows had to be dropped for budget.
+    # fetch errors could push the total past $Budget and trigger the exact Discord 400 the D-1
+    # work exists to prevent. Route the row list through _AddSectionEntries so the same budget
+    # discipline that governs every other row-emitting section governs this one too.
     if ($ParkedPollErrors.Count -gt 0) {
-        $lines += "  取得失敗: $($ParkedPollErrors.Count) 件（判断待ちに含まれていない可能性あり）"
-        $errorEntries = @()
-        foreach ($e in $ParkedPollErrors) {
-            $tid = if ($e.PSObject.Properties.Name -contains 'thread_id') { $e.thread_id } else { $e['thread_id'] }
-            $reason = if ($e.PSObject.Properties.Name -contains 'reason') { $e.reason } else { $e['reason'] }
-            $errorEntries += [PSCustomObject]@{ Line = "    $tid — $reason"; AgeSeconds = 0 }
-        }
-        # 飢餓 + footer still to come; reserve marker + trailing.
+        $lines += $fetchErrHeadLines
         $runLen = [ref]($lines -join "`n").Length
-        $result = _AddSectionEntries -Entries $errorEntries -MaxLen $Budget -Reserve ($overflowMarker + $trailingReserve) -RunningLen $runLen
+        $result = _AddSectionEntries -Entries $errorEntries -MaxLen $Budget -Reserve $reserveAfterFetchErr -RunningLen $runLen -Indent '    '
         $lines += $result.Emitted
-        if ($result.Dropped -gt 0) { $lines += "    +$($result.Dropped) 件（省略）" }
+        $lines += _SectionOverflowLines -Result $result -Indent '    '
     }
 
-    $lines += ""
-    $lines += "飢餓 (24h 以上評価されていない): $($starvedList.Count) 件"
-    if ($starvedList.Count -eq 0) {
-        $lines += "  (該当なし)"
-    }
-    else {
-        # 飢餓 is the LAST list-emitting section. Only the footer remains, so reserve only marker
-        # + a smaller trailing (footer ~200 alone).
+    $lines += $starvedHeadLines
+    if ($starvedList.Count -gt 0) {
+        # 飢餓 is the LAST list-emitting section, so only the footer is still to come — but it gets
+        # a floor like everyone else. Before F-1 this section was the second victim of the same
+        # defect: on 2026-09-03 it rendered 1 of 3 rows because 隔離 and 判断待ち had already run.
         $runLen = [ref]($lines -join "`n").Length
-        $result = _AddSectionEntries -Entries $starvedList -MaxLen $Budget -Reserve ($overflowMarker + 250) -RunningLen $runLen
+        $result = _AddSectionEntries -Entries $starvedList -MaxLen $Budget -Reserve $reserveAfterStarved -RunningLen $runLen
         $lines += $result.Emitted
-        if ($result.Dropped -gt 0) { $lines += "  +$($result.Dropped) 件（省略）" }
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
 
-    $lines += ""
-    $lines += "(0 件でも送信しています — 通知チャネル自体の生存確認を兼ねます。"
-    $lines += " 人間がこのダイジェストを読まない状態はチャネル故障ではなく運用の放棄であり、機械では検知できません。)"
+    $lines += $footerLines
     return ($lines -join "`n")
 }
 

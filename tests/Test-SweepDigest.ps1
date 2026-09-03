@@ -70,7 +70,23 @@ $budgetAssignments = $ast.FindAll({ param($n)
 if ($budgetAssignments.Count -ne 1) {
     throw "expected exactly one `$DigestBudget assignment in the sweep script, found $($budgetAssignments.Count)"
 }
-$script:DigestBudget = [int]$budgetAssignments[0].Right.Extent.Text
+# The right-hand side must be a bare integer literal, and that is a REQUIREMENT rather than a
+# convenience of the parser. This harness deliberately does not evaluate the expression: evaluating
+# it would mean executing a fragment of the production script to learn the budget, which puts the
+# harness back in the business of computing the number instead of reading the shipped one — the
+# coupling E-2 removed. It would also let a budget that is only knowable at run time pass a suite
+# whose entire purpose is that the shipped value is a fixed, inspectable number. Stated here
+# because the bare `[int]` cast used to fail with a PowerShell conversion error that named neither
+# the requirement nor this file (#215 gate round 2, msg-2424 weakest point; msg-2436 §4 residual).
+# Failure direction is unchanged and safe either way — this cannot turn a red suite green.
+$budgetLiteral = $budgetAssignments[0].Right.Extent.Text
+if ($budgetLiteral -notmatch '^\d+$') {
+    throw ("tests/Test-SweepDigest.ps1 requires `$DigestBudget to be assigned a bare integer " +
+           "literal so the shipped budget can be read without executing the sweep script; found " +
+           "'$budgetLiteral' in deploy/run-conductor-scheduled.ps1. Either restore a literal, or " +
+           "change this harness deliberately — do not silently start evaluating the expression.")
+}
+$script:DigestBudget = [int]$budgetLiteral
 
 function Write-Log { param([string]$Message) }
 
@@ -319,9 +335,13 @@ $decisionBudgetAssignments = $ast.FindAll({ param($n)
     $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
     $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
     $n.Left.VariablePath.UserPath -eq 'DecisionMessageDiscordBudget' }, $true)
+# Same integer-literal requirement as $DigestBudget above, and folded into the boolean rather than
+# left to the cast: an expression here used to abort the whole suite with a conversion error that
+# named nothing. Now it fails this one named check instead.
+$decisionBudgetLiteral = if ($decisionBudgetAssignments.Count -eq 1) { $decisionBudgetAssignments[0].Right.Extent.Text } else { $null }
 CheckTrue "`$DecisionMessageDiscordBudget is also within the ``content`` hard limit" `
-    ($decisionBudgetAssignments.Count -eq 1 -and [int]$decisionBudgetAssignments[0].Right.Extent.Text -le $DiscordContentHardLimit) `
-    $(if ($decisionBudgetAssignments.Count -eq 1) { $decisionBudgetAssignments[0].Right.Extent.Text } else { "assignments=$($decisionBudgetAssignments.Count)" })
+    ($decisionBudgetLiteral -match '^\d+$' -and [int]$decisionBudgetLiteral -le $DiscordContentHardLimit) `
+    $(if ($null -ne $decisionBudgetLiteral) { $decisionBudgetLiteral } else { "assignments=$($decisionBudgetAssignments.Count)" })
 
 # E-4's field needs a WRITER, not just a reader. This thread has now shipped three fields whose
 # consumer existed while nothing supplied a value (`next_participant`, `last_full_success_period`,
@@ -387,6 +407,244 @@ $digest3 = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
 CheckTrue "unbounded call still renders (existing tests pass, but pin it explicitly here too)" `
     ($digest3.Length -gt 0) $digest3.Length
 CheckTrue "unbounded call does NOT contain +N marker (no truncation)" ($digest3 -notmatch '\+\d+ 件（省略）') $digest3
+
+# =============================================================================================
+# F-1 — PER-SECTION ROW FLOOR (Bohr msg-2418 §4-4, rescoped by msg-2436 §4)
+#
+# The defect these cases exist to prevent: the renderer's trailing reserve counted the HEADERS of
+# the later sections and none of their ROWS, so the first row-emitting section was allowed to eat
+# the budget and every later section printed a correct header, a correct count, and nothing else.
+# Measured in production, not derived — the 2026-09-03 10:50 delivery (1735 chars, the first full
+# digest since 08-30) carried 4 of 21 判断待ち rows and 1 of 3 飢餓 rows; on 09-02, with 12
+# quarantine entries instead of 3, the same renderer carried 0 of 21 判断待ち rows. The visible row
+# count was a decreasing function of the PRECEDING sections' load.
+#
+# WHAT IS AND IS NOT ASSERTED HERE (msg-2418 §4-3 / msg-2436 §4, explicit prohibition): the 4 / 1 /
+# 0 figures above are the pre-fix measurements that make these cases negative controls. They are
+# NOT expected values and must never be written as assertions — pinning the defect as the spec is
+# the exact failure the whole thread is closing. What is asserted is the invariant: every non-empty
+# row-emitting section emits at least one row, and the total still fits the shipped budget.
+# =============================================================================================
+Write-Host ""
+Write-Host "F-1 — every non-empty row section keeps a floor of one row (msg-2436 §4)"
+
+# Row counter. Walks the rendered digest and attributes each line to the section it belongs to,
+# skipping the lines that are not rows: sub-headers, (該当なし), overflow markers, the 取得失敗
+# count line, and the indented repro-hint continuation that T-sdk-is-error-loses-the-reason S-8
+# attaches to a quarantine row (it is part of the row above it, not a row of its own).
+function Get-DigestRowCounts {
+    param([string]$Digest)
+    $counts = @{ quarantine = 0; parked = 0; fetcherr = 0; starved = 0 }
+    $sec = $null
+    foreach ($l in ($Digest -split "`n")) {
+        if ($l -match '^隔離中: ')       { $sec = 'quarantine'; continue }
+        if ($l -match '^判断待ち: ')     { $sec = 'parked'; continue }
+        if ($l -match '^\s+取得失敗: ')  { $sec = 'fetcherr'; continue }
+        if ($l -match '^飢餓 ')           { $sec = 'starved'; continue }
+        if ($l -match '^\(0 件でも')      { $sec = $null; continue }
+        if ($null -eq $sec -or $l -eq '') { continue }
+        if ($l -match '^\s+\+\d+ 件（省略') { continue }
+        if ($l -match '^\s+\[(stale|escalated|quarantined)\]') { continue }
+        if ($l -match '^\s+\(該当なし\)') { continue }
+        if ($sec -ne 'fetcherr' -and $l -match '^\s{4}\S') { continue }
+        $counts[$sec] = $counts[$sec] + 1
+    }
+    return $counts
+}
+
+# Shared fixture pieces. Key and question widths are taken from the real 2026-09-03 population so
+# the rows compete for the budget the way production's rows do; a fixture with short rows cannot
+# reproduce a defect whose whole mechanism is row width.
+$f1Now = [datetime]::Parse('2026-09-03T01:50:13Z').ToUniversalTime()
+$f1ParkedKeys = @(
+    'spirrow-magickit/T-dashboard-panels-do-not-name-the-project'
+    'spirrow-magickit/T-decision-page'
+    'spirrow-magickit/T-decision-post-error-rerender-mode'
+    'spirrow-mindwire/T-gate-bootstrap-close-refused-and-tick-crash'
+    'spirrow-mindwire/T-gate-reads-stale-base-diff'
+    'spirrow-mindwire/T-gate-silently-suppresses-approve-on-truncated-diff'
+    'spirrow-mindwire/T-infra-failure-posts-empty-rc'
+    'spirrow-mindwire/T-naysayer-blocking-bar-undefined'
+    'spirrow-mindwire/T-role-null-must-become-impossible'
+    'spirrow-mindwire/T-error-envelope-read-as-data'
+    'spirrow-mindwire/T-verdict-echo-after-real-verdict'
+    'spirrow-mindwire/T-denial-detail-and-overdeny'
+    'spirrow-mindwire/T-per-project-deploy-rule'
+    'spirrow-mindwire/T-adr-index-dangling-references'
+    'spirrow-mindwire/T-design-spec-delivery'
+    'spirrow-mindwire/T-sdk-is-error-loses-the-reason'
+    'spirrow-mindwire/T-exclusive-resource-lease-queue'
+    'spirrow-verimend/T-verimend-scaffold'
+    'spirrow-voxelworld/T-lod0-sliver-shards'
+    'spirrow-voxelworld/T-materializechunk-zone-relocation-crash'
+    'spirrow-voxelworld/T-ephemeral-develop-pr-retarget'
+)
+# The composer's question is flattened and capped at 80 chars by the renderer, so an 80-char filler
+# reproduces the shipped row width exactly without carrying 21 real questions into this file.
+$f1Question = 'This thread is waiting on a human decision and the composed question runs long en'
+$f1Parked = @()
+$f1Pending = @{}
+for ($i = 0; $i -lt $f1ParkedKeys.Count; $i++) {
+    $k = $f1ParkedKeys[$i]
+    $head = "msg-{0}" -f (2300 + $i)
+    $f1Parked += [PSCustomObject]@{
+        key = $k; project = ($k -split '/', 2)[0]; thread_id = ($k -split '/', 2)[1]; head_msg_id = $head
+    }
+    $f1Pending[$k] = [PSCustomObject]@{
+        signature = "human:$head"
+        envelope  = [PSCustomObject]@{ composer_status = 'ok'; output = [PSCustomObject]@{ question = $f1Question } }
+    }
+}
+
+# Quarantine records carry BOTH a fingerprint and a session_log_path, so each row gains the S-8
+# repro-hint continuation line — ~150 chars per entry, and the reason the quarantine section can
+# swallow the budget with only a handful of entries.
+function New-F1QuarantineSet {
+    param([int]$Count, [datetime]$Now)
+    $q = @{}
+    for ($i = 0; $i -lt $Count; $i++) {
+        $q["spirrow-mindwire/T-quarantined-thread-{0:D2}-conductor-failure" -f $i] = @{
+            state               = 'quarantined'
+            first_failure_at    = $Now.AddHours(-25 - $i).ToString('o')
+            failure_fingerprint = @{ head = "msg-{0}" -f (1700 + $i); control = 'run' }
+            session_log_path    = 'C:\Users\tomtar\spirrow-mindwire-data\logs\conductor-2026-09-02.log'
+        }
+    }
+    return $q
+}
+
+# Starvation is driven off $LiveKeys + $EvaluatedState, so the fixture supplies stale evaluation
+# timestamps rather than a starved list.
+function New-F1StarvedState {
+    param([int]$Count, [datetime]$Now)
+    $keys = @(
+        'spirrow-voxelworld/T-ephemeral-develop-pr-retarget'
+        'spirrow-mindwire/T-rider3-objection-parser-injection-surface'
+        'spirrow-mindwire/T-stalled-pr-has-no-detector'
+        'spirrow-mindwire/T-spec-pin-hardening-and-id-audit'
+        'spirrow-mindwire/T-implementer-context-drop-unexplained'
+    )
+    $state = @{}
+    for ($i = 0; $i -lt $Count; $i++) {
+        $state[$keys[$i]] = @{ last_evaluated_at = $Now.AddHours(-25 - ($i * 5)).ToString('o') }
+    }
+    return $state
+}
+
+function Test-F1Floor {
+    param([string]$CaseName, [string]$Digest, [hashtable]$NonEmptySections)
+    CheckTrue "$CaseName — total still fits the shipped budget (≤ $($script:DigestBudget))" `
+        ($Digest.Length -le $script:DigestBudget) $Digest.Length
+    $rows = Get-DigestRowCounts -Digest $Digest
+    foreach ($sec in $NonEmptySections.Keys) {
+        CheckTrue "$CaseName — 「$($NonEmptySections[$sec])」 section emits at least one row (floor)" `
+            ($rows[$sec] -ge 1) "rows=$($rows[$sec]) of section '$sec'; digest=$Digest"
+    }
+}
+
+# --- Case (i): the shape actually delivered on 2026-09-03 10:50 --------------------------------
+# 隔離 3 (with repro-hint continuations) / 判断待ち 21 (enriched) / 飢餓 5 / 取得失敗 0.
+# Pre-fix measurement (negative control, NOT an expectation): 判断待ち 4 rows, 飢餓 2 rows.
+$f1aStarvedState = New-F1StarvedState -Count 5 -Now $f1Now
+$f1aDigest = New-DailyDigest -QuarantineState (New-F1QuarantineSet -Count 3 -Now $f1Now) `
+    -EvaluatedState $f1aStarvedState -HeadsByProject @{} -ControlByProject @{} -Now $f1Now `
+    -LiveKeys @($f1aStarvedState.Keys) -HumanParked $f1Parked -PendingDecisionsState $f1Pending `
+    -ParkedPollErrors @() -Budget $script:DigestBudget
+CheckTrue "case (i) reproduces the delivered shape (隔離 3 / 判断待ち 21 / 飢餓 5)" `
+    (($f1aDigest -match '隔離中: 3 件') -and ($f1aDigest -match '判断待ち: 21 件') -and `
+     ($f1aDigest -match '飢餓 \(24h 以上評価されていない\): 5 件')) $f1aDigest
+Test-F1Floor -CaseName 'case (i) 2026-09-03 delivered shape' -Digest $f1aDigest `
+    -NonEmptySections @{ quarantine = '隔離中'; parked = '判断待ち'; starved = '飢餓' }
+
+# --- Case (ii): the saturated 2026-09-02 shape --------------------------------------------------
+# 隔離 12 / 判断待ち 21. Pre-fix measurement (negative control, NOT an expectation): 判断待ち 0 rows
+# — the live reading Heisenberg took at msg-2409, where the section printed its header, its true
+# count of 21, and a bare "+21 件（省略）".
+$f1bStarvedState = New-F1StarvedState -Count 1 -Now $f1Now
+$f1bDigest = New-DailyDigest -QuarantineState (New-F1QuarantineSet -Count 12 -Now $f1Now) `
+    -EvaluatedState $f1bStarvedState -HeadsByProject @{} -ControlByProject @{} -Now $f1Now `
+    -LiveKeys @($f1bStarvedState.Keys) -HumanParked $f1Parked -PendingDecisionsState $f1Pending `
+    -ParkedPollErrors @() -Budget $script:DigestBudget
+CheckTrue "case (ii) reproduces the saturated shape (隔離 12 / 判断待ち 21)" `
+    (($f1bDigest -match '隔離中: 12 件') -and ($f1bDigest -match '判断待ち: 21 件')) $f1bDigest
+Test-F1Floor -CaseName 'case (ii) 2026-09-02 saturated shape' -Digest $f1bDigest `
+    -NonEmptySections @{ quarantine = '隔離中'; parked = '判断待ち'; starved = '飢餓' }
+
+# --- All four row-emitting surfaces競合 at once (msg-2418 §4-2) ---------------------------------
+# Until F-1 the suite had no budget case in which two row-emitting sections competed at all: the
+# 200-entry check renders quarantine only, the 50-parked check renders 判断待ち only, and the
+# 100-error check renders fetch errors only. A shared budget cannot be verified by tests that never
+# make its claimants compete.
+$f1cErrors = @()
+for ($i = 0; $i -lt 8; $i++) {
+    $f1cErrors += [PSCustomObject]@{
+        thread_id = ("spirrow-voxelworld/T-parked-{0:D3}-fetch-error-with-long-detail" -f $i)
+        reason    = 'HTTP 503 upstream server temporarily unavailable — retrying next tick'
+    }
+}
+$f1cStarvedState = New-F1StarvedState -Count 5 -Now $f1Now
+$f1cDigest = New-DailyDigest -QuarantineState (New-F1QuarantineSet -Count 12 -Now $f1Now) `
+    -EvaluatedState $f1cStarvedState -HeadsByProject @{} -ControlByProject @{} -Now $f1Now `
+    -LiveKeys @($f1cStarvedState.Keys) -HumanParked $f1Parked -PendingDecisionsState $f1Pending `
+    -ParkedPollErrors $f1cErrors -Budget $script:DigestBudget
+Test-F1Floor -CaseName 'all four row sections competing' -Digest $f1cDigest `
+    -NonEmptySections @{ quarantine = '隔離中'; parked = '判断待ち'; fetcherr = '取得失敗'; starved = '飢餓' }
+
+# --- The exception clause, said out loud (msg-2436 §4 item 4) ----------------------------------
+# When even one row per section does not fit, the floor cannot be honoured. The renderer must not
+# quietly print zero rows: the section says the omission was caused by the budget.
+$f1dStarvedState = New-F1StarvedState -Count 5 -Now $f1Now
+$f1dDigest = New-DailyDigest -QuarantineState (New-F1QuarantineSet -Count 12 -Now $f1Now) `
+    -EvaluatedState $f1dStarvedState -HeadsByProject @{} -ControlByProject @{} -Now $f1Now `
+    -LiveKeys @($f1dStarvedState.Keys) -HumanParked $f1Parked -PendingDecisionsState $f1Pending `
+    -ParkedPollErrors @() -Budget 700
+CheckTrue "starved budget — total still fits (upper bound holds under the floor rule)" `
+    ($f1dDigest.Length -le 700) $f1dDigest.Length
+CheckTrue "starved budget — a section that could not seat even one row SAYS the budget caused it" `
+    ($f1dDigest -match '\+\d+ 件（省略 — 予算不足で 0 行）') $f1dDigest
+
+# --- A dropped row must have been genuinely unaffordable (msg-2436 §4 item 2) ------------------
+# The floor is only half of F-1. The other half is that the reserve which starves a section must
+# not itself be dead weight: on the 2026-09-03 shape the pre-fix renderer dropped 17 判断待ち rows
+# and 3 飢餓 rows while leaving 219 of 1950 characters unspent, because $trailingReserve = 400 was
+# an estimate of trailing content that had already been emitted. 飢餓 is the last row-emitting
+# section — only the footer follows it — so if it reports an omission, the budget must actually be
+# spent. Uniform-width rows here so the width of the row that was dropped is known exactly (all
+# keys are the same length and all ages fall in the same formatting bucket).
+$f1eNow = $f1Now
+$f1eState = @{}
+for ($i = 0; $i -lt 20; $i++) {
+    $f1eState["spirrow-mindwire/T-starved-uniform-row-{0:D2}" -f $i] = @{
+        last_evaluated_at = $f1eNow.AddHours(-30).ToString('o')
+    }
+}
+$f1eDigest = New-DailyDigest -QuarantineState (New-F1QuarantineSet -Count 2 -Now $f1eNow) `
+    -EvaluatedState $f1eState -HeadsByProject @{} -ControlByProject @{} -Now $f1eNow `
+    -LiveKeys @($f1eState.Keys) -HumanParked $f1Parked -PendingDecisionsState $f1Pending `
+    -ParkedPollErrors @() -Budget $script:DigestBudget
+$f1eRows = @(($f1eDigest -split "`n") | Where-Object { $_ -match '^  spirrow-mindwire/T-starved-uniform-row-\d\d\s' })
+$f1eWidths = @($f1eRows | ForEach-Object { $_.Length } | Sort-Object -Unique)
+CheckTrue "slack case — 飢餓 truncated and its rows are uniform width (fixture precondition)" `
+    (($f1eDigest -match '飢餓 \(24h 以上評価されていない\): 20 件') -and $f1eRows.Count -ge 1 -and `
+     $f1eRows.Count -lt 20 -and $f1eWidths.Count -eq 1) `
+    "emitted=$($f1eRows.Count) distinctWidths=$($f1eWidths -join ',')"
+CheckTrue "slack case — the dropped 飢餓 row genuinely did not fit (no dead reserve behind it)" `
+    (($f1eDigest.Length + 1 + $f1eWidths[0]) -gt $script:DigestBudget) `
+    "len=$($f1eDigest.Length) rowCost=$(1 + $f1eWidths[0]) budget=$($script:DigestBudget) unspent=$($script:DigestBudget - $f1eDigest.Length)"
+
+# --- The retired constants stay retired (msg-2436 §4 item 2) -----------------------------------
+# $trailingReserve = 400 and the inline 250 were estimates of the trailing content. F-1 replaced
+# them with a computation over the real lists. Re-adding either as a constant would recreate the
+# double bookkeeping — a number that has to be kept in step with content it cannot see — which is
+# the same failure mode E-2 closed when the harness held its own copy of $DigestBudget.
+foreach ($retired in 'trailingReserve', 'overflowMarker') {
+    $stillAssigned = $ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+        $n.Left.VariablePath.UserPath -eq $retired }, $true)
+    CheckTrue "`$$retired stays retired (reserve is computed at render time, not estimated)" `
+        ($stillAssigned.Count -eq 0) $stillAssigned.Count
+}
 
 # =============================================================================================
 # D-6 / D-1 — ⚠ line prepends above the header when passed
