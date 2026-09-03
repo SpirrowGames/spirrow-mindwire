@@ -542,18 +542,27 @@ function Test-F1Floor {
     }
 }
 
-# --- Case (i): the shape actually delivered on 2026-09-03 10:50 --------------------------------
-# 隔離 3 (with repro-hint continuations) / 判断待ち 21 (enriched) / 飢餓 5 / 取得失敗 0.
-# Pre-fix measurement (negative control, NOT an expectation): 判断待ち 4 rows, 飢餓 2 rows.
+# --- Case (i): a heavier synthetic load over the 2026-09-03 quarantine/parked shape ------------
+# 隔離 3 (with repro-hint continuations) / 判断待ち 21 (enriched) / 飢餓 5 / 取得失敗 0. The 飢餓 5 is
+# SYNTHETIC and deliberately heavier than production: the digest actually delivered at 10:50 that
+# day carried 飢餓 3, not 5 (conductor log line 9040, "sending daily digest (3 quarantined, 3
+# starved, 21 human-parked, payload=1735 chars)"; the 10:50 in the rendered header is $nowUtc,
+# fixed at tick start, while the send is logged at 11:25). 飢餓 5 is kept because it is a strictly
+# harder budget case and moves neither verdict. L418 above states the delivered figures.
+# Pre-fix measurements (negative controls, NOT expectations), each named with the run that produced
+# it — this fixture (隔離 3 / 判断待ち 21 / 飢餓 5) against the renderer at 97ffd89: 判断待ち 4 rows,
+# 飢餓 1 row, 1692 of 1950 chars used. The delivered shape (隔離 3 / 判断待ち 21 / 飢餓 3) against
+# that same renderer: 判断待ち 4 rows, 飢餓 1 row, 1682 of 1950 chars used. 飢餓 renders 1 row at
+# both loads, so the earlier "飢餓 2 rows" here belonged to no run at all.
 $f1aStarvedState = New-F1StarvedState -Count 5 -Now $f1Now
 $f1aDigest = New-DailyDigest -QuarantineState (New-F1QuarantineSet -Count 3 -Now $f1Now) `
     -EvaluatedState $f1aStarvedState -HeadsByProject @{} -ControlByProject @{} -Now $f1Now `
     -LiveKeys @($f1aStarvedState.Keys) -HumanParked $f1Parked -PendingDecisionsState $f1Pending `
     -ParkedPollErrors @() -Budget $script:DigestBudget
-CheckTrue "case (i) reproduces the delivered shape (隔離 3 / 判断待ち 21 / 飢餓 5)" `
+CheckTrue "case (i) renders the intended load (隔離 3 / 判断待ち 21 / 飢餓 5, 飢餓 synthetic)" `
     (($f1aDigest -match '隔離中: 3 件') -and ($f1aDigest -match '判断待ち: 21 件') -and `
      ($f1aDigest -match '飢餓 \(24h 以上評価されていない\): 5 件')) $f1aDigest
-Test-F1Floor -CaseName 'case (i) 2026-09-03 delivered shape' -Digest $f1aDigest `
+Test-F1Floor -CaseName 'case (i) 2026-09-03 shape with 飢餓 raised to 5' -Digest $f1aDigest `
     -NonEmptySections @{ quarantine = '隔離中'; parked = '判断待ち'; starved = '飢餓' }
 
 # --- Case (ii): the saturated 2026-09-02 shape --------------------------------------------------
@@ -605,9 +614,15 @@ CheckTrue "starved budget — a section that could not seat even one row SAYS th
 
 # --- A dropped row must have been genuinely unaffordable (msg-2436 §4 item 2) ------------------
 # The floor is only half of F-1. The other half is that the reserve which starves a section must
-# not itself be dead weight: on the 2026-09-03 shape the pre-fix renderer dropped 17 判断待ち rows
-# and 3 飢餓 rows while leaving 219 of 1950 characters unspent, because $trailingReserve = 400 was
-# an estimate of trailing content that had already been emitted. 飢餓 is the last row-emitting
+# not itself be dead weight. Two SEPARATE runs measure that, kept apart here because this comment
+# previously merged them into one figure that belonged to neither run (msg-2447 §6):
+#   * the delivered 2026-09-03 shape (隔離 3 / 判断待ち 21 / 飢餓 3) against the renderer at 97ffd89
+#     dropped 17 of 21 判断待ち rows and 2 of 3 飢餓 rows, leaving 268 of 1950 characters unspent;
+#   * the uniform-row fixture built just below (隔離 2 / 判断待ち 21 / 飢餓 20) against that same
+#     renderer leaves 220 of 1950 unspent — the figure this very check prints when it is red
+#     ("len=1730 rowCost=52 budget=1950 unspent=220"), dropping 16 判断待ち and 16 飢餓 rows.
+# Both have one cause: $trailingReserve = 400 was an estimate of trailing content that had already
+# been emitted, so the reserve outlived the content it stood for. 飢餓 is the last row-emitting
 # section — only the footer follows it — so if it reports an omission, the budget must actually be
 # spent. Uniform-width rows here so the width of the row that was dropped is known exactly (all
 # keys are the same length and all ages fall in the same formatting bucket).
