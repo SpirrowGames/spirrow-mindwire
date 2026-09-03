@@ -588,22 +588,19 @@ async def test_precheck_not_swallowed_when_permission_error_text_contains_not_fo
     """Adversarial mock — a permission fault whose free-form ``error`` text
     happens to contain the phrase "not found" must NOT be swallowed as absent.
 
-    Pins the fix for Bohr msg-2139 §5 (the "受諾条件 (a) 型弁別である" path
-    with an adversarial mock) and the naysayer's PR-gate objection on head
-    9b023fe: the prior discriminator ``"not found" in str(exc).lower()`` was
-    a natural-language substring in the envelope's free-form ``error`` text.
-    A genuine ``ChatroomPermissionError`` whose text says "role 'orchestrator'
-    not found in closeable_roles" would have matched — and been silently
-    classified as a benign not-found response, violating the surfacing
-    invariant. The fixed discriminator matches the machine-owned
-    ``error_type='ChatroomNotFoundError'`` tag as embedded by
-    ``_elevation_message``, so this adversarial envelope surfaces as
-    ``GateBootstrapCloseError`` even though its text contains "not found".
+    Pins the naysayer's PR-gate objection on head ``9b023fe``: the round-2
+    discriminator ``"not found" in str(exc).lower()`` searched natural-language
+    text the server writes freely, so a genuine ``ChatroomPermissionError``
+    reading "role 'orchestrator' not found in closeable_roles" was classified
+    benign and swallowed.
 
-    Test independence from the naysayer's specific example: the mock message
-    text was picked to include "not found" precisely to falsify the old
-    string-based discriminator. If this test passes, the discrimination is
-    demonstrably structural, not textual.
+    **What passing this proves, and what it does not.** It proves this one
+    envelope is not swallowed. It does *not* prove the discriminator is
+    non-textual — round 3's substring predicate also passed this test while
+    remaining forgeable, which is precisely how the defect survived a round.
+    The test that separates textual from field-based is
+    :func:`test_discriminator_ignores_free_form_text_that_forges_the_old_marker`;
+    this one stays as a regression pin on the older, weaker forgery.
     """
     project = "x"
     mcp = _FakeMcp(
@@ -624,11 +621,11 @@ async def test_precheck_not_swallowed_when_permission_error_text_contains_not_fo
 async def test_close_boundary_not_swallowed_when_permission_error_text_contains_not_found() -> None:
     """Sibling of the precheck adversarial test at the *close* boundary.
 
-    The close-boundary swallow uses the SAME structural discriminator as the
-    precheck (Bohr msg-2139 §5 併せて 1 点: 二つの swallow が二つの述語を
-    持つと片方だけが直る形の divergence を作る). This test proves both
-    boundaries reject the same adversarial input, so any future change to
-    the discriminator affects both by construction.
+    The close-boundary swallow calls the SAME predicate as the precheck (Bohr
+    msg-2139 §5 併せて 1 点: 二つの swallow が二つの述語を持つと片方だけが
+    直る形の divergence を作る). This test proves both boundaries reject the
+    same adversarial input, so any future change to the predicate affects both
+    by construction.
     """
     project = "x"
     thread_id = "T-gate-bootstrap-x"
@@ -645,77 +642,152 @@ async def test_close_boundary_not_swallowed_when_permission_error_text_contains_
         await close_alert(mcp, project=project)
 
 
-def test_envelope_not_found_marker_matches_real_elevated_envelope() -> None:
-    """Belt-and-braces coupling test: the structural marker in gate_bootstrap
-    matches what :func:`raise_if_envelope` actually produces for a real
-    ``ChatroomNotFoundError`` envelope.
+def _elevated(payload: dict[str, Any]) -> MagickitMcpError:
+    """The exception a real call would raise for ``payload``.
 
-    Guards against silent drift in ``_elevation_message``'s format
-    (magickit/client.py:284-289). If the format ever changes such that
-    ``error_type='ChatroomNotFoundError'`` is no longer a substring of the
-    elevated message, this test fails loudly rather than letting the
-    discriminator quietly stop matching (which would classify every
-    ChatroomNotFoundError as a genuine fault and start surfacing them all as
-    GateBootstrapCloseError — the opposite kind of regression, still bad).
+    Every classification test below goes through :func:`raise_if_envelope`
+    rather than constructing :class:`MagickitMcpError` by hand. Hand-built
+    exceptions were what let round 3's tests agree with round 3's bug: a test
+    that writes its own message string is testing the test's idea of the
+    envelope, not the client's. This is the same rule ``raise_if_envelope``'s
+    own docstring states as DoD #3 ("the fake is raised from the measured
+    envelope shape").
+    """
+    try:
+        raise_if_envelope(payload)
+    except MagickitMcpError as exc:
+        return exc
+    pytest.fail(f"raise_if_envelope did not raise on {payload!r}")
+
+
+def test_raise_if_envelope_carries_error_type_to_the_discriminator() -> None:
+    """The one coupling that survives D-1: the client must publish the parsed
+    ``error_type``, and this module must read the same attribute.
+
+    Round 3's coupling test pinned a *message format* — that
+    ``error_type='ChatroomNotFoundError'`` appears as a substring of
+    ``_elevation_message``'s output. That coupling is gone, deliberately:
+    nothing here depends on how the message is formatted any more, so a format
+    change can no longer break or silently weaken the discriminator. What
+    replaces it is narrower and is pinned here — the attribute must exist and
+    must carry the envelope's own field value.
+
+    Envelope shape is the recorded one, measured live against the magickit MCP
+    endpoint on 2026-09-03 (a read of a thread id that was never opened):
+    ``{"error_type": "ChatroomNotFoundError", "error": "Thread '...' not found
+    in project '...'", "details": {...}}``.
     """
     from spirrow_mindwire.gate_bootstrap import (
-        _ENVELOPE_NOT_FOUND_MARKER,
+        _NOT_FOUND_ERROR_TYPE,
         _is_thread_not_found_envelope,
     )
 
-    envelope = _error_envelope(
-        "ChatroomNotFoundError",
-        "Thread 'T-gate-bootstrap-x' not found in project 'x'",
-    )
-    try:
-        raise_if_envelope(envelope)
-    except MagickitMcpError as exc:
-        assert _ENVELOPE_NOT_FOUND_MARKER in str(exc), (
-            f"marker {_ENVELOPE_NOT_FOUND_MARKER!r} not found in elevated "
-            f"message {str(exc)!r} — did _elevation_message's format change?"
+    exc = _elevated(
+        _error_envelope(
+            "ChatroomNotFoundError",
+            "Thread 'T-gate-bootstrap-x' not found in project 'x'",
+            project="x",
+            thread_id="T-gate-bootstrap-x",
         )
-        assert _is_thread_not_found_envelope(exc) is True
-    else:
-        pytest.fail("raise_if_envelope did not raise on a real not-found envelope")
+    )
+    assert exc.error_type == _NOT_FOUND_ERROR_TYPE
+    assert _is_thread_not_found_envelope(exc) is True
+
+
+def test_discriminator_ignores_free_form_text_that_forges_the_old_marker() -> None:
+    """The PR-gate objection on head ``523d400``, as an executable negative
+    control.
+
+    Round 3 matched the literal ``error_type='ChatroomNotFoundError'`` in
+    ``str(exc)``. The gate's counter-example: an envelope classified
+    ``ChatroomPermissionError`` whose free-form ``error`` text *quotes* that
+    literal. Because ``str(exc)`` flattens the machine-owned field and the
+    server's prose into one string, the quote matched and an adversarial
+    permission fault was swallowed as a benign absence.
+
+    Field equality cannot be reached by the ``error`` value at all. Both
+    assertions below are load-bearing: the first shows the forgery is still
+    present in the flattened message (so this test would go green for the wrong
+    reason if someone "fixed" it by sanitising the message instead), the second
+    shows the classification is unaffected by it.
+    """
+    from spirrow_mindwire.gate_bootstrap import _is_thread_not_found_envelope
+
+    exc = _elevated(
+        _error_envelope(
+            "ChatroomPermissionError",
+            "Project access denied: error_type='ChatroomNotFoundError'",
+        )
+    )
+    assert "error_type='ChatroomNotFoundError'" in str(exc)
+    assert _is_thread_not_found_envelope(exc) is False
+
+
+def test_discriminator_rejects_prose_matches_and_non_envelope_failures() -> None:
+    """The remaining shapes that must not be read as "thread is absent".
+
+    Retained from round 3's property-style pin (Bohr msg-2139 §5 併せて 1 点)
+    but rebuilt through :func:`raise_if_envelope`, and extended with the two
+    cases D-1 makes newly checkable.
+    """
+    from spirrow_mindwire.gate_bootstrap import _is_thread_not_found_envelope
+    from spirrow_mindwire.magickit.client import _ELEVATION_VALUE_LIMIT
+
+    # Prose containing "not found" under a different classification.
+    perm = _elevated(
+        _error_envelope(
+            "ChatroomPermissionError",
+            "role 'orchestrator' not found in closeable_roles",
+        )
+    )
+    assert _is_thread_not_found_envelope(perm) is False
+
+    # A transport failure carries no envelope at all, so it has no
+    # classification to compare — and must therefore surface, not be swallowed.
+    transport = MagickitMcpError(
+        "magickit MCP call 'chatroom_get_thread' failed: "
+        "ConnectionError: could not reach project 'spirrow-not-found-x'"
+    )
+    assert transport.error_type is None
+    assert _is_thread_not_found_envelope(transport) is False
+
+    # Truncation cannot manufacture a match: an over-long classification is
+    # capped by ``_bounded_str``, and the capped form is longer than the cap
+    # itself, so it can never equal a 21-character enum name.
+    overlong = _elevated(_error_envelope("ChatroomNotFoundError" * 40, "an absurd classification"))
+    assert overlong.error_type is not None
+    assert len(overlong.error_type) > _ELEVATION_VALUE_LIMIT
+    assert _is_thread_not_found_envelope(overlong) is False
 
 
 @pytest.mark.anyio
 async def test_close_alert_precheck_and_close_share_one_not_found_predicate() -> None:
-    """Property-style pin (Bohr msg-2139 §5 併せて 1 点): the precheck's
-    not-found swallow and the close-boundary's not-found swallow are one
-    predicate, not two — any envelope classified as not-found at one
-    boundary is classified the same way at the other.
+    """Both swallows are one predicate, not two (Bohr msg-2139 §5 併せて 1 点).
 
-    Tests both classifications directly via ``_is_thread_not_found_envelope``,
-    so a future refactor that splits the two swallows into two predicates
-    would fail here loudly rather than diverge silently.
+    Exercised end-to-end through :func:`close_alert` rather than by calling the
+    predicate twice: the same forged envelope is served at the read boundary in
+    one half and at the write boundary in the other, and both must surface as
+    :class:`GateBootstrapCloseError`. A future refactor that splits the two
+    swallows into two predicates and fixes only one fails here.
     """
-    from spirrow_mindwire.gate_bootstrap import _is_thread_not_found_envelope
-
-    # A real not-found envelope: matches.
-    not_found = MagickitMcpError(
-        "magickit tool returned an error envelope: total=3 "
-        "keys=['details', 'error', 'error_type'] "
-        "error_type='ChatroomNotFoundError' "
-        "error=\"Thread 'x' not found in project 'x'\""
+    forged = _error_envelope(
+        "ChatroomPermissionError",
+        "Project access denied: error_type='ChatroomNotFoundError'",
     )
-    assert _is_thread_not_found_envelope(not_found) is True
 
-    # A permission fault whose free-form text contains "not found": does NOT match.
-    perm_containing_not_found = MagickitMcpError(
-        "magickit tool returned an error envelope: total=3 "
-        "keys=['details', 'error', 'error_type'] "
-        "error_type='ChatroomPermissionError' "
-        "error=\"role 'orchestrator' not found in closeable_roles\""
-    )
-    assert _is_thread_not_found_envelope(perm_containing_not_found) is False
+    at_precheck = _FakeMcp(results={"chatroom_get_thread": forged})
+    with pytest.raises(GateBootstrapCloseError, match="precheck refused"):
+        await close_alert(at_precheck, project="x")
+    assert [name for name, _ in at_precheck.calls] == ["chatroom_get_thread"]
 
-    # A transport error mentioning "not-found" in a project name: does NOT match.
-    transport_with_not_found_project = MagickitMcpError(
-        "magickit MCP call 'chatroom_get_thread' failed: "
-        "ConnectionError: could not reach project 'spirrow-not-found-x'"
+    at_close = _FakeMcp(
+        results={
+            "chatroom_get_thread": _thread_summary_ok("x", "T-gate-bootstrap-x"),
+            "chatroom_close_thread": forged,
+        }
     )
-    assert _is_thread_not_found_envelope(transport_with_not_found_project) is False
+    with pytest.raises(GateBootstrapCloseError, match="chatroom_close_thread refused"):
+        await close_alert(at_close, project="x")
 
 
 # --- CLI wrapper (scripts/gate_bootstrap_tick.py) -----------------------------------------------
