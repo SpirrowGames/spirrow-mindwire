@@ -38,7 +38,56 @@ def magickit_mcp_url() -> str:
 
 
 class MagickitMcpError(RuntimeError):
-    """An MCP tool call to magickit failed or returned an unusable result."""
+    """An MCP tool call to magickit failed or returned an unusable result.
+
+    ``error_type`` carries the chatroom error envelope's **own classification
+    field** when — and only when — this exception was raised from an envelope by
+    :func:`raise_if_envelope`. Every other construction site (transport wrap,
+    ``isError``, no-JSON, gateway) leaves it ``None``, because those failures
+    have no envelope and therefore no server-side classification.
+
+    **Why the field is carried instead of re-read from the message** (T-new-
+    project-gate-bootstrap Bohr msg-2383 §2 "INV-D"): a caller that needs to
+    tell one envelope kind from another used to search ``str(exc)`` for a
+    substring. That cannot work, because :func:`_elevation_message` flattens
+    the machine-owned ``error_type`` and the server's free-form ``error`` prose
+    into one string — after the flatten, no substring of it is provably
+    machine-owned. The PR-gate on #200 head ``523d400`` demonstrated the
+    forgery concretely: an envelope classified ``ChatroomPermissionError``
+    whose ``error`` text contains the literal ``error_type='ChatroomNotFound
+    Error'`` matched a marker search. Reading the parsed field before it is
+    formatted removes the flatten from the path, so free-form text cannot
+    reach the value a caller compares against.
+
+    **What this does and does not guarantee.** It guarantees that nothing but
+    the envelope's own top-level ``error_type`` key can decide the comparison —
+    no ``error`` prose, no ``details``, no other key. It does **not** guarantee
+    that the far end classified correctly: a caller that compares this field is
+    trusting conclair's classifier, and only that. The distinction is the whole
+    point — we trust the server's classification, we do not trust its prose.
+
+    The value is passed through :func:`_bounded_str`, so it obeys the same
+    :data:`_ELEVATION_VALUE_LIMIT` cap as every other payload-derived string
+    this module lets out. Truncation cannot manufacture a match against a short
+    name: a value at or under the cap is preserved byte-for-byte, and one over
+    it comes back longer than the cap with :data:`_ELEVATION_TRUNCATION_MARKER`
+    appended, so it can never equal a 21-character enum name.
+
+    ``error_type`` is a keyword-only attribute and is deliberately **not** part
+    of ``args``, so ``str(exc)`` is unchanged and every existing
+    ``MagickitMcpError("...")`` construction and ``except MagickitMcpError``
+    keeps working untouched. A ``copy``/``pickle`` round-trip (which rebuilds
+    from ``args``) would drop it back to ``None``; nothing in this repository
+    round-trips exceptions, and if that changes the degradation is fail-safe —
+    an equality test against a lost value yields ``False``, i.e. "not the
+    benign kind", i.e. the fault surfaces rather than being swallowed.
+    """
+
+    error_type: str | None
+
+    def __init__(self, message: str, *, error_type: str | None = None) -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class McpToolCaller(Protocol):
@@ -308,9 +357,22 @@ def raise_if_envelope(payload: Any) -> None:
     log sites — notably ``LoopControlReader.report_observed`` — stringify the
     exception rather than re-format the payload, keeping the value-safety
     rule in one place.
+
+    This is also the **only** site that populates
+    :attr:`MagickitMcpError.error_type`, and it is the only one that can: it is
+    the only place in the module holding a parsed envelope. The field is read
+    from the payload *before* :func:`_elevation_message` flattens it into prose,
+    which is what makes the attribute usable as a discriminator when the message
+    string is not (see :class:`MagickitMcpError`). :func:`is_envelope` has
+    already established that ``payload["error_type"]`` is a non-empty ``str``,
+    so :func:`_elevation_snippet` cannot return ``None`` here — an envelope-
+    raised error always carries a classification.
     """
     if is_envelope(payload):
-        raise MagickitMcpError(_elevation_message(payload))
+        raise MagickitMcpError(
+            _elevation_message(payload),
+            error_type=_elevation_snippet(payload, "error_type"),
+        )
 
 
 def parse_tool_result(result: Any) -> Any:

@@ -436,6 +436,86 @@ def test_dod2d_report_observed_survives_mixed_key_envelope(
     assert "stale" in log_text, f"expected stale-dashboard warning; got {log_text!r}"
 
 
+def test_envelope_error_type_is_published_on_the_exception() -> None:
+    """``raise_if_envelope`` publishes the envelope's classification field.
+
+    The field exists so a caller can discriminate envelope kinds without
+    searching ``str(exc)`` — the flattened message mixes the machine-owned
+    ``error_type`` with the server's free-form ``error`` prose, so no substring
+    of it is provably machine-owned (T-new-project-gate-bootstrap Bohr msg-2383
+    §2 "INV-D"; the forgery is exercised in ``tests/test_gate_bootstrap.py``).
+
+    Pinned here at the producing end: the value comes from the payload's own
+    key and nothing else can supply it.
+    """
+    from spirrow_mindwire.magickit.client import raise_if_envelope
+
+    with pytest.raises(MagickitMcpError) as caught:
+        raise_if_envelope(
+            {
+                "error_type": "ChatroomNotFoundError",
+                "error": "Thread 'T-x' not found in project 'p'",
+                "details": {"project": "p"},
+            }
+        )
+    assert caught.value.error_type == "ChatroomNotFoundError"
+
+    # The ``error`` prose cannot supply the value, however it is written.
+    with pytest.raises(MagickitMcpError) as forged:
+        raise_if_envelope(
+            {
+                "error_type": "ChatroomPermissionError",
+                "error": "denied: error_type='ChatroomNotFoundError'",
+            }
+        )
+    assert forged.value.error_type == "ChatroomPermissionError"
+
+
+def test_non_envelope_failures_carry_no_error_type() -> None:
+    """Every construction site other than the envelope one leaves it ``None``.
+
+    A transport failure, an ``isError`` result and a no-JSON result have no
+    envelope and therefore no server-side classification. ``None`` is the
+    honest value, and it is also the fail-safe one: an equality test against it
+    is ``False``, so such a failure can never be mistaken for a benign envelope
+    kind and swallowed.
+    """
+    from spirrow_mindwire.magickit.client import _wrap_transport_error
+
+    assert MagickitMcpError("hand-built").error_type is None
+    assert _wrap_transport_error("chatroom_get_thread", OSError("down")).error_type is None
+
+
+def test_envelope_error_type_obeys_the_value_limit() -> None:
+    """The published field is bounded by the same cap as the message.
+
+    :data:`_ELEVATION_VALUE_LIMIT` is the module's uniform bound on any
+    payload-derived string it lets out; the attribute is not exempt from it
+    just because it is not part of the message. Truncation cannot manufacture a
+    false match against a short enum name, because the truncated form is longer
+    than the cap while the names callers compare against are ~20 characters.
+    """
+    from spirrow_mindwire.magickit.client import (
+        _ELEVATION_TRUNCATION_MARKER,
+        _ELEVATION_VALUE_LIMIT,
+        raise_if_envelope,
+    )
+
+    with pytest.raises(MagickitMcpError) as caught:
+        raise_if_envelope({"error_type": "X" * (_ELEVATION_VALUE_LIMIT + 50), "error": "e"})
+    error_type = caught.value.error_type
+    assert error_type is not None
+    assert error_type.endswith(_ELEVATION_TRUNCATION_MARKER)
+    assert len(error_type) == _ELEVATION_VALUE_LIMIT + len(_ELEVATION_TRUNCATION_MARKER)
+
+    # At or under the cap the value is preserved byte-for-byte, so equality
+    # against a real enum name is exact.
+    exact = "C" * _ELEVATION_VALUE_LIMIT
+    with pytest.raises(MagickitMcpError) as unclipped:
+        raise_if_envelope({"error_type": exact, "error": "e"})
+    assert unclipped.value.error_type == exact
+
+
 def _max_elevation_message_length() -> int:
     """Compute the closed-form upper bound on :func:`_elevation_message` length.
 

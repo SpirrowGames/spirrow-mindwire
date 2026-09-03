@@ -469,6 +469,120 @@ async def open_alert(
     return OpenResult(thread_id=thread_id, already_exists=False)
 
 
+# The sweeper's honest ``embodiment`` self-declaration for the ``decide`` msg
+# that ``chatroom_close_thread`` emits (embodiment is required at that boundary
+# by ADR-2026-05-29-12's mandatory-on-state-transition rule, verified against
+# the live magickit schema in T-new-project-gate-bootstrap msg-2083; humans are
+# exempt but the sweeper is not human). This is a scheduled Python script — it
+# is not a terminal coding agent, not a web chat client, and not any of the
+# other named embodiments in the ADR-12 enum. Writing one of those named values
+# would make the audit ledger say something false about who acted. ``unknown``
+# is what the ADR-12 enum uses when no name applies (T-new-project-gate-bootstrap
+# Bohr msg-2084 §5(2) recommends this value on the same reasoning). If a
+# scheduled-script embodiment name is added to the enum later, replace here.
+_SWEEPER_EMBODIMENT = "unknown"
+
+
+# The conclair ``error_type`` value that classifies a benign "this thread does
+# not exist" answer. Recorded value, measured live against the magickit MCP
+# endpoint on 2026-09-03 by reading a thread id that was never opened:
+#
+#   {"error_type": "ChatroomNotFoundError",
+#    "error": "Thread 'T-...' not found in project 'spirrow-mindwire'",
+#    "details": {"project": "...", "thread_id": "..."}}
+_NOT_FOUND_ERROR_TYPE = "ChatroomNotFoundError"
+
+
+def _is_thread_not_found_envelope(exc: MagickitMcpError) -> bool:
+    """``True`` iff conclair classified ``exc``'s envelope as not-found.
+
+    **Envelope-classified, by field equality.** The comparison reads
+    :attr:`~spirrow_mindwire.magickit.client.MagickitMcpError.error_type` —
+    the envelope's own top-level classification key, captured by
+    :func:`~spirrow_mindwire.magickit.client.raise_if_envelope` from the parsed
+    payload *before* it is formatted into the exception message. It is not a
+    match against ``str(exc)``, and not a Python type dispatch either (magickit
+    has one exception class, not a subclass per envelope kind — client.py:40).
+
+    History, because two rounds of this PR got it wrong and the record should
+    not have to be reconstructed from the chatroom:
+
+    - Round 2 matched ``"not found" in str(exc).lower()`` — natural-language
+      text the server writes freely. A ``ChatroomPermissionError`` reading
+      "role 'orchestrator' not found in closeable_roles" matched it.
+    - Round 3 matched the literal ``error_type='ChatroomNotFoundError'`` in
+      ``str(exc)`` and called itself structural. It was not: ``str(exc)`` is a
+      flatten of the machine-owned field *and* the free-form ``error`` prose,
+      so an envelope classified ``ChatroomPermissionError`` whose ``error``
+      text merely quotes ``error_type='ChatroomNotFoundError'`` matched too.
+      The PR-gate on head ``523d400`` named exactly that forgery.
+
+    The general rule the two rounds share, and the reason a third substring
+    would have failed as well (Bohr msg-2383 §2, "INV-D"): *a discriminator
+    must read a field the distrusted party cannot write.* Flattening puts
+    trusted and untrusted bytes in one string, so after the flatten no
+    substring of it qualifies — the fix is to move the read before the flatten,
+    not to pick a longer needle.
+
+    **The exact claim, no stronger:** nothing in the envelope other than its own
+    top-level ``error_type`` key can make this return ``True`` — not the
+    ``error`` prose, not ``details``, not any other key, and not a transport
+    failure (those carry no envelope, so ``error_type`` is ``None`` and they
+    surface). What is **not** claimed is that conclair classified correctly: if
+    the server labels a permission fault ``ChatroomNotFoundError``, this
+    swallows it. That trust is deliberate and is the narrowest available — we
+    trust the far end's classifier and nothing else it says.
+    """
+    return exc.error_type == _NOT_FOUND_ERROR_TYPE
+
+
+async def _alert_thread_exists(
+    mcp: McpToolCaller,
+    *,
+    project: str,
+    thread_id: str,
+) -> bool:
+    """Cheap read-side precheck: does the sweeper's alert thread exist?
+
+    Reads ``chatroom_get_thread`` (``mode='summary'``) — one MCP round-trip
+    against a read-shaped tool. Returns ``True`` if the thread is present,
+    ``False`` if magickit reports it as not found. Any other envelope
+    re-raises unchanged so the caller sees genuine transport / permission
+    faults instead of swallowing them here.
+
+    Split from :func:`close_alert` so ``close_alert`` never issues a
+    write-shaped request against a thread that does not exist (T-new-
+    project-gate-bootstrap msg-2027 §設計側の指摘 (ii): 「閉じる対象が
+    無いなら呼ばない」). Before this precheck, DECLARED projects with no
+    T-gate-bootstrap-<project> thread ever opened would still issue
+    ``chatroom_close_thread`` on every tick — 153 close_refused/day in
+    the measurement window of msg-2024 — and rely on the not-found
+    swallow at the close boundary. That works but leaves a write-shaped
+    call in the ledger every 5 minutes for a state that could be read.
+
+    Cost balance is neutral or slightly better: the previous behaviour
+    was one write per tick (close → not-found → swallow); this is one
+    read per tick (get_thread → not-found). In the exists-and-close case
+    it costs one extra read, which fires at most once per gate-lifecycle
+    transition per project — rare enough to not be worth optimising.
+    """
+    try:
+        await mcp.call_tool(
+            "chatroom_get_thread",
+            {"project": project, "thread_id": thread_id, "mode": "summary"},
+        )
+    except MagickitMcpError as exc:
+        # Field equality on the envelope's own classification key, never a
+        # search of the flattened message (Bohr msg-2383 §2 INV-D; PR-gate on
+        # heads 9b023fe and 523d400). A permission fault must surface as
+        # GateBootstrapCloseError however its free-form text happens to read.
+        # Rationale in :func:`_is_thread_not_found_envelope`.
+        if _is_thread_not_found_envelope(exc):
+            return False
+        raise
+    return True
+
+
 async def close_alert(
     mcp: McpToolCaller,
     *,
@@ -484,34 +598,129 @@ async def close_alert(
     thread and the sweeper takes it down; no ``closeable_role`` is claimed
     because the sweeper does not have one and has no business inventing one.
 
-    ``merge_commit_sha``, if known, is written into the ``decide_content`` as
+    ``merge_commit_sha``, if known, is written into ``summary_content`` as
     the concrete evidence the predicate flipped ("gate is now declared, sha
     ``<...>``"). Not required — the mechanism works without it — but including
     it makes the close self-explanatory in the ledger.
 
-    Swallowed envelopes (idempotent no-op):
-      * "not found" — the thread was never opened / has already been deleted.
-      * "already resolved" / "already closed" — the thread has already been
-        taken down (a human closed it manually, or a previous tick did).
+    Structure of this call (T-new-project-gate-bootstrap S-3b, verified
+    against the live magickit schema in Heisenberg msg-2083):
 
-    Any other envelope raises :class:`GateBootstrapCloseError` (the payload
-    is preserved via chained exception) so a permission fault surfaces loudly
-    rather than being read as success — the msg-1968 obligation surfaces here.
+    1. **Precheck** via :func:`_alert_thread_exists`. If the thread was never
+       opened for this project, return ``CloseResult(was_open=False)``
+       immediately without any write-shaped call — msg-2027 §設計側の指摘 (ii)
+       (「閉じる対象が無いなら呼ばない」). This is the fix for the msg-2024
+       measurement (153 close_refused/day against threads that never existed).
+    2. **Close call**. Payload uses magickit's current
+       ``chatroom_close_thread`` schema: ``author`` (not ``owner``),
+       ``summary_content`` (not ``decide_content``), and ``embodiment``
+       (required by ADR-2026-05-29-12 mandatory-on-state-transition, since
+       the close emits a ``decide`` msg). ``tags`` carries both
+       ``system-alert`` and ``gate-bootstrap`` — this is the tag msg-1968's
+       carve-out predicate names for the eventual magickit-side role-check
+       exemption ("`system-alert` タグを持ち、かつ owner 自身によるクローズ
+       である場合はロールチェックを免除する"), and emitting it now means
+       the predicate will actually fire when the carve-out lands rather than
+       silently missing it.
+
+    Swallowed envelopes at the close call (idempotent no-op):
+      * "already resolved" / "already closed" — the thread was taken down
+        between the precheck and the close (a human closed it, or a race).
+      * "not found" — same, if the thread disappeared in the race window.
+
+    Swallowed envelope at the precheck call (idempotent no-op):
+      * "not found" — no thread was ever opened for this project; the
+        desired end-state is already the case.
+
+    Any other envelope — at either the precheck OR the close boundary —
+    raises :class:`GateBootstrapCloseError` (the payload is preserved via
+    chained exception) so a permission fault surfaces loudly rather than
+    being read as success. Both boundaries must satisfy this invariant, or
+    a read-side permission fault at the precheck would silently propagate
+    as ``MagickitMcpError`` and every alert would fail closed without
+    reaching the msg-1968 obligation's failure surface.
+
+    The not-found swallow is decided by **field equality on the envelope's own
+    classification key** — :func:`_is_thread_not_found_envelope` compares
+    :attr:`~spirrow_mindwire.magickit.client.MagickitMcpError.error_type`,
+    which :func:`~spirrow_mindwire.magickit.client.raise_if_envelope` captures
+    from the parsed payload before any of it is formatted into the exception
+    message. No search of ``str(exc)`` is performed at either boundary.
+
+    This is the fix for the PR-gate objection on head ``523d400``, and for the
+    earlier one on ``9b023fe`` that it superseded. Both prior rounds matched a
+    substring of the flattened message; the flatten mixes the machine-owned
+    ``error_type`` with the server's free-form ``error`` prose, so a permission
+    fault whose text reads "role 'orchestrator' not found in closeable_roles"
+    (round 2) or one whose text merely quotes ``error_type='ChatroomNotFound
+    Error'`` (round 3) was classified benign and swallowed. Reading the field
+    before the flatten is what removes that whole class, rather than trading
+    one forgeable needle for a longer one.
+
+    Precisely what now holds: no part of the envelope other than its own
+    top-level ``error_type`` key can produce the swallow, and a transport
+    failure — which carries no envelope at all — never can. What does **not**
+    hold, and is not claimed: that conclair's classification is itself correct.
+    A server that labelled a permission fault ``ChatroomNotFoundError`` would
+    still be believed. That is the one trust this contract takes, and it is
+    narrower than trusting anything the server wrote in prose.
+
+    Both boundaries route through the same
+    :func:`_is_thread_not_found_envelope` call — one predicate, two
+    swallows, no divergence hazard (Bohr §5 併せて 1 点).
     """
     thread_id = thread_id_for(project)
-    decide = _format_close_decide(project=project, merge_commit_sha=merge_commit_sha)
+    try:
+        thread_exists = await _alert_thread_exists(mcp, project=project, thread_id=thread_id)
+    except MagickitMcpError as exc:
+        # Any non-"not found" envelope at the read boundary is a genuine
+        # fault (permission / transport / auth). Surface it loudly through
+        # the same exception class the close boundary uses, so the operator
+        # sees ONE failure surface across the whole close_alert contract.
+        raise GateBootstrapCloseError(
+            f"chatroom_get_thread precheck refused for {thread_id!r} in project {project!r}: {exc}"
+        ) from exc
+    if not thread_exists:
+        return CloseResult(thread_id=thread_id, was_open=False)
+    summary = _format_close_decide(project=project, merge_commit_sha=merge_commit_sha)
     payload: dict[str, Any] = {
         "project": project,
         "thread_id": thread_id,
-        "owner": owner,
-        "decide_content": decide,
+        "author": owner,
+        "summary_content": summary,
+        "embodiment": _SWEEPER_EMBODIMENT,
+        "tags": list(ALERT_TAGS),
     }
     try:
         await mcp.call_tool("chatroom_close_thread", payload)
     except MagickitMcpError as exc:
-        message = str(exc).lower()
-        if "not found" in message:
+        # not-found: the SAME predicate object as the precheck (Bohr msg-2139
+        # §5 "併せて 1 点"). Both boundaries route through
+        # :func:`_is_thread_not_found_envelope`; any future change to the
+        # matcher affects both by construction.
+        if _is_thread_not_found_envelope(exc):
             return CloseResult(thread_id=thread_id, was_open=False)
+        # The already-* swallow below is still a free-form substring match, and
+        # that is a weaker predicate than the one directly above it. Recorded
+        # deliberately rather than left for a reader to notice (Bohr msg-2383
+        # §3 R-iii):
+        #
+        #   The stronger technique is available and would be preferable here
+        #   too — the same ``exc.error_type == "<Name>"`` equality. It is NOT
+        #   taken because the ``error_type`` conclair emits for an
+        #   already-resolved close has never been measured, and a guessed name
+        #   would be strictly worse than this substring: a wrong name matches
+        #   nothing, silently and forever, whereas the substring at least
+        #   matches the case it was written for. Discharge condition, one call:
+        #   close an already-resolved thread once, record the envelope's
+        #   ``error_type``, then convert this branch and ``open_alert``'s
+        #   "already exists" branch (same class of predicate, same discharge).
+        #
+        # The hazard is also smaller here than it was for not-found, which is
+        # why this is a follow-up and not a blocker: an "already resolved" text
+        # cannot plausibly be emitted by an unrelated permission or transport
+        # fault, whereas "not found" demonstrably could.
+        message = str(exc).lower()
         if "already resolved" in message or "already closed" in message:
             return CloseResult(thread_id=thread_id, was_open=False)
         raise GateBootstrapCloseError(
