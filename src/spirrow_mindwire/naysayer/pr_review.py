@@ -715,14 +715,17 @@ def parse_objections(critique: str) -> ObjectionReport:
     invisible — is also an injection surface. A critique that writes a decoy ``[]`` right
     after the marker and its REAL blocking array underneath parses ``EMPTY`` and derives
     APPROVE. Both the chained variant and the prose-separated variant were measured open on
-    ``main``. So the remainder is scanned: any ``[`` in it that begins a NON-EMPTY JSON list
-    means a chained block, and the parse is refused (a chained ``[]`` cannot hide an objection,
-    and ``[]`` in prose is ordinary — see the narrowing note at the loop). This does NOT
-    contradict V-1 — trailing text is still not *consumed*; it is now *inspected*, and its
-    presence disqualifies the block rather
+    ``main``. So the remainder is scanned: any ``[`` in it that begins a JSON list CONTAINING
+    AT LEAST ONE OBJECT means a chained block, and the parse is refused. A list with no object
+    in it cannot be the model's block — the schema is a flat list of flat objects — and could
+    not have produced APPROVE even if the parser had read it, so refusing it would cost the
+    ordinary ``[1]`` / ``my_dict["key"]`` / ``[]`` of everyday prose and buy nothing; see the
+    line-placement note at the loop, which carries the 11-case measurement and both residues.
+    This does NOT contradict V-1 — trailing text is still not *consumed*; it is now
+    *inspected*, and its presence disqualifies the block rather
     than being selected as the payload (selecting the later array is the fail-open ``find("[")``
     shape D-3 already rejected). D-4 stays dropped: arbitrary prose after the block is still
-    fine, only a chained ARRAY is refused.
+    fine, only a chained OBJECT ARRAY is refused.
 
     **What is NOT done here.** D-2-prime (a non-regression floor on ``gate_verdict``: the derived
     read may never lower the gate below the pre-Stage-1 baseline) is a Stage-2 constraint on
@@ -786,22 +789,50 @@ def parse_objections(critique: str) -> ObjectionReport:
     if not isinstance(parsed, list):
         return _missing_report(ObjectionMissingReason.NOT_A_LIST)
     # D-7: V-1's blindness to trailing text is what an injector exploits. If any ``[`` in the
-    # unconsumed remainder begins a NON-EMPTY JSON list, a second block is chained behind the
-    # first and the whole parse is refused. Refusing is fail-closed (MISSING → RC) and cannot
-    # be used to soften a verdict, which is why "reject" beats "pick the later array".
+    # unconsumed remainder begins a JSON list THAT COULD ITSELF HAVE BEEN AN OBJECTION BLOCK,
+    # a second block is chained behind the first and the whole parse is refused. Refusing is
+    # fail-closed (MISSING → RC) and cannot be used to soften a verdict, which is why
+    # "reject" beats "pick the later array".
     #
-    # Why non-empty and not any list (a deliberate narrowing of the #206 R5/R6 shape, which
-    # refuses every chained list). The attack is "show the parser a benign array, show the
-    # human the real one", so it only works if the LATER array is the more damning of the two.
-    # A chained ``[]`` is never more damning than what precedes it: if the first array blocks,
-    # the parse already derives RC; if it does not, an empty second array adds no hidden
-    # objection. So refusing on ``[]`` buys no attack coverage — and it costs a great deal,
-    # because ``[]`` in prose is ordinary. The gate's own system prompt says "``[]`` if you
-    # stated none", so the broad form derives MISSING for any critique that echoes its own
-    # instructions, which ``test_quoting_the_prompt_objection_exemplar_is_fail_closed`` catches
-    # on this very file. False RC is permitted (msg-2385 §2, F) but not free: this parser's
-    # output is the shadow measurement rider 2 is calibrating, and a defense that fires on
-    # ordinary critiques saturates the very signal it is instrumenting.
+    # Where the line sits, and why it is not arbitrary (msg-2413 §3, correcting the
+    # "non-empty" narrowing this file shipped at 6b009d9 and the "any list" shape of #206
+    # R5/R6). The attack is "show the parser a benign array, show the human the real one", so
+    # it only works if the parser COULD have read the later array as the model's objection
+    # block. The schema is a flat list of flat objects, so:
+    #
+    #   * A chained list containing no object hides nothing. ``[]`` adds no objection to what
+    #     precedes it; and ``[1]`` / ``["key"]`` / ``[1, 2]``, HAD the parser read them as the
+    #     block, derive UNKNOWN → REQUEST_CHANGES (each element is not a dict, so it is
+    #     counted as unknown-class — see the element loop below). An attacker cannot reach
+    #     APPROVE through them, so refusing them buys no attack coverage. This is exactly the
+    #     argument the 6b009d9 comment made for ``[]``; it stopped one notch short of its own
+    #     conclusion, and the notch is where the gate's objection landed (msg-2406).
+    #   * The cost of the extra notch is large, because bracketed text is ordinary: a citation
+    #     ``[1]``, a subscript ``my_dict["key"]``, a list literal. Measured on an 11-case
+    #     corpus (msg-2413 §3): "any list" scores 5/11, "non-empty" 6/11, this predicate
+    #     11/11, with all three attack cases still refused by all three. The 6b009d9 shape
+    #     broke the OK path too, not just APPROVE: an honest blocking critique whose trailing
+    #     prose says "See [1]." parsed as MISSING.
+    #
+    # False RC is permitted (msg-2385 §2, F) but not free: this parser's output is the shadow
+    # measurement rider 2 is calibrating, and a defense that fires on ordinary critiques
+    # saturates the very signal it is instrumenting. The gate's own system prompt writes
+    # "``[]`` if you stated none", which is why the "any list" shape reds
+    # ``test_quoting_the_prompt_objection_exemplar_is_fail_closed`` on this very file.
+    #
+    # WEAKEST POINT, kept deliberately (msg-2413 §4). Two residues, in opposite directions,
+    # and neither can be closed without reopening what was just fixed:
+    #
+    #   * Not refused: a chained list of SCALARS that a human would read as objections, e.g.
+    #     ``["correctness: foo is broken"]``. It is structurally indistinguishable from
+    #     ``["key"]``, so refusing it returns the false fires above. It is not fail-open in
+    #     the machine's direction — as shown above, that array cannot make the parser say
+    #     APPROVE — so what is abandoned is surplus fail-closure, not coverage of the attack.
+    #   * Still refused: a critique that quotes a schema-shaped array in its trailing prose
+    #     (a critique ABOUT this parser is the realistic case) self-jams into RC. That input
+    #     is structurally identical to the attack — no predicate can separate them — so this
+    #     one is a wart of the same family as D-1's re-typed-marker self-jam, with the same
+    #     loud, human-overridable exit. Placing such an example ABOVE the marker avoids it.
     #
     # ``bad_json`` rather than a new ``ObjectionMissingReason`` member: this is the shape #206
     # lands as ``payload_unparseable`` (which merges ``bad-json`` and ``not-a-list``), so
@@ -816,7 +847,7 @@ def parse_objections(critique: str) -> ObjectionReport:
         except ValueError:
             probe = bracket + 1
             continue
-        if isinstance(chained, list) and chained:
+        if isinstance(chained, list) and any(isinstance(e, dict) for e in chained):
             return _missing_report(ObjectionMissingReason.BAD_JSON)
         probe = bracket + 1
     if not parsed:

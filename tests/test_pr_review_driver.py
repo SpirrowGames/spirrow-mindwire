@@ -1996,8 +1996,9 @@ def test_d7_does_not_fire_on_honest_blocks_or_on_trailing_prose() -> None:
     ordinary cases, which would make the derived read useless as a measurement (rider 2 reads
     the divergence between derived and posted; a defense that fires constantly saturates it).
     Trailing prose after the block is explicitly still legal — D-4 stayed dropped. Only a
-    chained ARRAY is refused, and a bracket in trailing prose that does not open a valid JSON
-    list is not one.
+    chained array OF OBJECTS is refused: a bracket in trailing prose that does not open a
+    valid JSON list is not one, and neither is a list that holds no object (it could not have
+    been the model's block, so it can hide nothing).
     """
     blocking = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
     ok_cases = {
@@ -2012,10 +2013,11 @@ def test_d7_does_not_fire_on_honest_blocks_or_on_trailing_prose() -> None:
             f"{_OBJECTIONS_SENTINEL}\n{blocking}\n\nnote the [not json literal\n\n"
             "VERDICT: REQUEST_CHANGES"
         ),
-        # The narrowing. A chained EMPTY list is not a hidden block, and ``[]`` in prose is
-        # ordinary — the gate's own system prompt writes "``[]`` if you stated none", which is
-        # why the un-narrowed shape reds
+        # A chained EMPTY list is not a hidden block, and ``[]`` in prose is ordinary — the
+        # gate's own system prompt writes "``[]`` if you stated none", which is why the
+        # "any list" shape reds
         # ``test_quoting_the_prompt_objection_exemplar_is_fail_closed`` on this very file.
+        # The wider family of bracketed prose is pinned in the next test.
         "blocking + a bare [] in trailing prose": (
             f"{_OBJECTIONS_SENTINEL}\n{blocking}\n\nwrite `[]` if you stated none\n\n"
             "VERDICT: REQUEST_CHANGES"
@@ -2040,10 +2042,57 @@ def test_d7_does_not_fire_on_honest_blocks_or_on_trailing_prose() -> None:
         report = parse_objections(body)
         assert report.status is ObjectionParse.EMPTY, (
             f"{label}: an honest empty block must still derive APPROVE — D-7 refuses a "
-            f"chained NON-EMPTY array, not an empty one; got {report.status.value} "
+            f"chained array OF OBJECTS, not an empty one; got {report.status.value} "
             f"missing_reason={report.missing_reason}"
         )
         assert derive_verdict(report) is ReviewEvent.APPROVE, label
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        pytest.param("As noted in the literature [1], this is fine.", id="citation-[1]"),
+        pytest.param('my_dict["key"] appears in the diff', id="subscript-[key]"),
+        pytest.param("compare rows [1, 2] of the table", id="list-literal-[1,2]"),
+    ],
+)
+def test_d7_ignores_bracketed_prose_that_is_not_an_object_array(tail: str) -> None:
+    """D-7 draws its line at "could this have been the block?", not at "is it non-empty?".
+
+    The three shapes below are the ones the round-1 gate (msg-2406) and msg-2413 §1 measured
+    misfiring on the ``and chained`` predicate this PR first shipped: a citation ``[1]``, a
+    subscript ``my_dict["key"]``, and a list literal ``[1, 2]``. All three are ordinary
+    English/code prose, and none of them can hide an objection — the schema is a flat list of
+    flat OBJECTS, so had the parser read any of them as the block, every element would have
+    been counted unknown-class and the verdict derived REQUEST_CHANGES anyway. Refusing them
+    therefore buys no attack coverage and costs a false RC on everyday critiques, which is the
+    signal rider 2 is calibrating against.
+
+    Both exit paths are pinned, because the shipped predicate broke both: with an honest
+    EMPTY block the critique became MISSING instead of EMPTY (the gate's report), and with an
+    honest BLOCKING block it became MISSING instead of OK (one notch wider than the gate
+    found — same defect, but it corrupts the RC path's *reason* as well as the APPROVE path's
+    *verdict*).
+
+    NEGATIVE CONTROL (msg-2397 M6), run before this test was written: restoring the predicate
+    to ``isinstance(chained, list) and chained`` reds all three parametrisations, while
+    ``test_d7_chained_array_after_a_decoy_empty_block_is_refused`` (the attack pins) stays
+    green under both predicates — which is the point: the change gives up no attack coverage.
+    """
+    blocking = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
+    ok_body = f"{_OBJECTIONS_SENTINEL}\n{blocking}\n\n{tail}\n\nVERDICT: REQUEST_CHANGES"
+    report = parse_objections(ok_body)
+    assert report.status is ObjectionParse.OK, (
+        f"after an honest blocking block: D-7 must not fire; got {report.status.value} "
+        f"missing_reason={report.missing_reason}"
+    )
+    empty_body = f"{_OBJECTIONS_SENTINEL}\n[]\n\n{tail}\n\nVERDICT: APPROVE"
+    report = parse_objections(empty_body)
+    assert report.status is ObjectionParse.EMPTY, (
+        f"after an honest empty block: D-7 must not fire; got {report.status.value} "
+        f"missing_reason={report.missing_reason}"
+    )
+    assert derive_verdict(report) is ReviewEvent.APPROVE
 
 
 def test_d6_depth_bound_keeps_the_never_raises_contract_at_both_decode_sites() -> None:
