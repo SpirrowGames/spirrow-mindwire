@@ -3195,8 +3195,19 @@ try {
             # The lower bound the ⚠ predicate needs in order to distinguish "never succeeded" from
             # "first run" (Einstein msg-2396 E-4 / Bohr msg-2401 §5). Period-typed, so D-6's
             # predicate discipline still holds on the read side; write-once, so it records the FIRST
-            # attempt and not the latest. Set before the outcome is known, because an attempt that
-            # is about to fail is exactly the attempt this field has to remember.
+            # attempt and not the latest. Unconditional: evaluated on every attempt whatever the
+            # outcome turned out to be — unlike last_full_success_period below, which is gated on a
+            # full success. What carries that is NOT statement order, so the durability boundary is
+            # stated here rather than implied: this field and the rest of the record reach disk
+            # through the single Save-JsonState at the end of this branch, and Send-Notification
+            # does not rethrow — its catch converts the failure into a result hashtable ("NEVER
+            # fail the sweep because the notifier failed"), and all it runs before that try is a
+            # webhook-presence test plus Confirm-LogWorthKeeping, which the Write-Log above has
+            # already committed so it returns immediately. So a failing attempt still runs this
+            # block down to that save. Moving the assignment above the send would change nothing
+            # about what survives a crash, while implying a crash-ordering guarantee the single
+            # save does not give; PR #215 gate round 1 asked for that move, Bohr msg-2418 §2
+            # refuted it on those two facts.
             if (-not $notifyHealth.ContainsKey('first_attempt_period') -or -not $notifyHealth['first_attempt_period']) {
                 $notifyHealth['first_attempt_period'] = $currentPeriod
             }
