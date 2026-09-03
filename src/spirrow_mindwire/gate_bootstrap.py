@@ -411,10 +411,21 @@ class CloseResult:
     ``was_open`` is ``True`` when we actually closed a thread this call, and
     ``False`` when the thread was already absent / already resolved (idempotent
     no-op — this is by design, msg-1963 D-4).
+
+    ``resolved_by_msg`` names the ``decide`` msg that resolved the thread when
+    the caller observed a *resolved* state (either at the precheck or at the
+    post-refusal read-back — T-gate-bootstrap-close-retried-on-resolved-thread
+    S-2-prime). It is ``None`` in every other case: on a first-call close
+    (``was_open=True``), on an absent thread (``was_open=False``, thread never
+    opened), and when the observed thread payload had no ``resolved_by_msg``
+    field. The caller writes it into the tick's JSON output so the operator
+    can see WHO resolved the thread — the observation Bohr msg-2456 §2 named as
+    the ground truth in the incident report ("`msg-429` に close 済み").
     """
 
     thread_id: str
     was_open: bool
+    resolved_by_msg: str | None = None
 
 
 class GateBootstrapCloseError(RuntimeError):
@@ -430,6 +441,20 @@ class GateBootstrapCloseError(RuntimeError):
     """
 
 
+# The two chatroom statuses that make :func:`open_alert`'s target state
+# ("the alert is up and visible to a reader") satisfied. This is
+# T-gate-bootstrap-close-retried-on-resolved-thread S-4-prime (Bohr msg-2460 §2,
+# Einstein msg-2461 endorsement): the read-back after an open refusal accepts
+# ONLY these two statuses as "target reached". A ``resolved`` thread with the
+# same fixed id is NOT the target of ``open_alert`` — the alert is not up, it
+# was up and got taken down. Returning ``already_exists=True`` there would
+# silently pretend the alert exists (Einstein msg-2459 correctness blocking).
+# ``superseded`` and ``parked`` are deliberately absent from this set: their
+# semantics have not been measured (Bohr msg-2460 §4), and the safe direction
+# is to raise — a noisy 1-line refusal is better than a silent misclassification.
+_OPEN_ALERT_TARGET_STATUSES: frozenset[str] = frozenset({"active", "awaiting_reply"})
+
+
 async def open_alert(
     mcp: McpToolCaller,
     *,
@@ -440,12 +465,44 @@ async def open_alert(
 ) -> OpenResult:
     """Open ``T-gate-bootstrap-<project>`` idempotently.
 
-    "Already exists" is swallowed and reported (``already_exists=True``): the
-    same thread id is the whole idempotency mechanism, and the second call
-    within one project's lifetime is the *expected* second call, not a bug. Any
-    other envelope re-raises as :class:`MagickitMcpError` — the caller logs it
-    and next tick tries again (msg-1963 D-6, open-side is fail-closed on
-    everything except the deliberate collision).
+    "Already up" is reported as ``already_exists=True``: the same thread id is
+    the whole idempotency mechanism, and the second call within one project's
+    lifetime is the *expected* second call, not a bug.
+
+    **Refusal handling (T-gate-bootstrap-close-retried-on-resolved-thread S-4-prime,
+    Bohr msg-2460 §2, Einstein msg-2461 endorsement).** On any
+    :class:`MagickitMcpError` from ``chatroom_open_thread``, this function
+    **does not inspect the exception**. It reads the world (via
+    :func:`_read_thread_reading_or_none`) and asks a single question about
+    :func:`open_alert`'s own target state — "is the alert now up and visible?"
+    — i.e., is the observed status in :data:`_OPEN_ALERT_TARGET_STATUSES`
+    (``active`` / ``awaiting_reply``). Only in that case is
+    ``already_exists=True`` returned. Every other outcome — status of
+    ``resolved`` / ``superseded`` / ``parked``, an unknown status, an absent
+    thread, or a read that itself failed — re-raises the original
+    :class:`MagickitMcpError` unchanged.
+
+    Why the refusal path DOES NOT accept ``resolved`` here (Einstein msg-2459
+    blocking): the fixed thread id can hold a *resolved* thread from an earlier
+    life-cycle of the same alert. That is a thread that exists but is NOT open
+    — the target of :func:`open_alert` (a visible alert) is unmet. A prior
+    implementation accepted "existence" as sufficient, and Einstein named
+    that as exactly the same class of error that S-3's precheck rewrite fixed
+    in :func:`close_alert` (status-blindness). The recorded-but-not-fixed
+    consequence: once a project's alert life-cycles end in ``resolved`` and the
+    predicate fires again, this function raises on every subsequent open
+    attempt because a fixed-id thread cannot be reopened. That defect is
+    scope-boundaried out of this thread (Bohr msg-2460 §3) — see the raise
+    site for the message the operator sees.
+
+    Why the refusal path DOES NOT inspect the exception (Einstein msg-2457
+    invariant blocking): a name-based filter at the entry of the refusal
+    branch — "swallow only if ``error_type == '<Name>'``" — puts an
+    exception-classification predicate in the *control flow*, which
+    reintroduces the very class of bug this whole thread exists to close.
+    A future name drift on the server would then bypass the read-back and
+    the target-state check with it. The safe direction is: no filter at the
+    entry, and let the read-back's own answer decide.
     """
     thread_id = thread_id_for(project)
     title = title_template.format(project=project)
@@ -463,9 +520,31 @@ async def open_alert(
             },
         )
     except MagickitMcpError as exc:
-        if "already exists" in str(exc).lower():
+        # No exception inspection. Read the world; ask whether open's target
+        # state — an alert that is up and visible — has been reached.
+        reading = await _read_thread_reading_or_none(mcp, project=project, thread_id=thread_id)
+        if reading is not None and reading.status in _OPEN_ALERT_TARGET_STATUSES:
             return OpenResult(thread_id=thread_id, already_exists=True)
-        raise
+        # Enrich the message with the observed post-refusal state so the
+        # operator sees at a glance WHY the swallow did not fire. The most
+        # common non-target reading — ``status='resolved'`` — is the
+        # recorded-but-not-fixed defect: a fixed thread id cannot host two
+        # life-cycles of the alert (Bohr msg-2460 §3). The name of that
+        # defect is spelled out below so the next operator does not have to
+        # re-derive it. Frequency is expected to be zero today (playproof /
+        # lexora are in the DECLARED terminal state and do not call
+        # open_alert), and if it becomes non-zero the operator sees it here.
+        observed = _describe_reading(reading)
+        raise MagickitMcpError(
+            f"chatroom_open_thread refused for {thread_id!r} in project {project!r}; "
+            f"observed thread state after refusal: {observed}. "
+            f"If observed status is 'resolved', the alert cannot be raised again "
+            f"under the fixed thread_id: the alert life-cycle for this project has "
+            f"ended once and re-opening is not supported by this module (recorded "
+            f"as a scope-boundaried defect in T-gate-bootstrap-close-retried-on-"
+            f"resolved-thread §3; independent finding). Original refusal: {exc}",
+            error_type=exc.error_type,
+        ) from exc
     return OpenResult(thread_id=thread_id, already_exists=False)
 
 
@@ -504,8 +583,23 @@ def _is_thread_not_found_envelope(exc: MagickitMcpError) -> bool:
     match against ``str(exc)``, and not a Python type dispatch either (magickit
     has one exception class, not a subclass per envelope kind — client.py:40).
 
-    History, because two rounds of this PR got it wrong and the record should
-    not have to be reconstructed from the chatroom:
+    **Where this is used** (as of
+    T-gate-bootstrap-close-retried-on-resolved-thread S-3, Bohr msg-2460 §6):
+    exactly one call site — :func:`_alert_thread_state`, the precheck read
+    that opens :func:`close_alert`. That is the ONE remaining spot in this
+    module that uses envelope-name classification, and it does so because
+    conclair returns thread-absence as a *refusal*, not as a payload — there
+    is no other observable form of "the thread does not exist". At every
+    other spot (the refusal recheck at both :func:`open_alert` and
+    :func:`close_alert`), the design rule is "look at the observed world
+    state, never at the exception" (Bohr msg-2458 §2 as adopted after
+    Einstein msg-2457's invariant blocking; msg-2460 §1). A refusal-time
+    filter on ``error_type`` would place a name-based predicate in the
+    entrance of the control flow, which is exactly the L-A re-appearance the
+    thread was opened to close.
+
+    History, because rounds of the earlier PR got it wrong and the record
+    should not have to be reconstructed from the chatroom:
 
     - Round 2 matched ``"not found" in str(exc).lower()`` — natural-language
       text the server writes freely. A ``ChatroomPermissionError`` reading
@@ -536,38 +630,145 @@ def _is_thread_not_found_envelope(exc: MagickitMcpError) -> bool:
     return exc.error_type == _NOT_FOUND_ERROR_TYPE
 
 
-async def _alert_thread_exists(
+# Chatroom status the precheck cares about (and, transitively, the refusal
+# recheck's "target reached" test for close_alert). The design comment on
+# :func:`close_alert` and the discharge block on :func:`_read_thread_reading_or_none`
+# state why ``resolved`` is the ONLY status that means "close_alert's target
+# reached", not ``superseded`` / ``parked`` (Bohr msg-2460 §4).
+_RESOLVED_STATUS = "resolved"
+
+
+class _AlertThreadState(StrEnum):
+    """Three-value verdict of the precheck (T-gate-bootstrap-close-retried-on-
+    resolved-thread S-3 / Bohr msg-2460 §6 item 1).
+
+    The old two-value form (``bool``: exists / does not) was named
+    ``_alert_thread_exists`` and was the direct cause of L-B in the incident
+    report (Bohr msg-2456 §5): "存在するか" しか見ていない ∴ ``resolved`` を
+    「開いている」と誤って通し、毎 tick write-shaped な往復を出す. The rename
+    is deliberate — leaving the old name in place while widening the body would
+    let the same misreading re-occur (Bohr msg-2460 §6 note on the rename).
+    """
+
+    ABSENT = "absent"
+    """The thread does not exist at all (never opened for this project)."""
+
+    OPEN = "open"
+    """
+    The thread exists AND its status is anything other than ``resolved``.
+    :func:`close_alert` proceeds to issue the write-shaped close.
+    """
+
+    RESOLVED = "resolved"
+    """
+    The thread exists AND its status is ``resolved``. :func:`close_alert`
+    exits without issuing any write; the caller reports ``already_closed``
+    with the ``resolved_by_msg`` observation carried on the result.
+    """
+
+
+@dataclass(frozen=True)
+class _AlertThreadReading:
+    """The precheck's structured verdict: the tri-state plus the raw evidence.
+
+    ``status`` is the ``thread.status`` string the read observed (``None`` for
+    :attr:`_AlertThreadState.ABSENT` and for a malformed payload). It is
+    exposed so callers whose target state is not "resolved" — :func:`open_alert`
+    — can apply their own predicate on the same reading without re-deriving it
+    from ``state``.
+
+    ``resolved_by_msg`` is the ``thread.resolved_by_msg`` string the read
+    observed. Populated only when :attr:`state` is :attr:`_AlertThreadState.RESOLVED`
+    and the payload carries a string value at that key. This is what surfaces
+    into :class:`CloseResult` and, transitively, into the tick's JSON output —
+    it is the observable fact Bohr msg-2456 §2 named as the ground truth in
+    the incident report.
+    """
+
+    state: _AlertThreadState
+    status: str | None
+    resolved_by_msg: str | None
+
+
+def _classify_reading(payload: Any) -> _AlertThreadReading:
+    """Parse a ``chatroom_get_thread(mode='summary')`` payload into a reading.
+
+    Total over ``Any``: a payload whose shape is not the documented ``{"thread":
+    {"status": ..., ...}, ...}`` degrades to :attr:`_AlertThreadState.OPEN`
+    with ``status=None`` (safe-side: caller attempts / retries the close;
+    silently classifying a malformed payload as ``resolved`` would be the
+    opposite failure mode). Same tolerance philosophy the client boundary
+    takes (client.py's :func:`is_envelope` loose detection): favour a
+    diagnosable action over a silent misclassification.
+    """
+    thread = payload.get("thread") if isinstance(payload, dict) else None
+    thread_dict = thread if isinstance(thread, dict) else {}
+    status_val = thread_dict.get("status")
+    status = status_val if isinstance(status_val, str) else None
+    if status == _RESOLVED_STATUS:
+        rbm_val = thread_dict.get("resolved_by_msg")
+        rbm = rbm_val if isinstance(rbm_val, str) else None
+        return _AlertThreadReading(
+            state=_AlertThreadState.RESOLVED, status=status, resolved_by_msg=rbm
+        )
+    return _AlertThreadReading(state=_AlertThreadState.OPEN, status=status, resolved_by_msg=None)
+
+
+def _describe_reading(reading: _AlertThreadReading | None) -> str:
+    """One-line human-readable description of a reading, for error messages.
+
+    Fits inside a ``GateBootstrapCloseError`` message (or the wrapped
+    ``MagickitMcpError`` from :func:`open_alert`) so the operator sees the
+    world-state observation the swallow decision was made against without
+    having to reproduce it locally.
+    """
+    if reading is None:
+        return "state=unavailable (read-back failed or refused)"
+    if reading.state == _AlertThreadState.ABSENT:
+        return "state=absent (thread does not exist)"
+    if reading.state == _AlertThreadState.RESOLVED:
+        rbm = reading.resolved_by_msg or "unknown"
+        return f"state=resolved (resolved_by_msg={rbm!r})"
+    # OPEN — surface the raw status so an unexpected value ("parked",
+    # "superseded", or a future addition) is visible in the log rather than
+    # buried under a generic "open".
+    return f"state=open (status={reading.status!r})"
+
+
+async def _alert_thread_state(
     mcp: McpToolCaller,
     *,
     project: str,
     thread_id: str,
-) -> bool:
-    """Cheap read-side precheck: does the sweeper's alert thread exist?
+) -> _AlertThreadReading:
+    """Precheck read: classify the alert thread into
+    :attr:`~_AlertThreadState.ABSENT` / :attr:`~_AlertThreadState.OPEN` /
+    :attr:`~_AlertThreadState.RESOLVED`.
 
     Reads ``chatroom_get_thread`` (``mode='summary'``) — one MCP round-trip
-    against a read-shaped tool. Returns ``True`` if the thread is present,
-    ``False`` if magickit reports it as not found. Any other envelope
-    re-raises unchanged so the caller sees genuine transport / permission
-    faults instead of swallowing them here.
+    against a read-shaped tool. Returns the parsed reading on success. On a
+    :class:`MagickitMcpError` envelope classified as not-found by
+    :func:`_is_thread_not_found_envelope`, returns ABSENT (this is the ONE
+    remaining envelope-classification site in this module; see the docstring
+    on :func:`_is_thread_not_found_envelope` for why it is permitted only
+    here). Any other envelope re-raises unchanged so the caller sees genuine
+    transport / permission faults instead of swallowing them here.
 
-    Split from :func:`close_alert` so ``close_alert`` never issues a
-    write-shaped request against a thread that does not exist (T-new-
-    project-gate-bootstrap msg-2027 §設計側の指摘 (ii): 「閉じる対象が
-    無いなら呼ばない」). Before this precheck, DECLARED projects with no
-    T-gate-bootstrap-<project> thread ever opened would still issue
-    ``chatroom_close_thread`` on every tick — 153 close_refused/day in
-    the measurement window of msg-2024 — and rely on the not-found
-    swallow at the close boundary. That works but leaves a write-shaped
-    call in the ledger every 5 minutes for a state that could be read.
+    **T-gate-bootstrap-close-retried-on-resolved-thread S-3** (Bohr msg-2460
+    §6 item 1). The old two-value form (``_alert_thread_exists``, returning
+    ``bool``) caused L-B in the incident report: a ``resolved`` thread was
+    misread as "exists → close it" and every tick issued a write-shaped call
+    that got refused (338/day across playproof / lexora). The rename to
+    ``_alert_thread_state`` and the widening to a tri-state is the fix: the
+    ``resolved`` case is now first-class, and the caller can skip the write
+    entirely (``action=already_closed`` with ``resolved_by_msg`` on the
+    log line).
 
-    Cost balance is neutral or slightly better: the previous behaviour
-    was one write per tick (close → not-found → swallow); this is one
-    read per tick (get_thread → not-found). In the exists-and-close case
-    it costs one extra read, which fires at most once per gate-lifecycle
-    transition per project — rare enough to not be worth optimising.
+    Cost is unchanged from the two-value predecessor: one read per tick, no
+    write-shaped call unless the state is :attr:`_AlertThreadState.OPEN`.
     """
     try:
-        await mcp.call_tool(
+        payload = await mcp.call_tool(
             "chatroom_get_thread",
             {"project": project, "thread_id": thread_id, "mode": "summary"},
         )
@@ -578,9 +779,64 @@ async def _alert_thread_exists(
         # GateBootstrapCloseError however its free-form text happens to read.
         # Rationale in :func:`_is_thread_not_found_envelope`.
         if _is_thread_not_found_envelope(exc):
-            return False
+            return _AlertThreadReading(
+                state=_AlertThreadState.ABSENT, status=None, resolved_by_msg=None
+            )
         raise
-    return True
+    return _classify_reading(payload)
+
+
+async def _read_thread_reading_or_none(
+    mcp: McpToolCaller,
+    *,
+    project: str,
+    thread_id: str,
+) -> _AlertThreadReading | None:
+    """Post-refusal read-back: return a reading, or ``None`` on ANY read failure.
+
+    **The design's core predicate** (T-gate-bootstrap-close-retried-on-
+    resolved-thread S-2-prime / Bohr msg-2458 §2 as adopted after Einstein
+    msg-2457's invariant blocking). Called by :func:`open_alert` and
+    :func:`close_alert` on the *refusal* branch of their write-shaped call,
+    replacing the prose-substring swallows that used to live there
+    (``"already resolved"`` / ``"already closed"`` / ``"already exists"``)
+    and the earlier plan to use ``error_type == "ChatroomStateError"`` as a
+    swallow filter.
+
+    **Never inspects the exception.** The caller catches the refusal, calls
+    this helper, and lets its structured answer decide. Any read failure —
+    envelope refusal (including ChatroomNotFoundError), permission, transport,
+    unusable payload — returns ``None``, and the caller then raises. That
+    fail-closed direction is deliberate:
+
+    - ABSENT after a write refusal cannot be positively observed:
+      ``chatroom_get_thread`` returns not-found as a refusal, so recognising
+      absence there would require the same envelope-name filter this
+      function was written to avoid (Bohr msg-2460 §3). The precheck at the
+      start of :func:`close_alert` already handled ABSENT for the common
+      case; anything reaching here is a rare TOCTOU race where the safe
+      direction is a loud 1-line refusal and let the next tick's precheck
+      re-classify.
+    - Any other read failure means the target state could not be confirmed
+      at this call ∴ the caller must raise. Silent swallowing would
+      re-introduce the whole "wrote a swallow against something we cannot
+      actually see" family of bugs.
+
+    On success, callers apply their OWN target-state predicate to
+    ``reading.status``:
+      * :func:`open_alert` accepts ``{"active", "awaiting_reply"}``
+        (:data:`_OPEN_ALERT_TARGET_STATUSES`).
+      * :func:`close_alert` accepts ``_RESOLVED_STATUS`` only
+        (via :attr:`_AlertThreadState.RESOLVED`).
+    """
+    try:
+        payload = await mcp.call_tool(
+            "chatroom_get_thread",
+            {"project": project, "thread_id": thread_id, "mode": "summary"},
+        )
+    except MagickitMcpError:
+        return None
+    return _classify_reading(payload)
 
 
 async def close_alert(
@@ -603,14 +859,23 @@ async def close_alert(
     ``<...>``"). Not required — the mechanism works without it — but including
     it makes the close self-explanatory in the ledger.
 
-    Structure of this call (T-new-project-gate-bootstrap S-3b, verified
-    against the live magickit schema in Heisenberg msg-2083):
+    **Structure** (T-gate-bootstrap-close-retried-on-resolved-thread S-2-prime +
+    S-3, Bohr msg-2460 §6):
 
-    1. **Precheck** via :func:`_alert_thread_exists`. If the thread was never
-       opened for this project, return ``CloseResult(was_open=False)``
-       immediately without any write-shaped call — msg-2027 §設計側の指摘 (ii)
-       (「閉じる対象が無いなら呼ばない」). This is the fix for the msg-2024
-       measurement (153 close_refused/day against threads that never existed).
+    1. **Precheck** via :func:`_alert_thread_state`. Three-value:
+       - :attr:`_AlertThreadState.ABSENT` — the thread was never opened for
+         this project. Return ``CloseResult(was_open=False)`` immediately;
+         no write-shaped call is issued (msg-2027 §設計側の指摘 (ii): 「閉
+         じる対象が無いなら呼ばない」).
+       - :attr:`_AlertThreadState.RESOLVED` — the thread exists and its
+         status is already ``resolved``. Return ``CloseResult(was_open=False,
+         resolved_by_msg=...)`` immediately; NO write-shaped call is issued.
+         This is the direct fix for L-B in the incident report (Bohr
+         msg-2456 §5): the old two-value precheck missed this state and
+         issued a doomed close on every tick (338/day across playproof /
+         lexora — measured 2026-09-03).
+       - :attr:`_AlertThreadState.OPEN` — the thread exists and is not
+         resolved. Proceed to the write.
     2. **Close call**. Payload uses magickit's current
        ``chatroom_close_thread`` schema: ``author`` (not ``owner``),
        ``summary_content`` (not ``decide_content``), and ``embodiment``
@@ -623,55 +888,65 @@ async def close_alert(
        the predicate will actually fire when the carve-out lands rather than
        silently missing it.
 
-    Swallowed envelopes at the close call (idempotent no-op):
-      * "already resolved" / "already closed" — the thread was taken down
-        between the precheck and the close (a human closed it, or a race).
-      * "not found" — same, if the thread disappeared in the race window.
+    **Refusal handling — the design's core rule** (Bohr msg-2458 §2, adopted
+    after Einstein msg-2457's invariant blocking). If the close call raises
+    :class:`MagickitMcpError`, this function **does not inspect the
+    exception**. It calls :func:`_read_thread_reading_or_none` and asks a
+    single question: is the observed status ``resolved``? Only that one
+    outcome — the target state has actually been reached in the world —
+    swallows the refusal (``CloseResult(was_open=False,
+    resolved_by_msg=...)``). Every other outcome raises
+    :class:`GateBootstrapCloseError`:
 
-    Swallowed envelope at the precheck call (idempotent no-op):
-      * "not found" — no thread was ever opened for this project; the
-        desired end-state is already the case.
+      * ``status == "active"`` / ``"awaiting_reply"`` — target state not
+        reached; the refusal is real.
+      * ``status == "superseded"`` / ``"parked"`` — semantics are unmeasured
+        (Bohr msg-2460 §4). The safe direction is raise, not a guess about
+        whether the state counts as "closed enough".
+      * Any other status (unknown / malformed / a future addition) — same
+        conservative direction.
+      * :attr:`_AlertThreadState.ABSENT` — cannot be positively observed at
+        the read-back (would require the same envelope-name filter this
+        design avoids), so it too raises. The frequency floor here is small:
+        the precheck already handled ABSENT for the common case; only a
+        TOCTOU race (precheck saw OPEN, close saw absent) reaches here, and
+        the next tick's precheck re-classifies to ABSENT (1 loud line, then
+        silence).
+      * Read-back itself refused / transport failure — the target state
+        could not be confirmed ∴ raise (fail-closed).
 
-    Any other envelope — at either the precheck OR the close boundary —
-    raises :class:`GateBootstrapCloseError` (the payload is preserved via
-    chained exception) so a permission fault surfaces loudly rather than
-    being read as success. Both boundaries must satisfy this invariant, or
-    a read-side permission fault at the precheck would silently propagate
-    as ``MagickitMcpError`` and every alert would fail closed without
-    reaching the msg-1968 obligation's failure surface.
+    **Discharge of the earlier follow-up marker** (former substring branch —
+    `"already resolved" in str(exc).lower()`). The origin/main comment there
+    declared a "discharge condition, one call: close an already-resolved
+    thread once, record the envelope's ``error_type``". That measurement was
+    made (Bohr msg-2456 §2, incident report, 2026-09-03): the observed
+    envelope carries ``error_type='ChatroomStateError'`` and the ``error``
+    text ``"Cannot close thread '<id>' in status='resolved'"``. The measured
+    value is **recorded** here for the next reader, and **not used as a
+    predicate**:
 
-    The not-found swallow is decided by **field equality on the envelope's own
-    classification key** — :func:`_is_thread_not_found_envelope` compares
-    :attr:`~spirrow_mindwire.magickit.client.MagickitMcpError.error_type`,
-    which :func:`~spirrow_mindwire.magickit.client.raise_if_envelope` captures
-    from the parsed payload before any of it is formatted into the exception
-    message. No search of ``str(exc)`` is performed at either boundary.
+        The comment's proposal was to convert both substring branches to
+        ``exc.error_type == "<Name>"`` equality. Einstein msg-2457 blocked
+        that shape on the invariant grounds that placing a name-based
+        filter at the ENTRY of the refusal branch is an execution-path
+        dependence on the name — a future server rename bypasses the
+        swallow and re-introduces L-A silently. The measurement therefore
+        does not become a predicate: the design instead reads the world
+        after the refusal and asks about the *goal state*. The
+        ``error_type`` measurement is preserved above so a future reader
+        does not repeat the measurement, and so no reader mistakes its
+        absence for "we do not know the value".
 
-    This is the fix for the PR-gate objection on head ``523d400``, and for the
-    earlier one on ``9b023fe`` that it superseded. Both prior rounds matched a
-    substring of the flattened message; the flatten mixes the machine-owned
-    ``error_type`` with the server's free-form ``error`` prose, so a permission
-    fault whose text reads "role 'orchestrator' not found in closeable_roles"
-    (round 2) or one whose text merely quotes ``error_type='ChatroomNotFound
-    Error'`` (round 3) was classified benign and swallowed. Reading the field
-    before the flatten is what removes that whole class, rather than trading
-    one forgeable needle for a longer one.
-
-    Precisely what now holds: no part of the envelope other than its own
-    top-level ``error_type`` key can produce the swallow, and a transport
-    failure — which carries no envelope at all — never can. What does **not**
-    hold, and is not claimed: that conclair's classification is itself correct.
-    A server that labelled a permission fault ``ChatroomNotFoundError`` would
-    still be believed. That is the one trust this contract takes, and it is
-    narrower than trusting anything the server wrote in prose.
-
-    Both boundaries route through the same
-    :func:`_is_thread_not_found_envelope` call — one predicate, two
-    swallows, no divergence hazard (Bohr §5 併せて 1 点).
+    Both boundaries — the precheck read AND the post-refusal read-back —
+    obey the ONE failure surface: a read fault at the precheck surfaces as
+    :class:`GateBootstrapCloseError` (below); a refusal-plus-unconfirmed-
+    state at the write also surfaces as :class:`GateBootstrapCloseError`.
+    The operator sees one exception class for "the close contract could not
+    be discharged".
     """
     thread_id = thread_id_for(project)
     try:
-        thread_exists = await _alert_thread_exists(mcp, project=project, thread_id=thread_id)
+        reading = await _alert_thread_state(mcp, project=project, thread_id=thread_id)
     except MagickitMcpError as exc:
         # Any non-"not found" envelope at the read boundary is a genuine
         # fault (permission / transport / auth). Surface it loudly through
@@ -680,8 +955,20 @@ async def close_alert(
         raise GateBootstrapCloseError(
             f"chatroom_get_thread precheck refused for {thread_id!r} in project {project!r}: {exc}"
         ) from exc
-    if not thread_exists:
+
+    if reading.state == _AlertThreadState.ABSENT:
         return CloseResult(thread_id=thread_id, was_open=False)
+    if reading.state == _AlertThreadState.RESOLVED:
+        # Target state already reached — return without issuing any write.
+        # ``resolved_by_msg`` surfaces into the tick's JSON output so the
+        # operator sees WHO resolved the thread (incident report §2 named
+        # this observation as the ground truth).
+        return CloseResult(
+            thread_id=thread_id,
+            was_open=False,
+            resolved_by_msg=reading.resolved_by_msg,
+        )
+
     summary = _format_close_decide(project=project, merge_commit_sha=merge_commit_sha)
     payload: dict[str, Any] = {
         "project": project,
@@ -694,37 +981,27 @@ async def close_alert(
     try:
         await mcp.call_tool("chatroom_close_thread", payload)
     except MagickitMcpError as exc:
-        # not-found: the SAME predicate object as the precheck (Bohr msg-2139
-        # §5 "併せて 1 点"). Both boundaries route through
-        # :func:`_is_thread_not_found_envelope`; any future change to the
-        # matcher affects both by construction.
-        if _is_thread_not_found_envelope(exc):
-            return CloseResult(thread_id=thread_id, was_open=False)
-        # The already-* swallow below is still a free-form substring match, and
-        # that is a weaker predicate than the one directly above it. Recorded
-        # deliberately rather than left for a reader to notice (Bohr msg-2383
-        # §3 R-iii):
-        #
-        #   The stronger technique is available and would be preferable here
-        #   too — the same ``exc.error_type == "<Name>"`` equality. It is NOT
-        #   taken because the ``error_type`` conclair emits for an
-        #   already-resolved close has never been measured, and a guessed name
-        #   would be strictly worse than this substring: a wrong name matches
-        #   nothing, silently and forever, whereas the substring at least
-        #   matches the case it was written for. Discharge condition, one call:
-        #   close an already-resolved thread once, record the envelope's
-        #   ``error_type``, then convert this branch and ``open_alert``'s
-        #   "already exists" branch (same class of predicate, same discharge).
-        #
-        # The hazard is also smaller here than it was for not-found, which is
-        # why this is a follow-up and not a blocker: an "already resolved" text
-        # cannot plausibly be emitted by an unrelated permission or transport
-        # fault, whereas "not found" demonstrably could.
-        message = str(exc).lower()
-        if "already resolved" in message or "already closed" in message:
-            return CloseResult(thread_id=thread_id, was_open=False)
+        # Do not inspect the exception. Read the world; ask a single
+        # question about close_alert's target state ("thread is resolved").
+        # Bohr msg-2458 §2 as adopted after Einstein msg-2457 invariant
+        # blocking. The former substring branches
+        # (``"already resolved"`` / ``"already closed"``) and the fallback
+        # plan of ``error_type == "ChatroomStateError"`` are BOTH replaced
+        # by this one predicate, and the measured value of that error_type
+        # (2026-09-03: ``"ChatroomStateError"``) is recorded in the docstring
+        # above but deliberately NOT used as a filter (rationale there).
+        recheck = await _read_thread_reading_or_none(mcp, project=project, thread_id=thread_id)
+        if recheck is not None and recheck.state == _AlertThreadState.RESOLVED:
+            return CloseResult(
+                thread_id=thread_id,
+                was_open=False,
+                resolved_by_msg=recheck.resolved_by_msg,
+            )
+        observed = _describe_reading(recheck)
         raise GateBootstrapCloseError(
-            f"chatroom_close_thread refused for {thread_id!r} in project {project!r}: {exc}"
+            f"chatroom_close_thread refused for {thread_id!r} in project {project!r} "
+            f"and post-refusal read-back did not confirm target state 'resolved' "
+            f"({observed}). Original refusal: {exc}"
         ) from exc
     return CloseResult(thread_id=thread_id, was_open=True)
 
