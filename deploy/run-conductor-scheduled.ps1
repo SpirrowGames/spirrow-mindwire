@@ -93,13 +93,28 @@ $StarvedThreshold         = [TimeSpan]::FromHours(24)
 $SessionLogTailLines  = 50
 
 # T-digest-exceeds-discord-limit-and-is-dropped D-1: the digest renderer owns a fixed payload budget,
-# so the delivered message length is DECOUPLED from the queue length. 3,500 is well under the
-# `content` 2,000 hard limit AND under the `embed.description` 4,096 limit, giving room for either
-# transport. This is not a "how big can Discord take?" number — Discord's actual limits may change;
-# the invariant this constant defends is "the renderer emits ≤ this many characters, and any excess
-# collapses to `+N 件` rather than to a 400". (Bohr msg-2099 §0 / D-1 — msg-2013 sent 63 sequential
-# 400s because the ONLY defense was "hope the queue stays short.")
-$DigestBudget = 3500
+# so the delivered message length is DECOUPLED from the queue length. The invariant this constant
+# defends is "the renderer emits ≤ this many characters, and any excess collapses to `+N 件` rather
+# than to a 400". (Bohr msg-2099 §0 / D-1 — msg-2013 sent 63 sequential 400s because the ONLY
+# defense was "hope the queue stays short.")
+#
+# The number must be ≤ the limit of the transport the digest ACTUALLY ships on. Send-Notification
+# posts `content` (see the `@{ content = $Message }` payload), whose hard limit is 2,000 — the same
+# limit $DecisionMessageDiscordBudget already names, and 1950 is the margin that constant already
+# chose. Keep the two in step.
+#
+# Regression (Einstein msg-2396 E-2, Bohr msg-2401 §3, both measured on live state): this was 3,500,
+# chosen on the assumption the digest would move to `embed.description` (4,096). The transport move
+# never happened, so every full digest from #203 (b8b6a64) onward rendered 3,2xx chars and was
+# rejected 400 — measured 3257 on 2026-09-01 and 3272 on 2026-09-02, with only the 78-char degraded
+# fallback reaching the operator. The comment that stood here asserted "3,500 is well under the
+# `content` 2,000 hard limit", which is false as arithmetic; it is deleted rather than renumbered.
+#
+# Not fixed by raising the budget to a bigger transport: "the queue does not fit, so enlarge the
+# budget" is the manufacturing process for this whole defect class (Bohr msg-2401 §3-2). The budget
+# is what the transport accepts, never what we wish to list; not fitting is the truncation ladder's
+# job, and it has one.
+$DigestBudget = 1950
 
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 / §4 (msg-2106): the daily digest is period-gated,
 # not interval-gated. Runs once per LOCAL day at or after this wall-clock time — that is the promise
@@ -127,11 +142,13 @@ $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
 $evaluatedStatePath = Join-Path $dataDir "state\evaluated.json"
 $digestStatePath = Join-Path $dataDir "state\digest.json"
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): notify-health carries just enough to
-# derive the ⚠ line ("full digest is X periods overdue") from a single field — last_full_success_period.
-# Deliberately does NOT carry a `consecutive_failures` counter (Einstein msg-2102 §1 → Bohr msg-2103):
-# an unstored value cannot be miscleared by a degraded delivery, so the state minimisation IS the fix.
-# Remaining fields (last_attempt_at / last_error / last_error_class) are DIAGNOSTIC ONLY — the ⚠ predicate
-# consults ONLY the period id (D-6 predicate-discipline).
+# derive the ⚠ line ("full digest is X periods overdue") from period-typed fields —
+# last_full_success_period and first_attempt_period. Two, not one: a success record alone cannot
+# express "has never succeeded", which is the state the ⚠ most needs to report (E-4, see
+# Get-DigestPeriodsMissed). Deliberately does NOT carry a `consecutive_failures` counter (Einstein
+# msg-2102 §1 → Bohr msg-2103): an unstored value cannot be miscleared by a degraded delivery, so the
+# state minimisation IS the fix. Remaining fields (last_attempt_at / last_error / last_error_class)
+# are DIAGNOSTIC ONLY — the ⚠ predicate consults ONLY period ids (D-6 predicate-discipline).
 $notifyHealthPath = Join-Path $dataDir "state\notify-health.json"
 # Composer cache (T-decision-request-composer S2). One row per parked thread key,
 # keyed by the same "project/thread_id" the notified.json / evaluated.json use so a
@@ -795,23 +812,46 @@ function Test-DigestDeliveryDue {
     return $local.TimeOfDay -ge $DeliveryTime
 }
 
-# Compute the "periods missed since last full success" from health state. Returns 0 when the last
-# full success was in the current or previous period (healthy jitter) or when no history exists
-# (initial state — do not alarm on first run).
+# Compute the "periods missed since the operator was last told the queue" from health state.
 #
 # Uses date arithmetic on the parsed period ids so daylight-savings transitions do not skew the
 # count. The predicate is "the number of local calendar days elapsed", which is the same thing an
-# operator counts on a wall calendar; no time-difference math is involved.
+# operator counts on a wall calendar; no time-difference math is involved. D-6 predicate discipline
+# holds: every field this reads is period-typed. `last_attempt_at` / `last_error*` stay display-only.
+#
+# TWO histories, because "no success recorded" has two meanings and conflating them is fail-open
+# (Einstein msg-2396 E-4, accepted whole by Bohr msg-2401 §5):
+#
+#   * `LastFullSuccessPeriod` present — a full digest HAS landed before. Missed = the periods
+#     between then and now: delta ≤ 1 is healthy (today's send follows yesterday's success).
+#   * absent, `FirstAttemptPeriod` present — the digest has been ATTEMPTED and has NEVER once
+#     landed. Every period from the first attempt up to (not including) the current one is a period
+#     the operator was not told: missed = delta. Note this is one more than the branch above for
+#     the same delta, and correctly so — there the boundary period succeeded, here it failed.
+#   * both absent — genuinely nothing has ever been attempted. 0, do not alarm on a first run.
+#
+# What this closes: `last_full_success_period` records a SUCCESS EDGE, so a system that has never
+# succeeded has no record to read, and the old rule read that emptiness as "healthy first run". The
+# ⚠ therefore went permanently dark in the exact state it exists to report — measured on live
+# `state/notify-health.json`, which carried only last_error / last_error_class / last_attempt_at for
+# the whole of the #203 regression. A level condition ("has not succeeded") cannot be derived from
+# an edge record alone; `first_attempt_period` supplies the missing lower bound.
 function Get-DigestPeriodsMissed {
-    param([string]$CurrentPeriod, [string]$LastFullSuccessPeriod)
-    if (-not $LastFullSuccessPeriod) { return 0 }
+    param([string]$CurrentPeriod, [string]$LastFullSuccessPeriod, [string]$FirstAttemptPeriod)
+    $anchor = if ($LastFullSuccessPeriod) { $LastFullSuccessPeriod } else { $FirstAttemptPeriod }
+    if (-not $anchor) { return 0 }
     try {
         $cur = [datetime]::ParseExact($CurrentPeriod, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
-        $last = [datetime]::ParseExact($LastFullSuccessPeriod, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        $from = [datetime]::ParseExact($anchor, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
     } catch { return 0 }
-    $delta = ($cur - $last).Days
-    if ($delta -le 1) { return 0 }  # 1 = healthy (today's send follows yesterday's success)
-    return ($delta - 1)             # 2 = missed 1, 4 = missed 3, ...
+    $delta = ($cur - $from).Days
+    if ($LastFullSuccessPeriod) {
+        if ($delta -le 1) { return 0 }  # 1 = healthy (today's send follows yesterday's success)
+        return ($delta - 1)             # 2 = missed 1, 4 = missed 3, ...
+    }
+    # Never-succeeded branch: the anchor period itself is a period that failed, so it counts.
+    if ($delta -lt 1) { return 0 }      # 0 = the first attempt is happening right now
+    return $delta                       # 1 = missed 1, 3 = missed 3, ...
 }
 
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): the ⚠ line is DERIVED from
@@ -824,11 +864,21 @@ function Get-DigestHealthWarning {
     param([hashtable]$Health, [string]$CurrentPeriod)
     $lastFull = $null
     if ($Health -and $Health.ContainsKey('last_full_success_period')) { $lastFull = $Health['last_full_success_period'] }
-    $missed = Get-DigestPeriodsMissed -CurrentPeriod $CurrentPeriod -LastFullSuccessPeriod $lastFull
+    $firstAttempt = $null
+    if ($Health -and $Health.ContainsKey('first_attempt_period')) { $firstAttempt = $Health['first_attempt_period'] }
+    $missed = Get-DigestPeriodsMissed -CurrentPeriod $CurrentPeriod `
+                                      -LastFullSuccessPeriod $lastFull -FirstAttemptPeriod $firstAttempt
     if ($missed -lt 1) { return $null }
     $errClass = $null
     if ($Health -and $Health.ContainsKey('last_error_class')) { $errClass = $Health['last_error_class'] }
     $errSuffix = if ($errClass) { " / 直近: $errClass" } else { '' }
+    # Two wordings, because the two states call for different operator action: "it stopped working"
+    # sends you to what changed, "it has never worked" sends you to the wiring. The old single
+    # wording could not even render the second — it interpolated an empty $lastFull into
+    # "（最後の成功 ）", which is the shape of a bug report about the warning rather than a warning.
+    if (-not $lastFull) {
+        return "⚠ フル digest は一度も配送できていません（$missed 期間連続 / 初回試行 $firstAttempt$errSuffix）"
+    }
     return "⚠ フル digest が $missed 期間配送できていません（最後の成功 $lastFull$errSuffix）"
 }
 
@@ -3142,6 +3192,25 @@ try {
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest
 
+            # The lower bound the ⚠ predicate needs in order to distinguish "never succeeded" from
+            # "first run" (Einstein msg-2396 E-4 / Bohr msg-2401 §5). Period-typed, so D-6's
+            # predicate discipline still holds on the read side; write-once, so it records the FIRST
+            # attempt and not the latest. Unconditional: evaluated on every attempt whatever the
+            # outcome turned out to be — unlike last_full_success_period below, which is gated on a
+            # full success. What carries that is NOT statement order, so the durability boundary is
+            # stated here rather than implied: this field and the rest of the record reach disk
+            # through the single Save-JsonState at the end of this branch, and Send-Notification
+            # does not rethrow — its catch converts the failure into a result hashtable ("NEVER
+            # fail the sweep because the notifier failed"), and all it runs before that try is a
+            # webhook-presence test plus Confirm-LogWorthKeeping, which the Write-Log above has
+            # already committed so it returns immediately. So a failing attempt still runs this
+            # block down to that save. Moving the assignment above the send would change nothing
+            # about what survives a crash, while implying a crash-ordering guarantee the single
+            # save does not give; PR #215 gate round 1 asked for that move, Bohr msg-2418 §2
+            # refuted it on those two facts.
+            if (-not $notifyHealth.ContainsKey('first_attempt_period') -or -not $notifyHealth['first_attempt_period']) {
+                $notifyHealth['first_attempt_period'] = $currentPeriod
+            }
             # Diagnostic fields (D-6 predicate discipline: recorded but NEVER consulted by the ⚠
             # predicate). Written on every attempt regardless of outcome.
             $notifyHealth['last_attempt_at'] = $nowUtc.ToString("o")
