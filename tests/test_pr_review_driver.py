@@ -1996,9 +1996,10 @@ def test_d7_does_not_fire_on_honest_blocks_or_on_trailing_prose() -> None:
     ordinary cases, which would make the derived read useless as a measurement (rider 2 reads
     the divergence between derived and posted; a defense that fires constantly saturates it).
     Trailing prose after the block is explicitly still legal — D-4 stayed dropped. Only a
-    chained array OF OBJECTS is refused: a bracket in trailing prose that does not open a
-    valid JSON list is not one, and neither is a list that holds no object (it could not have
-    been the model's block, so it can hide nothing).
+    chained array that CLAIMS AN OBJECTION CLASS is refused: a bracket in trailing prose that
+    does not open a valid JSON list is not one, and neither is a list whose elements carry no
+    ``class`` key (the element loop reads ``class`` and nothing else to recognise an objection,
+    so such a list could not have been the model's block and can hide nothing).
     """
     blocking = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
     ok_cases = {
@@ -2042,7 +2043,8 @@ def test_d7_does_not_fire_on_honest_blocks_or_on_trailing_prose() -> None:
         report = parse_objections(body)
         assert report.status is ObjectionParse.EMPTY, (
             f"{label}: an honest empty block must still derive APPROVE — D-7 refuses a "
-            f"chained array OF OBJECTS, not an empty one; got {report.status.value} "
+            f"chained array that claims an objection class, not an empty one; "
+            f"got {report.status.value} "
             f"missing_reason={report.missing_reason}"
         )
         assert derive_verdict(report) is ReviewEvent.APPROVE, label
@@ -2054,38 +2056,60 @@ def test_d7_does_not_fire_on_honest_blocks_or_on_trailing_prose() -> None:
         pytest.param("As noted in the literature [1], this is fine.", id="citation-[1]"),
         pytest.param('my_dict["key"] appears in the diff', id="subscript-[key]"),
         pytest.param("compare rows [1, 2] of the table", id="list-literal-[1,2]"),
+        pytest.param(
+            'Consider structuring the payload like this: [{"port": 80}]',
+            id="dict-literal-[{port}]",
+        ),
+        pytest.param(
+            'the shape is {"items": [{"port": 80}]} in the config',
+            id="dict-literal-nested-in-object",
+        ),
     ],
 )
-def test_d7_ignores_bracketed_prose_that_is_not_an_object_array(tail: str) -> None:
-    """D-7 draws its line at "could this have been the block?", not at "is it non-empty?".
+def test_d7_ignores_bracketed_prose_that_does_not_claim_an_objection_class(tail: str) -> None:
+    """D-7 draws its line at "could this have been the block?", not at "does it look like data?".
 
-    The three shapes below are the ones the round-1 gate (msg-2406) and msg-2413 §1 measured
+    The first three shapes are the ones the round-1 gate (msg-2406) and msg-2413 §1 measured
     misfiring on the ``and chained`` predicate this PR first shipped: a citation ``[1]``, a
-    subscript ``my_dict["key"]``, and a list literal ``[1, 2]``. All three are ordinary
-    English/code prose, and none of them can hide an objection — the schema is a flat list of
-    flat OBJECTS, so had the parser read any of them as the block, every element would have
-    been counted unknown-class and the verdict derived REQUEST_CHANGES anyway. Refusing them
-    therefore buys no attack coverage and costs a false RC on everyday critiques, which is the
-    signal rider 2 is calibrating against.
+    subscript ``my_dict["key"]``, and a list literal ``[1, 2]``. The last two are the ones the
+    round-3 gate (msg-2428) found still misfiring one notch later, on ``any dict``: an ordinary
+    list of dicts, and the same list nested inside an object — which reaches the predicate
+    because the loop re-enters at ``probe = bracket + 1`` and finds the inner ``[``.
 
-    Both exit paths are pinned, because the shipped predicate broke both: with an honest
-    EMPTY block the critique became MISSING instead of EMPTY (the gate's report), and with an
-    honest BLOCKING block it became MISSING instead of OK (one notch wider than the gate
-    found — same defect, but it corrupts the RC path's *reason* as well as the APPROVE path's
-    *verdict*).
+    None of the five can hide an objection, and the reason is the same for all of them: the
+    element loop in ``parse_objections`` reads ``element.get("class")`` and nothing else to
+    recognise an objection, so an element with no ``class`` key is counted unknown-class exactly
+    like a non-dict element. Had the parser read any of these as the block it would have derived
+    REQUEST_CHANGES anyway (measured, one parse each). Refusing them therefore buys no attack
+    coverage and costs a false RC on everyday critiques, which is the signal rider 2 is
+    calibrating against.
 
-    NEGATIVE CONTROL (msg-2397 M6), run before this test was written: restoring the predicate
-    to ``isinstance(chained, list) and chained`` reds all three parametrisations, while
-    ``test_d7_chained_array_after_a_decoy_empty_block_is_refused`` (the attack pins) stays
-    green under both predicates — which is the point: the change gives up no attack coverage.
+    All THREE primaries are exercised, because they take different paths. Blocking and advisory
+    both parse into a report and exit through call site (b); empty exits through call site (a);
+    and of the three only blocking skips the scan (the caller contract). So the advisory case is
+    the one that proves the predicate itself — not the primary-aware skip — is what keeps these
+    tails from firing.
+
+    NEGATIVE CONTROL (msg-2397 M6), run before this test was written, on all five tails:
+    restoring the predicate to ``isinstance(chained, list) and chained`` reds all five, since it
+    is wider than both later shapes; restoring it to ``any(isinstance(e, dict) ...)`` — the shape
+    shipped at 82e50fb — reds the last two and only those, and reds them under the EMPTY and
+    ADVISORY primaries only: under a blocking primary they stay green either way, because the
+    scan never runs there. Meanwhile
+    ``test_d7_chained_array_after_a_decoy_empty_block_is_refused`` and
+    ``test_d7_refuses_a_chained_array_that_claims_a_class_but_little_else`` (the attack pins)
+    stay green under every one of those predicates — which is the point: the narrowing gives up
+    no attack coverage.
     """
     blocking = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
-    ok_body = f"{_OBJECTIONS_SENTINEL}\n{blocking}\n\n{tail}\n\nVERDICT: REQUEST_CHANGES"
-    report = parse_objections(ok_body)
-    assert report.status is ObjectionParse.OK, (
-        f"after an honest blocking block: D-7 must not fire; got {report.status.value} "
-        f"missing_reason={report.missing_reason}"
-    )
+    advisory = f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "reads oddly"}}]'
+    for label, primary in (("blocking", blocking), ("advisory-only", advisory)):
+        body = f"{_OBJECTIONS_SENTINEL}\n{primary}\n\n{tail}\n\nVERDICT: REQUEST_CHANGES"
+        report = parse_objections(body)
+        assert report.status is ObjectionParse.OK, (
+            f"after an honest {label} block: D-7 must not fire; got {report.status.value} "
+            f"missing_reason={report.missing_reason}"
+        )
     empty_body = f"{_OBJECTIONS_SENTINEL}\n[]\n\n{tail}\n\nVERDICT: APPROVE"
     report = parse_objections(empty_body)
     assert report.status is ObjectionParse.EMPTY, (
@@ -2095,6 +2119,60 @@ def test_d7_ignores_bracketed_prose_that_is_not_an_object_array(tail: str) -> No
     assert derive_verdict(report) is ReviewEvent.APPROVE
 
 
+def test_d7_refuses_a_chained_array_that_claims_a_class_but_little_else() -> None:
+    """The predicate's LOWER bound: ``class`` is required, and nothing beyond it may be.
+
+    The upper bound (the test above) is the one the gate keeps finding, so the pressure on this
+    predicate is all in the "be stricter" direction. This test is the counter-pressure, and it
+    exists because both of the obvious next notches were measured OPEN before the line was drawn
+    where it is (msg-2429 §3):
+
+    * Requiring the chained element's class to be IN the vocabulary lets a MISSPELLED class
+      through. The parser reads such an array as unknown-class → blocking, i.e. it is exactly an
+      array that "could have been the block", so letting it chain behind a decoy derives APPROVE.
+    * Additionally requiring ``where`` AND ``evidence`` lets a blocking class with no evidence
+      through. That one is worse than an evasion: ``parse_objections`` refuses, on the primary
+      side, to demote an unevidenced blocking objection — precisely so that "write no evidence"
+      cannot become the cheapest way to soften a verdict — and demanding evidence here would
+      reinstate that inversion on the chained side. (Requiring ``where`` OR ``evidence`` instead
+      of both opens nothing; it is the conjunction that is unsafe, not the mention of the keys.)
+
+    NEGATIVE CONTROL (msg-2397 M6), run before this test was written, and the reason both cases
+    are here rather than one: with the predicate restored to "class must be in the vocabulary"
+    the FIRST case goes red and the second stays green; with it restored to "class plus where
+    plus evidence" the SECOND goes red and the first stays green. Neither restoration reds the
+    test above, and no restoration reds the attack pins. So the two bounds are independent, and
+    each notch of narrowing has its own witness.
+    """
+    real_class = _blocking_class()
+    misspelled = real_class[:3] + real_class[4:]  # one character deleted — a plausible typo
+    assert misspelled != real_class and misspelled not in objection_classes(), (
+        "this fixture needs a class name that is a near-miss of a real one and is NOT known"
+    )
+    chained = {
+        "class outside the vocabulary (a misspelling)": (
+            f'[{{"class": "{misspelled}", "where": "a.py:1", "evidence": "n is 0"}}]'
+        ),
+        "blocking class carrying no evidence": f'[{{"class": "{real_class}", "where": "a.py:1"}}]',
+    }
+    # Both cases are evaluated before anything is asserted, so a restoration that opens ONE of
+    # the two bounds names which one in the failure text. Short-circuiting on the first would
+    # make the per-notch claim in the docstring above unverifiable from this test's output.
+    opened: list[str] = []
+    for label, block in chained.items():
+        body = f"{_OBJECTIONS_SENTINEL}\n[]\n\nand the real block:\n\n{block}\n\nVERDICT: APPROVE"
+        report = parse_objections(body)
+        if report.status is not ObjectionParse.MISSING:
+            opened.append(f"{label} (got {report.status.value})")
+            continue
+        assert report.missing_reason is ObjectionMissingReason.BAD_JSON, label
+        assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES, label
+    assert not opened, (
+        "each of these arrays is one the parser ITSELF reads as blocking, so chaining it behind "
+        "a decoy must be refused; the predicate let through: " + "; ".join(opened)
+    )
+
+
 def test_d7_scans_the_remainder_only_when_the_primary_read_derives_approve() -> None:
     """D-7 is primary-aware: the scan runs on the APPROVE-deriving branches and nowhere else.
 
@@ -2102,7 +2180,7 @@ def test_d7_scans_the_remainder_only_when_the_primary_read_derives_approve() -> 
     human". That attack needs the parser to arrive at APPROVE, so the remainder only matters
     when the primary read would. Scanning unconditionally — the shape this PR shipped before
     msg-2425 §6 — bought no attack coverage and cost a false RC on the honest case below, where
-    a blocking critique quotes a schema-shaped array in its own prose. A critique ABOUT this
+    a blocking critique quotes a real objection array in its own prose. A critique ABOUT this
     parser is the realistic instance, and it has already happened: msg-2413 §1 measured the
     gate's own round-1 review self-jamming on exactly this input.
 
@@ -2133,7 +2211,7 @@ def test_d7_scans_the_remainder_only_when_the_primary_read_derives_approve() -> 
     )
     report = parse_objections(quoting)
     assert report.status is ObjectionParse.OK, (
-        "a blocking critique that quotes a schema-shaped array must not self-jam: its primary "
+        "a blocking critique that quotes a real objection array must not self-jam: its primary "
         f"already derives RC, so the scan buys nothing; got {report.status.value} "
         f"missing_reason={report.missing_reason}"
     )

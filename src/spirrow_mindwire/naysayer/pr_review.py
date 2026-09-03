@@ -661,7 +661,7 @@ def _chains_another_block(rest: str) -> bool:
     later array is the fail-open ``find("[")`` shape D-3 already rejects). This does not
     contradict V-1: trailing text is still not *consumed*, it is *inspected*, and its presence
     disqualifies the block. D-4 stays dropped — arbitrary prose after the block is still legal,
-    only a chained OBJECT ARRAY is refused.
+    only a chained array that CLAIMS AN OBJECTION CLASS is refused.
 
     **CALLER CONTRACT (msg-2425 §6): ask this only when the primary read derives APPROVE.**
     :func:`parse_objections` calls it at exactly two places, both of them on that branch — the
@@ -670,25 +670,90 @@ def _chains_another_block(rest: str) -> bool:
     defends against needs the parser to reach APPROVE: a primary with a blocking objection
     derives REQUEST_CHANGES no matter what follows it, so a refusal there buys zero bits, and an
     attacker who plants a blocking objection in order to stop the scan has thereby produced the
-    REQUEST_CHANGES he was trying to avoid. DEPENDENCY, stated so the next person to move it
-    sees it: this reasoning rests entirely on :func:`derive_verdict` mapping "any blocking
-    objection" to REQUEST_CHANGES. If that function ever derives APPROVE with a blocking
-    objection present, the skip becomes unsound and both call sites must be revisited.
+    REQUEST_CHANGES he was trying to avoid.
 
-    **Where the predicate's line sits, and why it is not arbitrary** (msg-2413 §3, correcting
-    the "non-empty" narrowing this file shipped at 6b009d9 and the "any list" shape of #206
-    R5/R6). The attack is "show the parser a benign array, show the human the real one", so it
-    only works if the parser COULD have read the later array as the model's block. The schema
-    is a flat list of flat objects, therefore a chained list holding no object hides nothing:
-    ``[]`` adds no objection to what precedes it, and ``[1]`` / ``["key"]`` / ``[1, 2]``, HAD
-    the parser read them as the block, derive UNKNOWN → REQUEST_CHANGES (no element is a dict,
-    so each is counted unknown-class — see the element loop in :func:`parse_objections`). No
-    attacker reaches APPROVE through them, so refusing them buys no coverage and costs a false
-    RC on the ordinary citation, subscript and list literal of everyday prose. Measured on the
-    11-case corpus of msg-2413 §3: "any list" 5/11, "non-empty" 6/11, this predicate 11/11 —
-    all three refusing all three attack cases. False RC is permitted (msg-2385 §2, F) but it is
-    not free: this parser's output IS the shadow measurement rider 2 is calibrating, and a
-    defense that fires on ordinary critiques saturates the signal it instruments.
+    ``report.blocking`` is WIDER than "the model named a blocking class", and the skip covers
+    all of it: an unknown class (including a misspelling), a non-dict or class-less element,
+    and a blocking objection carrying no evidence each set ``blocks=True``, so those primaries
+    skip the scan too. That is the definition working rather than an exception — the only
+    property the skip needs is "this primary already derives REQUEST_CHANGES", which holds for
+    every one of them (measured across this change: derived stays REQUEST_CHANGES in all three
+    shapes, while the reported status sharpens from ``bad-json`` to the specific cause).
+
+    DEPENDENCY, stated so the next person to move it sees it: this reasoning rests entirely on
+    :func:`derive_verdict` mapping "any blocking objection" to REQUEST_CHANGES. That dependency
+    now carries a SECOND load — the predicate's lower bound below rests on the same mapping,
+    because the two arrays that bound it from below (a misspelled class; a blocking class with
+    no evidence) are worth refusing only while the parser still reads them as blocking. If
+    ``derive_verdict`` ever derives APPROVE with a blocking objection present, BOTH the skip and
+    the lower bound become unsound, and both call sites must be revisited.
+
+    **Where the predicate's line sits, and why it is not arbitrary** (msg-2429 §1-§3, correcting
+    the "any object" shape this file shipped at 82e50fb, the "non-empty" narrowing of 6b009d9
+    and the "any list" shape of #206 R5/R6). The attack is "show the parser a benign array, show
+    the human the real one", so it only works if the parser COULD have read the later array as
+    the model's block. Exactly one key decides that, and it is ``class``: the element loop in
+    :func:`parse_objections` reads ``element.get("class")`` and nothing else to tell an objection
+    from noise, so an element that carries no ``class`` key is counted unknown-class exactly like
+    an element that is not a dict at all. A chained list holding nothing that CLAIMS A CLASS
+    therefore hides nothing: ``[]`` adds no objection to what precedes it, and ``[1]`` /
+    ``["key"]`` / ``[1, 2]`` / ``[{"port": 80}]`` / ``[{"id": 1}, {"id": 2}]``, HAD the parser
+    read them as the block, all derive UNKNOWN → REQUEST_CHANGES (measured, one parse each). No
+    attacker reaches APPROVE through them, so refusing them buys no coverage and costs a false RC
+    on the ordinary citation, subscript, list literal AND list-of-dicts of everyday prose.
+
+    Measured on a 76-case corpus (7 attacks; 18 ordinary trailing-prose shapes and 5 dict-literal
+    shapes, each against an empty, an advisory-only and a blocking primary), scored end to end
+    through :func:`parse_objections`:
+
+    ======================================  =========  ============  ============
+    predicate                                  correct   false fires   attacks let
+                                                                              past
+    ======================================  =========  ============  ============
+    ``isinstance(chained, list)``               50/76            26             0
+    ``... and chained``                         52/76            24             0
+    ``... any dict`` (82e50fb)                  64/76            12             0
+    ``... any dict with "class"`` (here)        72/76             4             0
+    ``... any dict whose class is known``       73/76             2             1
+    ======================================  =========  ============  ============
+
+    Two of the false fires in EVERY row are the same input — an honest critique that quotes a
+    REAL objection array, residue 3 below — so the row-to-row deltas are unaffected by whether
+    one counts that inseparable case as a miss. The EIGHT this round removes are the four
+    dict-literal shapes whose objects claim no class, each against the two APPROVE-deriving
+    primaries: ``[{"port": 80}]``, ``[{"name": "a", "value": 1}]``, ``[{"id": 1}, {"id": 2}]``
+    and the same list nested inside an object, ``{"items": [{"port": 80}]}`` — the loop's
+    ``probe = bracket + 1`` re-entry reaches an inner list, so nesting does not hide it. The four
+    that REMAIN are both halves of residue 3 below: ``[{"class": "btn-primary"}]`` (2, an
+    ordinary ``class`` key) and a critique quoting a real objection array (2, inseparable).
+    Under a BLOCKING primary no row false-fires at all — that is the caller contract, not this
+    predicate. False RC is permitted (msg-2385 §2, F) but it is not free: this parser's output IS
+    the shadow measurement rider 2 is calibrating, and a defense that fires on ordinary critiques
+    saturates the signal it instruments.
+
+    **The line is bracketed from BELOW as well, which is why it stops here.** One notch narrower
+    opens a measured fail-open in each of two directions, and both are pinned:
+
+    * **Requiring the class to be IN the vocabulary** lets ``[{"class": "corectness", "where":
+      …, "evidence": …}]`` — a misspelling — chain behind a decoy ``[]`` and derive APPROVE.
+      The parser itself reads that array as unknown-class → blocking, so it is precisely an
+      array that "could have been the block".
+    * **Additionally requiring ``where`` and ``evidence``** lets ``[{"class": <blocking>,
+      "where": "a.py:1"}]`` chain and derive APPROVE. That is not merely an evasion: it
+      reinstates, on the chained side, the inversion ``parse_objections`` refuses on the primary
+      side, where ``NO_EVIDENCE`` deliberately does not demote a blocking objection precisely so
+      that "write no evidence" cannot become the cheapest way to soften a verdict. (Requiring
+      ``where`` OR ``evidence`` rather than both opens neither of these two — measured — so it
+      is the conjunctive form that is unsafe, not the mention of those keys.)
+
+    Both are pinned by :func:`test_d7_refuses_a_chained_array_that_claims_a_class_but_little_else`,
+    which exists so that a later reading of "match the schema more strictly" cannot quietly move
+    the line down. **Measured and NOT adopted:** requiring ``class`` plus (``where`` and
+    ``evidence``, or a known class) scores 74/76 here — better than the predicate above on this
+    corpus, and rejected anyway. It is a condition fitted to the corpus rather than derived from
+    the criterion, and it still lets the one-key misspelling ``[{"class": "corectness"}]`` through
+    (measured: derives APPROVE). ``class`` alone follows from the criterion, because ``class``
+    alone is what the element loop reads.
 
     **WHAT IS LEFT OVER.** Three residues, deliberately kept, in three different senses —
     listed apart because merging them has twice produced a wrong remedy:
@@ -704,7 +769,9 @@ def _chains_another_block(rest: str) -> bool:
        comma, plain prose, a markdown bullet list, YAML, or nothing at all. The scan cannot see
        any of these, and closing the JSON-syntax corner of it is measurably worse than leaving
        it open. Measured on a 35-case corpus (the 11 above plus 24 ordinary review-prose
-       shapes): this predicate scores 35/35 with zero false fires, while fail-closing on a
+       shapes): this predicate scores 35/35 with zero false fires — unchanged by this round's
+       narrowing, since none of those shapes carries a ``class`` key and adding a conjunct can
+       only make the predicate fire on fewer inputs — while fail-closing on a
        remainder ``[`` that does not decode scores 18/35 — 17 false fires, namely markdown
        links ``[text](url)``, type annotations ``list[str]`` / ``Optional[int]``, subscripts
        ``arr[i]``, ``[TODO]``, section references, log timestamps ``[2026-09-03 00:43]`` and
@@ -715,19 +782,33 @@ def _chains_another_block(rest: str) -> bool:
        APPROVE under BOTH shapes (measured, four ways). An attacker who can be told "use single
        quotes" can be told "use prose", which is strictly less control for the same result.
 
-    3. **CLOSED THIS ROUND (msg-2425 §6).** An honest critique that quotes a schema-shaped
-       array in its trailing prose — a critique ABOUT this parser is the realistic case, and
-       msg-2413 §1 measured the gate's own round-1 review self-jamming on it. The caller
-       contract above closes it whenever the critique carries a blocking objection, which is
-       every honest blocking critique. What remains is the APPROVING critique (empty block, or
-       advisory objections only) that quotes such an array. Scope the impossibility claim
-       exactly (msg-2425 §6, correcting msg-2419 §3): no predicate **over the remainder alone**
-       can separate that input from the attack, because the two remainders are byte-identical.
-       The separator that does exist is not in the remainder at all — it is the primary read,
-       which is what the caller contract above uses — and an approving primary is precisely the
-       case where the primary carries no signal, so this last remnant survives. It is a wart of
-       the same family as D-1's re-typed-marker self-jam, with the same loud, human-overridable
-       exit; an approving critique avoids it by placing the example ABOVE the marker.
+    3. **NARROWED TWICE, NOT CLOSED (msg-2425 §6, then msg-2429 §4).** State this one at the
+       predicate's WIDTH, not at its intent — describing it by what it was meant to catch is
+       what produced the two rounds of correction it has already had. The exact remaining
+       surface: an APPROVING primary (an empty block, or advisory objections only) whose
+       remainder contains a JSON array holding at least one object with a ``class`` key. That
+       covers two different things, and only the first is inseparable.
+
+       (i) A critique that quotes a REAL objection array — a critique ABOUT this parser is the
+       realistic case, and msg-2413 §1 measured the gate's own round-1 review self-jamming on
+       it. Scope the impossibility claim exactly (msg-2425 §6, correcting msg-2419 §3): no
+       predicate **over the remainder alone** can separate this from the attack, because the
+       two remainders are byte-identical. The separator that does exist is not in the remainder
+       — it is the primary read, which is what the caller contract above uses — and an approving
+       primary is precisely the case where the primary carries no signal, so this remnant
+       survives by construction.
+
+       (ii) A literal that uses ``class`` as an ordinary key with no relation to objections:
+       ``[{"class": "btn-primary"}]`` in a review of HTML/CSS/Java/ML code. This one IS
+       separable in principle and is not separated: 2/76 on the corpus above, a cost taken
+       knowingly rather than an oversight, because every narrower predicate measured opens a
+       fail-open (see the lower bound above). If shadow measurement ever shows (ii) firing in
+       practice, the fix is NOT a narrower predicate — it is to stop reading the remainder's
+       shape at all (require the block last, the family of D-4, dropped once already), and that
+       is a redesign, not an edit here.
+
+       Both are warts of D-1's re-typed-marker family, with the same loud, human-overridable
+       exit; an approving critique avoids them by placing the example ABOVE the marker.
 
     ``bad_json`` rather than a new :class:`ObjectionMissingReason` member: this is the shape
     #206 lands as ``payload_unparseable`` (which merges ``bad-json`` and ``not-a-list``), so
@@ -744,7 +825,7 @@ def _chains_another_block(rest: str) -> bool:
         except ValueError:
             probe = bracket + 1
             continue
-        if isinstance(chained, list) and any(isinstance(e, dict) for e in chained):
+        if isinstance(chained, list) and any(isinstance(e, dict) and "class" in e for e in chained):
             return True
         probe = bracket + 1
     return False
@@ -817,20 +898,23 @@ def parse_objections(critique: str) -> ObjectionReport:
     invisible — is also an injection surface. A critique that writes a decoy ``[]`` right
     after the marker and its REAL blocking array underneath parses ``EMPTY`` and derives
     APPROVE. Both the chained variant and the prose-separated variant were measured open on
-    ``main``. So the remainder is scanned by :func:`_chains_another_block`: any ``[`` in it
-    that begins a JSON list CONTAINING AT LEAST ONE OBJECT means a chained block, and the
-    parse is refused. A list with no object in it cannot be the model's block — the schema is
-    a flat list of flat objects — and could not have produced APPROVE even if the parser had
-    read it, so refusing it would cost the ordinary ``[1]`` / ``my_dict["key"]`` / ``[]`` of
-    everyday prose and buy nothing. The scan runs on the APPROVE-deriving branches only
-    (msg-2425 §6): an empty primary array, and an assembled report with no blocking objection.
-    That helper's docstring carries the predicate's placement, the caller contract, the
-    :func:`derive_verdict` property the skip depends on, and the three residues.
+    ``main``. So the remainder is scanned by :func:`_chains_another_block`: any ``[`` in it that
+    begins a JSON list HOLDING AT LEAST ONE OBJECT WITH A ``class`` KEY means a chained block,
+    and the parse is refused. A list holding nothing that claims a class cannot be the model's
+    block — ``class`` is the only key the element loop below reads to recognise an objection, so
+    such a list would have been counted unknown-class and derived REQUEST_CHANGES even if the
+    parser HAD read it — and refusing it would cost the ordinary ``[1]`` / ``my_dict["key"]`` /
+    ``[]`` / ``[{"port": 80}]`` of everyday prose while buying nothing (msg-2429 §1). The scan
+    runs on the APPROVE-deriving branches only (msg-2425 §6): an empty primary array, and an
+    assembled report with no blocking objection. That helper's docstring carries the predicate's
+    placement, the corpus that bounds it from ABOVE and the two fail-opens that bound it from
+    BELOW, the caller contract, the :func:`derive_verdict` property the skip depends on, and the
+    three residues.
     This does NOT contradict V-1 — trailing text is still not *consumed*; it is now
     *inspected*, and its presence disqualifies the block rather
     than being selected as the payload (selecting the later array is the fail-open ``find("[")``
     shape D-3 already rejected). D-4 stays dropped: arbitrary prose after the block is still
-    fine, only a chained OBJECT ARRAY is refused.
+    fine, only a chained array that CLAIMS AN OBJECTION CLASS is refused.
 
     **What is NOT done here.** D-2-prime (a non-regression floor on ``gate_verdict``: the derived
     read may never lower the gate below the pre-Stage-1 baseline) is a Stage-2 constraint on
