@@ -2095,6 +2095,75 @@ def test_d7_ignores_bracketed_prose_that_is_not_an_object_array(tail: str) -> No
     assert derive_verdict(report) is ReviewEvent.APPROVE
 
 
+def test_d7_scans_the_remainder_only_when_the_primary_read_derives_approve() -> None:
+    """D-7 is primary-aware: the scan runs on the APPROVE-deriving branches and nowhere else.
+
+    The trailing-list defense exists to stop "benign array for the parser, real array for the
+    human". That attack needs the parser to arrive at APPROVE, so the remainder only matters
+    when the primary read would. Scanning unconditionally — the shape this PR shipped before
+    msg-2425 §6 — bought no attack coverage and cost a false RC on the honest case below, where
+    a blocking critique quotes a schema-shaped array in its own prose. A critique ABOUT this
+    parser is the realistic instance, and it has already happened: msg-2413 §1 measured the
+    gate's own round-1 review self-jamming on exactly this input.
+
+    Skipping the scan under a blocking primary is safe because :func:`derive_verdict` maps any
+    blocking objection to REQUEST_CHANGES: the verdict is already the one an attacker would be
+    trying to avoid, so a refusal there changes nothing, and planting a blocking objection to
+    silence the scan is self-defeating. That dependency on ``derive_verdict`` is named in
+    ``_chains_another_block``'s docstring; if it ever stops holding, this test is where the
+    breakage surfaces.
+
+    The advisory-only case is why the guard reads ``not report.blocking`` rather than
+    ``not parsed``: an advisory objection parses into a NON-EMPTY report that still derives
+    APPROVE, so the window is open and the scan must run. Implementing the guard as "empty
+    primary only" reds that case and nothing else.
+
+    NEGATIVE CONTROL (msg-2397 M6), run before this test was written: with the scan restored to
+    the unconditional form, ONLY the first case below (blocking primary) goes red — the
+    advisory-only case and the empty-primary attack case stay green under both shapes, which is
+    what makes "no attack coverage was traded away" falsifiable rather than asserted.
+    """
+    real = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
+    advisory = f'[{{"class": "{_advisory_class()}", "where": "a.py:1", "evidence": "reads oddly"}}]'
+
+    # CLOSED THIS ROUND. An honest blocking critique may quote the schema in its own prose.
+    quoting = (
+        f"{_OBJECTIONS_SENTINEL}\n{real}\n\nthe injected payload looks like {real} in the "
+        "diff\n\nVERDICT: REQUEST_CHANGES"
+    )
+    report = parse_objections(quoting)
+    assert report.status is ObjectionParse.OK, (
+        "a blocking critique that quotes a schema-shaped array must not self-jam: its primary "
+        f"already derives RC, so the scan buys nothing; got {report.status.value} "
+        f"missing_reason={report.missing_reason}"
+    )
+    assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+    # STILL REFUSED. An advisory-only primary derives APPROVE, so the window is open.
+    advisory_attack = (
+        f"{_OBJECTIONS_SENTINEL}\n{advisory}\n\nand the real block:\n\n{real}\n\nVERDICT: APPROVE"
+    )
+    report = parse_objections(advisory_attack)
+    assert report.status is ObjectionParse.MISSING, (
+        "an advisory-only primary still derives APPROVE, so a chained real block must be "
+        f"refused; got {report.status.value}"
+    )
+    assert report.missing_reason is ObjectionMissingReason.BAD_JSON
+    assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+    # STILL REFUSED. The original attack, re-pinned across the reorder.
+    empty_attack = (
+        f"{_OBJECTIONS_SENTINEL}\n[]\n\nand the real block:\n\n{real}\n\nVERDICT: APPROVE"
+    )
+    report = parse_objections(empty_attack)
+    assert report.status is ObjectionParse.MISSING, (
+        "an empty primary with a chained real block must still be refused; got "
+        f"{report.status.value}"
+    )
+    assert report.missing_reason is ObjectionMissingReason.BAD_JSON
+    assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+
 def test_d6_depth_bound_keeps_the_never_raises_contract_at_both_decode_sites() -> None:
     """D-6 (msg-2380, msg-2397 M7). Over-deep payloads derive MISSING instead of crashing.
 
