@@ -16,11 +16,15 @@ from spirrow_mindwire.github.client import PrRef, PrResolution, PrState
 from spirrow_mindwire.pr_review_sweep.phase0 import (
     GO_THRESHOLD,
     MARGIN_LADDER_SECONDS,
+    OUT_OF_SCOPE_FINISHED,
+    OUT_OF_SCOPE_UNRECOGNISED,
     Bucket,
+    Excluded,
     ThreadFacts,
     Verdict,
     build_report,
     classify,
+    intake_exclusion_reason,
     measurement_offsets_seconds,
     report_to_json,
     sensitivity_table,
@@ -158,11 +162,13 @@ def test_the_cutoff_is_inclusive_matching_the_audit_query() -> None:
 
 
 @pytest.mark.parametrize("status", ["resolved", "superseded", ""])
-def test_statuses_outside_the_liveness_set_fall_through_to_the_union(status: str) -> None:
-    """D-6 verbatim: only ``parked`` / ``active`` / ``awaiting_reply`` can yield C.
+def test_classify_alone_is_not_the_guard_against_a_finished_thread(status: str) -> None:
+    """The S1 catch-all is unchanged; S-pre is what keeps these out (msg-2422 §3.3).
 
-    Recorded rather than "fixed": a resolved thread landing in ``a_union_b`` would inflate the
-    go/no-go, which is why :func:`build_report` also emits the status breakdown.
+    Pinned deliberately. If a later edit tries to "fix" the sweep by teaching
+    :func:`classify` about ``resolved``, the predicate would then hold the population rule
+    as well, and the two would be free to drift. The population rule has exactly one home:
+    :func:`intake_exclusion_reason`.
     """
     facts = _facts(
         status=status,
@@ -170,6 +176,106 @@ def test_statuses_outside_the_liveness_set_fall_through_to_the_union(status: str
         classification_events=(_TERMINAL + timedelta(days=1),),
     )
     assert classify(facts, _closed(), margin=_MARGIN).bucket is Bucket.AB
+    assert intake_exclusion_reason(status) is not None
+
+
+# ------------------------------------------------------------------------------ S-pre
+
+
+@pytest.mark.parametrize("status", ["parked", "active", "awaiting_reply"])
+def test_the_three_live_statuses_enter_the_sweep(status: str) -> None:
+    assert intake_exclusion_reason(status) is None
+
+
+@pytest.mark.parametrize("status", ["resolved", "superseded"])
+def test_a_finished_thread_is_out_of_scope_not_swept(status: str) -> None:
+    """msg-2422 §3.2: it belongs in neither bucket, so it gets no bucket."""
+    assert intake_exclusion_reason(status) == OUT_OF_SCOPE_FINISHED
+
+
+@pytest.mark.parametrize("status", ["", "archived", "ThreadStatus.SIXTH"])
+def test_an_unknown_status_lands_on_the_not_swept_side(status: str) -> None:
+    """The fail-safe. A sixth ``ThreadStatus`` upstream must not become sweepable here.
+
+    The reason differs from a finished thread's on purpose: "this is done" and "we do not
+    know what this is" are different facts, and Phase 2 closes threads irreversibly, so
+    the difference has to survive to the output rather than be flattened into one flag.
+    """
+    assert intake_exclusion_reason(status) == OUT_OF_SCOPE_UNRECOGNISED
+
+
+def test_a_finished_thread_is_not_classified_at_all() -> None:
+    pairs = [
+        (_facts(thread_id="T-live", status="active"), _closed()),
+        (_facts(thread_id="T-done", status="resolved"), _closed()),
+    ]
+    report = build_report(pairs, margin_seconds=300)
+    assert [c.thread_id for c in report.classifications] == ["T-live"]
+    assert report.a_union_b == 1
+    assert [(e.thread_id, e.reason) for e in report.out_of_scope] == [
+        ("T-done", OUT_OF_SCOPE_FINISHED)
+    ]
+
+
+def test_intake_runs_before_s0_so_a_finished_thread_is_not_even_a_c() -> None:
+    """S-pre precedes S0, so an open PR does not pull a finished thread back into C."""
+    pr = PrState(ref=_REF, resolution=PrResolution.OPEN)
+    report = build_report([(_facts(status="resolved"), pr)], margin_seconds=300)
+    assert report.classifications == []
+    assert len(report.out_of_scope) == 1
+
+
+def test_the_sensitivity_table_counts_the_same_population_as_the_headline() -> None:
+    """A table over a wider population would answer a question nobody asked."""
+    pairs = [*_quiescent(6), (_facts(thread_id="T-done", status="resolved"), _closed())]
+    report = build_report(pairs, margin_seconds=300)
+    assert report.a_union_b == 6
+    assert {row["a_union_b"] for row in report.sensitivity} == {6}
+    assert sensitivity_table(pairs) == report.sensitivity
+
+
+def test_exclusions_the_caller_already_made_still_reach_the_report() -> None:
+    """The CLI filters before fetching a PR, so those threads never become pairs."""
+    report = build_report(
+        _quiescent(1),
+        margin_seconds=300,
+        out_of_scope=[Excluded("T-early", "resolved", OUT_OF_SCOPE_FINISHED)],
+    )
+    assert [e.thread_id for e in report.out_of_scope] == ["T-early"]
+    assert report.a_union_b == 1
+
+
+def test_the_status_mix_accounts_for_every_thread_seen() -> None:
+    """``in scope + out of scope`` must add up, so the exclusion is checkable, not trusted."""
+    pairs = [
+        (_facts(thread_id="T-a", status="active"), _closed()),
+        (_facts(thread_id="T-b", status="resolved"), _closed()),
+        (_facts(thread_id="T-c", status="superseded"), _closed()),
+    ]
+    report = build_report(
+        pairs,
+        margin_seconds=300,
+        out_of_scope=[Excluded("T-d", "resolved", OUT_OF_SCOPE_FINISHED)],
+    )
+    assert report.status_breakdown == {"active": 1, "resolved": 2, "superseded": 1}
+    assert sum(report.status_breakdown.values()) == len(report.classifications) + len(
+        report.out_of_scope
+    )
+
+
+def test_the_serialised_report_names_the_excluded_and_does_not_merely_count_them() -> None:
+    report = build_report(
+        [(_facts(thread_id="T-done", status="resolved"), _closed())], margin_seconds=300
+    )
+    payload = report_to_json(report)
+    assert payload["out_of_scope_count"] == 1
+    assert payload["out_of_scope"] == [
+        {
+            "thread_id": "T-done",
+            "thread_status": "resolved",
+            "reason": OUT_OF_SCOPE_FINISHED,
+        }
+    ]
 
 
 def test_an_unmerged_close_is_still_terminal() -> None:

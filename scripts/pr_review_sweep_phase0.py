@@ -17,6 +17,12 @@ Phase 0 also runs under **no author identity** (msg-2177 R-43 ②). None of the 
 tools it may call takes one, and there is nothing for it to sign, because it never
 writes. Do not add an ``identity_name`` here to make some future inbox query convenient.
 
+A thread whose chatroom status is outside ``{parked, active, awaiting_reply}`` is out of
+scope (msg-2422 §3.3) and is filtered here, before S0 — so it costs no GitHub call and no
+event query. It is still reported: ``out_of_scope_count`` and the excluded ``thread_id``
+list are part of the output, because an exclusion nobody can see is the same defect in a
+smaller package.
+
 Two chatroom event queries are issued per candidate thread and MUST NOT be conflated
 (msg-2166 R-25) — see :mod:`spirrow_mindwire.pr_review_sweep.phase0` for why:
 
@@ -49,8 +55,10 @@ from spirrow_mindwire.pr_review_sweep.config import (
 )
 from spirrow_mindwire.pr_review_sweep.phase0 import (
     PROVISIONAL_MARGIN_SECONDS,
+    Excluded,
     ThreadFacts,
     build_report,
+    intake_exclusion_reason,
     report_to_json,
 )
 
@@ -195,15 +203,29 @@ async def _sweep_project(
     github: PrStateReader,
     entry: ProjectEntry,
     margin: timedelta,
-) -> list[tuple[ThreadFacts, PrState]]:
-    """Resolve every ``T-pr-review-<project>-N`` thread in one project."""
+) -> tuple[list[tuple[ThreadFacts, PrState]], list[Excluded]]:
+    """Resolve every ``T-pr-review-<project>-N`` thread in one project.
+
+    Returns the in-scope pairs and the threads S-pre excluded. The exclusions are
+    returned rather than dropped because msg-2422 §3.3 requires them in the output: a
+    silent exclusion is indistinguishable from a thread the sweep never saw.
+    """
     pairs: list[tuple[ThreadFacts, PrState]] = []
+    excluded: list[Excluded] = []
     for thread in await _list_threads(mcp, entry.project):
         thread_id = str(thread.get("thread_id") or "")
         number = entry.pr_number_for_thread(thread_id)
         if number is None:
             continue
         status = str(thread.get("status") or "")
+
+        # S-pre, and it runs BEFORE S0 (msg-2422 §3.3) in the I/O as well as in the
+        # predicate: a finished thread costs no GitHub call and no event query.
+        out_of_scope = intake_exclusion_reason(status)
+        if out_of_scope is not None:
+            excluded.append(Excluded(thread_id, status, out_of_scope))
+            continue
+
         pr = await github.fetch_pr_state(PrRef(entry.owner, entry.repo, number))
 
         if pr.resolution is not PrResolution.CLOSED or pr.closed_at is None:
@@ -235,17 +257,22 @@ async def _sweep_project(
                 pr,
             )
         )
-    return pairs
+    return pairs, excluded
 
 
 async def _run(config: SweepConfig, url: str | None, margin_seconds: int) -> dict[str, Any]:
     margin = timedelta(seconds=margin_seconds)
     mcp = ReadOnlyMcp(StreamableHttpChatroomMcp(url))
     pairs: list[tuple[ThreadFacts, PrState]] = []
+    excluded: list[Excluded] = []
     async with GitHubClient() as github:
         for entry in config.entries:
-            pairs.extend(await _sweep_project(mcp, github, entry, margin))
-    payload = report_to_json(build_report(pairs, margin_seconds=margin_seconds))
+            project_pairs, project_excluded = await _sweep_project(mcp, github, entry, margin)
+            pairs.extend(project_pairs)
+            excluded.extend(project_excluded)
+    payload = report_to_json(
+        build_report(pairs, margin_seconds=margin_seconds, out_of_scope=excluded)
+    )
     payload["projects"] = [e.project for e in config.entries]
     return payload
 

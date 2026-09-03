@@ -5,7 +5,15 @@ that has finished?** — and answers it without changing anything. Nothing here 
 
 The classification is the two-stage predicate frozen at msg-2151 D-6 (revised),
 evaluated in the order C > A > B (msg-2149 R-4, "a thread with post-terminal activity
-is never swept, even when the proof is complete")::
+is never swept, even when the proof is complete"), behind the intake filter added by
+msg-2422 §3.3::
+
+    S-pre  intake -- which threads the sweep looks at at all
+        status in {parked, active, awaiting_reply}  -> S0
+        status in {resolved, superseded}            -> OUT OF SCOPE, reason
+                                                       out-of-scope-finished
+        any other status                            -> OUT OF SCOPE, reason
+                                                       out-of-scope-unrecognised-status
 
     S0  PR resolution / terminality
         indeterminate (5xx, rate limit, network)  -> SKIP   (no verdict at all)
@@ -20,6 +28,25 @@ is never swept, even when the proof is complete")::
             (ii) the last msg names a successor, or status == "awaiting_reply"
                                                   -> C
         anything else                             -> AB     reason terminal-and-quiescent
+
+An out-of-scope thread is not classified: it is neither C nor ``a_union_b``, and it does
+not reach S0, so no PR is looked up for it. ``ThreadStatus`` has exactly five values
+(conclair ``schemas/thread.py``) and D-6's S1 named only three, dropping ``resolved`` and
+``superseded`` into its catch-all. The two Phase 0 runs of 2026-09-03 measured what that
+cost: 4 of the first run's 53 ``a_union_b`` threads were already ``resolved``, and 6 of the
+second run's 57 -- finished work counted as leftover work, and counted differently each
+time. The two available repairs are both wrong for the same reason: C means
+"alive, do not sweep", and ``a_union_b`` is a human's debt list, so a finished thread in
+either bucket is a row that no action can clear. msg-2422 §3.2 narrows the population
+instead of widening a bucket.
+
+The in-scope statuses are enumerated **positively**, which is what makes a sixth
+``ThreadStatus`` safe: an unrecognised status lands out of scope, i.e. on the not-swept
+side, rather than in S1's catch-all. The two exclusions carry different reasons because
+"this thread is finished" and "this state is unknown to us" are different facts; one flag
+standing for both is the defect ``T-reconcile-field-mismatch-flag-overloaded`` is open on.
+Exclusions are never silent -- :func:`report_to_json` emits the count and every
+``thread_id``.
 
 Phase 0 stops there. Splitting ``a_union_b`` into A (provably closable) and B (not) needs the
 ledger's ``can_close()``, which does not exist yet — that is Phase 1, in another
@@ -69,6 +96,7 @@ is a structured field chosen over prose ``NEXT:`` parsing (msg-2149 R-2), and th
 in fact writes its handoff into the message body. Measured on the first real Phase 0
 run (2026-09-03, 61 PR-review threads across spirrow-mindwire / -magickit / -verimend):
 exactly one thread reached C through limb (ii), and it did so via ``next_participant``.
+The second run the same day reproduced it over 62 threads -- again exactly one.
 So the field is populated rarely but not never. Where it is empty, (ii) degenerates to
 ``status == "awaiting_reply"``. The frozen design has no prose fallback and none is
 invented here; :func:`build_report` instead counts how often each limb decided, so the
@@ -95,9 +123,23 @@ PROVISIONAL_MARGIN_SECONDS = 300
 MARGIN_LADDER_SECONDS: tuple[int, ...] = (0, 60, 300, 900, 3600, 21600, 86400)
 
 #: Thread statuses S1 examines for liveness. ``parked`` is handled before this set and
-#: is never swept; anything outside both (``resolved`` / ``superseded``) falls straight
-#: through to ``a_union_b``, which is what D-6 says verbatim.
+#: is never swept. Since msg-2422 §3.3 nothing else reaches S1: S-pre already removed
+#: every status outside :data:`INTAKE_STATUSES`, so the fall-through below is reachable
+#: only by ``parked`` (which returned already) and by the two liveness statuses failing
+#: (i) or (ii).
 _LIVENESS_STATUSES = frozenset({"active", "awaiting_reply"})
+
+#: S-pre's population: the statuses a sweep may look at. Positive enumeration, so a
+#: status this deployment has never seen is out of scope rather than swept.
+INTAKE_STATUSES = frozenset({"parked", "active", "awaiting_reply"})
+
+#: The statuses that mean the thread is already finished. Listed only so an exclusion can
+#: say *why* it happened -- an unrecognised status is excluded too, for a different reason.
+FINISHED_STATUSES = frozenset({"resolved", "superseded"})
+
+#: Exclusion reasons. Two, not one: see the module docstring.
+OUT_OF_SCOPE_FINISHED = "out-of-scope-finished"
+OUT_OF_SCOPE_UNRECOGNISED = "out-of-scope-unrecognised-status"
 
 GO_THRESHOLD = 5
 
@@ -145,6 +187,53 @@ class Classification:
     thread_status: str = ""
     #: For AB/C rows reached through S1: which limb of (ii) decided, for observability.
     liveness_limb: str | None = None
+
+
+@dataclass(frozen=True)
+class Excluded:
+    """A thread S-pre kept out of the sweep. Deliberately *not* a :class:`Classification`.
+
+    Sharing the classification type would make an exclusion look like a verdict, and the
+    whole point of msg-2422 §3.2 is that these threads received no verdict: they are
+    neither "alive" nor "leftover". Keeping them in a separate list is what stops the
+    ``a_union_b`` figure and the human debt list from silently absorbing them again.
+    """
+
+    thread_id: str
+    status: str
+    reason: str
+
+
+def intake_exclusion_reason(status: str) -> str | None:
+    """Why ``status`` is out of scope, or ``None`` when the thread goes on to S0.
+
+    Total by construction: every string gets an answer. That is the repair msg-2422 §3.1
+    asked for -- the earlier shape relied on S1's catch-all, so the two statuses nobody
+    had named fell into the sweep. Here they cannot, and neither can a sixth one.
+    """
+    if status in INTAKE_STATUSES:
+        return None
+    return OUT_OF_SCOPE_FINISHED if status in FINISHED_STATUSES else OUT_OF_SCOPE_UNRECOGNISED
+
+
+def split_intake(
+    pairs: list[tuple[ThreadFacts, PrState]],
+) -> tuple[list[tuple[ThreadFacts, PrState]], list[Excluded]]:
+    """Apply S-pre: ``(in scope, excluded)``.
+
+    One definition, called by both :func:`build_report` and :func:`sensitivity_table`, so
+    the headline number and the margin table are guaranteed to count the same population.
+    Two call sites of one function; not two copies of one rule (R-8).
+    """
+    in_scope: list[tuple[ThreadFacts, PrState]] = []
+    excluded: list[Excluded] = []
+    for facts, pr in pairs:
+        reason = intake_exclusion_reason(facts.status)
+        if reason is None:
+            in_scope.append((facts, pr))
+        else:
+            excluded.append(Excluded(facts.thread_id, facts.status, reason))
+    return in_scope, excluded
 
 
 def _terminal_at(pr: PrState) -> datetime | None:
@@ -249,8 +338,14 @@ def sensitivity_table(
     pairs: list[tuple[ThreadFacts, PrState]],
     ladder: tuple[int, ...] = MARGIN_LADDER_SECONDS,
 ) -> list[dict[str, int]]:
-    """``a_union_b`` recomputed at each margin on the ladder (msg-2166 R-26)."""
-    return [{"margin_seconds": m, "a_union_b": _ab_count_at_margin(pairs, m)} for m in ladder]
+    """``a_union_b`` recomputed at each margin on the ladder (msg-2166 R-26).
+
+    Runs S-pre itself instead of trusting the caller to have run it. The table is read as
+    "would the go/no-go move if the margin were wrong", so a table counting a different
+    population than the headline would answer a question nobody asked.
+    """
+    in_scope, _ = split_intake(pairs)
+    return [{"margin_seconds": m, "a_union_b": _ab_count_at_margin(in_scope, m)} for m in ladder]
 
 
 @dataclass
@@ -270,17 +365,43 @@ class Phase0Report:
     no_go_full_list: list[Classification] = field(default_factory=list)
     status_breakdown: dict[str, int] = field(default_factory=dict)
     liveness_limbs: dict[str, int] = field(default_factory=dict)
+    #: S-pre's exclusions (msg-2422 §3.3). Reported, never silent: the design's own
+    #: instruction is that the count and the thread ids travel with the output, on the
+    #: same footing as ``status_breakdown``.
+    out_of_scope: list[Excluded] = field(default_factory=list)
 
 
-def build_report(pairs: list[tuple[ThreadFacts, PrState]], *, margin_seconds: int) -> Phase0Report:
-    """Classify every pair, measure, and decide go/no-go."""
+def build_report(
+    pairs: list[tuple[ThreadFacts, PrState]],
+    *,
+    margin_seconds: int,
+    out_of_scope: list[Excluded] | None = None,
+) -> Phase0Report:
+    """Classify every in-scope pair, measure, and decide go/no-go.
+
+    ``out_of_scope`` carries exclusions a caller already made -- the CLI applies S-pre
+    before S0 so a finished thread costs no GitHub call, which means those threads never
+    become pairs. They are merged with whatever S-pre finds here, so a caller that skips
+    the early filter still gets the same report; the filter is an optimisation, not the
+    guarantee.
+    """
     margin = timedelta(seconds=margin_seconds)
     report = Phase0Report(margin_seconds=margin_seconds)
 
-    for facts, pr in pairs:
+    in_scope, found = split_intake(pairs)
+    report.out_of_scope = [*(out_of_scope or []), *found]
+
+    # Counted over the whole intake, in scope and out, so that
+    # ``sum(status_breakdown.values()) == len(classifications) + len(out_of_scope)``
+    # holds and the exclusion can be checked by arithmetic rather than taken on trust.
+    for facts, _pr in in_scope:
+        report.status_breakdown[facts.status] = report.status_breakdown.get(facts.status, 0) + 1
+    for dropped in report.out_of_scope:
+        report.status_breakdown[dropped.status] = report.status_breakdown.get(dropped.status, 0) + 1
+
+    for facts, pr in in_scope:
         result = classify(facts, pr, margin=margin)
         report.classifications.append(result)
-        report.status_breakdown[facts.status] = report.status_breakdown.get(facts.status, 0) + 1
         if result.liveness_limb:
             report.liveness_limbs[result.liveness_limb] = (
                 report.liveness_limbs.get(result.liveness_limb, 0) + 1
@@ -329,21 +450,33 @@ def report_to_json(report: Phase0Report) -> dict[str, Any]:
         "offsets_seconds": report.offsets_seconds,
         "status_breakdown": report.status_breakdown,
         "liveness_limbs": report.liveness_limbs,
+        "out_of_scope_count": len(report.out_of_scope),
+        "out_of_scope": [
+            {"thread_id": e.thread_id, "thread_status": e.status, "reason": e.reason}
+            for e in report.out_of_scope
+        ],
     }
 
 
 __all__ = [
+    "FINISHED_STATUSES",
     "GO_THRESHOLD",
+    "INTAKE_STATUSES",
     "MARGIN_LADDER_SECONDS",
+    "OUT_OF_SCOPE_FINISHED",
+    "OUT_OF_SCOPE_UNRECOGNISED",
     "PROVISIONAL_MARGIN_SECONDS",
     "Bucket",
     "Classification",
+    "Excluded",
     "Phase0Report",
     "ThreadFacts",
     "Verdict",
     "build_report",
     "classify",
+    "intake_exclusion_reason",
     "measurement_offsets_seconds",
     "report_to_json",
     "sensitivity_table",
+    "split_intake",
 ]
