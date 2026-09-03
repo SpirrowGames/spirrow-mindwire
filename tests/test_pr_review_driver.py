@@ -2253,8 +2253,9 @@ def test_d6_depth_bound_keeps_the_never_raises_contract_at_both_decode_sites() -
 
     There are TWO ``raw_decode`` call sites — the primary parse and the D-7 loop's re-entry
     at ``rest[bracket:]`` — and M7 requires both to be covered. They are covered by ONE
-    pre-scan, because :func:`_nesting_exceeds` bounds the local depth of every suffix of the
-    string it is given and ``rest`` is a slice of that same string. A second scan before the
+    pre-scan, because :func:`_nesting_exceeds` counts every opener in the string it is given
+    and that count upper-bounds the depth reachable from any offset inside it, while ``rest``
+    is a slice of that same string and so cannot hold more. A second scan before the
     loop would be unreachable code, so the two-site coverage is pinned here by behaviour: the
     second body below reaches the loop (its primary parse succeeds on ``[]``) and is the
     input that crashes at the loop's call site.
@@ -2306,6 +2307,98 @@ def test_d6_bound_is_a_bound_not_a_catch_and_leaves_real_payloads_alone() -> Non
 
     real = f'[{{"class": "{_blocking_class()}", "where": "a.py:1", "evidence": "n is 0"}}]'
     assert not _nesting_exceeds(real), "the real objection schema must clear the bound"
+
+
+def test_d6_metric_never_decrements_so_in_string_closers_cannot_evade_the_bound() -> None:
+    """D-6 metric correction (gate msg-2432, adjudicated msg-2433 §1/§4).
+
+    The first form of the pre-scan tracked ``depth - floor`` and counted brackets inside
+    JSON string literals in both directions, on the stated assumption that disagreeing with
+    the decoder "only ever over-rejects". Exactly half of that was true. An in-string OPENER
+    over-estimates; an in-string CLOSER *under*-estimates. Hiding one ``]`` in a string at
+    every level walks ``depth`` between 0 and 1 forever, so ``depth - floor`` never passes 1
+    no matter how deep the JSON actually nests, and the payload reaches ``raw_decode``.
+
+    NEGATIVE CONTROL, run before this test was written: restore ``depth - floor`` and both
+    bodies below raise ``RecursionError`` out of :func:`parse_objections` — a
+    ``BaseException``, so the ``except ValueError`` never sees it and the "Never raises"
+    contract is false. The crash cliff was bisected at exactly 996 openers, so 1000 is one
+    parametrisation above it rather than a round number chosen for looks.
+
+    The brace body is wrapped in an outer ``[``. Unwrapped it is NOT a witness: D-3 refuses
+    any payload whose first non-whitespace character is not ``[``, so it returns
+    ``PROSE_BETWEEN`` under every metric including the broken one, and would pin nothing.
+    """
+    n = 1000
+    bodies = {
+        "in-string ] at every level": '["]", ' * n + '"x"' + "]" * n,
+        "in-string } at every level": "[" + '{"a":"}","b":' * n + "1" + "}" * n + "]",
+    }
+    for label, body in bodies.items():
+        report = parse_objections(f"{_OBJECTIONS_SENTINEL}\n{body}")  # must not raise
+        assert report.status is ObjectionParse.MISSING, label
+        assert report.missing_reason is ObjectionMissingReason.BAD_JSON, label
+        assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES, label
+
+
+def test_d6_metric_counts_in_string_openers_because_d7_decodes_from_inside_strings() -> None:
+    """The repair gate msg-2432 asked for is a regression, and this is the witness (msg-2433 §3).
+
+    The gate's instruction was to "track basic string state" and stop counting brackets that
+    sit inside string literals. That is unsound HERE — not in general — because
+    :func:`_chains_another_block` probes ``rest.find("[", probe)`` and therefore hands
+    ``raw_decode`` start offsets that are inside string literals. A metric that skips those
+    brackets is blind to precisely the input the D-7 loop then feeds to the decoder.
+
+    The body below is an empty primary array (so the D-7 loop runs) followed by one string
+    containing 1200 ``[``. The loop's ``find("[")`` lands inside that string and decodes from
+    there; the decoder sees 1200 open brackets and recurses past the limit.
+
+    NEGATIVE CONTROL, run before this test was written: with a string-aware metric restored,
+    this body raises ``RecursionError`` at the D-7 call site while the two bodies in the test
+    above stay green — each rejected metric fails its own witness and only its own. Keeping
+    this test and the one above together is what makes "count openers, never decrement" the
+    only one of the three that is green on both.
+    """
+    body = '[]\n"' + "[" * 1200 + '"'
+    report = parse_objections(f"{_OBJECTIONS_SENTINEL}\n{body}")  # must not raise
+    assert report.status is ObjectionParse.MISSING
+    assert report.missing_reason is ObjectionMissingReason.BAD_JSON
+    assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
+
+
+def test_d6_bound_still_admits_an_objection_block_whose_evidence_quotes_brackets() -> None:
+    """Lower side of the corrected metric: the residue is real but far from any honest block.
+
+    Never decrementing means every ``[``/``{`` after the marker counts, INCLUDING ones the
+    model typed inside an ``evidence`` string, so over-rejection is the price. The block
+    below is the shape most likely to pay it — gate msg-2432's own objection, whose evidence
+    quotes the attack payload — and it carries 4 openers against a limit of 100.
+
+    Width, measured over all 54 real gate critiques carrying a column-zero marker (PRs
+    #140-#217, read from the GitHub review bodies): max 5 openers, mean 2.4, p95 4. The
+    limit therefore sits ~20x above the largest honest payload observed and ~10x below the
+    measured crash cliff of 996, which is why :data:`_MAX_PAYLOAD_NESTING` did not move.
+    """
+    block = json.dumps(
+        [
+            {
+                "class": _blocking_class(),
+                "where": "src/spirrow_mindwire/naysayer/pr_review.py:642",
+                "evidence": 'a payload interleaving ["]", ["]", ... ]] evades the bound',
+            }
+        ]
+    )
+    assert sum(1 for ch in block if ch in "[{") == 4, (
+        "the witness must actually exercise in-string openers; if this drifts to 0 the test "
+        "below stops pinning anything"
+    )
+    report = parse_objections(f"{_OBJECTIONS_SENTINEL}\n{block}\n\nVERDICT: REQUEST_CHANGES")
+    assert report.status is ObjectionParse.OK
+    assert [o.objection_class for o in report.blocking] == [_blocking_class()], (
+        "the block must survive the bound intact, not merely avoid MISSING"
+    )
+    assert derive_verdict(report) is ReviewEvent.REQUEST_CHANGES
 
 
 def test_missing_reason_appears_in_shadow_log_line(caplog: pytest.LogCaptureFixture) -> None:

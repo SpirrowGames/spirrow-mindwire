@@ -621,30 +621,50 @@ def _nesting_exceeds(text: str, limit: int = _MAX_PAYLOAD_NESTING) -> bool:
     merely fail to restore "Never raises"; at the loop's call site it converts a crash into
     a false APPROVE — the one outcome this parser exists to make impossible.
 
-    Two deliberate conservatisms, both fail-closed (MISSING → REQUEST_CHANGES, never
-    APPROVE), which is the direction msg-2385 §2's F invariant permits:
+    **The metric: count openers, never decrement (msg-2433 §4).** Soundness, in one
+    sentence: the decoder deepens its recursion only when it consumes a structural ``[`` or
+    ``{``, and it consumes each character at most once, so the depth reached from ANY start
+    offset is at most the number of ``[``/``{`` characters in ``text``. That is why one
+    scan of the whole payload covers the primary decode AND every re-entry the D-7 loop
+    makes at ``rest[bracket:]``: ``rest`` is a slice of this same string, so its opener
+    count cannot exceed the whole string's. Bounding each slice separately would re-read the
+    tail once per ``[`` and reintroduce the O(N^2) shape (measured at 1.2 s worst case,
+    msg-2388 E-5) for no extra safety. Note what the proof does NOT need: any knowledge of
+    which brackets sit inside string literals.
 
-    * **Brackets inside JSON strings are counted.** Tracking string state would make the
-      scan agree exactly with the decoder, but disagreeing only ever over-rejects. An
-      honest ``evidence`` string holding 100 unbalanced brackets does not occur.
-    * **Every suffix is bounded, not just the whole string.** ``depth - floor`` measures the
-      rise from the lowest point seen so far, so it upper-bounds the local depth of a scan
-      started at ANY offset. The trailing-list loop calls ``raw_decode`` at every ``[`` in
-      the remainder, so one scan of the whole payload covers all of those starts; bounding
-      each slice separately would re-read the tail once per ``[`` and reintroduce the
-      O(N^2) shape (measured at 1.2 s worst case, msg-2388 E-5) for no extra safety.
+    **Why the two obvious refinements are worse — measured, not argued (msg-2433 §3).** The
+    first form of this scan tracked ``depth - floor`` (the rise above the lowest point seen)
+    and claimed that counting brackets inside JSON strings "only ever over-rejects". That
+    claim was exactly half true, and the false half was the fail-open one: counting an
+    in-string OPENER over-estimates, but counting an in-string CLOSER *under*-estimates. So
+    ``["]", ["]", … ]`` walked ``depth`` between 0 and 1 forever, ``depth - floor`` never
+    passed 1, and a 996-opener payload reached the decoder and raised ``RecursionError``
+    straight out of :func:`parse_objections` (gate msg-2432; reproduced here, cliff bisected
+    at exactly 996 openers). Nor is the repair the gate then asked for — "track string state
+    and ignore brackets inside strings": :func:`_chains_another_block` probes
+    ``rest.find("[", probe)`` and therefore hands ``raw_decode`` start offsets that are
+    INSIDE string literals, which a string-aware metric is blind to by construction.
+    Witness: ``'"' + "[" * 30 + '"'`` reaches depth 30 from offset 1 and that metric scores
+    it 0. On a 200,000-case differential fuzz against a per-start-offset oracle the
+    string-aware metric under-estimated 5,609 times, the ``depth - floor`` form it would
+    have replaced 910 times, and the opener count below 0 times.
+
+    **The residue, at its measured width.** Counting in-string openers and never
+    decrementing over-rejects: a payload whose text after the marker holds more than
+    ``limit`` ``[``/``{`` characters IN TOTAL is refused even though it nests two deep.
+    That is fail-closed (MISSING → REQUEST_CHANGES, never APPROVE), the direction
+    msg-2385 §2's F invariant permits. Width: over all 54 real gate critiques carrying a
+    column-zero marker (PRs #140-#217, GitHub review bodies), the opener count is at most
+    **5** (mean 2.4, p95 4) against a limit of 100 and a measured crash cliff of 996. So
+    :data:`_MAX_PAYLOAD_NESTING` does not move: it sits ~20x above the largest honest
+    payload observed and ~10x below the cliff.
     """
-    depth = 0
-    floor = 0
+    opened = 0
     for ch in text:
         if ch in "[{":
-            depth += 1
-            if depth - floor > limit:
+            opened += 1
+            if opened > limit:
                 return True
-        elif ch in "]}":
-            depth -= 1
-            if depth < floor:
-                floor = depth
     return False
 
 
@@ -832,7 +852,8 @@ def _chains_another_block(rest: str) -> bool:
 
 
 def parse_objections(critique: str) -> ObjectionReport:
-    """Parse the objection block out of ``critique``. Never raises.
+    """Parse the objection block out of ``critique``. Never raises — D-6 below carries the
+    single bound that makes that true, and the two occasions on which it was false.
 
     Five outcomes, all recorded, none of which changes what the gate posts:
 
@@ -884,14 +905,24 @@ def parse_objections(critique: str) -> ObjectionReport:
     :func:`test_v2_fence_less_payload_with_leading_newline_is_accepted` and
     :func:`test_d5_payload_starts_after_leading_whitespace_independent_of_helper`.
 
-    **D-6 (depth bound before the decoder, msg-2380 / msg-2385 §5 / msg-2388 E-5).** "Never
-    raises" above was false on ``main``: ``json``'s decoder recurses per open bracket, so a
-    payload of a thousand ``[`` leaked ``RecursionError`` — a ``BaseException``, so the
-    ``except ValueError`` below never saw it — and took the whole review call down with it,
-    since :func:`decide_verdict` calls this function unconditionally. Unlike the D-7 window
-    below, this one is NOT shadow-only: the crash is real today. Fixed by bounding the input
-    rather than catching the error; :func:`_nesting_exceeds` carries both reasons and the
-    single-scan/two-call-sites argument.
+    **D-6 (depth bound before the decoder, msg-2380 / msg-2385 §5 / msg-2388 E-5; metric
+    corrected by gate msg-2432 / msg-2433).** "Never raises" above was false on ``main``:
+    ``json``'s decoder recurses per open bracket, so a payload of a thousand ``[`` leaked
+    ``RecursionError`` — a ``BaseException``, so the ``except ValueError`` below never saw
+    it — and took the whole review call down with it, since :func:`decide_verdict` calls
+    this function unconditionally. Unlike the D-7 window below, this one is NOT shadow-only:
+    the crash is real on ``main`` today.
+
+    It was ALSO false on this branch, for four review rounds. The first bound counted
+    brackets inside string literals in BOTH directions, so a payload that hides a ``]`` in a
+    string at every level (``["]", ["]", … ]``) held the measured rise at 1 and let the same
+    ``RecursionError`` escape from here. ``main`` crashes on a strict superset of the inputs
+    this file ever crashed on — the branch narrowed the surface at every step, it never
+    widened it — but a docstring that says "Never raises" while a witness makes it raise is
+    the defect either way. Both are closed by bounding the input rather than catching the
+    error. :func:`_nesting_exceeds` carries the metric, its one-sentence soundness proof,
+    the two refinements that measured worse (including the one this gate round asked for),
+    and the residue at its measured width.
 
     **D-7 (trailing-list defense, msg-2361 / msg-2363, ported here by msg-2397 §9).** V-1's
     property — ``raw_decode`` stops at the first ``]``, so trailing text is structurally
@@ -960,9 +991,10 @@ def parse_objections(critique: str) -> ObjectionReport:
     payload = payload.lstrip()
     if _nesting_exceeds(payload):
         # D-6. ONE scan, both ``raw_decode`` call sites (msg-2397 M7). It runs on the whole
-        # payload, and :func:`_nesting_exceeds` bounds the local depth of EVERY suffix, so it
-        # covers the primary decode below AND every re-entry the D-7 loop makes at
-        # ``rest[bracket:]`` — ``rest`` is a slice of this same string. A second scan before
+        # payload and counts every ``[``/``{`` in it, which upper-bounds the depth reachable
+        # from ANY start offset inside it, so it covers the primary decode below AND every
+        # re-entry the D-7 loop makes at ``rest[bracket:]`` — ``rest`` is a slice of this
+        # same string, so it cannot hold more openers. A second scan before
         # the loop would be provably unreachable, i.e. dead code no negative control can turn
         # red; the two-site coverage is pinned by behaviour instead, one test per call site.
         return _missing_report(ObjectionMissingReason.BAD_JSON)
