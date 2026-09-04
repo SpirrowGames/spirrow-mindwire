@@ -484,7 +484,23 @@ _OBJECTIONS_SENTINEL = "<!-- mindwire:objections v1 -->"
 # design (see :func:`parse_objections` D-1 note). In Stage 1 the residual costs nothing (nothing
 # is posted from it); the rider-3 review (T-rider3-objection-parser-injection-surface) closes
 # the parser side of the reversal's pre-conditions.
-_OBJECTIONS_SENTINEL_RE = re.compile(rf"^{re.escape(_OBJECTIONS_SENTINEL)}\s*$", re.MULTILINE)
+#
+# **RESPONSIBILITY SEPARATION (gamma-1, msg-2478 §4.2 / msg-2521 §2.1).** This regex POSITIONS
+# the marker; it does not judge payload adjacency. The pre-gamma form carried a ``\s*$`` tail
+# anchor that forced the marker to sit alone on its line — a payload-shape check masquerading
+# as a positioner.
+# That doubling had two costs: (i) it hid D-3's status as the sole owner of adjacency (see
+# :func:`parse_objections`), so a refactor that tightened the regex could silently take over from
+# D-3 without any test moving; (ii) it fail-closed on a same-line marker+block (the honest form
+# ``<!-- mindwire:objections v1 --> [...]``) by not matching at all, sending it to
+# ``NO_MARKER`` rather than letting D-3 evaluate the payload. The same-line decoy the anchor was
+# once thought to guard (``<!-- mindwire:objections v1 -->[]\n[real block]``) is closed by D-7,
+# which lands in #214 (``aad3eda``) — the primary parses as ``EMPTY``, the scan runs on the
+# remainder, and the chained real block is refused. With that lower defense in place the tail
+# anchor buys no attack coverage and the doubling can be retired. Pinned by
+# :func:`test_marker_regex_is_a_positioner_only_d3_still_catches_non_adjacent_payload` and
+# :func:`test_marker_regex_positioner_only_reds_if_the_tail_anchor_is_reintroduced`.
+_OBJECTIONS_SENTINEL_RE = re.compile(rf"^{re.escape(_OBJECTIONS_SENTINEL)}", re.MULTILINE)
 
 
 class ObjectionParse(Enum):
