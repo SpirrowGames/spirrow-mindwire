@@ -45,17 +45,18 @@ machinery. Registration could not bootstrap (msg-1585 §1).
 `allowed_roles = []` (msg-1484 §2, Einstein endorsed msg-1485) and `independence_class = null`
 (msg-1487 §4; its constituent §2 / §3 endorsed by Einstein msg-1488).
 
-## The four identity names this repo writes
+## The identity names this repo writes
 
 Enumerated by grepping every `chatroom_post_message` and `chatroom_open_thread` call site in
-`src/`. Four names appear as the `author` (post) or `owner` (thread) argument:
+`src/`. The following names appear as the `author` (post) or `owner` (thread) argument:
 
-| identity_name          | writer                                                                    | grep evidence                                                |
-| ---------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| `naysayer-pr-review`   | `PrReviewOrchestrator.post_critique` (`orchestrator.py`)                  | `_DEFAULT_NAYSAYER_AUTHOR = "naysayer-pr-review"` (line 31)  |
-| `orchestrator`         | `PrReviewOrchestrator._open_thread` (thread `owner`, not a post `author`) | `_DEFAULT_OWNER = "orchestrator"` (line 30)                  |
-| `pr-gate-relay`        | `Conductor._post_pr_gate_relay` (`conductor/core.py`)                     | `_PR_GATE_RELAY_AUTHOR = "pr-gate-relay"` (line 136)         |
-| `spirrowgames-ops`     | `NaysayerPrReviewDriver` — GitHub review submission, not a chatroom post  | `naysayer_github_token` docstring, `pr_review.py`            |
+| identity_name                  | writer                                                                    | grep evidence                                                |
+| ------------------------------ | ------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `naysayer-pr-review`           | `PrReviewOrchestrator.post_critique` (`orchestrator.py`)                  | `_DEFAULT_NAYSAYER_AUTHOR = "naysayer-pr-review"` (line 31)  |
+| `orchestrator`                 | `PrReviewOrchestrator._open_thread` (thread `owner`, not a post `author`) | `_DEFAULT_OWNER = "orchestrator"` (line 30)                  |
+| `pr-gate-relay`                | `Conductor._post_pr_relay` (`conductor/core.py`)                          | `_PR_GATE_RELAY_AUTHOR = "pr-gate-relay"`                    |
+| `conductor-redirect-relay`     | `Conductor._post_redirect_relay` (`conductor/core.py`)                    | `_REDIRECT_RELAY_AUTHOR = "conductor-redirect-relay"`        |
+| `spirrowgames-ops`             | `NaysayerPrReviewDriver` — GitHub review submission, not a chatroom post  | `naysayer_github_token` docstring, `pr_review.py`            |
 
 `spirrowgames-ops` is a **GitHub identity**, not a magickit chatroom author, so it is out of scope
 for this epic (which is about the `role` column on chatroom messages and the `allowed_roles`
@@ -152,6 +153,34 @@ confirm they are all writes by code no longer running, in which case the `legiti
 classification stands, or (b) surface them as `residual > 0` findings for the write-half
 implementer to reason about before registration. This is the "residual" mechanism from msg-1493
 §3, applied.
+
+### `conductor-redirect-relay` — **machine**, `legitimate = ∅`
+
+**Primary source** (`src/spirrow_mindwire/conductor/core.py`, `_REDIRECT_RELAY_AUTHOR` and the
+guard-(i) redirect branch of `_route` / `_post_redirect_relay`):
+
+D-1 of `T-human-terminal-overuse` (msg-2540 §4): when the conductor's guard (i) redirects a
+non-human, non-attested-naysayer handoff-to-implementer to the human terminal, it posts a
+one-line factual observation of the routing event into the design thread. The observation
+names who authored the intercepted turn, which carve-out was NOT taken (human / naysayer-attested),
+what token the author wrote, and what the effective route is. Bohr's msg-2540 §2-5 established
+that the relay's `NEXT:` follows author-based routing (non-implementer authors → `NEXT: <author>`
+to unblock self-correction; implementer / self-nomination → `NEXT: human` because an implementer
+author re-triggers guard (i) and any per-episode second relay → `NEXT: human` so a spinning author
+cannot loop indefinitely at the loop's expense).
+
+The body is the conductor's own framing of a routing event, not the words of any participant.
+Same reasoning as `pr-gate-relay`: a role stamp here would fabricate the I-6 evidence the loop's
+independence carve-outs exist to make meaningful. Two distinct machine identities (rather than
+reusing `pr-gate-relay`) keep the two conductor write paths from blurring into one in
+`identity_findings.py`: they are triggered by different structural events and their bodies say
+different things, so a single reader can tell "the PR-gate verdict was relayed" from "guard (i)
+intercepted a bad handoff" without inspecting the body.
+
+`legitimate = ∅`.
+
+**Consequence for the write half**: `upsert_identity("conductor-redirect-relay", allowed_roles=[],
+independence_class=null)`.
 
 ### `pr-gate-relay` — **machine**, `legitimate = ∅`
 

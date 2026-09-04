@@ -646,12 +646,31 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "a calibration tag the conductor records so we can tell judgement-Tier-C apart from "
         "routing-artefact Tier-C; it does NOT redefine what Tier-C is."
     ),
+    # D-3 (T-human-terminal-overuse msg-2540 §4 / Einstein msg-2539 acceptance): teach the
+    # implementer the same `TIER-C: <label>` calibration syntax already taught to the proposer
+    # (A/C). msg-2537 §3 counted the labelling rate at 14/14 = 100% for the proposer (who was
+    # told the syntax) and 0/25 for the implementer (who was not). Extending the guidance closes
+    # half of the visibility gap — 79% of explicit human terminals come from roles that were
+    # never asked to label them. The naysayer is intentionally NOT taught this syntax (Einstein
+    # msg-2539 Objection 3 accepted): a naysayer's `NEXT: human` is an ESCALATION, not a Tier-C
+    # decision request; naming it under the same label set would push two different concepts
+    # through one field (Principle 2 hybrid). D-2 (the machine-side missing-label check) will
+    # follow the reverse order rule (msg-2537 §3 warning): teach BEFORE lint, and it must
+    # exclude ``author_role = naysayer`` from the denominator so the naysayer's correct absence
+    # is never counted as a violation.
     Role.IMPLEMENTER: (
         "As the implementer: when you open or update a develop→main pull request, hand to the "
         f"PR-gate — end your reply with `NEXT: {PR_REVIEW_TOKEN} <owner/repo#n>` (the PR ref) so "
         "the independent naysayer review runs before any human merge. For other work, hand back "
         "to the proposer for a spec-review (`NEXT: <proposer persona>`); for a Tier-C decision "
-        f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself."
+        f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself. "
+        f"When you do hand to `{HUMAN_TOKEN}`, name the class of Tier-C decision on the line "
+        "above your handoff, e.g.:\n\n"
+        "    TIER-C: merge-protected\n"
+        f"    NEXT: {HUMAN_TOKEN}\n\n"
+        f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` / `other:<one-line reason>`. This is "
+        "a calibration tag the conductor records so we can tell judgement-Tier-C apart from "
+        "routing-artefact Tier-C; it does NOT redefine what Tier-C is."
     ),
     Role.NAYSAYER: (
         "As the naysayer: after your critique, hand back to the proposer if your objections need a "

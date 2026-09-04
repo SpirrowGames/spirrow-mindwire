@@ -70,6 +70,22 @@ identities:
       conductor's own framing wrapping the driver's outcome, not the naysayer's verbatim
       critique.
 
+  - name: conductor-redirect-relay
+    kind: machine
+    legitimate: []
+    primary_source: "src/spirrow_mindwire/conductor/core.py::_REDIRECT_RELAY_AUTHOR"
+    reason: >-
+      D-1 (T-human-terminal-overuse msg-2540 §4). Written by the conductor itself when
+      guard (i) redirects a non-human, non-attested-naysayer handoff to the implementer
+      to the human terminal. Body is a factual observation of the routing event — who
+      authored the intercepted turn, which carve-out was NOT taken, what the target was —
+      framed by the conductor, not the words of any participant. Same reasoning as
+      `pr-gate-relay`: a role stamp here would fabricate the I-6 evidence the loop's
+      independence carve-outs exist to make meaningful. Kept distinct from `pr-gate-relay`
+      so the two conductor write paths do not blur into one identity in identity_findings —
+      they are triggered by different structural events (a PR-gate verdict vs. a
+      guard-(i) redirect) and their bodies say different things.
+
   - name: conductor-probe
     kind: machine
     legitimate: []

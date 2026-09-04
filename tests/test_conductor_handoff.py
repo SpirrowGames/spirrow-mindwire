@@ -341,9 +341,39 @@ def test_implementer_block_hands_back_to_proposer_and_never_merges() -> None:
     assert "never merge" in block
 
 
+def test_implementer_block_teaches_tier_c_syntax_and_enum() -> None:
+    # D-3 (T-human-terminal-overuse msg-2540 §4 / Einstein msg-2539): the implementer's block
+    # documents the `TIER-C: <label>` syntax and lists the enum, the same guidance already given
+    # to the proposer. msg-2537 §3 counted the implementer's labelling rate at 0/25 (never asked)
+    # vs. the proposer's 14/14 (was asked): the receiver is universal, the supply is what was
+    # missing. This test pins the fix in words so a future refactor that reverts the guidance
+    # regenerates the visible signal.
+    block = build_handoff_protocol_block(Role.IMPLEMENTER)
+    assert "TIER-C:" in block
+    for label in TIER_C_LABELS:
+        assert f"`{label}`" in block, f"enum label {label!r} missing from implementer guidance"
+    assert "other:<one-line reason>" in block
+    assert "does NOT redefine" in block  # calibration-not-definition mantra kept in the text
+
+
 def test_naysayer_block_is_advisory() -> None:
     block = build_handoff_protocol_block(Role.NAYSAYER)
     assert "advisory, not a veto" in block
+
+
+def test_naysayer_block_does_not_teach_tier_c_syntax() -> None:
+    # D-3 (Einstein msg-2539 Objection 3 accepted): the naysayer must NOT be taught the same
+    # `TIER-C: <label>` syntax. A naysayer's `NEXT: human` is an ESCALATION (safety-lever), not
+    # a Tier-C decision request; naming it under the same label set would push two different
+    # concepts through one field (Principle 2 hybrid). D-2 (the future machine-side missing-label
+    # check) will exclude ``author_role == naysayer`` from its denominator on the same grounds
+    # (msg-2540 §3): under the current spec the naysayer's `NEXT: human` is CORRECTLY unlabelled,
+    # so a lint that fires on absence must not fire on the naysayer.
+    block = build_handoff_protocol_block(Role.NAYSAYER)
+    assert "TIER-C:" not in block, (
+        "the naysayer block must not teach TIER-C: syntax — its NEXT: human is escalation, "
+        "not a Tier-C request; forcing a label conflates two concepts (Einstein msg-2539 Obj 3)"
+    )
 
 
 # --------------------------------------------------------------------------- #

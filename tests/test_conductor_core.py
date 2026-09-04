@@ -1483,3 +1483,247 @@ async def test_past_field_human_boundary_terminates_the_naysayer_segment() -> No
     outcome = await _conductor(mcp, disp).run()
     assert outcome.stop_reason is StopReason.HUMAN
     assert outcome.forced_naysayer_turns == 0  # segment naysayer counts; no second consult
+
+
+# --------------------------------------------------------------------------- #
+# D-1 (T-human-terminal-overuse msg-2540): guard-(i) redirect write-back
+#
+# The observed failure the relay closes (msg-2537 §4 / msg-2540 §2-2): a non-human,
+# non-attested-naysayer nomination of the implementer that hits guard (i) stops silently at the
+# human terminal, but the head token never moves off the offender's un-honoured target — so
+# ``head_skip`` (STOP_TOKENS = {none, human}) never SKIPs and the sweep re-launches the same dead
+# thread on every backoff step (288 observed bounces across 5 threads). D-1 writes the redirect
+# back as a chatroom post under a reserved machine identity, using author-based routing so the
+# offender can self-correct on a non-implementer author and a spinning author cannot spin
+# indefinitely (per-episode 1-relay cap).
+# --------------------------------------------------------------------------- #
+
+
+_REDIRECT_RELAY_AUTHOR = "conductor-redirect-relay"
+
+
+@pytest.mark.anyio
+async def test_d1_relay_fires_on_proposer_to_implementer_after_consult() -> None:
+    # The canonical failure class from msg-2537 §4: proposer nominates implementer AFTER an
+    # in-segment naysayer consult, so the forced consult is skipped and guard (i) stops silently
+    # at the human. Without D-1 the head stays on the offender's ``NEXT: Heisenberg`` and
+    # head_skip re-launches the thread indefinitely. With D-1 the conductor posts a relay whose
+    # own NEXT: names the OFFENDER (a non-implementer author), so the offender wakes here next
+    # round and can self-correct — no human turn spent.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("review\n\nNEXT: Bohr"))
+    mcp.seed(author="Bohr", content="revised, ready to build\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    # A single relay post was written, and its author is the reserved D-1 identity.
+    relay_posts = [p for p in mcp.posts if p["author"] == _REDIRECT_RELAY_AUTHOR]
+    assert len(relay_posts) == 1, mcp.posts
+    body = relay_posts[0]["content"]
+    # Author-based routing: proposer (non-implementer) → the offender is named.
+    assert body.rstrip().endswith("NEXT: Bohr")
+    # The intercepted token is reported in the body for observability.
+    assert "Heisenberg" in body
+    assert "guard-(i)" in body
+
+
+@pytest.mark.anyio
+async def test_d1_relay_carries_no_role_stamp() -> None:
+    # I-6 defence: same rule as ``_post_pr_relay`` — the redirect relay must NOT carry a role
+    # stamp. The conductor holds no role; claiming one here (e.g. ``naysayer`` because the
+    # observation is about a naysayer-adjacent handoff) would fabricate exactly the evidence the
+    # I-6 invariant exists to make meaningful. Distinct-identity registration (``kind: machine``,
+    # ``legitimate: []`` in ``spec/identity/legitimate_roles.yaml``) enforces this on the store
+    # side; this test pins it on the write side.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("review\n\nNEXT: Bohr"))
+    mcp.seed(author="Bohr", content="revised\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {})
+    await _conductor(mcp, disp).run()
+    relay = next(p for p in mcp.posts if p["author"] == _REDIRECT_RELAY_AUTHOR)
+    assert "role" not in relay, "the redirect relay must not stamp any role (I-6)"
+
+
+@pytest.mark.anyio
+async def test_d1_relay_fires_on_implementer_self_nomination_with_next_human() -> None:
+    # The 175/288 majority from msg-2537 §4 / msg-2540 §2-2: ``Heisenberg → NEXT: Heisenberg``.
+    # For an implementer-authored trigger the relay MUST use ``NEXT: human``, because relaying to
+    # the author (``NEXT: Heisenberg``) would re-enter guard (i) via the relay's un-rostered
+    # author on the next tick and either loop (if implementer→implementer paths existed) or fall
+    # to human anyway — Bohr §2-2's mechanism. With ``NEXT: human``, head_skip.STOP_TOKENS
+    # matches the head next tick and the sweep quietly SKIPs.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("review\n\nNEXT: Bohr"))
+    mcp.seed(author="Heisenberg", content="I'll take it\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    relay = next(p for p in mcp.posts if p["author"] == _REDIRECT_RELAY_AUTHOR)
+    assert relay["content"].rstrip().endswith("NEXT: human")
+
+
+@pytest.mark.anyio
+async def test_d1_relay_falls_back_to_human_for_unrostered_author() -> None:
+    # Defensive fallback: an unrostered author (no role in the roster) has no persona to route
+    # to, so ``NEXT: human`` is used. Without this the relay's own NEXT would resolve to ABSENT
+    # next round and the write-back would be pointless.
+    mcp = _FakeChatroomMcp()
+    # Set up a segment consult so the forced-consult path is skipped and we hit the stop.
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("review\n\nNEXT: Bohr"))
+    mcp.seed(author="Somebot", content="taking it\n\nNEXT: Heisenberg")  # Somebot: unrostered
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    relay = next(p for p in mcp.posts if p["author"] == _REDIRECT_RELAY_AUTHOR)
+    assert relay["content"].rstrip().endswith("NEXT: human")
+
+
+@pytest.mark.anyio
+async def test_d1_relay_does_not_fire_on_explicit_next_human() -> None:
+    # D-1 fires ONLY on the guard-(i) redirect terminal (``handoff.kind == ROLE ∧ role ==
+    # implementer``). An explicit ``NEXT: human`` from any author must NOT trigger a relay —
+    # that path is what D-3 teaches; it is not a routing artefact. This test pins the precise
+    # boundary of the D-1 predicate so a future generalisation cannot bleed into the correct
+    # cases.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("review\n\nNEXT: Bohr"))
+    mcp.seed(author="Bohr", content="TIER-C: scope\nNEXT: human")
+    disp = _ScriptedDispatcher(mcp, {})
+    await _conductor(mcp, disp).run()
+    assert not any(p["author"] == _REDIRECT_RELAY_AUTHOR for p in mcp.posts)
+
+
+@pytest.mark.anyio
+async def test_d1_relay_does_not_fire_when_forced_consult_fires() -> None:
+    # A guard-(i) redirect that is FOLLOWED by a forced consult (no prior in-segment naysayer)
+    # does not stop this round — the naysayer is dispatched, and the relay is not the
+    # observation the loop needs (the forced consult IS the loop's own correction). D-1 must not
+    # fire here. Later, once the naysayer replies, THAT reply drives the routing (the naysayer
+    # might escalate to human, or clear it via carve-out ③); the redirect terminal is not
+    # revisited on the same head, so no relay is warranted.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="skip review\n\nNEXT: Heisenberg")  # no prior consult
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["forced review\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert outcome.forced_naysayer_turns == 1  # the consult DID fire
+    assert not any(p["author"] == _REDIRECT_RELAY_AUTHOR for p in mcp.posts)
+
+
+@pytest.mark.anyio
+async def test_d1_relay_does_not_fire_on_carve_out_one_or_three() -> None:
+    # A carve-out ① (human-authored decide) or ③ (attested naysayer + RUN) that clears the
+    # handoff routes to the implementer normally, does not stop, and MUST NOT trigger a relay.
+    # Runs both scenarios back-to-back to prove they share the same behaviour: the predicate is
+    # ``stop_reason is HUMAN``, so a non-stop routing decision is structurally excluded from D-1.
+    # (Carve-out ① case)
+    mcp1 = _FakeChatroomMcp()
+    mcp1.seed(author="human", content="approved\n\nNEXT: Heisenberg")
+    disp1 = _ScriptedDispatcher(mcp1, {Role.IMPLEMENTER: ["built\n\nNEXT: none"]})
+    outcome1 = await _conductor(mcp1, disp1).run()
+    assert outcome1.stop_reason is StopReason.SETTLED
+    assert not any(p["author"] == _REDIRECT_RELAY_AUTHOR for p in mcp1.posts)
+    # (Carve-out ③ case)
+    mcp2 = _FakeChatroomMcp()
+    mcp2.seed(author="human", content="kickoff\n\nNEXT: Bohr")
+    disp2 = _design_to_code_dispatcher(mcp2)
+    outcome2 = await _conductor(mcp2, disp2, control=_FakeControl(ControlState.RUN)).run()
+    assert outcome2.stop_reason is StopReason.SETTLED
+    assert not any(p["author"] == _REDIRECT_RELAY_AUTHOR for p in mcp2.posts)
+
+
+@pytest.mark.anyio
+async def test_d1_relay_body_has_no_next_line_hijack_before_its_own() -> None:
+    # D-1b: the relay's body reports the intercepted token in prose (``target=<X>``), so no line
+    # ever starts with ``NEXT:`` except the relay's OWN final one — ``parse_next_token`` reads
+    # the LAST NEXT: line, and a body that quoted the offender's raw ``NEXT: <token>`` at
+    # line-head could shift what a downstream reader interprets as the relay's handoff. Uses
+    # ``parse_next_token`` (the actual parser) rather than a string check, so the invariant
+    # is stated in terms of what the code will see.
+    from spirrow_mindwire.conductor.handoff import parse_next_token
+
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("review\n\nNEXT: Bohr"))
+    mcp.seed(author="Bohr", content="revised\n\nNEXT: Heisenberg")
+    await _conductor(mcp, _ScriptedDispatcher(mcp, {})).run()
+    relay = next(p for p in mcp.posts if p["author"] == _REDIRECT_RELAY_AUTHOR)
+    # The parser must read the relay's OWN NEXT target (Bohr), never the quoted Heisenberg.
+    assert parse_next_token(relay["content"]) == "Bohr"
+
+
+@pytest.mark.anyio
+async def test_d1_relay_second_in_same_episode_overrides_to_human() -> None:
+    # D-1c: a 2nd redirect relay in the same episode overrides to ``NEXT: human`` to bound the
+    # chatroom-write cost. Episode window: walk back from the trigger until the first message
+    # whose author is neither the relay author nor the current author. Simulates a proposer that
+    # writes the bad handoff, gets relayed to (would say ``NEXT: Bohr``), then repeats the bad
+    # handoff — the 2nd redirect must land on human.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("review\n\nNEXT: Bohr"))
+    mcp.seed(author="Bohr", content="1st bad\n\nNEXT: Heisenberg")
+    # Simulate: the D-1 relay already fired once and Bohr repeated the same mistake.
+    mcp.seed(
+        author=_REDIRECT_RELAY_AUTHOR,
+        content="guard-(i) redirect: author=Bohr wrote target=Heisenberg …\n\nNEXT: Bohr",
+    )
+    mcp.seed(author="Bohr", content="2nd bad\n\nNEXT: Heisenberg")
+    outcome = await _conductor(mcp, _ScriptedDispatcher(mcp, {})).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    # Two relays total (the seeded one and the new one).
+    relay_posts = [p for p in mcp.posts if p["author"] == _REDIRECT_RELAY_AUTHOR]
+    assert len(relay_posts) == 1  # only the NEW relay is in mcp.posts (seeded ones aren't)
+    # The NEW relay's own NEXT: must be `human`, not `Bohr` — the 2nd-in-episode override.
+    assert relay_posts[0]["content"].rstrip().endswith("NEXT: human")
+
+
+@pytest.mark.anyio
+async def test_d1_relay_across_episode_boundary_uses_author_again() -> None:
+    # D-1c boundary: after an episode-closing message (any msg by an author who is neither the
+    # relay nor the current offender), the window resets. A NEW episode's first redirect uses
+    # ``NEXT: <author>`` again, not ``NEXT: human`` — the cap is per-episode, not per-thread.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("review\n\nNEXT: Bohr"))
+    mcp.seed(author="Bohr", content="1st bad\n\nNEXT: Heisenberg")
+    mcp.seed(
+        author=_REDIRECT_RELAY_AUTHOR,
+        content="guard-(i) redirect …\n\nNEXT: Bohr",
+    )
+    # Bohr self-corrects (a proposer handoff to naysayer). This closes the episode.
+    mcp.seed(author="Bohr", content="my bad, re-review\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("still no\n\nNEXT: Bohr"))
+    # Bohr repeats the mistake — new episode. The relay should say NEXT: Bohr, not human.
+    mcp.seed(author="Bohr", content="2nd bad but new episode\n\nNEXT: Heisenberg")
+    await _conductor(mcp, _ScriptedDispatcher(mcp, {})).run()
+    relay_posts = [p for p in mcp.posts if p["author"] == _REDIRECT_RELAY_AUTHOR]
+    assert len(relay_posts) == 1  # only the NEW relay (seeded relay not in .posts)
+    assert relay_posts[0]["content"].rstrip().endswith("NEXT: Bohr")
+
+
+def test_d1_relay_author_is_registered_as_machine_with_empty_legitimate() -> None:
+    # D-1a: the reserved identity ``conductor-redirect-relay`` must be classified as machine with
+    # ``legitimate=[]`` in ``spec/identity/legitimate_roles.yaml`` — same shape as
+    # ``pr-gate-relay``. Machine + empty legitimate is the honest value for a conductor-authored
+    # relay (Einstein msg-2539 Objection 1 acceptance / Bohr msg-2540 §1-4: giving the relay a
+    # role would break the I-6 invariant it exists to protect).
+    from spirrow_mindwire.identity.classification import (
+        default_classification_path,
+        load_legitimate_roles,
+    )
+
+    roles = load_legitimate_roles(default_classification_path())
+    entry = roles.by_key("conductor-redirect-relay")
+    assert entry is not None, (
+        "conductor-redirect-relay must be registered in spec/identity/legitimate_roles.yaml "
+        "(D-1a). Without registration, identity_findings surfaces every relay post as an "
+        "unclassified-author finding — noise on the fabrication detector."
+    )
+    assert entry.kind == "machine"
+    assert entry.legitimate == frozenset()

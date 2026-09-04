@@ -66,6 +66,20 @@ the loop autonomy it was not granted.
 
 The conductor never reaches ``main`` (D-5): merge-to-main stays a human / Tier-C action,
 structurally out of the loop.
+
+**D-1 redirect write-back (T-human-terminal-overuse msg-2540).** Guard (i)'s redirect used to be a
+silent side-effect: the conductor stopped at the human terminal, but posted nothing back, so the
+head token stayed on the offender's un-honoured target and ``head_skip`` (STOP_TOKENS = {none,
+human}) never SKIPped — the sweep re-launched the same dead thread on every backoff step (288
+observed bounces across 5 threads, msg-2537 §4). When a guard-(i) terminal fires (``handoff.kind ==
+ROLE ∧ handoff.role == implementer ∧ stop_reason == HUMAN``), the conductor now posts a
+chatroom-visible relay under a reserved machine identity (:data:`_REDIRECT_RELAY_AUTHOR` — same
+I-6 defence pattern as :data:`_PR_GATE_RELAY_AUTHOR`). Its ``NEXT:`` line uses author-based routing
+(msg-2540 §2-5): implementer-authored → ``NEXT: human``, other rostered author → ``NEXT: <author>``
+(so the offender wakes on the observation and can self-correct without paying a human turn), a 2nd
+relay in the same episode → ``NEXT: human`` (bound the chatroom-write cost). Routing itself is
+unchanged: guard (i) still redirects, carve-out ③ is still the only autonomous door to code,
+STOP_TOKENS is still the closed pair {none, human}. This relay is observation and hand-back only.
 """
 
 from __future__ import annotations
@@ -134,6 +148,22 @@ class PrGate(Protocol):
 # the deterministic fire_pr_review *verdict*, never by re-parsing this relay — so it is NOT a trust
 # marker: the gate trusts the driver outcome, not any author (msg-552/557).
 _PR_GATE_RELAY_AUTHOR = "pr-gate-relay"
+
+# D-1 (T-human-terminal-overuse msg-2540). The conductor authors its guard-(i)-redirect write-back
+# under this reserved name. Distinct from ``_PR_GATE_RELAY_AUTHOR`` so ``identity_findings.py`` can
+# separate the two conductor write paths: a PR-gate verdict relay and a guard-(i) redirect are
+# triggered by different structural events, and their bodies say different things (see
+# ``docs/identity-classification.md`` §5 and ``spec/identity/legitimate_roles.yaml``).
+#
+# What the relay MEANS. On a guard-(i) redirect terminal — a non-human, non-attested-naysayer
+# handoff-to-implementer that carve-out ① / ③ did not clear — the routing already stops at the human
+# terminal, silently. The relay writes that fact BACK into the thread so (a) the head token moves
+# off the offender's un-honoured target (unblocking ``head_skip.py``'s ``STOP_TOKENS`` when it
+# moves to ``human``) and (b) the offender wakes on the relay next round and can self-correct
+# (author-based routing, msg-2540 §2-5). Routing itself is unchanged: guard (i) still redirects,
+# carve-out ③ is still the only autonomous door to code, ``STOP_TOKENS`` still = {none, human}.
+# This relay is observation and hand-back only.
+_REDIRECT_RELAY_AUTHOR = "conductor-redirect-relay"
 
 
 class StopReason(StrEnum):
@@ -367,6 +397,24 @@ class Conductor:
                     f"§6 invariant broken: NO_HANDOFF on msg with next_participant set "
                     f"(msg={latest_msg_id!r}, field={_next_participant(latest)!r})"
                 )
+                # D-1 (T-human-terminal-overuse msg-2540): a guard-(i) redirect that terminated at
+                # the human (no forced consult fired, e.g. because the naysayer had already been
+                # consulted this segment) is the failure class msg-2537 §4 counted 288 times: a
+                # non-human, non-attested-naysayer nomination of the implementer stops silently and
+                # the head token never moves off the offender's un-honoured target, so head_skip
+                # (STOP_TOKENS = {none, human}) never SKIPs and the sweep re-launches the same dead
+                # thread on every backoff step. Write the redirect back as a chatroom post so the
+                # head moves and the offender wakes on the observation. The predicate is exact:
+                # ``handoff.kind is ROLE ∧ handoff.role is implementer ∧ stop_reason is HUMAN`` can
+                # only be reached via the guard-(i) fall-through (``_human_terminal(explicit_human=
+                # False)``); an explicit ``NEXT: human`` from the author would have ``handoff.kind
+                # is HUMAN`` instead, and every ABSENT path ends on ``NO_HANDOFF``, not ``HUMAN``.
+                if (
+                    stop_reason is StopReason.HUMAN
+                    and handoff.kind is HandoffKind.ROLE
+                    and handoff.role is self._implementer_role
+                ):
+                    await self._post_redirect_relay(handoff, messages)
                 return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
             if is_forced:
                 forced += 1
@@ -715,6 +763,144 @@ class Conductor:
             "author": _PR_GATE_RELAY_AUTHOR,
             "content": body,
         }
+
+    async def _post_redirect_relay(self, handoff: Handoff, messages: list[dict[str, Any]]) -> None:
+        """Post the D-1 write-back for a guard-(i) redirect terminal (msg-2540 §4 / §2-5).
+
+        Author-based routing rule (msg-2540 §2-5 as amended by Einstein Objection 2 acceptance
+        and Bohr's split on §2-2):
+
+        - author is the implementer (self-nomination case: ``Heisenberg → NEXT: Heisenberg``,
+          the 175/288 majority) → ``NEXT: human``. Author-nomination here would land the relay
+          right back on guard (i) via the relay author's un-rostered nomination-to-implementer
+          path (:meth:`_route`'s ``_roster_role`` returns ``None`` for the relay author) and
+          re-loop — Bohr's msg-2540 §2-2 mechanism.
+        - author is NOT the implementer (proposer / naysayer with no attestation / unrostered) →
+          ``NEXT: <author>``. The offender wakes on the relay next round and can self-correct
+          without paying a human turn (msg-2540 §2-1, 113/288 majority). An unrostered author has
+          no persona to route to, so falls back to ``NEXT: human``.
+        - **Episode limit** (msg-2540 §2-4): if a prior redirect relay already fired in the
+          current episode window (walk back until the first message authored by neither the
+          relay nor the current author closes the window), override to ``NEXT: human``. Without
+          this bound an author that keeps writing the same bad handoff spins at 1 chatroom-write
+          per bounce — worse than the current 288 silent spins at zero cost.
+
+        **D-1b (parser hijack prevention).** :func:`~.handoff.parse_next_token` reads the LAST
+        line matching the ``NEXT:`` line pattern. A body that quotes the offender's raw
+        ``NEXT: <token>`` at line-head anywhere later than the relay's own final ``NEXT:`` line
+        would shift what a downstream reader interprets as the relay's handoff. So the body
+        reports the intercepted token in prose (``author wrote target=<X>``), never as a
+        line-head ``NEXT:`` — nothing but the relay's own final line matches the pattern.
+
+        **No role stamp** (I-6, mirrors ``_post_pr_relay``). The relay is the conductor's own
+        framing of a routing event, not the words of any participant; claiming a role here would
+        fabricate the exact evidence the I-6 invariant exists to make meaningful.
+        """
+        author = _author(messages[-1])
+        author_role = self._roster_role(author)
+        target = self._decide_redirect_relay_target(author, author_role, messages)
+        # Diagnostics for the write-back body: name the two carve-outs that DID NOT clear the
+        # handoff, so a reader sees why guard (i) fired without having to re-derive it. Attest is
+        # only meaningful for the naysayer's own proceed (carve-out ③), so it appears only there.
+        author_role_str = author_role.value if author_role is not None else "unrostered"
+        intercepted_token = handoff.token or ""
+        # NOTE: the body deliberately does NOT contain any line starting with ``NEXT:`` except the
+        # very last one (the relay's own handoff). ``intercepted_token`` is quoted in prose, wrapped
+        # in a leading ``target=`` so the line begins with word characters and the ``^`` position of
+        # ``_NEXT_LINE_RE`` cannot match (the DECORATION class does not consume word chars). This
+        # keeps ``parse_next_token`` picking up the final ``NEXT: {target}`` line and only that one.
+        body = (
+            f"guard-(i) redirect (D-1, T-human-terminal-overuse msg-2540): "
+            f"author `{author}` (role: {author_role_str}) wrote a handoff to the implementer "
+            f"(target={intercepted_token!r}), but neither carve-out "
+            f"(① human-authored decide / ③ attested independent-naysayer proceed while "
+            f"control_state=run) applied, so the routing was intercepted and stopped at the "
+            f"human terminal.\n\n"
+            f"This post writes the observation back so the head token moves off the un-honoured "
+            f"implementer nomination (unblocking head_skip's stop-token SKIP) and — for a "
+            f"non-implementer author — the offender wakes here next round and can self-correct "
+            f"without paying a human turn. Routing itself is unchanged: guard (i) still "
+            f"redirects, carve-out ③ is still the only autonomous door to code, STOP_TOKENS is "
+            f"still the closed pair (none, human).\n\n"
+            f"NEXT: {target}"
+        )
+        await self._mcp.call_tool(
+            "chatroom_post_message",
+            {
+                "project": self._thread_ref.project_id,
+                "thread_id": self._thread_ref.thread_id,
+                "msg_type": "report",
+                "author": _REDIRECT_RELAY_AUTHOR,
+                "content": body,
+                # No ``role`` here, deliberately — mirrors ``_post_pr_relay``'s I-6 defence. The
+                # conductor holds no role; this relay is its own framing of a routing event, not
+                # a participant's words. See ``docs/identity-classification.md`` §5 for the
+                # classification (kind=machine, legitimate=[]).
+            },
+        )
+        logger.info(
+            "conductor redirect relay: author=%s author_role=%s intercepted_token=%r "
+            "relay_target=%s episode_second=%s",
+            author,
+            author_role_str,
+            intercepted_token,
+            target,
+            target == HUMAN_TOKEN
+            and author_role is not self._implementer_role
+            and author_role is not None
+            and bool(author.strip()),
+        )
+
+    def _decide_redirect_relay_target(
+        self,
+        author: str,
+        author_role: Role | None,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        """The target token the D-1 relay's own ``NEXT:`` line writes (msg-2540 §2-5).
+
+        See :meth:`_post_redirect_relay` for the full rule; this is the pure decision function so
+        it can be tested without any chatroom side-effect.
+        """
+        # Implementer authored → NEXT: human. Author-nomination for an implementer would re-enter
+        # guard (i) via the relay's un-rostered author (§2-2 Bohr).
+        if author_role is self._implementer_role:
+            return HUMAN_TOKEN
+        # Unrostered / empty author → NEXT: human (no persona to route to). Defensive fallback:
+        # the relay must always end on a valid stop token or a rostered participant name, or the
+        # next round's routing would ABSENT / NO_HANDOFF and the point of the write-back is lost.
+        if author_role is None or not author.strip():
+            return HUMAN_TOKEN
+        # Same-episode second redirect → NEXT: human, to bound the chatroom-write cost.
+        if self._episode_has_prior_redirect_relay(messages, author):
+            return HUMAN_TOKEN
+        return author
+
+    def _episode_has_prior_redirect_relay(
+        self, messages: list[dict[str, Any]], current_author: str
+    ) -> bool:
+        """Has a prior redirect-relay post fired in the current episode? (msg-2540 §2-4)
+
+        Episode window: the run of messages walking back from the head where every author is
+        either the redirect relay OR ``current_author``. The first message whose author is
+        neither closes the window. If any redirect relay sits inside that window, this would be
+        the 2nd redirect in the same episode — bound the chatroom-write cost by overriding to
+        ``NEXT: human`` (the relay's own text is then the last head, ``head_skip`` SKIPs, and
+        the human breaks the spin).
+
+        Case-insensitive author comparison so cosmetic casing drift in the chatroom cannot
+        silently split one author into two episodes.
+        """
+        author_key = current_author.casefold()
+        relay_key = _REDIRECT_RELAY_AUTHOR.casefold()
+        # Exclude the trigger itself (messages[-1]); walk back over the prior messages only.
+        for msg in reversed(messages[:-1]):
+            msg_author = _author(msg).casefold()
+            if msg_author == relay_key:
+                return True
+            if msg_author != author_key:
+                return False
+        return False
 
     def _to_event(self, msg: dict[str, Any], messages: list[dict[str, Any]]) -> ChatroomEvent:
         """Build the event for ``msg``, carrying the thread as ground truth (D-3).
