@@ -80,6 +80,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
 from ..github.client import ReviewEvent, parse_pr_ref
 from ..magickit.client import McpToolCaller
+from ..routing import GuardIVerdict, guard_proposer_to_implementer
 from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
 from ..value_objects import (
@@ -413,31 +414,25 @@ class Conductor:
         author = _author(messages[-1])
         author_role = self._roster_role(author)
 
-        # guard (i): design→implement Tier-C gate.
+        # guard (i): design→implement Tier-C gate. The predicate itself lives in
+        # :mod:`spirrow_mindwire.routing` (T-operator-board msg-2544 §C-3 single-source extraction);
+        # the operator-board's ``R-NEXT-HEIS-GUARD`` transition consults the same import, so the
+        # two callers cannot drift. Semantics preserved verbatim from the pre-extraction inline
+        # form — carve-out ① (human author), carve-out ③ (attested independent naysayer under
+        # RUN); carve-out ② (PR-gate verdict relay) is decided BEFORE this branch via
+        # ``HandoffKind.PR_REVIEW`` above (see the fire_pr_review path). Un-attested carve-out ③
+        # falls through to ``_human_terminal`` — the pre-existing safe path, no new failure mode.
+        # The verdict enum keeps the observations lifted booleans rather than raw objects so a
+        # future consumer (the board's transition table) can share the rule without also sharing
+        # this module's roster / control / attestation ownership.
         if handoff.kind is HandoffKind.ROLE and handoff.role is self._implementer_role:
-            if self._is_human(author):
-                # carve-out ① human-authored Tier-C decide. Tier-C msg-553 / msg-557.
-                assert handoff.identity is not None
-                return handoff.role, handoff.identity, False, False, None
-            # carve-out ③: when the project's loop control state is ``run``, the INDEPENDENT
-            # naysayer's OWN proceed-handoff to the implementer is honored without a per-step human
-            # GO. *Only* the naysayer may advance to code — the proposer cannot self-advance, which
-            # would let it bypass the naysayer's objection (Einstein msg-601 Fix-1). The naysayer's
-            # handoff IS this latest message (reviewing the current state), so a stale review cannot
-            # carry: the next iteration needs a fresh naysayer proceed AFTER the implementer's turn
-            # (reset-on-implementation). A naysayer escalation (``NEXT: human``) is not a
-            # proceed-handoff and falls through to the human terminal below, so the naysayer keeps
-            # its pull-the-human-back-in power at every state.
-            #
-            # P-3b (Tier-C msg-954 §2 / msg-970): the proceed must additionally carry the harness's
-            # own preflight stamp (:meth:`_attested`). Un-stamped, the branch is simply not taken
-            # and the turn falls through to ``_human_terminal`` below — the EXISTING safe path, so
-            # this adds no new failure mode, only a narrower door.
-            if (
-                author_role is self._naysayer_role
-                and self._control_state is ControlState.RUN
-                and self._attested(messages[-1])
-            ):
+            verdict = guard_proposer_to_implementer(
+                author_is_human=self._is_human(author),
+                author_is_naysayer=(author_role is self._naysayer_role),
+                control_state_is_run=(self._control_state is ControlState.RUN),
+                message_is_attested=self._attested(messages[-1]),
+            )
+            if verdict is GuardIVerdict.HONOR:
                 assert handoff.identity is not None
                 return handoff.role, handoff.identity, False, False, None
             # guard-(i) redirect is NOT an explicit human handoff: under the cost lever it does not
