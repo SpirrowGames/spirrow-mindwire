@@ -1,6 +1,6 @@
 # Operator Board — 設計書（実装レベル）
 
-版: **0.2** / 2026-09-05 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除）/ v0.2 差分の正本: Bohr msg-2544
+版: **0.3.1** / 2026-09-06 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除、msg-2567 → msg-2569 で v0.3.1 blocking 解除）/ v0.2 差分の正本: Bohr msg-2544 / v0.3 差分の正本: Bohr msg-2566 / v0.3.1 差分の正本: Bohr msg-2568
 設計 SOT: chatroom `spirrow-mindwire/T-operator-board`。本文はその同期コピー。
 対象リポジトリ: spirrow-conclair（状態）・spirrow-mindwire（tick / executor）・spirrow-magickit（UI）
 根拠: 2026-09-03〜04 operator セッションの実測（116 判断点）、light ティア判断リプレイ（一致 85%）、3 リポジトリのソース調査（conclair `cb517af` / mindwire `60f52b1` / magickit `6bfa87d`）
@@ -214,6 +214,7 @@ ALTER TABLE project_control ADD COLUMN desired_expires_at TIMESTAMPTZ NULL;
 | R-NEXT-HEIS-GUARD | any | `NEXT: Heisenberg` かつ `routing.guard_proposer_to_implementer(...)` が redirect を返す | `ready_for_human` | **判定はボードが持たない。** conductor と同じ述語（mindwire `routing.py`、PR #222）を呼ぶだけ。「naysayer に回すべきか」は J-ROUTE | J-ROUTE |
 | R-PUSH-GATE | implementing | PR の head が `gate_head_sha` と異なり CI が pending でない | `gate` | gate 発火（`naysayer_review.py` 相当を Python から直接） | |
 | R-CI-WAIT | implementing | head 更新、CI pending | （据え置き） | 次 tick へ | |
+| **E-CI-RED** | gate | `gate_admission` が `ROUTE_IMPLEMENTER` を返した（CI 赤 ∧ 現 head 未 route） | `implementing` | ci-route マーカ付きで relay → conductor を implementer で起動【v0.3.1 §A-5 / §B-3】 | |
 | R-GATE-RC | gate | verdict = CHANGES_REQUESTED on 現 head | `proposing` | Bohr を起こす（skill: RC は proposer へ） | J-ROUTE（例外: objection が全て機械的 nit のとき implementer 直行） |
 | R-GATE-OK | gate | verdict = APPROVED on 現 head ∧ CI 緑 ∧ !draft ∧ mergeable | `ready_for_human` | decision material 生成（推奨: merge）。**人に「教えて」と言わない** | |
 | R-MERGED | ready_for_human / any | gh で `merged=true` | `post_merge` | repo プロファイルの post-merge 手順（mindwire: sync-repo.ps1）→ 台帳 close 可否判定 → `NEXT: Bohr` 相当で proposing へ | |
@@ -230,6 +231,94 @@ ALTER TABLE project_control ADD COLUMN desired_expires_at TIMESTAMPTZ NULL;
 | R-HUMAN-SPIN | ready_for_human | `rounds=0 reason=human` が同 head で 3 回 | `stalled` | 原因 (1) 未 attest naysayer / (2) proposer→implementer 指名 を機械判定して facts に書く | |
 
 **遷移の優先順位**（同 tick に複数成立したとき）: R-HOLD > R-QUAR > R-MERGED > R-GATE-* > R-PUSH-GATE > R-NEXT-* > R-SILENT > R-STARVE。
+
+### 5.2A `gate_admission` — pre-gate CI-wait admission【v0.3.1】
+
+`NEXT: pr-review <ref>` を検出したとき、gate を「今このタイミングで呼んでよいか。呼べないなら誰に渡すか」を決める純関数。設計 v0.3.1 §A-1..§A-5 / §B-1..§B-3。現行 conductor と将来の operator tick の両方から同じ関数を呼ぶ（`routing.guard_proposer_to_implementer` と同じく単一 SOT）。実装: `src/spirrow_mindwire/gate_admission.py`。
+
+#### 5.2A.1 不変条件
+
+> **INV-CI-1** — naysayer モデルは `(head_sha, ci_conclusion)` の組につき高々 1 回しか呼ばれない。pending の観測はモデル呼び出しを伴わない（DEFER 経路）。R6（`ALREADY_REVIEWED`）が同一 head の再判定を dedupe する。
+
+> **INV-CI-2（改）** — `gate_admission` の入力に `verdict` は存在しない。∴ verdict の内容を読むことが**構造的に不可能**であり、carve-out ② をこの関数が所有することはあり得ない。`verdict_heads` は「その head に verdict が**在るか**」という admission の事実のみで、内容ではない。強制手段は grep でも AST でもなく**入力の不在**そのもの。署名テスト（`tests/test_gate_admission.py::test_inv_ci_2_gate_admission_signature_has_no_verdict_input`）は、その不在が事故で埋められないための早期警告として置く — 担保しているのは署名そのものであってテストではない（#222 で narrow した書き方を踏襲）。
+
+#### 5.2A.2 完了判定と待ち時計の分離（§A-1）
+
+**完了判定は timestamp を一切読まない**。
+
+- `concluded = rollup 非空 ∧ 全 check の status が "completed"`
+- `red = concluded ∧ ∃ conclusion ∈ {failure, timed_out, cancelled, action_required, startup_failure}`
+
+`started_at` / `created_at` は完了判定に登場しない。∴ 「CI が終わったか」は queued の null 有無と無関係に決まる。
+
+#### 5.2A.3 待ち時計 `ci_clock_start(rollup, head_committed_date)` を全域関数化（§A-2）
+
+```
+ts(c)          = c.started_at ?? c.created_at ?? None        # StatusContext は created_at しか持たない
+observed       = { ts(c) for c in rollup if ts(c) is not None }
+ci_clock_start = min(observed)            if observed ≠ ∅   → cap = CAP_CHECK   (6h)
+                 head_commit.committed_date if observed = ∅  → cap = CAP_NOCLOCK (12h)
+```
+
+`head_commit.committed_date` を最後の拠り所にした理由:
+
+- **常に存在する**（head sha があれば必ず引ける）。∴ 全域。
+- **head 束縛**。head が動けば時計も入れ替わるので、statelessness（head_skip が自動的に成り立つ性質）が fallback 経路でも壊れない。
+- **必ず真の開始時刻より早い**。∴ CAP は早く鳴ることはあっても遅れて鳴ることはない。誤りの向きが「人に早く渡す」側に固定される。
+
+fallback 側を 12h にしたのは、その早鳴りが実害になる唯一のケース（数日前に author した commit を今 push した）を実用上潰すため。それでも鳴ったら、**escalation message に必ず「どちらの時計を使ったか」（`clock=check` / `clock=commit`）を書く**ので、人は 1 行読んで「commit が古かっただけ」と判別できる。黙って早鳴りしない。
+
+`min(observed)` を選んだ理由: 途中で required check が増えれば時計は単調に早い側へ寄るだけ。∴ CAP が遅く鳴ることはない。
+
+#### 5.2A.4 admission 表（§A-3、msg-2568 で crash 経路を除去済み）
+
+| # | 条件 | admission | 行き先 |
+|---|---|---|---|
+| R1 | rollup 空（CI 未設定） | `INVOKE` | — |
+| R2 | `not concluded` ∧ `now − ci_clock_start ≤ cap` | `DEFER` | `NEXT: pr-review <ref>` 自己指名、**モデル呼び出しなし** |
+| R3 | `not concluded` ∧ CAP 超過 | `ROUTE_HUMAN` | 「CI stuck: `<check 名/status>`、時計 = `check`\|`commit`、起点 `<t>`」 |
+| R4 | `red` ∧ head ∉ `ci_red_routed_heads` | `ROUTE_IMPLEMENTER` | ci-route マーカ付きで implementer 起動（E-CI-RED） |
+| R5 | `red` ∧ head ∈ `ci_red_routed_heads`（新規 push なしで 2 度目） | `ROUTE_HUMAN` | 「同一 head で CI 赤 2 回、新規 push 無し」 |
+| R6 | `concluded ∧ ¬red` ∧ head ∈ `verdict_heads` ∧ `nomination_is_self` | `ALREADY_REVIEWED` | 既存 verdict の `NEXT:` に従う（撃ち直さない） |
+| R7 | `concluded ∧ ¬red`（それ以外） | `INVOKE` | — |
+
+- **CAP_CHECK = 6h**（`min(started_at)` 起点）: #222 の最長観測 2.5h（msg-2562）に headroom を足したサイズ。CAP に当たること自体が異常の信号なので、人に渡すのは正しい。
+- **CAP_NOCLOCK = 12h**（commit clock 起点）: fallback 側は真の開始時刻より早い分だけ余裕が必要。
+- R1 を分けたのは、CI の無い repo で 12h 待つ事故を防ぐため（fresh invocation にする）。
+- **R6 の `nomination_is_self`** により、operator の手動 `NEXT: pr-review` は常に override として通る（msg-2550 / 2556 / 2562 でやっていた撃ち直しの経路は残る）。自己指名だけが dedup 対象。
+
+#### 5.2A.5 唯一の新規レコード — ci-route マーカ（§A-5）
+
+R5 のループ安全のために `ci_red_routed_heads` が要る。これだけは ledger から derive できない（deferral は message を書かないため）。∴ **R4 で implementer に渡すときだけ** conductor が機械可読マーカ 1 行を relay message に付す:
+
+```
+<!-- mindwire:ci-route v1 {"head":"<sha>","conclusion":"failure","checks":["gate"]} -->
+```
+
+deferral（頻出）には書かず、CI 赤 routing（稀）にだけ書く。∴ スレッドノイズはほぼゼロ、状態ファイルもゼロ。v0.3.1 で唯一「記録を増やす」判断。
+
+#### 5.2A.6 3 つの辺の対照表（§B-3、concept drift の再発防止）
+
+`gate_admission` は「gate を今呼ぶか」だけを決め、gate の verdict をどう扱うかは決めない。関数がそれぞれ担当する辺を明示する:
+
+| 辺 | 決めるもの | 入力 | 実装 |
+|---|---|---|---|
+| proposer→implementer | guard (i) | 4 bool（human / naysayer / RUN / attested） | `guard_proposer_to_implementer`（#222 で landing） |
+| **gate verdict → 次役**（carve-out ②） | verdict の内容 | verdict | 既存経路。新規にモデル化しない（msg-2546 / msg-2564 の判断を維持） |
+| **CI 結論 → gate を呼ぶ / 待つ / implementer**（**E-CI-RED**）| 機械的事実 | rollup + head + 時計 | `gate_admission`（v0.3.1 新規） |
+
+3 行目は guard (i) の carve-out でも carve-out ② でもない**新しい辺**であり、conductor が機械的事実だけで決める（役の判断が入らない）。
+
+#### 5.2A.7 期待効果（#222 で再生した場合）
+
+| | 現行 | v0.3.1 |
+|---|---|---|
+| gate の CI-gate 短絡呼び出し（`pr_review.py:1613`） | 6 回（うち pending 3） | 3 回（pending 0、自己指名 backoff で吸収） |
+| pr-gate-relay の COMMENT 相当ノイズ | 3 回 | 0 回 |
+| 人の停止（gate ↔ 人） | 3 回（全部「聞くまでもない問い」） | 0 回 |
+| APPROVE 後の人の停止（merge = Tier-C） | 1 回 | 1 回（維持） |
+
+（msg-2568 §A-6 の元表は naysayer モデル呼び出し数を数えていたが、現行 `pr_review.py:1613` の L1 CI-gate 短絡は既に model 呼び出しを塞いでいる。減るのは pr-gate-relay の CI-gate 経路そのものと、対応する COMMENT 中継ノイズと、人の停止 — msg-2568 の意図はそのまま生きているが、数える単位を model call から gate invocation に置き換えた。実装 PR #224 で proposer に flag 済み。）
 
 ### 5.3 `waiting_on` の形
 
@@ -419,13 +508,18 @@ profile  = "ephemeral-develop"
 
 ## 12. 移行計画と受け入れ基準
 
+**P0 は「実装完了に依存」ではなく「契約凍結に依存」で並列化する**【v0.3.1 §B-1】。P1 と magickit は P0-D0（`contracts/board/v1/openapi.yaml` + vectors）の merge sha に着手条件を紐づけ、実装は fake に対して並行で書く。数日空転を消す。
+
 | Phase | 内容 | 受け入れ基準 | wrapper |
 |---|---|---|---|
+| **P0-D0** | **契約凍結**: `contracts/board/v1/openapi.yaml` + `contracts/board/v1/vectors/*.json`（各エンドポイントの request/response、**エラー shape 含む**）を conclair repo に merge | vectors が全 API を覆う。P1 / magickit の起票文面に本 merge sha が「着手条件」として書かれている | — |
 | P0 | Conclair: 0009 migration、`api/board.py`、`thread_relations` 派生書き込み、control TTL。magickit に `board_*` MCP ツール | alembic up/down 往復、既存テストが緑、`GET /related` が affects_threads / references から到達集合を返す | 変更なし |
-| P1 | mindwire `operator/`: observe + reconcile + push のみ（**行為なし**）。wrapper と並走。magickit `/dashboard/operator` 読み取り専用 | 当日の transcript の状況を再現した fixture で、reconcile が 116 判断点のうち決定的な 74 点（continue 系）と同じ列遷移を出す。盤面に 6 プロジェクトが並び、starvation と stalled が見える | 変更なし（tick が state ファイルも読む） |
+| P1 | mindwire `operator/`: observe + reconcile + push のみ（**行為なし**）。wrapper と並走。magickit `/dashboard/operator` 読み取り専用（**advisory only — conductor is authoritative** 常時表示、v0.3.1 §B-6 CON-P1-ADVISORY） | 当日の transcript の状況を再現した fixture で、reconcile が 116 判断点のうち決定的な 74 点（continue 系）と同じ列遷移を出す。盤面に 6 プロジェクトが並び、starvation と stalled が見える | 変更なし（tick が state ファイルも読む） |
 | P2 | 決定的遷移の引き継ぎ: R-MERGED、R-PUSH-GATE、R-GATE-*、R-NEXT-*（リース付き）、R-HOLD（TTL）、R-QUAR。sweep.json → backlog、quarantine → stalled | 「マージした」と人が言う必要が消える（R-MERGED が 5 分以内に post_merge へ動かす）。wrapper の候補ループを止めても 1 日のスループットが落ちない（PR land 数で比較）。**inventory gate 緑 ＋ 環境事前条件 assert を含む 1 周を人が見ている場で観測** | 候補ループ停止、digest / gate_bootstrap / git 準備は残す |
 | P3 | 判断点 J-ROUTE / J-ESCALATE / J-COND / J-STALL を light で。`waiting_on` 稼働。UI の override | 聞くまでもない問い 0 / 週。J-ESCALATE の override 率 < 10%。`operator_eval.py` が CI で粗分類 ≥ 0.85 | digest 移管、wrapper 退役 |
 | P4 | tomtebo-02: `[[nodes]]` 追加、§7 の並列規則、J-RELATED | 同一プロダクトで 2 node が implementing を並走し、関連スレッドが同時に取られない（fixture で検証） | — |
+
+**v0.3.1 の landing 順**: 現行 conductor 版 `gate_admission`（§5.2A、mindwire PR #224）→ 3 スレッドの起票（§16）→ P0-D0 → 並列 P0 / P1-with-fake / magickit-with-fake → 統合ターン → P2 カットオーバー。`gate_admission` は P0 より先に landing するので、**A landing 〜 board 稼働までの期間だけ、残った 1 回の人の停止（merge=Tier-C）に集約可視性が無い**期間が発生する（v0.3.1 §C の残余）。設計変更はしない。この期間はスレッドが唯一の可視面。
 
 対話型 operator（Claude Code）は P2 以降「盤面を見て人と話す」役になる。skill の `/mindwire-operator` は P3 で「ボードの読み方」に書き換える（skill 群は人の資産、書き換えは Tier-C）。
 
@@ -433,12 +527,14 @@ profile  = "ephemeral-develop"
 
 ## 13. 未決事項（設計レビューで決める）
 
-1. **【決定】Conclair へは magickit MCP 経由**（Einstein endorse、msg-2543）。magickit に `board_*` MCP ツールを足す。Conclair の「他サービスを呼ばない leaf」を守る。根拠の出所として **ADR-2026-06-04-18（mindwire デプロイ・トポロジと magickit 到達性）** が挙がったが未読。P0 着手前の read-back に本 ADR を項目として足し、実体があれば引用、無ければ不在を所見として記録する。どちらでも決定は変わらない【v0.2 #7】。
+1. **【決定】Conclair へは magickit MCP 経由**（Einstein endorse、msg-2543）。magickit に `board_*` MCP ツールを足す。Conclair の「他サービスを呼ばない leaf」を守る。根拠の出所として **ADR-2026-06-04-18（mindwire デプロイ・トポロジと magickit 到達性）** が挙がったが未読。P0 着手前の read-back に本 ADR を項目として足し、実体があれば引用、無ければ不在を所見として記録する。どちらでも決定は変わらない【v0.2 #7】。**v0.3.1 §D 補足**: ADR-2026-06-04-18 の実体が無い場合、conclair の schema と API 契約はこれに依存しないので **P0 は着手可**。ブロックされるのは magickit スレッドの deployment 節（MCP ツールの契約と UI は影響なし）のみ。topology の決定は新規 ADR が要る Tier-C(scope) として別に切り出す — P0/P1 を人待ちで止めない。CLAUDE.md §M が「ADR-10〜13 は参照名のみで実体未作成」と明記している以上、欠番はあり得る前提で分岐を先に置く。
 2. **【決定】`/related` の既定 depth=1、lease 経路は depth-1 固定**（v0.2 C-4）。depth 2 は J-RELATED / UI 限定、P1 末で消費者が無ければ削除。
 3. **【決定】guard (i) は単一述語に抽出（PR #222）**。ボードは呼ぶだけ。`T-human-terminal-overuse` の A 案が guard を変えるなら変更は 1 箇所。両側に依存を書く（v0.2 C-3）。
 4. **【決定】judgment 失敗時は保守側で進める**（Einstein endorse）。判断ログに `fallback=true`。
 5. **メモリの記述との差異**: 手元の記録では Conclair は「SQLite + WAL + FTS5」だが、ソースは PostgreSQL。設計はソースに従う。
 6. **【未決】P2 カットオーバー条件の観測手順の具体化**（inventory gate の実装が先）。
+7. **【決定・v0.3.1】pre-gate CI-wait は `gate_admission`（§5.2A）で単一 SOT。INV-CI-2 (改) の強制は署名の入力不在**（msg-2568 §B-2、Einstein endorse msg-2569）。carve-out ② と E-CI-RED は別の辺で、`gate_admission` は carve-out ② を所有しない。
+8. **【決定・v0.3.1】completion 判定と待ち時計の分離**（msg-2568 §A-1）。`ci_clock_start` は `started_at ?? created_at ?? committed_date` で全域関数化、CAP_NOCLOCK=12h で fallback、escalation 文字列に必ず clock 名を含める（Einstein endorse msg-2569）。
 
 ---
 
@@ -448,9 +544,55 @@ profile  = "ephemeral-develop"
 - msg-2544 Bohr: C-1 accept（排他対象は filesystem ではなく push 先。repo lease を fleet-wide 1 枚、辞書順 all-or-nothing）、C-2 accept（inventory gate + 環境事前条件 assert + 破壊的操作の限定 + カットオーバー条件）、C-3 accept（単一述語に抽出）、C-4 partial accept（lease 経路は depth-1）。ADR-2026-06-04-18 は未読のため引用せず read-back 項目に。
 - msg-2545 Einstein: 両 blocking 解除。「deadlock は all-or-nothing で閉じ、live-lock は tick 再試行で吸収」を確認。construction 可。
 - msg-2546 Heisenberg: v0.2 item 5（guard (i) 抽出）を PR #222 として実装。item 1/2/3/6 は P0 Conclair 依存、item 4/7 は follow-up。
+- **msg-2566 Bohr（v0.3）**: A pre-gate CI-wait（R-CI-WAIT 現行 conductor 版）、B 3 スレッドの契約境界（P0-D0 契約凍結で並列化）、C #222 advisory の同梱、D ADR-2026-06-04-18 欠番時の分岐。
+- **msg-2567 Einstein**: BLOCKING edge-case（`min(startedAt)` が queued で crash）、BLOCKING correctness（R4 = carve-out ② は factually false）。他 6 点 endorse。
+- **msg-2568 Bohr（v0.3.1）**: 両 blocking 全面受け入れ（押し戻し 0）。完了判定と時計を分離、`ci_clock_start` を `committed_date` fallback で全域化、CAP_NOCLOCK=12h、`route_pr_gate_outcome` → `gate_admission` へ改名、INV-CI-2 (改) を「入力の不在による構造的強制」に書き換え、3 辺の対照表と E-CI-RED を新設。
+- **msg-2569 Einstein**: 両 blocking 解除、v0.3.1 承認（"code work may proceed"）。時計と status の分離、署名レベル境界強制、E-CI-RED の別辺明示化を endorse。
+- **msg-（本 PR）Heisenberg**: v0.3.1 §A（`gate_admission` 純関数 + 36 tests）と §C（16 行 truth table）を mindwire PR #224 として実装。ci-route マーカ書込は conductor wiring follow-up に切り出し、本 docs PR で明示。§A-6 期待効果表の「naysayer モデル呼び出し数」については `naysayer/pr_review.py:1613` の L1 CI-gate 短絡が既に model 呼び出しを塞いでいる事実を確認、数える単位を「gate invocation + relay noise + 人の停止」に置き換え（PR #224 記述、本 docs §5.2A.7 反映）。
 
 ## 15. 開発の進め方（2026-09-05 Takahito 承認）
 
 設計スレッドは spirrow-mindwire の chatroom に立て、Einstein の設計レビューを通す。実装は **3 リポジトリで 3 スレッド**（conclair: P0 / mindwire: P1–P3 / magickit: P1 UI）に分け、依存は両側に書く（規約 3）。順序は conclair → mindwire と magickit 並行。P2 の「wrapper の候補ループ停止」は Tier-C。
 
 ループに載せる根拠: P0 と P1 は仕様が閉じていて、当日の自律レーンが #218〜#221 を完走した粒度に近い。載せない根拠: 3 repo 跨ぎの依存と、ループ自身の実行部を作り替える再帰性。→ **P0/P1/UI はループ、P2 のカットオーバーだけ operator lane（人が見ている場で）**。設計書の正本は本ファイル（repo）と Prismind、chatroom `spirrow-mindwire/T-operator-board` が設計レビューと裁定の SOT。
+
+---
+
+## 16. 3 スレッドの契約境界と起票文面【v0.3.1 §B】
+
+### 16.1 契約 vector の SOT と vendoring 機械チェック（§B-2）
+
+vector の SOT は **conclair repo 一箇所**。他 2 repo は vendor し、`contracts/board/v1/SOURCE` に取得元 commit sha を記録、**vendor 済みファイルの hash が記録 sha のものと一致しなければ CI が落ちる**テストを置く（CLAUDE.md の `EPHEMERAL-DEVELOP-PROCEDURE-V1` sentinel と同じ「SOT 1 + コピーに機械検査」の型）。コピーを黙って腐らせない。
+
+### 16.2 3 スレッドの起票文面に必ず入れる 4 行（§B-3）
+
+どのスレッドも、これが無いと D7（静かに止まる）を自分で踏む:
+
+1. **着手条件**（例: 「P0-D0 が merge されていること」）
+2. **環境事前条件**（repo_dir の実在パス、CI の有無）
+3. **依存の裏側**（自分が止まると誰が止まるか）
+4. **fail-loud 規約**: 着手条件・環境条件が満たされないと分かった時点で、黙って idle にせず `parked` + 理由を 1 本書く
+
+### 16.3 conclair `repo_dir` 未確認への設計制約（§B-4）
+
+> **CON-P0-ENV**: repo_dir が無い状態の P0 スレッドを sweep に載せてはならない。載せるなら第 1 ターンは環境 probe で、結果（有/無）を必ず message にする。
+
+「掲載したが動かない」は D7 が最優先で消すと決めた故障そのもの。∴ probe → 無ければ `parked`（理由付き）→ Takahito の clone 後に `backlog` へ、が正しい順。probe 前に載せるのは不可。
+
+### 16.4 各スレッドのスコープ（§12 / §15 の確定、§B-5）
+
+| thread | repo | 内容 | 着手条件 |
+|---|---|---|---|
+| `T-operator-board-p0` | conclair | **D0 契約凍結** → alembic 0009（board_cards / board_events / board_leases(project, resource_key) / board_nodes / board_judgments / thread_relations）→ `api/board.py` → relations 派生書き込み（`/related` は **default depth=1**、v0.2 item 6）→ `project_control.desired_expires_at` | CON-P0-ENV の probe 成功 |
+| `T-operator-board-mcp-and-ui` | magickit | `board_*` MCP ツール（**Conclair 直叩きはしない**、§13.1 確定）／`/dashboard/operator` 読み取り専用、既存 `board.py` 置換、`presented_hash` 再提示抑止 | P0-D0 |
+| `T-operator-board-p1` | mindwire | `operator/` observe + reconcile（純関数）+ push、**act 無し**／`run_conductor(settings, project=, thread_id=, repo_dir=)` と `Set-TomlValue` 廃止／**inventory gate**（v0.2 item 4）／`gate_admission` を `HandoffKind.PR_REVIEW` の前に呼ぶ conductor wiring（本 v0.3.1 §5.2A の実装 follow-up。fetch_check_rollup の追加、verdict_heads / ci_red_routed_heads の thread からの derive、ci-route マーカ書込を含む） | P0-D0 |
+
+**inventory gate は proposer（Bohr）の仕事として P1 スレッドの初回ターンで着手する。** §6.4 が in-repo で読めるようになったので msg-2546 の deferral 理由は消えた。受け入れ条件:
+
+> **ACC-INV-1**: `run-conductor-scheduled.ps1` の全関数が分類表に**ちょうど 1 回**現れ、owner が `port` / `drop` / `keep-in-wrapper` のいずれかである。`unclassified` が 1 件でも残る間は P2 カットオーバーを実行しない。
+
+### 16.5 P1 期間中の二重権威（§B-6、CON-P1-ADVISORY）
+
+P1 は push-only なので board は行為しないが、**board を人が読んで動くと conductor と board が二重に「次の役」を決める**期間が生まれる。∴:
+
+> **CON-P1-ADVISORY**: P1 の `/dashboard/operator` は「advisory only — conductor is authoritative」を常時表示し、カードの `next` は派生値であることを明示する。P2 カットオーバーまで board 由来の指示で人が動く導線（ボタン・コピー可能なコマンド）を置かない。
