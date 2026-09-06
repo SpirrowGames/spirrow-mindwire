@@ -1,6 +1,6 @@
 # Operator Board — 設計書（実装レベル）
 
-版: **0.3.2** / 2026-09-06 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除、msg-2567 → msg-2569 で v0.3.1 blocking 解除）+ PR-review naysayer（PR #224 msg-(gate) → v0.3.2 blocking 解除）/ v0.2 差分の正本: Bohr msg-2544 / v0.3 差分の正本: Bohr msg-2566 / v0.3.1 差分の正本: Bohr msg-2568 / v0.3.2 差分の正本: 本ファイル §5.2A（Heisenberg、PR-review msg-(gate) 受け入れ）
+版: **0.3.3** / 2026-09-06 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除、msg-2567 → msg-2569 で v0.3.1 blocking 解除）+ PR-review naysayer（PR #224 msg-(gate) → v0.3.2 で 2 件 blocking 解除、round-2 → v0.3.3 で 1 件 blocking 解除）/ v0.2 差分の正本: Bohr msg-2544 / v0.3 差分の正本: Bohr msg-2566 / v0.3.1 差分の正本: Bohr msg-2568 / v0.3.2 差分の正本: 本ファイル §5.2A（Heisenberg、PR-review msg-(gate) 受け入れ）/ v0.3.3 差分の正本: 本ファイル §5.2A.4 R1a/R1b 行（Heisenberg、PR-review msg-(gate) round-2 受け入れ）
 設計 SOT: chatroom `spirrow-mindwire/T-operator-board`。本文はその同期コピー。
 対象リポジトリ: spirrow-conclair（状態）・spirrow-mindwire（tick / executor）・spirrow-magickit（UI）
 根拠: 2026-09-03〜04 operator セッションの実測（116 判断点）、light ティア判断リプレイ（一致 85%）、3 リポジトリのソース調査（conclair `cb517af` / mindwire `60f52b1` / magickit `6bfa87d`）
@@ -275,8 +275,8 @@ fallback 側を 12h にしたのは、その早鳴りが実害になる唯一の
 | # | 条件 | admission | 行き先 |
 |---|---|---|---|
 | **R0-OVERRIDE** | `not nomination_is_self`（operator / role の手動 handoff） | `INVOKE` | — 【v0.3.2、msg-(gate) BLOCKING-2】 |
-| **R1a** | rollup 空 ∧ `now − head_committed_date ≤ CAP_EMPTY_RACE` | `DEFER` | 自己指名、**モデル呼び出しなし**【v0.3.2、msg-(gate) BLOCKING-1】 |
-| **R1b** | rollup 空 ∧ CAP_EMPTY_RACE 超過（steady-state「CI 未設定」） | `INVOKE` | — 【v0.3.2】 |
+| **R1a** | rollup 空 ∧ `now − head_pushed_at ≤ CAP_EMPTY_RACE` | `DEFER` | 自己指名、**モデル呼び出しなし**【v0.3.2 導入、v0.3.3 で discriminator を push clock に変更 — msg-(gate) BLOCKING-1 / round-2】 |
+| **R1b** | rollup 空 ∧ CAP_EMPTY_RACE 超過（`head_pushed_at` 基準、steady-state「CI 未設定」） | `INVOKE` | — 【v0.3.2 / v0.3.3】 |
 | R2 | `not concluded` ∧ `now − ci_clock_start ≤ cap` | `DEFER` | `NEXT: pr-review <ref>` 自己指名、**モデル呼び出しなし** |
 | R3 | `not concluded` ∧ CAP 超過 | `ROUTE_HUMAN` | 「CI stuck: `<check 名/status>`、時計 = `check`\|`commit`、起点 `<t>`」 |
 | R4 | `red` ∧ head ∉ `ci_red_routed_heads` | `ROUTE_IMPLEMENTER` | ci-route マーカ付きで implementer 起動（E-CI-RED） |
@@ -286,7 +286,7 @@ fallback 側を 12h にしたのは、その早鳴りが実害になる唯一の
 
 - **CAP_CHECK = 6h**（`min(started_at)` 起点）: #222 の最長観測 2.5h（msg-2562）に headroom を足したサイズ。CAP に当たること自体が異常の信号なので、人に渡すのは正しい。
 - **CAP_NOCLOCK = 12h**（commit clock 起点）: fallback 側は真の開始時刻より早い分だけ余裕が必要。
-- **CAP_EMPTY_RACE = 5min**（commit clock 起点、v0.3.2 追加）: GitHub Actions の CheckSuite は push 後に一瞬空を返す（数秒〜稀に分単位）ため、空 rollup を即座に「CI 未設定」と決めつけると naysayer の L1 CI-gate が fail-close→implementer→fix loop の pathological な循環に入る。CAP_EMPTY_RACE 以内は DEFER で CheckSuite の populate を待ち、以後は R1b で「genuinely 未設定」と判定する。
+- **CAP_EMPTY_RACE = 5min**（**push clock** 起点、v0.3.2 追加 / v0.3.3 で clock を commit → push に切替）: GitHub Actions の CheckSuite は push 後に一瞬空を返す（数秒〜稀に分単位）ため、空 rollup を即座に「CI 未設定」と決めつけると naysayer の L1 CI-gate が fail-close→implementer→fix loop の pathological な循環に入る。CAP_EMPTY_RACE 以内は DEFER で CheckSuite の populate を待ち、以後は R1b で「genuinely 未設定」と判定する。**v0.3.3 は clock を `head_committed_date` から `head_pushed_at`（GraphQL `commits.nodes[-1].commit.pushedDate` → REST `pull_request.head.repo.pushed_at` → REST `pull_request.updated_at` の順で fallback）に変更**: cherry-pick や既存 branch の re-push で `committed_date` が CAP を超えていても push 直後は grace window にとどまる（CheckSuite race は push イベントに束縛されるため）。`head_committed_date` は `ci_clock_start` の fallback（R2/R3 all-null rollup）にのみ残る — msg-2568 §A-2 の決定は不変。
 - **R0-OVERRIDE**（v0.3.2 追加）は msg-2566 §A-3 R6 note の「operator の手動 `NEXT: pr-review` は常に override として通る」を R6 単独から**全 admission 状態**に一般化したもの。R3（stuck CI）や R5（loop-safety escalation）で summon された operator が再指名しても escalation が re-fire する trap（msg-(gate) BLOCKING-2）を構造的に消す。naysayer の L1 CI-gate（`pr_review.py:1613`）は非 SUCCESS CI で model call 抜きに COMMENT へ短絡するので、R0-OVERRIDE 経由の manual invoke は pending / red CI 上でも model round を焼かない。
 - **R6 は self-nomination 経路のみ到達可能**（v0.3.2 で `and nomination_is_self` を落とした）。R0-OVERRIDE が non-self handoff を先に食うため、R6 に到達するのは conductor 自身の DEFER wake-up のみ。振る舞いは不変、rule label が実体を反映するようになった。
 
@@ -554,6 +554,8 @@ profile  = "ephemeral-develop"
 - **msg-（PR #224）Heisenberg（v0.3.1 実装）**: v0.3.1 §A（`gate_admission` 純関数 + 36 tests）と §C（16 行 truth table）を mindwire PR #224 として実装。ci-route マーカ書込は conductor wiring follow-up に切り出し、本 docs PR で明示。§A-6 期待効果表の「naysayer モデル呼び出し数」については `naysayer/pr_review.py:1613` の L1 CI-gate 短絡が既に model 呼び出しを塞いでいる事実を確認、数える単位を「gate invocation + relay noise + 人の停止」に置き換え（PR #224 記述、本 docs §5.2A.7 反映）。
 - **msg-(gate) PR-review naysayer（v0.3.2 blocking 2 件）**: BLOCKING-1（correctness — 空 rollup が GitHub Actions startup latency の race window で INVOKE を返し、naysayer が UNKNOWN 短絡→implementer→fix loop に入る）、BLOCKING-2（edge-case — `nomination_is_self` が R6 でしか consult されず、R3/R5 で summon された operator が re-nomination で escalation loop に閉じ込められる）。The bar is on how the design misreads reality (BLOCKING-1) と how the design leaves the operator's only escape valve inaccessible (BLOCKING-2), 両方とも構造の欠陥で in-body guard では塞げない類。
 - **msg-（PR #224 fix）Heisenberg（v0.3.2 受け入れ）**: 押し戻しゼロ。BLOCKING-1 → R1 を R1a（fresh commit + 空 → DEFER）/ R1b（過ぎたら INVOKE、CAP_EMPTY_RACE=5min で判別）に分割。BLOCKING-2 → `nomination_is_self=False` を先頭の R0-OVERRIDE として promote、下流の全 admission 状態を bypass、R6 の redundant guard を削除。§5.2A.4 表に 3 行追加、INV-CI-1 に manual-override carve-out を明記、Heisenberg fix commit で 16 追加 tests。R0-OVERRIDE の precedence は `test_r0_override_wins_over_every_downstream_rule` の 7 行 parametrised meta-test で pin。
+- **msg-(gate) PR-review naysayer round-2（v0.3.3 blocking 1 件）**: edge-case — v0.3.2 の R1a/R1b discriminator が `head_committed_date` を「push 時刻の proxy」として使っていたが、これは cherry-pick / 既存 branch の re-push / 過去の commit を含む push で成立しない。3 時間前 author の commit を今 push すると `commit_age > CAP_EMPTY_RACE` になり R1b が誤発火、CheckSuite startup race の最中に naysayer を起こして fail-close COMMENT を落とす。BLOCKING-1 の緩和が古い commit で完全に無効化される。
+- **msg-（PR #224 fix v0.3.3）Heisenberg（round-2 受け入れ）**: 押し戻しゼロ。`gate_admission` に新 kwarg `head_pushed_at: datetime` を追加、R1a/R1b の discriminator を `push_age = now - head_pushed_at` に変更。`head_committed_date` は `ci_clock_start` fallback にのみ残る（msg-2568 §A-2 決定を保持）。CAP_EMPTY_RACE の rationale コメントを push clock 起点に更新。呼び出し側は GraphQL `pushedDate` → REST `head.repo.pushed_at` → REST `pull_request.updated_at` の順で best-available proxy を渡す。4 新規 tests: 3 時間前 commit + 30 秒前 push → R1a（naysayer の元 scenario）、1 年前 commit + 10 秒前 push → R1a（極端版）、10 秒前 commit + 6 時間前 push → R1b（symmetric 側から invariant を pin）、reason 文字列に `push_age=` があり `commit_age` が無い（audit trail）。
 
 ## 15. 開発の進め方（2026-09-05 Takahito 承認）
 
