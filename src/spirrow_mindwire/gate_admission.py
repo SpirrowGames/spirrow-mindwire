@@ -48,23 +48,53 @@ The two clocks carry different caps (:data:`CAP_CHECK` = 6 h, :data:`CAP_NOCLOCK
 escalation (the only direction the ``committed_date`` fallback can err in — an
 old commit that was pushed today) is distinguishable at the escalation point.
 
-The admission table (rules R1-R7)
----------------------------------
+The admission table (R0 / R1a / R1b / R2-R7)
+--------------------------------------------
 
-Numbered exactly as in design §A-3. The ``rule`` field on :class:`AdmissionResult`
+Numbered as in design v0.3.1 §A-3, with R0-OVERRIDE and the R1a / R1b split
+added in v0.3.2 to address PR-review msg-(gate) BLOCKING-1 (empty-rollup race
+on GitHub Actions startup latency) and BLOCKING-2 (operator override trapped
+by R3 / R5 escalations). The ``rule`` field on :class:`AdmissionResult`
 carries the ID for auditability and metrics.
 
-* **R1** — rollup is empty (no CI configured for this PR). ``INVOKE``. The
-  gate runs; the naysayer's own CI-gate short-circuit (``fetch_ci_status`` →
-  ``CiState.UNKNOWN``) is the fail-closed default for repositories without
-  configured Actions.
+* **R0-OVERRIDE** — ``nomination_is_self`` is ``False``. ``INVOKE``. Any handoff
+  not authored by the conductor's own pr-gate-relay is treated as a manual
+  override: the operator (or any other role) who wrote the ``NEXT: pr-review
+  <ref>`` has decided the gate should run now, and admission gets out of the
+  way. The naysayer's own L1 CI-gate short-circuit at ``pr_review.py:1613``
+  still holds — an INVOKE on non-SUCCESS CI returns COMMENT without a model
+  call — so R0-OVERRIDE cannot burn a model round on pending / red CI. The
+  design principle in msg-2566 §A-3 R6 note ("operator の手動 `NEXT: pr-review`
+  は常に override として通る。自己指名だけが dedup 対象") is generalised here
+  from R6-only to all admission states. Without this, an operator summoned by
+  R3 or R5 was trapped: their manual re-nomination hit the same escalation
+  and re-summoned them (PR-review msg-(gate) BLOCKING-2).
+* **R1a** — rollup is empty AND ``now - head_committed_date <= CAP_EMPTY_RACE``.
+  ``DEFER``. The GitHub Actions CheckSuite is not populated instantly on push
+  — the checks API can return ``[]`` for several seconds after the ref moves
+  even when CI IS configured for this repo. Treating that transient ``[]`` as
+  R1's old "no CI configured" would wake the naysayer (pr_review.py:1613
+  short-circuits with COMMENT on UNKNOWN CI) on every tick during the race,
+  and if the implementer read the COMMENT as a rejection it would push a
+  "fix" — a pathological loop the PR-review flagged as BLOCKING-1. R1a
+  DEFERs during a bounded startup grace so the CheckSuite has time to
+  populate; on the next tick the rollup is non-empty and R2-R7 take over.
+* **R1b** — rollup is empty AND ``now - head_committed_date > CAP_EMPTY_RACE``.
+  ``INVOKE``. Past the startup grace, an empty rollup is genuinely "no CI
+  configured for this PR" (or CI is misconfigured beyond the startup
+  window). The gate runs; the naysayer's L1 CI-gate short-circuit is the
+  fail-closed default. This is a single COMMENT, not a loop: the implementer
+  does not push a "fix" for "CI is UNKNOWN — please configure Actions".
 * **R2** — CI incomplete and ``now - ci_clock_start.at <= cap``. ``DEFER``.
   Self-nominate the next ``NEXT: pr-review <ref>`` — do NOT invoke the model
   (INV-CI-1).
 * **R3** — CI incomplete and CAP exceeded. ``ROUTE_HUMAN``. Escalation reason
   names the incomplete check and the clock used, so an operator can tell "the
   CI is genuinely stuck" from "we fell back to the commit clock and it fired
-  because the commit is old".
+  because the commit is old". A summoned operator who wants to force an
+  invocation despite the stall re-writes the handoff by hand — that flips
+  ``nomination_is_self`` to ``False`` and R0-OVERRIDE fires (PR-review
+  msg-(gate) BLOCKING-2).
 * **R4** — CI red and this head has NOT been routed to the implementer for a
   CI fix in this thread. ``ROUTE_IMPLEMENTER``. The conductor writes a
   machine-readable ``<!-- mindwire:ci-route v1 ... -->`` marker on the relay
@@ -72,18 +102,26 @@ carries the ID for auditability and metrics.
   the same head without a new push".
 * **R5** — CI red and this head has already been routed to the implementer.
   ``ROUTE_HUMAN``. Loop-safety: an implementer that could not fix the CI in
-  one round should not be dispatched again without a human deciding.
-* **R6** — CI green, a prior gate verdict already lives on this head in this
-  thread, and the latest handoff was a self-nomination (i.e., the DEFER path
-  woke us up on the same head we already reviewed). ``ALREADY_REVIEWED``. Do
-  not re-invoke the model; the earlier verdict's ``NEXT:`` line is authoritative.
-  Operator's manual ``NEXT: pr-review <ref>`` (``nomination_is_self=False``)
-  is a deliberate override — it bypasses this rule and falls through to R7.
+  one round should not be dispatched again without a human deciding. Operator
+  who wants a retry on the same red head does so by manual handoff (R0-OVERRIDE
+  path) or by pushing a new commit (which rotates the head out of
+  ``ci_red_routed_heads``).
+* **R6** — CI green and a prior gate verdict already lives on this head in
+  this thread. ``ALREADY_REVIEWED``. Do not re-invoke the model; the earlier
+  verdict's ``NEXT:`` line is authoritative. This branch is only reached from
+  self-nomination (R0-OVERRIDE has already returned INVOKE on manual
+  handoffs), so the ``nomination_is_self`` check that used to guard it is
+  redundant and has been removed in v0.3.2 — the semantics are unchanged.
 * **R7** — CI green (default). ``INVOKE``.
 
 INV-CI-1 (design §A-1): the naysayer model is invoked at most once per
-``(head_sha, ci_conclusion)`` pair. The pending observation costs zero model
-calls; R6 dedupes a re-invocation on the same reviewed head.
+``(head_sha, ci_conclusion)`` pair *along the self-nomination path*. Manual
+overrides (R0-OVERRIDE) are counted separately and always allowed — a
+deliberate re-invocation by an operator or role is not "waste" but an
+explicit ask, and the naysayer's L1 short-circuit still absorbs the
+non-SUCCESS cases without a model call. The pending observation on the
+self-nomination path costs zero model calls; R6 dedupes a self-nominated
+re-invocation on the same reviewed head.
 
 E-CI-RED (design §B-3): the ``red → implementer`` edge is the CI-fix routing,
 NOT carve-out ②. Carve-out ② is the *verdict content* being relayed by the
@@ -95,7 +133,9 @@ Attribution
 
 T-operator-board msg-2566 §A (design v0.3), msg-2568 §A/§B (v0.3.1 —
 total-function ``ci_clock_start`` and the ``gate_admission`` rename with
-signature-level INV-CI-2 enforcement).
+signature-level INV-CI-2 enforcement), PR-review msg-(gate) BLOCKING-1/-2
+(v0.3.2 — empty-rollup race split into R1a/R1b, R0-OVERRIDE promoted from
+R6-only to top-level).
 """
 
 from __future__ import annotations
@@ -231,6 +271,19 @@ CAP_CHECK: timedelta = timedelta(hours=6)
 #: operator can distinguish a real stall from a fallback-clock false-early.
 CAP_NOCLOCK: timedelta = timedelta(hours=12)
 
+#: Startup grace for the "empty rollup" case (v0.3.2, PR-review msg-(gate)
+#: BLOCKING-1). GitHub Actions CheckSuites do not populate instantly on push
+#: — the checks API can return ``[]`` for several seconds (occasionally
+#: longer) even when CI IS configured. During this window R1a DEFERs so the
+#: naysayer is not woken up to fail-close on an UNKNOWN rollup only to loop
+#: on the implementer's "fix". Sized generously (5 min ≫ typical Actions
+#: population time of seconds) so a slow scheduler run never mis-classifies a
+#: race as "no CI configured". Past this cap, R1b returns INVOKE on the
+#: assumption CI is genuinely absent — the naysayer's L1 CI-gate short-circuit
+#: at ``pr_review.py:1613`` then handles it deterministically with a single
+#: COMMENT (no loop, no model call).
+CAP_EMPTY_RACE: timedelta = timedelta(minutes=5)
+
 
 def _concluded(rollup: Sequence[CheckRow]) -> bool:
     """Rollup is non-empty and every check's ``status`` equals :data:`COMPLETED`.
@@ -321,11 +374,11 @@ def gate_admission(
 ) -> AdmissionResult:
     """Answer whether the PR gate may be invoked now, and if not who is next.
 
-    See the module docstring for the admission table (R1-R7). This function is
-    pure — no I/O, no clock reads (``now`` is passed in), no mutable state.
-    Every observation the caller must lift from the world is a parameter, so
-    a fake CI rollup + a fixed ``now`` deterministically drives the entire
-    decision surface.
+    See the module docstring for the admission table (R0 / R1a / R1b / R2-R7).
+    This function is pure — no I/O, no clock reads (``now`` is passed in), no
+    mutable state. Every observation the caller must lift from the world is a
+    parameter, so a fake CI rollup + a fixed ``now`` deterministically drives
+    the entire decision surface.
 
     ``verdict`` is deliberately absent from the signature (INV-CI-2 改,
     design §B-2). Reading the PR-gate verdict *content* is therefore
@@ -337,26 +390,33 @@ def gate_admission(
     ----------
     rollup :
         The head SHA's status rollup, one :class:`CheckRow` per check. Empty
-        means "no CI configured for this PR" (R1); the caller must not
-        conflate "empty" with "not yet fetched" — a failed fetch should be
-        raised at the caller, not passed in as empty.
+        can mean two things and this function distinguishes them by the commit
+        clock: "CI has not yet populated the CheckSuite after this push" (R1a,
+        DEFER) or "this PR genuinely has no CI configured" (R1b, INVOKE). The
+        caller must not conflate "empty" with "not yet fetched" — a failed
+        fetch should be raised at the caller, not passed in as empty.
     head_sha :
         The PR's current head SHA. Used to key ``verdict_heads`` and
         ``ci_red_routed_heads`` and to identify the PR in the escalation
         message (R3/R5).
     head_committed_date :
         The commit's ``committedDate`` (the ``authored_date`` is not right —
-        an old commit can be committed today). Used only when the rollup
-        contributes no timestamp (see :func:`ci_clock_start`).
+        an old commit can be committed today). Used by :func:`ci_clock_start`
+        as the last-resort clock (R2/R3 with all-null rollup) AND by the R1a
+        startup-grace discriminator for empty rollups (v0.3.2).
     now :
         The current wall clock. Passed as a parameter so tests can drive
         the CAP boundary deterministically.
     nomination_is_self :
         ``True`` if the latest ``NEXT: pr-review <ref>`` was authored by the
         conductor's own pr-gate-relay (a DEFER wake-up). ``False`` if the
-        operator or a role wrote the handoff by hand — the manual override
-        path bypasses R6, so the caller cannot silently suppress a manual
-        re-review.
+        operator or a role wrote the handoff by hand — v0.3.2 promotes this
+        to a top-level R0-OVERRIDE so a manual handoff always INVOKEs,
+        regardless of admission state. This was extended from the msg-2566
+        R6-only override (which trapped operators summoned by R3 / R5 in
+        re-escalation loops, PR-review msg-(gate) BLOCKING-2) to cover every
+        state. The naysayer's L1 CI-gate short-circuit at ``pr_review.py:1613``
+        still absorbs non-SUCCESS CI without a model call.
     verdict_heads :
         The set of head SHAs on which a PR-gate verdict already exists in
         this thread. Derived by the caller from the thread's ``pr-gate-relay``
@@ -373,13 +433,50 @@ def gate_admission(
     :class:`AdmissionResult`
         The verdict, the design §A-3 rule that fired, and a one-line reason.
     """
-    # R1: no CI configured. Fresh invocation — the naysayer's own CI-gate is
-    # the fail-closed default when the rollup is genuinely empty at fetch time.
-    if not rollup:
+    # R0-OVERRIDE: any handoff not authored by the conductor's own self-wake
+    # is a manual override — invoke the gate. The naysayer's L1 CI-gate at
+    # pr_review.py:1613 short-circuits non-SUCCESS CI with a COMMENT (no model
+    # call), so an operator who forces the gate on stuck / red CI still gets
+    # a deterministic response without burning a review round. This fixes the
+    # PR-review msg-(gate) BLOCKING-2 trap: a summoned operator (R3 / R5) can
+    # now break out of the escalation loop by re-writing the handoff by hand.
+    if not nomination_is_self:
         return AdmissionResult(
             admission=GateAdmission.INVOKE,
-            rule="R1",
-            reason=f"no rollup for {head_sha[:12]}: fresh gate",
+            rule="R0-OVERRIDE",
+            reason=(
+                f"manual override on {head_sha[:12]}: nomination is not self-authored, "
+                f"admission bypassed"
+            ),
+        )
+
+    # R1a / R1b: empty rollup. Distinguish "CheckSuite has not populated yet"
+    # (a transient race on GitHub Actions startup latency, PR-review msg-(gate)
+    # BLOCKING-1) from "this PR genuinely has no CI configured" by the age of
+    # the commit. Fresh commit + empty rollup → DEFER; wait a tick and let the
+    # CheckSuite show up. Old commit + empty rollup → INVOKE; the naysayer's
+    # L1 CI-gate handles the "no CI" case deterministically with a single
+    # COMMENT (no loop).
+    if not rollup:
+        commit_age = now - head_committed_date
+        if commit_age <= CAP_EMPTY_RACE:
+            return AdmissionResult(
+                admission=GateAdmission.DEFER,
+                rule="R1a",
+                reason=(
+                    f"empty rollup for {head_sha[:12]} within CheckSuite startup grace "
+                    f"(commit_age={commit_age}, cap={CAP_EMPTY_RACE}): "
+                    f"waiting for CheckSuite to populate"
+                ),
+            )
+        return AdmissionResult(
+            admission=GateAdmission.INVOKE,
+            rule="R1b",
+            reason=(
+                f"empty rollup for {head_sha[:12]} past CheckSuite startup grace "
+                f"(commit_age={commit_age}, cap={CAP_EMPTY_RACE}): "
+                f"assuming no CI configured"
+            ),
         )
 
     concluded = _concluded(rollup)
@@ -410,7 +507,10 @@ def gate_admission(
     if _red(rollup):
         # R5 wins over R4 for a repeat red on the same head — an implementer
         # who could not fix the CI in one round should not be dispatched a
-        # second time without a human deciding.
+        # second time without a human deciding. An operator who wants to
+        # retry the implementer despite the loop-safety escalation does so
+        # via a manual handoff (R0-OVERRIDE path above) or by pushing a new
+        # commit (which rotates the head out of ci_red_routed_heads).
         if head_sha in ci_red_routed_heads:
             return AdmissionResult(
                 admission=GateAdmission.ROUTE_HUMAN,
@@ -429,16 +529,20 @@ def gate_admission(
         )
 
     # concluded ∧ ¬red past this point.
-    # R6: same head + prior verdict + self-nominated wake-up. Do NOT re-invoke;
-    # the earlier verdict's NEXT: line is authoritative. A manual (non-self)
-    # nomination falls through to R7 as an explicit override.
-    if head_sha in verdict_heads and nomination_is_self:
+    # R6: same head + prior verdict on self-nomination. Do NOT re-invoke; the
+    # earlier verdict's NEXT: line is authoritative. The old ``and
+    # nomination_is_self`` guard is dropped in v0.3.2 because R0-OVERRIDE has
+    # already returned on any non-self handoff — R6 is only reachable from a
+    # self-nomination wake-up, so the check would be redundant. Semantics
+    # unchanged; a manual re-review on a previously-reviewed head still
+    # short-circuits at R0-OVERRIDE, not here.
+    if head_sha in verdict_heads:
         return AdmissionResult(
             admission=GateAdmission.ALREADY_REVIEWED,
             rule="R6",
             reason=(f"gate already produced a verdict on {head_sha[:12]}; self-nomination dedup"),
         )
-    # R7: CI green (or manual override on a re-reviewed head). Fresh gate.
+    # R7: CI green (default). Fresh gate.
     return AdmissionResult(
         admission=GateAdmission.INVOKE,
         rule="R7",

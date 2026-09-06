@@ -1,9 +1,10 @@
 """Tests for :mod:`spirrow_mindwire.gate_admission`.
 
 Structure follows :mod:`tests.test_routing`'s three-part shape: behaviour
-tests for the admission table (R1-R7), signature / structural pins for the
-invariants that live in the function's shape rather than its body, and a
-small property suite for :func:`ci_clock_start`'s total-function guarantee.
+tests for the admission table (R0-OVERRIDE / R1a / R1b / R2-R7), signature
+/ structural pins for the invariants that live in the function's shape
+rather than its body, and a small property suite for :func:`ci_clock_start`'s
+total-function guarantee.
 
 Two invariants this suite pins directly:
 
@@ -18,6 +19,18 @@ Two invariants this suite pins directly:
    rollup) must return a :class:`ClockStart` without raising. The property
    test enumerates the 3^2 combinations (plus the empty rollup) for a
    single-row rollup, so the shape is checked, not sampled.
+
+Two loop-safety cases this suite pins directly (PR-review msg-(gate)):
+
+3. **R0-OVERRIDE ordering** — a manual (non-self) nomination INVOKEs
+   regardless of admission state, so an operator summoned by R3 or R5 can
+   break out of the escalation loop by re-writing the handoff by hand
+   (BLOCKING-2). The R0 tests parametrise every downstream state.
+
+4. **R1a vs R1b discrimination** — an empty rollup is DEFER during the
+   CheckSuite startup grace (fresh commit) and INVOKE past it (genuine "no
+   CI"). This closes the BLOCKING-1 race: an empty rollup right after push
+   is a transient GitHub Actions state, not "no CI configured".
 
 What this suite deliberately does NOT try to pin: the wiring of the
 predicate into the conductor's ``NEXT: pr-review <ref>`` handler. That
@@ -39,6 +52,7 @@ import pytest
 
 from spirrow_mindwire.gate_admission import (
     CAP_CHECK,
+    CAP_EMPTY_RACE,
     CAP_NOCLOCK,
     COMPLETED,
     RED_CONCLUSIONS,
@@ -136,14 +150,178 @@ def _admit(
 
 
 # --------------------------------------------------------------------------- #
-# R1 — empty rollup ⇒ INVOKE (no CI configured for this PR).
+# R0-OVERRIDE — any handoff not authored by the conductor's own self-wake is
+# a manual override; INVOKE regardless of admission state (PR-review
+# msg-(gate) BLOCKING-2). The naysayer's L1 CI-gate at pr_review.py:1613
+# absorbs non-SUCCESS CI without a model call.
 # --------------------------------------------------------------------------- #
 
 
-def test_r1_empty_rollup_invokes() -> None:
-    result = _admit(rollup=[])
+def test_r0_override_invokes_on_non_self_nomination_with_empty_rollup() -> None:
+    # A manual handoff (operator or role) with an empty rollup — R1a's
+    # startup grace does NOT apply; the operator has explicitly asked.
+    result = _admit(rollup=[], nomination_is_self=False)
     assert result.admission is GateAdmission.INVOKE
-    assert result.rule == "R1"
+    assert result.rule == "R0-OVERRIDE"
+
+
+def test_r0_override_invokes_on_non_self_nomination_with_pending_ci() -> None:
+    # An operator summoned by R3 who re-writes the handoff by hand: the
+    # override lifts them out of the escalation trap that used to re-fire R3
+    # on every re-nomination (PR-review msg-(gate) BLOCKING-2).
+    started = NOW - timedelta(hours=1)
+    result = _admit(rollup=[_running_check(started_at=started)], nomination_is_self=False)
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == "R0-OVERRIDE"
+
+
+def test_r0_override_invokes_on_non_self_nomination_past_r3_cap() -> None:
+    # The specific R3 scenario the naysayer flagged: CI genuinely stuck past
+    # CAP_CHECK. Self-nomination would ROUTE_HUMAN; manual override INVOKEs
+    # (and the naysayer's L1 CI-gate short-circuits on pending, so no waste).
+    started = NOW - (CAP_CHECK + timedelta(hours=1))
+    result = _admit(rollup=[_running_check(started_at=started)], nomination_is_self=False)
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == "R0-OVERRIDE"
+
+
+def test_r0_override_invokes_on_non_self_nomination_with_r5_looped_red_head() -> None:
+    # The specific R5 scenario the naysayer flagged: same red head, already
+    # dispatched to implementer once. Self-nomination would ROUTE_HUMAN;
+    # manual override INVOKEs (letting an operator opt into another gate
+    # look at what the implementer might have overlooked).
+    result = _admit(
+        rollup=[_completed_check(conclusion="failure")],
+        nomination_is_self=False,
+        ci_red_routed_heads=frozenset({HEAD}),
+    )
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == "R0-OVERRIDE"
+
+
+def test_r0_override_invokes_on_non_self_nomination_with_already_reviewed_head() -> None:
+    # The msg-2566 R6 note verbatim ("operator の手動 `NEXT: pr-review` は常に
+    # override として通る。自己指名だけが dedup 対象") — now enforced by
+    # R0-OVERRIDE rather than R6's ``and nomination_is_self`` clause.
+    result = _admit(
+        rollup=[_completed_check(conclusion="success")],
+        nomination_is_self=False,
+        verdict_heads=frozenset({HEAD}),
+    )
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == "R0-OVERRIDE"
+
+
+def test_r0_override_precedes_r1a_startup_grace() -> None:
+    # A fresh-commit + empty rollup + manual override: R0 fires before R1a,
+    # so the operator's ask is honoured immediately (no 5-minute wait). The
+    # naysayer's L1 CI-gate returns COMMENT on UNKNOWN CI without spending
+    # a model call.
+    fresh_committed = NOW - timedelta(seconds=30)
+    result = _admit(rollup=[], nomination_is_self=False, head_committed=fresh_committed)
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == "R0-OVERRIDE"
+
+
+def test_r0_override_precedes_r7_default_green() -> None:
+    # A green rollup with no prior verdict + manual override: R0 fires, not
+    # R7. The rule label is what changes; the outcome (INVOKE) is identical.
+    # Locks in the honest labelling so audit / metrics can tell "operator
+    # forced this" apart from "conductor's own self-wake".
+    result = _admit(rollup=[_completed_check(conclusion="success")], nomination_is_self=False)
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == "R0-OVERRIDE"
+
+
+@pytest.mark.parametrize(
+    ("rollup_factory", "extra_kwargs"),
+    [
+        # every downstream state the pre-v0.3.2 code path could produce.
+        pytest.param(lambda: [], {}, id="empty-rollup"),
+        pytest.param(
+            lambda: [_running_check(started_at=NOW - timedelta(hours=1))], {}, id="pending"
+        ),
+        pytest.param(
+            lambda: [_running_check(started_at=NOW - (CAP_CHECK + timedelta(hours=1)))],
+            {},
+            id="stuck-past-cap-check",
+        ),
+        pytest.param(lambda: [_completed_check(conclusion="failure")], {}, id="red-first"),
+        pytest.param(
+            lambda: [_completed_check(conclusion="failure")],
+            {"ci_red_routed_heads": frozenset({HEAD})},
+            id="red-routed-loop-safety",
+        ),
+        pytest.param(
+            lambda: [_completed_check(conclusion="success")],
+            {"verdict_heads": frozenset({HEAD})},
+            id="green-already-reviewed",
+        ),
+        pytest.param(lambda: [_completed_check(conclusion="success")], {}, id="green-fresh"),
+    ],
+)
+def test_r0_override_wins_over_every_downstream_rule(
+    rollup_factory: object, extra_kwargs: dict[str, object]
+) -> None:
+    # Structural pin for R0-OVERRIDE's precedence: no downstream rule (R1a /
+    # R1b / R2 / R3 / R4 / R5 / R6 / R7) may intercept a manual handoff.
+    # This is the parametrised form of PR-review msg-(gate) BLOCKING-2's
+    # "trap" test: on any admission state whatsoever, a non-self nomination
+    # produces R0-OVERRIDE.
+    result = _admit(rollup=rollup_factory(), nomination_is_self=False, **extra_kwargs)  # type: ignore[operator,arg-type]
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == "R0-OVERRIDE"
+
+
+# --------------------------------------------------------------------------- #
+# R1a / R1b — empty rollup, distinguish CheckSuite startup race from
+# "genuinely no CI" by the commit clock (PR-review msg-(gate) BLOCKING-1).
+# --------------------------------------------------------------------------- #
+
+
+def test_r1a_empty_rollup_fresh_commit_defers() -> None:
+    # The exact race the naysayer flagged: an implementer pushed a moment ago
+    # to a CI-configured repo; the checks API returns [] briefly while the
+    # CheckSuite is populating. R1a DEFERs during CAP_EMPTY_RACE so the
+    # naysayer is not woken up to fail-close on UNKNOWN CI and loop with
+    # the implementer.
+    fresh_committed = NOW - timedelta(seconds=30)
+    result = _admit(rollup=[], head_committed=fresh_committed)
+    assert result.admission is GateAdmission.DEFER
+    assert result.rule == "R1a"
+    assert "startup grace" in result.reason
+
+
+def test_r1a_defers_at_empty_race_cap_boundary() -> None:
+    # Boundary condition: exactly at CAP_EMPTY_RACE, still DEFER (design
+    # table uses `<=`). Off-by-one guard so a slow scheduler tick doesn't
+    # mis-classify a race as R1b.
+    at_cap_committed = NOW - CAP_EMPTY_RACE
+    result = _admit(rollup=[], head_committed=at_cap_committed)
+    assert result.admission is GateAdmission.DEFER
+    assert result.rule == "R1a"
+
+
+def test_r1b_empty_rollup_past_grace_invokes() -> None:
+    # Past CAP_EMPTY_RACE, the empty rollup is genuinely "no CI configured".
+    # The naysayer's L1 CI-gate at pr_review.py:1613 handles this with a
+    # single COMMENT — no loop, because the implementer does not push a
+    # "fix" in response to "CI is UNKNOWN, please configure Actions".
+    old_committed = NOW - (CAP_EMPTY_RACE + timedelta(minutes=1))
+    result = _admit(rollup=[], head_committed=old_committed)
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == "R1b"
+    assert "no CI configured" in result.reason
+
+
+def test_r1b_invokes_when_commit_is_much_older_than_grace() -> None:
+    # Well past CAP_EMPTY_RACE: R1b still fires (not R1a). This is the
+    # steady-state "no CI configured on this repo" case that the pre-v0.3.2
+    # R1 was designed for.
+    old_committed = NOW - timedelta(hours=6)
+    result = _admit(rollup=[], head_committed=old_committed)
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == "R1b"
 
 
 # --------------------------------------------------------------------------- #
@@ -291,18 +469,12 @@ def test_r6_dedupes_a_self_nomination_on_an_already_reviewed_head() -> None:
     assert result.rule == "R6"
 
 
-def test_r7_manual_operator_override_bypasses_r6_dedup() -> None:
-    # An operator's hand-typed ``NEXT: pr-review`` (``nomination_is_self=False``)
-    # is the documented override: a re-invocation on the same reviewed head
-    # is a legitimate user demand and must NOT be deduped. Preserves the
-    # msg-2550 / msg-2556 / msg-2562 manual-fire escape hatch after wiring.
-    result = _admit(
-        rollup=[_completed_check(conclusion="success")],
-        nomination_is_self=False,
-        verdict_heads=frozenset({HEAD}),
-    )
-    assert result.admission is GateAdmission.INVOKE
-    assert result.rule == "R7"
+# NOTE: the pre-v0.3.2 test_r7_manual_operator_override_bypasses_r6_dedup is
+# subsumed by test_r0_override_invokes_on_non_self_nomination_with_already_
+# reviewed_head above. The manual-override semantics moved from an
+# R7-fall-through to a top-level R0-OVERRIDE (PR-review msg-(gate)
+# BLOCKING-2); the outcome for the operator is unchanged (INVOKE), but the
+# rule label now honestly names "override" rather than "regular INVOKE".
 
 
 def test_r7_invokes_when_head_not_in_verdict_heads() -> None:
