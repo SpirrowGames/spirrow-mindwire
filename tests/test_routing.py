@@ -51,9 +51,20 @@ from spirrow_mindwire.routing import GuardIVerdict, guard_proposer_to_implemente
 # Truth table — every combination of the four observation booleans.
 # --------------------------------------------------------------------------- #
 #
-# The behaviour matrix is small (2^4 = 16 rows) so we enumerate it in full
+# The behaviour matrix is small (2⁴ = 16 rows) so we enumerate it in full
 # rather than sample it; the extraction is precisely worth this cost, since
 # a silent semantics change is the drift the extraction exists to prevent.
+#
+# The full 16-row enumeration is a promise the earlier iteration of this
+# suite quietly broke: PR-review msg-2564 (ADVISORY) counted only 13 rows
+# after the "author_is_human=True ∧ author_is_naysayer=True" combination
+# was collapsed to a single sample. Under the current roster
+# (``author_partition`` strictly partitions identity into one role), that
+# combination is not reachable in production — but the predicate is a
+# total function over four booleans, and the enumeration must match that
+# domain so a future change to the predicate's short-circuit ordering
+# cannot silently escape the truth table (T-operator-board msg-2566 §C /
+# msg-2568 §C). The three reintroduced rows are marked below.
 # --------------------------------------------------------------------------- #
 
 
@@ -65,9 +76,19 @@ from spirrow_mindwire.routing import GuardIVerdict, guard_proposer_to_implemente
         (True, False, False, True, GuardIVerdict.HONOR),
         (True, False, True, False, GuardIVerdict.HONOR),
         (True, False, True, True, GuardIVerdict.HONOR),
-        # A human author who ALSO carries a naysayer flag (impossible under the
-        # current roster but not the predicate's job to police) still honours —
-        # the carve-out ordering places ① first.
+        # A human author who ALSO carries a naysayer flag (unreachable under
+        # the current roster's identity partition, but the predicate has no
+        # roster and thus no way to police it): the carve-out ordering places
+        # ① first, so every combination in this block honours regardless of
+        # the state bits. The three rows below were the msg-2564 ADVISORY:
+        # they are unreachable in production yet required by the 2⁴ = 16-row
+        # enumeration promise. Enumerating unreachable rows is the point —
+        # "unreachable today" is a roster invariant that lives elsewhere,
+        # and if the roster ever changes (or a test injects a hybrid author
+        # for a regression case), the predicate must still HONOR.
+        (True, True, False, False, GuardIVerdict.HONOR),  # msg-2564 ADVISORY: added
+        (True, True, False, True, GuardIVerdict.HONOR),  # msg-2564 ADVISORY: added
+        (True, True, True, False, GuardIVerdict.HONOR),  # msg-2564 ADVISORY: added
         (True, True, True, True, GuardIVerdict.HONOR),
         # carve-out ③: attested naysayer under RUN is honoured.
         (False, True, True, True, GuardIVerdict.HONOR),
