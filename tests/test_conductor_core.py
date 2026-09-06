@@ -632,6 +632,94 @@ async def test_empty_human_identity_disables_human_carveout() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# guard (i) observation-scope: :meth:`_attested` on the latest message must
+# only be observed when the predicate would consume it (non-human naysayer
+# under RUN). The pre-extraction inline form got this from Python's short-
+# circuit ``and``; the extracted predicate takes lifted booleans, so the
+# caller must restore that observation scope explicitly (PR-review msg-2551).
+# --------------------------------------------------------------------------- #
+#
+# Two things this pins in the caller:
+#
+# * A human-authored ``NEXT: Heisenberg`` (carve-out ①) must not touch
+#   :meth:`_attested` on the latest message at all — the answer cannot flip
+#   the verdict, so observing it broadens the read for no gain.
+# * A proposer-authored ``NEXT: Heisenberg`` (guard-(i) default REDIRECT)
+#   must not touch :meth:`_attested` on the latest message either — the
+#   naysayer conjunction fails on ``author_is_naysayer`` alone.
+#
+# The RUN + naysayer path DOES need the attest observation and is covered by
+# the carve-out ③ block below; the short-circuit here is a subtractive
+# assertion, not a re-statement of the honor path.
+
+
+def _spy_attested(conductor: Conductor) -> list[str]:
+    """Replace ``conductor._attested`` with a spy that records the observed msg ids.
+
+    The spy still returns the real answer so the routing behaviour is
+    unchanged; only the observation scope is being measured.
+    """
+    observed: list[str] = []
+    original = conductor._attested  # bound method
+
+    def spy(msg: dict[str, Any]) -> bool:
+        observed.append(msg.get("msg_id", ""))
+        return original(msg)
+
+    conductor._attested = spy  # type: ignore[method-assign]
+    return observed
+
+
+@pytest.mark.anyio
+async def test_guard_i_does_not_observe_attest_for_human_authored_handoff() -> None:
+    # carve-out ① short-circuits on ``author_is_human``. The predicate's
+    # ``message_is_attested`` bit cannot flip HONOR to REDIRECT here, so the
+    # caller must not eagerly read the attestation marker on the latest
+    # message (the msg the human just posted). Regression: PR-review msg-2551
+    # noted that the extraction had widened the observation to every
+    # implementer handoff.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="approved for implementation\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(
+        mcp,
+        {
+            Role.IMPLEMENTER: ["done\n\nNEXT: Bohr"],
+            Role.PROPOSER: ["spec ok\n\nNEXT: none"],
+        },
+    )
+    conductor = _conductor(mcp, disp)
+    observed = _spy_attested(conductor)
+    outcome = await conductor.run()
+    # The human-authored latest message must not be attest-observed by the
+    # guard-(i) branch. (Prior segment messages remain fair game for
+    # ``_naysayer_consulted``; here the segment is empty so the spy list is.)
+    assert "m1" not in observed
+    assert disp.dispatches[0] == (Role.IMPLEMENTER, "m1")
+    assert outcome.stop_reason is StopReason.SETTLED
+
+
+@pytest.mark.anyio
+async def test_guard_i_does_not_observe_attest_for_proposer_authored_handoff() -> None:
+    # The default guard-(i) redirect (proposer→implementer) short-circuits on
+    # ``author_is_naysayer`` — the honour conjunction cannot fire, so the
+    # attest observation cannot change the verdict and must not be made.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Heisenberg")
+    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: [_attested("review\n\nNEXT: human")]})
+    conductor = _conductor(mcp, disp)
+    observed = _spy_attested(conductor)
+    outcome = await conductor.run()
+    # ``m1`` (Bohr's design→implement handoff) must not be attest-observed by
+    # the guard-(i) branch. ``m2`` (Einstein's forced review) IS observed —
+    # both by the guard-(i) branch on the next tick (naysayer author) and by
+    # ``_naysayer_consulted`` — and that observation is legitimate; only the
+    # Bohr message is the short-circuit case.
+    assert "m1" not in observed
+    assert outcome.forced_naysayer_turns == 1
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+# --------------------------------------------------------------------------- #
 # carve-out ③: the naysayer's proceed to the implementer, gated on loop control
 # --------------------------------------------------------------------------- #
 
