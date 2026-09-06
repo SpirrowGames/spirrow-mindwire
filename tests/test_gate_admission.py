@@ -27,10 +27,15 @@ Two loop-safety cases this suite pins directly (PR-review msg-(gate)):
    break out of the escalation loop by re-writing the handoff by hand
    (BLOCKING-2). The R0 tests parametrise every downstream state.
 
-4. **R1a vs R1b discrimination** — an empty rollup is DEFER during the
-   CheckSuite startup grace (fresh commit) and INVOKE past it (genuine "no
-   CI"). This closes the BLOCKING-1 race: an empty rollup right after push
-   is a transient GitHub Actions state, not "no CI configured".
+4. **R1a vs R1b discrimination on the push clock** — an empty rollup is
+   DEFER during the CheckSuite startup grace (fresh push) and INVOKE past
+   it (genuine "no CI"). This closes the BLOCKING-1 race: an empty rollup
+   right after push is a transient GitHub Actions state, not "no CI
+   configured". Discriminator is ``head_pushed_at``, not
+   ``head_committed_date`` — the v0.3.3 fix for PR-review msg-(gate)
+   round-2 BLOCKING (a cherry-pick or a re-pushed existing branch has a
+   stale commit_age but a fresh push_age; the CheckSuite race is bound
+   to the push).
 
 What this suite deliberately does NOT try to pin: the wiring of the
 predicate into the conductor's ``NEXT: pr-review <ref>`` handler. That
@@ -73,10 +78,17 @@ from spirrow_mindwire.gate_admission import (
 # durations. All rollup timestamps are expressed relative to this value so
 # the assertions read the way the design table does ("6 h ago", "8 h ago").
 NOW = datetime(2026, 9, 6, 12, 0, 0, tzinfo=UTC)
-# The commit's committed date, used only as the COMMIT-clock fallback. Chosen
-# well before NOW so the fallback path is testable without accidentally
-# straying into the CAP boundary of the CHECK path.
+# The commit's committed date, used only as the COMMIT-clock fallback in
+# :func:`ci_clock_start`. Chosen well before NOW so the fallback path is
+# testable without accidentally straying into the CAP boundary of the CHECK
+# path.
 HEAD_COMMITTED = NOW - timedelta(hours=1)
+# The head's push time. This is the R1a/R1b discriminator (v0.3.3, PR-review
+# msg-(gate) round-2 BLOCKING). Defaulted to ``NOW - 30s`` so a test that
+# does not care about the empty-rollup grace window stays firmly inside R1a
+# (fresh push) rather than accidentally straying into R1b. Tests that DO
+# care about the boundary pass their own value.
+HEAD_PUSHED = NOW - timedelta(seconds=30)
 HEAD = "a" * 40
 OTHER_HEAD = "b" * 40
 
@@ -136,12 +148,14 @@ def _admit(
     verdict_heads: frozenset[str] = frozenset(),
     ci_red_routed_heads: frozenset[str] = frozenset(),
     head_committed: datetime = HEAD_COMMITTED,
+    head_pushed: datetime = HEAD_PUSHED,
 ) -> AdmissionResult:
     """Call :func:`gate_admission` with named defaults so tests read at the site."""
     return gate_admission(
         rollup=rollup,
         head_sha=head,
         head_committed_date=head_committed,
+        head_pushed_at=head_pushed,
         now=now,
         nomination_is_self=nomination_is_self,
         verdict_heads=verdict_heads,
@@ -213,12 +227,12 @@ def test_r0_override_invokes_on_non_self_nomination_with_already_reviewed_head()
 
 
 def test_r0_override_precedes_r1a_startup_grace() -> None:
-    # A fresh-commit + empty rollup + manual override: R0 fires before R1a,
+    # A fresh-push + empty rollup + manual override: R0 fires before R1a,
     # so the operator's ask is honoured immediately (no 5-minute wait). The
     # naysayer's L1 CI-gate returns COMMENT on UNKNOWN CI without spending
     # a model call.
-    fresh_committed = NOW - timedelta(seconds=30)
-    result = _admit(rollup=[], nomination_is_self=False, head_committed=fresh_committed)
+    fresh_pushed = NOW - timedelta(seconds=30)
+    result = _admit(rollup=[], nomination_is_self=False, head_pushed=fresh_pushed)
     assert result.admission is GateAdmission.INVOKE
     assert result.rule == "R0-OVERRIDE"
 
@@ -275,18 +289,20 @@ def test_r0_override_wins_over_every_downstream_rule(
 
 # --------------------------------------------------------------------------- #
 # R1a / R1b — empty rollup, distinguish CheckSuite startup race from
-# "genuinely no CI" by the commit clock (PR-review msg-(gate) BLOCKING-1).
+# "genuinely no CI" by the **push clock** (PR-review msg-(gate) BLOCKING-1
+# fix; discriminator switched from committed_date to push_at in v0.3.3
+# per PR-review msg-(gate) round-2 BLOCKING).
 # --------------------------------------------------------------------------- #
 
 
-def test_r1a_empty_rollup_fresh_commit_defers() -> None:
+def test_r1a_empty_rollup_fresh_push_defers() -> None:
     # The exact race the naysayer flagged: an implementer pushed a moment ago
     # to a CI-configured repo; the checks API returns [] briefly while the
     # CheckSuite is populating. R1a DEFERs during CAP_EMPTY_RACE so the
     # naysayer is not woken up to fail-close on UNKNOWN CI and loop with
     # the implementer.
-    fresh_committed = NOW - timedelta(seconds=30)
-    result = _admit(rollup=[], head_committed=fresh_committed)
+    fresh_pushed = NOW - timedelta(seconds=30)
+    result = _admit(rollup=[], head_pushed=fresh_pushed)
     assert result.admission is GateAdmission.DEFER
     assert result.rule == "R1a"
     assert "startup grace" in result.reason
@@ -296,8 +312,8 @@ def test_r1a_defers_at_empty_race_cap_boundary() -> None:
     # Boundary condition: exactly at CAP_EMPTY_RACE, still DEFER (design
     # table uses `<=`). Off-by-one guard so a slow scheduler tick doesn't
     # mis-classify a race as R1b.
-    at_cap_committed = NOW - CAP_EMPTY_RACE
-    result = _admit(rollup=[], head_committed=at_cap_committed)
+    at_cap_pushed = NOW - CAP_EMPTY_RACE
+    result = _admit(rollup=[], head_pushed=at_cap_pushed)
     assert result.admission is GateAdmission.DEFER
     assert result.rule == "R1a"
 
@@ -307,21 +323,80 @@ def test_r1b_empty_rollup_past_grace_invokes() -> None:
     # The naysayer's L1 CI-gate at pr_review.py:1613 handles this with a
     # single COMMENT — no loop, because the implementer does not push a
     # "fix" in response to "CI is UNKNOWN, please configure Actions".
-    old_committed = NOW - (CAP_EMPTY_RACE + timedelta(minutes=1))
-    result = _admit(rollup=[], head_committed=old_committed)
+    old_pushed = NOW - (CAP_EMPTY_RACE + timedelta(minutes=1))
+    result = _admit(rollup=[], head_pushed=old_pushed)
     assert result.admission is GateAdmission.INVOKE
     assert result.rule == "R1b"
     assert "no CI configured" in result.reason
 
 
-def test_r1b_invokes_when_commit_is_much_older_than_grace() -> None:
+def test_r1b_invokes_when_push_is_much_older_than_grace() -> None:
     # Well past CAP_EMPTY_RACE: R1b still fires (not R1a). This is the
     # steady-state "no CI configured on this repo" case that the pre-v0.3.2
     # R1 was designed for.
-    old_committed = NOW - timedelta(hours=6)
-    result = _admit(rollup=[], head_committed=old_committed)
+    old_pushed = NOW - timedelta(hours=6)
+    result = _admit(rollup=[], head_pushed=old_pushed)
     assert result.admission is GateAdmission.INVOKE
     assert result.rule == "R1b"
+
+
+# The v0.3.3 fix: an old commit pushed today (cherry-pick, existing branch
+# pushed to new PR) must NOT bypass the CheckSuite startup grace just
+# because ``head_committed_date`` is stale. The R1a/R1b discriminator lives
+# on the PUSH clock, not the commit clock.
+
+
+def test_r1a_defers_when_old_commit_is_pushed_fresh_cherry_pick_case() -> None:
+    # The exact scenario the naysayer's msg-(gate) round-2 BLOCKING flagged:
+    # a 3-hour-old commit is pushed 30 seconds ago (cherry-pick, branch
+    # reuse, or delayed force-push). Under v0.3.2's committed_date
+    # discriminator this would have fired R1b — dropping a spurious fail-close
+    # comment on a PR whose CheckSuite is in its normal startup race. Under
+    # v0.3.3's push discriminator, it correctly stays in R1a.
+    old_committed = NOW - timedelta(hours=3)
+    fresh_pushed = NOW - timedelta(seconds=30)
+    result = _admit(rollup=[], head_committed=old_committed, head_pushed=fresh_pushed)
+    assert result.admission is GateAdmission.DEFER, (
+        "old-commit + fresh-push must still be in R1a startup grace"
+    )
+    assert result.rule == "R1a"
+
+
+def test_r1a_defers_for_very_old_commit_pushed_seconds_ago() -> None:
+    # More extreme version: a year-old commit pushed today. The commit is
+    # ancient by any measure but the push is fresh, so the CheckSuite race
+    # is still on. This pins the invariant that the R1a/R1b discriminator
+    # cannot be recovered from committed_date under any circumstances.
+    ancient_committed = NOW - timedelta(days=365)
+    fresh_pushed = NOW - timedelta(seconds=10)
+    result = _admit(rollup=[], head_committed=ancient_committed, head_pushed=fresh_pushed)
+    assert result.admission is GateAdmission.DEFER
+    assert result.rule == "R1a"
+
+
+def test_r1b_invokes_when_push_is_old_regardless_of_commit_freshness() -> None:
+    # Symmetric case: a commit authored today but pushed a long time ago.
+    # This is unusual (would require a rebase that preserved authorship
+    # dates), but locks the invariant from the other side: R1b fires on push
+    # age, so a "freshly authored but old-push" branch does NOT get spurious
+    # grace-window DEFERs.
+    fresh_committed = NOW - timedelta(seconds=10)
+    old_pushed = NOW - timedelta(hours=6)
+    result = _admit(rollup=[], head_committed=fresh_committed, head_pushed=old_pushed)
+    assert result.admission is GateAdmission.INVOKE
+    assert result.rule == "R1b"
+
+
+def test_r1a_reason_names_push_age_not_commit_age() -> None:
+    # The reason string is the audit trail an operator uses to distinguish
+    # "waiting for CheckSuite" from "assuming no CI configured". It must
+    # name the push clock so a future debugger can see WHICH clock decided
+    # the DEFER (and confirm the v0.3.3 fix is in force).
+    old_committed = NOW - timedelta(hours=3)
+    fresh_pushed = NOW - timedelta(seconds=30)
+    result = _admit(rollup=[], head_committed=old_committed, head_pushed=fresh_pushed)
+    assert "push_age=" in result.reason
+    assert "commit_age" not in result.reason
 
 
 # --------------------------------------------------------------------------- #

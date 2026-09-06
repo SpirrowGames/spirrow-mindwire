@@ -69,7 +69,7 @@ carries the ID for auditability and metrics.
   from R6-only to all admission states. Without this, an operator summoned by
   R3 or R5 was trapped: their manual re-nomination hit the same escalation
   and re-summoned them (PR-review msg-(gate) BLOCKING-2).
-* **R1a** — rollup is empty AND ``now - head_committed_date <= CAP_EMPTY_RACE``.
+* **R1a** — rollup is empty AND ``now - head_pushed_at <= CAP_EMPTY_RACE``.
   ``DEFER``. The GitHub Actions CheckSuite is not populated instantly on push
   — the checks API can return ``[]`` for several seconds after the ref moves
   even when CI IS configured for this repo. Treating that transient ``[]`` as
@@ -79,7 +79,11 @@ carries the ID for auditability and metrics.
   "fix" — a pathological loop the PR-review flagged as BLOCKING-1. R1a
   DEFERs during a bounded startup grace so the CheckSuite has time to
   populate; on the next tick the rollup is non-empty and R2-R7 take over.
-* **R1b** — rollup is empty AND ``now - head_committed_date > CAP_EMPTY_RACE``.
+  The clock is the **push time**, not the commit time (v0.3.3 fix for
+  PR-review msg-(gate) round 2 BLOCKING): a cherry-pick or a fresh push of
+  an existing branch has a stale committed_date but a fresh push_age, and
+  the CheckSuite race is bound to the push, not the commit.
+* **R1b** — rollup is empty AND ``now - head_pushed_at > CAP_EMPTY_RACE``.
   ``INVOKE``. Past the startup grace, an empty rollup is genuinely "no CI
   configured for this PR" (or CI is misconfigured beyond the startup
   window). The gate runs; the naysayer's L1 CI-gate short-circuit is the
@@ -135,7 +139,10 @@ T-operator-board msg-2566 §A (design v0.3), msg-2568 §A/§B (v0.3.1 —
 total-function ``ci_clock_start`` and the ``gate_admission`` rename with
 signature-level INV-CI-2 enforcement), PR-review msg-(gate) BLOCKING-1/-2
 (v0.3.2 — empty-rollup race split into R1a/R1b, R0-OVERRIDE promoted from
-R6-only to top-level).
+R6-only to top-level), PR-review msg-(gate) round-2 BLOCKING (v0.3.3 —
+R1a/R1b discriminator switched from ``head_committed_date`` to
+``head_pushed_at`` so cherry-picks / branch reuses / any push of an
+existing commit stop mis-firing R1b during the CheckSuite startup race).
 """
 
 from __future__ import annotations
@@ -272,16 +279,19 @@ CAP_CHECK: timedelta = timedelta(hours=6)
 CAP_NOCLOCK: timedelta = timedelta(hours=12)
 
 #: Startup grace for the "empty rollup" case (v0.3.2, PR-review msg-(gate)
-#: BLOCKING-1). GitHub Actions CheckSuites do not populate instantly on push
-#: — the checks API can return ``[]`` for several seconds (occasionally
-#: longer) even when CI IS configured. During this window R1a DEFERs so the
-#: naysayer is not woken up to fail-close on an UNKNOWN rollup only to loop
-#: on the implementer's "fix". Sized generously (5 min ≫ typical Actions
-#: population time of seconds) so a slow scheduler run never mis-classifies a
-#: race as "no CI configured". Past this cap, R1b returns INVOKE on the
-#: assumption CI is genuinely absent — the naysayer's L1 CI-gate short-circuit
-#: at ``pr_review.py:1613`` then handles it deterministically with a single
-#: COMMENT (no loop, no model call).
+#: BLOCKING-1; discriminator switched from committed_date to push time in
+#: v0.3.3, PR-review msg-(gate) round-2 BLOCKING). GitHub Actions CheckSuites
+#: do not populate instantly on push — the checks API can return ``[]`` for
+#: several seconds (occasionally longer) even when CI IS configured. During
+#: this window R1a DEFERs so the naysayer is not woken up to fail-close on
+#: an UNKNOWN rollup only to loop on the implementer's "fix". Sized
+#: generously (5 min ≫ typical Actions population time of seconds) so a slow
+#: scheduler run never mis-classifies a race as "no CI configured". Past
+#: this cap, R1b returns INVOKE on the assumption CI is genuinely absent —
+#: the naysayer's L1 CI-gate short-circuit at ``pr_review.py:1613`` then
+#: handles it deterministically with a single COMMENT (no loop, no model
+#: call). Measured against ``head_pushed_at``, not the commit clock, so a
+#: cherry-pick or a re-pushed existing branch stays in the grace window.
 CAP_EMPTY_RACE: timedelta = timedelta(minutes=5)
 
 
@@ -367,6 +377,7 @@ def gate_admission(
     rollup: Sequence[CheckRow],
     head_sha: str,
     head_committed_date: datetime,
+    head_pushed_at: datetime,
     now: datetime,
     nomination_is_self: bool,
     verdict_heads: frozenset[str],
@@ -402,8 +413,26 @@ def gate_admission(
     head_committed_date :
         The commit's ``committedDate`` (the ``authored_date`` is not right —
         an old commit can be committed today). Used by :func:`ci_clock_start`
-        as the last-resort clock (R2/R3 with all-null rollup) AND by the R1a
-        startup-grace discriminator for empty rollups (v0.3.2).
+        as the last-resort clock (R2/R3 with all-null rollup) per msg-2568
+        §A-2. NOT used for the R1a/R1b discriminator — that was the
+        PR-review msg-(gate) round-2 BLOCKING flaw fixed in v0.3.3 by adding
+        :param:`head_pushed_at`.
+    head_pushed_at :
+        The commit's *push* time to the remote — when this SHA first appeared
+        at ``head`` on the PR. Fixes the PR-review msg-(gate) round-2
+        BLOCKING objection: ``head_committed_date`` was factually wrong as
+        an R1a/R1b discriminator because a cherry-pick or a fresh push of an
+        existing branch has a commit_age past ``CAP_EMPTY_RACE`` even though
+        the push (and therefore the CheckSuite startup race) happened seconds
+        ago. Callers should provide the best-available proxy in preference
+        order: GraphQL ``PullRequest.commits.nodes[-1].commit.pushedDate`` for
+        the head, then REST ``pull_request.head.repo.pushed_at``, then REST
+        ``pull_request.updated_at`` — all always non-null on any PR that a
+        ``NEXT: pr-review`` handoff could be routing to. This is a strictly
+        better clock than committed_date for BOTH the R1a/R1b discriminator
+        AND (in a future refactor) the ci_clock_start fallback, but v0.3.3
+        touches only the discriminator to keep the msg-2568 decision on
+        ci_clock_start intact.
     now :
         The current wall clock. Passed as a parameter so tests can drive
         the CAP boundary deterministically.
@@ -453,19 +482,25 @@ def gate_admission(
     # R1a / R1b: empty rollup. Distinguish "CheckSuite has not populated yet"
     # (a transient race on GitHub Actions startup latency, PR-review msg-(gate)
     # BLOCKING-1) from "this PR genuinely has no CI configured" by the age of
-    # the commit. Fresh commit + empty rollup → DEFER; wait a tick and let the
-    # CheckSuite show up. Old commit + empty rollup → INVOKE; the naysayer's
-    # L1 CI-gate handles the "no CI" case deterministically with a single
-    # COMMENT (no loop).
+    # the *push*, NOT the commit. The v0.3.2 fix reused ``head_committed_date``
+    # here; the PR-review msg-(gate) round-2 objection was that this was
+    # factually wrong: a cherry-pick or a fresh push of an existing branch
+    # has ``commit_age > CAP_EMPTY_RACE`` even though the push happened
+    # seconds ago and the CheckSuite is in its startup race. v0.3.3 switches
+    # the discriminator to ``head_pushed_at`` — a strictly better proxy for
+    # "when could the CheckSuite have started to populate". Fresh push +
+    # empty rollup → DEFER; wait a tick and let the CheckSuite show up. Old
+    # push + empty rollup → INVOKE; the naysayer's L1 CI-gate handles the
+    # "no CI" case deterministically with a single COMMENT (no loop).
     if not rollup:
-        commit_age = now - head_committed_date
-        if commit_age <= CAP_EMPTY_RACE:
+        push_age = now - head_pushed_at
+        if push_age <= CAP_EMPTY_RACE:
             return AdmissionResult(
                 admission=GateAdmission.DEFER,
                 rule="R1a",
                 reason=(
                     f"empty rollup for {head_sha[:12]} within CheckSuite startup grace "
-                    f"(commit_age={commit_age}, cap={CAP_EMPTY_RACE}): "
+                    f"(push_age={push_age}, cap={CAP_EMPTY_RACE}): "
                     f"waiting for CheckSuite to populate"
                 ),
             )
@@ -474,7 +509,7 @@ def gate_admission(
             rule="R1b",
             reason=(
                 f"empty rollup for {head_sha[:12]} past CheckSuite startup grace "
-                f"(commit_age={commit_age}, cap={CAP_EMPTY_RACE}): "
+                f"(push_age={push_age}, cap={CAP_EMPTY_RACE}): "
                 f"assuming no CI configured"
             ),
         )
