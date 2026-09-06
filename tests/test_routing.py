@@ -2,26 +2,34 @@
 
 The predicate is extracted from ``conductor/core.py`` so the future
 operator-board ``R-NEXT-HEIS-GUARD`` transition can consult the same rule
-without a re-expression (T-operator-board msg-2544 §C-3). Two things this
+without a re-expression (T-operator-board msg-2544 §C-3). Three things this
 suite pins directly, and one thing it deliberately does NOT try to pin:
 
 1. The predicate covers exactly the carve-outs the pre-extraction inline
    form covered — ① human author and ③ attested independent naysayer under
-   RUN — and nothing else. Behaviour tests exercise the truth table.
-2. A file-scoped drift alarm: no *second function named
-   ``guard_proposer_to_implementer``* appears anywhere else in the tree,
-   and ``conductor/core.py`` still ``from ..routing import`` the predicate
+   RUN — and nothing else. Behaviour tests exercise the 2⁴ truth table.
+2. The attestation observation is a nullary callable (PR-review msg-2554
+   BLOCKING) and the predicate itself decides when it must fire — the
+   thunk is invoked only on the carve-out ③ branch, never on carve-out ①
+   or on the default REDIRECT path. Dedicated tests pin that
+   observation-scope contract at the predicate boundary so no caller has
+   to re-express (naysayer ∧ RUN) as a short-circuit before dispatching.
+3. A file-scoped drift alarm: no *second function named
+   ``guard_proposer_to_implementer``* appears anywhere in the tree
+   (including intra-file duplication — the counter no longer breaks after
+   the first hit per file, PR-review msg-2554 advisory), and
+   ``conductor/core.py`` still ``from ..routing import`` the predicate
    (rather than deleting the import along with an inline hand-roll). This
    is a name-and-import check, not a semantics check.
 
 What the file-scoped alarm CANNOT catch — and this suite makes no claim
-that it can (PR-review msg-2551): a determined re-inliner who spells the
-rule as, e.g., ``if is_human or (is_naysayer and run and attest):``
-inside a helper with any other name will slip past both checks. The
-name-defended-once assertion is a cheap early-warning, not a general
-"re-expression" detector; the actual invariant — that ``_route`` (and
-future callers) route on the imported predicate rather than on a hand-
-rolled chain — is enforced by the behaviour suite in
+that it can (PR-review msg-2551 / msg-2554): a determined re-inliner who
+spells the rule as, e.g., ``if is_human or (is_naysayer and run and
+attest):`` inside a helper with any other name will slip past both
+checks. The name-defended-once assertion is a cheap early-warning, not a
+general "re-expression" detector; the actual invariant — that ``_route``
+(and future callers) route on the imported predicate rather than on a
+hand-rolled chain — is enforced by the behaviour suite in
 :mod:`tests.test_conductor_core` (``test_guard_i_*``, ``test_carveout_*``,
 ``test_proposer_to_implementer_stops_at_human_*``, and the observation-
 scope short-circuit tests added by PR-review msg-2551). Semantic drift
@@ -80,12 +88,16 @@ def test_guard_i_truth_table(
     attested: bool,
     expected: GuardIVerdict,
 ) -> None:
+    # ``message_is_attested`` is a bool-returning thunk; a constant closure
+    # over ``attested`` is enough for the behaviour matrix. The observation-
+    # scope contract (that the thunk is not invoked in the short-circuit
+    # cases) lives in its own dedicated test below.
     assert (
         guard_proposer_to_implementer(
             author_is_human=author_is_human,
             author_is_naysayer=author_is_naysayer,
             control_state_is_run=run,
-            message_is_attested=attested,
+            message_is_attested=lambda: attested,
         )
         is expected
     )
@@ -105,7 +117,7 @@ def test_carveout_1_human_authored_decide_honours() -> None:
             author_is_human=True,
             author_is_naysayer=False,
             control_state_is_run=False,
-            message_is_attested=False,
+            message_is_attested=lambda: False,
         )
         is GuardIVerdict.HONOR
     )
@@ -119,7 +131,7 @@ def test_carveout_3_attested_naysayer_under_run_honours() -> None:
             author_is_human=False,
             author_is_naysayer=True,
             control_state_is_run=True,
-            message_is_attested=True,
+            message_is_attested=lambda: True,
         )
         is GuardIVerdict.HONOR
     )
@@ -134,7 +146,7 @@ def test_carveout_3_unattested_naysayer_falls_through_to_redirect() -> None:
             author_is_human=False,
             author_is_naysayer=True,
             control_state_is_run=True,
-            message_is_attested=False,
+            message_is_attested=lambda: False,
         )
         is GuardIVerdict.REDIRECT
     )
@@ -148,7 +160,7 @@ def test_carveout_3_naysayer_under_supervised_redirects() -> None:
             author_is_human=False,
             author_is_naysayer=True,
             control_state_is_run=False,
-            message_is_attested=True,
+            message_is_attested=lambda: True,
         )
         is GuardIVerdict.REDIRECT
     )
@@ -163,10 +175,97 @@ def test_proposer_to_implementer_redirects_by_default() -> None:
             author_is_human=False,
             author_is_naysayer=False,
             control_state_is_run=True,
-            message_is_attested=True,
+            message_is_attested=lambda: True,
         )
         is GuardIVerdict.REDIRECT
     )
+
+
+# --------------------------------------------------------------------------- #
+# Observation-scope contract for ``message_is_attested`` — the thunk fires
+# only inside the carve-out ③ branch, never for a human author, and never
+# for a non-naysayer / non-RUN case. This is the invariant that PR-review
+# msg-2554 asked the predicate itself to own, so the caller no longer has to
+# re-express (naysayer ∧ RUN) as a short-circuit before dispatching.
+# --------------------------------------------------------------------------- #
+
+
+class _CallCounter:
+    """Bool-returning thunk that records whether it was invoked.
+
+    Used in place of a ``unittest.mock.Mock`` to keep the intent
+    ("was it called?") legible at the assertion site.
+    """
+
+    def __init__(self, value: bool) -> None:
+        self._value = value
+        self.calls = 0
+
+    def __call__(self) -> bool:
+        self.calls += 1
+        return self._value
+
+
+@pytest.mark.parametrize(
+    ("author_is_human", "author_is_naysayer", "run"),
+    [
+        # carve-out ① short-circuits on the very first branch: the thunk
+        # must not fire regardless of the other cheap bits.
+        (True, False, False),
+        (True, False, True),
+        (True, True, False),
+        (True, True, True),
+        # Non-human, non-naysayer author (the default proposer→implementer
+        # case guard (i) is designed to redirect): naysayer bit is False, so
+        # ``and`` short-circuits before the thunk is reached.
+        (False, False, False),
+        (False, False, True),
+        # Non-human naysayer under supervised (not RUN): the RUN bit
+        # short-circuits before the thunk is reached.
+        (False, True, False),
+    ],
+)
+def test_attest_thunk_not_invoked_outside_carveout_3_branch(
+    author_is_human: bool,
+    author_is_naysayer: bool,
+    run: bool,
+) -> None:
+    # Attestation is expensive-ish (a marker read on the message body) and
+    # semantically inert for these branches; asserting the thunk is not
+    # invoked pins the observation-scope contract that used to live as an
+    # ad-hoc short-circuit in the caller.
+    thunk = _CallCounter(True)
+    guard_proposer_to_implementer(
+        author_is_human=author_is_human,
+        author_is_naysayer=author_is_naysayer,
+        control_state_is_run=run,
+        message_is_attested=thunk,
+    )
+    assert thunk.calls == 0
+
+
+def test_attest_thunk_invoked_exactly_once_in_carveout_3_branch() -> None:
+    # The only branch that consumes the attest bit: non-human naysayer
+    # under RUN. The predicate calls the thunk once and only once.
+    thunk = _CallCounter(True)
+    verdict = guard_proposer_to_implementer(
+        author_is_human=False,
+        author_is_naysayer=True,
+        control_state_is_run=True,
+        message_is_attested=thunk,
+    )
+    assert thunk.calls == 1
+    assert verdict is GuardIVerdict.HONOR
+
+    unattested = _CallCounter(False)
+    verdict = guard_proposer_to_implementer(
+        author_is_human=False,
+        author_is_naysayer=True,
+        control_state_is_run=True,
+        message_is_attested=unattested,
+    )
+    assert unattested.calls == 1
+    assert verdict is GuardIVerdict.REDIRECT
 
 
 # --------------------------------------------------------------------------- #
@@ -187,9 +286,9 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _count_top_level_defs(name: str) -> tuple[int, list[Path]]:
-    """Count files carrying a ``FunctionDef`` (or ``AsyncFunctionDef``) whose
-    ``node.name`` equals ``name`` — anywhere in the module's AST.
+def _count_all_defs(name: str) -> tuple[int, list[Path]]:
+    """Count every ``FunctionDef`` (or ``AsyncFunctionDef``) in the tree
+    whose ``node.name`` equals ``name`` — including intra-file duplicates.
 
     Scope of what this catches: only an exact-name collision. It does NOT
     catch a copy of the predicate's *logic* placed inside a helper with a
@@ -199,14 +298,22 @@ def _count_top_level_defs(name: str) -> tuple[int, list[Path]]:
     would break the moment the alternative differs from the extracted
     predicate on any truth-table row.
 
+    Counts every ``ast.FunctionDef`` node — a per-file break (the earlier
+    shape flagged by PR-review msg-2554 as an advisory) would have missed
+    intra-file duplication where a bad merge left a second same-named
+    ``def`` inside :mod:`spirrow_mindwire.routing` itself. The returned
+    ``paths`` list preserves duplicates so the failure message points at
+    every file the collision was seen in (the same path may appear more
+    than once if the collision is intra-file).
+
     Uses AST rather than substring search only to keep the count honest:
     a substring check would count THIS test file (it names the predicate
-    in a literal argument to :func:`_count_top_level_defs`), which would
+    in a literal argument to :func:`_count_all_defs`), which would
     be a false positive under the exact-name check too.
     """
     import ast
 
-    hits: list[Path] = []
+    paths: list[Path] = []
     skip_dirs = {".venv", "__pycache__", ".mypy_cache", ".pytest_cache"}
     for path in _repo_root().rglob("*.py"):
         if any(part in skip_dirs for part in path.parts):
@@ -224,26 +331,54 @@ def _count_top_level_defs(name: str) -> tuple[int, list[Path]]:
         # up the same way whether the second copy is top-level or method).
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-                hits.append(path)
-                break  # one hit per file is enough for the count
-    return len(hits), hits
+                paths.append(path)
+    return len(paths), paths
 
 
 def test_guard_predicate_defined_exactly_once() -> None:
     # Name-collision alarm: no second *function named
-    # ``guard_proposer_to_implementer``* exists outside
-    # :mod:`spirrow_mindwire.routing`. This is the narrowest useful version
-    # of Bohr msg-2544 §C-3's "定義箇所を 1 つにする" — it catches an
-    # obvious accidental duplication, but not a differently-named re-
-    # inlining (see the module docstring for what does catch that, and
-    # PR-review msg-2551 for why the earlier prose overclaimed).
+    # ``guard_proposer_to_implementer``* exists anywhere in the tree —
+    # including inside :mod:`spirrow_mindwire.routing` itself. This is the
+    # narrowest useful version of Bohr msg-2544 §C-3's "定義箇所を 1 つに
+    # する" — it catches an obvious accidental duplication, but not a
+    # differently-named re-inlining (see the module docstring for what
+    # does catch that, and PR-review msg-2551 for why the earlier prose
+    # overclaimed; PR-review msg-2554 pointed out the earlier
+    # per-file-break shape missed intra-file duplication).
     repo = _repo_root()
     allowed = repo / "src" / "spirrow_mindwire" / "routing.py"
-    count, hits = _count_top_level_defs("guard_proposer_to_implementer")
-    assert allowed in hits, f"predicate must live at {allowed}; hits={hits}"
+    count, paths = _count_all_defs("guard_proposer_to_implementer")
+    assert allowed in paths, f"predicate must live at {allowed}; paths={paths}"
     assert count == 1, (
         f"guard_proposer_to_implementer must be defined exactly once (in "
-        f"src/spirrow_mindwire/routing.py); found {count} definitions: {hits}"
+        f"src/spirrow_mindwire/routing.py); found {count} definitions "
+        f"(paths, with duplicates preserved to reveal intra-file collisions): "
+        f"{paths}"
+    )
+
+
+def test_count_all_defs_sees_intra_file_duplication(tmp_path: Path) -> None:
+    # Meta-test: prove the counter actually detects intra-file duplication
+    # (PR-review msg-2554 advisory). Two same-named ``def``s in one file
+    # must count as two, not one. The counter's earlier shape used a per-
+    # file ``break`` and would have missed this — this test would have
+    # failed under that shape, and passes now.
+    import ast
+
+    src = tmp_path / "twin.py"
+    src.write_text(
+        "def twin():\n    return 1\n\ndef twin():\n    return 2\n",
+        encoding="utf-8",
+    )
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    hits = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "twin"
+    ]
+    assert len(hits) == 2, (
+        "sanity check for the AST walker shape used by _count_all_defs: two "
+        "same-named defs in one file must be walked as two nodes"
     )
 
 

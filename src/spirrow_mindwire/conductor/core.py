@@ -426,30 +426,22 @@ class Conductor:
         # future consumer (the board's transition table) can share the rule without also sharing
         # this module's roster / control / attestation ownership.
         if handoff.kind is HandoffKind.ROLE and handoff.role is self._implementer_role:
-            # Observe cheap bits eagerly; observe :meth:`_attested` lazily via Python's ``and``
-            # short-circuit. The pre-extraction inline form was ``if is_human: … elif is_naysayer
-            # and run and self._attested(…): …`` — ``_attested`` was reached only for a non-human
-            # naysayer under RUN. The extraction lifts the observation to a keyword bool, which
-            # (as PR-review msg-2551 pointed out) would otherwise widen the observation to every
-            # implementer handoff. Restoring the same guard here keeps the observation scope of
-            # ``_attested`` verbatim from before the extraction; the *rule* (how the four bits
-            # combine into HONOR/REDIRECT) still lives once in ``routing.guard_proposer_to_
-            # implementer``, so this short-circuit is an observation-scope preservation, not a
-            # re-expression of the carve-out chain.
-            author_is_human = self._is_human(author)
-            author_is_naysayer = author_role is self._naysayer_role
-            control_state_is_run = self._control_state is ControlState.RUN
-            message_is_attested = (
-                not author_is_human
-                and author_is_naysayer
-                and control_state_is_run
-                and self._attested(messages[-1])
-            )
+            # Pass the attestation observation as a nullary thunk so the predicate — and only
+            # the predicate — decides when it must fire (PR-review msg-2554 BLOCKING). The
+            # earlier iteration lifted the observation into an eager bool, which forced the
+            # caller to re-express carve-out ③'s (naysayer ∧ RUN) short-circuit here just to
+            # avoid an unnecessary attestation read; that re-expression put the "which carve-
+            # outs consume the attest bit" decision in two places at once. With a thunk, the
+            # observation-scope short-circuit becomes ``routing``'s job — Python's ``and``
+            # in ``guard_proposer_to_implementer`` reproduces the pre-extraction inline
+            # form's scope exactly (``_attested`` is reached only for a non-human naysayer
+            # under RUN), and a future carve-out that needs the attest bit for a different
+            # role/state combination edits ``routing.py`` only.
             verdict = guard_proposer_to_implementer(
-                author_is_human=author_is_human,
-                author_is_naysayer=author_is_naysayer,
-                control_state_is_run=control_state_is_run,
-                message_is_attested=message_is_attested,
+                author_is_human=self._is_human(author),
+                author_is_naysayer=author_role is self._naysayer_role,
+                control_state_is_run=self._control_state is ControlState.RUN,
+                message_is_attested=lambda: self._attested(messages[-1]),
             )
             if verdict is GuardIVerdict.HONOR:
                 assert handoff.identity is not None

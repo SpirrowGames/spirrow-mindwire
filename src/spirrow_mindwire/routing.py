@@ -34,15 +34,19 @@ suite. Bohr's v0.2 sequencing constraint (msg-2544 §C-3): "抽出が landing
 するまで board の routing を live にしない" — this module is the
 extraction; the board routing lands against this import.
 
-The predicate is pure — it operates on booleans lifted from the conductor's
-state, takes no message body, does no I/O, and holds no attribution logic.
-Everything that decides *whether an author is the human*, *whether an
-identity is the naysayer role*, *whether the control state is RUN*, and
-*whether the message is attested* stays with its owner (the conductor's
-roster / control plane / attestation reader); this predicate only combines
-those observations into a routing verdict. That is the drift-resistant
-boundary — future carve-out changes edit the enum + this function only,
-never the ownership of each observation.
+The predicate is pure — it operates on booleans (and a bool-returning
+thunk) lifted from the conductor's state, takes no message body, does no
+I/O, and holds no attribution logic. Everything that decides *whether an
+author is the human*, *whether an identity is the naysayer role*, *whether
+the control state is RUN*, and *whether the message is attested* stays
+with its owner (the conductor's roster / control plane / attestation
+reader); this predicate only combines those observations into a routing
+verdict. The attestation observation is passed in as a nullary callable
+so the predicate — and only the predicate — decides *when* it must be
+consulted (PR-review msg-2554 BLOCKING). That is the drift-resistant
+boundary: future carve-out changes edit the enum + this function only,
+never the ownership of each observation, and never a caller-side
+re-expression of "which carve-outs actually need the attest bit".
 
 Attribution: T-operator-board thread (msg-2542 orchestrator design, msg-2544
 Bohr v0.2 §C-3 single-source extraction). ADR-2026-06-03-17 is cited from
@@ -53,6 +57,7 @@ behaviour verbatim from that surface, not from the ADR text.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import StrEnum
 
 
@@ -78,7 +83,7 @@ def guard_proposer_to_implementer(
     author_is_human: bool,
     author_is_naysayer: bool,
     control_state_is_run: bool,
-    message_is_attested: bool,
+    message_is_attested: Callable[[], bool],
 ) -> GuardIVerdict:
     """Decide whether a handoff to the implementer may proceed.
 
@@ -88,21 +93,33 @@ def guard_proposer_to_implementer(
     §C-3). Semantics are preserved verbatim from the previous inline
     ``_route`` decision in :mod:`spirrow_mindwire.conductor.core`.
 
-    Parameters are named booleans (rather than raw objects) on purpose:
-    lifting the *observations* to the caller keeps the predicate free of
-    identity, role-registry, and message-shape dependencies, so the two
-    call sites (the conductor and the future operator-board tick) share
-    the rule without also sharing a common object graph.
+    Parameters are named booleans (plus one bool-returning callable) on
+    purpose: lifting the *observations* to the caller keeps the predicate
+    free of identity, role-registry, and message-shape dependencies, so the
+    two call sites (the conductor and the future operator-board tick)
+    share the rule without also sharing a common object graph.
+
+    ``message_is_attested`` is a nullary callable rather than a bool
+    (PR-review msg-2554 BLOCKING). This is what keeps the "which carve-outs
+    consult the attest bit" question owned by this function alone: the
+    caller no longer has to reproduce the (naysayer ∧ RUN) short-circuit
+    just to avoid a needless attestation read on unrelated handoffs. If a
+    later carve-out needs the attest bit for a different combination of
+    role and control state, the change lands here — the caller keeps
+    passing the same thunk.
 
     Carve-out precedence:
 
     1. **carve-out ①**: ``author_is_human`` — honour immediately. A human-
        authored decide is the Tier-C gate itself; no other check may
-       withdraw the authorisation the human just gave.
+       withdraw the authorisation the human just gave. The thunk is NOT
+       invoked in this branch.
     2. **carve-out ③**: ``author_is_naysayer AND control_state_is_run AND
-       message_is_attested`` — honour. The independent naysayer's own
+       message_is_attested()`` — honour. The independent naysayer's own
        proceed under RUN is the only autonomous door to code; un-attested,
-       the branch is not taken.
+       the branch is not taken. The thunk is invoked only after both cheap
+       bits are true, so Python's boolean short-circuit preserves the
+       observation scope that the pre-extraction inline form had.
     3. Otherwise — ``REDIRECT``. Guard (i) fires. The conductor's inline
        version returned ``_human_terminal(..., explicit_human=False)``; the
        distinction between "an explicit ``NEXT: human``" and "a guard-(i)
@@ -119,10 +136,16 @@ def guard_proposer_to_implementer(
     with the PR-gate.
     """
     # carve-out ①: human-authored Tier-C decide (Tier-C msg-553 / msg-557).
+    # The attestation thunk is deliberately NOT invoked on this branch.
     if author_is_human:
         return GuardIVerdict.HONOR
     # carve-out ③: independent naysayer's own proceed under RUN + attest
-    # (P-3b, Tier-C msg-954 §2 / msg-970).
-    if author_is_naysayer and control_state_is_run and message_is_attested:
+    # (P-3b, Tier-C msg-954 §2 / msg-970). Python's ``and`` short-circuits
+    # so the thunk is invoked only when the cheap bits have already put us
+    # in the naysayer-under-RUN branch — reproducing the observation scope
+    # the pre-extraction inline form had, WITHOUT requiring the caller to
+    # re-express (naysayer ∧ RUN) itself. That re-expression was the drift
+    # the naysayer flagged in PR-review msg-2554.
+    if author_is_naysayer and control_state_is_run and message_is_attested():
         return GuardIVerdict.HONOR
     return GuardIVerdict.REDIRECT
