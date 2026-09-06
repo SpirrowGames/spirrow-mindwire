@@ -426,11 +426,30 @@ class Conductor:
         # future consumer (the board's transition table) can share the rule without also sharing
         # this module's roster / control / attestation ownership.
         if handoff.kind is HandoffKind.ROLE and handoff.role is self._implementer_role:
+            # Observe cheap bits eagerly; observe :meth:`_attested` lazily via Python's ``and``
+            # short-circuit. The pre-extraction inline form was ``if is_human: … elif is_naysayer
+            # and run and self._attested(…): …`` — ``_attested`` was reached only for a non-human
+            # naysayer under RUN. The extraction lifts the observation to a keyword bool, which
+            # (as PR-review msg-2551 pointed out) would otherwise widen the observation to every
+            # implementer handoff. Restoring the same guard here keeps the observation scope of
+            # ``_attested`` verbatim from before the extraction; the *rule* (how the four bits
+            # combine into HONOR/REDIRECT) still lives once in ``routing.guard_proposer_to_
+            # implementer``, so this short-circuit is an observation-scope preservation, not a
+            # re-expression of the carve-out chain.
+            author_is_human = self._is_human(author)
+            author_is_naysayer = author_role is self._naysayer_role
+            control_state_is_run = self._control_state is ControlState.RUN
+            message_is_attested = (
+                not author_is_human
+                and author_is_naysayer
+                and control_state_is_run
+                and self._attested(messages[-1])
+            )
             verdict = guard_proposer_to_implementer(
-                author_is_human=self._is_human(author),
-                author_is_naysayer=(author_role is self._naysayer_role),
-                control_state_is_run=(self._control_state is ControlState.RUN),
-                message_is_attested=self._attested(messages[-1]),
+                author_is_human=author_is_human,
+                author_is_naysayer=author_is_naysayer,
+                control_state_is_run=control_state_is_run,
+                message_is_attested=message_is_attested,
             )
             if verdict is GuardIVerdict.HONOR:
                 assert handoff.identity is not None

@@ -2,22 +2,33 @@
 
 The predicate is extracted from ``conductor/core.py`` so the future
 operator-board ``R-NEXT-HEIS-GUARD`` transition can consult the same rule
-without a re-expression (T-operator-board msg-2544 §C-3). Two things must
-hold and are pinned here:
+without a re-expression (T-operator-board msg-2544 §C-3). Two things this
+suite pins directly, and one thing it deliberately does NOT try to pin:
 
 1. The predicate covers exactly the carve-outs the pre-extraction inline
    form covered — ① human author and ③ attested independent naysayer under
    RUN — and nothing else. Behaviour tests exercise the truth table.
-2. The predicate is defined **once** in this codebase. A grep-count test
-   fails loud if a second definition (or a second re-expression of the
-   rule) is added — that would silently re-open the drift that motivated
-   the extraction in the first place.
+2. A file-scoped drift alarm: no *second function named
+   ``guard_proposer_to_implementer``* appears anywhere else in the tree,
+   and ``conductor/core.py`` still ``from ..routing import`` the predicate
+   (rather than deleting the import along with an inline hand-roll). This
+   is a name-and-import check, not a semantics check.
 
-Behaviour on the conductor call site (``_route``) is separately covered
-by :mod:`tests.test_conductor_core` (``test_guard_i_*``,
-``test_carveout_*``, ``test_proposer_to_implementer_stops_at_human_*``);
-the two suites together check that the predicate is correct AND that the
-conductor's consumer wiring routes on it correctly.
+What the file-scoped alarm CANNOT catch — and this suite makes no claim
+that it can (PR-review msg-2551): a determined re-inliner who spells the
+rule as, e.g., ``if is_human or (is_naysayer and run and attest):``
+inside a helper with any other name will slip past both checks. The
+name-defended-once assertion is a cheap early-warning, not a general
+"re-expression" detector; the actual invariant — that ``_route`` (and
+future callers) route on the imported predicate rather than on a hand-
+rolled chain — is enforced by the behaviour suite in
+:mod:`tests.test_conductor_core` (``test_guard_i_*``, ``test_carveout_*``,
+``test_proposer_to_implementer_stops_at_human_*``, and the observation-
+scope short-circuit tests added by PR-review msg-2551). Semantic drift
+that agrees with the extracted predicate on the truth table isn't drift;
+semantic drift that disagrees breaks those behaviour tests. That is the
+protection this repository actually has, and the file-scoped tests below
+sit on top of it, not in place of it.
 """
 
 from __future__ import annotations
@@ -159,9 +170,15 @@ def test_proposer_to_implementer_redirects_by_default() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Single-source pin — a grep count that fails loud if guard (i) is
-# re-expressed in a second location (T-operator-board msg-2544 §C-3:
-# "定義箇所を 1 つにする… 定義箇所が 1 つであることを grep-count で検査").
+# Single-source pin (name-scoped) — an AST count that fails loud if a second
+# *function named ``guard_proposer_to_implementer``* appears anywhere else
+# in the tree. This is intentionally weaker than the T-operator-board
+# msg-2544 §C-3 goal ("定義箇所を 1 つにする") — it catches a copy-with-
+# same-name (the most likely accidental duplication) but NOT a re-inlined
+# chain under a different name. That gap is covered by the conductor's
+# behaviour suite in :mod:`tests.test_conductor_core` (semantic drift shows
+# up as a failing carve-out test); this file-scoped alarm is a cheap early
+# warning, not a general "re-expression" detector (PR-review msg-2551).
 # --------------------------------------------------------------------------- #
 
 
@@ -171,13 +188,21 @@ def _repo_root() -> Path:
 
 
 def _count_top_level_defs(name: str) -> tuple[int, list[Path]]:
-    """Count files that carry a *real* ``def <name>(`` at the start of a line
-    (optionally indented) — not a string literal or comment mentioning it.
+    """Count files carrying a ``FunctionDef`` (or ``AsyncFunctionDef``) whose
+    ``node.name`` equals ``name`` — anywhere in the module's AST.
 
-    Uses AST rather than substring search on purpose: a substring check would
-    count THIS test file (it names the predicate in a literal argument to
-    :func:`_count_top_level_defs`), which is exactly the false positive that
-    would flip the drift signal green when a second definition appears.
+    Scope of what this catches: only an exact-name collision. It does NOT
+    catch a copy of the predicate's *logic* placed inside a helper with a
+    different name, nor an inline ``if is_human or (is_naysayer and run
+    and attest):`` chain at a call site. Those cases would be silent to
+    this check and are covered by the conductor's behaviour tests, which
+    would break the moment the alternative differs from the extracted
+    predicate on any truth-table row.
+
+    Uses AST rather than substring search only to keep the count honest:
+    a substring check would count THIS test file (it names the predicate
+    in a literal argument to :func:`_count_top_level_defs`), which would
+    be a false positive under the exact-name check too.
     """
     import ast
 
@@ -205,10 +230,13 @@ def _count_top_level_defs(name: str) -> tuple[int, list[Path]]:
 
 
 def test_guard_predicate_defined_exactly_once() -> None:
-    # The predicate MUST live only in :mod:`spirrow_mindwire.routing`. A
-    # second definition anywhere else in the tree is precisely the drift the
-    # extraction exists to prevent — Bohr msg-2544 §C-3: "board の
-    # R-NEXT-HEIS-GUARD は同じ述語を呼ぶだけにし、遷移表は判定を持たない".
+    # Name-collision alarm: no second *function named
+    # ``guard_proposer_to_implementer``* exists outside
+    # :mod:`spirrow_mindwire.routing`. This is the narrowest useful version
+    # of Bohr msg-2544 §C-3's "定義箇所を 1 つにする" — it catches an
+    # obvious accidental duplication, but not a differently-named re-
+    # inlining (see the module docstring for what does catch that, and
+    # PR-review msg-2551 for why the earlier prose overclaimed).
     repo = _repo_root()
     allowed = repo / "src" / "spirrow_mindwire" / "routing.py"
     count, hits = _count_top_level_defs("guard_proposer_to_implementer")
@@ -220,26 +248,27 @@ def test_guard_predicate_defined_exactly_once() -> None:
 
 
 def test_guard_predicate_call_sites_go_through_routing_module() -> None:
-    # The other side of the single-source rule: every consumer imports the
-    # predicate from :mod:`spirrow_mindwire.routing`, rather than
-    # reimplementing the carve-out chain inline. A test that fires when a
-    # future callsite adds a hand-rolled ``if author_is_human … elif
-    # naysayer …`` chain instead of ``guard_proposer_to_implementer(…)``.
-    #
-    # Weaker than the definition count above (a caller can re-express the
-    # rule without literally spelling ``def guard_proposer_to_implementer``),
-    # so this test does not enforce a numeric upper bound on imports; it
-    # only pins that the conductor — the one existing consumer at
-    # extraction time — imports through the module. Future callsites will
-    # each add their own regression test as they land.
+    # Import-presence alarm: ``conductor/core.py`` still ``from ..routing
+    # import`` the predicate and still spells ``guard_proposer_to_
+    # implementer(`` at least once. This is deliberately a string check on
+    # a specific file, not a general "no hand-rolled chain" scan: a
+    # determined re-inliner who deleted the import along with the call
+    # would slip past this AND leave a broken carve-out truth table, and
+    # the behaviour suite in :mod:`tests.test_conductor_core` (in
+    # particular ``test_guard_i_*`` / ``test_carveout_*`` / the
+    # observation-scope short-circuit tests) is what actually catches
+    # that. Documenting the split honestly (PR-review msg-2551): the
+    # file-scoped check below is the cheap early warning; the behaviour
+    # suite is the load-bearing guarantee.
     core = _repo_root() / "src" / "spirrow_mindwire" / "conductor" / "core.py"
     body = core.read_text(encoding="utf-8")
     assert "from ..routing import" in body, (
         "conductor/core.py must import guard_proposer_to_implementer from "
-        "..routing; a re-inlined carve-out chain would re-open drift with "
-        "the operator board's R-NEXT-HEIS-GUARD (msg-2544 §C-3)."
+        "..routing; deleting the import would drop the extraction back "
+        "into an inline chain (msg-2544 §C-3)."
     )
     assert "guard_proposer_to_implementer(" in body, (
         "conductor/core.py must call guard_proposer_to_implementer(...) "
-        "rather than re-express the carve-out chain inline."
+        "at least once; the behaviour suite in tests/test_conductor_core.py "
+        "enforces that the call still routes correctly."
     )

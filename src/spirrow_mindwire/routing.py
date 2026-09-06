@@ -20,11 +20,19 @@ it to the human terminal, unless one of the following carve-outs applies:
 Why this predicate is a module of its own — T-operator-board msg-2544 §C-3.
 The operator-board's ``R-NEXT-HEIS-GUARD`` transition must consult THE SAME
 routing rule the conductor consults; otherwise the two will drift. The rule
-is written here once, both call sites import it, and a follow-up test pins
-the definition count so a future in-place re-expression cannot silently
-re-open the drift. Bohr's v0.2 sequencing constraint (msg-2544 §C-3):
-"抽出が landing するまで board の routing を live にしない" — this module
-is the extraction; the board routing lands against this import.
+is written here once and both call sites import it. Two file-scoped tests
+in :mod:`tests.test_routing` fire on obvious accidental duplication (a
+second function named ``guard_proposer_to_implementer``; a deleted import
+in ``conductor/core.py``); a re-inlined chain under a different name is
+NOT caught by those alarms, and is caught instead by the conductor's
+carve-out behaviour suite (:mod:`tests.test_conductor_core`) — any inline
+chain that differs from this predicate on any truth-table row breaks a
+test there. The honest split, tightened after PR-review msg-2551: the
+file-scoped tests are cheap early warnings; the load-bearing invariant is
+"the truth table stays exactly this table", enforced by the behaviour
+suite. Bohr's v0.2 sequencing constraint (msg-2544 §C-3): "抽出が landing
+するまで board の routing を live にしない" — this module is the
+extraction; the board routing lands against this import.
 
 The predicate is pure — it operates on booleans lifted from the conductor's
 state, takes no message body, does no I/O, and holds no attribution logic.
