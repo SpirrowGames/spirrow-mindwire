@@ -980,10 +980,10 @@ msg-2279 §3-4 で resolution ルート整備: **U-1 は「retire」で resolve�
 | msg-2619 §2 | first task は fix ではなく measurement（notice が elided path を name するか） | **reflected** | §5 残余-7 本文 |
 | msg-2619 §2 | fix 空間 3 案（path-aware / never-elide dir / notice に path）と予算トレード | **reflected** | §5 残余-7 本文、issue #231 |
 | msg-2619 §3.1 | 実装スレッド不在に対処するため GitHub issue に filing、artefact に pointer | **reflected** | issue [`#231`](https://github.com/SpirrowGames/spirrow-mindwire/issues/231) 起票済、本 commit で 残余-7 pointer 追加 |
-| msg-2619 §3.2 | post-merge main から branch を切り、残余 pointer を追加する PR | **reflected**（本 commit そのもの） | 本 feature branch は origin/main（merge commit `b4eef73`）から切った |
+| msg-2619 §3.2 | post-merge main から branch を切り、残余 pointer を追加する PR | **reflected**（本 commit そのもの） | 本 feature branch は origin/main @ `1608db5` から切った。PR #208 の merge commit `b4eef73` は本 base の ancestor（`git merge-base --is-ancestor b4eef73 HEAD` = 0 で実測）— msg-2619 §3.2 の「post-merge」条件は base が `b4eef73` またはそれ以降の main tip であること ∴ 満たす。詳細は measured 節 |
 | msg-2619 §3 | edge を両側に書く（残余 → issue、issue → artefact） | **reflected** | 残余-7 が issue #231 を link、issue #231 本文が artefact path + msg-2619 を link |
 | msg-2619 §4 | 規律-17（container を持たない先延ばしは丁寧な drop） | **reflected** | §6 規律-17、§付録 G error type 17 |
-| msg-(gate advisory) | 実装スレッド kickoff は残余 pointer PR が main に land するまで block | **partially reflected**（本 PR body に明記して human に notify。本 spec commit は「実装スレッドは pointer PR の main への merge 後に stand up」を規律-17 の運用 note として持ち込む — 実装スレッドの stand-up sequencing は human が握る） | 本 PR body、§5 残余-7 の「実装スレッドの `OBL-READBACK-ENTRY` が pick up する」条件記述 |
+| msg-(gate advisory) | 実装スレッド kickoff は残余 pointer PR が main に land するまで block | **partially reflected**（本 PR body に sequencing 制約を明記して human に notify するのみ。本 spec commit は kickoff-sequencing の operational note を 規律-17 本文にも 残余-7 本文にも持ち込まない — 規律-17 は general rule に留め、operational sequencing は human の Tier-C 領域として PR body に置く。§5 残余-7 の「実装スレッドの `OBL-READBACK-ENTRY` が本 pointer を pick up する」は passive な依存関係の記述であって sequencing 制約ではない） | 本 PR body（sequencing 制約の唯一の記述場所） |
 
 **表明**: 上表は spec の text から組み立てた（私の記憶からではない）。**msg-2278 / msg-2279 / msg-2280 は本文書に完全反映され、`SUPERSEDED by msg-2279 §2` の 1 行を除いて "not reflected" は無い**。SUPERSEDED は明示された昇格であり、無視ではない。**本 followup commit は msg-2286 / msg-2589 / msg-2619 / msg-(gate advisory) を反映する** — msg-2589 の merge 半分と msg-(gate advisory) の kickoff-block 半分は human の tier-C 領域につき partial、それ以外は full reflected。
 
