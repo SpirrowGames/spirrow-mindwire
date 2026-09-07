@@ -21,7 +21,7 @@ adrs:
   - id: ADR-2026-05-29-12
     title: "embodiment 自己申告値化 (ADR-09 D-5 拡張・実装、5 API optional 受け口、enum、状態遷移 msg 必須化、human 例外、response-side omit)"
   - id: ADR-2026-05-29-13
-    title: "実装着手前 spec read-back チェックリスト (本ファイル §N.1 の SOT)"
+    title: "実装着手前 spec read-back チェックリスト (実装 = `spec/process/obligations.yaml` の `OBL-READBACK-ENTRY` / `OBL-READBACK-EXIT`、背景 = `spec/process/README.md`)"
   - id: ADR-2026-05-31-14
     title: "ガワ方式撤回 (claude.ai web 外部駆動の ToS 衝突 → Claude Code 転換)"
   - id: ADR-2026-05-31-15
@@ -34,3 +34,5 @@ adrs:
     title: "mindwire デプロイ・トポロジと magickit 到達性 (ADR-17 D-8 amendment)"
   - id: ADR-2026-06-04-19
     title: "独立 naysayer のエージェント化 + summon ルール (ADR-17 relay/bundle を supersede)"
+  - id: ADR-2026-08-25-20
+    title: "`independence_class` に `machine` を追加"
