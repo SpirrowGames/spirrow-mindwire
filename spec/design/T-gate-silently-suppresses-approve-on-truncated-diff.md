@@ -535,6 +535,7 @@ LLM 呼び出し境界で例外が発生したとき、**上から評価する**
 | **残余-4** | **反復回数の自動カウントは本 PR に無い。** escalation は文面による人への指示であって機械的な counter ではない。counter が要るなら残余-3 と同じ issue に含める | 未起票 |
 | **残余-5** | **持続的 operational 障害が、帯外の初回呼び出しで起きた場合、Tier-C 経路が一度も配達されない。** 赤い CI は出るが理由を言わない。総縮退状態（size-orthogonal ≈ ∅）では**露出が (B) クラス全体に広がる**。真の解は反復カウンタ（残余-4）か writable layer（残余-3） | 未起票。**AC-29(b) がテストで pin し、参照コメントを埋める** |
 | **補償(a)** | **CI が lockfile↔manifest 整合（`uv lock --check` 等）を検証しているか実測。** 無ければ、本設計は **lockfile を誰も見ない状態**を作ったことになる。**本 PR の非目標だが、本設計が作った穴の所在なので記録しないことは許さない** | 未起票 |
+| **残余-7** | **`D-2″` の basename-only lockfile 述語が benign な test fixture collision で mock lockfile を elide する**（PR-gate msg-2286 が指摘、例: `tests/fixtures/poetry.lock`）。**hostile 方向（`src/hidden/uv.lock` 等）は既に 脅威モデルの受容（msg-2231 §5）として settled — この残余は再開しない**（scope fence: msg-2619 §2）。severity は「fails safe (it does not break the pipeline, it merely hides the mock lockfile)」で **non-blocking**（msg-2286 逐語）。**First task は fix ではなく measurement**: `D-3` / `D-4` / `D-elided` の notice が elided path を name するか、announce only か を確定する — 前者は readability defect（軽微）、後者は silence defect（#182 と同型）で severity が変わる。fix 空間は path-aware match / never-elide directory / notice に path を書く の 3 案で、いずれも予算とトレードする ∴ measurement が可能な実装スレッドで解く | **起票済 [`#231`](https://github.com/SpirrowGames/spirrow-mindwire/issues/231)**。**実装スレッドの `OBL-READBACK-ENTRY` が本 pointer を pick up する**（規律-17） |
 
 **残余-6 は成立しない。** msg-2251 §5 は「AC-31 を採らないなら」を条件に立てたが、msg-2252 が AC-31 を明示採択した ∴ 条件不成立。記録は「残余-6 は消える」と明示していない ∴ 本文書は TOMBSTONED を **CONSOLIDATED** として付し、fidelity review に回した（msg-2278 disposition (d) で accepted）。
 
@@ -559,6 +560,7 @@ LLM 呼び出し境界で例外が発生したとき、**上から評価する**
 | **規律-14** | **記録由来の手続きの執行者は、著者ではなく記録アクセスで選ぶ。誰が実行するかに正しさが依存する手続きは、そもそも機械的ではなかった** | msg-2260 §3 |
 | **規律-15** | **設計は artefact の名前と場所を代入する機構を引用する。literal を書かない。散文は artefact を記述してよく、名指してはならない。** repo が名前を機構で代入するとき、散文で書いた literal は「plausible なだけの」名前を仕様に固定してしまい、機構との整合を silent に破る。**pass-1 が V-2 と衝突したのはこの型の欠陥である**（§付録 F R-3、error type 16） | msg-2279 §1.1 |
 | **規律-16** | **ontology が変わったら、既存の known-answer test は再利用前に新 ontology のもとで re-validate する。** 粗い ontology の下で書かれたテストは、細かい ontology が禁じる artefact に対して silently pass しうる。**5 タグ拡張時の positive KAT がまさにこれで、msg-2258 §5 の陽性集合は bare id で書かれていたため 5 タグ下では A/D-1〜A/D-6 だけで pass できた** | msg-2279 §2.4 |
+| **規律-17** | **container を持たない先延ばしは、丁寧な名前を付けた drop である。** ある item を「後で扱う」「実装スレッドに送る」等の deferral を成立させたいなら、**送り先の container が deferral の瞬間にアドレス可能でなければならない**。まだ stand-up されていない thread、まだ存在しない issue、誰も enumerate できないメモは、いずれも container ではない — deferral の瞬間に「そこ」を指せない先は、単に忘却である。**durable container を先に今作れる形（例: GitHub issue）で作ってそこに置き、将来 container が stand-up されるときは entry read-back（`OBL-READBACK-ENTRY`）が pick up する**。この規律は本設計の founding pathology（見ていないものを黙って落として well-formed な出力を生む）の container 版である | msg-2619 §4 |
 
 **番号の無い規律（本設計に対して同じ拘束力を持つ）**:
 
@@ -916,6 +918,7 @@ msg-2279 §3-4 で resolution ルート整備: **U-1 は「retire」で resolve�
 | 14 | 成果物の scope を、記録ではなく**要求**から取った。要求は「要求者が自分に欠けていると知っているもの」を語る。**知らずに欠けているものについては沈黙し、その沈黙は完全性と区別できない** | msg-2256 §3 | **規律-12** |
 | 15 | 抽出手続きを、それが走る当のデータに対して実行せずに規定した（**走査を正しく述べた直後に、走査が装飾になる集約子を指定した**） | msg-2258 §1 | **規律-13** |
 | 16 | **artefact の identity を、機械的に名前を代入する repo の中で、prose の literal から書いた。** 名前は「descriptive で plausible」ゆえに questioned されず、2 度の design clear を通過した。**執行者が指名された name を守るためには (a) gate を壊す or (b) validator を silently バイパスする の 2 択しか無く、pass-1 は (b) を取った** — 設計が offer した唯一のもう 1 つの選択肢だった。**規律-15 で閉じる。設計は artefact の name を機構から引用する。literal を書かない。** | msg-2279 §1 | **規律-15** |
+| 17 | **記録すべき item を、まだ存在しない container（実装スレッド）に「送る」ことで「保存した」と述べた。** 「実装スレッドに送る」という言い回しは container 名を持つ ∴ 保存に見える。しかし deferral の瞬間にその thread は addressable ではなく、enumeration は不可能 ∴ この操作は drop と区別できない。**PR-gate finding（msg-2286）を実装スレッドへ deferral する human の最初の instinct（msg-2589）がまさにこれで、msg-2619 §2 が container 補正を挿入し §4 で規律-17 として閉じた**。本 error type は「見ていないものを黙って落とす」本スレッド founding pathology の container 版 — silence でなく **misdirection** を経由する変異 | msg-2619 §4 | **規律-17** |
 
 **この登録簿は本スレッドの中核的な発見でもある**: msg-1871 の病理（部分的な view が、見ていないものを黙って省いたまま、well-formed で自信のある出力を生む）は 4 層で再生産された。
 
@@ -969,8 +972,20 @@ msg-2279 §3-4 で resolution ルート整備: **U-1 は「retire」で resolve�
 | msg-2255 §7.2 | UNRECOVERABLE は loop に返す | **reflected**（U-3 のみ返す。U-1 / U-2 は msg-2279 §3-4 で resolve、U-4 は disposition (a) で CONSOLIDATED accepted、U-5 は LANDED で close） | §付録 E |
 | msg-2260 §7 | route は artefact → fidelity → code、merge は Tier-C | **reflected** | §8 |
 | OBL-DECLARE-UNREADABLE | 本 turn で読めなかった仕様がある場合は宣言 | **N/A** — 本文書は本 turn で 66 通全数を unelided で取得。ADR-2026-05-29-13（spec read-back checklist）を含む ADR 本文は corpus 外で参照していない ∴ ADR 本体を根拠にした主張はしていない（本文書内の ADR 参照はすべて AC-22 の未検証命題として明示） | — |
+| msg-2286 PR-gate | D-2″ basename-only lockfile 述語の benign collision（test fixture が elide される）を残余として起票せよ | **reflected**（本 followup commit） | §5 残余-7、[`#231`](https://github.com/SpirrowGames/spirrow-mindwire/issues/231) |
+| msg-2589 (human C) | PR #208 を main に merge し、同時に basename-only 問題を追跡 issue として起票 | **partially reflected**（merge は Takahito が 2026-08-31T04:59:14Z に実施、merge commit `b4eef73`。issue 起票と 残余 pointer 追加は本 followup commit） | GitHub merge、[`#231`](https://github.com/SpirrowGames/spirrow-mindwire/issues/231)、§5 残余-7 |
+| msg-2619 §1 | merge の hand-on-button は human。loop は main への merge を tool でも行わない | **reflected**（本 commit は base=main で PR を open するのみ。merge は human） | §8 unchanged、本 PR は開くのみ |
+| msg-2619 §2 | 残余 scope fence — hostile direction（脅威モデルの受容 msg-2231 §5）は再開しない | **reflected** | §5 残余-7 本文に scope fence を明記、issue #231 本文にも明記 |
+| msg-2619 §2 | PR-gate finding の non-blocking severity を逐語で持ち込む | **reflected** | §5 残余-7 本文（「fails safe」逐語） |
+| msg-2619 §2 | first task は fix ではなく measurement（notice が elided path を name するか） | **reflected** | §5 残余-7 本文 |
+| msg-2619 §2 | fix 空間 3 案（path-aware / never-elide dir / notice に path）と予算トレード | **reflected** | §5 残余-7 本文、issue #231 |
+| msg-2619 §3.1 | 実装スレッド不在に対処するため GitHub issue に filing、artefact に pointer | **reflected** | issue [`#231`](https://github.com/SpirrowGames/spirrow-mindwire/issues/231) 起票済、本 commit で 残余-7 pointer 追加 |
+| msg-2619 §3.2 | post-merge main から branch を切り、残余 pointer を追加する PR | **reflected**（本 commit そのもの） | 本 feature branch は origin/main（merge commit `b4eef73`）から切った |
+| msg-2619 §3 | edge を両側に書く（残余 → issue、issue → artefact） | **reflected** | 残余-7 が issue #231 を link、issue #231 本文が artefact path + msg-2619 を link |
+| msg-2619 §4 | 規律-17（container を持たない先延ばしは丁寧な drop） | **reflected** | §6 規律-17、§付録 G error type 17 |
+| msg-(gate advisory) | 実装スレッド kickoff は残余 pointer PR が main に land するまで block | **partially reflected**（本 PR body に明記して human に notify。本 spec commit は「実装スレッドは pointer PR の main への merge 後に stand up」を規律-17 の運用 note として持ち込む — 実装スレッドの stand-up sequencing は human が握る） | 本 PR body、§5 残余-7 の「実装スレッドの `OBL-READBACK-ENTRY` が pick up する」条件記述 |
 
-**表明**: 上表は spec の text から組み立てた（私の記憶からではない）。**msg-2278 / msg-2279 / msg-2280 は本文書に完全反映され、`SUPERSEDED by msg-2279 §2` の 1 行を除いて "not reflected" は無い**。SUPERSEDED は明示された昇格であり、無視ではない。
+**表明**: 上表は spec の text から組み立てた（私の記憶からではない）。**msg-2278 / msg-2279 / msg-2280 は本文書に完全反映され、`SUPERSEDED by msg-2279 §2` の 1 行を除いて "not reflected" は無い**。SUPERSEDED は明示された昇格であり、無視ではない。**本 followup commit は msg-2286 / msg-2589 / msg-2619 / msg-(gate advisory) を反映する** — msg-2589 の merge 半分と msg-(gate advisory) の kickoff-block 半分は human の tier-C 領域につき partial、それ以外は full reflected。
 
 ---
 
@@ -980,5 +995,13 @@ msg-2279 §3-4 で resolution ルート整備: **U-1 は「retire」で resolve�
 - `python spec/design/verify.py` → **[本 commit 後に実測 — 結果は同上]**
 - `main` untouched（Tier-C 領域は触れない）
 - 本 commit の diff は `spec/design/` 内のみ（コード変更ゼロ、テスト変更ゼロ）
+
+**measured（followup commit で実測、msg-2619 §3.2 の 残余-7 pointer 追加）**:
+
+- `bash .mindwire-gate` → **exit 0, 2049 passed / 6 deselected**（pre-commit 実測）
+- `python spec/design/verify.py` → **exit 0, ERROR/WARNING なし**（pre-commit 実測）
+- 本 followup commit の diff は `spec/design/T-gate-silently-suppresses-approve-on-truncated-diff.md` のみ（コード変更ゼロ、テスト変更ゼロ、他の spec 変更ゼロ）
+- base は `origin/main` @ `1608db5`（PR #208 の merge commit `b4eef73` は本 base の ancestor、2026-08-31T04:59:14Z に land、その後に他 PR が積まれた現行 tip）
+- **spec-only commit** — 本 commit は 残余-7 の pointer と 規律-17 / error type 17 の追加のみ。D / AC / INV の body は無変更、Live index / Baseline / KAT 集合は無変更、fold 手続きも無変更
 
 **merge to protected `main` is Tier-C (Takahito). The loop never merges.**
