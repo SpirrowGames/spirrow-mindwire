@@ -29,6 +29,37 @@
 # Entries without `origin.moved_from` are net-new loop-readable formulations
 # (nothing was deleted from source to create them); the length invariant does
 # not apply to them and they evolve through the normal proposal flow.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# CONDITIONAL OBLIGATION BODIES CARRY THE COMPLIANCE AXIS, NOT THE OBSERVABILITY AXIS
+#
+# A conditional obligation says "if <antecedent> is observed, do X". Its `body`
+# is the string the loop actually reads at runtime, so on that string two axes
+# have to be distinguished:
+#
+#   - 履行軸 (the compliance axis): what the implementer is to do when the
+#     antecedent is observed, and where the change lands (which repository /
+#     server / call site / role). This is what the entry is FOR; it must be
+#     self-contained in `body`.
+#
+#   - 観測軸 (the observability axis): when and where the antecedent becomes
+#     observable — which probe surfaces it, on which host, under which
+#     conditions. This is the DESIGN's responsibility, not the manifest's.
+#     Keep it out of `body`. If you write it in, a design change to the probe
+#     (an example: the pre-role-check probe for OBL-GATE-BOOTSTRAP-CLOSE-CARVEOUT,
+#     which is T-new-project-gate-bootstrap S-4) will require a manifest change
+#     to stay in step, and the two representations of the same fact will drift.
+#
+# Citations: this rule was narrowed to its current form in Bohr msg-2392 §3 on
+# thread T-new-project-gate-bootstrap; the same thread's msg-2139 §4 fixed the
+# S-4 probe's scope as observability (i.e. not to be widened silently) and is
+# the reason the example above is a live example rather than a hypothesis.
+#
+# This note is not machine-checked. Whether a `body` has silently absorbed
+# observability-axis prose is a review-time judgement, not a testable predicate:
+# a key that fired on the shape of the prose would be a symptom-key, which is
+# exactly the failure mode msg-2387 §1(3) (the R-iv withdrawal) diagnosed. The
+# note is here so a reviewer has a rule to point at; enforcement is at review.
 # ─────────────────────────────────────────────────────────────────────────────
 
 version: 1
@@ -386,15 +417,17 @@ obligations:
     # written as a description is checked by nobody. It is now a requirement,
     # and it is checked — see the Enforced-by line at the end of this comment.
     #
-    # Where the antecedent becomes observable is not this entry's business —
-    # it is the design's business (T-new-project-gate-bootstrap S-4 probe,
-    # per Bohr msg-2084 §4). The obligation only encodes what the implementer
-    # must do IF the antecedent is observed; whether/where it fires is
-    # entirely outside this file's concern. An earlier version of this
-    # rationale asserted where the antecedent could be observed and made an
-    # internally contradictory claim about the S-4 probe's precheck
-    # short-circuit — removed here because the observability of the
-    # antecedent is the S-4 design's responsibility, not this obligation's.
+    # Observability of the antecedent (when/where it becomes observable) is
+    # NOT restated here. See the file-header authoring note "CONDITIONAL
+    # OBLIGATION BODIES CARRY THE COMPLIANCE AXIS, NOT THE OBSERVABILITY AXIS"
+    # for the general rule; this entry is one of the live examples cited
+    # there (S-4 of T-new-project-gate-bootstrap is the observability probe).
+    # Same-fact-in-two-places drifts (msg-2392 §4(4)), and an earlier revision
+    # of this paragraph is precisely where that drift began: it asserted where
+    # the antecedent could be observed and made an internally contradictory
+    # claim about the S-4 probe's precheck short-circuit. That is exactly the
+    # class of mistake the authoring note now warns against, so the fix is to
+    # let the file-header rule carry it, not to re-state it here.
     #
     # The cross-repo landing site is stated in `body` itself (round 3: PR-gate
     # msg-2391, proposer ruling msg-2392 §4). It is deliberately NOT restated

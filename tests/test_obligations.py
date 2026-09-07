@@ -16,7 +16,7 @@ enforce the invariants the Tier-C GO msg-737 nailed down:
 - **INV-C** (consumer-visible placement, msg-2387 §3): a conditional obligation's
   antecedent and the landing site of the change it prescribes both reach the
   *rendered* implementer prompt, and the meta-commentary round 1 stripped stays
-  out of it. All three halves in one test because the findings on that entry
+  out of it. All three parts in one test because the findings on that entry
   pulled in opposite directions and a guard on any half alone lets the others
   regress. Each asserts against that entry's own injected block, not against the
   whole prompt — msg-2392 §2 measured a whole-prompt ``in`` going green for a
@@ -182,7 +182,7 @@ def test_canary_2_double_prime_moved_bodies_preserve_original_length() -> None:
 #   test. An ``in`` against a large enough whole is true for reasons that have
 #   nothing to do with the declaration.
 #
-# So all three halves below assert against ``_injected_block``, this entry's own
+# So all three parts below assert against ``_injected_block``, this entry's own
 # slice of the rendered prompt (~270 chars), not against the ~17.7k-char prompt.
 # The two pre-existing halves were moved onto the slice for the same reason and
 # not merely for tidiness: on the whole prompt the positive half could go green
@@ -236,7 +236,7 @@ def test_obl_gate_bootstrap_close_carveout_body_carries_its_antecedent(
     """This entry's *own injected block* carries its antecedent and its landing
     site, and does not carry the meta-commentary round 1 removed.
 
-    All three halves are asserted together on purpose. The findings on this entry
+    All three parts are asserted together on purpose. The findings on this entry
     pulled in opposite directions — round 1 (msg-2111 §2) said the span was too
     wide and carried Einstein's meta-commentary, round 2 (msg-2207) said it was
     too narrow and had lost the antecedent, round 3 (msg-2391) said it never named
