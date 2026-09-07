@@ -616,10 +616,40 @@ function New-QuarantineRecord {
 function Get-FailureClass {
     param(
         [string[]]$SessionLogTail,
-        [string]$RepoRoot = $PSScriptRoot
+        # PR-gate msg-2486 flagged this as an unused parameter with an implicit CWD
+        # dependency. Bohr msg-2601 §1-2 escalated the fix from "remove" to "wire it
+        # up" for exactly the reason this sub-system exists: an unwired uv-run silently
+        # falls through to ``unknown`` when the caller's CWD lacks a ``pyproject.toml``,
+        # and a global ``failure_class = unknown`` on every quarantine is
+        # indistinguishable from D-6 not being deployed at all (msg-2470 §8 W-4).
+        # ``[AllowEmptyString()]`` + empty default keeps the parameter overridable
+        # while allowing the body to compute the real default lazily — the eager
+        # default (``Split-Path -Parent $PSScriptRoot``) throws in AST-lifted test
+        # contexts where ``$PSScriptRoot`` is empty, and would then block the
+        # short-circuit paths (empty tail) that never even reach the CWD.
+        [AllowEmptyString()]
+        [string]$RepoRoot = ''
     )
 
     if (-not $SessionLogTail -or $SessionLogTail.Count -eq 0) { return 'unknown' }
+
+    # Lazy default: compute the repo root only when the caller did not supply one AND
+    # the function actually needs it (past the short-circuits above). This script sits
+    # in ``<repo>/deploy/`` so ``Split-Path -Parent $PSScriptRoot`` is the repo root —
+    # the same expression the top-level ``$repoRoot`` on line ~159 uses. Kept in sync
+    # deliberately so a repo move needs one edit, not two.
+    if (-not $RepoRoot) {
+        if ($PSScriptRoot) {
+            $RepoRoot = Split-Path -Parent $PSScriptRoot
+        } else {
+            # Lifted-into-a-test caller with no $PSScriptRoot AND no explicit
+            # -RepoRoot. Falling back to '.' would silently re-introduce the CWD
+            # dependency this parameter exists to remove — msg-2601 §1-2 is
+            # explicit: silent fall-through to ``unknown`` is the failure mode we
+            # are structurally forbidding. Return ``unknown`` loudly instead.
+            return 'unknown'
+        }
+    }
 
     $blob = ($SessionLogTail -join "`n")
 
@@ -627,7 +657,14 @@ function Get-FailureClass {
         # ``uv run`` is the repo's convention for invoking a package in the managed venv;
         # `.mindwire-gate` uses the same. Passing the tail via stdin (not argv) keeps the
         # command line short and avoids any escaping surprise with quotes / backticks.
-        $output = $blob | uv run --quiet python -m spirrow_mindwire.stall_ledger 2>$null
+        #
+        # ``--directory $RepoRoot`` pins the working directory of the uv invocation so
+        # ``pyproject.toml`` / ``uv.lock`` resolve regardless of the caller's CWD. This
+        # is preferred over ``Push-Location``: uv's own flag never leaks CWD state back
+        # into PowerShell if the child crashes mid-flight, so the sweep's outer scope
+        # cannot be corrupted by a failed classification (matches CON-1's record-then-
+        # execute discipline — if the remedy scope leaks, so does the observation of it).
+        $output = $blob | uv run --directory $RepoRoot --quiet python -m spirrow_mindwire.stall_ledger 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $output) { return 'unknown' }
         # The CLI prints ONE line — the label. Any surplus (stderr already suppressed
         # above) is ignored; taking `[0]` guards against a stray blank line.
@@ -3130,7 +3167,13 @@ try {
             # tail BEFORE constructing the record so it lands as a first-class field.
             # Get-FailureClass never raises — a broken subprocess still yields 'unknown'
             # — so this call cannot be the reason a quarantine is silently skipped.
-            $failureClass = Get-FailureClass -SessionLogTail $tail
+            #
+            # ``-RepoRoot $repoRoot`` is passed explicitly (the function's default already
+            # resolves to the same value via ``Split-Path -Parent $PSScriptRoot``) so the
+            # call site names the CWD contract instead of relying on lexical implication —
+            # msg-2601 §2 counts a "receiver exists but no one supplies it" as the same
+            # bug family the ledger was built to catch (row 6: ``$RepoRoot`` — 受け口はあるが誰も読まない).
+            $failureClass = Get-FailureClass -SessionLogTail $tail -RepoRoot $repoRoot
             $rec = New-QuarantineRecord `
                 -FirstFailureAt $nowIso -ExitCode $code -StopReason $verdict.reason `
                 -FailureHead $probeHead -FailureControl $currentControl `

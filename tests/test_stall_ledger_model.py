@@ -13,8 +13,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
 from spirrow_mindwire.stall_ledger import (
     T_INFLIGHT,
     T_SKEW,
@@ -92,36 +90,28 @@ class TestEmittedEventIdsMembership:
         assert not EmittedEventIds(github_review_ids=("x",)).is_empty()
 
 
-class TestRemedyAttemptWindow:
-    """msg-2474 §2 + msg-2476 §1: an in-flight or id-lost attempt keeps its origin-
-    uncertain window open UP TO ``a.at + T_UNCERTAIN``. A completed attempt has its
-    ids known, so the window is closed and only clause 1 (id membership) matters."""
+class TestRemedyAttemptNoLocalWindowHelper:
+    """PR-gate msg-2486 + Bohr msg-2601 §1-1: the earlier ``is_open_window(now)``
+    helper on ``RemedyAttempt`` was deleted, not merely because it was unused, but
+    because a same-clock helper on the attempt cannot legitimately carry ``T_SKEW``
+    (CON-2 in msg-2476 §3). Its mere presence lured a future reader into copying
+    the pattern into the origin path, silently reopening E-106.
 
-    @pytest.fixture
-    def now(self) -> datetime:
-        return datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+    Pin the absence structurally so a well-meaning revival is caught by a red test
+    rather than sailing into review with a plausible-looking commit."""
 
-    def _attempt(self, at: datetime, state: RemedyState) -> RemedyAttempt:
-        return RemedyAttempt(at=at, kind="gate-refire", head_sha="abc123", state=state)
-
-    def test_in_flight_open_at_boundary(self, now: datetime) -> None:
-        a = self._attempt(now - T_UNCERTAIN, RemedyState.IN_FLIGHT)
-        assert a.is_open_window(now) is True
-
-    def test_in_flight_closed_past_boundary(self, now: datetime) -> None:
-        a = self._attempt(now - T_UNCERTAIN - timedelta(seconds=1), RemedyState.IN_FLIGHT)
-        assert a.is_open_window(now) is False
-
-    def test_id_lost_still_uses_window(self, now: datetime) -> None:
-        """msg-2474 §2 is explicit: ``id-lost`` keeps the window open — that is
-        precisely what makes ``id-lost`` safe."""
-        a = self._attempt(now - timedelta(minutes=10), RemedyState.ID_LOST)
-        assert a.is_open_window(now) is True
-
-    def test_completed_never_uses_window(self, now: datetime) -> None:
-        """Completed attempts have their ids captured, so clause 1 answers alone."""
-        a = self._attempt(now, RemedyState.COMPLETED)
-        assert a.is_open_window(now) is False
+    def test_is_open_window_is_not_reintroduced(self) -> None:
+        a = RemedyAttempt(
+            at=datetime(2026, 9, 3, 12, 0, tzinfo=UTC),
+            kind="gate-refire",
+            head_sha="abc123",
+            state=RemedyState.IN_FLIGHT,
+        )
+        assert not hasattr(a, "is_open_window"), (
+            "RemedyAttempt.is_open_window was deleted intentionally — the window "
+            "judgement lives in origin.origin() so it can pair a REMOTE event.at "
+            "against a T_SKEW-widened lower bound (CON-2). Do not resurrect it."
+        )
 
 
 class TestStallRecordIdentity:

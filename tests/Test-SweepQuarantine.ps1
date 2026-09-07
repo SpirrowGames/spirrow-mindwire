@@ -617,6 +617,50 @@ Write-Host "Get-FailureClass — empty tail returns 'unknown' without spawning p
 Check "empty tail -> unknown" 'unknown' (Get-FailureClass -SessionLogTail @())
 Check "null tail -> unknown" 'unknown' (Get-FailureClass -SessionLogTail $null)
 
+# PR-gate msg-2486 + Bohr msg-2601 §1-2: ``$RepoRoot`` must be wired into ``uv run``
+# so the classifier resolves the repo's ``pyproject.toml`` regardless of the caller's
+# current working directory. Without this pin, a repo-move (or any caller that runs
+# the sweep from a directory without a project file) would flip the classifier's
+# output to ``unknown`` for EVERY quarantine, and that failure is invisible in the
+# log — matching exactly the row-6 shape ("receiver exists but nobody reads it") the
+# ledger was designed to detect. The check below chdirs OUT of the repo, then calls
+# the classifier with a tail that MUST classify as ``sdk-error-during-execution``
+# per the pattern-discipline suite. If ``$RepoRoot`` were still unwired the call
+# would silently drop to ``unknown`` and the test would fail.
+Write-Host "Get-FailureClass — CWD-independent via -RepoRoot (msg-2601 §1-2)"
+$originalLocation = Get-Location
+$foreignCwd = [System.IO.Path]::GetTempPath()
+try {
+    Set-Location -LiteralPath $foreignCwd
+    # A representative fixture tail — the classifier's own tests pin that this exact
+    # payload lands as ``sdk-error-during-execution``. If the CLI runs and produces
+    # its normal answer, the wire-up is working. If it drops to ``unknown``, either
+    # ``$RepoRoot`` is unwired or ``uv`` is not on PATH; the Skip block below covers
+    # the latter so we do not fail the suite on developer machines without ``uv``.
+    $fixtureTail = @(
+        "some unrelated log line",
+        "ClaudeCodeSdkDeliveryError: SDK is_error; subtype='error_during_execution'",
+        "exit=1"
+    )
+    # Feasibility precheck: skip loudly (not silently) if uv is unavailable. The
+    # PR-gate CI environment has uv on PATH so this stays a real check there; a
+    # developer without uv sees a WARN, not a green pass, so the distinction is
+    # preserved in the log (the whole point of this file's opening docstring).
+    $uvOk = $false
+    try {
+        $null = & uv --version 2>$null
+        if ($LASTEXITCODE -eq 0) { $uvOk = $true }
+    } catch { $uvOk = $false }
+    if (-not $uvOk) {
+        Write-Host "  WARN  uv not on PATH — CWD-independence check skipped locally (CI still runs it)"
+    } else {
+        $observed = Get-FailureClass -SessionLogTail $fixtureTail -RepoRoot $repoRoot
+        Check "classifier resolves under foreign CWD" 'sdk-error-during-execution' $observed
+    }
+} finally {
+    Set-Location -LiteralPath $originalLocation
+}
+
 if ($script:failures -gt 0) {
     Write-Host "sweep quarantine: $($script:failures) check(s) FAILED"
     exit 1

@@ -121,23 +121,22 @@ class RemedyAttempt:
     outcome: RemedyOutcome = "unknown"
     flags: tuple[str, ...] = ()
 
-    def is_open_window(self, now: datetime) -> bool:
-        """The origin-uncertain window is open while ``state`` may still catch events
-        the loop caused.
-
-        - ``in-flight``: the remedy has not returned, so we do not know which events
-          are ours yet.
-        - ``id-lost``: the remedy IS over but we lost track of what it emitted; the
-          window keeps events near ``a.at`` out of participant motion.
-        - ``completed``: the ids are known and the window is unnecessary — set-
-          membership on ``emitted_event_ids`` handles origin directly.
-
-        The window has an absolute upper bound at ``a.at + T_UNCERTAIN``.
-        """
-
-        if self.state == RemedyState.COMPLETED:
-            return False
-        return now <= self.at + T_UNCERTAIN
+    # Deliberately no ``is_open_window(now)`` here. An earlier revision offered such
+    # a helper on this dataclass; PR-gate msg-2486 flagged it as speculative dead
+    # code and Bohr msg-2601 §1-1 escalated the reason from "unused" to "dangerous":
+    #   * The ONLY place that decides whether ``event.at`` falls inside the origin-
+    #     uncertain window is ``origin.origin()`` in this package, and that call
+    #     compares a REMOTE ``event.at`` against ``a.at``. Per CON-2 (msg-2476 §3),
+    #     any cross-clock comparison MUST widen its lower bound by T_SKEW.
+    #   * A helper on ``RemedyAttempt`` naturally receives the loop's local ``now``
+    #     — a same-clock comparison — so it cannot legitimately carry T_SKEW. If a
+    #     future reader sees a method named ``is_open_window`` on this class they
+    #     will (rightly) infer "the window judgement is here", copy the pattern into
+    #     the origin path, and silently reopen E-106: loop events leak forward out
+    #     of the window, get classified as participant motion, INV-3 (loop remedies
+    #     do not rejuvenate) breaks, and the record closes and re-opens age-0.
+    # The window judgement lives in exactly one place — ``origin.origin()`` — and it
+    # is the ONLY place that has both timestamps in scope with the right pairing.
 
 
 @dataclass
