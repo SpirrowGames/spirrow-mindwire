@@ -646,7 +646,23 @@ function Get-FailureClass {
             # -RepoRoot. Falling back to '.' would silently re-introduce the CWD
             # dependency this parameter exists to remove — msg-2601 §1-2 is
             # explicit: silent fall-through to ``unknown`` is the failure mode we
-            # are structurally forbidding. Return ``unknown`` loudly instead.
+            # are structurally forbidding. The function contract from the docstring
+            # above is "NEVER breaks the sweep" — so we cannot ``throw`` (the sweep
+            # would fault and lose the whole tick). But we CAN and MUST make the
+            # fall-back visible: PR-gate msg-(gate) round 2 objection #1 correctly
+            # observed that a bare ``return 'unknown'`` here is indistinguishable
+            # from the silent failure this branch exists to prevent.
+            #
+            # ``Write-Warning`` emits to the warning stream (visible in the sweep
+            # log and in tests' console output; unlike ``2>$null`` on child
+            # processes, it is NOT swallowed by the outer try/catch below since
+            # that catch only fires on terminating errors).
+            # ``Write-Log`` additionally records the event in the sweep's own log
+            # file so the operator's ledger of the tick names it — the stub in
+            # ``Test-SweepQuarantine.ps1`` is a no-op, so tests do not need to
+            # assert on log lines, but production readers see it.
+            Write-Warning "Get-FailureClass: no -RepoRoot and no `$PSScriptRoot in scope; classifier NOT invoked. Returning 'unknown' (loud fall-back per msg-2601 §1-2)."
+            Write-Log "WARN Get-FailureClass: RepoRoot unresolvable (no param, no `$PSScriptRoot); classifier skipped, failure_class='unknown'"
             return 'unknown'
         }
     }

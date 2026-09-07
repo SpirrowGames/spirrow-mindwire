@@ -661,6 +661,42 @@ try {
     Set-Location -LiteralPath $originalLocation
 }
 
+# PR-gate msg-(gate) round 2 objection #1: when neither -RepoRoot nor $PSScriptRoot
+# is available, the function must still honour "never break the sweep" (return, not
+# throw) but the fall-back MUST be loud enough that operators can see it — a bare
+# ``return 'unknown'`` is indistinguishable from the silent failure the whole
+# parameter exists to prevent. Pin BOTH properties:
+#   (a) return value is still 'unknown' (function contract: never break sweep)
+#   (b) a warning record is emitted (loudness: operator can see the misinvocation)
+# The function has no [CmdletBinding()] so common parameters like -WarningVariable
+# are not accepted; capture via warning-stream redirection (3>&1) instead.
+Write-Host "Get-FailureClass — loud fall-back when no RepoRoot resolvable (msg-(gate) round 2)"
+$didThrow = $false
+$fallbackResult = $null
+$warnings = @()
+try {
+    # Force the branch by nulling both signals in a scoped invocation. Child scope
+    # inherits $PSScriptRoot from parent, so shadow it locally. 3>&1 merges the
+    # warning stream into the success stream so ForEach-Object can pick warnings
+    # out by type (Write-Warning emits WarningRecord objects).
+    $merged = & {
+        $PSScriptRoot = $null
+        Get-FailureClass -SessionLogTail @('some tail line') -RepoRoot ''
+    } 3>&1
+    foreach ($item in $merged) {
+        if ($item -is [System.Management.Automation.WarningRecord]) {
+            $warnings += $item
+        } else {
+            $fallbackResult = $item
+        }
+    }
+} catch {
+    $didThrow = $true
+}
+Check "loud fall-back does NOT throw (never-break-sweep contract preserved)" $false $didThrow
+Check "loud fall-back returns 'unknown'" 'unknown' $fallbackResult
+Check "loud fall-back emits at least one Write-Warning record (not silent)" $true ($warnings.Count -gt 0)
+
 if ($script:failures -gt 0) {
     Write-Host "sweep quarantine: $($script:failures) check(s) FAILED"
     exit 1
