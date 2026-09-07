@@ -1,6 +1,6 @@
 # Operator Board — 設計書（実装レベル）
 
-版: **0.3.3** / 2026-09-06 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除、msg-2567 → msg-2569 で v0.3.1 blocking 解除）+ PR-review naysayer（PR #224 msg-(gate) → v0.3.2 で 2 件 blocking 解除、round-2 → v0.3.3 で 1 件 blocking 解除）/ v0.2 差分の正本: Bohr msg-2544 / v0.3 差分の正本: Bohr msg-2566 / v0.3.1 差分の正本: Bohr msg-2568 / v0.3.2 差分の正本: 本ファイル §5.2A（Heisenberg、PR-review msg-(gate) 受け入れ）/ v0.3.3 差分の正本: 本ファイル §5.2A.4 R1a/R1b 行（Heisenberg、PR-review msg-(gate) round-2 受け入れ）
+版: **0.3.4** / 2026-09-08 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除、msg-2567 → msg-2569 で v0.3.1 blocking 解除、msg-（v0.3.4 endorse）で §17 承認）+ PR-review naysayer（PR #224 msg-(gate) → v0.3.2 で 2 件 blocking 解除、round-2 → v0.3.3 で 1 件 blocking 解除、round-3 → APPROVE with structure advisory on `ci_clock_start`）/ v0.2 差分の正本: Bohr msg-2544 / v0.3 差分の正本: Bohr msg-2566 / v0.3.1 差分の正本: Bohr msg-2568 / v0.3.2 差分の正本: 本ファイル §5.2A（Heisenberg、PR-review msg-(gate) 受け入れ）/ v0.3.3 差分の正本: 本ファイル §5.2A.4 R1a/R1b 行（Heisenberg、PR-review msg-(gate) round-2 受け入れ）/ v0.3.4 差分の正本: 本ファイル §17（Bohr msg-2595、人 msg-2594 decide 後の残余レジスタ新設）
 設計 SOT: chatroom `spirrow-mindwire/T-operator-board`。本文はその同期コピー。
 対象リポジトリ: spirrow-conclair（状態）・spirrow-mindwire（tick / executor）・spirrow-magickit（UI）
 根拠: 2026-09-03〜04 operator セッションの実測（116 判断点）、light ティア判断リプレイ（一致 85%）、3 リポジトリのソース調査（conclair `cb517af` / mindwire `60f52b1` / magickit `6bfa87d`）
@@ -556,6 +556,9 @@ profile  = "ephemeral-develop"
 - **msg-（PR #224 fix）Heisenberg（v0.3.2 受け入れ）**: 押し戻しゼロ。BLOCKING-1 → R1 を R1a（fresh commit + 空 → DEFER）/ R1b（過ぎたら INVOKE、CAP_EMPTY_RACE=5min で判別）に分割。BLOCKING-2 → `nomination_is_self=False` を先頭の R0-OVERRIDE として promote、下流の全 admission 状態を bypass、R6 の redundant guard を削除。§5.2A.4 表に 3 行追加、INV-CI-1 に manual-override carve-out を明記、Heisenberg fix commit で 16 追加 tests。R0-OVERRIDE の precedence は `test_r0_override_wins_over_every_downstream_rule` の 7 行 parametrised meta-test で pin。
 - **msg-(gate) PR-review naysayer round-2（v0.3.3 blocking 1 件）**: edge-case — v0.3.2 の R1a/R1b discriminator が `head_committed_date` を「push 時刻の proxy」として使っていたが、これは cherry-pick / 既存 branch の re-push / 過去の commit を含む push で成立しない。3 時間前 author の commit を今 push すると `commit_age > CAP_EMPTY_RACE` になり R1b が誤発火、CheckSuite startup race の最中に naysayer を起こして fail-close COMMENT を落とす。BLOCKING-1 の緩和が古い commit で完全に無効化される。
 - **msg-（PR #224 fix v0.3.3）Heisenberg（round-2 受け入れ）**: 押し戻しゼロ。`gate_admission` に新 kwarg `head_pushed_at: datetime` を追加、R1a/R1b の discriminator を `push_age = now - head_pushed_at` に変更。`head_committed_date` は `ci_clock_start` fallback にのみ残る（msg-2568 §A-2 決定を保持）。CAP_EMPTY_RACE の rationale コメントを push clock 起点に更新。呼び出し側は GraphQL `pushedDate` → REST `head.repo.pushed_at` → REST `pull_request.updated_at` の順で best-available proxy を渡す。4 新規 tests: 3 時間前 commit + 30 秒前 push → R1a（naysayer の元 scenario）、1 年前 commit + 10 秒前 push → R1a（極端版）、10 秒前 commit + 6 時間前 push → R1b（symmetric 側から invariant を pin）、reason 文字列に `push_age=` があり `commit_age` が無い（audit trail）。
+- **msg-(gate) PR-review naysayer round-3（APPROVE with structure advisory）**: v0.3.3 の R1a/R1b 修正で BLOCKING は無くなり **APPROVE**（ci=success）。ただし単一 advisory (`class: structure`): `ci_clock_start` の fallback は `head_committed_date` のままなので、`observed = ∅` かつ古い commit を今 push した head では `now - clock.at > CAP_NOCLOCK` が瞬時に成立し、CheckSuite startup grace を bypass して R3 `ROUTE_HUMAN` へ false-early 早鳴りする。v0.3.3 で「discriminator だけ触れて `ci_clock_start` は msg-2568 §A-2 決定に従い据え置き」と明示していた通りの trade-off で、承認を阻まない。
+- **msg-2594 人（Takahito decide）**: PR #224 を naysayer APPROVE 版でマージし、`ci_clock_start` fallback は「別の follow-up 項目として記録し、後続 PR で直す」。PR #224 と PR #225 は 2026-09-06T09:33Z までに main へマージ済（takayan0908 手動、Tier-C）。
+- **msg-2595 Bohr（v0.3.4）**: 人 decide を受領。PR #224 は挙動ゼロ（配線が入っていない純関数）である事実を明示し、follow-up 記録先として本 §17 残余レジスタを新設。3 行 = `RES-CI-CLOCK-FALLBACK`（naysayer round-3 advisory の受け先。候補 α は `pr.updated_at` の前方ドリフトで「静かに止まる」に反転するため単純流用不可、候補 β は head 束縛マーカ、実装前に設計ターン必須）／ `RES-WIRING`（`gate_admission` 呼び出し元の欠落。効果表未実現）／ `RES-A-GAP`（board 稼働までの期間限定受容）。行は「id を名指しした PR がマージされた時だけ閉じる」という規律を伴う。§17 は board の最小前身であり、board 稼働時に残行が `backlog` の初期集合になる。
 
 ## 15. 開発の進め方（2026-09-05 Takahito 承認）
 
@@ -603,3 +606,44 @@ vector の SOT は **conclair repo 一箇所**。他 2 repo は vendor し、`co
 P1 は push-only なので board は行為しないが、**board を人が読んで動くと conductor と board が二重に「次の役」を決める**期間が生まれる。∴:
 
 > **CON-P1-ADVISORY**: P1 の `/dashboard/operator` は「advisory only — conductor is authoritative」を常時表示し、カードの `next` は派生値であることを明示する。P2 カットオーバーまで board 由来の指示で人が動く導線（ボタン・コピー可能なコマンド）を置かない。
+
+---
+
+## 17. 残余レジスタ【v0.3.4 §Bohr msg-2595】
+
+board が動くまでの唯一の耐久面はこの設計書。∴ 「宣言して未履行」（D8）を消すため、承認済み設計に対する残余（未実装 / 後で直す / 期限付き受容）はスレッド散文ではなく本節に id 付きで置く。
+
+**閉じ方の規律**: 行は **`id` を PR 本文で名指しでマージされた時にだけ閉じる**（namer が id を書かない PR は行を閉じない）。board 稼働時、§17 の残行がそのまま `backlog` カードの初期集合になる。§17 は board の最小前身であって、恒久的な別置き場ではない。
+
+### 17.1 行
+
+| id | 内容 | 検出手段 | 昇格条件 | 状態 |
+|---|---|---|---|---|
+| **RES-CI-CLOCK-FALLBACK** | `observed = ∅` 時の待ち時計が `head_committed_date` に落ちるため、古い commit を今 push した head で R3 `ROUTE_HUMAN` の false-early 早鳴りが起こる（naysayer round-3 advisory）| **既に出荷済**: R3 escalation 文字列の `clock=commit`。observability は追加コード不要 | `clock=commit` の escalation が 1 件でも出たら、その時点の `push_age` を確認。`push_age < CAP_NOCLOCK` なら誤発火 → **設計ターンへ昇格**（Bohr → Einstein → 実装） | **deferred**（§17.2 参照） |
+| **RES-WIRING** | `gate_admission` の呼び出し元が存在しない。§5.2A の期待効果表（gate invocation ・ relay noise ・ 人の停止の削減）は未実現。今の production は依然として旧経路 | 呼び出し元数 = 0（`grep -r "gate_admission(" src/` が `def gate_admission` 以外 0 行） | 無し（**scheduled**、次の PR）。配線 PR は本文で `RES-WIRING` を名指しすること | scheduled |
+| **RES-A-GAP** | A landing（本設計の §5.2A `gate_admission`）〜 board 稼働の間、人の停止に集約可視面が無い（msg-2568 §C の期間限定 gap）| 無し（期間限定） | board 稼働で自動消滅 | 期限付き受容 |
+
+### 17.2 RES-CI-CLOCK-FALLBACK の中身 —「`head_pushed_at` に替えるだけ」ではない（Bohr msg-2595 §C）
+
+naysayer round-3 advisory は正しい。ただし v0.3.3 と同じ手（`head_committed_date` → `head_pushed_at`）を `ci_clock_start` に流用するのは**誤りの向きが反転するので、そのままでは通らない**。ここを記録せずに「後で `head_pushed_at` に替える」とだけ書くと、後続の実装者が対称性から自明だと判断して入れる。
+
+#### 発火条件（連言。今日はほぼ到達不能）
+
+`rollup ≠ ∅` ∧ 全 check の `startedAt` / `createdAt` が null（legacy `StatusContext` 系）∧ head の commit が 12h より古い ∧ その head が今 push された。SpirrowGames の repo は GitHub Actions（CheckRun は `startedAt` を持つ）なので、第 2 項が現状ほぼ成立しない。
+
+#### 候補 α: fallback を `head_pushed_at` に替える
+
+v0.3.3 の proxy chain は `commit.pushedDate` → `repo.pushed_at` → `pr.updated_at` の 3 段。**第 2/3 段は head 束縛でない**。
+
+- R1a/R1b（cap 5 分）では、前方ドリフトしても次 tick で rollup が埋まるので**自己修復する**。∴ v0.3.3 では許容できた。
+- `ci_clock_start`（cap 12h）では、**PR にコメントが付くたびに時計が後ろへ動き、「CI stuck」が永遠に鳴らない**。これは D7 最優先の「静かに止まる」そのもの。誤りの向きが「早鳴り」から「鳴らない」へ反転する。
+
+∴ 流用可なら「head 束縛な第 1 段が取れた時だけ採用、取れなければ committed に落ちる」という段分けが必須で、その場合**誤りの向きが source によって変わる**関数になる。
+
+#### 候補 β: 初観測時刻を head 束縛マーカに固定する
+
+conductor が head を初めて見た tick に `first_seen(head)` を書き（§5.2A.5 の ci-route マーカと同じ機構）、以後それを読む。head が動けばマーカも入れ替わるので A-2 の statelessness は保たれる（純関数は状態を持たず、caller が head 束縛の事実を 1 つ増やすだけ）。一度書いたら動かないので前方ドリフトしない。欠点は RES-WIRING と結合すること。
+
+#### 判断
+
+**今は決めない。実装もしない。** 昇格したら **Bohr → Einstein の設計ターンを 1 回通してから**コードに落とす（新しい辺ではなく `ci_clock_start` の入力差し替えだが、候補で誤りの向きが「早鳴り」↔「鳴らない」に反転するため、実装者の対称性判断に委ねてよい変更ではない）。検証機会ゼロで投機的に直さないこと自体が、この行の判断内容である。
