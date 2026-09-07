@@ -665,51 +665,82 @@ try {
 # is available, the function must still honour "never break the sweep" (return, not
 # throw) but the fall-back MUST be loud enough that operators can see it — a bare
 # ``return 'unknown'`` is indistinguishable from the silent failure the whole
-# parameter exists to prevent. Pin BOTH properties:
+# parameter exists to prevent. Pin THREE properties:
 #   (a) return value is still 'unknown' (function contract: never break sweep)
 #   (b) a warning record is emitted (loudness: operator can see the misinvocation)
+#   (c) the function did not throw (function contract preservation)
 # The function has no [CmdletBinding()] so common parameters like -WarningVariable
 # are not accepted; capture via warning-stream redirection (3>&1) instead.
 #
-# On the mechanism used to synthesise "no $PSScriptRoot in scope":
-#   PR-gate round 3 claimed the assignment ``$PSScriptRoot = $null`` throws a
-#   SessionStateUnauthorizedAccessException because $PSScriptRoot is a read-only
-#   automatic variable. This is empirically false: $PSScriptRoot is set BY the
-#   engine on module/script load, not marked ReadOnly/Constant, and PowerShell
-#   scoping lets a child scope shadow a parent-scope variable of the same name.
-#   See PowerShell docs on about_Automatic_Variables and about_Scopes. The gate's
-#   assumption would make this test suite fail on first run — the fact that it
-#   passes in CI (and every prior local run) is the direct disproof.
-# We use ``Set-Variable -Scope Private -Force`` here rather than a bare assignment
-# so the shadowing intent is textually explicit for the next reader; this yields
-# the same behaviour as ``$PSScriptRoot = $null`` inside the child scope, but no
-# reader can mistake it for an attempt to overwrite the parent's automatic value.
-# The Private scope guarantees the shadow does not escape to the containing test.
+# HOW THIS TEST TRIGGERS THE FALL-BACK BRANCH (mechanism, empirically verified):
+#
+#   In production, Get-FailureClass is defined by ``deploy/run-conductor-scheduled.ps1``
+#   and $PSScriptRoot inside the function body is ``<repo>/deploy`` (a truthy value
+#   — the fall-back branch never runs; the branch above it computes RepoRoot from
+#   $PSScriptRoot instead).
+#
+#   In THIS test suite, Get-FailureClass is loaded via AST extraction + Invoke-
+#   Expression from run-conductor-scheduled.ps1 (see the ``foreach ($name in ...)``
+#   block at the top of this file). An AST-lifted function has NO backing script
+#   file, so PowerShell leaves $PSScriptRoot **empty** inside it, regardless of any
+#   parent-scope value.
+#
+#   Consequence: simply calling ``Get-FailureClass -RepoRoot ''`` from this test is
+#   sufficient to reach the fall-back branch — no scope trickery is needed. An
+#   earlier revision of this test used ``Set-Variable -Scope Private`` and a
+#   $PSScriptRoot sentinel to "shadow" the value; a PR-gate reviewer (round 4)
+#   correctly pointed out that Private hides from child scopes, meaning the shadow
+#   would not affect the function's own view of $PSScriptRoot even if the function
+#   were normally-defined. That objection did not overturn the test outcome
+#   (empirically the assertions still pass, because AST-lifted functions never
+#   inherit a $PSScriptRoot from anywhere), but the ceremony was misleading: it
+#   suggested the shadow was doing work it was not. Removed in favour of a direct
+#   call, with a probe helper (see below) that proves the fall-back branch was
+#   the actual code path taken.
+#
+# ON EARLIER ROUND-3 CHARACTERISATION:
+#
+#   A previous comment here characterised round-3's read-only claim as "empirically
+#   false" on the strength of a standalone repro showing that bare
+#   ``$PSScriptRoot = $null`` in ``& { ... }`` does not throw. That repro is
+#   accurate — the assignment does not throw — but the previous framing understated
+#   how much of the disagreement lives in genuine PowerShell scoping subtlety. The
+#   surface behaviour of the assignment is not read-only-locked, which is why the
+#   Set-Variable -Force earlier was not needed; the deeper question of whether a
+#   PARENT-SCOPE shadow reaches a child function is what round-4 correctly flagged,
+#   and it is separate. Both distinctions matter, and both are moot for this
+#   particular test because the AST-lift path avoids them entirely.
 Write-Host "Get-FailureClass — loud fall-back when no RepoRoot resolvable (msg-(gate) round 2)"
+
+# Precondition probe: confirm that AST-lifted functions see $PSScriptRoot as empty
+# in THIS test's execution context. This is what makes the direct ``-RepoRoot ''``
+# call sufficient to reach the fall-back branch — without the AST-lift artefact,
+# a call from the test script would inherit the script's own $PSScriptRoot and
+# never enter the fall-back at all.
+#
+# The probe MUST itself be AST-lifted, not defined normally with ``function ... {}``.
+# A normally-defined helper in this file sees ``<repo>/tests``, so it would not
+# probe the same behaviour Get-FailureClass exhibits.
+$probeSrc = 'function Get-InnerPSScriptRootProbe { $PSScriptRoot }'
+$probeAst = [System.Management.Automation.Language.Parser]::ParseInput($probeSrc, [ref]$null, [ref]$null)
+$probeFn = $probeAst.FindAll(
+    { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true
+) | Select-Object -First 1
+Invoke-Expression $probeFn.Extent.Text
+$innerProbe = Get-InnerPSScriptRootProbe
+Check "precondition: AST-lifted function sees empty `$PSScriptRoot (mechanism the fall-back branch depends on)" '' "$innerProbe"
+
 $didThrow = $false
 $fallbackResult = $null
 $warnings = @()
-$scopeProof = $null  # inside-child-scope value of $PSScriptRoot; used to prove the
-                     # shadow actually took effect (see assertion below).
 try {
     # 3>&1 merges the warning stream into the success stream so a foreach over the
     # merged pipeline can separate WarningRecord objects (Write-Warning) from
-    # ordinary strings (the return value). The Set-Variable line SHADOWS
-    # $PSScriptRoot in this child scope only — no parent-scope engine variable is
-    # touched, and the assignment cannot throw because it targets Private scope.
-    $merged = & {
-        Set-Variable -Name PSScriptRoot -Value $null -Scope Private -Force
-        # Emit the observed inner value on the ordinary output stream so the outer
-        # scope can prove the shadow worked. Prefixed with a sentinel so it never
-        # collides with a real classifier return string like 'unknown'.
-        "__scopeproof__:$PSScriptRoot"
-        Get-FailureClass -SessionLogTail @('some tail line') -RepoRoot ''
-    } 3>&1
+    # ordinary strings (the return value).
+    $merged = Get-FailureClass -SessionLogTail @('some tail line') -RepoRoot '' 3>&1
     foreach ($item in $merged) {
         if ($item -is [System.Management.Automation.WarningRecord]) {
             $warnings += $item
-        } elseif ("$item".StartsWith('__scopeproof__:')) {
-            $scopeProof = "$item".Substring('__scopeproof__:'.Length)
         } else {
             $fallbackResult = $item
         }
@@ -717,12 +748,7 @@ try {
 } catch {
     $didThrow = $true
 }
-# Precondition (proves the gate's read-only claim is empirically wrong):
-#   if $PSScriptRoot were truly locked, the Set-Variable line would throw and
-#   $didThrow would be $true — the subsequent assertions would fail. Since we
-#   test $didThrow = $false first, a green run of this line IS the disproof.
-Check "loud fall-back does NOT throw (never-break-sweep contract preserved; also disproves the read-only claim on `$PSScriptRoot)" $false $didThrow
-Check "loud fall-back: `$PSScriptRoot shadow took effect inside child scope" '' $scopeProof
+Check "loud fall-back does NOT throw (never-break-sweep contract preserved)" $false $didThrow
 Check "loud fall-back returns 'unknown'" 'unknown' $fallbackResult
 Check "loud fall-back emits at least one Write-Warning record (not silent)" $true ($warnings.Count -gt 0)
 
