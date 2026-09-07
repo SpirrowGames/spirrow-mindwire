@@ -46,6 +46,16 @@ class MagickitMcpError(RuntimeError):
     ``isError``, no-JSON, gateway) leaves it ``None``, because those failures
     have no envelope and therefore no server-side classification.
 
+    **Subclassing note** (T-sweeper-posts-into-resolved-thread-blocks-r2-deploy,
+    Bohr msg-536 W5): specific server refusals that carry a domain meaning
+    beyond "the call failed" — currently only :class:`ThreadResolvedError` —
+    are surfaced as subclasses of this exception. Producers that need to
+    branch on the domain-specific case catch the subclass; every other
+    ``except MagickitMcpError`` continues to catch it unchanged (subclass
+    inheritance). This keeps the classifier logic in ONE place
+    (:func:`raise_if_envelope`) rather than scattering the "which envelope
+    means what" reasoning across each producer.
+
     **Why the field is carried instead of re-read from the message** (T-new-
     project-gate-bootstrap Bohr msg-2383 §2 "INV-D"): a caller that needs to
     tell one envelope kind from another used to search ``str(exc)`` for a
@@ -88,6 +98,49 @@ class MagickitMcpError(RuntimeError):
     def __init__(self, message: str, *, error_type: str | None = None) -> None:
         super().__init__(message)
         self.error_type = error_type
+
+
+class ThreadResolvedError(MagickitMcpError):
+    """The magickit call was refused because the target thread is ``resolved``.
+
+    Design source: chatroom thread
+    ``T-sweeper-posts-into-resolved-thread-blocks-r2-deploy`` (Bohr msg-536 W5,
+    Einstein msg-535 / msg-537 endorsements). The type exists so producers can
+    catch a **domain error** — "the target thread is not writable, permanently
+    for this thread" — instead of each rediscovering the HTTP mapping or
+    string-matching ``status='resolved'`` out of a :class:`MagickitMcpError`
+    message. Non-retryable **by contract**: no caller should retry the same
+    call on the same thread expecting a different result. Class hierarchy is
+    ``MagickitMcpError`` → ``ThreadResolvedError`` so every existing ``except
+    MagickitMcpError`` continues to catch it (backwards-compatible surface).
+
+    **Detection at the client boundary** (:func:`_is_thread_resolved_envelope`).
+    A brief on why this classification lives at the client rather than each
+    producer: the ONE place with a parsed envelope is here, so the ONE place
+    to decide which envelope means "resolved" is here too. A false negative
+    (an envelope that DOES mean "resolved" but classifies to bare
+    :class:`MagickitMcpError`) is fail-safe — the caller still gets an
+    exception at the site the call was refused, and the failure surfaces
+    rather than being swallowed. A false positive would treat a non-resolved
+    refusal as terminal-non-retryable, so the detector is deliberately
+    conservative: match a known ``error_type`` name AND a marker in the
+    ``error`` prose that pins the state, or a dedicated future
+    ``error_type`` that carries the semantic directly.
+
+    **Producer contract** (Bohr msg-536 W4a, absorbed into W5):
+      * ``ThreadResolvedError`` is terminal for THIS thread — do not retry.
+      * The refusal is **never** itself posted into a chatroom thread. Posted
+        into the same thread it would 409 again; posted into a different
+        thread it is out-of-context. Producers deliver the payload to the
+        payload's intended reader through a different surface, or fail
+        loudly so the target is reconfigured. See ``spec/process/
+        obligations.yaml`` (W4b entry) for the design question every new
+        chatroom producer must answer.
+      * Where a caller has no better fallback, an uncaught
+        :class:`ThreadResolvedError` crashes the job visibly. That is the
+        fail-loud default (Bohr msg-534 / Einstein msg-535: "fail-loud
+        beats a prose contract that depends on being read").
+    """
 
 
 class McpToolCaller(Protocol):
@@ -339,6 +392,77 @@ def _elevation_message(payload: dict[object, Any]) -> str:
     return "magickit tool returned an error envelope: " + " ".join(parts)
 
 
+# ---- ThreadResolvedError detection (W5) ------------------------------------
+#
+# Design source: T-sweeper-posts-into-resolved-thread-blocks-r2-deploy Bohr
+# msg-536 W5. The ONE place a magickit call's refusal is classified into a
+# domain-specific type. Everything the client knows about "envelope means
+# thread-is-resolved" lives in this block; a future R2 (or later) rename
+# lands here in ONE edit, not scattered across every catch site.
+#
+# The predicate is a positive OR of two forms, deliberately conservative
+# (false-negative is fail-safe, false-positive is not — see
+# :class:`ThreadResolvedError` docstring):
+#
+#   Form A — the currently-observed refusal, measured 2026-09-03 (Bohr
+#     msg-2456 §2 on T-gate-bootstrap-close-retried-on-resolved-thread):
+#     ``error_type == "ChatroomStateError"`` AND the ``error`` prose
+#     contains the pinning marker ``status='resolved'``. Matching on prose
+#     alone is what msg-2457 blocked at the CLOSE-swallow site; the
+#     invariant there was about the *swallow* branch, not about the
+#     client-boundary classifier. This site's failure mode when the marker
+#     drifts is fail-safe: a bare :class:`MagickitMcpError` surfaces
+#     instead, i.e. the fault is still raised (the direction that pin
+#     protects against — silently swallowed refusal — is not reachable
+#     from here).
+#
+#   Form B — the semantic name (forward-compatible for R2 and later): the
+#     envelope carries an ``error_type`` value that names the state
+#     directly. Currently anticipated names: ``ThreadResolvedError``,
+#     ``ChatroomThreadResolvedError``. When R2's actual wire form is
+#     measured, extend this tuple in ONE place.
+#
+# Which producers currently touch this classifier:
+#   * :mod:`spirrow_mindwire.gate_bootstrap` — close_alert's post-refusal
+#     read-back is not affected (it observes world state, not
+#     exception type), but a caller that catches ThreadResolvedError
+#     directly reads the same fact via type rather than message string.
+#   * :mod:`spirrow_mindwire.gate_bootstrap_visibility` — the sweeper's
+#     failure-report post path (W2 in the design). Terminal + episode
+#     clear.
+#   * :class:`spirrow_mindwire.orchestrator.PrReviewOrchestrator` — the
+#     PR-gate critique post (W3 in the design). Terminal; the primary
+#     artifact of the gate is the GitHub PR review, so the chatroom
+#     record is fail-safe to drop with a diagnostic.
+_THREAD_RESOLVED_ERROR_TYPES_FORM_A: tuple[str, ...] = ("ChatroomStateError",)
+_THREAD_RESOLVED_ERROR_TYPES_FORM_B: tuple[str, ...] = (
+    "ThreadResolvedError",
+    "ChatroomThreadResolvedError",
+)
+_THREAD_RESOLVED_PROSE_MARKER = "status='resolved'"
+
+
+def _is_thread_resolved_envelope(payload: dict[object, Any]) -> bool:
+    """``True`` iff ``payload`` is an envelope meaning "target thread is resolved".
+
+    Positive OR of Form A (currently-observed close refusal) and Form B
+    (forward-compatible semantic error_type names). See the block comment
+    above for the design rationale and the pointer to msg-2457's invariant
+    argument for why this site is allowed to inspect ``error`` prose in a
+    way the close-swallow site is not.
+    """
+    error_type = payload.get("error_type")
+    if not isinstance(error_type, str):
+        return False
+    if error_type in _THREAD_RESOLVED_ERROR_TYPES_FORM_B:
+        return True
+    if error_type in _THREAD_RESOLVED_ERROR_TYPES_FORM_A:
+        error = payload.get("error")
+        if isinstance(error, str) and _THREAD_RESOLVED_PROSE_MARKER in error:
+            return True
+    return False
+
+
 def raise_if_envelope(payload: Any) -> None:
     """Raise :class:`MagickitMcpError` iff ``payload`` is a chatroom error envelope.
 
@@ -369,10 +493,20 @@ def raise_if_envelope(payload: Any) -> None:
     raised error always carries a classification.
     """
     if is_envelope(payload):
-        raise MagickitMcpError(
-            _elevation_message(payload),
-            error_type=_elevation_snippet(payload, "error_type"),
-        )
+        message = _elevation_message(payload)
+        error_type = _elevation_snippet(payload, "error_type")
+        # W5 (T-sweeper-posts-into-resolved-thread-blocks-r2-deploy Bohr
+        # msg-536): specialize the "target thread is resolved" refusal into
+        # a domain-typed subclass so producers can catch it without
+        # string-matching. Every other refusal keeps the generic
+        # :class:`MagickitMcpError` type — subclassing means an existing
+        # ``except MagickitMcpError`` still catches the specialized case
+        # (backwards-compatible on the read side, precise on the write
+        # side). See :func:`_is_thread_resolved_envelope` for the
+        # classifier's design rationale.
+        if _is_thread_resolved_envelope(payload):
+            raise ThreadResolvedError(message, error_type=error_type)
+        raise MagickitMcpError(message, error_type=error_type)
 
 
 def parse_tool_result(result: Any) -> Any:
@@ -616,6 +750,7 @@ __all__ = [
     "MagickitMcpError",
     "McpToolCaller",
     "StreamableHttpChatroomMcp",
+    "ThreadResolvedError",
     "is_envelope",
     "magickit_mcp_url",
     "parse_tool_result",

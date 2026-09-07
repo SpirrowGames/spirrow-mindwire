@@ -79,7 +79,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
 from ..github.client import ReviewEvent, parse_pr_ref
-from ..magickit.client import McpToolCaller
+from ..magickit.client import McpToolCaller, ThreadResolvedError
 from ..routing import GuardIVerdict, guard_proposer_to_implementer
 from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
@@ -698,24 +698,52 @@ class Conductor:
             f"{outcome.body}\n\n"
             f"NEXT: {nxt}"
         )
-        result = await self._mcp.call_tool(
-            "chatroom_post_message",
-            {
-                "project": self._thread_ref.project_id,
-                "thread_id": self._thread_ref.thread_id,
-                "msg_type": "report",
+        try:
+            result = await self._mcp.call_tool(
+                "chatroom_post_message",
+                {
+                    "project": self._thread_ref.project_id,
+                    "thread_id": self._thread_ref.thread_id,
+                    "msg_type": "report",
+                    "author": _PR_GATE_RELAY_AUTHOR,
+                    "content": body,
+                    # No ``role`` here, deliberately (D-1 sweep, T-dispatched-turn).
+                    # The other two harness write paths now supply one; this relay does
+                    # not, because it holds no role. It is the conductor restating a
+                    # verdict the Tier B driver produced elsewhere, and the honest value
+                    # for "which role authored this" is none. Claiming ``naysayer``
+                    # because the content came from one would put a role stamp on a post
+                    # no reviewer wrote — manufacturing exactly the evidence the I-6
+                    # invariant exists to make meaningful.
+                },
+            )
+        except ThreadResolvedError as exc:
+            # W3 (T-sweeper-posts-into-resolved-thread-blocks-r2-deploy Bohr
+            # msg-536): the design thread is resolved. This is the same
+            # async-verdict race Einstein msg-531 Objection 2 named,
+            # measured from the receiving side: a human resolved the design
+            # thread while the PR-gate was still computing, and the relay
+            # has nowhere to land as a chatroom record. The verdict itself
+            # is not lost — the GitHub PR review submitted by the driver is
+            # the primary artifact (the reader on the PR page sees it
+            # regardless of what happened here). The relay message this
+            # method returns is the conductor's internal dispatch event for
+            # the implementer, so returning a stub keeps that machinery on
+            # its normal path without a crash. Non-retryable (msg-536 W5),
+            # terminal for this thread; the refusal is never itself posted
+            # into a chatroom thread (msg-534 W4a).
+            logger.warning(
+                "pr-gate design-thread relay dropped (thread %r resolved): %s. "
+                "GitHub PR review is the primary artifact and still stands; "
+                "no retry — refusal is terminal for this thread.",
+                self._thread_ref.thread_id,
+                exc,
+            )
+            return {
+                "msg_id": "",
                 "author": _PR_GATE_RELAY_AUTHOR,
                 "content": body,
-                # No ``role`` here, deliberately (D-1 sweep, T-dispatched-turn).
-                # The other two harness write paths now supply one; this relay does
-                # not, because it holds no role. It is the conductor restating a
-                # verdict the Tier B driver produced elsewhere, and the honest value
-                # for "which role authored this" is none. Claiming ``naysayer``
-                # because the content came from one would put a role stamp on a post
-                # no reviewer wrote — manufacturing exactly the evidence the I-6
-                # invariant exists to make meaningful.
-            },
-        )
+            }
         return {
             "msg_id": _extract_relay_msg_id(result) or "",
             "author": _PR_GATE_RELAY_AUTHOR,

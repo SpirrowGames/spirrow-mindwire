@@ -178,7 +178,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .config import DEFAULT_DATA_DIR
-from .magickit.client import McpToolCaller
+from .magickit.client import McpToolCaller, ThreadResolvedError
 
 # The rate-limit floor — the ONE constant the whole objection cycle turns on.
 # Named here (not scattered as a magic number) because msg-2295 D-2'' pinned
@@ -342,12 +342,18 @@ class VisibilityReport:
     Fields:
       * ``action`` — one of ``"posted"``, ``"floor_blocked"``,
         ``"dedup_blocked"``, ``"state_read_failed"``,
-        ``"state_write_failed"``, ``"post_failed"``.
+        ``"state_write_failed"``, ``"post_failed"``,
+        ``"post_terminal_thread_resolved"`` (W2 —
+        T-sweeper-posts-into-resolved-thread-blocks-r2-deploy: the post
+        was refused because the target thread is resolved; the sweeper's
+        goal state is observed, the episode is cleared, and no retry
+        will follow because the refusal is terminal for this thread).
       * ``reason`` — human-readable summary. Machine consumers key on
         ``action``; ``reason`` is for the log reader.
       * ``episode`` — the episode record after the call, if any. Included
         so tests can inspect the post-condition without opening the state
-        file.
+        file. On ``post_terminal_thread_resolved`` the field is ``None``
+        because the episode was cleared as part of the terminal handling.
     """
 
     action: str
@@ -831,6 +837,48 @@ class CloseFailureVisibility:
         }
         try:
             await mcp.call_tool(_POST_MESSAGE_TOOL, arguments)
+        except ThreadResolvedError as resolved_exc:
+            # W2 (T-sweeper-posts-into-resolved-thread-blocks-r2-deploy Bohr
+            # msg-536): the target thread is resolved. Two facts follow:
+            #
+            #   (a) The sweeper's goal is met — the alert thread is not open.
+            #       Under the current close_alert design, the next tick's
+            #       precheck will observe RESOLVED and return without a
+            #       write-shaped call, so no further visibility invocation
+            #       occurs for this alert. That means clearing the episode
+            #       now is safe and mirrors :meth:`on_close_success` (which
+            #       fires on the "close succeeded, was_open false" branch —
+            #       the exact same world-state fact through a different
+            #       observation path).
+            #   (b) The refusal is TERMINAL for this thread. Retrying the
+            #       same post on the same thread will 409 again — this is
+            #       the "class of failure my prior guard did not cover"
+            #       fact msg-532 W2 named (Bohr msg-534: "409-on-resolved
+            #       is permanent for that thread; a retry policy that
+            #       treats it as transient spins forever").
+            #
+            # Clear the episode (Rule 1 — positive observation of goal state);
+            # DO NOT touch the floor (Rule 2 — flapping protection unchanged).
+            # The clear is best-effort under the same state-store contract as
+            # :meth:`on_close_success`.
+            try:
+                cleared_state = self._store.load()
+                if cleared_state.episodes.get(project) is not None:
+                    del cleared_state.episodes[project]
+                    self._store.save(cleared_state)
+            except _STATE_READ_ERRORS:
+                # Same trade as :meth:`on_close_success`: benign — the
+                # episode entry lingers, the next tick will overwrite it.
+                pass
+            return VisibilityReport(
+                action="post_terminal_thread_resolved",
+                reason=(
+                    "chatroom_post_message refused: target thread "
+                    f"{thread_id!r} is resolved "
+                    f"({type(resolved_exc).__name__}); goal state observed, "
+                    "episode cleared, floor preserved, terminal — no retry"
+                ),
+            )
         except Exception as post_exc:
             # Post failed: the write-ahead floor entry already persisted at
             # step 3, so the next 24 hours are blocked. Episode is retained

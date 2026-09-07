@@ -475,3 +475,48 @@ obligations:
       the declared paths. Silent expansion and silent omission are the same
       failure: in both cases the reviewer's picture of what happened is wrong,
       and in this loop the reviewer is the only defence there is.
+
+  - id: OBL-CHATROOM-PRODUCER-READER-SURFACE
+    role: implementer
+    # Net-new formulation (no origin). Issued by T-sweeper-posts-into-resolved-
+    # thread-blocks-r2-deploy Bohr msg-536 W4b (as narrowed by Einstein msg-537
+    # Objection 1: strip the disposition-(2) mechanics — successor thread ids,
+    # chain depth, state persistence — from this obligation and confine it to
+    # the domain question every producer must answer). The mechanics of
+    # disposition (2), if a producer ever needs it, belong to a fresh design
+    # thread at that time (msg-537: "writing a procedural rule with no
+    # accompanying implementation is exactly how unexercised specification rots
+    # before its first user arrives").
+    #
+    # Companion mechanism: :class:`spirrow_mindwire.magickit.client.
+    # ThreadResolvedError` (msg-536 W5) — the typed exception producers catch
+    # to fire the disposition. Producers already covered by this obligation:
+    # :func:`spirrow_mindwire.gate_bootstrap.close_alert` (world-observation
+    # preserves goal state; no chatroom write needed);
+    # :class:`spirrow_mindwire.gate_bootstrap_visibility.CloseFailureVisibility`
+    # (W2 — reader is the operator, log-only sink is legal because the tick's
+    # JSON output IS a durable operator-readable surface);
+    # :class:`spirrow_mindwire.orchestrator.PrReviewOrchestrator` and
+    # :meth:`spirrow_mindwire.conductor.core.Conductor._post_pr_relay` (W3 —
+    # reader is the human on the PR; the GitHub PR review submitted by the
+    # driver IS the primary artifact, chatroom post is a secondary record).
+    body: |
+      CHATROOM PRODUCER: DECLARE READER AND FALLBACK SURFACE. When you write
+      code that posts into a chatroom thread, answer two questions in the
+      producer's own comments or docstring, out loud, so the answer is visible
+      to the next reader: who is the payload's intended reader, and what
+      surface reaches that reader when the target thread is gone (a chatroom
+      write refused because the target thread is resolved is TERMINAL for
+      that thread and never itself posted into a chatroom thread). The
+      allowed fallback surfaces are three, and you must name which you took:
+      (1) an alternative durable surface that reaches the intended reader
+      (a PR comment, a GitHub review, a durable operator log the tick's
+      output already carries), (2) open a successor thread and post there
+      — this disposition requires a durable, rediscoverable successor
+      pointer AND a bounded chain, both out of scope for this obligation
+      and REQUIRING a fresh design thread before a producer relies on it,
+      so if you want (2), stop and open one, or (3) fail loudly so the
+      job's target gets reconfigured. Catch :class:`spirrow_mindwire.
+      magickit.client.ThreadResolvedError` to fire the disposition; an
+      uncaught :class:`ThreadResolvedError` is the correct fail-loud
+      default when a producer's author has not declared a surface.
