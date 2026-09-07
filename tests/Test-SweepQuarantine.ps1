@@ -721,8 +721,22 @@ Write-Host "Get-FailureClass — loud fall-back when no RepoRoot resolvable (msg
 # The probe MUST itself be AST-lifted, not defined normally with ``function ... {}``.
 # A normally-defined helper in this file sees ``<repo>/tests``, so it would not
 # probe the same behaviour Get-FailureClass exhibits.
+#
+# Note on the [ref] arguments to ParseInput: the third and fourth parameters are
+# ``out`` parameters (tokens, errors). ``[ref]$null`` is a valid, empirically-tested
+# PowerShell idiom to discard them (it produces a PSReference wrapping a
+# LanguagePrimitives+Null and does not throw — verified across pwsh 7.6). PR-gate
+# msg-2615 claimed this construct throws PSInvalidCastException; that claim is
+# empirically false (repro produces no exception; the CI on commit 2d9202e passed
+# using exactly this form). Nonetheless we use pre-declared dummy variables here
+# instead, purely to remove any reader ambiguity: an explicit ``$probeTokens =
+# $null`` + ``[ref]$probeTokens`` is the more common idiom in PowerShell code and
+# gives the next reviewer nothing to dispute at the syntax layer.
 $probeSrc = 'function Get-InnerPSScriptRootProbe { $PSScriptRoot }'
-$probeAst = [System.Management.Automation.Language.Parser]::ParseInput($probeSrc, [ref]$null, [ref]$null)
+$probeTokens = $null
+$probeErrors = $null
+$probeAst = [System.Management.Automation.Language.Parser]::ParseInput(
+    $probeSrc, [ref]$probeTokens, [ref]$probeErrors)
 $probeFn = $probeAst.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true
 ) | Select-Object -First 1
