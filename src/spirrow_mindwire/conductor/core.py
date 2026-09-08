@@ -726,7 +726,14 @@ class Conductor:
             # has nowhere to land as a chatroom record. The verdict itself
             # is not lost — the GitHub PR review submitted by the driver is
             # the primary artifact (the reader on the PR page sees it
-            # regardless of what happened here). The relay message this
+            # regardless of what happened here). Of OBL-CHATROOM-PRODUCER-
+            # READER-SURFACE's three allowed surfaces that is **disposition
+            # (1)**, an alternative durable surface that reaches the intended
+            # reader. Named explicitly because the obligation's ``body``
+            # requires each producer to say WHICH of the three it took, and
+            # naming the reader and the surface without naming the number
+            # answers only two of the three things it asks for (Bohr msg-559
+            # MUST-A). The relay message this
             # method returns is the conductor's internal dispatch event for
             # the implementer, so returning a stub keeps that machinery on
             # its normal path without a crash. Non-retryable (msg-536 W5),

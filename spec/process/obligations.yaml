@@ -498,10 +498,19 @@ obligations:
     # here — a per-producer answer list in the manifest goes stale the moment a
     # producer changes, and one authoritative copy is the placement discipline
     # of ADR-2026-05-29-13. Read them at the sites:
-    # :func:`spirrow_mindwire.gate_bootstrap.close_alert`;
     # :class:`spirrow_mindwire.gate_bootstrap_visibility.CloseFailureVisibility`
     # (W2); :class:`spirrow_mindwire.orchestrator.PrReviewOrchestrator` and
     # :meth:`spirrow_mindwire.conductor.core.Conductor._post_pr_relay` (W3).
+    #
+    # NOT covered, and listed so the next reader does not have to re-derive it
+    # (Bohr msg-559 MUST-B): :func:`spirrow_mindwire.gate_bootstrap.close_alert`
+    # closes a thread and never posts, so `body`'s antecedent ("when you write
+    # code that posts into a chatroom thread") does not fire for it and it has
+    # no declaration to read. This is a SCOPE statement, not a per-producer
+    # answer — the S-1 trim above drops answers, which drift; scope does not,
+    # and dropping it sent the reader to a site to read a declaration that does
+    # not exist and should not. It is named because it is the site this thread
+    # started from and is the first place a reader will look.
     body: |
       CHATROOM PRODUCER: DECLARE READER AND FALLBACK SURFACE. When you write
       code that posts into a chatroom thread, answer two questions in the

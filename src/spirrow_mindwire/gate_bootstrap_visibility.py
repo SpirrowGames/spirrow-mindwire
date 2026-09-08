@@ -889,6 +889,19 @@ class CloseFailureVisibility:
                     del cleared_state.episodes[project]
                     self._store.save(cleared_state)
             except _STATE_READ_ERRORS:
+                # This tuple covers the ``save`` above as well as the ``load``:
+                # its FIRST member is ``OSError`` (the name notwithstanding — it
+                # is the state-store contract's exception set, not a direction of
+                # I/O), so PermissionError and every other write-side OSError
+                # lands here. Do NOT widen it to reach further; the tuple's own
+                # comment at its definition says why (a programming bug must
+                # still crash). Recorded because PR #228's gate round 2 read the
+                # name, inferred "reads only", and asked for a wider catch that
+                # :data:`_STATE_READ_ERRORS`'s own comment forbids in capitals —
+                # refuted by fault injection at this exact save (Bohr msg-559,
+                # re-run independently): PermissionError(13), OSError(28),
+                # OSError(30) and InterruptedError all return normally.
+                #
                 # Same trade as :meth:`on_close_success`: benign — the
                 # episode entry lingers, the next tick will overwrite it.
                 pass
