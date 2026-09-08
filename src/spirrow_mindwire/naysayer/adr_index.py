@@ -37,12 +37,15 @@ CLAUDE.md is in CI), every entry carries a **format-valid body locator**
 T-adr-index-omits-chatroom-body-locator — before, the index silently pointed callers
 to Drive when the actual body was a chatroom decide-close, and three turns of
 "body unreadable" misjudgments followed), and every §M thread column matches the
-yaml's ``thread`` field per id (``test_section_m_threads_match_manifest``; the yaml's
-``thread`` is generated from §M, and drifted values would silently reintroduce the
-same class of bug). Two more arrived with ``repo:``: every ``repo:`` target must exist
+yaml's ``thread`` field per id (``test_section_m_threads_match_manifest``; that guards
+§M ↔ yaml agreement only — ``thread`` is *not* rendered into the injected block, which
+carries id/title/``body:``, so the misdirection class rides on ``body:``). Two more
+arrived with ``repo:``: every ``repo:`` target must exist
 in the tree (``test_real_manifest_repo_locators_resolve``), and an ADR whose body file
 IS in ``docs/adr/`` must not be left pointing elsewhere
-(``test_in_repo_adr_bodies_are_registered_as_repo_locators``). All six are hermetic —
+(``test_in_repo_adr_bodies_are_registered_as_repo_locators``). A seventh binds the two
+columns: a ``chatroom:`` locator must name the same thread as the ``thread`` column
+(``test_chatroom_body_locators_name_the_thread_column``). All seven are hermetic —
 same-tree reads only, never the network, Drive, or the chatroom.
 
 The body locator format is one of:

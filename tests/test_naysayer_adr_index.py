@@ -289,6 +289,32 @@ def test_section_m_threads_match_manifest() -> None:
     )
 
 
+def test_chatroom_body_locators_name_the_thread_column() -> None:
+    # msg-2758 objection 1, upheld msg-2760 §1. build_adr_index_block renders id, title
+    # and ``body:`` only — ``thread`` is never injected — so the check above guards a
+    # field no reader sees, while a mistyped ``chatroom:`` locator ships green and sends
+    # the reader to a thread that does not exist (measured: poisoning one locator leaves
+    # all 2141 tests passing). This binds the rendered field to the §M column. Hermetic.
+    offenders: dict[str, tuple[str, str]] = {}
+    for e in load_adr_entries():
+        if not e.body.startswith("chatroom:"):
+            continue
+        # Shape is pinned by test_real_manifest_body_locators_are_well_formed, so
+        # ``chatroom:<project>/<thread>#msg-<n>`` splits safely; ``[-1]`` drops the project.
+        locator_thread = e.body.split(":", 1)[1].split("#", 1)[0].split("/", 1)[-1]
+        if e.thread is None:
+            offenders[e.adr_id] = ("<no thread column>", locator_thread)
+        elif locator_thread != e.thread:
+            offenders[e.adr_id] = (e.thread, locator_thread)
+    assert not offenders, (
+        f"spec/adr_index.yaml: a ``body:`` locator names a different chatroom thread than "
+        f"its ``thread`` column, per ADR id (thread column, locator thread): {offenders}. "
+        f"CLAUDE.md §M's third column and the ``body:`` locator must name the same thread. "
+        f"A mismatch is drift in the hand-maintained locator, so fix the locator when §M is "
+        f"right; the yaml's ``thread`` comes back by rerunning scripts/gen_adr_index.py."
+    )
+
+
 def test_section_m_rows_all_parse() -> None:
     # T-adr-index-omits-chatroom-body-locator msg-2743 §5-3. The row regex requires the
     # third column's closing pipe, so a §M row written with only two cells does not match
