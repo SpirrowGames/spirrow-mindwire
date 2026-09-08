@@ -52,8 +52,14 @@
 #     originated `OBL-XXX`, and it stays there. Writing it in here means a
 #     design change to the probe will silently require a manifest change to
 #     stay in step, and the two representations of the same fact will drift.
-#     No live entry, probe, or thread is named here on purpose: naming one
-#     would restage the very drift risk this note exists to prevent.
+#     The rule above is stated without a live entry, probe, or thread as
+#     its illustrative example on purpose: pointing the reader at a
+#     specific antecedent-observation site would restage the very drift
+#     risk the rule exists to prevent. This bound is on the rule's
+#     *illustrative example* only — the Citations block below names the
+#     thread the rule ORIGINATED on as provenance, which is a different
+#     axis (where the rule came from, not what the rule regulates) and is
+#     not a live example of an observability antecedent.
 #
 # Citations: this rule was narrowed to its current form in Bohr msg-2392 §3
 # on thread T-new-project-gate-bootstrap; the same thread's msg-2139 §4
