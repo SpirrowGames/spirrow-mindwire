@@ -561,6 +561,7 @@ LLM 呼び出し境界で例外が発生したとき、**上から評価する**
 | **規律-15** | **設計は artefact の名前と場所を代入する機構を引用する。literal を書かない。散文は artefact を記述してよく、名指してはならない。** repo が名前を機構で代入するとき、散文で書いた literal は「plausible なだけの」名前を仕様に固定してしまい、機構との整合を silent に破る。**pass-1 が V-2 と衝突したのはこの型の欠陥である**（§付録 F R-3、error type 16） | msg-2279 §1.1 |
 | **規律-16** | **ontology が変わったら、既存の known-answer test は再利用前に新 ontology のもとで re-validate する。** 粗い ontology の下で書かれたテストは、細かい ontology が禁じる artefact に対して silently pass しうる。**5 タグ拡張時の positive KAT がまさにこれで、msg-2258 §5 の陽性集合は bare id で書かれていたため 5 タグ下では A/D-1〜A/D-6 だけで pass できた** | msg-2279 §2.4 |
 | **規律-17** | **container を持たない先延ばしは、丁寧な名前を付けた drop である。** ある item を「後で扱う」「実装スレッドに送る」等の deferral を成立させたいなら、**送り先の container が deferral の瞬間にアドレス可能でなければならない**。まだ stand-up されていない thread、まだ存在しない issue、誰も enumerate できないメモは、いずれも container ではない — deferral の瞬間に「そこ」を指せない先は、単に忘却である。**durable container を先に今作れる形（例: GitHub issue）で作ってそこに置き、将来 container が stand-up されるときは entry read-back（`OBL-READBACK-ENTRY`）が pick up する**。この規律は本設計の founding pathology（見ていないものを黙って落として well-formed な出力を生む）の container 版である | msg-2619 §4 |
+| **規律-18** | **deferral は container（規律-17）と door の両方を要する。** deferred item への pointer は **その item の consumer が実際に読む場所** に置き、**consumer は filing の瞬間に名指しされる**。誰の機構も enumerate しない list に置かれた pointer は、原理的には reachable であっても、実運用では unread の container であり、それは door を欠く container である。error type 17（container なき deferral）が名指した failure の、未割当だった片割れ — 「container 補正」と対になる「door 補正」 | msg-2713 §4 |
 
 **番号の無い規律（本設計に対して同じ拘束力を持つ）**:
 
@@ -933,7 +934,9 @@ msg-2279 §3-4 で resolution ルート整備: **U-1 は「retire」で resolve�
 
 # 付録 H — 仕様要求 read-back 表（OBL-READBACK-EXIT）
 
-**仕様の 1 行あたり 1 行の "reflected / not reflected" 表。** 出所は本 turn 起点の proposer / naysayer msg（msg-2278 / msg-2279 / msg-2280）+ pass-1 で cleared の msg（msg-2252 / msg-2259）。
+**仕様の 1 行あたり 1 行の "reflected / not reflected" 表。** 出所は本 turn 起点の proposer / naysayer msg（msg-2278 / msg-2279 / msg-2280）+ pass-1 で cleared の msg（msg-2252 / msg-2259）+ followup 群（msg-2286 / msg-2589 / msg-2619 / msg-2630 / msg-2654 / msg-2713 / Einstein advisory / msg-(gate advisory)）。
+
+**schema convention（本 followup PR から適用、規律-18）**: 実装ポインタ / 状態列の rationale が短くない場合は、行内に **short key**（例: `[N-1]`）で参照し、rationale 本文は本表直下の脚注リスト（`Rationale note list`）に置く。既存の paragraph-length セルは、rationale が settled で content-preserving な reformat が保証できるまで touch しない（issue [`#238`](https://github.com/SpirrowGames/spirrow-mindwire/issues/238) 本文の content-preserving 不変条件を継承）。
 
 | spec 由来 | 要求 | 状態 | 実装ポインタ |
 |---|---|---|---|
@@ -984,8 +987,23 @@ msg-2279 §3-4 で resolution ルート整備: **U-1 は「retire」で resolve�
 | msg-2619 §3 | edge を両側に書く（残余 → issue、issue → artefact） | **reflected** | 残余-7 が issue #231 を link、issue #231 本文が artefact path + msg-2619 を link |
 | msg-2619 §4 | 規律-17（container を持たない先延ばしは丁寧な drop） | **reflected** | §6 規律-17、§付録 G error type 17 |
 | msg-(gate advisory) | 実装スレッド kickoff は残余 pointer PR が main に land するまで block | **partially reflected**（本 PR body に sequencing 制約を明記して human に notify するのみ。本 spec commit は kickoff-sequencing の operational note を 規律-17 本文にも 残余-7 本文にも持ち込まない — 規律-17 は general rule に留め、operational sequencing は human の Tier-C 領域として PR body に置く。§5 残余-7 の「実装スレッドの `OBL-READBACK-ENTRY` が本 pointer を pick up する」は passive な依存関係の記述であって sequencing 制約ではない） | 本 PR body（sequencing 制約の唯一の記述場所） |
+| msg-2630 (PR-gate on #232) | §付録 H に paragraph-length cell あり — class `legibility`, non-blocking | **reflected** | `[N-1]` |
+| msg-2654 (human C) | (a) PR #232 merge、(b) legibility 指摘を tracked issue として起票 | **reflected** | `[N-2]` |
+| msg-2713 §2 | content-preserving 不変条件 + measurement-first + budget input | **reflected** | `[N-3]` |
+| msg-2713 §3 | pointer は §付録 H 直下（not §5、not issue tracker alone） | **reflected** | `[N-4]` |
+| msg-2713 §4 | 規律-18 alloc（door 補正）、新 error type / 新 残余 は無し | **reflected** | `[N-5]` |
+| Einstein advisory | schema 変更を後続 `OBL-READBACK-EXIT` agent に legible にする preamble rule | **reflected** | `[N-6]` |
 
-**表明**: 上表は spec の text から組み立てた（私の記憶からではない）。**msg-2278 / msg-2279 / msg-2280 は本文書に完全反映され、`SUPERSEDED by msg-2279 §2` の 1 行を除いて "not reflected" は無い**。SUPERSEDED は明示された昇格であり、無視ではない。**本 followup commit は msg-2286 / msg-2589 / msg-2619 / msg-(gate advisory) を反映する** — msg-2589 の merge 半分と msg-(gate advisory) の kickoff-block 半分は human の tier-C 領域につき partial、それ以外は full reflected。
+**Rationale note list（schema convention、規律-18）**:
+
+- **`[N-1]`**: PR-gate msg-2630 の weakest-remaining-point。class `legibility`、severity 逐語「It does not mislead or render the spec incorrect, making it an advisory `legibility` observation rather than a blocker」。指摘 location は本表の paragraph-length cell（当時 head `e87a94c` の line 977 = 現行 main の line 976 の msg-2589 row）。tracker: issue [`#238`](https://github.com/SpirrowGames/spirrow-mindwire/issues/238)。本 pointer 自体が本表直下の note list の最初の entry として本 followup commit で立つ ∴ 「pointer commit の row は dense cell を新規に増やさず、新 form を instantiate する」（msg-2713 §3）を diff で満たす。
+- **`[N-2]`**: human msg-2654 逐語: "Merge SpirrowGames/spirrow-mindwire#232 now on the strength of the existing APPROVE, and file the table-cell legibility remark as its own tracked issue so it has a durable, addressable destination." (a) merge は Takahito が 2026-09-08T00:29:42Z に実施、merge commit `859e013`（`git merge-base --is-ancestor 859e013 HEAD` = 0 で本 followup base に含まれる ∴ msg-(gate advisory) の kickoff-sequencing 制約は discharge 済）。(b) 追跡 issue は本 followup Step 1 で起票（issue [`#238`](https://github.com/SpirrowGames/spirrow-mindwire/issues/238)）。
+- **`[N-3]`**: content-preserving 不変条件 — reformat は text を「move する。restate しない」。msg-2589 row の facts は 3 round（msg-2624 r1 stand-up-sequencing 虚偽 / msg-2627 r2 base sha 矛盾 / msg-2628 r3 msg-2589 attribution 矛盾）を費やして settle した ∴ paraphrase はその settle を再開する。measurement は issue #238 本文の「First task」節（(1) cell 長分布、(2) `spec/design/verify.py` の mechanical check 可否、(3) row 触数の cost）。budget input（長 cell = character 圧迫、`_MAX_DIFF_CHARS` = 150,000、`#182` の founding 障害）は severity を advisory から昇格させないが、「先送りではなく実施」方向にわずかに押す。
+- **`[N-4]`**: msg-2713 §3 は pointer 置き場を「§付録 H の直下」と decision した — 本 item の consumer は「次に §付録 H を編集する agent（= 次の `OBL-READBACK-EXIT`）」であって「実装スレッドの `OBL-READBACK-ENTRY`」ではない ∴ §5 残余リストでも issue tracker のみでもなく、consumer が実際に読む場所に置く（規律-18 の door 要件）。本 note list が §付録 H の直下にあるのはこの decision の instantiation。edge 両側: 本 note と各 row から issue #238 へ / issue #238 から artefact path + §付録 H へ。
+- **`[N-5]`**: msg-2713 §4 は「a deferral needs a container AND a door」を規律として名指し、ledger 次番号（直前 max: 残余-7 / 規律-17 / error type 17）で **規律-18** を allocate。**新 error type は無い** — 本件は error type 17（container なき deferral）が名指した failure の未割当だった片割れ（door 補正）である ∴ 型としては同じ class。**新 残余 も無い** — 本 item は artefact 自体の editorial defect であって implementation 入力ではない（残余 は design residue の class であり、混入すると `OBL-READBACK-ENTRY` が enumerate する list の意味が薄まる、msg-2713 §3）。
+- **`[N-6]`**: Einstein advisory（今 turn 冒頭）: 「footnote structure を local example として instantiate するだけでは、後続 `OBL-READBACK-EXIT` agent は pattern の存在に気づかず paragraph cell に revert し、structural fix が ephemeral になる」。∴ §付録 H の header に short preamble rule を追加（本 header の「schema convention」段落）— schema 変更が後続 agent の discharge 手順にとって legible になる。preamble は short key の参照方式と content-preserving fence の 2 点のみに絞り、既存行への書き直し義務は課さない（既存の paragraph セルは、rationale が settled で content-preserving reformat が保証できるまで untouched のまま）。
+
+**表明**: 上表は spec の text から組み立てた（私の記憶からではない）。**msg-2278 / msg-2279 / msg-2280 は本文書に完全反映され、`SUPERSEDED by msg-2279 §2` の 1 行を除いて "not reflected" は無い**。SUPERSEDED は明示された昇格であり、無視ではない。**本 followup-2 commit は msg-2630 / msg-2654 / msg-2713 / Einstein advisory を反映する**（先の followup PR #232 の msg-2286 / msg-2589 / msg-2619 / msg-(gate advisory) 反映は保存 — 本 commit は既存行を touch していない）。msg-2589 の merge 半分と msg-(gate advisory) の kickoff-block 半分は human の tier-C 領域につき partial のまま、それ以外は full reflected。
 
 ---
 
@@ -1003,5 +1021,13 @@ msg-2279 §3-4 で resolution ルート整備: **U-1 は「retire」で resolve�
 - 本 followup commit の diff は `spec/design/T-gate-silently-suppresses-approve-on-truncated-diff.md` のみ（コード変更ゼロ、テスト変更ゼロ、他の spec 変更ゼロ）
 - base は `origin/main` @ `1608db5`（PR #208 の merge commit `b4eef73` は本 base の ancestor、2026-08-31T04:59:14Z に land、その後に他 PR が積まれた現行 tip）
 - **spec-only commit** — 本 commit は 残余-7 の pointer と 規律-17 / error type 17 の追加のみ。D / AC / INV の body は無変更、Live index / Baseline / KAT 集合は無変更、fold 手続きも無変更
+
+**measured（followup-2 commit で実測、msg-2713 §3-4 の 規律-18 + §付録 H schema convention + issue #238 pointer 追加）**:
+
+- `bash .mindwire-gate` → **exit 0, 2047 passed / 6 deselected**（pre-commit 実測）
+- `python spec/design/verify.py` → **exit 0, ERROR/WARNING なし**（pre-commit 実測）
+- 本 followup-2 commit の diff は `spec/design/T-gate-silently-suppresses-approve-on-truncated-diff.md` のみ（コード変更ゼロ、テスト変更ゼロ、他の spec 変更ゼロ）
+- base は `origin/main` @ `c06cc30`（PR #232 の merge commit `859e013` は本 base の ancestor、2026-09-08T00:29:42Z に land、`git merge-base --is-ancestor 859e013 HEAD` = 0 で本 base に含まれることを実測）
+- **spec-only commit** — 本 commit は §6 に 規律-18 の 1 行追加、§付録 H の header に schema convention 段落追加、§付録 H 表末に 6 行の short-cell rows 追加、表直下に `Rationale note list`（keyed notes、初 entry が issue #238 pointer）追加、`表明` 更新、measured 節追加のみ。**既存の行（既存 D / AC / INV、Live index、Baseline、KAT、fold 手続き、§5 残余表、§6 規律-6〜17、§付録 A〜G、§付録 H の既存 30 行）は 1 文字も touch していない**（content-preserving fence、issue #238 の invariant を本 commit 自身も継承）
 
 **merge to protected `main` is Tier-C (Takahito). The loop never merges.**
