@@ -973,6 +973,82 @@ async def test_fire_pr_review_opens_thread_then_posts_on_success() -> None:
     assert names == ["chatroom_open_thread", "chatroom_post_message"]
 
 
+# --------------------------------------------------------------------------- #
+# T-sweeper-posts-into-resolved-thread-blocks-r2-deploy W3 (Bohr msg-536):
+# When the PR-gate's critique post is refused because the review thread got
+# resolved (async race — a human merged and resolved before the review
+# completed), the critique CANNOT land as a chatroom record but the GitHub
+# PR review submitted by ``_submit_review`` is the primary artifact and
+# still stands. The post_critique closure catches
+# :class:`ThreadResolvedError` and returns normally so the driver continues.
+#
+# Contrast with ``test_a_critique_that_never_reached_the_thread_stops_the_review``:
+# on ``ChatroomNotFoundError`` the review does NOT submit, because "the
+# thread was never there" is a different fault whose safe answer is
+# fail-closed. "The thread WAS there, was reasoned about, then got
+# resolved" is a race, not a fault, and the verdict must still reach the
+# PR page (the reader's primary surface).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_w3_critique_post_thread_resolved_lets_driver_continue_to_submit() -> None:
+    """``ThreadResolvedError`` on ``chatroom_post_message`` → driver continues.
+
+    Unlike a not-found envelope (which stops the review), a resolved-thread
+    envelope means the review thread WAS there and got resolved between
+    review start and critique post. The GitHub PR review is the primary
+    artifact the human reader sees on the PR page; the chatroom record is
+    secondary. So the post refusal is caught inside ``post_critique`` and
+    the driver continues to ``_submit_review``.
+    """
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads({"T-pr-review-r-7": _thread_payload("o/r#7")}),
+            "chatroom_post_message": _error_envelope(
+                "ChatroomStateError",
+                "Cannot post to thread 'T-pr-review-r-7' in status='resolved'",
+                project="p",
+                thread_id="T-pr-review-r-7",
+            ),
+        }
+    )
+    driver = _SubmittingDriver()
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    ref, _outcome = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    assert driver.submitted is True, (
+        "the driver must continue to _submit_review on ThreadResolvedError — "
+        "the GitHub PR review is the primary artifact"
+    )
+    assert ref.thread_id == "T-pr-review-r-7"
+
+
+@pytest.mark.anyio
+async def test_w3_critique_post_thread_resolved_does_not_retry() -> None:
+    """A single post attempt only; the type is non-retryable (msg-536 W5).
+
+    ``ThreadResolvedError`` is terminal for this thread. A caller that
+    retried on the same thread would 409 again — the exact loop the design
+    exists to close. This test pins the "no retry within one review" side
+    of that contract.
+    """
+    mcp = _FakeMcp(
+        results={
+            "chatroom_get_thread": _existing_threads({"T-pr-review-r-8": _thread_payload("o/r#8")}),
+            "chatroom_post_message": _error_envelope(
+                "ChatroomStateError",
+                "Cannot post to thread 'T-pr-review-r-8' in status='resolved'",
+                project="p",
+                thread_id="T-pr-review-r-8",
+            ),
+        }
+    )
+    orch = PrReviewOrchestrator(mcp, driver=_SubmittingDriver())  # type: ignore[arg-type]
+    await orch.fire_pr_review(project="p", pr_ref="o/r#8")
+    posts = [name for name, _ in mcp.calls if name == "chatroom_post_message"]
+    assert len(posts) == 1
+
+
 # ---------- L2 merge gate: require_ci_success (ADR-2026-06-03-16 D-3) ------ #
 
 

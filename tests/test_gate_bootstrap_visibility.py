@@ -1647,3 +1647,119 @@ async def test_precheck_read_fault_reports_through_the_unified_surface(tmp_path:
     posts = [args for name, args in mcp.calls if name == "chatroom_post_message"]
     assert len(posts) == 1
     assert posts[0]["thread_id"] == "T-gate-bootstrap-spirrow-example"
+
+
+# --------------------------------------------------------------------------- #
+# T-sweeper-posts-into-resolved-thread-blocks-r2-deploy W2 (Bohr msg-536):
+# When the visibility post itself is refused because the alert thread is
+# resolved (R2's post_message refusal), the visibility mechanism treats the
+# refusal as TERMINAL, clears the episode (world-state = goal state), leaves
+# the floor intact (Rule 2 — flapping protection), and returns a distinct
+# ``action`` so the operator's tick JSON output records what happened.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_w2_post_refused_thread_resolved_is_terminal_clears_episode() -> None:
+    """Visibility post → ``ThreadResolvedError`` → episode cleared, floor kept.
+
+    Reader-mode note (msg-536 W4b) — POINTER ONLY, do not restate here. The
+    reader/fallback-surface declaration that
+    ``OBL-CHATROOM-PRODUCER-READER-SURFACE`` demands lives at the write site,
+    as fact (c) of the ``except ThreadResolvedError`` branch in
+    :meth:`CloseFailureVisibility.on_close_failure`. Read it there. This
+    docstring deliberately keeps no second copy: the obligation requires the
+    answer in the producer, and two copies of the reasoning drift the moment
+    the producer changes (Bohr msg-554 S-1). What this test pins is the
+    BEHAVIOUR that declaration describes, below.
+
+    The two directions this test pins together (they must both hold):
+      * The episode entry for this project is REMOVED after the terminal
+        handling — the sweeper's goal (alert thread not open) is observed,
+        so keeping the episode as if the failure persists would misrepresent
+        the world.
+      * The floor entry for this project is PRESERVED — flapping protection
+        (Rule 2 in the module docstring) still holds independently of the
+        specific failure kind.
+    """
+    from spirrow_mindwire.magickit.client import ThreadResolvedError
+
+    store = _MemoryStore()
+    now = _clock(datetime(2026, 9, 8, 0, 0, tzinfo=UTC))
+    vis = CloseFailureVisibility(store, now=now)
+    mcp = _RecordingMcp(
+        post_outcome=ThreadResolvedError(
+            "magickit tool returned an error envelope: "
+            "error_type='ChatroomStateError' "
+            "error=\"Cannot close thread 'T-x' in status='resolved'\"",
+            error_type="ChatroomStateError",
+        )
+    )
+
+    report = await vis.on_close_failure(
+        mcp,
+        project="spirrow-example",
+        thread_id=thread_id_for("spirrow-example"),
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("close refused"),
+    )
+
+    assert report.action == "post_terminal_thread_resolved", (
+        f"expected terminal action, got {report.action!r}: {report.reason!r}"
+    )
+    # Episode cleared — goal state observed.
+    assert "spirrow-example" not in store.state.episodes
+    # Floor preserved — Rule 2 flapping protection.
+    assert "spirrow-example" in store.state.floors
+
+
+@pytest.mark.anyio
+async def test_w2_post_refused_thread_resolved_never_raises() -> None:
+    """The visibility mechanism's non-raising contract holds under W2.
+
+    Module docstring invariant: "the visibility path never raises to its
+    caller". ``ThreadResolvedError`` is a new failure kind but the
+    invariant is unchanged — it must be captured into a
+    :class:`VisibilityReport`, not propagated.
+    """
+    from spirrow_mindwire.magickit.client import ThreadResolvedError
+
+    store = _MemoryStore()
+    now = _clock(datetime(2026, 9, 8, 0, 0, tzinfo=UTC))
+    vis = CloseFailureVisibility(store, now=now)
+    mcp = _RecordingMcp(post_outcome=ThreadResolvedError("resolved"))
+
+    # No exception should escape:
+    _ = await vis.on_close_failure(
+        mcp,
+        project="spirrow-example",
+        thread_id=thread_id_for("spirrow-example"),
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("close refused"),
+    )
+
+
+@pytest.mark.anyio
+async def test_w2_post_refused_thread_resolved_is_distinct_from_generic_post_failed() -> None:
+    """The new terminal action is a distinct value from generic ``post_failed``.
+
+    Machine consumers key on ``action`` (module docstring). A test that only
+    asserted ``!= "posted"`` would let a future edit collapse
+    ``post_terminal_thread_resolved`` back into ``post_failed`` and silently
+    lose the terminal semantics. Assert the distinct value explicitly.
+    """
+    from spirrow_mindwire.magickit.client import ThreadResolvedError
+
+    store = _MemoryStore()
+    now = _clock(datetime(2026, 9, 8, 0, 0, tzinfo=UTC))
+    vis = CloseFailureVisibility(store, now=now)
+    mcp = _RecordingMcp(post_outcome=ThreadResolvedError("resolved"))
+    report = await vis.on_close_failure(
+        mcp,
+        project="spirrow-example",
+        thread_id=thread_id_for("spirrow-example"),
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("close refused"),
+    )
+    assert report.action == "post_terminal_thread_resolved"
+    assert report.action != "post_failed"

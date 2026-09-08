@@ -178,7 +178,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .config import DEFAULT_DATA_DIR
-from .magickit.client import McpToolCaller
+from .magickit.client import McpToolCaller, ThreadResolvedError
 
 # The rate-limit floor — the ONE constant the whole objection cycle turns on.
 # Named here (not scattered as a magic number) because msg-2295 D-2'' pinned
@@ -342,12 +342,18 @@ class VisibilityReport:
     Fields:
       * ``action`` — one of ``"posted"``, ``"floor_blocked"``,
         ``"dedup_blocked"``, ``"state_read_failed"``,
-        ``"state_write_failed"``, ``"post_failed"``.
+        ``"state_write_failed"``, ``"post_failed"``,
+        ``"post_terminal_thread_resolved"`` (W2 —
+        T-sweeper-posts-into-resolved-thread-blocks-r2-deploy: the post
+        was refused because the target thread is resolved; the sweeper's
+        goal state is observed, the episode is cleared, and no retry
+        will follow because the refusal is terminal for this thread).
       * ``reason`` — human-readable summary. Machine consumers key on
         ``action``; ``reason`` is for the log reader.
       * ``episode`` — the episode record after the call, if any. Included
         so tests can inspect the post-condition without opening the state
-        file.
+        file. On ``post_terminal_thread_resolved`` the field is ``None``
+        because the episode was cleared as part of the terminal handling.
     """
 
     action: str
@@ -831,6 +837,83 @@ class CloseFailureVisibility:
         }
         try:
             await mcp.call_tool(_POST_MESSAGE_TOOL, arguments)
+        except ThreadResolvedError as resolved_exc:
+            # W2 (T-sweeper-posts-into-resolved-thread-blocks-r2-deploy Bohr
+            # msg-536): the target thread is resolved. Three facts follow:
+            #
+            #   (a) The sweeper's goal is met — the alert thread is not open.
+            #       Under the current close_alert design, the next tick's
+            #       precheck will observe RESOLVED and return without a
+            #       write-shaped call, so no further visibility invocation
+            #       occurs for this alert. That means clearing the episode
+            #       now is safe and mirrors :meth:`on_close_success` (which
+            #       fires on the "close succeeded, was_open false" branch —
+            #       the exact same world-state fact through a different
+            #       observation path).
+            #   (b) The refusal is TERMINAL for this thread. Retrying the
+            #       same post on the same thread will 409 again — this is
+            #       the "class of failure my prior guard did not cover"
+            #       fact msg-532 W2 named (Bohr msg-534: "409-on-resolved
+            #       is permanent for that thread; a retry policy that
+            #       treats it as transient spins forever").
+            #   (c) Reader and fallback surface — the declaration
+            #       OBL-CHATROOM-PRODUCER-READER-SURFACE requires from every
+            #       chatroom producer, in the producer's own comments, at the
+            #       write site (Bohr msg-554). Of the obligation's three
+            #       allowed surfaces this producer takes **disposition (1)**,
+            #       an alternative durable surface that reaches the intended
+            #       reader:
+            #         * intended reader: the OPERATOR (not a loop role — no
+            #           role reads this payload; the sweeper's alert thread is
+            #           an operator-facing surface).
+            #         * surface that reaches them once the thread is gone: the
+            #           tick's JSON output. The :class:`VisibilityReport`
+            #           returned immediately below rides on it as
+            #           ``action="post_terminal_thread_resolved"`` with a
+            #           ``reason`` string — a durable operator-readable
+            #           surface the operator already reads every tick.
+            #       So "terminal, no chatroom post" is a SINK, not silence
+            #       (msg-532): the refusal stays legible on the surface its
+            #       reader is already looking at. If you change the post
+            #       behaviour here, keep a surface that reaches the operator
+            #       or re-declare the disposition — this comment is the
+            #       obligation's only enforcement (no machine check exists).
+            #
+            # Clear the episode (Rule 1 — positive observation of goal state);
+            # DO NOT touch the floor (Rule 2 — flapping protection unchanged).
+            # The clear is best-effort under the same state-store contract as
+            # :meth:`on_close_success`.
+            try:
+                cleared_state = self._store.load()
+                if cleared_state.episodes.get(project) is not None:
+                    del cleared_state.episodes[project]
+                    self._store.save(cleared_state)
+            except _STATE_READ_ERRORS:
+                # This tuple covers the ``save`` above as well as the ``load``:
+                # its FIRST member is ``OSError`` (the name notwithstanding — it
+                # is the state-store contract's exception set, not a direction of
+                # I/O), so PermissionError and every other write-side OSError
+                # lands here. Do NOT widen it to reach further; the tuple's own
+                # comment at its definition says why (a programming bug must
+                # still crash). Recorded because PR #228's gate round 2 read the
+                # name, inferred "reads only", and asked for a wider catch that
+                # :data:`_STATE_READ_ERRORS`'s own comment forbids in capitals —
+                # refuted by fault injection at this exact save (Bohr msg-559,
+                # re-run independently): PermissionError(13), OSError(28),
+                # OSError(30) and InterruptedError all return normally.
+                #
+                # Same trade as :meth:`on_close_success`: benign — the
+                # episode entry lingers, the next tick will overwrite it.
+                pass
+            return VisibilityReport(
+                action="post_terminal_thread_resolved",
+                reason=(
+                    "chatroom_post_message refused: target thread "
+                    f"{thread_id!r} is resolved "
+                    f"({type(resolved_exc).__name__}); goal state observed, "
+                    "episode cleared, floor preserved, terminal — no retry"
+                ),
+            )
         except Exception as post_exc:
             # Post failed: the write-ahead floor entry already persisted at
             # step 3, so the next 24 hours are blocked. Episode is retained

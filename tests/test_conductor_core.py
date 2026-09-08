@@ -1552,6 +1552,60 @@ async def test_field_bearing_message_can_never_stop_on_no_handoff_bohr_msg179_se
     assert set(stop_reasons).isdisjoint({StopReason.NO_HANDOFF})
 
 
+# --------------------------------------------------------------------------- #
+# T-sweeper-posts-into-resolved-thread-blocks-r2-deploy W3 (Bohr msg-536):
+# When the PR-gate design-thread relay post is refused because the design
+# thread got resolved (async race — a human resolved the thread while the
+# PR-gate was still computing), the conductor must not crash. The GitHub PR
+# review is the primary artifact (still stands); the relay is a secondary
+# informational record. On :class:`ThreadResolvedError` the relay returns a
+# stub with an empty msg_id, which routes the conductor through the
+# existing "no msg_id → fail-safe to human" path — the human sees that
+# the relay did not land and can inspect the PR directly.
+# --------------------------------------------------------------------------- #
+
+
+class _ThreadResolvedOnPostMcp(_FakeChatroomMcp):
+    """A chatroom whose ``chatroom_post_message`` raises ``ThreadResolvedError``.
+
+    Simulates the async-verdict race Einstein msg-531 Objection 2 named:
+    the design thread was resolved between the PR-gate's fire and its
+    verdict-relay attempt.
+    """
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        if name == "chatroom_post_message":
+            from spirrow_mindwire.magickit.client import ThreadResolvedError
+
+            raise ThreadResolvedError(
+                "magickit tool returned an error envelope: error_type='ChatroomStateError'",
+                error_type="ChatroomStateError",
+            )
+        return await super().call_tool(name, arguments)
+
+
+@pytest.mark.anyio
+async def test_w3_pr_gate_relay_thread_resolved_does_not_crash_and_routes_to_human() -> None:
+    """Design thread resolved mid-gate → conductor fails safe to the human.
+
+    W3 (Bohr msg-536): the relay post cannot land as a chatroom record, but
+    the conductor MUST NOT crash — the GitHub PR review is the primary
+    artifact and the human should still be told to inspect it. Non-retryable
+    (msg-536 W5), so this is a one-shot terminal handling, not a loop.
+    """
+    mcp = _ThreadResolvedOnPostMcp()
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()
+    # The gate DID fire (it precedes the relay).
+    assert gate.fired == ["acme/widgets#7"]
+    # The relay post raised ThreadResolvedError; the conductor caught it and
+    # routed to the human via the empty-msg_id fail-safe branch.
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches == []
+
+
 @pytest.mark.anyio
 async def test_past_field_human_boundary_terminates_the_naysayer_segment() -> None:
     # `_naysayer_consulted` scans history for prior human boundaries so a fresh NEXT: human

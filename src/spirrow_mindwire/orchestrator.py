@@ -18,12 +18,15 @@ chain / a ``scripts/naysayer_review.py`` run / a future PR-event hook).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef, parse_pr_ref
-from .magickit.client import MagickitMcpError, McpToolCaller
+from .magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from .naysayer.pr_review import NaysayerPrReviewDriver, PrReviewOutcome
 from .value_objects import Role, ThreadRef
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_THREAD_PREFIX = "T-pr-review-"
 _DEFAULT_OWNER = "orchestrator"
@@ -225,29 +228,55 @@ class PrReviewOrchestrator:
                     project=project, thread_id=thread_id, title=title, propose=propose, pr=pr
                 )
                 opened = True
-            await self._mcp.call_tool(
-                "chatroom_post_message",
-                {
-                    "project": project,
-                    "thread_id": thread_id,
-                    "msg_type": "report",
-                    "author": self._naysayer_author,
-                    "content": body,
-                    # D-1 (T-dispatched-turn-gets-one-message). This is the Tier B
-                    # verdict — the single most gate-relevant message the harness
-                    # writes — and it recorded ``role: null`` 346 times out of 346
-                    # (live corpus, 2026-08-16). The claim is honest: this body IS
-                    # the independent naysayer's critique, relayed verbatim.
-                    #
-                    # Whether it RECORDS depends on ``self._naysayer_author`` being
-                    # a registered magickit identity with ``naysayer`` in its
-                    # allowed_roles; an unregistered author has its role dropped and
-                    # still posts. So this supplies the value and the registration is
-                    # a magickit-side fact to confirm, not something this repo can
-                    # assert. Read the posted message back to know which happened.
-                    "role": Role.NAYSAYER.value,
-                },
-            )
+            try:
+                await self._mcp.call_tool(
+                    "chatroom_post_message",
+                    {
+                        "project": project,
+                        "thread_id": thread_id,
+                        "msg_type": "report",
+                        "author": self._naysayer_author,
+                        "content": body,
+                        # D-1 (T-dispatched-turn-gets-one-message). This is the Tier B
+                        # verdict — the single most gate-relevant message the harness
+                        # writes — and it recorded ``role: null`` 346 times out of 346
+                        # (live corpus, 2026-08-16). The claim is honest: this body IS
+                        # the independent naysayer's critique, relayed verbatim.
+                        #
+                        # Whether it RECORDS depends on ``self._naysayer_author`` being
+                        # a registered magickit identity with ``naysayer`` in its
+                        # allowed_roles; an unregistered author has its role dropped and
+                        # still posts. So this supplies the value and the registration is
+                        # a magickit-side fact to confirm, not something this repo can
+                        # assert. Read the posted message back to know which happened.
+                        "role": Role.NAYSAYER.value,
+                    },
+                )
+            except ThreadResolvedError as exc:
+                # W3 (T-sweeper-posts-into-resolved-thread-blocks-r2-deploy Bohr
+                # msg-536): the review thread got resolved between our review
+                # start and now — the async-verdict race Einstein msg-531
+                # Objection 2 named. The critique cannot land here as a
+                # chatroom record, but the PRIMARY artifact of this gate is
+                # the GitHub PR review submitted by :meth:`_submit_review`,
+                # which the driver runs AFTER ``post_critique`` returns. So
+                # the correct disposition is (from W4b's three options):
+                # (1) an alternative durable surface that reaches the
+                # intended reader — the GitHub PR review, which is the
+                # reader's primary surface anyway. Swallow here so the
+                # driver continues to :meth:`_submit_review`; log at WARNING
+                # so the operator sees why the chatroom record is missing.
+                # Non-retryable (msg-536 W5) so no retry loop; terminal for
+                # this thread. Never itself posted into a chatroom thread
+                # (msg-534 W4a — posted into the same thread it would 409
+                # again; posted into a different thread it is out-of-context).
+                logger.warning(
+                    "pr-review chatroom record dropped (thread %r resolved): %s. "
+                    "Primary artifact (GitHub PR review) will still be submitted; "
+                    "no retry — refusal is terminal for this thread.",
+                    thread_id,
+                    exc,
+                )
 
         outcome = await self._driver.review(pr, post_critique=post_critique)
         return thread_ref, outcome
