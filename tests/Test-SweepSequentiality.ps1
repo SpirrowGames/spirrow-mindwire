@@ -88,42 +88,46 @@
 #
 #     Measured 2026-09-08 against deploy/run-conductor-scheduled.ps1 as
 #     committed in 014a665 (the last commit to touch that file; this PR
-#     does not modify it). Runner is an in-memory replica implementing
-#     L1/S1-S4/L2a/L2b/L2c of the pin — L3b and L3d are not implemented
-#     in the runner. msg-624/625 §2a re-audit; working tree byte-for-
-#     byte unmodified before and after:
+#     does not modify it). Option 3 (msg-630 §3, msg-631 sustained): the
+#     actual pin — this file, tests/Test-SweepSequentiality.ps1 — was
+#     invoked against mutated scratch copies of the sweep script in an
+#     isolated mirror. Working tree SHA256 hashes for both files
+#     unchanged before and after (verified); scratch mirror lives under
+#     .git/mindwire-scratch/pinrun/ (untracked, disposable).
 #
 #       DUPLICATION side — pin misses, as documented:
 #         msg-595's verbatim incremental-duplication mutation
 #           if ($cand.slow) { $jobs += Start-Job -FilePath $inner; continue }
-#         inserted above the pinned spawn line: replica GREEN. No rule
-#         of the replicated pin logic (L1/L2a/L2b/L2c) fired. Whether
-#         the pin's L3b/L3d ALSO pass silently on this mutation is not
-#         measured here; those two rules were not exercised by the
-#         runner and their behaviour on `Start-Job -FilePath $inner`
-#         is not part of this record.
-#         Bohr msg-595 measured the same duplication GREEN at 38b2fd6
-#         against the full pin — that is cross-version agreement (the
-#         pin was rewritten in 9ed8a82 and again in 014a665 between
-#         msg-595 and this measurement), not replication.
+#         inserted above the pinned spawn line: pin GREEN, exit 0. No
+#         rule fired — L1, S1-S4 identity resolution, L2a, L2b, L2c,
+#         L3b, and L3d all passed. `Start-Job -FilePath` is neither
+#         AST-opaque nor a static-type invocation, so L3b and L3d were
+#         exercised and did not fire on this mutation; the blind spot
+#         is a property of the full pin, not of a replica.
 #
-#       RESHAPE side — replica catches, on the same runner invocation:
-#         wrapping the spawn in `Start-Job -ScriptBlock { & $inner *>&1 }`:
-#           replica RED via L2c-sbe (ScriptBlockExpressionAst detector).
-#         wrapping the spawn in `ForEach-Object -Parallel { & $inner *>&1 }`:
-#           replica RED via L2c-sbe.
-#         wrapping the spawn in
-#         `[System.Threading.Tasks.Task]::Run({ & $inner *>&1 })`:
-#           replica RED via L2c-sbe.
+#         Cross-version corroboration: Bohr msg-595 measured the same
+#         duplication GREEN at 38b2fd6 against the pin as it was then.
+#         The pin was rewritten in 9ed8a82 and 014a665 between msg-595
+#         and this measurement, so the miss is agreement across pin
+#         revisions rather than replication.
 #
-#     The boundary is therefore measured against the four-rule replica
-#     on both sides. The reshape-RED results license claims about the
-#     pin itself because the replica mirrors L2c's implementation at
-#     lines 396-428 (structural read-back anchors the replica to the
-#     pin). The duplication-GREEN result licenses a claim about the
-#     replica, not about L3b and L3d — a reader wanting the wider
-#     assertion should run the full pin suite against the mutation
-#     rather than infer it from the four-rule result.
+#       RESHAPE side — pin catches, on the same pin invocation:
+#         `Start-Job -ScriptBlock { & $inner *>&1 }` wrapping the spawn:
+#           pin RED, L2c fires (ScriptBlockExpressionAst on the
+#           ancestor chain).
+#         `ForEach-Object -Parallel { & $inner *>&1 }` wrapping the spawn:
+#           pin RED, L2c fires.
+#         `[System.Threading.Tasks.Task]::Run({ & $inner *>&1 })` wrapping
+#         the spawn:
+#           pin RED, L2c AND L3b both fire — the Task type invocation
+#           is not on the L3b allowlist, so this reshape is double-
+#           caught (L3b would catch it even in a hypothetical L2c
+#           bypass).
+#
+#     The boundary is therefore measured against the actual pin on both
+#     sides — reshape RED, duplication GREEN — with no replica, no
+#     cross-version inference, and no unexecuted assumption about how
+#     the pin aggregates rule results.
 #
 #     Four closures were evaluated. The reason each was refused lives
 #     here so a re-open does not pay the measurement twice:
