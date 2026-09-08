@@ -453,6 +453,31 @@ obligations:
       【実装先 — proposer 補足（Einstein の逐語ではない）】この carve-out のコードは magickit リポジトリのサーバ側 `chatroom_close_thread` 実装に入る。mindwire リポジトリの側に実装先は無く、履行は magickit に PR を立てることである。
       【以下 Einstein msg-1968 逐語】もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合、その場合、ADR-10 のロールを sweeper に付与して誤魔化すのではなく、PR-gate の carve-out と同様に、`chatroom_close_thread` 側に『`system-alert` タグを持ち、かつ owner 自身によるクローズである場合はロールチェックを免除する』という構造的な carve-out（例外経路）をコードとして追加実装すること。
 
+  - id: OBL-STALL-DETECTOR-MONOTONIC-FIXTURES
+    role: implementer
+    # Net-new formulation (no origin). Issued by T-stalled-pr-has-no-detector
+    # msg-2692 §4-6 (Bohr) as the closing move against Residuals A and B of
+    # the stall-detector design: a parser that accepts well-formed input and
+    # returns the wrong verdict, and an upstream that silently returns an
+    # empty list. Neither is caught by the accounting rule or the state
+    # derivation; both are caught only by feeding real-world incidents into
+    # the current parser and observing which ones it still identifies.
+    #
+    # This obligation is what keeps the fixture set MONOTONIC. The mechanical
+    # side is `tests/test_stall_ledger_incident_backtest.py`, which loads
+    # every JSON file in `tests/data/stall_ledger_incidents/` and asserts the
+    # predicate identifies the stall (or that the fixture honestly records
+    # not-representable). A silently deleted fixture reds
+    # `test_all_seed_incidents_present`; a fixture added without provenance
+    # reds `test_fixture_has_required_provenance_fields`.
+    #
+    # Read-back ledger integration (msg-2691 endorsement of msg-2692 §4-6):
+    # the obligation body is delivered into the implementer prompt like
+    # every other entry here; canary two-prime asserts that delivery on
+    # every gate run.
+    body: |
+      MONOTONIC INCIDENT FIXTURES FOR THE STALL DETECTOR: when operator lane observes a stall that the stall_ledger did not identify at the time (`tests/test_stall_ledger_incident_backtest.py`), or a false-positive it did identify, ADD a JSON fixture under `tests/data/stall_ledger_incidents/` for that incident before the thread that observed it closes. The fixture MUST record its provenance (source, captured_at, captured_by) and its expected verdict (stall / not-stall / not-representable); a not-representable fixture MUST carry a reason. The set is monotonic — do not retire seed fixtures, only supersede them. The rule the corpus enforces is that a parser change that silently loses coverage of a previously-caught incident reds the backtest, not the digest weeks later.
+
   - id: OBL-SPEC-SCOPE-CLOSURE
     role: implementer
     # Net-new formulation (no origin). Issued by SPEC-2026-08-11-design-spec-delivery

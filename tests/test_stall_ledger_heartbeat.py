@@ -1,0 +1,441 @@
+"""Tests for the heartbeat module: accounting rule, state derivation,
+freshness/expires_at contract, digest rendering, and the GitHub query pin.
+
+Reference for every assertion below is Bohr msg-2692 (final resolution of both
+BLOCKING findings in the T-stalled-pr-has-no-detector design thread) plus
+Einstein msg-2693 (advisory: emit an absolute ``expires_at`` so the digest
+carries no domain logic).
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from spirrow_mindwire.stall_ledger.heartbeat import (
+    T_HEARTBEAT,
+    FetchOutcome,
+    HealthState,
+    HeartbeatRecord,
+    SourceReport,
+    advance_last_valid_ingest_at,
+    build_open_pr_query,
+    derive_state,
+    is_stale,
+    render_digest_lines,
+)
+
+# --------------------------------------------------------------------------- #
+# Accounting rule — msg-2692 §1: recognized + unrecognized == examined.
+#
+# This is the load-bearing defence against graceful-empty parsing failures.
+# A parser that silently drops rows it does not understand would leave
+# recognized + unrecognized < examined. Enforcing the invariant at construction
+# means such a state can never enter the state table.
+# --------------------------------------------------------------------------- #
+
+
+class TestAccountingRule:
+    def test_matches_examined_is_ok(self) -> None:
+        SourceReport(
+            name="github_prs",
+            fetch_outcome=FetchOutcome.OK,
+            examined=3,
+            recognized=2,
+            unrecognized=1,
+        )  # no raise
+
+    def test_undercount_raises(self) -> None:
+        """recognized + unrecognized < examined means the parser silently
+        dropped rows. This is the exact failure mode the rule exists to catch.
+        """
+
+        with pytest.raises(ValueError, match="accounting violation"):
+            SourceReport(
+                name="github_prs",
+                fetch_outcome=FetchOutcome.OK,
+                examined=5,
+                recognized=2,
+                unrecognized=1,  # 3 rows silently disappeared
+            )
+
+    def test_overcount_raises(self) -> None:
+        """recognized + unrecognized > examined means the parser double-counted
+        somewhere; also a bug, also caught here.
+        """
+
+        with pytest.raises(ValueError, match="accounting violation"):
+            SourceReport(
+                name="github_prs",
+                fetch_outcome=FetchOutcome.OK,
+                examined=3,
+                recognized=2,
+                unrecognized=2,
+            )
+
+    def test_negative_counts_rejected(self) -> None:
+        """A negative count would silently make some sums look correct by
+        cancellation. Reject before it reaches the state table.
+        """
+
+        with pytest.raises(ValueError, match="counts must be non-negative"):
+            SourceReport(
+                name="github_prs",
+                fetch_outcome=FetchOutcome.OK,
+                examined=-1,
+                recognized=0,
+                unrecognized=0,
+            )
+
+
+# --------------------------------------------------------------------------- #
+# State derivation — msg-2692 §1 table:
+#
+#   any source is failing → ingest_failure
+#   all sources ok, all examined == 0 → idle
+#   otherwise → healthy
+#
+# Note: examined == 0 with fetch_outcome == ok is IDLE, not INGEST_FAILURE.
+# That is Einstein msg-2691's blocking finding: a repository with no open
+# PRs must not drive alarm fatigue into the digest.
+# --------------------------------------------------------------------------- #
+
+
+def _make_source(
+    name: str = "src",
+    outcome: FetchOutcome = FetchOutcome.OK,
+    examined: int = 0,
+    recognized: int = 0,
+    unrecognized: int = 0,
+) -> SourceReport:
+    return SourceReport(
+        name=name,
+        fetch_outcome=outcome,
+        examined=examined,
+        recognized=recognized,
+        unrecognized=unrecognized,
+    )
+
+
+def _make_record(
+    *sources: SourceReport,
+    input_format_version: str = "v1",
+    observed: dict[str, str] | None = None,
+    evaluated_at: datetime = datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+    stalls: tuple[str, ...] = (),
+) -> HeartbeatRecord:
+    if observed is None:
+        observed = {src.name: input_format_version for src in sources}
+    return HeartbeatRecord(
+        evaluated_at=evaluated_at,
+        input_format_version=input_format_version,
+        sources=tuple(sources),
+        observed_format_versions=observed,
+        stalls=stalls,
+    )
+
+
+class TestStateDerivation:
+    def test_healthy_when_examined_and_all_recognized(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=3, recognized=3))
+        assert derive_state(rec) == HealthState.HEALTHY
+
+    def test_idle_when_all_sources_examined_zero(self) -> None:
+        """Einstein msg-2691 blocking #1: idle repositories must NOT flip
+        the state to ingest_failure — that would train the operator to
+        ignore the digest.
+        """
+
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=0),
+            _make_source("threads", FetchOutcome.OK, examined=0),
+        )
+        assert derive_state(rec) == HealthState.IDLE
+
+    def test_ingest_failure_when_fetch_outcome_not_ok(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.HTTP_ERROR, examined=0))
+        assert derive_state(rec) == HealthState.INGEST_FAILURE
+
+    def test_ingest_failure_on_timeout(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.TIMEOUT, examined=0))
+        assert derive_state(rec) == HealthState.INGEST_FAILURE
+
+    def test_ingest_failure_on_auth(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.AUTH_FAILURE, examined=0))
+        assert derive_state(rec) == HealthState.INGEST_FAILURE
+
+    def test_ingest_failure_on_file_missing(self) -> None:
+        rec = _make_record(_make_source("q", FetchOutcome.FILE_MISSING, examined=0))
+        assert derive_state(rec) == HealthState.INGEST_FAILURE
+
+    def test_ingest_failure_when_unrecognized_positive(self) -> None:
+        """Even with fetch_outcome=ok, an unrecognized > 0 says the parser
+        saw a row shape it does not understand. That IS drift, and it must
+        flip the state loudly rather than be counted as a partial success.
+        """
+
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=3, recognized=2, unrecognized=1)
+        )
+        assert derive_state(rec) == HealthState.INGEST_FAILURE
+
+    def test_ingest_failure_on_version_mismatch(self) -> None:
+        """A source stamped a version we do not know how to parse. Flag
+        rather than trust — even if the shape happens to match by accident.
+        """
+
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=1, recognized=1),
+            input_format_version="v1",
+            observed={"prs": "v2"},  # emitter says v2, we expect v1
+        )
+        assert derive_state(rec) == HealthState.INGEST_FAILURE
+
+    def test_failure_wins_over_healthy_in_mixed_sources(self) -> None:
+        """A partial outage across multiple sources: two healthy, one 500.
+        The 500 must not be masked by the two healthy ones — failure wins.
+        """
+
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=3, recognized=3),
+            _make_source("threads", FetchOutcome.OK, examined=1, recognized=1),
+            _make_source("q", FetchOutcome.HTTP_ERROR, examined=0),
+        )
+        assert derive_state(rec) == HealthState.INGEST_FAILURE
+
+    def test_failure_wins_over_idle_in_mixed_sources(self) -> None:
+        """Two sources returned empty; a third returned a failure. Idle
+        must NOT swallow the failure just because the other two look quiet.
+        """
+
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=0),
+            _make_source("threads", FetchOutcome.OK, examined=0),
+            _make_source("q", FetchOutcome.PARSE_ERROR, examined=0),
+        )
+        assert derive_state(rec) == HealthState.INGEST_FAILURE
+
+
+# --------------------------------------------------------------------------- #
+# last_valid_ingest_at — msg-2692 §2: heartbeat advances only when the ingest
+# was actually valid (healthy or idle). ingest_failure holds the previous
+# value.
+# --------------------------------------------------------------------------- #
+
+
+class TestLastValidIngestAt:
+    def test_advances_on_healthy(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=1, recognized=1))
+        assert advance_last_valid_ingest_at(rec, None) == rec.evaluated_at
+        assert (
+            advance_last_valid_ingest_at(rec, datetime(2025, 1, 1, tzinfo=UTC)) == rec.evaluated_at
+        )
+
+    def test_advances_on_idle(self) -> None:
+        """The Einstein-blocking-#1 fix: idle advances the heartbeat, so
+        an idle repository does not accumulate a false 'detector stale'
+        alarm.
+        """
+
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
+        assert advance_last_valid_ingest_at(rec, None) == rec.evaluated_at
+
+    def test_holds_on_ingest_failure(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.TIMEOUT, examined=0))
+        prev = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+        assert advance_last_valid_ingest_at(rec, prev) == prev
+
+    def test_holds_at_none_on_first_failure(self) -> None:
+        """If ingest has never once succeeded and this tick fails, the
+        heartbeat stays at None — the digest will render the never-succeeded
+        signal explicitly.
+        """
+
+        rec = _make_record(_make_source("prs", FetchOutcome.HTTP_ERROR, examined=0))
+        assert advance_last_valid_ingest_at(rec, None) is None
+
+
+# --------------------------------------------------------------------------- #
+# Freshness / expires_at — msg-2693 advisory: digest carries no domain logic;
+# it does now > expires_at, where expires_at is derived HERE.
+# --------------------------------------------------------------------------- #
+
+
+class TestExpiresAtAndStaleness:
+    def test_expires_at_is_evaluated_plus_heartbeat(self) -> None:
+        """The whole point of Einstein's msg-2693 advisory: the interval
+        is encapsulated here. A change to T_HEARTBEAT is one edit in this
+        module and the digest picks it up with zero code change.
+        """
+
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=1, recognized=1))
+        assert rec.expires_at == rec.evaluated_at + T_HEARTBEAT
+
+    def test_stale_when_last_valid_is_none(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
+        assert is_stale(now=rec.evaluated_at, record=rec, last_valid_ingest_at=None)
+
+    def test_not_stale_when_within_heartbeat(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
+        # just before expiry
+        now = rec.evaluated_at + T_HEARTBEAT - timedelta(minutes=1)
+        assert not is_stale(now=now, record=rec, last_valid_ingest_at=rec.evaluated_at)
+
+    def test_stale_at_expiry_boundary(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
+        now = rec.evaluated_at + T_HEARTBEAT + timedelta(seconds=1)
+        assert is_stale(now=now, record=rec, last_valid_ingest_at=rec.evaluated_at)
+
+
+# --------------------------------------------------------------------------- #
+# Digest rendering — msg-2692 §4-3: state name is the verdict, examined
+# breakdown is subordinate evidence. There must be NO reading of the line
+# under which "0 stalls" can claim health while ingest is broken.
+# --------------------------------------------------------------------------- #
+
+
+class TestDigestRendering:
+    def _rec_healthy(self) -> HeartbeatRecord:
+        return _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=3, recognized=3),
+            _make_source("threads", FetchOutcome.OK, examined=0),
+        )
+
+    def test_healthy_state_appears_as_verdict(self) -> None:
+        rec = self._rec_healthy()
+        lines = render_digest_lines(
+            record=rec, now=rec.evaluated_at, last_valid_ingest_at=rec.evaluated_at
+        )
+        assert lines[0].startswith("detector: healthy")
+
+    def test_idle_state_appears_as_verdict(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
+        lines = render_digest_lines(
+            record=rec, now=rec.evaluated_at, last_valid_ingest_at=rec.evaluated_at
+        )
+        assert lines[0].startswith("detector: idle")
+
+    def test_ingest_failure_state_appears_as_verdict(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.TIMEOUT, examined=0))
+        # Pass a previous last_valid so ``stale`` does not shadow the declared
+        # state (a first-ever failure would render ``stale`` because
+        # last_valid_ingest_at is None; here we want to see the raw failure
+        # verdict, so pretend one previous ingest succeeded a moment ago).
+        lines = render_digest_lines(
+            record=rec, now=rec.evaluated_at, last_valid_ingest_at=rec.evaluated_at
+        )
+        assert lines[0].startswith("detector: ingest_failure")
+
+    def test_first_ever_failure_renders_stale_over_declared(self) -> None:
+        """When last_valid_ingest_at is None the digest MUST show ``stale``
+        as the verdict — the record has never once been valid, so wall-clock
+        freshness is the load-bearing signal and the declared state (which
+        is a per-tick observation) is downgraded to a subordinate note.
+        """
+
+        rec = _make_record(_make_source("prs", FetchOutcome.TIMEOUT, examined=0))
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at, last_valid_ingest_at=None)
+        assert lines[0].startswith("detector: stale")
+        assert "declared=ingest_failure" in lines[0]
+
+    def test_stale_appears_when_wall_clock_says_so(self) -> None:
+        """Digest computes staleness from wall-clock; the record's declared
+        state is preserved in the header so an operator can tell "the
+        detector died" (declared=healthy, stale=true) from "ingest is
+        broken" (declared=ingest_failure).
+        """
+
+        rec = self._rec_healthy()
+        now = rec.evaluated_at + T_HEARTBEAT + timedelta(hours=1)
+        lines = render_digest_lines(record=rec, now=now, last_valid_ingest_at=rec.evaluated_at)
+        assert lines[0].startswith("detector: stale")
+        assert "declared=healthy" in lines[0]
+
+    def test_evidence_lines_carry_counts(self) -> None:
+        rec = self._rec_healthy()
+        lines = render_digest_lines(
+            record=rec, now=rec.evaluated_at, last_valid_ingest_at=rec.evaluated_at
+        )
+        joined = "\n".join(lines)
+        assert "prs: fetch=ok examined=3 recognized=3 unrecognized=0" in joined
+        assert "threads: fetch=ok examined=0 recognized=0 unrecognized=0" in joined
+
+    def test_verdict_line_does_not_carry_stall_count(self) -> None:
+        """Regression pin for msg-2692 §1: the state name is the verdict.
+        A prior draft rendered '0 stalls' at the verdict position; that is
+        precisely the phrasing that gives the parser 'the right to lie'
+        when the ingest is broken. The state must be first, counts must
+        not appear on line 0.
+        """
+
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
+        lines = render_digest_lines(
+            record=rec, now=rec.evaluated_at, last_valid_ingest_at=rec.evaluated_at
+        )
+        assert "stall" not in lines[0].lower(), (
+            "the verdict line must not carry a stall count — that grants the "
+            "parser the right to print '0 stalls' when ingest is broken. Put "
+            "the state name first; counts go on the subordinate evidence lines."
+        )
+
+    def test_never_ingested_is_shown_explicitly(self) -> None:
+        rec = _make_record(_make_source("prs", FetchOutcome.HTTP_ERROR, examined=0))
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at, last_valid_ingest_at=None)
+        assert "last_valid_ingest_at=never" in lines[0]
+
+    def test_version_drift_is_annotated_on_evidence(self) -> None:
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=1, recognized=1),
+            input_format_version="v1",
+            observed={"prs": "v2"},
+        )
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at, last_valid_ingest_at=None)
+        assert any("version_drift" in line for line in lines[1:])
+
+
+# --------------------------------------------------------------------------- #
+# Query pin — msg-2692 §4-4: pin the exact bytes of our own GitHub PR query
+# so a silent change to the retrieval path is caught in CI.
+# --------------------------------------------------------------------------- #
+
+
+class TestOpenPrQueryPin:
+    def test_query_shape_is_pinned(self) -> None:
+        """PIN: any change to this shape must be discussed in review, and if
+        it lands, this snapshot changes in the same commit.
+
+        The rule this test enforces: the heartbeat's live retrieval is
+        `GET /repos/{owner}/{repo}/pulls?state=open&per_page=100`. Nothing
+        else. `state=all`, an issue-search query, or a switch to graphql
+        would each silently change what the live sweep sees vs. what the
+        R-2b static fixtures were captured against — precisely the class
+        of drift ADV-1's own reasoning (msg-2688) categorises as
+        "trip-wire cheaper than fix".
+        """
+
+        q = build_open_pr_query(owner="SpirrowGames", repo="spirrow-mindwire")
+        assert q == {
+            "path": "/repos/SpirrowGames/spirrow-mindwire/pulls",
+            "params": {"state": "open", "per_page": 100},
+        }
+
+    def test_per_page_is_overridable(self) -> None:
+        """Callers can request a different page size (e.g. tests); default
+        pinned above is what production uses.
+        """
+
+        q = build_open_pr_query(owner="o", repo="r", per_page=10)
+        assert q["params"]["per_page"] == 10
+
+    def test_state_is_open_not_all(self) -> None:
+        """Anti-regression pin for Einstein msg-2691 blocking #2: the
+        R-2c live-canary/replay-probe pattern was withdrawn precisely
+        because it would have required this to become ``state=all`` (or a
+        historical-only query), which the LIVE sweep never runs. If a
+        future edit ever flips this to 'all', we are back to the probe
+        that does not exercise the live retrieval path.
+        """
+
+        q = build_open_pr_query(owner="o", repo="r")
+        assert q["params"]["state"] == "open"

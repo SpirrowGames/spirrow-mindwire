@@ -55,6 +55,18 @@ The three windows the design distinguishes (msg-2476 §2):
 
 from spirrow_mindwire.stall_ledger.classifier import Class, classify
 from spirrow_mindwire.stall_ledger.failure_class import classify_failure
+from spirrow_mindwire.stall_ledger.heartbeat import (
+    T_HEARTBEAT,
+    FetchOutcome,
+    HealthState,
+    HeartbeatRecord,
+    SourceReport,
+    advance_last_valid_ingest_at,
+    build_open_pr_query,
+    derive_state,
+    is_stale,
+    render_digest_lines,
+)
 from spirrow_mindwire.stall_ledger.model import (
     T_INFLIGHT,
     T_SKEW,
@@ -74,22 +86,32 @@ from spirrow_mindwire.stall_ledger.refire import RefireBudget, should_refire
 
 __all__ = [
     "N_THRESHOLDS",
+    "T_HEARTBEAT",
     "T_INFLIGHT",
     "T_SKEW",
     "T_UNCERTAIN",
     "Class",
     "EmittedEventIds",
     "Event",
+    "FetchOutcome",
+    "HealthState",
+    "HeartbeatRecord",
     "OriginKind",
     "RefireBudget",
     "RemedyAttempt",
     "RemedyState",
+    "SourceReport",
     "StallRecord",
     "Unit",
     "UnitKind",
+    "advance_last_valid_ingest_at",
+    "build_open_pr_query",
     "classify",
     "classify_failure",
+    "derive_state",
+    "is_stale",
     "origin",
+    "render_digest_lines",
     "should_refire",
     "stalled",
 ]

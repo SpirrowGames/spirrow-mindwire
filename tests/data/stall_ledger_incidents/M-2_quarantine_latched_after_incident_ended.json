@@ -1,0 +1,30 @@
+{
+  "id": "M-2",
+  "title": "quarantine latched with 7 same-signature entries after the wave ended",
+  "observed_by": "operator",
+  "observed_at": "2026-09-02T00:00Z",
+  "spec_thread": "T-stalled-pr-has-no-detector",
+  "spec_msg_ids": ["msg-2354"],
+  "provenance": {
+    "source": "quarantine.json + conductor log signature histogram",
+    "captured_at": "2026-09-08T00:00Z",
+    "captured_by": "operator lane, msg-2354 §1 M-2"
+  },
+  "predicate_input": {
+    "kind": "quarantine",
+    "identifier": "spirrow-mindwire/T-pr-review-threads-outlive-their-prs",
+    "quarantine_state": {
+      "is_present": true
+    },
+    "n_threshold_hours": 0,
+    "signature_daily_hits": {
+      "2026-08-30": 25,
+      "2026-08-31": 20,
+      "2026-09-01": 5,
+      "2026-09-02": 0
+    }
+  },
+  "expected_verdict": "stall",
+  "not_representable_reason": null,
+  "notes": "Quarantine presence is N=0 in N_THRESHOLDS, so any quarantine record with is_present=true is immediately stalled. Signature histogram captured here as evidence — Bohr msg-2354 §1 M-2 measured that the incident wave had ended by 2026-09-01 but the quarantine kept latched by design (Q3 in deploy/Clear-Quarantine.ps1). Detector sees stall today; whether to auto-clear is out of scope for the ledger (msg-2354 §3-2)."
+}

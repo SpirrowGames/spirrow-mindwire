@@ -662,7 +662,19 @@ function Get-FailureClass {
             # ``Test-SweepQuarantine.ps1`` is a no-op, so tests do not need to
             # assert on log lines, but production readers see it.
             Write-Warning "Get-FailureClass: no -RepoRoot and no `$PSScriptRoot in scope; classifier NOT invoked. Returning 'unknown' (loud fall-back per msg-2601 §1-2)."
-            Write-Log "WARN Get-FailureClass: RepoRoot unresolvable (no param, no `$PSScriptRoot); classifier skipped, failure_class='unknown'"
+            # ADV-1 (T-stalled-pr-has-no-detector msg-2618, resolved by msg-2692 §2 /
+            # msg-2688): call ``Write-Log`` only when it is defined in the current
+            # scope. The function contract of ``Get-FailureClass`` is "NEVER breaks
+            # the sweep" — an unconditional call reaches out of this function's
+            # closure and would raise ``CommandNotFoundException`` in any scope
+            # (dot-source into a stripped harness, extraction into another module)
+            # that lacks the logger. That exception is raised OUTSIDE the try/catch
+            # below and would bubble up to the caller, violating the contract.
+            # The msg-2688 rule this is the payment for: 弁済価格 < 強制機構価格
+            # なら払う — the fix is one line, an AST guard would be several.
+            if (Get-Command -Name Write-Log -ErrorAction SilentlyContinue) {
+                Write-Log "WARN Get-FailureClass: RepoRoot unresolvable (no param, no `$PSScriptRoot); classifier skipped, failure_class='unknown'"
+            }
             return 'unknown'
         }
     }
