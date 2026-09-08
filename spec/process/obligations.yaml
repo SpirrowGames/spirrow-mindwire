@@ -45,15 +45,27 @@
 #   - 観測軸 (the observability axis): when and where the antecedent becomes
 #     observable — which probe surfaces it, on which host, under which
 #     conditions. This is the DESIGN's responsibility, not the manifest's.
-#     Keep it out of `body`. If you write it in, a design change to the probe
-#     (an example: the pre-role-check probe for OBL-GATE-BOOTSTRAP-CLOSE-CARVEOUT,
-#     which is T-new-project-gate-bootstrap S-4) will require a manifest change
-#     to stay in step, and the two representations of the same fact will drift.
+#     Keep it out of `body`. In the shape a conditional entry actually has —
+#     "`OBL-XXX` says: if <antecedent>, do Y" — the manifest speaks only to
+#     what to do once the antecedent is observed. When and where the
+#     antecedent becomes observable is a decision of the design thread that
+#     originated `OBL-XXX`, and it stays there. Writing it in here means a
+#     design change to the probe will silently require a manifest change to
+#     stay in step, and the two representations of the same fact will drift.
+#     The rule above is stated without a live entry, probe, or thread as
+#     its illustrative example on purpose: pointing the reader at a
+#     specific antecedent-observation site would restage the very drift
+#     risk the rule exists to prevent. This bound is on the rule's
+#     *illustrative example* only — the Citations block below names the
+#     thread the rule ORIGINATED on as provenance, which is a different
+#     axis (where the rule came from, not what the rule regulates) and is
+#     not a live example of an observability antecedent.
 #
-# Citations: this rule was narrowed to its current form in Bohr msg-2392 §3 on
-# thread T-new-project-gate-bootstrap; the same thread's msg-2139 §4 fixed the
-# S-4 probe's scope as observability (i.e. not to be widened silently) and is
-# the reason the example above is a live example rather than a hypothesis.
+# Citations: this rule was narrowed to its current form in Bohr msg-2392 §3
+# on thread T-new-project-gate-bootstrap; the same thread's msg-2139 §4
+# constrained the observability side to remain a design-thread decision that
+# is not to be widened silently, and this note is the general rule that
+# follows from that constraint.
 #
 # This note is not machine-checked. Whether a `body` has silently absorbed
 # observability-axis prose is a review-time judgement, not a testable predicate:
@@ -418,16 +430,19 @@ obligations:
     # and it is checked — see the Enforced-by line at the end of this comment.
     #
     # Observability of the antecedent (when/where it becomes observable) is
-    # NOT restated here. See the file-header authoring note "CONDITIONAL
-    # OBLIGATION BODIES CARRY THE COMPLIANCE AXIS, NOT THE OBSERVABILITY AXIS"
-    # for the general rule; this entry is one of the live examples cited
-    # there (S-4 of T-new-project-gate-bootstrap is the observability probe).
+    # not stated here. The general rule is stated once in the file-header
+    # authoring note "CONDITIONAL OBLIGATION BODIES CARRY THE COMPLIANCE AXIS,
+    # NOT THE OBSERVABILITY AXIS"; that note is placeholder-shaped and names
+    # no specific probe, so a probe change does not propagate to it. Where
+    # the observability of this entry's antecedent lives (which thread, which
+    # probe) is a design fact and stays with the design thread named in the
+    # "Source:" line below — that pointer is enough for a reader who needs to
+    # find it, and this rationale does not attempt to describe the probe.
     # Same-fact-in-two-places drifts (msg-2392 §4(4)), and an earlier revision
     # of this paragraph is precisely where that drift began: it asserted where
     # the antecedent could be observed and made an internally contradictory
-    # claim about the S-4 probe's precheck short-circuit. That is exactly the
-    # class of mistake the authoring note now warns against, so the fix is to
-    # let the file-header rule carry it, not to re-state it here.
+    # claim about a probe's precheck short-circuit — exactly the class of
+    # mistake the authoring note warns against.
     #
     # The cross-repo landing site is stated in `body` itself (round 3: PR-gate
     # msg-2391, proposer ruling msg-2392 §4). It is deliberately NOT restated
