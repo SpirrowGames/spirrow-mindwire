@@ -17,7 +17,7 @@ enforce the invariants the Tier-C GO msg-737 nailed down:
   antecedent and the landing site of the change it prescribes both reach the
   *rendered* implementer prompt, and the meta-commentary round 1 stripped stays
   out of it. All three parts in one test because the findings on that entry
-  pulled in opposite directions and a guard on any half alone lets the others
+  pulled in opposite directions and a guard on any part alone lets the others
   regress. Each asserts against that entry's own injected block, not against the
   whole prompt — msg-2392 §2 measured a whole-prompt ``in`` going green for a
   reason unrelated to the entry.
@@ -184,10 +184,10 @@ def test_canary_2_double_prime_moved_bodies_preserve_original_length() -> None:
 #
 # So all three parts below assert against ``_injected_block``, this entry's own
 # slice of the rendered prompt (~270 chars), not against the ~17.7k-char prompt.
-# The two pre-existing halves were moved onto the slice for the same reason and
-# not merely for tidiness: on the whole prompt the positive half could go green
+# The two pre-existing parts were moved onto the slice for the same reason and
+# not merely for tidiness: on the whole prompt the positive part could go green
 # because some *other* entry happened to carry the same sentence, and the
-# negative half could go red because some other entry happened to use the phrase
+# negative part could go red because some other entry happened to use the phrase
 # 「義務付けられなければならない」. Neither is happening today (measured: 0
 # occurrences elsewhere), which is exactly the condition under which a broken
 # check looks healthy.
@@ -240,7 +240,7 @@ def test_obl_gate_bootstrap_close_carveout_body_carries_its_antecedent(
     pulled in opposite directions — round 1 (msg-2111 §2) said the span was too
     wide and carried Einstein's meta-commentary, round 2 (msg-2207) said it was
     too narrow and had lost the antecedent, round 3 (msg-2391) said it never named
-    the repository the prescribed change lands in — so a guard on any half alone
+    the repository the prescribed change lands in — so a guard on any part alone
     leaves the others free to regress on the next edit. msg-2387 §5: the span is
     decided by role, not by length.
 
@@ -256,7 +256,7 @@ def test_obl_gate_bootstrap_close_carveout_body_carries_its_antecedent(
     rendered = adapter._system_prompt
     block = _injected_block(manifest, rendered, Role.IMPLEMENTER, _CARVEOUT_ID)
 
-    # Positive half (msg-2387 §6(1)): the antecedent, verbatim from Einstein
+    # Positive part (msg-2387 §6(1)): the antecedent, verbatim from Einstein
     # msg-1968, where Einstein delimited it with 「」 inside his 処方 sentence.
     antecedent = "もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合"
     assert antecedent in block, (
@@ -267,7 +267,7 @@ def test_obl_gate_bootstrap_close_carveout_body_carries_its_antecedent(
         f"the antecedent back in `body`.\nBlock as injected:\n{block}"
     )
 
-    # Landing-site half (msg-2391 / msg-2392 §4): the body commands the reader to
+    # Landing-site part (msg-2391 / msg-2392 §4): the body commands the reader to
     # 「コードとして追加実装すること」 against `chatroom_close_thread`, and
     # `chatroom_close_thread` has in-repo call sites here (src/spirrow_mindwire/
     # gate_bootstrap.py), so a reader holding only a mindwire checkout lands on the
@@ -285,7 +285,7 @@ def test_obl_gate_bootstrap_close_carveout_body_carries_its_antecedent(
         f"requirement (msg-2391).\nBlock as injected:\n{block}"
     )
 
-    # Negative half (msg-2387 §5): the framing clause of Einstein's 処方 sentence is
+    # Negative part (msg-2387 §5): the framing clause of Einstein's 処方 sentence is
     # commentary *about* the obligation, not part of it, and round 1 was right to
     # strip it. Anchored on that specific clause rather than on a general
     # "no meta-commentary" heuristic, which would be unfalsifiable here.
