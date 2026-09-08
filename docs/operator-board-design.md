@@ -627,9 +627,19 @@ board が動くまでの唯一の耐久面はこの設計書。∴ 「宣言し�
 
 naysayer round-3 advisory は正しい。ただし v0.3.3 と同じ手（`head_committed_date` → `head_pushed_at`）を `ci_clock_start` に流用するのは**誤りの向きが反転するので、そのままでは通らない**。ここを記録せずに「後で `head_pushed_at` に替える」とだけ書くと、後続の実装者が対称性から自明だと判断して入れる。
 
-#### 発火条件（連言。今日はほぼ到達不能）
+#### 発火条件（R2/R3 到達性から）
 
-`rollup ≠ ∅` ∧ 全 check の `startedAt` / `createdAt` が null（legacy `StatusContext` 系）∧ head の commit が 12h より古い ∧ その head が今 push された。SpirrowGames の repo は GitHub Actions（CheckRun は `startedAt` を持つ）なので、第 2 項が現状ほぼ成立しない。
+本行のバグは `ci_clock_start` の fallback（`observed = ∅` 時に `head_committed_date` を返す第 2 分岐）が R2/R3 で消費された時にのみ発火する。∴ 発火条件は「R2/R3 到達性」と「fallback 到達性」の合成である。
+
+**R2/R3 到達性**: `gate_admission.py:522` の `if not concluded:` branch。前提として `if not rollup: ... return` (`gate_admission.py:495-515`) を通過している。∴ **`rollup ≠ ∅`** が必要。**空 rollup は R1b で terminate し R3 に到達しない** — R1b は `AdmissionResult(admission=INVOKE, rule="R1b")` を return して naysayer 側に渡し、`pr_review.py` の L1 CI-gate short-circuit が UNKNOWN CI を単発 COMMENT で fail-close する。R1b → R3 の chain は code path として存在しない（R2/R3 branch は `if not rollup:` return の後にある）。
+
+**fallback 到達性**: `gate_admission.py:320-380` の `ci_clock_start` は `observed = [ts for c in rollup if (ts := c.started_at or c.created_at)]` が empty の時のみ `head_committed_date` に fallback。∴ **rollup 内の全 check の `startedAt` / `createdAt` が null**（`observed = ∅`）が必要。
+
+∴ 発火条件（連言）: **`rollup ≠ ∅`** ∧ **`not concluded`** ∧ **全 check の `startedAt` / `createdAt` が null**（legacy `StatusContext` 系）∧ **head の commit が 12h より古い** ∧ **その head が今 push された**。
+
+**現行 repo の shield**: SpirrowGames の CI は GitHub Actions で、CheckRun は `startedAt` を**構造的に**持つ（Actions runner が step を開始した時点で API が populate する）。∴ rollup が非空になった tick では `observed = ∅` が構造的に成立しない。**shield が破れる条件**: (a) repo が legacy `StatusContext` を混ぜる（今日は使っていない）、(b) GitHub Actions API の platform-level 変更で `startedAt` が omit される（あった場合は本行を deferred に留める根拠が失われる → 昇格）。
+
+**PR-review msg-(gate) v0.3.4 round-1 の chain (R1b → R3) の扱い**: naysayer は「R1b が INVOKE downstream → R3 evaluate → ci_clock_start fallback → CAP_NOCLOCK 超過で R3 false-early 発火」の chain を示した。ただし `gate_admission.py:495-515` で R1b は terminate し、R2/R3 は evaluate されない。naysayer が想定した scenario で実際に発生するのは R1b path で naysayer 側の L1 が UNKNOWN CI COMMENT を出す挙動（R1b docstring: "This is a single COMMENT, not a loop"）で、R3 false-early とは別クラス — 本行の subject ではない。ただし旧 wording（「連言。今日はほぼ到達不能」）は R2/R3 到達性を明示していなかったため誤読余地があり、上記のように code 参照付きで rewrite した。
 
 #### 候補 α: fallback を `head_pushed_at` に替える
 
