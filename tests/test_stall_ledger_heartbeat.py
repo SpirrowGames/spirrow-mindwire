@@ -220,6 +220,69 @@ class TestStateDerivation:
 
 
 # --------------------------------------------------------------------------- #
+# Empty-sources trap — PR-gate msg-2699 (Tier B on #237, round 3):
+#
+# ``all(...)`` over an empty iterable is vacuously True, so an empty sources
+# tuple would slip through the state derivation as ``idle``. Two layers
+# defend against this:
+#
+#   1. Construction refuses to build such a record (fail-fast on config bug).
+#   2. ``derive_state`` returns ``INGEST_FAILURE`` if it ever sees one
+#      anyway — the state derivation is correct on its own, independent of
+#      construction rules that a future refactor might loosen.
+#
+# Regression pins for both layers below.
+# --------------------------------------------------------------------------- #
+
+
+class TestEmptySourcesTrap:
+    def test_construction_rejects_empty_sources(self) -> None:
+        """PR-gate msg-2699 regression pin: HeartbeatRecord.__post_init__
+        MUST refuse to build a record with zero sources. The config bug
+        gets surfaced at construction, not laundered into a false ``idle``.
+        """
+
+        with pytest.raises(ValueError, match="sources tuple is empty"):
+            HeartbeatRecord(
+                evaluated_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+                input_format_version="v1",
+                sources=(),
+                observed_format_versions={},
+            )
+
+    def test_derive_state_on_empty_sources_is_ingest_failure(self) -> None:
+        """Defence in depth: if a future refactor allows an empty-sources
+        record (e.g. via lazy discovery), the state derivation must still
+        return INGEST_FAILURE rather than the vacuous ``all(...) == True``
+        that gives ``idle``.
+
+        Uses ``object.__setattr__`` to bypass the frozen invariant and
+        prove the derivation itself is correct on its own — the test is
+        ABOUT the derivation, not about construction.
+        """
+
+        # Construct a legitimate record, then bypass frozen to blank the
+        # sources. This mirrors what a broken future refactor could reach.
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
+        object.__setattr__(rec, "sources", ())
+        assert derive_state(rec) == HealthState.INGEST_FAILURE
+
+    def test_empty_sources_does_not_advance_heartbeat(self) -> None:
+        """The combined defence prevents the exact scenario PR-gate msg-2699
+        named: an empty-sources record would previously have advanced the
+        heartbeat via IDLE, silently masking the ingest pipeline collapse.
+        Now: construction rejects; even if bypassed, the derivation
+        surfaces INGEST_FAILURE, so ``advance_last_valid_ingest_at`` HOLDS.
+        """
+
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
+        object.__setattr__(rec, "sources", ())
+        prev = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+        # HOLDS at previous — does not step forward to rec.evaluated_at.
+        assert advance_last_valid_ingest_at(rec, prev) == prev
+
+
+# --------------------------------------------------------------------------- #
 # last_valid_ingest_at — msg-2692 §2: heartbeat advances only when the ingest
 # was actually valid (healthy or idle). ingest_failure holds the previous
 # value.

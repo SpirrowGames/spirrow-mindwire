@@ -231,6 +231,26 @@ class HeartbeatRecord:
     stalls: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        # PR-gate msg-2699 (Tier B on #237, round 3): a HeartbeatRecord with
+        # zero sources is a configuration bug, not a state anyone can
+        # respond to. Rejecting at construction closes the "empty tuple
+        # slips through" path — see ``derive_state`` for the belt-and-braces
+        # second layer of the same defence, and the module test-suite for
+        # both regression pins. The rule this refuses to accept: a record
+        # whose ``sources`` is empty has NOTHING to be healthy or idle
+        # about, and ``all(...)`` over an empty iterable is True — so
+        # without this raise, a config error would silently render as
+        # ``idle`` and advance the heartbeat, which is the exact silent
+        # failure this thread was born to eliminate.
+        if not self.sources:
+            raise ValueError(
+                "HeartbeatRecord: sources tuple is empty. A heartbeat with no "
+                "sources cannot be healthy, idle, or ingest_failure — it is "
+                "not a valid state. If your caller has no sources to check, "
+                "surface that upstream as a configuration failure; do not "
+                "materialise a bare record and expect the state machine to "
+                "carry the missing information."
+            )
         # Every source that reports must have a matching observed_format_versions
         # entry — the version stamp is a REQUIRED part of the source report,
         # not an optional add-on. Making the two fields separate keeps the
@@ -292,6 +312,13 @@ def derive_state(record: HeartbeatRecord) -> HealthState:
 
     Evaluation order matters:
 
+        0. sources tuple is empty → ``ingest_failure`` (defence in depth for
+           PR-gate msg-2699). Under normal construction this is unreachable —
+           ``HeartbeatRecord.__post_init__`` refuses to build such a record
+           — but the derivation stands on its own: ``all(...)`` over an
+           empty iterable is vacuously True, and reading that as ``idle``
+           would silently advance the heartbeat and mask the loss of the
+           ingest pipeline. Belt AND braces.
         1. ANY source is failing → ``ingest_failure``.
         2. All ok, all examined == 0 → ``idle``.
         3. Otherwise → ``healthy``.
@@ -302,6 +329,14 @@ def derive_state(record: HeartbeatRecord) -> HealthState:
     500 completely; enforcing failure-first surfaces the 500 EVEN when the
     other sources look healthy.
     """
+
+    # Defence in depth against PR-gate msg-2699. Construction already
+    # refuses empty sources; if a future refactor loosens that (e.g.
+    # allows lazy source discovery), this branch keeps the state
+    # derivation correct — a record with no sources cannot be healthy or
+    # idle; it must be a failure.
+    if not record.sources:
+        return HealthState.INGEST_FAILURE
 
     if record.failing_sources():
         return HealthState.INGEST_FAILURE
