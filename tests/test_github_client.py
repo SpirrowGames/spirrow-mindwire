@@ -781,6 +781,7 @@ def _rollup_payload(
     pushed: str | None = None,
     updated: str | None = "2026-09-08T21:33:42Z",
     contexts: list[dict[str, Any]] | None = None,
+    has_next_page: bool = False,
 ) -> dict[str, Any]:
     """A GraphQL response shaped exactly like the one measured against #236 on 2026-09-09."""
     return {
@@ -796,7 +797,10 @@ def _rollup_payload(
                                     "committedDate": committed,
                                     "pushedDate": pushed,
                                     "statusCheckRollup": {
-                                        "contexts": {"nodes": contexts if contexts else []}
+                                        "contexts": {
+                                            "pageInfo": {"hasNextPage": has_next_page},
+                                            "nodes": contexts if contexts else [],
+                                        }
                                     },
                                 }
                             }
@@ -983,3 +987,54 @@ async def test_fetch_check_rollup_distinguishes_measured_empty_from_unread() -> 
     async with _rollup_client(payload) as client:
         rollup = await client.fetch_check_rollup(_PR)
     assert rollup is not None and rollup.rows == ()
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_returns_none_when_contexts_are_truncated() -> None:
+    # The failure this guard exists for is silent and looks like success: past the 100-context
+    # window GitHub drops the rest, so a build whose 101st check is still queued (or red) arrives
+    # as 100 rows that are all completed and all green. gate_admission would read _concluded=True
+    # and _red=False off that and fire R7 "CI green: fresh gate" on a build it never saw the end
+    # of. So the payload below is deliberately *perfect* — every present row concluded+success —
+    # and the only thing wrong with it is the cursor.
+    green = [
+        {
+            "__typename": "CheckRun",
+            "name": f"shard-{i}",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "startedAt": "2026-09-08T21:28:18Z",
+        }
+        for i in range(100)
+    ]
+    async with _rollup_client(_rollup_payload(contexts=green, has_next_page=True)) as client:
+        assert await client.fetch_check_rollup(_PR) is None
+
+    # Negative control: the identical 100 rows with the cursor down are read, not refused. This
+    # is what pins the refusal to hasNextPage rather than to "many rows" or "a full window".
+    async with _rollup_client(_rollup_payload(contexts=green, has_next_page=False)) as client:
+        rollup = await client.fetch_check_rollup(_PR)
+    assert rollup is not None
+    assert len(rollup.rows) == 100
+    assert all(r.status == "completed" and r.conclusion == "success" for r in rollup.rows)
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_query_asks_for_the_page_cursor() -> None:
+    # Byte-form pin, same reason as the ci-route marker's: the truncation guard above is only
+    # reachable if the request actually selects pageInfo. A payload fixture cannot notice that
+    # the real query stopped asking — the field would simply be absent, ``page`` would be None,
+    # and the guard would go quiet while still passing every test that feeds it a fixture.
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen["query"] = json.loads(request.content)["query"]
+        return httpx.Response(200, json=_rollup_payload())
+
+    async with _client(handler) as client:
+        assert await client.fetch_check_rollup(_PR) is not None
+    # Pinned adjacent to first:100 on purpose: the window and the cursor that detects its
+    # overflow are one decision, and a future edit that changes the window must meet this line.
+    assert "contexts(first:100){pageInfo{hasNextPage} nodes{" in seen["query"]

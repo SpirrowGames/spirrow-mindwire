@@ -684,9 +684,15 @@ class GitHubClient:
         commit clock), and REST has no field for the head's push time at all.
 
         **``None`` means "not read", never "no checks".** Every failure path -- transport, non-2xx,
-        unparseable body, and *a GraphQL ``errors`` array alongside partial data* -- returns
-        ``None`` so the caller can tell an unread rollup from a measured-empty one
-        (:class:`CheckRollup`). The partial-data case is not hypothetical: the sibling
+        unparseable body, *a GraphQL ``errors`` array alongside partial data*, and *a ``contexts``
+        page that reports ``hasNextPage``* -- returns ``None`` so the caller can tell an unread
+        rollup from a measured-empty one (:class:`CheckRollup`). The last one is a partial read
+        wearing the shape of a complete one: past 100 contexts the window drops the rest, so a
+        build whose 101st check is pending or red would read as concluded-and-green. The page is
+        refused rather than paginated -- the whole sweep fleet measures 6 contexts at most -- and
+        refusing costs one deferral the caller would have taken anyway before this was wired.
+
+        The partial-data case is not hypothetical: the sibling
         :meth:`_fetch_ci_status_graphql` omits ``contexts`` precisely because asking for them
         "returns partial data plus a ``FORBIDDEN`` error entry on exactly the private repos this
         fallback exists for". This method *must* ask for them, so instead of parsing a half-error
@@ -724,7 +730,7 @@ class GitHubClient:
             "repository(owner:$owner,name:$name){"
             "pullRequest(number:$number){headRefOid updatedAt "
             "commits(last:1){nodes{commit{committedDate pushedDate "
-            "statusCheckRollup{contexts(first:100){nodes{__typename "
+            "statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename "
             "... on CheckRun{name status conclusion startedAt} "
             "... on StatusContext{context state createdAt}}}}}}}}}}"
         )
@@ -785,6 +791,19 @@ class GitHubClient:
             return None
         rollup = commit.get("statusCheckRollup")
         contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+        page = contexts.get("pageInfo") if isinstance(contexts, dict) else None
+        if isinstance(page, dict) and page.get("hasNextPage") is True:
+            # Only an explicit hasNextPage=true refuses. A *null* statusCheckRollup leaves ``page``
+            # None and must still fall through to a measured-empty CheckRollup(rows=()) -- see
+            # test_fetch_check_rollup_distinguishes_measured_empty_from_unread. Absent contexts is
+            # not a truncated page, and conflating the two would take "no CI configured" away from
+            # R1a / R1b.
+            logger.warning(
+                "fetch_check_rollup: >100 check contexts on %s; rollup truncated "
+                "(unread; caller keeps its pre-gate default)",
+                head_sha[:12],
+            )
+            return None
         raw_nodes = contexts.get("nodes") if isinstance(contexts, dict) else None
         rows = tuple(
             row
