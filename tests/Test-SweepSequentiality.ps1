@@ -88,29 +88,42 @@
 #
 #     Measured 2026-09-08 against deploy/run-conductor-scheduled.ps1 as
 #     committed in 014a665 (the last commit to touch that file; this PR
-#     does not modify it). msg-624/625 §2a re-audit; in-memory mutation,
-#     working tree byte-for-byte unmodified before and after:
+#     does not modify it). Runner is an in-memory replica implementing
+#     L1/S1-S4/L2a/L2b/L2c of the pin — L3b and L3d are not implemented
+#     in the runner. msg-624/625 §2a re-audit; working tree byte-for-
+#     byte unmodified before and after:
 #
 #       DUPLICATION side — pin misses, as documented:
 #         msg-595's verbatim incremental-duplication mutation
 #           if ($cand.slow) { $jobs += Start-Job -FilePath $inner; continue }
-#         inserted above the pinned spawn line: pin GREEN, empty hit
-#         list (no rule fired). Consistent with Bohr msg-595 which
-#         measured the same GREEN at 38b2fd6.
+#         inserted above the pinned spawn line: replica GREEN. No rule
+#         of the replicated pin logic (L1/L2a/L2b/L2c) fired. Whether
+#         the pin's L3b/L3d ALSO pass silently on this mutation is not
+#         measured here; those two rules were not exercised by the
+#         runner and their behaviour on `Start-Job -FilePath $inner`
+#         is not part of this record.
+#         Bohr msg-595 measured the same duplication GREEN at 38b2fd6
+#         against the full pin — that is cross-version agreement (the
+#         pin was rewritten in 9ed8a82 and again in 014a665 between
+#         msg-595 and this measurement), not replication.
 #
-#       RESHAPE side — pin catches, on the same suite invocation:
+#       RESHAPE side — replica catches, on the same runner invocation:
 #         wrapping the spawn in `Start-Job -ScriptBlock { & $inner *>&1 }`:
-#           pin RED via L2c-sbe (ScriptBlockExpressionAst).
+#           replica RED via L2c-sbe (ScriptBlockExpressionAst detector).
 #         wrapping the spawn in `ForEach-Object -Parallel { & $inner *>&1 }`:
-#           pin RED via L2c-sbe.
+#           replica RED via L2c-sbe.
 #         wrapping the spawn in
 #         `[System.Threading.Tasks.Task]::Run({ & $inner *>&1 })`:
-#           pin RED via L2c-sbe.
+#           replica RED via L2c-sbe.
 #
-#     The boundary is therefore measured on both sides, not inferred from
-#     code — an incremental duplication is invisible to every rule in
-#     this file, and each of the three shapes L2c's comment names is
-#     caught only when it wraps the existing spawn.
+#     The boundary is therefore measured against the four-rule replica
+#     on both sides. The reshape-RED results license claims about the
+#     pin itself because the replica mirrors L2c's implementation at
+#     lines 396-428 (structural read-back anchors the replica to the
+#     pin). The duplication-GREEN result licenses a claim about the
+#     replica, not about L3b and L3d — a reader wanting the wider
+#     assertion should run the full pin suite against the mutation
+#     rather than infer it from the four-rule result.
 #
 #     Four closures were evaluated. The reason each was refused lives
 #     here so a re-open does not pay the measurement twice:
