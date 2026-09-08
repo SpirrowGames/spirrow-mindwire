@@ -36,6 +36,8 @@ from urllib.parse import quote
 
 import httpx
 
+from ..gate_admission import CheckRow
+
 _DEFAULT_API_BASE = "https://api.github.com"
 _DEFAULT_TIMEOUT_SECONDS = 60.0
 
@@ -209,6 +211,63 @@ class ReviewInfo:
     state: str  # APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED / PENDING
     commit_id: str | None  # the head SHA the review was submitted against
     submitted_at: str | None
+
+
+@dataclass(frozen=True)
+class CheckRollup:
+    """The four facts :func:`~spirrow_mindwire.gate_admission.gate_admission` needs about a head.
+
+    Constructed **only when the read succeeded**, which is the whole point of the type.
+    :func:`gate_admission`'s ``rollup`` parameter documents that "the caller must not conflate
+    'empty' with 'not yet fetched' — a failed fetch should be raised at the caller, not passed in
+    as empty", because an unread rollup passed in as ``[]`` would be judged by R1a / R1b (a
+    CheckSuite-startup race, or "no CI configured") instead of by the caller's own error policy.
+    :meth:`GitHubClient.fetch_check_rollup` therefore returns ``None`` on every failure and a
+    ``CheckRollup`` only on success, so an empty ``rows`` is always a *measured* empty.
+
+    ``head_pushed_at`` is the best available proxy for "when this SHA first appeared at head",
+    per :func:`gate_admission`'s documented preference order. See
+    :meth:`GitHubClient.fetch_check_rollup` for which element of that order this build actually
+    gets, and the measurement behind it.
+    """
+
+    head_sha: str
+    head_committed_date: datetime
+    head_pushed_at: datetime
+    rows: tuple[CheckRow, ...]
+
+
+#: GraphQL ``CheckStatusState`` / ``StatusState`` are SCREAMING_CASE while
+#: :mod:`~spirrow_mindwire.gate_admission` compares against lowercase
+#: (:data:`~spirrow_mindwire.gate_admission.COMPLETED`,
+#: :data:`~spirrow_mindwire.gate_admission.RED_CONCLUSIONS`). Normalising by ``.lower()`` rather
+#: than by a lookup table is deliberate: every red conclusion GitHub can emit
+#: (``FAILURE`` / ``TIMED_OUT`` / ``CANCELLED`` / ``ACTION_REQUIRED`` / ``STARTUP_FAILURE``)
+#: lowercases exactly onto a member of ``RED_CONCLUSIONS``, and a conclusion GitHub adds later
+#: lowercases onto a string that is simply not in that frozenset — i.e. it reads as *not red*,
+#: which matches ``_red``'s own treatment of an unknown conclusion. A table would have to be
+#: edited to stay correct; this cannot drift.
+#:
+#: ``StatusContext`` (the legacy commit-status variant) has no status/conclusion pair at all,
+#: only a ``state``. These two maps project it onto the pair so one :class:`CheckRow` shape
+#: covers both variants, exactly as :class:`CheckRow`'s docstring says the caller must.
+_STATUS_CONTEXT_STATUS: dict[str, str] = {
+    "SUCCESS": "completed",
+    "FAILURE": "completed",
+    "ERROR": "completed",
+    "PENDING": "pending",
+    "EXPECTED": "pending",
+}
+_STATUS_CONTEXT_CONCLUSION: dict[str, str | None] = {
+    "SUCCESS": "success",
+    "FAILURE": "failure",
+    # GitHub's ``ERROR`` is a hard failure of the reporting integration, not a soft warning;
+    # ``_GRAPHQL_ROLLUP_STATES`` above already folds it into FAILURE for the aggregate read and
+    # this keeps the per-row view consistent with it.
+    "ERROR": "failure",
+    "PENDING": None,
+    "EXPECTED": None,
+}
 
 
 # Run conclusions that count as "not a failure" (ADR-16 §D-4 state mapping).
@@ -616,6 +675,129 @@ class GitHubClient:
             _required_workflows_from_env(),
         )
 
+    async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup | None:
+        """The head SHA + per-check rows + both clocks :func:`gate_admission` needs, or ``None``.
+
+        One GraphQL request, which is the budget design v0.3.1 §A-2 sized for this read ("the
+        trade -- one extra ``gh`` read per tick -- is deliberate"). The REST equivalent is three
+        (``/pulls/{n}`` for the head, ``/actions/runs`` for the rows, ``/commits/{sha}`` for the
+        commit clock), and REST has no field for the head's push time at all.
+
+        **``None`` means "not read", never "no checks".** Every failure path -- transport, non-2xx,
+        unparseable body, and *a GraphQL ``errors`` array alongside partial data* -- returns
+        ``None`` so the caller can tell an unread rollup from a measured-empty one
+        (:class:`CheckRollup`). The partial-data case is not hypothetical: the sibling
+        :meth:`_fetch_ci_status_graphql` omits ``contexts`` precisely because asking for them
+        "returns partial data plus a ``FORBIDDEN`` error entry on exactly the private repos this
+        fallback exists for". This method *must* ask for them, so instead of parsing a half-error
+        response it refuses it. The conductor's fail direction for ``None`` is its pre-wiring
+        behaviour (fire the gate), so a repo where this read is forbidden is exactly as it was.
+
+        **Which clocks this returns, and what was measured (2026-09-09,
+        ``SpirrowGames/spirrow-mindwire#236`` @ ``703b836``).**
+
+        * ``head_committed_date`` <- ``commit.committedDate``. Exact. (Cross-checked against REST
+          ``/commits/{sha}``: both ``2026-09-08T21:27:42Z``.)
+        * ``head_pushed_at`` <- ``commit.pushedDate`` if non-null, else the PR's ``updatedAt``.
+          :func:`gate_admission` documents the preference order as ``pushedDate`` -> REST
+          ``head.repo.pushed_at`` -> REST ``updated_at``. **``pushedDate`` measured null** (GitHub
+          stopped populating it), so the second element decides in practice -- and the middle one
+          is skipped on measurement, not on convenience: ``head.repo.pushed_at`` is a
+          *repository*-level field that moves when any branch is pushed. On the same PR it read
+          ``21:47:09Z`` against a true push at ``~21:28:16Z`` (the CI run's ``created_at``) and a
+          PR ``updatedAt`` of ``21:33:42Z`` -- i.e. the repo field was the *further* of the two
+          from the fact being estimated, so taking it in preference would be worse, not more
+          faithful.
+
+        The residual in that substitution is stated here rather than smoothed over, because it
+        biases one rule: ``updatedAt`` is an upper bound on the push time (pushing the head
+        updates the PR, but so does a comment or a label), so ``push_age`` is under-estimated and
+        R1a's grace window can be re-entered by any PR event. On a PR that genuinely has no CI
+        configured, an event inside the window re-opens the grace instead of letting R1b conclude
+        "no CI". The direction is the safe one -- DEFER (no model call, no thread record) rather
+        than a spurious INVOKE -- and it is bounded by the next tick after the window, but it is a
+        real difference from what the design assumed it would be reading, so the wiring PR
+        reports it rather than the register absorbing it silently.
+        """
+        query = (
+            "query($owner:String!,$name:String!,$number:Int!){"
+            "repository(owner:$owner,name:$name){"
+            "pullRequest(number:$number){headRefOid updatedAt "
+            "commits(last:1){nodes{commit{committedDate pushedDate "
+            "statusCheckRollup{contexts(first:100){nodes{__typename "
+            "... on CheckRun{name status conclusion startedAt} "
+            "... on StatusContext{context state createdAt}}}}}}}}}}"
+        )
+        variables: dict[str, Any] = {"owner": pr.owner, "name": pr.repo, "number": pr.number}
+        try:
+            resp = await self._client.post(
+                "/graphql", json={"query": query, "variables": variables}
+            )
+        except httpx.RequestError as exc:
+            logger.warning(
+                "fetch_check_rollup: %s (unread; caller keeps its pre-gate default)", exc
+            )
+            return None
+        if resp.status_code >= 400:
+            logger.warning(
+                "fetch_check_rollup: -> %s (unread; caller keeps its pre-gate default)",
+                resp.status_code,
+            )
+            return None
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            logger.warning("fetch_check_rollup: malformed JSON: %s (unread)", exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("errors"):
+            # Partial data + an errors array. Refused rather than parsed -- see the docstring.
+            errors = payload.get("errors")
+            first = errors[0] if isinstance(errors, list) and errors else None
+            logger.warning(
+                "fetch_check_rollup: GraphQL returned errors (%s); treating the rollup as "
+                "unread rather than as a measured-empty one",
+                _error_element(first) or "unspecified",
+            )
+            return None
+        try:
+            pull = payload["data"]["repository"]["pullRequest"]
+            head_sha = str(pull["headRefOid"])
+            nodes = pull["commits"]["nodes"]
+            commit = nodes[0]["commit"] if nodes else None
+        except (KeyError, TypeError, IndexError) as exc:
+            logger.warning("fetch_check_rollup: cannot parse: %s (unread)", exc)
+            return None
+        if not head_sha or not isinstance(commit, dict):
+            return None
+        committed = _parse_github_timestamp(commit.get("committedDate"))
+        if committed is None:
+            # The commit clock is ci_clock_start's last resort and is guaranteed to exist on any
+            # commit; if it did not parse, the input to admission would be incomplete. Refuse.
+            logger.warning("fetch_check_rollup: no committedDate on %s (unread)", head_sha[:12])
+            return None
+        pushed = _parse_github_timestamp(commit.get("pushedDate")) or _parse_github_timestamp(
+            pull.get("updatedAt")
+        )
+        if pushed is None:
+            logger.warning("fetch_check_rollup: no push clock for %s (unread)", head_sha[:12])
+            return None
+        rollup = commit.get("statusCheckRollup")
+        contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+        raw_nodes = contexts.get("nodes") if isinstance(contexts, dict) else None
+        rows = tuple(
+            row
+            for row in (_check_row(node) for node in (raw_nodes or []) if isinstance(node, dict))
+            if row is not None
+        )
+        return CheckRollup(
+            head_sha=head_sha,
+            head_committed_date=committed,
+            head_pushed_at=pushed,
+            rows=rows,
+        )
+
     async def fetch_pr_state(self, pr: PrRef) -> PrState:
         """``GET /repos/{owner}/{repo}/pulls/{n}`` → terminality facts for the sweep's S0.
 
@@ -743,6 +925,46 @@ class GitHubClient:
         except ValueError as exc:
             raise GitHubHTTPError(f"POST {path} (review): malformed JSON: {exc}") from exc
         return body_json if isinstance(body_json, dict) else {"raw": body_json}
+
+
+def _check_row(node: dict[str, Any]) -> CheckRow | None:
+    """One ``statusCheckRollup.contexts`` node -> a :class:`CheckRow`, or ``None`` if unusable.
+
+    Handles both union members. ``CheckRun`` maps field-for-field (lowercased -- see the comment
+    on :data:`_STATUS_CONTEXT_STATUS` for why lowercasing beats a lookup table);
+    ``StatusContext`` carries only a ``state``, which the two projection maps turn into the
+    status/conclusion pair :class:`CheckRow` is defined in terms of.
+
+    An unknown ``__typename`` returns ``None`` -- dropped rather than guessed. Dropping is the
+    conservative direction for both rules a row can influence: a dropped row cannot hold
+    ``_concluded`` false (it could only ever have *delayed* the gate) and cannot make ``_red``
+    true (it could only ever have *withheld* an INVOKE). A row shaped unexpectedly must not be
+    able to invent a red CI and route an implementer at it.
+    """
+    typename = node.get("__typename")
+    if typename == "CheckRun":
+        conclusion_raw = node.get("conclusion")
+        return CheckRow(
+            name=str(node.get("name") or "<unnamed check>"),
+            status=str(node.get("status") or "").lower(),
+            conclusion=str(conclusion_raw).lower() if conclusion_raw else None,
+            started_at=_parse_github_timestamp(node.get("startedAt")),
+            # CheckRun has no ``createdAt`` in the GraphQL schema; CheckRow's contract already
+            # says a row may contribute nothing to the clock, and a queued run is exactly that.
+            created_at=None,
+        )
+    if typename == "StatusContext":
+        state = str(node.get("state") or "").upper()
+        if state not in _STATUS_CONTEXT_STATUS:
+            return None
+        return CheckRow(
+            name=str(node.get("context") or "<unnamed status>"),
+            status=_STATUS_CONTEXT_STATUS[state],
+            conclusion=_STATUS_CONTEXT_CONCLUSION[state],
+            started_at=None,
+            created_at=_parse_github_timestamp(node.get("createdAt")),
+        )
+    return None
 
 
 def _parse_github_timestamp(raw: object) -> datetime | None:

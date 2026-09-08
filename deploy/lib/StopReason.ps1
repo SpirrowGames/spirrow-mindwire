@@ -26,6 +26,18 @@
 # the notification surface instead of a silent regression back to "判断待ち" — the whole
 # problem this file exists to end.
 #
+# The DELIBERATELY-SILENT set (absent from the map on purpose, so no notification fires):
+#   'none'    — the thread settled; the normal end, the sweep just moves on.
+#   'hold'    — the operator asked for the stop; telling them about it is not news.
+#   'ci_wait' — pre-gate CI-wait admission DEFERred (design v0.3.1 §5.2A, R1a/R2): CI on the PR
+#               head has not concluded and the wait budget has not run out. Waking a person to
+#               say "CI is still running" is precisely the class of stop §5.2A exists to remove
+#               (its own table counts three such stops on #222 and targets zero), and the wait
+#               is bounded by CAP_CHECK / CAP_NOCLOCK — past the cap admission returns
+#               'human' via R3, which IS in the map above.
+# This set is not a narrowing of the notification predicate (note 1): every reason that means
+# "the loop parked and needs a person" is still in the map. Do not add 'ci_wait' to it.
+#
 # NO TOP-LEVEL SIDE EFFECTS: this file is dot-sourced by both the runner and the tests, so
 # any assignment at script scope here would mutate the caller's scope. Do NOT set
 # $ErrorActionPreference here (PR-gate finding on #172): the runner already declares its own
