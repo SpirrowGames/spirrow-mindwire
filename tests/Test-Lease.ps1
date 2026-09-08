@@ -24,6 +24,47 @@
 # Queue sections (Get-NextLeaseWaiter, Invoke-LeasePromotion, Remove-IneligibleLeaseWaiters,
 # Invoke-LeaseGrantFromEmpty) will be added in PR 3. Wrapper AST checks land in PR 4 with the
 # state-machine wiring.
+#
+# ---------------------------------------------------------------------------------------------
+# PR 3 PIN CHECKLIST — this list is the durable materialisation of the msg-2644 §4 pin table
+# (Bohr, T-exclusive-resource-lease-queue) plus Einstein's msg-2645 addition, promoted by the
+# human's msg-2653 Tier-C ruling out of the chat log and into the test file so PR 3 cannot
+# silently drop any item. Each row is expected to become one (or more) real Check pins in this
+# file when PR 3 lands. Any row that PR 3 decides NOT to implement MUST be justified in the
+# PR body and this comment updated in the same PR — silent deletion is the msg-923 failure
+# this whole feature exists to prevent.
+#
+#   #1  end-to-end grant order — real grant FIFO across candidates (msg-1958 §5).
+#   #2  no-steal invariant preserved in the grant path (msg-1958 §5).
+#   #3  expiry -> reclaim -> next-waiter grant ordering (msg-1958 §5).
+#   #4  TOCTOU pin — 'available' verdict followed by a competing acquire, our acquire is
+#       refused by the no-steal throw (msg-1960 §5). Proves the "acquire MAY fail after
+#       'available'" clause in Test-LeaseAvailableFor's docstring is load-bearing.
+#   #5  acquire failure -> caller does NOT launch and DOES call Register-LeaseWaiter
+#       (msg-1960 §5). Contract lives in PR 3 docstrings even though the live wrapper path
+#       lands in PR 4.
+#   #6  acquire-side fail-closed validation — Invoke-LeaseAcquire MUST throw on multi-element
+#       array / hashtable / integer $Requires, and the pin MUST cover a direct-acquire path
+#       that does NOT go through Test-LeaseAvailableFor (msg-1961; msg-2189 for symmetry).
+#   #7  ordering pin — inject a spy/stub for the un-rollbackable side-effect commands and
+#       assert `called times = 0` on the acquire-failure path (msg-2644 §3).
+#   #8  spy/stub coverage documentation — item #7's assertion is a NEGATIVE check bound to
+#       SPECIFIC command names. In the test file itself, immediately next to the spy/stub
+#       pin, list EVERY command name the pin actually guards (msg-2645 advisory, promoted
+#       by msg-2653 Tier-C). At time of writing the known name is Invoke-HeadSkipCommitLaunch;
+#       PR 3 MUST enumerate any additional un-rollbackable commands reachable from the
+#       candidate loop (Update-LoopControlState, process-launch shims, sweep-state writers,
+#       ...) or explicitly note "no other un-rollbackable commands reachable at PR 3 time"
+#       so a PR 4 implementer who adds one immediately sees they have widened the safety
+#       net's blind spot. Silent green under a renamed or newly-added un-rollbackable is
+#       the failure mode this item exists to catch.
+#
+# Two rows land outside this test file:
+#   - #5's contract text belongs in Test-LeaseAvailableFor's .OUTPUTS docstring in
+#     deploy/lib/Lease.ps1 (msg-1960 §3 wording; msg-2644 §2 ordering wording).
+#   - #6's fail-closed validation lives in Invoke-LeaseAcquire's parameter section in
+#     deploy/lib/Lease.ps1 (mirror of Test-LeaseAvailableFor's msg-2189 fix).
+# The rest are pins that PR 3 adds to THIS file.
 
 $ErrorActionPreference = "Stop"
 

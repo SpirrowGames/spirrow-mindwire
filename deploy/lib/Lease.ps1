@@ -104,6 +104,17 @@
 # Promotion / grant-from-empty / scrub still live in PR 3, and the wrapper AST wiring + the
 # probe activation land in PR 4.
 #
+# PR 3 open items that land in THIS file (not the test file): the acquire-side fail-closed
+# validation on Invoke-LeaseAcquire (mirror of the msg-2189 fix on Test-LeaseAvailableFor —
+# multi-element array / hashtable / integer $Requires MUST throw, including on the direct-
+# acquire path that never calls Test-LeaseAvailableFor; msg-1961) and the .OUTPUTS docstring
+# on Test-LeaseAvailableFor that spells out the asymmetric contract 'available' = advisory
+# predicate, 'waiting' = binding, 'held-by-self' = re-entrant idempotent (msg-1960 §3), plus
+# the ORDERING REQUIREMENT wording that acquire MUST succeed BEFORE any un-rollbackable side
+# effect (msg-2644 §2 supersedes the earlier "lease check before Invoke-HeadSkipCommitLaunch"
+# phrasing that failed to distinguish predicate from mutation). The full PR 3 pin checklist
+# lives at the top of tests/Test-Lease.ps1 — do not fork the list here.
+#
 # THE READER COLLAPSE (msg-2151 measurement + msg-2172 Tier-C, 2026-08-28). Get-JsonState is now
 # the CANONICAL state-file reader for the whole runner. The wrapper's previous inline
 # Get-JsonState is gone; the wrapper dot-sources this file and calls THIS function for every
