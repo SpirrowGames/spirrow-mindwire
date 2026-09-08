@@ -1,0 +1,31 @@
+{
+  "id": "M-1",
+  "title": "handoff field null flipped explicit NEXT: Heisenberg to human-parked",
+  "observed_by": "operator",
+  "observed_at": "2026-08-30T07:59Z",
+  "spec_thread": "T-stalled-pr-has-no-detector",
+  "spec_msg_ids": ["msg-2354"],
+  "provenance": {
+    "source": "conductor log + PR #199 / #200 head timestamps",
+    "captured_at": "2026-09-08T00:00Z",
+    "captured_by": "operator lane, msg-2354 §1 M-1"
+  },
+  "predicate_input": {
+    "kind": "pr",
+    "identifier": "spirrow-mindwire#199",
+    "pr_state": {
+      "is_open": true,
+      "is_draft": false,
+      "has_verdict": true,
+      "verdict_is_request_changes": true,
+      "verdict_recorded_as_indefinite_input": false,
+      "merge_state_is_executable": true,
+      "is_approve_awaiting_human_merge": false
+    },
+    "n_threshold_hours": 12,
+    "hours_since_last_participant_motion": 60
+  },
+  "expected_verdict": "stall",
+  "not_representable_reason": null,
+  "notes": "conductor stopped: reason=human rounds=0 last_msg=msg-2139. head_skip DEFER (attempts=38). Verdict-carrying PR whose next actor was never launched — the classifier's needs_actor_pr returns True on verdict_is_request_changes, and stalled(now - last_participant_motion > 12h) fires. Representable in v1 schema."
+}
