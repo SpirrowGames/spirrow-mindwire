@@ -46,10 +46,9 @@
 #         spawn's ancestors and nothing else in the body. It catches
 #         parallelization that MOVES `& $inner` into a script block; it
 #         does NOT catch DUPLICATION (a launch path added BESIDE the
-#         pinned spawn), and nothing else in this suite does either. See
-#         the "Spawn DUPLICATION" bullet in "Explicitly NOT covered here"
-#         for the design record (options considered, why each was refused,
-#         measured cost of the extraction option).
+#         pinned spawn). See the "Spawn DUPLICATION" bullet in
+#         "Explicitly NOT covered here" for the design record and the
+#         measured evidence (both sides of the boundary tabulated).
 #           * the walk reaches $dispatchLoop (not stopped by anything else),
 #           * no ancestor PipelineAst has .Background,
 #           * no ancestor is a ScriptBlockExpressionAst passed as a command
@@ -86,6 +85,32 @@
 #     spawn, so it catches parallelization that MOVES `& $inner` into a
 #     script block, and does not see a second launch path adjacent to it.
 #     Thread: T-sweep-pin-blind-to-launch-paths-added-beside-the-spawn.
+#
+#     Measured 2026-09-08 against deploy/run-conductor-scheduled.ps1 as
+#     committed in 014a665 (the last commit to touch that file; this PR
+#     does not modify it). msg-624/625 §2a re-audit; in-memory mutation,
+#     working tree byte-for-byte unmodified before and after:
+#
+#       DUPLICATION side — pin misses, as documented:
+#         msg-595's verbatim incremental-duplication mutation
+#           if ($cand.slow) { $jobs += Start-Job -FilePath $inner; continue }
+#         inserted above the pinned spawn line: pin GREEN, empty hit
+#         list (no rule fired). Consistent with Bohr msg-595 which
+#         measured the same GREEN at 38b2fd6.
+#
+#       RESHAPE side — pin catches, on the same suite invocation:
+#         wrapping the spawn in `Start-Job -ScriptBlock { & $inner *>&1 }`:
+#           pin RED via L2c-sbe (ScriptBlockExpressionAst).
+#         wrapping the spawn in `ForEach-Object -Parallel { & $inner *>&1 }`:
+#           pin RED via L2c-sbe.
+#         wrapping the spawn in
+#         `[System.Threading.Tasks.Task]::Run({ & $inner *>&1 })`:
+#           pin RED via L2c-sbe.
+#
+#     The boundary is therefore measured on both sides, not inferred from
+#     code — an incremental duplication is invisible to every rule in
+#     this file, and each of the three shapes L2c's comment names is
+#     caught only when it wraps the existing spawn.
 #
 #     Four closures were evaluated. The reason each was refused lives
 #     here so a re-open does not pay the measurement twice:
