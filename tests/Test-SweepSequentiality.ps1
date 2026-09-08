@@ -56,7 +56,9 @@
 #             -Parallel { … }`, `[Task]::Run({ … })`, etc. are caught by
 #             this ONLY when the mutation reshapes the existing spawn into
 #             one of them; the same shapes added as a SECOND launch path
-#             beside `& $inner` are NOT reached by this walk.
+#             beside `& $inner` are NOT reached by this walk. They may
+#             still be caught by a DIFFERENT rule — see the bullet; the
+#             uncovered set is narrower than "duplication".
 #
 #   L3b — inside the dispatch body, every InvokeMemberExpressionAst whose
 #         target is a TypeExpressionAst (i.e. every `[Type]::Method(...)`
@@ -79,21 +81,32 @@
 #     Parameters cannot be verified statically (splatting, conditional
 #     assignment), and a check that green-lights a construct it did not
 #     actually inspect is worse than one that never looked.
-#   * Spawn DUPLICATION — a launch path added BESIDE the pinned spawn
-#     (e.g. keeping the sync path and adding `$jobs += Start-Job -FilePath
-#     $inner` on a branch). L2c walks the ancestor chain of the EXISTING
-#     spawn, so it catches parallelization that MOVES `& $inner` into a
-#     script block, and does not see a second launch path adjacent to it.
+#   * Spawn DUPLICATION spelled as a PLAIN CMDLET TAKING A PATH — a launch
+#     path added BESIDE the pinned spawn (e.g. keeping the sync path and
+#     adding `$jobs += Start-Job -FilePath $inner` on a branch). L2c walks
+#     the ancestor chain of the EXISTING spawn, so it catches
+#     parallelization that MOVES `& $inner` into a script block, and does
+#     not see a second launch path adjacent to it.
 #     Thread: T-sweep-pin-blind-to-launch-paths-added-beside-the-spawn.
+#
+#     The uncovered set is NARROWER than "duplication", and the narrowing
+#     is measured, not argued. A second launch path is CAUGHT whenever it
+#     is spelled with a second `& $inner` (S1 census), with a static-type
+#     invocation (L3b), or with an AST-opaque construct (L3d). What
+#     escapes is the plain-cmdlet-with-a-path spelling — `Start-Job
+#     -FilePath $inner`, `Start-Process -FilePath $inner` — which trips
+#     none of those three. That is the hole, and it is the whole hole.
 #
 #     Measured 2026-09-08 against deploy/run-conductor-scheduled.ps1 as
 #     committed in 014a665 (the last commit to touch that file; this PR
 #     does not modify it). Option 3 (msg-630 §3, msg-631 sustained): the
 #     actual pin — this file, tests/Test-SweepSequentiality.ps1 — was
 #     invoked against mutated scratch copies of the sweep script in an
-#     isolated mirror. Working tree SHA256 hashes for both files
-#     unchanged before and after (verified); scratch mirror lives under
-#     .git/mindwire-scratch/pinrun/ (untracked, disposable).
+#     isolated mirror OUTSIDE the working tree, so the pin under test is
+#     copied byte-for-byte and only the sweep copy is mutated. Working
+#     tree SHA256 hashes for both files verified unchanged before and
+#     after every row. Re-measured in full on 2026-09-08 at head cfb5eab
+#     after #241 merged (main 691309d); all rows below reproduced.
 #
 #       DUPLICATION side — pin misses, as documented:
 #         msg-595's verbatim incremental-duplication mutation
@@ -111,7 +124,10 @@
 #         and this measurement, so the miss is agreement across pin
 #         revisions rather than replication.
 #
-#       RESHAPE side — pin catches, on the same pin invocation:
+#       RESHAPE side — pin catches, on the same pin invocation. The
+#       reshape mutations REPLACE the spawn line (they do not add a
+#       line), so the S1 census stays at 1 and the verdict is reached by
+#       the named rule rather than by S1 short-circuiting:
 #         `Start-Job -ScriptBlock { & $inner *>&1 }` wrapping the spawn:
 #           pin RED, L2c fires (ScriptBlockExpressionAst on the
 #           ancestor chain).
@@ -120,14 +136,39 @@
 #         `[System.Threading.Tasks.Task]::Run({ & $inner *>&1 })` wrapping
 #         the spawn:
 #           pin RED, L2c AND L3b both fire — the Task type invocation
-#           is not on the L3b allowlist, so this reshape is double-
-#           caught (L3b would catch it even in a hypothetical L2c
-#           bypass).
+#           is not on the L3b allowlist, so this reshape is double-caught.
+#
+#       DUPLICATION side, continued — the three spellings that ARE
+#       caught, each inserted BESIDE the pinned spawn (spawn line left
+#       intact, so L2c passes in every row):
+#         `$null = [System.Threading.Tasks.Task]::Run({ Write-Host "x" })`
+#           pin RED, L3b fires ALONE (L2c passed). This is the row that
+#           makes the aggregation observable: one rule fired, no other
+#           rule fired, and the pin exited 1. "Any rule fires ⇒ RED" is
+#           therefore executed for L3b rather than assumed — the
+#           aggregation is `$script:failures` incremented by each rule and
+#           read once at the end, and L2c does not short-circuit before
+#           L3b runs.
+#         `$null = [scriptblock]::Create("Write-Host x")`
+#           pin RED, L3b AND L3d fire (L2c passed).
+#         `$null = Start-Job -ScriptBlock { & $inner *>&1 }`
+#           pin RED, S1 fires — census 2, fail-closed exit before the
+#           later rules run. A duplication that re-spells `& $inner` is
+#           caught by identity, not by any async-shape rule.
+#
+#       And the second spelling that is MISSED, confirming the hole is a
+#       spelling class and not a one-off:
+#         `$null = Start-Process -FilePath $inner` inserted beside the
+#           spawn: pin GREEN, exit 0, no rule fired — same shape as
+#           msg-595's `Start-Job -FilePath $inner`.
 #
 #     The boundary is therefore measured against the actual pin on both
-#     sides — reshape RED, duplication GREEN — with no replica, no
-#     cross-version inference, and no unexecuted assumption about how
-#     the pin aggregates rule results.
+#     sides — reshape RED, plain-cmdlet-with-a-path duplication GREEN,
+#     static-type / AST-opaque / re-spelled-`& $inner` duplication RED —
+#     with no replica and no cross-version inference. The one claim about
+#     how the pin AGGREGATES rule results (that a single firing rule is
+#     sufficient for RED) is executed for L3b in the row above and is not
+#     asserted for any rule it was not executed for.
 #
 #     Four closures were evaluated. The reason each was refused lives
 #     here so a re-open does not pay the measurement twice:
