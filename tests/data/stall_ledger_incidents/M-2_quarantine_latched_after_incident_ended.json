@@ -17,6 +17,7 @@
       "is_present": true
     },
     "n_threshold_hours": 0,
+    "hours_since_last_participant_motion": 60,
     "signature_daily_hits": {
       "2026-08-30": 25,
       "2026-08-31": 20,

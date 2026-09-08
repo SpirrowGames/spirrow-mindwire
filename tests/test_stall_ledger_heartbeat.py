@@ -19,7 +19,6 @@ from spirrow_mindwire.stall_ledger.heartbeat import (
     HealthState,
     HeartbeatRecord,
     SourceReport,
-    advance_last_valid_ingest_at,
     build_open_pr_query,
     derive_state,
     is_stale,
@@ -223,15 +222,11 @@ class TestStateDerivation:
 # Empty-sources trap — PR-gate msg-2699 (Tier B on #237, round 3):
 #
 # ``all(...)`` over an empty iterable is vacuously True, so an empty sources
-# tuple would slip through the state derivation as ``idle``. Two layers
-# defend against this:
-#
-#   1. Construction refuses to build such a record (fail-fast on config bug).
-#   2. ``derive_state`` returns ``INGEST_FAILURE`` if it ever sees one
-#      anyway — the state derivation is correct on its own, independent of
-#      construction rules that a future refactor might loosen.
-#
-# Regression pins for both layers below.
+# tuple would silently slip through as ``idle`` if not refused. Round 4
+# (msg-2702) retired the "defence in depth" branch and its corruption-based
+# tests as YAGNI: the constructor guard is the single source of truth for
+# this invariant. Guarding one invariant in two places was precisely the
+# dual-management complexity round 2 fought to eliminate.
 # --------------------------------------------------------------------------- #
 
 
@@ -240,6 +235,7 @@ class TestEmptySourcesTrap:
         """PR-gate msg-2699 regression pin: HeartbeatRecord.__post_init__
         MUST refuse to build a record with zero sources. The config bug
         gets surfaced at construction, not laundered into a false ``idle``.
+        This is the ONE place the invariant is enforced (round-4 fix).
         """
 
         with pytest.raises(ValueError, match="sources tuple is empty"):
@@ -250,75 +246,134 @@ class TestEmptySourcesTrap:
                 observed_format_versions={},
             )
 
-    def test_derive_state_on_empty_sources_is_ingest_failure(self) -> None:
-        """Defence in depth: if a future refactor allows an empty-sources
-        record (e.g. via lazy discovery), the state derivation must still
-        return INGEST_FAILURE rather than the vacuous ``all(...) == True``
-        that gives ``idle``.
-
-        Uses ``object.__setattr__`` to bypass the frozen invariant and
-        prove the derivation itself is correct on its own — the test is
-        ABOUT the derivation, not about construction.
+    def test_build_classmethod_also_rejects_empty_sources(self) -> None:
+        """The ``HeartbeatRecord.build()`` factory delegates to the raw
+        constructor, so the same empty-sources rejection applies. This
+        test is on the production entry point rather than on ``__init__``
+        directly, so a future refactor of the classmethod that skipped
+        the constructor would fail here.
         """
 
-        # Construct a legitimate record, then bypass frozen to blank the
-        # sources. This mirrors what a broken future refactor could reach.
-        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
-        object.__setattr__(rec, "sources", ())
-        assert derive_state(rec) == HealthState.INGEST_FAILURE
-
-    def test_empty_sources_does_not_advance_heartbeat(self) -> None:
-        """The combined defence prevents the exact scenario PR-gate msg-2699
-        named: an empty-sources record would previously have advanced the
-        heartbeat via IDLE, silently masking the ingest pipeline collapse.
-        Now: construction rejects; even if bypassed, the derivation
-        surfaces INGEST_FAILURE, so ``advance_last_valid_ingest_at`` HOLDS.
-        """
-
-        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
-        object.__setattr__(rec, "sources", ())
-        prev = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
-        # HOLDS at previous — does not step forward to rec.evaluated_at.
-        assert advance_last_valid_ingest_at(rec, prev) == prev
+        with pytest.raises(ValueError, match="sources tuple is empty"):
+            HeartbeatRecord.build(
+                evaluated_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+                input_format_version="v1",
+                sources=(),
+                observed_format_versions={},
+                previous_last_valid_ingest_at=None,
+            )
 
 
 # --------------------------------------------------------------------------- #
-# last_valid_ingest_at — msg-2692 §2: heartbeat advances only when the ingest
-# was actually valid (healthy or idle). ingest_failure holds the previous
-# value.
+# HeartbeatRecord.build() — msg-2692 §2 + PR-gate msg-2702 (Tier B round 4):
+# the one-call factory that closes the circular-dependency seam. Takes the
+# previous tick's last_valid_ingest_at (from cross-tick state) and computes
+# the new value in the same call as the record's construction, so no caller
+# can render a lagging timestamp.
 # --------------------------------------------------------------------------- #
 
 
-class TestLastValidIngestAt:
-    def test_advances_on_healthy(self) -> None:
-        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=1, recognized=1))
-        assert advance_last_valid_ingest_at(rec, None) == rec.evaluated_at
-        assert (
-            advance_last_valid_ingest_at(rec, datetime(2025, 1, 1, tzinfo=UTC)) == rec.evaluated_at
+def _build_rec(
+    *sources: SourceReport,
+    previous_last_valid_ingest_at: datetime | None = None,
+    evaluated_at: datetime = datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+    input_format_version: str = "v1",
+    observed: dict[str, str] | None = None,
+    stalls: tuple[str, ...] = (),
+) -> HeartbeatRecord:
+    """Test helper: build a record through the production ``HeartbeatRecord.build()``
+    factory. Uses the classmethod so tests exercise the same one-call path
+    production code must go through.
+    """
+
+    if observed is None:
+        observed = {src.name: input_format_version for src in sources}
+    return HeartbeatRecord.build(
+        evaluated_at=evaluated_at,
+        input_format_version=input_format_version,
+        sources=tuple(sources),
+        observed_format_versions=observed,
+        previous_last_valid_ingest_at=previous_last_valid_ingest_at,
+        stalls=stalls,
+    )
+
+
+class TestBuildFactory:
+    def test_healthy_advances_to_this_tick_evaluated_at(self) -> None:
+        prev = datetime(2025, 1, 1, tzinfo=UTC)
+        rec = _build_rec(
+            _make_source("prs", FetchOutcome.OK, examined=1, recognized=1),
+            previous_last_valid_ingest_at=prev,
         )
+        assert rec.last_valid_ingest_at == rec.evaluated_at
 
-    def test_advances_on_idle(self) -> None:
-        """The Einstein-blocking-#1 fix: idle advances the heartbeat, so
-        an idle repository does not accumulate a false 'detector stale'
-        alarm.
+    def test_idle_also_advances(self) -> None:
+        """Einstein-blocking-#1: idle advances the heartbeat so an idle
+        repository does not accumulate a false 'detector stale' alarm.
         """
 
-        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
-        assert advance_last_valid_ingest_at(rec, None) == rec.evaluated_at
+        prev = datetime(2025, 1, 1, tzinfo=UTC)
+        rec = _build_rec(
+            _make_source("prs", FetchOutcome.OK, examined=0),
+            previous_last_valid_ingest_at=prev,
+        )
+        assert rec.last_valid_ingest_at == rec.evaluated_at
 
-    def test_holds_on_ingest_failure(self) -> None:
-        rec = _make_record(_make_source("prs", FetchOutcome.TIMEOUT, examined=0))
+    def test_ingest_failure_holds_at_previous(self) -> None:
         prev = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
-        assert advance_last_valid_ingest_at(rec, prev) == prev
+        rec = _build_rec(
+            _make_source("prs", FetchOutcome.TIMEOUT, examined=0),
+            previous_last_valid_ingest_at=prev,
+        )
+        assert rec.last_valid_ingest_at == prev
 
-    def test_holds_at_none_on_first_failure(self) -> None:
-        """If ingest has never once succeeded and this tick fails, the
-        heartbeat stays at None — the digest will render the never-succeeded
-        signal explicitly.
+    def test_ingest_failure_from_none_stays_none(self) -> None:
+        rec = _build_rec(
+            _make_source("prs", FetchOutcome.HTTP_ERROR, examined=0),
+            previous_last_valid_ingest_at=None,
+        )
+        assert rec.last_valid_ingest_at is None
+
+    def test_healthy_from_none_starts_the_heartbeat(self) -> None:
+        rec = _build_rec(
+            _make_source("prs", FetchOutcome.OK, examined=1, recognized=1),
+            previous_last_valid_ingest_at=None,
+        )
+        assert rec.last_valid_ingest_at == rec.evaluated_at
+
+    def test_healthy_tick_at_expiry_boundary_is_not_stale(self) -> None:
+        """PR-gate msg-2702 BLOCKING regression pin — the exact scenario
+        the naysayer named.
+
+        A healthy tick runs 1 minute past the previous tick's expiry
+        (previous_last_valid + T_HEARTBEAT). Under the OLD API the caller
+        would construct with previous_last_valid, then compute advance,
+        then forget to reconstruct — and ``is_stale(now, record)`` would
+        return True because the record still carried the lagging
+        timestamp. Under ``build()`` the record carries the NEW timestamp
+        as of construction, so ``is_stale`` sees a fresh tick.
+
+        The record's own ``expires_at`` idiom (``now > record.expires_at``)
+        also sees fresh — a caller cannot get a wrong answer with either
+        predicate.
         """
 
-        rec = _make_record(_make_source("prs", FetchOutcome.HTTP_ERROR, examined=0))
-        assert advance_last_valid_ingest_at(rec, None) is None
+        prev = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
+        # Previous expiry = 10:00 + 4h = 14:00. This tick runs at 14:01.
+        now = datetime(2026, 9, 8, 14, 1, tzinfo=UTC)
+        rec = _build_rec(
+            _make_source("prs", FetchOutcome.OK, examined=1, recognized=1),
+            previous_last_valid_ingest_at=prev,
+            evaluated_at=now,
+        )
+        # (1) The freshly-built record carries the NEW last_valid = now.
+        assert rec.last_valid_ingest_at == now
+        # (2) Therefore is_stale returns False.
+        assert not is_stale(now=now, record=rec)
+        # (3) And the docstring-endorsed idiom now > record.expires_at
+        #     also returns False. The property and is_stale agree.
+        assert rec.expires_at is not None
+        assert not (now > rec.expires_at)
 
 
 # --------------------------------------------------------------------------- #

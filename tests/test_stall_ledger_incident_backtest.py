@@ -23,6 +23,7 @@ Why backtest against static fixtures rather than a live probe:
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from spirrow_mindwire.stall_ledger.predicates import (
     needs_actor_pr,
     needs_actor_quarantine,
     needs_actor_thread,
+    stalled,
 )
 
 _FIXTURES_DIR = Path(__file__).parent / "data" / "stall_ledger_incidents"
@@ -138,39 +140,50 @@ def test_backtest_predicate(fixture: dict[str, Any]) -> None:
 
     inp = fixture["predicate_input"]
     kind = inp["kind"]
-    # A stall = (needs_actor is True) AND (hours_since > n_threshold_hours).
-    # We don't materialise a datetime pair here; the classifier's stalled()
-    # is trivial linear arithmetic once needs_actor is decided. The
-    # meaningful check for the backtest is on needs_actor + the time
-    # margin the fixture records.
+
+    # PR-gate msg-2702 BLOCKING regression pin: materialise the datetime
+    # pair and call the REAL ``stalled()`` function. The earlier draft
+    # reimplemented the ``>`` comparison inline, which meant any drift in
+    # the production predicate (inclusive vs. exclusive boundary, grace
+    # period, whatever) would silently pass this backtest. The whole
+    # purpose of the incident corpus (OBL-STALL-DETECTOR-MONOTONIC-FIXTURES)
+    # is defeated by a test that shadows the production function.
+    now = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
+    hours_since = inp["hours_since_last_participant_motion"]
+    last_participant_motion_at = now - timedelta(hours=hours_since)
+    n = timedelta(hours=inp["n_threshold_hours"])
+
     if kind == "pr":
         pr_state = PrState(**inp["pr_state"])
         actor_needed = needs_actor_pr(pr_state)
-        time_exceeded = inp["hours_since_last_participant_motion"] > inp["n_threshold_hours"]
-        observed_stall = actor_needed and time_exceeded
+        unit_kind = UnitKind.PR
     elif kind == "quarantine":
         q_state = QuarantineState(**inp["quarantine_state"])
         actor_needed = needs_actor_quarantine(q_state)
-        if "hours_since_last_participant_motion" in inp:
-            time_exceeded = inp["hours_since_last_participant_motion"] >= inp["n_threshold_hours"]
-        else:
-            time_exceeded = True
-        observed_stall = actor_needed and time_exceeded
+        unit_kind = UnitKind.QUARANTINE
     elif kind == "thread":
         t_state = ThreadState(**inp["thread_state"])
         actor_needed = needs_actor_thread(t_state)
-        time_exceeded = inp["hours_since_last_participant_motion"] > inp["n_threshold_hours"]
-        observed_stall = actor_needed and time_exceeded
+        unit_kind = UnitKind.THREAD
     else:
         pytest.fail(f"fixture {fixture['id']!r}: unknown kind {kind!r}")
+
+    observed_stall = stalled(
+        kind=unit_kind,
+        last_participant_motion_at=last_participant_motion_at,
+        now=now,
+        needs_actor_now=actor_needed,
+        n=n,
+    )
 
     expected = fixture["expected_verdict"] == "stall"
     assert observed_stall is expected, (
         f"{fixture['id']}: expected verdict={fixture['expected_verdict']!r}, "
-        f"but needs_actor={actor_needed} time_exceeded={time_exceeded} → "
-        f"stall={observed_stall}. If the incident's shape has genuinely changed, "
-        "update the fixture; if the predicate's meaning has shifted, that is a "
-        "regression the fixture is preventing."
+        f"but needs_actor={actor_needed} stalled()={observed_stall} "
+        f"(hours_since={hours_since}, n_hours={inp['n_threshold_hours']}). "
+        "If the incident's shape has genuinely changed, update the fixture; "
+        "if the predicate's meaning has shifted, that is a regression the "
+        "fixture is preventing."
     )
 
 

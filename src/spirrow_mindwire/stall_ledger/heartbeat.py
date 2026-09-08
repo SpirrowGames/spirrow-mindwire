@@ -233,15 +233,10 @@ class HeartbeatRecord:
     def __post_init__(self) -> None:
         # PR-gate msg-2699 (Tier B on #237, round 3): a HeartbeatRecord with
         # zero sources is a configuration bug, not a state anyone can
-        # respond to. Rejecting at construction closes the "empty tuple
-        # slips through" path — see ``derive_state`` for the belt-and-braces
-        # second layer of the same defence, and the module test-suite for
-        # both regression pins. The rule this refuses to accept: a record
-        # whose ``sources`` is empty has NOTHING to be healthy or idle
-        # about, and ``all(...)`` over an empty iterable is True — so
-        # without this raise, a config error would silently render as
-        # ``idle`` and advance the heartbeat, which is the exact silent
-        # failure this thread was born to eliminate.
+        # respond to. Rejecting at construction is the ONLY enforcement of
+        # this invariant — round 4 (msg-2702) retired the "defence in depth"
+        # branch in ``derive_state`` as dead code + memory-corruption tests,
+        # so this ``__post_init__`` raise is the single truth.
         if not self.sources:
             raise ValueError(
                 "HeartbeatRecord: sources tuple is empty. A heartbeat with no "
@@ -263,6 +258,78 @@ class HeartbeatRecord:
                     "observed_format_versions — every source must declare which "
                     "schema its payload was produced against."
                 )
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        evaluated_at: datetime,
+        input_format_version: str,
+        sources: tuple[SourceReport, ...],
+        observed_format_versions: Mapping[str, str],
+        previous_last_valid_ingest_at: datetime | None,
+        stalls: tuple[str, ...] = (),
+    ) -> HeartbeatRecord:
+        """The one-call constructor for a HeartbeatRecord (PR-gate msg-2702
+        BLOCKING fix).
+
+        Takes the PREVIOUS tick's ``last_valid_ingest_at`` (from persistent
+        cross-tick state) and computes the NEW value from THIS tick's own
+        source outcomes. The returned record already carries the correct
+        new timestamp.
+
+        WHY THIS CLASSMETHOD EXISTS.
+        The prior API exposed ``advance_last_valid_ingest_at(record, prev)``
+        as a standalone function. That signature demanded the caller do a
+        three-step dance: (1) construct a provisional record carrying the
+        PREVIOUS tick's ``last_valid_ingest_at``, (2) call ``advance...``
+        to compute the new value, (3) reconstruct the record with the new
+        value before rendering. If step 3 was missed — and the API's shape
+        actively invited missing it — the caller rendered a lagging
+        timestamp and, at the expiry boundary, ``is_stale`` incorrectly
+        flagged a fresh healthy tick as STALE. PR-gate msg-2702 named this
+        exact scenario. The three-step dance was the same class of
+        dual-management the round-2 fix (msg-2696) had already tried to
+        eliminate; it just hid one seam further out.
+
+        This classmethod collapses the dance into ONE call. The caller
+        cannot construct a record with a lagging timestamp because the
+        computation and the construction happen in the same call, on the
+        same values.
+
+        Direct ``HeartbeatRecord(...)`` construction remains possible (needed
+        for tests that want to pin a specific record shape), but production
+        code MUST go through ``build()`` — the docstring of the raw
+        constructor points here.
+        """
+
+        # SourceReport.is_failure encodes the per-source failure predicate
+        # msg-2692 §1 names. We compute it here rather than calling
+        # derive_state on a provisional record because (a) that would
+        # instantiate twice for no benefit, and (b) the empty-sources
+        # ``__post_init__`` guard has already refused empty ``sources``
+        # for us, so ``all(...)`` here cannot be vacuously satisfied on an
+        # empty iterable.
+        any_source_failed = any(
+            src.is_failure(
+                expected_format_version=input_format_version,
+                observed_version=observed_format_versions.get(src.name, ""),
+            )
+            for src in sources
+        )
+
+        # msg-2692 §2: healthy OR idle → advance to this tick's evaluated_at;
+        # ingest_failure → HOLD at the previous value.
+        new_last_valid = previous_last_valid_ingest_at if any_source_failed else evaluated_at
+
+        return cls(
+            evaluated_at=evaluated_at,
+            input_format_version=input_format_version,
+            sources=sources,
+            observed_format_versions=observed_format_versions,
+            last_valid_ingest_at=new_last_valid,
+            stalls=stalls,
+        )
 
     @property
     def expires_at(self) -> datetime | None:
@@ -312,13 +379,6 @@ def derive_state(record: HeartbeatRecord) -> HealthState:
 
     Evaluation order matters:
 
-        0. sources tuple is empty → ``ingest_failure`` (defence in depth for
-           PR-gate msg-2699). Under normal construction this is unreachable —
-           ``HeartbeatRecord.__post_init__`` refuses to build such a record
-           — but the derivation stands on its own: ``all(...)`` over an
-           empty iterable is vacuously True, and reading that as ``idle``
-           would silently advance the heartbeat and mask the loss of the
-           ingest pipeline. Belt AND braces.
         1. ANY source is failing → ``ingest_failure``.
         2. All ok, all examined == 0 → ``idle``.
         3. Otherwise → ``healthy``.
@@ -328,15 +388,14 @@ def derive_state(record: HeartbeatRecord) -> HealthState:
     HTTP 500. Falling through to ``idle`` on the first two would hide the
     500 completely; enforcing failure-first surfaces the 500 EVEN when the
     other sources look healthy.
-    """
 
-    # Defence in depth against PR-gate msg-2699. Construction already
-    # refuses empty sources; if a future refactor loosens that (e.g.
-    # allows lazy source discovery), this branch keeps the state
-    # derivation correct — a record with no sources cannot be healthy or
-    # idle; it must be a failure.
-    if not record.sources:
-        return HealthState.INGEST_FAILURE
+    Empty ``sources`` is impossible here — ``HeartbeatRecord.__post_init__``
+    refuses to construct such a record — so the vacuous-``all(...)`` trap
+    that PR-gate msg-2699 caught cannot be reached. The prior defence-in-
+    depth branch and its memory-corruption test were retired in round 4
+    (msg-2702) as YAGNI dead code: guarding one invariant in two places
+    invites the same dual-management complexity round 2 tried to eliminate.
+    """
 
     if record.failing_sources():
         return HealthState.INGEST_FAILURE
@@ -348,24 +407,17 @@ def derive_state(record: HeartbeatRecord) -> HealthState:
     return HealthState.HEALTHY
 
 
-def advance_last_valid_ingest_at(
-    record: HeartbeatRecord,
-    previous_last_valid: datetime | None,
-) -> datetime | None:
-    """The one bit of authority the emitter has over the outer predicate: does
-    ``last_valid_ingest_at`` advance this tick? (msg-2692 §2.)
-
-    * HEALTHY or IDLE → advances to ``evaluated_at``.
-    * INGEST_FAILURE  → holds at the previous value.
-
-    Passing ``previous_last_valid`` in (rather than reading it off the record)
-    keeps this function pure: the record is a per-evaluation snapshot, the
-    state file is the caller's business.
-    """
-
-    if derive_state(record) == HealthState.INGEST_FAILURE:
-        return previous_last_valid
-    return record.evaluated_at
+# ---------------------------------------------------------------------------
+# ``advance_last_valid_ingest_at`` was RETIRED in PR-gate round 4 (msg-2702).
+# It was a standalone function that took ``previous_last_valid`` out-of-band
+# and returned the new timestamp, forcing the caller into a three-step
+# construct-advance-reconstruct dance. That dance leaked into rendering when
+# a caller forgot the last step, producing false STALE alarms at the expiry
+# boundary. Its replacement is ``HeartbeatRecord.build(previous_last_valid_
+# ingest_at=...)`` — the classmethod above collapses the dance into one call
+# and cannot leave the record in an inconsistent state. No public function
+# is exposed here in its place; the one-call classmethod is the entire API.
+# ---------------------------------------------------------------------------
 
 
 def is_stale(now: datetime, record: HeartbeatRecord) -> bool:
