@@ -100,12 +100,25 @@ _ID_FIELDS = ("id", "adr_id", "path", "doc_id", "slug", "name", "file")
 # that a silent empty is what let the original misjudgment happen.
 _DEFAULT_BODY = "drive"
 
-# Where in-repo ADR bodies live, and the filename marker that means "this is an amendment
-# memo, not the body" (see :func:`check_in_repo_bodies_are_registered`). The marker is a
-# hyphen-delimited segment, not a bare substring: a body legitimately named
-# ``...-amendments-to-x.md`` must stay INSIDE the drift check. An exclusion that is wider
-# than its documentation is a guard that fails open silently, which is the failure class
-# this module exists to remove.
+# Where in-repo ADR bodies live, and the filename marker the drift check skips over
+# (see :func:`check_in_repo_bodies_are_registered`).
+#
+# The rule is LITERAL, and the literal is the whole rule: a filename is skipped when it
+# contains ``-amendment-`` as a hyphen-delimited segment. The marker does not, and cannot,
+# decide whether a file *is* an amendment memo. Two consequences, both accepted:
+#   * A real BODY can match it. A body titled "Amendment to X" lands on disk as
+#     ``...-amendment-to-x.md`` and is skipped exactly like a memo. The plural
+#     ``...-amendments-to-x.md`` is NOT skipped -- that asymmetry is the segment-vs-substring
+#     property (widening the marker back to a bare substring re-opens the drift hole for
+#     every such body), and tests/test_adr_index_gen.py pins both directions.
+#   * The direction of that miss is FAIL-OPEN. A skipped entry keeps whatever weak locator
+#     it already had -- normally bare ``drive`` -- which is the state that predates this
+#     check. No wrong locator is ever produced; the check only ever withholds a prompt.
+# The escape hatch stays open: writing ``body: repo:docs/adr/<file>.md`` by hand registers
+# the body regardless of its name. A name collision suppresses the nagging, never the
+# registration. What goes red when the skipped set changes is
+# tests/test_naysayer_adr_index.py::test_amendment_marker_skip_set_is_pinned_to_this_tree,
+# which pins the exact set of in-tree filenames this marker removes from the scan.
 _ADR_BODY_DIR = "docs/adr"
 _AMENDMENT_MARKER = "-amendment-"
 
@@ -314,13 +327,19 @@ def check_in_repo_bodies_are_registered(
     ("ADR-20 was never registered"). This moves that from something a human must notice
     to something the suite fails on.
 
-    ``*-amendment-*`` files are excluded: an amendment memo is a diff against a body, not
-    the body. ADR-2026-05-21-06 is exactly that case — its only file under ``docs/adr/``
-    says of itself "本メモは Drive 反映時に ADR-06 本体へマージする差分" — so mapping id to
-    file mechanically would point ADR-06 at a document that is not ADR-06. That is the
-    same misdirection this whole thread exists to remove, which is why the exclusion is
-    pinned by a test rather than left implicit. A *second* amendment would be the signal
-    to model amendments in the schema instead; that is out of scope here.
+    Filenames carrying ``-amendment-`` as a hyphen-delimited segment are skipped. That is
+    a rule about the *string*: it holds no opinion on whether the file is an amendment
+    memo, so a real body titled "Amendment to X" is skipped too. That collision is known
+    and accepted, and it fails OPEN — a skipped entry just keeps the weak locator it
+    already had, this function never writes one, and an explicit ``body: repo:…`` registers
+    such a body anyway. Full rule: the ``_AMENDMENT_MARKER`` comment above. Guard against
+    the skipped set changing: ``test_amendment_marker_skip_set_is_pinned_to_this_tree``.
+
+    The skip exists for ADR-2026-05-21-06, whose only file under ``docs/adr/`` says of
+    itself "本メモは Drive 反映時に ADR-06 本体へマージする差分": mapping id to file
+    mechanically would point ADR-06 at a document that is not ADR-06 — the same
+    misdirection this thread exists to remove. A *second* amendment would be the signal to
+    model amendments in the schema instead; that is out of scope here.
     """
     body_dir = repo_root / _ADR_BODY_DIR
     stale: list[tuple[str, str, str]] = []

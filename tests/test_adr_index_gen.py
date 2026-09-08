@@ -281,19 +281,35 @@ def test_check_in_repo_bodies_are_registered_excludes_amendment_memos(tmp_path: 
     ]
 
 
-def test_amendment_exclusion_is_a_segment_not_a_substring(tmp_path: Path) -> None:
-    # The exclusion is documented as ``*-amendment-*`` in this module's docstring and in
-    # docs/adr/README.md. It must therefore match a hyphen-delimited segment, not any
-    # occurrence of the word: a real body named ``ADR-7-amendments-to-the-registry.md``
-    # contains "amendment" but is a BODY, and dropping it from the drift check would
-    # re-open the exact hole that check closes -- silently, since an excluded file is
-    # indistinguishable from an absent one. Widen the marker back to a bare substring and
-    # this goes red.
+def test_amendment_marker_is_a_literal_segment_a_body_can_also_match(tmp_path: Path) -> None:
+    # Both halves of the marker's literal rule, pinned side by side so that neither half
+    # can be read as a safety claim about the other.
+    #
+    # (1) SEGMENT, not bare substring. The exclusion is documented as ``*-amendment-*`` in
+    # adr_index_gen's module comment and in docs/adr/README.md, so it must match a hyphen-
+    # delimited segment, not any occurrence of the word: a real body named
+    # ``ADR-7-amendments-to-the-registry.md`` contains "amendment" but is a BODY, and
+    # dropping it from the drift check would re-open the exact hole that check closes --
+    # silently, since an excluded file is indistinguishable from an absent one. Widen the
+    # marker back to a bare substring and this goes red.
     root = _tree(tmp_path, "ADR-7-amendments-to-the-registry.md")
     manifest = 'adrs:\n  - id: ADR-7\n    title: "t"\n    body: drive\n'
     assert check_in_repo_bodies_are_registered(manifest, root) == [
         ("ADR-7", "drive", "ADR-7-amendments-to-the-registry.md")
     ]
+    # (2) The SINGULAR form collides, asserted outright rather than left to inference. A
+    # real body titled "Amendment to X" is filed as ``ADR-8-amendment-to-x.md`` and the
+    # literal rule skips it like a memo. Not desirable, and (1) was never a claim that the
+    # marker is precise: this is an ACCEPTED collision of a string rule, written down so
+    # nobody has to rediscover it. Not patched -- tightening the marker (to ``-amendment-v``,
+    # say) would invent a convention out of the one real filename here and start mistaking
+    # version-less memos for bodies, trading fail-open for fail-wrong. Escape hatch: an
+    # explicit ``body: repo:docs/adr/<file>.md`` registers such a body anyway, so the
+    # collision costs the prompt, not the entry. Made loud in
+    # tests/test_naysayer_adr_index.py::test_amendment_marker_skip_set_is_pinned_to_this_tree.
+    collided = _tree(tmp_path / "singular", "ADR-8-amendment-to-x.md")
+    singular = 'adrs:\n  - id: ADR-8\n    title: "t"\n    body: drive\n'
+    assert check_in_repo_bodies_are_registered(singular, collided) == []
 
 
 def test_render_manifest_defaults_new_entries_to_drive_not_repo(tmp_path: Path) -> None:

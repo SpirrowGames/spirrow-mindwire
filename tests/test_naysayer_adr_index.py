@@ -16,6 +16,8 @@ from spirrow_mindwire.naysayer.adr_index import (
     repo_locator_path,
 )
 from spirrow_mindwire.naysayer.adr_index_gen import (
+    _ADR_BODY_DIR,
+    _AMENDMENT_MARKER,
     check_body_locator_formats,
     check_in_repo_bodies_are_registered,
     check_repo_locator_targets,
@@ -300,12 +302,71 @@ def test_section_m_rows_all_parse() -> None:
     parsed_ids = [adr_id for adr_id, _, _ in parse_adr_index_with_thread(claude_md)]
     # Count both sides rather than pinning today's total, so adding an ADR to §M is not
     # itself a failure.
+    #
+    # msg-2754 §5-4: TWO different §M defects shrink the parsed side, and naming the wrong
+    # one costs the reader the debugging session. parse_adr_index_with_thread() dedupes by id
+    # (``dict.setdefault``) while re.findall() does not, so a DUPLICATE row also makes the
+    # counts disagree — while leaving ``set(raw) - set(parsed)`` empty. Report whichever
+    # applies, both when both do, never a bare "Unparsed ids: []". The assertion stays strict
+    # on purpose: relaxing it to len(set(raw_ids)) would let duplicates through, trading a
+    # confusing red for a silent green — and a duplicate row IS a defect, the second row's
+    # title and thread being discarded without a word. The diagnosis was wrong, not the
+    # verdict.
+    duplicates = sorted({adr_id for adr_id in raw_ids if raw_ids.count(adr_id) > 1})
+    unparsed = sorted(set(raw_ids) - set(parsed_ids))
+    causes: list[str] = []
+    if duplicates:
+        causes.append(
+            f"DUPLICATE §M row(s) for {duplicates}: parse_adr_index_with_thread() keeps only "
+            f"the FIRST row per ADR id (``dict.setdefault``) and silently discards the later "
+            f"rows' title and thread, so the counts disagree without anything being "
+            f"unparsed. Delete the duplicate row(s) from §M."
+        )
+    if unparsed:
+        causes.append(
+            f"UNPARSED §M row(s) for {unparsed}: those ADRs silently drop out of the index "
+            f"and out of spec/adr_index.yaml. The leading cause is a row missing its third "
+            f"(``thread``) column — the cell may be empty, but the closing pipe is required. "
+            f"Inspect the row ABOVE each id named here as well: _ADR_INDEX_ROW_RE spells its "
+            f"cells ``[^|]``, which crosses newlines, so a row whose closing pipe is missing "
+            f"swallows the next line as its own third cell and it is the NEIGHBOUR that goes "
+            f"missing from this list (measured, msg-2754 §5-5)."
+        )
+    if not causes:
+        causes.append(
+            f"neither duplicated nor unparsed ids explain the gap, so compare the two lists "
+            f"directly: raw={sorted(raw_ids)} vs parsed={sorted(parsed_ids)}."
+        )
     assert len(raw_ids) == len(parsed_ids), (
         f"CLAUDE.md §M has {len(raw_ids)} raw ADR row(s) but parse_adr_index_with_thread() "
-        f"returned {len(parsed_ids)}: an §M row was not parsed, so that ADR silently drops "
-        f"out of the index and out of spec/adr_index.yaml. Unparsed ids: "
-        f"{sorted(set(raw_ids) - set(parsed_ids))}. The leading cause is a row missing its "
-        f"third (``thread``) column — the cell may be empty, but the closing pipe is required."
+        f"returned {len(parsed_ids)}. " + " ".join(causes)
+    )
+
+
+def test_amendment_marker_skip_set_is_pinned_to_this_tree() -> None:
+    # msg-2754 §5-2. ``_AMENDMENT_MARKER`` removes files from
+    # check_in_repo_bodies_are_registered()'s scan by NAME, with no opinion about what they
+    # are, so a real BODY titled "Amendment to X" — filed as ``...-amendment-to-x.md`` — is
+    # skipped like a memo and never prompted for registration. That miss fails open and is
+    # escapable by hand, so it is accepted rather than patched — but accepted must not mean
+    # unobserved, and no existing test can see it:
+    # test_amendment_memo_does_not_force_a_repo_locator_on_adr_06 is scoped to ADR-06's own
+    # files, and the §M checks never look at docs/adr/ at all. This pins the whole skipped
+    # SET instead, so a second colliding filename is loud. Hermetic: in-repo tree, no network.
+    repo_root = Path(__file__).resolve().parents[1]
+    body_dir = repo_root / _ADR_BODY_DIR
+    skipped = sorted(p.name for p in body_dir.glob("*.md") if _AMENDMENT_MARKER in p.name.lower())
+    assert skipped == ["ADR-2026-05-21-06-amendment-v2.2-i3-author-instance-id.md"], (
+        f"the set of docs/adr/ files hidden from the in-repo drift check changed: {skipped}. "
+        f"Two ways forward, and they are not interchangeable. (a) If the new file really is "
+        f"an amendment memo, add it to the expected list here — and note that "
+        f"check_in_repo_bodies_are_registered()'s docstring calls a SECOND amendment the "
+        f"signal to model amendments in the schema rather than to keep widening this list. "
+        f"(b) If it is a real ADR body that merely collides with the ``-amendment-`` segment, "
+        f"the drift check will never prompt you for it, so register it by hand: set that "
+        f"ADR's ``body:`` in spec/adr_index.yaml to ``repo:docs/adr/<file>.md``. Do not "
+        f"tighten _AMENDMENT_MARKER to make the collision go away — a narrower marker starts "
+        f"mistaking version-less memos for bodies, which is worse than failing open."
     )
 
 
