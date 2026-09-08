@@ -98,8 +98,14 @@
 #     none of those three. That is the hole, and it is the whole hole.
 #
 #     Measured 2026-09-08 against deploy/run-conductor-scheduled.ps1 as
-#     committed in 014a665 (the last commit to touch that file; this PR
-#     does not modify it). Option 3 (msg-630 §3, msg-631 sustained): the
+#     it stands in 014a665's tree — blob 4c9836d, which is the copy this
+#     branch has held since 1012079 (014a665 itself does not touch that
+#     file); this PR does not modify it. On main the file is blob 9fc60d6,
+#     changed by aece52a (+13/-1), which is NOT on this branch — it
+#     reaches main via the other merge parent 47eccbb. Every row below was
+#     re-run against BOTH blobs with this pin and the verdicts are
+#     identical row for row, so merging cannot change them.
+#     Option 3 (msg-630 §3, msg-631 sustained): the
 #     actual pin — this file, tests/Test-SweepSequentiality.ps1 — was
 #     invoked against mutated scratch copies of the sweep script in an
 #     isolated mirror OUTSIDE the working tree, so the pin under test is
@@ -145,10 +151,13 @@
 #           pin RED, L3b fires ALONE (L2c passed). This is the row that
 #           makes the aggregation observable: one rule fired, no other
 #           rule fired, and the pin exited 1. "Any rule fires ⇒ RED" is
-#           therefore executed for L3b rather than assumed — the
-#           aggregation is `$script:failures` incremented by each rule and
-#           read once at the end, and L2c does not short-circuit before
-#           L3b runs.
+#           therefore executed for L3b rather than assumed — after the
+#           S1-S4 identity stage, the aggregation is `$script:failures`
+#           incremented by each rule and read once at the end, and L2c
+#           does not short-circuit before L3b runs. That stage itself is
+#           NOT accumulate-and-read-once: it fails closed at four early
+#           `exit 1` sites, one per rule, which is why the S1 row below
+#           exits before L2c/L3b are ever reached.
 #         `$null = [scriptblock]::Create("Write-Host x")`
 #           pin RED, L3b AND L3d fire (L2c passed).
 #         `$null = Start-Job -ScriptBlock { & $inner *>&1 }`
