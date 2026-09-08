@@ -637,9 +637,19 @@ naysayer round-3 advisory は正しい。ただし v0.3.3 と同じ手（`head_c
 
 ∴ 発火条件（連言）: **`rollup ≠ ∅`** ∧ **`not concluded`** ∧ **全 check の `startedAt` / `createdAt` が null**（legacy `StatusContext` 系）∧ **head の commit が 12h より古い** ∧ **その head が今 push された**。
 
-**現行 repo の shield**: SpirrowGames の CI は GitHub Actions で、CheckRun は `startedAt` を**構造的に**持つ（Actions runner が step を開始した時点で API が populate する）。∴ rollup が非空になった tick では `observed = ∅` が構造的に成立しない。**shield が破れる条件**: (a) repo が legacy `StatusContext` を混ぜる（今日は使っていない）、(b) GitHub Actions API の platform-level 変更で `startedAt` が omit される（あった場合は本行を deferred に留める根拠が失われる → 昇格）。
+**現行 repo の shield（構造ではなく実測に基づく）**: 「CheckRun は `startedAt` を構造的に持つ」という以前の wording は不正確だった（queued CheckRun は仕様上 `startedAt=None` を取り得る、それは `ci_clock_start` の第 1 段が `check.started_at ... else check.created_at` で fallback を持つ理由そのもの）。∴ shield は API 仕様ではなく **SpirrowGames の CheckSuite lifecycle の実測**に立てる:
+
+- **観測**: PR push 直後、GitHub は CheckSuite を `QUEUED` で作るが、その `checkRuns` は空である。runner が job を pick up した時に CheckRun が初めて suite に足され、その時点で `startedAt` は既に populate されている。∴ 「rollup に CheckRun が現れる」タイミングと「その CheckRun が `startedAt` を持つ」タイミングは分離しない。
+- **検証**（本行の存在根拠の 1 つ）: 2026-09-08、直近 20 PR の head 40 CheckRuns を `graphql statusCheckRollup.contexts` で走査、`startedAt=None` は 0 件。PR #229 head `d4cc8f9` を含む複数の commit で `checkSuites.nodes` を直接見ても、`QUEUED` suite の `checkRuns` は空、`COMPLETED` suite の CheckRun は全て `startedAt` populate 済み。
+- **∴ 到達性の帰結**: queue 窓では rollup は依然 empty（R1a 処理 = deferred）。rollup が非空になった tick では全 check が `startedAt` を持つ（observed ≠ ∅）。R2/R3 が commit fallback を消費する状態には現行 workflow shape では至らない。
+
+**shield が破れる条件（=昇格 trigger）**: (a) repo が legacy `StatusContext` を混ぜる（今日は使っていない）、(b) matrix job で concurrency limit が効き、一部の job が CheckRun として suite に足された状態で queued に留まる（本 repo は matrix なし）、(c) `needs:` dependency chain で待たされた downstream job が同様に queued CheckRun として rollup に載る（本 repo は依存なし）、(d) GitHub Actions API の platform-level 変更で queued 段階の CheckRun が公開される。(a)-(c) は workflow shape の追加/変更で生じ得るため、`.github/workflows/*.yml` に matrix・`needs`・`StatusContext`（e.g., 外部 CI）が入る PR は本行の shield 前提を壊し得る（そういう PR が入ったら本行を昇格に回すこと）。
+
+**caller-side defense in depth（RES-WIRING の caller 実装時の obligation）**: `CheckRow.created_at` は GraphQL/REST の CheckRun object には対応フィールドが無い（CheckRun 自体は `createdAt` を top-level に持たない）。∴ caller は queued CheckRun を CheckRow にマップする際、`created_at` に**親 CheckSuite の `createdAt`** を入れて defense in depth を張ること。これによって上記 shield が (b)/(c)/(d) で破れても `observed ≠ ∅` は保たれる（min は suite 作成時刻に落ちる = push 直後の時刻に近く、`head_committed_date` の 12h 早鳴りは起きない）。この obligation は RES-WIRING の caller 実装の一部として扱い、caller PR の本文で本行を名指しすること。
 
 **PR-review msg-(gate) v0.3.4 round-1 の chain (R1b → R3) の扱い**: naysayer は「R1b が INVOKE downstream → R3 evaluate → ci_clock_start fallback → CAP_NOCLOCK 超過で R3 false-early 発火」の chain を示した。ただし `gate_admission.py:495-515` で R1b は terminate し、R2/R3 は evaluate されない。naysayer が想定した scenario で実際に発生するのは R1b path で naysayer 側の L1 が UNKNOWN CI COMMENT を出す挙動（R1b docstring: "This is a single COMMENT, not a loop"）で、R3 false-early とは別クラス — 本行の subject ではない。ただし旧 wording（「連言。今日はほぼ到達不能」）は R2/R3 到達性を明示していなかったため誤読余地があり、上記のように code 参照付きで rewrite した。
+
+**PR-review msg-(gate) v0.3.4 round-2 の shield rewording の扱い**: naysayer は「Actions は push 直後に CheckRun を queued 状態で作る、∴ rollup ≠ ∅ ∧ observed = ∅ が queue 窓で成立する」と主張した。前段の観測どおり、SpirrowGames の実 workflow shape ではこの scenario は成立しない（QUEUED CheckSuite は empty CheckRuns を持つ、runner が pick up して初めて CheckRun が現れる、その時点で startedAt は populate 済み）。ただし naysayer が誤読するに至った原因は旧 wording の「startedAt を構造的に持つ」が API 仕様の主張と読めたことであり（実際には CheckSuite lifecycle の実測に依存する主張）、この誤読余地は shield rewording そのものの問題だった。∴ 実測 + workflow shape 依存 + 昇格 trigger 明示 + caller obligation の 4 点構成に書き直した。本行の deferred 判断は据え置き（shield は残る、破れる条件は明示化された）。
 
 #### 候補 α: fallback を `head_pushed_at` に替える
 
