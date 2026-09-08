@@ -82,8 +82,14 @@ _MANIFEST_REL = Path("spec") / "adr_index.yaml"
 
 # A CLAUDE.md §M table row: ``| ADR-2026-05-27-09 (T28) | <title> | <thread> |``. The
 # naysayer index reads the manifest (below), not §M; §M is parsed only to build/validate
-# the manifest. The third column (``thread``) is optional in the regex so a §M row that
-# ever drops it (should not happen) does not crash the parser.
+# the manifest. What is optional about the third column (``thread``) is its *content*
+# (``[^|]*?`` admits an empty cell), NOT the column: the closing pipe is mandatory. A row
+# that drops the column outright (2 cells / 3 pipes) therefore does not match at all, and
+# its ADR vanishes from the parse result in silence — and, since ``adr_index_gen`` folds
+# §M into the generated manifest, out of the manifest too. §M is the only source for the
+# §M-only identity ADRs, so for those the entry simply ceases to exist. The guard against
+# that is ``test_section_m_rows_all_parse``; the two §M drift-checks cannot be, because
+# both are subset checks over rows that already parsed.
 _ADR_INDEX_ROW_RE = re.compile(
     r"^\|\s*(ADR-\d{4}-\d{2}-\d{2}-\d+)[^|]*\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|",
     re.MULTILINE,
@@ -187,9 +193,13 @@ def parse_adr_index_with_thread(
     """Parse §M into ``(adr_id, title, thread)`` rows (deduped by id, sorted).
 
     ``thread`` is the §M table's third column (the chatroom thread that carries the
-    ADR's decide-close, when one exists). An empty third column yields ``None`` — a
-    §M row without a thread is legal (though not currently used) and the caller
-    treats absence as "no chatroom body, look at Drive".
+    ADR's decide-close, when one exists). An *empty* third column (``| … | … |  |``)
+    yields ``None``: that row is legal (though not currently used) and the caller reads
+    the absence as "no chatroom body, look at Drive".
+
+    A row that omits the column altogether (``| … | … |``) is NOT that case. It is a
+    broken §M row: it does not match :data:`_ADR_INDEX_ROW_RE`, so the ADR drops out of
+    this result — and out of the generated manifest — with no error. See the note there.
     """
     seen: dict[str, tuple[str, str | None]] = {}
     for adr_id, title, thread in _ADR_INDEX_ROW_RE.findall(claude_md):

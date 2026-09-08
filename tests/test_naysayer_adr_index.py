@@ -287,6 +287,28 @@ def test_section_m_threads_match_manifest() -> None:
     )
 
 
+def test_section_m_rows_all_parse() -> None:
+    # T-adr-index-omits-chatroom-body-locator msg-2743 §5-3. The row regex requires the
+    # third column's closing pipe, so a §M row written with only two cells does not match
+    # and its ADR leaves the index — and the generated manifest — without a word. Neither
+    # §M drift-check above can see that: both are subset checks over rows that ALREADY
+    # parsed, so a row that never parsed is never examined and they stay green. This is
+    # the check that goes red instead. Hermetic: in-repo file only, no network.
+    repo_root = Path(__file__).resolve().parents[1]
+    claude_md = (repo_root / "CLAUDE.md").read_text(encoding="utf-8")
+    raw_ids = re.findall(r"(?m)^\|\s*(ADR-\d{4}-\d{2}-\d{2}-\d+)", claude_md)
+    parsed_ids = [adr_id for adr_id, _, _ in parse_adr_index_with_thread(claude_md)]
+    # Count both sides rather than pinning today's total, so adding an ADR to §M is not
+    # itself a failure.
+    assert len(raw_ids) == len(parsed_ids), (
+        f"CLAUDE.md §M has {len(raw_ids)} raw ADR row(s) but parse_adr_index_with_thread() "
+        f"returned {len(parsed_ids)}: an §M row was not parsed, so that ADR silently drops "
+        f"out of the index and out of spec/adr_index.yaml. Unparsed ids: "
+        f"{sorted(set(raw_ids) - set(parsed_ids))}. The leading cause is a row missing its "
+        f"third (``thread``) column — the cell may be empty, but the closing pipe is required."
+    )
+
+
 def test_parse_adr_index_still_parses_claude_md_section_m() -> None:
     # §M parser (used by adr_index_gen to build the manifest + the §M-subset drift-check).
     claude_md = (
