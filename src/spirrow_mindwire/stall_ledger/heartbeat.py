@@ -190,6 +190,31 @@ class SourceReport:
         return expected_format_version != observed_version
 
 
+def _is_source_failing(
+    src: SourceReport,
+    *,
+    expected_format_version: str,
+    observed_format_versions: Mapping[str, str],
+) -> bool:
+    """Stateless helper: does ``src`` push the record to ``ingest_failure``?
+
+    PR-gate msg-2705 (Tier B round 5) ADVISORY regression pin: this helper is
+    the ONE place the ``(src, expected_version, observed_map)`` triple is
+    unwrapped into a call to ``SourceReport.is_failure``. Both
+    ``HeartbeatRecord.build()`` (which cannot call an instance method before
+    the record exists) and ``HeartbeatRecord.failing_sources()`` (which
+    reads the same map from ``self``) delegate here so any future evolution
+    of ``is_failure``'s signature has one call site, not two. Guarding one
+    invariant in two places was the dual-management pattern rounds 1-4 all
+    reduced to; this helper closes the last remaining instance in the module.
+    """
+
+    return src.is_failure(
+        expected_format_version=expected_format_version,
+        observed_version=observed_format_versions.get(src.name, ""),
+    )
+
+
 @dataclass(frozen=True)
 class HeartbeatRecord:
     """One evaluation's record — emitted every tick (msg-2692 §4-1).
@@ -303,17 +328,16 @@ class HeartbeatRecord:
         constructor points here.
         """
 
-        # SourceReport.is_failure encodes the per-source failure predicate
-        # msg-2692 §1 names. We compute it here rather than calling
-        # derive_state on a provisional record because (a) that would
-        # instantiate twice for no benefit, and (b) the empty-sources
-        # ``__post_init__`` guard has already refused empty ``sources``
-        # for us, so ``all(...)`` here cannot be vacuously satisfied on an
-        # empty iterable.
+        # Delegate to ``_is_source_failing`` so this call site and
+        # ``failing_sources()`` share one implementation of the predicate
+        # (PR-gate msg-2705 ADVISORY). The empty-sources ``__post_init__``
+        # guard has already refused empty ``sources`` for us, so ``any(...)``
+        # here cannot be vacuously satisfied on an empty iterable.
         any_source_failed = any(
-            src.is_failure(
+            _is_source_failing(
+                src,
                 expected_format_version=input_format_version,
-                observed_version=observed_format_versions.get(src.name, ""),
+                observed_format_versions=observed_format_versions,
             )
             for src in sources
         )
@@ -362,14 +386,21 @@ class HeartbeatRecord:
         return self.last_valid_ingest_at + T_HEARTBEAT
 
     def failing_sources(self) -> tuple[SourceReport, ...]:
-        """Return the sources that pushed this record to INGEST_FAILURE state."""
+        """Return the sources that pushed this record to INGEST_FAILURE state.
+
+        Delegates to the module-level ``_is_source_failing`` helper so this
+        instance method and ``HeartbeatRecord.build()`` share one place
+        that knows how to unwrap the ``(src, expected_version, observed_map)``
+        triple into a per-source failure verdict (PR-gate msg-2705 ADVISORY).
+        """
 
         return tuple(
             src
             for src in self.sources
-            if src.is_failure(
+            if _is_source_failing(
+                src,
                 expected_format_version=self.input_format_version,
-                observed_version=self.observed_format_versions.get(src.name, ""),
+                observed_format_versions=self.observed_format_versions,
             )
         )
 

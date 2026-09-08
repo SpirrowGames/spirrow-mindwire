@@ -592,6 +592,56 @@ class TestDigestRendering:
         lines = render_digest_lines(record=rec, now=rec.evaluated_at)
         assert any("version_drift" in line for line in lines[1:])
 
+    def test_stalls_subordinate_line_rendered_when_non_empty(self) -> None:
+        """PR-gate msg-2705 BLOCKING regression pin: when ``stalls`` is
+        non-empty the digest MUST render a subordinate evidence line
+        naming them, and it must NOT appear on the verdict line (line 0).
+
+        The line-0 exclusion is already pinned by
+        ``test_verdict_line_does_not_carry_stall_count`` for the empty case;
+        this test pins the non-empty case symmetrically. Without this the
+        stalls-rendering branch of ``render_digest_lines`` was entirely
+        untested — a rename, a bug in ``str.join``, or a swap of the count
+        and the identifiers would go undetected.
+        """
+
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=2, recognized=2),
+            last_valid_ingest_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+            stalls=("pr:spirrow-mindwire#199", "pr:spirrow-mindwire#206"),
+        )
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at)
+        # Verdict line still carries no stall count (msg-2692 §1 boundary).
+        assert "stall" not in lines[0].lower()
+        # A subordinate line names the stall count AND every stall id, so
+        # a rename or a swap between the two would red this test.
+        joined = "\n".join(lines[1:])
+        assert "stalls: 2 —" in joined, (
+            f"expected the subordinate stalls line to appear as "
+            f"'stalls: <count> — <ids>'; got lines:\n{lines}"
+        )
+        assert "pr:spirrow-mindwire#199" in joined
+        assert "pr:spirrow-mindwire#206" in joined
+
+    def test_stalls_line_absent_when_empty(self) -> None:
+        """Complement to the non-empty test: with no stalls, no subordinate
+        stalls line is emitted (the verdict-line exclusion is separately
+        pinned by ``test_verdict_line_does_not_carry_stall_count``).
+        """
+
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=3, recognized=3),
+            last_valid_ingest_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+            stalls=(),
+        )
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at)
+        joined = "\n".join(lines)
+        assert "stalls:" not in joined, (
+            "an empty stalls tuple must not emit a 'stalls: 0 — ' line — "
+            "emitting the label with a zero count would recreate the "
+            "'right to lie' surface msg-2692 §1 removed."
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Query pin — msg-2692 §4-4: pin the exact bytes of our own GitHub PR query
