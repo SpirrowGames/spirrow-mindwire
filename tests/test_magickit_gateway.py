@@ -486,6 +486,35 @@ def test_non_envelope_failures_carry_no_error_type() -> None:
     assert _wrap_transport_error("chatroom_get_thread", OSError("down")).error_type is None
 
 
+def test_wrap_transport_error_returns_exception_with_no_cause_chain() -> None:
+    """Docstring contract pin: the helper constructs, it does not chain.
+
+    ``_wrap_transport_error`` builds and returns the :class:`MagickitMcpError`
+    without touching ``__cause__`` or ``__context__``. Preserving the
+    transport failure in the traceback is the caller's responsibility —
+    via ``raise ... from exc`` or an explicit ``__cause__`` assignment.
+
+    **Not a regression pin.** This assertion passes on the pre-docstring-
+    change code too, and always would: Python's :class:`BaseException`
+    constructor leaves ``__cause__`` at ``None`` unless ``raise ... from
+    ...`` sets it. The pin's value is prospective — a future "helpful"
+    edit that makes the helper set ``__cause__ = exc`` internally (so
+    callers could drop the ``from exc``) would look right in isolation
+    but would silently break the mixed-``BaseExceptionGroup`` path, which
+    needs ``__cause__`` set to the *group* of matched transport failures,
+    not to any one leaf (PR-gate #178 rounds 2, 3, 5, 7 and 9 iterated on
+    exactly that path). Pinning the negative contract keeps the docstring
+    true and keeps the caller-side chaining sites load-bearing.
+    """
+    from spirrow_mindwire.magickit.client import _wrap_transport_error
+
+    original = OSError("down")
+    wrapped = _wrap_transport_error("chatroom_get_thread", original)
+
+    assert wrapped.__cause__ is None
+    assert wrapped.__context__ is None
+
+
 def test_envelope_error_type_obeys_the_value_limit() -> None:
     """The published field is bounded by the same cap as the message.
 

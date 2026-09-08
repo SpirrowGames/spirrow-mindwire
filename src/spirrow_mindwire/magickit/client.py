@@ -466,11 +466,19 @@ _TRANSPORT_EXCEPTIONS: tuple[type[BaseException], ...] = (
 
 
 def _wrap_transport_error(name: str, exc: BaseException) -> MagickitMcpError:
-    """Uniform :class:`MagickitMcpError` from a transport-class ``exc``.
+    """Construct — but do NOT raise — a uniform :class:`MagickitMcpError`.
 
-    Includes the exception class name so a log reader can tell "timeout" apart
-    from "connection refused" without opening the traceback. ``from exc``
-    preserves the chain for tracebacks; the string form stays short.
+    Embeds ``exc``'s class name in the message so a log reader can tell
+    "timeout" apart from "connection refused" without opening the
+    traceback, and keeps the string form short.
+
+    This helper only builds and returns the exception object. It does
+    not touch ``__cause__`` or ``__context__``; the returned
+    :class:`MagickitMcpError` therefore starts with no cause chain.
+    Preserving the transport failure in the traceback is the caller's
+    responsibility — via ``raise ... from exc`` or by setting
+    ``__cause__`` explicitly. A bare ``raise _wrap_transport_error(...)``
+    would sever the chain.
     """
     return MagickitMcpError(f"magickit MCP call {name!r} failed: {type(exc).__name__}: {exc}")
 
