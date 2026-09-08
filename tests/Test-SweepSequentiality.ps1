@@ -150,10 +150,21 @@ function Test-IsDescendant {
 
 # Kept for the ancestor-chain walk in L2c (which needs to inspect every
 # intermediate node's type, not just answer a yes/no descendancy question).
+# `-Boundary` (optional): if the walk reaches this node before finding the
+# requested type, return $null instead of walking further up. Used at the
+# "spawn consumed by an assignment" check to keep the walk inside
+# $dispatchLoop — an unbounded walk would false-positive if a maintainer
+# wraps the whole dispatch loop in `$dummy = foreach ... { & $inner | Out-Null }`
+# (PR-gate advisory #2 on round-2, addressed here).
 function Get-EnclosingAst {
-    param([System.Management.Automation.Language.Ast]$Node, [Type]$Type)
+    param(
+        [System.Management.Automation.Language.Ast]$Node,
+        [Type]$Type,
+        [System.Management.Automation.Language.Ast]$Boundary = $null
+    )
     $n = $Node.Parent
     while ($null -ne $n) {
+        if ($null -ne $Boundary -and $n -eq $Boundary) { return $null }
         if ($Type.IsInstanceOfType($n)) { return $n }
         $n = $n.Parent
     }
@@ -305,8 +316,12 @@ CheckTrue 'spawn command element is $inner' `
     "spawn command element is $($first.GetType().Name) [$($first.Extent.Text)]"
 
 # "Consumed by an assignment": walk ancestors until we see an AssignmentStatementAst.
+# Bounded at $dispatchLoop so an assignment outside the loop (e.g. someone wrapping the
+# whole loop with `$dummy = foreach ... { & $inner | Out-Null }` and dropping the spawn's
+# own assignment) does not falsely satisfy this check.
 $enclosingAssignment = Get-EnclosingAst -Node $spawnCommand `
-    -Type ([System.Management.Automation.Language.AssignmentStatementAst])
+    -Type ([System.Management.Automation.Language.AssignmentStatementAst]) `
+    -Boundary $dispatchLoop
 if ($null -eq $enclosingAssignment) {
     $script:failures++
     Write-Host ("  FAIL  the spawn is no longer ``& `$inner`` with captured output. " +
@@ -389,17 +404,25 @@ while ($null -ne $n -and -not $reachedDispatchLoop) {
     }
     # SHAPE of `Start-Job { … }`, `ForEach-Object -Parallel { … }`,
     # `[Task]::Run({ … })`, `Invoke-Command -AsJob { … }` — anything whose spawn is
-    # wrapped in a script-block literal handed to a callee.  If the spawn is inside a
-    # ScriptBlockExpressionAst that is a command argument, that is the wrap.
+    # wrapped in a script-block literal that will be evaluated later.
+    #
+    # ANY ScriptBlockExpressionAst in the ancestor chain implies the spawn is a
+    # deferred expression literal. Normal synchronous control flow (bodies of
+    # foreach/if/while/try/functions) parses as ScriptBlockAst / StatementBlockAst,
+    # NOT ScriptBlockExpressionAst. A parent-type filter (CommandAst /
+    # InvokeMemberExpressionAst / …) creates a bypass when the script-block literal
+    # is wrapped in an intermediate expression — `({ … })`, `@({ … })`, or
+    # `[scriptblock]({ … })` — because the immediate parent becomes a
+    # ParenExpressionAst / ArrayLiteralAst / ConvertExpressionAst. Detecting the
+    # ScriptBlockExpressionAst directly, with no parent filter, closes that class.
+    # (PR-gate blocking #1 on round-2, addressed here.)
     if ($n -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
-        $p = $n.Parent
-        if ($p -is [System.Management.Automation.Language.CommandAst] -or
-            $p -is [System.Management.Automation.Language.CommandExpressionAst] -or
-            $p -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) {
-            $badAncestors.Add(
-                "spawn is inside a ScriptBlockExpressionAst passed to $($p.GetType().Name) " +
-                "at line $($p.Extent.StartLineNumber): [$($p.Extent.Text.Substring(0, [Math]::Min(80, $p.Extent.Text.Length)))]")
-        }
+        $badAncestors.Add(
+            "spawn is inside a ScriptBlockExpressionAst at line $($n.Extent.StartLineNumber): " +
+            "[$($n.Extent.Text.Substring(0, [Math]::Min(80, $n.Extent.Text.Length)))] " +
+            "(sync control-flow bodies parse as ScriptBlockAst/StatementBlockAst, not " +
+            "ScriptBlockExpressionAst — a ScriptBlockExpressionAst on the chain means the " +
+            "spawn is a deferred script-block literal)")
     }
     $n = $n.Parent
 }
