@@ -41,15 +41,23 @@
 #         `Join-Path $PSScriptRoot 'run-conductor.ps1'`.  Without this,
 #         L2a is trivially defeated by repointing $inner at a job wrapper
 #         and changing nothing at the call site.
-#   L2c — walking from the spawn site's CommandAst up the .Parent chain:
+#   L2c — walking from the spawn site's CommandAst up the .Parent chain
+#         asserts the RESHAPING boundary only: the walk sees the existing
+#         spawn's ancestors and nothing else in the body. It catches
+#         parallelization that MOVES `& $inner` into a script block; it
+#         does NOT catch DUPLICATION (a launch path added BESIDE the
+#         pinned spawn), and nothing else in this suite does either. See
+#         the "Spawn DUPLICATION" bullet in "Explicitly NOT covered here"
+#         for the design record (options considered, why each was refused,
+#         measured cost of the extraction option).
 #           * the walk reaches $dispatchLoop (not stopped by anything else),
 #           * no ancestor PipelineAst has .Background,
 #           * no ancestor is a ScriptBlockExpressionAst passed as a command
-#             argument (that is the SHAPE of `Start-Job { … }`,
-#             `ForEach-Object -Parallel { … }`, `[Task]::Run({ … })`, etc.).
-#         L2c catches parallelization that MOVES `& $inner` into a script
-#         block. It does NOT catch duplication (a launch path added BESIDE
-#         the pinned spawn) — that class is a separate thread.
+#             argument. The shapes `Start-Job { … }`, `ForEach-Object
+#             -Parallel { … }`, `[Task]::Run({ … })`, etc. are caught by
+#             this ONLY when the mutation reshapes the existing spawn into
+#             one of them; the same shapes added as a SECOND launch path
+#             beside `& $inner` are NOT reached by this walk.
 #
 #   L3b — inside the dispatch body, every InvokeMemberExpressionAst whose
 #         target is a TypeExpressionAst (i.e. every `[Type]::Method(...)`
@@ -77,8 +85,43 @@
 #     $inner` on a branch). L2c walks the ancestor chain of the EXISTING
 #     spawn, so it catches parallelization that MOVES `& $inner` into a
 #     script block, and does not see a second launch path adjacent to it.
-#     Fixing this reopens the L3a design question. Tracked separately as
-#     T-sweep-pin-blind-to-launch-paths-added-beside-the-spawn.
+#     Thread: T-sweep-pin-blind-to-launch-paths-added-beside-the-spawn.
+#
+#     Four closures were evaluated. The reason each was refused lives
+#     here so a re-open does not pay the measurement twice:
+#       (a) body-scoped `$inner`-occurrence check — WITHDRAWN, dies to a
+#           recompute bypass that does not name the variable:
+#           `Start-Job -FilePath (Join-Path $PSScriptRoot
+#           'run-conductor-once.ps1')` has zero occurrences of `$inner`.
+#       (b) denylist of async command names — REFUSED as structurally
+#           leaky ([System.Threading.Tasks.Task]::Run, [runspacefactory],
+#           `& $inner &` in PS7, and any wrapper defined elsewhere all
+#           miss the list; a denylist that fails-closed on unknowns is a
+#           category error).
+#       (c) extract the dispatch body into a small named function and
+#           allowlist it — REFUSED on measured T1 failure. The dispatch
+#           foreach body at deploy/run-conductor-scheduled.ps1:3035-3287
+#           measured 37 top-level statements (14 AssignmentStatementAst
+#           + 14 IfStatementAst + 9 PipelineAst) against a pre-declared
+#           threshold of ≤25, and ≥24 read-only captured names plus ≥10
+#           mutated-inherited names (three flag/accumulator writes and
+#           seven `++` counters, each needing [ref] or $script:
+#           threading) against a threshold of ≤3. Thresholds were pinned
+#           in advance (msg-615) so the reading could not be reshaped by
+#           the result. Resolution method: identity walk (S1→S2→S3, same
+#           as this file's dispatch-loop derivation) — not a depth
+#           heuristic — so the number reproduces from the pin's own
+#           logic without a separate script. Spawn-only extraction
+#           ("extract just the `& $inner` line into Invoke-Inner") is
+#           the same option in disguise: guarding a small named function
+#           reduces to "assert this function is called once", which is
+#           (a) with a function name substituted for the variable and
+#           dies to the identical recompute bypass.
+#       (d) accept and declare — SELECTED. This bullet IS (d). The hole
+#           is documented, its shape is named, and the measured cost of
+#           closing it is recorded so a future engineer who wants to
+#           re-open the extraction option knows what they are paying
+#           before they start.
 #   * Renaming the candidate collection from `$candidates` to something
 #     else (or changing the iteration to a pipeline expression) will trip
 #     S2's zero-match assertion. This is a deliberate declared cost of
