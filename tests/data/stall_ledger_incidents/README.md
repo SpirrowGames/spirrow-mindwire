@@ -30,12 +30,26 @@ time must be added here as a new file.
 }
 ```
 
-`expected_verdict = "not-representable"` is a first-class outcome. Some
-incidents (e.g. M-3: CI runs are never generated because the PR is dirty)
-require input shapes the current heartbeat schema does not carry. That
-"cannot be represented" IS the finding, and is preserved here rather than
-silently dropped — it is msg-2692 §4-5's "fixture 化できない incident は §3-1
-に対する発見として記録" clause made mechanical.
+`expected_verdict = "not-representable"` is a first-class outcome. If a
+future operator-observed incident carries a shape the current schema cannot
+express (a purely hypothetical example: an incident whose entire signal is
+"the sweep never ran on this repo in the last N ticks", a signal `PrState`
+/ `QuarantineState` / `ThreadState` do not currently carry), the fixture
+records `"expected_verdict": "not-representable"` and a `not_representable_
+reason` naming the missing schema field. That "cannot be represented" IS the
+finding, and is preserved here rather than silently dropped — it is msg-2692
+§4-5's "fixture 化できない incident は §3-1 に対する発見として記録" clause
+made mechanical.
+
+**None of the four seed fixtures (M-1..M-4) are currently not-representable.**
+All four are shipped with `"expected_verdict": "stall"` and fire against the
+production `stalled()` predicate. M-3 in particular — the CONFLICTING PR
+with no CI run — is representable via `verdict_recorded_as_indefinite_input:
+true` + `merge_state_is_executable: false`; the "no CI run" input shape is
+captured indirectly through the disposition it forces (see the fixture's
+`notes` field). A prior draft of this README used M-3 as the not-representable
+example, which contradicted the fixture on disk and misled readers about the
+schema's capabilities — corrected in PR-gate round 6 (msg-2708).
 
 ## What the backtest asserts
 

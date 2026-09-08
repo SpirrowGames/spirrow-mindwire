@@ -35,6 +35,41 @@ from spirrow_mindwire.stall_ledger.heartbeat import (
 # --------------------------------------------------------------------------- #
 
 
+class TestSourceReportShape:
+    """PR-gate msg-2708 regression pin: ``observed_format_version`` lives on
+    ``SourceReport`` itself, not in a parallel dict on ``HeartbeatRecord``.
+
+    The prior draft split the version stamp off into ``HeartbeatRecord.
+    observed_format_versions`` and forced ``__post_init__`` to run a
+    synchronisation loop checking that every source name had a matching
+    dict entry — the dual-management pattern rounds 1-5 kept reducing to.
+    This test pins the shape so a future edit that re-splits them reds.
+    """
+
+    def test_observed_format_version_is_a_field_on_source_report(self) -> None:
+        # dataclasses.fields is the loader-independent way to assert this.
+        import dataclasses
+
+        field_names = {f.name for f in dataclasses.fields(SourceReport)}
+        assert "observed_format_version" in field_names, (
+            "SourceReport must carry observed_format_version directly. "
+            "Splitting it off into a parallel dict on HeartbeatRecord "
+            "reintroduces the dual-management pattern PR-gate msg-2708 "
+            "removed."
+        )
+
+    def test_heartbeat_record_does_not_carry_observed_format_versions(self) -> None:
+        import dataclasses
+
+        field_names = {f.name for f in dataclasses.fields(HeartbeatRecord)}
+        assert "observed_format_versions" not in field_names, (
+            "HeartbeatRecord must NOT carry observed_format_versions as a "
+            "parallel dict. Per PR-gate msg-2708, the version stamp lives "
+            "on SourceReport; re-splitting them here recreates the sync "
+            "loop the round-6 refactor eliminated."
+        )
+
+
 class TestAccountingRule:
     def test_matches_examined_is_ok(self) -> None:
         SourceReport(
@@ -43,6 +78,7 @@ class TestAccountingRule:
             examined=3,
             recognized=2,
             unrecognized=1,
+            observed_format_version="v1",
         )  # no raise
 
     def test_undercount_raises(self) -> None:
@@ -57,6 +93,7 @@ class TestAccountingRule:
                 examined=5,
                 recognized=2,
                 unrecognized=1,  # 3 rows silently disappeared
+                observed_format_version="v1",
             )
 
     def test_overcount_raises(self) -> None:
@@ -71,6 +108,7 @@ class TestAccountingRule:
                 examined=3,
                 recognized=2,
                 unrecognized=2,
+                observed_format_version="v1",
             )
 
     def test_negative_counts_rejected(self) -> None:
@@ -85,6 +123,7 @@ class TestAccountingRule:
                 examined=-1,
                 recognized=0,
                 unrecognized=0,
+                observed_format_version="v1",
             )
 
 
@@ -107,6 +146,7 @@ def _make_source(
     examined: int = 0,
     recognized: int = 0,
     unrecognized: int = 0,
+    observed_format_version: str = "v1",
 ) -> SourceReport:
     return SourceReport(
         name=name,
@@ -114,24 +154,25 @@ def _make_source(
         examined=examined,
         recognized=recognized,
         unrecognized=unrecognized,
+        observed_format_version=observed_format_version,
     )
 
 
 def _make_record(
     *sources: SourceReport,
     input_format_version: str = "v1",
-    observed: dict[str, str] | None = None,
     evaluated_at: datetime = datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
     last_valid_ingest_at: datetime | None = None,
     stalls: tuple[str, ...] = (),
 ) -> HeartbeatRecord:
-    if observed is None:
-        observed = {src.name: input_format_version for src in sources}
+    # msg-2708 refactor: observed_format_version lives on SourceReport now,
+    # so ``_make_record`` no longer accepts a parallel ``observed`` dict.
+    # Tests that want a version mismatch build the source with a mismatched
+    # ``observed_format_version=`` directly.
     return HeartbeatRecord(
         evaluated_at=evaluated_at,
         input_format_version=input_format_version,
         sources=tuple(sources),
-        observed_format_versions=observed,
         last_valid_ingest_at=last_valid_ingest_at,
         stalls=stalls,
     )
@@ -187,9 +228,14 @@ class TestStateDerivation:
         """
 
         rec = _make_record(
-            _make_source("prs", FetchOutcome.OK, examined=1, recognized=1),
+            _make_source(
+                "prs",
+                FetchOutcome.OK,
+                examined=1,
+                recognized=1,
+                observed_format_version="v2",  # emitter says v2, we expect v1
+            ),
             input_format_version="v1",
-            observed={"prs": "v2"},  # emitter says v2, we expect v1
         )
         assert derive_state(rec) == HealthState.INGEST_FAILURE
 
@@ -243,7 +289,6 @@ class TestEmptySourcesTrap:
                 evaluated_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
                 input_format_version="v1",
                 sources=(),
-                observed_format_versions={},
             )
 
     def test_build_classmethod_also_rejects_empty_sources(self) -> None:
@@ -259,7 +304,6 @@ class TestEmptySourcesTrap:
                 evaluated_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
                 input_format_version="v1",
                 sources=(),
-                observed_format_versions={},
                 previous_last_valid_ingest_at=None,
             )
 
@@ -278,7 +322,6 @@ def _build_rec(
     previous_last_valid_ingest_at: datetime | None = None,
     evaluated_at: datetime = datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
     input_format_version: str = "v1",
-    observed: dict[str, str] | None = None,
     stalls: tuple[str, ...] = (),
 ) -> HeartbeatRecord:
     """Test helper: build a record through the production ``HeartbeatRecord.build()``
@@ -286,13 +329,10 @@ def _build_rec(
     production code must go through.
     """
 
-    if observed is None:
-        observed = {src.name: input_format_version for src in sources}
     return HeartbeatRecord.build(
         evaluated_at=evaluated_at,
         input_format_version=input_format_version,
         sources=tuple(sources),
-        observed_format_versions=observed,
         previous_last_valid_ingest_at=previous_last_valid_ingest_at,
         stalls=stalls,
     )
@@ -585,9 +625,14 @@ class TestDigestRendering:
 
     def test_version_drift_is_annotated_on_evidence(self) -> None:
         rec = _make_record(
-            _make_source("prs", FetchOutcome.OK, examined=1, recognized=1),
+            _make_source(
+                "prs",
+                FetchOutcome.OK,
+                examined=1,
+                recognized=1,
+                observed_format_version="v2",  # msg-2708: on the source itself
+            ),
             input_format_version="v1",
-            observed={"prs": "v2"},
         )
         lines = render_digest_lines(record=rec, now=rec.evaluated_at)
         assert any("version_drift" in line for line in lines[1:])

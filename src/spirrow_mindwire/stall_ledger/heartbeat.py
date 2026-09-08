@@ -129,8 +129,9 @@ class SourceReport:
 
     Every ledger evaluation walks 1..N sources (GitHub REST for PRs, chatroom
     API for threads, filesystem for quarantine.json). Each source reports its
-    outcome and its counts INDEPENDENTLY so an outage in one source does not
-    silently mask an idle-but-healthy signal from another.
+    outcome, its counts, AND its own observed schema version INDEPENDENTLY so
+    an outage in one source does not silently mask an idle-but-healthy signal
+    from another.
 
     Accounting invariant: ``recognized + unrecognized == examined``. The
     ``__post_init__`` validator asserts it here so a producer cannot silently
@@ -138,6 +139,15 @@ class SourceReport:
     ``unrecognized > 0`` and inherit the ``ingest_failure`` state. This is the
     load-bearing defence against schema drift: graceful-empty is structurally
     impossible when the accounting is enforced.
+
+    PR-gate msg-2708 (Tier B round 6) ADVISORY fix: ``observed_format_version``
+    lives HERE, not in a parallel dict on ``HeartbeatRecord``. Splitting the
+    version stamp off into ``HeartbeatRecord.observed_format_versions`` had
+    forced a synchronisation loop in ``__post_init__`` to check that every
+    source name had a matching dict entry — the exact "dual-management" shape
+    Principle 2 forbids and the same shape rounds 1-5 kept reducing to. A
+    version stamp is per-source data by construction; it belongs on the
+    per-source record.
     """
 
     name: str
@@ -145,6 +155,7 @@ class SourceReport:
     examined: int
     recognized: int
     unrecognized: int
+    observed_format_version: str
 
     def __post_init__(self) -> None:
         # Non-negative — a negative count would already be a bug on the emitter
@@ -169,7 +180,7 @@ class SourceReport:
                 "row must land in exactly one of the two buckets."
             )
 
-    def is_failure(self, expected_format_version: str, observed_version: str) -> bool:
+    def is_failure(self, expected_format_version: str) -> bool:
         """Would this source flip the record's state to ``ingest_failure``?
 
         ``fetch_outcome != ok`` — transport did not succeed.
@@ -181,38 +192,17 @@ class SourceReport:
         ``examined == 0`` is DELIBERATELY not a failure here (msg-2692 §1,
         msg-2691 blocking #1): a healthy source with no items to report is
         the ``idle`` state, not a failure.
+
+        The observed version is read from ``self.observed_format_version``
+        (msg-2708 refactor); the caller only supplies the parser's
+        ``expected_format_version``, which is one string per record.
         """
 
         if self.fetch_outcome != FetchOutcome.OK:
             return True
         if self.unrecognized > 0:
             return True
-        return expected_format_version != observed_version
-
-
-def _is_source_failing(
-    src: SourceReport,
-    *,
-    expected_format_version: str,
-    observed_format_versions: Mapping[str, str],
-) -> bool:
-    """Stateless helper: does ``src`` push the record to ``ingest_failure``?
-
-    PR-gate msg-2705 (Tier B round 5) ADVISORY regression pin: this helper is
-    the ONE place the ``(src, expected_version, observed_map)`` triple is
-    unwrapped into a call to ``SourceReport.is_failure``. Both
-    ``HeartbeatRecord.build()`` (which cannot call an instance method before
-    the record exists) and ``HeartbeatRecord.failing_sources()`` (which
-    reads the same map from ``self``) delegate here so any future evolution
-    of ``is_failure``'s signature has one call site, not two. Guarding one
-    invariant in two places was the dual-management pattern rounds 1-4 all
-    reduced to; this helper closes the last remaining instance in the module.
-    """
-
-    return src.is_failure(
-        expected_format_version=expected_format_version,
-        observed_version=observed_format_versions.get(src.name, ""),
-    )
+        return expected_format_version != self.observed_format_version
 
 
 @dataclass(frozen=True)
@@ -240,18 +230,19 @@ class HeartbeatRecord:
                                       is not respected (PR-gate msg-2696).
         * ``sources``               — per-source SourceReport list; the digest
                                       surfaces this as subordinate evidence
-                                      under the state name.
+                                      under the state name. Each report
+                                      carries its OWN ``observed_format_version``
+                                      as a field (msg-2708 refactor).
         * ``stalls``                — the actual level-triggered stall list.
-        * ``input_format_version``  — this evaluation's expected version.
-        * ``observed_format_versions`` — the version stamp EACH source sent;
-                                      a mismatch flips the record to
-                                      ``ingest_failure`` on that source.
+        * ``input_format_version``  — this evaluation's expected version. One
+                                      string on the record; the parser has one
+                                      expectation, sources declare per-source
+                                      observations.
     """
 
     evaluated_at: datetime
     input_format_version: str
     sources: tuple[SourceReport, ...]
-    observed_format_versions: Mapping[str, str]
     last_valid_ingest_at: datetime | None = None
     stalls: tuple[str, ...] = field(default_factory=tuple)
 
@@ -271,18 +262,13 @@ class HeartbeatRecord:
                 "materialise a bare record and expect the state machine to "
                 "carry the missing information."
             )
-        # Every source that reports must have a matching observed_format_versions
-        # entry — the version stamp is a REQUIRED part of the source report,
-        # not an optional add-on. Making the two fields separate keeps the
-        # per-source counts frozen even when the version stamp API changes
-        # shape, but the two MUST stay in sync per evaluation.
-        for src in self.sources:
-            if src.name not in self.observed_format_versions:
-                raise ValueError(
-                    f"HeartbeatRecord: source {src.name!r} has no version stamp in "
-                    "observed_format_versions — every source must declare which "
-                    "schema its payload was produced against."
-                )
+        # PR-gate msg-2708 (Tier B on #237, round 6): the version-stamp cross-
+        # check loop that used to live here is GONE. ``observed_format_version``
+        # is now a required field ON ``SourceReport`` itself, so a source
+        # without a version stamp cannot even be constructed and no
+        # synchronisation loop between two collections is possible. The
+        # dual-management pattern this whole 6-round exchange kept reducing
+        # to has one fewer instance in the module.
 
     @classmethod
     def build(
@@ -291,7 +277,6 @@ class HeartbeatRecord:
         evaluated_at: datetime,
         input_format_version: str,
         sources: tuple[SourceReport, ...],
-        observed_format_versions: Mapping[str, str],
         previous_last_valid_ingest_at: datetime | None,
         stalls: tuple[str, ...] = (),
     ) -> HeartbeatRecord:
@@ -328,18 +313,18 @@ class HeartbeatRecord:
         constructor points here.
         """
 
-        # Delegate to ``_is_source_failing`` so this call site and
-        # ``failing_sources()`` share one implementation of the predicate
-        # (PR-gate msg-2705 ADVISORY). The empty-sources ``__post_init__``
-        # guard has already refused empty ``sources`` for us, so ``any(...)``
-        # here cannot be vacuously satisfied on an empty iterable.
+        # msg-2708 refactor: ``SourceReport.is_failure`` now needs only the
+        # parser's expected version (each source carries its own observed
+        # version as a field). One canonical entry point (``is_failure``)
+        # used at both call sites — the ``_is_source_failing`` helper the
+        # round-5 refactor introduced became a trivial pass-through once the
+        # observed-map disappeared and was removed with it. Both this method
+        # and ``failing_sources`` now call ``src.is_failure(expected)``
+        # directly. The empty-sources ``__post_init__`` guard has already
+        # refused empty ``sources`` for us, so ``any(...)`` here cannot be
+        # vacuously satisfied on an empty iterable.
         any_source_failed = any(
-            _is_source_failing(
-                src,
-                expected_format_version=input_format_version,
-                observed_format_versions=observed_format_versions,
-            )
-            for src in sources
+            src.is_failure(expected_format_version=input_format_version) for src in sources
         )
 
         # msg-2692 §2: healthy OR idle → advance to this tick's evaluated_at;
@@ -350,7 +335,6 @@ class HeartbeatRecord:
             evaluated_at=evaluated_at,
             input_format_version=input_format_version,
             sources=sources,
-            observed_format_versions=observed_format_versions,
             last_valid_ingest_at=new_last_valid,
             stalls=stalls,
         )
@@ -388,20 +372,17 @@ class HeartbeatRecord:
     def failing_sources(self) -> tuple[SourceReport, ...]:
         """Return the sources that pushed this record to INGEST_FAILURE state.
 
-        Delegates to the module-level ``_is_source_failing`` helper so this
-        instance method and ``HeartbeatRecord.build()`` share one place
-        that knows how to unwrap the ``(src, expected_version, observed_map)``
-        triple into a per-source failure verdict (PR-gate msg-2705 ADVISORY).
+        Calls ``SourceReport.is_failure`` directly — after msg-2708 the
+        observed version lives on the source itself, so the (src, expected,
+        observed_map) triple that motivated a helper in round 5 is gone.
+        The one canonical entry point for "is this source failing?" is
+        now ``SourceReport.is_failure``, at every call site.
         """
 
         return tuple(
             src
             for src in self.sources
-            if _is_source_failing(
-                src,
-                expected_format_version=self.input_format_version,
-                observed_format_versions=self.observed_format_versions,
-            )
+            if src.is_failure(expected_format_version=self.input_format_version)
         )
 
 
@@ -527,10 +508,12 @@ def render_digest_lines(record: HeartbeatRecord, now: datetime) -> tuple[str, ..
 
     lines: list[str] = [header]
     for src in record.sources:
-        observed = record.observed_format_versions.get(src.name, "?")
+        # msg-2708: the observed version lives on the source itself. No dict
+        # lookup, no cross-collection sync, no missing-key fallback needed.
         version_note = (
-            f" version_drift(expected={record.input_format_version!r} observed={observed!r})"
-            if observed != record.input_format_version
+            f" version_drift(expected={record.input_format_version!r} "
+            f"observed={src.observed_format_version!r})"
+            if src.observed_format_version != record.input_format_version
             else ""
         )
         lines.append(
