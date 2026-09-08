@@ -1663,11 +1663,15 @@ async def test_precheck_read_fault_reports_through_the_unified_surface(tmp_path:
 async def test_w2_post_refused_thread_resolved_is_terminal_clears_episode() -> None:
     """Visibility post → ``ThreadResolvedError`` → episode cleared, floor kept.
 
-    Reader-mode note (msg-536 W4b): the operator IS the reader here, and the
-    :class:`VisibilityReport` returned from the visibility hook rides on the
-    tick's JSON output — a durable operator-readable surface. So the
-    "terminal, no chatroom post" disposition is not silence: the failure
-    action is legible in the same log line the operator already reads.
+    Reader-mode note (msg-536 W4b) — POINTER ONLY, do not restate here. The
+    reader/fallback-surface declaration that
+    ``OBL-CHATROOM-PRODUCER-READER-SURFACE`` demands lives at the write site,
+    as fact (c) of the ``except ThreadResolvedError`` branch in
+    :meth:`CloseFailureVisibility.on_close_failure`. Read it there. This
+    docstring deliberately keeps no second copy: the obligation requires the
+    answer in the producer, and two copies of the reasoning drift the moment
+    the producer changes (Bohr msg-554 S-1). What this test pins is the
+    BEHAVIOUR that declaration describes, below.
 
     The two directions this test pins together (they must both hold):
       * The episode entry for this project is REMOVED after the terminal

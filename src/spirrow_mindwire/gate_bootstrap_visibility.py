@@ -839,7 +839,7 @@ class CloseFailureVisibility:
             await mcp.call_tool(_POST_MESSAGE_TOOL, arguments)
         except ThreadResolvedError as resolved_exc:
             # W2 (T-sweeper-posts-into-resolved-thread-blocks-r2-deploy Bohr
-            # msg-536): the target thread is resolved. Two facts follow:
+            # msg-536): the target thread is resolved. Three facts follow:
             #
             #   (a) The sweeper's goal is met — the alert thread is not open.
             #       Under the current close_alert design, the next tick's
@@ -856,6 +856,28 @@ class CloseFailureVisibility:
             #       fact msg-532 W2 named (Bohr msg-534: "409-on-resolved
             #       is permanent for that thread; a retry policy that
             #       treats it as transient spins forever").
+            #   (c) Reader and fallback surface — the declaration
+            #       OBL-CHATROOM-PRODUCER-READER-SURFACE requires from every
+            #       chatroom producer, in the producer's own comments, at the
+            #       write site (Bohr msg-554). Of the obligation's three
+            #       allowed surfaces this producer takes **disposition (1)**,
+            #       an alternative durable surface that reaches the intended
+            #       reader:
+            #         * intended reader: the OPERATOR (not a loop role — no
+            #           role reads this payload; the sweeper's alert thread is
+            #           an operator-facing surface).
+            #         * surface that reaches them once the thread is gone: the
+            #           tick's JSON output. The :class:`VisibilityReport`
+            #           returned immediately below rides on it as
+            #           ``action="post_terminal_thread_resolved"`` with a
+            #           ``reason`` string — a durable operator-readable
+            #           surface the operator already reads every tick.
+            #       So "terminal, no chatroom post" is a SINK, not silence
+            #       (msg-532): the refusal stays legible on the surface its
+            #       reader is already looking at. If you change the post
+            #       behaviour here, keep a surface that reaches the operator
+            #       or re-declare the disposition — this comment is the
+            #       obligation's only enforcement (no machine check exists).
             #
             # Clear the episode (Rule 1 — positive observation of goal state);
             # DO NOT touch the floor (Rule 2 — flapping protection unchanged).

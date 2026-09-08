@@ -490,16 +490,18 @@ obligations:
     #
     # Companion mechanism: :class:`spirrow_mindwire.magickit.client.
     # ThreadResolvedError` (msg-536 W5) — the typed exception producers catch
-    # to fire the disposition. Producers already covered by this obligation:
-    # :func:`spirrow_mindwire.gate_bootstrap.close_alert` (world-observation
-    # preserves goal state; no chatroom write needed);
+    # to fire the disposition.
+    #
+    # Producers already covered, as BARE POINTERS ONLY (Bohr msg-554 S-1): each
+    # producer's reader and fallback surface are declared in that producer's own
+    # comments, which is what `body` below requires. Do not restate the answers
+    # here — a per-producer answer list in the manifest goes stale the moment a
+    # producer changes, and one authoritative copy is the placement discipline
+    # of ADR-2026-05-29-13. Read them at the sites:
+    # :func:`spirrow_mindwire.gate_bootstrap.close_alert`;
     # :class:`spirrow_mindwire.gate_bootstrap_visibility.CloseFailureVisibility`
-    # (W2 — reader is the operator, log-only sink is legal because the tick's
-    # JSON output IS a durable operator-readable surface);
-    # :class:`spirrow_mindwire.orchestrator.PrReviewOrchestrator` and
-    # :meth:`spirrow_mindwire.conductor.core.Conductor._post_pr_relay` (W3 —
-    # reader is the human on the PR; the GitHub PR review submitted by the
-    # driver IS the primary artifact, chatroom post is a secondary record).
+    # (W2); :class:`spirrow_mindwire.orchestrator.PrReviewOrchestrator` and
+    # :meth:`spirrow_mindwire.conductor.core.Conductor._post_pr_relay` (W3).
     body: |
       CHATROOM PRODUCER: DECLARE READER AND FALLBACK SURFACE. When you write
       code that posts into a chatroom thread, answer two questions in the
