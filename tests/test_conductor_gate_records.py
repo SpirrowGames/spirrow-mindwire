@@ -9,7 +9,12 @@ the load-bearing ones, not the parser unit tests.
 
 from __future__ import annotations
 
+import json
+
 from spirrow_mindwire.conductor.gate_records import (
+    _CI_ROUTE_CLOSE,
+    _CI_ROUTE_OPEN,
+    _CI_ROUTE_RE,
     ci_route_heads,
     normalize_sha,
     render_ci_route_marker,
@@ -42,6 +47,55 @@ def test_ci_route_marker_round_trips_through_a_relay_body() -> None:
     assert ci_route_heads([body]) == frozenset({_SHA})
 
 
+def test_ci_route_marker_survives_a_check_name_that_closes_the_comment() -> None:
+    # ``checks`` holds GitHub check-run names — arbitrary strings chosen by the TARGET repo's
+    # workflow, so the writer may not assume they are marker-safe. A name holding ``}`` followed
+    # by nothing but spaces and ``-->`` ends _CI_ROUTE_RE's non-greedy capture early; the reader
+    # then sees truncated JSON, drops the head, and R5 stops firing for it with no error
+    # anywhere — exactly the silent write/read drift this module exists to prevent.
+    hostile = "x} --> y"
+    marker = render_ci_route_marker(head=_SHA, conclusion="failure", checks=[hostile])
+    assert ci_route_heads([marker]) == frozenset({_SHA})
+
+    # The escape costs the reader nothing: json.loads gives the name back verbatim, so the
+    # human-facing field is preserved rather than sanitised away.
+    assert json.loads(_CI_ROUTE_RE.findall(marker)[0])["checks"] == [hostile]
+
+    # Negative control, deliberately in this same test: the SAME check name in a marker built
+    # the way this function built them before the escape existed. It contributes no head, so
+    # what rescues the head above is demonstrably the escape and not a property of the input.
+    unescaped = (
+        _CI_ROUTE_OPEN
+        + json.dumps(
+            {"head": _SHA, "conclusion": "failure", "checks": [hostile]},
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        + _CI_ROUTE_CLOSE
+    )
+    assert ci_route_heads([unescaped]) == frozenset()
+
+
+def test_ci_route_marker_never_emits_the_comment_close_in_its_payload() -> None:
+    # The test above pins the BEHAVIOUR for one hostile name; this pins the INVARIANT that
+    # behaviour rests on, across the family: whatever ``checks`` contains, the only ``-->`` in a
+    # rendered marker is the delimiter this module wrote itself. Tab/newline/CR were already
+    # safe because ensure_ascii escapes them; a plain space between ``}`` and ``-->`` was not,
+    # which is why the trigger is narrower than "the name contains an arrow".
+    hostile = ["x} --> y", "x}-->y", "}-->", "a}   -->b", "<!-- -->", "-->"]
+    for name in hostile:
+        marker = render_ci_route_marker(head=_SHA, conclusion="failure", checks=[name])
+        assert marker.startswith(_CI_ROUTE_OPEN)
+        assert marker.endswith(_CI_ROUTE_CLOSE)
+        payload = marker[len(_CI_ROUTE_OPEN) : -len(_CI_ROUTE_CLOSE)]
+        assert "-->" not in payload, f"check name {name!r} closed the marker early: {payload!r}"
+
+    # All of them in one marker, which is the real shape when several checks go red at once.
+    together = render_ci_route_marker(head=_SHA, conclusion="failure", checks=hostile)
+    assert "-->" not in together[len(_CI_ROUTE_OPEN) : -len(_CI_ROUTE_CLOSE)]
+    assert ci_route_heads([together]) == frozenset({_SHA})
+
+
 def test_ci_route_heads_collects_every_head_across_messages() -> None:
     other = "0" * 40
     bodies = [
@@ -55,8 +109,9 @@ def test_ci_route_heads_collects_every_head_across_messages() -> None:
 def test_ci_route_heads_ignores_a_malformed_marker_without_raising() -> None:
     # A scheduled loop reads a thread it does not control. One unparseable comment must cost
     # exactly one head, not the tick. The cost of the drop is bounded and named in the module:
-    # R5 does not fire for that head, so a second red routes an implementer (R4's behaviour,
-    # i.e. what happened before this wiring existed) instead of escalating.
+    # R5 does not fire for that head, so a second red routes an implementer (R4's behaviour --
+    # strictly more conservative than the pre-wiring path, which fired the gate regardless of
+    # CI) instead of escalating.
     bodies = [
         "<!-- mindwire:ci-route v1 {not json} -->",
         '<!-- mindwire:ci-route v1 ["a","list","not","an","object"] -->',

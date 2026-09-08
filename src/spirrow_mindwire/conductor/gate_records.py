@@ -79,13 +79,22 @@ def render_ci_route_marker(*, head: str, conclusion: str, checks: Sequence[str])
     """The R4 marker for ``head``, in the design's compact form.
 
     ``checks`` names the red checks, for a human reading the thread; only ``head`` is read back
-    by :func:`ci_route_heads`, so a change to the other fields cannot break R5.
+    by :func:`ci_route_heads`, so a change to the other fields cannot break R5 — the ``>`` escape
+    below is what makes that true. Without it a check name containing ``}`` followed by ``-->``
+    (GitHub check-run names are arbitrary strings, written in the target repo's workflow) would
+    close this comment early, and the reader's non-greedy capture would truncate the payload.
     """
     payload = json.dumps(
         {"head": normalize_sha(head), "conclusion": conclusion, "checks": list(checks)},
         separators=(",", ":"),
         ensure_ascii=True,
     )
+    # ``>`` is never JSON syntax — it can only occur inside a string value — so escaping it here
+    # makes ``-->`` structurally impossible inside the payload, and _CI_ROUTE_RE's non-greedy
+    # capture can no longer stop short of this marker's own closing brace. json.loads restores
+    # the character, so the value a reader gets back is unchanged. Tab/newline/CR were already
+    # safe (ensure_ascii turns them into backslash escapes); a plain space was not.
+    payload = payload.replace(">", "\\u003e")
     return f"{_CI_ROUTE_OPEN}{payload}{_CI_ROUTE_CLOSE}"
 
 
@@ -95,8 +104,10 @@ def ci_route_heads(bodies: Iterable[str]) -> frozenset[str]:
     A malformed marker contributes nothing instead of raising: the caller is a scheduled loop
     reading a thread it does not control, and one unparseable comment must not stop the tick.
     The cost of dropping one is bounded and known — R5 does not fire for that head, so a second
-    red routes an implementer instead of a human, which is R4's behaviour, i.e. the behaviour
-    before this wiring existed.
+    red routes an implementer instead of a human, which is R4's behaviour — strictly more
+    conservative than the pre-wiring path, which fired the gate regardless of CI (see
+    :class:`~spirrow_mindwire.conductor.core.CheckRollupSource` and the "pre-wiring behaviour"
+    log line beside it, both of which name firing the gate as what came before).
     """
     heads: set[str] = set()
     for body in bodies:
