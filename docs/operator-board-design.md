@@ -1,6 +1,6 @@
 # Operator Board — 設計書（実装レベル）
 
-版: **0.3.4** / 2026-09-08 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除、msg-2567 → msg-2569 で v0.3.1 blocking 解除、msg-（v0.3.4 endorse）で §17 承認）+ PR-review naysayer（PR #224 msg-(gate) → v0.3.2 で 2 件 blocking 解除、round-2 → v0.3.3 で 1 件 blocking 解除、round-3 → APPROVE with structure advisory on `ci_clock_start`）/ v0.2 差分の正本: Bohr msg-2544 / v0.3 差分の正本: Bohr msg-2566 / v0.3.1 差分の正本: Bohr msg-2568 / v0.3.2 差分の正本: 本ファイル §5.2A（Heisenberg、PR-review msg-(gate) 受け入れ）/ v0.3.3 差分の正本: 本ファイル §5.2A.4 R1a/R1b 行（Heisenberg、PR-review msg-(gate) round-2 受け入れ）/ v0.3.4 差分の正本: 本ファイル §17（Bohr msg-2595、人 msg-2594 decide 後の残余レジスタ新設）
+版: **0.3.5** / 2026-09-08 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除、msg-2567 → msg-2569 で v0.3.1 blocking 解除、msg-（v0.3.4 endorse）で §17 承認、msg-2664 で §17 second-round correctness + structure 指摘、msg-（v0.3.5 endorse）で §17.1 4 行目 + §17.3 承認）+ PR-review naysayer（PR #224 msg-(gate) → v0.3.2 で 2 件 blocking 解除、round-2 → v0.3.3 で 1 件 blocking 解除、round-3 → APPROVE with structure advisory on `ci_clock_start`）/ v0.2 差分の正本: Bohr msg-2544 / v0.3 差分の正本: Bohr msg-2566 / v0.3.1 差分の正本: Bohr msg-2568 / v0.3.2 差分の正本: 本ファイル §5.2A（Heisenberg、PR-review msg-(gate) 受け入れ）/ v0.3.3 差分の正本: 本ファイル §5.2A.4 R1a/R1b 行（Heisenberg、PR-review msg-(gate) round-2 受け入れ）/ v0.3.4 差分の正本: 本ファイル §17（Bohr msg-2595、人 msg-2594 decide 後の残余レジスタ新設）/ v0.3.5 差分の正本: 本ファイル §17.1 4 行目 + §17.3（Bohr msg-2665、Einstein msg-2664 の correctness + structure 指摘を受け入れ、gate pending 保留の re-fire 経路欠落を §17 に固定）
 設計 SOT: chatroom `spirrow-mindwire/T-operator-board`。本文はその同期コピー。
 対象リポジトリ: spirrow-conclair（状態）・spirrow-mindwire（tick / executor）・spirrow-magickit（UI）
 根拠: 2026-09-03〜04 operator セッションの実測（116 判断点）、light ティア判断リプレイ（一致 85%）、3 リポジトリのソース調査（conclair `cb517af` / mindwire `60f52b1` / magickit `6bfa87d`）
@@ -559,6 +559,14 @@ profile  = "ephemeral-develop"
 - **msg-(gate) PR-review naysayer round-3（APPROVE with structure advisory）**: v0.3.3 の R1a/R1b 修正で BLOCKING は無くなり **APPROVE**（ci=success）。ただし単一 advisory (`class: structure`): `ci_clock_start` の fallback は `head_committed_date` のままなので、`observed = ∅` かつ古い commit を今 push した head では `now - clock.at > CAP_NOCLOCK` が瞬時に成立し、CheckSuite startup grace を bypass して R3 `ROUTE_HUMAN` へ false-early 早鳴りする。v0.3.3 で「discriminator だけ触れて `ci_clock_start` は msg-2568 §A-2 決定に従い据え置き」と明示していた通りの trade-off で、承認を阻まない。
 - **msg-2594 人（Takahito decide）**: PR #224 を naysayer APPROVE 版でマージし、`ci_clock_start` fallback は「別の follow-up 項目として記録し、後続 PR で直す」。PR #224 と PR #225 は 2026-09-06T09:33Z までに main へマージ済（takayan0908 手動、Tier-C）。
 - **msg-2595 Bohr（v0.3.4）**: 人 decide を受領。PR #224 は挙動ゼロ（配線が入っていない純関数）である事実を明示し、follow-up 記録先として本 §17 残余レジスタを新設。3 行 = `RES-CI-CLOCK-FALLBACK`（naysayer round-3 advisory の受け先。候補 α は `pr.updated_at` の前方ドリフトで「静かに止まる」に反転するため単純流用不可、候補 β は head 束縛マーカ、実装前に設計ターン必須）／ `RES-WIRING`（`gate_admission` 呼び出し元の欠落。効果表未実現）／ `RES-A-GAP`（board 稼働までの期間限定受容）。行は「id を名指しした PR がマージされた時だけ閉じる」という規律を伴う。§17 は board の最小前身であり、board 稼働時に残行が `backlog` の初期集合になる。
+- **msg-2600 pr-gate-relay（v0.3.4 gate、COMMENT）**: PR #229 の CI が pending（head を open した直後）だったため、gate は L1 CI-gate short-circuit で fail-closed COMMENT を返し `NEXT: human` で終端。ADR-INDEX unavailable（模型呼び出しに到達せず）。
+- **msg-2657 人（Takahito decide B）**: PR-gate に対して「diff が documentation-only であることを根拠に CI を待たずに verdict を出せ」と指示。
+- **msg-2663 Bohr（人 decide B の分析と押し戻し）**: 押し戻し 1 点（「docs-only を CI 免除の根拠にしない」— 前提を結論に使う、CI が検証している主張そのもの、`head_pushed_at` の一件と同型の proxy 誤り）。ただし人が求めた結果（今 #229 を中身で見る）は override 無しで得られる: msg-2600 は #229 opened seconds ago の時点で撃たれたので、条件は時間で消えている見込み。∴ 今の gate 再発火は「CI を飛ばす」ではなく「msg-2600 の待ち条件の解消確認」。同時に本件を RES-WIRING の実測コスト第 1 号（2026-09-08、配線不在ゆえ人の裁定が実行不能）として日付で残す。§17 に `RES-GATE-PENDING-NO-REFIRE` を新設する提案。
+- **msg-2664 Einstein（msg-2663 レビュー）**: correctness 1 件（§E-3 「人を呼ばずに待つ」は機構を書いておらず、駐機 or 同期ポーリング燃焼に落ちる。escape hatch を automated replacement 前に premature に外している）と structure 1 件（`RES-GATE-PENDING-NO-REFIRE` の記録先を「先に来た PR に同梱」に delay するのは D8 症状、記憶依存で structural enforcement 無し。stacked PR / local file 等の物理的固定が必要）。ADR-2026-06-03-16 の pointer を non-blocking で提示。
+- **msg-2665 Bohr（v0.3.5）**: Einstein の 2 件いずれも受ける。correctness → §17.3.1 で escalate の境界を原則化（時間が答える問いで人を呼ばない / 時間が答えなかったという事実では呼ぶ）、cap 30 分 or 2 sweep 周期、escalate の形は「事実 + 推奨」で D7 症状を再生産しない、cap は `CAP_NOCLOCK` と別物（流用禁止）。structure → §17.3.2 で記録先を stacked PR に物理固定、`#229` の head を動かさないので CI をリセットしない。ただし fix loop 時の rebase 規律を明示（`#229` の head が動いたら常に本 stacked を rebase force-push、畳まない）。ADR-2026-06-03-16 は body が repo 未 vendoring のため title のみでの pointer 参照に留める（本 ADR body が入った後の設計ターンで矛盾すれば silent edit しない）。
+- **msg-（v0.3.5 endorse 相当）Einstein（msg-2665 レビュー）**: §17.3.1 escalate 境界 / §17.3.2 stacked PR / ADR operationalization をいずれも explicit endorse。structural gap 1 件（advisory）: §D-7 の「直してから 3 へ」に rebase 規律が execution step へ落ちておらず、Heisenberg が #229 fix 後に本 stacked PR を rebase し忘れる structural likelihood。設計ターン不要、Heisenberg に §D-7 の execution 中に rebase の要件を吸収させる。→ 本 §14 エントリと §17.3.2 の rebase 規律に反映。
+- **msg-(gate) PR-review naysayer（v0.3.4 content review、REQUEST_CHANGES ci=success）**: BLOCKING 1 件（correctness — §17.2 発火条件 の chain 「R1b INVOKE downstream → R3 evaluate → CAP_NOCLOCK 超過で R3 false-early 発火」）＋ ADVISORY 1 件（legibility — §16 skipped の false observation）。BLOCKING の chain 自体は code path 上 R1b が terminate するため成立しないが、旧 wording「連言。今日はほぼ到達不能」が R2/R3 到達性を明示していなかったため誤読余地があった。ADR pointers=4（ADR-05-29-10 / ADR-06-03-16 / ADR-06-03-17 / ADR-06-04-18、いずれも body 未 vendoring）。
+- **msg-（PR #229 fix v0.3.4 round-1）Heisenberg（受け入れ、部分 push-back）**: BLOCKING の chain 自体は `gate_admission.py:495-515` の R1b terminate と 522 の `if not concluded:` branch 位置で code 上不成立 — R2/R3 branch は空 rollup return の後にあり、R1b → R3 chain は存在しない。ただし v0.3.4 §17.2 の旧 wording が R2/R3 到達性を明示せず誤読余地があったため、code 参照付きで rewrite（`gate_admission.py:495-515` / `522` の line 参照、shield が破れる 2 条件、旧 wording の誤読余地と naysayer chain がなぜ発生しないかを本文中で解説）。ADVISORY は false observation — §16「3 スレッドの契約境界と起票文面【v0.3.1 §B】」は line 571 に存在（doc 変更不要）。版番号は v0.3.4 維持（fix commit）。#229 の head が動いたので #236 も §17.3.2 rebase 規律に従い rebase。
 
 ## 15. 開発の進め方（2026-09-05 Takahito 承認）
 
@@ -622,6 +630,7 @@ board が動くまでの唯一の耐久面はこの設計書。∴ 「宣言し�
 | **RES-CI-CLOCK-FALLBACK** | `observed = ∅` 時の待ち時計が `head_committed_date` に落ちるため、古い commit を今 push した head で R3 `ROUTE_HUMAN` の false-early 早鳴りが起こる（naysayer round-3 advisory）| **既に出荷済**: R3 escalation 文字列の `clock=commit`。observability は追加コード不要 | `clock=commit` の escalation が 1 件でも出たら、その時点の `push_age` を確認。`push_age < CAP_NOCLOCK` なら誤発火 → **設計ターンへ昇格**（Bohr → Einstein → 実装） | **deferred**（§17.2 参照） |
 | **RES-WIRING** | `gate_admission` の呼び出し元が存在しない。§5.2A の期待効果表（gate invocation ・ relay noise ・ 人の停止の削減）は未実現。今の production は依然として旧経路 | 呼び出し元数 = 0（`grep -r "gate_admission(" src/` が `def gate_admission` 以外 0 行） | 無し（**scheduled**、次の PR）。配線 PR は本文で `RES-WIRING` を名指しすること | scheduled |
 | **RES-A-GAP** | A landing（本設計の §5.2A `gate_admission`）〜 board 稼働の間、人の停止に集約可視面が無い（msg-2568 §C の期間限定 gap）| 無し（期間限定） | board 稼働で自動消滅 | 期限付き受容 |
+| **RES-GATE-PENDING-NO-REFIRE** | PR-gate が pending CI で保留するとき `NEXT: human` で終端し、再発火経路が無い。時間が答える問いで人を止める（実例: msg-2600, 2026-09-08。本設計スレッド自身の中で発生した D7 症状） | gate の `COMMENT (ci=pending)` msg の直後の `NEXT:` が `human` であること | 無し。board の `gate` → `waiting`（`waiting_on = {ci: <head>}`）＋ tick 再発火で自動消滅 | 期限付き受容（board 稼働で消滅） |
 
 ### 17.2 RES-CI-CLOCK-FALLBACK の中身 —「`head_pushed_at` に替えるだけ」ではない（Bohr msg-2595 §C）
 
@@ -675,3 +684,33 @@ conductor が head を初めて見た tick に `first_seen(head)` を書き（§
 #### 判断
 
 **今は決めない。実装もしない。** 昇格したら **Bohr → Einstein の設計ターンを 1 回通してから**コードに落とす（新しい辺ではなく `ci_clock_start` の入力差し替えだが、候補で誤りの向きが「早鳴り」↔「鳴らない」に反転するため、実装者の対称性判断に委ねてよい変更ではない）。検証機会ゼロで投機的に直さないこと自体が、この行の判断内容である。
+
+### 17.3 RES-GATE-PENDING-NO-REFIRE の運用規律（Bohr msg-2665 §A / §B、Einstein msg-2664 correctness + structure 受け入れ）
+
+board が稼働するまでの間、本行は「board 稼働で自動消滅」を状態にしているが、稼働までの期間中も駐機と escalate の境界は必要になる。以下は board 稼働までの暫定規律で、稼働と同時に破棄される（`gate` → `waiting`（`waiting_on = {ci: <head>}`）＋ tick 再発火が構造的に代替する）。
+
+#### 17.3.1 escalate の境界（Einstein msg-2664 objection 1 correctness 受け入れ）
+
+**原則**: 時間が答える問いで人を呼ばない。時間が答えなかったという事実では呼ぶ。
+
+前者は D7 の「聞くまでもない問い」。後者は §5.2A.4 の R3 stuck-CI → `ROUTE_HUMAN` と同型で、消してはならない escape hatch。gate が pending CI で保留した直後にただちに人を呼ぶのは前者、cap を超えても pending の場合に呼ぶのは後者。
+
+**cap**: **pending が 2 sweep 周期 または 30 分を超えたら escalate してよい**。
+
+- この cap は §5.2A.3 の `CAP_NOCLOCK`(12h) とは**別物**。あれは gate 内部の待ち予算、これは operator lane の駐機予算。流用しないこと（対称性からの流用が誤りを反転させる、は §17.2 で既に一度踏んだ轍）。
+- 実測根拠: msg-2597 で local gate は 2049 tests / 12.19s。CI wall-clock は分の単位が期待値なので、30 分は「時間が答える」領域を明確に外れる。
+- **cap 到達時の escalate の形が本質**: 「飛ばしますか?」（問い）ではなく「head `<sha>` の CI が 30 分 pending。docs-only PR で local gate <N>s。stuck の疑い。推奨: 〜」（事実 + 推奨）。前者が D7 症状、後者は正常な報告。
+- cap 到達の escalate は本行の検出列に 1 件足す実測でもある。
+
+#### 17.3.2 記録先の structural bind（Einstein msg-2664 objection 2 structure 受け入れ）
+
+散文で「後で書く」と約束する経路は D8 症状そのもの。∴ 追加行は **`#229` の head から stacked の独立 PR** として物理的に既存化する。この §17.1 4 行目と §17.3 全体は、その stacked PR 自身の diff。
+
+- 記録先が「行を書く約束」ではなく **行そのもの**である。記憶に残るのは意図ではなくテキスト。
+- open PR は loop が毎 tick 走査する既存の面（R-SILENT / stalled-PR 検出の対象）。新機構ゼロで忘却経路を閉じる。
+- `#229` の head を動かさないので CI をリセットしない（Einstein msg-2664 が §E-5 で endorse した性質を保つ）。
+- 「行は `id` を PR 本文で名指しでマージされた時にだけ閉じる」（§17 preamble）に例外を作らずそのまま乗る。
+
+**rebase 規律（Einstein msg-（v0.3.5 endorse 相当）の stacked-PR orphan 指摘、msg-2664 対応**）: `#229` が REQUEST_CHANGES を受けて fix commit + force-push で頭が動いた場合、この stacked PR（本行を持つ）の base が dead commit を指すことになる。**`#229` を動かした直後に、常に本 stacked PR を新しい `#229` head に rebase して force-push すること**。「畳むか同梱するか」の判断を挟んだ瞬間に memory 依存が戻る（記録先 bind の目的に反する）ので、`#229` が REQUEST_CHANGES を受けても本 stacked PR を畳まない。常に独立、常に rebase。
+
+**ADR-2026-06-03-16（naysayer CI-gate、approve-while-red 防止）との整合**: msg-2657 の「docs-only だから CI を飛ばす」を規則として持たない msg-2665 §B の判断は、本 ADR が SOT である approve-while-red 防止の invariant に整合する（本 ADR の body は本 repo に vendoring されておらず、Heisenberg 本ターンの実測でも `docs/adr/` に存在せず spec/adr_index.yaml が title のみを持つ状態。OBL-DECLARE-UNREADABLE により本 pointer は title からの推論ではなく、msg-2665 §C の指示「読んでから引く」の第 2 分岐「読めなかったら pointer のまま置く」として記録する。本 ADR body が repo に入った後の設計ターンで、§B の判断と本 ADR の実文が矛盾していれば silent edit で辻褄を合わせず設計ターンの trigger にすること）。
