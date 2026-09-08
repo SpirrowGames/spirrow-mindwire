@@ -156,7 +156,11 @@ race (the ``await`` window). The tight synchronous window between load
 and save inside the write-ahead phase is not closed here — closing it
 would require OS-level file locking or per-project files, either of
 which is a separate design item — but is not observable under the
-current sweep architecture.
+current sweep architecture. The "sequential ``foreach``" premise is
+pinned by ``tests/Test-SweepSequentiality.ps1`` (thread
+T-sweep-sequentiality-load-bearing-but-unpinned): if that guard fires,
+the argument in this paragraph has been invalidated at the source and
+the read/modify/save window here becomes observable.
 
 The module is deliberately transport-shaped: it talks to the same
 ``McpToolCaller`` abstraction the rest of the codebase uses, so a fake for
