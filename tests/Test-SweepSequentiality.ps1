@@ -94,10 +94,12 @@
 #           `Start-Job -FilePath (Join-Path $PSScriptRoot
 #           'run-conductor-once.ps1')` has zero occurrences of `$inner`.
 #       (b) denylist of async command names — REFUSED as structurally
-#           leaky ([System.Threading.Tasks.Task]::Run, [runspacefactory],
+#           leaky. A denylist fails OPEN on unknowns; every async API
+#           the maintainer has not yet imagined is an unknown, so
+#           [System.Threading.Tasks.Task]::Run, [runspacefactory],
 #           `& $inner &` in PS7, and any wrapper defined elsewhere all
-#           miss the list; a denylist that fails-closed on unknowns is a
-#           category error).
+#           miss the list by construction — not because the list is
+#           short but because the list is a list.
 #       (c) extract the dispatch body into a small named function and
 #           allowlist it — REFUSED on measured T1 failure. The dispatch
 #           foreach body at deploy/run-conductor-scheduled.ps1:3035-3287
