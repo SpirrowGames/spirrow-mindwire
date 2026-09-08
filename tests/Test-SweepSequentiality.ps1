@@ -11,7 +11,7 @@
 # Protected prose lives in src/spirrow_mindwire/gate_bootstrap_visibility.py
 # under **Concurrency profile.** (search for the phrase; line numbers drift).
 #
-# Design (msg-585 / msg-587):
+# Design (msg-585 / msg-587 / msg-596 / msg-599):
 #
 #   L1  — no PipelineAst in the file has .Background -eq $true.  This closes
 #         the postfix `&` async form STRUCTURALLY, without naming any cmdlet.
@@ -19,19 +19,37 @@
 #         `& { … } &` all reduce to a Background pipeline; nothing that gets
 #         it wrong appears at the source.
 #
-#   L2a — inside the dispatch ForEachStatementAst, exactly one CommandAst has
-#         InvocationOperator = 'Ampersand'; its command element is $inner;
-#         its result is consumed by an assignment.
+#   Dispatch loop identity (S1-S4, msg-599):
+#     S1  file-wide census of `& $inner` CommandAsts. Assert exactly 1.
+#     S2  file-wide census of ForEachStatementAsts whose iteration expression
+#         is a bare VariableExpressionAst named 'candidates'.
+#     S3  the dispatch loop = { L in S2 | Test-IsDescendant -Node S1 -Ancestor L }.
+#         Assert exactly 1. That is $dispatchLoop.
+#     S4  fail-closed on both edges (zero, or more than one) with distinct
+#         messages. Never fall back to "pick nearest".
+#
+#     Depth heuristics ("nearest", "outermost") are deliberately not used —
+#     an attacker chooses the tree. Identity + containment is a predicate on
+#     (loop, spawn), not on the loop's position among other loops.
+#
+#   L2a — the dispatch body contains exactly the S1 spawn: every `Ampersand`
+#         CommandAst that is a descendant of $dispatchLoop is the S1 node,
+#         and no other call-operator invocations live in the body. Also, the
+#         spawn's result is consumed by an assignment (output captured, call
+#         blocks).
 #   L2b — $inner's assignment (anywhere in the script) has RHS
 #         `Join-Path $PSScriptRoot 'run-conductor.ps1'`.  Without this,
 #         L2a is trivially defeated by repointing $inner at a job wrapper
 #         and changing nothing at the call site.
 #   L2c — walking from the spawn site's CommandAst up the .Parent chain:
-#           * the nearest enclosing loop is the dispatch ForEachStatementAst,
+#           * the walk reaches $dispatchLoop (not stopped by anything else),
 #           * no ancestor PipelineAst has .Background,
 #           * no ancestor is a ScriptBlockExpressionAst passed as a command
 #             argument (that is the SHAPE of `Start-Job { … }`,
 #             `ForEach-Object -Parallel { … }`, `[Task]::Run({ … })`, etc.).
+#         L2c catches parallelization that MOVES `& $inner` into a script
+#         block. It does NOT catch duplication (a launch path added BESIDE
+#         the pinned spawn) — that class is a separate thread.
 #
 #   L3b — inside the dispatch body, every InvokeMemberExpressionAst whose
 #         target is a TypeExpressionAst (i.e. every `[Type]::Method(...)`
@@ -54,11 +72,22 @@
 #     Parameters cannot be verified statically (splatting, conditional
 #     assignment), and a check that green-lights a construct it did not
 #     actually inspect is worse than one that never looked.
+#   * Spawn DUPLICATION — a launch path added BESIDE the pinned spawn
+#     (e.g. keeping the sync path and adding `$jobs += Start-Job -FilePath
+#     $inner` on a branch). L2c walks the ancestor chain of the EXISTING
+#     spawn, so it catches parallelization that MOVES `& $inner` into a
+#     script block, and does not see a second launch path adjacent to it.
+#     Fixing this reopens the L3a design question. Tracked separately as
+#     T-sweep-pin-blind-to-launch-paths-added-beside-the-spawn.
+#   * Renaming the candidate collection from `$candidates` to something
+#     else (or changing the iteration to a pipeline expression) will trip
+#     S2's zero-match assertion. This is a deliberate declared cost of
+#     strict identity: a tolerant matcher (e.g. "the pipeline MENTIONS
+#     $candidates") would green-light a construct it did not identify,
+#     which is the false-positive class msg-582/msg-585 removed.
 #
-# RED / GREEN demonstrations were run locally before commit (see the thread's
-# msg-585 revised DoD): L1, L2b, L2c, L3d each went RED under a targeted
-# mutation, and a benign body edit (log line + local variable + branch)
-# stayed green.  See the PR description for the transcript.
+# RED / GREEN demonstrations were run locally before commit; see the PR
+# description for the transcript, and thread msg-599 items 3(a)-(f).
 
 $ErrorActionPreference = 'Stop'
 
@@ -100,6 +129,37 @@ $ProtectedProse = @(
     '(the Level-3 argument names deploy/run-conductor-scheduled.ps1''s sequential foreach)'
 ) -join ' '
 
+# Parameterized descendancy walk — one helper, used both to derive
+# $dispatchLoop (S3, ancestor = candidate loop) and to scope the body-level
+# filters (L2a / L3b / L3d, ancestor = the resolved $dispatchLoop).
+# Einstein msg (naysayer round after msg-599): S3 defines $dispatchLoop, so
+# the helper cannot close over it; it must take the ancestor as a parameter.
+function Test-IsDescendant {
+    param(
+        [System.Management.Automation.Language.Ast]$Node,
+        [System.Management.Automation.Language.Ast]$Ancestor
+    )
+    if ($null -eq $Node -or $null -eq $Ancestor) { return $false }
+    $n = $Node.Parent
+    while ($null -ne $n) {
+        if ($n -eq $Ancestor) { return $true }
+        $n = $n.Parent
+    }
+    return $false
+}
+
+# Kept for the ancestor-chain walk in L2c (which needs to inspect every
+# intermediate node's type, not just answer a yes/no descendancy question).
+function Get-EnclosingAst {
+    param([System.Management.Automation.Language.Ast]$Node, [Type]$Type)
+    $n = $Node.Parent
+    while ($null -ne $n) {
+        if ($Type.IsInstanceOfType($n)) { return $n }
+        $n = $n.Parent
+    }
+    return $null
+}
+
 # =====================================================================================
 # L1 — no Background pipeline anywhere in the file
 # =====================================================================================
@@ -125,90 +185,136 @@ else {
 }
 
 # =====================================================================================
-# Locate the spawn site and the dispatch ForEachStatementAst STRUCTURALLY
-# (not by grep — a `&` in a string constant is not a call operator).
+# S1-S4 — derive $dispatchLoop by IDENTITY + CONTAINMENT, not by depth heuristics
 # =====================================================================================
+Write-Host ''
+Write-Host 'S1 — file-wide census of ``& `$inner`` CommandAsts'
 $allCommandAsts = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
 $ampCommands = @($allCommandAsts | Where-Object {
     $_.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand
 })
-# The spawn site: the sole `& $inner` in the file.
-$spawnCandidates = @($ampCommands | Where-Object {
+# S1: the sole `& $inner` in the file.
+$s1Candidates = @($ampCommands | Where-Object {
     $first = $_.CommandElements[0]
     ($first -is [System.Management.Automation.Language.VariableExpressionAst]) -and
     ($first.VariablePath.UserPath -eq 'inner')
 })
-if ($spawnCandidates.Count -ne 1) {
+Write-Host ("  census: {0} ``& `$inner`` invocation(s) file-wide" -f $s1Candidates.Count)
+if ($s1Candidates.Count -ne 1) {
     $script:failures++
-    Write-Host ("  FAIL  L2a — the spawn is no longer ``& `$inner`` with captured output (found " +
-                "$($spawnCandidates.Count) ``& `$inner`` call-operator invocation(s) in the file). " +
+    Write-Host ("  FAIL  S1 — expected exactly 1 ``& `$inner`` call-operator invocation, got $($s1Candidates.Count). " +
                 "If this is deliberate: (a) confirm the new form still blocks until the tick exits " +
-                "(e.g. `Start-Process -Wait` does NOT set `$LASTEXITCODE / `$output the way this " +
+                "(e.g. ``Start-Process -Wait`` does NOT set `$LASTEXITCODE / `$output the way this " +
                 "wrapper's verdict parse requires — see the block at the spawn site), " +
-                "(b) update this assertion (L2a) to describe the new spawn shape, " +
+                "(b) update S1 (and L2a) to describe the new spawn shape, " +
                 "(c) re-read $ProtectedProse")
-    # Cannot proceed with L2 without a unique spawn site; skip layers that scope to it.
     Write-Host ''
     Write-Host "sweep sequentiality: $($script:failures) check(s) FAILED"
     exit 1
 }
-$spawnCommand = $spawnCandidates[0]
+$spawnCommand = $s1Candidates[0]
+Write-Host ("  PASS  exactly one ``& `$inner`` at line {0}" -f $spawnCommand.Extent.StartLineNumber)
 
-# Walk up to find the enclosing ForEachStatementAst — that is the "dispatch body"
-# every subsequent layer scopes to.
-function Get-EnclosingAst {
-    param([System.Management.Automation.Language.Ast]$Node, [Type]$Type)
-    $n = $Node.Parent
-    while ($null -ne $n) {
-        if ($Type.IsInstanceOfType($n)) { return $n }
-        $n = $n.Parent
-    }
-    return $null
+Write-Host ''
+Write-Host 'S2 — file-wide census of ForEachStatementAsts iterating a bare $candidates'
+$allForEach = $ast.FindAll(
+    { param($n) $n -is [System.Management.Automation.Language.ForEachStatementAst] }, $true)
+$s2Loops = @($allForEach | Where-Object {
+    $expr = $_.Condition
+    # PipelineAst wrapping a single CommandExpressionAst wrapping a bare VariableExpressionAst
+    # named 'candidates'. Strict identity: pipelines, sorts, .Where{} etc. are all rejected —
+    # the declared cost documented in the header, not softened here.
+    if (-not ($expr -is [System.Management.Automation.Language.PipelineAst])) { return $false }
+    if ($expr.PipelineElements.Count -ne 1) { return $false }
+    $only = $expr.PipelineElements[0]
+    if (-not ($only -is [System.Management.Automation.Language.CommandExpressionAst])) { return $false }
+    $inner = $only.Expression
+    if (-not ($inner -is [System.Management.Automation.Language.VariableExpressionAst])) { return $false }
+    $inner.VariablePath.UserPath -eq 'candidates'
+})
+Write-Host ("  census: {0} loop(s) iterate a bare `$candidates" -f $s2Loops.Count)
+foreach ($l in $s2Loops) {
+    Write-Host ("           line {0}: [{1}]" -f $l.Extent.StartLineNumber, `
+        $l.Extent.Text.Substring(0, [Math]::Min(80, $l.Extent.Text.Length)))
 }
-
-$dispatchLoop = Get-EnclosingAst -Node $spawnCommand `
-    -Type ([System.Management.Automation.Language.ForEachStatementAst])
-if ($null -eq $dispatchLoop) {
+if ($s2Loops.Count -eq 0) {
     $script:failures++
-    Write-Host ("  FAIL  the spawn site has no enclosing ForEachStatementAst — the dispatch loop " +
-                "was removed or reshaped. Protected prose: $ProtectedProse")
+    Write-Host ("  FAIL  S2 — no ForEachStatementAst iterates a bare ``$candidates``. If the " +
+                "collection has been renamed or the iteration made non-trivial " +
+                "(e.g. `$candidates | Sort-Object), this is intentionally fail-closed: (a) confirm " +
+                "the new dispatch shape is still sequential, (b) rebind S2's iteration-expression " +
+                "predicate to name the new collection or expression, (c) re-read $ProtectedProse.")
+    Write-Host ''
+    Write-Host "sweep sequentiality: $($script:failures) check(s) FAILED"
+    exit 1
 }
+
+Write-Host ''
+Write-Host 'S3 — dispatchLoop = { L in S2 | L contains the S1 spawn }'
+$s3Loops = @($s2Loops | Where-Object { Test-IsDescendant -Node $spawnCommand -Ancestor $_ })
+Write-Host ("  census: {0} candidate loop(s) contain the S1 spawn" -f $s3Loops.Count)
+if ($s3Loops.Count -eq 0) {
+    $script:failures++
+    Write-Host ("  FAIL  S3 — no ``foreach (`$x in `$candidates)`` contains the ``& `$inner`` spawn. " +
+                "The spawn has been moved out of every candidate-dispatch loop. " +
+                "Protected prose: $ProtectedProse")
+    Write-Host ''
+    Write-Host "sweep sequentiality: $($script:failures) check(s) FAILED"
+    exit 1
+}
+if ($s3Loops.Count -gt 1) {
+    $script:failures++
+    $lines = ($s3Loops | ForEach-Object { $_.Extent.StartLineNumber }) -join ', '
+    Write-Host ("  FAIL  S4 — more than one ``foreach (`$x in `$candidates)`` contains the S1 spawn " +
+                "(lines: $lines). The dispatch identity is ambiguous, which usually means the spawn " +
+                "has been wrapped in a NESTED candidate-loop — that is exactly the shape S4 " +
+                "fail-closes on. Protected prose: $ProtectedProse")
+    Write-Host ''
+    Write-Host "sweep sequentiality: $($script:failures) check(s) FAILED"
+    exit 1
+}
+$dispatchLoop = $s3Loops[0]
+Write-Host ("  PASS  dispatchLoop identified at line {0}" -f $dispatchLoop.Extent.StartLineNumber)
 
 # =====================================================================================
-# L2a — the spawn site, positively identified
+# L2a — every ampersand descendant of $dispatchLoop IS the S1 spawn
+#       (restated from msg-585's count/id form; msg-599 topology change:
+#        the derivation now runs spawn → loop, so L2a describes what the
+#        loop must contain rather than counting inside a pre-known body).
 # =====================================================================================
 Write-Host ''
-Write-Host 'L2a — exactly one ``& `$inner`` in the dispatch body, consumed by an assignment'
-if ($null -ne $dispatchLoop) {
-    $ampInBody = @($ampCommands | Where-Object {
-        (Get-EnclosingAst -Node $_ -Type ([System.Management.Automation.Language.ForEachStatementAst])) -eq $dispatchLoop
-    })
-    Check 'exactly one call-operator invocation in dispatch body' 1 $ampInBody.Count
-
-    # Its command element is $inner (already true for spawnCommand — we found it that way — but
-    # this restates the assertion in the form a maintainer reading the test can defend).
-    $first = $spawnCommand.CommandElements[0]
-    CheckTrue 'spawn command element is $inner' `
-        (($first -is [System.Management.Automation.Language.VariableExpressionAst]) -and
-         ($first.VariablePath.UserPath -eq 'inner')) `
-        "spawn command element is $($first.GetType().Name) [$($first.Extent.Text)]"
-
-    # "Consumed by an assignment": walk ancestors until we see an AssignmentStatementAst.
-    $enclosingAssignment = Get-EnclosingAst -Node $spawnCommand `
-        -Type ([System.Management.Automation.Language.AssignmentStatementAst])
-    if ($null -eq $enclosingAssignment) {
+Write-Host 'L2a — every ampersand-CommandAst in the dispatch body IS the S1 spawn'
+$ampInBody = @($ampCommands | Where-Object { Test-IsDescendant -Node $_ -Ancestor $dispatchLoop })
+Check 'exactly one call-operator invocation in dispatch body' 1 $ampInBody.Count
+foreach ($a in $ampInBody) {
+    if ($a -ne $spawnCommand) {
         $script:failures++
-        Write-Host ("  FAIL  the spawn is no longer ``& `$inner`` with captured output. " +
-                    "If this is deliberate: (a) confirm the new form still blocks until the tick " +
-                    "exits, (b) update this assertion (L2a), (c) re-read $ProtectedProse")
-    }
-    else {
-        Write-Host '  PASS  spawn is consumed by an assignment (output captured, call blocks)'
+        Write-Host ("  FAIL  L2a — an ampersand invocation other than the pinned spawn appears in the " +
+                    "dispatch body at line $($a.Extent.StartLineNumber): [$($a.Extent.Text.Substring(0, [Math]::Min(80, $a.Extent.Text.Length)))]. " +
+                    "If this is a second synchronous invocation, add it to the pin deliberately. " +
+                    "Protected prose: $ProtectedProse")
     }
 }
+
+# Positive identity checks on the S1 node itself (retained from msg-585).
+$first = $spawnCommand.CommandElements[0]
+CheckTrue 'spawn command element is $inner' `
+    (($first -is [System.Management.Automation.Language.VariableExpressionAst]) -and
+     ($first.VariablePath.UserPath -eq 'inner')) `
+    "spawn command element is $($first.GetType().Name) [$($first.Extent.Text)]"
+
+# "Consumed by an assignment": walk ancestors until we see an AssignmentStatementAst.
+$enclosingAssignment = Get-EnclosingAst -Node $spawnCommand `
+    -Type ([System.Management.Automation.Language.AssignmentStatementAst])
+if ($null -eq $enclosingAssignment) {
+    $script:failures++
+    Write-Host ("  FAIL  the spawn is no longer ``& `$inner`` with captured output. " +
+                "If this is deliberate: (a) confirm the new form still blocks until the tick " +
+                "exits, (b) update this assertion (L2a), (c) re-read $ProtectedProse")
+}
 else {
-    Write-Host '  SKIP  L2a — no dispatch loop identified'
+    Write-Host '  PASS  spawn is consumed by an assignment (output captured, call blocks)'
 }
 
 # =====================================================================================
@@ -270,54 +376,49 @@ if ($innerAssignments.Count -ge 1) {
 # =====================================================================================
 Write-Host ''
 Write-Host 'L2c — spawn is not wrapped in a script-block passed as a command argument'
-if ($null -ne $dispatchLoop) {
-    $badAncestors = New-Object System.Collections.Generic.List[string]
-    $n = $spawnCommand.Parent
-    $reachedDispatchLoop = $false
-    while ($null -ne $n -and -not $reachedDispatchLoop) {
-        if ($n -eq $dispatchLoop) { $reachedDispatchLoop = $true; break }
-        # Background pipeline on any ancestor (redundant with L1's file-wide sweep, but the
-        # message here is scoped to the spawn and points the reader at the right line).
-        if ($n -is [System.Management.Automation.Language.PipelineAst] -and
-            $n.PSObject.Properties.Name -contains 'Background' -and $n.Background) {
-            $badAncestors.Add("Background PipelineAst at line $($n.Extent.StartLineNumber)")
+$badAncestors = New-Object System.Collections.Generic.List[string]
+$n = $spawnCommand.Parent
+$reachedDispatchLoop = $false
+while ($null -ne $n -and -not $reachedDispatchLoop) {
+    if ($n -eq $dispatchLoop) { $reachedDispatchLoop = $true; break }
+    # Background pipeline on any ancestor (redundant with L1's file-wide sweep, but the
+    # message here is scoped to the spawn and points the reader at the right line).
+    if ($n -is [System.Management.Automation.Language.PipelineAst] -and
+        $n.PSObject.Properties.Name -contains 'Background' -and $n.Background) {
+        $badAncestors.Add("Background PipelineAst at line $($n.Extent.StartLineNumber)")
+    }
+    # SHAPE of `Start-Job { … }`, `ForEach-Object -Parallel { … }`,
+    # `[Task]::Run({ … })`, `Invoke-Command -AsJob { … }` — anything whose spawn is
+    # wrapped in a script-block literal handed to a callee.  If the spawn is inside a
+    # ScriptBlockExpressionAst that is a command argument, that is the wrap.
+    if ($n -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+        $p = $n.Parent
+        if ($p -is [System.Management.Automation.Language.CommandAst] -or
+            $p -is [System.Management.Automation.Language.CommandExpressionAst] -or
+            $p -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) {
+            $badAncestors.Add(
+                "spawn is inside a ScriptBlockExpressionAst passed to $($p.GetType().Name) " +
+                "at line $($p.Extent.StartLineNumber): [$($p.Extent.Text.Substring(0, [Math]::Min(80, $p.Extent.Text.Length)))]")
         }
-        # SHAPE of `Start-Job { … }`, `ForEach-Object -Parallel { … }`,
-        # `[Task]::Run({ … })`, `Invoke-Command -AsJob { … }` — anything whose spawn is
-        # wrapped in a script-block literal handed to a callee.  If the spawn is inside a
-        # ScriptBlockExpressionAst that is a command argument, that is the wrap.
-        if ($n -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
-            $p = $n.Parent
-            if ($p -is [System.Management.Automation.Language.CommandAst] -or
-                $p -is [System.Management.Automation.Language.CommandExpressionAst] -or
-                $p -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) {
-                $badAncestors.Add(
-                    "spawn is inside a ScriptBlockExpressionAst passed to $($p.GetType().Name) " +
-                    "at line $($p.Extent.StartLineNumber): [$($p.Extent.Text.Substring(0, [Math]::Min(80, $p.Extent.Text.Length)))]")
-            }
-        }
-        $n = $n.Parent
     }
-    if (-not $reachedDispatchLoop) {
-        $script:failures++
-        Write-Host ("  FAIL  L2c — walking up from the spawn did not reach the dispatch " +
-                    "ForEachStatementAst before running out of ancestors. Protected prose: $ProtectedProse")
-    }
-    if ($badAncestors.Count -eq 0) {
-        Write-Host '  PASS  no Background pipeline / script-block-as-command-argument between spawn and dispatch loop'
-    }
-    else {
-        foreach ($msg in $badAncestors) {
-            $script:failures++
-            Write-Host "  FAIL  L2c ancestor: $msg"
-        }
-        Write-Host ("        The spawn has been wrapped in an async form (Start-Job { … }, " +
-                    "ForEach-Object -Parallel { … }, [Task]::Run({ … }), &-postfix, …). This " +
-                    "falsifies $ProtectedProse")
-    }
+    $n = $n.Parent
+}
+if (-not $reachedDispatchLoop) {
+    $script:failures++
+    Write-Host ("  FAIL  L2c — walking up from the spawn did not reach the dispatch " +
+                "ForEachStatementAst before running out of ancestors. Protected prose: $ProtectedProse")
+}
+if ($badAncestors.Count -eq 0) {
+    Write-Host '  PASS  no Background pipeline / script-block-as-command-argument between spawn and dispatch loop'
 }
 else {
-    Write-Host '  SKIP  L2c — no dispatch loop identified'
+    foreach ($msg in $badAncestors) {
+        $script:failures++
+        Write-Host "  FAIL  L2c ancestor: $msg"
+    }
+    Write-Host ("        The spawn has been wrapped in an async form (Start-Job { … }, " +
+                "ForEach-Object -Parallel { … }, [Task]::Run({ … }), &-postfix, …). This " +
+                "falsifies $ProtectedProse")
 }
 
 # =====================================================================================
@@ -325,43 +426,39 @@ else {
 # =====================================================================================
 Write-Host ''
 Write-Host 'L3b — static-type invocations in the dispatch body allowlisted (one entry)'
-if ($null -ne $dispatchLoop) {
-    $staticAllowlist = @(
-        'Math.Min'
-    )
-    $memberInvocations = $ast.FindAll(
-        { param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)
-    $bodyStatic = @($memberInvocations | Where-Object {
-        $isStatic = $_.Static -and ($_.Expression -is [System.Management.Automation.Language.TypeExpressionAst])
-        $encl = Get-EnclosingAst -Node $_ -Type ([System.Management.Automation.Language.ForEachStatementAst])
-        $isStatic -and ($encl -eq $dispatchLoop)
-    })
-    $seen = @()
-    foreach ($m in $bodyStatic) {
-        $typeName = $m.Expression.TypeName.FullName
-        # Normalise `System.Math` and `Math` both to `Math`.
-        $short = $typeName.Split('.')[-1]
-        $memberName = if ($m.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
-            $m.Member.Value
-        }
-        else { "$($m.Member.Extent.Text)" }
-        $key = "$short.$memberName"
-        $seen += $key
-        if ($staticAllowlist -notcontains $key) {
-            $script:failures++
-            Write-Host ("  FAIL  L3b — [$typeName]::$memberName at line $($m.Extent.StartLineNumber) " +
-                        "is not on the allowlist ($($staticAllowlist -join ', ')). " +
-                        "If this call is genuinely synchronous, add its short key ('$key') to the " +
-                        "allowlist deliberately and re-read $ProtectedProse. If it is `[Task]::Run` " +
-                        "or any other async entry point, do NOT add it.")
-        }
+$staticAllowlist = @(
+    'Math.Min'
+)
+$memberInvocations = $ast.FindAll(
+    { param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)
+$bodyStatic = @($memberInvocations | Where-Object {
+    $isStatic = $_.Static -and ($_.Expression -is [System.Management.Automation.Language.TypeExpressionAst])
+    $isStatic -and (Test-IsDescendant -Node $_ -Ancestor $dispatchLoop)
+})
+$disallowed = 0
+$seen = @()
+foreach ($m in $bodyStatic) {
+    $typeName = $m.Expression.TypeName.FullName
+    # Normalise `System.Math` and `Math` both to `Math`.
+    $short = $typeName.Split('.')[-1]
+    $memberName = if ($m.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        $m.Member.Value
     }
-    if ($script:failures -eq 0 -or $bodyStatic.Count -eq $seen.Count -and ($seen | Where-Object { $staticAllowlist -notcontains $_ }).Count -eq 0) {
-        Write-Host ("  PASS  {0} static-type invocation(s) in dispatch body, all allowlisted" -f $bodyStatic.Count)
+    else { "$($m.Member.Extent.Text)" }
+    $key = "$short.$memberName"
+    $seen += $key
+    if ($staticAllowlist -notcontains $key) {
+        $script:failures++
+        $disallowed++
+        Write-Host ("  FAIL  L3b — [$typeName]::$memberName at line $($m.Extent.StartLineNumber) " +
+                    "is not on the allowlist ($($staticAllowlist -join ', ')). " +
+                    "If this call is genuinely synchronous, add its short key ('$key') to the " +
+                    "allowlist deliberately and re-read $ProtectedProse. If it is ``[Task]::Run`` " +
+                    "or any other async entry point, do NOT add it.")
     }
 }
-else {
-    Write-Host '  SKIP  L3b — no dispatch loop identified'
+if ($disallowed -eq 0) {
+    Write-Host ("  PASS  {0} static-type invocation(s) in dispatch body, all allowlisted" -f $bodyStatic.Count)
 }
 
 # =====================================================================================
@@ -369,49 +466,39 @@ else {
 # =====================================================================================
 Write-Host ''
 Write-Host 'L3d — no AST-opaque constructs (Invoke-Expression / [scriptblock]::Create / [powershell]::Create) in dispatch body'
-if ($null -ne $dispatchLoop) {
-    $bodyCommands = @($allCommandAsts | Where-Object {
-        (Get-EnclosingAst -Node $_ -Type ([System.Management.Automation.Language.ForEachStatementAst])) -eq $dispatchLoop
-    })
-    $bannedCommandNames = @('Invoke-Expression', 'iex')
-    $opaqueHits = New-Object System.Collections.Generic.List[string]
-    foreach ($c in $bodyCommands) {
-        $name = if ($c.CommandElements.Count -ge 1) { $c.GetCommandName() } else { $null }
-        if ($null -ne $name -and $bannedCommandNames -contains $name) {
-            $opaqueHits.Add("$name at line $($c.Extent.StartLineNumber)")
-        }
-    }
-    # [scriptblock]::Create, [powershell]::Create — a static call whose Member is 'Create'
-    # on either type name. Search the whole file once; we already have the InvokeMember list.
-    $memberInvocations = $ast.FindAll(
-        { param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)
-    foreach ($m in $memberInvocations) {
-        if (-not ($m.Static -and ($m.Expression -is [System.Management.Automation.Language.TypeExpressionAst]))) { continue }
-        $encl = Get-EnclosingAst -Node $m -Type ([System.Management.Automation.Language.ForEachStatementAst])
-        if ($encl -ne $dispatchLoop) { continue }
-        $typeName = $m.Expression.TypeName.FullName
-        $short = $typeName.Split('.')[-1]
-        $memberName = if ($m.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $m.Member.Value } else { "$($m.Member.Extent.Text)" }
-        if ((($short -eq 'ScriptBlock') -or ($short -eq 'PowerShell')) -and ($memberName -eq 'Create')) {
-            $opaqueHits.Add("[$typeName]::$memberName at line $($m.Extent.StartLineNumber)")
-        }
-    }
-    if ($opaqueHits.Count -eq 0) {
-        Write-Host '  PASS  no AST-opaque constructs in dispatch body'
-    }
-    else {
-        foreach ($h in $opaqueHits) {
-            $script:failures++
-            Write-Host "  FAIL  L3d — $h"
-        }
-        Write-Host ("        AST-opaque constructs hide code from the parser this test relies on. " +
-                    "Remove them from the dispatch body, or (if the runtime string is genuinely " +
-                    "synchronous and cannot be expressed statically) split the change into a " +
-                    "separate PR that carries a hand-written justification. Protected prose: $ProtectedProse")
+$bodyCommands = @($allCommandAsts | Where-Object { Test-IsDescendant -Node $_ -Ancestor $dispatchLoop })
+$bannedCommandNames = @('Invoke-Expression', 'iex')
+$opaqueHits = New-Object System.Collections.Generic.List[string]
+foreach ($c in $bodyCommands) {
+    $name = if ($c.CommandElements.Count -ge 1) { $c.GetCommandName() } else { $null }
+    if ($null -ne $name -and $bannedCommandNames -contains $name) {
+        $opaqueHits.Add("$name at line $($c.Extent.StartLineNumber)")
     }
 }
+# [scriptblock]::Create, [powershell]::Create — a static call whose Member is 'Create'
+# on either type name. Reuse $memberInvocations from L3b's scan.
+foreach ($m in $memberInvocations) {
+    if (-not ($m.Static -and ($m.Expression -is [System.Management.Automation.Language.TypeExpressionAst]))) { continue }
+    if (-not (Test-IsDescendant -Node $m -Ancestor $dispatchLoop)) { continue }
+    $typeName = $m.Expression.TypeName.FullName
+    $short = $typeName.Split('.')[-1]
+    $memberName = if ($m.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $m.Member.Value } else { "$($m.Member.Extent.Text)" }
+    if ((($short -eq 'ScriptBlock') -or ($short -eq 'PowerShell')) -and ($memberName -eq 'Create')) {
+        $opaqueHits.Add("[$typeName]::$memberName at line $($m.Extent.StartLineNumber)")
+    }
+}
+if ($opaqueHits.Count -eq 0) {
+    Write-Host '  PASS  no AST-opaque constructs in dispatch body'
+}
 else {
-    Write-Host '  SKIP  L3d — no dispatch loop identified'
+    foreach ($h in $opaqueHits) {
+        $script:failures++
+        Write-Host "  FAIL  L3d — $h"
+    }
+    Write-Host ("        AST-opaque constructs hide code from the parser this test relies on. " +
+                "Remove them from the dispatch body, or (if the runtime string is genuinely " +
+                "synchronous and cannot be expressed statically) split the change into a " +
+                "separate PR that carries a hand-written justification. Protected prose: $ProtectedProse")
 }
 
 Write-Host ''
