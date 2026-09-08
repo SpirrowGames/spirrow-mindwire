@@ -196,13 +196,23 @@ class HeartbeatRecord:
 
     Fields the digest reads:
 
-        * ``evaluated_at``          — this evaluation ran to completion.
+        * ``evaluated_at``          — this evaluation ran to completion. Advances
+                                      EVERY tick, INCLUDING ingest failures. So
+                                      it is a "did the loop run?" signal, not a
+                                      "was the ingest valid?" signal.
         * ``last_valid_ingest_at``  — the most recent time a HEALTHY-OR-IDLE
-                                      ingest was recorded (advances on state
-                                      != INGEST_FAILURE, stops otherwise).
-        * ``expires_at``            — ``evaluated_at + T_HEARTBEAT``. The
-                                      digest tests ``now > expires_at`` to
-                                      derive ``stale`` (msg-2693 advisory).
+                                      ingest was recorded. Advances on state !=
+                                      INGEST_FAILURE, HELD at the previous
+                                      value on failure. This is the field the
+                                      freshness predicate must read; the
+                                      distinction is load-bearing (msg-2692 §2).
+        * ``expires_at``            — the absolute time after which the digest
+                                      renders ``stale``. Derived from
+                                      ``last_valid_ingest_at + T_HEARTBEAT`` —
+                                      NOT from ``evaluated_at``. See the
+                                      property docstring below for why the
+                                      distinction is a correctness bug when it
+                                      is not respected (PR-gate msg-2696).
         * ``sources``               — per-source SourceReport list; the digest
                                       surfaces this as subordinate evidence
                                       under the state name.
@@ -235,17 +245,34 @@ class HeartbeatRecord:
                 )
 
     @property
-    def expires_at(self) -> datetime:
-        """The absolute time after which the digest should render ``stale``
-        (msg-2693 advisory): the digest just does ``now > record.expires_at``
-        and needs no other knowledge to interpret it.
+    def expires_at(self) -> datetime | None:
+        """The absolute time after which the digest should render ``stale``.
 
-        Derived rather than stored: keeping the interval encapsulated in this
-        module means changing ``T_HEARTBEAT`` is a one-line edit here, and no
-        digest-side change is needed to pick it up.
+        Returns ``None`` iff ``last_valid_ingest_at is None`` (no ingest has
+        ever succeeded — the digest MUST treat that as always stale).
+        Otherwise returns ``last_valid_ingest_at + T_HEARTBEAT``.
+
+        WHY DERIVED FROM ``last_valid_ingest_at`` — NOT ``evaluated_at``.
+        The earlier draft returned ``evaluated_at + T_HEARTBEAT``. PR-gate
+        msg-2696 (Tier B PR-gate on #237) found the correctness bug that
+        made the property mask ongoing outages: during a persistent
+        ingest_failure the script still runs every tick, so ``evaluated_at``
+        advances, so ``expires_at`` advances into the future, and a caller
+        that does ``now > record.expires_at`` (which the docstring told
+        them to do) returns False and misses the dead detector. The bug
+        was invisible because ``is_stale`` internally read the correct
+        field, but the property still exposed a false contract — msg-2688
+        §2 called out that kind of "quiet false claim" as the failure this
+        thread was created to eliminate.
+
+        Fix: expose the same rule ``is_stale`` uses, from the same field,
+        so the ``now > record.expires_at`` idiom in the docstring IS the
+        implementation and cannot silently drift from it.
         """
 
-        return self.evaluated_at + T_HEARTBEAT
+        if self.last_valid_ingest_at is None:
+            return None
+        return self.last_valid_ingest_at + T_HEARTBEAT
 
     def failing_sources(self) -> tuple[SourceReport, ...]:
         """Return the sources that pushed this record to INGEST_FAILURE state."""
@@ -306,27 +333,28 @@ def advance_last_valid_ingest_at(
     return record.evaluated_at
 
 
-def is_stale(
-    now: datetime,
-    record: HeartbeatRecord,
-    last_valid_ingest_at: datetime | None,
-) -> bool:
-    """Digest-side freshness predicate (msg-2693 advisory).
+def is_stale(now: datetime, record: HeartbeatRecord) -> bool:
+    """Digest-side freshness predicate (msg-2693 advisory + PR-gate msg-2696 fix).
 
     Two comparisons, no domain logic:
 
-        * ``last_valid_ingest_at`` is None (nothing has ever succeeded) → stale.
-        * ``now > last_valid_ingest_at + T_HEARTBEAT`` → stale.
+        * ``record.expires_at`` is None (nothing has ever succeeded) → stale.
+        * ``now > record.expires_at`` → stale.
 
-    The interval lives in this module (via ``record.expires_at`` for the case
-    where the caller passes ``last_valid_ingest_at == record.evaluated_at``);
-    the digest's contract is only "compare a wall-clock now against the
-    expiry we hand you".
+    Reads ``last_valid_ingest_at`` FROM THE RECORD via ``record.expires_at``.
+    PR-gate msg-2696 (ADVISORY) called out that a prior draft took
+    ``last_valid_ingest_at`` as a separate parameter while the record ALSO
+    carried the field — the same value existing in two places, with the
+    caller responsible for keeping them in sync, is the exact
+    "dual-management" complexity ``ObligationsManifest``-style single-source
+    designs are built to avoid. There is one field, and it lives on the
+    record; every downstream predicate reads it from there.
     """
 
-    if last_valid_ingest_at is None:
+    expires_at = record.expires_at
+    if expires_at is None:
         return True
-    return now > last_valid_ingest_at + T_HEARTBEAT
+    return now > expires_at
 
 
 # ─── Digest rendering (msg-2692 §4-3) ──────────────────────────────────────────────────
@@ -343,11 +371,7 @@ def is_stale(
 # module.
 
 
-def render_digest_lines(
-    record: HeartbeatRecord,
-    now: datetime,
-    last_valid_ingest_at: datetime | None,
-) -> tuple[str, ...]:
+def render_digest_lines(record: HeartbeatRecord, now: datetime) -> tuple[str, ...]:
     """Return the digest lines for this heartbeat record.
 
     Line 0: state name + freshness suffix (`healthy`, `idle`, `ingest_failure`,
@@ -359,10 +383,15 @@ def render_digest_lines(
     Line 1+: subordinate evidence — one line per source with fetch_outcome
              and counts. This is the "件数は verdict の位置から降格して従属
              証拠へ" contract from msg-2692 §1.
+
+    Reads ``last_valid_ingest_at`` from the record (PR-gate msg-2696 ADVISORY —
+    the field lives on ``HeartbeatRecord`` and there is exactly one source of
+    truth for it; the earlier out-of-band parameter is retired).
     """
 
     declared = derive_state(record)
-    stale = is_stale(now=now, record=record, last_valid_ingest_at=last_valid_ingest_at)
+    last_valid_ingest_at = record.last_valid_ingest_at
+    stale = is_stale(now=now, record=record)
 
     if stale:
         # Preserve the declared state in the subordinate footer so an operator

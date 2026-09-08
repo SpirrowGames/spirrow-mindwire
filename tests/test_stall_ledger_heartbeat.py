@@ -123,6 +123,7 @@ def _make_record(
     input_format_version: str = "v1",
     observed: dict[str, str] | None = None,
     evaluated_at: datetime = datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+    last_valid_ingest_at: datetime | None = None,
     stalls: tuple[str, ...] = (),
 ) -> HeartbeatRecord:
     if observed is None:
@@ -132,6 +133,7 @@ def _make_record(
         input_format_version=input_format_version,
         sources=tuple(sources),
         observed_format_versions=observed,
+        last_valid_ingest_at=last_valid_ingest_at,
         stalls=stalls,
     )
 
@@ -263,29 +265,103 @@ class TestLastValidIngestAt:
 
 
 class TestExpiresAtAndStaleness:
-    def test_expires_at_is_evaluated_plus_heartbeat(self) -> None:
-        """The whole point of Einstein's msg-2693 advisory: the interval
-        is encapsulated here. A change to T_HEARTBEAT is one edit in this
-        module and the digest picks it up with zero code change.
+    def test_expires_at_derives_from_last_valid_ingest_at(self) -> None:
+        """PR-gate msg-2696 BLOCKING regression pin: ``expires_at`` MUST be
+        computed from ``last_valid_ingest_at``, NOT from ``evaluated_at``.
+
+        The whole point of the split between the two timestamps (msg-2692
+        §2) is that ``evaluated_at`` advances every tick regardless of
+        outcome, while ``last_valid_ingest_at`` holds during ingest failure.
+        If ``expires_at`` reads from ``evaluated_at``, a persistent outage
+        keeps pushing the expiry forward and ``now > expires_at`` never
+        fires — the exact bug PR-gate #237 caught. The record's expiry is
+        one wall-clock time, and its home is the timestamp that CAN stop
+        advancing.
         """
 
-        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=1, recognized=1))
-        assert rec.expires_at == rec.evaluated_at + T_HEARTBEAT
+        last_valid = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=1, recognized=1),
+            last_valid_ingest_at=last_valid,
+        )
+        assert rec.expires_at == last_valid + T_HEARTBEAT
+
+    def test_expires_at_is_none_when_never_ingested(self) -> None:
+        """No ingest has ever succeeded → ``expires_at`` is None, and the
+        digest MUST treat that as always stale. Returning ``evaluated_at``
+        (the old contract) let a caller mistake "the loop ran" for
+        "an ingest succeeded"; ``None`` refuses that misreading.
+        """
+
+        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
+        assert rec.expires_at is None
+
+    def test_expires_at_does_not_advance_during_persistent_ingest_failure(self) -> None:
+        """PR-gate msg-2696 BLOCKING regression pin (the exact scenario the
+        naysayer named): during a persistent outage the emitter still runs
+        every tick, so ``evaluated_at`` moves forward; ``last_valid_ingest_at``
+        holds; therefore ``expires_at`` holds. A caller doing
+        ``now > record.expires_at`` sees the outage go stale on schedule,
+        instead of the property forever running away from ``now``.
+        """
+
+        last_valid = datetime(2026, 9, 8, 6, 0, tzinfo=UTC)
+        # Simulate a failing tick that ran 6 hours after last_valid — evaluated_at
+        # has advanced, but the ingest failed so last_valid_ingest_at holds.
+        failing_tick = _make_record(
+            _make_source("prs", FetchOutcome.HTTP_ERROR, examined=0),
+            evaluated_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+            last_valid_ingest_at=last_valid,
+        )
+        assert failing_tick.expires_at == last_valid + T_HEARTBEAT
+        # And the digest predicate agrees: now (well past expiry) is stale.
+        now = failing_tick.evaluated_at
+        assert is_stale(now=now, record=failing_tick)
 
     def test_stale_when_last_valid_is_none(self) -> None:
         rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
-        assert is_stale(now=rec.evaluated_at, record=rec, last_valid_ingest_at=None)
+        assert is_stale(now=rec.evaluated_at, record=rec)
 
     def test_not_stale_when_within_heartbeat(self) -> None:
-        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
+        last_valid = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=0),
+            last_valid_ingest_at=last_valid,
+        )
         # just before expiry
-        now = rec.evaluated_at + T_HEARTBEAT - timedelta(minutes=1)
-        assert not is_stale(now=now, record=rec, last_valid_ingest_at=rec.evaluated_at)
+        now = last_valid + T_HEARTBEAT - timedelta(minutes=1)
+        assert not is_stale(now=now, record=rec)
 
     def test_stale_at_expiry_boundary(self) -> None:
-        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
-        now = rec.evaluated_at + T_HEARTBEAT + timedelta(seconds=1)
-        assert is_stale(now=now, record=rec, last_valid_ingest_at=rec.evaluated_at)
+        last_valid = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=0),
+            last_valid_ingest_at=last_valid,
+        )
+        now = last_valid + T_HEARTBEAT + timedelta(seconds=1)
+        assert is_stale(now=now, record=rec)
+
+    def test_is_stale_reads_last_valid_ingest_at_from_the_record(self) -> None:
+        """PR-gate msg-2696 ADVISORY regression pin: there is exactly ONE
+        place ``last_valid_ingest_at`` lives — on the record — and every
+        downstream predicate reads it from there. The out-of-band parameter
+        the earlier draft passed is retired; that signature does not exist
+        any more, and calling ``is_stale(now, record)`` is the only way.
+        """
+
+        # Same record shape, different `last_valid_ingest_at` values on the
+        # record → different is_stale answers. Nothing else needs to change.
+        rec_fresh = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=1, recognized=1),
+            last_valid_ingest_at=datetime(2026, 9, 8, 11, 0, tzinfo=UTC),
+        )
+        rec_stale = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=1, recognized=1),
+            last_valid_ingest_at=datetime(2026, 9, 1, 0, 0, tzinfo=UTC),
+        )
+        now = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
+        assert not is_stale(now=now, record=rec_fresh)
+        assert is_stale(now=now, record=rec_stale)
 
 
 # --------------------------------------------------------------------------- #
@@ -296,35 +372,40 @@ class TestExpiresAtAndStaleness:
 
 
 class TestDigestRendering:
-    def _rec_healthy(self) -> HeartbeatRecord:
+    def _rec_healthy(self, last_valid: datetime | None = None) -> HeartbeatRecord:
+        """A HEALTHY record. Callers pass ``last_valid_ingest_at`` if they
+        want to exercise a non-``never`` freshness reading; None yields the
+        never-yet-succeeded case.
+        """
+
         return _make_record(
             _make_source("prs", FetchOutcome.OK, examined=3, recognized=3),
             _make_source("threads", FetchOutcome.OK, examined=0),
+            last_valid_ingest_at=last_valid,
         )
 
     def test_healthy_state_appears_as_verdict(self) -> None:
-        rec = self._rec_healthy()
-        lines = render_digest_lines(
-            record=rec, now=rec.evaluated_at, last_valid_ingest_at=rec.evaluated_at
-        )
+        rec = self._rec_healthy(last_valid=datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at)
         assert lines[0].startswith("detector: healthy")
 
     def test_idle_state_appears_as_verdict(self) -> None:
-        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
-        lines = render_digest_lines(
-            record=rec, now=rec.evaluated_at, last_valid_ingest_at=rec.evaluated_at
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=0),
+            last_valid_ingest_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
         )
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at)
         assert lines[0].startswith("detector: idle")
 
     def test_ingest_failure_state_appears_as_verdict(self) -> None:
-        rec = _make_record(_make_source("prs", FetchOutcome.TIMEOUT, examined=0))
-        # Pass a previous last_valid so ``stale`` does not shadow the declared
-        # state (a first-ever failure would render ``stale`` because
-        # last_valid_ingest_at is None; here we want to see the raw failure
-        # verdict, so pretend one previous ingest succeeded a moment ago).
-        lines = render_digest_lines(
-            record=rec, now=rec.evaluated_at, last_valid_ingest_at=rec.evaluated_at
+        # A previous ingest succeeded a moment ago so ``stale`` does not
+        # shadow the declared state — the point of the test is that the
+        # raw ingest_failure verdict is what surfaces.
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.TIMEOUT, examined=0),
+            last_valid_ingest_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
         )
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at)
         assert lines[0].startswith("detector: ingest_failure")
 
     def test_first_ever_failure_renders_stale_over_declared(self) -> None:
@@ -335,7 +416,7 @@ class TestDigestRendering:
         """
 
         rec = _make_record(_make_source("prs", FetchOutcome.TIMEOUT, examined=0))
-        lines = render_digest_lines(record=rec, now=rec.evaluated_at, last_valid_ingest_at=None)
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at)
         assert lines[0].startswith("detector: stale")
         assert "declared=ingest_failure" in lines[0]
 
@@ -346,17 +427,16 @@ class TestDigestRendering:
         broken" (declared=ingest_failure).
         """
 
-        rec = self._rec_healthy()
-        now = rec.evaluated_at + T_HEARTBEAT + timedelta(hours=1)
-        lines = render_digest_lines(record=rec, now=now, last_valid_ingest_at=rec.evaluated_at)
+        last_valid = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
+        rec = self._rec_healthy(last_valid=last_valid)
+        now = last_valid + T_HEARTBEAT + timedelta(hours=1)
+        lines = render_digest_lines(record=rec, now=now)
         assert lines[0].startswith("detector: stale")
         assert "declared=healthy" in lines[0]
 
     def test_evidence_lines_carry_counts(self) -> None:
-        rec = self._rec_healthy()
-        lines = render_digest_lines(
-            record=rec, now=rec.evaluated_at, last_valid_ingest_at=rec.evaluated_at
-        )
+        rec = self._rec_healthy(last_valid=datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at)
         joined = "\n".join(lines)
         assert "prs: fetch=ok examined=3 recognized=3 unrecognized=0" in joined
         assert "threads: fetch=ok examined=0 recognized=0 unrecognized=0" in joined
@@ -369,10 +449,11 @@ class TestDigestRendering:
         not appear on line 0.
         """
 
-        rec = _make_record(_make_source("prs", FetchOutcome.OK, examined=0))
-        lines = render_digest_lines(
-            record=rec, now=rec.evaluated_at, last_valid_ingest_at=rec.evaluated_at
+        rec = _make_record(
+            _make_source("prs", FetchOutcome.OK, examined=0),
+            last_valid_ingest_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
         )
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at)
         assert "stall" not in lines[0].lower(), (
             "the verdict line must not carry a stall count — that grants the "
             "parser the right to print '0 stalls' when ingest is broken. Put "
@@ -381,7 +462,7 @@ class TestDigestRendering:
 
     def test_never_ingested_is_shown_explicitly(self) -> None:
         rec = _make_record(_make_source("prs", FetchOutcome.HTTP_ERROR, examined=0))
-        lines = render_digest_lines(record=rec, now=rec.evaluated_at, last_valid_ingest_at=None)
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at)
         assert "last_valid_ingest_at=never" in lines[0]
 
     def test_version_drift_is_annotated_on_evidence(self) -> None:
@@ -390,7 +471,7 @@ class TestDigestRendering:
             input_format_version="v1",
             observed={"prs": "v2"},
         )
-        lines = render_digest_lines(record=rec, now=rec.evaluated_at, last_valid_ingest_at=None)
+        lines = render_digest_lines(record=rec, now=rec.evaluated_at)
         assert any("version_drift" in line for line in lines[1:])
 
 
