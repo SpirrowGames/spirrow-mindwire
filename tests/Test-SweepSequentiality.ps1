@@ -41,15 +41,24 @@
 #         `Join-Path $PSScriptRoot 'run-conductor.ps1'`.  Without this,
 #         L2a is trivially defeated by repointing $inner at a job wrapper
 #         and changing nothing at the call site.
-#   L2c — walking from the spawn site's CommandAst up the .Parent chain:
+#   L2c — walking from the spawn site's CommandAst up the .Parent chain
+#         asserts the RESHAPING boundary only: the walk sees the existing
+#         spawn's ancestors and nothing else in the body. It catches
+#         parallelization that MOVES `& $inner` into a script block; it
+#         does NOT catch DUPLICATION (a launch path added BESIDE the
+#         pinned spawn). See the "Spawn DUPLICATION" bullet in
+#         "Explicitly NOT covered here" for the design record and the
+#         measured evidence (both sides of the boundary tabulated).
 #           * the walk reaches $dispatchLoop (not stopped by anything else),
 #           * no ancestor PipelineAst has .Background,
 #           * no ancestor is a ScriptBlockExpressionAst passed as a command
-#             argument (that is the SHAPE of `Start-Job { … }`,
-#             `ForEach-Object -Parallel { … }`, `[Task]::Run({ … })`, etc.).
-#         L2c catches parallelization that MOVES `& $inner` into a script
-#         block. It does NOT catch duplication (a launch path added BESIDE
-#         the pinned spawn) — that class is a separate thread.
+#             argument. The shapes `Start-Job { … }`, `ForEach-Object
+#             -Parallel { … }`, `[Task]::Run({ … })`, etc. are caught by
+#             this ONLY when the mutation reshapes the existing spawn into
+#             one of them; the same shapes added as a SECOND launch path
+#             beside `& $inner` are NOT reached by this walk. They may
+#             still be caught by a DIFFERENT rule — see the bullet; the
+#             uncovered set is narrower than "duplication".
 #
 #   L3b — inside the dispatch body, every InvokeMemberExpressionAst whose
 #         target is a TypeExpressionAst (i.e. every `[Type]::Method(...)`
@@ -72,13 +81,141 @@
 #     Parameters cannot be verified statically (splatting, conditional
 #     assignment), and a check that green-lights a construct it did not
 #     actually inspect is worse than one that never looked.
-#   * Spawn DUPLICATION — a launch path added BESIDE the pinned spawn
-#     (e.g. keeping the sync path and adding `$jobs += Start-Job -FilePath
-#     $inner` on a branch). L2c walks the ancestor chain of the EXISTING
-#     spawn, so it catches parallelization that MOVES `& $inner` into a
-#     script block, and does not see a second launch path adjacent to it.
-#     Fixing this reopens the L3a design question. Tracked separately as
-#     T-sweep-pin-blind-to-launch-paths-added-beside-the-spawn.
+#   * Spawn DUPLICATION spelled as a PLAIN CMDLET TAKING A PATH — a launch
+#     path added BESIDE the pinned spawn (e.g. keeping the sync path and
+#     adding `$jobs += Start-Job -FilePath $inner` on a branch). L2c walks
+#     the ancestor chain of the EXISTING spawn, so it catches
+#     parallelization that MOVES `& $inner` into a script block, and does
+#     not see a second launch path adjacent to it.
+#     Thread: T-sweep-pin-blind-to-launch-paths-added-beside-the-spawn.
+#
+#     The uncovered set is NARROWER than "duplication", and the narrowing
+#     is measured, not argued. A second launch path is CAUGHT whenever it
+#     is spelled with a second `& $inner` (S1 census), with a static-type
+#     invocation (L3b), or with an AST-opaque construct (L3d). What
+#     escapes is the plain-cmdlet-with-a-path spelling — `Start-Job
+#     -FilePath $inner`, `Start-Process -FilePath $inner` — which trips
+#     none of those three. That is the hole, and it is the whole hole.
+#
+#     Measured 2026-09-08 against deploy/run-conductor-scheduled.ps1 as
+#     it stands in 014a665's tree — blob 4c9836d, which is the copy this
+#     branch has held since 1012079 (014a665 itself does not touch that
+#     file); this PR does not modify it. On main the file is blob 9fc60d6,
+#     changed by aece52a (+13/-1), which is NOT on this branch — it
+#     reaches main via the other merge parent 47eccbb. Every row below was
+#     re-run against BOTH blobs with this pin and the verdicts are
+#     identical row for row, so merging cannot change them.
+#     Option 3 (msg-630 §3, msg-631 sustained): the
+#     actual pin — this file, tests/Test-SweepSequentiality.ps1 — was
+#     invoked against mutated scratch copies of the sweep script in an
+#     isolated mirror OUTSIDE the working tree, so the pin under test is
+#     copied byte-for-byte and only the sweep copy is mutated. Working
+#     tree SHA256 hashes for both files verified unchanged before and
+#     after every row. Re-measured in full on 2026-09-08 at head cfb5eab
+#     after #241 merged (main 691309d); all rows below reproduced.
+#
+#       DUPLICATION side — pin misses, as documented:
+#         msg-595's verbatim incremental-duplication mutation
+#           if ($cand.slow) { $jobs += Start-Job -FilePath $inner; continue }
+#         inserted above the pinned spawn line: pin GREEN, exit 0. No
+#         rule fired — L1, S1-S4 identity resolution, L2a, L2b, L2c,
+#         L3b, and L3d all passed. `Start-Job -FilePath` is neither
+#         AST-opaque nor a static-type invocation, so L3b and L3d were
+#         exercised and did not fire on this mutation; the blind spot
+#         is a property of the full pin, not of a replica.
+#
+#         Cross-version corroboration: Bohr msg-595 measured the same
+#         duplication GREEN at 38b2fd6 against the pin as it was then.
+#         The pin was rewritten in 9ed8a82 and 014a665 between msg-595
+#         and this measurement, so the miss is agreement across pin
+#         revisions rather than replication.
+#
+#       RESHAPE side — pin catches, on the same pin invocation. The
+#       reshape mutations REPLACE the spawn line (they do not add a
+#       line), so the S1 census stays at 1 and the verdict is reached by
+#       the named rule rather than by S1 short-circuiting:
+#         `Start-Job -ScriptBlock { & $inner *>&1 }` wrapping the spawn:
+#           pin RED, L2c fires (ScriptBlockExpressionAst on the
+#           ancestor chain).
+#         `ForEach-Object -Parallel { & $inner *>&1 }` wrapping the spawn:
+#           pin RED, L2c fires.
+#         `[System.Threading.Tasks.Task]::Run({ & $inner *>&1 })` wrapping
+#         the spawn:
+#           pin RED, L2c AND L3b both fire — the Task type invocation
+#           is not on the L3b allowlist, so this reshape is double-caught.
+#
+#       DUPLICATION side, continued — the three spellings that ARE
+#       caught, each inserted BESIDE the pinned spawn (spawn line left
+#       intact, so L2c passes in every row):
+#         `$null = [System.Threading.Tasks.Task]::Run({ Write-Host "x" })`
+#           pin RED, L3b fires ALONE (L2c passed). This is the row that
+#           makes the aggregation observable: one rule fired, no other
+#           rule fired, and the pin exited 1. "Any rule fires ⇒ RED" is
+#           therefore executed for L3b rather than assumed — after the
+#           S1-S4 identity stage, the aggregation is `$script:failures`
+#           incremented by each rule and read once at the end, and L2c
+#           does not short-circuit before L3b runs. That stage itself is
+#           NOT accumulate-and-read-once: it fails closed at four early
+#           `exit 1` sites, one per rule, which is why the S1 row below
+#           exits before L2c/L3b are ever reached.
+#         `$null = [scriptblock]::Create("Write-Host x")`
+#           pin RED, L3b AND L3d fire (L2c passed).
+#         `$null = Start-Job -ScriptBlock { & $inner *>&1 }`
+#           pin RED, S1 fires — census 2, fail-closed exit before the
+#           later rules run. A duplication that re-spells `& $inner` is
+#           caught by identity, not by any async-shape rule.
+#
+#       And the second spelling that is MISSED, confirming the hole is a
+#       spelling class and not a one-off:
+#         `$null = Start-Process -FilePath $inner` inserted beside the
+#           spawn: pin GREEN, exit 0, no rule fired — same shape as
+#           msg-595's `Start-Job -FilePath $inner`.
+#
+#     The boundary is therefore measured against the actual pin on both
+#     sides — reshape RED, plain-cmdlet-with-a-path duplication GREEN,
+#     static-type / AST-opaque / re-spelled-`& $inner` duplication RED —
+#     with no replica and no cross-version inference. The one claim about
+#     how the pin AGGREGATES rule results (that a single firing rule is
+#     sufficient for RED) is executed for L3b in the row above and is not
+#     asserted for any rule it was not executed for.
+#
+#     Four closures were evaluated. The reason each was refused lives
+#     here so a re-open does not pay the measurement twice:
+#       (a) body-scoped `$inner`-occurrence check — WITHDRAWN, dies to a
+#           recompute bypass that does not name the variable:
+#           `Start-Job -FilePath (Join-Path $PSScriptRoot
+#           'run-conductor-once.ps1')` has zero occurrences of `$inner`.
+#       (b) denylist of async command names — REFUSED as structurally
+#           leaky. A denylist fails OPEN on unknowns; every async API
+#           the maintainer has not yet imagined is an unknown, so
+#           [System.Threading.Tasks.Task]::Run, [runspacefactory],
+#           `& $inner &` in PS7, and any wrapper defined elsewhere all
+#           miss the list by construction — not because the list is
+#           short but because the list is a list.
+#       (c) extract the dispatch body into a small named function and
+#           allowlist it — REFUSED on measured T1 failure. The dispatch
+#           foreach body at deploy/run-conductor-scheduled.ps1:3035-3287
+#           measured 37 top-level statements (14 AssignmentStatementAst
+#           + 14 IfStatementAst + 9 PipelineAst) against a pre-declared
+#           threshold of ≤25, and ≥24 read-only captured names plus ≥10
+#           mutated-inherited names (three flag/accumulator writes and
+#           seven `++` counters, each needing [ref] or $script:
+#           threading) against a threshold of ≤3. Thresholds were pinned
+#           in advance (msg-615) so the reading could not be reshaped by
+#           the result. Resolution method: identity walk (S1→S2→S3, same
+#           as this file's dispatch-loop derivation) — not a depth
+#           heuristic — so the number reproduces from the pin's own
+#           logic without a separate script. Spawn-only extraction
+#           ("extract just the `& $inner` line into Invoke-Inner") is
+#           the same option in disguise: guarding a small named function
+#           reduces to "assert this function is called once", which is
+#           (a) with a function name substituted for the variable and
+#           dies to the identical recompute bypass.
+#       (d) accept and declare — SELECTED. This bullet IS (d). The hole
+#           is documented, its shape is named, and the measured cost of
+#           closing it is recorded so a future engineer who wants to
+#           re-open the extraction option knows what they are paying
+#           before they start.
 #   * Renaming the candidate collection from `$candidates` to something
 #     else (or changing the iteration to a pipeline expression) will trip
 #     S2's zero-match assertion. This is a deliberate declared cost of
