@@ -101,9 +101,13 @@ _ID_FIELDS = ("id", "adr_id", "path", "doc_id", "slug", "name", "file")
 _DEFAULT_BODY = "drive"
 
 # Where in-repo ADR bodies live, and the filename marker that means "this is an amendment
-# memo, not the body" (see :func:`check_in_repo_bodies_are_registered`).
+# memo, not the body" (see :func:`check_in_repo_bodies_are_registered`). The marker is a
+# hyphen-delimited segment, not a bare substring: a body legitimately named
+# ``...-amendments-to-x.md`` must stay INSIDE the drift check. An exclusion that is wider
+# than its documentation is a guard that fails open silently, which is the failure class
+# this module exists to remove.
 _ADR_BODY_DIR = "docs/adr"
-_AMENDMENT_MARKER = "amendment"
+_AMENDMENT_MARKER = "-amendment-"
 
 
 def _first_adr_id(node: dict[str, Any]) -> str | None:

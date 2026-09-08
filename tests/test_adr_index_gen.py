@@ -281,6 +281,21 @@ def test_check_in_repo_bodies_are_registered_excludes_amendment_memos(tmp_path: 
     ]
 
 
+def test_amendment_exclusion_is_a_segment_not_a_substring(tmp_path: Path) -> None:
+    # The exclusion is documented as ``*-amendment-*`` in this module's docstring and in
+    # docs/adr/README.md. It must therefore match a hyphen-delimited segment, not any
+    # occurrence of the word: a real body named ``ADR-7-amendments-to-the-registry.md``
+    # contains "amendment" but is a BODY, and dropping it from the drift check would
+    # re-open the exact hole that check closes -- silently, since an excluded file is
+    # indistinguishable from an absent one. Widen the marker back to a bare substring and
+    # this goes red.
+    root = _tree(tmp_path, "ADR-7-amendments-to-the-registry.md")
+    manifest = 'adrs:\n  - id: ADR-7\n    title: "t"\n    body: drive\n'
+    assert check_in_repo_bodies_are_registered(manifest, root) == [
+        ("ADR-7", "drive", "ADR-7-amendments-to-the-registry.md")
+    ]
+
+
 def test_render_manifest_defaults_new_entries_to_drive_not_repo(tmp_path: Path) -> None:
     # msg-2671 §4-9: the generator must NOT infer ``repo:`` by scanning docs/adr/. A new
     # entry defaults to ``drive`` even when a same-id file exists, because inference
