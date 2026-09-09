@@ -51,6 +51,26 @@ captured indirectly through the disposition it forces (see the fixture's
 example, which contradicted the fixture on disk and misled readers about the
 schema's capabilities — corrected in PR-gate round 6 (msg-2708).
 
+**M-5 / M-6 / M-7 are the corpus's first not-representable fixtures**
+(added under Bohr msg-2833 §3 D-12″). Their `not_representable_reason`
+fields carry the three-layer residual (schema / granularity / consumer)
+established by Einstein E-9 / E-10 in msg-2749, and their absence from
+predicate coverage is declared machine-readably in the
+`_KNOWN_UNCOVERED_KINDS` allowlist in the backtest suite. Each fixture is
+paired with a running "collision pin" test that constructs the incident
+and its valid-wait counterexample and asserts the v1 schema cannot
+distinguish them — the pin reds the day a schema change lets it, at which
+point the fixture's not-representable claim is due to be revisited.
+
+Fixture reason fields are restricted to **structural / mechanical residual
+descriptions** (Einstein msg-2832 ADVISORY, Bohr msg-2833 §2). Project-
+management state such as "no design thread owns this fix yet" is NEVER
+written into a fixture — it belongs on the chatroom design thread only,
+where it does not go stale when the code has not changed. The
+`_KNOWN_UNCOVERED_KINDS` allowlist follows the same rule: it names the
+receipt thread a schema fix would arrive on (a mechanical routing
+dependency), not the ownership state of the fix itself.
+
 ## What the backtest asserts
 
 The backtest lives in `tests/test_stall_ledger_incident_backtest.py`. It

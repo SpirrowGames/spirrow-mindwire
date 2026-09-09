@@ -1,0 +1,24 @@
+{
+  "id": "M-7",
+  "title": "loop_control hold did not take effect for 18 minutes (desired_at vs observed_at)",
+  "observed_by": "operator",
+  "observed_at": "2026-09-08T20:50Z",
+  "spec_thread": "T-stalled-pr-has-no-detector",
+  "spec_msg_ids": ["msg-2744", "msg-2749"],
+  "provenance": {
+    "source": "conductor log: desired_at=2026-09-08T20:32:19Z / observed_at=2026-09-08T20:50:28Z = 18m09s gap",
+    "captured_at": "2026-09-09T00:00Z",
+    "captured_by": "Bohr msg-2744 §1 (independently reproduced by Einstein msg-2749 §1)"
+  },
+  "predicate_input": {
+    "kind": "hold",
+    "identifier": "spirrow-mindwire/loop_control",
+    "hold_state": {
+      "desired_at": "2026-09-08T20:32:19Z",
+      "observed_at": "2026-09-08T20:50:28Z"
+    }
+  },
+  "expected_verdict": "not-representable",
+  "not_representable_reason": "Schema-layer residual (Bohr msg-2831 §3(a), Einstein msg-2749 §5). UnitKind enumerates only {pr, thread, quarantine}; there is no unit kind that carries the (desired_at, observed_at) pair a hold's incident is defined by. Unlike M-5 / M-6 the residual is not primarily granularity or consumer — it is that the ledger's kind registry has no shape at all in which to construct 'the incident' vs. 'a valid wait'. The collision pin therefore takes a different form: test_m7_collision_pin_no_hold_kind_in_registry asserts the ABSENCE of a hold-carrying kind, and reds the day one is added — that day is the mechanical trigger for revisiting this fixture.",
+  "notes": "Bohr msg-2744 §1 measured a 18m09s gap between desired_at (when the hold was requested) and observed_at (when it took effect on the running loop); Einstein msg-2749 §1 independently reproduced the same numbers from origin/main = b0b1829. The fixture records the residual only — the incident's fix lives on a different design thread and is not scoped here."
+}
