@@ -54,6 +54,7 @@ from typing import Any
 from ..github.client import (
     CiState,
     CiStatus,
+    CrossPrApproveCoverage,
     GitHubClient,
     GitHubHTTPError,
     GitHubReviewClient,
@@ -1455,7 +1456,47 @@ def _make_diff_view(diff: str) -> DiffView:
     )
 
 
-def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
+def _format_b_a_marker(coverage: list[CrossPrApproveCoverage]) -> str:
+    """Render the B-(a) marker section for the pass-1 user prompt (msg-473 §5, msg-475 §5).
+
+    Empty list → empty string: the caller inserts nothing, and pass 1 sees a prompt that
+    is byte-identical to the pre-B-(a) shape (T1 anti-tautology on the "no coverage"
+    path — tests assert both branches, so drift between them fails a test).
+
+    Non-empty list → a labelled section that names each ``(sha, other_pr, approved_at)``
+    row, followed by the accountability clause (msg-473 §3 — "(a) は archive 上の
+    accountability を買う"). The prompt does NOT tell the naysayer what verdict to reach;
+    that would violate the "自然言語は defer 決定にしか使わない" invariant (msg-473 §4)
+    from the other direction — a driver-side directive that shapes the verdict is the
+    exact procedural constraint msg-473 forbade. The clause says only: *if you decide to
+    object at these bytes, name what new evidence changes the prior verdict.* The
+    naysayer stays free to object; the archive gains a record of the reasoning.
+
+    Sha renders in short form (first 12 chars) to keep the prompt compact — the full
+    sha stays in the driver's log line, not in the model's context.
+    """
+    if not coverage:
+        return ""
+    lines = [
+        "Prior-verdict coverage (msg-473 §5 B-(a), accountability marker, not a verdict",
+        "constraint): the following commits in this diff have already received a head-",
+        "bound APPROVE on ANOTHER PR. This is informational — you remain free to object.",
+        "If you do object at these specific commits, name in your critique what evidence",
+        "on this PR's head sha changes the prior verdict.",
+        "",
+    ]
+    for c in coverage:
+        approved = c.approved_at or "unknown time"
+        lines.append(f"- commit {c.sha[:12]} approved in {c.other_pr.slug} at {approved}")
+    return "\n".join(lines)
+
+
+def _build_messages(
+    text: str,
+    pr_slug: str,
+    *,
+    coverage: list[CrossPrApproveCoverage] | None = None,
+) -> list[ChatMessage]:
     """Pass-1 (verdict) messages — the SINGLE entry point for the pass-1 system prompt.
 
     ``text`` is the ALREADY-TRUNCATED diff body (i.e. ``DiffView.text``): truncation is
@@ -1473,11 +1514,19 @@ def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
     verbatim via ``build_preamble()`` in the same single entry point the design-time
     agent uses, so a one-place edit to ``spec/NAYSAYER_PRINCIPLES.md`` propagates to
     both surfaces (fail-loud: a missing/blank SOT raises).
+
+    ``coverage`` (B-(a) marker, msg-473 §5 / msg-475 §5): when non-empty, its
+    :func:`_format_b_a_marker` rendering is inserted BEFORE the diff fence so the model
+    reads the marker in the same message that carries the diff. ``None`` / empty list is
+    the pre-B-(a) shape byte-for-byte — the marker is opt-in and fail-open in one place.
     """
     system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
+    marker = _format_b_a_marker(coverage or [])
+    marker_section = f"{marker}\n\n" if marker else ""
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
         f"specific hunks you object to, and end with your VERDICT line.\n\n"
+        f"{marker_section}"
         f"```diff\n{text}\n```"
     )
     return [
@@ -1719,13 +1768,34 @@ class NaysayerPrReviewDriver:
         view = _make_diff_view(diff)
         truncated = view.truncated
 
+        # B-(a) accountability marker (msg-473 §5, msg-475 §5): resolve which commits in this
+        # diff already carry a head-bound APPROVE on ANOTHER PR — the stacked-PR scenario
+        # msg-456 §R-B named. Fail-open (msg-473 §5 "解決に失敗したら marker 無しで撃つ"): any
+        # exception on the lookup path is logged and swallowed, and the review proceeds with
+        # ``coverage = []``. The marker never gates the fire; it enriches the request when
+        # available and gets out of the way when not.
+        coverage: list[CrossPrApproveCoverage] = []
+        try:
+            coverage = await self._github.find_cross_pr_head_bound_approves(
+                pr, reviewer_login=self._review_login
+            )
+        except Exception as exc:  # fail-open by design (msg-473 §5)
+            logger.warning(
+                "B-(a) coverage lookup failed for %s: %s (fail-open — firing without marker)",
+                pr.slug,
+                exc,
+            )
+            coverage = []
+
         # A-3 two-pass structure (msg-692 §1): run pass 1 (verdict) and pass 2 (ADR-pointer
         # collection) in parallel. Pass 1 = judge; pass 2 = index-injected hint collection whose
         # output cannot alter the verdict (structural guarantee — the driver never reads a
         # verdict token from pass 2's return value). Both fire against the SAME diff at the SAME
         # commit, so a reviewer can trust the ADR pointer section corresponds to the same
         # evidence the verdict was formed on.
-        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(view, pr.slug)
+        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(
+            view, pr.slug, coverage=coverage
+        )
 
         if isinstance(pass1_result, LexoraTimeoutError):
             # T-infra-failure-posts-empty-rc: pass 1 did not finish within the client timeout.
@@ -1798,7 +1868,11 @@ class NaysayerPrReviewDriver:
         )
 
     async def _run_two_passes(
-        self, view: DiffView, pr_slug: str
+        self,
+        view: DiffView,
+        pr_slug: str,
+        *,
+        coverage: list[CrossPrApproveCoverage] | None = None,
     ) -> tuple[Any, AdrPointerSelection, str]:
         """Execute pass 1 + pass 2 concurrently, return their (typed) outcomes.
 
@@ -1806,6 +1880,12 @@ class NaysayerPrReviewDriver:
         :func:`_make_diff_view`. Both passes read ``view.text`` — the raw diff string
         does not reach this method, so the truncation cannot be recomputed here (round-3
         PR-gate finding on PR #186). Same view = same evidence for both passes.
+
+        ``coverage`` (B-(a) marker, msg-473 §5) is threaded down to :func:`_build_messages`
+        for pass 1 only. Pass 2 (ADR-pointer collection) has no role in the accountability
+        marker — that pass is judging-neutral (msg-692 §2 "the driver never reads a verdict
+        token from pass-2's return value") and does not need to see the prior-verdict
+        context. Keeping coverage out of pass 2 preserves that separation.
 
         Returns a triple:
 
@@ -1821,7 +1901,7 @@ class NaysayerPrReviewDriver:
         """
         pass1_task = self._lexora.chat_completion(
             model=self._model,
-            messages=_build_messages(view.text, pr_slug),
+            messages=_build_messages(view.text, pr_slug, coverage=coverage),
             max_tokens=self._max_tokens,
         )
         pass2_task = self._collect_adr_pointers(view.text, pr_slug)

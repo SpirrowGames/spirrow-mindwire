@@ -1067,6 +1067,13 @@ class _FakeGitHubCi:
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
         return []
 
+    async def find_cross_pr_head_bound_approves(
+        self, pr: PrRef, *, reviewer_login: str
+    ) -> list[Any]:
+        # Orchestrator L2 tests never exercise B-(a); return empty (the fail-open baseline).
+        # Kept for GitHubReviewClient Protocol compliance.
+        return []
+
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         raise NotImplementedError
 

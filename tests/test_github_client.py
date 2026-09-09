@@ -14,6 +14,7 @@ import pytest
 
 from spirrow_mindwire.github.client import (
     CiState,
+    CrossPrApproveCoverage,
     GitHubClient,
     GitHubHTTPError,
     PrRef,
@@ -769,3 +770,239 @@ async def test_both_paths_unusable_stays_unknown_and_keeps_rest_head_sha() -> No
     assert st.state is CiState.UNKNOWN
     # REST reached the PR (so it knows the head) even though it could not read runs.
     assert st.head_sha == "abc"
+
+
+# ---------- B-(a) cross-PR head-bound APPROVE resolution ------------------ #
+#
+# The stacked-PR scenario (msg-456 §R-B / msg-475 §5): PR #21 base=main pulled in PR #19's
+# four commits. This lookup resolves *which* commits in ``pr`` already carry a head-bound
+# APPROVE on ANOTHER PR — the archive-side accountability marker (msg-473 §3, msg-473 §5).
+
+
+def _coverage_handler(
+    *,
+    # Body OR status code.
+    pr_commits: list[dict[str, Any]] | int | None = None,
+    # sha -> body OR status code.
+    commit_pulls: dict[str, list[dict[str, Any]] | int] | None = None,
+    # pr_number -> body OR status code.
+    reviews: dict[int, list[dict[str, Any]] | int] | None = None,
+    calls: list[str] | None = None,
+) -> Any:
+    """Handler emitting the three endpoints B-(a) resolution reads:
+
+    * ``GET /repos/{o}/{r}/pulls/{n}/commits``
+    * ``GET /repos/{o}/{r}/commits/{sha}/pulls``
+    * ``GET /repos/{o}/{r}/pulls/{k}/reviews`` (the existing endpoint fetch_pr_reviews reads)
+
+    An ``int`` value stands for a non-2xx status code (fail-soft branch); a list/dict
+    value is the JSON body of a 200 response.
+    """
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if calls is not None:
+            calls.append(f"{request.method} {request.url.path}")
+        path = request.url.path
+        if path.endswith("/pulls/42/commits"):
+            if isinstance(pr_commits, int):
+                return httpx.Response(pr_commits)
+            return httpx.Response(200, json=pr_commits or [])
+        if "/commits/" in path and path.endswith("/pulls"):
+            sha = path.split("/commits/")[1].split("/pulls")[0]
+            entry = (commit_pulls or {}).get(sha, [])
+            if isinstance(entry, int):
+                return httpx.Response(entry)
+            return httpx.Response(200, json=entry)
+        if path.endswith("/reviews"):
+            # /repos/{o}/{r}/pulls/{k}/reviews
+            k = int(path.rsplit("/", 2)[1])
+            entry = (reviews or {}).get(k, [])
+            if isinstance(entry, int):
+                return httpx.Response(entry)
+            return httpx.Response(200, json=entry)
+        return httpx.Response(404)
+
+    return handle
+
+
+def _pull_row(number: int, *, owner: str, repo: str) -> dict[str, Any]:
+    """A minimal ``commits/{sha}/pulls`` row — number + base.repo.name + base.repo.owner.login.
+
+    Extracted so the test data fits inside the 100-char line budget: the flat literal was
+    reading as noise across every case and the shape it names is the same for every row.
+    """
+    return {
+        "number": number,
+        "base": {"repo": {"name": repo, "owner": {"login": owner}}},
+    }
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_identifies_stacked_parent() -> None:
+    """Msg-456 §R-B scenario: PR #42 contains commit ``sha1`` which was APPROVE'd on PR #19.
+
+    The returned coverage names the covering PR and the APPROVE's ``commit_id``, wearing
+    the same shape the marker renderer consumes.
+    """
+    coverage_pr = PrRef("SpirrowGames", "spirrow-conclair", 19)
+    handler = _coverage_handler(
+        pr_commits=[{"sha": "sha1"}, {"sha": "sha2"}],
+        commit_pulls={
+            "sha1": [_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")],
+            "sha2": [],  # only sha1 has a covering PR
+        },
+        reviews={
+            19: [
+                {
+                    "user": {"login": "spirrowgames-ops"},
+                    "state": "APPROVED",
+                    "commit_id": "sha1",
+                    "submitted_at": "2026-09-07T04:51:05Z",
+                }
+            ]
+        },
+    )
+    async with _client(handler) as client:
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+    assert result == [
+        CrossPrApproveCoverage(sha="sha1", other_pr=coverage_pr, approved_at="2026-09-07T04:51:05Z")
+    ]
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_ignores_non_head_bound_approve() -> None:
+    """An APPROVE whose ``commit_id`` differs from ``sha`` is NOT head-bound → excluded.
+
+    Msg-456 §R-B is explicit: only ``commit_id=<sha>`` counts. Approving a different head
+    of the same PR means the bytes now in this diff were not the ones that received the
+    verdict.
+    """
+    handler = _coverage_handler(
+        pr_commits=[{"sha": "sha1"}],
+        commit_pulls={"sha1": [_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")]},
+        reviews={
+            19: [
+                {
+                    "user": {"login": "spirrowgames-ops"},
+                    "state": "APPROVED",
+                    "commit_id": "OTHER_HEAD",  # not sha1 → not head-bound to this commit
+                    "submitted_at": "2026-09-07T04:51:05Z",
+                }
+            ]
+        },
+    )
+    async with _client(handler) as client:
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+    assert result == []
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_ignores_wrong_reviewer() -> None:
+    """A commit APPROVE'd by a NON-naysayer reviewer (e.g. Copilot) does not cover it.
+
+    Only the caller-named ``reviewer_login`` counts — the debounce, the round-cap, and
+    B-(a) share one identity source (msg-478 §3, msg-475 §5).
+    """
+    handler = _coverage_handler(
+        pr_commits=[{"sha": "sha1"}],
+        commit_pulls={"sha1": [_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")]},
+        reviews={
+            19: [
+                {
+                    "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "sha1",
+                    "submitted_at": "2026-09-07T04:51:05Z",
+                }
+            ]
+        },
+    )
+    async with _client(handler) as client:
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+    assert result == []
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_excludes_same_pr() -> None:
+    """A commit's APPROVE on the SAME PR (the reviewed one) is not cross-PR coverage.
+
+    Same-PR references are structurally filtered — the marker is about ANOTHER PR's
+    prior verdict. GitHub's ``commits/{sha}/pulls`` returns the reviewed PR itself when
+    the sha is one of its commits, so the filter is load-bearing.
+    """
+    handler = _coverage_handler(
+        pr_commits=[{"sha": "sha1"}],
+        commit_pulls={
+            "sha1": [
+                # same PR number and owner/repo as _PR → structurally filtered out.
+                _pull_row(42, owner="spirrowgames", repo="spirrow-mindwire")
+            ]
+        },
+        reviews={
+            42: [
+                {
+                    "user": {"login": "spirrowgames-ops"},
+                    "state": "APPROVED",
+                    "commit_id": "sha1",
+                    "submitted_at": "2026-09-07T04:51:05Z",
+                }
+            ]
+        },
+    )
+    async with _client(handler) as client:
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+    assert result == []
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_fail_soft_on_commits_error() -> None:
+    """``pulls/{n}/commits`` failure → empty result (fail-soft, msg-473 §5 fail-open).
+
+    The driver's outer catch is not the whole story: each underlying read is fail-soft
+    on its own too so a partial failure produces "coverage=[]" rather than a raise. The
+    outer catch backstops any surprise inside; this test pins the inner path.
+    """
+    handler = _coverage_handler(pr_commits=500)
+    async with _client(handler) as client:
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+    assert result == []
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_deduplicates_repeated_sha() -> None:
+    """The same ``(sha, other_pr)`` pair returned twice by GitHub → returned once.
+
+    A commit can appear in the PR's commit list under an unusual merge topology; the
+    same other PR can carry two APPROVE reviews against the same head (debounce reuse).
+    The marker lists the FACT of coverage, not every re-review.
+    """
+    handler = _coverage_handler(
+        pr_commits=[{"sha": "sha1"}, {"sha": "sha1"}],  # sha1 appears twice
+        commit_pulls={"sha1": [_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")]},
+        reviews={
+            19: [
+                {
+                    "user": {"login": "spirrowgames-ops"},
+                    "state": "APPROVED",
+                    "commit_id": "sha1",
+                    "submitted_at": "2026-09-07T04:51:05Z",
+                }
+            ]
+        },
+    )
+    async with _client(handler) as client:
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+    assert len(result) == 1
+    assert result[0].sha == "sha1"
