@@ -1006,3 +1006,76 @@ async def test_find_cross_pr_head_bound_approves_deduplicates_repeated_sha() -> 
         )
     assert len(result) == 1
     assert result[0].sha == "sha1"
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_dedup_across_forks() -> None:
+    """PR-gate on #245 edge-case: dedup key must include the OWNER/REPO, not just the number.
+
+    GitHub's ``commits/{sha}/pulls`` returns cross-fork associations, so a commit can be
+    named by upstream PR #19 AND fork-PR #19 (different owner/repo, same number). The
+    prior implementation keyed on ``(sha, number)`` alone and collided those two into
+    one row, losing the fork's coverage. The key is now the full :class:`PrRef` so both
+    rows survive.
+    """
+    upstream_pr = _pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")
+    fork_pr = _pull_row(19, owner="AnotherOrg", repo="spirrow-conclair-fork")
+    handler = _coverage_handler(
+        pr_commits=[{"sha": "sha1"}],
+        commit_pulls={"sha1": [upstream_pr, fork_pr]},
+        reviews={
+            # Both PR #19s carry a head-bound APPROVE on the same sha (implausible in
+            # practice for cross-fork same numbers, but the point is that the DEDUP KEY
+            # must not treat them as identical — the marker must show both rows).
+            19: [
+                {
+                    "user": {"login": "spirrowgames-ops"},
+                    "state": "APPROVED",
+                    "commit_id": "sha1",
+                    "submitted_at": "2026-09-07T04:51:05Z",
+                }
+            ],
+        },
+    )
+    async with _client(handler) as client:
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+    # Both fork associations survive dedup — a number-only key would have collapsed them
+    # into one row and this assertion would fail.
+    assert len(result) == 2
+    slugs = {c.other_pr.slug for c in result}
+    assert slugs == {
+        "SpirrowGames/spirrow-conclair#19",
+        "AnotherOrg/spirrow-conclair-fork#19",
+    }
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_never_raises_on_dependency_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-gate on #245 correctness: the "does NOT raise" docstring promise is STRUCTURAL.
+
+    Every underlying read is documented fail-soft today, but the outer method carries an
+    ``except Exception`` belt so the guarantee holds even if a dependency later regresses
+    to raising. We simulate that regression by monkey-patching ``fetch_pr_reviews`` to
+    raise ``GitHubHTTPError`` and asserting the method returns ``[]`` rather than
+    propagating.
+    """
+    handler = _coverage_handler(
+        pr_commits=[{"sha": "sha1"}],
+        commit_pulls={"sha1": [_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")]},
+        reviews={},  # irrelevant — we override fetch_pr_reviews below
+    )
+
+    async def _raising_reviews(pr: PrRef) -> list[Any]:
+        raise GitHubHTTPError("simulated regression: private cross-fork", status_code=403)
+
+    async with _client(handler) as client:
+        monkeypatch.setattr(client, "fetch_pr_reviews", _raising_reviews)
+        # Must not raise. Must return [] (the fail-open marker-less state).
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+    assert result == []

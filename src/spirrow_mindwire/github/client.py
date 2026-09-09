@@ -773,12 +773,30 @@ class GitHubClient:
         無しで撃つ (defer しない)"). It does NOT raise — that would let a transient GitHub
         outage stop the gate from firing at all, which the fail-open rule forbids.
 
-        Ordering: results are deduplicated on ``(sha, other_pr.number)`` and returned in
-        the traversal order of ``pr``'s commit list — the same order a reader of the PR sees.
-        Duplicate suppression matters: the same sha can appear in the PR's commit list twice
-        under an unusual merge topology, and the same OTHER PR can carry more than one
-        APPROVE against the same head (e.g. a re-review + a debounce reuse); we want the
-        marker to point at the *fact* of prior approval, not to list it four times.
+        The no-raise guarantee is **structural**, not just a property inherited from the
+        callees. Every underlying read this method makes (``_list_pr_commits``,
+        ``_commit_pulls``, :meth:`fetch_pr_reviews`) is *documented* fail-soft today, and
+        an outer ``except Exception`` still wraps the loop so the promise the docstring
+        makes holds even if one of the dependencies later regresses to raising — a
+        regression this method's caller (:class:`~spirrow_mindwire.naysayer.pr_review
+        .NaysayerPrReviewDriver.review`) already backstops with its own ``except`` for
+        the same reason (msg-473 §5), but two independent guards on the fail-open
+        contract is what the naysayer PR-gate on PR #245 asked to see. Pinned by
+        ``test_find_cross_pr_head_bound_approves_never_raises_on_dependency_failure``.
+
+        Ordering: results are deduplicated on ``(sha, other_pr)`` — the FULL
+        :class:`PrRef` (owner + repo + number), not just the number — and returned in
+        the traversal order of ``pr``'s commit list. GitHub's ``commits/{sha}/pulls``
+        returns cross-fork associations, so PR #42 from the upstream repo and PR #42
+        from a fork are two different rows that can share the same commit sha; a
+        number-only key would collide those two into one. ``PrRef`` is a frozen
+        dataclass ∴ hashable, so the tuple is a valid ``set`` element without extra
+        canonicalisation. Duplicate suppression matters because the same sha can appear
+        in the PR's commit list twice under an unusual merge topology, and the same
+        OTHER PR can carry more than one APPROVE against the same head (e.g. a
+        re-review + a debounce reuse); we want the marker to point at the *fact* of
+        prior approval, not to list it four times. Pinned by
+        ``test_find_cross_pr_head_bound_approves_dedup_across_forks``.
 
         ``reviewer_login`` is a parameter (not a module constant) because the caller — the
         driver — already owns the naysayer login for the debounce reuse path
@@ -786,39 +804,58 @@ class GitHubClient:
         truth: the debounce, the round-cap, and the B-(a) marker all name the same identity,
         or none does. Hard-coding it here would let the two fall out of sync.
         """
-        commits = await self._list_pr_commits(pr)
-        if not commits:
-            return []
-        seen: set[tuple[str, int]] = set()
-        coverage: list[CrossPrApproveCoverage] = []
-        for sha in commits:
-            candidates = await self._commit_pulls(pr.owner, pr.repo, sha)
-            for other_pr in candidates:
-                # Same-PR self-reference never counts as cross-PR coverage. ``other_pr`` may
-                # still have a different (owner, repo) — GitHub returns cross-fork associations —
-                # but we compare on ``(owner, repo, number)`` via the frozen dataclass equality,
-                # and the same-PR case is exactly what msg-478 §3's "自 PR は覆いにしない" spelled
-                # out.
-                if (
-                    other_pr.number == pr.number
-                    and other_pr.owner.lower() == pr.owner.lower()
-                    and other_pr.repo.lower() == pr.repo.lower()
-                ):
-                    continue
-                key = (sha, other_pr.number)
-                if key in seen:
-                    continue
-                reviews = await self.fetch_pr_reviews(other_pr)
-                for r in reviews:
-                    if r.login == reviewer_login and r.state == "APPROVED" and r.commit_id == sha:
-                        coverage.append(
-                            CrossPrApproveCoverage(
-                                sha=sha, other_pr=other_pr, approved_at=r.submitted_at
+        try:
+            commits = await self._list_pr_commits(pr)
+            if not commits:
+                return []
+            seen: set[tuple[str, PrRef]] = set()
+            coverage: list[CrossPrApproveCoverage] = []
+            for sha in commits:
+                candidates = await self._commit_pulls(pr.owner, pr.repo, sha)
+                for other_pr in candidates:
+                    # Same-PR self-reference never counts as cross-PR coverage.
+                    # ``other_pr`` may still have a different (owner, repo) — GitHub
+                    # returns cross-fork associations — but we compare on
+                    # ``(owner, repo, number)`` via the frozen dataclass equality,
+                    # and the same-PR case is exactly what msg-478 §3's "自 PR は覆
+                    # いにしない" spelled out.
+                    if (
+                        other_pr.number == pr.number
+                        and other_pr.owner.lower() == pr.owner.lower()
+                        and other_pr.repo.lower() == pr.repo.lower()
+                    ):
+                        continue
+                    key = (sha, other_pr)
+                    if key in seen:
+                        continue
+                    reviews = await self.fetch_pr_reviews(other_pr)
+                    for r in reviews:
+                        if (
+                            r.login == reviewer_login
+                            and r.state == "APPROVED"
+                            and r.commit_id == sha
+                        ):
+                            coverage.append(
+                                CrossPrApproveCoverage(
+                                    sha=sha, other_pr=other_pr, approved_at=r.submitted_at
+                                )
                             )
-                        )
-                        seen.add(key)
-                        break
-        return coverage
+                            seen.add(key)
+                            break
+            return coverage
+        except Exception as exc:
+            # Structural fail-open belt: the callees are already fail-soft, but keeping
+            # this outer catch means the docstring's "does NOT raise" promise holds
+            # regardless of whether a future refactor changes a dependency's failure
+            # policy (naysayer PR-gate on PR #245 correctness objection). ``Exception``
+            # (not ``BaseException``) so ``KeyboardInterrupt`` / ``SystemExit`` /
+            # ``asyncio.CancelledError`` still propagate as expected.
+            logger.warning(
+                "find_cross_pr_head_bound_approves(%s) raised unexpectedly: %s (fail-open [])",
+                pr.slug,
+                exc,
+            )
+            return []
 
     async def _list_pr_commits(self, pr: PrRef) -> list[str]:
         """``GET /repos/{owner}/{repo}/pulls/{n}/commits`` → shas in PR order (paginated).
