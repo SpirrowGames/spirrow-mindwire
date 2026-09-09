@@ -482,14 +482,14 @@ async def test_dispatcher_appends_attestation_line_when_adapter_exposes_record()
         tools=[],
         mcp_servers={},
         setting_sources=[],
-        env={"ANTHROPIC_BASE_URL": "http://100.79.84.62:8110"},
+        env={"ANTHROPIC_BASE_URL": "http://{{IP_SERVICES}}:8110"},
         model="naysayer",
     )
     record = AttestationRecord(
         tier="naysayer",
         backend="gemini",
         expected="gemini",
-        route="100.79.84.62:8110",
+        route="{{IP_SERVICES}}:8110",
         probe="cost-row#5992",
         at=datetime(2026, 8, 13, 0, 23, 48, tzinfo=UTC),
     )
@@ -503,11 +503,11 @@ async def test_dispatcher_appends_attestation_line_when_adapter_exposes_record()
     assert lines[0] == "agent said this"
     assert lines[-2] == (
         "<!-- source: tools=0 · mcp=0 · setting_sources=empty "
-        "· route=100.79.84.62:8110 · tier=naysayer -->"
+        "· route={{IP_SERVICES}}:8110 · tier=naysayer -->"
     )
     assert lines[-1] == (
         "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
-        "· route=100.79.84.62:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->"
+        "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->"
     )
 
 
@@ -592,7 +592,7 @@ async def test_dispatcher_stamps_attestation_when_adapter_has_no_options_getter(
         tier="naysayer",
         backend="gemini",
         expected="gemini",
-        route="100.79.84.62:8110",
+        route="{{IP_SERVICES}}:8110",
         probe="cost-row#5992",
         at=_dt(2026, 8, 13, 0, 23, 48, tzinfo=UTC),
     )
@@ -606,7 +606,7 @@ async def test_dispatcher_stamps_attestation_when_adapter_has_no_options_getter(
     assert lines[0] == "agent said this"
     assert lines[-1] == (
         "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
-        "· route=100.79.84.62:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->"
+        "· route={{IP_SERVICES}}:8110 · probe=cost-row#5992 · at=2026-08-13T00:23:48Z -->"
     )
     # And no invented configuration line: this adapter has no options at all,
     # so a ``source:`` line here would be fiction, not a tautology (D1).
