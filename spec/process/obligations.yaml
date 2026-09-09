@@ -540,7 +540,7 @@ obligations:
     # of ADR-2026-05-29-13. Read them at the sites:
     # :class:`spirrow_mindwire.gate_bootstrap_visibility.CloseFailureVisibility`
     # (W2); :class:`spirrow_mindwire.orchestrator.PrReviewOrchestrator` and
-    # :meth:`spirrow_mindwire.conductor.core.Conductor._post_pr_relay` (W3).
+    # :meth:`spirrow_mindwire.orchestrator.PrReviewOrchestrator._post_design_relay` (W3).
     #
     # NOT covered, and listed so the next reader does not have to re-derive it
     # (Bohr msg-559 MUST-B): :func:`spirrow_mindwire.gate_bootstrap.close_alert`

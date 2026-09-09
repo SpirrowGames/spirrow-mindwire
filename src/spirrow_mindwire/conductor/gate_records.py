@@ -47,6 +47,16 @@ import json
 import re
 from collections.abc import Iterable, Sequence
 
+#: The reserved author under which the conductor's PR-gate verdict relay (and the R3/R4/R5
+#: admission posts) are written. Both readers below are restricted to messages authored under
+#: this name (noise rejection, not authentication — see module docstring). The constant lives
+#: here rather than in a writer module because two writers now exist (``conductor.core`` for the
+#: admission posts, ``orchestrator._post_design_relay`` for the verdict) and both readers live
+#: here; duplicating the literal is the exact drift that flips ``verdict_heads`` silently empty
+#: (T-pr-gate-relay-belongs-to-the-conductor msg-2835 §4 C-2). ``gate_records`` owns the record
+#: vocabulary — the leaf module both writers depend on — so one file defines the string.
+RELAY_AUTHOR = "pr-gate-relay"
+
 #: The ci-route marker, byte-for-byte from design v0.3.1 §5.2A.5:
 #: ``<!-- mindwire:ci-route v1 {"head":"<sha>","conclusion":"failure","checks":["gate"]} -->``
 _CI_ROUTE_OPEN = "<!-- mindwire:ci-route v1 "
@@ -149,6 +159,7 @@ def verdict_heads(bodies: Iterable[str]) -> frozenset[str]:
 
 
 __all__ = [
+    "RELAY_AUTHOR",
     "ci_route_heads",
     "normalize_sha",
     "render_ci_route_marker",

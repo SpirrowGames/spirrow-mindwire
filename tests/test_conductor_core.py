@@ -24,7 +24,11 @@ from spirrow_mindwire.dispatcher.core import Dispatcher
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
 from spirrow_mindwire.gate_admission import CheckRow
 from spirrow_mindwire.github.client import CheckRollup, CiState, PrRef, ReviewEvent
-from spirrow_mindwire.magickit.client import MagickitMcpError, raise_if_envelope
+from spirrow_mindwire.magickit.client import (
+    MagickitMcpError,
+    ThreadResolvedError,
+    raise_if_envelope,
+)
 from spirrow_mindwire.magickit.gateway import MagickitChatroomGateway
 from spirrow_mindwire.naysayer.pr_review import PrReviewOutcome
 from spirrow_mindwire.ports import SpawnContext
@@ -229,18 +233,56 @@ class _ScriptedPrGate:
 
     Records each fired pr_ref. With one verdict it repeats it; with several it pops one per call (so
     an RC→fix→re-gate→APPROVE cycle can be scripted).
+
+    It also performs the design-thread relay, because the real gate now does (D-1): a fake that
+    only returned a verdict would model a gate that writes nothing. The heading is built with
+    :func:`~spirrow_mindwire.conductor.gate_records.render_relay_heading` — the SAME renderer
+    production calls — so a byte drift here cannot leave production broken while these tests stay
+    green (T-pr-gate-relay-belongs-to-the-conductor msg-2835 §5 R-5(b): a hardcoded string here
+    was exactly what would let the ``@ sha`` disappear without an admission test noticing). The
+    round-trip pin over production's *actual* output lives in ``tests/test_orchestrator.py``.
     """
 
-    def __init__(self, *verdicts: ReviewEvent) -> None:
+    def __init__(self, mcp: _FakeChatroomMcp, *verdicts: ReviewEvent) -> None:
+        self._mcp = mcp
         self._verdicts = list(verdicts)
         self.fired: list[str] = []
+        self.design_threads: list[str] = []
 
     async def fire_pr_review(
-        self, *, project: str, pr_ref: str
-    ) -> tuple[ThreadRef, PrReviewOutcome]:
+        self, *, project: str, pr_ref: str, design_thread: str, implementer: str | None = None
+    ) -> tuple[ThreadRef, PrReviewOutcome, dict[str, Any]]:
         self.fired.append(pr_ref)
+        self.design_threads.append(design_thread)
         verdict = self._verdicts.pop(0) if len(self._verdicts) > 1 else self._verdicts[0]
-        return _thread_ref(), _pr_outcome(verdict)
+        outcome = _pr_outcome(verdict)
+        nxt = implementer if verdict is ReviewEvent.REQUEST_CHANGES and implementer else "human"
+        content = (
+            f"{render_relay_heading(pr_ref, outcome.head_sha)}\n\n"
+            f"VERDICT: {verdict.value} (ci={outcome.ci_state.value})\n\n"
+            f"{outcome.body}\n\n"
+            f"NEXT: {nxt}"
+        )
+        relay: dict[str, Any] = {"msg_id": "", "author": "pr-gate-relay", "content": content}
+        try:
+            result = await self._mcp.call_tool(
+                "chatroom_post_message",
+                {
+                    "project": project,
+                    "thread_id": design_thread,
+                    "msg_type": "report",
+                    "author": "pr-gate-relay",
+                    "content": content,
+                },
+            )
+        except ThreadResolvedError:
+            # Disposition (1), as the production relay does: the GitHub review still stands and
+            # the empty msg_id is what the conductor fails safe on.
+            return _thread_ref(), outcome, relay
+        msg = result.get("msg") if isinstance(result, dict) else None
+        if isinstance(msg, dict):
+            relay["msg_id"] = str(msg.get("msg_id", ""))
+        return _thread_ref(), outcome, relay
 
 
 # --------------------------------------------------------------------------- #
@@ -1063,7 +1105,7 @@ async def test_pr_gate_approve_stops_at_human() -> None:
     # relay is posted under the reserved author, and the implementer is NOT dispatched.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == ["acme/widgets#7"]
@@ -1084,7 +1126,7 @@ async def test_pr_gate_comment_stops_at_human_without_dispatch() -> None:
     # empty body again.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.COMMENT)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.COMMENT)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == ["acme/widgets#7"]
@@ -1100,7 +1142,7 @@ async def test_pr_gate_request_changes_dispatches_implementer_then_reapprove() -
     # the pr-review sentinel; the second gate APPROVEs → stop at the human.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.REQUEST_CHANGES, ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.REQUEST_CHANGES, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(
         mcp, {Role.IMPLEMENTER: ["pushed a fix\n\nNEXT: pr-review acme/widgets#7"]}
     )
@@ -1120,7 +1162,7 @@ async def test_pr_gate_request_changes_without_implementer_routes_to_human() -> 
     # human (fail-safe) rather than guessing who fixes it.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Einstein", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.REQUEST_CHANGES)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.REQUEST_CHANGES)
     disp = _ScriptedDispatcher(mcp, {})
     conductor = Conductor(
         mcp=mcp,
@@ -1152,7 +1194,7 @@ async def test_pr_gate_relay_without_msg_id_fails_safe_to_human() -> None:
     # path, so a RC fails safe to the human (no implementer dispatch) — Tier B msg-572 #2.
     mcp = _NoMsgIdMcp()
     mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.REQUEST_CHANGES)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.REQUEST_CHANGES)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert outcome.stop_reason is StopReason.HUMAN
@@ -1178,7 +1220,7 @@ async def test_pr_gate_malformed_ref_routes_to_human_without_firing() -> None:
     # the conductor validates via parse_pr_ref and fails safe to the human (Tier B PR #103 round 4).
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="oops\n\nNEXT: pr-review not-a-valid-ref")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == []  # never fired — the ref failed validation
@@ -1195,7 +1237,7 @@ async def test_pr_gate_normalizes_url_ref_to_slug_before_firing() -> None:
         author="Heisenberg",
         content="opened\n\nNEXT: pr-review https://github.com/acme/widgets/pull/7",
     )
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == ["acme/widgets#7"]  # normalized from the URL
@@ -1583,8 +1625,6 @@ class _ThreadResolvedOnPostMcp(_FakeChatroomMcp):
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "chatroom_post_message":
-            from spirrow_mindwire.magickit.client import ThreadResolvedError
-
             raise ThreadResolvedError(
                 "magickit tool returned an error envelope: error_type='ChatroomStateError'",
                 error_type="ChatroomStateError",
@@ -1603,7 +1643,7 @@ async def test_w3_pr_gate_relay_thread_resolved_does_not_crash_and_routes_to_hum
     """
     mcp = _ThreadResolvedOnPostMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     # The gate DID fire (it precedes the relay).
@@ -1708,7 +1748,7 @@ async def test_admission_defers_on_pending_ci_without_firing_the_gate() -> None:
     # rollup — the wait is held by GitHub's state, not by any timer on this side.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     source = _ScriptedRollupSource(_rollup(*_PENDING))
     outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
@@ -1747,7 +1787,7 @@ async def test_admission_invokes_on_green_ci_and_the_relay_names_the_head() -> N
     # of gate_admission's verdict_heads input on the next tick.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     source = _ScriptedRollupSource(_rollup(*_GREEN))
     outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
@@ -1776,7 +1816,7 @@ async def test_admission_does_not_re_fire_the_gate_on_an_already_reviewed_head()
         ),
     )
     mcp.seed(author="Heisenberg", content="please re-check\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     source = _ScriptedRollupSource(_rollup(*_GREEN))
     outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
@@ -1790,7 +1830,7 @@ async def test_admission_routes_the_implementer_on_a_first_red_and_stamps_the_ma
     # fired at all and the implementer is woken on a machine observation of CI.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     source = _ScriptedRollupSource(_rollup(*_RED))
     outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
@@ -1820,7 +1860,7 @@ async def test_the_marker_written_on_r4_is_the_marker_read_on_r5() -> None:
     # else keeps passing while R5 silently stops existing.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(
         mcp, {Role.IMPLEMENTER: ["could not fix it\n\nNEXT: pr-review acme/widgets#7"]}
     )
@@ -1843,7 +1883,7 @@ async def test_admission_escalates_to_a_human_when_ci_is_stuck_past_the_cap() ->
     # false-early on the commit-clock fallback without re-deriving anything.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     stuck = _rollup(
         _check("CI", "queued", started_ago=timedelta(hours=9)),
@@ -1871,7 +1911,7 @@ async def test_a_human_authored_handoff_overrides_admission() -> None:
     # discriminator that delivers the escape hatch is the one used.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="human", content="fire it anyway\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     source = _ScriptedRollupSource(_rollup(*_PENDING))  # would DEFER under self-nomination
     outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
@@ -1887,7 +1927,7 @@ async def test_an_unread_rollup_keeps_the_pre_wiring_behaviour() -> None:
     # behaves exactly as it did, and the naysayer's own fail-closed L1 CI-gate still applies.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(
         mcp, disp, orchestrator=gate, rollup_source=_ScriptedRollupSource(None)
@@ -1902,7 +1942,7 @@ async def test_no_rollup_source_is_byte_for_byte_the_pre_wiring_path() -> None:
     # otherwise change behaviour for every caller that has not opted in.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()  # rollup_source=None
     assert gate.fired == ["acme/widgets#7"]
@@ -1916,7 +1956,7 @@ async def test_r4_without_an_implementer_persona_routes_to_the_human() -> None:
     # human rather than guessing who fixes CI.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Einstein", content="opened\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     conductor = Conductor(
         mcp=mcp,
@@ -1950,7 +1990,7 @@ async def test_admission_reads_heads_only_off_relay_authored_messages() -> None:
         ),
     )
     mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(
         mcp, disp, orchestrator=gate, rollup_source=_ScriptedRollupSource(_rollup(*_RED))
