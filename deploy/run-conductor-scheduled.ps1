@@ -2873,6 +2873,18 @@ function Get-SweepOwnerMap {
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
     $map = @{}
     if ($null -eq $raw.owner_map) { return $map }
+    # Type check the top-level shape BEFORE iterating properties. `ConvertFrom-Json` yields
+    # `[PSCustomObject]` for JSON objects, `[string]` for strings, `[object[]]` for arrays.
+    # Iterating `.PSObject.Properties` on any non-object silently walks the .NET reflection
+    # surface — an array would yield `Length=2`, a string would yield `Length=8` and
+    # `Chars`, both passing the `IsNullOrWhiteSpace` guard below and populating the map with
+    # garbage. Fail LOUDLY here on a malformed shape instead (naysayer PR #252 objection 4).
+    if ($raw.owner_map -isnot [System.Management.Automation.PSCustomObject]) {
+        throw ("sweep.json 'owner_map' must be a JSON object (mapping predicted resource -> " +
+               "owning project); found $($raw.owner_map.GetType().Name) in $Path. " +
+               "Refusing to iterate — a string or array would silently walk .NET reflection " +
+               "properties and produce garbage entries.")
+    }
     foreach ($p in $raw.owner_map.PSObject.Properties) {
         $key = [string]$p.Name
         $val = [string]$p.Value

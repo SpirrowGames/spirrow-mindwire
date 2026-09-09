@@ -42,6 +42,13 @@ $fnResource = $functions | Where-Object { $_.Name -eq 'Test-HoldForCandidate' } 
 if (-not $fnResource) { throw "function not found in sweep script: Test-HoldForCandidate" }
 Invoke-Expression $fnResource.Extent.Text
 
+# Get-SweepOwnerMap reads sweep.json's optional owner_map. The shape-check regression is
+# PR #252 naysayer objection 4: a mistakenly-stringified or arrayified owner_map used to silently
+# walk .NET reflection properties (e.g., an array's `Length`) and populate the map with garbage.
+$fnOwnerMap = $functions | Where-Object { $_.Name -eq 'Get-SweepOwnerMap' } | Select-Object -First 1
+if (-not $fnOwnerMap) { throw "function not found in sweep script: Get-SweepOwnerMap" }
+Invoke-Expression $fnOwnerMap.Extent.Text
+
 $script:failures = 0
 function Check {
     param([string]$Name, $Expected, $Actual)
@@ -208,6 +215,62 @@ $ownerMap_bad = @{ 'github.com/spirrowgames/spirrow-mindwire' = 'spirrow-not-a-r
 Check "owner_map points at project not in control map -> launch" $false `
     (Test-HoldForCandidate -Candidate $cand_magickit_writing_mindwire `
         -PredictedResourceByRepoDir $predicted_ok -OwnerMap $ownerMap_bad -ControlByProject $controls_mindwire_held)
+
+Write-Host ""
+Write-Host "Get-SweepOwnerMap — malformed owner_map shapes fail LOUDLY (PR #252 objection 4)"
+
+# Helper: write a temporary sweep.json with a specific `owner_map` value and run the reader.
+function Invoke-OwnerMapRead {
+    param([string]$OwnerMapJson)
+    $tmp = New-TemporaryFile
+    try {
+        $body = @"
+{
+  "owner_map": $OwnerMapJson,
+  "candidates": [
+    { "project": "p", "thread_id": "t", "repo_dir": "C:/x" }
+  ]
+}
+"@
+        [System.IO.File]::WriteAllText($tmp.FullName, $body)
+        return Get-SweepOwnerMap -Path $tmp.FullName
+    }
+    finally {
+        Remove-Item -LiteralPath $tmp.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Positive case — a valid JSON object populates the map.
+$goodMap = Invoke-OwnerMapRead -OwnerMapJson '{"github.com/foo/bar":"proj"}'
+Check "well-formed owner_map -> 1 entry loaded" 1 $goodMap.Count
+Check "well-formed owner_map -> correct value" "proj" $goodMap['github.com/foo/bar']
+
+# Negative cases — a string or array must THROW loudly, not silently populate with .NET
+# reflection properties (`Length`, `Chars`, etc). Verified by catching the exception and
+# asserting we saw one.
+$didThrowString = $false
+try { Invoke-OwnerMapRead -OwnerMapJson '"not-an-object"' | Out-Null }
+catch { $didThrowString = $true }
+Check "owner_map = string throws" $true $didThrowString
+
+$didThrowArray = $false
+try { Invoke-OwnerMapRead -OwnerMapJson '["a","b"]' | Out-Null }
+catch { $didThrowArray = $true }
+Check "owner_map = array throws" $true $didThrowArray
+
+$didThrowNumber = $false
+try { Invoke-OwnerMapRead -OwnerMapJson '42' | Out-Null }
+catch { $didThrowNumber = $true }
+Check "owner_map = number throws" $true $didThrowNumber
+
+# Backward-compat: an ABSENT owner_map (or explicit null) means "gate OFF", not an error.
+$tmpNoField = New-TemporaryFile
+try {
+    [System.IO.File]::WriteAllText($tmpNoField.FullName, '{"candidates":[{"project":"p","thread_id":"t","repo_dir":"C:/x"}]}')
+    $absentMap = Get-SweepOwnerMap -Path $tmpNoField.FullName
+    Check "owner_map absent -> empty map (gate OFF, backward compat)" 0 $absentMap.Count
+}
+finally { Remove-Item -LiteralPath $tmpNoField.FullName -Force -ErrorAction SilentlyContinue }
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "sweep hold gate: $($script:failures) check(s) FAILED"; exit 1 }

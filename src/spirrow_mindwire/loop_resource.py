@@ -231,50 +231,107 @@ def resolve_batch(
 # --- normalisation (D-KEY-1 v3) ------------------------------------------
 
 
+def _is_scp_style(candidate: str) -> bool:
+    """True iff ``candidate`` looks like an scp-style SSH URL.
+
+    Git's scp-style syntax is ``[user@]host.xz:path/to/repo.git`` — a
+    non-scheme URL with a ``:`` that appears BEFORE any ``/``. Notably:
+
+    - ``user@`` is optional: ``github.com:org/repo`` is a valid scp-style
+      URL that Git recognises without a user prefix, and it does not have
+      to be ``git@`` — an operator could clone as ``user@github.com:...``
+      or ``root@host:...`` (naysayer PR #252 objection 2).
+    - A Windows drive letter (``C:``, ``D:``, …) also has a single ``:``
+      before any ``/``, but is a LOCAL path — distinguished by the
+      one-character alphabetic prefix (drive letters are always exactly
+      one letter).
+
+    Distinguishing an ambiguous edge — a single-letter hostname followed
+    by ``:path`` — is a losing battle in general, and Git itself
+    documents the drive-letter carve-out with the same shape. This
+    heuristic follows Git's convention: single alpha before ``:`` is a
+    drive letter, anything longer or containing ``.`` / ``@`` is a host.
+    """
+
+    if "://" in candidate:
+        return False
+    first_slash = candidate.find("/")
+    first_colon = candidate.find(":")
+    if first_colon == -1:
+        return False
+    if first_slash != -1 and first_slash < first_colon:
+        return False
+    prefix = candidate[:first_colon]
+    # Windows drive letter carve-out — single alpha char before ``:``.
+    return not (len(prefix) == 1 and prefix.isalpha())
+
+
 def _normalise_remote_url(url: str) -> str:
     """Return the D-KEY-1 v3 comparison key: ``<host>/<org>/<repo>``.
 
     Steps applied in order (see the specifying thread's D-KEY-1):
 
-    1. If ``git@host:org/repo`` scp-style, rewrite to ``host/org/repo``.
-    2. Otherwise strip a scheme (``https://``, ``ssh://``, ``git://``,
+    1. Trim + lowercase (schemes and hostnames are case-insensitive in
+       every Git flavour; the compare key is lowercase anyway, so doing
+       this up front makes every following step case-insensitive —
+       fixes naysayer PR #252 objection 3, where ``HTTPS://…`` retained
+       its prefix through the case-sensitive scheme-match and blew up
+       three-segment validation).
+    2. If scp-style (:func:`_is_scp_style`), rewrite ``host:path`` to
+       ``host/path`` — the ``user@`` prefix (if any) is stripped as
+       credentials on the same pass. Handles ``git@`` and any other
+       user prefix, and ``host:path`` with no user (naysayer objection
+       2).
+    3. Otherwise strip a scheme (``https://``, ``ssh://``, ``git://``,
        ``http://``, ``file://``) and any embedded credentials
-       (``user[:pass]@``) — a ``user@`` host is expected in ssh-style URLs
-       but must not appear in the compare key.
-    3. Strip any trailing ``.git`` and any trailing ``/``.
-    4. Lowercase.
+       (``user[:pass]@``).
+    4. Strip any trailing ``.git`` and any trailing ``/`` — in a LOOP so
+       ``.git/`` and ``/.git`` both collapse cleanly (fixes naysayer
+       objection 1, where a ``.git/`` suffix left ``.git`` in the
+       comparison key and made a HOLD miss every checkout that omitted
+       the trailing slash).
 
     The result is asserted to be exactly three ``/``-separated non-empty
     segments (host, org, repo). A URL that does not split into three
-    segments raises ``ValueError`` — that is a genuine parse failure the
-    caller must surface, not silently paper over.
+    segments raises ``ValueError`` — a genuine parse failure the caller
+    must surface, not silently paper over.
     """
 
-    stripped = url.strip()
+    lowered = url.strip().lower()
 
-    if stripped.startswith("git@") and ":" in stripped and "://" not in stripped:
-        # scp-style: git@github.com:org/repo(.git)
-        host_and_rest = stripped[len("git@") :]
-        host, _, path = host_and_rest.partition(":")
+    if _is_scp_style(lowered):
+        # scp-style: [user@]host:path (path is org/repo(.git))
+        # Strip an optional ``user@`` prefix on the host side, then swap
+        # the ``:`` for ``/``. Credentials in scp-style are never ``user:pass``
+        # — the ``:`` before the first ``/`` is the host/path separator —
+        # so the only credential form here is a bare ``user@``.
+        candidate = lowered
+        first_slash = candidate.find("/")  # after :, may be -1
+        first_colon = candidate.find(":")
+        first_at = candidate.find("@")
+        if first_at != -1 and first_at < first_colon:
+            candidate = candidate[first_at + 1 :]
+            first_colon = candidate.find(":")
+            first_slash = candidate.find("/")
+        host = candidate[:first_colon]
+        path = candidate[first_colon + 1 :]
         candidate = f"{host}/{path}"
     else:
-        for scheme in ("https://", "ssh://", "git://", "http://", "file://"):
-            if stripped.startswith(scheme):
-                candidate = stripped[len(scheme) :]
-                break
-        else:
-            candidate = stripped
-
+        # scheme://... or bare host/path
+        candidate = lowered
+        scheme_sep = candidate.find("://")
+        if scheme_sep != -1:
+            candidate = candidate[scheme_sep + 3 :]
         # Strip credentials on the first '@' before the first '/'.
         first_slash = candidate.find("/")
         first_at = candidate.find("@")
         if first_at != -1 and (first_slash == -1 or first_at < first_slash):
             candidate = candidate[first_at + 1 :]
 
-    if candidate.endswith(".git"):
-        candidate = candidate[: -len(".git")]
-    candidate = candidate.rstrip("/")
-    candidate = candidate.lower()
+    # Loop-strip trailing ``.git`` and ``/`` — both may repeat, and either
+    # order (``.git/`` vs ``/.git``) must collapse to the bare form.
+    while candidate.endswith(".git") or candidate.endswith("/"):
+        candidate = candidate[: -len(".git")] if candidate.endswith(".git") else candidate[:-1]
 
     parts = candidate.split("/")
     if len(parts) != 3 or not all(parts):
@@ -287,19 +344,27 @@ def _looks_like_local_path(origin: str) -> bool:
 
     ``git remote get-url origin`` on a linked clone returns either a URL
     (network form) or a local filesystem path. The former always contains
-    a scheme or an scp-style ``@host:``; the latter does not. This rule
-    is conservative in the direction that matters: false-positive local
-    would loop forever on the same path (caught by the cycle check
-    upstream), false-negative would try to normalise a filesystem path as
-    a URL (caught by ``_normalise_remote_url``'s three-segment check).
+    a scheme (``://``) or is scp-style (``:`` before any ``/``); the
+    latter does not — with the single carve-out for Windows drive
+    letters (``C:/…``), which contain a ``:`` but are still local.
+
+    This rule is conservative in the direction that matters: false-
+    positive local would loop forever on the same path (caught by the
+    cycle check upstream), false-negative would try to normalise a
+    filesystem path as a URL (caught by
+    ``_normalise_remote_url``'s three-segment check).
+
+    Delegating to :func:`_is_scp_style` — instead of the previous
+    hardcoded ``origin.startswith("git@")`` — is the fix for naysayer
+    PR #252 objection 2: a checkout cloned with a different SSH user
+    (``user@github.com:org/repo``) or no user at all
+    (``github.com:org/repo``) was being classified as local and followed
+    onto the filesystem, then failing open.
     """
 
     if "://" in origin:
         return False
-    # Windows-style ``C:/…`` or ``C:\…`` — treat as local. POSIX absolute
-    # or relative — same. scp-style ``git@host:...`` is a network URL and
-    # is filtered out by the ``@host:`` shape below.
-    return not (origin.startswith("git@") and ":" in origin)
+    return not _is_scp_style(origin)
 
 
 # --- git runner (test seam) ----------------------------------------------

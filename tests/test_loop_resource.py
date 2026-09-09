@@ -111,6 +111,39 @@ class _FakeGit(_GitRunner):
         # Non-github host — the compare key preserves host, which is the
         # entire point of the D-KEY-1 v3 shape (host is NOT stripped).
         ("https://gitlab.example.com/Team/repo.git", "gitlab.example.com/team/repo"),
+        # --- regression cases from naysayer PR #252 ---
+        # Objection 1: trailing ``.git/`` (either order of the two suffix
+        # elements must collapse cleanly, or a HOLD would miss every
+        # checkout whose remote used the other spelling).
+        (
+            "https://github.com/SpirrowGames/spirrow-mindwire.git/",
+            "github.com/spirrowgames/spirrow-mindwire",
+        ),
+        (
+            "https://github.com/SpirrowGames/spirrow-mindwire/.git",
+            "github.com/spirrowgames/spirrow-mindwire",
+        ),
+        # Objection 2: scp-style with a non-``git`` user and scp-style
+        # with NO user prefix — both are valid Git remote formats.
+        (
+            "user@github.com:SpirrowGames/spirrow-mindwire.git",
+            "github.com/spirrowgames/spirrow-mindwire",
+        ),
+        (
+            "github.com:SpirrowGames/spirrow-mindwire.git",
+            "github.com/spirrowgames/spirrow-mindwire",
+        ),
+        # Objection 3: schemes are case-insensitive per RFC 3986; a git
+        # config with ``HTTPS://`` must not blow up three-segment
+        # validation.
+        (
+            "HTTPS://github.com/SpirrowGames/spirrow-mindwire.git",
+            "github.com/spirrowgames/spirrow-mindwire",
+        ),
+        (
+            "SSH://Git@GitHub.com/SpirrowGames/spirrow-mindwire.git",
+            "github.com/spirrowgames/spirrow-mindwire",
+        ),
     ],
 )
 def test_normalise_remote_url_expected_shape(url: str, expected: str) -> None:
@@ -132,6 +165,63 @@ def test_normalise_remote_url_rejects_non_three_segment() -> None:
 
     with pytest.raises(ValueError, match="expected <host>/<org>/<repo>"):
         _normalise_remote_url("https://github.com/a/b/c/d")
+
+
+# --- _looks_like_local_path (regression from naysayer objection 2) -------
+
+
+def test_looks_like_local_path_recognises_scp_without_git_user(tmp_path: Path) -> None:
+    """A checkout whose ``origin`` is scp-style with a non-``git`` user
+    (or no user at all) must NOT be misclassified as a local path — the
+    resolver would follow it onto the filesystem and fail open, defeating
+    the HOLD gate. Naysayer PR #252 objection 2.
+    """
+
+    git = _FakeGit(
+        {str(tmp_path): "user@github.com:SpirrowGames/spirrow-mindwire.git"},
+    )
+    r = resolve_predicted_resource(str(tmp_path), _git=git)
+    assert r.resource == "github.com/spirrowgames/spirrow-mindwire"
+    assert r.reason is None
+    # Exactly one hop — the scp-style URL is recognised as a network URL,
+    # not followed as a local path.
+    assert len(git.calls) == 1
+
+
+def test_looks_like_local_path_recognises_scp_without_user(tmp_path: Path) -> None:
+    """``host:path`` — scp-style with no user prefix at all — is still a
+    valid Git remote and must resolve, not be treated as local."""
+
+    git = _FakeGit({str(tmp_path): "github.com:SpirrowGames/spirrow-mindwire.git"})
+    r = resolve_predicted_resource(str(tmp_path), _git=git)
+    assert r.resource == "github.com/spirrowgames/spirrow-mindwire"
+    assert r.reason is None
+    assert len(git.calls) == 1
+
+
+def test_looks_like_local_path_windows_drive_letter_is_local(tmp_path: Path) -> None:
+    """A Windows drive-letter path (``C:/other-clone``) has a ``:``
+    before a ``/`` — the same surface shape as scp-style — but MUST be
+    classified as local, or a linked-clone chain on Windows breaks.
+
+    We verify the disambiguation by pointing the fake at a local path
+    whose next hop resolves to a real URL: if drive-letter carve-out
+    fails, resolution stops before that hop.
+    """
+
+    hop1 = tmp_path / "a"
+    hop2 = tmp_path / "b"
+    hop1.mkdir()
+    hop2.mkdir()
+    git = _FakeGit(
+        {
+            str(hop1): str(hop2),  # local-path chain
+            str(hop2): "https://github.com/SpirrowGames/spirrow-mindwire.git",
+        }
+    )
+    r = resolve_predicted_resource(str(hop1), _git=git)
+    assert r.resource == "github.com/spirrowgames/spirrow-mindwire"
+    assert len(git.calls) == 2  # both hops followed
 
 
 # --- resolve_predicted_resource ------------------------------------
