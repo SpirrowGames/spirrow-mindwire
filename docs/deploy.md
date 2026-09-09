@@ -1,5 +1,7 @@
 # Deploy — Stage 3 unattended conductor daemon (ADR-18)
 
+> **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
+
 How to run the NEXT-driven design-loop **conductor** (`mindwire-loop --mode conductor`) as an
 unattended daemon. The conductor reads one design thread and serially dispatches the single
 `NEXT:`-named role each turn (proposer → implementer → naysayer), driving it to a stop condition
@@ -26,18 +28,18 @@ The daemon needs to reach four things from wherever it runs:
 
 | Dependency | Endpoint | Notes |
 |---|---|---|
-| magickit chatroom MCP | `MINDWIRE_MAGICKIT_MCP_URL` (default `http://100.79.84.62:8117/mcp`) | the thread substrate; reachable from sg-tomtebo-01 over Tailscale (verified — the voxelworld conductor smoke read/posted through it) |
-| Lexora gateway | `http://100.79.84.62:8110` | design-time naysayer (`naysayer` tier → Gemini) **and** the Tier B PR-gate driver |
+| magickit chatroom MCP | `MINDWIRE_MAGICKIT_MCP_URL` (default `http://{{IP_SERVICES}}:8117/mcp`) | the thread substrate; reachable from {{HOST_LOOP}} over Tailscale (verified — the voxelworld conductor smoke read/posted through it) |
+| Lexora gateway | `http://{{IP_SERVICES}}:8110` | design-time naysayer (`naysayer` tier → Gemini) **and** the Tier B PR-gate driver |
 | Claude inference | `https://api.anthropic.com` | the implementer's local subscription on the daemon host |
 | GitHub | api.github.com | PR open / diff read / review submit (via the scoped token) |
 
-**sg-tomtebo-01 is a viable host**: it reaches magickit + Lexora over Tailscale and has a local
-Claude subscription for the implementer. (Running co-resident on sg-ai-server-01 is the alternative;
+**{{HOST_LOOP}} is a viable host**: it reaches magickit + Lexora over Tailscale and has a local
+Claude subscription for the implementer. (Running co-resident on {{HOST_SERVICES}} is the alternative;
 then magickit/Lexora are loopback and the implementer needs its own inference there.)
 
 ### Host prerequisites (egress chokepoint + clock)
 
-sg-tomtebo-01 runs an **allow-list egress model**: every firewall profile is
+{{HOST_LOOP}} runs an **allow-list egress model**: every firewall profile is
 `DefaultOutboundAction=Block`, only `squid.exe` has an outbound rule, and `squid.conf`
 (`C:\Squid\etc\squid\squid.conf`, outside this repo) decides which domains are reachable. Two
 consequences bite the daemon:
@@ -178,7 +180,7 @@ conductor is worth it at all.
 
 ### The daemon runs from its OWN checkout, never a working one
 
-**The scheduled task must point at a clone nobody edits** — on sg-tomtebo-01,
+**The scheduled task must point at a clone nobody edits** — on {{HOST_LOOP}},
 `C:\Users\tomtar\spirrow-mindwire-daemon`, deliberately beside the data dir rather than in the dev
 workspace, so the location itself says "not a place to work".
 
@@ -578,8 +580,8 @@ caps accuracy at roughly ±1 s. It exists only because UDP/123 is blocked (see *
 
 ```powershell
 # magickit + Lexora reachable from this host?
-Test-NetConnection 100.79.84.62 -Port 8117   # magickit MCP
-Test-NetConnection 100.79.84.62 -Port 8110   # Lexora
+Test-NetConnection {{IP_SERVICES}} -Port 8117   # magickit MCP
+Test-NetConnection {{IP_SERVICES}} -Port 8110   # Lexora
 # secrets present? (the webhook lives in the User scope, NOT the session)
 if (-not $env:MINDWIRE_NAYSAYER_GITHUB_TOKEN) { "MISSING github token" }
 if (-not [Environment]::GetEnvironmentVariable('MINDWIRE_NOTIFY_DISCORD_WEBHOOK','User')) { "MISSING notify webhook" }
