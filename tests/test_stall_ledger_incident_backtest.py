@@ -71,6 +71,15 @@ _FIXTURES = _load_fixtures()
 # the schema grows the missing layers, the entry is REMOVED — that removal is the
 # mechanical proof that coverage arrived.
 #
+# That removal is FORCED, not merely expected. Until 1747db7 the sentence above was
+# a claim no assertion backed: a kind could gain a representable fixture and keep its
+# entry here forever while the suite stayed green (PR-gate msg-2844 objection 2,
+# reproduced by construction in Bohr msg-2845 §2). The enforcement now lives in
+# ``_assert_allowlist_is_exactly_the_residual`` below, which holds
+# ``set(_KNOWN_UNCOVERED_KINDS) == all_kinds - representable_kinds``: its
+# stale-on-coverage assertion is what makes the deletion mechanical, and its orphan
+# assertion additionally catches an entry that no fixture mentions at all.
+#
 # What belongs in an entry: ``receipt_thread`` is the mechanical routing dependency
 # (a chatroom thread name a schema fix would arrive on) and ``missing_layers`` is
 # the machine-readable list of what the schema does not carry today. What does NOT
@@ -101,6 +110,80 @@ _KNOWN_UNCOVERED_KINDS: dict[str, dict[str, Any]] = {
         ),
     },
 }
+
+
+def _assert_allowlist_is_exactly_the_residual(
+    all_kinds: set[str],
+    representable_kinds: set[str],
+    allowlist: dict[str, dict[str, Any]],
+) -> None:
+    """Hold ``set(allowlist) == all_kinds - representable_kinds``.
+
+    Three assertions that together ARE that set equality. The equality — rather
+    than the PR-gate's own prescription in msg-2844, "the sets must be mutually
+    exclusive" — is what Bohr msg-2845 §2 settled on, because exclusivity is too
+    weak: an entry naming a kind that NO fixture mentions is in neither
+    ``representable_kinds`` nor ``all_kinds``, so it satisfies exclusivity
+    trivially and lingers forever. Named directions:
+
+    (a) forward — every observed-but-uncovered kind has a well-formed entry,
+        i.e. ``all_kinds - representable_kinds ⊆ set(allowlist)``;
+    (b) stale-on-coverage — no representable kind keeps an entry, i.e. no member
+        of ``set(allowlist)`` lies in ``representable_kinds``;
+    (c) orphan — ``set(allowlist) - all_kinds`` is empty.
+
+    (b) ∧ (c) give ``set(allowlist) ⊆ all_kinds - representable_kinds``; with (a)
+    that is the equality. (b) and (c) are the new ones — at 1747db7 the loop hit a
+    bare ``continue`` on the representable branch and never looked at the
+    allowlist, which is PR-gate msg-2844 objection 2.
+
+    This is a module-level helper, not inline test body, so the repair is itself
+    pinned: ``test_allowlist_invariant_*`` below drive it with in-memory inputs.
+    A fix that is not under test can regress as silently as the hole it closed.
+    """
+
+    for kind in sorted(all_kinds):
+        if kind in representable_kinds:
+            assert kind not in allowlist, (
+                f"kind {kind!r} now HAS a representable fixture but is STILL listed "
+                "in _KNOWN_UNCOVERED_KINDS. Coverage arrived — delete the entry. "
+                "That deletion is the mechanical proof the residual closed; leaving "
+                "it turns the allowlist into a record of what was once missing "
+                "rather than what is missing now."
+            )
+            continue
+        assert kind in allowlist, (
+            f"kind {kind!r} appears in a fixture but has no representable "
+            f"fixture and no _KNOWN_UNCOVERED_KINDS entry. Either the "
+            "predicate silently lost coverage of this kind (representable "
+            "fixtures got retired — forbidden by the monotonic obligation), "
+            "or a not-representable fixture was added without declaring the "
+            "residual. Both are the shape the monotonic-fixture obligation "
+            "exists to prevent."
+        )
+        entry = allowlist[kind]
+        assert entry.get("receipt_thread"), (
+            f"_KNOWN_UNCOVERED_KINDS[{kind!r}] must name receipt_thread "
+            "(the design thread a schema fix would arrive on). Without it, "
+            "the allowlist entry has no mechanical routing target and is "
+            "indistinguishable from prose."
+        )
+        assert entry.get("missing_layers"), (
+            f"_KNOWN_UNCOVERED_KINDS[{kind!r}] must list missing_layers so "
+            "the residual is machine-readable, not prose. Each layer is a "
+            "one-line description of what the schema does not carry."
+        )
+
+    # Asserted outside the loop on purpose: the loop iterates observed kinds, so an
+    # entry naming a kind no fixture mentions is unreachable from inside it.
+    orphans = sorted(set(allowlist) - all_kinds)
+    assert not orphans, (
+        f"_KNOWN_UNCOVERED_KINDS names kind(s) {orphans} that NO fixture mentions. "
+        "The per-kind loop above can never reach them, so they would linger "
+        "indefinitely. Either the fixture that motivated the entry was retired "
+        "(forbidden by the monotonic obligation) or the entry outlived its residual "
+        "and must be deleted."
+    )
 
 
 def test_fixtures_directory_is_non_empty() -> None:
@@ -252,6 +335,13 @@ def test_representability_summary() -> None:
     layers). Deleting an allowlist entry becomes the mechanical proof that
     coverage arrived — Bohr Q-4 / Einstein msg-2832 BLOCKING invariant.
 
+    That last sentence is now ENFORCED rather than merely asserted here: the
+    check below delegates to ``_assert_allowlist_is_exactly_the_residual``,
+    whose stale-on-coverage direction fails the day a kind gains a representable
+    fixture and keeps its allowlist entry. At 1747db7 this docstring overclaimed
+    — nothing forced the deletion, and PR-gate msg-2844 objection 2 was right
+    about that (Bohr msg-2845 §2 reproduced it by construction).
+
     Deliberately NOT done here (Einstein msg-2749 E-11 "採ってはならない修正"):
     a bare ``assert "thread" in representable_kinds``. That would block the
     corpus red until the schema shipped, and the corpus is monotonic — the
@@ -277,29 +367,58 @@ def test_representability_summary() -> None:
         "no quarantine fixture is representable — the predicate lost quarantine coverage."
     )
 
-    for kind in sorted(all_kinds):
-        if kind in representable_kinds:
-            continue
-        assert kind in _KNOWN_UNCOVERED_KINDS, (
-            f"kind {kind!r} appears in a fixture but has no representable "
-            f"fixture and no _KNOWN_UNCOVERED_KINDS entry. Either the "
-            "predicate silently lost coverage of this kind (representable "
-            "fixtures got retired — forbidden by the monotonic obligation), "
-            "or a not-representable fixture was added without declaring the "
-            "residual. Both are the shape the monotonic-fixture obligation "
-            "exists to prevent."
+    _assert_allowlist_is_exactly_the_residual(
+        all_kinds=all_kinds,
+        representable_kinds=representable_kinds,
+        allowlist=_KNOWN_UNCOVERED_KINDS,
+    )
+
+
+# A self-contained entry for the invariant pins below. Deliberately NOT one of the
+# live ``_KNOWN_UNCOVERED_KINDS`` values: those two are supposed to be DELETED the day
+# their schema residual closes, and a pin that read them would break on that deletion —
+# exactly when the invariant matters most.
+_SYNTHETIC_ALLOWLIST_ENTRY: dict[str, Any] = {
+    "receipt_thread": "T-synthetic-pin-target-not-a-real-thread",
+    "missing_layers": ("synthetic: exists only inside the allowlist-invariant pins",),
+}
+
+
+def test_allowlist_invariant_rejects_stale_entry_once_coverage_arrives() -> None:
+    """Pin for the stale-on-coverage direction — PR-gate msg-2844 objection 2.
+
+    At 1747db7 this exact input passed: ``thread`` was representable, the loop hit
+    a bare ``continue``, and the entry survived. Bohr msg-2845 §2 reproduced that
+    by dropping a scratch fixture into the corpus and observing
+    ``test_representability_summary PASSED``.
+
+    Pinned in memory because §3.4 forbids pinning it the way it was reproduced:
+    a probe file written into ``tests/data/stall_ledger_incidents/`` would pollute
+    the corpus, which is monotonic and therefore cannot take the file back out.
+    """
+
+    with pytest.raises(AssertionError, match="STILL listed"):
+        _assert_allowlist_is_exactly_the_residual(
+            all_kinds={"thread"},
+            representable_kinds={"thread"},
+            allowlist={"thread": _SYNTHETIC_ALLOWLIST_ENTRY},
         )
-        entry = _KNOWN_UNCOVERED_KINDS[kind]
-        assert entry.get("receipt_thread"), (
-            f"_KNOWN_UNCOVERED_KINDS[{kind!r}] must name receipt_thread "
-            "(the design thread a schema fix would arrive on). Without it, "
-            "the allowlist entry has no mechanical routing target and is "
-            "indistinguishable from prose."
-        )
-        assert entry.get("missing_layers"), (
-            f"_KNOWN_UNCOVERED_KINDS[{kind!r}] must list missing_layers so "
-            "the residual is machine-readable, not prose. Each layer is a "
-            "one-line description of what the schema does not carry."
+
+
+def test_allowlist_invariant_rejects_orphan_entry_no_fixture_mentions() -> None:
+    """Pin for the orphan direction — the shape mutual exclusivity misses.
+
+    ``ghost`` is in neither ``all_kinds`` nor ``representable_kinds``, so the
+    PR-gate's own remedy ("the two sets must be mutually exclusive") is satisfied
+    and the entry would still linger. Only the set EQUALITY catches it, and only
+    from outside the per-kind loop, which iterates observed kinds.
+    """
+
+    with pytest.raises(AssertionError, match="NO fixture mentions"):
+        _assert_allowlist_is_exactly_the_residual(
+            all_kinds={"pr"},
+            representable_kinds={"pr"},
+            allowlist={"ghost": _SYNTHETIC_ALLOWLIST_ENTRY},
         )
 
 
@@ -312,6 +431,8 @@ def test_unit_kinds_are_consistent_with_registry() -> None:
 
     known = {k.value for k in UnitKind}
     for fx in _FIXTURES:
+        # Load-bearing: M-7 is the fixture that takes this branch — its "kind": "hold"
+        # is deliberately absent from UnitKind (see the M-7 collision pin below).
         if fx["expected_verdict"] == "not-representable":
             continue
         kind = fx["predicate_input"]["kind"]
