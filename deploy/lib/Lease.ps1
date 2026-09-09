@@ -715,18 +715,21 @@ function Test-LeaseAvailableFor {
     # this call is the ENTIRE validation for this function.
     $requiresStr = Assert-LeaseResourceName -Value $Requires -ParamName 'Requires' -FunctionName 'Test-LeaseAvailableFor'
 
+    # Assert-LeaseResourceName guarantees $requiresStr is a non-empty, non-whitespace [string].
+    # No conditional block is needed here — the msg-2189-era wrapper (`if (-not
+    # [string]::IsNullOrEmpty($requiresStr)) { ... }`) existed to handle the empty-Requires =
+    # trivially-available branch, which msg-2932 §3 #6a explicitly deleted. Empty / null /
+    # whitespace inputs throw at entry now; the body only runs with a real resource name.
     $holders = @{}
     $waitOn = @()
-    if ($true) {
-        $resource = $requiresStr
-        if ($LeasesState.ContainsKey($resource)) {
-            $lease = $LeasesState[$resource]
-            if ($null -ne $lease) {
-                $h = if ($lease -is [hashtable]) { $lease['holder'] } else { $lease.holder }
-                if (-not [string]::IsNullOrEmpty("$h")) {
-                    $holders[$resource] = "$h"
-                    if ("$h" -ne $CandidateKey) { $waitOn += $resource }
-                }
+    $resource = $requiresStr
+    if ($LeasesState.ContainsKey($resource)) {
+        $lease = $LeasesState[$resource]
+        if ($null -ne $lease) {
+            $h = if ($lease -is [hashtable]) { $lease['holder'] } else { $lease.holder }
+            if (-not [string]::IsNullOrEmpty("$h")) {
+                $holders[$resource] = "$h"
+                if ("$h" -ne $CandidateKey) { $waitOn += $resource }
             }
         }
     }
@@ -1081,9 +1084,22 @@ function Invoke-LeasePromotion {
     $Lease['reclaimed_from']   = $priorHolder
     $Lease['reclaimed_at']     = $nowIso
     $Lease['reclaimed_reason'] = "$Reason"
-    # No new holder, so no "restart" duty inherits. Clear reclaim_required — the empty state
-    # is not a candidate that owes the resource anything.
-    $Lease['reclaim_required'] = $false
+    # SET reclaim_required = $true even though there is no immediate successor (msg-2946
+    # blocking objection). `reclaim_required` is a property of the RESOURCE — "the physical
+    # editor/PIE/runner was NOT gracefully returned; the next holder MUST restart it before
+    # use" — NOT a property of the successor candidate. A forceful eviction (Phase 2) leaves
+    # the physical resource dirty by definition, and Invoke-LeaseAcquire's post-release branch
+    # preserves reclaim_required verbatim into the next holder's record. If we clear the flag
+    # here, whichever candidate later arrives on this empty record inherits `$false` and
+    # skips the restart — the exact "next holder walks into a dirty editor" failure the flag
+    # exists to prevent. The empty-record window between here and the next acquire does not
+    # execute code that CLEANS the resource; the dirty-state signal has to survive the gap.
+    #
+    # Contrast: Invoke-LeaseAcquire on a FRESH cold-start lease (New-LeaseRecord path,
+    # generation = 1) leaves `reclaim_required = $false` by default — that path represents
+    # "resource never held", not "resource forcefully evicted". The two writes are the
+    # correct pair; clearing here would collapse them into one lossy write.
+    $Lease['reclaim_required'] = $true
     $Lease['revoked_at']       = $null
     $Lease['revoked_reason']   = $null
     return 'phase-2-released'

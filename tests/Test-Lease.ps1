@@ -1218,6 +1218,12 @@ Check "row #3 Phase 2: promoted waiter dequeued" 0 $state['editor']['queue'].Cou
 Check "row #3 Phase 2: generation bumped" 4 $state['editor']['generation']
 
 # Phase 2 with an empty queue = release (holder null, permanent audit written, no successor).
+# msg-2946 blocking objection fix: the release MUST set reclaim_required = $true because the
+# flag is a property of the RESOURCE (dirty vs. clean), not the successor candidate. The
+# previous holder was forcefully evicted, so the physical resource is dirty and remains so
+# until SOMEONE restarts it. The next candidate that later acquires this empty record MUST
+# inherit `$true` so it knows to restart before use — the end-to-end regression pin at the
+# end of this section chains release-then-acquire to prove the signal survives.
 $state = @{
     editor = @{
         holder = 'p/T-holder'; generation = 3; expiring = $true
@@ -1230,8 +1236,32 @@ Check "row #3 released: verdict = 'phase-2-released'" 'phase-2-released' $verdic
 Check "row #3 released: holder cleared (empty stub, caller MUST remove)" $null $state['editor']['holder']
 Check "row #3 released: reclaimed_from PAIRED even on release" 'p/T-holder' $state['editor']['reclaimed_from']
 Check "row #3 released: reclaimed_reason PAIRED even on release" 'idle' $state['editor']['reclaimed_reason']
-CheckFalse "row #3 released: reclaim_required=false (nobody inherits the duty)" ([bool]$state['editor']['reclaim_required'])
+CheckTrue "row #3 released: reclaim_required=TRUE (msg-2946: dirty-resource signal survives empty release)" ([bool]$state['editor']['reclaim_required'])
 Check "row #3 released: generation bumped" 4 $state['editor']['generation']
+
+# msg-2946 END-TO-END REGRESSION PIN. The blocking objection was: "when a lease is forcefully
+# reclaimed with an empty queue, clearing reclaim_required to $false causes the next
+# candidate that acquires the lease to inherit the false flag and use a physically dirty
+# resource without restarting it". Chain the two operations here so a future refactor that
+# reintroduces the clear-on-release semantics reds this pin regardless of whether the two
+# functions still test in isolation.
+$state = @{
+    editor = @{
+        holder = 'p/T-crashed'; generation = 7; expiring = $true
+        revoked_at = $graceNow.ToUniversalTime().ToString("o"); revoked_reason = 'idle'
+        queue = @()
+    }
+}
+$verdict = Invoke-LeasePromotion -Lease $state['editor'] -Reason 'idle' -Now $graceNow.AddMinutes(5)
+Check "msg-2946 end-to-end setup: release verdict = 'phase-2-released'" 'phase-2-released' $verdict
+CheckTrue "msg-2946 end-to-end setup: reclaim_required survives release" ([bool]$state['editor']['reclaim_required'])
+# Now a fresh candidate arrives (later tick) and acquires this empty record.
+Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-successor' -Now $graceNow.AddMinutes(30)
+Check "msg-2946 end-to-end: successor becomes holder" 'p/T-successor' $state['editor']['holder']
+CheckTrue "msg-2946 end-to-end: successor inherits reclaim_required=TRUE (would have red-ed under the pre-fix behaviour)" `
+    ([bool]$state['editor']['reclaim_required'])
+Check "msg-2946 end-to-end: successor inherits reclaimed_from audit" 'p/T-crashed' $state['editor']['reclaimed_from']
+Check "msg-2946 end-to-end: successor inherits reclaimed_reason audit" 'idle' $state['editor']['reclaimed_reason']
 
 # Phase 2 with an INELIGIBLE queue (waiter present but off-sweep) = release (no promotion).
 $state = @{
