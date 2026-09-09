@@ -1011,10 +1011,19 @@ class GitHubClient:
         one would re-fetch that parent's review list (the N+1 pattern the naysayer flagged
         on PR #245: msg-680 advisory + msg-692 objection). The cache is orthogonal to the
         ``(sha, other_pr)`` output dedup — that key cannot elide the fetch because it
-        varies with ``sha``. A raised exception routes AWAY from the cache so a transient
-        outage on one commit does not silently poison the remaining commits' fetches for
-        the same parent (T-gate-firing-... §5 T2 acceptance ③④; Einstein msg-695 blocked
-        without this rule). Cache lifetime is the single call (T2 §5 ⑤) — a longer-lived
+        varies with ``sha``.
+
+        Two failure surfaces bypass the cache to preserve the pre-cache implicit-retry
+        semantics on transient outages. (a) A raised exception is caught locally and
+        ``continue``d over — Bohr §5 T2 acceptance ③ / ④ mandate, kept as a future-
+        regression belt after :meth:`fetch_pr_reviews`'s fail-soft contract may be
+        weakened. (b) An empty return is not stored — :meth:`fetch_pr_reviews` fail-softs
+        an HTTP failure (502, 4xx, malformed JSON) to ``[]`` today, so caching ``[]``
+        would trap a transient outage on one commit into a silent-drop for every
+        remaining commit referencing the same parent (the pr-gate naysayer's blocking
+        objection on this PR's first VERDICT). A parent that legitimately has zero
+        reviews still pays the pre-cache N+1 for its own ``other_pr``, no worse than the
+        pre-cache behaviour. Cache lifetime is the single call (T2 §5 ⑤) — a longer-lived
         cache would judge fresh heads against stale review data, undoing exactly the
         head-tied APPROVE invariant this method exposes.
         """
@@ -1037,18 +1046,28 @@ class GitHubClient:
             #    fire on a different head cannot judge it against stale review data
             #    (the head-tied APPROVE invariant this method exists to expose is the
             #    same invariant a longer-lived cache would silently undermine: T2 §5 ⑤).
-            # ③ Only *successful* returns of ``fetch_pr_reviews`` land here. The
-            #    inner ``try`` below routes an exception away from the cache so a
-            #    transient 502 on the first commit does NOT poison the lookup for
-            #    every remaining commit that references the same ``other_pr`` — the
-            #    negative-cache trap Einstein msg-695 blocked T2 on. A future
-            #    non-exceptional failure (``fetch_pr_reviews`` is documented
-            #    fail-soft and returns ``[]``) is still cached as ``[]`` — that is a
-            #    conscious limit of this belt: caching failure states requires
-            #    ``fetch_pr_reviews`` to distinguish "no reviews" from "fetch
-            #    failed" at its own return signature, which is out of scope. The
-            #    correctness clause bites specifically on the raised-exception path
-            #    the outer ``except Exception`` was reachable from before.
+            # ③ Only *non-empty* successful returns of ``fetch_pr_reviews`` land
+            #    here. Two failure surfaces both stay OUT of the cache:
+            #    (a) an EXCEPTION out of ``fetch_pr_reviews`` — caught by the inner
+            #        ``try`` below, ``continue``d over so the next commit for the
+            #        same ``other_pr`` retries (the future-regression belt: T2 §5
+            #        ③ / ④ mandate, Bohr msg-696 §1 "同じ病理を marker の取得側
+            #        に生えさせない");
+            #    (b) an EMPTY return ``[]`` — today's fail-soft manifestation.
+            #        ``fetch_pr_reviews`` is documented fail-soft and returns ``[]``
+            #        without raising on any HTTP error (502, 4xx, malformed JSON).
+            #        The pre-cache N+1 code retried implicitly by calling the fetch
+            #        afresh on every commit, so a first-commit 502 could recover on
+            #        the second commit. Caching ``[]`` would trap that failure
+            #        state and silently drop the marker for every remaining commit
+            #        referencing the same parent — the exact regression the pr-gate
+            #        naysayer objected to on this PR's first VERDICT. The
+            #        ``if reviews:`` guard below preserves the pre-cache retry
+            #        semantics: a truly empty parent (no reviews yet) pays the
+            #        pre-cache N+1 for that ``other_pr`` alone, same as before, not
+            #        worse. In the stacked-PR shape B-(a) targets, the parent
+            #        carries an APPROVE by construction, so this fallback almost
+            #        never triggers in the primary use case.
             reviews_cache: dict[PrRef, list[ReviewInfo]] = {}
             coverage: list[CrossPrApproveCoverage] = []
             for sha in commits:
@@ -1075,14 +1094,14 @@ class GitHubClient:
                         try:
                             reviews = await self.fetch_pr_reviews(other_pr)
                         except Exception as inner_exc:
-                            # Do NOT cache. A later commit that references the same
-                            # ``other_pr`` must be free to retry (T2 §5 ③ / ④). The
-                            # outer ``except Exception`` below still stands as the
-                            # structural fail-open belt (msg-473 §5), but we cannot
-                            # let it fire *here* — that would fail the whole method
-                            # off a single transient outage on one commit's fetch,
-                            # exactly the silent-drop amplification msg-696 §1
-                            # named "the same pathology on the acquisition side".
+                            # Exception path — future-regression belt (T2 §5 ③).
+                            # ``fetch_pr_reviews`` is documented fail-soft today so
+                            # this arm is unreachable under the current dependency;
+                            # kept per Bohr §5 T2 mandate and Einstein msg-695
+                            # blocking objection so the correctness contract does
+                            # not depend on a callee's undocumented no-raise
+                            # promise. Do NOT cache: a later commit against the
+                            # same ``other_pr`` retries.
                             logger.warning(
                                 "fetch_pr_reviews(%s) raised inside "
                                 "find_cross_pr_head_bound_approves(%s); not caching "
@@ -1093,7 +1112,14 @@ class GitHubClient:
                                 inner_exc,
                             )
                             continue
-                        reviews_cache[other_pr] = reviews
+                        # Empty-return path — TODAY's fail-soft manifestation.
+                        # A 502 / 4xx / malformed JSON at the HTTP layer surfaces
+                        # here as ``[]`` (see ``fetch_pr_reviews`` docstring). Not
+                        # caching ``[]`` preserves the implicit-retry semantics of
+                        # the pre-cache N+1 code (pr-gate naysayer's blocking
+                        # objection on this PR's first VERDICT).
+                        if reviews:
+                            reviews_cache[other_pr] = reviews
                     for r in reviews:
                         if (
                             r.login == reviewer_login

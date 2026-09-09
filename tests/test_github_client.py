@@ -1474,3 +1474,69 @@ async def test_find_cross_pr_head_bound_approves_does_not_cache_exception(
             approved_at="2026-09-07T04:51:05Z",
         )
     ]
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_does_not_cache_fail_soft_empty() -> None:
+    """PR-gate REQUEST_CHANGES on this PR's first VERDICT: fail-soft ``[]`` is NOT cached.
+
+    ``fetch_pr_reviews`` is documented fail-soft. A 502 / 4xx / malformed JSON at
+    the HTTP layer surfaces as ``[]`` WITHOUT raising. The pre-cache N+1 code
+    retried implicitly by calling the fetch afresh on every commit, so a first-
+    commit 502 could recover on the second commit. This test pins the property
+    that the cache preserves that retry: a first fetch that fail-softs to ``[]``
+    is NOT stored, and the next commit against the same parent tries again — and
+    when the parent has by then returned to health, the marker lands.
+
+    The naysayer's blocking objection on the first VERDICT
+    (:class:`~spirrow_mindwire.github.client.GitHubClient.find_cross_pr_head_bound_approves`
+    docstring, empty-return path (b)): a naive cache would store the fail-soft
+    ``[]`` and silently drop the marker for every remaining commit that shares
+    the same parent PR — the exact silent-drop amplification T2 §5 ③ was written
+    to prevent, but the acceptance criteria wording used exception-language while
+    the actual bug manifests as an empty return.
+    """
+    call_count = {"n": 0}
+    good_reviews_json = [
+        {
+            "user": {"login": "spirrowgames-ops"},
+            "state": "APPROVED",
+            "commit_id": "sha2",
+            "submitted_at": "2026-09-07T04:51:05Z",
+        }
+    ]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/pulls/42/commits"):
+            return httpx.Response(200, json=[{"sha": "sha1"}, {"sha": "sha2"}])
+        if "/commits/" in path and path.endswith("/pulls"):
+            return httpx.Response(
+                200,
+                json=[_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")],
+            )
+        if path.endswith("/pulls/19/reviews"):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Simulate a transient 502 → fetch_pr_reviews fail-softs to [].
+                return httpx.Response(502)
+            return httpx.Response(200, json=good_reviews_json)
+        return httpx.Response(404)
+
+    async with _client(handle) as client:
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+
+    # The second fetch actually happened — the cache did NOT store the fail-soft [].
+    assert call_count["n"] == 2, (
+        "cache stored the fail-soft [] from the transient 502 and skipped the retry on sha2"
+    )
+    # And with the retry succeeding, sha2's marker landed — no silent drop.
+    assert result == [
+        CrossPrApproveCoverage(
+            sha="sha2",
+            other_pr=PrRef("SpirrowGames", "spirrow-conclair", 19),
+            approved_at="2026-09-07T04:51:05Z",
+        )
+    ]
