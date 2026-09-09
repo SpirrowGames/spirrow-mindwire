@@ -79,7 +79,7 @@ from ..exceptions import (
     AdapterHealthError,
     AdapterSpawnError,
 )
-from ..naysayer.adr_index import load_adr_index
+from ..naysayer.adr_index import load_adr_entries
 from ..obligations import ObligationsManifest
 from ..ports import SpawnContext
 from ..thread_context import build_turn_prompt
@@ -259,24 +259,35 @@ def _adr_index_block() -> str:
 
     Source is the same in-repo manifest the naysayer uses (``spec/adr_index.yaml``); nothing is
     duplicated. An unloadable manifest says so out loud rather than shipping a silent gap.
+
+    The rendered block also carries each entry's ``body:`` locator (a chatroom message, a
+    file in this repository, or Drive), added in
+    ``T-adr-index-omits-chatroom-body-locator``. The original failure this fixes was that
+    the implementer could see an ADR id and title, know it needed the body, and have no
+    way to reach it — three turns of the ``T-not-waiting-conclair-contract-assumptions``
+    sub-thread misjudged ADR-2026-05-29-12 as "body unreadable" while the body was in
+    fact reachable at ``T-embodiment-self-declared#msg-325``.
     """
-    index = load_adr_index()
-    if not index:
+    entries = load_adr_entries()
+    if not entries:
         return (
             "ADR INDEX — UNAVAILABLE. The in-repo ADR manifest could not be loaded, so you do not "
             "even have the list of ADR ids. If a task names an ADR, say that you could not look it "
             "up; do not guess what it requires."
         )
-    rows = "\n".join(f"- {adr_id} — {title}" for adr_id, title in index)
+    rows = "\n".join(f"- {e.adr_id} — {e.title} [body: {e.body}]" for e in entries)
     return (
-        "ADR INDEX (ids and TITLES ONLY — the bodies are not available to you):\n"
+        "ADR INDEX (ids, TITLES, and BODY LOCATORS — the bodies themselves are not inlined):\n"
         f"{rows}\n"
         "Use this to identify an ADR and to avoid attributing to one what belongs to another. It "
         "is NOT the ADRs. A title tells you the subject, never the requirements — so never write "
-        "that an ADR 'requires' or 'permits' something on the strength of its title. If a task "
-        "needs an "
-        "ADR's actual content, say you cannot read it and ask for the relevant text to be quoted "
-        "into the thread."
+        "that an ADR 'requires' or 'permits' something on the strength of its title. The `body:` "
+        "locator names WHERE the body lives: `chatroom:<project>/<thread>#msg-<n>` is the "
+        "decide-close message that carries the ADR body; `repo:<path>` is a file in THIS "
+        "repository, so just open it — it is the cheapest of the three; `drive` means "
+        "Drive/spirrow-docs, and a bare `drive` (no file pointer) means the specific file is "
+        "unknown to this index. If a task needs an ADR's actual content, follow the locator "
+        "or say you could not read it — do not guess what it requires."
     )
 
 

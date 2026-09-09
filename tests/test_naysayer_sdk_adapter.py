@@ -172,14 +172,14 @@ def test_system_prompt_injects_adr_index_from_a_fixture_manifest(tmp_path: Path)
         encoding="utf-8",
     )
     prompt = build_naysayer_system_prompt(obligations=_OBLIGATIONS, repo_root=tmp_path)
-    assert "ADR index (id + title)" in prompt
-    assert "ADR-2026-05-31-15 — independence gradation" in prompt
+    assert "ADR index (id + title + body locator)" in prompt
+    assert "ADR-2026-05-31-15 — independence gradation [body: drive]" in prompt
 
 
 def test_system_prompt_defaults_to_mindwires_own_manifest() -> None:
     # The default must resolve to THIS repo's committed manifest, not the caller's cwd.
     prompt = build_naysayer_system_prompt(obligations=_OBLIGATIONS)
-    assert "ADR index (id + title)" in prompt
+    assert "ADR index (id + title + body locator)" in prompt
     assert "UNAVAILABLE" not in prompt
 
 
@@ -205,7 +205,7 @@ def test_adapter_injects_the_index_even_though_the_reviewed_repo_has_none(
     )
 
     prompt = adapter._system_prompt
-    assert "ADR index (id + title)" in prompt
+    assert "ADR index (id + title + body locator)" in prompt
     assert "UNAVAILABLE" not in prompt
     # A real entry from the committed manifest — proves it is MindWire's, not a stub.
     assert "ADR-2026-05-31-15" in prompt

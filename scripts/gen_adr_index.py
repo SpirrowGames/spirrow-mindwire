@@ -25,7 +25,11 @@ from pathlib import Path
 
 import yaml
 
-from spirrow_mindwire.naysayer.adr_index_gen import build_manifest_index, render_manifest
+from spirrow_mindwire.naysayer.adr_index_gen import (
+    build_manifest_index,
+    load_existing_body_locators,
+    render_manifest,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_CLAUDE_MD = _REPO_ROOT / "CLAUDE.md"
@@ -51,7 +55,11 @@ def main(argv: list[str] | None = None) -> int:
     claude_md = args.claude_md.read_text(encoding="utf-8")
     docmap_data = yaml.safe_load(args.docmap.read_text(encoding="utf-8"))
     index = build_manifest_index(claude_md, docmap_data)
-    rendered = render_manifest(index)
+    # Round-trip: hand-maintained ``body:`` locators (per T-adr-index-omits-chatroom-
+    # body-locator §4-1) must survive regeneration. Missing ids fall back to the
+    # ``drive`` default inside render_manifest.
+    body_locators = load_existing_body_locators(args.out)
+    rendered = render_manifest(index, body_locators)
 
     if args.check:
         current = args.out.read_text(encoding="utf-8") if args.out.exists() else ""
