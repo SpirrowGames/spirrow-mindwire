@@ -13,7 +13,7 @@ ADR 本体の置き場は**移行中**である。このディレクトリはそ
 | ADR-06 / 07 / 14 / 15 / 16 / 17 / 19 | Google Drive（folder `1LAENGwj…`） | 反映済み。Drive 側が本文の正本で、ローカル develop より進んでいる |
 | ADR-09〜13 | `CLAUDE.md` §M | identity 系。もともと §M が SOT |
 
-`spec/adr_index.yaml`（独立 naysayer に毎 summon 注入される索引）は id + title だけの派生ビューなので、本体がどこにあっても変わらない。
+`spec/adr_index.yaml`（独立 naysayer と implementer に毎 summon 注入される索引）は id + title + `thread` + **`body:` locator** の派生ビューである。本体の所在は索引に載る ∴ 本ディレクトリに本体を足したら、その entry の `body:` を `repo:docs/adr/<file>.md` に更新すること。`docs/adr/` に本体があるのに `body:` が別を指す entry は CI が落とす（`*-amendment-*` は除外 — ADR-06 改訂メモは本体ではないため）。locator は「読み手がバイト列を開ける場所」の主張であって、どのコピーが正本かの主張ではない。
 
 ## なぜ移ってきたか
 

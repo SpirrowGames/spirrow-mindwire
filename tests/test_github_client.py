@@ -772,6 +772,275 @@ async def test_both_paths_unusable_stays_unknown_and_keeps_rest_head_sha() -> No
     assert st.head_sha == "abc"
 
 
+# ---------- fetch_check_rollup (pre-gate admission input) ----------------- #
+
+
+def _rollup_payload(
+    *,
+    head: str = "abc123",
+    committed: str | None = "2026-09-08T21:27:42Z",
+    pushed: str | None = None,
+    updated: str | None = "2026-09-08T21:33:42Z",
+    contexts: list[dict[str, Any]] | None = None,
+    has_next_page: bool = False,
+) -> dict[str, Any]:
+    """A GraphQL response shaped exactly like the one measured against #236 on 2026-09-09."""
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "headRefOid": head,
+                    "updatedAt": updated,
+                    "commits": {
+                        "nodes": [
+                            {
+                                "commit": {
+                                    "committedDate": committed,
+                                    "pushedDate": pushed,
+                                    "statusCheckRollup": {
+                                        "contexts": {
+                                            "pageInfo": {"hasNextPage": has_next_page},
+                                            "nodes": contexts if contexts else [],
+                                        }
+                                    },
+                                }
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+    }
+
+
+def _rollup_client(payload: Any, *, status: int = 200) -> GitHubClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/graphql")
+        if status != 200:
+            return httpx.Response(status, json={"message": "nope"})
+        return httpx.Response(200, json=payload)
+
+    return _client(handler)
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_maps_checkrun_rows() -> None:
+    payload = _rollup_payload(
+        contexts=[
+            {
+                "__typename": "CheckRun",
+                "name": "test",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-09-08T21:28:18Z",
+            },
+            {
+                "__typename": "CheckRun",
+                "name": "queued one",
+                "status": "QUEUED",
+                "conclusion": None,
+                "startedAt": None,
+            },
+        ]
+    )
+    async with _rollup_client(payload) as client:
+        rollup = await client.fetch_check_rollup(_PR)
+    assert rollup is not None
+    assert rollup.head_sha == "abc123"
+    # Lower-cased so gate_admission's COMPLETED / RED_CONCLUSIONS comparisons (all lower-case)
+    # can match at all; a SCREAMING_CASE status would read as "not concluded" forever.
+    assert [(r.name, r.status, r.conclusion) for r in rollup.rows] == [
+        ("test", "completed", "success"),
+        ("queued one", "queued", None),
+    ]
+    # CheckRun has no createdAt in the GraphQL schema; a queued run contributes no clock, which
+    # is the exact rollup shape ci_clock_start's commit-clock fallback exists for.
+    assert rollup.rows[1].started_at is None and rollup.rows[1].created_at is None
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_projects_statuscontext_onto_the_checkrow_pair() -> None:
+    # StatusContext (legacy commit statuses) has only a ``state``. CheckRow is defined in terms
+    # of a status/conclusion pair, so the projection is what lets one row type cover both union
+    # members — without it a legacy status would be unclassifiable and drop out of the rollup.
+    payload = _rollup_payload(
+        contexts=[
+            {
+                "__typename": "StatusContext",
+                "context": "legacy/build",
+                "state": "FAILURE",
+                "createdAt": "2026-09-08T21:28:00Z",
+            },
+            {
+                "__typename": "StatusContext",
+                "context": "legacy/pending",
+                "state": "EXPECTED",
+                "createdAt": "2026-09-08T21:28:01Z",
+            },
+        ]
+    )
+    async with _rollup_client(payload) as client:
+        rollup = await client.fetch_check_rollup(_PR)
+    assert rollup is not None
+    assert [(r.name, r.status, r.conclusion) for r in rollup.rows] == [
+        ("legacy/build", "completed", "failure"),
+        ("legacy/pending", "pending", None),
+    ]
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_drops_an_unknown_union_member() -> None:
+    # Dropped rather than guessed, and the direction matters: a dropped row cannot hold
+    # _concluded false (it could only have delayed the gate) and cannot make _red true (it
+    # could only have withheld an INVOKE). A row of unknown shape must never be able to invent
+    # a red CI and route an implementer at it.
+    payload = _rollup_payload(
+        contexts=[
+            {"__typename": "SomethingNew", "name": "?", "status": "COMPLETED"},
+            {
+                "__typename": "StatusContext",
+                "context": "x",
+                "state": "WHAT",  # unknown state on a known member: also dropped
+                "createdAt": None,
+            },
+            {
+                "__typename": "CheckRun",
+                "name": "real",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "startedAt": "2026-09-08T21:28:18Z",
+            },
+        ]
+    )
+    async with _rollup_client(payload) as client:
+        rollup = await client.fetch_check_rollup(_PR)
+    assert rollup is not None
+    assert [r.name for r in rollup.rows] == ["real"]
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_falls_back_to_updated_at_when_pusheddate_is_null() -> None:
+    # Measured 2026-09-09: GitHub returns pushedDate=null. The fallback is what actually
+    # decides R1a / R1b in production, so it is pinned rather than left implicit.
+    async with _rollup_client(_rollup_payload(pushed=None)) as client:
+        rollup = await client.fetch_check_rollup(_PR)
+    assert rollup is not None
+    assert rollup.head_pushed_at.isoformat() == "2026-09-08T21:33:42+00:00"
+    assert rollup.head_committed_date.isoformat() == "2026-09-08T21:27:42+00:00"
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_prefers_pusheddate_when_present() -> None:
+    async with _rollup_client(_rollup_payload(pushed="2026-09-08T21:28:10Z")) as client:
+        rollup = await client.fetch_check_rollup(_PR)
+    assert rollup is not None
+    assert rollup.head_pushed_at.isoformat() == "2026-09-08T21:28:10+00:00"
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_returns_none_on_a_partial_errors_response() -> None:
+    # THE case this method's error policy exists for. _fetch_ci_status_graphql omits
+    # ``contexts`` because asking for them returns partial data plus a FORBIDDEN error entry on
+    # exactly the private repos that fallback exists for. This method must ask for them, so it
+    # refuses a half-error response instead of parsing it: returning the partial rollup would
+    # hand gate_admission a rollup that is short some checks and let it conclude "concluded".
+    payload = _rollup_payload(contexts=[])
+    payload["errors"] = [{"type": "FORBIDDEN", "message": "Resource not accessible"}]
+    async with _rollup_client(payload) as client:
+        assert await client.fetch_check_rollup(_PR) is None
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_returns_none_on_http_error() -> None:
+    async with _rollup_client(None, status=403) as client:
+        assert await client.fetch_check_rollup(_PR) is None
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_returns_none_on_transport_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    async with _client(handler) as client:
+        assert await client.fetch_check_rollup(_PR) is None
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_returns_none_when_a_clock_is_missing() -> None:
+    # committedDate is ci_clock_start's last resort and exists on every commit; if it did not
+    # parse, admission's input would be incomplete. Refusing (None) sends the caller back to
+    # its pre-wiring behaviour rather than letting it judge on a clock it never read.
+    async with _rollup_client(_rollup_payload(committed=None)) as client:
+        assert await client.fetch_check_rollup(_PR) is None
+    async with _rollup_client(_rollup_payload(pushed=None, updated=None)) as client:
+        assert await client.fetch_check_rollup(_PR) is None
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_distinguishes_measured_empty_from_unread() -> None:
+    # The distinction the CheckRollup type exists to carry: a PR with a null statusCheckRollup
+    # is a MEASURED empty (rows == ()), which R1a / R1b are entitled to rule on. Only a failed
+    # read is None. Conflating them would let "GitHub was down" be judged as "no CI configured".
+    payload = _rollup_payload()
+    payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"][
+        "statusCheckRollup"
+    ] = None
+    async with _rollup_client(payload) as client:
+        rollup = await client.fetch_check_rollup(_PR)
+    assert rollup is not None and rollup.rows == ()
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_returns_none_when_contexts_are_truncated() -> None:
+    # The failure this guard exists for is silent and looks like success: past the 100-context
+    # window GitHub drops the rest, so a build whose 101st check is still queued (or red) arrives
+    # as 100 rows that are all completed and all green. gate_admission would read _concluded=True
+    # and _red=False off that and fire R7 "CI green: fresh gate" on a build it never saw the end
+    # of. So the payload below is deliberately *perfect* — every present row concluded+success —
+    # and the only thing wrong with it is the cursor.
+    green = [
+        {
+            "__typename": "CheckRun",
+            "name": f"shard-{i}",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "startedAt": "2026-09-08T21:28:18Z",
+        }
+        for i in range(100)
+    ]
+    async with _rollup_client(_rollup_payload(contexts=green, has_next_page=True)) as client:
+        assert await client.fetch_check_rollup(_PR) is None
+
+    # Negative control: the identical 100 rows with the cursor down are read, not refused. This
+    # is what pins the refusal to hasNextPage rather than to "many rows" or "a full window".
+    async with _rollup_client(_rollup_payload(contexts=green, has_next_page=False)) as client:
+        rollup = await client.fetch_check_rollup(_PR)
+    assert rollup is not None
+    assert len(rollup.rows) == 100
+    assert all(r.status == "completed" and r.conclusion == "success" for r in rollup.rows)
+
+
+@pytest.mark.anyio
+async def test_fetch_check_rollup_query_asks_for_the_page_cursor() -> None:
+    # Byte-form pin, same reason as the ci-route marker's: the truncation guard above is only
+    # reachable if the request actually selects pageInfo. A payload fixture cannot notice that
+    # the real query stopped asking — the field would simply be absent, ``page`` would be None,
+    # and the guard would go quiet while still passing every test that feeds it a fixture.
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen["query"] = json.loads(request.content)["query"]
+        return httpx.Response(200, json=_rollup_payload())
+
+    async with _client(handler) as client:
+        assert await client.fetch_check_rollup(_PR) is not None
+    # Pinned adjacent to first:100 on purpose: the window and the cursor that detects its
+    # overflow are one decision, and a future edit that changes the window must meet this line.
+    assert "contexts(first:100){pageInfo{hasNextPage} nodes{" in seen["query"]
+
+
 # ---------- B-(a) cross-PR head-bound APPROVE resolution ------------------ #
 #
 # The stacked-PR scenario (msg-456 §R-B / msg-475 §5): PR #21 base=main pulled in PR #19's

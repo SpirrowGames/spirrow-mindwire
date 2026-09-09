@@ -15,10 +15,20 @@ import pytest
 
 from spirrow_mindwire.conductor.control import ControlState
 from spirrow_mindwire.conductor.core import Conductor, ConductorDispatcher, StopReason
+from spirrow_mindwire.conductor.gate_records import (
+    ci_route_heads,
+    render_ci_route_marker,
+    render_relay_heading,
+)
 from spirrow_mindwire.dispatcher.core import Dispatcher
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
-from spirrow_mindwire.github.client import CiState, ReviewEvent
-from spirrow_mindwire.magickit.client import MagickitMcpError, raise_if_envelope
+from spirrow_mindwire.gate_admission import CheckRow
+from spirrow_mindwire.github.client import CheckRollup, CiState, PrRef, ReviewEvent
+from spirrow_mindwire.magickit.client import (
+    MagickitMcpError,
+    ThreadResolvedError,
+    raise_if_envelope,
+)
 from spirrow_mindwire.magickit.gateway import MagickitChatroomGateway
 from spirrow_mindwire.naysayer.pr_review import PrReviewOutcome
 from spirrow_mindwire.ports import SpawnContext
@@ -196,6 +206,7 @@ def _conductor(
     orchestrator: Any = None,
     force_naysayer_only_on_explicit_human: bool = False,
     control: Any = None,
+    rollup_source: Any = None,
 ) -> Conductor:
     return Conductor(
         mcp=mcp,
@@ -207,6 +218,7 @@ def _conductor(
         orchestrator=orchestrator,
         force_naysayer_only_on_explicit_human=force_naysayer_only_on_explicit_human,
         control=control,
+        rollup_source=rollup_source,
     )
 
 
@@ -221,18 +233,56 @@ class _ScriptedPrGate:
 
     Records each fired pr_ref. With one verdict it repeats it; with several it pops one per call (so
     an RC→fix→re-gate→APPROVE cycle can be scripted).
+
+    It also performs the design-thread relay, because the real gate now does (D-1): a fake that
+    only returned a verdict would model a gate that writes nothing. The heading is built with
+    :func:`~spirrow_mindwire.conductor.gate_records.render_relay_heading` — the SAME renderer
+    production calls — so a byte drift here cannot leave production broken while these tests stay
+    green (T-pr-gate-relay-belongs-to-the-conductor msg-2835 §5 R-5(b): a hardcoded string here
+    was exactly what would let the ``@ sha`` disappear without an admission test noticing). The
+    round-trip pin over production's *actual* output lives in ``tests/test_orchestrator.py``.
     """
 
-    def __init__(self, *verdicts: ReviewEvent) -> None:
+    def __init__(self, mcp: _FakeChatroomMcp, *verdicts: ReviewEvent) -> None:
+        self._mcp = mcp
         self._verdicts = list(verdicts)
         self.fired: list[str] = []
+        self.design_threads: list[str] = []
 
     async def fire_pr_review(
-        self, *, project: str, pr_ref: str
-    ) -> tuple[ThreadRef, PrReviewOutcome]:
+        self, *, project: str, pr_ref: str, design_thread: str, implementer: str | None = None
+    ) -> tuple[ThreadRef, PrReviewOutcome, dict[str, Any]]:
         self.fired.append(pr_ref)
+        self.design_threads.append(design_thread)
         verdict = self._verdicts.pop(0) if len(self._verdicts) > 1 else self._verdicts[0]
-        return _thread_ref(), _pr_outcome(verdict)
+        outcome = _pr_outcome(verdict)
+        nxt = implementer if verdict is ReviewEvent.REQUEST_CHANGES and implementer else "human"
+        content = (
+            f"{render_relay_heading(pr_ref, outcome.head_sha)}\n\n"
+            f"VERDICT: {verdict.value} (ci={outcome.ci_state.value})\n\n"
+            f"{outcome.body}\n\n"
+            f"NEXT: {nxt}"
+        )
+        relay: dict[str, Any] = {"msg_id": "", "author": "pr-gate-relay", "content": content}
+        try:
+            result = await self._mcp.call_tool(
+                "chatroom_post_message",
+                {
+                    "project": project,
+                    "thread_id": design_thread,
+                    "msg_type": "report",
+                    "author": "pr-gate-relay",
+                    "content": content,
+                },
+            )
+        except ThreadResolvedError:
+            # Disposition (1), as the production relay does: the GitHub review still stands and
+            # the empty msg_id is what the conductor fails safe on.
+            return _thread_ref(), outcome, relay
+        msg = result.get("msg") if isinstance(result, dict) else None
+        if isinstance(msg, dict):
+            relay["msg_id"] = str(msg.get("msg_id", ""))
+        return _thread_ref(), outcome, relay
 
 
 # --------------------------------------------------------------------------- #
@@ -1055,7 +1105,7 @@ async def test_pr_gate_approve_stops_at_human() -> None:
     # relay is posted under the reserved author, and the implementer is NOT dispatched.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == ["acme/widgets#7"]
@@ -1076,7 +1126,7 @@ async def test_pr_gate_comment_stops_at_human_without_dispatch() -> None:
     # empty body again.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.COMMENT)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.COMMENT)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == ["acme/widgets#7"]
@@ -1092,7 +1142,7 @@ async def test_pr_gate_request_changes_dispatches_implementer_then_reapprove() -
     # the pr-review sentinel; the second gate APPROVEs → stop at the human.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.REQUEST_CHANGES, ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.REQUEST_CHANGES, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(
         mcp, {Role.IMPLEMENTER: ["pushed a fix\n\nNEXT: pr-review acme/widgets#7"]}
     )
@@ -1112,7 +1162,7 @@ async def test_pr_gate_request_changes_without_implementer_routes_to_human() -> 
     # human (fail-safe) rather than guessing who fixes it.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Einstein", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.REQUEST_CHANGES)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.REQUEST_CHANGES)
     disp = _ScriptedDispatcher(mcp, {})
     conductor = Conductor(
         mcp=mcp,
@@ -1144,7 +1194,7 @@ async def test_pr_gate_relay_without_msg_id_fails_safe_to_human() -> None:
     # path, so a RC fails safe to the human (no implementer dispatch) — Tier B msg-572 #2.
     mcp = _NoMsgIdMcp()
     mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.REQUEST_CHANGES)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.REQUEST_CHANGES)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert outcome.stop_reason is StopReason.HUMAN
@@ -1170,7 +1220,7 @@ async def test_pr_gate_malformed_ref_routes_to_human_without_firing() -> None:
     # the conductor validates via parse_pr_ref and fails safe to the human (Tier B PR #103 round 4).
     mcp = _FakeChatroomMcp()
     mcp.seed(author="Heisenberg", content="oops\n\nNEXT: pr-review not-a-valid-ref")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == []  # never fired — the ref failed validation
@@ -1187,7 +1237,7 @@ async def test_pr_gate_normalizes_url_ref_to_slug_before_firing() -> None:
         author="Heisenberg",
         content="opened\n\nNEXT: pr-review https://github.com/acme/widgets/pull/7",
     )
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert gate.fired == ["acme/widgets#7"]  # normalized from the URL
@@ -1575,8 +1625,6 @@ class _ThreadResolvedOnPostMcp(_FakeChatroomMcp):
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "chatroom_post_message":
-            from spirrow_mindwire.magickit.client import ThreadResolvedError
-
             raise ThreadResolvedError(
                 "magickit tool returned an error envelope: error_type='ChatroomStateError'",
                 error_type="ChatroomStateError",
@@ -1595,7 +1643,7 @@ async def test_w3_pr_gate_relay_thread_resolved_does_not_crash_and_routes_to_hum
     """
     mcp = _ThreadResolvedOnPostMcp()
     mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
-    gate = _ScriptedPrGate(ReviewEvent.APPROVE)
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
     disp = _ScriptedDispatcher(mcp, {})
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     # The gate DID fire (it precedes the relay).
@@ -1625,3 +1673,328 @@ async def test_past_field_human_boundary_terminates_the_naysayer_segment() -> No
     outcome = await _conductor(mcp, disp).run()
     assert outcome.stop_reason is StopReason.HUMAN
     assert outcome.forced_naysayer_turns == 0  # segment naysayer counts; no second consult
+
+
+# --------------------------------------------------------------------------- #
+# Pre-gate CI-wait admission (design v0.3.1 §5.2A / residual RES-WIRING)
+#
+# These pin the WIRING, not the admission table — the table itself is exhaustively covered by
+# tests/test_gate_admission.py against the pure function. What can only be tested here is the
+# conductor's half: which rollup facts it lifts from the world, what it does with each verdict,
+# and — the one that no unit test of either side can see — that the marker it WRITES on R4 is
+# the marker it READS on the next tick's R5.
+# --------------------------------------------------------------------------- #
+
+
+_HEAD = "703b836737f29fe0f4139d86d2d02077c662ce5f"
+
+
+def _check(
+    name: str,
+    status: str,
+    conclusion: str | None = None,
+    *,
+    started_ago: timedelta | None = timedelta(minutes=5),
+) -> CheckRow:
+    started = None if started_ago is None else datetime.now(UTC) - started_ago
+    return CheckRow(
+        name=name, status=status, conclusion=conclusion, started_at=started, created_at=None
+    )
+
+
+def _rollup(
+    *rows: CheckRow,
+    head: str = _HEAD,
+    committed_ago: timedelta = timedelta(minutes=30),
+    pushed_ago: timedelta = timedelta(minutes=30),
+) -> CheckRollup:
+    now = datetime.now(UTC)
+    return CheckRollup(
+        head_sha=head,
+        head_committed_date=now - committed_ago,
+        head_pushed_at=now - pushed_ago,
+        rows=rows,
+    )
+
+
+_GREEN = (_check("CI", "completed", "success"),)
+_PENDING = (_check("CI", "in_progress"),)
+_RED = (_check("CI", "completed", "failure"), _check("lint", "completed", "success"))
+
+
+class _ScriptedRollupSource:
+    """A fake :class:`~spirrow_mindwire.conductor.core.CheckRollupSource`.
+
+    One rollup repeats forever; several are popped one per call, so a red-then-red sequence
+    across two conductor rounds can be scripted. ``None`` stands for "could not read".
+    """
+
+    def __init__(self, *rollups: CheckRollup | None) -> None:
+        self._rollups = list(rollups)
+        self.asked: list[PrRef] = []
+
+    async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup | None:
+        self.asked.append(pr)
+        if len(self._rollups) > 1:
+            return self._rollups.pop(0)
+        return self._rollups[0]
+
+
+@pytest.mark.anyio
+async def test_admission_defers_on_pending_ci_without_firing_the_gate() -> None:
+    # R2. THE saving §5.2A.7 promises ("pending gate invocations 3 → 0", "relay COMMENT noise
+    # 3 → 0"): CI has not concluded, the wait budget has not run out, so the gate is not fired,
+    # nothing is posted, and nobody is summoned. The next tick re-derives this from a fresh
+    # rollup — the wait is held by GitHub's state, not by any timer on this side.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_PENDING))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []  # the model was never woken
+    assert mcp.posts == []  # a deferral writes NO record (design §5.2A.5)
+    assert disp.dispatches == []
+    assert outcome.stop_reason is StopReason.CI_WAIT
+    assert [pr.slug for pr in source.asked] == ["acme/widgets#7"]
+
+
+@pytest.mark.anyio
+async def test_ci_wait_is_not_a_human_stop() -> None:
+    # The stop reason is deliberately its own value and NOT `human`. The sweep's notification
+    # predicate is the KEY SET of deploy/lib/StopReason.ps1's phrase map, so a reason absent
+    # from that map is silent — which is the intended treatment for "CI is still running", and
+    # is why `ci_wait` must not be spelled `human` to reuse an existing branch.
+    assert StopReason.CI_WAIT.value == "ci_wait"
+    # The VALUE is what deploy/lib/StopReason.ps1's phrase map is keyed by, and membership in
+    # that map is the sweep's notification predicate. Mirrored here rather than imported
+    # (the map is PowerShell); Test-StopReasonPhrase.ps1 pins the map's own key set, so the two
+    # pins together catch a drift in either direction.
+    notifying: set[str] = {
+        "human",
+        "no_handoff_to_human",
+        "no_progress_to_human",
+        "round_cap",
+        "empty_thread",
+    }
+    assert StopReason.CI_WAIT.value not in notifying
+
+
+@pytest.mark.anyio
+async def test_admission_invokes_on_green_ci_and_the_relay_names_the_head() -> None:
+    # R7: the ordinary path is unchanged — green CI fires the gate exactly as before. The one
+    # visible difference is that the relay heading now names the head SHA, which is the whole
+    # of gate_admission's verdict_heads input on the next tick.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == ["acme/widgets#7"]
+    assert outcome.stop_reason is StopReason.HUMAN
+    relay = mcp.posts[-1]["content"]
+    # _pr_outcome pins head_sha="abc123"; the head the GATE read is recorded, not the one
+    # admission observed a moment earlier, so a push landing between the two is attributed to
+    # the diff that was actually reviewed.
+    assert relay.startswith(render_relay_heading("acme/widgets#7", "abc123"))
+
+
+@pytest.mark.anyio
+async def test_admission_does_not_re_fire_the_gate_on_an_already_reviewed_head() -> None:
+    # R6. A verdict for this exact head is already in the thread, so re-firing would buy a
+    # second opinion on an unchanged diff. Stops at the human — the same terminal the first
+    # verdict's own APPROVE reached — without re-parsing the earlier relay's NEXT: line
+    # (no author is trusted, msg-557).
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    mcp.seed(
+        author="pr-gate-relay",
+        content=(
+            f"{render_relay_heading('acme/widgets#7', _HEAD)}\n\n"
+            "VERDICT: approve (ci=success)\n\ncritique\n\nNEXT: human"
+        ),
+    )
+    mcp.seed(author="Heisenberg", content="please re-check\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_GREEN))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_admission_routes_the_implementer_on_a_first_red_and_stamps_the_marker() -> None:
+    # R4 (E-CI-RED). The CI-fix edge — NOT carve-out ②: there is no verdict, so the gate is not
+    # fired at all and the implementer is woken on a machine observation of CI.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_RED))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]
+    posted = mcp.posts[-1]
+    assert posted["author"] == "pr-gate-relay"
+    # The marker is the one new record design §5.2A.5 sanctions, and it names only the failing
+    # check — a green sibling must not be reported as broken to the implementer.
+    assert ci_route_heads([posted["content"]]) == frozenset({_HEAD})
+    assert "CI is red on 703b836737f2: CI" in posted["content"]
+    assert "lint" not in posted["content"]
+    # The implementer is woken on the ci-route post (it carries what to fix), not on its own
+    # pr-review trigger — the same rule the REQUEST_CHANGES path follows.
+    assert "ADMISSION: route_implementer" in disp.events[0].payload.body
+    assert outcome.stop_reason is StopReason.NO_PROGRESS  # scripted implementer stays silent
+
+
+@pytest.mark.anyio
+async def test_the_marker_written_on_r4_is_the_marker_read_on_r5() -> None:
+    # The round trip no unit test on either side can see. Round 1 goes red → R4 writes the
+    # ci-route marker and dispatches the implementer; the implementer pushes nothing that fixes
+    # CI and re-nominates; round 2 sees the SAME head still red, finds its own marker, and
+    # escalates to a human instead of dispatching the implementer a second time.
+    #
+    # If the writer and the reader ever drift, this is the only test that fails — everything
+    # else keeps passing while R5 silently stops existing.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(
+        mcp, {Role.IMPLEMENTER: ["could not fix it\n\nNEXT: pr-review acme/widgets#7"]}
+    )
+    source = _ScriptedRollupSource(_rollup(*_RED))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == []
+    assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]  # dispatched ONCE
+    assert outcome.stop_reason is StopReason.HUMAN
+    escalation = mcp.posts[-1]["content"]
+    assert "ADMISSION: route_human" in escalation
+    assert "rule=R5" in escalation
+    assert "CI red twice on 703b836737f2 with no new push" in escalation
+
+
+@pytest.mark.anyio
+async def test_admission_escalates_to_a_human_when_ci_is_stuck_past_the_cap() -> None:
+    # R3. The escalation is POSTED, not merely returned as a stop code: a human summoned with
+    # no reason in the thread is a stop nobody can act on. The reason already names the stuck
+    # check and which clock decided, so an operator can tell a genuinely stuck CI from a
+    # false-early on the commit-clock fallback without re-deriving anything.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    stuck = _rollup(
+        _check("CI", "queued", started_ago=timedelta(hours=9)),
+        committed_ago=timedelta(hours=9),
+        pushed_ago=timedelta(hours=9),
+    )
+    outcome = await _conductor(
+        mcp, disp, orchestrator=gate, rollup_source=_ScriptedRollupSource(stuck)
+    ).run()
+    assert gate.fired == []
+    assert disp.dispatches == []
+    assert outcome.stop_reason is StopReason.HUMAN
+    escalation = mcp.posts[-1]["content"]
+    assert "rule=R3" in escalation
+    assert "CI stuck on 703b836737f2: CI(queued)" in escalation
+    assert "clock=check" in escalation
+
+
+@pytest.mark.anyio
+async def test_a_human_authored_handoff_overrides_admission() -> None:
+    # R0-OVERRIDE, and the reason this call site reads ``nomination_is_self`` as "not authored
+    # by the human". A human summoned by R3 / R5 must be able to break the escalation loop by
+    # re-writing the handoff by hand; under the literal "authored by pr-gate-relay" reading
+    # every admission would be an override and the whole table would be unreachable, so the
+    # discriminator that delivers the escape hatch is the one used.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="fire it anyway\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_PENDING))  # would DEFER under self-nomination
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert gate.fired == ["acme/widgets#7"]
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_an_unread_rollup_keeps_the_pre_wiring_behaviour() -> None:
+    # ``None`` means "could not read", never "no checks". The fail direction is the behaviour
+    # that shipped before admission existed — fire the gate — so a repo whose rollup is
+    # forbidden (the FORBIDDEN-on-private-repos case fetch_check_rollup refuses to parse)
+    # behaves exactly as it did, and the naysayer's own fail-closed L1 CI-gate still applies.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(
+        mcp, disp, orchestrator=gate, rollup_source=_ScriptedRollupSource(None)
+    ).run()
+    assert gate.fired == ["acme/widgets#7"]
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_no_rollup_source_is_byte_for_byte_the_pre_wiring_path() -> None:
+    # An unwired conductor must not consult admission at all — a fresh red rollup would
+    # otherwise change behaviour for every caller that has not opted in.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()  # rollup_source=None
+    assert gate.fired == ["acme/widgets#7"]
+    assert outcome.stop_reason is StopReason.HUMAN
+
+
+@pytest.mark.anyio
+async def test_r4_without_an_implementer_persona_routes_to_the_human() -> None:
+    # Same fail-safe as the REQUEST_CHANGES path: with no single implementer persona there is
+    # nobody to dispatch, so the ci-route post stands as the record and the loop stops at a
+    # human rather than guessing who fixes CI.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    conductor = Conductor(
+        mcp=mcp,
+        dispatcher=disp,
+        thread_ref=_thread_ref(),
+        roster={"Bohr": Role.PROPOSER, "Einstein": Role.NAYSAYER},  # no implementer
+        naysayer_identity="Einstein",
+        orchestrator=gate,
+        rollup_source=_ScriptedRollupSource(_rollup(*_RED)),
+    )
+    outcome = await conductor.run()
+    assert gate.fired == []
+    assert disp.dispatches == []
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert ci_route_heads([mcp.posts[-1]["content"]]) == frozenset({_HEAD})
+
+
+@pytest.mark.anyio
+async def test_admission_reads_heads_only_off_relay_authored_messages() -> None:
+    # A role that QUOTES a ci-route marker in its own post (review turns in this arc have
+    # quoted markers verbatim) must not be able to suppress R4. Author filtering is not
+    # authentication — the chatroom accepts any author string — but it removes the ordinary
+    # way to get this wrong, exactly as ``_attested`` does for stamps.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(
+        author="Einstein",
+        content=(
+            "quoting the marker for discussion: "
+            + render_ci_route_marker(head=_HEAD, conclusion="failure", checks=["CI"])
+            + "\n\nNEXT: Heisenberg"
+        ),
+    )
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(
+        mcp, disp, orchestrator=gate, rollup_source=_ScriptedRollupSource(_rollup(*_RED))
+    ).run()
+    # R4, not R5: the quoted marker was ignored, so this still counts as the FIRST red.
+    assert [role for role, _ in disp.dispatches] == [Role.IMPLEMENTER]
+    assert outcome.stop_reason is StopReason.NO_PROGRESS

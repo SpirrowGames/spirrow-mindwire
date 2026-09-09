@@ -1,38 +1,82 @@
 # mindwire ADR index — union of CLAUDE.md §M references + spirrow-docs _docmap adr entries.
-# GENERATED FILE — do not hand-edit. Regenerate with:
+# GENERATED FILE — do not hand-edit id/title/thread. Regenerate with:
 #     python scripts/gen_adr_index.py --docmap <path-to-spirrow-docs/_docmap.yaml>
 # Run by the proposer on the docs host when an ADR is added/accepted (loop host/CI lacks
 # _docmap, so this committed copy is unavoidable; ADR-2026-06-04-19 N-2 / msg-438/443).
-# Derived view: id + title only (the canonical ADR body lives in Drive).
-# CI does not regenerate this (no _docmap in CI); it only checks it parses + is well-formed.
+# Derived view: id + title (+ thread when the ADR is a §M entry) — the ADR body lives in
+# ONE OF three places: Drive/spirrow-docs, THIS repository under `docs/adr/`, or the
+# chatroom decide-close message that resolved the thread (§M-only ADRs 09-13 have no
+# Drive body; their body IS the decide-close). The `body:` field per entry names the
+# concrete locator so the reader can reach the body from the index alone; see
+# T-adr-index-omits-chatroom-body-locator for why this field exists (three turns of
+# "body unreadable" misjudgments in T-not-waiting-conclair-contract-…).
+# A locator is NOT a canonicity claim. It says where a reader can open the bytes, not
+# which copy is normative — `repo:` no more declares "Git is the source of truth" than a
+# bare `drive` declares it for Drive. Moving canonicity is a Tier-C convention change
+# (`docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md`, deliberately untouched by the PR that
+# added `repo:`); do not cite `repo:` as precedent for it (msg-2671 D-2).
+# `body:` is hand-maintained per-entry and the generator preserves existing values on
+# regenerate; new entries default to `drive` (a weak, format-valid placeholder that names
+# the medium but not the file — carry it forward as debt, do not leave it silent).
+# Locator format (validated by tests/test_naysayer_adr_index.py):
+#     chatroom:<project>/<thread>#msg-<n>   — canonical: the decide-close message
+#     drive                                 — weak: "in Drive/spirrow-docs, file unknown"
+#     drive:<fileId-or-title>               — Drive with a specific pointer (future use)
+#     repo:<repo-relative path>.md          — the body file in THIS repository
+# CI does not regenerate this (no _docmap in CI); it checks that the file parses and is
+# well-formed, that every `body:` matches the locator format above, that every `repo:`
+# target actually exists in the tree, and that an ADR whose body file IS in `docs/adr/`
+# is not left pointing elsewhere. All four are hermetic — same-tree reads only, never
+# the network, Drive, or the chatroom.
 adrs:
   - id: ADR-2026-05-21-06
     title: "mindwire Interface Contract (Ports)"
+    body: drive
   - id: ADR-2026-05-23-07
     title: "Stage 3 Autonomy Gating + Implementer 安全設計"
+    body: drive
   - id: ADR-2026-05-24-08
     title: "Instance を一次概念とする識別モデル"
+    body: repo:docs/adr/ADR-2026-05-24-08-instance-identity-model.md
   - id: ADR-2026-05-27-09
     title: "identity 4 レイヤーモデル (identity_name / independence_class / role / 稼働形態 (embodiment) の直交分離)。independence_class レイヤーは ADR-2026-05-31-15 で二値→グラデーション補強。"
+    thread: T-T28-author-role-identity
+    body: chatroom:spirrow-mindwire/T-T28-author-role-identity#msg-283
   - id: ADR-2026-05-29-10
     title: "role registry (proposer / reviewer / implementer / integrator / dogfooder / naysayer / human の 7 role 定義、closeable_roles、close_reason enum)"
+    thread: T-T29-role-registry
+    body: chatroom:spirrow-mindwire/T-T29-role-registry#msg-309
   - id: ADR-2026-05-29-11
     title: "author/identity partition キー正規化 (lowercase + 区切り正規化 + 単射性 gate + strict-by-default)"
+    thread: T-author-partition-key-normalization
+    body: chatroom:spirrow-mindwire/T-author-partition-key-normalization#msg-324
   - id: ADR-2026-05-29-12
     title: "embodiment 自己申告値化 (ADR-09 D-5 拡張・実装、5 API optional 受け口、enum、状態遷移 msg 必須化、human 例外、response-side omit)"
+    thread: T-embodiment-self-declared
+    body: chatroom:spirrow-mindwire/T-embodiment-self-declared#msg-325
   - id: ADR-2026-05-29-13
     title: "実装着手前 spec read-back チェックリスト (実装 = `spec/process/obligations.yaml` の `OBL-READBACK-ENTRY` / `OBL-READBACK-EXIT`、背景 = `spec/process/README.md`)"
+    thread: T-implementer-spec-readback-checklist
+    body: chatroom:spirrow-mindwire/T-implementer-spec-readback-checklist#msg-326
   - id: ADR-2026-05-31-14
     title: "ガワ方式撤回 (claude.ai web 外部駆動の ToS 衝突 → Claude Code 転換)"
+    body: drive
   - id: ADR-2026-05-31-15
     title: "independence-class グラデーション化 + 「2 協調 1 独立」配置 (ADR-09/T28 の independence_class レイヤーを二値→グラデーションに補強、別訓練分布 naysayer の規範根拠、N-1/C-2 トレードオフ併記、§0 順序)"
+    thread: T-T15-poc-h-phase1-kickoff
+    body: drive
   - id: ADR-2026-06-03-16
     title: "naysayer CI-gate (APPROVE は CI 緑を含意 / approve-while-red 防止)"
+    body: drive
   - id: ADR-2026-06-03-17
     title: "独立 naysayer の design-time 参加復元 (5原則の常時注入 + relay orchestrator)"
+    body: drive
   - id: ADR-2026-06-04-18
     title: "mindwire デプロイ・トポロジと magickit 到達性 (ADR-17 D-8 amendment)"
+    body: repo:docs/adr/ADR-2026-06-04-18-mindwire-deploy-topology-magickit-reachability.md
   - id: ADR-2026-06-04-19
     title: "独立 naysayer のエージェント化 + summon ルール (ADR-17 relay/bundle を supersede)"
+    body: drive
   - id: ADR-2026-08-25-20
     title: "`independence_class` に `machine` を追加"
+    body: repo:docs/adr/ADR-2026-08-25-20-independence-class-machine-value.md

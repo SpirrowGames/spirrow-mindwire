@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from spirrow_mindwire.conductor.gate_records import render_relay_heading, verdict_heads
 from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent, ReviewInfo
 from spirrow_mindwire.magickit.client import MagickitMcpError, raise_if_envelope
 from spirrow_mindwire.magickit.watcher import ChatroomWatcher, WatchSpec
@@ -28,6 +29,24 @@ from spirrow_mindwire.ulid_util import new_ulid
 from spirrow_mindwire.value_objects import Role, SessionHandle, ThreadRef
 
 _TS = datetime(2026, 5, 23, tzinfo=UTC)
+
+_DESIGN_THREAD = "T-some-design-thread"
+# Threads _FakeMcp answers as live. The second one is load-bearing, not decoration: it is a real
+# design thread registered in the live sweep list whose id starts with the ledger prefix.
+_LIVE_DESIGN_THREADS = frozenset({_DESIGN_THREAD, "T-pr-review-threads-outlive-their-prs"})
+
+
+async def _fire(
+    orch: PrReviewOrchestrator, *, project: str, pr_ref: str, design_thread: str = _DESIGN_THREAD
+) -> tuple[ThreadRef, PrReviewOutcome]:
+    """``fire_pr_review`` with the required relay destination (D-1) defaulted.
+
+    It is orthogonal to what most tests below pin; the ones that pin it call the method directly.
+    """
+    ref, outcome, _relay = await orch.fire_pr_review(
+        project=project, pr_ref=pr_ref, design_thread=design_thread
+    )
+    return ref, outcome
 
 
 def _error_envelope(error_type: str, message: str, **details: Any) -> dict[str, Any]:
@@ -114,7 +133,11 @@ class _FakeMcp:
             # client wraps in MagickitMcpError before any payload exists. A refusal
             # by conclair is not that -- it arrives as a payload (see _error_envelope).
             raise self._raise_on[name]
-        if name == "chatroom_get_thread" and name not in self._results:
+        if name == "chatroom_get_thread" and arguments["thread_id"] in _LIVE_DESIGN_THREADS:
+            # D-2(c) refuses a destination that is not there, so these have to answer as live.
+            # They carry no PR ref: a design thread is not a ledger.
+            payload: Any = {"thread": {"title": "design"}, "messages": []}
+        elif name == "chatroom_get_thread" and name not in self._results:
             # A thread nobody programmed is a thread that is not there, and the far end
             # says so with an envelope inside a success response — which the client
             # then elevates to MagickitMcpError before the caller sees it.
@@ -125,6 +148,8 @@ class _FakeMcp:
             # `chatroom_get_thread` differently per thread_id (which is the whole
             # point of the collision tests below).
             payload = result(arguments) if callable(result) else result
+        # The three branches above assign rather than return so they all converge on this single
+        # choke point (see class docstring); an early return skips it and re-ships #150.
         raise_if_envelope(payload)
         return payload
 
@@ -160,7 +185,7 @@ async def test_fire_pr_review_thread_id_is_pr_derived() -> None:
     mcp = _FakeMcp()
     driver = _FakeDriver()
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
-    ref, outcome = await orch.fire_pr_review(project="spirrow-mindwire", pr_ref="org/repo#42")
+    ref, outcome = await _fire(orch, project="spirrow-mindwire", pr_ref="org/repo#42")
     assert ref.thread_id == "T-pr-review-repo-42"
     assert ref.project_id == "spirrow-mindwire"
     args = mcp.args_for("chatroom_open_thread")
@@ -193,7 +218,7 @@ async def test_fire_pr_review_critique_names_the_naysayer_role() -> None:
     """
     mcp = _FakeMcp()
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    await _fire(orch, project="p", pr_ref="o/r#7")
     post = mcp.args_for("chatroom_post_message")
     assert post["role"] == Role.NAYSAYER.value
 
@@ -207,7 +232,7 @@ async def test_fire_pr_review_returns_driver_outcome() -> None:
         head_sha="sha9",
     )
     orch = PrReviewOrchestrator(_FakeMcp(), driver=_FakeDriver(outcome))  # type: ignore[arg-type]
-    _ref, got = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    _ref, got = await _fire(orch, project="p", pr_ref="o/r#7")
     assert got is outcome
 
 
@@ -215,7 +240,7 @@ async def test_fire_pr_review_returns_driver_outcome() -> None:
 async def test_fire_pr_review_unparseable_ref_raises() -> None:
     orch = PrReviewOrchestrator(_FakeMcp(), driver=_FakeDriver())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="unparseable PR ref"):
-        await orch.fire_pr_review(project="p", pr_ref="not a pr ref")
+        await _fire(orch, project="p", pr_ref="not a pr ref")
 
 
 @pytest.mark.anyio
@@ -303,9 +328,13 @@ async def test_a_re_review_posts_into_the_existing_thread_without_reopening_it()
         },
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _outcome = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    ref, _outcome = await _fire(orch, project="p", pr_ref="o/r#7")
     assert ref.thread_id == "T-pr-review-r-7"
-    assert [name for name, _ in mcp.calls] == ["chatroom_get_thread", "chatroom_post_message"]
+    # reads: resolve the ledger id, then check the relay destination exists (D-2c, pre-payment).
+    # writes: the critique into the ledger, the verdict into the design thread.
+    assert [name for name, _ in mcp.calls] == ["chatroom_get_thread"] * 2 + [
+        "chatroom_post_message"
+    ] * 2
 
 
 # ---------- repo-qualified thread ids (T-pr-review-thread-id-not-repo-qualified) ---------- #
@@ -317,7 +346,7 @@ async def test_thread_id_carries_the_repo_case_folded() -> None:
     # same repo -- case must not be able to open two ledgers for one PR.
     mcp = _FakeMcp()
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(project="p", pr_ref="SpirrowGames/Spirrow-VoxelWorld#12")
+    ref, _ = await _fire(orch, project="p", pr_ref="SpirrowGames/Spirrow-VoxelWorld#12")
     assert ref.thread_id == "T-pr-review-spirrow-voxelworld-12"
 
 
@@ -337,14 +366,14 @@ async def test_another_repos_pr_with_the_same_number_gets_its_own_thread() -> No
         }
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(project="p", pr_ref="SpirrowGames/spirrow-conclair#12")
+    ref, _ = await _fire(orch, project="p", pr_ref="SpirrowGames/spirrow-conclair#12")
     assert ref.thread_id == "T-pr-review-spirrow-conclair-12"
     written_to = {
         args["thread_id"]
         for name, args in mcp.calls
         if name in ("chatroom_open_thread", "chatroom_post_message")
     }
-    assert written_to == {"T-pr-review-spirrow-conclair-12"}
+    assert written_to == {"T-pr-review-spirrow-conclair-12", _DESIGN_THREAD}
 
 
 @pytest.mark.anyio
@@ -359,7 +388,7 @@ async def test_a_pr_already_mid_review_keeps_its_unqualified_thread() -> None:
         }
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(project="p", pr_ref="SpirrowGames/spirrow-conclair#10")
+    ref, _ = await _fire(orch, project="p", pr_ref="SpirrowGames/spirrow-conclair#10")
     assert ref.thread_id == "T-pr-review-10"
 
 
@@ -379,7 +408,7 @@ async def test_an_unidentifiable_thread_at_the_legacy_id_is_not_reused() -> None
         }
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#10")
+    ref, _ = await _fire(orch, project="p", pr_ref="o/r#10")
     assert ref.thread_id == "T-pr-review-r-10"
 
 
@@ -397,7 +426,7 @@ async def test_a_taken_qualified_id_fails_before_the_review_is_paid_for() -> Non
     )
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
     with pytest.raises(ThreadIdCollisionError, match="other/r#9"):
-        await orch.fire_pr_review(project="p", pr_ref="o/r#9")
+        await _fire(orch, project="p", pr_ref="o/r#9")
     assert driver.reviewed == []
     assert all(name == "chatroom_get_thread" for name, _ in mcp.calls)
 
@@ -438,7 +467,7 @@ async def test_an_unidentifiable_thread_on_the_qualified_id_also_fails_before_th
     )
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
     with pytest.raises(ThreadIdCollisionError, match="unidentifiable"):
-        await orch.fire_pr_review(project="p", pr_ref="o/r#9")
+        await _fire(orch, project="p", pr_ref="o/r#9")
     assert driver.reviewed == []
     assert all(name == "chatroom_get_thread" for name, _ in mcp.calls)
 
@@ -466,7 +495,7 @@ async def test_the_same_pr_spelled_with_different_case_is_not_a_collision() -> N
         },
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(project="p", pr_ref="spirrowgames/spirrow-voxelworld#12")
+    ref, _ = await _fire(orch, project="p", pr_ref="spirrowgames/spirrow-voxelworld#12")
     assert ref.thread_id == "T-pr-review-spirrow-voxelworld-12"
     # Reused, not refused: the critique still reaches the thread.
     assert mcp.args_for("chatroom_post_message")["thread_id"] == (
@@ -496,7 +525,7 @@ async def test_a_thread_that_appears_between_resolve_and_open_is_not_written_int
     )
     orch = PrReviewOrchestrator(mcp, driver=_RacingDriver())  # type: ignore[arg-type]
     with pytest.raises(ThreadIdCollisionError, match="other/r#9"):
-        await orch.fire_pr_review(project="p", pr_ref="o/r#9")
+        await _fire(orch, project="p", pr_ref="o/r#9")
     assert all(name != "chatroom_post_message" for name, _ in mcp.calls)
 
 
@@ -524,7 +553,7 @@ async def test_a_race_that_opens_this_prs_own_thread_is_still_swallowed() -> Non
         },
     )
     orch = PrReviewOrchestrator(mcp, driver=_SamePrRacingDriver())  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#9")
+    ref, _ = await _fire(orch, project="p", pr_ref="o/r#9")
     assert ref.thread_id == "T-pr-review-r-9"
     assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-r-9"
 
@@ -565,7 +594,7 @@ async def test_a_pr_mentioned_further_down_the_thread_is_not_its_subject() -> No
     )
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
     with pytest.raises(ThreadIdCollisionError, match="unidentifiable") as excinfo:
-        await orch.fire_pr_review(project="p", pr_ref="o/r#9")
+        await _fire(orch, project="p", pr_ref="o/r#9")
     assert "other/elsewhere#3" not in str(excinfo.value)
     assert driver.reviewed == []
 
@@ -602,7 +631,7 @@ async def test_a_thread_whose_title_carries_no_ref_is_identified_by_its_request(
         }
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    ref, _ = await _fire(orch, project="p", pr_ref="o/r#7")
     assert ref.thread_id == "T-pr-review-r-7"
     assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-r-7"
 
@@ -643,7 +672,7 @@ async def test_a_title_naming_another_pr_does_not_overrule_the_opening_request()
         }
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    ref, _ = await _fire(orch, project="p", pr_ref="o/r#7")
     assert ref.thread_id == "T-pr-review-r-7"
     assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-r-7"
     # Resolving found this PR's own thread, so there is nothing to open.
@@ -691,7 +720,7 @@ async def test_a_thread_whose_request_carries_no_ref_is_identified_by_its_title(
         }
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    ref, _ = await _fire(orch, project="p", pr_ref="o/r#7")
     assert ref.thread_id == "T-pr-review-7"
     assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-7"
     assert all(name != "chatroom_open_thread" for name, _ in mcp.calls)
@@ -744,7 +773,7 @@ async def test_a_closing_note_naming_this_pr_does_not_make_the_thread_ours() -> 
     )
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
     with pytest.raises(ThreadIdCollisionError, match="other/elsewhere#3"):
-        await orch.fire_pr_review(project="p", pr_ref="o/r#9")
+        await _fire(orch, project="p", pr_ref="o/r#9")
     assert driver.reviewed == []
     assert all(name == "chatroom_get_thread" for name, _ in mcp.calls)
 
@@ -788,7 +817,7 @@ async def test_a_resolved_thread_is_still_identified_by_its_opening_request() ->
         }
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    ref, _ = await _fire(orch, project="p", pr_ref="o/r#7")
     assert ref.thread_id == "T-pr-review-r-7"
     assert mcp.args_for("chatroom_post_message")["thread_id"] == "T-pr-review-r-7"
     # Resolving found the thread, so there is nothing to open (the re-review path).
@@ -849,8 +878,8 @@ async def test_a_pr_with_no_ledger_thread_anywhere_still_gets_gated() -> None:
     mcp = _FakeMcp()  # every chatroom_get_thread answers "not found"
     driver = _FakeDriver()
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
-    ref, _ = await orch.fire_pr_review(
-        project="spirrow-mindwire", pr_ref="SpirrowGames/spirrow-magickit#22"
+    ref, _ = await _fire(
+        orch, project="spirrow-mindwire", pr_ref="SpirrowGames/spirrow-magickit#22"
     )
     assert ref.thread_id == "T-pr-review-spirrow-magickit-22"
     assert driver.reviewed == [PrRef("SpirrowGames", "spirrow-magickit", 22)]
@@ -879,7 +908,7 @@ async def test_an_open_that_was_refused_is_not_treated_as_an_open() -> None:
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
     with pytest.raises(MagickitMcpError, match="ChatroomValidationError"):
-        await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+        await _fire(orch, project="p", pr_ref="o/r#7")
     assert all(name != "chatroom_post_message" for name, _ in mcp.calls)
 
 
@@ -925,7 +954,7 @@ async def test_a_critique_that_never_reached_the_thread_stops_the_review() -> No
     driver = _SubmittingDriver()
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
     with pytest.raises(MagickitMcpError, match="ChatroomNotFoundError"):
-        await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+        await _fire(orch, project="p", pr_ref="o/r#7")
     assert driver.submitted is False
 
 
@@ -938,7 +967,7 @@ async def test_fire_pr_review_non_exists_open_error_raises() -> None:
     )
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
     with pytest.raises(MagickitMcpError):
-        await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+        await _fire(orch, project="p", pr_ref="o/r#7")
     assert all(name != "chatroom_post_message" for name, _ in mcp.calls)  # never posted
 
 
@@ -956,7 +985,7 @@ async def test_fire_pr_review_does_not_leak_thread_on_review_error() -> None:
     mcp = _FakeMcp()
     orch = PrReviewOrchestrator(mcp, driver=_RaisingDriver())  # type: ignore[arg-type]
     with pytest.raises(RuntimeError):
-        await orch.fire_pr_review(project="p", pr_ref="o/r#1")
+        await _fire(orch, project="p", pr_ref="o/r#1")
     assert all(name != "chatroom_open_thread" for name, _ in mcp.calls)
     assert all(name != "chatroom_post_message" for name, _ in mcp.calls)
 
@@ -967,10 +996,12 @@ async def test_fire_pr_review_opens_thread_then_posts_on_success() -> None:
     # open precedes post (lazy-open happens inside the single post_critique call).
     mcp = _FakeMcp()
     orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
-    await orch.fire_pr_review(project="p", pr_ref="o/r#1")
-    # The leading reads are the thread-id resolution; the writes are what this pins.
+    await _fire(orch, project="p", pr_ref="o/r#1")
+    # The leading reads are the thread-id resolution + the relay destination check; the writes
+    # are what this pins. The second post is the design-thread relay — part of firing the gate
+    # (D-1), not something a caller may or may not go on to do.
     names = [name for name, _ in mcp.calls if name != "chatroom_get_thread"]
-    assert names == ["chatroom_open_thread", "chatroom_post_message"]
+    assert names == ["chatroom_open_thread", "chatroom_post_message", "chatroom_post_message"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1015,7 +1046,7 @@ async def test_w3_critique_post_thread_resolved_lets_driver_continue_to_submit()
     )
     driver = _SubmittingDriver()
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
-    ref, _outcome = await orch.fire_pr_review(project="p", pr_ref="o/r#7")
+    ref, _outcome = await _fire(orch, project="p", pr_ref="o/r#7")
     assert driver.submitted is True, (
         "the driver must continue to _submit_review on ThreadResolvedError — "
         "the GitHub PR review is the primary artifact"
@@ -1044,9 +1075,119 @@ async def test_w3_critique_post_thread_resolved_does_not_retry() -> None:
         }
     )
     orch = PrReviewOrchestrator(mcp, driver=_SubmittingDriver())  # type: ignore[arg-type]
-    await orch.fire_pr_review(project="p", pr_ref="o/r#8")
-    posts = [name for name, _ in mcp.calls if name == "chatroom_post_message"]
-    assert len(posts) == 1
+    await _fire(orch, project="p", pr_ref="o/r#8")
+    # Scoped to the refusing thread: the relay goes to a different id, and counting both would
+    # stop this pinning "no retry on THIS thread".
+    ledger_posts = [
+        args
+        for name, args in mcp.calls
+        if name == "chatroom_post_message" and args["thread_id"] == "T-pr-review-r-8"
+    ]
+    assert len(ledger_posts) == 1
+
+
+# ---- D-6 (T-pr-gate-relay-belongs-to-the-conductor-not-the-gate) ---------- #
+
+
+@pytest.mark.anyio
+async def test_one_fire_lands_in_both_the_ledger_and_the_design_thread() -> None:
+    # D-6 #1: the defect was a fire that reached the ledger and stopped there — ten hand-fired
+    # gates out of ten on 2026-09-08, because the destination was the *caller's* state. Pins
+    # both posts in order plus the relay's byte format.
+    mcp = _FakeMcp()
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    _ref, _outcome, relay = await orch.fire_pr_review(
+        project="p", pr_ref="o/r#7", design_thread=_DESIGN_THREAD, implementer="Heisenberg"
+    )
+    posts = [args for name, args in mcp.calls if name == "chatroom_post_message"]
+    assert [args["thread_id"] for args in posts] == ["T-pr-review-r-7", _DESIGN_THREAD]
+    ledger, design = posts
+    assert ledger["author"] == "naysayer-pr-review"
+    assert ledger["role"] == Role.NAYSAYER.value
+    assert design["author"] == "pr-gate-relay"
+    assert "role" not in design  # D-4: the relay holds no role (I-6)
+    # APPROVE routes to the human even with an implementer on the roster: the relay is the
+    # necessary condition for the verdict to ARRIVE, not for the Tier-C park to lift.
+    # The heading is asserted through render_relay_heading, NOT a literal: the literal was
+    # what let #244's original merge silently drop `@ sha` and starve verdict_heads on merge
+    # with the admission wiring — a byte-identical failure to the head=None case
+    # (T-pr-gate-relay-belongs-to-the-conductor msg-2835 §5 R-5(b)).
+    assert design["content"] == (
+        f"{render_relay_heading('o/r#7', 'sha1')}\n\n"
+        "VERDICT: APPROVE (ci=success)\n\n"
+        "LGTM\n\nVERDICT: APPROVE\n\n"
+        "NEXT: human"
+    )
+    assert relay["author"] == "pr-gate-relay"
+    assert relay["content"] == design["content"]
+
+
+@pytest.mark.anyio
+async def test_verdict_heads_reads_the_head_out_of_the_production_relay_body() -> None:
+    # T-pr-gate-relay-belongs-to-the-conductor msg-2835 §5 R-5(c): the ROUND TRIP over
+    # production. render_relay_heading → chatroom body → verdict_heads → the same head. This is
+    # the one pin whose failure catches "production drops the renderer" (§3): a test that just
+    # asserts .startswith(render_relay_heading(...)) is byte-happy with a 4-char SHA that
+    # verdict_heads then silently drops, and the R6 admission check goes structurally dead. So
+    # the fixture uses a 7-hex-char head — the minimum ``_RELAY_HEAD_RE`` requires — and asserts
+    # that verdict_heads recovers exactly that head from the body the orchestrator wrote.
+    head = "0123abc"  # 7 hex chars — the minimum verdict_heads' _RELAY_HEAD_RE accepts.
+    outcome = PrReviewOutcome(
+        verdict=ReviewEvent.APPROVE,
+        body="LGTM\n\nVERDICT: APPROVE",
+        ci_state=CiState.SUCCESS,
+        head_sha=head,
+    )
+    mcp = _FakeMcp()
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver(outcome))  # type: ignore[arg-type]
+    _ref, _outcome, relay = await orch.fire_pr_review(
+        project="p", pr_ref="o/r#7", design_thread=_DESIGN_THREAD, implementer="Heisenberg"
+    )
+    # Round-trip against the WRITTEN body (what a reader would see on chatroom_get_thread), not
+    # against a locally re-rendered heading: if production ever stopped calling
+    # render_relay_heading (§3), the frozenset would go empty and this assertion would flip.
+    assert verdict_heads([relay["content"]]) == frozenset({head})
+
+
+@pytest.mark.anyio
+async def test_design_thread_that_is_a_ledger_id_raises_before_the_paid_review() -> None:
+    # D-6 #2: the ledger id is the one wrong value the operator has to hand — naysayer_review.py
+    # prints it and nothing else — so without this check the easiest answer is a silent no-op
+    # reported as success. The exception alone is not enough: it must be raised before the Gemini
+    # judgement is paid for, so what is pinned is that the driver's ``review`` was never awaited.
+    mcp = _FakeMcp()
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="LEDGER id grammar"):
+        await orch.fire_pr_review(
+            project="p", pr_ref="o/r#7", design_thread="T-pr-review-spirrow-mindwire-236"
+        )
+    assert driver.reviewed == []  # nothing was judged, so nothing was billed
+    assert all(name != "chatroom_post_message" for name, _ in mcp.calls)
+
+
+@pytest.mark.anyio
+async def test_design_thread_may_start_with_the_ledger_prefix() -> None:
+    # D-6 #3: the ledger check is a grammar, not startswith(prefix).
+    # T-pr-review-threads-outlive-their-prs is a live design thread in the sweep list; a prefix
+    # test would refuse it and re-open this very defect on the thread most likely to discuss it.
+    mcp = _FakeMcp()
+    orch = PrReviewOrchestrator(mcp, driver=_FakeDriver())  # type: ignore[arg-type]
+    live = "T-pr-review-threads-outlive-their-prs"
+    await _fire(orch, project="p", pr_ref="o/r#7", design_thread=live)
+    relayed = [args for name, args in mcp.calls if name == "chatroom_post_message"][-1]
+    assert relayed["thread_id"] == "T-pr-review-threads-outlive-their-prs"
+
+
+@pytest.mark.anyio
+async def test_design_thread_must_exist() -> None:
+    # D-2(c): a destination that is not there fails before the review is paid for, not after.
+    mcp = _FakeMcp()
+    driver = _FakeDriver()
+    orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="does not exist"):
+        await orch.fire_pr_review(project="p", pr_ref="o/r#7", design_thread="T-not-a-thread")
+    assert driver.reviewed == []
 
 
 # ---------- L2 merge gate: require_ci_success (ADR-2026-06-03-16 D-3) ------ #
