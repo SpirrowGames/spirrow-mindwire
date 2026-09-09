@@ -78,7 +78,8 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
-from ..github.client import ReviewEvent, parse_pr_ref
+from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
+from ..github.client import CheckRollup, PrRef, ReviewEvent, parse_pr_ref
 from ..magickit.client import McpToolCaller, ThreadResolvedError
 from ..routing import GuardIVerdict, guard_proposer_to_implementer
 from ..source_marker import parse_attestation_marker
@@ -92,6 +93,13 @@ from ..value_objects import (
     ThreadRef,
 )
 from .control import BASELINE_CONTROL_STATE, ControlState, LoopControl
+from .gate_records import (
+    ci_route_heads,
+    normalize_sha,
+    render_ci_route_marker,
+    render_relay_heading,
+    verdict_heads,
+)
 from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, resolve_handoff
 
 if TYPE_CHECKING:
@@ -130,6 +138,22 @@ class PrGate(Protocol):
     ) -> tuple[ThreadRef, PrReviewOutcome]: ...
 
 
+class CheckRollupSource(Protocol):
+    """The one read pre-gate admission needs: the head's check rollup + its two clocks.
+
+    The real :class:`~spirrow_mindwire.github.client.GitHubClient` satisfies this structurally.
+    A ``None`` return means the rollup could not be READ — never "there are no checks" — and the
+    conductor's fail direction for it is its pre-wiring behaviour (fire the gate), so a repo
+    whose rollup is unreadable behaves exactly as it did before ``gate_admission`` was wired.
+
+    Kept as a Protocol here rather than taking a ``GitHubClient`` so the conductor holds no
+    HTTP dependency of its own and the admission path is drivable from a scripted fake, the same
+    shape :class:`PrGate` already uses for the gate itself.
+    """
+
+    async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup | None: ...
+
+
 # The conductor authors its PR-gate verdict relay under this reserved name when it posts the Tier B
 # outcome back into the design thread (PR-2b-2). It is informational only — the conductor routes by
 # the deterministic fire_pr_review *verdict*, never by re-parsing this relay — so it is NOT a trust
@@ -147,6 +171,13 @@ class StopReason(StrEnum):
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
     HOLD = "hold"  # the project's loop control state is `hold` (or could not be read)
+    # Pre-gate admission (design v0.3.1 §5.2A, R1a / R2) said DEFER: CI on the PR head has not
+    # concluded and the wait budget has not run out. Deliberately NOT `HUMAN` — nobody is
+    # summoned and nothing is posted (deferrals write no record, §5.2A.5), because the answer to
+    # "is CI finished yet" is not a question worth stopping a person for. The next scheduled
+    # tick re-reads the same handoff and re-derives admission from the fresh rollup; the wait is
+    # therefore held by GitHub's state, not by a mindwire-side timer (§A-2 statelessness).
+    CI_WAIT = "ci_wait"
 
 
 @dataclass(frozen=True)
@@ -182,6 +213,7 @@ class Conductor:
         orchestrator: PrGate | None = None,
         force_naysayer_only_on_explicit_human: bool = False,
         control: LoopControl | None = None,
+        rollup_source: CheckRollupSource | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -211,6 +243,12 @@ class Conductor:
         # ``None`` orchestrator / a roster without exactly one implementer disables the gate path
         # (a pr-review sentinel then routes to the human, fail-safe).
         self._orchestrator = orchestrator
+        # Pre-gate CI-wait admission (design v0.3.1 §5.2A / RES-WIRING). ``None`` disables
+        # admission entirely and the PR-gate path is byte-for-byte its pre-wiring self: every
+        # ``NEXT: pr-review`` fires the gate immediately. That is also the fail direction when a
+        # source IS wired but cannot read (see ``_admit``), so "admission is off" and "admission
+        # could not see" produce the same, already-shipped behaviour rather than two new ones.
+        self._rollup_source = rollup_source
         # Cost lever (default off = baseline Obj2): force the naysayer consult only on an explicit
         # ``NEXT: human`` (real Tier-C handoff), not on a guard-(i) redirect or an ABSENT / Q-A
         # un-routed turn. Narrows WHICH terminals force a consult; the per-segment single-consult
@@ -323,6 +361,74 @@ class Conductor:
                     return self._stop(
                         round_index, StopReason.HUMAN, latest_msg_id, forced, forced_saveable
                     )
+                # Pre-gate CI-wait admission (design v0.3.1 §5.2A). Decided BEFORE the gate is
+                # fired, from machine facts only (the head's rollup + two clocks + two head sets
+                # read back off this thread) — the third edge of §5.2A.6, which is neither guard
+                # (i) nor carve-out ②. ``None`` (no source wired, or the rollup could not be
+                # read) falls through to the pre-wiring path below unchanged.
+                admitted = await self._admit(parsed_ref, latest, messages)
+                if admitted is not None:
+                    decision, rollup = admitted
+                    if decision.admission is GateAdmission.DEFER:
+                        # R1a / R2. Post nothing, summon nobody: the next tick re-derives this
+                        # from a fresh rollup. This is where §5.2A.7's "pending gate invocations
+                        # 3 → 0" and "relay COMMENT noise 3 → 0" are actually paid.
+                        return self._stop(
+                            round_index, StopReason.CI_WAIT, latest_msg_id, forced, forced_saveable
+                        )
+                    if decision.admission is GateAdmission.ALREADY_REVIEWED:
+                        # R6. A verdict for this exact head is already in the thread; re-firing
+                        # would buy a second opinion on an unchanged diff. Stop at the human, the
+                        # same terminal the first verdict's own APPROVE / COMMENT reached — the
+                        # earlier verdict's ``NEXT:`` is authoritative and is NOT re-parsed here
+                        # (no author is trusted, msg-557).
+                        return self._stop(
+                            round_index, StopReason.HUMAN, latest_msg_id, forced, forced_saveable
+                        )
+                    if decision.admission is GateAdmission.ROUTE_HUMAN:
+                        # R3 (CI stuck past the cap) / R5 (red twice on one head, no new push).
+                        # The escalation is POSTED, not merely returned: a human summoned without
+                        # the reason in the thread is a stop nobody can act on, and ``reason``
+                        # already names the stuck checks and which clock decided.
+                        escalation = await self._post_admission_escalation(
+                            parsed_ref.slug, decision
+                        )
+                        return self._stop(
+                            round_index,
+                            StopReason.HUMAN,
+                            _msg_id(escalation) or latest_msg_id,
+                            forced,
+                            forced_saveable,
+                        )
+                    if decision.admission is GateAdmission.ROUTE_IMPLEMENTER:
+                        # R4: first red on this head (E-CI-RED — the CI-fix edge, NOT carve-out
+                        # ②; no verdict exists to relay). The ci-route marker on this post is
+                        # what lets the NEXT tick's R5 tell a second red apart from this one.
+                        route_msg = await self._post_ci_route(parsed_ref.slug, decision, rollup)
+                        route_msg_id = _msg_id(route_msg)
+                        if not route_msg_id or not self._implementer_identity:
+                            # Same two fail-safes as the REQUEST_CHANGES path: without a msg_id
+                            # the no-progress guard cannot track the continue path, and without
+                            # exactly one implementer persona there is nobody to dispatch.
+                            return self._stop(
+                                round_index,
+                                StopReason.HUMAN,
+                                route_msg_id or latest_msg_id,
+                                forced,
+                                forced_saveable,
+                            )
+                        handle = sessions.get(self._implementer_identity)
+                        if handle is None:
+                            handle = await self._dispatcher.spawn_instance(
+                                self._thread_ref,
+                                self._implementer_role,
+                                self._implementer_identity,
+                            )
+                            sessions[self._implementer_identity] = handle
+                        await self._dispatcher.dispatch(handle, self._to_event(route_msg, messages))
+                        processed_msg_id = route_msg_id
+                        continue
+                    # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through.
                 verdict, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
                 # A missing relay id (post result with no msg_id) breaks no-progress tracking on
@@ -686,6 +792,15 @@ class Conductor:
         ``NEXT:`` line mirrors the chosen route for readability but is never re-parsed by the
         conductor (no author is trusted; msg-557). Returns the posted message as a dict so the
         conductor can dispatch the implementer on it (Tier B msg-567 #1).
+
+        The heading now names the head SHA the gate reviewed
+        (:func:`~spirrow_mindwire.conductor.gate_records.render_relay_heading`). That is not
+        decoration: it is the whole of ``gate_admission``'s ``verdict_heads`` input, and without
+        it R6 cannot tell "a verdict exists on THIS head" from "a verdict exists on this PR",
+        which are different facts the moment the implementer pushes a fix. ``outcome.head_sha``
+        (the head the gate actually read) is used rather than the head admission observed a
+        moment earlier, so a push that lands between the two is recorded against the diff that
+        was really reviewed.
         """
         nxt = (
             self._implementer_identity
@@ -693,11 +808,22 @@ class Conductor:
             else HUMAN_TOKEN
         )
         body = (
-            f"PR-gate (Tier B independent naysayer) — {pr_ref}\n\n"
+            f"{render_relay_heading(pr_ref, outcome.head_sha)}\n\n"
             f"VERDICT: {outcome.verdict.value} (ci={outcome.ci_state.value})\n\n"
             f"{outcome.body}\n\n"
             f"NEXT: {nxt}"
         )
+        return await self._post_as_relay(body)
+
+    async def _post_as_relay(self, body: str) -> dict[str, Any]:
+        """Post ``body`` into the design thread under the reserved relay author.
+
+        Shared by all three conductor-authored PR-gate posts — the verdict relay, the R3/R5
+        admission escalation, and the R4 ci-route dispatch — because they need identical
+        handling of the one failure that is not an error: a design thread resolved out from
+        under an in-flight gate (W3). Writing that handling once is what keeps the three from
+        drifting into three different answers to the same question.
+        """
         try:
             result = await self._mcp.call_tool(
                 "chatroom_post_message",
@@ -756,6 +882,130 @@ class Conductor:
             "author": _PR_GATE_RELAY_AUTHOR,
             "content": body,
         }
+
+    async def _admit(
+        self, pr: PrRef, latest: dict[str, Any], messages: list[dict[str, Any]]
+    ) -> tuple[AdmissionResult, CheckRollup] | None:
+        """Run pre-gate CI-wait admission for ``pr``, or ``None`` to keep the pre-wiring path.
+
+        ``None`` is returned for exactly two situations, and they are deliberately given the
+        same answer: no rollup source is wired at all, and a wired source that could not READ
+        the rollup. Both mean "admission has nothing to judge on", and the only honest response
+        to that is the behaviour that shipped before admission existed — fire the gate. Mapping
+        an unread rollup onto ``rollup=[]`` instead would hand ``gate_admission`` a *measured*
+        empty and let R1a / R1b rule on a fiction, which is precisely what that function's own
+        parameter documentation forbids ("the caller must not conflate 'empty' with 'not yet
+        fetched'").
+
+        ``nomination_is_self`` — the one input this call site has to interpret rather than read
+        ------------------------------------------------------------------------------------
+
+        The parameter is documented as "``True`` if the latest ``NEXT: pr-review <ref>`` was
+        authored by the conductor's own pr-gate-relay". Taken as a literal predicate at THIS
+        call site it is a constant ``False``, and the measurement is one line:
+        :meth:`_post_pr_relay` — the only place the relay author writes anything — emits a
+        ``NEXT:`` naming the implementer or the human, never ``pr-review``. So the conductor
+        cannot self-nominate, no message the relay author writes can carry a pr-review handoff,
+        and a literal reading sends **every** admission through R0-OVERRIDE to INVOKE. That is
+        not a conservative wiring; it is a no-op wearing one, and it would close RES-WIRING while
+        leaving §5.2A.7's entire expected effect unrealised.
+
+        What R0-OVERRIDE is FOR is stated in its own rationale: a human summoned by R3 or R5 must
+        be able to break the escalation loop by re-writing the handoff by hand (PR-review
+        msg-(gate) BLOCKING-2). The discriminator that delivers that, and that this call site can
+        actually evaluate, is authorship by the human identity — the same :meth:`_is_human` test
+        the conductor already uses for the Tier-C carve-out. So:
+
+        * human-authored ``NEXT: pr-review`` → ``nomination_is_self=False`` → R0-OVERRIDE →
+          INVOKE now. The escape hatch works, which it does not under the literal reading either
+          (there, everything invokes, so a summoned human cannot be trapped — but neither can
+          anything else be deferred).
+        * role-authored (the implementer's ordinary "I pushed, review it") →
+          ``nomination_is_self=True`` → the R1-R7 table applies. This is the autonomous path, and
+          it is the only path on which the design's savings exist.
+
+        This departs from the docstring's parenthetical "(or any other role)" and is reported as
+        a deviation rather than absorbed, because it is the single decision that determines
+        whether the mechanism runs at all. Nothing about it weakens a guard: every rule it makes
+        reachable ends in the conductor doing *less* (defer, don't re-fire, or stop and ask).
+        """
+        if self._rollup_source is None:
+            return None
+        rollup = await self._rollup_source.fetch_check_rollup(pr)
+        if rollup is None:
+            logger.info(
+                "gate admission skipped for %s: rollup unread — firing the gate (pre-wiring "
+                "behaviour)",
+                pr.slug,
+            )
+            return None
+        relay_bodies = [_content(msg) for msg in messages if _author(msg) == _PR_GATE_RELAY_AUTHOR]
+        decision = gate_admission(
+            rollup=rollup.rows,
+            head_sha=normalize_sha(rollup.head_sha),
+            head_committed_date=rollup.head_committed_date,
+            head_pushed_at=rollup.head_pushed_at,
+            now=datetime.now(UTC),
+            nomination_is_self=not self._is_human(_author(latest)),
+            verdict_heads=verdict_heads(relay_bodies),
+            ci_red_routed_heads=ci_route_heads(relay_bodies),
+        )
+        logger.info(
+            "gate admission for %s: rule=%s admission=%s reason=%s",
+            pr.slug,
+            decision.rule,
+            decision.admission.value,
+            decision.reason,
+        )
+        return decision, rollup
+
+    async def _post_admission_escalation(
+        self, pr_ref: str, decision: AdmissionResult
+    ) -> dict[str, Any]:
+        """Post the R3 / R5 escalation so the summoned human can see WHY they were summoned.
+
+        ``decision.reason`` already names the stuck checks and which clock decided (R3) or that
+        the same head went red twice with no intervening push (R5), so this adds no judgement of
+        its own — it carries a machine string to a human surface. Rare by construction: R3 needs
+        a 6 h / 12 h cap to elapse and R5 needs a second red on an unchanged head.
+        """
+        body = (
+            f"PR-gate admission (pre-gate CI wait) — {pr_ref}\n\n"
+            f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
+            f"{decision.reason}\n\n"
+            f"The gate was NOT fired. This is a machine observation of CI, not a review.\n\n"
+            f"NEXT: {HUMAN_TOKEN}"
+        )
+        return await self._post_as_relay(body)
+
+    async def _post_ci_route(
+        self, pr_ref: str, decision: AdmissionResult, rollup: CheckRollup
+    ) -> dict[str, Any]:
+        """Post the R4 CI-fix dispatch, carrying the one new record design §5.2A.5 sanctions.
+
+        The marker is written **only here** — never on a deferral, never on a verdict relay —
+        which is what keeps the thread cost of this whole mechanism at "one line, on the rare
+        red". It is also the only reason R5 can exist: a deferral leaves no message, so the
+        thread cannot otherwise distinguish a first red from a second one on the same head.
+        """
+        failing = [row.name for row in rollup.rows if (row.conclusion or "") in RED_CONCLUSIONS]
+        marker = render_ci_route_marker(
+            head=rollup.head_sha,
+            conclusion="failure",
+            checks=failing,
+        )
+        checks_line = ", ".join(failing) if failing else "<no named failing check>"
+        body = (
+            f"PR-gate admission (pre-gate CI wait) — {pr_ref}\n\n"
+            f"ADMISSION: {decision.admission.value} (rule={decision.rule})\n\n"
+            f"CI is red on {rollup.head_sha[:12]}: {checks_line}\n\n"
+            f"{decision.reason}\n\n"
+            f"The gate was NOT fired — there is no review verdict to act on. Fix CI and push; "
+            f"the next tick re-reads the rollup on the new head.\n\n"
+            f"NEXT: {self._implementer_identity or HUMAN_TOKEN}\n\n"
+            f"{marker}"
+        )
+        return await self._post_as_relay(body)
 
     def _to_event(self, msg: dict[str, Any], messages: list[dict[str, Any]]) -> ChatroomEvent:
         """Build the event for ``msg``, carrying the thread as ground truth (D-3).
@@ -878,6 +1128,7 @@ def _parse_occurred_at(value: Any) -> datetime:
 
 
 __all__ = [
+    "CheckRollupSource",
     "Conductor",
     "ConductorDispatcher",
     "ConductorOutcome",

@@ -613,7 +613,7 @@ vector の SOT は **conclair repo 一箇所**。他 2 repo は vendor し、`co
 |---|---|---|---|
 | `T-operator-board-p0` | conclair | **D0 契約凍結** → alembic 0009（board_cards / board_events / board_leases(project, resource_key) / board_nodes / board_judgments / thread_relations）→ `api/board.py` → relations 派生書き込み（`/related` は **default depth=1**、v0.2 item 6）→ `project_control.desired_expires_at` | CON-P0-ENV の probe 成功 |
 | `T-operator-board-mcp-and-ui` | magickit | `board_*` MCP ツール（**Conclair 直叩きはしない**、§13.1 確定）／`/dashboard/operator` 読み取り専用、既存 `board.py` 置換、`presented_hash` 再提示抑止 | P0-D0 |
-| `T-operator-board-p1` | mindwire | `operator/` observe + reconcile（純関数）+ push、**act 無し**／`run_conductor(settings, project=, thread_id=, repo_dir=)` と `Set-TomlValue` 廃止／**inventory gate**（v0.2 item 4）／`gate_admission` を `HandoffKind.PR_REVIEW` の前に呼ぶ conductor wiring（本 v0.3.1 §5.2A の実装 follow-up。fetch_check_rollup の追加、verdict_heads / ci_red_routed_heads の thread からの derive、ci-route マーカ書込を含む） | P0-D0 |
+| `T-operator-board-p1` | mindwire | `operator/` observe + reconcile（純関数）+ push、**act 無し**／`run_conductor(settings, project=, thread_id=, repo_dir=)` と `Set-TomlValue` 廃止／**inventory gate**（v0.2 item 4）／~~`gate_admission` を `HandoffKind.PR_REVIEW` の前に呼ぶ conductor wiring~~ → **RES-WIRING として P1 の外で実施済**（§17.1。§4.3 の裁定どおり P0-D0 に依存しなかったため、P1 の着手を待たずに配線した。P1 スレッドはこの項目を再実装しないこと） | P0-D0 |
 
 **inventory gate は proposer（Bohr）の仕事として P1 スレッドの初回ターンで着手する。** §6.4 が in-repo で読めるようになったので msg-2546 の deferral 理由は消えた。受け入れ条件:
 
@@ -638,7 +638,7 @@ board が動くまでの唯一の耐久面はこの設計書。∴ 「宣言し�
 | id | 内容 | 検出手段 | 昇格条件 | 状態 |
 |---|---|---|---|---|
 | **RES-CI-CLOCK-FALLBACK** | `observed = ∅` 時の待ち時計が `head_committed_date` に落ちるため、古い commit を今 push した head で R3 `ROUTE_HUMAN` の false-early 早鳴りが起こる（naysayer round-3 advisory）| **既に出荷済**: R3 escalation 文字列の `clock=commit`。observability は追加コード不要 | `clock=commit` の escalation が 1 件でも出たら、その時点の `push_age` を確認。`push_age < CAP_NOCLOCK` なら誤発火 → **設計ターンへ昇格**（Bohr → Einstein → 実装） | **deferred**（§17.2 参照） |
-| **RES-WIRING** | `gate_admission` の呼び出し元が存在しない。§5.2A の期待効果表（gate invocation ・ relay noise ・ 人の停止の削減）は未実現。今の production は依然として旧経路 | 呼び出し元数 = 0（`grep -r "gate_admission(" src/` が `def gate_admission` 以外 0 行） | 無し（**scheduled**、次の PR）。配線 PR は本文で `RES-WIRING` を名指しすること | scheduled |
+| **RES-WIRING** | `gate_admission` の呼び出し元が存在しない。§5.2A の期待効果表（gate invocation ・ relay noise ・ 人の停止の削減）は未実現。今の production は依然として旧経路 | 呼び出し元数 = 0（`grep -r "gate_admission(" src/` が `def gate_admission` 以外 0 行）→ **配線後は 1**（`conductor/core.py` の `Conductor._admit`）。production で配線が生きている観測物は 2 つ: ① `NEXT: pr-review` を踏むたび毎回出る `gate admission for <ref>: rule=<R> admission=<verdict>` の INFO ログ ② R4 のときだけ thread に残る `<!-- mindwire:ci-route v1 ... -->` マーカ（deferral は無記録ゆえ、赤 CI の routing だけが痕跡を残す） | 無し（**scheduled**、次の PR）。配線 PR は本文で `RES-WIRING` を名指しすること | **closed**（配線 PR で discharge。`nomination_is_self` の読み替え 1 件を deviation として PR 本文で開示。既定 ON で、rollup を読めなければ配線前の挙動に縮退する） |
 | **RES-A-GAP** | A landing（本設計の §5.2A `gate_admission`）〜 board 稼働の間、人の停止に集約可視面が無い（msg-2568 §C の期間限定 gap）| 無し（期間限定） | board 稼働で自動消滅 | 期限付き受容 |
 | **RES-GATE-PENDING-NO-REFIRE** | PR-gate が pending CI で保留するとき `NEXT: human` で終端し、再発火経路が無い。時間が答える問いで人を止める（実例: msg-2600, 2026-09-08。本設計スレッド自身の中で発生した D7 症状） | gate の `COMMENT (ci=pending)` msg の直後の `NEXT:` が `human` であること | 無し。board の `gate` → `waiting`（`waiting_on = {ci: <head>}`）＋ tick 再発火で自動消滅 | 期限付き受容（board 稼働で消滅） |
 
