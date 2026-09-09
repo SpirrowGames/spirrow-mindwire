@@ -1004,12 +1004,52 @@ class GitHubClient:
         (``_review_login``). Passing it through here keeps that field the single source of
         truth: the debounce, the round-cap, and the B-(a) marker all name the same identity,
         or none does. Hard-coding it here would let the two fall out of sync.
+
+        The inner :meth:`fetch_pr_reviews` call is cached per invocation on ``other_pr``
+        alone. In a stacked-PR shape (this method's primary target, msg-456 §R-B) many
+        commits in the reviewed PR reference the same parent PR; without this cache each
+        one would re-fetch that parent's review list (the N+1 pattern the naysayer flagged
+        on PR #245: msg-680 advisory + msg-692 objection). The cache is orthogonal to the
+        ``(sha, other_pr)`` output dedup — that key cannot elide the fetch because it
+        varies with ``sha``. A raised exception routes AWAY from the cache so a transient
+        outage on one commit does not silently poison the remaining commits' fetches for
+        the same parent (T-gate-firing-... §5 T2 acceptance ③④; Einstein msg-695 blocked
+        without this rule). Cache lifetime is the single call (T2 §5 ⑤) — a longer-lived
+        cache would judge fresh heads against stale review data, undoing exactly the
+        head-tied APPROVE invariant this method exposes.
         """
         try:
             commits = await self._list_pr_commits(pr)
             if not commits:
                 return []
             seen: set[tuple[str, PrRef]] = set()
+            # Per-invocation cache of the FETCHED review list, keyed on ``other_pr``
+            # alone. Different from ``seen`` above (which dedupes the OUTPUT rows on
+            # ``(sha, other_pr)`` to preserve cross-fork identity): this cache dedupes
+            # the INPUT — the ``fetch_pr_reviews(other_pr)`` HTTP call that ``seen``
+            # cannot elide because its key includes ``sha``. A stacked PR that pulls
+            # in N commits from the same parent would otherwise fetch that parent's
+            # review list N times (the N+1 pattern the naysayer flagged on PR #245:
+            # msg-680 advisory + msg-692 objection; T-gate-firing-... §5 T2).
+            #
+            # ⑤ Lifetime is bounded to this invocation. Not an instance attribute,
+            #    not a module-global, not a process-lifetime store — so a subsequent
+            #    fire on a different head cannot judge it against stale review data
+            #    (the head-tied APPROVE invariant this method exists to expose is the
+            #    same invariant a longer-lived cache would silently undermine: T2 §5 ⑤).
+            # ③ Only *successful* returns of ``fetch_pr_reviews`` land here. The
+            #    inner ``try`` below routes an exception away from the cache so a
+            #    transient 502 on the first commit does NOT poison the lookup for
+            #    every remaining commit that references the same ``other_pr`` — the
+            #    negative-cache trap Einstein msg-695 blocked T2 on. A future
+            #    non-exceptional failure (``fetch_pr_reviews`` is documented
+            #    fail-soft and returns ``[]``) is still cached as ``[]`` — that is a
+            #    conscious limit of this belt: caching failure states requires
+            #    ``fetch_pr_reviews`` to distinguish "no reviews" from "fetch
+            #    failed" at its own return signature, which is out of scope. The
+            #    correctness clause bites specifically on the raised-exception path
+            #    the outer ``except Exception`` was reachable from before.
+            reviews_cache: dict[PrRef, list[ReviewInfo]] = {}
             coverage: list[CrossPrApproveCoverage] = []
             for sha in commits:
                 candidates = await self._commit_pulls(pr.owner, pr.repo, sha)
@@ -1029,7 +1069,31 @@ class GitHubClient:
                     key = (sha, other_pr)
                     if key in seen:
                         continue
-                    reviews = await self.fetch_pr_reviews(other_pr)
+                    if other_pr in reviews_cache:
+                        reviews = reviews_cache[other_pr]
+                    else:
+                        try:
+                            reviews = await self.fetch_pr_reviews(other_pr)
+                        except Exception as inner_exc:
+                            # Do NOT cache. A later commit that references the same
+                            # ``other_pr`` must be free to retry (T2 §5 ③ / ④). The
+                            # outer ``except Exception`` below still stands as the
+                            # structural fail-open belt (msg-473 §5), but we cannot
+                            # let it fire *here* — that would fail the whole method
+                            # off a single transient outage on one commit's fetch,
+                            # exactly the silent-drop amplification msg-696 §1
+                            # named "the same pathology on the acquisition side".
+                            logger.warning(
+                                "fetch_pr_reviews(%s) raised inside "
+                                "find_cross_pr_head_bound_approves(%s); not caching "
+                                "so a subsequent commit referencing the same PR can "
+                                "retry: %s",
+                                other_pr.slug,
+                                pr.slug,
+                                inner_exc,
+                            )
+                            continue
+                        reviews_cache[other_pr] = reviews
                     for r in reviews:
                         if (
                             r.login == reviewer_login
