@@ -94,10 +94,10 @@ from ..value_objects import (
 )
 from .control import BASELINE_CONTROL_STATE, ControlState, LoopControl
 from .gate_records import (
+    RELAY_AUTHOR,
     ci_route_heads,
     normalize_sha,
     render_ci_route_marker,
-    render_relay_heading,
     verdict_heads,
 )
 from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, resolve_handoff
@@ -129,13 +129,14 @@ class PrGate(Protocol):
 
     The real :class:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator` satisfies this
     structurally; tests inject a fake. ``fire_pr_review`` runs the review synchronously
-    (CI-gate → Gemini judge → GitHub submit) and posts its critique to the
-    ``T-pr-review-<repo>-<n>`` thread; the conductor routes by the returned verdict.
+    (CI-gate → Gemini judge → GitHub submit), posts its critique to the
+    ``T-pr-review-<repo>-<n>`` ledger thread **and** relays the verdict into ``design_thread``;
+    the conductor routes by the returned verdict and dispatches on the returned relay message.
     """
 
     async def fire_pr_review(
-        self, *, project: str, pr_ref: str
-    ) -> tuple[ThreadRef, PrReviewOutcome]: ...
+        self, *, project: str, pr_ref: str, design_thread: str, implementer: str | None
+    ) -> tuple[ThreadRef, PrReviewOutcome, dict[str, Any]]: ...
 
 
 class CheckRollupSource(Protocol):
@@ -152,13 +153,6 @@ class CheckRollupSource(Protocol):
     """
 
     async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup | None: ...
-
-
-# The conductor authors its PR-gate verdict relay under this reserved name when it posts the Tier B
-# outcome back into the design thread (PR-2b-2). It is informational only — the conductor routes by
-# the deterministic fire_pr_review *verdict*, never by re-parsing this relay — so it is NOT a trust
-# marker: the gate trusts the driver outcome, not any author (msg-552/557).
-_PR_GATE_RELAY_AUTHOR = "pr-gate-relay"
 
 
 class StopReason(StrEnum):
@@ -768,61 +762,38 @@ class Conductor:
         return [m for m in messages if isinstance(m, dict)]
 
     async def _fire_pr_gate(self, pr_ref: str) -> tuple[ReviewEvent, dict[str, Any]]:
-        """Fire the Tier B naysayer review on ``pr_ref`` and relay its verdict (PR-2b-2).
+        """Fire the Tier B naysayer review on ``pr_ref`` and take back its verdict (PR-2b-2).
 
         Synchronous (ADR-19 N-1): the orchestrator runs the CI-gate + Gemini judge + GitHub
-        submit and posts its critique to the ``T-pr-review-<repo>-<n>`` thread; here the
-        conductor relays the verdict (with the critique body, so the implementer has its fix
-        context) into the design thread. Returns the verdict and the relay **message**, so the
-        implementer is dispatched on that relay event and sees the critique, not its own
-        pr-review trigger (Tier B msg-567 #1).
+        submit, posts its critique to the ``T-pr-review-<repo>-<n>`` ledger and relays the
+        verdict (with the critique body, so the implementer has its fix context) into the design
+        thread named here. The relay used to live in this class, which made the destination a
+        property of the *caller*: a hand-run driver held no design thread and silently relayed
+        nothing. Returns the verdict and the relay **message**, so the implementer is dispatched
+        on that relay event and sees the critique, not its own trigger (Tier B msg-567 #1).
         """
         assert self._orchestrator is not None
-        _thread_ref, outcome = await self._orchestrator.fire_pr_review(
-            project=self._thread_ref.project_id, pr_ref=pr_ref
+        _thread_ref, outcome, relay_msg = await self._orchestrator.fire_pr_review(
+            project=self._thread_ref.project_id,
+            pr_ref=pr_ref,
+            design_thread=self._thread_ref.thread_id,
+            implementer=self._implementer_identity,
         )
-        relay_msg = await self._post_pr_relay(pr_ref, outcome)
         return outcome.verdict, relay_msg
-
-    async def _post_pr_relay(self, pr_ref: str, outcome: PrReviewOutcome) -> dict[str, Any]:
-        """Post the PR-gate verdict (+ critique body) into the design thread as the relay author.
-
-        Informational only — the conductor has already chosen the route from ``outcome.verdict``;
-        this post is the human-readable record and the implementer's fix context on a RC. Its
-        ``NEXT:`` line mirrors the chosen route for readability but is never re-parsed by the
-        conductor (no author is trusted; msg-557). Returns the posted message as a dict so the
-        conductor can dispatch the implementer on it (Tier B msg-567 #1).
-
-        The heading now names the head SHA the gate reviewed
-        (:func:`~spirrow_mindwire.conductor.gate_records.render_relay_heading`). That is not
-        decoration: it is the whole of ``gate_admission``'s ``verdict_heads`` input, and without
-        it R6 cannot tell "a verdict exists on THIS head" from "a verdict exists on this PR",
-        which are different facts the moment the implementer pushes a fix. ``outcome.head_sha``
-        (the head the gate actually read) is used rather than the head admission observed a
-        moment earlier, so a push that lands between the two is recorded against the diff that
-        was really reviewed.
-        """
-        nxt = (
-            self._implementer_identity
-            if outcome.verdict is ReviewEvent.REQUEST_CHANGES and self._implementer_identity
-            else HUMAN_TOKEN
-        )
-        body = (
-            f"{render_relay_heading(pr_ref, outcome.head_sha)}\n\n"
-            f"VERDICT: {outcome.verdict.value} (ci={outcome.ci_state.value})\n\n"
-            f"{outcome.body}\n\n"
-            f"NEXT: {nxt}"
-        )
-        return await self._post_as_relay(body)
 
     async def _post_as_relay(self, body: str) -> dict[str, Any]:
         """Post ``body`` into the design thread under the reserved relay author.
 
-        Shared by all three conductor-authored PR-gate posts — the verdict relay, the R3/R5
-        admission escalation, and the R4 ci-route dispatch — because they need identical
-        handling of the one failure that is not an error: a design thread resolved out from
-        under an in-flight gate (W3). Writing that handling once is what keeps the three from
-        drifting into three different answers to the same question.
+        Shared by the two conductor-authored PR-gate posts — the R3/R5 admission escalation and
+        the R4 ci-route dispatch — because they need identical handling of the one failure that
+        is not an error: a design thread resolved out from under an in-flight gate (W3). Writing
+        that handling once is what keeps the two from drifting into two different answers to the
+        same question. The verdict relay is a third writer under the same author, but it lives
+        in :meth:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator._post_design_relay` —
+        "posting the verdict" is part of *firing* the gate, not of the conductor's own
+        record-keeping (T-pr-gate-relay-belongs-to-the-conductor D-1: no destination, no fire).
+        The single-definition author name shared with that writer is
+        :data:`~spirrow_mindwire.conductor.gate_records.RELAY_AUTHOR`.
         """
         try:
             result = await self._mcp.call_tool(
@@ -831,7 +802,7 @@ class Conductor:
                     "project": self._thread_ref.project_id,
                     "thread_id": self._thread_ref.thread_id,
                     "msg_type": "report",
-                    "author": _PR_GATE_RELAY_AUTHOR,
+                    "author": RELAY_AUTHOR,
                     "content": body,
                     # No ``role`` here, deliberately (D-1 sweep, T-dispatched-turn).
                     # The other two harness write paths now supply one; this relay does
@@ -849,22 +820,23 @@ class Conductor:
             # async-verdict race Einstein msg-531 Objection 2 named,
             # measured from the receiving side: a human resolved the design
             # thread while the PR-gate was still computing, and the relay
-            # has nowhere to land as a chatroom record. The verdict itself
-            # is not lost — the GitHub PR review submitted by the driver is
-            # the primary artifact (the reader on the PR page sees it
-            # regardless of what happened here). Of OBL-CHATROOM-PRODUCER-
-            # READER-SURFACE's three allowed surfaces that is **disposition
-            # (1)**, an alternative durable surface that reaches the intended
-            # reader. Named explicitly because the obligation's ``body``
-            # requires each producer to say WHICH of the three it took, and
-            # naming the reader and the surface without naming the number
-            # answers only two of the three things it asks for (Bohr msg-559
-            # MUST-A). The relay message this
-            # method returns is the conductor's internal dispatch event for
-            # the implementer, so returning a stub keeps that machinery on
-            # its normal path without a crash. Non-retryable (msg-536 W5),
-            # terminal for this thread; the refusal is never itself posted
-            # into a chatroom thread (msg-534 W4a).
+            # has nowhere to land as a chatroom record. The admission
+            # escalation / ci-route posts are the conductor's own
+            # observations of CI — a human summoned by R3 or R5 needs the
+            # reason on a durable surface; the R4 marker exists to key R5
+            # on the next tick. Of OBL-CHATROOM-PRODUCER-READER-SURFACE's
+            # three allowed surfaces this is **disposition (3)**: fail
+            # loudly (log warning) and return a stub so the caller reads
+            # the empty ``msg_id`` as "the record did not land". Non-
+            # retryable (msg-536 W5), terminal for this thread; the
+            # refusal is never itself posted into a chatroom thread
+            # (msg-534 W4a). Duplicating this handling here — instead of
+            # sharing one helper with ``_post_design_relay`` — is the
+            # accepted cost of the split: two files' worth of "handle a
+            # dropped relay" is a Principle-2 hybrid, but merging them
+            # would put the writer of the *verdict* back in this module,
+            # which is exactly what T-pr-gate-relay-belongs-to-the-
+            # conductor's D-1 rules out (msg-2836 §advisory objection).
             logger.warning(
                 "pr-gate design-thread relay dropped (thread %r resolved): %s. "
                 "GitHub PR review is the primary artifact and still stands; "
@@ -874,12 +846,14 @@ class Conductor:
             )
             return {
                 "msg_id": "",
-                "author": _PR_GATE_RELAY_AUTHOR,
+                "author": RELAY_AUTHOR,
                 "content": body,
             }
+        msg = result.get("msg") if isinstance(result, dict) else None
+        msg_id = str(msg.get("msg_id") or "") if isinstance(msg, dict) else ""
         return {
-            "msg_id": _extract_relay_msg_id(result) or "",
-            "author": _PR_GATE_RELAY_AUTHOR,
+            "msg_id": msg_id,
+            "author": RELAY_AUTHOR,
             "content": body,
         }
 
@@ -902,13 +876,15 @@ class Conductor:
 
         The parameter is documented as "``True`` if the latest ``NEXT: pr-review <ref>`` was
         authored by the conductor's own pr-gate-relay". Taken as a literal predicate at THIS
-        call site it is a constant ``False``, and the measurement is one line:
-        :meth:`_post_pr_relay` — the only place the relay author writes anything — emits a
-        ``NEXT:`` naming the implementer or the human, never ``pr-review``. So the conductor
-        cannot self-nominate, no message the relay author writes can carry a pr-review handoff,
-        and a literal reading sends **every** admission through R0-OVERRIDE to INVOKE. That is
-        not a conservative wiring; it is a no-op wearing one, and it would close RES-WIRING while
-        leaving §5.2A.7's entire expected effect unrealised.
+        call site it is a constant ``False``, and the measurement is one line: the three writers
+        that post under :data:`RELAY_AUTHOR` — the verdict relay in
+        :meth:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator._post_design_relay`,
+        :meth:`_post_admission_escalation`, and :meth:`_post_ci_route` — each emit a ``NEXT:``
+        naming the implementer or the human, never ``pr-review``. So the relay author cannot
+        self-nominate, no message it writes can carry a pr-review handoff, and a literal reading
+        sends **every** admission through R0-OVERRIDE to INVOKE. That is not a conservative
+        wiring; it is a no-op wearing one, and it would close RES-WIRING while leaving §5.2A.7's
+        entire expected effect unrealised.
 
         What R0-OVERRIDE is FOR is stated in its own rationale: a human summoned by R3 or R5 must
         be able to break the escalation loop by re-writing the handoff by hand (PR-review
@@ -939,7 +915,7 @@ class Conductor:
                 pr.slug,
             )
             return None
-        relay_bodies = [_content(msg) for msg in messages if _author(msg) == _PR_GATE_RELAY_AUTHOR]
+        relay_bodies = [_content(msg) for msg in messages if _author(msg) == RELAY_AUTHOR]
         decision = gate_admission(
             rollup=rollup.rows,
             head_sha=normalize_sha(rollup.head_sha),
@@ -1063,15 +1039,6 @@ class Conductor:
             forced_naysayer_turns=forced,
             forced_naysayer_turns_saveable=forced_saveable,
         )
-
-
-def _extract_relay_msg_id(result: Any) -> str | None:
-    """The msg_id of the conductor's own ``chatroom_post_message`` relay result, or ``None``."""
-    if isinstance(result, dict):
-        msg = result.get("msg")
-        if isinstance(msg, dict) and msg.get("msg_id"):
-            return str(msg["msg_id"])
-    return None
 
 
 def _msg_id(msg: dict[str, Any]) -> str:
