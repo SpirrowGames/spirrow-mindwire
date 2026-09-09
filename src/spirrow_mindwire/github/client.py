@@ -214,6 +214,27 @@ class ReviewInfo:
 
 
 @dataclass(frozen=True)
+class CrossPrApproveCoverage:
+    """A commit in this PR's diff already carries a head-bound APPROVE on another PR.
+
+    B-(a) accountability marker (msg-473 §5 / msg-475 §5 / msg-478 §0): the driver
+    stamps these onto the review-request body so the naysayer *sees* which commits
+    were already adjudicated. It is a marker for ARCHIVE-side accountability
+    (msg-473 §3 — "(a) は enforcement を買わない。accountability を買う"), NOT a
+    procedural constraint on the verdict.
+
+    ``sha`` is a commit sha that is BOTH (i) part of the reviewed PR's diff range
+    AND (ii) the exact head sha that another PR's APPROVE was submitted against.
+    ``other_pr`` is that other PR (never the reviewed PR itself). ``approved_at``
+    is the ``submitted_at`` of the APPROVE, retained so a reader can order events.
+    """
+
+    sha: str
+    other_pr: PrRef
+    approved_at: str | None
+
+
+@dataclass(frozen=True)
 class CheckRollup:
     """The four facts :func:`~spirrow_mindwire.gate_admission.gate_admission` needs about a head.
 
@@ -402,6 +423,10 @@ class GitHubReviewClient(Protocol):
     async def submit_review(
         self, pr: PrRef, *, event: ReviewEvent, body: str
     ) -> dict[str, Any]: ...
+
+    async def find_cross_pr_head_bound_approves(
+        self, pr: PrRef, *, reviewer_login: str
+    ) -> list[CrossPrApproveCoverage]: ...
 
     async def aclose(self) -> None: ...
 
@@ -927,6 +952,206 @@ class GitHubClient:
             page += 1
         return out
 
+    async def find_cross_pr_head_bound_approves(
+        self, pr: PrRef, *, reviewer_login: str
+    ) -> list[CrossPrApproveCoverage]:
+        """Which commits in ``pr``'s diff are covered by another PR's head-bound APPROVE.
+
+        B-(a) marker resolution (msg-475 §2: "この計測は resolution ロジックの feasibility spike
+        そのもの" — the same read-only API path the pre-implementation measurement proved out).
+
+        For each commit sha in ``pr``'s commit list, ask GitHub which OTHER PRs the commit
+        appears in (``GET /repos/{owner}/{repo}/commits/{sha}/pulls``). For each candidate PR
+        that is NOT ``pr`` itself, fetch its reviews (:meth:`fetch_pr_reviews`) and keep only
+        the ones where ``login == reviewer_login``, ``state == "APPROVED"`` and
+        ``commit_id == sha`` — the head-bound rule (msg-456 §R-B: "``commit_id=17fbcd6`` = その
+        内容自身の head に紐づいている"). Anything else (an APPROVE against a DIFFERENT head,
+        or an APPROVE by a different reviewer) is not a head-bound APPROVE and does not count.
+
+        Fail-soft: any network / non-2xx / parse failure on any of the underlying reads is
+        logged and treated as "no coverage found". The whole method returns ``[]`` when the
+        driver should fire without the marker (msg-473 §5 fail-open: "解決に失敗したら marker
+        無しで撃つ (defer しない)"). It does NOT raise — that would let a transient GitHub
+        outage stop the gate from firing at all, which the fail-open rule forbids.
+
+        The no-raise guarantee is **structural**, not just a property inherited from the
+        callees. Every underlying read this method makes (``_list_pr_commits``,
+        ``_commit_pulls``, :meth:`fetch_pr_reviews`) is *documented* fail-soft today, and
+        an outer ``except Exception`` still wraps the loop so the promise the docstring
+        makes holds even if one of the dependencies later regresses to raising — a
+        regression this method's caller (:class:`~spirrow_mindwire.naysayer.pr_review
+        .NaysayerPrReviewDriver.review`) already backstops with its own ``except`` for
+        the same reason (msg-473 §5), but two independent guards on the fail-open
+        contract is what the naysayer PR-gate on PR #245 asked to see. Pinned by
+        ``test_find_cross_pr_head_bound_approves_never_raises_on_dependency_failure``.
+
+        Ordering: results are deduplicated on ``(sha, other_pr)`` — the FULL
+        :class:`PrRef` (owner + repo + number), not just the number — and returned in
+        the traversal order of ``pr``'s commit list. GitHub's ``commits/{sha}/pulls``
+        returns cross-fork associations, so PR #42 from the upstream repo and PR #42
+        from a fork are two different rows that can share the same commit sha; a
+        number-only key would collide those two into one. ``PrRef`` is a frozen
+        dataclass ∴ hashable, so the tuple is a valid ``set`` element without extra
+        canonicalisation. Duplicate suppression matters because the same sha can appear
+        in the PR's commit list twice under an unusual merge topology, and the same
+        OTHER PR can carry more than one APPROVE against the same head (e.g. a
+        re-review + a debounce reuse); we want the marker to point at the *fact* of
+        prior approval, not to list it four times. Pinned by
+        ``test_find_cross_pr_head_bound_approves_dedup_across_forks``.
+
+        ``reviewer_login`` is a parameter (not a module constant) because the caller — the
+        driver — already owns the naysayer login for the debounce reuse path
+        (``_review_login``). Passing it through here keeps that field the single source of
+        truth: the debounce, the round-cap, and the B-(a) marker all name the same identity,
+        or none does. Hard-coding it here would let the two fall out of sync.
+        """
+        try:
+            commits = await self._list_pr_commits(pr)
+            if not commits:
+                return []
+            seen: set[tuple[str, PrRef]] = set()
+            coverage: list[CrossPrApproveCoverage] = []
+            for sha in commits:
+                candidates = await self._commit_pulls(pr.owner, pr.repo, sha)
+                for other_pr in candidates:
+                    # Same-PR self-reference never counts as cross-PR coverage.
+                    # ``other_pr`` may still have a different (owner, repo) — GitHub
+                    # returns cross-fork associations — but we compare on
+                    # ``(owner, repo, number)`` via the frozen dataclass equality,
+                    # and the same-PR case is exactly what msg-478 §3's "自 PR は覆
+                    # いにしない" spelled out.
+                    if (
+                        other_pr.number == pr.number
+                        and other_pr.owner.lower() == pr.owner.lower()
+                        and other_pr.repo.lower() == pr.repo.lower()
+                    ):
+                        continue
+                    key = (sha, other_pr)
+                    if key in seen:
+                        continue
+                    reviews = await self.fetch_pr_reviews(other_pr)
+                    for r in reviews:
+                        if (
+                            r.login == reviewer_login
+                            and r.state == "APPROVED"
+                            and r.commit_id == sha
+                        ):
+                            coverage.append(
+                                CrossPrApproveCoverage(
+                                    sha=sha, other_pr=other_pr, approved_at=r.submitted_at
+                                )
+                            )
+                            seen.add(key)
+                            break
+            return coverage
+        except Exception as exc:
+            # Structural fail-open belt: the callees are already fail-soft, but keeping
+            # this outer catch means the docstring's "does NOT raise" promise holds
+            # regardless of whether a future refactor changes a dependency's failure
+            # policy (naysayer PR-gate on PR #245 correctness objection). ``Exception``
+            # (not ``BaseException``) so ``KeyboardInterrupt`` / ``SystemExit`` /
+            # ``asyncio.CancelledError`` still propagate as expected.
+            logger.warning(
+                "find_cross_pr_head_bound_approves(%s) raised unexpectedly: %s (fail-open [])",
+                pr.slug,
+                exc,
+            )
+            return []
+
+    async def _list_pr_commits(self, pr: PrRef) -> list[str]:
+        """``GET /repos/{owner}/{repo}/pulls/{n}/commits`` → shas in PR order (paginated).
+
+        Fail-soft: any failure returns ``[]``. The caller (B-(a) marker resolution) treats an
+        empty list as "no coverage" and fires without the marker, which is the correct
+        fail-open behaviour — the marker is accountability, not a gate.
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/commits"
+        out: list[str] = []
+        page = 1
+        while True:
+            try:
+                resp = await self._client.get(path, params={"per_page": 100, "page": page})
+            except httpx.RequestError as exc:
+                logger.warning("_list_pr_commits: GET %s failed: %s (fail-soft [])", path, exc)
+                return []
+            if resp.status_code >= 400:
+                logger.warning(
+                    "_list_pr_commits: GET %s -> %s (fail-soft [])", path, resp.status_code
+                )
+                return []
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                logger.warning("_list_pr_commits: malformed JSON: %s (fail-soft [])", exc)
+                return []
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                sha = row.get("sha")
+                if isinstance(sha, str) and sha:
+                    out.append(sha)
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
+    async def _commit_pulls(self, owner: str, repo: str, sha: str) -> list[PrRef]:
+        """``GET /repos/{owner}/{repo}/commits/{sha}/pulls`` → PRs the commit appears in.
+
+        Requires ``Accept: application/vnd.github.groot-preview+json`` on older GitHub API
+        versions; the ``vnd.github+json`` we send by default already includes this data on
+        current versions, so no extra header is needed. Paginated (usually one page — a
+        commit rarely appears in many PRs).
+
+        Fail-soft: any failure returns ``[]`` (same reasoning as :meth:`_list_pr_commits`).
+        Cross-owner / cross-repo results (a fork's PR against this repo, seen for a shared
+        commit) are preserved verbatim as :class:`PrRef` values — the caller compares on
+        ``(owner, repo, number)`` so a foreign PR APPROVE remains identifiable.
+        """
+        path = f"/repos/{owner}/{repo}/commits/{sha}/pulls"
+        out: list[PrRef] = []
+        page = 1
+        while True:
+            try:
+                resp = await self._client.get(path, params={"per_page": 100, "page": page})
+            except httpx.RequestError as exc:
+                logger.warning("_commit_pulls: GET %s failed: %s (fail-soft [])", path, exc)
+                return []
+            if resp.status_code >= 400:
+                logger.warning("_commit_pulls: GET %s -> %s (fail-soft [])", path, resp.status_code)
+                return []
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                logger.warning("_commit_pulls: malformed JSON: %s (fail-soft [])", exc)
+                return []
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                number = row.get("number")
+                base = row.get("base") or {}
+                base_repo = base.get("repo") if isinstance(base, dict) else None
+                if not isinstance(base_repo, dict):
+                    continue
+                repo_name = base_repo.get("name")
+                owner_data = base_repo.get("owner") or {}
+                owner_login = owner_data.get("login") if isinstance(owner_data, dict) else None
+                if not isinstance(number, int) or number <= 0:
+                    continue
+                if not isinstance(repo_name, str) or not repo_name:
+                    continue
+                if not isinstance(owner_login, str) or not owner_login:
+                    continue
+                out.append(PrRef(owner=owner_login, repo=repo_name, number=number))
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event."""
         path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
@@ -1050,6 +1275,7 @@ def _error_detail(resp: httpx.Response) -> str:
 __all__ = [
     "CiState",
     "CiStatus",
+    "CrossPrApproveCoverage",
     "GitHubClient",
     "GitHubError",
     "GitHubHTTPError",

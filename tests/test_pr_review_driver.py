@@ -18,6 +18,7 @@ import pytest
 from spirrow_mindwire.github.client import (
     CiState,
     CiStatus,
+    CrossPrApproveCoverage,
     GitHubClient,
     GitHubHTTPError,
     PrRef,
@@ -52,7 +53,9 @@ from spirrow_mindwire.naysayer.pr_review import (
     ObjectionMissingReason,
     ObjectionParse,
     PostCritique,
+    _build_messages,
     _ci_gate_response,
+    _format_b_a_marker,
     _nesting_exceeds,
     _parse_model_verdict,
     decide_verdict,
@@ -115,14 +118,19 @@ class _FakeGitHub:
         submit_exc: Exception | None = None,
         ci: CiStatus | None = None,
         reviews: list[ReviewInfo] | None = None,
+        coverage: list[CrossPrApproveCoverage] | None = None,
+        coverage_exc: Exception | None = None,
     ) -> None:
         self._diff = diff
         self._fetch_exc = fetch_exc
         self._submit_exc = submit_exc
         self._ci = ci if ci is not None else CiStatus(CiState.SUCCESS, "sha-default", [])
         self._reviews = list(reviews) if reviews is not None else []
+        self._coverage = list(coverage) if coverage is not None else []
+        self._coverage_exc = coverage_exc
         self.fetched: list[PrRef] = []
         self.submitted: list[tuple[PrRef, ReviewEvent, str]] = []
+        self.coverage_requested: list[tuple[PrRef, str]] = []
 
     async def fetch_pr_diff(self, pr: PrRef) -> str:
         self.fetched.append(pr)
@@ -135,6 +143,14 @@ class _FakeGitHub:
 
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
         return list(self._reviews)
+
+    async def find_cross_pr_head_bound_approves(
+        self, pr: PrRef, *, reviewer_login: str
+    ) -> list[CrossPrApproveCoverage]:
+        self.coverage_requested.append((pr, reviewer_login))
+        if self._coverage_exc is not None:
+            raise self._coverage_exc
+        return list(self._coverage)
 
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         # Model the same-identity 422: the verdict event fails, but a COMMENT review (the
@@ -391,6 +407,205 @@ async def test_ambiguous_verdict_defaults_to_request_changes() -> None:
     driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
     await driver.review(_pr(), post_critique=post)
     assert github.submitted[0][1] is ReviewEvent.REQUEST_CHANGES
+
+
+# ---------- B-(a) accountability marker (msg-473 §5 / msg-475 §5) ---------- #
+#
+# The stacked-PR scenario msg-456 §R-B named: PR #21's diff on ``main`` included the four
+# commits already merged in PR #19, whose head-bound APPROVE the gate never saw. The
+# driver now resolves cross-PR head-bound APPROVE coverage and stamps a marker onto the
+# pass-1 user prompt so the naysayer sees which commits are covered. The marker buys
+# archive-side accountability (msg-473 §3), not enforcement — the naysayer stays free
+# to object.
+
+
+def test_format_b_a_marker_empty_returns_empty_string() -> None:
+    """No coverage → no marker section. The prompt shape is byte-identical to the pre-B-(a)
+    form (T1 anti-tautology on the fail-open / no-coverage branch).
+    """
+    assert _format_b_a_marker([]) == ""
+
+
+def test_format_b_a_marker_names_each_commit_pr_and_time() -> None:
+    """A non-empty marker lists ``sha[:12] approved in owner/repo#n at <time>`` per row.
+
+    The clause names the msg-473 §5 references so a reader can navigate from the review
+    body back to the spec, and it does NOT instruct the naysayer what verdict to reach —
+    that would violate the msg-473 §4 "自然言語は defer 決定にしか使わない" invariant from
+    the driver-input side.
+    """
+    coverage = [
+        CrossPrApproveCoverage(
+            sha="8ea546ae57f3738ce2d8f60241df2ae7a43d1fe2",
+            other_pr=PrRef("SpirrowGames", "spirrow-conclair", 19),
+            approved_at="2026-09-07T04:51:05Z",
+        ),
+        CrossPrApproveCoverage(
+            sha="17fbcd6dabcdef0123456789abcdef0123456789",
+            other_pr=PrRef("SpirrowGames", "spirrow-conclair", 20),
+            approved_at="2026-09-07T09:12:01Z",
+        ),
+    ]
+    marker = _format_b_a_marker(coverage)
+    # References msg-473 §5 (the accountability rule), not the reader's spec knowledge.
+    assert "msg-473 §5 B-(a)" in marker
+    assert "accountability" in marker
+    assert "8ea546ae57f3" in marker  # short sha
+    assert "SpirrowGames/spirrow-conclair#19" in marker
+    assert "2026-09-07T04:51:05Z" in marker
+    assert "17fbcd6dabcd" in marker
+    assert "SpirrowGames/spirrow-conclair#20" in marker
+    # No verdict directive — the marker informs, not procedurally constrains (msg-473 §4).
+    lowered = marker.lower()
+    assert "you must approve" not in lowered
+    assert "you must reject" not in lowered
+    assert "you must request_changes" not in lowered
+
+
+def test_build_messages_omits_marker_when_no_coverage() -> None:
+    """Empty ``coverage`` → the user prompt is the pre-B-(a) shape (no marker section).
+
+    This is the fail-open / no-hit path that the driver defaults to when the lookup
+    returns nothing or the client fails. Coverage of this branch also protects against
+    the ``coverage=None`` default silently activating some other behaviour.
+    """
+    messages_none = _build_messages("some diff", "acme/widgets#42")
+    messages_empty = _build_messages("some diff", "acme/widgets#42", coverage=[])
+    assert messages_none == messages_empty
+    user = messages_none[1].content
+    assert "B-(a)" not in user
+    assert "Prior-verdict coverage" not in user
+    assert "```diff\nsome diff\n```" in user
+
+
+def test_build_messages_inserts_marker_before_diff_fence() -> None:
+    """Non-empty ``coverage`` → the marker appears BEFORE the ``` diff fence.
+
+    Position matters: the naysayer reads top-to-bottom, and placing the marker after the
+    diff would make it competing footer text rather than context for the review. The
+    diff fence still parses cleanly.
+    """
+    coverage = [
+        CrossPrApproveCoverage(
+            sha="abc123def456",
+            other_pr=PrRef("SpirrowGames", "spirrow-conclair", 19),
+            approved_at="2026-09-07T04:51:05Z",
+        )
+    ]
+    messages = _build_messages("some diff", "acme/widgets#42", coverage=coverage)
+    user = messages[1].content
+    marker_pos = user.find("Prior-verdict coverage")
+    fence_pos = user.find("```diff")
+    assert marker_pos != -1  # marker present
+    assert fence_pos != -1  # diff fence present
+    assert marker_pos < fence_pos  # marker sits BEFORE the diff
+
+
+@pytest.mark.anyio
+async def test_driver_requests_coverage_with_review_login() -> None:
+    """The driver passes its ``_review_login`` down to ``find_cross_pr_head_bound_approves``.
+
+    Same field feeds the debounce reuse, the round-cap, and B-(a): one identity source of
+    truth. A custom ``review_login`` argument to the driver must propagate to the coverage
+    lookup so all three read the same identity (msg-475 §5 fail-open + one SoT).
+    """
+    lexora = _FakeLexora(content="ok\n\nVERDICT: APPROVE")
+    github = _FakeGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, review_login="custom-reviewer")
+    await driver.review(_pr(), post_critique=post)
+    assert github.coverage_requested == [(_pr(), "custom-reviewer")]
+
+
+@pytest.mark.anyio
+async def test_driver_stamps_marker_when_coverage_non_empty() -> None:
+    """The pass-1 user prompt carries the marker when coverage resolves.
+
+    Asserts against the pass-1 call (largest ``max_tokens`` — pass 2 is the small-JSON
+    ADR-pointer call). Marker-side vs verdict-side stay coupled through the driver so a
+    silent drift between "what the lookup returned" and "what pass 1 saw" would red the
+    assertion.
+    """
+    coverage = [
+        CrossPrApproveCoverage(
+            sha="8ea546ae57f3738ce2d8f60241df2ae7a43d1fe2",
+            other_pr=PrRef("SpirrowGames", "spirrow-conclair", 19),
+            approved_at="2026-09-07T04:51:05Z",
+        )
+    ]
+    lexora = _FakeLexora(content="ok\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(coverage=coverage)
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    await driver.review(_pr(), post_critique=post)
+
+    _model, messages, _max = max(lexora.calls, key=lambda call: call[2])
+    user = messages[1].content
+    assert "Prior-verdict coverage" in user
+    assert "SpirrowGames/spirrow-conclair#19" in user
+    assert "8ea546ae57f3" in user
+
+
+@pytest.mark.anyio
+async def test_driver_omits_marker_when_coverage_empty() -> None:
+    """Empty coverage list → the pass-1 user prompt shows no marker (T1 opposite pole).
+
+    Paired with :func:`test_driver_stamps_marker_when_coverage_non_empty` so drift on
+    EITHER side (silently adding the marker when there is no coverage, or silently
+    dropping it when there is) reds a test.
+    """
+    lexora = _FakeLexora(content="ok\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(coverage=[])
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    await driver.review(_pr(), post_critique=post)
+
+    _model, messages, _max = max(lexora.calls, key=lambda call: call[2])
+    user = messages[1].content
+    assert "Prior-verdict coverage" not in user
+    assert "B-(a)" not in user
+    # The review still fired — B-(a) fail-open never gates the fire itself.
+    assert github.submitted != []
+
+
+@pytest.mark.anyio
+async def test_driver_fires_without_marker_when_coverage_lookup_raises() -> None:
+    """msg-473 §5 fail-open: any exception on the coverage lookup → fire without marker.
+
+    A GitHub outage on the B-(a) endpoint must NOT stop the naysayer from reviewing the
+    PR. The lookup failure is logged (verified via caplog) and the review proceeds with
+    an empty coverage list — the pass-1 prompt has no marker section, and a verdict is
+    still submitted.
+    """
+    lexora = _FakeLexora(content="ok\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(coverage_exc=GitHubHTTPError("boom", status_code=503))
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    _model, messages, _max = max(lexora.calls, key=lambda call: call[2])
+    user = messages[1].content
+    assert "Prior-verdict coverage" not in user
+    # Fire happened despite the coverage lookup exception (fail-open).
+    assert outcome.verdict is ReviewEvent.APPROVE
+    assert github.submitted != []
+
+
+@pytest.mark.anyio
+async def test_ci_gate_short_circuit_skips_coverage_lookup() -> None:
+    """When CI is not green the L1 CI-gate short-circuits BEFORE B-(a) — no lookup happens.
+
+    The marker is scoped to the content review path (pass 1 to the model). A CI-gate
+    hold posts a fixed short-circuit body without a model call, so there is no user
+    prompt to enrich; running the (paid, network-bound) coverage lookup on that path
+    would waste API calls with nothing to attach them to.
+    """
+    lexora = _FakeLexora()
+    github = _FakeGitHub(ci=CiStatus(CiState.FAILURE, "sha1", ["test"]))
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    await driver.review(_pr(), post_critique=post)
+    assert github.coverage_requested == []  # CI-gate short-circuit → no B-(a) lookup
 
 
 @pytest.mark.anyio

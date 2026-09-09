@@ -149,6 +149,14 @@ class _FakeGitHub:
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
         return list(self._reviews)
 
+    async def find_cross_pr_head_bound_approves(
+        self, pr: PrRef, *, reviewer_login: str
+    ) -> list[Any]:
+        # ADR-pointer tests never exercise B-(a) coverage; return empty (the fail-open
+        # baseline). Kept structurally compatible with GitHubReviewClient so the driver
+        # still ticks its coverage lookup without side effects here.
+        return []
+
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         self.submitted.append((pr, event, body))
         return {"id": 1, "state": event.value}

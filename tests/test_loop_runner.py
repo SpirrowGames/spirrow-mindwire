@@ -265,6 +265,9 @@ class _FakeGitHub:
     async def fetch_pr_reviews(self, pr: Any) -> Any:
         raise AssertionError("not called")
 
+    async def find_cross_pr_head_bound_approves(self, pr: Any, *, reviewer_login: str) -> Any:
+        raise AssertionError("not called")
+
     async def submit_review(self, pr: Any, *, event: Any, body: str) -> Any:
         raise AssertionError("not called")
 
