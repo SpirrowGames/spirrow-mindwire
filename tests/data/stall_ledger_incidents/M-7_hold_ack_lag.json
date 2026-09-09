@@ -19,6 +19,12 @@
     }
   },
   "expected_verdict": "not-representable",
-  "not_representable_reason": "Schema-layer residual (Bohr msg-2831 §3(a), Einstein msg-2749 §5). UnitKind enumerates only {pr, thread, quarantine}; there is no unit kind that carries the (desired_at, observed_at) pair a hold's incident is defined by. Unlike M-5 / M-6 the residual is not primarily granularity or consumer — it is that the ledger's kind registry has no shape at all in which to construct 'the incident' vs. 'a valid wait'. The collision pin therefore takes a different form: test_m7_collision_pin_no_hold_kind_in_registry asserts the ABSENCE of a hold-carrying kind, and reds the day one is added — that day is the mechanical trigger for revisiting this fixture.",
+  "not_representable_reason": "Schema-layer residual (Bohr msg-2831 §3(a), Einstein msg-2749 §5). UnitKind enumerates only {pr, thread, quarantine}; there is no unit kind that carries the (desired_at, observed_at) pair a hold's incident is defined by. Unlike M-5 / M-6 the residual is not primarily granularity or consumer — it is that the ledger's kind registry has no shape at all in which to construct 'the incident' vs. 'a valid wait'. The collision pin therefore takes a different form: test_m7_collision_pin_no_hold_kind_in_registry holds the UnitKind registry to the exact set {pr, thread, quarantine}, so it reds the day ANY kind is added, removed or renamed — regardless of spelling. That day is the mechanical trigger for revisiting this fixture.",
+  "residual": {
+    "receipt_thread": "T-hold-ack-lands-only-as-a-side-effect-of-launching",
+    "missing_layers": [
+      "schema: UnitKind enumerates only {pr, thread, quarantine}; no unit kind carries a (desired_at, observed_at) pair — the shape a hold's incident is defined by"
+    ]
+  },
   "notes": "Bohr msg-2744 §1 measured a 18m09s gap between desired_at (when the hold was requested) and observed_at (when it took effect on the running loop); Einstein msg-2749 §1 independently reproduced the same numbers from origin/main = b0b1829. The fixture records the residual only — the incident's fix lives on a different design thread and is not scoped here."
 }

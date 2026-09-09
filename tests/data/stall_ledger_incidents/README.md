@@ -55,21 +55,37 @@ schema's capabilities — corrected in PR-gate round 6 (msg-2708).
 (added under Bohr msg-2833 §3 D-12″). Their `not_representable_reason`
 fields carry the three-layer residual (schema / granularity / consumer)
 established by Einstein E-9 / E-10 in msg-2749, and their absence from
-predicate coverage is declared machine-readably in the
-`_KNOWN_UNCOVERED_KINDS` allowlist in the backtest suite. Each fixture is
-paired with a running "collision pin" test that constructs the incident
-and its valid-wait counterexample and asserts the v1 schema cannot
-distinguish them — the pin reds the day a schema change lets it, at which
-point the fixture's not-representable claim is due to be revisited.
+predicate coverage is declared machine-readably in each fixture's own
+`residual` object (`receipt_thread` + `missing_layers`). The backtest holds
+the biconditional "a fixture carries a `residual` IFF its `expected_verdict`
+is `not-representable`", so the record cannot be omitted when the fixture is
+added, and must be deleted the day the fixture becomes representable.
+
+An earlier form declared this in a per-KIND `_KNOWN_UNCOVERED_KINDS`
+allowlist in the backtest suite. That was replaced (Bohr msg-2853 §2) because
+M-5 and M-6 share `"kind": "thread"`: a single entry served both, described
+only M-5, and routed M-6 to the wrong receipt thread. Worse, making M-5
+representable forced the deletion of that shared entry, silently absorbing
+M-6's still-open gap while the suite went green. Keyed per incident, that is
+unrepresentable — the two records are separate objects in separate files.
+
+Each fixture is also paired with a running "collision pin" test that
+constructs the incident and its valid-wait counterexample and asserts the v1
+schema cannot distinguish them. The pin's trigger is the SCHEMA (the
+`ThreadState` field set for M-5 / M-6, the `UnitKind` registry for M-7), not
+the equivalence of two constructed instances — an instance comparison is
+blind to an optional field with a default, which is how a trigger claimed by
+two docstrings measured green across the whole suite at e1de998 (PR-gate
+msg-2851 objection 1).
 
 Fixture reason fields are restricted to **structural / mechanical residual
 descriptions** (Einstein msg-2832 ADVISORY, Bohr msg-2833 §2). Project-
 management state such as "no design thread owns this fix yet" is NEVER
 written into a fixture — it belongs on the chatroom design thread only,
-where it does not go stale when the code has not changed. The
-`_KNOWN_UNCOVERED_KINDS` allowlist follows the same rule: it names the
-receipt thread a schema fix would arrive on (a mechanical routing
-dependency), not the ownership state of the fix itself.
+where it does not go stale when the code has not changed. The `residual`
+object follows the same rule: it names the receipt thread a schema fix would
+arrive on (a mechanical routing dependency), not the ownership state of the
+fix itself.
 
 ## What the backtest asserts
 
@@ -79,9 +95,12 @@ loads every JSON in this directory and asserts one of:
   * `expected_verdict == "stall"` → the classifier / predicate returns a
     stall for `predicate_input`.
   * `expected_verdict == "not-stall"` → the classifier returns not-stall.
-  * `expected_verdict == "not-representable"` → the reason is recorded and
-    the test asserts nothing about the classifier's output (the fixture is
-    a documentation artifact for the residual, not a mechanical check).
+  * `expected_verdict == "not-representable"` → the backtest asserts nothing
+    about the classifier's output (there is no input for it to consume), but
+    the fixture is NOT merely documentation: it must carry a
+    `not_representable_reason` and a well-formed `residual`, and its paired
+    collision pin runs on every suite invocation and reds when the schema
+    grows the layer the fixture is waiting on.
 
 The rule for adding a new fixture: capture what you actually saw, not what
 you think the detector should have seen. A fixture assembled from memory
