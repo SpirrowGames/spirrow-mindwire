@@ -310,20 +310,25 @@ class PrReviewOrchestrator:
         call site: an unusable id must cost nothing, whereas failing after ``driver.review``
         throws away a paid-for Gemini judgement and an irreversible GitHub review.
 
-        The ledger check is a **grammar**, not ``startswith(self._thread_prefix)``:
-        ``T-pr-review-threads-outlive-their-prs`` is a live design thread in the sweep list and a
-        prefix test would refuse it. Every ledger id this class mints ends in the PR number
-        (:func:`_qualified_thread_id` / :func:`_legacy_thread_id`), so "ends in digits" separates
-        the two without that false positive.
+        The ledger check is a **grammar**, not ``startswith(self._thread_prefix)``. Measured over
+        every chatroom thread (msg-2772: 667 threads, 17 projects, all statuses), 354 ids match
+        the grammar and **all 354 are ledgers**; legitimate design threads matching it: **0**.
+        ``startswith`` instead refuses two live design threads --
+        ``T-pr-review-threads-outlive-their-prs`` and ``T-pr-review-thread-id-not-repo-qualified``.
+        Judging by whether the opener names a PR ref refuses *this* thread, whose opener msg-2748
+        cites ``SpirrowGames/spirrow-mindwire#235``. Every ledger id this class mints ends in
+        the PR number (:func:`_qualified_thread_id` / :func:`_legacy_thread_id`), hence digits.
         """
         if not design_thread.strip():
             raise ValueError("design_thread is required: the PR-gate relay has no destination")
         if re.fullmatch(rf"{re.escape(self._thread_prefix)}(?:.*-)?\d+", design_thread):
             raise ValueError(
-                f"design_thread {design_thread!r} is a PR-review LEDGER id, not a design thread. "
-                "The critique already goes to the ledger; the design thread is the one this gate "
-                "was fired from. scripts/naysayer_review.py prints the ledger id, so it is the "
-                "easiest wrong value to reach for."
+                f"design_thread {design_thread!r} matches the PR-review LEDGER id grammar "
+                f"({self._thread_prefix}... ending in digits), so it is read as one. The critique "
+                "already goes to the ledger; the design thread is the one this gate was fired "
+                "from, and scripts/naysayer_review.py prints the ledger id, so it is the easiest "
+                "wrong value to reach for. If this really is a design thread, give it an id that "
+                "does not end in digits."
             )
         if not (await self._thread_subject(project=project, thread_id=design_thread)).exists:
             raise ValueError(

@@ -148,6 +148,8 @@ class _FakeMcp:
             # `chatroom_get_thread` differently per thread_id (which is the whole
             # point of the collision tests below).
             payload = result(arguments) if callable(result) else result
+        # The three branches above assign rather than return so they all converge on this single
+        # choke point (see class docstring); an early return skips it and re-ships #150.
         raise_if_envelope(payload)
         return payload
 
@@ -1156,7 +1158,7 @@ async def test_design_thread_that_is_a_ledger_id_raises_before_the_paid_review()
     mcp = _FakeMcp()
     driver = _FakeDriver()
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="LEDGER id"):
+    with pytest.raises(ValueError, match="LEDGER id grammar"):
         await orch.fire_pr_review(
             project="p", pr_ref="o/r#7", design_thread="T-pr-review-spirrow-mindwire-236"
         )
