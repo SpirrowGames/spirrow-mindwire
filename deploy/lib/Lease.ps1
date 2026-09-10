@@ -104,16 +104,22 @@
 # Promotion / grant-from-empty / scrub still live in PR 3, and the wrapper AST wiring + the
 # probe activation land in PR 4.
 #
-# PR 3 open items that land in THIS file (not the test file): the acquire-side fail-closed
-# validation on Invoke-LeaseAcquire (mirror of the msg-2189 fix on Test-LeaseAvailableFor —
-# multi-element array / hashtable / integer $Requires MUST throw, including on the direct-
-# acquire path that never calls Test-LeaseAvailableFor; msg-1961) and the .OUTPUTS docstring
-# on Test-LeaseAvailableFor that spells out the asymmetric contract 'available' = advisory
-# predicate, 'waiting' = binding, 'held-by-self' = re-entrant idempotent (msg-1960 §3), plus
-# the ORDERING REQUIREMENT wording that acquire MUST succeed BEFORE any un-rollbackable side
-# effect (msg-2644 §2 supersedes the earlier "lease check before Invoke-HeadSkipCommitLaunch"
-# phrasing that failed to distinguish predicate from mutation). The full PR 3 pin checklist
-# lives at the top of tests/Test-Lease.ps1 — do not fork the list here.
+# PR 3 landed rows #1-9 (see the checklist at the top of tests/Test-Lease.ps1 — that is the
+# single source of truth per row #9b). The Lease.ps1 changes this file carries for PR 3 are:
+#   - the positive entry validation on both -Resource (Invoke-LeaseAcquire) and -Requires
+#     (Test-LeaseAvailableFor), implemented via the shared Assert-LeaseResourceName helper below
+#     (row #6, msg-2932 §3 supersedes the row #5-only mirror described in msg-2189);
+#   - the .OUTPUTS docstring on Test-LeaseAvailableFor that spells out the asymmetric
+#     contract 'available' = advisory / 'waiting' = binding and folds the "free OR already
+#     held by this candidate" collapse rationale into it (row #5, msg-2644 §2 supersedes the
+#     older "lease check before Invoke-HeadSkipCommitLaunch" phrasing that failed to
+#     distinguish predicate from mutation, and msg-2738 §5 correction 1 pins that row #5 is
+#     documentation-only — the verdict domain does not change);
+#   - the grant seam (Get-NextLeaseWaiter / Invoke-LeasePromotion / Invoke-LeaseGrantFromEmpty
+#     / Remove-IneligibleLeaseWaiters) that the sweep tick will call in PR 4.
+# Row #9a (msg-2738 §3) explicitly required that the prior "PR 3 open items" tracker prose in
+# THIS file be DELETED rather than shrunk to a pointer once PR 3 lands — a "PR 3 open items"
+# header sitting above finished code reads as unfinished obligation. It is now gone.
 #
 # THE READER COLLAPSE (msg-2151 measurement + msg-2172 Tier-C, 2026-08-28). Get-JsonState is now
 # the CANONICAL state-file reader for the whole runner. The wrapper's previous inline
@@ -155,6 +161,111 @@
 # verdicts + held/quarantined filters. If a fourth disposition is ever added, THIS FUNCTION
 # is the one place that must be updated — leaving a case unhandled here reproduces the exact
 # "silent parked" failure mode the design exists to end.
+
+function Assert-LeaseResourceName {
+    <#
+    .SYNOPSIS
+        POSITIVE-ALLOWLIST entry validation for a resource-name parameter. Throws on ANY input
+        that is not a plain, non-null, non-empty, non-whitespace [string]. Returns the unwrapped
+        scalar string on success.
+
+    .DESCRIPTION
+        WHY THIS EXISTS (row #6 revised body, msg-2932 §3 supersedes the msg-2189-only mirror
+        described in the old row #6 wording). PowerShell's parameter binder silently coerces
+        a `[string]` annotation into misleading shapes at TWO different layers:
+
+          layer 1 (msg-2189, still true): `[string]$Requires` on Test-LeaseAvailableFor let the
+            binder join `@('editor','runner')` into the space-separated phantom name
+            'editor runner' BEFORE the body ran. A `[string]` annotation is not the hard-runtime
+            rejection it looks like — the type check happens after coercion, so a multi-element
+            array becomes a nonsense string that no lease matches, and the caller reads that as
+            'available'. Two candidates then race on the same real resource, and mutual exclusion
+            has silently collapsed (msg-2189 R3 phantom lock).
+
+          layer 2 (msg-2746 blocking objection). The natural fix to layer 1 — strip `[string]`
+            so the binder cannot join arrays — WIDENS the accepted type from [string] to [object].
+            $null, $true, $false, $42, `[pscustomobject]@{...}` all now flow through untouched.
+            A blocklist reading of the msg-1961 wording ("multi-element array / hashtable /
+            integer MUST throw") would let $null / $true / $false / whitespace-only strings /
+            arbitrary objects slip past — [bool] most dangerously, because $true becomes the
+            hashtable key "True" and locks a phantom resource EXACTLY as 'editor runner' did.
+
+        The fix (msg-2932 §3 #6a): a POSITIVE allowlist. The parameter is ACCEPTED if and only
+        if, after unwrapping any PSObject shell, it is an instance of [string] AND not $null
+        AND not empty AND not whitespace-only. EVERYTHING ELSE THROWS. No exceptions, no
+        coercion, no defaulting. The set of types PowerShell can hand you is open — a blocklist
+        would silently accept the next unlisted type as soon as it existed.
+
+        The PSObject unwrap step is required because pipeline / splat callsites can wrap a real
+        string in a PSObject shell (`ConvertFrom-Json` does this to every scalar, for instance).
+        `.BaseObject` gives the unwrapped value; the `-is [string]` check then answers the real
+        question. Without the unwrap, a legitimate string arriving from `ConvertFrom-Json`
+        would fail the `-is [string]` test even though the underlying value IS a string.
+
+    .PARAMETER Value
+        The raw parameter value handed by the binder.
+
+    .PARAMETER ParamName
+        The PARAMETER NAME to include in the exception message (e.g. 'Resource', 'Requires').
+
+    .PARAMETER FunctionName
+        The FUNCTION NAME to include in the exception message (e.g. 'Invoke-LeaseAcquire').
+
+    .OUTPUTS
+        The unwrapped scalar [string] on success. Throws on any invalid input; the exception
+        message includes the actual type PowerShell handed the function and the ParamName /
+        FunctionName so callers can grep the failure back to their site.
+
+    .NOTES
+        Row #6a mandates that a call path reaching Invoke-LeaseAcquire WITHOUT first calling
+        Test-LeaseAvailableFor MUST hit the same validation (msg-1961: authorisation lives in
+        the mutation, not the predicate — msg-1959). Sharing the validator between the two
+        functions is what makes that mandate hold structurally: neither function can ever
+        drift into a weaker check without editing the shared helper, which is impossible to
+        do accidentally.
+    #>
+    param(
+        $Value,
+        [string]$ParamName,
+        [string]$FunctionName
+    )
+    # Unwrap PSObject shell so a string carried through a pipeline / splat is judged on its
+    # underlying type, not the shell's. `ConvertFrom-Json` wraps every scalar this way, so a
+    # value legitimately arriving from disk state could look like [PSObject] at first glance.
+    #
+    # SUBTLE UNWRAP HAZARD (layer 3, msg-2932 §3 #6a implementation note). An earlier iteration
+    # of this helper wrote `$unwrapped = if (…) { $Value.PSObject.BaseObject } else { $Value }`.
+    # That LOOKED correct but the `if` was used as an EXPRESSION on the right-hand side of the
+    # assignment. PowerShell evaluates that shape by running the chosen branch through the
+    # PIPELINE, which UNROLLS a single-element array into its scalar element before assignment.
+    # ∴ `@('editor')` arrived as [object[]] with Count=1, went through the else branch, and
+    # `$unwrapped` was assigned the STRING 'editor' — the single-element array was silently
+    # coerced to a plain string BEFORE the -is [string] rejection could see it, and the
+    # subsequent validation passed. This is the layer-3 hole that repeats msg-2189 layer-1 in
+    # a different dialect: an implicit unwrap happens outside the function body and defeats the
+    # validation. The row #6a rejected-set pin for the single-element array case caught this.
+    #
+    # Fix: use STATEMENT-form if/else with direct assignments inside each branch. Direct
+    # assignment does NOT go through the pipeline, so the array shape survives untouched.
+    $unwrapped = $Value
+    if ($null -ne $Value -and $Value -is [System.Management.Automation.PSObject]) {
+        $unwrapped = $Value.PSObject.BaseObject
+    }
+    if ($null -eq $unwrapped) {
+        throw "${FunctionName}: -${ParamName} must be a non-empty [string] (msg-2932 §3 #6a positive-allowlist entry validation); got `$null"
+    }
+    if (-not ($unwrapped -is [string])) {
+        throw "${FunctionName}: -${ParamName} must be a non-empty [string] (msg-2932 §3 #6a positive-allowlist entry validation); got [$($unwrapped.GetType().FullName)]"
+    }
+    if ([string]::IsNullOrWhiteSpace($unwrapped)) {
+        # Whitespace-only strings ('', '   ', "`t`n") are strings by type but not by intent —
+        # a hashtable lookup on '' or '   ' would collide with the "no resource declared"
+        # semantics the caller opted OUT of by calling this function. Reject them explicitly
+        # so a stray ' ' in a caller's config becomes a hard error, not a silent hit.
+        throw "${FunctionName}: -${ParamName} must be a non-empty [string] (msg-2932 §3 #6a positive-allowlist entry validation); got an empty or whitespace-only string"
+    }
+    return [string]$unwrapped
+}
 
 function Get-LeaseHolderClassification {
     <#
@@ -472,44 +583,92 @@ function Test-LeaseAvailableFor {
     <#
     .SYNOPSIS
         Given a candidate that requires a resource, decide whether it may launch this tick with
-        respect to leases. Returns one of:
-          - 'available' : the required resource is free OR already held by this candidate; the
-                          candidate may launch. The caller must then call Invoke-LeaseAcquire on
-                          it BEFORE launch, so the record shows the acquisition before the
-                          session starts (a killed acquire+launch survives as a committed lease,
-                          not a phantom launch — same reasoning as head_skip's "session-start-
-                          before-write" contract).
+        respect to leases. This is an ADVISORY predicate. The BINDING mutation is
+        Invoke-LeaseAcquire — see the ORDERING REQUIREMENT below.
+
+    .DESCRIPTION
+        VERDICTS. Returns one of:
+          - 'available' : the required resource is FREE, OR is already HELD BY THIS candidate;
+                          the candidate is authorised to attempt an acquire.
           - 'waiting'   : the required resource is held by someone else and NOT this candidate.
-                          The candidate must NOT launch; disposition `lease-waiting`. The caller
-                          SHOULD call Register-LeaseWaiter to queue.
+                          The candidate must NOT attempt an acquire; disposition `lease-waiting`.
+                          The caller SHOULD call Register-LeaseWaiter to queue.
 
-        v1 is single-resource per candidate (msg-2038 correction: sweep.json's `requires` is a
-        single string, not an array). Multi-resource coordination + rollback is v2 work that
-        needs proper deadlock avoidance — bolting it onto a single-resource state machine is what
-        rounds 11-12 tried and had to be reverted.
+        THE 'available' COLLAPSE — intentional (msg-2738 §5 correction 1 pins this as
+        documentation-only, not a verdict change). 'available' folds two distinct situations
+        together: "the resource has no holder" AND "the current holder IS this candidate".
+        Both situations end with the same caller action — call Invoke-LeaseAcquire, which is
+        idempotent on self-hold (see its 'currentHolder -eq CandidateKey' branch below) — so
+        splitting the verdict into 'free' vs 'held-by-self' would ADD a caller branch that
+        every call site would immediately collapse again. The `.SYNOPSIS` still reads "free
+        OR already held by this candidate" for exactly this reason. If a future caller needs
+        the distinction, that caller's scope is when to split — verdict-domain expansion is
+        PR 4 attack-surface at the earliest and out of scope for PR 3 (row #5 documentation-
+        only, msg-1958 §4 single-seam rule).
 
-        SINGLE-RESOURCE, FAIL-CLOSED (msg-2185 → msg-2189 blocker fixes). Earlier the parameter
-        was typed `[string[]]` with an internal foreach loop; msg-2185 collapsed the signature to
-        `[string]` intending the type to act as a single-resource signal. That was insufficient.
-        PowerShell's parameter binder silently coerces a runtime `@('editor','runner')` into
-        `'editor runner'` before the function sees it, so the type is not a hard-runtime
-        rejection. The R2 pin claimed that was a "harmless no-op" because the joined nonsense
-        name matched no lease and returned 'available'. That claim was wrong: 'available' is a
-        LAUNCH-AUTHORISATION signal to the caller, so silently returning 'available' for a
-        malformed multi-resource request tells the caller "go ahead, launch" while the real
-        `editor` and `runner` leases remain UNCLAIMED. Another candidate that then correctly
-        requested `'editor'` would see it free, acquire, and launch — TWO candidates now
-        operating on the same exclusive resource. That IS mutual-exclusion collapse, dressed up
-        as a graceful degradation.
+        ASYMMETRIC CONTRACT (msg-1961; msg-2644 §2). The two verdicts do NOT carry equal
+        weight against a subsequent acquire:
 
-        The fix (msg-2189): accept `$Requires` as an untyped parameter and validate its actual
-        runtime shape at entry. If it is an array with 2+ elements, THROW — do not silently
-        joining-coerce, do not return 'available'. Single-element arrays coerce cleanly to their
-        scalar (a documented pwsh convenience the R2 tests already relied on and this fix
-        preserves). Anything not a string, array, or null is a type error. Fail-closed is the
-        right posture here: a malformed callsite must be VISIBLE to the caller (as an exception
-        they cannot swallow silently), not hidden behind a phantom 'available'. The type
-        signature is no longer the contract; the entry validation IS.
+          - 'available' is ADVISORY. Between this call and Invoke-LeaseAcquire another candidate
+            may acquire the lease, and OUR subsequent acquire will be refused by the "no
+            accidental steal" throw. Callers MUST treat 'available' as "try to acquire", NOT
+            as "you have the lease". An acquire failure after an 'available' verdict is an
+            EXPECTED outcome (a TOCTOU race), not an error condition.
+          - 'waiting' is BINDING. If this call returns 'waiting', the caller MUST NOT attempt
+            an acquire and MUST NOT launch (msg-1959: the mutation is the authorisation, so
+            the caller has no path to authorisation without the acquire succeeding).
+
+        ORDERING REQUIREMENT (msg-2644 §2 blocker fix; supersedes the earlier phrasing
+        "lease check before Invoke-HeadSkipCommitLaunch" in msg-1958 / msg-1960, which failed
+        to distinguish the advisory predicate from the binding mutation).
+
+            Invoke-LeaseAcquire MUST SUCCEED BEFORE any un-rollbackable side effect is committed.
+
+          Un-rollbackable side effects include, but are not limited to:
+            - Invoke-HeadSkipCommitLaunch (commits the head-skip in conductor state)
+            - any process launch (editor / PIE / runner)
+            - any write to sweep or loop-control state that a later abort cannot undo
+
+          The required sequence is therefore:
+
+              Test-LeaseAvailableFor        (advisory; MAY be skipped — it is an optimisation)
+              Invoke-LeaseAcquire           (binding; MUST succeed)
+              Invoke-HeadSkipCommitLaunch   (un-rollbackable; ONLY after a successful acquire)
+              <launch>
+
+          If Invoke-LeaseAcquire fails, the caller MUST NOT commit the head-skip, MUST NOT
+          launch, and MUST call Register-LeaseWaiter. Acquire failure after an 'available'
+          verdict is an EXPECTED outcome (TOCTOU), not an error. The candidate has NOT consumed
+          its turn — nothing un-rollbackable was committed, so it is still eligible when the
+          mechanism next wakes it.
+
+        The test file's row #7 ordering pin (tests/Test-Lease.ps1 §14) enforces this sequence
+        MECHANICALLY: it injects a spy for the known un-rollbackable command names, drives the
+        candidate loop into the acquire-failure branch, and asserts each spy was called ZERO
+        times. Docstring text alone is not enough — msg-923 explicitly forbids relying on
+        "the implementer reads it" as a control-flow mechanism (msg-2644 §3).
+
+        SINGLE-RESOURCE, FAIL-CLOSED, POSITIVE ALLOWLIST (msg-2185 → msg-2189 → msg-2746 →
+        msg-2932 §3 #6a). The `-Requires` validator has passed through THREE spec revisions:
+
+          - msg-2185: signature was collapsed from `[string[]]` to `[string]`. Intended as a
+            hard single-resource signal, but PowerShell's binder silently joined
+            `@('editor','runner')` into 'editor runner' BEFORE the body ran (layer-1 coercion).
+          - msg-2189: dropped the `[string]` annotation so the binder cannot join arrays. Layer-1
+            fixed, but the accepted type widened from [string] to [object], letting $null /
+            [bool] / [pscustomobject] flow through untouched (layer-2 hole raised by msg-2746).
+          - msg-2932 §3 #6a: POSITIVE allowlist — accept ONLY plain non-empty [string]. Every
+            other input throws through the shared Assert-LeaseResourceName helper. This closes
+            layer 2 without re-opening layer 1: no annotation, so the binder cannot coerce; the
+            body validates the actual runtime type. See Assert-LeaseResourceName's docstring
+            for the layered coercion story.
+
+        Entry validation is OWNED by row #6a via Assert-LeaseResourceName. This function does
+        NOT re-implement the validation inline — sharing the validator is what structurally
+        prevents drift between Test-LeaseAvailableFor's rejection set and Invoke-LeaseAcquire's
+        rejection set (msg-2932 §3 #6c: the same rejection MUST hold on the direct-acquire
+        path). This `.OUTPUTS` section describes the verdict domain and its contract; it does
+        NOT re-state the accepted-input shape (that lives on the shared helper).
 
     .PARAMETER LeasesState
         The full leases.json map: resource-name -> lease hashtable.
@@ -518,11 +677,12 @@ function Test-LeaseAvailableFor {
         The "$project/$thread_id" key of the candidate.
 
     .PARAMETER Requires
-        The single resource name the candidate declares in sweep.json's `requires`. Empty
-        string / `$null` / an empty array means the candidate declares no requires and is
-        trivially available. A one-element array is accepted as a documented convenience (pwsh
-        callers commonly type `@('editor')` where a single string is the API truth). A multi-
-        element array THROWS — see the SYNOPSIS msg-2189 note.
+        The single resource name the candidate declares in sweep.json's `requires`. Must be a
+        plain non-empty [string] — see Assert-LeaseResourceName for the rejection set. Callers
+        that KNOW a candidate has no `requires` declared MUST skip this call entirely; the
+        function does NOT accept `$null` / empty / whitespace / arrays / hashtables / booleans
+        as "trivially available" any more (msg-2932 §3 #6a; supersedes the msg-2189-era
+        behaviour where `$null` / `''` / `@()` collapsed to 'available').
 
     .OUTPUTS
         A hashtable @{
@@ -534,78 +694,42 @@ function Test-LeaseAvailableFor {
                      NOT signal multi-resource support.
         }
 
-        A malformed `-Requires` argument (multi-element array, wrong type) THROWS a
-        RuntimeException — the function does NOT return a verdict in that case. Callers must
-        not swallow the exception silently; the whole point of failing closed is to make the
-        misuse visible to the caller (msg-2189 blocker fix).
+        A malformed `-Requires` argument throws through Assert-LeaseResourceName — the function
+        does NOT return a verdict in that case. Callers must not swallow the exception silently;
+        the whole point of failing closed is to make the misuse visible to the caller.
     #>
     param(
         [hashtable]$LeasesState,
         [string]$CandidateKey,
-        # UNTYPED on purpose — see .SYNOPSIS msg-2189. A `[string]` parameter would let pwsh
-        # silently join a multi-element array into a nonsense string before the validation
-        # below could see it. The runtime type check is the real single-resource enforcement.
+        # UNTYPED on purpose (msg-2189 layer-1 coercion). A `[string]` annotation would let
+        # pwsh silently join a multi-element array into a nonsense string before the
+        # Assert-LeaseResourceName call below could see it. The shared validator is the real
+        # single-resource enforcement.
         $Requires
     )
 
-    # ENTRY VALIDATION (msg-2189 blocker fix). Normalise `$Requires` to a single scalar string
-    # OR throw on malformed input. Do this BEFORE any lease lookup so the caller's misuse cannot
-    # produce a phantom 'available' verdict.
-    $requiresStr = $null
-    if ($null -eq $Requires) {
-        $requiresStr = ''
-    }
-    elseif ($Requires -is [string]) {
-        $requiresStr = $Requires
-    }
-    elseif ($Requires -is [array]) {
-        if ($Requires.Count -eq 0) {
-            # `@()` is a legitimate "no requires" — same as null / empty string.
-            $requiresStr = ''
-        }
-        elseif ($Requires.Count -eq 1) {
-            # `@('editor')` is the documented convenience: one-element array coerces to its
-            # scalar. Callers that write `@('x')` are common in pwsh; rejecting them would
-            # break the R2 tests without adding safety.
-            $only = $Requires[0]
-            if ($null -eq $only) {
-                $requiresStr = ''
-            }
-            elseif ($only -is [string]) {
-                $requiresStr = $only
-            }
-            else {
-                throw "Test-LeaseAvailableFor: -Requires single-element array must contain a string, got [$($only.GetType().Name)] (msg-2189: single-resource contract)"
-            }
-        }
-        else {
-            # THE msg-2189 BLOCKER FIX. A caller passed `@('editor', 'runner', ...)` — the state
-            # machine is strictly single-resource (msg-2038; Invoke-LeaseAcquire takes ONE
-            # resource, no transactional rollback exists, rounds 11-12 tried and had to be
-            # reverted). Returning 'available' for the coerced 'editor runner' phantom name
-            # would authorise a launch that never actually claims the real leases — mutual
-            # exclusion collapse. Throw so the caller sees the misuse.
-            throw "Test-LeaseAvailableFor: -Requires must be a single resource, got a $($Requires.Count)-element array — multi-resource is not supported (msg-2189: single-resource contract, msg-2038 correction)"
-        }
-    }
-    else {
-        throw "Test-LeaseAvailableFor: -Requires must be a string or single-element array, got [$($Requires.GetType().FullName)] (msg-2189: single-resource contract)"
-    }
+    # ENTRY VALIDATION owned by the shared helper (msg-2932 §3 #6a positive allowlist).
+    # Assert-LeaseResourceName throws on ANY input that is not a plain non-empty [string] —
+    # $null, whitespace-only, booleans, hashtables, integers, [pscustomobject], multi- or
+    # single-element arrays. The unwrapping / rejection story lives on the helper's docstring;
+    # this call is the ENTIRE validation for this function.
+    $requiresStr = Assert-LeaseResourceName -Value $Requires -ParamName 'Requires' -FunctionName 'Test-LeaseAvailableFor'
 
+    # Assert-LeaseResourceName guarantees $requiresStr is a non-empty, non-whitespace [string].
+    # No conditional block is needed here — the msg-2189-era wrapper (`if (-not
+    # [string]::IsNullOrEmpty($requiresStr)) { ... }`) existed to handle the empty-Requires =
+    # trivially-available branch, which msg-2932 §3 #6a explicitly deleted. Empty / null /
+    # whitespace inputs throw at entry now; the body only runs with a real resource name.
     $holders = @{}
     $waitOn = @()
-    # Empty Requires (from null / '' / @() / @($null)): the candidate declared nothing to
-    # require. Trivially available.
-    if (-not [string]::IsNullOrEmpty($requiresStr)) {
-        $resource = $requiresStr
-        if ($LeasesState.ContainsKey($resource)) {
-            $lease = $LeasesState[$resource]
-            if ($null -ne $lease) {
-                $h = if ($lease -is [hashtable]) { $lease['holder'] } else { $lease.holder }
-                if (-not [string]::IsNullOrEmpty("$h")) {
-                    $holders[$resource] = "$h"
-                    if ("$h" -ne $CandidateKey) { $waitOn += $resource }
-                }
+    $resource = $requiresStr
+    if ($LeasesState.ContainsKey($resource)) {
+        $lease = $LeasesState[$resource]
+        if ($null -ne $lease) {
+            $h = if ($lease -is [hashtable]) { $lease['holder'] } else { $lease.holder }
+            if (-not [string]::IsNullOrEmpty("$h")) {
+                $holders[$resource] = "$h"
+                if ("$h" -ne $CandidateKey) { $waitOn += $resource }
             }
         }
     }
@@ -620,11 +744,30 @@ function Invoke-LeaseAcquire {
         Test-LeaseAvailableFor that the lease is free (no holder) or already held by this
         candidate. Mutates LeasesState in place.
 
+    .DESCRIPTION
+        THE BINDING MUTATION (msg-1959: the mutation is the authorisation, not the predicate).
+        Test-LeaseAvailableFor is advisory; the call to THIS function is the one that decides
+        whether the candidate holds the lease. See Test-LeaseAvailableFor's ORDERING REQUIREMENT
+        block for the sequence contract: acquire MUST succeed BEFORE any un-rollbackable side
+        effect (Invoke-HeadSkipCommitLaunch / process launch / conductor-state write). Acquire
+        failure — including the TOCTOU race where another candidate acquired between the
+        available verdict and this call — is an EXPECTED outcome, not an error: the caller MUST
+        NOT launch, MUST NOT commit head-skip state, and MUST call Register-LeaseWaiter.
+
+        ENTRY VALIDATION is owned by the shared Assert-LeaseResourceName helper — SAME positive
+        allowlist as Test-LeaseAvailableFor's -Requires (msg-2932 §3 #6a / #6c). A direct-acquire
+        path that does not first call Test-LeaseAvailableFor gets the SAME rejection set, because
+        the authorisation lives here and the guard must hold here. Sharing the validator is what
+        structurally prevents the two functions from drifting.
+
     .PARAMETER LeasesState
         The full leases.json map. Mutated in place — a resource that had no entry gets one.
 
     .PARAMETER Resource
-        Resource name.
+        Resource name. UNTYPED on purpose (msg-2189 layer-1 coercion; msg-2932 §3 #6a). Must
+        pass Assert-LeaseResourceName — a plain non-empty [string]. Any other shape ($null /
+        empty / whitespace-only / booleans / hashtables / integers / [pscustomobject] / multi-
+        or single-element arrays) throws before the state map is touched.
 
     .PARAMETER CandidateKey
         The "$project/$thread_id" acquiring the lease.
@@ -634,10 +777,20 @@ function Invoke-LeaseAcquire {
     #>
     param(
         [hashtable]$LeasesState,
-        [string]$Resource,
+        # UNTYPED on purpose (msg-2189 layer-1 coercion, msg-2932 §3 #6a positive allowlist).
+        # A `[string]` annotation would let pwsh silently join a multi-element array into a
+        # nonsense resource name that then creates a phantom lease record, LOCKING a resource
+        # whose name matches nothing real ("editor runner" instead of "editor"). The shared
+        # Assert-LeaseResourceName below is the single source of truth for accepted shapes.
+        $Resource,
         [string]$CandidateKey,
         [datetime]$Now
     )
+    # ENTRY VALIDATION — SAME shared helper Test-LeaseAvailableFor uses. Direct-acquire callers
+    # (row #6c) hit exactly this rejection set. Reassign the untyped $Resource to the unwrapped
+    # scalar so every subsequent hashtable lookup uses a real string, not a PSObject shell.
+    $Resource = Assert-LeaseResourceName -Value $Resource -ParamName 'Resource' -FunctionName 'Invoke-LeaseAcquire'
+
     if (-not $LeasesState.ContainsKey($Resource) -or $null -eq $LeasesState[$Resource]) {
         # Cold start — no record ever existed. Generation begins at 1.
         $LeasesState[$Resource] = New-LeaseRecord -Holder $CandidateKey -Now $Now -Generation 1
@@ -724,6 +877,354 @@ function Register-LeaseWaiter {
     # See Invoke-LeaseAcquire above — normalisation is the caller's boundary responsibility
     # (msg-1802 blocker #2). Do NOT re-invent it inline here.
     Add-LeaseWaiter -Lease $LeasesState[$Resource] -WaiterKey $WaiterKey -Now $Now
+}
+
+function Get-NextLeaseWaiter {
+    <#
+    .SYNOPSIS
+        Pick the next waiter to promote from a lease's queue. FIFO on `waiting_since`, with
+        sweep-list order as the tiebreak (msg-1183 D-3). Returns $null when the queue is empty
+        or every entry is ineligible after the sweep filter.
+
+    .DESCRIPTION
+        WHY FIFO AT GRANT TIME AND NOT ENQUEUE TIME (msg-1958 §5 row #1 pin). Add-LeaseWaiter
+        preserves append order and each waiter's original `waiting_since` (msg-2181 blocker fix
+        — the SYNOPSIS on Add-LeaseWaiter carries the full rationale). The FIFO ordering is
+        established here, at the moment the lease grants, so a promotion decision that has to
+        cross a re-enqueue storm still respects the first arrival's wait.
+
+        SWEEP-ORDER TIEBREAK. Two waiters with the exact-same `waiting_since` (same tick, same
+        Register-LeaseWaiter call ordering) fall back to sweep.json enumeration order. This is
+        deterministic (`SweepOrder` is a materialised list) and avoids the "sort-order is a
+        hash of the string" surprise that would appear if we sorted by key alphabetically.
+
+        ELIGIBILITY FILTER. When `-EligibleKeys` is provided, waiters not in that set are
+        skipped without being removed from the queue — that removal is Remove-IneligibleLease-
+        Waiters' job (a separate function so a caller that only wants to PEEK the next waiter
+        does not accidentally mutate the queue). When `-EligibleKeys` is $null, no filtering
+        happens (this is the "peek without knowledge of the current sweep" mode; tests use it).
+
+    .PARAMETER Lease
+        The per-resource lease hashtable.
+
+    .PARAMETER SweepOrder
+        The current sweep enumeration order (usually the sorted list of `sweep.json` project /
+        thread keys). Used ONLY as the tiebreak when two waiters share `waiting_since`. Empty /
+        $null means "no known sweep order" — ties fall back to queue-append order.
+
+    .PARAMETER EligibleKeys
+        Optional set of waiter keys currently eligible to be granted (usually the sweep keys
+        minus quarantined / off-sweep). When $null, no filtering happens.
+
+    .OUTPUTS
+        The chosen waiter hashtable (with `key` and `waiting_since`), or $null.
+    #>
+    param(
+        [hashtable]$Lease,
+        [string[]]$SweepOrder = @(),
+        [string[]]$EligibleKeys = $null
+    )
+    if ($null -eq $Lease) { return $null }
+    if (-not $Lease.ContainsKey('queue') -or $null -eq $Lease['queue']) { return $null }
+    $queue = @($Lease['queue'])
+    if ($queue.Count -eq 0) { return $null }
+
+    # Materialise the eligibility set (fast lookup vs. per-item linear scan).
+    $eligibleSet = $null
+    if ($null -ne $EligibleKeys) {
+        $eligibleSet = @{}
+        foreach ($k in $EligibleKeys) { $eligibleSet["$k"] = $true }
+    }
+
+    # Attach sweep-order index for the tiebreak, then sort by (waiting_since, sweep index,
+    # queue index). Queue index is the final tiebreaker so callers that pass neither SweepOrder
+    # nor EligibleKeys still get a deterministic answer (append order).
+    $annotated = @()
+    for ($i = 0; $i -lt $queue.Count; $i++) {
+        $w = $queue[$i]
+        $k = if ($w -is [hashtable]) { $w['key'] } else { $w.key }
+        if ($null -ne $eligibleSet -and -not $eligibleSet.ContainsKey("$k")) { continue }
+        $wsRaw = if ($w -is [hashtable]) { $w['waiting_since'] } else { $w.waiting_since }
+        $ws = [datetime]::MaxValue
+        try { if ($wsRaw) { $ws = [datetime]::Parse("$wsRaw").ToUniversalTime() } } catch { }
+        $sweepIdx = if ($null -ne $SweepOrder) { [array]::IndexOf($SweepOrder, "$k") } else { -1 }
+        if ($sweepIdx -lt 0) { $sweepIdx = [int]::MaxValue }
+        $annotated += [pscustomobject]@{
+            _waiter    = $w
+            _key       = "$k"
+            _wsInstant = $ws
+            _sweepIdx  = $sweepIdx
+            _queueIdx  = $i
+        }
+    }
+    if ($annotated.Count -eq 0) { return $null }
+    $sorted = $annotated | Sort-Object -Property _wsInstant, _sweepIdx, _queueIdx
+    return @($sorted)[0]._waiter
+}
+
+function Invoke-LeasePromotion {
+    <#
+    .SYNOPSIS
+        Advance the two-phase expiry state machine for a single lease (msg-1183 D-6' /
+        D-6'd). Phase 1: mark expiring, record TRANSIENT revoke intent, DO NOT change the
+        holder — the current holder gets ONE tick to make progress and pre-empt the revoke.
+        Phase 2 (called on the NEXT eligible tick, once Test-LeaseExpiring still holds AND
+        expiring=$true): reclaim from the current holder, either promote the next FIFO waiter
+        or empty the record (which the caller may then delete from LeasesState per the schema).
+
+    .DESCRIPTION
+        RETURN VALUE. A short string describing what happened this call, so the caller can log
+        and route without re-inspecting the record:
+          'phase-1'            — first tick: expiring flag set, holder unchanged.
+          'phase-2-promoted'   — waiter promoted, record now holds the new holder.
+          'phase-2-released'   — no eligible waiter; holder cleared, record left as an empty
+                                 stub (the caller MUST remove the key per the schema:
+                                 msg-2131 blocker, "ABSENT resource key = no holder, empty
+                                 queue"). We do NOT .Remove() here because $Lease is a
+                                 hashtable reference and the caller owns the parent map.
+          'noop'               — $null lease, or somehow already-clean state.
+
+        NO-STEAL INVARIANT PRESERVED (msg-1958 §5 row #2). Even in the grant path, the new
+        holder MUST come from the FIFO queue — a raw acquire on an occupied lease still throws
+        via Invoke-LeaseAcquire's no-steal branch (msg-1958 §5). This function does not bypass
+        that: promotion goes through the record's own `holder` field write with `reclaimed_from`
+        set to the PRIOR holder, which is a legitimate reclamation, not a steal. Callers that
+        pull a waiter out of the queue and try to `Invoke-LeaseAcquire` it on an occupied lease
+        would still be refused — the acquire path is a strict single writer, the grant path is
+        the reclamation.
+
+        AUDIT PAIRING (msg-1900 split). `reclaimed_from` / `reclaimed_at` / `reclaimed_reason`
+        are the PERMANENT audit fields; `revoked_at` / `revoked_reason` are the TRANSIENT
+        Phase-1 intent. Phase 2 CLEARS the transient fields (its purpose was served) and WRITES
+        the permanent trio in the same tick. Phase 1 sets ONLY the transient trio; the
+        permanent fields are untouched until the tick that actually reclaims.
+
+    .PARAMETER Lease
+        The per-resource lease hashtable. Mutated in place.
+
+    .PARAMETER Reason
+        Free-text audit paired with `reclaimed_from`. Default 'idle' (the automatic TTL path).
+        Callers passing an operator-initiated reason should use one of the `human-*` prefixes
+        (ADR-2026-05-29-10 role registry).
+
+    .PARAMETER Now
+        The tick's UTC timestamp.
+
+    .PARAMETER SweepOrder
+        The current sweep enumeration order (tiebreak on `waiting_since` collisions).
+
+    .PARAMETER EligibleKeys
+        Optional set of waiter keys currently eligible for promotion. Passed straight through
+        to Get-NextLeaseWaiter.
+    #>
+    param(
+        [hashtable]$Lease,
+        [string]$Reason = 'idle',
+        [datetime]$Now,
+        [string[]]$SweepOrder = @(),
+        [string[]]$EligibleKeys = $null
+    )
+    if ($null -eq $Lease) { return 'noop' }
+
+    $isExpiring = $Lease.ContainsKey('expiring') -and [bool]$Lease['expiring']
+    if (-not $isExpiring) {
+        # Phase 1 — msg-1183 D-6'd 1-tick pre-emption window. Mark, record intent, DO NOT touch
+        # the holder or the queue. The permanent audit fields (reclaimed_*) are NOT written yet;
+        # nothing has been reclaimed. Only the transient revoked_* fields carry the intent.
+        $Lease['expiring']       = $true
+        $Lease['revoked_at']     = $Now.ToUniversalTime().ToString("o")
+        $Lease['revoked_reason'] = "$Reason"
+        return 'phase-1'
+    }
+
+    # Phase 2 — actually reclaim.
+    $priorHolder = if ($Lease.ContainsKey('holder')) { "$($Lease['holder'])" } else { '' }
+    $priorGen = 0
+    if ($Lease.ContainsKey('generation') -and $null -ne $Lease['generation']) {
+        $priorGen = [int]$Lease['generation']
+    }
+    $nowIso = $Now.ToUniversalTime().ToString("o")
+    $next = Get-NextLeaseWaiter -Lease $Lease -SweepOrder $SweepOrder -EligibleKeys $EligibleKeys
+
+    if ($null -ne $next) {
+        $newHolder = if ($next -is [hashtable]) { $next['key'] } else { $next.key }
+        $Lease['holder']           = "$newHolder"
+        $Lease['acquired_at']      = $nowIso
+        $Lease['last_progress_at'] = $nowIso
+        $Lease['idle_evaluations'] = 0
+        $Lease['generation']       = $priorGen + 1
+        $Lease['pinned']           = $false
+        $Lease['expiring']         = $false
+        $Lease['reclaimed_from']   = $priorHolder
+        $Lease['reclaimed_at']     = $nowIso
+        $Lease['reclaimed_reason'] = "$Reason"
+        # The new holder MUST restart the resource before use (msg-1183 D-6'e) — the previous
+        # holder still physically had the editor / PIE / runner at Phase 1, and Phase 2 is the
+        # promotion tick, not a graceful release.
+        $Lease['reclaim_required'] = $true
+        # TRANSIENT Phase-1 intent is now consumed — clear.
+        $Lease['revoked_at']       = $null
+        $Lease['revoked_reason']   = $null
+        # Dequeue the promoted waiter.
+        Remove-LeaseWaiter -Lease $Lease -WaiterKey "$newHolder"
+        return 'phase-2-promoted'
+    }
+
+    # No eligible waiter — release. The record stays in memory as a "recently-reclaimed"
+    # stub so the digest can render the reclamation. The caller decides whether to remove the
+    # key from LeasesState (the schema commits to no empty stubs — msg-2131 — but the
+    # Merge-LeasesStateForWrite pass is where that decision lives, not here).
+    $Lease['holder']           = $null
+    $Lease['acquired_at']      = $null
+    $Lease['last_progress_at'] = $null
+    $Lease['idle_evaluations'] = 0
+    $Lease['generation']       = $priorGen + 1
+    $Lease['pinned']           = $false
+    $Lease['expiring']         = $false
+    $Lease['reclaimed_from']   = $priorHolder
+    $Lease['reclaimed_at']     = $nowIso
+    $Lease['reclaimed_reason'] = "$Reason"
+    # SET reclaim_required = $true even though there is no immediate successor (msg-2946
+    # blocking objection). `reclaim_required` is a property of the RESOURCE — "the physical
+    # editor/PIE/runner was NOT gracefully returned; the next holder MUST restart it before
+    # use" — NOT a property of the successor candidate. A forceful eviction (Phase 2) leaves
+    # the physical resource dirty by definition, and Invoke-LeaseAcquire's post-release branch
+    # preserves reclaim_required verbatim into the next holder's record. If we clear the flag
+    # here, whichever candidate later arrives on this empty record inherits `$false` and
+    # skips the restart — the exact "next holder walks into a dirty editor" failure the flag
+    # exists to prevent. The empty-record window between here and the next acquire does not
+    # execute code that CLEANS the resource; the dirty-state signal has to survive the gap.
+    #
+    # Contrast: Invoke-LeaseAcquire on a FRESH cold-start lease (New-LeaseRecord path,
+    # generation = 1) leaves `reclaim_required = $false` by default — that path represents
+    # "resource never held", not "resource forcefully evicted". The two writes are the
+    # correct pair; clearing here would collapse them into one lossy write.
+    $Lease['reclaim_required'] = $true
+    $Lease['revoked_at']       = $null
+    $Lease['revoked_reason']   = $null
+    return 'phase-2-released'
+}
+
+function Remove-IneligibleLeaseWaiters {
+    <#
+    .SYNOPSIS
+        Scrub a lease's queue of waiters that are no longer eligible: not on the current sweep
+        list, or currently quarantined. Preserves order of the remaining eligible entries.
+
+    .DESCRIPTION
+        WHY THIS IS SEPARATE FROM Get-NextLeaseWaiter. Get-NextLeaseWaiter is a peek — it MUST
+        NOT mutate the queue, so a caller that inspects "who's next" without granting doesn't
+        leave the queue in a different state than it found it (the sweep's classification /
+        promotion cycles walk this record multiple times per tick). Remove-IneligibleLeaseWaiters
+        is the sanction — call it explicitly, once per tick, from the classification pass, to
+        clean up waiters that have gone away (removed from sweep.json entirely, or quarantined).
+
+        WHY NOT DELETE MID-GRANT. Deletion inside promotion would collapse two responsibilities
+        into one: "who is next" (a pure predicate) and "who is no longer eligible" (a policy
+        decision that requires the current sweep enumeration). Keeping them separate is what
+        made Get-LeaseHolderClassification a clean predicate — same split.
+
+    .PARAMETER Lease
+        The per-resource lease hashtable. Mutated in place.
+
+    .PARAMETER SweepKeys
+        The set of keys currently present in sweep.json. Waiters NOT in this set are removed.
+
+    .PARAMETER QuarantinedKeys
+        The set of keys currently quarantined. Waiters in this set are removed.
+
+    .OUTPUTS
+        The number of waiters removed this call.
+    #>
+    param(
+        [hashtable]$Lease,
+        [string[]]$SweepKeys = @(),
+        [string[]]$QuarantinedKeys = @()
+    )
+    if ($null -eq $Lease) { return 0 }
+    if (-not $Lease.ContainsKey('queue') -or $null -eq $Lease['queue']) { return 0 }
+    $sweepSet = @{}
+    foreach ($k in $SweepKeys)       { $sweepSet["$k"]       = $true }
+    $qSet = @{}
+    foreach ($k in $QuarantinedKeys) { $qSet["$k"] = $true }
+    $before = @($Lease['queue']).Count
+    $Lease['queue'] = @($Lease['queue'] | Where-Object {
+        $k = if ($_ -is [hashtable]) { $_['key'] } else { $_.key }
+        $onSweep = $sweepSet.ContainsKey("$k")
+        $quarantined = $qSet.ContainsKey("$k")
+        $onSweep -and (-not $quarantined)
+    })
+    return ($before - @($Lease['queue']).Count)
+}
+
+function Invoke-LeaseGrantFromEmpty {
+    <#
+    .SYNOPSIS
+        When a lease has no holder but has a waiter, promote the FIFO waiter into the empty
+        record. Returns the promoted holder key, or $null when nothing was promoted (no queue,
+        no eligible waiters, or the lease was already held).
+
+    .DESCRIPTION
+        WHY THIS FUNCTION EXISTS SEPARATELY FROM Invoke-LeasePromotion. Empty-state promotion
+        does NOT go through Phase 1 (there is nothing to expire — the previous holder is
+        already gone). This is the "someone released, now grant to the next waiter" path,
+        called by the classification pass after it processes releases. Bolting it onto
+        Invoke-LeasePromotion would force a fake `expiring=$true` intermediate, which would
+        write a false Phase-1 audit record. Keep them separate.
+
+        AUDIT. The permanent audit trio (`reclaimed_from` / `reclaimed_at` / `reclaimed_reason`)
+        already carries the release rationale (set at the point the lease was emptied). This
+        function DOES NOT overwrite them — the new holder inherits the release's audit exactly
+        as `Invoke-LeaseAcquire` does on the post-release path.
+
+    .PARAMETER Lease
+        The per-resource lease hashtable. Mutated in place.
+
+    .PARAMETER Now
+        UTC tick timestamp.
+
+    .PARAMETER SweepOrder
+        The current sweep enumeration order (tiebreak on `waiting_since` collisions).
+
+    .PARAMETER EligibleKeys
+        Optional set of waiter keys currently eligible for promotion.
+
+    .OUTPUTS
+        The promoted holder key (string) on success, $null otherwise.
+    #>
+    param(
+        [hashtable]$Lease,
+        [datetime]$Now,
+        [string[]]$SweepOrder = @(),
+        [string[]]$EligibleKeys = $null
+    )
+    if ($null -eq $Lease) { return $null }
+    $currentHolder = if ($Lease.ContainsKey('holder')) { "$($Lease['holder'])" } else { '' }
+    # Already held — nothing to grant here. Callers that want to force a reclamation should
+    # go through Invoke-LeasePromotion, which respects the two-phase expiry contract.
+    if (-not [string]::IsNullOrEmpty($currentHolder)) { return $null }
+    $next = Get-NextLeaseWaiter -Lease $Lease -SweepOrder $SweepOrder -EligibleKeys $EligibleKeys
+    if ($null -eq $next) { return $null }
+    $newHolder = if ($next -is [hashtable]) { $next['key'] } else { $next.key }
+    $priorGen = 0
+    if ($Lease.ContainsKey('generation') -and $null -ne $Lease['generation']) {
+        $priorGen = [int]$Lease['generation']
+    }
+    $nowIso = $Now.ToUniversalTime().ToString("o")
+    $Lease['holder']           = "$newHolder"
+    $Lease['acquired_at']      = $nowIso
+    $Lease['last_progress_at'] = $nowIso
+    $Lease['idle_evaluations'] = 0
+    $Lease['generation']       = $priorGen + 1
+    $Lease['pinned']           = $false
+    $Lease['expiring']         = $false
+    # PERMANENT audit trio is preserved from the release — the digest reads reclaimed_reason
+    # to render the operator's Tier-C intent, and the new holder inherits reclaim_required if
+    # the release set it. Same discipline as Invoke-LeaseAcquire's post-release branch.
+    $Lease['revoked_at']       = $null
+    $Lease['revoked_reason']   = $null
+    Remove-LeaseWaiter -Lease $Lease -WaiterKey "$newHolder"
+    return "$newHolder"
 }
 
 function ConvertTo-LeaseHashtable {

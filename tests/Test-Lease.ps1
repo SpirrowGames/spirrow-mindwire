@@ -22,16 +22,21 @@
 #      pre-fix vector was a permanent one-way corruption; these tests pin the fixes.
 #
 # Queue sections (Get-NextLeaseWaiter, Invoke-LeasePromotion, Remove-IneligibleLeaseWaiters,
-# Invoke-LeaseGrantFromEmpty) will be added in PR 3. Wrapper AST checks land in PR 4 with the
-# state-machine wiring.
+# Invoke-LeaseGrantFromEmpty) landed with PR 3 — see §13 (grant seam), §15 (Remove-Ineligible-
+# LeaseWaiters), §16 (Invoke-LeaseGrantFromEmpty), and the merged Test-LeaseAvailableFor /
+# Invoke-LeaseAcquire section §9 (positive-allowlist entry validation, row #6 shared helper).
+# Wrapper AST checks land in PR 4 with the state-machine wiring.
 #
 # ---------------------------------------------------------------------------------------------
 # PR 3 PIN CHECKLIST — this list is the durable materialisation of the msg-2644 §4 pin table
 # (Bohr, T-exclusive-resource-lease-queue) plus Einstein's msg-2645 addition, promoted by the
 # human's msg-2653 Tier-C ruling out of the chat log and into the test file so PR 3 cannot
-# silently drop any item. Each row is expected to become one (or more) real Check pins in this
-# file when PR 3 lands. Any row that PR 3 decides NOT to implement MUST be justified in the
-# PR body and this comment updated in the same PR — silent deletion is the msg-923 failure
+# silently drop any item. Row bodies were subsequently revised by msg-2738 §3 (row #9 added
+# for the dual-management deletion), msg-2738 §5 correction 1 (row #5 is documentation-only,
+# msg-1959 asymmetric-contract wording), msg-2738 §5 correction 2 (row #6 mirror parameter
+# name / untyped requirement), and msg-2932 §3 (row #6 replaced with the #6a-#6d positive
+# allowlist body). Any row that PR 3 decides NOT to implement MUST be justified in the PR
+# body and this comment updated in the same PR — silent deletion is the msg-923 failure
 # this whole feature exists to prevent.
 #
 #   #1  end-to-end grant order — real grant FIFO across candidates (msg-1958 §5).
@@ -40,15 +45,44 @@
 #   #4  TOCTOU pin — 'available' verdict followed by a competing acquire, our acquire is
 #       refused by the no-steal throw (msg-1960 §5). Proves the "acquire MAY fail after
 #       'available'" clause in Test-LeaseAvailableFor's docstring is load-bearing.
-#   #5  acquire failure -> caller does NOT launch and DOES call Register-LeaseWaiter
-#       (msg-1960 §5). Contract lives in PR 3 docstrings even though the live wrapper path
-#       lands in PR 4.
-#   #6  acquire-side fail-closed validation — Invoke-LeaseAcquire MUST throw on multi-element
-#       array / hashtable / integer $Requires, and the pin MUST cover a direct-acquire path
-#       that does NOT go through Test-LeaseAvailableFor (msg-1961; msg-2189 for symmetry).
+#   #5  DOCUMENTATION-ONLY (msg-2738 §5 correction 1). Test-LeaseAvailableFor's .OUTPUTS /
+#       .DESCRIPTION docstring must spell out THREE things and the verdict domain MUST NOT
+#       change (msg-1958 §4 single-seam rule):
+#         a) ASYMMETRIC CONTRACT — 'available' is advisory (acquire MAY fail via TOCTOU);
+#            'waiting' is binding.
+#         b) THE 'available' COLLAPSE RATIONALE — 'available' intentionally folds "free" and
+#            "held-by-self" together because both call sites take the same action (idempotent
+#            acquire). PR 4 may split later if a real caller needs the distinction; PR 3
+#            does not.
+#         c) ORDERING REQUIREMENT (msg-2644 §2, verbatim in the docstring) — acquire MUST
+#            succeed BEFORE any un-rollbackable side effect. The docstring cites the row #7
+#            mechanical pin as the enforcement mechanism, per msg-2644 §3.
+#       Cross-reference: entry validation is OWNED by row #6a (Assert-LeaseResourceName);
+#       this row does not restate the accepted-input shape.
+#   #6  POSITIVE-ALLOWLIST entry validation (msg-2932 §3, supersedes the msg-1961 mirror
+#       wording). Split into four sub-items — all four are load-bearing:
+#         #6a Both Invoke-LeaseAcquire's -Resource and Test-LeaseAvailableFor's -Requires
+#             are UNTYPED (no [string]) and validated by the SHARED helper
+#             Assert-LeaseResourceName. Accept iff (after PSObject unwrap) the value is
+#             [string] AND not $null AND not empty AND not whitespace-only. Everything else
+#             throws. A blocklist reading is FORBIDDEN — the type set is open.
+#         #6b The rejected-set / accepted-set table is DRIVEN FROM A SINGLE fixture that
+#             runs against BOTH functions (two hand-written copies WILL drift). Rejected:
+#             multi-element array, single-element array (do NOT unwrap silently), hashtable,
+#             integer, $true / $false, $null, '', '   ', arbitrary [pscustomobject]. Accepted:
+#             'editor', a [string] arriving wrapped in PSObject (splat / pipeline path).
+#         #6c DIRECT-ACQUIRE PIN — a call path reaching Invoke-LeaseAcquire WITHOUT ever
+#             calling Test-LeaseAvailableFor MUST hit the same rejection set. Authorisation
+#             lives in the mutation (msg-1959).
+#         #6d PR BODY — one line per rejected input describing what the OLD [string]
+#             annotation did with that value and what the NEW positive validation does, so
+#             the change is demonstrably a net gain at the boundary rather than trading one
+#             hole for three (msg-2746 blocking objection).
 #   #7  ordering pin — inject a spy/stub for the un-rollbackable side-effect commands and
-#       assert `called times = 0` on the acquire-failure path (msg-2644 §3).
-#   #8  spy/stub coverage documentation — item #7's assertion is a NEGATIVE check bound to
+#       assert `called times = 0` on the acquire-failure path (msg-2644 §3). The pin is
+#       LOAD-BEARING only if reversing the sequence in the caller under test actually breaks
+#       it — see the revert-and-rerun receipt in §14 of THIS file.
+#   #8  spy/stub coverage documentation — row #7's assertion is a NEGATIVE check bound to
 #       SPECIFIC command names. In the test file itself, immediately next to the spy/stub
 #       pin, list EVERY command name the pin actually guards (msg-2645 advisory, promoted
 #       by msg-2653 Tier-C). At time of writing the known name is Invoke-HeadSkipCommitLaunch;
@@ -58,13 +92,32 @@
 #       so a PR 4 implementer who adds one immediately sees they have widened the safety
 #       net's blind spot. Silent green under a renamed or newly-added un-rollbackable is
 #       the failure mode this item exists to catch.
+#   #9  DUAL-MANAGEMENT DELETION (msg-2738 §3, disposition of the msg-2735 advisory). PR 3
+#       MUST delete (not shrink to a pointer) the "PR 3 open items that land in THIS file"
+#       comment block that used to sit above Assert-LeaseResourceName in deploy/lib/Lease.ps1
+#       — a "future work" heading over finished code reads as unfinished obligation. Row
+#       #9a is verified in tree (the block is gone). Row #9b installs a single-source rule:
+#       until PR 3 lands, if any PR-3 requirement wording is revised, THIS file's checklist
+#       is canonical and the Lease.ps1-side prose (if any survives) is a pointer only —
+#       never fork.
 #
-# Two rows land outside this test file:
-#   - #5's contract text belongs in Test-LeaseAvailableFor's .OUTPUTS docstring in
-#     deploy/lib/Lease.ps1 (msg-1960 §3 wording; msg-2644 §2 ordering wording).
-#   - #6's fail-closed validation lives in Invoke-LeaseAcquire's parameter section in
-#     deploy/lib/Lease.ps1 (mirror of Test-LeaseAvailableFor's msg-2189 fix).
+# ROW-9b ROUTING RULE for row bodies that live outside this checklist:
+#   - #5's contract text is materialised in Test-LeaseAvailableFor's .DESCRIPTION / .OUTPUTS
+#     docstring in deploy/lib/Lease.ps1. THIS file is canonical for the row's INTENT (what
+#     must be documented); Lease.ps1 is where the docstring lives (WHERE the documentation
+#     is rendered).
+#   - #6's shared entry-validation helper is Assert-LeaseResourceName in deploy/lib/Lease.ps1
+#     (msg-2932 §3 #6a). Both Test-LeaseAvailableFor and Invoke-LeaseAcquire call it; no
+#     inline copy of the validation exists on either function (msg-2932 §3 #6c mandates
+#     structural anti-drift, and a shared helper is that mechanism).
 # The rest are pins that PR 3 adds to THIS file.
+#
+# READ-BACK BASIS (msg-2738 §5, obligation OBL-READBACK-ENTRY / OBL-READBACK-EXIT). The
+# specifying messages for PR 3 are: msg-1958 §5, msg-1960 §3 / §5 / §6, msg-1961, msg-2644
+# §2 / §3 / §4, msg-2645, msg-2653, msg-2738 §3 / §5 (rows #9 + row #6 correction + row #5
+# scope), and msg-2932 §3 (rows #6a-#6d final wording). msg-2644 §4's table taken alone is
+# a SUPERSEDED snapshot; the checklist above is the current basis, and each row cites its
+# source msg-id(s). The OBL-READBACK-EXIT table in the PR body is 1:1 with rows #1-#9.
 
 $ErrorActionPreference = "Stop"
 
@@ -751,83 +804,82 @@ try { Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey '
 catch { $threw = $true }
 CheckTrue "acquire on foreign lease refuses (throws)" $threw
 
-# Empty string / null Requires -> trivially available (candidate declared nothing to require).
-$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires ''
-Check "empty-string Requires: available" 'available' $check.status
-Check "empty-string Requires: waitOn is empty" 0 $check.waitOn.Count
-$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires $null
-Check "null Requires: available" 'available' $check.status
-Check "null Requires: waitOn is empty" 0 $check.waitOn.Count
-
-# msg-2189 blocker fix pin. A multi-element array is NOT harmless coercion — it is a silent
-# fail-open lock bypass. The R2 tests I wrote claimed the pwsh-joined 'editor runner' phantom
-# resource returned 'available' safely (because Invoke-LeaseAcquire is single-arg so the caller
-# can't multi-acquire). The R3 naysayer correctly pointed out this was wrong: 'available' is a
-# LAUNCH-AUTHORISATION signal, so returning it for a malformed multi-resource request tells the
-# caller "go ahead, launch" while the real 'editor' and 'runner' leases stay UNCLAIMED. Another
-# candidate then correctly requests 'editor', sees it free, acquires, and launches — mutual
-# exclusion collapse, dressed up as graceful degradation. The fix is fail-closed: the function
-# THROWS on multi-element arrays, refusing to produce a verdict.
+# --- ROW #6 POSITIVE-ALLOWLIST ENTRY VALIDATION (msg-2932 §3 #6a-#6d) ---------------------------
+# Rewrite of the msg-2189 mirror pins. The prior wording admitted null / empty / single-element
+# array as "trivially available"; msg-2746 raised the layer-2 hole (untyped $Resource + blocklist
+# validation would let $null / $true / [pscustomobject] slip through), and msg-2932 §3 replaced
+# the row with a POSITIVE allowlist: accept iff the value is [string] AND not null AND not
+# empty/whitespace. Everything else throws.
 #
-# Runtime caveat that the R2 pin GOT WRONG (kept here as a historical note so a future reader
-# does not repeat the mistake): pwsh's `[string]` parameter binder silently joins multi-element
-# arrays with a space (`@('a','b')` → `'a b'`). We can no longer trust the type-level signal to
-# enforce the contract at runtime — the entry validation below is what does. This is why the
-# parameter is UNTYPED at the signature level and validated by hand inside the function.
-$threwMulti = $false
-try {
-    Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor','runner')
-}
-catch { $threwMulti = $true }
-CheckTrue "msg-2189: multi-element -Requires array THROWS (fail-closed on multi-resource)" $threwMulti
-# Also confirm 3+ element arrays throw (not just 2).
-$threwThree = $false
-try {
-    Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor','runner','gpu')
-}
-catch { $threwThree = $true }
-CheckTrue "msg-2189: 3-element -Requires array THROWS" $threwThree
-# Wrong types (hashtable, integer) also throw — the entry validation is exhaustive.
-$threwHash = $false
-try {
-    Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @{ editor = 'x' }
-}
-catch { $threwHash = $true }
-CheckTrue "msg-2189: hashtable -Requires THROWS (type is not string/array)" $threwHash
-$threwInt = $false
-try {
-    Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires 42
-}
-catch { $threwInt = $true }
-CheckTrue "msg-2189: integer -Requires THROWS" $threwInt
+# Row #6b mandates a SINGLE fixture driving both functions so a rejection cannot exist on one
+# function and not the other. Row #6c mandates that a DIRECT-ACQUIRE path (Invoke-LeaseAcquire
+# called without Test-LeaseAvailableFor first) hits the same rejection set. Row #6a mandates
+# that this validation is implemented by a SHARED helper — the row-6b fixture below is the
+# executable enforcement of that shared implementation.
+#
+# The rejected-set table is the msg-2932 §3 #6b table verbatim. Do NOT duplicate the entries
+# below across two hand-written loops — the loop drives both functions from ONE table.
 
-# Single-element array still coerces to its scalar — the documented pwsh convenience the R2
-# tests already relied on. This is preserved BY DESIGN in the entry validation (see msg-2189
-# rationale in the SYNOPSIS: a 1-element array is a common pwsh idiom, and rejecting it would
-# be paranoid over-restriction without adding any safety).
-$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor')
-Check "single-element array coerces to string (backward-compat preserved)" 'waiting' $check.status
-Check "single-element array: waitOn has exactly one element" 1 $check.waitOn.Count
-# Empty array is the same as null / empty string.
-$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @()
-Check "empty array -Requires: available" 'available' $check.status
+$leaseRejectedSet = @(
+    @{ label = "multi-element array (2, R3 case)"; value = @('editor','runner') }
+    @{ label = "multi-element array (3)";          value = @('editor','runner','gpu') }
+    @{ label = "single-element array (do NOT unwrap silently)"; value = @('editor') }
+    @{ label = "empty array";                      value = @() }
+    @{ label = "hashtable";                        value = @{ name = 'editor' } }
+    @{ label = "integer";                          value = 42 }
+    @{ label = "bool `$true (msg-2746: locks phantom key 'True')"; value = $true }
+    @{ label = "bool `$false";                     value = $false }
+    @{ label = "`$null";                            value = $null }
+    @{ label = "empty string ''";                  value = '' }
+    @{ label = "whitespace-only '   '";            value = '   ' }
+    @{ label = "arbitrary [pscustomobject]";       value = [pscustomobject]@{ n = 1 } }
+)
 
-# Regression pin: the R2 test that WAS wrong. If a future refactor re-introduces silent joining
-# ('available' for a coerced nonsense name), the naysayer's R3 failure mode returns. Explicitly
-# assert the OPPOSITE of R2's claim: the multi-array MUST NOT return 'available' — it must throw.
-# (This is a dual formulation of the throw check above; keeping both makes the intent obvious to
-# a future refactor reader who might grep either phrase.)
-$didNotReturnAvailable = $false
+function Assert-ThrowsForResource {
+    param([scriptblock]$Call, [string]$Label, [string]$Function)
+    $threw = $false
+    try { & $Call | Out-Null } catch { $threw = $true }
+    CheckTrue ("msg-2932 §3 #6b [$Function]: $Label MUST throw") $threw
+}
+
+# Row #6b — same table drives both functions. Row #6c is implicitly satisfied because
+# Invoke-LeaseAcquire's own call throws before any state-map lookup, whether Test-LeaseAvailableFor
+# was consulted or not; the explicit direct-acquire pin lives just below the loop.
+foreach ($case in $leaseRejectedSet) {
+    Assert-ThrowsForResource -Function 'Test-LeaseAvailableFor' -Label $case.label -Call {
+        Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires $case.value
+    }.GetNewClosure()
+    Assert-ThrowsForResource -Function 'Invoke-LeaseAcquire' -Label $case.label -Call {
+        Invoke-LeaseAcquire -LeasesState @{} -Resource $case.value -CandidateKey 'p/T-x' -Now $now2
+    }.GetNewClosure()
+}
+
+# Row #6c DIRECT-ACQUIRE PIN — Invoke-LeaseAcquire is called WITHOUT Test-LeaseAvailableFor first.
+# Rejection must still hold; the authorisation lives in the mutation (msg-1959), so the guard
+# must too. Use a representative rejection from the table (multi-element array — the R3 case).
+$threwDirect = $false
 try {
-    $verdict = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires @('editor','runner')
-    # If we reach here without an exception, the fix regressed — record the wrong behaviour.
-    $didNotReturnAvailable = ($verdict.status -ne 'available')
+    Invoke-LeaseAcquire -LeasesState @{} -Resource @('editor','runner') -CandidateKey 'p/T-x' -Now $now2
 }
-catch {
-    # Exception is the correct behaviour — the fix is holding.
-    $didNotReturnAvailable = $true
-}
-CheckTrue "msg-2189 (R2 regression pin): multi-element array MUST NOT return 'available'" $didNotReturnAvailable
+catch { $threwDirect = $true }
+CheckTrue "msg-2932 §3 #6c DIRECT-ACQUIRE PIN: rejection holds without Test-LeaseAvailableFor call" $threwDirect
+
+# Accepted-set counterpart. Row #6b: 'editor' plain string works, AND a [string] arriving inside
+# a PSObject shell (splat / pipeline / ConvertFrom-Json) is accepted after BaseObject unwrap.
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires 'editor'
+Check "row #6b accepted: plain 'editor' string" 'waiting' $check.status
+# Simulate the PSObject-wrapped path: ConvertFrom-Json wraps scalars in PSObject, and the
+# BaseObject IS the underlying string. The helper's unwrap step accepts this.
+$wrapped = '"editor"' | ConvertFrom-Json    # this yields the string 'editor' wrapped in a PSObject shell
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-x' -Requires $wrapped
+Check "row #6b accepted: [string] arriving inside PSObject shell (splat/pipeline)" 'waiting' $check.status
+# The direct-acquire path also accepts a wrapped string.
+$acqStateDirect = @{}
+$threwWrappedAcq = $false
+try { Invoke-LeaseAcquire -LeasesState $acqStateDirect -Resource $wrapped -CandidateKey 'p/T-a' -Now $now2 }
+catch { $threwWrappedAcq = $true }
+CheckFalse "row #6b accepted: Invoke-LeaseAcquire on PSObject-wrapped [string] does NOT throw" $threwWrappedAcq
+Check "row #6b accepted: Invoke-LeaseAcquire on wrapped string created the record" 'p/T-a' $acqStateDirect['editor']['holder']
 
 # Acquire after a release preserves reclaim_required + reclaimed_from + reclaimed_reason —
 # these are the PERMANENT audit trail the new holder inherits.
@@ -1036,6 +1088,434 @@ try {
 finally {
     Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# --- 13. Grant seam — Get-NextLeaseWaiter / Invoke-LeasePromotion / Invoke-LeaseGrantFromEmpty ---
+#
+# Covers CHECKLIST rows #1 (end-to-end grant FIFO), #2 (no-steal invariant in the grant path),
+# and #3 (expiry → reclaim → next-waiter promotion). These are the msg-1958 §5 pins from PR 3's
+# core scope, previously listed as "will be added in PR 3" in the earlier header comment.
+Write-Host ""
+Write-Host "Grant seam (rows #1-#3) — FIFO promotion, no-steal, expiry → reclaim ordering"
+
+$graceNow = [datetime]::Parse('2026-08-30T00:00:00Z').ToUniversalTime()
+
+# --- ROW #1: end-to-end grant FIFO across candidates -------------------------------------------
+# Waiter A enqueues first, waiter B enqueues second (later waiting_since). When the lease frees
+# and Invoke-LeaseGrantFromEmpty runs, A must be promoted, not B — even if the sweep enumeration
+# order lists B first (msg-1183 D-3: waiting-time FIFO wins over sweep order).
+$state = @{ editor = @{ holder = 'p/T-holder'; generation = 1; queue = @() } }
+Add-LeaseWaiter -Lease $state['editor'] -WaiterKey 'p/T-A' -Now $graceNow
+Add-LeaseWaiter -Lease $state['editor'] -WaiterKey 'p/T-B' -Now $graceNow.AddMinutes(1)
+# Sweep enumeration order deliberately puts B first. FIFO must still pick A.
+$peeked = Get-NextLeaseWaiter -Lease $state['editor'] -SweepOrder @('p/T-B','p/T-A')
+Check "row #1 peek: FIFO picks A over B (waiting_since wins over sweep order)" `
+    'p/T-A' $(if ($peeked -is [hashtable]) { $peeked['key'] } else { $peeked.key })
+
+# Now free the lease (holder released, permanent audit remains) and grant from empty.
+$state['editor']['holder'] = $null
+$state['editor']['reclaimed_from'] = 'p/T-holder'
+$state['editor']['reclaimed_at']   = $graceNow.ToUniversalTime().ToString("o")
+$state['editor']['reclaimed_reason'] = 'human-clear: PIE crashed'
+$promoted = Invoke-LeaseGrantFromEmpty -Lease $state['editor'] -Now $graceNow.AddMinutes(2) `
+    -SweepOrder @('p/T-B','p/T-A')
+Check "row #1 grant: FIFO promoted A"          'p/T-A' $promoted
+Check "row #1 grant: holder is A"              'p/T-A' $state['editor']['holder']
+Check "row #1 grant: A dequeued"               1       $state['editor']['queue'].Count
+Check "row #1 grant: B still in queue"         'p/T-B' $state['editor']['queue'][0].key
+Check "row #1 grant: generation bumped"        2       $state['editor']['generation']
+Check "row #1 grant: PERMANENT audit preserved (reclaimed_from)" 'p/T-holder' $state['editor']['reclaimed_from']
+Check "row #1 grant: PERMANENT audit preserved (reclaimed_reason)" 'human-clear: PIE crashed' $state['editor']['reclaimed_reason']
+
+# Tie-break: two waiters with the EXACT same waiting_since fall back to sweep order (not queue
+# order, not alphabetical). This is what makes 'sweep order' the deterministic tie-break rather
+# than "whatever the hashtable enumeration happens to be".
+$state = @{ editor = @{ holder = $null; generation = 0; queue = @() } }
+Add-LeaseWaiter -Lease $state['editor'] -WaiterKey 'p/T-Y' -Now $graceNow
+Add-LeaseWaiter -Lease $state['editor'] -WaiterKey 'p/T-X' -Now $graceNow  # same waiting_since
+$peeked = Get-NextLeaseWaiter -Lease $state['editor'] -SweepOrder @('p/T-X','p/T-Y')
+Check "row #1 tie: same waiting_since -> sweep order wins (X before Y)" `
+    'p/T-X' $(if ($peeked -is [hashtable]) { $peeked['key'] } else { $peeked.key })
+
+# Eligible-set filter: a waiter not in the eligible set is skipped WITHOUT being removed from
+# the queue (that removal is Remove-IneligibleLeaseWaiters' job).
+$state = @{ editor = @{ holder = $null; generation = 0; queue = @() } }
+Add-LeaseWaiter -Lease $state['editor'] -WaiterKey 'p/T-A' -Now $graceNow
+Add-LeaseWaiter -Lease $state['editor'] -WaiterKey 'p/T-B' -Now $graceNow.AddMinutes(1)
+$peeked = Get-NextLeaseWaiter -Lease $state['editor'] -SweepOrder @('p/T-A','p/T-B') -EligibleKeys @('p/T-B')
+Check "row #1 eligibility: A skipped (not eligible), B picked" `
+    'p/T-B' $(if ($peeked -is [hashtable]) { $peeked['key'] } else { $peeked.key })
+Check "row #1 eligibility: peek did NOT mutate the queue" 2 $state['editor']['queue'].Count
+
+# --- ROW #2: no-steal invariant preserved in the grant path -----------------------------------
+# The grant path promotes a waiter into an OCCUPIED lease (during Invoke-LeasePromotion Phase 2),
+# but does so through a `reclaimed_from`-annotated write — NOT through Invoke-LeaseAcquire. A
+# raw Invoke-LeaseAcquire on the same occupied lease MUST still throw (msg-1958 §5), even after
+# the grant path has fired earlier in the same tick. This is what stops a candidate outside the
+# queue from "smuggling" itself in via a direct acquire on a busy lease.
+$state = @{ editor = @{ holder = 'p/T-C'; generation = 7; queue = @() } }
+$threwSteal = $false
+try { Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-outsider' -Now $graceNow }
+catch { $threwSteal = $true }
+CheckTrue "row #2 no-steal: raw acquire on occupied lease still throws" $threwSteal
+Check "row #2 no-steal: holder is untouched by the failed acquire" 'p/T-C' $state['editor']['holder']
+Check "row #2 no-steal: generation is untouched by the failed acquire" 7 $state['editor']['generation']
+
+# And after a grant path fires (Phase 2 reclaim), the freshly-promoted lease is still protected
+# from a direct steal — the grant did not open a window during which a non-queued outsider can
+# race in on the same tick.
+$state = @{ editor = @{ holder = 'p/T-holder'; generation = 3; queue = @( @{ key = 'p/T-A'; waiting_since = $graceNow.ToUniversalTime().ToString("o") } ); expiring = $true } }
+$verdict = Invoke-LeasePromotion -Lease $state['editor'] -Reason 'idle' -Now $graceNow.AddMinutes(5) -SweepOrder @('p/T-A')
+Check "row #2 pre-check: Phase-2 promotion promoted A" 'phase-2-promoted' $verdict
+Check "row #2 pre-check: new holder is A" 'p/T-A' $state['editor']['holder']
+$threwPostGrant = $false
+try { Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-outsider' -Now $graceNow.AddMinutes(6) }
+catch { $threwPostGrant = $true }
+CheckTrue "row #2 no-steal: outsider CANNOT acquire the freshly-promoted lease" $threwPostGrant
+Check "row #2 no-steal: A is still the holder after the outsider's failed acquire" 'p/T-A' $state['editor']['holder']
+
+# --- ROW #3: expiry -> reclaim -> next-waiter grant ordering ----------------------------------
+# The state machine is TWO-PHASE (msg-1183 D-6'd): mark-expiring at tick T, promote at T+1.
+# The 1-tick pre-emption window is what lets a legitimate holder come back before the queue
+# takes over. Row #3 pins the ordering: Phase 1 does NOT change the holder, Phase 2 DOES, and
+# the new holder is the FIFO next waiter.
+$state = @{
+    editor = @{
+        holder            = 'p/T-holder'
+        acquired_at       = '2026-08-29T00:00:00Z'
+        last_progress_at  = '2026-08-29T00:00:00Z'
+        idle_evaluations  = 6
+        generation        = 3
+        pinned            = $false
+        expiring          = $false
+        reclaimed_from    = $null
+        reclaimed_at      = $null
+        reclaimed_reason  = $null
+        reclaim_required  = $false
+        revoked_at        = $null
+        revoked_reason    = $null
+        queue             = @( @{ key = 'p/T-next'; waiting_since = $graceNow.ToUniversalTime().ToString("o") } )
+    }
+}
+# Tick T: Phase 1. Mark expiring, record transient intent. Do NOT change holder.
+$phase1 = Invoke-LeasePromotion -Lease $state['editor'] -Reason 'idle' -Now $graceNow -SweepOrder @('p/T-next')
+Check "row #3 Phase 1: verdict = 'phase-1'" 'phase-1' $phase1
+Check "row #3 Phase 1: holder UNCHANGED (1-tick pre-emption window)" 'p/T-holder' $state['editor']['holder']
+CheckTrue "row #3 Phase 1: expiring flag set" ([bool]$state['editor']['expiring'])
+Check "row #3 Phase 1: revoked_reason set (TRANSIENT)" 'idle' $state['editor']['revoked_reason']
+Check "row #3 Phase 1: reclaimed_from still null (nothing reclaimed YET)" $null $state['editor']['reclaimed_from']
+Check "row #3 Phase 1: generation UNCHANGED (no ownership change)" 3 $state['editor']['generation']
+
+# Tick T+1: Phase 2. Actual reclamation. New holder is the FIFO next waiter.
+$phase2 = Invoke-LeasePromotion -Lease $state['editor'] -Reason 'idle' -Now $graceNow.AddMinutes(5) -SweepOrder @('p/T-next')
+Check "row #3 Phase 2: verdict = 'phase-2-promoted'" 'phase-2-promoted' $phase2
+Check "row #3 Phase 2: new holder is the FIFO next waiter" 'p/T-next' $state['editor']['holder']
+Check "row #3 Phase 2: reclaimed_from PAIRED with prior holder" 'p/T-holder' $state['editor']['reclaimed_from']
+Check "row #3 Phase 2: reclaimed_reason PAIRED with reason" 'idle' $state['editor']['reclaimed_reason']
+CheckFalse "row #3 Phase 2: expiring cleared" ([bool]$state['editor']['expiring'])
+Check "row #3 Phase 2: revoked_at cleared (TRANSIENT consumed)" $null $state['editor']['revoked_at']
+CheckTrue "row #3 Phase 2: reclaim_required=true (new holder must restart resource)" ([bool]$state['editor']['reclaim_required'])
+Check "row #3 Phase 2: promoted waiter dequeued" 0 $state['editor']['queue'].Count
+Check "row #3 Phase 2: generation bumped" 4 $state['editor']['generation']
+
+# Phase 2 with an empty queue = release (holder null, permanent audit written, no successor).
+# msg-2946 blocking objection fix: the release MUST set reclaim_required = $true because the
+# flag is a property of the RESOURCE (dirty vs. clean), not the successor candidate. The
+# previous holder was forcefully evicted, so the physical resource is dirty and remains so
+# until SOMEONE restarts it. The next candidate that later acquires this empty record MUST
+# inherit `$true` so it knows to restart before use — the end-to-end regression pin at the
+# end of this section chains release-then-acquire to prove the signal survives.
+$state = @{
+    editor = @{
+        holder = 'p/T-holder'; generation = 3; expiring = $true
+        revoked_at = $graceNow.ToUniversalTime().ToString("o"); revoked_reason = 'idle'
+        queue = @()
+    }
+}
+$verdict = Invoke-LeasePromotion -Lease $state['editor'] -Reason 'idle' -Now $graceNow.AddMinutes(5) -SweepOrder @()
+Check "row #3 released: verdict = 'phase-2-released'" 'phase-2-released' $verdict
+Check "row #3 released: holder cleared (empty stub, caller MUST remove)" $null $state['editor']['holder']
+Check "row #3 released: reclaimed_from PAIRED even on release" 'p/T-holder' $state['editor']['reclaimed_from']
+Check "row #3 released: reclaimed_reason PAIRED even on release" 'idle' $state['editor']['reclaimed_reason']
+CheckTrue "row #3 released: reclaim_required=TRUE (msg-2946: dirty-resource signal survives empty release)" ([bool]$state['editor']['reclaim_required'])
+Check "row #3 released: generation bumped" 4 $state['editor']['generation']
+
+# msg-2946 END-TO-END REGRESSION PIN. The blocking objection was: "when a lease is forcefully
+# reclaimed with an empty queue, clearing reclaim_required to $false causes the next
+# candidate that acquires the lease to inherit the false flag and use a physically dirty
+# resource without restarting it". Chain the two operations here so a future refactor that
+# reintroduces the clear-on-release semantics reds this pin regardless of whether the two
+# functions still test in isolation.
+$state = @{
+    editor = @{
+        holder = 'p/T-crashed'; generation = 7; expiring = $true
+        revoked_at = $graceNow.ToUniversalTime().ToString("o"); revoked_reason = 'idle'
+        queue = @()
+    }
+}
+$verdict = Invoke-LeasePromotion -Lease $state['editor'] -Reason 'idle' -Now $graceNow.AddMinutes(5)
+Check "msg-2946 end-to-end setup: release verdict = 'phase-2-released'" 'phase-2-released' $verdict
+CheckTrue "msg-2946 end-to-end setup: reclaim_required survives release" ([bool]$state['editor']['reclaim_required'])
+# Now a fresh candidate arrives (later tick) and acquires this empty record.
+Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-successor' -Now $graceNow.AddMinutes(30)
+Check "msg-2946 end-to-end: successor becomes holder" 'p/T-successor' $state['editor']['holder']
+CheckTrue "msg-2946 end-to-end: successor inherits reclaim_required=TRUE (would have red-ed under the pre-fix behaviour)" `
+    ([bool]$state['editor']['reclaim_required'])
+Check "msg-2946 end-to-end: successor inherits reclaimed_from audit" 'p/T-crashed' $state['editor']['reclaimed_from']
+Check "msg-2946 end-to-end: successor inherits reclaimed_reason audit" 'idle' $state['editor']['reclaimed_reason']
+
+# Phase 2 with an INELIGIBLE queue (waiter present but off-sweep) = release (no promotion).
+$state = @{
+    editor = @{
+        holder = 'p/T-holder'; generation = 3; expiring = $true
+        queue = @( @{ key = 'p/T-dead'; waiting_since = $graceNow.ToUniversalTime().ToString("o") } )
+    }
+}
+$verdict = Invoke-LeasePromotion -Lease $state['editor'] -Reason 'idle' -Now $graceNow -SweepOrder @() -EligibleKeys @()
+Check "row #3 released (ineligible queue): verdict = 'phase-2-released'" 'phase-2-released' $verdict
+Check "row #3 released (ineligible queue): holder cleared" $null $state['editor']['holder']
+
+# Non-expiring lease + Invoke-LeasePromotion = Phase 1 (idempotent — cannot skip to Phase 2 by
+# calling twice without a tick boundary between them, because Phase 1 has to observe expiring=$true).
+$state = @{ editor = @{ holder = 'p/T-holder'; generation = 3; expiring = $false; queue = @() } }
+$phase1a = Invoke-LeasePromotion -Lease $state['editor'] -Reason 'idle' -Now $graceNow
+Check "row #3 double-call: first call is Phase 1" 'phase-1' $phase1a
+# Second call sees expiring=$true from the first call, so it advances to Phase 2. This is the
+# tick-boundary contract: the caller must NOT call promotion twice in a single tick, but the
+# state machine trusts the caller's tick discipline and does what it is told when it IS called.
+$phase2a = Invoke-LeasePromotion -Lease $state['editor'] -Reason 'idle' -Now $graceNow.AddMinutes(5)
+Check "row #3 double-call: second call advances to Phase 2 (release; no waiter)" 'phase-2-released' $phase2a
+
+# --- 14. ROW #7 ORDERING PIN (msg-2644 §3) — un-rollbackable side effects gated by acquire ------
+#
+# ROW #8 COVERAGE DOCUMENTATION (msg-2645 advisory, msg-2653 Tier-C, msg-2738 §3). This pin
+# is a NEGATIVE check bound to SPECIFIC command names. A silent green under a renamed or
+# newly-added un-rollbackable command is EXACTLY the failure mode this item exists to catch.
+#
+#   COMMANDS THIS PIN GUARDS (enumerated exhaustively at PR 3 time):
+#     - Invoke-HeadSkipCommitLaunch  (commits the head-skip in conductor state; msg-2644 §2)
+#
+#   NO OTHER UN-ROLLBACKABLE COMMANDS ARE REACHABLE FROM THE CANDIDATE LOOP AT PR 3 TIME.
+#   The candidate loop's wrapper wiring lands in PR 4. Until it does, the only un-rollbackable
+#   surface a caller could reach between Test-LeaseAvailableFor and Invoke-LeaseAcquire is
+#   Invoke-HeadSkipCommitLaunch itself (per msg-2644 §2's enumeration: "head-skip commit /
+#   process launch / write to sweep or loop-control state that a later abort cannot undo").
+#   Neither `Update-LoopControlState` nor any process-launch shim (`Start-Editor`, `Invoke-Pie`,
+#   the runner spawn) is present in this repository AT THIS COMMIT — they either live in
+#   voxelworld / magickit-side scripts or land in PR 4. The pin below is therefore EXHAUSTIVE
+#   for its scope; the moment PR 4 adds ANY new un-rollbackable command reachable from the
+#   candidate loop, this comment must be updated in the SAME PR to name it and the pin below
+#   must gain a matching zero-call spy. Row #9b's single-source rule (checklist canonical)
+#   applies: DO NOT fork this enumeration.
+#
+# HOW THE PIN WORKS. We construct the caller-of-record — the candidate-loop step that reads
+# a Test-LeaseAvailableFor verdict, then Invoke-LeaseAcquire, then (only on success) fires the
+# un-rollbackable command. The spy replaces the un-rollbackable so we can count invocations.
+# We drive the caller into the acquire-failure branch (lease is already held by someone else,
+# so acquire throws) and assert the spy is called ZERO times. If a future refactor reverses
+# the order (fire, then acquire) — even by accident — this pin will red.
+#
+# REVERT-AND-RERUN RECEIPT. Bohr msg-2644 §3 requires that this pin be demonstrably load-
+# bearing: reversing the sequence in the caller must make the pin ACTUALLY fail. The reverted-
+# caller variant is exercised inline below (with a local flag $revertOrder) so a maintainer
+# can flip a single boolean and observe the pin flip red — the receipt lives in this test file
+# rather than in an out-of-band scratch script.
+
+Write-Host ""
+Write-Host "Row #7 ordering pin — Invoke-HeadSkipCommitLaunch is called 0 times on acquire failure"
+
+# The spy: a stand-in for Invoke-HeadSkipCommitLaunch that only records call counts. It NEVER
+# runs the real head-skip commit (there is no real head-skip commit in this test scope — PR 4
+# territory). Row #8 explicitly documents that this is the SINGLE guarded command at PR 3 time.
+$script:orderingSpyCalls = 0
+function Invoke-HeadSkipCommitLaunch { $script:orderingSpyCalls++ }
+
+# The candidate-loop step under test. The parameter $revertOrder is the REVERT-AND-RERUN switch:
+# when $false, we exercise the CORRECT order (acquire then head-skip); when $true, we exercise
+# the REVERSED (broken) order (head-skip then acquire). Row #7 requires that the pin FAILS
+# under the reversed order and PASSES under the correct order. Both branches share the same
+# call to the spy so the spy count semantics are identical.
+function Invoke-CandidateStep {
+    param(
+        [hashtable]$LeasesState,
+        [string]$Resource,
+        [string]$CandidateKey,
+        [datetime]$Now,
+        [bool]$RevertOrder = $false
+    )
+    $verdict = Test-LeaseAvailableFor -LeasesState $LeasesState -CandidateKey $CandidateKey -Requires $Resource
+    if ($verdict.status -ne 'available') {
+        # Waiting — the caller MUST NOT acquire, MUST NOT commit head-skip, MUST NOT launch,
+        # and MUST call Register-LeaseWaiter (row #5 docstring contract).
+        Register-LeaseWaiter -LeasesState $LeasesState -Resource $Resource -WaiterKey $CandidateKey -Now $Now
+        return 'waiting'
+    }
+    if ($RevertOrder) {
+        # BROKEN sequence: commit un-rollbackable side effect FIRST, then acquire. If the
+        # acquire fails (TOCTOU), the head-skip is already committed — the candidate has
+        # consumed its turn without holding the lease. This is precisely the failure the
+        # ordering pin exists to detect.
+        Invoke-HeadSkipCommitLaunch
+        try { Invoke-LeaseAcquire -LeasesState $LeasesState -Resource $Resource -CandidateKey $CandidateKey -Now $Now }
+        catch { return 'acquire-failed-after-headskip' }
+        return 'launched'
+    }
+    # CORRECT sequence (msg-2644 §2 ORDERING REQUIREMENT verbatim in Test-LeaseAvailableFor
+    # docstring): acquire MUST succeed BEFORE any un-rollbackable side effect.
+    try { Invoke-LeaseAcquire -LeasesState $LeasesState -Resource $Resource -CandidateKey $CandidateKey -Now $Now }
+    catch {
+        # Acquire failure after 'available' verdict — an EXPECTED outcome (TOCTOU). The caller
+        # MUST NOT proceed to the un-rollbackable side effect. Fall through to register-and-return.
+        Register-LeaseWaiter -LeasesState $LeasesState -Resource $Resource -WaiterKey $CandidateKey -Now $Now
+        return 'acquire-failed'
+    }
+    Invoke-HeadSkipCommitLaunch
+    return 'launched'
+}
+
+# CORRECT ORDER, ACQUIRE SUCCEEDS. The head-skip commit fires exactly once — this is the
+# healthy path, and the pin does NOT prevent it. This branch exists to prove the pin does
+# not over-guard (a "spy always 0" pin is a tautology; we need it to be 1 in the happy path).
+$script:orderingSpyCalls = 0
+$state = @{}
+$result = Invoke-CandidateStep -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-a' -Now $graceNow -RevertOrder:$false
+Check "row #7 sanity: healthy path launches" 'launched' $result
+Check "row #7 sanity: head-skip called exactly once on the healthy path" 1 $script:orderingSpyCalls
+
+# CORRECT ORDER, ACQUIRE FAILS (TOCTOU). This is THE row-#7 pin.
+# Set up: a foreign holder already owns the lease. Test-LeaseAvailableFor will return 'waiting'
+# for our candidate — so the caller MUST NOT even attempt acquire, and definitely MUST NOT
+# commit head-skip. Spy must be 0.
+$script:orderingSpyCalls = 0
+$state = @{ editor = @{ holder = 'p/T-other'; generation = 4; queue = @() } }
+$result = Invoke-CandidateStep -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-a' -Now $graceNow -RevertOrder:$false
+Check "row #7: verdict on foreign lease is 'waiting'" 'waiting' $result
+Check "row #7 PIN: head-skip called 0 times when verdict is 'waiting'" 0 $script:orderingSpyCalls
+CheckTrue "row #7 PIN: caller queued via Register-LeaseWaiter" ($state['editor']['queue'].Count -eq 1)
+
+# CORRECT ORDER, TOCTOU RACE. Test-LeaseAvailableFor returned 'available', then a competing
+# candidate acquired between the verdict and OUR acquire, so OUR acquire throws. Head-skip
+# must be 0 (msg-2644 §3, the load-bearing case).
+$script:orderingSpyCalls = 0
+$state = @{ editor = @{ holder = 'p/T-competitor'; generation = 1; queue = @() } }
+# Force 'available' by clearing the holder immediately before Test-LeaseAvailableFor sees it,
+# then restore before Invoke-LeaseAcquire — this simulates the TOCTOU window mechanically.
+$check = Test-LeaseAvailableFor -LeasesState @{} -CandidateKey 'p/T-a' -Requires 'editor'
+Check "row #7 TOCTOU setup: bare-state verdict is 'available'" 'available' $check.status
+# Now exercise the caller under the real state where our acquire will fail on the no-steal
+# throw (competitor is still the holder). This is the exact failure the spec calls "acquire
+# failure after an 'available' verdict — an EXPECTED outcome, not an error".
+$script:orderingSpyCalls = 0
+function Invoke-CandidateStepToctou {
+    # Same as Invoke-CandidateStep, but uses an already-obtained 'available' verdict from
+    # the empty state (pre-race), so the caller reaches the acquire branch and gets the
+    # no-steal throw against the post-race state.
+    param([hashtable]$LeasesState, [datetime]$Now, [bool]$RevertOrder = $false)
+    if ($RevertOrder) {
+        Invoke-HeadSkipCommitLaunch
+        try { Invoke-LeaseAcquire -LeasesState $LeasesState -Resource 'editor' -CandidateKey 'p/T-a' -Now $Now }
+        catch { return 'acquire-failed-after-headskip' }
+        return 'launched'
+    }
+    try { Invoke-LeaseAcquire -LeasesState $LeasesState -Resource 'editor' -CandidateKey 'p/T-a' -Now $Now }
+    catch {
+        Register-LeaseWaiter -LeasesState $LeasesState -Resource 'editor' -WaiterKey 'p/T-a' -Now $Now
+        return 'acquire-failed'
+    }
+    Invoke-HeadSkipCommitLaunch
+    return 'launched'
+}
+$result = Invoke-CandidateStepToctou -LeasesState $state -Now $graceNow -RevertOrder:$false
+Check "row #7 TOCTOU: verdict is 'acquire-failed' (no-steal throw)" 'acquire-failed' $result
+Check "row #7 TOCTOU PIN: head-skip called 0 times when acquire throws" 0 $script:orderingSpyCalls
+CheckTrue "row #7 TOCTOU: caller queued via Register-LeaseWaiter after failure" ($state['editor']['queue'].Count -eq 1)
+Check "row #7 TOCTOU: competitor is still the holder (no accidental steal)" 'p/T-competitor' $state['editor']['holder']
+
+# REVERT-AND-RERUN receipt (msg-2644 §3). Prove the pin is load-bearing: with the order reversed
+# in the caller, the spy IS called before the acquire fails — the pin's zero-call assertion
+# would NOW be wrong. We check that inline so the pin's proof lives next to the pin.
+$script:orderingSpyCalls = 0
+$state = @{ editor = @{ holder = 'p/T-competitor'; generation = 1; queue = @() } }
+$result = Invoke-CandidateStepToctou -LeasesState $state -Now $graceNow -RevertOrder:$true
+Check "row #7 REVERT: with reversed order, caller reports acquire-failed-after-headskip" `
+    'acquire-failed-after-headskip' $result
+Check "row #7 REVERT (load-bearing receipt): under reversed order the spy IS called (would have red-ed the pin)" `
+    1 $script:orderingSpyCalls
+
+# --- 15. Remove-IneligibleLeaseWaiters ---------------------------------------------------------
+Write-Host ""
+Write-Host "Remove-IneligibleLeaseWaiters — off-sweep / quarantined waiters are scrubbed"
+
+$state = @{ editor = @{ holder = 'p/T-h'; queue = @() } }
+Add-LeaseWaiter -Lease $state['editor'] -WaiterKey 'p/T-live'    -Now $graceNow
+Add-LeaseWaiter -Lease $state['editor'] -WaiterKey 'p/T-dead'    -Now $graceNow.AddSeconds(1)
+Add-LeaseWaiter -Lease $state['editor'] -WaiterKey 'p/T-jailed'  -Now $graceNow.AddSeconds(2)
+$removed = Remove-IneligibleLeaseWaiters -Lease $state['editor'] `
+    -SweepKeys @('p/T-live','p/T-jailed') `
+    -QuarantinedKeys @('p/T-jailed')
+Check "Remove-IneligibleLeaseWaiters: 2 removed (dead + jailed)" 2 $removed
+Check "Remove-IneligibleLeaseWaiters: only p/T-live remains" 1 $state['editor']['queue'].Count
+Check "Remove-IneligibleLeaseWaiters: preserves order of survivors" 'p/T-live' $state['editor']['queue'][0].key
+
+# No-op on null lease / missing queue.
+$removed = Remove-IneligibleLeaseWaiters -Lease $null -SweepKeys @('p/T-live')
+Check "Remove-IneligibleLeaseWaiters on null lease: 0 removed" 0 $removed
+
+# --- 16. Row #4 TOCTOU pin — 'available' can be followed by a failing acquire (docstring load-bearing) ---
+Write-Host ""
+Write-Host "Row #4 — 'available' verdict is ADVISORY: acquire MAY fail (TOCTOU); caller MUST NOT launch"
+
+# The load-bearing docstring clause on Test-LeaseAvailableFor is "acquire failure after
+# 'available' is an EXPECTED outcome, not an error". Row #4 pins that clause: we set up a
+# state where verdict is 'available', then simulate a competing acquire, then observe that
+# OUR subsequent acquire is refused by the no-steal throw.
+
+$state = @{}
+$check = Test-LeaseAvailableFor -LeasesState $state -CandidateKey 'p/T-a' -Requires 'editor'
+Check "row #4 setup: verdict on empty state is 'available'" 'available' $check.status
+# Meanwhile a different candidate acquired.
+Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-b' -Now $graceNow
+# Our acquire (having read 'available' pre-race) now throws.
+$threwToctou = $false
+try { Invoke-LeaseAcquire -LeasesState $state -Resource 'editor' -CandidateKey 'p/T-a' -Now $graceNow.AddSeconds(1) }
+catch { $threwToctou = $true }
+CheckTrue "row #4 PIN: acquire after 'available' verdict CAN fail (no-steal throw)" $threwToctou
+Check "row #4 PIN: original holder (p/T-b) is UNCHANGED by our failed acquire" 'p/T-b' $state['editor']['holder']
+
+# --- 17. Row #5 documentation pin — .DESCRIPTION docstring MUST spell out the three required things --
+Write-Host ""
+Write-Host "Row #5 — Test-LeaseAvailableFor docstring MUST document asymmetric contract + collapse rationale + ORDERING REQUIREMENT"
+
+$help = Get-Help -Name Test-LeaseAvailableFor -Full | Out-String
+CheckTrue "row #5a: docstring mentions 'ADVISORY' (asymmetric contract)" `
+    ([bool]($help -match 'ADVISORY'))
+CheckTrue "row #5a: docstring mentions 'BINDING' (asymmetric contract)" `
+    ([bool]($help -match 'BINDING'))
+CheckTrue "row #5b: docstring mentions the 'available' COLLAPSE (free OR held-by-self)" `
+    ([bool]($help -match "free OR already held by this candidate|free.*OR.*HELD BY THIS candidate|folds two distinct situations"))
+CheckTrue "row #5b: docstring mentions the collapse RATIONALE (idempotent acquire)" `
+    ([bool]($help -match 'idempotent'))
+CheckTrue "row #5c: docstring mentions ORDERING REQUIREMENT verbatim (msg-2644 §2)" `
+    ([bool]($help -match 'ORDERING REQUIREMENT'))
+CheckTrue "row #5c: docstring names Invoke-HeadSkipCommitLaunch in the un-rollbackable list" `
+    ([bool]($help -match 'Invoke-HeadSkipCommitLaunch'))
+CheckTrue "row #5c: docstring names Register-LeaseWaiter as the failure-path action" `
+    ([bool]($help -match 'Register-LeaseWaiter'))
+CheckTrue "row #5c: docstring calls out TOCTOU as EXPECTED (not error)" `
+    ([bool]($help -match 'TOCTOU'))
+# Cross-reference: entry validation lives on row #6a's shared helper — docstring MUST direct
+# readers to Assert-LeaseResourceName rather than restating the accepted-input shape inline
+# (msg-2932 §4).
+CheckTrue "row #5 cross-ref: docstring points to Assert-LeaseResourceName for entry validation" `
+    ([bool]($help -match 'Assert-LeaseResourceName'))
+
+# Verdict domain is UNCHANGED (msg-2738 §5 correction 1): still exactly two values, still with
+# the same 'free ∪ held-by-self -> available' collapse. Row #5 is documentation-only.
+$s = @{}
+$check = Test-LeaseAvailableFor -LeasesState $s -CandidateKey 'p/T-a' -Requires 'editor'
+Check "row #5 verdict domain unchanged: free -> 'available'" 'available' $check.status
+Invoke-LeaseAcquire -LeasesState $s -Resource 'editor' -CandidateKey 'p/T-a' -Now $graceNow
+$check = Test-LeaseAvailableFor -LeasesState $s -CandidateKey 'p/T-a' -Requires 'editor'
+Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdict as free)" 'available' $check.status
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }
