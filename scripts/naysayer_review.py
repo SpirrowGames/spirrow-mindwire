@@ -35,6 +35,14 @@ Run::
 prints — the ledger holds the critique, the design thread is where the verdict must arrive for
 the loop to move. Exit code 2 = the review ran but the relay did not land.
 
+Preflight (T-gate-firing-ignores-loop-state-and-prior-verdicts §A-1, policy tier —
+this script does not enforce it; the operator does):
+
+    手発火の前に、``--design-thread`` に指定するスレッドの最新 ``NEXT:`` を目視で確認せよ。
+    role persona (Heisenberg / Bohr / Einstein 等) を指している場合、その head は fix loop
+    の中 = 未確定であり、gate に読ませても空撃ちになる (R-A-1, msg-456)。``NEXT: pr-review`` /
+    ``NEXT: human`` / ``NEXT: none`` のいずれかに揃ってから撃つ。
+
 ⚠️ COST / SIDE EFFECTS: one real Gemini call (billed) + a real GitHub PR review submission + a
 chatroom post. Fire deliberately, once per PR.
 """
