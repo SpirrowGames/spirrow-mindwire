@@ -29,6 +29,18 @@
 # is not left pointing elsewhere. All four are hermetic — same-tree reads only, never
 # the network, Drive, or the chatroom.
 adrs:
+  - id: ADR-2026-05-21-02
+    title: "tomtar 入力経路 = mindwire webhook push (案 B)"
+    body: drive
+  - id: ADR-2026-05-21-03
+    title: "signal channel 設計 (語彙・transport・delivery)"
+    body: drive
+  - id: ADR-2026-05-21-04
+    title: "根本要求の再確認と tomtar 廃案、mindwire の責務再定義"
+    body: drive
+  - id: ADR-2026-05-21-05
+    title: "役割と adapter の抽象化 (ports & adapters)"
+    body: drive
   - id: ADR-2026-05-21-06
     title: "mindwire Interface Contract (Ports)"
     body: drive
@@ -67,7 +79,7 @@ adrs:
     body: repo:docs/adr/ADR-2026-05-31-15-independence-class-gradation.md
   - id: ADR-2026-06-03-16
     title: "naysayer CI-gate (APPROVE は CI 緑を含意 / approve-while-red 防止)"
-    body: drive
+    body: repo:docs/adr/ADR-2026-06-03-16-naysayer-ci-gate.md
   - id: ADR-2026-06-03-17
     title: "独立 naysayer の design-time 参加復元 (5原則の常時注入 + relay orchestrator)"
     body: drive
