@@ -10,7 +10,8 @@ ADR 本体の置き場は**移行中**である。このディレクトリはそ
 | ADR-2026-05-24-08 | **本ディレクトリ** | Drive 未反映だった |
 | ADR-2026-06-04-18 | **本ディレクトリ** | Drive 反映が Cloudflare WAF に阻まれて座礁していた |
 | ADR-2026-08-25-20 | **本ディレクトリ** | Drive 未反映、`_docmap` 未登録だった |
-| ADR-2026-05-23-07 / -05-31-14 / -05-31-15 / -06-03-16 | **本ディレクトリ** | Drive から取り直して移設（下記「Drive から取り直した 3 件」） |
+| ADR-2026-05-23-07 / -05-31-14 / -05-31-15 / -06-03-16 | **本ディレクトリ** | Drive から取り直して移設（下記「Drive から取り直した 4 件」） |
+| ADR-2026-05-21 / -02 / -03 / -04 / -05 | **本ディレクトリ** | Tomtar 系列。Google Docs だったので下記「Tomtar 系列 5 件」を参照 |
 | ADR-06 / 17 / 19 | Google Drive（folder `1LAENGwj…`。ADR-06 のみ Drive ルート直下 `18Joskr…`） | 未移設。Drive 側が本文の正本で、ローカル develop より進んでいる |
 | ADR-09〜13 | `CLAUDE.md` §M | identity 系。もともと §M が SOT |
 
@@ -30,7 +31,7 @@ ADR 本体の置き場は**移行中**である。このディレクトリはそ
 ## 残っている作業
 
 - **残り 3 件（ADR-06 / 17 / 19）をここへ移す。** 本文は Drive 側が新しいので、ローカルコピーではなく
-  **Drive から取り直して**移す必要がある。7 / 14 / 15 / 16 は移設済み。別 PR。
+  **Drive から取り直して**移す必要がある。7 / 14 / 15 / 16 と Tomtar 系列 5 件は移設済み。別 PR。
   - ADR-06 は移設時に `tests/test_naysayer_adr_index.py::test_amendment_memo_does_not_force_a_repo_locator_on_adr_06`
     が赤くなる。**それが正しい挙動**で、同テストの失敗メッセージが指示するとおり ADR-06 を `drive` から `repo:` に
     動かし、フィクスチャを新しい現実に合わせて書き直すこと（改訂メモを drift check から外す規則自体は据え置く）。
@@ -57,6 +58,43 @@ ADR 本体の置き場は**移行中**である。このディレクトリはそ
 **上の md5 は Drive 原本のもの**で、この repo のファイルのものではない。置換前のバイト列が
 Drive のそれと一致していたことの証拠として残してある（サイズは Drive の `fileSize` メタデータと
 一致を確認済み）。実値は `platform:infra-registry` にある。
+
+## Tomtar 系列 5 件（2026-09-10）
+
+`Spirrow Tomtar` project の TaskBriefs フォルダ（`1vhCCXMn…`）にあった 5 件。
+`spirrow-tomtar` は ADR-04 で**廃案**になったが、その廃案の理由と、mindwire が今の責務に
+辿り着いた経緯がここにしか無い。
+
+| ファイル | Drive fileId | 索引 |
+|---|---|---|
+| `ADR-2026-05-21-chatroom-is-conclair.md` | `1Y7L4bzHNxm-deadhdpfmKsKeaFmiPpfGAdfmOVuQ2f4` | **無し**（下記） |
+| `ADR-2026-05-21-02-tomtar-input-webhook-push.md` | `1X3Ly9B9W0Sha2RQ6uI_w3PPldtWds0oRL_YMytaRwSA` | `repo:` |
+| `ADR-2026-05-21-03-signal-channel-design.md` | `12h1cUg9zu3aZJnz8yCd6JDyq8frdhjRnsknwOKT3nSM` | `repo:` |
+| `ADR-2026-05-21-04-tomtar-withdrawal-mindwire-redefinition.md` | `1QyqP_OtujreVD-RPwvNlqFlAEMahcm_fvWAFrFH6j0k` | `repo:` |
+| `ADR-2026-05-21-05-roles-and-adapter-abstraction.md` | `1DlXB0ppMxCGy5BKMwDICVhSICBIcNY_nEhqY-FxqOzs` | `repo:` |
+
+### 上の 4 件と違い、md5 では検証できない
+
+これらは Drive 上で **Google Docs**（`application/vnd.google-apps.document`）であり、
+`.md` ファイルではない。∴ 「Drive のバイト列と一致」という主張が成立しない。
+本文は Google Docs のエクスポートから markdown に起こしたもので、
+**節・表・コードブロックの構造と文言は原文どおり**だが、バイト単位の同一性は無い。
+
+逐語からの逸脱は 1 箇所: ADR-05 の adapter 図にある `LocalQwen via Lexora (…経由)` の
+実ホスト名を `{{HOST_SERVICES}}` に置換した（規約 §3.1-2）。他の 4 件に実インフラ値は無い。
+
+### `ADR-2026-05-21`（末尾番号なし）は索引に載せない
+
+索引の id は `ADR-YYYY-MM-DD-N` 形式で、この 1 件だけ末尾の連番を持たない。
+`adr_index_gen` の id 正規表現にも `tests/test_adr_reverse_check.py` の走査対象にも
+掛からないので、**載せる場所が無い**。本文は本ディレクトリに置き、他の ADR からは
+題名で参照する（ADR-02 / -03 / -04 の §Related がそうしている）。
+
+### ADR-04 は「設計が根本要求から外れた」記録でもある
+
+§Context が、tomtar を作ることに集中するあまり根本要求への参照が薄れた経緯を
+solution-first thinking の drift として自己記述している。**廃案の判断そのものより、
+この一段落の方が後から効く。**
 
 ### もう 1 種類の逸脱: 欠番への参照から `ADR-` prefix を落とした
 

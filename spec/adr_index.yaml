@@ -31,16 +31,16 @@
 adrs:
   - id: ADR-2026-05-21-02
     title: "tomtar 入力経路 = mindwire webhook push (案 B)"
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-21-02-tomtar-input-webhook-push.md
   - id: ADR-2026-05-21-03
     title: "signal channel 設計 (語彙・transport・delivery)"
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-21-03-signal-channel-design.md
   - id: ADR-2026-05-21-04
     title: "根本要求の再確認と tomtar 廃案、mindwire の責務再定義"
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-21-04-tomtar-withdrawal-mindwire-redefinition.md
   - id: ADR-2026-05-21-05
     title: "役割と adapter の抽象化 (ports & adapters)"
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-21-05-roles-and-adapter-abstraction.md
   - id: ADR-2026-05-21-06
     title: "mindwire Interface Contract (Ports)"
     body: drive
