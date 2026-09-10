@@ -34,7 +34,7 @@ adrs:
     body: drive
   - id: ADR-2026-05-23-07
     title: "Stage 3 Autonomy Gating + Implementer 安全設計"
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-23-07-stage3-autonomy-gating.md
   - id: ADR-2026-05-24-08
     title: "Instance を一次概念とする識別モデル"
     body: repo:docs/adr/ADR-2026-05-24-08-instance-identity-model.md
@@ -60,11 +60,11 @@ adrs:
     body: chatroom:spirrow-mindwire/T-implementer-spec-readback-checklist#msg-326
   - id: ADR-2026-05-31-14
     title: "ガワ方式撤回 (claude.ai web 外部駆動の ToS 衝突 → Claude Code 転換)"
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-31-14-gawa-method-withdrawal.md
   - id: ADR-2026-05-31-15
     title: "independence-class グラデーション化 + 「2 協調 1 独立」配置 (ADR-09/T28 の independence_class レイヤーを二値→グラデーションに補強、別訓練分布 naysayer の規範根拠、N-1/C-2 トレードオフ併記、§0 順序)"
     thread: T-T15-poc-h-phase1-kickoff
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-31-15-independence-class-gradation.md
   - id: ADR-2026-06-03-16
     title: "naysayer CI-gate (APPROVE は CI 緑を含意 / approve-while-red 防止)"
     body: drive
