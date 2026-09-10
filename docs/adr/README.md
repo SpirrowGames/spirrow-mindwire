@@ -1,6 +1,7 @@
 # ADR bodies — in-repo set
 
-ADR 本体の置き場は**移行中**である。このディレクトリはその移行先で、まだ全部は揃っていない。
+ADR 本体の置き場は**このディレクトリ**である。Drive にしか無い本体は 2026-09-11 に全て移設し終えた
+（`spec/adr_index.yaml` に `body: drive` は 1 件も残っていない）。
 
 ## いま何がどこにあるか
 
@@ -12,7 +13,7 @@ ADR 本体の置き場は**移行中**である。このディレクトリはそ
 | ADR-2026-08-25-20 | **本ディレクトリ** | Drive 未反映、`_docmap` 未登録だった |
 | ADR-2026-05-23-07 / -05-31-14 / -05-31-15 / -06-03-16 | **本ディレクトリ** | Drive から取り直して移設（下記「Drive から取り直した 4 件」） |
 | ADR-2026-05-21 / -02 / -03 / -04 / -05 | **本ディレクトリ** | Tomtar 系列。Google Docs だったので下記「Tomtar 系列 5 件」を参照 |
-| ADR-06 / 17 / 19 | Google Drive（folder `1LAENGwj…`。ADR-06 のみ Drive ルート直下 `18Joskr…`） | 未移設。Drive 側が本文の正本で、ローカル develop より進んでいる |
+| ADR-06 / 17 / 19 | **本ディレクトリ** | Drive から取り直して移設（下記「最後の 3 件」） |
 | ADR-09〜13 | `CLAUDE.md` §M | identity 系。もともと §M が SOT |
 
 `spec/adr_index.yaml`（独立 naysayer と implementer に毎 summon 注入される索引）は id + title + `thread` + **`body:` locator** の派生ビューである。本体の所在は索引に載る ∴ 本ディレクトリに本体を足したら、その entry の `body:` を `repo:docs/adr/<file>.md` に更新すること。`docs/adr/` に本体があるのに `body:` が別を指す entry は CI が落とす（`*-amendment-*` は除外 — ADR-06 改訂メモは本体ではないため）。locator は「読み手がバイト列を開ける場所」の主張であって、どのコピーが正本かの主張ではない。
@@ -30,11 +31,8 @@ ADR 本体の置き場は**移行中**である。このディレクトリはそ
 
 ## 残っている作業
 
-- **残り 3 件（ADR-06 / 17 / 19）をここへ移す。** 本文は Drive 側が新しいので、ローカルコピーではなく
-  **Drive から取り直して**移す必要がある。7 / 14 / 15 / 16 と Tomtar 系列 5 件は移設済み。別 PR。
-  - ADR-06 は移設時に `tests/test_naysayer_adr_index.py::test_amendment_memo_does_not_force_a_repo_locator_on_adr_06`
-    が赤くなる。**それが正しい挙動**で、同テストの失敗メッセージが指示するとおり ADR-06 を `drive` から `repo:` に
-    動かし、フィクスチャを新しい現実に合わせて書き直すこと（改訂メモを drift check から外す規則自体は据え置く）。
+- ~~ADR 本体を Drive からここへ移す~~ → **完了**（2026-09-11）。`spec/adr_index.yaml` に
+  `body: drive` の entry は 1 件も残っていない。
 - **`_docmap.yaml` の去就。** `scripts/gen_adr_index.py --docmap` の入力として今も docs host 上で使われている。ADR 本体が本リポジトリに揃えば、索引はリポジトリ自身から生成でき、`adr_index.py` が「loop host / CI に `_docmap` が無いので commit 済コピーは不可避」と記す制約（ADR-2026-06-04-19 N-2）が消える。生成器の変更を伴うので別途。
 - **`docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md` の status。** 「Drive = doc の main」という前提そのものが、Spirrow ドキュメント基盤（Git 正本）に置き換わる方向にある。本 PR では本文を一切変更していないので、Draft のままそこにある。
 
@@ -95,6 +93,44 @@ Drive のそれと一致していたことの証拠として残してある（�
 §Context が、tomtar を作ることに集中するあまり根本要求への参照が薄れた経緯を
 solution-first thinking の drift として自己記述している。**廃案の判断そのものより、
 この一段落の方が後から効く。**
+
+## 最後の 3 件（2026-09-11）
+
+| ファイル | Drive fileId | サイズ / md5 |
+|---|---|---|
+| `ADR-2026-05-21-06-interface-contract-ports.md` | `18JoskFje3Wfu9D_kcKCRGNG0S4MtfmPi` | 22813 / `662e10bf74e2c89e886d9e230f742d8e` |
+| `ADR-2026-06-03-17-naysayer-design-participation.md` | `1beW6ej3pYMS-FA5XzYbqMNSkI_26b_p1` | 16934 / `431827f5a131c860c4b3d3a5bf9804df` |
+| `ADR-2026-06-04-19-naysayer-agentization-and-summon-rule.md` | `19uycTh4sw6ywHPDhQtLrC9KRmyT7LkIZ` | 25146 / `866972ebc22fd850b7bd12a1ce12f5f6` |
+
+**上の md5 はこの repo のファイルのもの**で、3 件ともサイズは Drive の `fileSize` メタデータと一致する。
+17 / 19 はバイト一致、06 は拡張子のみ `.markdown` → `.md`（`_docmap.yaml` が想定している名前に合わせた）。
+
+逐語からの逸脱は 1 箇所: ADR-19 の実ホスト名 2 件を `{{HOST_SERVICES}}` に置換した（規約 §3.1-2）。
+06 / 17 に実インフラ値は無い。
+
+### ADR-06 の移設でテストを 1 本書き換えた
+
+`tests/test_naysayer_adr_index.py` の ADR-06 フィクスチャは
+「`docs/adr/` の ADR-06 ファイルは改訂メモだけ ∴ locator は `drive` のまま」を固定していた。
+本体が入ったので前提が変わり、**設計どおり赤くなった**（同テストの失敗メッセージが対処を明示していた）。
+
+**守っている不変条件は変えていない** —— 「ADR-06 の locator が改訂メモを指してはならない」。
+表現だけが強くなった:
+
+| 旧 | 新 |
+|---|---|
+| ADR-06 のファイルは全部 amendment。∴ `body: drive` | ADR-06 のファイルは amendment 1 + 本体 1。∴ `body:` は**本体を名指し**、memo を名指さない |
+
+テスト名も `test_adr_06_locator_names_the_body_not_the_amendment_memo` に改めた。
+`_AMENDMENT_MARKER` が memo を drift check から隠す規則は据え置き —— 変わったのは
+「その check が見つけるべき本体が存在するようになった」ことだけである。
+
+### ADR-19 は ADR-17 を partial supersede している
+
+19 §Relates to が明記している: relay/convergence orchestrator（17 D-3）・`design_review.py`・
+`context_bundle.py` は**撤回**、5 原則 SOT（17 D-1）と D-4 / D-5 / D-6 / D-7 は carry over。
+∴ **17 を現状として読まないこと。** 撤回の理由は「Gemini の tool-less 制約が解除され、
+17 が前提にした『relay/bundle が必須』が崩れた」（19 §Author）。
 
 ### もう 1 種類の逸脱: 欠番への参照から `ADR-` prefix を落とした
 

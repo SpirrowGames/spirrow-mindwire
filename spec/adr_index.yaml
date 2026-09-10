@@ -43,7 +43,7 @@ adrs:
     body: repo:docs/adr/ADR-2026-05-21-05-roles-and-adapter-abstraction.md
   - id: ADR-2026-05-21-06
     title: "mindwire Interface Contract (Ports)"
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-21-06-interface-contract-ports.md
   - id: ADR-2026-05-23-07
     title: "Stage 3 Autonomy Gating + Implementer 安全設計"
     body: repo:docs/adr/ADR-2026-05-23-07-stage3-autonomy-gating.md
@@ -82,13 +82,13 @@ adrs:
     body: repo:docs/adr/ADR-2026-06-03-16-naysayer-ci-gate.md
   - id: ADR-2026-06-03-17
     title: "独立 naysayer の design-time 参加復元 (5原則の常時注入 + relay orchestrator)"
-    body: drive
+    body: repo:docs/adr/ADR-2026-06-03-17-naysayer-design-participation.md
   - id: ADR-2026-06-04-18
     title: "mindwire デプロイ・トポロジと magickit 到達性 (ADR-17 D-8 amendment)"
     body: repo:docs/adr/ADR-2026-06-04-18-mindwire-deploy-topology-magickit-reachability.md
   - id: ADR-2026-06-04-19
     title: "独立 naysayer のエージェント化 + summon ルール (ADR-17 relay/bundle を supersede)"
-    body: drive
+    body: repo:docs/adr/ADR-2026-06-04-19-naysayer-agentization-and-summon-rule.md
   - id: ADR-2026-08-25-20
     title: "`independence_class` に `machine` を追加"
     body: repo:docs/adr/ADR-2026-08-25-20-independence-class-machine-value.md
