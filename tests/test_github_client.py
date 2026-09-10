@@ -19,6 +19,7 @@ from spirrow_mindwire.github.client import (
     GitHubHTTPError,
     PrRef,
     ReviewEvent,
+    ReviewInfo,
     _derive_ci_state,
     _required_workflows_from_env,
     github_token,
@@ -1331,6 +1332,12 @@ async def test_find_cross_pr_head_bound_approves_never_raises_on_dependency_fail
     to raising. We simulate that regression by monkey-patching ``fetch_pr_reviews`` to
     raise ``GitHubHTTPError`` and asserting the method returns ``[]`` rather than
     propagating.
+
+    Note (T2 §5 ③): the inner ``except`` added for the review-fetch cache also swallows
+    the raise, but it re-``continue``s rather than returning; on a one-commit input the
+    loop still exits cleanly with ``coverage == []``, so the fail-open contract is
+    preserved either way. The many-commit / repeated-exception variant is covered by
+    ``test_find_cross_pr_head_bound_approves_does_not_cache_exception``.
     """
     handler = _coverage_handler(
         pr_commits=[{"sha": "sha1"}],
@@ -1348,3 +1355,188 @@ async def test_find_cross_pr_head_bound_approves_never_raises_on_dependency_fail
             _PR, reviewer_login="spirrowgames-ops"
         )
     assert result == []
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_caches_reviews_per_invocation() -> None:
+    """T2 §5 acceptance ② — the same ``other_pr`` triggers ``fetch_pr_reviews`` ONCE.
+
+    In the stacked-PR shape B-(a) primarily targets (msg-456 §R-B: PR #21 pulling in
+    PR #19's 4 commits), every commit in the reviewed PR names the same parent PR. The
+    old code re-fetched the parent's review list once per commit — an N+1 pattern the
+    naysayer flagged as advisory on msg-680 and re-flagged as an objection on
+    msg-692. The per-invocation cache elides those repeat calls without touching
+    ``seen`` (which dedupes the OUTPUT rows on ``(sha, other_pr)``, a key that varies
+    with ``sha`` and so cannot elide fetches on its own).
+    """
+    calls: list[str] = []
+    handler = _coverage_handler(
+        pr_commits=[{"sha": "sha1"}, {"sha": "sha2"}, {"sha": "sha3"}],
+        commit_pulls={
+            "sha1": [_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")],
+            "sha2": [_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")],
+            "sha3": [_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")],
+        },
+        reviews={
+            # Only sha1 was APPROVE'd head-bound; the point of the test is the CALL count,
+            # not the marker rows. A broken cache would still fetch three times and could
+            # coincidentally return the same marker, so the assertion below is on ``calls``.
+            19: [
+                {
+                    "user": {"login": "spirrowgames-ops"},
+                    "state": "APPROVED",
+                    "commit_id": "sha1",
+                    "submitted_at": "2026-09-07T04:51:05Z",
+                }
+            ],
+        },
+        calls=calls,
+    )
+    async with _client(handler) as client:
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+    # Marker output is unchanged (§5 ①): sha1 covered, sha2/sha3 not.
+    assert result == [
+        CrossPrApproveCoverage(
+            sha="sha1",
+            other_pr=PrRef("SpirrowGames", "spirrow-conclair", 19),
+            approved_at="2026-09-07T04:51:05Z",
+        )
+    ]
+    # §5 ② — exactly ONE fetch of PR #19's reviews across the three commits, not three.
+    review_calls = [c for c in calls if c.endswith("/pulls/19/reviews")]
+    assert len(review_calls) == 1, calls
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_does_not_cache_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2 §5 acceptance ③④ — a raised fetch is NOT cached; the next commit retries.
+
+    Einstein msg-695 blocked T2 on this rule: a naive cache that stored "failure"
+    would let one transient 502 silently drop the marker for every remaining commit
+    that references the same parent PR. The cache holds only successful returns;
+    the exception path escapes to a ``continue`` above the cache write, so a
+    subsequent commit against the SAME ``other_pr`` re-invokes the fetch. The
+    invariant this test pins: 1st call raises → 2nd call succeeds → marker appears.
+
+    ``fetch_pr_reviews`` is documented fail-soft in the current code (``[]`` on any
+    HTTP failure), so a real 502 today would not reach this ``except``; the raise
+    here simulates the future regression msg-696 §1 named (the "structural belt"
+    the outer ``except Exception`` already exists to catch). The point of §5 ③④ is
+    that even when that belt IS reached, one PR-scoped failure must not stick to
+    every subsequent commit for the same parent.
+    """
+    call_count = {"n": 0}
+    good_reviews = [
+        ReviewInfo(
+            login="spirrowgames-ops",
+            state="APPROVED",
+            commit_id="sha2",
+            submitted_at="2026-09-07T04:51:05Z",
+        )
+    ]
+
+    async def _flaky_reviews(pr: PrRef) -> list[ReviewInfo]:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # First look-up of PR #19's reviews raises; a negative cache would trap
+            # this and mask every downstream commit that names the same parent.
+            raise GitHubHTTPError("simulated transient outage", status_code=502)
+        return good_reviews
+
+    handler = _coverage_handler(
+        pr_commits=[{"sha": "sha1"}, {"sha": "sha2"}],
+        commit_pulls={
+            # Both commits point to the SAME parent PR #19 — the shape that would
+            # let a naive cache poison sha2 based on sha1's transient failure.
+            "sha1": [_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")],
+            "sha2": [_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")],
+        },
+        reviews={},  # irrelevant — the stub above shadows this
+    )
+
+    async with _client(handler) as client:
+        monkeypatch.setattr(client, "fetch_pr_reviews", _flaky_reviews)
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+
+    # The second call was actually made (retry, not a cache hit on failure).
+    assert call_count["n"] == 2, "cache trapped the exception and skipped the retry"
+    # And with the retry succeeding, sha2's marker landed — no silent drop.
+    assert result == [
+        CrossPrApproveCoverage(
+            sha="sha2",
+            other_pr=PrRef("SpirrowGames", "spirrow-conclair", 19),
+            approved_at="2026-09-07T04:51:05Z",
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_find_cross_pr_head_bound_approves_does_not_cache_fail_soft_empty() -> None:
+    """PR-gate REQUEST_CHANGES on this PR's first VERDICT: fail-soft ``[]`` is NOT cached.
+
+    ``fetch_pr_reviews`` is documented fail-soft. A 502 / 4xx / malformed JSON at
+    the HTTP layer surfaces as ``[]`` WITHOUT raising. The pre-cache N+1 code
+    retried implicitly by calling the fetch afresh on every commit, so a first-
+    commit 502 could recover on the second commit. This test pins the property
+    that the cache preserves that retry: a first fetch that fail-softs to ``[]``
+    is NOT stored, and the next commit against the same parent tries again — and
+    when the parent has by then returned to health, the marker lands.
+
+    The naysayer's blocking objection on the first VERDICT
+    (:class:`~spirrow_mindwire.github.client.GitHubClient.find_cross_pr_head_bound_approves`
+    docstring, empty-return path (b)): a naive cache would store the fail-soft
+    ``[]`` and silently drop the marker for every remaining commit that shares
+    the same parent PR — the exact silent-drop amplification T2 §5 ③ was written
+    to prevent, but the acceptance criteria wording used exception-language while
+    the actual bug manifests as an empty return.
+    """
+    call_count = {"n": 0}
+    good_reviews_json = [
+        {
+            "user": {"login": "spirrowgames-ops"},
+            "state": "APPROVED",
+            "commit_id": "sha2",
+            "submitted_at": "2026-09-07T04:51:05Z",
+        }
+    ]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/pulls/42/commits"):
+            return httpx.Response(200, json=[{"sha": "sha1"}, {"sha": "sha2"}])
+        if "/commits/" in path and path.endswith("/pulls"):
+            return httpx.Response(
+                200,
+                json=[_pull_row(19, owner="SpirrowGames", repo="spirrow-conclair")],
+            )
+        if path.endswith("/pulls/19/reviews"):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Simulate a transient 502 → fetch_pr_reviews fail-softs to [].
+                return httpx.Response(502)
+            return httpx.Response(200, json=good_reviews_json)
+        return httpx.Response(404)
+
+    async with _client(handle) as client:
+        result = await client.find_cross_pr_head_bound_approves(
+            _PR, reviewer_login="spirrowgames-ops"
+        )
+
+    # The second fetch actually happened — the cache did NOT store the fail-soft [].
+    assert call_count["n"] == 2, (
+        "cache stored the fail-soft [] from the transient 502 and skipped the retry on sha2"
+    )
+    # And with the retry succeeding, sha2's marker landed — no silent drop.
+    assert result == [
+        CrossPrApproveCoverage(
+            sha="sha2",
+            other_pr=PrRef("SpirrowGames", "spirrow-conclair", 19),
+            approved_at="2026-09-07T04:51:05Z",
+        )
+    ]
