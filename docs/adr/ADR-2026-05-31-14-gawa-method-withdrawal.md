@@ -73,7 +73,7 @@ Claude Code の自動化は「種類としてはクリーン」だが、OAuth/�
 - **ZDR（Zero Data Retention）＝推奨（必須ではない）**。承認されると全ユーザーコンテンツ（prompt/response）と識別メタデータが logging 前にクリアされる（申請制）。ZDR の差分は「訓練利用の防止」（それは paid 鍵が担う）ではなく「短期アビューズログ・24h キャッシュすら残さない」上積み部分のみ。**ただし推奨であって不要ではない**: 単発では個人データでない naysay も集積すると SpirrowGames の実態が再構成されうる（Einstein N-5）ため、短期ログ抑止としての価値があり、下記 (i)(ii) 非該当でも有効化が望ましい。
   - **再必須化トリガー（二本立て、N-1/N-3 取り込み）**: 以下の **いずれか** に該当する LLM 経路は ZDR 必須（or 外部 naysayer 不使用で内部処理）とする——
     - **(i) 他人の個人データを LLM 経路に載せる用途**（例: Thirdy の顧客ミーティング処理、ゲーム内 UGC のモデレーション）。
-    - **(ii) セキュリティ構成・未公開脆弱性が naysay 対象の中心になる経路**（例: 認証設計・インフラ構成・Vaultwarden/Tailscale/firewall 構成の議論、PR レビューで脆弱性筧所を記述する naysay）。これは「他人の個人データ」ではないが実害度が異なり、かつ **T15 認証4軸議論のように naysayer 経路を実際に通っている**（再帰構造）。Takahito 本人の認証材料・個人開発環境の機密も (ii) で拾う（「他人の」限定が本人機密を除外しないため）。
+    - **(ii) セキュリティ構成・未公開脆弱性が naysay 対象の中心になる経路**（例: 認証設計・インフラ構成・Vaultwarden/Tailscale/firewall 構成の議論、PR レビューで脆弱性箇所を記述する naysay）。これは「他人の個人データ」ではないが実害度が異なり、かつ **T15 認証4軸議論のように naysayer 経路を実際に通っている**（再帰構造）。Takahito 本人の認証材料・個人開発環境の機密も (ii) で拾う（「他人の」限定が本人機密を除外しないため）。
   - **検知点（N-2 取り込み）**: トリガーは静的条件だけでなく **評価タイミング** とセットで持つ。**新規 service/機能が Lexora 経由で LLM を呼ぶ設計をするとき、その設計 ADR の段階で「この経路に (i)(ii) のいずれかが載るか」を必須チェック項目にする**。「条件は書いたが検知が無主で暗黙運用に落ちる」を防ぐ。
 - **素の `generateContent` のみ**。grounding（検索/マップ、30日保持・無効化不可）/ File API / 明示的コンテキストキャッシュ / Live API / Interactions API は呼ばない（adapter 層で gate）。この gate は ZDR の要否と独立した surface 強制であり、ZDR 格下げの影響を受けない（PR spirrow-lexora#1）。
 
@@ -82,7 +82,7 @@ Claude Code の自動化は「種類としてはクリーン」だが、OAuth/�
 旧ガワ方式の不変条件「D2-1: 書き込み主体明示 / D2-2: ガワは read-only」を新構成へ写像する:
 
 - **D2-1（書き込み主体明示）**: 旧構成では「中の claude.ai が書き込み主体、ガワは経路」だった。新構成では各 Claude Code セッション / naysayer が自身の identity（instance_id）で chatroom に書き込むため、書き込み主体は instance 単位で明示される（ADR-2026-05-24-08 instance-identity モデルの author=instance_id 規約で担保）。
-- **D2-2（read-only 不変条件）**: 旧構成の「ガワは claude.ai を read-only 観測」は、新構成では「外部ハーネスは Claude Code を起動・観測するが、AR の出力主体性を奪わない（書き込みは AI 自身の判断）」へ写像。無人トリガーでも D-3 の ordinary usage 範囲内に留める。
+- **D2-2（read-only 不変条件）**: 旧構成の「ガワは claude.ai を read-only 観測」は、新構成では「外部ハーネスは Claude Code を起動・観測するが、AI の出力主体性を奪わない（書き込みは AI 自身の判断）」へ写像。無人トリガーでも D-3 の ordinary usage 範囲内に留める。
 
 ---
 
