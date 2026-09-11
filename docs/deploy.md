@@ -89,7 +89,8 @@ own **clone** — not a linked worktree). `[conductor].roster` maps chatroom per
 
 ## Target-repo branch flow (V-4, 2026-08-02)
 
-The dogfooding target (Spirrow-VoxelWorld) switched to a release-train flow with dev-speed plan
+The dogfooding target (spirrow-voxelworld, renamed from `Spirrow-VoxelWorld` on 2026-09-11) switched
+to a release-train flow with dev-speed plan
 batch 1, V-4: **feature → develop → release → main**.
 
 - `develop` is the integration branch, synced to `main@15883c1` on 2026-08-02 (voxelworld PR #175).
@@ -122,7 +123,7 @@ batch 1, V-4: **feature → develop → release → main**.
 
 > **Where this rule has to live.** The implementer runs with `setting_sources=[]` (SDK isolation, a
 > deliberate credential-surface fix — see the adapter), so it does **not** read any `CLAUDE.md`. A
-> branch rule recorded only there binds humans and not the loop. Spirrow-VoxelWorld currently has no
+> branch rule recorded only there binds humans and not the loop. spirrow-voxelworld currently has no
 > branch-policy document of its own, so this section is the de-facto record; the SOT belongs in the
 > target repo, and moving it there is an open follow-up.
 
