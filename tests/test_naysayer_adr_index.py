@@ -92,15 +92,15 @@ def test_load_adr_entries_carries_thread_and_body(tmp_path: Path) -> None:
     assert by_id["ADR-2026-06-03-16"].body == "drive"
 
 
-def test_load_adr_entries_missing_body_falls_back_to_drive(tmp_path: Path) -> None:
-    # Loader fail-open: an entry without ``body:`` renders as ``drive`` so downstream
+def test_load_adr_entries_missing_body_falls_back_to_unknown(tmp_path: Path) -> None:
+    # Loader fail-open: an entry without ``body:`` renders as ``unknown`` so downstream
     # rendering never sees an empty field (the CI check catches shipped manifests that
     # actually lack it; this fallback is for prompt-construction safety only).
     manifest = 'adrs:\n  - id: ADR-1\n    title: "t"\n'
     (tmp_path / "spec").mkdir()
     (tmp_path / "spec" / "adr_index.yaml").write_text(manifest, encoding="utf-8")
     entries = load_adr_entries(tmp_path)
-    assert entries[0].body == "drive"
+    assert entries[0].body == "unknown"
 
 
 def test_build_block_lists_manifest_entries(tmp_path: Path) -> None:

@@ -17,13 +17,15 @@
 # `docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md`. That decision is the grounds for it —
 # `repo:` never was, and still is not: do not cite a locator as precedent (msg-2671 D-2).
 # `body:` is hand-maintained per-entry and the generator preserves existing values on
-# regenerate; new entries default to `drive` (a weak, format-valid placeholder that names
-# the medium but not the file — carry it forward as debt, do not leave it silent).
+# regenerate; new entries default to `unknown` (a weak, format-valid placeholder — carry it
+# forward as debt, do not leave it silent). It used to default to `drive`, which after the
+# 2026-09-11 canonicity move would have pointed every new entry at a medium that is no
+# longer canonical.
 # Locator format (validated by tests/test_naysayer_adr_index.py):
 #     chatroom:<project>/<thread>#msg-<n>   — canonical: the decide-close message
-#     drive                                 — weak: "in Drive/spirrow-docs, file unknown"
-#     drive:<fileId-or-title>               — Drive with a specific pointer (future use)
+#     unknown                               — weak: this index does not record the location
 #     repo:<repo-relative path>.md          — the body file in THIS repository
+#     drive / drive:<fileId-or-title>       — legacy, still accepted, never emitted
 # CI does not regenerate this (no _docmap in CI); it checks that the file parses and is
 # well-formed, that every `body:` matches the locator format above, that every `repo:`
 # target actually exists in the tree, and that an ADR whose body file IS in `docs/adr/`
