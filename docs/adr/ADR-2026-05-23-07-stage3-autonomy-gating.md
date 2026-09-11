@@ -110,10 +110,17 @@ naysayer は main chain と context 分離された独立検証専用であり�
 
 ## 5. Open Questions / Follow-ups
 
+**すべてクローズ済 → spec 化。** 各項の行き先は docs-develop tree が記録していたもので、
+git 側には反映されていなかった（2026-09-11 に照合して取り込み）。設問文は当時のまま残す。
+
 1. 実装独立 PC の現行ネットワーク構成確定 → Tailscale ACL の具体ルール記述。
+   → `MINDWIRE_STAGE3_IMPLEMENTER_ENV_SPEC`
 2. ローカル develop doc フォルダのレイアウト規約（プロジェクト毎ディレクトリ命名）。
+   → `DOCS_DEVELOP_LAYOUT_CONVENTION`
 3. PR（develop→main）の naysayer レビュー trigger（PR open hook? 手動? watcher 連動?）。
+   → `MINDWIRE_STAGE3_WIRING_ALLOWLIST_SPEC` Part A
 4. implementer adapter の allow-list を設定ファイル化する形式（operation enum + path glob）。
+   → `MINDWIRE_STAGE3_WIRING_ALLOWLIST_SPEC` Part B
 
 ---
 

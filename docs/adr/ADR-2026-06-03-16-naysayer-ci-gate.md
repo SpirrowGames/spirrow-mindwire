@@ -64,7 +64,7 @@ naysayer adapter に**内部ポーリングを持たせない**（単一障害�
 
 review 側 token `MINDWIRE_NAYSAYER_GITHUB_TOKEN`（spirrowgames-ops, T22、fine-grained PAT）に **`Actions: Read-only`** を付与する。
 
-> **改訂（2026-06-03）**: 当初「`Checks: Read-only` + `Commit statuses: Read-only`」としたが、**fine-grained PAT に `Checks` 権限は存在しない**（GitHub UI に項目が無い ＝ Takahito 報告 と一致、GitHub Docs でも未掲載）。D-4 を Actions API に切り替えたため、必要権限は **`Actions: Read-only` のみ**ﾈfine-grained で付与可）。`Commit statuses: Read-only` は Actions CI には効かない（D-4）ので必須ではない（将来 status-context 型チェックを足す時のみ追加）。
+> **改訂（2026-06-03）**: 当初「`Checks: Read-only` + `Commit statuses: Read-only`」としたが、**fine-grained PAT に `Checks` 権限は存在しない**（GitHub UI に項目が無い ＝ Takahito 報告 と一致、GitHub Docs でも未掲載）。D-4 を Actions API に切り替えたため、必要権限は **`Actions: Read-only` のみ**（fine-grained で付与可）。`Commit statuses: Read-only` は Actions CI には効かない（D-4）ので必須ではない（将来 status-context 型チェックを足す時のみ追加）。
 
 無いと L1 は永久 fail-closed（= APPROVE しない。安全だが loop が進まない）。`Actions: Read-only` を付けても**書き込み権限は増えない**ので、author≠approver 分離（T22）や最小権限の原則とも整合。
 
@@ -86,7 +86,7 @@ D-5 で pending の再 fire を orchestration 層に置くが、その orchestra
 
 ### N-3: 独立 naysayer (Einstein) の formal review を経ていない（既知 deferral）
 
-本 ADR は proposer (Bohr) + implementer (Heisenberg) で収束し、**独立 naysayer (Einstein) の formal independent review を経ていない**。Einstein の design-thread 自律参加は `T-stage3-loop-wiring` msg-385 §4 の convergence/relay follow-up（ループが design-thread を agentize する）まで来ないため。論点γ（fail-closed の単一障害点性 / pending stall / 403→not-green の妥当性）は Heisenberg が msg-388 で実質カバーし、proposer が decide で引き取った（§ D-3 が L2 を権威にすることで L1 の単一障害点性を解消）。**ループ agentize 後、本 ADR を独立 naysay の再レビュー対象にしてよい**。これは「naysayer 設計を独立 naysayer 抜きで決めた」構造的皮肉を記録に残すための明示項@
+本 ADR は proposer (Bohr) + implementer (Heisenberg) で収束し、**独立 naysayer (Einstein) の formal independent review を経ていない**。Einstein の design-thread 自律参加は `T-stage3-loop-wiring` msg-385 §4 の convergence/relay follow-up（ループが design-thread を agentize する）まで来ないため。論点γ（fail-closed の単一障害点性 / pending stall / 403→not-green の妥当性）は Heisenberg が msg-388 で実質カバーし、proposer が decide で引き取った（§ D-3 が L2 を権威にすることで L1 の単一障害点性を解消）。**ループ agentize 後、本 ADR を独立 naysay の再レビュー対象にしてよい**。これは「naysayer 設計を独立 naysayer 抜きで決めた」構造的皮肉を記録に残すための明示項。
 【追記 2026-06-03: 恒久解の設計は ADR-2026-06-03-17（独立 naysayer の design-time 参加復元）/ `T-naysayer-design-participation` で議論中。実際の #85 merge も独立 naysay 未経由（CI 緑 + Tier C）で行われ、本 deferral を裏書きした、】
 
 ---
@@ -122,5 +122,5 @@ D-5 で pending の再 fire を orchestration 層に置くが、その orchestra
 ## 6. ADR-07 / ADR-05 / ADR-15 との関係
 
 - 本 ADR は **ADR-07（Stage 3 autonomy gating）の Tier B naysayer gate を補強**する。ADR-07 は「naysayer APPROVE が Tier C merge GO の必要条件」を立てたが、その APPROVE が CI 状態に対して無防備だった穴を本 ADR が塞ぐ（APPROVE に CI 緑を含意させ、merge 経路にも独立の CI 緑チェックを置く）。
-- **ADR-05** の `Capability.NAYSAYER_QUALIFIED` 機構・naysayer の独立性要件は据え置き。本 ADR は naysayer の**振る苞い（CI を見るか）**を規定するもので、独立性区画（ADR-15 の 2協調1独立）には触れない。
+- **ADR-05** の `Capability.NAYSAYER_QUALIFIED` 機構・naysayer の独立性要件は据え置き。本 ADR は naysayer の**振る舞い（CI を見るか）**を規定するもので、独立性区画（ADR-15 の 2協調1独立）には触れない。
 - §M（role/identity 規範）の rewrite は不要と判断（レビュー品質ゲート機構であり役割規範の再定義ではない、ADR-07 と同類）。必要なら §M に参照リンクのみ後付け。
