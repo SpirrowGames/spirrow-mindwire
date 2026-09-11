@@ -61,7 +61,9 @@ def _qualified_thread_id(prefix: str, pr: PrRef) -> str:
     (``Spirrow-VoxelWorld`` / ``spirrow-voxelworld``) cannot open two ledgers for
     one PR; GitHub repo names are case-insensitive for identity. That repo was
     renamed to the lower-cased spelling on 2026-09-11, which does not retire the
-    folding: threads and ledger entries opened before then keep the old one.
+    folding: threads and ledger entries opened before then keep the old one, and
+    nothing stops a caller typing it today — the fold is on the input, not on a
+    guess about who wrote it.
 
     The owner is deliberately *not* in the id: it would make every id half again as
     long for a distinction that only bites across organisations. That is a premise
