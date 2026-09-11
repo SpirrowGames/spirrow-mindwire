@@ -34,7 +34,7 @@ ADR 本体の置き場は**このディレクトリ**である。Drive にしか
 - ~~ADR 本体を Drive からここへ移す~~ → **完了**（2026-09-11）。`spec/adr_index.yaml` に
   `body: drive` の entry は 1 件も残っていない。
 - **`_docmap.yaml` の去就。** `scripts/gen_adr_index.py --docmap` の入力として今も docs host 上で使われている。ADR 本体が本リポジトリに揃えば、索引はリポジトリ自身から生成でき、`adr_index.py` が「loop host / CI に `_docmap` が無いので commit 済コピーは不可避」と記す制約（ADR-2026-06-04-19 N-2）が消える。生成器の変更を伴うので別途。
-- **`docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md` の status。** 「Drive = doc の main」という前提そのものが、Spirrow ドキュメント基盤（Git 正本）に置き換わる方向にある。本 PR では本文を一切変更していないので、Draft のままそこにある。
+- ~~`docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md` の status~~ → **完了**（2026-09-11）。「Drive = doc の main」は ADR-2026-05-23-07 §6 Amendment（Takahito 権限・判断、Tier-C）で撤回され、当該 spec は Superseded になった。正本は各リポジトリの Git ツリー、機構は [[platform:docs-infrastructure-design]] §6.3.1 の二層構成。
 
 ## 注意
 

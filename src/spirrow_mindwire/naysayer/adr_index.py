@@ -62,9 +62,10 @@ The body locator format is one of:
 
 **A locator is not a canonicity claim.** It names where a reader can open the bytes,
 not which copy is normative; ``repo:`` no more declares "Git is the source of truth"
-than a bare ``drive`` declares it for Drive. Moving canonicity is a Tier-C convention
-change (``docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md``) and is deliberately out of
-scope here — do not cite ``repo:`` as precedent for it (msg-2671 D-2).
+than a bare ``drive`` declares it for Drive. Canonicity moved from Drive to the Git trees
+on 2026-09-11 (ADR-2026-05-23-07 §6 Amendment, Takahito, Tier-C), superseding
+``docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md``. That decision is the grounds for it —
+``repo:`` never was, and still is not: do not cite a locator as precedent (msg-2671 D-2).
 
 The naysayer/implementer injectors expand the locator into the prompt so a reviewer
 can reach the body from the index alone — not knowing where a body lives is exactly

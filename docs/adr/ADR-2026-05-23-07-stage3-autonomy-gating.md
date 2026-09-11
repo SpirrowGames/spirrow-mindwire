@@ -124,4 +124,61 @@ git 側には反映されていなかった（2026-09-11 に照合して取り�
 
 ---
 
+## 6. Amendment (2026-09-11): doc の正本を Drive から Git へ移す — Takahito 権限・判断
+
+**本改訂は trilateral 議論（proposer/implementer/naysayer 収束）を経ていない。Takahito（human owner）の
+権限・判断で決定し、指示により本欄へ明記する。** 通常の §M / Tier C プロセスに対する例外で、決定主体は
+Takahito 単独である。
+
+### 決定内容
+
+**§2.5 の「Drive = doc の main」を撤回する。** ADR / spec 本体の正本は、各リポジトリの Git ツリー
+（`docs/adr/` と `docs/spec/`）である。Drive は正本ではない。
+
+`spec/adr_index.yaml` と `src/spirrow_mindwire/naysayer/adr_index*.py` は、この移動を
+「未了の Tier-C 規約変更」として名指ししていた（msg-2671 D-2）。本改訂がそれを行う。
+
+### なぜ
+
+§2.5 の運用には穴が 2 つあり、どちらも実際に発火した（`docs/adr/README.md` に記録）:
+
+1. **Drive に届かなければどこにも残らない。** develop 段リポジトリは remote を持たないので、反映前の
+   本文は 1 台のディスク上の 1 コピーしか存在しない。ADR-2026-06-04-18 は Tier-C GO まで通った
+   Accepted 文書でありながら、3 ヶ月この状態にあった。
+2. **反映漏れが検出されない。** ADR-2026-08-25-20 は `_docmap` にすら登録されず、索引からも落ちていた。
+
+Drive→Git 移行（Phase 2）は 2026-09-11 に完了し、`spec/adr_index.yaml` に `body: drive` の entry は
+残っていない。∴ 機構は既に Git を正本として動いており、本文だけが Drive を指していた。
+
+**移行そのものが、この判断の裏付けを 1 つ足した。** 照合したところ移行は public リポジトリの ADR に
+文字化けを 7 件持ち込んでおり（`役`→`彴` ×2 / `舞`→`苞` / `箇`→`筧` / `（`→`ﾈ` / `。`→`@` / `AI`→`AR`）、
+移行前の正しいバイト列を持っていたのは remote 無しの develop tree だけだった（PR #260 で復元）。
+穴 1 は理屈ではなく実測である。
+
+### 何が §2.5 を置き換えるか
+
+[[platform:docs-infrastructure-design]] §6.3.1 の二層構成。**Prismind 経由の書き込みは working tier
+（Git 管理外の下書き層）に入り、正本にはならない。** 正本になるのは、明示的な promote —— canonical tier
+（Git clone）への PR —— を通ったときだけである。滞留（working tier に N 日以上）と `diverged`
+（PR 後に working を編集）は同期時に検出してレポートに出す（同 §6.4.1）。これは上の穴 1 / 穴 2 に
+対する機構側の答えとして義務化されている。
+
+### 変えないもの
+
+- **locator は正本の主張ではない。** `spec/adr_index.yaml` の `body:` は「読み手がバイト列を開ける場所」を
+  名指すだけで、どのコピーが normative かを言わない。この規則は本改訂の後も変わらない —— `repo:` が
+  増えたことが正本移動の根拠だったのではなく、本改訂が根拠である。
+- **`develop → main` の merge は Tier-C のまま。** 本改訂は doc の正本の所在を動かすもので、コードの
+  merge 権限には触れない。
+- §2.5 の Deferred（magickit の read-source 切替ツール）は Deferred のまま。二層構成が
+  「呼び手は層を知らない」と定めた以上、切替を呼び手に見せる設計自体を作り直す必要がある。
+
+### 併走した措置
+
+`{{HOST_LOOP}}` のローカル develop tree（remote 無し）は、全 13 ファイルを照合して git 側に取り込んだ後、
+**書き込み停止**にした（削除はしない —— 同種の破損が後から見つかったとき、移行前のバイト列と照合できる
+のはそこだけのため）。
+
+---
+
 > **Provenance**: canonical reflection of `ADR-2026-05-23-07-stage3-autonomy-gating.md` (source author: main / claude.ai). Reflected to Drive by claude-code per §2.5 (Tier C, Takahito pre-GO obtained). Recorded in chatroom thread `T-phase2-stage3-autonomy-gating`.
