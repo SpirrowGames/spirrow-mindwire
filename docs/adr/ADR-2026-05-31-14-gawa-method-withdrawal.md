@@ -4,14 +4,14 @@
 - **Date**: 2026-05-31
 - **Scope**: spirrow-mindwire（T15 PoC-H / UI 自動化手段選定。identity 規範定義ではないため CLAUDE.md §M 対象外 = UI 自動化手段 ADR）
 - **Author**: Heisenberg (implementer, terminal_coding_agent) — chatroom T-T15-poc-h-phase1-kickoff の trilateral decide (Bohr proposer) を反映
-- **Relates to**: ADR-2026-05-27-08（旧採番。T15 ガワ方式の §M 参照名。本 ADR が実体化し置換）、ADR-2026-05-31-15（independence-class グラデーション。別経路 naysayer の規範根拠）
+- **Relates to**: 2026-05-27-08（旧採番。T15 ガワ方式の §M 参照名。本 ADR が実体化し置換）、ADR-2026-05-31-15（independence-class グラデーション。別経路 naysayer の規範根拠）
 - **Supersedes**: T15 ガワ方式（claude.ai web 版を外部から駆動する PoC 方針）。撤回記録として本 ADR が当該方針を閉じる。
 
 ---
 
 ## 1. Context
 
-T15 PoC-H は「既存 claude.ai persona を外部から操作するガワ」方式（ADR-2026-05-27-08 として §M に参照されていたが文書実体は未作成、起点は chatroom decide）で、claude.ai web 版を Playwright 等で駆動し AI をトリガーする構想だった。
+T15 PoC-H は「既存 claude.ai persona を外部から操作するガワ」方式（2026-05-27-08 として §M に参照されていたが文書実体は未作成、起点は chatroom decide）で、claude.ai web 版を Playwright 等で駆動し AI をトリガーする構想だった。
 
 Phase 1 段階 A（Step 1.1 retry）の実機検証で、この方式が**技術障壁ではなく規約エンフォースメント**に衝突することが判明した。
 
@@ -121,7 +121,7 @@ Claude Code の自動化は「種類としてはクリーン」だが、OAuth/�
 
 ## 5. Implementation Notes
 
-- 本 ADR は UI 自動化手段選定 ADR であり、CLAUDE.md §M（role/identity 規範定義）対象外。§M の注記行「ADR-2026-05-27-08（T15 ガワ方式）」を本 ADR の採番（05-31-14）に更新する。
+- 本 ADR は UI 自動化手段選定 ADR であり、CLAUDE.md §M（role/identity 規範定義）対象外。§M の注記行「2026-05-27-08（T15 ガワ方式）」を本 ADR の採番（05-31-14）に更新する。
 - 別経路 naysayer の独立性配置の規範根拠は ADR-2026-05-31-15。Gemini adapter 実装（Lexora naysayer ルートの backend 差し替え）は別タスク。
 - D-3 の ordinary usage 制約と 2026-06-15 Agent SDK credit 計量は、無人自動トリガー設計（Phase 2 以降）の着手前に再確認すること。
 
