@@ -173,7 +173,10 @@ def test_system_prompt_injects_adr_index_from_a_fixture_manifest(tmp_path: Path)
     )
     prompt = build_naysayer_system_prompt(obligations=_OBLIGATIONS, repo_root=tmp_path)
     assert "ADR index (id + title + body locator)" in prompt
-    assert "ADR-2026-05-31-15 — independence gradation [body: drive]" in prompt
+    # The fixture omits ``body:``, so this also pins the loader fail-open value — ``unknown``
+    # since the 2026-09-11 canonicity move (it was ``drive``, which now names a medium the
+    # amendment says the body is not in).
+    assert "ADR-2026-05-31-15 — independence gradation [body: unknown]" in prompt
 
 
 def test_system_prompt_defaults_to_mindwires_own_manifest() -> None:

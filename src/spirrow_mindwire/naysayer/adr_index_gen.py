@@ -80,13 +80,16 @@ _HEADER = """\
 # `docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md`. That decision is the grounds for it —
 # `repo:` never was, and still is not: do not cite a locator as precedent (msg-2671 D-2).
 # `body:` is hand-maintained per-entry and the generator preserves existing values on
-# regenerate; new entries default to `drive` (a weak, format-valid placeholder that names
-# the medium but not the file — carry it forward as debt, do not leave it silent).
+# regenerate; new entries default to `unknown` (a weak, format-valid placeholder — carry it
+# forward as debt, do not leave it silent). It used to default to `drive`, which after the
+# 2026-09-11 canonicity move would have pointed every new entry at a medium that is no
+# longer canonical.
 # Locator format (validated by tests/test_naysayer_adr_index.py):
 #     chatroom:<project>/<thread>#msg-<n>   — canonical: the decide-close message
-#     drive                                 — weak: "in Drive/spirrow-docs, file unknown"
-#     drive:<fileId-or-title>               — Drive with a specific pointer (future use)
+#     unknown                               — weak: this index does not record the location
 #     repo:<repo-relative path>.md          — the body file in THIS repository
+#     drive / drive:<fileId-or-title>       — legacy: accepted, and preserved on regenerate
+#                                             like any hand-set value; never defaulted to
 # CI does not regenerate this (no _docmap in CI); it checks that the file parses and is
 # well-formed, that every `body:` matches the locator format above, that every `repo:`
 # target actually exists in the tree, and that an ADR whose body file IS in `docs/adr/`
@@ -99,7 +102,7 @@ _ID_FIELDS = ("id", "adr_id", "path", "doc_id", "slug", "name", "file")
 # Bohr §4-4 in msg-2583 called this an accepted-but-debt state; keeping a placeholder
 # rather than an empty string is deliberate — the whole reason this field exists is
 # that a silent empty is what let the original misjudgment happen.
-_DEFAULT_BODY = "drive"
+_DEFAULT_BODY = "unknown"
 
 # Where in-repo ADR bodies live, and the filename marker the drift check skips over
 # (see :func:`check_in_repo_bodies_are_registered`).
@@ -224,9 +227,10 @@ def render_manifest(
     """Render the manifest YAML (header + ``adrs:`` list) — round-trips through PyYAML.
 
     ``body_locators`` maps adr id → existing body locator string (preserved on
-    regenerate). An id absent from the map gets :data:`_DEFAULT_BODY` (``drive``), a
-    weak but format-valid placeholder. Emitting a body value on every entry keeps the
-    CI locator-format check meaningful (it always has something to check) and stops the
+    regenerate). An id absent from the map gets :data:`_DEFAULT_BODY` (``unknown``), a
+    weak but format-valid placeholder that does not name a medium. Emitting a body value
+    on every entry keeps the CI locator-format check meaningful (it always has something
+    to check) and stops the
     generator from silently dropping a hand-maintained locator when the input changes.
     """
     body_locators = body_locators or {}

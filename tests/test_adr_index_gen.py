@@ -7,7 +7,11 @@ from typing import Any
 
 import yaml
 
-from spirrow_mindwire.naysayer.adr_index import load_adr_entries, load_adr_index
+from spirrow_mindwire.naysayer.adr_index import (
+    body_locator_is_valid,
+    load_adr_entries,
+    load_adr_index,
+)
 from spirrow_mindwire.naysayer.adr_index_gen import (
     build_manifest_index,
     check_body_locator_formats,
@@ -79,7 +83,7 @@ def test_build_manifest_index_carries_section_m_thread() -> None:
 
 def test_render_manifest_round_trips_through_loader(tmp_path: Path) -> None:
     index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
-    # No pre-existing body locators → every entry gets the ``drive`` default.
+    # No pre-existing body locators → every entry gets the ``unknown`` default.
     rendered = render_manifest(index, body_locators={})
     # Parses as YAML and matches the loader's view when written to spec/adr_index.yaml.
     parsed = yaml.safe_load(rendered)
@@ -102,7 +106,7 @@ def test_render_manifest_escapes_quotes() -> None:
 
 def test_render_manifest_preserves_body_locators(tmp_path: Path) -> None:
     # T-adr-index-omits-chatroom-body-locator §4-1: hand-maintained body locators must
-    # survive regeneration (round-trip). An id absent from the map gets ``drive``.
+    # survive regeneration (round-trip). An id absent from the map gets ``unknown``.
     index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
     rendered = render_manifest(
         index,
@@ -119,7 +123,7 @@ def test_render_manifest_preserves_body_locators(tmp_path: Path) -> None:
         == "chatroom:spirrow-mindwire/T-T28-author-role-identity#msg-283"
     )
     # No pre-existing locator for the docmap-only entry → default.
-    assert by_id["ADR-2026-06-03-16"].body == "drive"
+    assert by_id["ADR-2026-06-03-16"].body == "unknown"
 
 
 def test_load_existing_body_locators_reads_committed_manifest(tmp_path: Path) -> None:
@@ -312,9 +316,9 @@ def test_amendment_marker_is_a_literal_segment_a_body_can_also_match(tmp_path: P
     assert check_in_repo_bodies_are_registered(singular, collided) == []
 
 
-def test_render_manifest_defaults_new_entries_to_drive_not_repo(tmp_path: Path) -> None:
+def test_render_manifest_defaults_new_entries_to_unknown_not_repo(tmp_path: Path) -> None:
     # msg-2671 §4-9: the generator must NOT infer ``repo:`` by scanning docs/adr/. A new
-    # entry defaults to ``drive`` even when a same-id file exists, because inference
+    # entry defaults to ``unknown`` even when a same-id file exists, because inference
     # mis-files amendment memos (the ADR-06 trap). The drift check reports the gap; the
     # generator does not guess at it. Hand-maintained values still round-trip.
     _tree(tmp_path, "ADR-2026-01-01-1-body.md")
@@ -325,5 +329,32 @@ def test_render_manifest_defaults_new_entries_to_drive_not_repo(tmp_path: Path) 
     (tmp_path / "spec").mkdir()
     (tmp_path / "spec" / "adr_index.yaml").write_text(rendered, encoding="utf-8")
     by_id = {e.adr_id: e.body for e in load_adr_entries(tmp_path)}
-    assert by_id["ADR-2026-01-01-1"] == "drive"
+    assert by_id["ADR-2026-01-01-1"] == "unknown"
     assert by_id["ADR-2026-01-01-2"] == "repo:docs/adr/ADR-2026-01-01-2-x.md"
+
+
+def test_default_body_names_no_medium() -> None:
+    """The default must not point a new entry at a medium that is no longer canonical.
+
+    It was ``drive`` until 2026-09-11. After ADR-2026-05-23-07 §6 Amendment moved
+    canonicity to the Git trees, that default would have filed every new ADR under Drive
+    — the one place the amendment says the body is not. This pins the replacement to a
+    token that names no medium at all, which is what a weak locator should do.
+    """
+    from spirrow_mindwire.naysayer.adr_index_gen import _DEFAULT_BODY
+
+    assert _DEFAULT_BODY == "unknown"
+    assert "drive" not in _DEFAULT_BODY
+    assert body_locator_is_valid(_DEFAULT_BODY)
+
+
+def test_legacy_drive_locators_are_still_accepted() -> None:
+    """Entries written before the canonicity move must not red the suite.
+
+    Nothing new is emitted with a ``drive`` locator, but rejecting the form outright
+    would turn a historical value into a CI failure for a decision made after it was
+    written. Accepted, and preserved on regenerate like any other hand-set value — what
+    changed is only that a new entry never defaults to it.
+    """
+    assert body_locator_is_valid("drive")
+    assert body_locator_is_valid("drive:some-file-id")
