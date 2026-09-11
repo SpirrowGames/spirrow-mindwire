@@ -87,7 +87,7 @@ D-5 で pending の再 fire を orchestration 層に置くが、その orchestra
 ### N-3: 独立 naysayer (Einstein) の formal review を経ていない（既知 deferral）
 
 本 ADR は proposer (Bohr) + implementer (Heisenberg) で収束し、**独立 naysayer (Einstein) の formal independent review を経ていない**。Einstein の design-thread 自律参加は `T-stage3-loop-wiring` msg-385 §4 の convergence/relay follow-up（ループが design-thread を agentize する）まで来ないため。論点γ（fail-closed の単一障害点性 / pending stall / 403→not-green の妥当性）は Heisenberg が msg-388 で実質カバーし、proposer が decide で引き取った（§ D-3 が L2 を権威にすることで L1 の単一障害点性を解消）。**ループ agentize 後、本 ADR を独立 naysay の再レビュー対象にしてよい**。これは「naysayer 設計を独立 naysayer 抜きで決めた」構造的皮肉を記録に残すための明示項。
-【追記 2026-06-03: 恒久解の設計は ADR-2026-06-03-17（独立 naysayer の design-time 参加復元）/ `T-naysayer-design-participation` で議論中。実際の #85 merge も独立 naysay 未経由（CI 緑 + Tier C）で行われ、本 deferral を裏書きした、】
+【追記 2026-06-03: 恒久解の設計は ADR-2026-06-03-17（独立 naysayer の design-time 参加復元）/ `T-naysayer-design-participation` で議論中。実際の #85 merge も独立 naysay 未経由（CI 緑 + Tier C）で行われ、本 deferral を裏書きした。】
 
 ---
 
