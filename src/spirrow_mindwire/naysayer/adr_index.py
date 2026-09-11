@@ -106,7 +106,8 @@ _ADR_INDEX_ROW_RE = re.compile(
 # Accepts these shapes and only these:
 #   - chatroom:<project>/<thread>#msg-<n>
 #   - unknown                      (weak default: location not recorded)
-#   - drive / drive:<non-empty>    (legacy — Drive is no longer canonical; not emitted)
+#   - drive / drive:<non-empty>    (legacy — Drive is no longer canonical. Preserved on
+#                                  regenerate; never what a new entry defaults to)
 #   - repo:<repo-relative path>.md
 # ``[\w.-]+`` matches project/thread ids (letters/digits/_/./-); the anchor ``#msg-<n>``
 # is required for the chatroom form (Einstein's O-1 in msg-2582 — an anchor-missing

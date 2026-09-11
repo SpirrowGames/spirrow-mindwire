@@ -353,7 +353,8 @@ def test_legacy_drive_locators_are_still_accepted() -> None:
 
     Nothing new is emitted with a ``drive`` locator, but rejecting the form outright
     would turn a historical value into a CI failure for a decision made after it was
-    written. Accepted, never produced.
+    written. Accepted, and preserved on regenerate like any other hand-set value — what
+    changed is only that a new entry never defaults to it.
     """
     assert body_locator_is_valid("drive")
     assert body_locator_is_valid("drive:some-file-id")

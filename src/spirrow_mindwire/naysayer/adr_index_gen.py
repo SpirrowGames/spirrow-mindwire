@@ -88,7 +88,8 @@ _HEADER = """\
 #     chatroom:<project>/<thread>#msg-<n>   — canonical: the decide-close message
 #     unknown                               — weak: this index does not record the location
 #     repo:<repo-relative path>.md          — the body file in THIS repository
-#     drive / drive:<fileId-or-title>       — legacy, still accepted, never emitted
+#     drive / drive:<fileId-or-title>       — legacy: accepted, and preserved on regenerate
+#                                             like any hand-set value; never defaulted to
 # CI does not regenerate this (no _docmap in CI); it checks that the file parses and is
 # well-formed, that every `body:` matches the locator format above, that every `repo:`
 # target actually exists in the tree, and that an ADR whose body file IS in `docs/adr/`
