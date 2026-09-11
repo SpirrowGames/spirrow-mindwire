@@ -11,7 +11,7 @@ git の develop/main モデルを doc に一般化する（**Drive = doc の mai
 
 ## 2. Root
 - 専用 root に **単一 git repo `spirrow-docs`**（各 code repo とは分離 = Magickit project が必ずしも repo を持たないため）。
-- 規約上の理想配置は `/srv/spirrow-docs`（{{HOST_SERVICES}}）。Windows ホスト ({{HOST_LOOP}}) では bring-up 中 `C:\workspace\spirrow-docs` に instantiate。
+- 規約上の理想配置は `{{PATH_DOCS_DEVELOP}}`（{{HOST_SERVICES}}）。Windows ホスト ({{HOST_LOOP}}) では bring-up 中 `C:\workspace\spirrow-docs` に instantiate。
 
 ## 3. Layout
 - `<project>/<category>/<doc>.md`、category ∈ {adr, spec}。
