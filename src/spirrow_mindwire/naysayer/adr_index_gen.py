@@ -61,11 +61,13 @@ _TITLE_ID_PREFIX_RE = re.compile(r"^ADR-\d{4}-\d{2}-\d{2}-\d+\s*[^\w\s]?\s*")
 # Emitted verbatim as the manifest's header; kept byte-identical to the committed
 # spec/adr_index.yaml header so ``--check`` does not report spurious drift.
 _HEADER = """\
-# mindwire ADR index — union of CLAUDE.md §M references + spirrow-docs _docmap adr entries.
+# mindwire ADR index — union of CLAUDE.md §M references + the ADR bodies in docs/adr/.
 # GENERATED FILE — do not hand-edit id/title/thread. Regenerate with:
-#     python scripts/gen_adr_index.py --docmap <path-to-spirrow-docs/_docmap.yaml>
-# Run by the proposer on the docs host when an ADR is added/accepted (loop host/CI lacks
-# _docmap, so this committed copy is unavoidable; ADR-2026-06-04-19 N-2 / msg-438/443).
+#     python scripts/gen_adr_index.py            # --check to drift-check instead
+# Runs anywhere the repository is checked out, CI included. It did not until 2026-09-11:
+# the second source was a file on one machine in a tree with no remote, which is why
+# ADR-2026-06-04-19 N-2 records the committed copy as unavoidable. The bodies are the
+# source now, so `--check` is a real drift-check and the suite runs it.
 # Derived view: id + title (+ thread when the ADR is a §M entry) — the ADR body lives in
 # ONE OF three places: Drive/spirrow-docs, THIS repository under `docs/adr/`, or the
 # chatroom decide-close message that resolved the thread (§M-only ADRs 09-13 have no
@@ -90,7 +92,7 @@ _HEADER = """\
 #     repo:<repo-relative path>.md          — the body file in THIS repository
 #     drive / drive:<fileId-or-title>       — legacy: accepted, and preserved on regenerate
 #                                             like any hand-set value; never defaulted to
-# CI does not regenerate this (no _docmap in CI); it checks that the file parses and is
+# CI regenerates this and fails on drift (test_committed_manifest_matches_regeneration);
 # well-formed, that every `body:` matches the locator format above, that every `repo:`
 # target actually exists in the tree, and that an ADR whose body file IS in `docs/adr/`
 # is not left pointing elsewhere. All four are hermetic — same-tree reads only, never
@@ -141,6 +143,12 @@ def _first_adr_id(node: dict[str, Any]) -> str | None:
 def extract_docmap_adrs(docmap_data: Any) -> dict[str, str]:
     """Extract ``{adr_id: title}`` from a parsed ``_docmap`` structure (schema-tolerant).
 
+    **No longer on the generation path** (2026-09-11): :func:`adr_titles_from_repo`
+    replaced it. Kept because ``_docmap.yaml`` still exists in the archived, write-stopped
+    spirrow-docs tree and carries the pre-migration drive_doc_id / prismind_id mapping —
+    this is the reader for auditing that archive, and for ``--docmap`` when someone wants
+    to compare the two sources.
+
     Walks the (possibly nested) structure and records any mapping that carries a non-empty
     ``title`` together with an ADR id in one of its string fields. Tolerant of the top-level
     shape (list / dict / nested) since the canonical ``_docmap`` schema lives in spirrow-docs.
@@ -166,28 +174,67 @@ def extract_docmap_adrs(docmap_data: Any) -> dict[str, str]:
 
 
 def build_manifest_index(
-    claude_md: str, docmap_data: Any
+    claude_md: str, second_source: dict[str, str]
 ) -> tuple[tuple[str, str, str | None], ...]:
-    """Union of CLAUDE.md §M references and ``_docmap`` ADR entries, with §M thread column.
+    """Union of CLAUDE.md §M references and a second title source, with §M thread column.
 
     Returns ``(adr_id, title, thread)`` rows. Title preference: the §M summary when
-    present (the in-repo curated text), else the ``_docmap`` title. ``thread`` comes
+    present (the in-repo curated text), else the second source's title. ``thread`` comes
     from §M's third column when the ADR is a §M entry, else ``None`` (architecture ADRs
-    have no chatroom thread — their body lives in Drive/spirrow-docs). The union is the
-    point — it carries both the architecture ADRs §M omits and the identity ADRs
-    ``_docmap`` omits.
+    have no chatroom thread). The union is the point — it carries both the architecture
+    ADRs §M omits and the identity ADRs the second source omits.
+
+    ``second_source`` is ``{id: title}``. Pass :func:`adr_titles_from_repo` for it; the
+    caller used to pass ``_docmap`` entries instead, which is why this takes a mapping
+    rather than reading anything itself.
     """
     section_m_rows = parse_adr_index_with_thread(claude_md)
     section_m_titles = {adr_id: title for adr_id, title, _ in section_m_rows}
     section_m_threads = {adr_id: thread for adr_id, _, thread in section_m_rows}
-    docmap = extract_docmap_adrs(docmap_data)
-    ids = set(section_m_titles) | set(docmap)
+    ids = set(section_m_titles) | set(second_source)
     merged: list[tuple[str, str, str | None]] = []
     for adr_id in sorted(ids):
-        title = section_m_titles.get(adr_id) or docmap.get(adr_id, "")
+        title = section_m_titles.get(adr_id) or second_source.get(adr_id, "")
         thread = section_m_threads.get(adr_id)
         merged.append((adr_id, title, thread))
     return tuple(merged)
+
+
+def adr_titles_from_repo(repo_root: Any) -> dict[str, str]:
+    """Read ``{id: title}`` from the ADR bodies in ``docs/adr/``.
+
+    This replaces ``_docmap`` as the second source. Until 2026-09-11 the union needed a
+    file that lived only on one machine, in a tree with no remote -- so neither CI nor the
+    loop host could rebuild the index, and the committed copy could not be drift-checked
+    (ADR-2026-06-04-19 N-2). The Drive→Git migration put every ADR body in ``docs/adr/``
+    and ADR-2026-05-23-07 §6 moved canonicity here, which makes the bodies themselves the
+    available source. Measured on the day of the switch: the id set is identical either
+    way (19 = 19, nothing gained or lost).
+
+    The title is the body's first ``# `` heading with any ``ADR-…`` prefix stripped, which
+    is the document's own title. ``_docmap`` carried shorter curated summaries for six of
+    them; those are not recoverable from a tree nobody may write to any more, and a title
+    that drifts from its document is worse than a long one.
+
+    ``-amendment-`` files are skipped for the same reason ``check_stale_repo_bodies``
+    skips them: the string rule is about the filename, and ADR-2026-05-21-06's only file
+    here says of itself that it is a diff to be merged into the body.
+    """
+    body_dir = Path(repo_root) / _ADR_BODY_DIR
+    if not body_dir.is_dir():
+        return {}
+    titles: dict[str, str] = {}
+    for path in sorted(body_dir.glob("ADR-*.md")):
+        if _AMENDMENT_MARKER in path.name.lower():
+            continue
+        match = _ADR_ID_RE.match(path.name)
+        if match is None:
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("# "):
+                titles.setdefault(match.group(0), _TITLE_ID_PREFIX_RE.sub("", line[2:].strip()))
+                break
+    return titles
 
 
 def load_existing_body_locators(out_path: Any) -> dict[str, str]:

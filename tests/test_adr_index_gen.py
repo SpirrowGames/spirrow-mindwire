@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +65,7 @@ def test_extract_docmap_adrs_strips_id_prefix_from_title() -> None:
 
 
 def test_build_manifest_index_is_the_union() -> None:
-    index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
+    index = build_manifest_index(_CLAUDE_MD, extract_docmap_adrs(_DOCMAP))
     # The whole point: §M-only (09) AND _docmap-only (16) both present, sorted.
     assert [row[0] for row in index] == ["ADR-2026-05-27-09", "ADR-2026-06-03-16"]
     assert index[0][1] == "identity 4 layers"  # §M title kept
@@ -74,7 +75,7 @@ def test_build_manifest_index_is_the_union() -> None:
 def test_build_manifest_index_carries_section_m_thread() -> None:
     # T-adr-index-omits-chatroom-body-locator §4-1: the §M thread column must be
     # preserved through generation (single-source with CLAUDE.md — §4-6).
-    index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
+    index = build_manifest_index(_CLAUDE_MD, extract_docmap_adrs(_DOCMAP))
     by_id = {adr_id: (title, thread) for adr_id, title, thread in index}
     assert by_id["ADR-2026-05-27-09"][1] == "T-T28-author-role-identity"
     # Architecture ADRs (docmap-only, no §M row) have no thread.
@@ -82,7 +83,7 @@ def test_build_manifest_index_carries_section_m_thread() -> None:
 
 
 def test_render_manifest_round_trips_through_loader(tmp_path: Path) -> None:
-    index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
+    index = build_manifest_index(_CLAUDE_MD, extract_docmap_adrs(_DOCMAP))
     # No pre-existing body locators → every entry gets the ``unknown`` default.
     rendered = render_manifest(index, body_locators={})
     # Parses as YAML and matches the loader's view when written to spec/adr_index.yaml.
@@ -107,7 +108,7 @@ def test_render_manifest_escapes_quotes() -> None:
 def test_render_manifest_preserves_body_locators(tmp_path: Path) -> None:
     # T-adr-index-omits-chatroom-body-locator §4-1: hand-maintained body locators must
     # survive regeneration (round-trip). An id absent from the map gets ``unknown``.
-    index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
+    index = build_manifest_index(_CLAUDE_MD, extract_docmap_adrs(_DOCMAP))
     rendered = render_manifest(
         index,
         body_locators={
@@ -358,3 +359,47 @@ def test_legacy_drive_locators_are_still_accepted() -> None:
     """
     assert body_locator_is_valid("drive")
     assert body_locator_is_valid("drive:some-file-id")
+
+
+def test_committed_manifest_matches_regeneration() -> None:
+    """spec/adr_index.yaml is exactly what the generator produces from this tree.
+
+    This is the drift-check ADR-2026-06-04-19 N-2 recorded as impossible. It was: the
+    second source was spirrow-docs/_docmap.yaml, a file on one machine in a tree with no
+    remote, so CI could only check that the committed copy parsed and covered §M — never
+    that it was current. Since every ADR body landed in docs/adr/ and canonicity moved
+    here (ADR-2026-05-23-07 §6), the generator reads only this repository, so the full
+    comparison runs in the suite.
+
+    If this reds after adding an ADR, the fix is to run the generator, not to edit the
+    yaml: `python scripts/gen_adr_index.py`. Hand-set `body:` locators round-trip.
+    """
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[1]
+    committed = (repo_root / "spec" / "adr_index.yaml").read_text(encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(repo_root / "scripts" / "gen_adr_index.py"), "--check"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        "spec/adr_index.yaml is out of date. Run: python scripts/gen_adr_index.py"
+        + chr(10)
+        + result.stderr
+    )
+    assert "adrs:" in committed
+
+
+def test_generator_writes_lf_not_the_platform_default() -> None:
+    """The manifest is committed with LF; regenerating must not rewrite every line.
+
+    Path.write_text translates newlines to the platform default. That never showed while
+    the generator could only run on the Linux docs host — it needed a file that lived
+    there. Now that it runs on the loop host too, a CRLF write would turn every
+    regeneration into a whole-file diff, which is how a drift-check stops being read.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    raw = (repo_root / "spec" / "adr_index.yaml").read_bytes()
+    assert b"\r\n" not in raw

@@ -1,8 +1,10 @@
-# mindwire ADR index — union of CLAUDE.md §M references + spirrow-docs _docmap adr entries.
+# mindwire ADR index — union of CLAUDE.md §M references + the ADR bodies in docs/adr/.
 # GENERATED FILE — do not hand-edit id/title/thread. Regenerate with:
-#     python scripts/gen_adr_index.py --docmap <path-to-spirrow-docs/_docmap.yaml>
-# Run by the proposer on the docs host when an ADR is added/accepted (loop host/CI lacks
-# _docmap, so this committed copy is unavoidable; ADR-2026-06-04-19 N-2 / msg-438/443).
+#     python scripts/gen_adr_index.py            # --check to drift-check instead
+# Runs anywhere the repository is checked out, CI included. It did not until 2026-09-11:
+# the second source was a file on one machine in a tree with no remote, which is why
+# ADR-2026-06-04-19 N-2 records the committed copy as unavoidable. The bodies are the
+# source now, so `--check` is a real drift-check and the suite runs it.
 # Derived view: id + title (+ thread when the ADR is a §M entry) — the ADR body lives in
 # ONE OF three places: Drive/spirrow-docs, THIS repository under `docs/adr/`, or the
 # chatroom decide-close message that resolved the thread (§M-only ADRs 09-13 have no
@@ -27,14 +29,14 @@
 #     repo:<repo-relative path>.md          — the body file in THIS repository
 #     drive / drive:<fileId-or-title>       — legacy: accepted, and preserved on regenerate
 #                                             like any hand-set value; never defaulted to
-# CI does not regenerate this (no _docmap in CI); it checks that the file parses and is
+# CI regenerates this and fails on drift (test_committed_manifest_matches_regeneration);
 # well-formed, that every `body:` matches the locator format above, that every `repo:`
 # target actually exists in the tree, and that an ADR whose body file IS in `docs/adr/`
 # is not left pointing elsewhere. All four are hermetic — same-tree reads only, never
 # the network, Drive, or the chatroom.
 adrs:
   - id: ADR-2026-05-21-02
-    title: "tomtar 入力経路 = mindwire webhook push (案 B)"
+    title: "tomtar 入力経路を mindwire webhook push (案 B) に確定"
     body: repo:docs/adr/ADR-2026-05-21-02-tomtar-input-webhook-push.md
   - id: ADR-2026-05-21-03
     title: "signal channel 設計 (語彙・transport・delivery)"
@@ -75,23 +77,23 @@ adrs:
     thread: T-implementer-spec-readback-checklist
     body: chatroom:spirrow-mindwire/T-implementer-spec-readback-checklist#msg-326
   - id: ADR-2026-05-31-14
-    title: "ガワ方式撤回 (claude.ai web 外部駆動の ToS 衝突 → Claude Code 転換)"
+    title: "ガワ方式撤回 — claude.ai web 外部駆動の ToS 衝突と Claude Code への操作対象転換"
     body: repo:docs/adr/ADR-2026-05-31-14-gawa-method-withdrawal.md
   - id: ADR-2026-05-31-15
     title: "independence-class グラデーション化 + 「2 協調 1 独立」配置 (ADR-09/T28 の independence_class レイヤーを二値→グラデーションに補強、別訓練分布 naysayer の規範根拠、N-1/C-2 トレードオフ併記、§0 順序)"
     thread: T-T15-poc-h-phase1-kickoff
     body: repo:docs/adr/ADR-2026-05-31-15-independence-class-gradation.md
   - id: ADR-2026-06-03-16
-    title: "naysayer CI-gate (APPROVE は CI 緑を含意 / approve-while-red 防止)"
+    title: "naysayer CI-gate — APPROVE は CI 緑を含意する（approve-while-red 防止）"
     body: repo:docs/adr/ADR-2026-06-03-16-naysayer-ci-gate.md
   - id: ADR-2026-06-03-17
-    title: "独立 naysayer の design-time 参加復元 (5原則の常時注入 + relay orchestrator)"
+    title: "独立 naysayer の design-time 参加復元 — 5原則の常時注入 + convergence/relay orchestrator"
     body: repo:docs/adr/ADR-2026-06-03-17-naysayer-design-participation.md
   - id: ADR-2026-06-04-18
-    title: "mindwire デプロイ・トポロジと magickit 到達性 (ADR-17 D-8 amendment)"
+    title: "mindwire デプロイ・トポロジと magickit 到達性 — magickit を mindwire host から到達可能にする(ADR-17 D-8 amendment)"
     body: repo:docs/adr/ADR-2026-06-04-18-mindwire-deploy-topology-magickit-reachability.md
   - id: ADR-2026-06-04-19
-    title: "独立 naysayer のエージェント化 + summon ルール (ADR-17 relay/bundle を supersede)"
+    title: "独立 naysayer のエージェント化 + summon ルール(ADR-17 の relay/bundle を supersede)"
     body: repo:docs/adr/ADR-2026-06-04-19-naysayer-agentization-and-summon-rule.md
   - id: ADR-2026-08-25-20
     title: "`independence_class` に `machine` を追加"
