@@ -23,12 +23,16 @@ out-of-repo ``_docmap.yaml``:
 The manifest is a **derived view** (id + title + optional thread + body locator, never
 the canonical ADR body). It is *generated*, not hand-maintained:
 ``scripts/gen_adr_index.py`` (logic in :mod:`spirrow_mindwire.naysayer.adr_index_gen`)
-rebuilds id/title/thread from CLAUDE.md §M + the spirrow-docs ``_docmap``; the
+rebuilds id/title/thread from CLAUDE.md §M + the ADR bodies in ``docs/adr/``; the
 ``body:`` locator per entry is hand-maintained in the yaml and preserved on
-regenerate (round-trip). A committed copy is unavoidable — the loop host has no docs
-checkout and the deploy topology is undecided (ADR-18 / msg-438), so a runtime union
-(which needs ``_docmap``) is not possible. CI cannot run a *full* drift-check either
-(``_docmap`` is absent in CI), but it does enforce four things: the committed manifest
+regenerate (round-trip). The committed copy used to be unavoidable for a reason that
+no longer holds: the second source was ``spirrow-docs/_docmap.yaml``, a file on one
+machine in a tree with no remote (ADR-2026-06-04-19 N-2 / msg-438). Since 2026-09-11
+every ADR body is in ``docs/adr/`` and canonicity moved here (ADR-2026-05-23-07 §6), so
+the generator runs anywhere the repository does — **including CI, which now regenerates
+and fails on any drift** (``test_committed_manifest_matches_regeneration``). The file
+stays committed because the injectors read it without running the generator. CI also
+enforces four things: the committed manifest
 **parses and is well-formed** (``test_real_in_repo_manifest_loads_and_is_well_formed``),
 every §M-referenced ADR is present in the manifest
 (``test_section_m_adrs_are_a_subset_of_the_manifest``, a partial drift-check since

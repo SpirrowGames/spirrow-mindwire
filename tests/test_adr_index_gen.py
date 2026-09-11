@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+import tempfile
 from pathlib import Path
-from typing import Any
 
 import yaml
 
@@ -17,54 +18,23 @@ from spirrow_mindwire.naysayer.adr_index_gen import (
     check_body_locator_formats,
     check_in_repo_bodies_are_registered,
     check_repo_locator_targets,
-    extract_docmap_adrs,
     load_existing_body_locators,
     render_manifest,
 )
 
-# §M carries an identity ADR (09) the _docmap omits.
+# §M carries an identity ADR (09) the body scan omits (it has no .md body).
 _CLAUDE_MD = (
     "## §M\n| ADR | x | y |\n|---|---|---|\n"
     "| ADR-2026-05-27-09 (T28) | identity 4 layers | T-T28-author-role-identity |\n"
 )
 
-# A plausible _docmap shape: a list of doc entries (nested under a top-level key), each
-# with a path + title. Carries an architecture ADR (16) §M omits, plus a non-ADR doc.
-_DOCMAP: dict[str, Any] = {
-    "documents": [
-        {
-            "path": "adr/ADR-2026-06-03-16-ci-gate.md",
-            "title": "naysayer CI-gate",
-            "status": "accepted",
-        },
-        {"path": "guides/setup.md", "title": "Setup guide", "status": "draft"},
-    ]
-}
-
-
-def test_extract_docmap_adrs_tolerant_walk() -> None:
-    adrs = extract_docmap_adrs(_DOCMAP)
-    assert adrs == {"ADR-2026-06-03-16": "naysayer CI-gate"}  # non-ADR doc ignored
-
-
-def test_extract_docmap_adrs_strips_id_prefix_from_title() -> None:
-    # Real _docmap titles carry the id as a prefix; the rendered "- {id} — {title}" line must
-    # not double-print the id (Tier B re-review msg-446). The title's own parens are preserved.
-    docmap = {
-        "docs": [
-            {
-                "path": "adr/ADR-2026-05-21-06.md",
-                "title": "ADR-2026-05-21-06 — mindwire Interface Contract (Ports)",
-            }
-        ]
-    }
-    assert extract_docmap_adrs(docmap) == {
-        "ADR-2026-05-21-06": "mindwire Interface Contract (Ports)"
-    }
+# The second source: {id: title} as adr_titles_from_repo returns it. Carries an
+# architecture ADR (16) §M omits, so the union below is doing real work.
+_SECOND_SOURCE: dict[str, str] = {"ADR-2026-06-03-16": "naysayer CI-gate"}
 
 
 def test_build_manifest_index_is_the_union() -> None:
-    index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
+    index = build_manifest_index(_CLAUDE_MD, _SECOND_SOURCE)
     # The whole point: §M-only (09) AND _docmap-only (16) both present, sorted.
     assert [row[0] for row in index] == ["ADR-2026-05-27-09", "ADR-2026-06-03-16"]
     assert index[0][1] == "identity 4 layers"  # §M title kept
@@ -74,7 +44,7 @@ def test_build_manifest_index_is_the_union() -> None:
 def test_build_manifest_index_carries_section_m_thread() -> None:
     # T-adr-index-omits-chatroom-body-locator §4-1: the §M thread column must be
     # preserved through generation (single-source with CLAUDE.md — §4-6).
-    index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
+    index = build_manifest_index(_CLAUDE_MD, _SECOND_SOURCE)
     by_id = {adr_id: (title, thread) for adr_id, title, thread in index}
     assert by_id["ADR-2026-05-27-09"][1] == "T-T28-author-role-identity"
     # Architecture ADRs (docmap-only, no §M row) have no thread.
@@ -82,7 +52,7 @@ def test_build_manifest_index_carries_section_m_thread() -> None:
 
 
 def test_render_manifest_round_trips_through_loader(tmp_path: Path) -> None:
-    index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
+    index = build_manifest_index(_CLAUDE_MD, _SECOND_SOURCE)
     # No pre-existing body locators → every entry gets the ``unknown`` default.
     rendered = render_manifest(index, body_locators={})
     # Parses as YAML and matches the loader's view when written to spec/adr_index.yaml.
@@ -107,7 +77,7 @@ def test_render_manifest_escapes_quotes() -> None:
 def test_render_manifest_preserves_body_locators(tmp_path: Path) -> None:
     # T-adr-index-omits-chatroom-body-locator §4-1: hand-maintained body locators must
     # survive regeneration (round-trip). An id absent from the map gets ``unknown``.
-    index = build_manifest_index(_CLAUDE_MD, _DOCMAP)
+    index = build_manifest_index(_CLAUDE_MD, _SECOND_SOURCE)
     rendered = render_manifest(
         index,
         body_locators={
@@ -358,3 +328,105 @@ def test_legacy_drive_locators_are_still_accepted() -> None:
     """
     assert body_locator_is_valid("drive")
     assert body_locator_is_valid("drive:some-file-id")
+
+
+def test_committed_manifest_matches_regeneration() -> None:
+    """spec/adr_index.yaml is exactly what the generator produces from this tree.
+
+    This is the drift-check ADR-2026-06-04-19 N-2 recorded as impossible. It was: the
+    second source was spirrow-docs/_docmap.yaml, a file on one machine in a tree with no
+    remote, so CI could only check that the committed copy parsed and covered §M — never
+    that it was current. Since every ADR body landed in docs/adr/ and canonicity moved
+    here (ADR-2026-05-23-07 §6), the generator reads only this repository, so the full
+    comparison runs in the suite.
+
+    If this reds after adding an ADR, the fix is to run the generator, not to edit the
+    yaml: `python scripts/gen_adr_index.py`. Hand-set `body:` locators round-trip.
+    """
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[1]
+    committed = (repo_root / "spec" / "adr_index.yaml").read_text(encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(repo_root / "scripts" / "gen_adr_index.py"), "--check"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        "spec/adr_index.yaml is out of date. Run: python scripts/gen_adr_index.py"
+        + chr(10)
+        + result.stderr
+    )
+    assert "adrs:" in committed
+
+
+def test_generator_writes_lf_on_this_platform() -> None:
+    """Run the generator and assert the file it *wrote* has no CRLF.
+
+    The first version of this test read the checked-in manifest instead, which proves
+    nothing about the generator — git normalises on checkout, so it would have passed
+    against the very bug it was named for. Path.write_text translates newlines to the
+    platform default; on the loop host that turned all 98 lines into CRLF against an
+    LF-committed file, and it could not show while the generator only ran on the Linux
+    docs host. So the write path itself is exercised, on whatever platform runs the suite.
+    """
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "adr_index.yaml"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(repo_root / "scripts" / "gen_adr_index.py"),
+                "--out",
+                str(out),
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        raw = out.read_bytes()
+    assert raw, "generator wrote nothing"
+    assert b"\r\n" not in raw
+    assert raw.endswith(b"\n")
+
+
+def test_adr_titles_from_repo_keeps_a_body_with_no_heading(tmp_path: Path) -> None:
+    """A body file with no ``# `` line still gets an index entry, with an empty title.
+
+    The first version keyed inclusion on finding the heading, so such a file vanished
+    from the index entirely — which is the failure this index exists to prevent, and the
+    one ADR-2026-08-25-20 demonstrated by sitting unregistered for half a year. An empty
+    title is visible in the injected prompt; a missing row is not.
+    """
+    from spirrow_mindwire.naysayer.adr_index_gen import adr_titles_from_repo
+
+    body_dir = tmp_path / "docs" / "adr"
+    body_dir.mkdir(parents=True)
+    (body_dir / "ADR-2026-01-01-1-titled.md").write_text("# Real title", encoding="utf-8")
+    (body_dir / "ADR-2026-01-01-2-headless.md").write_text(
+        "no heading here, just prose", encoding="utf-8"
+    )
+    (body_dir / "ADR-2026-01-01-3-amendment-memo.md").write_text("# Skipped", encoding="utf-8")
+
+    titles = adr_titles_from_repo(tmp_path)
+
+    assert titles == {"ADR-2026-01-01-1": "Real title", "ADR-2026-01-01-2": ""}
+
+
+def test_a_headless_body_reaches_the_manifest(
+    tmp_path: Path,
+) -> None:
+    """And it survives all the way into the rendered manifest, not just the title map."""
+    from spirrow_mindwire.naysayer.adr_index_gen import adr_titles_from_repo
+
+    body_dir = tmp_path / "docs" / "adr"
+    body_dir.mkdir(parents=True)
+    (body_dir / "ADR-2026-01-01-2-headless.md").write_text("prose only", encoding="utf-8")
+    rendered = render_manifest(build_manifest_index("", adr_titles_from_repo(tmp_path)))
+    parsed = yaml.safe_load(rendered)
+    assert [e["id"] for e in parsed["adrs"]] == ["ADR-2026-01-01-2"]
+    assert parsed["adrs"][0]["title"] == ""
