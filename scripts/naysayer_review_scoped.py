@@ -29,7 +29,7 @@ Invariants preserved (naysayer discipline):
 Run::
 
     uv run python scripts/naysayer_review_scoped.py \
-        --pr SpirrowGames/Spirrow-VoxelWorld#52 \
+        --pr SpirrowGames/spirrow-voxelworld#52 \
         --scope-file C:/path/to/scope.md
 """
 

@@ -491,7 +491,7 @@ implementing_max = 1
 
 [[projects]]
 project  = "spirrow-voxelworld"
-repo     = "SpirrowGames/Spirrow-VoxelWorld"
+repo     = "SpirrowGames/spirrow-voxelworld"
 repo_dir = "C:/workspace/sandbox/voxelworld-impl"
 profile  = "ephemeral-develop"
 ```

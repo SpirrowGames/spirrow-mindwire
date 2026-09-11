@@ -59,7 +59,11 @@ def _qualified_thread_id(prefix: str, pr: PrRef) -> str:
 
     The repo is lower-cased so that the same repo written two ways
     (``Spirrow-VoxelWorld`` / ``spirrow-voxelworld``) cannot open two ledgers for
-    one PR; GitHub repo names are case-insensitive for identity.
+    one PR; GitHub repo names are case-insensitive for identity. That repo was
+    renamed to the lower-cased spelling on 2026-09-11, which does not retire the
+    folding: the ids built here were always lower-cased, but the *inputs* still
+    arrive both ways — chatroom titles and PR refs written before the rename, and
+    anything a caller types today.
 
     The owner is deliberately *not* in the id: it would make every id half again as
     long for a distinction that only bites across organisations. That is a premise
@@ -105,7 +109,9 @@ def _same_pr(found: PrRef | None, pr: PrRef) -> bool:
     repo: ``Spirrow-VoxelWorld#12`` and ``spirrow-voxelworld#12`` land on one
     thread id by construction. Comparing case-sensitively there would report a
     thread as colliding with itself and turn an idempotent re-fire into a hard
-    failure — and both spellings are in live use in the chatroom's titles.
+    failure — and both spellings are in live use in the chatroom's titles. The
+    repo's own name is the lower-cased one since 2026-09-11; the titles written
+    before that rename are what keep the other spelling live.
     """
     if found is None:
         return False
