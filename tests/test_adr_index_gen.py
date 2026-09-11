@@ -392,3 +392,41 @@ def test_generator_writes_lf_on_this_platform() -> None:
     assert raw, "generator wrote nothing"
     assert b"\r\n" not in raw
     assert raw.endswith(b"\n")
+
+
+def test_adr_titles_from_repo_keeps_a_body_with_no_heading(tmp_path: Path) -> None:
+    """A body file with no ``# `` line still gets an index entry, with an empty title.
+
+    The first version keyed inclusion on finding the heading, so such a file vanished
+    from the index entirely — which is the failure this index exists to prevent, and the
+    one ADR-2026-08-25-20 demonstrated by sitting unregistered for half a year. An empty
+    title is visible in the injected prompt; a missing row is not.
+    """
+    from spirrow_mindwire.naysayer.adr_index_gen import adr_titles_from_repo
+
+    body_dir = tmp_path / "docs" / "adr"
+    body_dir.mkdir(parents=True)
+    (body_dir / "ADR-2026-01-01-1-titled.md").write_text("# Real title", encoding="utf-8")
+    (body_dir / "ADR-2026-01-01-2-headless.md").write_text(
+        "no heading here, just prose", encoding="utf-8"
+    )
+    (body_dir / "ADR-2026-01-01-3-amendment-memo.md").write_text("# Skipped", encoding="utf-8")
+
+    titles = adr_titles_from_repo(tmp_path)
+
+    assert titles == {"ADR-2026-01-01-1": "Real title", "ADR-2026-01-01-2": ""}
+
+
+def test_a_headless_body_reaches_the_manifest(
+    tmp_path: Path,
+) -> None:
+    """And it survives all the way into the rendered manifest, not just the title map."""
+    from spirrow_mindwire.naysayer.adr_index_gen import adr_titles_from_repo
+
+    body_dir = tmp_path / "docs" / "adr"
+    body_dir.mkdir(parents=True)
+    (body_dir / "ADR-2026-01-01-2-headless.md").write_text("prose only", encoding="utf-8")
+    rendered = render_manifest(build_manifest_index("", adr_titles_from_repo(tmp_path)))
+    parsed = yaml.safe_load(rendered)
+    assert [e["id"] for e in parsed["adrs"]] == ["ADR-2026-01-01-2"]
+    assert parsed["adrs"][0]["title"] == ""

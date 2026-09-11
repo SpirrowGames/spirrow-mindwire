@@ -186,6 +186,10 @@ def adr_titles_from_repo(repo_root: Any) -> dict[str, str]:
     them; those are not recoverable from a tree nobody may write to any more, and a title
     that drifts from its document is worse than a long one.
 
+    A body with no ``# `` heading still gets an entry, with an empty title: an ADR missing
+    from the index is the failure this index exists to prevent, and an empty title shows up
+    in the prompt where a missing row would not.
+
     ``-amendment-`` files are skipped for the same reason ``check_stale_repo_bodies``
     skips them: the string rule is about the filename, and ADR-2026-05-21-06's only file
     here says of itself that it is a diff to be merged into the body.
@@ -200,9 +204,16 @@ def adr_titles_from_repo(repo_root: Any) -> dict[str, str]:
         match = _ADR_ID_RE.match(path.name)
         if match is None:
             continue
+        # The id is registered before the heading is looked for, on purpose. Keying
+        # inclusion on finding a ``# `` line would drop a body that has none — an ADR
+        # silently absent from the index is the exact failure this index exists to stop
+        # (ADR-2026-08-25-20 sat unregistered for half a year). An empty title is
+        # tolerated downstream and visible; an absent entry is neither.
+        adr_id = match.group(0)
+        titles.setdefault(adr_id, "")
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("# "):
-                titles.setdefault(match.group(0), _TITLE_ID_PREFIX_RE.sub("", line[2:].strip()))
+                titles[adr_id] = _TITLE_ID_PREFIX_RE.sub("", line[2:].strip())
                 break
     return titles
 
