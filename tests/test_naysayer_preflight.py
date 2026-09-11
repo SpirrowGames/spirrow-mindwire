@@ -42,7 +42,7 @@ from spirrow_mindwire.naysayer.principles import (
 )
 from spirrow_mindwire.value_objects import AttestationRecord
 
-_ROUTE = "http://100.79.84.62:8110"
+_ROUTE = "http://{{IP_SERVICES}}:8110"
 _TIER = "naysayer"
 _EXPECTED = "gemini"
 _NOW = datetime(2026, 8, 13, 4, 29, 54, tzinfo=UTC)
@@ -607,7 +607,7 @@ async def test_the_failure_message_does_not_dump_whole_rows() -> None:
 
     def _row_with_a_secret(row_id: int) -> dict[str, Any]:
         row = _light_row(row_id)
-        row["user_id"] = "sgadmin@example.internal"
+        row["user_id"] = "{{USER_SERVICES}}@example.internal"
         return row
 
     gateway = _FakeGateway(
@@ -621,7 +621,7 @@ async def test_the_failure_message_does_not_dump_whole_rows() -> None:
         await _attest(gateway)
     message = str(excinfo.value)
     assert "'user_id'" in message  # the column is named...
-    assert "sgadmin@example.internal" not in message  # ...its value is not.
+    assert "{{USER_SERVICES}}@example.internal" not in message  # ...its value is not.
 
 
 # --------------------------------------------------------------------------- #

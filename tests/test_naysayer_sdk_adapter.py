@@ -670,7 +670,7 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
     adapter = NaysayerSdkAdapter(
         cwd=tmp_path,
         obligations=_OBLIGATIONS,
-        inference_base_url="http://100.79.84.62:8110",
+        inference_base_url="http://{{IP_SERVICES}}:8110",
         client_factory=_factory(_FakeClient([_assistant("VERDICT: object."), _result()]), []),
         preflight=_preflight_ok(),
     )
@@ -686,7 +686,7 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
     assert lines[0] == "VERDICT: object."
     assert lines[-2] == (
         "<!-- source: tools=0 · mcp=0 · setting_sources=unset "
-        "· route=100.79.84.62:8110 · tier=naysayer -->"
+        "· route={{IP_SERVICES}}:8110 · tier=naysayer -->"
     )
     assert lines[-1] == (
         "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "

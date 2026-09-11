@@ -52,7 +52,7 @@ async def _fire(
 def _error_envelope(error_type: str, message: str, **details: Any) -> dict[str, Any]:
     """A failed chatroom call, shaped the way the live far end actually answers.
 
-    **Measured, not imagined** (2026-08-16, ``http://100.79.84.62:8117/mcp``, via
+    **Measured, not imagined** (2026-08-16, ``http://{{IP_SERVICES}}:8117/mcp``, via
     :class:`StreamableHttpChatroomMcp` — the same client production uses)::
 
         chatroom_get_thread(thread_id="T-probe-definitely-not-a-thread-20260816")

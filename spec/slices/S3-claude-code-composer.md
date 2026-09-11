@@ -1,5 +1,7 @@
 # S3 — Claude Code backend for the decision-request composer
 
+> **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
+
 **Status**: implementation SOT (single source of truth). This file — not a chatroom
 message — is what `OBL-READBACK-ENTRY` reads before touching S3 code. If a later
 Tier-C decision in the chatroom changes S3, that decision has no force until this
@@ -103,7 +105,7 @@ PR, cannot query anything — the "does not decide" guarantee is structural.
   environment shape it always does.
 - **Proxy environment (D-44 — Tier-C msg §24)**: `HTTP_PROXY`,
   `HTTPS_PROXY`, and `NO_PROXY` are on the allowlist. On the
-  sg-ai-server-01 deploy host, the ONLY route out of the box to
+  {{HOST_SERVICES}} deploy host, the ONLY route out of the box to
   `api.anthropic.com` is through a squid proxy exported via these three
   variables. Without them the child `claude -p` fails INSIDE the CLI
   with `terminal_reason:"api_error"` and `duration_api_ms:0` (the API

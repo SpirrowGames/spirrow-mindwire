@@ -1,5 +1,7 @@
 # Docs-Develop Layout Convention (cross-project)
 
+> **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
+
 - **Status**: Draft (local develop). Drive 反映は Takahito GO 後 (Tier C)。
 - **Author**: main (claude.ai). Materialized by claude-code from the ADR-07 §5 Open-Q2 resolution.
 - **Resolves**: ADR-2026-05-23-07 §2.5 / §5 Q2
@@ -9,7 +11,7 @@ git の develop/main モデルを doc に一般化する（**Drive = doc の mai
 
 ## 2. Root
 - 専用 root に **単一 git repo `spirrow-docs`**（各 code repo とは分離 = Magickit project が必ずしも repo を持たないため）。
-- 規約上の理想配置は `/srv/spirrow-docs`（sg-ai-server-01）。Windows ホスト (sg-tomtebo-01) では bring-up 中 `C:\workspace\spirrow-docs` に instantiate。
+- 規約上の理想配置は `/srv/spirrow-docs`（{{HOST_SERVICES}}）。Windows ホスト ({{HOST_LOOP}}) では bring-up 中 `C:\workspace\spirrow-docs` に instantiate。
 
 ## 3. Layout
 - `<project>/<category>/<doc>.md`、category ∈ {adr, spec}。

@@ -1,5 +1,7 @@
 # MindWire Stage 3 — Implementer Environment Spec
 
+> **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
+
 - **Status**: Draft (local develop). Drive 反映は Takahito GO 後 (Tier C)。
 - **Author**: main (claude.ai). Materialized by claude-code from the ADR-07 §5 Open-Q1 resolution.
 - **Resolves**: ADR-2026-05-23-07 §2.4 / §5 Q1
@@ -8,7 +10,7 @@
 implementer は EXECUTE_CODE を全開放するため、blast radius を loop のゲートではなく**環境レベルで物理封じ込め**する。本 spec はその独立 PC の封じ込め設定を規定する。Tier A（EXECUTE_CODE 全開放）の前提条件。
 
 ## 2. Tailscale ACL (Layer 1)
-- `tag:mindwire-implementer` ノードからの到達先は **sg-ai-server-01:tcp:8110 (Lexora) のみ許可**。grants 構文にマージ。
+- `tag:mindwire-implementer` ノードからの到達先は **{{HOST_SERVICES}}:tcp:8110 (Lexora) のみ許可**。grants 構文にマージ。
 - 定義時点で未記載 = default-deny ゆえ Vaultwarden / SSH / 他ノードは到達不可。
 - `autogroup:member` は従来どおり全許可（人の運用は維持）。
 
@@ -25,7 +27,7 @@ implementer は EXECUTE_CODE を全開放するため、blast radius を loop �
 ## 4. Credentials
 - GitHub token = mindwire repo scoped fine-grained PAT（Contents R/W + PR R/W）。
 - Vaultwarden アクセスを環境に置かない。長期クレデンシャルを implementer 環境に保持しない。
-- **Anthropic API キーは implementer PC に持たせない**。推論は Lexora 経由（Lexora が cloud Claude へルーティング、キーは sg-ai-server-01 のみ保持）。
+- **Anthropic API キーは implementer PC に持たせない**。推論は Lexora 経由（Lexora が cloud Claude へルーティング、キーは {{HOST_SERVICES}} のみ保持）。
 
 ## 5. Deny smoke test (EXECUTE_CODE 解放の前提)
 implementer から以下を実証:
