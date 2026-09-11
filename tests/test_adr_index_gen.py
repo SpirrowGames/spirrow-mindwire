@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any
 
 import yaml
 
@@ -18,54 +18,23 @@ from spirrow_mindwire.naysayer.adr_index_gen import (
     check_body_locator_formats,
     check_in_repo_bodies_are_registered,
     check_repo_locator_targets,
-    extract_docmap_adrs,
     load_existing_body_locators,
     render_manifest,
 )
 
-# §M carries an identity ADR (09) the _docmap omits.
+# §M carries an identity ADR (09) the body scan omits (it has no .md body).
 _CLAUDE_MD = (
     "## §M\n| ADR | x | y |\n|---|---|---|\n"
     "| ADR-2026-05-27-09 (T28) | identity 4 layers | T-T28-author-role-identity |\n"
 )
 
-# A plausible _docmap shape: a list of doc entries (nested under a top-level key), each
-# with a path + title. Carries an architecture ADR (16) §M omits, plus a non-ADR doc.
-_DOCMAP: dict[str, Any] = {
-    "documents": [
-        {
-            "path": "adr/ADR-2026-06-03-16-ci-gate.md",
-            "title": "naysayer CI-gate",
-            "status": "accepted",
-        },
-        {"path": "guides/setup.md", "title": "Setup guide", "status": "draft"},
-    ]
-}
-
-
-def test_extract_docmap_adrs_tolerant_walk() -> None:
-    adrs = extract_docmap_adrs(_DOCMAP)
-    assert adrs == {"ADR-2026-06-03-16": "naysayer CI-gate"}  # non-ADR doc ignored
-
-
-def test_extract_docmap_adrs_strips_id_prefix_from_title() -> None:
-    # Real _docmap titles carry the id as a prefix; the rendered "- {id} — {title}" line must
-    # not double-print the id (Tier B re-review msg-446). The title's own parens are preserved.
-    docmap = {
-        "docs": [
-            {
-                "path": "adr/ADR-2026-05-21-06.md",
-                "title": "ADR-2026-05-21-06 — mindwire Interface Contract (Ports)",
-            }
-        ]
-    }
-    assert extract_docmap_adrs(docmap) == {
-        "ADR-2026-05-21-06": "mindwire Interface Contract (Ports)"
-    }
+# The second source: {id: title} as adr_titles_from_repo returns it. Carries an
+# architecture ADR (16) §M omits, so the union below is doing real work.
+_SECOND_SOURCE: dict[str, str] = {"ADR-2026-06-03-16": "naysayer CI-gate"}
 
 
 def test_build_manifest_index_is_the_union() -> None:
-    index = build_manifest_index(_CLAUDE_MD, extract_docmap_adrs(_DOCMAP))
+    index = build_manifest_index(_CLAUDE_MD, _SECOND_SOURCE)
     # The whole point: §M-only (09) AND _docmap-only (16) both present, sorted.
     assert [row[0] for row in index] == ["ADR-2026-05-27-09", "ADR-2026-06-03-16"]
     assert index[0][1] == "identity 4 layers"  # §M title kept
@@ -75,7 +44,7 @@ def test_build_manifest_index_is_the_union() -> None:
 def test_build_manifest_index_carries_section_m_thread() -> None:
     # T-adr-index-omits-chatroom-body-locator §4-1: the §M thread column must be
     # preserved through generation (single-source with CLAUDE.md — §4-6).
-    index = build_manifest_index(_CLAUDE_MD, extract_docmap_adrs(_DOCMAP))
+    index = build_manifest_index(_CLAUDE_MD, _SECOND_SOURCE)
     by_id = {adr_id: (title, thread) for adr_id, title, thread in index}
     assert by_id["ADR-2026-05-27-09"][1] == "T-T28-author-role-identity"
     # Architecture ADRs (docmap-only, no §M row) have no thread.
@@ -83,7 +52,7 @@ def test_build_manifest_index_carries_section_m_thread() -> None:
 
 
 def test_render_manifest_round_trips_through_loader(tmp_path: Path) -> None:
-    index = build_manifest_index(_CLAUDE_MD, extract_docmap_adrs(_DOCMAP))
+    index = build_manifest_index(_CLAUDE_MD, _SECOND_SOURCE)
     # No pre-existing body locators → every entry gets the ``unknown`` default.
     rendered = render_manifest(index, body_locators={})
     # Parses as YAML and matches the loader's view when written to spec/adr_index.yaml.
@@ -108,7 +77,7 @@ def test_render_manifest_escapes_quotes() -> None:
 def test_render_manifest_preserves_body_locators(tmp_path: Path) -> None:
     # T-adr-index-omits-chatroom-body-locator §4-1: hand-maintained body locators must
     # survive regeneration (round-trip). An id absent from the map gets ``unknown``.
-    index = build_manifest_index(_CLAUDE_MD, extract_docmap_adrs(_DOCMAP))
+    index = build_manifest_index(_CLAUDE_MD, _SECOND_SOURCE)
     rendered = render_manifest(
         index,
         body_locators={
@@ -392,14 +361,34 @@ def test_committed_manifest_matches_regeneration() -> None:
     assert "adrs:" in committed
 
 
-def test_generator_writes_lf_not_the_platform_default() -> None:
-    """The manifest is committed with LF; regenerating must not rewrite every line.
+def test_generator_writes_lf_on_this_platform() -> None:
+    """Run the generator and assert the file it *wrote* has no CRLF.
 
-    Path.write_text translates newlines to the platform default. That never showed while
-    the generator could only run on the Linux docs host — it needed a file that lived
-    there. Now that it runs on the loop host too, a CRLF write would turn every
-    regeneration into a whole-file diff, which is how a drift-check stops being read.
+    The first version of this test read the checked-in manifest instead, which proves
+    nothing about the generator — git normalises on checkout, so it would have passed
+    against the very bug it was named for. Path.write_text translates newlines to the
+    platform default; on the loop host that turned all 98 lines into CRLF against an
+    LF-committed file, and it could not show while the generator only ran on the Linux
+    docs host. So the write path itself is exercised, on whatever platform runs the suite.
     """
+    import subprocess
+
     repo_root = Path(__file__).resolve().parents[1]
-    raw = (repo_root / "spec" / "adr_index.yaml").read_bytes()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "adr_index.yaml"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(repo_root / "scripts" / "gen_adr_index.py"),
+                "--out",
+                str(out),
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        raw = out.read_bytes()
+    assert raw, "generator wrote nothing"
     assert b"\r\n" not in raw
+    assert raw.endswith(b"\n")

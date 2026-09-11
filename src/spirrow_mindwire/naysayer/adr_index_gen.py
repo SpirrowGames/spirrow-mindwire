@@ -6,11 +6,11 @@ a **derived view**: this module regenerates it from the union of
 
   (a) the ADRs referenced in **CLAUDE.md §M** (in-repo, via
       :func:`parse_adr_index_with_thread`), and
-  (b) the ADR entries in the spirrow-docs **``_docmap.yaml``** (the canonical doc manifest).
+  (b) the ADR bodies in **``docs/adr/``** (via :func:`adr_titles_from_repo`).
 
 Neither source alone is complete — §M omits the architecture ADRs (06/07/08/14/16-19) and
-``_docmap`` omits the §M-only identity ADRs (09-13, which have no ``.md`` body) — so the
-union is taken (Tier B Finding-1, ``T-naysayer-unify-impl`` msg-442/443). Shipping this
+the bodies omit the §M-only identity ADRs (09-13, which have no ``.md`` body at all) — so
+the union is taken (Tier B Finding-1, ``T-naysayer-unify-impl`` msg-442/443). Shipping this
 generator is what makes the committed file a genuine derived view rather than a
 hand-maintained second source.
 
@@ -34,10 +34,13 @@ hot path): :func:`check_body_locator_formats` (grammar), :func:`check_repo_locat
 must not be left pointing at Drive — the failure main's own commit message named,
 "ADR-20 was never registered"). None of them touch the network, Drive, or the chatroom.
 
-``_docmap`` schema: the exact shape is owned by spirrow-docs and is not available on the
-loop host, so :func:`extract_docmap_adrs` is **schema-tolerant** — it walks the parsed
-structure and picks up any mapping carrying a ``title`` plus an ADR id in one of its string
-fields. Verify the regenerated file against the real ``_docmap`` on first run.
+Source (b) was ``spirrow-docs/_docmap.yaml`` until 2026-09-11 — a file on one machine in a
+tree with no remote, which is why ADR-2026-06-04-19 N-2 records the committed copy as
+unavoidable and why CI could never drift-check it. The migration put every body in
+``docs/adr/`` and ADR-2026-05-23-07 §6 moved canonicity here, so the bodies are the source
+and the generator runs anywhere the repository does. The id set was identical across the
+switch (19 either way); six titles grew, because they now come from each document's own
+heading instead of a curated summary that can no longer be maintained.
 """
 
 from __future__ import annotations
@@ -52,7 +55,7 @@ from .adr_index import body_locator_is_valid, parse_adr_index_with_thread, repo_
 
 _ADR_ID_RE = re.compile(r"ADR-\d{4}-\d{2}-\d{2}-\d+")
 
-# Some _docmap titles carry the ADR id as a prefix ("ADR-YYYY-MM-DD-N - Title"); strip it so
+# Some titles carry the ADR id as a prefix ("ADR-YYYY-MM-DD-N - Title"); strip it so
 # the rendered "- {id} - {title}" line does not print the id twice (Tier B re-review msg-446).
 # Strips the id plus one separator char (any dash/colon/etc.). ASCII-only pattern (carries no
 # ambiguous unicode); [^\w\s]? eats a single separator without over-eating the title's own text.
@@ -138,39 +141,6 @@ def _first_adr_id(node: dict[str, Any]) -> str | None:
             if match:
                 return match.group(0)
     return None
-
-
-def extract_docmap_adrs(docmap_data: Any) -> dict[str, str]:
-    """Extract ``{adr_id: title}`` from a parsed ``_docmap`` structure (schema-tolerant).
-
-    **No longer on the generation path** (2026-09-11): :func:`adr_titles_from_repo`
-    replaced it. Kept because ``_docmap.yaml`` still exists in the archived, write-stopped
-    spirrow-docs tree and carries the pre-migration drive_doc_id / prismind_id mapping —
-    this is the reader for auditing that archive, and for ``--docmap`` when someone wants
-    to compare the two sources.
-
-    Walks the (possibly nested) structure and records any mapping that carries a non-empty
-    ``title`` together with an ADR id in one of its string fields. Tolerant of the top-level
-    shape (list / dict / nested) since the canonical ``_docmap`` schema lives in spirrow-docs.
-    """
-    found: dict[str, str] = {}
-
-    def visit(node: Any) -> None:
-        if isinstance(node, dict):
-            title = node.get("title")
-            if isinstance(title, str) and title.strip():
-                adr_id = _first_adr_id(node)
-                if adr_id is not None:
-                    clean = _TITLE_ID_PREFIX_RE.sub("", title.strip()).strip()
-                    found.setdefault(adr_id, clean)
-            for value in node.values():
-                visit(value)
-        elif isinstance(node, list):
-            for item in node:
-                visit(item)
-
-    visit(docmap_data)
-    return found
 
 
 def build_manifest_index(
@@ -411,7 +381,6 @@ __all__ = [
     "check_body_locator_formats",
     "check_in_repo_bodies_are_registered",
     "check_repo_locator_targets",
-    "extract_docmap_adrs",
     "load_existing_body_locators",
     "render_manifest",
 ]

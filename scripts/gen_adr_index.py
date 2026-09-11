@@ -17,8 +17,9 @@ switch — 19 either way, nothing gained or lost.
     python scripts/gen_adr_index.py
     python scripts/gen_adr_index.py --check   # exit 1 on drift, write nothing
 
-``--docmap`` still accepts the archived ``_docmap.yaml`` for comparison against the old
-source; it is not needed to generate.
+The ``_docmap`` reader went with it. The one comparison it was wanted for — does the new
+source produce the same index — was made on the day of the switch and is recorded in the
+commit that made it: 19 ids either way, six titles longer.
 """
 
 from __future__ import annotations
@@ -27,12 +28,9 @@ import argparse
 import sys
 from pathlib import Path
 
-import yaml
-
 from spirrow_mindwire.naysayer.adr_index_gen import (
     adr_titles_from_repo,
     build_manifest_index,
-    extract_docmap_adrs,
     load_existing_body_locators,
     render_manifest,
 )
@@ -46,12 +44,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Regenerate spec/adr_index.yaml from CLAUDE.md §M + docs/adr/ bodies."
     )
-    parser.add_argument(
-        "--docmap",
-        type=Path,
-        default=None,
-        help="archived spirrow-docs/_docmap.yaml; only to compare against the old source",
-    )
     parser.add_argument("--claude-md", type=Path, default=_DEFAULT_CLAUDE_MD)
     parser.add_argument("--out", type=Path, default=_DEFAULT_OUT)
     parser.add_argument(
@@ -62,11 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     claude_md = args.claude_md.read_text(encoding="utf-8")
-    if args.docmap is None:
-        second_source = adr_titles_from_repo(_REPO_ROOT)
-    else:
-        second_source = extract_docmap_adrs(yaml.safe_load(args.docmap.read_text(encoding="utf-8")))
-    index = build_manifest_index(claude_md, second_source)
+    index = build_manifest_index(claude_md, adr_titles_from_repo(_REPO_ROOT))
     # Round-trip: hand-maintained ``body:`` locators (per T-adr-index-omits-chatroom-
     # body-locator §4-1) must survive regeneration. Missing ids fall back to the
     # ``drive`` default inside render_manifest.
