@@ -52,13 +52,26 @@ trigger id (`#1`〜`#5`) は `./ledger.md` の `trigger` 列で inline label 付
 
 ## 派生アーティファクト再生成手順 — naysayer ADR index manifest (旧 §N.2、ADR-2026-06-04-19 N-2)
 
-`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title のみ、ADR 本体は Drive)。canonical な ADR 集合は分散 (`CLAUDE.md §M` 参照 ∪ spirrow-docs `_docmap`) しており、loop host / CI には `_docmap` が無いため runtime union も **full** drift-check も不可 → **in-repo の commit 済コピーは不可避** (host-reality finding, T-naysayer-unify-impl msg-438/443)。
+`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title + thread + body locator。ADR 本体は `docs/adr/`)。canonical な ADR 集合は `CLAUDE.md §M` 参照 ∪ `docs/adr/` の ADR 本体で、**どちらも本リポジトリに在る**。∴ runtime union も **full** drift-check も可能で、後者は suite で回っている。
 
-手書き二重管理を避けるため、本ファイルは **生成物**として扱う:
+> **2026-09-12 までは違った。** 2 つ目の出典が spirrow-docs の `_docmap.yaml` —— remote を持たない tree の中の、1 台のマシンにしか無いファイル —— だったため、loop host / CI では union も full drift-check も不可で、**commit 済コピーは不可避**と結論されていた (host-reality finding, T-naysayer-unify-impl msg-438/443 / `ADR-2026-06-04-19` N-2)。その前提は Drive→Git 移行と `ADR-2026-05-23-07` §6（正本を Git へ）で消えた。**commit 済コピーは今も置いてあるが、理由が変わった** —— 注入側が生成器を走らせずに読むためである。
 
-- **再生成手順 (proposer)**: ADR を追加/Accepted した時、`_docmap` がある docs host で `python scripts/gen_adr_index.py --docmap <spirrow-docs/_docmap.yaml>` を実行し `spec/adr_index.yaml` を再生成・commit する (手編集しない)。
-- **CI の役割**: `_docmap` が CI に無いので **full** drift-check (docs-only の architecture ADR まで照合) は不可。ただし CLAUDE.md は CI に在るので CI は (a) commit 済 manifest が **parse でき well-formed** (`test_real_in_repo_manifest_loads_and_is_well_formed`) と (b) **partial drift-check** = §M 参照 ADR が manifest の部分集合であること (`test_section_m_adrs_are_a_subset_of_the_manifest`、identity ADR を §M に足して再生成を忘れたケースを捕捉、Tier B msg-448) を検証する。
-- `_docmap` schema は spirrow-docs 側が SOT で本 host から不可視のため、gen-script の `_docmap` reader は schema-tolerant (初回実行時に実 `_docmap` と突き合わせ確認)。
+手書き二重管理を避けるため、**`id` / `title` / `thread` は生成物**として扱う。**`body:` locator だけは違う** —— 1 エントリずつ手で維持し、再生成が round-trip で保存する（`T-adr-index-omits-chatroom-body-locator` §4-1）。生成器が推論しないのは、`docs/adr/` を走査して`repo:` を当てると amendment memo を誤配するため（ADR-06 の罠、msg-2671 §4-5）:
+
+- **再生成手順**: ADR を追加/Accepted した時、リポジトリがある場所で `python scripts/gen_adr_index.py` を
+  走らせる。**`--docmap` は 2026-09-12 に削除した**（`spirrow-mindwire#264`）—— 出典が `docs/adr/` の
+  ADR 本体になったので、docs host である必要も外部ファイルも要らない。`body:` locator は手で維持し、
+  再生成で round-trip する。
+- **新しい ADR を足したら locator を書く。** 生成器は推論しないので、新規 entry の `body:` は
+  `unknown`（弱いが format-valid なプレースホルダ）で出る。**そのままにしない** ——
+  `docs/adr/` に本体を置いたなら `repo:docs/adr/<file>.md`、本体が chatroom の decide-close なら
+  `chatroom:<project>/<thread>#msg-<n>` を手で書く。**本体ファイルがあるのに別を指していると CI が落とす**
+  （`check_in_repo_bodies_are_registered`）が、本体ファイルが無い §M-only ADR は落ちないので
+  `unknown` のまま残りうる。
+- **CI の役割**: **full drift-check が回る**（`test_committed_manifest_matches_regeneration`）。既にあった部分照合（`test_section_m_adrs_are_a_subset_of_the_manifest` ほか）は**そのまま残っている** ——全体照合が通っても、§M 側の綴り間違いは別の形で落ちる方が診断しやすい。
+  `ADR-2026-06-04-19` N-2 はこれを「不可避に不可能」と記録していたが、その前提（出典が 1 台のマシンに
+  しか無い）は Drive→Git 移行と `ADR-2026-05-23-07` §6 で消えた。**ADR を足して再生成し忘れると
+  gate が赤くなる。**
 
 ---
 

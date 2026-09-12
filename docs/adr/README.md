@@ -33,12 +33,21 @@ ADR 本体の置き場は**このディレクトリ**である。Drive にしか
 
 - ~~ADR 本体を Drive からここへ移す~~ → **完了**（2026-09-11）。`spec/adr_index.yaml` に
   `body: drive` の entry は 1 件も残っていない。
-- **`_docmap.yaml` の去就。** `scripts/gen_adr_index.py --docmap` の入力として今も docs host 上で使われている。ADR 本体が本リポジトリに揃えば、索引はリポジトリ自身から生成でき、`adr_index.py` が「loop host / CI に `_docmap` が無いので commit 済コピーは不可避」と記す制約（ADR-2026-06-04-19 N-2）が消える。生成器の変更を伴うので別途。
+- ~~**`_docmap.yaml` の去就。**~~ → **完了**（2026-09-12、`spirrow-mindwire#264`）。索引の出典が
+  `docs/adr/` の ADR 本体になり、`--docmap` は削除した。id 集合は切り替え前後で同一（19 ⇔ 19）で、
+  タイトル 6 件が `_docmap` の要約版から各文書の `# ` 見出しに変わった。`_docmap.yaml` 自体は凍結した
+  develop tree に残してある（移行前の `drive_doc_id` / `prismind_id` 対応を持つため）。
+  **これで `ADR-2026-06-04-19` N-2 が「不可能」と記録した full drift-check が CI で回る。**
 - ~~`docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md` の status~~ → **完了**（2026-09-11）。「Drive = doc の main」は ADR-2026-05-23-07 §6 Amendment（Takahito 権限・判断、Tier-C）で撤回され、当該 spec は Superseded になった。正本は各リポジトリの Git ツリー、機構は [[platform:docs-infrastructure-design]] §6.3.1 の二層構成。
 
 ## 注意
 
 移設した 7 件は**一切改変していない**（md5 一致で確認）。したがって本文中の「ローカル develop」「Drive 反映は Takahito GO 後」といった記述は、書かれた当時の運用を指したままである。上の表と突き合わせて読むこと。
+
+> **以下 4 つの節は作業記録である（2026-09-10 〜 09-11 の実測）。手順と locator はその後変わった** ——
+> `--docmap` は削除され（引数なしで走らせる）、ADR 本体は全件 `docs/adr/` に移り、`body: drive` の entry は
+> 0 件になった。**現行の手順と正本は「残っている作業」の上、および `spec/process/README.md` を見ること。**
+> ここを現行手順として読まない限り、本文はそのまま正しい記録である。
 
 ## Drive から取り直した 4 件（2026-09-10）
 

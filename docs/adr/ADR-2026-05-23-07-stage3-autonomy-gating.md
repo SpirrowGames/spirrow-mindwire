@@ -73,6 +73,9 @@ EXECUTE_CODE を全開放するため、blast radius は **loop のゲートで�
 
 ### 2.5 ドキュメント取り扱い
 
+> **本節は §6 Amendment（2026-09-11）で撤回済み。** doc の正本は Drive ではなく各リポジトリの Git ツリー。
+> 以下は撤回前の決定で、記録として残している —— **現行の規則として読まないこと。**
+
 git の develop/main モデルを doc にも一般化する（**Drive = doc の main**）。
 
 - プロジェクト毎に {{HOST_SERVICES}} ローカルへ **「develop ブランチ役」の doc フォルダ**を設置。そこの編集は **自由（Tier A）**。
