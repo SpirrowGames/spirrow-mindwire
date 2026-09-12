@@ -62,6 +62,12 @@ trigger id (`#1`〜`#5`) は `./ledger.md` の `trigger` 列で inline label 付
   走らせる。**`--docmap` は 2026-09-12 に削除した**（`spirrow-mindwire#264`）—— 出典が `docs/adr/` の
   ADR 本体になったので、docs host である必要も外部ファイルも要らない。`body:` locator は手で維持し、
   再生成で round-trip する。
+- **新しい ADR を足したら locator を書く。** 生成器は推論しないので、新規 entry の `body:` は
+  `unknown`（弱いが format-valid なプレースホルダ）で出る。**そのままにしない** ——
+  `docs/adr/` に本体を置いたなら `repo:docs/adr/<file>.md`、本体が chatroom の decide-close なら
+  `chatroom:<project>/<thread>#msg-<n>` を手で書く。**本体ファイルがあるのに別を指していると CI が落とす**
+  （`check_in_repo_bodies_are_registered`）が、本体ファイルが無い §M-only ADR は落ちないので
+  `unknown` のまま残りうる。
 - **CI の役割**: **full drift-check が回る**（`test_committed_manifest_matches_regeneration`）。既にあった部分照合（`test_section_m_adrs_are_a_subset_of_the_manifest` ほか）は**そのまま残っている** ——全体照合が通っても、§M 側の綴り間違いは別の形で落ちる方が診断しやすい。
   `ADR-2026-06-04-19` N-2 はこれを「不可避に不可能」と記録していたが、その前提（出典が 1 台のマシンに
   しか無い）は Drive→Git 移行と `ADR-2026-05-23-07` §6 で消えた。**ADR を足して再生成し忘れると

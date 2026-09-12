@@ -44,6 +44,11 @@ ADR 本体の置き場は**このディレクトリ**である。Drive にしか
 
 移設した 7 件は**一切改変していない**（md5 一致で確認）。したがって本文中の「ローカル develop」「Drive 反映は Takahito GO 後」といった記述は、書かれた当時の運用を指したままである。上の表と突き合わせて読むこと。
 
+> **以下 4 つの節は作業記録である（2026-09-10 〜 09-11 の実測）。手順と locator はその後変わった** ——
+> `--docmap` は削除され（引数なしで走らせる）、ADR 本体は全件 `docs/adr/` に移り、`body: drive` の entry は
+> 0 件になった。**現行の手順と正本は「残っている作業」の上、および `spec/process/README.md` を見ること。**
+> ここを現行手順として読まない限り、本文はそのまま正しい記録である。
+
 ## Drive から取り直した 4 件（2026-09-10）
 
 上の 7 件と違い、**この 4 件のうち 2 件は Drive のバイト列そのままではない。** ホスト名 2 箇所を
@@ -154,9 +159,8 @@ ADR-07 が `ADR-2026-05-21-04` / `-05` を引用しており、これも索引�
 **こちらは実在する ADR なので de-cite は誤り**（reverse check の docstring が
 「real citation を書き換えるな」と明示している）。`spirrow-docs/_docmap.yaml` に
 Tomtar 系列 4 件（`-02` / `-03` / `-04` / `-05`）を登録し、
-`python scripts/gen_adr_index.py --docmap …` で `spec/adr_index.yaml` を再生成した
-（**当時の手順**。`--docmap` は 2026-09-12 に削除されたので、今は引数なしで走らせる）。
-本体は Drive にあるので locator は `drive` のまま（移設は別 PR）。**—— これも当時の状態。** 本体は 2026-09-11 に `docs/adr/` へ移設され、`body: drive` の entry は現在 0 件（`grep -c` で確認可）。`drive` 形式は過去の値として受理されるだけで、新規には出ない。
+`python scripts/gen_adr_index.py --docmap …` で `spec/adr_index.yaml` を再生成した。
+本体は Drive にあるので locator は `drive` のまま（移設は別 PR）。
 
 **ローカルの develop 段リポジトリのコピーは使っていない。** 実測すると 4 件とも Drive と md5 が
 違い、07 は 368 バイト、14 は 2471 バイト、15 は 1425 バイト、16 は 340 バイト短かった。
