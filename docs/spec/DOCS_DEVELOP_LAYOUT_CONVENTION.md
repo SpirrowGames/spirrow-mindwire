@@ -18,7 +18,7 @@
 | §2 Root | 専用 root に単一 repo `spirrow-docs`（remote 無し）を置く | **各 code repo の `docs/` に置く。** 下書きは `{{PATH_DOCS_WORK}}` の working tier |
 | §3 Layout | `<project>/<category>/<doc>.md` | **`docs/adr/` と `docs/spec/`**（リポジトリごと） |
 | §4 Doc body | front-matter を入れない | **front-matter の `type` が分類の正本**（[[platform:document-conventions]]） |
-| §5 `_docmap.yaml` | ローカル専用台帳 | 去就は未決。`scripts/gen_adr_index.py --docmap` が今も入力に取る |
+| §5 `_docmap.yaml` | ローカル専用台帳 | **役目を終えた**（2026-09-12）。索引の出典は `docs/adr/` の ADR 本体になり `--docmap` は削除。ファイル自体は移行前の `drive_doc_id` 対応として凍結 tree に残る |
 | §6 反映ワークフロー | Tier A 編集 → Tier C で Drive 反映 | **working tier へ書き、明示的な promote（PR）で canonical へ。** 滞留と `diverged` は同期時に検出 |
 | §7 将来流用 | 切替ツールの台帳に流用可 | Deferred のまま（二層構成は「呼び手は層を知らない」と定めたので設計を作り直す必要がある） |
 

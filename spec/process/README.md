@@ -52,13 +52,18 @@ trigger id (`#1`〜`#5`) は `./ledger.md` の `trigger` 列で inline label 付
 
 ## 派生アーティファクト再生成手順 — naysayer ADR index manifest (旧 §N.2、ADR-2026-06-04-19 N-2)
 
-`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title のみ、ADR 本体は Drive)。canonical な ADR 集合は分散 (`CLAUDE.md §M` 参照 ∪ spirrow-docs `_docmap`) しており、loop host / CI には `_docmap` が無いため runtime union も **full** drift-check も不可 → **in-repo の commit 済コピーは不可避** (host-reality finding, T-naysayer-unify-impl msg-438/443)。
+`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title + thread + body locator。ADR 本体は `docs/adr/`)。canonical な ADR 集合は分散 (`CLAUDE.md §M` 参照 ∪ spirrow-docs `_docmap`) しており、loop host / CI には `_docmap` が無いため runtime union も **full** drift-check も不可 → **in-repo の commit 済コピーは不可避** (host-reality finding, T-naysayer-unify-impl msg-438/443)。
 
 手書き二重管理を避けるため、本ファイルは **生成物**として扱う:
 
-- **再生成手順 (proposer)**: ADR を追加/Accepted した時、`_docmap` がある docs host で `python scripts/gen_adr_index.py --docmap <spirrow-docs/_docmap.yaml>` を実行し `spec/adr_index.yaml` を再生成・commit する (手編集しない)。
-- **CI の役割**: `_docmap` が CI に無いので **full** drift-check (docs-only の architecture ADR まで照合) は不可。ただし CLAUDE.md は CI に在るので CI は (a) commit 済 manifest が **parse でき well-formed** (`test_real_in_repo_manifest_loads_and_is_well_formed`) と (b) **partial drift-check** = §M 参照 ADR が manifest の部分集合であること (`test_section_m_adrs_are_a_subset_of_the_manifest`、identity ADR を §M に足して再生成を忘れたケースを捕捉、Tier B msg-448) を検証する。
-- `_docmap` schema は spirrow-docs 側が SOT で本 host から不可視のため、gen-script の `_docmap` reader は schema-tolerant (初回実行時に実 `_docmap` と突き合わせ確認)。
+- **再生成手順**: ADR を追加/Accepted した時、リポジトリがある場所で `python scripts/gen_adr_index.py` を
+  走らせる。**`--docmap` は 2026-09-12 に削除した**（`spirrow-mindwire#264`）—— 出典が `docs/adr/` の
+  ADR 本体になったので、docs host である必要も外部ファイルも要らない。`body:` locator は手で維持し、
+  再生成で round-trip する。
+- **CI の役割**: **full drift-check が回る**（`test_committed_manifest_matches_regeneration`）。
+  `ADR-2026-06-04-19` N-2 はこれを「不可避に不可能」と記録していたが、その前提（出典が 1 台のマシンに
+  しか無い）は Drive→Git 移行と `ADR-2026-05-23-07` §6 で消えた。**ADR を足して再生成し忘れると
+  gate が赤くなる。**
 
 ---
 
