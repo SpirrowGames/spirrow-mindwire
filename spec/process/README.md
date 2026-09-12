@@ -52,7 +52,9 @@ trigger id (`#1`〜`#5`) は `./ledger.md` の `trigger` 列で inline label 付
 
 ## 派生アーティファクト再生成手順 — naysayer ADR index manifest (旧 §N.2、ADR-2026-06-04-19 N-2)
 
-`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title + thread + body locator。ADR 本体は `docs/adr/`)。canonical な ADR 集合は分散 (`CLAUDE.md §M` 参照 ∪ spirrow-docs `_docmap`) しており、loop host / CI には `_docmap` が無いため runtime union も **full** drift-check も不可 → **in-repo の commit 済コピーは不可避** (host-reality finding, T-naysayer-unify-impl msg-438/443)。
+`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title + thread + body locator。ADR 本体は `docs/adr/`)。canonical な ADR 集合は `CLAUDE.md §M` 参照 ∪ `docs/adr/` の ADR 本体で、**どちらも本リポジトリに在る**。∴ runtime union も **full** drift-check も可能で、後者は suite で回っている。
+
+> **2026-09-12 までは違った。** 2 つ目の出典が spirrow-docs の `_docmap.yaml` —— remote を持たない tree の中の、1 台のマシンにしか無いファイル —— だったため、loop host / CI では union も full drift-check も不可で、**commit 済コピーは不可避**と結論されていた (host-reality finding, T-naysayer-unify-impl msg-438/443 / `ADR-2026-06-04-19` N-2)。その前提は Drive→Git 移行と `ADR-2026-05-23-07` §6（正本を Git へ）で消えた。**commit 済コピーは今も置いてあるが、理由が変わった** —— 注入側が生成器を走らせずに読むためである。
 
 手書き二重管理を避けるため、本ファイルは **生成物**として扱う:
 
