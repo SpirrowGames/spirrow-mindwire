@@ -3,7 +3,7 @@ spec_id: SPEC-2026-08-30-gate-silently-suppresses-approve-on-truncated-diff
 thread: T-gate-silently-suppresses-approve-on-truncated-diff
 target_repo: spirrow-mindwire
 base_branch: main
-status: active
+status: withdrawn
 canary: not-applicable
 supersedes: []
 obligations:
@@ -13,11 +13,36 @@ obligations:
 items:
   - id: I-1
     title: "elision（宣言的除去）を実装 — D-1〜D-7 / §3-ESCAPE-HATCH / AC-4〜AC-12"
+    status: withdrawn
+    withdrawn_reason: >-
+      Premise measured dead by AC-0 and AC-3 on 2026-09-10 (thread msg-2952).
+      AC-0: the motivating verimend#3 case was `uv.lock` ADDITION (new file,
+      797 additions, 0 deletions) — old D-2's modification-only predicate
+      would have been a no-op, so D-2″'s reason to exist does not attach.
+      AC-3: the three measurable cap exceedances are 0.0% lockfile-eligible
+      and ~99% hand-written code — #182 R5 142,070 chars (pre-cliff,
+      100% hand-written), #182 R10 201,845 chars (the round that carried
+      msg-1871's suppressed APPROVE, 99.1% hand-written), playproof#61
+      170,126 chars (99.8% hand-written). D-2″'s allowlist elision would
+      remove 0 bytes from any of them; post-elision size equals pre-elision
+      size. The design's own §9 gate pre-committed to stop at this
+      measurement; it fired.
     paths:
       - "src/spirrow_mindwire/naysayer/pr_review.py"
       - "tests/test_pr_review_driver.py"
   - id: I-2
     title: "評価失敗の可視化を実装 — D-8⁵ / (A)(B)(C) 分類 / E-not-evaluated marker / AC-14‴〜AC-31"
+    status: withdrawn
+    withdrawn_reason: >-
+      Withdrawn by Tier-C order (msg-2954) as part of "Abort Phase B entirely."
+      The I-2 premise (operational evaluation failure is silent on the PR)
+      was never independently measured — only I-1's lockfile premise was
+      falsified in msg-2952. I-2's founding concern (the same silence family
+      as msg-1871) is not measured dead; it is closed by order, not by data.
+      If the operational-failure-visibility lane is revisited, it re-opens
+      as its own thread with its own founding measurement, not by revival
+      of this record. §5 residuals 残余-2/3/4/5 are the survivors of this
+      lane; see §5 for their disposition (moved to their own container).
     paths:
       - "src/spirrow_mindwire/naysayer/pr_review.py"
       - "tests/test_pr_review_driver.py"
@@ -25,6 +50,17 @@ items:
 
 # PR-gate: elision（宣言的除去）と評価失敗の可視化
 
+> **⚠ WITHDRAWN 2026-09-10 by Tier-C decision (thread msg-2954). Do not implement any section of this document.**
+>
+> **原因は 2 つあり、記録上分離する（規律-11: 記憶ではなく記録から lift する）:**
+>
+> - **I-1（elision / D-1〜D-7 / §3-ESCAPE-HATCH / AC-4〜AC-12）は premise が測定で死んだ。** AC-0（motivating verimend#3 は `uv.lock` ADDITION、旧 D-2 は no-op）と AC-3（#182 R5 142,070 / #182 R10 201,845 / playproof#61 170,126、すべて 0.0% lockfile-eligible、〜99% hand-written code）が §9 の pre-committed gate を発火させた（thread msg-2952）。D-2″ の allowlist elision は本設計が救うべき cap 超過ケースから 0 バイトも削らない。
+> - **I-2（評価失敗の可視化 / D-8⁵ / AC-14‴〜AC-31）は測定されずに Tier-C 命令で撤回された。** その premise（operational evaluation failure が PR 上で沈黙する）は AC-0 / AC-3 で refute されていない。再訪する場合は本記録の復活ではなく、新スレッドで自身の founding measurement を持つ。
+>
+> **各 item の `withdrawn_reason`（front-matter）が権威ある原因記述である。** 散文の abort 記録は要約であり、V-5 が非空を強制する field が SOT。
+>
+> **本文書は「撤回された設計」の記録として保持する。** 削除しない — 66 msg の transcript を再構成する費用が透明にゼロ以上であり、また規律-15 / 規律-17 / 規律-18 は本設計が生んだもので、他所から引用されている。§1〜§7 の設計内容は「なぜこう考えたか」の記録として読める（**実装ガイダンスとしては読めない** — 撤回されている）。§5 の残余処分と §8 の terminal route は本 abort と一緒に更新済み。
+>
 > **本ファイル名は spec-delivery 機構（`spec/design/verify.py` の V-2）が代入する。** 本文書のプロプロレベル散文はファイル名を literal で名指ししない（規律-15）。**path は `<thread>.md` で機構から一意に定まる。** それが本ファイルが `T-gate-silently-suppresses-approve-on-truncated-diff.md` である理由の全てである。
 >
 > **spec_id / base_branch / target_repo / obligations 等の front-matter フィールドは、`spec/design/verify.py` のスキーマ（V-1）と in-tree の適合実例（`spec/design/T-design-spec-delivery.md`）から導出した。** proposer / naysayer の散文からは取っていない — 両者は front-matter スキーマを読んでいない。
@@ -527,19 +563,23 @@ LLM 呼び出し境界で例外が発生したとき、**上から評価する**
 
 ## §5 起票する残余と補償（着手時）
 
-| # | 内容 | 状態 |
+> **⚠ 本 §5 は abort 時（2026-09-10、Tier-C msg-2954）に規律-7 逆引きで再導出した。** Phase B が実装されないため、Phase B の構成要素を前提とする残余は預け先を失う。以下は各残余の**現時点の**処分。abort 前の状態は §付録 A の被覆台帳から辿れる。
+
+| # | 内容 | 処分（2026-09-10） |
 |---|---|---|
-| **残余-1** | **`_MAX_DIFF_CHARS`（Baseline `A/D-1`）の値そのものの再測定。** elision 着地後、**post-elision の分布に対して**行う。いま raw を測っても捨てる数字になる ∴ 順序が固定されている | 未起票 |
-| **残余-2** | **operational 失敗の反復が PR 上に蓄積されない。** gate が繰り返し停止していることを検知する観測点は、現状 Checks の履歴か sweep 側にしかない。必要なら Reviews ではない場所（chatroom relay / sweep）に置く | 未起票（残余-3 と同一 issue に束ねる） |
-| **残余-3** | **operational 失敗時、赤い CI が理由を述べない。** 書ける層（orchestrator）での可視化設計。**AC-23 を前提条件に持つ** | 未起票（残余-2 と束ねる） |
-| **残余-4** | **反復回数の自動カウントは本 PR に無い。** escalation は文面による人への指示であって機械的な counter ではない。counter が要るなら残余-3 と同じ issue に含める | 未起票 |
-| **残余-5** | **持続的 operational 障害が、帯外の初回呼び出しで起きた場合、Tier-C 経路が一度も配達されない。** 赤い CI は出るが理由を言わない。総縮退状態（size-orthogonal ≈ ∅）では**露出が (B) クラス全体に広がる**。真の解は反復カウンタ（残余-4）か writable layer（残余-3） | 未起票。**AC-29(b) がテストで pin し、参照コメントを埋める** |
-| **補償(a)** | **CI が lockfile↔manifest 整合（`uv lock --check` 等）を検証しているか実測。** 無ければ、本設計は **lockfile を誰も見ない状態**を作ったことになる。**本 PR の非目標だが、本設計が作った穴の所在なので記録しないことは許さない** | 未起票 |
-| **残余-7** | **`D-2″` の basename-only lockfile 述語が benign な test fixture collision で mock lockfile を elide する**（PR-gate msg-2286 が指摘、例: `tests/fixtures/poetry.lock`）。**hostile 方向（`src/hidden/uv.lock` 等）は既に 脅威モデルの受容（msg-2231 §5）として settled — この残余は再開しない**（scope fence: msg-2619 §2）。severity は「fails safe (it does not break the pipeline, it merely hides the mock lockfile)」で **non-blocking**（msg-2286 逐語）。**First task は fix ではなく measurement**: `D-3` / `D-4` / `D-elided` の notice が elided path を name するか、announce only か を確定する — 前者は readability defect（軽微）、後者は silence defect（#182 と同型）で severity が変わる。fix 空間は path-aware match / never-elide directory / notice に path を書く の 3 案で、いずれも予算とトレードする ∴ measurement が可能な実装スレッドで解く | **起票済 [`#231`](https://github.com/SpirrowGames/spirrow-mindwire/issues/231)**。**実装スレッドの `OBL-READBACK-ENTRY` が本 pointer を pick up する**（規律-17） |
+| **残余-1** | **`_MAX_DIFF_CHARS`（Baseline `A/D-1`）の値そのものの再測定。** | **並行 unblock — 単独では NOT free.** 本残余は 2 つの独立した precondition のもとにあった: (a) post-elision 分布（本設計が着地した後の）、および (b) `T-gate-reads-stale-base-diff` が変える denominator（`spec/design/T-gate-reads-stale-base-diff.md:157` 参照、#11 が `202,849 → 118,107` を明示）。abort により (a) は void（elision は来ない ∴ raw = post-elision）だが (b) は生きている。∴ 再測定は「stale-base 修正の着地後、その修正が変えた denominator に対して」行う。**「即座に unblocked」と記録すると (b) を無視した denominator で測ることになる** — Einstein msg-2955 の言い回しの逐語採用は避け、状態を precondition レベルで記述する。**未起票。** stale-base 側で pick up される見込み（そちらの残余ではないが、着地の副作用として自然に問題領域に入る）。 |
+| **残余-2** | **operational 失敗の反復が PR 上に蓄積されない。** | **container 移動、door 空。** 主題は I-2（評価失敗の可視化）の survivor である。I-2 は測定されずに abort されたため、この観測は依然として `naysayer/pr_review.py` の操作面で意味を持つ。**[`#254`](https://github.com/SpirrowGames/spirrow-mindwire/issues/254) に束ねた**（残余-2/3/4/5 の 4 件を 1 issue、cross-link 両方向を規律-17 が要求）。**規律-18 door は空**（下記 note 参照）。 |
+| **残余-3** | **operational 失敗時、赤い CI が理由を述べない。** | **container 移動、door 空。** [`#254`](https://github.com/SpirrowGames/spirrow-mindwire/issues/254) に束ねた。AC-23 前提は Phase B と一緒に死んだ ∴ 再訪時は独立に premise を立てる。 |
+| **残余-4** | **反復回数の自動カウントは本 PR に無い。** | **container 移動、door 空。** [`#254`](https://github.com/SpirrowGames/spirrow-mindwire/issues/254) に束ねた。 |
+| **残余-5** | **持続的 operational 障害が、帯外の初回呼び出しで起きた場合、Tier-C 経路が一度も配達されない。** | **container 移動、door 空。** [`#254`](https://github.com/SpirrowGames/spirrow-mindwire/issues/254) に束ねた。**AC-29(b) による pin は消える**（AC-29(b) 自体が I-2 の子で、item withdrawal と共に非規範化）— pin なしのまま container に移した。 |
+| **補償(a)** | **CI が lockfile↔manifest 整合（`uv lock --check` 等）を検証しているか実測。** | **MOOT.** 本補償は「本設計が lockfile を elide する ∴ 誰も見ない状態が生まれる」を穴として記録したもの。elision は来ない ∴ 穴は開かない ∴ 記録すべき穴が存在しない。abort と共に消える。 |
+| **残余-7** | **`D-2″` の basename-only lockfile 述語の benign な test fixture collision**（旧 `#231`）。 | **MOOT.** 主題は D-2″ の predicate と `D-3` / `D-4` / `D-elided` notice の相互作用。abort により D-2″ も notice 群も来ない ∴ collision の対象自体が生まれない。**`#231` は本 abort と同時に close（reason: not planned、msg-2952 測定 + msg-2954 Tier-C order）した**。re-home しない — 「後で使う ghost requirement」を別 repo に運ぶのは規律-17 が禁じる silent drop と対称の失敗（container が対象を持たない）。 |
 
-**残余-6 は成立しない。** msg-2251 §5 は「AC-31 を採らないなら」を条件に立てたが、msg-2252 が AC-31 を明示採択した ∴ 条件不成立。記録は「残余-6 は消える」と明示していない ∴ 本文書は TOMBSTONED を **CONSOLIDATED** として付し、fidelity review に回した（msg-2278 disposition (d) で accepted）。
+**規律-18 door 補正（明示的 debt）:** 残余-2/3/4/5 のための issue は **container はあるが door は無い**。**operational-failure lane の consumer は `src/spirrow_mindwire/naysayer/pr_review.py` を次に触れる party だが、abort により本設計はそのコードに何も足さない ∴ door を刺す場所を今回の PR は開かない。** これは意識的な選択であり、silent drop ではない: **規律-18 の未払 debt として明示登録する**（msg-2713 §4）。Einstein msg-2955 が指摘したとおり、abort された設計の pointer を live なコードにコメントとして埋めることは pollution であり、正しい終端状態は「audible debt in the design document」— それは本節そのものである。将来 operational-failure lane を再開する party は本 debt を pick up し、その時点で door を name する。**door を欠く container は忘却より一歩マシで、door を持つ container より一歩劣る** — その中間位置を隠さず書いておく。
 
-**未起票のまま残っている旧スレッド由来の項目**: `T-unparseable-verdict-is-silent`（切り詰めも length cap も無く、単に verdict 解析が verdict を取れなかった場合の沈黙。msg-1874 で名前だけ残された。**本スレッドの記録上、以後一度も触れられていない**）。
+**残余-6 は成立しない。** msg-2251 §5 は「AC-31 を採らないなら」を条件に立てたが、msg-2252 が AC-31 を明示採択した ∴ 条件不成立。記録は「残余-6 は消える」と明示していない ∴ 本文書は TOMBSTONED を **CONSOLIDATED** として付し、fidelity review に回した（msg-2278 disposition (d) で accepted）。**abort により AC-31 自体は死んだが、この disposition の record は残す**（規律-11: 記録は削除しない、状態を追記する）。
+
+**未起票のまま残っている旧スレッド由来の項目**: `T-unparseable-verdict-is-silent`（切り詰めも length cap も無く、単に verdict 解析が verdict を取れなかった場合の沈黙。msg-1874 で名前だけ残された。**本スレッドの記録上、以後一度も触れられていない**）。**abort とは独立に生きている** — Phase B にも Phase A にも依存していない別問題。
 
 ---
 
@@ -616,12 +656,16 @@ LLM 呼び出し境界で例外が発生したとき、**上から評価する**
 
 ---
 
-## §8 route（この artefact の次）
+## §8 route（terminal record — 2026-09-10 abort）
 
-1. **本 artefact（pass-2）→ Einstein の fidelity review。** 検査対象は「lift が msg-2252 / msg-2259 / msg-2278 / msg-2280 が clear したものと一致しているか」「CONSOLIDATED 項目がその差分連鎖から逸脱していないか」「LANDED evidence が base の実測と食い違っていないか」であり、設計の再オープンではない（msg-2255 §7.1 で settled）。
-2. **UNRECOVERABLE 項目（§付録 E）のうち U-3 のみが loop に残る。U-1 / U-2 は本文書で resolved**（msg-2279 §3-4 の指示に従い、U-1 は retire、U-2 は allocation-in-the-open）**。**
-3. その後に code。**着手時の測定（AC-0 / AC-3 / AC-13″ / AC-15 / AC-22 / AC-26改(b)）は fidelity review の後に行う。AC-0 は D-2″ に対して blocking のまま。**
-4. **merge は Tier-C（Takahito）。loop は merge しない。** Einstein の clearance は「code work may proceed」であって merge 承認ではない（msg-2252 / msg-2259 / msg-2280 が自ら明記）。
+**本設計は撤回された。**§8 は abort 前の 4-step route を保持しない — abort により route 自体が終端する。以下は**この artefact の terminal state** の記録。
+
+1. **AC-0 と AC-3 が測定され、§9 の pre-committed gate が発火した**（thread msg-2952）。verimend#3 は addition（旧 D-2 no-op）、cap 超過 3 事例は 0.0% lockfile-eligible。∴ Phase B のうち I-1（elision）は premise が実測で死んだ。
+2. **Tier-C 決定（msg-2954）で Phase B 全体（I-1 + I-2）が abort された。** I-2 は測定されずに命令で撤回された — 両者を front-matter の per-item `withdrawn_reason` で分けて記録した（§0 見出しの banner + front-matter 参照）。
+3. **本 abort PR が着地して `main` に載る**ことで、この thread は close 条件を満たす（msg-2780 §8 の 2nd clause: 「when a human decides in the open that Phase B is not to be built」）。**merge は Tier-C（Takahito）。loop は merge しない。**
+4. **`verify.py` は本 abort を機械的に承認する**: V-3 が enum を確認（`withdrawn` は valid）、V-5 が per-item `withdrawn_reason` の非空を確認、V-10 が **`main` ブランチでの pin 標的化を WARNING で禁じる**（`current_branch == "main"` 限定、他ブランチでは silent — これは `verify.py` の設計であり本 thread の scope 外）。
+5. **§付録 E の U-3 は依然 resolved（out-of-corpus 宣言、msg-2279 §5）。** 旧 §8 clause 2 が「U-3 のみが loop に残る」と書いていたのは §付録 E の RESOLVED state と矛盾する pass-1 遺物であり（msg-2780 §8 clause 4 が本 thread に受け継いだ）、本 abort と共に §8 側を正した — U-3 は resolved であって「loop に残る」ではない。
+6. **残余の terminal state は §5 に記述**: 残余-1 は stale-base 側で自然に unblock される precondition の下、残余-2/3/4/5 は 1 新 issue に container 移動して door を空のまま audible debt として残す、残余-7 と 補償(a) は MOOT。`#231` は Phase B abort を close reason にして close する（re-home しない）。
 
 ---
 

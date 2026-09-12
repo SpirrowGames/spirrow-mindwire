@@ -1,6 +1,7 @@
 # ADR bodies — in-repo set
 
-ADR 本体の置き場は**移行中**である。このディレクトリはその移行先で、まだ全部は揃っていない。
+ADR 本体の置き場は**このディレクトリ**である。Drive にしか無い本体は 2026-09-11 に全て移設し終えた
+（`spec/adr_index.yaml` に `body: drive` は 1 件も残っていない）。
 
 ## いま何がどこにあるか
 
@@ -10,7 +11,9 @@ ADR 本体の置き場は**移行中**である。このディレクトリはそ
 | ADR-2026-05-24-08 | **本ディレクトリ** | Drive 未反映だった |
 | ADR-2026-06-04-18 | **本ディレクトリ** | Drive 反映が Cloudflare WAF に阻まれて座礁していた |
 | ADR-2026-08-25-20 | **本ディレクトリ** | Drive 未反映、`_docmap` 未登録だった |
-| ADR-06 / 07 / 14 / 15 / 16 / 17 / 19 | Google Drive（folder `1LAENGwj…`） | 反映済み。Drive 側が本文の正本で、ローカル develop より進んでいる |
+| ADR-2026-05-23-07 / -05-31-14 / -05-31-15 / -06-03-16 | **本ディレクトリ** | Drive から取り直して移設（下記「Drive から取り直した 4 件」） |
+| ADR-2026-05-21 / -02 / -03 / -04 / -05 | **本ディレクトリ** | Tomtar 系列。Google Docs だったので下記「Tomtar 系列 5 件」を参照 |
+| ADR-06 / 17 / 19 | **本ディレクトリ** | Drive から取り直して移設（下記「最後の 3 件」） |
 | ADR-09〜13 | `CLAUDE.md` §M | identity 系。もともと §M が SOT |
 
 `spec/adr_index.yaml`（独立 naysayer と implementer に毎 summon 注入される索引）は id + title + `thread` + **`body:` locator** の派生ビューである。本体の所在は索引に載る ∴ 本ディレクトリに本体を足したら、その entry の `body:` を `repo:docs/adr/<file>.md` に更新すること。`docs/adr/` に本体があるのに `body:` が別を指す entry は CI が落とす（`*-amendment-*` は除外 — ADR-06 改訂メモは本体ではないため）。locator は「読み手がバイト列を開ける場所」の主張であって、どのコピーが正本かの主張ではない。
@@ -28,10 +31,136 @@ ADR 本体の置き場は**移行中**である。このディレクトリはそ
 
 ## 残っている作業
 
-- **Drive 反映済みの 6 件をここへ移す。** 本文は Drive 側が新しい（例: ADR-14 は Drive 15559 バイト / ローカル 13088 バイト）ので、ローカルコピーではなく **Drive から取り直して**移す必要がある。別 PR。
-- **`_docmap.yaml` の去就。** `scripts/gen_adr_index.py --docmap` の入力として今も docs host 上で使われている。ADR 本体が本リポジトリに揃えば、索引はリポジトリ自身から生成でき、`adr_index.py` が「loop host / CI に `_docmap` が無いので commit 済コピーは不可避」と記す制約（ADR-2026-06-04-19 N-2）が消える。生成器の変更を伴うので別途。
-- **`docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md` の status。** 「Drive = doc の main」という前提そのものが、Spirrow ドキュメント基盤（Git 正本）に置き換わる方向にある。本 PR では本文を一切変更していないので、Draft のままそこにある。
+- ~~ADR 本体を Drive からここへ移す~~ → **完了**（2026-09-11）。`spec/adr_index.yaml` に
+  `body: drive` の entry は 1 件も残っていない。
+- ~~**`_docmap.yaml` の去就。**~~ → **完了**（2026-09-12、`spirrow-mindwire#264`）。索引の出典が
+  `docs/adr/` の ADR 本体になり、`--docmap` は削除した。id 集合は切り替え前後で同一（19 ⇔ 19）で、
+  タイトル 6 件が `_docmap` の要約版から各文書の `# ` 見出しに変わった。`_docmap.yaml` 自体は凍結した
+  develop tree に残してある（移行前の `drive_doc_id` / `prismind_id` 対応を持つため）。
+  **これで `ADR-2026-06-04-19` N-2 が「不可能」と記録した full drift-check が CI で回る。**
+- ~~`docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md` の status~~ → **完了**（2026-09-11）。「Drive = doc の main」は ADR-2026-05-23-07 §6 Amendment（Takahito 権限・判断、Tier-C）で撤回され、当該 spec は Superseded になった。正本は各リポジトリの Git ツリー、機構は [[platform:docs-infrastructure-design]] §6.3.1 の二層構成。
 
 ## 注意
 
 移設した 7 件は**一切改変していない**（md5 一致で確認）。したがって本文中の「ローカル develop」「Drive 反映は Takahito GO 後」といった記述は、書かれた当時の運用を指したままである。上の表と突き合わせて読むこと。
+
+> **以下 4 つの節は作業記録である（2026-09-10 〜 09-11 の実測）。手順と locator はその後変わった** ——
+> `--docmap` は削除され（引数なしで走らせる）、ADR 本体は全件 `docs/adr/` に移り、`body: drive` の entry は
+> 0 件になった。**現行の手順と正本は「残っている作業」の上、および `spec/process/README.md` を見ること。**
+> ここを現行手順として読まない限り、本文はそのまま正しい記録である。
+
+## Drive から取り直した 4 件（2026-09-10）
+
+上の 7 件と違い、**この 4 件のうち 2 件は Drive のバイト列そのままではない。** ホスト名 2 箇所を
+プレースホルダに置換してある（[[platform:document-conventions]] §3.1 は「以後に書かれるもの、
+**および Phase 2 で移行するもの**」に適用されると定めており、この移設はその Phase 2 に当たる）。
+
+| ファイル | Drive fileId | Drive のサイズ / md5 | 置換 |
+|---|---|---|---|
+| `ADR-2026-05-23-07-stage3-autonomy-gating.md` | `1JPjXtl4IK8bhYclMAcY8YVaVsPzy0N7t` | 8707 / `3936353b8fd4e1fd6ba514b8f1102654` | §2.5 の実ホスト名 1 件 → `{{HOST_SERVICES}}` |
+| `ADR-2026-05-31-14-gawa-method-withdrawal.md` | `16JC7hNAQEPioNygqVipNf2sZyCrZ0dDV` | 15559 / `5471883ae8d3d81de4f0a84266565a9e` | §1.1 の実ホスト名 1 件 → `{{HOST_LOOP}}` |
+| `ADR-2026-05-31-15-independence-class-gradation.md` | `1ZyElmou_dgREPxp2y9l-BtJFQCGXJT7B` | 11765 / `5ec718575bdce62b1fc60241df471bbd` | なし（実インフラ値を含まない） |
+| `ADR-2026-06-03-16-naysayer-ci-gate.md` | `1mXYoTqIrnrIsMoxnZ_vAmvkaU9tI7i6t` | 13973 / `9d703147896275a3de8a3217691f2edf` | なし（同上） |
+
+**上の md5 は Drive 原本のもの**で、この repo のファイルのものではない。置換前のバイト列が
+Drive のそれと一致していたことの証拠として残してある（サイズは Drive の `fileSize` メタデータと
+一致を確認済み）。実値は `platform:infra-registry` にある。
+
+## Tomtar 系列 5 件（2026-09-10）
+
+`Spirrow Tomtar` project の TaskBriefs フォルダ（`1vhCCXMn…`）にあった 5 件。
+`spirrow-tomtar` は ADR-04 で**廃案**になったが、その廃案の理由と、mindwire が今の責務に
+辿り着いた経緯がここにしか無い。
+
+| ファイル | Drive fileId | 索引 |
+|---|---|---|
+| `ADR-2026-05-21-chatroom-is-conclair.md` | `1Y7L4bzHNxm-deadhdpfmKsKeaFmiPpfGAdfmOVuQ2f4` | **無し**（下記） |
+| `ADR-2026-05-21-02-tomtar-input-webhook-push.md` | `1X3Ly9B9W0Sha2RQ6uI_w3PPldtWds0oRL_YMytaRwSA` | `repo:` |
+| `ADR-2026-05-21-03-signal-channel-design.md` | `12h1cUg9zu3aZJnz8yCd6JDyq8frdhjRnsknwOKT3nSM` | `repo:` |
+| `ADR-2026-05-21-04-tomtar-withdrawal-mindwire-redefinition.md` | `1QyqP_OtujreVD-RPwvNlqFlAEMahcm_fvWAFrFH6j0k` | `repo:` |
+| `ADR-2026-05-21-05-roles-and-adapter-abstraction.md` | `1DlXB0ppMxCGy5BKMwDICVhSICBIcNY_nEhqY-FxqOzs` | `repo:` |
+
+### 上の 4 件と違い、md5 では検証できない
+
+これらは Drive 上で **Google Docs**（`application/vnd.google-apps.document`）であり、
+`.md` ファイルではない。∴ 「Drive のバイト列と一致」という主張が成立しない。
+本文は Google Docs のエクスポートから markdown に起こしたもので、
+**節・表・コードブロックの構造と文言は原文どおり**だが、バイト単位の同一性は無い。
+
+逐語からの逸脱は 1 箇所: ADR-05 の adapter 図にある `LocalQwen via Lexora (…経由)` の
+実ホスト名を `{{HOST_SERVICES}}` に置換した（規約 §3.1-2）。他の 4 件に実インフラ値は無い。
+
+### `ADR-2026-05-21`（末尾番号なし）は索引に載せない
+
+索引の id は `ADR-YYYY-MM-DD-N` 形式で、この 1 件だけ末尾の連番を持たない。
+`adr_index_gen` の id 正規表現にも `tests/test_adr_reverse_check.py` の走査対象にも
+掛からないので、**載せる場所が無い**。本文は本ディレクトリに置き、他の ADR からは
+題名で参照する（ADR-02 / -03 / -04 の §Related がそうしている）。
+
+### ADR-04 は「設計が根本要求から外れた」記録でもある
+
+§Context が、tomtar を作ることに集中するあまり根本要求への参照が薄れた経緯を
+solution-first thinking の drift として自己記述している。**廃案の判断そのものより、
+この一段落の方が後から効く。**
+
+## 最後の 3 件（2026-09-11）
+
+| ファイル | Drive fileId | サイズ / md5 |
+|---|---|---|
+| `ADR-2026-05-21-06-interface-contract-ports.md` | `18JoskFje3Wfu9D_kcKCRGNG0S4MtfmPi` | 22813 / `662e10bf74e2c89e886d9e230f742d8e` |
+| `ADR-2026-06-03-17-naysayer-design-participation.md` | `1beW6ej3pYMS-FA5XzYbqMNSkI_26b_p1` | 16934 / `431827f5a131c860c4b3d3a5bf9804df` |
+| `ADR-2026-06-04-19-naysayer-agentization-and-summon-rule.md` | `19uycTh4sw6ywHPDhQtLrC9KRmyT7LkIZ` | 25146 / `866972ebc22fd850b7bd12a1ce12f5f6` |
+
+**上の md5 はこの repo のファイルのもの**で、3 件ともサイズは Drive の `fileSize` メタデータと一致する。
+17 / 19 はバイト一致、06 は拡張子のみ `.markdown` → `.md`（`_docmap.yaml` が想定している名前に合わせた）。
+
+逐語からの逸脱は 1 箇所: ADR-19 の実ホスト名 2 件を `{{HOST_SERVICES}}` に置換した（規約 §3.1-2）。
+06 / 17 に実インフラ値は無い。
+
+### ADR-06 の移設でテストを 1 本書き換えた
+
+`tests/test_naysayer_adr_index.py` の ADR-06 フィクスチャは
+「`docs/adr/` の ADR-06 ファイルは改訂メモだけ ∴ locator は `drive` のまま」を固定していた。
+本体が入ったので前提が変わり、**設計どおり赤くなった**（同テストの失敗メッセージが対処を明示していた）。
+
+**守っている不変条件は変えていない** —— 「ADR-06 の locator が改訂メモを指してはならない」。
+表現だけが強くなった:
+
+| 旧 | 新 |
+|---|---|
+| ADR-06 のファイルは全部 amendment。∴ `body: drive` | ADR-06 のファイルは amendment 1 + 本体 1。∴ `body:` は**本体を名指し**、memo を名指さない |
+
+テスト名も `test_adr_06_locator_names_the_body_not_the_amendment_memo` に改めた。
+`_AMENDMENT_MARKER` が memo を drift check から隠す規則は据え置き —— 変わったのは
+「その check が見つけるべき本体が存在するようになった」ことだけである。
+
+### ADR-19 は ADR-17 を partial supersede している
+
+19 §Relates to が明記している: relay/convergence orchestrator（17 D-3）・`design_review.py`・
+`context_bundle.py` は**撤回**、5 原則 SOT（17 D-1）と D-4 / D-5 / D-6 / D-7 は carry over。
+∴ **17 を現状として読まないこと。** 撤回の理由は「Gemini の tool-less 制約が解除され、
+17 が前提にした『relay/bundle が必須』が崩れた」（19 §Author）。
+
+### もう 1 種類の逸脱: 欠番への参照から `ADR-` prefix を落とした
+
+ADR-14 は `2026-05-27-08`（原文は `ADR-` prefix 付き）を 3 箇所で参照している。この番号の ADR は
+**実体化されず欠番**で、ADR-14 自身が「文書実体は未作成」と書いている。
+`tests/test_adr_reverse_check.py` は「引用された id は索引で解決できること」を要求するので、
+逐語のままだと CI が赤くなる。
+
+**`CLAUDE.md` §M の注記行が既にこの番号を `ADR-` prefix 無しで書いている**
+（「旧 §M 参照番号 2026-05-27-08 [この番号の ADR は実体化されず欠番…]」）。∴ 3 箇所とも
+その既存の表記に揃えた。reverse check の失敗メッセージが示す 2 分岐のうち
+「citation ではなく mention なので de-cite する」側であり、規約をこちらで新設してはいない。
+
+### 索引に 4 件足した（`_docmap.yaml` 経由、手編集ではない）
+
+ADR-07 が `ADR-2026-05-21-04` / `-05` を引用しており、これも索引で解決できなかった。
+**こちらは実在する ADR なので de-cite は誤り**（reverse check の docstring が
+「real citation を書き換えるな」と明示している）。`spirrow-docs/_docmap.yaml` に
+Tomtar 系列 4 件（`-02` / `-03` / `-04` / `-05`）を登録し、
+`python scripts/gen_adr_index.py --docmap …` で `spec/adr_index.yaml` を再生成した。
+本体は Drive にあるので locator は `drive` のまま（移設は別 PR）。
+
+**ローカルの develop 段リポジトリのコピーは使っていない。** 実測すると 4 件とも Drive と md5 が
+違い、07 は 368 バイト、14 は 2471 バイト、15 は 1425 バイト、16 は 340 バイト短かった。

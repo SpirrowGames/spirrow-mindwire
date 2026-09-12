@@ -81,7 +81,7 @@ def _attested(body: str, *, backend: str = "gemini", expected: str = "gemini") -
             tier="naysayer",
             backend=backend,
             expected=expected,
-            route="100.79.84.62:8110",
+            route="{{IP_SERVICES}}:8110",
             probe="cost-row#6032",
             at=_TS,
         ),
@@ -958,7 +958,7 @@ async def test_carve_out_three_ignores_a_stamp_quoted_inside_the_critique() -> N
     quoting = (
         "The stamp format is\n\n"
         "    <!-- attest: tier=naysayer · backend=gemini · expected=gemini "
-        "· route=100.79.84.62:8110 · probe=cost-row#6032 · at=2026-06-07T00:00:00Z -->\n\n"
+        "· route={{IP_SERVICES}}:8110 · probe=cost-row#6032 · at=2026-06-07T00:00:00Z -->\n\n"
         "and I approve of it.\n\nNEXT: Heisenberg"
     )
     mcp = _FakeChatroomMcp()

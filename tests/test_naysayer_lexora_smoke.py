@@ -3,12 +3,12 @@
 Marked ``manual`` → excluded from CI (``addopts -m "not manual"``); run with
 ``uv run pytest -m manual``. Requires a reachable Lexora gateway:
 
-- **Production** (mindwire co-resident with Lexora on sg-ai-server-01): the
+- **Production** (mindwire co-resident with Lexora on {{HOST_SERVICES}}): the
   default ``http://localhost:8110`` is correct — leave ``MINDWIRE_LEXORA_URL``
   unset. Loopback is mandatory there: Lexora binds ``0.0.0.0`` with no caller
   auth, so a LAN/Tailscale default would widen the unauthenticated surface.
 - **Dev box** (this machine reaches the server over Tailscale): export
-  ``MINDWIRE_LEXORA_URL=http://100.79.84.62:8110`` before running.
+  ``MINDWIRE_LEXORA_URL=http://{{IP_SERVICES}}:8110`` before running.
 
 What this asserts against the **real** gateway (msg-215 verification items):
 

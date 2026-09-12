@@ -92,15 +92,15 @@ def test_load_adr_entries_carries_thread_and_body(tmp_path: Path) -> None:
     assert by_id["ADR-2026-06-03-16"].body == "drive"
 
 
-def test_load_adr_entries_missing_body_falls_back_to_drive(tmp_path: Path) -> None:
-    # Loader fail-open: an entry without ``body:`` renders as ``drive`` so downstream
+def test_load_adr_entries_missing_body_falls_back_to_unknown(tmp_path: Path) -> None:
+    # Loader fail-open: an entry without ``body:`` renders as ``unknown`` so downstream
     # rendering never sees an empty field (the CI check catches shipped manifests that
     # actually lack it; this fallback is for prompt-construction safety only).
     manifest = 'adrs:\n  - id: ADR-1\n    title: "t"\n'
     (tmp_path / "spec").mkdir()
     (tmp_path / "spec" / "adr_index.yaml").write_text(manifest, encoding="utf-8")
     entries = load_adr_entries(tmp_path)
-    assert entries[0].body == "drive"
+    assert entries[0].body == "unknown"
 
 
 def test_build_block_lists_manifest_entries(tmp_path: Path) -> None:
@@ -230,24 +230,37 @@ def test_in_repo_adr_bodies_are_registered_as_repo_locators() -> None:
     )
 
 
-def test_amendment_memo_does_not_force_a_repo_locator_on_adr_06() -> None:
-    # msg-2671 §4-5, pinned as a fixture because it is the exact trap this whole thread
-    # exists to remove. ADR-2026-05-21-06's ONLY file under docs/adr/ is an *amendment
-    # memo* which says of itself that it is a diff to be merged into the ADR-06 body on
-    # Drive reflection. Mapping id -> file mechanically would point ADR-06 at a document
-    # that is not ADR-06 — a new instance of the misdirection, dressed as a fix. So the
-    # drift check excludes ``*-amendment-*`` and ADR-06 must stay on bare ``drive``.
+def test_adr_06_locator_names_the_body_not_the_amendment_memo() -> None:
+    # msg-2671 §4-5, kept as a fixture because it is the exact trap this whole thread
+    # exists to remove: ADR-2026-05-21-06 has TWO files under docs/adr/, and only one of
+    # them is ADR-06. The other is an *amendment memo* which says of itself that it is a
+    # diff to be merged into the ADR-06 body. Mapping id -> file mechanically would let
+    # the memo win — a new instance of the misdirection, dressed as a fix.
+    #
+    # Until 2026-09-11 the memo was the ONLY file here, so this fixture read "ADR-06 must
+    # stay on bare ``drive``". The body has since been migrated from Drive, so the same
+    # invariant now has a stronger form: the locator must name the body, and must not name
+    # the memo. ``_AMENDMENT_MARKER`` still hides the memo from
+    # check_in_repo_bodies_are_registered(); what changed is that there is now something
+    # else for that check to find.
     repo_root = Path(__file__).resolve().parents[1]
     body_dir = repo_root / "docs" / "adr"
     files = sorted(p.name for p in body_dir.glob("ADR-2026-05-21-06-*.md"))
-    assert files, "fixture gone: docs/adr/ no longer carries an ADR-06 file at all"
-    assert all("amendment" in f for f in files), (
-        f"docs/adr/ now has a NON-amendment ADR-06 file ({files}); that would be the real "
-        f"body, and ADR-2026-05-21-06 should move from `drive` to a repo: locator."
+    memos = [f for f in files if _AMENDMENT_MARKER in f.lower()]
+    bodies_on_disk = [f for f in files if _AMENDMENT_MARKER not in f.lower()]
+    assert memos, (
+        f"fixture gone: docs/adr/ no longer carries an ADR-06 amendment memo ({files}). "
+        f"This test exists to prove the memo cannot capture ADR-06's locator; with no memo "
+        f"present it proves nothing."
+    )
+    assert len(bodies_on_disk) == 1, (
+        f"expected exactly one non-amendment ADR-06 file, found {bodies_on_disk} "
+        f"(all ADR-06 files: {files})."
     )
     bodies = {e.adr_id: e.body for e in load_adr_entries()}
-    assert bodies["ADR-2026-05-21-06"] == "drive", (
-        "ADR-06 must stay on `drive` while its only in-repo file is an amendment memo."
+    assert bodies["ADR-2026-05-21-06"] == f"repo:docs/adr/{bodies_on_disk[0]}", (
+        f"ADR-06's locator is {bodies['ADR-2026-05-21-06']!r}; it must name the body "
+        f"({bodies_on_disk[0]}), never the amendment memo ({memos})."
     )
 
 
@@ -376,7 +389,7 @@ def test_amendment_marker_skip_set_is_pinned_to_this_tree() -> None:
     # skipped like a memo and never prompted for registration. That miss fails open and is
     # escapable by hand, so it is accepted rather than patched — but accepted must not mean
     # unobserved, and no existing test can see it:
-    # test_amendment_memo_does_not_force_a_repo_locator_on_adr_06 is scoped to ADR-06's own
+    # test_adr_06_locator_names_the_body_not_the_amendment_memo is scoped to ADR-06's own
     # files, and the §M checks never look at docs/adr/ at all. This pins the whole skipped
     # SET instead, so a second colliding filename is loud. Hermetic: in-repo tree, no network.
     repo_root = Path(__file__).resolve().parents[1]

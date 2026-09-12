@@ -368,6 +368,62 @@ function Test-HoldObserved {
     return ($Control.observed_state -eq 'hold')
 }
 
+# --- resource-axis HOLD gate (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) ------
+#
+# May a candidate's launch be optimised away because SOME OTHER project's HOLD covers the SAME
+# repository this candidate writes to?
+#
+# `loop_control_*` is keyed by chatroom project. Repositories are the actual contended resource,
+# and the two axes do not agree: `spirrow-magickit` has 8 candidates whose `repo_dir` is
+# `mindwire-impl` (measured 2026-09-09), so a HOLD on `spirrow-mindwire` does not stop those
+# even though they push to the same GitHub repo every `spirrow-mindwire` candidate does. See the
+# specifying thread for the full mapping (§2).
+#
+# This predicate is the ADDITIVE part of the gate: it can hold more, never fewer. Correctness
+# is easy to argue for that shape — a false-positive shows up as a stall the derivation-chain
+# log line explains (D-KEY-4c(4) requires it be logged); a false-negative degrades gracefully
+# to today's behaviour (project-only judgment).
+#
+# It is a PURE function (no I/O, no subprocess, no git) so `tests/Test-SweepHoldGate.ps1` can
+# AST-extract it and exercise it in isolation. The resolution that produces
+# `$PredictedResourceByRepoDir` happens in the tick preparation stage via
+# `Invoke-PredictedResourceProbe`, not here — the naming discipline is D-KEY-4c(1) in the
+# specifying thread (the identifier `Predicted` marks a value that MUST NOT reach the
+# fail-closed enforcer layer; the wrapper is the OPTIMISATION layer, and A — a resource axis
+# on `loop_control_*` itself — is the eventual enforcer, not yet implemented).
+#
+# Fail-open on every arm (D-KEY-4c(2)): unresolved candidate, missing owner map, unknown
+# owning project — all return $false, and the candidate falls through to project-only
+# judgment (= today's behaviour). The only condition that returns $true is: predicted resource
+# is known AND owner map names an owning project for it AND that owning project's control is
+# `Test-HoldObserved`.
+function Test-HoldForCandidate {
+    param(
+        $Candidate,
+        $PredictedResourceByRepoDir,
+        $OwnerMap,
+        $ControlByProject
+    )
+
+    # Any missing input is fail-open. The wrapper never HOLDS a candidate because it lost a
+    # hashtable — that would be the "silent stall" mode D-KEY-4c(4) exists to prevent.
+    if ($null -eq $Candidate) { return $false }
+    if ($null -eq $PredictedResourceByRepoDir) { return $false }
+    if ($null -eq $OwnerMap) { return $false }
+    if ($null -eq $ControlByProject) { return $false }
+
+    $entry = $PredictedResourceByRepoDir[$Candidate.repo_dir]
+    if ($null -eq $entry) { return $false }
+    $predicted = [string]$entry.predicted_resource
+    if ([string]::IsNullOrWhiteSpace($predicted)) { return $false }
+
+    $ownerProject = [string]$OwnerMap[$predicted]
+    if ([string]::IsNullOrWhiteSpace($ownerProject)) { return $false }
+
+    $ownerControl = $ControlByProject[$ownerProject]
+    return (Test-HoldObserved -Control $ownerControl)
+}
+
 # --- head-skip nomination predicate wiring (T-sweep-intake-and-quarantine-stalls) ---------------
 #
 # The skip rule now lives inside scripts/head_skip_decide.py (module: head_skip.py). The wrapper's
@@ -2713,6 +2769,135 @@ function Invoke-ControlProbe {
     }
 }
 
+# --- predicted-resource probe (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) -----
+# For a batch of distinct `repo_dir` values, invoke the Python resolver and return
+#   @{ <repo_dir> = @{ predicted_resource = <string or empty>; reason = <string or empty> } }
+# or $null when the probe could not run at all (interpreter missing, script crashed, output not
+# parseable as JSON). $null means UNKNOWN — the caller must treat it as fail-open (Test-HoldForCandidate
+# does: any missing input yields $false = do not add a resource-hold on top of project-hold).
+#
+# The whole point of shelling out is to keep the D-KEY-1 normalisation in ONE language (Python) —
+# managing the same graph traversal and URL parsing in PowerShell would be textbook Principle 2
+# dual-management (E-53 in the specifying thread). The wrapper's job here is transport, not logic:
+# feed the CLI a JSON list on stdin, read the JSON list back on stdout.
+#
+# Fail-open per D-KEY-4c(2). The CLI itself represents per-repo_dir resolution failures in its
+# per-row `reason` field with a `resource: null` — it does NOT return non-zero on those, so the
+# batch as a whole is usually usable even when one entry inside failed. This function only returns
+# $null when the WHOLE call fails (systemic failure of the probe machinery itself).
+function Invoke-PredictedResourceProbe {
+    param([string[]]$RepoDirs)
+
+    if ($null -eq $RepoDirs -or $RepoDirs.Count -eq 0) { return @{} }
+
+    $probe = Join-Path $repoRoot "scripts\resolve_resource.py"
+    if (-not (Test-Path -LiteralPath $probe)) {
+        Write-Log "predicted-resource probe not found at $probe — failing open (resource-axis HOLD gate disabled)"
+        return $null
+    }
+
+    # Compact JSON with `Depth 3` is enough for `{ "repo_dirs": [str, ...] }` and keeps the
+    # single-line stdin small so we can see it in a log if we need to.
+    $payload = @{ repo_dirs = $RepoDirs } | ConvertTo-Json -Depth 3 -Compress
+
+    try {
+        Push-Location $repoRoot
+        try {
+            $raw = $payload | & uv run python $probe --stdin-json 2>&1
+            $code = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+
+        if ($code -ne 0) {
+            Write-Log "predicted-resource probe exited $code — failing open. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
+            return $null
+        }
+        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        if (-not $json) {
+            Write-Log "predicted-resource probe produced no JSON — failing open"
+            return $null
+        }
+        $obj = $json | ConvertFrom-Json
+    }
+    catch {
+        Write-Log "predicted-resource probe failed ($($_.Exception.Message)) — failing open"
+        return $null
+    }
+
+    $map = @{}
+    if ($null -eq $obj.resolutions) {
+        Write-Log "predicted-resource probe returned no 'resolutions' array — failing open"
+        return $null
+    }
+    foreach ($row in @($obj.resolutions)) {
+        $rd = [string]$row.repo_dir
+        if ([string]::IsNullOrWhiteSpace($rd)) { continue }
+        $entry = @{
+            predicted_resource = if ($null -eq $row.resource) { '' } else { [string]$row.resource }
+            reason             = if ($null -eq $row.reason)   { '' } else { [string]$row.reason }
+        }
+        $map[$rd] = $entry
+    }
+    return $map
+}
+
+# --- sweep.json owner_map reader (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) --
+# Returns @{ <predicted_resource> = <owning_project> } from sweep.json's top-level `owner_map`
+# field, or @{} when the file has no such field. Missing = OFF (fully backward compatible):
+# without an owner_map, `Test-HoldForCandidate` never returns $true and the gate reverts to the
+# pre-change behaviour.
+#
+# `owner_map` is the ONE thing that MUST be declared (D-KEY-3b): the resource → owning-project
+# mapping is a chatroom-side operational fact that no observation of the repo itself can reveal
+# (which chatroom project "owns" a repo, in the sense of "when this project is HELD, that repo
+# should stop", is a policy call not a fact of the filesystem). `repo_dir → resource` is
+# deliberately NOT stored here — it is observed at tick prep time from the checkout's `origin`
+# via D-KEY-1 (`Invoke-PredictedResourceProbe`). Storing it as a declaration would be the same
+# `T-mindwire-checkout-pair-drifts-with-no-detector` bug shape the specifying thread's §2 (a)
+# rejected — a writable copy of a value the system can read authoritatively silently reverses
+# meaning the moment they disagree.
+#
+# Loud on inconsistency: an owner_map value that names a project no candidate references gets a
+# WARN log line at tick prep time (typo in the map, or a project retired from the sweep). It
+# does NOT fail closed: the extra key is harmless, and being loud about it beats blocking every
+# tick over an operator's leftover row.
+function Get-SweepOwnerMap {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        # `Get-SweepCandidates` already threw on the same file; a duplicate throw here would
+        # only add noise, so return an empty map and let the earlier throw be the one that
+        # halts the tick.
+        return @{}
+    }
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+    $map = @{}
+    if ($null -eq $raw.owner_map) { return $map }
+    # Type check the top-level shape BEFORE iterating properties. `ConvertFrom-Json` yields
+    # `[PSCustomObject]` for JSON objects, `[string]` for strings, `[object[]]` for arrays.
+    # Iterating `.PSObject.Properties` on any non-object silently walks the .NET reflection
+    # surface — an array would yield `Length=2`, a string would yield `Length=8` and
+    # `Chars`, both passing the `IsNullOrWhiteSpace` guard below and populating the map with
+    # garbage. Fail LOUDLY here on a malformed shape instead (naysayer PR #252 objection 4).
+    if ($raw.owner_map -isnot [System.Management.Automation.PSCustomObject]) {
+        throw ("sweep.json 'owner_map' must be a JSON object (mapping predicted resource -> " +
+               "owning project); found $($raw.owner_map.GetType().Name) in $Path. " +
+               "Refusing to iterate — a string or array would silently walk .NET reflection " +
+               "properties and produce garbage entries.")
+    }
+    foreach ($p in $raw.owner_map.PSObject.Properties) {
+        $key = [string]$p.Name
+        $val = [string]$p.Value
+        if ([string]::IsNullOrWhiteSpace($key) -or [string]::IsNullOrWhiteSpace($val)) {
+            throw ("sweep.json owner_map has a blank key or value: '$key' => '$val' (in $Path). " +
+                   "Owner_map keys are predicted resource identities (<host>/<org>/<repo>) and " +
+                   "values are chatroom project names — both must be non-blank.")
+        }
+        $map[$key] = $val
+    }
+    return $map
+}
+
 # --- deploy probe ---------------------------------------------------------------------------------
 # Fast-forwards this checkout to origin/main before the tick decides anything. Returns the parsed
 # verdict from deploy/sync-repo.ps1, or $null when it could not be run at all.
@@ -2894,6 +3079,53 @@ try {
         $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
     }
+
+    # --- resource-axis HOLD: one probe per DISTINCT repo_dir (§5a v2, D-KEY-4c) ----------------
+    # Batch the resolver call once per tick. The distinct repo_dir set is small (7 today per
+    # msg-2871), so this is bounded work; even in the worst case where every candidate has a
+    # distinct clone, the CLI reads stdin once and answers once.
+    #
+    # Fail-open (D-KEY-4c(2)): a $null return, an empty owner_map, or an unresolved entry all
+    # cause `Test-HoldForCandidate` to return $false — the candidate then falls through to the
+    # existing project-only HOLD check, which is today's behaviour.
+    #
+    # Runs AFTER the control loop so we already know which projects the control probe reported
+    # HELD; the resource-axis gate composes with those verdicts inside Test-HoldForCandidate.
+    $distinctRepoDirs = @($candidates | ForEach-Object { $_.repo_dir } | Sort-Object -Unique)
+    $predictedResourceByRepoDir = Invoke-PredictedResourceProbe -RepoDirs $distinctRepoDirs
+    $sweepOwnerMap = Get-SweepOwnerMap -Path $sweepConfigPath
+
+    if ($null -eq $predictedResourceByRepoDir) {
+        Write-Log "resource-axis HOLD gate disabled this tick (probe failed) — project-axis only"
+    }
+    else {
+        # Emit the observed resource for each repo_dir so the operator can copy it into
+        # `sweep.json` owner_map without re-typing. Also emit each entry's reason on failure
+        # (D-KEY-4c(4) requires the derivation chain be diagnosable).
+        foreach ($rd in ($predictedResourceByRepoDir.Keys | Sort-Object)) {
+            $entry = $predictedResourceByRepoDir[$rd]
+            if ([string]::IsNullOrWhiteSpace($entry.predicted_resource)) {
+                Write-Log "predicted resource [$rd]: UNRESOLVED — $($entry.reason)"
+            }
+            else {
+                Write-Log "predicted resource [$rd]: $($entry.predicted_resource)"
+            }
+        }
+        # Loudly report owner_map entries that match no observed resource (typo, or a repo
+        # the sweep no longer touches). Loud, not fatal — the operator sees it, the sweep runs.
+        $observedResources = @{}
+        foreach ($e in $predictedResourceByRepoDir.Values) {
+            if (-not [string]::IsNullOrWhiteSpace($e.predicted_resource)) {
+                $observedResources[$e.predicted_resource] = $true
+            }
+        }
+        foreach ($k in @($sweepOwnerMap.Keys)) {
+            if (-not $observedResources.ContainsKey($k)) {
+                Write-Log ("WARN sweep.json owner_map entry '$k' matches no observed resource this tick " +
+                           "(typo? project retired from sweep?)")
+            }
+        }
+    }
     $quarantineState = Get-JsonState -Path $quarantineStatePath
     $evaluatedState = Get-JsonState -Path $evaluatedStatePath
     $digestState = Get-JsonState -Path $digestStatePath
@@ -3060,6 +3292,25 @@ try {
             $held++
             $dispositions[$cand.key] = 'held'
             Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — project HELD (desired=hold, loop observed hold), not launching"
+            continue
+        }
+
+        # Resource-axis HOLD (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2):
+        # if the candidate writes to a repo that some OTHER project's HOLD covers, HOLD this
+        # one too — this is what the operator meant when they set a HOLD on the repo's owning
+        # project. Additive over the per-project check above: false-positives here become a
+        # diagnosable stall (the derivation chain is logged), false-negatives degrade to today.
+        # Fail-open on every arm; see Test-HoldForCandidate and Invoke-PredictedResourceProbe.
+        if (Test-HoldForCandidate -Candidate $cand `
+                -PredictedResourceByRepoDir $predictedResourceByRepoDir `
+                -OwnerMap $sweepOwnerMap -ControlByProject $controlByProject) {
+            $held++
+            $dispositions[$cand.key] = 'held'
+            $predicted = $predictedResourceByRepoDir[$cand.repo_dir].predicted_resource
+            $ownerProject = $sweepOwnerMap[$predicted]
+            Write-Log ("candidate $attempt/$($candidates.Count): $($cand.key) — resource HELD via " +
+                       "repo_dir=$($cand.repo_dir) -> predicted_resource=$predicted -> owning_project=$ownerProject " +
+                       "(that project's desired=hold, loop observed hold), not launching")
             continue
         }
 

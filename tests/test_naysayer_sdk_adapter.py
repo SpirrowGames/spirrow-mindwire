@@ -173,7 +173,10 @@ def test_system_prompt_injects_adr_index_from_a_fixture_manifest(tmp_path: Path)
     )
     prompt = build_naysayer_system_prompt(obligations=_OBLIGATIONS, repo_root=tmp_path)
     assert "ADR index (id + title + body locator)" in prompt
-    assert "ADR-2026-05-31-15 — independence gradation [body: drive]" in prompt
+    # The fixture omits ``body:``, so this also pins the loader fail-open value — ``unknown``
+    # since the 2026-09-11 canonicity move (it was ``drive``, which now names a medium the
+    # amendment says the body is not in).
+    assert "ADR-2026-05-31-15 — independence gradation [body: unknown]" in prompt
 
 
 def test_system_prompt_defaults_to_mindwires_own_manifest() -> None:
@@ -670,7 +673,7 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
     adapter = NaysayerSdkAdapter(
         cwd=tmp_path,
         obligations=_OBLIGATIONS,
-        inference_base_url="http://100.79.84.62:8110",
+        inference_base_url="http://{{IP_SERVICES}}:8110",
         client_factory=_factory(_FakeClient([_assistant("VERDICT: object."), _result()]), []),
         preflight=_preflight_ok(),
     )
@@ -686,7 +689,7 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
     assert lines[0] == "VERDICT: object."
     assert lines[-2] == (
         "<!-- source: tools=0 · mcp=0 · setting_sources=unset "
-        "· route=100.79.84.62:8110 · tier=naysayer -->"
+        "· route={{IP_SERVICES}}:8110 · tier=naysayer -->"
     )
     assert lines[-1] == (
         "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "

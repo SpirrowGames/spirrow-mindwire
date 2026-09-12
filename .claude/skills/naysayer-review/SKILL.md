@@ -5,6 +5,8 @@ description: Fire the independent naysayer (Gemini) PR review — the Stage 3 Ti
 
 # naysayer-review
 
+> **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
+
 Fires the **independent naysayer review** (ADR-05 §5 / ADR-07 Tier B) for a
 pull request. The judgment is made by the **Gemini** naysayer (a different model
 family from `main`), not by you.
@@ -45,7 +47,7 @@ threads).
 3. **Check preconditions** (the driver fails loud otherwise): the env vars
    `MINDWIRE_MAGICKIT_MCP_URL`, `MINDWIRE_LEXORA_URL`,
    `MINDWIRE_NAYSAYER_GITHUB_TOKEN` are set and the magickit chatroom MCP +
-   Lexora are reachable from **this host**. (On `sg-ai-server-01` they are
+   Lexora are reachable from **this host**. (On `{{HOST_SERVICES}}` they are
    local; from a box without the chatroom MCP on `:8117` this will fail at the
    chatroom post — run it where the loop runs.)
 4. **Run the driver** (it does the whole gate — raw diff → Gemini review →

@@ -1,5 +1,7 @@
 # Operator Board — 設計書（実装レベル）
 
+> **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
+
 版: **0.3.5** / 2026-09-08 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除、msg-2567 → msg-2569 で v0.3.1 blocking 解除、msg-（v0.3.4 endorse）で §17 承認、msg-2664 で §17 second-round correctness + structure 指摘、msg-（v0.3.5 endorse）で §17.1 4 行目 + §17.3 承認）+ PR-review naysayer（PR #224 msg-(gate) → v0.3.2 で 2 件 blocking 解除、round-2 → v0.3.3 で 1 件 blocking 解除、round-3 → APPROVE with structure advisory on `ci_clock_start`）/ v0.2 差分の正本: Bohr msg-2544 / v0.3 差分の正本: Bohr msg-2566 / v0.3.1 差分の正本: Bohr msg-2568 / v0.3.2 差分の正本: 本ファイル §5.2A（Heisenberg、PR-review msg-(gate) 受け入れ）/ v0.3.3 差分の正本: 本ファイル §5.2A.4 R1a/R1b 行（Heisenberg、PR-review msg-(gate) round-2 受け入れ）/ v0.3.4 差分の正本: 本ファイル §17（Bohr msg-2595、人 msg-2594 decide 後の残余レジスタ新設）/ v0.3.5 差分の正本: 本ファイル §17.1 4 行目 + §17.3（Bohr msg-2665、Einstein msg-2664 の correctness + structure 指摘を受け入れ、gate pending 保留の re-fire 経路欠落を §17 に固定）
 設計 SOT: chatroom `spirrow-mindwire/T-operator-board`。本文はその同期コピー。
 対象リポジトリ: spirrow-conclair（状態）・spirrow-mindwire（tick / executor）・spirrow-magickit（UI）
@@ -43,7 +45,7 @@
 ## 3. アーキテクチャ
 
 ```
- tomtebo-01 ──┐                       sg-ai-server-01
+ tomtebo-01 ──┐                       {{HOST_SERVICES}}
  tomtebo-02 ──┤  push (HTTP, Tailscale)   ┌──────────────────────────────┐
               │  ────────────────────►    │ Conclair (PostgreSQL)         │
   operator tick (Python, mindwire)        │  threads / messages / control │
@@ -331,7 +333,7 @@ deferral（頻出）には書かず、CI 赤 routing（稀）にだけ書く。�
 {"kind":"pr_merged","repo":"SpirrowGames/spirrow-mindwire","pr":214,"then":{"column":"proposing"}}
 {"kind":"control_run","then":{"column":"backlog"}}
 {"kind":"time","at":"2026-09-06T00:00:00Z","then":{"column":"proposing"}}
-{"kind":"resource","resource":"repo:SpirrowGames/spirrow-conclair","holder":"sg-tomtebo-01","since":"2026-09-05T08:00:00Z","then":{"column":"implementing"}}
+{"kind":"resource","resource":"repo:SpirrowGames/spirrow-conclair","holder":"{{HOST_LOOP}}","since":"2026-09-05T08:00:00Z","then":{"column":"implementing"}}
 ```
 `kind:"resource"` は lease が取れなかった候補を**不可視にしないため**のもの（v0.2 C-1）。R-SILENT の検出対象に入る。
 **operator が「〜したら X します」と言う代わりに、この JSON を書く。** tick は毎回全 `waiting` カードの `kind` を評価する。これが D8 の実体。
@@ -474,10 +476,10 @@ conductor 自体（`conductor/core.py`）は変えない。役セッションの
 schema_version = 1
 
 [operator]
-node = "sg-tomtebo-01"
-magickit_mcp_url = "http://100.79.84.62:8117/mcp"   # Conclair 直叩きはしない（§13.1 決定）。board_* は magickit MCP ツール経由
+node = "{{HOST_LOOP}}"
+magickit_mcp_url = "http://{{IP_SERVICES}}:8117/mcp"   # Conclair 直叩きはしない（§13.1 決定）。board_* は magickit MCP ツール経由
 tick_seconds = 300
-lexora_url = "http://100.79.84.62:8110"
+lexora_url = "http://{{IP_SERVICES}}:8110"
 judgment_tier = "light"
 
 [[projects]]
@@ -489,7 +491,7 @@ implementing_max = 1
 
 [[projects]]
 project  = "spirrow-voxelworld"
-repo     = "SpirrowGames/Spirrow-VoxelWorld"
+repo     = "SpirrowGames/spirrow-voxelworld"
 repo_dir = "C:/workspace/sandbox/voxelworld-impl"
 profile  = "ephemeral-develop"
 ```

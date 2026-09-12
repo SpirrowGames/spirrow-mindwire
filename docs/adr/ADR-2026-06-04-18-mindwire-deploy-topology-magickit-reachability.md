@@ -1,9 +1,11 @@
 # ADR-2026-06-04-18: mindwire デプロイ・トポロジと magickit 到達性 — magickit を mindwire host から到達可能にする(ADR-17 D-8 amendment)
 
+> **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
+
 - **Status**: **Accepted**（2026-06-05 trilateral 収束: proposer=Bohr / implementer=Heisenberg(msg-418/483) / 独立 naysayer=Einstein **gate APPROVE**(msg-485, principles_v1) / Takahito **Tier-C GO**(scope 判断 msg-484 = 認証は YAGNI で deferred + decide)。`T-mindwire-deploy-topology` を decide-close（msg-486）。**Drive 反映は pending**（Cloudflare WAF が本 markdown を block、retry 要）、_docmap は status=accepted に更新済）
 - **Date**: 2026-06-04
 - **Scope**: spirrow-mindwire のデプロイ・トポロジ + サービス到達性。**ADR-2026-06-03-17 D-8 を amend**（co-location 暗黙前提を撤回）。
-- **Author**: Bohr (proposer, terminal_coding_agent) — chatroom `T-mindwire-deploy-topology`（propose）。**発生源 = Takahito の指摘**:「sg-tomtebo-01 上で mindwire が稼働するのに sg-tomtebo-01 上でテストできない = 機能的に足りていないのでは」。proposer が D-8 で host トポロジを取り違えていた（mindwire host と magickit host を同一と暗黙仮定）ことを認めて起案。
+- **Author**: Bohr (proposer, terminal_coding_agent) — chatroom `T-mindwire-deploy-topology`（propose）。**発生源 = Takahito の指摘**:「{{HOST_LOOP}} 上で mindwire が稼働するのに {{HOST_LOOP}} 上でテストできない = 機能的に足りていないのでは」。proposer が D-8 で host トポロジを取り違えていた（mindwire host と magickit host を同一と暗黙仮定）ことを認めて起案。
 - **Relates to / amends**:
   - **ADR-2026-06-03-17 D-8**（relay transport は :8117 直結に依存しない / 「:8117 の 0.0.0.0 公開は不採用」）— 本 ADR が **D-8 の「公開不採用」を撤回**し、co-location 前提を是正。
   - ADR-05 §5（independence / connector は judge でない）、Lexora client（:8110 は 0.0.0.0 + no caller auth で既に tailnet 公開）。
@@ -14,14 +16,14 @@
 
 ### 1.1 確定トポロジ（Takahito 確認 2026-06-04）
 
-- **mindwire ループ = sg-tomtebo-01**（Windows、Tailscale `100.108.116.59`）。proposer/implementer のワークステーション兼、Stage 3 自律ループの稼働 host。
-- **Spirrow services = sg-ai-server-01**（`100.79.84.62`、Linux）: `spirrow-magickit-mcp-local.service`（chatroom MCP, `:8117`）+ Lexora（`:8110`）。
+- **mindwire ループ = {{HOST_LOOP}}**（Windows、Tailscale `{{IP_LOOP}}`）。proposer/implementer のワークステーション兼、Stage 3 自律ループの稼働 host。
+- **Spirrow services = {{HOST_SERVICES}}**（`{{IP_SERVICES}}`、Linux）: `spirrow-magickit-mcp-local.service`（chatroom MCP, `:8117`）+ Lexora（`:8110`）。
 
 ### 1.2 欠落（functional gap）
 
-- **magickit `:8117` は sg-ai-server-01 で localhost-bind** → **mindwire host(sg-tomtebo-01)から到達不可**（実測: `100.79.84.62:8117` timeout、`:22` も timeout、`:8110` のみ到達）。
+- **magickit `:8117` は {{HOST_SERVICES}} で localhost-bind** → **mindwire host({{HOST_LOOP}})から到達不可**（実測: `{{IP_SERVICES}}:8117` timeout、`:22` も timeout、`:8110` のみ到達）。
 - 一方 **Lexora `:8110` は 0.0.0.0 + no caller auth で tailnet 公開済**（lexora client docstring、msg-215）→ 到達可。
-- 結果: **headless な mindwire 自律ループ(Stage 3 の本体)は sg-tomtebo-01 から magickit に届かず、chatroom の gather/post ができない = 自律ループが成立しない**。`scripts/naysayer_review.py` / `scripts/design_review.py` の subprocess も同様に不可（#85 / #87 / #88 で再現）。
+- 結果: **headless な mindwire 自律ループ(Stage 3 の本体)は {{HOST_LOOP}} から magickit に届かず、chatroom の gather/post ができない = 自律ループが成立しない**。`scripts/naysayer_review.py` / `scripts/design_review.py` の subprocess も同様に不可（#85 / #87 / #88 で再現）。
 
 ### 1.3 connector が欠落を覆い隠していた
 
@@ -37,17 +39,17 @@ ADR-17 D-8 は「完全自動 orchestrator は **loop host(:8117 localhost)で�
 
 ### D-1: magickit MCP は mindwire host から到達可能にする（要件）
 
-> **不変条件: magickit chatroom MCP は、mindwire ループが稼働する host(sg-tomtebo-01)から到達可能でなければならない。** headless 自律ループは connector に依存できない（対話専用）ため、**直結 HTTP の magickit エンドポイント**が要る。
+> **不変条件: magickit chatroom MCP は、mindwire ループが稼働する host({{HOST_LOOP}})から到達可能でなければならない。** headless 自律ループは connector に依存できない（対話専用）ため、**直結 HTTP の magickit エンドポイント**が要る。
 
 ### D-2: 採用 = magickit を tailnet 公開（ADR-17 D-8「公開不採用」を撤回）
 
-- sg-ai-server-01 の `spirrow-magickit-mcp-local.service` を **tailscale interface（or 0.0.0.0）に bind** し、**tailnet ACL でアクセス制御**。mindwire は `MINDWIRE_MAGICKIT_MCP_URL=http://sg-ai-server-01:8117/mcp`（or tailnet IP）で直結。
+- {{HOST_SERVICES}} の `spirrow-magickit-mcp-local.service` を **tailscale interface（or 0.0.0.0）に bind** し、**tailnet ACL でアクセス制御**。mindwire は `MINDWIRE_MAGICKIT_MCP_URL=http://{{HOST_SERVICES}}:8117/mcp`（or tailnet IP）で直結。
 - **セキュリティ posture の整合**: 本デプロイは **既に tailnet を信頼境界としている**（Lexora が 0.0.0.0 + no-auth で稼働）。magickit の localhost-bind はこの posture から外れた outlier であり、tailnet 公開(ACL-gated)への変更は **この環境で実質的なセキュリティ低下を生まない**（control は tailnet ACL）。`-local` の語は「localhost-local」から「tailnet-local」へ意味を更新（or リネーム）。
 
 ### D-3: ADR-17 D-8 の amend
 
 - D-8「:8117 を 0.0.0.0 公開は不採用」→ **撤回。tailnet-scoped 公開を採用**（D-2）。
-- D-8「完全自動 orchestrator は loop host で動かす(co-location)」→ **co-location は不要**。orchestrator/driver は `MINDWIRE_MAGICKIT_MCP_URL` で magickit に届けばどこでも動く（本番は sg-tomtebo-01）。
+- D-8「完全自動 orchestrator は loop host で動かす(co-location)」→ **co-location は不要**。orchestrator/driver は `MINDWIRE_MAGICKIT_MCP_URL` で magickit に届けばどこでも動く（本番は {{HOST_LOOP}}）。
 - D-8 の「2具象 transport（StreamableHttp / connector）」自体は維持。ただし **自律ループは StreamableHttp(直結)一択**（connector は対話セッション専用、D-4）。
 
 ### D-4: connector は対話専用、自律ループは direct HTTP
@@ -67,7 +69,7 @@ ADR-19 議論中に Heisenberg（msg-419）が **remote OAuth magickit（`magick
 - **境界整理（process note §5）**: 「認証サブシステムを target に追加」は **仕様の増減 = Tier-C 承認事項**。proposer/naysayer が「permanent target = 認証」と先取り確定したのは **越権**（naysayer は advisory ＝ スコープ増減を進言はできるが、採否は Tier-C）。よって **permanent-target 確定表現は撤回**、スコープ採否は Takahito に戻す。
 
 **現スコープ（採用）= (A) tailnet-direct + narrow ACL**:
-- magickit を tailscale-IP bind（D-2）+ **ACL は sg-tomtebo-01 のみに narrow grant**（tailnet-wide にしない = 安価な blast-radius 制限。認証でなく hygiene）。
+- magickit を tailscale-IP bind（D-2）+ **ACL は {{HOST_LOOP}} のみに narrow grant**（tailnet-wide にしない = 安価な blast-radius 制限。認証でなく hygiene）。
 - **既知の制約として明記（隠さず割り切る）**: この経路は **無認証**で、magickit は caller identity を transport で検証しない（author は app 自己申告、同 tailnet 上では原理的に偽造可能）。**現脅威モデル（信頼 tailnet のみ）で受容**。
 
 **deferred = 信頼境界が変わった時に Tier-C が spec 増減として再判断**:
@@ -80,19 +82,19 @@ ADR-19 議論中に Heisenberg（msg-419）が **remote OAuth magickit（`magick
 
 ## 3. 論点（trilateral 叩き台）
 
-- **N-1（implementer / 環境）**: `spirrow-magickit-mcp-local.service` の bind 変更（localhost → tailscale interface or 0.0.0.0 + tailnet ACL）+ sg-tomtebo-01 から `curl http://sg-ai-server-01:8117/mcp` で smoke test。`MINDWIRE_MAGICKIT_MCP_URL` を mindwire host env に設定。:22 を開けるかは別途（SSH 運用したいなら）。
+- **N-1（implementer / 環境）**: `spirrow-magickit-mcp-local.service` の bind 変更（localhost → tailscale interface or 0.0.0.0 + tailnet ACL）+ {{HOST_LOOP}} から `curl http://{{HOST_SERVICES}}:8117/mcp` で smoke test。`MINDWIRE_MAGICKIT_MCP_URL` を mindwire host env に設定。:22 を開けるかは別途（SSH 運用したいなら）。
 - **N-2（naysayer 注目点 / security）**: **magickit MCP は mutation-capable**（chatroom post / project state 変更）で、LLM 推論のみの Lexora より **blast radius が大きい**。tailnet 公開 = tailnet メンバ全員が無認証で magickit を叩ける。tailnet メンバが自分のデバイスのみ(信頼可)なら許容、そうでなければ **scoped token 等の per-caller auth** を magickit+Lexora 横断で別途検討（本 ADR スコープ外、N として明示）。
 - **N-3（他サービス）**: mindwire が将来必要とする他 Spirrow services(Prismind/Cognilens/Conclair 等)に同じ localhost-vs-tailnet 非対称が無いか棚卸し。
-- **N-4（bootstrap）**: 本 ADR 自身の独立 naysayer review は、修正前ゆえ **connector-relay(対話 me)** で回す（headless 経路はまだ直っていない chicken-and-egg）。修正後は sg-tomtebo-01 から design_review.py / 自律ループが直接動く。
+- **N-4（bootstrap）**: 本 ADR 自身の独立 naysayer review は、修正前ゆえ **connector-relay(対話 me)** で回す（headless 経路はまだ直っていない chicken-and-egg）。修正後は {{HOST_LOOP}} から design_review.py / 自律ループが直接動く。
 
 ---
 
 ## 4. Consequences
 
-- **(+)** Stage 3 自律ループが**意図した host(sg-tomtebo-01)で実機稼働可能**になる（現状の根本欠落の解消）。`design_review.py` / `naysayer_review.py` subprocess も sg-tomtebo-01 から動く。
+- **(+)** Stage 3 自律ループが**意図した host({{HOST_LOOP}})で実機稼働可能**になる（現状の根本欠落の解消）。`design_review.py` / `naysayer_review.py` subprocess も {{HOST_LOOP}} から動く。
 - **(+)** 自律運用が connector(対話専用)非依存になり、トポロジが一貫（services=tailnet 公開で統一）。
 - **(−)** tailnet を信頼境界とする posture を**明示的な決定として引き受ける**（mutation-capable な magickit を tailnet に晒す、N-2）。tailnet メンバの信頼前提が崩れる場合は per-caller auth が follow-up。
-- **(−)** sg-ai-server-01 の service 設定変更（bind + ACL）が要る（運用作業）。
+- **(−)** {{HOST_SERVICES}} の service 設定変更（bind + ACL）が要る（運用作業）。
 
 ---
 

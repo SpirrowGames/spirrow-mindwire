@@ -23,12 +23,16 @@ out-of-repo ``_docmap.yaml``:
 The manifest is a **derived view** (id + title + optional thread + body locator, never
 the canonical ADR body). It is *generated*, not hand-maintained:
 ``scripts/gen_adr_index.py`` (logic in :mod:`spirrow_mindwire.naysayer.adr_index_gen`)
-rebuilds id/title/thread from CLAUDE.md §M + the spirrow-docs ``_docmap``; the
+rebuilds id/title/thread from CLAUDE.md §M + the ADR bodies in ``docs/adr/``; the
 ``body:`` locator per entry is hand-maintained in the yaml and preserved on
-regenerate (round-trip). A committed copy is unavoidable — the loop host has no docs
-checkout and the deploy topology is undecided (ADR-18 / msg-438), so a runtime union
-(which needs ``_docmap``) is not possible. CI cannot run a *full* drift-check either
-(``_docmap`` is absent in CI), but it does enforce four things: the committed manifest
+regenerate (round-trip). The committed copy used to be unavoidable for a reason that
+no longer holds: the second source was ``spirrow-docs/_docmap.yaml``, a file on one
+machine in a tree with no remote (ADR-2026-06-04-19 N-2 / msg-438). Since 2026-09-11
+every ADR body is in ``docs/adr/`` and canonicity moved here (ADR-2026-05-23-07 §6), so
+the generator runs anywhere the repository does — **including CI, which now regenerates
+and fails on any drift** (``test_committed_manifest_matches_regeneration``). The file
+stays committed because the injectors read it without running the generator. CI also
+enforces four things: the committed manifest
 **parses and is well-formed** (``test_real_in_repo_manifest_loads_and_is_well_formed``),
 every §M-referenced ADR is present in the manifest
 (``test_section_m_adrs_are_a_subset_of_the_manifest``, a partial drift-check since
@@ -51,20 +55,23 @@ same-tree reads only, never the network, Drive, or the chatroom.
 The body locator format is one of:
 
 * ``chatroom:<project>/<thread>#msg-<n>`` — canonical: the decide-close message.
-* ``drive`` — weak: "the body lives in Drive/spirrow-docs, file unknown". Carried
-  forward as debt.
-* ``drive:<fileId-or-title>`` — Drive with a specific pointer (future use).
+* ``unknown`` — weak: "this index does not record where the body is". The default a
+  new entry gets, carried forward as debt until someone records the real locator.
+* ``drive`` / ``drive:<fileId-or-title>`` — **legacy.** Drive stopped being canonical on
+  2026-09-11 (see below), so nothing new should be pointed there. Still accepted, because
+  rejecting it would red the suite over entries written before that decision.
 * ``repo:<repo-relative path>.md`` — the body file lives in **this** repository (under
   ``docs/adr/``). Guarded by the regex *plus* an out-of-regex path predicate (no
   absolute paths, no ``..`` segments) *plus* a same-tree existence check, because a
   precise-looking path that does not resolve is worse than the self-declaredly weak
-  bare ``drive`` (msg-2671 D-3).
+  ``unknown`` (msg-2671 D-3).
 
 **A locator is not a canonicity claim.** It names where a reader can open the bytes,
 not which copy is normative; ``repo:`` no more declares "Git is the source of truth"
-than a bare ``drive`` declares it for Drive. Moving canonicity is a Tier-C convention
-change (``docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md``) and is deliberately out of
-scope here — do not cite ``repo:`` as precedent for it (msg-2671 D-2).
+than ``unknown`` declares that nothing is. Canonicity moved from Drive to the Git trees
+on 2026-09-11 (ADR-2026-05-23-07 §6 Amendment, Takahito, Tier-C), superseding
+``docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md``. That decision is the grounds for it —
+``repo:`` never was, and still is not: do not cite a locator as precedent (msg-2671 D-2).
 
 The naysayer/implementer injectors expand the locator into the prompt so a reviewer
 can reach the body from the index alone — not knowing where a body lives is exactly
@@ -100,10 +107,12 @@ _ADR_INDEX_ROW_RE = re.compile(
 
 # Body locator format — the validation regex the CI uses. Kept module-level so the
 # manifest test, the generator, and any future producer all read the same source.
-# Accepts three shapes and only three:
+# Accepts these shapes and only these:
 #   - chatroom:<project>/<thread>#msg-<n>
-#   - drive
-#   - drive:<anything non-empty>
+#   - unknown                      (weak default: location not recorded)
+#   - drive / drive:<non-empty>    (legacy — Drive is no longer canonical. Preserved on
+#                                  regenerate; never what a new entry defaults to)
+#   - repo:<repo-relative path>.md
 # ``[\w.-]+`` matches project/thread ids (letters/digits/_/./-); the anchor ``#msg-<n>``
 # is required for the chatroom form (Einstein's O-1 in msg-2582 — an anchor-missing
 # ``chatroom:proj/T-foo`` string must be rejected here, not silently passed through).
@@ -115,7 +124,7 @@ _ADR_INDEX_ROW_RE = re.compile(
 # :func:`body_locator_is_valid` over matching this regex directly — the regex alone is
 # NOT the full validity rule.
 BODY_LOCATOR_RE = re.compile(
-    r"^(?:chatroom:[\w.-]+/[\w.-]+#msg-\d+|drive|drive:.+|repo:[A-Za-z0-9._/-]+\.md)$"
+    r"^(?:chatroom:[\w.-]+/[\w.-]+#msg-\d+|unknown|drive|drive:.+|repo:[A-Za-z0-9._/-]+\.md)$"
 )
 
 _REPO_LOCATOR_PREFIX = "repo:"
@@ -165,7 +174,7 @@ class AdrEntry:
 
     ``thread`` is only present for §M-referenced ADRs (identity/role ADRs 09-13/15
     and any future §M row); architecture ADRs from ``_docmap`` have ``None``. ``body``
-    is always present — a bare ``drive`` (weak locator, debt marker) is preferable to
+    is always present — ``unknown`` (weak locator, debt marker) is preferable to
     an absent field so the CI locator check has something to check.
     """
 
@@ -237,7 +246,7 @@ def load_adr_entries(repo_root: Path | None = None) -> tuple[AdrEntry, ...]:
     """Load the in-repo ADR manifest as full ``AdrEntry`` records (deduped, sorted).
 
     Same fail-open semantics as :func:`load_adr_index`: returns ``()`` on missing or
-    malformed manifest. An entry missing ``body`` falls open to the string ``"drive"``
+    malformed manifest. An entry missing ``body`` falls open to the string ``"unknown"``
     (the weakest valid locator) so downstream renderers always have SOMETHING to print
     rather than a silent empty field — a silent empty is what let the original
     misjudgment happen. The CI test enforces that shipped entries carry a real, format-
@@ -269,7 +278,7 @@ def load_adr_entries(repo_root: Path | None = None) -> tuple[AdrEntry, ...]:
         thread_val = entry.get("thread")
         thread = thread_val.strip() if isinstance(thread_val, str) and thread_val.strip() else None
         body_val = entry.get("body")
-        body = body_val.strip() if isinstance(body_val, str) and body_val.strip() else "drive"
+        body = body_val.strip() if isinstance(body_val, str) and body_val.strip() else "unknown"
         seen.setdefault(
             adr_id,
             AdrEntry(
@@ -315,9 +324,10 @@ def build_adr_index_block(repo_root: Path | None = None) -> str:
         "ADR you do not know exists. When you need an ADR body, follow its `body:` "
         "locator: `chatroom:<project>/<thread>#msg-<n>` names the message that carries "
         "the decide-close; `repo:<path>` names a file inside this repository (read it "
-        "directly); `drive` means the body is in spirrow-docs/Drive; a bare `drive` (no "
-        "file pointer) means the specific file is unknown to this index — a weak "
-        "locator and a known debt. A locator says where the bytes can be opened, not "
+        "directly); `unknown` means this index does not record where the body is — a "
+        "weak locator and a known debt; `drive` / `drive:<id>` are legacy entries from "
+        "before Drive stopped being canonical. A locator says where the bytes can be "
+        "opened, not "
         "which copy is normative:\n"
         f"{rows}"
     )

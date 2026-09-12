@@ -365,7 +365,7 @@ class TestD37NeutralEnvironment:
         assert "PYTHONIOENCODING" not in child_env
 
     def test_env_allowlist_preserves_proxy_variables(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """D-44 (Tier-C msg §24): the sg-ai-server-01 deploy host reaches
+        """D-44 (Tier-C msg §24): the {{HOST_SERVICES}} deploy host reaches
         api.anthropic.com ONLY through a squid proxy exported via
         ``HTTP_PROXY`` / ``HTTPS_PROXY`` / ``NO_PROXY``. If the scrub
         drops them, the child ``claude -p`` fails inside the CLI with

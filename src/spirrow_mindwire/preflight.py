@@ -127,7 +127,7 @@ The loop's token (R-1, msg-1269 §2) is a classic OAuth PAT with scopes
 ``gist, read:org, repo, workflow`` — it does NOT hold ``admin:org``, so the
 ``orgs/`` endpoint returns HTTP 404. However, the ``repos/`` endpoint
 **returns org-source rulesets too** (verified against ``guard-default-branch``
-id=21017016 on ``spirrow-mindwire`` and ``Spirrow-VoxelWorld``, both HTTP 200
+id=21017016 on ``spirrow-mindwire`` and ``spirrow-voxelworld``, both HTTP 200
 with ``source_type: "Organization"`` and the correct
 ``current_user_can_bypass`` field for the calling identity). So P1 uses the
 ``repos/`` endpoint for every ruleset regardless of ``ruleset_source_type``.

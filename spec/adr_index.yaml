@@ -1,8 +1,10 @@
-# mindwire ADR index — union of CLAUDE.md §M references + spirrow-docs _docmap adr entries.
+# mindwire ADR index — union of CLAUDE.md §M references + the ADR bodies in docs/adr/.
 # GENERATED FILE — do not hand-edit id/title/thread. Regenerate with:
-#     python scripts/gen_adr_index.py --docmap <path-to-spirrow-docs/_docmap.yaml>
-# Run by the proposer on the docs host when an ADR is added/accepted (loop host/CI lacks
-# _docmap, so this committed copy is unavoidable; ADR-2026-06-04-19 N-2 / msg-438/443).
+#     python scripts/gen_adr_index.py            # --check to drift-check instead
+# Runs anywhere the repository is checked out, CI included. It did not until 2026-09-11:
+# the second source was a file on one machine in a tree with no remote, which is why
+# ADR-2026-06-04-19 N-2 records the committed copy as unavoidable. The bodies are the
+# source now, so `--check` is a real drift-check and the suite runs it.
 # Derived view: id + title (+ thread when the ADR is a §M entry) — the ADR body lives in
 # ONE OF three places: Drive/spirrow-docs, THIS repository under `docs/adr/`, or the
 # chatroom decide-close message that resolved the thread (§M-only ADRs 09-13 have no
@@ -12,29 +14,45 @@
 # "body unreadable" misjudgments in T-not-waiting-conclair-contract-…).
 # A locator is NOT a canonicity claim. It says where a reader can open the bytes, not
 # which copy is normative — `repo:` no more declares "Git is the source of truth" than a
-# bare `drive` declares it for Drive. Moving canonicity is a Tier-C convention change
-# (`docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md`, deliberately untouched by the PR that
-# added `repo:`); do not cite `repo:` as precedent for it (msg-2671 D-2).
+# bare `drive` declares it for Drive. Canonicity moved from Drive to the Git trees on
+# 2026-09-11 (ADR-2026-05-23-07 §6 Amendment, Takahito, Tier-C), which also superseded
+# `docs/spec/DOCS_DEVELOP_LAYOUT_CONVENTION.md`. That decision is the grounds for it —
+# `repo:` never was, and still is not: do not cite a locator as precedent (msg-2671 D-2).
 # `body:` is hand-maintained per-entry and the generator preserves existing values on
-# regenerate; new entries default to `drive` (a weak, format-valid placeholder that names
-# the medium but not the file — carry it forward as debt, do not leave it silent).
+# regenerate; new entries default to `unknown` (a weak, format-valid placeholder — carry it
+# forward as debt, do not leave it silent). It used to default to `drive`, which after the
+# 2026-09-11 canonicity move would have pointed every new entry at a medium that is no
+# longer canonical.
 # Locator format (validated by tests/test_naysayer_adr_index.py):
 #     chatroom:<project>/<thread>#msg-<n>   — canonical: the decide-close message
-#     drive                                 — weak: "in Drive/spirrow-docs, file unknown"
-#     drive:<fileId-or-title>               — Drive with a specific pointer (future use)
+#     unknown                               — weak: this index does not record the location
 #     repo:<repo-relative path>.md          — the body file in THIS repository
-# CI does not regenerate this (no _docmap in CI); it checks that the file parses and is
+#     drive / drive:<fileId-or-title>       — legacy: accepted, and preserved on regenerate
+#                                             like any hand-set value; never defaulted to
+# CI regenerates this and fails on drift (test_committed_manifest_matches_regeneration);
 # well-formed, that every `body:` matches the locator format above, that every `repo:`
 # target actually exists in the tree, and that an ADR whose body file IS in `docs/adr/`
 # is not left pointing elsewhere. All four are hermetic — same-tree reads only, never
 # the network, Drive, or the chatroom.
 adrs:
+  - id: ADR-2026-05-21-02
+    title: "tomtar 入力経路を mindwire webhook push (案 B) に確定"
+    body: repo:docs/adr/ADR-2026-05-21-02-tomtar-input-webhook-push.md
+  - id: ADR-2026-05-21-03
+    title: "signal channel 設計 (語彙・transport・delivery)"
+    body: repo:docs/adr/ADR-2026-05-21-03-signal-channel-design.md
+  - id: ADR-2026-05-21-04
+    title: "根本要求の再確認と tomtar 廃案、mindwire の責務再定義"
+    body: repo:docs/adr/ADR-2026-05-21-04-tomtar-withdrawal-mindwire-redefinition.md
+  - id: ADR-2026-05-21-05
+    title: "役割と adapter の抽象化 (ports & adapters)"
+    body: repo:docs/adr/ADR-2026-05-21-05-roles-and-adapter-abstraction.md
   - id: ADR-2026-05-21-06
     title: "mindwire Interface Contract (Ports)"
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-21-06-interface-contract-ports.md
   - id: ADR-2026-05-23-07
     title: "Stage 3 Autonomy Gating + Implementer 安全設計"
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-23-07-stage3-autonomy-gating.md
   - id: ADR-2026-05-24-08
     title: "Instance を一次概念とする識別モデル"
     body: repo:docs/adr/ADR-2026-05-24-08-instance-identity-model.md
@@ -59,24 +77,24 @@ adrs:
     thread: T-implementer-spec-readback-checklist
     body: chatroom:spirrow-mindwire/T-implementer-spec-readback-checklist#msg-326
   - id: ADR-2026-05-31-14
-    title: "ガワ方式撤回 (claude.ai web 外部駆動の ToS 衝突 → Claude Code 転換)"
-    body: drive
+    title: "ガワ方式撤回 — claude.ai web 外部駆動の ToS 衝突と Claude Code への操作対象転換"
+    body: repo:docs/adr/ADR-2026-05-31-14-gawa-method-withdrawal.md
   - id: ADR-2026-05-31-15
     title: "independence-class グラデーション化 + 「2 協調 1 独立」配置 (ADR-09/T28 の independence_class レイヤーを二値→グラデーションに補強、別訓練分布 naysayer の規範根拠、N-1/C-2 トレードオフ併記、§0 順序)"
     thread: T-T15-poc-h-phase1-kickoff
-    body: drive
+    body: repo:docs/adr/ADR-2026-05-31-15-independence-class-gradation.md
   - id: ADR-2026-06-03-16
-    title: "naysayer CI-gate (APPROVE は CI 緑を含意 / approve-while-red 防止)"
-    body: drive
+    title: "naysayer CI-gate — APPROVE は CI 緑を含意する（approve-while-red 防止）"
+    body: repo:docs/adr/ADR-2026-06-03-16-naysayer-ci-gate.md
   - id: ADR-2026-06-03-17
-    title: "独立 naysayer の design-time 参加復元 (5原則の常時注入 + relay orchestrator)"
-    body: drive
+    title: "独立 naysayer の design-time 参加復元 — 5原則の常時注入 + convergence/relay orchestrator"
+    body: repo:docs/adr/ADR-2026-06-03-17-naysayer-design-participation.md
   - id: ADR-2026-06-04-18
-    title: "mindwire デプロイ・トポロジと magickit 到達性 (ADR-17 D-8 amendment)"
+    title: "mindwire デプロイ・トポロジと magickit 到達性 — magickit を mindwire host から到達可能にする(ADR-17 D-8 amendment)"
     body: repo:docs/adr/ADR-2026-06-04-18-mindwire-deploy-topology-magickit-reachability.md
   - id: ADR-2026-06-04-19
-    title: "独立 naysayer のエージェント化 + summon ルール (ADR-17 relay/bundle を supersede)"
-    body: drive
+    title: "独立 naysayer のエージェント化 + summon ルール(ADR-17 の relay/bundle を supersede)"
+    body: repo:docs/adr/ADR-2026-06-04-19-naysayer-agentization-and-summon-rule.md
   - id: ADR-2026-08-25-20
     title: "`independence_class` に `machine` を追加"
     body: repo:docs/adr/ADR-2026-08-25-20-independence-class-machine-value.md

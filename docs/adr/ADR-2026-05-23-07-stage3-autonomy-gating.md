@@ -1,0 +1,187 @@
+# ADR-2026-05-23-07: Stage 3 Autonomy Gating + Implementer 安全設計
+
+- **Status**: Accepted (2026-05-23, Takahito GO) — Claude Code が Drive へ canonical 反映 + ADR-07 thread decide-close（本 doc 自体が §2.5 のフローに従う）。
+- **Date**: 2026-05-23
+- **Author**: main (claude.ai)
+- **Related**: ADR-2026-05-21-04（mindwire 役割転換の根拠）, ADR-2026-05-21-05（役割と adapter の抽象化, §5 独立性）, ADR-06 v2.1（Phase 2 dogfood）
+- **Project**: spirrow-mindwire / Phase 2 dogfood Stage 3
+
+---
+
+## 1. Context
+
+Phase 2 dogfood は Stage 1（watcher baseline, PR #65 merged）と Stage 2（独立 naysayer adapter, PR #66 merged）を完了。三者ループの 2 者目（naysayer = DeepSeek V4-Flash, ADR-05 §5 独立性充足）が実モデルで稼働済み。
+
+Stage 3 は **autonomy gating + implementer** = 正式稼働の最終段。proposer↔naysayer↔**implementer** の三者ループを完成させる。fork2 の「重い部分」である EXECUTE_CODE capability 解放を含むため、**「どこまで自律で実行してよいか（自律度ライン）」の安全設計が本 ADR の主題**。
+
+設計原則は Stage 2 から継承する: **fail-loud no-fallback**、**naysayer の構造的独立性**（main chain と分離）。
+
+---
+
+## 2. Decision
+
+### 2.1 自律度ライン（3 Tier, operation ベース）
+
+| Tier | 範囲 | ゲート | 根拠 |
+|---|---|---|---|
+| **A 自律** | feature/* での開発・commit / feature→develop の **main 役 self-review & マージ** / EXECUTE_CODE（test・ビルド・実コード実行）/ ローカル develop doc フォルダの編集 / read・search | なし | 可逆・低ブラスト。feature / develop / ローカル doc は非 canonical |
+| **B naysayer-gate** | PR（develop→main）の独立レビュー | naysayer **明示 approve** 必須（objection 時は §2.2 へ） | 集約 diff に対する独立検証 |
+| **C human pre-GO** | main への merge / delete・force-push・history rewrite / 外部副作用（publish・post・send）/ Drive canonical doc 反映 | **Takahito 事前承認** | 不可逆・高ブラスト |
+
+判定軸は **operation ベース**（doc_type / path / git operation の種別）。develop 上では速度を最大化し、canonical（main / Drive）への昇格点にのみゲートを集約する。
+
+### 2.2 三者ループ完成形
+
+```
+proposer (claude-code / main chain)
+  └─ 提案
+implementer (Stage 3 新規 / EXECUTE_CODE 付き)
+  └─ feature/* で開発・commit【Tier A】
+  └─ feature/* → PR → develop を open
+main 役 (reviewer/integrator / claude.ai chain)
+  └─ self-review してマージ【Tier A: 自律、naysayer 不要】
+  └─ 区切りで develop → main の PR を open
+naysayer (DeepSeek V4-Flash / 独立)
+  └─ develop→main の集約 diff を独立レビュー【Tier B】
+       ├─ objection → proposer↔implementer の修正ループに差し戻し（自律再試行。human 呼び出しではない）
+       └─ approve → Takahito の merge 判断へ
+Takahito
+  └─ main merge GO【Tier C】
+```
+
+- **feature→develop は main 役の self-review & マージ（自律, Tier A）**。proposer と reviewer/integrator は同一 main チェーン（共有 context）なので独立検証ではないが、整合性・品質ゲートとして機能する。**現行の claude.ai↔claude-code レビュー運用（claude.ai が claude-code 実装をレビュー）で self-review の実効性は実証済み**。
+- **独立検証は develop→main に集約**。naysayer は per-commit のノイズではなく **集約 diff** に当たることでレビュー面の質を上げ、独立性（ADR-05 §5）も main 昇格点のみに保持される。
+- naysayer の objection は「人間を呼ぶ」シグナルではなく **「ループ内で直せ」** のシグナル。最終 merge 判断のみ Takahito。
+
+### 2.3 implementer adapter
+
+- `ClaudeCodeSdkAdapter` をベースに **EXECUTE_CODE capability** を付与。
+- 許可境界（allow-list, operation ベース）:
+  - **許可**: feature/* への commit、feature→develop の self-review マージ、ローカルでの任意コード実行、ローカル develop doc フォルダ書込
+  - **禁止（loop からは実行不可）**: main merge、force-push、delete、history rewrite、外部副作用、Drive canonical 書込 → すべて Tier C で Takahito 経由
+- Stage 2 の **fail-loud no-fallback** を継承（不明 tier → 502, fallback しない）。
+
+### 2.4 環境セキュリティ（独立 PC）
+
+EXECUTE_CODE を全開放するため、blast radius は **loop のゲートではなく環境レベルで物理的に封じる**。
+
+- **Tailscale ACL を絞る**: implementer ノードからの到達先を **Lexora（naysayer 用エンドポイント）と magickit 等の一部許可ツールに限定**。Vaultwarden / SSH / その他内部ホスト・ポートには到達不可。
+- **egress default-deny**: package registry・GitHub API・許可済み内部エンドポイント以外への外向き通信を遮断。
+- **scoped credentials**: GitHub token は対象 repo の最小権限。Vaultwarden アクセスは環境に置かない。長期クレデンシャルを implementer 環境に保持しない。
+
+→ Tier A（EXECUTE_CODE 全開放）が成立する前提条件として、**内部網への横移動と外部への exfiltration を環境レベルで不可能化**しておくことを必須とする。
+
+### 2.5 ドキュメント取り扱い
+
+> **本節は §6 Amendment（2026-09-11）で撤回済み。** doc の正本は Drive ではなく各リポジトリの Git ツリー。
+> 以下は撤回前の決定で、記録として残している —— **現行の規則として読まないこと。**
+
+git の develop/main モデルを doc にも一般化する（**Drive = doc の main**）。
+
+- プロジェクト毎に {{HOST_SERVICES}} ローカルへ **「develop ブランチ役」の doc フォルダ**を設置。そこの編集は **自由（Tier A）**。
+- 最終的に **Takahito 承認を得て Drive へ反映（Tier C）**。canonical な ADR / spec doc は Drive 反映時にのみゲート。
+- **Deferred（Stage 3 スコープ外, 別機会）**: magickit を拡張し、read 時にローカル develop doc / Drive canonical のどちらを読むか指定できるツール化。面白いが本 ADR では扱わない。
+
+### 2.6 Fail-mode
+
+- naysayer 到達不能・timeout 時は **fail-closed で halt**（human 待ち）。fallback で先に進めない。Stage 2 の fail-loud 原則と整合。
+
+---
+
+## 3. 独立性制約との整合（ADR-05 §5）
+
+naysayer は main chain と context 分離された独立検証専用であり、**irreversible 操作の最終権限を構造的に持てない**（main 経由の承認系に入れない）。したがって **Tier C のバックストップは構造的に Takahito 一択**。これは制約ではなく設計の要請であり、naysayer approve は「merge の必要条件」、Takahito GO は「十分条件」として二段で機能する。
+
+---
+
+## 4. Consequences
+
+### Positive
+- develop / ローカル doc 上で速度を最大化しつつ、canonical 昇格点（main / Drive）にゲートを集約 → 安全と速度の両立。
+- naysayer が集約 diff をレビュー → 独立検証の質が per-commit より向上。
+- 環境レベルの封じ込めにより、EXECUTE_CODE 全開放と安全性が両立。
+
+### Negative / Risks
+- feature→develop は self-review（同一 main チェーン）のため独立検証ではない（緩和: 独立性は develop→main の naysayer に集約。現行 claude.ai↔claude-code レビュー運用で self-review の実効性は実証済み）。
+- 環境セキュリティが Tailscale ACL / egress 設定の正しさに依存する（緩和: ACL を最小許可で構成、設定自体を Tier C 変更扱いにする）。
+- naysayer halt 固定により、naysayer 不安定時はループが止まる（受容: 安全側の意図的選択）。
+
+### Deferred
+- magickit read-source 切り替えツール化（§2.5）。
+
+---
+
+## 5. Open Questions / Follow-ups
+
+**すべてクローズ済 → spec 化。** 各項の行き先は docs-develop tree が記録していたもので、
+git 側には反映されていなかった（2026-09-11 に照合して取り込み）。設問文は当時のまま残す。
+
+1. 実装独立 PC の現行ネットワーク構成確定 → Tailscale ACL の具体ルール記述。
+   → `MINDWIRE_STAGE3_IMPLEMENTER_ENV_SPEC`
+2. ローカル develop doc フォルダのレイアウト規約（プロジェクト毎ディレクトリ命名）。
+   → `DOCS_DEVELOP_LAYOUT_CONVENTION`
+3. PR（develop→main）の naysayer レビュー trigger（PR open hook? 手動? watcher 連動?）。
+   → `MINDWIRE_STAGE3_WIRING_ALLOWLIST_SPEC` Part A
+4. implementer adapter の allow-list を設定ファイル化する形式（operation enum + path glob）。
+   → `MINDWIRE_STAGE3_WIRING_ALLOWLIST_SPEC` Part B
+
+---
+
+## 6. Amendment (2026-09-11): doc の正本を Drive から Git へ移す — Takahito 権限・判断
+
+**本改訂は trilateral 議論（proposer/implementer/naysayer 収束）を経ていない。Takahito（human owner）の
+権限・判断で決定し、指示により本欄へ明記する。** 通常の §M / Tier C プロセスに対する例外で、決定主体は
+Takahito 単独である。
+
+### 決定内容
+
+**§2.5 の「Drive = doc の main」を撤回する。** ADR / spec 本体の正本は、各リポジトリの Git ツリー
+（`docs/adr/` と `docs/spec/`）である。Drive は正本ではない。
+
+`spec/adr_index.yaml` と `src/spirrow_mindwire/naysayer/adr_index*.py` は、この移動を
+「未了の Tier-C 規約変更」として名指ししていた（msg-2671 D-2）。本改訂がそれを行う。
+
+### なぜ
+
+§2.5 の運用には穴が 2 つあり、どちらも実際に発火した（`docs/adr/README.md` に記録）:
+
+1. **Drive に届かなければどこにも残らない。** develop 段リポジトリは remote を持たないので、反映前の
+   本文は 1 台のディスク上の 1 コピーしか存在しない。ADR-2026-06-04-18 は Tier-C GO まで通った
+   Accepted 文書でありながら、3 ヶ月この状態にあった。
+2. **反映漏れが検出されない。** ADR-2026-08-25-20 は `_docmap` にすら登録されず、索引からも落ちていた。
+
+Drive→Git 移行（Phase 2）は 2026-09-11 に完了し、`spec/adr_index.yaml` に `body: drive` の entry は
+残っていない。∴ 機構は既に Git を正本として動いており、本文だけが Drive を指していた。
+
+**移行そのものが、この判断の裏付けを 1 つ足した。** 照合したところ移行は public リポジトリの ADR に
+文字化けを 7 件持ち込んでおり（`役`→`彴` ×2 / `舞`→`苞` / `箇`→`筧` / `（`→`ﾈ` / `。`→`@` / `AI`→`AR`）、
+移行前の正しいバイト列を持っていたのは remote 無しの develop tree だけだった（PR #260 で復元）。
+穴 1 は理屈ではなく実測である。
+
+### 何が §2.5 を置き換えるか
+
+[[platform:docs-infrastructure-design]] §6.3.1 の二層構成。**Prismind 経由の書き込みは working tier
+（Git 管理外の下書き層）に入り、正本にはならない。** 正本になるのは、明示的な promote —— canonical tier
+（Git clone）への PR —— を通ったときだけである。滞留（working tier に N 日以上）と `diverged`
+（PR 後に working を編集）は同期時に検出してレポートに出す（同 §6.4.1）。これは上の穴 1 / 穴 2 に
+対する機構側の答えとして義務化されている。
+
+### 変えないもの
+
+- **locator は正本の主張ではない。** `spec/adr_index.yaml` の `body:` は「読み手がバイト列を開ける場所」を
+  名指すだけで、どのコピーが normative かを言わない。この規則は本改訂の後も変わらない —— `repo:` が
+  増えたことが正本移動の根拠だったのではなく、本改訂が根拠である。
+- **`develop → main` の merge は Tier-C のまま。** 本改訂は doc の正本の所在を動かすもので、コードの
+  merge 権限には触れない。
+- §2.5 の Deferred（magickit の read-source 切替ツール）は Deferred のまま。二層構成が
+  「呼び手は層を知らない」と定めた以上、切替を呼び手に見せる設計自体を作り直す必要がある。
+
+### 併走した措置
+
+`{{HOST_LOOP}}` のローカル develop tree（remote 無し）は、全 13 ファイルを照合して git 側に取り込んだ後、
+**書き込み停止**にした（削除はしない —— 同種の破損が後から見つかったとき、移行前のバイト列と照合できる
+のはそこだけのため）。
+
+---
+
+> **Provenance**: canonical reflection of `ADR-2026-05-23-07-stage3-autonomy-gating.md` (source author: main / claude.ai). Reflected to Drive by claude-code per §2.5 (Tier C, Takahito pre-GO obtained). Recorded in chatroom thread `T-phase2-stage3-autonomy-gating`.
