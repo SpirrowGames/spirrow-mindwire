@@ -48,6 +48,13 @@ _REPO = Path(__file__).resolve().parents[1]
 _DRIVER = _REPO / "scripts" / "naysayer_review.py"
 _SKILL = _REPO / ".claude" / "skills" / "naysayer-review" / "SKILL.md"
 
+# This module's own path, relative to _REPO, for the check-D self-exclusion below. Resolved on
+# both sides: _REPO is resolve()d above, so comparing it against an unresolved Path(__file__)
+# would raise ValueError whenever the checkout is reached through a symlink or a Windows
+# junction (the two spellings of the same file differ as strings). Computed once rather than
+# per-file inside the comprehension.
+_SELF = Path(__file__).resolve().relative_to(_REPO).as_posix()
+
 # The two files allowed to carry a runnable command line (check C). Relative POSIX paths so the
 # failure message reads the same on Windows and on the CI runner.
 _ALLOWED_COMMAND_FILES = frozenset(
@@ -241,7 +248,7 @@ def test_d_no_conditional_hedge_survives_where_the_flag_is_documented() -> None:
     scanned = [
         (rel, text)
         for rel, text in _repo_text_files()
-        if "--design-thread" in text and rel != Path(__file__).relative_to(_REPO).as_posix()
+        if "--design-thread" in text and rel != _SELF
     ]
     # The self-exclusion above is only for this checker, which must quote the banned phrases to
     # ban them. It is excluded from D alone — never from the census in C.
