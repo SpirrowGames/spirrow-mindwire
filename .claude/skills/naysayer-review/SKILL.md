@@ -62,9 +62,9 @@ threads).
    following arguments are required`, exit 2, before anything is billed.
 
 5. **Relay the result verbatim.** Report the printed `VERDICT:` line and the
-   critique back to the user / thread exactly as the naysayer wrote it. Do not
-   edit it. The driver already posted to the chatroom and submitted the GitHub
-   review — **do not duplicate** either.
+   critique exactly as the naysayer wrote it. Do not edit it. The driver already
+   posted to the chatroom and submitted the GitHub review — **do not duplicate**
+   either.
 5b. **Say where the verdict is, in the design thread — one line, never the critique.**
    The driver's chatroom post goes to the `T-pr-review-<repo>-<n>` **ledger**; the
    design thread the gate was fired from is a different thread. Post there:
