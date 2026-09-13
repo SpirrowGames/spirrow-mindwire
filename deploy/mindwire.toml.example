@@ -50,6 +50,17 @@ Bohr = "proposer"
 Heisenberg = "implementer"
 Einstein = "naysayer"
 
+# Identities the conductor must NOT spawn, by稼働形態 (ADR-2026-09-14-21 D-2 / D-3). Values are
+# Prismind's embodiment enum: web_ai_chat / terminal_coding_agent / unknown. Anything other than
+# terminal_coding_agent means no adapter here can start it, so a `NEXT:` naming it stops at the
+# human (the same stop `NEXT: human` produces) instead of spawning.
+#
+# Fermi ships as a DEFAULT in src/spirrow_mindwire/identity/embodiment.py — leaving this block out
+# entirely is the ADR's behaviour, not "spawn anything named". Entries here are merged OVER the
+# shipped defaults, which is also how one would be corrected without a release.
+[conductor.identity_embodiment]
+Fermi = "web_ai_chat"
+
 # PR-review debounce knobs (cost levers, all default-off). They trim redundant Tier B re-reviews —
 # a PR averaged ~2.4 naysayer reviews (max 13) because each implementer fix push re-fired a full
 # Gemini review. Leave unset/false to keep the prior behavior (a full review on every fire).

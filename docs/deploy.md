@@ -552,12 +552,41 @@ Alerts fire for every human-terminal `StopReason`, not just `human`:
 | `human` | yes — the Tier-C decision point |
 | `no_handoff_to_human` | yes — `NEXT:` unparseable, routed to the human |
 | `no_progress_to_human` | yes — the dispatched role posted nothing |
+| `self_handoff_to_human` | yes — the head hands to its own author; nobody was spawned |
 | `round_cap` | yes — runaway backstop tripped |
 | `empty_thread` | yes — almost always a typo in the priority list |
 | `none` | **no** — a settled thread is the normal end; the sweep just moves on |
+| `hold` | **no** — the operator asked for the stop |
+| `ci_wait` | **no** — pre-gate CI wait; bounded by the admission caps |
 
 Do not narrow this to `reason -eq 'human'`. The first live sweep after this was wired stopped with
 `no_progress_to_human`, which a narrower check drops silently.
+
+### Two of these stops PARK the thread (2026-09-14, design §6.2)
+
+`no_progress_to_human` and `self_handoff_to_human` are not "try again in a while" — they are
+"running this exact head again achieves exactly the same nothing". After such a run the sweep
+calls `head_skip_decide.py --mode commit-terminal`, which records the reason and the head it
+stopped on; `head_skip.decide`'s Stage 1b then **SKIP**s the thread until its head msg id
+changes. Any other stop reason clears that state, so the call is unconditional.
+
+Before this, those threads fell to Stage 2's backoff, which is a floor on the launch *rate* and
+by design never terminates: two threads sat at one launch per hour for days
+(`spirrow-magickit/T-human-outage-degrade-close-only` and
+`spirrow-mindwire/T-scoped-driver-verdict-never-reaches-chatroom`, 72 retries each, no reply and
+no record on any of them).
+
+**A parked thread does not un-park itself.** The head has to move — a person posts, or edits the
+head's `NEXT:`. `launch_attempts` is preserved through the park, so the log still shows how long
+the spin ran before it was stopped.
+
+### Spawn-unavailable targets stop at the human (ADR-2026-09-14-21)
+
+A `NEXT:` naming an identity whose 稼働形態 is not `terminal_coding_agent` — `Fermi`
+(`web_ai_chat`) is the shipped case — is not spawned. The conductor stops on `human`, the same
+stop `NEXT: human` produces, and posts the reason into the thread. The table lives in
+`[conductor.identity_embodiment]`; the ADR's own entry ships as a default, so an empty block is
+the ADR's behaviour rather than "spawn anything named".
 
 Alerts are keyed on `(reason, last_msg)`, so a thread parked on a human for days alerts **once**
 rather than on every tick. A thread that changes *how* it is stuck re-alerts.

@@ -106,6 +106,7 @@ Write-Host "W-2 — the CLI wiring helpers exist under their contract names"
 # is a silent contract break; keep the names pinned here.
 Check "Invoke-HeadSkipDecide exists" $true ($null -ne (Get-FunctionAst -Name 'Invoke-HeadSkipDecide'))
 Check "Invoke-HeadSkipCommitLaunch exists" $true ($null -ne (Get-FunctionAst -Name 'Invoke-HeadSkipCommitLaunch'))
+Check "Invoke-HeadSkipCommitTerminal exists" $true ($null -ne (Get-FunctionAst -Name 'Invoke-HeadSkipCommitTerminal'))
 Check "Get-HeadSkipMode exists" $true ($null -ne (Get-FunctionAst -Name 'Get-HeadSkipMode'))
 
 Write-Host "Get-HeadSkipMode — env var routes to CLI mode, unknowns fall back to 'decide'"

@@ -49,6 +49,7 @@ from spirrow_mindwire.decision_request import (
 from spirrow_mindwire.decision_request.claude_code import (
     _SYSTEM_PROMPT,
     DEFAULT_COMPOSER_IDENTITY,
+    DEFAULT_MODEL,
     PROMPT_DIGESTS,
     PROMPT_VERSION,
     SubprocessResult,
@@ -278,6 +279,30 @@ class TestD37NeutralEnvironment:
         assert "--output-format" in argv
         fmt_idx = argv.index("--output-format")
         assert argv[fmt_idx + 1] == "json"
+
+    def test_argv_asks_for_the_cost_reduction_model_by_default(self) -> None:
+        """Cost-reduction design §7: this generator is 定型生成 and does not need a frontier
+        model. The flag is a request; what lands in the envelope is still whatever the child
+        REPORTS having run (D-42), which is why the assertion is on argv, not on extras."""
+        runner = FakeRunner(result=SubprocessResult(0, _cli_json_bytes(), b""))
+        composer = ClaudeCodeComposer(runner=runner)
+
+        composer.compose(_sample_request())
+
+        argv = runner.calls[0].argv
+        assert "--model" in argv
+        assert argv[argv.index("--model") + 1] == DEFAULT_MODEL
+
+    def test_model_none_sends_no_flag_and_reproduces_the_old_argv(self) -> None:
+        """The escape hatch, and the reason the flag is APPENDED rather than inserted: with the
+        model off, the argv is byte-identical to the one this composer built before §7."""
+        with_model = FakeRunner(result=SubprocessResult(0, _cli_json_bytes(), b""))
+        without = FakeRunner(result=SubprocessResult(0, _cli_json_bytes(), b""))
+        ClaudeCodeComposer(runner=with_model).compose(_sample_request())
+        ClaudeCodeComposer(runner=without, model=None).compose(_sample_request())
+
+        assert "--model" not in without.calls[0].argv
+        assert without.calls[0].argv == with_model.calls[0].argv[:-2]
 
     def test_env_is_scrubbed_of_mindwire_variables(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Seed a MINDWIRE_* env in the parent and assert it does NOT

@@ -23,6 +23,10 @@ Design intent (verbatim from the spec, D-35..D-43):
   I-2 is preserved (the wrapper falls back to the raw ping).
 - **D-42** cost / latency / model / turns propagated verbatim from the
   child's structured output. Model name is NEVER hard-coded here.
+  (2026-09-14) The model the child is ASKED to run is now a knob —
+  :data:`DEFAULT_MODEL`, per the cost-reduction design §7 — which does not
+  weaken D-42: what lands in the envelope is still whatever the child
+  reports having run, never this request.
 - **D-43** child stdout is decoded EXPLICITLY as UTF-8 (bytes → utf-8);
   ``subprocess.run(..., text=True)`` is DELIBERATELY not used because
   the platform default (cp932 on the Windows deploy host) would mojibake
@@ -72,6 +76,25 @@ diverge from what an operator sees when they run the same command by hand.
 """
 
 DEFAULT_TIMEOUT_SECONDS = 60
+
+DEFAULT_MODEL: str | None = "haiku"
+"""Model the child runs on — the cost-reduction design's §7 row for this generator.
+
+The composer writes a short, formulaic envelope (a question, two or three options, a
+recommendation) from a bounded tail. Nothing in that needs a frontier model, and it fires on
+every parked thread at a 5-minute cadence, so it is the clearest case in §7's table of "定型生成。
+frontier を通す理由がない".
+
+``"haiku"`` is the CLI's own alias rather than a pinned id, deliberately: pinning
+``claude-haiku-4-5-20251001`` here would make this file a place that goes stale when the alias
+moves, and D-42 already says the model NAME is never hard-coded here — what is recorded in the
+envelope is whatever the child reports having actually run, not this request.
+
+Set to ``None`` to send no ``--model`` flag at all, which restores the pre-2026-09-14 behaviour
+(the child runs on the CLI's default, currently a frontier model). That is the escape hatch if a
+Haiku-composed envelope ever reads worse than the raw ping it replaces — measure before
+reverting: I-2 already guarantees a failed composer falls back to the raw ping, so the downside
+of a weaker model is a weaker question, not a missed notification."""
 """Wall-clock ceiling for one child invocation.
 
 Matches the S2 wrapper's ``$DecisionComposerTimeoutSeconds`` (also 60 s).
@@ -275,10 +298,13 @@ class ClaudeCodeComposer:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         cwd: str | None = None,
         runner: SubprocessRunner | None = None,
+        model: str | None = DEFAULT_MODEL,
     ) -> None:
         self.identity_name = identity_name
         self._cli_path = cli_path
         self._timeout_seconds = timeout_seconds
+        # §7 of the cost-reduction design. ``None`` sends no --model flag (CLI default).
+        self._model = model
         # D-37: cwd OUTSIDE the repo. tempfile.gettempdir() gives an
         # OS-specific temp dir we never write to — the child launches
         # there, walks upward looking for CLAUDE.md, and finds nothing
@@ -468,7 +494,7 @@ class ClaudeCodeComposer:
         are what the current Claude Code CLI uses; if a future version
         renames them, this list is the single place to update.
         """
-        return [
+        argv = [
             self._cli_path,
             "-p",  # print / headless
             "--output-format",
@@ -485,6 +511,13 @@ class ClaudeCodeComposer:
             "--setting-sources",
             "",
         ]
+        if self._model:
+            # Appended rather than inserted so the argv digest of a no-model launch is
+            # byte-identical to the one this file produced before the flag existed — an
+            # operator comparing an old digest to a new one sees the model as the only
+            # difference, which is exactly the question they would be asking.
+            argv += ["--model", self._model]
+        return argv
 
     def _digest_argv(self, argv: list[str]) -> str:
         """First 16 hex chars of ``sha256(" ".join(argv))``.

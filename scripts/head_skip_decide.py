@@ -54,6 +54,21 @@ Output of ``decide`` (JSON, to stdout):
 Input to ``commit-launch`` (``--payload <json>`` argument): exactly the
 ``commit_launch_payload`` object from the corresponding decide verdict.
 
+**Phase 3 (``commit-terminal`` mode):** after the conductor session returns, the sweep feeds
+back the run's stop reason and the msg id it stopped on. A reason in
+:data:`~spirrow_mindwire.conductor.head_skip.TERMINAL_STOP_REASONS` parks the thread until its
+head moves (design §6.2); any other reason CLEARS the terminal state, so the call is
+unconditional and the wrapper needs no reason table of its own.
+
+Unlike phase 2 this runs AFTER the session, because a terminal outcome only exists once there
+is an outcome. A session killed mid-flight therefore records no terminal state and the thread
+stays on the ordinary backoff — the safe direction (it retries) rather than a park nobody
+asked for.
+
+Input to ``commit-terminal`` (``--payload <json>``):
+
+    {"thread_id": "T-a", "reason": "no_progress_to_human", "head_msg_id": "msg-244"}
+
 State file: one JSON object keyed by ``thread_id`` (values are Record dicts per
 :func:`~spirrow_mindwire.conductor.head_skip.record_to_json`). Written in both live modes;
 ``--mode report`` prints the verdicts but touches nothing on disk.
@@ -83,6 +98,7 @@ from spirrow_mindwire.conductor.head_skip import (
     can_reuse_cached_parse,
     commit_launch,
     commit_observation,
+    commit_terminal,
     decide,
     parse_head_token,
     record_from_json,
@@ -375,6 +391,28 @@ def _apply_commit_launch(
     return new_record
 
 
+def _apply_commit_terminal(*, state_path: Path, payload: dict[str, Any]) -> Record:
+    """Apply a commit-terminal payload to the state file for one thread.
+
+    ``head_msg_id`` is the id the conductor reported as ``last_msg`` — which, for the two stops
+    that park a thread, is the message a human will open. On a self-handoff stop that is the
+    conductor's own posted explanation (it posts, then stops on the posted id), and parking on
+    THAT id is what makes the park correct: the next human message moves the head again.
+    """
+    thread_id = str(payload.get("thread_id") or "")
+    if not thread_id:
+        raise ValueError("commit-terminal payload missing thread_id")
+    state = _load_state(state_path)
+    new_record = commit_terminal(
+        reason=str(payload.get("reason") or ""),
+        head_msg_id=str(payload.get("head_msg_id") or ""),
+        record=state.get(thread_id),
+    )
+    state[thread_id] = new_record
+    _save_state(state_path, state)
+    return new_record
+
+
 _ZERO_TIMEDELTA = timedelta(0)
 
 
@@ -463,6 +501,38 @@ def _main_commit_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _main_commit_terminal(args: argparse.Namespace) -> int:
+    try:
+        if args.payload_file:
+            payload_raw = Path(args.payload_file).read_text(encoding="utf-8")
+        else:
+            payload_raw = args.payload or sys.stdin.read()
+        payload = json.loads(payload_raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"head_skip: commit-terminal payload unreadable: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(payload, dict):
+        print("head_skip: commit-terminal payload must be a JSON object", file=sys.stderr)
+        return 1
+
+    try:
+        new_record = _apply_commit_terminal(state_path=Path(args.state_file), payload=payload)
+    except ValueError as exc:
+        print(f"head_skip: commit-terminal failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "mode": "commit-terminal",
+                "thread_id": payload.get("thread_id", ""),
+                "record": record_to_json(new_record),
+            },
+            ensure_ascii=True,
+        )
+    )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", default="")
@@ -479,11 +549,12 @@ def main() -> int:
     parser.add_argument(
         "--mode",
         default="decide",
-        choices=("decide", "commit-launch", REPORT_MODE_VALUE),
+        choices=("decide", "commit-launch", "commit-terminal", REPORT_MODE_VALUE),
         help=(
             "decide: batch-evaluate, emit verdicts, refresh observation only (never touch "
             "launch baseline); commit-launch: apply launch baseline for one thread; "
-            "report: dry-run decide (never touch state)"
+            "commit-terminal: record (or clear) one thread's terminal stop after the session "
+            "returns; report: dry-run decide (never touch state)"
         ),
     )
     parser.add_argument(
@@ -492,12 +563,15 @@ def main() -> int:
     parser.add_argument(
         "--payload",
         default=None,
-        help="inline JSON payload for commit-launch (alternative: --payload-file or stdin)",
+        help=(
+            "inline JSON payload for commit-launch / commit-terminal "
+            "(alternative: --payload-file or stdin)"
+        ),
     )
     parser.add_argument(
         "--payload-file",
         default=None,
-        help="path to a JSON file with the commit-launch payload",
+        help="path to a JSON file with the commit-launch / commit-terminal payload",
     )
     parser.add_argument(
         "--now-iso",
@@ -508,6 +582,8 @@ def main() -> int:
 
     if args.mode == "commit-launch":
         return _main_commit_launch(args)
+    if args.mode == "commit-terminal":
+        return _main_commit_terminal(args)
     # decide (default) or report
     if not args.project:
         print("head_skip: --project is required in decide/report mode", file=sys.stderr)

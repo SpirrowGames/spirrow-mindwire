@@ -413,3 +413,85 @@ def test_commit_launch_head_fetched_false_preserves_prior_observation(tmp_path: 
     # But observation is PRESERVED from prior (round-2 anti-poison).
     assert new_record.last_observed_head_msg_id == "msg-1"
     assert new_record.last_observed_nomination == "bohr"
+
+
+# --- phase 3: commit-terminal (design §6.2) ------------------------------------------------
+
+
+def test_commit_terminal_parks_one_thread_and_leaves_the_others(tmp_path: Path) -> None:
+    """The third phase writes the run's OUTCOME, and only for the thread that ran.
+
+    Same containment rule as commit-launch: the state file holds every candidate the last
+    decide batch observed, and a stop on one of them says nothing about the rest.
+    """
+    state_path = tmp_path / "head_skip.json"
+    pre_state = {
+        "T-a": {
+            "last_launch_at": _T0.isoformat(),
+            "nomination_at_launch": "bohr",
+            "control_at_launch": "run",
+            "head_msg_id_at_launch": "msg-a1",
+            "launch_attempts": 5,
+            "head_observed_at": _T0.isoformat(),
+            "last_observed_head_msg_id": "msg-a1",
+            "last_observed_nomination": "bohr",
+        },
+        "T-b": {
+            "last_launch_at": None,
+            "nomination_at_launch": "",
+            "control_at_launch": "",
+            "head_msg_id_at_launch": "",
+            "launch_attempts": 0,
+            "head_observed_at": _T0.isoformat(),
+            "last_observed_head_msg_id": "msg-b1",
+            "last_observed_nomination": "einstein",
+        },
+    }
+    state_path.write_text(json.dumps(pre_state), encoding="utf-8")
+
+    record = _MODULE._apply_commit_terminal(  # type: ignore[attr-defined]
+        state_path=state_path,
+        payload={
+            "thread_id": "T-a",
+            "reason": "no_progress_to_human",
+            "head_msg_id": "msg-a1",
+        },
+    )
+
+    assert record.terminal_stop_reason == "no_progress_to_human"
+    assert record.terminal_head_msg_id == "msg-a1"
+    # The launch baseline is untouched — the park is an addition to the record, not a reset.
+    assert record.launch_attempts == 5
+    assert record.last_launch_at == _T0
+
+    final = _read_state(state_path)
+    assert final["T-a"].terminal_stop_reason == "no_progress_to_human"
+    assert final["T-b"].terminal_stop_reason == ""
+
+
+def test_commit_terminal_clears_the_park_on_a_non_terminal_reason(tmp_path: Path) -> None:
+    """The wrapper calls this after EVERY run, so a live reason has to un-park."""
+    state_path = tmp_path / "head_skip.json"
+    state_path.write_text(json.dumps({}), encoding="utf-8")
+
+    _MODULE._apply_commit_terminal(  # type: ignore[attr-defined]
+        state_path=state_path,
+        payload={"thread_id": "T-a", "reason": "no_progress_to_human", "head_msg_id": "msg-1"},
+    )
+    _MODULE._apply_commit_terminal(  # type: ignore[attr-defined]
+        state_path=state_path,
+        payload={"thread_id": "T-a", "reason": "human", "head_msg_id": "msg-2"},
+    )
+
+    assert _read_state(state_path)["T-a"].terminal_stop_reason == ""
+
+
+def test_commit_terminal_refuses_a_payload_without_a_thread_id(tmp_path: Path) -> None:
+    state_path = tmp_path / "head_skip.json"
+    state_path.write_text(json.dumps({}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="thread_id"):
+        _MODULE._apply_commit_terminal(  # type: ignore[attr-defined]
+            state_path=state_path,
+            payload={"reason": "no_progress_to_human", "head_msg_id": "msg-1"},
+        )

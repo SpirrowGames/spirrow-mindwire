@@ -80,6 +80,7 @@ from datetime import UTC, datetime
 
 from .claude_code import (
     DEFAULT_CLAUDE_CLI,
+    DEFAULT_MODEL,
     DEFAULT_TIMEOUT_SECONDS,
     ClaudeCodeComposer,
 )
@@ -118,6 +119,7 @@ def _build_composer(
     claude_cli: str = DEFAULT_CLAUDE_CLI,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     cwd: str | None = None,
+    model: str | None = DEFAULT_MODEL,
 ) -> DecisionRequestComposer:
     """Resolve a backend name into a port implementation.
 
@@ -141,6 +143,7 @@ def _build_composer(
             cli_path=claude_cli,
             timeout_seconds=timeout_seconds,
             cwd=cwd,
+            model=model,
         )
     # NB: an unknown backend is a usage error, not a composer failure —
     # exit non-zero (see module docstring).
@@ -522,6 +525,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=(
+            "Model the composer child runs on (cost-reduction design §7; default "
+            f"{DEFAULT_MODEL!r}). Pass an empty string to send no --model flag and let the "
+            "Claude Code CLI pick its own default. Ignored unless --backend claude-code."
+        ),
+    )
+    parser.add_argument(
         "--timeout-seconds",
         type=float,
         default=DEFAULT_TIMEOUT_SECONDS,
@@ -594,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
         claude_cli=args.claude_cli,
         timeout_seconds=args.timeout_seconds,
         cwd=args.cwd,
+        model=(args.model if args.model != "" else None),
     )
     envelope = compose_once(composer, request)
     if fetch_extras:
