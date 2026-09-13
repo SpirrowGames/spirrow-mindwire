@@ -98,3 +98,6 @@ adrs:
   - id: ADR-2026-08-25-20
     title: "`independence_class` に `machine` を追加"
     body: repo:docs/adr/ADR-2026-08-25-20-independence-class-machine-value.md
+  - id: ADR-2026-09-14-21
+    title: "Fermi identity — claude.ai 対話セッションを 4 レイヤーモデルに組み込む"
+    body: repo:docs/adr/ADR-2026-09-14-21-fermi-identity.md
