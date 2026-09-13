@@ -568,6 +568,62 @@ function Invoke-HeadSkipCommitLaunch {
     return @{ ok = $true; error = $null }
 }
 
+# Invoke `head_skip_decide.py --mode commit-terminal --payload <payload>` for one thread.
+# Returns: @{ ok = $true / $false; error = $null / diagnostic }
+#
+# Called AFTER the conductor session returns — the mirror of commit-launch, and deliberately the
+# other way round in time: a launch has to be recorded even if the session is killed mid-flight,
+# whereas a terminal outcome only exists once there is an outcome to read (design §6.2).
+#
+# Called UNCONDITIONALLY on every parseable verdict, not only on the terminal reasons. The CLI
+# clears the terminal state for any non-terminal reason, so the wrapper does not carry a second
+# copy of the reason table — the one in head_skip.py's TERMINAL_STOP_REASONS stays the only one.
+#
+# FAIL-OPEN, unlike commit-launch. A failure here leaves the thread on the ordinary backoff, which
+# is the behaviour that shipped before this existed; aborting the tick (commit-launch's rule)
+# would trade a retry loop for a stopped sweep, and the retry loop is the lesser fault. The
+# failure is logged.
+function Invoke-HeadSkipCommitTerminal {
+    param(
+        [string]$ThreadId,
+        [string]$StopReason,
+        [string]$HeadMsgId,
+        [string]$StateFilePath
+    )
+
+    $decideScript = Join-Path $repoRoot "scripts\head_skip_decide.py"
+    if (-not (Test-Path -LiteralPath $decideScript)) {
+        return @{ ok = $false; error = "head_skip_decide.py not found at $decideScript" }
+    }
+    if ([string]::IsNullOrEmpty($ThreadId)) {
+        return @{ ok = $false; error = "commit-terminal thread_id is empty" }
+    }
+    $payload = @{
+        thread_id   = $ThreadId
+        reason      = $StopReason
+        head_msg_id = $HeadMsgId
+    }
+    $payloadJson = ConvertTo-Json -InputObject $payload -Depth 4 -Compress
+
+    try {
+        Push-Location $repoRoot
+        try {
+            $raw = & uv run python $decideScript `
+                --state-file $StateFilePath --mode commit-terminal --payload $payloadJson 2>&1
+            $code = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+    }
+    catch {
+        return @{ ok = $false; error = "head_skip commit-terminal invocation failed: $($_.Exception.Message)" }
+    }
+    if ($code -ne 0) {
+        $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
+        return @{ ok = $false; error = "head_skip commit-terminal exited ${code}: $tail" }
+    }
+    return @{ ok = $true; error = $null }
+}
+
 # Read the head-skip mode from the environment. Named after the CLI's REPORT_MODE_ENV constant
 # so a `git grep MINDWIRE_HEADSKIP_MODE` finds both sides. Values: "decide" (default) or
 # "report" (dry-run: the CLI computes verdicts but writes nothing on disk, and the wrapper does
@@ -3515,6 +3571,17 @@ try {
         # candidate we did not act on would reproduce the exponential-starvation loop #140 was
         # written to fix. See head_skip_decide.py's docstring for the two-phase protocol.
         $sweepSignature += "$($cand.key)=$($verdict.last_msg)"
+
+        # Design §6.2: record (or clear) this thread's terminal stop. A `no_progress_to_human`
+        # or `self_handoff_to_human` run parks the thread until its head moves — head_skip's
+        # Stage 1b then SKIPs it instead of DEFERring, which is what ends the 72-retry spin
+        # measured on T-human-outage-degrade-close-only. Every other reason clears the state.
+        $terminalResult = Invoke-HeadSkipCommitTerminal -ThreadId $thread `
+            -StopReason $verdict.reason -HeadMsgId $verdict.last_msg `
+            -StateFilePath $headSkipStatePath
+        if (-not $terminalResult.ok) {
+            Write-Log "head_skip commit-terminal FAILED for $($cand.key) — $($terminalResult.error) (sweep CONTINUES: the thread stays on the ordinary backoff)"
+        }
 
         if ($verdict.reason -and $needsHuman.ContainsKey($verdict.reason)) {
             # Signature carries the reason too, so a thread that changes *how* it is stuck re-alerts

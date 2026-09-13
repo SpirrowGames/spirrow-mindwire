@@ -80,6 +80,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
 from ..github.client import CheckRollup, PrRef, ReviewEvent, parse_pr_ref
+from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
+from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
 from ..routing import GuardIVerdict, guard_proposer_to_implementer
 from ..source_marker import parse_attestation_marker
@@ -162,6 +164,12 @@ class StopReason(StrEnum):
     SETTLED = "none"  # NEXT: none — thread settled
     NO_HANDOFF = "no_handoff_to_human"  # Obj3: missing / unparseable NEXT → human fallback
     NO_PROGRESS = "no_progress_to_human"  # dispatched role posted nothing new → human fallback
+    # The head's handoff names its own author (``author == next``). Design §6.1: this used to be
+    # discovered one layer down, in the adapter's ``deliver_event`` self-filter, which returned in
+    # silence — the session was spawned, ``query()`` never ran, no reply was posted, and the round
+    # ended on NO_PROGRESS. Measured on two threads that sat that way for days at one retry per
+    # hour. Detecting it in ``_route`` means the spawn never happens and the stop names its cause.
+    SELF_HANDOFF = "self_handoff_to_human"
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
     HOLD = "hold"  # the project's loop control state is `hold` (or could not be read)
@@ -208,6 +216,7 @@ class Conductor:
         force_naysayer_only_on_explicit_human: bool = False,
         control: LoopControl | None = None,
         rollup_source: CheckRollupSource | None = None,
+        identity_embodiment: Mapping[str, str] | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -243,6 +252,12 @@ class Conductor:
         # source IS wired but cannot read (see ``_admit``), so "admission is off" and "admission
         # could not see" produce the same, already-shipped behaviour rather than two new ones.
         self._rollup_source = rollup_source
+        # ADR-2026-09-14-21 D-2 / D-3: identities the conductor must NOT spawn, by embodiment.
+        # Merged over the ADR's shipped default (Fermi = web_ai_chat) so a loop host that never
+        # wrote the config line still refuses to spawn-attempt a web identity. An identity absent
+        # from the table is spawnable — the roster is already the operator's statement that these
+        # personas are driven from here (see :mod:`..identity.embodiment`).
+        self._embodiments = normalize_embodiment_table(identity_embodiment)
         # Cost lever (default off = baseline Obj2): force the naysayer consult only on an explicit
         # ``NEXT: human`` (real Tier-C handoff), not on a guard-(i) redirect or an ABSENT / Q-A
         # un-routed turn. Narrows WHICH terminals force a consult; the per-segment single-consult
@@ -468,6 +483,14 @@ class Conductor:
                     f"§6 invariant broken: NO_HANDOFF on msg with next_participant set "
                     f"(msg={latest_msg_id!r}, field={_next_participant(latest)!r})"
                 )
+                # Leave the reason in the thread for the stops whose cause is not readable from
+                # the head itself (§6.1 / §6.4). The posted id becomes ``last_msg_id`` — the same
+                # treatment the R3/R5 admission escalation gets — so the sweep records the stop
+                # against the message a human will actually open.
+                notice = self._terminal_notice(handoff, _author(latest), stop_reason)
+                if notice is not None:
+                    posted = await self._post_as_relay(notice)
+                    latest_msg_id = _msg_id(posted) or latest_msg_id
                 return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
             if is_forced:
                 forced += 1
@@ -513,6 +536,53 @@ class Conductor:
         """
         author = _author(messages[-1])
         author_role = self._roster_role(author)
+
+        # Spawnability (ADR-2026-09-14-21 D-2 / D-3), decided BEFORE every other branch so it
+        # cannot be reached around: an identity whose embodiment is not ``terminal_coding_agent``
+        # has no adapter that could run it, and writing one for ``web_ai_chat`` is the ガワ方式
+        # ADR-2026-05-31-14 withdrew. The token is checked, not just the resolved roster identity,
+        # so a nomination of a non-roster web identity (which resolves to ABSENT, or to an
+        # unresolvable field) is caught here rather than falling into the Obj3 fallback and
+        # arriving at the human with "NEXT: could not be read" — a true statement that names the
+        # wrong cause.
+        #
+        # The stop is ``StopReason.HUMAN``: the ADR says ``NEXT: Fermi`` is the same stop
+        # condition as ``NEXT: human``, and an operator's notification set is keyed on the reason
+        # string. What it deliberately does NOT do is route through :meth:`_human_terminal`, i.e.
+        # it does not force an Obj2 naysayer consult first. That consult exists to put an
+        # independent review in front of an *un-reviewed agent proposal* before a human approves
+        # it; a nomination nobody can start is a routing dead end, not a proposal. Forcing a
+        # Gemini call on it would spend the review budget on a turn that has nothing to review,
+        # and it would also delay the thread post below by a round.
+        if (blocked := self._spawn_blocked(handoff)) is not None:
+            identity, embodiment = blocked
+            logger.warning(
+                "conductor spawn-unavailable target: identity=%s embodiment=%s kind=%s "
+                "→ stopping at the human (ADR-2026-09-14-21 D-3)",
+                identity,
+                embodiment,
+                handoff.kind.value,
+            )
+            return None, "", False, False, StopReason.HUMAN
+
+        # Self-handoff (design §6.1): the head hands to its own author. Detected here, before
+        # ``spawn_instance``, because one layer down the adapter's self-filter drops the delivery
+        # in silence — the session is spawned, ``query()`` is never called, nothing is posted, and
+        # the round ends on NO_PROGRESS with no statement of what happened. Measured on
+        # spirrow-magickit/T-human-outage-degrade-close-only (head msg-244, author=Bohr,
+        # next=Bohr) and spirrow-mindwire/T-scoped-driver-verdict-never-reaches-chatroom (head
+        # msg-2775, same shape): 72 retries, no reply, no record, $0 spent and nothing learned.
+        #
+        # Only ROLE handoffs can self-hand: HUMAN / NONE stop anyway, PR_REVIEW routes by verdict
+        # rather than by name, and ABSENT has no target to compare against.
+        if handoff.kind is HandoffKind.ROLE and self._is_self_handoff(handoff, author):
+            logger.warning(
+                "conductor self-handoff: author=%s hands to itself (target=%s) "
+                "→ stopping for a human, not spawning",
+                author,
+                handoff.identity,
+            )
+            return None, "", False, False, StopReason.SELF_HANDOFF
 
         # guard (i): design→implement Tier-C gate. The predicate itself lives in
         # :mod:`spirrow_mindwire.routing` (T-operator-board msg-2544 §C-3 single-source extraction);
@@ -589,6 +659,85 @@ class Conductor:
             # ABSENT / Q-A is a non-explicit-human terminal → saveable.
             return self._naysayer_role, self._naysayer_identity, True, True, None
         return None, "", False, False, StopReason.NO_HANDOFF
+
+    def _spawn_blocked(self, handoff: Handoff) -> tuple[str, str] | None:
+        """``(identity, embodiment)`` when ``handoff`` names a target that must not be spawned.
+
+        Pure, and the single definition of the rule: :meth:`_route` acts on it and
+        :meth:`_terminal_notice` re-derives the same answer to write the thread record, so the
+        two can never disagree about why a turn stopped.
+
+        ``handoff.identity`` (the roster's canonical spelling) is preferred over ``handoff.token``
+        (what the author typed) when both are present, but the token is what makes the check work
+        for an identity that is deliberately NOT in the roster — which is the normal case for a
+        web identity, since a roster entry means "this daemon drives this persona".
+        """
+        if handoff.kind in (HandoffKind.NONE, HandoffKind.PR_REVIEW):
+            return None
+        name = handoff.identity or handoff.token or ""
+        embodiment = blocked_embodiment(name, self._embodiments)
+        return None if embodiment is None else (name, embodiment)
+
+    def _is_self_handoff(self, handoff: Handoff, author: str) -> bool:
+        """Does ``handoff`` hand back to ``author``?
+
+        Compared on ADR-2026-05-29-11 partition keys, not raw strings: ``Bohr`` handing to
+        ``bohr`` is the same self-handoff, and the adapter's own self-filter one layer down
+        compares instance ids that have been through the same normalisation on the way in.
+        A comparison that missed on case would leave exactly the silent path this check exists
+        to close.
+        """
+        target = handoff.identity or ""
+        if not target or not author:
+            return False
+        return normalize_identity_key(target) == normalize_identity_key(author)
+
+    def _terminal_notice(self, handoff: Handoff, author: str, reason: StopReason) -> str | None:
+        """The body to leave in the thread for a stop a reader could not otherwise explain.
+
+        ``None`` for every stop that already explains itself: ``NEXT: human`` is the author's own
+        statement, ``NEXT: none`` is a settle, NO_HANDOFF is visible in the head the human is
+        about to read, and CI_WAIT posts nothing by design (§5.2A.5).
+
+        The two that DO need a record are the two this change adds, and for the same reason: the
+        thread's own text says a participant was nominated, and the truth is that nobody was
+        started. Without a line saying so, the human opens a thread whose last message asks for
+        work and finds no evidence that anything happened at all — which is what "静かに止まる"
+        cost on the two measured threads.
+
+        The body ends on ``NEXT: human`` deliberately. It is the honest handoff (a person has to
+        act), and it is also what parks the sweep: ``head_skip``'s Stage 1 SKIPs a head whose
+        token is a stop token, so this post ends the retry loop instead of becoming its next
+        input.
+        """
+        if reason is StopReason.SELF_HANDOFF:
+            return (
+                f"Conductor stop — 自己ハンドオフ (author == next)\n\n"
+                f"head の author は `{author}` で、その `NEXT:` も "
+                f"`{handoff.identity}` を指しています。"
+                f"自分自身へのハンドオフは進行しません "
+                f"(セッションを起こしても、配送側の自己フィルタが自分の投稿を落とすため"
+                f"何も起きない)。\n\n"
+                f"∴ spawn せず、人間の介入が必要な停止として扱いました。\n\n"
+                f"次にやること: このスレッドの head に、別の参加者を指す `NEXT:` を書くか、"
+                f"`NEXT: human` で明示的に預けてください。head が動くまでループは再開しません。\n\n"
+                f"NEXT: {HUMAN_TOKEN}"
+            )
+        blocked = self._spawn_blocked(handoff)
+        if blocked is not None:
+            identity, embodiment = blocked
+            return (
+                f"Conductor stop — spawn できない identity への handoff\n\n"
+                f"`NEXT:` は `{identity}` を指していますが、この identity の稼働形態は "
+                f"`{embodiment}` で、Conductor が起動できるのは `terminal_coding_agent` だけです "
+                f"(ADR-2026-09-14-21 D-2 / D-3)。\n\n"
+                f"∴ spawn せず、`NEXT: human` と同じ停止として扱いました。"
+                f"これは特例ではなく、adapter を持たない稼働形態すべてに適用される一般則です。\n\n"
+                f"次にやること: `{identity}` に依頼する内容であれば、その本人が投稿してから"
+                f"スレッドを進めてください。\n\n"
+                f"NEXT: {HUMAN_TOKEN}"
+            )
+        return None
 
     def _human_terminal(
         self, messages: list[dict[str, Any]], *, explicit_human: bool = True

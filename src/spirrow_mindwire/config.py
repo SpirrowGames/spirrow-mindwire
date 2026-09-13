@@ -371,6 +371,22 @@ class ConductorConfig(_StrictModel):
     :class:`~spirrow_mindwire.conductor.core.Conductor` ctor default (PR-2b-3 D-2); a turn that does
     not converge to ``NEXT: human`` / ``none`` within this many rounds stops at the round cap.
     """
+    identity_embodiment: dict[str, str] = Field(default_factory=dict)
+    """Identities the conductor must NOT spawn, by稼働形態 (ADR-2026-09-14-21 D-2 / D-3).
+
+    ``{"Fermi": "web_ai_chat"}`` shape; the values are Prismind's ``embodiment`` enum
+    (``web_ai_chat`` / ``terminal_coding_agent`` / ``unknown``). Anything other than
+    ``terminal_coding_agent`` means "no adapter here can start this" and a ``NEXT:`` naming it
+    stops at the human instead of spawning.
+
+    The ADR's own entry (Fermi) ships as a default in
+    :data:`~spirrow_mindwire.identity.embodiment.DEFAULT_IDENTITY_EMBODIMENT` and does NOT need
+    to be repeated here — a loop host that never wrote this block still refuses to spawn Fermi.
+    Entries here are merged OVER the defaults on the normalised key, so this is also how a
+    shipped default would be corrected without a release. An identity named in neither is
+    spawnable: the roster is already the operator's statement that a persona is driven from
+    here."""
+
     force_naysayer_only_on_explicit_human: bool = False
     """Cost lever: when True, the conductor forces an Obj2 naysayer consult ONLY on an explicit
     ``NEXT: human`` (the genuine Tier-C handoff) — not on a guard-(i) design→implement redirect

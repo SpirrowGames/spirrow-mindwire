@@ -631,6 +631,9 @@ def build_conductor(
             human_identity=cond_cfg.human_identity,
             max_rounds=cond_cfg.max_rounds,
             force_naysayer_only_on_explicit_human=cond_cfg.force_naysayer_only_on_explicit_human,
+            # ADR-2026-09-14-21: merged over the shipped default inside the Conductor, so an
+            # empty config block is the ADR's behaviour rather than "spawn anything named".
+            identity_embodiment=dict(cond_cfg.identity_embodiment),
             orchestrator=orchestrator,
             # Per-project loop control (Part C). Keyed on ``[loop].project`` — the same key the
             # sweep rewrites per candidate — so one daemon invocation controls exactly the project

@@ -80,14 +80,19 @@ Check 'caller $ErrorActionPreference is unchanged after dot-source' $eapBefore $
 # ---------------------------------------------------------------------------------------
 Write-Host 'Get-StopReasonPhraseMap — returns the expected KEY SET (the notification predicate)'
 $map = Get-StopReasonPhraseMap
-# NB: the five keys are intentionally hard-coded HERE (and only here) because this is the
+# NB: the keys are intentionally hard-coded HERE (and only here) because this is the
 # one place where "which reasons need a notification" is a fact we want the test to fail on
 # if silently narrowed. Wording is NOT hard-coded — only the enum-like key set.
-$expectedKeys = @('human', 'no_handoff_to_human', 'no_progress_to_human', 'round_cap', 'empty_thread')
+#
+# 2026-09-14 (design §6.1): grew from five to six with 'self_handoff_to_human'. The count
+# assertion is here to catch a silent NARROWING; a widening is a deliberate act and updating
+# this line is the act. A new conductor StopReason that needs a notification belongs in the
+# map AND in this list.
+$expectedKeys = @('human', 'no_handoff_to_human', 'no_progress_to_human', 'self_handoff_to_human', 'round_cap', 'empty_thread')
 foreach ($k in $expectedKeys) {
     CheckTrue "map has key '$k'" ($map.ContainsKey($k))
 }
-Check 'map has exactly 5 keys (narrowing = notification loss, §4 §W-4)' 5 $map.Count
+Check 'map has exactly 6 keys (narrowing = notification loss, §4 §W-4)' 6 $map.Count
 
 Write-Host 'Get-StopReasonPhraseMap — returns a fresh hashtable each call (no shared state)'
 $m1 = Get-StopReasonPhraseMap

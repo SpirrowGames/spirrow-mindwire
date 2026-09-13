@@ -8,6 +8,7 @@ exception mapping without spinning up the real CLI.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -485,6 +486,46 @@ async def test_own_role_self_filter_skips(tmp_path: Path) -> None:
     await adapter.deliver_event(handle, _event(author="proposer-1"))
     assert captured == []
     assert client.queries == []
+
+
+@pytest.mark.anyio
+async def test_self_filter_drop_is_logged_not_silent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Design §6.1: the filter stays, the silence does not.
+
+    This return is where the self-handoff stall hid — the session was spawned, the delivery was
+    dropped here without a word, and the round ended on NO_PROGRESS with nothing anywhere saying
+    why. The conductor now refuses to route a self-handoff at all, so reaching here means
+    something routed one anyway, which is exactly when a human has to be able to find out.
+    """
+    client = _FakeClient([_assistant("x"), _result()])
+    captured: list[ReplyDraft] = []
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx(captured))
+
+    with caplog.at_level(logging.WARNING, logger="spirrow_mindwire.adapters.claude_code_sdk"):
+        await adapter.deliver_event(handle, _event(author="proposer-1"))
+
+    assert client.queries == [], "still dropped — this is not a behaviour change"
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+    assert "proposer-1" in caplog.records[0].getMessage()
+
+
+@pytest.mark.anyio
+async def test_non_new_message_drop_is_logged_not_silent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = _FakeClient([_assistant("x"), _result()])
+    captured: list[ReplyDraft] = []
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx(captured))
+
+    with caplog.at_level(logging.WARNING, logger="spirrow_mindwire.adapters.claude_code_sdk"):
+        await adapter.deliver_event(handle, _event(event_type=EventType.THREAD_CLOSED))
+
+    assert client.queries == []
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
 
 
 @pytest.mark.anyio

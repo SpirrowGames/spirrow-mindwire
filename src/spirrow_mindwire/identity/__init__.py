@@ -2,6 +2,10 @@
 
 Two responsibilities, kept small:
 
+- :mod:`.embodiment` — the ADR-2026-09-14-21 spawnability rule: which
+  identities the conductor may start a session for (embodiment =
+  ``terminal_coding_agent``) and which it must hand to a human instead.
+
 - :mod:`.normalize` — the ADR-2026-05-29-11 partition-key normalisation
   (lowercase + separator collapse to ``-``), applied at every join between a raw
   identity string observed in a message and the classification's canonical name;
@@ -30,6 +34,13 @@ from .classification import (
     derive_allowed_and_residual,
     load_legitimate_roles,
 )
+from .embodiment import (
+    DEFAULT_IDENTITY_EMBODIMENT,
+    EMBODIMENT_VALUES,
+    SPAWNABLE_EMBODIMENT,
+    blocked_embodiment,
+    normalize_embodiment_table,
+)
 from .normalize import (
     IdentityCollisionError,
     find_collisions,
@@ -37,14 +48,19 @@ from .normalize import (
 )
 
 __all__ = [
+    "DEFAULT_IDENTITY_EMBODIMENT",
+    "EMBODIMENT_VALUES",
+    "SPAWNABLE_EMBODIMENT",
     "ClassificationEntry",
     "ClassificationError",
     "DerivationResult",
     "IdentityCollisionError",
     "LegitimateRolesFile",
+    "blocked_embodiment",
     "default_classification_path",
     "derive_allowed_and_residual",
     "find_collisions",
     "load_legitimate_roles",
+    "normalize_embodiment_table",
     "normalize_identity_key",
 ]

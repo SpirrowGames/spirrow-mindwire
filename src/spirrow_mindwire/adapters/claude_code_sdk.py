@@ -28,6 +28,7 @@ Option (i)), never duplicated into ``HealthStatus.details`` (I2).
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -72,6 +73,8 @@ from ._sdk_result import (
     capture_is_error_detail,
     emit_sdk_error_marker,
 )
+
+logger = logging.getLogger(__name__)
 
 # A session that is halting or terminal (ADR-06 §4 I8). For these states
 # halt() is an idempotent no-op, and deliver_event is rejected (no query()
@@ -416,6 +419,16 @@ class ClaudeCodeSdkAdapter:
             )
         if event.event_type is not EventType.NEW_MESSAGE:
             # Phase 1 handles NEW_MESSAGE only; other event types are no-ops here.
+            #
+            # Logged, not silent (design §6.1): a drop that leaves no trace is how the
+            # self-handoff stall stayed invisible for days — the round ended on NO_PROGRESS and
+            # nothing anywhere said WHY nothing was delivered. The delivery is still dropped;
+            # only the silence is removed.
+            logger.warning(
+                "deliver_event dropped: session=%s event=%s is not NEW_MESSAGE (no-op in Phase 1)",
+                handle.session_id,
+                event.event_type.value,
+            )
             return
         payload = event.payload
         if payload.author == handle.instance_id:
@@ -424,6 +437,19 @@ class ClaudeCodeSdkAdapter:
             # "proposer-1"), so the filter compares against our instance_id, not
             # the bare role. Defends against a dispatcher routing bug causing a
             # self-reply loop.
+            #
+            # This is the return that hid the self-handoff stall (design §6.1). The conductor
+            # now refuses to spawn a self-handoff at all, so reaching here means something
+            # routed one anyway — which is exactly when a human needs to be able to find out.
+            # The filter stays (it is the last line of defence against a self-reply loop); the
+            # silence does not.
+            logger.warning(
+                "deliver_event dropped: session=%s event=%s author=%s is this instance itself "
+                "(self-filter). Nothing was delivered and no reply will be posted.",
+                handle.session_id,
+                event.event_id,
+                payload.author,
+            )
             return
 
         session.state = SessionState.PROCESSING

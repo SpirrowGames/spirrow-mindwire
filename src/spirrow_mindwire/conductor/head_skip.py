@@ -127,6 +127,20 @@ HEAD_CACHE_TTL: timedelta = timedelta(minutes=60)
 # instead of a quiet park). Any change here needs a test change and an ADR reference.
 STOP_TOKENS: frozenset[str] = frozenset({NONE_TOKEN, HUMAN_TOKEN})
 
+# Conductor stop reasons that TERMINATE a thread until its head moves (design §6.2).
+#
+# These are not stop *tokens* — the head still says ``NEXT: Bohr``, which is exactly the problem.
+# A ``no_progress_to_human`` stop means the nominated participant was started and posted nothing,
+# and re-running the same head produces the same nothing: Stage 2 rightly sees no progress, backs
+# off, and retries forever at CAP (measured: 72 DEFER(3600s) retries on one thread). Backoff is a
+# floor on the launch RATE and by design never terminates, so the fix cannot live in Stage 2.
+# It lives here, as a separate stage keyed on a recorded outcome plus the head msg id.
+#
+# Values are the string form of :class:`spirrow_mindwire.conductor.core.StopReason` members. The
+# link is pinned by a test rather than an import: this module is loaded by the sweep CLI, which
+# has no business importing the conductor (and its GitHub / MCP dependencies) to read two strings.
+TERMINAL_STOP_REASONS: frozenset[str] = frozenset({"no_progress_to_human", "self_handoff_to_human"})
+
 
 class Decision(StrEnum):
     """The three possible verdicts for a single candidate on a single tick."""
@@ -212,6 +226,21 @@ class Record:
           evaluation. Used by the caller to synthesise the head body on a cache hit
           (``NEXT: {last_observed_nomination}`` re-parses to the same token, so :func:`decide`
           reaches the same verdict without a network fetch).
+      terminal_stop_reason / terminal_head_msg_id
+          The third family (design §6.2), and the only one written from the conductor's
+          **outcome** rather than from a probe: the reason a run terminated and the head it
+          terminated on. Set by :func:`commit_terminal` after a run whose reason is in
+          :data:`TERMINAL_STOP_REASONS`; cleared by :func:`commit_launch`. Together they answer
+          the one question Stage 2 cannot: "did we already run this exact head and learn that
+          running it achieves nothing?"
+
+          This is the one place head msg-id equality is load-bearing, and it does NOT contradict
+          the rule stated above for :func:`decide`'s progression check. There, two different
+          msg-ids saying ``NEXT: Bohr`` are the same scheduling input, so head-id equality would
+          be the wrong progress signal. Here the question is the opposite one — not "has the
+          nomination changed?" but "has ANYTHING at all happened since the run that got us
+          nowhere?" — and for that, head msg-id is exactly the right key: any new message,
+          whatever it says, is new input.
     """
 
     last_launch_at: datetime | None = None
@@ -222,6 +251,8 @@ class Record:
     head_observed_at: datetime | None = None
     last_observed_head_msg_id: str = ""
     last_observed_nomination: str = ""
+    terminal_stop_reason: str = ""
+    terminal_head_msg_id: str = ""
 
 
 # --- Parser --------------------------------------------------------------------------------------
@@ -325,6 +356,40 @@ def decide(
             progressed=False,
             attempts_before=record.launch_attempts if record else 0,
             attempts_after=record.launch_attempts if record else 0,
+            delay=timedelta(0),
+            eligible_at=None,
+        )
+
+    # --- Stage 1b: terminal-outcome judgment (design §6.2). Reads the recorded outcome + the
+    # head msg id, and NOTHING else. ------------------------------------------------------------
+    #
+    # A run that ended in :data:`TERMINAL_STOP_REASONS` learned that this exact head goes
+    # nowhere. Until the head moves, re-launching buys another identical nothing. Stage 2 cannot
+    # express that — its backoff is a rate floor that never terminates, which is correct for a
+    # thread that is merely slow and wrong for one that is finished until a person acts.
+    #
+    # Deliberately a SEPARATE stage rather than an addition to :data:`STOP_TOKENS`: that set is
+    # closed on purpose (a nomination the sweep must not chase), and widening it would put a
+    # scheduling outcome into a vocabulary about handoff targets. The two skip surfaces stay
+    # independent, and each keeps its own reason string in the verdict.
+    #
+    # ``attempts`` is preserved, not reset: the record still says how many times this thread was
+    # launched without progress, which is the audit trail for how long the spin ran before it was
+    # terminated. It is simply no longer the input to a retry.
+    if (
+        record is not None
+        and record.terminal_stop_reason in TERMINAL_STOP_REASONS
+        and record.terminal_head_msg_id != ""
+        and record.terminal_head_msg_id == head_msg_id
+    ):
+        return Verdict(
+            decision=Decision.SKIP,
+            reason=f"terminal-stop:{record.terminal_stop_reason}",
+            token=token,
+            token_raw=raw,
+            progressed=False,
+            attempts_before=record.launch_attempts,
+            attempts_after=record.launch_attempts,
             delay=timedelta(0),
             eligible_at=None,
         )
@@ -493,6 +558,10 @@ def commit_launch(
         obs_head_msg_id = prior_record.last_observed_head_msg_id if prior_record else ""
         obs_nomination = prior_record.last_observed_nomination if prior_record else ""
         obs_at = prior_record.head_observed_at if prior_record else None
+    # The terminal fields are deliberately NOT carried forward: a LAUNCH means the head moved off
+    # whatever we terminated on (or an operator forced one), so the old outcome no longer
+    # describes this thread. Leaving them set would make the NEXT run's own outcome ambiguous —
+    # is the record's terminal head the one we just ran, or a stale one from two heads ago?
     return Record(
         last_launch_at=now,
         nomination_at_launch=verdict.token,
@@ -548,6 +617,51 @@ def commit_observation(
         head_observed_at=now,
         last_observed_head_msg_id=head_msg_id,
         last_observed_nomination=token,
+        # Carried, not dropped. An observation is not an outcome: the SKIP this function is most
+        # often called after IS the terminal skip, so rebuilding the record without these two
+        # fields would erase the terminal state on the very next tick and re-open the retry loop
+        # this stage exists to close.
+        terminal_stop_reason=record.terminal_stop_reason,
+        terminal_head_msg_id=record.terminal_head_msg_id,
+    )
+
+
+def commit_terminal(
+    *,
+    reason: str,
+    head_msg_id: str,
+    record: Record | None,
+) -> Record:
+    """Record that a conductor run ended on ``head_msg_id`` with a terminal ``reason``.
+
+    Phase 3 of the sweep protocol (design §6.2), called AFTER the session returns — unlike
+    :func:`commit_launch`, which must be called before it. The asymmetry is intended: a launch
+    has to be recorded even if the session is killed mid-flight, whereas a terminal outcome by
+    definition only exists once there is an outcome to read.
+
+    A ``reason`` outside :data:`TERMINAL_STOP_REASONS` **clears** the terminal fields rather than
+    raising. Every other stop reason is a statement that this head is still live (``human``
+    parks on a stop token, ``ci_wait`` is waiting on GitHub, ``hold`` is the operator's), and the
+    honest record for those is "no terminal outcome" — leaving a stale one set would keep a
+    thread parked on an outcome that has since been superseded. Giving the caller one
+    unconditional call to make after every run is also what keeps the wrapper simple enough to
+    get right.
+    """
+    terminal = reason in TERMINAL_STOP_REASONS
+    base = record if record is not None else Record()
+    return Record(
+        last_launch_at=base.last_launch_at,
+        nomination_at_launch=base.nomination_at_launch,
+        control_at_launch=base.control_at_launch,
+        head_msg_id_at_launch=base.head_msg_id_at_launch,
+        # Preserved (design §6.2: "attempts カウンタは記録として残す"). The counter is the audit
+        # trail of how long the spin ran; it is simply no longer the input to a retry.
+        launch_attempts=base.launch_attempts,
+        head_observed_at=base.head_observed_at,
+        last_observed_head_msg_id=base.last_observed_head_msg_id,
+        last_observed_nomination=base.last_observed_nomination,
+        terminal_stop_reason=reason if terminal else "",
+        terminal_head_msg_id=head_msg_id if terminal and head_msg_id else "",
     )
 
 
@@ -616,6 +730,8 @@ def record_to_json(record: Record) -> dict[str, Any]:
         "head_observed_at": _iso(record.head_observed_at),
         "last_observed_head_msg_id": record.last_observed_head_msg_id,
         "last_observed_nomination": record.last_observed_nomination,
+        "terminal_stop_reason": record.terminal_stop_reason,
+        "terminal_head_msg_id": record.terminal_head_msg_id,
     }
 
 
@@ -640,6 +756,8 @@ def record_from_json(data: dict[str, Any] | None) -> Record | None:
         head_observed_at=_parse_iso(data.get("head_observed_at")),
         last_observed_head_msg_id=str(data.get("last_observed_head_msg_id") or ""),
         last_observed_nomination=str(data.get("last_observed_nomination") or ""),
+        terminal_stop_reason=str(data.get("terminal_stop_reason") or ""),
+        terminal_head_msg_id=str(data.get("terminal_head_msg_id") or ""),
     )
 
 
