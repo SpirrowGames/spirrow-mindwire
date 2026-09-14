@@ -2000,6 +2000,7 @@ function Push-DecisionMaterial {
         [string]$Signature,
         [string]$Project,
         [string]$ThreadId,
+        [string]$StopReason,
         $Envelope
     )
 
@@ -2079,6 +2080,19 @@ function Push-DecisionMaterial {
         signature       = $Signature
         composer_status = 'ok'
     }
+    # Why the conductor stopped, as the bare StopReason token. magickit renders it on the
+    # やること board card so a Tier-C decision and a `round_cap` anomaly stop looking alike
+    # (magickit spec S5-decision-materials.md §1.1).
+    #
+    # It is also inside `$Signature` -- that string is "$reason:$last_msg" -- but the receiver
+    # is forbidden to parse that field ("Magickit は parse しない", same §1.1). Sending the
+    # reason as its own field is what lets the reader have it without reading our signature
+    # format, which we are free to respell.
+    #
+    # Guarded with IsNullOrEmpty, not `if ($StopReason)`: same PowerShell trap the question /
+    # recommendation lines below carry a comment about. No StopReason token is the string "0"
+    # today, but the guard costs nothing and the next one might be.
+    if (-not [string]::IsNullOrEmpty($StopReason)) { $body['stop_reason'] = "$StopReason" }
     # PR #171 pre-merge review round 2: the guard here must NOT use `if ($x)`. PowerShell
     # evaluates the string literal `"0"` as $false under implicit boolean cast, so a composer
     # output where `question` or `recommendation` or `recommendation_reason` equals "0"
@@ -2519,7 +2533,7 @@ function Send-HumanParkAlert {
     # STEP 2 (D-34: ①→②) — material PUT BEFORE the notification. Its failure is logged and
     # discarded; the notification body below does NOT branch on it.
     $null = Push-DecisionMaterial -NotifyState $NotifyState -Key $Key -Signature $Signature `
-        -Project $Project -ThreadId $ThreadId -Envelope $envelope
+        -Project $Project -ThreadId $ThreadId -StopReason $StopReason -Envelope $envelope
 
     $enriched = Format-DecisionMessage -Project $Project -ThreadId $ThreadId `
         -StopReason $StopReason -Rounds $Rounds `

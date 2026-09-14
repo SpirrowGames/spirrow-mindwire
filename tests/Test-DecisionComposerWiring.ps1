@@ -667,6 +667,43 @@ Check 'PUT body carries composer-read head_msg_id' 'msg-777' $sentBody.head_msg_
 Check 'PUT body carries the signature (magickit stores it opaquely)' 'human:msg-1' $sentBody.signature
 Check 'PUT body carries composer_status=ok' 'ok' $sentBody.composer_status
 Check 'PUT body carries the question' 'Adopt A or B?' $sentBody.question
+# The reason is sent as its own field, NOT left for the receiver to split out of the
+# signature -- magickit spec S5-decision-materials.md §1.1 forbids parsing that field.
+Check 'PUT body carries the stop reason as its own field' 'human' $sentBody.stop_reason
+
+# ---------- (a2) the stop reason travels, and an absent one is omitted ------------------------
+Write-Host ''
+Write-Host '(a2) Push-DecisionMaterial — stop_reason is carried per-reason, omitted when absent'
+foreach ($reason in @('human', 'no_progress_to_human', 'round_cap', 'empty_thread')) {
+    Reset-MaterialSpy
+    $pending = @{}
+    $notified = @{}
+    $script:composerCallCount = 0
+    $script:composerReturn = @{ ok = $true; envelope = $freshEnvelope; error = $null }
+    Send-HumanParkAlert -PendingDecisionsState $pending -NotifyState $notified `
+        -Key "p/T-$reason" -Project 'p' -ThreadId "T-$reason" `
+        -Signature "${reason}:msg-1" -LastMsgId 'msg-777' `
+        -StopReason $reason -Rounds 3 -RawFallback 'raw ping'
+    $b = $script:materialLastCall.BodyJson | ConvertFrom-Json
+    # Every reason travels verbatim. The wrapper does not decide which ones are "interesting"
+    # -- that is the reader's call, and a filter here would silently withhold a reason the
+    # board is ready to show.
+    Check "PUT body carries stop_reason=$reason" $reason $b.stop_reason
+}
+
+# Called directly rather than through Send-HumanParkAlert: the absent-reason case is about
+# the PUT body alone, and routing it through the alert would also drive the notification
+# header off a reason it never sees in production, testing two things at once.
+Reset-MaterialSpy
+Push-DecisionMaterial -NotifyState @{} -Key 'p/T-noreason' -Signature 'human:msg-1' `
+    -Project 'p' -ThreadId 'T-noreason' -StopReason '' -Envelope $freshEnvelope | Out-Null
+$bNone = $script:materialLastCall.BodyJson | ConvertFrom-Json
+# Omitted, not sent as "". The receiver stores NULL and the card shows no reason, which is
+# the truthful rendering of "we did not record one" -- an empty string would print as a
+# reason whose name is blank.
+CheckTrue 'an empty stop reason is omitted from the PUT body' `
+    (-not ($bNone.PSObject.Properties.Name -contains 'stop_reason')) `
+    ("keys=[" + (($bNone.PSObject.Properties.Name) -join ',') + "]")
 
 # --------- (b) fail-open: a throwing / 4xx / 5xx PUT does NOT change the notification --------
 Write-Host ''
