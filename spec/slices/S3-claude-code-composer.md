@@ -166,11 +166,13 @@ historical reference; the v2 revision layers D-46 rev2 through D-53 rev2 on
 top of these five, described in §D-46..§D-53 below):
 
 1. You do not decide. You phrase.
-2. At least 2 options, each with `id`, `label`, `gain`, `loss`.
+2. At least 2 options, each with `id`, `label`, `gain`, `loss`. **The axis
+   of the options is the problem, not the participants** — see §D-55.
 3. Exactly one recommendation (or none). If given, its reason MUST cite a
    concrete fact from the tail (a msg-id, a number, a quoted phrase). General
    platitudes ("A is safer overall") violate the rule.
-4. Unknowns are declared as unknown. Do not fill.
+4. Unknowns are declared as unknown. Do not fill. **Only unknowns that could
+   change which option is right** — see §D-56.
 5. Output is JSON only, matching the specified schema. Prose outside JSON
    is a violation.
 
@@ -205,6 +207,33 @@ The forced (a)/(b) branch removes the option to invent.
 same failure mode applies to code identifiers (§D-51 below). Both use the
 identical (a)/(b) branch so the model sees one pattern rather than two
 different mechanisms.
+
+### D-46 rev3 — the reader is the project's OWNER (2026-09-14, prompt v3)
+
+**What rev2 got right and rev3 keeps**: the (a)/(b) branch above, unchanged.
+The thread's interior — its internal labels and its code identifiers — is
+still opaque to the reader and still has to be glossed. That is the part
+that was always load-bearing.
+
+**What rev2 got wrong**: it described the reader only by what they had NOT
+read ("the Discord reader has NOT read the thread"), and the prompt turned
+that into a reader who knows nothing at all. Measured 2026-09-14 on a live
+request, the composer opened with *"This thread is investigating why 18
+quarantined work items in **a system called spirrow-mindwire** stopped…"* —
+it was explaining the project to the person who owns it. The same request
+carried 12 unknowns, one of which was *"Whether Takahito, named as the
+person who decides quarantine release, is the reader of this decision
+request"*.
+
+**Rule**: the reader OWNS these projects. They know what the project is,
+what it is for, and who works on it. The prompt states this, and forbids
+introducing the project or defining it. The question starts from the
+problem.
+
+**Why this is not a length rule**: D-48 rev2 stands (§D-48). Nothing here
+asks the model to compress. The text gets shorter only because the project
+explainer and the thread's history stop being written at all — content the
+owner does not need was never a length problem, it was an audience problem.
 
 ## D-47 — "hallucinating is worse than jargon" — rationale note (msg-1442 §28.2)
 
@@ -439,6 +468,72 @@ them would raise the misfire rate without raising the hit rate. If a
 future stop makes a commit the actual decision target, adding it is a
 one-word prompt edit with a `PROMPT_VERSION` bump.
 
+## D-55 — the options' axis is the problem, not the participants (2026-09-14, prompt v3)
+
+**Status**: この節が軸の SOT。**v2 までこの spec には軸を定める行が無く、定義は
+prompt 本文にしか存在しなかった**（`claude_code.py` の `options[].label`）。
+実装だけが持っていた規則をここで初めて明文化する。
+
+**Problem this closes.** v2 の prompt は label を "one sentence naming what the
+reader would DO" と定義していた。このシステムで読み手が「する」ことはエージェント
+の差配なので、モデルは忠実にそう書く。2026-09-14 に本番の判断ページで実測した
+1 件は、4 択すべての主語がエージェントだった:
+
+- A: "Let Bohr proceed as written: dispatch the two Lane 1 measurements to H…"
+- B: "Stop the agent loop and read Bohr's finalized capture specification an…"
+- C: "Have Bohr run only the first measurement, the time-boxed check for whe…"
+- D: "Direct Bohr to settle the disagreement with Einstein about what causes…"
+
+Takahito（唯一の決裁者）の指摘:
+
+> 判断の軸が「誰の意見を採用するか」ってなっているのがおかしいんだよね。僕が判断
+> すべきは誰の意見を採用するかじゃなくて、問題をどう解決するか。結果的に誰かの意見
+> を採用することになるけど、**それは結果であって判断軸じゃない**。
+
+**なぜこれが体裁の問題ではないか。** エージェントを主語にすると、**問題の解き方と
+しては別物である複数の案が、1 つの選択肢（「進めさせる」）に潰れる**。実測の A は
+Bohr が出した技術案 2 つのうち片方を含んでいたが、もう片方は選択肢として現れて
+いない。読み手には比較するものが残らない。さらに B（「止めて自分で読む」）は問題の
+解き方ですらなく、読む行為が解決策の位置に置かれている。
+
+**Rule.** `options[].label` は**問題の解き方**を名指す。主語は問題であって、人でも
+エージェントでもない。誰が実行するかはその選択の結果であり、読み手は**別の口**
+（判断ページの宛先 select）で指定する。`gain` / `loss` は同じ軸の上に置く ——
+読み手が選択肢を横に並べて同じ次元で比較できること。
+
+スレッドの参加者が出した提案は、**「X の提案」としてではなく、それが問題に何をするか
+で**記述して選択肢に並べる。tail に実質 1 案しか無いなら、そのことを `question` に
+書き、tail 自身が挙げている代替（何もしないを含む）を同じ書き方で並べる。
+
+**Scope note (D-50 rev2).** 本決定は schema キーを増やさない。`label` の**意味**を
+変えるだけで、キーの改名でも削除でもない ∴ D-50 rev2 の制約に抵触しない。
+
+**Where enforced.** prompt の OUTPUT SHAPE `options[].label` のみ。**機械的な検査は
+無い** —— 「エージェントが主語か」は文字列では判定できず、判定できるふりをした
+テストは §Testing 6a が禁じている false comfort そのものになる。検出経路は A-19 rev2
+の人間による A/B。
+
+## D-56 — unknowns は判断に効くものだけ (2026-09-14, prompt v3)
+
+**Problem this closes.** v2 rule 6 は「tail から検証していないものを**全部**書け」で、
+「空リストが正しいのは tail がこの判断にとって完全なときだけ」と続く。結果、実測の
+1 件は unknowns が **12 件・平均 157 文字**になり、その中には次が含まれていた:
+
+> "Whether Takahito, named as the person who decides quarantine release, is
+> the reader of this decision request."
+
+これは tail の欠落ではなく**composer の指示の欠落**で、しかもその答えは prompt に
+書いてある。読み手は自分が誰かを教えてもらう必要がない。
+
+**Rule.** unknowns に載せるのは「検証しておらず、**かつ、もし違っていたらどの選択肢が
+正しいかが変わりうる**もの」。D-46 rev3 / D-51 の (b) 分岐で落ちたラベル・識別子は
+引き続き載せる（定義されていない語で説明された選択肢は読み手が重み付けできない
+∴ 判断に効く）。**読み手が誰か・読み手の意図・この依頼が何のためか**についての
+unknown は書かない。
+
+**What this does NOT change.** D-39 property 4「Unknowns are declared as unknown.
+Do not fill.」は不変。埋めてよいという話ではなく、**関係ないものを書かない**という話。
+
 ## Prompt-version bump policy (D-49 corollary)
 
 Bumping is a three-edit change, all in the SAME commit as the prompt-text
@@ -460,6 +555,15 @@ row; that needs a comparison against git history, which nothing in the
 suite does. The mapping makes the violation visible in a diff, it does
 not make it impossible. Mechanising it is deliberately OUT OF SCOPE for
 the v2 revision (D-54 follow-up).
+
+**Versions shipped.**
+
+| version | digest | decisions |
+|---|---|---|
+| `2` | `4b7a8119…59859c4` | D-46 rev2 / D-47 / D-48 rev2 / D-49 / D-50 rev2 / D-51 / D-52 / D-53 rev2 |
+| `3` | `00b9fa52…7f74c4b` | **D-55**（軸）/ **D-46 rev3**（読み手は持ち主）/ **D-56**（unknowns） |
+
+v3 は長さ目標を導入しない。D-48 rev2 は不変。
 
 **User-prompt shape**:
 

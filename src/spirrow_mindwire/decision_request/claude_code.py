@@ -115,7 +115,7 @@ latency (I-2 fallback still fires the raw ping; ceiling only bounds how
 long the wrapper waits before falling back).
 """
 
-PROMPT_VERSION = "2"
+PROMPT_VERSION = "3"
 """Bumped whenever the system-prompt text below changes.
 
 Written verbatim to ``envelope.extras["prompt_version"]`` so a future
@@ -138,10 +138,41 @@ the tail supplies one, and refuses to fabricate one from a bare number
 (D-53 rev2 — msg-1464 §30.2). D-49 pins the exact prompt text as a
 sha256 digest tied to this version string; see
 :mod:`tests.test_claude_code_composer` ``TestPromptDigestPin``.
+
+**v3 (D-55 / D-46 rev3 / D-56)**: measured on the live dashboard
+2026-09-14 — every option v2 produced named an *agent* ("Let Bohr
+proceed as written", "Stop the agent loop and read the specification
+yourself", "Direct Bohr to settle the disagreement with Einstein"), so
+the reader was choosing **whose proposal to adopt** rather than **how to
+solve the problem**. Takahito: "僕が判断すべきは誰の意見を採用するかじゃ
+なくて、問題をどう解決するか。結果的に誰かの意見を採用することになるけど、
+それは結果であって判断軸じゃない". v3 (a) redefines ``options[].label``
+as a way to resolve the problem, with the agent-as-subject form named
+and forbidden, and gain/loss required to share one comparable axis
+(D-55); (b) replaces the "has NOT read this thread" reader with the
+project's **owner** — the v2 reader model made the composer gloss the
+project itself ("a system called spirrow-mindwire") while the actual
+reader owns it; the thread-interior gloss of rules 3/4 is unchanged and
+is the part that was always load-bearing (D-46 rev3); (c) narrows
+``unknowns`` from "everything you did NOT verify" to what could change
+which option is right, and forbids unknowns about the reader's own
+identity or intent — v2 emitted 12 unknowns on one request, including
+"Whether Takahito, named as the person who decides quarantine release,
+is the reader of this decision request" (D-56).
+
+**No length target is introduced in v3.** D-48 rev2 removed the numeric
+target because brevity pressure produced text the reader could not
+follow, and that finding stands. The length reduction v3 aims at comes
+from dropping content the owner does not need (the project explainer,
+the thread's history, unknowns that cannot move the decision), not from
+compressing what remains. A separate on-demand summary renders these
+requests short on the dashboard when the reader wants that view, which
+is what removes the last reason to push brevity into this prompt.
 """
 
 PROMPT_DIGESTS: Mapping[str, str] = {
     "2": "4b7a8119a514a14ec9728440958149accf9ff5173457cc9aa438932af59859c4",
+    "3": "00b9fa523f56729135a1208ad9ecafa06adfb4d58405b0e9c40c0a2a87f74c4b",
 }
 """Version string -> ``sha256(_SYSTEM_PROMPT.encode('utf-8')).hexdigest()``
 of the prompt text that shipped under that version.
@@ -435,8 +466,10 @@ class ClaudeCodeComposer:
         """The system prompt. D-39 (a)..(e).
 
         The text is intentionally boring: this is not where a composer
-        gets clever. Every property (does-not-decide, ≥2 options,
-        gain/loss/label, one recommendation with a fact-grounded reason,
+        gets clever. Every property (does-not-decide, ≥2 options, each
+        label naming a way to resolve the problem rather than an agent
+        to dispatch (D-55), gain/loss on one comparable axis, one
+        recommendation with a fact-grounded reason, decision-bearing
         unknowns declared, JSON only) is stated as a hard rule so the
         rejection at the parse stage is unambiguous when a rule breaks.
         """
@@ -774,14 +807,25 @@ def _shape_composer_answer(
 # PROMPT_VERSION, then interpolate — the version-bump-first order is what
 # makes the extras data usable retrospectively.
 #
-# v2 (D-46 rev2 / D-47 / D-48 rev2 / D-49 / D-50 rev2 / D-51 / D-52 /
-# D-53 rev2): see the docstring on ``PROMPT_VERSION`` above, and
+# v3 (D-55 / D-46 rev3 / D-56), on top of v2 (D-46 rev2 / D-47 /
+# D-48 rev2 / D-49 / D-50 rev2 / D-51 / D-52 / D-53 rev2): see the
+# docstring on ``PROMPT_VERSION`` above, and
 # spec/slices/S3-claude-code-composer.md for the specifying rationale.
-# Guiding principle for anyone editing this text: the READER of what the
-# model writes has NOT read this thread — they opened a Discord ping.
-# Understandability beats brevity. Explanations cost sentences, not
-# clauses. Making a term up sounds fluent and is worse than admitting
-# you did not see it.
+#
+# Two guiding principles for anyone editing this text.
+#
+# The READER owns these projects. They have not read this thread, so its
+# internal labels and code identifiers still need glossing — but they do
+# not need the project explained to them. Understandability beats
+# brevity. Explanations cost sentences, not clauses. Making a term up
+# sounds fluent and is worse than admitting you did not see it.
+#
+# The AXIS is the problem, never the people. An option says how the
+# problem gets solved; who carries it out is a consequence the reader
+# routes separately. The moment the options start naming agents, the
+# reader is being asked whose proposal to adopt — which is not a
+# question they can answer from a decision request, and not the one
+# they are trying to answer.
 #
 # D-50 (verbatim-copy prohibition): DO NOT paste the msg-1442 §28.5 or
 # msg-1464 §30.2 fragments in unchanged. The wording below is the
@@ -793,9 +837,14 @@ You are a decision-request composer. You do NOT decide.
 Your role is to phrase a question a human operator will answer. The human
 is the only decision authority. Do not choose, do not merge, do not act.
 
-The person who reads what you write has NOT read this thread. They opened
-a notification. Everything they need to understand the question must be
-in what you produce. Understandability beats brevity. Making a term up
+The person who reads what you write OWNS these projects. They have not
+read this thread, but they know what the project is, what it is for, and
+who works on it. Do NOT explain the project. Do NOT introduce it as "a
+system called X" or say what X is. Start from the problem.
+
+What they do not carry is this thread's interior: the labels that only
+mean something inside it, and the code identifiers it names. Explain
+those (rules 3 and 4). Understandability beats brevity. Making a term up
 sounds fluent and is worse than admitting you did not see it: an unknown
 the reader can see is a smaller problem than a plausible sentence that is
 wrong.
@@ -810,7 +859,7 @@ You must produce exactly one JSON object matching this schema:
 {
   "question": "several plain sentences ending with the decision question",
   "options": [
-    {"id": "A", "label": "one sentence naming what the reader would DO",
+    {"id": "A", "label": "one sentence naming a way to resolve the problem",
      "gain": "what this option gets you", "loss": "what it costs you"},
     {"id": "B", "label": "...", "gain": "...", "loss": "..."}
   ],
@@ -824,7 +873,64 @@ Hard rules:
 1. You do not decide. You phrase a question and, at most, recommend.
 
 2. At least 2 options. Each option has id (single uppercase letter A,
-   B, C, ...), label (see OUTPUT SHAPE below), gain, loss.
+   B, C, ...), label, gain, loss.
+
+   **Each label names a WAY TO RESOLVE THE PROBLEM.** The subject of a
+   label is the problem. It is never a person and never an agent.
+
+   Before you write each label, check it against this test: strike out
+   every participant name. If nothing is left, or what is left is
+   "proceed" / "continue" / "stop", the label named a dispatch and not
+   a resolution. Rewrite it as what would actually be DONE to the
+   problem.
+
+   FORBIDDEN, with the rewrite each one needs:
+     "Approve Bohr's plan and dispatch it to Heisenberg"
+       -> say what the plan DOES: "Project each denial to a scalar at
+          capture time, keeping the marker bounded"
+     "Hold the dispatch and confirm the SDK schema first"
+       -> that is sequencing, not a resolution. Either the schema
+          lookup changes which fix is right (then the fixes are the
+          options and the lookup belongs in unknowns), or it does not
+          (then it is not a decision).
+     "Stop the loop and read the specification yourself"
+       -> reading is not a resolution. Drop it.
+     "Split the 403 investigation into its own tracked work"
+       -> only an option if the reader is choosing between scopes; say
+          which problem each scope solves.
+
+   A proposal a participant made in the thread is one candidate among
+   the others: describe it by what it does, never as "X's proposal".
+   Who carries out the chosen option is decided separately, by the
+   reader, elsewhere. It is not what they are choosing between here.
+
+   If the tail really contains only one candidate resolution, say so in
+   the question, and give the alternatives the tail itself names —
+   including doing nothing — described the same way.
+
+   gain and loss sit on ONE axis shared by every option: what solving
+   it THAT way buys, and what it costs. The reader must be able to lay
+   the options side by side and compare the same dimension across them.
+
+   **The option SET is one axis too.** Every option must be an answer
+   to the same question, and they must be mutually exclusive. Name that
+   question in the last sentence of the question field, then let the
+   options be its answers and nothing else.
+
+   A mixed set is the most common way this goes wrong. Do not produce
+   one option that adopts a plan, a second that reorders the steps of
+   that same plan, and a third that hands the topic to someone else:
+   those answer three different questions, so there is nothing to
+   compare and the reader cannot tell what they are being asked.
+
+   If the thread has already settled HOW to solve the problem -- a
+   design converged, a reviewer ruled, and what is left is whether it
+   proceeds -- then say exactly that in the question and give TWO
+   options: proceed, and do not proceed. Say what each one does to the
+   problem, and put the real cost of not proceeding in the loss of the
+   second. Do not pad such a set to three by inventing a middle. A
+   scope or sequencing variant is a third option ONLY if the tail
+   actually puts it forward as a rival answer to the same question.
 
 3. The first time you use a label that only carries meaning inside this
    thread (examples: D-0, F-1-C, CF-1, P-7, gate names, phase names,
@@ -860,18 +966,24 @@ Hard rules:
    satisfy this. If no fact in the tail supports a recommendation, set
    both recommendation and recommendation_reason to null.
 
-6. Declare in unknowns everything you did NOT verify from the tail.
-   Empty list is only correct when the tail is complete for this
-   decision. Otherwise list what you did not see. Labels and code
-   identifiers routed through the (b) branch of rule 3 or rule 4 go
-   into unknowns as well.
+6. Declare in unknowns what you did not verify AND that bears on this
+   decision -- something that, if it turned out otherwise, could change
+   which option is right. Labels and code identifiers routed through the
+   (b) branch of rule 3 or rule 4 go into unknowns as well, because the
+   reader cannot weigh an option described with a term nobody defined.
+   Empty list is correct when nothing you failed to verify would move
+   the decision.
+   Do NOT list gaps that cannot move it. Never write an unknown about
+   who the reader is, whether they are the right reader, what they
+   intend, or what this request is for: that is not a gap in the tail,
+   it is a gap in your instructions, and it is answered here.
 
 7. Output JSON ONLY. Do not wrap in code fences. Do not add commentary
    before or after. Do not apologise. The first character of your
    output is {, the last is }.
 
 8. There is no length limit and no length target on the question or
-   the labels. Do not compress. A longer text a stranger can follow is
+   the labels. Do not compress. A longer text the reader can follow is
    CORRECT. A shorter one they cannot follow is WRONG. If something
    truly will not fit, drop first the extra background, then the
    detail of your reasoning. Never delete an explanation to save room.
@@ -919,18 +1031,19 @@ Hard rules:
 OUTPUT SHAPE
 
 question:
-  Start with 1 or 2 plain sentences saying what this thread is about,
-  and use those sentences to explain the internal labels and code
-  identifiers you are about to name. Then ask the decision in a SHORT
-  final sentence that uses only terms you have already explained. The
-  last sentence must be the question itself. At least 2 sentences.
-  Around 6 sentences is usually enough. If you are past that, check
-  you are not explaining things the reader does not need. Do NOT
-  delete an explanation to get under any target.
+  State the PROBLEM the thread is stuck on -- not its history, and not
+  what the project is. Use these sentences to explain the internal
+  labels and code identifiers you are about to name. Then ask the
+  decision in a SHORT final sentence that uses only terms you have
+  already explained. The last sentence must be the question itself.
+  At least 2 sentences. Around 6 sentences is usually enough. If you
+  are past that, check you are not narrating how the thread got here.
+  Do NOT delete an explanation to get under any target.
 
 options[].label:
-  One sentence naming what the reader would be choosing to DO. Not a
-  slogan. No length target.
+  One sentence naming a way to resolve the problem (rule 2). Not a
+  slogan. No length target. The subject is the problem, never a person
+  and never an agent.
 """
 
 
