@@ -75,7 +75,7 @@ resolvable ``claude`` on PATH, and a hard-coded path here would silently
 diverge from what an operator sees when they run the same command by hand.
 """
 
-DEFAULT_TIMEOUT_SECONDS = 60
+DEFAULT_TIMEOUT_SECONDS = 240
 
 DEFAULT_MODEL: str | None = "haiku"
 """Model the child runs on — the cost-reduction design's §7 row for this generator.
@@ -102,17 +102,50 @@ The number is not duplicated in the wrapper's config — the wrapper passes
 its own value in explicitly. This is the fallback for callers who did not
 plumb one through (tests, ad-hoc).
 
-**D-45 (Tier-C msg §25.2)**: originally 30 s. Raised to 60 s after A-18
-measured the real end-to-end elapsed at **33,812 ms** on a live parked
-thread (``spirrow-voxelworld/T-T227-P0-spec-kickoff``, tail 6 msgs /
-21,026 chars). 30 s would have tripped the timeout on real inputs while
-staying green on stub tests. Tail was **not** trimmed to buy time: §25.1
-records the 21 KB input producing a high-quality question (F-1 rubric
-satisfied), and trading quality for latency defeats the purpose of case B.
-The extra 30 s of ceiling costs at most 60 s of notification delay on
-composer failure, negligible against the measured 8-11 h human response
-latency (I-2 fallback still fires the raw ping; ceiling only bounds how
-long the wrapper waits before falling back).
+**D-57 (Tier-C, 2026-09-15)**: 240 s. The ceiling is now derived by a
+rule rather than argued case by case — *the longest elapsed on record for
+a run that SUCCEEDED, plus buffer*, revised upward whenever a longer
+successful run is measured. Takahito's call, and the reasoning is the
+service's shape: this is not a product with users waiting on it. A
+ceiling that is too high costs a slower fallback to the raw ping on the
+rare failure; a ceiling that is too low costs the composed question
+itself on a perfectly good run. Those are not symmetric here.
+
+Measurements on record (all real backend, ``composer_status=ok``):
+
+===========  ==========  ====================================
+elapsed      prompt      input
+===========  ==========  ====================================
+33,812 ms    v1          A-18, voxelworld T-T227, 21,026 chars
+40,213 ms    v1          A-20 baseline (Tier-C §2, 2026-08-22)
+109,530 ms   v2          A-19 rev2, mindwire T-quarantine, 25,105 chars
+153,183 ms   v3          A-19 rev2, same input
+===========  ==========  ====================================
+
+240 s is 153,183 ms + ~57 %. **The two largest numbers were measured on
+sg-ai-server-01, not the deploy host**, because the A-19 rev2 A/B was run
+there; the 2.7x gap against the 40 s baseline is therefore confounded
+with the host. Under D-57 that does not block the raise (240 s is above
+every recorded success either way), but it does mean the next
+measurement on the loop host is the one that should drive the following
+revision.
+
+**What replaced D-45 clause 4.** D-45 said not to raise this unilaterally
+and to report to Tier-C instead, because going above 60 s "changes the
+trade-off's shape". That report happened: with the v2 prompt the default
+60 s produced ``composer_status=timeout`` on a live thread. Tier-C's
+answer was the rule above, so a future implementer measuring a longer
+successful run should apply it — three sites, one commit — and record the
+measurement in the table. **The rule is still bounded by "SUCCEEDED":** a
+run that timed out is not evidence about how long the work takes, so it
+never sets the ceiling.
+
+**Still not traded away (D-45 clause 2, unchanged)**: the tail is not
+trimmed to buy latency. A-18 records the 21 KB input producing a
+high-quality question; trading quality for latency defeats the purpose of
+case B. The ceiling only bounds how long the wrapper waits before falling
+back — I-2 still fires the raw ping — and the measured human response
+latency is 8-11 h (msg-1370 §1), against which even 240 s is noise.
 """
 
 PROMPT_VERSION = "3"

@@ -701,6 +701,9 @@ Decision (Tier-C msg §25.2):
    to be lowered instead, and that is a Tier-C trade-off (Bohr's original
    D-5 chose 60 s under the same logic; going above it changes the
    trade-off's shape).
+   **→ 実行済み。この clause は §D-57 に置き換わった** (2026-09-15)。報告の
+   中身は「v2 prompt で実スレッドが 60 s を超え `composer_status=timeout`」で、
+   Tier-C の回答が D-57 の規則。**clause 2（tail を削らない）は不変。**
 
 Test coverage: existing unit tests pin `timeout_seconds=30` explicitly in
 the two D-41 timeout cases; those constants are arbitrary test doubles
@@ -708,6 +711,58 @@ and do NOT track the default. Adding a pin on the default itself would
 make every future ceiling change a two-file edit for no diagnostic gain;
 the three-site synchronization requirement above is the invariant that
 matters, and the D-45 note in each site is its documentation.
+
+## D-57 — ceiling は「成功した最長 + バッファ」で更新する (Tier-C, 2026-09-15)
+
+**Status**: D-45 clause 4 の後継。以後、wall-clock ceiling は**議論ではなく
+規則**で決める。
+
+**Rule**: `DEFAULT_TIMEOUT_SECONDS` は **`composer_status=ok` で終わった実行の
+うち最長の elapsed + バッファ**。より長い**成功**実行が測れたら、その都度
+3 箇所を同時に更新し、下の表に測定を追記する。
+
+**`ok` で終わった実行だけが根拠になる。** タイムアウトした実行は「その仕事に
+どれだけかかるか」の証拠ではない ∴ ceiling を動かさない。
+
+**なぜ緩い方に倒すか (Takahito)**: このサービスは**待っているユーザーが居ない**。
+高すぎる ceiling の代償は、稀な失敗時に raw ping への fallback が遅れること。
+低すぎる ceiling の代償は、**正常な実行で作れたはずの問いを失うこと**。この 2 つは
+釣り合わない。どちらに転んでも I-2 で raw ping は出るし、人の応答遅延は実測
+8-11 時間 (msg-1370 §1) なので、この範囲の値は誤差。
+
+### 測定の記録 (すべて実バックエンド / `composer_status=ok`)
+
+| elapsed | prompt | 入力 | 測定ホスト |
+|---|---|---|---|
+| 33,812 ms | v1 | A-18, voxelworld T-T227, 21,026 chars | deploy host |
+| 40,213 ms | v1 | A-20 baseline (Tier-C §2, 2026-08-22) | deploy host |
+| 109,530 ms | v2 | A-19 rev2, mindwire T-quarantine, 25,105 chars | **sg-ai-server-01** |
+| 153,183 ms | v3 | A-19 rev2, 同一入力 | **sg-ai-server-01** |
+
+**現行値 240 s** = 153,183 ms + 約 57%。
+
+**交絡を隠さない**: 上位 2 件は A-19 rev2 の A/B を sg-ai-server-01 で走らせた
+ものなので、40 s ベースラインとの 2.7 倍差は**ホスト差と交絡している**。D-57 の
+規則としては問題ない (240 s はどの成功実行より上) が、**次に loop host で測った値が
+次の改訂を駆動すべき**。
+
+### A-19 rev2 / A-20 の実施記録 (2026-09-15)
+
+- **A-19 rev2: pass。** 入力 `spirrow-mindwire/T-quarantine-reasons-captured-but-never-read`
+  (tail 5 / 25,105 chars) を v2 と v3 で 2 回 compose し、Takahito が判定。
+  v2 の 4 択は全部「承認プロセスをどう進めるか」で、スレッドが検討した
+  Candidate B が選択肢に現れていなかった。v3 は「ログを読めるようにする 3 通りの
+  方法」(射影 / sidecar / 現状維持) になり、**Candidate B と「何もしない」が
+  選択肢として現れた**。question 1355 → 1125 字。
+  v2 の unknowns には「この意思決定者がスレッド全体を読んだのか不明」——— D-56 が
+  名指しで禁じた形 ——— が入っていたが、v3 では消え、SDK 型定義 / transcript の
+  実在 / ADR の実在という**判断に効く 3 件**になった。
+- **A-19 の限界**: §14 (Windows cp932) と D-44 (proxy scrub) は Linux 上の実行では
+  踏めない ∴ **この実施は A-18 の代替にはならない**。
+- **A-21 rev2 は未実施。** `Format-DecisionMessage` は PowerShell で、実施ホストに
+  pwsh が無い。参考値として v2 材料の実寸: question 1,235 / labels 715 /
+  得失 2,122 / 推奨理由 496 / unknowns 1,895 = **合計 6,463 字 = 予算 1950 の
+  3.3 倍**。切り捨ての梯子だと**ラベルまで落ちる**計算だが、これは実測ではない。
 
 ## Extras (envelope) — the full list S3 populates
 
