@@ -14,11 +14,11 @@ was retired; the independent-model identity is pinned in
 Runtime target (chatroom ``T-phase2-stage2-naysayer-adapter`` msg-215):
 - Default endpoint is **``http://localhost:8110``** — Lexora binds
   ``0.0.0.0`` with **no caller auth**, so on the production host (mindwire
-  co-resident with Lexora on sg-ai-server-01) the loopback address is the
-  one that does not widen the unauthenticated surface onto the LAN /
+  co-resident with Lexora on ``{{HOST_SERVICES}}``) the loopback address is
+  the one that does not widen the unauthenticated surface onto the LAN /
   Tailscale net. Override via ``MINDWIRE_LEXORA_URL`` (e.g. a dev box
-  reaches the server over Tailscale at ``http://100.79.84.62:8110``); the
-  default must stay loopback.
+  reaches the server over Tailscale at ``http://{{IP_SERVICES}}:8110``,
+  values via [[platform:infra-registry]]); the default must stay loopback.
 - No auth header is sent (the gateway requires none from callers; its
   configured api_keys are for Lexora → upstream providers, not for us).
 
