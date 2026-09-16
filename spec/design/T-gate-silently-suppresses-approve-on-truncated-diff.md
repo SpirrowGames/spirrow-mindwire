@@ -567,7 +567,7 @@ LLM 呼び出し境界で例外が発生したとき、**上から評価する**
 
 | # | 内容 | 処分（2026-09-10） |
 |---|---|---|
-| **残余-1** | **`_MAX_DIFF_CHARS`（Baseline `A/D-1`）の値そのものの再測定。** | **container**: [`#273`](https://github.com/SpirrowGames/spirrow-mindwire/issues/273) に container 化（Tier-C msg-3027 order B、Bohr msg-3035/msg-3037 の edit set E-8、Bohr msg-3059 の edit set E-10/E-13、Tier-C msg-3064 の edit set E-14 で snapshot 化・pointer 純化）。**snapshot（規律-11）**: 本セルは terminal snapshot、**operative rule（BLOCKED-UNTIL / no-rescaling / releasing event / cancellation / done-means / 対象 corpus）の live SOT は `#273` body のみ** — 本セルは restate しない（以後の rule 変更は issue 側でのみ行われ、本 terminal record は追随しない）。**characterisation・Door 補正 audible debt・gate advisory 処分履歴は下記 §5.1 prose を参照。** |
+| **残余-1** | **`_MAX_DIFF_CHARS`（Baseline `A/D-1`）の値そのものの再測定。** | **container**: [`#273`](https://github.com/SpirrowGames/spirrow-mindwire/issues/273)。**snapshot（規律-11）**: 本セルは terminal snapshot、**operative rule（BLOCKED-UNTIL / no-rescaling / releasing event / cancellation / done-means / 対象 corpus）の live SOT は `#273` body のみ** — 本セルは restate しない（以後の rule 変更は issue 側でのみ行われ、本 terminal record は追随しない）。**characterisation と本 §5 record 自身が抱える Door 補正 audible debt は下記 §5.1 prose を参照。** |
 | **残余-2** | **operational 失敗の反復が PR 上に蓄積されない。** | **container 移動、door 空。** 主題は I-2（評価失敗の可視化）の survivor である。I-2 は測定されずに abort されたため、この観測は依然として `naysayer/pr_review.py` の操作面で意味を持つ。**[`#254`](https://github.com/SpirrowGames/spirrow-mindwire/issues/254) に束ねた**（残余-2/3/4/5 の 4 件を 1 issue、cross-link 両方向を規律-17 が要求）。**規律-18 door は空**（下記 note 参照）。 |
 | **残余-3** | **operational 失敗時、赤い CI が理由を述べない。** | **container 移動、door 空。** [`#254`](https://github.com/SpirrowGames/spirrow-mindwire/issues/254) に束ねた。AC-23 前提は Phase B と一緒に死んだ ∴ 再訪時は独立に premise を立てる。 |
 | **残余-4** | **反復回数の自動カウントは本 PR に無い。** | **container 移動、door 空。** [`#254`](https://github.com/SpirrowGames/spirrow-mindwire/issues/254) に束ねた。 |
@@ -577,14 +577,9 @@ LLM 呼び出し境界で例外が発生したとき、**上から評価する**
 
 ### §5.1 残余-1 の characterisation・audible debt・処分履歴（table row からの pointer 先）
 
-**preconditions の characterisation（履歴として保持）**: 本残余は 2 つの独立した precondition のもとにあった — (a) post-elision 分布（本設計が着地した後の）、および (b) `T-gate-reads-stale-base-diff` が変える denominator（`spec/design/T-gate-reads-stale-base-diff.md:157` 参照、#11 が `202,849 → 118,107` を明示）。abort により **(a) は void**（elision は来ない ∴ raw = post-elision — dead precondition として記録）。**(b) は生きている**（stale-base 修正が denominator を per-PR-variable な量だけ縮める） ∴ 再測定は「stale-base 修正の着地後、その修正が変えた denominator に対して」行う。**operative な block の識別・discharge の判定・rescaling 禁止規範・releasing event の identity と時点は [`#273`](https://github.com/SpirrowGames/spirrow-mindwire/issues/273) body が SOT** — 本節は restate しない（msg-3063 advisory 1 disposition: split SOT の解消 = §5 は characterisation + pointer + §5 自身の audible debt に純化、rule は `#273` 側でのみ更新される）。
+**preconditions の characterisation（履歴として保持）**: 本残余は 2 つの独立した precondition のもとにあった — (a) post-elision 分布（本設計が着地した後の）、および (b) `T-gate-reads-stale-base-diff` が変える denominator（`spec/design/T-gate-reads-stale-base-diff.md:157` 参照、#11 が `202,849 → 118,107` を明示）。abort により **(a) は void**（elision は来ない ∴ raw = post-elision — dead precondition として記録）。**(b) は生きている**（stale-base 修正が denominator を per-PR-variable な量だけ縮める）。
 
 **Door 補正（規律-18 audible debt、本 §5 record が抱える）**: stale-base lane の tracking PR は既に merged で open な surface が存在しない ∴ door を刺す場所が無い。`T-gate-reads-stale-base-diff.md` は他 lane の live SOT であり本 PR は編集しない（msg-3037 §3）— pointer は本 §5 に audible debt として置き続ける（下記 残余-2/3/4/5 の door 補正 段落と同種の debt、対象 lane が異なる）。
-
-**gate advisory の処分履歴（本 §5 cell の編集履歴）**:
-- **msg-2961**（`#255` PR-gate structure advisory: stale-base 側で「pick up される見込み」文の存在）→ Bohr msg-2963 で当該文を **削除**（softened ではなく deleted、msg-3035 §4）。
-- **msg-3042**（`#274` R1 PR-gate 3 advisories: cancellation clause / §8 clause 6 rule-copy / `本 §5` topological typo）→ Bohr msg-3059 edit set E-10/E-11/E-12 で **反映**（Einstein msg-3060 clearance）。
-- **msg-3063**（`#274` R2 PR-gate 2 advisories: split SOT / cell density）→ **Tier-C msg-3064 で直接 Heisenberg にルート**、edit set E-14 (本節) で反映: 本 §5 cell から operative rule 部を strip して `#273` を単一 SOT に、cell の 5 概念ブロック（snapshot / BLOCKED-UNTIL / no-rescaling / Door 補正 / gate 処分）のうち rule 部を削除し残りを §5.1 の prose に展開（cell 密度 700+ chars を短い pointer に縮約）。
 
 **規律-18 door 補正（明示的 debt）:** 残余-2/3/4/5 のための issue は **container はあるが door は無い**。**operational-failure lane の consumer は `src/spirrow_mindwire/naysayer/pr_review.py` を次に触れる party だが、abort により本設計はそのコードに何も足さない ∴ door を刺す場所を今回の PR は開かない。** これは意識的な選択であり、silent drop ではない: **規律-18 の未払 debt として明示登録する**（msg-2713 §4）。Einstein msg-2955 が指摘したとおり、abort された設計の pointer を live なコードにコメントとして埋めることは pollution であり、正しい終端状態は「audible debt in the design document」— それは本節そのものである。将来 operational-failure lane を再開する party は本 debt を pick up し、その時点で door を name する。**door を欠く container は忘却より一歩マシで、door を持つ container より一歩劣る** — その中間位置を隠さず書いておく。
 
@@ -676,8 +671,7 @@ LLM 呼び出し境界で例外が発生したとき、**上から評価する**
 3. **本 abort PR が着地して `main` に載る**ことで、この thread は close 条件を満たす（msg-2780 §8 の 2nd clause: 「when a human decides in the open that Phase B is not to be built」）。**merge は Tier-C（Takahito）。loop は merge しない。**
 4. **`verify.py` は本 abort を機械的に承認する**: V-3 が enum を確認（`withdrawn` は valid）、V-5 が per-item `withdrawn_reason` の非空を確認、V-10 が **`main` ブランチでの pin 標的化を WARNING で禁じる**（`current_branch == "main"` 限定、他ブランチでは silent — これは `verify.py` の設計であり本 thread の scope 外）。
 5. **§付録 E の U-3 は依然 resolved（out-of-corpus 宣言、msg-2279 §5）。** 旧 §8 clause 2 が「U-3 のみが loop に残る」と書いていたのは §付録 E の RESOLVED state と矛盾する pass-1 遺物であり（msg-2780 §8 clause 4 が本 thread に受け継いだ）、本 abort と共に §8 側を正した — U-3 は resolved であって「loop に残る」ではない。
-6. **残余の terminal state は §5 に記述**: 残余-1 は [`#273`](https://github.com/SpirrowGames/spirrow-mindwire/issues/273) に container 化（**operative rule の live SOT は `#273` body のみ、§5 の 残余-1 行と §5.1 prose は characterisation・§5 自身の audible debt・§5 cell の編集履歴だけを持ち rule は restate しない** — Tier-C msg-3027 order B に基づき Bohr msg-3035/msg-3037/msg-3059、および Tier-C msg-3064 に基づき edit set E-14 が確定）、残余-2/3/4/5 は [`#254`](https://github.com/SpirrowGames/spirrow-mindwire/issues/254) に container 移動して door を空のまま audible debt として残す、残余-7 と 補償(a) は MOOT。`#231` は Phase B abort を close reason にして close する（re-home しない）。
-7. **本 abort PR の close 条件 (Tier-C msg-3027 order B 由来)**: 上記 clause 6 の 残余-1 分の container（`#273`）が実在し、§5 の 残余-1 行および §5.1 prose から pointer が張られていること。これは msg-2961 の PR-gate structure advisory への処分であり、gate 再発火は new head に対して ordinary loop operation として行われる（msg-3035 §5）。**merge は依然 Tier-C（Takahito）**; loop は merge しない。
+6. **残余の terminal state は §5 に記述**: 残余-1 は [`#273`](https://github.com/SpirrowGames/spirrow-mindwire/issues/273) に container 化、残余-2/3/4/5 は [`#254`](https://github.com/SpirrowGames/spirrow-mindwire/issues/254) に container 移動して door を空のまま audible debt として残す、残余-7 と 補償(a) は MOOT。`#231` は Phase B abort を close reason にして close する（re-home しない）。
 
 ---
 
