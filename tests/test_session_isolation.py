@@ -21,8 +21,10 @@ that (``invariant``, ``tests/test_session_isolation.py:45``).
 
 Both failure directions were run as negative controls before this was committed:
 a probe module that builds ``ClaudeAgentOptions`` without the helper reds
-``test_every_adapter_module_isolates_or_declares_why_not``, and the same probe
-listed in ``_NOT_SDK_BACKED`` reds ``test_exemptions_build_no_sdk_session``.
+``test_every_adapter_module_isolates_or_declares_why_not``; the same probe
+listed in ``_NOT_SDK_BACKED`` reds ``test_exemptions_build_no_sdk_session``;
+and a probe that only names the helper in a comment reds the first test too,
+which a substring check would have passed.
 """
 
 from __future__ import annotations
@@ -70,6 +72,24 @@ def _uses_sdk_options(tree: ast.AST) -> bool:
     return False
 
 
+def _calls_isolation_helper(tree: ast.AST) -> bool:
+    """True if the module actually calls ``session_isolation_kwargs``.
+
+    AST for the same reason as :func:`_uses_sdk_options`: a substring check is
+    satisfied by a module that only *mentions* the name — in a comment, a
+    docstring, or a dead string constant — while omitting the call. The gate on
+    #276 named that hole (``invariant``, round 4), and it is the same shape as
+    the one round 2 named: a guard whose evidence is text rather than code.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name == "session_isolation_kwargs":
+                return True
+    return False
+
+
 def test_kwargs_are_the_isolation_pair() -> None:
     assert session_isolation_kwargs() == {"setting_sources": [], "strict_mcp_config": True}
 
@@ -87,10 +107,11 @@ def test_each_call_gets_its_own_setting_sources_list() -> None:
 def test_every_adapter_module_isolates_or_declares_why_not(path: Path) -> None:
     if path.name in _NOT_SDK_BACKED:
         pytest.skip(f"declared not SDK-backed: {_NOT_SDK_BACKED[path.name]}")
-    assert "session_isolation_kwargs()" in path.read_text(encoding="utf-8"), (
-        f"{path.name} builds a role session without session_isolation_kwargs(). "
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert _calls_isolation_helper(tree), (
+        f"{path.name} builds a role session without calling session_isolation_kwargs(). "
         f"Call it, or — if this module spawns no SDK session — add it to "
-        f"_NOT_SDK_BACKED with the reason."
+        f"_NOT_SDK_BACKED with the reason. (Naming it in a comment is not calling it.)"
     )
 
 
