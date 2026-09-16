@@ -96,6 +96,7 @@ from ..value_objects import (
     SessionState,
     ThreadRef,
 )
+from ._session_isolation import session_isolation_kwargs
 
 # Reuse the SDK session glue (same package, identical reply-drain protocol).
 from .claude_code_sdk import (
@@ -369,20 +370,9 @@ class ImplementerSdkAdapter:
             "tools": list(_IMPLEMENTER_BUILTIN_TOOLS),
             "allowed_tools": self._allowed_tools,
             "mcp_servers": self._mcp_servers,
-            # Isolation (T37 #4). setting_sources=[] runs the session in SDK
-            # isolation mode: it does NOT load this host's user/project/local
-            # settings (claude.ai connectors, CLAUDE.md, env, hooks). That both
-            # stops the implementer from inheriting the operator's MCP connectors
-            # (a credential-surface leak — the agent reached smart_read/Gmail/
-            # Drive). It matters more now, not less: with the per-call guard gone,
-            # host settings are one of the few things that could still widen what
-            # this session reaches, and they stay out.
-            # strict_mcp_config ignores any MCP config not passed here
-            # (project ``.mcp.json`` / plugin servers), so only ``mcp_servers``
-            # (empty by default) is honored. Inference auth (credentials file) is
-            # independent of settings sources, so this does not affect routing.
-            "setting_sources": [],
-            "strict_mcp_config": True,
+            # Isolation (T37 #4) — this role had it first; the definition now lives
+            # in ``_session_isolation`` so all three roles cannot drift apart.
+            **session_isolation_kwargs(),
             # No ``can_use_tool``: with nothing to ask, "default" would leave the
             # SDK waiting on a prompt no one can answer in a headless session.
             # The invariants this used to approximate are enforced outside the

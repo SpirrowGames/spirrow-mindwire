@@ -73,6 +73,7 @@ from ._sdk_result import (
     capture_is_error_detail,
     emit_sdk_error_marker,
 )
+from ._session_isolation import session_isolation_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -362,6 +363,9 @@ class ClaudeCodeSdkAdapter:
             # Exposure is not approval: `allowed_tools` auto-approves, so any
             # bound has to be a guard. Which bound is the caller's call.
             can_use_tool=self._can_use_tool,
+            # Host settings / MCP config stay out; see ``_session_isolation`` for
+            # what that prevents and what it cost to learn.
+            **session_isolation_kwargs(),
         )
         try:
             client = self._client_factory(options)
