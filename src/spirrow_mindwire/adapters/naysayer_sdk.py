@@ -78,6 +78,7 @@ from ._sdk_result import (
     capture_is_error_detail,
     emit_sdk_error_marker,
 )
+from ._session_isolation import session_isolation_kwargs
 
 _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
     {SessionState.HALTING, SessionState.HALTED, SessionState.FAILED}
@@ -363,15 +364,9 @@ class NaysayerSdkAdapter:
             "tools": [],
             "allowed_tools": self._allowed_tools,
             "mcp_servers": self._mcp_servers,
-            # Same isolation as the implementer and the base adapter. ``tools:
-            # []`` disables the built-ins but says nothing about MCP: without
-            # these two, a session still inherits this host's account-level
-            # claude.ai connectors and can call their tools. No naysayer failure
-            # has been observed from that — the observed one was the proposer's
-            # (see ``claude_code_sdk.py``) — but the exposure is identical, and
-            # for this role it also widens what an independent reviewer touches.
-            "setting_sources": [],
-            "strict_mcp_config": True,
+            # ``tools: []`` disables the built-ins and says nothing about MCP; these
+            # keep host connectors out. See ``_session_isolation``.
+            **session_isolation_kwargs(),
             "env": env,
         }
         if self._model is not None:

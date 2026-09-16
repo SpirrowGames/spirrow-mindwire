@@ -73,6 +73,7 @@ from ._sdk_result import (
     capture_is_error_detail,
     emit_sdk_error_marker,
 )
+from ._session_isolation import session_isolation_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -362,25 +363,9 @@ class ClaudeCodeSdkAdapter:
             # Exposure is not approval: `allowed_tools` auto-approves, so any
             # bound has to be a guard. Which bound is the caller's call.
             can_use_tool=self._can_use_tool,
-            # Isolation, same as the implementer's (T37 #4, ``implementer.py``).
-            # It was never applied here, and the gap is not theoretical: on
-            # 2026-09-15 the proposer inherited this host's account-level
-            # claude.ai connector, reached for one of its ``mcp__*`` tools, and
-            # the CLI died with ``AxiosError: Request failed with status code
-            # 403`` the moment ``_PathScopeGuard`` refused the call (a guard
-            # that, by construction, can bound nothing but Read/Glob/Grep). The
-            # conductor scored that as ``sdk-error-during-execution`` and
-            # quarantined the thread, which has no automatic clear path — so one
-            # inherited connector parked a live thread indefinitely.
-            #
-            # ``setting_sources=[]`` keeps this host's user/project/local
-            # settings out (connectors, CLAUDE.md, env, hooks);
-            # ``strict_mcp_config=True`` honors only ``mcp_servers`` passed
-            # above. Together they make the composition root the only thing that
-            # decides what a role may reach — which is what the ``can_use_tool``
-            # comment above already claimed was true.
-            setting_sources=[],
-            strict_mcp_config=True,
+            # Host settings / MCP config stay out; see ``_session_isolation`` for
+            # what that prevents and what it cost to learn.
+            **session_isolation_kwargs(),
         )
         try:
             client = self._client_factory(options)
