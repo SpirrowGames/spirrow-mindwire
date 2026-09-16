@@ -688,10 +688,33 @@ async def test_end_to_end_a_naysayer_post_carries_both_marker_lines(tmp_path: Pa
     lines = gateway.posts[0].rstrip().splitlines()
     assert lines[0] == "VERDICT: object."
     assert lines[-2] == (
-        "<!-- source: tools=0 · mcp=0 · setting_sources=unset "
+        "<!-- source: tools=0 · mcp=0 · setting_sources=empty "
         "· route={{IP_SERVICES}}:8110 · tier=naysayer -->"
     )
     assert lines[-1] == (
         "<!-- attest: tier=naysayer · backend=gemini · expected=gemini "
         "· route=lexora.local:8110 · probe=cost-row#6032 · at=2026-06-04T00:00:00Z -->"
     )
+
+
+@pytest.mark.anyio
+async def test_spawn_isolates_host_settings_and_mcp_config(tmp_path: Path) -> None:
+    """The naysayer session inherits neither host settings nor host MCP servers.
+
+    ``tools=[]`` disables the built-ins and says nothing about MCP, so without
+    these two the session still holds this host account's claude.ai connector
+    tools. No naysayer failure has been observed from that — the observed one
+    was the proposer's — but the exposure is the same, and for an independent
+    reviewer it also widens what the review can touch.
+    """
+    captured: list[Any] = []
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url="http://{{IP_SERVICES}}:8110",
+        client_factory=_factory(_FakeClient([_assistant("VERDICT: object."), _result()]), captured),
+        preflight=_preflight_ok(),
+    )
+    await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    assert captured[0].setting_sources == []
+    assert captured[0].strict_mcp_config is True

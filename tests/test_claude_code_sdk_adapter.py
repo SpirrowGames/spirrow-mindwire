@@ -801,3 +801,37 @@ async def test_sdk_is_error_absent_reason_is_captured_as_absent_not_defaulted(
     # of the two had happened, and this asserts we no longer reach for it.
     assert "SDK session reported is_error" not in hs.error.message
     assert "none carried a reason" in hs.error.message
+
+
+@pytest.mark.anyio
+async def test_spawn_isolates_host_settings_and_mcp_config(tmp_path: Path) -> None:
+    """The session does not inherit this host's settings or MCP servers.
+
+    The regression this pins is not a style preference. On 2026-09-15 the
+    proposer inherited the host account's claude.ai connector, called one of its
+    ``mcp__*`` tools, and the CLI died with ``AxiosError: Request failed with
+    status code 403`` as soon as ``_PathScopeGuard`` refused the call — the
+    guard bounds Read/Glob/Grep and nothing else, so refusing was the only
+    answer it could give. The conductor recorded
+    ``sdk-error-during-execution`` and quarantined the thread; quarantine has no
+    automatic clear path, so the thread stayed parked until a human cleared it.
+
+    ``mcp_servers={}`` alone never prevented this: an inherited connector is not
+    passed through that argument, which is exactly why the provenance marker
+    could read ``mcp=0`` while the session held connector tools.
+    """
+    captured: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured.append(options)
+        return _FakeClient([])
+
+    adapter = ClaudeCodeSdkAdapter(
+        cwd=tmp_path,
+        builtin_tools=("Read",),
+        allowed_tools=["Read"],
+        client_factory=factory,
+    )
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    assert captured[0].setting_sources == []
+    assert captured[0].strict_mcp_config is True
