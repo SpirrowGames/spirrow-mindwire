@@ -13,15 +13,15 @@ by hand.
 
 The mechanism this module gives it:
 
-  1. On every sweep tick, for every distinct ``project`` in the sweep list that
-     carries a ``repo_dir``, evaluate the 4-branch predicate in
-     :func:`inspect_gate`.
+  1. On every sweep tick, for every distinct ``(project, repo_dir)`` pair in
+     the sweep list, evaluate the 4-branch predicate in :func:`inspect_gate`.
   2. If the predicate says "not declared" (``MISSING`` or ``NEW_REPO``): open
-     ``T-gate-bootstrap-<project>`` idempotently, with owner = the sweeper's
-     machine identity and ``tags = ["system-alert", "gate-bootstrap"]``. The
-     ``propose_content`` is a fixed template — no LLM call — that names the
-     constraint (**declare a green predicate**, don't drift from CI, don't
-     be stricter than PR judgement).
+     the pair's bootstrap alert thread idempotently (id derived from
+     ``(project, repo_dir)`` — see :func:`thread_id_for`), with owner = the
+     sweeper's machine identity and ``tags = ["system-alert", "gate-bootstrap"]``.
+     The ``propose_content`` is a fixed template — no LLM call — that names
+     the constraint (**declare a green predicate**, don't drift from CI,
+     don't be stricter than PR judgement).
   3. If the predicate says "declared" (``DECLARED`` or ``STALE_WORKTREE``):
      the alert is resolved; attempt to close the fixed-id thread. Not-found /
      already-resolved envelopes are swallowed as success (idempotent no-op).
@@ -53,6 +53,8 @@ rejects (msg-1965 N-4).
 
 from __future__ import annotations
 
+import hashlib
+import re
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -69,10 +71,17 @@ from .magickit.client import MagickitMcpError, McpToolCaller
 # claimed by this file (msg-1965 N-4, msg-1967 N-5-B).
 DEFAULT_SWEEPER_OWNER = "orchestrator"
 
-# Fixed thread-id prefix. The full id is ``T-gate-bootstrap-<project>``. Fixed
-# because it IS the idempotency key: the same predicate opens and closes it, so
-# a second open on the same project resolves to "already exists" and the sweep
-# stays cost-flat (msg-1963 D-4).
+# Thread-id prefix. The full id is
+# ``T-gate-bootstrap-<project>-<slug of normalized repo_dir>-<sha256[:6] of normalized repo_dir>``.
+# The ``(project, repo_dir)`` composition IS the idempotency key: the same
+# predicate on the same ``(project, repo_dir)`` opens and closes exactly one
+# thread, so a second open on the same pair resolves to "already exists" and
+# the sweep stays cost-flat (msg-1963 D-4). See :func:`thread_id_for` for the
+# key form and its history — this was originally just
+# ``T-gate-bootstrap-<project>``, but ``project`` is not one-to-one with
+# ``repo_dir`` in production ``config/sweep.json`` (Bohr msg-2779 §5: three
+# distinct repos share the ``spirrow-magickit`` project id) and the
+# project-only key silently collided one repo's alert into another's.
 THREAD_ID_PREFIX = "T-gate-bootstrap-"
 
 # Tag set. ``system-alert`` names the kind of thread this is (msg-1967 N-5-B —
@@ -386,9 +395,82 @@ def inspect_gate(
     )
 
 
-def thread_id_for(project: str) -> str:
-    """The fixed idempotency-key thread id for ``project``'s bootstrap alert."""
-    return f"{THREAD_ID_PREFIX}{project}"
+def _normalize_repo_dir(repo_dir: Any) -> str:
+    """Return a canonical form of ``repo_dir`` for :func:`thread_id_for`.
+
+    Windows / POSIX 両対応の正準形. Backslashes are folded to forward slashes
+    and the whole string is lowercased so Windows' case-insensitive filesystem
+    semantics land the same identity on ``C:/foo`` and ``c:/FOO`` — which name
+    the same entity and must map to the same thread id.
+
+    This is the ONE normalisation used by :func:`thread_id_for` for BOTH the
+    slug and the hash suffix (Bohr msg-3122 §2 change 3): using two different
+    normalisations here would cause ``C:/foo`` and ``c:/FOO`` to slugify to
+    the same string but hash to different digests, producing two thread ids
+    for a single filesystem entity — the mirror of the collision this whole
+    change exists to close.
+    """
+    return str(repo_dir).replace("\\", "/").lower()
+
+
+def thread_id_for(project: str, repo_dir: Any) -> str:
+    """The idempotency-key thread id for one (project, repo_dir) alert.
+
+    Key form::
+
+        T-gate-bootstrap-<project>-<slug>-<hash6>
+
+    where ``<slug>`` is :func:`_normalize_repo_dir` (``repo_dir``) with every
+    run of non-alphanumeric bytes collapsed to a single ``-`` and edge dashes
+    stripped, and ``<hash6>`` is the first 6 hex digits of the SHA-256 of the
+    same normalised path.
+
+    **Why ``(project, repo_dir)`` and not just ``project``.** The prior form,
+    ``T-gate-bootstrap-<project>``, silently collided when one project id in
+    ``config/sweep.json`` mapped to multiple ``repo_dir``s (Bohr msg-2779 §5:
+    ``spirrow-magickit`` maps to ``magickit-impl`` AND ``mindwire-impl`` AND
+    ``conclair-impl``). The mechanism opened one thread under the shared key
+    and every subsequent tick from the other repos was swallowed as
+    ``already exists`` — 534 ticks of a real ``conclair-impl`` alert silently
+    dropped. Composing the key from the pair the predicate is evaluated on
+    restores real-positive visibility (msg-1962 acceptance condition).
+
+    **Why a slug PLUS a hash suffix, not either alone.** ``basename(repo_dir)``
+    fails injectivity trivially (``experimental/magickit-impl`` and
+    ``sandbox/magickit-impl`` share a basename — Einstein msg-3119 advisory).
+    A slug of the full path collapses runs of non-alphanumerics so path
+    separators (``/``) and in-name hyphens (``-``) become indistinguishable,
+    and Einstein msg-3121's blocking reversal:
+    ``C:/workspace-sandbox/conclair-impl`` and
+    ``C:/workspace/sandbox-conclair-impl`` both slugify to
+    ``c-workspace-sandbox-conclair-impl``. Adding a hash of the SAME
+    normalised path (24 bits of entropy) recovers separation on the pair
+    Einstein constructed AND on every future pair whose slugs collapse the
+    same way.
+
+    **What the hash property is, precisely.** Not literal injectivity — a
+    fixed-length hash on infinite input cannot be injective (Bohr msg-3122
+    §3). What ``thread_id_for`` delivers is *collision-resistance with a
+    bounded and testable failure mode*: for the finite set of
+    ``(project, repo_dir)`` pairs the mechanism actually evaluates, collision
+    probability at 24 bits and N=100 is roughly 3e-4, and the config-level test
+    :func:`test_thread_id_for_no_collisions_in_current_sweep` promotes that
+    probabilistic bound to a decision-time guarantee for the specific config
+    deployed. If N grows into the four-digit range the hash length must be
+    increased; the test would flip red first and force the revise.
+
+    **Hash input is the normalised path, not the slug** (Bohr msg-3122 §2
+    change 2). Hashing the slug would preserve the collision (both slug
+    inputs are identical, so both digests would be identical); hashing the
+    pre-slug normalised path lets the digest disambiguate what the slug
+    could not. Both inputs share :func:`_normalize_repo_dir` so that
+    Windows-case-insensitive semantics stay consistent across the two
+    components.
+    """
+    normalized = _normalize_repo_dir(repo_dir)
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", normalized).strip("-")
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:6]
+    return f"{THREAD_ID_PREFIX}{project}-{slug}-{digest}"
 
 
 @dataclass(frozen=True)
@@ -459,11 +541,17 @@ async def open_alert(
     mcp: McpToolCaller,
     *,
     project: str,
+    repo_dir: Any,
     owner: str = DEFAULT_SWEEPER_OWNER,
     title_template: str = _TITLE_TEMPLATE,
     propose_template: str = _PROPOSE_TEMPLATE,
 ) -> OpenResult:
-    """Open ``T-gate-bootstrap-<project>`` idempotently.
+    """Open the ``(project, repo_dir)`` bootstrap alert thread idempotently.
+
+    The thread id is :func:`thread_id_for` (project, repo_dir); ``repo_dir``
+    is a load-bearing part of the identity key because production
+    ``config/sweep.json`` maps one project id onto multiple repo dirs (Bohr
+    msg-2779 §5) — see :func:`thread_id_for` for the history.
 
     "Already up" is reported as ``already_exists=True``: the same thread id is
     the whole idempotency mechanism, and the second call within one project's
@@ -504,7 +592,7 @@ async def open_alert(
     the target-state check with it. The safe direction is: no filter at the
     entry, and let the read-back's own answer decide.
     """
-    thread_id = thread_id_for(project)
+    thread_id = thread_id_for(project, repo_dir)
     title = title_template.format(project=project)
     propose = propose_template.format(project=project)
     try:
@@ -843,10 +931,14 @@ async def close_alert(
     mcp: McpToolCaller,
     *,
     project: str,
+    repo_dir: Any,
     merge_commit_sha: str | None = None,
     owner: str = DEFAULT_SWEEPER_OWNER,
 ) -> CloseResult:
-    """Close ``T-gate-bootstrap-<project>`` — take the sweeper's own alert down.
+    """Close the ``(project, repo_dir)`` bootstrap alert — take the sweeper's own alert down.
+
+    The thread id is :func:`thread_id_for` (project, repo_dir). See
+    :func:`open_alert` for why ``repo_dir`` is part of the key.
 
     Called when the predicate has become false: ``.mindwire-gate`` is now
     declared, so the system alert no longer describes reality. This is a
@@ -944,7 +1036,7 @@ async def close_alert(
     The operator sees one exception class for "the close contract could not
     be discharged".
     """
-    thread_id = thread_id_for(project)
+    thread_id = thread_id_for(project, repo_dir)
     try:
         reading = await _alert_thread_state(mcp, project=project, thread_id=thread_id)
     except MagickitMcpError as exc:

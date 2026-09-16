@@ -145,7 +145,7 @@ async def _run_tick(
     mcp: McpToolCaller = (
         mcp_factory(mcp_url) if mcp_factory is not None else StreamableHttpChatroomMcp(mcp_url)
     )
-    thread_id = thread_id_for(project)
+    thread_id = thread_id_for(project, repo_dir)
     out["thread_id"] = thread_id
 
     if should_alert(inspection.status):
@@ -157,7 +157,7 @@ async def _run_tick(
         # failure report into it would either target a vacuum or defeat the
         # rate-limiter's asymmetric-clear rule (msg-2301 D-2'''').
         try:
-            result = await open_alert(mcp, project=project, owner=owner)
+            result = await open_alert(mcp, project=project, repo_dir=repo_dir, owner=owner)
         except MagickitMcpError as exc:
             out["error"] = f"open_alert failed: {exc}"
             return 1, out
@@ -204,7 +204,11 @@ async def _run_tick(
     #     ``test_precheck_read_fault_reports_through_the_unified_surface``.
     try:
         result = await close_alert(
-            mcp, project=project, owner=owner, merge_commit_sha=merge_commit_sha
+            mcp,
+            project=project,
+            repo_dir=repo_dir,
+            owner=owner,
+            merge_commit_sha=merge_commit_sha,
         )
     except GateBootstrapCloseError as exc:
         # Loud surface for the msg-1968 obligation: if the close is refused,
