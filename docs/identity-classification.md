@@ -55,6 +55,7 @@ Enumerated by grepping every `chatroom_post_message` and `chatroom_open_thread` 
 | `naysayer-pr-review`   | `PrReviewOrchestrator.post_critique` (`orchestrator.py`)                  | `_DEFAULT_NAYSAYER_AUTHOR = "naysayer-pr-review"` (line 31)  |
 | `orchestrator`         | `PrReviewOrchestrator._open_thread` (thread `owner`, not a post `author`) | `_DEFAULT_OWNER = "orchestrator"` (line 30)                  |
 | `pr-gate-relay`        | `Conductor._post_pr_gate_relay` (`conductor/core.py`)                     | `_PR_GATE_RELAY_AUTHOR = "pr-gate-relay"` (line 136)         |
+| `conductor-relay`      | `Conductor._post_as_conductor_relay` (`conductor/core.py`)                | `CONDUCTOR_RELAY_AUTHOR = "conductor-relay"` (module-level)  |
 | `spirrowgames-ops`     | `NaysayerPrReviewDriver` — GitHub review submission, not a chatroom post  | `naysayer_github_token` docstring, `pr_review.py`            |
 
 `spirrowgames-ops` is a **GitHub identity**, not a magickit chatroom author, so it is out of scope
@@ -189,6 +190,37 @@ an actor that produced one. `legitimate = ∅`.
 
 **Consequence for the write half**: `upsert_identity("pr-gate-relay", allowed_roles=[],
 independence_class=null)`. The 26/26 null count (PR #153 commit message) is honest and stays.
+
+### `conductor-relay` — **machine**, `legitimate = ∅`
+
+**Primary source** (`src/spirrow_mindwire/conductor/core.py`, `CONDUCTOR_RELAY_AUTHOR` constant
+and the guard-(i) redirect write-back path in `run()`):
+
+The relay is the write-back for T-human-terminal-overuse D-1 (Bohr msg-2540, Einstein msg-2539
+ACCEPT). When guard (i) redirects a design→implement handoff to the human terminal — a non-human,
+non-attested-naysayer author nominated the implementer — the conductor writes back one observation
+into the design thread so the head moves off the redirected `NEXT: <implementer>` token. Without
+this write-back, head_skip Stage 1 does not SKIP (the token is not `human` or `none`), and the
+loop bounces forever (measured 288 times across 5 threads before this landed, msg-2537 §4).
+
+The relay's body is the conductor's own framing — a restatement of the routing verdict (which
+carve-outs did NOT apply, what the redirect target is) — not any role's verbatim speech. Reusing
+`pr-gate-relay` as the author would put a D-1 write-back into the same author bucket the PR-gate
+verdict readers key on (`gate_records.RELAY_AUTHOR` narrows readers to that author for exactly this
+noise-rejection reason, module docstring line 34–41), silently blurring two distinct facts. So a
+separate machine identity is registered here (Einstein msg-2539 Obj-1, Bohr msg-2540 §1 fix).
+
+`conductor-relay` is therefore **machinery** — same reasoning as `pr-gate-relay`. `legitimate = ∅`,
+`kind = machine`. Giving this identity a role would violate the I-6 invariant that both machine
+entries above document (msg-2540 §1-4 explicitly pins that constraint: the loader hard-rejects
+`kind=machine` with a non-empty `legitimate` list, and giving the relay a role to route around that
+would fabricate exactly the evidence the invariant exists to make meaningful).
+
+**Consequence for the write half**: `upsert_identity("conductor-relay", allowed_roles=[],
+independence_class=null)`. No live-corpus count yet — this identity is registered by T-human-
+terminal-overuse before its first post, so `residual` starts empty; the first `identity_findings`
+run after the landing will confirm that (or surface unexpected earlier writes, which would be a
+live-corpus finding not a spec change).
 
 ## What this classification does NOT decide
 

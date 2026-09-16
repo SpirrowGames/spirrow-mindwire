@@ -334,8 +334,17 @@ class TestShippedFile:
         # Smoke test on the actual file: a hand-edit that breaks the invariants is
         # caught here rather than at live-script run time.
         loaded = load_legitimate_roles(default_classification_path())
-        # The four names from docs/identity-classification.md must appear.
-        for name in ("naysayer-pr-review", "orchestrator", "pr-gate-relay", "conductor-probe"):
+        # The five names from docs/identity-classification.md must appear.
+        # ``conductor-relay`` is D-1a (T-human-terminal-overuse msg-2540 §1-4, Einstein Obj-1):
+        # the D-1 write-back writer needs a registered identity or ``identity_findings`` would
+        # surface it as an unclassified author on every tick after the landing.
+        for name in (
+            "naysayer-pr-review",
+            "orchestrator",
+            "pr-gate-relay",
+            "conductor-probe",
+            "conductor-relay",
+        ):
             entry = loaded.by_key(name)
             assert entry is not None, f"missing classification for {name!r}"
         naysayer = loaded.by_key("naysayer-pr-review")
@@ -343,12 +352,27 @@ class TestShippedFile:
         # Only naysayer is a participant.
         assert naysayer.kind == "participant"
         assert naysayer.legitimate == frozenset({"naysayer"})
-        # The other three are machines.
-        for name in ("orchestrator", "pr-gate-relay", "conductor-probe"):
+        # The other four are machines.
+        for name in ("orchestrator", "pr-gate-relay", "conductor-probe", "conductor-relay"):
             entry = loaded.by_key(name)
             assert entry is not None
             assert entry.kind == "machine"
             assert entry.legitimate == frozenset()
+
+    def test_conductor_relay_uses_the_module_constant_as_its_key(self) -> None:
+        # D-1a pin (msg-2540 §1-4): the yaml entry's key must match the runtime constant so a
+        # rename on one side without the other would be caught here rather than at write time.
+        # The identity is registered as ``kind=machine`` with ``legitimate=[]`` because the D-1
+        # relay body is the conductor's own framing, not any role's speech — same reasoning
+        # ``pr-gate-relay`` documents. Giving this identity a role would violate the I-6
+        # invariant (the loader's own hard-reject: ``kind=machine`` requires ``legitimate=[]``).
+        from spirrow_mindwire.conductor.core import CONDUCTOR_RELAY_AUTHOR
+
+        loaded = load_legitimate_roles(default_classification_path())
+        entry = loaded.by_key(CONDUCTOR_RELAY_AUTHOR)
+        assert entry is not None
+        assert entry.kind == "machine"
+        assert entry.legitimate == frozenset()
 
     def test_kind_decides_the_bidirectional_side_without_any_traffic(self) -> None:
         """`kind` alone fixes which side of the msg-1489 §4 biconditional applies.
