@@ -553,6 +553,79 @@ def test_permission_denials_projection_escapes_control_chars_in_keys() -> None:
     assert r'"quote\"key"="third"' in element
 
 
+def test_permission_denials_projection_truncates_at_pair_boundaries_not_mid_quote() -> None:
+    """PR #288 PR-gate follow-up (blocking correctness): a joined pair-text
+    that exceeds ``_FIELD_VALUE_MAX_LEN`` must NOT be sliced mid-quote by
+    the outer ``_summarize_value`` truncation.
+
+    The msg-3334 revision wrapped every key and every value in ``json.dumps``
+    for line-integrity and legibility. That made the marker's format
+    structurally-quoted, so a quote-aware log reader (``shlex.split``,
+    JSON-fragment parsers, ...) relies on every ``"..."`` span being
+    closed. But ``_summarize_value``'s string branch truncates blindly at
+    ``_FIELD_VALUE_MAX_LEN``: if the joined pair-text exceeds the cap, the
+    truncation could sever a closing ``"`` or split a ``\\uXXXX`` escape
+    sequence in half — reintroducing structural invalidity from a different
+    angle than the newline defects the earlier revisions fixed.
+
+    Fix pinned here: pair-boundary-aware truncation inside
+    ``_project_denial_element`` (:func:`_join_pairs_bounded`), with a
+    ``…(+K pairs truncated)`` footer so the drop is a diagnostic surface
+    (one long pair dropped vs. many short pairs dropped is distinguishable
+    to a reader).
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    # Force overflow: many pairs whose joined length vastly exceeds
+    # _FIELD_VALUE_MAX_LEN. Each key + value pair is small enough on its
+    # own to fit; it's the join that pushes past the cap.
+    denial = {f"key_{i:03d}": ("v" * 40) for i in range(30)}
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    element = captured[0]
+    assert isinstance(element, str)
+
+    # Overflow fired: the pair-boundary truncator dropped at least some pairs
+    # and marked the count. Without this footer, a reader cannot tell "one
+    # very long pair" from "twenty short pairs" (which the plain
+    # `_summarize_value` `...(+Nch)` footer conflates).
+    assert "pairs truncated)" in element, f"expected pair-truncation footer; got: {element!r}"
+
+    # Structural pin: the element ends with the footer (which ends in ``)``),
+    # not mid-pair. If a blind truncation had fired, the element would end
+    # mid-token (e.g., ``"key_012"="vvv``) with an unclosed quote span.
+    assert element.endswith("pairs truncated)"), (
+        f"element ended mid-pair or footer misformed: {element!r}"
+    )
+
+    # Every ``"`` in the element belongs to a properly-closed pair. The
+    # projected form is ``"K1"="V1" "K2"="V2" …(+N pairs truncated)``; each
+    # pair contributes exactly 4 raw quote characters (``"K"="V"``), and the
+    # footer contributes none. So the count must be a multiple of 4.
+    # (A ``\"`` inside a value adds 1 to the raw count, so this test
+    # deliberately uses value strings that contain no ``"`` — the pin is
+    # about truncation-induced imbalance, not escape-encoded quotes.)
+    raw_quote_count = element.count('"')
+    assert raw_quote_count % 4 == 0, (
+        f"quote count {raw_quote_count} is not a multiple of 4 — "
+        f"a pair boundary was severed. element={element!r}"
+    )
+
+    # And the whole thing still fits inside the per-field cap that the
+    # pipeline's ``bounded is bounded`` invariant demands.
+    assert len(element) <= _FIELD_VALUE_MAX_LEN + len("…(+999999ch)"), (
+        f"element exceeded per-field bound: len={len(element)}"
+    )
+
+    # And single-line: no raw newline byte survived the projection.
+    assert "\n" not in element
+    assert "\r" not in element
+
+
 def test_permission_denials_projection_c_independence_never_merged_into_errors() -> None:
     """The (c) constraint from msg-2944 §1 pinned as a hard test.
 

@@ -171,6 +171,51 @@ def _scalarize_denial_value(value: Any) -> str:
     return f"{type(value).__name__}(repr_omitted)"
 
 
+def _join_pairs_bounded(pairs: list[str], budget: int) -> str:
+    """Join projected ``"k"="v"`` pairs with spaces, truncating at whole-pair boundaries.
+
+    A quote-aware log parser reading the marker relies on every ``"..."`` span
+    being closed. The outer :func:`_summarize_value` truncates strings blindly;
+    if it slices through a pair mid-quote — or, worse, mid-``\\n`` /
+    ``\\uXXXX`` escape sequence — the marker becomes structurally invalid
+    (PR #288 PR-gate follow-up, blocking correctness objection).
+
+    This helper truncates at whole-pair boundaries and appends a
+    ``…(+K pairs truncated)`` footer so the drop count is itself a
+    diagnostic surface: a reader can tell "one long pair dropped" from
+    "twelve short pairs dropped", which the plain :func:`_summarize_value`
+    footer (``…(+Nch)``) does not distinguish.
+
+    A single pair that itself exceeds ``budget`` is dropped rather than
+    partially rendered — a partially-rendered pair would defeat the
+    quote-safety guarantee this helper exists to provide. That is
+    strictly worse for content preservation than truncating inside the
+    value, and strictly better for structural integrity; the invariant
+    the msg-3328 quoting change staked its safety on is structural
+    integrity, so the trade-off resolves that way.
+    """
+    if not pairs:
+        return ""
+    # Reserve worst-case footer width up front so appending the footer after
+    # a boundary-fit truncation cannot push the result over budget. The
+    # worst case footer is the one that names every pair as dropped.
+    max_footer_len = len(f"…(+{len(pairs)} pairs truncated)")
+    limit = max(0, budget - max_footer_len)
+    kept: list[str] = []
+    used = 0
+    for p in pairs:
+        add = len(p) + (1 if kept else 0)  # +1 for the joining space
+        if used + add > limit:
+            break
+        kept.append(p)
+        used += add
+    if len(kept) == len(pairs):
+        return " ".join(pairs)
+    dropped = len(pairs) - len(kept)
+    footer = f"…(+{dropped} pairs truncated)"
+    return (" ".join(kept) + " " + footer) if kept else footer
+
+
 def _project_denial_element(elem: Any) -> str:
     """Project one ``permission_denials`` element to a bounded string.
 
@@ -206,11 +251,18 @@ def _project_denial_element(elem: Any) -> str:
     symmetrically closes the invariant on both sides of ``=``.
 
     The result is bounded by the same per-field length cap as every other
-    captured string (``_FIELD_VALUE_MAX_LEN``), because the last line of this
-    function feeds the projected text back through :func:`_summarize_value`'s
-    string branch. The projection therefore preserves the ``bounded is
-    bounded`` invariant that PR #181 round 3's docstring (lines 148-153)
-    identified as load-bearing.
+    captured string (``_FIELD_VALUE_MAX_LEN``), because :func:`_join_pairs_bounded`
+    truncates the joined pair-text at whole-pair boundaries BEFORE the outer
+    :func:`_summarize_value` sees it. Doing the truncation here rather than
+    letting the generic string branch of ``_summarize_value`` slice blindly is
+    the only structurally-safe option now that pairs are quoted: a blind cut
+    could sever a closing ``"`` (or split an escape sequence like ``\\n`` in
+    half), producing an unclosed JSON quote span that a quote-aware log
+    reader would treat as malformed (PR #288 PR-gate follow-up, blocking
+    correctness objection). The projection therefore preserves BOTH the
+    ``bounded is bounded`` invariant PR #181 round 3's docstring (lines
+    148-153) identified as load-bearing AND the quote-structural integrity
+    the msg-3328 quoting change introduced.
     """
     if elem is None or isinstance(elem, (bool, int, float, str)):
         return _scalarize_denial_value(elem)
@@ -238,7 +290,12 @@ def _project_denial_element(elem: Any) -> str:
             f"{json.dumps(str(k))}={json.dumps(str(_scalarize_denial_value(source[k])))}"
             for k in keys
         ]
-        text = " ".join(pairs)
+        # Pair-boundary-aware truncation BEFORE _summarize_value sees the text.
+        # Without this, a joined text over _FIELD_VALUE_MAX_LEN would be
+        # sliced mid-quote by _summarize_value's blind string truncation,
+        # leaving an unclosed JSON quote span — PR #288 PR-gate follow-up,
+        # blocking correctness objection.
+        text = _join_pairs_bounded(pairs, _FIELD_VALUE_MAX_LEN)
     summarised = _summarize_value(text)
     return summarised if isinstance(summarised, str) else str(summarised)
 
