@@ -1517,6 +1517,251 @@ Invoke-LeaseAcquire -LeasesState $s -Resource 'editor' -CandidateKey 'p/T-a' -No
 $check = Test-LeaseAvailableFor -LeasesState $s -CandidateKey 'p/T-a' -Requires 'editor'
 Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdict as free)" 'available' $check.status
 
+# --- 18. P4-3 v4.1 — Read-LeasesStateForTick: read-verdict dispatch + fail-closed on unreadable ---
+#
+# Design source: msg-3305 §2 v3 (initial 3-verdict dispatch), msg-3307 §3 v4 (migration boundary
+# split of 'missing' from 'valid'), msg-3309 §2 v4.1 (disposition label unified to
+# 'lease-state-unreadable'). Einstein endorse at msg-3310.
+#
+# The pins below are (d-1) through (d-7) from msg-3307 §3(d), adjusted to the seam-level API:
+# rather than driving the full wrapper tick (which no fixture in this file has), each pin drives
+# Read-LeasesStateForTick directly and asserts the returned verdict record. The (d-2) write-fail
+# pin is out of scope for THIS function (Read-LeasesStateForTick does not flush; it only reads)
+# and lives on the caller's write path in a later PR — the ledger row #P4-3(b) still stands.
+#
+# ROW-BY-ROW MAPPING:
+#   (d-1)  inject shape='invalid-*' -> lease-requiring disposition, flush skipped
+#   (d-2)  SKIPPED HERE (write-fail is Set-JsonState throw; belongs to the caller's tick.
+#          The seam neither writes nor throws; the ledger row is preserved in P4-3(b) prose.)
+#   (d-3)  regression: valid file + mid-tick clear behaviour lives with Merge-LeasesStateForWrite,
+#          already covered by §3 scenarios above; the seam does not touch merging.
+#   (d-4)  MIGRATION BOUNDARY: shape='missing' -> disposition='lease-state-unreadable',
+#          flush_allowed=$false, notification includes 'migration runbook' pointer
+#   (d-5)  BOOTSTRAP AFTER MIGRATION: pre-seed valid empty leases.json ({}); read as 'valid';
+#          state is empty; flush_allowed=$true (the seam permits the caller's acquire path)
+#   (d-6)  operator-delete hazard documentation pin: 'unreadable' notification contains
+#          'DO NOT manually delete leases.json' verbatim
+#   (d-7)  migration-complete recognition: valid empty file ({}) is verdict='valid', NOT 'missing'
+Write-Host ""
+Write-Host "P4-3 v4.1 — Read-LeasesStateForTick: read-verdict dispatch + fail-closed policy"
+
+$p43fixtureDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mindwire-lease-p43-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $p43fixtureDir -Force | Out-Null
+$p43utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+try {
+    # --- (d-4) MIGRATION BOUNDARY — missing file --------------------------------------------
+    $missingPath = Join-Path $p43fixtureDir 'missing-leases.json'
+    if (Test-Path -LiteralPath $missingPath) { Remove-Item -LiteralPath $missingPath -Force }
+    $r = Read-LeasesStateForTick -Path $missingPath
+    Check "(d-4) missing: shape reported as 'missing'" 'missing' $r.shape
+    Check "(d-4) missing: verdict='missing' (v4.1 UNMIGRATED, NOT valid)" 'missing' $r.verdict
+    Check "(d-4) missing: state is empty" 0 $r.state.Keys.Count
+    Check "(d-4) missing: disposition='lease-state-unreadable' (msg-3309 §1 unified label)" 'lease-state-unreadable' $r.disposition
+    CheckFalse "(d-4) missing: flush_allowed=`$false (do NOT create the file — that would silently declare migration complete)" $r.flush_allowed
+    CheckTrue "(d-4) missing: notification is populated" ([bool]$r.notification)
+    CheckTrue "(d-4) missing: notification names the missing path" ([bool]($r.notification -match [regex]::Escape($missingPath)))
+    CheckTrue "(d-4) missing: notification includes UNMIGRATED (v4.1 (a-missing) copy)" ([bool]($r.notification -match 'UNMIGRATED'))
+    CheckTrue "(d-4) missing: notification directs the operator to the migration runbook" ([bool]($r.notification -match 'migration runbook'))
+    CheckTrue "(d-4) missing: log_line names UNMIGRATED (wrapper INFO log surface)" ([bool]($r.log_line -match 'UNMIGRATED'))
+
+    # --- (d-5) BOOTSTRAP AFTER MIGRATION — valid empty file, first-ever acquire allowed -----
+    #
+    # P4-5 runbook STEP 4 seeds `Set-Content -Path leases.json -Value '{}'` when no active
+    # manual holder exists. That parses to shape='object' with zero properties. The tick after
+    # STEP 4 MUST read the file as (a-valid) so the acquire path opens.
+    $seededPath = Join-Path $p43fixtureDir 'seeded-leases.json'
+    [System.IO.File]::WriteAllText($seededPath, '{}', $p43utf8NoBom)
+    $r = Read-LeasesStateForTick -Path $seededPath
+    Check "(d-5) seeded {}: shape='object' (Read-JsonStateWithShape verdict on `{`}`)" 'object' $r.shape
+    Check "(d-5) seeded {}: verdict='valid'" 'valid' $r.verdict
+    Check "(d-5) seeded {}: state is empty (migration-complete-no-holder)" 0 $r.state.Keys.Count
+    Check "(d-5) seeded {}: disposition='' (lease-requiring candidates may proceed to acquire)" '' $r.disposition
+    CheckTrue "(d-5) seeded {}: flush_allowed=`$true (first-ever acquire can persist)" $r.flush_allowed
+    Check "(d-5) seeded {}: notification is `$null" $null $r.notification
+
+    # BOOTSTRAP CYCLE E2E: after (d-5)'s empty read, simulate the wrapper writing a first-ever
+    # holder record to the same path (this is what the caller's T-5 flush would do). The
+    # NEXT tick MUST see verdict='valid' with the holder present. This is the load-bearing
+    # bootstrap-cycle pin from msg-3305 §2 (d-5).
+    $bootstrapState = @{
+        editor = @{
+            holder            = 'p/T-first-holder'
+            acquired_at       = '2026-09-18T00:00:00Z'
+            last_progress_at  = '2026-09-18T00:00:00Z'
+            idle_evaluations  = 0
+            generation        = 1
+            pinned            = $false
+            expiring          = $false
+            reclaimed_from    = $null
+            reclaimed_at      = $null
+            reclaimed_reason  = $null
+            reclaim_required  = $false
+            revoked_at        = $null
+            revoked_reason    = $null
+            queue             = @()
+        }
+    }
+    [System.IO.File]::WriteAllText($seededPath, ($bootstrapState | ConvertTo-Json -Depth 5), $p43utf8NoBom)
+    $r = Read-LeasesStateForTick -Path $seededPath
+    Check "(d-5) bootstrap-cycle: next-tick shape='object'" 'object' $r.shape
+    Check "(d-5) bootstrap-cycle: next-tick verdict='valid'" 'valid' $r.verdict
+    CheckTrue "(d-5) bootstrap-cycle: holder from previous tick survives" ([bool]$r.state.ContainsKey('editor'))
+    $roundtripHolder = if ($r.state['editor'] -is [hashtable]) { $r.state['editor']['holder'] } else { $r.state['editor'].holder }
+    Check "(d-5) bootstrap-cycle: holder key preserved through disk" 'p/T-first-holder' $roundtripHolder
+
+    # --- (d-1) INVALID SHAPE (array root) — lease-arm disabled locally --------------------
+    $arrayPath = Join-Path $p43fixtureDir 'array-leases.json'
+    [System.IO.File]::WriteAllText($arrayPath, '[{"editor":"x"},{"foo":"y"}]', $p43utf8NoBom)
+    $r = Read-LeasesStateForTick -Path $arrayPath
+    Check "(d-1) array root: shape='array' (msg-2151 corruption vector)" 'array' $r.shape
+    Check "(d-1) array root: verdict='unreadable'" 'unreadable' $r.verdict
+    Check "(d-1) array root: state is empty (shape guard stripped metadata)" 0 $r.state.Keys.Count
+    Check "(d-1) array root: disposition='lease-state-unreadable' (msg-3309 §1 unified label)" 'lease-state-unreadable' $r.disposition
+    CheckFalse "(d-1) array root: flush_allowed=`$false (preserve forensic evidence on disk)" $r.flush_allowed
+    CheckTrue "(d-1) array root: notification is populated" ([bool]$r.notification)
+    CheckTrue "(d-1) array root: notification names shape=array" ([bool]($r.notification -match 'array'))
+
+    # Scalar root — same fail-closed branch.
+    $scalarPath = Join-Path $p43fixtureDir 'scalar-leases.json'
+    [System.IO.File]::WriteAllText($scalarPath, '"just a string"', $p43utf8NoBom)
+    $r = Read-LeasesStateForTick -Path $scalarPath
+    Check "(d-1) scalar root: shape='scalar'" 'scalar' $r.shape
+    Check "(d-1) scalar root: verdict='unreadable'" 'unreadable' $r.verdict
+    Check "(d-1) scalar root: disposition='lease-state-unreadable'" 'lease-state-unreadable' $r.disposition
+    CheckFalse "(d-1) scalar root: flush_allowed=`$false" $r.flush_allowed
+
+    # Parse-error — same fail-closed branch (msg-1916 §2 rationale — do not convert a weird
+    # file into a deleted file).
+    $parsePath = Join-Path $p43fixtureDir 'parse-error-leases.json'
+    [System.IO.File]::WriteAllText($parsePath, '{"editor": broken', $p43utf8NoBom)
+    $r = Read-LeasesStateForTick -Path $parsePath
+    Check "(d-1) parse-error: shape='parse-error'" 'parse-error' $r.shape
+    Check "(d-1) parse-error: verdict='unreadable'" 'unreadable' $r.verdict
+    Check "(d-1) parse-error: disposition='lease-state-unreadable'" 'lease-state-unreadable' $r.disposition
+    CheckFalse "(d-1) parse-error: flush_allowed=`$false" $r.flush_allowed
+    CheckTrue "(d-1) parse-error: error is populated (ConvertFrom-Json exception surfaced)" ([bool]$r.error)
+
+    # --- (d-6) OPERATOR-DELETE HAZARD DOCUMENTATION PIN --------------------------------------
+    #
+    # The 'unreadable' notification MUST contain the "DO NOT manually delete leases.json"
+    # warning VERBATIM. This is a hygiene pin (msg-3305 §2 (d-6)): the warning is what
+    # mediates the operator-delete-after-corruption hazard, which mechanism deliberately does
+    # not prevent (§4 scope-out). A future refactor that silently drops the warning would
+    # remove the ONLY mitigation and reintroduce the hazard.
+    $r = Read-LeasesStateForTick -Path $arrayPath
+    CheckTrue "(d-6) unreadable notification contains 'DO NOT manually delete leases.json' verbatim" `
+        ([bool]($r.notification -match 'DO NOT manually delete leases\.json'))
+
+    # The 'missing' notification MUST NOT include the "DO NOT delete" phrasing — cause is
+    # different (unmigrated vs corrupted), and the operator guidance differs. The (d-4) pin
+    # already checked the affirmative (migration runbook pointer); this is the paired negative.
+    $r = Read-LeasesStateForTick -Path $missingPath
+    CheckFalse "(d-6) missing notification does NOT include the 'DO NOT delete' phrasing (cause-differentiated)" `
+        ([bool]($r.notification -match 'DO NOT manually delete'))
+
+    # --- (d-7) MIGRATION-COMPLETE RECOGNITION ------------------------------------------------
+    #
+    # A file present with `{}` MUST be treated as (a-valid) with empty state, NOT as
+    # (a-missing). This pins the file-based-marker semantics: presence = migrated, absence =
+    # unmigrated. The (d-5) test above already exercises this on the happy path; (d-7) is
+    # the NEGATIVE guard — the empty-object case MUST NOT be classified as missing/unreadable.
+    [System.IO.File]::WriteAllText($seededPath, '{}', $p43utf8NoBom)
+    $r = Read-LeasesStateForTick -Path $seededPath
+    Check "(d-7) `{`}` file: verdict='valid' (NOT 'missing', NOT 'unreadable')" 'valid' $r.verdict
+    CheckTrue "(d-7) `{`}` file: flush_allowed=`$true (migration-complete recognised)" $r.flush_allowed
+    Check "(d-7) `{`}` file: disposition='' (no defer of lease-requiring candidates)" '' $r.disposition
+
+    # Reject the mis-classification symmetrically — a caller that follows d-7 correctly will
+    # never observe disposition='lease-state-unreadable' on an empty-object file.
+    Check "(d-7) `{`}` file: disposition is NOT the unreadable label" $false ($r.disposition -eq 'lease-state-unreadable')
+
+    # SILENT-DOUBLE-ALLOCATION PIN (pr-gate REQUEST_CHANGES on PR 286 v1, commit 5e6af92
+    # class=correctness). An earlier draft mapped shape='empty' (blank / whitespace / `[]`)
+    # to verdict='valid' with state=@{}. That opened a silent-double-allocation hole: if
+    # an ACTIVE leases.json (a valid file naming a live holder) were accidentally truncated
+    # to whitespace by an operator or a script, the wrapper would see shape='empty', return
+    # verdict='valid' with an empty state map, and permit a competing lease-requiring
+    # candidate to acquire on the NEXT tick — while the physical holder was still running.
+    # v4.1 fixes this by redirecting shape='empty' into the unreadable branch. The distinction
+    # between "operator ran the runbook and deliberately seeded empty" (runbook writes literal
+    # `{}` → shape='object' → verdict='valid') and "operator accidentally truncated the file"
+    # (blank/whitespace → shape='empty' → verdict='unreadable') is NOT observable by the
+    # wrapper; the runbook is the operator's explicit contract path, and anything else that
+    # lands with an empty root is fail-closed. See Read-LeasesStateForTick's docstring
+    # §WHY 'empty' SHAPE FALLS INTO UNREADABLE for the full rationale.
+    #
+    # NB: a TRULY zero-byte file (0 bytes on disk) is caught by Read-JsonStateWithShape's
+    # try/catch and reported as shape='parse-error' — Get-Content -Raw on a 0-byte file
+    # returns $null, and $null.Trim() throws. That is also (a-unreadable) under P4-3 v4.1.
+    # The runbook's STEP 4 uses `Set-Content -Value '{}'` which writes 2 bytes plus newline —
+    # shape='object' — so the runbook itself lands on (a-valid) unambiguously.
+    $whitespacePath = Join-Path $p43fixtureDir 'whitespace-leases.json'
+    [System.IO.File]::WriteAllText($whitespacePath, "  `n`t  `n", $p43utf8NoBom)
+    $r = Read-LeasesStateForTick -Path $whitespacePath
+    Check "(d-7 companion) whitespace-only file: shape='empty' (raw shape from Read-JsonStateWithShape)" 'empty' $r.shape
+    Check "(d-7 companion) whitespace-only file: verdict='unreadable' (fail-closed on truncation hazard)" 'unreadable' $r.verdict
+    Check "(d-7 companion) whitespace-only file: disposition='lease-state-unreadable'" 'lease-state-unreadable' $r.disposition
+    CheckFalse "(d-7 companion) whitespace-only file: flush_allowed=`$false (do NOT overwrite the truncated file — the operator may still hold physically)" $r.flush_allowed
+    CheckTrue "(d-7 companion) whitespace-only file: notification is populated" ([bool]$r.notification)
+    CheckTrue "(d-7 companion) whitespace-only file: notification contains 'DO NOT manually delete' verbatim" `
+        ([bool]($r.notification -match 'DO NOT manually delete leases\.json'))
+
+    # A root JSON array `[]` — ConvertFrom-Json parses to $null in pwsh 7, Read-Json-
+    # StateWithShape reports shape='empty'. Same fail-closed policy applies for the same
+    # reason (an operator who seeded `[]` intending "empty JSON array" is redirected into
+    # the runbook via the notification; they land on `{}` on their next attempt).
+    $emptyArrayPath = Join-Path $p43fixtureDir 'empty-array-leases.json'
+    [System.IO.File]::WriteAllText($emptyArrayPath, '[]', $p43utf8NoBom)
+    $r = Read-LeasesStateForTick -Path $emptyArrayPath
+    Check "(d-7 companion) `[`]` file: shape='empty'" 'empty' $r.shape
+    Check "(d-7 companion) `[`]` file: verdict='unreadable' (fail-closed)" 'unreadable' $r.verdict
+    Check "(d-7 companion) `[`]` file: disposition='lease-state-unreadable'" 'lease-state-unreadable' $r.disposition
+    CheckFalse "(d-7 companion) `[`]` file: flush_allowed=`$false" $r.flush_allowed
+
+    # ACTIVE-LEASE-TRUNCATION SCENARIO (the specific hazard the pr-gate flagged). Set up a
+    # valid file naming an active holder, then truncate it to whitespace, and assert the
+    # next read fails closed rather than silently dropping the holder record. This is the
+    # load-bearing test for "mutual exclusion NEVER violated" under the truncation failure
+    # mode; a green run under it is what makes the (d-7 companion) fix load-bearing rather
+    # than cosmetic.
+    $liveHolderPath = Join-Path $p43fixtureDir 'live-then-truncated.json'
+    $liveState = @{
+        editor = @{
+            holder            = 'p/T-active-holder'
+            acquired_at       = '2026-09-18T00:00:00Z'
+            last_progress_at  = '2026-09-18T00:00:00Z'
+            idle_evaluations  = 0
+            generation        = 2
+            pinned            = $false
+            expiring          = $false
+            reclaimed_from    = $null
+            reclaimed_at      = $null
+            reclaimed_reason  = $null
+            reclaim_required  = $false
+            revoked_at        = $null
+            revoked_reason    = $null
+            queue             = @()
+        }
+    }
+    [System.IO.File]::WriteAllText($liveHolderPath, ($liveState | ConvertTo-Json -Depth 5), $p43utf8NoBom)
+    $preTruncate = Read-LeasesStateForTick -Path $liveHolderPath
+    Check "(d-7 companion) truncation setup: pre-truncate verdict='valid'" 'valid' $preTruncate.verdict
+    CheckTrue "(d-7 companion) truncation setup: pre-truncate names the holder" ([bool]$preTruncate.state.ContainsKey('editor'))
+    # Simulate accidental truncation to whitespace (e.g. `> leases.json` or a script bug).
+    [System.IO.File]::WriteAllText($liveHolderPath, "`n", $p43utf8NoBom)
+    $postTruncate = Read-LeasesStateForTick -Path $liveHolderPath
+    Check "(d-7 companion) truncation hazard: post-truncate verdict='unreadable' (NOT valid)" 'unreadable' $postTruncate.verdict
+    Check "(d-7 companion) truncation hazard: post-truncate state is empty" 0 $postTruncate.state.Keys.Count
+    CheckFalse "(d-7 companion) truncation hazard: flush_allowed=`$false (would-be flush would silently drop the holder)" $postTruncate.flush_allowed
+    Check "(d-7 companion) truncation hazard: disposition='lease-state-unreadable' (competing candidate deferred)" 'lease-state-unreadable' $postTruncate.disposition
+}
+finally {
+    if (Test-Path -LiteralPath $p43fixtureDir) {
+        Remove-Item -LiteralPath $p43fixtureDir -Recurse -Force
+    }
+}
+
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "lease gate: $($script:failures) check(s) FAILED"; exit 1 }
 Write-Host "lease gate: all checks passed"
