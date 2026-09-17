@@ -236,20 +236,6 @@ def _body_without_footer(body: str) -> str:
     return _VERDICT_FOOTER_RE.sub("", body).rstrip()
 
 
-def _strip_footer_and_use_event(body: str, event: ReviewEvent) -> ReviewEvent:
-    """Return the event authoritatively (kept as a small function for future replay-time policy).
-
-    Currently a pass-through of ``event`` — this exists as a seam so a future policy
-    (e.g. never re-escalate a COMMENT-fallback back to APPROVE) has an obvious place to
-    live, referenced from :meth:`NaysayerPrReviewDriver._maybe_replay_verdict`. The
-    ``body`` argument is unused today; keeping it in the signature documents the intent
-    that a policy might read the body to decide (DESIGN v3 §1 "422→COMMENT fallback:
-    replay must NOT re-escalate").
-    """
-    del body  # currently unused; see docstring
-    return event
-
-
 # A verdict must be its own line, starting at COLUMN ZERO (``^...$`` with MULTILINE, and no
 # leading-whitespace class after ``^``).
 #
@@ -2542,7 +2528,7 @@ class NaysayerPrReviewDriver:
         try:
             receipt = await self._post_and_submit(
                 pr,
-                verdict=_strip_footer_and_use_event(cand_body, footer_event),
+                verdict=footer_event,
                 body=_body_without_footer(cand_body),
                 head_sha=ci.head_sha,
                 post_critique=post_critique,

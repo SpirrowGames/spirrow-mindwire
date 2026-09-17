@@ -1563,17 +1563,35 @@ def classify_http_error(exc: GitHubHTTPError) -> Retryability:
 class Scope(StrEnum):
     """Whether a terminal HTTP failure belongs to the environment or the target.
 
-    ``ENVIRONMENT`` = the fault does not belong to *this* thread — the token is
-    dead, or the repo is unreachable, and the same fault will greet every other
-    thread the credential touches. Quarantining a thread for this is a false
-    attribution (D-4). ``TARGET`` = the fault belongs to this specific PR (422
-    same-identity, 404 for a deleted PR, permission gap on this repo only).
+    The concrete mapping lives in :func:`scope_from_probe` — read that function
+    for the truth table. This class docstring is a summary, not the spec, and
+    must not be relied on where the two disagree.
+
+    ``ENVIRONMENT_CREDENTIAL`` / ``ENVIRONMENT_PERMISSION`` = the fault does not
+    belong to *this* thread — the token is dead or suspended (credential), or
+    the credential is fine but lacks access to *this* repo (permission). In
+    either case the same fault will greet every other thread the credential
+    touches, and quarantining a thread for it is a false attribution (D-4).
+    Note that a permission gap on *this repo* is deliberately classified as
+    ENVIRONMENT_PERMISSION, not TARGET, per msg-1987 Q2-B — the gap is not
+    caused by anything this thread did, so alerting is the right response.
+
+    ``TARGET`` = the fault belongs to this specific PR: currently only 422 with
+    a live probe (same-identity, PR closed mid-flight, etc.). If future policy
+    treats other statuses as target-scoped, update :func:`scope_from_probe`
+    first and this docstring in the same commit.
 
     ``UNKNOWN`` is the fail-safe: reserved for when the scope probe itself could
-    not run (network / another 5xx). Callers must NOT collapse UNKNOWN into
-    either concrete value — quarantining an UNKNOWN would silently expand
-    ENVIRONMENT into a thread-fault (T22 false attribution), and treating
-    UNKNOWN as ENVIRONMENT would silently suppress a genuine TARGET fault.
+    not run (network / another 5xx). Callers must NOT AFFIRMATIVELY classify
+    UNKNOWN as either concrete value — routing an UNKNOWN through the
+    ENVIRONMENT alert-only path would silently suppress a possible TARGET
+    fault, and routing it through the TARGET suppression-marker path would
+    permanently poison the head on a merely transient probe failure (PR-gate
+    objection 3, msg-3188). UNKNOWN itself is not a decision; it means "no
+    decision was made". The default quarantine that follows a raw
+    :class:`GitHubHTTPError` is the fall-through the process already had, not
+    an affirmative TARGET classification — see :func:`scope_from_probe`
+    "未分類は必ず 1" for the rationale.
     """
 
     ENVIRONMENT_CREDENTIAL = "environment/credential"
@@ -1604,17 +1622,25 @@ def scope_from_probe(failure_status: int | None, probe_status: int) -> Scope:
       (the token is fine and this repo works; the failure is about this
       specific PR — same-identity guard, deleted PR, etc.).
     - ``probe_status == 0`` (transport-level probe failure) → :attr:`UNKNOWN`
-      (the scope-determination call itself did not run; fail-safe: never
-      quarantine on UNKNOWN, never alert as environment on UNKNOWN).
+      (the scope-determination call itself did not run; fail-safe: do not
+      affirmatively classify).
     - Anything else (a probe returning 5xx, an unexpected 4xx) → :attr:`UNKNOWN`
       for the same reason.
 
     Callers use the returned value to decide whether the terminal failure is
-    thread-scoped (:attr:`TARGET` → quarantine, current behaviour) or
-    environment-scoped (:attr:`ENVIRONMENT_*` → alert without quarantine,
-    exit code 2). :attr:`UNKNOWN` falls back to "treat as thread-scoped" =
-    quarantine, per DESIGN v3 §3 "未分類は必ず 1"— never route a fault
-    through the alert-only path unless we can prove it is environment.
+    thread-scoped (:attr:`TARGET` → suppression marker + re-raise
+    :class:`TargetTerminalError`) or environment-scoped
+    (:attr:`ENVIRONMENT_*` → :class:`EnvironmentTerminalError` → alert
+    without quarantine, exit code 2). :attr:`UNKNOWN` is NOT a decision:
+    callers re-raise the underlying :class:`GitHubHTTPError` unchanged, which
+    falls through the daemon's default catch-all (exit code 1 → quarantine).
+    That is the DESIGN v3 §3 "未分類は必ず 1" rule — the default path is
+    the same one an unclassified error would have hit before this scoping
+    existed, so UNKNOWN preserves the pre-existing behaviour rather than
+    affirmatively routing to TARGET or ENVIRONMENT. Never route a fault
+    through the alert-only path unless the probe positively proves it is
+    environment, and never write a target-suppression marker unless the probe
+    positively proves it is target (PR-gate objection 3, msg-3188).
     """
     if probe_status == 401:
         return Scope.ENVIRONMENT_CREDENTIAL
