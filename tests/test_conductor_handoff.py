@@ -341,6 +341,33 @@ def test_implementer_block_hands_back_to_proposer_and_never_merges() -> None:
     assert "never merge" in block
 
 
+def test_implementer_block_teaches_tier_c_syntax_and_enum() -> None:
+    # D-3 (T-human-terminal-overuse, Bohr msg-2540 §4 D-3 approved by Einstein msg-2539 Obj-3):
+    # the implementer's block now documents the same `TIER-C: <label>` syntax the proposer has (A
+    # only shipped it to the proposer, so 25/25 implementer human terminals recorded a null label
+    # in the 08-24..09-04 window purely because the emitter was never told, msg-2537 §3). The
+    # parser reads the label on any human terminal — extending the emit-side guidance to the
+    # implementer is what closes the loop.
+    block = build_handoff_protocol_block(Role.IMPLEMENTER)
+    assert "TIER-C:" in block
+    for label in TIER_C_LABELS:
+        assert f"`{label}`" in block, f"enum label {label!r} missing from implementer guidance"
+    assert "other:<one-line reason>" in block
+    assert "does NOT redefine" in block  # calibration-not-definition mantra kept in the text
+
+
+def test_naysayer_block_does_not_carry_tier_c_guidance() -> None:
+    # D-3 negative — msg-2540 §3 / Einstein msg-2539 Obj-3: the naysayer's `NEXT: human` is an
+    # escalation of a design concern, NOT a Tier-C decision request. Forcing a `TIER-C: <label>`
+    # onto that surface would push two distinct concepts into one field (hybrid complexity). So
+    # the naysayer block deliberately does NOT include the TIER-C emission guidance, and the D-2
+    # future machine-judgement check (msg-2540 §3 pin) must exclude naysayer authorship from its
+    # denominator. Pinned here so a future edit to `_ROLE_HANDOFF_GUIDANCE` cannot silently
+    # extend the emission guidance to naysayer and destroy that exclusion by "helpful uniformity".
+    block = build_handoff_protocol_block(Role.NAYSAYER)
+    assert "TIER-C:" not in block
+
+
 def test_naysayer_block_is_advisory() -> None:
     block = build_handoff_protocol_block(Role.NAYSAYER)
     assert "advisory, not a veto" in block

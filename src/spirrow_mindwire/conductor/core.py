@@ -112,6 +112,26 @@ logger = logging.getLogger(__name__)
 # Single SOT in config.py so ConductorConfig.max_rounds and this ctor default cannot drift (D-2).
 _DEFAULT_MAX_ROUNDS = DEFAULT_CONDUCTOR_MAX_ROUNDS
 
+#: The reserved author under which the conductor's guard-(i) redirect write-back is posted
+#: (T-human-terminal-overuse D-1, Bohr msg-2540 § approved by Einstein msg-2539). When a non-human,
+#: non-attested-naysayer author nominates the implementer, guard (i) redirects to the human
+#: terminal and this relay writes ONE observation into the design thread so the head moves off the
+#: rejected `NEXT: <implementer>` token. Without it, ``head_skip`` Stage 1 does not SKIP (that
+#: stop-token set is a closed set of ``human`` / ``none``) and the sweep re-launches the same head
+#: forever — measured 288 times across 5 threads before this landed (msg-2537 §4).
+#:
+#: DELIBERATELY DISTINCT FROM :data:`~.gate_records.RELAY_AUTHOR`. That relay author is the key
+#: :func:`~.gate_records.ci_route_heads` and :func:`~.gate_records.verdict_heads` filter on
+#: (``gate_records`` module docstring, "the two readers are deliberately restricted to messages
+#: authored by the conductor's relay author"); reusing the same string here would silently mix
+#: D-1 write-backs into that reader stream. Einstein's msg-2539 Objection 1 flagged the identity
+#: registration side; the same fact keeps the two writers apart for the reader side too.
+#:
+#: Registered as ``kind=machine`` / ``legitimate=[]`` in ``spec/identity/legitimate_roles.yaml``
+#: (I-6 invariant, msg-2540 §1-4: the loader hard-rejects ``kind=machine`` with a non-empty
+#: legitimate list, so a route around the invariant is structurally impossible).
+CONDUCTOR_RELAY_AUTHOR = "conductor-relay"
+
 
 class ConductorDispatcher(Protocol):
     """The slice of :class:`~spirrow_mindwire.dispatcher.core.Dispatcher` the conductor drives.
@@ -491,6 +511,21 @@ class Conductor:
                 if notice is not None:
                     posted = await self._post_as_relay(notice)
                     latest_msg_id = _msg_id(posted) or latest_msg_id
+                else:
+                    # T-human-terminal-overuse D-1 (Bohr msg-2540 approved by Einstein msg-2539).
+                    # A guard-(i) redirect stops on ``StopReason.HUMAN`` when the naysayer was
+                    # already consulted in the segment; the current head still says ``NEXT:
+                    # <implementer>`` and head_skip Stage 1 will not SKIP that token. Post a
+                    # write-back under ``CONDUCTOR_RELAY_AUTHOR`` so the head moves — either to
+                    # ``NEXT: human`` (self-terminating for the implementer-authored / unknown-
+                    # author cases) or to ``NEXT: <author>`` (author-directed autonomous
+                    # correction for the proposer / naysayer cases, at most one per episode).
+                    redirect_body = self._render_guard_i_redirect_notice(
+                        handoff, latest, messages, stop_reason
+                    )
+                    if redirect_body is not None:
+                        posted = await self._post_as_conductor_relay(redirect_body)
+                        latest_msg_id = _msg_id(posted) or latest_msg_id
                 return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
             if is_forced:
                 forced += 1
@@ -1005,6 +1040,210 @@ class Conductor:
             "author": RELAY_AUTHOR,
             "content": body,
         }
+
+    async def _post_as_conductor_relay(self, body: str) -> dict[str, Any]:
+        """Post ``body`` into the design thread under :data:`CONDUCTOR_RELAY_AUTHOR`.
+
+        The T-human-terminal-overuse D-1 write-back (Bohr msg-2540 approved by Einstein msg-2539).
+        Same shape and same fail-loud-on-resolved-thread disposition as :meth:`_post_as_relay`, but
+        under a distinct reserved author — deliberately. The two writers do different jobs and are
+        keyed on by different readers:
+
+        - ``pr-gate-relay`` — PR-gate verdict / R3+R5 admission / R4 ci-route.
+          Read by :func:`~.gate_records.verdict_heads` (R6 dedupe) and
+          :func:`~.gate_records.ci_route_heads` (R5 second-red input). Those readers narrow to
+          this author for noise rejection (module docstring, "the two readers are deliberately
+          restricted to messages authored by the conductor's relay author").
+        - ``conductor-relay`` — the D-1 redirect write-back. Nothing reads this author for
+          decision-making yet; the D-1 mechanism only requires that head_skip see a moved head
+          (which any author with a stop-token ``NEXT:`` line would do). Isolating it from the
+          PR-gate readers is what msg-2539 Objection 1 named as necessary.
+
+        Fail-safe on :class:`~spirrow_mindwire.magickit.client.ThreadResolvedError`: the design
+        thread was resolved out from under this write. Same disposition as ``_post_as_relay`` —
+        log a warning and return a stub with an empty msg_id; the D-1 write-back is transitional
+        (no reader keyed on it), so losing one is not silent gap-creation the way losing a
+        verdict relay would be.
+        """
+        try:
+            result = await self._mcp.call_tool(
+                "chatroom_post_message",
+                {
+                    "project": self._thread_ref.project_id,
+                    "thread_id": self._thread_ref.thread_id,
+                    "msg_type": "report",
+                    "author": CONDUCTOR_RELAY_AUTHOR,
+                    "content": body,
+                    # No ``role`` here, deliberately. Same reasoning as ``_post_as_relay`` and
+                    # the ``pr-gate-relay`` yaml entry: the body is the conductor's own framing
+                    # of the redirect it just performed, not any role's verbatim speech.
+                    # Claiming a role would fabricate the very evidence the I-6 invariant exists
+                    # to make meaningful (msg-2540 §1-4).
+                },
+            )
+        except ThreadResolvedError as exc:
+            logger.warning(
+                "guard-(i) redirect write-back dropped (thread %r resolved): %s. "
+                "No retry — refusal is terminal for this thread "
+                "(OBL-CHATROOM-PRODUCER-READER-SURFACE disposition 3, fail loudly).",
+                self._thread_ref.thread_id,
+                exc,
+            )
+            return {
+                "msg_id": "",
+                "author": CONDUCTOR_RELAY_AUTHOR,
+                "content": body,
+            }
+        msg = result.get("msg") if isinstance(result, dict) else None
+        msg_id = str(msg.get("msg_id") or "") if isinstance(msg, dict) else ""
+        return {
+            "msg_id": msg_id,
+            "author": CONDUCTOR_RELAY_AUTHOR,
+            "content": body,
+        }
+
+    def _render_guard_i_redirect_notice(
+        self,
+        handoff: Handoff,
+        latest: dict[str, Any],
+        messages: list[dict[str, Any]],
+        stop_reason: StopReason,
+    ) -> str | None:
+        """The T-human-terminal-overuse D-1 write-back body, or ``None`` when not applicable.
+
+        Fires only when the stop is a guard-(i) redirect: the handoff is a ROLE handoff to the
+        implementer, and the stop reason is :attr:`StopReason.HUMAN` — an explicit ``NEXT: human``
+        (``handoff.kind is HUMAN``) does not qualify (the author's own decision needs no
+        write-back, and the head already carries a stop token so head_skip already handles it).
+
+        The final ``NEXT:`` line's target is determined by :meth:`_guard_i_redirect_target`
+        (msg-2540 §2-5 rule):
+
+        - author is the implementer (self-nomination, msg-2537 §4's 3/5 stuck threads) or the
+          author's role is unknown to the roster → ``NEXT: human`` (self-terminating: head_skip
+          Stage 1 will SKIP this new head on the next tick, ending the bounce loop).
+        - author is proposer / naysayer, first redirect this episode → ``NEXT: <author>``
+          (author-directed autonomous correction: the author is dispatched on the next tick to
+          read the notice and rewrite the routing itself, guard (i) does not re-fire because the
+          relay author's role is not implementer).
+        - author is proposer / naysayer, second redirect this episode (D-1c episode limit) →
+          ``NEXT: human`` (bounded cost of the author-directed path).
+
+        Quoted violation tokens (``NEXT: <implementer>`` shown as an example inside prose) are
+        kept OUT of line-start position by wrapping them in backticks and preceding them with
+        prose — :func:`~.handoff.parse_next_token` reads the LAST line-start ``NEXT:`` and the
+        body has exactly one such line (the final ``NEXT: <target>`` at the bottom), so no
+        quoted example can hijack the parse (msg-2540 §4 D-1b, test-pinned by
+        ``test_guard_i_redirect_body_parse_is_hijack_safe``).
+        """
+        if stop_reason is not StopReason.HUMAN:
+            return None
+        if handoff.kind is not HandoffKind.ROLE or handoff.role is not self._implementer_role:
+            return None
+        author = _author(latest)
+        author_role = self._roster_role(author)
+        target = self._guard_i_redirect_target(author, author_role, messages)
+        return self._format_guard_i_redirect_body(
+            author=author, author_role=author_role, handoff=handoff, target=target
+        )
+
+    def _guard_i_redirect_target(
+        self,
+        author: str,
+        author_role: Role | None,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        """The final ``NEXT:`` target for a D-1 redirect write-back (msg-2540 §2-5).
+
+        Implementer / unknown author → ``human``: self-terminating, bounces stop next tick
+        (msg-2540 §2-2: an author-directed relay with role=None re-enters guard (i) and repeats).
+
+        Proposer / naysayer author, first redirect this episode → ``<author>``: author-directed
+        autonomous correction (msg-2540 §2-1: relay's own author has role=None so guard (i) does
+        not fire on the relay's own turn; the AUTHOR is dispatched next and can read the notice).
+
+        Second redirect in the same episode → ``human``: the D-1c bound (msg-2540 §2-4). Without
+        it a stubborn author looping on the same mistake would spin the loop at 1 launch/tick,
+        which is a strictly-worse regression than the free spin we replaced.
+        """
+        if author_role is None or author_role is self._implementer_role:
+            return HUMAN_TOKEN
+        if self._has_prior_guard_i_relay_in_episode(messages, author):
+            return HUMAN_TOKEN
+        return author
+
+    def _has_prior_guard_i_relay_in_episode(
+        self, messages: list[dict[str, Any]], current_author: str
+    ) -> bool:
+        """Is there already a D-1 relay in the current episode? (msg-2540 §2-4 candidate impl.)
+
+        An "episode" is the run of turns bounded by turns routed WITHOUT a redirect. Walk back
+        from the message BEFORE the head (``messages[-2]``); if we see a prior
+        ``CONDUCTOR_RELAY_AUTHOR`` post before we cross an episode boundary (any author that is
+        neither the current author nor this relay), a prior redirect happened this episode and
+        the D-1c bound applies.
+
+        The predicate is a pure function of the message list — no persisted state — so a test
+        can drive it directly (``test_guard_i_second_redirect_in_episode_uses_human``).
+        """
+        for msg in reversed(messages[:-1]):
+            msg_author = _author(msg)
+            if msg_author == CONDUCTOR_RELAY_AUTHOR:
+                return True
+            if msg_author != current_author:
+                return False
+        return False
+
+    def _format_guard_i_redirect_body(
+        self,
+        *,
+        author: str,
+        author_role: Role | None,
+        handoff: Handoff,
+        target: str,
+    ) -> str:
+        """Render the D-1 write-back body. See :meth:`_render_guard_i_redirect_notice` for shape.
+
+        The body is one screen of prose (nothing computed at read time), so the whole notice is
+        the author's ``NEXT:`` line + the redirect verdict + the routing that comes next. The
+        final line is the ONLY line-start ``NEXT:`` line — every mention of ``NEXT: <role>``
+        elsewhere is inside prose (preceded by Japanese text, then backticks around the token),
+        because :func:`~.handoff.parse_next_token` takes the last line-start match and a quoted
+        example that started a line would hijack the parse (msg-2540 §4 D-1b).
+        """
+        author_role_label = author_role.value if author_role is not None else "roster に未登録"
+        implementer_token = handoff.identity or handoff.token or "<implementer>"
+        # msg-2540 §2-5 explains the observed audience for each of the two possible targets. This
+        # framing is written for the author who is being redirected (the one whose next event
+        # will be the relay itself, if target is the author) OR for the human reader who opens
+        # the thread when it has come to rest (if target is human). Both need to see the same
+        # facts, so the body does not branch on target for the diagnostic prose.
+        target_line = f"NEXT: {target}"
+        return (
+            "Conductor stop — guard (i) redirect (design→implement Tier-C gate)\n\n"
+            f"直近の post ({author}, role: {author_role_label}) の `NEXT:` は "
+            f"implementer (`{implementer_token}`) を指しました。guard (i) はこの handoff を "
+            "Tier-C の gate として拦截し、実装へは通しません "
+            "(ADR-2026-06-03-17, T-human-terminal-overuse D-1)。\n\n"
+            "carve-out の該当状況:\n"
+            f"- ① human-authored Tier-C decide — 不適合: author (`{author}`) は human "
+            "identity ではありません。\n"
+            "- ② PR-gate verdict relay — 不適合: この handoff は PR-gate の verdict relay "
+            "ではありません。\n"
+            "- ③ attested independent naysayer proceed under control=`run` — 不適合: "
+            "author が naysayer でない、あるいは attest 済でない、あるいは control が "
+            "`run` ではありません。\n\n"
+            "実装へ進める経路は 2 つだけです — human が直接 `NEXT: <implementer>` を "
+            "書く (carve-out ①)、あるいは attested naysayer が control=`run` 下で "
+            "`NEXT: <implementer>` を書く (carve-out ③) — どちらも proposer が "
+            "自己前進で implementer を指名する形は取れません "
+            "(Einstein msg-601 Fix-1: *Only* the naysayer may advance to code)。\n\n"
+            "この post は conductor 自身の書き戻しです (author: "
+            f"`{CONDUCTOR_RELAY_AUTHOR}`、role: なし)。head_skip Stage 1 の SKIP token 集合 "
+            "は closed set `{human, none}` — この relay の `NEXT:` が動くことで、"
+            "同じ head が永続 relaunch されるループ (msg-2537 §4 実測 288 回) が終端します。\n\n"
+            f"{target_line}"
+        )
 
     async def _admit(
         self, pr: PrRef, latest: dict[str, Any], messages: list[dict[str, Any]]

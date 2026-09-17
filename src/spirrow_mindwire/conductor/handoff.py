@@ -646,12 +646,27 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "a calibration tag the conductor records so we can tell judgement-Tier-C apart from "
         "routing-artefact Tier-C; it does NOT redefine what Tier-C is."
     ),
+    # D-3 (T-human-terminal-overuse, Bohr msg-2540 §4 D-3 approved by Einstein msg-2539 Obj-3):
+    # implementer receives the same TIER-C: <label> emission guidance the proposer already has (A
+    # msg-890 §3 shipped the calibration tag ONLY on the proposer side; the parser reads it on
+    # every human-terminal path, so 25/25 implementer human terminals recorded a null label in the
+    # 08-24..09-04 window purely because the emitter was never told). Naysayer is deliberately NOT
+    # given this guidance — msg-2540 §3 / Einstein Obj-3: a naysayer's ``NEXT: human`` is an
+    # escalation of a design concern, not a Tier-C decision request, and forcing a Tier-C label
+    # onto that surface would push two distinct concepts into one field (hybrid complexity).
     Role.IMPLEMENTER: (
         "As the implementer: when you open or update a develop→main pull request, hand to the "
         f"PR-gate — end your reply with `NEXT: {PR_REVIEW_TOKEN} <owner/repo#n>` (the PR ref) so "
         "the independent naysayer review runs before any human merge. For other work, hand back "
         "to the proposer for a spec-review (`NEXT: <proposer persona>`); for a Tier-C decision "
-        f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself."
+        f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself. "
+        f"When you hand to `{HUMAN_TOKEN}`, name the Tier-C type on the line above your handoff, "
+        "e.g.:\n\n"
+        "    TIER-C: merge-protected\n"
+        f"    NEXT: {HUMAN_TOKEN}\n\n"
+        f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` / `other:<one-line reason>`. This is "
+        "a calibration tag the conductor records so we can tell judgement-Tier-C apart from "
+        "routing-artefact Tier-C; it does NOT redefine what Tier-C is."
     ),
     Role.NAYSAYER: (
         "As the naysayer: after your critique, hand back to the proposer if your objections need a "
