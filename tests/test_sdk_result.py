@@ -407,6 +407,219 @@ def test_absent_dump_survives_a_broken_property() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# T-quarantine-reasons-captured-but-never-read (msg-2944 §5) — the projection
+# for ``permission_denials``. Four acceptance criteria named verbatim in the
+# spec: property (bounded) / readability / (c)-independence / [] non-regression.
+# --------------------------------------------------------------------------- #
+
+
+def test_permission_denials_projection_readability_reason_reaches_the_marker() -> None:
+    """A mapping-shaped denial must reach the marker as text — not ``list(len=1)``.
+
+    This is the whole point of the projection (msg-2944 §5, readability
+    acceptance criterion). Before the projection, a real
+    ``permission_denials=[{tool_name: …, tool_input: …, rule: …}]`` was
+    summarised as ``"list(len=1)"`` by ``_summarize_value``'s scalar-only
+    predicate (the elements are dicts, so the ``all(isinstance(scalar))``
+    check at line 168 fails). The projection reduces each element to a
+    bounded ``"k=v"`` string ahead of time so the outer predicate accepts
+    the list and the element-wise preservation branch runs.
+
+    A reader of the marker must be able to see WHAT was denied — the
+    ``list(len=1)`` outcome carries no reason and is exactly the defect
+    this whole thread exists to remove.
+    """
+    denial = {
+        "tool_name": "Bash",
+        "tool_input": "git push origin main",
+        "rule": "branch-protection",
+    }
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    # No opaque length-only summary anywhere in the pipeline.
+    assert captured != "list(len=1)"
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    # The denial content is legible in the projected element.
+    element = captured[0]
+    assert isinstance(element, str)
+    assert "tool_name=Bash" in element
+    assert "rule=branch-protection" in element
+    assert "git push origin main" in element
+
+    # Picker treats the denial as a real reason (it is one).
+    assert detail["reason_source"] == "field:permission_denials"
+    # Sanity: the marker's message string carries the denial too.
+    assert "Bash" in detail["message"]
+
+
+def test_permission_denials_projection_c_independence_never_merged_into_errors() -> None:
+    """The (c) constraint from msg-2944 §1 pinned as a hard test.
+
+    Einstein msg-2943 (c) verdict: authorisation-failure and
+    domain-invariant-violation surfaces must NEVER be merged into a single
+    diagnostic pipeline. In this codebase that means ``permission_denials``
+    is emitted as an INDEPENDENT top-level key inside ``captured_fields``,
+    and its contents are never merged into ``errors[]``. Pin here so a
+    future refactor cannot silently collapse them (msg-3156: "a test that
+    fails if a future change collapses them").
+    """
+    final = _FakeResultMessage(
+        result=None,
+        permission_denials=[
+            {"tool_name": "Write", "rule": "read-only-branch"},
+        ],
+        errors=["something else entirely"],
+    )
+    detail = capture_is_error_detail(final)
+    fields = detail["captured_fields"]
+
+    # Independent top-level keys, both present, structurally separate.
+    assert "permission_denials" in fields
+    assert "errors" in fields
+    assert fields["permission_denials"] != fields["errors"]
+
+    # The denial content did not leak into errors[].
+    errors_summary = fields["errors"]
+    assert errors_summary == ["something else entirely"]
+    for entry in errors_summary:
+        assert "tool_name" not in entry
+        assert "read-only-branch" not in entry
+
+    # And symmetrically, the errors[] content did not leak into the denial.
+    denials_summary = fields["permission_denials"]
+    assert isinstance(denials_summary, list)
+    for entry in denials_summary:
+        assert "something else entirely" not in entry
+
+
+def test_permission_denials_projection_empty_list_non_regression() -> None:
+    """``permission_denials=[]`` must behave EXACTLY as it did pre-change.
+
+    C-group observation (msg-2771 §4 / msg-2944 §5 non-regression criterion):
+    one of the 10 live sessions carried ``permission_denials=[]``. The
+    projection must not turn that into ``["+0 more"]`` or any other
+    non-empty artefact — an empty list stays an empty list, so
+    :func:`_is_empty_reason_value` keeps returning True and the picker
+    falls through to the next candidate exactly as before.
+    """
+    final = _FakeResultMessage(
+        result=None,
+        permission_denials=[],
+        api_error_status=429,  # a real reason on a later field
+    )
+    detail = capture_is_error_detail(final)
+
+    # Empty stays empty in both raw-adjacent surfaces.
+    assert detail["captured_fields"]["permission_denials"] == []
+    # The picker skips the empty denial list and lands on the real reason.
+    assert detail["reason_source"] == "field:api_error_status"
+    assert "429" in detail["message"]
+
+
+def test_permission_denials_projection_is_bounded_under_pathological_input() -> None:
+    """Property test: pathological denials cannot balloon the marker.
+
+    msg-2944 §5 acceptance criterion: "deep nesting / huge strings / many
+    keys / circular refs" must not blow past the current per-field length
+    cap or crash. The bound this test enforces is the SAME constant as
+    every other captured string (``_FIELD_VALUE_MAX_LEN`` = 500 + the
+    truncation footer). PR #181 round 3's ``bounded is bounded`` guarantee
+    is preserved by the projection, not weakened.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    huge_string = "z" * 50_000
+    deep_nest: Any = {"level": 0}
+    cursor = deep_nest
+    for i in range(1, 100):
+        cursor["nested"] = {"level": i}
+        cursor = cursor["nested"]
+
+    # Circular reference at a value slot.
+    cyc: dict[str, Any] = {"self": None, "tool_name": "cyc"}
+    cyc["self"] = cyc
+
+    many_keys = {f"key_{i}": f"value_{i}" for i in range(500)}
+
+    denials = [
+        {"tool_name": "Bash", "tool_input": huge_string, "rule": "r1"},
+        {"tool_name": "Deep", "tool_input": deep_nest, "rule": "r2"},
+        {"tool_name": "Cyclic", "tool_input": cyc, "rule": "r3"},
+        {"tool_name": "Wide", "tool_input": many_keys, "rule": "r4"},
+        # Non-dict, non-scalar element (an arbitrary object).
+        object(),
+        # Scalar element.
+        "raw string denial",
+        # None element.
+        None,
+    ]
+    final = _FakeResultMessage(result=None, permission_denials=denials)
+
+    # No exception, no infinite recursion — the pipeline returns cleanly.
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    # Each element is a string, and each string is bounded by the same
+    # per-field cap as every other captured string.
+    max_allowed_len = _FIELD_VALUE_MAX_LEN + len("…(+999999ch)")
+    for element in captured:
+        assert isinstance(element, str), f"unexpected type in projection: {type(element)!r}"
+        assert len(element) <= max_allowed_len, (
+            f"projected denial exceeded per-field bound: len={len(element)}"
+        )
+
+    # And the picker still recognises the (non-empty) list as a reason.
+    assert detail["reason_source"] == "field:permission_denials"
+
+
+def test_permission_denials_projection_truncates_long_lists_with_overflow_marker() -> None:
+    """A denial list longer than ``_SMALL_LIST_ELEM_LIMIT`` truncates with a
+    trailing ``"+K more"`` string so the count of dropped entries survives.
+
+    The overflow marker itself is diagnostic: "one denial" vs "twenty
+    denials, first eight preserved" is a distinction a reader must be able
+    to make from the marker alone.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _SMALL_LIST_ELEM_LIMIT
+
+    denials = [{"tool_name": f"tool_{i}", "rule": "r"} for i in range(20)]
+    final = _FakeResultMessage(result=None, permission_denials=denials)
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    # Final list length MUST fit within ``_SMALL_LIST_ELEM_LIMIT`` so the
+    # outer scalar-only predicate in ``_summarize_value`` still accepts it.
+    # The projection reserves one slot for the overflow marker inside that
+    # bound (kept = LIMIT - 1, then + 1 marker = LIMIT total).
+    assert len(captured) == _SMALL_LIST_ELEM_LIMIT
+    kept = _SMALL_LIST_ELEM_LIMIT - 1
+    assert captured[-1] == f"+{20 - kept} more"
+    # And the preserved entries still carry their content.
+    assert "tool_name=tool_0" in captured[0]
+
+
+def test_permission_denials_projection_scalar_only_list_passes_through_normally() -> None:
+    """A denial list that already contains only scalars must not double-project.
+
+    The projection prepends ``str()`` on scalars via ``_scalarize_denial_value``,
+    which for a plain string just runs it through :func:`_summarize_value`
+    (bounded, but otherwise identity). This test pins that a "reasonable"
+    input reaches the marker as-is — the projection is only supposed to
+    change the *unreasonable* dict case.
+    """
+    final = _FakeResultMessage(result=None, permission_denials=["denied: Bash"])
+    detail = capture_is_error_detail(final)
+    captured = detail["captured_fields"]["permission_denials"]
+    assert captured == ["denied: Bash"]
+    assert detail["reason_source"] == "field:permission_denials"
+
+
+# --------------------------------------------------------------------------- #
 # emit_sdk_error_marker + find_sdk_error_signal — the transport (S-6)
 # --------------------------------------------------------------------------- #
 
