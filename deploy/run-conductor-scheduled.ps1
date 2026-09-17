@@ -249,6 +249,44 @@ function ConvertTo-UtcInstant {
     return [datetime]::Parse("$Value").ToUniversalTime()
 }
 
+# Parse a magickit-supplied ISO-8601 UTC timestamp (e.g. "2026-09-08T20:32:19.106309Z") into a UTC
+# [datetimeoffset], returning $null when the input is $null, empty, or unparseable.
+#
+# Called by the control probe log (F4b: HOLD NOT ACKNOWLEDGED warning below) and — per Bohr
+# msg-2789 §3 (F2-d) — reserved for reuse by Test-HoldObserved's future freshness gate (F2).
+#
+# WHY A DEDICATED PARSER, when ConvertTo-UtcInstant already exists just above:
+#
+# 1. **String comparison is unsafe here (F2-a).** ISO-8601 lexical ordering only agrees with
+#    time ordering when precision matches. `desired_at` may be microsecond-precise
+#    (e.g. "2026-09-08T20:32:19.106309Z") while `observed_at` is second-precise
+#    ("2026-09-08T20:32:19Z"). Comparing those as strings puts the microsecond value BEFORE the
+#    second value ('.' 0x2E < 'Z' 0x5A), so a same-second acknowledgement reads as stale. The
+#    caller MUST type-parse both operands.
+# 2. **Parse failure MUST NOT throw here (F2-c).** The enclosing bug this helper serves is
+#    "hold is silently unacknowledged". An unparseable timestamp on that path must be treated as
+#    "no acknowledgement", not as an unhandled exception that aborts the tick — otherwise the
+#    fail direction of the sweep flips from launch-anyway to abort, which parks every project
+#    the moment magickit returns a novel timestamp shape. ConvertTo-UtcInstant intentionally
+#    throws (its callers want that); this one intentionally returns $null.
+# 3. **AssumeUniversal + AdjustToUniversal + InvariantCulture** together pin the parse: a bare
+#    timestamp with no `Z` still lands in UTC (rather than the local machine's TZ, which would
+#    produce off-by-hours "stale minutes" values), and the parse never depends on the current
+#    culture's date format.
+function ConvertFrom-ControlTimestamp {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $s = "$Value"
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    try {
+        return [datetimeoffset]::Parse(
+            $s,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+    }
+    catch { return $null }
+}
+
 # Merge-on-write: re-read the file just before writing and preserve any keys the operator removed
 # during the tick. Used for the quarantine.json state file, where BOTH the sweep and an external
 # tool (Clear-Quarantine) may write during a sweep run. (The head-skip state file
@@ -366,6 +404,88 @@ function Test-HoldObserved {
     if ($null -eq $Control) { return $false }          # unreadable probe — fail open, launch
     if ($Control.desired_state -ne 'hold') { return $false }
     return ($Control.observed_state -eq 'hold')
+}
+
+# HOLD-acknowledgement freshness verdict — pure predicate, extracted for testability.
+#
+# Called ONLY when the operator has asked for HOLD ($Control.desired_state -eq 'hold'). Returns
+# $null when the acknowledgement is fresh (nothing to warn about); returns
+# @{ Reason = <string> } when the acknowledgement has not landed and the sweep should log the
+# HOLD NOT ACKNOWLEDGED line. This shape lets the caller stay a single `if ($null -ne $verdict)`
+# branch and keeps the two ack-not-landed messages distinguished only in `.Reason` (the outer
+# log line is the same greppable prefix for both, per Bohr msg-2789 §3).
+#
+# Three edges caught by PR #279 naysayer review (rounds 1 & 2) that the naive freshness check
+# misses. The invariant they compose to is:
+#
+#   observed_state = 'hold' is the acknowledgement itself; observed_at is only a freshness metric.
+#
+# Every silent-verdict path below must therefore confirm observed_state = 'hold'. Every
+# ack-not-landed path is either "no hold observation was ever reported" or "the observation is
+# stale relative to the request".
+#
+# (1) OLDER MAGICKIT SERVERS (no timestamp fields). Servers on the old schema return $null for
+#     BOTH desired_at and observed_at while still setting observed_state = 'hold'. In that case
+#     the ack HAS landed — we simply cannot measure its freshness — and the correct verdict is
+#     "fresh" (silent). Treating a null observed_at as "never acknowledged" would fire a false
+#     warning on every tick against those hosts (PR #279 review round 1, blocking objection #1).
+#     Only when observed_state itself is NOT 'hold' does a null observed_at mean "never
+#     acknowledged".
+#
+# (2) LAG IS MEASURED FROM desired_at, NOT observed_at. The operator's question is "how long
+#     has my HOLD request been sitting unacknowledged?", which is UtcNow - desired_at.
+#     Subtracting observed_at instead measures how long it has been since the daemon last
+#     observed ANYTHING for this project — after a maintenance gap that number can be days
+#     even though the pending HOLD is 10 seconds old (PR #279 review round 1, blocking
+#     objection #2). Both raw timestamps still appear in the outer log line's `desired_at=…` /
+#     `observed_at=…` display; the summary metric quoted in `.Reason` is the request-pending
+#     duration.
+#
+# (3) A FRESH observed_at DOES NOT IMPLY AN ACK. The daemon can refresh observed_at during a
+#     routine status update while still reporting observed_state = 'run' — the timestamp is a
+#     heartbeat, not a state transition. If we treated observed_at >= desired_at as a
+#     sufficient condition on its own, that heartbeat would silence the warning against a
+#     hold the daemon has not entered (PR #279 review round 2, blocking objection). The fresh
+#     branch must also require observed_state = 'hold'; when the timestamp is fresh but the
+#     state is something else, the correct verdict is "not acknowledged" (with the observed
+#     state quoted for triage — the operator asked for hold and got run/supervised/other).
+function Test-HoldAckStale {
+    param($Control, $Now)
+
+    if ($null -eq $Control)                          { return $null }
+    if ($Control.desired_state -ne 'hold')           { return $null }
+
+    $desiredAt = ConvertFrom-ControlTimestamp $Control.desired_at
+    $observedAt = ConvertFrom-ControlTimestamp $Control.observed_at
+
+    if ($null -eq $observedAt) {
+        # Edge (1). observed_state is the acknowledgement itself; the timestamp is only for
+        # freshness. An old magickit that acknowledges without a timestamp is still acknowledged.
+        if ($Control.observed_state -eq 'hold') { return $null }
+        return @{ Reason = 'never acknowledged' }
+    }
+
+    if ($null -eq $desiredAt) {
+        # desired_at is unmeasurable, so freshness is unmeasurable — but observed_state still
+        # tells us whether the daemon is in hold. Same asymmetry as edge (1): silent only when
+        # the state IS hold; warn otherwise (edge (3) applied to the missing-desired_at branch).
+        if ($Control.observed_state -eq 'hold') { return $null }
+        return @{ Reason = "not acknowledged (observed_state=$($Control.observed_state))" }
+    }
+
+    if ($observedAt -ge $desiredAt) {
+        # Edge (3). A fresh timestamp only counts as an acknowledgement when observed_state
+        # is actually 'hold'. Otherwise the timestamp is a heartbeat over a non-hold state.
+        if ($Control.observed_state -eq 'hold') { return $null }
+        return @{ Reason = "not acknowledged (observed_state=$($Control.observed_state))" }
+    }
+
+    # Edge (2). Lag is UtcNow - desired_at (how long the operator's request has been pending),
+    # NOT UtcNow - observed_at (how long since the last observation of any kind). The observed
+    # state is stale here regardless of value, so we do not gate this branch on observed_state.
+    $nowUtc = if ($null -eq $Now) { [datetimeoffset]::UtcNow } else { $Now }
+    $lagMinutes = [math]::Round(($nowUtc - $desiredAt).TotalMinutes, 1)
+    return @{ Reason = "$lagMinutes minutes stale" }
 }
 
 # --- resource-axis HOLD gate (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) ------
@@ -3152,7 +3272,31 @@ try {
         $c = Invoke-ControlProbe -Project $proj
         $controlByProject[$proj] = $c
         if ($null -ne $c) {
-            Write-Log "control probe [$proj]: desired=$($c.desired_state) observed=$($c.observed_state) configured=$($c.configured)"
+            # F4b (Bohr msg-2789 §3): include desired_at/observed_at on the probe line, and — when
+            # the operator has asked for HOLD but the acknowledgement is missing or stale — emit a
+            # SEPARATE, greppable line with the prefix ``HOLD NOT ACKNOWLEDGED``. The separate line
+            # is deliberate: msg-2733 §6 documents that prior instances of this defect were seen,
+            # correctly suspected, then dismissed as timing noise because no named log entry pinned
+            # them. A distinct substring makes classification stick — the operator's dashboard, a
+            # grep, or an alert rule can hook it without pattern-matching a values-heavy probe row.
+            $desiredAtDisplay = if ($null -eq $c.desired_at)  { '(null)' } else { "$($c.desired_at)" }
+            $observedAtDisplay = if ($null -eq $c.observed_at) { '(null)' } else { "$($c.observed_at)" }
+            Write-Log ("control probe [{0}]: desired={1} desired_at={2} observed={3} observed_at={4} configured={5}" -f `
+                $proj, $c.desired_state, $desiredAtDisplay, $c.observed_state, $observedAtDisplay, $c.configured)
+
+            if ($c.desired_state -eq 'hold') {
+                # Fresh-vs-stale ack decision (F4b). Bohr msg-2789 §3 F2-a: comparison MUST be on
+                # parsed [datetimeoffset] values, not on raw ISO-8601 strings — the parse and the
+                # two-edge verdict now live in Test-HoldAckStale (see that function's block-comment
+                # for the false-positive and lag-source fixes from PR #279 naysayer review). This
+                # line is purely observability: neither verdict gates the launch. F2 (the predicate
+                # change) is a separate, later commit.
+                $ackVerdict = Test-HoldAckStale -Control $c
+                if ($null -ne $ackVerdict) {
+                    Write-Log ("HOLD NOT ACKNOWLEDGED [{0}] — desired_at={1} observed_at={2} ({3})" -f `
+                        $proj, $desiredAtDisplay, $observedAtDisplay, $ackVerdict.Reason)
+                }
+            }
         }
         if (Test-HoldObserved -Control $c) { continue }
         $h = Invoke-HeadProbe -Project $proj
@@ -3500,7 +3644,27 @@ try {
         $verdict = Get-ConductorVerdict -Output $output
         # Keep the daemon's raw output only when the run was eventful; a plain `rounds=0` stop is
         # fully described by the summary line below.
-        if ($code -ne 0 -or $null -eq $verdict.rounds -or $verdict.rounds -gt 0) {
+        #
+        # F4a (Bohr msg-2789 §3): but ALSO keep the raw output when the run carries a
+        # ``loop control:`` diagnostic (see ``conductor/control.py`` — both the ``read()``
+        # fail-safe warning and the ``report_observed()`` swallow-and-warn use that prefix)
+        # OR when the daemon reported ``reason=hold``. On 2026-09-09 05:45 (msg-2733 §4) two
+        # ``code=0 && reason=hold && rounds=0`` runs left ZERO stdout lines in the log because
+        # this filter drops the whole ``$output`` bucket on eventless runs; that made the split
+        # between "control-plane transport failed" (H1) and "report_observed failed" (H2)
+        # invisible from the log alone. This clause makes both hypotheses' evidence survive.
+        #
+        # ``Select-String -Quiet -SimpleMatch`` is used deliberately in place of a bare
+        # ``$output -match 'loop control:'``. The naive form has an array-vs-scalar hazard:
+        # when ``$output`` collapses to a single string that DOES NOT contain the pattern,
+        # ``-match`` returns ``$false``; wrapping that in ``@(...).Count -gt 0`` gives 1 (the
+        # boolean is a single-element array), so the guard fails OPEN and the filter unloads
+        # every eventless run into the log (Einstein msg-2787 blocking-objection). ``-Quiet``
+        # returns a plain ``[bool]`` for both scalar and array inputs; ``-SimpleMatch`` avoids
+        # any accidental regex-escape drift on the fixed prefix.
+        $isControlBearing = ($verdict.reason -eq 'hold') -or `
+                            [bool]($output | Select-String -Pattern 'loop control:' -SimpleMatch -Quiet)
+        if ($code -ne 0 -or $null -eq $verdict.rounds -or $verdict.rounds -gt 0 -or $isControlBearing) {
             Add-Content -LiteralPath $logPath -Value $output -Encoding utf8
         }
         Write-Log "$($cand.key) -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"

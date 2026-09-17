@@ -13,13 +13,20 @@ moment magickit hiccups, which is exactly the silent-stop failure the sweep is b
 
 Output: one JSON object on stdout, e.g.
 
-    {"project": "spirrow-voxelworld", "desired_state": "hold", "observed_state": "run",
-     "configured": true}
+    {"project": "spirrow-voxelworld", "desired_state": "hold",
+     "desired_at": "2026-09-08T20:32:19.106309Z", "observed_state": "run",
+     "observed_at": "2026-09-07T23:20:28Z", "configured": true}
 
 ``desired_state`` is what the operator set (or ``run`` for a project nobody has configured — see
 ``conductor/control.py`` on why an absent row is not a failure). ``observed_state`` is what the loop
 last reported acting on; the sweep does not route on it, but it is printed so the log shows whether
 a HOLD had already landed before this tick.
+
+``desired_at`` and ``observed_at`` are the magickit-server-assigned wall-clock instants those two
+values were written at. They are surfaced here so the sweep wrapper can log them and — per
+Bohr msg-2789 §3 / F4b — warn on the sweep log when a HOLD's acknowledgement has not landed
+(``observed_at`` older than ``desired_at``, or ``null``). This is a strictly-observability
+addition: this script does not gate on either value.
 """
 
 from __future__ import annotations
@@ -58,7 +65,14 @@ async def fetch_control(project: str, url: str | None) -> dict[str, Any]:
     return {
         "project": project,
         "desired_state": payload["desired_state"],
+        # ``desired_at`` / ``observed_at`` are magickit-server-assigned wall-clock instants
+        # (the client never sends timestamps — confirmed in Heisenberg msg-2788 §"F2 前提").
+        # Surfaced so the sweep wrapper can compute the HOLD-ack lag (F4b). The .get() calls
+        # tolerate an older magickit that omits the fields; the wrapper treats a missing
+        # ``observed_at`` under ``desired_state == "hold"`` as "never acknowledged".
+        "desired_at": payload.get("desired_at"),
         "observed_state": payload.get("observed_state"),
+        "observed_at": payload.get("observed_at"),
         "configured": bool(payload.get("configured")),
     }
 
