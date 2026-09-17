@@ -680,6 +680,87 @@ def test_permission_denials_projection_preserves_non_ascii_in_dict_elements() ->
     assert "🚫" in reparsed_element
 
 
+def test_permission_denials_projection_single_large_value_preserves_key() -> None:
+    """PR #288 PR-gate msg-3345 blocking regression fix.
+
+    Regression scenario: a dict denial with a single key whose value
+    exceeds ``_FIELD_VALUE_MAX_LEN``. Before the two-phase budgeting
+    (msg-3345 fix), the previous pair-boundary truncation dropped the
+    entire pair (including the key), leaving only
+    ``…(+1 pairs truncated)`` — a total loss of visibility.
+
+    After the fix, the key MUST be preserved and the value MUST render
+    as a bounded prefix with a truncation footer. This is the naysayer's
+    "budget the value before quoting so the whole pair fits" strategy,
+    which is strictly safer than blind slicing (no mid-quote severance)
+    AND strictly better for content preservation than dropping.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    huge = "x" * 5000
+    denial = {"tool_input": huge}
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    element = captured[0]
+    assert isinstance(element, str)
+
+    # Key preserved — this is the load-bearing pin.
+    assert '"tool_input"=' in element, f"single-large-value dict dropped its key: {element!r}"
+
+    # Value has a truncation footer (bounded), not raw x's forever.
+    assert "ch)" in element, f"value did not carry a truncation footer: {element!r}"
+
+    # And the whole element stays within the per-field cap.
+    assert len(element) <= _FIELD_VALUE_MAX_LEN, f"element exceeded budget: len={len(element)}"
+
+    # No mid-quote slice — every " span is closed. Simple structural
+    # check: raw quote count is even (each opening " has a closing ").
+    # (No inner escaped ``\"`` in this input since we used plain x's.)
+    assert element.count('"') % 2 == 0
+
+    # Line integrity intact.
+    assert "\n" not in element
+    assert "\r" not in element
+
+
+def test_permission_denials_projection_multi_pair_with_one_large_value_preserves_all_keys() -> None:
+    """PR #288 PR-gate msg-3345 blocking regression fix — multi-pair case.
+
+    A dict with several keys where ONE has a large value must not lose
+    the other keys. Under the pre-fix pair-boundary truncation, the
+    large pair was dropped and any pairs after it were also dropped
+    (once the loop broke). After the fix, all keys survive.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    denial = {
+        "tool_name": "Bash",
+        "tool_input": "x" * 5000,
+        "rule": "branch-protection",
+        "reason": "unbypassable-ruleset",
+    }
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    element = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(element, str)
+
+    # Every key preserved.
+    for key in ["tool_name", "tool_input", "rule", "reason"]:
+        assert f'"{key}"=' in element, (
+            f"key {key!r} dropped from multi-pair overflow projection: {element!r}"
+        )
+
+    # The large value has a truncation footer; the small ones don't.
+    # (We can't assert this precisely without parsing, but the total
+    # length is bounded, which is the important guarantee.)
+    assert len(element) <= _FIELD_VALUE_MAX_LEN
+
+
 def test_join_pairs_bounded_returns_full_join_when_it_fits() -> None:
     """PR #288 PR-gate msg-3339 advisory-eager-truncation fix.
 
@@ -716,6 +797,29 @@ def test_join_pairs_bounded_returns_full_join_when_it_fits() -> None:
     )
     assert "pairs truncated)" not in result
     assert len(result) <= _FIELD_VALUE_MAX_LEN
+
+
+def test_join_pairs_bounded_respects_budget_when_footer_alone_exceeds_it() -> None:
+    """PR #288 PR-gate msg-3345 advisory boundary-completeness fix.
+
+    Edge case unreachable in practice (``_FIELD_VALUE_MAX_LEN`` = 500,
+    max footer ~21 chars) but the boundary math should be complete:
+    when ``budget`` is exceptionally small (< ``max_footer_len + 1``),
+    the plain-text footer alone can exceed budget. Before this fix, the
+    helper returned an over-budget footer and relied on the outer
+    ``_summarize_value``'s blind slice to enforce the boundary
+    retroactively. After the fix, the helper hard-slices the footer as
+    a last resort so its return contract ("no longer than budget") is
+    always honoured.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _join_pairs_bounded
+
+    # Pass a tiny budget that's smaller than the footer.
+    pairs = ['"tool"="Bash"']
+    result = _join_pairs_bounded(pairs, budget=10)
+    assert len(result) <= 10, (
+        f"tiny-budget edge case broke the contract: len={len(result)}, result={result!r}"
+    )
 
 
 def test_join_pairs_bounded_reserves_room_for_joining_space() -> None:

@@ -222,7 +222,65 @@ def _join_pairs_bounded(pairs: list[str], budget: int) -> str:
         used += add
     dropped = len(pairs) - len(kept)
     footer = f"…(+{dropped} pairs truncated)"
-    return (" ".join(kept) + " " + footer) if kept else footer
+    result = (" ".join(kept) + " " + footer) if kept else footer
+    # Boundary completeness (PR #288 PR-gate msg-3345 advisory): when
+    # ``budget`` is exceptionally small (< ``max_footer_len + 1``), the
+    # footer alone can exceed ``budget``. Unreachable in practice with
+    # ``_FIELD_VALUE_MAX_LEN`` = 500 and ~21-char footers, but the boundary
+    # math should be complete regardless. Fall back to hard-slicing the
+    # footer as a last resort; the caller's contract is "no longer than
+    # budget", not "structurally intact" in this degenerate case.
+    if len(result) > budget:
+        return result[:budget]
+    return result
+
+
+def _build_budgeted_pairs(raw_pairs: list[tuple[str, str]], budget: int) -> list[str]:
+    """Build quoted ``"K"="V"`` pairs whose values are budgeted to fit.
+
+    Called from :func:`_project_denial_element`'s phase-2 overflow path
+    (PR #288 PR-gate msg-3345 blocking regression fix). Given the raw
+    ``(key, value)`` string tuples for a dict-shaped denial whose fully-
+    quoted join exceeds ``budget``, this helper rebuilds each pair with
+    a per-value budget derived from an equal share of the total budget,
+    so no key gets dropped entirely and every value survives as a
+    bounded prefix + ``…(+Nch)`` footer.
+
+    The value is truncated on its RAW form before being handed to
+    :func:`json.dumps`; because ``json.dumps`` quoting is applied to a
+    shorter string, the resulting quote span is structurally valid — no
+    mid-quote slicing is possible from this code path. That is the
+    naysayer's proposed "budget the value before quoting so the whole
+    pair fits" strategy from msg-3342.
+
+    If a key alone consumes its pair's share (very rare — would need a
+    key hundreds of characters long), the value falls back to ``""``
+    with a marker so the key remains visible.
+    """
+    if not raw_pairs:
+        return []
+    n = len(raw_pairs)
+    # Per-pair total budget: an equal share of the total, minus the joining
+    # space that will separate this pair from the next one.
+    per_pair = max(30, budget // n - 1)
+    # Small footer-reservation constant used inside each pair's value budget.
+    # ``…(+999999ch)`` is 12 chars — the worst case footer for values seen
+    # in practice, safe against very long values (up to 999_999 chars).
+    v_footer_reserve = len("…(+999999ch)")
+    result: list[str] = []
+    for k, v in raw_pairs:
+        key_json = json.dumps(k, ensure_ascii=False)
+        # Value budget: per_pair - key_json - '=' - 2 value quotes - footer.
+        v_budget = per_pair - len(key_json) - 3 - v_footer_reserve
+        if v_budget < 1:
+            # Key alone consumes the pair's share. Preserve the key with a
+            # marker so it remains visible; the value is unrecoverable at
+            # this budget.
+            result.append(f"{key_json}=<value truncated>")
+            continue
+        v_truncated = v[:v_budget] + f"…(+{len(v) - v_budget}ch)" if len(v) > v_budget else v
+        result.append(f"{key_json}={json.dumps(v_truncated, ensure_ascii=False)}")
+    return result
 
 
 def _project_denial_element(elem: Any) -> str:
@@ -278,15 +336,21 @@ def _project_denial_element(elem: Any) -> str:
     captured string (``_FIELD_VALUE_MAX_LEN``), on TWO different paths that
     a reader of this docstring must not conflate:
 
-    * **Dict path** (this function's main branch): :func:`_join_pairs_bounded`
-      truncates the joined pair-text at whole-pair boundaries BEFORE the
-      outer :func:`_summarize_value` sees it. Doing the truncation here
-      rather than letting the generic string branch of ``_summarize_value``
-      slice blindly is the only structurally-safe option now that pairs are
-      quoted: a blind cut could sever a closing ``"`` (or split an escape
-      sequence like ``\\n`` in half), producing an unclosed JSON quote span
-      that a quote-aware log reader would treat as malformed (PR #288
-      PR-gate follow-up, blocking correctness objection).
+    * **Dict path** (this function's main branch): two-phase strategy.
+      Phase 1: build fully-quoted pairs with each value bounded by
+      :func:`_scalarize_denial_value`. If the join fits, return as-is
+      (common case, zero overhead). Phase 2: on overflow, rebuild pairs
+      via :func:`_build_budgeted_pairs`, which allocates each pair an
+      equal share of the total budget and truncates values inside their
+      raw form (before ``json.dumps`` quoting) so the resulting quote
+      span is structurally valid. This preserves every KEY and a
+      bounded prefix of every value — strictly better than dropping
+      whole pairs (PR #288 PR-gate msg-3345 blocking regression fix).
+      :func:`_join_pairs_bounded` acts as a final safety net against
+      pathological escape expansion, using whole-pair-boundary truncation
+      so a blind cut can never sever a JSON quote span or split an
+      escape sequence like ``\\n`` in half (PR #288 PR-gate follow-up,
+      earlier blocking correctness objection).
     * **Scalar path** (early return at the top of this function): a scalar
       element bypasses the projection machinery entirely and is bounded
       by :func:`_scalarize_denial_value`, which routes strings through
@@ -330,17 +394,42 @@ def _project_denial_element(elem: Any) -> str:
             # Sorting failed (mixed unorderable types after str() cast is
             # unlikely, but be defensive): fall back to insertion order.
             keys = list(source.keys())
+        # Two-phase pair budgeting (PR #288 PR-gate msg-3345 blocking
+        # regression fix). Phase 1: build pairs with the default per-value
+        # bound (``_FIELD_VALUE_MAX_LEN`` via ``_scalarize_denial_value``).
+        # If they join within budget, use as-is — this is the common path
+        # for small readable dicts and adds zero overhead.
+        raw_pairs = [(str(k), str(_scalarize_denial_value(source[k]))) for k in keys]
         pairs = [
-            f"{json.dumps(str(k), ensure_ascii=False)}"
-            f"={json.dumps(str(_scalarize_denial_value(source[k])), ensure_ascii=False)}"
-            for k in keys
+            f"{json.dumps(k, ensure_ascii=False)}={json.dumps(v, ensure_ascii=False)}"
+            for k, v in raw_pairs
         ]
-        # Pair-boundary-aware truncation BEFORE _summarize_value sees the text.
-        # Without this, a joined text over _FIELD_VALUE_MAX_LEN would be
-        # sliced mid-quote by _summarize_value's blind string truncation,
-        # leaving an unclosed JSON quote span — PR #288 PR-gate follow-up,
-        # blocking correctness objection.
-        text = _join_pairs_bounded(pairs, _FIELD_VALUE_MAX_LEN)
+        full = " ".join(pairs)
+        if len(full) <= _FIELD_VALUE_MAX_LEN:
+            text = full
+        else:
+            # Phase 2: overflow. Rebuild pairs with per-value budgets so
+            # every pair fits its share of the total budget. This preserves
+            # visibility into every KEY at the cost of shorter values —
+            # strictly better than the previous behaviour, which dropped
+            # entire pairs (including their keys) when a single pair
+            # exceeded budget. A dict like ``{"tool_input": "x" * 5000}``
+            # previously collapsed to just ``…(+1 pairs truncated)`` with
+            # NO key visible; now it renders as ``"tool_input"="xxx...…(+Nch)"``
+            # with the key preserved and the value truncated with a footer.
+            #
+            # The truncation happens on the RAW value string (before
+            # ``json.dumps``), so the resulting JSON quote span is
+            # structurally valid — this is why the naysayer's "budget the
+            # value before quoting so the whole pair fits" framing works:
+            # quoting a shorter string is still quoted correctly, and no
+            # blind mid-quote slice happens anywhere.
+            pairs = _build_budgeted_pairs(raw_pairs, _FIELD_VALUE_MAX_LEN)
+            # ``_join_pairs_bounded`` as a final safety net for pathological
+            # cases where JSON escape expansion (e.g., every character
+            # requiring ``\\uXXXX``) pushes a pair over its share even after
+            # per-value budgeting.
+            text = _join_pairs_bounded(pairs, _FIELD_VALUE_MAX_LEN)
     summarised = _summarize_value(text)
     return summarised if isinstance(summarised, str) else str(summarised)
 
