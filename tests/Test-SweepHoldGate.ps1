@@ -49,6 +49,16 @@ $fnOwnerMap = $functions | Where-Object { $_.Name -eq 'Get-SweepOwnerMap' } | Se
 if (-not $fnOwnerMap) { throw "function not found in sweep script: Get-SweepOwnerMap" }
 Invoke-Expression $fnOwnerMap.Extent.Text
 
+# ConvertFrom-ControlTimestamp is F4b's parse helper. It is used from the control probe log's
+# HOLD-ack freshness check today, and per Bohr msg-2789 §3 F2-d it will be reused by
+# Test-HoldObserved's freshness gate when F2 lands. The fail-mode is load-bearing (F2-c):
+# an unparseable timestamp MUST return $null (fall-through → launch), never raise (would flip
+# the sweep's fail direction from launch-anyway to abort-tick). Extracted via the same AST
+# idiom so a rename or inlining fails loudly here.
+$fnTs = $functions | Where-Object { $_.Name -eq 'ConvertFrom-ControlTimestamp' } | Select-Object -First 1
+if (-not $fnTs) { throw "function not found in sweep script: ConvertFrom-ControlTimestamp" }
+Invoke-Expression $fnTs.Extent.Text
+
 $script:failures = 0
 function Check {
     param([string]$Name, $Expected, $Actual)
@@ -271,6 +281,42 @@ try {
     Check "owner_map absent -> empty map (gate OFF, backward compat)" 0 $absentMap.Count
 }
 finally { Remove-Item -LiteralPath $tmpNoField.FullName -Force -ErrorAction SilentlyContinue }
+
+Write-Host ""
+Write-Host "ConvertFrom-ControlTimestamp — F4b parse helper (fall-through on unparseable, F2-c)"
+
+# A valid ISO-8601 with microseconds parses to the same UTC instant.
+$tsMicro = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19.106309Z'
+Check "microsecond-precision ISO -> parsed" ([datetimeoffset]) $tsMicro.GetType()
+Check "microsecond-precision ISO -> UTC offset" ([TimeSpan]::Zero) $tsMicro.Offset
+
+# A second-precision timestamp parses too — the whole point of the helper is not to rely on the
+# raw strings for ordering (F2-a: microsecond-vs-second precision flips lexical ordering).
+$tsSec = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19Z'
+Check "second-precision ISO -> parsed" ([datetimeoffset]) $tsSec.GetType()
+
+# The regression F2-a exists to prevent: microsecond value is LATER than the same-second value.
+# Naive string comparison would put the microsecond value FIRST ('.' < 'Z'), which would read as
+# stale. The parsed comparison must respect real time order.
+Check "F2-a: microsecond after same-second (parsed order)" $true ($tsMicro -gt $tsSec)
+
+# A missing microsecond field with a fractional-second observed_at (same second): observed newer.
+$dAt = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19Z'
+$oAt = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19.500000Z'
+Check "F2-a: fractional-second observed after bare-second desired" $true ($oAt -gt $dAt)
+
+# Fail-through cases — every one MUST return $null (F2-c: parse failure = "no ack"; never throw).
+Check "null -> null (never throws)"    $null (ConvertFrom-ControlTimestamp $null)
+Check "empty string -> null"           $null (ConvertFrom-ControlTimestamp '')
+Check "whitespace -> null"             $null (ConvertFrom-ControlTimestamp '   ')
+Check "garbage string -> null"         $null (ConvertFrom-ControlTimestamp 'not-a-date')
+Check "half-parsed date -> null"       $null (ConvertFrom-ControlTimestamp '2026-99-99T99:99:99Z')
+
+# A no-suffix timestamp is treated as UTC (AssumeUniversal + AdjustToUniversal), not as local
+# machine time. This is what keeps the "N minutes stale" metric in the HOLD NOT ACKNOWLEDGED
+# warning honest across daemon hosts in any timezone.
+$tsNoZ = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19'
+Check "bare (no Z) treated as UTC -> zero offset" ([TimeSpan]::Zero) $tsNoZ.Offset
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "sweep hold gate: $($script:failures) check(s) FAILED"; exit 1 }
