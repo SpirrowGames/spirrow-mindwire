@@ -1590,6 +1590,12 @@ def scope_from_probe(failure_status: int | None, probe_status: int) -> Scope:
 
     - ``probe_status == 401`` → :attr:`ENVIRONMENT_CREDENTIAL` (token itself is
       dead; the same fault greets every repo this credential touches).
+    - ``probe_status == 403`` → :attr:`ENVIRONMENT_CREDENTIAL` (token is
+      *suspended* at the credential level — SAML enforcement, GitHub abuse
+      detection, org disablement. Same blast radius as a dead token, so the
+      same key is used; msg-1987 Q2-B). ``probe_identity`` explicitly documents
+      that a suspended token returns 403 from ``GET /user``; PR-gate objection
+      2 caught that we were dropping this into UNKNOWN before this branch.
     - ``probe_status == 200`` and ``failure_status in {403, 404}`` →
       :attr:`ENVIRONMENT_PERMISSION` (credential lives, but has no access to
       *this* repo — a repo-scoped gap that is nonetheless not "this thread's
@@ -1611,6 +1617,12 @@ def scope_from_probe(failure_status: int | None, probe_status: int) -> Scope:
     through the alert-only path unless we can prove it is environment.
     """
     if probe_status == 401:
+        return Scope.ENVIRONMENT_CREDENTIAL
+    if probe_status == 403:
+        # Suspended credential (SAML / abuse protection / org disablement).
+        # Semantically the same as 401 for our purposes: the token itself
+        # cannot speak to GitHub anywhere, so every repo it touches is
+        # equally blocked. Route to the credential-level key.
         return Scope.ENVIRONMENT_CREDENTIAL
     if probe_status == 200:
         if failure_status in (403, 404):
@@ -1655,6 +1667,33 @@ class EnvironmentTerminalError(GitHubError):
         self.status_code = status_code
 
 
+class TargetTerminalError(GitHubHTTPError):
+    """A GitHub write failed with a TARGET-scoped terminal fault (post-classification).
+
+    Raised by the naysayer driver's submit path when :func:`classify_http_error`
+    returned :attr:`Retryability.TERMINAL` AND :func:`scope_from_probe` returned
+    :attr:`Scope.TARGET` — i.e. we have positive evidence that the failure
+    belongs to *this* PR, not the environment. Subclasses :class:`GitHubHTTPError`
+    so existing ``except GitHubHTTPError`` handlers keep working while callers
+    that need the scope decision can catch this specific type.
+
+    This exists because PR-gate objection 3 (msg-3188 review) found that using
+    ``exc.status_code not in (401,)`` to decide "post the target-terminal
+    suppression marker" silently collapses :attr:`Scope.UNKNOWN` into
+    :attr:`Scope.TARGET` — a 403 whose probe was unreachable (probe_status=0 →
+    UNKNOWN, fail-safe re-raise as plain :class:`GitHubHTTPError`) would still
+    hit the marker path and permanently poison the head. Making the marker
+    condition ``isinstance(exc, TargetTerminalError)`` restores the invariant
+    that UNKNOWN never collapses into a concrete scope value.
+    """
+
+    def __init__(self, source: GitHubHTTPError) -> None:
+        super().__init__(str(source), status_code=source.status_code)
+        # Preserve the raw exception's retry hints for observability parity.
+        self.retry_after = source.retry_after
+        self.rate_limited = source.rate_limited
+
+
 __all__ = [
     "CiState",
     "CiStatus",
@@ -1671,6 +1710,7 @@ __all__ = [
     "ReviewEvent",
     "ReviewInfo",
     "Scope",
+    "TargetTerminalError",
     "classify_http_error",
     "github_token",
     "naysayer_github_token",

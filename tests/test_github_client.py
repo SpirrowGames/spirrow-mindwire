@@ -23,6 +23,7 @@ from spirrow_mindwire.github.client import (
     ReviewEvent,
     ReviewInfo,
     Scope,
+    TargetTerminalError,
     _derive_ci_state,
     _required_workflows_from_env,
     classify_http_error,
@@ -973,6 +974,25 @@ def test_scope_from_probe_unexpected_probe_status_is_unknown() -> None:
     assert scope_from_probe(failure_status=403, probe_status=500) is Scope.UNKNOWN
 
 
+def test_scope_from_probe_403_probe_is_environment_credential_suspended_token() -> None:
+    # PR-gate objection 2 (msg pr-gate review of #280): probe_identity's docstring
+    # explicitly says a *suspended* token (SAML enforcement, GitHub abuse detection,
+    # org disablement) returns 403 from GET /user. The previous mapping table only
+    # handled probe 401 / 200 / anything-else-UNKNOWN, so a 403 probe fell through
+    # to UNKNOWN and (via _submit_review's re-raise) quarantined the thread — the
+    # exact false-quarantine that this PR exists to prevent for env-terminal faults.
+    #
+    # A suspended token has the same blast radius as a dead token (every repo it
+    # touches is equally blocked from writing), so it maps to the same key —
+    # Scope.ENVIRONMENT_CREDENTIAL — and the failure_status is irrelevant to the
+    # decision (a suspended token is a credential-level fact, not a repo-level one).
+    assert scope_from_probe(failure_status=401, probe_status=403) is Scope.ENVIRONMENT_CREDENTIAL
+    assert scope_from_probe(failure_status=403, probe_status=403) is Scope.ENVIRONMENT_CREDENTIAL
+    assert scope_from_probe(failure_status=404, probe_status=403) is Scope.ENVIRONMENT_CREDENTIAL
+    assert scope_from_probe(failure_status=422, probe_status=403) is Scope.ENVIRONMENT_CREDENTIAL
+    assert scope_from_probe(failure_status=None, probe_status=403) is Scope.ENVIRONMENT_CREDENTIAL
+
+
 def test_environment_terminal_error_carries_pr_scope_status() -> None:
     exc = EnvironmentTerminalError(
         pr=_PR,
@@ -984,6 +1004,42 @@ def test_environment_terminal_error_carries_pr_scope_status() -> None:
     assert exc.scope is Scope.ENVIRONMENT_CREDENTIAL
     assert exc.status_code == 401
     assert "dead pat" in str(exc)
+
+
+def test_target_terminal_error_subclasses_github_http_error_and_preserves_retry_hints() -> None:
+    # PR-gate objection 3: TargetTerminalError exists specifically so the replay
+    # suppression-marker branch can catch it *without* also catching a raw
+    # GitHubHTTPError whose scope was UNKNOWN. The subclass relationship keeps
+    # every existing `except GitHubHTTPError` handler correct (it is still one),
+    # while `isinstance(exc, TargetTerminalError)` gives the positive test the
+    # marker path now depends on.
+    src = GitHubHTTPError(
+        "POST /pulls/1/reviews returned 422: same identity",
+        status_code=422,
+        retry_after=None,
+        rate_limited=False,
+    )
+    wrapped = TargetTerminalError(src)
+    assert isinstance(wrapped, GitHubHTTPError)
+    assert wrapped.status_code == 422
+    assert wrapped.retry_after is None
+    assert wrapped.rate_limited is False
+    # The wrapper preserves the source message so operator logs remain diagnostic.
+    assert "same identity" in str(wrapped)
+
+
+def test_target_terminal_error_carries_rate_limit_hints_when_source_does() -> None:
+    # A 429 that gets classified as TARGET (in some future path) would still want
+    # to expose its Retry-After to a caller — verify the fields pass through.
+    src = GitHubHTTPError(
+        "POST … returned 429",
+        status_code=429,
+        retry_after=12.5,
+        rate_limited=True,
+    )
+    wrapped = TargetTerminalError(src)
+    assert wrapped.retry_after == 12.5
+    assert wrapped.rate_limited is True
 
 
 # ── fetch_pr_reviews_strict (D-7 strict-read wrapper) ──

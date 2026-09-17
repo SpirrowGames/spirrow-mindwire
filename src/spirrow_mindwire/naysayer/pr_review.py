@@ -64,6 +64,7 @@ from ..github.client import (
     ReviewEvent,
     ReviewInfo,
     Scope,
+    TargetTerminalError,
     classify_http_error,
     naysayer_github_token,
     scope_from_probe,
@@ -2341,37 +2342,73 @@ class NaysayerPrReviewDriver:
                 # (msg-1987 Q5-A rationale: record the attempted event, not the fallback).
                 await self._github.submit_review(pr, event=ReviewEvent.COMMENT, body=receipt.body)
                 return
-            classification = classify_http_error(exc)
-            if classification is Retryability.TERMINAL:
-                probe_status = await self._github.probe_identity()
-                scope = scope_from_probe(exc.status_code, probe_status)
-                logger.warning(
-                    "naysayer submit failure: pr=%s status_code=%s retryability=%s "
-                    "scope=%s decision=%s",
-                    pr.slug,
-                    exc.status_code,
-                    classification.value,
-                    scope.value,
-                    _submit_decision(scope),
-                )
-                if scope in (Scope.ENVIRONMENT_CREDENTIAL, Scope.ENVIRONMENT_PERMISSION):
-                    raise EnvironmentTerminalError(
-                        pr=pr,
-                        scope=scope,
-                        status_code=exc.status_code,
-                        message=f"environment-terminal on {pr.slug}: {exc}",
-                    ) from exc
-            else:
-                logger.warning(
-                    "naysayer submit failure: pr=%s status_code=%s retryability=%s "
-                    "scope=%s decision=%s",
-                    pr.slug,
-                    exc.status_code,
-                    classification.value,
-                    Scope.UNKNOWN.value,
-                    "raise",
-                )
-            raise
+            await self._classify_and_reraise(pr, exc, origin="submit")
+
+    async def _classify_and_reraise(self, pr: PrRef, exc: GitHubHTTPError, *, origin: str) -> None:
+        """Classify a :class:`GitHubHTTPError`, probe if terminal, then raise the typed variant.
+
+        Central funnel used by both :meth:`_submit_review` (write failures) and
+        :meth:`_maybe_replay_verdict` (strict-read failures) — PR-gate objection 1
+        (msg review of PR #280) caught that the strict-read path was NOT going
+        through classification, so a 401 on ``fetch_pr_reviews_strict`` bubbled
+        out as a plain :class:`GitHubHTTPError` and quarantined the thread. This
+        method is the single site where the classify → probe → typed-raise
+        transition happens.
+
+        Semantics (same for both origins):
+
+        * ``Retryability.RETRYABLE`` → re-raise the raw ``exc`` (Stage 2 will
+          layer retry on top; for now the caller sees a transient failure).
+        * ``Retryability.TERMINAL`` + ``Scope.ENVIRONMENT_*`` → raise
+          :class:`EnvironmentTerminalError` (daemon exits 2, alert-not-quarantine).
+        * ``Retryability.TERMINAL`` + ``Scope.TARGET`` → raise
+          :class:`TargetTerminalError` (a proper subclass of ``GitHubHTTPError``
+          that carries positive-evidence "this is thread-scoped" — callers that
+          want to write a suppression marker MUST catch this specifically, not
+          any ``GitHubHTTPError`` that happens to be non-401).
+        * ``Retryability.TERMINAL`` + ``Scope.UNKNOWN`` → re-raise the raw ``exc``
+          (fail-safe: DESIGN v3 §3 "未分類は必ず 1", and the ``Scope`` docstring's
+          "callers MUST NOT collapse UNKNOWN into either concrete value" —
+          keeping the raw type preserves the UNKNOWN-ness at the type level).
+
+        ``origin`` is a free-form tag included in the log record so the same
+        failure showing up on the read side vs the write side is distinguishable
+        in operations, without inventing a second log format.
+        """
+        classification = classify_http_error(exc)
+        if classification is Retryability.TERMINAL:
+            probe_status = await self._github.probe_identity()
+            scope = scope_from_probe(exc.status_code, probe_status)
+            logger.warning(
+                "naysayer %s failure: pr=%s status_code=%s retryability=%s scope=%s decision=%s",
+                origin,
+                pr.slug,
+                exc.status_code,
+                classification.value,
+                scope.value,
+                _submit_decision(scope),
+            )
+            if scope in (Scope.ENVIRONMENT_CREDENTIAL, Scope.ENVIRONMENT_PERMISSION):
+                raise EnvironmentTerminalError(
+                    pr=pr,
+                    scope=scope,
+                    status_code=exc.status_code,
+                    message=f"environment-terminal on {pr.slug} ({origin}): {exc}",
+                ) from exc
+            if scope is Scope.TARGET:
+                raise TargetTerminalError(exc) from exc
+            # UNKNOWN falls through — do NOT collapse into TARGET.
+        else:
+            logger.warning(
+                "naysayer %s failure: pr=%s status_code=%s retryability=%s scope=%s decision=%s",
+                origin,
+                pr.slug,
+                exc.status_code,
+                classification.value,
+                Scope.UNKNOWN.value,
+                "raise",
+            )
+        raise exc
 
     async def _maybe_replay_verdict(
         self,
@@ -2400,11 +2437,12 @@ class NaysayerPrReviewDriver:
            authorise a duplicate POST, DESIGN v3 §2).
 
         We use :meth:`~spirrow_mindwire.github.client.GitHubReviewClient.fetch_pr_reviews_strict`,
-        not the fail-soft variant — a terminal read failure here (a dead PAT) raises
-        :class:`GitHubHTTPError`, which propagates through the normal submit-failure
-        classification path (:meth:`_submit_review`) and eventually raises
-        :class:`EnvironmentTerminalError`, exiting the turn without POSTing a garbage
-        verdict (D-7 msg-1987).
+        not the fail-soft variant — a terminal read failure here (a dead PAT) is
+        routed through :meth:`_classify_and_reraise` (``origin="read"``) which is
+        the SAME funnel :meth:`_submit_review` uses. Env-scope failures raise
+        :class:`EnvironmentTerminalError` and exit the turn without POSTing a
+        garbage verdict; target/UNKNOWN failures re-raise and quarantine
+        (fail-safe) (D-7 msg-1987, PR-gate objection 1).
 
         A ``mindwire:unposted`` sentinel (see :func:`_target_terminal_suppression_marker`)
         on the chatroom body is our ONE dedup ledger against re-submitting a verdict we
@@ -2457,7 +2495,15 @@ class NaysayerPrReviewDriver:
         # Discharge check via STRICT read — the only path that raises on env-terminal.
         # A landed prior review means we do not re-POST; UNKNOWN (impossible here
         # because strict raises) would also refuse; NOT_LANDED authorises replay.
-        prior = await self._github.fetch_pr_reviews_strict(pr)
+        # PR-gate objection 1: the strict-read failure MUST be classified through
+        # the same funnel as a submit failure. Without this, a 401 on the read
+        # bubbles out as a plain GitHubHTTPError and quarantines the thread —
+        # exactly the failure mode this PR exists to prevent.
+        try:
+            prior = await self._github.fetch_pr_reviews_strict(pr)
+        except GitHubHTTPError as read_exc:
+            await self._classify_and_reraise(pr, read_exc, origin="read")
+            raise  # unreachable — _classify_and_reraise always raises
         head_landed = landed(
             prior,
             head_sha=ci.head_sha,
@@ -2489,17 +2535,29 @@ class NaysayerPrReviewDriver:
                 head_sha=ci.head_sha,
                 post_critique=post_critique,
             )
-        except GitHubHTTPError as exc:
-            # A target-terminal exception here (422 same-identity handled by fallback;
-            # 422 other / 404) means the verdict is undeliverable for structural reasons.
-            # Record a suppression marker via the chatroom so future ticks do not loop
-            # (msg-1984 §2). The environment-terminal path raises EnvironmentTerminalError
-            # above and exits the turn — not this branch.
-            classification = classify_http_error(exc)
-            if classification is Retryability.TERMINAL and exc.status_code not in (401,):
-                await self._post_target_terminal_marker(
-                    pr, ci, exc=exc, post_critique=post_critique
-                )
+        except TargetTerminalError as exc:
+            # POSITIVE evidence (via classify + probe in _submit_review) that this
+            # specific PR/head is terminally rejected — a 422/404/403 whose probe
+            # said the credential itself is fine, so the fault belongs to this PR.
+            # Record a suppression marker so future ticks do not loop (msg-1984 §2).
+            #
+            # PR-gate objection 3: the previous "TERMINAL and not 401" test was
+            # unsafe because a raw GitHubHTTPError re-raised from Scope.UNKNOWN
+            # (probe failed → could not decide scope) would still hit that branch
+            # and permanently poison the head. Requiring the typed TargetTerminalError
+            # is the load-bearing barrier: the Scope docstring's "callers must NOT
+            # collapse UNKNOWN into either concrete value" is now enforced by the
+            # type system, not by a hand-written status-code list.
+            await self._post_target_terminal_marker(pr, ci, exc=exc, post_critique=post_critique)
+            raise
+        except GitHubHTTPError:
+            # UNKNOWN scope (probe failed) or RETRYABLE — do NOT write a suppression
+            # marker. The invariant "UNKNOWN never collapses into TARGET" is what
+            # this branch preserves; the plain re-raise sends the fault down the
+            # quarantine path where an unknown-scope failure belongs (fail-safe,
+            # DESIGN v3 §3 "未分類は必ず 1"). The environment-terminal path is
+            # caught nowhere here because EnvironmentTerminalError does not
+            # subclass GitHubHTTPError — it propagates past both handlers.
             raise
 
         return PrReviewOutcome(
