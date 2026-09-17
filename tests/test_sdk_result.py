@@ -626,6 +626,98 @@ def test_permission_denials_projection_truncates_at_pair_boundaries_not_mid_quot
     assert "\r" not in element
 
 
+def test_permission_denials_projection_preserves_non_ascii_in_dict_elements() -> None:
+    """PR #288 PR-gate msg-3339 blocking regression fix.
+
+    Before this fix, the inner ``json.dumps`` in ``_project_denial_element``
+    used its default ``ensure_ascii=True``, so a dict denial containing
+    Japanese text, emojis, or accented letters would render as
+    ``\\uXXXX`` escape sequences inside the projected string. The outer
+    :func:`emit_sdk_error_marker` uses ``ensure_ascii=False``, so scalar
+    denials preserved non-ASCII while dict denials mangled it — an
+    asymmetry the naysayer correctly identified as a legibility
+    regression (from PR #283's pre-quoting behaviour, which preserved
+    non-ASCII in dict values as raw text).
+
+    Fix: pass ``ensure_ascii=False`` to both inner ``json.dumps`` calls so
+    the projection preserves non-ASCII printables symmetrically. Line
+    integrity is still guaranteed by RFC 8259's mandatory escape of
+    U+0000-U+001F, which ``ensure_ascii=False`` does not disable.
+    """
+    denial = {
+        "tool_name": "編集ツール",
+        "rule": "禁止-本番ブランチ",
+        "path": "docs/日本語/README.md",
+        "emoji": "🚫",
+    }
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    element = captured[0]
+    assert isinstance(element, str)
+
+    # Non-ASCII characters survive as literal Unicode (not \\uXXXX escapes).
+    assert '"tool_name"="編集ツール"' in element
+    assert '"rule"="禁止-本番ブランチ"' in element
+    assert '"path"="docs/日本語/README.md"' in element
+    assert '"emoji"="🚫"' in element
+
+    # No \\u escape sequences leaked into the projection.
+    assert r"\u" not in element, f"non-ASCII was aggressively ASCII-escaped: {element!r}"
+
+    # Round-trip through the marker emission (which also uses
+    # ensure_ascii=False) preserves the Unicode too, proving end-to-end
+    # legibility.
+    stream = io.StringIO()
+    emit_sdk_error_marker(detail, stream=stream)
+    payload = stream.getvalue()[len(SDK_ERROR_MARKER_PREFIX) :].rstrip("\n")
+    parsed = json.loads(payload)
+    reparsed_element = parsed["captured_fields"]["permission_denials"][0]
+    assert "編集ツール" in reparsed_element
+    assert "🚫" in reparsed_element
+
+
+def test_join_pairs_bounded_returns_full_join_when_it_fits() -> None:
+    """PR #288 PR-gate msg-3339 advisory-eager-truncation fix.
+
+    An earlier version of ``_join_pairs_bounded`` unconditionally reserved
+    ``max_footer_len + 1`` in its ``limit``, so a joined text whose true
+    length fell strictly between ``budget - max_footer_len - 1`` and
+    ``budget`` would be truncated and get a ``…(+N pairs truncated)``
+    footer appended — even though the raw join would have fit uncensored
+    within ``budget``. That's data lost for nothing.
+
+    Fix: fast-path check ``if len(full) <= budget: return full`` before
+    entering the footer-aware truncation path. Pin here with a case that
+    hits the previous edge exactly.
+    """
+    from spirrow_mindwire.adapters._sdk_result import (
+        _FIELD_VALUE_MAX_LEN,
+        _join_pairs_bounded,
+    )
+
+    # Two pairs whose joined length lands strictly between
+    # ``budget - max_footer_len - 1`` and ``budget``. max_footer_len for
+    # 2 pairs = len("…(+2 pairs truncated)") = 21. Previous limit for
+    # budget=500 was 500-21-1=478. Craft a join length of exactly 490 —
+    # inside budget but outside the old limit.
+    p1 = '"k1"="' + "a" * 240 + '"'  # len 248
+    p2 = '"k2"="' + "b" * 233 + '"'  # len 241
+    # Full join: 248 + 1 (space) + 241 = 490. Fits in budget=500,
+    # exceeds old limit=478. Pre-fix behaviour would have dropped p2.
+    result = _join_pairs_bounded([p1, p2], _FIELD_VALUE_MAX_LEN)
+    assert result == p1 + " " + p2, (
+        f"eager truncation regressed — pair was dropped even though the "
+        f"full join fits in budget. len(result)={len(result)}, "
+        f"len(full)={len(p1) + 1 + len(p2)}, budget={_FIELD_VALUE_MAX_LEN}"
+    )
+    assert "pairs truncated)" not in result
+    assert len(result) <= _FIELD_VALUE_MAX_LEN
+
+
 def test_join_pairs_bounded_reserves_room_for_joining_space() -> None:
     """PR #288 PR-gate msg-3336 advisory-off-by-one disposition.
 

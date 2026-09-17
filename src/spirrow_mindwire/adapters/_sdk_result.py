@@ -196,14 +196,20 @@ def _join_pairs_bounded(pairs: list[str], budget: int) -> str:
     """
     if not pairs:
         return ""
-    # Reserve worst-case footer width AND the single space that will join
-    # the kept pairs to the footer, so the append at the return site cannot
-    # push the result over budget by one character (PR #288 PR-gate
-    # msg-3336 follow-up: an earlier version of this helper reserved only
-    # the footer width, and the joining space added an unaccounted +1 that
-    # could force ``_summarize_value`` to blind-slice the footer text).
-    # The reservation is worst-case: when nothing is dropped the space is
-    # not appended and the extra byte is unused, which is negligible.
+    # Fast path: if every pair fits into the raw budget with no footer needed,
+    # return the full join. Reserving footer space unconditionally in the
+    # slow path would drop a pair whose length falls in the interval
+    # ``(budget - max_footer_len - 1, budget]`` — even though that pair would
+    # fit uncensored in ``budget`` and needs no footer at all (PR #288
+    # PR-gate msg-3339 advisory: eager truncation sacrifices perfectly
+    # valid pairs).
+    full = " ".join(pairs)
+    if len(full) <= budget:
+        return full
+    # Slow path: overflow. Reserve worst-case footer width AND the single
+    # space that will join the kept pairs to the footer, so the append at
+    # the return site cannot push the result over budget by one character
+    # (PR #288 PR-gate msg-3336 follow-up).
     max_footer_len = len(f"…(+{len(pairs)} pairs truncated)")
     limit = max(0, budget - max_footer_len - 1)
     kept: list[str] = []
@@ -214,8 +220,6 @@ def _join_pairs_bounded(pairs: list[str], budget: int) -> str:
             break
         kept.append(p)
         used += add
-    if len(kept) == len(pairs):
-        return " ".join(pairs)
     dropped = len(pairs) - len(kept)
     footer = f"…(+{dropped} pairs truncated)"
     return (" ".join(kept) + " " + footer) if kept else footer
@@ -246,6 +250,21 @@ def _project_denial_element(elem: Any) -> str:
     ``str(...)`` normalises the input first so a numeric or boolean value
     doesn't get emitted as a bare token (``k=42``) that reintroduces boundary
     ambiguity — every key and every value is a quoted JSON string.
+
+    ``ensure_ascii=False`` is passed explicitly so non-ASCII characters
+    (Japanese text, emojis, accented letters, localized paths) survive the
+    projection as literal Unicode rather than being mangled to ``\\uXXXX``
+    escape sequences. This is REQUIRED for consistency with
+    :func:`emit_sdk_error_marker`'s outer ``json.dumps(..., ensure_ascii=False)``:
+    without it, scalar denials preserve non-ASCII (via the outer emission's
+    default) while dict elements aggressively ASCII-escape it (via the inner
+    default), producing an asymmetry that reduces log legibility on dict
+    elements. msg-3328 §2 briefly considered ``ensure_ascii=True`` as an
+    "ASCII-safe conservative posture", but that premise doesn't hold once
+    the outer emitter is already ``ensure_ascii=False`` — the invariant
+    the log tooling actually contracts against is single-line with escaped
+    control characters, which ``ensure_ascii=False`` still guarantees per
+    RFC 8259 §7. (PR #288 PR-gate msg-3339 blocking regression.)
 
     Keys get the same treatment as values because the SDK types the field as
     ``list[Any]`` and the CLI populates dict elements from an untrusted CLI
@@ -312,7 +331,8 @@ def _project_denial_element(elem: Any) -> str:
             # unlikely, but be defensive): fall back to insertion order.
             keys = list(source.keys())
         pairs = [
-            f"{json.dumps(str(k))}={json.dumps(str(_scalarize_denial_value(source[k])))}"
+            f"{json.dumps(str(k), ensure_ascii=False)}"
+            f"={json.dumps(str(_scalarize_denial_value(source[k])), ensure_ascii=False)}"
             for k in keys
         ]
         # Pair-boundary-aware truncation BEFORE _summarize_value sees the text.
