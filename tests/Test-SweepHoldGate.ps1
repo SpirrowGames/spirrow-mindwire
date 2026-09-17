@@ -405,22 +405,70 @@ Check "PR#279 obj#2: lag measured from desired_at (not observed_at); expected '0
 Check "PR#279 obj#2: lag NOT '7200 minutes stale' (would be the pre-fix answer)" `
     $true ($verdictLag.Reason -ne '7200 minutes stale')
 
-# Fresh-ack arm — observed_at >= desired_at means the ack landed at or after the request. This
-# is the settled steady state that MUST stay silent (no warning every tick).
-Check "fresh ack (observed_at > desired_at) -> null (SILENT)" $null `
+# Fresh-ack arm — observed_at >= desired_at AND observed_state = 'hold' means the ack landed at
+# or after the request AND the daemon actually entered hold. This is the settled steady state
+# that MUST stay silent (no warning every tick). Note the CONJUNCTION with observed_state: a
+# fresh timestamp alone is insufficient (PR #279 review round 2, pinned below).
+Check "fresh ack (observed_at > desired_at, observed='hold') -> null (SILENT)" $null `
     (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
         -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:05Z'))
-Check "fresh ack (observed_at == desired_at exactly) -> null (SILENT)" $null `
+Check "fresh ack (observed_at == desired_at exactly, observed='hold') -> null (SILENT)" $null `
     (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
         -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:00Z'))
 
-# desired_at unparseable BUT observed_at present: cannot measure freshness in either direction,
-# so the safe verdict is "fresh" (silent). Warning here would fire on every tick against a
-# hypothetical mixed-schema server that returns only observed_at.
-Check "desired_at null, observed_at present -> null (can't compare freshness; assume fresh)" `
+# ============================================================================================
+# PR #279 review ROUND 2, BLOCKING objection (fresh observed_at + non-hold observed_state).
+# ============================================================================================
+# Scenario: operator issued a HOLD; the daemon then did a routine status update afterwards
+# (refreshing observed_at), but the daemon has NOT yet processed the hold — observed_state is
+# still 'run'. A fresh timestamp with a non-hold state is a heartbeat, not an acknowledgement.
+# The pre-fix code short-circuited on `observed_at -ge $desired_at` alone and returned SILENT,
+# suppressing the warning against a hold the daemon had not entered. The correct verdict is
+# "not acknowledged", with observed_state quoted so an operator sees WHAT state the daemon is
+# still in.
+$verdictHeartbeatRun = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:05Z')
+Check "PR#279 R2: fresh observed_at + observed='run' -> stale 'not acknowledged (observed_state=run)'" `
+    'not acknowledged (observed_state=run)' $verdictHeartbeatRun.Reason
+# Regression counter-pin: the pre-fix answer was SILENT (null). If the observed_state check
+# is ever removed from the fresh branch, this reddens.
+Check "PR#279 R2: fresh observed_at + observed='run' -> NOT null (pre-fix answer)" `
+    $true ($null -ne $verdictHeartbeatRun)
+# Same shape with a non-'run' non-'hold' state (e.g. 'supervised'): also a heartbeat, also
+# not an ack. The quoted state must reflect the actual value for operator triage.
+$verdictHeartbeatSup = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'supervised' `
+    -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:05Z')
+Check "PR#279 R2: fresh observed_at + observed='supervised' -> stale (state quoted)" `
+    'not acknowledged (observed_state=supervised)' $verdictHeartbeatSup.Reason
+# Exact-equal timestamp with a non-hold state: same rule. The equality boundary is not a
+# safe harbour — it is still a heartbeat if the state is wrong.
+$verdictHeartbeatEqual = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:00Z')
+Check "PR#279 R2: exact-equal observed_at + observed='run' -> stale (no equality safe-harbour)" `
+    'not acknowledged (observed_state=run)' $verdictHeartbeatEqual.Reason
+
+# desired_at unparseable BUT observed_at present. Freshness is unmeasurable, but observed_state
+# still decides: 'hold' means the daemon IS in hold (silent), any other state means the daemon
+# is not in hold and the warning must fire (round-2 objection applied to the missing-desired_at
+# branch — same asymmetry as the older-magickit case).
+Check "desired_at null, observed_at present, observed='hold' -> null (SILENT)" `
     $null `
     (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
         -DesiredAt '' -ObservedAt '2026-09-08T20:00:00Z'))
+$verdictNoDesiredButRun = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '' -ObservedAt '2026-09-08T20:00:00Z')
+Check "desired_at null, observed_at present, observed='run' -> stale (state quoted)" `
+    'not acknowledged (observed_state=run)' $verdictNoDesiredButRun.Reason
+
+# Stale-observed branch (observed_at < desired_at) is unchanged by round 2: lag is measured from
+# desired_at regardless of observed_state, because the observation is stale either way. But
+# ensure the observed_state=hold case (the §2c "stale ack that Test-HoldObserved currently
+# mistakes for fresh") still surfaces the stale lag — F4b MUST warn even though F2 hasn't
+# landed yet, or the operator sees no signal that observed=hold is chronologically wrong.
+$verdictStaleHold = Test-HoldAckStale -Now $now -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+    -DesiredAt '2026-09-17T03:59:50Z' -ObservedAt '2026-09-12T04:00:00Z')
+Check "stale ack (observed_at < desired_at) with observed='hold' -> still warns 'N minutes stale'" `
+    '0.2 minutes stale' $verdictStaleHold.Reason
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "sweep hold gate: $($script:failures) check(s) FAILED"; exit 1 }

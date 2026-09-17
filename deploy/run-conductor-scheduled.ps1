@@ -415,22 +415,40 @@ function Test-HoldObserved {
 # branch and keeps the two ack-not-landed messages distinguished only in `.Reason` (the outer
 # log line is the same greppable prefix for both, per Bohr msg-2789 §3).
 #
-# Two edges caught by PR #279 naysayer review that the naive freshness check misses:
+# Three edges caught by PR #279 naysayer review (rounds 1 & 2) that the naive freshness check
+# misses. The invariant they compose to is:
+#
+#   observed_state = 'hold' is the acknowledgement itself; observed_at is only a freshness metric.
+#
+# Every silent-verdict path below must therefore confirm observed_state = 'hold'. Every
+# ack-not-landed path is either "no hold observation was ever reported" or "the observation is
+# stale relative to the request".
 #
 # (1) OLDER MAGICKIT SERVERS (no timestamp fields). Servers on the old schema return $null for
 #     BOTH desired_at and observed_at while still setting observed_state = 'hold'. In that case
 #     the ack HAS landed — we simply cannot measure its freshness — and the correct verdict is
 #     "fresh" (silent). Treating a null observed_at as "never acknowledged" would fire a false
-#     warning on every tick against those hosts (PR #279 review, blocking objection #1). Only
-#     when observed_state itself is NOT 'hold' does a null observed_at mean "never acknowledged".
+#     warning on every tick against those hosts (PR #279 review round 1, blocking objection #1).
+#     Only when observed_state itself is NOT 'hold' does a null observed_at mean "never
+#     acknowledged".
 #
 # (2) LAG IS MEASURED FROM desired_at, NOT observed_at. The operator's question is "how long
 #     has my HOLD request been sitting unacknowledged?", which is UtcNow - desired_at.
 #     Subtracting observed_at instead measures how long it has been since the daemon last
 #     observed ANYTHING for this project — after a maintenance gap that number can be days
-#     even though the pending HOLD is 10 seconds old (PR #279 review, blocking objection #2).
-#     Both raw timestamps still appear in the outer log line's `desired_at=…` / `observed_at=…`
-#     display; the summary metric quoted in `.Reason` is the request-pending duration.
+#     even though the pending HOLD is 10 seconds old (PR #279 review round 1, blocking
+#     objection #2). Both raw timestamps still appear in the outer log line's `desired_at=…` /
+#     `observed_at=…` display; the summary metric quoted in `.Reason` is the request-pending
+#     duration.
+#
+# (3) A FRESH observed_at DOES NOT IMPLY AN ACK. The daemon can refresh observed_at during a
+#     routine status update while still reporting observed_state = 'run' — the timestamp is a
+#     heartbeat, not a state transition. If we treated observed_at >= desired_at as a
+#     sufficient condition on its own, that heartbeat would silence the warning against a
+#     hold the daemon has not entered (PR #279 review round 2, blocking objection). The fresh
+#     branch must also require observed_state = 'hold'; when the timestamp is fresh but the
+#     state is something else, the correct verdict is "not acknowledged" (with the observed
+#     state quoted for triage — the operator asked for hold and got run/supervised/other).
 function Test-HoldAckStale {
     param($Control, $Now)
 
@@ -447,11 +465,24 @@ function Test-HoldAckStale {
         return @{ Reason = 'never acknowledged' }
     }
 
-    if ($null -eq $desiredAt) { return $null }          # can't compare freshness; assume fresh
-    if ($observedAt -ge $desiredAt) { return $null }
+    if ($null -eq $desiredAt) {
+        # desired_at is unmeasurable, so freshness is unmeasurable — but observed_state still
+        # tells us whether the daemon is in hold. Same asymmetry as edge (1): silent only when
+        # the state IS hold; warn otherwise (edge (3) applied to the missing-desired_at branch).
+        if ($Control.observed_state -eq 'hold') { return $null }
+        return @{ Reason = "not acknowledged (observed_state=$($Control.observed_state))" }
+    }
+
+    if ($observedAt -ge $desiredAt) {
+        # Edge (3). A fresh timestamp only counts as an acknowledgement when observed_state
+        # is actually 'hold'. Otherwise the timestamp is a heartbeat over a non-hold state.
+        if ($Control.observed_state -eq 'hold') { return $null }
+        return @{ Reason = "not acknowledged (observed_state=$($Control.observed_state))" }
+    }
 
     # Edge (2). Lag is UtcNow - desired_at (how long the operator's request has been pending),
-    # NOT UtcNow - observed_at (how long since the last observation of any kind).
+    # NOT UtcNow - observed_at (how long since the last observation of any kind). The observed
+    # state is stale here regardless of value, so we do not gate this branch on observed_state.
     $nowUtc = if ($null -eq $Now) { [datetimeoffset]::UtcNow } else { $Now }
     $lagMinutes = [math]::Round(($nowUtc - $desiredAt).TotalMinutes, 1)
     return @{ Reason = "$lagMinutes minutes stale" }
