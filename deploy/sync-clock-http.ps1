@@ -3,7 +3,7 @@
 #
 # Why this exists instead of w32time: on this host, every firewall profile is
 # DefaultOutboundAction=Block and nothing grants UDP/123, so w32time cannot reach ANY time source —
-# external or on the tailnet. This was verified 2026-08-02 on the loop host of that deploy:
+# external or on the tailnet. This was verified 2026-08-02 on the mindwire loop host at that time:
 # `w32tm /stripchart` returned 0x800705B4 against time.windows.com, ntp.nict.jp, time.google.com and
 # the tailnet services host alike. w32time therefore reported "Source: Free-running System Clock"
 # and had never synchronised; the clock had drifted 173 s.
