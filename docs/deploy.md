@@ -262,6 +262,117 @@ Three rules are load-bearing:
 > unread announcement that `spec/process/README.md` (the fail-open-placement rule) exists to prevent. Alerts are deduped on the reason, so a
 > week spent on a feature branch costs one message, not 2016.
 
+### Migration boundary — lease-state substrate change (T-exclusive-resource-lease-queue PR 4)
+
+This subsection is the runbook that MUST be followed when a `main` merge lands PR 4 of
+`T-exclusive-resource-lease-queue`. Before that merge, the "who holds the editor" contract lived
+as a sentence in a Tier-C decision message (msg-923's `暫定運用: T-materializechunk-zone-relocation-
+crash (C2) が editor/PIE を保持`). After the merge, the same contract lives in
+`<data_dir>/state/leases.json`, and the wrapper's `Read-LeasesStateForTick` phase reads that file
+at the start of every tick.
+
+**The substrate change is what this runbook exists for.** The wrapper cannot look at the disk and
+tell "day-1 of a fresh daemon, no physical holder anywhere" apart from "day-1 of a daemon replacing
+a chatroom-recorded manual hold" — the two cases look identical from the file system (no
+`leases.json` present). The distinction has to be an operator declaration. So:
+
+- **File present on disk = migration complete.** The wrapper treats the state map as authoritative.
+- **File absent on disk = MIGRATION NOT COMPLETE.** The wrapper defers every lease-requiring
+  candidate (disposition `lease-state-unreadable`) and REFUSES to create the file itself — creating
+  it would silently declare migration complete and open the "physical editor still held by C2 while
+  the wrapper granted it to someone else" collision this whole feature exists to prevent.
+
+The behaviour is a "fail-closed on missing" policy (P4-3 v4.1 in the design thread). Deploy-time is
+the only moment where "missing" is expected; from that moment on, a missing file means an operator
+mistake, not a normal state.
+
+STEP 1 — pre-deploy observation (operator).
+
+Observe the CURRENT owner of the editor lease. Sources, in priority order:
+
+  (a) the most recent Tier-C decision text that names an editor holder. msg-923 § 暫定運用 named
+      `spirrow-voxelworld/T-materializechunk-zone-relocation-crash` (C2); VERIFY this is still
+      current when you are actually deploying — a Tier-C decision from months back MAY have been
+      superseded by a later message. Ask the human to re-declare "who currently holds the editor"
+      out loud before proceeding;
+
+  (b) direct observation of the physical editor process on the host — any active PIE session? any
+      editor PID? A held file lock on `<repo>/<pie-lockfile>`?
+
+Result of STEP 1: either an owner key K (e.g. `spirrow-voxelworld/T-materializechunk-zone-relocation-crash`),
+or "no active manual holder".
+
+STEP 2 — daemon pause (operator).
+
+Disable the Task Scheduler task that runs `deploy/run-conductor-scheduled.ps1` (see § Task
+Scheduler above for the task name). Verify no active daemon tick is in flight: watch the current
+log file (`<data_dir>/logs/conductor-YYYY-MM-DD.log`) until the current tick's line lands, or
+until the buffered tick completes silently.
+
+STEP 3 — code deploy (implementer half).
+
+Run `deploy/sync-repo.ps1` in this checkout to fast-forward to `origin/main`. Confirm the sync
+returns `updated` (or `current` if you already synced) and no `blocked`/`failed` verdicts.
+
+STEP 4 — seed migration state (operator).
+
+Based on the STEP 1 result:
+
+- **If owner key K was found:** run
+
+  ```powershell
+  pwsh deploy/Grant-Lease.ps1 -Resource editor -Holder <K> `
+      -Reason "human-migration: seeded from <source msg-id or Tier-C ref>"
+  ```
+
+  The `human-migration:` prefix distinguishes this deploy-time seed from an ad-hoc `human-grant`
+  or `human-clear` in the audit trail (permanent `reclaimed_reason` field, per msg-1900). The
+  `human-*` family names the `human` role from ADR-2026-05-29-10.
+
+- **If no active manual holder:** create an empty `leases.json`:
+
+  ```powershell
+  Set-Content -Path <data_dir>/state/leases.json -Value '{}'
+  ```
+
+  An empty JSON object is the file-based migration marker: it establishes "migration completed, no
+  holder anywhere". The wrapper's `Read-LeasesStateForTick` treats this as `verdict='valid'` with an
+  empty state map, and the acquire path opens for the next lease-requiring candidate that runs.
+
+STEP 5 — verify (operator).
+
+Confirm the seed landed:
+
+```powershell
+Test-Path <data_dir>/state/leases.json           # MUST return $true
+Get-Content <data_dir>/state/leases.json | ConvertFrom-Json   # MUST parse (no ConvertFrom-Json exception)
+```
+
+If STEP 4 seeded a holder, `Get-Content ... | ConvertFrom-Json | ConvertTo-Json` should render
+the expected holder key. If STEP 4 seeded an empty state, the object should parse to a
+zero-property PSCustomObject.
+
+STEP 6 — resume (operator).
+
+Re-enable the Task Scheduler task.
+
+STEP 7 — watchpoint (operator).
+
+Watch `<data_dir>/logs/conductor-YYYY-MM-DD.log` for the first 3 ticks after resume. Any
+`lease-state-unreadable` disposition line means the migration was incomplete or the seed was
+corrupted (parse-error on the file). See *Recovery* below.
+
+Recovery (STEP 7 shows a failure).
+
+Re-run the runbook: pause the daemon (STEP 2), inspect `<data_dir>/state/leases.json` on disk
+(present? valid JSON? holder key spelled correctly?), re-run STEP 4 as appropriate, and resume
+(STEP 6). **Do NOT manually delete `leases.json` to "reset"** — a delete flips the wrapper to the
+"missing" branch, indistinguishable from unmigrated, and if a physical holder is still running
+the next tick's automated acquire silently double-allocates the resource. If the file appears
+corrupt (root array, root scalar, JSON parse error), inspect any `<data_dir>/state/leases.json.bad-<utc>`
+files first — `Save-CorruptedStateBackup` renames a corrupt file when the flush caller runs, so
+your forensic evidence is preserved.
+
 ### Which thread gets driven
 
 The sweep list lives in **`<data_dir>/config/sweep.json`** (template: `deploy/sweep.json.example`),
@@ -396,6 +507,7 @@ forever.
 | `<data_dir>/state/quarantine-history.json` | append-only clear log; every `Clear-Quarantine` writes its `-Reason` here |
 | `<data_dir>/state/evaluated.json` | `first_seen_at` + `last_evaluated_at` per **live** thread; the starvation metric pivots on the current sweep list and prunes ex-live keys |
 | `<data_dir>/state/digest.json` | `last_sent_at` of the daily digest — one send per 24h max |
+| `<data_dir>/state/leases.json` | exclusive-resource lease map — one entry per resource name (v1: `editor`), each with holder / acquired_at / queue / audit fields. **File presence = migration complete** (see § Migration boundary). A missing file is treated as UNMIGRATED, NOT bootstrap: lease-requiring candidates are deferred and the wrapper refuses to create the file automatically. `<path>.bad-<utc>` companions are created by `Save-CorruptedStateBackup` when a corrupt file is encountered on flush — do NOT delete either without first following the recovery steps in § Migration boundary |
 
 Deleting `head_skip.json` costs one full bootstrap sweep (every thread launches once, no
 backoff); `notified.json` at most one duplicate alert.
@@ -403,6 +515,10 @@ Deleting `quarantine.json` **un-quarantines every thread silently** — do not d
 `Clear-Quarantine`; the history file exists precisely so cleared-with-reason and cleared-without-
 context are not confusable later. Deleting `evaluated.json` resets the starvation clock (harmless,
 one tick of empty starvation report). Deleting `digest.json` forces the next tick to send a digest.
+Deleting `leases.json` **flips the wrapper to the UNMIGRATED branch** — the next tick reads the
+file as missing and defers every lease-requiring candidate; more dangerously, if a physical
+holder is still running when the operator re-runs the runbook, the automated re-seed can silently
+double-allocate. Never delete it as a shortcut; follow § Migration boundary Recovery.
 
 ## Quarantine and daily digest
 
