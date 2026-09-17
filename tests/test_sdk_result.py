@@ -626,6 +626,120 @@ def test_permission_denials_projection_truncates_at_pair_boundaries_not_mid_quot
     assert "\r" not in element
 
 
+def test_join_pairs_bounded_reserves_room_for_joining_space() -> None:
+    """PR #288 PR-gate msg-3336 advisory-off-by-one disposition.
+
+    ``_join_pairs_bounded`` returns ``" ".join(kept) + " " + footer`` when
+    it truncates. An earlier version reserved only the worst-case footer
+    width in its budget calculation and forgot the single joining space,
+    so the return could exceed ``budget`` by exactly 1 character. That
+    ugly overshoot would then get blind-sliced by the outer
+    :func:`_summarize_value`, chopping the ``ch)`` off the plain-text
+    footer. Structurally safe (the footer is plain text with no quote to
+    sever) but sloppy, and it defeated the exactness the helper was
+    written for.
+
+    Fix: reserve ``max_footer_len + 1`` in the budget. Pin here so a
+    future refactor cannot silently regress the boundary math.
+    """
+    from spirrow_mindwire.adapters._sdk_result import (
+        _FIELD_VALUE_MAX_LEN,
+        _join_pairs_bounded,
+    )
+
+    # Build a set of small pairs and pick a budget that WOULD have hit the
+    # boundary exactly with the old math (limit = budget - max_footer_len).
+    # 30 pairs @ 15 chars each + 29 joining spaces + 1 footer-join space +
+    # footer width. The exact result must be <= _FIELD_VALUE_MAX_LEN.
+    pairs = [f'"k{i:02d}"="v{i:02d}"' for i in range(30)]
+    result = _join_pairs_bounded(pairs, _FIELD_VALUE_MAX_LEN)
+    assert len(result) <= _FIELD_VALUE_MAX_LEN, (
+        f"joined length {len(result)} exceeds budget {_FIELD_VALUE_MAX_LEN} — "
+        f"the joining-space reservation regressed. result={result!r}"
+    )
+
+
+def test_scalar_denial_with_newline_stays_single_line_via_outer_emission() -> None:
+    """PR #288 PR-gate msg-3336 blocking-claim disposition.
+
+    Claim: a scalar denial element containing ``\\n`` (e.g.
+    ``permission_denials=["error\\nmsg"]``) would cause the raw newline
+    byte to reach the log verbatim and split the marker line.
+
+    Verdict: the claim is factually incorrect. This test pins the actual
+    behaviour empirically so a future maintainer reading the code (or a
+    future PR-gate pass) can see the reasoning:
+
+    1. The scalar bypass path in ``_project_denial_element`` does return
+       the string unchanged (``_scalarize_denial_value`` bounds it but
+       does not escape control characters). So ``captured_fields`` DOES
+       contain the raw LF byte.
+
+    2. HOWEVER, the marker is emitted via :func:`emit_sdk_error_marker`,
+       which calls ``json.dumps(detail, ensure_ascii=False)`` on the
+       entire detail dict. Per RFC 8259 §7, every character U+0000 through
+       U+001F in a JSON string value MUST be escaped — and the Python
+       ``json`` module honours that mandate regardless of ``ensure_ascii``
+       (which only affects non-ASCII printables ≥ U+0080). The LF becomes
+       the two-character ``\\n`` escape in the emitted marker.
+
+    3. The marker line therefore contains exactly ONE LF byte (the
+       trailing terminator written by ``emit_sdk_error_marker`` itself);
+       the payload area contains none.
+
+    4. Round-tripping the emitted payload via ``json.loads`` recovers the
+       original raw LF, proving structural validity.
+
+    Bohr's msg-3328 §3 explicitly dispositioned scalar quoting as YAGNI
+    on exactly this reasoning: "declining on YAGNI grounds ... widens the
+    diff without addressing an observed problem". This test pins the
+    "no observed problem" claim.
+    """
+    final = _FakeResultMessage(result=None, permission_denials=["error\nmsg"])
+    detail = capture_is_error_detail(final)
+
+    # (1) Captured field contains the raw LF — scalar bypass path.
+    assert detail["captured_fields"]["permission_denials"] == ["error\nmsg"]
+
+    # (2)-(3) Marker line is single-line — outer json.dumps escaped the LF.
+    stream = io.StringIO()
+    emit_sdk_error_marker(detail, stream=stream)
+    output = stream.getvalue()
+    assert output.count("\n") == 1, f"marker line was split by an unescaped LF: {output!r}"
+    assert output.endswith("\n")
+
+    # (4) Round-trip parses cleanly.
+    payload = output[len(SDK_ERROR_MARKER_PREFIX) :].rstrip("\n")
+    parsed = json.loads(payload)
+    assert parsed["captured_fields"]["permission_denials"] == ["error\nmsg"]
+
+
+def test_scalar_denial_is_bounded_by_summarize_value() -> None:
+    """PR #288 PR-gate msg-3336 secondary-claim disposition.
+
+    Secondary claim: the scalar bypass path breaks the ``bounded is
+    bounded`` invariant.
+
+    Verdict: also factually incorrect. Scalar strings ARE bounded, just
+    on a different path than the dict case — via
+    :func:`_scalarize_denial_value` which routes strings through
+    :func:`_summarize_value`'s string-truncation branch directly. Pin
+    empirically: a 50000-char scalar denial produces a captured value at
+    most ``_FIELD_VALUE_MAX_LEN`` plus the ``…(+Nch)`` footer.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    huge = "z" * 50_000
+    final = _FakeResultMessage(result=None, permission_denials=[huge])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(captured, str)
+    assert len(captured) <= _FIELD_VALUE_MAX_LEN + len("…(+999999ch)")
+    # Truncation footer is present so a reader can see length was clipped.
+    assert captured.endswith("ch)")
+
+
 def test_permission_denials_projection_c_independence_never_merged_into_errors() -> None:
     """The (c) constraint from msg-2944 §1 pinned as a hard test.
 

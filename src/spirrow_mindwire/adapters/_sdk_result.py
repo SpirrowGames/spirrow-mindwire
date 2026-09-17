@@ -196,11 +196,16 @@ def _join_pairs_bounded(pairs: list[str], budget: int) -> str:
     """
     if not pairs:
         return ""
-    # Reserve worst-case footer width up front so appending the footer after
-    # a boundary-fit truncation cannot push the result over budget. The
-    # worst case footer is the one that names every pair as dropped.
+    # Reserve worst-case footer width AND the single space that will join
+    # the kept pairs to the footer, so the append at the return site cannot
+    # push the result over budget by one character (PR #288 PR-gate
+    # msg-3336 follow-up: an earlier version of this helper reserved only
+    # the footer width, and the joining space added an unaccounted +1 that
+    # could force ``_summarize_value`` to blind-slice the footer text).
+    # The reservation is worst-case: when nothing is dropped the space is
+    # not appended and the extra byte is unused, which is negligible.
     max_footer_len = len(f"…(+{len(pairs)} pairs truncated)")
-    limit = max(0, budget - max_footer_len)
+    limit = max(0, budget - max_footer_len - 1)
     kept: list[str] = []
     used = 0
     for p in pairs:
@@ -251,18 +256,38 @@ def _project_denial_element(elem: Any) -> str:
     symmetrically closes the invariant on both sides of ``=``.
 
     The result is bounded by the same per-field length cap as every other
-    captured string (``_FIELD_VALUE_MAX_LEN``), because :func:`_join_pairs_bounded`
-    truncates the joined pair-text at whole-pair boundaries BEFORE the outer
-    :func:`_summarize_value` sees it. Doing the truncation here rather than
-    letting the generic string branch of ``_summarize_value`` slice blindly is
-    the only structurally-safe option now that pairs are quoted: a blind cut
-    could sever a closing ``"`` (or split an escape sequence like ``\\n`` in
-    half), producing an unclosed JSON quote span that a quote-aware log
-    reader would treat as malformed (PR #288 PR-gate follow-up, blocking
-    correctness objection). The projection therefore preserves BOTH the
-    ``bounded is bounded`` invariant PR #181 round 3's docstring (lines
-    148-153) identified as load-bearing AND the quote-structural integrity
-    the msg-3328 quoting change introduced.
+    captured string (``_FIELD_VALUE_MAX_LEN``), on TWO different paths that
+    a reader of this docstring must not conflate:
+
+    * **Dict path** (this function's main branch): :func:`_join_pairs_bounded`
+      truncates the joined pair-text at whole-pair boundaries BEFORE the
+      outer :func:`_summarize_value` sees it. Doing the truncation here
+      rather than letting the generic string branch of ``_summarize_value``
+      slice blindly is the only structurally-safe option now that pairs are
+      quoted: a blind cut could sever a closing ``"`` (or split an escape
+      sequence like ``\\n`` in half), producing an unclosed JSON quote span
+      that a quote-aware log reader would treat as malformed (PR #288
+      PR-gate follow-up, blocking correctness objection).
+    * **Scalar path** (early return at the top of this function): a scalar
+      element bypasses the projection machinery entirely and is bounded
+      by :func:`_scalarize_denial_value`, which routes strings through
+      :func:`_summarize_value`'s string branch directly. No quoting is
+      applied — scalars have no key/value boundary to disambiguate — so
+      the mid-quote-truncation risk the dict path guards against does not
+      exist here. Line integrity across the emitted marker as a whole is
+      guaranteed by :func:`emit_sdk_error_marker`'s ``json.dumps`` on the
+      outer detail dict, which escapes every control character in every
+      captured string per RFC 8259 §7 regardless of ``ensure_ascii``.
+      msg-3328 §3 ratified this asymmetry as YAGNI: wrapping scalars in a
+      second layer of ``json.dumps`` inside the projection would widen
+      the diff without addressing any observed line-integrity problem
+      that the outer emission is not already handling.
+
+    The projection therefore preserves BOTH the ``bounded is bounded``
+    invariant PR #181 round 3's docstring (lines 148-153) identified as
+    load-bearing AND the quote-structural integrity the msg-3328 quoting
+    change introduced — on both paths, through the mechanism appropriate
+    to each.
     """
     if elem is None or isinstance(elem, (bool, int, float, str)):
         return _scalarize_denial_value(elem)
