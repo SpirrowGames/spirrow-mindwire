@@ -59,6 +59,13 @@ $fnTs = $functions | Where-Object { $_.Name -eq 'ConvertFrom-ControlTimestamp' }
 if (-not $fnTs) { throw "function not found in sweep script: ConvertFrom-ControlTimestamp" }
 Invoke-Expression $fnTs.Extent.Text
 
+# Test-HoldAckStale is the HOLD-freshness verdict function extracted so PR #279's two blocking
+# correctness edges can be pinned as regressions rather than as a comment. Inlining it back into
+# the probe loop would silently defeat the tests below.
+$fnAck = $functions | Where-Object { $_.Name -eq 'Test-HoldAckStale' } | Select-Object -First 1
+if (-not $fnAck) { throw "function not found in sweep script: Test-HoldAckStale" }
+Invoke-Expression $fnAck.Extent.Text
+
 $script:failures = 0
 function Check {
     param([string]$Name, $Expected, $Actual)
@@ -317,6 +324,103 @@ Check "half-parsed date -> null"       $null (ConvertFrom-ControlTimestamp '2026
 # warning honest across daemon hosts in any timezone.
 $tsNoZ = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19'
 Check "bare (no Z) treated as UTC -> zero offset" ([TimeSpan]::Zero) $tsNoZ.Offset
+
+Write-Host ""
+Write-Host "Test-HoldAckStale — HOLD-ack freshness verdict (PR #279 review, blocking objections 1 & 2)"
+
+# Control builder that includes the F4b timestamp fields. observed_at = $null models older
+# magickit servers that predate the timestamp fields (PR #279 review objection 1).
+function New-ControlWithTs {
+    param(
+        [string]$Desired,
+        $Observed,
+        [string]$DesiredAt,
+        [string]$ObservedAt
+    )
+    $obsField = if ($null -eq $Observed) { 'null' } else { '"' + $Observed + '"' }
+    $desAtField = if ([string]::IsNullOrEmpty($DesiredAt)) { 'null' } else { '"' + $DesiredAt + '"' }
+    $obsAtField = if ([string]::IsNullOrEmpty($ObservedAt)) { 'null' } else { '"' + $ObservedAt + '"' }
+    return ('{"project":"p","desired_state":"' + $Desired + '","desired_at":' + $desAtField +
+        ',"observed_state":' + $obsField + ',"observed_at":' + $obsAtField +
+        ',"configured":true}' | ConvertFrom-Json)
+}
+
+# Trivial-return arms (not the interesting bug fixes, but the function must still fall out fast
+# for callers other than the probe loop, in case Test-HoldAckStale ever gets composed elsewhere).
+Check "null control -> null (nothing to warn about)" $null `
+    (Test-HoldAckStale -Control $null)
+Check "desired != hold -> null (nothing to warn about)" $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'run' -Observed 'run' `
+        -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:01:00Z'))
+
+# The two ack-not-landed arms — reason string is what the outer log line quotes.
+$verdictNever = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '')
+Check "hold desired, never observed (observed=run, observed_at=null) -> stale, 'never acknowledged'" `
+    'never acknowledged' $verdictNever.Reason
+
+# ============================================================================================
+# PR #279 review, BLOCKING objection 1 (false-positive on older magickit).
+# ============================================================================================
+# Older magickit servers omit the timestamp fields. If the loop is holding, observed_state comes
+# back as 'hold' but observed_at is $null. The pre-fix code unconditionally emitted "never
+# acknowledged" in that case, blasting a false HOLD NOT ACKNOWLEDGED warning to the logs every
+# tick against those hosts. The correct verdict is "fresh" — silent — because observed_state
+# itself is the acknowledgement; observed_at is only there to measure freshness.
+Check "PR#279 obj#1: old magickit (observed='hold', observed_at=null) -> null (SILENT, hold IS acked)" `
+    $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt ''))
+# Even without desired_at on the old server, observed_state='hold' is enough to declare fresh.
+Check "PR#279 obj#1: old magickit (both timestamps null, observed='hold') -> null (SILENT)" `
+    $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '' -ObservedAt ''))
+# Contrast case: same server (both timestamps null) but observed_state is NOT 'hold' — that
+# genuinely IS "never acknowledged" (there is no observation of any kind), so it MUST warn.
+$verdictOldRun = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '' -ObservedAt '')
+Check "PR#279 obj#1: old magickit (observed='run', both null) -> stale 'never acknowledged'" `
+    'never acknowledged' $verdictOldRun.Reason
+
+# ============================================================================================
+# PR #279 review, BLOCKING objection 2 (lag measured from desired_at, not observed_at).
+# ============================================================================================
+# Scenario: operator requested a HOLD 10 seconds ago (desired_at = Now - 10s). The daemon's last
+# successful observation happened during the previous run, 5 days ago (observed_at = Now - 5d).
+# The pre-fix code computed lag = UtcNow - observed_at = ~7200 minutes, an absurd figure that
+# implies the operator has been waiting 5 days. The correct lag = UtcNow - desired_at ≈ 0.2 min,
+# because the operator's HOLD request is what has been pending, not the daemon's observation.
+$now = [datetimeoffset]::Parse('2026-09-17T04:00:00Z',
+    [System.Globalization.CultureInfo]::InvariantCulture,
+    [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+$verdictLag = Test-HoldAckStale -Now $now -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '2026-09-17T03:59:50Z' -ObservedAt '2026-09-12T04:00:00Z')
+# desired_at is 10 seconds before Now → ~0.2 minutes stale (rounded, 1 dp).
+Check "PR#279 obj#2: lag measured from desired_at (not observed_at); expected '0.2 minutes stale'" `
+    '0.2 minutes stale' $verdictLag.Reason
+# Explicit counter-claim: the WRONG value under the pre-fix logic would be ~7200 minutes.
+# Regression pin — if this ever comes back to matching the observed_at subtraction, the fix
+# has been reverted.
+Check "PR#279 obj#2: lag NOT '7200 minutes stale' (would be the pre-fix answer)" `
+    $true ($verdictLag.Reason -ne '7200 minutes stale')
+
+# Fresh-ack arm — observed_at >= desired_at means the ack landed at or after the request. This
+# is the settled steady state that MUST stay silent (no warning every tick).
+Check "fresh ack (observed_at > desired_at) -> null (SILENT)" $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:05Z'))
+Check "fresh ack (observed_at == desired_at exactly) -> null (SILENT)" $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:00Z'))
+
+# desired_at unparseable BUT observed_at present: cannot measure freshness in either direction,
+# so the safe verdict is "fresh" (silent). Warning here would fire on every tick against a
+# hypothetical mixed-schema server that returns only observed_at.
+Check "desired_at null, observed_at present -> null (can't compare freshness; assume fresh)" `
+    $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '' -ObservedAt '2026-09-08T20:00:00Z'))
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "sweep hold gate: $($script:failures) check(s) FAILED"; exit 1 }

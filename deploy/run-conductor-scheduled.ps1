@@ -406,6 +406,57 @@ function Test-HoldObserved {
     return ($Control.observed_state -eq 'hold')
 }
 
+# HOLD-acknowledgement freshness verdict — pure predicate, extracted for testability.
+#
+# Called ONLY when the operator has asked for HOLD ($Control.desired_state -eq 'hold'). Returns
+# $null when the acknowledgement is fresh (nothing to warn about); returns
+# @{ Reason = <string> } when the acknowledgement has not landed and the sweep should log the
+# HOLD NOT ACKNOWLEDGED line. This shape lets the caller stay a single `if ($null -ne $verdict)`
+# branch and keeps the two ack-not-landed messages distinguished only in `.Reason` (the outer
+# log line is the same greppable prefix for both, per Bohr msg-2789 §3).
+#
+# Two edges caught by PR #279 naysayer review that the naive freshness check misses:
+#
+# (1) OLDER MAGICKIT SERVERS (no timestamp fields). Servers on the old schema return $null for
+#     BOTH desired_at and observed_at while still setting observed_state = 'hold'. In that case
+#     the ack HAS landed — we simply cannot measure its freshness — and the correct verdict is
+#     "fresh" (silent). Treating a null observed_at as "never acknowledged" would fire a false
+#     warning on every tick against those hosts (PR #279 review, blocking objection #1). Only
+#     when observed_state itself is NOT 'hold' does a null observed_at mean "never acknowledged".
+#
+# (2) LAG IS MEASURED FROM desired_at, NOT observed_at. The operator's question is "how long
+#     has my HOLD request been sitting unacknowledged?", which is UtcNow - desired_at.
+#     Subtracting observed_at instead measures how long it has been since the daemon last
+#     observed ANYTHING for this project — after a maintenance gap that number can be days
+#     even though the pending HOLD is 10 seconds old (PR #279 review, blocking objection #2).
+#     Both raw timestamps still appear in the outer log line's `desired_at=…` / `observed_at=…`
+#     display; the summary metric quoted in `.Reason` is the request-pending duration.
+function Test-HoldAckStale {
+    param($Control, $Now)
+
+    if ($null -eq $Control)                          { return $null }
+    if ($Control.desired_state -ne 'hold')           { return $null }
+
+    $desiredAt = ConvertFrom-ControlTimestamp $Control.desired_at
+    $observedAt = ConvertFrom-ControlTimestamp $Control.observed_at
+
+    if ($null -eq $observedAt) {
+        # Edge (1). observed_state is the acknowledgement itself; the timestamp is only for
+        # freshness. An old magickit that acknowledges without a timestamp is still acknowledged.
+        if ($Control.observed_state -eq 'hold') { return $null }
+        return @{ Reason = 'never acknowledged' }
+    }
+
+    if ($null -eq $desiredAt) { return $null }          # can't compare freshness; assume fresh
+    if ($observedAt -ge $desiredAt) { return $null }
+
+    # Edge (2). Lag is UtcNow - desired_at (how long the operator's request has been pending),
+    # NOT UtcNow - observed_at (how long since the last observation of any kind).
+    $nowUtc = if ($null -eq $Now) { [datetimeoffset]::UtcNow } else { $Now }
+    $lagMinutes = [math]::Round(($nowUtc - $desiredAt).TotalMinutes, 1)
+    return @{ Reason = "$lagMinutes minutes stale" }
+}
+
 # --- resource-axis HOLD gate (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) ------
 #
 # May a candidate's launch be optimised away because SOME OTHER project's HOLD covers the SAME
@@ -3204,26 +3255,15 @@ try {
 
             if ($c.desired_state -eq 'hold') {
                 # Fresh-vs-stale ack decision (F4b). Bohr msg-2789 §3 F2-a: comparison MUST be on
-                # parsed [datetimeoffset] values, not on raw ISO-8601 strings. Two ack-not-landed
-                # cases are distinguished only in the log message; the outer warning is emitted for
-                # both. Neither case gates the launch — this line is purely observability. F2 (the
-                # predicate change) is a separate, later commit.
-                $desiredAt = ConvertFrom-ControlTimestamp $c.desired_at
-                $observedAt = ConvertFrom-ControlTimestamp $c.observed_at
-                $ackStale = $false
-                $ackReason = ''
-                if ($null -eq $observedAt) {
-                    $ackStale = $true
-                    $ackReason = 'never acknowledged'
-                }
-                elseif ($null -ne $desiredAt -and $observedAt -lt $desiredAt) {
-                    $ackStale = $true
-                    $lagMinutes = [math]::Round(([datetimeoffset]::UtcNow - $observedAt).TotalMinutes, 1)
-                    $ackReason = "$lagMinutes minutes stale"
-                }
-                if ($ackStale) {
+                # parsed [datetimeoffset] values, not on raw ISO-8601 strings — the parse and the
+                # two-edge verdict now live in Test-HoldAckStale (see that function's block-comment
+                # for the false-positive and lag-source fixes from PR #279 naysayer review). This
+                # line is purely observability: neither verdict gates the launch. F2 (the predicate
+                # change) is a separate, later commit.
+                $ackVerdict = Test-HoldAckStale -Control $c
+                if ($null -ne $ackVerdict) {
                     Write-Log ("HOLD NOT ACKNOWLEDGED [{0}] — desired_at={1} observed_at={2} ({3})" -f `
-                        $proj, $desiredAtDisplay, $observedAtDisplay, $ackReason)
+                        $proj, $desiredAtDisplay, $observedAtDisplay, $ackVerdict.Reason)
                 }
             }
         }
