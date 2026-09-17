@@ -2340,7 +2340,19 @@ class NaysayerPrReviewDriver:
             if exc.status_code == 422 and "own pull request" in str(exc).lower():
                 # Same body carries the ORIGINAL verdict footer; that is intentional
                 # (msg-1987 Q5-A rationale: record the attempted event, not the fallback).
-                await self._github.submit_review(pr, event=ReviewEvent.COMMENT, body=receipt.body)
+                # The fallback POST goes through the SAME classification funnel — a
+                # 401/403/404 on the fallback must land in EnvironmentTerminalError /
+                # TargetTerminalError / raw-UNKNOWN just like the primary, so an
+                # environment outage during the fallback does NOT quarantine the thread
+                # (PR-gate #280 objection 2026-09-17: unclassified fallback fell through).
+                try:
+                    await self._github.submit_review(
+                        pr, event=ReviewEvent.COMMENT, body=receipt.body
+                    )
+                except GitHubHTTPError as fallback_exc:
+                    await self._classify_and_reraise(
+                        pr, fallback_exc, origin="submit-comment-fallback"
+                    )
                 return
             await self._classify_and_reraise(pr, exc, origin="submit")
 

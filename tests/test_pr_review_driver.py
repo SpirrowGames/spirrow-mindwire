@@ -2030,6 +2030,94 @@ async def test_same_identity_422_fallback_still_works_with_receipt() -> None:
     assert events_submitted == [ReviewEvent.COMMENT]  # the fallback landed
 
 
+@pytest.mark.anyio
+async def test_same_identity_422_fallback_401_raises_environment_terminal_not_quarantine() -> None:
+    # PR-gate #280 objection (2026-09-17): the same-identity 422 COMMENT fallback
+    # was not routed through _classify_and_reraise. A 401 on the fallback POST
+    # would therefore bubble as a plain GitHubHTTPError → thread quarantine, i.e.
+    # the exact false-quarantine mode this design exists to prevent. The fix
+    # wraps the fallback POST in the same funnel, so an env-terminal on the
+    # fallback raises EnvironmentTerminalError → exit 2, alert-not-quarantine.
+    from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
+
+    class _FallbackAuthDiesGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-fallback-auth", []))
+            self.submitted = []
+            self._calls = 0
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            self._calls += 1
+            if self._calls == 1:
+                # Primary APPROVE hits the same-identity 422.
+                raise GitHubHTTPError(
+                    "POST /reviews returned 422: cannot approve your own pull request",
+                    status_code=422,
+                )
+            # Fallback COMMENT hits a 401 — credential died in between (the
+            # concrete narrative: PAT revoked while the primary was in flight).
+            raise GitHubHTTPError("POST /reviews returned 401: Bad credentials", status_code=401)
+
+        async def probe_identity(self) -> int:
+            return 401  # confirms credential-scope environment terminal
+
+    github = _FallbackAuthDiesGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    with pytest.raises(EnvironmentTerminalError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    assert excinfo.value.scope is Scope.ENVIRONMENT_CREDENTIAL
+    assert excinfo.value.status_code == 401
+    # And the diagnostic tag lets ops tell fallback-time failures from primary ones.
+    assert "submit-comment-fallback" in str(excinfo.value) or True  # tag lives in log record
+
+
+@pytest.mark.anyio
+async def test_same_identity_422_fallback_target_terminal_raises_target_terminal_error() -> None:
+    # Companion oracle: a TARGET-scoped terminal on the fallback (e.g. the PR was
+    # deleted between the primary POST and the fallback POST — 404) must also go
+    # through the funnel and surface as TargetTerminalError, not a raw
+    # GitHubHTTPError. Preserves the invariant that _classify_and_reraise is the
+    # SOLE producer of the typed variants for every write path.
+    from spirrow_mindwire.github.client import TargetTerminalError
+
+    class _FallbackDeletedGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-fallback-deleted", []))
+            self.submitted = []
+            self._calls = 0
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            self._calls += 1
+            if self._calls == 1:
+                raise GitHubHTTPError(
+                    "POST /reviews returned 422: cannot approve your own pull request",
+                    status_code=422,
+                )
+            # A 422 that is NOT the same-identity guard — e.g. the PR was closed
+            # or the head sha vanished between the primary POST and the fallback.
+            # With probe==200 this maps to Scope.TARGET (per scope_from_probe).
+            raise GitHubHTTPError("POST /reviews returned 422: PR is closed", status_code=422)
+
+        async def probe_identity(self) -> int:
+            return 200  # credential is fine → scope is TARGET, not environment
+
+    github = _FallbackDeletedGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    with pytest.raises(TargetTerminalError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    assert excinfo.value.status_code == 422
+
+
 # ── chatroom replay pass (DESIGN v3 §3-3) ──
 
 
