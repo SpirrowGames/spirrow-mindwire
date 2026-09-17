@@ -50,6 +50,20 @@ The wrapper is responsible for turning the outer bounds (subprocess
 timeout / non-zero exit / JSON parse failure) into the operator-facing
 `?` — this module only produces the per-project envelope from which
 those decisions can be made.
+
+**Third state (msg-2648 §3 / PR-gate #221 disposition):** items that
+the MCP call returned but that were not shaped as JSON objects are
+counted separately, in :attr:`ProjectReport.malformed_count`, and are
+**never** mixed into ``unregistered_count``. "Not seen", "seen and
+untracked", and "seen but unreadable" are three distinct states — the
+first two feed the sweep-completeness signal, the third feeds a
+data-integrity signal. Collapsing them into one number recreates the
+fail-silent shape msg-1181 named as the core defect. A day where
+``malformed_count > 0`` is a day where the count is not comparable to
+another day: the P-2 before/after check msg-2531 §1 defines relies on
+the assumption that the two measurements enumerated the same population,
+and a garbled listing breaks that assumption without touching the
+count.
 """
 
 from __future__ import annotations
@@ -123,12 +137,22 @@ class ProjectReport:
     intentionally distinct from ``unregistered_count == 0``, which means
     "measured, and nothing is unregistered" (msg-2531 §2 invariant 2:
     "0 件" と "測れなかった" を同じ表示にしない).
+
+    ``malformed_count`` is the third state msg-2648 §3 pins down:
+    items the MCP call returned that were not shaped as JSON objects
+    and therefore could not be evaluated. It is deliberately kept off
+    ``unregistered_count`` — "unreadable" is not the same as "measured 0"
+    or "measured N". ``malformed_count is None`` mirrors
+    ``unregistered_count is None``: when the whole listing failed we do
+    not know what we did not see, and the honest report is "unknown",
+    not "zero".
     """
 
     project: str
     unregistered_count: int | None
     unregistered: tuple[str, ...] = ()
     error: str | None = None
+    malformed_count: int | None = 0
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -136,6 +160,7 @@ class ProjectReport:
             "unregistered_count": self.unregistered_count,
             "unregistered": list(self.unregistered),
             "error": self.error,
+            "malformed_count": self.malformed_count,
         }
 
 
@@ -148,6 +173,14 @@ class EnumerateReport:
     the projects whose counts were not measured — this is the signal the
     wrapper uses to decide between rendering a number and rendering `?`
     (msg-2531 §2 invariant 2).
+
+    ``malformed_count_total`` is the same sum for the third-state field
+    (msg-2648 §3): the aggregate number of items the MCP calls returned
+    but that could not be shaped as objects. When this is non-zero the
+    matching-day count is **not** comparable to another day's count —
+    the P-2 before/after check documented in msg-2531 §1 requires the
+    two measurements to have enumerated the same population, and a
+    garbled listing breaks that assumption without touching the count.
     """
 
     projects: tuple[ProjectReport, ...] = field(default_factory=tuple)
@@ -164,12 +197,22 @@ class EnumerateReport:
     def any_unmeasured(self) -> bool:
         return any(p.unregistered_count is None for p in self.projects)
 
+    @property
+    def malformed_count_total(self) -> int:
+        return sum(p.malformed_count for p in self.projects if p.malformed_count is not None)
+
+    @property
+    def any_malformed(self) -> bool:
+        return any(p.malformed_count is not None and p.malformed_count > 0 for p in self.projects)
+
     def as_json(self) -> dict[str, Any]:
         return {
             "projects": [p.as_json() for p in self.projects],
             "unregistered_count_total": self.unregistered_count_total,
             "unmeasured_projects": list(self.unmeasured_projects),
             "any_unmeasured": self.any_unmeasured,
+            "malformed_count_total": self.malformed_count_total,
+            "any_malformed": self.any_malformed,
         }
 
 
@@ -253,7 +296,11 @@ def is_unregistered_live(project: str, thread: dict[str, Any], registered: Regis
 
 
 def enumerate_project(
-    project: str, threads: Iterable[dict[str, Any]], registered: RegisteredIndex
+    project: str,
+    threads: Iterable[dict[str, Any]],
+    registered: RegisteredIndex,
+    *,
+    malformed_count: int = 0,
 ) -> ProjectReport:
     """Apply :func:`is_unregistered_live` over ``threads`` and produce a report.
 
@@ -262,10 +309,21 @@ def enumerate_project(
     cannot be a "known thread" the sweep is missing — no id to compare
     against), matching the shape-tolerance :mod:`parked_humans` applies
     to head-cross-check candidates.
+
+    ``malformed_count`` is the count of non-object items the caller
+    already dropped upstream (msg-2648 §3 — the CLI's ``_list_live_threads``
+    filters non-dicts before handing the accumulated list here). Any
+    additional non-dicts encountered *inside* this function are added to
+    that upstream tally so tests that call ``enumerate_project`` directly
+    with a mixed list still count what got dropped; the aggregate lives
+    on :attr:`ProjectReport.malformed_count` and is **never** merged into
+    ``unregistered_count``.
     """
     unregistered: list[str] = []
+    dropped = malformed_count
     for thread in threads:
         if not isinstance(thread, dict):
+            dropped += 1
             continue
         if not is_unregistered_live(project, thread, registered):
             continue
@@ -277,6 +335,7 @@ def enumerate_project(
         unregistered_count=len(unregistered),
         unregistered=tuple(unregistered),
         error=None,
+        malformed_count=dropped,
     )
 
 
@@ -284,16 +343,21 @@ def project_error_report(project: str, error: str) -> ProjectReport:
     """A :class:`ProjectReport` for a project whose enumeration failed.
 
     Distinct from ``enumerate_project(...)`` returning an empty list:
-    this constructor forces ``unregistered_count = None`` and carries
-    the reason. Callers converting an :class:`~spirrow_mindwire.magickit
-    .client.MagickitMcpError` (or any transport failure) go through this
-    helper so the "did not measure" signal is uniform.
+    this constructor forces ``unregistered_count = None`` and
+    ``malformed_count = None`` and carries the reason. Callers
+    converting an :class:`~spirrow_mindwire.magickit.client.MagickitMcpError`
+    (or any transport failure) go through this helper so the "did not
+    measure" signal is uniform. ``malformed_count`` is ``None`` here for
+    the same reason ``unregistered_count`` is: when the whole listing
+    call failed we do not know how many items came back garbled, and a
+    zero would silently claim the population was cleanly enumerated.
     """
     return ProjectReport(
         project=project,
         unregistered_count=None,
         unregistered=(),
         error=error,
+        malformed_count=None,
     )
 
 
