@@ -142,6 +142,147 @@ _CAPTURE_ERROR_SENTINEL: Any = object()
 _SMALL_LIST_ELEM_LIMIT = 8
 
 
+def _scalarize_denial_value(value: Any) -> str:
+    """Reduce a denial-element value to a bounded string. Never a container.
+
+    This is a *strict* scalarizer used inside :func:`_project_denial_element`:
+    nested containers deliberately collapse to ``type(len=N)`` rather than
+    recursing. The projection's whole purpose is to hand ``_summarize_value``
+    a list whose members are already scalars, so ANY container reappearing
+    here would defeat the point (the outer scalar-only predicate at line 168
+    would reject it and the entire ``permission_denials`` field would fall
+    back to ``list(len=1)`` — the exact defect this thread exists to fix).
+    """
+    if value is None or isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        # Reuse the per-field string truncation so bounds match the rest of
+        # the pipeline exactly.
+        summarised = _summarize_value(value)
+        return summarised if isinstance(summarised, str) else str(summarised)
+    if hasattr(value, "__len__"):
+        try:
+            length = len(value)
+        except Exception:
+            return f"{type(value).__name__}(repr_omitted)"
+        return f"{type(value).__name__}(len={length})"
+    return f"{type(value).__name__}(repr_omitted)"
+
+
+def _project_denial_element(elem: Any) -> str:
+    """Project one ``permission_denials`` element to a bounded string.
+
+    The SDK types ``ResultMessage.permission_denials`` as ``list[Any] | None``
+    (`claude_agent_sdk/types.py:1159`, SDK 0.1.77 observed 2026-09-17) and the
+    parser at ``_internal/message_parser.py:262`` passes the CLI's raw JSON
+    array through unchanged, so there is no stable element schema to key off.
+    Per msg-3156's fallback rule (``schema undefined / unstable → generic
+    scalarizer alone``) this is a *generic* scalarizer: no priority key set,
+    no field-name specialisation. For a mapping-shaped element it emits
+    ``"k1=v1 k2=v2 …"`` with keys sorted for determinism; for an object with
+    ``vars()`` it treats the attribute dict the same way; for a scalar it
+    stringifies; for anything else it emits ``type(repr_omitted)``.
+
+    The result is bounded by the same per-field length cap as every other
+    captured string (``_FIELD_VALUE_MAX_LEN``), because the last line of this
+    function feeds the projected text back through :func:`_summarize_value`'s
+    string branch. The projection therefore preserves the ``bounded is
+    bounded`` invariant that PR #181 round 3's docstring (lines 148-153)
+    identified as load-bearing.
+    """
+    if elem is None or isinstance(elem, (bool, int, float, str)):
+        return _scalarize_denial_value(elem)
+    if isinstance(elem, dict):
+        source: dict[Any, Any] = elem
+    else:
+        try:
+            source = dict(vars(elem))
+        except TypeError:
+            source = {}
+        except Exception:
+            # A hostile __dict__ (property that raises, etc.) — surface the
+            # type so a reader knows *something* was there.
+            return f"{type(elem).__name__}(repr_omitted)"
+    if not source:
+        text = f"{type(elem).__name__}(repr_omitted)"
+    else:
+        try:
+            keys = sorted(source.keys(), key=str)
+        except Exception:
+            # Sorting failed (mixed unorderable types after str() cast is
+            # unlikely, but be defensive): fall back to insertion order.
+            keys = list(source.keys())
+        pairs = [f"{k}={_scalarize_denial_value(source[k])}" for k in keys]
+        text = " ".join(pairs)
+    summarised = _summarize_value(text)
+    return summarised if isinstance(summarised, str) else str(summarised)
+
+
+def _project_denials(value: Any) -> Any:
+    """Project ``permission_denials`` list elements to bounded strings.
+
+    Applied in :func:`_capture_known` for the ``permission_denials`` field
+    only, BEFORE :func:`_summarize_value` runs. The projection changes only
+    *what* gets summarised: the scalar-only predicate at line 168, the
+    per-field length cap, and ``_SMALL_LIST_ELEM_LIMIT`` are all unchanged.
+    After projection the list contains only strings, so the predicate accepts
+    it and the element-wise preservation branch takes over — exactly what
+    ``errors=[…]`` already gets for free because the SDK types errors as
+    ``list[str]``.
+
+    Non-list / non-tuple inputs pass through unchanged so downstream
+    :func:`_summarize_value` handles ``None`` / scalars / dicts the same way
+    it did before this change. Empty lists also pass through unchanged, which
+    keeps the ``[]`` non-regression case identical to prior behaviour
+    (``[]`` → ``[]`` → :func:`_is_empty_reason_value` returns True →
+    ``reason_source`` falls through to the next candidate, as it did before).
+
+    Long lists are truncated to ``_SMALL_LIST_ELEM_LIMIT`` elements with a
+    trailing ``"+K more"`` string so the count of dropped entries is itself
+    a diagnostic surface — a reader can tell "one denial" from "twenty
+    denials, first eight preserved".
+    """
+    if not isinstance(value, (list, tuple)):
+        return value
+    if not value:
+        return value
+    # If the input already fits within the outer preservation bound, keep
+    # every element. Otherwise reserve one slot for the ``"+K more"`` overflow
+    # marker so the FINAL list length is still ``<= _SMALL_LIST_ELEM_LIMIT``
+    # and passes the scalar-only predicate in :func:`_summarize_value`; if
+    # instead we merely truncated at the raw limit and then appended, the
+    # resulting length would be ``_SMALL_LIST_ELEM_LIMIT + 1`` and the whole
+    # field would collapse right back to ``list(len=N)`` — the very defect
+    # this projection exists to prevent.
+    keep = len(value) if len(value) <= _SMALL_LIST_ELEM_LIMIT else _SMALL_LIST_ELEM_LIMIT - 1
+    projected: list[str] = []
+    for elem in value[:keep]:
+        try:
+            projected.append(_project_denial_element(elem))
+        except Exception as exc:
+            # Never let a single hostile element destroy the whole projection.
+            projected.append(f"project_failed:{type(exc).__name__}")
+    if len(value) > keep:
+        projected.append(f"+{len(value) - keep} more")
+    return projected
+
+
+def _project_denials_safely(value: Any) -> Any:
+    """:func:`_project_denials` with a top-level fail-safe.
+
+    If the projection pipeline itself raises, fall through to the raw value
+    so :func:`_summarize_value` still produces *something* — a ``list(len=N)``
+    summary is a regression, but a crash that shadows the underlying
+    ``SdkIsErrorSignal`` is strictly worse.
+    """
+    try:
+        return _project_denials(value)
+    except Exception:
+        return value
+
+
 def _summarize_value(value: Any) -> Any:
     """Reduce ``value`` to a JSON-safe, length-bounded summary.
 
@@ -223,13 +364,28 @@ def _capture_known(final: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     :func:`_pick_reason` cannot recognise as empty (PR #181 round 3 defect).
     The SUMMARY dict feeds ``captured_fields`` in the marker, so it is
     length-bounded and JSON-safe.
+
+    ``permission_denials`` gets a dedicated projection pass BEFORE the shared
+    summariser sees it (T-quarantine-reasons-captured-but-never-read, msg-2944
+    §5): the SDK types this field as ``list[Any]`` and the CLI populates it
+    with mapping-shaped elements, so ``_summarize_value``'s scalar-only
+    predicate rejects the whole list and it falls back to the useless
+    ``list(len=1)``. The projection reduces each element to a bounded string
+    ahead of time so the same predicate accepts it and the element-wise
+    preservation branch takes over. Nothing else about capture changes —
+    ``permission_denials`` remains an independent key in ``captured_fields``
+    (Einstein msg-2943 (c) constraint: authorisation-failure surfaces must
+    NOT be merged into ``errors[]``).
     """
     raw: dict[str, Any] = {}
     summary: dict[str, Any] = {}
     for name in (*_SESSION_FACT_FIELDS, *_KNOWN_REASON_FIELDS):
         value = _raw_field(final, name)
         raw[name] = value
-        summary[name] = _summarize_safely(value)
+        if name == "permission_denials" and value is not _CAPTURE_ERROR_SENTINEL:
+            summary[name] = _summarize_safely(_project_denials_safely(value))
+        else:
+            summary[name] = _summarize_safely(value)
     return raw, summary
 
 
