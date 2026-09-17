@@ -1676,31 +1676,85 @@ try {
     # never observe disposition='lease-state-unreadable' on an empty-object file.
     Check "(d-7) `{`}` file: disposition is NOT the unreadable label" $false ($r.disposition -eq 'lease-state-unreadable')
 
-    # An operator who instead seeded whitespace-only content or `[]` still lands on (a-valid)
-    # with empty state — same policy as `{}` under the migration-marker contract. See the
-    # docstring section "'empty' SHAPE COUNTS AS VALID" for the rationale.
+    # SILENT-DOUBLE-ALLOCATION PIN (pr-gate REQUEST_CHANGES on PR 286 v1, commit 5e6af92
+    # class=correctness). An earlier draft mapped shape='empty' (blank / whitespace / `[]`)
+    # to verdict='valid' with state=@{}. That opened a silent-double-allocation hole: if
+    # an ACTIVE leases.json (a valid file naming a live holder) were accidentally truncated
+    # to whitespace by an operator or a script, the wrapper would see shape='empty', return
+    # verdict='valid' with an empty state map, and permit a competing lease-requiring
+    # candidate to acquire on the NEXT tick — while the physical holder was still running.
+    # v4.1 fixes this by redirecting shape='empty' into the unreadable branch. The distinction
+    # between "operator ran the runbook and deliberately seeded empty" (runbook writes literal
+    # `{}` → shape='object' → verdict='valid') and "operator accidentally truncated the file"
+    # (blank/whitespace → shape='empty' → verdict='unreadable') is NOT observable by the
+    # wrapper; the runbook is the operator's explicit contract path, and anything else that
+    # lands with an empty root is fail-closed. See Read-LeasesStateForTick's docstring
+    # §WHY 'empty' SHAPE FALLS INTO UNREADABLE for the full rationale.
     #
     # NB: a TRULY zero-byte file (0 bytes on disk) is caught by Read-JsonStateWithShape's
     # try/catch and reported as shape='parse-error' — Get-Content -Raw on a 0-byte file
-    # returns $null, and $null.Trim() throws. That is (a-unreadable) under P4-3 v4.1, and
-    # is the safe branch (0 bytes is more likely a half-write than a deliberate seed). The
-    # runbook's STEP 4 uses `Set-Content -Value '{}'` which writes 2 bytes plus newline —
+    # returns $null, and $null.Trim() throws. That is also (a-unreadable) under P4-3 v4.1.
+    # The runbook's STEP 4 uses `Set-Content -Value '{}'` which writes 2 bytes plus newline —
     # shape='object' — so the runbook itself lands on (a-valid) unambiguously.
     $whitespacePath = Join-Path $p43fixtureDir 'whitespace-leases.json'
     [System.IO.File]::WriteAllText($whitespacePath, "  `n`t  `n", $p43utf8NoBom)
     $r = Read-LeasesStateForTick -Path $whitespacePath
-    Check "(d-7 companion) whitespace-only file: shape='empty'" 'empty' $r.shape
-    Check "(d-7 companion) whitespace-only file: verdict='valid' (treated as migrated-with-no-holder)" 'valid' $r.verdict
-    CheckTrue "(d-7 companion) whitespace-only file: flush_allowed=`$true" $r.flush_allowed
+    Check "(d-7 companion) whitespace-only file: shape='empty' (raw shape from Read-JsonStateWithShape)" 'empty' $r.shape
+    Check "(d-7 companion) whitespace-only file: verdict='unreadable' (fail-closed on truncation hazard)" 'unreadable' $r.verdict
+    Check "(d-7 companion) whitespace-only file: disposition='lease-state-unreadable'" 'lease-state-unreadable' $r.disposition
+    CheckFalse "(d-7 companion) whitespace-only file: flush_allowed=`$false (do NOT overwrite the truncated file — the operator may still hold physically)" $r.flush_allowed
+    CheckTrue "(d-7 companion) whitespace-only file: notification is populated" ([bool]$r.notification)
+    CheckTrue "(d-7 companion) whitespace-only file: notification contains 'DO NOT manually delete' verbatim" `
+        ([bool]($r.notification -match 'DO NOT manually delete leases\.json'))
 
-    # And a root JSON array `[]` — ConvertFrom-Json parses to $null in pwsh 7, Read-Json-
-    # StateWithShape reports shape='empty' (msg-1923 rationale: `[]` has no metadata to leak,
-    # so treat as empty rather than 'array'/corrupt).
+    # A root JSON array `[]` — ConvertFrom-Json parses to $null in pwsh 7, Read-Json-
+    # StateWithShape reports shape='empty'. Same fail-closed policy applies for the same
+    # reason (an operator who seeded `[]` intending "empty JSON array" is redirected into
+    # the runbook via the notification; they land on `{}` on their next attempt).
     $emptyArrayPath = Join-Path $p43fixtureDir 'empty-array-leases.json'
     [System.IO.File]::WriteAllText($emptyArrayPath, '[]', $p43utf8NoBom)
     $r = Read-LeasesStateForTick -Path $emptyArrayPath
     Check "(d-7 companion) `[`]` file: shape='empty'" 'empty' $r.shape
-    Check "(d-7 companion) `[`]` file: verdict='valid'" 'valid' $r.verdict
+    Check "(d-7 companion) `[`]` file: verdict='unreadable' (fail-closed)" 'unreadable' $r.verdict
+    Check "(d-7 companion) `[`]` file: disposition='lease-state-unreadable'" 'lease-state-unreadable' $r.disposition
+    CheckFalse "(d-7 companion) `[`]` file: flush_allowed=`$false" $r.flush_allowed
+
+    # ACTIVE-LEASE-TRUNCATION SCENARIO (the specific hazard the pr-gate flagged). Set up a
+    # valid file naming an active holder, then truncate it to whitespace, and assert the
+    # next read fails closed rather than silently dropping the holder record. This is the
+    # load-bearing test for "mutual exclusion NEVER violated" under the truncation failure
+    # mode; a green run under it is what makes the (d-7 companion) fix load-bearing rather
+    # than cosmetic.
+    $liveHolderPath = Join-Path $p43fixtureDir 'live-then-truncated.json'
+    $liveState = @{
+        editor = @{
+            holder            = 'p/T-active-holder'
+            acquired_at       = '2026-09-18T00:00:00Z'
+            last_progress_at  = '2026-09-18T00:00:00Z'
+            idle_evaluations  = 0
+            generation        = 2
+            pinned            = $false
+            expiring          = $false
+            reclaimed_from    = $null
+            reclaimed_at      = $null
+            reclaimed_reason  = $null
+            reclaim_required  = $false
+            revoked_at        = $null
+            revoked_reason    = $null
+            queue             = @()
+        }
+    }
+    [System.IO.File]::WriteAllText($liveHolderPath, ($liveState | ConvertTo-Json -Depth 5), $p43utf8NoBom)
+    $preTruncate = Read-LeasesStateForTick -Path $liveHolderPath
+    Check "(d-7 companion) truncation setup: pre-truncate verdict='valid'" 'valid' $preTruncate.verdict
+    CheckTrue "(d-7 companion) truncation setup: pre-truncate names the holder" ([bool]$preTruncate.state.ContainsKey('editor'))
+    # Simulate accidental truncation to whitespace (e.g. `> leases.json` or a script bug).
+    [System.IO.File]::WriteAllText($liveHolderPath, "`n", $p43utf8NoBom)
+    $postTruncate = Read-LeasesStateForTick -Path $liveHolderPath
+    Check "(d-7 companion) truncation hazard: post-truncate verdict='unreadable' (NOT valid)" 'unreadable' $postTruncate.verdict
+    Check "(d-7 companion) truncation hazard: post-truncate state is empty" 0 $postTruncate.state.Keys.Count
+    CheckFalse "(d-7 companion) truncation hazard: flush_allowed=`$false (would-be flush would silently drop the holder)" $postTruncate.flush_allowed
+    Check "(d-7 companion) truncation hazard: disposition='lease-state-unreadable' (competing candidate deferred)" 'lease-state-unreadable' $postTruncate.disposition
 }
 finally {
     if (Test-Path -LiteralPath $p43fixtureDir) {

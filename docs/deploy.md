@@ -365,15 +365,19 @@ corrupted (parse-error on the file). See *Recovery* below.
 Recovery (STEP 7 shows a failure).
 
 Re-run the runbook: pause the daemon (STEP 2), inspect `<data_dir>/state/leases.json` on disk
-(present? valid JSON? holder key spelled correctly?), re-run STEP 4 as appropriate, and resume
-(STEP 6). **Do NOT manually delete `leases.json` to "reset"** — a delete flips the wrapper to the
-"missing" branch, indistinguishable from unmigrated, and if a physical holder is still running
-the next tick's automated acquire silently double-allocates the resource. If the file appears
-corrupt (root array, root scalar, JSON parse error), **inspect `leases.json` directly** —
-`Read-LeasesStateForTick` returns `verdict='unreadable'` in this case and the T-5 flush is
-skipped, so the corrupt file itself is preserved in place as your forensic evidence. Do NOT
-expect a `.bad-<utc>` companion file: the P4-3 v4.1 fail-closed policy skips the flush path
-that would invoke `Save-CorruptedStateBackup`, so no rename happens under this branch.
+(present? valid JSON object? holder key spelled correctly?), re-run STEP 4 as appropriate, and
+resume (STEP 6). **Do NOT manually delete `leases.json` to "reset"** — a delete flips the wrapper
+to the "missing" branch, indistinguishable from unmigrated, and if a physical holder is still
+running the next tick's automated acquire silently double-allocates the resource. Same hazard
+applies to accidental truncation: if `leases.json` becomes blank, whitespace-only, or a JSON
+array (`[]`), the wrapper treats it as `verdict='unreadable'` (NOT as valid-with-no-holder) —
+this is fail-closed by design and prevents silent-double-allocation, so **do NOT `> leases.json`
+or write blank lines to it** as a shortcut. Any of the fail-closed cases (root array, root
+scalar, JSON parse error, blank/whitespace, `[]`) **must be inspected and repaired directly**:
+`Read-LeasesStateForTick` returns `verdict='unreadable'` and the T-5 flush is skipped, so the
+file stays in place as your forensic evidence. Do NOT expect a `.bad-<utc>` companion file:
+the P4-3 v4.1 fail-closed policy skips the flush path that would invoke
+`Save-CorruptedStateBackup`, so no rename happens under this branch.
 
 ### Which thread gets driven
 
@@ -509,7 +513,7 @@ forever.
 | `<data_dir>/state/quarantine-history.json` | append-only clear log; every `Clear-Quarantine` writes its `-Reason` here |
 | `<data_dir>/state/evaluated.json` | `first_seen_at` + `last_evaluated_at` per **live** thread; the starvation metric pivots on the current sweep list and prunes ex-live keys |
 | `<data_dir>/state/digest.json` | `last_sent_at` of the daily digest — one send per 24h max |
-| `<data_dir>/state/leases.json` | exclusive-resource lease map — one entry per resource name (v1: `editor`), each with holder / acquired_at / queue / audit fields. **File presence = migration complete** (see § Migration boundary). A missing file is treated as UNMIGRATED, NOT bootstrap: lease-requiring candidates are deferred and the wrapper refuses to create the file automatically. If a subsequent tick reads the file and finds it corrupt (root array, root scalar, JSON parse error) the P4-3 v4.1 policy skips the T-5 flush — the corrupt file stays in place as forensic evidence, and `Save-CorruptedStateBackup` (the `.bad-<utc>` rename) is NOT invoked on that path. Do NOT delete without following the recovery steps in § Migration boundary |
+| `<data_dir>/state/leases.json` | exclusive-resource lease map — one entry per resource name (v1: `editor`), each with holder / acquired_at / queue / audit fields. **Only shape `{...}` (JSON object) is treated as a valid migration marker** (see § Migration boundary). A missing file is treated as UNMIGRATED, NOT bootstrap: lease-requiring candidates are deferred and the wrapper refuses to create the file automatically. If a subsequent tick reads the file and finds any non-object root (root array, root scalar, JSON parse error, blank/whitespace, `[]`), the P4-3 v4.1 policy fails closed: `verdict='unreadable'`, T-5 flush skipped, corrupt file preserved in place as forensic evidence. `Save-CorruptedStateBackup` (the `.bad-<utc>` rename) is NOT invoked on that path. Do NOT delete or truncate without following the recovery steps in § Migration boundary |
 
 Deleting `head_skip.json` costs one full bootstrap sweep (every thread launches once, no
 backoff); `notified.json` at most one duplicate alert.
@@ -520,7 +524,10 @@ one tick of empty starvation report). Deleting `digest.json` forces the next tic
 Deleting `leases.json` **flips the wrapper to the UNMIGRATED branch** — the next tick reads the
 file as missing and defers every lease-requiring candidate; more dangerously, if a physical
 holder is still running when the operator re-runs the runbook, the automated re-seed can silently
-double-allocate. Never delete it as a shortcut; follow § Migration boundary Recovery.
+double-allocate. Never delete it as a shortcut. Truncating it (blank / whitespace / `[]`) does
+NOT bypass this: the wrapper treats those shapes as `verdict='unreadable'` fail-closed, not as
+valid-with-no-holder, so the next tick defers rather than granting — but repairing then requires
+following the same Recovery path. Follow § Migration boundary Recovery in either case.
 
 ## Quarantine and daily digest
 
