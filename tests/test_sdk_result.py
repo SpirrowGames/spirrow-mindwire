@@ -442,17 +442,70 @@ def test_permission_denials_projection_readability_reason_reaches_the_marker() -
     assert captured != "list(len=1)"
     assert isinstance(captured, list)
     assert len(captured) == 1
-    # The denial content is legible in the projected element.
+    # The denial content is legible in the projected element. Values are
+    # wrapped in ``json.dumps``-style quotes so a value containing spaces
+    # (``git push origin main``) has unambiguous boundaries (msg-3231
+    # legibility objection / msg-3326 revision / msg-3328 substitution).
     element = captured[0]
     assert isinstance(element, str)
-    assert "tool_name=Bash" in element
-    assert "rule=branch-protection" in element
-    assert "git push origin main" in element
+    assert 'tool_name="Bash"' in element
+    assert 'rule="branch-protection"' in element
+    assert 'tool_input="git push origin main"' in element
 
     # Picker treats the denial as a real reason (it is one).
     assert detail["reason_source"] == "field:permission_denials"
     # Sanity: the marker's message string carries the denial too.
     assert "Bash" in detail["message"]
+
+
+def test_permission_denials_projection_escapes_quotes_backslashes_and_newlines() -> None:
+    """Escape pin (msg-3328 §4): ``"``, ``\\``, and ``\\n`` in a denial value
+    must not break the marker's quoting or its line-integrity.
+
+    Einstein's msg-3327 blocking objection: the earlier hand-rolled escaper
+    (msg-3326 revision) only handled ``"`` and ``\\`` — a newline in a
+    denial value (trivial to produce from any tool output pinned into a
+    permission decision) would land verbatim in the marker and split the
+    log line, desynchronising every line-oriented reader downstream.
+
+    Fix (msg-3328): use ``json.dumps`` on the stringified value, which
+    normalises every control character (``\\n``, ``\\r``, ``\\t``, and the
+    rest) and every character that could break the outer double-quote
+    boundary. This test is the load-bearing pin — if a future change swaps
+    ``json.dumps`` out for something newline-unsafe, the final assertion
+    (no ``\\n`` byte anywhere in the rendered field) fails loudly.
+    """
+    denial = {
+        "tool_name": 'Bash "sub"',
+        "tool_input": "line1\nline2",
+        "rule": "back\\slash",
+    }
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    element = captured[0]
+    assert isinstance(element, str)
+
+    # Inner ``"`` is escaped as ``\"`` (two characters), so the outer
+    # double-quote boundary stays unambiguous.
+    assert r'tool_name="Bash \"sub\""' in element
+
+    # Inner ``\`` is escaped as ``\\`` (two characters).
+    assert r'rule="back\\slash"' in element
+
+    # Inner newline is escaped as the literal two-character sequence ``\n``,
+    # NOT rendered as an embedded LF byte.
+    assert r'tool_input="line1\nline2"' in element
+
+    # The load-bearing line-integrity assertion: no raw newline byte anywhere
+    # in the rendered field. This is what Einstein's objection specifically
+    # required — a log parser reading one marker per line must not see this
+    # field split across multiple lines.
+    assert "\n" not in element
+    assert "\r" not in element
 
 
 def test_permission_denials_projection_c_independence_never_merged_into_errors() -> None:
@@ -599,8 +652,8 @@ def test_permission_denials_projection_truncates_long_lists_with_overflow_marker
     assert len(captured) == _SMALL_LIST_ELEM_LIMIT
     kept = _SMALL_LIST_ELEM_LIMIT - 1
     assert captured[-1] == f"+{20 - kept} more"
-    # And the preserved entries still carry their content.
-    assert "tool_name=tool_0" in captured[0]
+    # And the preserved entries still carry their content (quoted per msg-3328).
+    assert 'tool_name="tool_0"' in captured[0]
 
 
 def test_permission_denials_projection_scalar_only_list_passes_through_normally() -> None:

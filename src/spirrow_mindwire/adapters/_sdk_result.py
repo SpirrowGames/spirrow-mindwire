@@ -181,9 +181,21 @@ def _project_denial_element(elem: Any) -> str:
     Per msg-3156's fallback rule (``schema undefined / unstable → generic
     scalarizer alone``) this is a *generic* scalarizer: no priority key set,
     no field-name specialisation. For a mapping-shaped element it emits
-    ``"k1=v1 k2=v2 …"`` with keys sorted for determinism; for an object with
-    ``vars()`` it treats the attribute dict the same way; for a scalar it
-    stringifies; for anything else it emits ``type(repr_omitted)``.
+    ``'k1="v1" k2="v2" …'`` with keys sorted for determinism and values wrapped
+    via :func:`json.dumps` on a stringified value so ``"``, ``\\``, newlines,
+    and other control characters cannot break the key/value boundary or the
+    marker's line-integrity (msg-3328: the marker is a single line and must
+    stay a single line under all values); for an object with ``vars()`` it
+    treats the attribute dict the same way; for a scalar it stringifies; for
+    anything else it emits ``type(repr_omitted)``.
+
+    ``json.dumps`` is used rather than a hand-rolled escaper deliberately: a
+    bespoke escaper for a subset of characters would leave others (notably
+    ``\\n`` and ``\\r``) to reach the marker verbatim and split the log line,
+    which is exactly the defect Einstein's msg-3327 objection identified.
+    ``str(...)`` normalises the input first so a numeric or boolean value
+    doesn't get emitted as a bare token (``k=42``) that reintroduces boundary
+    ambiguity — every value is a quoted JSON string.
 
     The result is bounded by the same per-field length cap as every other
     captured string (``_FIELD_VALUE_MAX_LEN``), because the last line of this
@@ -214,7 +226,7 @@ def _project_denial_element(elem: Any) -> str:
             # Sorting failed (mixed unorderable types after str() cast is
             # unlikely, but be defensive): fall back to insertion order.
             keys = list(source.keys())
-        pairs = [f"{k}={_scalarize_denial_value(source[k])}" for k in keys]
+        pairs = [f"{k}={json.dumps(str(_scalarize_denial_value(source[k])))}" for k in keys]
         text = " ".join(pairs)
     summarised = _summarize_value(text)
     return summarised if isinstance(summarised, str) else str(summarised)
