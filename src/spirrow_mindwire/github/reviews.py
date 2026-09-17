@@ -8,14 +8,17 @@ Two responsibilities, one module:
    is per-caller (DESIGN v3 §2 corrected in msg-1990: round cap is NOT a caller of
    :func:`landed`; its head-independent ``sum(...)`` on prior verdict reviews is a
    different question — a per-PR spend cap, not a per-head landed check).
-2. :class:`ReviewReceipt` / :func:`append_verdict_footer` / :func:`parse_verdict_footer`
-   — the SINGLE producer/consumer of the ``<!-- mindwire:verdict head_sha=<sha>
-   event=<EVENT> -->`` HTML-comment sentinel the chatroom-replay path uses as its
-   version gate and machine-readable payload (DESIGN v3 Q5-A: HTML comment
-   sentinel, both ``head_sha`` AND ``event`` in the footer, one generation site).
-   Putting these next to :func:`landed` keeps footer construction / parsing / the
-   dedup predicate under one roof — a body posted here is the same body a replay
-   consumer reads, so the round-trip is verified by tests that touch one file.
+2. :class:`ReviewReceipt` / :func:`parse_verdict_footer` — the SINGLE
+   consumer of the ``<!-- mindwire:verdict head_sha=<sha> event=<EVENT> -->``
+   HTML-comment sentinel the chatroom-replay path uses as its version gate and
+   machine-readable payload (DESIGN v3 Q5-A: HTML comment sentinel, both
+   ``head_sha`` AND ``event`` in the footer, one generation site). The single
+   generation site is
+   :func:`spirrow_mindwire.naysayer.pr_review._insert_verdict_footer_before_marker`,
+   which places the footer above the ADR-INDEX marker's final-line invariant
+   rather than tail-appending it; the round-trip (write there, parse here) is
+   pinned by driver-level tests. Keeping the parser next to :func:`landed`
+   keeps footer parsing / the dedup predicate under one roof.
 
 Three-valued: :class:`LandedState` distinguishes ``LANDED`` from ``NOT_LANDED``
 from ``UNKNOWN``. The distinction is load-bearing for D-7 (env-terminal reads):
@@ -123,6 +126,13 @@ def landed(
 # safer to skip replay than to guess which match is "the" verdict when the
 # invariant "exactly one footer per body" no longer holds. Same fail-safe
 # direction as :class:`LandedState.UNKNOWN`: when in doubt, do not POST.
+#
+# The single GENERATION site lives in
+# :func:`spirrow_mindwire.naysayer.pr_review._insert_verdict_footer_before_marker`
+# — the ADR-INDEX marker's "final non-empty line" invariant forces the footer
+# to be inserted above it rather than tail-appended, so keeping the writer at
+# the marker-aware call site (and only the parser here) avoids a helper that
+# would look correct in isolation and be wrong on production bodies.
 _VERDICT_FOOTER_RE = re.compile(
     r"<!-- mindwire:verdict head_sha=([A-Fa-f0-9]{7,40}) "
     r"event=(APPROVE|REQUEST_CHANGES|COMMENT) -->"
@@ -137,29 +147,6 @@ _VERDICT_FOOTER_RE = re.compile(
 # the current head_sha the driver holds — a prefix match is required for the
 # comparison ``footer_sha == current_head_sha[: len(footer_sha)]``. Callers do
 # that comparison themselves; this module returns the raw string.
-
-
-def append_verdict_footer(body: str, *, head_sha: str, event: ReviewEvent) -> str:
-    """Append the ``<!-- mindwire:verdict head_sha=... event=... -->`` sentinel to ``body``.
-
-    ONE call site (the driver's ``_submit_review`` receipt path). Idempotent-shaped:
-    if the caller passes an already-marked body, the parser will find TWO footers
-    and refuse replay (fail-safe) — so callers must invoke this exactly once per
-    body, and the tests pin that.
-
-    ``head_sha`` is stored verbatim. Callers producing a truncated sha (e.g. the
-    debounce skip body uses ``head[:12]``) get a footer with that same short form;
-    :func:`parse_verdict_footer` accepts >= 7 chars, and the comparison at the
-    replay site does a prefix match against the current head_sha.
-
-    ``event`` is stored as its GitHub API name (``APPROVE`` / ``REQUEST_CHANGES``
-    / ``COMMENT``). The DESIGN v3 rationale for storing the event in the footer
-    is directional-safety: a replay that re-POSTs must submit the SAME verdict
-    the driver decided last time, not a re-parse of the model's prose (which
-    would risk reading a quoted REQUEST_CHANGES as APPROVE, msg-1987 §1).
-    """
-    marker = f"<!-- mindwire:verdict head_sha={head_sha} event={event.value} -->"
-    return f"{body}\n\n{marker}" if body else marker
 
 
 def parse_verdict_footer(body: str) -> tuple[str, ReviewEvent] | None:
@@ -227,7 +214,6 @@ class ReviewReceipt:
 __all__ = [
     "LandedState",
     "ReviewReceipt",
-    "append_verdict_footer",
     "landed",
     "parse_verdict_footer",
 ]

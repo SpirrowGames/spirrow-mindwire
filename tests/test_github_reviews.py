@@ -24,7 +24,6 @@ from spirrow_mindwire.github.client import ReviewEvent, ReviewInfo
 from spirrow_mindwire.github.reviews import (
     LandedState,
     ReviewReceipt,
-    append_verdict_footer,
     landed,
     parse_verdict_footer,
 )
@@ -137,25 +136,16 @@ def test_landed_finds_review_among_many() -> None:
 
 
 # ── Verdict footer (DESIGN v3 Q5-A: HTML comment sentinel, head_sha + event) ──
-
-
-def test_append_verdict_footer_appends_html_comment_sentinel() -> None:
-    marked = append_verdict_footer(
-        "the critique\n\nVERDICT: APPROVE", head_sha="deadbeef" * 5, event=ReviewEvent.APPROVE
-    )
-    assert marked.endswith(
-        "<!-- mindwire:verdict head_sha=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef event=APPROVE -->"
-    )
-
-
-def test_append_verdict_footer_on_empty_body_returns_just_the_marker() -> None:
-    marked = append_verdict_footer("", head_sha="abc1234", event=ReviewEvent.COMMENT)
-    assert marked == "<!-- mindwire:verdict head_sha=abc1234 event=COMMENT -->"
+# The single generation site is
+# :func:`spirrow_mindwire.naysayer.pr_review._insert_verdict_footer_before_marker`;
+# these tests exercise the parser directly against literal footer strings so we
+# can pin the parser's own contract independent of any helper (msg-3218 PR-gate
+# review of #280: no dead-code producer next to the parser).
 
 
 def test_parse_verdict_footer_roundtrip_for_each_event() -> None:
     for event in (ReviewEvent.APPROVE, ReviewEvent.REQUEST_CHANGES, ReviewEvent.COMMENT):
-        body = append_verdict_footer("x", head_sha="abcdef1234567890", event=event)
+        body = f"x\n\n<!-- mindwire:verdict head_sha=abcdef1234567890 event={event.value} -->"
         parsed = parse_verdict_footer(body)
         assert parsed is not None
         sha, ev = parsed

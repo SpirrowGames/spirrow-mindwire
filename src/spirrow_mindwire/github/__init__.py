@@ -21,7 +21,6 @@ from .client import (
 from .reviews import (
     LandedState,
     ReviewReceipt,
-    append_verdict_footer,
     landed,
     parse_verdict_footer,
 )
@@ -39,7 +38,6 @@ __all__ = [
     "ReviewReceipt",
     "Scope",
     "TargetTerminalError",
-    "append_verdict_footer",
     "classify_http_error",
     "github_token",
     "landed",
