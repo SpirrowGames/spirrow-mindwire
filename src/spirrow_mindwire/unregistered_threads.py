@@ -304,7 +304,15 @@ def enumerate_project(
 ) -> ProjectReport:
     """Apply :func:`is_unregistered_live` over ``threads`` and produce a report.
 
-    ``threads`` is the raw ``items`` array from ``chatroom_list_threads``.
+    ``threads`` is a well-shaped iterable of thread dicts. Callers are
+    responsible for filtering out non-object items *before* handing the
+    list here; the CLI's ``_list_live_threads`` does exactly that at the
+    tool boundary and passes the count of what it dropped through
+    ``malformed_count``. This function does not re-filter: the type
+    signature declares ``Iterable[dict[str, Any]]`` and the shape check
+    lives at the one boundary that actually meets untrusted input
+    (msg-3225 PR-gate ADVISORY on PR #282 — YAGNI / dual-management).
+
     A thread whose ``thread_id`` is missing or non-string is ignored (it
     cannot be a "known thread" the sweep is missing — no id to compare
     against), matching the shape-tolerance :mod:`parked_humans` applies
@@ -312,19 +320,12 @@ def enumerate_project(
 
     ``malformed_count`` is the count of non-object items the caller
     already dropped upstream (msg-2648 §3 — the CLI's ``_list_live_threads``
-    filters non-dicts before handing the accumulated list here). Any
-    additional non-dicts encountered *inside* this function are added to
-    that upstream tally so tests that call ``enumerate_project`` directly
-    with a mixed list still count what got dropped; the aggregate lives
-    on :attr:`ProjectReport.malformed_count` and is **never** merged into
-    ``unregistered_count``.
+    filters non-dicts before handing the accumulated list here). It flows
+    through unchanged onto :attr:`ProjectReport.malformed_count` and is
+    **never** merged into ``unregistered_count``.
     """
     unregistered: list[str] = []
-    dropped = malformed_count
     for thread in threads:
-        if not isinstance(thread, dict):
-            dropped += 1
-            continue
         if not is_unregistered_live(project, thread, registered):
             continue
         thread_id = str(thread.get("thread_id") or "").strip()
@@ -335,7 +336,7 @@ def enumerate_project(
         unregistered_count=len(unregistered),
         unregistered=tuple(unregistered),
         error=None,
-        malformed_count=dropped,
+        malformed_count=malformed_count,
     )
 
 
