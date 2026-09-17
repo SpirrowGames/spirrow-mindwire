@@ -369,9 +369,11 @@ Re-run the runbook: pause the daemon (STEP 2), inspect `<data_dir>/state/leases.
 (STEP 6). **Do NOT manually delete `leases.json` to "reset"** — a delete flips the wrapper to the
 "missing" branch, indistinguishable from unmigrated, and if a physical holder is still running
 the next tick's automated acquire silently double-allocates the resource. If the file appears
-corrupt (root array, root scalar, JSON parse error), inspect any `<data_dir>/state/leases.json.bad-<utc>`
-files first — `Save-CorruptedStateBackup` renames a corrupt file when the flush caller runs, so
-your forensic evidence is preserved.
+corrupt (root array, root scalar, JSON parse error), **inspect `leases.json` directly** —
+`Read-LeasesStateForTick` returns `verdict='unreadable'` in this case and the T-5 flush is
+skipped, so the corrupt file itself is preserved in place as your forensic evidence. Do NOT
+expect a `.bad-<utc>` companion file: the P4-3 v4.1 fail-closed policy skips the flush path
+that would invoke `Save-CorruptedStateBackup`, so no rename happens under this branch.
 
 ### Which thread gets driven
 
@@ -507,7 +509,7 @@ forever.
 | `<data_dir>/state/quarantine-history.json` | append-only clear log; every `Clear-Quarantine` writes its `-Reason` here |
 | `<data_dir>/state/evaluated.json` | `first_seen_at` + `last_evaluated_at` per **live** thread; the starvation metric pivots on the current sweep list and prunes ex-live keys |
 | `<data_dir>/state/digest.json` | `last_sent_at` of the daily digest — one send per 24h max |
-| `<data_dir>/state/leases.json` | exclusive-resource lease map — one entry per resource name (v1: `editor`), each with holder / acquired_at / queue / audit fields. **File presence = migration complete** (see § Migration boundary). A missing file is treated as UNMIGRATED, NOT bootstrap: lease-requiring candidates are deferred and the wrapper refuses to create the file automatically. `<path>.bad-<utc>` companions are created by `Save-CorruptedStateBackup` when a corrupt file is encountered on flush — do NOT delete either without first following the recovery steps in § Migration boundary |
+| `<data_dir>/state/leases.json` | exclusive-resource lease map — one entry per resource name (v1: `editor`), each with holder / acquired_at / queue / audit fields. **File presence = migration complete** (see § Migration boundary). A missing file is treated as UNMIGRATED, NOT bootstrap: lease-requiring candidates are deferred and the wrapper refuses to create the file automatically. If a subsequent tick reads the file and finds it corrupt (root array, root scalar, JSON parse error) the P4-3 v4.1 policy skips the T-5 flush — the corrupt file stays in place as forensic evidence, and `Save-CorruptedStateBackup` (the `.bad-<utc>` rename) is NOT invoked on that path. Do NOT delete without following the recovery steps in § Migration boundary |
 
 Deleting `head_skip.json` costs one full bootstrap sweep (every thread launches once, no
 backoff); `notified.json` at most one duplicate alert.
