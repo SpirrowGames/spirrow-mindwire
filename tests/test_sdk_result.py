@@ -680,6 +680,133 @@ def test_permission_denials_projection_preserves_non_ascii_in_dict_elements() ->
     assert "🚫" in reparsed_element
 
 
+def test_build_budgeted_pairs_fallback_is_json_quoted_under_huge_key() -> None:
+    """PR #288 PR-gate msg-3348 blocking invariant fix.
+
+    When a dict key is so long that no value budget remains
+    (``v_share < 1``), the previous implementation emitted a bare
+    literal ``<value truncated>`` token — unquoted. That broke the
+    ``_project_denial_element`` docstring's load-bearing invariant
+    ("every key and every value is a quoted JSON string") and would
+    break any quote-aware log parser that reached the token.
+
+    Fix pinned here: the fallback marker MUST be JSON-quoted so the
+    invariant holds even in the degenerate huge-key case. This branch
+    was previously a coverage blind spot.
+    """
+    from spirrow_mindwire.adapters._sdk_result import (
+        _FIELD_VALUE_MAX_LEN,
+        _build_budgeted_pairs,
+    )
+
+    # Force v_share < 1 by making the key longer than per_pair.
+    # per_pair for 1 pair = _FIELD_VALUE_MAX_LEN - 1 = 499.
+    # After json.dumps(key), the quoted key needs to be >= 496 chars so
+    # v_share = 499 - 496 - 3 < 1.
+    huge_key = "K" * 600
+    result = _build_budgeted_pairs([(huge_key, "v")], _FIELD_VALUE_MAX_LEN)
+    assert len(result) == 1
+    element = result[0]
+
+    # The value marker MUST be JSON-quoted (starts with " and ends with ").
+    # Rendered form: '"KKK...K"="<value truncated>"'
+    assert '="<value truncated>"' in element, f"fallback marker was not JSON-quoted: {element!r}"
+
+    # Structural invariant: raw quote count is a multiple of 4
+    # (2 for the key, 2 for the value). A bare unquoted marker would
+    # produce 2 quotes total (odd of a 4-multiple would fail).
+    assert element.count('"') % 4 == 0
+
+
+def test_permission_denials_projection_footer_reports_true_dropped_count() -> None:
+    """PR #288 PR-gate msg-3348 blocking correctness fix.
+
+    Double-truncation defect: Phase 1 bounds a huge string to
+    ~_FIELD_VALUE_MAX_LEN chars with a ``…(+Nch)`` footer. If Phase 2
+    then truncates the already-truncated string and computes its footer
+    from the Phase-1-truncated length, the reported dropped count is
+    mathematically false — presenting a small footer count (~41) for a
+    value where the true drop is huge (~4529). The reader is misled
+    about the scale of data loss.
+
+    Fix: Phase 2 receives RAW values (not Phase-1-scalarized) so its
+    footer computes against the original length. This test pins the
+    correctness invariant against future regression.
+    """
+    huge = "x" * 5000
+    denial = {"tool_input": huge}
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    element = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(element, str)
+
+    # Extract the footer's dropped-char count from the element. The
+    # element renders as ``"tool_input"="xxx...xxx…(+Nch)"``. We just
+    # need to find the number inside ``…(+Nch)``.
+    import re
+
+    match = re.search(r"…\(\+(\d+)ch\)", element)
+    assert match is not None, f"no truncation footer found in element: {element!r}"
+    dropped = int(match.group(1))
+
+    # The true dropped count is (5000 - kept), where kept is the number
+    # of raw chars that survived. kept is roughly per_pair minus overhead
+    # — well under 5000. So the reported dropped MUST be a substantial
+    # fraction of 5000, not something absurdly small like 41.
+    # Concretely: kept ~= 470-480, so dropped should be ~4520-4530.
+    # Assert dropped is at least 4000 (well above the pre-fix false
+    # value of ~41 which was computed against Phase 1's ~512-char
+    # already-truncated string).
+    assert dropped >= 4000, (
+        f"footer reports mathematically false dropped count: "
+        f"{dropped} (expected close to 5000-per_pair_budget, i.e. ~4500). "
+        f"element={element!r}"
+    )
+    # And the count is consistent with the input length: kept + dropped
+    # should equal or be very close to len(huge) = 5000.
+    assert 4000 <= dropped <= 5000
+
+
+def test_permission_denials_projection_value_that_fits_uncensored_gets_no_footer() -> None:
+    """PR #288 PR-gate msg-3348 advisory structure fix.
+
+    Advisory eager-truncation flaw: ``_build_budgeted_pairs`` reserved
+    ``v_footer_reserve`` (12 chars) unconditionally, so a value that
+    fits within the raw budget uncensored got truncated anyway and
+    received a footer — mirroring the exact "eager truncation
+    sacrifices perfectly valid pairs" defect msg-3339 fixed in
+    ``_join_pairs_bounded``. Pin the fast-path so this can't regress.
+
+    Construction: a dict with enough small pairs to trigger Phase 2
+    overflow, plus one pair whose value length lands strictly between
+    ``v_share - v_footer_reserve`` and ``v_share``. Before the fix,
+    that pair would be truncated + footered; after, it survives as-is.
+    """
+    # Force Phase 2 by making the joined text just over _FIELD_VALUE_MAX_LEN
+    # (500). Use 10 pairs of ~55 chars each = 550 chars — triggers overflow.
+    # For 11 pairs total (10 + target), per_pair = 500//11 - 1 = 44. For
+    # key ``"target"`` (json 8 chars), v_share = 44 - 8 - 3 = 33 and
+    # v_budget with reserve = 33 - 12 = 21. A value of 30 chars fits in
+    # v_share (30 <= 33) uncensored but would previously get truncated to
+    # 21 + a 12-char footer under the eager-reserve path.
+    denial = {f"k{i}": ("v" * 45) for i in range(10)}
+    # Add one target value that lands in the fits-uncensored zone.
+    denial["target"] = "y" * 30
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    element = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(element, str)
+
+    # The target value should appear uncensored (all 30 y's), with no
+    # truncation footer immediately after it. Before the fix, it would
+    # have been truncated to ``yyy...yyy…(+9ch)`` or similar.
+    assert '"target"="' + ("y" * 30) + '"' in element, (
+        f"target value was eagerly truncated even though it fits uncensored: {element!r}"
+    )
+
+
 def test_permission_denials_projection_single_large_value_preserves_key() -> None:
     """PR #288 PR-gate msg-3345 blocking regression fix.
 

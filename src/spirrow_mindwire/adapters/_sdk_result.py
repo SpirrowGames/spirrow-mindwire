@@ -235,16 +235,29 @@ def _join_pairs_bounded(pairs: list[str], budget: int) -> str:
     return result
 
 
-def _build_budgeted_pairs(raw_pairs: list[tuple[str, str]], budget: int) -> list[str]:
+_VALUE_TRUNCATED_MARKER = "<value truncated>"
+
+
+def _build_budgeted_pairs(raw_pairs: list[tuple[str, Any]], budget: int) -> list[str]:
     """Build quoted ``"K"="V"`` pairs whose values are budgeted to fit.
 
     Called from :func:`_project_denial_element`'s phase-2 overflow path
-    (PR #288 PR-gate msg-3345 blocking regression fix). Given the raw
-    ``(key, value)`` string tuples for a dict-shaped denial whose fully-
-    quoted join exceeds ``budget``, this helper rebuilds each pair with
-    a per-value budget derived from an equal share of the total budget,
-    so no key gets dropped entirely and every value survives as a
-    bounded prefix + ``…(+Nch)`` footer.
+    (PR #288 PR-gate msg-3345 blocking regression fix). Given
+    ``(key_str, raw_value)`` tuples for a dict-shaped denial whose
+    fully-quoted join exceeds ``budget``, this helper rebuilds each pair
+    with a per-value budget derived from an equal share of the total
+    budget, so no key gets dropped entirely and every value survives as
+    a bounded prefix + ``…(+Nch)`` footer.
+
+    Values arrive in their ORIGINAL form (pre-scalarization), NOT the
+    already-truncated form :func:`_scalarize_denial_value` returns. This
+    is load-bearing for footer correctness (PR #288 PR-gate msg-3348
+    blocking correctness objection): if the value had already been
+    Phase-1-truncated, this helper would compute its footer against the
+    truncated length and emit a mathematically false dropped-char count
+    (e.g., reporting ``…(+41ch)`` for a value where 4529 chars were
+    actually dropped). Working from the raw value means the footer
+    accurately reports total data loss.
 
     The value is truncated on its RAW form before being handed to
     :func:`json.dumps`; because ``json.dumps`` quoting is applied to a
@@ -253,9 +266,18 @@ def _build_budgeted_pairs(raw_pairs: list[tuple[str, str]], budget: int) -> list
     naysayer's proposed "budget the value before quoting so the whole
     pair fits" strategy from msg-3342.
 
+    Non-string raw values are routed through :func:`_scalarize_denial_value`
+    to obtain a bounded type-marker representation (e.g., ``dict(len=3)``).
+    Type markers are short, so the truncation branch below rarely fires
+    for them.
+
     If a key alone consumes its pair's share (very rare — would need a
-    key hundreds of characters long), the value falls back to ``""``
-    with a marker so the key remains visible.
+    key hundreds of characters long), the value falls back to the marker
+    ``"<value truncated>"`` (JSON-quoted, per the structural invariant
+    :func:`_project_denial_element` binds — PR #288 PR-gate msg-3348
+    blocking invariant objection: every value must be a quoted JSON
+    string, so a bare unquoted ``<value truncated>`` would violate the
+    contract).
     """
     if not raw_pairs:
         return []
@@ -263,22 +285,43 @@ def _build_budgeted_pairs(raw_pairs: list[tuple[str, str]], budget: int) -> list
     # Per-pair total budget: an equal share of the total, minus the joining
     # space that will separate this pair from the next one.
     per_pair = max(30, budget // n - 1)
-    # Small footer-reservation constant used inside each pair's value budget.
-    # ``…(+999999ch)`` is 12 chars — the worst case footer for values seen
-    # in practice, safe against very long values (up to 999_999 chars).
+    # Footer-reservation constant used only WHEN the value overflows its
+    # uncensored share. ``…(+999999ch)`` is 12 chars — the worst case
+    # footer for values seen in practice, safe against very long values
+    # (up to 999_999 chars). Reserving unconditionally would eagerly
+    # truncate values that fit uncensored — the same defect msg-3339
+    # fixed in :func:`_join_pairs_bounded`, so the same fast-path check
+    # applies here (PR #288 PR-gate msg-3348 advisory structure).
     v_footer_reserve = len("…(+999999ch)")
+    truncated_marker_json = json.dumps(_VALUE_TRUNCATED_MARKER, ensure_ascii=False)
     result: list[str] = []
-    for k, v in raw_pairs:
+    for k, v_raw in raw_pairs:
         key_json = json.dumps(k, ensure_ascii=False)
-        # Value budget: per_pair - key_json - '=' - 2 value quotes - footer.
-        v_budget = per_pair - len(key_json) - 3 - v_footer_reserve
-        if v_budget < 1:
-            # Key alone consumes the pair's share. Preserve the key with a
-            # marker so it remains visible; the value is unrecoverable at
-            # this budget.
-            result.append(f"{key_json}=<value truncated>")
+        # Value share NOT counting footer reservation. If the value fits
+        # in this share uncensored, no footer is needed.
+        v_share = per_pair - len(key_json) - 3  # -3 for '=' + 2 value quotes
+        if v_share < 1:
+            # Key alone consumes the pair's share. Preserve the key with
+            # a JSON-quoted marker so the "every value is a quoted JSON
+            # string" invariant holds.
+            result.append(f"{key_json}={truncated_marker_json}")
             continue
-        v_truncated = v[:v_budget] + f"…(+{len(v) - v_budget}ch)" if len(v) > v_budget else v
+        # Convert non-string values via the standard scalarizer (returns
+        # bounded type-markers for containers). For strings, keep the raw
+        # form so the footer computes against original length.
+        v_str = v_raw if isinstance(v_raw, str) else str(_scalarize_denial_value(v_raw))
+        if len(v_str) <= v_share:
+            # Fast path: fits uncensored. No footer, no eager truncation.
+            v_truncated = v_str
+        else:
+            # Overflow path: reserve room for the footer.
+            v_budget = v_share - v_footer_reserve
+            if v_budget < 1:
+                # Not enough room even for the footer. Fall back to the
+                # quoted marker so the invariant holds.
+                result.append(f"{key_json}={truncated_marker_json}")
+                continue
+            v_truncated = v_str[:v_budget] + f"…(+{len(v_str) - v_budget}ch)"
         result.append(f"{key_json}={json.dumps(v_truncated, ensure_ascii=False)}")
     return result
 
@@ -399,10 +442,20 @@ def _project_denial_element(elem: Any) -> str:
         # bound (``_FIELD_VALUE_MAX_LEN`` via ``_scalarize_denial_value``).
         # If they join within budget, use as-is — this is the common path
         # for small readable dicts and adds zero overhead.
-        raw_pairs = [(str(k), str(_scalarize_denial_value(source[k]))) for k in keys]
+        #
+        # Note that Phase 1 uses SCALARIZED values (bounded strings, type
+        # markers for containers) but Phase 2 receives RAW values below,
+        # so its per-value truncation footer computes against original
+        # length rather than the already-truncated Phase-1 length. This
+        # matters when the input has a huge string value: Phase 1 truncates
+        # to ~512 chars, but Phase 2 needs to report the ACTUAL dropped
+        # count (e.g., ``…(+4970ch)``), not a mathematically false
+        # ``…(+41ch)`` computed against Phase 1's already-truncated form
+        # (PR #288 PR-gate msg-3348 blocking correctness objection).
+        raw_pairs_scalarized = [(str(k), str(_scalarize_denial_value(source[k]))) for k in keys]
         pairs = [
             f"{json.dumps(k, ensure_ascii=False)}={json.dumps(v, ensure_ascii=False)}"
-            for k, v in raw_pairs
+            for k, v in raw_pairs_scalarized
         ]
         full = " ".join(pairs)
         if len(full) <= _FIELD_VALUE_MAX_LEN:
@@ -424,6 +477,7 @@ def _project_denial_element(elem: Any) -> str:
             # value before quoting so the whole pair fits" framing works:
             # quoting a shorter string is still quoted correctly, and no
             # blind mid-quote slice happens anywhere.
+            raw_pairs = [(str(k), source[k]) for k in keys]
             pairs = _build_budgeted_pairs(raw_pairs, _FIELD_VALUE_MAX_LEN)
             # ``_join_pairs_bounded`` as a final safety net for pathological
             # cases where JSON escape expansion (e.g., every character
