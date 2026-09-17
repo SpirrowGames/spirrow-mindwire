@@ -1218,6 +1218,12 @@ class _FakeGitHubCi:
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    async def probe_identity(self) -> int:
+        # Orchestrator L2 tests never exercise the naysayer classification funnel; return
+        # 200 so any accidental call yields a well-defined value. Kept for
+        # GitHubReviewClient Protocol compliance (T-gate-review-submit-failure-handling PR-A).
+        return 200
+
     async def aclose(self) -> None:
         return None
 

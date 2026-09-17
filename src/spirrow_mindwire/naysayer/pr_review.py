@@ -55,13 +55,19 @@ from ..github.client import (
     CiState,
     CiStatus,
     CrossPrApproveCoverage,
+    EnvironmentTerminalError,
     GitHubClient,
     GitHubHTTPError,
     GitHubReviewClient,
     PrRef,
+    Retryability,
     ReviewEvent,
     ReviewInfo,
+    Scope,
+    TargetTerminalError,
+    classify_http_error,
     naysayer_github_token,
+    scope_from_probe,
 )
 from ..lexora.client import (
     LEXORA_BACKEND_TIMEOUT_SECONDS,
@@ -1601,6 +1607,15 @@ def _log_pass2(pr_slug: str, selection: AdrPointerSelection, raw: str) -> None:
         logger.info("%s (%s)", line, pr_slug)
 
 
+def _submit_decision(scope: Scope) -> str:
+    """One-word label for the structured submit-failure log line's ``decision`` field."""
+    if scope in (Scope.ENVIRONMENT_CREDENTIAL, Scope.ENVIRONMENT_PERMISSION):
+        return "environment-terminal-raise"
+    if scope is Scope.TARGET:
+        return "target-terminal-raise"
+    return "unknown-raise"
+
+
 class NaysayerPrReviewDriver:
     """Independent PR-diff code review via Lexora (one-shot) + GitHub (T20 → ADR-19 driver)."""
 
@@ -2076,16 +2091,93 @@ class NaysayerPrReviewDriver:
         advisory for the whole life of that PR — the fix is to re-open the PR under the author
         identity, not to lean on this fallback.
 
-        Until 2026-08-29 this fallback was dead code: it branches on text that
-        :func:`~spirrow_mindwire.github.client._error_detail` dropped. See that docstring.
+        On any :class:`GitHubHTTPError` from the primary POST that is NOT the same-identity 422
+        the exception is routed through :meth:`_classify_and_reraise` — same funnel used on the
+        fallback POST — so an environment-terminal failure (401 / 403 / 404 with a live probe)
+        raises :class:`EnvironmentTerminalError` (daemon exits 2, PS wrapper alerts) rather than
+        quarantining the thread. A TARGET-scoped 422 raises :class:`TargetTerminalError`; an
+        UNKNOWN (probe unreachable) re-raises the raw ``GitHubHTTPError`` — the fall-through the
+        quarantine path already handles as "未分類は必ず 1" (DESIGN v3 §3, msg-1987).
+
+        The fallback POST goes through the SAME classification funnel: an environment outage
+        during the fallback must NOT quarantine the thread either (msg-3218 fix — the fallback
+        was uninstrumented before, so a 401 on the fallback fell through to the raw
+        ``GitHubHTTPError`` path and quarantined).
         """
         try:
             await self._github.submit_review(pr, event=verdict, body=body)
         except GitHubHTTPError as exc:
             if exc.status_code == 422 and "own pull request" in str(exc).lower():
-                await self._github.submit_review(pr, event=ReviewEvent.COMMENT, body=body)
-            else:
-                raise
+                try:
+                    await self._github.submit_review(pr, event=ReviewEvent.COMMENT, body=body)
+                except GitHubHTTPError as fallback_exc:
+                    await self._classify_and_reraise(
+                        pr, fallback_exc, origin="submit-comment-fallback"
+                    )
+                return
+            await self._classify_and_reraise(pr, exc, origin="submit")
+
+    async def _classify_and_reraise(self, pr: PrRef, exc: GitHubHTTPError, *, origin: str) -> None:
+        """Classify a :class:`GitHubHTTPError`, probe if terminal, then raise the typed variant.
+
+        Central funnel used by both the primary submit and the same-identity 422 COMMENT
+        fallback (msg-3218 fix) so an environment-terminal outage during either leg raises
+        :class:`EnvironmentTerminalError` (daemon exits 2, alert-not-quarantine) rather
+        than bubbling out as a plain ``GitHubHTTPError`` and quarantining the thread.
+
+        Semantics:
+
+        * ``Retryability.RETRYABLE`` → re-raise the raw ``exc`` (a caller that wants
+          retries adds them behind an idempotency guard — retries + ``landed()``
+          ship together in PR-B, msg-3276).
+        * ``Retryability.TERMINAL`` + ``Scope.ENVIRONMENT_*`` → raise
+          :class:`EnvironmentTerminalError` (daemon exits 2, alert-not-quarantine).
+        * ``Retryability.TERMINAL`` + ``Scope.TARGET`` → raise
+          :class:`TargetTerminalError` (a proper subclass of ``GitHubHTTPError``
+          that carries positive-evidence "this is thread-scoped").
+        * ``Retryability.TERMINAL`` + ``Scope.UNKNOWN`` → re-raise the raw ``exc``
+          (fail-safe: DESIGN v3 §3 "未分類は必ず 1", and the ``Scope`` docstring's
+          "callers MUST NOT collapse UNKNOWN into either concrete value" —
+          keeping the raw type preserves the UNKNOWN-ness at the type level).
+
+        ``origin`` is a free-form tag included in the log record so the same
+        failure showing up on the primary vs the fallback leg is distinguishable
+        in operations, without inventing a second log format.
+        """
+        classification = classify_http_error(exc)
+        if classification is Retryability.TERMINAL:
+            probe_status = await self._github.probe_identity()
+            scope = scope_from_probe(exc.status_code, probe_status)
+            logger.warning(
+                "naysayer %s failure: pr=%s status_code=%s retryability=%s scope=%s decision=%s",
+                origin,
+                pr.slug,
+                exc.status_code,
+                classification.value,
+                scope.value,
+                _submit_decision(scope),
+            )
+            if scope in (Scope.ENVIRONMENT_CREDENTIAL, Scope.ENVIRONMENT_PERMISSION):
+                raise EnvironmentTerminalError(
+                    pr=pr,
+                    scope=scope,
+                    status_code=exc.status_code,
+                    message=f"environment-terminal on {pr.slug} ({origin}): {exc}",
+                ) from exc
+            if scope is Scope.TARGET:
+                raise TargetTerminalError(exc) from exc
+            # UNKNOWN falls through — do NOT collapse into TARGET.
+        else:
+            logger.warning(
+                "naysayer %s failure: pr=%s status_code=%s retryability=%s scope=%s decision=%s",
+                origin,
+                pr.slug,
+                exc.status_code,
+                classification.value,
+                Scope.UNKNOWN.value,
+                "raise",
+            )
+        raise exc
 
     async def aclose(self) -> None:
         """Close the shared Lexora + GitHub clients (driver teardown)."""
