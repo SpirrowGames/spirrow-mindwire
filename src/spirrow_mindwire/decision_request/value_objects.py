@@ -127,10 +127,13 @@ class DecisionOption:
     shape here means a broken composer cannot smuggle an option id that
     the UI would then reject.
 
-    ``label`` is a one-line label. ``gain`` / ``loss`` are single-line
-    trade-off descriptions — the msg-1370 §2 "得るもの / 失うもの"
-    fields. They are strings because the UI treats them as text, not
-    structured data; a composer that wants to leave one empty can (an
+    ``label`` names **a way to resolve the problem**, not an agent to
+    dispatch and not the reader's next action (D-55). "one-line" is not
+    enforced and has not been true since D-48 rev2 dropped the length
+    target; the prompt is the only place the shape is asked for.
+    ``gain`` / ``loss`` are the trade-off on that same axis — the
+    msg-1370 §2 "得るもの / 失うもの" fields. They are strings because the
+    UI treats them as text, not structured data; a composer that wants to leave one empty can (an
     empty ``loss`` means "no meaningful downside was identified", which
     is different from an unset field).
     """
@@ -153,7 +156,9 @@ class DecisionOption:
 class DecisionRequestOutput:
     """The composer's structured answer.
 
-    ``question`` is a one-line prompt. ``options`` may be empty (the
+    ``question`` states the problem and ends on the decision (D-48 rev2
+    put a 2-sentence floor under it, so "one-line" stopped being true;
+    nothing here enforces either way). ``options`` may be empty (the
     composer legitimately could not slice the decision; that state is
     recorded, not hidden). ``recommendation`` names an option id or is
     ``None``; a recommendation that names an id absent from ``options``

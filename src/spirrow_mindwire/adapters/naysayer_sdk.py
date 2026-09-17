@@ -78,6 +78,7 @@ from ._sdk_result import (
     capture_is_error_detail,
     emit_sdk_error_marker,
 )
+from ._session_isolation import session_isolation_kwargs
 
 _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
     {SessionState.HALTING, SessionState.HALTED, SessionState.FAILED}
@@ -363,6 +364,9 @@ class NaysayerSdkAdapter:
             "tools": [],
             "allowed_tools": self._allowed_tools,
             "mcp_servers": self._mcp_servers,
+            # ``tools: []`` disables the built-ins and says nothing about MCP; these
+            # keep host connectors out. See ``_session_isolation``.
+            **session_isolation_kwargs(),
             "env": env,
         }
         if self._model is not None:

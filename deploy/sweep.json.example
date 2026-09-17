@@ -8,10 +8,23 @@
     "project (not a linked worktree, and never the checkout the daemon itself is running from —",
     "the implementer would be editing its own running code).",
     "",
+    "owner_map is OPTIONAL. When present it turns on the resource-axis HOLD gate — a HOLD on the",
+    "listed 'owning project' also stops every candidate that writes to the matching repo, even",
+    "when those candidates belong to a different chatroom project. See the specifying thread",
+    "'T-loop-control-keyed-by-project-resource-is-the-repo' §5a v2 for the design. The KEY is a",
+    "predicted resource identity in the shape <host>/<org>/<repo>, lowercased; the sweep's tick",
+    "log prints the resource it observed for each repo_dir so you can copy the exact string in",
+    "without re-typing. Missing owner_map = gate OFF (fully backward compatible; behaviour is",
+    "then identical to before the resource axis existed).",
+    "",
     "Do NOT list T-pr-review-* threads: they resolve to `NEXT: pr-review <ref>`, which fires the",
     "Tier B PR-gate against the paid Lexora/Gemini backend. Driving those from an unattended sweep",
     "would spend money on a timer, so it stays an explicit human action."
   ],
+  "owner_map": {
+    "github.com/spirrowgames/spirrow-mindwire": "spirrow-mindwire",
+    "github.com/spirrowgames/spirrow-voxelworld": "spirrow-voxelworld"
+  },
   "candidates": [
     {
       "project": "spirrow-voxelworld",

@@ -152,6 +152,14 @@ class _FakeGitHub:
     async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
         return list(self._reviews)
 
+    async def find_cross_pr_head_bound_approves(
+        self, pr: PrRef, *, reviewer_login: str
+    ) -> list[Any]:
+        # ADR-pointer tests never exercise B-(a) coverage; return empty (the fail-open
+        # baseline). Kept structurally compatible with GitHubReviewClient so the driver
+        # still ticks its coverage lookup without side effects here.
+        return []
+
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         self.submitted.append((pr, event, body))
         return {"id": 1, "state": event.value}
@@ -358,9 +366,10 @@ async def test_t5_marker_present_on_round_cap_escalation_body() -> None:
 
 @pytest.mark.anyio
 async def test_t5_marker_present_on_pass1_timeout_degrade_body() -> None:
-    # Pass 1 timeout → degrade to fail-closed REQUEST_CHANGES. Pass 2 (also raising, since the
-    # fake shares state) is caught into unavailable(call-failed). The marker still appears
-    # on the degrade body — the marker invariant does not weaken on the safe-degrade path.
+    # Pass 1 timeout → degrade to a COMMENT-hold addressed to the human (T-infra-failure-posts-
+    # empty-rc; previously REQUEST_CHANGES). Pass 2 (also raising, since the fake shares state)
+    # is caught into unavailable(call-failed). The marker still appears on the degrade body —
+    # the marker invariant does not weaken on the safe-degrade path.
     lexora = _FakeLexora(
         pass1_exc=LexoraTimeoutError("POST /v1/chat/completions timed out"),
         pass2_exc=LexoraTimeoutError("POST /v1/chat/completions timed out"),
@@ -370,7 +379,7 @@ async def test_t5_marker_present_on_pass1_timeout_degrade_body() -> None:
     driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
     outcome = await driver.review(_pr(), post_critique=post)
     assert outcome.timed_out is True
-    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+    assert outcome.verdict is ReviewEvent.COMMENT
     assert posted[0].rstrip().endswith(MARKER_UNAVAILABLE)
 
 

@@ -52,13 +52,26 @@ trigger id (`#1`〜`#5`) は `./ledger.md` の `trigger` 列で inline label 付
 
 ## 派生アーティファクト再生成手順 — naysayer ADR index manifest (旧 §N.2、ADR-2026-06-04-19 N-2)
 
-`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title のみ、ADR 本体は Drive)。canonical な ADR 集合は分散 (`CLAUDE.md §M` 参照 ∪ spirrow-docs `_docmap`) しており、loop host / CI には `_docmap` が無いため runtime union も **full** drift-check も不可 → **in-repo の commit 済コピーは不可避** (host-reality finding, T-naysayer-unify-impl msg-438/443)。
+`spec/adr_index.yaml` は独立 naysayer の system prompt に毎 summon 注入される **全 ADR 索引の派生ビュー** (id + title + thread + body locator。ADR 本体は `docs/adr/`)。canonical な ADR 集合は `CLAUDE.md §M` 参照 ∪ `docs/adr/` の ADR 本体で、**どちらも本リポジトリに在る**。∴ runtime union も **full** drift-check も可能で、後者は suite で回っている。
 
-手書き二重管理を避けるため、本ファイルは **生成物**として扱う:
+> **2026-09-12 までは違った。** 2 つ目の出典が spirrow-docs の `_docmap.yaml` —— remote を持たない tree の中の、1 台のマシンにしか無いファイル —— だったため、loop host / CI では union も full drift-check も不可で、**commit 済コピーは不可避**と結論されていた (host-reality finding, T-naysayer-unify-impl msg-438/443 / `ADR-2026-06-04-19` N-2)。その前提は Drive→Git 移行と `ADR-2026-05-23-07` §6（正本を Git へ）で消えた。**commit 済コピーは今も置いてあるが、理由が変わった** —— 注入側が生成器を走らせずに読むためである。
 
-- **再生成手順 (proposer)**: ADR を追加/Accepted した時、`_docmap` がある docs host で `python scripts/gen_adr_index.py --docmap <spirrow-docs/_docmap.yaml>` を実行し `spec/adr_index.yaml` を再生成・commit する (手編集しない)。
-- **CI の役割**: `_docmap` が CI に無いので **full** drift-check (docs-only の architecture ADR まで照合) は不可。ただし CLAUDE.md は CI に在るので CI は (a) commit 済 manifest が **parse でき well-formed** (`test_real_in_repo_manifest_loads_and_is_well_formed`) と (b) **partial drift-check** = §M 参照 ADR が manifest の部分集合であること (`test_section_m_adrs_are_a_subset_of_the_manifest`、identity ADR を §M に足して再生成を忘れたケースを捕捉、Tier B msg-448) を検証する。
-- `_docmap` schema は spirrow-docs 側が SOT で本 host から不可視のため、gen-script の `_docmap` reader は schema-tolerant (初回実行時に実 `_docmap` と突き合わせ確認)。
+手書き二重管理を避けるため、**`id` / `title` / `thread` は生成物**として扱う。**`body:` locator だけは違う** —— 1 エントリずつ手で維持し、再生成が round-trip で保存する（`T-adr-index-omits-chatroom-body-locator` §4-1）。生成器が推論しないのは、`docs/adr/` を走査して`repo:` を当てると amendment memo を誤配するため（ADR-06 の罠、msg-2671 §4-5）:
+
+- **再生成手順**: ADR を追加/Accepted した時、リポジトリがある場所で `python scripts/gen_adr_index.py` を
+  走らせる。**`--docmap` は 2026-09-12 に削除した**（`spirrow-mindwire#264`）—— 出典が `docs/adr/` の
+  ADR 本体になったので、docs host である必要も外部ファイルも要らない。`body:` locator は手で維持し、
+  再生成で round-trip する。
+- **新しい ADR を足したら locator を書く。** 生成器は推論しないので、新規 entry の `body:` は
+  `unknown`（弱いが format-valid なプレースホルダ）で出る。**そのままにしない** ——
+  `docs/adr/` に本体を置いたなら `repo:docs/adr/<file>.md`、本体が chatroom の decide-close なら
+  `chatroom:<project>/<thread>#msg-<n>` を手で書く。**本体ファイルがあるのに別を指していると CI が落とす**
+  （`check_in_repo_bodies_are_registered`）が、本体ファイルが無い §M-only ADR は落ちないので
+  `unknown` のまま残りうる。
+- **CI の役割**: **full drift-check が回る**（`test_committed_manifest_matches_regeneration`）。既にあった部分照合（`test_section_m_adrs_are_a_subset_of_the_manifest` ほか）は**そのまま残っている** ——全体照合が通っても、§M 側の綴り間違いは別の形で落ちる方が診断しやすい。
+  `ADR-2026-06-04-19` N-2 はこれを「不可避に不可能」と記録していたが、その前提（出典が 1 台のマシンに
+  しか無い）は Drive→Git 移行と `ADR-2026-05-23-07` §6 で消えた。**ADR を足して再生成し忘れると
+  gate が赤くなる。**
 
 ---
 
@@ -72,9 +85,14 @@ fail-open を設計するとき、**「degradation を宣言する」ことで�
 
 適用: 「これを誰が、いつ読むか」を問う。真実を含むだけの artifact より、**読み手のいる経路** (通知 / CI failure / 人が開くファイル) を選ぶ。報告が文書なら限界は**冒頭**に置く (脚注ではなく) — `T-slope-extension-dead-mode` msg-2111 が監査報告の不完全性を冒頭要件にしたのはこの理由。
 
-**`spec/NAYSAYER_PRINCIPLES.md` には意図的に足していない**: あの SOT は全 naysayer 呼び出しに逐語注入され、短いことで機能する。既知 5 件は個別に機構で塞がれており、ループは隣接する推論に独立到達できることが実測されている ∴ 原則リストを薄めるコストに見合わない。
+**`spec/NAYSAYER_PRINCIPLES.md` に足すもの / 足さないもの** (2026-08-29 精緻化、`T-naysayer-blocking-bar-undefined` msg-2033 §0 V-3(b)): あの SOT は全 naysayer 呼び出しに逐語注入され、**短いことで機能する** ∴ 8000 bytes の上限を同ファイル自身に規律として置いてある。
 
-**併せて置き場所の注意**: `CLAUDE.md` に書いた規約が縛るのは **人間だけ**である。implementer は `setting_sources=[]` (SDK 隔離、credential 面の対策) で走り `CLAUDE.md` を読まない。naysayer の system prompt も preamble + role + ADR 索引 + handoff で本書を含まない。**ループに効かせたい規約は、ループが実際に読む場所 (`./obligations.yaml`) に置くこと** — 本規律を再形式化したのが `OBL-READBACK-*` であり、そのために本 README の pointer から `./obligations.yaml` が SOT である旨を明示している。
+- **一般的な工学教訓は足さない** (本節がそれ)。既知 5 件は個別に機構で塞がれており、ループは隣接する推論に独立到達できることが実測されている ∴ 原則リストを薄めるコストに見合わない。
+- **naysayer 自身の出力契約は足す**。objection の class 語彙 (`objection_classes`) と blocking の線引きがそれで、v2 で足した。根拠: 独立到達しないことが 2 リポジトリで実測されている (mindwire #186 R6/R7 = 同規模の指摘が隣接ラウンドで APPROVE / RC に割れた、spirrow-verimend#3 R3 = 実行時に誤らない指摘が RC になった)。**逐語注入先そのものが唯一の読み手である**種類の規約は、他のどこに置いても届かない。
+
+上限を超える改訂は、上限を上げるのではなく何かを削って収めること。
+
+**併せて置き場所の注意**: `CLAUDE.md` に書いた規約が縛るのは **人間だけ**である。implementer は `setting_sources=[]` (SDK 隔離、credential 面の対策) で走り `CLAUDE.md` を読まない。design-time naysayer の system prompt は preamble + role + **obligations** + ADR 索引 + handoff で構成される (現物は `src/spirrow_mindwire/adapters/naysayer_sdk.py::build_naysayer_system_prompt`) — `CLAUDE.md` は含まないが、`./obligations.yaml` は含まれる。**ループに効かせたい規約は、ループが実際に読む場所 (`./obligations.yaml`) に置くこと** — 本規律を再形式化したのが `OBL-READBACK-*` であり、そのために本 README の pointer から `./obligations.yaml` が SOT である旨を明示している。ただしその配送範囲は naysayer の一方の面 (design-time) だけである — 次節参照。
 
 ---
 
@@ -87,6 +105,36 @@ fail-open を設計するとき、**「degradation を宣言する」ことで�
 manifest の書式・読込 API・不変条件 (verbatim 長さ保持 = canary ②″) は `src/spirrow_mindwire/obligations.py` の docstring と `./obligations.yaml` の冒頭コメントに定義がある。composition root (`loop_runner._build_dispatcher`) が startup で 1 度だけ読み込み、失敗時は `SystemExit` で fail-closed。canary は `tests/test_obligations.py` に 3 本 (① id 網羅 / ②′ 描画注入 / ②″ 長さ保持) + 本 README への pointer 存在 grep — いずれも skip 条件なし。
 
 `moved_from` は Python literal (`path::LITERAL_NAME`) と doc section (`path::§HEADING`) の両方を受ける opaque string。**現時点で origin を持つのは Python literal 例の `OBL-VERDICT-CONSTRAINT` の 1 件のみ**。`OBL-READBACK-ENTRY` / `OBL-READBACK-EXIT` は旧 `CLAUDE.md §N.1.3 / §N.1.4` の spirit を英文で再定式化したもの (Japanese の numbered list 構造は verbatim には prompt body へ落ちない) で、**verbatim 移設ではなく net-new formulation** ゆえ `origin` を持たない — canary 二重プライムの length 不変式は verbatim 移設の text にのみ適用される (前身が Japanese の要件リストで、英文 body の length と一致させても不変式の意味を持たない)。PR #135 Tier-B naysayer Finding 1 が過去の origin 記載の誤りを指摘し、当該 PR で訂正した。`OBL-DECLARE-UNREADABLE` は当初 Python literal 例だったが、T-adr-index-dangling-references で body から bare な ADR-2026-05-29-13 anchor を除去する書き換えが入り、byte-for-byte 一致が保てなくなったため `origin` を落とし net-new formulation に再分類した (bump ではなく drop を選んだ理由は当該 obligation の隣接コメント参照 = `original_length` の bump は `moved_from` の主張を残したまま invariant の意味を silently 再定義してしまう、PR #135 Finding 1 と同型の構造欠陥)。歴史的な source length 795 は provenance 記録として同コメントに保存されている。
+
+---
+
+## `./obligations.yaml` の配送範囲は naysayer の片面 (design-time) だけである (2026-08-30、T-obligations-not-reaching-pr-gate)
+
+**前節の「ループが実際に読む場所」規律は、宛先を粗く見せる。実際の配送はもっと細かい。** naysayer は 2 面あり (実体・出力の性質ともに異なる)、`./obligations.yaml` の `role: naysayer` エントリが届くのはそのうちの **design-time 面 (`src/spirrow_mindwire/adapters/naysayer_sdk.py`) だけ**である。両面の記述は `docs/architecture.md` §8bis.4 (`### 8bis.4 naysayer は 2 面あり、 worldview が異なる`) が SOT。
+
+### 事実の宣言 (配送 topology)
+
+- **design-time 面**: `build_naysayer_system_prompt` が `render_role_obligations(Role.NAYSAYER)` を呼び、`role: naysayer` の各 obligation body を verbatim に prompt に描画する (前節の canary 二プライム `test_canary_2_prime_naysayer_prompt_carries_the_injected_obligations` が pin)。
+- **Tier B PR-gate 面**: `naysayer/pr_review.py::_build_messages` が構成する pass-1 system prompt は `build_preamble() + _PR_REVIEW_SYSTEM_PROMPT + PASS_1_ADR_INDEX_SELF_DECLARATION` の 3 連結のみで、**`render_role_obligations` の呼び出しを持たない** (repo 全体で本関数を呼ぶ唯一の site は上記 design-time adapter)。∴ `./obligations.yaml` の内容は PR-gate に一切届かない。
+- この配送範囲は `tests/test_obligations.py::test_pr_gate_pass1_prompt_carries_no_obligation_body` によって pin されている (負の tripwire)。**このテストが assert しているのは「配線が無い」ことであり、「obligation の意図がどちらの面向けか」ではない**。
+
+### `spec/NAYSAYER_PRINCIPLES.md` の位置づけ (事実の carve-out、配置指示ではない)
+
+`spec/NAYSAYER_PRINCIPLES.md` は adversarial review の**根本原則**を担う唯一の SOT であり、その目的のために design-time / PR-gate の**両面**に (`build_preamble()` 経由で) 逐語注入される。∴ 事実として同 doc の記述は両面に届く。**この事実は「PR-gate 向けのプロセス規約はここに置け」という配置指示ではない** — 同 doc は原則リストであってプロセス規約の SOT ではなく、また 8000 bytes 上限を自己規律として持つ (原則リストは短いことで機能する、前節参照)。プロセス規約の SOT は本 README の pointer が指すとおり `./obligations.yaml` のままである。
+
+### 将来 PR-gate 向け obligation を追加する場合の手順
+
+「PR-gate にも効かせるべき規約」が初めて実在の候補として現れたときは:
+
+1. その規約を `./obligations.yaml` に追加する (SOT は本ファイル)。
+2. **同時に、PR-gate への配送経路と surface 分離を実装する** — 現状 `role:` フィールドは `implementer` / `naysayer` の 2 値のみを受け、naysayer 面は暗黙に design-time だけを指す。**`./obligations.yaml` に書くだけでは PR-gate に届かない**。配送語彙 (面の識別) を schema に足すか、別経路を敷くかは、その時点で判断する (v1 で `surface:` / `applies_to:` 相当を先取りしないのは、値が 1 つしかない語彙を先取りすると粗いまま schema に固定する ∵ 現時点で PR-gate 向けの母集団は 0 件)。
+3. 同 commit で K-3 相当のテスト (負の tripwire) を編集し、新しい配線が実際に PR-gate prompt へ届くことを assert する (正の側) — 単に id を追加するだけでは配送されない。
+
+### 意図の申告を検出する機械は存在しない
+
+**「ある obligation が PR-gate 向けの意図で書かれたこと」を検出する機械は無い**。上記テストが pin しているのは **配線の有無**であって、「書き手がどちらの面向けと思っていたか」ではない。上記手順 (2) を怠って obligation を `./obligations.yaml` に追加した場合、prompt は変わらない ∴ 上記テストは緑のまま素通りする。この検出は人間 (PR-gate 自身のレビューを含む) に委ねられている。
+
+**由来**: 本節は `T-obligations-not-reaching-pr-gate` (2026-08-30) の帰結で、20 日間 `./obligations.yaml` の naysayer 2 件 (`OBL-VERDICT-CONSTRAINT` / `OBL-NO-MERGE-AUTHORITY`) が「両面に届いている」と信じられていたのを訂正するもの。実測では両者とも一度も PR-gate に届いておらず、そもそも届けるべきでもない (design-time thread 前提の文言 / PR-gate が blocking verdict を出す面での APPROVE 側脱較正 ∵ 各 obligation 隣接コメント参照)。
 
 ---
 

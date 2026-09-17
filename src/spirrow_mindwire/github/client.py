@@ -28,11 +28,15 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from types import TracebackType
 from typing import Any, Protocol
+from urllib.parse import quote
 
 import httpx
+
+from ..gate_admission import CheckRow
 
 _DEFAULT_API_BASE = "https://api.github.com"
 _DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -158,6 +162,47 @@ class CiStatus:
     failing: list[str]  # names of failing workflow runs (for the REQUEST_CHANGES body)
 
 
+class PrResolution(StrEnum):
+    """Whether — and how — a PR reference resolved (PR-review sweep S0, msg-2151 D-6).
+
+    The distinction that matters is between a **definite** answer and **no answer**.
+    ``NOT_FOUND`` is definite: GitHub says this PR does not exist, so the sweep's
+    thread→repo mapping is wrong or the PR is gone, and that is a fact to report.
+    ``UNRESOLVABLE`` is the absence of an answer — a 5xx, a rate limit, a dead socket,
+    or an auth failure — and the sweep must then neither close nor report, because
+    both would be a verdict pronounced on data it never read (D-7, fail-open).
+
+    Collapsing the two is the failure this enum exists to prevent: it would turn every
+    transient outage into a permanent-looking debt entry.
+    """
+
+    OPEN = "open"
+    CLOSED = "closed"
+    NOT_FOUND = "not_found"
+    UNRESOLVABLE = "unresolvable"
+
+
+@dataclass(frozen=True)
+class PrState:
+    """Terminality facts for one PR, as S0 needs them.
+
+    ``closed_at`` is the terminal time for BOTH merged and merely-closed PRs: GitHub
+    sets it whenever ``state == "closed"``, and a merged PR is a closed one with
+    ``merged == true``. Branching on ``merged_at`` vs ``closed_at`` was an earlier
+    draft's unnecessary complication (msg-2151).
+    """
+
+    ref: PrRef
+    resolution: PrResolution
+    closed_at: datetime | None = None
+    merged: bool = False
+    head_sha: str | None = None
+
+    @property
+    def slug(self) -> str:
+        return self.ref.slug
+
+
 @dataclass(frozen=True)
 class ReviewInfo:
     """A submitted PR review (the subset the naysayer debounce reads)."""
@@ -166,6 +211,84 @@ class ReviewInfo:
     state: str  # APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED / PENDING
     commit_id: str | None  # the head SHA the review was submitted against
     submitted_at: str | None
+
+
+@dataclass(frozen=True)
+class CrossPrApproveCoverage:
+    """A commit in this PR's diff already carries a head-bound APPROVE on another PR.
+
+    B-(a) accountability marker (msg-473 §5 / msg-475 §5 / msg-478 §0): the driver
+    stamps these onto the review-request body so the naysayer *sees* which commits
+    were already adjudicated. It is a marker for ARCHIVE-side accountability
+    (msg-473 §3 — "(a) は enforcement を買わない。accountability を買う"), NOT a
+    procedural constraint on the verdict.
+
+    ``sha`` is a commit sha that is BOTH (i) part of the reviewed PR's diff range
+    AND (ii) the exact head sha that another PR's APPROVE was submitted against.
+    ``other_pr`` is that other PR (never the reviewed PR itself). ``approved_at``
+    is the ``submitted_at`` of the APPROVE, retained so a reader can order events.
+    """
+
+    sha: str
+    other_pr: PrRef
+    approved_at: str | None
+
+
+@dataclass(frozen=True)
+class CheckRollup:
+    """The four facts :func:`~spirrow_mindwire.gate_admission.gate_admission` needs about a head.
+
+    Constructed **only when the read succeeded**, which is the whole point of the type.
+    :func:`gate_admission`'s ``rollup`` parameter documents that "the caller must not conflate
+    'empty' with 'not yet fetched' — a failed fetch should be raised at the caller, not passed in
+    as empty", because an unread rollup passed in as ``[]`` would be judged by R1a / R1b (a
+    CheckSuite-startup race, or "no CI configured") instead of by the caller's own error policy.
+    :meth:`GitHubClient.fetch_check_rollup` therefore returns ``None`` on every failure and a
+    ``CheckRollup`` only on success, so an empty ``rows`` is always a *measured* empty.
+
+    ``head_pushed_at`` is the best available proxy for "when this SHA first appeared at head",
+    per :func:`gate_admission`'s documented preference order. See
+    :meth:`GitHubClient.fetch_check_rollup` for which element of that order this build actually
+    gets, and the measurement behind it.
+    """
+
+    head_sha: str
+    head_committed_date: datetime
+    head_pushed_at: datetime
+    rows: tuple[CheckRow, ...]
+
+
+#: GraphQL ``CheckStatusState`` / ``StatusState`` are SCREAMING_CASE while
+#: :mod:`~spirrow_mindwire.gate_admission` compares against lowercase
+#: (:data:`~spirrow_mindwire.gate_admission.COMPLETED`,
+#: :data:`~spirrow_mindwire.gate_admission.RED_CONCLUSIONS`). Normalising by ``.lower()`` rather
+#: than by a lookup table is deliberate: every red conclusion GitHub can emit
+#: (``FAILURE`` / ``TIMED_OUT`` / ``CANCELLED`` / ``ACTION_REQUIRED`` / ``STARTUP_FAILURE``)
+#: lowercases exactly onto a member of ``RED_CONCLUSIONS``, and a conclusion GitHub adds later
+#: lowercases onto a string that is simply not in that frozenset — i.e. it reads as *not red*,
+#: which matches ``_red``'s own treatment of an unknown conclusion. A table would have to be
+#: edited to stay correct; this cannot drift.
+#:
+#: ``StatusContext`` (the legacy commit-status variant) has no status/conclusion pair at all,
+#: only a ``state``. These two maps project it onto the pair so one :class:`CheckRow` shape
+#: covers both variants, exactly as :class:`CheckRow`'s docstring says the caller must.
+_STATUS_CONTEXT_STATUS: dict[str, str] = {
+    "SUCCESS": "completed",
+    "FAILURE": "completed",
+    "ERROR": "completed",
+    "PENDING": "pending",
+    "EXPECTED": "pending",
+}
+_STATUS_CONTEXT_CONCLUSION: dict[str, str | None] = {
+    "SUCCESS": "success",
+    "FAILURE": "failure",
+    # GitHub's ``ERROR`` is a hard failure of the reporting integration, not a soft warning;
+    # ``_GRAPHQL_ROLLUP_STATES`` above already folds it into FAILURE for the aggregate read and
+    # this keeps the per-row view consistent with it.
+    "ERROR": "failure",
+    "PENDING": None,
+    "EXPECTED": None,
+}
 
 
 # Run conclusions that count as "not a failure" (ADR-16 §D-4 state mapping).
@@ -323,6 +446,10 @@ class GitHubReviewClient(Protocol):
 
     async def probe_identity(self) -> int: ...
 
+    async def find_cross_pr_head_bound_approves(
+        self, pr: PrRef, *, reviewer_login: str
+    ) -> list[CrossPrApproveCoverage]: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -370,20 +497,91 @@ class GitHubClient:
         await self._client.aclose()
 
     async def fetch_pr_diff(self, pr: PrRef) -> str:
-        """``GET /repos/{owner}/{repo}/pulls/{n}`` as a unified diff."""
-        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
+        """PR diff via a three-dot ``compare`` — the same view a human sees on GitHub.
+
+        Two reads (fail-loud on either):
+
+        1. ``GET /repos/{owner}/{repo}/pulls/{n}`` (JSON) — learn the PR's ``base.ref``
+           (branch name, resolved fresh each call) and ``head.sha`` (the specific
+           commit we then compare against).
+        2. ``GET /repos/{owner}/{repo}/compare/{base_ref}...{head_sha}`` with
+           ``Accept: application/vnd.github.v3.diff`` — the three-dot form asks
+           GitHub for the diff from the **merge base** of ``base_ref`` and
+           ``head_sha`` to ``head_sha``.
+
+        Why not ``GET /pulls/{n}`` in diff form (the endpoint this method used
+        to hit): that endpoint diffs against the ``base.sha`` snapshotted **at PR
+        creation time**, not the current base head. If the base moved forward
+        with commits that are also ancestors of ``head_sha`` (a stacked PR whose
+        parent has landed; a branch that pulled ``develop`` in; the empty-merge
+        workaround that this fix retires), the returned diff carries all the
+        already-merged code as if it belonged to this PR. A measured example
+        (``SpirrowGames/spirrow-lexora#10``, 2026-08-31): the pulls/{n} diff
+        was 183,288 chars; the true PR was 86,585 — the 53% excess was PR #9,
+        which the same gate had already APPROVED and merged. The gate would
+        then object to code that no longer belongs to the PR it is reviewing,
+        and any cap on the diff would fire on the union rather than the PR
+        itself. See ``spec/design/T-gate-reads-stale-base-diff.md`` for the
+        end-to-end reasoning; the short of it is that ``compare`` computes
+        against the current merge base, so already-landed ancestors drop out.
+
+        Both reads raise :class:`GitHubHTTPError` on failure (no fallback to the
+        old endpoint): the old failure mode was **silent** (a wrong-but-parseable
+        diff), which is exactly what fail-loud is meant to preclude. An
+        unreachable / non-2xx response is loud, and that is the trade.
+        """
+        # Step 1 — read metadata for base.ref and head.sha. Same JSON we already
+        # read on the CI path (see :meth:`_fetch_ci_status_rest`).
+        meta_path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
         try:
-            resp = await self._client.get(
-                path, headers={"Accept": "application/vnd.github.v3.diff"}
-            )
+            resp = await self._client.get(meta_path)
         except httpx.RequestError as exc:
-            raise GitHubHTTPError(f"GET {path} (diff): {exc}") from exc
+            raise GitHubHTTPError(f"GET {meta_path} (pr meta): {exc}") from exc
         if resp.status_code >= 400:
             raise GitHubHTTPError(
-                f"GET {path} (diff) returned {resp.status_code}: {_error_detail(resp)}",
+                f"GET {meta_path} (pr meta) returned {resp.status_code}: {_error_detail(resp)}",
                 status_code=resp.status_code,
             )
-        return resp.text
+        try:
+            payload = resp.json()
+            base_ref = str(payload["base"]["ref"])
+            head_sha = str(payload["head"]["sha"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise GitHubHTTPError(f"GET {meta_path} (pr meta): malformed response: {exc}") from exc
+        if not base_ref or not head_sha:
+            raise GitHubHTTPError(f"GET {meta_path} (pr meta): missing base.ref or head.sha")
+
+        # Step 2 — three-dot compare. `base_ref` is URL-encoded because a
+        # feature-branch name may contain `/` (e.g. `feature/stacked`); leaving
+        # a raw slash in the path segment routes to a different endpoint and
+        # returns 404. Head is a hex SHA and needs no encoding, but the same
+        # `quote` call is harmless on it.
+        base_seg = quote(base_ref, safe="")
+        head_seg = quote(head_sha, safe="")
+        compare_path = f"/repos/{pr.owner}/{pr.repo}/compare/{base_seg}...{head_seg}"
+        try:
+            resp = await self._client.get(
+                compare_path, headers={"Accept": "application/vnd.github.v3.diff"}
+            )
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {compare_path} (diff): {exc}") from exc
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {compare_path} (diff) returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        diff = resp.text
+        # D-8: log the compare parameters and resulting size so a reader can
+        # cross-check the input the gate is about to judge. Not a body field —
+        # the review body format is fixed by other tests and this log is
+        # deliberately out-of-band.
+        logger.info(
+            "fetch_pr_diff: compare %s...%s -> %d chars",
+            base_ref,
+            head_sha[:12],
+            len(diff),
+        )
+        return diff
 
     async def fetch_ci_status(self, pr: PrRef) -> CiStatus:
         """Aggregate CI state for the PR head SHA — REST first, GraphQL as fallback.
@@ -524,6 +722,209 @@ class GitHubClient:
             _required_workflows_from_env(),
         )
 
+    async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup | None:
+        """The head SHA + per-check rows + both clocks :func:`gate_admission` needs, or ``None``.
+
+        One GraphQL request, which is the budget design v0.3.1 §A-2 sized for this read ("the
+        trade -- one extra ``gh`` read per tick -- is deliberate"). The REST equivalent is three
+        (``/pulls/{n}`` for the head, ``/actions/runs`` for the rows, ``/commits/{sha}`` for the
+        commit clock), and REST has no field for the head's push time at all.
+
+        **``None`` means "not read", never "no checks".** Every failure path -- transport, non-2xx,
+        unparseable body, *a GraphQL ``errors`` array alongside partial data*, and *a ``contexts``
+        page that reports ``hasNextPage``* -- returns ``None`` so the caller can tell an unread
+        rollup from a measured-empty one (:class:`CheckRollup`). The last one is a partial read
+        wearing the shape of a complete one: past 100 contexts the window drops the rest, so a
+        build whose 101st check is pending or red would read as concluded-and-green. The page is
+        refused rather than paginated -- the whole sweep fleet measures 6 contexts at most -- and
+        refusing costs one deferral the caller would have taken anyway before this was wired.
+
+        The partial-data case is not hypothetical: the sibling
+        :meth:`_fetch_ci_status_graphql` omits ``contexts`` precisely because asking for them
+        "returns partial data plus a ``FORBIDDEN`` error entry on exactly the private repos this
+        fallback exists for". This method *must* ask for them, so instead of parsing a half-error
+        response it refuses it. The conductor's fail direction for ``None`` is its pre-wiring
+        behaviour (fire the gate), so a repo where this read is forbidden is exactly as it was.
+
+        **Which clocks this returns, and what was measured (2026-09-09,
+        ``SpirrowGames/spirrow-mindwire#236`` @ ``703b836``).**
+
+        * ``head_committed_date`` <- ``commit.committedDate``. Exact. (Cross-checked against REST
+          ``/commits/{sha}``: both ``2026-09-08T21:27:42Z``.)
+        * ``head_pushed_at`` <- ``commit.pushedDate`` if non-null, else the PR's ``updatedAt``.
+          :func:`gate_admission` documents the preference order as ``pushedDate`` -> REST
+          ``head.repo.pushed_at`` -> REST ``updated_at``. **``pushedDate`` measured null** (GitHub
+          stopped populating it), so the second element decides in practice -- and the middle one
+          is skipped on measurement, not on convenience: ``head.repo.pushed_at`` is a
+          *repository*-level field that moves when any branch is pushed. On the same PR it read
+          ``21:47:09Z`` against a true push at ``~21:28:16Z`` (the CI run's ``created_at``) and a
+          PR ``updatedAt`` of ``21:33:42Z`` -- i.e. the repo field was the *further* of the two
+          from the fact being estimated, so taking it in preference would be worse, not more
+          faithful.
+
+        The residual in that substitution is stated here rather than smoothed over, because it
+        biases one rule: ``updatedAt`` is an upper bound on the push time (pushing the head
+        updates the PR, but so does a comment or a label), so ``push_age`` is under-estimated and
+        R1a's grace window can be re-entered by any PR event. On a PR that genuinely has no CI
+        configured, an event inside the window re-opens the grace instead of letting R1b conclude
+        "no CI". The direction is the safe one -- DEFER (no model call, no thread record) rather
+        than a spurious INVOKE -- and it is bounded by the next tick after the window, but it is a
+        real difference from what the design assumed it would be reading, so the wiring PR
+        reports it rather than the register absorbing it silently.
+        """
+        query = (
+            "query($owner:String!,$name:String!,$number:Int!){"
+            "repository(owner:$owner,name:$name){"
+            "pullRequest(number:$number){headRefOid updatedAt "
+            "commits(last:1){nodes{commit{committedDate pushedDate "
+            "statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename "
+            "... on CheckRun{name status conclusion startedAt} "
+            "... on StatusContext{context state createdAt}}}}}}}}}}"
+        )
+        variables: dict[str, Any] = {"owner": pr.owner, "name": pr.repo, "number": pr.number}
+        try:
+            resp = await self._client.post(
+                "/graphql", json={"query": query, "variables": variables}
+            )
+        except httpx.RequestError as exc:
+            logger.warning(
+                "fetch_check_rollup: %s (unread; caller keeps its pre-gate default)", exc
+            )
+            return None
+        if resp.status_code >= 400:
+            logger.warning(
+                "fetch_check_rollup: -> %s (unread; caller keeps its pre-gate default)",
+                resp.status_code,
+            )
+            return None
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            logger.warning("fetch_check_rollup: malformed JSON: %s (unread)", exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("errors"):
+            # Partial data + an errors array. Refused rather than parsed -- see the docstring.
+            errors = payload.get("errors")
+            first = errors[0] if isinstance(errors, list) and errors else None
+            logger.warning(
+                "fetch_check_rollup: GraphQL returned errors (%s); treating the rollup as "
+                "unread rather than as a measured-empty one",
+                _error_element(first) or "unspecified",
+            )
+            return None
+        try:
+            pull = payload["data"]["repository"]["pullRequest"]
+            head_sha = str(pull["headRefOid"])
+            nodes = pull["commits"]["nodes"]
+            commit = nodes[0]["commit"] if nodes else None
+        except (KeyError, TypeError, IndexError) as exc:
+            logger.warning("fetch_check_rollup: cannot parse: %s (unread)", exc)
+            return None
+        if not head_sha or not isinstance(commit, dict):
+            return None
+        committed = _parse_github_timestamp(commit.get("committedDate"))
+        if committed is None:
+            # The commit clock is ci_clock_start's last resort and is guaranteed to exist on any
+            # commit; if it did not parse, the input to admission would be incomplete. Refuse.
+            logger.warning("fetch_check_rollup: no committedDate on %s (unread)", head_sha[:12])
+            return None
+        pushed = _parse_github_timestamp(commit.get("pushedDate")) or _parse_github_timestamp(
+            pull.get("updatedAt")
+        )
+        if pushed is None:
+            logger.warning("fetch_check_rollup: no push clock for %s (unread)", head_sha[:12])
+            return None
+        rollup = commit.get("statusCheckRollup")
+        contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+        page = contexts.get("pageInfo") if isinstance(contexts, dict) else None
+        if isinstance(page, dict) and page.get("hasNextPage") is True:
+            # Only an explicit hasNextPage=true refuses. A *null* statusCheckRollup leaves ``page``
+            # None and must still fall through to a measured-empty CheckRollup(rows=()) -- see
+            # test_fetch_check_rollup_distinguishes_measured_empty_from_unread. Absent contexts is
+            # not a truncated page, and conflating the two would take "no CI configured" away from
+            # R1a / R1b.
+            logger.warning(
+                "fetch_check_rollup: >100 check contexts on %s; rollup truncated "
+                "(unread; caller keeps its pre-gate default)",
+                head_sha[:12],
+            )
+            return None
+        raw_nodes = contexts.get("nodes") if isinstance(contexts, dict) else None
+        rows = tuple(
+            row
+            for row in (_check_row(node) for node in (raw_nodes or []) if isinstance(node, dict))
+            if row is not None
+        )
+        return CheckRollup(
+            head_sha=head_sha,
+            head_committed_date=committed,
+            head_pushed_at=pushed,
+            rows=rows,
+        )
+
+    async def fetch_pr_state(self, pr: PrRef) -> PrState:
+        """``GET /repos/{owner}/{repo}/pulls/{n}`` → terminality facts for the sweep's S0.
+
+        Fail direction is neither the fail-loud of :meth:`fetch_pr_diff` nor the
+        fail-soft ``[]`` of :meth:`fetch_pr_reviews`. It is a third thing, because the
+        caller must be able to tell "GitHub says no such PR" from "GitHub did not
+        answer" — the first is a finding, the second must produce no verdict at all.
+        So every failure is returned as a :class:`PrResolution`, not raised:
+
+        * ``404``                                        -> ``NOT_FOUND`` (definite)
+        * any other non-2xx, incl. 401 / 403 / 429 / 5xx -> ``UNRESOLVABLE``
+        * network error, malformed JSON                  -> ``UNRESOLVABLE``
+
+        403 is grouped with the indeterminates on purpose. GitHub serves both "rate
+        limited" and "you cannot see this repo" as 403, and neither is evidence that
+        the PR is absent; reading a permissions problem as ``NOT_FOUND`` would file
+        every unreadable-repo thread as a debt.
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
+        try:
+            resp = await self._client.get(path)
+        except httpx.RequestError as exc:
+            logger.warning("fetch_pr_state: GET %s failed: %s (unresolvable)", path, exc)
+            return PrState(ref=pr, resolution=PrResolution.UNRESOLVABLE)
+        if resp.status_code == 404:
+            return PrState(ref=pr, resolution=PrResolution.NOT_FOUND)
+        if resp.status_code >= 400:
+            logger.warning(
+                "fetch_pr_state: GET %s -> %s (unresolvable): %s",
+                path,
+                resp.status_code,
+                _error_detail(resp),
+            )
+            return PrState(ref=pr, resolution=PrResolution.UNRESOLVABLE)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            logger.warning("fetch_pr_state: malformed JSON: %s (unresolvable)", exc)
+            return PrState(ref=pr, resolution=PrResolution.UNRESOLVABLE)
+        if not isinstance(payload, dict):
+            return PrState(ref=pr, resolution=PrResolution.UNRESOLVABLE)
+
+        state = str(payload.get("state") or "").lower()
+        head = payload.get("head")
+        head_sha = str(head.get("sha")) if isinstance(head, dict) and head.get("sha") else None
+        if state == "open":
+            return PrState(ref=pr, resolution=PrResolution.OPEN, head_sha=head_sha)
+        if state != "closed":
+            # A third state would mean the API contract moved under us. Refusing to
+            # guess is the same rule as the 403 case above.
+            logger.warning("fetch_pr_state: %s has unknown state %r", pr.slug, state)
+            return PrState(ref=pr, resolution=PrResolution.UNRESOLVABLE)
+
+        return PrState(
+            ref=pr,
+            resolution=PrResolution.CLOSED,
+            closed_at=_parse_github_timestamp(payload.get("closed_at")),
+            merged=bool(payload.get("merged")),
+            head_sha=head_sha,
+        )
+
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
         """``GET /repos/{owner}/{repo}/pulls/{n}/reviews`` → submitted reviews (paginated).
 
@@ -641,6 +1042,296 @@ class GitHubClient:
             page += 1
         return out
 
+    async def find_cross_pr_head_bound_approves(
+        self, pr: PrRef, *, reviewer_login: str
+    ) -> list[CrossPrApproveCoverage]:
+        """Which commits in ``pr``'s diff are covered by another PR's head-bound APPROVE.
+
+        B-(a) marker resolution (msg-475 §2: "この計測は resolution ロジックの feasibility spike
+        そのもの" — the same read-only API path the pre-implementation measurement proved out).
+
+        For each commit sha in ``pr``'s commit list, ask GitHub which OTHER PRs the commit
+        appears in (``GET /repos/{owner}/{repo}/commits/{sha}/pulls``). For each candidate PR
+        that is NOT ``pr`` itself, fetch its reviews (:meth:`fetch_pr_reviews`) and keep only
+        the ones where ``login == reviewer_login``, ``state == "APPROVED"`` and
+        ``commit_id == sha`` — the head-bound rule (msg-456 §R-B: "``commit_id=17fbcd6`` = その
+        内容自身の head に紐づいている"). Anything else (an APPROVE against a DIFFERENT head,
+        or an APPROVE by a different reviewer) is not a head-bound APPROVE and does not count.
+
+        Fail-soft: any network / non-2xx / parse failure on any of the underlying reads is
+        logged and treated as "no coverage found". The whole method returns ``[]`` when the
+        driver should fire without the marker (msg-473 §5 fail-open: "解決に失敗したら marker
+        無しで撃つ (defer しない)"). It does NOT raise — that would let a transient GitHub
+        outage stop the gate from firing at all, which the fail-open rule forbids.
+
+        The no-raise guarantee is **structural**, not just a property inherited from the
+        callees. Every underlying read this method makes (``_list_pr_commits``,
+        ``_commit_pulls``, :meth:`fetch_pr_reviews`) is *documented* fail-soft today, and
+        an outer ``except Exception`` still wraps the loop so the promise the docstring
+        makes holds even if one of the dependencies later regresses to raising — a
+        regression this method's caller (:class:`~spirrow_mindwire.naysayer.pr_review
+        .NaysayerPrReviewDriver.review`) already backstops with its own ``except`` for
+        the same reason (msg-473 §5), but two independent guards on the fail-open
+        contract is what the naysayer PR-gate on PR #245 asked to see. Pinned by
+        ``test_find_cross_pr_head_bound_approves_never_raises_on_dependency_failure``.
+
+        Ordering: results are deduplicated on ``(sha, other_pr)`` — the FULL
+        :class:`PrRef` (owner + repo + number), not just the number — and returned in
+        the traversal order of ``pr``'s commit list. GitHub's ``commits/{sha}/pulls``
+        returns cross-fork associations, so PR #42 from the upstream repo and PR #42
+        from a fork are two different rows that can share the same commit sha; a
+        number-only key would collide those two into one. ``PrRef`` is a frozen
+        dataclass ∴ hashable, so the tuple is a valid ``set`` element without extra
+        canonicalisation. Duplicate suppression matters because the same sha can appear
+        in the PR's commit list twice under an unusual merge topology, and the same
+        OTHER PR can carry more than one APPROVE against the same head (e.g. a
+        re-review + a debounce reuse); we want the marker to point at the *fact* of
+        prior approval, not to list it four times. Pinned by
+        ``test_find_cross_pr_head_bound_approves_dedup_across_forks``.
+
+        ``reviewer_login`` is a parameter (not a module constant) because the caller — the
+        driver — already owns the naysayer login for the debounce reuse path
+        (``_review_login``). Passing it through here keeps that field the single source of
+        truth: the debounce, the round-cap, and the B-(a) marker all name the same identity,
+        or none does. Hard-coding it here would let the two fall out of sync.
+
+        The inner :meth:`fetch_pr_reviews` call is cached per invocation on ``other_pr``
+        alone. In a stacked-PR shape (this method's primary target, msg-456 §R-B) many
+        commits in the reviewed PR reference the same parent PR; without this cache each
+        one would re-fetch that parent's review list (the N+1 pattern the naysayer flagged
+        on PR #245: msg-680 advisory + msg-692 objection). The cache is orthogonal to the
+        ``(sha, other_pr)`` output dedup — that key cannot elide the fetch because it
+        varies with ``sha``.
+
+        Two failure surfaces bypass the cache to preserve the pre-cache implicit-retry
+        semantics on transient outages. (a) A raised exception is caught locally and
+        ``continue``d over — Bohr §5 T2 acceptance ③ / ④ mandate, kept as a future-
+        regression belt after :meth:`fetch_pr_reviews`'s fail-soft contract may be
+        weakened. (b) An empty return is not stored — :meth:`fetch_pr_reviews` fail-softs
+        an HTTP failure (502, 4xx, malformed JSON) to ``[]`` today, so caching ``[]``
+        would trap a transient outage on one commit into a silent-drop for every
+        remaining commit referencing the same parent (the pr-gate naysayer's blocking
+        objection on this PR's first VERDICT). A parent that legitimately has zero
+        reviews still pays the pre-cache N+1 for its own ``other_pr``, no worse than the
+        pre-cache behaviour. Cache lifetime is the single call (T2 §5 ⑤) — a longer-lived
+        cache would judge fresh heads against stale review data, undoing exactly the
+        head-tied APPROVE invariant this method exposes.
+        """
+        try:
+            commits = await self._list_pr_commits(pr)
+            if not commits:
+                return []
+            seen: set[tuple[str, PrRef]] = set()
+            # Per-invocation cache of the FETCHED review list, keyed on ``other_pr``
+            # alone. Different from ``seen`` above (which dedupes the OUTPUT rows on
+            # ``(sha, other_pr)`` to preserve cross-fork identity): this cache dedupes
+            # the INPUT — the ``fetch_pr_reviews(other_pr)`` HTTP call that ``seen``
+            # cannot elide because its key includes ``sha``. A stacked PR that pulls
+            # in N commits from the same parent would otherwise fetch that parent's
+            # review list N times (the N+1 pattern the naysayer flagged on PR #245:
+            # msg-680 advisory + msg-692 objection; T-gate-firing-... §5 T2).
+            #
+            # ⑤ Lifetime is bounded to this invocation. Not an instance attribute,
+            #    not a module-global, not a process-lifetime store — so a subsequent
+            #    fire on a different head cannot judge it against stale review data
+            #    (the head-tied APPROVE invariant this method exists to expose is the
+            #    same invariant a longer-lived cache would silently undermine: T2 §5 ⑤).
+            # ③ Only *non-empty* successful returns of ``fetch_pr_reviews`` land
+            #    here. Two failure surfaces both stay OUT of the cache:
+            #    (a) an EXCEPTION out of ``fetch_pr_reviews`` — caught by the inner
+            #        ``try`` below, ``continue``d over so the next commit for the
+            #        same ``other_pr`` retries (the future-regression belt: T2 §5
+            #        ③ / ④ mandate, Bohr msg-696 §1 "同じ病理を marker の取得側
+            #        に生えさせない");
+            #    (b) an EMPTY return ``[]`` — today's fail-soft manifestation.
+            #        ``fetch_pr_reviews`` is documented fail-soft and returns ``[]``
+            #        without raising on any HTTP error (502, 4xx, malformed JSON).
+            #        The pre-cache N+1 code retried implicitly by calling the fetch
+            #        afresh on every commit, so a first-commit 502 could recover on
+            #        the second commit. Caching ``[]`` would trap that failure
+            #        state and silently drop the marker for every remaining commit
+            #        referencing the same parent — the exact regression the pr-gate
+            #        naysayer objected to on this PR's first VERDICT. The
+            #        ``if reviews:`` guard below preserves the pre-cache retry
+            #        semantics: a truly empty parent (no reviews yet) pays the
+            #        pre-cache N+1 for that ``other_pr`` alone, same as before, not
+            #        worse. In the stacked-PR shape B-(a) targets, the parent
+            #        carries an APPROVE by construction, so this fallback almost
+            #        never triggers in the primary use case.
+            reviews_cache: dict[PrRef, list[ReviewInfo]] = {}
+            coverage: list[CrossPrApproveCoverage] = []
+            for sha in commits:
+                candidates = await self._commit_pulls(pr.owner, pr.repo, sha)
+                for other_pr in candidates:
+                    # Same-PR self-reference never counts as cross-PR coverage.
+                    # ``other_pr`` may still have a different (owner, repo) — GitHub
+                    # returns cross-fork associations — but we compare on
+                    # ``(owner, repo, number)`` via the frozen dataclass equality,
+                    # and the same-PR case is exactly what msg-478 §3's "自 PR は覆
+                    # いにしない" spelled out.
+                    if (
+                        other_pr.number == pr.number
+                        and other_pr.owner.lower() == pr.owner.lower()
+                        and other_pr.repo.lower() == pr.repo.lower()
+                    ):
+                        continue
+                    key = (sha, other_pr)
+                    if key in seen:
+                        continue
+                    if other_pr in reviews_cache:
+                        reviews = reviews_cache[other_pr]
+                    else:
+                        try:
+                            reviews = await self.fetch_pr_reviews(other_pr)
+                        except Exception as inner_exc:
+                            # Exception path — future-regression belt (T2 §5 ③).
+                            # ``fetch_pr_reviews`` is documented fail-soft today so
+                            # this arm is unreachable under the current dependency;
+                            # kept per Bohr §5 T2 mandate and Einstein msg-695
+                            # blocking objection so the correctness contract does
+                            # not depend on a callee's undocumented no-raise
+                            # promise. Do NOT cache: a later commit against the
+                            # same ``other_pr`` retries.
+                            logger.warning(
+                                "fetch_pr_reviews(%s) raised inside "
+                                "find_cross_pr_head_bound_approves(%s); not caching "
+                                "so a subsequent commit referencing the same PR can "
+                                "retry: %s",
+                                other_pr.slug,
+                                pr.slug,
+                                inner_exc,
+                            )
+                            continue
+                        # Empty-return path — TODAY's fail-soft manifestation.
+                        # A 502 / 4xx / malformed JSON at the HTTP layer surfaces
+                        # here as ``[]`` (see ``fetch_pr_reviews`` docstring). Not
+                        # caching ``[]`` preserves the implicit-retry semantics of
+                        # the pre-cache N+1 code (pr-gate naysayer's blocking
+                        # objection on this PR's first VERDICT).
+                        if reviews:
+                            reviews_cache[other_pr] = reviews
+                    for r in reviews:
+                        if (
+                            r.login == reviewer_login
+                            and r.state == "APPROVED"
+                            and r.commit_id == sha
+                        ):
+                            coverage.append(
+                                CrossPrApproveCoverage(
+                                    sha=sha, other_pr=other_pr, approved_at=r.submitted_at
+                                )
+                            )
+                            seen.add(key)
+                            break
+            return coverage
+        except Exception as exc:
+            # Structural fail-open belt: the callees are already fail-soft, but keeping
+            # this outer catch means the docstring's "does NOT raise" promise holds
+            # regardless of whether a future refactor changes a dependency's failure
+            # policy (naysayer PR-gate on PR #245 correctness objection). ``Exception``
+            # (not ``BaseException``) so ``KeyboardInterrupt`` / ``SystemExit`` /
+            # ``asyncio.CancelledError`` still propagate as expected.
+            logger.warning(
+                "find_cross_pr_head_bound_approves(%s) raised unexpectedly: %s (fail-open [])",
+                pr.slug,
+                exc,
+            )
+            return []
+
+    async def _list_pr_commits(self, pr: PrRef) -> list[str]:
+        """``GET /repos/{owner}/{repo}/pulls/{n}/commits`` → shas in PR order (paginated).
+
+        Fail-soft: any failure returns ``[]``. The caller (B-(a) marker resolution) treats an
+        empty list as "no coverage" and fires without the marker, which is the correct
+        fail-open behaviour — the marker is accountability, not a gate.
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/commits"
+        out: list[str] = []
+        page = 1
+        while True:
+            try:
+                resp = await self._client.get(path, params={"per_page": 100, "page": page})
+            except httpx.RequestError as exc:
+                logger.warning("_list_pr_commits: GET %s failed: %s (fail-soft [])", path, exc)
+                return []
+            if resp.status_code >= 400:
+                logger.warning(
+                    "_list_pr_commits: GET %s -> %s (fail-soft [])", path, resp.status_code
+                )
+                return []
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                logger.warning("_list_pr_commits: malformed JSON: %s (fail-soft [])", exc)
+                return []
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                sha = row.get("sha")
+                if isinstance(sha, str) and sha:
+                    out.append(sha)
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
+    async def _commit_pulls(self, owner: str, repo: str, sha: str) -> list[PrRef]:
+        """``GET /repos/{owner}/{repo}/commits/{sha}/pulls`` → PRs the commit appears in.
+
+        Requires ``Accept: application/vnd.github.groot-preview+json`` on older GitHub API
+        versions; the ``vnd.github+json`` we send by default already includes this data on
+        current versions, so no extra header is needed. Paginated (usually one page — a
+        commit rarely appears in many PRs).
+
+        Fail-soft: any failure returns ``[]`` (same reasoning as :meth:`_list_pr_commits`).
+        Cross-owner / cross-repo results (a fork's PR against this repo, seen for a shared
+        commit) are preserved verbatim as :class:`PrRef` values — the caller compares on
+        ``(owner, repo, number)`` so a foreign PR APPROVE remains identifiable.
+        """
+        path = f"/repos/{owner}/{repo}/commits/{sha}/pulls"
+        out: list[PrRef] = []
+        page = 1
+        while True:
+            try:
+                resp = await self._client.get(path, params={"per_page": 100, "page": page})
+            except httpx.RequestError as exc:
+                logger.warning("_commit_pulls: GET %s failed: %s (fail-soft [])", path, exc)
+                return []
+            if resp.status_code >= 400:
+                logger.warning("_commit_pulls: GET %s -> %s (fail-soft [])", path, resp.status_code)
+                return []
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                logger.warning("_commit_pulls: malformed JSON: %s (fail-soft [])", exc)
+                return []
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                number = row.get("number")
+                base = row.get("base") or {}
+                base_repo = base.get("repo") if isinstance(base, dict) else None
+                if not isinstance(base_repo, dict):
+                    continue
+                repo_name = base_repo.get("name")
+                owner_data = base_repo.get("owner") or {}
+                owner_login = owner_data.get("login") if isinstance(owner_data, dict) else None
+                if not isinstance(number, int) or number <= 0:
+                    continue
+                if not isinstance(repo_name, str) or not repo_name:
+                    continue
+                if not isinstance(owner_login, str) or not owner_login:
+                    continue
+                out.append(PrRef(owner=owner_login, repo=repo_name, number=number))
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event.
 
@@ -690,15 +1381,105 @@ class GitHubClient:
         return int(resp.status_code)
 
 
+def _check_row(node: dict[str, Any]) -> CheckRow | None:
+    """One ``statusCheckRollup.contexts`` node -> a :class:`CheckRow`, or ``None`` if unusable.
+
+    Handles both union members. ``CheckRun`` maps field-for-field (lowercased -- see the comment
+    on :data:`_STATUS_CONTEXT_STATUS` for why lowercasing beats a lookup table);
+    ``StatusContext`` carries only a ``state``, which the two projection maps turn into the
+    status/conclusion pair :class:`CheckRow` is defined in terms of.
+
+    An unknown ``__typename`` returns ``None`` -- dropped rather than guessed. Dropping is the
+    conservative direction for both rules a row can influence: a dropped row cannot hold
+    ``_concluded`` false (it could only ever have *delayed* the gate) and cannot make ``_red``
+    true (it could only ever have *withheld* an INVOKE). A row shaped unexpectedly must not be
+    able to invent a red CI and route an implementer at it.
+    """
+    typename = node.get("__typename")
+    if typename == "CheckRun":
+        conclusion_raw = node.get("conclusion")
+        return CheckRow(
+            name=str(node.get("name") or "<unnamed check>"),
+            status=str(node.get("status") or "").lower(),
+            conclusion=str(conclusion_raw).lower() if conclusion_raw else None,
+            started_at=_parse_github_timestamp(node.get("startedAt")),
+            # CheckRun has no ``createdAt`` in the GraphQL schema; CheckRow's contract already
+            # says a row may contribute nothing to the clock, and a queued run is exactly that.
+            created_at=None,
+        )
+    if typename == "StatusContext":
+        state = str(node.get("state") or "").upper()
+        if state not in _STATUS_CONTEXT_STATUS:
+            return None
+        return CheckRow(
+            name=str(node.get("context") or "<unnamed status>"),
+            status=_STATUS_CONTEXT_STATUS[state],
+            conclusion=_STATUS_CONTEXT_CONCLUSION[state],
+            started_at=None,
+            created_at=_parse_github_timestamp(node.get("createdAt")),
+        )
+    return None
+
+
+def _parse_github_timestamp(raw: object) -> datetime | None:
+    """GitHub's ``2026-08-30T01:02:03Z`` → an aware :class:`datetime`, or ``None``.
+
+    Returns ``None`` rather than raising on anything unparseable: the sweep's caller
+    already treats a missing terminal time as "cannot classify", which is the same
+    safe outcome, and a malformed timestamp on one PR must not abort the whole run.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("unparseable GitHub timestamp %r", raw)
+        return None
+
+
+def _error_element(element: object) -> str:
+    """One entry of GitHub's ``errors`` array as text — entries are strings OR objects."""
+    if isinstance(element, str):
+        return element.strip()
+    if isinstance(element, dict):
+        for key in ("message", "code"):
+            value = element.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
 def _error_detail(resp: httpx.Response) -> str:
-    """Best-effort extraction of a GitHub ``{"message": ...}`` error string."""
+    """Best-effort extraction of a GitHub error string — ``message`` AND ``errors``.
+
+    GitHub puts the GENERIC reason in ``message`` and the DISCRIMINATING one in ``errors``.
+    The same-identity review refusal is the case that matters here::
+
+        {"message": "Unprocessable Entity",
+         "errors": ["Review Can not request changes on your own pull request"],
+         "status": "422"}
+
+    Returning ``message`` alone therefore threw away the only text a caller can branch on,
+    which made :meth:`NaysayerPrReviewDriver._submit_review`'s COMMENT backstop **dead code**:
+    it matches on ``"own pull request"``, a string that could never reach the exception. The
+    unit test for that backstop stayed green only because it fabricated the message itself.
+    Measured on PR #194 head 054eeaf, 2026-08-29 (thread ``T-pr-review-spirrow-mindwire-194``
+    msg-2037): the verdict leg raised, the fallback did not fire, and the driver exited 1.
+
+    So ``errors`` is appended whenever present. Deliberately NOT truncated on this branch —
+    the discriminating entry can be last, and cutting it would restore the original bug.
+    """
     try:
         body = resp.json()
     except ValueError:
         return resp.text[:500]
-    if isinstance(body, dict) and "message" in body:
-        return str(body["message"])
-    return str(body)[:500]
+    if not (isinstance(body, dict) and "message" in body):
+        return str(body)[:500]
+    detail = str(body["message"])
+    raw_errors = body.get("errors")
+    entries = raw_errors if isinstance(raw_errors, list) else []
+    extras = [text for text in (_error_element(e) for e in entries) if text]
+    return f"{detail}: {'; '.join(extras)}" if extras else detail
 
 
 def _retry_after_seconds(resp: httpx.Response) -> float | None:
@@ -877,12 +1658,15 @@ class EnvironmentTerminalError(GitHubError):
 __all__ = [
     "CiState",
     "CiStatus",
+    "CrossPrApproveCoverage",
     "EnvironmentTerminalError",
     "GitHubClient",
     "GitHubError",
     "GitHubHTTPError",
     "GitHubReviewClient",
     "PrRef",
+    "PrResolution",
+    "PrState",
     "Retryability",
     "ReviewEvent",
     "ReviewInfo",

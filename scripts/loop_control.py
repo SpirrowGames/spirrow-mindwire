@@ -32,6 +32,23 @@ from typing import Any
 
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
 
+# Windows stdout defaults to a legacy codepage (e.g. cp932). The machine-read
+# JSON on stdout uses ``ensure_ascii=True`` below, so stdout is guaranteed
+# ASCII-only — no reconfiguration needed, and any reconfiguration to UTF-8
+# would in fact corrupt the operator's console by writing raw UTF-8 bytes
+# into a cp932 read path (PR #210 gate round-2).
+#
+# stderr is a separate concern: the fail-open ``print`` at line 75 may carry
+# an exception message with native text (a wrapped MCP payload, a localized
+# error string). Setting ``errors="backslashreplace"`` — WITHOUT overriding
+# the encoding — makes stderr incapable of raising while preserving native
+# console readability. The ``getattr`` guard exists because ``reconfigure``
+# is a ``TextIOWrapper`` method; see ``scripts/dogfood_smoke.py`` for the
+# same probe convention.
+_reconfigure_err = getattr(sys.stderr, "reconfigure", None)
+if _reconfigure_err is not None:
+    _reconfigure_err(errors="backslashreplace")
+
 
 async def fetch_control(project: str, url: str | None) -> dict[str, Any]:
     mcp = StreamableHttpChatroomMcp(url)
@@ -61,7 +78,10 @@ def main() -> int:
         print(f"loop_control: probe failed: {exc}", file=sys.stderr)
         return 1
 
-    print(json.dumps(state, ensure_ascii=False))
+    # Machine-read JSON: emit ASCII-only so the sweep wrapper's
+    # ``ConvertFrom-Json`` can decode it under any stdout encoding
+    # (msg-2292 D-3).
+    print(json.dumps(state, ensure_ascii=True))
     return 0
 
 

@@ -1,7 +1,7 @@
 """Canaries and pointer-existence guard for the loop-readable obligations manifest.
 
-Two canaries + one grep, no skip conditions. Together they enforce the invariants
-the Tier-C GO msg-737 nailed down:
+Two canaries + one INV-C guard + one grep, no skip conditions. Together they
+enforce the invariants the Tier-C GO msg-737 nailed down:
 
 - **two-prime** wiring: the *rendered* system prompt each adapter assembles from a manifest
   contains that manifest's body verbatim. This is the "prompt builder receives the
@@ -13,6 +13,14 @@ the Tier-C GO msg-737 nailed down:
   well-meaning "cleanup" that shortens or reflows the moved body reds this canary
   rather than silently drifting the loop's actual instruction away from what was
   reviewed.
+- **INV-C** (consumer-visible placement, msg-2387 §3): a conditional obligation's
+  antecedent and the landing site of the change it prescribes both reach the
+  *rendered* implementer prompt, and the meta-commentary round 1 stripped stays
+  out of it. All three parts in one test because the findings on that entry
+  pulled in opposite directions and a guard on any part alone lets the others
+  regress. Each asserts against that entry's own injected block, not against the
+  whole prompt — msg-2392 §2 measured a whole-prompt ``in`` going green for a
+  reason unrelated to the entry.
 
 Canary ① (a hardcoded ``_EXPECTED_IDS_BY_ROLE`` shadow list of manifest ids in
 this module) was **removed** on the naysayer round-3 finding: production code
@@ -46,6 +54,7 @@ from spirrow_mindwire.adapters.naysayer_sdk import (
     NaysayerSdkAdapter,
     build_naysayer_system_prompt,
 )
+from spirrow_mindwire.naysayer.pr_review import _build_messages, _build_pass2_messages
 from spirrow_mindwire.obligations import (
     ObligationsManifest,
     default_manifest_path,
@@ -146,6 +155,154 @@ def test_canary_2_double_prime_moved_bodies_preserve_original_length() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# INV-C (consumer-visible placement) — a conditional obligation's antecedent must
+# survive into the string production actually injects.
+#
+# msg-2207 (PR-gate on #199) found the antecedent of
+# OBL-GATE-BOOTSTRAP-CLOSE-CARVEOUT living only in a YAML `#` comment. YAML
+# loaders discard comments, so the injected `body` began "その場合、" — an anaphor
+# whose referent had been dropped on the way to the reader. Bohr msg-2387 §1(3)
+# traced the miss to having *recorded* self-containment as a property that
+# already held rather than *requiring* it: "a property written as a description
+# is checked by nobody". §6(1) therefore makes it a check, and specifies that
+# the check read the production injection path rather than re-parsing the YAML
+# in the test — re-implementing the loader would measure a string no consumer
+# ever sees, which is the same class of fault as the one being fixed.
+#
+# Round 3 (msg-2391) then found the *landing site* of the prescribed change —
+# that it is a magickit change, not a mindwire one — living only in a comment
+# too, and msg-2392 §2 showed by measurement why the obvious guard against that
+# is not a guard at all: the rendered implementer prompt already contains the
+# string "magickit", in the ADR index line for ADR-2026-06-04-18, so
+# ``"magickit" in rendered`` was true at head b40d024 *before* any fix. Hence
+# the rule this block now follows:
+#
+#   measuring the consumer-visible representation is not enough; the assertion
+#   has to be scoped to the part of it that corresponds to the declaration under
+#   test. An ``in`` against a large enough whole is true for reasons that have
+#   nothing to do with the declaration.
+#
+# So all three parts below assert against ``_injected_block``, this entry's own
+# slice of the rendered prompt (~270 chars), not against the ~17.7k-char prompt.
+# The two pre-existing parts were moved onto the slice for the same reason and
+# not merely for tidiness: on the whole prompt the positive part could go green
+# because some *other* entry happened to carry the same sentence, and the
+# negative part could go red because some other entry happened to use the phrase
+# 「義務付けられなければならない」. Neither is happening today (measured: 0
+# occurrences elsewhere), which is exactly the condition under which a broken
+# check looks healthy.
+# --------------------------------------------------------------------------- #
+
+_CARVEOUT_ID = "OBL-GATE-BOOTSTRAP-CLOSE-CARVEOUT"
+
+
+def _injected_block(manifest: ObligationsManifest, rendered: str, role: Role, entry_id: str) -> str:
+    """Return the slice of ``rendered`` that is ``entry_id``'s own injected block.
+
+    Nothing here re-implements the loader or the renderer. The obligations region
+    is obtained by calling the production renderer
+    (:meth:`ObligationsManifest.render_role_obligations`) and asserting that its
+    output is a literal substring of the adapter's assembled prompt — which is
+    itself the claim that the adapter ships what the renderer produced, so the
+    architectural boundary the round-3 gate endorsed is kept and made explicit.
+    The block then runs from this entry's ``[<id>]`` header to the next entry's
+    header, using the id order the manifest itself reports. Splitting on ``\\n\\n``
+    would be wrong: block-scalar bodies (e.g. OBL-SPEC-SCOPE-CLOSURE) contain
+    blank lines of their own.
+    """
+    region = manifest.render_role_obligations(role)
+    assert region, f"the manifest renders no obligations at all for role {role!r}"
+    assert region in rendered, (
+        "the adapter's system prompt does not contain the renderer's output verbatim — "
+        "the injection path has changed shape, and every assertion below would be "
+        "measuring a string production no longer ships"
+    )
+    ids = [o.id for o in manifest.for_role(role)]
+    assert entry_id in ids, (
+        f"{entry_id} is not among role {role!r}'s obligations — the entry was removed "
+        "or its role changed"
+    )
+    index = ids.index(entry_id)
+    start = region.index(f"[{entry_id}]\n")
+    # Ends at the next entry's header, or at the end of the region for the last entry.
+    next_header = f"\n\n[{ids[index + 1]}]\n" if index + 1 < len(ids) else None
+    end = region.index(next_header, start) if next_header is not None else len(region)
+    return region[start:end]
+
+
+def test_obl_gate_bootstrap_close_carveout_body_carries_its_antecedent(
+    tmp_path: Path,
+) -> None:
+    """This entry's *own injected block* carries its antecedent and its landing
+    site, and does not carry the meta-commentary round 1 removed.
+
+    All three parts are asserted together on purpose. The findings on this entry
+    pulled in opposite directions — round 1 (msg-2111 §2) said the span was too
+    wide and carried Einstein's meta-commentary, round 2 (msg-2207) said it was
+    too narrow and had lost the antecedent, round 3 (msg-2391) said it never named
+    the repository the prescribed change lands in — so a guard on any part alone
+    leaves the others free to regress on the next edit. msg-2387 §5: the span is
+    decided by role, not by length.
+
+    The subject is ``adapter._system_prompt`` built from ``load_manifest()`` with
+    no path argument, i.e. the in-repo manifest production loads, put through the
+    renderer production uses — narrowed to this entry's block. Nothing here
+    re-implements ``yaml.safe_load``.
+    """
+    manifest = load_manifest()
+    adapter = ImplementerSdkAdapter(
+        cwd=tmp_path, obligations=manifest, inference_base_url="http://lx"
+    )
+    rendered = adapter._system_prompt
+    block = _injected_block(manifest, rendered, Role.IMPLEMENTER, _CARVEOUT_ID)
+
+    # Positive part (msg-2387 §6(1)): the antecedent, verbatim from Einstein
+    # msg-1968, where Einstein delimited it with 「」 inside his 処方 sentence.
+    antecedent = "もし事前ロールチェックが存在して sweeper が弾かれる事実が確認された場合"
+    assert antecedent in block, (
+        f"the antecedent of {_CARVEOUT_ID} is not in the block this entry injects "
+        "into the implementer's system prompt. A YAML `#` comment is not a place an "
+        "obligation's antecedent can live: the loader discards comments, so the "
+        "implementer is handed a bare 「その場合、」 with no referent (msg-2207). Put "
+        f"the antecedent back in `body`.\nBlock as injected:\n{block}"
+    )
+
+    # Landing-site part (msg-2391 / msg-2392 §4): the body commands the reader to
+    # 「コードとして追加実装すること」 against `chatroom_close_thread`, and
+    # `chatroom_close_thread` has in-repo call sites here (src/spirrow_mindwire/
+    # gate_bootstrap.py), so a reader holding only a mindwire checkout lands on the
+    # wrong repository unless the body says which one. Asserted on the block, never
+    # on the whole prompt: the prompt carries "magickit" in its ADR index line for
+    # ADR-2026-06-04-18, so the whole-prompt form of this check passes at head
+    # b40d024, before the fix (msg-2392 §2 — reproduced independently before
+    # writing this).
+    assert "magickit" in block, (
+        f"{_CARVEOUT_ID} does not name the repository its prescribed change lands in. "
+        "The carve-out is a change to magickit's server-side chatroom_close_thread; "
+        "mindwire only calls that tool. Stated only in a YAML comment, the fact is "
+        "discarded by the loader and the implementer searches this repository — where "
+        "chatroom_close_thread really does appear — and fails to execute a cross-repo "
+        f"requirement (msg-2391).\nBlock as injected:\n{block}"
+    )
+
+    # Negative part (msg-2387 §5): the framing clause of Einstein's 処方 sentence is
+    # commentary *about* the obligation, not part of it, and round 1 was right to
+    # strip it. Anchored on that specific clause rather than on a general
+    # "no meta-commentary" heuristic, which would be unfalsifiable here.
+    for meta_fragment in (
+        "実装者は「コードを確認する」だけでなく",
+        "義務付けられなければならない",
+    ):
+        assert meta_fragment not in block, (
+            f"Einstein's meta-commentary {meta_fragment!r} is back in the block "
+            f"{_CARVEOUT_ID} injects — round 1 (msg-2111 §2) removed it. Widening the "
+            "span to restore the antecedent, or annotating it with the landing site, "
+            "must not drag the framing clause back in; the antecedent is separately "
+            f"quotable because msg-1968 delimits it with 「」.\nBlock as injected:\n{block}"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # pointer chain: CLAUDE.md §N (pointer only) → spec/process/README.md (imperative).
 # msg-733 §11.2 deliberately splits the human-facing regulation out of CLAUDE.md,
 # so the imperative verb no longer lives in §N — it lives at the destination.
@@ -208,3 +365,86 @@ def test_loader_produces_an_immutable_manifest() -> None:
 
         with __import__("pytest").raises(dataclasses.FrozenInstanceError):
             o.body = "tampered"  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# negative tripwire — the PR-gate messages carry NO obligation body/id.
+#
+# This is the executable declaration that the Tier B PR-gate face is NOT a
+# delivery destination for `spec/process/obligations.yaml`. Only the
+# design-time naysayer face (`build_naysayer_system_prompt`) renders the
+# manifest into a prompt — the PR-gate's pass-1 messages come out of
+# `naysayer/pr_review.py::_build_messages` (the SINGLE production entry
+# point that constructs the ChatMessages actually sent to Lexora on the
+# verdict pass), and `_build_pass2_messages` for the pointer pass; neither
+# calls `render_role_obligations` anywhere on that path (verified 2026-08-30
+# in T-obligations-not-reaching-pr-gate — a full-history pickaxe on the two
+# PR-gate prompt modules for "OBL-" and for verbatim obligation body fragments
+# returned zero commits: this face has never carried any obligation body).
+#
+# CHOICE OF UNIT-UNDER-TEST — assert on `_build_messages` (and its pass-2
+# sibling), NOT on the helper `build_pr_review_pass1_system_prompt` from
+# `pr_review_adr_pointers.py`. That helper is one of the parts the driver
+# uses today; a future edit could bypass the helper and wire
+# `render_role_obligations` directly into `_build_messages`, and testing
+# only the helper would leave that leak invisible. `_build_messages` /
+# `_build_pass2_messages` are the actual production entry points — testing
+# THEIR output is what pins "no manifest body reaches the PR-gate", however
+# the internal construction changes.
+#
+# SCOPE — this test is a WIRING tripwire, not an INTENT detector.
+# It fails only when a body/id from the manifest actually appears in the
+# rendered PR-gate messages. It does NOT detect that a newly added
+# `role: naysayer` obligation was meant to reach the PR-gate: adding an entry
+# to `spec/process/obligations.yaml` without also wiring the PR-gate builder
+# to `render_role_obligations` leaves this test green. There is no machine
+# detector for intent-side face-mismatch — see
+# `spec/process/README.md` §「`./obligations.yaml` の配送範囲は naysayer
+# の片面 (design-time) だけである」and specifically its §「意図の申告を
+# 検出する機械は存在しない」. If you are adding a route for a PR-gate
+# obligation, you must edit BOTH this test (positive assertion of the new
+# body appearing in the PR-gate messages) AND the PR-gate builder — a green
+# CI on an obligations-only change is not proof of delivery.
+# --------------------------------------------------------------------------- #
+
+
+def test_pr_gate_pass1_prompt_carries_no_obligation_body() -> None:
+    """The PR-gate pass-1 messages (as produced by
+    `naysayer.pr_review._build_messages` — the SINGLE production entry point
+    for the verdict pass) contain no obligation body or id from the
+    loop-readable manifest — for any role.
+
+    Asserts on ALL entries in the manifest (not just `role: naysayer`) so that
+    if `_MANIFEST_ROLES` is ever extended (e.g. a `proposer` face) this test
+    will still hold the PR-gate face empty until the wiring is explicitly
+    added. The wiring change is what should red this test, at which point the
+    author must edit here to declare which entries the PR-gate is now
+    delivering (positive assertion), together with the builder change.
+
+    Also asserts on `_build_pass2_messages` output — the pointer pass is
+    structurally quarantined from the verdict (see
+    `pr_review_adr_pointers.py`), but leakage of an obligation body into
+    its system prompt would still constitute delivery to the PR-gate face
+    and must red this test.
+    """
+    manifest = load_manifest()
+    # Concatenate the system + user text from BOTH production entry points.
+    # A dummy diff / slug is enough — the manifest bodies must not appear
+    # anywhere in what the driver actually hands to Lexora, regardless of
+    # which ChatMessage carries them.
+    pass1 = _build_messages("dummy-diff", "owner/repo#0")
+    pass2 = _build_pass2_messages("dummy-diff", "owner/repo#0")
+    rendered = "\n".join(msg.content for msg in (*pass1, *pass2))
+    for obligation in manifest.obligations:
+        assert obligation.body not in rendered, (
+            f"obligation {obligation.id!r} body appears in the PR-gate messages "
+            "(pass-1 `_build_messages` or pass-2 `_build_pass2_messages`) — this "
+            "face has never been a manifest delivery destination; if you are "
+            "adding routing on purpose, edit this test to a positive assertion in the "
+            "same commit and see spec/process/README.md §「`./obligations.yaml` の"
+            "配送範囲は naysayer の片面 (design-time) だけである」"
+        )
+        assert f"[{obligation.id}]" not in rendered, (
+            f"obligation id label [{obligation.id}] appears in the PR-gate messages "
+            "— same rule as the body assertion above"
+        )

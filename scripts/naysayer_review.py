@@ -28,7 +28,20 @@ Preconditions (env — resolved at construction; fail-loud if missing):
 
 Run::
 
-    uv run python scripts/naysayer_review.py --pr SpirrowGames/spirrow-mindwire#82
+    uv run python scripts/naysayer_review.py --pr SpirrowGames/spirrow-mindwire#82 \
+        --design-thread T-the-thread-this-gate-was-fired-from
+
+``--design-thread`` is required and is NOT the ``T-pr-review-<repo>-<n>`` ledger id this script
+prints — the ledger holds the critique, the design thread is where the verdict must arrive for
+the loop to move. Exit code 2 = the review ran but the relay did not land.
+
+Preflight (T-gate-firing-ignores-loop-state-and-prior-verdicts §A-1, policy tier —
+this script does not enforce it; the operator does):
+
+    手発火の前に、``--design-thread`` に指定するスレッドの最新 ``NEXT:`` を目視で確認せよ。
+    role persona (Heisenberg / Bohr / Einstein 等) を指している場合、その head は fix loop
+    の中 = 未確定であり、gate に読ませても空撃ちになる (R-A-1, msg-456)。``NEXT: pr-review`` /
+    ``NEXT: human`` / ``NEXT: none`` のいずれかに揃ってから撃つ。
 
 ⚠️ COST / SIDE EFFECTS: one real Gemini call (billed) + a real GitHub PR review submission + a
 chatroom post. Fire deliberately, once per PR.
@@ -55,6 +68,11 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="Fire an independent naysayer PR review.")
     parser.add_argument("--pr", required=True, help="PR ref: 'owner/repo#n' or a GitHub PR URL")
     parser.add_argument("--project", default="spirrow-mindwire", help="chatroom project id")
+    parser.add_argument(
+        "--design-thread",
+        required=True,
+        help="design thread the verdict is relayed into (NOT the T-pr-review-<repo>-<n> ledger)",
+    )
     args = parser.parse_args()
 
     mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or package default
@@ -64,14 +82,27 @@ async def main() -> None:
 
     print(f"[naysayer-review] opening review thread for {args.pr} (Gemini review, billed) ...")
     try:
-        thread_ref, outcome = await orchestrator.fire_pr_review(
-            project=args.project, pr_ref=args.pr
+        thread_ref, outcome, relay = await orchestrator.fire_pr_review(
+            project=args.project, pr_ref=args.pr, design_thread=args.design_thread
         )
+        # Both destinations are named: printing only the ledger id is what supplied the one
+        # wrong answer an operator could reach for when asked for a design thread (msg-2765 §2).
         print(
-            f"[naysayer-review] thread={thread_ref.thread_id}  verdict={outcome.verdict.value}  "
+            f"[naysayer-review] thread={thread_ref.thread_id}  "
+            f"design_thread={args.design_thread}  relay={relay['msg_id'] or 'DROPPED'}  "
+            f"verdict={outcome.verdict.value}  "
             f"ci={outcome.ci_state.value}  head={outcome.head_sha}"
         )
         print(f"\n[naysayer-review] critique:\n{outcome.body}")
+        if not relay["msg_id"]:
+            # D-5: the conductor already fails safe to the human on an empty relay id; this
+            # path had none, so a dropped relay ended in a green shell.
+            print(
+                f"[naysayer-review] relay DROPPED — the verdict is in {thread_ref.thread_id} "
+                f"but never reached {args.design_thread}; record it there by hand",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
     finally:
         await driver.aclose()
 

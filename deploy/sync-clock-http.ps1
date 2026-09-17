@@ -1,10 +1,10 @@
 #!/usr/bin/env pwsh
 # deploy/sync-clock-http.ps1 — keep this host's clock correct without NTP (I-4).
 #
-# Why this exists instead of w32time: every firewall profile on sg-tomtebo-01 is
-# DefaultOutboundAction=Block and nothing grants UDP/123, so w32time cannot reach ANY time source —
-# external or on the tailnet (measured 2026-08-02: `w32tm /stripchart` returns 0x800705B4 against
-# time.windows.com, ntp.nict.jp, time.google.com and 100.79.84.62 alike). w32time therefore reports
+# Why this exists instead of w32time: every firewall profile on the loop host of that deploy was
+# DefaultOutboundAction=Block and nothing granted UDP/123, so w32time could not reach ANY time source —
+# external or on the tailnet (measured 2026-08-02: `w32tm /stripchart` returned 0x800705B4 against
+# time.windows.com, ntp.nict.jp, time.google.com and the tailnet services host alike). w32time therefore reported
 # "Source: Free-running System Clock" and had never synchronised; the clock had drifted 173 s.
 #
 # The egress that DOES work is HTTPS through the local squid proxy, so this takes the time from an

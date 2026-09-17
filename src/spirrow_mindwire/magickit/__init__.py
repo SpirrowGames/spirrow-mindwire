@@ -11,6 +11,7 @@ from .client import (
     MagickitMcpError,
     McpToolCaller,
     StreamableHttpChatroomMcp,
+    ThreadResolvedError,
     magickit_mcp_url,
     parse_tool_result,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "MagickitMcpError",
     "McpToolCaller",
     "StreamableHttpChatroomMcp",
+    "ThreadResolvedError",
     "WatchSpec",
     "magickit_mcp_url",
     "parse_tool_result",

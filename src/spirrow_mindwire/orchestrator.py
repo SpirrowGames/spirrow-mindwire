@@ -18,12 +18,19 @@ chain / a ``scripts/naysayer_review.py`` run / a future PR-event hook).
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
+from typing import Any
 
-from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef, parse_pr_ref
-from .magickit.client import MagickitMcpError, McpToolCaller
+from .conductor.gate_records import RELAY_AUTHOR, render_relay_heading
+from .conductor.handoff import HUMAN_TOKEN
+from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef, ReviewEvent, parse_pr_ref
+from .magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
 from .naysayer.pr_review import NaysayerPrReviewDriver, PrReviewOutcome
 from .value_objects import Role, ThreadRef
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_THREAD_PREFIX = "T-pr-review-"
 _DEFAULT_OWNER = "orchestrator"
@@ -52,7 +59,11 @@ def _qualified_thread_id(prefix: str, pr: PrRef) -> str:
 
     The repo is lower-cased so that the same repo written two ways
     (``Spirrow-VoxelWorld`` / ``spirrow-voxelworld``) cannot open two ledgers for
-    one PR; GitHub repo names are case-insensitive for identity.
+    one PR; GitHub repo names are case-insensitive for identity. That repo was
+    renamed to the lower-cased spelling on 2026-09-11, which does not retire the
+    folding: the ids built here were always lower-cased, but the *inputs* still
+    arrive both ways — chatroom titles and PR refs written before the rename, and
+    anything a caller types today.
 
     The owner is deliberately *not* in the id: it would make every id half again as
     long for a distinction that only bites across organisations. That is a premise
@@ -98,7 +109,9 @@ def _same_pr(found: PrRef | None, pr: PrRef) -> bool:
     repo: ``Spirrow-VoxelWorld#12`` and ``spirrow-voxelworld#12`` land on one
     thread id by construction. Comparing case-sensitively there would report a
     thread as colliding with itself and turn an idempotent re-fire into a hard
-    failure — and both spellings are in live use in the chatroom's titles.
+    failure — and both spellings are in live use in the chatroom's titles. The
+    repo's own name is the lower-cased one since 2026-09-11; the titles written
+    before that rename are what keep the other spelling live.
     """
     if found is None:
         return False
@@ -168,8 +181,10 @@ class PrReviewOrchestrator:
         *,
         project: str,
         pr_ref: str,
+        design_thread: str,
         title: str | None = None,
-    ) -> tuple[ThreadRef, PrReviewOutcome]:
+        implementer: str | None = None,
+    ) -> tuple[ThreadRef, PrReviewOutcome, dict[str, Any]]:
         """Open the review thread for a develop→main PR and drive the naysayer review.
 
         The thread id is **PR-derived and deterministic** — ``T-pr-review-<repo>-<n>`` — so there
@@ -178,6 +193,14 @@ class PrReviewOrchestrator:
         :class:`~spirrow_mindwire.naysayer.pr_review.PrReviewOutcome`. Raises ``ValueError`` if
         ``pr_ref`` is unparseable; the driver fail-closes (raises) on an unreachable Lexora/GitHub
         or an empty review, so a failed review is never silently treated as a pass.
+
+        ``design_thread`` — the thread this gate was fired *from* — is required: ledger post and
+        design-thread relay happen in this one call, so a caller cannot fire without saying where
+        the verdict lands. The relay used to belong to the conductor, so every caller that was not
+        one (a hand-run ``scripts/naysayer_review.py``) silently relayed nothing. Validated before
+        the review is paid for (:meth:`_validate_design_thread`). The relay message is the third
+        return value so the conductor dispatches the implementer on the critique, not on its own
+        pr-review trigger (Tier B msg-567 #1).
         """
         pr = parse_pr_ref(pr_ref)
         if pr is None:
@@ -193,6 +216,7 @@ class PrReviewOrchestrator:
         # still opened lazily (msg-453: no abandoned empty thread on a transient remote error).
         resolved = await self._resolve_thread_id(project=project, pr=pr)
         thread_id = resolved.thread_id
+        await self._validate_design_thread(project=project, design_thread=design_thread)
         title = title or f"PR review (develop→main) — {pr_ref}"
         propose = (
             f"naysayer review request — develop→main PR {pr_ref}\n\n"
@@ -225,46 +249,82 @@ class PrReviewOrchestrator:
                     project=project, thread_id=thread_id, title=title, propose=propose, pr=pr
                 )
                 opened = True
-            result = await self._mcp.call_tool(
-                "chatroom_post_message",
-                {
-                    "project": project,
-                    "thread_id": thread_id,
-                    "msg_type": "report",
-                    "author": self._naysayer_author,
-                    "content": body,
-                    # D-1 (T-dispatched-turn-gets-one-message). This is the Tier B
-                    # verdict — the single most gate-relevant message the harness
-                    # writes — and it recorded ``role: null`` 346 times out of 346
-                    # (live corpus, 2026-08-16). The claim is honest: this body IS
-                    # the independent naysayer's critique, relayed verbatim.
-                    #
-                    # Whether it RECORDS depends on ``self._naysayer_author`` being
-                    # a registered magickit identity with ``naysayer`` in its
-                    # allowed_roles; an unregistered author has its role dropped and
-                    # still posts. So this supplies the value and the registration is
-                    # a magickit-side fact to confirm, not something this repo can
-                    # assert. Read the posted message back to know which happened.
-                    "role": Role.NAYSAYER.value,
-                },
-            )
+            try:
+                result = await self._mcp.call_tool(
+                    "chatroom_post_message",
+                    {
+                        "project": project,
+                        "thread_id": thread_id,
+                        "msg_type": "report",
+                        "author": self._naysayer_author,
+                        "content": body,
+                        # D-1 (T-dispatched-turn-gets-one-message). This is the Tier B
+                        # verdict — the single most gate-relevant message the harness
+                        # writes — and it recorded ``role: null`` 346 times out of 346
+                        # (live corpus, 2026-08-16). The claim is honest: this body IS
+                        # the independent naysayer's critique, relayed verbatim.
+                        #
+                        # Whether it RECORDS depends on ``self._naysayer_author`` being
+                        # a registered magickit identity with ``naysayer`` in its
+                        # allowed_roles; an unregistered author has its role dropped and
+                        # still posts. So this supplies the value and the registration is
+                        # a magickit-side fact to confirm, not something this repo can
+                        # assert. Read the posted message back to know which happened.
+                        "role": Role.NAYSAYER.value,
+                    },
+                )
+            except ThreadResolvedError as exc:
+                # W3 (T-sweeper-posts-into-resolved-thread-blocks-r2-deploy Bohr
+                # msg-536): the review thread got resolved between our review
+                # start and now — the async-verdict race Einstein msg-531
+                # Objection 2 named. The critique cannot land here as a
+                # chatroom record, but the PRIMARY artifact of this gate is
+                # the GitHub PR review submitted by :meth:`_submit_review`,
+                # which the driver runs AFTER ``post_critique`` returns. So
+                # the correct disposition is (from W4b's three options):
+                # (1) an alternative durable surface that reaches the
+                # intended reader — the GitHub PR review, which is the
+                # reader's primary surface anyway. Swallow here so the
+                # driver continues to :meth:`_submit_review`; log at WARNING
+                # so the operator sees why the chatroom record is missing.
+                # Non-retryable (msg-536 W5) so no retry loop; terminal for
+                # this thread. Never itself posted into a chatroom thread
+                # (msg-534 W4a — posted into the same thread it would 409
+                # again; posted into a different thread it is out-of-context).
+                logger.warning(
+                    "pr-review chatroom record dropped (thread %r resolved): %s. "
+                    "Primary artifact (GitHub PR review) will still be submitted; "
+                    "no retry — refusal is terminal for this thread.",
+                    thread_id,
+                    exc,
+                )
+                # T-gate-review-submit-failure-handling Q4-A: post_critique returns the
+                # chatroom msg_id so the driver's :class:`ReviewReceipt` can carry it.
+                # A dropped chatroom record has no id — return "" so the receipt is still
+                # well-formed; the order invariant is enforced by the receipt's presence,
+                # not the id value (a receipt with an empty id still proves post_critique
+                # ran before _submit_review).
+                return ""
             # Return the chatroom msg_id so the driver's ``ReviewReceipt`` can carry it
             # (T-gate-review-submit-failure-handling DESIGN v3 Q4-A: the (post → submit)
             # order is proven by the receipt, which requires the id of the message we
             # relayed). An unparseable / missing id becomes "", which is still a valid
             # receipt — it just weakens the audit trail for that one post; the order
             # invariant is enforced by the receipt's presence, not its id value.
+            msg = result.get("msg") if isinstance(result, dict) else None
+            if isinstance(msg, dict):
+                return str(msg.get("msg_id") or "")
             if isinstance(result, dict):
-                msg_id = result.get("msg_id") or ""
-                return str(msg_id)
+                return str(result.get("msg_id") or "")
             return ""
 
         async def read_review_thread() -> list[tuple[str, str]]:
             """Return (author, body) for each message in the review thread (chatroom-replay).
 
-            Used by the driver's replay pass (DESIGN v3 §3-3) to look for a previously-
-            posted-but-never-submitted verdict. Returns ``[]`` when the thread does not
-            yet exist (a first-review case has nothing to replay).
+            Used by the driver's replay pass (T-gate-review-submit-failure-handling
+            DESIGN v3 §3-3) to look for a previously-posted-but-never-submitted verdict.
+            Returns ``[]`` when the thread does not yet exist (a first-review case has
+            nothing to replay), or when the read itself fails.
             """
             if not opened:
                 # First review — nothing to replay against. Do NOT open the thread just to
@@ -300,7 +360,124 @@ class PrReviewOrchestrator:
         outcome = await self._driver.review(
             pr, post_critique=post_critique, read_review_thread=read_review_thread
         )
-        return thread_ref, outcome
+        relay = await self._post_design_relay(
+            project=project,
+            design_thread=design_thread,
+            pr_ref=pr_ref,
+            outcome=outcome,
+            implementer=implementer,
+        )
+        return thread_ref, outcome, relay
+
+    async def _validate_design_thread(self, *, project: str, design_thread: str) -> None:
+        """Reject an unusable relay destination BEFORE the review is paid for (D-2).
+
+        Same phase as :meth:`_resolve_thread_id`, for the reason written four lines above its
+        call site: an unusable id must cost nothing, whereas failing after ``driver.review``
+        throws away a paid-for Gemini judgement and an irreversible GitHub review.
+
+        The ledger check is a **grammar**, not ``startswith(self._thread_prefix)``. Measured over
+        every chatroom thread (msg-2772: 667 threads, 17 projects, all statuses), 354 ids match
+        the grammar and **all 354 are ledgers**; legitimate design threads matching it: **0**.
+        ``startswith`` instead refuses two live design threads --
+        ``T-pr-review-threads-outlive-their-prs`` and ``T-pr-review-thread-id-not-repo-qualified``.
+        Judging by whether the opener names a PR ref refuses *this* thread, whose opener msg-2748
+        cites ``SpirrowGames/spirrow-mindwire#235``. Every ledger id this class mints ends in
+        the PR number (:func:`_qualified_thread_id` / :func:`_legacy_thread_id`), hence digits.
+        """
+        if not design_thread.strip():
+            raise ValueError("design_thread is required: the PR-gate relay has no destination")
+        if re.fullmatch(rf"{re.escape(self._thread_prefix)}(?:.*-)?\d+", design_thread):
+            raise ValueError(
+                f"design_thread {design_thread!r} matches the PR-review LEDGER id grammar "
+                f"({self._thread_prefix}... ending in digits), so it is read as one. The critique "
+                "already goes to the ledger; the design thread is the one this gate was fired "
+                "from, and scripts/naysayer_review.py prints the ledger id, so it is the easiest "
+                "wrong value to reach for. If this really is a design thread, give it an id that "
+                "does not end in digits."
+            )
+        if not (await self._thread_subject(project=project, thread_id=design_thread)).exists:
+            raise ValueError(
+                f"design_thread {design_thread!r} does not exist in project {project!r}"
+            )
+
+    async def _post_design_relay(
+        self,
+        *,
+        project: str,
+        design_thread: str,
+        pr_ref: str,
+        outcome: PrReviewOutcome,
+        implementer: str | None,
+    ) -> dict[str, Any]:
+        """Post the verdict (+ critique body) into the design thread as the relay author.
+
+        Informational only — the conductor routes from ``outcome.verdict``; this post is the
+        human-readable record and the implementer's fix context on a RC. Its ``NEXT:`` line
+        mirrors that route for readability and is never re-parsed (no author is trusted; msg-557).
+
+        The heading names the head SHA the gate reviewed
+        (:func:`~spirrow_mindwire.conductor.gate_records.render_relay_heading`). That is not
+        decoration: it is the whole of ``gate_admission``'s ``verdict_heads`` input, and without
+        it R6 (ALREADY_REVIEWED) cannot tell "a verdict exists on THIS head" from "a verdict
+        exists on this PR" — different facts the moment the implementer pushes a fix. So the
+        heading MUST use the renderer rather than a local literal: a local literal was what let
+        #244 (T-pr-gate-relay-belongs-to-the-conductor msg-2835 §3) drop the ``@ sha`` on merge
+        and starve R6 silently — the failure was byte-indistinguishable from the ``head=None``
+        case the renderer already handles. ``outcome.head_sha`` (the head the gate actually
+        read) is used, not what admission observed a moment earlier, so a push that lands
+        between the two is recorded against the diff that was really reviewed.
+        """
+        nxt = (
+            implementer
+            if outcome.verdict is ReviewEvent.REQUEST_CHANGES and implementer
+            else HUMAN_TOKEN
+        )
+        body = (
+            f"{render_relay_heading(pr_ref, outcome.head_sha)}\n\n"
+            f"VERDICT: {outcome.verdict.value} (ci={outcome.ci_state.value})\n\n"
+            f"{outcome.body}\n\n"
+            f"NEXT: {nxt}"
+        )
+        try:
+            result = await self._mcp.call_tool(
+                "chatroom_post_message",
+                {
+                    "project": project,
+                    "thread_id": design_thread,
+                    "msg_type": "report",
+                    "author": RELAY_AUTHOR,
+                    "content": body,
+                    # No ``role`` here, deliberately (D-1 sweep, T-dispatched-turn).
+                    # The other two harness write paths now supply one; this relay does
+                    # not, because it holds no role. It is the conductor restating a
+                    # verdict the Tier B driver produced elsewhere, and the honest value
+                    # for "which role authored this" is none. Claiming ``naysayer``
+                    # because the content came from one would put a role stamp on a post
+                    # no reviewer wrote — manufacturing exactly the evidence the I-6
+                    # invariant exists to make meaningful.
+                },
+            )
+        except ThreadResolvedError as exc:
+            # W3 (msg-536): the design thread was resolved while the gate ran. Same
+            # **disposition (1)** as ``post_critique`` above, for the reason set out there
+            # in full — the GitHub PR review is the primary artifact and reaches the reader
+            # regardless (named by number: OBL-CHATROOM-PRODUCER-READER-SURFACE requires
+            # each producer to say WHICH of the three it took, Bohr msg-559 MUST-A). The
+            # stub keeps the conductor's dispatch path from crashing, and its empty
+            # ``msg_id`` is what keeps the drop visible: the conductor fails safe to the
+            # human and the driver script exits non-zero (D-5). Non-retryable (msg-536 W5).
+            logger.warning(
+                "pr-gate design-thread relay dropped (thread %r resolved): %s. "
+                "GitHub PR review is the primary artifact and still stands; "
+                "no retry — refusal is terminal for this thread.",
+                design_thread,
+                exc,
+            )
+            return {"msg_id": "", "author": RELAY_AUTHOR, "content": body}
+        msg = result.get("msg") if isinstance(result, dict) else None
+        msg_id = str(msg.get("msg_id") or "") if isinstance(msg, dict) else ""
+        return {"msg_id": msg_id, "author": RELAY_AUTHOR, "content": body}
 
     async def _resolve_thread_id(self, *, project: str, pr: PrRef) -> _ResolvedThread:
         """Pick the thread id this PR's gate writes to, and prove it is free or ours.

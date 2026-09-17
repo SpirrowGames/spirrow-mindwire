@@ -8,6 +8,7 @@ exception mapping without spinning up the real CLI.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -488,6 +489,46 @@ async def test_own_role_self_filter_skips(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_self_filter_drop_is_logged_not_silent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Design §6.1: the filter stays, the silence does not.
+
+    This return is where the self-handoff stall hid — the session was spawned, the delivery was
+    dropped here without a word, and the round ended on NO_PROGRESS with nothing anywhere saying
+    why. The conductor now refuses to route a self-handoff at all, so reaching here means
+    something routed one anyway, which is exactly when a human has to be able to find out.
+    """
+    client = _FakeClient([_assistant("x"), _result()])
+    captured: list[ReplyDraft] = []
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx(captured))
+
+    with caplog.at_level(logging.WARNING, logger="spirrow_mindwire.adapters.claude_code_sdk"):
+        await adapter.deliver_event(handle, _event(author="proposer-1"))
+
+    assert client.queries == [], "still dropped — this is not a behaviour change"
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+    assert "proposer-1" in caplog.records[0].getMessage()
+
+
+@pytest.mark.anyio
+async def test_non_new_message_drop_is_logged_not_silent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = _FakeClient([_assistant("x"), _result()])
+    captured: list[ReplyDraft] = []
+    adapter = ClaudeCodeSdkAdapter(cwd=tmp_path, client_factory=_factory(client))
+    handle = await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx(captured))
+
+    with caplog.at_level(logging.WARNING, logger="spirrow_mindwire.adapters.claude_code_sdk"):
+        await adapter.deliver_event(handle, _event(event_type=EventType.THREAD_CLOSED))
+
+    assert client.queries == []
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+
+
+@pytest.mark.anyio
 async def test_non_new_message_event_is_noop(tmp_path: Path) -> None:
     client = _FakeClient([_assistant("x"), _result()])
     captured: list[ReplyDraft] = []
@@ -760,3 +801,37 @@ async def test_sdk_is_error_absent_reason_is_captured_as_absent_not_defaulted(
     # of the two had happened, and this asserts we no longer reach for it.
     assert "SDK session reported is_error" not in hs.error.message
     assert "none carried a reason" in hs.error.message
+
+
+@pytest.mark.anyio
+async def test_spawn_isolates_host_settings_and_mcp_config(tmp_path: Path) -> None:
+    """The session does not inherit this host's settings or MCP servers.
+
+    The regression this pins is not a style preference. On 2026-09-15 the
+    proposer inherited the host account's claude.ai connector, called one of its
+    ``mcp__*`` tools, and the CLI died with ``AxiosError: Request failed with
+    status code 403`` as soon as ``_PathScopeGuard`` refused the call — the
+    guard bounds Read/Glob/Grep and nothing else, so refusing was the only
+    answer it could give. The conductor recorded
+    ``sdk-error-during-execution`` and quarantined the thread; quarantine has no
+    automatic clear path, so the thread stayed parked until a human cleared it.
+
+    ``mcp_servers={}`` alone never prevented this: an inherited connector is not
+    passed through that argument, which is exactly why the provenance marker
+    could read ``mcp=0`` while the session held connector tools.
+    """
+    captured: list[Any] = []
+
+    def factory(options: Any) -> Any:
+        captured.append(options)
+        return _FakeClient([])
+
+    adapter = ClaudeCodeSdkAdapter(
+        cwd=tmp_path,
+        builtin_tools=("Read",),
+        allowed_tools=["Read"],
+        client_factory=factory,
+    )
+    await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
+    assert captured[0].setting_sources == []
+    assert captured[0].strict_mcp_config is True

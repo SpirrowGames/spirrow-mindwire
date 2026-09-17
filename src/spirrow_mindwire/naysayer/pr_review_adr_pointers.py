@@ -295,10 +295,26 @@ def build_pr_review_pass2_messages(
 # violation shape, cheap to normalise before the parse-fail bounce). We do NOT
 # treat this normalisation as a filter step counted toward ``dropped``: it only
 # rescues a syntactically-valid array that was wrapped, and never invents pointers.
+#
+# Public (was ``_strip_wrapping``) because pass 1's objection-block parser hits the exact
+# same model behaviour — a JSON payload the prompt asked for unfenced, returned fenced.
+# One normalisation, two readers: writing a second one is how the two would drift.
+#
+# The two branches are anchored (``^`` … ``$``, no ``re.MULTILINE``), so the alternation can
+# match at most once each and ``sub`` removes exactly a WRAPPING pair. Deliberate: a closing
+# fence that is not the last thing in the payload is left in place. The two consumers then
+# diverge, and the difference is the reason this is anchored rather than greedy:
+#   * ``parse_objections`` reads with ``raw_decode``, which stops at the end of the array —
+#     an unstripped closing fence, the VERDICT line and any trailing prose are never consumed.
+#   * ``select_adr_pointers`` reads with ``json.loads`` over the whole payload, so the same
+#     input fails and degrades to ``unavailable(parse-fail)`` — fail-closed, as designed.
+# Neither consumer wants a greedy strip: removing a ``\`\`\``` from the middle of a payload
+# would be editing the model's content, not normalising its wrapper. Both behaviours are
+# pinned by tests (see ``test_objection_block_parses_with_a_closing_fence_off_the_end``).
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?|\n?\s*```\s*$", re.IGNORECASE)
 
 
-def _strip_wrapping(raw: str) -> str:
+def strip_wrapping_fences(raw: str) -> str:
     stripped = raw.strip()
     # Strip a single leading + trailing code fence pair, if present.
     stripped = _FENCE_RE.sub("", stripped)
@@ -344,7 +360,7 @@ def select_adr_pointers(raw_content: str, manifest_ids: frozenset[str]) -> AdrPo
             measured_bytes=measured_bytes,
         )
 
-    body = _strip_wrapping(raw_content)
+    body = strip_wrapping_fences(raw_content)
     try:
         parsed = json.loads(body)
     except (json.JSONDecodeError, ValueError):

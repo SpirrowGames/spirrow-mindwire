@@ -71,8 +71,8 @@ def test_lexora_url_defaults_to_loopback(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_lexora_url_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MINDWIRE_LEXORA_URL", "http://100.79.84.62:8110")
-    assert lexora_url() == "http://100.79.84.62:8110"
+    monkeypatch.setenv("MINDWIRE_LEXORA_URL", "http://{{IP_SERVICES}}:8110")
+    assert lexora_url() == "http://{{IP_SERVICES}}:8110"
 
 
 def test_lexora_url_empty_env_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -80,3 +80,22 @@ identities:
       that way or this probe goes blind." Defined by contract not to write; listed for
       completeness so a live-corpus finding of a post authored by this name would surface
       as an unexpected write (residual) rather than be silently absorbed.
+
+  - name: conductor-relay
+    kind: machine
+    legitimate: []
+    primary_source: "src/spirrow_mindwire/conductor/core.py::CONDUCTOR_RELAY_AUTHOR"
+    reason: >-
+      T-human-terminal-overuse D-1 (Bohr msg-2540, Einstein msg-2539 ACCEPT). When guard (i)
+      redirects a design→implement handoff to the human terminal (a non-human, non-attested-
+      naysayer author nominated the implementer), the conductor writes back one observation
+      into the design thread so the head moves off the redirected token: without a write-back
+      the head still says `NEXT: <implementer>`, head_skip Stage 1 does not SKIP, and the
+      loop bounces forever (measured 288 times across 5 threads before this landed). The
+      relay's body is the conductor's own framing — a restatement of the routing verdict —
+      not any role's verbatim speech, so `legitimate = []` and no role is stamped on the
+      post. Distinct from `pr-gate-relay` (Einstein msg-2539 Obj-1 fix: reusing that author
+      would mix D-1 write-backs with PR-gate verdicts in the very readers that classify by
+      author). msg-2540 §1-4 pins the loader constraint (kind=machine + legitimate=[]);
+      giving this identity a role would violate the I-6 invariant the pr-gate-relay entry
+      already documents.

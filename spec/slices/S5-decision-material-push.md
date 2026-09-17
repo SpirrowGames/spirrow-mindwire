@@ -1,5 +1,7 @@
 # S5 判断材料 push — spec (mindwire 側)
 
+> **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
+
 判断ページ (magickit 側 `T-decision-page` 増分 3、`spirrow-magickit`
 repo の `spec/slices/S5-decision-materials.md`) が用意した material 受け口
 に対し、mindwire の composer が生成した材料 (問い / 選択肢 / 得るもの /
@@ -206,7 +208,7 @@ magickit S5 §1.3 により受け側は 400 で弾き部分保存もしない �
 
 ## 4. wire measurements (M-1〜M-3、msg-1445 §6)
 
-**M-1 (実装前・sg-tomtebo-01 上・pwsh から実測)**:
+**M-1 (実装前・{{HOST_LOOP}} 上・pwsh から実測)**:
 
 | 手段 | 結果 | 所要 |
 |---|---|---|
@@ -222,7 +224,7 @@ DM-5 の `-TimeoutSec 10` は実測 RTT の **~50 倍**の余裕。
 `origin/main` を fast-forward する ∴ **稼働 checkout は `main`**。
 本増分の land 先も `main` (別ブランチに merge しても稼働は取りに行かない)。
 
-**M-3**: sg-tomtebo-01 上で
+**M-3**: {{HOST_LOOP}} 上で
 `[Environment]::GetEnvironmentVariable('MINDWIRE_DECISION_COMPOSER_BACKEND', 'User')`
 は `claude-code`。稼働ログ (`~/spirrow-mindwire-data/logs/conductor-2026-08-23.log`)
 にも `composer fire: ... status=ok` の行が複数存在 ∴ **稼働 backend は

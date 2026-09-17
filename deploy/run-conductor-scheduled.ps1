@@ -84,11 +84,43 @@ $QuarantineEscalatedAfter = [TimeSpan]::FromHours(24)
 $QuarantineStaleAfter     = [TimeSpan]::FromDays(7)
 $StarvedThreshold         = [TimeSpan]::FromHours(24)
 
-# Digest cadence and how many lines of session tail we keep with a quarantine record. These ARE
-# derived from the four above (digest is daily because escalation is daily) but stated here to keep
-# the whole tuning surface in one section.
-$DailyDigestInterval  = [TimeSpan]::FromHours(24)
+# Session-log tail length kept with a quarantine record. Kept here to keep the whole tuning
+# surface in one section.
+# (Historical note: $DailyDigestInterval = 24h used to live here alongside SessionLogTailLines.
+# T-digest-exceeds-discord-limit-and-is-dropped D-6/§4 replaced interval-gating with period-gating
+# (see $DailyDigestDeliveryTime below), retiring the constant. PR-gate round 3 caught it as dead
+# code and it was removed here.)
 $SessionLogTailLines  = 50
+
+# T-digest-exceeds-discord-limit-and-is-dropped D-1: the digest renderer owns a fixed payload budget,
+# so the delivered message length is DECOUPLED from the queue length. The invariant this constant
+# defends is "the renderer emits ≤ this many characters, and any excess collapses to `+N 件` rather
+# than to a 400". (Bohr msg-2099 §0 / D-1 — msg-2013 sent 63 sequential 400s because the ONLY
+# defense was "hope the queue stays short.")
+#
+# The number must be ≤ the limit of the transport the digest ACTUALLY ships on. Send-Notification
+# posts `content` (see the `@{ content = $Message }` payload), whose hard limit is 2,000 — the same
+# limit $DecisionMessageDiscordBudget already names, and 1950 is the margin that constant already
+# chose. Keep the two in step.
+#
+# Regression (Einstein msg-2396 E-2, Bohr msg-2401 §3, both measured on live state): this was 3,500,
+# chosen on the assumption the digest would move to `embed.description` (4,096). The transport move
+# never happened, so every full digest from #203 (b8b6a64) onward rendered 3,2xx chars and was
+# rejected 400 — measured 3257 on 2026-09-01 and 3272 on 2026-09-02, with only the 78-char degraded
+# fallback reaching the operator. The comment that stood here asserted "3,500 is well under the
+# `content` 2,000 hard limit", which is false as arithmetic; it is deleted rather than renumbered.
+#
+# Not fixed by raising the budget to a bigger transport: "the queue does not fit, so enlarge the
+# budget" is the manufacturing process for this whole defect class (Bohr msg-2401 §3-2). The budget
+# is what the transport accepts, never what we wish to list; not fitting is the truncation ladder's
+# job, and it has one.
+$DigestBudget = 1950
+
+# T-digest-exceeds-discord-limit-and-is-dropped D-6 / §4 (msg-2106): the daily digest is period-gated,
+# not interval-gated. Runs once per LOCAL day at or after this wall-clock time — that is the promise
+# the phone-side reader has ("my 09:00 digest"). Time drift (24h clock walking off) is impossible
+# because the gate is "period ≠ last_sent_period AND local ≥ this time", not "elapsed ≥ 24h".
+$DailyDigestDeliveryTime = [TimeSpan]::FromHours(9)
 
 # --- paths -------------------------------------------------------------------------------------
 # mindwire-loop reads <data_dir>/config/mindwire.toml; honour the same env var run-conductor.ps1 does.
@@ -109,6 +141,15 @@ $quarantineStatePath = Join-Path $dataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
 $evaluatedStatePath = Join-Path $dataDir "state\evaluated.json"
 $digestStatePath = Join-Path $dataDir "state\digest.json"
+# T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): notify-health carries just enough to
+# derive the ⚠ line ("full digest is X periods overdue") from period-typed fields —
+# last_full_success_period and first_attempt_period. Two, not one: a success record alone cannot
+# express "has never succeeded", which is the state the ⚠ most needs to report (E-4, see
+# Get-DigestPeriodsMissed). Deliberately does NOT carry a `consecutive_failures` counter (Einstein
+# msg-2102 §1 → Bohr msg-2103): an unstored value cannot be miscleared by a degraded delivery, so the
+# state minimisation IS the fix. Remaining fields (last_attempt_at / last_error / last_error_class)
+# are DIAGNOSTIC ONLY — the ⚠ predicate consults ONLY period ids (D-6 predicate-discipline).
+$notifyHealthPath = Join-Path $dataDir "state\notify-health.json"
 # Composer cache (T-decision-request-composer S2). One row per parked thread key,
 # keyed by the same "project/thread_id" the notified.json / evaluated.json use so a
 # reader can cross-reference by eye. The row carries the last composer envelope
@@ -123,6 +164,14 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # at the bottom). Extracted per Bohr msg-1466 D-3 / Einstein msg-1467 §3-A4: the extracted file is
 # the testability seam, not a refactor.
 . (Join-Path $PSScriptRoot 'lib/StopReason.ps1')
+# Lease.ps1 owns the canonical Get-JsonState (msg-2172 reader collapse). The wrapper's inline
+# reader that used to live at line ~172 is gone; dot-sourcing here brings Get-JsonState into the
+# wrapper's script scope. Order matters: Write-Log is defined further down and Get-JsonState's
+# opportunistic log-through calls Write-Log if resolvable — but since Write-Log is a function
+# (not a variable), PowerShell resolves it at CALL time via Get-Command, so the dot-source order
+# above the Write-Log definition is safe. The wrapper's LEASE state-machine is still inert (the
+# candidate-loop gate lands in PR 4); what activates in PR 2 is the READER half of Lease.ps1.
+. (Join-Path $PSScriptRoot 'lib/Lease.ps1')
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
@@ -169,23 +218,14 @@ function Write-QuietSummary {
 }
 
 # --- small JSON state files ---------------------------------------------------------------------
-function Get-JsonState {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return @{} }
-    try {
-        $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
-        if (-not $raw.Trim()) { return @{} }
-        $obj = $raw | ConvertFrom-Json
-        $map = @{}
-        foreach ($p in $obj.PSObject.Properties) { $map[$p.Name] = $p.Value }
-        return $map
-    }
-    catch {
-        # Corrupt state must not block the sweep; worst case is one duplicate alert / one extra run.
-        Write-Log "state file unreadable ($Path): $($_.Exception.Message) — treating as empty"
-        return @{}
-    }
-}
+# Get-JsonState was collapsed into deploy/lib/Lease.ps1 (msg-2172 Tier-C, 2026-08-28). The
+# canonical reader lives there — it added a JSON-root shape guard (root arrays / scalars now
+# return empty rather than leaking Count/Length/... metadata as fake resource keys, which the
+# 2026-08-28 measurement confirmed was a permanent one-way corruption vector) and an
+# opportunistic log-through that fires the "state file unreadable — treating as empty" line
+# through Write-Log when it resolves in the caller's scope. Save-CorruptedStateBackup, the
+# `.bad-<utc>` rename side effect, is a Lease.ps1 helper the flush caller invokes; PR 4 wires
+# it into the leases.json flush path.
 
 function Save-JsonState {
     param([string]$Path, [hashtable]$State)
@@ -326,6 +366,62 @@ function Test-HoldObserved {
     if ($null -eq $Control) { return $false }          # unreadable probe — fail open, launch
     if ($Control.desired_state -ne 'hold') { return $false }
     return ($Control.observed_state -eq 'hold')
+}
+
+# --- resource-axis HOLD gate (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) ------
+#
+# May a candidate's launch be optimised away because SOME OTHER project's HOLD covers the SAME
+# repository this candidate writes to?
+#
+# `loop_control_*` is keyed by chatroom project. Repositories are the actual contended resource,
+# and the two axes do not agree: `spirrow-magickit` has 8 candidates whose `repo_dir` is
+# `mindwire-impl` (measured 2026-09-09), so a HOLD on `spirrow-mindwire` does not stop those
+# even though they push to the same GitHub repo every `spirrow-mindwire` candidate does. See the
+# specifying thread for the full mapping (§2).
+#
+# This predicate is the ADDITIVE part of the gate: it can hold more, never fewer. Correctness
+# is easy to argue for that shape — a false-positive shows up as a stall the derivation-chain
+# log line explains (D-KEY-4c(4) requires it be logged); a false-negative degrades gracefully
+# to today's behaviour (project-only judgment).
+#
+# It is a PURE function (no I/O, no subprocess, no git) so `tests/Test-SweepHoldGate.ps1` can
+# AST-extract it and exercise it in isolation. The resolution that produces
+# `$PredictedResourceByRepoDir` happens in the tick preparation stage via
+# `Invoke-PredictedResourceProbe`, not here — the naming discipline is D-KEY-4c(1) in the
+# specifying thread (the identifier `Predicted` marks a value that MUST NOT reach the
+# fail-closed enforcer layer; the wrapper is the OPTIMISATION layer, and A — a resource axis
+# on `loop_control_*` itself — is the eventual enforcer, not yet implemented).
+#
+# Fail-open on every arm (D-KEY-4c(2)): unresolved candidate, missing owner map, unknown
+# owning project — all return $false, and the candidate falls through to project-only
+# judgment (= today's behaviour). The only condition that returns $true is: predicted resource
+# is known AND owner map names an owning project for it AND that owning project's control is
+# `Test-HoldObserved`.
+function Test-HoldForCandidate {
+    param(
+        $Candidate,
+        $PredictedResourceByRepoDir,
+        $OwnerMap,
+        $ControlByProject
+    )
+
+    # Any missing input is fail-open. The wrapper never HOLDS a candidate because it lost a
+    # hashtable — that would be the "silent stall" mode D-KEY-4c(4) exists to prevent.
+    if ($null -eq $Candidate) { return $false }
+    if ($null -eq $PredictedResourceByRepoDir) { return $false }
+    if ($null -eq $OwnerMap) { return $false }
+    if ($null -eq $ControlByProject) { return $false }
+
+    $entry = $PredictedResourceByRepoDir[$Candidate.repo_dir]
+    if ($null -eq $entry) { return $false }
+    $predicted = [string]$entry.predicted_resource
+    if ([string]::IsNullOrWhiteSpace($predicted)) { return $false }
+
+    $ownerProject = [string]$OwnerMap[$predicted]
+    if ([string]::IsNullOrWhiteSpace($ownerProject)) { return $false }
+
+    $ownerControl = $ControlByProject[$ownerProject]
+    return (Test-HoldObserved -Control $ownerControl)
 }
 
 # --- head-skip nomination predicate wiring (T-sweep-intake-and-quarantine-stalls) ---------------
@@ -472,6 +568,62 @@ function Invoke-HeadSkipCommitLaunch {
     return @{ ok = $true; error = $null }
 }
 
+# Invoke `head_skip_decide.py --mode commit-terminal --payload <payload>` for one thread.
+# Returns: @{ ok = $true / $false; error = $null / diagnostic }
+#
+# Called AFTER the conductor session returns — the mirror of commit-launch, and deliberately the
+# other way round in time: a launch has to be recorded even if the session is killed mid-flight,
+# whereas a terminal outcome only exists once there is an outcome to read (design §6.2).
+#
+# Called UNCONDITIONALLY on every parseable verdict, not only on the terminal reasons. The CLI
+# clears the terminal state for any non-terminal reason, so the wrapper does not carry a second
+# copy of the reason table — the one in head_skip.py's TERMINAL_STOP_REASONS stays the only one.
+#
+# FAIL-OPEN, unlike commit-launch. A failure here leaves the thread on the ordinary backoff, which
+# is the behaviour that shipped before this existed; aborting the tick (commit-launch's rule)
+# would trade a retry loop for a stopped sweep, and the retry loop is the lesser fault. The
+# failure is logged.
+function Invoke-HeadSkipCommitTerminal {
+    param(
+        [string]$ThreadId,
+        [string]$StopReason,
+        [string]$HeadMsgId,
+        [string]$StateFilePath
+    )
+
+    $decideScript = Join-Path $repoRoot "scripts\head_skip_decide.py"
+    if (-not (Test-Path -LiteralPath $decideScript)) {
+        return @{ ok = $false; error = "head_skip_decide.py not found at $decideScript" }
+    }
+    if ([string]::IsNullOrEmpty($ThreadId)) {
+        return @{ ok = $false; error = "commit-terminal thread_id is empty" }
+    }
+    $payload = @{
+        thread_id   = $ThreadId
+        reason      = $StopReason
+        head_msg_id = $HeadMsgId
+    }
+    $payloadJson = ConvertTo-Json -InputObject $payload -Depth 4 -Compress
+
+    try {
+        Push-Location $repoRoot
+        try {
+            $raw = & uv run python $decideScript `
+                --state-file $StateFilePath --mode commit-terminal --payload $payloadJson 2>&1
+            $code = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+    }
+    catch {
+        return @{ ok = $false; error = "head_skip commit-terminal invocation failed: $($_.Exception.Message)" }
+    }
+    if ($code -ne 0) {
+        $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
+        return @{ ok = $false; error = "head_skip commit-terminal exited ${code}: $tail" }
+    }
+    return @{ ok = $true; error = $null }
+}
+
 # Read the head-skip mode from the environment. Named after the CLI's REPORT_MODE_ENV constant
 # so a `git grep MINDWIRE_HEADSKIP_MODE` finds both sides. Values: "decide" (default) or
 # "report" (dry-run: the CLI computes verdicts but writes nothing on disk, and the wrapper does
@@ -533,7 +685,20 @@ function New-QuarantineRecord {
         [string]$FailureHead,
         [string]$FailureControl,
         [string]$SessionLogPath,
-        [string[]]$SessionLogTail
+        [string[]]$SessionLogTail,
+        # T-stalled-pr-has-no-detector Deliverable 6 (msg-2470 §4 / msg-2354 §1 M-2):
+        # ``failure_fingerprint`` is ``{head, control}`` and every entry is unique per
+        # occurrence, so a digest group-by on it produces "every entry in its own bin"
+        # (Einstein E-6, and Bohr confirms in msg-2470 §4). The error class buried in
+        # ``session_log_tail`` is the field the operator actually needs to group on,
+        # so we extract it at quarantine time and persist it as a first-class field.
+        #
+        # The classifier's SOT is ``src/spirrow_mindwire/stall_ledger/failure_class.py``
+        # (single place to add a new signature). ``Get-FailureClass`` below invokes it.
+        # Optional so all existing callers (the tests lift this function's AST directly
+        # and call it with the old signature) keep working with an ``unknown`` default;
+        # the sweep passes the resolved value explicitly.
+        [string]$FailureClass = 'unknown'
     )
 
     return @{
@@ -544,8 +709,114 @@ function New-QuarantineRecord {
         exit_code            = $ExitCode
         stop_reason          = $StopReason
         failure_fingerprint  = @{ head = $FailureHead; control = $FailureControl }
+        failure_class        = $FailureClass
         session_log_path     = $SessionLogPath
         session_log_tail     = $SessionLogTail
+    }
+}
+
+# T-stalled-pr-has-no-detector Deliverable 6 wire-up. Extracts the failure class from
+# the session log tail by invoking the Python classifier over stdin. The classifier's
+# rules (which regex catches which error label) are the single SOT so a new signature
+# added there flows to both the persisted field and any digest side that groups on it.
+#
+# Failure-mode contract: this wrapper NEVER breaks the sweep. If ``uv``/``python`` is
+# missing, the classifier crashes, or the child returns a nonzero exit, we return
+# ``unknown`` — same value the ``New-QuarantineRecord`` default uses. The quarantine
+# record is far too important to withhold because a subprocess broke; the ledger's
+# noisiness invariant covers the ``unknown`` case with a distinct group in the digest.
+function Get-FailureClass {
+    param(
+        [string[]]$SessionLogTail,
+        # PR-gate msg-2486 flagged this as an unused parameter with an implicit CWD
+        # dependency. Bohr msg-2601 §1-2 escalated the fix from "remove" to "wire it
+        # up" for exactly the reason this sub-system exists: an unwired uv-run silently
+        # falls through to ``unknown`` when the caller's CWD lacks a ``pyproject.toml``,
+        # and a global ``failure_class = unknown`` on every quarantine is
+        # indistinguishable from D-6 not being deployed at all (msg-2470 §8 W-4).
+        # ``[AllowEmptyString()]`` + empty default keeps the parameter overridable
+        # while allowing the body to compute the real default lazily — the eager
+        # default (``Split-Path -Parent $PSScriptRoot``) throws in AST-lifted test
+        # contexts where ``$PSScriptRoot`` is empty, and would then block the
+        # short-circuit paths (empty tail) that never even reach the CWD.
+        [AllowEmptyString()]
+        [string]$RepoRoot = ''
+    )
+
+    if (-not $SessionLogTail -or $SessionLogTail.Count -eq 0) { return 'unknown' }
+
+    # Lazy default: compute the repo root only when the caller did not supply one AND
+    # the function actually needs it (past the short-circuits above). This script sits
+    # in ``<repo>/deploy/`` so ``Split-Path -Parent $PSScriptRoot`` is the repo root —
+    # the same expression the top-level ``$repoRoot`` on line ~159 uses. Kept in sync
+    # deliberately so a repo move needs one edit, not two.
+    if (-not $RepoRoot) {
+        if ($PSScriptRoot) {
+            $RepoRoot = Split-Path -Parent $PSScriptRoot
+        } else {
+            # Lifted-into-a-test caller with no $PSScriptRoot AND no explicit
+            # -RepoRoot. Falling back to '.' would silently re-introduce the CWD
+            # dependency this parameter exists to remove — msg-2601 §1-2 is
+            # explicit: silent fall-through to ``unknown`` is the failure mode we
+            # are structurally forbidding. The function contract from the docstring
+            # above is "NEVER breaks the sweep" — so we cannot ``throw`` (the sweep
+            # would fault and lose the whole tick). But we CAN and MUST make the
+            # fall-back visible: PR-gate msg-(gate) round 2 objection #1 correctly
+            # observed that a bare ``return 'unknown'`` here is indistinguishable
+            # from the silent failure this branch exists to prevent.
+            #
+            # ``Write-Warning`` emits to the warning stream (visible in the sweep
+            # log and in tests' console output; unlike ``2>$null`` on child
+            # processes, it is NOT swallowed by the outer try/catch below since
+            # that catch only fires on terminating errors).
+            # ``Write-Log`` additionally records the event in the sweep's own log
+            # file so the operator's ledger of the tick names it — the stub in
+            # ``Test-SweepQuarantine.ps1`` is a no-op, so tests do not need to
+            # assert on log lines, but production readers see it.
+            Write-Warning "Get-FailureClass: no -RepoRoot and no `$PSScriptRoot in scope; classifier NOT invoked. Returning 'unknown' (loud fall-back per msg-2601 §1-2)."
+            # ADV-1 (T-stalled-pr-has-no-detector msg-2618, resolved by msg-2692 §2 /
+            # msg-2688): call ``Write-Log`` only when it is defined in the current
+            # scope. The function contract of ``Get-FailureClass`` is "NEVER breaks
+            # the sweep" — an unconditional call reaches out of this function's
+            # closure and would raise ``CommandNotFoundException`` in any scope
+            # (dot-source into a stripped harness, extraction into another module)
+            # that lacks the logger. That exception is raised OUTSIDE the try/catch
+            # below and would bubble up to the caller, violating the contract.
+            # The msg-2688 rule this is the payment for: 弁済価格 < 強制機構価格
+            # なら払う — the fix is one line, an AST guard would be several.
+            if (Get-Command -Name Write-Log -ErrorAction SilentlyContinue) {
+                Write-Log "WARN Get-FailureClass: RepoRoot unresolvable (no param, no `$PSScriptRoot); classifier skipped, failure_class='unknown'"
+            }
+            return 'unknown'
+        }
+    }
+
+    $blob = ($SessionLogTail -join "`n")
+
+    try {
+        # ``uv run`` is the repo's convention for invoking a package in the managed venv;
+        # `.mindwire-gate` uses the same. Passing the tail via stdin (not argv) keeps the
+        # command line short and avoids any escaping surprise with quotes / backticks.
+        #
+        # ``--directory $RepoRoot`` pins the working directory of the uv invocation so
+        # ``pyproject.toml`` / ``uv.lock`` resolve regardless of the caller's CWD. This
+        # is preferred over ``Push-Location``: uv's own flag never leaks CWD state back
+        # into PowerShell if the child crashes mid-flight, so the sweep's outer scope
+        # cannot be corrupted by a failed classification (matches CON-1's record-then-
+        # execute discipline — if the remedy scope leaks, so does the observation of it).
+        $output = $blob | uv run --directory $RepoRoot --quiet python -m spirrow_mindwire.stall_ledger 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $output) { return 'unknown' }
+        # The CLI prints ONE line — the label. Any surplus (stderr already suppressed
+        # above) is ignored; taking `[0]` guards against a stray blank line.
+        $label = if ($output -is [array]) { $output[0] } else { $output }
+        $label = "$label".Trim()
+        if (-not $label) { return 'unknown' }
+        return $label
+    } catch {
+        # Absolutely fatal failures (uv missing, venv broken, python crash) still fall
+        # through to the ledger-preserving ``unknown`` — this function is on the hot
+        # path of the sweep's failure branch and must never itself become a new failure.
+        return 'unknown'
     }
 }
 
@@ -656,20 +927,199 @@ function Format-DurationDigest {
     return "${minutes}m"
 }
 
-# Should the daily-digest clock advance given this Send-Notification result?
+# Result classifier for a Send-Notification return. Two questions come out of one shape so the two
+# never diverge:
+#   - Test-DigestDelivered: should the cadence gate advance for this period? (i.e., "retrying THIS
+#     period cannot help — either something landed or nothing WILL land")
+#     If yes, `last_sent_period` advances → cadence gate closes for the period.
+#   - Test-DigestFullSuccess: did the FULL digest land? (only 'sent' with class 'ok')
+#     If yes, `last_full_success_period` advances → ⚠ predicate clears.
 #
-# 'sent'     -> yes, the notification landed and we do not want to re-attempt for 24h.
-# 'skipped'  -> yes, the operator has no webhook configured. Retrying every 5 minutes accomplishes
-#               nothing (the webhook will not appear on its own) and would log-spam the daemon.
-# 'failed'   -> no, the webhook is configured but the POST failed. This is the ONLY case where the
-#               next tick should retry — the whole reason the clock is gated on the result at all.
+# Cadence-advancing outcomes:
+#   * sent(ok)              — the full digest landed.
+#   * degraded(ok)          — the fixed-length fallback landed after a full 400.
+#   * skipped(no-webhook)   — the operator has deliberately no channel; retrying every 5 minutes
+#                             accomplishes nothing and would log-spam the daemon.
+#   * failed(deterministic-permanent) — the webhook is gone (401/403/404). PR-gate review
+#                             (2026-08-30): my Get-NotificationFailureClass docstring literally
+#                             said "Do NOT send a second POST" for this class, but the earlier
+#                             predicate ignored $class and refused to advance, spamming 404s every
+#                             5 minutes for the rest of the day. Advance the period so the
+#                             next-tick check sees "already sent" and stops.
+#   * failed(deterministic-payload) — only reached when the FULL digest 400s AND the degraded
+#                             fallback ALSO 400s. Retrying the same tick will fail the same way;
+#                             advance to prevent spam. (This branch is defensive — the degraded
+#                             message is fixed and small; if it 400s, something more fundamental
+#                             is broken and 5-minute spam does not help.)
 #
-# Pulled out as a helper so the "which outcomes are terminal?" decision is testable and lives in
-# one place. If a future refactor adds a fourth outcome, this table is the only line to touch.
-# (Tier B naysayer, PR #138 round 5.)
-function Test-DigestClockAdvances {
-    param([string]$Result)
-    return ($Result -eq 'sent' -or $Result -eq 'skipped')
+# Held (returns $false):
+#   * failed(transient)     — network / 5xx / 429 / unknown. The next tick has a real chance to
+#                             succeed; this is the WHOLE reason the cadence gate exists.
+#
+# `skipped` and every non-transient failure count for cadence but NOT for full-success — the human
+# was not informed, so ⚠ must keep ticking. This distinction is what surfaces "wired the webhook
+# but Discord side keeps 400ing" without the operator having to guess.
+#
+# (T-digest-exceeds-discord-limit-and-is-dropped D-6; replaces the older Test-DigestClockAdvances.
+# PR-gate naysayer 2026-08-30 caught that the earlier version of THIS function inspected $status
+# only and mis-held cadence on non-retryable failures.)
+function Test-DigestDelivered {
+    param($Result)
+    if ($Result -is [hashtable]) {
+        $status = $Result['status']
+        $class = $Result['class']
+    } else {
+        $status = $Result
+        $class = $null
+    }
+    if ($status -eq 'sent' -or $status -eq 'skipped' -or $status -eq 'degraded') { return $true }
+    # A non-retryable failure class still advances cadence — the whole point of "non-retryable" is
+    # that a 2nd POST this tick, or a 3rd POST 5 minutes later, is guaranteed to fail the same way.
+    # Held would mean spam. Advanced means "we tried once, we know it won't work, don't try again
+    # until tomorrow"; ⚠ still lights up because Test-DigestFullSuccess is separate.
+    if ($status -eq 'failed' -and ($class -eq 'deterministic-permanent' -or $class -eq 'deterministic-payload')) {
+        return $true
+    }
+    return $false
+}
+function Test-DigestFullSuccess {
+    param($Result)
+    if ($Result -is [hashtable]) {
+        return ($Result['status'] -eq 'sent' -and $Result['class'] -eq 'ok')
+    }
+    return ($Result -eq 'sent')
+}
+
+# T-digest-exceeds-discord-limit-and-is-dropped D-2: combine the full-digest send result with
+# the (optional) degraded-fallback send result into the single result that drives cadence and
+# health decisions downstream.
+#
+# The rule is tight:
+#   * No degraded attempt (fallback was not triggered) → pass-through the full result.
+#   * Degraded landed (status='sent') → emit `{status='degraded'; class='ok'}` so
+#     Test-DigestFullSuccess stays false (the operator got the fallback, not the queue) while
+#     Test-DigestDelivered advances cadence.
+#   * Degraded also failed → USE the degraded's actual result. This is the crux: its `class`
+#     (transient vs deterministic-*) is what the cadence predicate needs. PR-gate round 3 caught
+#     the earlier revision preserving the ORIGINAL `deterministic-payload` on degraded-transient-
+#     failure, which Test-DigestDelivered treats as non-retryable, silently advancing cadence
+#     and abandoning what was actually a retryable delivery.
+#
+# Extracted so the transformation is testable in isolation — tests/Test-SweepDigest.ps1's
+# "PR-gate regression" block pins the four combinations. If a future edit ever collapses this
+# back to inline code that discards the degraded class, the pinned tests fail loudly.
+function Resolve-DigestSendResult {
+    param($FullResult, $DegradedResult = $null)
+    if ($null -eq $DegradedResult) { return $FullResult }
+    if ($DegradedResult -is [hashtable] -and $DegradedResult['status'] -eq 'sent') {
+        $httpStatus = if ($DegradedResult.ContainsKey('http_status')) { $DegradedResult['http_status'] } else { 200 }
+        return @{ status = 'degraded'; class = 'ok'; http_status = $httpStatus; error = 'full-payload rejected, degraded landed' }
+    }
+    return $DegradedResult
+}
+
+# T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106 §3, msg-2104): the digest cadence
+# is per-PERIOD, not per-interval. A period id is a wall-clock local date string; the predicate
+# "period P ≠ period Q" is jitter-immune because a 5-minute tick offset does not cross a date
+# boundary. This is the whole point of the shift from `last_sent_at` (a timestamp) to
+# `last_sent_period` (a discrete id) — the jitter tolerance that Einstein msg-2104 proposed as a
+# fudge constant becomes structurally unnecessary.
+#
+# The period id is the LOCAL calendar day (yyyy-MM-dd). "Local" means the machine running the
+# scheduler; that is the same clock Takahito reads on his phone at breakfast, which is the
+# consumer this digest is FOR.
+function Get-DigestPeriod {
+    param([datetime]$Now)
+    # Get-Date .ToLocalTime() gives us a DateTime with Kind=Local. Format as ISO date.
+    return $Now.ToLocalTime().ToString('yyyy-MM-dd')
+}
+
+# Are we AT or PAST today's delivery time? Period-gated cadence has two parts (msg-2106 §4): the
+# period must be new AND the local wall clock must be ≥ configured delivery time. Without the second
+# check, a period boundary at midnight (23:58 send + 00:03 tick) would double-send.
+function Test-DigestDeliveryDue {
+    param([datetime]$Now, [TimeSpan]$DeliveryTime)
+    $local = $Now.ToLocalTime()
+    return $local.TimeOfDay -ge $DeliveryTime
+}
+
+# Compute the "periods missed since the operator was last told the queue" from health state.
+#
+# Uses date arithmetic on the parsed period ids so daylight-savings transitions do not skew the
+# count. The predicate is "the number of local calendar days elapsed", which is the same thing an
+# operator counts on a wall calendar; no time-difference math is involved. D-6 predicate discipline
+# holds: every field this reads is period-typed. `last_attempt_at` / `last_error*` stay display-only.
+#
+# TWO histories, because "no success recorded" has two meanings and conflating them is fail-open
+# (Einstein msg-2396 E-4, accepted whole by Bohr msg-2401 §5):
+#
+#   * `LastFullSuccessPeriod` present — a full digest HAS landed before. Missed = the periods
+#     between then and now: delta ≤ 1 is healthy (today's send follows yesterday's success).
+#   * absent, `FirstAttemptPeriod` present — the digest has been ATTEMPTED and has NEVER once
+#     landed. Every period from the first attempt up to (not including) the current one is a period
+#     the operator was not told: missed = delta. Note this is one more than the branch above for
+#     the same delta, and correctly so — there the boundary period succeeded, here it failed.
+#   * both absent — genuinely nothing has ever been attempted. 0, do not alarm on a first run.
+#
+# What this closes: `last_full_success_period` records a SUCCESS EDGE, so a system that has never
+# succeeded has no record to read, and the old rule read that emptiness as "healthy first run". The
+# ⚠ therefore went permanently dark in the exact state it exists to report — measured on live
+# `state/notify-health.json`, which carried only last_error / last_error_class / last_attempt_at for
+# the whole of the #203 regression. A level condition ("has not succeeded") cannot be derived from
+# an edge record alone; `first_attempt_period` supplies the missing lower bound.
+function Get-DigestPeriodsMissed {
+    param([string]$CurrentPeriod, [string]$LastFullSuccessPeriod, [string]$FirstAttemptPeriod)
+    $anchor = if ($LastFullSuccessPeriod) { $LastFullSuccessPeriod } else { $FirstAttemptPeriod }
+    if (-not $anchor) { return 0 }
+    try {
+        $cur = [datetime]::ParseExact($CurrentPeriod, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        $from = [datetime]::ParseExact($anchor, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    } catch { return 0 }
+    $delta = ($cur - $from).Days
+    if ($LastFullSuccessPeriod) {
+        if ($delta -le 1) { return 0 }  # 1 = healthy (today's send follows yesterday's success)
+        return ($delta - 1)             # 2 = missed 1, 4 = missed 3, ...
+    }
+    # Never-succeeded branch: the anchor period itself is a period that failed, so it counts.
+    if ($delta -lt 1) { return 0 }      # 0 = the first attempt is happening right now
+    return $delta                       # 1 = missed 1, 3 = missed 3, ...
+}
+
+# T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): the ⚠ line is DERIVED from
+# `last_full_success_period`. No stored counter, no threshold constant — just "period arithmetic
+# says N days without a full delivery, and N ≥ 2". The predicate discipline (D-6) forbids
+# consulting `last_attempt_at` / `last_error*` here: those are display-only, and letting them
+# influence the predicate would recreate the "cleared by a transient recovery" bug Einstein
+# msg-2102 §2 found in the earlier draft.
+function Get-DigestHealthWarning {
+    param([hashtable]$Health, [string]$CurrentPeriod)
+    $lastFull = $null
+    if ($Health -and $Health.ContainsKey('last_full_success_period')) { $lastFull = $Health['last_full_success_period'] }
+    $firstAttempt = $null
+    if ($Health -and $Health.ContainsKey('first_attempt_period')) { $firstAttempt = $Health['first_attempt_period'] }
+    $missed = Get-DigestPeriodsMissed -CurrentPeriod $CurrentPeriod `
+                                      -LastFullSuccessPeriod $lastFull -FirstAttemptPeriod $firstAttempt
+    if ($missed -lt 1) { return $null }
+    $errClass = $null
+    if ($Health -and $Health.ContainsKey('last_error_class')) { $errClass = $Health['last_error_class'] }
+    $errSuffix = if ($errClass) { " / 直近: $errClass" } else { '' }
+    # Two wordings, because the two states call for different operator action: "it stopped working"
+    # sends you to what changed, "it has never worked" sends you to the wiring. The old single
+    # wording could not even render the second — it interpolated an empty $lastFull into
+    # "（最後の成功 ）", which is the shape of a bug report about the warning rather than a warning.
+    if (-not $lastFull) {
+        return "⚠ フル digest は一度も配送できていません（$missed 期間連続 / 初回試行 $firstAttempt$errSuffix）"
+    }
+    return "⚠ フル digest が $missed 期間配送できていません（最後の成功 $lastFull$errSuffix）"
+}
+
+# T-digest-exceeds-discord-limit-and-is-dropped D-2 (msg-2099): the fallback message the operator
+# sees when the full digest hits a deterministic-payload rejection. Fixed length, self-describing,
+# and honest about what happened: the point is that a DEGRADED delivery is still a delivery, and
+# the operator reading it should be told "the mechanism is broken, not the queue".
+function New-DegradedDigestMessage {
+    param([int]$WaitingCount, [string]$CurrentPeriod)
+    return "MindWire 日次ダイジェスト ($CurrentPeriod) — フル本文の組み立てに失敗しました（$WaitingCount 件待機中）。chatroom を確認してください。"
 }
 
 # The signature Send-NotificationIfChanged uses to dedup the K-budget "systemic cause suspected"
@@ -728,18 +1178,35 @@ function New-DailyDigest {
         # $ParkedPollErrors is the errors[] list from scripts/parked_humans.py (per-candidate fetch
         # failures). Rendered as "取得失敗: N 件" under the 判断待ち section so an outage does not
         # silently under-report; the section itself never disappears (I-2 "黙って劣化しない").
-        [array]$ParkedPollErrors = @()
+        [array]$ParkedPollErrors = @(),
+        # T-digest-exceeds-discord-limit-and-is-dropped D-1 (msg-2099): budget in characters.
+        # 0 or omitted = unbounded (legacy callers). When > 0, per-section entry lists are truncated
+        # (oldest-first is preserved) and a `+N 件` marker records the exact number dropped, so the
+        # header count is always the true total. If the fixed overhead alone exceeds the budget,
+        # the digest is emitted anyway (its overhead is small and self-consistent); a caller that
+        # cannot afford even the overhead should call New-DegradedDigestMessage directly.
+        [int]$Budget = 0,
+        # T-digest-exceeds-discord-limit-and-is-dropped D-6: the ⚠ line derived from
+        # notify-health.json. Prepended above the header when set — non-null iff the last full
+        # success is ≥ 2 periods old. Never affects the dedup signature: msg-2101 D-7 forbids
+        # letting rendering-side ephemera reach any suppression predicate.
+        [string]$HealthWarning = $null
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
+    # Age (seconds since first_failure_at) is carried alongside each line so the renderer can sort
+    # oldest-first — msg-2099 D-1: truncation must drop what is LEAST likely to have been forgotten.
     $escalatedList = @()
     $quarantinedList = @()
     $staleList = @()
+    $oldestQuarantineAge = $null
     foreach ($key in $QuarantineState.Keys) {
         $rec = $QuarantineState[$key]
         $firstAt = ConvertTo-UtcInstant $rec.first_failure_at
         $derived = Get-DerivedQuarantineState -FirstFailureAt $firstAt -Now $Now
-        $age = Format-DurationDigest -Span ($Now - $firstAt)
+        $ageSpan = ($Now - $firstAt)
+        if ($null -eq $oldestQuarantineAge -or $ageSpan -gt $oldestQuarantineAge) { $oldestQuarantineAge = $ageSpan }
+        $age = Format-DurationDigest -Span $ageSpan
 
         # Extract project id from key ("project/thread_id") to reach the right probe map.
         $project = ($key -split '/', 2)[0]
@@ -778,10 +1245,15 @@ function New-DailyDigest {
         if ($hint) { $line += "   ⚠ $hint" }
         if ($reproHint) { $line += "`n    $reproHint" }
 
+        # Carry the age-in-seconds beside the line so the sort step can order oldest-first without
+        # re-parsing formatted durations. PSCustomObject with .Line and .AgeSeconds so the sort key
+        # is unambiguous even if a formatted string happens to contain digits (unlikely, but the
+        # explicit numeric key is honest about what "oldest first" means).
+        $entry = [PSCustomObject]@{ Line = $line; AgeSeconds = [int64]$ageSpan.TotalSeconds }
         switch ($derived) {
-            'stale'       { $staleList       += $line }
-            'escalated'   { $escalatedList   += $line }
-            default       { $quarantinedList += $line }
+            'stale'       { $staleList       += $entry }
+            'escalated'   { $escalatedList   += $entry }
+            default       { $quarantinedList += $entry }
         }
     }
 
@@ -806,100 +1278,307 @@ function New-DailyDigest {
             # A "never evaluated" thread carries a slightly different label so the operator does not
             # spend cognitive effort deciding whether the entry means "stuck" or "never touched."
             $suffix = if (-not $lastAtRaw) { "   (未評価)" } else { "" }
-            $starvedList += "  $key   $(Format-DurationDigest -Span $age)$suffix"
+            $starvedLine = "  $key   $(Format-DurationDigest -Span $age)$suffix"
+            $starvedList += [PSCustomObject]@{ Line = $starvedLine; AgeSeconds = [int64]$age.TotalSeconds }
         }
     }
 
+    # Sort each section oldest-first (largest AgeSeconds first) — msg-2099 D-1: what's most likely
+    # to have been forgotten goes first, and truncation drops the newest.
+    $staleList       = @($staleList       | Sort-Object -Property AgeSeconds -Descending)
+    $escalatedList   = @($escalatedList   | Sort-Object -Property AgeSeconds -Descending)
+    $quarantinedList = @($quarantinedList | Sort-Object -Property AgeSeconds -Descending)
+    $starvedList     = @($starvedList     | Sort-Object -Property AgeSeconds -Descending)
+
+    # Build the compact summary line first (msg-2099 D-1: "1 行目で行動が決まる — 件数と最古の
+    # 待ち日数"). Emitted even when both sections are 0 so the format is stable across empty and
+    # non-empty days.
+    $totalQ = $escalatedList.Count + $quarantinedList.Count + $staleList.Count
+    $oldestQuarantineDays = if ($oldestQuarantineAge) { [int]($oldestQuarantineAge.TotalDays) } else { 0 }
+    $summary = "human-parked $($HumanParked.Count) / 隔離 $totalQ / 飢餓 $($starvedList.Count) / 最古 ${oldestQuarantineDays}d"
+
     $lines = @()
+    # T-digest-exceeds-discord-limit-and-is-dropped D-6: ⚠ line ABOVE the header when set. Prepending
+    # rather than appending because the mobile reader sees the first ~2 lines in the notification
+    # preview, and the whole point of the ⚠ is that the operator sees it without opening.
+    if ($HealthWarning) { $lines += $HealthWarning }
     $lines += "MindWire 日次ダイジェスト ($(Get-Date -Date $Now.ToLocalTime() -Format 'yyyy-MM-dd HH:mm'))"
+    $lines += $summary
     $lines += ""
 
-    $totalQ = $escalatedList.Count + $quarantinedList.Count + $staleList.Count
+    # T-digest-exceeds-discord-limit-and-is-dropped D-1: emit-with-budget helper. When $Budget is 0
+    # every list is emitted in full (legacy behaviour, preserves existing tests). When $Budget > 0,
+    # each section is truncated so the ENTIRE output stays ≤ budget; the count in the header stays
+    # correct because it is computed from the full list before truncation.
+    #
+    # F-1 (msg-2418 §4-4 / msg-2436 §4) — PER-SECTION ROW FLOOR. What the earlier accounting got
+    # wrong, and why the fix is a computation rather than a bigger constant:
+    #
+    #   The former reserve was two constants — $overflowMarker = 60 and $trailingReserve = 400,
+    #   the latter documented as "判断待ち header + fetch-error rows : ~80". It reserved the
+    #   HEADERS of the later sections and none of their ROWS. So the first row-emitting section
+    #   was allowed to eat the budget down to (Budget - 460) and every later section then found
+    #   ~0 characters left. Every later section still printed its header and its true count, then
+    #   a bare "+N 件（省略）" — a correct-looking section with nothing in it.
+    #
+    #   Measured on production, not derived: the digest delivered 2026-09-03 10:50 (payload 1735
+    #   chars, the first full delivery since 08-30) rendered 4 of 21 判断待ち rows and 1 of 3 飢餓
+    #   rows. On 09-02, with 12 quarantine entries instead of 3, the same renderer rendered 0 of
+    #   21 判断待ち rows. The visible row count of a section is therefore a DECREASING FUNCTION OF
+    #   THE PRECEDING SECTIONS' LOAD, not a constant — which also means an unrelated edit to an
+    #   earlier section's line length silently changes how much of the human's decision queue is
+    #   visible. That is not a property to manage by tuning; it is the defect.
+    #
+    #   The fix: every row-emitting section declares a FLOOR of one row that no earlier section
+    #   may consume. An earlier section's reserve is therefore not an estimate but the exact
+    #   character cost of "every later section reduced to its floor" — headers, one row each,
+    #   their overflow markers, and the footer — computed HERE, at render time, from the real
+    #   lists. Both constants are retired rather than retuned: a constant cannot know that a
+    #   later section is empty (it over-reserves) nor that its first row is 170 characters wide
+    #   (it under-reserves, which is what starved 判断待ち). Keeping either one alongside the
+    #   computation would be the same double-bookkeeping this thread already closed once in E-2,
+    #   where the test harness kept its own copy of $DigestBudget.
+    #
+    #   The upper bound is unchanged and still absolute: $digest.Length ≤ $Budget. The floor is
+    #   satisfiable for every input where one row per non-empty section fits at all; when even
+    #   that does not fit, the renderer says so in the section instead of quietly printing none
+    #   (msg-2436 §4 item 4).
+
+    function _EntryLine {
+        param($Entry)
+        if ($Entry -is [PSCustomObject] -and $Entry.PSObject.Properties.Name -contains 'Line') { return $Entry.Line }
+        return [string]$Entry
+    }
+    # The "+N 件（省略）" line has exactly one home so the budget arithmetic below measures the
+    # same string the renderer emits. $FloorUnmet is the msg-2436 §4 item-4 case: the section had
+    # rows and not one of them fit, which must be visible rather than silent.
+    function _SectionOverflowLine {
+        param([string]$Indent, [int]$Count, [bool]$FloorUnmet = $false)
+        if ($FloorUnmet) { return "$Indent+$Count 件（省略 — 予算不足で 0 行）" }
+        return "$Indent+$Count 件（省略）"
+    }
+    function _LinesCost {
+        param([array]$Lines)
+        $n = 0
+        foreach ($l in $Lines) { $n += 1 + ([string]$l).Length }
+        return $n
+    }
+    # The floor cost of a row-emitting section: its first row (entries are already ordered so that
+    # index 0 is the one that matters most) plus the widest line the section can append after it.
+    # Summed, not maxed, because that is exactly the test _AddSectionEntries applies at index 0 —
+    # the two have to agree or the floor is only reserved on paper.
+    function _SectionFloorCost {
+        param([array]$Entries, [string]$Indent)
+        if ($Entries.Count -eq 0) { return 0 }
+        $row = 1 + (_EntryLine $Entries[0]).Length
+        $marker = 1 + (_SectionOverflowLine -Indent $Indent -Count $Entries.Count -FloorUnmet $true).Length
+        return $row + $marker
+    }
+    function _AddSectionEntries {
+        param([array]$Entries, [int]$MaxLen, [int]$Reserve, [ref]$RunningLen, [string]$Indent = '  ')
+        # Returns @{ Emitted; Dropped; FloorUnmet }. Adds newline+entry pairs from $Entries in
+        # order, stopping when the NEXT line plus the line this section would itself append plus
+        # $Reserve (the floor-inclusive cost of everything still to come) would pass $MaxLen.
+        $out = @()
+        $dropped = 0
+        # Width of each line this section can append after its rows. Measured from the same
+        # formatter the renderer emits, so the reserve equals the emission exactly — the old flat
+        # 60 was a bound, and a bound leaves slack that is indistinguishable from starvation.
+        $plainWidth = 1 + (_SectionOverflowLine -Indent $Indent -Count $Entries.Count -FloorUnmet $false).Length
+        $unmetWidth = 1 + (_SectionOverflowLine -Indent $Indent -Count $Entries.Count -FloorUnmet $true).Length
+        for ($i = 0; $i -lt $Entries.Count; $i++) {
+            $line = _EntryLine $Entries[$i]
+            # +1 for the newline that will join this line to whatever came before.
+            $cost = 1 + $line.Length
+            # What this section can still append, by position: at index 0 the alternative branch is
+            # the floor-unmet line (the widest); after that only the plain marker is reachable; and
+            # emitting the LAST entry appends nothing at all.
+            $append = if ($i -eq 0) { $unmetWidth } elseif ($i -lt $Entries.Count - 1) { $plainWidth } else { 0 }
+            if ($MaxLen -gt 0 -and ($RunningLen.Value + $cost + $append + $Reserve) -gt $MaxLen) {
+                $dropped = $Entries.Count - $i
+                break
+            }
+            $out += $line
+            $RunningLen.Value += $cost
+        }
+        return @{ Emitted = $out; Dropped = $dropped; FloorUnmet = ($Entries.Count -gt 0 -and $out.Count -eq 0) }
+    }
+    # One call site for "emit the rows, then whatever line the truncation needs", so no section can
+    # drift into reporting its overflow differently from the others.
+    function _SectionOverflowLines {
+        param($Result, [string]$Indent)
+        if ($Result.Dropped -le 0) { return @() }
+        return @(_SectionOverflowLine -Indent $Indent -Count $Result.Dropped -FloorUnmet ([bool]$Result.FloorUnmet))
+    }
+
+    # ---- every row list is built BEFORE anything is emitted -------------------------------------
+    # The reserve ladder below has to know the width of the FIRST row of every later section, so
+    # the rows cannot be built lazily inside their own emit blocks any more. Building them here
+    # changes no row content; it only moves construction ahead of the first budget decision.
+
+    # 判断待ち rows — T-decision-request-composer S4 (msg-1370 §0 defect 2 / §4 / A-4; D-32 for the
+    # grammar-ownership rule). Row order is preserved (msg-1370's caller-owned order — this
+    # renderer does not resort human-parked; only quarantine sections are sorted oldest-first).
+    # The count and the row order come from $HumanParked, which is itself the output of
+    # scripts/parked_humans.py — so this section restores fully from a wiped pending-decisions.json
+    # (A-14); the cache only enriches the row with the composer's question.
+    $parkedEntries = @()
+    foreach ($p in $HumanParked) {
+        $key = $p.key
+        $head = $p.head_msg_id
+        # Look up the composer question by (key, signature = "human:<head>"). Any other
+        # signature shape came from a different reason and does not match this row — the
+        # cache row is intentionally strict on signature equality (S2 A-3).
+        $sig = "human:$head"
+        $questionSnippet = $null
+        if ($PendingDecisionsState.ContainsKey($key)) {
+            $row = $PendingDecisionsState[$key]
+            if ($row -is [hashtable]) { $rowSig = $row['signature']; $env = $row['envelope'] }
+            else { $rowSig = $row.signature; $env = $row.envelope }
+            if ($rowSig -eq $sig -and $env) {
+                $status = if ($env.PSObject.Properties.Name -contains 'composer_status') { $env.composer_status } else { $null }
+                $output = if ($env.PSObject.Properties.Name -contains 'output') { $env.output } else { $null }
+                if ($status -eq 'ok' -and $output) {
+                    $q = if ($output.PSObject.Properties.Name -contains 'question') { $output.question } else { $null }
+                    if ($q) {
+                        # One-line-per-row readability: cap at 80 chars, flatten any
+                        # embedded newlines, so a multi-line composed question cannot wrap
+                        # the digest layout.
+                        $flat = ($q -replace "`r?`n", ' ').Trim()
+                        if ($flat.Length -gt 80) { $flat = $flat.Substring(0, 79) + '…' }
+                        $questionSnippet = $flat
+                    }
+                }
+            }
+        }
+        $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
+        $parkedEntries += [PSCustomObject]@{ Line = "  $key   [$head]$suffix"; AgeSeconds = 0 }
+    }
+
+    # 取得失敗 rows (I-2 "黙って劣化しない").
+    $errorEntries = @()
+    foreach ($e in $ParkedPollErrors) {
+        $tid = if ($e.PSObject.Properties.Name -contains 'thread_id') { $e.thread_id } else { $e['thread_id'] }
+        $reason = if ($e.PSObject.Properties.Name -contains 'reason') { $e.reason } else { $e['reason'] }
+        $errorEntries += [PSCustomObject]@{ Line = "    $tid — $reason"; AgeSeconds = 0 }
+    }
+
+    # ---- the fixed text of every later section, named once and emitted from the same variable ---
+    # These are the lines the renderer WILL emit whatever the budget does, so their cost is known
+    # exactly. Emitting them from the same variables the ladder measures is what makes the reserve
+    # a measurement instead of the former "~80 / ~200, call it 400" estimate.
+    $staleHeadLine = "  [stale] — 直すか、スレッドを畳むか決めよ"
+    $escHeadLine   = "  [escalated] — 24h 以上経過"
+    $quarHeadLine  = "  [quarantined]"
+
+    $parkedHeadLines = @("", "判断待ち: $($HumanParked.Count) 件")
+    if ($HumanParked.Count -eq 0) { $parkedHeadLines += "  (該当なし)" }
+
+    # The count-line stays unconditional (PR-gate review round 2, 2026-08-30): the operator needs
+    # to see "取得失敗: N" even when the individual rows had to be dropped for budget.
+    $fetchErrHeadLines = @()
+    if ($ParkedPollErrors.Count -gt 0) {
+        $fetchErrHeadLines = @("  取得失敗: $($ParkedPollErrors.Count) 件（判断待ちに含まれていない可能性あり）")
+    }
+
+    $starvedHeadLines = @("", "飢餓 (24h 以上評価されていない): $($starvedList.Count) 件")
+    if ($starvedList.Count -eq 0) { $starvedHeadLines += "  (該当なし)" }
+
+    $footerLines = @(
+        ""
+        "(0 件でも送信しています — 通知チャネル自体の生存確認を兼ねます。"
+        " 人間がこのダイジェストを読まない状態はチャネル故障ではなく運用の放棄であり、機械では検知できません。)"
+    )
+
+    # ---- the reserve ladder ----------------------------------------------------------------------
+    # Read bottom-up. Each value is the exact number of characters the renderer will still emit
+    # after the named section, with every later row-emitting section reduced to its floor. Passed
+    # as -Reserve so a section physically cannot consume a later section's floor.
+    $reserveAfterStarved  = _LinesCost $footerLines
+    $reserveAfterFetchErr = (_LinesCost $starvedHeadLines) +
+                            (_SectionFloorCost -Entries $starvedList -Indent '  ') + $reserveAfterStarved
+    $reserveAfterParked   = (_LinesCost $fetchErrHeadLines) +
+                            (_SectionFloorCost -Entries $errorEntries -Indent '    ') + $reserveAfterFetchErr
+    $reserveAfterQuar     = (_LinesCost $parkedHeadLines) +
+                            (_SectionFloorCost -Entries $parkedEntries -Indent '  ') + $reserveAfterParked
+    $reserveAfterEsc      = $reserveAfterQuar
+    if ($quarantinedList.Count -gt 0) {
+        $reserveAfterEsc += (_LinesCost @($quarHeadLine)) + (_SectionFloorCost -Entries $quarantinedList -Indent '  ')
+    }
+    $reserveAfterStale    = $reserveAfterEsc
+    if ($escalatedList.Count -gt 0) {
+        $reserveAfterStale += (_LinesCost @($escHeadLine)) + (_SectionFloorCost -Entries $escalatedList -Indent '  ')
+    }
+
     $lines += "隔離中: $totalQ 件"
     if ($totalQ -eq 0) {
         $lines += "  (該当なし)"
     }
     else {
+        # Sections in order of urgency: stale (7d+) → escalated (24h+) → quarantined (fresh). The
+        # order was already this in the legacy renderer; the change is only that within each
+        # section, entries are oldest-first (see the sort step above). msg-2436 §4 item 3: the
+        # floor changes who is guaranteed a row, NOT who gets the surplus — the surplus is still
+        # handed out greedily in this same urgency order.
         if ($staleList.Count -gt 0) {
-            $lines += "  [stale] — 直すか、スレッドを畳むか決めよ"
-            $lines += $staleList
+            $lines += $staleHeadLine
+            $runLen = [ref]($lines -join "`n").Length
+            $result = _AddSectionEntries -Entries $staleList -MaxLen $Budget -Reserve $reserveAfterStale -RunningLen $runLen
+            $lines += $result.Emitted
+            $lines += _SectionOverflowLines -Result $result -Indent '  '
         }
         if ($escalatedList.Count -gt 0) {
-            $lines += "  [escalated] — 24h 以上経過"
-            $lines += $escalatedList
+            $lines += $escHeadLine
+            $runLen = [ref]($lines -join "`n").Length
+            $result = _AddSectionEntries -Entries $escalatedList -MaxLen $Budget -Reserve $reserveAfterEsc -RunningLen $runLen
+            $lines += $result.Emitted
+            $lines += _SectionOverflowLines -Result $result -Indent '  '
         }
         if ($quarantinedList.Count -gt 0) {
-            $lines += "  [quarantined]"
-            $lines += $quarantinedList
+            $lines += $quarHeadLine
+            $runLen = [ref]($lines -join "`n").Length
+            $result = _AddSectionEntries -Entries $quarantinedList -MaxLen $Budget -Reserve $reserveAfterQuar -RunningLen $runLen
+            $lines += $result.Emitted
+            $lines += _SectionOverflowLines -Result $result -Indent '  '
         }
     }
 
-    # 判断待ち — T-decision-request-composer S4 (msg-1370 §0 defect 2 / §4 / A-4; D-32 for the
-    # grammar-ownership rule). Emitted even at 0 件, mirroring the "silent day is the point"
-    # contract of 飢餓 (msg-814 §5). The count and the row order come from $HumanParked, which is
-    # itself the output of scripts/parked_humans.py — so this section restores fully from a wiped
-    # pending-decisions.json (A-14); the cache only enriches the row with the composer's question.
-    $lines += ""
-    $lines += "判断待ち: $($HumanParked.Count) 件"
-    if ($HumanParked.Count -eq 0) {
-        $lines += "  (該当なし)"
-    }
-    else {
-        foreach ($p in $HumanParked) {
-            $key = $p.key
-            $head = $p.head_msg_id
-            # Look up the composer question by (key, signature = "human:<head>"). Any other
-            # signature shape came from a different reason and does not match this row — the
-            # cache row is intentionally strict on signature equality (S2 A-3).
-            $sig = "human:$head"
-            $questionSnippet = $null
-            if ($PendingDecisionsState.ContainsKey($key)) {
-                $row = $PendingDecisionsState[$key]
-                if ($row -is [hashtable]) { $rowSig = $row['signature']; $env = $row['envelope'] }
-                else { $rowSig = $row.signature; $env = $row.envelope }
-                if ($rowSig -eq $sig -and $env) {
-                    $status = if ($env.PSObject.Properties.Name -contains 'composer_status') { $env.composer_status } else { $null }
-                    $output = if ($env.PSObject.Properties.Name -contains 'output') { $env.output } else { $null }
-                    if ($status -eq 'ok' -and $output) {
-                        $q = if ($output.PSObject.Properties.Name -contains 'question') { $output.question } else { $null }
-                        if ($q) {
-                            # One-line-per-row readability: cap at 80 chars, flatten any
-                            # embedded newlines, so a multi-line composed question cannot wrap
-                            # the digest layout.
-                            $flat = ($q -replace "`r?`n", ' ').Trim()
-                            if ($flat.Length -gt 80) { $flat = $flat.Substring(0, 79) + '…' }
-                            $questionSnippet = $flat
-                        }
-                    }
-                }
-            }
-            $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
-            $lines += "  $key   [$head]$suffix"
-        }
+    # 判断待ち — emitted even at 0 件, mirroring the "silent day is the point" contract of 飢餓
+    # (msg-814 §5). Rows were built above; only the emission happens here.
+    $lines += $parkedHeadLines
+    if ($HumanParked.Count -gt 0) {
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $parkedEntries -MaxLen $Budget -Reserve $reserveAfterParked -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
     # Fetch-error surface (I-2 "黙って劣化しない"). When scripts/parked_humans.py could not read
     # some threads' bodies, the section stays but the count above under-reports. Say so out loud.
+    #
+    # PR-gate review round 2 (2026-08-30): the per-row loop was unconditional, so a spike of ~20+
+    # fetch errors could push the total past $Budget and trigger the exact Discord 400 the D-1
+    # work exists to prevent. Route the row list through _AddSectionEntries so the same budget
+    # discipline that governs every other row-emitting section governs this one too.
     if ($ParkedPollErrors.Count -gt 0) {
-        $lines += "  取得失敗: $($ParkedPollErrors.Count) 件（判断待ちに含まれていない可能性あり）"
-        foreach ($e in $ParkedPollErrors) {
-            $tid = if ($e.PSObject.Properties.Name -contains 'thread_id') { $e.thread_id } else { $e['thread_id'] }
-            $reason = if ($e.PSObject.Properties.Name -contains 'reason') { $e.reason } else { $e['reason'] }
-            $lines += "    $tid — $reason"
-        }
+        $lines += $fetchErrHeadLines
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $errorEntries -MaxLen $Budget -Reserve $reserveAfterFetchErr -RunningLen $runLen -Indent '    '
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '    '
     }
 
-    $lines += ""
-    $lines += "飢餓 (24h 以上評価されていない): $($starvedList.Count) 件"
-    if ($starvedList.Count -eq 0) {
-        $lines += "  (該当なし)"
-    }
-    else {
-        $lines += $starvedList
+    $lines += $starvedHeadLines
+    if ($starvedList.Count -gt 0) {
+        # 飢餓 is the LAST list-emitting section, so only the footer is still to come — but it gets
+        # a floor like everyone else. Before F-1 this section was the second victim of the same
+        # defect: on 2026-09-03 it rendered 1 of 3 rows because 隔離 and 判断待ち had already run.
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $starvedList -MaxLen $Budget -Reserve $reserveAfterStarved -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
 
-    $lines += ""
-    $lines += "(0 件でも送信しています — 通知チャネル自体の生存確認を兼ねます。"
-    $lines += " 人間がこのダイジェストを読まない状態はチャネル故障ではなく運用の放棄であり、機械では検知できません。)"
+    $lines += $footerLines
     return ($lines -join "`n")
 }
 
@@ -971,6 +1650,47 @@ function Get-ConductorVerdict {
 $notifyWebhook = [Environment]::GetEnvironmentVariable('MINDWIRE_NOTIFY_DISCORD_WEBHOOK', 'User')
 $notifyProxy = if ($env:MINDWIRE_NOTIFY_PROXY) { $env:MINDWIRE_NOTIFY_PROXY } else { "http://127.0.0.1:3128" }
 
+# T-digest-exceeds-discord-limit-and-is-dropped D-5 (msg-2099): the CONSUMPTION contract for a
+# failure class is defined by this thread — the STATUS→CLASS mapping is not. That mapping's proper
+# home is T-gate-review-submit-failure-handling; while it lands, the inline switch below is the
+# provisional table with the caveat spelled out here so a reader knows to check the other thread
+# once it merges (and to update `provisional=$true` → `$false` in one place).
+#
+# Three classes are meaningful to the caller:
+#   - deterministic-payload: the request itself was rejected by the peer. Retrying with the SAME
+#     payload will fail the SAME way. Only path that can succeed is a SMALLER payload → degraded
+#     fallback (D-2). Digest cadence: mark last_sent_period so we do not spam, do NOT mark
+#     last_full_success_period so ⚠ stays lit.
+#   - deterministic-permanent: the webhook itself is gone (401/403/404). Retrying anything to this
+#     URL will fail the same way. Do NOT send a second POST (that is the whole point of "permanent").
+#     Digest cadence: mark last_sent_period (webhook-less days should not spam either).
+#   - transient: network flake, proxy hiccup, Discord outage, or a rate-limit. Retryable on the
+#     next tick. This is the ONLY class where digest cadence should hold its clock.
+#   - unknown: fail-safe = transient (D-5). If we cannot tell, assume it might resolve on retry.
+function Get-NotificationFailureClass {
+    param([int]$HttpStatus, [string]$ExceptionMessage)
+    # Payload-derived rejections. 400 is the exact failure msg-2013 measured 63 times in 3 days.
+    # 413 (Payload Too Large) is included even though Discord returns 400 for oversize `content` —
+    # some intermediaries (proxies, WAFs) translate one into the other, and both mean the same thing
+    # to the caller: sending SMALLER is the only way through.
+    if ($HttpStatus -eq 400 -or $HttpStatus -eq 413) { return 'deterministic-payload' }
+    # Webhook itself is gone. 401 (bad token) / 403 (forbidden) / 404 (webhook deleted from the
+    # Discord side) all mean "this URL will never accept your POST"; retrying with a smaller
+    # payload will not help, so degraded fallback is skipped.
+    if ($HttpStatus -eq 401 -or $HttpStatus -eq 403 -or $HttpStatus -eq 404) { return 'deterministic-permanent' }
+    # 429 is 4xx but transient — the whole point of the class is that its taxonomy is not "status
+    # code >= 400" but "same POST retries succeed". This is exactly why D-5 refuses to define the
+    # taxonomy inline: too many rules and only one place they can drift out of sync.
+    if ($HttpStatus -eq 429) { return 'transient' }
+    # 5xx: server-side, retryable.
+    if ($HttpStatus -ge 500 -and $HttpStatus -lt 600) { return 'transient' }
+    # No status code at all: network / DNS / proxy. Retryable.
+    if ($HttpStatus -eq 0) { return 'transient' }
+    # Unknown 4xx that wasn't caught above — safest default is transient (D-5, fail-safe = do the
+    # thing that already worked, per #138 round 2's rationale for the outage case).
+    return 'transient'
+}
+
 function Send-Notification {
     param([string]$Message)
 
@@ -982,7 +1702,7 @@ function Send-Notification {
         # a webhook-less run does not permanently flood the log with "sending daily digest" and
         # "notification skipped" every 5 minutes forever. (Tier B naysayer, PR #138 round 5.)
         Write-Log "notification skipped (MINDWIRE_NOTIFY_DISCORD_WEBHOOK not set)"
-        return 'skipped'
+        return @{ status = 'skipped'; class = 'no-webhook'; http_status = 0; error = $null }
     }
     try {
         $payload = @{ content = $Message } | ConvertTo-Json -Compress
@@ -993,19 +1713,25 @@ function Send-Notification {
         # First line only, so a multi-line digest does not spam the log with its own body.
         $firstLine = ($Message -split "`n", 2)[0]
         Write-Log "notification sent: $firstLine"
-        return 'sent'
+        return @{ status = 'sent'; class = 'ok'; http_status = 200; error = $null }
     }
     catch {
-        # 'failed' — webhook configured but the send failed (network, proxy, Discord outage). A
-        # retry on the next tick is the right response, so the digest gate does NOT advance its
-        # clock on this. Never fail the sweep because the notifier failed — the conductor's work
-        # already happened. Same redaction rule as before: scrub the webhook out of any exception
-        # text before it touches the log or a record. Quarantine records / digest lines / this log
-        # line all go through this branch, so no path that touches user data can leak the bearer
-        # secret.
+        # 'failed' — webhook configured but the send failed. NEVER fail the sweep because the
+        # notifier failed — the conductor's work already happened. Redaction: scrub the webhook
+        # out of any exception text before it touches the log or a record. Quarantine records /
+        # digest lines / this log line all go through this branch, so no path that touches user
+        # data can leak the bearer secret.
         $reason = "$($_.Exception.Message)".Replace($notifyWebhook, '<webhook-redacted>')
-        Write-Log "notification FAILED (non-fatal): $reason"
-        return 'failed'
+        # Extract the HTTP status from the exception if the response object survived. 0 = no status
+        # (network / DNS / proxy failure). See Get-NotificationFailureClass for the taxonomy.
+        $httpStatus = 0
+        $resp = $_.Exception.Response
+        if ($null -ne $resp) {
+            try { $httpStatus = [int]$resp.StatusCode } catch { $httpStatus = 0 }
+        }
+        $class = Get-NotificationFailureClass -HttpStatus $httpStatus -ExceptionMessage $reason
+        Write-Log "notification FAILED (non-fatal, class=$class, http=$httpStatus): $reason"
+        return @{ status = 'failed'; class = $class; http_status = $httpStatus; error = $reason }
     }
 }
 
@@ -1029,12 +1755,26 @@ function Send-NotificationIfChanged {
         Write-Log "notification suppressed (unchanged since last alert: $Key = $Signature)"
         return
     }
-    # $null = drops Send-Notification's status string so it does not leak into the pipeline of
-    # whatever call site invokes Send-NotificationIfChanged. The change record on the state map is
-    # intentional either way — a failed send does not undo the dedup, or a webhook outage would
-    # repeat every 5 minutes forever, retraining the channel into noise. A 'skipped' status (no
-    # webhook) is treated the same: mark the signature so we do not spam the log with skip
-    # messages on every re-attempt. (Endorsed by Tier B naysayer on round 2 of #138.)
+    # The dedup record is intentional on every outcome (sent / skipped / any failure class). A
+    # failed send does NOT undo the dedup, or a webhook outage would repeat every 5 minutes forever,
+    # retraining the channel into noise. A 'skipped' status (no webhook) is treated the same: mark
+    # the signature so we do not spam the log with skip messages on every re-attempt.
+    # (Endorsed by Tier B naysayer on round 2 of #138.)
+    #
+    # T-digest-exceeds-discord-limit-and-is-dropped: an earlier revision of this PR skipped
+    # recording on `deterministic-payload` (400/413) failures, chasing the letter of msg-2099 D-3.
+    # That was wrong and the PR-gate naysayer caught it (2026-08-30): the dedup MAP IS KEYED BY
+    # $Key (the thread id), not by $Signature. A DIFFERENT signature for the SAME key already
+    # bypasses the check naturally — `Test-NotificationSuppressed` returns false when the recorded
+    # $State[$Key] does not equal the new $Signature — so recording the failed signature never
+    # blocks a new-signature alert from firing. Skipping the record produced the exact spam loop
+    # this path exists to prevent: same alert, same signature, 400 every 5 minutes, forever.
+    #
+    # The msg-2013 §3(b) concern ("永久に失われる") that D-3 was addressing is already covered by
+    # msg-2099 D-4: the digest is a state sync and re-lists every currently-waiting thread daily,
+    # so a "lost" delta alert re-surfaces in the digest regardless of what notified.json records.
+    # ∴ ALWAYS record. D-3 is superseded on this specific point; the letter of D-3 predicted an
+    # asymmetry that the map-shape does not actually create. (msg-2013 → msg-2099 → PR-gate review.)
     $null = Send-Notification -Message $Message
     $State[$Key] = $Signature
 }
@@ -1071,16 +1811,26 @@ $DecisionMessageDiscordBudget = 1950
 # it in.
 $DecisionComposerTailLimit = 5
 
-# How long the wrapper waits for the CLI. 60s is generous for the stub (measured <1s) and gives S3's
-# LLM-backed composer a workable ceiling. On timeout the wrapper KILLS the process and returns $null
-# — I-2 says a stuck composer must never delay the raw ping.
+# How long the wrapper waits for the CLI. On timeout the wrapper KILLS the process and returns
+# $null — I-2 says a stuck composer must never delay the raw ping.
 #
-# D-45 (Tier-C msg §25.2): originally 30s. Raised to 60s after A-18 measured 33,812 ms end-to-end on
-# a live parked thread (tail 6 msgs / 21,026 chars). Composer failure fails-open through I-2, so the
-# ceiling only bounds how long the wrapper waits before falling back to the raw ping — measured
-# 8-11h human response latency dwarfs the extra 30s. The three sites (this constant, the Python
-# DEFAULT_TIMEOUT_SECONDS, and the CLI's --timeout-seconds default) MUST stay in sync.
-$DecisionComposerTimeoutSeconds = 60
+# D-57 (Tier-C, 2026-09-15) sets this by rule, not by argument: **the longest elapsed on record
+# for a run that SUCCEEDED, plus buffer**, revised upward whenever a longer successful run is
+# measured. 240s = the 153,183 ms A-19 rev2 v3 run + ~57%. A run that TIMED OUT never sets the
+# ceiling — it is not evidence about how long the work takes.
+#
+# Why the rule leans generous: this service has no users waiting on it. Too high costs a slower
+# fallback to the raw ping on a rare failure; too low costs the composed question on a perfectly
+# good run. Composer failure fails open through I-2 either way, and the measured 8-11h human
+# response latency dwarfs any value in this range.
+#
+# History: 30s -> 60s (D-45, after A-18 measured 33,812 ms) -> 240s. D-45 clause 4 told the
+# implementer to report rather than raise; that report was the v2 prompt producing
+# composer_status=timeout at 60s on a live thread, and D-57 is Tier-C's answer to it.
+#
+# The three sites (this constant, the Python DEFAULT_TIMEOUT_SECONDS, and the CLI's
+# --timeout-seconds default) MUST stay in sync.
+$DecisionComposerTimeoutSeconds = 240
 
 # The default composer backend when the env var is unset. S1/S2 ships 'stub'; S3 will ship
 # 'claude-code' and flip the default from a config change, not a code edit.
@@ -1260,6 +2010,7 @@ function Push-DecisionMaterial {
         [string]$Signature,
         [string]$Project,
         [string]$ThreadId,
+        [string]$StopReason,
         $Envelope
     )
 
@@ -1339,6 +2090,19 @@ function Push-DecisionMaterial {
         signature       = $Signature
         composer_status = 'ok'
     }
+    # Why the conductor stopped, as the bare StopReason token. magickit renders it on the
+    # やること board card so a Tier-C decision and a `round_cap` anomaly stop looking alike
+    # (magickit spec S5-decision-materials.md §1.1).
+    #
+    # It is also inside `$Signature` -- that string is "$reason:$last_msg" -- but the receiver
+    # is forbidden to parse that field ("Magickit は parse しない", same §1.1). Sending the
+    # reason as its own field is what lets the reader have it without reading our signature
+    # format, which we are free to respell.
+    #
+    # Guarded with IsNullOrEmpty, not `if ($StopReason)`: same PowerShell trap the question /
+    # recommendation lines below carry a comment about. No StopReason token is the string "0"
+    # today, but the guard costs nothing and the next one might be.
+    if (-not [string]::IsNullOrEmpty($StopReason)) { $body['stop_reason'] = "$StopReason" }
     # PR #171 pre-merge review round 2: the guard here must NOT use `if ($x)`. PowerShell
     # evaluates the string literal `"0"` as $false under implicit boolean cast, so a composer
     # output where `question` or `recommendation` or `recommendation_reason` equals "0"
@@ -1779,7 +2543,7 @@ function Send-HumanParkAlert {
     # STEP 2 (D-34: ①→②) — material PUT BEFORE the notification. Its failure is logged and
     # discarded; the notification body below does NOT branch on it.
     $null = Push-DecisionMaterial -NotifyState $NotifyState -Key $Key -Signature $Signature `
-        -Project $Project -ThreadId $ThreadId -Envelope $envelope
+        -Project $Project -ThreadId $ThreadId -StopReason $StopReason -Envelope $envelope
 
     $enriched = Format-DecisionMessage -Project $Project -ThreadId $ThreadId `
         -StopReason $StopReason -Rounds $Rounds `
@@ -1818,8 +2582,46 @@ function Get-SweepCandidates {
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
     $out = @()
     foreach ($c in @($raw.candidates)) {
+        # Reject `$null`, `""`, AND whitespace-only strings uniformly and loudly. PowerShell's `-not`
+        # operator handles the first two but treats `" "` as truthy, which would silently pass a bad
+        # value downstream. `IsNullOrWhiteSpace` closes that hole here — at the single validation
+        # point — so every consumer of a candidate can trust that all three required fields are
+        # non-blank. This is the load-bearing check for the CWD-probing attack path the T-new-
+        # project-gate-bootstrap PR-gate identified on PR #192: an empty/whitespace `repo_dir` that
+        # reached `gate_bootstrap_tick.py` would resolve `Path("") / ".mindwire-gate"` against the
+        # sweep's CWD (this MindWire host repo) and falsely report `DECLARED`. The Python side of
+        # the same defence lives in `inspect_gate`, which returns `UNUSABLE` for a non-absolute
+        # `repo_dir` regardless of caller — but this upstream check is what makes the failure mode
+        # uniform: a broken sweep config halts the sweep, it does not silently skip candidates.
         foreach ($f in 'project', 'thread_id', 'repo_dir') {
-            if (-not $c.$f) { throw "sweep config entry missing '$f': $($c | ConvertTo-Json -Compress)" }
+            if ([string]::IsNullOrWhiteSpace([string]$c.$f)) {
+                throw "sweep config entry missing or blank '$f': $($c | ConvertTo-Json -Compress)"
+            }
+        }
+        # `repo_dir` MUST be an absolute path — this is the contract documented in
+        # `deploy/sweep.json.example` ("repo_dir is the implementer's own CLONE for that project").
+        # A relative value like `"some/relative/path"` would pass the blank check above and reach
+        # `gate_bootstrap_tick.py`, where `inspect_gate` correctly returns `UNUSABLE` — but a
+        # UNUSABLE verdict is a silent SKIP of that candidate, not a loud halt. The T-new-project-
+        # gate-bootstrap PR-gate identified this asymmetry: if the goal is uniform failure modes,
+        # the PowerShell side must enforce the same absolute-path contract the Python side does,
+        # so a broken config `throw`s from `Get-SweepCandidates` instead of quietly disappearing
+        # into the fail-closed Python branch.
+        #
+        # `IsPathFullyQualified` is the correct predicate here (not `IsPathRooted`, which the
+        # earlier revision used): `IsPathRooted` returns `$true` for drive-relative paths like
+        # `C:foo` (drive but no root) and root-relative paths like `\foo` (root but no drive),
+        # both of which Python's `pathlib.PureWindowsPath.is_absolute()` correctly rejects.
+        # Managing the same "must be absolute" rule with two different definitions is exactly the
+        # dual-management asymmetry the PR-gate flagged (2026-08-29 review #3). Empirically
+        # verified on pwsh 7 / .NET on the daemon host: `IsPathFullyQualified` returns `False`
+        # for `'C:foo'`, `'\relative\path'`, `''`, `' '`, `'./relative'` — matching Python
+        # `PureWindowsPath.is_absolute()` for each. The shebang (`#!/usr/bin/env pwsh`) and the
+        # Task Scheduler invocation both pin PowerShell 7+, where `IsPathFullyQualified` is
+        # available (added in .NET Core 2.1).
+        if (-not [System.IO.Path]::IsPathFullyQualified([string]$c.repo_dir)) {
+            throw ("sweep config entry has non-absolute 'repo_dir': $($c | ConvertTo-Json -Compress) " +
+                   "— use a fully-qualified absolute path (see deploy/sweep.json.example).")
         }
         $out += [pscustomobject]@{
             project   = $c.project
@@ -2047,6 +2849,135 @@ function Invoke-ControlProbe {
     }
 }
 
+# --- predicted-resource probe (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) -----
+# For a batch of distinct `repo_dir` values, invoke the Python resolver and return
+#   @{ <repo_dir> = @{ predicted_resource = <string or empty>; reason = <string or empty> } }
+# or $null when the probe could not run at all (interpreter missing, script crashed, output not
+# parseable as JSON). $null means UNKNOWN — the caller must treat it as fail-open (Test-HoldForCandidate
+# does: any missing input yields $false = do not add a resource-hold on top of project-hold).
+#
+# The whole point of shelling out is to keep the D-KEY-1 normalisation in ONE language (Python) —
+# managing the same graph traversal and URL parsing in PowerShell would be textbook Principle 2
+# dual-management (E-53 in the specifying thread). The wrapper's job here is transport, not logic:
+# feed the CLI a JSON list on stdin, read the JSON list back on stdout.
+#
+# Fail-open per D-KEY-4c(2). The CLI itself represents per-repo_dir resolution failures in its
+# per-row `reason` field with a `resource: null` — it does NOT return non-zero on those, so the
+# batch as a whole is usually usable even when one entry inside failed. This function only returns
+# $null when the WHOLE call fails (systemic failure of the probe machinery itself).
+function Invoke-PredictedResourceProbe {
+    param([string[]]$RepoDirs)
+
+    if ($null -eq $RepoDirs -or $RepoDirs.Count -eq 0) { return @{} }
+
+    $probe = Join-Path $repoRoot "scripts\resolve_resource.py"
+    if (-not (Test-Path -LiteralPath $probe)) {
+        Write-Log "predicted-resource probe not found at $probe — failing open (resource-axis HOLD gate disabled)"
+        return $null
+    }
+
+    # Compact JSON with `Depth 3` is enough for `{ "repo_dirs": [str, ...] }` and keeps the
+    # single-line stdin small so we can see it in a log if we need to.
+    $payload = @{ repo_dirs = $RepoDirs } | ConvertTo-Json -Depth 3 -Compress
+
+    try {
+        Push-Location $repoRoot
+        try {
+            $raw = $payload | & uv run python $probe --stdin-json 2>&1
+            $code = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+
+        if ($code -ne 0) {
+            Write-Log "predicted-resource probe exited $code — failing open. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
+            return $null
+        }
+        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        if (-not $json) {
+            Write-Log "predicted-resource probe produced no JSON — failing open"
+            return $null
+        }
+        $obj = $json | ConvertFrom-Json
+    }
+    catch {
+        Write-Log "predicted-resource probe failed ($($_.Exception.Message)) — failing open"
+        return $null
+    }
+
+    $map = @{}
+    if ($null -eq $obj.resolutions) {
+        Write-Log "predicted-resource probe returned no 'resolutions' array — failing open"
+        return $null
+    }
+    foreach ($row in @($obj.resolutions)) {
+        $rd = [string]$row.repo_dir
+        if ([string]::IsNullOrWhiteSpace($rd)) { continue }
+        $entry = @{
+            predicted_resource = if ($null -eq $row.resource) { '' } else { [string]$row.resource }
+            reason             = if ($null -eq $row.reason)   { '' } else { [string]$row.reason }
+        }
+        $map[$rd] = $entry
+    }
+    return $map
+}
+
+# --- sweep.json owner_map reader (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) --
+# Returns @{ <predicted_resource> = <owning_project> } from sweep.json's top-level `owner_map`
+# field, or @{} when the file has no such field. Missing = OFF (fully backward compatible):
+# without an owner_map, `Test-HoldForCandidate` never returns $true and the gate reverts to the
+# pre-change behaviour.
+#
+# `owner_map` is the ONE thing that MUST be declared (D-KEY-3b): the resource → owning-project
+# mapping is a chatroom-side operational fact that no observation of the repo itself can reveal
+# (which chatroom project "owns" a repo, in the sense of "when this project is HELD, that repo
+# should stop", is a policy call not a fact of the filesystem). `repo_dir → resource` is
+# deliberately NOT stored here — it is observed at tick prep time from the checkout's `origin`
+# via D-KEY-1 (`Invoke-PredictedResourceProbe`). Storing it as a declaration would be the same
+# `T-mindwire-checkout-pair-drifts-with-no-detector` bug shape the specifying thread's §2 (a)
+# rejected — a writable copy of a value the system can read authoritatively silently reverses
+# meaning the moment they disagree.
+#
+# Loud on inconsistency: an owner_map value that names a project no candidate references gets a
+# WARN log line at tick prep time (typo in the map, or a project retired from the sweep). It
+# does NOT fail closed: the extra key is harmless, and being loud about it beats blocking every
+# tick over an operator's leftover row.
+function Get-SweepOwnerMap {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        # `Get-SweepCandidates` already threw on the same file; a duplicate throw here would
+        # only add noise, so return an empty map and let the earlier throw be the one that
+        # halts the tick.
+        return @{}
+    }
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+    $map = @{}
+    if ($null -eq $raw.owner_map) { return $map }
+    # Type check the top-level shape BEFORE iterating properties. `ConvertFrom-Json` yields
+    # `[PSCustomObject]` for JSON objects, `[string]` for strings, `[object[]]` for arrays.
+    # Iterating `.PSObject.Properties` on any non-object silently walks the .NET reflection
+    # surface — an array would yield `Length=2`, a string would yield `Length=8` and
+    # `Chars`, both passing the `IsNullOrWhiteSpace` guard below and populating the map with
+    # garbage. Fail LOUDLY here on a malformed shape instead (naysayer PR #252 objection 4).
+    if ($raw.owner_map -isnot [System.Management.Automation.PSCustomObject]) {
+        throw ("sweep.json 'owner_map' must be a JSON object (mapping predicted resource -> " +
+               "owning project); found $($raw.owner_map.GetType().Name) in $Path. " +
+               "Refusing to iterate — a string or array would silently walk .NET reflection " +
+               "properties and produce garbage entries.")
+    }
+    foreach ($p in $raw.owner_map.PSObject.Properties) {
+        $key = [string]$p.Name
+        $val = [string]$p.Value
+        if ([string]::IsNullOrWhiteSpace($key) -or [string]::IsNullOrWhiteSpace($val)) {
+            throw ("sweep.json owner_map has a blank key or value: '$key' => '$val' (in $Path). " +
+                   "Owner_map keys are predicted resource identities (<host>/<org>/<repo>) and " +
+                   "values are chatroom project names — both must be non-blank.")
+        }
+        $map[$key] = $val
+    }
+    return $map
+}
+
 # --- deploy probe ---------------------------------------------------------------------------------
 # Fast-forwards this checkout to origin/main before the tick decides anything. Returns the parsed
 # verdict from deploy/sync-repo.ps1, or $null when it could not be run at all.
@@ -2074,6 +3005,58 @@ function Invoke-RepoSync {
     }
     catch {
         Write-Log "repo sync failed ($($_.Exception.Message)) — running whatever code is checked out"
+        return $null
+    }
+}
+
+# --- gate-bootstrap tick -------------------------------------------------------------------------
+# For each distinct (project, repo_dir) in the sweep list, delegate to
+# scripts/gate_bootstrap_tick.py — the LLM-free predicate that opens
+# `T-gate-bootstrap-<project>` idempotently when `.mindwire-gate` is not declared,
+# and takes it back down (also idempotently) once it is.
+#
+# The full design lives in the chatroom thread `T-new-project-gate-bootstrap`
+# (msg-1962 request; msg-1963/1965/1967 design; msg-1964/1966/1968 naysayer);
+# see the module docstring on `src/spirrow_mindwire/gate_bootstrap.py` for the
+# summary.
+#
+# Fail-open on the SWEEP. A broken gate-bootstrap tick MUST NOT stop the main sweep — the
+# alert-opener is a nice-to-have; the sweep itself is load-bearing. Non-zero exits from the
+# probe are logged and the loop moves on. This matches Invoke-ControlProbe's fail-open contract
+# for the same reason: the main sweep is what actually runs conductors.
+function Invoke-GateBootstrapTick {
+    param([string]$Project, [string]$RepoDir)
+
+    $probe = Join-Path $repoRoot "scripts\gate_bootstrap_tick.py"
+    if (-not (Test-Path -LiteralPath $probe)) {
+        Write-Log "gate-bootstrap probe not found at $probe — skipping (alert-opener is best-effort)"
+        return $null
+    }
+    try {
+        Push-Location $repoRoot
+        try {
+            $raw = & uv run python $probe --project $Project --repo-dir $RepoDir 2>&1
+            $code = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+
+        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        if (-not $json) {
+            Write-Log "gate-bootstrap [$Project]: no JSON on stdout (exit=$code) — failing open"
+            return $null
+        }
+        $obj = $json | ConvertFrom-Json
+        if ($code -ne 0) {
+            # Non-zero is a magickit failure (open / close). Log the reason; the next tick retries.
+            Write-Log "gate-bootstrap [$Project]: status=$($obj.status) action=$($obj.action) error=$($obj.error)"
+        }
+        else {
+            Write-Log "gate-bootstrap [$Project]: status=$($obj.status) action=$($obj.action) reason=$($obj.reason)"
+        }
+        return $obj
+    }
+    catch {
+        Write-Log "gate-bootstrap [$Project] failed ($($_.Exception.Message)) — sweep continues (fail-open)"
         return $null
     }
 }
@@ -2132,6 +3115,32 @@ try {
     $candidates = Get-SweepCandidates -Path $sweepConfigPath
     Write-Log "sweep list ($($candidates.Count) candidates from $sweepConfigPath): $(($candidates | ForEach-Object { $_.key }) -join ', ')"
 
+    # Gate-bootstrap tick, once per distinct (project, repo_dir). Runs BEFORE the main sweep so the
+    # alert thread is open by the time the first candidate on a fresh project actually gets picked up.
+    # Fail-open by design (Invoke-GateBootstrapTick swallows every kind of local failure and returns
+    # $null): a broken alert-opener must not stop the main sweep, which is what actually runs conductors.
+    #
+    # `repo_dir` is guaranteed non-blank AND fully-qualified absolute here because
+    # `Get-SweepCandidates` validates every required field with `IsNullOrWhiteSpace` and then
+    # applies `IsPathFullyQualified` to `repo_dir` specifically — both `throw` loudly on the first
+    # offender. That is the single validation point for sweep-config well-formedness; do NOT add a
+    # silent `continue` here to tolerate what should have been rejected upstream — a broken config
+    # must halt the sweep, not cause candidates to vanish without a log line. The PowerShell
+    # `IsPathFullyQualified` and Python `PureWindowsPath.is_absolute()` predicates were verified
+    # to agree on the same set of accepted paths, so a sweep-driven caller cannot reach Python's
+    # fail-closed `UNUSABLE` branch — that branch is now only reachable by non-sweep callers (test
+    # harness, ad-hoc CLI use), which is what the Python-side defence is for.
+    $gateBootstrapPairs = @{}
+    foreach ($c in $candidates) {
+        $pairKey = "$($c.project)::$($c.repo_dir)"
+        if (-not $gateBootstrapPairs.ContainsKey($pairKey)) {
+            $gateBootstrapPairs[$pairKey] = @{ project = $c.project; repo_dir = $c.repo_dir }
+        }
+    }
+    foreach ($pair in $gateBootstrapPairs.Values) {
+        [void](Invoke-GateBootstrapTick -Project $pair.project -RepoDir $pair.repo_dir)
+    }
+
     # One probe per distinct project, not per candidate — the probe returns every thread of a project
     # in a single call, so N candidates in one project still cost one call.
     $headsByProject = @{}
@@ -2149,6 +3158,53 @@ try {
         $h = Invoke-HeadProbe -Project $proj
         $headsByProject[$proj] = $h
         if ($null -ne $h) { Write-Log "head probe [$proj]: $($h.Count) threads reported" }
+    }
+
+    # --- resource-axis HOLD: one probe per DISTINCT repo_dir (§5a v2, D-KEY-4c) ----------------
+    # Batch the resolver call once per tick. The distinct repo_dir set is small (7 today per
+    # msg-2871), so this is bounded work; even in the worst case where every candidate has a
+    # distinct clone, the CLI reads stdin once and answers once.
+    #
+    # Fail-open (D-KEY-4c(2)): a $null return, an empty owner_map, or an unresolved entry all
+    # cause `Test-HoldForCandidate` to return $false — the candidate then falls through to the
+    # existing project-only HOLD check, which is today's behaviour.
+    #
+    # Runs AFTER the control loop so we already know which projects the control probe reported
+    # HELD; the resource-axis gate composes with those verdicts inside Test-HoldForCandidate.
+    $distinctRepoDirs = @($candidates | ForEach-Object { $_.repo_dir } | Sort-Object -Unique)
+    $predictedResourceByRepoDir = Invoke-PredictedResourceProbe -RepoDirs $distinctRepoDirs
+    $sweepOwnerMap = Get-SweepOwnerMap -Path $sweepConfigPath
+
+    if ($null -eq $predictedResourceByRepoDir) {
+        Write-Log "resource-axis HOLD gate disabled this tick (probe failed) — project-axis only"
+    }
+    else {
+        # Emit the observed resource for each repo_dir so the operator can copy it into
+        # `sweep.json` owner_map without re-typing. Also emit each entry's reason on failure
+        # (D-KEY-4c(4) requires the derivation chain be diagnosable).
+        foreach ($rd in ($predictedResourceByRepoDir.Keys | Sort-Object)) {
+            $entry = $predictedResourceByRepoDir[$rd]
+            if ([string]::IsNullOrWhiteSpace($entry.predicted_resource)) {
+                Write-Log "predicted resource [$rd]: UNRESOLVED — $($entry.reason)"
+            }
+            else {
+                Write-Log "predicted resource [$rd]: $($entry.predicted_resource)"
+            }
+        }
+        # Loudly report owner_map entries that match no observed resource (typo, or a repo
+        # the sweep no longer touches). Loud, not fatal — the operator sees it, the sweep runs.
+        $observedResources = @{}
+        foreach ($e in $predictedResourceByRepoDir.Values) {
+            if (-not [string]::IsNullOrWhiteSpace($e.predicted_resource)) {
+                $observedResources[$e.predicted_resource] = $true
+            }
+        }
+        foreach ($k in @($sweepOwnerMap.Keys)) {
+            if (-not $observedResources.ContainsKey($k)) {
+                Write-Log ("WARN sweep.json owner_map entry '$k' matches no observed resource this tick " +
+                           "(typo? project retired from sweep?)")
+            }
+        }
     }
     $quarantineState = Get-JsonState -Path $quarantineStatePath
     $evaluatedState = Get-JsonState -Path $evaluatedStatePath
@@ -2316,6 +3372,25 @@ try {
             $held++
             $dispositions[$cand.key] = 'held'
             Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — project HELD (desired=hold, loop observed hold), not launching"
+            continue
+        }
+
+        # Resource-axis HOLD (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2):
+        # if the candidate writes to a repo that some OTHER project's HOLD covers, HOLD this
+        # one too — this is what the operator meant when they set a HOLD on the repo's owning
+        # project. Additive over the per-project check above: false-positives here become a
+        # diagnosable stall (the derivation chain is logged), false-negatives degrade to today.
+        # Fail-open on every arm; see Test-HoldForCandidate and Invoke-PredictedResourceProbe.
+        if (Test-HoldForCandidate -Candidate $cand `
+                -PredictedResourceByRepoDir $predictedResourceByRepoDir `
+                -OwnerMap $sweepOwnerMap -ControlByProject $controlByProject) {
+            $held++
+            $dispositions[$cand.key] = 'held'
+            $predicted = $predictedResourceByRepoDir[$cand.repo_dir].predicted_resource
+            $ownerProject = $sweepOwnerMap[$predicted]
+            Write-Log ("candidate $attempt/$($candidates.Count): $($cand.key) — resource HELD via " +
+                       "repo_dir=$($cand.repo_dir) -> predicted_resource=$predicted -> owning_project=$ownerProject " +
+                       "(that project's desired=hold, loop observed hold), not launching")
             continue
         }
 
@@ -2514,10 +3589,22 @@ try {
                 $tail = $output[($output.Count - $take)..($output.Count - 1)]
             }
             $nowIso = $nowUtc.ToString("o")
+            # T-stalled-pr-has-no-detector Deliverable 6: extract failure_class from the
+            # tail BEFORE constructing the record so it lands as a first-class field.
+            # Get-FailureClass never raises — a broken subprocess still yields 'unknown'
+            # — so this call cannot be the reason a quarantine is silently skipped.
+            #
+            # ``-RepoRoot $repoRoot`` is passed explicitly (the function's default already
+            # resolves to the same value via ``Split-Path -Parent $PSScriptRoot``) so the
+            # call site names the CWD contract instead of relying on lexical implication —
+            # msg-2601 §2 counts a "receiver exists but no one supplies it" as the same
+            # bug family the ledger was built to catch (row 6: ``$RepoRoot`` — 受け口はあるが誰も読まない).
+            $failureClass = Get-FailureClass -SessionLogTail $tail -RepoRoot $repoRoot
             $rec = New-QuarantineRecord `
                 -FirstFailureAt $nowIso -ExitCode $code -StopReason $verdict.reason `
                 -FailureHead $probeHead -FailureControl $currentControl `
-                -SessionLogPath $logPath -SessionLogTail $tail
+                -SessionLogPath $logPath -SessionLogTail $tail `
+                -FailureClass $failureClass
             $quarantineState[$cand.key] = $rec
             $newlyQuarantined++
             Write-Log "quarantined $($cand.key): exit=$code reason=$($verdict.reason) — sweep CONTINUES (signal is the notification, not the stop)"
@@ -2575,6 +3662,17 @@ try {
         # candidate we did not act on would reproduce the exponential-starvation loop #140 was
         # written to fix. See head_skip_decide.py's docstring for the two-phase protocol.
         $sweepSignature += "$($cand.key)=$($verdict.last_msg)"
+
+        # Design §6.2: record (or clear) this thread's terminal stop. A `no_progress_to_human`
+        # or `self_handoff_to_human` run parks the thread until its head moves — head_skip's
+        # Stage 1b then SKIPs it instead of DEFERring, which is what ends the 72-retry spin
+        # measured on T-human-outage-degrade-close-only. Every other reason clears the state.
+        $terminalResult = Invoke-HeadSkipCommitTerminal -ThreadId $thread `
+            -StopReason $verdict.reason -HeadMsgId $verdict.last_msg `
+            -StateFilePath $headSkipStatePath
+        if (-not $terminalResult.ok) {
+            Write-Log "head_skip commit-terminal FAILED for $($cand.key) — $($terminalResult.error) (sweep CONTINUES: the thread stays on the ordinary backoff)"
+        }
 
         if ($verdict.reason -and $needsHuman.ContainsKey($verdict.reason)) {
             # Signature carries the reason too, so a thread that changes *how* it is stuck re-alerts
@@ -2679,48 +3777,131 @@ try {
 
     # Daily digest. Sent even when both quarantine and starvation lists are empty (spec/msg-814 §5).
     # A silent day IS the point: "no alert" then still means "the channel is alive," which is what
-    # the 5h failure specifically lacked. Attempted at most once per $DailyDigestInterval.
+    # the 5h failure specifically lacked.
     #
-    # The clock advances on 'sent' AND 'skipped' — both are terminal outcomes: 'sent' means the
-    # notification landed, 'skipped' means the operator has no webhook configured, and neither
-    # merits a 5-minute retry. Only 'failed' (webhook configured but the POST failed — network,
-    # proxy, Discord outage) holds the clock back for retry.
+    # T-digest-exceeds-discord-limit-and-is-dropped (msg-2099 through msg-2106): cadence is
+    # PERIOD-gated, not interval-gated. Two predicates must both hold:
+    #   (a) $currentPeriod ≠ $digestState['last_sent_period'] — the digest has not landed today yet
+    #   (b) local wall clock ≥ $DailyDigestDeliveryTime — the operator's delivery time has arrived
     #
-    # Also gated on $notifyWebhook up front: without a webhook, computing the digest, calling
-    # Confirm-LogWorthKeeping (which promotes the buffered log to disk), and writing the "sending
-    # daily digest" line every 5 minutes for the life of the daemon is nothing but log spam. It
-    # violates the whole point of Write-QuietSummary. So when there is no webhook, the whole block
-    # is silent — the clock still advances so we do not loop, but nothing is computed, logged, or
-    # persisted for a channel nobody is listening to. (Tier B naysayer, PR #138 round 5.)
-    $lastDigestAt = $null
-    if ($digestState.ContainsKey('last_sent_at') -and $digestState['last_sent_at']) {
-        try { $lastDigestAt = (ConvertTo-UtcInstant $digestState['last_sent_at']) } catch { }
+    # Why period + delivery-time instead of "24h since last send" (msg-2106 §4):
+    #   * "24h since last send" drifts forward a few minutes per day (any tick jitter, any run-time
+    #     variance). Weeks later the send has walked into 3am, defeating the point of a phone
+    #     notification.
+    #   * "24h since last send" also double-sends around a period boundary: 23:58 send → 00:03 tick
+    #     is still <24h from delivery time, but "period ≠ last_sent_period AND local ≥ delivery"
+    #     correctly refuses to re-send.
+    # Period + delivery-time drops both by CONSTRUCTION — no jitter constant, no drift math.
+    #
+    # Webhook-less runs (msg-2106 D-3 preservation of #138 R5): still advance last_sent_period so
+    # the loop does not re-enter this branch every 5 minutes. But `last_full_success_period` is NOT
+    # advanced — a channel that does not exist has not been informed, and the ⚠ predicate is
+    # deliberately blind to whether the reason is "no webhook" or "webhook 400s" (both mean the
+    # human has not gotten the digest).
+    $currentPeriod = Get-DigestPeriod -Now $nowUtc
+    $lastSentPeriod = $null
+    if ($digestState.ContainsKey('last_sent_period') -and $digestState['last_sent_period']) {
+        $lastSentPeriod = [string]$digestState['last_sent_period']
     }
-    $digestDue = ($null -eq $lastDigestAt) -or (($nowUtc - $lastDigestAt) -ge $DailyDigestInterval)
+    $deliveryDue = Test-DigestDeliveryDue -Now $nowUtc -DeliveryTime $DailyDigestDeliveryTime
+    $digestDue = ($lastSentPeriod -ne $currentPeriod) -and $deliveryDue
     if ($digestDue) {
+        # Load notify-health for ⚠ derivation (D-6). Missing file = empty hashtable (state files
+        # are corrupt-tolerant per Get-JsonState). Never fails the sweep on health-file trouble.
+        $notifyHealth = Get-JsonState -Path $notifyHealthPath
+        if ($null -eq $notifyHealth) { $notifyHealth = @{} }
         if (-not $notifyWebhook) {
             # No point building or logging a digest for a channel that does not exist. Advance the
-            # clock silently so we do not re-enter this branch until the next full interval.
-            $digestState['last_sent_at'] = $nowUtc.ToString("o")
+            # sent-period so we do not re-enter this branch until tomorrow, but leave
+            # last_full_success_period alone: a webhook-less day is not a healthy day for the
+            # human-consumer perspective. When the operator eventually wires a webhook, the ⚠ shows
+            # correctly how many days went unreported.
+            $digestState['last_sent_period'] = $currentPeriod
             Save-JsonState -Path $digestStatePath -State $digestState
         }
         else {
+            $healthWarning = Get-DigestHealthWarning -Health $notifyHealth -CurrentPeriod $currentPeriod
             $digest = New-DailyDigest -QuarantineState $quarantineState `
                 -EvaluatedState $evaluatedState `
                 -HeadsByProject $headsByProject -ControlByProject $controlByProject -Now $nowUtc `
                 -LiveKeys $liveKeys `
                 -HumanParked $humanParked -PendingDecisionsState $pendingDecisionsState `
-                -ParkedPollErrors $parkedPollErrors
+                -ParkedPollErrors $parkedPollErrors `
+                -Budget $DigestBudget `
+                -HealthWarning $healthWarning
             Confirm-LogWorthKeeping
-            Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved)"
+            Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest
-            # See Test-DigestClockAdvances for the terminal-outcomes contract. 'skipped' here
-            # would be from a webhook that was set at $digestDue evaluation but has since been
-            # unset — very narrow race, but the same reasoning still holds.
-            if (Test-DigestClockAdvances -Result $result) {
-                $digestState['last_sent_at'] = $nowUtc.ToString("o")
+
+            # The lower bound the ⚠ predicate needs in order to distinguish "never succeeded" from
+            # "first run" (Einstein msg-2396 E-4 / Bohr msg-2401 §5). Period-typed, so D-6's
+            # predicate discipline still holds on the read side; write-once, so it records the FIRST
+            # attempt and not the latest. Unconditional: evaluated on every attempt whatever the
+            # outcome turned out to be — unlike last_full_success_period below, which is gated on a
+            # full success. What carries that is NOT statement order, so the durability boundary is
+            # stated here rather than implied: this field and the rest of the record reach disk
+            # through the single Save-JsonState at the end of this branch, and Send-Notification
+            # does not rethrow — its catch converts the failure into a result hashtable ("NEVER
+            # fail the sweep because the notifier failed"), and all it runs before that try is a
+            # webhook-presence test plus Confirm-LogWorthKeeping, which the Write-Log above has
+            # already committed so it returns immediately. So a failing attempt still runs this
+            # block down to that save. Moving the assignment above the send would change nothing
+            # about what survives a crash, while implying a crash-ordering guarantee the single
+            # save does not give; PR #215 gate round 1 asked for that move, Bohr msg-2418 §2
+            # refuted it on those two facts.
+            if (-not $notifyHealth.ContainsKey('first_attempt_period') -or -not $notifyHealth['first_attempt_period']) {
+                $notifyHealth['first_attempt_period'] = $currentPeriod
+            }
+            # Diagnostic fields (D-6 predicate discipline: recorded but NEVER consulted by the ⚠
+            # predicate). Written on every attempt regardless of outcome.
+            $notifyHealth['last_attempt_at'] = $nowUtc.ToString("o")
+            if ($result -is [hashtable]) {
+                $notifyHealth['last_error'] = $result['error']
+                $notifyHealth['last_error_class'] = $result['class']
+            }
+
+            # T-digest-exceeds-discord-limit-and-is-dropped D-2 (msg-2099): on a
+            # deterministic-payload rejection, immediately try a fixed-length degraded message.
+            # NOT on deterministic-permanent (401/403/404 → the webhook is dead, a second POST
+            # will fail the same way — Test-DigestDelivered still advances cadence, no spam) and
+            # NOT on transient (429/5xx/network → the retry belongs to the next tick).
+            #
+            # Whatever the degraded attempt returns, its ACTUAL outcome must drive the cadence
+            # decision — PR-gate review round 2 (2026-08-30) caught the earlier version dropping
+            # the degraded's failure CLASS: if degraded also failed but transiently (503, network
+            # flake), the earlier code preserved the ORIGINAL `deterministic-payload` result,
+            # which Test-DigestDelivered treats as non-retryable, silently advancing cadence and
+            # abandoning what was actually a retryable delivery. Now the whole `$result` is
+            # replaced by the degraded's real return, with only the success case renamed to
+            # `degraded/ok` so Test-DigestFullSuccess stays false (the human was not told the
+            # queue contents).
+            if ($result -is [hashtable] -and $result['status'] -eq 'failed' -and $result['class'] -eq 'deterministic-payload') {
+                $degradedMessage = New-DegradedDigestMessage `
+                    -WaitingCount ($humanParked.Count + $quarantineState.Count) `
+                    -CurrentPeriod $currentPeriod
+                Write-Log "digest full payload rejected (400/413) — attempting degraded fallback ($($degradedMessage.Length) chars)"
+                $degradedResult = Send-Notification -Message $degradedMessage
+                # Combine into the single result that drives cadence/health decisions below.
+                # See Resolve-DigestSendResult's docstring for the four combinations.
+                $result = Resolve-DigestSendResult -FullResult $result -DegradedResult $degradedResult
+            }
+
+            # Cadence advance: any DELIVERED outcome (sent full, sent degraded, skipped-no-webhook)
+            # OR any non-retryable failure (deterministic-permanent when the webhook is dead;
+            # deterministic-payload when even the degraded fallback failed) closes the period.
+            # ONLY a transient failure holds the clock so the NEXT tick retries. See
+            # Test-DigestDelivered's docstring for the full table.
+            if (Test-DigestDelivered -Result $result) {
+                $digestState['last_sent_period'] = $currentPeriod
                 Save-JsonState -Path $digestStatePath -State $digestState
             }
+            # ⚠ advance: only a FULL success (status=sent, class=ok) clears the ⚠. A degraded
+            # delivery satisfies cadence but not health — the operator was NOT told the queue
+            # contents, so ⚠ must stay lit until a full digest lands.
+            if (Test-DigestFullSuccess -Result $result) {
+                $notifyHealth['last_full_success_period'] = $currentPeriod
+            }
+            Save-JsonState -Path $notifyHealthPath -State $notifyHealth
         }
     }
 

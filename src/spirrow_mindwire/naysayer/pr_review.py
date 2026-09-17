@@ -43,9 +43,10 @@ GitHub submission never depend on pass 2 succeeding.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -53,6 +54,7 @@ from typing import Any
 from ..github.client import (
     CiState,
     CiStatus,
+    CrossPrApproveCoverage,
     EnvironmentTerminalError,
     GitHubClient,
     GitHubHTTPError,
@@ -87,9 +89,15 @@ from .pr_review_adr_pointers import (
     build_pr_review_pass2_messages,
     load_manifest_ids,
     select_adr_pointers,
+    strip_wrapping_fences,
     unavailable_log_line,
 )
-from .principles import NAYSAYER_MODEL_TIER, principles_version
+from .principles import (
+    NAYSAYER_MODEL_TIER,
+    PrinciplesError,
+    objection_classes,
+    principles_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +112,9 @@ _DEFAULT_MAX_TOKENS = 32000
 # M3 (T34): the CLIENT timeout must be backend + margin so the client always outlives the backend:
 # the backend therefore surfaces its result (completion / partial / error) as the response, and we
 # never time out *before* it does (the old equal-900s tie could lose that race, producing a
-# client-side TimeoutException with no backend answer). On a genuine timeout the driver degrades to
-# a fail-closed REQUEST_CHANGES (M2), so the margin is about *who reports the timeout*, not safety.
+# client-side TimeoutException with no backend answer). On a genuine timeout the driver degrades
+# to a COMMENT-hold addressed to the human (T-infra-failure-posts-empty-rc, see
+# :meth:`_degrade_on_timeout`); the margin is about *who reports the timeout*, not safety.
 # The backend fact (900s) is the SINGLE source of truth in ``lexora/client.py`` — imported here as
 # ``LEXORA_BACKEND_TIMEOUT_SECONDS`` rather than re-hardcoded, so the two files cannot drift.
 _CLIENT_TIMEOUT_MARGIN_SECONDS = 60.0
@@ -314,6 +323,20 @@ def _strip_footer_and_use_event(body: str, event: ReviewEvent) -> ReviewEvent:
 # opposite treatment. This is not an inconsistency to be tidied up. Revisit only when a FALSE RED
 # is actually observed here — a review body whose bold verdict forced a REQUEST_CHANGES the author
 # did not intend.
+#
+# ---- Divergence back-reference (R-4a, rider-3 msg-2130 §1) -------------------------------------
+# This regex is used with a LAST-WINS anchor (see ``_parse_model_verdict``: ``matches[-1]``).
+# The objection-block parser next to it (:func:`parse_objections`) uses STRICT-SINGLE (D-1):
+# two column-zero markers derive MISSING rather than picking one. The two parsers therefore
+# disagree on how to react to a column-zero echo — deliberately.
+#
+# Whether the last-wins discipline here should follow the objection parser to strict-single is
+# an open question under ``T-verdict-echo-after-real-verdict`` (msg-1979); rider 3 (msg-2072 §5,
+# discharge in msg-2130 §1) chose the "explicit-justification" branch of R-4 rather than the
+# "unify" branch, so the divergence is named on BOTH sides — here and in ``parse_objections`` —
+# to keep a future reader from making it consistent by touching this line prematurely. This note
+# is DESCRIPTIVE: it records that a decision is pending, not which way it should go.
+# ------------------------------------------------------------------------------------------------
 _VERDICT_RE = re.compile(
     r"^VERDICT:\s*(APPROVE|REQUEST[ _-]?CHANGES|COMMENT)\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -340,17 +363,98 @@ _VERDICT_RE = re.compile(
 # The APPROVE form is therefore described in prose rather than shown. Pinned by
 # test_no_src_file_teaches_a_column_zero_approve_verdict (scans ``src/`` with _VERDICT_RE itself)
 # and test_quoting_the_prompt_exemplar_cannot_open_the_gate (replays the echo).
+#
+# ---- Objection classes (T-naysayer-blocking-bar-undefined Stage 1, msg-2031 / msg-2033) ----
+#
+# SUPERSEDES the Stage 0 affordance (PR #188, merged as 043d3b9) that this same paragraph used to
+# describe. Stage 0 gave the reviewer a prose slot for non-blocking observations; Stage 1 replaces
+# that slot with a NAMED class per objection, taken from the ``objection_classes`` map in the
+# principles frontmatter, plus a machine-readable block the driver parses. The Stage 0 wording is
+# not kept alongside it — two ways to say "this one is a nit" is the dual-management defect the
+# class system exists to remove.
+#
+# Three properties of the wording below are load-bearing:
+#
+#   * It does NOT enumerate the class names. ``build_preamble()`` already injects the frontmatter
+#     verbatim into this same system prompt, so an enumeration here would be a second copy of the
+#     enum that can drift from the SOT. The absence is pinned by
+#     ``test_no_src_file_duplicates_the_objection_class_vocabulary``.
+#   * Its objection-block exemplar uses PLACEHOLDER class names, not real ones. The exemplar is
+#     handed to the model on every review, so a model restating its instructions emits it; a
+#     placeholder parses as ``UNKNOWN``, which :func:`derive_verdict` counts as blocking. The echo
+#     therefore lands on the fail-closed side — the same reasoning that makes the VERDICT exemplar
+#     a REQUEST_CHANGES (see the note above _PR_REVIEW_SYSTEM_PROMPT).
+#   * It adds NO new column-0 ``VERDICT:`` line, so the column-0 APPROVE ban and the quoted-echo
+#     defence are untouched.
+#
+# What Stage 1 deliberately does NOT do: change any verdict. The parsed block feeds
+# ``VerdictDecision.derived_verdict``, which no gate path reads (see the SHADOW note there).
+#
+# The problem this addresses (Bohr, msg-1923 §1): "blocking" had no definition anywhere, so the
+# same class of 1-2-line prose defect landed on opposite sides of the verdict in adjacent rounds
+# of one PR (#186 R6 = APPROVE, R7 = REQUEST_CHANGES), and a third case in another repository
+# (spirrow-verimend#3 R3) cost the loop a round for a defect that misleads nobody at runtime.
+#
+# The prompt below now names "blocking" (the property that forces REQUEST_CHANGES) and gives the
+# reviewer a place to record NON-blocking observations (nits) alongside blocking objections. This
+# closes an asymmetry Bohr diagnosed on the same thread that produced this change: the previous
+# prompt had a non-blocking slot only on the APPROVE side ("name the single weakest remaining
+# point"), so the ONLY place a reviewer could record a nit was inside an APPROVE body — and the
+# moment a nit was weighed as material, the reviewer had no shape in which to say "one blocking
+# problem, plus three nits", so the pressure went straight to REQUEST_CHANGES. Measured on PR #186
+# rounds 6 and 7 (msg-1923 §1): the same class of 1-2-line prose defect landed on opposite sides
+# of the verdict in adjacent rounds. This is the Stage 0 half of the response (D-3 in msg-1926 /
+# msg-1930 §4): purely additive prompt formatting, NO change to verdict semantics — the gate still
+# posts REQUEST_CHANGES iff the model wrote it, and the advisory section (if any) is prose that
+# rides in the body next to the blocking objections. The Stage 1 half (per-objection ``class`` +
+# code-side ``VERDICT`` derivation) is the Tier-C decision that follows this one — a bump of
+# ``spec/NAYSAYER_PRINCIPLES.md`` ``version: 1 → 2`` — and is deliberately NOT done here.
+#
+# What this affordance does NOT do, and why the wording is careful:
+#
+#   * No "blocking" / "advisory" enum is introduced in the prompt beyond the existing 6-item list of
+#     what qualifies as "the real problems" (correctness / edge / security / invariant / untested /
+#     regression). Fixing the taxonomy is Stage 1's job; anticipating it here would either fossilise
+#     a wording that Stage 1 revisits or (worse) drift from whatever Stage 1 settles on.
+#   * No new column-0 ``VERDICT:`` line. The exemplar remains the single REQUEST_CHANGES line, so
+#     test_system_prompt_verdict_exemplar_is_accepted_by_the_parser stays green and neither the
+#     column-0 APPROVE ban nor the quoted-echo defence introduced above is weakened.
+#   * "You may additionally" — permissive, not mandatory. A blocking objection alone still counts
+#     as a complete review; the affordance exists to remove pressure, not to add a checklist item.
 _PR_REVIEW_SYSTEM_PROMPT = """\
 You are the independent naysayer performing adversarial CODE REVIEW of a pull \
 request's diff in a Spirrow MindWire ChatRoom thread. You are a different model \
 from the implementer. Assume the change is flawed until proven otherwise and \
-find the real problems: correctness bugs, missing edge cases, security issues, \
-broken invariants, untested behaviour, and regressions.
+find the real problems.
+
+What kinds of problem exist, and which of them force a change before merge, are \
+defined by the `objection_classes` map in the frontmatter of the naysayer \
+principles above. That map is the only list of class names; this prompt does not \
+repeat it. A class with `blocks: true` is one whose fix the implementer must \
+make before merge, and its `evidence:` line states what you must be able to say \
+to raise it — if you cannot say that, you have not established a blocking \
+objection. A class with `blocks: false` is a real observation that does not \
+force a change before merge; record those too, so that noticing one never \
+pressures you into inflating it into a blocking objection.
 
 For every objection, quote the specific hunk/line you object to and explain the \
 concrete flaw. Do not fabricate problems and do not pad with generic caveats. \
 If, after a genuine search, you find no blocking problem, say so and name the \
 single weakest remaining point.
+
+Then, at the very END of your reply and immediately BEFORE the verdict line, \
+emit exactly one machine-readable objection block: the marker below at the \
+start of its own line, followed by a single JSON array — no code fence, no \
+prose between them.
+
+<!-- mindwire:objections v1 -->
+[{"class": "<a class name from objection_classes>", "where": "path:line", \
+"evidence": "<what that class's evidence: line asks for>"}]
+
+One element per objection you stated above, in the same order; `[]` if you \
+stated none. Every objection you made in prose must appear, and the block must \
+not add any you did not make. The block records what you already wrote — it \
+does not replace the prose, and nothing in it changes the verdict line below.
 
 End your reply with exactly one verdict line, in exactly this form — at the start of the line, \
 holding nothing else (no indentation, no bold or backticks, no trailing note):
@@ -359,7 +463,8 @@ VERDICT: REQUEST_CHANGES
 
 Write that line verbatim if you found at least one blocking problem. If, after a genuine search, \
 you found none, write the same line with the single word APPROVE in place of REQUEST_CHANGES. \
-Those two are the only verdicts, and nothing else may appear on the line.
+Those two are the only verdicts, and nothing else may appear on the line. Non-blocking advisory \
+observations, if any, belong in the body ABOVE this line — never on the verdict line itself.
 
 Your reply is posted verbatim to the thread and submitted as your GitHub PR \
 review body — reply directly with the review, no preamble.
@@ -474,6 +579,657 @@ def _parse_model_verdict(critique: str) -> ModelVerdict:
     return ModelVerdict.REQUEST_CHANGES
 
 
+# ─── Objection classes (T-naysayer-blocking-bar-undefined Stage 1) ───────────────────
+#
+# The model tags each objection with a class from the ``objection_classes`` map in the
+# principles frontmatter and emits them as one JSON array in a marked block at the end of
+# its reply. This module parses that block and DERIVES a verdict from it —
+# ``derived_verdict`` — which is recorded and reported but never posted.
+#
+# **The Stage 1 safety property, stated once so it cannot be lost:** ``derived_verdict``
+# does not appear in ``decide_verdict``'s ``gate_verdict`` computation. Whatever this
+# parser does — mis-parses, is fed an injected block, crashes on nothing at all — the
+# verdict submitted to GitHub is bit-identical to the pre-Stage-1 behaviour. The robustness
+# of this parser is the thing being MEASURED, not something the gate depends on yet
+# (msg-2033 §J-3). Reversing that is Stage 2, a separate Tier-C decision whose stated
+# pre-conditions include an independent review of this parser's injection surface.
+_OBJECTIONS_SENTINEL = "<!-- mindwire:objections v1 -->"
+
+# Anchored at COLUMN ZERO. A unified-diff line carries a ``+``/``-``/space prefix, so a VERBATIM
+# quote of this file's own diff (which necessarily contains the sentinel literal) cannot satisfy
+# the anchor. The residual is real: a model that RE-TYPES the marker without the prefix produces
+# a genuine match. This is the exploit surface :data:`_VERDICT_RE`'s own last-wins discipline is
+# still exposed to (pending on ``T-verdict-echo-after-real-verdict``); this parser diverges by
+# design (see :func:`parse_objections` D-1 note). In Stage 1 the residual costs nothing (nothing
+# is posted from it); the rider-3 review (T-rider3-objection-parser-injection-surface) closes
+# the parser side of the reversal's pre-conditions.
+#
+# **RESPONSIBILITY SEPARATION (gamma-1, msg-2478 §4.2 / msg-2521 §2.1).** This regex POSITIONS
+# the marker; it does not judge payload adjacency. The pre-gamma form carried a ``\s*$`` tail
+# anchor that forced the marker to sit alone on its line — a payload-shape check masquerading
+# as a positioner.
+# That doubling had two costs: (i) it hid D-3's status as the sole owner of adjacency (see
+# :func:`parse_objections`), so a refactor that tightened the regex could silently take over from
+# D-3 without any test moving; (ii) it fail-closed on a same-line marker+block (the honest form
+# ``<!-- mindwire:objections v1 --> [...]``) by not matching at all, sending it to
+# ``NO_MARKER`` rather than letting D-3 evaluate the payload. The same-line decoy the anchor was
+# once thought to guard (``<!-- mindwire:objections v1 -->[]\n[real block]``) is closed by D-7,
+# which lands in #214 (``aad3eda``) — the primary parses as ``EMPTY``, the scan runs on the
+# remainder, and the chained real block is refused. With that lower defense in place the tail
+# anchor buys no attack coverage and the doubling can be retired. Pinned by
+# :func:`test_marker_regex_is_a_positioner_only_d3_still_catches_non_adjacent_payload` and
+# :func:`test_marker_regex_positioner_only_reds_if_the_tail_anchor_is_reintroduced`.
+_OBJECTIONS_SENTINEL_RE = re.compile(rf"^{re.escape(_OBJECTIONS_SENTINEL)}", re.MULTILINE)
+
+
+class ObjectionParse(Enum):
+    """How the objection block of one critique read. Every value is recorded, none is fatal.
+
+    ``UNKNOWN`` and ``NO_EVIDENCE`` are element-level facts promoted to the report so the
+    gate notice can name what happened; ``MISSING`` covers both "no marker" and "the array
+    would not parse", because the derivation treats them identically (fail-closed) and a
+    finer split would suggest the two are handled differently when they are not.
+
+    A **sub-reason** for ``MISSING`` is carried separately on :class:`ObjectionReport`
+    (``missing_reason``), never on this enum: the derivation MUST be blind to it (all
+    ``MISSING`` variants derive REQUEST_CHANGES) but the shadow measurement MUST see it
+    (rider 2 needs to tell "D-1 over-fired" from "D-3 over-fired" from "the model wrote
+    no block at all"). Splitting the enum would leak the distinction into the derivation
+    path; hanging it off the report keeps derivation single-valued and measurement rich.
+    """
+
+    OK = "ok"
+    EMPTY = "empty"
+    MISSING = "missing"
+    UNKNOWN = "unknown-class"
+    NO_EVIDENCE = "no-evidence"
+
+
+class ObjectionMissingReason(Enum):
+    """Sub-reason attached to a :class:`ObjectionParse.MISSING` report (rider 3, msg-2130 §3).
+
+    Every value derives REQUEST_CHANGES identically — the derivation reads
+    :class:`ObjectionParse.MISSING` and stops. This enum exists so the shadow log line
+    can name *which* MISSING cause fired, without which ``parse=missing`` is a black
+    box that folds the enum's sub-causes (currently six: ``no-marker`` / ``multi-marker``
+    / ``prose-between`` / ``bad-json`` / ``not-a-list`` / ``principles-error``) into one.
+    **It is NOT surfaced on the posted D-divergence notice** (msg-2212 §1 / msg-2213):
+    the notice is readable to the model whose diff is under review, and naming which
+    parser wall it tripped gives that model (or an attacker whose exploit is in the
+    diff) a per-attempt oracle to hill-climb. Rider 2 reads the sub-cause off the log
+    line, which lives in the operator-side channel and is not returned to the reviewed
+    revision.
+
+    The two counters rider 2 was asked to instrument (msg-2130 §3) map to
+    :attr:`MULTI_MARKER` (D-1 fired) and :attr:`PROSE_BETWEEN` (D-3 fired). The other
+    values distinguish the pre-existing MISSING causes so a rise in either counter can
+    be told apart from a rise in the baseline ``no_marker`` / ``bad_json`` cases.
+    """
+
+    NO_MARKER = "no-marker"  # zero column-zero markers (baseline: no block written)
+    MULTI_MARKER = "multi-marker"  # D-1 fired: two or more column-zero markers
+    PROSE_BETWEEN = "prose-between"  # D-3 fired: payload does not start with ``[``
+    BAD_JSON = "bad-json"  # ``raw_decode`` raised on the payload
+    NOT_A_LIST = "not-a-list"  # top-level JSON value was not a list
+    PRINCIPLES_ERROR = "principles-error"  # vocabulary load failed (unreachable in practice)
+
+
+@dataclass(frozen=True)
+class Objection:
+    """One element of the model's objection block, resolved against the class vocabulary."""
+
+    objection_class: str
+    where: str
+    evidence: str
+    known: bool  # the class name is in ``objection_classes()``
+    blocks: bool  # counts toward the derived REQUEST_CHANGES
+
+
+@dataclass(frozen=True)
+class ObjectionReport:
+    """The parse of one critique's objection block.
+
+    ``missing_reason`` is set iff ``status is ObjectionParse.MISSING``. See
+    :class:`ObjectionMissingReason` for why the sub-reason lives here rather than being
+    baked into the ``status`` enum.
+    """
+
+    status: ObjectionParse
+    objections: tuple[Objection, ...] = ()
+    unknown_classes: tuple[str, ...] = ()
+    missing_reason: ObjectionMissingReason | None = None
+
+    @property
+    def blocking(self) -> tuple[Objection, ...]:
+        return tuple(o for o in self.objections if o.blocks)
+
+    @property
+    def advisory(self) -> tuple[Objection, ...]:
+        return tuple(o for o in self.objections if not o.blocks)
+
+    def counts_by_class(self) -> Mapping[str, int]:
+        counts: dict[str, int] = {}
+        for o in self.objections:
+            counts[o.objection_class] = counts.get(o.objection_class, 0) + 1
+        return counts
+
+    def counts_label(self) -> str:
+        counts = self.counts_by_class()
+        return ", ".join(f"{name}={counts[name]}" for name in sorted(counts)) or "none"
+
+
+def _missing_report(reason: ObjectionMissingReason) -> ObjectionReport:
+    """Construct a MISSING report tagged with its sub-reason (rider-3 msg-2130 §3).
+
+    The ``reason`` argument is required — a call without one would produce a MISSING report
+    whose cause is unknowable, which is precisely the black-box the instrumentation exists
+    to eliminate. All MISSING cases still derive REQUEST_CHANGES (:func:`derive_verdict`
+    only looks at ``status``); the reason surfaces on the shadow log line ONLY, never on
+    the posted D-divergence notice (msg-2212 §1 / msg-2213: naming the sub-cause in the
+    review body hands the reviewed revision an oracle to hill-climb against).
+    """
+    return ObjectionReport(status=ObjectionParse.MISSING, missing_reason=reason)
+
+
+# Deepest bracket nesting :func:`parse_objections` will hand to ``raw_decode``. Well under
+# CPython's recursion limit (empirically ``raw_decode("[" * 200)`` still returns ValueError,
+# ``"[" * 1000`` raises RecursionError), and orders of magnitude above any real objection
+# block: the schema is a flat list of flat objects, so honest payloads nest 2 deep.
+_MAX_PAYLOAD_NESTING = 100
+
+
+def _nesting_exceeds(text: str, limit: int = _MAX_PAYLOAD_NESTING) -> bool:
+    """Cheap pre-scan: could any suffix of ``text`` nest brackets deeper than ``limit``?
+
+    **Bound, not catch (msg-2385 §5).** ``json``'s decoder recurses per open bracket, so a
+    payload of a thousand ``[`` raises ``RecursionError`` — which is a ``BaseException``, not
+    a ``ValueError``, so it escapes :func:`parse_objections`'s ``except ValueError`` and
+    breaks the "Never raises" contract in that function's docstring. Catching it is not a
+    fix: at the moment ``RecursionError`` fires the stack is already exhausted, so the
+    handler itself can re-raise. Rejecting over-deep input *before* the decoder sees it is
+    deterministic and pinnable.
+
+    A second, sharper reason, measured rather than argued: widening the two
+    ``except ValueError`` clauses to ``except (ValueError, RecursionError)`` makes the D-7
+    loop treat an over-deep chained payload as "this bracket did not open a list" and step
+    past it, so the critique parses ``EMPTY`` and derives **APPROVE**. The catch does not
+    merely fail to restore "Never raises"; at the loop's call site it converts a crash into
+    a false APPROVE — the one outcome this parser exists to make impossible.
+
+    **The metric: count openers, never decrement (msg-2433 §4).** Soundness, in one
+    sentence: the decoder deepens its recursion only when it consumes a structural ``[`` or
+    ``{``, and it consumes each character at most once, so the depth reached from ANY start
+    offset is at most the number of ``[``/``{`` characters in ``text``. That is why one
+    scan of the whole payload covers the primary decode AND every re-entry the D-7 loop
+    makes at ``rest[bracket:]``: ``rest`` is a slice of this same string, so its opener
+    count cannot exceed the whole string's. Bounding each slice separately would re-read the
+    tail once per ``[`` and reintroduce the O(N^2) shape (measured at 1.2 s worst case,
+    msg-2388 E-5) for no extra safety. Note what the proof does NOT need: any knowledge of
+    which brackets sit inside string literals.
+
+    **Why the two obvious refinements are worse — measured, not argued (msg-2433 §3).** The
+    first form of this scan tracked ``depth - floor`` (the rise above the lowest point seen)
+    and claimed that counting brackets inside JSON strings "only ever over-rejects". That
+    claim was exactly half true, and the false half was the fail-open one: counting an
+    in-string OPENER over-estimates, but counting an in-string CLOSER *under*-estimates. So
+    ``["]", ["]", … ]`` walked ``depth`` between 0 and 1 forever, ``depth - floor`` never
+    passed 1, and a 996-opener payload reached the decoder and raised ``RecursionError``
+    straight out of :func:`parse_objections` (gate msg-2432; reproduced here, cliff bisected
+    at exactly 996 openers). Nor is the repair the gate then asked for — "track string state
+    and ignore brackets inside strings": :func:`_chains_another_block` probes
+    ``rest.find("[", probe)`` and therefore hands ``raw_decode`` start offsets that are
+    INSIDE string literals, which a string-aware metric is blind to by construction.
+    Witness: ``'"' + "[" * 30 + '"'`` reaches depth 30 from offset 1 and that metric scores
+    it 0. On a 200,000-case differential fuzz against a per-start-offset oracle the
+    string-aware metric under-estimated 5,609 times, the ``depth - floor`` form it would
+    have replaced 910 times, and the opener count below 0 times.
+
+    **The residue, at its measured width.** Counting in-string openers and never
+    decrementing over-rejects: a payload whose text after the marker holds more than
+    ``limit`` ``[``/``{`` characters IN TOTAL is refused even though it nests two deep.
+    That is fail-closed (MISSING → REQUEST_CHANGES, never APPROVE), the direction
+    msg-2385 §2's F invariant permits. Width: over all 54 real gate critiques carrying a
+    column-zero marker (PRs #140-#217, GitHub review bodies), the opener count is at most
+    **5** (mean 2.4, p95 4) against a limit of 100 and a measured crash cliff of 996. So
+    :data:`_MAX_PAYLOAD_NESTING` does not move: it sits ~20x above the largest honest
+    payload observed and ~10x below the cliff.
+    """
+    opened = 0
+    for ch in text:
+        if ch in "[{":
+            opened += 1
+            if opened > limit:
+                return True
+    return False
+
+
+def _chains_another_block(rest: str) -> bool:
+    """D-7. True iff ``rest`` carries a second array that could have been the objection block.
+
+    ``rest`` is the text :func:`parse_objections` did not consume. V-1 — ``raw_decode`` stops
+    at the end of the first JSON value, so trailing text is structurally invisible — is also
+    an injection surface: a critique that writes a decoy ``[]`` right after the marker and its
+    REAL blocking array underneath parses EMPTY and derives APPROVE. Both the chained and the
+    prose-separated variant were measured open on ``main`` (msg-2361 / msg-2388 E-2b). So the
+    remainder is scanned and the whole parse REFUSED — fail-closed (MISSING → RC), so it can
+    never soften a verdict, which is why "reject" beats "pick the later array" (selecting the
+    later array is the fail-open ``find("[")`` shape D-3 already rejects). This does not
+    contradict V-1: trailing text is still not *consumed*, it is *inspected*, and its presence
+    disqualifies the block. D-4 stays dropped — arbitrary prose after the block is still legal,
+    only a chained array that CLAIMS AN OBJECTION CLASS is refused.
+
+    **CALLER CONTRACT (msg-2425 §6): ask this only when the primary read derives APPROVE.**
+    :func:`parse_objections` calls it at exactly two places, both of them on that branch — the
+    empty-array return and the assembled report when ``report.blocking`` is empty. Skipping the
+    scan when the primary already carries a blocking objection is safe *because* the attack it
+    defends against needs the parser to reach APPROVE: a primary with a blocking objection
+    derives REQUEST_CHANGES no matter what follows it, so a refusal there buys zero bits, and an
+    attacker who plants a blocking objection in order to stop the scan has thereby produced the
+    REQUEST_CHANGES he was trying to avoid.
+
+    ``report.blocking`` is WIDER than "the model named a blocking class", and the skip covers
+    all of it: an unknown class (including a misspelling), a non-dict or class-less element,
+    and a blocking objection carrying no evidence each set ``blocks=True``, so those primaries
+    skip the scan too. That is the definition working rather than an exception — the only
+    property the skip needs is "this primary already derives REQUEST_CHANGES", which holds for
+    every one of them (measured across this change: derived stays REQUEST_CHANGES in all three
+    shapes, while the reported status sharpens from ``bad-json`` to the specific cause).
+
+    DEPENDENCY, stated so the next person to move it sees it: this reasoning rests entirely on
+    :func:`derive_verdict` mapping "any blocking objection" to REQUEST_CHANGES. That dependency
+    now carries a SECOND load — the predicate's lower bound below rests on the same mapping,
+    because the two arrays that bound it from below (a misspelled class; a blocking class with
+    no evidence) are worth refusing only while the parser still reads them as blocking. If
+    ``derive_verdict`` ever derives APPROVE with a blocking objection present, BOTH the skip and
+    the lower bound become unsound, and both call sites must be revisited.
+
+    **Where the predicate's line sits, and why it is not arbitrary** (msg-2429 §1-§3, correcting
+    the "any object" shape this file shipped at 82e50fb, the "non-empty" narrowing of 6b009d9
+    and the "any list" shape of #206 R5/R6). The attack is "show the parser a benign array, show
+    the human the real one", so it only works if the parser COULD have read the later array as
+    the model's block. Exactly one key decides that, and it is ``class``: the element loop in
+    :func:`parse_objections` reads ``element.get("class")`` and nothing else to tell an objection
+    from noise, so an element that carries no ``class`` key is counted unknown-class exactly like
+    an element that is not a dict at all. A chained list holding nothing that CLAIMS A CLASS
+    therefore hides nothing: ``[]`` adds no objection to what precedes it, and ``[1]`` /
+    ``["key"]`` / ``[1, 2]`` / ``[{"port": 80}]`` / ``[{"id": 1}, {"id": 2}]``, HAD the parser
+    read them as the block, all derive UNKNOWN → REQUEST_CHANGES (measured, one parse each). No
+    attacker reaches APPROVE through them, so refusing them buys no coverage and costs a false RC
+    on the ordinary citation, subscript, list literal AND list-of-dicts of everyday prose.
+
+    Measured on a 76-case corpus (7 attacks; 18 ordinary trailing-prose shapes and 5 dict-literal
+    shapes, each against an empty, an advisory-only and a blocking primary), scored end to end
+    through :func:`parse_objections`:
+
+    ======================================  =========  ============  ============
+    predicate                                  correct   false fires   attacks let
+                                                                              past
+    ======================================  =========  ============  ============
+    ``isinstance(chained, list)``               50/76            26             0
+    ``... and chained``                         52/76            24             0
+    ``... any dict`` (82e50fb)                  64/76            12             0
+    ``... any dict with "class"`` (here)        72/76             4             0
+    ``... any dict whose class is known``       73/76             2             1
+    ======================================  =========  ============  ============
+
+    Two of the false fires in EVERY row are the same input — an honest critique that quotes a
+    REAL objection array, residue 3 below — so the row-to-row deltas are unaffected by whether
+    one counts that inseparable case as a miss. The EIGHT this round removes are the four
+    dict-literal shapes whose objects claim no class, each against the two APPROVE-deriving
+    primaries: ``[{"port": 80}]``, ``[{"name": "a", "value": 1}]``, ``[{"id": 1}, {"id": 2}]``
+    and the same list nested inside an object, ``{"items": [{"port": 80}]}`` — the loop's
+    ``probe = bracket + 1`` re-entry reaches an inner list, so nesting does not hide it. The four
+    that REMAIN are both halves of residue 3 below: ``[{"class": "btn-primary"}]`` (2, an
+    ordinary ``class`` key) and a critique quoting a real objection array (2, inseparable).
+    Under a BLOCKING primary no row false-fires at all — that is the caller contract, not this
+    predicate. False RC is permitted (msg-2385 §2, F) but it is not free: this parser's output IS
+    the shadow measurement rider 2 is calibrating, and a defense that fires on ordinary critiques
+    saturates the signal it instruments.
+
+    **The line is bracketed from BELOW as well, which is why it stops here.** One notch narrower
+    opens a measured fail-open in each of two directions, and both are pinned:
+
+    * **Requiring the class to be IN the vocabulary** lets ``[{"class": "corectness", "where":
+      …, "evidence": …}]`` — a misspelling — chain behind a decoy ``[]`` and derive APPROVE.
+      The parser itself reads that array as unknown-class → blocking, so it is precisely an
+      array that "could have been the block".
+    * **Additionally requiring ``where`` and ``evidence``** lets ``[{"class": <blocking>,
+      "where": "a.py:1"}]`` chain and derive APPROVE. That is not merely an evasion: it
+      reinstates, on the chained side, the inversion ``parse_objections`` refuses on the primary
+      side, where ``NO_EVIDENCE`` deliberately does not demote a blocking objection precisely so
+      that "write no evidence" cannot become the cheapest way to soften a verdict. (Requiring
+      ``where`` OR ``evidence`` rather than both opens neither of these two — measured — so it
+      is the conjunctive form that is unsafe, not the mention of those keys.)
+
+    Both are pinned by :func:`test_d7_refuses_a_chained_array_that_claims_a_class_but_little_else`,
+    which exists so that a later reading of "match the schema more strictly" cannot quietly move
+    the line down. **Measured and NOT adopted:** requiring ``class`` plus (``where`` and
+    ``evidence``, or a known class) scores 74/76 here — better than the predicate above on this
+    corpus, and rejected anyway. It is a condition fitted to the corpus rather than derived from
+    the criterion, and it still lets the one-key misspelling ``[{"class": "corectness"}]`` through
+    (measured: derives APPROVE). ``class`` alone follows from the criterion, because ``class``
+    alone is what the element loop reads.
+
+    **WHAT IS LEFT OVER.** Three residues, deliberately kept, in three different senses —
+    listed apart because merging them has twice produced a wrong remedy:
+
+    1. **DISCARDED (surplus fail-closure).** A chained list of SCALARS a human would read as
+       objections, e.g. ``["correctness: foo is broken"]``, is not refused. It is structurally
+       indistinguishable from ``["key"]``, so refusing it returns every false fire above. It is
+       not fail-open in the machine's direction — as shown above that array cannot make the
+       parser say APPROVE — so what is given up is surplus fail-closure, not attack coverage.
+
+    2. **NOT CLOSABLE (the region gate msg-2420 found).** A trailing block that the machine
+       cannot parse but a human reads as objections: Python-style single quotes, a trailing
+       comma, plain prose, a markdown bullet list, YAML, or nothing at all. The scan cannot see
+       any of these, and closing the JSON-syntax corner of it is measurably worse than leaving
+       it open. Measured on a 35-case corpus (the 11 above plus 24 ordinary review-prose
+       shapes): this predicate scores 35/35 with zero false fires — unchanged by this round's
+       narrowing, since none of those shapes carries a ``class`` key and adding a conjunct can
+       only make the predicate fire on fewer inputs — while fail-closing on a
+       remainder ``[`` that does not decode scores 18/35 — 17 false fires, namely markdown
+       links ``[text](url)``, type annotations ``list[str]`` / ``Optional[int]``, subscripts
+       ``arr[i]``, ``[TODO]``, section references, log timestamps ``[2026-09-03 00:43]`` and
+       character classes ``[a-z]+`` — and reds
+       :func:`test_d7_does_not_fire_on_honest_blocks_or_on_trailing_prose`. It also buys
+       nothing, because the same evasion is reachable without any bracket at all: writing the
+       objections as prose, as a bullet list, as YAML, or omitting them entirely all derive
+       APPROVE under BOTH shapes (measured, four ways). An attacker who can be told "use single
+       quotes" can be told "use prose", which is strictly less control for the same result.
+
+    3. **NARROWED TWICE, NOT CLOSED (msg-2425 §6, then msg-2429 §4).** State this one at the
+       predicate's WIDTH, not at its intent — describing it by what it was meant to catch is
+       what produced the two rounds of correction it has already had. The exact remaining
+       surface: an APPROVING primary (an empty block, or advisory objections only) whose
+       remainder contains a JSON array holding at least one object with a ``class`` key. That
+       covers two different things, and only the first is inseparable.
+
+       (i) A critique that quotes a REAL objection array — a critique ABOUT this parser is the
+       realistic case, and msg-2413 §1 measured the gate's own round-1 review self-jamming on
+       it. Scope the impossibility claim exactly (msg-2425 §6, correcting msg-2419 §3): no
+       predicate **over the remainder alone** can separate this from the attack, because the
+       two remainders are byte-identical. The separator that does exist is not in the remainder
+       — it is the primary read, which is what the caller contract above uses — and an approving
+       primary is precisely the case where the primary carries no signal, so this remnant
+       survives by construction.
+
+       (ii) A literal that uses ``class`` as an ordinary key with no relation to objections:
+       ``[{"class": "btn-primary"}]`` in a review of HTML/CSS/Java/ML code. This one IS
+       separable in principle and is not separated: 2/76 on the corpus above, a cost taken
+       knowingly rather than an oversight, because every narrower predicate measured opens a
+       fail-open (see the lower bound above). If shadow measurement ever shows (ii) firing in
+       practice, the fix is NOT a narrower predicate — it is to stop reading the remainder's
+       shape at all (require the block last, the family of D-4, dropped once already), and that
+       is a redesign, not an edit here.
+
+       Both are warts of D-1's re-typed-marker family, with the same loud, human-overridable
+       exit; an approving critique avoids them by placing the example ABOVE the marker.
+
+    ``bad_json`` rather than a new :class:`ObjectionMissingReason` member: this is the shape
+    #206 lands as ``payload_unparseable`` (which merges ``bad-json`` and ``not-a-list``), so
+    reusing the existing member keeps this backport free of an enum change #206 would
+    immediately rename, and off the enum-derived exhaustive pin in
+    ``test_missing_reason_never_leaks_into_the_posted_notice``.
+    """
+    probe = 0
+    while (bracket := rest.find("[", probe)) >= 0:
+        try:
+            # D-6 has already bounded the nesting of the whole payload, and ``rest`` is a
+            # slice of it, so this re-entry cannot raise RecursionError either.
+            chained, _ = json.JSONDecoder().raw_decode(rest[bracket:])
+        except ValueError:
+            probe = bracket + 1
+            continue
+        if isinstance(chained, list) and any(isinstance(e, dict) and "class" in e for e in chained):
+            return True
+        probe = bracket + 1
+    return False
+
+
+def parse_objections(critique: str) -> ObjectionReport:
+    """Parse the objection block out of ``critique``. Never raises — D-6 below carries the
+    single bound that makes that true, and the two occasions on which it was false.
+
+    Five outcomes, all recorded, none of which changes what the gate posts:
+
+    ``OK``           marker present, array parsed, every class known and evidenced.
+    ``EMPTY``        the array is ``[]`` — a legal statement that nothing was objected to.
+    ``MISSING``      no column-zero marker, more than one column-zero marker, the payload
+                     after the marker does not begin with a JSON array, a SECOND array is
+                     chained behind the first (D-7), or the payload nests deeper than
+                     :data:`_MAX_PAYLOAD_NESTING` (D-6).
+    ``UNKNOWN``      some element names a class outside the vocabulary.
+    ``NO_EVIDENCE``  some blocking element carries no evidence.
+
+    ``NO_EVIDENCE`` deliberately does NOT demote the objection to advisory. Demotion would be
+    fail-open, and worse, it would make "write no evidence" the cheapest way to soften a
+    verdict — inverting the evidence obligation the class system is built on (msg-2033 §J-3).
+
+    Malformed ELEMENTS inside a well-formed array (not an object, missing ``class``) are
+    counted as unknown-class rather than dropped: silently discarding an element the model
+    wrote is the one behaviour that could make the derived verdict quieter than the prose.
+
+    **D-1 (strict-single sentinel, rider-3 msg-2072 / msg-2073).** Two or more column-zero
+    markers in one critique derive MISSING — not "last-wins", not "concatenate all". Last-wins
+    is bypassable by a re-typed copy placed AFTER the model's own block (the same residual
+    :data:`_VERDICT_RE` still carries), and concatenation lets an attacker (or the model's own
+    verbosity) *add* blocking objections at will, which is a new denial-of-service surface
+    aimed straight at the reversed gate. MISSING derives REQUEST_CHANGES, which is fail-closed
+    and *loud*: the reason is named in the report, so a human can see what happened. The
+    accepted side-effect: a PR touching this file whose reviewer re-types the marker at
+    column zero self-jams into RC. The override path is human, which is the right shape for
+    a rare deadlock caused by discussing the parser inside the parser's own gate.
+
+    **D-3 (strict bracket placement, rider-3 msg-2072).** After fence-stripping, the payload's
+    first non-whitespace character must be ``[`` — no prose in between. This closes an
+    F-a-direction window (msg-2074 §1): a scan-forward ``find("[")`` would silently anchor to
+    a benign or malicious empty array further down (``Here are my objections: []`` etc.),
+    discarding the model's real block. Failing this trips MISSING → RC, which is loud and
+    fail-closed. The reliability cost (models that lead with a short sentence get their
+    objection block dropped) is Stage-1 shadow-measurable before the reversal.
+
+    **D-5 (explicit whitespace handling, rider-3 msg-2130 §2 / gate advisory on #198).** The
+    D-3 check runs ``.lstrip()`` on the payload IN THIS FUNCTION rather than trusting
+    :func:`strip_wrapping_fences` to have trimmed it. Two reasons: (a) the pre-D-5 code was
+    correct only by accident — ``payload.startswith("[")`` worked because the helper happens
+    to call ``.strip()`` even when no fence is present, so a future optimisation limiting the
+    helper to "mutate only when a fence exists" would silently break D-3 by turning every
+    ``\\n[...]`` payload into MISSING; (b) D-5 is a REINFORCEMENT of D-3, not a relaxation
+    (whitespace cannot carry an injected payload nor construct a false array, so the receiving
+    language is the same). The load-bearing wall is now self-sufficient. Pinned by
+    :func:`test_v2_fence_less_payload_with_leading_newline_is_accepted` and
+    :func:`test_d5_payload_starts_after_leading_whitespace_independent_of_helper`.
+
+    **D-6 (depth bound before the decoder, msg-2380 / msg-2385 §5 / msg-2388 E-5; metric
+    corrected by gate msg-2432 / msg-2433).** "Never raises" above was false on ``main``:
+    ``json``'s decoder recurses per open bracket, so a payload of a thousand ``[`` leaked
+    ``RecursionError`` — a ``BaseException``, so the ``except ValueError`` below never saw
+    it — and took the whole review call down with it, since :func:`decide_verdict` calls
+    this function unconditionally. Unlike the D-7 window below, this one is NOT shadow-only:
+    the crash is real on ``main`` today.
+
+    It was ALSO false on this branch, for four review rounds. The first bound counted
+    brackets inside string literals in BOTH directions, so a payload that hides a ``]`` in a
+    string at every level (``["]", ["]", … ]``) held the measured rise at 1 and let the same
+    ``RecursionError`` escape from here. ``main`` crashes on a strict superset of the inputs
+    this file ever crashed on — the branch narrowed the surface at every step, it never
+    widened it — but a docstring that says "Never raises" while a witness makes it raise is
+    the defect either way. Both are closed by bounding the input rather than catching the
+    error. :func:`_nesting_exceeds` carries the metric, its one-sentence soundness proof,
+    the two refinements that measured worse (including the one this gate round asked for),
+    and the residue at its measured width.
+
+    **D-7 (trailing-list defense, msg-2361 / msg-2363, ported here by msg-2397 §9).** V-1's
+    property — ``raw_decode`` stops at the first ``]``, so trailing text is structurally
+    invisible — is also an injection surface. A critique that writes a decoy ``[]`` right
+    after the marker and its REAL blocking array underneath parses ``EMPTY`` and derives
+    APPROVE. Both the chained variant and the prose-separated variant were measured open on
+    ``main``. So the remainder is scanned by :func:`_chains_another_block`: any ``[`` in it that
+    begins a JSON list HOLDING AT LEAST ONE OBJECT WITH A ``class`` KEY means a chained block,
+    and the parse is refused. A list holding nothing that claims a class cannot be the model's
+    block — ``class`` is the only key the element loop below reads to recognise an objection, so
+    such a list would have been counted unknown-class and derived REQUEST_CHANGES even if the
+    parser HAD read it — and refusing it would cost the ordinary ``[1]`` / ``my_dict["key"]`` /
+    ``[]`` / ``[{"port": 80}]`` of everyday prose while buying nothing (msg-2429 §1). The scan
+    runs on the APPROVE-deriving branches only (msg-2425 §6): an empty primary array, and an
+    assembled report with no blocking objection. That helper's docstring carries the predicate's
+    placement, the corpus that bounds it from ABOVE and the two fail-opens that bound it from
+    BELOW, the caller contract, the :func:`derive_verdict` property the skip depends on, and the
+    three residues.
+    This does NOT contradict V-1 — trailing text is still not *consumed*; it is now
+    *inspected*, and its presence disqualifies the block rather
+    than being selected as the payload (selecting the later array is the fail-open ``find("[")``
+    shape D-3 already rejected). D-4 stays dropped: arbitrary prose after the block is still
+    fine, only a chained array that CLAIMS AN OBJECTION CLASS is refused.
+
+    **What is NOT done here.** D-2-prime (a non-regression floor on ``gate_verdict``: the derived
+    read may never lower the gate below the pre-Stage-1 baseline) is a Stage-2 constraint on
+    :func:`decide_verdict`, not a parser change; ``derived_verdict`` does not participate in
+    ``gate_verdict`` yet (see the SHADOW note above :data:`_OBJECTIONS_SENTINEL`), so wiring
+    D-2-prime is premature until the reversal is on the table. R-4 (unify the two parsers' anchor
+    strategy, or justify the divergence, before the reversal) is discharged by the D-1 note
+    above and the divergence back-reference at :data:`_VERDICT_RE` (msg-2130 §1): the objection
+    parser is deliberately strict-single, ``_VERDICT_RE`` remains last-wins for the reasons on
+    ``T-verdict-echo-after-real-verdict``, and the divergence is named on BOTH sides rather
+    than left implicit. V-1 (verify the array-terminator method): confirmed by inspection —
+    ``raw_decode`` stops at the end of the JSON value, so anything after ``]`` is structurally
+    invisible to this parser (matching the note next to the ``raw_decode`` call below); no
+    code change is needed.
+
+    **MISSING sub-reasons (rider-3 msg-2130 §3).** Every MISSING return path carries an
+    :class:`ObjectionMissingReason` so the shadow log line and the D-divergence notice can
+    distinguish which cause fired (``multi_marker`` = D-1, ``prose_between`` = D-3,
+    ``no_marker`` / ``bad_json`` / ``not_a_list`` = pre-existing causes). This is the
+    instrumentation rider 2 needs to tell "D-1/D-3 over-fired" from "the model wrote nothing".
+    """
+    matches = list(_OBJECTIONS_SENTINEL_RE.finditer(critique))
+    if not matches:
+        # Baseline: the model wrote no column-zero marker at all. Same fail-closed outcome
+        # as MULTI_MARKER, but a different signal for shadow measurement.
+        return _missing_report(ObjectionMissingReason.NO_MARKER)
+    if len(matches) > 1:
+        # D-1: two-plus markers derive MISSING → REQUEST_CHANGES. The question "which match
+        # wins?" is deleted rather than answered — see the docstring above for why last-wins
+        # and concatenate-all were both rejected.
+        return _missing_report(ObjectionMissingReason.MULTI_MARKER)
+    payload = strip_wrapping_fences(critique[matches[0].end() :])
+    # D-5: ``.lstrip()`` here in the parser, so the D-3 check does not depend on
+    # ``strip_wrapping_fences`` incidentally trimming leading whitespace. See the docstring
+    # for the coupling this breaks. Whitespace-only leaders are fine — they carry no payload.
+    if not payload.lstrip().startswith("["):
+        # D-3: no scan-forward. If the payload's first non-whitespace char is not ``[``,
+        # fall through to MISSING rather than anchor to some later ``[`` in the prose.
+        return _missing_report(ObjectionMissingReason.PROSE_BETWEEN)
+    # D-3/D-5: raw_decode wants to start at the ``[``, so consume the leading whitespace
+    # we just verified. The strip is safe because D-3 has already established that the
+    # first non-whitespace char is ``[``.
+    payload = payload.lstrip()
+    if _nesting_exceeds(payload):
+        # D-6. ONE scan, both ``raw_decode`` call sites (msg-2397 M7). It runs on the whole
+        # payload and counts every ``[``/``{`` in it, which upper-bounds the depth reachable
+        # from ANY start offset inside it, so it covers the primary decode below AND every
+        # re-entry the D-7 loop makes at ``rest[bracket:]`` — ``rest`` is a slice of this
+        # same string, so it cannot hold more openers. A second scan before
+        # the loop would be provably unreachable, i.e. dead code no negative control can turn
+        # red; the two-site coverage is pinned by behaviour instead, one test per call site.
+        return _missing_report(ObjectionMissingReason.BAD_JSON)
+    try:
+        # ``raw_decode`` stops at the end of the array, so the verdict line (and any prose)
+        # that follows the block is simply not consumed — no need to guess where it ends.
+        # V-1 (rider-3 msg-2074): this is what makes trailing text after ``]`` structurally
+        # invisible to the parser, which is why D-4 ("no trailing text allowed") was dropped
+        # rather than turned into a code change (msg-2130 §3).
+        parsed, consumed = json.JSONDecoder().raw_decode(payload)
+    except ValueError:
+        return _missing_report(ObjectionMissingReason.BAD_JSON)
+    if not isinstance(parsed, list):
+        return _missing_report(ObjectionMissingReason.NOT_A_LIST)
+    # D-7, call site (a): an empty primary array derives APPROVE, so the remainder is where a
+    # chained real block would hide. :func:`_chains_another_block` carries the whole rationale
+    # — the predicate's line, the caller contract this branch satisfies, and the three
+    # residues. Read it before moving either call site.
+    rest = payload[consumed:]
+    if not parsed:
+        if _chains_another_block(rest):
+            return _missing_report(ObjectionMissingReason.BAD_JSON)
+        return ObjectionReport(status=ObjectionParse.EMPTY)
+
+    try:
+        vocabulary = objection_classes()
+    except PrinciplesError:  # pragma: no cover - unreachable in practice, see below
+        # A malformed SOT has already taken this call down: ``build_preamble()`` reads the
+        # same file to assemble the system prompt, long before any critique exists to parse.
+        # Narrow on purpose — swallowing every exception here would hide a real bug in this
+        # parser behind a fail-closed status that looks like a badly-behaved model.
+        return _missing_report(ObjectionMissingReason.PRINCIPLES_ERROR)
+
+    objections: list[Objection] = []
+    unknown: list[str] = []
+    no_evidence = False
+    for element in parsed:
+        raw_class = element.get("class") if isinstance(element, dict) else None
+        name = raw_class.strip() if isinstance(raw_class, str) else ""
+        where = str(element.get("where", "")) if isinstance(element, dict) else ""
+        evidence = str(element.get("evidence", "")) if isinstance(element, dict) else ""
+        entry = vocabulary.get(name)
+        if entry is None:
+            unknown.append(name or repr(element)[:80])
+            objections.append(
+                Objection(
+                    objection_class=name or "<malformed>",
+                    where=where,
+                    evidence=evidence,
+                    known=False,
+                    blocks=True,
+                )
+            )
+            continue
+        if entry.blocks and not evidence.strip():
+            no_evidence = True
+        objections.append(
+            Objection(
+                objection_class=name,
+                where=where,
+                evidence=evidence,
+                known=True,
+                blocks=entry.blocks,
+            )
+        )
+
+    if unknown:
+        status = ObjectionParse.UNKNOWN
+    elif no_evidence:
+        status = ObjectionParse.NO_EVIDENCE
+    else:
+        status = ObjectionParse.OK
+    report = ObjectionReport(
+        status=status, objections=tuple(objections), unknown_classes=tuple(unknown)
+    )
+    # D-7, call site (b): the primary parsed into objections, but if NONE of them blocks the
+    # derived verdict is still APPROVE — advisory-only and (vacuously) empty reports alike —
+    # so the same window is open and the same scan applies. When something does block, the
+    # scan is skipped on purpose; :func:`_chains_another_block`'s caller contract says why
+    # that is safe and names the :func:`derive_verdict` property it depends on.
+    if not report.blocking and _chains_another_block(rest):
+        return _missing_report(ObjectionMissingReason.BAD_JSON)
+    return report
+
+
+def derive_verdict(report: ObjectionReport) -> ReviewEvent:
+    """The verdict the class vocabulary implies: RC iff any objection blocks (fail-closed).
+
+    ``MISSING`` derives REQUEST_CHANGES (D-7b): a review whose machine-readable half could
+    not be read is not evidence of "no blocking objection". Unknown classes count as blocking
+    for the same reason, and an unevidenced blocking objection stays blocking (see
+    :func:`parse_objections`).
+
+    SHADOW: no caller posts this. See the block above :data:`_OBJECTIONS_SENTINEL`.
+    """
+    if report.status is ObjectionParse.MISSING:
+        return ReviewEvent.REQUEST_CHANGES
+    return ReviewEvent.REQUEST_CHANGES if report.blocking else ReviewEvent.APPROVE
+
+
 @dataclass(frozen=True)
 class VerdictDecision:
     """The full verdict picture of a single review — model side, gate side, and the diff view.
@@ -490,6 +1246,28 @@ class VerdictDecision:
     gate_verdict: ReviewEvent
     view: DiffView
     finish_reason: str | None
+    # Stage 1 SHADOW pair. ``objections`` is the parse of the model's machine-readable block;
+    # ``derived_verdict`` is what the class vocabulary implies. NEITHER is read by
+    # ``gate_verdict`` above — grep this file: the only consumers are ``render_gate_notice``
+    # (the D-divergence note) and the structured log line. Defaults keep them optional for the
+    # short-circuit paths that construct no block at all.
+    objections: ObjectionReport = ObjectionReport(status=ObjectionParse.MISSING)
+    derived_verdict: ReviewEvent = ReviewEvent.REQUEST_CHANGES
+
+    @property
+    def diverged(self) -> bool:
+        """The derived verdict disagrees with what the gate posted, or the block was unusable.
+
+        Both halves matter for the shadow measurement: a disagreement is the signal the
+        derivation is being calibrated on, and an unusable block is the reason a
+        disagreement might be spurious. Reporting only the first would let a systematically
+        unreadable block look like a systematically wrong derivation.
+        """
+        return self.derived_verdict is not self.gate_verdict or self.objections.status in (
+            ObjectionParse.MISSING,
+            ObjectionParse.UNKNOWN,
+            ObjectionParse.NO_EVIDENCE,
+        )
 
     @property
     def suppressed(self) -> bool:
@@ -521,8 +1299,16 @@ def decide_verdict(critique: str, *, view: DiffView, finish_reason: str | None) 
         # survives on ``model_verdict`` for the notice, so the record does not lie about
         # which one was written.
         gv = ReviewEvent.REQUEST_CHANGES
+    # SHADOW (Stage 1). Computed AFTER ``gv`` and never fed back into it — the two statements
+    # above are the whole of the gate rule and this change adds nothing to them.
+    report = parse_objections(critique)
     return VerdictDecision(
-        model_verdict=mv, gate_verdict=gv, view=view, finish_reason=finish_reason
+        model_verdict=mv,
+        gate_verdict=gv,
+        view=view,
+        finish_reason=finish_reason,
+        objections=report,
+        derived_verdict=derive_verdict(report),
     )
 
 
@@ -536,6 +1322,7 @@ _MARKER_A_HEADROOM = "<!-- mindwire:note A-headroom -->"
 _MARKER_B_DIFF = "<!-- mindwire:note B-diff -->"
 _MARKER_B_LEN = "<!-- mindwire:note B-len -->"
 _MARKER_C_SUPPRESSED = "<!-- mindwire:note C-suppressed -->"
+_MARKER_D_DIVERGENCE = "<!-- mindwire:note D-divergence -->"
 
 
 def _model_verdict_label(mv: ModelVerdict) -> str:
@@ -564,7 +1351,8 @@ def render_gate_notice(decision: VerdictDecision) -> str:
     fire_b_diff = view.truncated
     fire_b_len = decision.finish_reason == "length"
     fire_c = decision.suppressed
-    if not (fire_a or fire_b_diff or fire_b_len or fire_c):
+    fire_d = decision.diverged
+    if not (fire_a or fire_b_diff or fire_b_len or fire_c or fire_d):
         return ""
 
     lines: list[str] = [_GATE_NOTICE_SENTINEL]
@@ -625,7 +1413,79 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             "(see the note(s) above); a review of a partial diff / partial output "
             "cannot open the gate."
         )
+    if fire_d:
+        # Rider 1 (msg-2031) put in a channel that has readers. ``spec/process/README.md``
+        # (fail-open 宣言先, 旧 §N.3) says a degradation announced only to a log is an
+        # announcement to nobody — measured: a correctly-declared ADR-index fail-open sat
+        # unread for five weeks in review-artifact prose. So the divergence rides in the body
+        # that is posted to the chatroom AND submitted as the GitHub review, next to the
+        # verdict it is about. The classed objections themselves need no new store: the model
+        # wrote them into this same body, which both channels already carry verbatim.
+        report = decision.objections
+        lines.append(">")
+        lines.append(f"> {_MARKER_D_DIVERGENCE}")
+        lines.append(
+            f"> **Objection-class shadow (measurement only — nothing here changed the "
+            f"verdict).** authored: {_model_verdict_label(decision.model_verdict)}   "
+            f"posted: {_gate_verdict_label(decision.gate_verdict)}   derived from classes: "
+            f"{_gate_verdict_label(decision.derived_verdict)}. Block parse: "
+            f"`{report.status.value}`; {len(report.blocking)} blocking / "
+            f"{len(report.advisory)} advisory; by class: {report.counts_label()}."
+        )
+        if report.unknown_classes:
+            lines.append(
+                f"> Class names outside `objection_classes`: "
+                f"{', '.join(sorted(set(report.unknown_classes)))} (counted as blocking)."
+            )
+        if report.status is ObjectionParse.MISSING:
+            # msg-2212 §1 / msg-2213: the sub-cause (``missing_reason``) is deliberately NOT
+            # named in the posted notice. Naming which of D-1 / D-3 / no-marker / bad-json
+            # fired hands the model — or an attacker whose diff is under review — a per-attempt
+            # oracle they can hill-climb against ("D-1 fired → collapse to one marker"; "D-3
+            # fired → drop the leading prose") until the block parses clean. In Stage 1 this
+            # is shadow so the F-a-direction risk is bounded, but the reversal PR is the
+            # payoff for this same oracle. Rider 2 still gets the sub-cause: it rides on
+            # :func:`_log_objections` below, which is not posted anywhere the reviewed
+            # revision can read. Pinned by
+            # :func:`test_d_divergence_notice_never_names_the_missing_sub_reason`.
+            lines.append(
+                "> No readable objection block was found, so the derived side defaults to "
+                "REQUEST_CHANGES (fail-closed). This says nothing about the review above."
+            )
     return "\n".join(lines)
+
+
+def _log_objections(pr_slug: str, head_sha: str | None, decision: VerdictDecision) -> None:
+    """One structured line per review — the AUXILIARY channel for the shadow (J-4 (iii)).
+
+    Auxiliary, not the record: the gate notice above is where a reader finds this. A log line
+    is what ``spec/process/README.md`` (旧 §N.3) measured as unread, so it is here for grepping
+    a corpus of runs, never as the place a divergence is announced.
+
+    The ``missing_reason=`` field (rider-3 msg-2130 §3) breaks ``parse=missing`` out into
+    its five sub-causes (``no-marker`` / ``multi-marker`` / ``prose-between`` / ``bad-json`` /
+    ``not-a-list``). Without it, a spike in ``parse=missing`` cannot be triaged: three
+    independent signals — the model wrote nothing (baseline), D-1 fired (multi-marker), D-3
+    fired (prose-between) — all collapse to the same string. The field is ``-`` when
+    ``status != MISSING``, so the log line stays grep-friendly.
+    """
+    report = decision.objections
+    missing_reason = report.missing_reason.value if report.missing_reason is not None else "-"
+    logger.info(
+        "naysayer objections %s (head %s): parse=%s missing_reason=%s blocking=%d advisory=%d "
+        "by_class=%s authored=%s posted=%s derived=%s diverged=%s",
+        pr_slug,
+        head_sha or "?",
+        report.status.value,
+        missing_reason,
+        len(report.blocking),
+        len(report.advisory),
+        report.counts_label(),
+        _model_verdict_label(decision.model_verdict),
+        _gate_verdict_label(decision.gate_verdict),
+        _gate_verdict_label(decision.derived_verdict),
+        decision.diverged,
+    )
 
 
 def prepend_gate_notice(body: str, decision: VerdictDecision) -> str:
@@ -714,7 +1574,47 @@ def _make_diff_view(diff: str) -> DiffView:
     )
 
 
-def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
+def _format_b_a_marker(coverage: list[CrossPrApproveCoverage]) -> str:
+    """Render the B-(a) marker section for the pass-1 user prompt (msg-473 §5, msg-475 §5).
+
+    Empty list → empty string: the caller inserts nothing, and pass 1 sees a prompt that
+    is byte-identical to the pre-B-(a) shape (T1 anti-tautology on the "no coverage"
+    path — tests assert both branches, so drift between them fails a test).
+
+    Non-empty list → a labelled section that names each ``(sha, other_pr, approved_at)``
+    row, followed by the accountability clause (msg-473 §3 — "(a) は archive 上の
+    accountability を買う"). The prompt does NOT tell the naysayer what verdict to reach;
+    that would violate the "自然言語は defer 決定にしか使わない" invariant (msg-473 §4)
+    from the other direction — a driver-side directive that shapes the verdict is the
+    exact procedural constraint msg-473 forbade. The clause says only: *if you decide to
+    object at these bytes, name what new evidence changes the prior verdict.* The
+    naysayer stays free to object; the archive gains a record of the reasoning.
+
+    Sha renders in short form (first 12 chars) to keep the prompt compact — the full
+    sha stays in the driver's log line, not in the model's context.
+    """
+    if not coverage:
+        return ""
+    lines = [
+        "Prior-verdict coverage (msg-473 §5 B-(a), accountability marker, not a verdict",
+        "constraint): the following commits in this diff have already received a head-",
+        "bound APPROVE on ANOTHER PR. This is informational — you remain free to object.",
+        "If you do object at these specific commits, name in your critique what evidence",
+        "on this PR's head sha changes the prior verdict.",
+        "",
+    ]
+    for c in coverage:
+        approved = c.approved_at or "unknown time"
+        lines.append(f"- commit {c.sha[:12]} approved in {c.other_pr.slug} at {approved}")
+    return "\n".join(lines)
+
+
+def _build_messages(
+    text: str,
+    pr_slug: str,
+    *,
+    coverage: list[CrossPrApproveCoverage] | None = None,
+) -> list[ChatMessage]:
     """Pass-1 (verdict) messages — the SINGLE entry point for the pass-1 system prompt.
 
     ``text`` is the ALREADY-TRUNCATED diff body (i.e. ``DiffView.text``): truncation is
@@ -732,11 +1632,19 @@ def _build_messages(text: str, pr_slug: str) -> list[ChatMessage]:
     verbatim via ``build_preamble()`` in the same single entry point the design-time
     agent uses, so a one-place edit to ``spec/NAYSAYER_PRINCIPLES.md`` propagates to
     both surfaces (fail-loud: a missing/blank SOT raises).
+
+    ``coverage`` (B-(a) marker, msg-473 §5 / msg-475 §5): when non-empty, its
+    :func:`_format_b_a_marker` rendering is inserted BEFORE the diff fence so the model
+    reads the marker in the same message that carries the diff. ``None`` / empty list is
+    the pre-B-(a) shape byte-for-byte — the marker is opt-in and fail-open in one place.
     """
     system = build_pr_review_pass1_system_prompt(verdict_task_prompt=_PR_REVIEW_SYSTEM_PROMPT)
+    marker = _format_b_a_marker(coverage or [])
+    marker_section = f"{marker}\n\n" if marker else ""
     user = (
         f"Review the diff for pull request {pr_slug}. Critique it, quoting the "
         f"specific hunks you object to, and end with your VERDICT line.\n\n"
+        f"{marker_section}"
         f"```diff\n{text}\n```"
     )
     return [
@@ -1023,18 +1931,42 @@ class NaysayerPrReviewDriver:
         view = _make_diff_view(diff)
         truncated = view.truncated
 
+        # B-(a) accountability marker (msg-473 §5, msg-475 §5): resolve which commits in this
+        # diff already carry a head-bound APPROVE on ANOTHER PR — the stacked-PR scenario
+        # msg-456 §R-B named. Fail-open (msg-473 §5 "解決に失敗したら marker 無しで撃つ"): any
+        # exception on the lookup path is logged and swallowed, and the review proceeds with
+        # ``coverage = []``. The marker never gates the fire; it enriches the request when
+        # available and gets out of the way when not.
+        coverage: list[CrossPrApproveCoverage] = []
+        try:
+            coverage = await self._github.find_cross_pr_head_bound_approves(
+                pr, reviewer_login=self._review_login
+            )
+        except Exception as exc:  # fail-open by design (msg-473 §5)
+            logger.warning(
+                "B-(a) coverage lookup failed for %s: %s (fail-open — firing without marker)",
+                pr.slug,
+                exc,
+            )
+            coverage = []
+
         # A-3 two-pass structure (msg-692 §1): run pass 1 (verdict) and pass 2 (ADR-pointer
         # collection) in parallel. Pass 1 = judge; pass 2 = index-injected hint collection whose
         # output cannot alter the verdict (structural guarantee — the driver never reads a
         # verdict token from pass 2's return value). Both fire against the SAME diff at the SAME
         # commit, so a reviewer can trust the ADR pointer section corresponds to the same
         # evidence the verdict was formed on.
-        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(view, pr.slug)
+        pass1_result, pass2_selection, pass2_raw = await self._run_two_passes(
+            view, pr.slug, coverage=coverage
+        )
 
         if isinstance(pass1_result, LexoraTimeoutError):
-            # M2 (T34): pass 1 did not finish within the client timeout. Degrade to fail-closed
-            # REQUEST_CHANGES via the same post_critique + _submit_review path, rather than
-            # letting the timeout propagate and crash the pipeline. Pass 2's own outcome
+            # T-infra-failure-posts-empty-rc: pass 1 did not finish within the client timeout.
+            # Degrade to a COMMENT-hold (addressed to the human) via the same post_critique +
+            # _submit_review path, rather than letting the timeout propagate and crash the
+            # pipeline. COMMENT (not REQUEST_CHANGES): the gate did not reach a verdict, and
+            # an empty RC would trigger the conductor to spawn the implementer against a body
+            # that carries no fix — see :meth:`_degrade_on_timeout`. Pass 2's own outcome
             # (whatever it was — usually also unavailable when Lexora is wedged) is stamped on
             # the marker of the degrade body, keeping the marker invariant intact.
             return await self._degrade_on_timeout(
@@ -1068,6 +2000,7 @@ class NaysayerPrReviewDriver:
         # re-states the rule as a 3-line reference and asserts equivalence.
         decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
         verdict = decision.gate_verdict
+        _log_objections(pr.slug, ci.head_sha, decision)
         # Prepend the gate notice BEFORE the ADR-pointer marker is appended: the notice sits
         # at the head of the body so a reader who sees ``CHANGES_REQUESTED`` in the review
         # state finds the reason at the top of the critique, not after a possibly-truncated
@@ -1102,7 +2035,11 @@ class NaysayerPrReviewDriver:
         )
 
     async def _run_two_passes(
-        self, view: DiffView, pr_slug: str
+        self,
+        view: DiffView,
+        pr_slug: str,
+        *,
+        coverage: list[CrossPrApproveCoverage] | None = None,
     ) -> tuple[Any, AdrPointerSelection, str]:
         """Execute pass 1 + pass 2 concurrently, return their (typed) outcomes.
 
@@ -1110,6 +2047,12 @@ class NaysayerPrReviewDriver:
         :func:`_make_diff_view`. Both passes read ``view.text`` — the raw diff string
         does not reach this method, so the truncation cannot be recomputed here (round-3
         PR-gate finding on PR #186). Same view = same evidence for both passes.
+
+        ``coverage`` (B-(a) marker, msg-473 §5) is threaded down to :func:`_build_messages`
+        for pass 1 only. Pass 2 (ADR-pointer collection) has no role in the accountability
+        marker — that pass is judging-neutral (msg-692 §2 "the driver never reads a verdict
+        token from pass-2's return value") and does not need to see the prior-verdict
+        context. Keeping coverage out of pass 2 preserves that separation.
 
         Returns a triple:
 
@@ -1125,7 +2068,7 @@ class NaysayerPrReviewDriver:
         """
         pass1_task = self._lexora.chat_completion(
             model=self._model,
-            messages=_build_messages(view.text, pr_slug),
+            messages=_build_messages(view.text, pr_slug, coverage=coverage),
             max_tokens=self._max_tokens,
         )
         pass2_task = self._collect_adr_pointers(view.text, pr_slug)
@@ -1184,38 +2127,67 @@ class NaysayerPrReviewDriver:
         would_skip_head_unchanged: bool = False,
         would_cap: bool = False,
     ) -> PrReviewOutcome:
-        """M2 (T34): a timed-out Lexora review → fail-closed REQUEST_CHANGES (never a silent pass).
+        """T-infra-failure-posts-empty-rc: a timed-out Lexora review → COMMENT-hold + human stop.
 
-        Mirrors the truncated-review path: post an explanatory critique, submit a REQUEST_CHANGES
-        review, and return the :class:`PrReviewOutcome` with ``timed_out=True`` so the timeout is
-        observable to the caller. The default verdict (REQUEST_CHANGES) keeps the gate on the same
-        safe side as a length-capped / truncated review; whether a transient timeout should instead
-        be a COMMENT-hold is the open question Q left for the naysayer / Tier-C (msg-503).
+        A pass-1 client timeout is an INFRA failure — the gate itself did not complete, so no
+        verdict was reached. Post an explanatory critique addressed to the HUMAN, submit a
+        ``COMMENT`` review (not ``REQUEST_CHANGES``), and return with ``timed_out=True`` so the
+        timeout is observable. ``REQUEST_CHANGES`` was the previous choice; the failure mode it
+        produced — the conductor spawning the implementer on an empty relay with nothing to fix
+        — was worse than the fail-closed asymmetry it bought (T-infra-failure-posts-empty-rc §1).
+
+        The judging rule this path now follows is the one already applied elsewhere in this
+        module: ``REQUEST_CHANGES`` is a fix signal, so it is reserved for reviews whose body
+        carries implementer-actionable content (a failing CI check, an objection block, a
+        parseable critique). Reviews where the gate itself could not finish (CI UNKNOWN in
+        :func:`_ci_gate_response`; the round-cap escalation above; this timeout path) post a
+        ``COMMENT`` and let the conductor's non-RC branch stop at the human. No new conductor
+        wiring is required — the routing at ``conductor/core.py`` already treats non-RC verdicts
+        as ``StopReason.HUMAN``.
+
+        ``COMMENT`` is not one of ``_VERDICT_STATES``, so the ``skip_if_head_unchanged`` reuse
+        path (:meth:`_latest_verdict_review`) cannot pick this posting up as the "already
+        reviewed this head" verdict; a timeout body will not calcify as the head's standing
+        verdict and be re-served on subsequent fires.
 
         The pass-2 selection (may be a real outcome if pass 2 finished before pass 1 timed out,
         or ``call-failed`` if it too failed) is stamped on the marker so the timeout-degrade
         body carries the marker like every other body — the marker invariant does not weaken
         on the safe-degrade path.
         """
+        head = ci.head_sha or "?"
         body = (
-            f"The naysayer review for {pr.slug} exceeded the configured Lexora client timeout and "
-            f"did not complete. A review that could not finish is treated as not-approved "
-            f"(fail-closed), the same as a truncated/length-capped review: an unfinished review "
-            f"must never APPROVE. Split the PR into smaller diffs or retry.\n\n"
-            f"VERDICT: REQUEST_CHANGES"
+            # 1. This is NOT a fix request — do not push a "fix" on the strength of this post.
+            f"This is not a fix request. Do not push a change on the strength of this posting: "
+            f"the naysayer gate for {pr.slug} did not reach a verdict, so there is no critique to "
+            f"answer.\n\n"
+            # 2. What failed (client timeout / head SHA).
+            f"What happened: the naysayer's pass-1 review call exceeded the configured Lexora "
+            f"client timeout against head {head} and did not complete.\n\n"
+            # 3. No verdict was reached ∴ this PR has NOT been approved by the gate.
+            f"No verdict was reached. This PR has not been approved by the naysayer gate; do not "
+            f"merge on the strength of this review.\n\n"
+            # 4. Addressed to the human: re-fire the gate, or adjudicate.
+            f"Addressed to the human: re-fire the gate against the current head, or adjudicate "
+            f"this PR directly (Tier-C).\n\n"
+            f"VERDICT: COMMENT"
         )
         selection = pass2_selection if pass2_selection is not None else _not_attempted_selection()
         _log_pass2(pr.slug, selection, pass2_raw)
         body = append_marker(body, selection)
+        # Timeout posts as COMMENT (not REQUEST_CHANGES) per origin/main change: the body
+        # is human-addressed, not a fix request; posting RC would ignite an implementer
+        # dispatch on an empty critique. The outcome's ``timed_out=True`` flag remains
+        # the machine-readable signal for the conductor to stop at the human.
         receipt = await self._post_and_submit(
             pr,
-            verdict=ReviewEvent.REQUEST_CHANGES,
+            verdict=ReviewEvent.COMMENT,
             body=body,
             head_sha=ci.head_sha,
             post_critique=post_critique,
         )
         return PrReviewOutcome(
-            verdict=ReviewEvent.REQUEST_CHANGES,
+            verdict=ReviewEvent.COMMENT,
             body=receipt.body,
             ci_state=ci.state,
             head_sha=ci.head_sha,
@@ -1339,6 +2311,18 @@ class NaysayerPrReviewDriver:
           so the verdict (rendered in the body) is still recorded. Same body, so the
           footer stamps the ORIGINAL attempted event — replay-consumer semantics remain
           honest: "we attempted APPROVE; GitHub gave us a COMMENT because of author=approver".
+
+          GitHub forbids a formal APPROVE / REQUEST_CHANGES on your *own* PR. T22 provisions
+          the naysayer a distinct identity (``MINDWIRE_NAYSAYER_GITHUB_TOKEN`` =
+          ``spirrowgames-ops``) so the formal verdict goes through. This COMMENT fallback
+          backstops the two ways the two identities can still coincide: (a) the window before
+          that token is provisioned, and (b) — measured on PR #194, 2026-08-29 — a PR
+          **opened by** ``spirrowgames-ops``, which collides from the other end and is not
+          fixed by any token change. A COMMENT is NOT a formal verdict:
+          ``_latest_verdict_review`` does not see it, so case (b) degrades the gate to
+          advisory for the whole life of that PR — the fix is to re-open the PR under the
+          author identity, not to lean on this fallback.
+
         * **TERMINAL, environment-scoped** (D-1 + probe): raise
           :class:`EnvironmentTerminalError` so the daemon entry point can exit 2 and
           the PS wrapper alert-without-quarantine (DESIGN v3 §3, msg-1987 §D-7). The

@@ -91,13 +91,20 @@ async def test_context_is_rebuilt_each_round_not_frozen_at_spawn() -> None:
 
     async def _dispatch(handle: SessionHandle, event: ChatroomEvent) -> None:
         await real_dispatch(handle, event)
-        # simulate the dispatched role posting its reply
+        # simulate the dispatched role posting its reply.
+        #
+        # The reply hands to Bohr, not back to Einstein. It used to hand to Einstein, which is a
+        # self-handoff (author == next) — a shape the conductor now refuses to spawn and stops on
+        # (StopReason.SELF_HANDOFF, design §6.1). This fixture only ever needed *a second round*
+        # to prove the context is rebuilt rather than frozen at spawn; which participant that
+        # round goes to is incidental, and a handoff that the loop treats as a fault is the wrong
+        # way to ask for one.
         mcp.messages = [
             *mcp.messages,
             {
                 "msg_id": f"msg-{len(mcp.messages) + 1}",
                 "author": "Einstein",
-                "content": "review\n\nNEXT: Einstein",
+                "content": "review\n\nNEXT: Bohr",
                 "timestamp": "",
             },
         ]

@@ -1,0 +1,31 @@
+{
+  "id": "M-3",
+  "title": "conflicting PR generates no CI run, gate stuck at COMMENT(ci=pending)",
+  "observed_by": "operator",
+  "observed_at": "2026-09-02T00:00Z",
+  "spec_thread": "T-stalled-pr-has-no-detector",
+  "spec_msg_ids": ["msg-2354"],
+  "provenance": {
+    "source": "GitHub API: actions/runs?head_sha=068e392 → 0 rows; mergeable=CONFLICTING / DIRTY",
+    "captured_at": "2026-09-08T00:00Z",
+    "captured_by": "operator lane, msg-2354 §1 M-3"
+  },
+  "predicate_input": {
+    "kind": "pr",
+    "identifier": "spirrow-mindwire#206",
+    "pr_state": {
+      "is_open": true,
+      "is_draft": false,
+      "has_verdict": true,
+      "verdict_is_request_changes": false,
+      "verdict_recorded_as_indefinite_input": true,
+      "merge_state_is_executable": false,
+      "is_approve_awaiting_human_merge": false
+    },
+    "n_threshold_hours": 12,
+    "hours_since_last_participant_motion": 48
+  },
+  "expected_verdict": "stall",
+  "not_representable_reason": null,
+  "notes": "Two signals in one PR: (a) gate posted an indefinite verdict (ci=pending), and (b) merge state is DIRTY so rebase is needed. Either one alone makes needs_actor_pr True. The classifier's disposition matters here — classify() returns externally-blocked when merge is not executable, refireable when CI became definitive after indefinite verdict. Both are stalls; the disposition is what the human needs, and the classifier ordering (externally-blocked > refireable) surfaces the more actionable one first. Auto-refire against a CONFLICTING PR accomplishes nothing (msg-2354 §3-2)."
+}

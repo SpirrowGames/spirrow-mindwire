@@ -26,6 +26,22 @@
 # the notification surface instead of a silent regression back to "判断待ち" — the whole
 # problem this file exists to end.
 #
+# The DELIBERATELY-SILENT set (absent from the map on purpose, so no notification fires):
+#   'none'    — the thread settled; the normal end, the sweep just moves on.
+#   'hold'    — the operator asked for the stop; telling them about it is not news.
+#   'ci_wait' — pre-gate CI-wait admission DEFERred (design v0.3.1 §5.2A, R1a/R2): CI on the PR
+#               head has not concluded and the wait budget has not run out. Waking a person to
+#               say "CI is still running" is precisely the class of stop §5.2A exists to remove
+#               (its own table counts three such stops on #222 and targets zero), and the wait
+#               is bounded by CAP_CHECK / CAP_NOCLOCK — past the cap admission returns
+#               'human' via R3, which IS in the map above.
+# This set is not a narrowing of the notification predicate (note 1): every reason that means
+# "the loop parked and needs a person" is still in the map. Do not add 'ci_wait' to it.
+#
+# 2026-09-14 (design §6.1): 'self_handoff_to_human' joined the MAP, not this set. A thread
+# whose head hands to its own author cannot move until a person edits that head, which is
+# exactly the class of stop note 1 says must stay audible.
+#
 # NO TOP-LEVEL SIDE EFFECTS: this file is dot-sourced by both the runner and the tests, so
 # any assignment at script scope here would mutate the caller's scope. Do NOT set
 # $ErrorActionPreference here (PR-gate finding on #172): the runner already declares its own
@@ -43,11 +59,12 @@ function Get-StopReasonPhraseMap {
     # The map's contents mirror the $needsHuman literal that used to live in
     # deploy/run-conductor-scheduled.ps1 verbatim; the migration must not change any wording.
     return @{
-        'human'                = "あなたの判断待ちで停止しました"
-        'no_handoff_to_human'  = "NEXT: が読めず human に fallback して停止しました"
-        'no_progress_to_human' = "dispatch した role が何も投稿せず停止しました"
-        'round_cap'            = "ラウンド上限で停止しました（暴走バックストップ発動）"
-        'empty_thread'         = "スレッドにメッセージがありません（優先リストの指定ミスの可能性）"
+        'human'                 = "あなたの判断待ちで停止しました"
+        'no_handoff_to_human'   = "NEXT: が読めず human に fallback して停止しました"
+        'no_progress_to_human'  = "dispatch した role が何も投稿せず停止しました"
+        'self_handoff_to_human' = "自己ハンドオフ（author == next）のため人間の介入が必要です"
+        'round_cap'             = "ラウンド上限で停止しました（暴走バックストップ発動）"
+        'empty_thread'          = "スレッドにメッセージがありません（優先リストの指定ミスの可能性）"
     }
 }
 

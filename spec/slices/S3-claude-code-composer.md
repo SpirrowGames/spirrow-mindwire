@@ -1,5 +1,7 @@
 # S3 — Claude Code backend for the decision-request composer
 
+> **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
+
 **Status**: implementation SOT (single source of truth). This file — not a chatroom
 message — is what `OBL-READBACK-ENTRY` reads before touching S3 code. If a later
 Tier-C decision in the chatroom changes S3, that decision has no force until this
@@ -103,7 +105,7 @@ PR, cannot query anything — the "does not decide" guarantee is structural.
   environment shape it always does.
 - **Proxy environment (D-44 — Tier-C msg §24)**: `HTTP_PROXY`,
   `HTTPS_PROXY`, and `NO_PROXY` are on the allowlist. On the
-  sg-ai-server-01 deploy host, the ONLY route out of the box to
+  {{HOST_SERVICES}} deploy host, the ONLY route out of the box to
   `api.anthropic.com` is through a squid proxy exported via these three
   variables. Without them the child `claude -p` fails INSIDE the CLI
   with `terminal_reason:"api_error"` and `duration_api_ms:0` (the API
@@ -164,11 +166,13 @@ historical reference; the v2 revision layers D-46 rev2 through D-53 rev2 on
 top of these five, described in §D-46..§D-53 below):
 
 1. You do not decide. You phrase.
-2. At least 2 options, each with `id`, `label`, `gain`, `loss`.
+2. At least 2 options, each with `id`, `label`, `gain`, `loss`. **The axis
+   of the options is the problem, not the participants** — see §D-55.
 3. Exactly one recommendation (or none). If given, its reason MUST cite a
    concrete fact from the tail (a msg-id, a number, a quoted phrase). General
    platitudes ("A is safer overall") violate the rule.
-4. Unknowns are declared as unknown. Do not fill.
+4. Unknowns are declared as unknown. Do not fill. **Only unknowns that could
+   change which option is right** — see §D-56.
 5. Output is JSON only, matching the specified schema. Prose outside JSON
    is a violation.
 
@@ -203,6 +207,33 @@ The forced (a)/(b) branch removes the option to invent.
 same failure mode applies to code identifiers (§D-51 below). Both use the
 identical (a)/(b) branch so the model sees one pattern rather than two
 different mechanisms.
+
+### D-46 rev3 — the reader is the project's OWNER (2026-09-14, prompt v3)
+
+**What rev2 got right and rev3 keeps**: the (a)/(b) branch above, unchanged.
+The thread's interior — its internal labels and its code identifiers — is
+still opaque to the reader and still has to be glossed. That is the part
+that was always load-bearing.
+
+**What rev2 got wrong**: it described the reader only by what they had NOT
+read ("the Discord reader has NOT read the thread"), and the prompt turned
+that into a reader who knows nothing at all. Measured 2026-09-14 on a live
+request, the composer opened with *"This thread is investigating why 18
+quarantined work items in **a system called spirrow-mindwire** stopped…"* —
+it was explaining the project to the person who owns it. The same request
+carried 12 unknowns, one of which was *"Whether Takahito, named as the
+person who decides quarantine release, is the reader of this decision
+request"*.
+
+**Rule**: the reader OWNS these projects. They know what the project is,
+what it is for, and who works on it. The prompt states this, and forbids
+introducing the project or defining it. The question starts from the
+problem.
+
+**Why this is not a length rule**: D-48 rev2 stands (§D-48). Nothing here
+asks the model to compress. The text gets shorter only because the project
+explainer and the thread's history stop being written at all — content the
+owner does not need was never a length problem, it was an audience problem.
 
 ## D-47 — "hallucinating is worse than jargon" — rationale note (msg-1442 §28.2)
 
@@ -437,6 +468,72 @@ them would raise the misfire rate without raising the hit rate. If a
 future stop makes a commit the actual decision target, adding it is a
 one-word prompt edit with a `PROMPT_VERSION` bump.
 
+## D-55 — the options' axis is the problem, not the participants (2026-09-14, prompt v3)
+
+**Status**: この節が軸の SOT。**v2 までこの spec には軸を定める行が無く、定義は
+prompt 本文にしか存在しなかった**（`claude_code.py` の `options[].label`）。
+実装だけが持っていた規則をここで初めて明文化する。
+
+**Problem this closes.** v2 の prompt は label を "one sentence naming what the
+reader would DO" と定義していた。このシステムで読み手が「する」ことはエージェント
+の差配なので、モデルは忠実にそう書く。2026-09-14 に本番の判断ページで実測した
+1 件は、4 択すべての主語がエージェントだった:
+
+- A: "Let Bohr proceed as written: dispatch the two Lane 1 measurements to H…"
+- B: "Stop the agent loop and read Bohr's finalized capture specification an…"
+- C: "Have Bohr run only the first measurement, the time-boxed check for whe…"
+- D: "Direct Bohr to settle the disagreement with Einstein about what causes…"
+
+Takahito（唯一の決裁者）の指摘:
+
+> 判断の軸が「誰の意見を採用するか」ってなっているのがおかしいんだよね。僕が判断
+> すべきは誰の意見を採用するかじゃなくて、問題をどう解決するか。結果的に誰かの意見
+> を採用することになるけど、**それは結果であって判断軸じゃない**。
+
+**なぜこれが体裁の問題ではないか。** エージェントを主語にすると、**問題の解き方と
+しては別物である複数の案が、1 つの選択肢（「進めさせる」）に潰れる**。実測の A は
+Bohr が出した技術案 2 つのうち片方を含んでいたが、もう片方は選択肢として現れて
+いない。読み手には比較するものが残らない。さらに B（「止めて自分で読む」）は問題の
+解き方ですらなく、読む行為が解決策の位置に置かれている。
+
+**Rule.** `options[].label` は**問題の解き方**を名指す。主語は問題であって、人でも
+エージェントでもない。誰が実行するかはその選択の結果であり、読み手は**別の口**
+（判断ページの宛先 select）で指定する。`gain` / `loss` は同じ軸の上に置く ——
+読み手が選択肢を横に並べて同じ次元で比較できること。
+
+スレッドの参加者が出した提案は、**「X の提案」としてではなく、それが問題に何をするか
+で**記述して選択肢に並べる。tail に実質 1 案しか無いなら、そのことを `question` に
+書き、tail 自身が挙げている代替（何もしないを含む）を同じ書き方で並べる。
+
+**Scope note (D-50 rev2).** 本決定は schema キーを増やさない。`label` の**意味**を
+変えるだけで、キーの改名でも削除でもない ∴ D-50 rev2 の制約に抵触しない。
+
+**Where enforced.** prompt の OUTPUT SHAPE `options[].label` のみ。**機械的な検査は
+無い** —— 「エージェントが主語か」は文字列では判定できず、判定できるふりをした
+テストは §Testing 6a が禁じている false comfort そのものになる。検出経路は A-19 rev2
+の人間による A/B。
+
+## D-56 — unknowns は判断に効くものだけ (2026-09-14, prompt v3)
+
+**Problem this closes.** v2 rule 6 は「tail から検証していないものを**全部**書け」で、
+「空リストが正しいのは tail がこの判断にとって完全なときだけ」と続く。結果、実測の
+1 件は unknowns が **12 件・平均 157 文字**になり、その中には次が含まれていた:
+
+> "Whether Takahito, named as the person who decides quarantine release, is
+> the reader of this decision request."
+
+これは tail の欠落ではなく**composer の指示の欠落**で、しかもその答えは prompt に
+書いてある。読み手は自分が誰かを教えてもらう必要がない。
+
+**Rule.** unknowns に載せるのは「検証しておらず、**かつ、もし違っていたらどの選択肢が
+正しいかが変わりうる**もの」。D-46 rev3 / D-51 の (b) 分岐で落ちたラベル・識別子は
+引き続き載せる（定義されていない語で説明された選択肢は読み手が重み付けできない
+∴ 判断に効く）。**読み手が誰か・読み手の意図・この依頼が何のためか**についての
+unknown は書かない。
+
+**What this does NOT change.** D-39 property 4「Unknowns are declared as unknown.
+Do not fill.」は不変。埋めてよいという話ではなく、**関係ないものを書かない**という話。
+
 ## Prompt-version bump policy (D-49 corollary)
 
 Bumping is a three-edit change, all in the SAME commit as the prompt-text
@@ -458,6 +555,15 @@ row; that needs a comparison against git history, which nothing in the
 suite does. The mapping makes the violation visible in a diff, it does
 not make it impossible. Mechanising it is deliberately OUT OF SCOPE for
 the v2 revision (D-54 follow-up).
+
+**Versions shipped.**
+
+| version | digest | decisions |
+|---|---|---|
+| `2` | `4b7a8119…59859c4` | D-46 rev2 / D-47 / D-48 rev2 / D-49 / D-50 rev2 / D-51 / D-52 / D-53 rev2 |
+| `3` | `00b9fa52…7f74c4b` | **D-55**（軸）/ **D-46 rev3**（読み手は持ち主）/ **D-56**（unknowns） |
+
+v3 は長さ目標を導入しない。D-48 rev2 は不変。
 
 **User-prompt shape**:
 
@@ -595,6 +701,9 @@ Decision (Tier-C msg §25.2):
    to be lowered instead, and that is a Tier-C trade-off (Bohr's original
    D-5 chose 60 s under the same logic; going above it changes the
    trade-off's shape).
+   **→ 実行済み。この clause は §D-57 に置き換わった** (2026-09-15)。報告の
+   中身は「v2 prompt で実スレッドが 60 s を超え `composer_status=timeout`」で、
+   Tier-C の回答が D-57 の規則。**clause 2（tail を削らない）は不変。**
 
 Test coverage: existing unit tests pin `timeout_seconds=30` explicitly in
 the two D-41 timeout cases; those constants are arbitrary test doubles
@@ -602,6 +711,58 @@ and do NOT track the default. Adding a pin on the default itself would
 make every future ceiling change a two-file edit for no diagnostic gain;
 the three-site synchronization requirement above is the invariant that
 matters, and the D-45 note in each site is its documentation.
+
+## D-57 — ceiling は「成功した最長 + バッファ」で更新する (Tier-C, 2026-09-15)
+
+**Status**: D-45 clause 4 の後継。以後、wall-clock ceiling は**議論ではなく
+規則**で決める。
+
+**Rule**: `DEFAULT_TIMEOUT_SECONDS` は **`composer_status=ok` で終わった実行の
+うち最長の elapsed + バッファ**。より長い**成功**実行が測れたら、その都度
+3 箇所を同時に更新し、下の表に測定を追記する。
+
+**`ok` で終わった実行だけが根拠になる。** タイムアウトした実行は「その仕事に
+どれだけかかるか」の証拠ではない ∴ ceiling を動かさない。
+
+**なぜ緩い方に倒すか (Takahito)**: このサービスは**待っているユーザーが居ない**。
+高すぎる ceiling の代償は、稀な失敗時に raw ping への fallback が遅れること。
+低すぎる ceiling の代償は、**正常な実行で作れたはずの問いを失うこと**。この 2 つは
+釣り合わない。どちらに転んでも I-2 で raw ping は出るし、人の応答遅延は実測
+8-11 時間 (msg-1370 §1) なので、この範囲の値は誤差。
+
+### 測定の記録 (すべて実バックエンド / `composer_status=ok`)
+
+| elapsed | prompt | 入力 | 測定ホスト |
+|---|---|---|---|
+| 33,812 ms | v1 | A-18, voxelworld T-T227, 21,026 chars | deploy host |
+| 40,213 ms | v1 | A-20 baseline (Tier-C §2, 2026-08-22) | deploy host |
+| 109,530 ms | v2 | A-19 rev2, mindwire T-quarantine, 25,105 chars | **{{HOST_SERVICES}}** |
+| 153,183 ms | v3 | A-19 rev2, 同一入力 | **{{HOST_SERVICES}}** |
+
+**現行値 240 s** = 153,183 ms + 約 57%。
+
+**交絡を隠さない**: 上位 2 件は A-19 rev2 の A/B を {{HOST_SERVICES}} で走らせた
+ものなので、40 s ベースラインとの 2.7 倍差は**ホスト差と交絡している**。D-57 の
+規則としては問題ない (240 s はどの成功実行より上) が、**次に loop host で測った値が
+次の改訂を駆動すべき**。
+
+### A-19 rev2 / A-20 の実施記録 (2026-09-15)
+
+- **A-19 rev2: pass。** 入力 `spirrow-mindwire/T-quarantine-reasons-captured-but-never-read`
+  (tail 5 / 25,105 chars) を v2 と v3 で 2 回 compose し、Takahito が判定。
+  v2 の 4 択は全部「承認プロセスをどう進めるか」で、スレッドが検討した
+  Candidate B が選択肢に現れていなかった。v3 は「ログを読めるようにする 3 通りの
+  方法」(射影 / sidecar / 現状維持) になり、**Candidate B と「何もしない」が
+  選択肢として現れた**。question 1355 → 1125 字。
+  v2 の unknowns には「この意思決定者がスレッド全体を読んだのか不明」——— D-56 が
+  名指しで禁じた形 ——— が入っていたが、v3 では消え、SDK 型定義 / transcript の
+  実在 / ADR の実在という**判断に効く 3 件**になった。
+- **A-19 の限界**: §14 (Windows cp932) と D-44 (proxy scrub) は Linux 上の実行では
+  踏めない ∴ **この実施は A-18 の代替にはならない**。
+- **A-21 rev2 は未実施。** `Format-DecisionMessage` は PowerShell で、実施ホストに
+  pwsh が無い。参考値として v2 材料の実寸: question 1,235 / labels 715 /
+  得失 2,122 / 推奨理由 496 / unknowns 1,895 = **合計 6,463 字 = 予算 1950 の
+  3.3 倍**。切り捨ての梯子だと**ラベルまで落ちる**計算だが、これは実測ではない。
 
 ## Extras (envelope) — the full list S3 populates
 

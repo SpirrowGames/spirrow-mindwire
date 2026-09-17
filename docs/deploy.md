@@ -1,5 +1,7 @@
 # Deploy — Stage 3 unattended conductor daemon (ADR-18)
 
+> **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
+
 How to run the NEXT-driven design-loop **conductor** (`mindwire-loop --mode conductor`) as an
 unattended daemon. The conductor reads one design thread and serially dispatches the single
 `NEXT:`-named role each turn (proposer → implementer → naysayer), driving it to a stop condition
@@ -26,18 +28,18 @@ The daemon needs to reach four things from wherever it runs:
 
 | Dependency | Endpoint | Notes |
 |---|---|---|
-| magickit chatroom MCP | `MINDWIRE_MAGICKIT_MCP_URL` (default `http://100.79.84.62:8117/mcp`) | the thread substrate; reachable from sg-tomtebo-01 over Tailscale (verified — the voxelworld conductor smoke read/posted through it) |
-| Lexora gateway | `http://100.79.84.62:8110` | design-time naysayer (`naysayer` tier → Gemini) **and** the Tier B PR-gate driver |
+| magickit chatroom MCP | `MINDWIRE_MAGICKIT_MCP_URL` (default `http://{{IP_SERVICES}}:8117/mcp`) | the thread substrate; reachable from {{HOST_LOOP}} over Tailscale (verified — the voxelworld conductor smoke read/posted through it) |
+| Lexora gateway | `http://{{IP_SERVICES}}:8110` | design-time naysayer (`naysayer` tier → Gemini) **and** the Tier B PR-gate driver |
 | Claude inference | `https://api.anthropic.com` | the implementer's local subscription on the daemon host |
 | GitHub | api.github.com | PR open / diff read / review submit (via the scoped token) |
 
-**sg-tomtebo-01 is a viable host**: it reaches magickit + Lexora over Tailscale and has a local
-Claude subscription for the implementer. (Running co-resident on sg-ai-server-01 is the alternative;
+**{{HOST_LOOP}} is a viable host**: it reaches magickit + Lexora over Tailscale and has a local
+Claude subscription for the implementer. (Running co-resident on {{HOST_SERVICES}} is the alternative;
 then magickit/Lexora are loopback and the implementer needs its own inference there.)
 
 ### Host prerequisites (egress chokepoint + clock)
 
-sg-tomtebo-01 runs an **allow-list egress model**: every firewall profile is
+{{HOST_LOOP}} runs an **allow-list egress model**: every firewall profile is
 `DefaultOutboundAction=Block`, only `squid.exe` has an outbound rule, and `squid.conf`
 (`C:\Squid\etc\squid\squid.conf`, outside this repo) decides which domains are reachable. Two
 consequences bite the daemon:
@@ -87,7 +89,8 @@ own **clone** — not a linked worktree). `[conductor].roster` maps chatroom per
 
 ## Target-repo branch flow (V-4, 2026-08-02)
 
-The dogfooding target (Spirrow-VoxelWorld) switched to a release-train flow with dev-speed plan
+The dogfooding target (spirrow-voxelworld, renamed from `Spirrow-VoxelWorld` on 2026-09-11) switched
+to a release-train flow with dev-speed plan
 batch 1, V-4: **feature → develop → release → main**.
 
 - `develop` is the integration branch, synced to `main@15883c1` on 2026-08-02 (voxelworld PR #175).
@@ -120,7 +123,7 @@ batch 1, V-4: **feature → develop → release → main**.
 
 > **Where this rule has to live.** The implementer runs with `setting_sources=[]` (SDK isolation, a
 > deliberate credential-surface fix — see the adapter), so it does **not** read any `CLAUDE.md`. A
-> branch rule recorded only there binds humans and not the loop. Spirrow-VoxelWorld currently has no
+> branch rule recorded only there binds humans and not the loop. spirrow-voxelworld currently has no
 > branch-policy document of its own, so this section is the de-facto record; the SOT belongs in the
 > target repo, and moving it there is an open follow-up.
 
@@ -178,7 +181,7 @@ conductor is worth it at all.
 
 ### The daemon runs from its OWN checkout, never a working one
 
-**The scheduled task must point at a clone nobody edits** — on sg-tomtebo-01,
+**The scheduled task must point at a clone nobody edits** — on {{HOST_LOOP}},
 `C:\Users\tomtar\spirrow-mindwire-daemon`, deliberately beside the data dir rather than in the dev
 workspace, so the location itself says "not a place to work".
 
@@ -549,12 +552,41 @@ Alerts fire for every human-terminal `StopReason`, not just `human`:
 | `human` | yes — the Tier-C decision point |
 | `no_handoff_to_human` | yes — `NEXT:` unparseable, routed to the human |
 | `no_progress_to_human` | yes — the dispatched role posted nothing |
+| `self_handoff_to_human` | yes — the head hands to its own author; nobody was spawned |
 | `round_cap` | yes — runaway backstop tripped |
 | `empty_thread` | yes — almost always a typo in the priority list |
 | `none` | **no** — a settled thread is the normal end; the sweep just moves on |
+| `hold` | **no** — the operator asked for the stop |
+| `ci_wait` | **no** — pre-gate CI wait; bounded by the admission caps |
 
 Do not narrow this to `reason -eq 'human'`. The first live sweep after this was wired stopped with
 `no_progress_to_human`, which a narrower check drops silently.
+
+### Two of these stops PARK the thread (2026-09-14, design §6.2)
+
+`no_progress_to_human` and `self_handoff_to_human` are not "try again in a while" — they are
+"running this exact head again achieves exactly the same nothing". After such a run the sweep
+calls `head_skip_decide.py --mode commit-terminal`, which records the reason and the head it
+stopped on; `head_skip.decide`'s Stage 1b then **SKIP**s the thread until its head msg id
+changes. Any other stop reason clears that state, so the call is unconditional.
+
+Before this, those threads fell to Stage 2's backoff, which is a floor on the launch *rate* and
+by design never terminates: two threads sat at one launch per hour for days
+(`spirrow-magickit/T-human-outage-degrade-close-only` and
+`spirrow-mindwire/T-scoped-driver-verdict-never-reaches-chatroom`, 72 retries each, no reply and
+no record on any of them).
+
+**A parked thread does not un-park itself.** The head has to move — a person posts, or edits the
+head's `NEXT:`. `launch_attempts` is preserved through the park, so the log still shows how long
+the spin ran before it was stopped.
+
+### Spawn-unavailable targets stop at the human (ADR-2026-09-14-21)
+
+A `NEXT:` naming an identity whose 稼働形態 is not `terminal_coding_agent` — `Fermi`
+(`web_ai_chat`) is the shipped case — is not spawned. The conductor stops on `human`, the same
+stop `NEXT: human` produces, and posts the reason into the thread. The table lives in
+`[conductor.identity_embodiment]`; the ADR's own entry ships as a default, so an empty block is
+the ADR's behaviour rather than "spawn anything named".
 
 Alerts are keyed on `(reason, last_msg)`, so a thread parked on a human for days alerts **once**
 rather than on every tick. A thread that changes *how* it is stuck re-alerts.
@@ -578,8 +610,8 @@ caps accuracy at roughly ±1 s. It exists only because UDP/123 is blocked (see *
 
 ```powershell
 # magickit + Lexora reachable from this host?
-Test-NetConnection 100.79.84.62 -Port 8117   # magickit MCP
-Test-NetConnection 100.79.84.62 -Port 8110   # Lexora
+Test-NetConnection {{IP_SERVICES}} -Port 8117   # magickit MCP
+Test-NetConnection {{IP_SERVICES}} -Port 8110   # Lexora
 # secrets present? (the webhook lives in the User scope, NOT the session)
 if (-not $env:MINDWIRE_NAYSAYER_GITHUB_TOKEN) { "MISSING github token" }
 if (-not [Environment]::GetEnvironmentVariable('MINDWIRE_NOTIFY_DISCORD_WEBHOOK','User')) { "MISSING notify webhook" }

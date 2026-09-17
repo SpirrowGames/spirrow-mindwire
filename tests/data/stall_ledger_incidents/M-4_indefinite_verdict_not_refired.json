@@ -1,0 +1,31 @@
+{
+  "id": "M-4",
+  "title": "gate posted ci=pending, no auto-refire, operator hand-fired 12 times",
+  "observed_by": "operator",
+  "observed_at": "2026-09-02T00:00Z",
+  "spec_thread": "T-stalled-pr-has-no-detector",
+  "spec_msg_ids": ["msg-2354", "msg-2126"],
+  "provenance": {
+    "source": "T-infra-failure-posts-empty-rc msg-2126 (already-recorded incident thread)",
+    "captured_at": "2026-09-08T00:00Z",
+    "captured_by": "operator lane, msg-2354 §1 M-4"
+  },
+  "predicate_input": {
+    "kind": "pr",
+    "identifier": "spirrow-mindwire#PR-affected-by-empty-rc",
+    "pr_state": {
+      "is_open": true,
+      "is_draft": false,
+      "has_verdict": true,
+      "verdict_is_request_changes": false,
+      "verdict_recorded_as_indefinite_input": true,
+      "merge_state_is_executable": true,
+      "is_approve_awaiting_human_merge": false
+    },
+    "n_threshold_hours": 12,
+    "hours_since_last_participant_motion": 24
+  },
+  "expected_verdict": "stall",
+  "not_representable_reason": null,
+  "notes": "needs_actor_pr returns True on verdict_recorded_as_indefinite_input. The disposition is refireable (verdict_is_indefinite AND CI became definitive). D-5' allows one automatic remedy per head_sha — operator hand-fired 12 times, all 12 succeeded, confirming this is the disposition the ledger should produce."
+}

@@ -32,14 +32,29 @@ $script:StarvedThreshold         = [TimeSpan]::FromHours(24)
 # Get-JsonState / Write-Log stubs so the lifts stay self-contained.
 function Write-Log { param([string]$Message) }
 
+# Get-JsonState now lives in deploy/lib/Lease.ps1 (msg-2172 reader collapse) — dot-source it here
+# so the lifted wrapper functions that call Get-JsonState (e.g. Merge-StateForWrite) resolve. Lease
+# lib is pure functions with no top-level side effects, same as StopReason.ps1's discipline.
+$leaseLib = Join-Path $repoRoot 'deploy/lib/Lease.ps1'
+if (-not (Test-Path -LiteralPath $leaseLib)) { throw "Lease lib not found: $leaseLib" }
+. $leaseLib
+
 $functions = $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
-foreach ($name in 'New-QuarantineRecord', 'Get-DerivedQuarantineState', 'Get-FingerprintHint',
+foreach ($name in 'New-QuarantineRecord', 'Get-FailureClass',
+                  'Get-DerivedQuarantineState', 'Get-FingerprintHint',
                   'Get-QuarantineReproHint',
                   'Format-DurationDigest', 'Get-StarvedKeys', 'New-DailyDigest',
-                  'Get-SystemicAlertSignature', 'Merge-StateForWrite', 'Get-JsonState',
+                  'Get-SystemicAlertSignature', 'Merge-StateForWrite',
                   'Save-JsonState', 'Update-EvaluatedTimestamp', 'ConvertTo-UtcInstant',
-                  'Test-DigestClockAdvances') {
+                  # T-digest-exceeds-discord-limit-and-is-dropped (msg-2099..2106): Test-DigestClockAdvances
+                  # is retired in favour of the two-question split (delivered vs. full-success), so
+                  # cadence and health advance separately. See the two Check blocks below and the
+                  # dedicated Test-SweepDigest.ps1 for the full DoD suite.
+                  'Test-DigestDelivered', 'Test-DigestFullSuccess',
+                  'Get-DigestPeriod', 'Test-DigestDeliveryDue',
+                  'Get-DigestPeriodsMissed', 'Get-DigestHealthWarning',
+                  'New-DegradedDigestMessage', 'Get-NotificationFailureClass') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if (-not $fn) { throw "function not found in sweep script: $name" }
     Invoke-Expression $fn.Extent.Text
@@ -356,19 +371,61 @@ Check "starvation section excludes a brand-new live thread absent from state" $t
 Check "starvation section excludes an ex-live thread (state file only)" $true `
     ($digest2 -notmatch 'p/T-ex-live')
 
-Write-Host "Test-DigestClockAdvances — sent + skipped are terminal, only failed retries"
+Write-Host "Test-DigestDelivered / Test-DigestFullSuccess — the two questions after msg-2106"
 # THE regression this exists to prevent: previously a webhook-less run had Send-Notification
 # return $false on the "not configured" branch, the digest gate held its clock, digestDue stayed
-# true forever, and every 5-min tick spammed 2 log lines. Locking the terminal-outcomes table into
-# this helper means any future edit that flips a case is caught by this test.
-Check "sent -> clock advances" $true (Test-DigestClockAdvances -Result 'sent')
-Check "skipped -> clock advances (no webhook, not spamming the log)" $true `
-    (Test-DigestClockAdvances -Result 'skipped')
-Check "failed -> clock HELD (transient, retry next tick)" $false `
-    (Test-DigestClockAdvances -Result 'failed')
-# Unknown status is treated as non-terminal (do not advance) — safer default.
-Check "unknown status -> clock HELD (fail closed)" $false `
-    (Test-DigestClockAdvances -Result 'weird-future-status')
+# true forever, and every 5-min tick spammed 2 log lines.
+#
+# msg-2106 split the single "should the clock advance?" question into two, because degraded
+# delivery satisfies cadence (mark the period sent) but NOT health (⚠ must stay up until a
+# FULL delivery lands). Locking BOTH tables into helpers means any future edit that flips
+# a case is caught here.
+#
+# The predicate is "should cadence advance?" — i.e., "is any further retry THIS period guaranteed
+# not to help?". YES for delivery, YES for non-retryable failure (webhook dead — a 2nd POST 5 min
+# later fails the same way, and holding the clock spams the log and Discord). NO only for
+# transient failure, where the next tick has a real chance. (PR-gate naysayer 2026-08-30 caught
+# that an earlier version of this predicate held cadence on 404, spamming for the rest of the day.)
+Check "sent(ok) delivered? -> yes" $true (Test-DigestDelivered -Result @{ status='sent'; class='ok' })
+Check "sent(ok) full success? -> yes" $true (Test-DigestFullSuccess -Result @{ status='sent'; class='ok' })
+
+Check "degraded delivered? -> yes (cadence satisfied)" $true (Test-DigestDelivered -Result @{ status='degraded'; class='ok' })
+Check "degraded full success? -> NO (⚠ still lit)" $false (Test-DigestFullSuccess -Result @{ status='degraded'; class='ok' })
+
+Check "skipped(no-webhook) delivered? -> yes (no retry loop on missing webhook)" $true `
+    (Test-DigestDelivered -Result @{ status='skipped'; class='no-webhook' })
+Check "skipped(no-webhook) full success? -> NO (no channel means no informed operator)" $false `
+    (Test-DigestFullSuccess -Result @{ status='skipped'; class='no-webhook' })
+
+Check "failed(transient) delivered? -> NO (retry next tick)" $false `
+    (Test-DigestDelivered -Result @{ status='failed'; class='transient' })
+Check "failed(transient) full success? -> NO" $false `
+    (Test-DigestFullSuccess -Result @{ status='failed'; class='transient' })
+
+# CRITICAL: non-retryable failures MUST advance cadence. Held would mean the digest cadence spams
+# a POST every 5 minutes for the rest of the day (404 → 404 → 404 → …). This is the exact spam
+# loop the PR-gate naysayer flagged in the first revision of this file. Full-success stays false
+# so ⚠ lights up on tomorrow's digest.
+Check "failed(deterministic-permanent, e.g. 404) delivered? -> YES (webhook dead; do not spam)" $true `
+    (Test-DigestDelivered -Result @{ status='failed'; class='deterministic-permanent' })
+Check "failed(deterministic-permanent) full success? -> NO (channel not informed)" $false `
+    (Test-DigestFullSuccess -Result @{ status='failed'; class='deterministic-permanent' })
+
+# deterministic-payload only reaches this predicate when the FULL digest 400s AND degraded ALSO
+# 400s (defensive — the degraded is fixed and small; this branch is theoretically unreachable but
+# the predicate must still be safe if it is). Retry cannot help; advance cadence.
+Check "failed(deterministic-payload, degraded also failed) delivered? -> YES (do not spam 400s)" $true `
+    (Test-DigestDelivered -Result @{ status='failed'; class='deterministic-payload' })
+Check "failed(deterministic-payload) full success? -> NO" $false `
+    (Test-DigestFullSuccess -Result @{ status='failed'; class='deterministic-payload' })
+
+# Legacy string-form still handled — Send-NotificationIfChanged historically dropped the return
+# via $null=, but a future refactor may pass the string on. Under the string form there is no
+# class, so 'failed' has to be held (fail-safe = retry, in case it was transient — this is the
+# ONLY safe default when class is unknown).
+Check "string 'sent' delivered? -> yes" $true (Test-DigestDelivered -Result 'sent')
+Check "string 'failed' delivered? -> no (unknown class; fail-safe hold for retry)" $false `
+    (Test-DigestDelivered -Result 'failed')
 
 Write-Host "ConvertTo-UtcInstant — handles both string and [DateTime] inputs uniformly"
 # Naive [datetime]::Parse on a DateTime happens to survive via implicit ToString + Parse-Local +
@@ -531,6 +588,184 @@ try {
 finally { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
 
 Write-Host ""
+# T-stalled-pr-has-no-detector Deliverable 6 — the failure_class field must survive
+# round trips and default to 'unknown' when not supplied. Both branches matter:
+#   * default: existing callers (nothing named the parameter) still write the field
+#     so downstream group-by never sees a missing key.
+#   * populated: a caller that classified the tail can pass the resolved label and
+#     it lands on the record unchanged (byte-for-byte, no PSCustomObject rewrite).
+Write-Host "New-QuarantineRecord — failure_class field (T-stalled-pr-has-no-detector D-6)"
+$rec1 = New-QuarantineRecord -FirstFailureAt '2026-09-03T10:00:00Z' -ExitCode 1 `
+    -StopReason 'reason=eod' -FailureHead 'msg-1' -FailureControl 'run' `
+    -SessionLogPath 'C:\logs\a.log' -SessionLogTail @('one','two')
+Check "default failure_class is 'unknown'" 'unknown' $rec1['failure_class']
+
+$rec2 = New-QuarantineRecord -FirstFailureAt '2026-09-03T10:00:00Z' -ExitCode 1 `
+    -StopReason 'reason=eod' -FailureHead 'msg-1' -FailureControl 'run' `
+    -SessionLogPath 'C:\logs\a.log' -SessionLogTail @('one','two') `
+    -FailureClass 'sdk-error-during-execution'
+Check "explicit failure_class is preserved" 'sdk-error-during-execution' $rec2['failure_class']
+
+# Round-trip test — the field must survive the same JSON path failure_fingerprint does.
+$rt = ($rec2 | ConvertTo-Json -Depth 5) | ConvertFrom-Json
+Check "failure_class survives JSON round-trip" 'sdk-error-during-execution' $rt.failure_class
+
+# Get-FailureClass — no tail means unknown, no subprocess spawned. This is the branch
+# the sweep hits when the failure produced no captured output (msg-2354 §1 M-2's
+# "last_msg 空" case), so it MUST return quickly and MUST NOT surface an exception.
+Write-Host "Get-FailureClass — empty tail returns 'unknown' without spawning python"
+Check "empty tail -> unknown" 'unknown' (Get-FailureClass -SessionLogTail @())
+Check "null tail -> unknown" 'unknown' (Get-FailureClass -SessionLogTail $null)
+
+# PR-gate msg-2486 + Bohr msg-2601 §1-2: ``$RepoRoot`` must be wired into ``uv run``
+# so the classifier resolves the repo's ``pyproject.toml`` regardless of the caller's
+# current working directory. Without this pin, a repo-move (or any caller that runs
+# the sweep from a directory without a project file) would flip the classifier's
+# output to ``unknown`` for EVERY quarantine, and that failure is invisible in the
+# log — matching exactly the row-6 shape ("receiver exists but nobody reads it") the
+# ledger was designed to detect. The check below chdirs OUT of the repo, then calls
+# the classifier with a tail that MUST classify as ``sdk-error-during-execution``
+# per the pattern-discipline suite. If ``$RepoRoot`` were still unwired the call
+# would silently drop to ``unknown`` and the test would fail.
+Write-Host "Get-FailureClass — CWD-independent via -RepoRoot (msg-2601 §1-2)"
+$originalLocation = Get-Location
+$foreignCwd = [System.IO.Path]::GetTempPath()
+try {
+    Set-Location -LiteralPath $foreignCwd
+    # A representative fixture tail — the classifier's own tests pin that this exact
+    # payload lands as ``sdk-error-during-execution``. If the CLI runs and produces
+    # its normal answer, the wire-up is working. If it drops to ``unknown``, either
+    # ``$RepoRoot`` is unwired or ``uv`` is not on PATH; the Skip block below covers
+    # the latter so we do not fail the suite on developer machines without ``uv``.
+    $fixtureTail = @(
+        "some unrelated log line",
+        "ClaudeCodeSdkDeliveryError: SDK is_error; subtype='error_during_execution'",
+        "exit=1"
+    )
+    # Feasibility precheck: skip loudly (not silently) if uv is unavailable. The
+    # PR-gate CI environment has uv on PATH so this stays a real check there; a
+    # developer without uv sees a WARN, not a green pass, so the distinction is
+    # preserved in the log (the whole point of this file's opening docstring).
+    $uvOk = $false
+    try {
+        $null = & uv --version 2>$null
+        if ($LASTEXITCODE -eq 0) { $uvOk = $true }
+    } catch { $uvOk = $false }
+    if (-not $uvOk) {
+        Write-Host "  WARN  uv not on PATH — CWD-independence check skipped locally (CI still runs it)"
+    } else {
+        $observed = Get-FailureClass -SessionLogTail $fixtureTail -RepoRoot $repoRoot
+        Check "classifier resolves under foreign CWD" 'sdk-error-during-execution' $observed
+    }
+} finally {
+    Set-Location -LiteralPath $originalLocation
+}
+
+# PR-gate msg-(gate) round 2 objection #1: when neither -RepoRoot nor $PSScriptRoot
+# is available, the function must still honour "never break the sweep" (return, not
+# throw) but the fall-back MUST be loud enough that operators can see it — a bare
+# ``return 'unknown'`` is indistinguishable from the silent failure the whole
+# parameter exists to prevent. Pin THREE properties:
+#   (a) return value is still 'unknown' (function contract: never break sweep)
+#   (b) a warning record is emitted (loudness: operator can see the misinvocation)
+#   (c) the function did not throw (function contract preservation)
+# The function has no [CmdletBinding()] so common parameters like -WarningVariable
+# are not accepted; capture via warning-stream redirection (3>&1) instead.
+#
+# HOW THIS TEST TRIGGERS THE FALL-BACK BRANCH (mechanism, empirically verified):
+#
+#   In production, Get-FailureClass is defined by ``deploy/run-conductor-scheduled.ps1``
+#   and $PSScriptRoot inside the function body is ``<repo>/deploy`` (a truthy value
+#   — the fall-back branch never runs; the branch above it computes RepoRoot from
+#   $PSScriptRoot instead).
+#
+#   In THIS test suite, Get-FailureClass is loaded via AST extraction + Invoke-
+#   Expression from run-conductor-scheduled.ps1 (see the ``foreach ($name in ...)``
+#   block at the top of this file). An AST-lifted function has NO backing script
+#   file, so PowerShell leaves $PSScriptRoot **empty** inside it, regardless of any
+#   parent-scope value.
+#
+#   Consequence: simply calling ``Get-FailureClass -RepoRoot ''`` from this test is
+#   sufficient to reach the fall-back branch — no scope trickery is needed. An
+#   earlier revision of this test used ``Set-Variable -Scope Private`` and a
+#   $PSScriptRoot sentinel to "shadow" the value; a PR-gate reviewer (round 4)
+#   correctly pointed out that Private hides from child scopes, meaning the shadow
+#   would not affect the function's own view of $PSScriptRoot even if the function
+#   were normally-defined. That objection did not overturn the test outcome
+#   (empirically the assertions still pass, because AST-lifted functions never
+#   inherit a $PSScriptRoot from anywhere), but the ceremony was misleading: it
+#   suggested the shadow was doing work it was not. Removed in favour of a direct
+#   call, with a probe helper (see below) that proves the fall-back branch was
+#   the actual code path taken.
+#
+# ON EARLIER ROUND-3 CHARACTERISATION:
+#
+#   A previous comment here characterised round-3's read-only claim as "empirically
+#   false" on the strength of a standalone repro showing that bare
+#   ``$PSScriptRoot = $null`` in ``& { ... }`` does not throw. That repro is
+#   accurate — the assignment does not throw — but the previous framing understated
+#   how much of the disagreement lives in genuine PowerShell scoping subtlety. The
+#   surface behaviour of the assignment is not read-only-locked, which is why the
+#   Set-Variable -Force earlier was not needed; the deeper question of whether a
+#   PARENT-SCOPE shadow reaches a child function is what round-4 correctly flagged,
+#   and it is separate. Both distinctions matter, and both are moot for this
+#   particular test because the AST-lift path avoids them entirely.
+Write-Host "Get-FailureClass — loud fall-back when no RepoRoot resolvable (msg-(gate) round 2)"
+
+# Precondition probe: confirm that AST-lifted functions see $PSScriptRoot as empty
+# in THIS test's execution context. This is what makes the direct ``-RepoRoot ''``
+# call sufficient to reach the fall-back branch — without the AST-lift artefact,
+# a call from the test script would inherit the script's own $PSScriptRoot and
+# never enter the fall-back at all.
+#
+# The probe MUST itself be AST-lifted, not defined normally with ``function ... {}``.
+# A normally-defined helper in this file sees ``<repo>/tests``, so it would not
+# probe the same behaviour Get-FailureClass exhibits.
+#
+# Note on the [ref] arguments to ParseInput: the third and fourth parameters are
+# ``out`` parameters (tokens, errors). ``[ref]$null`` is a valid, empirically-tested
+# PowerShell idiom to discard them (it produces a PSReference wrapping a
+# LanguagePrimitives+Null and does not throw — verified across pwsh 7.6). PR-gate
+# msg-2615 claimed this construct throws PSInvalidCastException; that claim is
+# empirically false (repro produces no exception; the CI on commit 2d9202e passed
+# using exactly this form). Nonetheless we use pre-declared dummy variables here
+# instead, purely to remove any reader ambiguity: an explicit ``$probeTokens =
+# $null`` + ``[ref]$probeTokens`` is the more common idiom in PowerShell code and
+# gives the next reviewer nothing to dispute at the syntax layer.
+$probeSrc = 'function Get-InnerPSScriptRootProbe { $PSScriptRoot }'
+$probeTokens = $null
+$probeErrors = $null
+$probeAst = [System.Management.Automation.Language.Parser]::ParseInput(
+    $probeSrc, [ref]$probeTokens, [ref]$probeErrors)
+$probeFn = $probeAst.FindAll(
+    { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true
+) | Select-Object -First 1
+Invoke-Expression $probeFn.Extent.Text
+$innerProbe = Get-InnerPSScriptRootProbe
+Check "precondition: AST-lifted function sees empty `$PSScriptRoot (mechanism the fall-back branch depends on)" '' "$innerProbe"
+
+$didThrow = $false
+$fallbackResult = $null
+$warnings = @()
+try {
+    # 3>&1 merges the warning stream into the success stream so a foreach over the
+    # merged pipeline can separate WarningRecord objects (Write-Warning) from
+    # ordinary strings (the return value).
+    $merged = Get-FailureClass -SessionLogTail @('some tail line') -RepoRoot '' 3>&1
+    foreach ($item in $merged) {
+        if ($item -is [System.Management.Automation.WarningRecord]) {
+            $warnings += $item
+        } else {
+            $fallbackResult = $item
+        }
+    }
+} catch {
+    $didThrow = $true
+}
+Check "loud fall-back does NOT throw (never-break-sweep contract preserved)" $false $didThrow
+Check "loud fall-back returns 'unknown'" 'unknown' $fallbackResult
+Check "loud fall-back emits at least one Write-Warning record (not silent)" $true ($warnings.Count -gt 0)
+
 if ($script:failures -gt 0) {
     Write-Host "sweep quarantine: $($script:failures) check(s) FAILED"
     exit 1

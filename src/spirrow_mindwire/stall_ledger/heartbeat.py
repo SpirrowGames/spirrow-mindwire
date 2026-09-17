@@ -1,0 +1,563 @@
+"""Ledger heartbeat — the emitter-side record that lets the digest render an
+operational state (``healthy`` / ``idle`` / ``ingest_failure``) instead of a raw
+domain conclusion (``0 stalls``).
+
+The thread that specifies this module is ``T-stalled-pr-has-no-detector``. The
+concrete definitions this module implements come from Bohr msg-2692 §1 (the
+state table, the accounting rule, and the digest-side rendering discipline)
+with two amendments landed in this slice:
+
+    * Einstein msg-2691 (blocking #1): ``examined == 0`` is NOT an ingestion
+      failure by itself. Failure is decided by ``fetch_outcome`` — a healthy
+      idle state (`fetch_outcome == "ok"` and `examined == 0`) advances the
+      heartbeat exactly like a healthy non-empty state, so a repository with no
+      open PRs does not drive perpetual false alarms into the daily digest.
+
+    * Einstein msg-2687 → msg-2692 (blocking #2 → resolution): the live-canary
+      / historical replay probe (R-2c) is dropped, because a probe against
+      historical data does not exercise the live retrieval path anyway. The
+      drift the probe was meant to catch first appears on the accounting rule
+      of the next real ingest: ``recognized + unrecognized == examined`` is
+      asserted, and ``unrecognized > 0`` is one of the ingestion-failure
+      predicates below.
+
+    * Einstein msg-2693 (advisory): the digest is domain-agnostic. It compares
+      ``now`` against ``expires_at`` (an absolute timestamp emitted by THIS
+      module as ``evaluated_at + T_HEARTBEAT``). That keeps the heartbeat
+      interval — a mindwire-specific policy — encapsulated in the emitter.
+
+The regress this module closes at (msg-2692 §1):
+
+    - domain logic lives HERE (accounting rule + state derivation + expires_at)
+    - the digest emits STATE NAMES as the verdict, with ``examined`` breakdown
+      as SUBORDINATE evidence
+    - the outer freshness predicate is a single wall-clock comparison
+      (``now > expires_at``) that carries no domain knowledge and needs no
+      second detector to interpret its silence
+
+Not covered here (documented residuals, msg-2692 §3):
+
+    - Residual A — well-formed but mis-classified inputs (parser accepts,
+      predicate returns wrong verdict). Recovered by the monotonic-fixture
+      obligation (see spec/process/obligations.yaml → OBL-STALL-DETECTOR-
+      MONOTONIC-FIXTURES) and the incident-backtest suite
+      (tests/test_stall_ledger_incident_backtest.py).
+
+    - Residual B — upstream filter-semantics drift ("200 OK + empty" that
+      SHOULD have been non-empty). Not observable from our repo alone. Enters
+      the fixture obligation the same way Residual A does when observed by
+      operator lane.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import StrEnum
+from typing import Any
+
+# ─── Heartbeat interval (msg-2693 advisory) ────────────────────────────────────────────
+#
+# The digest gets an absolute ``expires_at`` timestamp per record. The interval that
+# derives it lives HERE, not in the digest renderer, so that a change to the sweep
+# cadence (or to what the operator considers "too old") is one edit, not two. The
+# outer freshness comparison the digest performs is `now > expires_at`, which needs
+# no knowledge of the sweep schedule at all.
+#
+# The value is a policy pick, not a measurement. Two things constrain it: the sweep
+# cadence (5 min) sets the smallest interval that can advance the heartbeat, and the
+# operator's tolerance for "detector may have died" sets the largest one before the
+# digest should turn red. 4h is comfortably above both a routine transient network
+# hiccup (self-clearing within one 5-min tick) and a scheduled maintenance window
+# (the two we have observed lasted 20 min and 40 min); it stays well under the 24h
+# starvation threshold the same digest already uses so a stale heartbeat surfaces
+# BEFORE the operator's own attention interval elapses.
+
+T_HEARTBEAT: timedelta = timedelta(hours=4)
+
+
+class FetchOutcome(StrEnum):
+    """Result of talking to one upstream source.
+
+    Named enum-side so the accounting rule and the state derivation both read
+    the same identifiers — msg-2691 (Einstein blocking #1) called the earlier
+    "0 items means failure" collapse a boundary error precisely because the
+    two concepts (transport outcome vs. domain cardinality) were left as one
+    field.
+
+    * ``ok``               — talked, got a well-formed answer (possibly empty).
+    * ``http_error``       — got an HTTP-layer answer but it was ≠ 2xx.
+    * ``timeout``          — waited past the source's deadline.
+    * ``auth_failure``     — 401/403 or credential rejection specifically
+                             (kept separate from ``http_error`` because a
+                             human fixes it differently — rotate a token, not
+                             wait it out).
+    * ``file_missing``     — a filesystem-backed source (e.g. quarantine.json)
+                             was not there or unreadable.
+    * ``parse_error``      — the transport succeeded but the payload did not
+                             conform to the schema the parser expects.
+    """
+
+    OK = "ok"
+    HTTP_ERROR = "http_error"
+    TIMEOUT = "timeout"
+    AUTH_FAILURE = "auth_failure"
+    FILE_MISSING = "file_missing"
+    PARSE_ERROR = "parse_error"
+
+
+class HealthState(StrEnum):
+    """The three verdicts the digest renders (msg-2692 §1 table).
+
+    ``stale`` is deliberately absent from this enum — it is derived by the
+    digest side from ``expires_at`` and ``now``, not stored on the record.
+    Keeping ``stale`` off the record preserves the property Einstein
+    endorsed (msg-2691, msg-2693): the record's declared state is what the
+    ingest itself observed, and the freshness verdict is a separate
+    wall-clock comparison the digest performs with no domain knowledge.
+    """
+
+    HEALTHY = "healthy"
+    IDLE = "idle"
+    INGEST_FAILURE = "ingest_failure"
+
+
+@dataclass(frozen=True)
+class SourceReport:
+    """One upstream source's contribution to a single heartbeat evaluation.
+
+    Every ledger evaluation walks 1..N sources (GitHub REST for PRs, chatroom
+    API for threads, filesystem for quarantine.json). Each source reports its
+    outcome, its counts, AND its own observed schema version INDEPENDENTLY so
+    an outage in one source does not silently mask an idle-but-healthy signal
+    from another.
+
+    Accounting invariant: ``recognized + unrecognized == examined``. The
+    ``__post_init__`` validator asserts it here so a producer cannot silently
+    drop a row it could not parse — the record must show the drop as
+    ``unrecognized > 0`` and inherit the ``ingest_failure`` state. This is the
+    load-bearing defence against schema drift: graceful-empty is structurally
+    impossible when the accounting is enforced.
+
+    PR-gate msg-2708 (Tier B round 6) ADVISORY fix: ``observed_format_version``
+    lives HERE, not in a parallel dict on ``HeartbeatRecord``. Splitting the
+    version stamp off into ``HeartbeatRecord.observed_format_versions`` had
+    forced a synchronisation loop in ``__post_init__`` to check that every
+    source name had a matching dict entry — the exact "dual-management" shape
+    Principle 2 forbids and the same shape rounds 1-5 kept reducing to. A
+    version stamp is per-source data by construction; it belongs on the
+    per-source record.
+    """
+
+    name: str
+    fetch_outcome: FetchOutcome
+    examined: int
+    recognized: int
+    unrecognized: int
+    observed_format_version: str
+
+    def __post_init__(self) -> None:
+        # Non-negative — a negative count would already be a bug on the emitter
+        # side, but the assertion here catches the case before the record ever
+        # touches the state table (a negative would silently make some sums
+        # look "correct" by cancellation).
+        if self.examined < 0 or self.recognized < 0 or self.unrecognized < 0:
+            raise ValueError(
+                f"SourceReport({self.name!r}): counts must be non-negative "
+                f"(examined={self.examined}, recognized={self.recognized}, "
+                f"unrecognized={self.unrecognized})"
+            )
+        # The accounting rule (msg-2692 §1). This is what makes graceful-empty
+        # structurally impossible: a parser that silently drops the rows it
+        # cannot understand leaves ``recognized + unrecognized < examined``,
+        # and the check below prevents such a record from ever being built.
+        if self.recognized + self.unrecognized != self.examined:
+            raise ValueError(
+                f"SourceReport({self.name!r}): accounting violation "
+                f"recognized({self.recognized}) + unrecognized({self.unrecognized}) "
+                f"!= examined({self.examined}). No silent-discard: every examined "
+                "row must land in exactly one of the two buckets."
+            )
+
+    def is_failure(self, expected_format_version: str) -> bool:
+        """Would this source flip the record's state to ``ingest_failure``?
+
+        ``fetch_outcome != ok`` — transport did not succeed.
+        ``unrecognized > 0``  — parser saw rows it could not understand.
+        ``expected != observed`` version — schema stamp says the source
+                                           payload is a version we do not
+                                           know how to read.
+
+        ``examined == 0`` is DELIBERATELY not a failure here (msg-2692 §1,
+        msg-2691 blocking #1): a healthy source with no items to report is
+        the ``idle`` state, not a failure.
+
+        The observed version is read from ``self.observed_format_version``
+        (msg-2708 refactor); the caller only supplies the parser's
+        ``expected_format_version``, which is one string per record.
+        """
+
+        if self.fetch_outcome != FetchOutcome.OK:
+            return True
+        if self.unrecognized > 0:
+            return True
+        return expected_format_version != self.observed_format_version
+
+
+@dataclass(frozen=True)
+class HeartbeatRecord:
+    """One evaluation's record — emitted every tick (msg-2692 §4-1).
+
+    Fields the digest reads:
+
+        * ``evaluated_at``          — this evaluation ran to completion. Advances
+                                      EVERY tick, INCLUDING ingest failures. So
+                                      it is a "did the loop run?" signal, not a
+                                      "was the ingest valid?" signal.
+        * ``last_valid_ingest_at``  — the most recent time a HEALTHY-OR-IDLE
+                                      ingest was recorded. Advances on state !=
+                                      INGEST_FAILURE, HELD at the previous
+                                      value on failure. This is the field the
+                                      freshness predicate must read; the
+                                      distinction is load-bearing (msg-2692 §2).
+        * ``expires_at``            — the absolute time after which the digest
+                                      renders ``stale``. Derived from
+                                      ``last_valid_ingest_at + T_HEARTBEAT`` —
+                                      NOT from ``evaluated_at``. See the
+                                      property docstring below for why the
+                                      distinction is a correctness bug when it
+                                      is not respected (PR-gate msg-2696).
+        * ``sources``               — per-source SourceReport list; the digest
+                                      surfaces this as subordinate evidence
+                                      under the state name. Each report
+                                      carries its OWN ``observed_format_version``
+                                      as a field (msg-2708 refactor).
+        * ``stalls``                — the actual level-triggered stall list.
+        * ``input_format_version``  — this evaluation's expected version. One
+                                      string on the record; the parser has one
+                                      expectation, sources declare per-source
+                                      observations.
+    """
+
+    evaluated_at: datetime
+    input_format_version: str
+    sources: tuple[SourceReport, ...]
+    last_valid_ingest_at: datetime | None = None
+    stalls: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        # PR-gate msg-2699 (Tier B on #237, round 3): a HeartbeatRecord with
+        # zero sources is a configuration bug, not a state anyone can
+        # respond to. Rejecting at construction is the ONLY enforcement of
+        # this invariant — round 4 (msg-2702) retired the "defence in depth"
+        # branch in ``derive_state`` as dead code + memory-corruption tests,
+        # so this ``__post_init__`` raise is the single truth.
+        if not self.sources:
+            raise ValueError(
+                "HeartbeatRecord: sources tuple is empty. A heartbeat with no "
+                "sources cannot be healthy, idle, or ingest_failure — it is "
+                "not a valid state. If your caller has no sources to check, "
+                "surface that upstream as a configuration failure; do not "
+                "materialise a bare record and expect the state machine to "
+                "carry the missing information."
+            )
+        # PR-gate msg-2708 (Tier B on #237, round 6): the version-stamp cross-
+        # check loop that used to live here is GONE. ``observed_format_version``
+        # is now a required field ON ``SourceReport`` itself, so a source
+        # without a version stamp cannot even be constructed and no
+        # synchronisation loop between two collections is possible. The
+        # dual-management pattern this whole 6-round exchange kept reducing
+        # to has one fewer instance in the module.
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        evaluated_at: datetime,
+        input_format_version: str,
+        sources: tuple[SourceReport, ...],
+        previous_last_valid_ingest_at: datetime | None,
+        stalls: tuple[str, ...] = (),
+    ) -> HeartbeatRecord:
+        """The one-call constructor for a HeartbeatRecord (PR-gate msg-2702
+        BLOCKING fix).
+
+        Takes the PREVIOUS tick's ``last_valid_ingest_at`` (from persistent
+        cross-tick state) and computes the NEW value from THIS tick's own
+        source outcomes. The returned record already carries the correct
+        new timestamp.
+
+        WHY THIS CLASSMETHOD EXISTS.
+        The prior API exposed ``advance_last_valid_ingest_at(record, prev)``
+        as a standalone function. That signature demanded the caller do a
+        three-step dance: (1) construct a provisional record carrying the
+        PREVIOUS tick's ``last_valid_ingest_at``, (2) call ``advance...``
+        to compute the new value, (3) reconstruct the record with the new
+        value before rendering. If step 3 was missed — and the API's shape
+        actively invited missing it — the caller rendered a lagging
+        timestamp and, at the expiry boundary, ``is_stale`` incorrectly
+        flagged a fresh healthy tick as STALE. PR-gate msg-2702 named this
+        exact scenario. The three-step dance was the same class of
+        dual-management the round-2 fix (msg-2696) had already tried to
+        eliminate; it just hid one seam further out.
+
+        This classmethod collapses the dance into ONE call. The caller
+        cannot construct a record with a lagging timestamp because the
+        computation and the construction happen in the same call, on the
+        same values.
+
+        Direct ``HeartbeatRecord(...)`` construction remains possible (needed
+        for tests that want to pin a specific record shape), but production
+        code MUST go through ``build()`` — the docstring of the raw
+        constructor points here.
+        """
+
+        # msg-2708 refactor: ``SourceReport.is_failure`` now needs only the
+        # parser's expected version (each source carries its own observed
+        # version as a field). One canonical entry point (``is_failure``)
+        # used at both call sites — the ``_is_source_failing`` helper the
+        # round-5 refactor introduced became a trivial pass-through once the
+        # observed-map disappeared and was removed with it. Both this method
+        # and ``failing_sources`` now call ``src.is_failure(expected)``
+        # directly. The empty-sources ``__post_init__`` guard has already
+        # refused empty ``sources`` for us, so ``any(...)`` here cannot be
+        # vacuously satisfied on an empty iterable.
+        any_source_failed = any(
+            src.is_failure(expected_format_version=input_format_version) for src in sources
+        )
+
+        # msg-2692 §2: healthy OR idle → advance to this tick's evaluated_at;
+        # ingest_failure → HOLD at the previous value.
+        new_last_valid = previous_last_valid_ingest_at if any_source_failed else evaluated_at
+
+        return cls(
+            evaluated_at=evaluated_at,
+            input_format_version=input_format_version,
+            sources=sources,
+            last_valid_ingest_at=new_last_valid,
+            stalls=stalls,
+        )
+
+    @property
+    def expires_at(self) -> datetime | None:
+        """The absolute time after which the digest should render ``stale``.
+
+        Returns ``None`` iff ``last_valid_ingest_at is None`` (no ingest has
+        ever succeeded — the digest MUST treat that as always stale).
+        Otherwise returns ``last_valid_ingest_at + T_HEARTBEAT``.
+
+        WHY DERIVED FROM ``last_valid_ingest_at`` — NOT ``evaluated_at``.
+        The earlier draft returned ``evaluated_at + T_HEARTBEAT``. PR-gate
+        msg-2696 (Tier B PR-gate on #237) found the correctness bug that
+        made the property mask ongoing outages: during a persistent
+        ingest_failure the script still runs every tick, so ``evaluated_at``
+        advances, so ``expires_at`` advances into the future, and a caller
+        that does ``now > record.expires_at`` (which the docstring told
+        them to do) returns False and misses the dead detector. The bug
+        was invisible because ``is_stale`` internally read the correct
+        field, but the property still exposed a false contract — msg-2688
+        §2 called out that kind of "quiet false claim" as the failure this
+        thread was created to eliminate.
+
+        Fix: expose the same rule ``is_stale`` uses, from the same field,
+        so the ``now > record.expires_at`` idiom in the docstring IS the
+        implementation and cannot silently drift from it.
+        """
+
+        if self.last_valid_ingest_at is None:
+            return None
+        return self.last_valid_ingest_at + T_HEARTBEAT
+
+    def failing_sources(self) -> tuple[SourceReport, ...]:
+        """Return the sources that pushed this record to INGEST_FAILURE state.
+
+        Calls ``SourceReport.is_failure`` directly — after msg-2708 the
+        observed version lives on the source itself, so the (src, expected,
+        observed_map) triple that motivated a helper in round 5 is gone.
+        The one canonical entry point for "is this source failing?" is
+        now ``SourceReport.is_failure``, at every call site.
+        """
+
+        return tuple(
+            src
+            for src in self.sources
+            if src.is_failure(expected_format_version=self.input_format_version)
+        )
+
+
+def derive_state(record: HeartbeatRecord) -> HealthState:
+    """Map a heartbeat record to its state (msg-2692 §1 table).
+
+    Evaluation order matters:
+
+        1. ANY source is failing → ``ingest_failure``.
+        2. All ok, all examined == 0 → ``idle``.
+        3. Otherwise → ``healthy``.
+
+    The failure-first order is what prevents an idle-looking record from
+    masking a partial outage: two sources returned empty, one returned an
+    HTTP 500. Falling through to ``idle`` on the first two would hide the
+    500 completely; enforcing failure-first surfaces the 500 EVEN when the
+    other sources look healthy.
+
+    Empty ``sources`` is impossible here — ``HeartbeatRecord.__post_init__``
+    refuses to construct such a record — so the vacuous-``all(...)`` trap
+    that PR-gate msg-2699 caught cannot be reached. The prior defence-in-
+    depth branch and its memory-corruption test were retired in round 4
+    (msg-2702) as YAGNI dead code: guarding one invariant in two places
+    invites the same dual-management complexity round 2 tried to eliminate.
+    """
+
+    if record.failing_sources():
+        return HealthState.INGEST_FAILURE
+
+    # msg-2692 §1: "all_sources have fetch_outcome == ok and examined == 0"
+    if all(src.examined == 0 for src in record.sources):
+        return HealthState.IDLE
+
+    return HealthState.HEALTHY
+
+
+# ---------------------------------------------------------------------------
+# ``advance_last_valid_ingest_at`` was RETIRED in PR-gate round 4 (msg-2702).
+# It was a standalone function that took ``previous_last_valid`` out-of-band
+# and returned the new timestamp, forcing the caller into a three-step
+# construct-advance-reconstruct dance. That dance leaked into rendering when
+# a caller forgot the last step, producing false STALE alarms at the expiry
+# boundary. Its replacement is ``HeartbeatRecord.build(previous_last_valid_
+# ingest_at=...)`` — the classmethod above collapses the dance into one call
+# and cannot leave the record in an inconsistent state. No public function
+# is exposed here in its place; the one-call classmethod is the entire API.
+# ---------------------------------------------------------------------------
+
+
+def is_stale(now: datetime, record: HeartbeatRecord) -> bool:
+    """Digest-side freshness predicate (msg-2693 advisory + PR-gate msg-2696 fix).
+
+    Two comparisons, no domain logic:
+
+        * ``record.expires_at`` is None (nothing has ever succeeded) → stale.
+        * ``now > record.expires_at`` → stale.
+
+    Reads ``last_valid_ingest_at`` FROM THE RECORD via ``record.expires_at``.
+    PR-gate msg-2696 (ADVISORY) called out that a prior draft took
+    ``last_valid_ingest_at`` as a separate parameter while the record ALSO
+    carried the field — the same value existing in two places, with the
+    caller responsible for keeping them in sync, is the exact
+    "dual-management" complexity ``ObligationsManifest``-style single-source
+    designs are built to avoid. There is one field, and it lives on the
+    record; every downstream predicate reads it from there.
+    """
+
+    expires_at = record.expires_at
+    if expires_at is None:
+        return True
+    return now > expires_at
+
+
+# ─── Digest rendering (msg-2692 §4-3) ──────────────────────────────────────────────────
+#
+# The digest surface owns the layout. This helper produces the FIXED CANONICAL LINE
+# for one heartbeat record — the "verdict" the digest prints. The state name is the
+# first token; the per-source counts follow as subordinate evidence UNDER the state,
+# never as the verdict itself.
+#
+# The rule the shape enforces: a reader who reads only the state token gets the
+# correct answer. A reader who reads the evidence gets the same answer with more
+# detail. There is NO reading of this line that lets "0 stalls" claim health while
+# the ingest was broken — that boundary is what msg-2691 blocking-#1 taught this
+# module.
+
+
+def render_digest_lines(record: HeartbeatRecord, now: datetime) -> tuple[str, ...]:
+    """Return the digest lines for this heartbeat record.
+
+    Line 0: state name + freshness suffix (`healthy`, `idle`, `ingest_failure`,
+            `stale`).  ``stale`` is derived from ``now`` and appears in place
+            of the state name when ``is_stale`` fires — the record's DECLARED
+            state (which is what the ingest itself observed) is preserved in
+            the subordinate line below rather than dropped.
+
+    Line 1+: subordinate evidence — one line per source with fetch_outcome
+             and counts. This is the "件数は verdict の位置から降格して従属
+             証拠へ" contract from msg-2692 §1.
+
+    Reads ``last_valid_ingest_at`` from the record (PR-gate msg-2696 ADVISORY —
+    the field lives on ``HeartbeatRecord`` and there is exactly one source of
+    truth for it; the earlier out-of-band parameter is retired).
+    """
+
+    declared = derive_state(record)
+    last_valid_ingest_at = record.last_valid_ingest_at
+    stale = is_stale(now=now, record=record)
+
+    if stale:
+        # Preserve the declared state in the subordinate footer so an operator
+        # can tell "stale because ingest_failure" from "stale because the
+        # detector process itself died" (declared=healthy but wall-clock says
+        # stale — the process is not running).
+        header = f"detector: stale (declared={declared.value})"
+    else:
+        header = f"detector: {declared.value}"
+
+    if last_valid_ingest_at is not None:
+        header += f" · last_valid_ingest_at={last_valid_ingest_at.isoformat()}"
+    else:
+        header += " · last_valid_ingest_at=never"
+
+    lines: list[str] = [header]
+    for src in record.sources:
+        # msg-2708: the observed version lives on the source itself. No dict
+        # lookup, no cross-collection sync, no missing-key fallback needed.
+        version_note = (
+            f" version_drift(expected={record.input_format_version!r} "
+            f"observed={src.observed_format_version!r})"
+            if src.observed_format_version != record.input_format_version
+            else ""
+        )
+        lines.append(
+            f"  · {src.name}: fetch={src.fetch_outcome.value} "
+            f"examined={src.examined} recognized={src.recognized} "
+            f"unrecognized={src.unrecognized}{version_note}"
+        )
+    if record.stalls:
+        lines.append(f"  · stalls: {len(record.stalls)} — {', '.join(record.stalls)}")
+    return tuple(lines)
+
+
+# ─── Query pin (msg-2692 §4-4) ─────────────────────────────────────────────────────────
+#
+# THE FIRST DEFENCE against "自分側のクエリ drift": we build our own GitHub PR
+# retrieval query in ONE function whose exact output is snapshot-tested. The pin
+# is not "these bytes are correct" — it is "these bytes changed", which is the
+# minimum guarantee that lets a reviewer notice the query moved.
+#
+# Kept in this module (rather than in a generic github helper) on purpose: the
+# heartbeat's ingest path IS this query, so a snapshot elsewhere would either
+# duplicate the string (drift risk) or leave the heartbeat's actual retrieval
+# unpinned.
+
+
+def build_open_pr_query(owner: str, repo: str, per_page: int = 100) -> Mapping[str, Any]:
+    """Return the (path, params) pair the heartbeat's PR-listing call uses.
+
+    Kept as a MAPPING so a snapshot test can diff structured input rather
+    than a formatted URL — a params order swap on the caller side would not
+    change the effective request, and the snapshot must not red on it.
+
+    The pin is what makes msg-2692 §4-4 mechanical rather than aspirational:
+    ADV-1's own rule from msg-2688 (弁済価格 < 強制機構価格 なら払う) is
+    applied backwards here — the fix for query drift IS the query being
+    rebuilt correctly, and the trip-wire (a snapshot test) is cheap enough
+    to be worth it because a silent query change directly enables the
+    residual B failure mode (msg-2692 §3).
+    """
+
+    return {
+        "path": f"/repos/{owner}/{repo}/pulls",
+        "params": {
+            "state": "open",  # msg-2692 §1: what the live sweep MUST look at
+            "per_page": per_page,
+        },
+    }

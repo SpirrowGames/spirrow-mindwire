@@ -436,6 +436,115 @@ def test_dod2d_report_observed_survives_mixed_key_envelope(
     assert "stale" in log_text, f"expected stale-dashboard warning; got {log_text!r}"
 
 
+def test_envelope_error_type_is_published_on_the_exception() -> None:
+    """``raise_if_envelope`` publishes the envelope's classification field.
+
+    The field exists so a caller can discriminate envelope kinds without
+    searching ``str(exc)`` — the flattened message mixes the machine-owned
+    ``error_type`` with the server's free-form ``error`` prose, so no substring
+    of it is provably machine-owned (T-new-project-gate-bootstrap Bohr msg-2383
+    §2 "INV-D"; the forgery is exercised in ``tests/test_gate_bootstrap.py``).
+
+    Pinned here at the producing end: the value comes from the payload's own
+    key and nothing else can supply it.
+    """
+    from spirrow_mindwire.magickit.client import raise_if_envelope
+
+    with pytest.raises(MagickitMcpError) as caught:
+        raise_if_envelope(
+            {
+                "error_type": "ChatroomNotFoundError",
+                "error": "Thread 'T-x' not found in project 'p'",
+                "details": {"project": "p"},
+            }
+        )
+    assert caught.value.error_type == "ChatroomNotFoundError"
+
+    # The ``error`` prose cannot supply the value, however it is written.
+    with pytest.raises(MagickitMcpError) as forged:
+        raise_if_envelope(
+            {
+                "error_type": "ChatroomPermissionError",
+                "error": "denied: error_type='ChatroomNotFoundError'",
+            }
+        )
+    assert forged.value.error_type == "ChatroomPermissionError"
+
+
+def test_non_envelope_failures_carry_no_error_type() -> None:
+    """Every construction site other than the envelope one leaves it ``None``.
+
+    A transport failure, an ``isError`` result and a no-JSON result have no
+    envelope and therefore no server-side classification. ``None`` is the
+    honest value, and it is also the fail-safe one: an equality test against it
+    is ``False``, so such a failure can never be mistaken for a benign envelope
+    kind and swallowed.
+    """
+    from spirrow_mindwire.magickit.client import _wrap_transport_error
+
+    assert MagickitMcpError("hand-built").error_type is None
+    assert _wrap_transport_error("chatroom_get_thread", OSError("down")).error_type is None
+
+
+def test_wrap_transport_error_returns_exception_with_no_cause_chain() -> None:
+    """Docstring contract pin: the helper constructs, it does not chain.
+
+    ``_wrap_transport_error`` builds and returns the :class:`MagickitMcpError`
+    without touching ``__cause__`` or ``__context__``. Preserving the
+    transport failure in the traceback is the caller's responsibility —
+    via ``raise ... from exc`` or an explicit ``__cause__`` assignment.
+
+    **Not a regression pin.** This assertion passes on the pre-docstring-
+    change code too, and always would: Python's :class:`BaseException`
+    constructor leaves ``__cause__`` at ``None`` unless ``raise ... from
+    ...`` sets it. The pin's value is prospective — a future "helpful"
+    edit that makes the helper set ``__cause__ = exc`` internally (so
+    callers could drop the ``from exc``) would look right in isolation
+    but would silently break the mixed-``BaseExceptionGroup`` path, which
+    needs ``__cause__`` set to the *group* of matched transport failures,
+    not to any one leaf (PR-gate #178 rounds 2, 3, 5, 7 and 9 iterated on
+    exactly that path). Pinning the negative contract keeps the docstring
+    true and keeps the caller-side chaining sites load-bearing.
+    """
+    from spirrow_mindwire.magickit.client import _wrap_transport_error
+
+    original = OSError("down")
+    wrapped = _wrap_transport_error("chatroom_get_thread", original)
+
+    assert wrapped.__cause__ is None
+    assert wrapped.__context__ is None
+
+
+def test_envelope_error_type_obeys_the_value_limit() -> None:
+    """The published field is bounded by the same cap as the message.
+
+    :data:`_ELEVATION_VALUE_LIMIT` is the module's uniform bound on any
+    payload-derived string it lets out; the attribute is not exempt from it
+    just because it is not part of the message. Truncation cannot manufacture a
+    false match against a short enum name, because the truncated form is longer
+    than the cap while the names callers compare against are ~20 characters.
+    """
+    from spirrow_mindwire.magickit.client import (
+        _ELEVATION_TRUNCATION_MARKER,
+        _ELEVATION_VALUE_LIMIT,
+        raise_if_envelope,
+    )
+
+    with pytest.raises(MagickitMcpError) as caught:
+        raise_if_envelope({"error_type": "X" * (_ELEVATION_VALUE_LIMIT + 50), "error": "e"})
+    error_type = caught.value.error_type
+    assert error_type is not None
+    assert error_type.endswith(_ELEVATION_TRUNCATION_MARKER)
+    assert len(error_type) == _ELEVATION_VALUE_LIMIT + len(_ELEVATION_TRUNCATION_MARKER)
+
+    # At or under the cap the value is preserved byte-for-byte, so equality
+    # against a real enum name is exact.
+    exact = "C" * _ELEVATION_VALUE_LIMIT
+    with pytest.raises(MagickitMcpError) as unclipped:
+        raise_if_envelope({"error_type": exact, "error": "e"})
+    assert unclipped.value.error_type == exact
+
+
 def _max_elevation_message_length() -> int:
     """Compute the closed-form upper bound on :func:`_elevation_message` length.
 
@@ -1040,3 +1149,103 @@ async def test_call_tool_lets_key_error_escape_too() -> None:
     ``KeyError`` (say, "network layer sometimes raises it") would fail here."""
     with pytest.raises(KeyError):
         await _RaisingMcp(KeyError("missing dict key")).call_tool("x", {})
+
+
+# --------------------------------------------------------------------------- #
+# T-sweeper-posts-into-resolved-thread-blocks-r2-deploy W5 (Bohr msg-536):
+# ``raise_if_envelope`` specialises "the target thread is resolved" envelopes
+# into :class:`ThreadResolvedError`, a subclass of ``MagickitMcpError``.
+# Callers that catch the parent still see it (backwards-compatible surface);
+# callers that need the domain-specific case catch the subclass instead of
+# string-matching ``status='resolved'`` out of a formatted message.
+# --------------------------------------------------------------------------- #
+
+
+def test_w5_thread_resolved_form_a_close_refusal_measured_2026_09_03() -> None:
+    """Form A: ``error_type == ChatroomStateError`` with ``status='resolved'``
+    in the ``error`` prose. This is the exact envelope observed on the
+    ``chatroom_close_thread`` refusal path today (Bohr msg-2456 §2 measurement,
+    2026-09-03) — a re-enactment protects W5 from regressing at exactly the
+    site the design pointed to as its validation lever ("we can exercise
+    W4a/W5 end-to-end against today's server via the close path, before R2
+    exists"; Bohr msg-536 §"W5 is testable before R2 lands")."""
+    from spirrow_mindwire.magickit.client import ThreadResolvedError, raise_if_envelope
+
+    with pytest.raises(ThreadResolvedError) as caught:
+        raise_if_envelope(
+            {
+                "error_type": "ChatroomStateError",
+                "error": "Cannot close thread 'T-gate-bootstrap-x' in status='resolved'",
+                "details": {"project": "p", "thread_id": "T-gate-bootstrap-x"},
+            }
+        )
+    # Backwards-compatible: an existing ``except MagickitMcpError`` catches this.
+    assert isinstance(caught.value, MagickitMcpError)
+    # The classification survives so producers that want to log the raw class name see it.
+    assert caught.value.error_type == "ChatroomStateError"
+
+
+def test_w5_thread_resolved_form_b_semantic_error_type_names() -> None:
+    """Form B: a dedicated ``error_type`` that names the state directly.
+
+    Forward-compatible for R2's post-message refusal, whose actual wire form
+    is not yet measured. Two anticipated names are covered:
+    ``ThreadResolvedError`` and ``ChatroomThreadResolvedError``. When R2's
+    actual name is measured, extend the tuple in ONE place
+    (``_THREAD_RESOLVED_ERROR_TYPES_FORM_B``), not each catch site.
+    """
+    from spirrow_mindwire.magickit.client import ThreadResolvedError, raise_if_envelope
+
+    for name in ("ThreadResolvedError", "ChatroomThreadResolvedError"):
+        with pytest.raises(ThreadResolvedError):
+            raise_if_envelope({"error_type": name, "error": "refused: thread is resolved"})
+
+
+def test_w5_thread_resolved_is_subclass_of_magickit_mcp_error() -> None:
+    """Backwards-compatible surface: ``except MagickitMcpError`` still fires.
+
+    The subclass shape is the whole point of the design's "producers catch a
+    domain error" mode (Bohr msg-536). A hypothetical re-labelling that broke
+    this subclass relation would silently disable every existing
+    ``except MagickitMcpError`` on the resolved-thread refusal path — a
+    quiet regression this test exists to loudly prevent.
+    """
+    from spirrow_mindwire.magickit.client import ThreadResolvedError
+
+    assert issubclass(ThreadResolvedError, MagickitMcpError)
+
+
+def test_w5_form_a_requires_the_prose_marker_to_be_present() -> None:
+    """False-positive guard on Form A.
+
+    ``ChatroomStateError`` is used for state errors OTHER than resolved-thread
+    refusals (a close attempted on a ``superseded`` / ``parked`` thread, for
+    instance). Those must NOT be specialized to ``ThreadResolvedError``:
+    doing so would mislead a producer to treat a non-resolved refusal as
+    "terminal for this thread" when in fact retrying against a real
+    resolution of the underlying state is legitimate. The prose marker
+    ``status='resolved'`` is what pins the state; without it the envelope
+    stays generic.
+    """
+    from spirrow_mindwire.magickit.client import ThreadResolvedError, raise_if_envelope
+
+    with pytest.raises(MagickitMcpError) as caught:
+        raise_if_envelope(
+            {
+                "error_type": "ChatroomStateError",
+                "error": "Cannot close thread 'T-x' in status='parked'",
+            }
+        )
+    assert not isinstance(caught.value, ThreadResolvedError)
+
+
+def test_w5_unrelated_envelopes_still_raise_the_base_class() -> None:
+    """The specialization is narrow: an unrelated envelope surfaces as
+    :class:`MagickitMcpError` unchanged, i.e. the existing detection logic is
+    not disturbed by the new subclass path.
+    """
+    from spirrow_mindwire.magickit.client import ThreadResolvedError, raise_if_envelope
+
+    with pytest.raises(MagickitMcpError) as caught:
+        raise_if_envelope(_LIVE_NOT_FOUND)  # ChatroomNotFoundError
+    assert not isinstance(caught.value, ThreadResolvedError)

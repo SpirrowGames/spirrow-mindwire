@@ -40,10 +40,14 @@ def route_authority(raw: str) -> str | None:
     Hand-rolled rather than :func:`urllib.parse.urlsplit` because the input is
     an operator-supplied env value, not a guaranteed-well-formed URL, and
     ``urlsplit`` mis-parses the most likely malformed case: ``urlsplit`` on a
-    schemeless ``"100.79.84.62:8110"`` yields an empty ``netloc`` (a scheme
-    must start with a letter, so the whole string lands in ``path``) and we
-    would print nothing at all for a value that was in fact configured. The
-    reader needs to see what was set, including when it was set wrong.
+    schemeless ``"192.0.2.10:8110"`` yields an empty ``netloc`` (RFC 3986 §3.1
+    requires a scheme to start with a letter, so a digit-leading token like
+    ``192.0.2.10`` cannot be a scheme and the whole string lands in ``path``)
+    and we would print nothing at all for a value that was in fact configured.
+    The reader needs to see what was set, including when it was set wrong. The
+    example uses ``192.0.2.10`` (RFC 5737 TEST-NET-1 documentation address) —
+    the load-bearing property is the digit-leading first character, which is
+    what makes it fail the scheme grammar; any RFC 5737 address preserves it.
 
     The reductions, in order:
 

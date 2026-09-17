@@ -14,11 +14,11 @@ was retired; the independent-model identity is pinned in
 Runtime target (chatroom ``T-phase2-stage2-naysayer-adapter`` msg-215):
 - Default endpoint is **``http://localhost:8110``** — Lexora binds
   ``0.0.0.0`` with **no caller auth**, so on the production host (mindwire
-  co-resident with Lexora on sg-ai-server-01) the loopback address is the
-  one that does not widen the unauthenticated surface onto the LAN /
+  co-resident with Lexora on ``{{HOST_SERVICES}}``) the loopback address is
+  the one that does not widen the unauthenticated surface onto the LAN /
   Tailscale net. Override via ``MINDWIRE_LEXORA_URL`` (e.g. a dev box
-  reaches the server over Tailscale at ``http://100.79.84.62:8110``); the
-  default must stay loopback.
+  reaches the server over Tailscale at ``http://{{IP_SERVICES}}:8110``,
+  values via [[platform:infra-registry]]); the default must stay loopback.
 - No auth header is sent (the gateway requires none from callers; its
   configured api_keys are for Lexora → upstream providers, not for us).
 
@@ -102,9 +102,10 @@ class LexoraTimeoutError(LexoraHTTPError):
     A **subclass** of :class:`LexoraHTTPError`, so existing ``except LexoraHTTPError`` handlers
     stay backward-compatible (a timeout is still an HTTP-layer failure). It is broken out so a
     caller that wants to treat a timeout differently — e.g. the naysayer PR-review driver, which
-    degrades a timed-out review to a fail-closed REQUEST_CHANGES instead of crashing the pipeline —
-    can catch it *specifically* (``except LexoraTimeoutError``) ahead of the generic handler. Other
-    transport failures (connect / read errors, etc.) remain plain :class:`LexoraHTTPError`.
+    degrades a timed-out review to a COMMENT-hold addressed to the human (T-infra-failure-posts-
+    empty-rc) instead of crashing the pipeline — can catch it *specifically* (``except
+    LexoraTimeoutError``) ahead of the generic handler. Other transport failures (connect / read
+    errors, etc.) remain plain :class:`LexoraHTTPError`.
     """
 
 
@@ -329,7 +330,8 @@ class LexoraClient:
         except httpx.TimeoutException as e:
             # TimeoutException is a subclass of RequestError, so it must be caught FIRST to wrap
             # it as the (sub)typed LexoraTimeoutError. The naysayer driver catches this specifically
-            # to degrade a timed-out review to a fail-closed REQUEST_CHANGES instead of crashing.
+            # to degrade a timed-out review to a COMMENT-hold addressed to the human
+            # (T-infra-failure-posts-empty-rc) instead of crashing.
             raise LexoraTimeoutError(f"POST /v1/chat/completions ({model}) timed out: {e}") from e
         except httpx.RequestError as e:
             raise LexoraHTTPError(f"POST /v1/chat/completions ({model}): {e}") from e

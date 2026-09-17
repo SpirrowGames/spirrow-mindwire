@@ -84,7 +84,13 @@ from .dispatcher.event_log import (
     EVENT_KIND_DELIVERY_FAILED,
 )
 from .dispatcher.registry import InMemoryAdapterRegistry
-from .github.client import EnvironmentTerminalError
+from .github.client import (
+    CheckRollup,
+    EnvironmentTerminalError,
+    GitHubClient,
+    PrRef,
+    naysayer_github_token,
+)
 from .magickit.client import McpToolCaller, StreamableHttpChatroomMcp
 from .magickit.gateway import MagickitChatroomGateway
 from .magickit.watcher import ChatroomWatcher, WatchSpec
@@ -540,6 +546,35 @@ async def run_loop(settings: MindwireSettings) -> None:
         await loop.aclose()
 
 
+class _PerCallCheckRollupSource:
+    """``CheckRollupSource`` backed by a short-lived :class:`GitHubClient`, one per admission.
+
+    Per-call rather than a shared long-lived client, matching what the PR-review driver already
+    does with its own client: the conductor has no teardown hook to close a pooled client on, and
+    inventing one for a read that happens at most once per tick would buy a connection pool at
+    the cost of a lifecycle that can leak.
+
+    **Token.** The review-side identity (:func:`naysayer_github_token`), not the author one, so
+    admission and the gate it admits are looking at the same repo through the same credential —
+    an admission that could see a rollup the gate cannot (or the reverse) would decide on a
+    world the gate does not live in. Measured 2026-09-09 on ``SpirrowGames/spirrow-mindwire``:
+    the GraphQL ``statusCheckRollup.contexts`` read returns 200 with full per-check rows under
+    this token.
+
+    Never raises: :meth:`GitHubClient.fetch_check_rollup` is fail-soft to ``None`` on every error
+    path, and ``None`` is the conductor's "keep the pre-wiring behaviour" signal. A scheduled
+    loop must not die because GitHub was briefly unreachable.
+    """
+
+    def __init__(self, token: str | None = None) -> None:
+        self._token = token
+
+    async def fetch_check_rollup(self, pr: PrRef) -> CheckRollup | None:
+        token = self._token if self._token is not None else naysayer_github_token()
+        async with GitHubClient(token) as client:
+            return await client.fetch_check_rollup(pr)
+
+
 def build_conductor(
     settings: MindwireSettings,
     *,
@@ -602,6 +637,9 @@ def build_conductor(
             human_identity=cond_cfg.human_identity,
             max_rounds=cond_cfg.max_rounds,
             force_naysayer_only_on_explicit_human=cond_cfg.force_naysayer_only_on_explicit_human,
+            # ADR-2026-09-14-21: merged over the shipped default inside the Conductor, so an
+            # empty config block is the ADR's behaviour rather than "spawn anything named".
+            identity_embodiment=dict(cond_cfg.identity_embodiment),
             orchestrator=orchestrator,
             # Per-project loop control (Part C). Keyed on ``[loop].project`` — the same key the
             # sweep rewrites per candidate — so one daemon invocation controls exactly the project
@@ -609,6 +647,12 @@ def build_conductor(
             # turned the stop control off would be a way to make the loop unstoppable from the
             # dashboard while still looking configured.
             control=LoopControlReader(mcp, project=loop_cfg.project),
+            # Pre-gate CI-wait admission (design v0.3.1 §5.2A, residual RES-WIRING). Wired
+            # unconditionally, for the same reason ``control`` is: a knob that turned admission
+            # off would restore exactly the behaviour the residual exists to end, and there is
+            # already a structural off-switch that does not need a flag — an unreadable rollup
+            # degrades to the pre-wiring path (fire the gate) inside ``Conductor._admit``.
+            rollup_source=_PerCallCheckRollupSource(),
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc

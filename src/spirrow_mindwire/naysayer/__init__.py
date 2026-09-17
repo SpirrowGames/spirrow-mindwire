@@ -14,18 +14,22 @@ from .adr_index import build_adr_index_block, load_adr_index, parse_adr_index
 from .principles import (
     NAYSAYER_MODEL_TIER,
     NAYSAYER_UPSTREAM_MODEL,
+    ObjectionClass,
     build_preamble,
     load_principles,
+    objection_classes,
     principles_version,
 )
 
 __all__ = [
     "NAYSAYER_MODEL_TIER",
     "NAYSAYER_UPSTREAM_MODEL",
+    "ObjectionClass",
     "build_adr_index_block",
     "build_preamble",
     "load_adr_index",
     "load_principles",
+    "objection_classes",
     "parse_adr_index",
     "principles_version",
 ]

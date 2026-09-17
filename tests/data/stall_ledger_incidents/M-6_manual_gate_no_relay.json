@@ -1,0 +1,34 @@
+{
+  "id": "M-6",
+  "title": "manually-fired PR gate posted its review but no relay reached the design thread",
+  "observed_by": "operator",
+  "observed_at": "2026-09-08T00:00Z",
+  "spec_thread": "T-stalled-pr-has-no-detector",
+  "spec_msg_ids": ["msg-2744"],
+  "provenance": {
+    "source": "chatroom body + PR review timeline (operator lane note relayed as msg-2734)",
+    "captured_at": "2026-09-09T00:00Z",
+    "captured_by": "Bohr msg-2744 §5 D-12 M-6"
+  },
+  "predicate_input": {
+    "kind": "thread",
+    "identifier": "spirrow-mindwire/T-stalled-pr-has-no-detector",
+    "thread_state": {
+      "status": "active",
+      "dormant_until_expired": true
+    },
+    "n_threshold_hours": 6,
+    "hours_since_last_participant_motion": 24
+  },
+  "expected_verdict": "not-representable",
+  "not_representable_reason": "Three-layer structural residual (Bohr msg-2831 §3(a), Einstein msg-2749 §5). (schema layer) no unit kind carries a GitHub review event's timestamp alongside the design thread reference the review was meant to relay into — the cross-artifact pair 'a review was posted' vs 'thread head' is unrepresentable in v1; (granularity layer) even with a per-review completion field a single design thread can await multiple reviews across multiple PRs, so the field would have to live on the review-relay request, not on the containing ThreadState (Einstein E-10); (consumer layer) scripts/parked_humans.py reads only the thread head's NEXT: line, so 'a review landed but was not relayed' cannot be distinguished from 'no review has landed yet' by the consumer that shapes the human-parked digest (Einstein E-9). Absent all three, the incident and its valid-wait counterexample construct byte-equivalent ThreadState objects — see test_m6_collision_pin_incident_equivalent_to_valid_wait for the machine assertion.",
+  "residual": {
+    "receipt_thread": "T-pr-gate-relay-belongs-to-the-conductor-not-the-gate",
+    "missing_layers": [
+      "schema: no unit kind carries a GitHub review event's timestamp alongside the design thread reference the review was meant to relay into — the cross-artifact pair 'a review was posted' vs 'thread head' is unrepresentable in v1",
+      "granularity: even with a per-review completion field a single design thread can await multiple reviews across multiple PRs, so the field would have to live on the review-relay request, not on the containing ThreadState (Einstein E-10)",
+      "consumer: scripts/parked_humans.py reads only the thread head's NEXT: line, so 'a review landed but was not relayed' cannot be distinguished from 'no review has landed yet' by the consumer that shapes the human-parked digest (Einstein E-9)"
+    ]
+  },
+  "notes": "Observed 2026-09-08 (Bohr msg-2744 §5 M-6): a manually-fired PR-gate review was posted on a mindwire PR but its design thread received no relay msg, so the thread head continued to name a role that had already acted. This class of stall — 'the awaited actor acted on a different surface, but nothing on the thread reflects it' — is the same family as M-5 in cause but a different surface pairing (GitHub review vs. Tier-C merge). Recorded here so the corpus preserves the incident without poisoning it as a spurious 'stall' verdict indistinguishable from a legitimate pre-review wait."
+}
