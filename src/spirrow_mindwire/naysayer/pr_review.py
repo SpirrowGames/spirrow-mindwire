@@ -53,15 +53,25 @@ from typing import Any
 from ..github.client import (
     CiState,
     CiStatus,
+    EnvironmentTerminalError,
     GitHubClient,
     GitHubHTTPError,
     GitHubReviewClient,
     PrRef,
+    Retryability,
     ReviewEvent,
     ReviewInfo,
+    Scope,
+    classify_http_error,
     naysayer_github_token,
+    scope_from_probe,
 )
-from ..github.reviews import LandedState, landed
+from ..github.reviews import (
+    LandedState,
+    ReviewReceipt,
+    landed,
+    parse_verdict_footer,
+)
 from ..lexora.client import (
     LEXORA_BACKEND_TIMEOUT_SECONDS,
     ChatMessage,
@@ -135,6 +145,100 @@ _DEFAULT_REVIEW_LOGIN = "spirrowgames-ops"
 # counts only these. Counting non-verdicts would let a comment-only interaction prematurely, and
 # then permanently, escalate the gate (Copilot + independent naysayer review on PR #113).
 _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
+
+# The FULL set of GitHub review states the chatroom-replay discharge check treats as
+# "our write reached GitHub" (DESIGN v3 §2, msg-1987). This includes COMMENT — a
+# 422-fallback COMMENT that landed IS a discharge, and treating it as un-landed would
+# loop APPROVE→422→COMMENT→APPROVE→422→COMMENT indefinitely. Only the replay path
+# uses this set; ``_skip_unchanged_response`` and the round cap keep ``_VERDICT_STATES``
+# because they ask a different question ("did we spend a Gemini review", not "did our
+# write reach GitHub").
+_ALL_LANDED_STATES = ("APPROVED", "CHANGES_REQUESTED", "COMMENTED")
+
+# The suppression-marker sentinel the replay path writes when a target-terminal
+# rejection makes further re-POSTs futile (msg-1984 §2). Its presence for the
+# current head is the ONE dedup ledger the driver keeps — same shape rationale as
+# the verdict footer (HTML comment, machine-readable, invisible in rendered text).
+_TARGET_TERMINAL_MARKER_RE = re.compile(r"<!-- mindwire:unposted head_sha=([A-Fa-f0-9?]+) -->")
+
+
+def _target_terminal_suppression_marker(
+    *, head_sha: str, status_code: int | None, reason: str
+) -> str:
+    """Render the 1-message body carrying the ``mindwire:unposted`` suppression sentinel."""
+    return (
+        f"投函不能: {head_sha[:12] if head_sha != '?' else '?'} "
+        f"(status={status_code}, reason={reason})\n\n"
+        f"<!-- mindwire:unposted head_sha={head_sha} -->"
+    )
+
+
+# Regex that identifies the ADR-INDEX marker at the end of a body — see the module
+# docstring of :mod:`.pr_review_adr_pointers` for the marker shape. Not imported from
+# that module because we treat it as an OPAQUE final line here (we only need to know
+# where it starts, not to parse its contents).
+_ADR_INDEX_MARKER_TAIL_RE = re.compile(r"\n\s*ADR-INDEX:[^\n]*\Z")
+
+
+def _insert_verdict_footer_before_marker(body: str, *, head_sha: str, event: ReviewEvent) -> str:
+    """Insert the verdict footer between the critique and the ADR-INDEX marker.
+
+    The ADR-INDEX marker's invariant is that it is the FINAL non-empty line of a
+    posted body (msg-690 M2, :mod:`.pr_review_adr_pointers`); the verdict footer
+    (DESIGN v3 Q5-A) has no such requirement — it just needs to be present and
+    unambiguous. So we place the footer ABOVE the marker.
+
+    If the body does NOT end with an ADR-INDEX marker (which should never happen on
+    the production paths; each of the 5 call sites appends it), we fall back to a
+    plain append — the replay path only needs the footer to exist, so this fallback
+    keeps the driver behaviour safe rather than raising in a test-only scenario.
+    """
+    match = _ADR_INDEX_MARKER_TAIL_RE.search(body)
+    footer = f"<!-- mindwire:verdict head_sha={head_sha} event={event.value} -->"
+    if match is None:
+        # No marker in this body — append the footer normally. Tests that construct
+        # bodies without the marker will still parse successfully.
+        return f"{body}\n\n{footer}" if body else footer
+    head = body[: match.start()].rstrip()
+    tail = body[match.start() :].lstrip("\n")
+    return f"{head}\n\n{footer}\n\n{tail}"
+
+
+def _submit_decision(scope: Scope) -> str:
+    """One-word label for the structured submit-failure log line's ``decision`` field."""
+    if scope in (Scope.ENVIRONMENT_CREDENTIAL, Scope.ENVIRONMENT_PERMISSION):
+        return "environment-terminal-raise"
+    if scope is Scope.TARGET:
+        return "target-terminal-raise"
+    return "unknown-raise"
+
+
+def _body_without_footer(body: str) -> str:
+    """Return ``body`` with the ``mindwire:verdict`` sentinel line removed (replay repost helper).
+
+    The footer is re-appended by :meth:`~NaysayerPrReviewDriver._post_and_submit`, so a
+    body that already carries one must have it stripped first — otherwise the parser
+    sees two footers and refuses replay next time (the "unambiguous" invariant).
+    """
+    # Simple: drop everything after (and including) the last blank line if the tail is a marker.
+    from ..github.reviews import _VERDICT_FOOTER_RE
+
+    return _VERDICT_FOOTER_RE.sub("", body).rstrip()
+
+
+def _strip_footer_and_use_event(body: str, event: ReviewEvent) -> ReviewEvent:
+    """Return the event authoritatively (kept as a small function for future replay-time policy).
+
+    Currently a pass-through of ``event`` — this exists as a seam so a future policy
+    (e.g. never re-escalate a COMMENT-fallback back to APPROVE) has an obvious place to
+    live, referenced from :meth:`NaysayerPrReviewDriver._maybe_replay_verdict`. The
+    ``body`` argument is unused today; keeping it in the signature documents the intent
+    that a policy might read the body to decide (DESIGN v3 §1 "422→COMMENT fallback:
+    replay must NOT re-escalate").
+    """
+    del body  # currently unused; see docstring
+    return event
+
 
 # A verdict must be its own line, starting at COLUMN ZERO (``^...$`` with MULTILINE, and no
 # leading-whitespace class after ``^``).
@@ -262,8 +366,21 @@ review body — reply directly with the review, no preamble.
 """
 
 # The driver posts its critique to the review thread via this callback (supplied by the
-# orchestrator), so the chatroom transport stays out of the judging core.
-PostCritique = Callable[[str], Awaitable[None]]
+# orchestrator), so the chatroom transport stays out of the judging core. Returns the
+# chatroom ``msg_id`` of the posted message — captured in the :class:`ReviewReceipt` so
+# the (post, submit) pair is proven to have happened in that order (Q4-A structural
+# guarantee; DESIGN v3 §5, msg-1987). A caller that cannot / does not want to return an
+# id (test fake) may return the empty string; the receipt still enforces the order.
+PostCritique = Callable[[str], Awaitable[str]]
+
+# The chatroom-replay pass reads the messages of the review thread to look for a
+# previously-posted-but-never-submitted verdict (DESIGN v3 §3-3). Signature returns
+# the list of ``(author, body)`` pairs — the driver only needs the body text (for the
+# footer parse) and the author (to filter to the naysayer's own posts). Providing this
+# callback is OPTIONAL: when ``None``, the driver behaves as before (no replay), so
+# tests / callers that do not want to wire chatroom read stay simple. In production the
+# orchestrator wires it (see :class:`~spirrow_mindwire.orchestrator.PrReviewOrchestrator`).
+ReadReviewThread = Callable[[], Awaitable[list[tuple[str, str]]]]
 
 
 class NaysayerPrReviewError(RuntimeError):
@@ -734,7 +851,13 @@ class NaysayerPrReviewDriver:
             else GitHubClient(github_token if github_token is not None else naysayer_github_token())
         )
 
-    async def review(self, pr: PrRef, *, post_critique: PostCritique) -> PrReviewOutcome:
+    async def review(
+        self,
+        pr: PrRef,
+        *,
+        post_critique: PostCritique,
+        read_review_thread: ReadReviewThread | None = None,
+    ) -> PrReviewOutcome:
         """Review one PR: L1 CI-gate → (if green) Lexora judge → post critique → submit review.
 
         ``post_critique`` posts the critique body to the review thread; it is invoked **before**
@@ -747,17 +870,41 @@ class NaysayerPrReviewDriver:
         pointer marker as its final line — a short-circuit path stamps ``ADR-INDEX: unavailable``
         because pass 2 was not attempted, so an inspecting human can always see whether the
         review carried an ADR-index cross-check.
+
+        Chatroom-replay pass (T-gate-review-submit-failure-handling DESIGN v3 §3-3): before
+        anything else, look for a prior naysayer post carrying a verdict footer for the
+        current head that never landed on GitHub (crashed after chatroom relay, or hit an
+        environment-terminal on submit). If found, re-POST it without calling the model.
+        Runs BEFORE ``skip_if_head_unchanged`` (v1 order requirement) so a replay-eligible
+        verdict is not shadowed by a "head unchanged, use prior" short-circuit. Requires
+        ``read_review_thread`` to be wired; without it the driver behaves as before
+        (no replay).
         """
         # L1 CI-gate (ADR-16 §D-2): the APPROVE must imply CI green for the reviewed head SHA.
         # Query CI BEFORE the (costly) content review and short-circuit when it is not green —
         # fail-closed: failure / pending / UNKNOWN never APPROVE (fetch_ci_status never raises).
         ci = await self._github.fetch_ci_status(pr)
+
+        # Chatroom-replay pass (DESIGN v3 §3-3). Consumes a footer-marked verdict from a
+        # prior post that never made it to GitHub — the exact #192 scenario, where the
+        # Gemini review executed, the body was relayed to chatroom, and the POST failed
+        # with an environment-terminal 401. We re-POST the same body / event without
+        # calling the model (the critique is already paid for; the discharge check via
+        # ``fetch_pr_reviews_strict`` guarantees we do not double-submit if the previous
+        # POST actually succeeded but we lost the response).
+        if read_review_thread is not None and ci.head_sha is not None:
+            replay = await self._maybe_replay_verdict(
+                pr, ci, post_critique=post_critique, read_review_thread=read_review_thread
+            )
+            if replay is not None:
+                return replay
         if ci.state is not CiState.SUCCESS:
             verdict, body = _ci_gate_response(ci, pr.slug)
             selection = _not_attempted_selection()
             body = append_marker(body, selection)
-            await post_critique(body)
-            await self._submit_review(pr, verdict, body)  # no Lexora call — gate stands in
+            await self._post_and_submit(
+                pr, verdict=verdict, body=body, head_sha=ci.head_sha, post_critique=post_critique
+            )
             return PrReviewOutcome(
                 verdict=verdict,
                 body=body,
@@ -808,10 +955,20 @@ class NaysayerPrReviewDriver:
                     verdict, body = skip
                     selection = _not_attempted_selection()
                     body = append_marker(body, selection)
-                    await post_critique(body)
+                    # Debounce skip does NOT submit to GitHub (the prior verdict review
+                    # from the debounce head-match already sits on the PR — a second submit
+                    # would be a duplicate). But we still stamp the verdict footer, inserted
+                    # BEFORE the ADR-INDEX marker so both sentinels coexist and the marker
+                    # keeps its final-line invariant. A downstream replay reads a well-formed
+                    # body if this path is ever the "last written for this head" the chatroom
+                    # holds.
+                    body_with_footer = _insert_verdict_footer_before_marker(
+                        body, head_sha=ci.head_sha or "", event=verdict
+                    )
+                    await post_critique(body_with_footer)
                     return PrReviewOutcome(
                         verdict=verdict,
-                        body=body,
+                        body=body_with_footer,
                         ci_state=ci.state,
                         head_sha=ci.head_sha,
                         skipped_head_unchanged=True,
@@ -838,11 +995,16 @@ class NaysayerPrReviewDriver:
                     )
                     selection = _not_attempted_selection()
                     body = append_marker(body, selection)
-                    await post_critique(body)
-                    await self._submit_review(pr, ReviewEvent.COMMENT, body)
-                    return PrReviewOutcome(
+                    receipt = await self._post_and_submit(
+                        pr,
                         verdict=ReviewEvent.COMMENT,
                         body=body,
+                        head_sha=ci.head_sha,
+                        post_critique=post_critique,
+                    )
+                    return PrReviewOutcome(
+                        verdict=ReviewEvent.COMMENT,
+                        body=receipt.body,
                         ci_state=ci.state,
                         head_sha=ci.head_sha,
                         rounds_capped=True,
@@ -918,12 +1080,16 @@ class NaysayerPrReviewDriver:
         _log_pass2(pr.slug, pass2_selection, pass2_raw)
         body = append_marker(body, pass2_selection)
 
-        await post_critique(body)
         # Fail-closed: unreachable GitHub raises here too (posted first, so the human sees it).
-        await self._submit_review(pr, verdict, body)
+        # The receipt (DESIGN v3 Q4-A) proves post_critique fired before _submit_review — a
+        # sixth code path cannot skip the relay because the type signature refuses to compile
+        # a submit call without one.
+        receipt = await self._post_and_submit(
+            pr, verdict=verdict, body=body, head_sha=ci.head_sha, post_critique=post_critique
+        )
         return PrReviewOutcome(
             verdict=verdict,
-            body=body,
+            body=receipt.body,
             ci_state=ci.state,
             head_sha=ci.head_sha,
             truncated=truncated,
@@ -1041,11 +1207,16 @@ class NaysayerPrReviewDriver:
         selection = pass2_selection if pass2_selection is not None else _not_attempted_selection()
         _log_pass2(pr.slug, selection, pass2_raw)
         body = append_marker(body, selection)
-        await post_critique(body)
-        await self._submit_review(pr, ReviewEvent.REQUEST_CHANGES, body)
-        return PrReviewOutcome(
+        receipt = await self._post_and_submit(
+            pr,
             verdict=ReviewEvent.REQUEST_CHANGES,
             body=body,
+            head_sha=ci.head_sha,
+            post_critique=post_critique,
+        )
+        return PrReviewOutcome(
+            verdict=ReviewEvent.REQUEST_CHANGES,
+            body=receipt.body,
             ci_state=ci.state,
             head_sha=ci.head_sha,
             model=self._model,
@@ -1108,23 +1279,275 @@ class NaysayerPrReviewDriver:
         )
         return verdict, body
 
-    async def _submit_review(self, pr: PrRef, verdict: ReviewEvent, body: str) -> None:
-        """Submit the PR review, falling back to COMMENT on the same-identity 422.
+    async def _post_and_submit(
+        self,
+        pr: PrRef,
+        *,
+        verdict: ReviewEvent,
+        body: str,
+        head_sha: str | None,
+        post_critique: PostCritique,
+    ) -> ReviewReceipt:
+        """Stamp the verdict footer, post to chatroom, submit to GitHub — the ONE post→submit site.
 
-        GitHub forbids a formal APPROVE / REQUEST_CHANGES on your *own* PR. T22 provisions the
-        naysayer a distinct identity (``MINDWIRE_NAYSAYER_GITHUB_TOKEN`` = ``spirrowgames-ops``) so
-        the formal verdict goes through. This COMMENT fallback remains a backstop for the window
-        before that token is provisioned (the naysayer then shares the author identity and the
-        verdict event 422s): we re-submit the same body as a COMMENT so the verdict (in the body)
-        is still recorded, rather than fail-closed-halting on a credential-config issue.
+        Called from all five review paths (CI-gate, round-cap escalation, timeout-degrade,
+        normal review, and the replay path via :meth:`_replay_receipt`). Consolidating the
+        sequence here means the DESIGN v3 invariants live in one place and cannot drift:
+
+        * **Q4-A order** — ``post_critique`` fires BEFORE :meth:`_submit_review`; the
+          returned :class:`ReviewReceipt` is the caller's proof the order held. A new
+          code path cannot bypass the relay because :meth:`_submit_review` requires the
+          receipt as its argument (structural enforcement, not test-coverage-only).
+        * **Q5-A footer** — the ``<!-- mindwire:verdict head_sha=... event=... -->``
+          sentinel is appended here, exactly once per body. Both channels (chatroom
+          relay + GitHub review) see the same body, so a replay consumer reading the
+          chatroom sees the exact bytes that were submitted (or attempted).
+
+        ``head_sha`` may be ``None`` (a very early CI-gate path where the head could not
+        be resolved). In that case the footer records an empty ``head_sha=``, and the
+        replay parser rejects such a footer as ambiguous — a fail-safe direction that
+        matches every other UNKNOWN-collapses-fail-safe rule in this design.
+
+        Placement w.r.t. the ADR-INDEX marker (msg-690 M2 "marker is the final line"):
+        the incoming ``body`` already ends with the ADR marker (:func:`append_marker`
+        was called at each call site before we got here). We insert the verdict footer
+        BETWEEN the critique proper and the marker, so the marker keeps its
+        fixed-position invariant. Both sentinels coexist; a replay consumer parses on
+        the HTML-comment shape, which does not collide with the plaintext marker line.
+        """
+        body_with_footer = _insert_verdict_footer_before_marker(
+            body, head_sha=head_sha or "", event=verdict
+        )
+        msg_id = await post_critique(body_with_footer)
+        receipt = ReviewReceipt(
+            head_sha=head_sha or "",
+            event=verdict,
+            chatroom_msg_id=msg_id,
+            body=body_with_footer,
+        )
+        await self._submit_review(pr, receipt=receipt)
+        return receipt
+
+    async def _submit_review(self, pr: PrRef, *, receipt: ReviewReceipt) -> None:
+        """Submit the PR review from a receipt, classify + probe on a terminal, raise as needed.
+
+        The receipt (DESIGN v3 Q4-A) is the caller's proof that ``post_critique`` fired
+        first — this method cannot be reached without one. On a
+        :class:`~spirrow_mindwire.github.client.GitHubHTTPError` we branch:
+
+        * **same-identity 422** (T22 fallback): re-submit the receipt body as a COMMENT
+          so the verdict (rendered in the body) is still recorded. Same body, so the
+          footer stamps the ORIGINAL attempted event — replay-consumer semantics remain
+          honest: "we attempted APPROVE; GitHub gave us a COMMENT because of author=approver".
+        * **TERMINAL, environment-scoped** (D-1 + probe): raise
+          :class:`EnvironmentTerminalError` so the daemon entry point can exit 2 and
+          the PS wrapper alert-without-quarantine (DESIGN v3 §3, msg-1987 §D-7). The
+          probe uses the SAME credential the write just failed under (single-token, per
+          Q6 answer, msg-1986). ``UNKNOWN`` from the probe means we could not decide
+          scope — fail-safe: propagate as an ordinary :class:`GitHubHTTPError` so the
+          existing exit-1 / quarantine path handles it (DESIGN v3 §3 "未分類は必ず 1").
+        * **anything else** (RETRYABLE transport, 5xx, unclassified) — re-raise, same
+          as before this change.
         """
         try:
-            await self._github.submit_review(pr, event=verdict, body=body)
+            await self._github.submit_review(pr, event=receipt.event, body=receipt.body)
         except GitHubHTTPError as exc:
             if exc.status_code == 422 and "own pull request" in str(exc).lower():
-                await self._github.submit_review(pr, event=ReviewEvent.COMMENT, body=body)
+                # Same body carries the ORIGINAL verdict footer; that is intentional
+                # (msg-1987 Q5-A rationale: record the attempted event, not the fallback).
+                await self._github.submit_review(pr, event=ReviewEvent.COMMENT, body=receipt.body)
+                return
+            classification = classify_http_error(exc)
+            if classification is Retryability.TERMINAL:
+                probe_status = await self._github.probe_identity()
+                scope = scope_from_probe(exc.status_code, probe_status)
+                logger.warning(
+                    "naysayer submit failure: pr=%s status_code=%s retryability=%s "
+                    "scope=%s decision=%s",
+                    pr.slug,
+                    exc.status_code,
+                    classification.value,
+                    scope.value,
+                    _submit_decision(scope),
+                )
+                if scope in (Scope.ENVIRONMENT_CREDENTIAL, Scope.ENVIRONMENT_PERMISSION):
+                    raise EnvironmentTerminalError(
+                        pr=pr,
+                        scope=scope,
+                        status_code=exc.status_code,
+                        message=f"environment-terminal on {pr.slug}: {exc}",
+                    ) from exc
             else:
-                raise
+                logger.warning(
+                    "naysayer submit failure: pr=%s status_code=%s retryability=%s "
+                    "scope=%s decision=%s",
+                    pr.slug,
+                    exc.status_code,
+                    classification.value,
+                    Scope.UNKNOWN.value,
+                    "raise",
+                )
+            raise
+
+    async def _maybe_replay_verdict(
+        self,
+        pr: PrRef,
+        ci: CiStatus,
+        *,
+        post_critique: PostCritique,
+        read_review_thread: ReadReviewThread,
+    ) -> PrReviewOutcome | None:
+        """Look for a previous chatroom post carrying a verdict footer that never landed on GitHub.
+
+        Returns the :class:`PrReviewOutcome` when a replay fires (verdict re-POSTed
+        without spending a Gemini call); ``None`` when no eligible footer is found or
+        the discharge check confirms the verdict already landed (nothing to replay).
+
+        The three conditions all must hold:
+
+        1. The chatroom thread carries at least one message with a footer whose
+           ``head_sha`` equals (or is a prefix of) ``ci.head_sha`` — a footer for an
+           older head is superseded, not replay-eligible.
+        2. That footer is UNAMBIGUOUS (:func:`parse_verdict_footer` returned a single
+           match; two footers on one body → UNKNOWN, refuse to POST — fail-safe).
+        3. :func:`landed` on the STRICT review-read reports
+           :attr:`LandedState.NOT_LANDED` — the verdict is not already on GitHub, and
+           the read succeeded (so an UNKNOWN result from a fail-soft read cannot
+           authorise a duplicate POST, DESIGN v3 §2).
+
+        We use :meth:`~spirrow_mindwire.github.client.GitHubReviewClient.fetch_pr_reviews_strict`,
+        not the fail-soft variant — a terminal read failure here (a dead PAT) raises
+        :class:`GitHubHTTPError`, which propagates through the normal submit-failure
+        classification path (:meth:`_submit_review`) and eventually raises
+        :class:`EnvironmentTerminalError`, exiting the turn without POSTing a garbage
+        verdict (D-7 msg-1987).
+
+        A ``mindwire:unposted`` sentinel (see :func:`_target_terminal_suppression_marker`)
+        on the chatroom body is our ONE dedup ledger against re-submitting a verdict we
+        already know is terminally rejected at the target level (a 422 for a deleted PR,
+        a 404). Its presence for the current head suppresses replay — the human must
+        adjudicate (msg-1984 §2).
+        """
+        try:
+            messages = await read_review_thread()
+        except Exception as exc:  # replay must not itself sink the sweep
+            logger.warning("naysayer replay: read_review_thread failed: %s (skipping replay)", exc)
+            return None
+
+        # Suppression marker check first: if we have already recorded this head as
+        # "cannot post", replay is refused for that head (msg-1984 §2 抑止マーカー).
+        for _author, body in reversed(messages):
+            if _TARGET_TERMINAL_MARKER_RE.search(body) and (
+                ci.head_sha and f"head_sha={ci.head_sha}" in body
+            ):
+                logger.info(
+                    "naysayer replay: suppression marker present for %s head=%s — no replay",
+                    pr.slug,
+                    ci.head_sha[:12],
+                )
+                return None
+
+        # Find the most recent naysayer-authored body with a footer for the current head.
+        candidate: tuple[str, str, ReviewEvent] | None = None  # (body, sha, event)
+        for _author, body in reversed(messages):
+            # Author filter is intentionally loose — the orchestrator wires the reader
+            # to return only naysayer posts, and asserting on the exact author string
+            # would couple us to the identity name at read-time. The footer parser
+            # already rejects unrelated bodies.
+            parsed = parse_verdict_footer(body)
+            if parsed is None:
+                continue
+            footer_sha, footer_event = parsed
+            # Prefix match: a short footer sha (e.g. from a debounce-skip body carrying
+            # head[:12]) matches the current head when it is that head's prefix.
+            if ci.head_sha and not ci.head_sha.startswith(footer_sha):
+                continue
+            candidate = (body, footer_sha, footer_event)
+            break
+
+        if candidate is None:
+            return None
+
+        cand_body, _footer_sha, footer_event = candidate
+
+        # Discharge check via STRICT read — the only path that raises on env-terminal.
+        # A landed prior review means we do not re-POST; UNKNOWN (impossible here
+        # because strict raises) would also refuse; NOT_LANDED authorises replay.
+        prior = await self._github.fetch_pr_reviews_strict(pr)
+        head_landed = landed(
+            prior,
+            head_sha=ci.head_sha,
+            login=self._review_login,
+            states=_ALL_LANDED_STATES,
+        )
+        if head_landed is LandedState.LANDED:
+            logger.info(
+                "naysayer replay: verdict already landed for %s head=%s — no replay",
+                pr.slug,
+                (ci.head_sha or "?")[:12],
+            )
+            return None
+        if head_landed is LandedState.UNKNOWN:
+            # Belt-and-braces: strict raises on a real read failure, so UNKNOWN here
+            # can only mean head_sha is None (guarded upstream), but the fail-safe
+            # direction is the same as everywhere else in the design — do not POST.
+            return None
+
+        # Re-POST the exact prior body (footer intact). The chatroom relay is repeated
+        # (the SOT for the replay is the previous chatroom post; posting the same body
+        # again keeps the SOT well-formed for a future replay iteration if THIS one
+        # also fails to land).
+        try:
+            receipt = await self._post_and_submit(
+                pr,
+                verdict=_strip_footer_and_use_event(cand_body, footer_event),
+                body=_body_without_footer(cand_body),
+                head_sha=ci.head_sha,
+                post_critique=post_critique,
+            )
+        except GitHubHTTPError as exc:
+            # A target-terminal exception here (422 same-identity handled by fallback;
+            # 422 other / 404) means the verdict is undeliverable for structural reasons.
+            # Record a suppression marker via the chatroom so future ticks do not loop
+            # (msg-1984 §2). The environment-terminal path raises EnvironmentTerminalError
+            # above and exits the turn — not this branch.
+            classification = classify_http_error(exc)
+            if classification is Retryability.TERMINAL and exc.status_code not in (401,):
+                await self._post_target_terminal_marker(
+                    pr, ci, exc=exc, post_critique=post_critique
+                )
+            raise
+
+        return PrReviewOutcome(
+            verdict=receipt.event,
+            body=receipt.body,
+            ci_state=ci.state,
+            head_sha=ci.head_sha,
+            adr_pointer_selection=None,
+        )
+
+    async def _post_target_terminal_marker(
+        self,
+        pr: PrRef,
+        ci: CiStatus,
+        *,
+        exc: GitHubHTTPError,
+        post_critique: PostCritique,
+    ) -> None:
+        """Post the 1-line ``mindwire:unposted`` suppression marker (DESIGN v3 §3 msg-1987)."""
+        body = _target_terminal_suppression_marker(
+            head_sha=ci.head_sha or "?",
+            status_code=exc.status_code,
+            reason=str(exc)[:200],
+        )
+        try:
+            await post_critique(body)
+        except Exception as post_exc:  # marker is best-effort
+            logger.warning(
+                "naysayer replay: could not post target-terminal marker for %s: %s",
+                pr.slug,
+                post_exc,
+            )
 
     async def aclose(self) -> None:
         """Close the shared Lexora + GitHub clients (driver teardown)."""

@@ -2434,11 +2434,78 @@ try {
         # decide-visited candidate (including this one), so there is no per-launch refresh here.
         # first_seen_at is preserved by Update-EvaluatedTimestamp.
 
+        # EXIT CODE 2 — environment-scoped terminal (T-gate-review-submit-failure-handling
+        # DESIGN v3 §3). The Python daemon signals this when a GitHub write failed with a
+        # scope-probed environment fault (dead PAT / repo the credential has no access to);
+        # it is NOT this thread's fault, so do NOT quarantine — notify and continue.
+        #
+        # The daemon prints one JSON payload row to stdout right before exiting 2, prefixed
+        # with ``MINDWIRE_ENV_TERMINAL_PAYLOAD `` (see :func:`_emit_environment_terminal_payload`
+        # in loop_runner.py). We parse that row here to build the dedup key that matches the
+        # fault CLASS (Einstein v3 §condition 1 / Bohr msg-1987 §Q2-B):
+        #
+        #   scope=environment/credential          -> __github_credential__ (single, global)
+        #   scope=environment/permission          -> __github_permission__/<owner>/<repo>
+        #
+        # If the parse fails or a required field is missing, we FALL BACK to the global
+        # ``__github_credential__`` key and fire the notification anyway. A malformed payload
+        # must NEVER swallow a critical environment alert (Einstein v3 condition 1, msg-1988).
+        # The control-flow decision (do-not-quarantine) rides on the EXIT CODE, not on the
+        # parse — the parse only shapes the dedup key.
+        if ($code -eq 2) {
+            $dispositions[$cand.key] = 'env-terminal'
+            $nowIso = $nowUtc.ToString("o")
+            $envPayload = $null
+            $envKey = "__github_credential__"
+            $envSig = "${nowIso}:env-terminal"
+            foreach ($line in $output) {
+                if ($line -match '^MINDWIRE_ENV_TERMINAL_PAYLOAD\s+(.*)$') {
+                    try {
+                        $envPayload = $Matches[1] | ConvertFrom-Json -ErrorAction Stop
+                    } catch {
+                        Write-Log "env-terminal payload parse FAILED (falling back to global key): $($_.Exception.Message)"
+                        $envPayload = $null
+                    }
+                    break
+                }
+            }
+            if ($null -ne $envPayload -and $envPayload.PSObject.Properties.Name -contains 'scope') {
+                $scope = "$($envPayload.scope)"
+                if ($scope -eq 'environment/permission' -and
+                    $envPayload.PSObject.Properties.Name -contains 'owner' -and
+                    $envPayload.PSObject.Properties.Name -contains 'repo') {
+                    $envKey = "__github_permission__/$($envPayload.owner)/$($envPayload.repo)"
+                    $envSig = "${nowIso}:${scope}:$($envPayload.owner)/$($envPayload.repo):$($envPayload.status_code)"
+                } elseif ($scope -eq 'environment/credential') {
+                    $envKey = "__github_credential__"
+                    $envSig = "${nowIso}:${scope}:$($envPayload.status_code)"
+                }
+                # Unknown / unexpected scope value stays on the global fallback — the alert
+                # still fires, on the safe side of "notify, do not swallow".
+            }
+            $envBody = ("MindWire: GitHub credential / permission fault — **$($cand.key)** exit=2. " +
+                        "スレッドは無傷（quarantine 書かず）。PAT/権限を確認してください。")
+            if ($null -ne $envPayload) {
+                $envBody += "`n(scope=$($envPayload.scope), status=$($envPayload.status_code))"
+            } else {
+                $envBody += "`n(payload parse failed; alerting on global credential key)"
+            }
+            Send-NotificationIfChanged -State $notifyState -Key $envKey `
+                -Signature $envSig `
+                -Message $envBody
+            Write-Log "env-terminal $($cand.key): exit=2 key=$envKey — sweep CONTINUES, no quarantine"
+            continue
+        }
+
         # NON-ZERO EXIT — quarantine, notify, keep going. The old wrapper broke the sweep here
         # (silent), which was the exact failure mode of the 2026-08-11 5h starvation on threads
         # BEHIND the broken candidate. The direct cause of that starvation is fixed elsewhere
         # (#136 / OBL-MERGE-MECHANISM); this branch exists to keep the NEXT unknown breakage from
         # dying in the same silent way — quarantine declares it, and the sweep continues.
+        # Bohr msg-1987 §Q2-A condition 3: PS treats every non-zero code we do not explicitly
+        # handle (i.e. anything other than the 0/2 above) as a thread-scoped failure. Future
+        # exit codes MUST land here as "quarantine" until this branch is extended for them —
+        # the front-compat direction is "unknown → uarantine", never "unknown → alert-only".
         if ($code -ne 0) {
             $dispositions[$cand.key] = 'failed'
             $tail = @()

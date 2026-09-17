@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .client import (
+    EnvironmentTerminalError,
     GitHubClient,
     GitHubError,
     GitHubHTTPError,
@@ -14,13 +15,18 @@ from .client import (
     classify_http_error,
     github_token,
     parse_pr_ref,
+    scope_from_probe,
 )
 from .reviews import (
     LandedState,
+    ReviewReceipt,
+    append_verdict_footer,
     landed,
+    parse_verdict_footer,
 )
 
 __all__ = [
+    "EnvironmentTerminalError",
     "GitHubClient",
     "GitHubError",
     "GitHubHTTPError",
@@ -29,9 +35,13 @@ __all__ = [
     "PrRef",
     "Retryability",
     "ReviewEvent",
+    "ReviewReceipt",
     "Scope",
+    "append_verdict_footer",
     "classify_http_error",
     "github_token",
     "landed",
     "parse_pr_ref",
+    "parse_verdict_footer",
+    "scope_from_probe",
 ]

@@ -20,8 +20,14 @@ from __future__ import annotations
 
 import pytest
 
-from spirrow_mindwire.github.client import ReviewInfo
-from spirrow_mindwire.github.reviews import LandedState, landed
+from spirrow_mindwire.github.client import ReviewEvent, ReviewInfo
+from spirrow_mindwire.github.reviews import (
+    LandedState,
+    ReviewReceipt,
+    append_verdict_footer,
+    landed,
+    parse_verdict_footer,
+)
 
 _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
 _ALL_STATES = ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING")
@@ -128,3 +134,79 @@ def test_landed_finds_review_among_many() -> None:
     ]
     result = landed(reviews, head_sha="sha-abc", login="spirrowgames-ops", states=_VERDICT_STATES)
     assert result is LandedState.LANDED
+
+
+# ── Verdict footer (DESIGN v3 Q5-A: HTML comment sentinel, head_sha + event) ──
+
+
+def test_append_verdict_footer_appends_html_comment_sentinel() -> None:
+    marked = append_verdict_footer(
+        "the critique\n\nVERDICT: APPROVE", head_sha="deadbeef" * 5, event=ReviewEvent.APPROVE
+    )
+    assert marked.endswith(
+        "<!-- mindwire:verdict head_sha=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef event=APPROVE -->"
+    )
+
+
+def test_append_verdict_footer_on_empty_body_returns_just_the_marker() -> None:
+    marked = append_verdict_footer("", head_sha="abc1234", event=ReviewEvent.COMMENT)
+    assert marked == "<!-- mindwire:verdict head_sha=abc1234 event=COMMENT -->"
+
+
+def test_parse_verdict_footer_roundtrip_for_each_event() -> None:
+    for event in (ReviewEvent.APPROVE, ReviewEvent.REQUEST_CHANGES, ReviewEvent.COMMENT):
+        body = append_verdict_footer("x", head_sha="abcdef1234567890", event=event)
+        parsed = parse_verdict_footer(body)
+        assert parsed is not None
+        sha, ev = parsed
+        assert sha == "abcdef1234567890"
+        assert ev is event
+
+
+def test_parse_verdict_footer_returns_none_when_no_marker() -> None:
+    # A body without the footer is not eligible for replay (a pre-footer post from
+    # an older version of the driver, or an ordinary chatroom message).
+    assert parse_verdict_footer("just some text\n\nVERDICT: APPROVE") is None
+
+
+def test_parse_verdict_footer_returns_none_on_multiple_markers() -> None:
+    # More than one footer means the invariant "exactly one footer per body"
+    # is broken — fail-safe: refuse replay (DESIGN v3 §1 UNKNOWN direction).
+    body = (
+        "<!-- mindwire:verdict head_sha=abc1234 event=APPROVE -->\n"
+        "<!-- mindwire:verdict head_sha=def5678 event=REQUEST_CHANGES -->"
+    )
+    assert parse_verdict_footer(body) is None
+
+
+def test_parse_verdict_footer_rejects_short_sha_below_seven_chars() -> None:
+    # Regex requires >=7 chars; 6 does not match.
+    body = "<!-- mindwire:verdict head_sha=abc123 event=APPROVE -->"
+    assert parse_verdict_footer(body) is None
+
+
+def test_parse_verdict_footer_accepts_truncated_sha_at_seven_chars() -> None:
+    # The debounce-skip body uses ``head[:12]``; a >=7-char sha is accepted so
+    # replay can prefix-match it against the current full head_sha.
+    body = "<!-- mindwire:verdict head_sha=abcdef1 event=REQUEST_CHANGES -->"
+    parsed = parse_verdict_footer(body)
+    assert parsed is not None
+    sha, event = parsed
+    assert sha == "abcdef1"
+    assert event is ReviewEvent.REQUEST_CHANGES
+
+
+def test_review_receipt_is_frozen_and_carries_the_four_fields() -> None:
+    receipt = ReviewReceipt(
+        head_sha="abcdef1234567890",
+        event=ReviewEvent.APPROVE,
+        chatroom_msg_id="msg-42",
+        body="the body\n\n<!-- mindwire:verdict head_sha=abcdef1234567890 event=APPROVE -->",
+    )
+    assert receipt.head_sha == "abcdef1234567890"
+    assert receipt.event is ReviewEvent.APPROVE
+    assert receipt.chatroom_msg_id == "msg-42"
+    with pytest.raises((AttributeError, TypeError)):
+        # frozen=True dataclass → cannot mutate; the exact exception type varies
+        # (dataclasses raises FrozenInstanceError, an AttributeError subclass).
+        receipt.head_sha = "other"  # type: ignore[misc]

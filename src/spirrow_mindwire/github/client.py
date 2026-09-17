@@ -315,6 +315,8 @@ class GitHubReviewClient(Protocol):
 
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]: ...
 
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]: ...
+
     async def submit_review(
         self, pr: PrRef, *, event: ReviewEvent, body: str
     ) -> dict[str, Any]: ...
@@ -571,6 +573,74 @@ class GitHubClient:
             page += 1
         return out
 
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+        """Fail-LOUD twin of :meth:`fetch_pr_reviews` (``GET /pulls/{n}/reviews``).
+
+        The chatroom-replay discharge check (D-7, DESIGN v3 §2) NEEDS to
+        distinguish "asked and got nothing" from "could not ask" — the
+        fail-soft :meth:`fetch_pr_reviews` collapses both to ``[]``, which
+        :func:`~spirrow_mindwire.github.reviews.landed` would then read as
+        :attr:`~spirrow_mindwire.github.reviews.LandedState.NOT_LANDED` and
+        authorise a re-POST at exactly the moment (a credential outage) when
+        a duplicate POST is most likely (DESIGN v3 §2 fail-open trap).
+
+        This variant raises :class:`GitHubHTTPError` on transport / non-2xx /
+        parse failure, so the replay path can classify the exception via
+        :func:`classify_http_error` and treat a TERMINAL read the same way it
+        would treat a TERMINAL write: probe scope, and if environment,
+        abort the turn without POSTing (D-7 msg-1987 §D-7).
+
+        Deliberately implemented as a SEPARATE method rather than a mode
+        parameter on :meth:`fetch_pr_reviews` (DESIGN v3 §3 constraint: "do not
+        share the fail-soft and strict paths in one function"). Existing callers
+        (round-cap accounting, ``_skip_unchanged_response``) keep the fail-soft
+        semantics they were written against; only the replay-discharge site
+        opts into the strict variant.
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
+        out: list[ReviewInfo] = []
+        page = 1
+        while True:
+            try:
+                resp = await self._client.get(path, params={"per_page": 100, "page": page})
+            except httpx.RequestError as exc:
+                raise GitHubHTTPError(f"GET {path} (reviews strict): {exc}") from exc
+            if resp.status_code >= 400:
+                raise GitHubHTTPError(
+                    f"GET {path} (reviews strict) returned {resp.status_code}: "
+                    f"{_error_detail(resp)}",
+                    status_code=resp.status_code,
+                    retry_after=_retry_after_seconds(resp),
+                    rate_limited=_is_rate_limited(resp),
+                )
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                raise GitHubHTTPError(
+                    f"GET {path} (reviews strict): malformed JSON: {exc}"
+                ) from exc
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                user = row.get("user")
+                login = str(user.get("login") or "") if isinstance(user, dict) else ""
+                cid = row.get("commit_id")
+                submitted = row.get("submitted_at")
+                out.append(
+                    ReviewInfo(
+                        login=login,
+                        state=str(row.get("state") or ""),
+                        commit_id=str(cid) if cid else None,
+                        submitted_at=str(submitted) if submitted else None,
+                    )
+                )
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event.
 
@@ -731,9 +801,83 @@ class Scope(StrEnum):
     UNKNOWN = "unknown"
 
 
+def scope_from_probe(failure_status: int | None, probe_status: int) -> Scope:
+    """Decide :class:`Scope` from a submit failure + the ``probe_identity()`` result.
+
+    Truth table (DESIGN v3 §3 axes, mapping the two facts we can observe onto
+    the four :class:`Scope` values):
+
+    - ``probe_status == 401`` → :attr:`ENVIRONMENT_CREDENTIAL` (token itself is
+      dead; the same fault greets every repo this credential touches).
+    - ``probe_status == 200`` and ``failure_status in {403, 404}`` →
+      :attr:`ENVIRONMENT_PERMISSION` (credential lives, but has no access to
+      *this* repo — a repo-scoped gap that is nonetheless not "this thread's
+      fault"; msg-1987 Q2-B rationale).
+    - ``probe_status == 200`` and ``failure_status == 422`` → :attr:`TARGET`
+      (the token is fine and this repo works; the failure is about this
+      specific PR — same-identity guard, deleted PR, etc.).
+    - ``probe_status == 0`` (transport-level probe failure) → :attr:`UNKNOWN`
+      (the scope-determination call itself did not run; fail-safe: never
+      quarantine on UNKNOWN, never alert as environment on UNKNOWN).
+    - Anything else (a probe returning 5xx, an unexpected 4xx) → :attr:`UNKNOWN`
+      for the same reason.
+
+    Callers use the returned value to decide whether the terminal failure is
+    thread-scoped (:attr:`TARGET` → quarantine, current behaviour) or
+    environment-scoped (:attr:`ENVIRONMENT_*` → alert without quarantine,
+    exit code 2). :attr:`UNKNOWN` falls back to "treat as thread-scoped" =
+    quarantine, per DESIGN v3 §3 "未分類は必ず 1"— never route a fault
+    through the alert-only path unless we can prove it is environment.
+    """
+    if probe_status == 401:
+        return Scope.ENVIRONMENT_CREDENTIAL
+    if probe_status == 200:
+        if failure_status in (403, 404):
+            return Scope.ENVIRONMENT_PERMISSION
+        if failure_status == 422:
+            return Scope.TARGET
+        # 401 with a probe of 200 is a contradiction (the same credential just
+        # said "unauthorised" and "OK" in adjacent calls). Fail-safe UNKNOWN
+        # rather than picking a side and being wrong.
+        return Scope.UNKNOWN
+    return Scope.UNKNOWN
+
+
+class EnvironmentTerminalError(GitHubError):
+    """A GitHub write failed with an ENVIRONMENT-scoped terminal fault.
+
+    Raised by the naysayer driver when :func:`classify_http_error` returns
+    :attr:`Retryability.TERMINAL` AND :func:`scope_from_probe` returns one of
+    the :attr:`Scope.ENVIRONMENT_CREDENTIAL` / :attr:`Scope.ENVIRONMENT_PERMISSION`
+    values. The daemon entry point catches this specifically to (a) emit the
+    machine-readable payload line the PowerShell wrapper parses for its dedup
+    key and (b) exit with code 2 — the signal that means "do NOT quarantine,
+    alert instead" (DESIGN v3 §3).
+
+    Fields carry the information the wrapper's alert body / dedup key needs:
+    ``scope`` selects between the ``__github_credential__`` / repo-scoped
+    ``__github_permission__/<owner>/<repo>`` alert keys (msg-1987 Q2-B), and
+    ``pr`` / ``status_code`` supply the failure fingerprint.
+    """
+
+    def __init__(
+        self,
+        *,
+        pr: PrRef,
+        scope: Scope,
+        status_code: int | None,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+        self.pr = pr
+        self.scope = scope
+        self.status_code = status_code
+
+
 __all__ = [
     "CiState",
     "CiStatus",
+    "EnvironmentTerminalError",
     "GitHubClient",
     "GitHubError",
     "GitHubHTTPError",
@@ -747,4 +891,5 @@ __all__ = [
     "github_token",
     "naysayer_github_token",
     "parse_pr_ref",
+    "scope_from_probe",
 ]

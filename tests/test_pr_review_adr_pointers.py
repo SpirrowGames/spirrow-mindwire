@@ -149,6 +149,9 @@ class _FakeGitHub:
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
         return list(self._reviews)
 
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+        return list(self._reviews)
+
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
         self.submitted.append((pr, event, body))
         return {"id": 1, "state": event.value}
@@ -167,8 +170,9 @@ def _pr() -> PrRef:
 def _capture() -> tuple[list[str], Any]:
     posted: list[str] = []
 
-    async def post(body: str) -> None:
+    async def post(body: str) -> str:
         posted.append(body)
+        return f"msg-{len(posted)}"
 
     return posted, post
 

@@ -14,17 +14,20 @@ import pytest
 
 from spirrow_mindwire.github.client import (
     CiState,
+    EnvironmentTerminalError,
     GitHubClient,
     GitHubHTTPError,
     PrRef,
     Retryability,
     ReviewEvent,
+    Scope,
     _derive_ci_state,
     _required_workflows_from_env,
     classify_http_error,
     github_token,
     naysayer_github_token,
     parse_pr_ref,
+    scope_from_probe,
 )
 
 _PR = PrRef(owner="spirrowgames", repo="spirrow-mindwire", number=42)
@@ -693,3 +696,108 @@ async def test_probe_identity_returns_zero_on_transport_failure() -> None:
 
     async with _client(handler) as client:
         assert await client.probe_identity() == 0
+
+
+# ── scope_from_probe (D-1 axis-2 mapping) ──
+
+
+def test_scope_from_probe_401_maps_to_environment_credential() -> None:
+    # Token itself is dead → the fault does not belong to *this* thread.
+    assert scope_from_probe(failure_status=401, probe_status=401) is Scope.ENVIRONMENT_CREDENTIAL
+    # A submit that failed with 403 while the same credential returns 401 on
+    # /user is still credential-scope (the credential died between the two calls).
+    assert scope_from_probe(failure_status=403, probe_status=401) is Scope.ENVIRONMENT_CREDENTIAL
+
+
+def test_scope_from_probe_permission_403_or_404_with_live_probe_is_environment_permission() -> None:
+    # Credential is alive (200 on /user) but the write failed with a permission-like
+    # code — the repo is inaccessible to this credential. Environment-scoped, but
+    # repo-keyed so the alert dedup does not collapse across repos.
+    assert scope_from_probe(failure_status=403, probe_status=200) is Scope.ENVIRONMENT_PERMISSION
+    assert scope_from_probe(failure_status=404, probe_status=200) is Scope.ENVIRONMENT_PERMISSION
+
+
+def test_scope_from_probe_422_with_live_probe_is_target() -> None:
+    # 422 means the request cannot be satisfied for THIS PR (same-identity, deleted
+    # PR, etc.) — the fault is target-scoped, and the existing quarantine path
+    # handles it as a thread fault.
+    assert scope_from_probe(failure_status=422, probe_status=200) is Scope.TARGET
+
+
+def test_scope_from_probe_zero_probe_is_unknown_never_environment() -> None:
+    # A transport-failed probe returns 0 (see probe_identity). UNKNOWN prevents both
+    # false-attribution (never quarantine on UNKNOWN) and false-suppression (never
+    # alert as environment on UNKNOWN) — DESIGN v3 §3 "未分類は必ず 1".
+    assert scope_from_probe(failure_status=401, probe_status=0) is Scope.UNKNOWN
+    assert scope_from_probe(failure_status=403, probe_status=0) is Scope.UNKNOWN
+    assert scope_from_probe(failure_status=None, probe_status=0) is Scope.UNKNOWN
+
+
+def test_scope_from_probe_unexpected_probe_status_is_unknown() -> None:
+    # A probe that returned 500 (some other transient GitHub issue) is not enough
+    # signal to decide — fail-safe UNKNOWN, do not route to alert-only.
+    assert scope_from_probe(failure_status=403, probe_status=500) is Scope.UNKNOWN
+
+
+def test_environment_terminal_error_carries_pr_scope_status() -> None:
+    exc = EnvironmentTerminalError(
+        pr=_PR,
+        scope=Scope.ENVIRONMENT_CREDENTIAL,
+        status_code=401,
+        message="dead pat",
+    )
+    assert exc.pr == _PR
+    assert exc.scope is Scope.ENVIRONMENT_CREDENTIAL
+    assert exc.status_code == 401
+    assert "dead pat" in str(exc)
+
+
+# ── fetch_pr_reviews_strict (D-7 strict-read wrapper) ──
+
+
+def _reviews_handler(*, status: int, body: bytes | None = None) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path.endswith("/reviews")
+        return httpx.Response(status, content=body if body is not None else b"[]")
+
+    return handler
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_reviews_strict_raises_on_401_where_fail_soft_returns_empty() -> None:
+    # The whole point of the strict variant: the fail-soft returns [] on any error
+    # (which the landed() predicate would then read as NOT_LANDED, authorising a
+    # duplicate POST at exactly the moment it should not). Strict raises so the
+    # caller can classify + probe.
+    async with _client(_reviews_handler(status=401)) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.fetch_pr_reviews_strict(_PR)
+        # And the SAME endpoint returns [] on the fail-soft twin.
+        assert await client.fetch_pr_reviews(_PR) == []
+    assert excinfo.value.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_reviews_strict_raises_on_transport_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("dns")
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError):
+            await client.fetch_pr_reviews_strict(_PR)
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_reviews_strict_returns_reviews_on_success() -> None:
+    # Same parsing as the fail-soft variant on the happy path — the only difference
+    # is where they diverge on error. This asserts the happy paths remain aligned.
+    body = (
+        b'[{"user":{"login":"spirrowgames-ops"},"state":"APPROVED",'
+        b'"commit_id":"abc","submitted_at":"2026-08-29T00:00:00Z"}]'
+    )
+    async with _client(_reviews_handler(status=200, body=body)) as client:
+        strict = await client.fetch_pr_reviews_strict(_PR)
+    assert len(strict) == 1
+    assert strict[0].state == "APPROVED"
+    assert strict[0].commit_id == "abc"
