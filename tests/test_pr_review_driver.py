@@ -160,6 +160,11 @@ class _FakeGitHub:
         self.submitted.append((pr, event, body))
         return {"id": 1, "state": event.value}
 
+    async def probe_identity(self) -> int:
+        # Default: credential lives (200). Terminal-classification tests override this
+        # in a subclass to route the fault into ENVIRONMENT_* / TARGET / UNKNOWN scopes.
+        return 200
+
     async def aclose(self) -> None:
         return None
 
@@ -3116,3 +3121,290 @@ def test_gate_notice_divergence_axis() -> None:
     assert _MARKER_D_DIVERGENCE in unreadable
     assert f"`{ObjectionParse.MISSING.value}`" in unreadable
     assert "fail-closed" in unreadable
+
+
+# ---------- classification funnel (T-gate-review-submit-failure-handling PR-A) ----------
+
+
+@pytest.mark.anyio
+async def test_environment_terminal_raises_environment_terminal_error() -> None:
+    # A 401 on submit + a 401 on the follow-up probe → ENVIRONMENT_CREDENTIAL.
+    # The driver raises EnvironmentTerminalError so the daemon entry point can
+    # exit 2 and the PS wrapper alert-without-quarantine.
+    from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
+
+    class _EnvGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-env", []))
+            self.probe_calls = 0
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            raise GitHubHTTPError("POST /reviews returned 401: Bad credentials", status_code=401)
+
+        async def probe_identity(self) -> int:
+            self.probe_calls += 1
+            return 401  # credential itself is dead
+
+    github = _EnvGitHub()
+    lexora = _FakeLexora(content="ok\n\nVERDICT: APPROVE")
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    with pytest.raises(EnvironmentTerminalError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    assert excinfo.value.scope is Scope.ENVIRONMENT_CREDENTIAL
+    assert excinfo.value.status_code == 401
+    assert github.probe_calls == 1  # exactly one probe per terminal failure
+
+
+@pytest.mark.anyio
+async def test_environment_terminal_permission_403_with_live_probe() -> None:
+    # A 403 on submit + a 200 on probe → ENVIRONMENT_PERMISSION (repo-scoped
+    # alert key on the PS side).
+    from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
+
+    class _PermGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-perm", []))
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            raise GitHubHTTPError("POST /reviews returned 403", status_code=403)
+
+        async def probe_identity(self) -> int:
+            return 200  # credential lives; the repo is inaccessible
+
+    github = _PermGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    with pytest.raises(EnvironmentTerminalError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    assert excinfo.value.scope is Scope.ENVIRONMENT_PERMISSION
+
+
+@pytest.mark.anyio
+async def test_target_terminal_422_with_live_probe_raises_target_terminal_error() -> None:
+    # A 422 on submit (not the same-identity 422) + a 200 on probe → TARGET.
+    # The driver raises TargetTerminalError (a GitHubHTTPError subclass), so
+    # existing except-GitHubHTTPError handlers still quarantine, while a
+    # positive test on isinstance(exc, TargetTerminalError) can distinguish
+    # it from an UNKNOWN-scope re-raise (PR-B's marker path will need this).
+    from spirrow_mindwire.github.client import (
+        EnvironmentTerminalError,
+        TargetTerminalError,
+    )
+
+    class _TargetGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-t", []))
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            raise GitHubHTTPError(
+                "POST /reviews returned 422: unprocessable entity", status_code=422
+            )
+
+        async def probe_identity(self) -> int:
+            return 200
+
+    github = _TargetGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    with pytest.raises(TargetTerminalError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    assert not isinstance(excinfo.value, EnvironmentTerminalError)
+    assert excinfo.value.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_unknown_scope_reraises_not_environment_terminal_not_target_terminal() -> None:
+    # A 401 on submit + a transport-failed probe (0) → UNKNOWN. The driver
+    # MUST NOT route UNKNOWN through the environment-terminal path OR the
+    # target-terminal path; it re-raises the raw GitHubHTTPError so the
+    # existing quarantine path handles it. DESIGN v3 §3 "未分類は必ず 1".
+    from spirrow_mindwire.github.client import (
+        EnvironmentTerminalError,
+        TargetTerminalError,
+    )
+
+    class _UnknownGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-u", []))
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            raise GitHubHTTPError("POST /reviews returned 401", status_code=401)
+
+        async def probe_identity(self) -> int:
+            return 0  # transport failure; we could not decide scope
+
+    github = _UnknownGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    assert not isinstance(excinfo.value, EnvironmentTerminalError)
+    assert not isinstance(excinfo.value, TargetTerminalError)
+    # Raw type preserves the UNKNOWN-ness at the type level so no branch that
+    # keys on TargetTerminalError can collapse UNKNOWN into TARGET.
+    assert type(excinfo.value) is GitHubHTTPError
+
+
+@pytest.mark.anyio
+async def test_retryable_error_reraises_raw() -> None:
+    # A 5xx on submit → RETRYABLE. PR-A ships classification without retries;
+    # PR-B will add retries behind a landed() idempotency guard (msg-3276).
+    # For now the driver must re-raise the raw exception without invoking the
+    # probe (RETRYABLE never touches scope_from_probe by definition).
+    from spirrow_mindwire.github.client import (
+        EnvironmentTerminalError,
+        TargetTerminalError,
+    )
+
+    class _RetryableGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-r", []))
+            self.probe_calls = 0
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            raise GitHubHTTPError("POST /reviews returned 503", status_code=503)
+
+        async def probe_identity(self) -> int:
+            self.probe_calls += 1
+            return 200
+
+    github = _RetryableGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    assert not isinstance(excinfo.value, EnvironmentTerminalError)
+    assert not isinstance(excinfo.value, TargetTerminalError)
+    assert excinfo.value.status_code == 503
+    # RETRYABLE must NOT spend the scope probe: it is a wasted /user call whose
+    # outcome is not consulted by classify_http_error on a retryable status.
+    assert github.probe_calls == 0
+
+
+@pytest.mark.anyio
+async def test_same_identity_422_fallback_still_works() -> None:
+    # T22 same-identity 422 → COMMENT fallback survives the funnel refactor.
+    # The primary APPROVE fails 422 with "own pull request"; the fallback COMMENT
+    # POST succeeds (the _FakeGitHub only raises for non-COMMENT events).
+    exc = GitHubHTTPError(
+        "POST /reviews returned 422: cannot approve your own pull request",
+        status_code=422,
+    )
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-t22", []),
+        submit_exc=exc,
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    outcome = await driver.review(_pr(), post_critique=post)
+    # The APPROVE 422s → fallback COMMENT is submitted; outcome verdict remains
+    # APPROVE (that is what we DECIDED, even if GitHub gave us a COMMENT).
+    assert outcome.verdict is ReviewEvent.APPROVE
+    events_submitted = [event for _, event, _ in github.submitted]
+    assert events_submitted == [ReviewEvent.COMMENT]  # the fallback landed
+
+
+@pytest.mark.anyio
+async def test_same_identity_422_fallback_401_raises_environment_terminal_not_quarantine() -> None:
+    # msg-3218 fix: the same-identity 422 → COMMENT fallback was not routed
+    # through _classify_and_reraise. A 401 on the fallback POST would therefore
+    # bubble as a plain GitHubHTTPError → thread quarantine, i.e. the exact
+    # false-quarantine mode this design exists to prevent. The fix wraps the
+    # fallback POST in the same funnel, so an env-terminal on the fallback
+    # raises EnvironmentTerminalError → exit 2, alert-not-quarantine.
+    from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
+
+    class _FallbackAuthDiesGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-fallback-auth", []))
+            self._calls = 0
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            self._calls += 1
+            if self._calls == 1:
+                # Primary APPROVE hits the same-identity 422.
+                raise GitHubHTTPError(
+                    "POST /reviews returned 422: cannot approve your own pull request",
+                    status_code=422,
+                )
+            # Fallback COMMENT hits a 401 — credential died mid-flight.
+            raise GitHubHTTPError("POST /reviews returned 401: Bad credentials", status_code=401)
+
+        async def probe_identity(self) -> int:
+            return 401  # confirms credential-scope environment terminal
+
+    github = _FallbackAuthDiesGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    with pytest.raises(EnvironmentTerminalError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    assert excinfo.value.scope is Scope.ENVIRONMENT_CREDENTIAL
+    assert excinfo.value.status_code == 401
+    # The origin tag distinguishes fallback-time failures from primary ones in
+    # the log record (see _classify_and_reraise's logger.warning call).
+    assert "submit-comment-fallback" in str(excinfo.value)
+
+
+@pytest.mark.anyio
+async def test_same_identity_422_fallback_target_terminal_raises_target_terminal_error() -> None:
+    # Companion oracle: a TARGET-scoped terminal on the fallback (e.g. the PR
+    # was deleted between the primary POST and the fallback POST) must also go
+    # through the funnel and surface as TargetTerminalError, not a raw
+    # GitHubHTTPError. Preserves the invariant that _classify_and_reraise is
+    # the SOLE producer of the typed variants for every write path.
+    from spirrow_mindwire.github.client import TargetTerminalError
+
+    class _FallbackDeletedGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-fallback-deleted", []))
+            self._calls = 0
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            self._calls += 1
+            if self._calls == 1:
+                raise GitHubHTTPError(
+                    "POST /reviews returned 422: cannot approve your own pull request",
+                    status_code=422,
+                )
+            # A 422 that is NOT the same-identity guard — with probe==200 this
+            # maps to Scope.TARGET (per scope_from_probe).
+            raise GitHubHTTPError("POST /reviews returned 422: PR is closed", status_code=422)
+
+        async def probe_identity(self) -> int:
+            return 200  # credential is fine → scope is TARGET, not environment
+
+    github = _FallbackDeletedGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    with pytest.raises(TargetTerminalError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    assert excinfo.value.status_code == 422

@@ -161,6 +161,13 @@ class _FakeGitHub:
         self.submitted.append((pr, event, body))
         return {"id": 1, "state": event.value}
 
+    async def probe_identity(self) -> int:
+        # ADR-pointer tests never exercise the terminal-classification funnel; return
+        # 200 so any accidental call still yields a well-defined value. Kept
+        # structurally compatible with GitHubReviewClient (T-gate-review-submit-
+        # failure-handling PR-A: new Protocol member).
+        return 200
+
     async def aclose(self) -> None:
         return None
 
