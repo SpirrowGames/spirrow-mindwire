@@ -52,13 +52,6 @@ def test_landed_returns_not_landed_when_read_is_empty() -> None:
     assert result is LandedState.NOT_LANDED
 
 
-def test_landed_returns_unknown_when_read_is_none() -> None:
-    # The fail-soft fetch returned "I could not read" (D-7 hook). Distinct from
-    # `[]` (asked-and-empty). The dedup guard MUST NOT proceed on UNKNOWN.
-    result = landed(None, head_sha="sha-abc", login="spirrowgames-ops", states=_VERDICT_STATES)
-    assert result is LandedState.UNKNOWN
-
-
 def test_landed_returns_unknown_when_head_sha_is_none() -> None:
     # CI-status path can produce a null head; without one, we cannot say a
     # landed review belongs to *this* head.

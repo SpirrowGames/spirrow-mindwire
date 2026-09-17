@@ -21,13 +21,13 @@ Two responsibilities, one module:
    keeps footer parsing / the dedup predicate under one roof.
 
 Three-valued: :class:`LandedState` distinguishes ``LANDED`` from ``NOT_LANDED``
-from ``UNKNOWN``. The distinction is load-bearing for D-7 (env-terminal reads):
-a call site that cannot see the review-set MUST NOT collapse UNKNOWN into
-NOT_LANDED, or the dedup guard will vanish in exactly the moment it is most
-needed (a fail-soft read that returned ``[]`` because of a 401 would otherwise
-authorise a re-POST that duplicates a landed verdict). The upstream fetcher
-signals "I could not read" by passing ``reviews=None``; a real empty list still
-means "asked and answered, nothing there".
+from ``UNKNOWN``. The failure mode being guarded is D-7 (env-terminal reads):
+a fail-soft read that returned ``[]`` because of a 401 would authorise a re-POST
+that duplicates a landed verdict. The FETCHER is what closes that gap: the
+replay path uses ``fetch_pr_reviews_strict``, which raises on any read failure
+and is caught + classified by ``_classify_and_reraise`` before :func:`landed`
+runs. This predicate therefore only carries a ``head_sha=None`` UNKNOWN axis;
+its ``reviews`` argument is always a concrete list at the call site.
 """
 
 from __future__ import annotations
@@ -45,11 +45,10 @@ class LandedState(StrEnum):
 
     ``LANDED`` — a matching review is present in the read set.
     ``NOT_LANDED`` — the read succeeded and no matching review is present.
-    ``UNKNOWN`` — the caller could not read the review set (transport error,
-    401 on a fail-soft read, etc). Callers MUST NOT treat this as
-    ``NOT_LANDED``; treating it that way lets the dedup guard fail open at
-    exactly the moment (a terminal read failure) when a duplicate POST is most
-    likely.
+    ``UNKNOWN`` — ``head_sha`` was ``None``; callers MUST NOT treat this as
+    ``NOT_LANDED`` (fail-safe: do not POST when in doubt). Read-failure UNKNOWN
+    is not produced here — the strict fetcher raises upstream (see module
+    docstring).
     """
 
     LANDED = "landed"
@@ -58,7 +57,7 @@ class LandedState(StrEnum):
 
 
 def landed(
-    reviews: list[ReviewInfo] | None,
+    reviews: list[ReviewInfo],
     *,
     head_sha: str | None,
     login: str,
@@ -66,17 +65,13 @@ def landed(
 ) -> LandedState:
     """Has a review matching ``(head_sha, login, states)`` already landed on GitHub?
 
-    ``reviews`` is the read set from
-    :meth:`~spirrow_mindwire.github.client.GitHubReviewClient.fetch_pr_reviews`.
-    Passing ``None`` (the read failed / was not attempted) → :attr:`LandedState.UNKNOWN`.
-    Passing an empty list (the read succeeded, no reviews yet) → :attr:`NOT_LANDED`.
+    ``reviews`` is the read set from a fetcher that has already established a
+    successful read (the strict fetcher raises upstream on failure). An empty
+    list → :attr:`NOT_LANDED` (asked-and-empty).
 
-    ``head_sha=None`` is also UNKNOWN — the CI-status path can produce a null
-    head (never confirmed against a commit), and the same reasoning applies:
-    without a head to compare against, we cannot say a landed review belongs to
-    *this* head. The T-gate-silently-suppresses-approve-on-truncated-diff round
-    of PR-gate work already learned that discarding this distinction produces
-    false-positive matches.
+    ``head_sha=None`` → :attr:`LandedState.UNKNOWN` — the CI-status path can
+    produce a null head (never confirmed against a commit); without a head to
+    compare against, we cannot say a landed review belongs to *this* head.
 
     ``states`` is deliberately per-caller (DESIGN v3 §2):
 
@@ -92,7 +87,7 @@ def landed(
     (fail-safe: a review that cannot be pinned to a commit cannot discharge
     a specific head).
     """
-    if reviews is None or head_sha is None:
+    if head_sha is None:
         return LandedState.UNKNOWN
     state_set = frozenset(states)
     for r in reviews:
