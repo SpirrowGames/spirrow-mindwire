@@ -128,7 +128,12 @@ def test_a_thread_without_id_is_ignored() -> None:
 
 
 def test_enumerate_skips_non_dict_items() -> None:
-    """A garbled listing (e.g. a stray string in ``items``) must not break enumeration."""
+    """A garbled listing (e.g. a stray string in ``items``) must not break enumeration.
+
+    The dropped items are counted in ``malformed_count`` — msg-2648 §3's
+    third state — and are **not** silently absorbed into
+    ``unregistered_count``.
+    """
     registered = _index(projects=("p",))
     threads: list[object] = [
         _thread(thread_id="T-a"),
@@ -138,6 +143,56 @@ def test_enumerate_skips_non_dict_items() -> None:
     report = enumerate_project("p", threads, registered)  # type: ignore[arg-type]
     assert report.unregistered_count == 2
     assert report.unregistered == ("T-a", "T-b")
+    # The stray string counts as one malformed item.
+    assert report.malformed_count == 1
+
+
+def test_enumerate_counts_multiple_malformed_items_separately_from_registered() -> None:
+    """msg-2648 §3: malformed count is NEVER mixed into unregistered_count.
+
+    Even when every valid item is registered (so unregistered_count == 0),
+    the malformed count stays visible.
+    """
+    registered = _index(("p", "T-a"), ("p", "T-b"))
+    threads: list[object] = [
+        _thread(thread_id="T-a"),
+        None,
+        _thread(thread_id="T-b"),
+        42,
+        ["not", "a", "thread"],
+    ]
+    report = enumerate_project("p", threads, registered)  # type: ignore[arg-type]
+    assert report.unregistered_count == 0
+    assert report.unregistered == ()
+    assert report.malformed_count == 3
+
+
+def test_enumerate_adds_external_malformed_count_from_upstream() -> None:
+    """The CLI's ``_list_live_threads`` also drops non-dicts; both counts sum here.
+
+    Callers pass ``malformed_count=<count from the paged listing>`` so
+    a listing that returned 5 garbage items *at the wire* still surfaces
+    that number even if the shape-clean list this function receives has
+    zero drops of its own.
+    """
+    registered = _index(projects=("p",))
+    threads = [_thread(thread_id="T-a"), _thread(thread_id="T-b")]
+    report = enumerate_project("p", threads, registered, malformed_count=5)
+    assert report.unregistered_count == 2
+    assert report.malformed_count == 5
+
+
+def test_enumerate_adds_upstream_and_local_malformed_counts() -> None:
+    """When both the upstream and local drops fire, ``malformed_count`` is the sum."""
+    registered = _index(projects=("p",))
+    threads: list[object] = [
+        _thread(thread_id="T-a"),
+        "stray",
+        _thread(thread_id="T-b"),
+    ]
+    report = enumerate_project("p", threads, registered, malformed_count=2)  # type: ignore[arg-type]
+    assert report.unregistered_count == 2
+    assert report.malformed_count == 3  # 2 upstream + 1 local
 
 
 def test_enumerate_preserves_thread_order() -> None:
@@ -181,11 +236,61 @@ def test_totals_sum_only_measured_projects() -> None:
     assert report.unmeasured_projects == ("q",)
 
 
+def test_project_error_report_sets_malformed_count_to_none() -> None:
+    """msg-2648 §3: when the whole listing failed, malformed_count is unknown too.
+
+    Setting it to 0 would silently claim the population was cleanly
+    enumerated when in fact nothing was — the same fail-silent shape
+    that the third state is meant to defeat.
+    """
+    report = project_error_report("q", "chatroom_list_threads failed: boom")
+    assert report.unregistered_count is None
+    assert report.malformed_count is None
+
+
+def test_malformed_count_total_sums_only_measured_projects() -> None:
+    """An unmeasured project must not silently zero out a real malformed count."""
+    report = EnumerateReport(
+        projects=(
+            ProjectReport(project="p", unregistered_count=3, malformed_count=2),
+            project_error_report("q", "network"),
+            ProjectReport(project="r", unregistered_count=1, malformed_count=4),
+        )
+    )
+    assert report.malformed_count_total == 6
+    assert report.any_malformed is True
+
+
+def test_any_malformed_is_false_when_only_measured_zero_and_unmeasured() -> None:
+    """``any_malformed`` fires only on a **positive** measured drop count.
+
+    An unmeasured project (``malformed_count is None``) is not evidence
+    of drops — it is evidence that we could not tell. A day where every
+    project either measured 0 drops or failed entirely reports
+    ``any_malformed=False`` so the wrapper does not tell the operator
+    "data was dropped" when what actually happened is "we could not
+    check".
+    """
+    report = EnumerateReport(
+        projects=(
+            ProjectReport(project="p", unregistered_count=1, malformed_count=0),
+            project_error_report("q", "network"),
+        )
+    )
+    assert report.any_malformed is False
+
+
 def test_enumerate_report_as_json_is_stable() -> None:
     """Snapshot the JSON shape the wrapper reads — a breaking change is caught here, not in prod."""
     report = EnumerateReport(
         projects=(
-            ProjectReport(project="p", unregistered_count=1, unregistered=("T-a",), error=None),
+            ProjectReport(
+                project="p",
+                unregistered_count=1,
+                unregistered=("T-a",),
+                error=None,
+                malformed_count=2,
+            ),
             project_error_report("q", "network"),
         )
     )
@@ -197,17 +302,21 @@ def test_enumerate_report_as_json_is_stable() -> None:
                 "unregistered_count": 1,
                 "unregistered": ["T-a"],
                 "error": None,
+                "malformed_count": 2,
             },
             {
                 "project": "q",
                 "unregistered_count": None,
                 "unregistered": [],
                 "error": "network",
+                "malformed_count": None,
             },
         ],
         "unregistered_count_total": 1,
         "unmeasured_projects": ["q"],
         "any_unmeasured": True,
+        "malformed_count_total": 2,
+        "any_malformed": True,
     }
 
 
