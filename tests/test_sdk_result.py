@@ -442,15 +442,17 @@ def test_permission_denials_projection_readability_reason_reaches_the_marker() -
     assert captured != "list(len=1)"
     assert isinstance(captured, list)
     assert len(captured) == 1
-    # The denial content is legible in the projected element. Values are
-    # wrapped in ``json.dumps``-style quotes so a value containing spaces
-    # (``git push origin main``) has unambiguous boundaries (msg-3231
-    # legibility objection / msg-3326 revision / msg-3328 substitution).
+    # The denial content is legible in the projected element. Both keys and
+    # values are wrapped in ``json.dumps``-style quotes so a value containing
+    # spaces (``git push origin main``) has unambiguous boundaries (msg-3231
+    # legibility objection / msg-3326 revision / msg-3328 substitution) and
+    # a key containing a control character cannot split the marker line
+    # (PR #288 PR-gate follow-up: symmetric json.dumps on keys).
     element = captured[0]
     assert isinstance(element, str)
-    assert 'tool_name="Bash"' in element
-    assert 'rule="branch-protection"' in element
-    assert 'tool_input="git push origin main"' in element
+    assert '"tool_name"="Bash"' in element
+    assert '"rule"="branch-protection"' in element
+    assert '"tool_input"="git push origin main"' in element
 
     # Picker treats the denial as a real reason (it is one).
     assert detail["reason_source"] == "field:permission_denials"
@@ -491,14 +493,14 @@ def test_permission_denials_projection_escapes_quotes_backslashes_and_newlines()
 
     # Inner ``"`` is escaped as ``\"`` (two characters), so the outer
     # double-quote boundary stays unambiguous.
-    assert r'tool_name="Bash \"sub\""' in element
+    assert r'"tool_name"="Bash \"sub\""' in element
 
     # Inner ``\`` is escaped as ``\\`` (two characters).
-    assert r'rule="back\\slash"' in element
+    assert r'"rule"="back\\slash"' in element
 
     # Inner newline is escaped as the literal two-character sequence ``\n``,
     # NOT rendered as an embedded LF byte.
-    assert r'tool_input="line1\nline2"' in element
+    assert r'"tool_input"="line1\nline2"' in element
 
     # The load-bearing line-integrity assertion: no raw newline byte anywhere
     # in the rendered field. This is what Einstein's objection specifically
@@ -506,6 +508,49 @@ def test_permission_denials_projection_escapes_quotes_backslashes_and_newlines()
     # field split across multiple lines.
     assert "\n" not in element
     assert "\r" not in element
+
+
+def test_permission_denials_projection_escapes_control_chars_in_keys() -> None:
+    """PR #288 PR-gate follow-up: KEYS containing control characters must
+    also not split the marker line.
+
+    The msg-3328 revision applied ``json.dumps`` to values only; the PR-gate
+    naysayer identified that the SDK types the field as ``list[Any]`` and
+    the CLI populates dict elements from an untrusted CLI JSON blob whose
+    key shape is not enforced, so an input mapping can easily contain a key
+    like ``{"bad\\nkey": "value"}``. If the key were injected raw into the
+    f-string, that newline would be emitted verbatim and split the log line
+    — reintroducing the exact defect this whole PR exists to fix.
+
+    Fix pinned here: apply ``json.dumps(str(k))`` symmetrically to keys, so
+    the same line-integrity invariant holds on both sides of ``=``.
+    """
+    denial = {
+        "bad\nkey": "safe-value",
+        "tab\tkey": "another",
+        'quote"key': "third",
+    }
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    element = captured[0]
+    assert isinstance(element, str)
+
+    # No raw control byte anywhere — this is the invariant the PR-gate
+    # objection specifically named.
+    assert "\n" not in element
+    assert "\r" not in element
+    assert "\t" not in element
+
+    # Each key is JSON-escaped inside its quotes: newline becomes literal
+    # ``\n`` (two characters), tab becomes literal ``\t``, quote becomes
+    # ``\"``. The outer ``"..."="..."`` boundary is preserved on both sides.
+    assert r'"bad\nkey"="safe-value"' in element
+    assert r'"tab\tkey"="another"' in element
+    assert r'"quote\"key"="third"' in element
 
 
 def test_permission_denials_projection_c_independence_never_merged_into_errors() -> None:
@@ -652,8 +697,9 @@ def test_permission_denials_projection_truncates_long_lists_with_overflow_marker
     assert len(captured) == _SMALL_LIST_ELEM_LIMIT
     kept = _SMALL_LIST_ELEM_LIMIT - 1
     assert captured[-1] == f"+{20 - kept} more"
-    # And the preserved entries still carry their content (quoted per msg-3328).
-    assert 'tool_name="tool_0"' in captured[0]
+    # And the preserved entries still carry their content (both keys and
+    # values are json.dumps-quoted per msg-3328 + PR #288 PR-gate follow-up).
+    assert '"tool_name"="tool_0"' in captured[0]
 
 
 def test_permission_denials_projection_scalar_only_list_passes_through_normally() -> None:
