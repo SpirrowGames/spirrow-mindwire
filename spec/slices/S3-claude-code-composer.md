@@ -736,12 +736,12 @@ matters, and the D-45 note in each site is its documentation.
 |---|---|---|---|
 | 33,812 ms | v1 | A-18, voxelworld T-T227, 21,026 chars | deploy host |
 | 40,213 ms | v1 | A-20 baseline (Tier-C §2, 2026-08-22) | deploy host |
-| 109,530 ms | v2 | A-19 rev2, mindwire T-quarantine, 25,105 chars | **sg-ai-server-01** |
-| 153,183 ms | v3 | A-19 rev2, 同一入力 | **sg-ai-server-01** |
+| 109,530 ms | v2 | A-19 rev2, mindwire T-quarantine, 25,105 chars | **{{HOST_SERVICES}}** |
+| 153,183 ms | v3 | A-19 rev2, 同一入力 | **{{HOST_SERVICES}}** |
 
 **現行値 240 s** = 153,183 ms + 約 57%。
 
-**交絡を隠さない**: 上位 2 件は A-19 rev2 の A/B を sg-ai-server-01 で走らせた
+**交絡を隠さない**: 上位 2 件は A-19 rev2 の A/B を {{HOST_SERVICES}} で走らせた
 ものなので、40 s ベースラインとの 2.7 倍差は**ホスト差と交絡している**。D-57 の
 規則としては問題ない (240 s はどの成功実行より上) が、**次に loop host で測った値が
 次の改訂を駆動すべき**。
