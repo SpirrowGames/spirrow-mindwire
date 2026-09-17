@@ -15,16 +15,22 @@ import pytest
 from spirrow_mindwire.github.client import (
     CiState,
     CrossPrApproveCoverage,
+    EnvironmentTerminalError,
     GitHubClient,
     GitHubHTTPError,
     PrRef,
+    Retryability,
     ReviewEvent,
     ReviewInfo,
+    Scope,
+    TargetTerminalError,
     _derive_ci_state,
     _required_workflows_from_env,
+    classify_http_error,
     github_token,
     naysayer_github_token,
     parse_pr_ref,
+    scope_from_probe,
 )
 
 _PR = PrRef(owner="spirrowgames", repo="spirrow-mindwire", number=42)
@@ -771,6 +777,320 @@ async def test_both_paths_unusable_stays_unknown_and_keeps_rest_head_sha() -> No
     assert st.state is CiState.UNKNOWN
     # REST reached the PR (so it knows the head) even though it could not read runs.
     assert st.head_sha == "abc"
+
+
+# ---------- D-1: error classification (T-gate-review-submit-failure-handling) ----------
+
+
+def test_classify_transport_error_is_retryable() -> None:
+    # ``status_code is None`` = the httpx.RequestError branch (connection reset,
+    # dns failure, TLS handshake, ...). All of these can succeed on a retry.
+    exc = GitHubHTTPError("POST /… (review): ConnectError()", status_code=None)
+    assert classify_http_error(exc) is Retryability.RETRYABLE
+
+
+def test_classify_5xx_is_retryable() -> None:
+    for status in (500, 502, 503, 504):
+        exc = GitHubHTTPError("POST /… (review) returned 5xx", status_code=status)
+        assert classify_http_error(exc) is Retryability.RETRYABLE
+
+
+def test_classify_429_is_retryable() -> None:
+    exc = GitHubHTTPError("POST /… (review) returned 429", status_code=429, retry_after=30.0)
+    assert classify_http_error(exc) is Retryability.RETRYABLE
+
+
+def test_classify_403_with_rate_limit_hint_is_retryable() -> None:
+    # Secondary rate limit: 403 that CAN succeed later. The hint distinguishes it
+    # from a permission 403 (below), which will NOT succeed on retry.
+    exc = GitHubHTTPError("POST /… returned 403", status_code=403, rate_limited=True)
+    assert classify_http_error(exc) is Retryability.RETRYABLE
+
+
+def test_classify_403_without_rate_limit_hint_is_terminal() -> None:
+    # Plain 403 = permission denied. Retrying will keep saying 403; the caller
+    # must escalate to the scope probe (D-1) instead of burning attempts.
+    exc = GitHubHTTPError("POST /… returned 403", status_code=403, rate_limited=False)
+    assert classify_http_error(exc) is Retryability.TERMINAL
+
+
+def test_classify_401_is_terminal() -> None:
+    exc = GitHubHTTPError("POST /… returned 401: Bad credentials", status_code=401)
+    assert classify_http_error(exc) is Retryability.TERMINAL
+
+
+def test_classify_404_is_terminal() -> None:
+    exc = GitHubHTTPError("POST /… returned 404", status_code=404)
+    assert classify_http_error(exc) is Retryability.TERMINAL
+
+
+def test_classify_422_is_terminal() -> None:
+    # Same-identity 422 is handled by a COMMENT fallback at the driver seam; the
+    # classifier itself just needs to say "not retryable". Any deeper meaning
+    # (fallback vs escalate) belongs to the caller, not the static table.
+    exc = GitHubHTTPError("POST /… returned 422", status_code=422)
+    assert classify_http_error(exc) is Retryability.TERMINAL
+
+
+def test_github_http_error_defaults_are_neutral() -> None:
+    # A caller that constructs GitHubHTTPError without header context (the many
+    # existing raise-sites for reads / GraphQL) must not accidentally look like
+    # a rate-limited request. Defaults preserve the pre-change semantics.
+    exc = GitHubHTTPError("something", status_code=500)
+    assert exc.retry_after is None
+    assert exc.rate_limited is False
+
+
+# ---------- D-1 retry-hint header parsing on submit_review ----------
+
+
+def _submit_handler(*, status: int, headers: dict[str, str] | None = None) -> Any:
+    body = b'{"message": "boom"}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path.endswith("/reviews")
+        return httpx.Response(status, content=body, headers=headers or {})
+
+    return handler
+
+
+@pytest.mark.anyio
+async def test_submit_review_populates_retry_after_from_header() -> None:
+    async with _client(_submit_handler(status=429, headers={"Retry-After": "30"})) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x")
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.retry_after == 30.0
+    assert excinfo.value.rate_limited is True
+
+
+@pytest.mark.anyio
+async def test_submit_review_populates_rate_limited_from_remaining_zero() -> None:
+    # A 403 with `x-ratelimit-remaining: 0` is the primary rate limit shape.
+    # Retry-After may or may not be present; `rate_limited` must still be True.
+    async with _client(
+        _submit_handler(status=403, headers={"x-ratelimit-remaining": "0"})
+    ) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x")
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.rate_limited is True
+    assert classify_http_error(excinfo.value) is Retryability.RETRYABLE
+
+
+@pytest.mark.anyio
+async def test_submit_review_permission_403_is_not_rate_limited() -> None:
+    async with _client(_submit_handler(status=403)) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x")
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.rate_limited is False
+    assert classify_http_error(excinfo.value) is Retryability.TERMINAL
+
+
+@pytest.mark.anyio
+async def test_submit_review_401_carries_no_retry_hint() -> None:
+    async with _client(_submit_handler(status=401)) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x")
+    assert excinfo.value.status_code == 401
+    assert excinfo.value.retry_after is None
+    assert excinfo.value.rate_limited is False
+
+
+# ---------- probe_identity() (scope probe payload) ----------
+
+
+def _probe_handler(*, status: int) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/user"
+        return httpx.Response(status, content=b'{"login": "x"}')
+
+    return handler
+
+
+@pytest.mark.anyio
+async def test_probe_identity_returns_200_when_credential_lives() -> None:
+    async with _client(_probe_handler(status=200)) as client:
+        assert await client.probe_identity() == 200
+
+
+@pytest.mark.anyio
+async def test_probe_identity_returns_401_when_credential_dead() -> None:
+    async with _client(_probe_handler(status=401)) as client:
+        assert await client.probe_identity() == 401
+
+
+@pytest.mark.anyio
+async def test_probe_identity_returns_zero_on_transport_failure() -> None:
+    # 0 is the "we could not ask" sentinel — distinct from any HTTP status.
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("dns")
+
+    async with _client(handler) as client:
+        assert await client.probe_identity() == 0
+
+
+# ── scope_from_probe (D-1 axis-2 mapping) ──
+
+
+def test_scope_from_probe_401_maps_to_environment_credential() -> None:
+    # Token itself is dead → the fault does not belong to *this* thread.
+    assert scope_from_probe(failure_status=401, probe_status=401) is Scope.ENVIRONMENT_CREDENTIAL
+    # A submit that failed with 403 while the same credential returns 401 on
+    # /user is still credential-scope (the credential died between the two calls).
+    assert scope_from_probe(failure_status=403, probe_status=401) is Scope.ENVIRONMENT_CREDENTIAL
+
+
+def test_scope_from_probe_permission_403_or_404_with_live_probe_is_environment_permission() -> None:
+    # Credential is alive (200 on /user) but the write failed with a permission-like
+    # code — the repo is inaccessible to this credential. Environment-scoped, but
+    # repo-keyed so the alert dedup does not collapse across repos.
+    assert scope_from_probe(failure_status=403, probe_status=200) is Scope.ENVIRONMENT_PERMISSION
+    assert scope_from_probe(failure_status=404, probe_status=200) is Scope.ENVIRONMENT_PERMISSION
+
+
+def test_scope_from_probe_422_with_live_probe_is_target() -> None:
+    # 422 means the request cannot be satisfied for THIS PR (same-identity, deleted
+    # PR, etc.) — the fault is target-scoped, and the existing quarantine path
+    # handles it as a thread fault.
+    assert scope_from_probe(failure_status=422, probe_status=200) is Scope.TARGET
+
+
+def test_scope_from_probe_zero_probe_is_unknown_never_environment() -> None:
+    # A transport-failed probe returns 0 (see probe_identity). UNKNOWN prevents both
+    # false-attribution (never quarantine on UNKNOWN) and false-suppression (never
+    # alert as environment on UNKNOWN) — DESIGN v3 §3 "未分類は必ず 1".
+    assert scope_from_probe(failure_status=401, probe_status=0) is Scope.UNKNOWN
+    assert scope_from_probe(failure_status=403, probe_status=0) is Scope.UNKNOWN
+    assert scope_from_probe(failure_status=None, probe_status=0) is Scope.UNKNOWN
+
+
+def test_scope_from_probe_unexpected_probe_status_is_unknown() -> None:
+    # A probe that returned 500 (some other transient GitHub issue) is not enough
+    # signal to decide — fail-safe UNKNOWN, do not route to alert-only.
+    assert scope_from_probe(failure_status=403, probe_status=500) is Scope.UNKNOWN
+
+
+def test_scope_from_probe_403_probe_is_environment_credential_suspended_token() -> None:
+    # PR-gate objection 2 (msg pr-gate review of #280): probe_identity's docstring
+    # explicitly says a *suspended* token (SAML enforcement, GitHub abuse detection,
+    # org disablement) returns 403 from GET /user. The previous mapping table only
+    # handled probe 401 / 200 / anything-else-UNKNOWN, so a 403 probe fell through
+    # to UNKNOWN and (via _submit_review's re-raise) quarantined the thread — the
+    # exact false-quarantine that this PR exists to prevent for env-terminal faults.
+    #
+    # A suspended token has the same blast radius as a dead token (every repo it
+    # touches is equally blocked from writing), so it maps to the same key —
+    # Scope.ENVIRONMENT_CREDENTIAL — and the failure_status is irrelevant to the
+    # decision (a suspended token is a credential-level fact, not a repo-level one).
+    assert scope_from_probe(failure_status=401, probe_status=403) is Scope.ENVIRONMENT_CREDENTIAL
+    assert scope_from_probe(failure_status=403, probe_status=403) is Scope.ENVIRONMENT_CREDENTIAL
+    assert scope_from_probe(failure_status=404, probe_status=403) is Scope.ENVIRONMENT_CREDENTIAL
+    assert scope_from_probe(failure_status=422, probe_status=403) is Scope.ENVIRONMENT_CREDENTIAL
+    assert scope_from_probe(failure_status=None, probe_status=403) is Scope.ENVIRONMENT_CREDENTIAL
+
+
+def test_environment_terminal_error_carries_pr_scope_status() -> None:
+    exc = EnvironmentTerminalError(
+        pr=_PR,
+        scope=Scope.ENVIRONMENT_CREDENTIAL,
+        status_code=401,
+        message="dead pat",
+    )
+    assert exc.pr == _PR
+    assert exc.scope is Scope.ENVIRONMENT_CREDENTIAL
+    assert exc.status_code == 401
+    assert "dead pat" in str(exc)
+
+
+def test_target_terminal_error_subclasses_github_http_error_and_preserves_retry_hints() -> None:
+    # PR-gate objection 3: TargetTerminalError exists specifically so the replay
+    # suppression-marker branch can catch it *without* also catching a raw
+    # GitHubHTTPError whose scope was UNKNOWN. The subclass relationship keeps
+    # every existing `except GitHubHTTPError` handler correct (it is still one),
+    # while `isinstance(exc, TargetTerminalError)` gives the positive test the
+    # marker path now depends on.
+    src = GitHubHTTPError(
+        "POST /pulls/1/reviews returned 422: same identity",
+        status_code=422,
+        retry_after=None,
+        rate_limited=False,
+    )
+    wrapped = TargetTerminalError(src)
+    assert isinstance(wrapped, GitHubHTTPError)
+    assert wrapped.status_code == 422
+    assert wrapped.retry_after is None
+    assert wrapped.rate_limited is False
+    # The wrapper preserves the source message so operator logs remain diagnostic.
+    assert "same identity" in str(wrapped)
+
+
+def test_target_terminal_error_carries_rate_limit_hints_when_source_does() -> None:
+    # A 429 that gets classified as TARGET (in some future path) would still want
+    # to expose its Retry-After to a caller — verify the fields pass through.
+    src = GitHubHTTPError(
+        "POST … returned 429",
+        status_code=429,
+        retry_after=12.5,
+        rate_limited=True,
+    )
+    wrapped = TargetTerminalError(src)
+    assert wrapped.retry_after == 12.5
+    assert wrapped.rate_limited is True
+
+
+# ── fetch_pr_reviews_strict (D-7 strict-read wrapper) ──
+
+
+def _reviews_handler(*, status: int, body: bytes | None = None) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path.endswith("/reviews")
+        return httpx.Response(status, content=body if body is not None else b"[]")
+
+    return handler
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_reviews_strict_raises_on_401_where_fail_soft_returns_empty() -> None:
+    # The whole point of the strict variant: the fail-soft returns [] on any error
+    # (which the landed() predicate would then read as NOT_LANDED, authorising a
+    # duplicate POST at exactly the moment it should not). Strict raises so the
+    # caller can classify + probe.
+    async with _client(_reviews_handler(status=401)) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.fetch_pr_reviews_strict(_PR)
+        # And the SAME endpoint returns [] on the fail-soft twin.
+        assert await client.fetch_pr_reviews(_PR) == []
+    assert excinfo.value.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_reviews_strict_raises_on_transport_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("dns")
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError):
+            await client.fetch_pr_reviews_strict(_PR)
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_reviews_strict_returns_reviews_on_success() -> None:
+    # Same parsing as the fail-soft variant on the happy path — the only difference
+    # is where they diverge on error. This asserts the happy paths remain aligned.
+    body = (
+        b'[{"user":{"login":"spirrowgames-ops"},"state":"APPROVED",'
+        b'"commit_id":"abc","submitted_at":"2026-08-29T00:00:00Z"}]'
+    )
+    async with _client(_reviews_handler(status=200, body=body)) as client:
+        strict = await client.fetch_pr_reviews_strict(_PR)
+    assert len(strict) == 1
+    assert strict[0].state == "APPROVED"
+    assert strict[0].commit_id == "abc"
 
 
 # ---------- fetch_check_rollup (pre-gate admission input) ----------------- #

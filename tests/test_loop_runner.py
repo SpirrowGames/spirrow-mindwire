@@ -265,10 +265,16 @@ class _FakeGitHub:
     async def fetch_pr_reviews(self, pr: Any) -> Any:
         raise AssertionError("not called")
 
+    async def fetch_pr_reviews_strict(self, pr: Any) -> Any:
+        raise AssertionError("not called")
+
     async def find_cross_pr_head_bound_approves(self, pr: Any, *, reviewer_login: str) -> Any:
         raise AssertionError("not called")
 
     async def submit_review(self, pr: Any, *, event: Any, body: str) -> Any:
+        raise AssertionError("not called")
+
+    async def probe_identity(self) -> int:
         raise AssertionError("not called")
 
     async def aclose(self) -> None:
@@ -943,3 +949,92 @@ def test_main_does_nothing_extra_when_the_error_has_no_sdk_signal(
         loop_runner.main()
 
     assert "sdk_error_detail=" not in capsys.readouterr().out
+
+
+# ── T-gate-review-submit-failure-handling: exit-code-2 payload ──
+
+
+def test_main_exits_two_and_emits_payload_on_environment_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A driver-raised :class:`EnvironmentTerminalError` becomes exit 2 + one payload row.
+
+    DESIGN v3 §3 (msg-1987): the daemon signals "this fault is not the thread's"
+    by exiting with code 2 and printing a JSON payload row to stdout the PS
+    wrapper parses for its alert dedup key. The parse is fail-open on the PS
+    side (Einstein v3 condition 1, msg-1988) — but the Python side MUST emit a
+    well-formed row on the happy path, and MUST exit with code exactly 2 so the
+    wrapper's do-not-quarantine branch runs.
+    """
+    import json
+
+    from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
+    from spirrow_mindwire.github.client import PrRef as ClientPrRef
+
+    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+        raise EnvironmentTerminalError(
+            pr=ClientPrRef("spirrowgames", "spirrow-mindwire", 192),
+            scope=Scope.ENVIRONMENT_CREDENTIAL,
+            status_code=401,
+            message="POST /reviews 401: Bad credentials",
+        )
+
+    monkeypatch.setattr(loop_runner, "run_conductor", _fake_run_conductor)
+    monkeypatch.setattr(loop_runner, "load_settings", lambda: MindwireSettings())
+    monkeypatch.setattr("sys.argv", ["mindwire-loop", "--mode", "conductor"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        loop_runner.main()
+    assert excinfo.value.code == 2
+
+    out = capsys.readouterr().out
+    prefix = "MINDWIRE_ENV_TERMINAL_PAYLOAD "
+    payload_lines = [line for line in out.splitlines() if line.startswith(prefix)]
+    assert len(payload_lines) == 1, f"expected exactly one payload row; got: {payload_lines}"
+    payload = json.loads(payload_lines[0].removeprefix(prefix))
+    assert payload == {
+        "scope": "environment/credential",
+        "status_code": 401,
+        "owner": "spirrowgames",
+        "repo": "spirrow-mindwire",
+        "pr": 192,
+    }
+
+
+def test_main_exit_two_payload_carries_repo_for_permission_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The permission-scoped payload names owner+repo so the PS wrapper can build
+    the repo-keyed ``__github_permission__/<owner>/<repo>`` dedup key
+    (msg-1987 §Q2-B: fault-class keying)."""
+    import json
+
+    from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
+    from spirrow_mindwire.github.client import PrRef as ClientPrRef
+
+    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+        raise EnvironmentTerminalError(
+            pr=ClientPrRef("other-owner", "other-repo", 7),
+            scope=Scope.ENVIRONMENT_PERMISSION,
+            status_code=403,
+            message="POST /reviews 403",
+        )
+
+    monkeypatch.setattr(loop_runner, "run_conductor", _fake_run_conductor)
+    monkeypatch.setattr(loop_runner, "load_settings", lambda: MindwireSettings())
+    monkeypatch.setattr("sys.argv", ["mindwire-loop", "--mode", "conductor"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        loop_runner.main()
+    assert excinfo.value.code == 2
+
+    out = capsys.readouterr().out
+    prefix = "MINDWIRE_ENV_TERMINAL_PAYLOAD "
+    payload_lines = [line for line in out.splitlines() if line.startswith(prefix)]
+    assert len(payload_lines) == 1
+    payload = json.loads(payload_lines[0].removeprefix(prefix))
+    assert payload["scope"] == "environment/permission"
+    assert payload["owner"] == "other-owner"
+    assert payload["repo"] == "other-repo"

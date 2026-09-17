@@ -84,7 +84,13 @@ from .dispatcher.event_log import (
     EVENT_KIND_DELIVERY_FAILED,
 )
 from .dispatcher.registry import InMemoryAdapterRegistry
-from .github.client import CheckRollup, GitHubClient, PrRef, naysayer_github_token
+from .github.client import (
+    CheckRollup,
+    EnvironmentTerminalError,
+    GitHubClient,
+    PrRef,
+    naysayer_github_token,
+)
 from .magickit.client import McpToolCaller, StreamableHttpChatroomMcp
 from .magickit.gateway import MagickitChatroomGateway
 from .magickit.watcher import ChatroomWatcher, WatchSpec
@@ -754,6 +760,39 @@ def _ensure_utf8_runtime() -> None:
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 
+# The stdout sentinel the PS wrapper looks for to locate the environment-terminal
+# payload row. Kept as a module constant so tests can assert on the exact bytes and
+# the PS parser can be pinned against the same string (T-gate-review-submit-failure-
+# handling DESIGN v3 §3, msg-1988). Any change here must land alongside the matching
+# regex update in :file:`deploy/run-conductor-scheduled.ps1`.
+_ENV_TERMINAL_PAYLOAD_PREFIX = "MINDWIRE_ENV_TERMINAL_PAYLOAD "
+
+
+def _emit_environment_terminal_payload(exc: EnvironmentTerminalError) -> None:
+    """Print the JSON payload row the PS wrapper parses for the alert dedup key.
+
+    Shape: one line, prefix ``MINDWIRE_ENV_TERMINAL_PAYLOAD `` followed by a JSON
+    object with ``scope`` / ``status_code`` / ``owner`` / ``repo`` / ``pr``. The PS
+    parser is permitted to consume ONLY this row for its dedup key; the control
+    flow decision (do-not-quarantine) rides on the exit code, never on this row
+    (DESIGN v3 §3, msg-1987). If parsing fails on the PS side, the wrapper falls
+    back to the global ``__github_credential__`` key and still fires the alert —
+    a malformed row never swallows a critical environment notification (Einstein
+    v3 condition 1, msg-1988).
+    """
+    import json  # local to avoid pulling json into hot-path imports of this module
+
+    payload = {
+        "scope": exc.scope.value,
+        "status_code": exc.status_code,
+        "owner": exc.pr.owner,
+        "repo": exc.pr.repo,
+        "pr": exc.pr.number,
+    }
+    sys.stdout.write(f"{_ENV_TERMINAL_PAYLOAD_PREFIX}{json.dumps(payload)}\n")
+    sys.stdout.flush()
+
+
 def main() -> None:
     """Entry point for the ``mindwire-loop`` console script.
 
@@ -787,6 +826,31 @@ def main() -> None:
             asyncio.run(run_loop(settings))
     except KeyboardInterrupt:
         logger.info("stage3 loop interrupted; shut down cleanly")
+    except EnvironmentTerminalError as env_exc:
+        # T-gate-review-submit-failure-handling DESIGN v3 §3: an environment-scoped
+        # terminal (a dead PAT, or a repo whose access this credential does not have
+        # while the same credential answers ``GET /user`` fine) is NOT a fault of
+        # this thread. Signalling it as exit code 2 tells the PowerShell wrapper NOT
+        # to quarantine the thread — instead the wrapper alerts on the fault-class
+        # key (``__github_credential__`` / ``__github_permission__/<owner>/<repo>``)
+        # and continues the sweep.
+        #
+        # The payload line is JSON-shaped and printed to stdout on its OWN line,
+        # prefixed with a fixed sentinel so the PS parser can locate it in a mixed
+        # log stream. The PS side parses this only to build the dedup key; the
+        # control-flow decision (do-not-quarantine) rides on the exit CODE, not on
+        # the parse. If parsing fails, PS falls back to the global
+        # ``__github_credential__`` key and still fires the notification — a
+        # malformed payload never suppresses a critical environment alert
+        # (Einstein v3 condition 1, msg-1988).
+        _emit_environment_terminal_payload(env_exc)
+        logger.warning(
+            "environment-terminal exit=2: pr=%s scope=%s status_code=%s",
+            env_exc.pr.slug,
+            env_exc.scope.value,
+            env_exc.status_code,
+        )
+        sys.exit(2)
     except BaseException as exc:
         # Exit-time SDK-error marker (T-sdk-is-error-loses-the-reason S-6,
         # second copy). Sequenced carefully because Python's default

@@ -236,7 +236,7 @@ class PrReviewOrchestrator:
         # race handler: it is now reached only when the id was free at resolve time.
         opened = resolved.exists
 
-        async def post_critique(body: str) -> None:
+        async def post_critique(body: str) -> str:
             # Open the thread LAZILY — only once there is a critique to put in it, and only if it
             # is not already there. The driver calls this exactly once, after a review is produced.
             # Opening durable chatroom state up-front (before the fallible Lexora/GitHub calls
@@ -250,7 +250,7 @@ class PrReviewOrchestrator:
                 )
                 opened = True
             try:
-                await self._mcp.call_tool(
+                result = await self._mcp.call_tool(
                     "chatroom_post_message",
                     {
                         "project": project,
@@ -298,8 +298,68 @@ class PrReviewOrchestrator:
                     thread_id,
                     exc,
                 )
+                # T-gate-review-submit-failure-handling Q4-A: post_critique returns the
+                # chatroom msg_id so the driver's :class:`ReviewReceipt` can carry it.
+                # A dropped chatroom record has no id — return "" so the receipt is still
+                # well-formed; the order invariant is enforced by the receipt's presence,
+                # not the id value (a receipt with an empty id still proves post_critique
+                # ran before _submit_review).
+                return ""
+            # Return the chatroom msg_id so the driver's ``ReviewReceipt`` can carry it
+            # (T-gate-review-submit-failure-handling DESIGN v3 Q4-A: the (post → submit)
+            # order is proven by the receipt, which requires the id of the message we
+            # relayed). An unparseable / missing id becomes "", which is still a valid
+            # receipt — it just weakens the audit trail for that one post; the order
+            # invariant is enforced by the receipt's presence, not its id value.
+            msg = result.get("msg") if isinstance(result, dict) else None
+            if isinstance(msg, dict):
+                return str(msg.get("msg_id") or "")
+            if isinstance(result, dict):
+                return str(result.get("msg_id") or "")
+            return ""
 
-        outcome = await self._driver.review(pr, post_critique=post_critique)
+        async def read_review_thread() -> list[tuple[str, str]]:
+            """Return (author, body) for each message in the review thread (chatroom-replay).
+
+            Used by the driver's replay pass (T-gate-review-submit-failure-handling
+            DESIGN v3 §3-3) to look for a previously-posted-but-never-submitted verdict.
+            Returns ``[]`` when the thread does not yet exist (a first-review case has
+            nothing to replay), or when the read itself fails.
+            """
+            if not opened:
+                # First review — nothing to replay against. Do NOT open the thread just to
+                # read from it (Tier B msg-453: no abandoned empty threads).
+                return []
+            try:
+                payload = await self._mcp.call_tool(
+                    "chatroom_get_thread",
+                    {"project": project, "thread_id": thread_id, "mode": "full"},
+                )
+            except MagickitMcpError:
+                # Fail-quiet on read: a broken read here should not stop the sweep — the
+                # driver treats an empty message list as "no replay candidate" and falls
+                # through to a normal review, which is the safe direction.
+                return []
+            if not isinstance(payload, dict):
+                return []
+            messages = payload.get("messages") or []
+            out: list[tuple[str, str]] = []
+            for m in messages:
+                if not isinstance(m, dict):
+                    continue
+                author = str(m.get("author") or "")
+                body = str(m.get("content") or "")
+                # Only naysayer-authored posts are replay candidates — every other
+                # message in the thread (opener, human notes) is by construction not a
+                # verdict, so the footer parser would reject it anyway. Filtering here
+                # keeps the per-message work in the driver bounded.
+                if author == self._naysayer_author:
+                    out.append((author, body))
+            return out
+
+        outcome = await self._driver.review(
+            pr, post_critique=post_critique, read_review_thread=read_review_thread
+        )
         relay = await self._post_design_relay(
             project=project,
             design_thread=design_thread,

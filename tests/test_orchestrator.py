@@ -170,8 +170,19 @@ class _FakeDriver:
             head_sha="sha1",
         )
 
-    async def review(self, pr: PrRef, *, post_critique: PostCritique) -> PrReviewOutcome:
+    async def review(
+        self,
+        pr: PrRef,
+        *,
+        post_critique: PostCritique,
+        read_review_thread: Any = None,
+    ) -> PrReviewOutcome:
         self.reviewed.append(pr)
+        # The orchestrator supplies ``read_review_thread`` for the chatroom-replay pass
+        # (T-gate-review-submit-failure-handling DESIGN v3 §3-3). The fake ignores it —
+        # tests here assert on the post→outcome path, not on replay behaviour (which is
+        # covered end-to-end in tests/test_pr_review_driver.py).
+        _ = read_review_thread
         await post_critique(self._outcome.body)
         return self._outcome
 
@@ -513,9 +524,17 @@ async def test_a_thread_that_appears_between_resolve_and_open_is_not_written_int
     threads: dict[str, dict[str, Any]] = {}
 
     class _RacingDriver(_FakeDriver):
-        async def review(self, pr: PrRef, *, post_critique: PostCritique) -> PrReviewOutcome:
+        async def review(
+            self,
+            pr: PrRef,
+            *,
+            post_critique: PostCritique,
+            read_review_thread: Any = None,
+        ) -> PrReviewOutcome:
             threads["T-pr-review-r-9"] = _thread_payload("other/r#9")  # the race
-            return await super().review(pr, post_critique=post_critique)
+            return await super().review(
+                pr, post_critique=post_critique, read_review_thread=read_review_thread
+            )
 
     mcp = _FakeMcp(
         results={
@@ -542,9 +561,17 @@ async def test_a_race_that_opens_this_prs_own_thread_is_still_swallowed() -> Non
     threads: dict[str, dict[str, Any]] = {}
 
     class _SamePrRacingDriver(_FakeDriver):
-        async def review(self, pr: PrRef, *, post_critique: PostCritique) -> PrReviewOutcome:
+        async def review(
+            self,
+            pr: PrRef,
+            *,
+            post_critique: PostCritique,
+            read_review_thread: Any = None,
+        ) -> PrReviewOutcome:
             threads["T-pr-review-r-9"] = _thread_payload("o/r#9")  # another gate, same PR
-            return await super().review(pr, post_critique=post_critique)
+            return await super().review(
+                pr, post_critique=post_critique, read_review_thread=read_review_thread
+            )
 
     mcp = _FakeMcp(
         results={
@@ -924,8 +951,16 @@ class _SubmittingDriver(_FakeDriver):
         super().__init__()
         self.submitted = False
 
-    async def review(self, pr: PrRef, *, post_critique: PostCritique) -> PrReviewOutcome:
-        outcome = await super().review(pr, post_critique=post_critique)
+    async def review(
+        self,
+        pr: PrRef,
+        *,
+        post_critique: PostCritique,
+        read_review_thread: Any = None,
+    ) -> PrReviewOutcome:
+        outcome = await super().review(
+            pr, post_critique=post_critique, read_review_thread=read_review_thread
+        )
         self.submitted = True
         return outcome
 
@@ -974,7 +1009,14 @@ async def test_fire_pr_review_non_exists_open_error_raises() -> None:
 class _RaisingDriver:
     """A driver whose review fails before any critique (transient remote error)."""
 
-    async def review(self, pr: PrRef, *, post_critique: PostCritique) -> PrReviewOutcome:
+    async def review(
+        self,
+        pr: PrRef,
+        *,
+        post_critique: PostCritique,
+        read_review_thread: Any = None,
+    ) -> PrReviewOutcome:
+        _ = read_review_thread
         raise RuntimeError("transient github/lexora error")
 
 
@@ -1208,6 +1250,9 @@ class _FakeGitHubCi:
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
         return []
 
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+        return []
+
     async def find_cross_pr_head_bound_approves(
         self, pr: PrRef, *, reviewer_login: str
     ) -> list[Any]:
@@ -1216,6 +1261,9 @@ class _FakeGitHubCi:
         return []
 
     async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def probe_identity(self) -> int:
         raise NotImplementedError
 
     async def aclose(self) -> None:
