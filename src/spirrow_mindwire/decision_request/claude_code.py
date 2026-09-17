@@ -123,8 +123,8 @@ elapsed      prompt      input
 ===========  ==========  ====================================
 
 240 s is 153,183 ms + ~57 %. **The two largest numbers were measured on
-sg-ai-server-01, not the deploy host**, because the A-19 rev2 A/B was run
-there; the 2.7x gap against the 40 s baseline is therefore confounded
+the services host, not the deploy host**, because the A-19 rev2 A/B was
+run there; the 2.7x gap against the 40 s baseline is therefore confounded
 with the host. Under D-57 that does not block the raise (240 s is above
 every recorded success either way), but it does mean the next
 measurement on the loop host is the one that should drive the following
@@ -636,7 +636,7 @@ class ClaudeCodeComposer:
             # If the deploy uses `claude login` instead, this is absent
             # and the CLI reads its own credential file — that is fine.
             "ANTHROPIC_API_KEY",
-            # D-44 (Tier-C msg §24): the sg-ai-server-01 deploy host has
+            # D-44 (Tier-C msg §24): the deploy host has
             # NO direct egress — the ONLY route to api.anthropic.com is
             # through the squid proxy exported via HTTP_PROXY / HTTPS_PROXY
             # (with NO_PROXY carrying the LAN exceptions). Dropping these

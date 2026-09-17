@@ -15,7 +15,8 @@
 #                                          Einstein — the I-5 role-independence rule)
 #   MINDWIRE_DECISION_DASHBOARD_URL     = base URL of the Magickit dashboard used in the Discord
 #                                          alert's D-29 link. Default:
-#                                          https://sg-ai-server-01.taile861db.ts.net:8443
+#                                          https://{{HOST_SERVICES}}.taile861db.ts.net:8443 (values
+#                                          via [[platform:infra-registry]] — do not hardcode)
 
 schema_version = 1
 
