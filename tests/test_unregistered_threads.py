@@ -127,72 +127,41 @@ def test_a_thread_without_id_is_ignored() -> None:
     assert not is_unregistered_live("p", {"status": "active"}, registered)
 
 
-def test_enumerate_skips_non_dict_items() -> None:
-    """A garbled listing (e.g. a stray string in ``items``) must not break enumeration.
+def test_enumerate_carries_upstream_malformed_count_through_unchanged() -> None:
+    """msg-3225 PR-gate ADVISORY on PR #282: filtering lives at the boundary, not here.
 
-    The dropped items are counted in ``malformed_count`` — msg-2648 §3's
-    third state — and are **not** silently absorbed into
-    ``unregistered_count``.
-    """
-    registered = _index(projects=("p",))
-    threads: list[object] = [
-        _thread(thread_id="T-a"),
-        "not-a-thread",
-        _thread(thread_id="T-b"),
-    ]
-    report = enumerate_project("p", threads, registered)  # type: ignore[arg-type]
-    assert report.unregistered_count == 2
-    assert report.unregistered == ("T-a", "T-b")
-    # The stray string counts as one malformed item.
-    assert report.malformed_count == 1
+    The CLI's ``_list_live_threads`` filters non-dicts at the wire and
+    passes the drop count in via ``malformed_count``. This function
+    trusts its own type signature and does no re-filtering — the earlier
+    "add locally-dropped items to the upstream tally" branch was
+    dual-management (production runtime logic added purely to support
+    tests that violated the signature) and was removed.
 
-
-def test_enumerate_counts_multiple_malformed_items_separately_from_registered() -> None:
-    """msg-2648 §3: malformed count is NEVER mixed into unregistered_count.
-
-    Even when every valid item is registered (so unregistered_count == 0),
-    the malformed count stays visible.
-    """
-    registered = _index(("p", "T-a"), ("p", "T-b"))
-    threads: list[object] = [
-        _thread(thread_id="T-a"),
-        None,
-        _thread(thread_id="T-b"),
-        42,
-        ["not", "a", "thread"],
-    ]
-    report = enumerate_project("p", threads, registered)  # type: ignore[arg-type]
-    assert report.unregistered_count == 0
-    assert report.unregistered == ()
-    assert report.malformed_count == 3
-
-
-def test_enumerate_adds_external_malformed_count_from_upstream() -> None:
-    """The CLI's ``_list_live_threads`` also drops non-dicts; both counts sum here.
-
-    Callers pass ``malformed_count=<count from the paged listing>`` so
-    a listing that returned 5 garbage items *at the wire* still surfaces
-    that number even if the shape-clean list this function receives has
-    zero drops of its own.
+    Contract pinned here: the ``malformed_count`` passed in flows onto
+    ``ProjectReport.malformed_count`` unchanged, and is **never**
+    merged into ``unregistered_count``.
     """
     registered = _index(projects=("p",))
     threads = [_thread(thread_id="T-a"), _thread(thread_id="T-b")]
     report = enumerate_project("p", threads, registered, malformed_count=5)
     assert report.unregistered_count == 2
+    assert report.unregistered == ("T-a", "T-b")
     assert report.malformed_count == 5
 
 
-def test_enumerate_adds_upstream_and_local_malformed_counts() -> None:
-    """When both the upstream and local drops fire, ``malformed_count`` is the sum."""
-    registered = _index(projects=("p",))
-    threads: list[object] = [
-        _thread(thread_id="T-a"),
-        "stray",
-        _thread(thread_id="T-b"),
-    ]
-    report = enumerate_project("p", threads, registered, malformed_count=2)  # type: ignore[arg-type]
-    assert report.unregistered_count == 2
-    assert report.malformed_count == 3  # 2 upstream + 1 local
+def test_enumerate_default_malformed_count_is_zero_when_boundary_saw_nothing_bad() -> None:
+    """A shape-clean listing at the wire produces ``malformed_count == 0``.
+
+    The default of ``0`` is the "measured, and dropped nothing" signal;
+    it is deliberately distinct from ``None`` (which
+    :func:`project_error_report` sets to mean "did not measure").
+    """
+    registered = _index(("p", "T-a"))
+    threads = [_thread(thread_id="T-a"), _thread(thread_id="T-b")]
+    report = enumerate_project("p", threads, registered)
+    assert report.unregistered_count == 1
+    assert report.unregistered == ("T-b",)
+    assert report.malformed_count == 0
 
 
 def test_enumerate_preserves_thread_order() -> None:
