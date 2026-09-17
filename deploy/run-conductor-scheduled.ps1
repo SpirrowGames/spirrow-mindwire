@@ -3532,7 +3532,15 @@ try {
             $nowIso = $nowUtc.ToString("o")
             $envPayload = $null
             $envKey = "__github_credential__"
-            $envSig = "${nowIso}:env-terminal"
+            # Signature is STATE-DERIVED (scope + repo + status_code), not time-derived. A
+            # persistent env-terminal fault (revoked PAT, org-disabled repo) produces the same
+            # signature on every sweep, so ``Send-NotificationIfChanged`` fires ONCE per state
+            # change instead of every 5 minutes. An earlier revision embedded ``$nowIso`` in
+            # the signature, which made every tick a "new" signature and defeated the whole
+            # dedup — pr-review caught it on #280 @ 64bc63f. Restoring the state-derived form
+            # is what makes the map-shape dedup work at all (:func:`Test-NotificationSuppressed`
+            # compares $State[$Key] to $Signature by equality; equal signatures suppress).
+            $envSig = "env-terminal:parse-failed"
             foreach ($line in $output) {
                 if ($line -match '^MINDWIRE_ENV_TERMINAL_PAYLOAD\s+(.*)$') {
                     try {
@@ -3550,10 +3558,10 @@ try {
                     $envPayload.PSObject.Properties.Name -contains 'owner' -and
                     $envPayload.PSObject.Properties.Name -contains 'repo') {
                     $envKey = "__github_permission__/$($envPayload.owner)/$($envPayload.repo)"
-                    $envSig = "${nowIso}:${scope}:$($envPayload.owner)/$($envPayload.repo):$($envPayload.status_code)"
+                    $envSig = "${scope}:$($envPayload.owner)/$($envPayload.repo):$($envPayload.status_code)"
                 } elseif ($scope -eq 'environment/credential') {
                     $envKey = "__github_credential__"
-                    $envSig = "${nowIso}:${scope}:$($envPayload.status_code)"
+                    $envSig = "${scope}:$($envPayload.status_code)"
                 }
                 # Unknown / unexpected scope value stays on the global fallback — the alert
                 # still fires, on the safe side of "notify, do not swallow".
@@ -3580,7 +3588,7 @@ try {
         # Bohr msg-1987 §Q2-A condition 3: PS treats every non-zero code we do not explicitly
         # handle (i.e. anything other than the 0/2 above) as a thread-scoped failure. Future
         # exit codes MUST land here as "quarantine" until this branch is extended for them —
-        # the front-compat direction is "unknown → uarantine", never "unknown → alert-only".
+        # the front-compat direction is "unknown → quarantine", never "unknown → alert-only".
         if ($code -ne 0) {
             $dispositions[$cand.key] = 'failed'
             $tail = @()
