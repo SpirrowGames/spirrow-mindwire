@@ -900,3 +900,63 @@ async def test_drain_reply_without_timeout_preserves_pre_v12_behaviour() -> None
 
     body = await _drain_reply(_Client())
     assert body == "hi"
+
+
+@pytest.mark.anyio
+async def test_drain_reply_does_not_wrap_inner_timeout_error_as_sdk_turn_timeout() -> None:
+    """PR-gate #299 round 2 blocker: an inner ``TimeoutError`` bubbling out of
+    ``receive_response()`` must propagate as-is — NOT be misattributed to the
+    outer turn budget.
+
+    The pre-fix code used ``asyncio.wait_for`` + ``except TimeoutError`` and
+    would incorrectly wrap any inner ``TimeoutError`` (e.g. an SDK-internal
+    network timeout of a few seconds) into an ``adapter.turn_timeout`` verdict
+    against a 30-minute budget that had barely started counting. The fix uses
+    ``asyncio.timeout()`` + ``.expired()`` so the two cases become
+    distinguishable.
+    """
+    from spirrow_mindwire.adapters.claude_code_sdk import (
+        SdkTurnTimeoutError,
+        _drain_reply,
+    )
+
+    class _InnerTimeoutError(TimeoutError):
+        """Marker so pytest.raises can tell we got THIS one, not asyncio's."""
+
+    class _Client:
+        async def receive_response(self) -> AsyncIterator[Any]:
+            # Immediately raise a TimeoutError from inside the receive
+            # generator — simulates an SDK-internal request timeout that
+            # has nothing to do with our turn budget.
+            raise _InnerTimeoutError("inner SDK network timeout")
+            yield  # unreachable; makes the function an async-generator
+
+        async def connect(self) -> None: ...
+
+        async def query(self, _p: str) -> None: ...
+
+        async def interrupt(self) -> None: ...
+
+        async def disconnect(self) -> None: ...
+
+    # Ample turn budget: we're testing that an INNER TimeoutError propagates,
+    # not the outer deadline behaviour.
+    with pytest.raises(_InnerTimeoutError):
+        await _drain_reply(_Client(), turn_timeout_seconds=30.0)
+
+    # And verify the wrapping DOES still happen when it IS our deadline:
+    class _HangingClient:
+        async def receive_response(self) -> AsyncIterator[Any]:
+            await asyncio.sleep(10.0)
+            yield _result()
+
+        async def connect(self) -> None: ...
+
+        async def query(self, _p: str) -> None: ...
+
+        async def interrupt(self) -> None: ...
+
+        async def disconnect(self) -> None: ...
+
+    with pytest.raises(SdkTurnTimeoutError):
+        await _drain_reply(_HangingClient(), turn_timeout_seconds=0.05)

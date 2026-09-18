@@ -205,18 +205,29 @@ async def _drain_reply(
     ``adapter.delivery_failed`` vs ``adapter.turn_timeout``).
     """
     if turn_timeout_seconds is not None:
+        # PR-gate #299 round 2 blocker: ``asyncio.wait_for`` cannot tell OUR
+        # deadline expiring apart from an inner ``TimeoutError`` bubbling out
+        # of the SDK's own ``receive_response()`` — both surface as
+        # ``TimeoutError`` in the outer catch, and wrapping unconditionally
+        # would misattribute an inner network hiccup to the 30-minute turn
+        # budget. Python 3.11's ``asyncio.timeout()`` returns a context
+        # object whose ``.expired()`` says "MY deadline fired" vs. "no, this
+        # ``TimeoutError`` came from somewhere else" — the exact distinction
+        # the pre-existing comment CLAIMED but the ``wait_for`` shape could
+        # never provide. Only wrap into ``SdkTurnTimeoutError`` when our
+        # deadline actually expired; otherwise let the exception propagate
+        # so ``deliver_event`` sees it via the ordinary
+        # ``adapter.delivery_failed`` path.
+        timeout_ctx = asyncio.timeout(turn_timeout_seconds)
         try:
-            return await asyncio.wait_for(
-                _drain_reply(client, turn_timeout_seconds=None),
-                timeout=turn_timeout_seconds,
-            )
+            async with timeout_ctx:
+                return await _drain_reply(client, turn_timeout_seconds=None)
         except TimeoutError as exc:
-            # Re-raise as our named type so deliver_event can distinguish it
-            # from plain ``asyncio.TimeoutError`` that might leak from
-            # elsewhere (e.g. an inner ``wait_for`` inside the SDK).
-            raise SdkTurnTimeoutError(
-                f"SDK turn did not finish inside {turn_timeout_seconds}s"
-            ) from exc
+            if timeout_ctx.expired():
+                raise SdkTurnTimeoutError(
+                    f"SDK turn did not finish inside {turn_timeout_seconds}s"
+                ) from exc
+            raise
 
     chunks: list[str] = []
     final: Any = None

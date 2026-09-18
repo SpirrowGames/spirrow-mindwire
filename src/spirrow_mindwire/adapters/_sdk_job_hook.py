@@ -394,23 +394,29 @@ class _JobAwareAnyioProxy:
             )
         except pywintypes.error:
             # Cannot open the process handle — attempt to terminate the
-            # child directly so it does not leak, then re-raise.
-            try:
+            # child directly so it does not leak, then re-raise the
+            # ORIGINAL pywintypes.error. PR-gate #299 round 2: the previous
+            # ``try/finally: raise`` shape would swallow the pywintypes.error
+            # if ``process.terminate()`` also raised, because a raise in a
+            # ``finally`` after a new exception re-raises the NEW one. Suppress
+            # any secondary exception from ``terminate()`` so the root cause
+            # (why OpenProcess failed) propagates cleanly.
+            with contextlib.suppress(Exception):
                 process.terminate()
-            finally:
-                raise
+            raise
         try:
             try:
                 win32job.AssignProcessToJobObject(handle, hproc)
             except pywintypes.error:
                 # Assign failed — the child is not in our Job so
-                # KILL_ON_JOB_CLOSE will not reap it. Terminate now,
-                # re-raise, and let the caller's ``finally`` clean up
-                # the Job.
-                try:
+                # KILL_ON_JOB_CLOSE will not reap it. Terminate now (best
+                # effort — a raise from terminate must not shadow the
+                # original pywintypes.error; see the OpenProcess handler
+                # above for the same PR-gate #299 round 2 rationale) and
+                # let the caller's ``finally`` clean up the Job.
+                with contextlib.suppress(Exception):
                     process.terminate()
-                finally:
-                    raise
+                raise
         finally:
             with contextlib.suppress(pywintypes.error):
                 win32api.CloseHandle(hproc)

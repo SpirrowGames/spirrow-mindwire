@@ -482,3 +482,125 @@ def test_lookup_and_assign_leftover_opens_process_with_query_limited_information
         f"or IsProcessInJob raises ACCESS_DENIED and every child is skipped "
         f"(PR-gate #299)"
     )
+
+
+# --------------------------------------------------------------------------- #
+# PR-gate #299 round 2 regression: the proxy's ``try/finally: raise`` after
+# OpenProcess / Assign failed would swallow the ORIGINAL pywintypes.error
+# whenever ``process.terminate()`` itself raised, because Python's ``raise``
+# in a ``finally`` re-raises whatever exception is currently active — the
+# terminate-time error, not the OpenProcess-time error. The fix uses
+# ``contextlib.suppress(Exception)`` around the terminate() call so the
+# original error propagates cleanly.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_proxy_preserves_openprocess_error_when_terminate_also_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-gate #299 round 2: a failing terminate() must not shadow the original."""
+    if not _IS_WINDOWS:
+        pytest.skip("Windows-only Job Object primitive")
+
+    class _OriginalOpenProcessError(Exception):
+        """The exception that MUST propagate — pytest.raises pins its identity."""
+
+    class _SecondaryTerminateError(Exception):
+        """The exception that MUST NOT propagate (would shadow the original)."""
+
+    class _FakePywintypes:
+        # Point the real production ``except pywintypes.error:`` at our marker
+        # so the OpenProcess failure enters the handler under test.
+        error = _OriginalOpenProcessError
+
+    class _AlwaysFailingWin32Api:
+        def OpenProcess(self, *_a: Any, **_k: Any) -> int:  # noqa: N802
+            raise _OriginalOpenProcessError("cannot open pid — this MUST propagate")
+
+        def CloseHandle(self, *_a: Any, **_k: Any) -> None:  # noqa: N802
+            return None
+
+    class _StubWin32Job:
+        def AssignProcessToJobObject(self, *_a: Any, **_k: Any) -> None:  # noqa: N802
+            return None
+
+    class _FailingProcess:
+        pid = 4242
+
+        def terminate(self) -> None:
+            raise _SecondaryTerminateError("terminate hiccup — MUST be swallowed")
+
+    class _FakeAnyioSpawningFailing:
+        async def open_process(self, *_a: Any, **_k: Any) -> _FailingProcess:
+            return _FailingProcess()
+
+    monkeypatch.setitem(sys.modules, "win32api", _AlwaysFailingWin32Api())
+    monkeypatch.setitem(sys.modules, "win32job", _StubWin32Job())
+    monkeypatch.setitem(sys.modules, "pywintypes", _FakePywintypes)
+
+    proxy = _JobAwareAnyioProxy(_FakeAnyioSpawningFailing())
+    token = _JOB_HANDLE_CTX.set(0xB0B)
+    try:
+        # ``pytest.raises`` pins the exception identity — the ORIGINAL
+        # OpenProcess error must survive, not the terminate() secondary error.
+        with pytest.raises(_OriginalOpenProcessError):
+            await proxy.open_process("cmd")
+    finally:
+        _JOB_HANDLE_CTX.reset(token)
+
+
+@pytest.mark.anyio
+async def test_proxy_preserves_assign_error_when_terminate_also_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-gate #299 round 2: same guarantee for the AssignProcessToJobObject branch.
+
+    The Assign path has the same ``try/finally: raise`` shape as the
+    OpenProcess path — this pins that path independently, so a partial
+    revert of the fix reds here.
+    """
+    if not _IS_WINDOWS:
+        pytest.skip("Windows-only Job Object primitive")
+
+    class _OriginalAssignError(Exception):
+        pass
+
+    class _SecondaryTerminateError(Exception):
+        pass
+
+    class _FakePywintypes:
+        error = _OriginalAssignError
+
+    class _StubWin32Api:
+        def OpenProcess(self, *_a: Any, **_k: Any) -> int:  # noqa: N802
+            return 0xDEAD
+
+        def CloseHandle(self, *_a: Any, **_k: Any) -> None:  # noqa: N802
+            return None
+
+    class _AssignFailingWin32Job:
+        def AssignProcessToJobObject(self, *_a: Any, **_k: Any) -> None:  # noqa: N802
+            raise _OriginalAssignError("assign failed — this MUST propagate")
+
+    class _FailingProcess:
+        pid = 4242
+
+        def terminate(self) -> None:
+            raise _SecondaryTerminateError("terminate hiccup — MUST be swallowed")
+
+    class _FakeAnyioSpawning:
+        async def open_process(self, *_a: Any, **_k: Any) -> _FailingProcess:
+            return _FailingProcess()
+
+    monkeypatch.setitem(sys.modules, "win32api", _StubWin32Api())
+    monkeypatch.setitem(sys.modules, "win32job", _AssignFailingWin32Job())
+    monkeypatch.setitem(sys.modules, "pywintypes", _FakePywintypes)
+
+    proxy = _JobAwareAnyioProxy(_FakeAnyioSpawning())
+    token = _JOB_HANDLE_CTX.set(0xB0B)
+    try:
+        with pytest.raises(_OriginalAssignError):
+            await proxy.open_process("cmd")
+    finally:
+        _JOB_HANDLE_CTX.reset(token)
