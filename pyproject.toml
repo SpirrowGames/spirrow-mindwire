@@ -25,6 +25,15 @@ dependencies = [
   # directly, so we own the contract.
   "starlette>=0.40",
   "uvicorn>=0.30",
+  # T-auto-backgrounded-command-hangs-conductor-4h (v12): the implementer's
+  # spawn cleanup path uses ``psutil`` to enumerate any ``claude.exe`` child
+  # that the SDK spawned before ``_JobAwareAnyioProxy`` had a chance to assign
+  # it to our Job — the "leftover" belt in the timeout/cancel path. Not a
+  # Windows-only extra: the daemon runs on Windows in production, and pinning
+  # the requirement here keeps the dependency graph honest across platforms
+  # (the POSIX code path raises ``NotImplementedError`` before ``psutil`` is
+  # touched, but a stray ``import`` must still resolve at all times).
+  "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
@@ -66,6 +75,15 @@ warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
 module = ["watchdog.*", "ulid.*", "mcp.*", "claude_agent_sdk.*"]
+ignore_missing_imports = true
+
+# T-auto-backgrounded-command-hangs-conductor-4h (v12): pywin32 ships no
+# type stubs and psutil ships incomplete ones; the Windows-only job hook
+# module (``adapters/_sdk_job_hook.py``) imports these on Windows only.
+# Silence the missing-imports errors here rather than salt every import with
+# ``# type: ignore``.
+[[tool.mypy.overrides]]
+module = ["win32api", "win32job", "pywintypes", "psutil"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -835,3 +835,68 @@ async def test_spawn_isolates_host_settings_and_mcp_config(tmp_path: Path) -> No
     await adapter.spawn(_thread_ref(), Role.PROPOSER, _ctx([]))
     assert captured[0].setting_sources == []
     assert captured[0].strict_mcp_config is True
+
+
+# --------------------------------------------------------------------------- #
+# v12 B-1 — bounded drain via ``_drain_reply(turn_timeout_seconds=...)``
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_drain_reply_turn_timeout_raises_named_exception() -> None:
+    """A drain that outlasts the budget raises ``SdkTurnTimeoutError``.
+
+    This is the ``T-auto-backgrounded-command-hangs-conductor-4h`` core
+    guarantee: no matter what the CLI does with the turn, the drain
+    returns to the adapter inside the budget.
+    """
+    from spirrow_mindwire.adapters.claude_code_sdk import (
+        SdkTurnTimeoutError,
+        _drain_reply,
+    )
+
+    class _HangingClient:
+        async def receive_response(self) -> AsyncIterator[Any]:
+            await asyncio.sleep(10.0)
+            yield _result()
+
+        async def connect(self) -> None: ...
+
+        async def query(self, _p: str) -> None: ...
+
+        async def interrupt(self) -> None: ...
+
+        async def disconnect(self) -> None: ...
+
+    with pytest.raises(SdkTurnTimeoutError):
+        await _drain_reply(_HangingClient(), turn_timeout_seconds=0.05)
+
+
+@pytest.mark.anyio
+async def test_drain_reply_without_timeout_preserves_pre_v12_behaviour() -> None:
+    """turn_timeout_seconds=None keeps the pre-v12 unbounded drain path.
+
+    All existing callers pass ``None`` (the default) so this test guards
+    against a regression where the timeout would leak into other adapters
+    that have not opted in.
+    """
+    from spirrow_mindwire.adapters.claude_code_sdk import _drain_reply
+
+    class _Client:
+        def __init__(self) -> None:
+            self._msgs = [_assistant("hi"), _result()]
+
+        async def receive_response(self) -> AsyncIterator[Any]:
+            for m in self._msgs:
+                yield m
+
+        async def connect(self) -> None: ...
+
+        async def query(self, _p: str) -> None: ...
+
+        async def interrupt(self) -> None: ...
+
+        async def disconnect(self) -> None: ...
+
+    body = await _drain_reply(_Client())
+    assert body == "hi"

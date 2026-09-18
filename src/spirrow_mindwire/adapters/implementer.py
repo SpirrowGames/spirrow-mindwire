@@ -62,6 +62,7 @@ default endpoint).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -96,15 +97,92 @@ from ..value_objects import (
     SessionState,
     ThreadRef,
 )
+from . import _sdk_job_hook
+from ._sdk_job_hook import (
+    _JOB_HANDLE_CTX,
+    JobState,
+)
 from ._session_isolation import session_isolation_kwargs
 
 # Reuse the SDK session glue (same package, identical reply-drain protocol).
 from .claude_code_sdk import (
+    SdkTurnTimeoutError,
     _default_client_factory,
     _drain_reply,
     _SdkClient,
     _shutdown,
 )
+
+# Default budgets for the two v12 timeouts (T-auto-backgrounded-command-hangs-\
+# conductor-4h). Both are conservative — smaller than the Task Scheduler's 4 h
+# wall by a wide margin, larger than any healthy turn. Overridable via the
+# constructor + env vars for operational tuning.
+_DEFAULT_SPAWN_TIMEOUT_SECONDS = 60.0
+_DEFAULT_TURN_TIMEOUT_SECONDS = 30 * 60.0  # 30 minutes — a long turn is fine,
+# a session that eats hours is what we exist to break.
+
+
+def _read_float_env(name: str, default: float) -> float:
+    """Read a float from ``os.environ``; return ``default`` if unset or malformed.
+
+    A malformed value is logged (would be, if we had a logger here — the
+    dispatcher's log capture picks up the ``ValueError`` message) and then
+    ignored: the whole point of an env override is to be safe under
+    operator error, not to break the daemon at import.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _extract_sdk_pid(client: Any) -> int | None:
+    """Best-effort extraction of the SDK subprocess pid for verify (v12).
+
+    The SDK's ``ClaudeSDKClient`` stores its transport at ``._transport``
+    and the transport keeps the anyio ``Process`` on ``._process``. This
+    helper walks that path defensively — if the SDK's private layout
+    changes we return ``None`` rather than crash, and the caller skips the
+    verify (the cost is a lost fail-loud check; the alternative would be
+    the whole spawn failing on an SDK internal-refactor).
+    """
+    try:
+        transport = getattr(client, "_transport", None) or getattr(client, "transport", None)
+        if transport is None:
+            return None
+        process = getattr(transport, "_process", None) or getattr(transport, "process", None)
+        if process is None:
+            return None
+        pid = getattr(process, "pid", None)
+        return int(pid) if pid is not None else None
+    except Exception:
+        return None
+
+
+def _default_sdk_executable_path() -> str:
+    """Best-effort absolute path to the bundled SDK ``claude`` executable.
+
+    Used by ``lookup_and_assign_leftover`` as the identity check when walking
+    the daemon's direct children. On POSIX (no Job Objects) this is only ever
+    consulted after a raise, so a wrong value cannot leak beyond the
+    diagnostic. On Windows the bundled binary is
+    ``claude_agent_sdk/_bundled/claude.exe``; if we cannot import the SDK we
+    fall back to ``"claude"`` and let the caller's normalization decide.
+    """
+    try:
+        import claude_agent_sdk
+
+        pkg_dir = Path(claude_agent_sdk.__file__).resolve().parent
+        candidate = pkg_dir / "_bundled" / "claude.exe"
+        if candidate.exists():
+            return str(candidate)
+    except Exception:
+        pass
+    return "claude"
+
 
 _SHUTDOWN_STATES: frozenset[SessionState] = frozenset(
     {SessionState.HALTING, SessionState.HALTED, SessionState.FAILED}
@@ -190,8 +268,25 @@ class ImplementerSdkSpawnError(AdapterSpawnError):
     """``spawn`` failure for the implementer adapter (§3.4)."""
 
 
+class ImplementerSdkSpawnTimeoutError(ImplementerSdkSpawnError):
+    """``spawn`` exceeded its init time budget (v12 B-4).
+
+    Distinct subclass so the dispatcher / conductor can tell "the SDK never
+    connected" from "the SDK connected but errored". Error code:
+    ``adapter.spawn_timeout``.
+    """
+
+
 class ImplementerSdkDeliveryError(AdapterDeliveryError):
     """``deliver_event`` failure for the implementer adapter (§3.4)."""
+
+
+class ImplementerSdkTurnTimeoutError(ImplementerSdkDeliveryError):
+    """The SDK turn did not finish inside the caller's time budget (v12 B-1).
+
+    Wraps :class:`SdkTurnTimeoutError` from the shared drain helper.
+    Error code: ``adapter.turn_timeout``.
+    """
 
 
 class ImplementerSdkHaltError(AdapterHaltError):
@@ -215,6 +310,12 @@ class _Session:
     # dataclass field so an old cached instance without options still loads.
     options: Any = None
     error: ErrorInfo | None = None
+    # v12 — the Job Object that owns every claude.exe descendant of this
+    # session. ``None`` on POSIX (no Job primitive) and until ``spawn`` has
+    # created it. ``close_handle`` is idempotent and sets it back to ``None``
+    # on close, so a double-cleanup does not attempt to close the same handle
+    # twice (which on Windows can destroy a recycled handle).
+    job_state: JobState | None = None
 
 
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
@@ -316,6 +417,10 @@ class ImplementerSdkAdapter:
         system_prompt: str = _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT,
         extra_env: dict[str, str] | None = None,
         client_factory: Any = None,
+        spawn_timeout_seconds: float | None = None,
+        turn_timeout_seconds: float | None = None,
+        sdk_executable_path: str | None = None,
+        job_module: Any = None,
     ) -> None:
         self._cwd = Path(cwd)
         # Inference MUST be routed via Lexora (env spec §4): require an explicit
@@ -347,6 +452,34 @@ class ImplementerSdkAdapter:
         self._extra_env = dict(extra_env or {})
         self._client_factory = client_factory or _default_client_factory
         self._sessions: dict[SessionHandle, _Session] = {}
+        # v12 timeouts — bound the two async waits that the observed hang
+        # exposed. Env overrides let operators tune per host without a code
+        # change; the constructor arg takes precedence for tests.
+        self._spawn_timeout_seconds = (
+            spawn_timeout_seconds
+            if spawn_timeout_seconds is not None
+            else _read_float_env(
+                "MINDWIRE_IMPLEMENTER_SPAWN_TIMEOUT_SECONDS",
+                _DEFAULT_SPAWN_TIMEOUT_SECONDS,
+            )
+        )
+        self._turn_timeout_seconds = (
+            turn_timeout_seconds
+            if turn_timeout_seconds is not None
+            else _read_float_env(
+                "MINDWIRE_IMPLEMENTER_TURN_TIMEOUT_SECONDS",
+                _DEFAULT_TURN_TIMEOUT_SECONDS,
+            )
+        )
+        # v12 — the SDK executable's absolute path. Used by the fallback
+        # ``lookup_and_assign_leftover`` to distinguish OUR ``claude.exe``
+        # from any other executable a child process might be. Defaults to
+        # the bundled SDK executable path, resolvable at import time.
+        self._sdk_executable_path = sdk_executable_path or _default_sdk_executable_path()
+        # ``job_module`` is dependency-injected so tests can substitute a fake
+        # for the Windows-only APIs without patching module globals. Default
+        # is the real ``_sdk_job_hook`` module.
+        self._job_module = job_module if job_module is not None else _sdk_job_hook
 
     def _make_options(self) -> ClaudeAgentOptions:
         env = {
@@ -390,6 +523,28 @@ class ImplementerSdkAdapter:
         role: Role,
         ctx: SpawnContext,
     ) -> SessionHandle:
+        """Spawn an SDK client under a Windows Job Object with bounded init (v12).
+
+        The v12 design (see ``T-auto-backgrounded-command-hangs-conductor-4h``)
+        wraps the SDK spawn in three layered protections:
+
+        1. A **spawn init timeout** (``asyncio.wait_for`` on ``connect()``).
+           A hung SDK subprocess bounds the wait so the conductor is not
+           parked behind one spawn (B-4).
+        2. A **Windows Job Object** with ``KILL_ON_JOB_CLOSE``. Every
+           ``claude.exe`` the SDK spawns is added to the Job via a
+           ContextVar-gated proxy on ``anyio.open_process``. When the Job's
+           last handle closes, the OS reaps the whole tree.
+        3. A **``try/finally``** with a ``session_registered`` flag and an
+           idempotent ``close_handle`` helper. Success takes the halt path
+           for cleanup; every other exit (timeout, exception, cancel,
+           KeyboardInterrupt, SystemExit) hits the finally which first runs
+           a fallback ``lookup_and_assign_leftover`` (in case the proxy
+           missed a race) and then closes the Job.
+
+        The three together bind the observed hang class to a finite wall
+        with an OS-level reaper for anything Python cannot cleanly halt.
+        """
         if not self._inference_base_url:
             raise ImplementerSdkSpawnError(
                 "no inference base URL configured (set inference_base_url or "
@@ -397,36 +552,118 @@ class ImplementerSdkAdapter:
                 "via Lexora, never api.anthropic.com directly (ADR-07 §2.4 / env spec §4)"
             )
         options = self._make_options()
-        try:
-            client = self._client_factory(options)
-            await client.connect()
-        except Exception as exc:
-            raise ImplementerSdkSpawnError(
-                f"spawn failed for role {role.value} on thread {thread_ref.thread_id}: {exc}"
-            ) from exc
 
         now = datetime.now(UTC)
-        handle = SessionHandle(
-            session_id=new_ulid(),
-            instance_id=ctx.own_instance_id,
-            adapter_id=self.adapter_id,
-            thread_ref=thread_ref,
-            role=role,
-            started_at=now,
-        )
-        self._sessions[handle] = _Session(
-            client=client,
+        session = _Session(
+            # Placeholder — replaced by the real client after connect().
+            client=None,  # type: ignore[arg-type]
             ctx=ctx,
             own_role=role,
             state=SessionState.IDLE,
             last_active_at=now,
-            # Retain the exact ``ClaudeAgentOptions`` object we passed to
-            # the SDK client so the harness can derive the source marker
-            # from it (msg-805 D3 / msg-834 §2 (a)). Never re-declare or
-            # re-read; the marker's SOT is this instance.
             options=options,
         )
-        return handle
+        session_registered = False
+        client: _SdkClient | None = None
+        session_id_for_diag = f"pending:{thread_ref.thread_id}"
+        try:
+            # ── Job Object creation (Windows only) ───────────────────────
+            # POSIX raises NotImplementedError from create_job; we let that
+            # bubble as an ImplementerSdkSpawnError below. The daemon runs on
+            # Windows in production; a POSIX host that reaches here is a
+            # deployment error (v12 §POSIX).
+            try:
+                session.job_state = self._job_module.create_job(session_id_for_diag)
+            except NotImplementedError:
+                # POSIX — no Job Object. Fall through with job_state=None;
+                # the ContextVar stays None, the proxy is a no-op, and the
+                # spawn proceeds without the Windows-only protection. The
+                # rest of v12 (bounded init timeout, bounded turn timeout)
+                # still applies.
+                session.job_state = None
+
+            # ── SDK client factory + connect, bounded by wait_for ────────
+            client = self._client_factory(options)
+            job_handle_for_ctx = session.job_state.handle if session.job_state is not None else None
+            token = _JOB_HANDLE_CTX.set(job_handle_for_ctx)
+            try:
+                await asyncio.wait_for(
+                    client.connect(),
+                    timeout=self._spawn_timeout_seconds,
+                )
+            finally:
+                _JOB_HANDLE_CTX.reset(token)
+
+            # ── success invariant: verify the proxy caught the child ─────
+            # Only meaningful when we actually built a Job (Windows). Miss
+            # here is fail-loud: it means our ``claude.exe`` is running
+            # OUTSIDE our Job and KILL_ON_JOB_CLOSE will not reap it.
+            if session.job_state is not None:
+                pid = _extract_sdk_pid(client)
+                if pid is not None and not self._job_module.is_process_in_job(
+                    pid, session.job_state
+                ):
+                    raise ImplementerSdkSpawnError(
+                        f"adapter.job_assign_missed: claude.exe pid={pid} did "
+                        f"not land in our Job — the SDK spawn hook was not "
+                        f"installed, or the proxy did not fire. Aborting "
+                        f"spawn for {role.value} on thread {thread_ref.thread_id}."
+                    )
+
+            session.client = client
+            handle = SessionHandle(
+                session_id=new_ulid(),
+                instance_id=ctx.own_instance_id,
+                adapter_id=self.adapter_id,
+                thread_ref=thread_ref,
+                role=role,
+                started_at=now,
+            )
+            self._sessions[handle] = session
+            session_registered = True
+            return handle
+
+        except TimeoutError as exc:
+            # B-4 spawn init timeout. The disconnect best-effort tries to
+            # let the SDK reap its subprocess through its own cancellation
+            # path; the finally then handles the Job cleanup and fallback
+            # lookup for anything the proxy missed.
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(client.disconnect(), timeout=5.0)
+            raise ImplementerSdkSpawnTimeoutError(
+                f"adapter.spawn_timeout: SDK spawn did not connect inside "
+                f"{self._spawn_timeout_seconds}s for role {role.value} on "
+                f"thread {thread_ref.thread_id}"
+            ) from exc
+        except ImplementerSdkSpawnError:
+            # Already a spawn error — pass through so the caller sees our
+            # error class; the finally still runs.
+            raise
+        except Exception as exc:
+            raise ImplementerSdkSpawnError(
+                f"spawn failed for role {role.value} on thread {thread_ref.thread_id}: {exc}"
+            ) from exc
+        finally:
+            # v12 §finally-cleanup — always runs on every failure exit,
+            # including asyncio.CancelledError and KeyboardInterrupt /
+            # SystemExit (which bypass ``except Exception``). Skipped on
+            # success because the halt path then owns the cleanup.
+            if not session_registered and session.job_state is not None:
+                # Fallback lookup FIRST — in case the proxy missed a race
+                # with the SDK's ``anyio.open_process`` call and left a
+                # ``claude.exe`` outside the Job. Silent per-child skip is
+                # inside the helper; we still guard the whole call in case
+                # psutil itself raises, because losing the ORIGINAL failure
+                # reason (the timeout, the cancel) to a diagnostic is
+                # strictly worse than a leaked child. ``adapter.lookup_\
+                # leftover_failed`` — swallowed so the original spawn
+                # failure propagates cleanly.
+                with contextlib.suppress(Exception):
+                    self._job_module.lookup_and_assign_leftover(
+                        session.job_state, self._sdk_executable_path
+                    )
+                self._job_module.close_handle(session.job_state)
 
     def source_marker_options(self, handle: SessionHandle) -> Any:
         """Return the ``ClaudeAgentOptions`` for ``handle``, or ``None`` if unknown.
@@ -457,9 +694,17 @@ class ImplementerSdkAdapter:
             return
 
         session.state = SessionState.PROCESSING
+        # B-1 bounded turn drain (v12) — hand ``_drain_reply`` the turn
+        # budget so a CLI that silently backgrounds a foreground shell
+        # command cannot hold the drain open past our wall. A hit here
+        # raises ``SdkTurnTimeoutError`` which we wrap as
+        # ``adapter.turn_timeout``.
         try:
             await session.client.query(_build_prompt(event, session.own_role))
-            body = await _drain_reply(session.client)
+            body = await _drain_reply(
+                session.client,
+                turn_timeout_seconds=self._turn_timeout_seconds,
+            )
             await session.ctx.on_reply(
                 ReplyDraft(
                     body=body,
@@ -467,6 +712,16 @@ class ImplementerSdkAdapter:
                     adapter_metadata={"adapter_id": self.adapter_id, "model": self._model},
                 )
             )
+        except SdkTurnTimeoutError as exc:
+            session.state = SessionState.FAILED
+            session.error = ErrorInfo(
+                code="adapter.turn_timeout",
+                message=str(exc),
+                raised_at=datetime.now(UTC),
+            )
+            raise ImplementerSdkTurnTimeoutError(
+                f"deliver_event turn timeout for session {handle.session_id}: {exc}"
+            ) from exc
         except Exception as exc:
             session.state = SessionState.FAILED
             session.error = ErrorInfo(
@@ -487,22 +742,46 @@ class ImplementerSdkAdapter:
         *,
         grace: timedelta = timedelta(seconds=5),
     ) -> None:
+        """Interrupt+disconnect the SDK; close the Job Object (v12).
+
+        The graceful shutdown is best-effort under ``grace``. Regardless of
+        whether it succeeds, times out, or is cancelled, the Windows Job
+        handle is closed via the idempotent ``close_handle`` helper in a
+        ``finally`` — that is what makes ``KILL_ON_JOB_CLOSE`` fire and
+        reaps any ``claude.exe`` (and its descendants) that the SDK could
+        not politely disconnect. ``close_handle`` is safe under BaseException
+        (asyncio cancel, KeyboardInterrupt), so a cancel during halt still
+        closes the Job.
+        """
         session = self._sessions.get(handle)
         if session is None or session.state in _SHUTDOWN_STATES:
             return
         session.state = SessionState.HALTING
+        halt_error: Exception | None = None
         try:
-            await asyncio.wait_for(_shutdown(session.client), timeout=grace.total_seconds())
-        except Exception as exc:
+            try:
+                await asyncio.wait_for(_shutdown(session.client), timeout=grace.total_seconds())
+            except Exception as exc:
+                halt_error = exc
+        finally:
+            # v12 § halt Job cleanup — MUST run even if shutdown raised
+            # or was cancelled. The helper is idempotent (sentinel + guard)
+            # so a repeat halt or a concurrent spawn-finally-close is safe.
+            if session.job_state is not None:
+                # Cleanup diagnostic only — do not override the halt
+                # error with a close diagnostic.
+                with contextlib.suppress(Exception):
+                    self._job_module.close_handle(session.job_state)
+        if halt_error is not None:
             session.state = SessionState.FAILED
             session.error = ErrorInfo(
                 code="adapter.halt_failed",
-                message=str(exc),
+                message=str(halt_error),
                 raised_at=datetime.now(UTC),
             )
             raise ImplementerSdkHaltError(
-                f"halt failed for session {handle.session_id}: {exc}"
-            ) from exc
+                f"halt failed for session {handle.session_id}: {halt_error}"
+            ) from halt_error
         session.state = SessionState.HALTED
 
     async def health(self, handle: SessionHandle) -> HealthStatus:
@@ -523,4 +802,6 @@ __all__ = [
     "ImplementerSdkHaltError",
     "ImplementerSdkHealthError",
     "ImplementerSdkSpawnError",
+    "ImplementerSdkSpawnTimeoutError",
+    "ImplementerSdkTurnTimeoutError",
 ]
