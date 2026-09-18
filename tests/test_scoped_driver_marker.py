@@ -105,14 +105,28 @@ def _find_posted_body_assignment(module: ast.Module) -> ast.AST:
     The scoped driver has exactly one ``posted_body`` assignment (verified by the second
     assertion below). If a second one is ever added, this helper fails loudly rather
     than silently picking the wrong one.
+
+    Accepts both :class:`ast.Assign` (``posted_body = ...``) and :class:`ast.AnnAssign`
+    (``posted_body: str = ...``) — the latter shape is what a routine type-annotation
+    refactor produces, and a strict ``isinstance(node, ast.Assign)`` filter would
+    silently miss it and report zero matches. PR-gate on #289 msg-3387 §3, structure
+    advisory. An ``ast.AnnAssign`` without a value (a pure annotation like
+    ``posted_body: str``) has ``node.value is None`` and is skipped — it is not an
+    assignment we can extract a RHS from.
     """
     found: list[ast.AST] = []
     for node in ast.walk(module):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if isinstance(target, ast.Name) and target.id == "posted_body":
-                found.append(node.value)
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "posted_body":
+                    found.append(node.value)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "posted_body"
+            and node.value is not None
+        ):
+            found.append(node.value)
     assert len(found) == 1, (
         f"expected exactly one 'posted_body' assignment in {_SCOPED_DRIVER.name}, "
         f"found {len(found)}"
@@ -182,13 +196,30 @@ def test_t2_posted_body_is_prefixed_with_the_marker() -> None:
 
 
 def _print_calls_carrying_phrase(func: ast.AsyncFunctionDef, phrase: str) -> list[ast.Call]:
-    """Return every ``print(...)`` call inside ``func`` whose concatenated string args
-    contain ``phrase`` as a substring.
+    """Return every ``print(...)`` call inside ``func`` whose string args contain
+    ``phrase`` as a substring.
 
     ``ast.walk(func)`` visits every descendant node, so a ``print`` sitting inside an
-    if/try block still counts. The concatenation over string constants inside each
-    argument covers the ``print("a" " b", file=...)`` implicit-concat shape the scoped
-    driver actually uses for its stderr lines.
+    if/try block still counts. Each positional argument to ``print(...)`` must be a
+    single :class:`ast.Constant` string node for this check to be sound; that is the
+    shape the scoped driver uses today.
+
+    Note on implicit string concatenation (PR-gate on #289 msg-3387 §1, docs advisory):
+    the ``"a" " b"`` shape used at the module's line 130/131/135/136 is NOT preserved
+    as separate nodes in the AST — CPython's parser folds implicit adjacent string
+    literals at compile time into a single :class:`ast.Constant` whose ``value`` is
+    already ``"a b"``. So no reconstruction from multiple constants is happening or
+    needed. What we're extracting is the single, pre-folded constant per argument.
+
+    On unspecified iteration order (PR-gate on #289 msg-3387 §2, structure advisory):
+    :func:`ast.walk` does not guarantee traversal order across siblings, so
+    concatenating text pulled out of nested nodes (f-strings' ``FormattedValue``
+    interleaved with literal ``Constant`` parts, ``ast.BinOp`` string additions, etc.)
+    would jam substrings together in an unspecified order and silently produce false
+    negatives on the substring match. We defend against that by restricting each
+    argument to a bare ``ast.Constant`` string — every other shape fails loudly via
+    the ``other_shape`` marker below, forcing whoever refactored the script to update
+    this helper deliberately rather than let a scrambled ``text`` pass silently.
     """
     hits: list[ast.Call] = []
     for node in ast.walk(func):
@@ -196,12 +227,23 @@ def _print_calls_carrying_phrase(func: ast.AsyncFunctionDef, phrase: str) -> lis
             continue
         if not (isinstance(node.func, ast.Name) and node.func.id == "print"):
             continue
-        text = ""
+        text_parts: list[str] = []
+        other_shape = False
         for arg in node.args:
-            for sub in ast.walk(arg):
-                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
-                    text += sub.value
-        if phrase in text:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                text_parts.append(arg.value)
+            else:
+                # Any non-string-Constant positional arg (f-string, BinOp, Name, Call,
+                # bytes, number, ...) means the caller reshaped their print args in a
+                # way this helper cannot reason about deterministically. Skip THIS
+                # print call rather than pretend we know its text. The T3 assertions
+                # then fire on "no matching print found for phrase X", telling the
+                # refactorer to update this helper for the new shape.
+                other_shape = True
+                break
+        if other_shape:
+            continue
+        if phrase in "".join(text_parts):
             hits.append(node)
     return hits
 
