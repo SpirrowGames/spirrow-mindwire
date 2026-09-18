@@ -157,20 +157,25 @@ def test_non_string_truthy_thread_id_is_coerced_not_ignored(raw_id: object, coer
     assert report.malformed_count == 0
 
 
-@pytest.mark.parametrize("raw_id", [0, [], {}, ""])
+@pytest.mark.parametrize("raw_id", [0, [], {}, "", None])
 def test_falsy_non_string_thread_id_is_ignored(raw_id: object) -> None:
     """Pin the falsy branch of the coercion so a refactor cannot silently break it.
 
     The docstring on :func:`enumerate_project` describes a strict
     divergence: truthy non-strings (``123``, ``["x"]``) coerce and
     surface under ``unregistered``; falsy non-strings (``0``, ``[]``,
-    ``{}``) and the empty string coerce to ``""`` via the
+    ``{}``, ``None``) and the empty string coerce to ``""`` via the
     ``str(x or "")`` idiom and are dropped. Both sides of that boundary
     must be pinned — a refactor from ``str(thread.get("thread_id") or "")``
     to ``str(thread.get("thread_id", ""))`` would push ``0`` through as
     ``"0"``, silently violating the falsy contract described in the
     docstring, and only the presence of this test would catch it
-    (PR-gate ADVISORY on PR #298, class=``untested``).
+    (PR-gate ADVISORY on PR #298, class=``untested``). ``None`` is
+    covered explicitly as a distinct upstream state from a missing key:
+    a JSON payload can send ``"thread_id": null`` and, mechanically, that
+    is a dict with the key present and the value ``None`` — different
+    from ``dict.get`` returning the default because the key is absent
+    (PR-gate ADVISORY on PR #298 iteration 2, class=``speculative``).
     """
     registered = _index(projects=("p",))
     threads = [{"thread_id": raw_id, "status": "active"}]
