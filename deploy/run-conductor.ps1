@@ -30,25 +30,39 @@ $env:PYTHONIOENCODING = "utf-8"
 # The default target is Anthropic's public API URL; only override if you have your own reason
 # (proxy, test double, etc.) — this is not an infra-value leak, so a public default is fine.
 if (-not $env:MINDWIRE_IMPLEMENTER_BASE_URL) { $env:MINDWIRE_IMPLEMENTER_BASE_URL = "https://api.anthropic.com" }
-# INTERNAL INFRA endpoints — resolution + validation both live in Python:
-#   * MINDWIRE_MAGICKIT_MCP_URL  → validated in ``spirrow_mindwire.magickit.client.magickit_mcp_url``
-#                                  (unset raises ``MagickitMcpError`` at ``StreamableHttpChatroomMcp.__init__``
-#                                  time; no in-code fallback per ADR-2026-06-04-18 v1.1 §2 D-2)
-#   * MINDWIRE_NAYSAYER_BASE_URL → validated in ``NaysayerSdkAdapter.spawn`` (empty raises
-#                                  ``NaysayerSdkSpawnError``; independence per ADR-2026-05-21-05 §5)
-#   * MINDWIRE_LEXORA_URL        → optional in ``spirrow_mindwire.lexora.client.lexora_url``;
-#                                  unset falls back to the safe-by-design loopback (Lexora binds
+# INTERNAL INFRA endpoints — resolution + validation both live in Python. The validation is
+# lazy (each variable is checked at the moment its consumer is constructed / a session is
+# spawned), NOT at wrapper start. The wrapper does NOT pre-flight these because a wrapper-side
+# check would either duplicate the Python message (drift risk — PR #296 pr-gate advisory,
+# msg-3484) or diverge from it (two different rationales for the same rule):
+#
+#   * MINDWIRE_MAGICKIT_MCP_URL  → validated in ``spirrow_mindwire.magickit.client.magickit_mcp_url``.
+#                                  Unset raises ``MagickitMcpError`` from
+#                                  ``StreamableHttpChatroomMcp.__init__`` — the MCP client is
+#                                  constructed inside the composition root
+#                                  (``spirrow_mindwire.loop_runner._build_dispatcher``), so this
+#                                  fails as part of daemon startup for BOTH ``run_loop`` and
+#                                  ``run_conductor``, before either enters its event loop.
+#                                  No in-code fallback per ADR-2026-06-04-18 v1.1 §2 D-2.
+#   * MINDWIRE_NAYSAYER_BASE_URL → read at ``NaysayerSdkAdapter.__init__`` (composition-root time)
+#                                  but only VALIDATED at ``NaysayerSdkAdapter.spawn``, when a
+#                                  naysayer session is actually summoned. An empty value raises
+#                                  ``NaysayerSdkSpawnError`` at that point. If a daemon is
+#                                  configured without any naysayer-triggering watches and sits
+#                                  idle, this variable is not checked until the first summon.
+#                                  Independence rationale per ADR-2026-05-21-05 §5.
+#   * MINDWIRE_LEXORA_URL        → optional in ``spirrow_mindwire.lexora.client.lexora_url``.
+#                                  Unset falls back to the safe-by-design loopback (Lexora binds
 #                                  0.0.0.0 + no auth, so loopback is the only default that does
-#                                  not widen the unauthenticated surface). Operators on a
-#                                  different host set the env from [[platform:infra-registry]].
+#                                  not widen the unauthenticated surface). Operators on a host
+#                                  where Lexora is NOT co-resident set the env from
+#                                  [[platform:infra-registry]].
 #
 # The operator resolves the required values from [[platform:infra-registry]] and sets them
 # (persistent user env var sourced from Vaultwarden, mirroring the MINDWIRE_NAYSAYER_GITHUB_TOKEN
-# secret handling below). If any required var is missing, Python raises a loud typed error
-# within seconds of subprocess start — the whole daemon exits non-zero and the operator sees it
-# in the log. The wrapper does not pre-flight these because a wrapper-side check would either
-# duplicate the Python message (drift risk — PR #296 pr-gate advisory) or diverge from it
-# (worse: two different rationales for the same rule).
+# secret handling below). A misconfigured daemon that reaches the naysayer summon path will
+# exit non-zero at that call; a misconfigured daemon whose magickit URL is missing will not
+# even complete startup.
 
 # --- secret precondition (fail loud, never hardcode) -------------------------------------------
 if (-not $env:MINDWIRE_NAYSAYER_GITHUB_TOKEN) {

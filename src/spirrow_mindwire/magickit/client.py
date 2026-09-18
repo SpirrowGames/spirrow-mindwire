@@ -15,14 +15,21 @@ rationale). No auth (the Tailscale boundary gates access). See
 for the contract.
 
 **Single source of validation** (T-public-repo-carries-real-infra-values PR
-#296 pr-gate advisory): :func:`magickit_mcp_url` is the ONE place that
-enforces the env-required contract for ``MINDWIRE_MAGICKIT_MCP_URL``. The
-deploy wrapper (``deploy/run-conductor.ps1``) deliberately does NOT
+#296 pr-gate advisory, msg-3484): :func:`magickit_mcp_url` is the ONE place
+that enforces the env-required contract for ``MINDWIRE_MAGICKIT_MCP_URL``.
+The deploy wrapper (``deploy/run-conductor.ps1``) deliberately does NOT
 duplicate the check — a wrapper-side ``throw`` would either mirror this
 function's message (drift risk when the variable name or the ADR rationale
 changes) or diverge from it (worse: two different rationales for the same
-rule). If the env is unset when the daemon starts, Python raises the typed
-error within seconds of subprocess start and the daemon exits non-zero.
+rule). The MCP client is constructed inside the composition root
+(:func:`spirrow_mindwire.loop_runner._build_dispatcher`), so a missing env
+raises ``MagickitMcpError`` during daemon startup for both ``run_loop`` and
+``run_conductor``, before either enters its event loop. That startup timing
+is a property of where the client is constructed, not a promise this
+function makes: any caller that defers ``StreamableHttpChatroomMcp()`` to
+a later code path (an on-demand script, a lazy component) would see the
+same error surface at that later moment. The wrapper comment describes
+the timing accordingly.
 
 :class:`StreamableHttpChatroomMcp` does real network I/O and is therefore
 exercised only by the ``-m manual`` smoke test (PR-G), not CI; the pure
