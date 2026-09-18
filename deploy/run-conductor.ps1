@@ -4,8 +4,10 @@
 # Runs `mindwire-loop --mode conductor` with the full environment the role adapters resolve at
 # spawn. Two rules:
 #   1. Secrets are NEVER baked in — the GitHub token must already be in the environment.
-#   2. Non-secret internal infra addresses default to the SpirrowGames Tailscale endpoints and are
-#      overridable per host (they are environment-dependent, mirroring the in-code defaults).
+#   2. Non-secret internal infra addresses are REQUIRED in the environment. The operator resolves
+#      each value from [[platform:infra-registry]] and sets it before launching; there are no
+#      hard-coded fallbacks — a missing env is a loud `throw`, not a silent misroute (ADR-18 v1.1
+#      §2 D-2, ADR-22 D-1; T-public-repo-carries-real-infra-values Bohr msg-2734 §1).
 #
 # Register this with Task Scheduler (Windows) / a systemd unit (Linux) for unattended runs. See
 # docs/deploy.md for the full runbook (host choice, secrets, config, service registration).
@@ -21,16 +23,41 @@ $ErrorActionPreference = "Stop"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-# --- inference / gateway endpoints (non-secret internal infra; override per host) ---------------
-# implementer inference: this host's local Claude subscription (NOT routed via Lexora).
+# --- inference / gateway endpoints ---------------------------------------------------------------
+# implementer inference: the local Claude subscription reaches Anthropic directly (NOT via Lexora).
+# The default target is Anthropic's public API URL; only override if you have your own reason
+# (proxy, test double, etc.) — this is not an infra-value leak, so a public default is fine.
 if (-not $env:MINDWIRE_IMPLEMENTER_BASE_URL) { $env:MINDWIRE_IMPLEMENTER_BASE_URL = "https://api.anthropic.com" }
-# design-time naysayer: Lexora 'naysayer' tier -> Gemini (the SDK reaches it at :8110). Independence
-# (ADR-05 §5) holds because the tier is a different model family; same tier the PR-gate uses.
-if (-not $env:MINDWIRE_NAYSAYER_BASE_URL)    { $env:MINDWIRE_NAYSAYER_BASE_URL = "http://100.79.84.62:8110" }
-# Tier B PR-gate driver: Lexora gateway.
-if (-not $env:MINDWIRE_LEXORA_URL)           { $env:MINDWIRE_LEXORA_URL = "http://100.79.84.62:8110" }
-# magickit chatroom MCP defaults to http://100.79.84.62:8117/mcp in-code; override only if relocated:
-# if (-not $env:MINDWIRE_MAGICKIT_MCP_URL)    { $env:MINDWIRE_MAGICKIT_MCP_URL = "http://100.79.84.62:8117/mcp" }
+# INTERNAL INFRA endpoints — env-required, fail-fast. The hard-coded fallbacks that used to live
+# here landed local no-auth topology (tailnet host / IP / port) into the public source repository
+# as the shipped default behaviour (T-public-repo-carries-real-infra-values Bohr msg-2734 §6:
+# "振る舞いを持つ既定値 3 箇所"), and silent misroute after a config change was itself a failure
+# mode. Operators resolve the actual values from [[platform:infra-registry]] and set the env vars
+# before launching (persistent user env var sourced from Vaultwarden, mirroring the
+# MINDWIRE_NAYSAYER_GITHUB_TOKEN secret handling below). See ADR-2026-06-04-18 v1.1 §2 D-2 for
+# the magickit contract; the sibling NAYSAYER_BASE_URL / LEXORA_URL adopt the same fail-fast
+# shape for symmetry (Bohr msg-3391 §1 "symmetry こそが安全性の担保").
+if (-not $env:MINDWIRE_NAYSAYER_BASE_URL) {
+    throw "MINDWIRE_NAYSAYER_BASE_URL is not set. Resolve the Lexora 'naysayer' tier URL " +
+          "(Gemini via Lexora, independence per ADR-05 §5; same tier as the PR-gate) from " +
+          "[[platform:infra-registry]] and set it in the environment before launching. There is " +
+          "no in-code default (T-public-repo-carries-real-infra-values Bohr msg-2734 §6; the " +
+          "fallback was removed to stop landing tailnet topology in the public source repo)."
+}
+if (-not $env:MINDWIRE_LEXORA_URL) {
+    throw "MINDWIRE_LEXORA_URL is not set. Resolve the Lexora gateway URL (Tier B PR-gate " +
+          "driver) from [[platform:infra-registry]] and set it in the environment before " +
+          "launching. There is no in-code default (T-public-repo-carries-real-infra-values Bohr " +
+          "msg-2734 §6; the fallback was removed to stop landing tailnet topology in the public " +
+          "source repo)."
+}
+if (-not $env:MINDWIRE_MAGICKIT_MCP_URL) {
+    throw "MINDWIRE_MAGICKIT_MCP_URL is not set. Resolve the magickit MCP URL (local no-auth " +
+          "chatroom MCP endpoint) from [[platform:infra-registry]] and set it in the environment " +
+          "before launching. There is no in-code default (ADR-2026-06-04-18 v1.1 §2 D-2 — the " +
+          "in-code fallback was removed to prevent silent misroute after ADR-18 §1.1 established " +
+          "that the mindwire loop host is not the magickit host)."
+}
 
 # --- secret precondition (fail loud, never hardcode) -------------------------------------------
 if (-not $env:MINDWIRE_NAYSAYER_GITHUB_TOKEN) {

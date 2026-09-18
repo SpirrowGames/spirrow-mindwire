@@ -6,10 +6,13 @@ and (Step 3 PR-G) the ChatroomWatcher (T14) to reach the magickit chatroom
 MCP tools.
 
 Runtime target (chatroom thread ``T-phase1-impl-t11-t13`` msg-193): the
-**local no-auth** magickit MCP instance on sg-ai-server-01's Tailscale IP,
-default ``http://100.79.84.62:8117/mcp``, overridable via
-``MINDWIRE_MAGICKIT_MCP_URL`` (the IP is environment-dependent — do not
-hardcode it elsewhere). No auth (the Tailscale boundary gates access).
+**local no-auth** magickit MCP instance reached over Tailscale. The URL is
+resolved from ``MINDWIRE_MAGICKIT_MCP_URL`` (env). The env is **required** —
+unset raises :class:`MagickitMcpError` at :meth:`StreamableHttpChatroomMcp.__init__`
+call time (not at module import — see :func:`magickit_mcp_url` for the
+rationale). No auth (the Tailscale boundary gates access). See
+``docs/adr/ADR-2026-06-04-18-amendment-v1.1-magickit-default-fail-fast.md``
+for the contract.
 
 :class:`StreamableHttpChatroomMcp` does real network I/O and is therefore
 exercised only by the ``-m manual`` smoke test (PR-G), not CI; the pure
@@ -27,14 +30,38 @@ import httpx
 from mcp import ClientSession, McpError
 from mcp.client.streamable_http import StreamableHTTPError, streamablehttp_client
 
-_DEFAULT_MAGICKIT_MCP_URL = "http://100.79.84.62:8117/mcp"
-"""Default local no-auth magickit MCP endpoint (Tailscale). Env-overridable; not to be hardcoded."""
-
 
 def magickit_mcp_url() -> str:
-    """Resolve the magickit MCP URL from ``MINDWIRE_MAGICKIT_MCP_URL`` (env) or the default."""
-    # Treat unset *or empty* as "use default" (an empty URL would fail confusingly).
-    return os.environ.get("MINDWIRE_MAGICKIT_MCP_URL") or _DEFAULT_MAGICKIT_MCP_URL
+    """Resolve the magickit MCP URL from ``MINDWIRE_MAGICKIT_MCP_URL`` (env).
+
+    Env is **required** (ADR-2026-06-04-18 v1.1 §2 D-2): if the variable is
+    unset or empty, this raises :class:`MagickitMcpError` at call time. There
+    is no in-code fallback — the rationale is in the amendment ADR:
+
+    - a hard-coded default landed the local no-auth magickit host / IP / port
+      into the public source repository as the shipped default behaviour
+      (``T-public-repo-carries-real-infra-values`` Bohr msg-2734 §1);
+    - after ADR-18 §1.1 established that the mindwire loop host is not the
+      magickit host, any localhost fallback would *always* point at the wrong
+      place — silent misroute is the failure mode the fail-fast is closing.
+
+    **Evaluated on demand, not at module import.** The check runs from
+    :meth:`StreamableHttpChatroomMcp.__init__` (which calls this function) so
+    a pytest fixture can set ``MINDWIRE_MAGICKIT_MCP_URL`` via
+    ``monkeypatch.setenv`` before any construction happens. Validating at
+    module import would fail during test collection, defeating the fixture
+    migration path documented in ADR-2026-06-04-18 v1.1 §2.4.
+    """
+    url = os.environ.get("MINDWIRE_MAGICKIT_MCP_URL")
+    if not url:
+        raise MagickitMcpError(
+            "MINDWIRE_MAGICKIT_MCP_URL is not set. The magickit MCP URL is "
+            "resolved from that environment variable; there is no in-code "
+            "default (ADR-2026-06-04-18 v1.1 §2 D-2 — fail-fast to prevent "
+            "silent misroute). Set the variable to the value from "
+            "[[platform:infra-registry]] before launching."
+        )
+    return url
 
 
 class MagickitMcpError(RuntimeError):

@@ -1965,16 +1965,36 @@ $DecisionComposerIdentity = if ($env:MINDWIRE_DECISION_COMPOSER_IDENTITY) {
     $env:MINDWIRE_DECISION_COMPOSER_IDENTITY
 } else { 'Composer' }
 
-# Dashboard base URL for D-29 (the link always survives the truncation ladder). Read from env with
-# the Tailscale-visible default from Takahito's §11.1 measurement — an operator relocating the
-# dashboard sets MINDWIRE_DECISION_DASHBOARD_URL and every link updates without touching the format
-# code. Path composition (`/dashboard/decisions/<project>/<thread>` for the human link,
+# Dashboard base URL for D-29 (the link always survives the truncation ladder). Resolved from
+# ``MINDWIRE_DECISION_DASHBOARD_URL`` (env). The env is **required** — unset raises a loud
+# PowerShell `throw` at init time. There is no in-code fallback (ADR-2026-09-18-22 D-1):
+#
+#   (i) the hard-coded fallback that used to live here landed a tailnet MagicDNS FQDN + port into
+#       the public source repository (T-public-repo-carries-real-infra-values Bohr msg-2734 §5.1),
+#       and that value class is one the registry hook does not detect;
+#   (ii) if the env is unset the material PUT and the human-facing Discord link both target the
+#        wrong place. The PUT is fail-open (D-4, D-34) so it swallows a 1-line log, but the
+#        Discord link is not — a human clicks it and hits 404 / dead host, silently believing the
+#        material is stored somewhere it never landed. Loud fail at init > silent misroute.
+#
+# D-1's invariant scope is disjoint from D-4's material-side fail-open: D-1 covers deploy-time
+# config errors (deploy not complete), D-4 covers runtime material-service outages (magickit down,
+# network partition). The two are subject-disjoint and both hold at once (ADR-22 D-4 invariant
+# scope paragraph).
+#
+# Path composition (`/dashboard/decisions/<project>/<thread>` for the human link,
 # `/v1/decisions/<project>/<thread>/material` for the magickit PUT) lives in New-DecisionLink /
 # New-MaterialUrl below — a URL-shape change is one edit in one place, not a search across the
 # wrapper.
-$DecisionDashboardBaseUrl = if ($env:MINDWIRE_DECISION_DASHBOARD_URL) {
-    $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
-} else { 'https://sg-ai-server-01.taile861db.ts.net:8443' }
+if (-not $env:MINDWIRE_DECISION_DASHBOARD_URL) {
+    throw "MINDWIRE_DECISION_DASHBOARD_URL is not set. Resolve the decision-material dashboard " +
+          "base URL from [[platform:infra-registry]] and set it in the environment before " +
+          "launching the scheduled sweep. There is no in-code default (ADR-2026-09-18-22 D-1 — " +
+          "fail-fast to prevent silent misroute of the human-facing Discord link, which is not " +
+          "covered by the D-4 fail-open that shields material PUTs; T-public-repo-carries-real-" +
+          "infra-values msg-2734 §5.1 for the underlying repo-visibility rationale)."
+}
+$DecisionDashboardBaseUrl = $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
 
 # --- decision-material push (T-decision-material-push, msg-1445) -------------------------------
 # The material push (mindwire composer → magickit `/v1/decisions/.../material`) shares a base URL,
