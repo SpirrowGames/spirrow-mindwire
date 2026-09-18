@@ -1,20 +1,28 @@
 """F-1 (T-scoped-driver-verdict-never-reaches-chatroom) — the drift alarm.
 
-Two invariants keep the detection rule in ``docs/gate-validity-and-crossthread-rules.md``
+Three invariants keep the detection rule in ``docs/gate-validity-and-crossthread-rules.md``
 from silently breaking:
 
 * **T1** — ``SCOPED_REVIEW_BODY_MARKER`` exists at the canonical import path documented
-  in Artifact C (``spirrow_mindwire.naysayer.pr_review``) and carries the exact literal
-  the doc promises. A rename or a value change here silently breaks every downstream
-  detector that imports the constant and calls ``body.startswith(...)`` on it.
+  in Artifact C (``spirrow_mindwire.naysayer.pr_review``) AND the F-1 doc quotes the same
+  literal. Enforcing this without adding a third copy of the string to the test file
+  (PR-gate on #289 msg-3382: "tri-management of the marker literal") — the constant
+  imported at module load IS the source of truth; the doc must contain that same string,
+  and the test contains no hardcoded copy.
 * **T2** — ``scripts/naysayer_review_scoped.py`` stamps the marker at index 0 of
   ``posted_body``, BEFORE ``prepend_gate_notice``. The script is read as source and
   parsed with :mod:`ast` — never imported (``scripts/`` is not a package; importing the
   file would pull in the orchestrator/driver stack and any accidental construction of
   the gate would cost a billed Gemini call — same rationale as
   :mod:`tests.test_gate_command_doc_consistency`).
+* **T3** — the three-line stderr NOTICE (Artifact B) is emitted in ``main()`` BEFORE the
+  first awaited call inside ``main()``. Also AST-based — a textual regex over the whole
+  source cannot see function boundaries (an ``await`` inside a helper defined before
+  ``main()`` would decoy the check) nor common Python syntax (``x = await f()`` starts
+  with ``x``, not ``await``, so a line-anchored regex like ``^\\s+await\\s`` silently
+  misses it — PR-gate on #289 msg-3382, correctness objection).
 
-If either assertion goes red, the invariant the F-1 detection rule keys on is no longer
+If any assertion goes red, the invariant the F-1 detection rule keys on is no longer
 true, and the ``body.startswith(SCOPED_REVIEW_BODY_MARKER)`` exemption in
 ``docs/gate-validity-and-crossthread-rules.md`` §2 will silently mis-classify
 scoped-driver reviews. Do not fix the assertion — fix the code the assertion describes.
@@ -23,7 +31,6 @@ scoped-driver reviews. Do not fix the assertion — fix the code the assertion d
 from __future__ import annotations
 
 import ast
-import re
 from pathlib import Path
 
 from spirrow_mindwire.naysayer.pr_review import SCOPED_REVIEW_BODY_MARKER
@@ -32,25 +39,34 @@ _REPO = Path(__file__).resolve().parents[1]
 _SCOPED_DRIVER = _REPO / "scripts" / "naysayer_review_scoped.py"
 _F1_DOC = _REPO / "docs" / "gate-validity-and-crossthread-rules.md"
 
-# The exact literal the F-1 doc's detection rule keys on. A change here without a matching
-# doc edit is the drift T1 exists to catch.
-_EXPECTED_MARKER = "<!-- naysayer:scoped-driver -->"
 
+def test_t1_marker_constant_matches_the_documented_literal() -> None:
+    """T1: the imported constant appears verbatim inside the F-1 doc; both are HTML-comment shaped.
 
-def test_t1_marker_constant_is_the_documented_literal() -> None:
-    """T1: the imported constant equals the literal quoted in the F-1 doc.
+    Two assertions, both keyed on the imported constant itself (no hardcoded copy in
+    this file — PR-gate on #289 §2 asked us to remove the third source of truth). A
+    legitimate rename of the constant value + doc together stays green; a doc-only
+    rename or a constant-only rename goes red.
 
-    Downstream detectors follow the doc's ``from spirrow_mindwire.naysayer.pr_review
-    import SCOPED_REVIEW_BODY_MARKER`` line; if the constant's value drifts away from
-    the string the doc promises, every ``startswith`` caller silently starts missing
-    the scoped-driver marker.
+    The HTML-comment shape check (``<!-- ... -->``) is a structural guard, not a
+    duplicate of the literal: if the constant is ever changed to something that GitHub
+    markdown WOULD render (say, a bold header), the raw ``body`` would still carry the
+    string for a ``startswith`` check but the human-readable review UI would suddenly
+    show F-1 diagnostic bytes — a regression the marker's shape rules out.
     """
-    assert SCOPED_REVIEW_BODY_MARKER == _EXPECTED_MARKER
-    # The doc must also quote the same literal — a doc-only rename is drift too.
     doc_text = _F1_DOC.read_text(encoding="utf-8")
-    assert _EXPECTED_MARKER in doc_text, (
-        "docs/gate-validity-and-crossthread-rules.md must quote the exact marker literal "
-        f"{_EXPECTED_MARKER!r} that detectors will match on."
+    assert SCOPED_REVIEW_BODY_MARKER in doc_text, (
+        f"docs/gate-validity-and-crossthread-rules.md must quote "
+        f"SCOPED_REVIEW_BODY_MARKER={SCOPED_REVIEW_BODY_MARKER!r} verbatim so detectors "
+        "reading the doc find the exact string the constant carries."
+    )
+    assert SCOPED_REVIEW_BODY_MARKER.startswith("<!--"), (
+        f"SCOPED_REVIEW_BODY_MARKER={SCOPED_REVIEW_BODY_MARKER!r} must be an HTML comment "
+        "(starts with '<!--') so it renders as empty in GitHub's PR review UI."
+    )
+    assert SCOPED_REVIEW_BODY_MARKER.endswith("-->"), (
+        f"SCOPED_REVIEW_BODY_MARKER={SCOPED_REVIEW_BODY_MARKER!r} must end with '-->' so "
+        "the HTML comment closes and no downstream body content is accidentally hidden."
     )
 
 
@@ -58,6 +74,17 @@ def _read_scoped_driver_ast() -> ast.Module:
     """Parse the scoped driver as source. Never import — see module docstring."""
     src = _SCOPED_DRIVER.read_text(encoding="utf-8")
     return ast.parse(src, filename=str(_SCOPED_DRIVER))
+
+
+def _find_main_func(module: ast.Module) -> ast.AsyncFunctionDef:
+    """Locate the top-level ``async def main`` — the only place T3 cares about."""
+    for node in module.body:
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "main":
+            return node
+    raise AssertionError(
+        f"{_SCOPED_DRIVER.name} must define a top-level `async def main` "
+        "for the F-1 stderr-notice ordering check to have a scope."
+    )
 
 
 def _finds_import_of_marker(module: ast.Module) -> bool:
@@ -154,34 +181,76 @@ def test_t2_posted_body_is_prefixed_with_the_marker() -> None:
     )
 
 
-def test_t3_notice_stderr_lines_are_emitted_before_ci_gate() -> None:
-    """B (msg-3373 §3.2): the three-line stderr NOTICE prints before any CI-gate return.
+def _print_calls_carrying_phrase(func: ast.AsyncFunctionDef, phrase: str) -> list[ast.Call]:
+    """Return every ``print(...)`` call inside ``func`` whose concatenated string args
+    contain ``phrase`` as a substring.
 
-    Structural check: locate the first ``print(..., file=sys.stderr)`` triple in
-    ``main()`` and confirm all three carry the ``[scoped-naysayer] NOTICE`` /
-    ``verdict lives only in stdout`` / ``detectors keyed on 'ledger thread + reviews'``
-    lines. These lines must be reachable on every invocation — including the CI-red /
-    timeout(exit 3) / empty(exit 4) early-return paths — which is why they sit
-    immediately after ``parse_args()`` and before any awaited call. Reading the source
-    is enough to enforce ordering: a later PR that moves them after ``await
-    github.fetch_ci_status(...)`` would let the CI-red return skip them silently.
+    ``ast.walk(func)`` visits every descendant node, so a ``print`` sitting inside an
+    if/try block still counts. The concatenation over string constants inside each
+    argument covers the ``print("a" " b", file=...)`` implicit-concat shape the scoped
+    driver actually uses for its stderr lines.
     """
-    src = _SCOPED_DRIVER.read_text(encoding="utf-8")
-    # The three sentinel substrings the doc / decide committed to.
-    for phrase in (
+    hits: list[ast.Call] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (isinstance(node.func, ast.Name) and node.func.id == "print"):
+            continue
+        text = ""
+        for arg in node.args:
+            for sub in ast.walk(arg):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    text += sub.value
+        if phrase in text:
+            hits.append(node)
+    return hits
+
+
+def test_t3_notice_stderr_lines_are_emitted_before_first_await_in_main() -> None:
+    """B (msg-3373 §3.2): the three-line stderr NOTICE prints before any awaited call.
+
+    AST-based ordering check — the PR-gate correctness objection on #289 (msg-3382)
+    caught two ways a source-text regex silently misses awaits:
+
+    1. ``x = await f()`` starts the line with ``x``, not ``await``, so a regex like
+       ``^\\s+await\\s`` finds no match on that line. The first ``await`` in the scoped
+       driver's ``main()`` today is exactly that shape (``ci = await
+       github.fetch_ci_status(pr)``) — a line-anchored regex misses it and settles for
+       a later ``await github.submit_review(...)``, hiding the true first-await
+       position from the test.
+    2. A regex over the whole module can't see function boundaries; an ``await`` in a
+       helper defined before ``main()`` (e.g., a future ``async def _fetch_scope()``)
+       would decoy the check and false-positive.
+
+    The AST check locates ``main()``, walks its body for the first :class:`ast.Await`
+    node, and asserts that every ``print(...)`` carrying one of the three sentinel
+    stderr phrases has a source-line position strictly less than that first-await line.
+    """
+    module = _read_scoped_driver_ast()
+    main_func = _find_main_func(module)
+
+    awaits = [n for n in ast.walk(main_func) if isinstance(n, ast.Await)]
+    assert awaits, (
+        f"{_SCOPED_DRIVER.name}::main must still contain at least one await — the "
+        "T3 ordering check is trivially green without one, which would hide regressions."
+    )
+    first_await_line = min(a.lineno for a in awaits)
+
+    sentinel_phrases = (
         "NOTICE: this driver does NOT post to the chatroom",
         "verdict lives only in stdout",
         "detectors keyed on 'ledger thread + reviews'",
-    ):
-        assert phrase in src, f"scoped driver source must carry the stderr phrase {phrase!r}"
-
-    # Ordering: the NOTICE block must appear before the first ``await`` inside main().
-    # A regex is safer than parsing here — it only asks "does the NOTICE precede the
-    # first await?" and answers False when someone reorders them.
-    notice_pos = src.find("NOTICE: this driver does NOT post to the chatroom")
-    first_await = re.search(r"^\s+await\s", src, flags=re.MULTILINE)
-    assert first_await is not None, "scoped driver must still contain an await call"
-    assert notice_pos < first_await.start(), (
-        "stderr NOTICE must be emitted BEFORE the first awaited call so CI-red / "
-        "timeout / empty-reply early returns cannot skip it."
     )
+    for phrase in sentinel_phrases:
+        prints = _print_calls_carrying_phrase(main_func, phrase)
+        assert prints, (
+            f"main() must contain a print(...) call carrying the F-1 stderr phrase "
+            f"{phrase!r}; without it the CI-red / timeout / empty-reply early-return "
+            "paths give the operator no notice at all."
+        )
+        earliest = min(p.lineno for p in prints)
+        assert earliest < first_await_line, (
+            f"print(...) carrying {phrase!r} (line {earliest}) must precede the first "
+            f"await in main() (line {first_await_line}) so early-return paths never "
+            "skip the NOTICE."
+        )
