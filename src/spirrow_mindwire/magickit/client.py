@@ -14,6 +14,16 @@ rationale). No auth (the Tailscale boundary gates access). See
 ``docs/adr/ADR-2026-06-04-18-amendment-v1.1-magickit-default-fail-fast.md``
 for the contract.
 
+**Single source of validation** (T-public-repo-carries-real-infra-values PR
+#296 pr-gate advisory): :func:`magickit_mcp_url` is the ONE place that
+enforces the env-required contract for ``MINDWIRE_MAGICKIT_MCP_URL``. The
+deploy wrapper (``deploy/run-conductor.ps1``) deliberately does NOT
+duplicate the check — a wrapper-side ``throw`` would either mirror this
+function's message (drift risk when the variable name or the ADR rationale
+changes) or diverge from it (worse: two different rationales for the same
+rule). If the env is unset when the daemon starts, Python raises the typed
+error within seconds of subprocess start and the daemon exits non-zero.
+
 :class:`StreamableHttpChatroomMcp` does real network I/O and is therefore
 exercised only by the ``-m manual`` smoke test (PR-G), not CI; the pure
 result-parsing helper and all gateway/watcher *logic* are unit-tested
@@ -51,6 +61,12 @@ def magickit_mcp_url() -> str:
     ``monkeypatch.setenv`` before any construction happens. Validating at
     module import would fail during test collection, defeating the fixture
     migration path documented in ADR-2026-06-04-18 v1.1 §2.4.
+
+    **This is the ONE place that enforces the env-required contract**
+    (T-public-repo-carries-real-infra-values PR #296 pr-gate advisory). The
+    deploy wrapper (``deploy/run-conductor.ps1``) does not repeat the check;
+    duplicating it in PowerShell would create a dual-management drift risk
+    that this function's single-source ownership is designed to eliminate.
     """
     url = os.environ.get("MINDWIRE_MAGICKIT_MCP_URL")
     if not url:
