@@ -127,6 +127,36 @@ def test_a_thread_without_id_is_ignored() -> None:
     assert not is_unregistered_live("p", {"status": "active"}, registered)
 
 
+@pytest.mark.parametrize(
+    "raw_id, coerced",
+    [
+        (123, "123"),
+        (["x"], "['x']"),
+        ({"a": 1}, "{'a': 1}"),
+    ],
+)
+def test_non_string_truthy_thread_id_is_coerced_not_ignored(raw_id: object, coerced: str) -> None:
+    """Pin the current coercion behaviour so a future strict-check is a conscious break.
+
+    The docstring on :func:`enumerate_project` was updated to accurately
+    describe that truthy non-string ``thread_id`` values are coerced via
+    :func:`str` and surface under ``unregistered`` (msg-3325 PR-gate
+    ADVISORY on PR #287). Tightening this to reject non-strings would be
+    a material semantics change, out of scope for the docstring fix; this
+    test pins the current behaviour so any such tightening lights up
+    here first rather than as a silent regression.
+    """
+    registered = _index(projects=("p",))
+    threads = [{"thread_id": raw_id, "status": "active"}]
+    report = enumerate_project("p", threads, registered)
+    assert report.unregistered == (coerced,)
+    assert report.unregistered_count == 1
+    # Coercion is not a "malformed" event — the item was a dict with an
+    # id-shaped field, just of the wrong Python type. The boundary drop
+    # counter tracks non-object items only.
+    assert report.malformed_count == 0
+
+
 def test_enumerate_carries_upstream_malformed_count_through_unchanged() -> None:
     """msg-3225 PR-gate ADVISORY on PR #282: filtering lives at the boundary, not here.
 

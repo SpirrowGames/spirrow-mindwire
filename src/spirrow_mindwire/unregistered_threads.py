@@ -313,10 +313,14 @@ def enumerate_project(
     lives at the one boundary that actually meets untrusted input
     (msg-3225 PR-gate ADVISORY on PR #282 — YAGNI / dual-management).
 
-    A thread whose ``thread_id`` is missing or non-string is ignored (it
-    cannot be a "known thread" the sweep is missing — no id to compare
-    against), matching the shape-tolerance :mod:`parked_humans` applies
-    to head-cross-check candidates.
+    A thread whose ``thread_id`` is missing, empty, or a falsy non-string
+    value (e.g., ``0``, ``[]``, ``{}``) is ignored — the coercion below
+    yields ``""``, and an empty id has nothing to compare against
+    sweep.json. Truthy non-string values (e.g., ``123``, ``["x"]``) are
+    coerced via :func:`str` and surface as their coerced form (``"123"``,
+    ``"['x']"``) under ``unregistered``; the upstream tool contract
+    expects ``thread_id`` to be a string, so any such coercion reflects a
+    schema violation upstream.
 
     ``malformed_count`` is the count of non-object items the caller
     already dropped upstream (msg-2648 §3 — the CLI's ``_list_live_threads``
