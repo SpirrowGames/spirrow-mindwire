@@ -56,6 +56,7 @@ from spirrow_mindwire.naysayer.pr_review import (
     _DEFAULT_MAX_TOKENS,
     _DEFAULT_TIMEOUT_SECONDS,
     _PR_REVIEW_SYSTEM_PROMPT,
+    SCOPED_REVIEW_BODY_MARKER,
     _ci_gate_response,
     _make_diff_view,
     decide_verdict,
@@ -94,11 +95,47 @@ def _build_messages(text: str, pr_slug: str, scope: str) -> list[ChatMessage]:
 
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="Scope-clarified re-naysayer for one PR.")
+    # F-1 (T-scoped-driver-verdict-never-reaches-chatroom msg-3373 §3.1 / msg-3377 §3.3):
+    # the description spells out that this driver has no chatroom transport and names the
+    # canonical detection doc (F-1) + the programmatic marker the classification rule keys
+    # on. Detection tools inferring gate firing from "ledger thread + reviews" MUST NOT
+    # read this path's absence as "gate not fired"; they exempt by ``startswith`` on
+    # ``SCOPED_REVIEW_BODY_MARKER``, not by body-text heuristics.
+    parser = argparse.ArgumentParser(
+        description=(
+            "Scope-clarified re-naysayer for one PR. NOTE: this driver does NOT post "
+            "to the chatroom. The verdict appears only in stdout and (unless --no-submit) "
+            'in the GitHub PR review. Detection tools that infer gate firing from "ledger '
+            'thread + reviews" will read this path as "gate not fired" — see '
+            "docs/gate-validity-and-crossthread-rules.md (F-1); this driver stamps "
+            "SCOPED_REVIEW_BODY_MARKER at the top of every submitted review body so "
+            "detectors can identify it without body-text heuristics."
+        ),
+    )
     parser.add_argument("--pr", required=True, help="PR ref: 'owner/repo#n' or URL")
     parser.add_argument("--scope-file", required=True, help="file with the binding scope block")
     parser.add_argument("--no-submit", action="store_true", help="skip the GitHub review submit")
     args = parser.parse_args()
+
+    # F-1 (T-scoped-driver-verdict-never-reaches-chatroom msg-3373 §3.2): print the
+    # detection-invariant notice to stderr on every invocation — BEFORE the CI-gate /
+    # timeout / empty-reply early-return paths, so the "using this script" operator
+    # sees it whether the invocation succeeds, times out, or short-circuits. stderr
+    # (not stdout) so grep pipelines on verdict / POSTED body stay clean.
+    print(
+        "[scoped-naysayer] NOTICE: this driver does NOT post to the chatroom.",
+        file=sys.stderr,
+    )
+    print(
+        "[scoped-naysayer] verdict lives only in stdout"
+        " and (unless --no-submit) in the GitHub review.",
+        file=sys.stderr,
+    )
+    print(
+        "[scoped-naysayer] detectors keyed on 'ledger thread + reviews'"
+        " will read this as gate-not-fired.",
+        file=sys.stderr,
+    )
 
     pr = parse_pr_ref(args.pr)
     if pr is None:
@@ -153,7 +190,17 @@ async def main() -> None:
         # the CLI stdout and the GitHub review body both showed ``VERDICT: APPROVE`` while the
         # script quietly submitted REQUEST_CHANGES — the exact symptom this thread was born to
         # fix (msg-1871 §3).
-        posted_body = prepend_gate_notice(body, decision)
+        #
+        # F-1 (T-scoped-driver-verdict-never-reaches-chatroom msg-3379 §2.1): stamp the
+        # ``SCOPED_REVIEW_BODY_MARKER`` at index 0 of ``posted_body`` — BEFORE the gate notice —
+        # so orphan-review anomaly detectors can identify a scoped-driver review by
+        # ``body.startswith(SCOPED_REVIEW_BODY_MARKER)`` alone. The marker sits above the
+        # gate notice so a truncation / length-cap invocation (where the notice IS prepended)
+        # still leaves the marker at position 0 — the detector's single-branch invariant.
+        # The marker is a GitHub-safe HTML comment (renders as empty in the UI, preserved
+        # verbatim in the API's raw ``body`` field), so it disturbs neither human readers nor
+        # ``startswith`` callers. See ``docs/gate-validity-and-crossthread-rules.md`` (F-1).
+        posted_body = f"{SCOPED_REVIEW_BODY_MARKER}\n\n{prepend_gate_notice(body, decision)}"
 
         # The "verbatim" section preserves the model's original words (Bohr msg-1872 §8:
         # "証拠を消して見た目を整えるのは沈黙の別形態である"). The "POSTED TO GITHUB" section
