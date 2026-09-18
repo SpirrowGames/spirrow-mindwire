@@ -523,11 +523,12 @@ context are not confusable later. Deleting `evaluated.json` resets the starvatio
 one tick of empty starvation report). Deleting `digest.json` forces the next tick to send a digest.
 Deleting `leases.json` **flips the wrapper to the UNMIGRATED branch** — the next tick reads the
 file as missing and defers every lease-requiring candidate; more dangerously, if a physical
-holder is still running when the operator re-runs the runbook, the automated re-seed can silently
-double-allocate. Never delete it as a shortcut. Truncating it (blank / whitespace / `[]`) does
-NOT bypass this: the wrapper treats those shapes as `verdict='unreadable'` fail-closed, not as
-valid-with-no-holder, so the next tick defers rather than granting — but repairing then requires
-following the same Recovery path. Follow § Migration boundary Recovery in either case.
+holder is still running when the operator re-runs the runbook, the operator's manual re-seed
+followed by the next tick's automated acquire can silently double-allocate. Never delete it as a
+shortcut. Truncating it (blank / whitespace / `[]`) does NOT bypass this: the wrapper treats those
+shapes as `verdict='unreadable'` fail-closed, not as valid-with-no-holder, so the next tick defers
+rather than granting — but repairing then requires following the same Recovery path. Follow §
+Migration boundary Recovery in either case.
 
 ## Quarantine and daily digest
 

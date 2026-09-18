@@ -1530,7 +1530,9 @@ Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdic
 # and lives on the caller's write path in a later PR — the ledger row #P4-3(b) still stands.
 #
 # ROW-BY-ROW MAPPING:
-#   (d-1)  inject shape='invalid-*' -> lease-requiring disposition, flush skipped
+#   (d-1)  inject shape ∈ {array, scalar, parse-error} -> lease-requiring disposition, flush skipped
+#          (shape='empty' — blank / whitespace / `[]` — is the same fail-closed branch under
+#          v4.1 but is pinned separately by the (d-7 companion) truncation-hazard checks below)
 #   (d-2)  SKIPPED HERE (write-fail is Set-JsonState throw; belongs to the caller's tick.
 #          The seam neither writes nor throws; the ledger row is preserved in P4-3(b) prose.)
 #   (d-3)  regression: valid file + mid-tick clear behaviour lives with Merge-LeasesStateForWrite,
