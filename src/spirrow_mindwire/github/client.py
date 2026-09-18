@@ -1649,10 +1649,15 @@ class TargetTerminalError(GitHubHTTPError):
     """
 
     def __init__(self, source: GitHubHTTPError) -> None:
-        super().__init__(str(source), status_code=source.status_code)
-        # Preserve the raw exception's retry hints for observability parity.
-        self.retry_after = source.retry_after
-        self.rate_limited = source.rate_limited
+        # Preserve the raw exception's retry hints for observability parity;
+        # pass them through the base constructor so the fields are initialised
+        # once (not written to defaults then overwritten). msg-3281 advisory.
+        super().__init__(
+            str(source),
+            status_code=source.status_code,
+            retry_after=source.retry_after,
+            rate_limited=source.rate_limited,
+        )
 
 
 __all__ = [
