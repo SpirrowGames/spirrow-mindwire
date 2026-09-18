@@ -1531,8 +1531,17 @@ Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdic
 #
 # ROW-BY-ROW MAPPING:
 #   (d-1)  inject shape ∈ {array, scalar, parse-error} -> lease-requiring disposition, flush skipped
-#          (shape='empty' — blank / whitespace / `[]` — is the same fail-closed branch under
-#          v4.1 but is pinned separately by the (d-7 companion) truncation-hazard checks below)
+#          NB: the shape word 'array' here means the RAW shape Read-JsonStateWithShape emits for
+#          a NON-empty root JSON array (e.g. `[1,2,3]` or `[{...},{...}]`) — i.e. a value that
+#          survives the `$null -eq $obj` filter and reaches the `.IsArray` branch. An EMPTY root
+#          JSON array `[]` is NOT shape='array' under this seam: `ConvertFrom-Json '[]'` returns
+#          $null in PowerShell 7, which the shape helper catches BEFORE the array branch and
+#          bucketises as shape='empty' (see deploy/lib/Lease.ps1 §Read-JsonStateWithShape, the
+#          `if ($null -eq $obj)` guard). So `[]` and `[1,2,3]` land on DIFFERENT raw shapes even
+#          though they are both root arrays; both reach the same fail-closed verdict='unreadable'
+#          bucket under v4.1, but through different switch cases in Read-LeasesStateForTick.
+#          The shape='empty' pins — blank / whitespace / `[]` — live in the (d-7 companion)
+#          truncation-hazard block below, not here.
 #   (d-2)  SKIPPED HERE (write-fail is Set-JsonState throw; belongs to the caller's tick.
 #          The seam neither writes nor throws; the ledger row is preserved in P4-3(b) prose.)
 #   (d-3)  regression: valid file + mid-tick clear behaviour lives with Merge-LeasesStateForWrite,
