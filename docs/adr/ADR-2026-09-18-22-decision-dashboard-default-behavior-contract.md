@@ -2,7 +2,7 @@
 
 > **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
 
-- **Status**: Draft（本メモ着地時点。Takahito Tier-C 承認後に Accepted へ昇格）
+- **Status**: Accepted（Takahito Tier-C 承認 2026-09-18、`T-public-repo-carries-real-infra-values` msg-3408）
 - **Date**: 2026-09-18
 - **Scope**: mindwire wrapper（`deploy/run-conductor-scheduled.ps1`）が decision-material-push の dashboard base URL に用いる default value の contract を確立する。**新規 subject** — 既存 ADR は本トピックを持たない（`docs/adr/` 全文 grep 済、msg-current 実測）
 - **Author**: Heisenberg (implementer) — 起票 chatroom thread `T-public-repo-carries-real-infra-values`（Bohr msg-3391 §2 選定 → msg-3393 §0.3 β2 分岐 → Einstein 該当 turn endorsement）

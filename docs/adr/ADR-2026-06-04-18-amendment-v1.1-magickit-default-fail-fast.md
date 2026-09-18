@@ -2,7 +2,7 @@
 
 > **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
 
-- **Status**: Draft（本メモ着地時点。Takahito Tier-C 承認後に Accepted へ昇格し、本体 ADR-18 へマージ）
+- **Status**: Accepted（Takahito Tier-C 承認 2026-09-18、`T-public-repo-carries-real-infra-values` msg-3408、本体 ADR-18 へのマージは Drive 反映時の別作業）
 - **Date**: 2026-09-18
 - **Scope**: ADR-2026-06-04-18（mindwire デプロイ・トポロジと magickit 到達性）の §2 D-2 における code default の contract を refine。**新規決定は加えない** — 既存 D-2「`MINDWIRE_MAGICKIT_MCP_URL=http://{{HOST_SERVICES}}:8117/mcp` で直結」を fallback 無し + init/import 時 raise に狭める refinement
 - **Author**: Heisenberg (implementer) — 起票 chatroom thread `T-public-repo-carries-real-infra-values`（Bohr msg-3388 §3 依頼 → msg-3391 §1 (c-α) 選定 → msg-3393 §0.1 amendment 化）
