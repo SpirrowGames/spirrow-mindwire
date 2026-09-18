@@ -100,6 +100,15 @@ _IS_WINDOWS: bool = sys.platform == "win32"
 # --------------------------------------------------------------------------- #
 # PROCESS_TERMINATE (0x0001) — allow the Job to terminate the process.
 # PROCESS_SET_QUOTA (0x0100) — required by AssignProcessToJobObject.
+# PROCESS_QUERY_LIMITED_INFORMATION (0x1000) — required by IsProcessInJob.
+#   PR-gate #299 found the omission: opening a process handle with only
+#   PROCESS_TERMINATE | PROCESS_SET_QUOTA then calling IsProcessInJob raises
+#   ERROR_ACCESS_DENIED, which crashed the spawn verify on Windows and made
+#   the fallback belt's IsProcessInJob check silently skip every child. The
+#   verify path (is_process_in_job) and the belt (lookup_and_assign_leftover)
+#   both add this flag to their OpenProcess call; the proxy's OpenProcess
+#   only calls AssignProcessToJobObject and does NOT need it (Microsoft docs
+#   on AssignProcessToJobObject: PROCESS_TERMINATE | PROCESS_SET_QUOTA).
 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000) — the whole point of the Job:
 #   when the last handle closes, the OS kills every process in the Job.
 # JOB_OBJECT_LIMIT_BREAKAWAY_OK (0x0800) — set to 0 so no child can escape
@@ -108,6 +117,7 @@ _IS_WINDOWS: bool = sys.platform == "win32"
 # JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK (0x1000) — same, for silent breakaway.
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SET_QUOTA = 0x0100
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 # BREAKAWAY_OK and SILENT_BREAKAWAY_OK are opt-in flags: leaving them cleared
 # in ExtendedLimitInformation is what enforces "child cannot escape the Job".
@@ -247,8 +257,15 @@ def is_process_in_job(pid: int, job_state: JobState) -> bool:
     import win32api
     import win32job
 
+    # PROCESS_QUERY_LIMITED_INFORMATION is REQUIRED by IsProcessInJob (Microsoft
+    # docs, jobapi/nf-jobapi-isprocessinjob). Omitting it raised ACCESS_DENIED
+    # here and crashed spawn on every Windows session — PR-gate #299 blocker.
     try:
-        hproc = win32api.OpenProcess(_PROCESS_TERMINATE | _PROCESS_SET_QUOTA, False, pid)
+        hproc = win32api.OpenProcess(
+            _PROCESS_TERMINATE | _PROCESS_SET_QUOTA | _PROCESS_QUERY_LIMITED_INFORMATION,
+            False,
+            pid,
+        )
     except pywintypes.error:
         return False
     try:
@@ -299,8 +316,16 @@ def lookup_and_assign_leftover(job_state: JobState, exe_absolute_path: str) -> N
             continue
         if os.path.normcase(os.path.abspath(child_exe)) != normalized_target:
             continue
+        # PROCESS_QUERY_LIMITED_INFORMATION is required by IsProcessInJob (see
+        # is_process_in_job). PR-gate #299 blocker: without it the belt's
+        # IsProcessInJob raised ACCESS_DENIED and silently skipped every child,
+        # rendering the fallback useless — the exact opposite of its purpose.
         try:
-            hproc = win32api.OpenProcess(_PROCESS_TERMINATE | _PROCESS_SET_QUOTA, False, child.pid)
+            hproc = win32api.OpenProcess(
+                _PROCESS_TERMINATE | _PROCESS_SET_QUOTA | _PROCESS_QUERY_LIMITED_INFORMATION,
+                False,
+                child.pid,
+            )
         except pywintypes.error:
             continue
         try:

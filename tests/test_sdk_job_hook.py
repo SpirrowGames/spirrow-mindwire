@@ -328,3 +328,157 @@ def test_lookup_and_assign_leftover_is_noop_when_handle_none() -> None:
         pytest.skip("Windows-only enumeration path")
     state = JobState(handle=None, session_id="s1")
     _sdk_job_hook.lookup_and_assign_leftover(state, "claude.exe")
+
+
+# --------------------------------------------------------------------------- #
+# PR-gate #299 regression: IsProcessInJob's OpenProcess needs
+# PROCESS_QUERY_LIMITED_INFORMATION (0x1000). Omitting the flag raised
+# ACCESS_DENIED at IsProcessInJob and crashed spawn on every Windows session
+# (verify path) and silently skipped every child (belt path). These tests
+# pin the access mask so a future refactor that drops the flag reds here
+# instead of in production.
+# --------------------------------------------------------------------------- #
+
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+class _AccessRightsRecorder:
+    """Fake win32api that records the access-rights bitmask passed to OpenProcess.
+
+    Used to verify the caller supplied ``PROCESS_QUERY_LIMITED_INFORMATION``
+    before calling ``IsProcessInJob`` — the PR-gate #299 blocker.
+    """
+
+    def __init__(self) -> None:
+        self.open_access_masks: list[int] = []
+
+    def OpenProcess(  # noqa: N802
+        self, access: int, _inherit: bool, _pid: int
+    ) -> int:
+        self.open_access_masks.append(access)
+        return 0xC0DE
+
+    def CloseHandle(self, _handle: int) -> None:  # noqa: N802
+        return None
+
+
+class _FakeJobModuleWithVerify:
+    """Fake win32job for is_process_in_job / lookup path."""
+
+    def __init__(self) -> None:
+        self.is_in_job_answer = True
+
+    def IsProcessInJob(self, _hproc: int, _job_handle: int) -> bool:  # noqa: N802
+        return self.is_in_job_answer
+
+    def AssignProcessToJobObject(  # noqa: N802
+        self, _job_handle: int, _hproc: int
+    ) -> None:
+        return None
+
+
+def test_is_process_in_job_opens_process_with_query_limited_information(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-gate #299 blocker: IsProcessInJob's handle needs the query right.
+
+    Without ``PROCESS_QUERY_LIMITED_INFORMATION`` (0x1000) in the
+    OpenProcess access mask, ``IsProcessInJob`` raises ACCESS_DENIED at
+    runtime. That crashed the spawn verify on every Windows session on the
+    first PR-299 revision; this test reds if the flag is ever dropped.
+    """
+    if not _IS_WINDOWS:
+        pytest.skip("Windows-only Job Object primitive")
+
+    class _FakePywintypes:
+        class error(Exception):  # noqa: N801, N818
+            pass
+
+    rec = _AccessRightsRecorder()
+    monkeypatch.setitem(sys.modules, "win32api", rec)
+    monkeypatch.setitem(sys.modules, "win32job", _FakeJobModuleWithVerify())
+    monkeypatch.setitem(sys.modules, "pywintypes", _FakePywintypes)
+
+    state = JobState(handle=0xB0B, session_id="s1")
+    _sdk_job_hook.is_process_in_job(1234, state)
+
+    assert len(rec.open_access_masks) == 1
+    access = rec.open_access_masks[0]
+    assert access & _PROCESS_QUERY_LIMITED_INFORMATION, (
+        f"OpenProcess called with 0x{access:04X}; must include "
+        f"PROCESS_QUERY_LIMITED_INFORMATION (0x{_PROCESS_QUERY_LIMITED_INFORMATION:04X}) "
+        f"or IsProcessInJob raises ACCESS_DENIED (PR-gate #299)"
+    )
+
+
+def test_lookup_and_assign_leftover_opens_process_with_query_limited_information(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-gate #299 blocker: the belt's IsProcessInJob check needs the same flag.
+
+    Without ``PROCESS_QUERY_LIMITED_INFORMATION`` the belt's IsProcessInJob
+    raised ACCESS_DENIED and the caller's ``except pywintypes.error`` silently
+    swallowed it — the fallback then skipped every child instead of
+    Assigning the leftover claude.exe to the Job. That defeated the whole
+    v12 §Einstein-round-5 finally-runs-lookup guarantee.
+    """
+    if not _IS_WINDOWS:
+        pytest.skip("Windows-only enumeration path")
+
+    class _FakePywintypes:
+        class error(Exception):  # noqa: N801, N818
+            pass
+
+    class _FakeChild:
+        def __init__(self, pid: int, exe_path: str) -> None:
+            self.pid = pid
+            self._exe = exe_path
+
+        def exe(self) -> str:
+            return self._exe
+
+    class _FakeProc:
+        def __init__(self, children: list[_FakeChild]) -> None:
+            self._children = children
+
+        def children(self) -> list[_FakeChild]:
+            return self._children
+
+    class _FakePsutil:
+        class NoSuchProcess(Exception):  # noqa: N818
+            pass
+
+        class AccessDenied(Exception):  # noqa: N818
+            pass
+
+        def __init__(self, children: list[_FakeChild]) -> None:
+            self._children = children
+
+        def Process(self, _pid: int) -> _FakeProc:  # noqa: N802
+            return _FakeProc(self._children)
+
+    import os as _os
+
+    fake_exe = _os.path.abspath("claude.exe")
+    fake_child = _FakeChild(pid=9999, exe_path=fake_exe)
+
+    rec = _AccessRightsRecorder()
+    fake_job = _FakeJobModuleWithVerify()
+    fake_job.is_in_job_answer = False  # force the belt to attempt an Assign
+    monkeypatch.setitem(sys.modules, "win32api", rec)
+    monkeypatch.setitem(sys.modules, "win32job", fake_job)
+    monkeypatch.setitem(sys.modules, "pywintypes", _FakePywintypes)
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil([fake_child]))
+
+    state = JobState(handle=0xB0B, session_id="s1")
+    _sdk_job_hook.lookup_and_assign_leftover(state, fake_exe)
+
+    assert len(rec.open_access_masks) == 1
+    access = rec.open_access_masks[0]
+    assert access & _PROCESS_QUERY_LIMITED_INFORMATION, (
+        f"belt OpenProcess called with 0x{access:04X}; must include "
+        f"PROCESS_QUERY_LIMITED_INFORMATION (0x{_PROCESS_QUERY_LIMITED_INFORMATION:04X}) "
+        f"or IsProcessInJob raises ACCESS_DENIED and every child is skipped "
+        f"(PR-gate #299)"
+    )
