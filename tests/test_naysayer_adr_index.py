@@ -395,7 +395,10 @@ def test_amendment_marker_skip_set_is_pinned_to_this_tree() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     body_dir = repo_root / _ADR_BODY_DIR
     skipped = sorted(p.name for p in body_dir.glob("*.md") if _AMENDMENT_MARKER in p.name.lower())
-    assert skipped == ["ADR-2026-05-21-06-amendment-v2.2-i3-author-instance-id.md"], (
+    assert skipped == [
+        "ADR-2026-05-21-06-amendment-v2.2-i3-author-instance-id.md",
+        "ADR-2026-06-04-18-amendment-v1.1-magickit-default-fail-fast.md",
+    ], (
         f"the set of docs/adr/ files hidden from the in-repo drift check changed: {skipped}. "
         f"Two ways forward, and they are not interchangeable. (a) If the new file really is "
         f"an amendment memo, add it to the expected list here — and note that "

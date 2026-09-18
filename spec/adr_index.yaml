@@ -101,3 +101,6 @@ adrs:
   - id: ADR-2026-09-14-21
     title: "Fermi identity — claude.ai 対話セッションを 4 レイヤーモデルに組み込む"
     body: repo:docs/adr/ADR-2026-09-14-21-fermi-identity.md
+  - id: ADR-2026-09-18-22
+    title: "decision-material-push dashboard URL の default behavior contract（env 必須、fail-fast）"
+    body: repo:docs/adr/ADR-2026-09-18-22-decision-dashboard-default-behavior-contract.md
