@@ -22,7 +22,7 @@
 ```powershell
 $DecisionDashboardBaseUrl = if ($env:MINDWIRE_DECISION_DASHBOARD_URL) {
     $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
-} else { 'https://{{HOST_SERVICES}}.{{TAILNET_DOMAIN}}:8443' }
+} else { 'https://{{HOST_SERVICES}}.<tailnet MagicDNS domain — registry gap G4>:8443' }
 ```
 
 `else` 分岐が hardcoded fallback として実 tailnet URL を持っている。この URL は `New-DecisionLink`（Discord 通知に載る human-facing dashboard link）と `New-MaterialUrl`（magickit `/v1/decisions/.../material` への PUT target）の両方を組み立てる SOT である。
@@ -53,7 +53,7 @@ $DecisionDashboardBaseUrl = if ($env:MINDWIRE_DECISION_DASHBOARD_URL) {
 
 deploy operator は `MINDWIRE_DECISION_DASHBOARD_URL` を `[[platform:infra-registry]]` から解決した実値で set する。set 方法は既存 secret 管理と同じ pattern（PowerShell の persistent user env var、`Vaultwarden` sourced が推奨、`deploy/run-conductor.ps1:37-39` の `MINDWIRE_NAYSAYER_GITHUB_TOKEN` と同型）。
 
-registry 台帳の側での `{{HOST_LOOP_TAILNET_MAGICDNS}}` 型の placeholder 対応は本 ADR の scope 外（`T-public-repo-carries-real-infra-values` msg-2734 §5.1 の G4「tailnet MagicDNS ドメインが台帳にも §5.1 パターンにも無い」問題、別スレッド案件）。
+registry 台帳側での **tailnet MagicDNS FQDN 用 placeholder** の追加は本 ADR の scope 外（`T-public-repo-carries-real-infra-values` msg-2734 §5.1 の G4「tailnet MagicDNS ドメインが台帳にも §5.1 パターンにも無い」問題、別スレッド案件。具体的な placeholder 名は spirrow-docs 側の判断で決まる ∴ 本 ADR で先取り命名しない）。
 
 ### D-3: silent misroute への対策 — human-facing link を fail-open 対象から除外
 
