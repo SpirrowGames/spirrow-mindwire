@@ -1550,8 +1550,10 @@ Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdic
 #          (a-valid) shape='object' path — that corner case is out of scope for (d-1) and is
 #          not injected here.
 #          Source of truth for the raw-shape mapping: deploy/lib/Lease.ps1 §Read-JsonStateWithShape
-#          L1516-1548. The shape='empty' pins — blank / whitespace / `[]` — live in the (d-7
-#          companion) truncation-hazard block below, not here.
+#          (function name only — line numbers deliberately omitted to avoid drift-with-refactor
+#          dual-management between this comment and that file). The shape='empty' pins —
+#          blank / whitespace / `[]` — live in the (d-7 companion) truncation-hazard block
+#          below, not here.
 #   (d-2)  SKIPPED HERE (write-fail is Set-JsonState throw; belongs to the caller's tick.
 #          The seam neither writes nor throws; the ledger row is preserved in P4-3(b) prose.)
 #   (d-3)  regression: valid file + mid-tick clear behaviour lives with Merge-LeasesStateForWrite,
