@@ -1531,17 +1531,27 @@ Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdic
 #
 # ROW-BY-ROW MAPPING:
 #   (d-1)  inject shape ∈ {array, scalar, parse-error} -> lease-requiring disposition, flush skipped
-#          NB: the shape word 'array' here means the RAW shape Read-JsonStateWithShape emits for
-#          a NON-empty root JSON array (e.g. `[1,2,3]` or `[{...},{...}]`) — i.e. a value that
-#          survives the `$null -eq $obj` filter and reaches the `.IsArray` branch. An EMPTY root
-#          JSON array `[]` is NOT shape='array' under this seam: `ConvertFrom-Json '[]'` returns
-#          $null in PowerShell 7, which the shape helper catches BEFORE the array branch and
-#          bucketises as shape='empty' (see deploy/lib/Lease.ps1 §Read-JsonStateWithShape, the
-#          `if ($null -eq $obj)` guard). So `[]` and `[1,2,3]` land on DIFFERENT raw shapes even
-#          though they are both root arrays; both reach the same fail-closed verdict='unreadable'
-#          bucket under v4.1, but through different switch cases in Read-LeasesStateForTick.
-#          The shape='empty' pins — blank / whitespace / `[]` — live in the (d-7 companion)
-#          truncation-hazard block below, not here.
+#          NB: the shape word 'array' here has a NARROW meaning driven by PowerShell 7's
+#          ConvertFrom-Json unwrap semantics. shape='array' is emitted only for root JSON arrays
+#          whose deserialised value survives the `$null -eq $obj` filter, is NOT a PSCustomObject,
+#          AND reaches the `.IsArray` branch — in practice, arrays of length ≥ 2 (e.g. `[1,2,3]`).
+#          Length-0 and length-1 root arrays land on OTHER raw shapes because ConvertFrom-Json
+#          unwraps them before we reach type discrimination:
+#            - `[]`         → ConvertFrom-Json emits 0 items to the pipeline → `$obj` = $null
+#                             → caught by the `$null -eq $obj` guard        → shape='empty'
+#            - `[1]`        → unwrapped to a bare Int32 (1)                 → shape='scalar'
+#            - `[{"a":1}]`  → unwrapped to a bare PSCustomObject            → shape='object'
+#            - `[1,2,3]`    → System.Object[]                               → shape='array'
+#          So a root array's raw shape is NOT determined by its rootedness alone; it is determined
+#          by what ConvertFrom-Json leaves in `$obj` after unwrap. This (d-1) block's array pin
+#          therefore uses a length-≥2 input — see L1634 for the actual fixture
+#          (`[{"editor":"x"},{"foo":"y"}]`, two elements, stays as System.Object[]). All four
+#          bullets above route to verdict='unreadable' EXCEPT `[{"a":1}]`, which lands on the
+#          (a-valid) shape='object' path — that corner case is out of scope for (d-1) and is
+#          not injected here.
+#          Source of truth for the raw-shape mapping: deploy/lib/Lease.ps1 §Read-JsonStateWithShape
+#          L1516-1548. The shape='empty' pins — blank / whitespace / `[]` — live in the (d-7
+#          companion) truncation-hazard block below, not here.
 #   (d-2)  SKIPPED HERE (write-fail is Set-JsonState throw; belongs to the caller's tick.
 #          The seam neither writes nor throws; the ledger row is preserved in P4-3(b) prose.)
 #   (d-3)  regression: valid file + mid-tick clear behaviour lives with Merge-LeasesStateForWrite,
