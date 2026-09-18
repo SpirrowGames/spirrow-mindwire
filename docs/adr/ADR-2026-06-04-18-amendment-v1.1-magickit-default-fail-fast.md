@@ -4,7 +4,7 @@
 
 - **Status**: Accepted（Takahito Tier-C 承認 2026-09-18、`T-public-repo-carries-real-infra-values` msg-3408、本体 ADR-18 へのマージは Drive 反映時の別作業）
 - **Date**: 2026-09-18
-- **Scope**: ADR-2026-06-04-18（mindwire デプロイ・トポロジと magickit 到達性）の §2 D-2 における code default の contract を refine。**新規決定は加えない** — 既存 D-2「`MINDWIRE_MAGICKIT_MCP_URL=http://{{HOST_SERVICES}}:8117/mcp` で直結」を fallback 無し + init/import 時 raise に狭める refinement
+- **Scope**: ADR-2026-06-04-18（mindwire デプロイ・トポロジと magickit 到達性）の §2 D-2 における code default の contract を refine。**新規決定は加えない** — 既存 D-2「`MINDWIRE_MAGICKIT_MCP_URL=http://{{HOST_SERVICES}}:8117/mcp` で直結」を fallback 無し + `MagickitMcp.__init__` 時 raise に狭める refinement
 - **Author**: Heisenberg (implementer) — 起票 chatroom thread `T-public-repo-carries-real-infra-values`（Bohr msg-3388 §3 依頼 → msg-3391 §1 (c-α) 選定 → msg-3393 §0.1 amendment 化）
 - **Relates to**:
   - **ADR-2026-06-04-18 §2 D-2**（本 ADR の base）— `MINDWIRE_MAGICKIT_MCP_URL` の topology 記述と直結パス
@@ -31,7 +31,7 @@ ADR-18 v1.0 §2 D-2 は「mindwire は `MINDWIRE_MAGICKIT_MCP_URL=http://{{HOST_
 
 | 選択肢 | 判定 | 根拠 |
 |---|---|---|
-| **(c-α) env 必須、init/import 時 raise（本改訂の採用案）** | **採用** | ADR-18 D-1（reachability 不変条件）に整合。value を code から消せる ∴ public repo の値露出を機構的に解消。unset は loud 失敗、silent misroute より遥かに安全 |
+| **(c-α) env 必須、`MagickitMcp.__init__` 時 raise（本改訂の採用案）** | **採用** | ADR-18 D-1（reachability 不変条件）に整合。value を code から消せる ∴ public repo の値露出を機構的に解消。unset は loud 失敗、silent misroute より遥かに安全 |
 | (c-β) localhost fallback | **却下** | ADR-18 §1.1 で「mindwire loop host ≠ magickit host」が確立 ∴ localhost fallback は**常に間違った先を指す**。dev-only の便利さすら本 topology では存在しない |
 | (c-γ) 起動時に registry を fetch | **却下** | code に registry parser + fetch を持ち込む ∴ 外部依存 + 起動時 network 前提。**本 repo に registry を読める runtime が無い**（`[[platform:infra-registry]]` は human-readable tombstone）。registry parser 自体が新規 code path として test/gate 対象になる |
 
@@ -49,7 +49,7 @@ ADR-18 v1.0 §2 D-2 は「mindwire は `MINDWIRE_MAGICKIT_MCP_URL=http://{{HOST_
 
 **D-2 v1.1（改訂後、追加句のみを示す。既存文は無変更）**:
 
-> …mindwire は `MINDWIRE_MAGICKIT_MCP_URL=http://{{HOST_SERVICES}}:8117/mcp`（or tailnet IP）で直結。**当該 env は必須**（unset 時は init/import 時に `MagickitMcpError` を raise、fallback は持たない）。**理由**: 既定値が code に埋まると (i) public repo に infra topology が landing する（`T-public-repo-carries-real-infra-values`）、(ii) env 未設定 deploy で silent misroute が起きる（ADR-18 §1.1 で loop host ≠ magickit host が確立している以上、localhost fallback は常に誤り）。loud 失敗が silent misroute より安全。
+> …mindwire は `MINDWIRE_MAGICKIT_MCP_URL=http://{{HOST_SERVICES}}:8117/mcp`（or tailnet IP）で直結。**当該 env は必須**（unset 時は `MagickitMcp.__init__` の呼び出し時に `MagickitMcpError` を raise、fallback は持たない。**module import 時ではない** — test fixture が env を pytest fixture 経由で set できるよう、検証は class の instance 化時点まで遅延する）。**理由**: 既定値が code に埋まると (i) public repo に infra topology が landing する（`T-public-repo-carries-real-infra-values`）、(ii) env 未設定 deploy で silent misroute が起きる（ADR-18 §1.1 で loop host ≠ magickit host が確立している以上、localhost fallback は常に誤り）。loud 失敗が silent misroute より安全。
 
 ### 2.2 §2 D-1（不変条件）は無変更
 
