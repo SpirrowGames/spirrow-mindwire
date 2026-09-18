@@ -1390,6 +1390,21 @@ def prepend_gate_notice(body: str, decision: VerdictDecision) -> str:
     return f"{notice}\n\n{body}"
 
 
+# Programmatic self-identifier stamped at the very top of every review body posted by
+# ``scripts/naysayer_review_scoped.py`` (F-1: T-scoped-driver-verdict-never-reaches-chatroom
+# msg-3379). Detectors and orphan-review anomaly alarms MUST use
+# ``body.startswith(SCOPED_REVIEW_BODY_MARKER)`` on this exact string to distinguish
+# scoped-driver reviews from gate-path reviews without relying on LLM-output body-text
+# heuristics ("the scope" / "adjudicated scope" etc. are conversational tokens the gate
+# path can also emit — false-positive risk). HTML-comment shape: rendered as empty by
+# GitHub's markdown renderer (no UI clutter), preserved verbatim in the API's raw ``body``
+# field so a ``startswith`` check is deterministic. Stamped BEFORE ``prepend_gate_notice``
+# in the caller so the marker stays at index 0 even when the gate notice prepends the
+# body under truncation / length-cap paths. Do NOT edit this literal without updating
+# ``docs/gate-validity-and-crossthread-rules.md`` (F-1) in the same commit.
+SCOPED_REVIEW_BODY_MARKER = "<!-- naysayer:scoped-driver -->"
+
+
 def _ci_gate_response(ci: CiStatus, pr_slug: str) -> tuple[ReviewEvent, str]:
     """Map a non-green CI state to a (verdict, body) — the L1 gate (ADR-16 §D-2).
 
