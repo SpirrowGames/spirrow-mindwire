@@ -28,8 +28,22 @@ raises ``MagickitMcpError`` during daemon startup for both ``run_loop`` and
 is a property of where the client is constructed, not a promise this
 function makes: any caller that defers ``StreamableHttpChatroomMcp()`` to
 a later code path (an on-demand script, a lazy component) would see the
-same error surface at that later moment. The wrapper comment describes
-the timing accordingly.
+same error surface at that later moment.
+
+**Process-exit behaviour** (PR #296 pr-gate advisory, msg-3516): for
+``MINDWIRE_MAGICKIT_MCP_URL`` specifically, the composition-root
+construction means the ``MagickitMcpError`` propagates out of
+``asyncio.run(run_*(...))`` before the event loop settles into its poll or
+task-thread, and :func:`spirrow_mindwire.loop_runner.main`'s
+``except BaseException`` re-raises for this class (``find_sdk_error_signal``
+returns ``None``), so the Python default excepthook prints the traceback and
+the process exits non-zero. This holds for BOTH ``run_loop`` (watcher) and
+``run_conductor`` because both invoke ``_build_dispatcher`` before
+delegating to their respective event loops. Other env-required infra values
+that are consumed LATER (e.g. ``MINDWIRE_NAYSAYER_BASE_URL``, validated at
+``NaysayerSdkAdapter.spawn`` when a naysayer is summoned) have a mode-
+dependent exit story — the wrapper comment enumerates it. Do not
+generalise this function's startup-fail property to those other variables.
 
 :class:`StreamableHttpChatroomMcp` does real network I/O and is therefore
 exercised only by the ``-m manual`` smoke test (PR-G), not CI; the pure

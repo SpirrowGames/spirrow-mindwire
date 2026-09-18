@@ -60,9 +60,40 @@ if (-not $env:MINDWIRE_IMPLEMENTER_BASE_URL) { $env:MINDWIRE_IMPLEMENTER_BASE_UR
 #
 # The operator resolves the required values from [[platform:infra-registry]] and sets them
 # (persistent user env var sourced from Vaultwarden, mirroring the MINDWIRE_NAYSAYER_GITHUB_TOKEN
-# secret handling below). A misconfigured daemon that reaches the naysayer summon path will
-# exit non-zero at that call; a misconfigured daemon whose magickit URL is missing will not
-# even complete startup.
+# secret handling below). What "fail loud" means for each variable depends on WHERE Python raises
+# and WHICH mode this wrapper launches — the wrapper launches ``mindwire-loop --mode conductor``
+# (see the ``uv run`` line at the bottom of this file), so the guarantees below hold for THIS
+# wrapper specifically; a different wrapper that launches ``--mode watcher`` would see different
+# behaviour, called out inline where it diverges (see PR #296 pr-gate advisory, msg-3516):
+#
+#   * MAGICKIT_MCP_URL missing → the daemon fails during startup, before any event loop entry.
+#     ``StreamableHttpChatroomMcp()`` is constructed inside the composition root
+#     (``spirrow_mindwire.loop_runner._build_dispatcher``), so the ``MagickitMcpError`` propagates
+#     out of ``asyncio.run(run_conductor(...))`` (or ``asyncio.run(run_loop(...))`` under watcher
+#     mode; magickit URL is composition-root-checked in BOTH modes) and the process exits non-zero
+#     via the default excepthook (``spirrow_mindwire.loop_runner.main``'s ``except BaseException``
+#     re-raises for this class of error). Operator-visible: within seconds of ``uv run`` starting.
+#
+#   * NAYSAYER_BASE_URL missing → the failure timing depends on the mode:
+#       - CONDUCTOR mode (what THIS wrapper launches): ``Conductor.run()`` awaits
+#         ``spawn_instance`` sequentially — no ``asyncio.create_task``, no per-turn task-exception
+#         swallow — so a ``NaysayerSdkSpawnError`` at the first naysayer summon propagates through
+#         ``run_conductor`` (unwrapped except a ``finally`` for teardown) into ``asyncio.run``, out
+#         to ``main``, and the process exits non-zero. Operator-visible: when the design thread
+#         first summons a naysayer. If the conductor's task_thread reaches a stop condition
+#         without ever summoning one, the misconfiguration is not surfaced by this wrapper's run.
+#       - WATCHER mode (NOT launched here — flagged so operators forking this file for
+#         ``--mode watcher`` do not inherit a false expectation): ``ChatroomWatcher.run`` wraps
+#         each ``poll_once()`` in ``except Exception: logger.exception("chatroom poll failed;
+#         continuing")`` (see ``src/spirrow_mindwire/magickit/watcher.py`` line ~224). Under that
+#         swallow the daemon does NOT exit — the same ``NaysayerSdkSpawnError`` recurs every
+#         ``poll_interval_seconds`` in the log while process supervisors see a healthy daemon.
+#         Only a startup-time validation (or narrowing the watcher's except to exclude spawn-time
+#         config faults) would make watcher-mode fail loud on this variable. Out of scope for
+#         this wrapper; recorded here so the divergence is visible.
+#
+#   * LEXORA_URL missing → no failure. Falls back to the safe-by-design loopback default (see
+#     the LEXORA row in the block above).
 
 # --- secret precondition (fail loud, never hardcode) -------------------------------------------
 if (-not $env:MINDWIRE_NAYSAYER_GITHUB_TOKEN) {
