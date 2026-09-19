@@ -113,8 +113,10 @@ class Stage3ProposerAdapter(ClaudeCodeSdkAdapter):
 
     It was text-only (``tools=[]``) until it turned out that a proposer which
     cannot open a file cannot check a claim either; see
-    :data:`_PROPOSER_BUILTIN_TOOLS` for what it may now read and why that does
-    not touch the reasoning below.
+    :data:`_BOHR_BUILTIN_TOOLS` for what the persona currently playing this
+    role may read, and the block comment above that constant for why the
+    persona-scoped tool面 does not by itself touch the role-level invariant
+    reasoned about below.
 
     Why: the registry's Phase 1 ``qualified_for`` is "first qualified", and the
     base adapter declares ``EXECUTE_CODE`` (T16's dual-use, one adapter filling
@@ -266,35 +268,55 @@ def _assert_role_resolution(
         )
 
 
-# The proposer designs against this repository, so it has to be able to READ it.
-# It could not: the adapter passed ``tools=[]``, which disables every built-in,
-# and the proposer's own turn on T-fs-delete-path-scope (msg-1197) stopped with
+# The Bohr persona (the daemon-hosted persona that currently plays the proposer
+# role) designs against this repository, so it has to be able to READ it. It
+# could not: the adapter passed ``tools=[]``, which disables every built-in,
+# and Bohr's own turn on T-fs-delete-path-scope (msg-1197) stopped with
 # "read 系 tool の実行権限が下りず、一次照合を一切行えていない" — it declined to
 # design rather than guess, which is right, and then nothing moved. The Einstein
 # review of that turn endorsed the refusal. So the gap is here, not there.
 #
-# Read / Glob / Grep only. No Write, no Edit, no Bash: a proposer that can change
-# the tree is an implementer, and the Stage 3 split says only the implementer
-# executes, behind the allow-list. ``capabilities`` is untouched — it is a class
-# attribute, independent of this list — so PROPOSER stays the only slot this
-# adapter qualifies for and the IMPLEMENTER slot still resolves unambiguously to
-# the gated adapter. That was the whole reason the class drops ``EXECUTE_CODE``;
-# reading files was never what it was protecting against.
+# The list is **persona-scoped, not role-scoped** (Takahito msg-3507: "Bohr
+# であることと PROPOSER であることは必ずしも一致しない"; ADR-2026-05-27-09 identity
+# 4 layers puts ``identity_name`` (persona) and ``role`` on orthogonal axes).
+# What lives here is Bohr's built-in tool面 for its current embodiment; the
+# role-level invariant "a proposer role adapter cannot change the tree" is
+# enforced on a different axis and belongs to the role adapter's contract, not
+# to this list. Concretely the role invariant is upheld by three separate
+# things: (a) :class:`Stage3ProposerAdapter` drops ``EXECUTE_CODE`` from
+# ``capabilities`` so PROPOSER is the only registry slot it qualifies for and
+# the IMPLEMENTER slot resolves unambiguously to the allow-list-gated adapter;
+# (b) the ``can_use_tool`` guard injected at :func:`build_proposer` (currently
+# :class:`_PathScopeGuard`, whose ``scopeable_tools`` frozenset admits only
+# ``Read`` / ``Glob`` / ``Grep``) refuses anything it cannot bound; (c) the
+# tests at :file:`tests/test_loop_runner.py` that assert Bohr's persona tool
+# 面 today does not include write/execute tools. Widening this list to add a
+# new tool for Bohr therefore does *not* by itself widen the role — the guard
+# still has to admit the tool for it to actually run through the adapter.
 #
-# They are auto-approved because a call that is not auto-approved goes to an
-# interactive permission prompt, and nobody is there to answer it — which is
-# exactly the "permission denied" the proposer reported. That is a property of
-# running headless, not of whether a guard exists: the ``can_use_tool`` guard
-# injected below still runs on every call, and is where the bound lives.
-_PROPOSER_BUILTIN_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
+# Read / Glob / Grep is the current persona 面. They are auto-approved because
+# a call that is not auto-approved goes to an interactive permission prompt,
+# and nobody is there to answer it — which is exactly the "permission denied"
+# Bohr reported. That is a property of running headless, not of whether a
+# guard exists: the ``can_use_tool`` guard injected below still runs on every
+# call, and is where the bound lives.
+_BOHR_BUILTIN_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
 
 
 def build_proposer(repo_dir: Path) -> Stage3ProposerAdapter:
-    """Proposer with read-only access to ``repo_dir`` (same model family as ``main``)."""
+    """Proposer with read-only access to ``repo_dir`` (same model family as ``main``).
+
+    The tool list wired here is Bohr's persona-scoped built-in tool面
+    (:data:`_BOHR_BUILTIN_TOOLS`); the role-level "proposer cannot change the
+    tree" invariant lives on other axes (see the block comment above the
+    constant). The path-scope guard installed here is the seam that enforces
+    the intersection of the two — the persona can only actually invoke a tool
+    the guard admits.
+    """
     return Stage3ProposerAdapter(
         cwd=repo_dir,
-        builtin_tools=_PROPOSER_BUILTIN_TOOLS,
-        allowed_tools=list(_PROPOSER_BUILTIN_TOOLS),
+        builtin_tools=_BOHR_BUILTIN_TOOLS,
+        allowed_tools=list(_BOHR_BUILTIN_TOOLS),
         # The scope is decided here, where the role is known — the adapter has no
         # way to tell a filesystem path from an MCP tool's URI-shaped ``path``,
         # so it is not asked to guess. `allowed_tools` auto-approves, which is
