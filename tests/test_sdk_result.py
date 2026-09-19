@@ -442,17 +442,625 @@ def test_permission_denials_projection_readability_reason_reaches_the_marker() -
     assert captured != "list(len=1)"
     assert isinstance(captured, list)
     assert len(captured) == 1
-    # The denial content is legible in the projected element.
+    # The denial content is legible in the projected element. Both keys and
+    # values are wrapped in ``json.dumps``-style quotes so a value containing
+    # spaces (``git push origin main``) has unambiguous boundaries (msg-3231
+    # legibility objection / msg-3326 revision / msg-3328 substitution) and
+    # a key containing a control character cannot split the marker line
+    # (PR #288 PR-gate follow-up: symmetric json.dumps on keys).
     element = captured[0]
     assert isinstance(element, str)
-    assert "tool_name=Bash" in element
-    assert "rule=branch-protection" in element
-    assert "git push origin main" in element
+    assert '"tool_name"="Bash"' in element
+    assert '"rule"="branch-protection"' in element
+    assert '"tool_input"="git push origin main"' in element
 
     # Picker treats the denial as a real reason (it is one).
     assert detail["reason_source"] == "field:permission_denials"
     # Sanity: the marker's message string carries the denial too.
     assert "Bash" in detail["message"]
+
+
+def test_permission_denials_projection_escapes_quotes_backslashes_and_newlines() -> None:
+    """Escape pin (msg-3328 §4): ``"``, ``\\``, and ``\\n`` in a denial value
+    must not break the marker's quoting or its line-integrity.
+
+    Einstein's msg-3327 blocking objection: the earlier hand-rolled escaper
+    (msg-3326 revision) only handled ``"`` and ``\\`` — a newline in a
+    denial value (trivial to produce from any tool output pinned into a
+    permission decision) would land verbatim in the marker and split the
+    log line, desynchronising every line-oriented reader downstream.
+
+    Fix (msg-3328): use ``json.dumps`` on the stringified value, which
+    normalises every control character (``\\n``, ``\\r``, ``\\t``, and the
+    rest) and every character that could break the outer double-quote
+    boundary. This test is the load-bearing pin — if a future change swaps
+    ``json.dumps`` out for something newline-unsafe, the final assertion
+    (no ``\\n`` byte anywhere in the rendered field) fails loudly.
+    """
+    denial = {
+        "tool_name": 'Bash "sub"',
+        "tool_input": "line1\nline2",
+        "rule": "back\\slash",
+    }
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    element = captured[0]
+    assert isinstance(element, str)
+
+    # Inner ``"`` is escaped as ``\"`` (two characters), so the outer
+    # double-quote boundary stays unambiguous.
+    assert r'"tool_name"="Bash \"sub\""' in element
+
+    # Inner ``\`` is escaped as ``\\`` (two characters).
+    assert r'"rule"="back\\slash"' in element
+
+    # Inner newline is escaped as the literal two-character sequence ``\n``,
+    # NOT rendered as an embedded LF byte.
+    assert r'"tool_input"="line1\nline2"' in element
+
+    # The load-bearing line-integrity assertion: no raw newline byte anywhere
+    # in the rendered field. This is what Einstein's objection specifically
+    # required — a log parser reading one marker per line must not see this
+    # field split across multiple lines.
+    assert "\n" not in element
+    assert "\r" not in element
+
+
+def test_permission_denials_projection_escapes_control_chars_in_keys() -> None:
+    """PR #288 PR-gate follow-up: KEYS containing control characters must
+    also not split the marker line.
+
+    The msg-3328 revision applied ``json.dumps`` to values only; the PR-gate
+    naysayer identified that the SDK types the field as ``list[Any]`` and
+    the CLI populates dict elements from an untrusted CLI JSON blob whose
+    key shape is not enforced, so an input mapping can easily contain a key
+    like ``{"bad\\nkey": "value"}``. If the key were injected raw into the
+    f-string, that newline would be emitted verbatim and split the log line
+    — reintroducing the exact defect this whole PR exists to fix.
+
+    Fix pinned here: apply ``json.dumps(str(k))`` symmetrically to keys, so
+    the same line-integrity invariant holds on both sides of ``=``.
+    """
+    denial = {
+        "bad\nkey": "safe-value",
+        "tab\tkey": "another",
+        'quote"key': "third",
+    }
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    element = captured[0]
+    assert isinstance(element, str)
+
+    # No raw control byte anywhere — this is the invariant the PR-gate
+    # objection specifically named.
+    assert "\n" not in element
+    assert "\r" not in element
+    assert "\t" not in element
+
+    # Each key is JSON-escaped inside its quotes: newline becomes literal
+    # ``\n`` (two characters), tab becomes literal ``\t``, quote becomes
+    # ``\"``. The outer ``"..."="..."`` boundary is preserved on both sides.
+    assert r'"bad\nkey"="safe-value"' in element
+    assert r'"tab\tkey"="another"' in element
+    assert r'"quote\"key"="third"' in element
+
+
+def test_permission_denials_projection_truncates_at_pair_boundaries_not_mid_quote() -> None:
+    """PR #288 PR-gate follow-up (blocking correctness): a joined pair-text
+    that exceeds ``_FIELD_VALUE_MAX_LEN`` must NOT be sliced mid-quote by
+    the outer ``_summarize_value`` truncation.
+
+    The msg-3334 revision wrapped every key and every value in ``json.dumps``
+    for line-integrity and legibility. That made the marker's format
+    structurally-quoted, so a quote-aware log reader (``shlex.split``,
+    JSON-fragment parsers, ...) relies on every ``"..."`` span being
+    closed. But ``_summarize_value``'s string branch truncates blindly at
+    ``_FIELD_VALUE_MAX_LEN``: if the joined pair-text exceeds the cap, the
+    truncation could sever a closing ``"`` or split a ``\\uXXXX`` escape
+    sequence in half — reintroducing structural invalidity from a different
+    angle than the newline defects the earlier revisions fixed.
+
+    Fix pinned here: pair-boundary-aware truncation inside
+    ``_project_denial_element`` (:func:`_join_pairs_bounded`), with a
+    ``…(+K pairs truncated)`` footer so the drop is a diagnostic surface
+    (one long pair dropped vs. many short pairs dropped is distinguishable
+    to a reader).
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    # Force overflow: many pairs whose joined length vastly exceeds
+    # _FIELD_VALUE_MAX_LEN. Each key + value pair is small enough on its
+    # own to fit; it's the join that pushes past the cap.
+    denial = {f"key_{i:03d}": ("v" * 40) for i in range(30)}
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    element = captured[0]
+    assert isinstance(element, str)
+
+    # Overflow fired: the pair-boundary truncator dropped at least some pairs
+    # and marked the count. Without this footer, a reader cannot tell "one
+    # very long pair" from "twenty short pairs" (which the plain
+    # `_summarize_value` `...(+Nch)` footer conflates).
+    assert "pairs truncated)" in element, f"expected pair-truncation footer; got: {element!r}"
+
+    # Structural pin: the element ends with the footer (which ends in ``)``),
+    # not mid-pair. If a blind truncation had fired, the element would end
+    # mid-token (e.g., ``"key_012"="vvv``) with an unclosed quote span.
+    assert element.endswith("pairs truncated)"), (
+        f"element ended mid-pair or footer misformed: {element!r}"
+    )
+
+    # Every ``"`` in the element belongs to a properly-closed pair. The
+    # projected form is ``"K1"="V1" "K2"="V2" …(+N pairs truncated)``; each
+    # pair contributes exactly 4 raw quote characters (``"K"="V"``), and the
+    # footer contributes none. So the count must be a multiple of 4.
+    # (A ``\"`` inside a value adds 1 to the raw count, so this test
+    # deliberately uses value strings that contain no ``"`` — the pin is
+    # about truncation-induced imbalance, not escape-encoded quotes.)
+    raw_quote_count = element.count('"')
+    assert raw_quote_count % 4 == 0, (
+        f"quote count {raw_quote_count} is not a multiple of 4 — "
+        f"a pair boundary was severed. element={element!r}"
+    )
+
+    # And the whole thing still fits inside the per-field cap that the
+    # pipeline's ``bounded is bounded`` invariant demands.
+    assert len(element) <= _FIELD_VALUE_MAX_LEN + len("…(+999999ch)"), (
+        f"element exceeded per-field bound: len={len(element)}"
+    )
+
+    # And single-line: no raw newline byte survived the projection.
+    assert "\n" not in element
+    assert "\r" not in element
+
+
+def test_permission_denials_projection_preserves_non_ascii_in_dict_elements() -> None:
+    """PR #288 PR-gate msg-3339 blocking regression fix.
+
+    Before this fix, the inner ``json.dumps`` in ``_project_denial_element``
+    used its default ``ensure_ascii=True``, so a dict denial containing
+    Japanese text, emojis, or accented letters would render as
+    ``\\uXXXX`` escape sequences inside the projected string. The outer
+    :func:`emit_sdk_error_marker` uses ``ensure_ascii=False``, so scalar
+    denials preserved non-ASCII while dict denials mangled it — an
+    asymmetry the naysayer correctly identified as a legibility
+    regression (from PR #283's pre-quoting behaviour, which preserved
+    non-ASCII in dict values as raw text).
+
+    Fix: pass ``ensure_ascii=False`` to both inner ``json.dumps`` calls so
+    the projection preserves non-ASCII printables symmetrically. Line
+    integrity is still guaranteed by RFC 8259's mandatory escape of
+    U+0000-U+001F, which ``ensure_ascii=False`` does not disable.
+    """
+    denial = {
+        "tool_name": "編集ツール",
+        "rule": "禁止-本番ブランチ",
+        "path": "docs/日本語/README.md",
+        "emoji": "🚫",
+    }
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    element = captured[0]
+    assert isinstance(element, str)
+
+    # Non-ASCII characters survive as literal Unicode (not \\uXXXX escapes).
+    assert '"tool_name"="編集ツール"' in element
+    assert '"rule"="禁止-本番ブランチ"' in element
+    assert '"path"="docs/日本語/README.md"' in element
+    assert '"emoji"="🚫"' in element
+
+    # No \\u escape sequences leaked into the projection.
+    assert r"\u" not in element, f"non-ASCII was aggressively ASCII-escaped: {element!r}"
+
+    # Round-trip through the marker emission (which also uses
+    # ensure_ascii=False) preserves the Unicode too, proving end-to-end
+    # legibility.
+    stream = io.StringIO()
+    emit_sdk_error_marker(detail, stream=stream)
+    payload = stream.getvalue()[len(SDK_ERROR_MARKER_PREFIX) :].rstrip("\n")
+    parsed = json.loads(payload)
+    reparsed_element = parsed["captured_fields"]["permission_denials"][0]
+    assert "編集ツール" in reparsed_element
+    assert "🚫" in reparsed_element
+
+
+def test_build_budgeted_pairs_fallback_is_json_quoted_under_huge_key() -> None:
+    """PR #288 PR-gate msg-3348 blocking invariant fix.
+
+    When a dict key is so long that no value budget remains
+    (``v_share < 1``), the previous implementation emitted a bare
+    literal ``<value truncated>`` token — unquoted. That broke the
+    ``_project_denial_element`` docstring's load-bearing invariant
+    ("every key and every value is a quoted JSON string") and would
+    break any quote-aware log parser that reached the token.
+
+    Fix pinned here: the fallback marker MUST be JSON-quoted so the
+    invariant holds even in the degenerate huge-key case. This branch
+    was previously a coverage blind spot.
+    """
+    from spirrow_mindwire.adapters._sdk_result import (
+        _FIELD_VALUE_MAX_LEN,
+        _build_budgeted_pairs,
+    )
+
+    # Force v_share < 1 by making the key longer than per_pair.
+    # per_pair for 1 pair = _FIELD_VALUE_MAX_LEN - 1 = 499.
+    # After json.dumps(key), the quoted key needs to be >= 496 chars so
+    # v_share = 499 - 496 - 3 < 1.
+    huge_key = "K" * 600
+    result = _build_budgeted_pairs([(huge_key, "v")], _FIELD_VALUE_MAX_LEN)
+    assert len(result) == 1
+    element = result[0]
+
+    # The value marker MUST be JSON-quoted (starts with " and ends with ").
+    # Rendered form: '"KKK...K"="<value truncated>"'
+    assert '="<value truncated>"' in element, f"fallback marker was not JSON-quoted: {element!r}"
+
+    # Structural invariant: raw quote count is a multiple of 4
+    # (2 for the key, 2 for the value). A bare unquoted marker would
+    # produce 2 quotes total (odd of a 4-multiple would fail).
+    assert element.count('"') % 4 == 0
+
+
+def test_permission_denials_projection_footer_reports_true_dropped_count() -> None:
+    """PR #288 PR-gate msg-3348 blocking correctness fix.
+
+    Double-truncation defect: Phase 1 bounds a huge string to
+    ~_FIELD_VALUE_MAX_LEN chars with a ``…(+Nch)`` footer. If Phase 2
+    then truncates the already-truncated string and computes its footer
+    from the Phase-1-truncated length, the reported dropped count is
+    mathematically false — presenting a small footer count (~41) for a
+    value where the true drop is huge (~4529). The reader is misled
+    about the scale of data loss.
+
+    Fix: Phase 2 receives RAW values (not Phase-1-scalarized) so its
+    footer computes against the original length. This test pins the
+    correctness invariant against future regression.
+    """
+    huge = "x" * 5000
+    denial = {"tool_input": huge}
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    element = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(element, str)
+
+    # Extract the footer's dropped-char count from the element. The
+    # element renders as ``"tool_input"="xxx...xxx…(+Nch)"``. We just
+    # need to find the number inside ``…(+Nch)``.
+    import re
+
+    match = re.search(r"…\(\+(\d+)ch\)", element)
+    assert match is not None, f"no truncation footer found in element: {element!r}"
+    dropped = int(match.group(1))
+
+    # The true dropped count is (5000 - kept), where kept is the number
+    # of raw chars that survived. kept is roughly per_pair minus overhead
+    # — well under 5000. So the reported dropped MUST be a substantial
+    # fraction of 5000, not something absurdly small like 41.
+    # Concretely: kept ~= 470-480, so dropped should be ~4520-4530.
+    # Assert dropped is at least 4000 (well above the pre-fix false
+    # value of ~41 which was computed against Phase 1's ~512-char
+    # already-truncated string).
+    assert dropped >= 4000, (
+        f"footer reports mathematically false dropped count: "
+        f"{dropped} (expected close to 5000-per_pair_budget, i.e. ~4500). "
+        f"element={element!r}"
+    )
+    # And the count is consistent with the input length: kept + dropped
+    # should equal or be very close to len(huge) = 5000.
+    assert 4000 <= dropped <= 5000
+
+
+def test_permission_denials_projection_value_that_fits_uncensored_gets_no_footer() -> None:
+    """PR #288 PR-gate msg-3348 advisory structure fix.
+
+    Advisory eager-truncation flaw: ``_build_budgeted_pairs`` reserved
+    ``v_footer_reserve`` (12 chars) unconditionally, so a value that
+    fits within the raw budget uncensored got truncated anyway and
+    received a footer — mirroring the exact "eager truncation
+    sacrifices perfectly valid pairs" defect msg-3339 fixed in
+    ``_join_pairs_bounded``. Pin the fast-path so this can't regress.
+
+    Construction: a dict with enough small pairs to trigger Phase 2
+    overflow, plus one pair whose value length lands strictly between
+    ``v_share - v_footer_reserve`` and ``v_share``. Before the fix,
+    that pair would be truncated + footered; after, it survives as-is.
+    """
+    # Force Phase 2 by making the joined text just over _FIELD_VALUE_MAX_LEN
+    # (500). Use 10 pairs of ~55 chars each = 550 chars — triggers overflow.
+    # For 11 pairs total (10 + target), per_pair = 500//11 - 1 = 44. For
+    # key ``"target"`` (json 8 chars), v_share = 44 - 8 - 3 = 33 and
+    # v_budget with reserve = 33 - 12 = 21. A value of 30 chars fits in
+    # v_share (30 <= 33) uncensored but would previously get truncated to
+    # 21 + a 12-char footer under the eager-reserve path.
+    denial = {f"k{i}": ("v" * 45) for i in range(10)}
+    # Add one target value that lands in the fits-uncensored zone.
+    denial["target"] = "y" * 30
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    element = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(element, str)
+
+    # The target value should appear uncensored (all 30 y's), with no
+    # truncation footer immediately after it. Before the fix, it would
+    # have been truncated to ``yyy...yyy…(+9ch)`` or similar.
+    assert '"target"="' + ("y" * 30) + '"' in element, (
+        f"target value was eagerly truncated even though it fits uncensored: {element!r}"
+    )
+
+
+def test_permission_denials_projection_single_large_value_preserves_key() -> None:
+    """PR #288 PR-gate msg-3345 blocking regression fix.
+
+    Regression scenario: a dict denial with a single key whose value
+    exceeds ``_FIELD_VALUE_MAX_LEN``. Before the two-phase budgeting
+    (msg-3345 fix), the previous pair-boundary truncation dropped the
+    entire pair (including the key), leaving only
+    ``…(+1 pairs truncated)`` — a total loss of visibility.
+
+    After the fix, the key MUST be preserved and the value MUST render
+    as a bounded prefix with a truncation footer. This is the naysayer's
+    "budget the value before quoting so the whole pair fits" strategy,
+    which is strictly safer than blind slicing (no mid-quote severance)
+    AND strictly better for content preservation than dropping.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    huge = "x" * 5000
+    denial = {"tool_input": huge}
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"]
+    assert isinstance(captured, list)
+    assert len(captured) == 1
+    element = captured[0]
+    assert isinstance(element, str)
+
+    # Key preserved — this is the load-bearing pin.
+    assert '"tool_input"=' in element, f"single-large-value dict dropped its key: {element!r}"
+
+    # Value has a truncation footer (bounded), not raw x's forever.
+    assert "ch)" in element, f"value did not carry a truncation footer: {element!r}"
+
+    # And the whole element stays within the per-field cap.
+    assert len(element) <= _FIELD_VALUE_MAX_LEN, f"element exceeded budget: len={len(element)}"
+
+    # No mid-quote slice — every " span is closed. Simple structural
+    # check: raw quote count is even (each opening " has a closing ").
+    # (No inner escaped ``\"`` in this input since we used plain x's.)
+    assert element.count('"') % 2 == 0
+
+    # Line integrity intact.
+    assert "\n" not in element
+    assert "\r" not in element
+
+
+def test_permission_denials_projection_multi_pair_with_one_large_value_preserves_all_keys() -> None:
+    """PR #288 PR-gate msg-3345 blocking regression fix — multi-pair case.
+
+    A dict with several keys where ONE has a large value must not lose
+    the other keys. Under the pre-fix pair-boundary truncation, the
+    large pair was dropped and any pairs after it were also dropped
+    (once the loop broke). After the fix, all keys survive.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    denial = {
+        "tool_name": "Bash",
+        "tool_input": "x" * 5000,
+        "rule": "branch-protection",
+        "reason": "unbypassable-ruleset",
+    }
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    element = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(element, str)
+
+    # Every key preserved.
+    for key in ["tool_name", "tool_input", "rule", "reason"]:
+        assert f'"{key}"=' in element, (
+            f"key {key!r} dropped from multi-pair overflow projection: {element!r}"
+        )
+
+    # The large value has a truncation footer; the small ones don't.
+    # (We can't assert this precisely without parsing, but the total
+    # length is bounded, which is the important guarantee.)
+    assert len(element) <= _FIELD_VALUE_MAX_LEN
+
+
+def test_join_pairs_bounded_returns_full_join_when_it_fits() -> None:
+    """PR #288 PR-gate msg-3339 advisory-eager-truncation fix.
+
+    An earlier version of ``_join_pairs_bounded`` unconditionally reserved
+    ``max_footer_len + 1`` in its ``limit``, so a joined text whose true
+    length fell strictly between ``budget - max_footer_len - 1`` and
+    ``budget`` would be truncated and get a ``…(+N pairs truncated)``
+    footer appended — even though the raw join would have fit uncensored
+    within ``budget``. That's data lost for nothing.
+
+    Fix: fast-path check ``if len(full) <= budget: return full`` before
+    entering the footer-aware truncation path. Pin here with a case that
+    hits the previous edge exactly.
+    """
+    from spirrow_mindwire.adapters._sdk_result import (
+        _FIELD_VALUE_MAX_LEN,
+        _join_pairs_bounded,
+    )
+
+    # Two pairs whose joined length lands strictly between
+    # ``budget - max_footer_len - 1`` and ``budget``. max_footer_len for
+    # 2 pairs = len("…(+2 pairs truncated)") = 21. Previous limit for
+    # budget=500 was 500-21-1=478. Craft a join length of exactly 490 —
+    # inside budget but outside the old limit.
+    p1 = '"k1"="' + "a" * 240 + '"'  # len 248
+    p2 = '"k2"="' + "b" * 233 + '"'  # len 241
+    # Full join: 248 + 1 (space) + 241 = 490. Fits in budget=500,
+    # exceeds old limit=478. Pre-fix behaviour would have dropped p2.
+    result = _join_pairs_bounded([p1, p2], _FIELD_VALUE_MAX_LEN)
+    assert result == p1 + " " + p2, (
+        f"eager truncation regressed — pair was dropped even though the "
+        f"full join fits in budget. len(result)={len(result)}, "
+        f"len(full)={len(p1) + 1 + len(p2)}, budget={_FIELD_VALUE_MAX_LEN}"
+    )
+    assert "pairs truncated)" not in result
+    assert len(result) <= _FIELD_VALUE_MAX_LEN
+
+
+def test_join_pairs_bounded_respects_budget_when_footer_alone_exceeds_it() -> None:
+    """PR #288 PR-gate msg-3345 advisory boundary-completeness fix.
+
+    Edge case unreachable in practice (``_FIELD_VALUE_MAX_LEN`` = 500,
+    max footer ~21 chars) but the boundary math should be complete:
+    when ``budget`` is exceptionally small (< ``max_footer_len + 1``),
+    the plain-text footer alone can exceed budget. Before this fix, the
+    helper returned an over-budget footer and relied on the outer
+    ``_summarize_value``'s blind slice to enforce the boundary
+    retroactively. After the fix, the helper hard-slices the footer as
+    a last resort so its return contract ("no longer than budget") is
+    always honoured.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _join_pairs_bounded
+
+    # Pass a tiny budget that's smaller than the footer.
+    pairs = ['"tool"="Bash"']
+    result = _join_pairs_bounded(pairs, budget=10)
+    assert len(result) <= 10, (
+        f"tiny-budget edge case broke the contract: len={len(result)}, result={result!r}"
+    )
+
+
+def test_join_pairs_bounded_reserves_room_for_joining_space() -> None:
+    """PR #288 PR-gate msg-3336 advisory-off-by-one disposition.
+
+    ``_join_pairs_bounded`` returns ``" ".join(kept) + " " + footer`` when
+    it truncates. An earlier version reserved only the worst-case footer
+    width in its budget calculation and forgot the single joining space,
+    so the return could exceed ``budget`` by exactly 1 character. That
+    ugly overshoot would then get blind-sliced by the outer
+    :func:`_summarize_value`, chopping the ``ch)`` off the plain-text
+    footer. Structurally safe (the footer is plain text with no quote to
+    sever) but sloppy, and it defeated the exactness the helper was
+    written for.
+
+    Fix: reserve ``max_footer_len + 1`` in the budget. Pin here so a
+    future refactor cannot silently regress the boundary math.
+    """
+    from spirrow_mindwire.adapters._sdk_result import (
+        _FIELD_VALUE_MAX_LEN,
+        _join_pairs_bounded,
+    )
+
+    # Build a set of small pairs and pick a budget that WOULD have hit the
+    # boundary exactly with the old math (limit = budget - max_footer_len).
+    # 30 pairs @ 15 chars each + 29 joining spaces + 1 footer-join space +
+    # footer width. The exact result must be <= _FIELD_VALUE_MAX_LEN.
+    pairs = [f'"k{i:02d}"="v{i:02d}"' for i in range(30)]
+    result = _join_pairs_bounded(pairs, _FIELD_VALUE_MAX_LEN)
+    assert len(result) <= _FIELD_VALUE_MAX_LEN, (
+        f"joined length {len(result)} exceeds budget {_FIELD_VALUE_MAX_LEN} — "
+        f"the joining-space reservation regressed. result={result!r}"
+    )
+
+
+def test_scalar_denial_with_newline_stays_single_line_via_outer_emission() -> None:
+    """PR #288 PR-gate msg-3336 blocking-claim disposition.
+
+    Claim: a scalar denial element containing ``\\n`` (e.g.
+    ``permission_denials=["error\\nmsg"]``) would cause the raw newline
+    byte to reach the log verbatim and split the marker line.
+
+    Verdict: the claim is factually incorrect. This test pins the actual
+    behaviour empirically so a future maintainer reading the code (or a
+    future PR-gate pass) can see the reasoning:
+
+    1. The scalar bypass path in ``_project_denial_element`` does return
+       the string unchanged (``_scalarize_denial_value`` bounds it but
+       does not escape control characters). So ``captured_fields`` DOES
+       contain the raw LF byte.
+
+    2. HOWEVER, the marker is emitted via :func:`emit_sdk_error_marker`,
+       which calls ``json.dumps(detail, ensure_ascii=False)`` on the
+       entire detail dict. Per RFC 8259 §7, every character U+0000 through
+       U+001F in a JSON string value MUST be escaped — and the Python
+       ``json`` module honours that mandate regardless of ``ensure_ascii``
+       (which only affects non-ASCII printables ≥ U+0080). The LF becomes
+       the two-character ``\\n`` escape in the emitted marker.
+
+    3. The marker line therefore contains exactly ONE LF byte (the
+       trailing terminator written by ``emit_sdk_error_marker`` itself);
+       the payload area contains none.
+
+    4. Round-tripping the emitted payload via ``json.loads`` recovers the
+       original raw LF, proving structural validity.
+
+    Bohr's msg-3328 §3 explicitly dispositioned scalar quoting as YAGNI
+    on exactly this reasoning: "declining on YAGNI grounds ... widens the
+    diff without addressing an observed problem". This test pins the
+    "no observed problem" claim.
+    """
+    final = _FakeResultMessage(result=None, permission_denials=["error\nmsg"])
+    detail = capture_is_error_detail(final)
+
+    # (1) Captured field contains the raw LF — scalar bypass path.
+    assert detail["captured_fields"]["permission_denials"] == ["error\nmsg"]
+
+    # (2)-(3) Marker line is single-line — outer json.dumps escaped the LF.
+    stream = io.StringIO()
+    emit_sdk_error_marker(detail, stream=stream)
+    output = stream.getvalue()
+    assert output.count("\n") == 1, f"marker line was split by an unescaped LF: {output!r}"
+    assert output.endswith("\n")
+
+    # (4) Round-trip parses cleanly.
+    payload = output[len(SDK_ERROR_MARKER_PREFIX) :].rstrip("\n")
+    parsed = json.loads(payload)
+    assert parsed["captured_fields"]["permission_denials"] == ["error\nmsg"]
+
+
+def test_scalar_denial_is_bounded_by_summarize_value() -> None:
+    """PR #288 PR-gate msg-3336 secondary-claim disposition.
+
+    Secondary claim: the scalar bypass path breaks the ``bounded is
+    bounded`` invariant.
+
+    Verdict: also factually incorrect. Scalar strings ARE bounded, just
+    on a different path than the dict case — via
+    :func:`_scalarize_denial_value` which routes strings through
+    :func:`_summarize_value`'s string-truncation branch directly. Pin
+    empirically: a 50000-char scalar denial produces a captured value at
+    most ``_FIELD_VALUE_MAX_LEN`` plus the ``…(+Nch)`` footer.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    huge = "z" * 50_000
+    final = _FakeResultMessage(result=None, permission_denials=[huge])
+    detail = capture_is_error_detail(final)
+
+    captured = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(captured, str)
+    assert len(captured) <= _FIELD_VALUE_MAX_LEN + len("…(+999999ch)")
+    # Truncation footer is present so a reader can see length was clipped.
+    assert captured.endswith("ch)")
 
 
 def test_permission_denials_projection_c_independence_never_merged_into_errors() -> None:
@@ -599,8 +1207,9 @@ def test_permission_denials_projection_truncates_long_lists_with_overflow_marker
     assert len(captured) == _SMALL_LIST_ELEM_LIMIT
     kept = _SMALL_LIST_ELEM_LIMIT - 1
     assert captured[-1] == f"+{20 - kept} more"
-    # And the preserved entries still carry their content.
-    assert "tool_name=tool_0" in captured[0]
+    # And the preserved entries still carry their content (both keys and
+    # values are json.dumps-quoted per msg-3328 + PR #288 PR-gate follow-up).
+    assert '"tool_name"="tool_0"' in captured[0]
 
 
 def test_permission_denials_projection_scalar_only_list_passes_through_normally() -> None:
