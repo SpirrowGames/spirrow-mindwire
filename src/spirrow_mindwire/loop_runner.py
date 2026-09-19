@@ -314,7 +314,17 @@ def build_implementer(repo_dir: Path, *, obligations: ObligationsManifest) -> Im
     ``obligations`` is the loop-readable obligations manifest loaded at the
     composition root and passed in by injection — the adapter never reaches for a
     module-global path itself. See :func:`_load_obligations_or_exit`.
+
+    v12 (T-auto-backgrounded-command-hangs-conductor-4h): installs the SDK
+    Job Object hook exactly once here. The install is a no-op on POSIX, and
+    idempotent under re-invocation — this is safe even if the composition
+    root is re-entered from tests or a hot-reload. Placement here (rather
+    than at module import) means a docs-only checkout that never builds an
+    implementer never patches the SDK's transport module.
     """
+    from .adapters import _sdk_job_hook
+
+    _sdk_job_hook.install_hook()
     return ImplementerSdkAdapter(cwd=repo_dir, obligations=obligations)
 
 
