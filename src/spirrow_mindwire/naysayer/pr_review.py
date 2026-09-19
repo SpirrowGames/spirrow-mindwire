@@ -391,6 +391,18 @@ class PrReviewOutcome:
     truncated: bool = False
     finish_reason: str | None = None
     model: str | None = None
+    # The naysayer principles frontmatter ``version:`` this review was judged under. Recorded
+    # on **every** emit path — the happy path, the CI-gate short-circuit, the head-unchanged
+    # skip, the round-cap escalation, and the timeout-degrade — because the SOT declares
+    # "Every naysayer output records the ``principles_version`` it judged under, so a later
+    # revision stays auditable" (spec/NAYSAYER_PRINCIPLES.md). A short-circuit path that
+    # produced a review body under the current principles is still a naysayer output; leaving
+    # its ``principles_version`` at the ``None`` default would silently drop the audit tag on
+    # the very outputs a version bump most needs to explain (a red gate held while the
+    # semantics of "blocking" was being redefined has to be legible under the version that
+    # held it). Pinned by :func:`test_principles_version_recorded_on_every_emit_path` in
+    # tests/test_pr_review_driver.py. Kept ``int | None`` rather than ``int`` so a synthetic
+    # outcome in a caller test does not have to load the SOT.
     principles_version: int | None = None
     ci_gated: bool = False  # True when the L1 CI-gate short-circuited the content review
     timed_out: bool = False  # M2 (T34): the Lexora review timed out → degraded to fail-closed RC
@@ -1700,6 +1712,7 @@ class NaysayerPrReviewDriver:
                 body=body,
                 ci_state=ci.state,
                 head_sha=ci.head_sha,
+                principles_version=principles_version(),
                 ci_gated=True,
                 adr_pointer_selection=selection,
             )
@@ -1751,6 +1764,7 @@ class NaysayerPrReviewDriver:
                         body=body,
                         ci_state=ci.state,
                         head_sha=ci.head_sha,
+                        principles_version=principles_version(),
                         skipped_head_unchanged=True,
                         adr_pointer_selection=selection,
                     )
@@ -1782,6 +1796,7 @@ class NaysayerPrReviewDriver:
                         body=body,
                         ci_state=ci.state,
                         head_sha=ci.head_sha,
+                        principles_version=principles_version(),
                         rounds_capped=True,
                         adr_pointer_selection=selection,
                     )
