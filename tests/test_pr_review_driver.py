@@ -39,6 +39,7 @@ from spirrow_mindwire.naysayer.pr_review import (
     _MARKER_A_HEADROOM,
     _MARKER_B_DIFF,
     _MARKER_B_LEN,
+    _MARKER_C_DEMOTED,
     _MARKER_C_SUPPRESSED,
     _MARKER_D_DIVERGENCE,
     _MAX_DIFF_CHARS,
@@ -58,10 +59,12 @@ from spirrow_mindwire.naysayer.pr_review import (
     _format_b_a_marker,
     _nesting_exceeds,
     _parse_model_verdict,
+    _parse_single_line_where,
     decide_verdict,
     derive_verdict,
     parse_objections,
     render_gate_notice,
+    verify_citations,
 )
 from spirrow_mindwire.naysayer.pr_review_adr_pointers import (
     build_pr_review_pass1_system_prompt,
@@ -120,6 +123,8 @@ class _FakeGitHub:
         reviews: list[ReviewInfo] | None = None,
         coverage: list[CrossPrApproveCoverage] | None = None,
         coverage_exc: Exception | None = None,
+        files: dict[tuple[str, str], str | None] | None = None,
+        file_exc: Exception | None = None,
     ) -> None:
         self._diff = diff
         self._fetch_exc = fetch_exc
@@ -128,9 +133,18 @@ class _FakeGitHub:
         self._reviews = list(reviews) if reviews is not None else []
         self._coverage = list(coverage) if coverage is not None else []
         self._coverage_exc = coverage_exc
+        # T-gate-blocks-on-miscounted-line-numbers. Map (path, ref) -> content-or-None (None
+        # models a 404 at that ref). Absent entries default to None (fail-closed on the
+        # demotion direction — an unknown (path, ref) reads as "path not there").
+        self._files: dict[tuple[str, str], str | None] = dict(files or {})
+        self._file_exc = file_exc
         self.fetched: list[PrRef] = []
         self.submitted: list[tuple[PrRef, ReviewEvent, str]] = []
         self.coverage_requested: list[tuple[PrRef, str]] = []
+        # Every fetch_file_at call, in order: the driver's ``verify_citations`` MUST memoise
+        # per ``(path, ref)`` on a single review, so tests can assert on the exact call
+        # sequence rather than just the final content.
+        self.file_reads: list[tuple[PrRef, str, str]] = []
 
     async def fetch_pr_diff(self, pr: PrRef) -> str:
         self.fetched.append(pr)
@@ -164,6 +178,18 @@ class _FakeGitHub:
         # Default: credential lives (200). Terminal-classification tests override this
         # in a subclass to route the fault into ENVIRONMENT_* / TARGET / UNKNOWN scopes.
         return 200
+
+    async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None:
+        # T-gate-blocks-on-miscounted-line-numbers. Default fixture behaviour: raise if the
+        # test configured ``file_exc`` (AC-5 fail-loud), else look ``(path, ref)`` up in
+        # ``files`` — the entry may be a string (content) or None (models a 404). Absent
+        # keys read as ``None``: an accidental unmapped call in a test that never touches
+        # this method costs zero, and any test that does exercise it must supply the
+        # fixture explicitly.
+        self.file_reads.append((pr, path, ref))
+        if self._file_exc is not None:
+            raise self._file_exc
+        return self._files.get((path, ref))
 
     async def aclose(self) -> None:
         return None
@@ -3408,3 +3434,404 @@ async def test_same_identity_422_fallback_target_terminal_raises_target_terminal
     with pytest.raises(TargetTerminalError) as excinfo:
         await driver.review(_pr(), post_critique=post)
     assert excinfo.value.status_code == 422
+
+
+# ---------- T-gate-blocks-on-miscounted-line-numbers -----------------------
+#
+# The v1 predicate is deliberately narrow (Bohr msg-3604 D-2 / msg-3606 D-3 revise,
+# tightened by msg-3608 after Einstein msg-3607): a blocking objection is demoted to
+# advisory iff its ``where`` parses exactly as ``path:N`` and line N at head is empty
+# (or past EOF). When every blocking objection was demoted AND the model wrote RC AND
+# the truncation safety valves are quiet, the gate verdict is overridden from
+# REQUEST_CHANGES to COMMENT so the loop escalates to the human instead of consuming
+# another Gemini round on the same falsified premise. Tests below pin each AC in the
+# design's §5 receipt table.
+
+
+def _blocking_where(where: str, evidence: str = "n is 0") -> str:
+    return f'{{"class": "{_blocking_class()}", "where": "{where}", "evidence": "{evidence}"}}'
+
+
+def _critique_blocking(where: str) -> str:
+    """A critique whose objection block carries exactly one blocking element at ``where``."""
+    payload = f"[{_blocking_where(where)}]"
+    return _critique_with_objections(ModelVerdict.REQUEST_CHANGES, payload)
+
+
+def _empty_line_file(target_line: int, non_empty_line: str = "some content") -> str:
+    """A file whose ``target_line`` is composed entirely of whitespace.
+
+    Every other line is ``non_empty_line`` so a test can flip the target between
+    empty/non-empty without renumbering. Newline-terminated so line counting matches
+    ``str.splitlines`` (see :func:`_line_is_empty`).
+    """
+    lines = [non_empty_line] * (target_line + 3)
+    lines[target_line - 1] = "   "
+    return "\n".join(lines) + "\n"
+
+
+def _non_empty_line_file(target_line: int) -> str:
+    """A file whose ``target_line`` carries a non-whitespace character."""
+    lines = ["content"] * (target_line + 3)
+    return "\n".join(lines) + "\n"
+
+
+# ---------- verify_citations helper (unit tests, no driver flow) ---------
+
+
+def test_parse_single_line_where_accepts_path_colon_integer() -> None:
+    assert _parse_single_line_where("src/x.py:42") == ("src/x.py", 42)
+    assert _parse_single_line_where("Docs/T07.md:287") == ("Docs/T07.md", 287)
+    assert _parse_single_line_where(" src/y.py:1\n") == ("src/y.py", 1)
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "src/x.py",  # path-only, no colon
+        "src/x.py:",  # empty line number
+        "src/x.py:abc",  # non-numeric suffix
+        "src/x.py:287-289",  # range
+        "src/x.py:287,289",  # comma-separated list
+        "src/x.py:0",  # zero: invalid line index
+        "https://github.com/o/r/pull/1#L42",  # URL
+        "",  # empty
+    ],
+)
+def test_parse_single_line_where_rejects_non_single_line_forms(where: str) -> None:
+    """AC-3. The v1 parser is strict on shape; non-``path:N`` forms return None and the
+    caller leaves the objection blocking (deferred to v2 telemetry — msg-3608 §7)."""
+    assert _parse_single_line_where(where) is None
+
+
+@pytest.mark.anyio
+async def test_verify_citations_demotes_blocking_on_empty_line() -> None:
+    """AC-1 predicate half. verify_citations rewrites the blocking entry to blocks=False
+    when the cited line is blank at head."""
+    report = parse_objections(_critique_blocking("Docs/T07.md:287"))
+    assert len(report.blocking) == 1
+    github = _FakeGitHub(files={("Docs/T07.md", "sha-head"): _empty_line_file(287)})
+    new_report, demoted = await verify_citations(
+        report, github=github, pr=_pr(), head_sha="sha-head"
+    )
+    assert len(new_report.blocking) == 0
+    assert len(new_report.advisory) == 1
+    assert len(demoted) == 1
+    assert demoted[0].where == "Docs/T07.md:287"
+    assert demoted[0].blocks is True  # ORIGINAL preserved (for the notice)
+
+
+@pytest.mark.anyio
+async def test_verify_citations_leaves_non_empty_line_blocking() -> None:
+    """A line that has content — even if the model's PREMISE about that line is still
+    wrong — stays blocking (msg-3604 D-2 (3) fail-closed)."""
+    report = parse_objections(_critique_blocking("src/y.py:5"))
+    github = _FakeGitHub(files={("src/y.py", "sha-head"): _non_empty_line_file(5)})
+    new_report, demoted = await verify_citations(
+        report, github=github, pr=_pr(), head_sha="sha-head"
+    )
+    assert len(new_report.blocking) == 1
+    assert demoted == ()
+
+
+@pytest.mark.anyio
+async def test_verify_citations_leaves_range_where_untouched() -> None:
+    """AC-3 (Einstein msg-3607 → Bohr msg-3608): range citations are OUT of v1 scope,
+    regardless of whether the endpoints are empty at head."""
+    report = parse_objections(_critique_blocking("Docs/T07.md:287-289"))
+    github = _FakeGitHub(files={("Docs/T07.md", "sha-head"): _empty_line_file(287)})
+    new_report, demoted = await verify_citations(
+        report, github=github, pr=_pr(), head_sha="sha-head"
+    )
+    assert len(new_report.blocking) == 1
+    assert demoted == ()
+    # Zero reads: the parse fails BEFORE fetch_file_at is called (msg-3606 D-6 cost note).
+    assert github.file_reads == []
+
+
+@pytest.mark.anyio
+async def test_verify_citations_keeps_blocking_when_path_missing_at_head() -> None:
+    """AC-4. fetch_file_at returning None (404 → definite "not there at ref") keeps the
+    objection blocking (msg-3604 D-2 (2) fail-closed on the DEMOTION direction)."""
+    report = parse_objections(_critique_blocking("Docs/missing.md:10"))
+    github = _FakeGitHub()  # empty files map → all reads default to None
+    new_report, demoted = await verify_citations(
+        report, github=github, pr=_pr(), head_sha="sha-head"
+    )
+    assert len(new_report.blocking) == 1
+    assert demoted == ()
+    # AC-4 costs one read to CONFIRM the 404, and then remembers it (AC-7 memoisation
+    # would coalesce a second citation of the same path).
+    assert github.file_reads == [(_pr(), "Docs/missing.md", "sha-head")]
+
+
+@pytest.mark.anyio
+async def test_verify_citations_propagates_http_error_fail_loud() -> None:
+    """AC-5. A non-404 HTTP error from fetch_file_at surfaces — the driver does not
+    swallow it (msg-3604 D-7 fail-loud)."""
+    report = parse_objections(_critique_blocking("Docs/T07.md:5"))
+    github = _FakeGitHub(file_exc=GitHubHTTPError("boom", status_code=503))
+    with pytest.raises(GitHubHTTPError):
+        await verify_citations(report, github=github, pr=_pr(), head_sha="sha-head")
+
+
+@pytest.mark.anyio
+async def test_verify_citations_memoises_reads_per_path_ref_pair() -> None:
+    """AC-7. Two blocking objections citing the same file at the same head produce ONE
+    fetch_file_at call — the (path, ref) key is memoised for the review."""
+    payload = f"[{_blocking_where('Docs/T07.md:5')}, {_blocking_where('Docs/T07.md:9')}]"
+    report = parse_objections(_critique_with_objections(ModelVerdict.REQUEST_CHANGES, payload))
+    file_content = "content\n\ncontent\n\ncontent\n\ncontent\n\ncontent\n"
+    github = _FakeGitHub(files={("Docs/T07.md", "sha-head"): file_content})
+    await verify_citations(report, github=github, pr=_pr(), head_sha="sha-head")
+    assert len(github.file_reads) == 1
+    assert github.file_reads[0] == (_pr(), "Docs/T07.md", "sha-head")
+
+
+@pytest.mark.anyio
+async def test_verify_citations_demotes_when_line_is_past_eof() -> None:
+    """The predicate covers "past EOF" as a special case of "the line points at
+    nothing" (msg-3604 D-2 (3) or-clause). A citation ``:99`` against a 3-line file
+    is demoted for the same structural reason as one against a blank line."""
+    report = parse_objections(_critique_blocking("Docs/T07.md:99"))
+    github = _FakeGitHub(files={("Docs/T07.md", "sha-head"): "one\ntwo\nthree\n"})
+    new_report, demoted = await verify_citations(
+        report, github=github, pr=_pr(), head_sha="sha-head"
+    )
+    assert len(new_report.blocking) == 0
+    assert len(demoted) == 1
+
+
+# ---------- driver flow: gate_verdict override + notice ---------------------
+
+
+def _blocking_body(where: str) -> str:
+    return _critique_blocking(where)
+
+
+@pytest.mark.anyio
+async def test_ac_1_single_empty_line_blocking_overrides_gate_to_comment() -> None:
+    """AC-1 (Bohr msg-3606 revise). One blocking objection with ``where`` at an empty
+    line, model wrote RC, truncation valves quiet → gate_verdict = COMMENT (NOT
+    APPROVE — msg-1871 safety valve is preserved). Rounds cap is not consumed on this
+    miscount again because the loop escalates to the human on COMMENT."""
+    critique = _blocking_body("Docs/T07.md:287")
+    lexora = _FakeLexora(content=critique)
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-head-1", []),
+        files={("Docs/T07.md", "sha-head-1"): _empty_line_file(287)},
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.verdict is ReviewEvent.COMMENT
+    assert len(github.submitted) == 1
+    _pr_ref, event, _body = github.submitted[0]
+    assert event is ReviewEvent.COMMENT
+
+
+@pytest.mark.anyio
+async def test_ac_1b_model_approve_keeps_approve_notice_still_records_demotion() -> None:
+    """AC-1b (Bohr msg-3606 revise). If the model wrote APPROVE, gate_verdict is already
+    APPROVE and no override is needed. Demotion is still recorded on the decision so
+    the notice can name it (a blocking-class objection under an APPROVE model verdict
+    is a diverged case in its own right)."""
+    payload = f"[{_blocking_where('Docs/T07.md:287')}]"
+    critique = _critique_with_objections(ModelVerdict.APPROVE, payload)
+    lexora = _FakeLexora(content=critique)
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-head-1b", []),
+        files={("Docs/T07.md", "sha-head-1b"): _empty_line_file(287)},
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    # APPROVE → APPROVE. The gate did NOT override.
+    assert outcome.verdict is ReviewEvent.APPROVE
+    # Notice still records the demotion.
+    assert _MARKER_C_DEMOTED in posted[0]
+
+
+@pytest.mark.anyio
+async def test_ac_2_partial_demotion_leaves_remaining_blocker_stays_rc() -> None:
+    """AC-2 (Bohr msg-3606 revise). Two blocking objections; one cites an empty line
+    (demoted), the other a non-empty line (kept). ``report.blocking`` still holds one
+    element → override predicate fails → gate_verdict stays REQUEST_CHANGES."""
+    payload = f"[{_blocking_where('Docs/A.md:5')}, {_blocking_where('src/y.py:3')}]"
+    critique = _critique_with_objections(ModelVerdict.REQUEST_CHANGES, payload)
+    lexora = _FakeLexora(content=critique)
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-head-2", []),
+        files={
+            ("Docs/A.md", "sha-head-2"): _empty_line_file(5),
+            ("src/y.py", "sha-head-2"): _non_empty_line_file(3),
+        },
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+
+
+@pytest.mark.anyio
+async def test_ac_3_range_where_is_left_unchanged_and_stays_rc() -> None:
+    """AC-3 (Einstein msg-3607 → Bohr msg-3608). Range citations are OUT of v1; the
+    objection stays blocking and no override fires."""
+    critique = _blocking_body("Docs/T07.md:287-289")
+    lexora = _FakeLexora(content=critique)
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-head-3", []),
+        files={("Docs/T07.md", "sha-head-3"): _empty_line_file(287)},
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+
+
+@pytest.mark.anyio
+async def test_ac_4_missing_path_does_not_demote_stays_rc() -> None:
+    """AC-4 (Bohr msg-3604 D-2 (2)). A 404 on the head-side path keeps the objection
+    blocking — reading is not the same as verifying, and a missing path is not
+    evidence that the citation is wrong."""
+    critique = _blocking_body("Docs/moved.md:10")
+    lexora = _FakeLexora(content=critique)
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-head-4", []),
+        files={("Docs/moved.md", "sha-head-4"): None},  # 404
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+
+
+@pytest.mark.anyio
+async def test_ac_5_read_failure_propagates_and_review_fails() -> None:
+    """AC-5 (Bohr msg-3604 D-7 fail-loud). A non-404 HTTP failure on the read surfaces
+    — the driver does not swallow it. Silence would let a GitHub outage look identical
+    to a confirmed non-empty line."""
+    critique = _blocking_body("Docs/T07.md:287")
+    lexora = _FakeLexora(content=critique)
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-head-5", []),
+        file_exc=GitHubHTTPError("upstream 503", status_code=503),
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    with pytest.raises(GitHubHTTPError):
+        await driver.review(_pr(), post_critique=post)
+
+
+@pytest.mark.anyio
+async def test_ac_6_gate_notice_names_path_line_and_head_and_records_override() -> None:
+    """AC-6 (Bohr msg-3604 D-4 / msg-3606 D-3 revise). When demotion + override fire,
+    the notice must carry: (i) the C-DEMOTED marker, (ii) the ``path:line`` of the
+    demoted citation, (iii) the head SHA (short form) the file was read at, (iv) the
+    fact that the gate rewrote RC → COMMENT. Absent any of these, an operator cannot
+    reproduce the demotion by hand (which is msg-3602 §2's original ask of the gate)."""
+    critique = _blocking_body("Docs/T07.md:287")
+    lexora = _FakeLexora(content=critique)
+    head_sha = "sha6abcdef012345"
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, head_sha, []),
+        files={("Docs/T07.md", head_sha): _empty_line_file(287)},
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    body = posted[0]
+    assert _GATE_NOTICE_SENTINEL in body
+    assert _MARKER_C_DEMOTED in body
+    assert "Docs/T07.md:287" in body
+    assert head_sha[:12] in body
+    # "override" text names both endpoints of the rewrite so a reader can grep it.
+    assert "REQUEST_CHANGES" in body
+    assert "COMMENT" in body
+    assert outcome.verdict is ReviewEvent.COMMENT
+
+
+@pytest.mark.anyio
+async def test_ac_7_driver_memoises_per_path_head_pair() -> None:
+    """AC-7. Two blocking objections at different lines of the SAME file cause ONE
+    fetch_file_at read across the whole driver review (memoisation in the helper
+    survives at the driver-invocation layer too)."""
+    payload = f"[{_blocking_where('Docs/T07.md:5')}, {_blocking_where('Docs/T07.md:7')}]"
+    critique = _critique_with_objections(ModelVerdict.REQUEST_CHANGES, payload)
+    lexora = _FakeLexora(content=critique)
+    # Both lines empty → both demoted → override fires → outcome is COMMENT.
+    lines = ["content", "content", "content", "content", "  ", "content", "  ", "content"]
+    file_content = "\n".join(lines) + "\n"
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-head-7", []),
+        files={("Docs/T07.md", "sha-head-7"): file_content},
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.verdict is ReviewEvent.COMMENT
+    # Exactly one file read — proves memoisation at the driver layer.
+    assert len(github.file_reads) == 1
+
+
+@pytest.mark.anyio
+async def test_ac_9_truncated_diff_never_overrides_gate() -> None:
+    """AC-9 (msg-1871 safety valve). ``view.truncated == True`` forces RC regardless of
+    demotion — a partial review can never open the gate, not even to COMMENT. The
+    demotion is still RECORDED (in the notice) but the gate verdict stays RC."""
+    critique = _blocking_body("Docs/T07.md:287")
+    lexora = _FakeLexora(content=critique)
+    # A diff LONGER than _MAX_DIFF_CHARS forces view.truncated=True.
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-head-9", []),
+        diff="x" * (_MAX_DIFF_CHARS + 1),
+        files={("Docs/T07.md", "sha-head-9"): _empty_line_file(287)},
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    # Truncation short-circuits the override: gate stays REQUEST_CHANGES.
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+
+
+@pytest.mark.anyio
+async def test_ac_10_finish_length_never_overrides_gate() -> None:
+    """AC-10 (msg-1871 safety valve). ``finish_reason == "length"`` (the model was cut
+    off mid-critique) is the OTHER partial-review case. Same rule: no override."""
+    critique = _blocking_body("Docs/T07.md:287")
+    lexora = _FakeLexora(content=critique, finish_reason="length")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-head-10", []),
+        files={("Docs/T07.md", "sha-head-10"): _empty_line_file(287)},
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+
+
+@pytest.mark.anyio
+async def test_gate_notice_absent_when_no_demotion_fires() -> None:
+    """Anti-tautology: on the ordinary blocking-and-non-empty path the C-DEMOTED note
+    stays out of the body. (Enforces OBL-NO-POLLUTING-PR-HEADER for this axis: the
+    C-DEMOTED sentinel is rare and noticed, not an unconditional banner.)"""
+    critique = _blocking_body("src/y.py:5")
+    lexora = _FakeLexora(content=critique)
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-head-noise", []),
+        files={("src/y.py", "sha-head-noise"): _non_empty_line_file(5)},
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    await driver.review(_pr(), post_critique=post)
+    body = posted[0]
+    assert _MARKER_C_DEMOTED not in body

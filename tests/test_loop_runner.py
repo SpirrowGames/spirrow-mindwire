@@ -274,6 +274,11 @@ class _FakeGitHub:
     async def probe_identity(self) -> int:
         raise AssertionError("not called")
 
+    async def fetch_file_at(self, pr: Any, *, path: str, ref: str) -> str | None:
+        # T-gate-blocks-on-miscounted-line-numbers Protocol compliance. Never called in
+        # loop-runner tests.
+        raise AssertionError("not called")
+
     async def aclose(self) -> None:
         self.closed = True
 
