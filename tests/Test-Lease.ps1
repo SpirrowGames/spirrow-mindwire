@@ -1548,8 +1548,10 @@ Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdic
 #            - `[1,2,3]`    → System.Object[]                               → shape='array'
 #          So a root array's raw shape is NOT determined by its rootedness alone; it is determined
 #          by what ConvertFrom-Json leaves in `$obj` after unwrap. This (d-1) block's array pin
-#          therefore uses a length-≥2 input — see L1634 for the actual fixture
-#          (`[{"editor":"x"},{"foo":"y"}]`, two elements, stays as System.Object[]). All four
+#          therefore uses a length-≥2 input — search for `$arrayPath` in the (d-1) block below
+#          for the actual fixture write (`[{"editor":"x"},{"foo":"y"}]`, two elements, stays as
+#          System.Object[]; the search term is preferred to a line number to avoid the same
+#          drift-with-refactor dual-management called out three lines below). All four
 #          bullets above route to verdict='unreadable' EXCEPT `[{"a":1}]`, which lands on the
 #          (a-valid) shape='object' path — that corner case IS pinned in the (d-1 boundary)
 #          block below (search for '(d-1 boundary)'), so a future change in ConvertFrom-Json
@@ -1699,7 +1701,7 @@ try {
     CheckTrue "(d-1 boundary) [{`"a`":1}]: flush_allowed=`$true (corner case routes to acquire-permitted branch)" $r.flush_allowed
     Check "(d-1 boundary) [{`"a`":1}]: disposition='' (no defer of lease-requiring candidates)" '' $r.disposition
     Check "(d-1 boundary) [{`"a`":1}]: state has 1 entry (unwrapped inner-object property survives)" 1 $r.state.Keys.Count
-    CheckTrue "(d-1 boundary) [{`"a`":1}]: state key 'a' present (unwrap leaks inner property name — latent hazard, see comment)" ([bool]$r.state.ContainsKey('a'))
+    CheckTrue "(d-1 boundary) [{`"a`":1}]: state key 'a' present (unwrap leaks inner property name — latent hazard, see comment)" ($r.state.ContainsKey('a'))
     Check "(d-1 boundary) [{`"a`":1}]: notification is `$null (valid path emits no operator surface)" $null $r.notification
 
     # --- (d-6) OPERATOR-DELETE HAZARD DOCUMENTATION PIN --------------------------------------
