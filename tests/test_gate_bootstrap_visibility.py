@@ -76,6 +76,14 @@ from spirrow_mindwire.gate_bootstrap_visibility import (
     _State,
 )
 
+# ``thread_id_for`` now composes its id from both ``project`` and ``repo_dir``
+# (Bohr msg-3120 through msg-3122). These visibility tests do not exercise the
+# id derivation itself — they need a stable, deterministic id to build fakes
+# against. Kept as one module-level constant so a future change to the
+# derivation does not have to be chased across per-test literals.
+_TEST_REPO_DIR = Path("/tmp/gate-bootstrap-visibility-test-repo")
+
+
 # --- fakes ---------------------------------------------------------------------------------------
 
 
@@ -255,7 +263,7 @@ async def test_floor_holds_across_failing_posts() -> None:
         report = await vis.on_close_failure(
             mcp,
             project="spirrow-verimend",
-            thread_id=thread_id_for("spirrow-verimend"),
+            thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
             owner=DEFAULT_SWEEPER_OWNER,
             exc=GateBootstrapCloseError("simulated close refusal"),
         )
@@ -307,7 +315,7 @@ async def test_dedup_survives_foreign_writes() -> None:
         await vis.on_close_failure(
             mcp,
             project="spirrow-verimend",
-            thread_id=thread_id_for("spirrow-verimend"),
+            thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
             owner=DEFAULT_SWEEPER_OWNER,
             exc=GateBootstrapCloseError("close refusal"),
         )
@@ -344,7 +352,7 @@ async def test_fail_closed_when_state_write_fails() -> None:
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -401,7 +409,7 @@ async def test_human_close_clears_episode_without_permanent_suppression() -> Non
     r1 = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("initial refusal"),
     )
@@ -409,7 +417,10 @@ async def test_human_close_clears_episode_without_permanent_suppression() -> Non
 
     # Phase 2: human closes the thread → sweep's close call now returns
     # was_open=False → tick calls on_close_success → episode cleared.
-    vis.on_close_success(project="spirrow-verimend", thread_id=thread_id_for("spirrow-verimend"))
+    vis.on_close_success(
+        project="spirrow-verimend",
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
+    )
     assert "spirrow-verimend" not in store.state.episodes, (
         "on_close_success must clear the episode entry (Rule 1)"
     )
@@ -425,7 +436,7 @@ async def test_human_close_clears_episode_without_permanent_suppression() -> Non
     r3 = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("recurring refusal"),
     )
@@ -462,13 +473,13 @@ async def test_flap_does_not_restart_spam() -> None:
             # "no failure this tick" → close succeeded → clear episode.
             vis.on_close_success(
                 project="spirrow-verimend",
-                thread_id=thread_id_for("spirrow-verimend"),
+                thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
             )
         else:
             await vis.on_close_failure(
                 mcp,
                 project="spirrow-verimend",
-                thread_id=thread_id_for("spirrow-verimend"),
+                thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
                 owner=DEFAULT_SWEEPER_OWNER,
                 exc=GateBootstrapCloseError("flapping refusal"),
             )
@@ -570,7 +581,7 @@ def test_file_state_store_roundtrips(tmp_path: Path) -> None:
         episodes={
             "spirrow-verimend": FailureEpisode(
                 project="spirrow-verimend",
-                thread_id=thread_id_for("spirrow-verimend"),
+                thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
                 signature="GateBootstrapCloseError",
                 first_seen_at="2026-08-31T00:00:00+00:00",
                 reported_at="2026-08-31T00:00:00+00:00",
@@ -622,7 +633,7 @@ async def test_failure_report_does_not_claim_close_will_wait_24h() -> None:
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("closeable_roles check failed"),
     )
@@ -671,7 +682,7 @@ async def test_read_failure_fails_closed_and_preserves_other_projects_state(tmp_
             episodes={
                 "spirrow-magickit": FailureEpisode(
                     project="spirrow-magickit",
-                    thread_id=thread_id_for("spirrow-magickit"),
+                    thread_id=thread_id_for("spirrow-magickit", _TEST_REPO_DIR),
                     signature="GateBootstrapCloseError",
                     first_seen_at="2026-08-30T00:00:00+00:00",
                     reported_at="2026-08-30T00:00:00+00:00",
@@ -696,7 +707,7 @@ async def test_read_failure_fails_closed_and_preserves_other_projects_state(tmp_
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -904,7 +915,7 @@ async def test_concurrent_tick_updates_survive_our_post_await(tmp_path: Path) ->
         )
         concurrent_state.episodes["spirrow-voxelworld"] = FailureEpisode(
             project="spirrow-voxelworld",
-            thread_id=thread_id_for("spirrow-voxelworld"),
+            thread_id=thread_id_for("spirrow-voxelworld", _TEST_REPO_DIR),
             signature="GateBootstrapCloseError",
             first_seen_at="2026-08-31T00:05:00+00:00",
             reported_at="2026-08-31T00:05:00+00:00",
@@ -919,7 +930,7 @@ async def test_concurrent_tick_updates_survive_our_post_await(tmp_path: Path) ->
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -1003,7 +1014,7 @@ async def test_post_success_when_reload_after_await_fails(tmp_path: Path) -> Non
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -1074,7 +1085,7 @@ async def test_visibility_survives_unicode_decode_error_in_state_file(tmp_path: 
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -1117,7 +1128,7 @@ async def test_on_close_success_survives_unicode_decode_error_in_state_file(tmp_
     # Must not raise.
     vis.on_close_success(
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
     )
     # File is unchanged (no partial overwrite).
     assert path.read_bytes() == b"\xff\xfe invalid utf-8"
@@ -1351,7 +1362,7 @@ async def test_malformed_entry_does_not_erase_state_file(tmp_path: Path) -> None
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -1438,7 +1449,7 @@ async def test_visibility_survives_naive_timestamp_in_state_file(tmp_path: Path)
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -1646,7 +1657,10 @@ async def test_precheck_read_fault_reports_through_the_unified_surface(tmp_path:
     )
     posts = [args for name, args in mcp.calls if name == "chatroom_post_message"]
     assert len(posts) == 1
-    assert posts[0]["thread_id"] == "T-gate-bootstrap-spirrow-example"
+    # The thread id is derived from ``(project, repo_dir)`` at tick time
+    # (Bohr msg-3120 through msg-3122). The tick's ``repo_dir`` in this test
+    # is the ``repo_dir`` fixture built above, so use the same derivation here.
+    assert posts[0]["thread_id"] == thread_id_for("spirrow-example", repo_dir)
 
 
 # --------------------------------------------------------------------------- #
@@ -1699,7 +1713,7 @@ async def test_w2_post_refused_thread_resolved_is_terminal_clears_episode() -> N
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-example",
-        thread_id=thread_id_for("spirrow-example"),
+        thread_id=thread_id_for("spirrow-example", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refused"),
     )
@@ -1733,7 +1747,7 @@ async def test_w2_post_refused_thread_resolved_never_raises() -> None:
     _ = await vis.on_close_failure(
         mcp,
         project="spirrow-example",
-        thread_id=thread_id_for("spirrow-example"),
+        thread_id=thread_id_for("spirrow-example", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refused"),
     )
@@ -1757,7 +1771,7 @@ async def test_w2_post_refused_thread_resolved_is_distinct_from_generic_post_fai
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-example",
-        thread_id=thread_id_for("spirrow-example"),
+        thread_id=thread_id_for("spirrow-example", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refused"),
     )
