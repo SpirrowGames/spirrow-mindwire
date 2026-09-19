@@ -41,7 +41,7 @@ from spirrow_mindwire.config import (
     Stage3LoopConfig,
 )
 from spirrow_mindwire.loop_runner import (
-    _PROPOSER_BUILTIN_TOOLS,
+    _BOHR_BUILTIN_TOOLS,
     Stage3Conductor,
     Stage3ProposerAdapter,
     build_conductor,
@@ -280,24 +280,37 @@ class _FakeGitHub:
 
 # --------------------------------------------------------------------------- #
 # Stage3ProposerAdapter: read-only (drops EXECUTE_CODE)
+#
+# The tests below split along the persona / role axis that Takahito's msg-3507
+# and ADR-2026-05-27-09 (identity 4 layers) make explicit. Bohr the *persona*
+# has a tool面 (:data:`_BOHR_BUILTIN_TOOLS`); the proposer *role* has a
+# contract (cannot change the tree). They are orthogonal and the tests below
+# treat them that way — persona-scoped fact tests read from the persona
+# constant, role-scoped invariant tests read from the adapter's
+# ``capabilities`` and from :class:`_PathScopeGuard`'s admissible set.
 # --------------------------------------------------------------------------- #
 
 
-def test_the_proposer_can_read_the_repository_it_designs_against() -> None:
+def test_the_bohr_persona_can_read_the_repository_it_designs_against() -> None:
     """It could not, and that stopped the loop rather than a design.
 
-    On T-fs-delete-path-scope msg-1197 the proposer reported that no read tool
-    was permitted, declined to design a security gate from quoted excerpts, and
+    On T-fs-delete-path-scope msg-1197 Bohr reported that no read tool was
+    permitted, declined to design a security gate from quoted excerpts, and
     handed back to a human; the naysayer's review endorsed the refusal. Nothing
     then moved for a day. Read / Glob / Grep are what "check the claim before
     designing against it" costs.
+
+    This is a **persona-level** fact — it names Bohr's current built-in tool
+    面 explicitly, and does *not* speak to the proposer role's read-only
+    invariant (that is enforced by ``capabilities`` and by the path-scope
+    guard, tested separately below).
     """
-    assert set(_PROPOSER_BUILTIN_TOOLS) == {"Read", "Glob", "Grep"}
+    assert set(_BOHR_BUILTIN_TOOLS) == {"Read", "Glob", "Grep"}
     proposer = build_proposer(Path("."))
-    assert list(proposer._builtin_tools) == list(_PROPOSER_BUILTIN_TOOLS)
+    assert list(proposer._builtin_tools) == list(_BOHR_BUILTIN_TOOLS)
     # Auto-approved because running headless means an un-approved call reaches a
     # prompt no one can answer. The bound is the guard, asserted separately.
-    assert list(proposer._allowed_tools) == list(_PROPOSER_BUILTIN_TOOLS)
+    assert list(proposer._allowed_tools) == list(_BOHR_BUILTIN_TOOLS)
 
 
 def test_the_proposer_is_scoped_to_the_repository_it_was_given() -> None:
@@ -316,16 +329,32 @@ def test_the_proposer_is_scoped_to_the_repository_it_was_given() -> None:
     assert guard.root == repo
 
 
-def test_the_proposer_still_cannot_write_or_run_anything() -> None:
-    """Reading is the widening; writing and executing are not.
+def test_bohr_persona_tools_today_do_not_include_write_or_execute_tools() -> None:
+    """A persona-scoped snapshot of Bohr's current tool面.
 
-    A proposer that can change the tree is an implementer, and the Stage 3 split
-    puts every such call behind the allow-list-gated adapter.
+    This asserts a fact about the persona *as it stands*: Bohr's built-in
+    tool面 today happens not to contain any write/execute tool. It is not the
+    role's invariant (see the block comment atop this section) — the proposer
+    *role* stays read-only regardless of what future Bohr embodiments carry,
+    because the role's read-only-ness is enforced by ``capabilities`` (the
+    IMPLEMENTER slot resolves to the gated adapter) and by the
+    ``can_use_tool`` guard (:class:`_PathScopeGuard` admits only
+    ``Read`` / ``Glob`` / ``Grep`` today). If a future change widens Bohr's
+    persona 面 to include a write or execute tool it must also widen the guard
+    (or a per-persona equivalent) — the role invariant is protected there.
     """
-    forbidden = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Task", "WebFetch"}
-    assert forbidden.isdisjoint(set(_PROPOSER_BUILTIN_TOOLS))
+    persona_forbidden_today = {
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "Bash",
+        "Task",
+        "WebFetch",
+    }
+    assert persona_forbidden_today.isdisjoint(set(_BOHR_BUILTIN_TOOLS))
     proposer = build_proposer(Path("."))
-    assert forbidden.isdisjoint(set(proposer._allowed_tools))
+    assert persona_forbidden_today.isdisjoint(set(proposer._allowed_tools))
 
 
 def test_reading_does_not_make_the_proposer_qualify_as_the_implementer() -> None:
