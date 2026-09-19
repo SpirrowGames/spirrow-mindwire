@@ -40,10 +40,10 @@ returns ``None``), so the Python default excepthook prints the traceback and
 the process exits non-zero. This holds for BOTH ``run_loop`` (watcher) and
 ``run_conductor`` because both invoke ``_build_dispatcher`` before
 delegating to their respective event loops. Other env-required infra values
-that are consumed LATER (e.g. ``MINDWIRE_NAYSAYER_BASE_URL``, validated at
-``NaysayerSdkAdapter.spawn`` when a naysayer is summoned) have a mode-
-dependent exit story — the wrapper comment enumerates it. Do not
-generalise this function's startup-fail property to those other variables.
+whose validation happens later have a mode-dependent exit story documented
+where they are validated (``MINDWIRE_NAYSAYER_BASE_URL`` →
+:mod:`spirrow_mindwire.adapters.naysayer_sdk`). Do not generalise this
+function's startup-fail property to those other variables.
 
 :class:`StreamableHttpChatroomMcp` does real network I/O and is therefore
 exercised only by the ``-m manual`` smoke test (PR-G), not CI; the pure
