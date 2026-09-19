@@ -225,6 +225,126 @@ def test_blocking_class_without_evidence_is_fail_loud(
         objection_classes()
 
 
+# ─── T-naysayer-blocking-bar-undefined promotion pin 2 (msg-3520) ──────────────────
+# Syntactic linter over ``evidence:`` shape. Two failure modes: empty value (``空値``),
+# and class↔evidence type mismatch (``class↔evidence 型不一致``: an obligation attached
+# to a class the SOT says has none). No boilerplate / content heuristic (msg-3521 obj-2:
+# YAGNI). Together these tests pin the closed set of shapes the linter must reject and
+# the closed set it must accept, so a future edit cannot silently widen either.
+
+
+@pytest.mark.parametrize(
+    "evidence_yaml",
+    [
+        # ``evidence:`` bare — YAML parses to None.
+        "  correctness:\n    blocks: true\n    evidence:\n",
+        # explicit null — same value as bare, kept as a separate case so a future YAML
+        # parser change that treats the two differently reds both this and the row above.
+        "  correctness:\n    blocks: true\n    evidence: null\n",
+        # empty-string evidence — the ``空値`` msg-3520 names, on a blocking class.
+        '  correctness:\n    blocks: true\n    evidence: ""\n',
+        # whitespace-only evidence — the trap the ``.strip()`` in the loader catches.
+        '  correctness:\n    blocks: true\n    evidence: "   "\n',
+        # non-string evidence — the type check.
+        "  correctness:\n    blocks: true\n    evidence: 42\n",
+        "  correctness:\n    blocks: true\n    evidence: []\n",
+    ],
+    ids=["bare", "explicit-null", "empty-string", "whitespace-only", "integer", "empty-list"],
+)
+def test_blocking_class_empty_or_nonstring_evidence_is_fail_loud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, evidence_yaml: str
+) -> None:
+    """The ``空値`` half of msg-3520 pin 2: a blocking class needs a real string obligation.
+
+    Parametrised across every empty-shape a YAML author might reasonably write. The failure
+    reason is identical in each case — "blocking but no evidence obligation" — and the test
+    pins that unified reason so a future refactor that split the reasons into per-shape
+    messages would red this test rather than silently changing observed behaviour.
+    """
+    _write_principles(
+        tmp_path,
+        monkeypatch,
+        _frontmatter(body=f"version: 2\nobjection_classes:\n{evidence_yaml}"),
+    )
+    with pytest.raises(PrinciplesError, match="evidence"):
+        objection_classes()
+
+
+def test_advisory_class_with_string_evidence_is_fail_loud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``class↔evidence 型不一致`` half of msg-3520 pin 2.
+
+    The SOT (v2 §"Objection classes") states that "no advisory class needs one" — an
+    advisory class HAS NO evidence obligation. Silently accepting one lets a future editor
+    drift the vocabulary into a hybrid state where "advisory" sometimes carries an
+    obligation, which is the P-2 (dual-management) defect the class system exists to remove.
+
+    The error message names the shape explicitly ("type mismatch") so a reader debugging
+    a red load has one place to look, and pins that wording so a future rewording that
+    drops the diagnostic still stays greppable.
+    """
+    _write_principles(
+        tmp_path,
+        monkeypatch,
+        _frontmatter(
+            body=(
+                "version: 2\n"
+                "objection_classes:\n"
+                "  naming:\n"
+                "    blocks: false\n"
+                '    evidence: "should not be here"\n'
+            )
+        ),
+    )
+    with pytest.raises(PrinciplesError, match="type mismatch"):
+        objection_classes()
+
+
+@pytest.mark.parametrize(
+    "advisory_yaml",
+    [
+        # No evidence key at all — the ordinary shape used throughout the shipped SOT.
+        "  naming:\n    blocks: false\n",
+        # Explicit null — the "there is nothing to state" spelling. Accepted so the linter
+        # does not force one spelling over another (a design change, not a shape check).
+        "  naming:\n    blocks: false\n    evidence: null\n",
+    ],
+    ids=["absent", "explicit-null"],
+)
+def test_advisory_class_without_evidence_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, advisory_yaml: str
+) -> None:
+    """The two accepted shapes for advisory classes. Pinned so a linter tightening cannot
+    silently rule out the absent-key form the shipped SOT uses on all five advisory classes.
+    """
+    _write_principles(
+        tmp_path, monkeypatch, _frontmatter(body=f"version: 2\nobjection_classes:\n{advisory_yaml}")
+    )
+    classes = objection_classes()
+    assert set(classes) == {"naming"}
+    assert classes["naming"].blocks is False
+    assert classes["naming"].evidence is None
+
+
+def test_shipped_sot_advisory_classes_carry_no_evidence() -> None:
+    """The canonical (shipped) SOT respects the msg-3520 pin 2 invariant.
+
+    A regression that adds ``evidence:`` to any advisory class in the shipped SOT would
+    red the loader's own load-time check, but this test states the invariant DIRECTLY —
+    so a reader tracing the pin can see it holds on the real vocabulary without walking
+    through a chain of failure paths in an unrelated test.
+    """
+    for name, entry in objection_classes().items():
+        if entry.blocks:
+            assert entry.evidence is not None, f"blocking class {name!r} missing evidence"
+        else:
+            assert entry.evidence is None, (
+                f"advisory class {name!r} carries an evidence obligation ({entry.evidence!r}); "
+                f"the SOT design has no evidence obligation on advisory classes"
+            )
+
+
 def test_non_boolean_blocks_is_fail_loud(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_principles(
         tmp_path,

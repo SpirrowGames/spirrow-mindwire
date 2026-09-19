@@ -180,15 +180,44 @@ def objection_classes() -> Mapping[str, ObjectionClass]:
         blocks = entry.get("blocks")
         if not isinstance(blocks, bool):
             raise PrinciplesError(f"{where} has no boolean 'blocks' (got {blocks!r})")
+        # T-naysayer-blocking-bar-undefined promotion pin 2 (msg-3520): the ``evidence:`` line
+        # is validated for two syntactic failure modes only — empty value (``空値``) and
+        # class↔evidence type mismatch (``class↔evidence 型不一致``). No heuristic /
+        # boilerplate detection (msg-3521 obj-2 is that YAGNI); the linter is a shape check,
+        # not a judgement of the string's *content*.
+        #
+        # The shape is asymmetric on purpose, and mirrors the design intent stated in the SOT
+        # itself. A blocking class carries an ``evidence:`` obligation (what a reader can
+        # check to accept the objection); an advisory class carries *none* — the SOT states
+        # "no advisory class needs one" (spec/NAYSAYER_PRINCIPLES.md §"Objection classes",
+        # v2). So the two failure modes are:
+        #
+        #   (i)  blocking + missing / empty / whitespace-only / non-string evidence
+        #        → the escape hatch this design deliberately does not have. Reachable as
+        #        ``evidence:`` (bare, YAML → None), ``evidence: null``, ``evidence: ""``,
+        #        ``evidence: "   "``, ``evidence: 42``, or an absent key.
+        #   (ii) advisory + evidence field present with a non-null value
+        #        → the class↔evidence type mismatch: assigning an obligation to a class the
+        #        SOT says has none. Silently accepting it lets a future editor drift the
+        #        vocabulary into a hybrid state where "advisory" sometimes carries an
+        #        obligation, which is the exact dual-management complexity Principle 2
+        #        exists to remove.
+        #
+        # ``evidence: null`` on an advisory class parses to ``None`` and is accepted — it is
+        # the "explicitly no obligation" spelling, indistinguishable from an absent key. The
+        # linter refuses to sharpen that distinction: making the two spellings mean different
+        # things is a design change, not a shape check.
         evidence = entry.get("evidence")
         if blocks:
-            # A blocking class with no evidence obligation is the escape hatch this design
-            # deliberately does not have: it would let an objection block while stating
-            # nothing a reader could check.
             if not isinstance(evidence, str) or not evidence.strip():
                 raise PrinciplesError(f"{where} is blocking but carries no 'evidence' obligation")
-        elif evidence is not None and not isinstance(evidence, str):
-            raise PrinciplesError(f"{where} has a non-string 'evidence' (got {evidence!r})")
+        elif evidence is not None:
+            raise PrinciplesError(
+                f"{where} is advisory (blocks: false) but carries an 'evidence' field "
+                f"({evidence!r}); advisory classes have no evidence obligation to state, so a "
+                f"non-null 'evidence' is a class-to-evidence type mismatch. Remove the field, "
+                f"or set it to ``null`` if the explicit spelling is preferred."
+            )
         classes[str(name)] = ObjectionClass(
             name=str(name),
             blocks=blocks,
