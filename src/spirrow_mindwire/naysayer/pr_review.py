@@ -1254,7 +1254,14 @@ _MARKER_D_DIVERGENCE = "<!-- mindwire:note D-divergence -->"
 # All three failing → NO demotion. Ranges (``:N-M``) and lists (``:N,M``) are OUT for v1
 # because the endpoints-only shape false-demotes model padding, and the all-empty shape
 # defers to v2 telemetry (AC-8 ③ triggers v2).
-_WHERE_SINGLE_LINE_RE = re.compile(r"^(?P<path>[^\s:]+):(?P<line>\d+)$")
+#
+# Path characters (PR #307 gate correction). The path segment permits any character other
+# than ``:`` (the line-number separator) and newlines — spaces are common in real
+# repositories (``Docs/My Spec.md``) and forbidding them made every objection whose
+# citation contained a space stay falsely blocking. ``:`` is still forbidden because a
+# citation like ``owner:path:line`` would parse ambiguously; the corpus does not carry
+# that shape and fetch_file_at fail-loud handles a nonsense path if one appears.
+_WHERE_SINGLE_LINE_RE = re.compile(r"^(?P<path>[^:\n]+):(?P<line>\d+)$")
 _EMPTY_LINE_RE = re.compile(r"^\s*$")
 
 
@@ -1267,10 +1274,11 @@ def _parse_single_line_where(where: str) -> tuple[str, int] | None:
     ``:line``, a non-numeric suffix like ``:head`` or ``:abc``, a URL — returns ``None``
     (caller keeps the objection blocking, unchanged). ``msg-3608 §D-2 (1) v1 final form``.
 
-    The path portion forbids whitespace and ``:`` characters — ``:`` because
-    ``owner/repo:path:line`` would parse ambiguously and a citation carrying an ``owner:``
-    fragment would be a form the corpus has never carried; a stricter path check is
-    unneeded because ``fetch_file_at`` will fail-loud on a nonsense path.
+    The path portion forbids ``:`` and newlines but permits any other character —
+    including spaces, since real repositories carry paths like ``Docs/My Spec.md`` (PR #307
+    gate correction). ``:`` remains forbidden because ``owner/repo:path:line`` would parse
+    ambiguously; a citation with an ``owner:`` fragment is a form the corpus has never
+    carried, and ``fetch_file_at`` will fail-loud on a nonsense path if one appears.
     """
     stripped = where.strip()
     m = _WHERE_SINGLE_LINE_RE.match(stripped)

@@ -1874,9 +1874,15 @@ async def test_fetch_file_at_returns_raw_text_on_200() -> None:
 
 
 @pytest.mark.anyio
-async def test_fetch_file_at_url_encodes_slashes_in_path() -> None:
-    """Docs/Filename.md-style paths must be URL-encoded so the slash does not route to
-    a different endpoint (same discipline as ``fetch_pr_diff``'s base_ref encoding)."""
+async def test_fetch_file_at_preserves_path_separators_and_encodes_segments() -> None:
+    """PR #307 gate correction. GitHub's ``/contents/{path}`` endpoint is a catch-all
+    route: nested paths reach it as ordinary URL segments (a raw ``/``), NOT with the
+    separator percent-encoded. Encoding ``/`` to ``%2F`` makes GitHub search the root
+    for a file literally named ``Docs/T07.md`` and 404 unconditionally. But INSIDE a
+    single segment, reserved characters (spaces, ``#``, ``?``) still need encoding, or
+    the query string would start early. This test pins both halves: separator raw,
+    segment contents encoded.
+    """
     raw_paths: list[bytes] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1884,8 +1890,12 @@ async def test_fetch_file_at_url_encodes_slashes_in_path() -> None:
         return httpx.Response(200, text="body")
 
     async with _client(handler) as client:
-        await client.fetch_file_at(_PR, path="Docs/T07.md", ref="abc123")
-    assert raw_paths[0].startswith(b"/repos/spirrowgames/spirrow-mindwire/contents/Docs%2FT07.md")
+        await client.fetch_file_at(_PR, path="Docs/T07 spec.md", ref="abc123")
+    # Separator between segments is a raw ``/``; the space inside the second segment is
+    # encoded to ``%20`` so it does not terminate the path portion of the URL.
+    assert raw_paths[0].startswith(
+        b"/repos/spirrowgames/spirrow-mindwire/contents/Docs/T07%20spec.md"
+    )
 
 
 @pytest.mark.anyio

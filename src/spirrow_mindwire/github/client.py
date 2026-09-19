@@ -1342,21 +1342,28 @@ class GitHubClient:
         The ``Accept: application/vnd.github.raw`` header asks the ``contents`` endpoint to
         return the raw bytes rather than the base64-wrapped JSON envelope. GitHub decodes
         the blob server-side so the driver can compare a specific line's text directly.
-        Both ``path`` (may contain ``/``, e.g. ``Docs/T07-recorder-spec.md``) and ``ref``
-        (a hex SHA in practice) are URL-encoded because a raw slash in the path segment
-        would route to a different endpoint and 404 falsely.
+
+        URL encoding note (PR #307 gate correction). The GitHub ``/contents/{path}`` endpoint
+        is a catch-all route: ``path`` must reach GitHub as ordinary URL path segments — a
+        raw ``/`` between ``Docs`` and ``T07-recorder-spec.md``, not the percent-encoded
+        ``%2F``. Encoding the separator asks GitHub for a single file literally named
+        ``Docs/T07-recorder-spec.md`` at the repository root, which always 404s for any
+        nested path. So each segment is encoded individually (``quote(seg, safe="")`` handles
+        spaces and other reserved characters in a segment) and joined with a raw ``/``. The
+        ``ref`` is passed via ``params=`` — ``httpx`` URL-encodes query parameters on our
+        behalf, so double-encoding it here would corrupt SHA fragments that happen to be
+        anything other than plain hex.
 
         See :func:`spirrow_mindwire.naysayer.pr_review.verify_citations` for the caller
         contract (memoisation on ``(path, ref)``, single-line-``where`` gate, empty-line
         predicate) and the driver-side gate-verdict override that consumes the result.
         """
-        path_seg = quote(path, safe="")
-        ref_seg = quote(ref, safe="")
+        path_seg = "/".join(quote(part, safe="") for part in path.split("/"))
         contents_path = f"/repos/{pr.owner}/{pr.repo}/contents/{path_seg}"
         try:
             resp = await self._client.get(
                 contents_path,
-                params={"ref": ref_seg},
+                params={"ref": ref},
                 headers={"Accept": "application/vnd.github.raw"},
             )
         except httpx.RequestError as exc:

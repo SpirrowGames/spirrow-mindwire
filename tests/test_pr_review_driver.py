@@ -3483,6 +3483,9 @@ def test_parse_single_line_where_accepts_path_colon_integer() -> None:
     assert _parse_single_line_where("src/x.py:42") == ("src/x.py", 42)
     assert _parse_single_line_where("Docs/T07.md:287") == ("Docs/T07.md", 287)
     assert _parse_single_line_where(" src/y.py:1\n") == ("src/y.py", 1)
+    # PR #307 gate correction: paths containing spaces are legitimate and must parse
+    # (the previous ``[^\s:]+`` regex silently kept such objections falsely blocking).
+    assert _parse_single_line_where("Docs/My Spec.md:287") == ("Docs/My Spec.md", 287)
 
 
 @pytest.mark.parametrize(
