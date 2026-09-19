@@ -158,16 +158,17 @@ def test_non_string_truthy_thread_id_is_coerced_not_ignored(raw_id: object, coer
 
 
 @pytest.mark.parametrize("raw_id", [0, [], {}, "", None])
-def test_falsy_non_string_thread_id_is_ignored(raw_id: object) -> None:
+def test_falsy_thread_id_is_ignored(raw_id: object) -> None:
     """Pin the falsy branch of the coercion so a refactor cannot silently break it.
 
     The docstring on :func:`enumerate_project` describes a strict
     divergence: truthy non-strings (``123``, ``["x"]``) coerce and
-    surface under ``unregistered``; falsy non-strings (``0``, ``[]``,
-    ``{}``, ``None``) and the empty string coerce to ``""`` via the
-    ``str(x or "")`` idiom and are dropped. Both sides of that boundary
-    must be pinned — a refactor from ``str(thread.get("thread_id") or "")``
-    to ``str(thread.get("thread_id", ""))`` would push ``0`` through as
+    surface under ``unregistered``; every falsy ``thread_id`` — the
+    falsy non-strings (``0``, ``[]``, ``{}``, ``None``) and the empty
+    string ``""`` — coerces to ``""`` via the ``str(x or "")`` idiom
+    and is dropped. Both sides of that boundary must be pinned — a
+    refactor from ``str(thread.get("thread_id") or "")`` to
+    ``str(thread.get("thread_id", ""))`` would push ``0`` through as
     ``"0"``, silently violating the falsy contract described in the
     docstring, and only the presence of this test would catch it
     (PR-gate ADVISORY on PR #298, class=``untested``). ``None`` is
@@ -176,6 +177,11 @@ def test_falsy_non_string_thread_id_is_ignored(raw_id: object) -> None:
     is a dict with the key present and the value ``None`` — different
     from ``dict.get`` returning the default because the key is absent
     (PR-gate ADVISORY on PR #298 iteration 2, class=``speculative``).
+    The empty string ``""`` is a string, not a non-string, so the test
+    name uses the umbrella term "falsy" rather than "non-string" — the
+    property that unites all five parametrised values is that they are
+    all falsy under Python truth-testing (PR-gate ADVISORY on PR #298
+    iteration 3, class=``naming``).
     """
     registered = _index(projects=("p",))
     threads = [{"thread_id": raw_id, "status": "active"}]
