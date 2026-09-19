@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -604,3 +605,220 @@ async def test_proxy_preserves_assign_error_when_terminate_also_raises(
             await proxy.open_process("cmd")
     finally:
         _JOB_HANDLE_CTX.reset(token)
+
+
+# --------------------------------------------------------------------------- #
+# PR-gate #299 round 3 regression: when ``exe_absolute_path`` is a bare name
+# like ``"claude"`` (the fallback of ``_default_sdk_executable_path`` when
+# the bundled binary is missing AND ``shutil.which`` returns None), the
+# belt's matching logic must NOT compare ``os.path.abspath("claude")``
+# (which prepends CWD, guaranteeing a mismatch) against the child's real
+# absolute path. It must fall back to a case-insensitive basename check.
+# The naysayer showed the pre-fix code silently skipped every child under
+# this condition, defeating the entire finally-runs-lookup safety net.
+# --------------------------------------------------------------------------- #
+
+
+def test_lookup_and_assign_leftover_matches_child_via_basename_when_target_is_bare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-gate #299 round 3: bare "claude" target must still match a child."""
+    if not _IS_WINDOWS:
+        pytest.skip("Windows-only enumeration path")
+
+    class _FakePywintypes:
+        class error(Exception):  # noqa: N801, N818
+            pass
+
+    class _FakeChild:
+        def __init__(self, pid: int, exe_path: str) -> None:
+            self.pid = pid
+            self._exe = exe_path
+
+        def exe(self) -> str:
+            return self._exe
+
+    class _FakeProc:
+        def __init__(self, children: list[_FakeChild]) -> None:
+            self._children = children
+
+        def children(self) -> list[_FakeChild]:
+            return self._children
+
+    class _FakePsutil:
+        class NoSuchProcess(Exception):  # noqa: N818
+            pass
+
+        class AccessDenied(Exception):  # noqa: N818
+            pass
+
+        def __init__(self, children: list[_FakeChild]) -> None:
+            self._children = children
+
+        def Process(self, _pid: int) -> _FakeProc:  # noqa: N802
+            return _FakeProc(self._children)
+
+    # The child's REAL absolute path (a location the daemon's CWD will never
+    # match: PATH-installed Python scripts directory).
+    real_child_exe = r"C:\Python311\Scripts\claude.exe"
+    fake_child = _FakeChild(pid=9999, exe_path=real_child_exe)
+
+    rec = _AccessRightsRecorder()
+    fake_job = _FakeJobModuleWithVerify()
+    fake_job.is_in_job_answer = False  # force the Assign path
+    monkeypatch.setitem(sys.modules, "win32api", rec)
+    monkeypatch.setitem(sys.modules, "win32job", fake_job)
+    monkeypatch.setitem(sys.modules, "pywintypes", _FakePywintypes)
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil([fake_child]))
+
+    state = JobState(handle=0xB0B, session_id="s1")
+    # Pass the bare-name fallback — the exact string
+    # ``_default_sdk_executable_path`` returns when nothing resolves.
+    _sdk_job_hook.lookup_and_assign_leftover(state, "claude")
+
+    # Pre-fix behaviour: 0 OpenProcess calls (silent skip because
+    # abspath("claude") != C:\Python311\Scripts\claude.exe).
+    # Post-fix behaviour: exactly 1 OpenProcess call (basename match hit).
+    assert len(rec.open_access_masks) == 1, (
+        "belt matched 0 children — bare-name target ('claude') failed to hit "
+        r"the child C:\Python311\Scripts\claude.exe via basename fallback "
+        "(PR-gate #299 round 3)"
+    )
+
+
+def test_lookup_and_assign_leftover_matches_claude_exe_when_target_bare_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare ``"claude"`` target must also match a ``claude.exe`` child.
+
+    Windows treats ``claude`` and ``claude.exe`` as the same command; the
+    belt normalizes the target basename by appending ``.exe`` if absent so
+    the two forms compare equal.
+    """
+    if not _IS_WINDOWS:
+        pytest.skip("Windows-only enumeration path")
+
+    class _FakePywintypes:
+        class error(Exception):  # noqa: N801, N818
+            pass
+
+    class _FakeChild:
+        def __init__(self, pid: int, exe_path: str) -> None:
+            self.pid = pid
+            self._exe = exe_path
+
+        def exe(self) -> str:
+            return self._exe
+
+    class _FakeProc:
+        def __init__(self, children: list[_FakeChild]) -> None:
+            self._children = children
+
+        def children(self) -> list[_FakeChild]:
+            return self._children
+
+    class _FakePsutil:
+        class NoSuchProcess(Exception):  # noqa: N818
+            pass
+
+        class AccessDenied(Exception):  # noqa: N818
+            pass
+
+        def __init__(self, children: list[_FakeChild]) -> None:
+            self._children = children
+
+        def Process(self, _pid: int) -> _FakeProc:  # noqa: N802
+            return _FakeProc(self._children)
+
+    # Mix: one matching CLAUDE.EXE (case-insensitive), one unrelated child.
+    matching = _FakeChild(pid=1000, exe_path=r"C:\opt\node\CLAUDE.EXE")
+    unrelated = _FakeChild(pid=1001, exe_path=r"C:\Windows\System32\cmd.exe")
+
+    rec = _AccessRightsRecorder()
+    fake_job = _FakeJobModuleWithVerify()
+    fake_job.is_in_job_answer = False
+    monkeypatch.setitem(sys.modules, "win32api", rec)
+    monkeypatch.setitem(sys.modules, "win32job", fake_job)
+    monkeypatch.setitem(sys.modules, "pywintypes", _FakePywintypes)
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil([matching, unrelated]))
+
+    state = JobState(handle=0xB0B, session_id="s1")
+    _sdk_job_hook.lookup_and_assign_leftover(state, "claude")
+
+    # Only the matching child should have been OpenProcess'd.
+    assert len(rec.open_access_masks) == 1, (
+        "belt matched wrong number of children — bare 'claude' should match "
+        "CLAUDE.EXE (case-insensitive) but skip cmd.exe"
+    )
+
+
+def test_lookup_and_assign_leftover_absolute_target_still_uses_full_path_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Sanity: when the target IS a real absolute path, full-path matching
+    still applies — the basename fallback must NOT loosen behaviour for
+    real absolute targets. A child with the same basename but a different
+    absolute path is correctly skipped.
+    """
+    if not _IS_WINDOWS:
+        pytest.skip("Windows-only enumeration path")
+
+    class _FakePywintypes:
+        class error(Exception):  # noqa: N801, N818
+            pass
+
+    class _FakeChild:
+        def __init__(self, pid: int, exe_path: str) -> None:
+            self.pid = pid
+            self._exe = exe_path
+
+        def exe(self) -> str:
+            return self._exe
+
+    class _FakeProc:
+        def __init__(self, children: list[_FakeChild]) -> None:
+            self._children = children
+
+        def children(self) -> list[_FakeChild]:
+            return self._children
+
+    class _FakePsutil:
+        class NoSuchProcess(Exception):  # noqa: N818
+            pass
+
+        class AccessDenied(Exception):  # noqa: N818
+            pass
+
+        def __init__(self, children: list[_FakeChild]) -> None:
+            self._children = children
+
+        def Process(self, _pid: int) -> _FakeProc:  # noqa: N802
+            return _FakeProc(self._children)
+
+    # A real, existing absolute path — we use tmp_path to guarantee it
+    # exists at test time (so ``os.path.exists`` returns True and the belt
+    # takes the STRICT full-path branch).
+    real_target = tmp_path / "claude.exe"
+    real_target.write_bytes(b"")
+
+    # A different absolute path with the SAME basename — must be skipped.
+    other_claude = _FakeChild(pid=1000, exe_path=r"C:\Somewhere\Else\claude.exe")
+
+    rec = _AccessRightsRecorder()
+    fake_job = _FakeJobModuleWithVerify()
+    fake_job.is_in_job_answer = False
+    monkeypatch.setitem(sys.modules, "win32api", rec)
+    monkeypatch.setitem(sys.modules, "win32job", fake_job)
+    monkeypatch.setitem(sys.modules, "pywintypes", _FakePywintypes)
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil([other_claude]))
+
+    state = JobState(handle=0xB0B, session_id="s1")
+    _sdk_job_hook.lookup_and_assign_leftover(state, str(real_target))
+
+    # 0 matches — the real absolute target does NOT match the differently
+    # located claude.exe child. This is the correct behaviour: strict
+    # matching when we have a real path, loose matching only when we don't.
+    assert len(rec.open_access_masks) == 0, (
+        "belt loosened matching for a real absolute target — the basename "
+        "fallback must ONLY apply when the target is not a real absolute path"
+    )

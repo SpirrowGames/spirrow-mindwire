@@ -166,11 +166,25 @@ def _default_sdk_executable_path() -> str:
     """Best-effort absolute path to the bundled SDK ``claude`` executable.
 
     Used by ``lookup_and_assign_leftover`` as the identity check when walking
-    the daemon's direct children. On POSIX (no Job Objects) this is only ever
-    consulted after a raise, so a wrong value cannot leak beyond the
-    diagnostic. On Windows the bundled binary is
-    ``claude_agent_sdk/_bundled/claude.exe``; if we cannot import the SDK we
-    fall back to ``"claude"`` and let the caller's normalization decide.
+    the daemon's direct children. Three resolution strategies, tried in
+    order:
+
+    1. The SDK's bundled binary (``claude_agent_sdk/_bundled/claude.exe``).
+       This is the canonical location for the vendored CLI.
+    2. ``shutil.which("claude")`` — resolves the PATH to a real executable
+       location. PR-gate #299 round 3 blocker: if the bundled binary is
+       missing (system install, refactored SDK layout, or a stub package),
+       the previous code returned the bare string ``"claude"``. The belt in
+       ``lookup_and_assign_leftover`` then compared ``os.path.abspath\
+       ("claude")`` — which does NOT do a PATH lookup — against the child's
+       real absolute path, guaranteeing a mismatch and rendering the belt
+       useless. ``shutil.which`` fixes this by producing a real absolute
+       path.
+    3. The bare string ``"claude"``. The belt normalizes both sides and,
+       when the target is not a real absolute path, falls back to a
+       case-insensitive basename comparison (see
+       ``_sdk_job_hook.lookup_and_assign_leftover``). This preserves the
+       belt's utility even under total resolution failure.
     """
     try:
         import claude_agent_sdk
@@ -181,6 +195,15 @@ def _default_sdk_executable_path() -> str:
             return str(candidate)
     except Exception:
         pass
+    # Fallback 2 (PR-gate #299 round 3): try PATH via shutil.which. On
+    # Windows shutil.which auto-appends .exe if omitted; on POSIX it uses
+    # the bare name.
+    import shutil
+
+    resolved = shutil.which("claude") or shutil.which("claude.exe")
+    if resolved:
+        return resolved
+    # Fallback 3: bare name. The belt handles this via basename comparison.
     return "claude"
 
 

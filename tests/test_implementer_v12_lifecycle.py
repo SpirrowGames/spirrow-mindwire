@@ -354,3 +354,78 @@ async def test_spawn_on_posix_falls_through_when_create_raises(tmp_path: Path) -
     # No Job to close — halt is still safe.
     await adapter.halt(handle)
     assert job.close_calls == []
+
+
+# --------------------------------------------------------------------------- #
+# PR-gate #299 round 3 regression: _default_sdk_executable_path must try
+# shutil.which as a fallback before returning the bare string "claude".
+# The bare-string fallback still exists, but it should be a last resort so
+# the belt's basename comparison can absorb it — the primary path is a real
+# absolute path resolved via PATH.
+# --------------------------------------------------------------------------- #
+
+
+def test_default_sdk_executable_path_uses_shutil_which_when_bundled_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the SDK's bundled claude.exe is missing, PATH resolution takes over.
+
+    Simulates a system-installed claude by (1) creating a fake claude.exe in
+    ``tmp_path``, (2) monkeypatching ``shutil.which`` to return that path,
+    and (3) monkeypatching ``claude_agent_sdk.__file__`` so the bundled
+    lookup path resolves to a non-existent location. The function should
+    return the ``shutil.which`` result — NOT the bare ``"claude"`` string.
+    """
+    import shutil
+
+    from spirrow_mindwire.adapters import implementer as impl
+
+    # Fake system-installed claude.exe.
+    system_claude = tmp_path / "system_claude.exe"
+    system_claude.write_bytes(b"")
+
+    def _fake_which(name: str) -> str | None:
+        if name in ("claude", "claude.exe"):
+            return str(system_claude)
+        return None
+
+    # Force the bundled-binary check to fail: point ``claude_agent_sdk.__file__``
+    # at a non-existent location so the ``.exists()`` check returns False.
+    import claude_agent_sdk
+
+    monkeypatch.setattr(
+        claude_agent_sdk, "__file__", str(tmp_path / "nonexistent_pkg" / "__init__.py")
+    )
+    monkeypatch.setattr(shutil, "which", _fake_which)
+
+    resolved = impl._default_sdk_executable_path()
+
+    assert resolved == str(system_claude), (
+        f"expected shutil.which result {system_claude!r}, got {resolved!r} — "
+        f"the PR-gate #299 round 3 bare-string fallback (returning 'claude') "
+        f"was reached instead"
+    )
+
+
+def test_default_sdk_executable_path_returns_bare_claude_as_last_resort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only when BOTH bundled AND shutil.which fail, the bare 'claude' fallback.
+
+    The belt in ``_sdk_job_hook.lookup_and_assign_leftover`` handles this
+    string via basename comparison (see the round 3 tests over there), so
+    the belt still works even under total resolution failure.
+    """
+    import shutil
+
+    import claude_agent_sdk
+
+    from spirrow_mindwire.adapters import implementer as impl
+
+    monkeypatch.setattr(
+        claude_agent_sdk, "__file__", str(tmp_path / "nonexistent_pkg" / "__init__.py")
+    )
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    resolved = impl._default_sdk_executable_path()
+    assert resolved == "claude"

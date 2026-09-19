@@ -303,7 +303,33 @@ def lookup_and_assign_leftover(job_state: JobState, exe_absolute_path: str) -> N
     import win32api
     import win32job
 
-    normalized_target = os.path.normcase(os.path.abspath(exe_absolute_path))
+    # PR-gate #299 round 3 blocker: matching strategy MUST handle the case
+    # where the caller's ``exe_absolute_path`` is not, in fact, a real
+    # absolute path — that happens when ``_default_sdk_executable_path``
+    # falls through both the bundled binary and ``shutil.which`` fallbacks
+    # and returns the bare string ``"claude"``. ``os.path.abspath("claude")``
+    # does NOT do a PATH lookup: it prepends the daemon's current working
+    # directory, guaranteeing a mismatch against every child's real absolute
+    # path. That silently defeated the entire belt.
+    #
+    # Fix: use full absolute-path matching ONLY when the target is a real
+    # absolute path that exists. Otherwise fall back to a case-insensitive
+    # basename comparison — safe because the enumeration is restricted to
+    # ``os.getpid()``'s DIRECT children (any ``claude.exe`` at that scope
+    # was spawned by us or by the SDK we own).
+    target = exe_absolute_path
+    target_is_real_path = os.path.isabs(target) and os.path.exists(target)
+    if target_is_real_path:
+        normalized_target = os.path.normcase(os.path.abspath(target))
+        target_basename = None
+    else:
+        normalized_target = None
+        target_basename = os.path.basename(target).lower()
+        # A target with no extension (e.g. bare "claude") should also match
+        # "claude.exe" on Windows — the OS treats them as the same command.
+        if not target_basename.endswith(".exe"):
+            target_basename = target_basename + ".exe"
+
     try:
         children = psutil.Process(os.getpid()).children()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -314,8 +340,12 @@ def lookup_and_assign_leftover(job_state: JobState, exe_absolute_path: str) -> N
             child_exe = child.exe()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-        if os.path.normcase(os.path.abspath(child_exe)) != normalized_target:
-            continue
+        if normalized_target is not None:
+            if os.path.normcase(os.path.abspath(child_exe)) != normalized_target:
+                continue
+        else:
+            if os.path.basename(child_exe).lower() != target_basename:
+                continue
         # PROCESS_QUERY_LIMITED_INFORMATION is required by IsProcessInJob (see
         # is_process_in_job). PR-gate #299 blocker: without it the belt's
         # IsProcessInJob raised ACCESS_DENIED and silently skipped every child,
