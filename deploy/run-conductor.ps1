@@ -29,71 +29,26 @@ $env:PYTHONIOENCODING = "utf-8"
 # implementer inference: the local Claude subscription reaches Anthropic directly (NOT via Lexora).
 # The default target is Anthropic's public API URL; only override if you have your own reason
 # (proxy, test double, etc.) — this is not an infra-value leak, so a public default is fine.
+# (Not dual-management with an SDK auto-default: ``ImplementerSdkAdapter.spawn`` refuses to spawn
+# without a set env var, so this line is what satisfies that requirement, not a redundant mirror.)
 if (-not $env:MINDWIRE_IMPLEMENTER_BASE_URL) { $env:MINDWIRE_IMPLEMENTER_BASE_URL = "https://api.anthropic.com" }
-# INTERNAL INFRA endpoints — resolution + validation both live in Python. The validation is
-# lazy (each variable is checked at the moment its consumer is constructed / a session is
-# spawned), NOT at wrapper start. The wrapper does NOT pre-flight these because a wrapper-side
-# check would either duplicate the Python message (drift risk — PR #296 pr-gate advisory,
-# msg-3484) or diverge from it (two different rationales for the same rule):
 #
-#   * MINDWIRE_MAGICKIT_MCP_URL  → validated in ``spirrow_mindwire.magickit.client.magickit_mcp_url``.
-#                                  Unset raises ``MagickitMcpError`` from
-#                                  ``StreamableHttpChatroomMcp.__init__`` — the MCP client is
-#                                  constructed inside the composition root
-#                                  (``spirrow_mindwire.loop_runner._build_dispatcher``), so this
-#                                  fails as part of daemon startup for BOTH ``run_loop`` and
-#                                  ``run_conductor``, before either enters its event loop.
-#                                  No in-code fallback per ADR-2026-06-04-18 v1.1 §2 D-2.
-#   * MINDWIRE_NAYSAYER_BASE_URL → read at ``NaysayerSdkAdapter.__init__`` (composition-root time)
-#                                  but only VALIDATED at ``NaysayerSdkAdapter.spawn``, when a
-#                                  naysayer session is actually summoned. An empty value raises
-#                                  ``NaysayerSdkSpawnError`` at that point. If a daemon is
-#                                  configured without any naysayer-triggering watches and sits
-#                                  idle, this variable is not checked until the first summon.
-#                                  Independence rationale per ADR-2026-05-21-05 §5.
-#   * MINDWIRE_LEXORA_URL        → optional in ``spirrow_mindwire.lexora.client.lexora_url``.
-#                                  Unset falls back to the safe-by-design loopback (Lexora binds
-#                                  0.0.0.0 + no auth, so loopback is the only default that does
-#                                  not widen the unauthenticated surface). Operators on a host
-#                                  where Lexora is NOT co-resident set the env from
-#                                  [[platform:infra-registry]].
+# INTERNAL INFRA endpoints — the operator resolves values from [[platform:infra-registry]] and
+# sets them as persistent user env vars (sourced from Vaultwarden, mirroring the token below).
+# Validation lives in Python — the wrapper does NOT pre-flight (single source of truth,
+# PR #296 pr-gate advisory msg-3484 / msg-3516 / T-public-repo-carries-real-infra-values):
 #
-# The operator resolves the required values from [[platform:infra-registry]] and sets them
-# (persistent user env var sourced from Vaultwarden, mirroring the MINDWIRE_NAYSAYER_GITHUB_TOKEN
-# secret handling below). What "fail loud" means for each variable depends on WHERE Python raises
-# and WHICH mode this wrapper launches — the wrapper launches ``mindwire-loop --mode conductor``
-# (see the ``uv run`` line at the bottom of this file), so the guarantees below hold for THIS
-# wrapper specifically; a different wrapper that launches ``--mode watcher`` would see different
-# behaviour, called out inline where it diverges (see PR #296 pr-gate advisory, msg-3516):
+#   Variable                       | Required | Checked at                    | Python owner
+#   -------------------------------|----------|-------------------------------|-------------
+#   MINDWIRE_MAGICKIT_MCP_URL      | required | daemon startup                | spirrow_mindwire.magickit.client (magickit_mcp_url)
+#   MINDWIRE_NAYSAYER_BASE_URL     | required | first naysayer summon         | spirrow_mindwire.adapters.naysayer_sdk (NaysayerSdkAdapter)
+#   MINDWIRE_LEXORA_URL            | optional | on use (loopback default)     | spirrow_mindwire.lexora.client (lexora_url)
 #
-#   * MAGICKIT_MCP_URL missing → the daemon fails during startup, before any event loop entry.
-#     ``StreamableHttpChatroomMcp()`` is constructed inside the composition root
-#     (``spirrow_mindwire.loop_runner._build_dispatcher``), so the ``MagickitMcpError`` propagates
-#     out of ``asyncio.run(run_conductor(...))`` (or ``asyncio.run(run_loop(...))`` under watcher
-#     mode; magickit URL is composition-root-checked in BOTH modes) and the process exits non-zero
-#     via the default excepthook (``spirrow_mindwire.loop_runner.main``'s ``except BaseException``
-#     re-raises for this class of error). Operator-visible: within seconds of ``uv run`` starting.
-#
-#   * NAYSAYER_BASE_URL missing → the failure timing depends on the mode:
-#       - CONDUCTOR mode (what THIS wrapper launches): ``Conductor.run()`` awaits
-#         ``spawn_instance`` sequentially — no ``asyncio.create_task``, no per-turn task-exception
-#         swallow — so a ``NaysayerSdkSpawnError`` at the first naysayer summon propagates through
-#         ``run_conductor`` (unwrapped except a ``finally`` for teardown) into ``asyncio.run``, out
-#         to ``main``, and the process exits non-zero. Operator-visible: when the design thread
-#         first summons a naysayer. If the conductor's task_thread reaches a stop condition
-#         without ever summoning one, the misconfiguration is not surfaced by this wrapper's run.
-#       - WATCHER mode (NOT launched here — flagged so operators forking this file for
-#         ``--mode watcher`` do not inherit a false expectation): ``ChatroomWatcher.run`` wraps
-#         each ``poll_once()`` in ``except Exception: logger.exception("chatroom poll failed;
-#         continuing")`` (see ``src/spirrow_mindwire/magickit/watcher.py`` line ~224). Under that
-#         swallow the daemon does NOT exit — the same ``NaysayerSdkSpawnError`` recurs every
-#         ``poll_interval_seconds`` in the log while process supervisors see a healthy daemon.
-#         Only a startup-time validation (or narrowing the watcher's except to exclude spawn-time
-#         config faults) would make watcher-mode fail loud on this variable. Out of scope for
-#         this wrapper; recorded here so the divergence is visible.
-#
-#   * LEXORA_URL missing → no failure. Falls back to the safe-by-design loopback default (see
-#     the LEXORA row in the block above).
+# The Python owner listed above is the ONE place that raises on a missing / empty value, records
+# the ADR rationale, and documents the process-exit story (per --mode where it diverges). See
+# that module for the fail-loud contract, the mode-specific exit timing, and why there is no
+# in-code fallback. Do not paraphrase those docs here — that is the dual-management drift the
+# advisory called out.
 
 # --- secret precondition (fail loud, never hardcode) -------------------------------------------
 if (-not $env:MINDWIRE_NAYSAYER_GITHUB_TOKEN) {

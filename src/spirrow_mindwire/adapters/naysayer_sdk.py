@@ -22,6 +22,48 @@ agent always reasons under the current, versioned principles.
 ``capabilities`` carries ``NAYSAYER_QUALIFIED`` (independent model → may fill the
 naysayer slot) and omits ``EXECUTE_CODE`` (design-time review is advice, not repo
 mutation — advisory, not a veto, ADR-17 D-5).
+
+**Environment variable — ``MINDWIRE_NAYSAYER_BASE_URL``** (single source of
+validation, T-public-repo-carries-real-infra-values PR #296 pr-gate advisory
+msg-3484 + msg-3516). This adapter is the ONE place that validates the
+variable; the deploy wrappers deliberately do NOT duplicate the check.
+
+*When*: :meth:`NaysayerSdkAdapter.__init__` **reads** the env into
+``self._inference_base_url`` but does **not** validate. The check happens at
+:meth:`NaysayerSdkAdapter.spawn` (see the guard on ``self._inference_base_url``
+that raises :class:`NaysayerSdkSpawnError`), which runs when a naysayer session
+is actually summoned. That is intentional — it lets a daemon that never needs
+a naysayer (e.g. an operator-lane conductor working purely on the operator
+thread) start without a value.
+
+*Process-exit timing (per ``--mode``)*: the exit story diverges by mode
+because different call sites treat spawn failures differently. Producers
+forking the deploy wrappers should read this before adding their own preflight
+(the wrappers document only the mode they launch and point here for the rest):
+
+  - ``--mode conductor`` (launched by ``deploy/run-conductor.ps1``):
+    :meth:`Conductor.run` awaits ``spawn_instance`` sequentially — no
+    ``asyncio.create_task`` and no per-turn task-exception swallow — so a
+    :class:`NaysayerSdkSpawnError` at the first naysayer summon propagates
+    through ``run_conductor`` (unwrapped except a ``finally`` for teardown),
+    out to ``asyncio.run``, and the process exits non-zero via the default
+    excepthook. Operator-visible: at first naysayer summon on a design thread.
+    If the conductor's task_thread hits a stop condition without ever summoning
+    a naysayer, an unset value is not surfaced by that run.
+  - ``--mode watcher``: :meth:`ChatroomWatcher.run` wraps each ``poll_once()``
+    in ``except Exception: logger.exception("chatroom poll failed; continuing")``
+    (see ``src/spirrow_mindwire/magickit/watcher.py``). Under that swallow the
+    daemon does NOT exit — a :class:`NaysayerSdkSpawnError` from an unset value
+    recurs every ``poll_interval_seconds`` in the log while process supervisors
+    see a healthy daemon. Making watcher-mode fail loud on this variable would
+    require either narrowing the watcher's ``except`` to exclude spawn-time
+    config faults or an explicit startup-time validation pass. Out of scope
+    for this adapter; called out so the divergence is documented in ONE place.
+
+The :meth:`spawn` body itself (below) contains the older, more detailed
+account of ``_run_preflight`` failure — that account is about attestation
+outcomes (backend mismatch vs transient 502) rather than env-config faults;
+the two accounts are complementary, not duplicative.
 """
 
 from __future__ import annotations
