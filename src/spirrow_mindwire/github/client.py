@@ -448,6 +448,8 @@ class GitHubReviewClient(Protocol):
         self, pr: PrRef, *, reviewer_login: str
     ) -> list[CrossPrApproveCoverage]: ...
 
+    async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -1315,6 +1317,68 @@ class GitHubClient:
         except httpx.RequestError:
             return 0
         return int(resp.status_code)
+
+    async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None:
+        """``GET /repos/{owner}/{repo}/contents/{path}?ref={ref}`` → raw file bytes at ``ref``.
+
+        The T-gate-blocks-on-miscounted-line-numbers verification step. When a blocking
+        objection cites ``path:line``, the driver reads the head-side file at ``ref`` (the
+        PR's ``head.sha``) so the citation can be checked against the actual tree the
+        reviewer saw — not the compare-diff, which loses the line-number frame outside
+        each hunk.
+
+        Fail direction is fixed by design (Bohr msg-3604 D-7 endorsed by Einstein msg-3605):
+
+        * ``404`` → ``None``. "The path does not exist at ``ref``" is a definite,
+          machine-readable answer distinct from "we could not ask"; the caller keeps the
+          objection blocking on ``None`` (fail-closed on the DEMOTION direction — a
+          citation whose file cannot be read is not evidence that the citation is wrong).
+        * any other non-2xx / network error → :class:`GitHubHTTPError` (fail-loud). A
+          silent "do-not-demote" here would let a GitHub outage look identical to a
+          confirmed non-empty line, hiding the exact ``verify_citations`` failure the
+          gate notice needs to surface (ADR-2026-06-03-16: APPROVE implies verified CI
+          state, and by extension the gate never lies about what it read).
+
+        The ``Accept: application/vnd.github.raw`` header asks the ``contents`` endpoint to
+        return the raw bytes rather than the base64-wrapped JSON envelope. GitHub decodes
+        the blob server-side so the driver can compare a specific line's text directly.
+
+        URL encoding note (PR #307 gate correction). The GitHub ``/contents/{path}`` endpoint
+        is a catch-all route: ``path`` must reach GitHub as ordinary URL path segments — a
+        raw ``/`` between ``Docs`` and ``T07-recorder-spec.md``, not the percent-encoded
+        ``%2F``. Encoding the separator asks GitHub for a single file literally named
+        ``Docs/T07-recorder-spec.md`` at the repository root, which always 404s for any
+        nested path. So each segment is encoded individually (``quote(seg, safe="")`` handles
+        spaces and other reserved characters in a segment) and joined with a raw ``/``. The
+        ``ref`` is passed via ``params=`` — ``httpx`` URL-encodes query parameters on our
+        behalf, so double-encoding it here would corrupt SHA fragments that happen to be
+        anything other than plain hex.
+
+        See :func:`spirrow_mindwire.naysayer.pr_review.verify_citations` for the caller
+        contract (memoisation on ``(path, ref)``, single-line-``where`` gate, empty-line
+        predicate) and the driver-side gate-verdict override that consumes the result.
+        """
+        path_seg = "/".join(quote(part, safe="") for part in path.split("/"))
+        contents_path = f"/repos/{pr.owner}/{pr.repo}/contents/{path_seg}"
+        try:
+            resp = await self._client.get(
+                contents_path,
+                params={"ref": ref},
+                headers={"Accept": "application/vnd.github.raw"},
+            )
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {contents_path} (contents): {exc}") from exc
+        if resp.status_code == 404:
+            return None
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {contents_path} (contents) returned {resp.status_code}: "
+                f"{_error_detail(resp)}",
+                status_code=resp.status_code,
+                retry_after=_retry_after_seconds(resp),
+                rate_limited=_is_rate_limited(resp),
+            )
+        return resp.text
 
 
 def _check_row(node: dict[str, Any]) -> CheckRow | None:

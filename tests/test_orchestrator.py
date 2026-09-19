@@ -1224,6 +1224,11 @@ class _FakeGitHubCi:
         # GitHubReviewClient Protocol compliance (T-gate-review-submit-failure-handling PR-A).
         return 200
 
+    async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None:
+        # Orchestrator L2 tests never exercise the T-gate-blocks-on-miscounted-line-numbers
+        # verify_citations pass. Kept for GitHubReviewClient Protocol compliance.
+        raise NotImplementedError
+
     async def aclose(self) -> None:
         return None
 

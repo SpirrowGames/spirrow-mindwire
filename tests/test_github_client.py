@@ -1837,3 +1837,117 @@ def test_target_terminal_error_carries_rate_limit_hints_when_source_does() -> No
     wrapped = TargetTerminalError(src)
     assert wrapped.retry_after == 12.5
     assert wrapped.rate_limited is True
+
+
+# ---------- fetch_file_at (T-gate-blocks-on-miscounted-line-numbers) ------- #
+
+
+@pytest.mark.anyio
+async def test_fetch_file_at_returns_raw_text_on_200() -> None:
+    """Happy path: ``contents`` returns the raw file bytes when the ``Accept:
+    application/vnd.github.raw`` header is honoured, and the URL is
+    ``/repos/.../contents/{path}?ref={sha}``."""
+    calls: list[tuple[str, str, str | None, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(
+            (
+                request.method,
+                request.url.path,
+                request.headers.get("accept"),
+                request.url.params.get("ref"),
+            )
+        )
+        return httpx.Response(200, text="line1\nline2\n")
+
+    async with _client(handler) as client:
+        content = await client.fetch_file_at(_PR, path="src/x.py", ref="abcdef012345")
+    assert content == "line1\nline2\n"
+    assert calls == [
+        (
+            "GET",
+            "/repos/spirrowgames/spirrow-mindwire/contents/src/x.py",
+            "application/vnd.github.raw",
+            "abcdef012345",
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_fetch_file_at_preserves_path_separators_and_encodes_segments() -> None:
+    """PR #307 gate correction. GitHub's ``/contents/{path}`` endpoint is a catch-all
+    route: nested paths reach it as ordinary URL segments (a raw ``/``), NOT with the
+    separator percent-encoded. Encoding ``/`` to ``%2F`` makes GitHub search the root
+    for a file literally named ``Docs/T07.md`` and 404 unconditionally. But INSIDE a
+    single segment, reserved characters (spaces, ``#``, ``?``) still need encoding, or
+    the query string would start early. This test pins both halves: separator raw,
+    segment contents encoded.
+    """
+    raw_paths: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw_paths.append(request.url.raw_path)
+        return httpx.Response(200, text="body")
+
+    async with _client(handler) as client:
+        await client.fetch_file_at(_PR, path="Docs/T07 spec.md", ref="abc123")
+    # Separator between segments is a raw ``/``; the space inside the second segment is
+    # encoded to ``%20`` so it does not terminate the path portion of the URL.
+    assert raw_paths[0].startswith(
+        b"/repos/spirrowgames/spirrow-mindwire/contents/Docs/T07%20spec.md"
+    )
+
+
+@pytest.mark.anyio
+async def test_fetch_file_at_returns_none_on_404() -> None:
+    """A 404 is a positive machine-readable answer: the path does not exist at ``ref``.
+    Distinct from a network error (which raises) — the caller uses this to keep the
+    objection blocking (msg-3604 D-2 (2)) without a fail-loud reason to abort the review."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    async with _client(handler) as client:
+        result = await client.fetch_file_at(_PR, path="Docs/missing.md", ref="abc")
+    assert result is None
+
+
+@pytest.mark.anyio
+async def test_fetch_file_at_5xx_raises_github_http_error() -> None:
+    """AC-5 fail-loud. A 5xx from the ``contents`` endpoint surfaces as
+    :class:`GitHubHTTPError`; the driver's ``verify_citations`` propagates it and the
+    review fails rather than silently claiming the citation was verified."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="Service Unavailable")
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError) as exc:
+            await client.fetch_file_at(_PR, path="x.py", ref="abc")
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.anyio
+async def test_fetch_file_at_403_raises_github_http_error() -> None:
+    """403 (rate limit / permission) is fail-loud too — not a silent "not there"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="rate limited")
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError) as exc:
+            await client.fetch_file_at(_PR, path="x.py", ref="abc")
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_fetch_file_at_transport_error_raises_github_http_error() -> None:
+    """A transport-level failure (DNS, connection refused, timeout) also surfaces
+    fail-loud — the caller does not distinguish "we could not ask" from a 5xx."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError):
+            await client.fetch_file_at(_PR, path="x.py", ref="abc")
