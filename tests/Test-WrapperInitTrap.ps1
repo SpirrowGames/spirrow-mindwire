@@ -182,7 +182,7 @@ exit `$LASTEXITCODE
     Set-Content -LiteralPath $runnerPath -Value $runnerScript -Encoding utf8
 
     $procA = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $runnerPath) `
-        -PassThru -Wait -WindowStyle Hidden `
+        -PassThru -Wait `
         -RedirectStandardOutput (Join-Path $tempRoot "A-stdout.txt") `
         -RedirectStandardError  (Join-Path $tempRoot "A-stderr.txt")
     Check "case A: exit code is 1 (LastTaskResult=0x1 contract)" 1 $procA.ExitCode
@@ -218,7 +218,7 @@ exit `$LASTEXITCODE
     Set-Content -LiteralPath $runnerPathB -Value $runnerScriptB -Encoding utf8
 
     $procB = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $runnerPathB) `
-        -PassThru -Wait -WindowStyle Hidden `
+        -PassThru -Wait `
         -RedirectStandardOutput (Join-Path $tempRoot "B-stdout.txt") `
         -RedirectStandardError  (Join-Path $tempRoot "B-stderr.txt")
     Check "case B: exit code is 1 even when the Discord POST fails" 1 $procB.ExitCode
