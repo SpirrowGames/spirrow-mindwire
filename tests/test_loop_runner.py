@@ -286,13 +286,16 @@ class _FakeGitHub:
 # --------------------------------------------------------------------------- #
 # Stage3ProposerAdapter: read-only (drops EXECUTE_CODE)
 #
-# The tests below split along the persona / role axis that Takahito's msg-3507
-# and ADR-2026-05-27-09 (identity 4 layers) make explicit. Bohr the *persona*
-# has a tool面 (:data:`_BOHR_BUILTIN_TOOLS`); the proposer *role* has a
-# contract (cannot change the tree). They are orthogonal and the tests below
-# treat them that way — persona-scoped fact tests read from the persona
-# constant, role-scoped invariant tests read from the adapter's
-# ``capabilities`` and from :class:`_PathScopeGuard`'s admissible set.
+# The tests below split along two axes named by Takahito's msg-3507 and
+# ADR-2026-05-27-09 (identity 4 layers): Bohr the *persona* has a tool面
+# (:data:`_BOHR_BUILTIN_TOOLS`); the proposer *role* has a contract (cannot
+# change the tree). The name of the constant reflects that split; the runtime
+# composition does not yet parameterise the proposer factory by persona, so
+# the split is a naming discipline the tests below defend rather than a
+# structural decoupling the code enacts. Fact tests about what Bohr's tools
+# are today read from the persona-named constant; role-invariant tests read
+# from the adapter's ``capabilities`` and from :class:`_PathScopeGuard`'s
+# admissible set, which is where the role's read-only-ness actually lives.
 # --------------------------------------------------------------------------- #
 
 

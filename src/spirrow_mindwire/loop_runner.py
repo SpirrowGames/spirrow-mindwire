@@ -114,9 +114,10 @@ class Stage3ProposerAdapter(ClaudeCodeSdkAdapter):
     It was text-only (``tools=[]``) until it turned out that a proposer which
     cannot open a file cannot check a claim either; see
     :data:`_BOHR_BUILTIN_TOOLS` for what the persona currently playing this
-    role may read, and the block comment above that constant for why the
-    persona-scoped tool面 does not by itself touch the role-level invariant
-    reasoned about below.
+    role may read, and the block comment above that constant for why widening
+    that constant does not by itself widen the role-level invariant reasoned
+    about below (the role invariant is enforced on other axes — capabilities,
+    the ``can_use_tool`` guard, and the persona-tool tests).
 
     Why: the registry's Phase 1 ``qualified_for`` is "first qualified", and the
     base adapter declares ``EXECUTE_CODE`` (T16's dual-use, one adapter filling
@@ -276,23 +277,33 @@ def _assert_role_resolution(
 # design rather than guess, which is right, and then nothing moved. The Einstein
 # review of that turn endorsed the refusal. So the gap is here, not there.
 #
-# The list is **persona-scoped, not role-scoped** (Takahito msg-3507: "Bohr
-# であることと PROPOSER であることは必ずしも一致しない"; ADR-2026-05-27-09 identity
-# 4 layers puts ``identity_name`` (persona) and ``role`` on orthogonal axes).
-# What lives here is Bohr's built-in tool面 for its current embodiment; the
-# role-level invariant "a proposer role adapter cannot change the tree" is
-# enforced on a different axis and belongs to the role adapter's contract, not
-# to this list. Concretely the role invariant is upheld by three separate
-# things: (a) :class:`Stage3ProposerAdapter` drops ``EXECUTE_CODE`` from
+# The list is named for the persona whose tools it happens to enumerate, not
+# for the role. Takahito msg-3507 ("Bohr であることと PROPOSER であることは必ずし
+# も一致しない") and ADR-2026-05-27-09 (identity 4 layers) draw ``identity_name``
+# (persona) and ``role`` on orthogonal axes, and the name reflects that: what
+# lives here is Bohr's built-in tool面 for its current embodiment, not a
+# statement about what the proposer role may carry in general.
+#
+# The rename is honest about naming; it is not a structural decoupling.
+# :func:`build_proposer` still hardcodes this constant into the proposer role's
+# adapter, so today every proposer built by this composition root gets exactly
+# these tools. A future embodiment that put a different persona in the proposer
+# slot would need :func:`build_proposer` to accept a persona identifier and
+# look up a per-persona tool tuple — that plumbing does not yet exist.
+#
+# What the role invariant "a proposer role adapter cannot change the tree"
+# does have is enforcement on axes independent of this constant, and those
+# axes are still what stops a widening of this list from silently widening the
+# role: (a) :class:`Stage3ProposerAdapter` drops ``EXECUTE_CODE`` from
 # ``capabilities`` so PROPOSER is the only registry slot it qualifies for and
 # the IMPLEMENTER slot resolves unambiguously to the allow-list-gated adapter;
 # (b) the ``can_use_tool`` guard injected at :func:`build_proposer` (currently
 # :class:`_PathScopeGuard`, whose ``scopeable_tools`` frozenset admits only
 # ``Read`` / ``Glob`` / ``Grep``) refuses anything it cannot bound; (c) the
-# tests at :file:`tests/test_loop_runner.py` that assert Bohr's persona tool
+# tests at :file:`tests/test_loop_runner.py` that assert Bohr's built-in tool
 # 面 today does not include write/execute tools. Widening this list to add a
-# new tool for Bohr therefore does *not* by itself widen the role — the guard
-# still has to admit the tool for it to actually run through the adapter.
+# new tool therefore does *not* by itself widen the role — the guard still has
+# to admit the tool for it to actually run through the adapter.
 #
 # Read / Glob / Grep is the current persona 面. They are auto-approved because
 # a call that is not auto-approved goes to an interactive permission prompt,
@@ -306,12 +317,16 @@ _BOHR_BUILTIN_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
 def build_proposer(repo_dir: Path) -> Stage3ProposerAdapter:
     """Proposer with read-only access to ``repo_dir`` (same model family as ``main``).
 
-    The tool list wired here is Bohr's persona-scoped built-in tool面
-    (:data:`_BOHR_BUILTIN_TOOLS`); the role-level "proposer cannot change the
-    tree" invariant lives on other axes (see the block comment above the
-    constant). The path-scope guard installed here is the seam that enforces
-    the intersection of the two — the persona can only actually invoke a tool
-    the guard admits.
+    The tool list wired here is :data:`_BOHR_BUILTIN_TOOLS` — named for the
+    persona whose tools it happens to enumerate today. This function does not
+    yet take a persona parameter, so it hardcodes that constant; the naming is
+    honest labeling of what the constant is, not a claim that this composition
+    root already dispatches on persona.
+
+    The role-level "proposer cannot change the tree" invariant lives on other
+    axes (see the block comment above the constant). The path-scope guard
+    installed here is the seam that enforces the intersection — the adapter
+    can only actually invoke a tool the guard admits.
     """
     return Stage3ProposerAdapter(
         cwd=repo_dir,
