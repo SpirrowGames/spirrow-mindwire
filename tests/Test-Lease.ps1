@@ -1531,6 +1531,10 @@ Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdic
 #
 # ROW-BY-ROW MAPPING:
 #   (d-1)  inject shape ∈ {array, scalar, parse-error} -> lease-requiring disposition, flush skipped
+#          (d-1 boundary) additionally pins [{"a":1}] on the (a-valid) shape='object' path — a
+#          length-1 object-in-array unwraps to a bare PSCustomObject and does NOT reach the
+#          fail-closed set, so this boundary marker documents the routing gap between "root
+#          JSON array" (English) and "shape='array'" (Read-JsonStateWithShape verdict).
 #          NB: the shape word 'array' here has a NARROW meaning driven by PowerShell 7's
 #          ConvertFrom-Json unwrap semantics. shape='array' is emitted only for root JSON arrays
 #          whose deserialised value survives the `$null -eq $obj` filter, is NOT a PSCustomObject,
@@ -1547,8 +1551,10 @@ Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdic
 #          therefore uses a length-≥2 input — see L1634 for the actual fixture
 #          (`[{"editor":"x"},{"foo":"y"}]`, two elements, stays as System.Object[]). All four
 #          bullets above route to verdict='unreadable' EXCEPT `[{"a":1}]`, which lands on the
-#          (a-valid) shape='object' path — that corner case is out of scope for (d-1) and is
-#          not injected here.
+#          (a-valid) shape='object' path — that corner case IS pinned in the (d-1 boundary)
+#          block below (search for '(d-1 boundary)'), so a future change in ConvertFrom-Json
+#          unwrap semantics would trip a test rather than silently drift this comment out of
+#          sync with the code.
 #          Source of truth for the raw-shape mapping: deploy/lib/Lease.ps1 §Read-JsonStateWithShape
 #          (function name only — line numbers deliberately omitted to avoid drift-with-refactor
 #          dual-management between this comment and that file). The shape='empty' pins —
@@ -1664,6 +1670,37 @@ try {
     Check "(d-1) parse-error: disposition='lease-state-unreadable'" 'lease-state-unreadable' $r.disposition
     CheckFalse "(d-1) parse-error: flush_allowed=`$false" $r.flush_allowed
     CheckTrue "(d-1) parse-error: error is populated (ConvertFrom-Json exception surfaced)" ([bool]$r.error)
+
+    # --- (d-1 boundary) LENGTH-1 OBJECT ARRAY CORNER CASE -----------------------------------
+    #
+    # The row-by-row mapping at the top of §18 documents that `[{"a":1}]` is the ONE JSON root
+    # shape that unwraps to a bare PSCustomObject and lands on the (a-valid) shape='object'
+    # path — outside the (d-1) fail-closed set of {array, scalar, parse-error}. That mapping
+    # was written from source reading; THIS pin exercises the code path directly, so a future
+    # refactor of Read-JsonStateWithShape (e.g. `ConvertFrom-Json -NoEnumerate`, a PowerShell
+    # version bump that changes single-element-array unwrap, or explicit array preservation)
+    # that altered the unwrap behaviour would trip a test rather than silently drift the
+    # row-mapping comment out of sync with the code.
+    #
+    # Origin: pr-gate advisory on PR #297 @ 2c71156 (msg-3526) flagged that the comment
+    # documented this corner case without exercising it — "documenting a gap in test coverage
+    # without closing it". Human decision A on that advisory closes the gap by pinning the
+    # observed behaviour here. NB: the value stored under state['a'] is the inner object's
+    # `a` property value (Int32 1) — this pin does NOT assert that value because the routing
+    # (shape + verdict + flush_allowed) is what's load-bearing; the leaked property name is a
+    # latent hazard (an operator writing an object-in-array creates a "resource" named after
+    # the inner property key), out of scope for THIS pin and tracked separately if it ever
+    # needs a mitigation.
+    $lengthOneObjectArrayPath = Join-Path $p43fixtureDir 'length1-object-array-leases.json'
+    [System.IO.File]::WriteAllText($lengthOneObjectArrayPath, '[{"a":1}]', $p43utf8NoBom)
+    $r = Read-LeasesStateForTick -Path $lengthOneObjectArrayPath
+    Check "(d-1 boundary) [{`"a`":1}]: shape='object' (NOT 'array' — length-1 array unwraps in pwsh 7)" 'object' $r.shape
+    Check "(d-1 boundary) [{`"a`":1}]: verdict='valid' (NOT 'unreadable' — lands on (a-valid) path)" 'valid' $r.verdict
+    CheckTrue "(d-1 boundary) [{`"a`":1}]: flush_allowed=`$true (corner case routes to acquire-permitted branch)" $r.flush_allowed
+    Check "(d-1 boundary) [{`"a`":1}]: disposition='' (no defer of lease-requiring candidates)" '' $r.disposition
+    Check "(d-1 boundary) [{`"a`":1}]: state has 1 entry (unwrapped inner-object property survives)" 1 $r.state.Keys.Count
+    CheckTrue "(d-1 boundary) [{`"a`":1}]: state key 'a' present (unwrap leaks inner property name — latent hazard, see comment)" ([bool]$r.state.ContainsKey('a'))
+    Check "(d-1 boundary) [{`"a`":1}]: notification is `$null (valid path emits no operator surface)" $null $r.notification
 
     # --- (d-6) OPERATOR-DELETE HAZARD DOCUMENTATION PIN --------------------------------------
     #
