@@ -20,4 +20,5 @@ pwsh -NoProfile -File tests/Test-SyncRepo.ps1
 pwsh -NoProfile -File tests/Test-DecisionComposerWiring.ps1
 pwsh -NoProfile -File tests/Test-StopReasonPhrase.ps1
 pwsh -NoProfile -File tests/Test-SweepSequentiality.ps1
+pwsh -NoProfile -File tests/Test-WrapperInitTrap.ps1
 uv run pytest

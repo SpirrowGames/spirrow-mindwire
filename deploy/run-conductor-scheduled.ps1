@@ -175,6 +175,72 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
+# --- fatal init trap ----------------------------------------------------------------------------
+# T-deploy-required-env-outage-is-silent (msg-3578 / Bohr msg-3586 D-1 v4). BEFORE this trap
+# existed, any uncaught throw during wrapper init (top-level code above the outer `try` at the
+# `--- run ---` section below) was written to Task Scheduler's stderr and NOWHERE else: no line
+# in `conductor-*.log`, no Discord notification, and the only external symptom was
+# `LastTaskResult=0x1` on the Get-ScheduledTaskInfo output. Measured 2026-09-19: two consecutive
+# 5-min ticks (09:10:04-09:25:02 JST) silently failed after PR #296 introduced a required env var
+# whose absence made the wrapper `throw` at line ~1989 (`MINDWIRE_DECISION_DASHBOARD_URL is not
+# set …`). ADR-2026-09-18-22 D-1's intent ("loud fail at init > silent misroute") was correct,
+# but the loud side had no human-facing destination.
+#
+# This trap gives every uncaught init throw ONE guaranteed human-facing surface set:
+#   (1) a line in `conductor-*.log` (direct Add-Content, bypasses the buffered Write-Log —
+#       Confirm-LogWorthKeeping is defined further down and cannot be relied on here),
+#   (2) a Discord POST via the notify webhook, and
+#   (3) `exit 1` so the task scheduler's `LastTaskResult=0x1` contract is preserved.
+#
+# EACH of the three steps is wrapped in its own try/catch. `Add-Content` may fail (disk full,
+# permission), and `Invoke-WebRequest` will fail on DNS/timeout/proxy/TLS — a secondary throw
+# inside a trap would break the handler before step (3) runs (Einstein msg-3583 Obj-1). The
+# `exit 1` is the LAST statement, unconditional, always reached.
+#
+# Self-contained: the trap references only `$logPath` (defined above), `$env:*` (process env),
+# and .NET/PS builtins. It does not call `Write-Log` / `Format-LogLine` / `Send-Notification`
+# (all defined below), and it does not touch state files (`$dataDir\state\*.json`). No dedup or
+# marker file: at a 5-min cadence, a rebooting-daemon-that-cannot-start deserves a ping every
+# 5 min (Einstein msg-3581 Obj-2), not a debounce that could suppress a live outage.
+#
+# Webhook lookup uses `$env:MINDWIRE_NOTIFY_DISCORD_WEBHOOK` (process env, which Windows merges
+# from Machine ∪ User at process start), not `[Environment]::GetEnvironmentVariable(..., 'User')`
+# — the User-scope explicit read would silently skip Discord on hosts that legitimately place
+# the webhook in Machine scope (Einstein msg-3585 Obj-1). Line 1770 (`Send-Notification`) uses
+# the same `$env:` form for the same reason (single access pattern for the same variable).
+trap {
+    # (1) log direct write — bypass the buffered Write-Log so a fatal init has a durable line
+    # in `conductor-*.log` even though $script:logCommitted is false. Failure to write here is
+    # swallowed: throwing inside a trap would prevent step (3) `exit 1` from running.
+    try {
+        $__initTrapLine = "[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ssK") + "] [wrapper] FATAL init: $($_.Exception.Message)"
+        Add-Content -LiteralPath $logPath -Value $__initTrapLine -Encoding utf8
+        Write-Host $__initTrapLine
+    } catch { }
+
+    # (2) Discord POST — same proxy default and same redaction shape as Send-Notification, but
+    # inlined so this handler does not depend on any function defined below. Network failures
+    # (DNS, timeout, proxy refused, TLS) throw from Invoke-WebRequest with -ErrorAction Stop;
+    # the try/catch here holds those failures so step (3) always runs.
+    try {
+        $__initTrapWebhook = $env:MINDWIRE_NOTIFY_DISCORD_WEBHOOK
+        if ($__initTrapWebhook) {
+            $__initTrapProxy = if ($env:MINDWIRE_NOTIFY_PROXY) { $env:MINDWIRE_NOTIFY_PROXY } else { 'http://127.0.0.1:3128' }
+            $__initTrapMsg = "$($_.Exception.Message)".Replace($__initTrapWebhook, '<webhook-redacted>')
+            $__initTrapPayload = @{ content = "MindWire wrapper FATAL init (host $env:COMPUTERNAME): $__initTrapMsg" } | ConvertTo-Json -Compress
+            $null = Invoke-WebRequest -Uri $__initTrapWebhook -Method Post `
+                -ContentType 'application/json; charset=utf-8' `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($__initTrapPayload)) `
+                -Proxy $__initTrapProxy -TimeoutSec 30 -ErrorAction Stop
+        }
+    } catch { }
+
+    # (3) exit 1 — unconditional. Preserves the `LastTaskResult=0x1` contract that the existing
+    # scheduled-task monitoring relies on. MUST be the last statement of the trap; a throw in
+    # step (1) or (2) would abort the handler and skip this line.
+    exit 1
+}
+
 # --- logging ------------------------------------------------------------------------------------
 # At a 5-minute cadence the common tick is "nothing moved", and writing a dozen lines for that would
 # put ~3k lines of noise a day between the entries that matter. So detail is buffered and only
@@ -1767,7 +1833,14 @@ function Get-ConductorVerdict {
 # Delivery goes through the local squid proxy on purpose: pwsh.exe has no outbound firewall
 # permission of its own, so a request that skipped the proxy would be blocked rather than silently
 # escaping the egress chokepoint.
-$notifyWebhook = [Environment]::GetEnvironmentVariable('MINDWIRE_NOTIFY_DISCORD_WEBHOOK', 'User')
+#
+# Read via `$env:` (process environment block) rather than
+# `[Environment]::GetEnvironmentVariable(..., 'User')`, so the webhook is picked up whether it is
+# configured in User or Machine scope — Windows merges both into the process env at task start.
+# The prior `'User'` explicit read silently skipped Discord on hosts placing the webhook in
+# Machine scope (T-deploy-required-env-outage-is-silent human msg-3588, aligning this line with
+# the same access pattern the fatal init trap above already uses).
+$notifyWebhook = $env:MINDWIRE_NOTIFY_DISCORD_WEBHOOK
 $notifyProxy = if ($env:MINDWIRE_NOTIFY_PROXY) { $env:MINDWIRE_NOTIFY_PROXY } else { "http://127.0.0.1:3128" }
 
 # T-digest-exceeds-discord-limit-and-is-dropped D-5 (msg-2099): the CONSUMPTION contract for a
