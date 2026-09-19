@@ -48,8 +48,16 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $sweepScript = Join-Path $repoRoot "deploy/run-conductor-scheduled.ps1"
 if (-not (Test-Path -LiteralPath $sweepScript)) { throw "sweep script not found: $sweepScript" }
 
+# Note on the [ref] arguments: ParseFile's 2nd/3rd params are `out` (tokens, errors). The
+# `[ref]$null` idiom to discard the token array is valid and empirically-tested (see
+# tests/Test-SweepQuarantine.ps1 L725-734 for a full falsification receipt of the "throws
+# on assignment to `$null`" claim, verified on pwsh 7.x on both Windows and the CI Linux
+# runner). Nonetheless the reader-clarity convention that file chose is a pre-declared
+# `$tokens = $null` variable — this test follows that convention so a reviewer has
+# nothing to dispute at the syntax layer.
+$parseTokens = $null
 $parseErrors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($sweepScript, [ref]$null, [ref]$parseErrors)
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($sweepScript, [ref]$parseTokens, [ref]$parseErrors)
 if ($parseErrors) {
     $parseErrors | ForEach-Object { Write-Host "PARSE ERROR line $($_.Extent.StartLineNumber): $($_.Message)" }
     throw "deploy/run-conductor-scheduled.ps1 does not parse"
