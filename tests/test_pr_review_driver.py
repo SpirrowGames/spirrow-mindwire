@@ -702,6 +702,129 @@ async def test_outcome_records_principles_version() -> None:
     assert outcome.principles_version == principles_version()
 
 
+@pytest.mark.anyio
+async def test_principles_version_recorded_on_every_emit_path() -> None:
+    """Every ``PrReviewOutcome`` this driver returns tags its ``principles_version``.
+
+    The naysayer principles SOT declares (spec/NAYSAYER_PRINCIPLES.md): "Every naysayer
+    output records the ``principles_version`` it judged under, so a later revision stays
+    auditable." Before this test the happy path recorded the tag (see the test above), but
+    the four short-circuit paths (CI-gate, head-unchanged skip, round-cap escalation, and
+    the timeout-degrade) left the field at its ``None`` default — silently dropping the
+    audit tag on precisely the review bodies a version bump most needs to explain.
+
+    This test is a T-naysayer-blocking-bar-undefined prerequisite pin for the SHADOW →
+    LIVE promotion of ``derived_verdict``: msg-3520 promotion-gate condition (1). The
+    promotion changes the semantics of "blocking" mid-history; leaving any emit path
+    untagged would let a red or COMMENT verdict held during the transition be read back
+    without knowing which principles version defined "blocking" at the time it was held.
+
+    Coverage is the closed set of five construction sites in
+    ``src/spirrow_mindwire/naysayer/pr_review.py`` (``PrReviewOutcome(`` occurrences). The
+    parametrisation names each path so a future emit path added without recording the tag
+    reds this test rather than adding a silent sixth case.
+    """
+    expected = principles_version()
+
+    # (a) L1 CI-gate short-circuit (CI failure → REQUEST_CHANGES, no Lexora call).
+    lexora_ci = _FakeLexora()
+    github_ci = _FakeGitHub(ci=CiStatus(CiState.FAILURE, "sha-ci", ["test"]))
+    _p_ci, post_ci = _capture()
+    driver_ci = NaysayerPrReviewDriver(lexora=lexora_ci, github=github_ci)
+    outcome_ci = await driver_ci.review(_pr(), post_critique=post_ci)
+    assert outcome_ci.ci_gated is True
+    assert outcome_ci.principles_version == expected, (
+        "CI-gate short-circuit emit path drops principles_version tag"
+    )
+
+    # (b) head-unchanged skip (reuses prior verdict, no Lexora call).
+    lexora_sk = _FakeLexora()
+    github_sk = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    _p_sk, post_sk = _capture()
+    driver_sk = NaysayerPrReviewDriver(
+        lexora=lexora_sk, github=github_sk, skip_if_head_unchanged=True
+    )
+    outcome_sk = await driver_sk.review(_pr(), post_critique=post_sk)
+    assert outcome_sk.skipped_head_unchanged is True
+    assert outcome_sk.principles_version == expected, (
+        "head-unchanged skip emit path drops principles_version tag"
+    )
+
+    # (c) round-cap escalation (COMMENT to human, no Lexora call).
+    lexora_cap = _FakeLexora()
+    github_cap = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s1", "2026-06-10T00:00:01Z"),
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s2", "2026-06-10T00:00:02Z"),
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s3", "2026-06-10T00:00:03Z"),
+        ],
+    )
+    _p_cap, post_cap = _capture()
+    driver_cap = NaysayerPrReviewDriver(lexora=lexora_cap, github=github_cap, max_review_rounds=3)
+    outcome_cap = await driver_cap.review(_pr(), post_critique=post_cap)
+    assert outcome_cap.rounds_capped is True
+    assert outcome_cap.principles_version == expected, (
+        "round-cap escalation emit path drops principles_version tag"
+    )
+
+    # (d) timeout-degrade (Lexora timeout → COMMENT-hold to human).
+    lexora_to = _FakeLexora(raise_exc=LexoraTimeoutError("timed out"))
+    github_to = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha-to", []))
+    _p_to, post_to = _capture()
+    driver_to = NaysayerPrReviewDriver(lexora=lexora_to, github=github_to)
+    outcome_to = await driver_to.review(_pr(), post_critique=post_to)
+    assert outcome_to.timed_out is True
+    assert outcome_to.principles_version == expected, (
+        "timeout-degrade emit path drops principles_version tag"
+    )
+
+    # (e) happy path re-asserted here so the pin lists all five sites in one place. If
+    # someone deletes the older test_outcome_records_principles_version above, this leg
+    # keeps the invariant covered rather than letting the happy path silently regress.
+    lexora_ok = _FakeLexora(content="all good\n\nVERDICT: APPROVE")
+    github_ok = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha7", []))
+    _p_ok, post_ok = _capture()
+    driver_ok = NaysayerPrReviewDriver(lexora=lexora_ok, github=github_ok)
+    outcome_ok = await driver_ok.review(_pr(), post_critique=post_ok)
+    assert outcome_ok.principles_version == expected, (
+        "happy (Lexora-reviewed) emit path drops principles_version tag"
+    )
+
+
+def test_pr_review_outcome_construction_site_count_is_bounded() -> None:
+    """The five ``PrReviewOutcome(`` sites the pin above enumerates.
+
+    Not a substitute for the behavioural check — a construction site that omits the
+    ``principles_version=`` kwarg still constructs a ``PrReviewOutcome``, and the count
+    stays 5. This test guards a different failure mode: a SIXTH emit path added without a
+    new leg in ``test_principles_version_recorded_on_every_emit_path``. The behavioural
+    pin covers only the sites its cases exercise; a new emit path lurks silently under
+    coverage-by-parametrisation until this counter reds.
+
+    Kept literal (5) rather than a self-referential scan of the test's own body, so a
+    silent widening of one file cannot be dismissed by editing the other.
+    """
+    text = (
+        Path(__file__).resolve().parents[1] / "src/spirrow_mindwire/naysayer/pr_review.py"
+    ).read_text(encoding="utf-8")
+    # ``PrReviewOutcome(`` (construction), not ``PrReviewOutcome:`` (annotation) or
+    # ``PrReviewOutcome`` (bare reference). The construction pattern is what the pin
+    # covers.
+    sites = re.findall(r"\breturn PrReviewOutcome\(", text)
+    assert len(sites) == 5, (
+        f"expected 5 PrReviewOutcome construction sites (the closed set the "
+        f"principles_version pin enumerates); found {len(sites)}. If a new emit path was "
+        f"added, add a case to test_principles_version_recorded_on_every_emit_path and "
+        f"bump this counter."
+    )
+
+
 # ---------- L1 CI-gate (ADR-2026-06-03-16) -------------------------------- #
 
 
