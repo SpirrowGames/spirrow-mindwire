@@ -408,12 +408,20 @@ def _resolve_pin(repo_root: Path, no_fetch: bool) -> PinResult:
             return PinResult("NO-PIN", "MISSING_FIELD")
         pinned_at_bs = pin["pinned_at"]
         if not isinstance(pinned_at_bs, str):
+            # Coerce a datetime (unquoted YAML timestamps parse to datetime).
             try:
                 pinned_at_bs = pinned_at_bs.isoformat()
             except AttributeError:
                 return PinResult("NO-PIN", "MISSING_FIELD")
-            if not pinned_at_bs:
-                return PinResult("NO-PIN", "MISSING_FIELD")
+        # Post-coercion emptiness guard covers BOTH inputs — a literal
+        # ``pinned_at: ""`` (skips the coercion branch above but must still
+        # halt as MISSING_FIELD) and a degenerate datetime whose isoformat
+        # returns "".  The earlier form only checked emptiness inside the
+        # coercion branch and let a literal empty string through as
+        # BOOTSTRAP; pr-gate correctness objection #1 at head-sha
+        # ca2a944 caught that regression.
+        if not isinstance(pinned_at_bs, str) or not pinned_at_bs:
+            return PinResult("NO-PIN", "MISSING_FIELD")
         # Any of the 7 resolved-form fields present → PROHIBITED_FIELD.
         # `pin.get(field) is not None` treats YAML null as absent (a
         # dispatcher writing ``spec_id: ~`` is not carrying a value).
@@ -457,8 +465,11 @@ def _resolve_pin(repo_root: Path, no_fetch: bool) -> PinResult:
             pinned_at = pinned_at.isoformat()  # datetime → str
         except AttributeError:
             return PinResult("NO-PIN", "MISSING_FIELD")
-        if not pinned_at:
-            return PinResult("NO-PIN", "MISSING_FIELD")
+    # Post-coercion emptiness guard covers both the literal ``pinned_at: ""``
+    # case and a degenerate datetime that coerces to "" (same shape as the
+    # bootstrap branch — see the extended comment there).
+    if not isinstance(pinned_at, str) or not pinned_at:
+        return PinResult("NO-PIN", "MISSING_FIELD")
     blob_sha = pin["blob_sha"]
     commit = pin["commit"]
     if not _HEX40.fullmatch(blob_sha) or not _HEX40.fullmatch(commit):

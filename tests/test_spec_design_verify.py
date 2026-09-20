@@ -152,6 +152,82 @@ def test_a30_bootstrap_missing_pinned_by_is_missing_field(tmp_path: Path) -> Non
     assert (result.state, result.reason) == ("NO-PIN", "MISSING_FIELD")
 
 
+def test_a30_bootstrap_empty_pinned_at_is_missing_field(tmp_path: Path) -> None:
+    """Regression: pr-gate correctness objection #1 at head-sha ca2a944.
+
+    A literal ``pinned_at: ""`` under ``mode: bootstrap`` must halt as
+    MISSING_FIELD.  The earlier form only checked emptiness inside the
+    datetime-coercion branch, so an explicit empty string skipped the
+    check entirely and was accepted as BOOTSTRAP.  The
+    post-coercion guard now catches both cases.
+    """
+
+    _init_git_repo(tmp_path)
+    _write_pin(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "mode": "bootstrap",
+            "pinned_at": "",
+            "pinned_by": "dispatcher",
+        },
+    )
+    result = VERIFY._resolve_pin(tmp_path, no_fetch=True)
+    assert (result.state, result.reason) == ("NO-PIN", "MISSING_FIELD")
+
+
+def test_a30_bootstrap_empty_pinned_by_is_missing_field(tmp_path: Path) -> None:
+    """Companion to the above: empty ``pinned_by`` must also halt.
+
+    Already covered by the ``pinned_by`` presence + non-empty check; the
+    explicit case is spelled out here to close the same regression shape
+    on the sibling required field.
+    """
+
+    _init_git_repo(tmp_path)
+    _write_pin(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "mode": "bootstrap",
+            "pinned_at": "2026-09-20T00:00:00Z",
+            "pinned_by": "",
+        },
+    )
+    result = VERIFY._resolve_pin(tmp_path, no_fetch=True)
+    assert (result.state, result.reason) == ("NO-PIN", "MISSING_FIELD")
+
+
+def test_resolved_empty_pinned_at_is_missing_field(tmp_path: Path) -> None:
+    """Regression: the same pr-gate objection applies to the resolved path.
+
+    The resolved-mode pinned_at check had the identical shape as the
+    bootstrap-mode one and the identical bug (empty-string accepted).
+    Both fixes are inside I-2's scope (spec/design/verify.py), so both
+    are corrected together and both are pinned by tests.
+    """
+
+    _init_git_repo(tmp_path)
+    _write_pin(
+        tmp_path,
+        {
+            "schema_version": 1,
+            # Full resolved-form field set; only pinned_at is degenerate.
+            "spec_id": "SPEC-2026-01-01-fixture",
+            "thread": "T-fixture",
+            "repo": "spirrow-mindwire",
+            "branch": "feature/test",
+            "path": "spec/design/T-fixture.md",
+            "blob_sha": "0" * 40,
+            "commit": "0" * 40,
+            "pinned_at": "",
+            "pinned_by": "human",
+        },
+    )
+    result = VERIFY._resolve_pin(tmp_path, no_fetch=True)
+    assert (result.state, result.reason) == ("NO-PIN", "MISSING_FIELD")
+
+
 @pytest.mark.parametrize(
     "prohibited_field",
     ["spec_id", "thread", "repo", "branch", "path", "blob_sha", "commit"],
