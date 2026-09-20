@@ -1343,37 +1343,58 @@ class GitHubClient:
         return the raw bytes rather than the base64-wrapped JSON envelope. GitHub decodes
         the blob server-side so the driver can compare a specific line's text directly.
 
-        URL encoding note (PR #307 gate correction). The GitHub ``/contents/{path}`` endpoint
-        is a catch-all route: ``path`` must reach GitHub as ordinary URL path segments — a
-        raw ``/`` between ``Docs`` and ``T07-recorder-spec.md``, not the percent-encoded
-        ``%2F``. Encoding the separator asks GitHub for a single file literally named
-        ``Docs/T07-recorder-spec.md`` at the repository root, which always 404s for any
-        nested path. So each segment is encoded individually (``quote(seg, safe="")`` handles
-        spaces and other reserved characters in a segment) and joined with a raw ``/``. The
-        ``ref`` is passed via ``params=`` — ``httpx`` URL-encodes query parameters on our
-        behalf, so double-encoding it here would corrupt SHA fragments that happen to be
-        anything other than plain hex.
+        URL encoding note (PR #307 gate correction + follow-up structured-URL fix).
+        The GitHub ``/contents/{path}`` endpoint is a catch-all route: ``path`` must
+        reach GitHub as ordinary URL path segments — a raw ``/`` between ``Docs`` and
+        ``T07-recorder-spec.md``, not the percent-encoded ``%2F``. Encoding the
+        separator asks GitHub for a single file literally named
+        ``Docs/T07-recorder-spec.md`` at the repository root, which always 404s for
+        any nested path. So each segment is encoded individually
+        (``quote(seg, safe="")`` handles spaces and other reserved characters within
+        a segment) and joined with a raw ``/``.
+
+        The encoded bytes are then handed to :class:`httpx.URL` via its dedicated
+        ``raw_path`` kwarg — the structured API for "authoritative, already-encoded
+        URL bytes; use them literally in the request line". This is deliberately
+        different from string-formatting the encoded path into a URL string and
+        letting ``client.get(str)`` run it through httpx's URL parser: that path
+        works today only because httpx's parser recognises ``%XX`` sequences and
+        chooses not to double-encode them, which is not part of httpx's stable
+        contract (PR #307 gate re-review advisory). ``raw_path`` bypasses the parser
+        entirely — the bytes we build here are the bytes GitHub receives.
+
+        ``ref`` is folded in via :meth:`httpx.URL.copy_merge_params`, so httpx
+        applies query-string encoding to the value (SHA fragments that happen to be
+        anything other than plain hex therefore round-trip correctly), still without
+        the URL going through a string parser.
 
         See :func:`spirrow_mindwire.naysayer.pr_review.verify_citations` for the caller
         contract (memoisation on ``(path, ref)``, single-line-``where`` gate, empty-line
         predicate) and the driver-side gate-verdict override that consumes the result.
         """
-        path_seg = "/".join(quote(part, safe="") for part in path.split("/"))
-        contents_path = f"/repos/{pr.owner}/{pr.repo}/contents/{path_seg}"
+        # Encode each nested segment; join with raw '/' so GitHub's catch-all route
+        # receives ``Docs/T07 spec.md`` as two segments, not one literal filename.
+        encoded_path_segments = "/".join(quote(seg, safe="") for seg in path.split("/"))
+        raw_path = (
+            f"/repos/{quote(pr.owner, safe='')}/{quote(pr.repo, safe='')}"
+            f"/contents/{encoded_path_segments}"
+        ).encode("ascii")
+        # Structured URL construction: authoritative encoded bytes via raw_path,
+        # then httpx encodes the ref query value. No pre-encoded string ever reaches
+        # httpx's URL-string parser.
+        url = self._client.base_url.copy_with(raw_path=raw_path).copy_merge_params({"ref": ref})
         try:
             resp = await self._client.get(
-                contents_path,
-                params={"ref": ref},
+                url,
                 headers={"Accept": "application/vnd.github.raw"},
             )
         except httpx.RequestError as exc:
-            raise GitHubHTTPError(f"GET {contents_path} (contents): {exc}") from exc
+            raise GitHubHTTPError(f"GET {url.path} (contents): {exc}") from exc
         if resp.status_code == 404:
             return None
         if resp.status_code >= 400:
             raise GitHubHTTPError(
-                f"GET {contents_path} (contents) returned {resp.status_code}: "
-                f"{_error_detail(resp)}",
+                f"GET {url.path} (contents) returned {resp.status_code}: {_error_detail(resp)}",
                 status_code=resp.status_code,
                 retry_after=_retry_after_seconds(resp),
                 rate_limited=_is_rate_limited(resp),
