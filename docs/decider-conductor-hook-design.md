@@ -35,6 +35,8 @@ Decider の責務は最終的に **admission-gate（`src/spirrow_mindwire/tier_c
 | D13 | 評価は **A-pre / A-post / live shadow** の 3 面で出す。A-post 母数不足なら shadow が JSONL を貯め続ける | msg-3818 §6, msg-3820 |
 | D14 | `TIER_C_LABELS` は `src/spirrow_mindwire/tier_c_admission_gate.py` の `ADMIT_LABELS` を import して同一定数を参照する（文字列二重管理禁止） | msg-3818 §4 |
 | D15 | bounce 活性化は evaluation phase gate 制。annotate は「genuine 見逃し 0 件」を満たしたときのみ、bounce は Takahito 追加承認 | 本 spec §6-C / Takahito 2026-09-21 |
+| D16 | Decider は Conductor から **2 点** で呼ばれる。(§3.3.a) 一般フックは `stop is None` 時に silent-stop 検出（Track B）に使い、shadow / active の両モードで実動作は `stop is None` ガード下に限定される。(§3.3.b) Tier-C フックは `stop == HUMAN` 時に走り、annotate / bounce モードで動作する — bounce は 1 回のみ `stop = None` に書き換えて呼び出し元へ差し戻す。両フックの入場条件は disjoint（stop が None か HUMAN かで排他）∴ D2 単調性は保たれる | 本 spec §3.3 / PR #326 PR-gate BLOCKING correctness |
+| D17 | admission-gate 結果の Decider への受け渡しは **in-memory `turn.gate_result` 契約**。JSONL からの live join は禁止（live / replay の distribution shift 回避、dual-management 回避）。replay driver は fixture として同じ shape の `AdmissionGateResult` を構築し `turn` に載せてから `state_builder` に渡す | 本 spec §3.5 / PR #326 PR-gate ADVISORY structure |
 
 ---
 
@@ -77,26 +79,55 @@ scripts/
 - `parsed_next: str | None`（head の `NEXT:` パース結果）
 - `prev_next: str | None`（1 つ前のターンの `NEXT:`）
 - `diff_stat: DiffStat | None`（implementer/PR ターンのみ）
-- `gate_jsonl_kind: LogKind | None`（admission-gate JSONL から join、`ADMIT / ADMIT_UNSURE / BOUNCED / RETRY_ADMIT.reason / second_time_force_admit`）
+- `gate_result: AdmissionGateResult | None`（admission-gate が turn 上に置く in-memory 値。`kind ∈ ADMIT / ADMIT_UNSURE / BOUNCED / RETRY_ADMIT.reason / second_time_force_admit`。**JSONL からの join はしない** — live と replay の入力分布シフトを避けるため、admission-gate が `turn` オブジェクト経由で in-memory に受け渡すこと。replay driver は同じ `turn` 形で構築した fixture を Decider に流す。詳細は §3.5）
 
 **Constants**: `TIER_C_LABELS` は `src/spirrow_mindwire/tier_c_admission_gate.py::ADMIT_LABELS` を import して同一定数を参照する（文字列二重管理禁止 — D14）。
 
-### 3.3 Conductor フック（1 箇所のみ）
+### 3.3 Conductor フック（2 箇所）
 
-`StopReason` 規則判定の直後に 1 フック:
+Decider は Conductor から **2 点で呼ばれる**。両者は目的も入場条件も異なる。
+
+#### 3.3.a 一般フック（shadow / active — Track B: `handoff_valid` / `made_progress`）
+
+`StopReason` 規則判定の直後、**Tier-C 一次判定より前**に呼ぶ。silent-stop 検出などの「stop が無かったところに stop を足す」用途:
 
 ```python
 stop = rule_stop_reason(turn)              # 既存
-dv   = decider.evaluate(state_builder(turn))  # None if MINDWIRE_DECIDER_BACKEND=off
+dv   = decider.evaluate_general(state_builder(turn))  # Track B。None if MINDWIRE_DECIDER_BACKEND=off
 log_decision(turn, stop, dv)               # 常に記録（decision_id を turn ログに残す）
 if cfg.decider.mode == "active" and dv and stop is None:
-    stop = StopReason.from_verdict(dv)     # bounce active 時のみ経路が変わる
+    stop = StopReason.from_verdict(dv)     # active モード時のみ経路が変わる
 ```
 
-- `stop is None` ガードにより、shadow mode は実動作に一切影響しない（D12）
-- `routing_artifact` を Decider が計算する経路は存在しない（`rule_stop_reason` が既に落としている — D9, msg-3820）
+- `stop is None` ガードにより、shadow mode は実動作に一切影響しない（D12）。
+- **このガードは Tier-C bounce 用ではない** — 一般フックが扱うのは「規則判定が stop を出さなかったターン」だけで、`NEXT: human` によって既に `stop = HUMAN` が載っているケースには到達しない。Tier-C bounce は §3.3.b の別フックで実行される。
 
-### 3.4 設定
+#### 3.3.b Tier-C フック（annotate / bounce — parsed_next == "human" のみ）
+
+`stop == StopReason.HUMAN` のとき、human に届ける **直前**に走る。annotate は escalation を人へ通す前に注釈を付け、bounce は escalation を呼び出し元へ差し戻す:
+
+```python
+# rule_stop_reason の直後、human への手渡し（forced-naysayer や escalation 通知）の直前
+if stop is StopReason.HUMAN and cfg.decider.tierc.mode != "off":
+    tv = decider.evaluate_tierc(state_builder(turn))  # 3+3+0 の問いへ回答
+    log_decision(turn, stop, tv)                      # decision_id を残す（shadow / annotate / bounce いずれでも）
+    if cfg.decider.tierc.mode == "annotate" and tv.verdict == "LIKELY_NOT":
+        escalation.annotation = f"Jev: likely not Tier-C (p={tv.confidence:.2f}) — {tv.reason}"
+        # stop は HUMAN のまま。人には届く。annotate は情報の付与のみ
+    elif cfg.decider.tierc.mode == "bounce" and tv.verdict == "LIKELY_NOT" and tv.reason == "answerable_from_thread":
+        if not bounce_ledger.already_bounced(turn):    # 1 回だけ
+            bounce_ledger.mark(turn)
+            stop = None                                 # human 経路をキャンセルし、
+            reroute_to_bounce_prompt(turn, tv)          # 呼び出し元 agent へ §4.5 の 3 択プロンプトを差し戻す
+        # 2 回目は Decider を通さず必ず human へ（stop = HUMAN のまま）
+```
+
+- 入場条件: `stop == StopReason.HUMAN` かつ `[decider.tierc].mode != "off"`。annotate mode でも bounce mode でも、まずここで Tier-C 問いを回答する。
+- annotate は `stop` を書き換えない（人には届く。文言注釈のみ）。
+- bounce は 1 回に限り `stop = None` にして呼び出し元 agent へ差し戻す。2 回目の `NEXT: human` は `bounce_ledger.already_bounced(turn) == True` により Decider の分岐を通過せず、そのまま `stop = HUMAN` として人へ届く。
+- `routing_artifact` を Decider が計算する経路は存在しない（`rule_stop_reason` が既に落としている — D9, msg-3820）。
+
+### 3.4 設定（両フック共通）
 
 ```toml
 [decider]
@@ -115,17 +146,39 @@ skip_naysayer_when_confirmed = false
 
 `naysayer_gating` の shadow（compute + LOG, don't act）と同じ意味論。
 
+### 3.5 admission-gate 結果の受け渡し（in-memory 契約、JSONL join 禁止）
+
+`DecisionState.gate_result` は **live 実行時に admission-gate が `turn` オブジェクト経由で in-memory に渡す**。Decider が JSONL ファイルを直接読むことは無い。理由:
+
+- **分布シフト回避**: replay で JSONL を join し、live で `None` のままにすると、Decider backend が受け取る入力が live / replay で構造的に異なる ∴ 較正済み閾値が live で無効化される（PR-gate advisory: docs/decider-conductor-hook-design.md structure 指摘）。
+- **dual-management 回避**: live で JSONL をパースすると、admission-gate の state が in-memory と on-disk の 2 箇所に載る ∴ Principle 2 違反。
+
+**受け渡しの流れ**:
+
+1. `tier_c_admission_gate.decide_admission(...)` は verdict と `log_entries` を返す。live の Conductor はこれを既に受け取っている（`src/spirrow_mindwire/tier_c_admission_gate.py` 現行 API）。
+2. Conductor 側でこの verdict を `turn.gate_result: AdmissionGateResult` として保持する（型は `AdmissionVerdict + BounceReason | RetryAdmitReason + kind: LogKind` の compact な dataclass、詳細は実装 PR で確定）。
+3. `state_builder(turn)` はこの `turn.gate_result` をそのまま `DecisionState.gate_result` にコピーする。JSONL は触らない。
+4. **replay driver** (`scripts/decider_replay.py`) は同じ `AdmissionGateResult` 型を fixture として構築し、`state_builder` に渡す前の `turn` に載せる。fixture の source は過去の JSONL でよいが、それは **replay driver の入力構築フェーズ**の話で、Decider から見た state の shape は live と replay で同一になる。
+5. `gate_result` が `None` になるのは admission-gate を通らないターン（`stop != HUMAN` の全ターン + admission-gate mode が off のとき）のみ。この場合の Decider の振る舞いは Track B 問いのみに縮退する（Tier-C 問いは呼ばれない）。
+
+これにより live / replay の入力分布は同一の shape になり、`gate_jsonl_kind` を offline join で埋めていた v3.4 初稿の distribution shift は解消される。
+
 ---
 
-## 4. 問いセット v3.4（3 + 3 + 0）
+## 4. 問いセット v3.4
 
-### 4.1 genuine 側（noul, 3 問）
+**2 つの問いセットが並行して定義される**:
+
+- **Tier-C 問いセット（3 + 3 + 0、§4.1〜§4.4）** — §3.3.b Tier-C フックが呼ぶ。`stop == HUMAN` のときにのみ回答される。genuine / spurious の合成規則と bounce 定義は本節の主題。
+- **Track B 問いセット（§4.7）** — §3.3.a 一般フックが呼ぶ。毎ターン回答される（`stop is None` ガードにより shadow / active mode でのみ経路に効く）。目的は silent-stop 検出と handoff 妥当性チェック。
+
+### 4.1 Tier-C genuine 側（noul, 3 問）
 
 - **`changes_goal_or_spec`** — このハンドオフが承認を要する変更（goal / spec の書き換え）を含むか
 - **`incurs_cost`** — このハンドオフが cost を発生させる決定を含むか
 - **`irreversible`** — このハンドオフが取り消せない操作（データ削除・公開リリース）を含むか
 
-### 4.2 spurious 側（noul, 3 問）
+### 4.2 Tier-C spurious 側（noul, 3 問）
 
 - **`answerable_from_thread`** — スレッド内の既存情報から答えが導けるか
 - **`is_permission_seeking`** — 権限を求めているだけで、判断そのものは著者ができる状態か
@@ -165,6 +218,19 @@ Conductor は human に上げる前に呼び出し元 agent へ **1 回だけ**�
 1. **構造層（不変）**: 2 回目の `NEXT: human` は Decider を通さず無条件で human に届く。1 回だけの bounce は既存機構で保証されており、無限ループ不可。genuine Tier-C の agent が引き下がらない限り必ず人に届く。
 2. **経験層（bounce active の入場条件）**: bounce は annotate 実運用後、評価セット (A-pre / A-post / live shadow) で **genuine 見逃し 0 件**を満たしたときにしか active にしない（§6-C 制約 1）。この条件は Takahito 追加承認事項でもある（D15）。
 3. **観測層（事後レビュー）**: bounce の (a) self-resolve / (b) stand_down / (c) reassert のすべてを JSONL に kind 付きで記録し、evaluation report に msg_id 全件列挙する。genuine を self-resolve / stand_down で silent drop していないか、人が事後に走査できる。
+
+### 4.7 Track B 問いセット（一般フック用、noul, 2 問）
+
+§3.3.a 一般フックが呼ぶ。silent-stop の検出（`stand_down`）と、動けない handoff の検出（`escalate`）に使う。msg-3404 §3 の v1 定義を踏襲:
+
+- **`handoff_valid`** (noul) — この handoff の `NEXT:` 先が実際に動ける identity で、停滞する自己ハンドオフではないか。停滞判定は「認識可能な identity か」「embodiment が terminal_coding_agent か（動けない web_ai_chat 系ではないか）」「author == next の自己ハンドオフではないか」の意味的判断を含む。**ただしこれらのうち規則で確定するもの（self-handoff, embodiment 不整合など）は `rule_stop_reason` 側で先に落ちる ∴ Decider が答える対象は「規則ではまだ落ちていないが人間の目には停滞して見える」grey zone のみ**（D9, msg-3820）。
+  - 閾値: `handoff_valid_min = 0.30` 未満 → `escalate`（人に上げる）。
+- **`made_progress`** (noul) — このラウンドは具体的な変更・決定・新情報を生んだか（過去の言い換え・同じ主張の反復ではないか）。実装フェーズでは diff_stat の実質、設計フェーズでは新たな決定 / データの導入 / 反論への disposition の有無を評価する。
+  - 閾値: `made_progress_min = 0.25` 未満 → `stand_down`（続行しても価値が出ない）。
+
+**合成規則**: 2 問は独立に評価し、各々の閾値で個別に verdict を出す。両方が同時に発火した場合、優先度は `escalate > stand_down`（人の目を優先）。`choice` 型の `next_action` / `tier` は shadow のみで残す（msg-3404 §3、active には昇格しない）。
+
+**Track B 回帰ケース**: §6.5 参照。`rule_stop_reason` で落ちるケース（msg-3656 の author==NEXT、msg-3712 / 3797 の spawn 不能 embodiment）は含めない。Decider の replay ではなく Conductor rule 側テストに置く。
 
 ---
 
@@ -206,7 +272,7 @@ state builder は Conductor 側と同一実装を再利用（D12 と同じ build
 - 179 件 + 遡及正例に、admission-gate v8 のラベル必須化と §2.3 の relay routing を先に適用し、`ADMIT` / `ADMIT_UNSURE` / `second_time_force_admit` として通ったものだけを対象。
 - 予測母数: MERGE ≈ 17 + GOAL 2 + α ∴ **数十件を下回る可能性が高い**。その場合は結果ヘッダに「replay 単独で bounce 可否を確定できない」と書き、live shadow JSONL の蓄積待ちに切り替える。
 - 比較相手: 「ルール vs Jev vs LLM light」ではなく **「全件 escalate の現状 vs LLM light vs Jev」**（gate 後の残りではルールは定義上何も言わない — msg-3818 §1）。
-- state builder に **gate JSONL の `kind`（`ADMIT` / `ADMIT_UNSURE` / `BOUNCED` / `RETRY_ADMIT.reason` / `second_time_force_admit`）を feature として入れる**。`ADMIT_UNSURE` と `second_time_force_admit` は「ルールが判別に失敗した」集合 ∴ Decider annotate が最初に価値を出す場所。
+- state builder は **`DecisionState.gate_result`（in-memory の `AdmissionGateResult`、`kind ∈ ADMIT / ADMIT_UNSURE / BOUNCED / RETRY_ADMIT.reason / second_time_force_admit`）を feature として持つ**。`ADMIT_UNSURE` と `second_time_force_admit` は「ルールが判別に失敗した」集合 ∴ Decider annotate が最初に価値を出す場所。**JSONL の live-time join は禁止**（§3.5 in-memory 契約 — live と replay で同一 shape、distribution shift 回避）。replay driver は過去 JSONL を fixture 構築の入力にしてよいが、Decider へ渡す時点では in-memory `AdmissionGateResult` に正規化されている。
 
 ### 6.3 判定規則の事前固定（P 値ではなく規則として）
 
@@ -247,7 +313,7 @@ implementer の push ごとに走る Gemini フルレビュー（PR 平均 2.4 �
 
 ## 8. 実装順
 
-1. **state builder**（gate JSONL kind を feature 化）**+ questions v3.4**（3 + 3）**+ replay script**（`--track=tierc` は A-pre / A-post 両方吐く）。lexora `/v1/decide` に blocked されないため先行着手可。
+1. **state builder**（`gate_result` を in-memory feature 化、§3.5）**+ questions v3.4**（Tier-C 3 + 3 + Track B 2、§4.7）**+ replay script**（`--track=tierc` は A-pre / A-post 両方吐く、`--track=handoff` は Track B）。lexora `/v1/decide` に blocked されないため先行着手可。
 2. **adapter + verdict + Conductor フック、mode=shadow で先行デプロイ**（`stop is None` ガード下、log-only。Takahito 承認不要 — 実動作を変えないため）。lexora `/v1/decide` 完了後。
 3. **`T-tier-c-admission-gate` PR #322 マージ後（既済）、並行**で:
    - (3a) A-pre / A-post のオフライン replay を回す（既存 179 件 + 遡及正例）
