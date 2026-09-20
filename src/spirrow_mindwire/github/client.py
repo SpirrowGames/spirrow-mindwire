@@ -438,6 +438,8 @@ class GitHubReviewClient(Protocol):
 
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]: ...
 
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]: ...
+
     async def submit_review(
         self, pr: PrRef, *, event: ReviewEvent, body: str
     ) -> dict[str, Any]: ...
@@ -974,6 +976,74 @@ class GitHubClient:
             page += 1
         return out
 
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+        """Fail-LOUD twin of :meth:`fetch_pr_reviews` (``GET /pulls/{n}/reviews``).
+
+        The chatroom-replay discharge check (D-7, DESIGN v3 §2) NEEDS to
+        distinguish "asked and got nothing" from "could not ask" — the
+        fail-soft :meth:`fetch_pr_reviews` collapses both to ``[]``, which
+        :func:`~spirrow_mindwire.github.reviews.landed` would then read as
+        :attr:`~spirrow_mindwire.github.reviews.LandedState.NOT_LANDED` and
+        authorise a re-POST at exactly the moment (a credential outage) when
+        a duplicate POST is most likely (DESIGN v3 §2 fail-open trap).
+
+        This variant raises :class:`GitHubHTTPError` on transport / non-2xx /
+        parse failure, so the replay path can classify the exception via
+        :func:`classify_http_error` and treat a TERMINAL read the same way it
+        would treat a TERMINAL write: probe scope, and if environment,
+        abort the turn without POSTing (D-7 msg-1987 §D-7).
+
+        Deliberately implemented as a SEPARATE method rather than a mode
+        parameter on :meth:`fetch_pr_reviews` (DESIGN v3 §3 constraint: "do not
+        share the fail-soft and strict paths in one function"). Existing callers
+        (round-cap accounting, ``_skip_unchanged_response``) keep the fail-soft
+        semantics they were written against; only the replay-discharge site
+        opts into the strict variant.
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
+        out: list[ReviewInfo] = []
+        page = 1
+        while True:
+            try:
+                resp = await self._client.get(path, params={"per_page": 100, "page": page})
+            except httpx.RequestError as exc:
+                raise GitHubHTTPError(f"GET {path} (reviews strict): {exc}") from exc
+            if resp.status_code >= 400:
+                raise GitHubHTTPError(
+                    f"GET {path} (reviews strict) returned {resp.status_code}: "
+                    f"{_error_detail(resp)}",
+                    status_code=resp.status_code,
+                    retry_after=_retry_after_seconds(resp),
+                    rate_limited=_is_rate_limited(resp),
+                )
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                raise GitHubHTTPError(
+                    f"GET {path} (reviews strict): malformed JSON: {exc}"
+                ) from exc
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                user = row.get("user")
+                login = str(user.get("login") or "") if isinstance(user, dict) else ""
+                cid = row.get("commit_id")
+                submitted = row.get("submitted_at")
+                out.append(
+                    ReviewInfo(
+                        login=login,
+                        state=str(row.get("state") or ""),
+                        commit_id=str(cid) if cid else None,
+                        submitted_at=str(submitted) if submitted else None,
+                    )
+                )
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
     async def find_cross_pr_head_bound_approves(
         self, pr: PrRef, *, reviewer_login: str
     ) -> list[CrossPrApproveCoverage]:
@@ -1302,7 +1372,16 @@ class GitHubClient:
         Returns the HTTP status code (200 on success, 401 on a dead token, 403 on
         a suspended one, etc.). Never raises: a transport-level failure returns 0
         so the caller can distinguish "GitHub said no" (a real answer, one of the
-        4xx codes) from "we could not ask" (an unknown, code 0). D-1's scope-
+        4xx codes) from "we could not ask" (an unknown, code 0). A **rate-limited**
+        403 is reported as 0 rather than 403: GitHub answers a primary or secondary
+        rate limit on ``GET /user`` with the same status a suspended token gets, and
+        :func:`scope_from_probe` maps probe-403 to
+        :class:`Scope.ENVIRONMENT_CREDENTIAL` — so without this the loop would raise
+        a credential-suspended environment alert for a throttle that clears by
+        itself. Rate limiting is exactly "we could not ask", so it collapses to the
+        UNKNOWN code the fail-safe path already handles. Detection reuses
+        :func:`_is_rate_limited` (``x-ratelimit-remaining: 0`` or ``Retry-After``),
+        the same predicate the submit path uses, so the two cannot drift. D-1's scope-
         determination path treats status 200 as "credential lives → the terminal
         we just saw was TARGET-scoped", 401 as
         :class:`Scope.ENVIRONMENT_CREDENTIAL`, and 0 as :class:`Scope.UNKNOWN`
@@ -1315,6 +1394,9 @@ class GitHubClient:
         try:
             resp = await self._client.get("/user")
         except httpx.RequestError:
+            return 0
+        if resp.status_code == 403 and _is_rate_limited(resp):
+            # Throttled, not suspended — "we could not ask", so answer UNKNOWN.
             return 0
         return int(resp.status_code)
 

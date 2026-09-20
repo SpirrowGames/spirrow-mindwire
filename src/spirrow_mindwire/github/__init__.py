@@ -18,6 +18,12 @@ from .client import (
     parse_pr_ref,
     scope_from_probe,
 )
+from .reviews import (
+    LandedState,
+    ReviewReceipt,
+    landed,
+    parse_verdict_footer,
+)
 
 __all__ = [
     "EnvironmentTerminalError",
@@ -25,13 +31,17 @@ __all__ = [
     "GitHubError",
     "GitHubHTTPError",
     "GitHubReviewClient",
+    "LandedState",
     "PrRef",
     "Retryability",
     "ReviewEvent",
+    "ReviewReceipt",
     "Scope",
     "TargetTerminalError",
     "classify_http_error",
     "github_token",
+    "landed",
     "parse_pr_ref",
+    "parse_verdict_footer",
     "scope_from_probe",
 ]

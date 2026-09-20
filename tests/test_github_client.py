@@ -779,6 +779,68 @@ async def test_both_paths_unusable_stays_unknown_and_keeps_rest_head_sha() -> No
     assert st.head_sha == "abc"
 
 
+# ---------- D-1: error classification (T-gate-review-submit-failure-handling) ----------
+
+
+def _submit_handler(*, status: int, headers: dict[str, str] | None = None) -> Any:
+    body = b'{"message": "boom"}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path.endswith("/reviews")
+        return httpx.Response(status, content=body, headers=headers or {})
+
+    return handler
+
+
+def _reviews_handler(*, status: int, body: bytes | None = None) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path.endswith("/reviews")
+        return httpx.Response(status, content=body if body is not None else b"[]")
+
+    return handler
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_reviews_strict_raises_on_401_where_fail_soft_returns_empty() -> None:
+    # The whole point of the strict variant: the fail-soft returns [] on any error
+    # (which the landed() predicate would then read as NOT_LANDED, authorising a
+    # duplicate POST at exactly the moment it should not). Strict raises so the
+    # caller can classify + probe.
+    async with _client(_reviews_handler(status=401)) as client:
+        with pytest.raises(GitHubHTTPError) as excinfo:
+            await client.fetch_pr_reviews_strict(_PR)
+        # And the SAME endpoint returns [] on the fail-soft twin.
+        assert await client.fetch_pr_reviews(_PR) == []
+    assert excinfo.value.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_reviews_strict_raises_on_transport_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("dns")
+
+    async with _client(handler) as client:
+        with pytest.raises(GitHubHTTPError):
+            await client.fetch_pr_reviews_strict(_PR)
+
+
+@pytest.mark.anyio
+async def test_fetch_pr_reviews_strict_returns_reviews_on_success() -> None:
+    # Same parsing as the fail-soft variant on the happy path — the only difference
+    # is where they diverge on error. This asserts the happy paths remain aligned.
+    body = (
+        b'[{"user":{"login":"spirrowgames-ops"},"state":"APPROVED",'
+        b'"commit_id":"abc","submitted_at":"2026-08-29T00:00:00Z"}]'
+    )
+    async with _client(_reviews_handler(status=200, body=body)) as client:
+        strict = await client.fetch_pr_reviews_strict(_PR)
+    assert len(strict) == 1
+    assert strict[0].state == "APPROVED"
+    assert strict[0].commit_id == "abc"
+
+
 # ---------- fetch_check_rollup (pre-gate admission input) ----------------- #
 
 
@@ -1698,6 +1760,15 @@ def _probe_handler(*, status: int) -> Any:
     return handler
 
 
+def _probe_hdr_handler(*, status: int, headers: dict[str, str]) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/user"
+        return httpx.Response(status, headers=headers, content=b'{"login": "x"}')
+
+    return handler
+
+
 @pytest.mark.anyio
 async def test_probe_identity_returns_200_when_credential_lives() -> None:
     async with _client(_probe_handler(status=200)) as client:
@@ -1708,6 +1779,36 @@ async def test_probe_identity_returns_200_when_credential_lives() -> None:
 async def test_probe_identity_returns_401_when_credential_dead() -> None:
     async with _client(_probe_handler(status=401)) as client:
         assert await client.probe_identity() == 401
+
+
+@pytest.mark.anyio
+async def test_probe_identity_primary_rate_limited_403_is_unknown_not_suspended() -> None:
+    # PR-gate objection on #280: GitHub answers an exhausted primary rate limit on
+    # GET /user with 403 — the same status a suspended token gets. scope_from_probe
+    # maps probe-403 to ENVIRONMENT_CREDENTIAL, so reporting the raw 403 here would
+    # raise a credential-suspended environment alert for a throttle that clears by
+    # itself. A throttle is "we could not ask", so it must collapse to 0 (UNKNOWN).
+    async with _client(
+        _probe_hdr_handler(status=403, headers={"x-ratelimit-remaining": "0"})
+    ) as client:
+        assert await client.probe_identity() == 0
+
+
+@pytest.mark.anyio
+async def test_probe_identity_secondary_rate_limited_403_is_unknown_not_suspended() -> None:
+    # The secondary limit signals with Retry-After rather than an exhausted budget;
+    # _is_rate_limited covers both, and probe_identity must honour both the same way.
+    async with _client(_probe_hdr_handler(status=403, headers={"Retry-After": "30"})) as client:
+        assert await client.probe_identity() == 0
+
+
+@pytest.mark.anyio
+async def test_probe_identity_plain_403_still_reports_suspended_credential() -> None:
+    # The complement that keeps the fix from swallowing the real signal: a 403 with
+    # no rate-limit evidence is still the suspended-token answer scope_from_probe
+    # maps to ENVIRONMENT_CREDENTIAL.
+    async with _client(_probe_handler(status=403)) as client:
+        assert await client.probe_identity() == 403
 
 
 @pytest.mark.anyio

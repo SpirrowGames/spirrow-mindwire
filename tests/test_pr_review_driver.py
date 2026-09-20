@@ -158,6 +158,13 @@ class _FakeGitHub:
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
         return list(self._reviews)
 
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+        # Fail-loud twin: tests that inject a fetch failure route it through the loud
+        # path via ``fetch_exc``. Default is the same list the fail-soft variant returns.
+        if self._fetch_exc is not None:
+            raise self._fetch_exc
+        return list(self._reviews)
+
     async def find_cross_pr_head_bound_approves(
         self, pr: PrRef, *, reviewer_login: str
     ) -> list[CrossPrApproveCoverage]:
@@ -202,8 +209,11 @@ def _pr() -> PrRef:
 def _capture() -> tuple[list[str], PostCritique]:
     posted: list[str] = []
 
-    async def post(body: str) -> None:
+    async def post(body: str) -> str:
         posted.append(body)
+        # Return a stub msg_id — the driver's ReviewReceipt keeps it for observability
+        # but the tests in this file assert on the posted body, not on the id.
+        return f"msg-{len(posted)}"
 
     return posted, post
 
@@ -1838,6 +1848,496 @@ def test_verdict_decision_is_immutable() -> None:
         decision.model_verdict = ModelVerdict.REQUEST_CHANGES  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         view.original_chars = 42  # type: ignore[misc]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# T-gate-review-submit-failure-handling — verdict footer, environment terminal,
+# chatroom replay (DESIGN v3 §3, msgs 1981-1988).
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _find_verdict_footer(body: str) -> tuple[str, str] | None:
+    """Extract (head_sha, event) from the verdict footer, or None if absent/ambiguous."""
+    from spirrow_mindwire.github.reviews import parse_verdict_footer
+
+    parsed = parse_verdict_footer(body)
+    if parsed is None:
+        return None
+    sha, event = parsed
+    return sha, event.value
+
+
+@pytest.mark.anyio
+async def test_normal_review_body_carries_verdict_footer_and_adr_marker_final() -> None:
+    # DESIGN v3 Q5-A: the verdict footer is stamped on every posted body. The
+    # ADR-INDEX marker keeps its final-line invariant (msg-690 M2) — the footer
+    # is inserted BEFORE the marker, so both sentinels coexist without conflict.
+    lexora = _FakeLexora(content="LGTM\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "abcdef1234567890", []))
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    body = posted[0]
+    parsed = _find_verdict_footer(body)
+    assert parsed is not None
+    sha, event = parsed
+    assert sha == "abcdef1234567890"
+    assert event == "APPROVE"
+    # ADR-INDEX marker is the final non-empty line.
+    lines = [ln for ln in body.rstrip().splitlines() if ln.strip()]
+    assert lines[-1].startswith("ADR-INDEX:")
+    # And the same body is what got submitted to GitHub.
+    _pr_ref, _event, submitted_body = github.submitted[0]
+    assert submitted_body == body
+    assert outcome.verdict is ReviewEvent.APPROVE
+
+
+@pytest.mark.anyio
+async def test_ci_gate_body_carries_verdict_footer() -> None:
+    # CI-gate short-circuit path also flows through _post_and_submit, so the
+    # footer stamps here too — a replay consumer for a CI-gate COMMENT is a
+    # legitimate use of the marker.
+    lexora = _FakeLexora()
+    github = _FakeGitHub(ci=CiStatus(CiState.FAILURE, "aaaabbbb01234567", ["voxel-gate"]))
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    await driver.review(_pr(), post_critique=post)
+
+    parsed = _find_verdict_footer(posted[0])
+    assert parsed is not None
+    sha, event = parsed
+    assert sha == "aaaabbbb01234567"
+    assert event == "REQUEST_CHANGES"
+
+
+@pytest.mark.anyio
+async def test_target_terminal_422_with_live_probe_reraises_not_environment_terminal() -> None:
+    # A 422 on submit (not the same-identity 422; some other 422) + a 200 on
+    # probe → TARGET. The driver re-raises GitHubHTTPError, and the daemon's
+    # existing exit-1 / quarantine path handles it. Environment-terminal path
+    # is NOT taken.
+    from spirrow_mindwire.github.client import EnvironmentTerminalError
+
+    class _TargetGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-t", []))
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            raise GitHubHTTPError(
+                "POST /reviews returned 422: unprocessable entity", status_code=422
+            )
+
+        async def probe_identity(self) -> int:
+            return 200
+
+    github = _TargetGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    # NOT an EnvironmentTerminalError — that would suppress the quarantine
+    # incorrectly on a genuine target-scoped fault.
+    assert not isinstance(excinfo.value, EnvironmentTerminalError)
+    assert excinfo.value.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_unknown_scope_reraises_not_environment_terminal() -> None:
+    # A 401 on submit + a transport-failed probe (0) → UNKNOWN. The driver
+    # MUST NOT route UNKNOWN through the environment-terminal path; it
+    # re-raises so the existing quarantine path handles it. DESIGN v3 §3
+    # "未分類は必ず 1".
+    from spirrow_mindwire.github.client import EnvironmentTerminalError
+
+    class _UnknownGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "sha-u", []))
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            raise GitHubHTTPError("POST /reviews returned 401", status_code=401)
+
+        async def probe_identity(self) -> int:
+            return 0  # transport failure; we could not decide scope
+
+    github = _UnknownGitHub()
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await driver.review(_pr(), post_critique=post)
+    assert not isinstance(excinfo.value, EnvironmentTerminalError)
+
+
+@pytest.mark.anyio
+async def test_same_identity_422_fallback_still_works_with_receipt() -> None:
+    # The T22 same-identity 422 → COMMENT fallback survives the receipt refactor.
+    exc = GitHubHTTPError(
+        "POST /reviews returned 422: cannot approve your own pull request", status_code=422
+    )
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "sha-t22", []),
+        submit_exc=exc,
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=_FakeLexora(content="ok\n\nVERDICT: APPROVE"), github=github
+    )
+    outcome = await driver.review(_pr(), post_critique=post)
+    # The APPROVE 422s → fallback COMMENT is submitted; the outcome verdict remains
+    # APPROVE (that is what we DECIDED, even if GitHub gave us a COMMENT).
+    assert outcome.verdict is ReviewEvent.APPROVE
+    events_submitted = [event for _, event, _ in github.submitted]
+    assert events_submitted == [ReviewEvent.COMMENT]  # the fallback landed
+
+
+def _replay_reader(bodies: list[tuple[str, str]]) -> Any:
+    async def read() -> list[tuple[str, str]]:
+        return list(bodies)
+
+    return read
+
+
+@pytest.mark.anyio
+async def test_replay_reposts_prior_verdict_when_footer_matches_head_and_not_landed() -> None:
+    # The exact #192 scenario: a prior naysayer chatroom post carries the verdict
+    # footer for the current head; the GitHub reviews list is empty (nothing landed);
+    # the driver re-POSTs the same verdict WITHOUT calling Gemini.
+    lexora = _FakeLexora(content="should not be called")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "deadbeefdeadbeef", []),
+        reviews=[],  # nothing landed on GitHub
+    )
+    prior_body = (
+        "prior critique\n\n"
+        "VERDICT: APPROVE\n\n"
+        "<!-- mindwire:verdict head_sha=deadbeefdeadbeef event=APPROVE -->\n\n"
+        "ADR-INDEX: unavailable"
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(
+        _pr(),
+        post_critique=post,
+        read_review_thread=_replay_reader([("naysayer", prior_body)]),
+    )
+    # Gemini NOT called; the verdict was re-POSTed from the chatroom body.
+    assert lexora.calls == []
+    assert outcome.verdict is ReviewEvent.APPROVE
+    assert [event for _, event, _ in github.submitted] == [ReviewEvent.APPROVE]
+
+
+@pytest.mark.anyio
+async def test_replay_does_not_fire_when_landed_check_says_landed() -> None:
+    # Discharge check: the review DID land on GitHub last time (we just lost the
+    # response). Replay must NOT re-POST, or we get a duplicate.
+    lexora = _FakeLexora(content="ok\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "cafebabecafebabe", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "APPROVED", "cafebabecafebabe", "2026-08-29T00:00:00Z"),
+        ],
+    )
+    prior_body = (
+        "prior\n\nVERDICT: APPROVE\n\n"
+        "<!-- mindwire:verdict head_sha=cafebabecafebabe event=APPROVE -->\n\n"
+        "ADR-INDEX: unavailable"
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(
+        _pr(),
+        post_critique=post,
+        read_review_thread=_replay_reader([("naysayer", prior_body)]),
+    )
+    # Not the replay path — the discharge check said landed, so we fell through
+    # to a normal review (lexora call OK, one fresh submission).
+    assert lexora.calls != []
+    assert outcome.verdict is ReviewEvent.APPROVE
+    # And critically: only ONE new submit (the fresh review), not two.
+    assert len(github.submitted) == 1
+
+
+@pytest.mark.anyio
+async def test_replay_ignores_footer_for_different_head() -> None:
+    # A footer for an old head is superseded, not replay-eligible.
+    lexora = _FakeLexora(content="fresh\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "1111222233334444", []))
+    prior_body = (
+        "old critique\n\nVERDICT: APPROVE\n\n"
+        "<!-- mindwire:verdict head_sha=5555666677778888 event=APPROVE -->\n\n"
+        "ADR-INDEX: unavailable"
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(
+        _pr(),
+        post_critique=post,
+        read_review_thread=_replay_reader([("naysayer", prior_body)]),
+    )
+    # Full review path (Gemini called), not replay.
+    assert lexora.calls != []
+    assert outcome.verdict is ReviewEvent.APPROVE
+
+
+@pytest.mark.anyio
+async def test_replay_suppression_marker_prevents_replay_on_current_head() -> None:
+    # A prior "投函不能" marker for THIS head means the human must adjudicate;
+    # the driver falls through to a normal review rather than re-POSTing.
+    lexora = _FakeLexora(content="fresh\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "9999aaaabbbbcccc", []))
+    prior_footer_body = (
+        "prior\n\nVERDICT: APPROVE\n\n"
+        "<!-- mindwire:verdict head_sha=9999aaaabbbbcccc event=APPROVE -->\n\n"
+        "ADR-INDEX: unavailable"
+    )
+    suppression_body = (
+        "投函不能: 9999aaaabbbbcccc (status=422, reason=cannot post)\n\n"
+        "<!-- mindwire:unposted head_sha=9999aaaabbbbcccc -->"
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    _outcome = await driver.review(
+        _pr(),
+        post_critique=post,
+        read_review_thread=_replay_reader(
+            [
+                ("naysayer", prior_footer_body),
+                ("naysayer", suppression_body),  # more recent — the marker
+            ]
+        ),
+    )
+    # Replay refused → fresh Gemini call ran.
+    assert lexora.calls != []
+
+
+@pytest.mark.anyio
+async def test_replay_read_failure_falls_through_to_normal_review() -> None:
+    # A broken read_review_thread must NOT stop the sweep — the driver treats
+    # a read failure the same as "no replay candidate" and continues.
+    lexora = _FakeLexora(content="fresh\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha-r", []))
+
+    async def broken_reader() -> list[tuple[str, str]]:
+        raise RuntimeError("chatroom read failed")
+
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(_pr(), post_critique=post, read_review_thread=broken_reader)
+    assert outcome.verdict is ReviewEvent.APPROVE
+    assert lexora.calls != []
+
+
+@pytest.mark.anyio
+async def test_replay_strict_read_env_terminal_raises_environment_terminal_error() -> None:
+    # PR-gate objection 1 (msg pr-gate review of #280): the strict-read failure on
+    # the discharge check MUST be routed through the same classify+probe funnel
+    # _submit_review uses. Before this fix the raw GitHubHTTPError bubbled out and
+    # quarantined the thread — exactly the false-quarantine this PR exists to
+    # prevent for env-terminal faults. This test now asserts the DETERMINISTIC
+    # outcome (EnvironmentTerminalError, not "either of two exceptions"), which is
+    # the property that reds if the funnel wiring regresses.
+    from spirrow_mindwire.github.client import EnvironmentTerminalError
+
+    probe_calls: list[int] = []
+
+    class _ReadFailGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "7777888899990000", []))
+
+        async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+            raise GitHubHTTPError("GET /reviews returned 401", status_code=401)
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            raise AssertionError("submit_review must not be called after strict read raises")
+
+        async def probe_identity(self) -> int:
+            probe_calls.append(1)
+            return 401
+
+    github = _ReadFailGitHub()
+    prior_body = (
+        "prior\n\nVERDICT: APPROVE\n\n"
+        "<!-- mindwire:verdict head_sha=7777888899990000 event=APPROVE -->\n\n"
+        "ADR-INDEX: unavailable"
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=_FakeLexora(content="unused"), github=github)
+    with pytest.raises(EnvironmentTerminalError) as excinfo:
+        await driver.review(
+            _pr(),
+            post_critique=post,
+            read_review_thread=_replay_reader([("naysayer", prior_body)]),
+        )
+    # The classify+probe funnel is what set scope; verify it ran (probe was called)
+    # and that the raised exception carries the same shape as a write-side env-terminal.
+    assert probe_calls, "probe_identity must run to decide scope on a terminal strict-read"
+    from spirrow_mindwire.github.client import Scope
+
+    assert excinfo.value.scope is Scope.ENVIRONMENT_CREDENTIAL
+    assert excinfo.value.status_code == 401
+    assert excinfo.value.pr == _pr()
+
+
+@pytest.mark.anyio
+async def test_replay_strict_read_403_suspended_token_raises_environment_terminal_error() -> None:
+    # PR-gate objection 2 (msg pr-gate review of #280) combined with objection 1
+    # (strict-read routing):
+    # a strict-read 401 whose probe returns 403 (suspended token — SAML enforcement
+    # / abuse detection) MUST route to Scope.ENVIRONMENT_CREDENTIAL, not fall through
+    # to UNKNOWN and quarantine. This is the composite test that both fixes must
+    # pass simultaneously; if scope_from_probe forgets probe==403, or if the read
+    # path forgets to consult the probe, this reds.
+    from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
+
+    class _SuspendedGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "6666555544443333", []))
+
+        async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+            raise GitHubHTTPError("GET /reviews returned 401", status_code=401)
+
+        async def probe_identity(self) -> int:
+            # Suspended token — GH returns 403 from /user, not 401 (per probe_identity
+            # docstring). The design must treat this as credential-scoped nonetheless.
+            return 403
+
+    github = _SuspendedGitHub()
+    prior_body = (
+        "prior\n\nVERDICT: APPROVE\n\n"
+        "<!-- mindwire:verdict head_sha=6666555544443333 event=APPROVE -->\n\n"
+        "ADR-INDEX: unavailable"
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=_FakeLexora(content="unused"), github=github)
+    with pytest.raises(EnvironmentTerminalError) as excinfo:
+        await driver.review(
+            _pr(),
+            post_critique=post,
+            read_review_thread=_replay_reader([("naysayer", prior_body)]),
+        )
+    assert excinfo.value.scope is Scope.ENVIRONMENT_CREDENTIAL
+
+
+@pytest.mark.anyio
+async def test_submit_403_with_unreachable_probe_reraises_plain_error_and_no_marker() -> None:
+    # PR-gate objection 3 (msg pr-gate review of #280): the invariant "callers must
+    # NOT collapse UNKNOWN into either concrete Scope value" (Scope docstring). A 403
+    # on submit whose probe fails (transport error → probe_status=0 → Scope.UNKNOWN)
+    # is fail-safe re-raised as a plain GitHubHTTPError. The replay handler must NOT
+    # write the mindwire:unposted suppression marker for this case — writing it
+    # would permanently poison the head for a head that might well be fine as soon
+    # as the transient probe/network issue clears.
+    from spirrow_mindwire.github.client import TargetTerminalError
+
+    posted: list[str] = []
+
+    async def capture(body: str) -> str:
+        posted.append(body)
+        return "chatroom-msg-id"
+
+    class _Submit403ProbeDeadGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "2222333344445555", []))
+            self.submitted = []
+
+        async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+            return []  # NOT_LANDED — replay is eligible
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            raise GitHubHTTPError("POST /reviews returned 403", status_code=403)
+
+        async def probe_identity(self) -> int:
+            # Probe network died: fail-safe UNKNOWN (never route to env or target).
+            return 0
+
+    github = _Submit403ProbeDeadGitHub()
+    prior_body = (
+        "prior\n\nVERDICT: APPROVE\n\n"
+        "<!-- mindwire:verdict head_sha=2222333344445555 event=APPROVE -->\n\n"
+        "ADR-INDEX: unavailable"
+    )
+    driver = NaysayerPrReviewDriver(lexora=_FakeLexora(content="unused"), github=github)
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await driver.review(
+            _pr(),
+            post_critique=capture,
+            read_review_thread=_replay_reader([("naysayer", prior_body)]),
+        )
+    # The load-bearing assertion: the exception is a PLAIN GitHubHTTPError, not a
+    # TargetTerminalError. Type-level proof that scope did NOT get collapsed.
+    assert not isinstance(excinfo.value, TargetTerminalError)
+    assert excinfo.value.status_code == 403
+    # And the marker was NOT posted (the invariant this test defends). Any post
+    # here must be the replay POST body carrying the verdict footer — never the
+    # 1-line "mindwire:unposted" suppression marker.
+    for body in posted:
+        assert "mindwire:unposted" not in body, (
+            f"UNKNOWN scope must not write a target-terminal suppression marker; got: {body!r}"
+        )
+
+
+@pytest.mark.anyio
+async def test_submit_422_with_live_probe_writes_target_terminal_marker() -> None:
+    # Positive-evidence path (msg-1984 §2, DESIGN v3 §3): a 422 whose probe returns
+    # 200 (credential is fine) is Scope.TARGET — the PR itself is bad. This is the
+    # ONE case where the mindwire:unposted marker fires. Pinning this alongside the
+    # UNKNOWN test above proves the split works both ways.
+    posted: list[str] = []
+
+    async def capture(body: str) -> str:
+        posted.append(body)
+        return "chatroom-msg-id"
+
+    class _Submit422LiveProbeGitHub(_FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(ci=CiStatus(CiState.SUCCESS, "8888999900001111", []))
+            self.submitted = []
+
+        async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+            return []  # NOT_LANDED
+
+        async def submit_review(
+            self, pr: PrRef, *, event: ReviewEvent, body: str
+        ) -> dict[str, Any]:
+            # 422 that is NOT the same-identity "own pull request" case (that has
+            # its own COMMENT fallback). This is e.g. a deleted-PR / merged-branch
+            # / bad-commit-id 422.
+            raise GitHubHTTPError("POST /reviews returned 422: PR is closed", status_code=422)
+
+        async def probe_identity(self) -> int:
+            return 200  # credential is fine → not env
+
+    github = _Submit422LiveProbeGitHub()
+    prior_body = (
+        "prior\n\nVERDICT: APPROVE\n\n"
+        "<!-- mindwire:verdict head_sha=8888999900001111 event=APPROVE -->\n\n"
+        "ADR-INDEX: unavailable"
+    )
+    from spirrow_mindwire.github.client import TargetTerminalError
+
+    driver = NaysayerPrReviewDriver(lexora=_FakeLexora(content="unused"), github=github)
+    with pytest.raises(TargetTerminalError):
+        await driver.review(
+            _pr(),
+            post_critique=capture,
+            read_review_thread=_replay_reader([("naysayer", prior_body)]),
+        )
+    # The marker WAS posted (positive-evidence path).
+    marker_posts = [b for b in posted if "mindwire:unposted" in b]
+    assert len(marker_posts) == 1, f"expected exactly one suppression marker; got {posted!r}"
+    assert "head_sha=8888999900001111" in marker_posts[0]
 
 
 # =========================================================================== #

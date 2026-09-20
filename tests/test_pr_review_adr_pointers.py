@@ -149,6 +149,9 @@ class _FakeGitHub:
     async def fetch_pr_reviews(self, pr: PrRef) -> list[ReviewInfo]:
         return list(self._reviews)
 
+    async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]:
+        return list(self._reviews)
+
     async def find_cross_pr_head_bound_approves(
         self, pr: PrRef, *, reviewer_login: str
     ) -> list[Any]:
@@ -187,8 +190,9 @@ def _pr() -> PrRef:
 def _capture() -> tuple[list[str], Any]:
     posted: list[str] = []
 
-    async def post(body: str) -> None:
+    async def post(body: str) -> str:
         posted.append(body)
+        return f"msg-{len(posted)}"
 
     return posted, post
 

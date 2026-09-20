@@ -766,6 +766,58 @@ Check "loud fall-back does NOT throw (never-break-sweep contract preserved)" $fa
 Check "loud fall-back returns 'unknown'" 'unknown' $fallbackResult
 Check "loud fall-back emits at least one Write-Warning record (not silent)" $true ($warnings.Count -gt 0)
 
+# ------------------------------------------------------------------------------------------------
+# env-terminal Discord dedup signature: STATE-DERIVED, never TIME-DERIVED.
+#
+# pr-review objection on #280 @ 64bc63f (msg-3236): an earlier revision embedded $nowIso in the
+# $envSig assignments in the exit-code==2 branch, which made every sweep produce a fresh signature
+# and defeated `Send-NotificationIfChanged`'s per-key-equality dedup. A revoked PAT would then spam
+# Discord every 5 minutes instead of alerting once per state change.
+#
+# The state-derived form (scope + owner/repo + status_code) has no test elsewhere — the sweep's
+# exit=2 branch is inline (not a lifted function), so a behavioural test would need to run the whole
+# wrapper. A source-level invariant catches the regression at the exact seam pr-review flagged: any
+# $envSig assignment inside the exit=2 branch that references $nowIso (or any Get-Date /
+# DateTime.UtcNow / [datetime]::Now derivative) breaks dedup.
+Write-Host "env-terminal signature: state-derived, never time-derived (pr-review #280 msg-3236)"
+
+$sweepText = Get-Content -LiteralPath $sweepScript -Raw
+# The exit-2 branch is bounded by the two comment sentinels around it. Anchor on the branch header
+# and the closing `continue` to slice deterministically — a stray $envSig assignment anywhere else
+# in the file (there are none today) would not affect this branch, and the check would false-alarm
+# on it. Slicing means the assertion targets exactly the block pr-review flagged.
+$branchMatch = [regex]::Match(
+    $sweepText,
+    '(?ms)^\s*if \(\$code -eq 2\) \{.*?^\s*continue\s*$',
+    [System.Text.RegularExpressions.RegexOptions]::Multiline)
+Check "exit=2 branch locatable in sweep source" $true $branchMatch.Success
+
+if ($branchMatch.Success) {
+    $branchText = $branchMatch.Value
+    # Collect every `$envSig = ...` assignment line in the branch.
+    $envSigAssigns = [regex]::Matches($branchText, '(?m)^\s*\$envSig\s*=\s*(.+)$') |
+        ForEach-Object { $_.Groups[1].Value }
+    Check "at least one `$envSig assignment present (fallback + at least one scope)" $true ($envSigAssigns.Count -ge 2)
+
+    # Every assignment RHS must be free of $nowIso. This is the exact regression the naysayer caught
+    # on #280 @ 64bc63f. Both interpolation forms (bare `$nowIso` and braced `${nowIso}`) must be
+    # rejected — pr-review's example used the braced form, and PS accepts both.
+    $nowIsoAssigns = @($envSigAssigns | Where-Object { $_ -match '\$\{?nowIso\}?' })
+    Check "no `$envSig assignment embeds `$nowIso (dedup defeat regression guard, msg-3236)" 0 $nowIsoAssigns.Count
+
+    # Belt-and-braces: no time-source APIs either. The invariant is "signature is derived from
+    # fault state, not from wall-clock". Get-Date, [datetime]::UtcNow, [DateTime]::Now, and
+    # ToString('o') on any DateTime all produce sweep-varying values; if a future edit reaches for
+    # any of them, catch it here rather than at 3 AM in the Discord channel.
+    $timeApiAssigns = @($envSigAssigns | Where-Object {
+        $_ -match 'Get-Date' -or
+        $_ -match '\[DateTime\]::' -or
+        $_ -match '\[datetime\]::' -or
+        $_ -match '\.ToString\(''o''\)'
+    })
+    Check "no `$envSig assignment reaches for a wall-clock API (state-derived invariant, msg-3236)" 0 $timeApiAssigns.Count
+}
+
 if ($script:failures -gt 0) {
     Write-Host "sweep quarantine: $($script:failures) check(s) FAILED"
     exit 1
