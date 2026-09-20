@@ -30,6 +30,7 @@ from spirrow_mindwire.gate_bootstrap import (
     GateBootstrapCloseError,
     GateStatus,
     OpenResult,
+    _normalize_repo_dir,
     close_alert,
     inspect_gate,
     open_alert,
@@ -416,10 +417,21 @@ def test_thread_id_for_no_collisions_in_current_sweep() -> None:
     # checked-in example and in Bohr msg-2779 §5). Dedup on the pair itself so
     # a "collision" the test reports is a real collision — same id for two
     # distinct pairs — not just the same pair listed twice.
+    #
+    # Dedup uses :func:`_normalize_repo_dir` on ``repo_dir`` so the key we
+    # dedup on lines up with what :func:`thread_id_for` sees (PR-gate on
+    # PR #277 advisory `structure`, msg-3159 finding #2): the two lists
+    # can legitimately spell the same path with different casing or slash
+    # direction, and the normalised form is what determines identity. If
+    # we left them separate here, the same identity would appear twice in
+    # ``unique_pairs``, ``thread_id_for`` would (correctly) produce equal
+    # ids for both, and the final ``len(set(ids)) == len(ids)`` assertion
+    # would flip red on what is actually a duplicate entry, not a
+    # collision.
     seen_pairs: set[tuple[str, str]] = set()
     unique_pairs: list[tuple[str, str]] = []
     for pair in checked_in_pairs + production_pairs:
-        key = (pair[0], str(pair[1]))
+        key = (pair[0], _normalize_repo_dir(pair[1]))
         if key in seen_pairs:
             continue
         seen_pairs.add(key)
@@ -480,6 +492,40 @@ async def test_open_alert_opens_fixed_thread_id_with_alert_tags() -> None:
     # And names the design ADRs the PR-side is expected to cite (msg-1967).
     assert "ADR-2026-05-29-10" in args["propose_content"]
     assert "ADR-2026-06-03-16" in args["propose_content"]
+
+
+@pytest.mark.anyio
+async def test_open_alert_title_and_propose_include_repo_label_and_full_repo_dir() -> None:
+    """Alert title carries the repo basename; the body carries the full path.
+
+    Pins T-new-project-gate-bootstrap msg-3750 §4 / PR-gate on PR #277
+    advisory `legibility`: when a single ``project`` maps to two or more
+    ``repo_dir``s (production ``config/sweep.json`` maps
+    ``spirrow-magickit`` onto three of them), the operator sees two threads
+    with identical titles unless the repository is named on the title.
+    Identity is still the ``thread_id`` (hashed full path) — the label is
+    display only. The body carries the full ``repo_dir`` so a
+    basename-collision does not hide the underlying path from the reader.
+    """
+    project = "spirrow-magickit"
+    repo_dir = Path("/tmp/experimental/magickit-impl")
+    mcp = _FakeMcp(results={"chatroom_open_thread": {"ok": True}})
+    await open_alert(mcp, project=project, repo_dir=repo_dir)
+    args = mcp.args_for("chatroom_open_thread")
+    # Title carries the repo basename so the operator's thread list is
+    # not two identical rows.
+    assert "magickit-impl" in args["title"], (
+        f"title omits the repo label — two threads for {project!r} become "
+        f"indistinguishable in the UI (PR-gate #277 advisory): {args['title']!r}"
+    )
+    # Body carries the full path so basename collisions do not hide the
+    # underlying identity from the reader.
+    assert str(repo_dir) in args["propose_content"], (
+        f"propose_content omits the full repo_dir; only the basename is "
+        f"disambiguating on the title, and the propose body is the only "
+        f"place a reader can recover the full identity in a basename "
+        f"collision: {args['propose_content']!r}"
+    )
 
 
 @pytest.mark.anyio

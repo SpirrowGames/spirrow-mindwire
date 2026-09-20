@@ -59,7 +59,7 @@ import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 from .magickit.client import MagickitMcpError, McpToolCaller
@@ -101,15 +101,25 @@ _UPSTREAM_REF_FALLBACKS: tuple[str, ...] = ("origin/HEAD", "origin/main", "origi
 
 # The template the sweeper posts as the thread's ``propose_content``. It is a
 # **fixed string** — no LLM call, no repo-specific interpolation beyond the
-# project name — because the *question* is universal ("declare a green") and
-# only the *answer* is repo-specific (msg-1963 D-3). The implementer that picks
-# this up reads the actual CI config and writes the gate script itself.
+# project / repo_dir / repo_label — because the *question* is universal
+# ("declare a green") and only the *answer* is repo-specific (msg-1963 D-3).
+# The implementer that picks this up reads the actual CI config and writes
+# the gate script itself.
+#
+# The ``{repo_dir}`` and ``{repo_label}`` interpolation is a T-new-project-
+# gate-bootstrap msg-3750 §4 addition: PR-gate on PR #277 flagged that
+# multiple alerts sharing one ``project`` (e.g. ``spirrow-magickit`` maps
+# to three ``repo_dir``s in production ``config/sweep.json``) were
+# indistinguishable in the operator UI. The full path lives in the body
+# so the operator can identify the exact filesystem entity even if two
+# repos happen to have the same basename.
 _PROPOSE_TEMPLATE = """\
 [This thread was opened automatically by the sweeper. It is a system alert, not \
 a design proposal — the machine only asks the question; the answer is written \
 by an implementer that reads the target repository.]
 
 Project: {project}
+Repository: {repo_dir} (label: {repo_label})
 
 The predicate `gate_missing({project})` fired this tick: neither the working \
 tree nor any resolvable upstream ref (`origin/HEAD` / `origin/main` / \
@@ -147,9 +157,35 @@ it remains as a stalled record, per msg-1967 N-5-C (a known residual: the \
 general "PR stopped, thread stranded" problem is out of scope for this \
 mechanism)."""
 
-# Fixed title. Short enough for the chatroom UI and fixed for the same reason
-# the thread id is fixed — this is one thread per project, not a series.
-_TITLE_TEMPLATE = "System alert: {project} has no `.mindwire-gate` — declare a green"
+# Title template. Short enough for the chatroom UI. The ``{repo_label}`` slot
+# lets the operator distinguish alerts for two different ``repo_dir``s under
+# the same project (T-new-project-gate-bootstrap msg-3750 §4, PR-gate on
+# PR #277 advisory `legibility`). Identity remains the ``thread_id`` — see
+# :func:`thread_id_for` — and the ``{repo_label}`` here is a display-only
+# hint. If two repos have the same ``repo_label`` (basename collision), the
+# threads are still distinct (identity is on the hashed path) and the operator
+# can disambiguate via the full ``{repo_dir}`` in the propose body.
+_TITLE_TEMPLATE = "System alert: {project} @ {repo_label} has no `.mindwire-gate` — declare a green"
+
+
+def _repo_label(repo_dir: Any) -> str:
+    """Human-readable short label for ``repo_dir``.
+
+    The **basename** of the path — long enough to identify the repo in the
+    chatroom UI, short enough to fit a title. **NOT an identity** (that is
+    :func:`thread_id_for`, which composes the full normalised path plus a
+    hash suffix); if two ``repo_dir``s share a basename the labels will
+    collide but the ``thread_id``s will not, so operators still see two
+    distinct threads with the same title and can disambiguate from the
+    full path in the propose body.
+
+    Einstein msg-3121 rejected the basename as an *identity* on principled
+    injectivity grounds. That rejection is unchanged here: this function
+    is used for display, and the identity split (msg-3750 §4) is what
+    lets us reuse the basename for the display without re-opening the
+    injectivity question.
+    """
+    return PurePath(str(repo_dir)).name or str(repo_dir)
 
 
 class GateStatus(StrEnum):
@@ -593,8 +629,14 @@ async def open_alert(
     entry, and let the read-back's own answer decide.
     """
     thread_id = thread_id_for(project, repo_dir)
-    title = title_template.format(project=project)
-    propose = propose_template.format(project=project)
+    repo_label = _repo_label(repo_dir)
+    # ``repo_dir`` on the propose body carries the FULL path (so an operator
+    # can distinguish basename-colliding repos). ``repo_label`` on the title
+    # is a short hint only. See :func:`_repo_label` and msg-3750 §4 for the
+    # identity-vs-display separation.
+    format_kwargs = {"project": project, "repo_dir": str(repo_dir), "repo_label": repo_label}
+    title = title_template.format(**format_kwargs)
+    propose = propose_template.format(**format_kwargs)
     try:
         await mcp.call_tool(
             "chatroom_open_thread",

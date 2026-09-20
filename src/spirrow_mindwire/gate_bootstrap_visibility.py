@@ -51,16 +51,25 @@ is a separate design item and out of scope for this PR (msg-2301 §4).
 State machine (D-2''' rules 1-3, D-2'' 2-field split)
 --------------------------------------------------
 
-Per-project state carries FOUR fields, in TWO logically-independent records:
+Per-``thread_id`` state carries FOUR fields, in TWO logically-independent
+records. **Both records are keyed by ``thread_id``** (not by ``project``);
+see the "Instance-level keying" section below for why the previous
+project-keyed shape silently collided independent repositories.
 
-- The **episode record**, keyed by ``(project, thread_id, signature)``:
+- The **episode record**, keyed by ``thread_id``:
+    * ``project`` — retained on the value for log / operator context (the
+      key is the identity).
+    * ``thread_id`` — echoes the key so the invariant
+      ``value.thread_id == outer key`` can be asserted at decode time.
     * ``signature`` — a stable short identifier for the failure kind
       (:class:`GateBootstrapCloseError` at present; the ``error_type`` field
       of the underlying envelope if we grow richer failure taxonomy).
     * ``first_seen_at`` — when this episode began.
     * ``reported_at`` — set ONLY on a successful post; used for dedup so
       "one episode → one report" holds even across restarts.
-- The **rate-limit floor record**, keyed by ``(project,)`` ONLY:
+- The **rate-limit floor record**, keyed by ``thread_id``:
+    * ``project`` — retained on the value for log context.
+    * ``thread_id`` — echoes the key (invariant as above).
     * ``last_attempt_at`` — written **write-ahead**, before any post is
       attempted, regardless of whether that post will succeed or fail. This
       is the entire basis of the 24-hour floor (Einstein msg-2294 objection:
@@ -70,6 +79,25 @@ The two records are stored side-by-side in one file but the code reads and
 writes them separately so a future edit cannot accidentally clear the floor
 by clearing an episode (D-2''' Rule 2 — a rate limiter must never be reset by
 the condition it is rate-limiting).
+
+Instance-level keying (PR-gate on PR #277 blocking `correctness` / T-new-project-
+gate-bootstrap msg-3159, msg-3749, msg-3750). The prior schema keyed both
+records by ``project`` alone. PR #277 fixed the alert *identity* — the
+chatroom thread_id is now composed from ``(project, repo_dir)`` so two
+distinct repos sharing one ``project`` (production ``config/sweep.json``
+maps ``spirrow-magickit`` onto three different ``repo_dir``s, Bohr
+msg-2779 §5) do not overwrite each other's threads. The rate-limiter,
+however, was left keyed by ``project``: a successful ``on_close_success``
+in one of those repos silently deleted the shared ``project`` cooldown
+entry that a still-failing sibling repo was relying on, causing the
+failing repo to bypass the 24-hour floor on its very next tick. The
+fix is to make **both** records agree with the identity used for the
+alert thread itself — keyed by ``thread_id``. Consequence: for
+"one project ↔ one repo" installs the observable behaviour is
+unchanged; for the multi-repo case each repo's cooldown is now
+independent. The invariant test
+``test_visibility_state_isolates_repos_under_same_project`` pins the
+new behaviour precisely against the PR-gate reproduction scenario.
 
 Evaluation order, in this order and no other, so the 24h upper bound holds
 even if the dedup key drifts:
@@ -282,31 +310,61 @@ def visibility_state_path() -> Path:
     the D-2 fail-closed invariant depends on the state actually being
     persisted, and a caller who split the paths could produce a
     silently-broken installation.
+
+    **Schema-version suffix (``_v2``).** The file name carries the state
+    schema version explicitly so a schema change (the ``project`` →
+    ``thread_id`` rekey performed under T-new-project-gate-bootstrap
+    msg-3750) can be released without a runtime migration: the v2 store
+    starts empty on any install that has only a v1 file. Bohr msg-3750 §3
+    M1: state at this layer is transient (cooldown records live at most 24
+    hours), so writing a runtime migration for it would be OverScope. The
+    orphaned v1 file is deliberately left on disk for a human to inspect
+    (the same fail-closed discipline the load path applies to a corrupt
+    v2 file — a partial migration would risk painting over a real record
+    with an empty one).
+
+    Two consequences follow from choosing the orphan-and-forget path and
+    the operator must know both:
+
+    * For one tick after the release lands, a repo that was actively
+      failing to close (whose v1 cooldown blocked further alerts) posts
+      exactly one report because its v2 cooldown is empty. That is
+      strictly fewer alerts than the pre-#277 project-shared cooldown
+      would have blocked on the sibling repo's success, so no new spam
+      vector is created — a single-tick fail-open, bounded.
+    * The v1 file is not garbage-collected by this module. If it is
+      still on disk months later, that is the schema version that was
+      running before this release; leave it or delete it manually.
     """
     env_data_dir = os.environ.get("MINDWIRE_PATHS__DATA_DIR")
     data_dir = Path(env_data_dir).expanduser() if env_data_dir else DEFAULT_DATA_DIR
-    return data_dir / "state" / "gate_bootstrap_failure.json"
+    return data_dir / "state" / "gate_bootstrap_failure_v2.json"
 
 
 @dataclass(frozen=True)
 class FailureEpisode:
-    """One episode of "close_alert failed for this project" — dedup record.
+    """One episode of "close_alert failed for this alert thread" — dedup record.
 
-    Keyed by ``(project, thread_id, signature)`` per D-2''' Rule 3. The
-    ``thread_id`` component matters when a human manually resolves and later
-    re-opens an alert thread (with the same fixed id): the state must not
-    permanently suppress the fresh episode's report. Because the current
-    ``thread_id`` scheme is deterministic (``T-gate-bootstrap-<project>``)
-    the thread_id contribution is a no-op in normal running, but including
-    it costs nothing and future-proofs against non-deterministic ids.
+    Keyed by ``thread_id`` in the containing ``_State.episodes`` map
+    (T-new-project-gate-bootstrap msg-3750 §2 Option A). ``thread_id`` is
+    itself derived from ``(project, repo_dir)`` at :func:`thread_id_for`
+    (in :mod:`spirrow_mindwire.gate_bootstrap`), so making it the sole
+    dedup identity is the same choice as at the alert thread layer — one
+    identity, one Instance, one state slot.
+
+    The ``project`` field is kept on the value for operator-log context
+    only; it is NOT part of the identity, and two entries with the same
+    ``project`` but different ``thread_id``s live independently. The
+    ``thread_id`` field on the value must equal the outer map's key
+    (invariant asserted at :func:`_decode_episodes`).
 
     ``signature`` is intentionally kept short and structural (the exception
     class name, or the envelope's ``error_type`` if we surface it). The
     naysayer flagged its stability as unverified (msg-2295); the design's
-    answer is that the **floor** is signature-INDEPENDENT (project-only key)
-    so a drifting signature cannot break the 24h upper bound. This dedup
-    record is the finer-grained inner layer, and its worst failure mode is
-    "one extra report per unique signature per 24h" — bounded by the floor.
+    answer is that the **floor** is signature-INDEPENDENT so a drifting
+    signature cannot break the 24h upper bound. This dedup record is the
+    finer-grained inner layer, and its worst failure mode is "one extra
+    report per unique signature per 24h" — bounded by the floor.
     """
 
     project: str
@@ -318,7 +376,7 @@ class FailureEpisode:
 
 @dataclass(frozen=True)
 class RateLimitFloor:
-    """The rate-limit floor — project-only key, signature-independent.
+    """The rate-limit floor — keyed by ``thread_id``, signature-independent.
 
     Split from :class:`FailureEpisode` in D-2''' Rule 2. The two records
     share a file but are otherwise independent: an episode clear does NOT
@@ -326,12 +384,22 @@ class RateLimitFloor:
     can be present with no episode (an old failure whose thread has been
     closed manually — the floor still holds until 24h have elapsed).
 
-    ``last_attempt_at`` is the only field; it is written **write-ahead**
-    (before any post is attempted) so a mid-tick crash does not lose the
-    attempt evidence and open the door to a next-tick retry.
+    **Instance-level keying** (T-new-project-gate-bootstrap msg-3750 §2):
+    the containing ``_State.floors`` map is keyed by ``thread_id``, and
+    the ``thread_id`` field on the value echoes that key so the invariant
+    ``value.thread_id == outer key`` can be asserted at decode time. The
+    ``project`` field is retained for operator-log context only; two
+    floors that share a ``project`` but differ in ``thread_id`` are
+    independent cooldowns. This is the direct fix for the PR-gate on
+    PR #277 blocking `correctness` finding.
+
+    ``last_attempt_at`` is written **write-ahead** (before any post is
+    attempted) so a mid-tick crash does not lose the attempt evidence
+    and open the door to a next-tick retry.
     """
 
     project: str
+    thread_id: str
     last_attempt_at: str  # ISO-8601 UTC
 
 
@@ -384,8 +452,13 @@ class _State:
     files that can drift.
     """
 
-    episodes: dict[str, FailureEpisode] = field(default_factory=dict)  # keyed by project
-    floors: dict[str, RateLimitFloor] = field(default_factory=dict)  # keyed by project
+    # Both maps are keyed by ``thread_id`` (T-new-project-gate-bootstrap
+    # msg-3750 §2 Option A). Do NOT re-key by ``project`` — a shared
+    # ``project`` key across two ``repo_dir``s of the same project is the
+    # exact defect the PR-gate on PR #277 found: one repo's
+    # ``on_close_success`` would delete a still-failing sibling's floor.
+    episodes: dict[str, FailureEpisode] = field(default_factory=dict)  # keyed by thread_id
+    floors: dict[str, RateLimitFloor] = field(default_factory=dict)  # keyed by thread_id
 
 
 class FailureStateStore(Protocol):
@@ -473,7 +546,7 @@ class FileFailureStateStore:
             # empty state (see class docstring). Raising JSONDecodeError
             # lines up with what ``on_close_failure`` already catches.
             raise json.JSONDecodeError(
-                "gate_bootstrap_failure.json top level is not a JSON object",
+                "gate_bootstrap_failure_v2.json top level is not a JSON object",
                 raw,
                 0,
             )
@@ -563,25 +636,31 @@ def _decode_state(data: Mapping[str, Any]) -> _State:
 def _decode_episodes(raw: Any) -> dict[str, FailureEpisode]:
     """Decode the ``episodes`` section — raise on ANY schema drift.
 
+    Keys are ``thread_id`` (schema v2 — T-new-project-gate-bootstrap
+    msg-3750 §2). The ``thread_id`` field on the entry must equal the
+    outer key: :class:`StateFileMalformedError` is raised otherwise so a
+    silently-mangled file cannot make the identity drift undetected.
     See :func:`_decode_state` for the "why not silently drop" rationale.
     """
     if not isinstance(raw, Mapping):
         raise StateFileMalformedError(f"'episodes' is not a JSON object (got {type(raw).__name__})")
     episodes: dict[str, FailureEpisode] = {}
-    for project, entry in raw.items():
-        if not isinstance(project, str):
+    for key, entry in raw.items():
+        if not isinstance(key, str):
             raise StateFileMalformedError(
-                f"episode key {project!r} is not a string (got {type(project).__name__})"
+                f"episode key {key!r} is not a string (got {type(key).__name__})"
             )
         if not isinstance(entry, Mapping):
             raise StateFileMalformedError(
-                f"episode entry for project {project!r} is not a JSON object "
+                f"episode entry for thread_id {key!r} is not a JSON object "
                 f"(got {type(entry).__name__})"
             )
         try:
-            episodes[project] = FailureEpisode(
-                project=project,
-                thread_id=str(entry["thread_id"]),
+            thread_id_value = str(entry["thread_id"])
+            project_value = str(entry["project"])
+            episode = FailureEpisode(
+                project=project_value,
+                thread_id=thread_id_value,
                 signature=str(entry["signature"]),
                 first_seen_at=str(entry["first_seen_at"]),
                 reported_at=(
@@ -590,40 +669,57 @@ def _decode_episodes(raw: Any) -> dict[str, FailureEpisode]:
             )
         except (KeyError, TypeError) as exc:
             raise StateFileMalformedError(
-                f"episode entry for project {project!r} is malformed ({type(exc).__name__}: {exc})"
+                f"episode entry for thread_id {key!r} is malformed ({type(exc).__name__}: {exc})"
             ) from exc
+        if thread_id_value != key:
+            # The map key IS the identity. Silently ignoring a mismatch
+            # would let a mangled file rebind an entry under a foreign
+            # identity, which is exactly the class of silent-drift the
+            # PR-gate on PR #277 caught for the runtime path.
+            raise StateFileMalformedError(
+                f"episode entry key {key!r} does not match value.thread_id {thread_id_value!r}"
+            )
+        episodes[key] = episode
     return episodes
 
 
 def _decode_floors(raw: Any) -> dict[str, RateLimitFloor]:
     """Decode the ``floors`` section — raise on ANY schema drift.
 
-    Symmetric to :func:`_decode_episodes`. Separate function per
-    section keeps the error messages precise about which top-level key
-    the drift is under.
+    Symmetric to :func:`_decode_episodes`. Keys are ``thread_id``; the
+    ``thread_id`` field on the entry must equal the outer key. Separate
+    function per section keeps the error messages precise about which
+    top-level key the drift is under.
     """
     if not isinstance(raw, Mapping):
         raise StateFileMalformedError(f"'floors' is not a JSON object (got {type(raw).__name__})")
     floors: dict[str, RateLimitFloor] = {}
-    for project, entry in raw.items():
-        if not isinstance(project, str):
+    for key, entry in raw.items():
+        if not isinstance(key, str):
             raise StateFileMalformedError(
-                f"floor key {project!r} is not a string (got {type(project).__name__})"
+                f"floor key {key!r} is not a string (got {type(key).__name__})"
             )
         if not isinstance(entry, Mapping):
             raise StateFileMalformedError(
-                f"floor entry for project {project!r} is not a JSON object "
+                f"floor entry for thread_id {key!r} is not a JSON object "
                 f"(got {type(entry).__name__})"
             )
         try:
-            floors[project] = RateLimitFloor(
-                project=project,
+            thread_id_value = str(entry["thread_id"])
+            floor = RateLimitFloor(
+                project=str(entry["project"]),
+                thread_id=thread_id_value,
                 last_attempt_at=str(entry["last_attempt_at"]),
             )
         except (KeyError, TypeError) as exc:
             raise StateFileMalformedError(
-                f"floor entry for project {project!r} is malformed ({type(exc).__name__}: {exc})"
+                f"floor entry for thread_id {key!r} is malformed ({type(exc).__name__}: {exc})"
             ) from exc
+        if thread_id_value != key:
+            raise StateFileMalformedError(
+                f"floor entry key {key!r} does not match value.thread_id {thread_id_value!r}"
+            )
+        floors[key] = floor
     return floors
 
 
@@ -631,17 +727,22 @@ def _encode_state(state: _State) -> str:
     return json.dumps(
         {
             "episodes": {
-                project: {
+                tid: {
+                    "project": ep.project,
                     "thread_id": ep.thread_id,
                     "signature": ep.signature,
                     "first_seen_at": ep.first_seen_at,
                     "reported_at": ep.reported_at,
                 }
-                for project, ep in state.episodes.items()
+                for tid, ep in state.episodes.items()
             },
             "floors": {
-                project: {"last_attempt_at": floor.last_attempt_at}
-                for project, floor in state.floors.items()
+                tid: {
+                    "project": floor.project,
+                    "thread_id": floor.thread_id,
+                    "last_attempt_at": floor.last_attempt_at,
+                }
+                for tid, floor in state.floors.items()
             },
         },
         indent=2,
@@ -689,6 +790,15 @@ class CloseFailureVisibility:
         overwrite it. Compared to raising, that is the strictly less-bad
         failure mode.
 
+        **Instance-level clear** (T-new-project-gate-bootstrap msg-3750
+        §2). The episode is looked up by ``thread_id``, not by
+        ``project``. Under the shared-project multi-repo case
+        (``spirrow-magickit`` x three ``repo_dir``s), a success on one
+        repo's alert MUST NOT delete a sibling repo's episode entry.
+        The ``project`` argument is kept for symmetry with
+        :meth:`on_close_failure` (both callers already pass it) but not
+        used as a lookup key here — the identity IS the ``thread_id``.
+
         Catches every state-read failure via :data:`_STATE_READ_ERRORS`
         (includes ``UnicodeDecodeError`` since PR #209 gate round-4 —
         invalid UTF-8 bytes on disk must not crash the tick from what is
@@ -697,12 +807,18 @@ class CloseFailureVisibility:
         state we cannot reason about, and the safe response is to do
         nothing, not to overwrite it.
         """
+        # ``project`` is intentionally not used here — see the docstring's
+        # "Instance-level clear" paragraph. It stays on the signature for
+        # legibility at the call site (the sweeper's tick code names both
+        # project and thread_id when it dispatches to the visibility hook)
+        # and so the two hook methods share the same shape.
+        del project
         try:
             state = self._store.load()
-            episode = state.episodes.get(project)
-            if episode is None or episode.thread_id != thread_id:
+            episode = state.episodes.get(thread_id)
+            if episode is None:
                 return
-            del state.episodes[project]
+            del state.episodes[thread_id]
             self._store.save(state)
         except _STATE_READ_ERRORS:
             return
@@ -767,9 +883,11 @@ class CloseFailureVisibility:
                 ),
             )
 
-        # 1. Floor (project-only key, signature-independent). See module
-        #    docstring for why this is checked FIRST.
-        floor_entry = state.floors.get(project)
+        # 1. Floor (keyed by ``thread_id``, signature-independent — see
+        #    module docstring "Instance-level keying" for why this key
+        #    changed from ``project`` in msg-3750). Checked FIRST so a
+        #    drifting signature cannot open a backdoor around the limit.
+        floor_entry = state.floors.get(thread_id)
         if floor_entry is not None:
             last_attempt = _parse_iso(floor_entry.last_attempt_at)
             if last_attempt is not None and now - last_attempt < self._floor:
@@ -779,15 +897,15 @@ class CloseFailureVisibility:
                         f"rate-limit floor active: last attempt at {floor_entry.last_attempt_at}, "
                         f"floor {self._floor}"
                     ),
-                    episode=state.episodes.get(project),
+                    episode=state.episodes.get(thread_id),
                 )
 
-        # 2. Dedup (episode key). If a matching episode has already reported,
-        #    do not report again.
-        existing = state.episodes.get(project)
+        # 2. Dedup (keyed by ``thread_id``). If an episode for this
+        #    thread has already reported the same signature, do not
+        #    report again.
+        existing = state.episodes.get(thread_id)
         if (
             existing is not None
-            and existing.thread_id == thread_id
             and existing.signature == signature
             and existing.reported_at is not None
         ):
@@ -805,8 +923,10 @@ class CloseFailureVisibility:
         #    actually enforceable — writing the floor only on post-success
         #    would let a persistently failing post loop 288 times per 24h
         #    (Einstein msg-2294 objection).
-        state.floors[project] = RateLimitFloor(project=project, last_attempt_at=now_iso)
-        if existing is None or existing.thread_id != thread_id or existing.signature != signature:
+        state.floors[thread_id] = RateLimitFloor(
+            project=project, thread_id=thread_id, last_attempt_at=now_iso
+        )
+        if existing is None or existing.signature != signature:
             # New episode — write it now (without reported_at).
             episode = FailureEpisode(
                 project=project,
@@ -815,7 +935,7 @@ class CloseFailureVisibility:
                 first_seen_at=now_iso,
                 reported_at=None,
             )
-            state.episodes[project] = episode
+            state.episodes[thread_id] = episode
         else:
             episode = existing
         try:
@@ -889,8 +1009,8 @@ class CloseFailureVisibility:
             # :meth:`on_close_success`.
             try:
                 cleared_state = self._store.load()
-                if cleared_state.episodes.get(project) is not None:
-                    del cleared_state.episodes[project]
+                if cleared_state.episodes.get(thread_id) is not None:
+                    del cleared_state.episodes[thread_id]
                     self._store.save(cleared_state)
             except _STATE_READ_ERRORS:
                 # This tuple covers the ``save`` above as well as the ``load``:
@@ -996,7 +1116,7 @@ class CloseFailureVisibility:
                 ),
                 episode=reported_episode,
             )
-        state.episodes[project] = reported_episode
+        state.episodes[thread_id] = reported_episode
         # Loss of the reported_at mark on the save side is a benign
         # failure: the floor entry from step 3 already blocks the next
         # 24h of attempts, so no spam results. Worst case: one extra
