@@ -4,8 +4,12 @@
 # Runs `mindwire-loop --mode conductor` with the full environment the role adapters resolve at
 # spawn. Two rules:
 #   1. Secrets are NEVER baked in — the GitHub token must already be in the environment.
-#   2. Non-secret internal infra addresses default to the SpirrowGames Tailscale endpoints and are
-#      overridable per host (they are environment-dependent, mirroring the in-code defaults).
+#   2. Non-secret internal infra addresses (magickit MCP URL, naysayer inference base URL) are
+#      required by the Python runtime and validated there — this wrapper does NOT duplicate that
+#      validation. The single source of truth is the Python client / adapter constructor that
+#      consumes the value (see ADR-2026-06-04-18 v1.1 §2 D-2, ADR-2026-05-21-05 §5); duplicating
+#      the check in PowerShell created a dual-management drift risk (PR #296 pr-gate advisory,
+#      T-public-repo-carries-real-infra-values), so it lives in exactly one place — Python.
 #
 # Register this with Task Scheduler (Windows) / a systemd unit (Linux) for unattended runs. See
 # docs/deploy.md for the full runbook (host choice, secrets, config, service registration).
@@ -21,16 +25,31 @@ $ErrorActionPreference = "Stop"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-# --- inference / gateway endpoints (non-secret internal infra; override per host) ---------------
-# implementer inference: this host's local Claude subscription (NOT routed via Lexora).
+# --- inference / gateway endpoints ---------------------------------------------------------------
+# implementer inference: the local Claude subscription reaches Anthropic directly (NOT via Lexora).
+# The default target is Anthropic's public API URL; only override if you have your own reason
+# (proxy, test double, etc.) — this is not an infra-value leak, so a public default is fine.
+# (Not dual-management with an SDK auto-default: ``ImplementerSdkAdapter.spawn`` refuses to spawn
+# without a set env var, so this line is what satisfies that requirement, not a redundant mirror.)
 if (-not $env:MINDWIRE_IMPLEMENTER_BASE_URL) { $env:MINDWIRE_IMPLEMENTER_BASE_URL = "https://api.anthropic.com" }
-# design-time naysayer: Lexora 'naysayer' tier -> Gemini (the SDK reaches it at :8110). Independence
-# (ADR-05 §5) holds because the tier is a different model family; same tier the PR-gate uses.
-if (-not $env:MINDWIRE_NAYSAYER_BASE_URL)    { $env:MINDWIRE_NAYSAYER_BASE_URL = "http://100.79.84.62:8110" }
-# Tier B PR-gate driver: Lexora gateway.
-if (-not $env:MINDWIRE_LEXORA_URL)           { $env:MINDWIRE_LEXORA_URL = "http://100.79.84.62:8110" }
-# magickit chatroom MCP defaults to http://100.79.84.62:8117/mcp in-code; override only if relocated:
-# if (-not $env:MINDWIRE_MAGICKIT_MCP_URL)    { $env:MINDWIRE_MAGICKIT_MCP_URL = "http://100.79.84.62:8117/mcp" }
+#
+# INTERNAL INFRA endpoints — the operator resolves values from [[platform:infra-registry]] and
+# sets them as persistent user env vars (sourced from Vaultwarden, mirroring the token below).
+# Validation lives in Python — the wrapper does NOT pre-flight (single source of truth,
+# PR #296 pr-gate advisory msg-3484 / msg-3516 / PR #300 pr-gate advisory msg-3591 /
+# T-public-repo-carries-real-infra-values):
+#
+#   Variable                       | Python owner
+#   -------------------------------|-------------
+#   MINDWIRE_MAGICKIT_MCP_URL      | spirrow_mindwire.magickit.client (magickit_mcp_url)
+#   MINDWIRE_NAYSAYER_BASE_URL     | spirrow_mindwire.adapters.naysayer_sdk (NaysayerSdkAdapter)
+#   MINDWIRE_LEXORA_URL            | spirrow_mindwire.lexora.client (lexora_url)
+#
+# The Python owner listed above is the ONE place that raises on a missing / empty value, records
+# whether the variable is required or optional, when it is checked (startup vs. first use vs. lazy
+# default), the ADR rationale, and the process-exit story (per --mode where it diverges). See
+# that module for the fail-loud contract and why there is no in-code fallback. Do not paraphrase
+# those facts here — that is the dual-management drift the advisory called out.
 
 # --- secret precondition (fail loud, never hardcode) -------------------------------------------
 if (-not $env:MINDWIRE_NAYSAYER_GITHUB_TOKEN) {

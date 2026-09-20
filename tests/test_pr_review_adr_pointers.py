@@ -165,7 +165,19 @@ class _FakeGitHub:
         return {"id": 1, "state": event.value}
 
     async def probe_identity(self) -> int:
+        # ADR-pointer tests never exercise the terminal-classification funnel; return
+        # 200 so any accidental call still yields a well-defined value. Kept
+        # structurally compatible with GitHubReviewClient (T-gate-review-submit-
+        # failure-handling PR-A: new Protocol member).
         return 200
+
+    async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None:
+        # ADR-pointer tests never exercise the T-gate-blocks-on-miscounted-line-numbers
+        # verify_citations pass (the model output in these fixtures has no blocking
+        # objection block, so verify_citations short-circuits). Kept structurally
+        # compatible with GitHubReviewClient so the driver still ticks its
+        # citation-verification lookup without side effects here.
+        return None
 
     async def aclose(self) -> None:
         return None

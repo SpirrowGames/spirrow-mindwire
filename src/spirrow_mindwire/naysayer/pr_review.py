@@ -47,7 +47,7 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -212,15 +212,6 @@ def _insert_verdict_footer_before_marker(body: str, *, head_sha: str, event: Rev
     head = body[: match.start()].rstrip()
     tail = body[match.start() :].lstrip("\n")
     return f"{head}\n\n{footer}\n\n{tail}"
-
-
-def _submit_decision(scope: Scope) -> str:
-    """One-word label for the structured submit-failure log line's ``decision`` field."""
-    if scope in (Scope.ENVIRONMENT_CREDENTIAL, Scope.ENVIRONMENT_PERMISSION):
-        return "environment-terminal-raise"
-    if scope is Scope.TARGET:
-        return "target-terminal-raise"
-    return "unknown-raise"
 
 
 def _body_without_footer(body: str) -> str:
@@ -1240,6 +1231,28 @@ class VerdictDecision:
     # short-circuit paths that construct no block at all.
     objections: ObjectionReport = ObjectionReport(status=ObjectionParse.MISSING)
     derived_verdict: ReviewEvent = ReviewEvent.REQUEST_CHANGES
+    # T-gate-blocks-on-miscounted-line-numbers (Bohr msg-3606 D-3 revise). When the driver's
+    # citation-verification pass demotes a blocking objection to advisory (its ``where``
+    # citation points at a blank line at head), the ORIGINAL objection is recorded here so
+    # the C-DEMOTED note in ``render_gate_notice`` can name what was demoted and why. The
+    # demotion itself is expressed on ``objections`` (the demoted entry has ``blocks=False``);
+    # this field carries the parallel evidence trail — same objection, unmodified — so the
+    # notice does not have to reconstruct "which advisory entries used to block" from
+    # ``objections`` alone. Empty tuple on the normal path.
+    demoted_objections: tuple[Objection, ...] = ()
+    # When the driver overrides ``gate_verdict`` because every blocking objection was demoted
+    # (Bohr msg-3606 D-3 revise: RC → COMMENT so the loop escalates to human instead of
+    # spending another Gemini round on a miscount). The override predicate is exactly the
+    # conjunction stated in that message — model wrote RC, no blocking objections remain
+    # after demotion, and none of the truncation safety valves fired (msg-1871). ``False``
+    # on the normal path.
+    gate_verdict_overridden: bool = False
+    # The head SHA the driver's citation-verification pass read blob content at, or ``None``
+    # when the pass did not run (test-only ``decide_verdict`` calls, or a run without CI
+    # head_sha). Preserved on the decision object so the C-DEMOTED note can name the exact
+    # commit whose bytes it inspected — a reader who wants to reproduce the demotion runs
+    # ``git show <sha>:<path>`` against this value.
+    verified_head_sha: str | None = None
 
     @property
     def diverged(self) -> bool:
@@ -1309,7 +1322,157 @@ _MARKER_A_HEADROOM = "<!-- mindwire:note A-headroom -->"
 _MARKER_B_DIFF = "<!-- mindwire:note B-diff -->"
 _MARKER_B_LEN = "<!-- mindwire:note B-len -->"
 _MARKER_C_SUPPRESSED = "<!-- mindwire:note C-suppressed -->"
+_MARKER_C_DEMOTED = "<!-- mindwire:note C-demoted -->"
 _MARKER_D_DIVERGENCE = "<!-- mindwire:note D-divergence -->"
+
+
+# ─── verify_citations: single-line where + empty-line predicate ─────────────────────
+#
+# T-gate-blocks-on-miscounted-line-numbers (Bohr msg-3604 D-2 revise, Einstein msg-3607).
+# The gate has an observed miscount pattern: a blocking objection's ``where`` cites
+# ``path:line`` where ``line`` is a paragraph-boundary blank at head, so the model's stated
+# premise ("Q-A is on line 287") is directly falsifiable and false. Left unhandled the
+# false-blocker consumes ``max_review_rounds`` on the same miscount over and over
+# (measured on ``spirrow-playproof#79``: 3 rounds spent, same 8/13 miscount rate across
+# the operator's 13-citation corpus in msg-3603).
+#
+# The v1 predicate is DELIBERATELY NARROW (§2 non-scope in msg-3604, tightened by
+# msg-3608 after Einstein's msg-3607 range objection): a blocking objection is demoted to
+# advisory iff (1) its ``where`` parses **exactly** as ``path:N`` (single integer, no
+# ranges/lists), (2) the head-side ``contents`` API reads the file (2xx or 404-→-None),
+# and (3) line ``N`` exists and is composed entirely of whitespace, OR ``N`` is past EOF.
+# All three failing → NO demotion. Ranges (``:N-M``) and lists (``:N,M``) are OUT for v1
+# because the endpoints-only shape false-demotes model padding, and the all-empty shape
+# defers to v2 telemetry (AC-8 ③ triggers v2).
+#
+# Path characters (PR #307 gate correction). The path segment permits any character other
+# than ``:`` (the line-number separator) and newlines — spaces are common in real
+# repositories (``Docs/My Spec.md``) and forbidding them made every objection whose
+# citation contained a space stay falsely blocking. ``:`` is still forbidden because a
+# citation like ``owner:path:line`` would parse ambiguously; the corpus does not carry
+# that shape and fetch_file_at fail-loud handles a nonsense path if one appears.
+_WHERE_SINGLE_LINE_RE = re.compile(r"^(?P<path>[^:\n]+):(?P<line>\d+)$")
+_EMPTY_LINE_RE = re.compile(r"^\s*$")
+
+
+def _parse_single_line_where(where: str) -> tuple[str, int] | None:
+    """Return ``(path, line)`` iff ``where`` is exactly ``path:N`` for a positive integer N.
+
+    Deliberately strict: whitespace on either side of ``where`` is tolerated (models often
+    emit a trailing newline), but any INTERNAL structure that is not the ``path:N`` form —
+    a range ``:N-M``, a comma-separated list ``:N,M``, a "path only" citation without
+    ``:line``, a non-numeric suffix like ``:head`` or ``:abc``, a URL — returns ``None``
+    (caller keeps the objection blocking, unchanged). ``msg-3608 §D-2 (1) v1 final form``.
+
+    The path portion forbids ``:`` and newlines but permits any other character —
+    including spaces, since real repositories carry paths like ``Docs/My Spec.md`` (PR #307
+    gate correction). ``:`` remains forbidden because ``owner/repo:path:line`` would parse
+    ambiguously; a citation with an ``owner:`` fragment is a form the corpus has never
+    carried, and ``fetch_file_at`` will fail-loud on a nonsense path if one appears.
+    """
+    stripped = where.strip()
+    m = _WHERE_SINGLE_LINE_RE.match(stripped)
+    if m is None:
+        return None
+    line_no = int(m.group("line"))
+    if line_no < 1:
+        return None
+    return m.group("path"), line_no
+
+
+def _line_is_empty(content: str, line_no: int) -> bool:
+    """True iff line ``line_no`` of ``content`` (1-indexed) exists and is all whitespace.
+
+    Also true when ``line_no`` is past the file's last content line — an out-of-bounds
+    citation is fail-open on the DEMOTION direction (msg-3604 D-2 (3), "or N exceeds EOF"):
+    the citation is definitionally pointing at nothing, which is the exact ``pointing at
+    empty`` premise the demotion predicate targets.
+
+    Line-splitting matches ``str.splitlines()``: LF, CR, or CRLF each end one line, and a
+    trailing newline does not create a phantom empty line at EOF (so a file whose last
+    substantive line is ``:N`` returns ``False`` at ``line_no=N``, ``True`` at
+    ``line_no=N+1``). This matches what GitHub's own ``contents?ref=`` response yields —
+    the raw file bytes as committed — so a reader who fetches the same URL sees the same
+    line count.
+    """
+    lines = content.splitlines()
+    if line_no > len(lines):
+        return True
+    return _EMPTY_LINE_RE.match(lines[line_no - 1]) is not None
+
+
+async def verify_citations(
+    report: ObjectionReport,
+    *,
+    github: GitHubReviewClient,
+    pr: PrRef,
+    head_sha: str,
+) -> tuple[ObjectionReport, tuple[Objection, ...]]:
+    """Read the head tree for each single-line ``path:N`` citation; demote blocking→advisory
+    iff line N is blank.
+
+    Returns ``(report', demoted)`` where ``report'`` carries the same objections in the same
+    order, with any that met the v1 demotion predicate replaced by their ``blocks=False``
+    variant; ``demoted`` is the tuple of ORIGINAL (still-blocking) objections that were
+    demoted, in encounter order, so the C-DEMOTED gate notice can name what was demoted
+    without hunting through ``objections`` for the "used to block" set.
+
+    **Read discipline (msg-3604 D-6, D-7).** Each ``(path, head_sha)`` is fetched at most
+    once per review — memoised in a local dict so a blocking objection citing the same
+    file twice does not double-bill the GitHub API. Any HTTP failure from
+    :meth:`fetch_file_at` other than 404 propagates as :class:`GitHubHTTPError`; the driver
+    does not swallow it. A read outage is fail-LOUD, not fail-open on the demotion
+    direction: "we could not read the file" is a different fact from "we read the file
+    and it says the line is non-empty", and collapsing them would hide the exact
+    verification outage the gate notice is supposed to make audible. 404 returns
+    ``None`` (a positive machine answer: the path does not exist at ``head_sha``),
+    which keeps the objection blocking — the missing-path case is not falsifiable by
+    this predicate.
+
+    **What is NOT touched** (msg-3608 §D-2 revise, Einstein msg-3607 dispose): non-single-
+    line ``where`` forms — ranges ``:N-M``, comma lists ``:N,M``, path-only citations,
+    ``:head`` / ``:abc`` non-numeric suffixes, URLs — are left as-is (blocking stays
+    blocking). Advisory objections are also untouched. A blocking objection whose
+    ``where`` fails the single-line parse costs zero reads: the parse fails before
+    :meth:`fetch_file_at` is called.
+    """
+    if not head_sha:
+        # No head sha to read against → cannot verify. The driver only calls this when
+        # ``ci.head_sha`` is known, but a defensive check keeps the helper callable in
+        # tests without threading a real CI status through.
+        return report, ()
+    cache: dict[tuple[str, str], str | None] = {}
+    demoted: list[Objection] = []
+    new_objs: list[Objection] = []
+    for o in report.objections:
+        if not o.blocks:
+            new_objs.append(o)
+            continue
+        parsed = _parse_single_line_where(o.where)
+        if parsed is None:
+            # Non-single-line where. Untouched (msg-3608 AC-3).
+            new_objs.append(o)
+            continue
+        path, line_no = parsed
+        cache_key = (path, head_sha)
+        if cache_key not in cache:
+            # Fail-loud: any non-404 HTTP error propagates and the whole review fails
+            # (msg-3604 D-7, AC-5). 404 → ``None`` (path missing at head).
+            cache[cache_key] = await github.fetch_file_at(pr, path=path, ref=head_sha)
+        content = cache[cache_key]
+        if content is None:
+            # 404: cannot verify, keep blocking (msg-3604 D-2 (2) fail-closed, AC-4).
+            new_objs.append(o)
+            continue
+        if _line_is_empty(content, line_no):
+            demoted.append(o)
+            new_objs.append(replace(o, blocks=False))
+        else:
+            # Line has content — the citation may still be wrong ("pointing at the WRONG
+            # non-empty line") but that is out of scope for v1; the objection stays
+            # blocking (msg-3604 D-2 (3) fail-closed, msg-3608 AC).
+            new_objs.append(o)
+    return replace(report, objections=tuple(new_objs)), tuple(demoted)
 
 
 def _model_verdict_label(mv: ModelVerdict) -> str:
@@ -1338,8 +1501,16 @@ def render_gate_notice(decision: VerdictDecision) -> str:
     fire_b_diff = view.truncated
     fire_b_len = decision.finish_reason == "length"
     fire_c = decision.suppressed
+    # C-DEMOTED (T-gate-blocks-on-miscounted-line-numbers, msg-3604 D-4 / msg-3606 D-3
+    # revise). Fires whenever ``verify_citations`` demoted at least one blocking objection,
+    # regardless of whether the demotion also triggered a gate_verdict override. The
+    # demotion itself is the fact the notice makes audible; the override rider is an
+    # extra clause inside the note. msg-1871's discipline reapplies verbatim: whenever
+    # the gate rewrites what the model wrote (blocking → advisory here, APPROVE → RC
+    # there), the notice must say so.
+    fire_c_demoted = bool(decision.demoted_objections)
     fire_d = decision.diverged
-    if not (fire_a or fire_b_diff or fire_b_len or fire_c or fire_d):
+    if not (fire_a or fire_b_diff or fire_b_len or fire_c or fire_c_demoted or fire_d):
         return ""
 
     lines: list[str] = [_GATE_NOTICE_SENTINEL]
@@ -1400,6 +1571,37 @@ def render_gate_notice(decision: VerdictDecision) -> str:
             "(see the note(s) above); a review of a partial diff / partial output "
             "cannot open the gate."
         )
+    if fire_c_demoted:
+        # T-gate-blocks-on-miscounted-line-numbers (msg-3604 D-4 / msg-3606 D-3 revise).
+        # The gate rewrote what the model wrote (a blocking objection became advisory
+        # because its cited line is blank at head); msg-1871's rule is that whenever the
+        # gate overrides the model, the notice names what and why. The note carries the
+        # ORIGINAL objection's ``where`` and the head sha the file was read at, so a
+        # reader can re-run the operator's own ``awk`` / ``sed`` verification against the
+        # same bytes and confirm the demotion for themselves — this citation is the
+        # audit trail msg-3602 §2 wanted from the gate.
+        head_sha_read = decision.verified_head_sha
+        head_short = head_sha_read[:12] if head_sha_read else "?"
+        demoted = decision.demoted_objections
+        wheres = ", ".join(f"`{o.where}`" for o in demoted)
+        lines.append(">")
+        lines.append(f"> {_MARKER_C_DEMOTED}")
+        lines.append(
+            f"> **Objection demoted by the gate — citation points at an empty line "
+            f"at head `{head_short}`.** {len(demoted)} blocking objection"
+            f"{'s' if len(demoted) != 1 else ''} demoted to advisory because the cited "
+            f"line(s) — {wheres} — are composed entirely of whitespace in the reviewed "
+            f"tree. The objection text is preserved in the advisory bucket below; "
+            f"only its blocking classification was withdrawn."
+        )
+        if decision.gate_verdict_overridden:
+            lines.append(
+                "> Because every blocking objection was demoted and the model wrote "
+                "`VERDICT: REQUEST_CHANGES` on this run, the gate verdict was rewritten "
+                "from `REQUEST_CHANGES` to `COMMENT` — the same escalation path the "
+                "round-cap uses, so a human decides whether the miscount premise stands "
+                "instead of the loop spending another Gemini round on it."
+            )
     if fire_d:
         # Rider 1 (msg-2031) put in a channel that has readers. ``spec/process/README.md``
         # (fail-open 宣言先, 旧 §N.3) says a degradation announced only to a log is an
@@ -1487,6 +1689,21 @@ def prepend_gate_notice(body: str, decision: VerdictDecision) -> str:
     if not notice:
         return body
     return f"{notice}\n\n{body}"
+
+
+# Programmatic self-identifier stamped at the very top of every review body posted by
+# ``scripts/naysayer_review_scoped.py`` (F-1: T-scoped-driver-verdict-never-reaches-chatroom
+# msg-3379). Detectors and orphan-review anomaly alarms MUST use
+# ``body.startswith(SCOPED_REVIEW_BODY_MARKER)`` on this exact string to distinguish
+# scoped-driver reviews from gate-path reviews without relying on LLM-output body-text
+# heuristics ("the scope" / "adjudicated scope" etc. are conversational tokens the gate
+# path can also emit — false-positive risk). HTML-comment shape: rendered as empty by
+# GitHub's markdown renderer (no UI clutter), preserved verbatim in the API's raw ``body``
+# field so a ``startswith`` check is deterministic. Stamped BEFORE ``prepend_gate_notice``
+# in the caller so the marker stays at index 0 even when the gate notice prepends the
+# body under truncation / length-cap paths. Do NOT edit this literal without updating
+# ``docs/gate-validity-and-crossthread-rules.md`` (F-1) in the same commit.
+SCOPED_REVIEW_BODY_MARKER = "<!-- naysayer:scoped-driver -->"
 
 
 def _ci_gate_response(ci: CiStatus, pr_slug: str) -> tuple[ReviewEvent, str]:
@@ -1704,6 +1921,15 @@ def _log_pass2(pr_slug: str, selection: AdrPointerSelection, raw: str) -> None:
         line = unavailable_log_line(selection)
     if line:
         logger.info("%s (%s)", line, pr_slug)
+
+
+def _submit_decision(scope: Scope) -> str:
+    """One-word label for the structured submit-failure log line's ``decision`` field."""
+    if scope in (Scope.ENVIRONMENT_CREDENTIAL, Scope.ENVIRONMENT_PERMISSION):
+        return "environment-terminal-raise"
+    if scope is Scope.TARGET:
+        return "target-terminal-raise"
+    return "unknown-raise"
 
 
 class NaysayerPrReviewDriver:
@@ -1986,6 +2212,48 @@ class NaysayerPrReviewDriver:
         # matrix — see ``_oracle_gate_verdict`` in tests/test_pr_review_driver.py, which
         # re-states the rule as a 3-line reference and asserts equivalence.
         decision = decide_verdict(body, view=view, finish_reason=completion.finish_reason)
+        # T-gate-blocks-on-miscounted-line-numbers (Bohr msg-3604 D-1 / msg-3606 D-3 revise).
+        # Between ``decide_verdict`` (which fixes ``gate_verdict`` from model verdict +
+        # truncation valves) and the notice/log/submit downstream, run one pass that verifies
+        # single-line ``path:N`` citations against the head-side tree — any blocking objection
+        # whose cited line is blank at head is demoted to advisory. If EVERY blocking objection
+        # was demoted AND the truncation valves are quiet AND the model wrote RC, the gate
+        # verdict is rewritten from REQUEST_CHANGES to COMMENT, so the loop escalates to the
+        # human instead of burning another Gemini round on the same falsified premise. msg-1871
+        # safety valve is preserved verbatim: a truncated review keeps its force-RC (no
+        # override), and an APPROVE model verdict short-circuits above so no override is
+        # relevant. The predicate is stated once here, then replayed by tests as the ORACLE
+        # (msg-3606 §D-3 revise) so a refactor cannot silently move it.
+        if ci.head_sha:
+            new_report, demoted = await verify_citations(
+                decision.objections,
+                github=self._github,
+                pr=pr,
+                head_sha=ci.head_sha,
+            )
+            if demoted:
+                gate_verdict_after = decision.gate_verdict
+                override_fired = False
+                safety_valves_quiet = not view.truncated and completion.finish_reason != "length"
+                if (
+                    not new_report.blocking
+                    and decision.model_verdict is ModelVerdict.REQUEST_CHANGES
+                    and decision.gate_verdict is ReviewEvent.REQUEST_CHANGES
+                    and safety_valves_quiet
+                ):
+                    gate_verdict_after = ReviewEvent.COMMENT
+                    override_fired = True
+                decision = replace(
+                    decision,
+                    gate_verdict=gate_verdict_after,
+                    objections=new_report,
+                    derived_verdict=derive_verdict(new_report),
+                    demoted_objections=demoted,
+                    gate_verdict_overridden=override_fired,
+                    verified_head_sha=ci.head_sha,
+                )
+            else:
+                decision = replace(decision, verified_head_sha=ci.head_sha)
         verdict = decision.gate_verdict
         _log_objections(pr.slug, ci.head_sha, decision)
         # Prepend the gate notice BEFORE the ADR-pointer marker is appended: the notice sits
@@ -2345,32 +2613,28 @@ class NaysayerPrReviewDriver:
     async def _classify_and_reraise(self, pr: PrRef, exc: GitHubHTTPError, *, origin: str) -> None:
         """Classify a :class:`GitHubHTTPError`, probe if terminal, then raise the typed variant.
 
-        Central funnel used by both :meth:`_submit_review` (write failures) and
-        :meth:`_maybe_replay_verdict` (strict-read failures) — PR-gate objection 1
-        (msg review of PR #280) caught that the strict-read path was NOT going
-        through classification, so a 401 on ``fetch_pr_reviews_strict`` bubbled
-        out as a plain :class:`GitHubHTTPError` and quarantined the thread. This
-        method is the single site where the classify → probe → typed-raise
-        transition happens.
+        Central funnel used by both the primary submit and the same-identity 422 COMMENT
+        fallback (msg-3218 fix) so an environment-terminal outage during either leg raises
+        :class:`EnvironmentTerminalError` (daemon exits 2, alert-not-quarantine) rather
+        than bubbling out as a plain ``GitHubHTTPError`` and quarantining the thread.
 
-        Semantics (same for both origins):
+        Semantics:
 
-        * ``Retryability.RETRYABLE`` → re-raise the raw ``exc`` (Stage 2 will
-          layer retry on top; for now the caller sees a transient failure).
+        * ``Retryability.RETRYABLE`` → re-raise the raw ``exc`` (a caller that wants
+          retries adds them behind an idempotency guard — retries + ``landed()``
+          ship together in PR-B, msg-3276).
         * ``Retryability.TERMINAL`` + ``Scope.ENVIRONMENT_*`` → raise
           :class:`EnvironmentTerminalError` (daemon exits 2, alert-not-quarantine).
         * ``Retryability.TERMINAL`` + ``Scope.TARGET`` → raise
           :class:`TargetTerminalError` (a proper subclass of ``GitHubHTTPError``
-          that carries positive-evidence "this is thread-scoped" — callers that
-          want to write a suppression marker MUST catch this specifically, not
-          any ``GitHubHTTPError`` that happens to be non-401).
+          that carries positive-evidence "this is thread-scoped").
         * ``Retryability.TERMINAL`` + ``Scope.UNKNOWN`` → re-raise the raw ``exc``
           (fail-safe: DESIGN v3 §3 "未分類は必ず 1", and the ``Scope`` docstring's
           "callers MUST NOT collapse UNKNOWN into either concrete value" —
           keeping the raw type preserves the UNKNOWN-ness at the type level).
 
         ``origin`` is a free-form tag included in the log record so the same
-        failure showing up on the read side vs the write side is distinguishable
+        failure showing up on the primary vs the fallback leg is distinguishable
         in operations, without inventing a second log format.
         """
         classification = classify_http_error(exc)
@@ -2535,8 +2799,11 @@ class NaysayerPrReviewDriver:
             )
         except TargetTerminalError as exc:
             # POSITIVE evidence (via classify + probe in _submit_review) that this
-            # specific PR/head is terminally rejected — a 422/404/403 whose probe
-            # said the credential itself is fine, so the fault belongs to this PR.
+            # specific PR/head is terminally rejected — a 422 whose probe said the
+            # credential itself is fine, so the fault belongs to this PR. 403 and
+            # 404 are NOT in that set even with a live probe: `scope_from_probe`
+            # maps them to ENVIRONMENT_PERMISSION, which raises
+            # EnvironmentTerminalError and never reaches this handler.
             # Record a suppression marker so future ticks do not loop (msg-1984 §2).
             #
             # PR-gate objection 3: the previous "TERMINAL and not 401" test was

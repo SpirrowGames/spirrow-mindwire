@@ -175,6 +175,72 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
+# --- fatal init trap ----------------------------------------------------------------------------
+# T-deploy-required-env-outage-is-silent (msg-3578 / Bohr msg-3586 D-1 v4). BEFORE this trap
+# existed, any uncaught throw during wrapper init (top-level code above the outer `try` at the
+# `--- run ---` section below) was written to Task Scheduler's stderr and NOWHERE else: no line
+# in `conductor-*.log`, no Discord notification, and the only external symptom was
+# `LastTaskResult=0x1` on the Get-ScheduledTaskInfo output. Measured 2026-09-19: two consecutive
+# 5-min ticks (09:10:04-09:25:02 JST) silently failed after PR #296 introduced a required env var
+# whose absence made the wrapper `throw` at line ~1989 (`MINDWIRE_DECISION_DASHBOARD_URL is not
+# set …`). ADR-2026-09-18-22 D-1's intent ("loud fail at init > silent misroute") was correct,
+# but the loud side had no human-facing destination.
+#
+# This trap gives every uncaught init throw ONE guaranteed human-facing surface set:
+#   (1) a line in `conductor-*.log` (direct Add-Content, bypasses the buffered Write-Log —
+#       Confirm-LogWorthKeeping is defined further down and cannot be relied on here),
+#   (2) a Discord POST via the notify webhook, and
+#   (3) `exit 1` so the task scheduler's `LastTaskResult=0x1` contract is preserved.
+#
+# EACH of the three steps is wrapped in its own try/catch. `Add-Content` may fail (disk full,
+# permission), and `Invoke-WebRequest` will fail on DNS/timeout/proxy/TLS — a secondary throw
+# inside a trap would break the handler before step (3) runs (Einstein msg-3583 Obj-1). The
+# `exit 1` is the LAST statement, unconditional, always reached.
+#
+# Self-contained: the trap references only `$logPath` (defined above), `$env:*` (process env),
+# and .NET/PS builtins. It does not call `Write-Log` / `Format-LogLine` / `Send-Notification`
+# (all defined below), and it does not touch state files (`$dataDir\state\*.json`). No dedup or
+# marker file: at a 5-min cadence, a rebooting-daemon-that-cannot-start deserves a ping every
+# 5 min (Einstein msg-3581 Obj-2), not a debounce that could suppress a live outage.
+#
+# Webhook lookup uses `$env:MINDWIRE_NOTIFY_DISCORD_WEBHOOK` (process env, which Windows merges
+# from Machine ∪ User at process start), not `[Environment]::GetEnvironmentVariable(..., 'User')`
+# — the User-scope explicit read would silently skip Discord on hosts that legitimately place
+# the webhook in Machine scope (Einstein msg-3585 Obj-1). Line 1770 (`Send-Notification`) uses
+# the same `$env:` form for the same reason (single access pattern for the same variable).
+trap {
+    # (1) log direct write — bypass the buffered Write-Log so a fatal init has a durable line
+    # in `conductor-*.log` even though $script:logCommitted is false. Failure to write here is
+    # swallowed: throwing inside a trap would prevent step (3) `exit 1` from running.
+    try {
+        $__initTrapLine = "[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ssK") + "] [wrapper] FATAL init: $($_.Exception.Message)"
+        Add-Content -LiteralPath $logPath -Value $__initTrapLine -Encoding utf8
+        Write-Host $__initTrapLine
+    } catch { }
+
+    # (2) Discord POST — same proxy default and same redaction shape as Send-Notification, but
+    # inlined so this handler does not depend on any function defined below. Network failures
+    # (DNS, timeout, proxy refused, TLS) throw from Invoke-WebRequest with -ErrorAction Stop;
+    # the try/catch here holds those failures so step (3) always runs.
+    try {
+        $__initTrapWebhook = $env:MINDWIRE_NOTIFY_DISCORD_WEBHOOK
+        if ($__initTrapWebhook) {
+            $__initTrapProxy = if ($env:MINDWIRE_NOTIFY_PROXY) { $env:MINDWIRE_NOTIFY_PROXY } else { 'http://127.0.0.1:3128' }
+            $__initTrapMsg = "$($_.Exception.Message)".Replace($__initTrapWebhook, '<webhook-redacted>')
+            $__initTrapPayload = @{ content = "MindWire wrapper FATAL init (host $env:COMPUTERNAME): $__initTrapMsg" } | ConvertTo-Json -Compress
+            $null = Invoke-WebRequest -Uri $__initTrapWebhook -Method Post `
+                -ContentType 'application/json; charset=utf-8' `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($__initTrapPayload)) `
+                -Proxy $__initTrapProxy -TimeoutSec 30 -ErrorAction Stop
+        }
+    } catch { }
+
+    # (3) exit 1 — unconditional. Preserves the `LastTaskResult=0x1` contract that the existing
+    # scheduled-task monitoring relies on. MUST be the last statement of the trap; a throw in
+    # step (1) or (2) would abort the handler and skip this line.
+    exit 1
+}
+
 # --- logging ------------------------------------------------------------------------------------
 # At a 5-minute cadence the common tick is "nothing moved", and writing a dozen lines for that would
 # put ~3k lines of noise a day between the entries that matter. So detail is buffered and only
@@ -247,6 +313,44 @@ function ConvertTo-UtcInstant {
     if ($null -eq $Value) { return $null }
     if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
     return [datetime]::Parse("$Value").ToUniversalTime()
+}
+
+# Parse a magickit-supplied ISO-8601 UTC timestamp (e.g. "2026-09-08T20:32:19.106309Z") into a UTC
+# [datetimeoffset], returning $null when the input is $null, empty, or unparseable.
+#
+# Called by the control probe log (F4b: HOLD NOT ACKNOWLEDGED warning below) and — per Bohr
+# msg-2789 §3 (F2-d) — reserved for reuse by Test-HoldObserved's future freshness gate (F2).
+#
+# WHY A DEDICATED PARSER, when ConvertTo-UtcInstant already exists just above:
+#
+# 1. **String comparison is unsafe here (F2-a).** ISO-8601 lexical ordering only agrees with
+#    time ordering when precision matches. `desired_at` may be microsecond-precise
+#    (e.g. "2026-09-08T20:32:19.106309Z") while `observed_at` is second-precise
+#    ("2026-09-08T20:32:19Z"). Comparing those as strings puts the microsecond value BEFORE the
+#    second value ('.' 0x2E < 'Z' 0x5A), so a same-second acknowledgement reads as stale. The
+#    caller MUST type-parse both operands.
+# 2. **Parse failure MUST NOT throw here (F2-c).** The enclosing bug this helper serves is
+#    "hold is silently unacknowledged". An unparseable timestamp on that path must be treated as
+#    "no acknowledgement", not as an unhandled exception that aborts the tick — otherwise the
+#    fail direction of the sweep flips from launch-anyway to abort, which parks every project
+#    the moment magickit returns a novel timestamp shape. ConvertTo-UtcInstant intentionally
+#    throws (its callers want that); this one intentionally returns $null.
+# 3. **AssumeUniversal + AdjustToUniversal + InvariantCulture** together pin the parse: a bare
+#    timestamp with no `Z` still lands in UTC (rather than the local machine's TZ, which would
+#    produce off-by-hours "stale minutes" values), and the parse never depends on the current
+#    culture's date format.
+function ConvertFrom-ControlTimestamp {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $s = "$Value"
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    try {
+        return [datetimeoffset]::Parse(
+            $s,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+    }
+    catch { return $null }
 }
 
 # Merge-on-write: re-read the file just before writing and preserve any keys the operator removed
@@ -366,6 +470,88 @@ function Test-HoldObserved {
     if ($null -eq $Control) { return $false }          # unreadable probe — fail open, launch
     if ($Control.desired_state -ne 'hold') { return $false }
     return ($Control.observed_state -eq 'hold')
+}
+
+# HOLD-acknowledgement freshness verdict — pure predicate, extracted for testability.
+#
+# Called ONLY when the operator has asked for HOLD ($Control.desired_state -eq 'hold'). Returns
+# $null when the acknowledgement is fresh (nothing to warn about); returns
+# @{ Reason = <string> } when the acknowledgement has not landed and the sweep should log the
+# HOLD NOT ACKNOWLEDGED line. This shape lets the caller stay a single `if ($null -ne $verdict)`
+# branch and keeps the two ack-not-landed messages distinguished only in `.Reason` (the outer
+# log line is the same greppable prefix for both, per Bohr msg-2789 §3).
+#
+# Three edges caught by PR #279 naysayer review (rounds 1 & 2) that the naive freshness check
+# misses. The invariant they compose to is:
+#
+#   observed_state = 'hold' is the acknowledgement itself; observed_at is only a freshness metric.
+#
+# Every silent-verdict path below must therefore confirm observed_state = 'hold'. Every
+# ack-not-landed path is either "no hold observation was ever reported" or "the observation is
+# stale relative to the request".
+#
+# (1) OLDER MAGICKIT SERVERS (no timestamp fields). Servers on the old schema return $null for
+#     BOTH desired_at and observed_at while still setting observed_state = 'hold'. In that case
+#     the ack HAS landed — we simply cannot measure its freshness — and the correct verdict is
+#     "fresh" (silent). Treating a null observed_at as "never acknowledged" would fire a false
+#     warning on every tick against those hosts (PR #279 review round 1, blocking objection #1).
+#     Only when observed_state itself is NOT 'hold' does a null observed_at mean "never
+#     acknowledged".
+#
+# (2) LAG IS MEASURED FROM desired_at, NOT observed_at. The operator's question is "how long
+#     has my HOLD request been sitting unacknowledged?", which is UtcNow - desired_at.
+#     Subtracting observed_at instead measures how long it has been since the daemon last
+#     observed ANYTHING for this project — after a maintenance gap that number can be days
+#     even though the pending HOLD is 10 seconds old (PR #279 review round 1, blocking
+#     objection #2). Both raw timestamps still appear in the outer log line's `desired_at=…` /
+#     `observed_at=…` display; the summary metric quoted in `.Reason` is the request-pending
+#     duration.
+#
+# (3) A FRESH observed_at DOES NOT IMPLY AN ACK. The daemon can refresh observed_at during a
+#     routine status update while still reporting observed_state = 'run' — the timestamp is a
+#     heartbeat, not a state transition. If we treated observed_at >= desired_at as a
+#     sufficient condition on its own, that heartbeat would silence the warning against a
+#     hold the daemon has not entered (PR #279 review round 2, blocking objection). The fresh
+#     branch must also require observed_state = 'hold'; when the timestamp is fresh but the
+#     state is something else, the correct verdict is "not acknowledged" (with the observed
+#     state quoted for triage — the operator asked for hold and got run/supervised/other).
+function Test-HoldAckStale {
+    param($Control, $Now)
+
+    if ($null -eq $Control)                          { return $null }
+    if ($Control.desired_state -ne 'hold')           { return $null }
+
+    $desiredAt = ConvertFrom-ControlTimestamp $Control.desired_at
+    $observedAt = ConvertFrom-ControlTimestamp $Control.observed_at
+
+    if ($null -eq $observedAt) {
+        # Edge (1). observed_state is the acknowledgement itself; the timestamp is only for
+        # freshness. An old magickit that acknowledges without a timestamp is still acknowledged.
+        if ($Control.observed_state -eq 'hold') { return $null }
+        return @{ Reason = 'never acknowledged' }
+    }
+
+    if ($null -eq $desiredAt) {
+        # desired_at is unmeasurable, so freshness is unmeasurable — but observed_state still
+        # tells us whether the daemon is in hold. Same asymmetry as edge (1): silent only when
+        # the state IS hold; warn otherwise (edge (3) applied to the missing-desired_at branch).
+        if ($Control.observed_state -eq 'hold') { return $null }
+        return @{ Reason = "not acknowledged (observed_state=$($Control.observed_state))" }
+    }
+
+    if ($observedAt -ge $desiredAt) {
+        # Edge (3). A fresh timestamp only counts as an acknowledgement when observed_state
+        # is actually 'hold'. Otherwise the timestamp is a heartbeat over a non-hold state.
+        if ($Control.observed_state -eq 'hold') { return $null }
+        return @{ Reason = "not acknowledged (observed_state=$($Control.observed_state))" }
+    }
+
+    # Edge (2). Lag is UtcNow - desired_at (how long the operator's request has been pending),
+    # NOT UtcNow - observed_at (how long since the last observation of any kind). The observed
+    # state is stale here regardless of value, so we do not gate this branch on observed_state.
+    $nowUtc = if ($null -eq $Now) { [datetimeoffset]::UtcNow } else { $Now }
+    $lagMinutes = [math]::Round(($nowUtc - $desiredAt).TotalMinutes, 1)
+    return @{ Reason = "$lagMinutes minutes stale" }
 }
 
 # --- resource-axis HOLD gate (T-loop-control-keyed-by-project-resource-is-the-repo §5a v2) ------
@@ -1647,7 +1833,14 @@ function Get-ConductorVerdict {
 # Delivery goes through the local squid proxy on purpose: pwsh.exe has no outbound firewall
 # permission of its own, so a request that skipped the proxy would be blocked rather than silently
 # escaping the egress chokepoint.
-$notifyWebhook = [Environment]::GetEnvironmentVariable('MINDWIRE_NOTIFY_DISCORD_WEBHOOK', 'User')
+#
+# Read via `$env:` (process environment block) rather than
+# `[Environment]::GetEnvironmentVariable(..., 'User')`, so the webhook is picked up whether it is
+# configured in User or Machine scope — Windows merges both into the process env at task start.
+# The prior `'User'` explicit read silently skipped Discord on hosts placing the webhook in
+# Machine scope (T-deploy-required-env-outage-is-silent human msg-3588, aligning this line with
+# the same access pattern the fatal init trap above already uses).
+$notifyWebhook = $env:MINDWIRE_NOTIFY_DISCORD_WEBHOOK
 $notifyProxy = if ($env:MINDWIRE_NOTIFY_PROXY) { $env:MINDWIRE_NOTIFY_PROXY } else { "http://127.0.0.1:3128" }
 
 # T-digest-exceeds-discord-limit-and-is-dropped D-5 (msg-2099): the CONSUMPTION contract for a
@@ -1845,16 +2038,36 @@ $DecisionComposerIdentity = if ($env:MINDWIRE_DECISION_COMPOSER_IDENTITY) {
     $env:MINDWIRE_DECISION_COMPOSER_IDENTITY
 } else { 'Composer' }
 
-# Dashboard base URL for D-29 (the link always survives the truncation ladder). Read from env with
-# the Tailscale-visible default from Takahito's §11.1 measurement — an operator relocating the
-# dashboard sets MINDWIRE_DECISION_DASHBOARD_URL and every link updates without touching the format
-# code. Path composition (`/dashboard/decisions/<project>/<thread>` for the human link,
+# Dashboard base URL for D-29 (the link always survives the truncation ladder). Resolved from
+# ``MINDWIRE_DECISION_DASHBOARD_URL`` (env). The env is **required** — unset raises a loud
+# PowerShell `throw` at init time. There is no in-code fallback (ADR-2026-09-18-22 D-1):
+#
+#   (i) the hard-coded fallback that used to live here landed a tailnet MagicDNS FQDN + port into
+#       the public source repository (T-public-repo-carries-real-infra-values Bohr msg-2734 §5.1),
+#       and that value class is one the registry hook does not detect;
+#   (ii) if the env is unset the material PUT and the human-facing Discord link both target the
+#        wrong place. The PUT is fail-open (D-4, D-34) so it swallows a 1-line log, but the
+#        Discord link is not — a human clicks it and hits 404 / dead host, silently believing the
+#        material is stored somewhere it never landed. Loud fail at init > silent misroute.
+#
+# D-1's invariant scope is disjoint from D-4's material-side fail-open: D-1 covers deploy-time
+# config errors (deploy not complete), D-4 covers runtime material-service outages (magickit down,
+# network partition). The two are subject-disjoint and both hold at once (ADR-22 D-4 invariant
+# scope paragraph).
+#
+# Path composition (`/dashboard/decisions/<project>/<thread>` for the human link,
 # `/v1/decisions/<project>/<thread>/material` for the magickit PUT) lives in New-DecisionLink /
 # New-MaterialUrl below — a URL-shape change is one edit in one place, not a search across the
 # wrapper.
-$DecisionDashboardBaseUrl = if ($env:MINDWIRE_DECISION_DASHBOARD_URL) {
-    $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
-} else { 'https://sg-ai-server-01.taile861db.ts.net:8443' }
+if (-not $env:MINDWIRE_DECISION_DASHBOARD_URL) {
+    throw "MINDWIRE_DECISION_DASHBOARD_URL is not set. Resolve the decision-material dashboard " +
+          "base URL from [[platform:infra-registry]] and set it in the environment before " +
+          "launching the scheduled sweep. There is no in-code default (ADR-2026-09-18-22 D-1 — " +
+          "fail-fast to prevent silent misroute of the human-facing Discord link, which is not " +
+          "covered by the D-4 fail-open that shields material PUTs; T-public-repo-carries-real-" +
+          "infra-values msg-2734 §5.1 for the underlying repo-visibility rationale)."
+}
+$DecisionDashboardBaseUrl = $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
 
 # --- decision-material push (T-decision-material-push, msg-1445) -------------------------------
 # The material push (mindwire composer → magickit `/v1/decisions/.../material`) shares a base URL,
@@ -1864,13 +2077,15 @@ $DecisionDashboardBaseUrl = if ($env:MINDWIRE_DECISION_DASHBOARD_URL) {
 # material lands at Y and the page correctly shows "material absent" — the exact split the composer
 # was written to close.
 #
-# Wire measurements from sg-tomtebo-01 (M-1, msg-1445 §6):
-#   * Invoke-WebRequest → https://sg-ai-server-01.taile861db.ts.net:8443/... returns 404 in ~190 ms
-#     with the wire proxy DISABLED (the tailnet cert validates under the default TLS handler and
-#     pwsh has outbound permission for that host).
-#   * With `-Proxy http://127.0.0.1:3128` the same request is refused by squid (403). Do NOT
-#     thread the notification proxy in here.
-# ∴ -TimeoutSec 10 is >50× the observed RTT, and the request goes direct.
+# Wire measurements and the derived direct-request / no-proxy decision live in the composer thread
+# (msg-1445 §6). This wrapper deliberately does NOT re-carry the measurement fixtures (host FQDN,
+# RTT, squid-403 detail) because a deploy script is not the correct location for historical
+# infrastructure evidence (T-public-repo-carries-real-infra-values §5.1 = registry gap G4 —
+# Einstein PR-gate advisory: single-use masking placeholders in a deploy wrapper are over-scope;
+# the ADR/composer thread is where operational context is preserved). The two facts this file
+# actually needs from that measurement — a ~190 ms RTT ceiling and "do not route this call through
+# the notification proxy" — are re-stated where the code enforces them below (the $DecisionMaterial
+# TimeoutSeconds comment and the Invoke-MaterialPut proxy note).
 #
 # The push is fail-open (D-34, msg-1443 §3): every failure — HTTP 4xx/5xx, TLS, DNS, connect refused,
 # timeout — writes ONE log line and returns to the caller. The notification then fires REGARDLESS
@@ -1880,8 +2095,8 @@ $DecisionDashboardBaseUrl = if ($env:MINDWIRE_DECISION_DASHBOARD_URL) {
 
 # How long the wrapper waits for the material PUT. Kept small (10 s) because a slow PUT would delay
 # the notification that follows; the notification is the "someone is being asked" signal and must
-# not wait on the material store. Measured RTT (M-1): ~190 ms round trip for a fresh connection —
-# a ceiling of 10 s allows for a 50× stall before the wrapper gives up and moves on. If a live
+# not wait on the material store. Measured RTT (msg-1445 §6): ~190 ms round trip for a fresh
+# connection — a ceiling of 10 s allows for a 50× stall before the wrapper gives up and moves on. If a live
 # measurement ever comes back over 2 s, that is the signal that the assumption behind this constant
 # is wrong; raise the alarm before raising the ceiling.
 $DecisionMaterialTimeoutSeconds = 10
@@ -1927,8 +2142,8 @@ function Invoke-MaterialPut {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($BodyJson)
         # -SkipHttpErrorCheck so a 4xx / 5xx returns a response object instead of throwing — the
         # caller wants to log the status code, not a "The remote server returned an error" wrapper.
-        # Not routed through $notifyProxy: M-1 confirmed the tailnet host is reachable directly and
-        # squid denies the tunnel. Keep this call OUT of the notification proxy path.
+        # Not routed through $notifyProxy: msg-1445 §6 confirmed the tailnet host is reachable
+        # directly and the notification proxy denies the tunnel. Keep this call OUT of the proxy path.
         $resp = Invoke-WebRequest -Uri $Url -Method Put `
             -ContentType 'application/json; charset=utf-8' `
             -Body $bytes -TimeoutSec $TimeoutSec `
@@ -3152,7 +3367,31 @@ try {
         $c = Invoke-ControlProbe -Project $proj
         $controlByProject[$proj] = $c
         if ($null -ne $c) {
-            Write-Log "control probe [$proj]: desired=$($c.desired_state) observed=$($c.observed_state) configured=$($c.configured)"
+            # F4b (Bohr msg-2789 §3): include desired_at/observed_at on the probe line, and — when
+            # the operator has asked for HOLD but the acknowledgement is missing or stale — emit a
+            # SEPARATE, greppable line with the prefix ``HOLD NOT ACKNOWLEDGED``. The separate line
+            # is deliberate: msg-2733 §6 documents that prior instances of this defect were seen,
+            # correctly suspected, then dismissed as timing noise because no named log entry pinned
+            # them. A distinct substring makes classification stick — the operator's dashboard, a
+            # grep, or an alert rule can hook it without pattern-matching a values-heavy probe row.
+            $desiredAtDisplay = if ($null -eq $c.desired_at)  { '(null)' } else { "$($c.desired_at)" }
+            $observedAtDisplay = if ($null -eq $c.observed_at) { '(null)' } else { "$($c.observed_at)" }
+            Write-Log ("control probe [{0}]: desired={1} desired_at={2} observed={3} observed_at={4} configured={5}" -f `
+                $proj, $c.desired_state, $desiredAtDisplay, $c.observed_state, $observedAtDisplay, $c.configured)
+
+            if ($c.desired_state -eq 'hold') {
+                # Fresh-vs-stale ack decision (F4b). Bohr msg-2789 §3 F2-a: comparison MUST be on
+                # parsed [datetimeoffset] values, not on raw ISO-8601 strings — the parse and the
+                # two-edge verdict now live in Test-HoldAckStale (see that function's block-comment
+                # for the false-positive and lag-source fixes from PR #279 naysayer review). This
+                # line is purely observability: neither verdict gates the launch. F2 (the predicate
+                # change) is a separate, later commit.
+                $ackVerdict = Test-HoldAckStale -Control $c
+                if ($null -ne $ackVerdict) {
+                    Write-Log ("HOLD NOT ACKNOWLEDGED [{0}] — desired_at={1} observed_at={2} ({3})" -f `
+                        $proj, $desiredAtDisplay, $observedAtDisplay, $ackVerdict.Reason)
+                }
+            }
         }
         if (Test-HoldObserved -Control $c) { continue }
         $h = Invoke-HeadProbe -Project $proj
@@ -3500,7 +3739,27 @@ try {
         $verdict = Get-ConductorVerdict -Output $output
         # Keep the daemon's raw output only when the run was eventful; a plain `rounds=0` stop is
         # fully described by the summary line below.
-        if ($code -ne 0 -or $null -eq $verdict.rounds -or $verdict.rounds -gt 0) {
+        #
+        # F4a (Bohr msg-2789 §3): but ALSO keep the raw output when the run carries a
+        # ``loop control:`` diagnostic (see ``conductor/control.py`` — both the ``read()``
+        # fail-safe warning and the ``report_observed()`` swallow-and-warn use that prefix)
+        # OR when the daemon reported ``reason=hold``. On 2026-09-09 05:45 (msg-2733 §4) two
+        # ``code=0 && reason=hold && rounds=0`` runs left ZERO stdout lines in the log because
+        # this filter drops the whole ``$output`` bucket on eventless runs; that made the split
+        # between "control-plane transport failed" (H1) and "report_observed failed" (H2)
+        # invisible from the log alone. This clause makes both hypotheses' evidence survive.
+        #
+        # ``Select-String -Quiet -SimpleMatch`` is used deliberately in place of a bare
+        # ``$output -match 'loop control:'``. The naive form has an array-vs-scalar hazard:
+        # when ``$output`` collapses to a single string that DOES NOT contain the pattern,
+        # ``-match`` returns ``$false``; wrapping that in ``@(...).Count -gt 0`` gives 1 (the
+        # boolean is a single-element array), so the guard fails OPEN and the filter unloads
+        # every eventless run into the log (Einstein msg-2787 blocking-objection). ``-Quiet``
+        # returns a plain ``[bool]`` for both scalar and array inputs; ``-SimpleMatch`` avoids
+        # any accidental regex-escape drift on the fixed prefix.
+        $isControlBearing = ($verdict.reason -eq 'hold') -or `
+                            [bool]($output | Select-String -Pattern 'loop control:' -SimpleMatch -Quiet)
+        if ($code -ne 0 -or $null -eq $verdict.rounds -or $verdict.rounds -gt 0 -or $isControlBearing) {
             Add-Content -LiteralPath $logPath -Value $output -Encoding utf8
         }
         Write-Log "$($cand.key) -> exit=$code reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg)"

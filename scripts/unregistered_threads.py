@@ -47,18 +47,22 @@ Output (stdout, JSON, ASCII-only per D-33)
           "project": "spirrow-mindwire",
           "unregistered_count": 3,
           "unregistered": ["T-a", "T-b", "T-c"],
-          "error": null
+          "error": null,
+          "malformed_count": 0
         },
         {
           "project": "spirrow-voxelworld",
           "unregistered_count": null,
           "unregistered": [],
-          "error": "chatroom_list_threads failed: TimeoutException: ..."
+          "error": "chatroom_list_threads failed: TimeoutException: ...",
+          "malformed_count": null
         }
       ],
       "unregistered_count_total": 3,
       "unmeasured_projects": ["spirrow-voxelworld"],
-      "any_unmeasured": true
+      "any_unmeasured": true,
+      "malformed_count_total": 0,
+      "any_malformed": false
     }
 
 ``unregistered_count == null`` means "did not measure" — the MCP call
@@ -67,6 +71,23 @@ from ``unregistered_count == 0`` (measured, and nothing is unregistered)
 so the wrapper can render ``?`` for the former and a real number for
 the latter (msg-2531 §2 invariant 2: "0 件" と "測れなかった" を同じ
 表示にしない).
+
+``malformed_count`` is the msg-2648 §3 third state: items the MCP
+listing returned but that were not shaped as JSON objects. It sits
+alongside ``error`` so the wrapper can tell "did not measure" (whole
+call failed → ``unregistered_count == null``) apart from "measured, but
+part of the population was unreadable" (``unregistered_count`` is a
+number, ``malformed_count > 0``). A day where ``any_malformed`` is true
+is a day where ``unregistered_count_total`` **must not** be used for the
+P-2 before/after comparison msg-2531 §1 defines — the two measurements
+did not enumerate the same population, and the delta cannot be
+attributed to state transitions alone. See PR #221's PR-gate advisory
+(``mindwire:objections`` on that PR): the remedy the gate suggested was
+to correct the offset arithmetic, but that would only make a
+server-side pagination contract violation *repeat* items rather than
+*skip* them; the actual defect the gate saw is "we drop garbage
+silently", and this field is the fix — the count of dropped items is
+now observable and never mixed into the primary metric.
 
 Fail direction
 --------------
@@ -154,7 +175,7 @@ def _as_dict(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-async def _list_live_threads(mcp: ToolCaller, project: str) -> list[dict[str, Any]]:
+async def _list_live_threads(mcp: ToolCaller, project: str) -> tuple[list[dict[str, Any]], int]:
     """Every live thread in a project, paged, filtered server-side to :data:`LIVE_STATUSES`.
 
     Passing ``status_filter`` at the tool boundary keeps the request
@@ -162,9 +183,21 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> list[dict[str, An
     pay for their metadata just so this predicate can throw them away.
     The same trim also documents intent — the client asks for exactly
     the set it plans to consume.
+
+    Returns the list of dict-shaped items and the count of non-dict
+    items dropped (the msg-2648 §3 third state). The offset increment
+    is deliberately ``len(items)`` and not ``len(dropped-filtered
+    items)``: the offset is a **server-side** cursor and must match the
+    server's own idea of what it just handed us. Correcting it locally
+    for dropped items — as the PR-gate advisory on PR #221 suggested —
+    would only *repeat* the last page when a broken server was paging
+    correctly, without helping the *actual* fail-silent defect (garbage
+    was being dropped without ever being counted). The remedy is
+    therefore to *observe* the drop count, not to change the arithmetic.
     """
     statuses = sorted(LIVE_STATUSES)
     out: list[dict[str, Any]] = []
+    malformed = 0
     offset = 0
     while True:
         page = _as_dict(
@@ -183,12 +216,22 @@ async def _list_live_threads(mcp: ToolCaller, project: str) -> list[dict[str, An
         items = page.get("items")
         if not isinstance(items, list) or not items:
             break
-        out.extend(item for item in items if isinstance(item, dict))
+        for item in items:
+            if isinstance(item, dict):
+                out.append(item)
+            else:
+                malformed += 1
+        # Offset advances by the raw page length (server-side cursor
+        # position). See docstring for why we do not compensate for
+        # ``malformed`` here — the PR-gate advisory on #221 asked us to,
+        # and the disposition (msg-2648 §2) declined and pointed the fix
+        # at the counter instead. Any deviation from raw len desyncs
+        # against a server that IS paging correctly.
         offset += len(items)
         total = page.get("total")
         if isinstance(total, int) and offset >= total:
             break
-    return out
+    return out, malformed
 
 
 async def _enumerate_project_with_recovery(
@@ -205,14 +248,22 @@ async def _enumerate_project_with_recovery(
       so a one-project outage still surfaces without crashing the whole
       enumeration. ``BaseException`` (``KeyboardInterrupt``, ``SystemExit``)
       is deliberately NOT caught: those must still terminate the CLI.
+
+    The malformed-item count from ``_list_live_threads`` is threaded
+    into :func:`enumerate_project` so the ``ProjectReport``'s
+    ``malformed_count`` reflects what the *tool call* saw, not just what
+    the predicate saw afterwards. When the whole call fails, the report
+    goes through :func:`project_error_report` which sets
+    ``malformed_count = None`` — a listing that raised does not have a
+    knowable malformed count.
     """
     try:
-        threads = await _list_live_threads(mcp, project)
+        threads, malformed = await _list_live_threads(mcp, project)
     except MagickitMcpError as exc:
         return project_error_report(project, f"chatroom_list_threads failed: {exc}")
     except Exception as exc:  # pragma: no cover - defence in depth
         return project_error_report(project, f"unexpected {type(exc).__name__}: {exc}")
-    return enumerate_project(project, threads, registered)
+    return enumerate_project(project, threads, registered, malformed_count=malformed)
 
 
 async def _run(registered: RegisteredIndex, url: str | None) -> EnumerateReport:

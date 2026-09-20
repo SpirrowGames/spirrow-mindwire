@@ -113,8 +113,11 @@ class Stage3ProposerAdapter(ClaudeCodeSdkAdapter):
 
     It was text-only (``tools=[]``) until it turned out that a proposer which
     cannot open a file cannot check a claim either; see
-    :data:`_PROPOSER_BUILTIN_TOOLS` for what it may now read and why that does
-    not touch the reasoning below.
+    :data:`_BOHR_BUILTIN_TOOLS` for what the persona currently playing this
+    role may read, and the block comment above that constant for why widening
+    that constant does not by itself widen the role-level invariant reasoned
+    about below (the role invariant is enforced on other axes — capabilities,
+    the ``can_use_tool`` guard, and the persona-tool tests).
 
     Why: the registry's Phase 1 ``qualified_for`` is "first qualified", and the
     base adapter declares ``EXECUTE_CODE`` (T16's dual-use, one adapter filling
@@ -266,35 +269,69 @@ def _assert_role_resolution(
         )
 
 
-# The proposer designs against this repository, so it has to be able to READ it.
-# It could not: the adapter passed ``tools=[]``, which disables every built-in,
-# and the proposer's own turn on T-fs-delete-path-scope (msg-1197) stopped with
+# The Bohr persona (the daemon-hosted persona that currently plays the proposer
+# role) designs against this repository, so it has to be able to READ it. It
+# could not: the adapter passed ``tools=[]``, which disables every built-in,
+# and Bohr's own turn on T-fs-delete-path-scope (msg-1197) stopped with
 # "read 系 tool の実行権限が下りず、一次照合を一切行えていない" — it declined to
 # design rather than guess, which is right, and then nothing moved. The Einstein
 # review of that turn endorsed the refusal. So the gap is here, not there.
 #
-# Read / Glob / Grep only. No Write, no Edit, no Bash: a proposer that can change
-# the tree is an implementer, and the Stage 3 split says only the implementer
-# executes, behind the allow-list. ``capabilities`` is untouched — it is a class
-# attribute, independent of this list — so PROPOSER stays the only slot this
-# adapter qualifies for and the IMPLEMENTER slot still resolves unambiguously to
-# the gated adapter. That was the whole reason the class drops ``EXECUTE_CODE``;
-# reading files was never what it was protecting against.
+# The list is named for the persona whose tools it happens to enumerate, not
+# for the role. Takahito msg-3507 ("Bohr であることと PROPOSER であることは必ずし
+# も一致しない") and ADR-2026-05-27-09 (identity 4 layers) draw ``identity_name``
+# (persona) and ``role`` on orthogonal axes, and the name reflects that: what
+# lives here is Bohr's built-in tool面 for its current embodiment, not a
+# statement about what the proposer role may carry in general.
 #
-# They are auto-approved because a call that is not auto-approved goes to an
-# interactive permission prompt, and nobody is there to answer it — which is
-# exactly the "permission denied" the proposer reported. That is a property of
-# running headless, not of whether a guard exists: the ``can_use_tool`` guard
-# injected below still runs on every call, and is where the bound lives.
-_PROPOSER_BUILTIN_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
+# The rename is honest about naming; it is not a structural decoupling.
+# :func:`build_proposer` still hardcodes this constant into the proposer role's
+# adapter, so today every proposer built by this composition root gets exactly
+# these tools. A future embodiment that put a different persona in the proposer
+# slot would need :func:`build_proposer` to accept a persona identifier and
+# look up a per-persona tool tuple — that plumbing does not yet exist.
+#
+# What the role invariant "a proposer role adapter cannot change the tree"
+# does have is enforcement on axes independent of this constant, and those
+# axes are still what stops a widening of this list from silently widening the
+# role: (a) :class:`Stage3ProposerAdapter` drops ``EXECUTE_CODE`` from
+# ``capabilities`` so PROPOSER is the only registry slot it qualifies for and
+# the IMPLEMENTER slot resolves unambiguously to the allow-list-gated adapter;
+# (b) the ``can_use_tool`` guard injected at :func:`build_proposer` (currently
+# :class:`_PathScopeGuard`, whose ``scopeable_tools`` frozenset admits only
+# ``Read`` / ``Glob`` / ``Grep``) refuses anything it cannot bound; (c) the
+# tests at :file:`tests/test_loop_runner.py` that assert Bohr's built-in tool
+# 面 today does not include write/execute tools. Widening this list to add a
+# new tool therefore does *not* by itself widen the role — the guard still has
+# to admit the tool for it to actually run through the adapter.
+#
+# Read / Glob / Grep is the current persona 面. They are auto-approved because
+# a call that is not auto-approved goes to an interactive permission prompt,
+# and nobody is there to answer it — which is exactly the "permission denied"
+# Bohr reported. That is a property of running headless, not of whether a
+# guard exists: the ``can_use_tool`` guard injected below still runs on every
+# call, and is where the bound lives.
+_BOHR_BUILTIN_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
 
 
 def build_proposer(repo_dir: Path) -> Stage3ProposerAdapter:
-    """Proposer with read-only access to ``repo_dir`` (same model family as ``main``)."""
+    """Proposer with read-only access to ``repo_dir`` (same model family as ``main``).
+
+    The tool list wired here is :data:`_BOHR_BUILTIN_TOOLS` — named for the
+    persona whose tools it happens to enumerate today. This function does not
+    yet take a persona parameter, so it hardcodes that constant; the naming is
+    honest labeling of what the constant is, not a claim that this composition
+    root already dispatches on persona.
+
+    The role-level "proposer cannot change the tree" invariant lives on other
+    axes (see the block comment above the constant). The path-scope guard
+    installed here is the seam that enforces the intersection — the adapter
+    can only actually invoke a tool the guard admits.
+    """
     return Stage3ProposerAdapter(
         cwd=repo_dir,
-        builtin_tools=_PROPOSER_BUILTIN_TOOLS,
-        allowed_tools=list(_PROPOSER_BUILTIN_TOOLS),
+        builtin_tools=_BOHR_BUILTIN_TOOLS,
+        allowed_tools=list(_BOHR_BUILTIN_TOOLS),
         # The scope is decided here, where the role is known — the adapter has no
         # way to tell a filesystem path from an MCP tool's URI-shaped ``path``,
         # so it is not asked to guess. `allowed_tools` auto-approves, which is
@@ -314,7 +351,17 @@ def build_implementer(repo_dir: Path, *, obligations: ObligationsManifest) -> Im
     ``obligations`` is the loop-readable obligations manifest loaded at the
     composition root and passed in by injection — the adapter never reaches for a
     module-global path itself. See :func:`_load_obligations_or_exit`.
+
+    v12 (T-auto-backgrounded-command-hangs-conductor-4h): installs the SDK
+    Job Object hook exactly once here. The install is a no-op on POSIX, and
+    idempotent under re-invocation — this is safe even if the composition
+    root is re-entered from tests or a hot-reload. Placement here (rather
+    than at module import) means a docs-only checkout that never builds an
+    implementer never patches the SDK's transport module.
     """
+    from .adapters import _sdk_job_hook
+
+    _sdk_job_hook.install_hook()
     return ImplementerSdkAdapter(cwd=repo_dir, obligations=obligations)
 
 
@@ -764,7 +811,7 @@ def _ensure_utf8_runtime() -> None:
 # payload row. Kept as a module constant so tests can assert on the exact bytes and
 # the PS parser can be pinned against the same string (T-gate-review-submit-failure-
 # handling DESIGN v3 §3, msg-1988). Any change here must land alongside the matching
-# regex update in :file:`deploy/run-conductor-scheduled.ps1`.
+# regex update in :file:`deploy/run-conductor-scheduled.ps1` (PR-C).
 _ENV_TERMINAL_PAYLOAD_PREFIX = "MINDWIRE_ENV_TERMINAL_PAYLOAD "
 
 
@@ -833,7 +880,11 @@ def main() -> None:
         # this thread. Signalling it as exit code 2 tells the PowerShell wrapper NOT
         # to quarantine the thread — instead the wrapper alerts on the fault-class
         # key (``__github_credential__`` / ``__github_permission__/<owner>/<repo>``)
-        # and continues the sweep.
+        # and continues the sweep. PR-C teaches the PS wrapper to distinguish
+        # exit=2 from exit=1; until PR-C lands, exit=2 falls into the same
+        # ``$code -ne 0`` branch exit=1 uses (verified by Bohr msg-3276 against
+        # ``deploy/run-conductor-scheduled.ps1``: line 3681 uses ``-ne 0``, not
+        # ``-eq 1``, so this PR-A is an ops-behaviour no-op).
         #
         # The payload line is JSON-shaped and printed to stdout on its OWN line,
         # prefixed with a fixed sentinel so the PS parser can locate it in a mixed

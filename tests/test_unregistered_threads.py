@@ -127,17 +127,102 @@ def test_a_thread_without_id_is_ignored() -> None:
     assert not is_unregistered_live("p", {"status": "active"}, registered)
 
 
-def test_enumerate_skips_non_dict_items() -> None:
-    """A garbled listing (e.g. a stray string in ``items``) must not break enumeration."""
+@pytest.mark.parametrize(
+    "raw_id, coerced",
+    [
+        (123, "123"),
+        (["x"], "['x']"),
+        ({"a": 1}, "{'a': 1}"),
+    ],
+)
+def test_non_string_truthy_thread_id_is_coerced_not_ignored(raw_id: object, coerced: str) -> None:
+    """Pin the current coercion behaviour so a future strict-check is a conscious break.
+
+    The docstring on :func:`enumerate_project` was updated to accurately
+    describe that truthy non-string ``thread_id`` values are coerced via
+    :func:`str` and surface under ``unregistered`` (msg-3325 PR-gate
+    ADVISORY on PR #287). Tightening this to reject non-strings would be
+    a material semantics change, out of scope for the docstring fix; this
+    test pins the current behaviour so any such tightening lights up
+    here first rather than as a silent regression.
+    """
     registered = _index(projects=("p",))
-    threads: list[object] = [
-        _thread(thread_id="T-a"),
-        "not-a-thread",
-        _thread(thread_id="T-b"),
-    ]
-    report = enumerate_project("p", threads, registered)  # type: ignore[arg-type]
+    threads = [{"thread_id": raw_id, "status": "active"}]
+    report = enumerate_project("p", threads, registered)
+    assert report.unregistered == (coerced,)
+    assert report.unregistered_count == 1
+    # Coercion is not a "malformed" event — the item was a dict with an
+    # id-shaped field, just of the wrong Python type. The boundary drop
+    # counter tracks non-object items only.
+    assert report.malformed_count == 0
+
+
+@pytest.mark.parametrize("raw_id", [0, [], {}, "", None])
+def test_falsy_thread_id_is_ignored(raw_id: object) -> None:
+    """Pin the falsy branch of the coercion so a refactor cannot silently break it.
+
+    The docstring on :func:`enumerate_project` describes a strict
+    divergence: truthy non-strings (``123``, ``["x"]``) coerce and
+    surface under ``unregistered``; every falsy ``thread_id`` — the
+    falsy non-strings (``0``, ``[]``, ``{}``, ``None``) and the empty
+    string ``""`` — coerces to ``""`` via the ``str(x or "")`` idiom
+    and is dropped. Both sides of that boundary must be pinned — a
+    refactor from ``str(thread.get("thread_id") or "")`` to
+    ``str(thread.get("thread_id", ""))`` would push ``0`` through as
+    ``"0"``, silently violating the falsy contract described in the
+    docstring, and only the presence of this test would catch it.
+    ``None`` is covered explicitly as a distinct upstream state from a
+    missing key: a JSON payload can send ``"thread_id": null`` and,
+    mechanically, that is a dict with the key present and the value
+    ``None`` — different from ``dict.get`` returning the default because
+    the key is absent. The empty string ``""`` is a string, not a
+    non-string, so the test name uses the umbrella term "falsy" rather
+    than "non-string" — the property that unites all five parametrised
+    values is that they are all falsy under Python truth-testing.
+    """
+    registered = _index(projects=("p",))
+    threads = [{"thread_id": raw_id, "status": "active"}]
+    report = enumerate_project("p", threads, registered)
+    assert report.unregistered == ()
+    assert report.unregistered_count == 0
+    assert report.malformed_count == 0
+
+
+def test_enumerate_carries_upstream_malformed_count_through_unchanged() -> None:
+    """msg-3225 PR-gate ADVISORY on PR #282: filtering lives at the boundary, not here.
+
+    The CLI's ``_list_live_threads`` filters non-dicts at the wire and
+    passes the drop count in via ``malformed_count``. This function
+    trusts its own type signature and does no re-filtering — the earlier
+    "add locally-dropped items to the upstream tally" branch was
+    dual-management (production runtime logic added purely to support
+    tests that violated the signature) and was removed.
+
+    Contract pinned here: the ``malformed_count`` passed in flows onto
+    ``ProjectReport.malformed_count`` unchanged, and is **never**
+    merged into ``unregistered_count``.
+    """
+    registered = _index(projects=("p",))
+    threads = [_thread(thread_id="T-a"), _thread(thread_id="T-b")]
+    report = enumerate_project("p", threads, registered, malformed_count=5)
     assert report.unregistered_count == 2
     assert report.unregistered == ("T-a", "T-b")
+    assert report.malformed_count == 5
+
+
+def test_enumerate_default_malformed_count_is_zero_when_boundary_saw_nothing_bad() -> None:
+    """A shape-clean listing at the wire produces ``malformed_count == 0``.
+
+    The default of ``0`` is the "measured, and dropped nothing" signal;
+    it is deliberately distinct from ``None`` (which
+    :func:`project_error_report` sets to mean "did not measure").
+    """
+    registered = _index(("p", "T-a"))
+    threads = [_thread(thread_id="T-a"), _thread(thread_id="T-b")]
+    report = enumerate_project("p", threads, registered)
+    assert report.unregistered_count == 1
+    assert report.unregistered == ("T-b",)
+    assert report.malformed_count == 0
 
 
 def test_enumerate_preserves_thread_order() -> None:
@@ -181,11 +266,61 @@ def test_totals_sum_only_measured_projects() -> None:
     assert report.unmeasured_projects == ("q",)
 
 
+def test_project_error_report_sets_malformed_count_to_none() -> None:
+    """msg-2648 §3: when the whole listing failed, malformed_count is unknown too.
+
+    Setting it to 0 would silently claim the population was cleanly
+    enumerated when in fact nothing was — the same fail-silent shape
+    that the third state is meant to defeat.
+    """
+    report = project_error_report("q", "chatroom_list_threads failed: boom")
+    assert report.unregistered_count is None
+    assert report.malformed_count is None
+
+
+def test_malformed_count_total_sums_only_measured_projects() -> None:
+    """An unmeasured project must not silently zero out a real malformed count."""
+    report = EnumerateReport(
+        projects=(
+            ProjectReport(project="p", unregistered_count=3, malformed_count=2),
+            project_error_report("q", "network"),
+            ProjectReport(project="r", unregistered_count=1, malformed_count=4),
+        )
+    )
+    assert report.malformed_count_total == 6
+    assert report.any_malformed is True
+
+
+def test_any_malformed_is_false_when_only_measured_zero_and_unmeasured() -> None:
+    """``any_malformed`` fires only on a **positive** measured drop count.
+
+    An unmeasured project (``malformed_count is None``) is not evidence
+    of drops — it is evidence that we could not tell. A day where every
+    project either measured 0 drops or failed entirely reports
+    ``any_malformed=False`` so the wrapper does not tell the operator
+    "data was dropped" when what actually happened is "we could not
+    check".
+    """
+    report = EnumerateReport(
+        projects=(
+            ProjectReport(project="p", unregistered_count=1, malformed_count=0),
+            project_error_report("q", "network"),
+        )
+    )
+    assert report.any_malformed is False
+
+
 def test_enumerate_report_as_json_is_stable() -> None:
     """Snapshot the JSON shape the wrapper reads — a breaking change is caught here, not in prod."""
     report = EnumerateReport(
         projects=(
-            ProjectReport(project="p", unregistered_count=1, unregistered=("T-a",), error=None),
+            ProjectReport(
+                project="p",
+                unregistered_count=1,
+                unregistered=("T-a",),
+                error=None,
+                malformed_count=2,
+            ),
             project_error_report("q", "network"),
         )
     )
@@ -197,17 +332,21 @@ def test_enumerate_report_as_json_is_stable() -> None:
                 "unregistered_count": 1,
                 "unregistered": ["T-a"],
                 "error": None,
+                "malformed_count": 2,
             },
             {
                 "project": "q",
                 "unregistered_count": None,
                 "unregistered": [],
                 "error": "network",
+                "malformed_count": None,
             },
         ],
         "unregistered_count_total": 1,
         "unmeasured_projects": ["q"],
         "any_unmeasured": True,
+        "malformed_count_total": 2,
+        "any_malformed": True,
     }
 
 

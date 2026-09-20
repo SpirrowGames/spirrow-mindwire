@@ -45,6 +45,12 @@ _NOT_SDK_BACKED: dict[str, str] = {
     "__init__.py": "package marker; defines no adapter",
     "_sdk_result.py": "parses an SDK result object; spawns nothing",
     "_session_isolation.py": "this module IS the policy",
+    "_sdk_job_hook.py": (
+        "SDK-adjacent process-lifecycle hook (Windows Job Objects); wraps the "
+        "SDK's transport but builds no ClaudeAgentOptions of its own — "
+        "isolation is applied by the adapter that USES the hook "
+        "(implementer.py) via session_isolation_kwargs()"
+    ),
     "naysayer_lexora.py": "reaches Lexora over HTTP; builds no SDK session",
 }
 

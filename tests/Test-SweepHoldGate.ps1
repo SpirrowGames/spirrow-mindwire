@@ -49,6 +49,23 @@ $fnOwnerMap = $functions | Where-Object { $_.Name -eq 'Get-SweepOwnerMap' } | Se
 if (-not $fnOwnerMap) { throw "function not found in sweep script: Get-SweepOwnerMap" }
 Invoke-Expression $fnOwnerMap.Extent.Text
 
+# ConvertFrom-ControlTimestamp is F4b's parse helper. It is used from the control probe log's
+# HOLD-ack freshness check today, and per Bohr msg-2789 §3 F2-d it will be reused by
+# Test-HoldObserved's freshness gate when F2 lands. The fail-mode is load-bearing (F2-c):
+# an unparseable timestamp MUST return $null (fall-through → launch), never raise (would flip
+# the sweep's fail direction from launch-anyway to abort-tick). Extracted via the same AST
+# idiom so a rename or inlining fails loudly here.
+$fnTs = $functions | Where-Object { $_.Name -eq 'ConvertFrom-ControlTimestamp' } | Select-Object -First 1
+if (-not $fnTs) { throw "function not found in sweep script: ConvertFrom-ControlTimestamp" }
+Invoke-Expression $fnTs.Extent.Text
+
+# Test-HoldAckStale is the HOLD-freshness verdict function extracted so PR #279's two blocking
+# correctness edges can be pinned as regressions rather than as a comment. Inlining it back into
+# the probe loop would silently defeat the tests below.
+$fnAck = $functions | Where-Object { $_.Name -eq 'Test-HoldAckStale' } | Select-Object -First 1
+if (-not $fnAck) { throw "function not found in sweep script: Test-HoldAckStale" }
+Invoke-Expression $fnAck.Extent.Text
+
 $script:failures = 0
 function Check {
     param([string]$Name, $Expected, $Actual)
@@ -271,6 +288,187 @@ try {
     Check "owner_map absent -> empty map (gate OFF, backward compat)" 0 $absentMap.Count
 }
 finally { Remove-Item -LiteralPath $tmpNoField.FullName -Force -ErrorAction SilentlyContinue }
+
+Write-Host ""
+Write-Host "ConvertFrom-ControlTimestamp — F4b parse helper (fall-through on unparseable, F2-c)"
+
+# A valid ISO-8601 with microseconds parses to the same UTC instant.
+$tsMicro = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19.106309Z'
+Check "microsecond-precision ISO -> parsed" ([datetimeoffset]) $tsMicro.GetType()
+Check "microsecond-precision ISO -> UTC offset" ([TimeSpan]::Zero) $tsMicro.Offset
+
+# A second-precision timestamp parses too — the whole point of the helper is not to rely on the
+# raw strings for ordering (F2-a: microsecond-vs-second precision flips lexical ordering).
+$tsSec = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19Z'
+Check "second-precision ISO -> parsed" ([datetimeoffset]) $tsSec.GetType()
+
+# The regression F2-a exists to prevent: microsecond value is LATER than the same-second value.
+# Naive string comparison would put the microsecond value FIRST ('.' < 'Z'), which would read as
+# stale. The parsed comparison must respect real time order.
+Check "F2-a: microsecond after same-second (parsed order)" $true ($tsMicro -gt $tsSec)
+
+# A missing microsecond field with a fractional-second observed_at (same second): observed newer.
+$dAt = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19Z'
+$oAt = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19.500000Z'
+Check "F2-a: fractional-second observed after bare-second desired" $true ($oAt -gt $dAt)
+
+# Fail-through cases — every one MUST return $null (F2-c: parse failure = "no ack"; never throw).
+Check "null -> null (never throws)"    $null (ConvertFrom-ControlTimestamp $null)
+Check "empty string -> null"           $null (ConvertFrom-ControlTimestamp '')
+Check "whitespace -> null"             $null (ConvertFrom-ControlTimestamp '   ')
+Check "garbage string -> null"         $null (ConvertFrom-ControlTimestamp 'not-a-date')
+Check "half-parsed date -> null"       $null (ConvertFrom-ControlTimestamp '2026-99-99T99:99:99Z')
+
+# A no-suffix timestamp is treated as UTC (AssumeUniversal + AdjustToUniversal), not as local
+# machine time. This is what keeps the "N minutes stale" metric in the HOLD NOT ACKNOWLEDGED
+# warning honest across daemon hosts in any timezone.
+$tsNoZ = ConvertFrom-ControlTimestamp '2026-09-08T20:32:19'
+Check "bare (no Z) treated as UTC -> zero offset" ([TimeSpan]::Zero) $tsNoZ.Offset
+
+Write-Host ""
+Write-Host "Test-HoldAckStale — HOLD-ack freshness verdict (PR #279 review, blocking objections 1 & 2)"
+
+# Control builder that includes the F4b timestamp fields. observed_at = $null models older
+# magickit servers that predate the timestamp fields (PR #279 review objection 1).
+function New-ControlWithTs {
+    param(
+        [string]$Desired,
+        $Observed,
+        [string]$DesiredAt,
+        [string]$ObservedAt
+    )
+    $obsField = if ($null -eq $Observed) { 'null' } else { '"' + $Observed + '"' }
+    $desAtField = if ([string]::IsNullOrEmpty($DesiredAt)) { 'null' } else { '"' + $DesiredAt + '"' }
+    $obsAtField = if ([string]::IsNullOrEmpty($ObservedAt)) { 'null' } else { '"' + $ObservedAt + '"' }
+    return ('{"project":"p","desired_state":"' + $Desired + '","desired_at":' + $desAtField +
+        ',"observed_state":' + $obsField + ',"observed_at":' + $obsAtField +
+        ',"configured":true}' | ConvertFrom-Json)
+}
+
+# Trivial-return arms (not the interesting bug fixes, but the function must still fall out fast
+# for callers other than the probe loop, in case Test-HoldAckStale ever gets composed elsewhere).
+Check "null control -> null (nothing to warn about)" $null `
+    (Test-HoldAckStale -Control $null)
+Check "desired != hold -> null (nothing to warn about)" $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'run' -Observed 'run' `
+        -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:01:00Z'))
+
+# The two ack-not-landed arms — reason string is what the outer log line quotes.
+$verdictNever = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '')
+Check "hold desired, never observed (observed=run, observed_at=null) -> stale, 'never acknowledged'" `
+    'never acknowledged' $verdictNever.Reason
+
+# ============================================================================================
+# PR #279 review, BLOCKING objection 1 (false-positive on older magickit).
+# ============================================================================================
+# Older magickit servers omit the timestamp fields. If the loop is holding, observed_state comes
+# back as 'hold' but observed_at is $null. The pre-fix code unconditionally emitted "never
+# acknowledged" in that case, blasting a false HOLD NOT ACKNOWLEDGED warning to the logs every
+# tick against those hosts. The correct verdict is "fresh" — silent — because observed_state
+# itself is the acknowledgement; observed_at is only there to measure freshness.
+Check "PR#279 obj#1: old magickit (observed='hold', observed_at=null) -> null (SILENT, hold IS acked)" `
+    $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt ''))
+# Even without desired_at on the old server, observed_state='hold' is enough to declare fresh.
+Check "PR#279 obj#1: old magickit (both timestamps null, observed='hold') -> null (SILENT)" `
+    $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '' -ObservedAt ''))
+# Contrast case: same server (both timestamps null) but observed_state is NOT 'hold' — that
+# genuinely IS "never acknowledged" (there is no observation of any kind), so it MUST warn.
+$verdictOldRun = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '' -ObservedAt '')
+Check "PR#279 obj#1: old magickit (observed='run', both null) -> stale 'never acknowledged'" `
+    'never acknowledged' $verdictOldRun.Reason
+
+# ============================================================================================
+# PR #279 review, BLOCKING objection 2 (lag measured from desired_at, not observed_at).
+# ============================================================================================
+# Scenario: operator requested a HOLD 10 seconds ago (desired_at = Now - 10s). The daemon's last
+# successful observation happened during the previous run, 5 days ago (observed_at = Now - 5d).
+# The pre-fix code computed lag = UtcNow - observed_at = ~7200 minutes, an absurd figure that
+# implies the operator has been waiting 5 days. The correct lag = UtcNow - desired_at ≈ 0.2 min,
+# because the operator's HOLD request is what has been pending, not the daemon's observation.
+$now = [datetimeoffset]::Parse('2026-09-17T04:00:00Z',
+    [System.Globalization.CultureInfo]::InvariantCulture,
+    [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+$verdictLag = Test-HoldAckStale -Now $now -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '2026-09-17T03:59:50Z' -ObservedAt '2026-09-12T04:00:00Z')
+# desired_at is 10 seconds before Now → ~0.2 minutes stale (rounded, 1 dp).
+Check "PR#279 obj#2: lag measured from desired_at (not observed_at); expected '0.2 minutes stale'" `
+    '0.2 minutes stale' $verdictLag.Reason
+# Explicit counter-claim: the WRONG value under the pre-fix logic would be ~7200 minutes.
+# Regression pin — if this ever comes back to matching the observed_at subtraction, the fix
+# has been reverted.
+Check "PR#279 obj#2: lag NOT '7200 minutes stale' (would be the pre-fix answer)" `
+    $true ($verdictLag.Reason -ne '7200 minutes stale')
+
+# Fresh-ack arm — observed_at >= desired_at AND observed_state = 'hold' means the ack landed at
+# or after the request AND the daemon actually entered hold. This is the settled steady state
+# that MUST stay silent (no warning every tick). Note the CONJUNCTION with observed_state: a
+# fresh timestamp alone is insufficient (PR #279 review round 2, pinned below).
+Check "fresh ack (observed_at > desired_at, observed='hold') -> null (SILENT)" $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:05Z'))
+Check "fresh ack (observed_at == desired_at exactly, observed='hold') -> null (SILENT)" $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:00Z'))
+
+# ============================================================================================
+# PR #279 review ROUND 2, BLOCKING objection (fresh observed_at + non-hold observed_state).
+# ============================================================================================
+# Scenario: operator issued a HOLD; the daemon then did a routine status update afterwards
+# (refreshing observed_at), but the daemon has NOT yet processed the hold — observed_state is
+# still 'run'. A fresh timestamp with a non-hold state is a heartbeat, not an acknowledgement.
+# The pre-fix code short-circuited on `observed_at -ge $desired_at` alone and returned SILENT,
+# suppressing the warning against a hold the daemon had not entered. The correct verdict is
+# "not acknowledged", with observed_state quoted so an operator sees WHAT state the daemon is
+# still in.
+$verdictHeartbeatRun = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:05Z')
+Check "PR#279 R2: fresh observed_at + observed='run' -> stale 'not acknowledged (observed_state=run)'" `
+    'not acknowledged (observed_state=run)' $verdictHeartbeatRun.Reason
+# Regression counter-pin: the pre-fix answer was SILENT (null). If the observed_state check
+# is ever removed from the fresh branch, this reddens.
+Check "PR#279 R2: fresh observed_at + observed='run' -> NOT null (pre-fix answer)" `
+    $true ($null -ne $verdictHeartbeatRun)
+# Same shape with a non-'run' non-'hold' state (e.g. 'supervised'): also a heartbeat, also
+# not an ack. The quoted state must reflect the actual value for operator triage.
+$verdictHeartbeatSup = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'supervised' `
+    -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:05Z')
+Check "PR#279 R2: fresh observed_at + observed='supervised' -> stale (state quoted)" `
+    'not acknowledged (observed_state=supervised)' $verdictHeartbeatSup.Reason
+# Exact-equal timestamp with a non-hold state: same rule. The equality boundary is not a
+# safe harbour — it is still a heartbeat if the state is wrong.
+$verdictHeartbeatEqual = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '2026-09-08T20:00:00Z' -ObservedAt '2026-09-08T20:00:00Z')
+Check "PR#279 R2: exact-equal observed_at + observed='run' -> stale (no equality safe-harbour)" `
+    'not acknowledged (observed_state=run)' $verdictHeartbeatEqual.Reason
+
+# desired_at unparseable BUT observed_at present. Freshness is unmeasurable, but observed_state
+# still decides: 'hold' means the daemon IS in hold (silent), any other state means the daemon
+# is not in hold and the warning must fire (round-2 objection applied to the missing-desired_at
+# branch — same asymmetry as the older-magickit case).
+Check "desired_at null, observed_at present, observed='hold' -> null (SILENT)" `
+    $null `
+    (Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+        -DesiredAt '' -ObservedAt '2026-09-08T20:00:00Z'))
+$verdictNoDesiredButRun = Test-HoldAckStale -Control (New-ControlWithTs -Desired 'hold' -Observed 'run' `
+    -DesiredAt '' -ObservedAt '2026-09-08T20:00:00Z')
+Check "desired_at null, observed_at present, observed='run' -> stale (state quoted)" `
+    'not acknowledged (observed_state=run)' $verdictNoDesiredButRun.Reason
+
+# Stale-observed branch (observed_at < desired_at) is unchanged by round 2: lag is measured from
+# desired_at regardless of observed_state, because the observation is stale either way. But
+# ensure the observed_state=hold case (the §2c "stale ack that Test-HoldObserved currently
+# mistakes for fresh") still surfaces the stale lag — F4b MUST warn even though F2 hasn't
+# landed yet, or the operator sees no signal that observed=hold is chronologically wrong.
+$verdictStaleHold = Test-HoldAckStale -Now $now -Control (New-ControlWithTs -Desired 'hold' -Observed 'hold' `
+    -DesiredAt '2026-09-17T03:59:50Z' -ObservedAt '2026-09-12T04:00:00Z')
+Check "stale ack (observed_at < desired_at) with observed='hold' -> still warns 'N minutes stale'" `
+    '0.2 minutes stale' $verdictStaleHold.Reason
 
 Write-Host ""
 if ($script:failures -gt 0) { Write-Host "sweep hold gate: $($script:failures) check(s) FAILED"; exit 1 }

@@ -161,7 +161,29 @@ def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
     return build_turn_prompt(event, own_role, "Reply to this message in your role.")
 
 
-async def _drain_reply(client: _SdkClient) -> str:
+class SdkTurnTimeoutError(RuntimeError):
+    """The SDK turn did not finish inside the caller's time budget (v12 B-1).
+
+    Raised by :func:`_drain_reply` when ``turn_timeout_seconds`` is exceeded
+    while waiting for a ``ResultMessage``. This exists to break the observed
+    hang class (T-auto-backgrounded-command-hangs-conductor-4h): the CLI can
+    hold a turn open indefinitely if it moved a foreground shell command to
+    a background task, and without an outer time budget the whole conductor
+    is stuck behind one SDK session.
+
+    Kept as a plain :class:`RuntimeError` subclass (not an
+    :class:`AdapterError`) because the drain helper is used by multiple
+    adapters — each adapter's ``deliver_event`` catches this and wraps it
+    into the adapter-appropriate ``AdapterDeliveryError`` subclass with the
+    ``adapter.turn_timeout`` error code.
+    """
+
+
+async def _drain_reply(
+    client: _SdkClient,
+    *,
+    turn_timeout_seconds: float | None = None,
+) -> str:
     """Drain one SDK response, returning the concatenated assistant text.
 
     Raises :class:`~._sdk_result.SdkIsErrorSignal` when the SDK reports
@@ -173,10 +195,40 @@ async def _drain_reply(client: _SdkClient) -> str:
     ``ResultMessage`` at all): those did not lose reason text — the message
     itself IS the reason — so the special-purpose signal type is not warranted.
 
+    Raises :class:`SdkTurnTimeoutError` when ``turn_timeout_seconds`` is
+    passed and the whole drain does not finish inside that budget (v12
+    B-1). ``None`` (the default) preserves the pre-v12 unbounded behaviour
+    for adapters that have not opted in.
+
     The caller in :meth:`ClaudeCodeSdkAdapter.deliver_event` picks the
     ``ErrorInfo.code`` off the exception type (``adapter.sdk_is_error`` vs
-    ``adapter.delivery_failed``).
+    ``adapter.delivery_failed`` vs ``adapter.turn_timeout``).
     """
+    if turn_timeout_seconds is not None:
+        # PR-gate #299 round 2 blocker: ``asyncio.wait_for`` cannot tell OUR
+        # deadline expiring apart from an inner ``TimeoutError`` bubbling out
+        # of the SDK's own ``receive_response()`` — both surface as
+        # ``TimeoutError`` in the outer catch, and wrapping unconditionally
+        # would misattribute an inner network hiccup to the 30-minute turn
+        # budget. Python 3.11's ``asyncio.timeout()`` returns a context
+        # object whose ``.expired()`` says "MY deadline fired" vs. "no, this
+        # ``TimeoutError`` came from somewhere else" — the exact distinction
+        # the pre-existing comment CLAIMED but the ``wait_for`` shape could
+        # never provide. Only wrap into ``SdkTurnTimeoutError`` when our
+        # deadline actually expired; otherwise let the exception propagate
+        # so ``deliver_event`` sees it via the ordinary
+        # ``adapter.delivery_failed`` path.
+        timeout_ctx = asyncio.timeout(turn_timeout_seconds)
+        try:
+            async with timeout_ctx:
+                return await _drain_reply(client, turn_timeout_seconds=None)
+        except TimeoutError as exc:
+            if timeout_ctx.expired():
+                raise SdkTurnTimeoutError(
+                    f"SDK turn did not finish inside {turn_timeout_seconds}s"
+                ) from exc
+            raise
+
     chunks: list[str] = []
     final: Any = None
     async for msg in client.receive_response():
@@ -564,4 +616,5 @@ __all__ = [
     "ClaudeCodeSdkHaltError",
     "ClaudeCodeSdkHealthError",
     "ClaudeCodeSdkSpawnError",
+    "SdkTurnTimeoutError",
 ]

@@ -1648,6 +1648,249 @@ function Save-CorruptedStateBackup {
     return $badPath
 }
 
+function Read-LeasesStateForTick {
+    <#
+    .SYNOPSIS
+        Read leases.json at tick start and return a policy-carrying verdict — the P4-3 v4.1
+        seam. This is the ONE function the wrapper's T-0 phase calls; it collapses three read
+        outcomes (valid / missing / unreadable) into a caller-consumable record with the
+        disposition, the flush-allowed flag, and the operator notification text pre-composed.
+
+    .DESCRIPTION
+        WHY THIS FUNCTION EXISTS (T-exclusive-resource-lease-queue, msg-3305 / msg-3307 /
+        msg-3309 design v4.1). The lease-state read at tick start has THREE distinct outcomes,
+        and each drives a different tick-level policy:
+
+          - 'valid'      — the file exists AND its root is a JSON OBJECT (shape='object', a
+                           real `{...}` structure, whether empty or populated). The tick
+                           proceeds normally: lease-requiring candidates may acquire, and the
+                           T-5 flush WILL run at end-of-tick. Note the STRICT boundary here:
+                           only shape='object' counts as valid. See §WHY 'empty' SHAPE FALLS
+                           INTO UNREADABLE below for the safety rationale.
+
+          - 'missing'    — the file does NOT exist on disk. This is NOT bootstrap. Per msg-3306
+                           it is UNMIGRATED: msg-923's original condition placed a manual
+                           holder in chatroom prose, and until the operator has run the
+                           P4-5 deploy runbook, the wrapper CANNOT distinguish "fresh daemon,
+                           no physical holder anywhere" from "daemon replacing a chatroom-
+                           recorded manual hold" by observation alone. The distinction is an
+                           OPERATOR DECLARATION, not a wrapper inference — file present =
+                           migration completed; file absent = migration not completed. On
+                           this branch: lease-requiring candidates get disposition
+                           'lease-state-unreadable', T-5 flush is SKIPPED (so we do not
+                           create the file — creating it would silently declare migration
+                           complete), and a notification with the migration-runbook pointer
+                           is composed.
+
+          - 'unreadable' — the file exists but its root is NOT a well-formed JSON object.
+                           This bucket covers FOUR raw shapes from Read-JsonStateWithShape:
+                           'array', 'scalar', 'parse-error', AND 'empty' (blank / whitespace /
+                           `[]`). All four are treated identically: lease-requiring candidates
+                           get disposition 'lease-state-unreadable', T-5 flush is SKIPPED
+                           (preserves the operator's forensic evidence), and a notification
+                           with an explicit "DO NOT delete leases.json" warning is composed
+                           — because an operator who deletes the file to "recover" would
+                           flip us into 'missing' on the next tick, where the now-empty
+                           state can silently double-allocate against a still-running
+                           physical holder.
+
+        DISPOSITION UNIFICATION (msg-3308 advisory, msg-3309 §1 accept). Both 'missing' and
+        'unreadable' produce the SAME wrapper disposition ('lease-state-unreadable') because
+        the behavioural policy is identical (defer, skip flush, notify). The CAUSE is preserved
+        in the notification text (cause-specific: migration-runbook vs DO-NOT-delete), NOT in
+        the disposition label. This matches the wrapper's state-centric disposition convention
+        (existing set: 'held' / 'quarantined-skipped' / 'head-deferred' / …) rather than
+        introducing a new cause-centric label ('lease-not-migrated') that would read
+        anachronistically on day 100 if a valid file goes missing to accidental deletion.
+
+        WHY 'empty' SHAPE (blank file OR `[]`) FALLS INTO UNREADABLE. An earlier iteration of
+        this function mapped shape='empty' to verdict='valid' with state=@{} on the reasoning
+        that "file present = migration completed". The pr-gate review of PR 286 (v1 diff at
+        commit 5e6af92, class=correctness objection) caught the silent-double-allocation
+        hazard this opens:
+
+          If an ACTIVE `leases.json` (a valid file naming a live holder) is accidentally
+          truncated to whitespace — for example by an operator running `> leases.json` in a
+          shell, or a script writing blank lines to it — the wrapper's next read would see
+          shape='empty', return verdict='valid' with state=@{}, and permit a competing
+          lease-requiring candidate to acquire on the NEXT tick. The physical holder is
+          still running; mutual exclusion has collapsed.
+
+        The distinction between "operator ran the runbook and deliberately seeded empty state"
+        (which the runbook writes as literal `{}`, landing on shape='object') and "operator
+        accidentally truncated the file" (blank/whitespace, shape='empty') is NOT observable
+        by the wrapper. The runbook is the operator's explicit contract path; anything else
+        that lands here is fail-closed. Point (a) is preserved — an operator following STEP 4
+        with `Set-Content -Value '{}'` still lands on shape='object' → verdict='valid'. Point
+        (b) — an operator who ignored the runbook and seeded `''` or `[]` — is now redirected
+        into the unreadable notification, which explicitly tells them to inspect and repair
+        the file (which in practice means writing `{}` if they meant "empty state"). This
+        DEGRADES their liveness by one tick, and that is the price of never silently dropping
+        an active holder record.
+
+        THE SIDE-EFFECT BOUNDARY. This function is PURE with respect to the filesystem — it
+        reads Path exactly once (via Read-JsonStateWithShape) and returns a verdict record.
+        It does NOT log, does NOT rename corrupt files, does NOT send notifications. Every
+        side effect is the caller's, which keeps the seam testable in isolation and preserves
+        the "one file, one owner" boundary R2/R3 endorsed for Save-CorruptedStateBackup.
+
+    .PARAMETER Path
+        Absolute path to leases.json.
+
+    .OUTPUTS
+        A hashtable with the following keys:
+
+          state          — hashtable, the lease map. Empty (@{}) on 'missing' or 'unreadable'
+                           OR when the file is a valid empty object. Populated on 'valid'.
+          verdict        — one of 'valid' | 'missing' | 'unreadable'. This is the P4-3 v4.1
+                           three-branch dispatch; the caller decides tick policy from it.
+          shape          — the raw shape from Read-JsonStateWithShape: 'missing' | 'empty' |
+                           'object' | 'array' | 'scalar' | 'parse-error'. Preserved so the
+                           caller and tests can disambiguate cause within 'unreadable' (empty
+                           vs array vs scalar vs parse-error) or confirm the migration-marker
+                           check landed on the correct shape. The verdict → shape mapping is
+                           NOT symmetric: 'valid' ⇔ shape='object'; 'missing' ⇔ shape='missing';
+                           'unreadable' ⇔ shape ∈ {empty, array, scalar, parse-error}.
+          disposition    — the wrapper disposition a LEASE-REQUIRING candidate would get this
+                           tick: '' (empty string) on 'valid', 'lease-state-unreadable' on
+                           'missing' or 'unreadable'. Lease-UNRELATED candidates are not
+                           affected — the caller must apply this only to candidates whose
+                           sweep.json entry declared a non-empty `requires`.
+          flush_allowed  — [bool] $true only on 'valid'. $false on 'missing' or 'unreadable':
+                           on 'missing' skipping the flush is what prevents the wrapper from
+                           silently declaring migration complete; on 'unreadable' skipping
+                           preserves the operator's forensic evidence.
+          log_line       — a one-line INFO log entry (or short summary) describing the read
+                           outcome for the wrapper's tick log. Always populated.
+          notification   — on 'missing' and 'unreadable': the full ERROR-level notification
+                           text to log and (if $env:MINDWIRE_NOTIFY_DISCORD_WEBHOOK is set)
+                           send. Includes the file path, the shape verdict, and cause-specific
+                           operator guidance (see §CAUSE-SPECIFIC NOTIFICATION TEXT below).
+                           $null on 'valid'.
+          error          — the raw parse error message from Read-JsonStateWithShape (shape=
+                           'parse-error' only), else $null. Diagnostic; the notification text
+                           carries the same information for the operator.
+
+    .NOTES
+        CAUSE-SPECIFIC NOTIFICATION TEXT (msg-3309 §2 delta). Both 'missing' and 'unreadable'
+        produce a notification, but the text is DIFFERENT for each cause:
+
+          - shape='missing': "leases.json missing at <path> — treated as UNMIGRATED (see
+            docs/deploy.md § migration runbook). If you have completed the runbook and this
+            appears again, an operator has deleted the file; verify no physical holder is
+            running before allowing bootstrap."
+
+          - shape ∈ {empty, array, scalar, parse-error}: "leases.json unreadable at <path>
+            (verdict=<shape>) — DO NOT manually delete the file. Inspect and repair directly,
+            or verify no physical holder is running before allowing bootstrap." The shape name
+            is reported verbatim so an operator can distinguish "someone truncated the file"
+            (shape=empty) from "operator hand-edited to JSON array" (shape=array) from
+            "half-write mid-flush" (shape=parse-error) in the diagnostic log without
+            re-inspecting the file.
+
+        The (d-6) test pin greps the 'unreadable' branch's notification for the verbatim
+        substring 'DO NOT manually delete leases.json'; the (d-4) test pin greps the
+        'missing' branch's notification for 'migration runbook'. These text checks are
+        hygiene pins that prevent the warnings being silently dropped by a future refactor.
+
+        DEGRADATION INVARIANT LEDGER (msg-3305 §2c, msg-3307 §3c v4). Preserved across the
+        three branches:
+
+          - MUTUAL EXCLUSION. Under 'valid': normal path enforces it. Under 'missing':
+            nothing is granted this tick (T-5 skipped, disposition defer), so the pre-existing
+            chatroom-recorded manual hold is not violated. Under 'unreadable': nothing is
+            granted (same). NEVER violated.
+          - LIVENESS FOR LEASE-UNRELATED WORK. All three branches — the wrapper applies
+            disposition only to candidates with non-empty `requires`, so lease-unrelated
+            candidates proceed through pre-existing gates unchanged.
+          - LIVENESS FOR LEASE-RELATED WORK. Preserved on 'valid'. DEFERRED on 'missing' and
+            'unreadable' — accepted by design. Recovery is the operator's action (runbook +
+            file inspect/repair), NOT wrapper auto-heal.
+
+        OPERATOR-DELETE-AFTER-CORRUPTION HAZARD (msg-3305 §4). A misinformed operator who
+        deletes a corrupt file to "recover" flips us from 'unreadable' → 'missing' on the
+        next tick, indistinguishable from bootstrap. Mitigation is (mechanism-side) the
+        'DO NOT delete' warning in the 'unreadable' notification, and (operator-side)
+        inspecting the `.bad-<utc>` backup before deletion. Preventing the hazard mechanically
+        would require a sentinel/lock file, which msg-3304 endorse ruled out by YAGNI.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $r = Read-JsonStateWithShape -Path $Path
+
+    # v4.1 three-verdict dispatch. Shape values from Read-JsonStateWithShape are:
+    #   missing | empty | object | array | scalar | parse-error
+    # We map them into three tick-policy verdicts:
+    #   'object'  -> 'valid'      (the ONLY shape treated as valid — see docstring §WHY
+    #                              'empty' SHAPE FALLS INTO UNREADABLE for the rationale)
+    #   'missing' -> 'missing'    (UNMIGRATED per msg-3306)
+    #   everything else ('empty', 'array', 'scalar', 'parse-error')
+    #             -> 'unreadable' (fail-closed, no double-allocation risk)
+    $result = @{
+        state         = @{}
+        verdict       = $null
+        shape         = "$($r.shape)"
+        disposition   = ''
+        flush_allowed = $false
+        log_line      = ''
+        notification  = $null
+        error         = $r.error
+    }
+
+    switch ($r.shape) {
+        'object' {
+            $result.state = $r.state
+            $result.verdict = 'valid'
+            $result.flush_allowed = $true
+            $result.log_line = "leases.json read OK at $Path (shape=object, resources=$($r.state.Keys.Count))"
+        }
+        'missing' {
+            # (a-missing) v4.1. This is NOT bootstrap — it is UNMIGRATED per msg-3306.
+            $result.state = @{}
+            $result.verdict = 'missing'
+            $result.disposition = 'lease-state-unreadable'
+            $result.flush_allowed = $false
+            $result.log_line = "leases.json missing at $Path — treated as UNMIGRATED (T-5 flush skipped, lease-requiring candidates deferred)"
+            $result.notification = @(
+                "leases.json missing at $Path — this is treated as UNMIGRATED",
+                "(see docs/deploy.md § migration runbook). If you have completed the",
+                "runbook and this appears again, an operator has deleted the file;",
+                "verify no physical holder is running before allowing bootstrap."
+            ) -join ' '
+        }
+        default {
+            # 'empty' | 'array' | 'scalar' | 'parse-error' — the fail-closed bucket. This
+            # covers the msg-2151 root-array/scalar/parse-error corruption vector class AND
+            # (per the pr-gate REQUEST_CHANGES on PR 286 v1, commit 5e6af92 class=correctness)
+            # the shape='empty' case: a blank / whitespace-only / `[]` file. Treating shape=
+            # empty as valid would have opened a silent-double-allocation hole if an active
+            # leases.json were accidentally truncated to whitespace — see the docstring
+            # §WHY 'empty' SHAPE FALLS INTO UNREADABLE for the full rationale. Shape guard
+            # has already stripped any metadata; the corrupt file itself is preserved on disk
+            # for operator inspection (T-5 flush is skipped so Save-CorruptedStateBackup does
+            # not fire in this path — v3/v4 explicitly chose to keep the operator's forensic
+            # evidence in place under (a-unreadable)).
+            $result.state = @{}
+            $result.verdict = 'unreadable'
+            $result.disposition = 'lease-state-unreadable'
+            $result.flush_allowed = $false
+            $errSuffix = if ($r.error) { " error=$($r.error)" } else { '' }
+            $result.log_line = "leases.json unreadable at $Path (shape=$($r.shape))$errSuffix — T-5 flush skipped, lease-requiring candidates deferred"
+            $result.notification = @(
+                "leases.json unreadable at $Path (verdict=$($r.shape)) —",
+                "DO NOT manually delete leases.json. Inspect and repair the file",
+                "directly, or verify no physical holder is running before",
+                "allowing bootstrap."
+            ) -join ' '
+        }
+    }
+
+    return $result
+}
+
 function Get-LeaseSummaryLines {
     <#
     .SYNOPSIS

@@ -49,8 +49,10 @@ msg-1443 のまま (`D-32` は magickit 側 `T-decision-page` に由来、
 
 ### D-33 — 無認証は**意図的な選択**である
 
-PUT 面に認証を掛けない。防壁は **tailnet 限定** (`*.taile861db.ts.net`、
-公開インターネットには出ていない)。
+PUT 面に認証を掛けない。防壁は **tailnet 限定** (`*.{{TAILNET_MAGICDNS_DOMAIN}}`、
+公開インターネットには出ていない。`{{TAILNET_MAGICDNS_DOMAIN}}` は
+`spirrow-docs` infra-registry §1 への追加待ちの mindwire-local placeholder。
+T-public-repo-carries-real-infra-values §5.1 = registry gap G4)。
 
 **失効条件**: `:8443` が tailnet の外に出る変更 (公開 / 別 proxy 経由 /
 認証境界の変更) が入った時点で本判断は無効。**そのとき測り直し、この
