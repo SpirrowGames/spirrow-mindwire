@@ -278,6 +278,28 @@ def _build_budgeted_pairs(raw_pairs: list[tuple[str, Any]], budget: int) -> list
     blocking invariant objection: every value must be a quoted JSON
     string, so a bare unquoted ``<value truncated>`` would violate the
     contract).
+
+    Post-quote overflow check (PR #288 PR-gate msg-3452 blocking
+    edge-case fix): budgeting on the RAW string can still overflow
+    ``per_pair`` if :func:`json.dumps` escape expansion inflates the
+    quoted form beyond its budget — a pathological value composed
+    entirely of chars that require escaping (e.g., ``"\\n" * 5000``
+    expands 2x; a value of ``"\\x01"`` expands 6x to ``\\u0001``).
+    Under the previous logic, such a pair would exceed
+    :data:`_FIELD_VALUE_MAX_LEN` and be dropped entirely by the outer
+    :func:`_join_pairs_bounded` safety net, obliterating the KEY too
+    — the exact regression Phase 2 was written to eliminate. Fix:
+    after quoting, if the pair's quoted length exceeds ``per_pair``,
+    swap the value for the ``"<value truncated>"`` marker. This keeps
+    the key visible under any escape-expansion factor without
+    over-truncating normal ASCII/UTF-8 text upfront: normal text
+    (expansion factor ~1.0) uses its full share; pathological escape
+    payloads degrade cleanly to the marker. Attempting instead to
+    bin-pack escaped lengths exactly (iterative ``json.dumps`` retries)
+    would violate YAGNI, and a pessimistic worst-case scale factor
+    (e.g., dividing v_budget by 6 upfront) would sacrifice normal-text
+    legibility to accommodate a rare edge case (Einstein's
+    ``speculative`` advisory ahead of this revision).
     """
     if not raw_pairs:
         return []
@@ -322,7 +344,18 @@ def _build_budgeted_pairs(raw_pairs: list[tuple[str, Any]], budget: int) -> list
                 result.append(f"{key_json}={truncated_marker_json}")
                 continue
             v_truncated = v_str[:v_budget] + f"…(+{len(v_str) - v_budget}ch)"
-        result.append(f"{key_json}={json.dumps(v_truncated, ensure_ascii=False)}")
+        pair = f"{key_json}={json.dumps(v_truncated, ensure_ascii=False)}"
+        # Post-quote overflow check (PR #288 PR-gate msg-3452 blocking
+        # edge-case fix). If ``json.dumps`` escape expansion inflated
+        # the quoted form beyond its per-pair budget (e.g., 5000
+        # newlines quoting to ``\\n`` x 5000 = 10000 chars), swap the
+        # value for the JSON-quoted marker so the KEY still survives
+        # the outer :func:`_join_pairs_bounded` cap. Without this swap
+        # the safety net would drop the whole pair — reproducing the
+        # exact regression Phase 2 was written to eliminate.
+        if len(pair) > per_pair:
+            pair = f"{key_json}={truncated_marker_json}"
+        result.append(pair)
     return result
 
 

@@ -888,6 +888,195 @@ def test_permission_denials_projection_multi_pair_with_one_large_value_preserves
     assert len(element) <= _FIELD_VALUE_MAX_LEN
 
 
+def test_build_budgeted_pairs_v_budget_below_one_fallback_is_json_quoted() -> None:
+    """PR #288 PR-gate msg-3452 blocking untested-branch fix.
+
+    Coverage-blind-spot pin. There are TWO fallback sites in
+    :func:`_build_budgeted_pairs` that emit the JSON-quoted
+    ``<value truncated>`` marker:
+
+    * the first fires when ``v_share < 1`` (key alone consumes the pair's
+      share — covered by
+      :func:`test_build_budgeted_pairs_fallback_is_json_quoted_under_huge_key`);
+    * the second fires when ``1 <= v_share <= v_footer_reserve``, so
+      ``v_share >= 1`` passes the first check but ``v_budget = v_share -
+      v_footer_reserve`` (= 12) still comes out below 1.
+
+    Before this pin, the second site had zero test coverage. Craft a key
+    whose ``json.dumps`` form leaves ``v_share`` in the ``[1, 12]``
+    window and assert the resulting element is a properly JSON-quoted
+    ``key=<marker>`` pair.
+    """
+    from spirrow_mindwire.adapters._sdk_result import (
+        _FIELD_VALUE_MAX_LEN,
+        _build_budgeted_pairs,
+    )
+
+    # per_pair for 1 pair = _FIELD_VALUE_MAX_LEN - 1 = 499.
+    # For an all-ASCII key of length N, json.dumps -> N + 2 chars.
+    # v_share = per_pair - len(key_json) - 3
+    #         = 499 - (N + 2) - 3 = 494 - N.
+    # To land v_share in [1, 12], choose N in [482, 493]. Pick N = 489
+    # -> v_share = 5, v_budget = 5 - 12 = -7 (< 1).
+    key = "K" * 489
+    result = _build_budgeted_pairs([(key, "x" * 100)], _FIELD_VALUE_MAX_LEN)
+    assert len(result) == 1
+    element = result[0]
+
+    # The value fell back to the JSON-quoted marker.
+    assert '="<value truncated>"' in element, (
+        f"1 <= v_share <= 12 fallback did not emit JSON-quoted marker: {element!r}"
+    )
+    # The key is preserved as a JSON-quoted string (still the load-bearing
+    # invariant even in this rarely-reached branch).
+    assert element.startswith('"' + key + '"='), (
+        f"key was not JSON-quoted in the v_budget<1 fallback: {element[:40]!r}"
+    )
+    # Structural quote count: 2 quotes around the key, 2 around the
+    # marker — total is a multiple of 4.
+    assert element.count('"') % 4 == 0
+
+
+def test_permission_denials_projection_escape_expansion_preserves_key() -> None:
+    """PR #288 PR-gate msg-3452 blocking edge-case fix.
+
+    Regression scenario: a value composed of characters that
+    :func:`json.dumps` must escape (e.g., ``"\\n" * 5000`` expands 2x,
+    ``"\\x01"`` expands 6x to ``\\u0001``). Under the previous
+    ``_build_budgeted_pairs``, the per-value budget was computed on the
+    RAW string length only. Escape expansion could then push the quoted
+    pair past its ``per_pair`` share, and — because the pair still
+    exceeded :data:`_FIELD_VALUE_MAX_LEN` — the outer
+    :func:`_join_pairs_bounded` safety net dropped the whole pair,
+    obliterating the KEY too. That reproduced the exact regression
+    Phase 2 was written to eliminate.
+
+    Fix: after quoting, if the pair exceeds ``per_pair``, swap the
+    value for the JSON-quoted ``<value truncated>`` marker so the key
+    survives. This test pins the fix with the naysayer's own example
+    (``{"tool_input": "\\n" * 5000}``).
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    # Naysayer's exact reproduction.
+    denial = {"tool_input": "\n" * 5000}
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    element = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(element, str)
+
+    # Key preserved — this is the load-bearing pin: pre-fix output was
+    # ``…(+1 pairs truncated)`` with no key visible at all.
+    assert '"tool_input"=' in element, (
+        f"escape-expansion regression: key dropped by outer safety net "
+        f"under a pathological escape-heavy value: {element!r}"
+    )
+
+    # Total length stays within the field cap.
+    assert len(element) <= _FIELD_VALUE_MAX_LEN
+
+    # Line integrity: no literal newlines or CRs leaked into the marker.
+    assert "\n" not in element
+    assert "\r" not in element
+
+    # A repeat with U+0001 (which json.dumps expands 6x to backslash-u0001)
+    # exercises the same code path via a different escape factor.
+    denial_ctrl = {"tool_input": "\x01" * 5000}
+    final_ctrl = _FakeResultMessage(result=None, permission_denials=[denial_ctrl])
+    detail_ctrl = capture_is_error_detail(final_ctrl)
+    element_ctrl = detail_ctrl["captured_fields"]["permission_denials"][0]
+    assert '"tool_input"=' in element_ctrl, (
+        f"escape-expansion regression with U+0001: key dropped: {element_ctrl!r}"
+    )
+    assert len(element_ctrl) <= _FIELD_VALUE_MAX_LEN
+
+
+def test_permission_denials_projection_escape_expansion_multi_pair_preserves_all_keys() -> None:
+    """PR #288 PR-gate msg-3452 blocking edge-case fix — multi-pair variant.
+
+    Same escape-expansion regression, but the dict has multiple keys.
+    Before the fix, the escape-heavy pair would exceed
+    :data:`_FIELD_VALUE_MAX_LEN` and be dropped by
+    :func:`_join_pairs_bounded`, and depending on ordering the join
+    would either lose that key alone or emit the ``pairs truncated``
+    footer. After the fix, all keys survive because the offending
+    value degrades locally to the ``<value truncated>`` marker.
+    """
+    from spirrow_mindwire.adapters._sdk_result import _FIELD_VALUE_MAX_LEN
+
+    denial = {
+        "tool_name": "Bash",
+        "tool_input": "\n" * 5000,
+        "rule": "branch-protection",
+        "reason": "unbypassable-ruleset",
+    }
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    element = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(element, str)
+
+    # Every key preserved despite escape-heavy value.
+    for key in ["tool_name", "tool_input", "rule", "reason"]:
+        assert f'"{key}"=' in element, (
+            f"key {key!r} dropped from multi-pair escape-expansion projection: {element!r}"
+        )
+
+    # The escape-heavy value collapsed to the marker; the others survived normally.
+    assert '"tool_input"="<value truncated>"' in element, (
+        f"escape-heavy value did not degrade to marker: {element!r}"
+    )
+    assert '"tool_name"="Bash"' in element
+    assert '"rule"="branch-protection"' in element
+    assert '"reason"="unbypassable-ruleset"' in element
+
+    assert len(element) <= _FIELD_VALUE_MAX_LEN
+    assert "\n" not in element
+    assert "\r" not in element
+
+
+def test_permission_denials_projection_normal_text_not_over_truncated_after_escape_fix() -> None:
+    """PR #288 PR-gate msg-3452 blocking edge-case fix — YAGNI pin.
+
+    Einstein's ``speculative`` advisory ahead of this revision warned
+    against implementing the escape-expansion fix via a pessimistic
+    up-front worst-case scale factor (e.g., dividing ``v_budget`` by 6
+    to accommodate ``\\uXXXX``). That would sacrifice normal-text
+    legibility to satisfy a rare edge case. The adopted post-quote
+    check MUST leave normal-text values untouched — this test pins
+    that: a plain-ASCII 5000-char value still gets a bounded prefix
+    plus ``…(+Nch)`` footer that captures ~4500 of the dropped chars,
+    same as before the escape-expansion fix.
+    """
+    huge = "x" * 5000
+    denial = {"tool_input": huge}
+    final = _FakeResultMessage(result=None, permission_denials=[denial])
+    detail = capture_is_error_detail(final)
+
+    element = detail["captured_fields"]["permission_denials"][0]
+    assert isinstance(element, str)
+
+    # Key preserved.
+    assert '"tool_input"=' in element
+    # Value renders as a bounded prefix, NOT the fallback marker.
+    assert '"<value truncated>"' not in element, (
+        "normal-text value was over-truncated to the marker: "
+        "post-quote check should only fire for escape-expansion overflow."
+    )
+    # And there's still a real footer reporting the dropped-char count.
+    import re
+
+    match = re.search(r"…\(\+(\d+)ch\)", element)
+    assert match is not None, f"no truncation footer in normal-text case: {element!r}"
+    dropped = int(match.group(1))
+    # Same guarantee as the correctness-fix test: substantial dropped count.
+    assert dropped >= 4000, (
+        f"normal-text over-truncation regression: footer reports "
+        f"only {dropped} dropped chars for a 5000-char input"
+    )
+
+
 def test_join_pairs_bounded_returns_full_join_when_it_fits() -> None:
     """PR #288 PR-gate msg-3339 advisory-eager-truncation fix.
 
