@@ -288,10 +288,12 @@ def extract_label(body: str) -> str | None:
     raw = match.group("label")
     lowered = raw.lower()
     if lowered.startswith("other:"):
-        # Preserve the reason text case; strip only the leading
-        # whitespace between the colon and the reason so the bounce
-        # log carries a canonical form for aggregation.
-        return "other:" + raw[len("other:") :].lstrip()
+        # Preserve the reason text case; strip BOTH leading whitespace
+        # (between the colon and the reason) and any trailing whitespace
+        # the greedy ``other:[^\r\n]*`` regex captured, so
+        # ``TIER-C: other: text  `` and ``TIER-C: other: text`` aggregate
+        # to the same canonical label. Fix for PR-gate objection #322-2.
+        return "other:" + raw[len("other:") :].strip()
     return lowered
 
 

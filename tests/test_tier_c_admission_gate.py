@@ -113,6 +113,18 @@ class TestExtractLabel:
         body = "TIER-C: other: some free-form reason here\nNEXT: human\n"
         assert extract_label(body) == "other:some free-form reason here"
 
+    def test_other_label_strips_trailing_whitespace(self) -> None:
+        """Regression pin for PR-gate objection #322-2.
+
+        The greedy ``other:[^\\r\\n]*`` regex captures the trailing
+        spaces before the newline; the canonicaliser must strip them
+        so ``other: text  `` and ``other: text`` aggregate together.
+        """
+        padded = "TIER-C: other: some reason with pad   \nNEXT: human\n"
+        tight = "TIER-C: other: some reason with pad\nNEXT: human\n"
+        assert extract_label(padded) == extract_label(tight)
+        assert extract_label(padded) == "other:some reason with pad"
+
     def test_no_label_returns_none(self) -> None:
         assert extract_label("no tier-c label anywhere\nNEXT: human\n") is None
 

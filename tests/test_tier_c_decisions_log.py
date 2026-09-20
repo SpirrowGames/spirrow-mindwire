@@ -164,6 +164,70 @@ class TestRetryLookup:
         lookup = build_retry_lookup(log)
         assert lookup("u-other", "alice") is False
 
+    def test_reused_uuid_after_admit_reopens_state(self, tmp_path: Path) -> None:
+        """Regression pin for PR-gate objection #322-1 (BLOCKING).
+
+        A UUID may be reused across independent bounce/admit cycles
+        (short-token spaces collide; sequence counters wrap). The
+        lookup must reflect the LAST observation, not the first
+        ``RETRY_ADMIT`` it stumbles onto. Before the fix, forward
+        iteration returned ``False`` early on the resolved cycle and
+        never reached the fresh ``BOUNCED`` — trapping the author in
+        an infinite loop.
+        """
+        log = tmp_path / "decisions.jsonl"
+        append_log_entries(
+            log,
+            [
+                # First cycle: bounce, then admit — resolved.
+                LogEntry(
+                    kind=LogKind.BOUNCED,
+                    payload={
+                        "ts": NOW.isoformat(),
+                        "author": "alice",
+                        "retry_uuid": "u-reused",
+                        "reason": "no-label",
+                    },
+                ),
+                LogEntry(
+                    kind=LogKind.RETRY_ADMIT,
+                    payload={
+                        "ts": NOW.isoformat(),
+                        "author": "alice",
+                        "retry_uuid": "u-reused",
+                        "reason": "label_corrected",
+                    },
+                ),
+                # Second cycle: same UUID reused for a fresh bounce.
+                LogEntry(
+                    kind=LogKind.BOUNCED,
+                    payload={
+                        "ts": NOW.isoformat(),
+                        "author": "alice",
+                        "retry_uuid": "u-reused",
+                        "reason": "unknown-label",
+                    },
+                ),
+            ],
+        )
+        # The LAST event for this UUID is a fresh BOUNCED ∴ unresolved.
+        assert build_retry_lookup(log)("u-reused", "alice") is True
+
+        # And a second RETRY_ADMIT closes the second cycle again.
+        append_log_entry(
+            log,
+            LogEntry(
+                kind=LogKind.RETRY_ADMIT,
+                payload={
+                    "ts": NOW.isoformat(),
+                    "author": "alice",
+                    "retry_uuid": "u-reused",
+                    "reason": "label_corrected",
+                },
+            ),
+        )
+        assert build_retry_lookup(log)("u-reused", "alice") is False
+
 
 class TestGateEndToEndAgainstLog:
     """Small integration: run the admission gate against a real JSONL

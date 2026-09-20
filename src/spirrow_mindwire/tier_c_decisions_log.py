@@ -131,10 +131,13 @@ def append_log_entries(
     Convenience for the common case where a single admission call
     returns a small list of entries (a legacy admit is one
     ``LABEL_MIGRATION`` row; a RETRY admit on a legacy label is one
-    ``LABEL_MIGRATION`` + one ``RETRY_ADMIT``, in that order). Order
-    matters because the RETRY lookup walks the file backwards and
-    the ``RETRY_ADMIT`` should sit after the ``LABEL_MIGRATION`` it
-    describes.
+    ``LABEL_MIGRATION`` + one ``RETRY_ADMIT``, in that order). The
+    RETRY lookup scans the file FORWARDS from oldest to newest row
+    and lets the last observation for a given UUID win (see
+    :func:`build_retry_lookup`) — so keeping the ``RETRY_ADMIT``
+    strictly after the ``LABEL_MIGRATION`` it describes is a
+    presentation convention (the log tells a coherent left-to-right
+    story of what the gate did), not a correctness requirement.
     """
     for entry in entries:
         append_log_entry(log_path, entry, thread=thread, msg_id=msg_id)
@@ -182,10 +185,16 @@ def build_retry_lookup(log_path: Path) -> RetryLookup:
 
     The rule (msg-3710 §1 "RETRY_ADMIT が append されたら uuid は
     resolved"): a UUID is an unresolved bounce for an author when the
-    log contains a ``BOUNCED`` row whose ``retry_uuid`` matches (that
-    is: the caller stamped the bounce's uuid in a ``retry_uuid`` field
-    on the ``BOUNCED`` row) and whose ``author`` matches, AND no
-    subsequent ``RETRY_ADMIT`` row references the same ``retry_uuid``.
+    LAST event in the log against that ``retry_uuid`` is a ``BOUNCED``
+    row for the same ``author`` — i.e. no later ``RETRY_ADMIT`` has
+    resolved it yet. Because a UUID may be reused across independent
+    bounce/admit cycles (e.g. a sequence counter, or a hash collision
+    in a short-token space), we cannot exit the scan at the first
+    ``RETRY_ADMIT`` we see: a subsequent ``BOUNCED`` with the same
+    UUID re-opens the state, and the truthful answer is the last
+    observation. So the scan reads the whole file forwards, updating
+    a single ``bounced`` flag as it goes, and returns whatever the
+    final state was. This is the fix for PR-gate objection #322-1.
 
     Callers that want a different UUID field name should re-derive
     this callable — the field name is a contract between the gate's
@@ -195,6 +204,13 @@ def build_retry_lookup(log_path: Path) -> RetryLookup:
     """
 
     def _lookup(uuid: str, author: str) -> bool:
+        # Read the whole file forwards; let the last observation for
+        # this UUID win. A ``BOUNCED`` for this ``(uuid, author)`` pair
+        # opens the state; ANY later ``RETRY_ADMIT`` for the same UUID
+        # closes it (the gate authored the admission itself so the
+        # author on the ADMIT row may legitimately be a system
+        # principal — matching only on UUID is the right rule); a
+        # further ``BOUNCED`` with the same UUID re-opens it.
         bounced = False
         for row in _iter_rows(log_path):
             kind = row.get("kind")
@@ -203,12 +219,7 @@ def build_retry_lookup(log_path: Path) -> RetryLookup:
                 if row_uuid == uuid and row.get("author") == author:
                     bounced = True
             elif kind == LogKind.RETRY_ADMIT.value and row_uuid == uuid:
-                # Any later RETRY_ADMIT (regardless of author)
-                # resolves the bounce. The gate authored the
-                # admission itself so the author on the ADMIT
-                # row can legitimately be a system principal;
-                # matching only on UUID is the right rule here.
-                return False
+                bounced = False
         return bounced
 
     return _lookup
