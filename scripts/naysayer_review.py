@@ -53,9 +53,12 @@ import argparse
 import asyncio
 import sys
 
+from spirrow_mindwire.conductor.roster import RoleResolutionError, derive_identity_by_role
+from spirrow_mindwire.config import load_settings
 from spirrow_mindwire.magickit.client import StreamableHttpChatroomMcp
 from spirrow_mindwire.naysayer.pr_review import NaysayerPrReviewDriver
 from spirrow_mindwire.orchestrator import PrReviewOrchestrator
+from spirrow_mindwire.value_objects import Role
 
 # Windows consoles default to legacy codepages (cp932) that can't encode the naysayer's reply /
 # em-dashes; emit UTF-8 so print() doesn't raise.
@@ -75,6 +78,24 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
+    # Resolve the implementer persona from the SAME roster the conductor uses at runtime
+    # (T-hand-fired-gate-cannot-name-the-implementer msg-3885 D-1). Before this landed, the
+    # manual driver silently omitted ``implementer=`` and every REQUEST_CHANGES relay routed
+    # to ``NEXT: human`` — the design thread parked with no dispatch. Fail-loud (exit 3): the
+    # roster is the daemon's [conductor].roster SOT, an operator is at the terminal, so a
+    # misconfigured roster prints the exact miswiring and stops before the gate is billed.
+    # ``Role.IMPLEMENTER`` is the same role the daemon's own ``Conductor(...)`` construction
+    # uses in production (``loop_runner.py`` never overrides the ctor default — msg-3887); the
+    # ``implementer_role`` ctor arg is a testing seam without a config surface, and passing the
+    # literal here is what keeps the two lanes byte-identical rather than routing through a
+    # settings field that does not exist.
+    settings = load_settings()
+    try:
+        implementer = derive_identity_by_role(settings.conductor.roster, Role.IMPLEMENTER)
+    except RoleResolutionError as exc:
+        print(f"[naysayer-review] {exc}", file=sys.stderr)
+        raise SystemExit(3) from exc
+
     mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or package default
     # The driver resolves Lexora + the spirrowgames-ops GitHub token from env.
     driver = NaysayerPrReviewDriver()
@@ -83,7 +104,10 @@ async def main() -> None:
     print(f"[naysayer-review] opening review thread for {args.pr} (Gemini review, billed) ...")
     try:
         thread_ref, outcome, relay = await orchestrator.fire_pr_review(
-            project=args.project, pr_ref=args.pr, design_thread=args.design_thread
+            project=args.project,
+            pr_ref=args.pr,
+            design_thread=args.design_thread,
+            implementer=implementer,
         )
         # Both destinations are named: printing only the ledger id is what supplied the one
         # wrong answer an operator could reach for when asked for a design thread (msg-2765 §2).

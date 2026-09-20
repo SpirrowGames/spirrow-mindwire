@@ -103,6 +103,7 @@ from .gate_records import (
     verdict_heads,
 )
 from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, resolve_handoff
+from .roster import RoleResolutionError, derive_identity_by_role
 
 if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
@@ -290,17 +291,21 @@ class Conductor:
         self._control = control
         self._control_state: ControlState = BASELINE_CONTROL_STATE
         # The implementer persona is derived from the roster (the single source of truth for role
-        # assignment) — not a ctor arg, which would risk disjoint state (Tier B msg-567 #2).
-        self._implementer_identity = self._derive_implementer_identity()
-
-    def _derive_implementer_identity(self) -> str:
-        """The roster persona filling the implementer role, or "" if there is not exactly one.
-
-        Used for the PR-gate RC→fix dispatch (PR-2b-2). With zero or several implementer personas a
-        PR-gate REQUEST_CHANGES routes to the human instead of guessing (fail-safe).
-        """
-        matches = [name for name, role in self._roster.items() if role is self._implementer_role]
-        return matches[0] if len(matches) == 1 else ""
+        # assignment) — not a ctor arg, which would risk disjoint state (Tier B msg-567 #2). The
+        # resolver lives in :mod:`.roster` and is shared with the hand-run PR-gate driver so both
+        # lanes read the same code against the same SOT
+        # (T-hand-fired-gate-cannot-name-the-implementer msg-3885). The daemon's fail direction
+        # here is fail-safe (``None`` → the RC→fix dispatch falls through to ``NEXT: human``,
+        # byte-identical to the pre-refactor ``""`` sentinel); the hand-run driver's fail
+        # direction is fail-loud (msg-3849). Scope fence: no ``logger.warning`` in this except —
+        # that would be a conductor-side observability change, explicitly out of scope for this
+        # fix (msg-3851 §Why the conductor swallows).
+        try:
+            self._implementer_identity: str | None = derive_identity_by_role(
+                self._roster, self._implementer_role
+            )
+        except RoleResolutionError:
+            self._implementer_identity = None
 
     async def run(self) -> ConductorOutcome:
         """Drive the thread turn-by-turn until a stop condition; return the outcome.
@@ -435,7 +440,8 @@ class Conductor:
                         # what lets the NEXT tick's R5 tell a second red apart from this one.
                         route_msg = await self._post_ci_route(parsed_ref.slug, decision, rollup)
                         route_msg_id = _msg_id(route_msg)
-                        if not route_msg_id or not self._implementer_identity:
+                        implementer_identity = self._implementer_identity
+                        if not route_msg_id or not implementer_identity:
                             # Same two fail-safes as the REQUEST_CHANGES path: without a msg_id
                             # the no-progress guard cannot track the continue path, and without
                             # exactly one implementer persona there is nobody to dispatch.
@@ -446,36 +452,37 @@ class Conductor:
                                 forced,
                                 forced_saveable,
                             )
-                        handle = sessions.get(self._implementer_identity)
+                        handle = sessions.get(implementer_identity)
                         if handle is None:
                             handle = await self._dispatcher.spawn_instance(
                                 self._thread_ref,
                                 self._implementer_role,
-                                self._implementer_identity,
+                                implementer_identity,
                             )
-                            sessions[self._implementer_identity] = handle
+                            sessions[implementer_identity] = handle
                         await self._dispatcher.dispatch(handle, self._to_event(route_msg, messages))
                         processed_msg_id = route_msg_id
                         continue
                     # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through.
                 verdict, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
+                implementer_identity = self._implementer_identity
                 # A missing relay id (post result with no msg_id) breaks no-progress tracking on
                 # the continue path, so fail-safe to the human instead of re-processing the relay
                 # next round (Tier B msg-572 #2). APPROVE / COMMENT also stop at the human.
                 if (
                     not relay_msg_id
                     or verdict is not ReviewEvent.REQUEST_CHANGES
-                    or not self._implementer_identity
+                    or not implementer_identity
                 ):
                     last = relay_msg_id or latest_msg_id
                     return self._stop(round_index, StopReason.HUMAN, last, forced, forced_saveable)
-                handle = sessions.get(self._implementer_identity)
+                handle = sessions.get(implementer_identity)
                 if handle is None:
                     handle = await self._dispatcher.spawn_instance(
-                        self._thread_ref, self._implementer_role, self._implementer_identity
+                        self._thread_ref, self._implementer_role, implementer_identity
                     )
-                    sessions[self._implementer_identity] = handle
+                    sessions[implementer_identity] = handle
                 # Dispatch the implementer on the RELAY event (the verdict + critique), not its own
                 # pr-review trigger — else it wakes blind to what it must fix (Tier B msg-567 #1).
                 await self._dispatcher.dispatch(handle, self._to_event(relay_msg, messages))
