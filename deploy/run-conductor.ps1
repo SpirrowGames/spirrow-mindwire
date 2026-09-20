@@ -36,19 +36,20 @@ if (-not $env:MINDWIRE_IMPLEMENTER_BASE_URL) { $env:MINDWIRE_IMPLEMENTER_BASE_UR
 # INTERNAL INFRA endpoints — the operator resolves values from [[platform:infra-registry]] and
 # sets them as persistent user env vars (sourced from Vaultwarden, mirroring the token below).
 # Validation lives in Python — the wrapper does NOT pre-flight (single source of truth,
-# PR #296 pr-gate advisory msg-3484 / msg-3516 / T-public-repo-carries-real-infra-values):
+# PR #296 pr-gate advisory msg-3484 / msg-3516 / PR #300 pr-gate advisory msg-3591 /
+# T-public-repo-carries-real-infra-values):
 #
-#   Variable                       | Required | Checked at                    | Python owner
-#   -------------------------------|----------|-------------------------------|-------------
-#   MINDWIRE_MAGICKIT_MCP_URL      | required | daemon startup                | spirrow_mindwire.magickit.client (magickit_mcp_url)
-#   MINDWIRE_NAYSAYER_BASE_URL     | required | first naysayer summon         | spirrow_mindwire.adapters.naysayer_sdk (NaysayerSdkAdapter)
-#   MINDWIRE_LEXORA_URL            | optional | on use (loopback default)     | spirrow_mindwire.lexora.client (lexora_url)
+#   Variable                       | Python owner
+#   -------------------------------|-------------
+#   MINDWIRE_MAGICKIT_MCP_URL      | spirrow_mindwire.magickit.client (magickit_mcp_url)
+#   MINDWIRE_NAYSAYER_BASE_URL     | spirrow_mindwire.adapters.naysayer_sdk (NaysayerSdkAdapter)
+#   MINDWIRE_LEXORA_URL            | spirrow_mindwire.lexora.client (lexora_url)
 #
 # The Python owner listed above is the ONE place that raises on a missing / empty value, records
-# the ADR rationale, and documents the process-exit story (per --mode where it diverges). See
-# that module for the fail-loud contract, the mode-specific exit timing, and why there is no
-# in-code fallback. Do not paraphrase those docs here — that is the dual-management drift the
-# advisory called out.
+# whether the variable is required or optional, when it is checked (startup vs. first use vs. lazy
+# default), the ADR rationale, and the process-exit story (per --mode where it diverges). See
+# that module for the fail-loud contract and why there is no in-code fallback. Do not paraphrase
+# those facts here — that is the dual-management drift the advisory called out.
 
 # --- secret precondition (fail loud, never hardcode) -------------------------------------------
 if (-not $env:MINDWIRE_NAYSAYER_GITHUB_TOKEN) {
