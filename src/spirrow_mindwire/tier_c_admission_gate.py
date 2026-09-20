@@ -258,9 +258,21 @@ _RETRY_LINE_RE: re.Pattern[str] = re.compile(
 # a CRLF-terminated ``TIER-C: other: reason\r\n`` does not capture the CR
 # into the reason (a stray ``\r`` in the reason string would poison the
 # canonical form the ``.strip()`` step relies on).
+#
+# The generic-enum sub-pattern accepts BOTH kebab-case (``merge-protected``)
+# and snake_case (``merge_protected``): ``[A-Za-z][A-Za-z0-9_-]*``. The
+# kebab convention is the one the four Tier-C intents actually use, but
+# authors typing an unrecognised label frequently reach for underscores
+# — an author-facing regex that only tolerates hyphens forces a
+# snake_case typo (``TIER-C: unknown_label``) all the way out of the
+# grammar, and the caller then hits the ``NO_LABEL`` bounce arm ("the
+# handoff carried no TIER-C: line") when the label was visibly present.
+# Widening the character class routes such labels into the correct
+# ``UNKNOWN_LABEL`` arm whose hint text names the four valid intents.
+# Fix for PR-gate objection #322-10 (structure).
 _LABEL_LINE_RE: re.Pattern[str] = re.compile(
     r"^[ \t]*TIER-C:[ \t]*"
-    r"(?P<label>other:[^\r\n]*|unsure:goal\?|[A-Za-z][A-Za-z0-9-]*)"
+    r"(?P<label>other:[^\r\n]*|unsure:goal\?|[A-Za-z][A-Za-z0-9_-]*)"
     r"[ \t]*\r?$",
     re.IGNORECASE | re.MULTILINE,
 )

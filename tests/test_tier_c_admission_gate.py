@@ -170,6 +170,30 @@ class TestExtractLabel:
         body_crlf = "TIER-C: other: some reason\r\nNEXT: human\r\n"
         assert extract_label(body_crlf) == "other:some reason"
 
+    def test_snake_case_label_parses(self) -> None:
+        """Regression pin for PR-gate objection #322-10 (structure).
+
+        The generic-enum sub-pattern must accept ``_`` in the label
+        token so a snake_case typo (``TIER-C: unknown_label``) parses
+        as a label and is routed to the ``UNKNOWN_LABEL`` bounce arm
+        rather than falling through to the ``NO_LABEL`` arm ("the
+        handoff carried no TIER-C: line"). The parser is deliberately
+        lenient about the character class so the DOWNSTREAM enum check
+        is the one that decides admissibility — before this widening,
+        the grammar's character class silently swallowed labels a
+        human reader would call obvious typos.
+        """
+        body = "TIER-C: unknown_label\nNEXT: human\n"
+        assert extract_label(body) == "unknown_label"
+
+    def test_mixed_hyphen_underscore_label_parses(self) -> None:
+        """Companion pin for #322-10: mixing ``-`` and ``_`` in a
+        single token still parses. The parser is a permissive
+        character-level shape check, not the admission enum check.
+        """
+        body = "TIER-C: my_novel-label\nNEXT: human\n"
+        assert extract_label(body) == "my_novel-label"
+
 
 class TestExtractRetryUuid:
     """The RETRY prefix parser is opaque about UUID format on purpose.
@@ -350,6 +374,32 @@ class TestMainLabelEvaluation:
         entry = result.log_entries[0]
         assert entry.kind is LogKind.BOUNCED
         assert entry.payload["label"] == "my-invented-label"
+
+    def test_snake_case_unknown_label_routes_to_unknown_not_no_label(self) -> None:
+        """Regression pin for PR-gate objection #322-10 (structure).
+
+        Before the character-class widening, a snake_case label like
+        ``unknown_label`` failed the parser regex entirely, and the
+        gate bounced with ``NO_LABEL`` — telling the author "you did
+        not attach a TIER-C: line" when the author had visibly typed
+        one. The correct outcome is ``UNKNOWN_LABEL`` whose hint text
+        names the four valid intents. The rule id ``R1-unknown-label``
+        is what makes this test tell the two arms apart.
+        """
+        body = "TIER-C: unknown_label\nNEXT: human\n"
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_no_retries,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
+        assert result.verdict is AdmissionVerdict.BOUNCE
+        assert result.rule == "R1-unknown-label"
+        assert result.bounce_reason is BounceReason.UNKNOWN_LABEL
+        entry = result.log_entries[0]
+        assert entry.kind is LogKind.BOUNCED
+        assert entry.payload["label"] == "unknown_label"
 
 
 # ---------------------------------------------------------------------------
