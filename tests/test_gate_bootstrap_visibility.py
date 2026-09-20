@@ -1828,29 +1828,30 @@ async def test_w2_post_refused_thread_resolved_is_distinct_from_generic_post_fai
 
 @pytest.mark.anyio
 async def test_visibility_state_isolates_repos_under_same_project() -> None:
-    """Two repos under one ``project`` must not share a cooldown slot.
+    """Independent sibling repos must NOT be rate-limited by each other's floor.
 
-    PR-gate on PR #277 correctness finding, T-new-project-gate-bootstrap
-    msg-3159 §1 / msg-3750 §2. The reproduction: production
-    ``config/sweep.json`` maps ``spirrow-magickit`` onto three different
-    ``repo_dir``s (Bohr msg-2779 §5). If a close succeeds for one of them,
-    the visibility hook that fires on the success path MUST NOT touch the
-    cooldown state of the other two — those cooldowns are what stop the
-    (still-failing) siblings from re-posting on their very next tick.
+    T-new-project-gate-bootstrap msg-3750 §2, corrected against the
+    PR-gate on head e1185b6's ``docs`` advisory (msg-3159's original
+    prose named the wrong mechanism — see the "Instance-level keying"
+    paragraph in :mod:`spirrow_mindwire.gate_bootstrap_visibility` for
+    the whole story). The dominant observable failure of the old
+    ``project``-keyed schema is that sibling A's ``on_close_failure``
+    writes ``floors[project]`` and sibling B's later ``on_close_failure``
+    reads the same slot, finds A's entry, and returns ``floor_blocked``
+    — B's independent failure never reaches its own alert thread.
 
-    Sequence:
-      1. Sibling A (``magickit-impl``) fails to close → a report is posted
-         → both a floor entry and an episode entry are written.
-      2. Sibling B (``mindwire-impl`` under the SAME ``project``) closes
-         successfully → ``on_close_success`` fires with B's ``thread_id``.
-      3. Sibling A tries again immediately (same 24h window). The floor
-         from step 1 MUST still be in effect — the assertion is on the
-         post count, which pins the rate limiter's behaviour rather than
-         on state-map internals.
+    Sequence (exercises exactly that mechanism):
+      1. Sibling A (``magickit-impl``) fails to close → ``on_close_failure``
+         writes A's floor and posts A's report.
+      2. Five minutes later, sibling B (``mindwire-impl`` under the SAME
+         ``project``) fails independently. B's floor lookup MUST see nothing
+         (Instance-level isolation) and B's report MUST post.
 
-    A regression that re-keys either map by ``project`` will fail step 3:
-    B's success in step 2 would delete A's shared floor, so step 3 would
-    write a second attempt.
+    Under the pre-fix schema (project-keyed floors), step 2 would find A's
+    floor at ``floors["spirrow-magickit"]`` (5min < 24h) and return
+    ``floor_blocked`` — the concrete regression this test reds against.
+    Under the fixed schema (thread_id-keyed floors), the two siblings hold
+    independent slots and both get to post.
     """
     project = "spirrow-magickit"
     sibling_a = Path("/tmp/gate-bootstrap-magickit-impl")
@@ -1864,7 +1865,7 @@ async def test_visibility_state_isolates_repos_under_same_project() -> None:
     vis = CloseFailureVisibility(store, now=now)
     mcp = _RecordingMcp()  # default: post succeeds
 
-    # Step 1: sibling A posts one failure report.
+    # Step 1: sibling A fails, posts, writes its floor.
     r1 = await vis.on_close_failure(
         mcp,
         project=project,
@@ -1875,12 +1876,52 @@ async def test_visibility_state_isolates_repos_under_same_project() -> None:
     assert r1.action == "posted"
     assert len(mcp.post_calls()) == 1
 
-    # Step 2: sibling B's close succeeds → visibility hook clears B's episode.
-    vis.on_close_success(project=project, thread_id=tid_b)
+    # Step 2: 5 minutes later, sibling B (different repo, same project)
+    # fails independently. Under the pre-fix ``project``-keyed schema
+    # this would floor_block against A's cooldown; under the fixed
+    # ``thread_id``-keyed schema each sibling has its own floor slot.
+    r2 = await vis.on_close_failure(
+        mcp,
+        project=project,
+        thread_id=tid_b,
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("B close refused"),
+    )
+    assert r2.action == "posted", (
+        f"sibling B was rate-limited by sibling A's cooldown — the "
+        f"PR-gate #277 correctness reproduction (msg-3750 §2). The old "
+        f"schema keyed floors by ``project`` alone, so B's independent "
+        f"failure looked up A's entry at 5min and returned "
+        f"floor_blocked. Got action={r2.action!r} reason={r2.reason!r}"
+    )
 
-    # Step 3: sibling A fails again inside the 24h window. If the shared
-    # ``project`` key were the cooldown identity, step 2 would have wiped
-    # A's floor and this call would attempt a second post.
+    # Two independent posts landed, one per sibling.
+    assert len(mcp.post_calls()) == 2, (
+        f"expected two independent post attempts (one per sibling); got "
+        f"{len(mcp.post_calls())}. Each sibling must hold its own floor."
+    )
+
+    # Both siblings' floors coexist in state — the load-bearing structural
+    # check the rewrite of this test made possible: if either was missing,
+    # the rate limiter's identity is not per-thread.
+    assert tid_a in store.state.floors, (
+        "sibling A's floor was not recorded — the write-ahead step's "
+        "``floors[thread_id] = ...`` did not fire for A"
+    )
+    assert tid_b in store.state.floors, (
+        "sibling B's floor was not recorded — the write-ahead step's "
+        "``floors[thread_id] = ...`` did not fire for B (this is the "
+        "assertion a project-keyed regression would fail: B's write "
+        "would have overwritten A's entry at the shared project slot)"
+    )
+    # And neither entry accidentally aliases the other.
+    assert store.state.floors[tid_a] is not store.state.floors[tid_b]
+
+    # Third check: sibling A tries again inside its own 24h window. This
+    # time the floor MUST block (A's own cooldown, keyed by its own
+    # thread_id). This half of the test guards the OTHER direction: a
+    # naive fix that removed the floor entirely would still pass step 2
+    # but would let A itself spam.
     r3 = await vis.on_close_failure(
         mcp,
         project=project,
@@ -1889,20 +1930,15 @@ async def test_visibility_state_isolates_repos_under_same_project() -> None:
         exc=GateBootstrapCloseError("A close still refused"),
     )
     assert r3.action == "floor_blocked", (
-        f"sibling B's on_close_success erased sibling A's cooldown — the "
-        f"PR-gate #277 correctness reproduction (msg-3159 finding #1). "
-        f"Got action={r3.action!r} reason={r3.reason!r}"
+        f"sibling A's own 24h floor did not block a same-thread retry — "
+        f"got action={r3.action!r} reason={r3.reason!r}. The per-thread "
+        f"floor must still enforce the 24h bound within one thread."
     )
-    # Load-bearing: post count is bounded by the floor across the whole
-    # sequence, EVEN with a sibling's success intervening.
-    assert len(mcp.post_calls()) == 1, (
-        f"expected exactly one post attempt across the isolation window; "
-        f"got {len(mcp.post_calls())} — the rate limiter is not per-thread"
+    assert len(mcp.post_calls()) == 2, (
+        "A's second failure attempt should NOT have produced a third "
+        "post; the per-thread floor bounds each thread to one attempt "
+        "per 24h"
     )
-    # And both siblings' floors coexist independently in state.
-    assert tid_a in store.state.floors
-    # Sibling B never failed so it has no floor — asserting neither is
-    # the check here, but assertion (a) above is what pins the behaviour.
 
 
 def test_visibility_state_file_v2_starts_empty_when_v1_exists(tmp_path: Path) -> None:

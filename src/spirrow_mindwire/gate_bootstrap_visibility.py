@@ -80,24 +80,56 @@ writes them separately so a future edit cannot accidentally clear the floor
 by clearing an episode (D-2''' Rule 2 — a rate limiter must never be reset by
 the condition it is rate-limiting).
 
-Instance-level keying (PR-gate on PR #277 blocking `correctness` / T-new-project-
-gate-bootstrap msg-3159, msg-3749, msg-3750). The prior schema keyed both
-records by ``project`` alone. PR #277 fixed the alert *identity* — the
-chatroom thread_id is now composed from ``(project, repo_dir)`` so two
-distinct repos sharing one ``project`` (production ``config/sweep.json``
-maps ``spirrow-magickit`` onto three different ``repo_dir``s, Bohr
+Instance-level keying (PR-gate on PR #277 blocking `correctness` /
+T-new-project-gate-bootstrap msg-3159, msg-3749, msg-3750, msg-3752
+follow-up). The prior schema keyed both records by ``project``
+alone. PR #277 fixed the alert *identity* — the chatroom thread_id
+is now composed from ``(project, repo_dir)`` so two distinct repos
+sharing one ``project`` (production ``config/sweep.json`` maps
+``spirrow-magickit`` onto three different ``repo_dir``s, Bohr
 msg-2779 §5) do not overwrite each other's threads. The rate-limiter,
-however, was left keyed by ``project``: a successful ``on_close_success``
-in one of those repos silently deleted the shared ``project`` cooldown
-entry that a still-failing sibling repo was relying on, causing the
-failing repo to bypass the 24-hour floor on its very next tick. The
-fix is to make **both** records agree with the identity used for the
-alert thread itself — keyed by ``thread_id``. Consequence: for
-"one project ↔ one repo" installs the observable behaviour is
-unchanged; for the multi-repo case each repo's cooldown is now
-independent. The invariant test
-``test_visibility_state_isolates_repos_under_same_project`` pins the
-new behaviour precisely against the PR-gate reproduction scenario.
+however, was left keyed by ``project``: sibling repos of the same
+project shared one floor slot AND one episode slot, with two
+observable consequences and one intermediate mode that reads plausibly
+but does NOT occur:
+
+  * **Cross-sibling floor blocking (dominant observable failure).**
+    Sibling A fails at t=0 and its ``on_close_failure`` writes
+    ``floors[project]``. Sibling B fails at any t within the 24h
+    window; B's floor lookup reads ``floors[project]``, finds A's
+    entry, and returns ``floor_blocked`` — B's genuinely independent
+    failure never reaches its own alert thread. This is what the
+    ``test_visibility_state_isolates_repos_under_same_project``
+    regression pins.
+  * **Cross-sibling dedup overwrite (secondary, > 24h after A's post).**
+    If B's failure lands more than 24h after A's, B's write-ahead
+    overwrites ``episodes[project]`` (its ``thread_id`` and
+    ``signature`` both differ from A's, so the code treats it as a
+    new episode). A's ``reported_at`` mark is lost, and A's next
+    failure signature is treated as a fresh episode rather than a
+    dedup hit.
+  * **``on_close_success`` deleting a sibling's cooldown floor —
+    this mechanism does NOT exist and is called out here because
+    the PR-gate on head b82f8f4 (msg-3159) named it as the bug
+    surface, and a later reader arriving through that reference
+    would otherwise chase a defect that is not in the code.**
+    ``on_close_success`` never touches ``floors`` under any schema,
+    and its ``episodes`` lookup was already guarded by
+    ``if episode.thread_id != thread_id: return`` — under PR #277's
+    ``thread_id`` composition, a sibling closing another sibling's
+    ``episodes[project]`` entry hits that guard and returns without
+    a delete. The PR-gate on head e1185b6 named the earlier prose
+    (which followed msg-3159 verbatim) as a hallucinated mechanism
+    and the correction landed with this paragraph.
+
+The fix is to make **both** records agree with the identity used
+for the alert thread itself — keyed by ``thread_id``. Consequence:
+for "one project ↔ one repo" installs the observable behaviour is
+unchanged; for the multi-repo case each repo's cooldown and dedup
+record are now independent. The invariant test
+``test_visibility_state_isolates_repos_under_same_project`` pins
+the new behaviour precisely against the dominant failure mode
+(cross-sibling floor blocking).
 
 Evaluation order, in this order and no other, so the 24h upper bound holds
 even if the dedup key drifts:

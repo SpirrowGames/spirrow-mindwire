@@ -349,6 +349,46 @@ def test_thread_id_for_handles_windows_and_posix_paths() -> None:
     assert forward == backward == upper == mixed
 
 
+def test_thread_id_for_preserves_posix_case_sensitivity() -> None:
+    """POSIX paths that differ only in case MUST land on DIFFERENT thread ids.
+
+    Pins the PR-gate on head e1185b6 blocking `edge-case`. POSIX filesystems
+    are case-sensitive: ``/tmp/Repo`` and ``/tmp/repo`` are two distinct
+    directories, and folding case across them would re-introduce the same
+    cross-repo collision PR #277 was opened to close. Windows detection in
+    :func:`_normalize_repo_dir` is syntactic — a drive-letter prefix or a UNC
+    prefix — so a path that starts with a plain ``/`` is treated as POSIX
+    and its case is preserved.
+
+    A regression that reverts to an unconditional ``.lower()`` would fail
+    this test.
+    """
+    project = "spirrow-example"
+    lower = thread_id_for(project, "/tmp/gate-bootstrap/repo")
+    mixed = thread_id_for(project, "/tmp/gate-bootstrap/Repo")
+    upper = thread_id_for(project, "/opt/Workspace/repo")
+    also_lower = thread_id_for(project, "/opt/workspace/repo")
+    assert lower != mixed, (
+        "POSIX paths ``/tmp/gate-bootstrap/repo`` and "
+        "``/tmp/gate-bootstrap/Repo`` are distinct filesystem entities; "
+        "``_normalize_repo_dir`` must not fold case across them"
+    )
+    assert upper != also_lower, (
+        "POSIX paths ``/opt/Workspace/repo`` and ``/opt/workspace/repo`` "
+        "are distinct filesystem entities; ``_normalize_repo_dir`` must "
+        "not fold case across them"
+    )
+    # Windows-shaped path with the same characters MUST still fold case
+    # (the fix is POSIX-only), otherwise Windows semantics break.
+    win_lower = thread_id_for(project, "C:/tmp/gate-bootstrap/repo")
+    win_mixed = thread_id_for(project, "C:/tmp/gate-bootstrap/Repo")
+    assert win_lower == win_mixed, (
+        "Windows path case-folding regressed: ``C:/tmp/Repo`` and "
+        "``C:/tmp/repo`` name the same filesystem entity and must land on "
+        "one thread id (Bohr msg-3122 §2 change 3)"
+    )
+
+
 def test_thread_id_for_disambiguates_slug_collisions() -> None:
     """Einstein msg-3121's blocking reversal, pinned as a regression test.
 

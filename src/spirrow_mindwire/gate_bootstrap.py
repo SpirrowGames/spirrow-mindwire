@@ -434,19 +434,58 @@ def inspect_gate(
 def _normalize_repo_dir(repo_dir: Any) -> str:
     """Return a canonical form of ``repo_dir`` for :func:`thread_id_for`.
 
-    Windows / POSIX 両対応の正準形. Backslashes are folded to forward slashes
-    and the whole string is lowercased so Windows' case-insensitive filesystem
-    semantics land the same identity on ``C:/foo`` and ``c:/FOO`` — which name
-    the same entity and must map to the same thread id.
+    Windows / POSIX 両対応の正準形. Two normalisations run:
 
-    This is the ONE normalisation used by :func:`thread_id_for` for BOTH the
-    slug and the hash suffix (Bohr msg-3122 §2 change 3): using two different
-    normalisations here would cause ``C:/foo`` and ``c:/FOO`` to slugify to
-    the same string but hash to different digests, producing two thread ids
-    for a single filesystem entity — the mirror of the collision this whole
-    change exists to close.
+    1. **Backslash folding**. Every ``\\`` becomes ``/``. Windows can
+       spell the same filesystem entity with either separator, and the
+       ``PathLike`` values the sweep contract receives come from a
+       ``argparse type=Path`` boundary that keeps whichever separator
+       the caller wrote. Folding early makes the rest of the function
+       separator-agnostic.
+    2. **Case folding — Windows only**. Windows filesystems are
+       case-insensitive by default (``C:/foo`` and ``c:/FOO`` name the
+       same entity), so the same entity must map to the same thread id.
+       POSIX filesystems are case-sensitive: ``/tmp/Repo`` and
+       ``/tmp/repo`` are two distinct directories, and folding case
+       across them would re-introduce the exact cross-repo collision
+       PR #277 exists to close (PR-gate on head ``e1185b6`` blocking
+       ``edge-case``: an unconditional ``.lower()`` on POSIX turns two
+       distinct sibling repos into one identity, and their alert
+       threads AND visibility cooldowns start overwriting each other).
+
+    The Windows detection reads the first slash-folded characters
+    only — a drive-letter prefix (``[A-Za-z]:``) or a UNC prefix
+    (``//`` after folding) is a Windows path. Any other shape is
+    POSIX. The rule is deliberately syntactic on the ``repo_dir``
+    string, not on the runtime OS: a Windows daemon host may in
+    principle receive a POSIX path in its config, and the identity
+    of that path must not change if the sweep migrates hosts.
+
+    This is the ONE normalisation used by :func:`thread_id_for` for
+    BOTH the slug and the hash suffix (Bohr msg-3122 §2 change 3):
+    using two different normalisations here would cause ``C:/foo``
+    and ``c:/FOO`` to slugify to the same string but hash to different
+    digests, producing two thread ids for a single filesystem entity —
+    the mirror of the collision this whole change exists to close.
     """
-    return str(repo_dir).replace("\\", "/").lower()
+    slashed = str(repo_dir).replace("\\", "/")
+    # Windows path: drive-letter (``C:/``) or UNC (``//server/share``)
+    # prefix, in either case AFTER slash-folding. Preserves case only
+    # in the tail, but Windows' whole-path case-insensitive semantics
+    # justify a whole-string ``.lower()`` here.
+    if _WINDOWS_PATH_RE.match(slashed) or slashed.startswith("//"):
+        return slashed.lower()
+    # POSIX path: preserve case. ``/tmp/Repo`` and ``/tmp/repo`` are
+    # distinct filesystem entities; either identity is authoritative
+    # and must reach a distinct hash suffix in :func:`thread_id_for`.
+    return slashed
+
+
+# Compiled once — Windows drive-letter prefix. Anchored at the start
+# so a directory NAME that happens to contain ``:`` in the middle
+# (which is illegal on Windows anyway but legal on POSIX) does not
+# accidentally trigger case folding.
+_WINDOWS_PATH_RE = re.compile(r"^[A-Za-z]:")
 
 
 def thread_id_for(project: str, repo_dir: Any) -> str:
