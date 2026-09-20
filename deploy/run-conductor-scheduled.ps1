@@ -2077,13 +2077,15 @@ $DecisionDashboardBaseUrl = $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
 # material lands at Y and the page correctly shows "material absent" — the exact split the composer
 # was written to close.
 #
-# Wire measurements from sg-tomtebo-01 (M-1, msg-1445 §6):
-#   * Invoke-WebRequest → https://sg-ai-server-01.taile861db.ts.net:8443/... returns 404 in ~190 ms
-#     with the wire proxy DISABLED (the tailnet cert validates under the default TLS handler and
-#     pwsh has outbound permission for that host).
-#   * With `-Proxy http://127.0.0.1:3128` the same request is refused by squid (403). Do NOT
-#     thread the notification proxy in here.
-# ∴ -TimeoutSec 10 is >50× the observed RTT, and the request goes direct.
+# Wire measurements and the derived direct-request / no-proxy decision live in the composer thread
+# (msg-1445 §6). This wrapper deliberately does NOT re-carry the measurement fixtures (host FQDN,
+# RTT, squid-403 detail) because a deploy script is not the correct location for historical
+# infrastructure evidence (T-public-repo-carries-real-infra-values §5.1 = registry gap G4 —
+# Einstein PR-gate advisory: single-use masking placeholders in a deploy wrapper are over-scope;
+# the ADR/composer thread is where operational context is preserved). The two facts this file
+# actually needs from that measurement — a ~190 ms RTT ceiling and "do not route this call through
+# the notification proxy" — are re-stated where the code enforces them below (the $DecisionMaterial
+# TimeoutSeconds comment and the Invoke-MaterialPut proxy note).
 #
 # The push is fail-open (D-34, msg-1443 §3): every failure — HTTP 4xx/5xx, TLS, DNS, connect refused,
 # timeout — writes ONE log line and returns to the caller. The notification then fires REGARDLESS
@@ -2093,8 +2095,8 @@ $DecisionDashboardBaseUrl = $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
 
 # How long the wrapper waits for the material PUT. Kept small (10 s) because a slow PUT would delay
 # the notification that follows; the notification is the "someone is being asked" signal and must
-# not wait on the material store. Measured RTT (M-1): ~190 ms round trip for a fresh connection —
-# a ceiling of 10 s allows for a 50× stall before the wrapper gives up and moves on. If a live
+# not wait on the material store. Measured RTT (msg-1445 §6): ~190 ms round trip for a fresh
+# connection — a ceiling of 10 s allows for a 50× stall before the wrapper gives up and moves on. If a live
 # measurement ever comes back over 2 s, that is the signal that the assumption behind this constant
 # is wrong; raise the alarm before raising the ceiling.
 $DecisionMaterialTimeoutSeconds = 10
@@ -2140,8 +2142,8 @@ function Invoke-MaterialPut {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($BodyJson)
         # -SkipHttpErrorCheck so a 4xx / 5xx returns a response object instead of throwing — the
         # caller wants to log the status code, not a "The remote server returned an error" wrapper.
-        # Not routed through $notifyProxy: M-1 confirmed the tailnet host is reachable directly and
-        # squid denies the tunnel. Keep this call OUT of the notification proxy path.
+        # Not routed through $notifyProxy: msg-1445 §6 confirmed the tailnet host is reachable
+        # directly and the notification proxy denies the tunnel. Keep this call OUT of the proxy path.
         $resp = Invoke-WebRequest -Uri $Url -Method Put `
             -ContentType 'application/json; charset=utf-8' `
             -Body $bytes -TimeoutSec $TimeoutSec `
