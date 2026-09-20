@@ -1,0 +1,306 @@
+# Decider — Conductor 停止判定への判断フック（設計書 v3.4）
+
+版: **3.4** / 2026-09-21 / 起票: Fermi（Cowork セッション, 2026-09-18）/ 設計 SOT: chatroom `spirrow-mindwire/T-decider-conductor-hook` / v3 差分: Bohr msg-3818 / v3.1: Bohr msg-3820 / v3.2: Bohr msg-3822 / v3.3: Bohr msg-3824 / v3.4: Bohr msg-3826 / 独立 naysayer レビュー: Einstein msg-3819 → msg-3821 → msg-3823 → msg-3825 → msg-3827 (APPROVE) / **Tier-C 承認**: Takahito 2026-09-21（"Approve v3.4 for implementation with bounce activation gated by planned evaluation phases"）
+
+対象リポジトリ: spirrow-mindwire（本 repo — Conductor / adapter / state builder / replay）、spirrow-lexora（`/v1/decide` エンドポイント側、本設計の前提）。
+
+前提: `T-decide-endpoint` (spirrow-lexora)。**本設計の実装ステップは lexora 側 `/v1/decide` 完了に blocked**。state builder / questions 定義 / replay script は先行着手可、adapter と Conductor フックは lexora 側完了後。
+
+---
+
+## 0. 一言で
+
+Operator の「進める / 人に回す / 止める」判断のうち、生成が要らない判断（Tier-C 一次判定 / handoff 妥当性 / made_progress / naysayer レビュー深さ）を Lexora `/v1/decide`（裏は Jev または LLM light emulation）に寄せる。狙いは (a) silent stop の検出、(b) 聞くまでもない問いが人に届く率の低減、(c) naysayer レビューコストの削減。T42（silent stop の汎用 watchdog）とは統合する — watchdog の判定器がこの Decider。
+
+Decider の責務は最終的に **admission-gate（`src/spirrow_mindwire/tier_c_admission_gate.py`）を通った後の grey zone** に狭められる（`ADMIT_UNSURE` / `second_time_force_admit` / label 名指しの真偽の judgement）。Tier-C の正の確定は admission-gate のラベル判定が担う。
+
+---
+
+## 1. 決定事項（Tier-C 承認済み。以後の実装はこれを前提にする）
+
+| # | 決定 | 出典 msg |
+|---|---|---|
+| D1 | 生成の要らない判断を `/v1/decide` に寄せる。Decider は生成を行わず、noul / choice の 4+3+... の question 群に答える構造 | msg-3404 §0 |
+| D2 | 単調性原則: Decider は既存規則判定の `stop` を **覆さない**。active でも「停止理由を足す」方向にしか動かない | msg-3404 §0 |
+| D3 | 唯一の例外は §4 Tier-C 一次判定の bounce（annotate → bounce の移行は Takahito 承認事項） | msg-3404 §0 |
+| D4 | env 切替: `MINDWIRE_DECIDER_BACKEND = off (default) \| lexora`（`MINDWIRE_DECISION_COMPOSER_BACKEND` と同じ流儀）。設定 `[decider].mode = off \| shadow \| active` | msg-3404 §1, §2 |
+| D5 | 問いはコードで持ちバージョン付与（ログに残す） | msg-3404 §1 |
+| D6 | ログ join キー: `thread_id + round + decision_id`。turn ログに `decision_id` を残す | msg-3404 §2, §6 |
+| D7 | `typesafe-ai` skill をこの repo に置かない、`/v1/decide` のみを呼ぶ（依存を増やさない側に倒す） | msg-3404 §5 / v3 |
+| D8 | 問いセット v3.4: **genuine 3 + spurious 3 + computed feature 0**。合成規則: genuine=和 / spurious=max | msg-3822, msg-3824 |
+| D9 | computed feature は全廃。`routing_artifact` は Conductor `rule_stop_reason` が既に捕捉するため二重管理禁止（Principle 2）。`protected_merge` は admission-gate の `merge-protected` ラベルが担うため Decider に持たない | msg-3820, msg-3822 |
+| D10 | bounce の応答は **3 択**: (a) self-resolve `NEXT: <role>` / (b) stand_down `NEXT: none` / (c) reassert `NEXT: human`。**構文的引用検査は入れない**（意味的幻覚を止められず、副作用のみ大きいため） | msg-3822, msg-3824, msg-3826 |
+| D11 | safety story は「構造 + 経験 + 観測」の 3 層。invariant「構造的に不可能」は撤回する | msg-3824 |
+| D12 | 実装順は shadow 先行デプロイ（`stop is None` ガード下で log-only、Takahito 承認不要 — 実動作を変えないため）。オフライン replay と live shadow JSONL 蓄積は並行 | msg-3820 |
+| D13 | 評価は **A-pre / A-post / live shadow** の 3 面で出す。A-post 母数不足なら shadow が JSONL を貯め続ける | msg-3818 §6, msg-3820 |
+| D14 | `TIER_C_LABELS` は `src/spirrow_mindwire/tier_c_admission_gate.py` の `ADMIT_LABELS` を import して同一定数を参照する（文字列二重管理禁止） | msg-3818 §4 |
+| D15 | bounce 活性化は evaluation phase gate 制。annotate は「genuine 見逃し 0 件」を満たしたときのみ、bounce は Takahito 追加承認 | 本 spec §6-C / Takahito 2026-09-21 |
+
+---
+
+## 2. 現状の事実（実測。実装はこれに接続する）
+
+- Conductor 停止判定は `src/spirrow_mindwire/conductor/core.py` の `StopReason` enum（`HUMAN / SETTLED / NO_HANDOFF / NO_PROGRESS / SELF_HANDOFF / ROUND_CAP / EMPTY / HOLD / CI_WAIT`）で捕捉される。self-handoff / round cap / empty / hold / CI pending / 不明ハンドオフ / no progress はすべて `rule_stop_reason` 側で `stop` に載る ∴ Decider 経路には到達しても適用されない。
+- Admission gate は `src/spirrow_mindwire/tier_c_admission_gate.py` に実装済み。`ADMIT_LABELS = frozenset({"goal", "cost", "irreversible", "merge-protected"})`、`UNSURE_LABEL = "unsure:goal?"`。`LogKind` enum に `ADMIT` / `BOUNCE` / `LABEL_MIGRATION` 等の記録種別あり。
+- `spirrow-lexora/T-decide-endpoint` の `/v1/decide` 完成が本設計の前提。**未完成の間は Decider adapter は書けない**（stub / mock ですらこの前提には触らない — 本物の endpoint spec が固まるまで adapter 実装は着手しない）。
+- state builder は既存の `scripts/thread_heads.py` / `scripts/head_skip_decide.py` の抽出ロジックを再利用可能（同じ thread head 情報を DecisionState に注入する）。
+- `naysayer_lexora` adapter (`src/spirrow_mindwire/adapters/naysayer_lexora.py`) と同じパターンで書ける（stateless HTTP、`ChatMessage` の代わりに Decider payload、shared `LexoraClient`、fail-loud）。
+
+---
+
+## 3. 構成（既存パターン踏襲）
+
+### 3.1 モジュール配置
+
+```
+src/spirrow_mindwire/
+  decider/
+    __init__.py
+    state.py         # DecisionState + state_builder(turn) -> DecisionState
+    questions.py     # v1 の question 定義（version 付き、コードで保持）
+    verdict.py       # 答え → Verdict の純関数
+  adapters/
+    decider_lexora.py  # /v1/decide を叩く adapter。env: MINDWIRE_LEXORA_URL, MINDWIRE_DECIDER_BACKEND
+scripts/
+  decider_replay.py  # --track=tierc / --track=handoff の replay driver
+```
+
+### 3.2 DecisionState
+
+`decider/state.py` の `DecisionState` フィールド:
+
+- `thread_id: str`
+- `round: int`
+- `roster: Mapping[str, Role]`（identity → role）
+- `head_summary: str`（head 要約、最大 M 文字）
+- `recent_events: list[EventSummary]`（直近 N 件、author / `NEXT:` / 本文先頭 M 文字）
+- `parsed_next: str | None`（head の `NEXT:` パース結果）
+- `prev_next: str | None`（1 つ前のターンの `NEXT:`）
+- `diff_stat: DiffStat | None`（implementer/PR ターンのみ）
+- `gate_jsonl_kind: LogKind | None`（admission-gate JSONL から join、`ADMIT / ADMIT_UNSURE / BOUNCED / RETRY_ADMIT.reason / second_time_force_admit`）
+
+**Constants**: `TIER_C_LABELS` は `src/spirrow_mindwire/tier_c_admission_gate.py::ADMIT_LABELS` を import して同一定数を参照する（文字列二重管理禁止 — D14）。
+
+### 3.3 Conductor フック（1 箇所のみ）
+
+`StopReason` 規則判定の直後に 1 フック:
+
+```python
+stop = rule_stop_reason(turn)              # 既存
+dv   = decider.evaluate(state_builder(turn))  # None if MINDWIRE_DECIDER_BACKEND=off
+log_decision(turn, stop, dv)               # 常に記録（decision_id を turn ログに残す）
+if cfg.decider.mode == "active" and dv and stop is None:
+    stop = StopReason.from_verdict(dv)     # bounce active 時のみ経路が変わる
+```
+
+- `stop is None` ガードにより、shadow mode は実動作に一切影響しない（D12）
+- `routing_artifact` を Decider が計算する経路は存在しない（`rule_stop_reason` が既に落としている — D9, msg-3820）
+
+### 3.4 設定
+
+```toml
+[decider]
+mode = "shadow"                # off | shadow | active
+active_questions = ["handoff_valid", "made_progress"]
+
+[decider.thresholds]
+handoff_valid_min = 0.30       # 未満 → escalate
+made_progress_min = 0.25       # 未満 → stand_down
+min_confidence   = 0.60        # choice 系はこれ未満なら無視
+
+[decider.tierc]
+mode = "off"                   # off | annotate | bounce
+skip_naysayer_when_confirmed = false
+```
+
+`naysayer_gating` の shadow（compute + LOG, don't act）と同じ意味論。
+
+---
+
+## 4. 問いセット v3.4（3 + 3 + 0）
+
+### 4.1 genuine 側（noul, 3 問）
+
+- **`changes_goal_or_spec`** — このハンドオフが承認を要する変更（goal / spec の書き換え）を含むか
+- **`incurs_cost`** — このハンドオフが cost を発生させる決定を含むか
+- **`irreversible`** — このハンドオフが取り消せない操作（データ削除・公開リリース）を含むか
+
+### 4.2 spurious 側（noul, 3 問）
+
+- **`answerable_from_thread`** — スレッド内の既存情報から答えが導けるか
+- **`is_permission_seeking`** — 権限を求めているだけで、判断そのものは著者ができる状態か
+- **`is_review_disposition`** — レビュー結果への disposition（「異論なし、進めてよいか」型）で、実質は自律進行が正解か
+
+### 4.3 computed feature（DecisionState 上の事実, 0 個）
+
+**削除済み**。v3.4 では computed feature を持たない。理由:
+
+- `routing_artifact`: `rule_stop_reason` が self-handoff / round cap / embodiment != terminal_coding_agent / CI pending を既に落としている（D9, msg-3820）
+- `protected_merge`: admission-gate の `merge-protected` ラベルが担う（D9, msg-3822）
+
+### 4.4 合成規則
+
+- **genuine 合成**: `sum(genuine) >= genuine_min → CONFIRMED`。3 種は概念的に直交する ∴ 和で合成。
+- **spurious 合成**: `max(spurious) >= spurious_min かつ genuine < genuine_max → LIKELY_NOT`。`answerable_from_thread` と `is_review_disposition` は外延が相関する ∴ 和 / 平均だと二重計上され閾値が問い数依存になる（msg-3818 §2 Q1, msg-3818 §4）。
+- **UNSURE**: いずれの条件も満たさない場合。
+
+### 4.5 bounce 定義（LIKELY_NOT かつ根拠 = `answerable_from_thread` のとき 1 回だけ）
+
+Conductor は human に上げる前に呼び出し元 agent へ **1 回だけ**差し戻す。プロンプト:
+
+> このハンドオフは Decider により「スレッド内の情報から答えが導ける可能性が高い」と判定されました（confidence p, 根拠 = `answerable_from_thread`）。以下いずれかで応答してください:
+>
+> **(a) self-resolve** — スレッド内の情報から答えを組み立て、次の作業担当を指す `NEXT: <role>` を出す（正常系）。差し戻し理由と結論は本文に短く残してください。
+>
+> **(b) stand_down** — 判断保留が不要になったと認める場合、応答本文にその旨を記し、末尾を `NEXT: none` で締める。JSONL には `BOUNCE_ACCEPTED` として記録される。スレッドに未処理の別作業が残っており自分がそれを引き取る場合は (a) を選ぶこと。
+>
+> **(c) reassert NEXT: human** — Tier-C 判断が実際に必要な場合、Tier-C 該当理由（goal / cost / irreversible / merge-protected のどれか）を本文に明記して再度 `NEXT: human`。**2 回目ルールにより Decider を経由せず必ず human に届く**。
+
+**構文的引用検査は入れない**（v3.1 で提案した msg_id 実在性チェックは v3.3 で廃止）。理由は Einstein v3.1 の指摘通り: 構文検査は意味的幻覚を止められず、「引用しろ」の圧力で無関係な msg_id を貼らせる副作用の方が大きい。
+
+### 4.6 Safety story（構造 + 経験 + 観測）
+
+「silent drop が構造的に不可能」という invariant は撤回する。代わりに 3 層で守る（D11, msg-3824）:
+
+1. **構造層（不変）**: 2 回目の `NEXT: human` は Decider を通さず無条件で human に届く。1 回だけの bounce は既存機構で保証されており、無限ループ不可。genuine Tier-C の agent が引き下がらない限り必ず人に届く。
+2. **経験層（bounce active の入場条件）**: bounce は annotate 実運用後、評価セット (A-pre / A-post / live shadow) で **genuine 見逃し 0 件**を満たしたときにしか active にしない（§6-C 制約 1）。この条件は Takahito 追加承認事項でもある（D15）。
+3. **観測層（事後レビュー）**: bounce の (a) self-resolve / (b) stand_down / (c) reassert のすべてを JSONL に kind 付きで記録し、evaluation report に msg_id 全件列挙する。genuine を self-resolve / stand_down で silent drop していないか、人が事後に走査できる。
+
+---
+
+## 5. Tier-C 一次判定（parsed_next == "human" のときのみ追加）
+
+`NEXT: human` が出たとき、本当に Tier-C たり得るかを一次判定する。**admission-gate が入った後の世界では、Decider の役割は「著者が名指したラベルは本当か」に変わる**（msg-3818 §1）。
+
+段階（Tier-C mode: `off → annotate → bounce`）:
+
+- **annotate**: escalation は従来通り人へ届く。通知に `Jev: likely not Tier-C (p) — <根拠>` を 1 行付けるだけ。実力未知数の間はここまで。
+  - 入場条件: 見逃し 0 件制約（§6-C 制約 1）を live shadow で満たしたとき。
+  - annotate 文言の `likely not Tier-C (p)` は confidence が較正済みレンジのときだけ出し、それ以外は無表示。
+- **bounce**: LIKELY_NOT かつ根拠が `answerable_from_thread` のときだけ、人に上げる前に呼び出し元へ **1 回だけ**差し戻し（§4.5）。**2 回目の `NEXT: human` は Decider を通さず必ず人へ**。無限ループ不可。
+  - 入場条件: Takahito 追加承認 + §6-C 制約 1 継続。
+- **`skip_naysayer_when_confirmed`**: CONFIRMED なら `force_naysayer_only_on_explicit_human` の Gemini 相談を省略、UNSURE のみ従来通り相談（cost lever）。
+
+正解ラベルは自然に貯まる: 人が escalation を「決めた」か「呼び出し元に返した」かが chatroom に残る = genuine / spurious の正解。
+
+---
+
+## 6. 較正・評価
+
+### 6.1 replay script
+
+`scripts/decider_replay.py`:
+
+- `--track=tierc` → A-pre / A-post 両方を吐く
+- `--track=handoff` → handoff_valid / made_progress の replay（B track）
+
+state builder は Conductor 側と同一実装を再利用（D12 と同じ builder を使う — 分布シフト防止）。
+
+### 6.2 トラック A — 2 スライス（A-pre / A-post）
+
+**A-pre**（歴史的分布, 179 件そのまま）
+- 用途: ルール単体の効果確認および v8 gate 導入前後の分布比較。
+- **Jev の go/no-go には使わない**（gate 前分布は gate 後には存在しない — msg-3818 §1）。
+
+**A-post**（v8 gate 適用後に admit された残りを Decider に流す）
+- 179 件 + 遡及正例に、admission-gate v8 のラベル必須化と §2.3 の relay routing を先に適用し、`ADMIT` / `ADMIT_UNSURE` / `second_time_force_admit` として通ったものだけを対象。
+- 予測母数: MERGE ≈ 17 + GOAL 2 + α ∴ **数十件を下回る可能性が高い**。その場合は結果ヘッダに「replay 単独で bounce 可否を確定できない」と書き、live shadow JSONL の蓄積待ちに切り替える。
+- 比較相手: 「ルール vs Jev vs LLM light」ではなく **「全件 escalate の現状 vs LLM light vs Jev」**（gate 後の残りではルールは定義上何も言わない — msg-3818 §1）。
+- state builder に **gate JSONL の `kind`（`ADMIT` / `ADMIT_UNSURE` / `BOUNCED` / `RETRY_ADMIT.reason` / `second_time_force_admit`）を feature として入れる**。`ADMIT_UNSURE` と `second_time_force_admit` は「ルールが判別に失敗した」集合 ∴ Decider annotate が最初に価値を出す場所。
+
+### 6.3 判定規則の事前固定（P 値ではなく規則として）
+
+1. **制約（必須）**: genuine の見逃しが比較相手以下、絶対数で **0 件**。1 件でも見逃したら bounce 投入不可、msg_id を全件列挙。
+2. **効果**: A-post 対象で、Jev の正解 LIKELY_NOT 件数 − LLM light の正解 LIKELY_NOT 件数を **対応のある比較**（McNemar / 符号検定）で。不一致対が 10 未満なら「差は測れない」と結論に明記。
+3. **同等なら安い方**: 差が測れない場合は Jev を入れず、LLM light か annotate 止まり。TypeSafe への依存を増やさない側に倒す（D7）。
+
+### 6.4 §6a — 見逃し / bounce の msg_id 全件列挙
+
+evaluation report に msg_id 単位で列挙する（集計値だけで通さない）:
+- genuine 見逃し
+- `BOUNCE_ACCEPTED` (b: stand_down)
+- `BOUNCE_SELF_RESOLVED` (a: self-resolve) — self-resolve 後の `NEXT:` 先と本文冒頭 M 文字を付記。特に元 handoff が「goal / cost / irreversible / merge-protected のいずれかに読める言い回しを含んでいた」ケースをフラグ立てして人がスキャンできるようにする（heuristic の実装は後段、まず msg_id 列挙だけ）。
+
+### 6.5 トラック B — handoff_valid / made_progress
+
+**回帰ケースには本スレッド自身の一部を含める**が、以下は Decider の replay には載せず Conductor の rule 側テストに置く（D9, msg-3820）:
+- msg-3656 の `author == NEXT` 自己ハンドオフ → `rule_stop_reason` の `SELF_HANDOFF` で落ちる
+- msg-3712 / 3797 の spawn 不能 embodiment → `rule_stop_reason` 側で落ちる
+
+トラック B の回帰ケースは「rule で落ちない、`handoff_valid` が真に問いとして働くもの」だけに絞る。
+
+---
+
+## 7. naysayer レビュー深さ判定（段階 3、別 PR 可）
+
+implementer の push ごとに走る Gemini フルレビュー（PR 平均 2.4 回・最大 13 回）の手前で、diff + 前回レビューを state に:
+
+- `only_addresses_prior_findings` (noul)
+- `introduces_new_design_decision` (noul)
+- `touches_risky_area` (noul: 認証・削除・スキーマ・デプロイ)
+
+→ 対応のみなら差分レビュー、新規判断ありならフル。`max_review_rounds` の粗い cap より賢い lever。
+
+併せて verdict 一貫性チェック: REQUEST_CHANGES 本文の指摘が diff の実在箇所を指しているか (noul)。truncated-diff 系事故の検出（TypeSafe citation-check cookbook 相当）。
+
+---
+
+## 8. 実装順
+
+1. **state builder**（gate JSONL kind を feature 化）**+ questions v3.4**（3 + 3）**+ replay script**（`--track=tierc` は A-pre / A-post 両方吐く）。lexora `/v1/decide` に blocked されないため先行着手可。
+2. **adapter + verdict + Conductor フック、mode=shadow で先行デプロイ**（`stop is None` ガード下、log-only。Takahito 承認不要 — 実動作を変えないため）。lexora `/v1/decide` 完了後。
+3. **`T-tier-c-admission-gate` PR #322 マージ後（既済）、並行**で:
+   - (3a) A-pre / A-post のオフライン replay を回す（既存 179 件 + 遡及正例）
+   - (3b) shadow から live JSONL を蓄積する（`ADMIT / ADMIT_UNSURE / BOUNCED / RETRY_ADMIT.reason / second_time_force_admit` の実分布）
+4. **トラック A 評価（A-pre / A-post / live shadow の 3 面）→ Takahito が bounce 投入可否 & backend 選択を決める**（最初の Tier-C 判定）。live shadow の n が数十に達した時点で評価を締める。
+5. `handoff_valid` / `made_progress` のみ active（トラック B 通過後）。
+6. **Tier-C annotate**（入場条件は §6-C 制約 1 のみ — 見逃し 0 件。3 者比較の勝敗は annotate には無関係で、bounce と backend 選択に効く）。annotate 文言の `likely not Tier-C (p)` は confidence が較正済みレンジのときだけ出す。
+7. naysayer 深さ判定（shadow → active）。
+8. **Tier-C bounce**（Takahito 追加承認後、§4.5 の 3 択プロンプト込み）。
+
+### 遡及正例の収集規則（msg-3818 §2 Q3, msg-3820）
+
+- **母集団**: 8 project ではなく全 project の `type=decide, author=human` を遡る。「A: 進める」型は genuine ではない ∴ 方向・仕様・費用を実際に変えた decide だけを Bohr が全文から拾う。
+- **本当の見逃し例**: agent が黙って決め、後で human がひっくり返したもの。gate の `DECIDED:` ログが入れば今後はそこから取れる。過去分は human の「それは違う」型 decide を探す。
+- **合成ケース / red-team は別トラック**にし、実データと **絶対に合算しない**。同系統のモデルが書いた合成例は LLM emulation にとって in-distribution で、3 者比較を歪める。用途は「見逃しのストレステスト」だけ。
+- **20 の意味を過大に読まない**: 見逃し 0 / 20 でも 95% 上限は約 14%（rule of three）∴ 安全性は見逃し率の数字ではなく §4.6 の safety story（構造 + 経験 + 観測 の 3 層）で担保する。
+
+---
+
+## 9. 非変更事項（v3.4 で不変）
+
+- 単調性原則（D2、既存 stop を覆さない）
+- `/v1/decide` のみを呼ぶ制約（D7）
+- annotate → bounce の移行は Takahito 承認事項（D15）
+- ログ join キー: `thread_id + round + decision_id`（D6）
+- `TIER_C_LABELS` import による文字列二重管理禁止（D14）
+- shadow 先行デプロイ（D12）
+- 問いセット 3 + 3 + 0（D8）
+- 合成規則: genuine=和 / spurious=max（D8）
+- bounce 3 択、構文検査なし（D10）
+- 3 層 safety story（D11）
+- 評価 3 面（A-pre / A-post / live shadow — D13）
+
+---
+
+## 10. Open questions / 実装時に決めること
+
+- Lexora `/v1/decide` の request / response schema（本設計は「4 種類の question type: noul / choice / free-form」までは決めたが、実際のワイヤ形式は lexora 側 `T-decide-endpoint` の spec に従う）
+- `[decider.thresholds]` の初期値は shadow データを 1〜2 週貯めてから較正する（現在は暫定値: `handoff_valid_min = 0.30 / made_progress_min = 0.25 / min_confidence = 0.60`）
+- `DecisionState.recent_events` の N と `head_summary` の M（暫定 N=5, M=500 chars）
+
+---
+
+## 11. 参照
+
+- `docs/operator-board-design.md` §17（Cowork operator セッションの 116 判断点、light ティア判断リプレイ 85%）
+- `src/spirrow_mindwire/tier_c_admission_gate.py`（admission gate v8 実装、`ADMIT_LABELS`）
+- `src/spirrow_mindwire/conductor/core.py`（`StopReason`, `rule_stop_reason` 相当）
+- `src/spirrow_mindwire/adapters/naysayer_lexora.py`（adapter パターンの参照実装）
+- `src/spirrow_mindwire/lexora/client.py`（Lexora HTTP client）
+- ADR-2026-05-23-07（Stage 3 Autonomy Gating）
+- ADR-2026-06-03-16（naysayer CI-gate）
+- ADR-2026-06-03-17（naysayer design participation）
+- chatroom `spirrow-mindwire/T-decider-conductor-hook`（設計 SOT）
+- chatroom `spirrow-mindwire/T-tier-c-admission-gate`（前提: v8 gate）
+- chatroom `spirrow-lexora/T-decide-endpoint`（前提: `/v1/decide` エンドポイント）
