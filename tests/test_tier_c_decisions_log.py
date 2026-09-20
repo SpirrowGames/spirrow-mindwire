@@ -20,6 +20,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from spirrow_mindwire.tier_c_admission_gate import (
     LogEntry,
     LogKind,
@@ -36,6 +38,43 @@ NOW = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
 
 def _read_rows(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text("utf-8").splitlines()]
+
+
+class TestLogEntryImmutability:
+    """Structural pin for PR-gate objection #322-9.
+
+    ``@dataclass(frozen=True)`` on its own only protects field
+    reassignment (``entry.payload = ...``). The payload dict itself
+    is still mutable through ``entry.payload[key] = value``, which
+    silently violates the freeze promise. ``__post_init__`` wraps
+    the payload in a :class:`types.MappingProxyType` so mutation
+    through the dict interface raises :class:`TypeError`.
+    """
+
+    def test_payload_mutation_raises(self) -> None:
+        entry = LogEntry(
+            kind=LogKind.BOUNCED,
+            payload={"ts": NOW.isoformat(), "author": "alice"},
+        )
+        with pytest.raises(TypeError):
+            entry.payload["author"] = "eve"  # type: ignore[index]
+
+    def test_payload_read_still_works(self) -> None:
+        entry = LogEntry(
+            kind=LogKind.BOUNCED,
+            payload={"ts": NOW.isoformat(), "author": "alice"},
+        )
+        assert entry.payload["author"] == "alice"
+
+    def test_payload_source_mutation_does_not_leak(self) -> None:
+        """The wrapper is over a defensive COPY of the caller's dict,
+        so mutating the source dict after construction does not sneak
+        past the freeze either.
+        """
+        source = {"ts": NOW.isoformat(), "author": "alice"}
+        entry = LogEntry(kind=LogKind.BOUNCED, payload=source)
+        source["author"] = "eve"
+        assert entry.payload["author"] == "alice"
 
 
 class TestAppend:
@@ -278,6 +317,121 @@ class TestRetryLookup:
         assert lookup("u1", "alice") is True
         # Bob's is resolved.
         assert lookup("u1", "bob") is False
+
+
+class TestMalformedRowsAreSkipped:
+    """Regression pins for PR-gate objection #322-7 (BLOCKING untested).
+
+    The log-scanner's docstring promises malformed rows will be
+    skipped rather than raised on, so an external touch to the file
+    (rotation race, half-written line, a value that isn't a JSON
+    object) can never break the RETRY store. That resilience was
+    coded and documented but not exercised — these tests pin the
+    three flavours of malformed content the scanner must survive.
+    """
+
+    def test_malformed_json_line_is_skipped(self, tmp_path: Path) -> None:
+        log = tmp_path / "decisions.jsonl"
+        # Write a well-formed BOUNCED, then a syntactically-broken line,
+        # then another well-formed row. The lookup must see the surrounding
+        # rows without failing on the middle one.
+        append_log_entry(
+            log,
+            LogEntry(
+                kind=LogKind.BOUNCED,
+                payload={
+                    "ts": NOW.isoformat(),
+                    "author": "alice",
+                    "retry_uuid": "u1",
+                    "reason": "no-label",
+                },
+            ),
+        )
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write('{"broken":\n')  # unterminated JSON
+        assert build_retry_lookup(log)("u1", "alice") is True
+
+    def test_non_dict_json_line_is_skipped(self, tmp_path: Path) -> None:
+        """A valid JSON value that isn't a dict (list, number, string)
+        must not crash the scanner — the docstring is explicit that
+        ``isinstance(row, dict)`` is the acceptance condition."""
+        log = tmp_path / "decisions.jsonl"
+        append_log_entry(
+            log,
+            LogEntry(
+                kind=LogKind.BOUNCED,
+                payload={
+                    "ts": NOW.isoformat(),
+                    "author": "alice",
+                    "retry_uuid": "u1",
+                    "reason": "no-label",
+                },
+            ),
+        )
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write('["a", "list", "not", "a", "dict"]\n')
+            fh.write("42\n")
+            fh.write('"a bare string"\n')
+        assert build_retry_lookup(log)("u1", "alice") is True
+
+    def test_empty_lines_are_skipped(self, tmp_path: Path) -> None:
+        """Blank lines (from a partial write, or a tool that appends a
+        stray newline) must be skipped without incident."""
+        log = tmp_path / "decisions.jsonl"
+        append_log_entry(
+            log,
+            LogEntry(
+                kind=LogKind.BOUNCED,
+                payload={
+                    "ts": NOW.isoformat(),
+                    "author": "alice",
+                    "retry_uuid": "u1",
+                    "reason": "no-label",
+                },
+            ),
+        )
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write("\n\n   \n\n")
+        assert build_retry_lookup(log)("u1", "alice") is True
+
+    def test_malformed_row_between_two_wellformed_still_processes_both(
+        self, tmp_path: Path
+    ) -> None:
+        """The scanner must fully cross a malformed row and continue
+        processing the tail. If it silently stopped at the bad line,
+        a later ``RETRY_ADMIT`` that resolves the bounce would be
+        invisible to the lookup and the author would stay locked out.
+        """
+        log = tmp_path / "decisions.jsonl"
+        append_log_entry(
+            log,
+            LogEntry(
+                kind=LogKind.BOUNCED,
+                payload={
+                    "ts": NOW.isoformat(),
+                    "author": "alice",
+                    "retry_uuid": "u1",
+                    "reason": "no-label",
+                },
+            ),
+        )
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write("not json at all\n")
+        append_log_entry(
+            log,
+            LogEntry(
+                kind=LogKind.RETRY_ADMIT,
+                payload={
+                    "ts": NOW.isoformat(),
+                    "author": "alice",
+                    "retry_uuid": "u1",
+                    "reason": "label_corrected",
+                },
+            ),
+        )
+        # The RETRY_ADMIT sitting past the bad line still resolves the
+        # bounce — bad line traversed, not fatal.
+        assert build_retry_lookup(log)("u1", "alice") is False
 
 
 class TestGateEndToEndAgainstLog:

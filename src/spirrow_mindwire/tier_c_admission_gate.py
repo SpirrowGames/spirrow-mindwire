@@ -61,10 +61,11 @@ approved as the settled design.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -350,10 +351,33 @@ class LogEntry:
     * RETRY admits return one ``RETRY_ADMIT``, plus a preceding
       ``LABEL_MIGRATION`` if the retry itself normalised a legacy
       label (msg-3710 §1 0a → 0b).
+
+    Immutability
+    ------------
+
+    :class:`LogEntry` is ``frozen=True``, and its ``payload`` is
+    wrapped in a :class:`types.MappingProxyType` in ``__post_init__``
+    so a downstream caller cannot mutate the entry through
+    ``entry.payload[key] = value`` after construction. Fix for
+    PR-gate objection #322-9: a frozen dataclass whose only field
+    is a mutable dict makes the freeze meaningless. Reads and
+    equality comparisons still work — ``MappingProxyType`` is a
+    read-only view over the underlying dict, not a re-implementation.
     """
 
     kind: LogKind
-    payload: dict[str, Any]
+    payload: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        # Wrap the payload in a read-only view so ``frozen=True`` covers
+        # both the field assignment (existing behaviour) AND mutation
+        # through the payload's dict interface. If the caller already
+        # handed us a ``MappingProxyType`` we do not double-wrap: two
+        # layers would defeat the equality shortcut with the underlying
+        # dict without adding any protection. Fix for #322-9.
+        if isinstance(self.payload, MappingProxyType):
+            return
+        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
 
 
 @dataclass(frozen=True)

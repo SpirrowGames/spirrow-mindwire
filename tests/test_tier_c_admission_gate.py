@@ -113,6 +113,22 @@ class TestExtractLabel:
         body = "TIER-C: other: some free-form reason here\nNEXT: human\n"
         assert extract_label(body) == "other:some free-form reason here"
 
+    def test_other_label_preserves_reason_case(self) -> None:
+        """Regression pin for PR-gate objection #322-8 (BLOCKING untested).
+
+        The ``other:<reason>`` canonicaliser lower-cases the ``other:``
+        prefix (uniform aggregation key) but MUST preserve the case of
+        the reason text itself — an author writing
+        ``TIER-C: other: LoopControl reset`` must not have their
+        capitalised project name flattened. Before this pin the
+        behaviour was implemented (``.strip()`` on the raw sub-match,
+        not on the lower-cased form) but no test exercised any
+        case-mixed input, so a regression that added ``.lower()`` in
+        the wrong place would slip through.
+        """
+        body = "TIER-C: other: LoopControl State Reset\nNEXT: human\n"
+        assert extract_label(body) == "other:LoopControl State Reset"
+
     def test_other_label_strips_trailing_whitespace(self) -> None:
         """Regression pin for PR-gate objection #322-2.
 
