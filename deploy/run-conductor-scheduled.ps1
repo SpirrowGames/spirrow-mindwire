@@ -2078,10 +2078,11 @@ $DecisionDashboardBaseUrl = $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
 # was written to close.
 #
 # Wire measurements and the derived direct-request / no-proxy decision live in the composer thread
-# (msg-1445 §6); this wrapper does not re-carry the measurement fixtures. The two facts this file
-# actually needs from that measurement — a ~190 ms RTT ceiling and "do not route this call through
-# the notification proxy" — are re-stated where the code enforces them below (the $DecisionMaterial
-# TimeoutSeconds comment and the Invoke-MaterialPut proxy note).
+# (msg-1445 §6); this wrapper does not re-carry the measurement fixtures (host FQDN, RTT,
+# squid-403 detail). The two facts this file actually needs from that measurement — a ~190 ms RTT
+# ceiling and "do not route this call through the notification proxy" — are re-stated where the
+# code enforces them below (the $DecisionMaterialTimeoutSeconds comment and the Invoke-MaterialPut
+# proxy note).
 #
 # The push is fail-open (D-34, msg-1443 §3): every failure — HTTP 4xx/5xx, TLS, DNS, connect refused,
 # timeout — writes ONE log line and returns to the caller. The notification then fires REGARDLESS
