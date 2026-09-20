@@ -8,6 +8,7 @@ session tests are gone — what remains is the deterministic-guard + judging beh
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -798,7 +799,7 @@ async def test_principles_version_recorded_on_every_emit_path() -> None:
 
 
 def test_pr_review_outcome_construction_site_count_is_bounded() -> None:
-    """The five ``PrReviewOutcome(`` sites the pin above enumerates.
+    """The five ``PrReviewOutcome(...)`` construction sites the pin above enumerates.
 
     Not a substitute for the behavioural check — a construction site that omits the
     ``principles_version=`` kwarg still constructs a ``PrReviewOutcome``, and the count
@@ -807,21 +808,31 @@ def test_pr_review_outcome_construction_site_count_is_bounded() -> None:
     pin covers only the sites its cases exercise; a new emit path lurks silently under
     coverage-by-parametrisation until this counter reds.
 
+    Counted via AST rather than a text regex, so the pin does not couple to a specific
+    syntactic form (msg-3622 PR-gate advisory, msg-3739 Einstein Obj-2): a refactor that
+    assigns the object to a local before returning it —
+    ``outcome = PrReviewOutcome(...); return outcome`` — is still a construction site the
+    invariant must cover, and this test counts it the same. The AST also ignores
+    ``PrReviewOutcome`` inside strings, docstrings, and comments, so a mention of the
+    type in prose cannot inflate the count.
+
     Kept literal (5) rather than a self-referential scan of the test's own body, so a
     silent widening of one file cannot be dismissed by editing the other.
     """
-    text = (
-        Path(__file__).resolve().parents[1] / "src/spirrow_mindwire/naysayer/pr_review.py"
-    ).read_text(encoding="utf-8")
-    # ``PrReviewOutcome(`` (construction), not ``PrReviewOutcome:`` (annotation) or
-    # ``PrReviewOutcome`` (bare reference). The construction pattern is what the pin
-    # covers.
-    sites = re.findall(r"\breturn PrReviewOutcome\(", text)
+    source_path = Path(__file__).resolve().parents[1] / "src/spirrow_mindwire/naysayer/pr_review.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "PrReviewOutcome"
+    ]
     assert len(sites) == 5, (
         f"expected 5 PrReviewOutcome construction sites (the closed set the "
-        f"principles_version pin enumerates); found {len(sites)}. If a new emit path was "
-        f"added, add a case to test_principles_version_recorded_on_every_emit_path and "
-        f"bump this counter."
+        f"principles_version pin enumerates); found {len(sites)} at lines "
+        f"{[s.lineno for s in sites]}. If a new emit path was added, add a case to "
+        f"test_principles_version_recorded_on_every_emit_path and bump this counter."
     )
 
 
