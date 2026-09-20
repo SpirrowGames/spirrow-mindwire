@@ -1466,9 +1466,13 @@ class GitHubClient:
           copy-paste-ready for ``curl``.** Reserved characters in the file path
           (spaces, ``#``, ``?``) reach the exception string in their decoded form
           and would need to be re-encoded before an operator could paste the logged
-          path into a shell. Accepted as an operability downgrade in exchange for
-          removing the parallel ``contents_path`` string that would otherwise have
-          to track ``raw_path`` in lockstep.
+          path into a shell. Accepted as an operability downgrade — actively
+          monitored rather than permanently accepted — in exchange for removing
+          the parallel ``contents_path`` string that would otherwise have to track
+          ``raw_path`` in lockstep. Revisit trigger: ≥1 operator report of a
+          broken copy-paste debug path within 3 weeks of this trade-off landing;
+          the fix is to format a display-only encoded string from
+          ``url.raw_path.decode("ascii")`` for the exception message.
 
         See :func:`spirrow_mindwire.naysayer.pr_review.verify_citations` for the caller
         contract (memoisation on ``(path, ref)``, single-line-``where`` gate, empty-line
