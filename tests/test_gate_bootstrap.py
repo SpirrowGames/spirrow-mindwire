@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +31,7 @@ from spirrow_mindwire.gate_bootstrap import (
     GateBootstrapCloseError,
     GateStatus,
     OpenResult,
+    _normalize_repo_dir,
     close_alert,
     inspect_gate,
     open_alert,
@@ -36,6 +39,15 @@ from spirrow_mindwire.gate_bootstrap import (
     thread_id_for,
 )
 from spirrow_mindwire.magickit.client import MagickitMcpError, raise_if_envelope
+
+# The tests below need one deterministic ``repo_dir`` to build test-side
+# thread ids against, matching what production would compute at run time
+# (:func:`thread_id_for` composes the id from both ``project`` and
+# ``repo_dir`` — Bohr msg-3120 §2.1 through msg-3122 §2). Kept as a module
+# constant so a regression that quietly changes the id derivation does not
+# have to be chased across dozens of individual test literals.
+_TEST_REPO_DIR = Path("/tmp/gate-bootstrap-test-repo")
+
 
 # --- fakes ---------------------------------------------------------------------------------------
 
@@ -280,8 +292,246 @@ def test_inspect_gate_stale_worktree_when_ref_carries_gate(tmp_path: Path) -> No
 
 
 def test_thread_id_for_uses_fixed_prefix() -> None:
-    """The idempotency key is a deterministic function of the project id (msg-1963 D-4)."""
-    assert thread_id_for("spirrow-verimend") == f"{THREAD_ID_PREFIX}spirrow-verimend"
+    """The idempotency key is a deterministic function of ``(project, repo_dir)``.
+
+    Pins msg-1963 D-4 (deterministic idempotency key) AND the msg-3120 §2.1
+    key form extension: after Bohr msg-2779 §5 established that ``project`` is
+    not one-to-one with ``repo_dir`` in production ``config/sweep.json`` and
+    Einstein msg-3119 blocked the previous "just add ``repo_dir``" form on
+    injectivity grounds, the composed key form is
+    ``T-gate-bootstrap-<project>-<slug>-<hash6>`` with the slug and the hash
+    both taken over the SAME normalised ``repo_dir`` (Bohr msg-3122 §2).
+    """
+    project = "spirrow-verimend"
+    repo_dir = Path("C:/workspace/sandbox/verimend-impl")
+    tid = thread_id_for(project, repo_dir)
+    # Prefix + project appear at the start (order matters for the human reader
+    # of a chatroom listing, and the ledger key structure the design pins).
+    assert tid.startswith(f"{THREAD_ID_PREFIX}{project}-")
+    # The tail is a 6-hex digest. This bounds the id's shape at the level the
+    # design actually asserts: prefix + project + slug + hash6 (Bohr msg-3122
+    # §2). A regression that dropped the hash suffix (returning to the pure
+    # slug form Einstein msg-3121 blocked) fails this assertion.
+    assert re.match(r"^[a-f0-9]{6}$", tid.rsplit("-", 1)[-1])
+
+
+def test_thread_id_for_is_injective_over_repo_dir() -> None:
+    """The same project on TWO distinct ``repo_dir``s produces TWO distinct thread ids.
+
+    This is the specific defect the msg-3120 rewrite closes: prior to it,
+    ``spirrow-magickit`` on ``magickit-impl`` / ``mindwire-impl`` /
+    ``conclair-impl`` all shared one thread id, and only one repo's alert
+    could exist at a time (Bohr msg-2779 §5).
+    """
+    project = "spirrow-magickit"
+    a = thread_id_for(project, Path("C:/workspace/sandbox/magickit-impl"))
+    b = thread_id_for(project, Path("C:/workspace/sandbox/mindwire-impl"))
+    c = thread_id_for(project, Path("C:/workspace/sandbox/conclair-impl"))
+    assert a != b
+    assert a != c
+    assert b != c
+
+
+def test_thread_id_for_handles_windows_and_posix_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a Windows host, ``C:\\...`` and ``C:/...`` (and the case variants) all land on ONE id.
+
+    Rationale in :func:`spirrow_mindwire.gate_bootstrap._normalize_repo_dir`:
+    Windows filesystems are case-insensitive and both separator styles refer
+    to the same entity, so the identity key MUST fold them together — or the
+    same repo would end up with two thread ids depending on how PowerShell
+    or Python happened to write the path this tick (Bohr msg-3122 §2 change
+    3, "同じ entity なのに別 key" の逆方向のバグ).
+
+    ``os.name`` is monkeypatched so this invariant is exercised regardless
+    of what platform CI runs on. The pin is the Windows filesystem's
+    case-insensitive semantics — the OS the sweep host runs is what
+    :func:`_normalize_repo_dir` consults at call time (PR-gate on head
+    c71041f follow-up).
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    project = "spirrow-magickit"
+    forward = thread_id_for(project, "C:/workspace/sandbox/magickit-impl")
+    backward = thread_id_for(project, "C:\\workspace\\sandbox\\magickit-impl")
+    upper = thread_id_for(project, "C:/Workspace/Sandbox/Magickit-Impl")
+    mixed = thread_id_for(project, "c:\\WORKSPACE/sandbox\\MAGICKIT-impl")
+    assert forward == backward == upper == mixed
+    # And the boundary case the PR-gate on head c71041f named — a
+    # RELATIVE Windows path (no drive letter, no UNC prefix) must also
+    # fold case, because on a Windows host the filesystem still applies
+    # case-insensitive semantics regardless of whether the path is
+    # relative or absolute. A syntactic detector would misclassify
+    # ``workspace\\repo`` as POSIX and skip the fold; ``os.name`` sees
+    # the actual filesystem and folds correctly.
+    rel_lower = thread_id_for(project, "workspace/repo")
+    rel_upper = thread_id_for(project, "WORKSPACE\\repo")
+    assert rel_lower == rel_upper, (
+        "relative Windows paths did NOT fold case — this is the c71041f "
+        "PR-gate boundary case #1 (relative paths bypassed a syntactic "
+        "detector because they lack drive-letter / UNC prefix)"
+    )
+
+
+def test_thread_id_for_preserves_posix_case_sensitivity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a POSIX host, POSIX paths that differ only in case MUST land on DIFFERENT thread ids.
+
+    Pins the PR-gate on head e1185b6 blocking `edge-case`. POSIX filesystems
+    are case-sensitive: ``/tmp/Repo`` and ``/tmp/repo`` are two distinct
+    directories, and folding case across them would re-introduce the same
+    cross-repo collision PR #277 was opened to close.
+
+    ``os.name`` is monkeypatched to ``"posix"`` so this invariant runs on
+    any CI platform — the pin is POSIX filesystem semantics, not whatever
+    OS happens to host the test process.
+
+    Also pins the boundary case the PR-gate on head c71041f named: a POSIX
+    path starting with ``//`` (implementation-defined leading double slash,
+    occasionally emitted by path concatenation) MUST NOT be misclassified
+    as UNC and case-folded. Under ``os.name == "posix"`` the double slash
+    is treated as POSIX and case is preserved.
+
+    A regression that reverts to an unconditional ``.lower()``, or to a
+    syntactic UNC detector, would fail this test.
+    """
+    monkeypatch.setattr(os, "name", "posix")
+    project = "spirrow-example"
+    lower = thread_id_for(project, "/tmp/gate-bootstrap/repo")
+    mixed = thread_id_for(project, "/tmp/gate-bootstrap/Repo")
+    upper = thread_id_for(project, "/opt/Workspace/repo")
+    also_lower = thread_id_for(project, "/opt/workspace/repo")
+    assert lower != mixed, (
+        "POSIX paths ``/tmp/gate-bootstrap/repo`` and "
+        "``/tmp/gate-bootstrap/Repo`` are distinct filesystem entities; "
+        "``_normalize_repo_dir`` must not fold case across them"
+    )
+    assert upper != also_lower, (
+        "POSIX paths ``/opt/Workspace/repo`` and ``/opt/workspace/repo`` "
+        "are distinct filesystem entities; ``_normalize_repo_dir`` must "
+        "not fold case across them"
+    )
+    # PR-gate on head c71041f boundary case #2: POSIX path with ``//``
+    # leading double slash MUST NOT be misclassified as UNC and folded.
+    double_slash_upper = thread_id_for(project, "//tmp/Repo")
+    double_slash_lower = thread_id_for(project, "//tmp/repo")
+    assert double_slash_upper != double_slash_lower, (
+        "POSIX ``//tmp`` path was misclassified as UNC and case-folded — "
+        "this is the c71041f PR-gate boundary case #2 (a syntactic "
+        "detector matched ``//`` and lowercased; ``os.name`` sees "
+        "``posix`` and preserves case correctly)"
+    )
+
+
+def test_thread_id_for_disambiguates_slug_collisions() -> None:
+    """Einstein msg-3121's blocking reversal, pinned as a regression test.
+
+    ``C:/workspace-sandbox/conclair-impl`` and
+    ``C:/workspace/sandbox-conclair-impl`` are DIFFERENT filesystem entities
+    that a pure slug of the path would collapse together (``[^a-zA-Z0-9]+``
+    treats ``/`` and ``-`` identically). The hash suffix separates them.
+
+    A refactor that "cleaned up" the id by dropping the hash suffix — or that
+    hashed the slug instead of the pre-slug normalised path — would fail
+    this test.
+    """
+    project = "spirrow-example"
+    a = thread_id_for(project, "C:/workspace-sandbox/conclair-impl")
+    b = thread_id_for(project, "C:/workspace/sandbox-conclair-impl")
+    # Slug portion IS deliberately the same on the two paths — that is the
+    # collision the whole hash suffix exists to break. Assert it directly so
+    # this test also documents the reason for the design.
+    slug_a = a[len(f"{THREAD_ID_PREFIX}{project}-") : -7]  # strip hash suffix "-XXXXXX"
+    slug_b = b[len(f"{THREAD_ID_PREFIX}{project}-") : -7]
+    assert slug_a == slug_b, (
+        "Einstein msg-3121 reversal preconditions changed — the two paths no longer collide "
+        "under the slug regex, so this test is not exercising what it names"
+    )
+    # And the whole id must still differ (the hash suffix does the disambiguation).
+    assert a != b
+
+
+def test_thread_id_for_no_collisions_in_current_sweep() -> None:
+    """Every ``(project, repo_dir)`` pair known to this repo produces a distinct id.
+
+    Bohr msg-3122 §3: the hash suffix carries a probabilistic guarantee at
+    24 bits (roughly 3e-4 collision probability at N=100). This test lifts that
+    to a decision-time guarantee for the specific configuration this repo
+    ships: it walks every pair in ``deploy/sweep.json.example`` AND every
+    pair Bohr msg-2779 §5 measured in the daemon host's live
+    ``config/sweep.json`` (which is not checked in), builds the thread ids
+    for all of them, and asserts every id is distinct.
+
+    The live-config pairs are hand-copied from Bohr msg-2779 §5 rather than
+    read from disk because the daemon host's config is not on the same
+    machine as CI. A drift between this list and the production config would
+    make the assertion weaker but not falsely-green (it just means we would
+    stop guaranteeing pairs the test does not name). If the production set
+    grows, add the pair here — this test is where the config-side guarantee
+    lives.
+    """
+    # In-repo example — always available in CI.
+    example_path = Path(__file__).resolve().parent.parent / "deploy" / "sweep.json.example"
+    example = json.loads(example_path.read_text(encoding="utf-8"))
+    checked_in_pairs = [(c["project"], c["repo_dir"]) for c in example.get("candidates", [])]
+    # Production pairs from Bohr msg-2779 §5. 8 distinct pairs; the three
+    # spirrow-magickit rows are the ones the msg-3120 rewrite exists to
+    # separate.
+    production_pairs = [
+        ("spirrow-mindwire", "C:/workspace/sandbox/mindwire-impl"),
+        ("spirrow-voxelworld", "C:/workspace/sandbox/voxelworld-impl"),
+        ("spirrow-magickit", "C:/workspace/sandbox/magickit-impl"),
+        ("spirrow-magickit", "C:/workspace/sandbox/mindwire-impl"),
+        ("spirrow-magickit", "C:/workspace/sandbox/conclair-impl"),
+        ("spirrow-playproof", "C:/workspace/sandbox/playproof-impl"),
+        ("spirrow-lexora", "C:/workspace/sandbox/lexora-impl"),
+        ("spirrow-verimend", "C:/workspace/sandbox/verimend-impl"),
+    ]
+    # The two sources may overlap (voxelworld/mindwire appear in both the
+    # checked-in example and in Bohr msg-2779 §5). Dedup on the pair itself so
+    # a "collision" the test reports is a real collision — same id for two
+    # distinct pairs — not just the same pair listed twice.
+    #
+    # Dedup uses :func:`_normalize_repo_dir` on ``repo_dir`` so the key we
+    # dedup on lines up with what :func:`thread_id_for` sees (PR-gate on
+    # PR #277 advisory `structure`, msg-3159 finding #2): the two lists
+    # can legitimately spell the same path with different casing or slash
+    # direction, and the normalised form is what determines identity. If
+    # we left them separate here, the same identity would appear twice in
+    # ``unique_pairs``, ``thread_id_for`` would (correctly) produce equal
+    # ids for both, and the final ``len(set(ids)) == len(ids)`` assertion
+    # would flip red on what is actually a duplicate entry, not a
+    # collision.
+    seen_pairs: set[tuple[str, str]] = set()
+    unique_pairs: list[tuple[str, str]] = []
+    for pair in checked_in_pairs + production_pairs:
+        key = (pair[0], _normalize_repo_dir(pair[1]))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        unique_pairs.append((pair[0], pair[1]))
+    assert len(unique_pairs) >= 8, (
+        f"the corpus of pairs to check for collisions is smaller than the msg-2779 "
+        f"§5 measurement (>=8 pairs) — did deploy/sweep.json.example lose entries? "
+        f"got: {unique_pairs!r}"
+    )
+    ids = [thread_id_for(project, repo_dir) for project, repo_dir in unique_pairs]
+    # The load-bearing assertion. A collision here means the 24-bit hash
+    # suffix is not enough for THIS configuration; hash length must grow.
+    assert len(set(ids)) == len(ids), (
+        f"thread_id_for collided over the current sweep corpus. Pairs and ids: "
+        f"{list(zip(unique_pairs, ids, strict=True))!r}"
+    )
+
+
+# Local alias used by the test bodies below when they need to build a thread
+# id that a fake will match. Kept trivially different from production callers
+# so a refactor that drops the ``repo_dir`` argument at any call site fails
+# these tests before it fails production. re is imported at the top of the
+# module for the assertion in :func:`test_thread_id_for_uses_fixed_prefix`.
+def _tid(project: str, repo_dir: Path | str = _TEST_REPO_DIR) -> str:
+    return thread_id_for(project, repo_dir)
 
 
 # --- open_alert -----------------------------------------------------------------------------------
@@ -304,11 +554,12 @@ async def test_open_alert_opens_fixed_thread_id_with_alert_tags() -> None:
         ``gate-bootstrap`` (specific alert kind).
     """
     mcp = _FakeMcp(results={"chatroom_open_thread": {"ok": True}})
-    result = await open_alert(mcp, project="spirrow-verimend")
-    assert result == OpenResult(thread_id="T-gate-bootstrap-spirrow-verimend", already_exists=False)
+    thread_id = _tid("spirrow-verimend")
+    result = await open_alert(mcp, project="spirrow-verimend", repo_dir=_TEST_REPO_DIR)
+    assert result == OpenResult(thread_id=thread_id, already_exists=False)
     args = mcp.args_for("chatroom_open_thread")
     assert args["project"] == "spirrow-verimend"
-    assert args["thread_id"] == "T-gate-bootstrap-spirrow-verimend"
+    assert args["thread_id"] == thread_id
     assert args["owner"] == DEFAULT_SWEEPER_OWNER
     assert set(args["tags"]) == set(ALERT_TAGS)
     # The propose_content self-identifies as a system alert (msg-1967 N-5-B).
@@ -316,6 +567,40 @@ async def test_open_alert_opens_fixed_thread_id_with_alert_tags() -> None:
     # And names the design ADRs the PR-side is expected to cite (msg-1967).
     assert "ADR-2026-05-29-10" in args["propose_content"]
     assert "ADR-2026-06-03-16" in args["propose_content"]
+
+
+@pytest.mark.anyio
+async def test_open_alert_title_and_propose_include_repo_label_and_full_repo_dir() -> None:
+    """Alert title carries the repo basename; the body carries the full path.
+
+    Pins T-new-project-gate-bootstrap msg-3750 §4 / PR-gate on PR #277
+    advisory `legibility`: when a single ``project`` maps to two or more
+    ``repo_dir``s (production ``config/sweep.json`` maps
+    ``spirrow-magickit`` onto three of them), the operator sees two threads
+    with identical titles unless the repository is named on the title.
+    Identity is still the ``thread_id`` (hashed full path) — the label is
+    display only. The body carries the full ``repo_dir`` so a
+    basename-collision does not hide the underlying path from the reader.
+    """
+    project = "spirrow-magickit"
+    repo_dir = Path("/tmp/experimental/magickit-impl")
+    mcp = _FakeMcp(results={"chatroom_open_thread": {"ok": True}})
+    await open_alert(mcp, project=project, repo_dir=repo_dir)
+    args = mcp.args_for("chatroom_open_thread")
+    # Title carries the repo basename so the operator's thread list is
+    # not two identical rows.
+    assert "magickit-impl" in args["title"], (
+        f"title omits the repo label — two threads for {project!r} become "
+        f"indistinguishable in the UI (PR-gate #277 advisory): {args['title']!r}"
+    )
+    # Body carries the full path so basename collisions do not hide the
+    # underlying identity from the reader.
+    assert str(repo_dir) in args["propose_content"], (
+        f"propose_content omits the full repo_dir; only the basename is "
+        f"disambiguating on the title, and the propose body is the only "
+        f"place a reader can recover the full identity in a basename "
+        f"collision: {args['propose_content']!r}"
+    )
 
 
 @pytest.mark.anyio
@@ -338,7 +623,7 @@ async def test_open_alert_returns_already_exists_when_readback_sees_active_threa
     is now the read-back's ``status`` field, not the error_type.
     """
     project = "spirrow-verimend"
-    thread_id = "T-gate-bootstrap-spirrow-verimend"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_open_thread": _error_envelope(
@@ -351,7 +636,7 @@ async def test_open_alert_returns_already_exists_when_readback_sees_active_threa
             "chatroom_get_thread": _thread_summary_ok(project, thread_id, status="active"),
         }
     )
-    result = await open_alert(mcp, project=project)
+    result = await open_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     assert result == OpenResult(thread_id=thread_id, already_exists=True)
     # Load-bearing: the read-back was actually issued.
     reads = [name for name, _ in mcp.calls if name == "chatroom_get_thread"]
@@ -368,7 +653,7 @@ async def test_open_alert_accepts_awaiting_reply_as_target_reached() -> None:
     values satisfy that. Same result as the ``active`` case above.
     """
     project = "spirrow-verimend"
-    thread_id = "T-gate-bootstrap-spirrow-verimend"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_open_thread": _error_envelope(
@@ -378,7 +663,7 @@ async def test_open_alert_accepts_awaiting_reply_as_target_reached() -> None:
             "chatroom_get_thread": _thread_summary_ok(project, thread_id, status="awaiting_reply"),
         }
     )
-    result = await open_alert(mcp, project=project)
+    result = await open_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     assert result == OpenResult(thread_id=thread_id, already_exists=True)
 
 
@@ -398,7 +683,7 @@ async def test_open_alert_raises_when_readback_sees_resolved_thread() -> None:
     state would fail this test.
     """
     project = "spirrow-verimend"
-    thread_id = "T-gate-bootstrap-spirrow-verimend"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_open_thread": _error_envelope(
@@ -411,7 +696,7 @@ async def test_open_alert_raises_when_readback_sees_resolved_thread() -> None:
         }
     )
     with pytest.raises(MagickitMcpError) as excinfo:
-        await open_alert(mcp, project=project)
+        await open_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     # The raise must NAME the observed state so the operator can distinguish
     # "target unreached" from "transport failure" from "unknown".
     assert "state=resolved" in str(excinfo.value)
@@ -432,7 +717,7 @@ async def test_open_alert_raises_when_readback_status_is_absent() -> None:
     The safe direction is raise (fail-closed).
     """
     project = "spirrow-verimend"
-    thread_id = "T-gate-bootstrap-spirrow-verimend"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_open_thread": _error_envelope(
@@ -448,7 +733,7 @@ async def test_open_alert_raises_when_readback_status_is_absent() -> None:
         }
     )
     with pytest.raises(MagickitMcpError) as excinfo:
-        await open_alert(mcp, project=project)
+        await open_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     assert "state=unavailable" in str(excinfo.value)
 
 
@@ -471,7 +756,7 @@ async def test_open_alert_reraises_other_envelopes() -> None:
         }
     )
     with pytest.raises(MagickitMcpError, match="ChatroomAuthError"):
-        await open_alert(mcp, project="spirrow-verimend")
+        await open_alert(mcp, project="spirrow-verimend", repo_dir=_TEST_REPO_DIR)
 
 
 # --- close_alert ----------------------------------------------------------------------------------
@@ -555,7 +840,7 @@ async def test_close_alert_prechecks_then_closes_with_current_schema() -> None:
     invents one to bypass the gate.
     """
     project = "spirrow-verimend"
-    thread_id = "T-gate-bootstrap-spirrow-verimend"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _thread_summary_ok(project, thread_id),
@@ -565,6 +850,7 @@ async def test_close_alert_prechecks_then_closes_with_current_schema() -> None:
     result = await close_alert(
         mcp,
         project=project,
+        repo_dir=_TEST_REPO_DIR,
         merge_commit_sha="deadbeef",
     )
     assert result == CloseResult(thread_id=thread_id, was_open=True)
@@ -605,16 +891,17 @@ async def test_close_alert_precheck_not_found_makes_no_close_call() -> None:
     ``False`` and close_alert exits without touching ``chatroom_close_thread``.
     """
     project = "x"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _error_envelope(
                 "ChatroomNotFoundError",
-                "Thread 'T-gate-bootstrap-x' not found in project 'x'",
+                f"Thread {thread_id!r} not found in project {project!r}",
             ),
         }
     )
-    result = await close_alert(mcp, project=project)
-    assert result == CloseResult(thread_id="T-gate-bootstrap-x", was_open=False)
+    result = await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
+    assert result == CloseResult(thread_id=thread_id, was_open=False)
     # Load-bearing: the write-shaped call was never issued.
     close_calls = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
     assert close_calls == []
@@ -637,7 +924,7 @@ async def test_close_alert_precheck_resolved_skips_close_entirely() -> None:
     ground truth for the incident).
     """
     project = "spirrow-playproof"
-    thread_id = "T-gate-bootstrap-spirrow-playproof"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _thread_summary_ok(
@@ -645,7 +932,7 @@ async def test_close_alert_precheck_resolved_skips_close_entirely() -> None:
             ),
         }
     )
-    result = await close_alert(mcp, project=project)
+    result = await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     assert result == CloseResult(thread_id=thread_id, was_open=False, resolved_by_msg="msg-429")
     # Load-bearing: NO write-shaped call was issued.
     close_calls = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
@@ -665,13 +952,13 @@ async def test_close_alert_precheck_resolved_without_resolved_by_msg_surfaces_no
     ``status='resolved'`` alone determines the swallow.
     """
     project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _thread_summary_ok(project, thread_id, status="resolved"),
         }
     )
-    result = await close_alert(mcp, project=project)
+    result = await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     assert result == CloseResult(thread_id=thread_id, was_open=False, resolved_by_msg=None)
 
 
@@ -688,7 +975,7 @@ async def test_close_alert_race_resolved_between_precheck_and_close_swallows() -
     msg-2457's invariant blocking.
     """
     project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _SequencedResult(
@@ -707,7 +994,7 @@ async def test_close_alert_race_resolved_between_precheck_and_close_swallows() -
             ),
         }
     )
-    result = await close_alert(mcp, project=project)
+    result = await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     assert result == CloseResult(thread_id=thread_id, was_open=False, resolved_by_msg="msg-777")
     # Load-bearing: two reads happened (precheck + recheck) and one close.
     reads = [name for name, _ in mcp.calls if name == "chatroom_get_thread"]
@@ -726,7 +1013,7 @@ async def test_close_alert_raises_when_recheck_sees_active_after_refusal() -> No
     reading succeeds") would fail this test.
     """
     project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _thread_summary_ok(project, thread_id, status="active"),
@@ -737,7 +1024,7 @@ async def test_close_alert_raises_when_recheck_sees_active_after_refusal() -> No
         }
     )
     with pytest.raises(GateBootstrapCloseError) as excinfo:
-        await close_alert(mcp, project=project)
+        await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     # The raise must NAME the observed post-refusal state so the operator can
     # distinguish "target unreached" (this test) from "target reached but
     # refusal fired" (which is impossible — read-back returning 'resolved'
@@ -759,7 +1046,7 @@ async def test_close_alert_raises_when_recheck_cannot_confirm_state_after_refusa
     precheck re-classifies to ABSENT and the state self-heals in 1 loud line.
     """
     project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _SequencedResult(
@@ -780,7 +1067,7 @@ async def test_close_alert_raises_when_recheck_cannot_confirm_state_after_refusa
         }
     )
     with pytest.raises(GateBootstrapCloseError) as excinfo:
-        await close_alert(mcp, project=project)
+        await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     assert "state=unavailable" in str(excinfo.value)
 
 
@@ -812,7 +1099,7 @@ async def test_close_alert_raises_close_refused_on_precheck_permission_fault() -
         }
     )
     with pytest.raises(GateBootstrapCloseError, match="precheck refused"):
-        await close_alert(mcp, project=project)
+        await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     # Load-bearing: because the precheck raised, the write-shaped call was never
     # issued — the invariant does not weaken to "close_thread only".
     close_calls = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
@@ -821,7 +1108,7 @@ async def test_close_alert_raises_close_refused_on_precheck_permission_fault() -
     # the operator can read the underlying error type — same shape as the
     # close-boundary wrap below.
     try:
-        await close_alert(mcp, project=project)
+        await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     except GateBootstrapCloseError as wrapped:
         assert isinstance(wrapped.__cause__, MagickitMcpError)
         assert "read access denied" in str(wrapped.__cause__)
@@ -843,7 +1130,7 @@ async def test_close_alert_raises_close_refused_on_role_check_denial() -> None:
     contract is unchanged.
     """
     project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _thread_summary_ok(project, thread_id),
@@ -854,7 +1141,7 @@ async def test_close_alert_raises_close_refused_on_role_check_denial() -> None:
         }
     )
     with pytest.raises(GateBootstrapCloseError, match="closeable_roles"):
-        await close_alert(mcp, project=project)
+        await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
 
 
 @pytest.mark.anyio
@@ -886,7 +1173,7 @@ async def test_precheck_not_swallowed_when_permission_error_text_contains_not_fo
         }
     )
     with pytest.raises(GateBootstrapCloseError, match="precheck refused"):
-        await close_alert(mcp, project=project)
+        await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     close_calls = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
     assert close_calls == []
 
@@ -902,7 +1189,7 @@ async def test_close_boundary_not_swallowed_when_permission_error_text_contains_
     by construction.
     """
     project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _thread_summary_ok(project, thread_id),
@@ -913,7 +1200,7 @@ async def test_close_boundary_not_swallowed_when_permission_error_text_contains_
         }
     )
     with pytest.raises(GateBootstrapCloseError, match="closeable_roles"):
-        await close_alert(mcp, project=project)
+        await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
 
 
 def _elevated(payload: dict[str, Any]) -> MagickitMcpError:
@@ -1059,7 +1346,7 @@ async def test_close_alert_precheck_and_close_boundaries_both_surface_the_forger
     # ``_is_thread_not_found_envelope`` returning False → re-raise → wrap.
     at_precheck = _FakeMcp(results={"chatroom_get_thread": forged})
     with pytest.raises(GateBootstrapCloseError, match="precheck refused"):
-        await close_alert(at_precheck, project="x")
+        await close_alert(at_precheck, project="x", repo_dir=_TEST_REPO_DIR)
     assert [name for name, _ in at_precheck.calls] == ["chatroom_get_thread"]
 
     # Close boundary: precheck succeeds → close is issued → close fails →
@@ -1071,12 +1358,12 @@ async def test_close_alert_precheck_and_close_boundaries_both_surface_the_forger
     # this fake.
     at_close = _FakeMcp(
         results={
-            "chatroom_get_thread": _thread_summary_ok("x", "T-gate-bootstrap-x"),
+            "chatroom_get_thread": _thread_summary_ok("x", _tid("x")),
             "chatroom_close_thread": forged,
         }
     )
     with pytest.raises(GateBootstrapCloseError, match="chatroom_close_thread refused"):
-        await close_alert(at_close, project="x")
+        await close_alert(at_close, project="x", repo_dir=_TEST_REPO_DIR)
 
 
 # --- N-1..N-6 (S-2-prime / S-4-prime regression pins) -------------------------------------------
@@ -1103,7 +1390,7 @@ async def test_close_alert_swallows_when_random_error_type_and_readback_sees_res
     を固定する回帰テストなので、DoD の筆頭に置く。"
     """
     project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _SequencedResult(
@@ -1122,7 +1409,7 @@ async def test_close_alert_swallows_when_random_error_type_and_readback_sees_res
             ),
         }
     )
-    result = await close_alert(mcp, project=project)
+    result = await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     assert result == CloseResult(thread_id=thread_id, was_open=False, resolved_by_msg="msg-99")
 
 
@@ -1141,7 +1428,7 @@ async def test_close_alert_readback_runs_regardless_of_error_type() -> None:
     verifying that each drives the same number of read-back calls.
     """
     project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    thread_id = _tid(project)
 
     async def _run_one(refusal_error_type: str) -> _FakeMcp:
         mcp = _FakeMcp(
@@ -1159,7 +1446,7 @@ async def test_close_alert_readback_runs_regardless_of_error_type() -> None:
                 ),
             }
         )
-        result = await close_alert(mcp, project=project)
+        result = await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
         assert result.was_open is False
         return mcp
 
@@ -1183,7 +1470,7 @@ async def test_close_alert_readback_failure_at_recheck_boundary_raises() -> None
     against something we cannot see" bug family.
     """
     project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _SequencedResult(
@@ -1199,12 +1486,12 @@ async def test_close_alert_readback_failure_at_recheck_boundary_raises() -> None
             ),
             "chatroom_close_thread": _error_envelope(
                 "ChatroomStateError",
-                "Cannot close thread 'T-gate-bootstrap-x' in status='resolved'",
+                f"Cannot close thread {thread_id!r} in status='resolved'",
             ),
         }
     )
     with pytest.raises(GateBootstrapCloseError) as excinfo:
-        await close_alert(mcp, project=project)
+        await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     assert "state=unavailable" in str(excinfo.value)
 
 
@@ -1219,14 +1506,14 @@ async def test_close_alert_precheck_open_status_active_proceeds_to_close() -> No
     implementation that never issues the close.
     """
     project = "x"
-    thread_id = "T-gate-bootstrap-x"
+    thread_id = _tid(project)
     mcp = _FakeMcp(
         results={
             "chatroom_get_thread": _thread_summary_ok(project, thread_id, status="active"),
             "chatroom_close_thread": {"ok": True},
         }
     )
-    result = await close_alert(mcp, project=project)
+    result = await close_alert(mcp, project=project, repo_dir=_TEST_REPO_DIR)
     assert result == CloseResult(thread_id=thread_id, was_open=True, resolved_by_msg=None)
     closes = [name for name, _ in mcp.calls if name == "chatroom_close_thread"]
     assert closes == ["chatroom_close_thread"]
@@ -1262,7 +1549,7 @@ async def test_cli_run_tick_declared_calls_close_only(tmp_path: Path) -> None:
     側の指摘 (ii): 「閉じる対象が無いなら呼ばない」.
     """
     project = "spirrow-example"
-    thread_id = "T-gate-bootstrap-spirrow-example"
+    thread_id = thread_id_for(project, tmp_path)
     (tmp_path / ".mindwire-gate").write_text("#!/usr/bin/env bash\nexit 0\n")
     fake = _FakeMcp(
         results={
@@ -1319,7 +1606,7 @@ async def test_cli_run_tick_declared_skips_close_when_precheck_sees_resolved(
     §2 named as the ground truth).
     """
     project = "spirrow-playproof"
-    thread_id = "T-gate-bootstrap-spirrow-playproof"
+    thread_id = thread_id_for(project, tmp_path)
     (tmp_path / ".mindwire-gate").write_text("#!/usr/bin/env bash\nexit 0\n")
     fake = _FakeMcp(
         results={
@@ -1363,7 +1650,7 @@ async def test_cli_run_tick_declared_skips_close_when_alert_thread_absent(
     (msg-1963 D-4).
     """
     project = "spirrow-example"
-    thread_id = "T-gate-bootstrap-spirrow-example"
+    thread_id = thread_id_for(project, tmp_path)
     (tmp_path / ".mindwire-gate").write_text("#!/usr/bin/env bash\nexit 0\n")
     fake = _FakeMcp(
         results={
@@ -1401,6 +1688,7 @@ async def test_cli_run_tick_new_repo_opens_alert(tmp_path: Path) -> None:
     UNUSABLE fall-closed. The tick opens the fixed-id thread and reports it.
     """
     _init_repo(tmp_path)
+    expected_thread_id = thread_id_for("spirrow-newborn", tmp_path)
     fake = _FakeMcp(results={"chatroom_open_thread": {"ok": True}})
     exit_code, out = await _CLI._run_tick(
         "spirrow-newborn",
@@ -1413,9 +1701,9 @@ async def test_cli_run_tick_new_repo_opens_alert(tmp_path: Path) -> None:
     assert exit_code == 0
     assert out["status"] == GateStatus.NEW_REPO.value
     assert out["action"] == "opened"
-    assert out["thread_id"] == "T-gate-bootstrap-spirrow-newborn"
+    assert out["thread_id"] == expected_thread_id
     args = fake.args_for("chatroom_open_thread")
-    assert args["thread_id"] == "T-gate-bootstrap-spirrow-newborn"
+    assert args["thread_id"] == expected_thread_id
     assert set(args["tags"]) == set(ALERT_TAGS)
 
 

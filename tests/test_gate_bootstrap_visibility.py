@@ -76,6 +76,14 @@ from spirrow_mindwire.gate_bootstrap_visibility import (
     _State,
 )
 
+# ``thread_id_for`` now composes its id from both ``project`` and ``repo_dir``
+# (Bohr msg-3120 through msg-3122). These visibility tests do not exercise the
+# id derivation itself — they need a stable, deterministic id to build fakes
+# against. Kept as one module-level constant so a future change to the
+# derivation does not have to be chased across per-test literals.
+_TEST_REPO_DIR = Path("/tmp/gate-bootstrap-visibility-test-repo")
+
+
 # --- fakes ---------------------------------------------------------------------------------------
 
 
@@ -255,7 +263,7 @@ async def test_floor_holds_across_failing_posts() -> None:
         report = await vis.on_close_failure(
             mcp,
             project="spirrow-verimend",
-            thread_id=thread_id_for("spirrow-verimend"),
+            thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
             owner=DEFAULT_SWEEPER_OWNER,
             exc=GateBootstrapCloseError("simulated close refusal"),
         )
@@ -307,7 +315,7 @@ async def test_dedup_survives_foreign_writes() -> None:
         await vis.on_close_failure(
             mcp,
             project="spirrow-verimend",
-            thread_id=thread_id_for("spirrow-verimend"),
+            thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
             owner=DEFAULT_SWEEPER_OWNER,
             exc=GateBootstrapCloseError("close refusal"),
         )
@@ -344,7 +352,7 @@ async def test_fail_closed_when_state_write_fails() -> None:
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -401,7 +409,7 @@ async def test_human_close_clears_episode_without_permanent_suppression() -> Non
     r1 = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("initial refusal"),
     )
@@ -409,12 +417,16 @@ async def test_human_close_clears_episode_without_permanent_suppression() -> Non
 
     # Phase 2: human closes the thread → sweep's close call now returns
     # was_open=False → tick calls on_close_success → episode cleared.
-    vis.on_close_success(project="spirrow-verimend", thread_id=thread_id_for("spirrow-verimend"))
-    assert "spirrow-verimend" not in store.state.episodes, (
+    vis.on_close_success(
+        project="spirrow-verimend",
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
+    )
+    _tid = thread_id_for("spirrow-verimend", _TEST_REPO_DIR)
+    assert _tid not in store.state.episodes, (
         "on_close_success must clear the episode entry (Rule 1)"
     )
     # But the floor must NOT be cleared (Rule 2).
-    assert "spirrow-verimend" in store.state.floors, (
+    assert _tid in store.state.floors, (
         "on_close_success must NOT clear the floor (Rule 2: rate limiter must not be reset by "
         "the condition it is rate-limiting)"
     )
@@ -425,7 +437,7 @@ async def test_human_close_clears_episode_without_permanent_suppression() -> Non
     r3 = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("recurring refusal"),
     )
@@ -462,13 +474,13 @@ async def test_flap_does_not_restart_spam() -> None:
             # "no failure this tick" → close succeeded → clear episode.
             vis.on_close_success(
                 project="spirrow-verimend",
-                thread_id=thread_id_for("spirrow-verimend"),
+                thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
             )
         else:
             await vis.on_close_failure(
                 mcp,
                 project="spirrow-verimend",
-                thread_id=thread_id_for("spirrow-verimend"),
+                thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
                 owner=DEFAULT_SWEEPER_OWNER,
                 exc=GateBootstrapCloseError("flapping refusal"),
             )
@@ -566,19 +578,21 @@ def test_file_state_store_roundtrips(tmp_path: Path) -> None:
     """
     path = tmp_path / "state" / "gate_bootstrap_failure.json"
     store = FileFailureStateStore(path)
+    _verimend_tid = thread_id_for("spirrow-verimend", _TEST_REPO_DIR)
     state = _State(
         episodes={
-            "spirrow-verimend": FailureEpisode(
+            _verimend_tid: FailureEpisode(
                 project="spirrow-verimend",
-                thread_id=thread_id_for("spirrow-verimend"),
+                thread_id=_verimend_tid,
                 signature="GateBootstrapCloseError",
                 first_seen_at="2026-08-31T00:00:00+00:00",
                 reported_at="2026-08-31T00:00:00+00:00",
             ),
         },
         floors={
-            "spirrow-verimend": RateLimitFloor(
+            _verimend_tid: RateLimitFloor(
                 project="spirrow-verimend",
+                thread_id=_verimend_tid,
                 last_attempt_at="2026-08-31T00:00:00+00:00",
             ),
         },
@@ -622,7 +636,7 @@ async def test_failure_report_does_not_claim_close_will_wait_24h() -> None:
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("closeable_roles check failed"),
     )
@@ -666,20 +680,22 @@ async def test_read_failure_fails_closed_and_preserves_other_projects_state(tmp_
     # that a subsequent bug would erase.
     path = tmp_path / "state" / "gate_bootstrap_failure.json"
     real_store = FileFailureStateStore(path)
+    _bystander_tid = thread_id_for("spirrow-magickit", _TEST_REPO_DIR)
     real_store.save(
         _State(
             episodes={
-                "spirrow-magickit": FailureEpisode(
+                _bystander_tid: FailureEpisode(
                     project="spirrow-magickit",
-                    thread_id=thread_id_for("spirrow-magickit"),
+                    thread_id=_bystander_tid,
                     signature="GateBootstrapCloseError",
                     first_seen_at="2026-08-30T00:00:00+00:00",
                     reported_at="2026-08-30T00:00:00+00:00",
                 ),
             },
             floors={
-                "spirrow-magickit": RateLimitFloor(
+                _bystander_tid: RateLimitFloor(
                     project="spirrow-magickit",
+                    thread_id=_bystander_tid,
                     last_attempt_at="2026-08-30T00:00:00+00:00",
                 ),
             },
@@ -696,7 +712,7 @@ async def test_read_failure_fails_closed_and_preserves_other_projects_state(tmp_
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -877,13 +893,15 @@ async def test_concurrent_tick_updates_survive_our_post_await(tmp_path: Path) ->
     ``spirrow-voxelworld`` records get silently erased. That is
     precisely the lost-update bug this fix closes.
     """
-    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path = tmp_path / "state" / "gate_bootstrap_failure_v2.json"
+    _mindwire_tid = thread_id_for("spirrow-mindwire", _TEST_REPO_DIR)
     store = FileFailureStateStore(path)
     store.save(
         _State(
             floors={
-                "spirrow-mindwire": RateLimitFloor(
+                _mindwire_tid: RateLimitFloor(
                     project="spirrow-mindwire",
+                    thread_id=_mindwire_tid,
                     last_attempt_at="2026-08-30T00:00:00+00:00",
                 ),
             }
@@ -898,13 +916,15 @@ async def test_concurrent_tick_updates_survive_our_post_await(tmp_path: Path) ->
         # on-disk state (which now has our write-ahead save from
         # step 3), adding a third project's records, and saving.
         concurrent_state = store.load()
-        concurrent_state.floors["spirrow-voxelworld"] = RateLimitFloor(
+        _voxel_tid = thread_id_for("spirrow-voxelworld", _TEST_REPO_DIR)
+        concurrent_state.floors[_voxel_tid] = RateLimitFloor(
             project="spirrow-voxelworld",
+            thread_id=_voxel_tid,
             last_attempt_at="2026-08-31T00:05:00+00:00",
         )
-        concurrent_state.episodes["spirrow-voxelworld"] = FailureEpisode(
+        concurrent_state.episodes[_voxel_tid] = FailureEpisode(
             project="spirrow-voxelworld",
-            thread_id=thread_id_for("spirrow-voxelworld"),
+            thread_id=_voxel_tid,
             signature="GateBootstrapCloseError",
             first_seen_at="2026-08-31T00:05:00+00:00",
             reported_at="2026-08-31T00:05:00+00:00",
@@ -919,7 +939,7 @@ async def test_concurrent_tick_updates_survive_our_post_await(tmp_path: Path) ->
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -932,29 +952,31 @@ async def test_concurrent_tick_updates_survive_our_post_await(tmp_path: Path) ->
     final = store.load()
 
     # (1) Our own project's episode must have reported_at set (post ok).
-    assert "spirrow-verimend" in final.episodes
-    verimend_episode = final.episodes["spirrow-verimend"]
+    _verimend_tid = thread_id_for("spirrow-verimend", _TEST_REPO_DIR)
+    _voxel_tid = thread_id_for("spirrow-voxelworld", _TEST_REPO_DIR)
+    assert _verimend_tid in final.episodes
+    verimend_episode = final.episodes[_verimend_tid]
     assert verimend_episode.reported_at is not None
-    assert "spirrow-verimend" in final.floors
+    assert _verimend_tid in final.floors
 
     # (2) THE load-bearing assertion: the concurrent tick's project
     # records must survive. A regression will fail this — the pre-await
     # snapshot save at step 5 does not know about ``spirrow-voxelworld``
     # and blindly writes a state that does not contain it.
-    assert "spirrow-voxelworld" in final.floors, (
+    assert _voxel_tid in final.floors, (
         "concurrent tick's floor for spirrow-voxelworld was erased by our "
         "stale-state save — this is the PR #209 gate round-3 TOCTOU bug"
     )
-    assert "spirrow-voxelworld" in final.episodes, (
+    assert _voxel_tid in final.episodes, (
         "concurrent tick's episode for spirrow-voxelworld was erased by our "
         "stale-state save — this is the PR #209 gate round-3 TOCTOU bug"
     )
-    voxel_episode = final.episodes["spirrow-voxelworld"]
+    voxel_episode = final.episodes[_voxel_tid]
     assert voxel_episode.reported_at == "2026-08-31T00:05:00+00:00"
 
     # (3) Pre-existing bystander must also survive (unchanged floor).
-    assert "spirrow-mindwire" in final.floors
-    assert final.floors["spirrow-mindwire"].last_attempt_at == "2026-08-30T00:00:00+00:00"
+    assert _mindwire_tid in final.floors
+    assert final.floors[_mindwire_tid].last_attempt_at == "2026-08-30T00:00:00+00:00"
 
 
 @pytest.mark.anyio
@@ -1003,7 +1025,7 @@ async def test_post_success_when_reload_after_await_fails(tmp_path: Path) -> Non
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -1074,7 +1096,7 @@ async def test_visibility_survives_unicode_decode_error_in_state_file(tmp_path: 
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -1117,7 +1139,7 @@ async def test_on_close_success_survives_unicode_decode_error_in_state_file(tmp_
     # Must not raise.
     vis.on_close_success(
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
     )
     # File is unchanged (no partial overwrite).
     assert path.read_bytes() == b"\xff\xfe invalid utf-8"
@@ -1213,21 +1235,30 @@ def test_file_state_store_load_raises_on_malformed_episode_entry(tmp_path: Path)
     This test writes a state file with a well-formed bystander entry
     PLUS a malformed episode (missing the required ``thread_id`` key)
     and asserts that ``load()`` raises :class:`StateFileMalformedError`.
+
+    Both entries are keyed by ``thread_id`` (schema v2 — T-new-project-
+    gate-bootstrap msg-3750 §2). The well-formed entry's ``thread_id``
+    field mirrors the outer key so the key/value invariant is satisfied
+    and the malformed entry is the sole reason the load fails.
     """
-    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path = tmp_path / "state" / "gate_bootstrap_failure_v2.json"
     path.parent.mkdir(parents=True)
     # Well-formed bystander + malformed target (missing thread_id).
+    _magickit_tid = "T-gate-bootstrap-spirrow-magickit-x-y-abcdef"
+    _verimend_tid = "T-gate-bootstrap-spirrow-verimend-x-y-fedcba"
     path.write_text(
         json.dumps(
             {
                 "episodes": {
-                    "spirrow-magickit": {
-                        "thread_id": "T-gate-bootstrap-spirrow-magickit",
+                    _magickit_tid: {
+                        "project": "spirrow-magickit",
+                        "thread_id": _magickit_tid,
                         "signature": "GateBootstrapCloseError",
                         "first_seen_at": "2026-08-30T00:00:00+00:00",
                         "reported_at": "2026-08-30T00:00:00+00:00",
                     },
-                    "spirrow-verimend": {
+                    _verimend_tid: {
+                        "project": "spirrow-verimend",
                         # thread_id INTENTIONALLY missing — schema drift.
                         "signature": "GateBootstrapCloseError",
                         "first_seen_at": "2026-08-31T00:00:00+00:00",
@@ -1251,14 +1282,17 @@ def test_file_state_store_load_raises_on_malformed_floor_entry(tmp_path: Path) -
     refactor cannot accidentally regress one section while the other
     stays green.
     """
-    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path = tmp_path / "state" / "gate_bootstrap_failure_v2.json"
     path.parent.mkdir(parents=True)
+    _verimend_tid = "T-gate-bootstrap-spirrow-verimend-x-y-abcdef"
     path.write_text(
         json.dumps(
             {
                 "episodes": {},
                 "floors": {
-                    "spirrow-verimend": {
+                    _verimend_tid: {
+                        "project": "spirrow-verimend",
+                        "thread_id": _verimend_tid,
                         # last_attempt_at INTENTIONALLY missing.
                     },
                 },
@@ -1319,24 +1353,30 @@ async def test_malformed_entry_does_not_erase_state_file(tmp_path: Path) -> None
     entry permanently. The on-disk bytes-equal assertion catches
     that exactly.
     """
-    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path = tmp_path / "state" / "gate_bootstrap_failure_v2.json"
     path.parent.mkdir(parents=True)
+    _magickit_tid = "T-gate-bootstrap-spirrow-magickit-x-y-abcdef"
+    _corrupted_tid = "T-gate-bootstrap-spirrow-corrupted-x-y-fedcba"
     pre_bytes = json.dumps(
         {
             "episodes": {
-                "spirrow-magickit": {
-                    "thread_id": "T-gate-bootstrap-spirrow-magickit",
+                _magickit_tid: {
+                    "project": "spirrow-magickit",
+                    "thread_id": _magickit_tid,
                     "signature": "GateBootstrapCloseError",
                     "first_seen_at": "2026-08-30T00:00:00+00:00",
                     "reported_at": "2026-08-30T00:00:00+00:00",
                 },
-                "spirrow-corrupted": {
-                    # Malformed on purpose.
+                _corrupted_tid: {
+                    "project": "spirrow-corrupted",
+                    # Malformed on purpose — no thread_id / first_seen_at.
                     "signature": "GateBootstrapCloseError",
                 },
             },
             "floors": {
-                "spirrow-magickit": {
+                _magickit_tid: {
+                    "project": "spirrow-magickit",
+                    "thread_id": _magickit_tid,
                     "last_attempt_at": "2026-08-30T00:00:00+00:00",
                 },
             },
@@ -1351,7 +1391,7 @@ async def test_malformed_entry_does_not_erase_state_file(tmp_path: Path) -> None
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -1411,16 +1451,19 @@ async def test_visibility_survives_naive_timestamp_in_state_file(tmp_path: Path)
          (proof the naive value did not survive to cause a future
          crash).
     """
-    path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    path = tmp_path / "state" / "gate_bootstrap_failure_v2.json"
     path.parent.mkdir(parents=True)
     # Naive ISO timestamp — no timezone, no ``Z``. Legal ISO-8601 but
     # produces a naive ``datetime`` from ``fromisoformat``.
+    _verimend_tid = thread_id_for("spirrow-verimend", _TEST_REPO_DIR)
     path.write_text(
         json.dumps(
             {
                 "episodes": {},
                 "floors": {
-                    "spirrow-verimend": {
+                    _verimend_tid: {
+                        "project": "spirrow-verimend",
+                        "thread_id": _verimend_tid,
                         "last_attempt_at": "2026-08-31T12:00:00",  # NAIVE
                     },
                 },
@@ -1438,7 +1481,7 @@ async def test_visibility_survives_naive_timestamp_in_state_file(tmp_path: Path)
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-verimend",
-        thread_id=thread_id_for("spirrow-verimend"),
+        thread_id=thread_id_for("spirrow-verimend", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refusal"),
     )
@@ -1454,8 +1497,9 @@ async def test_visibility_survives_naive_timestamp_in_state_file(tmp_path: Path)
     # And the naive floor was replaced with an aware one, so a future
     # tick will not re-trip the same bug.
     final = store.load()
-    assert "spirrow-verimend" in final.floors
-    replaced = final.floors["spirrow-verimend"].last_attempt_at
+    _verimend_tid = thread_id_for("spirrow-verimend", _TEST_REPO_DIR)
+    assert _verimend_tid in final.floors
+    replaced = final.floors[_verimend_tid].last_attempt_at
     # Aware ISO-8601 always ends with an explicit offset ("+00:00")
     # or "Z"; naive never does. This is a structural check that the
     # replacement is not itself naive.
@@ -1646,7 +1690,10 @@ async def test_precheck_read_fault_reports_through_the_unified_surface(tmp_path:
     )
     posts = [args for name, args in mcp.calls if name == "chatroom_post_message"]
     assert len(posts) == 1
-    assert posts[0]["thread_id"] == "T-gate-bootstrap-spirrow-example"
+    # The thread id is derived from ``(project, repo_dir)`` at tick time
+    # (Bohr msg-3120 through msg-3122). The tick's ``repo_dir`` in this test
+    # is the ``repo_dir`` fixture built above, so use the same derivation here.
+    assert posts[0]["thread_id"] == thread_id_for("spirrow-example", repo_dir)
 
 
 # --------------------------------------------------------------------------- #
@@ -1699,7 +1746,7 @@ async def test_w2_post_refused_thread_resolved_is_terminal_clears_episode() -> N
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-example",
-        thread_id=thread_id_for("spirrow-example"),
+        thread_id=thread_id_for("spirrow-example", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refused"),
     )
@@ -1708,9 +1755,10 @@ async def test_w2_post_refused_thread_resolved_is_terminal_clears_episode() -> N
         f"expected terminal action, got {report.action!r}: {report.reason!r}"
     )
     # Episode cleared — goal state observed.
-    assert "spirrow-example" not in store.state.episodes
+    _example_tid = thread_id_for("spirrow-example", _TEST_REPO_DIR)
+    assert _example_tid not in store.state.episodes
     # Floor preserved — Rule 2 flapping protection.
-    assert "spirrow-example" in store.state.floors
+    assert _example_tid in store.state.floors
 
 
 @pytest.mark.anyio
@@ -1733,7 +1781,7 @@ async def test_w2_post_refused_thread_resolved_never_raises() -> None:
     _ = await vis.on_close_failure(
         mcp,
         project="spirrow-example",
-        thread_id=thread_id_for("spirrow-example"),
+        thread_id=thread_id_for("spirrow-example", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refused"),
     )
@@ -1757,9 +1805,188 @@ async def test_w2_post_refused_thread_resolved_is_distinct_from_generic_post_fai
     report = await vis.on_close_failure(
         mcp,
         project="spirrow-example",
-        thread_id=thread_id_for("spirrow-example"),
+        thread_id=thread_id_for("spirrow-example", _TEST_REPO_DIR),
         owner=DEFAULT_SWEEPER_OWNER,
         exc=GateBootstrapCloseError("close refused"),
     )
     assert report.action == "post_terminal_thread_resolved"
     assert report.action != "post_failed"
+
+
+# --------------------------------------------------------------------------- #
+# T-new-project-gate-bootstrap msg-3750: Instance-level (thread_id) state keying
+# --------------------------------------------------------------------------- #
+#
+# PR-gate on PR #277 blocking `correctness`: the alert-thread identity was
+# re-keyed to ``(project, repo_dir)`` in the msg-3120..msg-3122 iteration, but
+# the visibility state kept keying by ``project`` alone. That combination lets
+# a successful ``on_close_success`` in one repo delete the cooldown for a
+# sibling repo of the same project, causing the failing sibling to spam on
+# the next tick. msg-3750 §2 pins both maps to ``thread_id`` — the tests
+# below exercise the exact reproduction case.
+
+
+@pytest.mark.anyio
+async def test_visibility_state_isolates_repos_under_same_project() -> None:
+    """Independent sibling repos must NOT be rate-limited by each other's floor.
+
+    T-new-project-gate-bootstrap msg-3750 §2, corrected against the
+    PR-gate on head e1185b6's ``docs`` advisory (msg-3159's original
+    prose named the wrong mechanism — see the "Instance-level keying"
+    paragraph in :mod:`spirrow_mindwire.gate_bootstrap_visibility` for
+    the whole story). The dominant observable failure of the old
+    ``project``-keyed schema is that sibling A's ``on_close_failure``
+    writes ``floors[project]`` and sibling B's later ``on_close_failure``
+    reads the same slot, finds A's entry, and returns ``floor_blocked``
+    — B's independent failure never reaches its own alert thread.
+
+    Sequence (exercises exactly that mechanism):
+      1. Sibling A (``magickit-impl``) fails to close → ``on_close_failure``
+         writes A's floor and posts A's report.
+      2. Five minutes later, sibling B (``mindwire-impl`` under the SAME
+         ``project``) fails independently. B's floor lookup MUST see nothing
+         (Instance-level isolation) and B's report MUST post.
+
+    Under the pre-fix schema (project-keyed floors), step 2 would find A's
+    floor at ``floors["spirrow-magickit"]`` (5min < 24h) and return
+    ``floor_blocked`` — the concrete regression this test reds against.
+    Under the fixed schema (thread_id-keyed floors), the two siblings hold
+    independent slots and both get to post.
+    """
+    project = "spirrow-magickit"
+    sibling_a = Path("/tmp/gate-bootstrap-magickit-impl")
+    sibling_b = Path("/tmp/gate-bootstrap-mindwire-impl")
+    tid_a = thread_id_for(project, sibling_a)
+    tid_b = thread_id_for(project, sibling_b)
+    assert tid_a != tid_b, "test setup broken: siblings must have distinct thread ids"
+
+    store = _MemoryStore()
+    now = _clock(datetime(2026, 9, 20, 0, 0, tzinfo=UTC))
+    vis = CloseFailureVisibility(store, now=now)
+    mcp = _RecordingMcp()  # default: post succeeds
+
+    # Step 1: sibling A fails, posts, writes its floor.
+    r1 = await vis.on_close_failure(
+        mcp,
+        project=project,
+        thread_id=tid_a,
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("A close refused"),
+    )
+    assert r1.action == "posted"
+    assert len(mcp.post_calls()) == 1
+
+    # Step 2: 5 minutes later, sibling B (different repo, same project)
+    # fails independently. Under the pre-fix ``project``-keyed schema
+    # this would floor_block against A's cooldown; under the fixed
+    # ``thread_id``-keyed schema each sibling has its own floor slot.
+    r2 = await vis.on_close_failure(
+        mcp,
+        project=project,
+        thread_id=tid_b,
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("B close refused"),
+    )
+    assert r2.action == "posted", (
+        f"sibling B was rate-limited by sibling A's cooldown — the "
+        f"PR-gate #277 correctness reproduction (msg-3750 §2). The old "
+        f"schema keyed floors by ``project`` alone, so B's independent "
+        f"failure looked up A's entry at 5min and returned "
+        f"floor_blocked. Got action={r2.action!r} reason={r2.reason!r}"
+    )
+
+    # Two independent posts landed, one per sibling.
+    assert len(mcp.post_calls()) == 2, (
+        f"expected two independent post attempts (one per sibling); got "
+        f"{len(mcp.post_calls())}. Each sibling must hold its own floor."
+    )
+
+    # Both siblings' floors coexist in state — the load-bearing structural
+    # check the rewrite of this test made possible: if either was missing,
+    # the rate limiter's identity is not per-thread.
+    assert tid_a in store.state.floors, (
+        "sibling A's floor was not recorded — the write-ahead step's "
+        "``floors[thread_id] = ...`` did not fire for A"
+    )
+    assert tid_b in store.state.floors, (
+        "sibling B's floor was not recorded — the write-ahead step's "
+        "``floors[thread_id] = ...`` did not fire for B (this is the "
+        "assertion a project-keyed regression would fail: B's write "
+        "would have overwritten A's entry at the shared project slot)"
+    )
+    # And neither entry accidentally aliases the other.
+    assert store.state.floors[tid_a] is not store.state.floors[tid_b]
+
+    # Third check: sibling A tries again inside its own 24h window. This
+    # time the floor MUST block (A's own cooldown, keyed by its own
+    # thread_id). This half of the test guards the OTHER direction: a
+    # naive fix that removed the floor entirely would still pass step 2
+    # but would let A itself spam.
+    r3 = await vis.on_close_failure(
+        mcp,
+        project=project,
+        thread_id=tid_a,
+        owner=DEFAULT_SWEEPER_OWNER,
+        exc=GateBootstrapCloseError("A close still refused"),
+    )
+    assert r3.action == "floor_blocked", (
+        f"sibling A's own 24h floor did not block a same-thread retry — "
+        f"got action={r3.action!r} reason={r3.reason!r}. The per-thread "
+        f"floor must still enforce the 24h bound within one thread."
+    )
+    assert len(mcp.post_calls()) == 2, (
+        "A's second failure attempt should NOT have produced a third "
+        "post; the per-thread floor bounds each thread to one attempt "
+        "per 24h"
+    )
+
+
+def test_visibility_state_file_v2_starts_empty_when_v1_exists(tmp_path: Path) -> None:
+    """A pre-existing v1 file on disk MUST NOT feed into the v2 store.
+
+    msg-3750 §3 M1: the schema-version rename (``gate_bootstrap_failure``
+    → ``gate_bootstrap_failure_v2``) intentionally orphans the v1 file
+    rather than migrating it. Cooldown records live at most 24 hours, so
+    writing runtime migration for them is OverScope (Principle 1). This
+    test writes a v1 file and confirms that a v2 store constructed at
+    the sibling path does not observe it — the v2 file is absent, so
+    loading returns empty state.
+
+    A regression that pointed the store at the v1 path would fail this
+    test with the pre-populated data leaking through.
+    """
+    v1_path = tmp_path / "state" / "gate_bootstrap_failure.json"
+    v2_path = tmp_path / "state" / "gate_bootstrap_failure_v2.json"
+    v1_path.parent.mkdir(parents=True)
+    # Content is deliberately not valid under the v2 schema (v1 keyed by
+    # ``project``, no ``project`` field on the value); if the store
+    # accidentally opened this file, decoding would fail loudly rather
+    # than silently loading — either verdict fails the test differently
+    # from the pass condition below.
+    v1_path.write_text(
+        json.dumps(
+            {
+                "episodes": {
+                    "spirrow-magickit": {
+                        "thread_id": "T-gate-bootstrap-spirrow-magickit",
+                        "signature": "GateBootstrapCloseError",
+                        "first_seen_at": "2026-08-30T00:00:00+00:00",
+                        "reported_at": "2026-08-30T00:00:00+00:00",
+                    },
+                },
+                "floors": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    v2_store = FileFailureStateStore(v2_path)
+    loaded = v2_store.load()
+
+    assert loaded.episodes == {}, (
+        "v2 store loaded a v1 file's records; the schema-version rename "
+        "in msg-3750 §3 M1 requires the v1 file to be orphaned"
+    )
+    assert loaded.floors == {}
+    # v1 file must remain on disk (msg-3750 §3 M1: leave it for a human).
+    assert v1_path.exists()
