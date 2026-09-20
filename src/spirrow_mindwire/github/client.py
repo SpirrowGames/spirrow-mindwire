@@ -1403,13 +1403,13 @@ class GitHubClient:
     async def fetch_file_at(self, pr: PrRef, *, path: str, ref: str) -> str | None:
         """``GET /repos/{owner}/{repo}/contents/{path}?ref={ref}`` → raw file bytes at ``ref``.
 
-        The T-gate-blocks-on-miscounted-line-numbers verification step. When a blocking
-        objection cites ``path:line``, the driver reads the head-side file at ``ref`` (the
-        PR's ``head.sha``) so the citation can be checked against the actual tree the
+        Backs the naysayer's citation-verification step: when a blocking objection
+        cites ``path:line``, the driver reads the head-side file at ``ref`` (the PR's
+        ``head.sha``) so the citation can be checked against the actual tree the
         reviewer saw — not the compare-diff, which loses the line-number frame outside
         each hunk.
 
-        Fail direction is fixed by design (Bohr msg-3604 D-7 endorsed by Einstein msg-3605):
+        Fail direction is fixed by design:
 
         * ``404`` → ``None``. "The path does not exist at ``ref``" is a definite,
           machine-readable answer distinct from "we could not ask"; the caller keeps the
@@ -1425,13 +1425,12 @@ class GitHubClient:
         return the raw bytes rather than the base64-wrapped JSON envelope. GitHub decodes
         the blob server-side so the driver can compare a specific line's text directly.
 
-        URL encoding note (PR #307 gate correction + follow-up structured-URL fix).
-        The GitHub ``/contents/{path}`` endpoint is a catch-all route: ``path`` must
-        reach GitHub as ordinary URL path segments — a raw ``/`` between ``Docs`` and
-        ``T07-recorder-spec.md``, not the percent-encoded ``%2F``. Encoding the
-        separator asks GitHub for a single file literally named
-        ``Docs/T07-recorder-spec.md`` at the repository root, which always 404s for
-        any nested path. So each segment is encoded individually
+        URL construction. The GitHub ``/contents/{path}`` endpoint is a catch-all
+        route: ``path`` must reach GitHub as ordinary URL path segments — a raw ``/``
+        between ``Docs`` and ``T07-recorder-spec.md``, not the percent-encoded
+        ``%2F``. Encoding the separator asks GitHub for a single file literally
+        named ``Docs/T07-recorder-spec.md`` at the repository root, which always
+        404s for any nested path. So each segment is encoded individually
         (``quote(seg, safe="")`` handles spaces and other reserved characters within
         a segment) and joined with a raw ``/``.
 
@@ -1442,39 +1441,34 @@ class GitHubClient:
         letting ``client.get(str)`` run it through httpx's URL parser: that path
         works today only because httpx's parser recognises ``%XX`` sequences and
         chooses not to double-encode them, which is not part of httpx's stable
-        contract (PR #307 gate re-review advisory). ``raw_path`` bypasses the parser
-        entirely — the bytes we build here are the bytes GitHub receives.
+        contract. ``raw_path`` bypasses the parser entirely — the bytes we build
+        here are the bytes GitHub receives.
 
         ``ref`` is folded in via :meth:`httpx.URL.copy_merge_params`, so httpx
         applies query-string encoding to the value (SHA fragments that happen to be
         anything other than plain hex therefore round-trip correctly), still without
         the URL going through a string parser.
 
-        Known limitations (recorded so a future operator can find them without
-        re-reading a chatroom thread — Einstein advisory on PR #316's disposition).
+        Known limitations:
 
         * **GitHub Enterprise Server ``base_url`` prefix is dropped.** The absolute
-          ``raw_path`` we build here starts at ``/repos/...``, and
+          ``raw_path`` built here starts at ``/repos/...``, and
           :meth:`httpx.URL.copy_with` replaces the URL path wholesale rather than
           appending. A ``base_url`` configured as ``https://ghe.example.com/api/v3/``
-          would therefore produce ``https://ghe.example.com/repos/...``, dropping the
-          ``/api/v3`` routing prefix that GHES needs. This is not a regression from
-          PR #307 — the earlier ``client.get("/repos/...")`` form had the same
-          absolute-path override — but it means this client is not GHES-ready as
-          written. Fix, when a GHES deployment is on the table: read
-          ``self._client.base_url.raw_path`` and prepend it to the ``raw_path`` we
-          build here (stripping duplicated leading ``/``). Deferred as debt because
-          no GHES deployment target is on the roadmap; landing dead code for a
-          hypothetical deployment fails Principle 1.
+          would therefore produce ``https://ghe.example.com/repos/...``, dropping
+          the ``/api/v3`` routing prefix that GHES needs, so this client is not
+          GHES-ready as written. Fix, when a GHES deployment is on the table: read
+          ``self._client.base_url.raw_path`` and prepend it to the ``raw_path`` built
+          here (stripping duplicated leading ``/``). Deferred as debt because no GHES
+          deployment target is on the roadmap; landing dead code for a hypothetical
+          deployment fails Principle 1.
         * **Exception message uses the decoded path (``url.path``), which is not
           copy-paste-ready for ``curl``.** Reserved characters in the file path
           (spaces, ``#``, ``?``) reach the exception string in their decoded form
           and would need to be re-encoded before an operator could paste the logged
           path into a shell. Accepted as an operability downgrade in exchange for
           removing the parallel ``contents_path`` string that would otherwise have
-          to track ``raw_path`` in lockstep (human A on msg-3786; v2 trigger pinned
-          at "≥1 operator report of a broken copy-paste debug path within 3 weeks
-          of PR #316 landing" — Bohr msg-3787).
+          to track ``raw_path`` in lockstep.
 
         See :func:`spirrow_mindwire.naysayer.pr_review.verify_citations` for the caller
         contract (memoisation on ``(path, ref)``, single-line-``where`` gate, empty-line
