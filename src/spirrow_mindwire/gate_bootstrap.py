@@ -54,6 +54,7 @@ rejects (msg-1965 N-4).
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import subprocess
 from collections.abc import Sequence
@@ -434,7 +435,7 @@ def inspect_gate(
 def _normalize_repo_dir(repo_dir: Any) -> str:
     """Return a canonical form of ``repo_dir`` for :func:`thread_id_for`.
 
-    Windows / POSIX 両対応の正準形. Two normalisations run:
+    Two normalisations run:
 
     1. **Backslash folding**. Every ``\\`` becomes ``/``. Windows can
        spell the same filesystem entity with either separator, and the
@@ -442,50 +443,64 @@ def _normalize_repo_dir(repo_dir: Any) -> str:
        ``argparse type=Path`` boundary that keeps whichever separator
        the caller wrote. Folding early makes the rest of the function
        separator-agnostic.
-    2. **Case folding — Windows only**. Windows filesystems are
+    2. **Case folding — Windows host only**. Windows filesystems are
        case-insensitive by default (``C:/foo`` and ``c:/FOO`` name the
        same entity), so the same entity must map to the same thread id.
        POSIX filesystems are case-sensitive: ``/tmp/Repo`` and
        ``/tmp/repo`` are two distinct directories, and folding case
        across them would re-introduce the exact cross-repo collision
-       PR #277 exists to close (PR-gate on head ``e1185b6`` blocking
-       ``edge-case``: an unconditional ``.lower()`` on POSIX turns two
-       distinct sibling repos into one identity, and their alert
-       threads AND visibility cooldowns start overwriting each other).
+       PR #277 exists to close.
 
-    The Windows detection reads the first slash-folded characters
-    only — a drive-letter prefix (``[A-Za-z]:``) or a UNC prefix
-    (``//`` after folding) is a Windows path. Any other shape is
-    POSIX. The rule is deliberately syntactic on the ``repo_dir``
-    string, not on the runtime OS: a Windows daemon host may in
-    principle receive a POSIX path in its config, and the identity
-    of that path must not change if the sweep migrates hosts.
+    The Windows/POSIX decision reads ``os.name`` — the runtime OS
+    of the process that hosts the sweep. Rationale: the sweep runs
+    on the host that owns the filesystem the paths point at, so the
+    OS Python sees IS the OS whose case-sensitivity rules apply.
 
-    This is the ONE normalisation used by :func:`thread_id_for` for
-    BOTH the slug and the hash suffix (Bohr msg-3122 §2 change 3):
-    using two different normalisations here would cause ``C:/foo``
-    and ``c:/FOO`` to slugify to the same string but hash to different
-    digests, producing two thread ids for a single filesystem entity —
-    the mirror of the collision this whole change exists to close.
+    **Why not a syntactic detector.** Two earlier attempts tried to
+    infer OS from the path string itself (drive-letter or UNC prefix
+    → Windows; otherwise POSIX). The PR-gate on head ``c71041f``
+    named two boundary conditions that break the heuristic:
+
+    * Relative Windows paths (``workspace\\repo``) lack both a
+      drive-letter and a UNC prefix → misclassified as POSIX →
+      case preserved. On a Windows host that reintroduces the
+      cross-repo collision the whole change closes.
+    * POSIX paths starting with ``//`` (implementation-defined
+      leading double slash, occasionally emitted by path
+      concatenation) match a UNC heuristic → misclassified as
+      Windows → case folded. On a POSIX host that folds two
+      genuinely distinct directories into one identity.
+
+    ``os.name`` sidesteps both because it names the actual
+    filesystem semantics rather than trying to infer them from
+    an ambiguous string. Consequence: the identity of a given
+    ``repo_dir`` string is stable within a host, but the SAME
+    string on different hosts may map to different identities —
+    that is the correct behaviour, because a Windows path on
+    POSIX and a POSIX path on Windows are not the same filesystem
+    entity (they are not on the same filesystem at all). If the
+    sweep ever migrates hosts (Windows → POSIX or vice versa),
+    identities re-key on the first tick — a rare event and the
+    :func:`visibility_state_path` M1 orphan-and-forget migration
+    absorbs the transient state churn without operator action.
+
+    ``os.name`` is read at call time (not cached at import) so
+    tests can drive both branches on either CI platform with
+    :meth:`pytest.MonkeyPatch.setattr`.
+
+    This is the ONE normalisation used by :func:`thread_id_for`
+    for BOTH the slug and the hash suffix (Bohr msg-3122 §2
+    change 3): using two different normalisations here would
+    cause the same filesystem entity to slugify one way and hash
+    another, producing two thread ids for one entity — the
+    mirror of the collision this whole change exists to close.
     """
     slashed = str(repo_dir).replace("\\", "/")
-    # Windows path: drive-letter (``C:/``) or UNC (``//server/share``)
-    # prefix, in either case AFTER slash-folding. Preserves case only
-    # in the tail, but Windows' whole-path case-insensitive semantics
-    # justify a whole-string ``.lower()`` here.
-    if _WINDOWS_PATH_RE.match(slashed) or slashed.startswith("//"):
+    if os.name == "nt":
+        # Windows: case-insensitive filesystem semantics.
         return slashed.lower()
-    # POSIX path: preserve case. ``/tmp/Repo`` and ``/tmp/repo`` are
-    # distinct filesystem entities; either identity is authoritative
-    # and must reach a distinct hash suffix in :func:`thread_id_for`.
+    # POSIX: case-sensitive filesystem semantics. Preserve case.
     return slashed
-
-
-# Compiled once — Windows drive-letter prefix. Anchored at the start
-# so a directory NAME that happens to contain ``:`` in the middle
-# (which is illegal on Windows anyway but legal on POSIX) does not
-# accidentally trigger case folding.
-_WINDOWS_PATH_RE = re.compile(r"^[A-Za-z]:")
 
 
 def thread_id_for(project: str, repo_dir: Any) -> str:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -331,8 +332,10 @@ def test_thread_id_for_is_injective_over_repo_dir() -> None:
     assert b != c
 
 
-def test_thread_id_for_handles_windows_and_posix_paths() -> None:
-    """``C:\\...`` and ``C:/...`` (and the case variants) all land on ONE id.
+def test_thread_id_for_handles_windows_and_posix_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a Windows host, ``C:\\...`` and ``C:/...`` (and the case variants) all land on ONE id.
 
     Rationale in :func:`spirrow_mindwire.gate_bootstrap._normalize_repo_dir`:
     Windows filesystems are case-insensitive and both separator styles refer
@@ -340,29 +343,60 @@ def test_thread_id_for_handles_windows_and_posix_paths() -> None:
     same repo would end up with two thread ids depending on how PowerShell
     or Python happened to write the path this tick (Bohr msg-3122 §2 change
     3, "同じ entity なのに別 key" の逆方向のバグ).
+
+    ``os.name`` is monkeypatched so this invariant is exercised regardless
+    of what platform CI runs on. The pin is the Windows filesystem's
+    case-insensitive semantics — the OS the sweep host runs is what
+    :func:`_normalize_repo_dir` consults at call time (PR-gate on head
+    c71041f follow-up).
     """
+    monkeypatch.setattr(os, "name", "nt")
     project = "spirrow-magickit"
     forward = thread_id_for(project, "C:/workspace/sandbox/magickit-impl")
     backward = thread_id_for(project, "C:\\workspace\\sandbox\\magickit-impl")
     upper = thread_id_for(project, "C:/Workspace/Sandbox/Magickit-Impl")
     mixed = thread_id_for(project, "c:\\WORKSPACE/sandbox\\MAGICKIT-impl")
     assert forward == backward == upper == mixed
+    # And the boundary case the PR-gate on head c71041f named — a
+    # RELATIVE Windows path (no drive letter, no UNC prefix) must also
+    # fold case, because on a Windows host the filesystem still applies
+    # case-insensitive semantics regardless of whether the path is
+    # relative or absolute. A syntactic detector would misclassify
+    # ``workspace\\repo`` as POSIX and skip the fold; ``os.name`` sees
+    # the actual filesystem and folds correctly.
+    rel_lower = thread_id_for(project, "workspace/repo")
+    rel_upper = thread_id_for(project, "WORKSPACE\\repo")
+    assert rel_lower == rel_upper, (
+        "relative Windows paths did NOT fold case — this is the c71041f "
+        "PR-gate boundary case #1 (relative paths bypassed a syntactic "
+        "detector because they lack drive-letter / UNC prefix)"
+    )
 
 
-def test_thread_id_for_preserves_posix_case_sensitivity() -> None:
-    """POSIX paths that differ only in case MUST land on DIFFERENT thread ids.
+def test_thread_id_for_preserves_posix_case_sensitivity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a POSIX host, POSIX paths that differ only in case MUST land on DIFFERENT thread ids.
 
     Pins the PR-gate on head e1185b6 blocking `edge-case`. POSIX filesystems
     are case-sensitive: ``/tmp/Repo`` and ``/tmp/repo`` are two distinct
     directories, and folding case across them would re-introduce the same
-    cross-repo collision PR #277 was opened to close. Windows detection in
-    :func:`_normalize_repo_dir` is syntactic — a drive-letter prefix or a UNC
-    prefix — so a path that starts with a plain ``/`` is treated as POSIX
-    and its case is preserved.
+    cross-repo collision PR #277 was opened to close.
 
-    A regression that reverts to an unconditional ``.lower()`` would fail
-    this test.
+    ``os.name`` is monkeypatched to ``"posix"`` so this invariant runs on
+    any CI platform — the pin is POSIX filesystem semantics, not whatever
+    OS happens to host the test process.
+
+    Also pins the boundary case the PR-gate on head c71041f named: a POSIX
+    path starting with ``//`` (implementation-defined leading double slash,
+    occasionally emitted by path concatenation) MUST NOT be misclassified
+    as UNC and case-folded. Under ``os.name == "posix"`` the double slash
+    is treated as POSIX and case is preserved.
+
+    A regression that reverts to an unconditional ``.lower()``, or to a
+    syntactic UNC detector, would fail this test.
     """
+    monkeypatch.setattr(os, "name", "posix")
     project = "spirrow-example"
     lower = thread_id_for(project, "/tmp/gate-bootstrap/repo")
     mixed = thread_id_for(project, "/tmp/gate-bootstrap/Repo")
@@ -378,14 +412,15 @@ def test_thread_id_for_preserves_posix_case_sensitivity() -> None:
         "are distinct filesystem entities; ``_normalize_repo_dir`` must "
         "not fold case across them"
     )
-    # Windows-shaped path with the same characters MUST still fold case
-    # (the fix is POSIX-only), otherwise Windows semantics break.
-    win_lower = thread_id_for(project, "C:/tmp/gate-bootstrap/repo")
-    win_mixed = thread_id_for(project, "C:/tmp/gate-bootstrap/Repo")
-    assert win_lower == win_mixed, (
-        "Windows path case-folding regressed: ``C:/tmp/Repo`` and "
-        "``C:/tmp/repo`` name the same filesystem entity and must land on "
-        "one thread id (Bohr msg-3122 §2 change 3)"
+    # PR-gate on head c71041f boundary case #2: POSIX path with ``//``
+    # leading double slash MUST NOT be misclassified as UNC and folded.
+    double_slash_upper = thread_id_for(project, "//tmp/Repo")
+    double_slash_lower = thread_id_for(project, "//tmp/repo")
+    assert double_slash_upper != double_slash_lower, (
+        "POSIX ``//tmp`` path was misclassified as UNC and case-folded — "
+        "this is the c71041f PR-gate boundary case #2 (a syntactic "
+        "detector matched ``//`` and lowercased; ``os.name`` sees "
+        "``posix`` and preserves case correctly)"
     )
 
 
