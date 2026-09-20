@@ -42,7 +42,7 @@ items:
 - 旧 §4-2（`OBL-SPEC-RECEIPT` body）を**新 body 全文**に置き換え（§4-2 本節、逐語）。
 - 旧 §5（`verify.py` 検査）に V-14 新設、V-13 enumeration を 13 code に拡張、`_OPTIONAL_MANIFEST_KEYS` を追加（§5 本節）。
 - 旧 D-* に D-32〜D-39 を追加（§2.1）。
-- 旧 A-* に A-30〜A-40 を追加（§7）。
+- 旧 A-* に A-30〜A-41 を追加（§7）。
 
 **id namespace は旧 spec と共有する**（D-30 継承 — 一度振った id は再利用も再割当もしない）∴ 本 spec は未使用番号のみを採る（D-32 以降・A-30 以降・V-14）。`D-25′` の `′` は id の一部（旧 §0 継承）— 本 spec 内でも同様。**inherited id の V-14 解決は `supersedes` chain を辿る**（D-37 — 詳細は §5-D）。
 
@@ -75,8 +75,8 @@ items:
   - **BOOTSTRAP** — 1 code (`BOOTSTRAP`)。pin present ＋ `mode: bootstrap`。**message body 続行が sanctioned な唯一の code。**
   - **FAULT** — 12 code (`ABSENT` / `PARSE_ERROR` / `SCHEMA_VERSION` / `MISSING_FIELD` / `PROHIBITED_FIELD` / `DETACHED_HEAD` / `BRANCH_MISMATCH` / `REPO_MISMATCH` / `FETCH_UNAVAILABLE` / `COMMIT_UNREACHABLE` / `BLOB_UNREADABLE` / `SHA_MISMATCH`)。すべて halt。`ABSENT` は本 spec で FAULT 側に移った。
   - 分割は §3 の全 13 code を覆う。§3 に新 code が追加された場合、既定は FAULT に属する（旧 D-24 継承）。BOOTSTRAP に新 code を足すには本決定を改訂しなければならない（fail-closed — D-6 継承）。
-- **D-35（pin schema は `schema_version: 1` を維持し `mode` を追加、BOOTSTRAP 判定は schema_version 検査の後）** `mode: {resolved, bootstrap}`、省略時 default = `resolved`（旧 pin と後方互換）。`mode: resolved` は旧 §3 の全必須フィールドを要求（現行通り）。`mode: bootstrap` は §3-A の限定 field 集合のみ許す。**BOOTSTRAP 判定は `schema_version` 検査を通過した後にのみ行う** — 未来 v2 pin を旧 agent が bootstrap 経路で素通しさせないため。`schema_version` を上げない理由は、旧 verify.py が bootstrap 形を旧 step 4 で `MISSING_FIELD` として halt する fail-closed 挙動を保つため（正しい fail-closed）。
-- **D-36（`verify.py` は本 spec でも gate ではない — 旧 D-10 継承）** V-14 の新設と pin BOOTSTRAP / PROHIBITED_FIELD 認識は診断であり、CI gate にしない。main 上の常態は warning 0 / error 0（旧 A-12 継承、本 spec A-34 で自己適用を追加）。
+- **D-35（pin schema は `schema_version: 1` を維持し `mode` を追加、BOOTSTRAP 判定は schema_version 検査の後）** `mode: {resolved, bootstrap}`、省略時 default = `resolved`（旧 pin と後方互換）。`mode: resolved` は旧 §3 の全必須フィールドを要求（現行通り）。`mode: bootstrap` は §3-A の限定 field 集合のみ許す。`mode` が `resolved` / `bootstrap` / 省略のいずれでもない値の場合は `NO-PIN(MISSING_FIELD)`（§3-B step 3.5 の第 3 枝 — §4-1 body の "malformed" 語義が未知 enum 値を吸収する）。**BOOTSTRAP 判定は `schema_version` 検査を通過した後にのみ行う** — 未来 v2 pin を旧 agent が bootstrap 経路で素通しさせないため。`schema_version` を上げない理由は、旧 verify.py が bootstrap 形を旧 step 4 で `MISSING_FIELD` として halt する fail-closed 挙動を保つため（正しい fail-closed）。
+- **D-36（`verify.py` は本 spec でも gate ではない — 旧 D-10 継承）** V-14 の新設と pin BOOTSTRAP / PROHIBITED_FIELD 認識は診断であり、CI gate にしない。`verify.py` の exit code は script 実行そのものの成否（YAML 読み込み・argparse・IO の成否）のみを反映し、`errors` / `warnings` 配列の要素数には依存しない — V-1〜V-13 の error / warning がすでにこの性質下で運用されている（旧 §5 と旧 D-10）∴ V-14 error も同じ扱いで、`errors` 配列に流れても exit code は 0 のまま。main 上の常態は warning 0 / error 0（旧 A-12 継承、本 spec A-34 で自己適用を追加）。
 - **D-37（V-14 は「明示定義」を要求し、`supersedes` chain を辿る）** V-14 は id 参照側と定義子側を次のとおり扱う:
   - **id パターン（境界あり）**: `(?<![A-Z0-9-])[A-Z]+-\d+′?(?![A-Z0-9-])`。直前 / 直後が `[A-Z0-9-]` の場合はマッチしない（`SPEC-2026-08-11-design-spec-delivery` や `ADR-2026-05-23-07` からの部分抽出を防ぐ）。末尾 prime を id の一部として保つ（`D-25′` を切らない — D-30 継承）。
   - **定義子（明示 3 形）**: `**X-nn**` bold および `**X-nn（…` 形（decision list 見出し）、表行頭 `| X-nn |`、front-matter `items[].id`。
@@ -104,19 +104,25 @@ items:
 - 任意: `reason` (str, 自由記述)
 - **禁止（7 field）: `spec_id` / `thread` / `repo` / `branch` / `path` / `blob_sha` / `commit`** — いずれかが present なら `NO-PIN(PROHIBITED_FIELD)`
 
-未知フィールドは無視してよい（旧 §3 継承の前方互換）。
+**`mode` が `resolved` / `bootstrap` 以外の値**（例: `mode: future_feature`）: `NO-PIN(MISSING_FIELD)`（§3-B step 3.5 第 3 枝で halt）。fail-closed により旧 agent は未来 v2 の未知 mode 値を `resolved` として素通ししない。
+
+未知フィールドは無視してよい（旧 §3 継承の前方互換）— **未知 "field" と未知 "mode 値" は別**である点に注意（前者は前方互換、後者は fail-closed halt）。
 
 ### §3-B 解決手順（step 順の差分）
 
-旧 §3 の 11 step を継承。step 3（`schema_version != 1` → `SCHEMA_VERSION`）と step 4（必須フィールド／型／hex40）の**間**に新 step 3.5 を挿入する:
+旧 §3 の 11 step を継承。step 3（`schema_version != 1` → `SCHEMA_VERSION`）と step 4（必須フィールド／型／hex40）の**間**に新 step 3.5 を挿入する。step 3.5 は `pin.get("mode")` の値で **3 分岐**する:
 
-- **step 3.5（新）**: `pin.get("mode") == "bootstrap"` の場合:
+- **枝 1 — `mode == "bootstrap"`**:
   - `pinned_at` / `pinned_by` の存在と型（非空 str）を確認 — 欠落は `NO-PIN(MISSING_FIELD)`
   - §3-A の 7 個の禁止 field が pin dict に**在らない**ことを確認 — いずれかが present なら `NO-PIN(PROHIBITED_FIELD)`
   - すべて OK → `NO-PIN(BOOTSTRAP)`（sanctioned proceed on message body）
-- `mode` が省略か `resolved` の場合、step 4 以降を実行（旧 §3 のまま）。
+- **枝 2 — `mode` が省略（`None`）または `"resolved"`**:
+  - step 4 以降を実行（旧 §3 のまま）。
+- **枝 3 — 上記いずれでもない値**（`mode` フィールドが present だが `"bootstrap"` / `"resolved"` のいずれでもない任意の string、例: `mode: future_feature`、`mode: ""`、`mode: 42` 等）:
+  - `NO-PIN(MISSING_FIELD)` として halt する。§4-1 body の "A required field that is missing or malformed is MISSING_FIELD" にある **"malformed"** が「known field の未知 enum 値」を意味論的に覆う（既知 field に不正な値が入っている状態）。
+  - fail-closed により `resolved` 経路（枝 2）への fall-through は**禁止** — 未来 v2 の新 mode 値を旧 agent が resolved として誤処理する事故を防ぐ。BOOTSTRAP 経路への fall-through も禁止（未知値を bootstrap と解釈する権限は agent に無い — dispatcher が明示的に `mode: bootstrap` を書いた場合のみ）。
 
-**BOOTSTRAP 判定は step 3（`schema_version`）を通過した後にのみ行う** — 未来 v2 の bootstrap 形 pin を旧 v1 agent が素通しさせない（D-35）。
+**BOOTSTRAP 判定は step 3（`schema_version`）を通過した後にのみ行う** — 未来 v2 の bootstrap 形 pin を旧 v1 agent が素通しさせない（D-35）。**枝 3 の MISSING_FIELD も step 3 の後**（`schema_version != 1` の場合は先に `SCHEMA_VERSION` で halt する ∴ そちらが優先）。
 
 ### §3-C 例
 
@@ -144,6 +150,15 @@ mode: bootstrap
 pinned_at: 2026-09-20T00:00:00Z
 pinned_by: dispatcher
 reason: "no spec-pin mapping for thread T-spec-pin-hardening-and-id-audit at dispatch time"
+```
+
+**未知 mode の例（halt）**:
+
+```yaml
+schema_version: 1
+mode: future_feature   # → NO-PIN(MISSING_FIELD)
+pinned_at: 2026-12-01T00:00:00Z
+pinned_by: dispatcher
 ```
 
 ### §3-D reason code 総表
@@ -265,6 +280,8 @@ receipt（§4-2）はこの code をそのまま書く。§3 に新しい reason
 
 本 body の `Never delete ...` 段落は、本 spec が定める負の制約そのものである。**§4-1 の本文が唯一の正本であり**、本 spec の他節に原文があるわけではない。実装時に改稿してはならず、`obligations.yaml` には逐語で載せること（A-2 継承、A-32 の body 一意判定条件がこの逐語一致に依存する）。末尾段落は D-9 継承の帰結であり、`OBL-DECLARE-UNREADABLE` の body には**一切触れない**ことでその entry の `origin.original_length`（E-9）を保つ。
 
+未知 `mode` 値（§3-B 枝 3）は body 中 "A required field that is missing or malformed is MISSING_FIELD" の **"malformed"** が意味論的に覆う ∴ body 変更を伴わない — A-32 の一意判定は 13 code すべてについて body だけで成立する。
+
 ### §4-2 `OBL-SPEC-RECEIPT`（新 body — 全文、逐語）
 
 ```yaml
@@ -316,13 +333,13 @@ receipt（§4-2）はこの code をそのまま書く。§3 に新しい reason
 
 旧 §5 の V-1〜V-13 と入出力仕様を継承したうえで、以下を実装する。
 
-### §5-A pin BOOTSTRAP / PROHIBITED_FIELD 認識（V-9 拡張）
+### §5-A pin BOOTSTRAP / PROHIBITED_FIELD 認識（V-9 拡張）＋ 未知 mode 認識
 
-`_resolve_pin` に §3-B の step 3.5 を実装する。V-9 の info 出力に `NO-PIN(BOOTSTRAP)` と `NO-PIN(PROHIBITED_FIELD)` を新規に含める。exit code に影響しない（既存 `NO-PIN` と同扱い、D-36）。
+`_resolve_pin` に §3-B の step 3.5（3 分岐）を実装する。V-9 の info 出力に `NO-PIN(BOOTSTRAP)` と `NO-PIN(PROHIBITED_FIELD)` を新規に含める。未知 mode 値は `NO-PIN(MISSING_FIELD)` として（既存 code を通じて）報告される。exit code に影響しない（既存 `NO-PIN` と同扱い、D-36）。
 
 ### §5-B V-13 の enumeration 拡張
 
-`PIN_REASON_CODES` タプルを **13 要素**にする（旧 11 ＋ `BOOTSTRAP` ＋ `PROHIBITED_FIELD`）。V-13 は 13 code すべての逐語出現を照合する（A-31）。
+`PIN_REASON_CODES` タプルを **13 要素**にする（旧 11 ＋ `BOOTSTRAP` ＋ `PROHIBITED_FIELD`）。V-13 は 13 code すべての逐語出現を照合する（A-31）。未知 mode 値の halt は既存 `MISSING_FIELD` を再利用する ∴ enumeration は 13 のまま。
 
 ### §5-C V-1 に optional key を追加
 
@@ -350,22 +367,23 @@ receipt（§4-2）はこの code をそのまま書く。§3 に新しい reason
 - **`supersedes` chain の解決**: 現 manifest の front-matter `supersedes` に列挙された各 `SPEC-*` id について、`spec/design/*.md` を走査し、front-matter の `spec_id` が一致する file を発見して読み込む。読み込んだ file から再帰的に定義子を抽出し、`verify_exempt_ids` があれば current の集合と union する。先祖 file が発見できない / 読み込めない場合は V-14 error（診断のみ — D-36 により exit code 0 のまま）。
 - PIN reason code（`ABSENT` 等の全大文字語）は id パターンにマッチしない ∴ V-14 対象外（V-13 が別に照合）。
 
-### §5-E `--json` 出力への影響
+### §5-E `--json` 出力への影響 ＋ exit code の独立性
 
 - pin state に `BOOTSTRAP` と `PROHIBITED_FIELD` を追加（json schema は前方互換 — 未知値を捨てる consumer は無い）。
-- V-14 の error は既存 `errors` 配列に流れる。
+- V-14 の error は既存 `errors` 配列に流れる（V-1〜V-13 と同じ路）。
+- **exit code の独立性（D-36 明示）**: `verify.py` の exit code は script 実行そのものの成否（YAML 読み込み・argparse・IO の成否）のみを反映し、`errors` 配列 / `warnings` 配列の要素数には**依存しない**。V-1〜V-13 は既にこの性質下で運用されており（旧 D-10 継承）、V-14 の追加によってこの性質は変更されない ∴ V-14 error が `errors` 配列に何件積まれても exit code は 0 のまま。CI gate 化する経路は本 spec に無い（D-36 を改訂する後続 spec が別途必要）。
 
 ## §6 items 継承規則
 
 旧 spec §6 をそのまま継承（`target_repo` / `base_branch` / `canary` の継承、`items` の順序 = 実行順、依存フィールド無し、暗黙の大域既定値無し）。
 
-## §7 受け入れ条件（新規 A-30〜A-40）
+## §7 受け入れ条件（新規 A-30〜A-41）
 
 旧 A-1〜A-29 を継承したうえで、以下を追加する。
 
 - **A-30** `spec/design/verify.py` は bootstrap 形の pin（`mode: bootstrap`）を、valid case で `NO-PIN(BOOTSTRAP)`、`pinned_at` / `pinned_by` 欠落で `NO-PIN(MISSING_FIELD)`、`spec_id` 等 7 field いずれかの混在で `NO-PIN(PROHIBITED_FIELD)` として報告する。
-- **A-31** `PIN_REASON_CODES` は **13 要素**である（旧 11 ＋ `BOOTSTRAP` ＋ `PROHIBITED_FIELD`）。V-13 は `OBL-SPEC-PIN` の body に 13 code すべての逐語出現を要求する。
-- **A-32**（旧 A-26 の後継 — proceed 側の唯一 code は BOOTSTRAP に潰される） `OBL-SPEC-PIN` の body だけを読んで、13 code すべてについて halt / proceed が一意に決まる。proceed してよいのは `BOOTSTRAP` の 1 code のみ。`ABSENT` は halt である。**回帰防止**: 旧 A-26 は 11 code を対象にし、`ABSENT` を proceed 側に置いていた。
+- **A-31** `PIN_REASON_CODES` は **13 要素**である（旧 11 ＋ `BOOTSTRAP` ＋ `PROHIBITED_FIELD`）。V-13 は `OBL-SPEC-PIN` の body に 13 code すべての逐語出現を要求する。未知 mode 値の halt は `MISSING_FIELD` の再利用であり、enumeration を増やさない。
+- **A-32**（旧 A-26 の後継 — proceed 側の唯一 code は BOOTSTRAP に潰される） `OBL-SPEC-PIN` の body だけを読んで、13 code すべてについて halt / proceed が一意に決まる。proceed してよいのは `BOOTSTRAP` の 1 code のみ。`ABSENT` は halt である。未知 `mode` 値は body の "missing or malformed" が MISSING_FIELD を指定し halt に落ちる。**回帰防止**: 旧 A-26 は 11 code を対象にし、`ABSENT` を proceed 側に置いていた。
 - **A-33**（旧 A-28 の後継 — 停止ターンに worked 形を書かせない） `OBL-SPEC-RECEIPT` の body だけを読んで、`NO-PIN/BOOTSTRAP` で worked-from-message-body 形を書き、他 12 code（`ABSENT` を含む）で halted 形を書く、が一意に決まる。停止したターンに worked 形を書かせる読みが成立しないこと。**回帰防止**: 旧 A-28 は 11 code の下で ABSENT を worked 側の唯一 code としていた。
 - **A-34** 本 manifest 自身が V-1〜V-14 を error 0 で通過する（自己適用）。`verify_exempt_ids: ["U-1"]` を宣言する — 本 manifest §2.1 D-38 の議論で親 spec の `U-1` を narrative reference として引用しており、`U-1` は親 spec でも narrative-only（bold / 表定義を持たない）∴ chain walking でも解決しない。他の inherited id（`D-*` / `A-*` / `V-*` / `E-*`）は D-37 の `supersedes` chain walking により親 spec 本文の bold / 表定義から解決される。
 - **A-35** 旧 `spec/design/T-design-spec-delivery.md` に対して V-14 を実行すると、外部から `verify_exempt_ids: ["U-1"]` を与えた条件下で error 0（他の全参照が定義子を持つ）。**旧 spec ファイル自体は書き換えない**（D-19 / D-20 継承 — supersede されているが immutable）∴ I-2 の test 入力として旧 spec を扱い、`verify_exempt_ids: ["U-1"]` を external override で与える code path で error 0 を確認する形とする。
@@ -374,6 +392,7 @@ receipt（§4-2）はこの code をそのまま書く。§3 に新しい reason
 - **A-38** V-14 が本 `spec/design/T-spec-pin-hardening-and-id-audit.md` に対し error 0 で通過することが、I-2 実装 PR の test で確認できる（D-37 の `supersedes` chain walking と `verify_exempt_ids: ["U-1"]` を前提とする）。
 - **A-39** 本 manifest は `SPEC-2026-08-11-design-spec-delivery` を `supersedes` に持つ。V-4 が緑（実在 spec_id を指し、self-reference でない）。V-10 は `main` 上で旧 spec を「superseded」の warning として報告するようになる（旧 V-10 挙動）— exit code は 0 のまま（D-36）。
 - **A-40** `mode: bootstrap` ＋ §3-A 禁止 7 field のいずれかを含む pin を置くと `verify.py` が `NO-PIN(PROHIBITED_FIELD)` を報告する（PROHIBITED_FIELD の到達経路が唯一 bootstrap 用 field 混在であることを test で示す — 回帰防止）。
+- **A-41** `verify.py` は `mode` フィールドが `resolved` / `bootstrap` 以外の値（例: `mode: future_feature`、`mode: ""`、`mode: 42`）を持つ pin を `NO-PIN(MISSING_FIELD)` として halt する — §3-B step 3.5 の第 3 枝。fall-through による `resolved` 経路への誤処理が起きないこと（fail-closed 回帰防止）。既存の "missing or malformed" 語義がこれを吸収する ∴ `PIN_REASON_CODES` は 13 要素のまま（A-31 と整合）。**V-14 の error は `errors` 配列に流れるが `verify.py` の exit code は D-36 により 0 のまま**であることを test で確認する（V-14 が意図せぬ CI gate 化していないことの回帰防止 — pr-gate objection の資産）。
 
 ## §8 運用（順序 = items 列挙順 — D-15 継承）
 
@@ -394,6 +413,9 @@ receipt（§4-2）はこの code をそのまま書く。§3 に新しい reason
 - **id パターンから境界を落とす案（r3 で採っていた形）**: `SPEC-2026-...` / `ADR-2026-...` から `SPEC-2026` / `ADR-2026` が false-positive に抽出される ∴ V-14 が main 上で恒久 error を出す（D-21 違反）。負の lookaround で境界を持たせる（D-37）。
 - **`OBL-SPEC-PIN` body に「pin schema の詳細」を追加する案**: 手順の正本は §3 であり、body は結果に対する挙動を決めるだけである（旧 D-31 継承）。BOOTSTRAP / PROHIBITED_FIELD は「結果」であり、body に code の綴りと behavior を書けば足る。
 - **items 依存グラフ／DAG／`verify.py` に順序検査を持たせる案**: 旧 D-15 継承 — 順序の SOT は `items` の列挙順である。本 spec も同規則に従う。
+- **未知 `mode` 値を新 code `UNKNOWN_MODE` として導入する案**（pr-gate-relay 経路の r5 で追記）: `PIN_REASON_CODES` が 14 に増え、A-31 / V-13 / §3-D / §4-1 body / OBL-SPEC-RECEIPT の全箇所に触れる。§4-1 body の "A required field that is missing or malformed is MISSING_FIELD" にある "malformed" が既知 field の未知 enum 値を意味論的に覆う ∴ MISSING_FIELD の再利用で fail-closed halt が達成される。halt 挙動は両案で同一で、enumeration 保持は Principle 2 の観点で強い ∴ MISSING_FIELD 再利用を採る。診断解像度を上げたい将来があれば、その時点で `UNKNOWN_MODE` を新設する後続 spec を起こす（D-19 に沿う扱い）。
+- **V-14 出力を `errors` 配列から分離し独立 `diagnostics` チャンネルに置く案**（pr-gate-relay 経路の r5 で追記）: JSON schema を拡張し consumer 側にも分岐が要る（Principle 2）。V-1〜V-13 と非対称になり、既存 verify.py の error/warning/info の三段レベルと重複する。exit code の独立性は D-36 の明示（§5-E）で既に保証される ∴ 現行 `errors` 路で流し、V-1〜V-13 と対称に扱う方が既存 verify.py の性質と整合する。将来 V-14 だけを CI gate 化したくなった場合はその時点で D-36 を改訂する後続 spec が要る。
+- **D-36 を「V-14 は例外的に exit non-zero を許す」に narrowing する案**: pr-gate-relay が挙げた option (c) の逆方向。CI gate 化は本 spec の目的（診断追加）を超え、cutover 影響（既存 CI pipeline の失敗経路が増える）が I-2 / I-3 の scope を大きく越える ∴ 本 spec で採らず、後続 spec の判断に委ねる。
 
 ## §10 検査されていないもの（過大申告しない — 旧 §2.1 継承）
 
