@@ -35,8 +35,10 @@ Decider の責務は最終的に **admission-gate（`src/spirrow_mindwire/tier_c
 | D13 | 評価は **A-pre / A-post / live shadow** の 3 面で出す。A-post 母数不足なら shadow が JSONL を貯め続ける | msg-3818 §6, msg-3820 |
 | D14 | `TIER_C_LABELS` は `src/spirrow_mindwire/tier_c_admission_gate.py` の `ADMIT_LABELS` を import して同一定数を参照する（文字列二重管理禁止） | msg-3818 §4 |
 | D15 | bounce 活性化は evaluation phase gate 制。annotate は「genuine 見逃し 0 件」を満たしたときのみ、bounce は Takahito 追加承認 | 本 spec §6-C / Takahito 2026-09-21 |
-| D16 | Decider は Conductor から **2 点** で呼ばれる。(§3.3.a) 一般フックは `stop is None` 時に silent-stop 検出（Track B）に使い、shadow / active の両モードで実動作は `stop is None` ガード下に限定される。(§3.3.b) Tier-C フックは `stop == HUMAN` 時に走り、annotate / bounce モードで動作する — bounce は 1 回のみ `stop = None` に書き換えて呼び出し元へ差し戻す。両フックの入場条件は disjoint（stop が None か HUMAN かで排他）∴ D2 単調性は保たれる | 本 spec §3.3 / PR #326 PR-gate BLOCKING correctness |
+| D16 | Decider は Conductor から **2 点** で呼ばれ、両フックは strict disjoint に運用する（entry condition + logging + evaluation の全てを排他化）。(§3.3.a) 一般フックは **`stop is None` のときだけ** evaluate / log / route する（shadow でも `stop is None` ガード内に閉じる）— これは Track B の意味論（stop が無いターンで新たに stop を足すか）とも整合する。(§3.3.b) Tier-C フックは `stop == HUMAN` のときだけ走る。両フックが同一 turn で発火することは無い ∴ `decision_id` は上書きされず join key として機能する。D2 単調性は entry-guard の排他性から従う | 本 spec §3.3 / PR #326 PR-gate BLOCKING correctness (round 1) + round-2 correctness #3 |
 | D17 | admission-gate 結果の Decider への受け渡しは **in-memory `turn.gate_result` 契約**。JSONL からの live join は禁止（live / replay の distribution shift 回避、dual-management 回避）。replay driver は fixture として同じ shape の `AdmissionGateResult` を構築し `turn` に載せてから `state_builder` に渡す | 本 spec §3.5 / PR #326 PR-gate ADVISORY structure |
+| D18 | Tier-C フック (§3.3.b) は **grey zone gating** で運用: `gate_result.kind ∈ {ADMIT_UNSURE, second_time_force_admit}` のときにのみ Decider に問いを渡し、`ADMIT` (with a valid label) / それ以外は問い掛けしない。理由: D9 で `merge-protected` などの label を Decider の genuine 語彙から外している ∴ もし ADMIT を Decider が再評価すれば genuine sum = 0 で誤 bounce する。Decider の権限は admission-gate が判別できなかった grey zone に限定する | 本 spec §3.3.b / PR #326 round-2 PR-gate BLOCKING correctness #1 |
+| D19 | Tier-C フックの annotation は **annotate mode と bounce mode の両方で発火**。bounce mode は annotate の superset — LIKELY_NOT の注釈は bounce 資格に関わらず（`answerable_from_thread` 以外の根拠、既 bounced、2 回目、いずれの状態でも）人へ届く。bounce 節は annotate 節の後に加算的に走り、eligible な場合のみ `stop = None` を書き込む | 本 spec §3.3.b / PR #326 round-2 PR-gate BLOCKING regression |
 
 ---
 
@@ -89,18 +91,21 @@ Decider は Conductor から **2 点で呼ばれる**。両者は目的も入場
 
 #### 3.3.a 一般フック（shadow / active — Track B: `handoff_valid` / `made_progress`）
 
-`StopReason` 規則判定の直後、**Tier-C 一次判定より前**に呼ぶ。silent-stop 検出などの「stop が無かったところに stop を足す」用途:
+`StopReason` 規則判定の直後、**`stop is None` のときにのみ**呼ぶ。silent-stop 検出などの「stop が無かったところに stop を足す」用途:
 
 ```python
 stop = rule_stop_reason(turn)              # 既存
-dv   = decider.evaluate_general(state_builder(turn))  # Track B。None if MINDWIRE_DECIDER_BACKEND=off
-log_decision(turn, stop, dv)               # 常に記録（decision_id を turn ログに残す）
-if cfg.decider.mode == "active" and dv and stop is None:
-    stop = StopReason.from_verdict(dv)     # active モード時のみ経路が変わる
+if stop is None:                           # §3.3.b と disjoint (D16)
+    dv = decider.evaluate_general(state_builder(turn))  # Track B。None if MINDWIRE_DECIDER_BACKEND=off
+    if dv is not None:
+        log_decision(turn, stop, dv, hook="general")   # turn.decision_ids に append
+    if cfg.decider.mode == "active" and dv:
+        stop = StopReason.from_verdict(dv)             # active モード時のみ経路が変わる
 ```
 
-- `stop is None` ガードにより、shadow mode は実動作に一切影響しない（D12）。
-- **このガードは Tier-C bounce 用ではない** — 一般フックが扱うのは「規則判定が stop を出さなかったターン」だけで、`NEXT: human` によって既に `stop = HUMAN` が載っているケースには到達しない。Tier-C bounce は §3.3.b の別フックで実行される。
+- **entry-guard は `stop is None`**（D16）。`stop == HUMAN` のターンで §3.3.a が走ると `log_decision` が §3.3.b と 2 回発火し、`decision_id` を join key として扱えなくなる ∴ 明示的に排他にする。Track B は「stop が無かったのに新たに stop を足すべきか」を問うもので、`NEXT: human` で既に停止が確定しているターンには問いとして意味を持たない。
+- `stop is None` ガードは D12 shadow の要件でもある: shadow mode は log-only、active mode でのみ `stop` に書き込む。
+- Track B の一般フックは `stop == HUMAN` には到達しない ∴ Tier-C bounce は §3.3.b の別フックで実行される。
 
 #### 3.3.b Tier-C フック（annotate / bounce — parsed_next == "human" のみ）
 
@@ -109,23 +114,42 @@ if cfg.decider.mode == "active" and dv and stop is None:
 ```python
 # rule_stop_reason の直後、human への手渡し（forced-naysayer や escalation 通知）の直前
 if stop is StopReason.HUMAN and cfg.decider.tierc.mode != "off":
-    tv = decider.evaluate_tierc(state_builder(turn))  # 3+3+0 の問いへ回答
-    log_decision(turn, stop, tv)                      # decision_id を残す（shadow / annotate / bounce いずれでも）
-    if cfg.decider.tierc.mode == "annotate" and tv.verdict == "LIKELY_NOT":
-        escalation.annotation = f"Jev: likely not Tier-C (p={tv.confidence:.2f}) — {tv.reason}"
-        # stop は HUMAN のまま。人には届く。annotate は情報の付与のみ
-    elif cfg.decider.tierc.mode == "bounce" and tv.verdict == "LIKELY_NOT" and tv.reason == "answerable_from_thread":
-        if not bounce_ledger.already_bounced(turn):    # 1 回だけ
+    gr = turn.gate_result   # §3.5 in-memory 契約
+    # Decider は admission-gate を通った後の grey zone のみを裁く（D9, D18）。
+    # ADMIT with valid label (goal / cost / irreversible / merge-protected) は既に人へ確定 ∴ 問い掛けしない。
+    is_grey_zone = (
+        gr is not None
+        and gr.kind in {LogKind.ADMIT_UNSURE, LogKind.second_time_force_admit}
+    )
+    if is_grey_zone:
+        tv = decider.evaluate_tierc(state_builder(turn))  # 3+3+0 の問いへ回答
+        log_decision(turn, stop, tv, hook="tierc")        # turn.decision_ids に append
+
+        # Annotation は annotate / bounce mode の両方で発火する superset (D19):
+        # bounce mode に上げても、bounce eligible でない LIKELY_NOT の注釈が人へ届く既存挙動は保たれる。
+        if cfg.decider.tierc.mode in {"annotate", "bounce"} and tv.verdict == "LIKELY_NOT":
+            escalation.annotation = f"Jev: likely not Tier-C (p={tv.confidence:.2f}) — {tv.reason}"
+            # stop は HUMAN のまま。人には届く。annotate は情報の付与のみ
+
+        # Bounce は annotate に加算される: mode=bounce + LIKELY_NOT + 根拠=answerable_from_thread + 未 bounce のみ発火
+        if (cfg.decider.tierc.mode == "bounce"
+                and tv.verdict == "LIKELY_NOT"
+                and tv.reason == "answerable_from_thread"
+                and not bounce_ledger.already_bounced(turn)):
             bounce_ledger.mark(turn)
-            stop = None                                 # human 経路をキャンセルし、
-            reroute_to_bounce_prompt(turn, tv)          # 呼び出し元 agent へ §4.5 の 3 択プロンプトを差し戻す
-        # 2 回目は Decider を通さず必ず human へ（stop = HUMAN のまま）
+            stop = None                                    # human 経路をキャンセルし、
+            reroute_to_bounce_prompt(turn, tv)             # 呼び出し元 agent へ §4.5 の 3 択プロンプトを差し戻す
+        # 2 回目は already_bounced(turn) == True で bounce 節を通過せず、そのまま stop = HUMAN として人へ届く。
+    # gr が None または grey zone でない: Decider は問い掛けせず、admission-gate の判定をそのまま人へ届ける。
 ```
 
-- 入場条件: `stop == StopReason.HUMAN` かつ `[decider.tierc].mode != "off"`。annotate mode でも bounce mode でも、まずここで Tier-C 問いを回答する。
+- 入場条件: `stop == StopReason.HUMAN` かつ `[decider.tierc].mode != "off"` かつ `gate_result.kind ∈ {ADMIT_UNSURE, second_time_force_admit}`（D18 grey zone gating）。
+- **admission-gate ADMIT (with any valid label) → Decider は問い掛けしない**: D9 で `merge-protected` を Decider から削除した ∴ Decider の問いセットには merge-protected を genuine と認識する語彙が無い。もし ADMIT を Decider が再評価すれば、genuine sum = 0 で spurious のいずれかが発火した瞬間に valid な merge-protected escalation が LIKELY_NOT と判定される ∴ 誤 bounce。これは D9 が admission-gate に委譲した責務を Decider が上書きするパターンで、D2 単調性・Principle 2 の二重管理禁止の両方に反する。Decider の権限は grey zone (ADMIT_UNSURE / second_time_force_admit) に限定する。
 - annotate は `stop` を書き換えない（人には届く。文言注釈のみ）。
-- bounce は 1 回に限り `stop = None` にして呼び出し元 agent へ差し戻す。2 回目の `NEXT: human` は `bounce_ledger.already_bounced(turn) == True` により Decider の分岐を通過せず、そのまま `stop = HUMAN` として人へ届く。
+- bounce は 1 回に限り `stop = None` にして呼び出し元 agent へ差し戻す。2 回目の `NEXT: human` は `bounce_ledger.already_bounced(turn) == True` により bounce 節を通過せず、そのまま `stop = HUMAN` として人へ届く。annotation は 2 回目でも発火するので人は Decider の判定を注釈として見える。
 - `routing_artifact` を Decider が計算する経路は存在しない（`rule_stop_reason` が既に落としている — D9, msg-3820）。
+
+**turn ログの `decision_ids`**: `log_decision(turn, stop, tv, hook=...)` は turn の `decision_ids: list[DecisionRecord]` に append する（scalar でなく list ∴ §3.3.a と §3.3.b が両方走った場合でも上書きされない — なお §3.3.a / §3.3.b は disjoint なので同一 turn で両方走ることは無いが、shape として list を採ることで将来 hook を足したときに壊れない）。join key は各 record の `decision_id` を使う。
 
 ### 3.4 設定（両フック共通）
 
@@ -240,10 +264,11 @@ Conductor は human に上げる前に呼び出し元 agent へ **1 回だけ**�
 
 段階（Tier-C mode: `off → annotate → bounce`）:
 
+- **入場条件（両モード共通）**: `stop == HUMAN` かつ `gate_result.kind ∈ {ADMIT_UNSURE, second_time_force_admit}` (D18)。admission-gate ADMIT (with a valid label) の場合、Decider は問いを渡さず（4.1 が `merge-protected` の genuine 語彙を持たないため誤 bounce の risk）、admission-gate の判定をそのまま人へ届ける。
 - **annotate**: escalation は従来通り人へ届く。通知に `Jev: likely not Tier-C (p) — <根拠>` を 1 行付けるだけ。実力未知数の間はここまで。
   - 入場条件: 見逃し 0 件制約（§6-C 制約 1）を live shadow で満たしたとき。
   - annotate 文言の `likely not Tier-C (p)` は confidence が較正済みレンジのときだけ出し、それ以外は無表示。
-- **bounce**: LIKELY_NOT かつ根拠が `answerable_from_thread` のときだけ、人に上げる前に呼び出し元へ **1 回だけ**差し戻し（§4.5）。**2 回目の `NEXT: human` は Decider を通さず必ず人へ**。無限ループ不可。
+- **bounce**: bounce は annotate の superset（D19）— annotation は annotate mode と bounce mode の両方で LIKELY_NOT に対して発火する。bounce 節は annotation の後に加算的に走り、LIKELY_NOT かつ根拠が `answerable_from_thread` かつ 1 回目のときに限り呼び出し元へ差し戻す（§4.5）。**2 回目の `NEXT: human` は bounce 節を通過せず必ず人へ（annotation は継続）**。無限ループ不可。
   - 入場条件: Takahito 追加承認 + §6-C 制約 1 継続。
 - **`skip_naysayer_when_confirmed`**: CONFIRMED なら `force_naysayer_only_on_explicit_human` の Gemini 相談を省略、UNSURE のみ従来通り相談（cost lever）。
 
