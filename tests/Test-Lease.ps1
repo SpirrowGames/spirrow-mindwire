@@ -1550,9 +1550,8 @@ Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdic
 #          by what ConvertFrom-Json leaves in `$obj` after unwrap. This (d-1) block's array pin
 #          therefore uses a length-≥2 input — search for `$arrayPath` in the (d-1) block below
 #          for the actual fixture write (`[{"editor":"x"},{"foo":"y"}]`, two elements, stays as
-#          System.Object[]; the search term is preferred to a line number to avoid the same
-#          drift-with-refactor dual-management called out three lines below). All four
-#          bullets above route to verdict='unreadable' EXCEPT `[{"a":1}]`, which lands on the
+#          System.Object[]). All four bullets above route to verdict='unreadable' EXCEPT
+#          `[{"a":1}]`, which lands on the
 #          (a-valid) shape='object' path — that corner case IS pinned in the (d-1 boundary)
 #          block below (search for '(d-1 boundary)'), so a future change in ConvertFrom-Json
 #          unwrap semantics would trip a test rather than silently drift this comment out of
