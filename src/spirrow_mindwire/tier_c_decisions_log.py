@@ -185,16 +185,28 @@ def build_retry_lookup(log_path: Path) -> RetryLookup:
 
     The rule (msg-3710 §1 "RETRY_ADMIT が append されたら uuid は
     resolved"): a UUID is an unresolved bounce for an author when the
-    LAST event in the log against that ``retry_uuid`` is a ``BOUNCED``
-    row for the same ``author`` — i.e. no later ``RETRY_ADMIT`` has
-    resolved it yet. Because a UUID may be reused across independent
-    bounce/admit cycles (e.g. a sequence counter, or a hash collision
-    in a short-token space), we cannot exit the scan at the first
-    ``RETRY_ADMIT`` we see: a subsequent ``BOUNCED`` with the same
-    UUID re-opens the state, and the truthful answer is the last
-    observation. So the scan reads the whole file forwards, updating
-    a single ``bounced`` flag as it goes, and returns whatever the
-    final state was. This is the fix for PR-gate objection #322-1.
+    LAST event in the log against the ``(retry_uuid, author)`` PAIR
+    is a ``BOUNCED`` — i.e. no later ``RETRY_ADMIT`` for the SAME
+    ``(uuid, author)`` pair has resolved it yet. Because a UUID may
+    be reused across independent bounce/admit cycles (e.g. a sequence
+    counter, or a hash collision in a short-token space), we cannot
+    exit the scan at the first ``RETRY_ADMIT`` we see: a subsequent
+    ``BOUNCED`` with the same UUID re-opens the state, and the
+    truthful answer is the last observation. So the scan reads the
+    whole file forwards, updating a single ``bounced`` flag as it
+    goes, and returns whatever the final state was. This is the fix
+    for PR-gate objection #322-1 (forward-scan) and #322-4
+    (cross-author scoping).
+
+    Author scoping (PR-gate objection #322-4): both the ``BOUNCED``
+    open and the ``RETRY_ADMIT`` close must match the target author,
+    not only the UUID. ``decide_admission`` stamps every entry with
+    the message author it received, so a shared UUID between two
+    authors (say Alice's and Bob's colliding sequence-counter values)
+    keeps two independent flags. Absent this scoping, Bob's admission
+    would clear Alice's unresolved bounce and lock her out of the
+    retry path — the exact "trapping the user in an infinite loop"
+    class of bug the RETRY prologue exists to prevent.
 
     Callers that want a different UUID field name should re-derive
     this callable — the field name is a contract between the gate's
@@ -205,20 +217,19 @@ def build_retry_lookup(log_path: Path) -> RetryLookup:
 
     def _lookup(uuid: str, author: str) -> bool:
         # Read the whole file forwards; let the last observation for
-        # this UUID win. A ``BOUNCED`` for this ``(uuid, author)`` pair
-        # opens the state; ANY later ``RETRY_ADMIT`` for the same UUID
-        # closes it (the gate authored the admission itself so the
-        # author on the ADMIT row may legitimately be a system
-        # principal — matching only on UUID is the right rule); a
-        # further ``BOUNCED`` with the same UUID re-opens it.
+        # this (uuid, author) pair win. Rows that reference a
+        # different UUID or a different author are irrelevant to this
+        # author's retry state and are skipped whole.
         bounced = False
         for row in _iter_rows(log_path):
+            if row.get("retry_uuid") != uuid:
+                continue
+            if row.get("author") != author:
+                continue
             kind = row.get("kind")
-            row_uuid = row.get("retry_uuid")
             if kind == LogKind.BOUNCED.value:
-                if row_uuid == uuid and row.get("author") == author:
-                    bounced = True
-            elif kind == LogKind.RETRY_ADMIT.value and row_uuid == uuid:
+                bounced = True
+            elif kind == LogKind.RETRY_ADMIT.value:
                 bounced = False
         return bounced
 

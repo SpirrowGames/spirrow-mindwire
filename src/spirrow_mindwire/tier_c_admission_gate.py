@@ -227,8 +227,15 @@ RELEASE_CROSS_REPO_HINT: str = (
 # infra can decide whether the token maps to an unresolved bounce for
 # the same author. This keeps the gate free of UUID format assumptions
 # (v4 / v7 / bespoke) that a future infra change could invalidate.
+# ``[ \t]*\r?$`` (not ``[ \t]*$``): with ``re.MULTILINE`` the ``$`` anchor
+# in Python matches strictly before ``\n`` — never before ``\r``. A body
+# carrying CRLF line endings (any HTTP client, any Windows author) would
+# leave a stray ``\r`` between the trailing whitespace and the newline,
+# so ``[ \t]*$`` would fail to match and the parser would return ``None``
+# on a perfectly valid RETRY line. The explicit ``\r?`` accepts either
+# line-ending convention. Fix for PR-gate objection #322-3 (CRLF).
 _RETRY_LINE_RE: re.Pattern[str] = re.compile(
-    r"^[ \t]*RETRY:[ \t]*(?P<uuid>\S+)[ \t]*$", re.MULTILINE
+    r"^[ \t]*RETRY:[ \t]*(?P<uuid>\S+)[ \t]*\r?$", re.MULTILINE
 )
 
 # The TIER-C label grammar. Deliberately narrow: the label must sit on
@@ -245,10 +252,15 @@ _RETRY_LINE_RE: re.Pattern[str] = re.compile(
 #
 # ``other:<reason>`` is a distinct family: the reason text may contain
 # arbitrary non-newline characters after the colon.
+# ``[ \t]*\r?$`` for the same CRLF reason as ``_RETRY_LINE_RE`` above.
+# The ``other:[^\r\n]*`` sub-pattern intentionally excludes ``\r`` too so
+# a CRLF-terminated ``TIER-C: other: reason\r\n`` does not capture the CR
+# into the reason (a stray ``\r`` in the reason string would poison the
+# canonical form the ``.strip()`` step relies on).
 _LABEL_LINE_RE: re.Pattern[str] = re.compile(
     r"^[ \t]*TIER-C:[ \t]*"
     r"(?P<label>other:[^\r\n]*|unsure:goal\?|[A-Za-z][A-Za-z0-9-]*)"
-    r"[ \t]*$",
+    r"[ \t]*\r?$",
     re.IGNORECASE | re.MULTILINE,
 )
 

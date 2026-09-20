@@ -228,6 +228,57 @@ class TestRetryLookup:
         )
         assert build_retry_lookup(log)("u-reused", "alice") is False
 
+    def test_cross_author_uuid_collision_is_scoped(self, tmp_path: Path) -> None:
+        """Regression pin for PR-gate objection #322-4 (BLOCKING).
+
+        A reused UUID can collide across authors (e.g. two authors
+        each holding a small integer counter). ``RETRY_ADMIT`` rows
+        must clear ONLY the state of their own author — otherwise
+        Bob's successful retry would silently resolve Alice's
+        unresolved bounce and lock her out of her retry path.
+        """
+        log = tmp_path / "decisions.jsonl"
+        append_log_entries(
+            log,
+            [
+                # Alice bounces on UUID "u1".
+                LogEntry(
+                    kind=LogKind.BOUNCED,
+                    payload={
+                        "ts": NOW.isoformat(),
+                        "author": "alice",
+                        "retry_uuid": "u1",
+                        "reason": "no-label",
+                    },
+                ),
+                # Bob independently bounces on the SAME UUID "u1".
+                LogEntry(
+                    kind=LogKind.BOUNCED,
+                    payload={
+                        "ts": NOW.isoformat(),
+                        "author": "bob",
+                        "retry_uuid": "u1",
+                        "reason": "no-label",
+                    },
+                ),
+                # Bob retries successfully — this must NOT clear Alice.
+                LogEntry(
+                    kind=LogKind.RETRY_ADMIT,
+                    payload={
+                        "ts": NOW.isoformat(),
+                        "author": "bob",
+                        "retry_uuid": "u1",
+                        "reason": "label_corrected",
+                    },
+                ),
+            ],
+        )
+        lookup = build_retry_lookup(log)
+        # Alice's bounce is still unresolved.
+        assert lookup("u1", "alice") is True
+        # Bob's is resolved.
+        assert lookup("u1", "bob") is False
+
 
 class TestGateEndToEndAgainstLog:
     """Small integration: run the admission gate against a real JSONL

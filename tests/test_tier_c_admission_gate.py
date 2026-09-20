@@ -128,6 +128,32 @@ class TestExtractLabel:
     def test_no_label_returns_none(self) -> None:
         assert extract_label("no tier-c label anywhere\nNEXT: human\n") is None
 
+    def test_label_recognised_with_crlf_line_endings(self) -> None:
+        """Regression pin for PR-gate objection #322-3 (BLOCKING).
+
+        Python's ``re.MULTILINE`` ``$`` matches strictly before ``\\n``
+        and NOT before ``\\r``. A body carrying CRLF endings — every
+        HTTP client, every Windows author — must still parse. Before
+        the ``\\r?$`` fix, a CRLF body silently produced NO_LABEL and
+        the author was bounced despite writing a valid label.
+        """
+        body_crlf = "some body\r\nTIER-C: goal\r\nNEXT: human\r\n"
+        assert extract_label(body_crlf) == "goal"
+
+    def test_retry_uuid_recognised_with_crlf_line_endings(self) -> None:
+        """Companion regression pin for #322-3 covering the RETRY line."""
+        body_crlf = "RETRY: 550e8400\r\nTIER-C: goal\r\nNEXT: human\r\n"
+        assert extract_retry_uuid(body_crlf) == "550e8400"
+        assert extract_label(body_crlf) == "goal"
+
+    def test_other_label_with_crlf_does_not_capture_cr(self) -> None:
+        """Companion regression pin for #322-3: the greedy ``other:``
+        sub-pattern excludes ``\\r`` so the trailing CR does not sneak
+        into the canonical reason string.
+        """
+        body_crlf = "TIER-C: other: some reason\r\nNEXT: human\r\n"
+        assert extract_label(body_crlf) == "other:some reason"
+
 
 class TestExtractRetryUuid:
     """The RETRY prefix parser is opaque about UUID format on purpose.
