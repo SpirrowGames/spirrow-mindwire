@@ -320,11 +320,24 @@ class LogEntry:
 
     The gate returns log entries in the order they should be appended.
     Every entry carries a ``kind`` (from :class:`LogKind`) plus a
-    ``payload`` dict of kind-specific fields. The ``ts`` / ``thread`` /
-    ``msg_id`` / ``author`` common columns are added by the caller
-    (they live at the transport boundary, not in the pure decision
-    function) so this dataclass stays testable with just the fields the
-    gate itself decides.
+    ``payload`` dict of kind-specific fields — including every field
+    the gate itself has enough information to stamp:
+
+    * ``ts`` — from the ``now`` clock the caller injected.
+    * ``author`` — from the ``author`` parameter the caller passed.
+    * ``retry_uuid`` — for ``BOUNCED`` and ``RETRY_ADMIT`` entries,
+      from the ``bounce_uuid`` / retry-token parameters.
+    * per-kind fields (``reason``, ``hint``, ``label``, ``from``,
+      ``to``, ``normalized_label``, etc.).
+
+    Only the message-envelope columns the gate never sees —
+    ``thread`` and ``msg_id`` — are added by the transport at
+    :func:`~spirrow_mindwire.tier_c_decisions_log.append_log_entry`
+    time. This means the caller may pass the returned entries to
+    :func:`~spirrow_mindwire.tier_c_decisions_log.append_log_entries`
+    without any unpack/re-instantiate step: the gate is the sole
+    constructor of a well-formed :class:`LogEntry` shape. Fix for
+    PR-gate objection #322-6 (dual-management complexity).
 
     A single ``decide_admission`` call may return zero, one, or two
     entries:
@@ -390,6 +403,7 @@ def decide_admission(
     author: str,
     retry_lookup: RetryLookup,
     now: datetime,
+    bounce_uuid: str,
 ) -> AdmissionDecision:
     """Answer whether a ``NEXT: human`` handoff may reach the human.
 
@@ -400,9 +414,10 @@ def decide_admission(
 
     The function is pure: no I/O, no clock reads (``now`` is passed
     in), no mutable module state. Every observation the caller must
-    lift from the world — the RETRY store, the current wall clock —
-    is a parameter. A test can drive every arm deterministically with
-    a fake ``retry_lookup`` and a fixed ``now``.
+    lift from the world — the RETRY store, the current wall clock,
+    a fresh UUID for a possible bounce — is a parameter. A test can
+    drive every arm deterministically with a fake ``retry_lookup``,
+    a fixed ``now``, and a fixed ``bounce_uuid``.
 
     Parameters
     ----------
@@ -410,9 +425,9 @@ def decide_admission(
         The full message body. The gate extracts the TIER-C label
         and any RETRY prefix from it.
     author :
-        The canonical persona name of the message author. Used only
-        as the second argument to ``retry_lookup`` — the gate does
-        not itself compare authors.
+        The canonical persona name of the message author. Used both
+        as the second argument to ``retry_lookup`` and as the
+        ``author`` field on every emitted log entry.
     retry_lookup :
         A callable ``(uuid, author) -> bool`` that returns ``True``
         exactly when the UUID names an unresolved bounce recorded
@@ -420,11 +435,22 @@ def decide_admission(
     now :
         The wall-clock timestamp to stamp on log entries. Passed as
         a parameter so tests can drive the timestamp deterministically.
+    bounce_uuid :
+        A freshly-generated UUID the gate stamps into the
+        ``retry_uuid`` field of any ``BOUNCED`` entry it emits. The
+        transport should generate one per admission call regardless
+        of the expected outcome; unused UUIDs are cheap and this
+        keeps the gate as the sole constructor of a well-formed
+        :class:`LogEntry` (fix for PR-gate objection #322-6). If the
+        arm chosen is not a bounce, the UUID is discarded.
     """
 
-    # Common fields the caller-side transport will merge with the
-    # entry payload after we return. Keeping these local to this
-    # helper so every arm builds an entry the same shape.
+    # Common-field stamper. The gate has enough context — ``now``,
+    # ``author`` — to fully populate every payload it emits, so
+    # downstream code sees a complete row without any unpack /
+    # re-instantiate step. Only ``thread`` / ``msg_id`` are added
+    # later by the transport at append time (they live on the
+    # message envelope the gate never sees).
     def _entry(kind: LogKind, extra: dict[str, Any]) -> LogEntry:
         payload = {"ts": now.isoformat(), "author": author, **extra}
         return LogEntry(kind=kind, payload=payload)
@@ -542,7 +568,11 @@ def decide_admission(
             log_entries=[
                 _entry(
                     LogKind.BOUNCED,
-                    {"reason": BounceReason.NO_LABEL.value, "label": None},
+                    {
+                        "reason": BounceReason.NO_LABEL.value,
+                        "label": None,
+                        "retry_uuid": bounce_uuid,
+                    },
                 )
             ],
         )
@@ -583,6 +613,7 @@ def decide_admission(
                     {
                         "reason": BounceReason.OTHER_NOT_ADMITTED.value,
                         "label": label,
+                        "retry_uuid": bounce_uuid,
                     },
                 )
             ],
@@ -619,6 +650,7 @@ def decide_admission(
                         "reason": (BounceReason.RELEASE_CROSS_REPO_NEEDS_AUTHOR_CHOICE.value),
                         "label": label,
                         "hint": RELEASE_CROSS_REPO_HINT,
+                        "retry_uuid": bounce_uuid,
                     },
                 )
             ],
@@ -635,7 +667,11 @@ def decide_admission(
         log_entries=[
             _entry(
                 LogKind.BOUNCED,
-                {"reason": BounceReason.UNKNOWN_LABEL.value, "label": label},
+                {
+                    "reason": BounceReason.UNKNOWN_LABEL.value,
+                    "label": label,
+                    "retry_uuid": bounce_uuid,
+                },
             )
         ],
     )

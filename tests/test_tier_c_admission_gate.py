@@ -191,7 +191,13 @@ class TestMainLabelEvaluation:
     @pytest.mark.parametrize("label", sorted(ADMIT_LABELS))
     def test_admit_label_admits(self, label: str) -> None:
         body = f"TIER-C: {label}\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_no_retries, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_no_retries,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.ADMIT
         assert result.rule == "R1-admit"
         assert result.normalized_label == label
@@ -199,16 +205,61 @@ class TestMainLabelEvaluation:
 
     def test_no_label_bounces(self) -> None:
         body = "no label anywhere\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_no_retries, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_no_retries,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.BOUNCE
         assert result.rule == "R1-no-label"
         assert result.bounce_reason is BounceReason.NO_LABEL
         assert len(result.log_entries) == 1
         assert result.log_entries[0].kind is LogKind.BOUNCED
+        # The gate stamps bounce_uuid into the BOUNCED payload so
+        # downstream code has a fully-populated row without any
+        # unpack/re-instantiate step (fix for #322-6).
+        assert result.log_entries[0].payload["retry_uuid"] == "test-uuid"
+
+    @pytest.mark.parametrize(
+        ("body", "rule"),
+        [
+            ("no label anywhere\nNEXT: human\n", "R1-no-label"),
+            ("TIER-C: other: novel\nNEXT: human\n", "R1-other-not-admitted"),
+            ("TIER-C: my-invented\nNEXT: human\n", "R1-unknown-label"),
+            (f"TIER-C: {RELEASE_CROSS_REPO_LABEL}\nNEXT: human\n", "R1-release-cross-repo"),
+        ],
+    )
+    def test_every_bounce_arm_stamps_the_uuid(self, body: str, rule: str) -> None:
+        """Regression pin for PR-gate objection #322-6.
+
+        The gate is the SOLE constructor of a well-formed
+        :class:`LogEntry` shape. Every bounce arm must stamp the
+        ``bounce_uuid`` the transport passed in so the caller can
+        append the returned entries directly, without cracking open
+        the frozen dataclass.
+        """
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_no_retries,
+            now=NOW,
+            bounce_uuid="stamp-me",
+        )
+        assert result.verdict is AdmissionVerdict.BOUNCE
+        assert result.rule == rule
+        assert result.log_entries[0].payload["retry_uuid"] == "stamp-me"
 
     def test_unsure_label_admits_and_records_admit_unsure(self) -> None:
         body = f"TIER-C: {UNSURE_LABEL}\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_no_retries, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_no_retries,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.ADMIT
         assert result.rule == "R1-admit-unsure"
         assert result.normalized_label == UNSURE_LABEL
@@ -217,7 +268,13 @@ class TestMainLabelEvaluation:
 
     def test_other_label_bounces(self) -> None:
         body = "TIER-C: other: some novel class\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_no_retries, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_no_retries,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.BOUNCE
         assert result.rule == "R1-other-not-admitted"
         assert result.bounce_reason is BounceReason.OTHER_NOT_ADMITTED
@@ -228,7 +285,13 @@ class TestMainLabelEvaluation:
     @pytest.mark.parametrize(("legacy", "expected"), sorted(LEGACY_LABEL_MAP.items()))
     def test_legacy_label_migrates_and_admits(self, legacy: str, expected: str) -> None:
         body = f"TIER-C: {legacy}\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_no_retries, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_no_retries,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.ADMIT
         assert result.rule == "R1-legacy-migration"
         assert result.normalized_label == expected
@@ -241,7 +304,13 @@ class TestMainLabelEvaluation:
 
     def test_release_cross_repo_bounces_with_choice_hint(self) -> None:
         body = f"TIER-C: {RELEASE_CROSS_REPO_LABEL}\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_no_retries, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_no_retries,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.BOUNCE
         assert result.rule == "R1-release-cross-repo"
         assert result.bounce_reason is BounceReason.RELEASE_CROSS_REPO_NEEDS_AUTHOR_CHOICE
@@ -252,7 +321,13 @@ class TestMainLabelEvaluation:
 
     def test_unknown_label_bounces(self) -> None:
         body = "TIER-C: my-invented-label\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_no_retries, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_no_retries,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.BOUNCE
         assert result.rule == "R1-unknown-label"
         assert result.bounce_reason is BounceReason.UNKNOWN_LABEL
@@ -278,7 +353,13 @@ class TestRetryPrologue:
 
     def test_retry_with_admit_label_admits_as_label_corrected(self) -> None:
         body = "RETRY: 550e8400\nTIER-C: goal\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_always_retry, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_always_retry,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.ADMIT
         assert result.rule == "R0-RETRY:label_corrected"
         assert result.normalized_label == "goal"
@@ -289,7 +370,13 @@ class TestRetryPrologue:
 
     def test_retry_with_unsure_label_admits_as_unsure_after_retry(self) -> None:
         body = f"RETRY: xyz\nTIER-C: {UNSURE_LABEL}\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_always_retry, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_always_retry,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.ADMIT
         assert result.rule == "R0-RETRY:unsure_after_retry"
         assert result.normalized_label == UNSURE_LABEL
@@ -314,7 +401,13 @@ class TestRetryPrologue:
     )
     def test_retry_with_non_admit_label_force_admits(self, label_line: str) -> None:
         body = f"RETRY: aaa\n{label_line}\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_always_retry, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_always_retry,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.ADMIT
         assert result.rule == "R0-RETRY:second_time_force_admit"
         entry = result.log_entries[-1]
@@ -337,7 +430,13 @@ class TestRetryPrologue:
         story of what the gate did.
         """
         body = "RETRY: 550e8400\nTIER-C: scope\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_always_retry, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_always_retry,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.ADMIT
         assert result.rule == "R0-RETRY:label_corrected"
         assert result.normalized_label == "goal"
@@ -357,7 +456,13 @@ class TestRetryPrologue:
         drops back to Step 1's ordinary label evaluation (msg-3710 §1
         step 0 fallthrough comment)."""
         body = "RETRY: 550e8400\nTIER-C: goal\nNEXT: human\n"
-        result = decide_admission(body=body, author="alice", retry_lookup=_no_retries, now=NOW)
+        result = decide_admission(
+            body=body,
+            author="alice",
+            retry_lookup=_no_retries,
+            now=NOW,
+            bounce_uuid="test-uuid",
+        )
         assert result.verdict is AdmissionVerdict.ADMIT
         assert result.rule == "R1-admit"  # not R0-RETRY:*
         assert result.log_entries == []

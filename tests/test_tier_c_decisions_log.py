@@ -293,20 +293,20 @@ class TestGateEndToEndAgainstLog:
     def test_bounce_then_retry_admits_on_the_second_call(self, tmp_path: Path) -> None:
         log = tmp_path / "decisions.jsonl"
 
-        # First call: no label → BOUNCE. Persist the bounce.
+        # First call: no label → BOUNCE. The transport pre-generates
+        # a fresh UUID and hands it to the gate; the gate stamps it
+        # into the BOUNCED payload; the transport appends the entries
+        # verbatim — no unpack/re-instantiate step (fix for #322-6).
         no_lookup = build_retry_lookup(log)
         first = decide_admission(
             body="NEXT: human\n",
             author="alice",
             retry_lookup=no_lookup,
             now=NOW,
+            bounce_uuid="u1",
         )
         assert first.verdict.value == "bounce"
-        # Simulate the transport stamping the retry_uuid on the bounce row.
-        bounced_entry = first.log_entries[0]
-        payload = dict(bounced_entry.payload)
-        payload["retry_uuid"] = "u1"
-        append_log_entry(log, LogEntry(kind=bounced_entry.kind, payload=payload))
+        append_log_entries(log, first.log_entries)
 
         # Second call: the author sends RETRY: u1 with a corrected label.
         retry_lookup = build_retry_lookup(log)
@@ -315,6 +315,7 @@ class TestGateEndToEndAgainstLog:
             author="alice",
             retry_lookup=retry_lookup,
             now=NOW,
+            bounce_uuid="u2",  # unused — the arm chosen is not a bounce
         )
         assert second.verdict.value == "admit"
         assert second.rule == "R0-RETRY:label_corrected"
