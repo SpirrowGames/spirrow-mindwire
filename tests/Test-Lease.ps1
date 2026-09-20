@@ -1548,20 +1548,18 @@ Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdic
 #            - `[1,2,3]`    → System.Object[]                               → shape='array'
 #          So a root array's raw shape is NOT determined by its rootedness alone; it is determined
 #          by what ConvertFrom-Json leaves in `$obj` after unwrap. This (d-1) block's array pin
-#          therefore uses a length-≥2 input — search for `$arrayPath` in the (d-1) block below
-#          for the actual fixture write (`[{"editor":"x"},{"foo":"y"}]`, two elements, stays as
-#          System.Object[]; the search term is preferred to a line number to avoid the same
-#          drift-with-refactor dual-management called out three lines below). All four
-#          bullets above route to verdict='unreadable' EXCEPT `[{"a":1}]`, which lands on the
-#          (a-valid) shape='object' path — that corner case IS pinned in the (d-1 boundary)
-#          block below (search for '(d-1 boundary)'), so a future change in ConvertFrom-Json
-#          unwrap semantics would trip a test rather than silently drift this comment out of
-#          sync with the code.
+#          therefore uses a length-≥2 input — search for `$arrayPath` for the actual fixture
+#          write (`[{"editor":"x"},{"foo":"y"}]`, two elements, stays as System.Object[]). All
+#          four bullets above route to verdict='unreadable' EXCEPT `[{"a":1}]`, which lands on
+#          the (a-valid) shape='object' path — that corner case IS pinned in the (d-1 boundary)
+#          block (search for '(d-1 boundary)'), so a future change in ConvertFrom-Json unwrap
+#          semantics would trip a test rather than silently drift this comment out of sync with
+#          the code.
 #          Source of truth for the raw-shape mapping: deploy/lib/Lease.ps1 §Read-JsonStateWithShape
 #          (function name only — line numbers deliberately omitted to avoid drift-with-refactor
 #          dual-management between this comment and that file). The shape='empty' pins —
 #          blank / whitespace / `[]` — live in the (d-7 companion) truncation-hazard block
-#          below, not here.
+#          (search for '(d-7 companion)'), not here.
 #   (d-2)  SKIPPED HERE (write-fail is Set-JsonState throw; belongs to the caller's tick.
 #          The seam neither writes nor throws; the ledger row is preserved in P4-3(b) prose.)
 #   (d-3)  regression: valid file + mid-tick clear behaviour lives with Merge-LeasesStateForWrite,
