@@ -37,14 +37,21 @@ _LIVE_DESIGN_THREADS = frozenset({_DESIGN_THREAD, "T-pr-review-threads-outlive-t
 
 
 async def _fire(
-    orch: PrReviewOrchestrator, *, project: str, pr_ref: str, design_thread: str = _DESIGN_THREAD
+    orch: PrReviewOrchestrator,
+    *,
+    project: str,
+    pr_ref: str,
+    design_thread: str = _DESIGN_THREAD,
+    implementer: str | None = None,
 ) -> tuple[ThreadRef, PrReviewOutcome]:
     """``fire_pr_review`` with the required relay destination (D-1) defaulted.
 
-    It is orthogonal to what most tests below pin; the ones that pin it call the method directly.
+    Also defaults ``implementer=None`` — the fail-safe route
+    (T-hand-fired-gate-cannot-name-the-implementer msg-3885 D-3 made it a no-default kwarg on the
+    production signature, but tests that pin unrelated behaviour supply the honest ``None``).
     """
     ref, outcome, _relay = await orch.fire_pr_review(
-        project=project, pr_ref=pr_ref, design_thread=design_thread
+        project=project, pr_ref=pr_ref, design_thread=design_thread, implementer=implementer
     )
     return ref, outcome
 
@@ -1202,7 +1209,10 @@ async def test_design_thread_that_is_a_ledger_id_raises_before_the_paid_review()
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="LEDGER id grammar"):
         await orch.fire_pr_review(
-            project="p", pr_ref="o/r#7", design_thread="T-pr-review-spirrow-mindwire-236"
+            project="p",
+            pr_ref="o/r#7",
+            design_thread="T-pr-review-spirrow-mindwire-236",
+            implementer=None,
         )
     assert driver.reviewed == []  # nothing was judged, so nothing was billed
     assert all(name != "chatroom_post_message" for name, _ in mcp.calls)
@@ -1228,7 +1238,9 @@ async def test_design_thread_must_exist() -> None:
     driver = _FakeDriver()
     orch = PrReviewOrchestrator(mcp, driver=driver)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="does not exist"):
-        await orch.fire_pr_review(project="p", pr_ref="o/r#7", design_thread="T-not-a-thread")
+        await orch.fire_pr_review(
+            project="p", pr_ref="o/r#7", design_thread="T-not-a-thread", implementer=None
+        )
     assert driver.reviewed == []
 
 

@@ -182,8 +182,8 @@ class PrReviewOrchestrator:
         project: str,
         pr_ref: str,
         design_thread: str,
+        implementer: str | None,
         title: str | None = None,
-        implementer: str | None = None,
     ) -> tuple[ThreadRef, PrReviewOutcome, dict[str, Any]]:
         """Open the review thread for a develop→main PR and drive the naysayer review.
 
@@ -201,6 +201,15 @@ class PrReviewOrchestrator:
         the review is paid for (:meth:`_validate_design_thread`). The relay message is the third
         return value so the conductor dispatches the implementer on the critique, not on its own
         pr-review trigger (Tier B msg-567 #1).
+
+        ``implementer`` — the persona to hand a REQUEST_CHANGES verdict to, or ``None`` when the
+        caller could not resolve one. Required kwarg with no default (T-hand-fired-gate-cannot-
+        name-the-implementer msg-3885): the previous default of ``None`` let ``scripts/naysayer_
+        review.py`` silently pass nothing, so a manual RC verdict routed to ``NEXT: human`` and
+        parked the design thread. Callers resolve it via
+        :func:`~.conductor.roster.derive_identity_by_role`; ``None`` here is the honest signal
+        that the roster had zero or several implementer personas, and the relay routes to
+        ``NEXT: human`` (fail-safe, unchanged from the pre-refactor ``""`` sentinel).
         """
         pr = parse_pr_ref(pr_ref)
         if pr is None:
