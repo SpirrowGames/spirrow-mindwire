@@ -16,11 +16,7 @@
 #   MINDWIRE_DECISION_DASHBOARD_URL     = base URL of the Magickit dashboard used in the Discord
 #                                          alert's D-29 link. Default:
 #                                          https://{{HOST_SERVICES}}.{{TAILNET_MAGICDNS_DOMAIN}}:8443
-#                                          (values via [[platform:infra-registry]] — do not hardcode.
-#                                          {{TAILNET_MAGICDNS_DOMAIN}} is a mindwire-local placeholder
-#                                          pending addition to spirrow-docs infra-registry §1; see
-#                                          T-public-repo-carries-real-infra-values §5.1 = registry
-#                                          gap G4.)
+#                                          (values via [[platform:infra-registry]] — do not hardcode.)
 
 schema_version = 1
 
