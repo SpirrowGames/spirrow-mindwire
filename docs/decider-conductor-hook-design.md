@@ -39,6 +39,7 @@ Decider の責務は最終的に **admission-gate（`src/spirrow_mindwire/tier_c
 | D17 | admission-gate 結果の Decider への受け渡しは **in-memory `turn.gate_result` 契約**。JSONL からの live join は禁止（live / replay の distribution shift 回避、dual-management 回避）。replay driver は fixture として同じ shape の `AdmissionGateResult` を構築し `turn` に載せてから `state_builder` に渡す | 本 spec §3.5 / PR #326 PR-gate ADVISORY structure |
 | D18 | Tier-C フック (§3.3.b) は **grey zone gating** で運用: `gate_result.kind ∈ {ADMIT_UNSURE, second_time_force_admit}` のときにのみ Decider に問いを渡し、`ADMIT` (with a valid label) / それ以外は問い掛けしない。理由: D9 で `merge-protected` などの label を Decider の genuine 語彙から外している ∴ もし ADMIT を Decider が再評価すれば genuine sum = 0 で誤 bounce する。Decider の権限は admission-gate が判別できなかった grey zone に限定する | 本 spec §3.3.b / PR #326 round-2 PR-gate BLOCKING correctness #1 |
 | D19 | Tier-C フックの annotation は **annotate mode と bounce mode の両方で発火**。bounce mode は annotate の superset — LIKELY_NOT の注釈は bounce 資格に関わらず（`answerable_from_thread` 以外の根拠、既 bounced、2 回目、いずれの状態でも）人へ届く。bounce 節は annotate 節の後に加算的に走り、eligible な場合のみ `stop = None` を書き込む | 本 spec §3.3.b / PR #326 round-2 PR-gate BLOCKING regression |
+| D20 | 両フックは **backend=off と mode!=off の設定不整合に対して fail-open**: `evaluate_general` / `evaluate_tierc` が `None` を返した場合、annotation / bounce / route の全てをスキップし escalation を人へそのまま届ける（§3.3.a は `if dv is not None:`、§3.3.b は `if tv is not None:`）。設定と env の不整合は Conductor 起動時 preflight が捕捉すべき事象で、hook 内で crash / silent drop させない — Tier-C escalation を落とすリスクの方が env 不整合を素通しするリスクより高い。加えて §3.3.a の active-mode route は `dv.is_actionable` を要求（continue verdict で `from_verdict` を呼ばない） | 本 spec §3.3 / PR #326 round-3 PR-gate BLOCKING correctness (tv None crash) + ADVISORY structure (`and dv:` truthiness) |
 
 ---
 
@@ -99,12 +100,13 @@ if stop is None:                           # §3.3.b と disjoint (D16)
     dv = decider.evaluate_general(state_builder(turn))  # Track B。None if MINDWIRE_DECIDER_BACKEND=off
     if dv is not None:
         log_decision(turn, stop, dv, hook="general")   # turn.decision_ids に append
-    if cfg.decider.mode == "active" and dv:
-        stop = StopReason.from_verdict(dv)             # active モード時のみ経路が変わる
+    if cfg.decider.mode == "active" and dv is not None and dv.is_actionable:
+        stop = StopReason.from_verdict(dv)             # active モード時 & 実際に stop を追加する verdict のみ経路が変わる
 ```
 
 - **entry-guard は `stop is None`**（D16）。`stop == HUMAN` のターンで §3.3.a が走ると `log_decision` が §3.3.b と 2 回発火し、`decision_id` を join key として扱えなくなる ∴ 明示的に排他にする。Track B は「stop が無かったのに新たに stop を足すべきか」を問うもので、`NEXT: human` で既に停止が確定しているターンには問いとして意味を持たない。
 - `stop is None` ガードは D12 shadow の要件でもある: shadow mode は log-only、active mode でのみ `stop` に書き込む。
+- **`dv.is_actionable` の意味**: `evaluate_general` は Track B の 2 問（`handoff_valid` / `made_progress`）を評価するが、両方が閾値を超えて「続行してよい」と判断した場合の Verdict は truthy な object だが `stop` を追加すべきではない。`dv.is_actionable = True` は「`from_verdict(dv)` が `StopReason` の実値を返す」ことを意味し、continue verdict では `False` になる ∴ `stop = None` の shape が保たれる。単に `if dv:` にすると continue verdict でも `from_verdict` が呼ばれ、enum factory が非 actionable な値に対して何を返すかで挙動が不定になる（PR #326 round-3 PR-gate ADVISORY structure）。
 - Track B の一般フックは `stop == HUMAN` には到達しない ∴ Tier-C bounce は §3.3.b の別フックで実行される。
 
 #### 3.3.b Tier-C フック（annotate / bounce — parsed_next == "human" のみ）
@@ -122,25 +124,27 @@ if stop is StopReason.HUMAN and cfg.decider.tierc.mode != "off":
         and gr.kind in {LogKind.ADMIT_UNSURE, LogKind.second_time_force_admit}
     )
     if is_grey_zone:
-        tv = decider.evaluate_tierc(state_builder(turn))  # 3+3+0 の問いへ回答
-        log_decision(turn, stop, tv, hook="tierc")        # turn.decision_ids に append
+        tv = decider.evaluate_tierc(state_builder(turn))  # 3+3+0 の問いへ回答。None if MINDWIRE_DECIDER_BACKEND=off
+        if tv is not None:                                # §3.3.a と parity: backend off なら以降を skip し人へそのまま届ける
+            log_decision(turn, stop, tv, hook="tierc")    # turn.decision_ids に append
 
-        # Annotation は annotate / bounce mode の両方で発火する superset (D19):
-        # bounce mode に上げても、bounce eligible でない LIKELY_NOT の注釈が人へ届く既存挙動は保たれる。
-        if cfg.decider.tierc.mode in {"annotate", "bounce"} and tv.verdict == "LIKELY_NOT":
-            escalation.annotation = f"Jev: likely not Tier-C (p={tv.confidence:.2f}) — {tv.reason}"
-            # stop は HUMAN のまま。人には届く。annotate は情報の付与のみ
+            # Annotation は annotate / bounce mode の両方で発火する superset (D19):
+            # bounce mode に上げても、bounce eligible でない LIKELY_NOT の注釈が人へ届く既存挙動は保たれる。
+            if cfg.decider.tierc.mode in {"annotate", "bounce"} and tv.verdict == "LIKELY_NOT":
+                escalation.annotation = f"Jev: likely not Tier-C (p={tv.confidence:.2f}) — {tv.reason}"
+                # stop は HUMAN のまま。人には届く。annotate は情報の付与のみ
 
-        # Bounce は annotate に加算される: mode=bounce + LIKELY_NOT + 根拠=answerable_from_thread + 未 bounce のみ発火
-        if (cfg.decider.tierc.mode == "bounce"
-                and tv.verdict == "LIKELY_NOT"
-                and tv.reason == "answerable_from_thread"
-                and not bounce_ledger.already_bounced(turn)):
-            bounce_ledger.mark(turn)
-            stop = None                                    # human 経路をキャンセルし、
-            reroute_to_bounce_prompt(turn, tv)             # 呼び出し元 agent へ §4.5 の 3 択プロンプトを差し戻す
-        # 2 回目は already_bounced(turn) == True で bounce 節を通過せず、そのまま stop = HUMAN として人へ届く。
+            # Bounce は annotate に加算される: mode=bounce + LIKELY_NOT + 根拠=answerable_from_thread + 未 bounce のみ発火
+            if (cfg.decider.tierc.mode == "bounce"
+                    and tv.verdict == "LIKELY_NOT"
+                    and tv.reason == "answerable_from_thread"
+                    and not bounce_ledger.already_bounced(turn)):
+                bounce_ledger.mark(turn)
+                stop = None                                # human 経路をキャンセルし、
+                reroute_to_bounce_prompt(turn, tv)         # 呼び出し元 agent へ §4.5 の 3 択プロンプトを差し戻す
+            # 2 回目は already_bounced(turn) == True で bounce 節を通過せず、そのまま stop = HUMAN として人へ届く。
     # gr が None または grey zone でない: Decider は問い掛けせず、admission-gate の判定をそのまま人へ届ける。
+    # tv is None (backend=off with mode!=off の設定ミス): fail-open で人へそのまま届ける。設定と env の不整合は Conductor の起動時 preflight で捉えるべきで、hook 内では動作停止させない。
 ```
 
 - 入場条件: `stop == StopReason.HUMAN` かつ `[decider.tierc].mode != "off"` かつ `gate_result.kind ∈ {ADMIT_UNSURE, second_time_force_admit}`（D18 grey zone gating）。
@@ -148,6 +152,7 @@ if stop is StopReason.HUMAN and cfg.decider.tierc.mode != "off":
 - annotate は `stop` を書き換えない（人には届く。文言注釈のみ）。
 - bounce は 1 回に限り `stop = None` にして呼び出し元 agent へ差し戻す。2 回目の `NEXT: human` は `bounce_ledger.already_bounced(turn) == True` により bounce 節を通過せず、そのまま `stop = HUMAN` として人へ届く。annotation は 2 回目でも発火するので人は Decider の判定を注釈として見える。
 - `routing_artifact` を Decider が計算する経路は存在しない（`rule_stop_reason` が既に落としている — D9, msg-3820）。
+- **backend=off / mode!=off の fail-open**: `evaluate_tierc` は `MINDWIRE_DECIDER_BACKEND=off` のとき `None` を返す。§3.3.a が `if dv is not None:` で処理をスキップするのと parity で、§3.3.b も `if tv is not None:` で annotation / bounce 節を全部スキップし、escalation は無編集で人へ届く。設定と env の不整合（`[decider.tierc].mode = "annotate"` に上げたが env は off のまま）は Conductor 起動時の preflight が捕捉すべき事象で、hook 内では動作停止・crash させない — Tier-C escalation を silent drop するリスクの方が env 不整合を騒ぎ立てないリスクより高い ∴ hook は fail-open（D20）。
 
 **turn ログの `decision_ids`**: `log_decision(turn, stop, tv, hook=...)` は turn の `decision_ids: list[DecisionRecord]` に append する（scalar でなく list ∴ §3.3.a と §3.3.b が両方走った場合でも上書きされない — なお §3.3.a / §3.3.b は disjoint なので同一 turn で両方走ることは無いが、shape として list を採ることで将来 hook を足したときに壊れない）。join key は各 record の `decision_id` を使う。
 
