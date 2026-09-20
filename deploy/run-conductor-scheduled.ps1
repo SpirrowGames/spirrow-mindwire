@@ -2078,11 +2078,7 @@ $DecisionDashboardBaseUrl = $env:MINDWIRE_DECISION_DASHBOARD_URL.TrimEnd('/')
 # was written to close.
 #
 # Wire measurements and the derived direct-request / no-proxy decision live in the composer thread
-# (msg-1445 §6). This wrapper deliberately does NOT re-carry the measurement fixtures (host FQDN,
-# RTT, squid-403 detail) because a deploy script is not the correct location for historical
-# infrastructure evidence (T-public-repo-carries-real-infra-values §5.1 = registry gap G4 —
-# Einstein PR-gate advisory: single-use masking placeholders in a deploy wrapper are over-scope;
-# the ADR/composer thread is where operational context is preserved). The two facts this file
+# (msg-1445 §6); this wrapper does not re-carry the measurement fixtures. The two facts this file
 # actually needs from that measurement — a ~190 ms RTT ceiling and "do not route this call through
 # the notification proxy" — are re-stated where the code enforces them below (the $DecisionMaterial
 # TimeoutSeconds comment and the Invoke-MaterialPut proxy note).
