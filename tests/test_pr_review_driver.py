@@ -704,7 +704,7 @@ async def test_outcome_records_principles_version() -> None:
 
 
 @pytest.mark.anyio
-async def test_principles_version_recorded_on_every_emit_path() -> None:
+async def test_principles_version_recorded_on_every_judgment_emit_path() -> None:
     """Every ``PrReviewOutcome`` this driver returns tags its ``principles_version``.
 
     The naysayer principles SOT declares (spec/NAYSAYER_PRINCIPLES.md): "Every naysayer
@@ -799,13 +799,14 @@ async def test_principles_version_recorded_on_every_emit_path() -> None:
 
 
 def test_pr_review_outcome_construction_site_count_is_bounded() -> None:
-    """The five ``PrReviewOutcome(...)`` construction sites the pin above enumerates.
+    """The five JUDGMENT ``PrReviewOutcome(...)`` construction sites the pin above enumerates.
 
     Not a substitute for the behavioural check — a construction site that omits the
     ``principles_version=`` kwarg still constructs a ``PrReviewOutcome``, and the count
-    stays 5. This test guards a different failure mode: a SIXTH emit path added without a
-    new leg in ``test_principles_version_recorded_on_every_emit_path``. The behavioural
-    pin covers only the sites its cases exercise; a new emit path lurks silently under
+    stays 5. This test guards a different failure mode: a SIXTH judgment emit path added
+    without a new leg in
+    ``test_principles_version_recorded_on_every_judgment_emit_path``. The behavioural pin
+    covers only the sites its cases exercise; a new emit path lurks silently under
     coverage-by-parametrisation until this counter reds.
 
     Counted via AST rather than a text regex, so the pin does not couple to a specific
@@ -816,23 +817,57 @@ def test_pr_review_outcome_construction_site_count_is_bounded() -> None:
     ``PrReviewOutcome`` inside strings, docstrings, and comments, so a mention of the
     type in prose cannot inflate the count.
 
+    Excludes the one construction site enclosed by ``_maybe_replay_verdict``: replay
+    re-emits a prior verdict rather than producing a new judgment, and therefore has no
+    ``principles_version()`` value to claim (msg-3846 operator's re-count, msg-3914
+    Bohr's design, msg-3917/3919 the "prose-code" correction). If that function is ever
+    renamed or a second replay path is added, this counter reds — a legitimate replay
+    extension asks the maintainer to update the exclusion allowlist deliberately rather
+    than silently disabling the check for the new function.
+
     Kept literal (5) rather than a self-referential scan of the test's own body, so a
     silent widening of one file cannot be dismissed by editing the other.
     """
     source_path = Path(__file__).resolve().parents[1] / "src/spirrow_mindwire/naysayer/pr_review.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    sites = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "PrReviewOutcome"
-    ]
-    assert len(sites) == 5, (
-        f"expected 5 PrReviewOutcome construction sites (the closed set the "
-        f"principles_version pin enumerates); found {len(sites)} at lines "
-        f"{[s.lineno for s in sites]}. If a new emit path was added, add a case to "
-        f"test_principles_version_recorded_on_every_emit_path and bump this counter."
+
+    # Walk with an explicit stack so each Call knows the FunctionDef that lexically encloses
+    # it. ``ast.walk`` alone loses that ancestry — a plain filter over Call nodes cannot tell
+    # a judgment path's site from the replay path's site. Nesting depth in pr_review.py is
+    # one level (methods on the driver class), so a stack tracking the most-recent
+    # FunctionDef is sufficient; if a nested-function refactor arrives, extend to a list.
+    replay_excluded = "_maybe_replay_verdict"
+    excluded_lines: list[int] = []
+    counted_lines: list[int] = []
+
+    def walk(node: ast.AST, enclosing: str | None) -> None:
+        # A FunctionDef or AsyncFunctionDef becomes the enclosing function for its body.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            enclosing = node.name
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "PrReviewOutcome"
+        ):
+            if enclosing == replay_excluded:
+                excluded_lines.append(node.lineno)
+            else:
+                counted_lines.append(node.lineno)
+        for child in ast.iter_child_nodes(node):
+            walk(child, enclosing)
+
+    walk(tree, None)
+
+    assert len(counted_lines) == 5, (
+        f"expected 5 JUDGMENT PrReviewOutcome construction sites (the closed set the "
+        f"principles_version pin enumerates); found {len(counted_lines)} at lines "
+        f"{counted_lines}. Excluded (replay path in {replay_excluded!r}, does not "
+        f"produce a new judgment): {excluded_lines}. If a new judgment emit path was "
+        f"added, add a case to "
+        f"test_principles_version_recorded_on_every_judgment_emit_path and bump this "
+        f"counter. If a new replay path was added, extend the exclusion allowlist "
+        f"deliberately (and add a case to "
+        f"test_replay_path_does_not_claim_current_principles_version)."
     )
 
 
@@ -2166,6 +2201,55 @@ async def test_replay_reposts_prior_verdict_when_footer_matches_head_and_not_lan
     assert lexora.calls == []
     assert outcome.verdict is ReviewEvent.APPROVE
     assert [event for _, event, _ in github.submitted] == [ReviewEvent.APPROVE]
+
+
+@pytest.mark.anyio
+async def test_replay_path_does_not_claim_current_principles_version() -> None:
+    """A replayed verdict returns ``principles_version is None`` — it made no new judgment.
+
+    Companion to :func:`test_principles_version_recorded_on_every_judgment_emit_path`
+    (which pins the five judgment paths). Replay re-emits a prior verdict rather than
+    judging afresh (msg-3846 operator's re-count of the ``_maybe_replay_verdict`` site,
+    msg-3914 Bohr's Option-2 design). Populating this field with the CURRENT
+    ``principles_version()`` would falsely attribute an old judgment to today's
+    principles; populating it with the ORIGINAL version is not possible because the
+    persisted verdict footer's schema is ``head_sha`` + ``event`` only (see
+    :data:`_VERDICT_FOOTER_RE`) and does not carry the version. ``None`` is therefore
+    the ONLY value here that is not a fabrication.
+
+    Pinning this contract in a test (rather than only in the field docstring) keeps
+    the invariant executable: a well-meaning refactor that "helpfully" adds
+    ``principles_version=principles_version()`` to the replay site would silently
+    corrupt the audit tag of every replayed verdict; this test reds instead.
+    """
+    lexora = _FakeLexora(content="should not be called")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "deadbeefdeadbeef", []),
+        reviews=[],  # nothing landed on GitHub → replay path fires
+    )
+    prior_body = (
+        "prior critique\n\n"
+        "VERDICT: APPROVE\n\n"
+        "<!-- mindwire:verdict head_sha=deadbeefdeadbeef event=APPROVE -->\n\n"
+        "ADR-INDEX: unavailable"
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(
+        _pr(),
+        post_critique=post,
+        read_review_thread=_replay_reader([("naysayer", prior_body)]),
+    )
+    # Sanity: this is actually the replay path (no Lexora spent, verdict re-POSTed).
+    assert lexora.calls == []
+    assert [event for _, event, _ in github.submitted] == [ReviewEvent.APPROVE]
+    # The contract: replay claims no new principles version.
+    assert outcome.principles_version is None, (
+        "replay path must not claim the current principles_version — the outcome "
+        "records no new judgment, and the original version is not recoverable from "
+        "the persisted footer (schema = head_sha + event only). Writing anything "
+        "but None would be a fabricated audit tag."
+    )
 
 
 @pytest.mark.anyio
