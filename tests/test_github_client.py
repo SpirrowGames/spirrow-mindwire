@@ -1899,6 +1899,63 @@ async def test_fetch_file_at_preserves_path_separators_and_encodes_segments() ->
 
 
 @pytest.mark.anyio
+async def test_fetch_file_at_uses_structured_raw_path_not_string_parsing() -> None:
+    """PR #307 gate re-review advisory (msg-3655): the URL must be constructed via
+    :class:`httpx.URL`'s structured ``raw_path`` API, not by string-formatting an
+    already-percent-encoded path into a URL string and relying on httpx's URL-string
+    parser to preserve our ``%XX`` sequences.
+
+    This test pins the structural property that WOULD BREAK if we regressed to a
+    "pass a pre-encoded string to ``client.get(str)``" pattern: a path segment whose
+    encoded form contains a literal ``%`` (from encoding a reserved character) must
+    reach GitHub as the exact ``%XX`` bytes we chose, byte-for-byte, without any
+    parser-mediated re-normalisation. We use a filename with characters that fully
+    exercise the encoding path (``#`` → ``%23``, space → ``%20``, ``?`` → ``%3F``);
+    a string-parser round-trip would raise ``InvalidURL`` on the raw ``?`` / ``#``,
+    so the fact that the request goes through at all — with the encoded bytes intact
+    — is evidence that raw_path bypassed the parser.
+    """
+    raw_paths: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw_paths.append(request.url.raw_path)
+        return httpx.Response(200, text="body")
+
+    async with _client(handler) as client:
+        # ``What is #7 spec?.md`` — every reserved character (space, #, ?) forces
+        # pre-encoding on our side; if the URL went through httpx's string parser,
+        # the raw ``?`` / ``#`` would either raise or be split off as query/fragment.
+        await client.fetch_file_at(_PR, path="Docs/What is #7 spec?.md", ref="abc123")
+    assert raw_paths[0] == (
+        b"/repos/spirrowgames/spirrow-mindwire/contents"
+        b"/Docs/What%20is%20%237%20spec%3F.md?ref=abc123"
+    )
+
+
+@pytest.mark.anyio
+async def test_fetch_file_at_encodes_ref_query_via_httpx() -> None:
+    """The ``ref`` query value is applied via :meth:`httpx.URL.copy_merge_params`, so
+    httpx handles query-string encoding. A ref that contains a character which would
+    be reserved in a query (e.g. ``&`` or space — hypothetical for a git ref, but the
+    encoding path must be correct in principle) round-trips as an encoded value, not
+    a raw one that would corrupt the query string. Pinning this behaviour prevents
+    a regression where someone "helpfully" pre-encodes ``ref`` and creates a
+    double-encoding bug on real content."""
+    seen_ref: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_ref.append(request.url.params.get("ref"))
+        return httpx.Response(200, text="body")
+
+    async with _client(handler) as client:
+        # Refs are almost always SHAs, but the query-encoding path is exercised here
+        # with a value that would break an unencoded URL.
+        await client.fetch_file_at(_PR, path="a.md", ref="feat/branch name")
+    # httpx has decoded the query value for us, confirming it was encoded on the wire.
+    assert seen_ref == ["feat/branch name"]
+
+
+@pytest.mark.anyio
 async def test_fetch_file_at_returns_none_on_404() -> None:
     """A 404 is a positive machine-readable answer: the path does not exist at ``ref``.
     Distinct from a network error (which raises) — the caller uses this to keep the
