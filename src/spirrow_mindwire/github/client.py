@@ -1450,6 +1450,32 @@ class GitHubClient:
         anything other than plain hex therefore round-trip correctly), still without
         the URL going through a string parser.
 
+        Known limitations (recorded so a future operator can find them without
+        re-reading a chatroom thread — Einstein advisory on PR #316's disposition).
+
+        * **GitHub Enterprise Server ``base_url`` prefix is dropped.** The absolute
+          ``raw_path`` we build here starts at ``/repos/...``, and
+          :meth:`httpx.URL.copy_with` replaces the URL path wholesale rather than
+          appending. A ``base_url`` configured as ``https://ghe.example.com/api/v3/``
+          would therefore produce ``https://ghe.example.com/repos/...``, dropping the
+          ``/api/v3`` routing prefix that GHES needs. This is not a regression from
+          PR #307 — the earlier ``client.get("/repos/...")`` form had the same
+          absolute-path override — but it means this client is not GHES-ready as
+          written. Fix, when a GHES deployment is on the table: read
+          ``self._client.base_url.raw_path`` and prepend it to the ``raw_path`` we
+          build here (stripping duplicated leading ``/``). Deferred as debt because
+          no GHES deployment target is on the roadmap; landing dead code for a
+          hypothetical deployment fails Principle 1.
+        * **Exception message uses the decoded path (``url.path``), which is not
+          copy-paste-ready for ``curl``.** Reserved characters in the file path
+          (spaces, ``#``, ``?``) reach the exception string in their decoded form
+          and would need to be re-encoded before an operator could paste the logged
+          path into a shell. Accepted as an operability downgrade in exchange for
+          removing the parallel ``contents_path`` string that would otherwise have
+          to track ``raw_path`` in lockstep (human A on msg-3786; v2 trigger pinned
+          at "≥1 operator report of a broken copy-paste debug path within 3 weeks
+          of PR #316 landing" — Bohr msg-3787).
+
         See :func:`spirrow_mindwire.naysayer.pr_review.verify_citations` for the caller
         contract (memoisation on ``(path, ref)``, single-line-``where`` gate, empty-line
         predicate) and the driver-side gate-verdict override that consumes the result.
