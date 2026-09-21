@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """spec/design/verify.py — diagnostic for the spec-delivery mechanism.
 
-Implements V-1..V-13 from SPEC-2026-08-11-design-spec-delivery §5 and the
+Implements V-1..V-14 from SPEC-2026-09-20-pin-hardening-and-id-audit §5
+(inheriting SPEC-2026-08-11-design-spec-delivery via ``supersedes``) and the
 fail-closed pin-resolution procedure from §3.  This script is a diagnostic,
-not a CI gate (D-10): `main` is expected to be error-0 / warning-0 (A-12);
-warnings do not affect the exit code.
+not a CI gate (D-10 / D-36): `main` is expected to be error-0 / warning-0
+(A-12); errors and warnings from V-1..V-14 do NOT affect the exit code —
+only usage / environment failures do.  See D-36 (§5-E) for the exit-code
+independence rationale.
 
 Usage:
     python spec/design/verify.py [--repo-root PATH] [--json] [--pin-only] [--no-fetch]
 
 Exit codes:
-    0 — no error (warnings are informational)
-    1 — one or more errors
-    2 — usage / environment error (not a git repo, unusable arguments)
+    0 — script executed to completion (regardless of errors / warnings from
+        checks; per D-36 verify.py is diagnostic, not gate)
+    2 — usage / environment error (not a git repo, unusable arguments,
+        YAML load failure of a required file)
 """
 
 from __future__ import annotations
@@ -31,14 +35,20 @@ import yaml
 # Constants — spec §3 (pin schema) and §5 (checks)
 # ---------------------------------------------------------------------------
 
-# The eleven pin-resolution reason codes, in the order §3 lists them.  A-29
-# / V-13 require every one of these to appear verbatim in OBL-SPEC-PIN's
-# body when the entry exists.
+# The thirteen pin-resolution reason codes, in the order §3-D lists them
+# (12 FAULT codes then the sole BOOTSTRAP proceed-code).  A-31 / V-13 require
+# every one of these to appear verbatim in OBL-SPEC-PIN's body when the entry
+# exists.  BOOTSTRAP and PROHIBITED_FIELD are new in
+# SPEC-2026-09-20-pin-hardening-and-id-audit; unknown ``mode`` values re-use
+# MISSING_FIELD (justified body-side by the "any value other than resolved
+# or bootstrap is also MISSING_FIELD" sentence), so the enumeration stays at
+# 13 rather than adding a UNKNOWN_MODE code (D-35 / §9 rejected).
 PIN_REASON_CODES: tuple[str, ...] = (
     "ABSENT",
     "PARSE_ERROR",
     "SCHEMA_VERSION",
     "MISSING_FIELD",
+    "PROHIBITED_FIELD",
     "DETACHED_HEAD",
     "BRANCH_MISMATCH",
     "REPO_MISMATCH",
@@ -46,6 +56,20 @@ PIN_REASON_CODES: tuple[str, ...] = (
     "COMMIT_UNREACHABLE",
     "BLOB_UNREADABLE",
     "SHA_MISMATCH",
+    "BOOTSTRAP",
+)
+
+# §3-A: seven fields whose presence turns a ``mode: bootstrap`` pin into
+# PROHIBITED_FIELD.  A bootstrap pin must carry none of the resolved-form
+# identity/reachability fields; a mixed pin is neither one nor the other.
+_BOOTSTRAP_PROHIBITED_FIELDS: tuple[str, ...] = (
+    "spec_id",
+    "thread",
+    "repo",
+    "branch",
+    "path",
+    "blob_sha",
+    "commit",
 )
 
 # Manifest front-matter — required top-level keys and their expected types.
@@ -59,6 +83,14 @@ _REQUIRED_MANIFEST_KEYS: dict[str, type | tuple[type, ...]] = {
     "supersedes": list,
     "obligations": list,
     "items": list,
+}
+
+# §5-C — optional top-level keys.  When present, V-1 checks the type; when
+# absent, V-1 is silent.  Unknown keys not in either dict are silently
+# tolerated (forward-compat: adding a new optional key in a successor spec
+# must not fail V-1 on older manifests that do not know about it).
+_OPTIONAL_MANIFEST_KEYS: dict[str, type | tuple[type, ...]] = {
+    "verify_exempt_ids": list,
 }
 
 # §6 tripartite model of item-level fields.  Each item-level field has TWO
@@ -119,6 +151,55 @@ _CANARY_ENUM: frozenset[str] = frozenset({"required", "not-applicable"})
 _HEX40 = re.compile(r"\A[0-9a-f]{40}\Z")
 
 _YAML_FRONTMATTER = re.compile(r"\A---\r?\n(?P<body>.*?)\r?\n---\r?\n?", re.DOTALL)
+
+# ---------------------------------------------------------------------------
+# V-14 patterns — §5-D of SPEC-2026-09-20-pin-hardening-and-id-audit
+# ---------------------------------------------------------------------------
+#
+# Bounded id pattern.  Prefix is bound to [A-Z]{1,2} to structurally exclude
+# 3+ letter acronyms (SHA / UTF / ADR / SPEC / HTTP / JSON / XML / HTML / CSS
+# / TCP / DNS / JWT / ISO / ASCII); digit run is bound to \d{1,3} to exclude
+# 4+ digit terms (ES-2015).  The negative lookarounds prevent substring
+# extraction from longer tokens like SPEC-2026-... or ADR-2026-... whose
+# surrounding chars are ``[A-Z0-9-]``.  Prime (U+2032) is preserved as part
+# of the id (the spec's "D-25 <U+2032 PRIME>" convention).  The rare
+# 2-letter false-positives that slip past the bound (IL-6, S-1) are
+# handled via ``verify_exempt_ids`` (D-38) — see D-37 for the
+# responsibility split rationale.
+# The literal ``U+2032 PRIME`` and ``U+FF08 FULLWIDTH LEFT PARENTHESIS``
+# below are spelled with ``\u`` escapes so the ruff RUF001 / RUF003 lints
+# stay silent — the compiled patterns behave identically to the equivalent
+# raw-string forms the spec text uses.
+_PRIME = "\N{PRIME}"
+_FULLWIDTH_LPAREN = "\N{FULLWIDTH LEFT PARENTHESIS}"
+
+_ID_REFERENCE = re.compile("(?<![A-Z0-9-])[A-Z]{1,2}-\\d{1,3}" + _PRIME + "?(?![A-Z0-9-])")
+
+# Definition patterns (SPEC-2026-09-20 section 5-D 定義子抽出).  Bold form:
+# first occurrence per line of ``**X-nn**`` or ``**X-nn(`` (either the
+# half-width U+0028 or the full-width U+FF08 that the spec's own
+# decision-list titles use).  Table form: row starting with ``| X-nn |``.
+# Symmetrically bounded with the reference pattern so a definition that
+# is bounded out on one side is not extracted on the other (which would
+# create a "defined but not referenced" ghost).
+_DEF_BOLD = re.compile(
+    "\\*\\*([A-Z]{1,2}-\\d{1,3}" + _PRIME + "?)(?:\\*\\*|[" + _FULLWIDTH_LPAREN + "(])"
+)
+_DEF_TABLE = re.compile("^\\|\\s*([A-Z]{1,2}-\\d{1,3}" + _PRIME + "?)\\s*\\|")
+
+# Inline-code stripper.  Fenced blocks are handled by a line-based scanner
+# in ``_strip_fenced_blocks`` (regex-based matching is too fragile against
+# prose that mentions backtick sequences, e.g., the spec's own §5-D
+# discussion of what a fence *looks like*).  The inline pattern matches a
+# backtick pair that does not cross a newline.
+_INLINE_CODE = re.compile(r"`[^`\n]+`")
+
+# A fence opener: line whose first non-whitespace run is 3+ backticks.  The
+# fence extends to the next line whose first non-whitespace run is 3+
+# backticks (of at least the same count as the opener, per CommonMark).
+# Anything before the fence closes — or before end of file, if unclosed —
+# is treated as fenced content.
+_FENCE_OPENER = re.compile(r"^\s*(`{3,})")
 
 # ---------------------------------------------------------------------------
 # Finding — a single line of output
@@ -306,6 +387,57 @@ def _resolve_pin(repo_root: Path, no_fetch: bool) -> PinResult:
     if pin.get("schema_version") != 1:
         return PinResult("NO-PIN", "SCHEMA_VERSION")
 
+    # 3.5 — mode branch (§3-B).  BOOTSTRAP judgement runs AFTER schema_version
+    # (D-35): a future v2 bootstrap-shaped pin must not be waved through by a
+    # v1 agent.  Three branches:
+    #   1. mode == "bootstrap"  → check limited-field constraints, emit
+    #      BOOTSTRAP / MISSING_FIELD / PROHIBITED_FIELD
+    #   2. mode is None or "resolved" → fall through to step 4 (legacy path)
+    #   3. anything else (int, empty string, other string) → MISSING_FIELD.
+    #      Justified body-side by the §4-1 "any value other than resolved
+    #      or bootstrap is also MISSING_FIELD" sentence.  fail-closed: the
+    #      agent does NOT infer the dispatcher's intent.
+    mode = pin.get("mode")
+    if mode == "bootstrap":
+        # Branch 1 — bootstrap form.  Required: pinned_at, pinned_by (both
+        # non-empty str, with datetime coercion for pinned_at per YAML).
+        pinned_by = pin.get("pinned_by")
+        if not isinstance(pinned_by, str) or not pinned_by:
+            return PinResult("NO-PIN", "MISSING_FIELD")
+        if "pinned_at" not in pin:
+            return PinResult("NO-PIN", "MISSING_FIELD")
+        pinned_at_bs = pin["pinned_at"]
+        if not isinstance(pinned_at_bs, str):
+            # Coerce a datetime (unquoted YAML timestamps parse to datetime).
+            try:
+                pinned_at_bs = pinned_at_bs.isoformat()
+            except AttributeError:
+                return PinResult("NO-PIN", "MISSING_FIELD")
+        # Post-coercion emptiness guard covers BOTH inputs — a literal
+        # ``pinned_at: ""`` (skips the coercion branch above but must still
+        # halt as MISSING_FIELD) and a degenerate datetime whose isoformat
+        # returns "".  The earlier form only checked emptiness inside the
+        # coercion branch and let a literal empty string through as
+        # BOOTSTRAP; pr-gate correctness objection #1 at head-sha
+        # ca2a944 caught that regression.
+        if not isinstance(pinned_at_bs, str) or not pinned_at_bs:
+            return PinResult("NO-PIN", "MISSING_FIELD")
+        # Any of the 7 resolved-form fields present → PROHIBITED_FIELD.
+        # `pin.get(field) is not None` treats YAML null as absent (a
+        # dispatcher writing ``spec_id: ~`` is not carrying a value).
+        for field in _BOOTSTRAP_PROHIBITED_FIELDS:
+            if pin.get(field) is not None:
+                return PinResult("NO-PIN", "PROHIBITED_FIELD")
+        return PinResult("NO-PIN", "BOOTSTRAP")
+    elif mode is not None and mode != "resolved":
+        # Branch 3 — unknown mode value.  Any non-None value that is not
+        # "resolved" or "bootstrap" (including empty string, non-string
+        # types like int, or unknown string values like "future_feature")
+        # halts as MISSING_FIELD.  No fall-through to the resolved path
+        # (would defeat the fail-closed guarantee for future mode values).
+        return PinResult("NO-PIN", "MISSING_FIELD")
+    # Branch 2 — mode is None or "resolved": continue to step 4.
+
     # 4 — required fields + type + hex40.  `pinned_at` may be parsed by
     # yaml.safe_load as a datetime (unquoted ISO 8601 timestamps are the
     # canonical YAML form and the spec's own §3 example is unquoted); we
@@ -333,8 +465,11 @@ def _resolve_pin(repo_root: Path, no_fetch: bool) -> PinResult:
             pinned_at = pinned_at.isoformat()  # datetime → str
         except AttributeError:
             return PinResult("NO-PIN", "MISSING_FIELD")
-        if not pinned_at:
-            return PinResult("NO-PIN", "MISSING_FIELD")
+    # Post-coercion emptiness guard covers both the literal ``pinned_at: ""``
+    # case and a degenerate datetime that coerces to "" (same shape as the
+    # bootstrap branch — see the extended comment there).
+    if not isinstance(pinned_at, str) or not pinned_at:
+        return PinResult("NO-PIN", "MISSING_FIELD")
     blob_sha = pin["blob_sha"]
     commit = pin["commit"]
     if not _HEX40.fullmatch(blob_sha) or not _HEX40.fullmatch(commit):
@@ -468,6 +603,40 @@ def _check_v1(manifest: Manifest) -> list[Finding]:
                     f"(expected {exp}, got {type(val).__name__})",
                 )
             )
+    # §5-C: optional keys — checked ONLY when present.  Absence is silent;
+    # unknown keys (in neither dict) are also silent (forward-compat).
+    for key, expected_type in _OPTIONAL_MANIFEST_KEYS.items():
+        if key not in manifest.data:
+            continue
+        val = manifest.data[key]
+        if not isinstance(val, expected_type):
+            exp = expected_type.__name__ if isinstance(expected_type, type) else str(expected_type)
+            findings.append(
+                Finding(
+                    "ERROR",
+                    "V-1",
+                    _target_label(manifest),
+                    f"optional front-matter key `{key}` has wrong type "
+                    f"(expected {exp}, got {type(val).__name__})",
+                )
+            )
+            continue
+        # `verify_exempt_ids` must be list[str] (element-level check).  The
+        # individual ids are NOT checked against the id-pattern here — a
+        # deliberately-permissive entry (e.g., a non-conforming string
+        # kept for audit trail) is not V-1's concern.
+        if key == "verify_exempt_ids":
+            for idx, entry in enumerate(val):
+                if not isinstance(entry, str):
+                    findings.append(
+                        Finding(
+                            "ERROR",
+                            "V-1",
+                            _target_label(manifest),
+                            f"verify_exempt_ids[{idx}] is not a string "
+                            f"(got {type(entry).__name__})",
+                        )
+                    )
     return findings
 
 
@@ -826,6 +995,195 @@ def _check_v12(manifest: Manifest) -> list[Finding]:
     return findings
 
 
+# ---------------------------------------------------------------------------
+# V-14 helpers — internal id reference audit (SPEC-2026-09-20 §5-D)
+# ---------------------------------------------------------------------------
+
+
+def _read_manifest_body(path: Path) -> str:
+    """Return the body of a manifest (text after the closing ``---``).
+
+    Returns the empty string if the file cannot be read or has no
+    front-matter.  Chain-walk callers report the missing-file case
+    separately with a V-14 error.
+    """
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    match = _YAML_FRONTMATTER.match(raw)
+    if match is None:
+        return raw
+    return raw[match.end() :]
+
+
+def _strip_fenced_blocks(body: str) -> str:
+    """Remove fenced code blocks by scanning line by line.
+
+    A regex-based match is too fragile: the spec's own §5-D discusses what
+    a fence *looks like* using inline prose that carries backtick runs, and
+    a naive multi-line regex reads that prose as an opening fence with no
+    closer — swallowing the rest of the file.  The scanner requires a
+    fence opener to be the leading token of its line and requires the
+    closer to carry at least as many backticks as the opener.
+    """
+
+    lines = body.splitlines(keepends=True)
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = _FENCE_OPENER.match(line)
+        if m is None:
+            out.append(line)
+            i += 1
+            continue
+        opener_len = len(m.group(1))
+        # Scan forward until a line whose leading backtick run is >= opener_len.
+        i += 1
+        while i < len(lines):
+            close = _FENCE_OPENER.match(lines[i])
+            i += 1
+            if close is not None and len(close.group(1)) >= opener_len:
+                break
+        # else: unterminated fence — treat rest as fenced (drop it).
+    return "".join(out)
+
+
+def _strip_code(body: str) -> str:
+    """Strip fenced code blocks and inline code from a manifest body.
+
+    Per §5-D: reference extraction excludes ``` fences and single-backtick
+    inline code.  Stripping fences first avoids interpreting backticks
+    that live inside a fenced block as inline code.
+    """
+
+    body = _strip_fenced_blocks(body)
+    body = _INLINE_CODE.sub("", body)
+    return body
+
+
+def _extract_references(body: str) -> set[str]:
+    """Extract bounded internal-id references from a body (post-strip)."""
+
+    stripped = _strip_code(body)
+    return set(_ID_REFERENCE.findall(stripped))
+
+
+def _extract_definitions(body: str, items: list[Any]) -> set[str]:
+    """Extract definition-side ids from a body plus front-matter items.
+
+    Bold form takes the FIRST match per line only (§5-D 定義子抽出).
+    Table form matches any row whose leading cell is a bounded id.
+    Front-matter ``items[].id`` values are trivially definitional (I-N).
+    """
+
+    defs: set[str] = set()
+    for item in items or []:
+        if isinstance(item, dict):
+            iid = item.get("id")
+            if isinstance(iid, str) and _ID_REFERENCE.fullmatch(iid):
+                defs.add(iid)
+    for raw_line in body.splitlines():
+        m_bold = _DEF_BOLD.search(raw_line)
+        if m_bold:
+            defs.add(m_bold.group(1))
+        m_table = _DEF_TABLE.match(raw_line)
+        if m_table:
+            defs.add(m_table.group(1))
+    return defs
+
+
+def _resolve_supersedes_chain(
+    manifest: Manifest,
+    manifests_by_spec_id: dict[str, Manifest],
+) -> tuple[set[str], set[str], list[Finding]]:
+    """Walk the ``supersedes`` chain and return (defs_union, exempts_union, errors).
+
+    Each ancestor contributes its own definitions and ``verify_exempt_ids``
+    to the current manifest's exemption / definition sets.  Cycles are
+    prevented by tracking visited manifest paths (``m.path``): using the
+    manifest file path — always a hashable :class:`pathlib.Path` — avoids
+    the ``TypeError: unhashable type`` crash that a malformed front-matter
+    ``spec_id`` (e.g. YAML list / dict) would otherwise raise when V-1
+    schema errors let a manifest flow into V-14 (D-36: check failures do
+    not stop the run).  An ancestor file that cannot be located in
+    ``manifests_by_spec_id`` produces a V-14 error (per D-37) but does
+    not stop the walk.
+    """
+
+    findings: list[Finding] = []
+    defs: set[str] = set()
+    exempts: set[str] = set()
+    visited: set[Path] = set()
+
+    def _walk(m: Manifest) -> None:
+        if m.path in visited:
+            return
+        visited.add(m.path)
+        body = _read_manifest_body(m.path)
+        items = m.data.get("items") if isinstance(m.data.get("items"), list) else []
+        defs.update(_extract_definitions(body, items))
+        raw_exempts = m.data.get("verify_exempt_ids") or []
+        if isinstance(raw_exempts, list):
+            for entry in raw_exempts:
+                if isinstance(entry, str):
+                    exempts.add(entry)
+        supersedes = m.data.get("supersedes") or []
+        if not isinstance(supersedes, list):
+            return
+        for parent_id in supersedes:
+            if not isinstance(parent_id, str):
+                continue
+            parent = manifests_by_spec_id.get(parent_id)
+            if parent is None:
+                findings.append(
+                    Finding(
+                        "ERROR",
+                        "V-14",
+                        _target_label(m),
+                        f"supersedes ancestor `{parent_id}` file not found "
+                        "(cannot resolve chain-walked definitions)",
+                    )
+                )
+                continue
+            _walk(parent)
+
+    _walk(manifest)
+    return defs, exempts, findings
+
+
+def _check_v14(
+    manifest: Manifest,
+    manifests_by_spec_id: dict[str, Manifest],
+) -> list[Finding]:
+    """V-14 — internal id references must resolve to a definition or exemption.
+
+    Errors flow into the ``errors`` array but do NOT affect the exit code
+    (D-36 / §5-E): verify.py stays a diagnostic even after V-14 lands.
+    """
+
+    findings: list[Finding] = []
+    body = _read_manifest_body(manifest.path)
+    references = _extract_references(body)
+    defs, exempts, walk_findings = _resolve_supersedes_chain(manifest, manifests_by_spec_id)
+    findings.extend(walk_findings)
+    unresolved = sorted(references - defs - exempts)
+    for ref in unresolved:
+        findings.append(
+            Finding(
+                "ERROR",
+                "V-14",
+                _target_label(manifest),
+                f"reference `{ref}` has no definition in this manifest, "
+                "no chain-walked definition in a `supersedes` ancestor, "
+                "and no `verify_exempt_ids` entry",
+            )
+        )
+    return findings
+
+
 def _check_v13(
     obligations_by_id: dict[str, dict[str, Any]],
 ) -> list[Finding]:
@@ -1015,6 +1373,16 @@ def _run(
     # V-10 — warnings for withdrawn / superseded on `main`
     all_findings.extend(_check_v10(manifests, current_branch))
 
+    # V-14 — internal id reference audit (SPEC-2026-09-20 §5-D).  Errors
+    # here flow into `errors` but do NOT affect the exit code (D-36 /
+    # §5-E): verify.py stays diagnostic.
+    manifests_by_spec_id: dict[str, Manifest] = {}
+    for m in manifests:
+        if isinstance(m.spec_id, str) and m.spec_id and m.spec_id not in manifests_by_spec_id:
+            manifests_by_spec_id[m.spec_id] = m
+    for m in manifests:
+        all_findings.extend(_check_v14(m, manifests_by_spec_id))
+
     return _emit(all_findings, resolved_items, pin, json_output)
 
 
@@ -1042,7 +1410,11 @@ def _emit(
         for f in findings:
             print(f.render())
 
-    return 1 if errors else 0
+    # D-36 / §5-E: verify.py is a diagnostic, not a gate.  Check-driven
+    # findings (V-1..V-14 errors / warnings) do NOT affect the exit code —
+    # only usage / environment failures (handled in ``main``) do.  A-12
+    # keeps ``main`` at error-0 / warning-0 by discipline, not by gate.
+    return 0
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
