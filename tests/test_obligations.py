@@ -47,7 +47,10 @@ puts the imperative in the destination (`spec/process/README.md`).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+import yaml
 
 from spirrow_mindwire.adapters.implementer import ImplementerSdkAdapter
 from spirrow_mindwire.adapters.naysayer_sdk import (
@@ -448,3 +451,105 @@ def test_pr_gate_pass1_prompt_carries_no_obligation_body() -> None:
             f"obligation id label [{obligation.id}] appears in the PR-gate messages "
             "— same rule as the body assertion above"
         )
+
+
+# --------------------------------------------------------------------------- #
+# SPEC-2026-09-20 §4-1 / §4-2 verbatim-body invariant (Bohr msg-3991 objection 2).
+#
+# The landed spec `spec/design/T-spec-pin-hardening-and-id-audit.md` is the SOLE
+# source of truth for OBL-SPEC-PIN and OBL-SPEC-RECEIPT bodies (A-32 of that
+# spec — the body-only 一意判定 depends on byte-exact match). These tests read
+# the spec file at runtime and compare its §4-1 / §4-2 YAML fence content
+# against the corresponding entry's body in `spec/process/obligations.yaml`;
+# hardcoding the expected text into the test would create triple-management
+# (spec / manifest / test), which msg-3991 objection 2 forbids.
+#
+# The spec file is landed on main (SPEC-2026-09-20 D-19 immutability) so its
+# content is the invariant; drift is a manifest bug, never a spec correction.
+# --------------------------------------------------------------------------- #
+
+
+_LANDED_SPEC_PATH = (
+    Path(__file__).resolve().parents[1] / "spec" / "design" / "T-spec-pin-hardening-and-id-audit.md"
+)
+
+
+def _extract_yaml_block_from_spec_section(spec_text: str, section_heading: str) -> str:
+    """Return the parsed ``body:`` field of the YAML block inside *section_heading*.
+
+    Slices the markdown between ``section_heading`` and the next ``### `` /
+    ``## `` heading, finds the first ```` ```yaml ```` fence in that slice,
+    and returns the ``body:`` of the first list entry inside the fence. The
+    fence-closing ```` ``` ```` line is INCLUDED-until (not INCLUDED-through)
+    so the captured content ends with the trailing ``\\n`` that YAML block
+    literals preserve — the same convention
+    :meth:`~spirrow_mindwire.obligations.load_manifest` normalises with
+    ``body.rstrip("\\n")``, so this helper also strips one trailing newline
+    for a like-for-like comparison against the loaded body.
+    """
+    heading_re = re.escape(section_heading)
+    match = re.search(rf"{heading_re}[^\n]*\n(.*?)(?=\n### |\n## )", spec_text, re.DOTALL)
+    assert match, f"section {section_heading!r} not found in landed spec"
+    section = match.group(1)
+    fence_match = re.search(r"```yaml\n(.*?)```", section, re.DOTALL)
+    assert fence_match, f"no ```yaml fence in section {section_heading!r}"
+    fence_content = fence_match.group(1)
+    parsed = yaml.safe_load(fence_content)
+    assert isinstance(parsed, list) and parsed, (
+        f"fence content in section {section_heading!r} did not parse to a non-empty list"
+    )
+    body = parsed[0]["body"]
+    assert isinstance(body, str)
+    # Match `spirrow_mindwire.obligations._parse_entry`'s normalisation so the
+    # comparison is on the same shape production code compares (the loaded body
+    # never carries a trailing block-literal newline).
+    return body.rstrip("\n")
+
+
+def test_obl_spec_pin_body_matches_landed_spec_section_4_1() -> None:
+    """OBL-SPEC-PIN body in obligations.yaml == §4-1 body in the landed spec.
+
+    A-32 of SPEC-2026-09-20 requires the OBL-SPEC-PIN body to be readable in
+    isolation — the whole point of the "body-only 一意判定" invariant is that
+    the string a runtime agent reads matches the string a design reviewer
+    reviewed. The spec's §4-1 YAML fence is the reviewed artifact; the
+    manifest is the runtime artifact; a drift between them means a runtime
+    agent is bound by text nobody reviewed. This test reads the spec at
+    runtime (Bohr msg-3991 objection 2: no hardcoded copy of the spec text
+    in the test file) and rejects any drift.
+    """
+    spec_text = _LANDED_SPEC_PATH.read_text(encoding="utf-8")
+    expected = _extract_yaml_block_from_spec_section(spec_text, "### §4-1")
+    manifest = load_manifest()
+    actual_entries = [o for o in manifest.obligations if o.id == "OBL-SPEC-PIN"]
+    assert len(actual_entries) == 1, "OBL-SPEC-PIN must appear exactly once"
+    actual = actual_entries[0].body
+    assert actual == expected, (
+        "OBL-SPEC-PIN body drifted from "
+        "spec/design/T-spec-pin-hardening-and-id-audit.md §4-1 "
+        f"(spec len={len(expected)}, manifest len={len(actual)}). "
+        "SPEC-2026-09-20 A-32 requires byte-exact match — the spec is the SOT "
+        "(D-19 immutability). Either restore the manifest body, or open a "
+        "successor spec if the spec text needs to change."
+    )
+
+
+def test_obl_spec_receipt_body_matches_landed_spec_section_4_2() -> None:
+    """OBL-SPEC-RECEIPT body in obligations.yaml == §4-2 body in the landed spec.
+
+    Same rationale as ``test_obl_spec_pin_body_matches_landed_spec_section_4_1``:
+    A-33 (the successor of A-28) pins the receipt-form to 13 codes with
+    NO-PIN/BOOTSTRAP as the sole worked-form code, and a drift between the
+    spec and the manifest would make the runtime receipt shape divergent from
+    the reviewed one.
+    """
+    spec_text = _LANDED_SPEC_PATH.read_text(encoding="utf-8")
+    expected = _extract_yaml_block_from_spec_section(spec_text, "### §4-2")
+    manifest = load_manifest()
+    actual_entries = [o for o in manifest.obligations if o.id == "OBL-SPEC-RECEIPT"]
+    assert len(actual_entries) == 1, "OBL-SPEC-RECEIPT must appear exactly once"
+    actual = actual_entries[0].body
+    assert actual == expected, (
+        f"OBL-SPEC-RECEIPT body drifted from spec/design/T-spec-pin-hardening-and-id-audit.md §4-2 "
+        f"(spec len={len(expected)}, manifest len={len(actual)})."
+    )

@@ -674,3 +674,125 @@ def test_reply_sent_event_normalizes_missing_model_id() -> None:
         idempotency_key="s:1",
     )
     assert ev_missing.fields[EVENT_FIELD_MODEL_ID] == ""
+
+
+# --------------------------------------------------------------------------- #
+# SPEC-2026-09-20 I-3 — dispatcher writes `.mindwire/pin` before every
+# implementer / naysayer dispatch (D-32 / A-36). Tests pin four invariants:
+#
+#   (a) implementer dispatch writes a bootstrap pin (Phase 1: no mapping).
+#   (b) naysayer dispatch writes a bootstrap pin (D-32 names both roles).
+#   (c) proposer dispatch is a no-op — the target set is implementer/naysayer.
+#   (d) the pin file is present BEFORE the adapter's deliver_event runs
+#       (fail-loud on invert: if the write happens after delivery, the
+#       adapter side would never see the pin at dispatch time).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_pin_writer_writes_bootstrap_pin_for_implementer_dispatch(tmp_path: Path) -> None:
+    from spirrow_mindwire.spec_pin import SpecPinWriter
+
+    class _ImplementerAdapter(_ReplyingAdapter):
+        capabilities = frozenset(
+            {Capability.READ_THREAD, Capability.POST_REPLY, Capability.EXECUTE_CODE}
+        )
+
+    adapter = _ImplementerAdapter()
+    disp = Dispatcher(
+        registry=_registry_with(adapter),
+        gateway=_FakeGateway(),
+        spec_pin_writer=SpecPinWriter(repo_root=tmp_path),
+    )
+    handle = await disp.spawn_instance(_thread_ref(), Role.IMPLEMENTER, "implementer-1")
+    await disp.dispatch(handle, _event())
+    pin_path = tmp_path / ".mindwire" / "pin"
+    assert pin_path.is_file(), (
+        "SPEC-2026-09-20 D-32: dispatcher must write `.mindwire/pin` before an "
+        "implementer dispatch; missing file means the pin write did not fire"
+    )
+    # bootstrap shape (§3-B) — reader would classify as NO-PIN(BOOTSTRAP)
+    import yaml as _yaml
+
+    parsed = _yaml.safe_load(pin_path.read_text(encoding="utf-8"))
+    assert parsed["mode"] == "bootstrap"
+    assert parsed["pinned_by"] == "dispatcher"
+
+
+@pytest.mark.anyio
+async def test_pin_writer_writes_bootstrap_pin_for_naysayer_dispatch(tmp_path: Path) -> None:
+    from spirrow_mindwire.spec_pin import SpecPinWriter
+
+    class _NaysayerAdapter(_ReplyingAdapter):
+        capabilities = frozenset(
+            {Capability.READ_THREAD, Capability.POST_REPLY, Capability.NAYSAYER_QUALIFIED}
+        )
+
+    adapter = _NaysayerAdapter()
+    disp = Dispatcher(
+        registry=_registry_with(adapter),
+        gateway=_FakeGateway(),
+        spec_pin_writer=SpecPinWriter(repo_root=tmp_path),
+    )
+    handle = await disp.spawn_instance(_thread_ref(), Role.NAYSAYER, "naysayer-1")
+    await disp.dispatch(handle, _event())
+    assert (tmp_path / ".mindwire" / "pin").is_file(), (
+        "SPEC-2026-09-20 D-32 names both implementer and naysayer explicitly; "
+        "naysayer dispatch must also write a pin"
+    )
+
+
+@pytest.mark.anyio
+async def test_pin_writer_noops_for_proposer_dispatch(tmp_path: Path) -> None:
+    from spirrow_mindwire.spec_pin import SpecPinWriter
+
+    adapter = _ReplyingAdapter()
+    disp = Dispatcher(
+        registry=_registry_with(adapter),
+        gateway=_FakeGateway(),
+        spec_pin_writer=SpecPinWriter(repo_root=tmp_path),
+    )
+    handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
+    await disp.dispatch(handle, _event())
+    assert not (tmp_path / ".mindwire" / "pin").exists(), (
+        "SPEC-2026-09-20 D-32 targets implementer/naysayer dispatch only; a pin "
+        "for the proposer would silently widen the target-role set"
+    )
+
+
+@pytest.mark.anyio
+async def test_pin_file_is_present_before_adapter_deliver_event(tmp_path: Path) -> None:
+    """The pin is written BEFORE the adapter receives the event.
+
+    If the write happened AFTER ``deliver_event``, the adapter — the very
+    subject the pin is written for — would run with no pin visible in its
+    cwd, and the reader-side OBL-SPEC-PIN check would fail on every
+    dispatch. The adapter records the pin's presence at delivery time; if
+    the write is misordered, the recorded value flips to ``False``.
+    """
+    from spirrow_mindwire.spec_pin import SpecPinWriter
+
+    pin_path = tmp_path / ".mindwire" / "pin"
+
+    class _RecordingAdapter(_ReplyingAdapter):
+        capabilities = frozenset(
+            {Capability.READ_THREAD, Capability.POST_REPLY, Capability.EXECUTE_CODE}
+        )
+        pin_visible_at_delivery: bool = False
+
+        async def deliver_event(self, handle: SessionHandle, event: ChatroomEvent) -> None:
+            type(self).pin_visible_at_delivery = pin_path.is_file()
+            await super().deliver_event(handle, event)
+
+    adapter = _RecordingAdapter()
+    disp = Dispatcher(
+        registry=_registry_with(adapter),
+        gateway=_FakeGateway(),
+        spec_pin_writer=SpecPinWriter(repo_root=tmp_path),
+    )
+    handle = await disp.spawn_instance(_thread_ref(), Role.IMPLEMENTER, "implementer-1")
+    await disp.dispatch(handle, _event())
+    assert _RecordingAdapter.pin_visible_at_delivery, (
+        "the pin was not visible when deliver_event ran — the write must happen "
+        "BEFORE the adapter is invoked (SPEC-2026-09-20 D-32: '直前に')"
+    )

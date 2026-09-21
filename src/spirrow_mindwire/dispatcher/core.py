@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 from ..ports import AdapterRegistry, RoleAdapter, SpawnContext
 from ..source_marker import append_markers
+from ..spec_pin import SpecPinWriter
 from ..value_objects import ChatroomEvent, Event, ReplyDraft, Role, SessionHandle, ThreadRef
 from .dedup import DEFAULT_DEDUP_SET_SIZE, EventDedup
 from .event_log import delivery_failed_event, reply_sent_event
@@ -67,12 +68,22 @@ class Dispatcher:
         gateway: ChatroomGateway,
         event_sink: EventSink | None = None,
         dedup_size: int = DEFAULT_DEDUP_SET_SIZE,
+        spec_pin_writer: SpecPinWriter | None = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
         self._event_sink = event_sink
         self._dedup = EventDedup(max_size=dedup_size)
         self._sessions: dict[SessionHandle, _DispatchSession] = {}
+        # SPEC-2026-09-20-pin-hardening-and-id-audit §2.1 D-32: the dispatcher
+        # writes `.mindwire/pin` before EVERY implementer / naysayer dispatch.
+        # The writer knows the target repo root and the (currently-empty) thread
+        # → SPEC-id mapping; a ``None`` here means the caller opted out (tests
+        # and the pre-SPEC-2026-09-20 code path that does not need pin writing).
+        # Production paths (`loop_runner.build_loop` /
+        # `loop_runner.build_conductor`) always inject a writer. See the note on
+        # concurrency in ``spec_pin.SpecPinWriter``.
+        self._spec_pin_writer = spec_pin_writer
 
     async def spawn_instance(
         self, thread_ref: ThreadRef, role: Role, instance_id: str
@@ -131,6 +142,17 @@ class Dispatcher:
         # retried under the same event_id: Phase 1 is fail-loud; retry /
         # dead-letter (and any dedup redesign it needs) is out of scope.
         self._dedup.mark(event.event_id)
+        # SPEC-2026-09-20-pin-hardening-and-id-audit §2.1 D-32: write
+        # `.mindwire/pin` BEFORE delivering to the adapter. The writer is a
+        # no-op for roles outside implementer/naysayer (proposer), so
+        # ``write_before_dispatch`` is safe to call unconditionally. A
+        # :class:`~spirrow_mindwire.spec_pin.PinDispatchAbort` propagates: this
+        # is a fail-loud operational fault (mapping refers to a spec file the
+        # writer cannot construct a resolved pin from — Bohr msg-3991
+        # objection 3). Under Phase 1's empty mapping this branch is
+        # unreachable and every dispatch writes a bootstrap pin.
+        if self._spec_pin_writer is not None:
+            self._spec_pin_writer.write_before_dispatch(handle.role, handle.thread_ref.thread_id)
         # I9: serialize deliver_event per SessionHandle (FIFO by call order; the
         # caller delivers in occurred_at order — ChatRoom msg-id monotonic).
         async with session.lock:
