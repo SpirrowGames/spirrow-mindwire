@@ -1,6 +1,6 @@
 # Decider — Conductor 停止判定への判断フック（設計書 v3.4）
 
-版: **3.4** / 2026-09-21 / 起票: Fermi（Cowork セッション, 2026-09-18）/ 設計 SOT: chatroom `spirrow-mindwire/T-decider-conductor-hook` / v3 差分: Bohr msg-3818 / v3.1: Bohr msg-3820 / v3.2: Bohr msg-3822 / v3.3: Bohr msg-3824 / v3.4: Bohr msg-3826 / 独立 naysayer レビュー: Einstein msg-3819 → msg-3821 → msg-3823 → msg-3825 → msg-3827 (APPROVE) / **Tier-C 承認**: Takahito 2026-09-21（"Approve v3.4 for implementation with bounce activation gated by planned evaluation phases"）/ PR #326 round-3 PR-gate ADVISORY structure（sequential mutation overlap + Tier-C threshold config omission）を Takahito 2026-09-21（"Address both structural advisories before merging the design documentation"）で PR #331 にて修正（D21 追加 + `[decider.thresholds]` に Tier-C 閾値追加）/ PR #331 round-3 PR-gate ADVISORY structure（`elif` の連結誤読 + `stop = ...` indentation の視覚的曖昧）を Takahito 2026-09-21（"Fix both advisories within PR #331 before merging (reopen, amend, re-review)"）で本 PR にて修正（D22 追加 + §3.3.a active-mode を `if dv is not None:` 配下に nest + §3.3.b の `elif` を standalone `if` に変更）
+版: **3.4** / 2026-09-21 / 起票: Fermi（Cowork セッション, 2026-09-18）/ 設計 SOT: chatroom `spirrow-mindwire/T-decider-conductor-hook` / v3 差分: Bohr msg-3818 / v3.1: Bohr msg-3820 / v3.2: Bohr msg-3822 / v3.3: Bohr msg-3824 / v3.4: Bohr msg-3826 / 独立 naysayer レビュー: Einstein msg-3819 → msg-3821 → msg-3823 → msg-3825 → msg-3827 (APPROVE) / **Tier-C 承認**: Takahito 2026-09-21（"Approve v3.4 for implementation with bounce activation gated by planned evaluation phases"）/ PR #326 round-3 PR-gate ADVISORY structure（sequential mutation overlap + Tier-C threshold config omission）を Takahito 2026-09-21（"Address both structural advisories before merging the design documentation"）で PR #331 にて修正（D21 追加 + `[decider.thresholds]` に Tier-C 閾値追加）/ PR #331 round-3 PR-gate ADVISORY structure（`elif` の連結誤読 + `stop = ...` indentation の視覚的曖昧）を Takahito 2026-09-21（"Fix both advisories within PR #331 before merging (reopen, amend, re-review)"）で本 PR にて修正（D22 追加 + §3.3.a active-mode を `if dv is not None:` 配下に nest + §3.3.b の `elif` を standalone `if` に変更）/ PR #333 round-4 PR-gate ADVISORY docs（§3.3.b inline comment の lifecycle 説明矛盾: `rule_stop_reason の直後` は §3.3.a の説明で §3.3.b は admission-gate の直後）を Takahito 2026-09-21（"Fix advisory to correct the §3.3.b comment to say 'admission-gate の直後' before merging"）で本 PR にて修正
 
 対象リポジトリ: spirrow-mindwire（本 repo — Conductor / adapter / state builder / replay）、spirrow-lexora（`/v1/decide` エンドポイント側、本設計の前提）。
 
@@ -119,7 +119,7 @@ if original_stop is None:                  # §3.3.b と structurally disjoint (
 `original_stop == StopReason.HUMAN` のとき（§3.3.a と共有の snapshot、D21）、human に届ける **直前**に走る。annotate は escalation を人へ通す前に注釈を付け、bounce は escalation を呼び出し元へ差し戻す:
 
 ```python
-# rule_stop_reason の直後（§3.3.a の snapshot と同じ original_stop を使う）、
+# admission-gate の直後（§3.3.a の snapshot と同じ original_stop を使う）、
 # human への手渡し（forced-naysayer や escalation 通知）の直前。
 # 独立フックであり §3.3.a とは admission-gate の実行を挟んで別 lifecycle 点で呼ばれる ∴ standalone `if`
 # （`elif` にしない — 物理的に §3.3.a のブロックに連結されるという誤読を避け、また 2 フックの間に admission-gate
