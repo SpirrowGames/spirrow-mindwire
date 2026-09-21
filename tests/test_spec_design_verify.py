@@ -228,6 +228,52 @@ def test_resolved_empty_pinned_at_is_missing_field(tmp_path: Path) -> None:
     assert (result.state, result.reason) == ("NO-PIN", "MISSING_FIELD")
 
 
+# Pin the invariant across the full resolved-mode required-string field set.
+# The BLOCKING pr-gate objection at head 063feae claimed a resolved-mode pin
+# with `pinned_by: ""` (or any required field empty) wrongly returned success
+# instead of MISSING_FIELD; the actual code at that head — and at every prior
+# I-2 head (ca2a944 / ba74387) — already guards with
+# `not isinstance(val, str) or not val`.  This parametrisation pins the
+# invariant across every field x every degenerate value shape so a future
+# refactor that accidentally drops the emptiness half of the guard reds the
+# gate immediately rather than silently accepting a degenerate pin.
+@pytest.mark.parametrize(
+    "field",
+    ["spec_id", "thread", "repo", "branch", "path", "blob_sha", "commit", "pinned_by"],
+)
+@pytest.mark.parametrize(
+    "bad_value",
+    ["", None, 42, [], {}],
+    ids=["empty_str", "yaml_null", "int", "empty_list", "empty_map"],
+)
+def test_resolved_required_field_empty_or_wrong_type_is_missing_field(
+    tmp_path: Path, field: str, bad_value: Any
+) -> None:
+    """Every resolved-mode required string field, every degenerate shape →
+    ``MISSING_FIELD``.  40 cases (8 fields x 5 shapes)."""
+
+    _init_git_repo(tmp_path)
+    pin: dict[str, Any] = {
+        "schema_version": 1,
+        "spec_id": "SPEC-2026-01-01-fixture",
+        "thread": "T-fixture",
+        "repo": "spirrow-mindwire",
+        "branch": "feature/test",
+        "path": "spec/design/T-fixture.md",
+        "blob_sha": "0" * 40,
+        "commit": "0" * 40,
+        "pinned_at": "2026-01-01T00:00:00Z",
+        "pinned_by": "human",
+    }
+    pin[field] = bad_value
+    _write_pin(tmp_path, pin)
+    result = VERIFY._resolve_pin(tmp_path, no_fetch=True)
+    assert (result.state, result.reason) == ("NO-PIN", "MISSING_FIELD"), (
+        f"resolved-mode {field}={bad_value!r} must halt as MISSING_FIELD "
+        f"(got state={result.state!r} reason={result.reason!r})"
+    )
+
+
 @pytest.mark.parametrize(
     "prohibited_field",
     ["spec_id", "thread", "repo", "branch", "path", "blob_sha", "commit"],
