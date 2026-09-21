@@ -1560,14 +1560,8 @@ Check "row #5 verdict domain unchanged: held-by-self -> 'available' (SAME verdic
 #          dual-management between this comment and that file). The shape='empty' pins —
 #          blank / whitespace / `[]` — live in the (d-7 companion) truncation-hazard block
 #          (search for '(d-7 companion)'), not here.
-#          Caveat on `$arrayPath` as a search anchor: variable-name anchors carry a residual
-#          drift risk — a rename refactor that missed this comment would silently break the
-#          pointer (grep would return no hits, giving no diagnostic signal that the reference
-#          is stale). Region-tag anchors like '(d-1 boundary)' and '(d-7 companion)' above do
-#          not share this hazard because tag strings have no other referent than the block
-#          they name; the `$arrayPath` reference accepts the residual rename risk as the
-#          trade-off for symbolic naming (line-number pinning was rejected on a stronger
-#          drift axis — ambient line insertions, which happen without coordinated grep).
+#          Caveat: a rename of `$arrayPath` that missed this comment would silently break the
+#          search anchor (grep returns no hits — no diagnostic signal that the reference is stale).
 #   (d-2)  SKIPPED HERE (write-fail is Set-JsonState throw; belongs to the caller's tick.
 #          The seam neither writes nor throws; the ledger row is preserved in P4-3(b) prose.)
 #   (d-3)  regression: valid file + mid-tick clear behaviour lives with Merge-LeasesStateForWrite,
