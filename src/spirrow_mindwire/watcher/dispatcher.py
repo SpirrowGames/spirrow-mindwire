@@ -78,7 +78,13 @@ from spirrow_mindwire.schema import (
     RetryBackoffStarted,
     ThreadStatusChanged,
 )
+from spirrow_mindwire.spec_pin import (
+    EMPTY_MAPPING,
+    SpecPinMapping,
+    SpecPinWriter,
+)
 from spirrow_mindwire.ulid_util import new_ulid
+from spirrow_mindwire.value_objects import Role
 
 from .dedup import DedupCache
 from .events import ThreadEvent
@@ -148,6 +154,7 @@ class ThreadDispatcher:
         max_retries: int = 0,
         retry_backoff_seconds: tuple[float, ...] = (),
         retry_jitter: float = 0.0,
+        spec_pin_mapping: SpecPinMapping | None = None,
     ) -> None:
         self._base_dir = base_dir
         self._phanthand_client = phanthand_client
@@ -184,6 +191,17 @@ class ThreadDispatcher:
         self._max_retries = max_retries
         self._retry_backoff_seconds = retry_backoff_seconds
         self._retry_jitter = retry_jitter
+        # SPEC-2026-09-20-pin-hardening-and-id-audit §2.1 D-32: this Phase 0/1
+        # dispatcher runs the implementer session (``claude-code``) inside
+        # ``layout.thread_dir``, so the pin lives at
+        # ``layout.thread_dir/.mindwire/pin`` (per-thread cwd).
+        # ``SpecPinMapping`` is passed here (not a full ``SpecPinWriter``)
+        # because the writer's ``repo_root`` varies per thread; we build a
+        # fresh :class:`~spirrow_mindwire.spec_pin.SpecPinWriter` per invoke
+        # rooted at that thread's layout. Phase 1 always uses the empty
+        # mapping (bootstrap pin every dispatch); the seam exists for a
+        # successor spec that wires thread → SPEC-id mapping.
+        self._spec_pin_mapping: SpecPinMapping = spec_pin_mapping or EMPTY_MAPPING
         # Per-thread serialization: architecture.md §4.0 requires that a
         # single thread never run two invocations concurrently. Without
         # this, two events landing close together (e.g. seq=1 then seq=2)
@@ -322,6 +340,31 @@ class ThreadDispatcher:
                     msg_seq=latest.seq,
                 )
             )
+            # SPEC-2026-09-20-pin-hardening-and-id-audit §2.1 D-32: write
+            # `.mindwire/pin` into the SDK's cwd (= ``layout.thread_dir``)
+            # BEFORE ``invoke_claude_code`` runs. The Phase 0/1 replier here is
+            # always ``claude-code`` — the implementer face — so pinning is
+            # required unconditionally on this branch. ``PinDispatchAbortError``
+            # propagates out (fail-loud); the outer ``_safe_handle`` in
+            # ``runner.py`` logs it and terminates the thread rather than
+            # burying the fault (msg-3991 objection 3).
+            # PR-review #335 round-2: pin_target_dir and spec_source_root
+            # are DIFFERENT concerns. On this Phase 0/1 path pin_target_dir
+            # is layout.thread_dir (SDK cwd = per-thread scratch), and no
+            # spec source lives under that scratch dir — spec_source_root
+            # is left unset. Phase 1 uses EMPTY_MAPPING so the resolved-pin
+            # branch is unreached; a future mapping that returns a spec_id
+            # here will abort loudly instead of silently degrading.
+            # PR-review #335 round-4 (advisory): the blocking file I/O is
+            # dispatched to the thread-pool executor through
+            # ``write_before_dispatch_async`` so it does not stall this
+            # coroutine's event loop while the on-disk write proceeds.
+            pin_writer = SpecPinWriter(
+                pin_target_dir=layout.thread_dir,
+                spec_source_root=None,
+                mapping=self._spec_pin_mapping,
+            )
+            await pin_writer.write_before_dispatch_async(Role.IMPLEMENTER, event.thread_id)
             try:
                 result = await self._invoker(
                     prompt=prompt,

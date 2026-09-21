@@ -99,6 +99,7 @@ from .obligations import ObligationsError, ObligationsManifest, load_manifest
 from .orchestrator import PrReviewOrchestrator
 from .ports import RoleAdapter
 from .preflight import PreflightError, preflight_gate
+from .spec_pin import SpecPinWriter
 from .value_objects import Capability, Event, Role, ThreadRef
 
 logger = logging.getLogger(__name__)
@@ -506,7 +507,34 @@ def _build_dispatcher(
 
     registry = build_registry(proposer=proposer, implementer=implementer, naysayer=naysayer)
     gateway = MagickitChatroomGateway(mcp)
-    dispatcher = Dispatcher(registry=registry, gateway=gateway, event_sink=_log_event_sink)
+    # SPEC-2026-09-20-pin-hardening-and-id-audit §2.1 D-32 / D-39: the
+    # dispatcher writes `.mindwire/pin` before every implementer / naysayer
+    # dispatch. The pin lives at ``<repo_root>/.mindwire/pin``, so the writer
+    # is built from ``loop.repo_dir`` — the same working tree the implementer
+    # / naysayer SDK adapters operate in. Phase 1 has no production
+    # ``SpecPinMapping``, so the default empty mapping applies and every
+    # dispatch writes a bootstrap pin (§3-B).
+    #
+    # When ``cfg.repo_dir`` is None the adapters above were all pre-built by
+    # the caller (tests), in which case the composition root does not know a
+    # repo root and pin writing is left off — production paths always set
+    # ``cfg.repo_dir`` because the ``if proposer is None or ...`` block above
+    # would already have raised ``SystemExit``.
+    pin_writer: SpecPinWriter | None = None
+    if cfg.repo_dir is not None:
+        # In the Stage 3 loop the SDK invoke's cwd IS the git checkout, so
+        # pin_target_dir and spec_source_root are the same path. The Phase
+        # 0/1 ThreadDispatcher, by contrast, uses layout.thread_dir for
+        # pin_target_dir (per-thread scratch) and leaves spec_source_root
+        # unset (PR-review #335 round-2: the two must not be conflated).
+        repo = Path(cfg.repo_dir)
+        pin_writer = SpecPinWriter(pin_target_dir=repo, spec_source_root=repo)
+    dispatcher = Dispatcher(
+        registry=registry,
+        gateway=gateway,
+        event_sink=_log_event_sink,
+        spec_pin_writer=pin_writer,
+    )
     return mcp, registry, dispatcher
 
 
