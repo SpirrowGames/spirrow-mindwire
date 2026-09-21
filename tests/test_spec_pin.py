@@ -19,6 +19,7 @@ These pin the four invariants the atomic cutover PR is required to guarantee
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import cast
 
@@ -332,16 +333,87 @@ def test_writer_overwrites_existing_pin_atomically(tmp_path: Path) -> None:
     # Now write again — a new bootstrap pin (different pinned_at may or may not
     # differ; either way there must be exactly one pin file after the second write).
     writer.write_before_dispatch(Role.IMPLEMENTER, "01JOTHERTHREADID000000000000")
-    pins = list((tmp_path / ".mindwire").glob("pin*"))
-    assert [p.name for p in pins] == ["pin"], (
-        f"expected exactly one 'pin' file (atomic write leaves no .tmp behind); "
-        f"found {[p.name for p in pins]}"
+    entries = sorted(p.name for p in (tmp_path / ".mindwire").iterdir())
+    assert entries == ["pin"], (
+        f"expected exactly one 'pin' file (atomic write leaves no .tmp behind); found {entries}"
     )
     second = (tmp_path / ".mindwire" / "pin").read_bytes()
     # The second reason references the second thread id
     assert b"01JOTHERTHREADID000000000000" in second
     # Sanity: the two are different
     assert first != second
+
+
+def test_atomic_write_tmp_filename_is_unique_per_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Successive writes must NOT reuse the same tmp filename.
+
+    PR-review #335 round-3 (BLOCKING): a hardcoded ``pin.tmp`` lets two
+    cross-process writers open the same tmp file, one process replaces it
+    while the other is mid-write, and the reader sees a torn file.
+    :func:`_atomic_write` therefore uses :func:`tempfile.mkstemp` which
+    guarantees a per-call unique name. This test observes the tmp names
+    by wrapping ``os.replace`` to capture the source path each call sees.
+    """
+    seen_tmp_paths: list[Path] = []
+    real_replace = os.replace
+
+    def spy_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        seen_tmp_paths.append(Path(os.fspath(src)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr("os.replace", spy_replace)
+
+    writer = SpecPinWriter(pin_target_dir=tmp_path)
+    writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
+    writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
+    writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
+
+    assert len(seen_tmp_paths) == 3, "expected three tmp files across three writes"
+    # All three must be distinct — a hardcoded ".mindwire/pin.tmp" would
+    # give three copies of the same path here (the bug this test guards).
+    assert len(set(seen_tmp_paths)) == 3, (
+        "tmp filenames are not unique across successive writes — "
+        "cross-process writers would race on the same tmp file "
+        f"(saw: {seen_tmp_paths})"
+    )
+    # And the fixed suffix ``pin.tmp`` must never appear literally: an
+    # accidental regression back to ``path.with_suffix(...+'.tmp')`` would
+    # give exactly ``.mindwire/pin.tmp`` on every call.
+    for p in seen_tmp_paths:
+        assert p.name != "pin.tmp", (
+            f"tmp filename regressed to the hardcoded ``pin.tmp`` shape: {p!r}"
+        )
+
+
+def test_atomic_write_cleans_up_tmp_file_on_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that raises mid-flight must NOT leak tmp files.
+
+    Cross-process defence needs no leftover ``.pin.*.tmp`` accumulating
+    in the pin directory: (a) the pin directory is small and (b) an
+    inspector auditing pin state should see the current pin only. Force
+    the write path to raise by patching ``os.replace``; the abort must
+    unlink the tmp file it created before re-raising.
+    """
+    writer = SpecPinWriter(pin_target_dir=tmp_path)
+
+    class _BoomError(RuntimeError):
+        pass
+
+    def broken_replace(_src: str | os.PathLike[str], _dst: str | os.PathLike[str]) -> None:
+        raise _BoomError("simulated replace failure")
+
+    monkeypatch.setattr("os.replace", broken_replace)
+
+    with pytest.raises(_BoomError):
+        writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
+
+    # No .tmp file should remain in the pin directory after the abort.
+    leftover = sorted((tmp_path / ".mindwire").iterdir())
+    assert leftover == [], f"tmp file leaked after write failure: {[p.name for p in leftover]}"
 
 
 # --------------------------------------------------------------------------- #

@@ -45,7 +45,10 @@ minimises byte-drift with pre-SPEC-2026-09-20 pins that never had a
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -233,16 +236,45 @@ def pin_yaml_bytes(pin: Mapping[str, object]) -> bytes:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
-    """Write bytes to *path* atomically (write to `.tmp`, then rename).
+    """Write bytes to *path* atomically, safe under concurrent writers.
 
-    The rename is atomic on POSIX and on NTFS for same-directory renames,
-    so a reader observing the pin file sees either the previous complete
-    content or the new complete content — never a half-written file.
+    Two-step atomic replace: (1) create a per-writer unique temporary
+    file in ``path.parent``, write to it in full, then (2) ``os.replace``
+    it over ``path``. The rename is atomic on POSIX and on NTFS for
+    same-directory renames.
+
+    Uniqueness of the tmp file (via :func:`tempfile.mkstemp` with a
+    process- and call-unique suffix) is load-bearing under concurrent
+    writers (PR-review #335 round-3 finding): a hardcoded
+    ``pin.tmp`` name lets two processes racing to write open the SAME
+    tmp path — process A then renames tmp to ``path`` while process B
+    is still writing to it, and the reader sees a torn or interleaved
+    file. Per-writer tmp names uncouple the writers so each ``replace``
+    installs whichever writer's own COMPLETE tmp file happened to
+    finish last, and the reader sees at worst one writer's whole pin.
+
+    Failure cleanup: if writing the tmp file raises, the leftover tmp
+    is removed. ``.mindwire/`` is ``.gitignore``d (SPEC-2026-08-11
+    D-5), so a crash between mkstemp and unlink leaves the tmp inside
+    the untracked pin directory; a subsequent successful write will
+    not reuse the name (mkstemp is unique per call).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
+    fd, tmp_name = tempfile.mkstemp(prefix=".pin.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        # os.replace is atomic on both POSIX and NTFS for same-dir renames.
+        os.replace(tmp_path, path)
+    except BaseException:
+        # Clean up the tmp file on any failure so a crashed writer does
+        # not leak files into the pin directory. Ignore secondary
+        # errors from the cleanup itself — the primary exception is
+        # re-raised.
+        with contextlib.suppress(OSError):
+            tmp_path.unlink()
+        raise
 
 
 @dataclass(frozen=True)
@@ -289,14 +321,20 @@ class SpecPinWriter:
       would bury any one of them under the BOOTSTRAP annunciator.
 
     Concurrency note: two concurrent dispatches on the same
-    ``pin_target_dir`` would race the file. The T13 dispatcher serialises
+    ``pin_target_dir`` would race the file. Within-process races are
+    already prevented by higher layers — the T13 dispatcher serialises
     per-session (I9 FIFO), and the Phase 0/1 ThreadDispatcher uses a
-    per-thread asyncio lock, so within-process races are impossible on
-    the "one-role-per-repo-clone" production topology. Cross-process
-    races (two Stage 3 loops on the same clone) are a configuration
-    error the deployment layer prevents — the writer's
-    ``_atomic_write`` still guarantees the file is never observed
-    half-written, which is what the reader depends on.
+    per-thread asyncio lock — so on the "one-role-per-repo-clone"
+    production topology no two writers coexist in a single interpreter.
+    Cross-process races (two Stage 3 loops on the same clone) are a
+    configuration error the deployment layer prevents, but the writer
+    remains defensive against them: :func:`_atomic_write` uses a
+    per-writer unique tmp filename (:func:`tempfile.mkstemp`) so a
+    racing pair of processes cannot corrupt each other's write, and a
+    reader still observes at worst one writer's whole complete pin
+    (PR-review #335 round-3: a hardcoded ``pin.tmp`` name silently
+    voided this guarantee — the fix is the tmp filename, not the
+    rename step).
     """
 
     pin_target_dir: Path
