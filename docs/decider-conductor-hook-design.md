@@ -1,6 +1,6 @@
 # Decider — Conductor 停止判定への判断フック（設計書 v3.4）
 
-版: **3.4** / 2026-09-21 / 起票: Fermi（Cowork セッション, 2026-09-18）/ 設計 SOT: chatroom `spirrow-mindwire/T-decider-conductor-hook` / v3 差分: Bohr msg-3818 / v3.1: Bohr msg-3820 / v3.2: Bohr msg-3822 / v3.3: Bohr msg-3824 / v3.4: Bohr msg-3826 / 独立 naysayer レビュー: Einstein msg-3819 → msg-3821 → msg-3823 → msg-3825 → msg-3827 (APPROVE) / **Tier-C 承認**: Takahito 2026-09-21（"Approve v3.4 for implementation with bounce activation gated by planned evaluation phases"）/ PR #326 round-3 PR-gate ADVISORY structure（sequential mutation overlap + Tier-C threshold config omission）を Takahito 2026-09-21（"Address both structural advisories before merging the design documentation"）で本 PR にて修正（D21 追加 + `[decider.thresholds]` に Tier-C 閾値追加）
+版: **3.4** / 2026-09-21 / 起票: Fermi（Cowork セッション, 2026-09-18）/ 設計 SOT: chatroom `spirrow-mindwire/T-decider-conductor-hook` / v3 差分: Bohr msg-3818 / v3.1: Bohr msg-3820 / v3.2: Bohr msg-3822 / v3.3: Bohr msg-3824 / v3.4: Bohr msg-3826 / 独立 naysayer レビュー: Einstein msg-3819 → msg-3821 → msg-3823 → msg-3825 → msg-3827 (APPROVE) / **Tier-C 承認**: Takahito 2026-09-21（"Approve v3.4 for implementation with bounce activation gated by planned evaluation phases"）/ PR #326 round-3 PR-gate ADVISORY structure（sequential mutation overlap + Tier-C threshold config omission）を Takahito 2026-09-21（"Address both structural advisories before merging the design documentation"）で PR #331 にて修正（D21 追加 + `[decider.thresholds]` に Tier-C 閾値追加）/ PR #331 round-3 PR-gate ADVISORY structure（`elif` の連結誤読 + `stop = ...` indentation の視覚的曖昧）を Takahito 2026-09-21（"Fix both advisories within PR #331 before merging (reopen, amend, re-review)"）で本 PR にて修正（D22 追加 + §3.3.a active-mode を `if dv is not None:` 配下に nest + §3.3.b の `elif` を standalone `if` に変更）
 
 対象リポジトリ: spirrow-mindwire（本 repo — Conductor / adapter / state builder / replay）、spirrow-lexora（`/v1/decide` エンドポイント側、本設計の前提）。
 
@@ -40,7 +40,8 @@ Decider の責務は最終的に **admission-gate（`src/spirrow_mindwire/tier_c
 | D18 | Tier-C フック (§3.3.b) は **grey zone gating** で運用: `gate_result.kind ∈ {ADMIT_UNSURE, second_time_force_admit}` のときにのみ Decider に問いを渡し、`ADMIT` (with a valid label) / それ以外は問い掛けしない。理由: D9 で `merge-protected` などの label を Decider の genuine 語彙から外している ∴ もし ADMIT を Decider が再評価すれば genuine sum = 0 で誤 bounce する。Decider の権限は admission-gate が判別できなかった grey zone に限定する | 本 spec §3.3.b / PR #326 round-2 PR-gate BLOCKING correctness #1 |
 | D19 | Tier-C フックの annotation は **annotate mode と bounce mode の両方で発火**。bounce mode は annotate の superset — LIKELY_NOT の注釈は bounce 資格に関わらず（`answerable_from_thread` 以外の根拠、既 bounced、2 回目、いずれの状態でも）人へ届く。bounce 節は annotate 節の後に加算的に走り、eligible な場合のみ `stop = None` を書き込む | 本 spec §3.3.b / PR #326 round-2 PR-gate BLOCKING regression |
 | D20 | 両フックは **backend=off と mode!=off の設定不整合に対して fail-open**: `evaluate_general` / `evaluate_tierc` が `None` を返した場合、annotation / bounce / route の全てをスキップし escalation を人へそのまま届ける（§3.3.a は `if dv is not None:`、§3.3.b は `if tv is not None:`）。設定と env の不整合は Conductor 起動時 preflight が捕捉すべき事象で、hook 内で crash / silent drop させない — Tier-C escalation を落とすリスクの方が env 不整合を素通しするリスクより高い。加えて §3.3.a の active-mode route は `dv.is_actionable` を要求（continue verdict で `from_verdict` を呼ばない） | 本 spec §3.3 / PR #326 round-3 PR-gate BLOCKING correctness (tv None crash) + ADVISORY structure (`and dv:` truthiness) |
-| D21 | 両フックの **entry-guard は `rule_stop_reason(turn)` の snapshot (`original_stop`) に基づく**。`stop` 変数は §3.3.a の active-mode Track B が mutate しうるため、`stop` を直接 entry-guard に使うと Track B が `escalate` を発火した瞬間に `stop == HUMAN` となり §3.3.b の entry-guard も真になる（sequential mutation で entry-guards が overlap）。これは D16 の「両フックの入場条件は disjoint」を prose の主張だけに留めていた（実態は `is_grey_zone` の内部 state に依存して bug を回避していた）欠陥である。snapshot `original_stop = rule_stop_reason(turn)` を 1 度だけ取り、`original_stop is None` / `original_stop is StopReason.HUMAN` で両フックを排他化する（`elif` 相当）。これで disjoint 性が entry-guard の shape 自体から従い、内部 state（`gate_result` の有無）に依存せずに保証される。log_decision の二重発火リスク（D16 で扱った correctness 事象）も snapshot 排他により構造的に不可能になる | 本 spec §3.3 / PR #326 round-3 PR-gate ADVISORY structure (sequential mutation overlap) |
+| D21 | 両フックの **entry-guard は `rule_stop_reason(turn)` の snapshot (`original_stop`) に基づく**。`stop` 変数は §3.3.a の active-mode Track B が mutate しうるため、`stop` を直接 entry-guard に使うと Track B が `escalate` を発火した瞬間に `stop == HUMAN` となり §3.3.b の entry-guard も真になる（sequential mutation で entry-guards が overlap）。これは D16 の「両フックの入場条件は disjoint」を prose の主張だけに留めていた（実態は `is_grey_zone` の内部 state に依存して bug を回避していた）欠陥である。snapshot `original_stop = rule_stop_reason(turn)` を 1 度だけ取り、`original_stop is None` / `original_stop is StopReason.HUMAN` で両フックを排他化する（両者は standalone `if` として書く — D22）。これで disjoint 性が entry-guard の shape 自体から従い、内部 state（`gate_result` の有無）に依存せずに保証される。log_decision の二重発火リスク（D16 で扱った correctness 事象）も snapshot 排他により構造的に不可能になる | 本 spec §3.3 / PR #326 round-3 PR-gate ADVISORY structure (sequential mutation overlap) |
+| D22 | §3.3.b Tier-C フックは **standalone `if` として書く**（`elif` にしない）。§3.3.a と §3.3.b は Conductor の別 lifecycle 点で呼ばれ、間に admission-gate が `turn.gate_result` を populate するタイミングを挟む ∴ 物理的に連結された `if / elif` ブロックではない。`elif` で書くと (a) 2 フックが同一ブロックに連結されているという誤読を招き、実装者が admission-gate 実行を挟まず 1 箇所で書いてしまう ∴ `turn.gate_result` が未設定のまま §3.3.b に入る、または (b) `elif` 相当の意味論的排他が entry-guard の shape でなく `if / elif` の連結に依存しているように見える。実際の disjoint 性は D21 の snapshot によって保証されており、`if original_stop is StopReason.HUMAN:` は §3.3.a の `if original_stop is None:` と排他条件で shape 上 disjoint。加えて §3.3.a active-mode 側の `stop` 書き換えは `if dv is not None:` 配下に nest することで `if cfg.decider.mode == "active" and dv.is_actionable:` の block indentation を視覚的に明確化する（context lines で `stop = ...` が `if` の block 外に見える誤読の余地を排除） | 本 spec §3.3 / PR #331 round-3 PR-gate ADVISORY structure (elif contiguity + indentation legibility) |
 
 ---
 
@@ -101,10 +102,10 @@ original_stop = stop                       # snapshot: 両フックの entry-gua
 
 if original_stop is None:                  # §3.3.b と structurally disjoint (D16 + D21)
     dv = decider.evaluate_general(state_builder(turn))  # Track B。None if MINDWIRE_DECIDER_BACKEND=off
-    if dv is not None:
+    if dv is not None:                                  # backend off (D20 fail-open) なら以降を skip
         log_decision(turn, stop, dv, hook="general")   # turn.decision_ids に append
-    if cfg.decider.mode == "active" and dv is not None and dv.is_actionable:
-        stop = StopReason.from_verdict(dv)             # active モード時 & 実際に stop を追加する verdict のみ経路が変わる
+        if cfg.decider.mode == "active" and dv.is_actionable:
+            stop = StopReason.from_verdict(dv)         # active モード時 & 実際に stop を追加する verdict のみ経路が変わる
 ```
 
 - **entry-guard は `original_stop is None`**（D16 + D21）。`stop` を直接見ると、Track B が `escalate` を発火して `stop = StopReason.from_verdict(dv)` で `HUMAN` に書き換えた瞬間、§3.3.b の entry-guard（`stop == HUMAN`）も付随的に真になる（sequential mutation で entry-guards が overlap）。`rule_stop_reason` の返り値を `original_stop` として 1 度 snapshot し、両フックの entry-guard を snapshot 基準にすることで disjoint 性が entry-guard の shape 自体から従う（内部 state `is_grey_zone` に依存しない）。
@@ -119,8 +120,11 @@ if original_stop is None:                  # §3.3.b と structurally disjoint (
 
 ```python
 # rule_stop_reason の直後（§3.3.a の snapshot と同じ original_stop を使う）、
-# human への手渡し（forced-naysayer や escalation 通知）の直前
-elif original_stop is StopReason.HUMAN and cfg.decider.tierc.mode != "off":  # §3.3.a と structurally disjoint (D21)
+# human への手渡し（forced-naysayer や escalation 通知）の直前。
+# 独立フックであり §3.3.a とは admission-gate の実行を挟んで別 lifecycle 点で呼ばれる ∴ standalone `if`
+# （`elif` にしない — 物理的に §3.3.a のブロックに連結されるという誤読を避け、また 2 フックの間に admission-gate
+# が turn.gate_result を populate するタイミングを尊重するため。disjoint 性は D21 snapshot が担う — D22）:
+if original_stop is StopReason.HUMAN and cfg.decider.tierc.mode != "off":  # §3.3.a と structurally disjoint (D21, D22)
     gr = turn.gate_result   # §3.5 in-memory 契約
     # Decider は admission-gate を通った後の grey zone のみを裁く（D9, D18）。
     # ADMIT with valid label (goal / cost / irreversible / merge-protected) は既に人へ確定 ∴ 問い掛けしない。
@@ -153,6 +157,7 @@ elif original_stop is StopReason.HUMAN and cfg.decider.tierc.mode != "off":  # �
 ```
 
 - 入場条件: `original_stop == StopReason.HUMAN`（§3.3.a と共有の snapshot、D21）かつ `[decider.tierc].mode != "off"` かつ `gate_result.kind ∈ {ADMIT_UNSURE, second_time_force_admit}`（D18 grey zone gating）。`original_stop` を使うことで、§3.3.a active-mode の Track B escalate（`stop` を `HUMAN` に書き換える）が誤って §3.3.b を発火させることは無い。
+- **本フックは standalone `if` として書く（`elif` にしない — D22）**: §3.3.a と §3.3.b は Conductor の別 lifecycle 点で呼ばれ、間に admission-gate が `turn.gate_result` を populate するタイミングを挟む ∴ 物理的に連結された `if / elif` ブロックではない。`elif` で書くと (a) 2 フックが同一ブロックに連結されているという誤読を招き、実装者が admission-gate 実行を挟まず 1 箇所で書いてしまう ∴ `turn.gate_result` が未設定のまま §3.3.b に入るリスク、(b) `elif` 相当の意味論的排他が entry-guard の shape でなく `if / elif` の連結に依存しているように見える。実際の disjoint 性は D21 の snapshot によって保証されており、`if original_stop is StopReason.HUMAN:` は §3.3.a の `if original_stop is None:` と排他条件で shape 上 disjoint。
 - **admission-gate ADMIT (with any valid label) → Decider は問い掛けしない**: D9 で `merge-protected` を Decider から削除した ∴ Decider の問いセットには merge-protected を genuine と認識する語彙が無い。もし ADMIT を Decider が再評価すれば、genuine sum = 0 で spurious のいずれかが発火した瞬間に valid な merge-protected escalation が LIKELY_NOT と判定される ∴ 誤 bounce。これは D9 が admission-gate に委譲した責務を Decider が上書きするパターンで、D2 単調性・Principle 2 の二重管理禁止の両方に反する。Decider の権限は grey zone (ADMIT_UNSURE / second_time_force_admit) に限定する。
 - annotate は `stop` を書き換えない（人には届く。文言注釈のみ）。
 - bounce は 1 回に限り `stop = None` にして呼び出し元 agent へ差し戻す。2 回目の `NEXT: human` は `bounce_ledger.already_bounced(turn) == True` により bounce 節を通過せず、そのまま `stop = HUMAN` として人へ届く。annotation は 2 回目でも発火するので人は Decider の判定を注釈として見える。
