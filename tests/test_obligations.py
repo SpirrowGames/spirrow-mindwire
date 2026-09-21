@@ -477,18 +477,31 @@ _LANDED_SPEC_PATH = (
 def _extract_yaml_block_from_spec_section(spec_text: str, section_heading: str) -> str:
     """Return the parsed ``body:`` field of the YAML block inside *section_heading*.
 
-    Slices the markdown between ``section_heading`` and the next ``### `` /
-    ``## `` heading, finds the first ```` ```yaml ```` fence in that slice,
-    and returns the ``body:`` of the first list entry inside the fence. The
-    fence-closing ```` ``` ```` line is INCLUDED-until (not INCLUDED-through)
-    so the captured content ends with the trailing ``\\n`` that YAML block
-    literals preserve — the same convention
+    Slices the markdown between ``section_heading`` and either the next
+    ``### `` / ``## `` heading or end-of-file, finds the first ```` ```yaml ````
+    fence in that slice, and returns the ``body:`` of the first list entry
+    inside the fence. The fence-closing ```` ``` ```` line is INCLUDED-until
+    (not INCLUDED-through) so the captured content ends with the trailing
+    ``\\n`` that YAML block literals preserve — the same convention
     :meth:`~spirrow_mindwire.obligations.load_manifest` normalises with
     ``body.rstrip("\\n")``, so this helper also strips one trailing newline
     for a like-for-like comparison against the loaded body.
+
+    The end-of-file alternative matters even though today's spec follows
+    every extracted section with another heading: PR-review #335 finding
+    (BLOCKING #2) — a helper that crashes on the last section of a file is
+    a shape latent for regression the day a future spec revision puts a
+    section at the end. ``\\Z`` in the lookahead makes the helper total
+    over "section is at EOF" so a later change to the spec's shape does not
+    silently red this test with an opaque ``AssertionError: section not
+    found`` on an existing manifest.
     """
     heading_re = re.escape(section_heading)
-    match = re.search(rf"{heading_re}[^\n]*\n(.*?)(?=\n### |\n## )", spec_text, re.DOTALL)
+    match = re.search(
+        rf"{heading_re}[^\n]*\n(.*?)(?=\n### |\n## |\Z)",
+        spec_text,
+        re.DOTALL,
+    )
     assert match, f"section {section_heading!r} not found in landed spec"
     section = match.group(1)
     fence_match = re.search(r"```yaml\n(.*?)```", section, re.DOTALL)
@@ -532,6 +545,33 @@ def test_obl_spec_pin_body_matches_landed_spec_section_4_1() -> None:
         "(D-19 immutability). Either restore the manifest body, or open a "
         "successor spec if the spec text needs to change."
     )
+
+
+def test_extract_yaml_block_handles_section_at_end_of_file() -> None:
+    """The extractor must not crash when the target section is the last in the doc.
+
+    PR-review #335 finding (BLOCKING #2): the previous lookahead form
+    ``(?=\\n### |\\n## )`` fails on a section that is the last one in the
+    document (no subsequent heading before EOF), leaving the caller with an
+    opaque ``AssertionError: section not found``. The helper now also
+    accepts ``\\Z`` (end of string) as a valid terminator; this test pins
+    that behaviour by constructing an in-test spec where the target section
+    is followed by nothing.
+    """
+    tiny_spec = (
+        "---\nspec_id: SPEC-TEST\n---\n\n"
+        "# Header\n\n"
+        "## §4 body\n\n"
+        "### §4-1 last-section-in-doc\n\n"
+        "```yaml\n"
+        "- id: OBL-TEST\n"
+        "  role: implementer\n"
+        "  body: |\n"
+        "    the only sentence\n"
+        "```\n"
+    )
+    body = _extract_yaml_block_from_spec_section(tiny_spec, "### §4-1")
+    assert body == "the only sentence"
 
 
 def test_obl_spec_receipt_body_matches_landed_spec_section_4_2() -> None:

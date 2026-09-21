@@ -83,12 +83,23 @@ class PinDispatchAbortError(SpecPinError):
     """The dispatch cannot proceed because a resolved pin cannot be constructed.
 
     Raised when a thread has a mapped spec_id (``SpecPinMapping.spec_id_for``
-    returned a non-``None`` value) but the spec file is missing or unreadable.
-    Bohr msg-3991 objection 3: silently degrading to bootstrap in this case is
-    fail-open — it buries a mapping fault under the annunciator that
+    returned a non-``None`` value) but the writer cannot build a resolved pin
+    from it — either the spec file is not on disk, or (Phase 1) no git reader
+    is wired to compute the resolved-form fields (branch / commit / blob_sha).
+    Bohr msg-3991 objection 3: silently degrading to bootstrap in either case
+    is fail-open — it buries a mapping fault under the annunciator that
     ``ABSENT`` / ``BOOTSTRAP`` was designed to expose. Instead, the dispatcher
-    aborts loudly so the operator can see the fault (the missing SPEC-id, the
-    expected path, and the cause).
+    aborts loudly so the operator can see the fault (the SPEC-id the mapping
+    named, the path it pointed at, and the concrete cause).
+
+    The ``cause`` string is copied verbatim into the exception message; it MUST
+    read as a full sentence that names the actual cause of the abort, because
+    it is the only free-text explanation an operator sees. The message
+    deliberately does not editorialise on whether the file exists — the
+    caller's ``cause`` is the single source of truth for what went wrong
+    (measured PR-review #335 finding: a fixed "is unreadable" prefix
+    contradicted the actual cause on the Phase 1 no-git-reader path where the
+    spec file existed and was readable).
     """
 
     def __init__(self, *, spec_id: str, expected_path: Path, cause: str, thread_id: str) -> None:
@@ -98,8 +109,8 @@ class PinDispatchAbortError(SpecPinError):
         self.thread_id = thread_id
         super().__init__(
             f"cannot write resolved `.mindwire/pin` for thread {thread_id!r}: "
-            f"mapping names spec_id={spec_id!r} but "
-            f"{expected_path.as_posix()} is unreadable ({cause}). "
+            f"mapping names spec_id={spec_id!r} (expected at "
+            f"{expected_path.as_posix()}) but {cause}. "
             "Refusing to degrade to bootstrap (mapping fault must not be buried "
             "under the BOOTSTRAP annunciator — SPEC-2026-09-20 §3-B, Bohr msg-3991)."
         )
@@ -294,19 +305,20 @@ class SpecPinWriter:
                 role.value,
             )
             return
-        # spec_id present — mapping wants a resolved pin. If the spec file
-        # is unreachable, abort loudly (msg-3991 objection 3). Resolved-pin
-        # construction requires a git reader; Phase 1 does not wire one, so
-        # a mapping that returns a spec_id today is a configuration error
-        # (no code path constructs that mapping). The abort message names
-        # the SPEC-id + path so an operator can see what was missing.
+        # spec_id present — mapping wants a resolved pin. Two possible
+        # aborts, each with a distinct `cause` that reads accurately as a
+        # standalone sentence (:class:`PinDispatchAbortError` docstring):
+        # (a) the mapped file is not on disk, (b) the file exists but no
+        # git reader is wired to build the resolved-form fields. Both are
+        # operational faults per msg-3991 objection 3 — degrading to
+        # bootstrap would bury either one under the BOOTSTRAP annunciator.
         expected_path = self.repo_root / "spec" / "design" / f"{spec_id}.md"
         if not expected_path.is_file():
             raise PinDispatchAbortError(
                 spec_id=spec_id,
                 expected_path=expected_path,
                 cause=(
-                    "spec file not found under spec/design/ "
+                    "the mapped spec file is not on disk "
                     "(resolved-pin construction requires the landed spec)"
                 ),
                 thread_id=thread_id,
@@ -321,8 +333,8 @@ class SpecPinWriter:
             spec_id=spec_id,
             expected_path=expected_path,
             cause=(
-                "resolved-pin construction requires a git reader that "
-                "this build does not wire (Phase 1 mapping = bootstrap only)"
+                "this build wires no git reader for resolved-pin construction "
+                "(Phase 1 mapping = bootstrap only; the file exists on disk)"
             ),
             thread_id=thread_id,
         )

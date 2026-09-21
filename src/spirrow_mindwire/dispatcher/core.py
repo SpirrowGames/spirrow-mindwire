@@ -146,7 +146,7 @@ class Dispatcher:
         # `.mindwire/pin` BEFORE delivering to the adapter. The writer is a
         # no-op for roles outside implementer/naysayer (proposer), so
         # ``write_before_dispatch`` is safe to call unconditionally. A
-        # :class:`~spirrow_mindwire.spec_pin.PinDispatchAbort` propagates: this
+        # :class:`~spirrow_mindwire.spec_pin.PinDispatchAbortError` propagates: this
         # is a fail-loud operational fault (mapping refers to a spec file the
         # writer cannot construct a resolved pin from — Bohr msg-3991
         # objection 3). Under Phase 1's empty mapping this branch is

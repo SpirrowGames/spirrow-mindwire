@@ -344,7 +344,7 @@ class ThreadDispatcher:
             # `.mindwire/pin` into the SDK's cwd (= ``layout.thread_dir``)
             # BEFORE ``invoke_claude_code`` runs. The Phase 0/1 replier here is
             # always ``claude-code`` — the implementer face — so pinning is
-            # required unconditionally on this branch. ``PinDispatchAbort``
+            # required unconditionally on this branch. ``PinDispatchAbortError``
             # propagates out (fail-loud); the outer ``_safe_handle`` in
             # ``runner.py`` logs it and terminates the thread rather than
             # burying the fault (msg-3991 objection 3).

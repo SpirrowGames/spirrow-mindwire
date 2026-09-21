@@ -156,6 +156,13 @@ def test_writer_aborts_when_mapped_spec_exists_but_no_git_reader_wired(tmp_path:
     infrastructure will also wire the git reader, at which point this test
     will be updated in the same PR (deliberate coupling — the shape of the
     fault message names it).
+
+    Also pins PR-review #335 BLOCKING #1: the exception message must NOT
+    claim the file is unreadable when it is on disk. A hardcoded "is
+    unreadable" prefix contradicts the actual cause on this path (the file
+    exists and is perfectly readable; the fault is the missing git reader),
+    so the message must derive from the caller-supplied `cause` string and
+    the `cause` on this path must say the file exists.
     """
     spec_id = "SPEC-2026-09-20-pin-hardening-and-id-audit"
     (tmp_path / "spec" / "design").mkdir(parents=True)
@@ -164,10 +171,44 @@ def test_writer_aborts_when_mapped_spec_exists_but_no_git_reader_wired(tmp_path:
     )
     mapping = _StaticMapping({_THREAD_ID: spec_id})
     writer = SpecPinWriter(repo_root=tmp_path, mapping=mapping)
-    with pytest.raises(PinDispatchAbortError):
+    with pytest.raises(PinDispatchAbortError) as exc_info:
         writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
+    message = str(exc_info.value)
+    # The message must NOT falsely claim the file is unreadable — the file
+    # exists on disk on this path (PR-review #335 finding).
+    assert "is unreadable" not in message, (
+        "PinDispatchAbortError message on the no-git-reader path claims the "
+        f"file 'is unreadable' but the file exists on disk. Message: {message!r}"
+    )
+    # It MUST name the actual cause (Phase 1 missing git reader).
+    assert "git reader" in message, (
+        f"exception message does not name the actual cause (no git reader): {message!r}"
+    )
     # Still no pin file — the abort takes precedence.
     assert not (tmp_path / ".mindwire" / "pin").exists()
+
+
+def test_abort_message_names_the_missing_file_cause_when_file_is_absent(
+    tmp_path: Path,
+) -> None:
+    """Symmetric assertion for the path-missing branch (PR-review #335 BLOCKING #1).
+
+    The two abort branches must produce mutually distinguishable messages —
+    an operator reading the exception must be able to tell "spec file not on
+    disk" from "spec file exists but no git reader wired" without guessing.
+    """
+    mapping = _StaticMapping({_THREAD_ID: "SPEC-2099-01-01-nonexistent"})
+    writer = SpecPinWriter(repo_root=tmp_path, mapping=mapping)
+    with pytest.raises(PinDispatchAbortError) as exc_info:
+        writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
+    message = str(exc_info.value)
+    assert "not on disk" in message, (
+        f"path-missing exception message does not name the actual cause: {message!r}"
+    )
+    # And by symmetry MUST NOT be confusable with the git-reader path.
+    assert "git reader" not in message, (
+        f"path-missing message names the wrong branch's cause (git reader): {message!r}"
+    )
 
 
 # --------------------------------------------------------------------------- #
