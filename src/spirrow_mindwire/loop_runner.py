@@ -522,7 +522,13 @@ def _build_dispatcher(
     # would already have raised ``SystemExit``.
     pin_writer: SpecPinWriter | None = None
     if cfg.repo_dir is not None:
-        pin_writer = SpecPinWriter(repo_root=Path(cfg.repo_dir))
+        # In the Stage 3 loop the SDK invoke's cwd IS the git checkout, so
+        # pin_target_dir and spec_source_root are the same path. The Phase
+        # 0/1 ThreadDispatcher, by contrast, uses layout.thread_dir for
+        # pin_target_dir (per-thread scratch) and leaves spec_source_root
+        # unset (PR-review #335 round-2: the two must not be conflated).
+        repo = Path(cfg.repo_dir)
+        pin_writer = SpecPinWriter(pin_target_dir=repo, spec_source_root=repo)
     dispatcher = Dispatcher(
         registry=registry,
         gateway=gateway,

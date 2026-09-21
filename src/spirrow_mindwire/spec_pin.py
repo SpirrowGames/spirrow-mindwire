@@ -249,9 +249,28 @@ def _atomic_write(path: Path, data: bytes) -> None:
 class SpecPinWriter:
     """The pin writer both dispatchers call before an implementer / naysayer dispatch.
 
-    Constructed with a target repo root (where ``.mindwire/pin`` lives) and,
-    optionally, a :class:`SpecPinMapping` (defaults to :data:`EMPTY_MAPPING`,
-    which reports no mapping for every thread and forces a bootstrap pin).
+    Two independent directories, kept SEPARATE so the two dispatchers can
+    hold them right (PR-review #335 round-2 finding: conflating the two
+    breaks the Phase 0/1 path where the pin lives inside the SDK's
+    per-thread scratch dir and no spec source exists there at all):
+
+    - ``pin_target_dir``: the directory whose ``./.mindwire/pin`` is the
+      output file. This is the SDK invoke's cwd — where the agent reads
+      the pin from on entry. For the Stage 3 T13
+      :class:`~spirrow_mindwire.dispatcher.core.Dispatcher` this is the
+      target git checkout; for the Phase 0/1
+      :class:`~spirrow_mindwire.watcher.dispatcher.ThreadDispatcher` it
+      is ``layout.thread_dir`` (per-thread scratch).
+    - ``spec_source_root``: the directory whose ``./spec/design/`` holds
+      spec files for resolved-pin construction. ``None`` means the caller
+      does not support resolved-pin construction on this writer — a
+      mapping that returns a non-``None`` ``spec_id`` on such a writer
+      aborts with :class:`PinDispatchAbortError` naming the missing
+      source-root as the cause (fail-loud per msg-3991 objection 3,
+      never silent bootstrap degradation).
+
+    ``mapping`` (default :data:`EMPTY_MAPPING`) is the thread → SPEC-id
+    table. Phase 1 leaves it empty; every dispatch writes bootstrap.
 
     ``write_before_dispatch(role, thread_id)`` is the single call site:
 
@@ -260,38 +279,35 @@ class SpecPinWriter:
       dispatch.
     - If the mapping returns ``None`` for ``thread_id``, a bootstrap pin
       is written.
-    - If the mapping returns a ``spec_id`` and the spec file is readable,
-      a resolved pin is written (with real git blob_sha / HEAD sha).
-    - If the mapping returns a ``spec_id`` and the spec file is NOT
-      readable, :class:`PinDispatchAbortError` is raised (Bohr msg-3991
-      objection 3 — no silent degradation).
+    - If the mapping returns a ``spec_id``, resolved-pin construction is
+      required. In this codebase it always aborts loudly with
+      :class:`PinDispatchAbortError` — either because no
+      ``spec_source_root`` was configured, because the mapped file is
+      not on disk under that root, or because Phase 1 wires no git reader
+      to compute the resolved-form fields. All three aborts are
+      operational faults per msg-3991 objection 3; degrading to bootstrap
+      would bury any one of them under the BOOTSTRAP annunciator.
 
-    Concurrency note: two concurrent dispatches on the same repo_root
-    would race the file. The T13 :class:`~spirrow_mindwire.dispatcher.
-    core.Dispatcher` serialises per-session (I9 FIFO), and the Phase 0/1
-    :class:`~spirrow_mindwire.watcher.dispatcher.ThreadDispatcher` uses
-    a per-thread asyncio lock, so within-process races are impossible on
-    the "one-role-per-repo-clone" production topology (each Stage 3 loop
-    clone runs at most one adapter of a given role at a time). Cross-
-    process races (two Stage 3 loops on the same clone) are a
-    configuration error the deployment layer prevents — this writer's
+    Concurrency note: two concurrent dispatches on the same
+    ``pin_target_dir`` would race the file. The T13 dispatcher serialises
+    per-session (I9 FIFO), and the Phase 0/1 ThreadDispatcher uses a
+    per-thread asyncio lock, so within-process races are impossible on
+    the "one-role-per-repo-clone" production topology. Cross-process
+    races (two Stage 3 loops on the same clone) are a configuration
+    error the deployment layer prevents — the writer's
     ``_atomic_write`` still guarantees the file is never observed
     half-written, which is what the reader depends on.
     """
 
-    repo_root: Path
+    pin_target_dir: Path
+    spec_source_root: Path | None = None
     mapping: SpecPinMapping = EMPTY_MAPPING
-    # Optional git shell function for resolved-pin construction. Left None
-    # in Phase 1 (no production mapping wires a real resolved pin). When a
-    # successor spec adds mapping infrastructure, it will pass a real
-    # git-reader callable; the shape stays a Protocol seam so this module
-    # never grows a hard git dependency.
 
     def write_before_dispatch(self, role: Role, thread_id: str) -> None:
         """Write ``.mindwire/pin`` before an implementer / naysayer dispatch.
 
         No-op for roles outside :data:`_PIN_REQUIRED_ROLES`; a full pin
-        write (bootstrap or resolved) for the required roles.
+        write (bootstrap) or a fail-loud abort for the required roles.
         """
         if role not in _PIN_REQUIRED_ROLES:
             return
@@ -305,15 +321,31 @@ class SpecPinWriter:
                 role.value,
             )
             return
-        # spec_id present — mapping wants a resolved pin. Two possible
+        # spec_id present — mapping wants a resolved pin. Three possible
         # aborts, each with a distinct `cause` that reads accurately as a
-        # standalone sentence (:class:`PinDispatchAbortError` docstring):
-        # (a) the mapped file is not on disk, (b) the file exists but no
-        # git reader is wired to build the resolved-form fields. Both are
-        # operational faults per msg-3991 objection 3 — degrading to
-        # bootstrap would bury either one under the BOOTSTRAP annunciator.
-        expected_path = self.repo_root / "spec" / "design" / f"{spec_id}.md"
+        # standalone sentence (:class:`PinDispatchAbortError` docstring).
+        # All three are operational faults per msg-3991 objection 3 —
+        # degrading to bootstrap would bury any of them under BOOTSTRAP.
+        if self.spec_source_root is None:
+            # (a) The caller (typically a per-thread scratch-dir writer)
+            #     did not wire a spec source at all. This is the shape
+            #     that the Phase 0/1 ThreadDispatcher takes — a mapping
+            #     returning a non-None spec_id there is a configuration
+            #     error, not a request the writer can honour.
+            raise PinDispatchAbortError(
+                spec_id=spec_id,
+                expected_path=Path("<no spec_source_root configured>"),
+                cause=(
+                    "this writer was configured without a spec_source_root, "
+                    "so resolved-pin construction is not supported on it "
+                    "(the mapping returned a spec_id but the writer has no "
+                    "source tree to resolve it against)"
+                ),
+                thread_id=thread_id,
+            )
+        expected_path = self.spec_source_root / "spec" / "design" / f"{spec_id}.md"
         if not expected_path.is_file():
+            # (b) The spec source exists but the mapped file is missing.
             raise PinDispatchAbortError(
                 spec_id=spec_id,
                 expected_path=expected_path,
@@ -323,12 +355,11 @@ class SpecPinWriter:
                 ),
                 thread_id=thread_id,
             )
-        # Phase 1 stops here: resolved-pin construction needs git shell
-        # (branch, commit, blob_sha) which is not wired at the composition
-        # root today. When a successor spec introduces a mapping table
-        # that actually points at a spec, it will also wire the git
-        # reader; until then, a spec_id-returning mapping is unreachable
-        # from the composition root and this branch is defensive.
+        # (c) Phase 1 stops here: resolved-pin construction needs git
+        #     shell (branch, commit, blob_sha) which is not wired at the
+        #     composition root today. When a successor spec introduces a
+        #     mapping table that actually points at a spec, it will also
+        #     wire the git reader.
         raise PinDispatchAbortError(
             spec_id=spec_id,
             expected_path=expected_path,
@@ -340,7 +371,7 @@ class SpecPinWriter:
         )
 
     def _write(self, pin: Mapping[str, object]) -> None:
-        target = self.repo_root / _PIN_RELATIVE_PATH
+        target = self.pin_target_dir / _PIN_RELATIVE_PATH
         _atomic_write(target, pin_yaml_bytes(pin))
 
 

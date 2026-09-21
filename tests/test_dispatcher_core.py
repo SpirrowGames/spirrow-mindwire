@@ -702,7 +702,7 @@ async def test_pin_writer_writes_bootstrap_pin_for_implementer_dispatch(tmp_path
     disp = Dispatcher(
         registry=_registry_with(adapter),
         gateway=_FakeGateway(),
-        spec_pin_writer=SpecPinWriter(repo_root=tmp_path),
+        spec_pin_writer=SpecPinWriter(pin_target_dir=tmp_path),
     )
     handle = await disp.spawn_instance(_thread_ref(), Role.IMPLEMENTER, "implementer-1")
     await disp.dispatch(handle, _event())
@@ -732,7 +732,7 @@ async def test_pin_writer_writes_bootstrap_pin_for_naysayer_dispatch(tmp_path: P
     disp = Dispatcher(
         registry=_registry_with(adapter),
         gateway=_FakeGateway(),
-        spec_pin_writer=SpecPinWriter(repo_root=tmp_path),
+        spec_pin_writer=SpecPinWriter(pin_target_dir=tmp_path),
     )
     handle = await disp.spawn_instance(_thread_ref(), Role.NAYSAYER, "naysayer-1")
     await disp.dispatch(handle, _event())
@@ -750,7 +750,7 @@ async def test_pin_writer_noops_for_proposer_dispatch(tmp_path: Path) -> None:
     disp = Dispatcher(
         registry=_registry_with(adapter),
         gateway=_FakeGateway(),
-        spec_pin_writer=SpecPinWriter(repo_root=tmp_path),
+        spec_pin_writer=SpecPinWriter(pin_target_dir=tmp_path),
     )
     handle = await disp.spawn_instance(_thread_ref(), Role.PROPOSER, "proposer-1")
     await disp.dispatch(handle, _event())
@@ -788,7 +788,7 @@ async def test_pin_file_is_present_before_adapter_deliver_event(tmp_path: Path) 
     disp = Dispatcher(
         registry=_registry_with(adapter),
         gateway=_FakeGateway(),
-        spec_pin_writer=SpecPinWriter(repo_root=tmp_path),
+        spec_pin_writer=SpecPinWriter(pin_target_dir=tmp_path),
     )
     handle = await disp.spawn_instance(_thread_ref(), Role.IMPLEMENTER, "implementer-1")
     await disp.dispatch(handle, _event())

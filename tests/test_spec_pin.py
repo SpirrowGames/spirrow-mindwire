@@ -1,17 +1,18 @@
 """Tests for :mod:`spirrow_mindwire.spec_pin` — SPEC-2026-09-20 I-3.
 
 These pin the four invariants the atomic cutover PR is required to guarantee
-(Bohr msg-3989 test requirements + msg-3991 objections 2 / 3):
+(Bohr msg-3989 test requirements + msg-3991 objections 2 / 3, plus PR-gate
+#335 round-2 finding on pin_target_dir vs spec_source_root):
 
 1. A thread without a mapping entry gets a **bootstrap** pin (§3-B branch 1).
-2. A thread with a mapping entry AND a readable spec file gets a **resolved**
-   pin (§3-A) — Phase 1 has no wiring for this path, so the test asserts the
-   fail-loud shape below.
-3. A thread with a mapping entry but the spec file is missing → the dispatch
-   aborts loudly via :class:`~spirrow_mindwire.spec_pin.PinDispatchAbortError` and
-   **no pin file is written** (Bohr msg-3991 objection 3: no silent
-   degradation to bootstrap; the mapping fault must NOT be buried under the
-   BOOTSTRAP annunciator).
+2. A thread with a mapping entry AND a spec_source_root, but the spec file
+   missing on disk, aborts loudly (Bohr msg-3991 objection 3).
+3. A thread with a mapping entry on a writer that has NO spec_source_root
+   aborts loudly with a message naming the missing configuration (PR-review
+   #335 round-2 finding: pin_target_dir and spec_source_root must not be
+   conflated — the Phase 0/1 ThreadDispatcher writes into a per-thread
+   scratch dir that does not contain the source tree, so its writer has
+   no spec_source_root).
 4. The bootstrap pin YAML follows §3-C canonical form byte-for-byte (schema
    version, mode, pinned_by, absence of the seven resolved-form fields).
 """
@@ -61,7 +62,7 @@ class _StaticMapping:
 
 def test_writer_writes_bootstrap_pin_when_thread_is_unmapped(tmp_path: Path) -> None:
     """The empty mapping is the Phase 1 default; every dispatch writes bootstrap."""
-    writer = SpecPinWriter(repo_root=tmp_path, mapping=EMPTY_MAPPING)
+    writer = SpecPinWriter(pin_target_dir=tmp_path, mapping=EMPTY_MAPPING)
     writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
 
     pin_path = tmp_path / ".mindwire" / "pin"
@@ -89,7 +90,7 @@ def test_writer_uses_dispatcher_as_pinned_by_for_bootstrap(tmp_path: Path) -> No
     match the canonical example. Pinning this test prevents a regression
     that silently rewrites the value on the basis of an unreadable ADR.
     """
-    writer = SpecPinWriter(repo_root=tmp_path, mapping=EMPTY_MAPPING)
+    writer = SpecPinWriter(pin_target_dir=tmp_path, mapping=EMPTY_MAPPING)
     writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
     parsed = yaml.safe_load((tmp_path / ".mindwire" / "pin").read_text(encoding="utf-8"))
     assert parsed["pinned_by"] == "dispatcher"
@@ -97,7 +98,7 @@ def test_writer_uses_dispatcher_as_pinned_by_for_bootstrap(tmp_path: Path) -> No
 
 def test_writer_writes_pin_for_naysayer_role(tmp_path: Path) -> None:
     """§2.1 D-32 names implementer and naysayer explicitly; both get pins."""
-    writer = SpecPinWriter(repo_root=tmp_path)
+    writer = SpecPinWriter(pin_target_dir=tmp_path)
     writer.write_before_dispatch(Role.NAYSAYER, _THREAD_ID)
     assert (tmp_path / ".mindwire" / "pin").is_file()
 
@@ -109,13 +110,70 @@ def test_writer_noops_for_proposer_role(tmp_path: Path) -> None:
     against a silent widening that writes a pin the proposer's face does not
     read.
     """
-    writer = SpecPinWriter(repo_root=tmp_path)
+    writer = SpecPinWriter(pin_target_dir=tmp_path)
     writer.write_before_dispatch(Role.PROPOSER, _THREAD_ID)
     assert not (tmp_path / ".mindwire" / "pin").exists()
 
 
 # --------------------------------------------------------------------------- #
-# Invariant 2 / 3 — mapped thread + spec file absent -> PinDispatchAbortError
+# pin_target_dir vs spec_source_root — the two must not be conflated
+# (PR-review #335 round-2 BLOCKING finding)
+# --------------------------------------------------------------------------- #
+
+
+def test_pin_target_dir_is_the_only_directory_the_pin_write_touches(tmp_path: Path) -> None:
+    """The pin lands under ``pin_target_dir``; ``spec_source_root`` is not touched.
+
+    PR-review #335 round-2: the old ``repo_root`` parameter conflated
+    "where the pin file goes" with "where spec files live", which broke
+    the Phase 0/1 ThreadDispatcher path (pin goes to per-thread scratch,
+    spec source lives in the git checkout). Split enforced by giving the
+    two parameters distinct directories in this test and asserting the
+    pin lands under ``pin_target_dir`` — never under ``spec_source_root``.
+    """
+    pin_dir = tmp_path / "pin_target"
+    source_dir = tmp_path / "spec_source"
+    pin_dir.mkdir()
+    source_dir.mkdir()
+    writer = SpecPinWriter(pin_target_dir=pin_dir, spec_source_root=source_dir)
+    writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
+    assert (pin_dir / ".mindwire" / "pin").is_file()
+    assert not (source_dir / ".mindwire" / "pin").exists(), (
+        "pin escaped pin_target_dir into spec_source_root — the two must remain "
+        "distinct concerns (PR-review #335 round-2 BLOCKING)"
+    )
+
+
+def test_writer_without_spec_source_root_aborts_on_mapped_thread(tmp_path: Path) -> None:
+    """A writer without ``spec_source_root`` cannot honour a mapped ``spec_id``.
+
+    This is the shape the Phase 0/1 ThreadDispatcher uses: pin_target_dir
+    is per-thread scratch, spec_source_root is ``None``. A mapping that
+    returns a non-``None`` ``spec_id`` on such a writer is a configuration
+    error, and the writer must abort loudly (msg-3991 objection 3: never
+    silent bootstrap degradation) with a message that names the missing
+    ``spec_source_root`` as the actual cause — not the spec file's state.
+    """
+    mapping = _StaticMapping({_THREAD_ID: "SPEC-2099-01-01-anything"})
+    writer = SpecPinWriter(
+        pin_target_dir=tmp_path,
+        spec_source_root=None,
+        mapping=mapping,
+    )
+    with pytest.raises(PinDispatchAbortError) as exc_info:
+        writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
+    message = str(exc_info.value)
+    assert "spec_source_root" in message, (
+        f"exception message does not name the missing spec_source_root: {message!r}"
+    )
+    # The message must not mislead by naming a file's on-disk state.
+    assert "not on disk" not in message
+    assert "git reader" not in message
+    assert not (tmp_path / ".mindwire" / "pin").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Mapped thread + spec file absent -> PinDispatchAbortError
 # (Bohr msg-3991 Objection 3: no silent degradation to bootstrap)
 # --------------------------------------------------------------------------- #
 
@@ -133,7 +191,11 @@ def test_writer_aborts_when_mapping_points_at_missing_spec_file(tmp_path: Path) 
     operator can see what was missing.
     """
     mapping = _StaticMapping({_THREAD_ID: "SPEC-2099-01-01-nonexistent"})
-    writer = SpecPinWriter(repo_root=tmp_path, mapping=mapping)
+    writer = SpecPinWriter(
+        pin_target_dir=tmp_path,
+        spec_source_root=tmp_path,
+        mapping=mapping,
+    )
     with pytest.raises(PinDispatchAbortError) as exc_info:
         writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
     err = exc_info.value
@@ -157,12 +219,12 @@ def test_writer_aborts_when_mapped_spec_exists_but_no_git_reader_wired(tmp_path:
     will be updated in the same PR (deliberate coupling — the shape of the
     fault message names it).
 
-    Also pins PR-review #335 BLOCKING #1: the exception message must NOT
-    claim the file is unreadable when it is on disk. A hardcoded "is
-    unreadable" prefix contradicts the actual cause on this path (the file
-    exists and is perfectly readable; the fault is the missing git reader),
-    so the message must derive from the caller-supplied `cause` string and
-    the `cause` on this path must say the file exists.
+    Also pins PR-review #335 round-1 BLOCKING #1: the exception message
+    must NOT claim the file is unreadable when it is on disk. A hardcoded
+    "is unreadable" prefix contradicts the actual cause on this path (the
+    file exists and is perfectly readable; the fault is the missing git
+    reader), so the message derives from the caller-supplied `cause`
+    string and the `cause` on this path says the file exists.
     """
     spec_id = "SPEC-2026-09-20-pin-hardening-and-id-audit"
     (tmp_path / "spec" / "design").mkdir(parents=True)
@@ -170,12 +232,16 @@ def test_writer_aborts_when_mapped_spec_exists_but_no_git_reader_wired(tmp_path:
         "---\nspec_id: " + spec_id + "\n---\ncontent\n", encoding="utf-8"
     )
     mapping = _StaticMapping({_THREAD_ID: spec_id})
-    writer = SpecPinWriter(repo_root=tmp_path, mapping=mapping)
+    writer = SpecPinWriter(
+        pin_target_dir=tmp_path,
+        spec_source_root=tmp_path,
+        mapping=mapping,
+    )
     with pytest.raises(PinDispatchAbortError) as exc_info:
         writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
     message = str(exc_info.value)
     # The message must NOT falsely claim the file is unreadable — the file
-    # exists on disk on this path (PR-review #335 finding).
+    # exists on disk on this path (PR-review #335 round-1 finding).
     assert "is unreadable" not in message, (
         "PinDispatchAbortError message on the no-git-reader path claims the "
         f"file 'is unreadable' but the file exists on disk. Message: {message!r}"
@@ -191,23 +257,32 @@ def test_writer_aborts_when_mapped_spec_exists_but_no_git_reader_wired(tmp_path:
 def test_abort_message_names_the_missing_file_cause_when_file_is_absent(
     tmp_path: Path,
 ) -> None:
-    """Symmetric assertion for the path-missing branch (PR-review #335 BLOCKING #1).
+    """Symmetric assertion for the path-missing branch (PR-review #335 round-1 BLOCKING #1).
 
-    The two abort branches must produce mutually distinguishable messages —
-    an operator reading the exception must be able to tell "spec file not on
-    disk" from "spec file exists but no git reader wired" without guessing.
+    The three abort branches (no spec_source_root / file missing / no git
+    reader) must produce mutually distinguishable messages — an operator
+    reading the exception must be able to tell them apart without guessing.
     """
     mapping = _StaticMapping({_THREAD_ID: "SPEC-2099-01-01-nonexistent"})
-    writer = SpecPinWriter(repo_root=tmp_path, mapping=mapping)
+    writer = SpecPinWriter(
+        pin_target_dir=tmp_path,
+        spec_source_root=tmp_path,
+        mapping=mapping,
+    )
     with pytest.raises(PinDispatchAbortError) as exc_info:
         writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
     message = str(exc_info.value)
     assert "not on disk" in message, (
         f"path-missing exception message does not name the actual cause: {message!r}"
     )
-    # And by symmetry MUST NOT be confusable with the git-reader path.
+    # And by symmetry MUST NOT be confusable with the git-reader path or
+    # the no-spec_source_root path.
     assert "git reader" not in message, (
         f"path-missing message names the wrong branch's cause (git reader): {message!r}"
+    )
+    assert "spec_source_root" not in message, (
+        f"path-missing message names the wrong branch's cause "
+        f"(spec_source_root missing): {message!r}"
     )
 
 
@@ -251,7 +326,7 @@ def test_pin_yaml_bytes_is_block_style_and_preserves_key_order() -> None:
 
 def test_writer_overwrites_existing_pin_atomically(tmp_path: Path) -> None:
     """Two successive writes leave exactly one pin file with the latest content."""
-    writer = SpecPinWriter(repo_root=tmp_path)
+    writer = SpecPinWriter(pin_target_dir=tmp_path)
     writer.write_before_dispatch(Role.IMPLEMENTER, _THREAD_ID)
     first = (tmp_path / ".mindwire" / "pin").read_bytes()
     # Now write again — a new bootstrap pin (different pinned_at may or may not

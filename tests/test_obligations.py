@@ -488,17 +488,24 @@ def _extract_yaml_block_from_spec_section(spec_text: str, section_heading: str) 
     for a like-for-like comparison against the loaded body.
 
     The end-of-file alternative matters even though today's spec follows
-    every extracted section with another heading: PR-review #335 finding
-    (BLOCKING #2) — a helper that crashes on the last section of a file is
-    a shape latent for regression the day a future spec revision puts a
-    section at the end. ``\\Z`` in the lookahead makes the helper total
-    over "section is at EOF" so a later change to the spec's shape does not
-    silently red this test with an opaque ``AssertionError: section not
-    found`` on an existing manifest.
+    every extracted section with another heading: PR-review #335 round-1
+    finding (BLOCKING #2) — a helper that crashes on the last section of
+    a file is a shape latent for regression the day a future spec revision
+    puts a section at the end. ``\\Z`` in the lookahead makes the helper
+    total over "section is at EOF" so a later change to the spec's shape
+    does not silently red this test with an opaque ``AssertionError:
+    section not found`` on an existing manifest.
+
+    The H1 alternative ``\\n# `` is a symmetric defence (PR-review #335
+    round-2 ADVISORY #3): omitting it would silently absorb content
+    across an H1 boundary and hand the reader whichever YAML fence
+    happened to appear later, if any. Neither current nor foreseeable
+    spec placement is affected, but the extractor is not the place to
+    take a "we do not do that today" shortcut on a boundary term.
     """
     heading_re = re.escape(section_heading)
     match = re.search(
-        rf"{heading_re}[^\n]*\n(.*?)(?=\n### |\n## |\Z)",
+        rf"{heading_re}[^\n]*\n(.*?)(?=\n# |\n## |\n### |\Z)",
         spec_text,
         re.DOTALL,
     )
@@ -544,6 +551,40 @@ def test_obl_spec_pin_body_matches_landed_spec_section_4_1() -> None:
         "SPEC-2026-09-20 A-32 requires byte-exact match — the spec is the SOT "
         "(D-19 immutability). Either restore the manifest body, or open a "
         "successor spec if the spec text needs to change."
+    )
+
+
+def test_extract_yaml_block_stops_at_h1_boundary() -> None:
+    """The extractor must stop at an H1 heading, not silently cross it.
+
+    PR-review #335 round-2 ADVISORY #3: an extractor that stops at H2/H3
+    but not H1 could silently absorb the content of a later section if an
+    H1 is placed between them. This test constructs a spec where the
+    target section is followed by an H1 heading whose own body contains a
+    ```yaml fence — the extractor must stop at the H1 and NOT return
+    the H1's fence content.
+    """
+    tiny_spec = (
+        "---\nspec_id: SPEC-TEST\n---\n\n"
+        "### §4-1 target section\n\n"
+        "```yaml\n"
+        "- id: OBL-TARGET\n"
+        "  role: implementer\n"
+        "  body: |\n"
+        "    the intended body\n"
+        "```\n\n"
+        "# next H1 section\n\n"
+        "```yaml\n"
+        "- id: OBL-WRONG\n"
+        "  role: implementer\n"
+        "  body: |\n"
+        "    the wrong body that must NOT be returned\n"
+        "```\n"
+    )
+    body = _extract_yaml_block_from_spec_section(tiny_spec, "### §4-1")
+    assert body == "the intended body", (
+        "extractor silently absorbed content across the H1 boundary and "
+        f"returned the wrong body: {body!r}"
     )
 
 

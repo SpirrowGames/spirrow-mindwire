@@ -348,7 +348,18 @@ class ThreadDispatcher:
             # propagates out (fail-loud); the outer ``_safe_handle`` in
             # ``runner.py`` logs it and terminates the thread rather than
             # burying the fault (msg-3991 objection 3).
-            pin_writer = SpecPinWriter(repo_root=layout.thread_dir, mapping=self._spec_pin_mapping)
+            # PR-review #335 round-2: pin_target_dir and spec_source_root
+            # are DIFFERENT concerns. On this Phase 0/1 path pin_target_dir
+            # is layout.thread_dir (SDK cwd = per-thread scratch), and no
+            # spec source lives under that scratch dir — spec_source_root
+            # is left unset. Phase 1 uses EMPTY_MAPPING so the resolved-pin
+            # branch is unreached; a future mapping that returns a spec_id
+            # here will abort loudly instead of silently degrading.
+            pin_writer = SpecPinWriter(
+                pin_target_dir=layout.thread_dir,
+                spec_source_root=None,
+                mapping=self._spec_pin_mapping,
+            )
             pin_writer.write_before_dispatch(Role.IMPLEMENTER, event.thread_id)
             try:
                 result = await self._invoker(
