@@ -20,6 +20,7 @@ These pin the four invariants the atomic cutover PR is required to guarantee
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import cast
 
@@ -427,3 +428,107 @@ def test_empty_mapping_reports_no_spec_for_any_thread() -> None:
     assert mapping.spec_id_for("any-thread") is None
     assert mapping.spec_id_for(_THREAD_ID) is None
     assert mapping.spec_id_for("") is None
+
+
+# --------------------------------------------------------------------------- #
+# Async surface — write_before_dispatch_async (PR-review #335 round-4 ADVISORY)
+#
+# The blocking file I/O (mkstemp + write + os.replace) is deferred to the
+# default thread-pool executor via asyncio.to_thread so async dispatch loops
+# do not stall while the pin is being written. Three invariants pinned here:
+#
+#   (a) the async wrapper produces the same on-disk shape as the sync method
+#       (parity — one code path with one behaviour).
+#   (b) PinDispatchAbortError still propagates through the await (fail-loud —
+#       msg-3991 objection 3 is preserved across the executor hop).
+#   (c) the sync work actually runs off the event-loop thread (regression:
+#       reverting to a direct sync call would run on the event-loop thread
+#       and re-introduce the ADVISORY the human asked us to fix).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_write_before_dispatch_async_produces_same_pin_shape(tmp_path: Path) -> None:
+    """Parity: the async wrapper writes the same bytes shape as the sync method."""
+    writer = SpecPinWriter(pin_target_dir=tmp_path, mapping=EMPTY_MAPPING)
+    await writer.write_before_dispatch_async(Role.IMPLEMENTER, _THREAD_ID)
+
+    pin_path = tmp_path / ".mindwire" / "pin"
+    assert pin_path.is_file(), "async pin write did not land on disk"
+    parsed = yaml.safe_load(pin_path.read_text(encoding="utf-8"))
+    assert parsed["schema_version"] == 1
+    assert parsed["mode"] == "bootstrap"
+    assert parsed["pinned_by"] == DISPATCHER_PINNED_BY
+    assert "pinned_at" in parsed
+    # §3-A: the resolved-form fields must be absent on a bootstrap pin —
+    # exactly the same invariant the sync path pins in
+    # test_writer_writes_bootstrap_pin_when_thread_is_unmapped.
+    forbidden = _RESOLVED_FORM_FIELDS.intersection(parsed.keys())
+    assert not forbidden, f"async bootstrap pin contains resolved-form fields {sorted(forbidden)}"
+
+
+@pytest.mark.anyio
+async def test_write_before_dispatch_async_noops_for_proposer_role(tmp_path: Path) -> None:
+    """The async wrapper preserves the sync no-op branch for out-of-scope roles."""
+    writer = SpecPinWriter(pin_target_dir=tmp_path)
+    await writer.write_before_dispatch_async(Role.PROPOSER, _THREAD_ID)
+    assert not (tmp_path / ".mindwire" / "pin").exists()
+
+
+@pytest.mark.anyio
+async def test_write_before_dispatch_async_propagates_abort(tmp_path: Path) -> None:
+    """PinDispatchAbortError must surface through the await, not get swallowed.
+
+    asyncio.to_thread re-raises the sync exception on the awaiting frame; if
+    a future refactor forgets that (e.g. wraps the executor call in a
+    ``try/except``), this test breaks and the fail-loud contract of msg-3991
+    objection 3 is preserved on the async path.
+    """
+    mapping = _StaticMapping({_THREAD_ID: "SPEC-2099-01-01-nonexistent"})
+    writer = SpecPinWriter(
+        pin_target_dir=tmp_path,
+        spec_source_root=tmp_path,
+        mapping=mapping,
+    )
+    with pytest.raises(PinDispatchAbortError):
+        await writer.write_before_dispatch_async(Role.IMPLEMENTER, _THREAD_ID)
+    # Same "no pin left behind" guarantee as the sync path.
+    assert not (tmp_path / ".mindwire" / "pin").exists()
+
+
+@pytest.mark.anyio
+async def test_write_before_dispatch_async_runs_off_event_loop_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The blocking sync work must run on a different thread from the event loop.
+
+    Regression: a naïve refactor that removes the ``asyncio.to_thread``
+    wrapper (or accidentally makes the async surface call ``write_before_dispatch``
+    inline) would run the disk I/O on the event-loop thread — which is the
+    exact ADVISORY (PR-review #335 round-4) this refactor exists to fix.
+    We compare the thread that actually performs the ``os.replace`` step of
+    the atomic write against the thread the awaiting coroutine is on: they
+    MUST differ. ``asyncio.to_thread`` uses the running loop's default
+    executor, which is a distinct ``ThreadPoolExecutor`` worker.
+    """
+    calling_thread = threading.get_ident()
+    replace_thread: dict[str, int | None] = {"tid": None}
+    real_replace = os.replace
+
+    def spy_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        replace_thread["tid"] = threading.get_ident()
+        real_replace(src, dst)
+
+    monkeypatch.setattr("os.replace", spy_replace)
+    writer = SpecPinWriter(pin_target_dir=tmp_path)
+    await writer.write_before_dispatch_async(Role.IMPLEMENTER, _THREAD_ID)
+
+    assert replace_thread["tid"] is not None, "os.replace spy was never called"
+    assert replace_thread["tid"] != calling_thread, (
+        "the blocking os.replace ran on the event-loop thread — "
+        "write_before_dispatch_async is expected to offload sync I/O to "
+        "the default thread-pool executor via asyncio.to_thread "
+        "(PR-review #335 round-4 ADVISORY: no sync I/O on the async loop)"
+    )
+    # And the pin still landed correctly, so the offload didn't lose the write.
+    assert (tmp_path / ".mindwire" / "pin").is_file()

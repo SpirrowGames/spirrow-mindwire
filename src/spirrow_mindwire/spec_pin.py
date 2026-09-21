@@ -45,6 +45,7 @@ minimises byte-drift with pre-SPEC-2026-09-20 pins that never had a
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -341,11 +342,51 @@ class SpecPinWriter:
     spec_source_root: Path | None = None
     mapping: SpecPinMapping = EMPTY_MAPPING
 
+    async def write_before_dispatch_async(self, role: Role, thread_id: str) -> None:
+        """Async wrapper around :meth:`write_before_dispatch` for asyncio callers.
+
+        Both dispatchers that call this writer live inside ``async def``
+        coroutines (the T13
+        :meth:`~spirrow_mindwire.dispatcher.core.Dispatcher.dispatch` and
+        the Phase 0/1
+        :meth:`~spirrow_mindwire.watcher.dispatcher.ThreadDispatcher._run_thread`).
+        The write itself is small-file blocking I/O (``mkstemp`` + a
+        few-hundred-byte YAML write + ``os.replace``), and running it
+        inline on the event loop would block every other task the loop
+        holds for as long as the disk takes to accept the write. PR-review
+        #335 round-4 raised this as ADVISORY, and the human decision
+        before merge was: defer it.
+
+        The deferral uses :func:`asyncio.to_thread` (Python 3.9+ high-level
+        wrapper over the running loop's default executor). This preserves
+        two guarantees the callers rely on:
+
+        - **Fail-loud propagation.** ``asyncio.to_thread`` re-raises the
+          sync exception in the awaiting coroutine — a
+          :class:`PinDispatchAbortError` still stops the dispatch on the
+          call site's own frame (msg-3991 objection 3).
+        - **Ordering.** ``await`` on the coroutine returned here does not
+          return until the sync work has completed, so callers may safely
+          rely on the pin being on disk when the next line runs (T13
+          ``deliver_event`` / Phase 0/1 ``invoke_claude_code`` — the
+          "直前に" invariant of §2.1 D-32).
+
+        The synchronous :meth:`write_before_dispatch` remains public for
+        tests and for the (rare) synchronous caller a successor spec may
+        introduce; do not remove it without amending both surfaces at once.
+        """
+        await asyncio.to_thread(self.write_before_dispatch, role, thread_id)
+
     def write_before_dispatch(self, role: Role, thread_id: str) -> None:
         """Write ``.mindwire/pin`` before an implementer / naysayer dispatch.
 
         No-op for roles outside :data:`_PIN_REQUIRED_ROLES`; a full pin
         write (bootstrap) or a fail-loud abort for the required roles.
+
+        This is the **synchronous** entry point. Async callers on the event
+        loop should await :meth:`write_before_dispatch_async` instead so the
+        blocking file I/O runs on the default thread-pool executor rather
+        than stalling the loop (PR-review #335 round-4 advisory).
         """
         if role not in _PIN_REQUIRED_ROLES:
             return

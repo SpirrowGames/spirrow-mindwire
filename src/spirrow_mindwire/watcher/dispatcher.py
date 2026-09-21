@@ -355,12 +355,16 @@ class ThreadDispatcher:
             # is left unset. Phase 1 uses EMPTY_MAPPING so the resolved-pin
             # branch is unreached; a future mapping that returns a spec_id
             # here will abort loudly instead of silently degrading.
+            # PR-review #335 round-4 (advisory): the blocking file I/O is
+            # dispatched to the thread-pool executor through
+            # ``write_before_dispatch_async`` so it does not stall this
+            # coroutine's event loop while the on-disk write proceeds.
             pin_writer = SpecPinWriter(
                 pin_target_dir=layout.thread_dir,
                 spec_source_root=None,
                 mapping=self._spec_pin_mapping,
             )
-            pin_writer.write_before_dispatch(Role.IMPLEMENTER, event.thread_id)
+            await pin_writer.write_before_dispatch_async(Role.IMPLEMENTER, event.thread_id)
             try:
                 result = await self._invoker(
                     prompt=prompt,

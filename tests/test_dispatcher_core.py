@@ -796,3 +796,58 @@ async def test_pin_file_is_present_before_adapter_deliver_event(tmp_path: Path) 
         "the pin was not visible when deliver_event ran — the write must happen "
         "BEFORE the adapter is invoked (SPEC-2026-09-20 D-32: '直前に')"
     )
+
+
+@pytest.mark.anyio
+async def test_dispatch_awaits_async_pin_writer_not_sync(tmp_path: Path) -> None:
+    """The dispatcher awaits ``write_before_dispatch_async``, not the sync method.
+
+    PR-review #335 round-4 (advisory) and the subsequent human decision:
+    the pin write is blocking file I/O and must not run on the event loop.
+    The refactor exposes ``write_before_dispatch_async`` which offloads to
+    ``asyncio.to_thread``; the dispatcher awaits that surface. A regression
+    that reverts to a direct sync call at this call site would silently
+    reintroduce the ADVISORY, so this test pins the call shape.
+
+    We drop in a writer subclass that records which surface was called and
+    assert only the async one fired for one full ``dispatch()``.
+    """
+    from spirrow_mindwire.spec_pin import SpecPinWriter
+
+    class _RecordingWriter(SpecPinWriter):
+        sync_calls: int = 0
+        async_calls: int = 0
+
+        def write_before_dispatch(self, role: Role, thread_id: str) -> None:
+            # This still runs — asyncio.to_thread invokes it on a worker
+            # thread. What we care about is whether the ASYNC entry point
+            # was the one the dispatcher touched (it wraps this method).
+            type(self).sync_calls += 1
+            super().write_before_dispatch(role, thread_id)
+
+        async def write_before_dispatch_async(self, role: Role, thread_id: str) -> None:
+            type(self).async_calls += 1
+            await super().write_before_dispatch_async(role, thread_id)
+
+    class _ImplementerAdapter(_ReplyingAdapter):
+        capabilities = frozenset(
+            {Capability.READ_THREAD, Capability.POST_REPLY, Capability.EXECUTE_CODE}
+        )
+
+    adapter = _ImplementerAdapter()
+    disp = Dispatcher(
+        registry=_registry_with(adapter),
+        gateway=_FakeGateway(),
+        spec_pin_writer=_RecordingWriter(pin_target_dir=tmp_path),
+    )
+    handle = await disp.spawn_instance(_thread_ref(), Role.IMPLEMENTER, "implementer-1")
+    await disp.dispatch(handle, _event())
+
+    assert _RecordingWriter.async_calls == 1, (
+        "the dispatcher did not await write_before_dispatch_async — a direct "
+        "sync call would run blocking file I/O on the event loop "
+        "(PR-review #335 round-4 ADVISORY regression)"
+    )
+    # And the pin still landed via the sync inner method that async_wraps.
+    assert (tmp_path / ".mindwire" / "pin").is_file()
+    assert _RecordingWriter.sync_calls == 1

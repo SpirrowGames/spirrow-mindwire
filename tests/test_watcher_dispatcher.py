@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1268,4 +1269,60 @@ async def test_thread_dispatcher_writes_bootstrap_pin_before_invoke(tmp_path: Pa
     assert pin_visible["at_invoke"], (
         "SPEC-2026-09-20 D-32 '直前に' — the pin must be visible when the SDK "
         "invoker runs; a false here means the write happened after invoke"
+    )
+
+
+@pytest.mark.anyio
+async def test_thread_dispatcher_pin_write_runs_off_event_loop_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Phase 0/1 dispatcher's pin write is deferred to a worker thread.
+
+    PR-review #335 round-4 (advisory) and the human decision: sync file
+    I/O on an async loop is a structural defect even when the file is
+    small. The ``ThreadDispatcher`` awaits
+    ``SpecPinWriter.write_before_dispatch_async`` which uses
+    ``asyncio.to_thread`` — the offload MUST occur.
+
+    We observe the thread that runs the atomic-write's ``os.replace``
+    step versus the event-loop thread of the awaiting coroutine: they
+    must differ. If they match, someone silently reverted the dispatcher
+    to the sync call site (regression).
+    """
+    import threading as _threading
+
+    layout = _seed_thread(tmp_path)
+    calling_thread = _threading.get_ident()
+    replace_thread: dict[str, int | None] = {"tid": None}
+    real_replace = os.replace
+
+    def spy_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        # Only observe the pin write — other atomic writes on this
+        # dispatch path (message files, meta.yaml) go through os.replace
+        # too and would drown out the signal.
+        if Path(os.fspath(dst)).name == "pin":
+            replace_thread["tid"] = _threading.get_ident()
+        real_replace(src, dst)
+
+    async def recording_invoker(**kwargs: Any) -> InvokeResult:
+        write_message_file(layout, 2, "claude-code", "ok", atomic=True)
+        return _ok_result()
+
+    dispatcher = ThreadDispatcher(
+        base_dir=tmp_path,
+        phanthand_client=AsyncMock(spec=PhanthandClient),
+        dedup=DedupCache(ttl=timedelta(seconds=5)),
+        invoker=recording_invoker,
+    )
+    monkeypatch.setattr("os.replace", spy_replace)
+    await dispatcher.handle(_event())
+
+    assert replace_thread["tid"] is not None, (
+        "os.replace was never called during the dispatch — the pin write did not happen at all"
+    )
+    assert replace_thread["tid"] != calling_thread, (
+        "the pin write's os.replace ran on the event-loop thread — the "
+        "ThreadDispatcher is expected to await write_before_dispatch_async, "
+        "which offloads sync I/O to the thread-pool executor "
+        "(PR-review #335 round-4 ADVISORY regression)"
     )

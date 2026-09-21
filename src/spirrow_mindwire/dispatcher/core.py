@@ -145,14 +145,25 @@ class Dispatcher:
         # SPEC-2026-09-20-pin-hardening-and-id-audit §2.1 D-32: write
         # `.mindwire/pin` BEFORE delivering to the adapter. The writer is a
         # no-op for roles outside implementer/naysayer (proposer), so
-        # ``write_before_dispatch`` is safe to call unconditionally. A
+        # ``write_before_dispatch_async`` is safe to call unconditionally. A
         # :class:`~spirrow_mindwire.spec_pin.PinDispatchAbortError` propagates: this
         # is a fail-loud operational fault (mapping refers to a spec file the
         # writer cannot construct a resolved pin from — Bohr msg-3991
         # objection 3). Under Phase 1's empty mapping this branch is
         # unreachable and every dispatch writes a bootstrap pin.
+        #
+        # ``write_before_dispatch_async`` defers the blocking file I/O
+        # (mkstemp + write + os.replace) to the default thread-pool
+        # executor via ``asyncio.to_thread``, so the pin write does not
+        # stall other tasks on the event loop (PR-review #335 round-4
+        # ADVISORY, human decision: refactor before merge). The await
+        # returns only after the write has completed, preserving the
+        # "直前に" invariant — the pin is on disk before ``deliver_event``
+        # runs.
         if self._spec_pin_writer is not None:
-            self._spec_pin_writer.write_before_dispatch(handle.role, handle.thread_ref.thread_id)
+            await self._spec_pin_writer.write_before_dispatch_async(
+                handle.role, handle.thread_ref.thread_id
+            )
         # I9: serialize deliver_event per SessionHandle (FIFO by call order; the
         # caller delivers in occurred_at order — ChatRoom msg-id monotonic).
         async with session.lock:
