@@ -783,6 +783,110 @@ def test_v14_chain_walking_unions_definitions() -> None:
 
 
 # ---------------------------------------------------------------------------
+# supersedes chain walking — cycle detection tolerates unhashable spec_id
+# ---------------------------------------------------------------------------
+
+
+def test_v14_chain_walking_survives_unhashable_spec_id(tmp_path: Path) -> None:
+    """Regression: `_resolve_supersedes_chain` must not crash when a manifest
+    reaches V-14 with a non-string ``spec_id`` (e.g. a YAML list) that V-1
+    would flag as a schema error.  V-1..V-14 findings are diagnostic under
+    D-36 and do not stop the run, so a malformed manifest can flow into
+    V-14; the cycle-detection ``visited`` set must be indexed on ``m.path``
+    (always :class:`pathlib.Path`, always hashable) rather than
+    ``m.spec_id`` (may be list / dict on malformed input).
+    """
+
+    # Construct a Manifest whose spec_id is a list — the exact unhashable
+    # shape pr-gate identified in msg-3940.  We bypass the yaml loader
+    # because well-formed YAML wouldn't necessarily produce this, but
+    # `_check_v14` receives whatever the loader hands over.
+    path = tmp_path / "T-malformed.md"
+    path.write_text(
+        "---\n"
+        "spec_id: SPEC-should-be-a-string\n"
+        "thread: T-malformed\n"
+        "target_repo: r\n"
+        "base_branch: main\n"
+        "status: active\n"
+        "canary: not-applicable\n"
+        "supersedes: []\n"
+        "obligations: []\n"
+        "items: []\n"
+        "---\n"
+        "\n"
+        "empty body.\n",
+        encoding="utf-8",
+    )
+    data, err = VERIFY._load_yaml_frontmatter(path)
+    assert err is None and data is not None
+    # Force the unhashable shape after load, mirroring what V-1 would
+    # otherwise report — V-14 must not itself crash on this input.
+    data["spec_id"] = ["SPEC-list-form"]
+    m = VERIFY.Manifest(path, data)
+
+    # Empty manifest map: no ancestors reachable.  The call must return
+    # without raising TypeError.  We tolerate whatever V-14 findings the
+    # walk produces — the regression under test is that no exception
+    # escapes the cycle-detection set membership check.
+    defs, exempts, findings = VERIFY._resolve_supersedes_chain(m, {})
+    assert isinstance(defs, set)
+    assert isinstance(exempts, set)
+    assert isinstance(findings, list)
+
+
+def test_v14_chain_walking_cycle_terminates(tmp_path: Path) -> None:
+    """Two manifests supersede each other → walk terminates without hang.
+
+    Complements the unhashable-spec_id regression above: cycle detection
+    on ``m.path`` must still stop a genuine A→B→A cycle.
+    """
+
+    a_body = (
+        "---\n"
+        "spec_id: SPEC-A\n"
+        "thread: T-A\n"
+        "target_repo: r\n"
+        "base_branch: main\n"
+        "status: active\n"
+        "canary: not-applicable\n"
+        "supersedes: [SPEC-B]\n"
+        "obligations: []\n"
+        "items: []\n"
+        "---\n\nbody A.\n"
+    )
+    b_body = (
+        "---\n"
+        "spec_id: SPEC-B\n"
+        "thread: T-B\n"
+        "target_repo: r\n"
+        "base_branch: main\n"
+        "status: active\n"
+        "canary: not-applicable\n"
+        "supersedes: [SPEC-A]\n"
+        "obligations: []\n"
+        "items: []\n"
+        "---\n\nbody B.\n"
+    )
+    a_path = tmp_path / "T-A.md"
+    b_path = tmp_path / "T-B.md"
+    a_path.write_text(a_body, encoding="utf-8")
+    b_path.write_text(b_body, encoding="utf-8")
+    ad, _ = VERIFY._load_yaml_frontmatter(a_path)
+    bd, _ = VERIFY._load_yaml_frontmatter(b_path)
+    assert ad is not None and bd is not None
+    a = VERIFY.Manifest(a_path, ad)
+    b = VERIFY.Manifest(b_path, bd)
+
+    # Must terminate — the assertion here is behaviour (return, do not
+    # exceed recursion / hang).  Bounded-time completion of the call
+    # itself is the pass condition.
+    defs, exempts, _findings = VERIFY._resolve_supersedes_chain(a, {a.spec_id: a, b.spec_id: b})
+    assert isinstance(defs, set)
+    assert isinstance(exempts, set)
+
+
+# ---------------------------------------------------------------------------
 # main() smoke — usage errors still return non-zero (unchanged)
 # ---------------------------------------------------------------------------
 

@@ -1103,20 +1103,25 @@ def _resolve_supersedes_chain(
 
     Each ancestor contributes its own definitions and ``verify_exempt_ids``
     to the current manifest's exemption / definition sets.  Cycles are
-    prevented by tracking visited spec_ids; an ancestor file that cannot
-    be located in ``manifests_by_spec_id`` produces a V-14 error (per
-    D-37) but does not stop the walk.
+    prevented by tracking visited manifest paths (``m.path``): using the
+    manifest file path — always a hashable :class:`pathlib.Path` — avoids
+    the ``TypeError: unhashable type`` crash that a malformed front-matter
+    ``spec_id`` (e.g. YAML list / dict) would otherwise raise when V-1
+    schema errors let a manifest flow into V-14 (D-36: check failures do
+    not stop the run).  An ancestor file that cannot be located in
+    ``manifests_by_spec_id`` produces a V-14 error (per D-37) but does
+    not stop the walk.
     """
 
     findings: list[Finding] = []
     defs: set[str] = set()
     exempts: set[str] = set()
-    visited: set[str] = set()
+    visited: set[Path] = set()
 
     def _walk(m: Manifest) -> None:
-        if m.spec_id in visited:
+        if m.path in visited:
             return
-        visited.add(m.spec_id)
+        visited.add(m.path)
         body = _read_manifest_body(m.path)
         items = m.data.get("items") if isinstance(m.data.get("items"), list) else []
         defs.update(_extract_definitions(body, items))
