@@ -481,6 +481,48 @@ class PrReviewOutcome:
     truncated: bool = False
     finish_reason: str | None = None
     model: str | None = None
+    # In-memory tag: the ``principles_version()`` value under which THIS outcome was judged.
+    # NOT persisted to any durable channel — the GitHub review body carries only the verdict
+    # footer ``<!-- mindwire:verdict head_sha=... event=... -->`` (see
+    # :func:`_insert_verdict_footer_before_marker` and :data:`_VERDICT_FOOTER_RE`), whose
+    # schema does not include the principles version. This field exists for envelope-level
+    # audit only (in-memory logging, shadow-log analysis, test assertions) — a future reader
+    # who searches the persisted payload for a ``principles_version=`` segment will find none.
+    #
+    # Recorded on **every judgment emit path** — the happy (Lexora-reviewed) path, the
+    # CI-gate short-circuit, the round-cap escalation, and the timeout-degrade — because
+    # the SOT declares "Every naysayer output records the ``principles_version`` it judged
+    # under, so a later revision stays auditable" (spec/NAYSAYER_PRINCIPLES.md). A
+    # short-circuit path that decided TODAY under the current principles (CI green vs
+    # not-green; cap-hit vs not; timeout vs completion) is still a naysayer judgment;
+    # leaving its ``principles_version`` at the ``None`` default would silently drop the
+    # audit tag on the very outputs a version bump most needs to explain (a red gate held
+    # while the semantics of "blocking" was being redefined has to be legible under the
+    # version that held it). Pinned by
+    # :func:`test_principles_version_recorded_on_every_judgment_emit_path` in
+    # tests/test_pr_review_driver.py.
+    #
+    # Left as ``None`` on reuse outcomes — the two paths that re-emit a prior verdict
+    # rather than producing a new judgment today:
+    #
+    #   * :meth:`_maybe_replay_verdict` — chatroom-replay of a verdict whose GitHub POST
+    #     did not land last turn.
+    #   * :meth:`_emit_head_unchanged_skip` — debounce skip of a re-review on an unchanged
+    #     head (the prior verdict stands).
+    #
+    # Both re-emit a decision that was made under some earlier principles version; there
+    # is no new principles version to declare, and the historical version is not
+    # recoverable from the persisted payload (it lived in-memory during the earlier turn
+    # and was not written to any durable channel — the verdict footer schema is
+    # ``head_sha`` + ``event`` only). Stamping today's ``principles_version()`` on either
+    # of these would falsely attribute an old judgment to today's principles, corrupting
+    # the audit tag exactly at the seam a version bump most needs to remain honest
+    # (PR-gate #301 objection, msg-4053). ``None`` is the only value here that is not a
+    # fabrication. Pinned by
+    # :func:`test_replay_path_does_not_claim_current_principles_version` and
+    # :func:`test_head_unchanged_skip_does_not_claim_current_principles_version`.
+    # Kept ``int | None`` rather than ``int`` both to encode this reuse contract and so a
+    # synthetic outcome in a caller test does not have to load the SOT.
     principles_version: int | None = None
     ci_gated: bool = False  # True when the L1 CI-gate short-circuited the content review
     timed_out: bool = False  # M2 (T34): the Lexora review timed out → degraded to fail-closed RC
@@ -2031,6 +2073,7 @@ class NaysayerPrReviewDriver:
                 body=body,
                 ci_state=ci.state,
                 head_sha=ci.head_sha,
+                principles_version=principles_version(),
                 ci_gated=True,
                 adr_pointer_selection=selection,
             )
@@ -2073,27 +2116,8 @@ class NaysayerPrReviewDriver:
                         ci.head_sha,
                     )
                 else:
-                    verdict, body = skip
-                    selection = _not_attempted_selection()
-                    body = append_marker(body, selection)
-                    # Debounce skip does NOT submit to GitHub (the prior verdict review
-                    # from the debounce head-match already sits on the PR — a second submit
-                    # would be a duplicate). But we still stamp the verdict footer, inserted
-                    # BEFORE the ADR-INDEX marker so both sentinels coexist and the marker
-                    # keeps its final-line invariant. A downstream replay reads a well-formed
-                    # body if this path is ever the "last written for this head" the chatroom
-                    # holds.
-                    body_with_footer = _insert_verdict_footer_before_marker(
-                        body, head_sha=ci.head_sha or "", event=verdict
-                    )
-                    await post_critique(body_with_footer)
-                    return PrReviewOutcome(
-                        verdict=verdict,
-                        body=body_with_footer,
-                        ci_state=ci.state,
-                        head_sha=ci.head_sha,
-                        skipped_head_unchanged=True,
-                        adr_pointer_selection=selection,
+                    return await self._emit_head_unchanged_skip(
+                        ci, skip=skip, post_critique=post_critique
                     )
             elif cap_hit:
                 if self._shadow:
@@ -2128,6 +2152,7 @@ class NaysayerPrReviewDriver:
                         body=receipt.body,
                         ci_state=ci.state,
                         head_sha=ci.head_sha,
+                        principles_version=principles_version(),
                         rounds_capped=True,
                         adr_pointer_selection=selection,
                     )
@@ -2672,6 +2697,57 @@ class NaysayerPrReviewDriver:
             )
         raise exc
 
+    async def _emit_head_unchanged_skip(
+        self,
+        ci: CiStatus,
+        *,
+        skip: tuple[ReviewEvent, str],
+        post_critique: PostCritique,
+    ) -> PrReviewOutcome:
+        """Emit the head-unchanged skip outcome — REUSE of a prior verdict, not a new judgment.
+
+        Extracted out of :meth:`review` so this reuse path is lexically distinguishable from
+        the judgment paths (PR-gate #301 objection, msg-4053; Einstein msg-4054 advisory):
+        the AST site-count pin
+        (:func:`test_pr_review_outcome_construction_site_count_is_bounded` in
+        tests/test_pr_review_driver.py) excludes ``PrReviewOutcome`` construction sites
+        enclosed by this function alongside :meth:`_maybe_replay_verdict`, since neither
+        produces a new judgment and both must therefore leave
+        :attr:`PrReviewOutcome.principles_version` at ``None``.
+
+        Debounce skip does NOT submit to GitHub (the prior verdict review from the debounce
+        head-match already sits on the PR — a second submit would be a duplicate). But we
+        still stamp the verdict footer, inserted BEFORE the ADR-INDEX marker so both
+        sentinels coexist and the marker keeps its final-line invariant. A downstream
+        replay reads a well-formed body if this path is ever the "last written for this
+        head" the chatroom holds.
+
+        Does NOT populate :attr:`PrReviewOutcome.principles_version` (same contract as
+        :meth:`_maybe_replay_verdict`): this outcome re-emits a prior verdict rather than
+        producing a new judgment today, so there is no new principles version to claim.
+        The historical version of the original judgment is not persisted anywhere (the
+        verdict footer schema is ``head_sha`` + ``event`` only; see
+        :data:`_VERDICT_FOOTER_RE`), so it cannot be recovered here — writing anything but
+        ``None`` would fabricate an audit tag attributing an old judgment to today's
+        principles. Pinned by
+        :func:`test_head_unchanged_skip_does_not_claim_current_principles_version`.
+        """
+        verdict, body = skip
+        selection = _not_attempted_selection()
+        body = append_marker(body, selection)
+        body_with_footer = _insert_verdict_footer_before_marker(
+            body, head_sha=ci.head_sha or "", event=verdict
+        )
+        await post_critique(body_with_footer)
+        return PrReviewOutcome(
+            verdict=verdict,
+            body=body_with_footer,
+            ci_state=ci.state,
+            head_sha=ci.head_sha,
+            skipped_head_unchanged=True,
+            adr_pointer_selection=selection,
+        )
+
     async def _maybe_replay_verdict(
         self,
         pr: PrRef,
@@ -2711,6 +2787,19 @@ class NaysayerPrReviewDriver:
         already know is terminally rejected at the target level (a 422 for a deleted PR,
         a 404). Its presence for the current head suppresses replay — the human must
         adjudicate (msg-1984 §2).
+
+        Does NOT populate :attr:`PrReviewOutcome.principles_version`: replay produces no
+        new judgment, so there is no version to claim. The historical version of the
+        original judgment is not persisted anywhere (the verdict footer schema is
+        ``head_sha`` + ``event`` only; see :data:`_VERDICT_FOOTER_RE`), so it cannot be
+        recovered here — writing anything but ``None`` would be a fabricated value. The
+        outcome returned below is one of the ``PrReviewOutcome`` call sites excluded from
+        the AST site-count pin
+        (:func:`test_pr_review_outcome_construction_site_count_is_bounded` in
+        tests/test_pr_review_driver.py); the other is
+        :meth:`_emit_head_unchanged_skip`, which reuses a prior verdict under the same
+        rationale. The behavioural pin lives at
+        :func:`test_replay_path_does_not_claim_current_principles_version`.
         """
         try:
             messages = await read_review_thread()
