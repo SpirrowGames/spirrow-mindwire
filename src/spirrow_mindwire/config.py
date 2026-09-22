@@ -398,6 +398,93 @@ class ConductorConfig(_StrictModel):
     while keeping the independent review at real Tier-C handoffs."""
 
 
+class DeciderThresholdsConfig(_StrictModel):
+    """``[decider.thresholds]`` — Decider 合成規則の閾値 (v3.4 §3.4)。
+
+    Track B (``handoff_valid`` / ``made_progress``) と Tier-C の合成に
+    使う 3 系列の閾値。既定値は v3.4 の暫定値でそのまま採り、shadow
+    データを 1〜2 週貯めてから較正する (§10 open question)。
+
+    Tier-C の閾値は :class:`~spirrow_mindwire.decider.verdict.TierCThresholds`
+    に渡されるため、意味論の SOT は同 dataclass の docstring を参照する
+    こと。 config は「値の入り口」だけを担う。
+    """
+
+    # Track B (step 1 では adapter / hook 未着地 ∴ 参照点 0、拡張性
+    # 担保のため config には保持する)。 §4.7。
+    handoff_valid_min: float = Field(default=0.30, ge=0.0, le=1.0)
+    made_progress_min: float = Field(default=0.25, ge=0.0, le=1.0)
+    min_confidence: float = Field(default=0.60, ge=0.0, le=1.0)
+
+    # Tier-C 3 値 (§3.4 [decider.thresholds] + verdict.py のヘルパと対応)。
+    # genuine 系: 3 問の和 (§4.4) ∴ 論理上限 3.0。
+    # spurious 系: 3 問の max (§4.4) ∴ 論理上限 1.0 — le=3.0 で受理すると
+    # spurious_min > 1.0 が silently 通り LIKELY_NOT が到達不能になる
+    # (PR #337 pr-gate BLOCKING correctness)。TierCThresholds の
+    # __post_init__ と bound を揃える。
+    tierc_genuine_min: float = Field(default=0.60, ge=0.0, le=3.0)
+    tierc_genuine_max: float = Field(default=0.40, ge=0.0, le=3.0)
+    tierc_spurious_min: float = Field(default=0.60, ge=0.0, le=1.0)
+
+
+class DeciderTierCConfig(_StrictModel):
+    """``[decider.tierc]`` — Tier-C フック (§3.3.b) の運用モード。
+
+    4 値 (Fermi msg-4066/4067 DECIDED #1、msg-4063 で追加):
+
+    * ``off`` — フックそのものが走らない (default)。 既存の設定形は
+      本 default で読める ∴ 後方互換。
+    * ``shadow`` — grey-zone gating → ``evaluate_tierc`` → ``log_decision``
+      まで走らせ、annotation / bounce は一切しない。 意味論は
+      :attr:`NaysayerGatingConfig.shadow` (D12 の一般フック shadow) と
+      parity — 実動作を変えない (``stop`` 不変、人への通知不変) ∴ D2
+      単調性を破らない。 Tier-C を lexora `/v1/decide` main 着地待ちで
+      先行走行させるための log-only モード。
+    * ``annotate`` — LIKELY_NOT に対して escalation 通知に注釈 1 行を
+      付ける。 §6-C 制約 1 (genuine 見逃し 0 件) を満たしたときのみ
+      投入 (D15)。
+    * ``bounce`` — LIKELY_NOT かつ ``answerable_from_thread`` の場合に
+      呼び出し元 agent へ 1 回だけ差し戻す。 Takahito 追加承認事項 (D15)。
+
+    :attr:`skip_naysayer_when_confirmed` は Decider が CONFIRMED を
+    出したときに ``force_naysayer_only_on_explicit_human`` の Gemini
+    相談を省く cost lever (§5)。 shadow / annotate / bounce のいずれ
+    でも参照可能で、 default は False。
+    """
+
+    mode: Literal["off", "shadow", "annotate", "bounce"] = "off"
+    skip_naysayer_when_confirmed: bool = False
+
+
+class DeciderConfig(_StrictModel):
+    """``[decider]`` — Decider 全体 (v3.4 §3.4)。
+
+    Fermi msg-4063/4066/4067 の re-scope に従い、step 1 では adapter /
+    Conductor フックの配線は行わず、以下 config だけを追加する:
+
+    * :attr:`mode` — Track B (一般フック §3.3.a) の運用モード。 3 値
+      ``off | shadow | active`` (msg-3404 §2、D12)。 default は
+      ``"off"`` — 既存設定は本 default で読め、環境の shadow への
+      昇格は上位 config で個別に指示する。
+    * :attr:`backend` — env ``MINDWIRE_DECIDER_BACKEND`` に相当する
+      環境切替 (D4)。 TOML 上でも上書きできるようにする。 default
+      ``"off"`` (adapter 未着地の間に mode を shadow に上げても
+      backend=off ∴ evaluate は None を返し fail-open で通す — D20)。
+    * :attr:`active_questions` — Track B active モードで実際に stop に
+      効かせる問い (msg-3404 §2)。 default は Fermi の msg-3404 案の
+      通り ``("handoff_valid", "made_progress")``。 Tier-C 問いは §3.3.b
+      別フックのため本 list には入れない。
+    * :attr:`thresholds` — 合成規則の閾値 (§3.4)。
+    * :attr:`tierc` — Tier-C フックの運用モード (4 値、shadow 込み)。
+    """
+
+    mode: Literal["off", "shadow", "active"] = "off"
+    backend: Literal["off", "lexora"] = "off"
+    active_questions: tuple[str, ...] = ("handoff_valid", "made_progress")
+    thresholds: DeciderThresholdsConfig = Field(default_factory=DeciderThresholdsConfig)
+    tierc: DeciderTierCConfig = Field(default_factory=DeciderTierCConfig)
+
+
 class NaysayerGatingConfig(_StrictModel):
     """PR-review debounce knobs (cost lever) for the Tier B naysayer gate.
 
@@ -456,6 +543,7 @@ class MindwireSettings(BaseSettings):
     loop: Stage3LoopConfig = Field(default_factory=Stage3LoopConfig)
     conductor: ConductorConfig = Field(default_factory=ConductorConfig)
     naysayer_gating: NaysayerGatingConfig = Field(default_factory=NaysayerGatingConfig)
+    decider: DeciderConfig = Field(default_factory=DeciderConfig)
 
     @field_validator("schema_version")
     @classmethod
@@ -533,11 +621,15 @@ __all__ = [
     "DEFAULT_DATA_DIR",
     "ClaudeCodeConfig",
     "ConductorConfig",
+    "DeciderConfig",
+    "DeciderThresholdsConfig",
+    "DeciderTierCConfig",
     "ExtraMCPServerConfig",
     "LoggingConfig",
     "LoopWatchConfig",
     "MCPServerConfig",
     "MindwireSettings",
+    "NaysayerGatingConfig",
     "PathsConfig",
     "PhanthandConfig",
     "Stage3LoopConfig",
