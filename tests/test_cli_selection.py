@@ -51,6 +51,19 @@ _OBLIGATIONS = load_manifest()
 _ADAPTERS_DIR = Path(__file__).resolve().parents[1] / "src" / "spirrow_mindwire" / "adapters"
 
 
+def _executable_stub(tmp_path: Path) -> Path:
+    """A stand-in binary that passes the startup guard on every platform.
+
+    The execute bit matters: POSIX checks it and Windows has none to check, so a
+    stub written without it goes green locally on the loop host and reds only on
+    the Linux CI runner. That is how this helper came to exist.
+    """
+    cli = tmp_path / "claude.exe"
+    cli.write_text("", encoding="utf-8")
+    cli.chmod(0o755)
+    return cli
+
+
 # --------------------------------------------------------------------------- #
 # the helper
 # --------------------------------------------------------------------------- #
@@ -295,8 +308,7 @@ def test_the_composition_root_routes_config_to_the_two_anthropic_roles(tmp_path:
     """``[loop]`` -> proposer + implementer; the naysayer is skipped at the same call site."""
     from spirrow_mindwire.loop_runner import _build_dispatcher
 
-    cli = tmp_path / "claude.exe"
-    cli.write_text("", encoding="utf-8")
+    cli = _executable_stub(tmp_path)
     settings = MindwireSettings(
         loop=Stage3LoopConfig(
             repo_dir=tmp_path,
@@ -340,8 +352,7 @@ def test_a_directory_is_not_an_executable(tmp_path: Path) -> None:
 
 
 def test_a_real_binary_passes_through(tmp_path: Path) -> None:
-    cli = tmp_path / "claude.exe"
-    cli.write_text("", encoding="utf-8")
+    cli = _executable_stub(tmp_path)
     assert _resolve_role_cli_path_or_exit(cli) == cli.resolve()
 
 
@@ -356,8 +367,7 @@ def test_a_relative_setting_is_made_absolute_before_it_goes_anywhere(
     gets the absolute form it matches most precisely rather than the basename
     fallback it keeps for degenerate targets.
     """
-    cli = tmp_path / "claude.exe"
-    cli.write_text("", encoding="utf-8")
+    cli = _executable_stub(tmp_path)
     monkeypatch.chdir(tmp_path)
 
     resolved = _resolve_role_cli_path_or_exit(Path("claude.exe"))
@@ -372,8 +382,7 @@ def test_a_relative_setting_is_made_absolute_before_it_goes_anywhere(
 )
 def test_a_file_that_cannot_be_executed_stops_the_daemon(tmp_path: Path) -> None:
     """Exists but unrunnable is the same per-tick spawn failure, one step later."""
-    cli = tmp_path / "claude.exe"
-    cli.write_text("", encoding="utf-8")
+    cli = _executable_stub(tmp_path)
     cli.chmod(0o644)
     with pytest.raises(SystemExit, match="not executable"):
         _resolve_role_cli_path_or_exit(cli)
