@@ -315,7 +315,12 @@ def _assert_role_resolution(
 _BOHR_BUILTIN_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
 
 
-def build_proposer(repo_dir: Path) -> Stage3ProposerAdapter:
+def build_proposer(
+    repo_dir: Path,
+    *,
+    model: str | None = None,
+    cli_path: Path | None = None,
+) -> Stage3ProposerAdapter:
     """Proposer with read-only access to ``repo_dir`` (same model family as ``main``).
 
     The tool list wired here is :data:`_BOHR_BUILTIN_TOOLS` — named for the
@@ -328,11 +333,19 @@ def build_proposer(repo_dir: Path) -> Stage3ProposerAdapter:
     axes (see the block comment above the constant). The path-scope guard
     installed here is the seam that enforces the intersection — the adapter
     can only actually invoke a tool the guard admits.
+
+    ``model`` / ``cli_path`` come from ``[loop].role_model`` /
+    ``[loop].role_cli_path`` and default to None = the SDK's own choice. They
+    are passed as a pair because naming a model the vendored CLI is too old for
+    fails at the API, not here; ``adapters/_cli_selection`` carries the measured
+    versions, and the reason the naysayer is not offered the same pair.
     """
     return Stage3ProposerAdapter(
         cwd=repo_dir,
         builtin_tools=_BOHR_BUILTIN_TOOLS,
         allowed_tools=list(_BOHR_BUILTIN_TOOLS),
+        model=model,
+        cli_path=cli_path,
         # The scope is decided here, where the role is known — the adapter has no
         # way to tell a filesystem path from an MCP tool's URI-shaped ``path``,
         # so it is not asked to guess. `allowed_tools` auto-approves, which is
@@ -341,7 +354,13 @@ def build_proposer(repo_dir: Path) -> Stage3ProposerAdapter:
     )
 
 
-def build_implementer(repo_dir: Path, *, obligations: ObligationsManifest) -> ImplementerSdkAdapter:
+def build_implementer(
+    repo_dir: Path,
+    *,
+    obligations: ObligationsManifest,
+    model: str | None = None,
+    cli_path: Path | None = None,
+) -> ImplementerSdkAdapter:
     """Allow-list-gated implementer; inference base URL + allow-list from env/defaults.
 
     ``inference_base_url`` is left to the adapter's
@@ -359,11 +378,21 @@ def build_implementer(repo_dir: Path, *, obligations: ObligationsManifest) -> Im
     root is re-entered from tests or a hot-reload. Placement here (rather
     than at module import) means a docs-only checkout that never builds an
     implementer never patches the SDK's transport module.
+
+    ``model`` / ``cli_path`` are the same pair :func:`build_proposer` takes, from
+    the same two config keys — the two roles that route to Anthropic move
+    together, so a host cannot end up designing on one model and implementing on
+    another without saying so.
     """
     from .adapters import _sdk_job_hook
 
     _sdk_job_hook.install_hook()
-    return ImplementerSdkAdapter(cwd=repo_dir, obligations=obligations)
+    return ImplementerSdkAdapter(
+        cwd=repo_dir,
+        obligations=obligations,
+        model=model,
+        cli_path=cli_path,
+    )
 
 
 def build_naysayer(repo_dir: Path, *, obligations: ObligationsManifest) -> NaysayerSdkAdapter:
@@ -379,6 +408,32 @@ def build_naysayer(repo_dir: Path, *, obligations: ObligationsManifest) -> Naysa
     composition root and passed in by injection.
     """
     return NaysayerSdkAdapter(cwd=repo_dir, obligations=obligations)
+
+
+def _resolve_role_cli_path_or_exit(configured: Path | None) -> Path | None:
+    """Check ``[loop].role_cli_path`` points at a real file — fail-closed with ``SystemExit``.
+
+    Unset is the normal case and returns ``None`` (the SDK uses its vendored
+    CLI). Set-but-wrong is checked here, at daemon startup, rather than left to
+    the first spawn: the sweep runs the daemon every five minutes, so a typo'd
+    path would otherwise surface as a per-tick spawn failure — the shape an
+    operator reads as "the loop is broken" rather than "one setting is wrong".
+
+    Existence is all that is checked. Whether the binary is new enough for
+    ``role_model`` is not knowable from here without running it, and the API
+    says so precisely when it is not (``adapters/_cli_selection``).
+    """
+    if configured is None:
+        return None
+    path = Path(configured).expanduser()
+    if not path.is_file():
+        raise SystemExit(
+            f"loop.role_cli_path does not point at a file: {path} — set "
+            "[loop].role_cli_path (or MINDWIRE_LOOP__ROLE_CLI_PATH) to the Claude Code "
+            "executable the proposer/implementer sessions should run, or leave it unset "
+            "to use the CLI vendored in claude-agent-sdk"
+        )
+    return path
 
 
 def _load_obligations_or_exit() -> ObligationsManifest:
@@ -498,11 +553,20 @@ def _build_dispatcher(
         # would be exactly the "correct-but-invisible fail-open" that
         # spec/process/README.md warns against.
         obligations = _load_obligations_or_exit()
+        role_cli_path = _resolve_role_cli_path_or_exit(cfg.role_cli_path)
         if proposer is None:
-            proposer = build_proposer(repo_dir)
+            proposer = build_proposer(repo_dir, model=cfg.role_model, cli_path=role_cli_path)
         if implementer is None:
-            implementer = build_implementer(repo_dir, obligations=obligations)
+            implementer = build_implementer(
+                repo_dir,
+                obligations=obligations,
+                model=cfg.role_model,
+                cli_path=role_cli_path,
+            )
         if naysayer is None:
+            # No model / cli_path here, by design: the naysayer's independence is
+            # its Lexora tier, and a newer CLI breaks that route (422). See
+            # ``adapters/_cli_selection``.
             naysayer = build_naysayer(repo_dir, obligations=obligations)
 
     registry = build_registry(proposer=proposer, implementer=implementer, naysayer=naysayer)
