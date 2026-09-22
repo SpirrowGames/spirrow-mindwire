@@ -1290,3 +1290,181 @@ async def test_halt_between_turns_is_a_pure_state_transition(
     assert hs.state is SessionState.HALTED
     # halt did not construct any client.
     assert factory.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# PR-gate on PR-338 @ 5a3d99b:
+#   (1) deliver_event's own shutdown must be bounded, and a halt that arrives
+#       while that shutdown is in flight must not report a clean halt;
+#   (2) a fast halt that reaches HALTED before deliver_event's except block
+#       runs must not be clobbered to FAILED.
+# --------------------------------------------------------------------------- #
+
+
+class _DisconnectBlocksClient(_ShutdownRecordingClient):
+    """``disconnect`` signals that it started, then blocks until released
+    (never, unless the test sets ``release_disconnect``)."""
+
+    def __init__(self, responses: list[Any]) -> None:
+        super().__init__(responses)
+        self.disconnect_started = asyncio.Event()
+        self.release_disconnect = asyncio.Event()
+
+    async def disconnect(self) -> None:
+        self.disconnect_started.set()
+        await self.release_disconnect.wait()
+        self.disconnected += 1
+
+
+def _adapter_with(tmp_path: Path, client: Any, *, shutdown_grace: timedelta) -> NaysayerSdkAdapter:
+    def factory(options: Any) -> Any:
+        return client
+
+    return NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+        shutdown_grace=shutdown_grace,
+    )
+
+
+@pytest.mark.anyio
+async def test_deliver_owned_shutdown_is_bounded_by_shutdown_grace(
+    tmp_path: Path,
+) -> None:
+    """A hung ``disconnect`` after a successful turn no longer parks
+    deliver_event forever: ``shutdown_grace`` expires and the turn fails with
+    ``adapter.shutdown_failed`` (the AC 5a contract); no reply is posted."""
+    client = _DisconnectBlocksClient([_assistant("critique"), _result()])
+    adapter = _adapter_with(tmp_path, client, shutdown_grace=timedelta(milliseconds=50))
+    captured: list[ReplyDraft] = []
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
+
+    with pytest.raises(NaysayerSdkDeliveryError) as exc_info:
+        await asyncio.wait_for(adapter.deliver_event(handle, _event()), timeout=2.0)
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.shutdown_failed"
+    assert captured == []
+
+
+@pytest.mark.anyio
+async def test_halt_during_deliver_owned_shutdown_reports_the_failure(
+    tmp_path: Path,
+) -> None:
+    """Rescue-halt scenario: deliver_event's finally already swapped the
+    client out and its shutdown hangs. halt reads ``client is None`` but must
+    NOT return a clean HALTED — it waits for the in-flight shutdown and, when
+    deliver_event records ``adapter.shutdown_failed``, raises."""
+    client = _DisconnectBlocksClient([_assistant("critique"), _result()])
+    adapter = _adapter_with(tmp_path, client, shutdown_grace=timedelta(milliseconds=100))
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+
+    deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await asyncio.wait_for(client.disconnect_started.wait(), timeout=2.0)
+
+    with pytest.raises(NaysayerSdkHaltError):
+        await adapter.halt(handle, grace=timedelta(seconds=2))
+    with pytest.raises(NaysayerSdkDeliveryError):
+        await asyncio.wait_for(deliver_task, timeout=2.0)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.shutdown_failed"
+    # halt did not run a second shutdown on the client deliver_event owned.
+    assert client.interrupted == 1
+
+
+@pytest.mark.anyio
+async def test_halt_grace_bounds_its_wait_on_a_deliver_owned_shutdown(
+    tmp_path: Path,
+) -> None:
+    """halt's ``grace`` bounds its wait on a shutdown it did not steal:
+    shorter than the deliver-side bound → ``adapter.halt_failed``."""
+    client = _DisconnectBlocksClient([_assistant("critique"), _result()])
+    adapter = _adapter_with(tmp_path, client, shutdown_grace=timedelta(seconds=1))
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+
+    deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await asyncio.wait_for(client.disconnect_started.wait(), timeout=2.0)
+
+    with pytest.raises(NaysayerSdkHaltError):
+        await adapter.halt(handle, grace=timedelta(milliseconds=50))
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.halt_failed"
+    client.release_disconnect.set()
+    with contextlib.suppress(NaysayerSdkDeliveryError):
+        await asyncio.wait_for(deliver_task, timeout=2.0)
+
+
+@pytest.mark.anyio
+async def test_halt_during_deliver_owned_shutdown_that_succeeds_is_halted(
+    tmp_path: Path,
+) -> None:
+    """If the in-flight deliver-owned shutdown completes, halt ends HALTED
+    and the turn's reply is not posted."""
+    client = _DisconnectBlocksClient([_assistant("critique"), _result()])
+    adapter = _adapter_with(tmp_path, client, shutdown_grace=timedelta(seconds=2))
+    captured: list[ReplyDraft] = []
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
+
+    deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await asyncio.wait_for(client.disconnect_started.wait(), timeout=2.0)
+    halt_task = asyncio.create_task(adapter.halt(handle, grace=timedelta(seconds=2)))
+    await asyncio.sleep(0.01)
+    assert not halt_task.done()  # halt is waiting on the in-flight shutdown
+    client.release_disconnect.set()
+    await asyncio.wait_for(halt_task, timeout=2.0)
+    await asyncio.wait_for(deliver_task, timeout=2.0)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.HALTED
+    assert captured == []
+    assert client.disconnected == 1
+
+
+class _QueryRaisesLaterClient(_ShutdownRecordingClient):
+    """``query`` parks until the test lets it go, then raises — modelling an
+    interrupted stream whose error surfaces only after halt has finished."""
+
+    def __init__(self, responses: list[Any]) -> None:
+        super().__init__(responses)
+        self.query_started = asyncio.Event()
+        self.proceed = asyncio.Event()
+
+    async def query(self, prompt: str) -> None:
+        self.query_started.set()
+        await self.proceed.wait()
+        raise RuntimeError("stream closed by interrupt")
+
+
+@pytest.mark.anyio
+async def test_fast_halt_reaching_halted_is_not_clobbered_by_deliver_except(
+    tmp_path: Path,
+) -> None:
+    """halt steals the client, shuts it down quickly and reaches HALTED
+    before the interrupted query's exception reaches deliver_event's except
+    block. That block must yield to halt for any shutdown state — not only
+    HALTING — so the session stays HALTED with no delivery_failed error."""
+    client = _QueryRaisesLaterClient([])
+    adapter = _adapter_with(tmp_path, client, shutdown_grace=timedelta(seconds=2))
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+
+    deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await asyncio.wait_for(client.query_started.wait(), timeout=2.0)
+    await adapter.halt(handle)
+    assert (await adapter.health(handle)).state is SessionState.HALTED
+
+    client.proceed.set()
+    with pytest.raises(NaysayerSdkDeliveryError):
+        await asyncio.wait_for(deliver_task, timeout=2.0)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.HALTED
+    assert hs.error is None
+    assert client.interrupted == 1
+    assert client.disconnected == 1

@@ -253,6 +253,12 @@ class _Session:
     # preflight is intentionally discarded (see :meth:`spawn`).
     attestation: AttestationRecord | None = None
     error: ErrorInfo | None = None
+    # Set (under :attr:`client_lock`) while :meth:`NaysayerSdkAdapter.deliver_event`'s
+    # finally owns an in-flight shutdown of the per-turn client; the event fires
+    # when that bounded shutdown has finished (either way). A :meth:`halt` that
+    # finds ``client is None`` but ``releasing`` set waits on it rather than
+    # reporting a clean halt over a subprocess still being torn down.
+    releasing: asyncio.Event | None = None
 
 
 def build_naysayer_system_prompt(
@@ -418,8 +424,13 @@ class NaysayerSdkAdapter:
         client_factory: Callable[[Any], _SdkClient] | None = None,
         expected_backend: str = NAYSAYER_EXPECTED_BACKEND,
         preflight: Callable[[], Awaitable[AttestationRecord]] | None = None,
+        shutdown_grace: timedelta = timedelta(seconds=5),
     ) -> None:
         self._cwd = Path(cwd)
+        # Upper bound on the per-turn client shutdown that deliver_event's
+        # finally runs itself (halt's own shutdown is bounded by its ``grace``
+        # argument). Defaults to halt's default grace.
+        self._shutdown_grace = shutdown_grace
         # Independence (ADR-05 §5): inference MUST route to the naysayer (Gemini)
         # tier, never the SDK default (api.anthropic.com). Require an explicit URL.
         self._inference_base_url = (
@@ -765,12 +776,16 @@ class NaysayerSdkAdapter:
             body, result = await _drain_reply(client)
             body_success = True
         except SdkIsErrorSignal as sig:
-            # If halt won the race, it has already set state to HALTING and
-            # will move it to HALTED after its own shutdown finishes.
+            # If halt won the race, it has set state to HALTING — and, if
+            # its shutdown was fast, possibly already to HALTED (or FAILED
+            # with ``adapter.halt_failed``) — before this except runs.
             # Overwriting state / session.error from here would clobber the
             # halt path's authoritative diagnosis — halt is the reason the
-            # SDK stream died, not an intrinsic SDK failure.
-            if session.state != SessionState.HALTING:
+            # SDK stream died, not an intrinsic SDK failure. The check is
+            # therefore "any shutdown state", not "== HALTING" (PR-gate on
+            # PR-338 @ 5a3d99b: a fast halt reaching HALTED first was
+            # clobbered to FAILED by the narrower check).
+            if session.state not in _SHUTDOWN_STATES:
                 session.state = SessionState.FAILED
                 session.error = ErrorInfo(
                     code="adapter.sdk_is_error",
@@ -781,7 +796,8 @@ class NaysayerSdkAdapter:
                 f"deliver_event failed for session {handle.session_id}: {sig}"
             ) from sig
         except Exception as exc:
-            if session.state != SessionState.HALTING:
+            # Same yield-to-halt rule as the SdkIsErrorSignal branch above.
+            if session.state not in _SHUTDOWN_STATES:
                 session.state = SessionState.FAILED
                 session.error = ErrorInfo(
                     code="adapter.delivery_failed",
@@ -796,14 +812,38 @@ class NaysayerSdkAdapter:
             # already stole it (concurrent :meth:`halt`), ``owned`` is ``None``
             # here and this coroutine has no shutdown to do; halt owns it.
             # If halt did not race us, we own the shutdown.
+            #
+            # When we own the shutdown we also publish a ``releasing`` event
+            # under the same lock, so a :meth:`halt` that arrives while this
+            # shutdown is in flight (and therefore reads ``client is None``)
+            # waits for it instead of reporting a clean halt over a
+            # subprocess that is still being torn down (PR-gate on PR-338 @
+            # 5a3d99b).
+            releasing: asyncio.Event | None = None
             async with session.client_lock:
                 owned = session.client
                 session.client = None
+                if owned is not None:
+                    releasing = asyncio.Event()
+                    session.releasing = releasing
             if owned is not None:
                 try:
-                    await _shutdown(owned)
+                    # Bounded, same as halt's ``grace`` (PR-gate on PR-338 @
+                    # 5a3d99b): an unbounded ``await _shutdown`` let a hung
+                    # disconnect park deliver_event forever while halt read
+                    # ``None`` and reported success. A timeout surfaces here
+                    # as ``TimeoutError`` and takes the same branches as any
+                    # other shutdown failure.
+                    await asyncio.wait_for(
+                        _shutdown(owned), timeout=self._shutdown_grace.total_seconds()
+                    )
                 except Exception as shutdown_exc:
-                    if body_success and session.state != SessionState.HALTING:
+                    # Deliberately NOT gated on halt's state: this client was
+                    # never stolen by halt (else ``owned`` would be ``None``),
+                    # so halt holds no diagnosis about it. A halt that raced
+                    # in after the swap is waiting on ``releasing`` and reads
+                    # the FAILED state written here.
+                    if body_success:
                         # Main path completed → no other exception is in flight
                         # → the shutdown failure is the sole anomaly. Match the
                         # main ``except`` contract (state=FAILED, session.error,
@@ -827,18 +867,19 @@ class NaysayerSdkAdapter:
                             f"{handle.session_id} after a successful turn "
                             f"(subprocess may have leaked): {shutdown_exc}"
                         ) from shutdown_exc
-                    # Either the main path was ALREADY raising when shutdown
-                    # failed (state / session.error / the exception itself are
-                    # all set by the except blocks above) or halt is authoritative
-                    # (state=HALTING). Re-raising the shutdown error here would
-                    # REPLACE the propagating exception in the first case, and
-                    # would clobber halt's ownership of the session in the
-                    # second. Log-only, and the original failure or halt path
-                    # continues.
+                    # The main path was ALREADY raising when shutdown failed
+                    # (state / session.error / the exception itself are all
+                    # set by the except blocks above). Re-raising the shutdown
+                    # error here would REPLACE the propagating exception.
+                    # Log-only; the original failure continues.
                     logger.exception(
                         "naysayer per-turn client shutdown failed while unwinding "
                         "another error; original error will propagate"
                     )
+                finally:
+                    session.releasing = None
+                    if releasing is not None:
+                        releasing.set()
 
         # halt() may have raced between ``body_success = True`` and here
         # (its own ``client_lock`` acquisition can interleave with ours in
@@ -919,6 +960,16 @@ class NaysayerSdkAdapter:
         interrupt/disconnect within it is reported as ``adapter.halt_failed``
         and reraised as :class:`NaysayerSdkHaltError`, matching the
         original halt contract before the 1-turn-1-session change.
+
+        ``grace`` also bounds a shutdown halt did *not* steal: if
+        ``deliver_event``'s finally already swapped the client out and is
+        shutting it down (``_Session.releasing`` set), halt waits for that
+        shutdown instead of returning a clean ``HALTED`` over it. A timeout
+        there is ``adapter.halt_failed``; a shutdown that deliver_event
+        itself reported as failed (``adapter.shutdown_failed``, state
+        ``FAILED``) makes halt raise :class:`NaysayerSdkHaltError` and keeps
+        that diagnosis. The deliver-side shutdown is itself bounded by the
+        adapter's ``shutdown_grace``, so neither party can park forever.
         """
         session = self._sessions.get(handle)
         if session is None or session.state in _SHUTDOWN_STATES:
@@ -926,8 +977,8 @@ class NaysayerSdkAdapter:
         # Steal the live per-turn client (if any) under the swap lock, and
         # flip state to HALTING under the SAME lock so a concurrent
         # ``deliver_event`` sees the transition atomically with the steal.
-        # deliver_event's except blocks check ``state != HALTING`` before
-        # overwriting session.state, so this ordering is what stops halt's
+        # deliver_event's except blocks check ``state not in _SHUTDOWN_STATES``
+        # before overwriting session.state, so this ordering is what stops halt's
         # authority from being clobbered by a "the SDK stream died, must be
         # FAILED" write from the racing deliver.
         async with session.client_lock:
@@ -936,6 +987,34 @@ class NaysayerSdkAdapter:
             session.state = SessionState.HALTING
             owned = session.client
             session.client = None
+            pending = session.releasing
+        if owned is None and pending is not None:
+            # deliver_event's finally already owns the shutdown of this
+            # turn's client and it is still in flight. Do not report a clean
+            # halt over it: wait (bounded by ``grace``) and read the outcome
+            # deliver_event recorded. PR-gate on PR-338 @ 5a3d99b.
+            try:
+                await asyncio.wait_for(pending.wait(), timeout=grace.total_seconds())
+            except TimeoutError as exc:
+                session.state = SessionState.FAILED
+                session.error = ErrorInfo(
+                    code="adapter.halt_failed",
+                    message="per-turn client shutdown owned by deliver_event did not "
+                    f"finish within grace={grace}",
+                    raised_at=datetime.now(UTC),
+                )
+                raise NaysayerSdkHaltError(
+                    f"halt failed for session {handle.session_id}: in-flight per-turn "
+                    f"shutdown did not finish within grace (subprocess may have leaked)"
+                ) from exc
+            if session.state is SessionState.FAILED:
+                # deliver_event recorded ``adapter.shutdown_failed``; keep that
+                # diagnosis (it names the cause) and fail the halt loudly.
+                raise NaysayerSdkHaltError(
+                    f"halt failed for session {handle.session_id}: the per-turn "
+                    f"client shutdown failed "
+                    f"({session.error.code if session.error else 'unknown'})"
+                )
         if owned is not None:
             try:
                 await asyncio.wait_for(_shutdown(owned), timeout=grace.total_seconds())
