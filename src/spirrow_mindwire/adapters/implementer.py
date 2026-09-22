@@ -98,6 +98,7 @@ from ..value_objects import (
     ThreadRef,
 )
 from . import _sdk_job_hook
+from ._cli_selection import cli_selection_kwargs
 from ._sdk_job_hook import (
     _JOB_HANDLE_CTX,
     JobState,
@@ -435,6 +436,7 @@ class ImplementerSdkAdapter:
         obligations: ObligationsManifest,
         inference_base_url: str | None = None,
         model: str | None = None,
+        cli_path: str | Path | None = None,
         allowed_tools: list[str] | None = None,
         mcp_servers: dict[str, Any] | None = None,
         system_prompt: str = _DEFAULT_IMPLEMENTER_SYSTEM_PROMPT,
@@ -454,6 +456,7 @@ class ImplementerSdkAdapter:
             else os.environ.get("MINDWIRE_IMPLEMENTER_BASE_URL", "")
         )
         self._model = model
+        self._cli_path = cli_path
         # Empty by default → every tool call routes through the guard (the guard
         # is the single enforcement point; auto-approval would bypass it).
         self._allowed_tools = list(allowed_tools) if allowed_tools is not None else []
@@ -498,7 +501,18 @@ class ImplementerSdkAdapter:
         # ``lookup_and_assign_leftover`` to distinguish OUR ``claude.exe``
         # from any other executable a child process might be. Defaults to
         # the bundled SDK executable path, resolvable at import time.
-        self._sdk_executable_path = sdk_executable_path or _default_sdk_executable_path()
+        #
+        # ``cli_path`` has to win over that default when it is set, because the
+        # two describe the same thing from opposite ends: ``cli_path`` tells the
+        # SDK which binary to *launch*, and this tells the belt which binary to
+        # *recognise* among the daemon's leftover children. Left on the bundled
+        # default while the session actually runs a host install, the belt would
+        # compare two real, different absolute paths, never match, and silently
+        # stop adopting leftovers — the failure mode PR-gate #299 round 3 already
+        # fixed once from the other direction.
+        self._sdk_executable_path = sdk_executable_path or (
+            str(cli_path) if cli_path is not None else _default_sdk_executable_path()
+        )
         # ``job_module`` is dependency-injected so tests can substitute a fake
         # for the Windows-only APIs without patching module globals. Default
         # is the real ``_sdk_job_hook`` module.
@@ -535,9 +549,10 @@ class ImplementerSdkAdapter:
             # agent now — see the module docstring.
             "permission_mode": "bypassPermissions",
             "env": env,
+            # Model / CLI binary, omitted entirely when neither was chosen
+            # (see ``_cli_selection``).
+            **cli_selection_kwargs(model=self._model, cli_path=self._cli_path),
         }
-        if self._model is not None:
-            kwargs["model"] = self._model
         return ClaudeAgentOptions(**kwargs)
 
     async def spawn(

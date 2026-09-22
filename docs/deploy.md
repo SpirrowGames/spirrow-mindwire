@@ -87,6 +87,47 @@ Copy `deploy/mindwire.toml.example` to `<data_dir>/config/mindwire.toml` and fil
 own **clone** — not a linked worktree). `[conductor].roster` maps chatroom personas to roles and
 `naysayer_identity` must map to the `naysayer` role.
 
+### Choosing the role sessions' model (`[loop].role_model` / `[loop].role_cli_path`)
+
+Both default to unset, which is the behaviour every deploy had before they existed: the proposer and
+the implementer run the CLI vendored inside `claude-agent-sdk`, on that CLI's default model.
+
+`role_model` on its own is valid whenever the model is one the vendored CLI already supports —
+naming `haiku` is a cost lever that needs no binary change, and nothing enforces a pairing that would
+forbid it. What needs **both** is reaching a model *newer* than the vendored CLI, because there the
+refusal comes from the API rather than the SDK: the symptom is a per-turn 400 that names a version,
+not a startup error.
+
+```
+API Error: 400 Claude Code 2.1.133 does not support this model; version 2.1.280 or newer is required.
+```
+
+The SDK prefers its vendored binary over anything on `PATH`, and the newest CLI reachable under this
+repo's `claude-agent-sdk>=0.1.0,<0.2` pin is 2.1.139 — so reaching a newer model means pointing
+`role_cli_path` at a CLI installed on the host:
+
+```toml
+[loop]
+role_model = "claude-opus-5-5"
+role_cli_path = "C:/Users/<you>/.local/bin/claude.exe"
+```
+
+A `role_cli_path` that is not a file, or is not executable, stops the daemon at startup with a named
+error rather than failing once per five-minute tick. It is resolved to an absolute path there too —
+a relative one would be read against the daemon's working directory by that check and against the
+session's `cwd` by the SDK, which are not the same directory.
+
+Two things to know before setting them:
+
+- **The CLI version stops being pinned by the lockfile.** Claude Code updates itself in place, so
+  the binary a role session runs can change with no deploy and no diff. That is the cost of the
+  override; leaving both unset keeps the vendored, locked binary.
+- **Neither reaches the design-time naysayer, and neither may.** Its independence *is* its Lexora
+  tier (ADR-05 §5), and a newer CLI breaks that route outright — measured 2026-09-23, same host and
+  options, only the binary differing: vendored 2.1.133 returns the reply, 2.1.280 returns
+  `422 body.messages[1].role: expected 'user' or 'assistant', got 'system'`. The naysayer adapter
+  therefore has no `cli_path` parameter at all; see `adapters/_cli_selection.py`.
+
 ## Target-repo branch flow (V-4, 2026-08-02)
 
 The dogfooding target (spirrow-voxelworld, renamed from `Spirrow-VoxelWorld` on 2026-09-11) switched

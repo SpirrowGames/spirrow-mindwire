@@ -323,7 +323,50 @@ class Stage3LoopConfig(_StrictModel):
     process that only reads other settings is unaffected.
     """
 
+    role_model: str | None = None
+    """Model the proposer + implementer sessions run on; ``None`` = the CLI's default.
+
+    An alias (``opus`` / ``sonnet`` / ``haiku``) or a full model id
+    (``claude-opus-5-5``). It reaches exactly the two roles that route inference
+    to Anthropic. The design-time naysayer is **not** covered and must not be:
+    its model is the Lexora ``naysayer`` tier, which is what makes the review
+    leg a different distribution from the proposer it reviews (ADR-05 §5), so it
+    is decided in ``naysayer.principles``, not here.
+
+    A model newer than the bundled CLI is rejected by the API rather than by the
+    SDK, so this usually has to be set together with :attr:`role_cli_path` —
+    ``adapters/_cli_selection`` has the measured versions and the failure text.
+    """
+
+    role_cli_path: Path | None = None
+    """Claude Code executable the proposer + implementer sessions run on.
+
+    ``None`` (the default) uses the CLI vendored inside ``claude-agent-sdk``,
+    which is what every session used before this setting existed. Set it to
+    reach a model the vendored CLI is too old for — but note that it points at a
+    binary this repo does not pin, and Claude Code updates itself in place, so
+    the version a role session runs can change with no deploy and no diff.
+
+    Deliberately does not reach the naysayer: a newer CLI breaks its
+    Lexora-gateway route outright (HTTP 422). See ``adapters/_cli_selection``.
+    """
+
     watches: tuple[LoopWatchConfig, ...] = ()
+
+    @field_validator("role_model", "role_cli_path", mode="before")
+    @classmethod
+    def _blank_means_unset(cls, v: object) -> object:
+        """Treat an empty / whitespace-only value as "not configured".
+
+        These are routinely cleared by blanking the env var
+        (``MINDWIRE_LOOP__ROLE_MODEL=``) rather than unsetting it. Without this,
+        ``role_model`` would send ``--model ""`` and ``role_cli_path`` would
+        coerce to ``Path(".")`` — a directory offered to the SDK as an
+        executable — which are two confusing failures for one obvious intent.
+        """
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
 
 class ConductorConfig(_StrictModel):

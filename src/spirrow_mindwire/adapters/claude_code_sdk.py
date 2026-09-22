@@ -68,6 +68,7 @@ from ..value_objects import (
     SessionState,
     ThreadRef,
 )
+from ._cli_selection import cli_selection_kwargs
 from ._sdk_result import (
     SdkIsErrorSignal,
     capture_is_error_detail,
@@ -378,11 +379,19 @@ class ClaudeCodeSdkAdapter:
         can_use_tool: Any | None = None,
         allowed_tools: list[str] | None = None,
         mcp_servers: dict[str, Any] | None = None,
+        model: str | None = None,
+        cli_path: str | Path | None = None,
         client_factory: Callable[[Any], _SdkClient] | None = None,
     ) -> None:
         self._cwd = cwd
         self._system_prompt = system_prompt
         self._builtin_tools = list(builtin_tools)
+        # Both default to None = the SDK's own choice (its bundled CLI, that CLI's
+        # default model), which is what every session ran on before these existed.
+        # They travel together on purpose — see ``_cli_selection`` for why naming a
+        # model usually forces naming a binary, and why the naysayer has neither.
+        self._model = model
+        self._cli_path = cli_path
         # Injected, never inferred. Exposing built-ins does not tell this class
         # WHICH bound applies — a filesystem scope is right for a role that only
         # reads the tree, and wrong for anything reaching an MCP tool whose
@@ -418,6 +427,9 @@ class ClaudeCodeSdkAdapter:
             # Host settings / MCP config stay out; see ``_session_isolation`` for
             # what that prevents and what it cost to learn.
             **session_isolation_kwargs(),
+            # Model / CLI binary, omitted entirely when the composition root chose
+            # neither (see ``_cli_selection``).
+            **cli_selection_kwargs(model=self._model, cli_path=self._cli_path),
         )
         try:
             client = self._client_factory(options)

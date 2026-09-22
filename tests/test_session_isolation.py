@@ -45,6 +45,11 @@ _NOT_SDK_BACKED: dict[str, str] = {
     "__init__.py": "package marker; defines no adapter",
     "_sdk_result.py": "parses an SDK result object; spawns nothing",
     "_session_isolation.py": "this module IS the policy",
+    "_cli_selection.py": (
+        "builds the model / cli_path kwargs for an adapter to splat; constructs "
+        "no ClaudeAgentOptions and spawns nothing — isolation is applied by the "
+        "adapter that USES it, next to its own session_isolation_kwargs() call"
+    ),
     "_sdk_job_hook.py": (
         "SDK-adjacent process-lifecycle hook (Windows Job Objects); wraps the "
         "SDK's transport but builds no ClaudeAgentOptions of its own — "
