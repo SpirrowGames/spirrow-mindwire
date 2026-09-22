@@ -419,18 +419,43 @@ def _resolve_role_cli_path_or_exit(configured: Path | None) -> Path | None:
     path would otherwise surface as a per-tick spawn failure — the shape an
     operator reads as "the loop is broken" rather than "one setting is wrong".
 
-    Existence is all that is checked. Whether the binary is new enough for
-    ``role_model`` is not knowable from here without running it, and the API
-    says so precisely when it is not (``adapters/_cli_selection``).
+    The path is made **absolute** before it goes anywhere, because a relative
+    one is read against two different base directories by the two things that
+    consume it: this check runs in the daemon's working directory, while the SDK
+    hands the string to the OS with the session's ``cwd`` (``[loop].repo_dir``)
+    in play. A relative value could therefore pass here and fail at every spawn,
+    or — worse — resolve to a different binary than the one that was checked.
+    Resolving once, at the point the operator's string enters the program,
+    removes the question rather than answering it per consumer. It also keeps
+    the implementer's leftover belt on a real absolute path, which is the form
+    it matches most precisely (``adapters/_sdk_job_hook`` falls back to a
+    basename comparison for anything else).
+
+    Existence and the executable bit are all that is checked. Whether the binary
+    is new enough for ``role_model`` is not knowable from here without running
+    it, and the API says so precisely when it is not
+    (``adapters/_cli_selection``).
     """
     if configured is None:
         return None
-    path = Path(configured).expanduser()
+    path = Path(configured).expanduser().resolve()
     if not path.is_file():
         raise SystemExit(
             f"loop.role_cli_path does not point at a file: {path} — set "
             "[loop].role_cli_path (or MINDWIRE_LOOP__ROLE_CLI_PATH) to the Claude Code "
             "executable the proposer/implementer sessions should run, or leave it unset "
+            "to use the CLI vendored in claude-agent-sdk"
+        )
+    # A file that exists but cannot be executed fails at spawn, once per sweep
+    # tick — the shape this guard exists to convert into one startup error. The
+    # check is a no-op on Windows (``os.access`` reports X_OK for any readable
+    # file there), so it buys nothing on the current loop host and everything on
+    # a POSIX one; it is here because the cost of being wrong is asymmetric.
+    if not os.access(path, os.X_OK):
+        raise SystemExit(
+            f"loop.role_cli_path is not executable: {path} — the daemon would spawn it "
+            "once per tick and fail each time; fix the file's permissions, point "
+            "[loop].role_cli_path at the real Claude Code executable, or leave it unset "
             "to use the CLI vendored in claude-agent-sdk"
         )
     return path

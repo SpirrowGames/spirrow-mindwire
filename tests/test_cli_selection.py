@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 from pathlib import Path
 from typing import Any
 
@@ -317,9 +318,9 @@ def test_the_composition_root_routes_config_to_the_two_anthropic_roles(tmp_path:
     naysayer = registry.qualified_for(Role.NAYSAYER)[0]
 
     assert proposer._model == "claude-opus-5-5"  # type: ignore[attr-defined]
-    assert proposer._cli_path == cli  # type: ignore[attr-defined]
+    assert proposer._cli_path == cli.resolve()  # type: ignore[attr-defined]
     assert implementer._model == "claude-opus-5-5"  # type: ignore[attr-defined]
-    assert implementer._cli_path == cli  # type: ignore[attr-defined]
+    assert implementer._cli_path == cli.resolve()  # type: ignore[attr-defined]
     # Not "the naysayer got None" — it has nowhere to put one, and its model is
     # the tier that makes it a different distribution from the two above.
     assert not hasattr(naysayer, "_cli_path")
@@ -341,7 +342,41 @@ def test_a_directory_is_not_an_executable(tmp_path: Path) -> None:
 def test_a_real_binary_passes_through(tmp_path: Path) -> None:
     cli = tmp_path / "claude.exe"
     cli.write_text("", encoding="utf-8")
-    assert _resolve_role_cli_path_or_exit(cli) == cli
+    assert _resolve_role_cli_path_or_exit(cli) == cli.resolve()
+
+
+def test_a_relative_setting_is_made_absolute_before_it_goes_anywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two consumers read a relative path against two different base directories.
+
+    This check runs in the daemon's working directory; the SDK hands the string
+    to the OS with the session's own ``cwd`` in play. Resolved here, neither can
+    disagree about which file was meant — and the implementer's leftover belt
+    gets the absolute form it matches most precisely rather than the basename
+    fallback it keeps for degenerate targets.
+    """
+    cli = tmp_path / "claude.exe"
+    cli.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    resolved = _resolve_role_cli_path_or_exit(Path("claude.exe"))
+
+    assert resolved is not None
+    assert resolved.is_absolute()
+    assert resolved == cli.resolve()
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX-only: Windows reports X_OK for any readable file"
+)
+def test_a_file_that_cannot_be_executed_stops_the_daemon(tmp_path: Path) -> None:
+    """Exists but unrunnable is the same per-tick spawn failure, one step later."""
+    cli = tmp_path / "claude.exe"
+    cli.write_text("", encoding="utf-8")
+    cli.chmod(0o644)
+    with pytest.raises(SystemExit, match="not executable"):
+        _resolve_role_cli_path_or_exit(cli)
 
 
 def test_unset_stays_unset() -> None:

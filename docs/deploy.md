@@ -109,8 +109,10 @@ role_model = "claude-opus-5-5"
 role_cli_path = "C:/Users/<you>/.local/bin/claude.exe"
 ```
 
-A `role_cli_path` that is not a file stops the daemon at startup with a named error, rather than
-failing once per five-minute tick.
+A `role_cli_path` that is not a file, or is not executable, stops the daemon at startup with a named
+error rather than failing once per five-minute tick. It is resolved to an absolute path there too —
+a relative one would be read against the daemon's working directory by that check and against the
+session's `cwd` by the SDK, which are not the same directory.
 
 Two things to know before setting them:
 
