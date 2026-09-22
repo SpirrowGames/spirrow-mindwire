@@ -1,6 +1,6 @@
 # Decider — Conductor 停止判定への判断フック（設計書 v3.4）
 
-版: **3.4** / 2026-09-21 / 起票: Fermi（Cowork セッション, 2026-09-18）/ 設計 SOT: chatroom `spirrow-mindwire/T-decider-conductor-hook` / v3 差分: Bohr msg-3818 / v3.1: Bohr msg-3820 / v3.2: Bohr msg-3822 / v3.3: Bohr msg-3824 / v3.4: Bohr msg-3826 / 独立 naysayer レビュー: Einstein msg-3819 → msg-3821 → msg-3823 → msg-3825 → msg-3827 (APPROVE) / **Tier-C 承認**: Takahito 2026-09-21（"Approve v3.4 for implementation with bounce activation gated by planned evaluation phases"）/ PR #326 round-3 PR-gate ADVISORY structure（sequential mutation overlap + Tier-C threshold config omission）を Takahito 2026-09-21（"Address both structural advisories before merging the design documentation"）で本 PR にて修正（D21 追加 + `[decider.thresholds]` に Tier-C 閾値追加）
+版: **3.4** / 2026-09-21 / 起票: Fermi（Cowork セッション, 2026-09-18）/ 設計 SOT: chatroom `spirrow-mindwire/T-decider-conductor-hook` / v3 差分: Bohr msg-3818 / v3.1: Bohr msg-3820 / v3.2: Bohr msg-3822 / v3.3: Bohr msg-3824 / v3.4: Bohr msg-3826 / 独立 naysayer レビュー: Einstein msg-3819 → msg-3821 → msg-3823 → msg-3825 → msg-3827 (APPROVE) / **Tier-C 承認**: Takahito 2026-09-21（"Approve v3.4 for implementation with bounce activation gated by planned evaluation phases"）/ PR #326 round-3 PR-gate ADVISORY structure（sequential mutation overlap + Tier-C threshold config omission）を Takahito 2026-09-21（"Address both structural advisories before merging the design documentation"）で本 PR にて修正（D21 追加 + `[decider.thresholds]` に Tier-C 閾値追加）/ step 1 実装 PR: `[decider.tierc].mode` に `shadow` 4 値目追加（§3.4 / §5、Fermi msg-4066/4067 DECIDED #1）— Track B 未実装のまま Tier-C を lexora 待ちで先行走行させるための log-only モード（D2 単調性保存、D12 と semantic parity）
 
 対象リポジトリ: spirrow-mindwire（本 repo — Conductor / adapter / state builder / replay）、spirrow-lexora（`/v1/decide` エンドポイント側、本設計の前提）。
 
@@ -180,11 +180,11 @@ spurious_min     = 0.55        # max(spurious) >= spurious_min かつ genuine < 
 genuine_max      = 0.40        # LIKELY_NOT 判定に必要な genuine 上限（これ以上は CONFIRMED 側寄り ∴ LIKELY_NOT にしない）
 
 [decider.tierc]
-mode = "off"                   # off | annotate | bounce
+mode = "off"                   # off | shadow | annotate | bounce
 skip_naysayer_when_confirmed = false
 ```
 
-`naysayer_gating` の shadow（compute + LOG, don't act）と同じ意味論。
+`naysayer_gating` の shadow（compute + LOG, don't act）と同じ意味論。 `[decider.tierc].mode = "shadow"` は Fermi msg-4066/4067 DECIDED #1 で追加された 4 番目の値で、§3.3.b の grey-zone gating → `evaluate_tierc` → `log_decision` まで走らせ annotation / bounce は一切しない (D2 単調性を破らない — D12 の一般フック shadow と semantic parity)。 既定 `off` は既存 TOML と後方互換 (3 値時代の config が bump 無しで読める)。 目的は lexora `T-decide-jev-provider` main 着地後の Tier-C 先行走行 (§8 実装順の並べ替え)。
 
 **閾値の初期値**は暫定であり、§10 Open questions の通り shadow データで較正する（Track B は 1〜2 週、Tier-C は §6.2 A-post + live shadow の n が数十件貯まった時点）。genuine 系は sum、spurious 系は max で合成されるため（§4.4）、初期値は「genuine 3 問中 2 問が中程度の positive」「spurious 3 問中 1 問が強く positive」を境界に置く暫定値。
 
@@ -280,9 +280,11 @@ Conductor は human に上げる前に呼び出し元 agent へ **1 回だけ**�
 
 `NEXT: human` が出たとき、本当に Tier-C たり得るかを一次判定する。**admission-gate が入った後の世界では、Decider の役割は「著者が名指したラベルは本当か」に変わる**（msg-3818 §1）。
 
-段階（Tier-C mode: `off → annotate → bounce`）:
+段階（Tier-C mode: `off → shadow → annotate → bounce`）:
 
-- **入場条件（両モード共通）**: `original_stop == HUMAN`（D21 snapshot 基準、§3.3.a と共有）かつ `gate_result.kind ∈ {ADMIT_UNSURE, second_time_force_admit}` (D18)。admission-gate ADMIT (with a valid label) の場合、Decider は問いを渡さず（4.1 が `merge-protected` の genuine 語彙を持たないため誤 bounce の risk）、admission-gate の判定をそのまま人へ届ける。
+- **入場条件（全モード共通）**: `original_stop == HUMAN`（D21 snapshot 基準、§3.3.a と共有）かつ `gate_result.kind ∈ {ADMIT_UNSURE, second_time_force_admit}` (D18)。admission-gate ADMIT (with a valid label) の場合、Decider は問いを渡さず（4.1 が `merge-protected` の genuine 語彙を持たないため誤 bounce の risk）、admission-gate の判定をそのまま人へ届ける。
+- **shadow**: grey-zone gating → `evaluate_tierc` → `log_decision` まで走らせ、annotation / bounce は一切しない (D2 単調性を破らない — D12 の一般フック shadow と semantic parity)。 目的は lexora `T-decide-jev-provider` main 着地後の A-post replay + live shadow JSONL 蓄積 (§8 step 3 の Tier-C 先行走行、Fermi msg-4066/4067 DECIDED #1)。 Takahito 承認不要（実動作を変えないため）。 shadow 中も §6.3 の評価集計に流し込む点で annotate / bounce の前段。
+  - shadow 段階では **ADMIT (有効ラベル付き) ターンの問いログも scope=out_of_gate として残す** (Fermi DECIDED #3) — verdict 合成 (annotate / bounce の判断) には流さず (D18 invariant を維持)、§6.3 の集計で in_gate / out_of_gate を絶対に合算しない。 目的: A-post の n 不足 (§6.2) への対処 — ADMIT ターンで Jev が LIKELY_NOT を出す率 ≈ 誤 bounce リスクの実測値そのもの ∴ bounce 投入判断の材料。 shadow のみ ∴ 誤 bounce リスクは発生しない。
 - **annotate**: escalation は従来通り人へ届く。通知に `Jev: likely not Tier-C (p) — <根拠>` を 1 行付けるだけ。実力未知数の間はここまで。
   - 入場条件: 見逃し 0 件制約（§6-C 制約 1）を live shadow で満たしたとき。
   - annotate 文言の `likely not Tier-C (p)` は confidence が較正済みレンジのときだけ出し、それ以外は無表示。
