@@ -114,17 +114,25 @@ class TierCThresholds:
     spurious_min: float = DEFAULT_SPURIOUS_MIN
 
     def __post_init__(self) -> None:
+        # genuine は 3 問の和 (§4.4) ∴ 論理上限は 3.0。
+        # spurious は 3 問の max (§4.4) ∴ 論理上限は 1.0 —
+        # ここを 3.0 で緩めると spurious_min > 1.0 が silently 受理され
+        # LIKELY_NOT が到達不能になる (PR #337 pr-gate BLOCKING correctness)。
         for name, value in (
             ("genuine_min", self.genuine_min),
             ("genuine_max", self.genuine_max),
-            ("spurious_min", self.spurious_min),
         ):
             if not 0.0 <= value <= 3.0:
-                # 3 値問いを 3 つ和で合成する ∴ 上限は 3.0。 各値 [0, 1] 想定。
                 raise ValueError(
                     f"{name}={value} must be within [0.0, 3.0] "
-                    "(genuine=sum of 3 noul values in [0, 1], spurious=max of 3)"
+                    "(genuine=sum of 3 noul values each in [0, 1])"
                 )
+        if not 0.0 <= self.spurious_min <= 1.0:
+            raise ValueError(
+                f"spurious_min={self.spurious_min} must be within [0.0, 1.0] "
+                "(spurious=max of 3 noul values each in [0, 1]; "
+                "a value > 1.0 makes LIKELY_NOT structurally unreachable)"
+            )
 
 
 @dataclass(frozen=True)

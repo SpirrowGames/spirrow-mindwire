@@ -417,9 +417,14 @@ class DeciderThresholdsConfig(_StrictModel):
     min_confidence: float = Field(default=0.60, ge=0.0, le=1.0)
 
     # Tier-C 3 値 (§3.4 [decider.thresholds] + verdict.py のヘルパと対応)。
+    # genuine 系: 3 問の和 (§4.4) ∴ 論理上限 3.0。
+    # spurious 系: 3 問の max (§4.4) ∴ 論理上限 1.0 — le=3.0 で受理すると
+    # spurious_min > 1.0 が silently 通り LIKELY_NOT が到達不能になる
+    # (PR #337 pr-gate BLOCKING correctness)。TierCThresholds の
+    # __post_init__ と bound を揃える。
     tierc_genuine_min: float = Field(default=0.60, ge=0.0, le=3.0)
     tierc_genuine_max: float = Field(default=0.40, ge=0.0, le=3.0)
-    tierc_spurious_min: float = Field(default=0.60, ge=0.0, le=3.0)
+    tierc_spurious_min: float = Field(default=0.60, ge=0.0, le=1.0)
 
 
 class DeciderTierCConfig(_StrictModel):

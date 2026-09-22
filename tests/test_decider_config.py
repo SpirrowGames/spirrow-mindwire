@@ -9,8 +9,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
+import pytest
+from pydantic import ValidationError
+
 from spirrow_mindwire.config import (
     DeciderConfig,
+    DeciderThresholdsConfig,
     DeciderTierCConfig,
     MindwireSettings,
     load_settings,
@@ -77,6 +81,34 @@ def test_loading_toml_with_shadow_tierc(tmp_path: Path) -> None:
     )
     settings = load_settings(toml)
     assert settings.decider.tierc.mode == "shadow"
+
+
+def test_tierc_spurious_min_bound_is_zero_to_one() -> None:
+    """spurious 系は 3 問の max (§4.4) ∴ 論理上限は 1.0。
+
+    pydantic Field の上限も TierCThresholds.__post_init__ と揃える必要が
+    ある — 3.0 で緩めると spurious_min > 1.0 が silently 通り、Decider が
+    構造的に LIKELY_NOT を出せない silent-broken config が受理される
+    (PR #337 pr-gate BLOCKING correctness)。
+    """
+    # 1.0 ちょうどは許容 (境界値)。
+    ok = DeciderThresholdsConfig(tierc_spurious_min=1.0)
+    assert ok.tierc_spurious_min == 1.0
+
+    with pytest.raises(ValidationError):
+        DeciderThresholdsConfig(tierc_spurious_min=1.1)
+
+
+def test_tierc_genuine_bounds_are_zero_to_three() -> None:
+    """genuine 系は 3 問の和 (§4.4) ∴ 論理上限は 3.0 — spurious とは
+    独立の上限を持つ (二分された bound の parity テスト)。"""
+    ok = DeciderThresholdsConfig(tierc_genuine_min=3.0, tierc_genuine_max=3.0)
+    assert ok.tierc_genuine_min == 3.0
+
+    with pytest.raises(ValidationError):
+        DeciderThresholdsConfig(tierc_genuine_min=3.1)
+    with pytest.raises(ValidationError):
+        DeciderThresholdsConfig(tierc_genuine_max=3.1)
 
 
 def test_default_active_questions_are_track_b_only() -> None:

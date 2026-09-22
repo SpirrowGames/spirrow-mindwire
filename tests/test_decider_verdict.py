@@ -201,10 +201,35 @@ def test_negative_answer_raises_value_error() -> None:
         evaluate_tierc(bad)
 
 
-def test_thresholds_out_of_range_raise() -> None:
-    """genuine 系は [0, 3]、spurious 系は [0, 1]。 3.0 超えは即 fail。"""
-    with pytest.raises(ValueError):
+def test_thresholds_genuine_bound_is_zero_to_three() -> None:
+    """genuine 系は 3 問の和 (§4.4) ∴ 論理上限は 3.0。3.0 超えは fail。"""
+    with pytest.raises(ValueError, match=r"genuine_min"):
         TierCThresholds(genuine_min=3.1)
+    with pytest.raises(ValueError, match=r"genuine_max"):
+        TierCThresholds(genuine_max=3.1)
+
+
+def test_thresholds_spurious_bound_is_zero_to_one() -> None:
+    """spurious 系は 3 問の max (§4.4) ∴ 論理上限は 1.0。
+
+    spurious_min > 1.0 が受理されると LIKELY_NOT が到達不能になり、
+    Decider が構造的に annotate / bounce を発火できない silent-broken
+    状態になる (PR #337 pr-gate BLOCKING correctness)。 3.0 で緩めた
+    以前の bound は本テストが red で押し戻す。
+    """
+    with pytest.raises(ValueError, match=r"spurious_min"):
+        TierCThresholds(spurious_min=1.1)
+    # 1.0 ちょうどは許容 (spurious 3 問がいずれも 1.0 のときに丁度届く境界)。
+    ok = TierCThresholds(spurious_min=1.0)
+    assert ok.spurious_min == 1.0
+
+
+def test_thresholds_reject_negative_values() -> None:
+    """負値は 3 系全てで fail。"""
+    with pytest.raises(ValueError):
+        TierCThresholds(genuine_min=-0.1)
+    with pytest.raises(ValueError):
+        TierCThresholds(spurious_min=-0.1)
 
 
 # ---------------------------------------------------------------------------
