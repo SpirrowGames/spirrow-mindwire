@@ -237,11 +237,24 @@ async def test_options_route_to_gemini_tier(tmp_path: Path) -> None:
         client_factory=_factory(client, opts),
         preflight=_preflight_ok(),
     )
-    await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    # 1-turn-1-session
+    # (T-naysayer-sdk-session-carries-the-whole-conversation-every-turn): the
+    # client factory is no longer called at spawn — the SDK subprocess is per
+    # turn. The ``ClaudeAgentOptions`` is stored on the session at spawn and
+    # exposed for the harness marker via ``source_marker_options``; reading it
+    # from there pins the wiring without depending on when ``deliver_event``
+    # happens to run.
+    stored_opts = adapter.source_marker_options(handle)
     # Independence: inference is pinned to the Lexora Gemini tier, never api.anthropic.com.
-    assert opts[0].env["ANTHROPIC_BASE_URL"] == _BASE_URL
-    assert opts[0].model == "naysayer"
-    assert "silence is negligence" in opts[0].system_prompt  # principles injected (D-1)
+    assert stored_opts.env["ANTHROPIC_BASE_URL"] == _BASE_URL
+    assert stored_opts.model == "naysayer"
+    assert "silence is negligence" in stored_opts.system_prompt  # principles injected (D-1)
+    # And the SAME options object is handed to the per-turn factory in deliver_event
+    # (nothing is re-built between turns), so the marker and the subprocess cannot
+    # drift from each other.
+    await adapter.deliver_event(handle, _event())
+    assert opts and opts[0] is stored_opts
 
 
 @pytest.mark.anyio
@@ -398,12 +411,17 @@ def _preflight_failing(exc: Exception) -> Callable[[], Any]:
 
 
 @pytest.mark.anyio
-async def test_spawn_runs_the_preflight_and_retains_the_record(tmp_path: Path) -> None:
-    """The record reaches the dispatcher through the ``attestation_record`` getter.
-
-    That getter is the seam P-1 opened (``dispatcher/core.py`` looks it up
-    duck-typed, independently of ``source_marker_options``). Until now no
-    adapter defined it, so the branch was inert; this is what makes it live.
+async def test_spawn_runs_a_dry_run_preflight_and_discards_the_record(
+    tmp_path: Path,
+) -> None:
+    """1-turn-1-session
+    (T-naysayer-sdk-session-carries-the-whole-conversation-every-turn): spawn
+    still probes so an unroutable / mis-credentialed configuration fails at
+    attach time (protects the orchestrator + human from a mysterious
+    first-turn failure), but the observation itself is DISCARDED. Stamping the
+    spawn-time probe onto later posts is exactly the per-process independence
+    claim D-2 rejects. The record only appears once
+    :meth:`deliver_event` runs its own per-verdict preflight.
     """
     calls: list[int] = []
     adapter = NaysayerSdkAdapter(
@@ -414,7 +432,35 @@ async def test_spawn_runs_the_preflight_and_retains_the_record(tmp_path: Path) -
         preflight=_preflight_ok(calls),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    # Dry-run happened (fail-loud at attach time is the whole point of keeping it)…
     assert calls == [1]
+    # …but the record is NOT retained — attestation is per-verdict, not per-process.
+    assert adapter.attestation_record(handle) is None
+
+
+@pytest.mark.anyio
+async def test_per_turn_preflight_populates_the_record_deliver_event_reads(
+    tmp_path: Path,
+) -> None:
+    """The record the dispatcher's ``attestation_record`` reads comes from the
+    per-turn preflight, not the dry-run at spawn.
+
+    The dispatcher looks up ``attestation_record(handle)`` after ``on_reply``
+    (see ``dispatcher/core.py``); ``on_reply`` fires inside ``deliver_event``,
+    which sets ``session.attestation`` at the top of the turn. So even though
+    spawn discards its probe, a naysayer post always carries an ``attest:``
+    line stamped with the CURRENT turn's observation.
+    """
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=_factory(_FakeClient([_assistant("x"), _result()]), []),
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    assert adapter.attestation_record(handle) is None  # dry-run was discarded
+    await adapter.deliver_event(handle, _event())
     record = adapter.attestation_record(handle)
     assert record is not None
     assert record.backend == "gemini"
@@ -480,14 +526,20 @@ async def test_preflight_runs_before_the_sdk_session_is_connected(tmp_path: Path
 
 @pytest.mark.anyio
 async def test_attestation_record_is_none_for_an_unknown_handle(tmp_path: Path) -> None:
+    """Duck-typed getter contract: unknown handle → ``None``, matched-and-attested
+    handle → the current record. Post-deliver_event we know the record is set
+    (per-turn preflight writes it); an unknown handle must never fall through
+    to return someone else's record.
+    """
     adapter = NaysayerSdkAdapter(
         cwd=tmp_path,
         obligations=_OBLIGATIONS,
         inference_base_url=_BASE_URL,
-        client_factory=_factory(_FakeClient([]), []),
+        client_factory=_factory(_FakeClient([_assistant("x"), _result()]), []),
         preflight=_preflight_ok(),
     )
     handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    await adapter.deliver_event(handle, _event())  # populates session.attestation
     other = SessionHandle(
         session_id="01JOTHER",
         instance_id="naysayer-1",
@@ -715,6 +767,326 @@ async def test_spawn_isolates_host_settings_and_mcp_config(tmp_path: Path) -> No
         client_factory=_factory(_FakeClient([_assistant("VERDICT: object."), _result()]), captured),
         preflight=_preflight_ok(),
     )
-    await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
-    assert captured[0].setting_sources == []
-    assert captured[0].strict_mcp_config is True
+    # 1-turn-1-session: the factory is called per turn in ``deliver_event``,
+    # not at spawn. Inspect the stored options directly for the invariant
+    # (options is built at spawn and handed unchanged to every per-turn factory).
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    stored = adapter.source_marker_options(handle)
+    assert stored.setting_sources == []
+    assert stored.strict_mcp_config is True
+
+
+# --------------------------------------------------------------------------- #
+# T-naysayer-sdk-session-carries-the-whole-conversation-every-turn
+#   — 1-turn-1-session lifecycle: per-turn client, shutdown-failure contract
+# --------------------------------------------------------------------------- #
+
+
+class _ShutdownRecordingClient(_FakeClient):
+    """``_FakeClient`` that records interrupt/disconnect calls so tests can
+    assert the per-turn ``try/finally`` actually shuts the client down."""
+
+    def __init__(self, responses: list[Any]) -> None:
+        super().__init__(responses)
+        self.interrupted = 0
+        self.disconnected = 0
+
+    async def interrupt(self) -> None:
+        self.interrupted += 1
+
+    async def disconnect(self) -> None:
+        self.disconnected += 1
+
+
+class _CountingFactory:
+    """Client-factory that returns a fresh :class:`_ShutdownRecordingClient` on
+    every call and records the call count + options each call received."""
+
+    def __init__(self, responses_per_turn: list[list[Any]]) -> None:
+        self._responses_per_turn = list(responses_per_turn)
+        self.calls: list[Any] = []
+        self.clients: list[_ShutdownRecordingClient] = []
+
+    def __call__(self, options: Any) -> _ShutdownRecordingClient:
+        self.calls.append(options)
+        responses = self._responses_per_turn.pop(0)
+        client = _ShutdownRecordingClient(responses)
+        self.clients.append(client)
+        return client
+
+
+@pytest.mark.anyio
+async def test_deliver_event_builds_a_fresh_client_per_turn_and_shuts_it_down(
+    tmp_path: Path,
+) -> None:
+    """Two consecutive turns each build their own subprocess and shut it down.
+
+    This is the whole point of the 1-turn-1-session change: bounding the
+    SDK-side conversation buffer to one turn is what stops the O(n²)
+    input-token growth. Pin it by counting factory calls, then confirm both
+    per-turn clients were fully shut down (interrupt + disconnect on each).
+    """
+    factory = _CountingFactory(
+        [
+            [_assistant("first"), _result()],
+            [_assistant("second"), _result()],
+        ]
+    )
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+    )
+    captured: list[ReplyDraft] = []
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
+    # No client is built at spawn — the per-turn lifecycle is the whole point.
+    assert factory.calls == []
+    await adapter.deliver_event(handle, _event(msg_id="m1"))
+    await adapter.deliver_event(handle, _event(msg_id="m2"))
+    assert len(factory.calls) == 2
+    assert len(captured) == 2
+    for client in factory.clients:
+        # Each per-turn client received ``interrupt`` AND ``disconnect`` from the
+        # try/finally shutdown path — no leaked subprocess between turns.
+        assert client.interrupted == 1
+        assert client.disconnected == 1
+    # The stored options object is handed unchanged to every per-turn factory
+    # call (msg-834 §2 (a) — subprocess and marker cannot drift from each other).
+    assert factory.calls[0] is factory.calls[1]
+
+
+class _RaisingConnectClient(_ShutdownRecordingClient):
+    """SDK client whose ``connect`` raises to exercise partial init safety."""
+
+    async def connect(self) -> None:
+        raise RuntimeError("connect failed")
+
+
+@pytest.mark.anyio
+async def test_partial_init_safe_when_connect_raises(tmp_path: Path) -> None:
+    """AC #2 (msg-4098): ``factory`` / ``connect`` / ``query`` / ``drain`` can each
+    raise; the ``finally`` shutdown must not fall over trying to shut down a
+    partially-initialised client. Regression against
+    ``UnboundLocalError`` on the ``client`` name and against ``AttributeError``
+    from calling ``_shutdown(None)``.
+
+    We assert that the caller gets the wrapped ``NaysayerSdkDeliveryError`` and
+    the session reaches ``FAILED`` — the exact contract of the main ``except``
+    blocks. If ``finally`` swallowed the original with an ``UnboundLocalError``
+    the caller would see the wrong exception instead.
+    """
+    client = _RaisingConnectClient([_assistant("never yielded"), _result()])
+
+    def factory(options: Any) -> _RaisingConnectClient:
+        return client
+
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    with pytest.raises(NaysayerSdkDeliveryError) as excinfo:
+        await adapter.deliver_event(handle, _event())
+    # Original cause preserved (not replaced by an UnboundLocalError):
+    assert "connect failed" in str(excinfo.value)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.delivery_failed"
+
+
+@pytest.mark.anyio
+async def test_partial_init_safe_when_factory_raises(tmp_path: Path) -> None:
+    """AC #2 (msg-4098) — factory side of the same guarantee.
+
+    If the factory itself throws, ``client`` never binds. A naive ``finally``
+    that referred to a bare ``client`` name would ``UnboundLocalError`` here.
+    Assert the original factory error propagates wrapped as a delivery error
+    with the session in ``FAILED``.
+    """
+
+    def factory(options: Any) -> Any:
+        raise RuntimeError("factory blew up")
+
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    with pytest.raises(NaysayerSdkDeliveryError) as excinfo:
+        await adapter.deliver_event(handle, _event())
+    assert "factory blew up" in str(excinfo.value)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+
+
+class _ShutdownFailingClient(_FakeClient):
+    """SDK client whose ``interrupt`` succeeds but ``disconnect`` raises.
+
+    Chosen because ``_shutdown`` calls ``interrupt`` then ``disconnect``; the
+    tested failure mode is "shutdown itself throws after the main body ran",
+    which is what happens when the subprocess died between drain and shutdown
+    or when the pipe was already closed.
+    """
+
+    async def disconnect(self) -> None:
+        raise RuntimeError("disconnect failed")
+
+
+@pytest.mark.anyio
+async def test_shutdown_failure_after_successful_turn_is_propagated(
+    tmp_path: Path,
+) -> None:
+    """AC #5a (msg-4102): on the ``body_success + shutdown fails`` path the
+    caller receives a wrapped :class:`NaysayerSdkDeliveryError` with
+    ``session.state == FAILED`` and ``session.error.code == "adapter.shutdown_failed"``.
+
+    A silent-swallow implementation would let this test pass its ``on_reply``
+    step (the reply was already emitted) and return normally from
+    ``deliver_event``. Fail-loud is the point: an un-shut-down subprocess in
+    the Codex Pro tier burns the 5-hour quota, so a leak must never be
+    hidden.
+    """
+
+    class _RaisingDisconnectFactory:
+        def __init__(self) -> None:
+            self.clients: list[_ShutdownFailingClient] = []
+
+        def __call__(self, options: Any) -> _ShutdownFailingClient:
+            c = _ShutdownFailingClient([_assistant("critique text"), _result()])
+            self.clients.append(c)
+            return c
+
+    factory = _RaisingDisconnectFactory()
+    captured: list[ReplyDraft] = []
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
+    with pytest.raises(NaysayerSdkDeliveryError) as excinfo:
+        await adapter.deliver_event(handle, _event())
+    # The main body (query→drain) DID complete — that is exactly why
+    # ``body_success`` was flipped. But shutdown runs in the main try's
+    # ``finally`` before the separate ``on_reply`` try block, so a shutdown
+    # failure interrupts delivery ahead of the post. That is the confirmed
+    # design (msg-4102): a leaked subprocess is treated as a whole-turn
+    # failure, not a "post the reply anyway" degradation.
+    assert captured == []
+    # Contract match with the main ``except`` blocks:
+    assert "subprocess may have leaked" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert "disconnect failed" in str(excinfo.value.__cause__)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.shutdown_failed"
+    assert "disconnect failed" in hs.error.message
+
+
+class _QueryFailsAndDisconnectFailsClient(_FakeClient):
+    """SDK client where the main path (query) raises AND shutdown (disconnect)
+    also raises. Exercises the ``body_success is False`` branch of the
+    ``finally`` — the ORIGINAL exception must reach the caller, the shutdown
+    failure must be logged only.
+    """
+
+    async def query(self, prompt: str) -> None:
+        raise RuntimeError("query failed")
+
+    async def disconnect(self) -> None:
+        raise RuntimeError("disconnect also failed")
+
+
+@pytest.mark.anyio
+async def test_shutdown_failure_during_error_unwinding_does_not_mask_original(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """AC #5b (msg-4102): when the main path is already raising and shutdown
+    ALSO fails, the caller must receive the ORIGINAL error (not the shutdown
+    error), ``session.error.code`` must reflect the main-path failure (not
+    ``adapter.shutdown_failed``), and the shutdown failure must be recorded in
+    the log — no path is silent.
+
+    A ``raise`` inside a ``finally`` while another exception is propagating
+    replaces the in-flight exception. The intended behaviour is the opposite:
+    the root cause (why the turn failed) is more informative than the fact
+    that cleanup also stumbled. Log-only for the secondary preserves
+    diagnostics without hiding the primary.
+    """
+    client = _QueryFailsAndDisconnectFailsClient([_assistant("never sent"), _result()])
+
+    def factory(options: Any) -> _QueryFailsAndDisconnectFailsClient:
+        return client
+
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    with (
+        caplog.at_level("ERROR", logger="spirrow_mindwire.adapters.naysayer_sdk"),
+        pytest.raises(NaysayerSdkDeliveryError) as excinfo,
+    ):
+        await adapter.deliver_event(handle, _event())
+    # Caller receives the ORIGINAL failure, not the shutdown error:
+    assert "query failed" in str(excinfo.value)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    # Main-path code, NOT ``adapter.shutdown_failed`` — the shutdown failure
+    # must not overwrite the primary diagnosis.
+    assert hs.error.code == "adapter.delivery_failed"
+    # Nothing was silent: the shutdown failure was logged.
+    assert any(
+        "shutdown failed while unwinding another error" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.anyio
+async def test_halt_after_a_successful_turn_needs_no_subprocess(
+    tmp_path: Path,
+) -> None:
+    """``halt`` in the 1-turn-1-session world is a state transition, not a
+    subprocess call. The per-turn ``deliver_event`` already shut its own
+    client down in its ``finally``; ``halt`` racing that would risk a double
+    shutdown, so it deliberately does not touch ``session.client``.
+
+    Assert that after a successful turn, ``halt`` reaches ``HALTED`` without
+    talking to any client. A shutdown-raising client that was already fully
+    cleaned up inside ``deliver_event`` would raise here if ``halt`` still
+    called into it.
+    """
+    factory = _CountingFactory([[_assistant("critique"), _result()]])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    await adapter.deliver_event(handle, _event())
+    await adapter.halt(handle)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.HALTED
+    # Each per-turn client was already fully shut down by deliver_event; halt
+    # must not add a second shutdown.
+    for client in factory.clients:
+        assert client.interrupted == 1
+        assert client.disconnected == 1
