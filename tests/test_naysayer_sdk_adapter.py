@@ -8,8 +8,10 @@ verbatim 5-principles injection (ADR-17 D-1).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,7 @@ from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from spirrow_mindwire.adapters.naysayer_sdk import (
     NaysayerSdkAdapter,
     NaysayerSdkDeliveryError,
+    NaysayerSdkHaltError,
     NaysayerSdkSpawnError,
     build_naysayer_system_prompt,
 )
@@ -1062,15 +1065,13 @@ async def test_shutdown_failure_during_error_unwinding_does_not_mask_original(
 async def test_halt_after_a_successful_turn_needs_no_subprocess(
     tmp_path: Path,
 ) -> None:
-    """``halt`` in the 1-turn-1-session world is a state transition, not a
-    subprocess call. The per-turn ``deliver_event`` already shut its own
-    client down in its ``finally``; ``halt`` racing that would risk a double
-    shutdown, so it deliberately does not touch ``session.client``.
-
-    Assert that after a successful turn, ``halt`` reaches ``HALTED`` without
-    talking to any client. A shutdown-raising client that was already fully
-    cleaned up inside ``deliver_event`` would raise here if ``halt`` still
-    called into it.
+    """Between turns there is no live per-turn client, so ``halt`` reads
+    ``session.client is None`` on its steal-swap and skips shutdown — the
+    turn's ``deliver_event`` finally already owned and disposed of the
+    subprocess. Steal semantics (see ``_Session`` docstring): whichever
+    coroutine reads a non-``None`` client under ``client_lock`` owns the
+    shutdown; the other reads ``None`` and knows the shutdown is not
+    theirs to do. Assert exactly one shutdown per per-turn client.
     """
     factory = _CountingFactory([[_assistant("critique"), _result()]])
     adapter = NaysayerSdkAdapter(
@@ -1090,3 +1091,202 @@ async def test_halt_after_a_successful_turn_needs_no_subprocess(
     for client in factory.clients:
         assert client.interrupted == 1
         assert client.disconnected == 1
+
+
+# --------------------------------------------------------------------------- #
+# PR-gate feedback (PR-338 @ e26288a): halt() must interrupt an in-flight turn.
+# The earlier 1-turn-1-session commit stripped halt of its cancellation power,
+# letting a running subprocess keep burning tokens after halt returned and
+# letting the turn still post its reply. These tests pin the fix.
+# --------------------------------------------------------------------------- #
+
+
+class _MidDrainPausingClient(_ShutdownRecordingClient):
+    """A client that blocks inside ``receive_response`` until an external
+    event is set, letting a test invoke :meth:`halt` while the turn is
+    mid-drain and observe the effect on the subprocess and the reply path.
+
+    ``interrupt`` releases the pause event so a halt-triggered
+    :func:`_shutdown` unblocks the drain rather than deadlocking the
+    ``deliver_event`` task — this matches the real SDK contract that
+    ``interrupt`` causes any pending ``receive_response`` to unwind.
+    """
+
+    def __init__(self, responses: list[Any]) -> None:
+        super().__init__(responses)
+        self.mid_drain = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def receive_response(self) -> AsyncIterator[Any]:
+        self.mid_drain.set()
+        await self.release.wait()
+        for msg in self._responses:
+            yield msg
+
+    async def interrupt(self) -> None:
+        await super().interrupt()
+        # Real ClaudeSDKClient.interrupt unblocks the pending
+        # receive_response; simulate that so the deliver_event task can
+        # unwind after halt cancels the turn.
+        self.release.set()
+
+
+@pytest.mark.anyio
+async def test_halt_during_a_running_turn_actively_shuts_down_the_subprocess(
+    tmp_path: Path,
+) -> None:
+    """PR-gate blocking (PR-338 @ e26288a): if ``halt`` is called while
+    ``deliver_event`` is mid-drain, the running per-turn subprocess must
+    actually be interrupted+disconnected — flipping ``state = HALTED``
+    while leaving the client alive was the regression.
+
+    The pausing client parks the drain until an external signal; the test
+    calls ``halt`` while the drain is parked; ``halt`` must steal the
+    client, call ``interrupt`` (which the fake uses to unblock the drain)
+    and ``disconnect``, and reach ``HALTED``.
+    """
+    client = _MidDrainPausingClient([_assistant("critique"), _result()])
+
+    def factory(options: Any) -> _MidDrainPausingClient:
+        return client
+
+    captured: list[ReplyDraft] = []
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
+
+    deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    # Wait until deliver_event is parked inside receive_response — that is
+    # the state the pr-gate cared about (subprocess live, not between turns).
+    await asyncio.wait_for(client.mid_drain.wait(), timeout=2.0)
+
+    await adapter.halt(handle)
+
+    # halt owned the swap and drove interrupt+disconnect on the live client.
+    assert client.interrupted == 1
+    assert client.disconnected == 1
+
+    # deliver_event must unwind and NOT post the reply — a halted turn is
+    # not the naysayer's to speak. It may either return silently (drain
+    # completed after the interrupt) or raise (halted mid-drain), but
+    # either way ``on_reply`` was not called.
+    with contextlib.suppress(NaysayerSdkDeliveryError):
+        await asyncio.wait_for(deliver_task, timeout=2.0)
+    assert captured == []
+
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.HALTED
+
+
+@pytest.mark.anyio
+async def test_halt_during_a_running_turn_is_exactly_one_shutdown(
+    tmp_path: Path,
+) -> None:
+    """Steal semantics: the read-and-swap under ``client_lock`` guarantees
+    that exactly one coroutine (halt or deliver_event's finally) calls
+    ``_shutdown`` on the per-turn client — no double-shutdown even when
+    halt races with the drain.
+
+    Concretely: after both ``halt`` returns and the ``deliver_event`` task
+    finishes, ``interrupted`` and ``disconnected`` are each exactly 1.
+    """
+    client = _MidDrainPausingClient([_assistant("critique"), _result()])
+
+    def factory(options: Any) -> _MidDrainPausingClient:
+        return client
+
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await asyncio.wait_for(client.mid_drain.wait(), timeout=2.0)
+    await adapter.halt(handle)
+    with contextlib.suppress(NaysayerSdkDeliveryError):
+        await asyncio.wait_for(deliver_task, timeout=2.0)
+    assert client.interrupted == 1
+    assert client.disconnected == 1
+
+
+class _HangingShutdownClient(_ShutdownRecordingClient):
+    """Client that never returns from ``disconnect``, so halt's grace
+    timeout is the only thing that gets us out."""
+
+    async def disconnect(self) -> None:
+        await asyncio.Event().wait()  # never set
+
+
+@pytest.mark.anyio
+async def test_halt_grace_timeout_fires_halt_failed(tmp_path: Path) -> None:
+    """The pre-existing halt contract (before the 1-turn-1-session change)
+    honoured ``grace`` via :func:`asyncio.wait_for` and raised
+    :class:`NaysayerSdkHaltError` with ``session.error.code =
+    "adapter.halt_failed"`` on timeout. Restore that guarantee now that
+    ``halt`` runs shutdown again.
+    """
+    client = _MidDrainPausingClient([_assistant("critique"), _result()])
+
+    # Swap disconnect for the hanging variant on this one instance.
+    async def _hanging_disconnect() -> None:
+        await asyncio.Event().wait()
+
+    client.disconnect = _hanging_disconnect  # type: ignore[method-assign]
+
+    def factory(options: Any) -> _MidDrainPausingClient:
+        return client
+
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await asyncio.wait_for(client.mid_drain.wait(), timeout=2.0)
+    with pytest.raises(NaysayerSdkHaltError):
+        await adapter.halt(handle, grace=timedelta(milliseconds=50))
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.FAILED
+    assert hs.error is not None
+    assert hs.error.code == "adapter.halt_failed"
+    # Unblock the paused drain so the deliver task can finish; halt already
+    # called interrupt so release is set, but be defensive.
+    client.release.set()
+    with contextlib.suppress(NaysayerSdkDeliveryError):
+        await asyncio.wait_for(deliver_task, timeout=2.0)
+
+
+@pytest.mark.anyio
+async def test_halt_between_turns_is_a_pure_state_transition(
+    tmp_path: Path,
+) -> None:
+    """When no turn is in flight, ``session.client`` is ``None``; halt reads
+    that under the swap lock and skips shutdown entirely — no factory call,
+    no subprocess touched. State advances IDLE → HALTED directly.
+    """
+    factory = _CountingFactory([[_assistant("critique"), _result()]])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    # No deliver_event has run — session.client is None from spawn.
+    await adapter.halt(handle)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.HALTED
+    # halt did not construct any client.
+    assert factory.calls == []

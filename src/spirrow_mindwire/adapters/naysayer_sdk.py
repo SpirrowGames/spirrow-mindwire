@@ -68,6 +68,7 @@ the two accounts are complementary, not duplicative.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -191,13 +192,14 @@ class _Session:
 
     **1-turn-1-session lifecycle**
     (T-naysayer-sdk-session-carries-the-whole-conversation-every-turn):
-    ``client`` is intentionally ``None`` here and stays ``None`` between
-    turns. A fresh :class:`_SdkClient` (real subprocess in production) is
-    constructed inside :meth:`NaysayerSdkAdapter.deliver_event`, drained,
-    and shut down in the same call. The SDK subprocess never outlives one
-    turn, so it cannot accumulate conversation history in the SDK's own
-    session buffer — the O(n²) input growth that motivated this design
-    lived exactly in that buffer.
+    ``client`` is ``None`` *between* turns; a fresh :class:`_SdkClient`
+    (real subprocess in production) is constructed inside
+    :meth:`NaysayerSdkAdapter.deliver_event`, published to this field
+    under :attr:`client_lock`, and cleared to ``None`` again in the
+    same call's ``finally`` block. The SDK subprocess never outlives
+    one turn, so it cannot accumulate conversation history in the SDK's
+    own session buffer — the O(n²) input growth that motivated this
+    design lived exactly in that buffer.
 
     Consequence for future tool/MCP use: because each turn gets a fresh
     subprocess, the SDK session never carries tool-execution memory
@@ -208,13 +210,31 @@ class _Session:
     property in exchange for cross-turn tool memory is a real trade the
     caller must state — the docstring exists so the trade is not made
     silently by "just holding the client open".
+
+    **Halt-during-turn concurrency** (PR-gate feedback, pr-review pass on
+    PR-338 @ e26288a — "``halt`` no longer interrupts active generations"):
+    :meth:`NaysayerSdkAdapter.halt` must be able to interrupt a running
+    per-turn client, not just flip a state flag while the subprocess
+    keeps burning tokens. The publication is therefore *stealable* under
+    :attr:`client_lock`: whichever coroutine (halt or deliver_event's
+    finally) reads ``client`` and swaps it to ``None`` under the lock
+    *owns* the shutdown of that client. The other coroutine finds
+    ``None`` and knows there is nothing left to shut down, so the two
+    paths cannot double-shutdown the same subprocess.
     """
 
-    # ``None`` between turns; the per-turn client (see class docstring) is
-    # created and torn down inside :meth:`deliver_event`. Kept on the record
-    # only for symmetry with the older shape — nothing writes to this field
-    # under the current design.
+    # The live per-turn SDK client. ``None`` between turns AND after the
+    # owner-swap in :meth:`deliver_event`'s ``finally`` / :meth:`halt`.
+    # Read-and-swap under :attr:`client_lock` — see class docstring for the
+    # steal-semantics contract with :meth:`NaysayerSdkAdapter.halt`.
     client: _SdkClient | None
+    # Serialises the owner-swap on :attr:`client` between :meth:`deliver_event`'s
+    # ``finally`` block and :meth:`NaysayerSdkAdapter.halt`. The lock only
+    # covers the swap itself — the actual ``_shutdown`` runs *outside* the
+    # lock so a slow ``interrupt``/``disconnect`` never blocks the other
+    # party's swap read (which is what would let a second shutdown attempt
+    # sneak in against a half-torn-down subprocess).
+    client_lock: asyncio.Lock
     ctx: SpawnContext
     own_role: Role
     state: SessionState
@@ -557,6 +577,12 @@ class NaysayerSdkAdapter:
         )
         self._sessions[handle] = _Session(
             client=None,  # per-turn: constructed inside deliver_event
+            # Serialises the client-ownership swap between deliver_event's
+            # finally and halt (see _Session docstring). Constructed here so
+            # every path that reaches for it in :meth:`deliver_event` /
+            # :meth:`halt` finds a real lock even on a session that never
+            # runs a turn (halt between spawn and first deliver, etc.).
+            client_lock=asyncio.Lock(),
             ctx=ctx,
             own_role=role,
             state=SessionState.IDLE,
@@ -697,6 +723,17 @@ class NaysayerSdkAdapter:
         # main path was already unwinding (log-only, so the original cause
         # is not hidden).
         #
+        # **Publish under ``client_lock``** (PR-gate feedback on PR-338,
+        # e26288a — "``halt`` no longer interrupts active generations"): the
+        # client is written to ``session.client`` under the lock so
+        # :meth:`halt` can *steal* it and force-shut down a turn that is
+        # currently running. Steal semantics: whichever coroutine reads
+        # ``session.client`` and swaps it to ``None`` under the lock owns
+        # the shutdown. That is what closes the double-shutdown race the
+        # earlier "don't touch session.client from halt" strategy tried to
+        # avoid — cheaply and without stripping halt of its cancellation
+        # power.
+        #
         # Three-way ErrorInfo.code split — same reasoning as
         # ClaudeCodeSdkAdapter.deliver_event (T-sdk-is-error-loses-the-reason
         # D-3(c)): SDK is_error, on_reply raised, and everything else each
@@ -709,37 +746,64 @@ class NaysayerSdkAdapter:
         client: _SdkClient | None = None
         body_success = False
         try:
-            client = self._client_factory(session.options)
+            async with session.client_lock:
+                # If ``halt`` won the race between preflight and here, do not
+                # construct a subprocess we would immediately have to tear
+                # down. Halt has already claimed the session; report that as
+                # a delivery failure and let halt finish its transition to
+                # ``HALTED``.
+                if session.state in _SHUTDOWN_STATES:
+                    raise NaysayerSdkDeliveryError(
+                        f"session {handle.session_id} was halted before its "
+                        f"per-turn client could be published; refusing to spawn "
+                        f"an SDK subprocess for a halted session"
+                    )
+                client = self._client_factory(session.options)
+                session.client = client
             await client.connect()
             await client.query(_build_prompt(event, session.own_role))
             body, result = await _drain_reply(client)
             body_success = True
         except SdkIsErrorSignal as sig:
-            session.state = SessionState.FAILED
-            session.error = ErrorInfo(
-                code="adapter.sdk_is_error",
-                message=str(sig),
-                raised_at=datetime.now(UTC),
-            )
+            # If halt won the race, it has already set state to HALTING and
+            # will move it to HALTED after its own shutdown finishes.
+            # Overwriting state / session.error from here would clobber the
+            # halt path's authoritative diagnosis — halt is the reason the
+            # SDK stream died, not an intrinsic SDK failure.
+            if session.state != SessionState.HALTING:
+                session.state = SessionState.FAILED
+                session.error = ErrorInfo(
+                    code="adapter.sdk_is_error",
+                    message=str(sig),
+                    raised_at=datetime.now(UTC),
+                )
             raise NaysayerSdkDeliveryError(
                 f"deliver_event failed for session {handle.session_id}: {sig}"
             ) from sig
         except Exception as exc:
-            session.state = SessionState.FAILED
-            session.error = ErrorInfo(
-                code="adapter.delivery_failed",
-                message=str(exc),
-                raised_at=datetime.now(UTC),
-            )
+            if session.state != SessionState.HALTING:
+                session.state = SessionState.FAILED
+                session.error = ErrorInfo(
+                    code="adapter.delivery_failed",
+                    message=str(exc),
+                    raised_at=datetime.now(UTC),
+                )
             raise NaysayerSdkDeliveryError(
                 f"deliver_event failed for session {handle.session_id}: {exc}"
             ) from exc
         finally:
-            if client is not None:
+            # Steal the client back from the session under the lock. If halt
+            # already stole it (concurrent :meth:`halt`), ``owned`` is ``None``
+            # here and this coroutine has no shutdown to do; halt owns it.
+            # If halt did not race us, we own the shutdown.
+            async with session.client_lock:
+                owned = session.client
+                session.client = None
+            if owned is not None:
                 try:
-                    await _shutdown(client)
+                    await _shutdown(owned)
                 except Exception as shutdown_exc:
-                    if body_success:
+                    if body_success and session.state != SessionState.HALTING:
                         # Main path completed → no other exception is in flight
                         # → the shutdown failure is the sole anomaly. Match the
                         # main ``except`` contract (state=FAILED, session.error,
@@ -763,19 +827,29 @@ class NaysayerSdkAdapter:
                             f"{handle.session_id} after a successful turn "
                             f"(subprocess may have leaked): {shutdown_exc}"
                         ) from shutdown_exc
-                    # Main path was ALREADY raising when shutdown failed
-                    # (state / session.error / the exception itself are all
-                    # set by the except blocks above). Re-raising the shutdown
-                    # error here would REPLACE the propagating exception — the
-                    # original cause of the turn's failure would be relegated
-                    # to ``__context__`` and callers would receive the shutdown
-                    # failure instead. That masks the root cause, which is the
-                    # opposite of Principle 5. Log-only, and the original
-                    # exception continues propagating.
+                    # Either the main path was ALREADY raising when shutdown
+                    # failed (state / session.error / the exception itself are
+                    # all set by the except blocks above) or halt is authoritative
+                    # (state=HALTING). Re-raising the shutdown error here would
+                    # REPLACE the propagating exception in the first case, and
+                    # would clobber halt's ownership of the session in the
+                    # second. Log-only, and the original failure or halt path
+                    # continues.
                     logger.exception(
                         "naysayer per-turn client shutdown failed while unwinding "
                         "another error; original error will propagate"
                     )
+
+        # halt() may have raced between ``body_success = True`` and here
+        # (its own ``client_lock`` acquisition can interleave with ours in
+        # the ``finally`` above). If it has, halt is authoritative — the
+        # verdict is not the naysayer's to post. Return without calling
+        # ``on_reply`` so a halted turn does not become a stealth post.
+        # PR-gate note (PR-338 @ e26288a): the earlier design flipped
+        # ``state = HALTED`` in halt but let deliver_event drain and post
+        # anyway; this check is what makes that state read authoritative.
+        if session.state in _SHUTDOWN_STATES:
+            return
 
         try:
             await session.ctx.on_reply(
@@ -813,18 +887,68 @@ class NaysayerSdkAdapter:
 
         1-turn-1-session
         (T-naysayer-sdk-session-carries-the-whole-conversation-every-turn):
-        no long-lived SDK subprocess exists between turns, so ``halt`` is
-        primarily a state-machine transition. If a turn is still in flight
-        the per-turn ``deliver_event`` owns the client and its ``finally``
-        block will shut it down; racing that from here would risk a
-        double-shutdown, so we do not touch ``session.client`` at all.
-        ``grace`` is retained for signature compatibility but has nothing
-        to wait on.
+        no long-lived SDK subprocess exists between turns, so a between-turn
+        ``halt`` is a pure state-machine transition.
+
+        **Halt during a live turn** (PR-gate feedback on PR-338 @ e26288a
+        — "``halt`` no longer interrupts active generations"): if a turn
+        is in flight, :meth:`deliver_event` has published its per-turn
+        client to ``session.client`` under :attr:`_Session.client_lock`.
+        Halt steals that client (read-and-swap under the same lock), sets
+        state to ``HALTING`` while holding the lock, then runs
+        :func:`_shutdown` on the stolen client *outside* the lock so a
+        slow ``disconnect`` never blocks ``deliver_event``'s finally from
+        making its own read-and-swap.
+
+        Steal semantics — the read-and-swap under the lock is what makes
+        this safe:
+
+        * If halt reads a non-``None`` client, ``deliver_event``'s finally
+          will subsequently read ``None`` and skip shutdown; halt owns it.
+        * If halt reads ``None`` (``deliver_event``'s finally already ran,
+          or the turn was between events), halt has nothing to shut down;
+          ``deliver_event`` owned it (or nothing did).
+
+        Either way exactly one coroutine calls ``_shutdown`` on any given
+        client. ``deliver_event`` also checks ``session.state`` after its
+        finally and, if halt has flipped it to ``HALTING``/``HALTED``,
+        returns without calling ``on_reply`` — a halted turn does not
+        become a stealth post.
+
+        ``grace`` bounds the shutdown wait; a subprocess that will not
+        interrupt/disconnect within it is reported as ``adapter.halt_failed``
+        and reraised as :class:`NaysayerSdkHaltError`, matching the
+        original halt contract before the 1-turn-1-session change.
         """
-        _ = grace  # kept for interface stability; nothing to wait on here
         session = self._sessions.get(handle)
         if session is None or session.state in _SHUTDOWN_STATES:
             return
+        # Steal the live per-turn client (if any) under the swap lock, and
+        # flip state to HALTING under the SAME lock so a concurrent
+        # ``deliver_event`` sees the transition atomically with the steal.
+        # deliver_event's except blocks check ``state != HALTING`` before
+        # overwriting session.state, so this ordering is what stops halt's
+        # authority from being clobbered by a "the SDK stream died, must be
+        # FAILED" write from the racing deliver.
+        async with session.client_lock:
+            if session.state in _SHUTDOWN_STATES:
+                return  # another halt call won under the lock
+            session.state = SessionState.HALTING
+            owned = session.client
+            session.client = None
+        if owned is not None:
+            try:
+                await asyncio.wait_for(_shutdown(owned), timeout=grace.total_seconds())
+            except Exception as exc:
+                session.state = SessionState.FAILED
+                session.error = ErrorInfo(
+                    code="adapter.halt_failed",
+                    message=str(exc),
+                    raised_at=datetime.now(UTC),
+                )
+                raise NaysayerSdkHaltError(
+                    f"halt failed for session {handle.session_id}: {exc}"
+                ) from exc
         session.state = SessionState.HALTED
 
     async def health(self, handle: SessionHandle) -> HealthStatus:
