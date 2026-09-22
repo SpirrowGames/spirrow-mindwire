@@ -92,8 +92,11 @@ own **clone** — not a linked worktree). `[conductor].roster` maps chatroom per
 Both default to unset, which is the behaviour every deploy had before they existed: the proposer and
 the implementer run the CLI vendored inside `claude-agent-sdk`, on that CLI's default model.
 
-They are set **together** or not at all. A model newer than the vendored CLI is refused by the API,
-not by the SDK, so the symptom is a per-turn 400 that names a version rather than a startup error:
+`role_model` on its own is valid whenever the model is one the vendored CLI already supports —
+naming `haiku` is a cost lever that needs no binary change, and nothing enforces a pairing that would
+forbid it. What needs **both** is reaching a model *newer* than the vendored CLI, because there the
+refusal comes from the API rather than the SDK: the symptom is a per-turn 400 that names a version,
+not a startup error.
 
 ```
 API Error: 400 Claude Code 2.1.133 does not support this model; version 2.1.280 or newer is required.

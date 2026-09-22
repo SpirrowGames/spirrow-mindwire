@@ -27,9 +27,10 @@ project = "spirrow-voxelworld"
 # Claude Code's project-root to the main repo, so fs.write lands outside repo_root and is denied).
 repo_dir = "C:/workspace/sandbox/voxelworld-impl"
 # Model + Claude Code binary for the proposer and implementer sessions. Both default to unset =
-# the CLI vendored in claude-agent-sdk, on its default model. Set them TOGETHER: a model newer than
-# the vendored CLI is refused by the API per turn ("400 … version 2.1.280 or newer is required"),
-# and the newest CLI under this repo's `claude-agent-sdk<0.2` pin is 2.1.139. Neither reaches the
+# the CLI vendored in claude-agent-sdk, on its default model. role_model alone is fine for a model
+# the vendored CLI already supports (e.g. "haiku", a pure cost lever). Reaching a NEWER model needs
+# both: the API refuses it per turn ("400 … version 2.1.280 or newer is required") and the newest
+# CLI under this repo's `claude-agent-sdk<0.2` pin is 2.1.139. Neither reaches the
 # naysayer — a newer CLI breaks its Lexora route (422). See docs/deploy.md and
 # src/spirrow_mindwire/adapters/_cli_selection.py. Note the CLI at role_cli_path self-updates, so it
 # is not pinned by the lockfile.
