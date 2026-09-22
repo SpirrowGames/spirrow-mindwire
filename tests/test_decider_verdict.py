@@ -53,11 +53,28 @@ def _all_answers(
 
 
 def test_genuine_and_spurious_keys_partition_the_six_questions() -> None:
-    """genuine / spurious 集合は空でなく、互いに重ならず、和で 6 問。"""
+    """genuine / spurious 並びは空でなく、互いに重ならず、和で 6 問。"""
     assert TIER_C_GENUINE_KEYS
     assert TIER_C_SPURIOUS_KEYS
-    assert TIER_C_GENUINE_KEYS.isdisjoint(TIER_C_SPURIOUS_KEYS)
+    assert set(TIER_C_GENUINE_KEYS).isdisjoint(set(TIER_C_SPURIOUS_KEYS))
     assert len(TIER_C_GENUINE_KEYS) + len(TIER_C_SPURIOUS_KEYS) == 6
+
+
+def test_tier_c_keys_are_tuples_not_sets() -> None:
+    """PR #337 pr-gate BLOCKING correctness の regression guard。
+
+    key の並びを ``frozenset`` / ``set`` にすると Python の string hash
+    randomization (``PYTHONHASHSEED``) が iterate 順に染み込み、
+    ``fired_reason`` が process ごとに揺れる (§4.5 bounce 入場条件が
+    replay と live で割れる)。 tuple であることを型レベルで固定して
+    おき、うっかり set 系に戻したら本テストが赤で叩き返す。
+
+    (Fermi msg-4087 DECIDED #1 に対する軽量な型保証 — Einstein 助言に
+    従い ``PYTHONHASHSEED`` を弄る subprocess テストは書かず、この 1 行
+    で「hash 依存が構造的に入り込まない」不変条件を守る。)
+    """
+    assert type(TIER_C_GENUINE_KEYS) is tuple
+    assert type(TIER_C_SPURIOUS_KEYS) is tuple
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +156,88 @@ def test_likely_not_boundary_spurious_min_minus_epsilon() -> None:
     answers = _all_answers(answerable_from_thread=0.59)
     verdict = evaluate_tierc(answers)
     assert verdict.kind is TierCVerdictKind.UNSURE
+
+
+# ---------------------------------------------------------------------------
+# spurious tie-break の決定性 (Fermi msg-4087 DECIDED — PR #337 pr-gate BLOCKING)
+# ---------------------------------------------------------------------------
+
+
+def test_spurious_tie_break_answerable_from_thread_loses() -> None:
+    """``answerable_from_thread`` は同点で ``fired_reason`` から降りる。
+
+    §4.5 の bounce 入場条件は ``fired_reason == "answerable_from_thread"``
+    ∴ 同点でこれが選ばれると「同点で bounce 側 (人に届かない側)」が
+    発火する。 D2 単調性の精神で「迷ったら人に届く側」に倒すため、
+    ``answerable_from_thread`` は tie で負ける (Fermi msg-4087 DECIDED #2)。
+
+    LIKELY_NOT は依然として発火するが、 fired_reason は
+    ``answerable_from_thread`` 以外を選ぶ ∴ §4.5 の bounce は起きない —
+    これが「LIKELY_NOT だが bounce の入場条件は同点で満たさない」の
+    正確な意味。
+    """
+    answers = _all_answers(
+        answerable_from_thread=0.7,
+        is_permission_seeking=0.7,  # 同点 — こちらが勝つべき
+    )
+    verdict = evaluate_tierc(answers)
+    assert verdict.kind is TierCVerdictKind.LIKELY_NOT
+    assert verdict.fired_reason == "is_permission_seeking"
+    # bounce 入場条件 (fired_reason == "answerable_from_thread") は満たさない。
+    assert verdict.fired_reason != "answerable_from_thread"
+
+
+def test_spurious_tie_break_three_way_tie_prefers_declaration_order() -> None:
+    """3 問すべて同点 → ``answerable_from_thread`` を除いた宣言順で先の key。
+
+    宣言順は ``TIERC_QUESTIONS_V1`` = ``TIER_C_SPURIOUS_KEYS`` で固定:
+    ``answerable_from_thread`` (idx 0) / ``is_permission_seeking`` (idx 1)
+    / ``is_review_disposition`` (idx 2)。 ``answerable_from_thread`` は
+    tie で負ける (上の invariant) ∴ 残る 2 問のうち宣言順で先の
+    ``is_permission_seeking`` が勝つ。
+    """
+    answers = _all_answers(
+        answerable_from_thread=0.8,
+        is_permission_seeking=0.8,
+        is_review_disposition=0.8,
+    )
+    verdict = evaluate_tierc(answers)
+    assert verdict.kind is TierCVerdictKind.LIKELY_NOT
+    assert verdict.fired_reason == "is_permission_seeking"
+
+
+def test_spurious_tie_break_non_bounce_pair_prefers_declaration_order() -> None:
+    """``answerable_from_thread`` を含まない同点 → 宣言順で先の key。
+
+    ``is_permission_seeking`` (idx 1) と ``is_review_disposition`` (idx 2)
+    の 2 者同点で ``is_permission_seeking`` が勝つ (どちらも
+    ``answerable_from_thread`` ではないので 2 段目の tie-break は同点、
+    3 段目の宣言順で決まる)。
+    """
+    answers = _all_answers(
+        is_permission_seeking=0.75,
+        is_review_disposition=0.75,
+    )
+    verdict = evaluate_tierc(answers)
+    assert verdict.kind is TierCVerdictKind.LIKELY_NOT
+    assert verdict.fired_reason == "is_permission_seeking"
+
+
+def test_spurious_argmax_still_picks_strict_maximum() -> None:
+    """同点ではないケースでは tie-break の余計な倒しは効かない。
+
+    ``answerable_from_thread`` が単独で最大なら普通に ``fired_reason``
+    になる (bounce 入場条件が満たされる、その先の判断は §4.5 の
+    bounce policy 側の責務)。
+    """
+    answers = _all_answers(
+        answerable_from_thread=0.9,  # 単独最大
+        is_permission_seeking=0.7,
+        is_review_disposition=0.6,
+    )
+    verdict = evaluate_tierc(answers)
+    assert verdict.kind is TierCVerdictKind.LIKELY_NOT
+    assert verdict.fired_reason == "answerable_from_thread"
 
 
 # ---------------------------------------------------------------------------

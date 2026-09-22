@@ -59,14 +59,32 @@ DEFAULT_SPURIOUS_MIN: Final[float] = 0.60
 入場条件)。 v3.4 暫定値。"""
 
 
-# 問いセットから自動導出した genuine / spurious key の集合。
-# caller は評価点を dict で渡し、本 module がこの集合で分類する。
-TIER_C_GENUINE_KEYS: frozenset[str] = frozenset(
+# 問いセットから自動導出した genuine / spurious key の並び。
+# caller は評価点を dict で渡し、本 module がこの並びで分類する。
+#
+# **tuple である理由 (Fermi msg-4087 DECIDED)**: frozenset[str] を iterate
+# すると、Python の string hash randomization (PYTHONHASHSEED) が iteration
+# 順に染み込み、``_extract_scores`` が組み立てる dict の insertion 順が
+# process 依存でランダムになる。 spurious の tie-break (§4.4 の
+# ``max(...)``) はその dict の走査順で決まるため、``fired_reason`` が
+# 同じ入力に対して process ごとに変わる — §4.5 で ``fired_reason ==
+# "answerable_from_thread"`` を bounce の入場条件に使っている以上、この
+# 非決定性は replay と live で bounce が割れる致命的な穴だった (PR #337
+# pr-gate BLOCKING correctness)。 tuple は宣言順で iterate される ∴
+# hash 依存が構造的に入り込む余地が無い。
+TIER_C_GENUINE_KEYS: tuple[str, ...] = tuple(
     q.key for q in TIERC_QUESTIONS_V1 if q.kind is TierCQuestionKind.GENUINE
 )
-TIER_C_SPURIOUS_KEYS: frozenset[str] = frozenset(
+TIER_C_SPURIOUS_KEYS: tuple[str, ...] = tuple(
     q.key for q in TIERC_QUESTIONS_V1 if q.kind is TierCQuestionKind.SPURIOUS
 )
+
+# spurious の tie-break で「``answerable_from_thread`` を負ける側に倒す」
+# ためのラベル (Fermi msg-4087 DECIDED #2)。 §4.5 の bounce 入場条件で
+# 特別扱いされる key で、同点時にこれを ``fired_reason`` にしてしまうと
+# 「同点で bounce 側 (人に届かない側)」が発火しうる。 D2 単調性の精神で
+# 「迷ったら人に届く側」に倒すため、この key は tie で負ける。
+_TIER_C_BOUNCE_TRIGGER_SPURIOUS_KEY: Final[str] = "answerable_from_thread"
 
 
 class TierCVerdictKind(StrEnum):
@@ -159,12 +177,17 @@ class TierCVerdict:
     questions_version: str = TIERC_QUESTIONS_VERSION
 
 
-def _extract_scores(answers: Mapping[str, float], keys: frozenset[str]) -> dict[str, float]:
+def _extract_scores(answers: Mapping[str, float], keys: tuple[str, ...]) -> dict[str, float]:
     """``answers`` から ``keys`` に含まれる key を選び、[0, 1] 範囲を検証する。
 
     未回答 key は KeyError で早期に fail (silent drop 禁止)。 範囲外は
     ValueError。 noul answer は「その命題が真である確からしさ」で
     [0, 1] に載る想定 (choice 系は本 module では扱わない)。
+
+    ``keys`` は tuple (宣言順) で受け取る ∴ 返す dict の insertion 順も
+    宣言順で安定する。 spurious の tie-break はこの順序に依存するため、
+    ここに frozenset / set を再導入すると PR #337 pr-gate BLOCKING が
+    再発する。
     """
 
     picked: dict[str, float] = {}
@@ -172,7 +195,7 @@ def _extract_scores(answers: Mapping[str, float], keys: frozenset[str]) -> dict[
         if k not in answers:
             raise KeyError(
                 f"answers missing required Tier-C question key: {k!r} "
-                f"(expected all of: {sorted(keys)})"
+                f"(expected all of: {list(keys)})"
             )
         v = answers[k]
         if not 0.0 <= v <= 1.0:
@@ -182,6 +205,37 @@ def _extract_scores(answers: Mapping[str, float], keys: frozenset[str]) -> dict[
             )
         picked[k] = v
     return picked
+
+
+def _spurious_argmax(spurious_answers: dict[str, float]) -> tuple[str, float]:
+    """spurious の arg-max + score を **決定的な** tie-break で返す。
+
+    tie-break の優先順位 (max() の tuple key の順、大きいほうが勝つ):
+
+    1. ``score`` (高いほうが勝つ) — §4.4 の合成規則そのもの。
+    2. ``key != "answerable_from_thread"`` (True が勝つ) — §4.5 で
+       ``answerable_from_thread`` は bounce の入場条件 ∴ 同点でこれを
+       ``fired_reason`` にすると同点で bounce 側 (人に届かない側) が
+       発火しうる。 D2 単調性の精神で「迷ったら人に届く側」に倒す
+       (Fermi msg-4087 DECIDED #2)。
+    3. ``-declaration_index`` (小さい index が勝つ) — 非
+       ``answerable_from_thread`` 同士の同点は宣言順で先の key を選ぶ。
+       宣言順は ``TIERC_QUESTIONS_V1`` = ``TIER_C_SPURIOUS_KEYS`` で
+       固定 ∴ ``PYTHONHASHSEED`` に依存せず replay / live が一致する
+       (PR #337 pr-gate BLOCKING correctness の是正の中核)。
+
+    """
+
+    def sort_key(item: tuple[str, float]) -> tuple[float, bool, int]:
+        key, score = item
+        return (
+            score,
+            key != _TIER_C_BOUNCE_TRIGGER_SPURIOUS_KEY,
+            -TIER_C_SPURIOUS_KEYS.index(key),
+        )
+
+    fired_key, spurious_score = max(spurious_answers.items(), key=sort_key)
+    return fired_key, spurious_score
 
 
 def evaluate_tierc(
@@ -230,8 +284,10 @@ def evaluate_tierc(
 
     genuine_score = sum(genuine_answers.values())
     # spurious_answers は空にならない (TIER_C_SPURIOUS_KEYS が空でないことを
-    # ``TIERC_QUESTIONS_V1`` の shape 不変条件でテストする)。
-    fired_key, spurious_score = max(spurious_answers.items(), key=lambda kv: kv[1])
+    # ``TIERC_QUESTIONS_V1`` の shape 不変条件でテストする)。 tie-break は
+    # ``_spurious_argmax`` の docstring 参照 — hash 依存を持ち込まないため
+    # 素の ``max(..., key=lambda kv: kv[1])`` は使わない。
+    fired_key, spurious_score = _spurious_argmax(spurious_answers)
 
     if genuine_score >= th.genuine_min:
         return TierCVerdict(
@@ -291,7 +347,12 @@ def build_out_of_gate_verdict(
     spurious_answers = _extract_scores(answers, TIER_C_SPURIOUS_KEYS)
 
     genuine_score = sum(genuine_answers.values())
-    _, spurious_score = max(spurious_answers.items(), key=lambda kv: kv[1])
+    # 同じ ``_spurious_argmax`` を使い、tuple 定数の一本化 (Fermi msg-4087
+    # DECIDED #4) と合わせて集計側 (§6.3) の score が非決定的に揺れないようにする。
+    # scope=OUT_OF_GATE の record は fired_reason を捨てて None 固定にする
+    # (D18 の invariant — grey zone 外は annotate / bounce の判断材料にしない) ため
+    # ここで得た key は使わない。
+    _, spurious_score = _spurious_argmax(spurious_answers)
 
     return TierCVerdict(
         kind=TierCVerdictKind.UNSURE,
