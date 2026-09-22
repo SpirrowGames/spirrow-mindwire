@@ -8,6 +8,7 @@ session tests are gone — what remains is the deterministic-guard + judging beh
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -700,6 +701,216 @@ async def test_outcome_records_principles_version() -> None:
     driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
     outcome = await driver.review(_pr(), post_critique=post)
     assert outcome.principles_version == principles_version()
+
+
+@pytest.mark.anyio
+async def test_principles_version_recorded_on_every_judgment_emit_path() -> None:
+    """Every JUDGMENT ``PrReviewOutcome`` this driver returns tags its ``principles_version``.
+
+    The naysayer principles SOT declares (spec/NAYSAYER_PRINCIPLES.md): "Every naysayer
+    output records the ``principles_version`` it judged under, so a later revision stays
+    auditable." Before this test the happy path recorded the tag (see the test above), but
+    the three short-circuit judgment paths (CI-gate, round-cap escalation, and the
+    timeout-degrade) left the field at its ``None`` default — silently dropping the audit
+    tag on precisely the review bodies a version bump most needs to explain. The
+    head-unchanged skip is NOT covered here: it is a reuse path, not a judgment (see
+    :func:`test_head_unchanged_skip_does_not_claim_current_principles_version`).
+
+    This test is a T-naysayer-blocking-bar-undefined prerequisite pin for the SHADOW →
+    LIVE promotion of ``derived_verdict``: msg-3520 promotion-gate condition (1). The
+    promotion changes the semantics of "blocking" mid-history; leaving any judgment path
+    untagged would let a red or COMMENT verdict held during the transition be read back
+    without knowing which principles version defined "blocking" at the time it was held.
+
+    Coverage is the closed set of four JUDGMENT construction sites in
+    ``src/spirrow_mindwire/naysayer/pr_review.py`` (``PrReviewOutcome(`` occurrences NOT
+    enclosed by a reuse helper — see
+    :func:`test_pr_review_outcome_construction_site_count_is_bounded`). The
+    parametrisation names each path so a future judgment path added without recording the
+    tag reds this test rather than adding a silent fifth case.
+    """
+    expected = principles_version()
+
+    # (a) L1 CI-gate short-circuit (CI failure → REQUEST_CHANGES, no Lexora call).
+    lexora_ci = _FakeLexora()
+    github_ci = _FakeGitHub(ci=CiStatus(CiState.FAILURE, "sha-ci", ["test"]))
+    _p_ci, post_ci = _capture()
+    driver_ci = NaysayerPrReviewDriver(lexora=lexora_ci, github=github_ci)
+    outcome_ci = await driver_ci.review(_pr(), post_critique=post_ci)
+    assert outcome_ci.ci_gated is True
+    assert outcome_ci.principles_version == expected, (
+        "CI-gate short-circuit emit path drops principles_version tag"
+    )
+
+    # (b) round-cap escalation (COMMENT to human, no Lexora call).
+    lexora_cap = _FakeLexora()
+    github_cap = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s1", "2026-06-10T00:00:01Z"),
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s2", "2026-06-10T00:00:02Z"),
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "s3", "2026-06-10T00:00:03Z"),
+        ],
+    )
+    _p_cap, post_cap = _capture()
+    driver_cap = NaysayerPrReviewDriver(lexora=lexora_cap, github=github_cap, max_review_rounds=3)
+    outcome_cap = await driver_cap.review(_pr(), post_critique=post_cap)
+    assert outcome_cap.rounds_capped is True
+    assert outcome_cap.principles_version == expected, (
+        "round-cap escalation emit path drops principles_version tag"
+    )
+
+    # (c) timeout-degrade (Lexora timeout → COMMENT-hold to human).
+    lexora_to = _FakeLexora(raise_exc=LexoraTimeoutError("timed out"))
+    github_to = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha-to", []))
+    _p_to, post_to = _capture()
+    driver_to = NaysayerPrReviewDriver(lexora=lexora_to, github=github_to)
+    outcome_to = await driver_to.review(_pr(), post_critique=post_to)
+    assert outcome_to.timed_out is True
+    assert outcome_to.principles_version == expected, (
+        "timeout-degrade emit path drops principles_version tag"
+    )
+
+    # (d) happy path re-asserted here so the pin lists all four judgment sites in one
+    # place. If someone deletes the older test_outcome_records_principles_version above,
+    # this leg keeps the invariant covered rather than letting the happy path silently
+    # regress.
+    lexora_ok = _FakeLexora(content="all good\n\nVERDICT: APPROVE")
+    github_ok = _FakeGitHub(ci=CiStatus(CiState.SUCCESS, "sha7", []))
+    _p_ok, post_ok = _capture()
+    driver_ok = NaysayerPrReviewDriver(lexora=lexora_ok, github=github_ok)
+    outcome_ok = await driver_ok.review(_pr(), post_critique=post_ok)
+    assert outcome_ok.principles_version == expected, (
+        "happy (Lexora-reviewed) emit path drops principles_version tag"
+    )
+
+
+@pytest.mark.anyio
+async def test_head_unchanged_skip_does_not_claim_current_principles_version() -> None:
+    """A head-unchanged skip returns ``principles_version is None`` — it reuses a prior verdict.
+
+    Companion to :func:`test_principles_version_recorded_on_every_judgment_emit_path`
+    (which pins the four JUDGMENT paths) and
+    :func:`test_replay_path_does_not_claim_current_principles_version` (which pins the
+    replay reuse path). The head-unchanged skip is the second reuse path: the naysayer
+    already reviewed this head, the head has not moved, so the prior verdict stands and
+    no new judgment is produced today.
+
+    Populating this field with the CURRENT ``principles_version()`` would falsely
+    attribute the prior judgment to today's principles (PR-gate #301 objection msg-4053).
+    Populating it with the ORIGINAL version is not possible because the persisted verdict
+    footer's schema is ``head_sha`` + ``event`` only (see :data:`_VERDICT_FOOTER_RE`) and
+    does not carry the version. ``None`` is therefore the ONLY value here that is not a
+    fabrication.
+
+    Pinning this contract in a test (rather than only in the field docstring) keeps the
+    invariant executable: a well-meaning refactor that "helpfully" adds
+    ``principles_version=principles_version()`` to the head-unchanged skip site would
+    silently corrupt the audit tag of every debounce-served verdict; this test reds
+    instead.
+    """
+    expected_none = None
+    lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
+    outcome = await driver.review(_pr(), post_critique=post)
+    # Sanity: this is actually the head-unchanged skip path (no Lexora spent, skipped flag set).
+    assert lexora.calls == []
+    assert outcome.skipped_head_unchanged is True
+    # The contract: reuse of a prior verdict claims no new principles version.
+    assert outcome.principles_version is expected_none, (
+        "head-unchanged skip must not claim the current principles_version — the "
+        "outcome reuses a prior verdict, and the original version is not recoverable "
+        "from the persisted footer (schema = head_sha + event only). Writing anything "
+        "but None would be a fabricated audit tag (PR-gate #301, msg-4053)."
+    )
+
+
+def test_pr_review_outcome_construction_site_count_is_bounded() -> None:
+    """The four JUDGMENT ``PrReviewOutcome(...)`` construction sites the pin above enumerates.
+
+    Not a substitute for the behavioural check — a construction site that omits the
+    ``principles_version=`` kwarg still constructs a ``PrReviewOutcome``, and the count
+    stays 4. This test guards a different failure mode: a FIFTH judgment emit path added
+    without a new leg in
+    ``test_principles_version_recorded_on_every_judgment_emit_path``. The behavioural pin
+    covers only the sites its cases exercise; a new emit path lurks silently under
+    coverage-by-parametrisation until this counter reds.
+
+    Counted via AST rather than a text regex, so the pin does not couple to a specific
+    syntactic form (msg-3622 PR-gate advisory, msg-3739 Einstein Obj-2): a refactor that
+    assigns the object to a local before returning it —
+    ``outcome = PrReviewOutcome(...); return outcome`` — is still a construction site the
+    invariant must cover, and this test counts it the same. The AST also ignores
+    ``PrReviewOutcome`` inside strings, docstrings, and comments, so a mention of the
+    type in prose cannot inflate the count.
+
+    Excludes the two construction sites enclosed by REUSE helpers, whose contract is to
+    re-emit a prior verdict rather than produce a new judgment and therefore leave
+    ``principles_version`` at ``None``:
+
+    * ``_maybe_replay_verdict`` — chatroom-replay of a verdict that never landed on
+      GitHub (msg-3846 operator's re-count, msg-3914 Bohr's design, msg-3917/3919 the
+      "prose-code" correction).
+    * ``_emit_head_unchanged_skip`` — debounce skip that reuses the prior verdict on an
+      unchanged head (PR-gate #301 objection msg-4053, Einstein msg-4054 advisory that
+      lifted the reuse outcome out of ``review()`` so the AST filter can name it).
+
+    If either function is renamed or a third reuse path is added, this counter reds —
+    a legitimate reuse extension asks the maintainer to update the exclusion allowlist
+    deliberately rather than silently disabling the check for the new function.
+
+    Kept literal (4) rather than a self-referential scan of the test's own body, so a
+    silent widening of one file cannot be dismissed by editing the other.
+    """
+    source_path = Path(__file__).resolve().parents[1] / "src/spirrow_mindwire/naysayer/pr_review.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+
+    # Walk with an explicit stack so each Call knows the FunctionDef that lexically encloses
+    # it. ``ast.walk`` alone loses that ancestry — a plain filter over Call nodes cannot tell
+    # a judgment path's site from a reuse path's site. Nesting depth in pr_review.py is one
+    # level (methods on the driver class), so tracking the most-recent FunctionDef is
+    # sufficient; if a nested-function refactor arrives, extend to a list.
+    reuse_excluded = {"_maybe_replay_verdict", "_emit_head_unchanged_skip"}
+    excluded_lines: list[tuple[str, int]] = []
+    counted_lines: list[int] = []
+
+    def walk(node: ast.AST, enclosing: str | None) -> None:
+        # A FunctionDef or AsyncFunctionDef becomes the enclosing function for its body.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            enclosing = node.name
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "PrReviewOutcome"
+        ):
+            if enclosing in reuse_excluded:
+                excluded_lines.append((enclosing or "?", node.lineno))
+            else:
+                counted_lines.append(node.lineno)
+        for child in ast.iter_child_nodes(node):
+            walk(child, enclosing)
+
+    walk(tree, None)
+
+    assert len(counted_lines) == 4, (
+        f"expected 4 JUDGMENT PrReviewOutcome construction sites (the closed set the "
+        f"principles_version pin enumerates); found {len(counted_lines)} at lines "
+        f"{counted_lines}. Excluded (reuse paths in {sorted(reuse_excluded)!r}, which "
+        f"re-emit a prior verdict and do NOT produce a new judgment): {excluded_lines}. "
+        f"If a new judgment emit path was added, add a case to "
+        f"test_principles_version_recorded_on_every_judgment_emit_path and bump this "
+        f"counter. If a new reuse path was added, extend the exclusion allowlist "
+        f"deliberately (and add a case to "
+        f"test_replay_path_does_not_claim_current_principles_version or "
+        f"test_head_unchanged_skip_does_not_claim_current_principles_version)."
+    )
 
 
 # ---------- L1 CI-gate (ADR-2026-06-03-16) -------------------------------- #
@@ -2032,6 +2243,55 @@ async def test_replay_reposts_prior_verdict_when_footer_matches_head_and_not_lan
     assert lexora.calls == []
     assert outcome.verdict is ReviewEvent.APPROVE
     assert [event for _, event, _ in github.submitted] == [ReviewEvent.APPROVE]
+
+
+@pytest.mark.anyio
+async def test_replay_path_does_not_claim_current_principles_version() -> None:
+    """A replayed verdict returns ``principles_version is None`` — it made no new judgment.
+
+    Companion to :func:`test_principles_version_recorded_on_every_judgment_emit_path`
+    (which pins the five judgment paths). Replay re-emits a prior verdict rather than
+    judging afresh (msg-3846 operator's re-count of the ``_maybe_replay_verdict`` site,
+    msg-3914 Bohr's Option-2 design). Populating this field with the CURRENT
+    ``principles_version()`` would falsely attribute an old judgment to today's
+    principles; populating it with the ORIGINAL version is not possible because the
+    persisted verdict footer's schema is ``head_sha`` + ``event`` only (see
+    :data:`_VERDICT_FOOTER_RE`) and does not carry the version. ``None`` is therefore
+    the ONLY value here that is not a fabrication.
+
+    Pinning this contract in a test (rather than only in the field docstring) keeps
+    the invariant executable: a well-meaning refactor that "helpfully" adds
+    ``principles_version=principles_version()`` to the replay site would silently
+    corrupt the audit tag of every replayed verdict; this test reds instead.
+    """
+    lexora = _FakeLexora(content="should not be called")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "deadbeefdeadbeef", []),
+        reviews=[],  # nothing landed on GitHub → replay path fires
+    )
+    prior_body = (
+        "prior critique\n\n"
+        "VERDICT: APPROVE\n\n"
+        "<!-- mindwire:verdict head_sha=deadbeefdeadbeef event=APPROVE -->\n\n"
+        "ADR-INDEX: unavailable"
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github)
+    outcome = await driver.review(
+        _pr(),
+        post_critique=post,
+        read_review_thread=_replay_reader([("naysayer", prior_body)]),
+    )
+    # Sanity: this is actually the replay path (no Lexora spent, verdict re-POSTed).
+    assert lexora.calls == []
+    assert [event for _, event, _ in github.submitted] == [ReviewEvent.APPROVE]
+    # The contract: replay claims no new principles version.
+    assert outcome.principles_version is None, (
+        "replay path must not claim the current principles_version — the outcome "
+        "records no new judgment, and the original version is not recoverable from "
+        "the persisted footer (schema = head_sha + event only). Writing anything "
+        "but None would be a fabricated audit tag."
+    )
 
 
 @pytest.mark.anyio
