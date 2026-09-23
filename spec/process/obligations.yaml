@@ -147,7 +147,34 @@ obligations:
     # names as one of the two things that DO authorize a merge. See
     # spec/process/README.md §「`./obligations.yaml` の配送範囲は naysayer
     # の片面 (design-time) だけである」.
-    body: "DESIGN-GATE PROCEED IS NOT MERGE AUTHORIZATION (ADR-2026-06-03-17 D-5, \"consultation, not approval\"): when you end a design-time turn by handing to the implementer, the only thing you authorize is forward motion into code work. You do not authorize a merge, and no phrasing of yours can — \"clear to land\", \"ship it\", \"approved\", \"LGTM\" all mean exactly \"code work may proceed\" when they appear in a design thread, and you should expect to be read literally by someone who wants to merge. A merge is authorized by two things a design thread cannot contain: a PR-gate artifact — a GitHub review submitted against that pull request's exact head sha — and the human's own decision. If the work looks ready to land, say that it is ready for the PR gate and hand to the human; do not write a sentence that a reader could mistake for the authorization itself."
+    #
+    # 2026-09-23 scope narrowing (Takahito Tier-C ruling on
+    # T-no-merge-authority-clause-unscoped-to-main): the original 3rd sentence
+    # ("A merge is authorized by … the human's own decision.") stated the
+    # human-decision requirement WITHOUT a branch scope, which contradicted
+    # (i) the immediately-preceding comment in this file acknowledging
+    # sanctioned `develop` self-merges, and (ii) docs/architecture.md:433 which
+    # names `main` alone as the branch no path automates into. Consequence
+    # measured (msg-947, 2026-09-22T14:31Z, T-9-7-drift-hygiene): the
+    # design-time naysayer read the unscoped clause literally and escalated a
+    # sanctioned operator `develop` merge as a bypass of a human merge gate.
+    # The rewrite scopes the human-decision requirement to protected-branch
+    # targets (`main`) and adds an explicit sentence for the non-protected
+    # sanctioned path so the naysayer reads it too. The anti-drift core the
+    # clause exists to enforce — that a design-thread sentence is never the
+    # authorization — is preserved in every path: the new 4th sentence names
+    # it explicitly for the non-protected path, and sentences 1-2 are
+    # untouched. The ADR-2026-06-03-17 D-5 citation stays where it anchors
+    # the advisory-vs-authorization framing (D-5's literal content) and is
+    # NOT extended to anchor the main-only human-decision line (D-5 is not a
+    # merge clause; §1 of the Tier-C ruling establishes this).
+    #
+    # Canary invariant: this entry carries no `origin` key ∴ canary two-double-
+    # prime (`len(body) == origin.original_length`) does not apply and is not
+    # broken by the rewrite. Delivery scope is UNCHANGED — design-time
+    # naysayer face only; the T-obligations-not-reaching-pr-gate rationale
+    # above still applies verbatim.
+    body: "DESIGN-GATE PROCEED IS NOT MERGE AUTHORIZATION (ADR-2026-06-03-17 D-5, \"consultation, not approval\"): when you end a design-time turn by handing to the implementer, the only thing you authorize is forward motion into code work. You do not authorize a merge, and no phrasing of yours can — \"clear to land\", \"ship it\", \"approved\", \"LGTM\" all mean exactly \"code work may proceed\" when they appear in a design thread, and you should expect to be read literally by someone who wants to merge. What authorizes a merge is never a design-thread sentence; it is a PR-gate artifact — a GitHub review submitted against that pull request's exact head sha — plus, for a merge whose target is a protected branch (`main`), the human's own decision. Where the project's own merge policy sanctions self-merge into a non-protected integration branch, that PR-gate artifact together with the project sanction is the whole authorization and a human GO is not required — but a design-thread sentence is still not what authorized it. If the work is bound for a protected branch and looks ready to land, say that it is ready for the PR gate and hand to the human; do not write a sentence that a reader could mistake for the authorization itself."
 
   - id: OBL-READBACK-ENTRY
     role: implementer
