@@ -37,6 +37,7 @@ from spirrow_mindwire.decider.verdict import (
     TierCScope,
     TierCVerdict,
     TierCVerdictKind,
+    build_out_of_gate_verdict,
     evaluate_tierc,
 )
 
@@ -55,6 +56,7 @@ __all__ = [
     "TierCVerdict",
     "TierCVerdictKind",
     "Turn",
+    "build_out_of_gate_verdict",
     "evaluate_tierc",
     "state_builder",
 ]
