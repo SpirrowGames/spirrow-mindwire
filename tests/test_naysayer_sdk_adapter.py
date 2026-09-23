@@ -1468,3 +1468,127 @@ async def test_fast_halt_reaching_halted_is_not_clobbered_by_deliver_except(
     assert hs.error is None
     assert client.interrupted == 1
     assert client.disconnected == 1
+
+
+# --------------------------------------------------------------------------- #
+# PR-gate on PR-338 @ cc91962 (advisory, human-selected option A): a session
+# that is already halted must not burn a per-turn preflight on deliver_event.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_deliver_event_on_a_halted_session_skips_the_preflight(
+    tmp_path: Path,
+) -> None:
+    """The shutdown-state check at the top of ``deliver_event`` runs BEFORE the
+    per-turn preflight, with no ``await`` between them, so a halted session
+    refuses delivery without a network probe and without a factory call.
+    """
+    calls: list[int] = []
+    factory = _CountingFactory([[_assistant("critique"), _result()]])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=_preflight_ok(calls),
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    assert calls == [1]  # spawn's dry-run
+    await adapter.halt(handle)
+    with pytest.raises(NaysayerSdkDeliveryError, match="cannot deliver"):
+        await adapter.deliver_event(handle, _event())
+    assert calls == [1]  # no per-turn preflight was run
+    assert factory.calls == []
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.HALTED
+    assert adapter.attestation_record(handle) is None
+
+
+@pytest.mark.anyio
+async def test_halt_during_a_failing_preflight_is_not_clobbered(
+    tmp_path: Path,
+) -> None:
+    """``halt`` lands while the per-turn preflight is awaiting (no client yet,
+    so halt is a pure state transition to HALTED); the preflight then fails.
+    The preflight's except must yield to halt's authority exactly as the
+    body's except blocks do — state stays HALTED, ``session.error`` stays empty.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+    spawned = False
+
+    async def preflight() -> AttestationRecord:
+        if not spawned:
+            return _attestation()
+        started.set()
+        await release.wait()
+        raise PreflightError("unreachable")
+
+    factory = _CountingFactory([[_assistant("critique"), _result()]])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=preflight,
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx([]))
+    spawned = True
+    deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    await adapter.halt(handle)
+    release.set()
+    with pytest.raises(NaysayerSdkDeliveryError):
+        await asyncio.wait_for(deliver_task, timeout=2.0)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.HALTED
+    assert adapter._sessions[handle].error is None
+    assert factory.calls == []
+
+
+@pytest.mark.anyio
+async def test_halt_during_a_succeeding_preflight_spawns_no_subprocess(
+    tmp_path: Path,
+) -> None:
+    """``halt`` lands while the per-turn preflight is awaiting and the
+    preflight then *succeeds* (PR-gate on PR-342 @ 0090ce3). The halt must not
+    be lost: the re-check of ``session.state`` under ``client_lock`` —
+    immediately before the factory is called, with no await in between —
+    refuses to publish a client. No subprocess is spawned, no reply is
+    posted, state stays HALTED and ``session.error`` stays empty.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+    spawned = False
+
+    async def preflight() -> AttestationRecord:
+        if not spawned:
+            return _attestation()
+        started.set()
+        await release.wait()
+        return _attestation()
+
+    captured: list[ReplyDraft] = []
+    factory = _CountingFactory([[_assistant("critique"), _result()]])
+    adapter = NaysayerSdkAdapter(
+        cwd=tmp_path,
+        obligations=_OBLIGATIONS,
+        inference_base_url=_BASE_URL,
+        client_factory=factory,
+        preflight=preflight,
+    )
+    handle = await adapter.spawn(_thread_ref(), Role.NAYSAYER, _ctx(captured))
+    spawned = True
+    deliver_task = asyncio.create_task(adapter.deliver_event(handle, _event()))
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    await adapter.halt(handle)
+    release.set()
+    with pytest.raises(NaysayerSdkDeliveryError, match="halted before"):
+        await asyncio.wait_for(deliver_task, timeout=2.0)
+    hs = await adapter.health(handle)
+    assert hs.state is SessionState.HALTED
+    assert adapter._sessions[handle].error is None
+    assert adapter._sessions[handle].client is None
+    assert factory.calls == []
+    assert captured == []

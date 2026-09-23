@@ -655,6 +655,12 @@ class NaysayerSdkAdapter:
         session = self._sessions.get(handle)
         if session is None:
             raise NaysayerSdkDeliveryError(f"unknown session {handle.session_id}")
+        # Shutdown-state guard. It sits BEFORE the per-turn preflight below with
+        # no ``await`` in between, so a session halted between turns refuses
+        # delivery without burning a network probe (PR-gate advisory on PR-338
+        # @ cc91962; pinned by
+        # test_deliver_event_on_a_halted_session_skips_the_preflight). Keep it
+        # above the preflight.
         if session.state in _SHUTDOWN_STATES:
             raise NaysayerSdkDeliveryError(
                 f"session {handle.session_id} is {session.state.value}; cannot deliver"
@@ -706,12 +712,17 @@ class NaysayerSdkAdapter:
         try:
             session.attestation = await self._run_preflight()
         except Exception as exc:
-            session.state = SessionState.FAILED
-            session.error = ErrorInfo(
-                code="adapter.delivery_failed",
-                message=str(exc),
-                raised_at=datetime.now(UTC),
-            )
+            # Yield to halt: the preflight is awaited with no client published,
+            # so a halt landing here is a pure state transition that may already
+            # have reached HALTED. Same "any shutdown state" rule as the body's
+            # except blocks below — do not clobber halt's state with FAILED.
+            if session.state not in _SHUTDOWN_STATES:
+                session.state = SessionState.FAILED
+                session.error = ErrorInfo(
+                    code="adapter.delivery_failed",
+                    message=str(exc),
+                    raised_at=datetime.now(UTC),
+                )
             raise NaysayerSdkDeliveryError(
                 f"per-turn preflight attestation failed for session {handle.session_id}; "
                 f"refusing to post an unattested naysayer verdict: {exc}"
