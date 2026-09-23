@@ -356,3 +356,12 @@ def test_out_of_gate_verdict_never_fires_annotate_or_bounce() -> None:
     # scores は集計用に埋まる (§6.3 の evaluation で使える)。
     assert verdict.genuine_score == pytest.approx(3.0)
     assert verdict.spurious_score == pytest.approx(1.0)
+
+
+def test_build_out_of_gate_verdict_is_exported_from_facade() -> None:
+    """step 2 の caller が verdict module を直に import せず facade から取れること。"""
+    import spirrow_mindwire.decider as decider
+    from spirrow_mindwire.decider.verdict import build_out_of_gate_verdict
+
+    assert decider.build_out_of_gate_verdict is build_out_of_gate_verdict
+    assert "build_out_of_gate_verdict" in decider.__all__
