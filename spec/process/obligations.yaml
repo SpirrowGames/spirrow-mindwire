@@ -137,8 +137,8 @@ obligations:
     # (T-obligations-not-reaching-pr-gate, 2026-08-30): the body is self-scoped
     # to design threads by its own opening line ("DESIGN-GATE PROCEED IS NOT
     # MERGE AUTHORIZATION") and its guidance ("when you end a design-time turn
-    # by handing to the implementer" / "say that it is ready for the PR gate
-    # and hand to the human"). Injecting it into the PR-gate would create a
+    # by handing to the implementer" / "say that it is ready for the PR gate"
+    # / "also hand to the human"). Injecting it into the PR-gate would create a
     # self-referential instruction telling the PR-gate to hand off to the
     # PR-gate; further, the failure mode the clause exists to prevent (an
     # advisory design comment being misread as merge authorization) is not
@@ -163,8 +163,11 @@ obligations:
     # sanctioned path so the naysayer reads it too. The anti-drift core the
     # clause exists to enforce — that a design-thread sentence is never the
     # authorization — is preserved in every path: the new 4th sentence names
-    # it explicitly for the non-protected path, and sentences 1-2 are
-    # untouched. The ADR-2026-06-03-17 D-5 citation stays where it anchors
+    # it explicitly for the non-protected path, the closing sentence forbids
+    # authorization-like phrasing "whatever the target branch" (PR-gate
+    # regression objection on #343 @ 1445b1e: an earlier draft scoped that
+    # ban to protected branches only), and sentences 1-2 are untouched.
+    # The ADR-2026-06-03-17 D-5 citation stays where it anchors
     # the advisory-vs-authorization framing (D-5's literal content) and is
     # NOT extended to anchor the main-only human-decision line (D-5 is not a
     # merge clause; §1 of the Tier-C ruling establishes this).
@@ -174,7 +177,7 @@ obligations:
     # broken by the rewrite. Delivery scope is UNCHANGED — design-time
     # naysayer face only; the T-obligations-not-reaching-pr-gate rationale
     # above still applies verbatim.
-    body: "DESIGN-GATE PROCEED IS NOT MERGE AUTHORIZATION (ADR-2026-06-03-17 D-5, \"consultation, not approval\"): when you end a design-time turn by handing to the implementer, the only thing you authorize is forward motion into code work. You do not authorize a merge, and no phrasing of yours can — \"clear to land\", \"ship it\", \"approved\", \"LGTM\" all mean exactly \"code work may proceed\" when they appear in a design thread, and you should expect to be read literally by someone who wants to merge. What authorizes a merge is never a design-thread sentence; it is a PR-gate artifact — a GitHub review submitted against that pull request's exact head sha — plus, for a merge whose target is a protected branch (`main`), the human's own decision. Where the project's own merge policy sanctions self-merge into a non-protected integration branch, that PR-gate artifact together with the project sanction is the whole authorization and a human GO is not required — but a design-thread sentence is still not what authorized it. If the work is bound for a protected branch and looks ready to land, say that it is ready for the PR gate and hand to the human; do not write a sentence that a reader could mistake for the authorization itself."
+    body: "DESIGN-GATE PROCEED IS NOT MERGE AUTHORIZATION (ADR-2026-06-03-17 D-5, \"consultation, not approval\"): when you end a design-time turn by handing to the implementer, the only thing you authorize is forward motion into code work. You do not authorize a merge, and no phrasing of yours can — \"clear to land\", \"ship it\", \"approved\", \"LGTM\" all mean exactly \"code work may proceed\" when they appear in a design thread, and you should expect to be read literally by someone who wants to merge. What authorizes a merge is never a design-thread sentence; it is a PR-gate artifact — a GitHub review submitted against that pull request's exact head sha — plus, for a merge whose target is a protected branch (`main`), the human's own decision. Where the project's own merge policy sanctions self-merge into a non-protected integration branch, that PR-gate artifact together with the project sanction is the whole authorization and a human GO is not required — but a design-thread sentence is still not what authorized it. If the work looks ready to land, say that it is ready for the PR gate. If its target is a protected branch, also hand to the human; otherwise the absence of a human GO is not a reason to escalate — the project's own merge policy governs that merge. Whatever the target branch, do not write a sentence that a reader could mistake for the authorization itself."
 
   - id: OBL-READBACK-ENTRY
     role: implementer
