@@ -1,9 +1,11 @@
 """Decider replay driver — Fermi msg-4066/4067 step 1 分担の一部。
 
-**Scope**: adapter (``decider_lexora.py``) が着地するまでの間、fixture ->
-DecisionState -> 問い JSONL の dry-run 経路だけを提供する。 実際に
-``/v1/decide`` を叩く経路 (--track=tierc の実呼び出し) は step 2 で
-adapter 着地後に足す。
+**Scope**: fixture -> DecisionState -> 問い JSONL の dry-run 経路 (step 1) と、
+``--endpoint URL`` 指定時に ``/v1/decide`` を実際に叩く経路 (step 2、Bohr
+msg-4180 §3)。 ``--endpoint`` 無しは従来どおりの dry-run。 ``--endpoint`` 有りは
+live adapter と同じ ``decide_once`` (同じ request builder ``decider.wire``、同じ
+応答分類) を policy ``mindwire.replay.tierc`` で呼び、record に ``decision``
+(``DecisionResult`` の JSON) を足す。 116 件の一括投入は Jev 切替 (課金判断) 後。
 
 **Design pointer**:
 
@@ -59,24 +61,27 @@ Tier-C fixture のみを想定する。
       "state": { … DecisionState を JSON 化した payload … }
     }
 
-adapter 着地後 (step 2) は本 record に ``answers`` / ``verdict`` を後付け
-した joined record に拡張する。 現在は dry-run: 問いと state だけを吐く。
+``--endpoint`` 指定時は record に ``"decision": {outcome, decision_id, provider,
+raw_answers, verdict, policy, questions_version, latency_ms, error}`` が加わる
+(live の ``log_decision`` と同じ shape)。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from collections.abc import Iterable
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
 
+from spirrow_mindwire.adapters.decider_lexora import DECIDER_TIMEOUT_SECONDS, decide_once
 from spirrow_mindwire.decider.questions import (
     TIERC_QUESTIONS_V1,
     TIERC_QUESTIONS_VERSION,
 )
+from spirrow_mindwire.decider.result import decision_result_to_dict
 from spirrow_mindwire.decider.state import (
     AdmissionGateResult,
     DecisionState,
@@ -86,6 +91,8 @@ from spirrow_mindwire.decider.state import (
     state_builder,
 )
 from spirrow_mindwire.decider.verdict import TierCScope
+from spirrow_mindwire.decider.wire import POLICY_REPLAY_TIERC, state_to_dict
+from spirrow_mindwire.lexora.client import LexoraClient
 from spirrow_mindwire.tier_c_admission_gate import (
     AdmissionVerdict,
     BounceReason,
@@ -214,33 +221,6 @@ def parse_turn(row: dict[str, Any]) -> SimpleTurn:
 # ---------------------------------------------------------------------------
 
 
-def _gate_result_to_json(gate: AdmissionGateResult | None) -> dict[str, Any] | None:
-    if gate is None:
-        return None
-    return {
-        "verdict": gate.verdict.value,
-        "kind": gate.kind.value if gate.kind is not None else None,
-        "label": gate.label,
-        "retry_admit_reason": (gate.retry_admit_reason.value if gate.retry_admit_reason else None),
-        "bounce_reason": gate.bounce_reason.value if gate.bounce_reason else None,
-        "is_grey_zone": gate.is_grey_zone,
-    }
-
-
-def _state_to_json(state: DecisionState) -> dict[str, Any]:
-    return {
-        "thread_id": state.thread_id,
-        "round_index": state.round_index,
-        "roster": {k: v.value for k, v in state.roster.items()},
-        "head_summary": state.head_summary,
-        "recent_events": [asdict(e) for e in state.recent_events],
-        "parsed_next": state.parsed_next,
-        "prev_next": state.prev_next,
-        "diff_stat": asdict(state.diff_stat) if state.diff_stat else None,
-        "gate_result": _gate_result_to_json(state.gate_result),
-    }
-
-
 def _questions_to_json() -> list[dict[str, Any]]:
     return [{"key": q.key, "kind": q.kind.value, "prompt": q.prompt} for q in TIERC_QUESTIONS_V1]
 
@@ -270,7 +250,8 @@ def build_tierc_record(state: DecisionState) -> dict[str, Any]:
         "questions_version": TIERC_QUESTIONS_VERSION,
         "scope": scope.value,
         "questions": _questions_to_json(),
-        "state": _state_to_json(state),
+        # Same dict ``decider.wire.state_to_wire`` serialises for /v1/decide (msg-4180 §2-1).
+        "state": state_to_dict(state),
     }
 
 
@@ -297,20 +278,31 @@ def iter_fixture(path: Path) -> Iterable[dict[str, Any]]:
                 raise ValueError(f"{path}:{lineno}: invalid JSON — {exc}") from exc
 
 
+async def _decide_records(
+    states: list[DecisionState], records: list[dict[str, Any]], endpoint: str
+) -> None:
+    """``--endpoint`` 経路: 各 state を live と同じ ``decide_once`` に流し record に足す。"""
+    async with LexoraClient(endpoint, timeout_seconds=DECIDER_TIMEOUT_SECONDS) as client:
+        for state, rec in zip(states, records, strict=True):
+            dr = await decide_once(state, client=client, policy=POLICY_REPLAY_TIERC)
+            rec["decision"] = decision_result_to_dict(dr)
+
+
 def run_tierc_replay(
     *,
     fixture: Path,
     out: Path | None,
     mode: Literal["dry-run"],
+    endpoint: str | None = None,
 ) -> int:
-    """Tier-C fixture を dry-run で JSONL に吐く (step 1 の cap)。
+    """Tier-C fixture を JSONL に吐く。
 
-    ``mode="dry-run"`` のみ実装 — adapter 未着地 ∴ 実 provider 呼び出しは
-    step 2 の PR で足す。 CLI から他の mode を指定すると parser で拒否
-    される (Literal 型で強制)。
+    ``endpoint`` が ``None`` なら dry-run (step 1 と同一出力)。 指定があれば
+    各 record を ``/v1/decide`` に流し ``decision`` を付ける (msg-4180 §3)。
     """
 
     records: list[dict[str, Any]] = []
+    states: list[DecisionState] = []
     skipped_no_gate = 0
     for row in iter_fixture(fixture):
         try:
@@ -326,7 +318,11 @@ def run_tierc_replay(
             continue
 
         state = state_builder(turn)
+        states.append(state)
         records.append(build_tierc_record(state))
+
+    if endpoint is not None:
+        asyncio.run(_decide_records(states, records, endpoint))
 
     sink = out.open("w", encoding="utf-8") if out is not None else sys.stdout
     try:
@@ -338,7 +334,8 @@ def run_tierc_replay(
 
     print(
         f"decider_replay: emitted {len(records)} tierc records "
-        f"(skipped {skipped_no_gate} non-gate turns, mode={mode})",
+        f"(skipped {skipped_no_gate} non-gate turns, mode={mode}, "
+        f"endpoint={endpoint or 'none'})",
         file=sys.stderr,
     )
     return 0
@@ -376,6 +373,15 @@ def main(argv: list[str] | None = None) -> int:
             "step 2 で 'live' / 'shadow' を足す。"
         ),
     )
+    parser.add_argument(
+        "--endpoint",
+        default=None,
+        help=(
+            "Lexora base URL (例 http://localhost:8110)。 指定すると各 turn を "
+            "/v1/decide に流し record に decision を付ける (policy=mindwire.replay.tierc)。 "
+            "未指定なら dry-run。"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.track != "tierc":
@@ -394,7 +400,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    return run_tierc_replay(fixture=args.fixture, out=args.out, mode=args.mode)
+    return run_tierc_replay(
+        fixture=args.fixture, out=args.out, mode=args.mode, endpoint=args.endpoint
+    )
 
 
 if __name__ == "__main__":

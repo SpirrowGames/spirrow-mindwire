@@ -475,14 +475,17 @@ class DeciderTierCConfig(_StrictModel):
 
     4 値 (Fermi msg-4066/4067 DECIDED #1、msg-4063 で追加):
 
-    * ``off`` — フックそのものが走らない (default)。 既存の設定形は
-      本 default で読める ∴ 後方互換。
+    * ``off`` — フックそのものが走らない。 step 1 では default だった。
     * ``shadow`` — grey-zone gating → ``evaluate_tierc`` → ``log_decision``
       まで走らせ、annotation / bounce は一切しない。 意味論は
       :attr:`NaysayerGatingConfig.shadow` (D12 の一般フック shadow) と
       parity — 実動作を変えない (``stop`` 不変、人への通知不変) ∴ D2
       単調性を破らない。 Tier-C を lexora `/v1/decide` main 着地待ちで
-      先行走行させるための log-only モード。
+      先行走行させるための log-only モード。 **step 2 以降の default**
+      (Bohr msg-4180 §4)。 ``[decider].backend`` の default は ``off`` の
+      ままなので、 default 設定では Decider は構築されず HTTP も飛ばない
+      (``adapters.decider_lexora.build_decider`` が ``None`` を返す)。
+      有効化は ``MINDWIRE_DECIDER_BACKEND=lexora`` + ``MINDWIRE_LEXORA_URL``。
     * ``annotate`` — LIKELY_NOT に対して escalation 通知に注釈 1 行を
       付ける。 §6-C 制約 1 (genuine 見逃し 0 件) を満たしたときのみ
       投入 (D15)。
@@ -495,7 +498,7 @@ class DeciderTierCConfig(_StrictModel):
     でも参照可能で、 default は False。
     """
 
-    mode: Literal["off", "shadow", "annotate", "bounce"] = "off"
+    mode: Literal["off", "shadow", "annotate", "bounce"] = "shadow"
     skip_naysayer_when_confirmed: bool = False
 
 

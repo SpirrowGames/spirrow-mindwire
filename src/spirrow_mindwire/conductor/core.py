@@ -78,6 +78,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
+from ..decider.hook import Decider, ThreadMessage, run_tierc_hook
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
 from ..github.client import CheckRollup, PrRef, ReviewEvent, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
@@ -102,7 +103,7 @@ from .gate_records import (
     render_ci_route_marker,
     verdict_heads,
 )
-from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, resolve_handoff
+from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, parse_next_token, resolve_handoff
 from .roster import RoleResolutionError, derive_identity_by_role
 
 if TYPE_CHECKING:
@@ -238,6 +239,7 @@ class Conductor:
         control: LoopControl | None = None,
         rollup_source: CheckRollupSource | None = None,
         identity_embodiment: Mapping[str, str] | None = None,
+        decider: Decider | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -284,6 +286,11 @@ class Conductor:
         # un-routed turn. Narrows WHICH terminals force a consult; the per-segment single-consult
         # bound (``_naysayer_consulted``) is unchanged. Trims redundant design-loop naysayer calls.
         self._force_only_on_explicit_human = force_naysayer_only_on_explicit_human
+        # Tier-C Decider (T-decider-conductor-hook step 2). ``None`` = off (the default and the
+        # pre-step-2 behaviour, byte-for-byte). When wired it is an OBSERVER: ``_decider_hook``
+        # logs a decision on every explicit ``NEXT: human`` head and never changes the routing
+        # decision ``_route`` already made (D20 monotonicity).
+        self._decider = decider
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
         # ``supervised`` baseline, so a bare Conductor never self-authorises code. The state is
@@ -494,6 +501,9 @@ class Conductor:
             target_role, target_identity, is_forced, is_saveable, stop_reason = self._route(
                 handoff, messages
             )
+            # Tier-C Decider hook: right after the rule-based routing decision, before it is acted
+            # on. Observation only — neither ``stop_reason`` nor ``target_role`` is read back.
+            await self._decider_hook(handoff, messages, round_index, stop_reason)
             if target_role is None:
                 assert stop_reason is not None  # _route always sets a reason when it stops
                 # Bohr msg-179 §6 invariant: a message that carries a non-null next_participant
@@ -552,6 +562,49 @@ class Conductor:
             processed_msg_id = latest_msg_id
         return self._stop(
             self._max_rounds, StopReason.ROUND_CAP, processed_msg_id, forced, forced_saveable
+        )
+
+    async def _decider_hook(
+        self,
+        handoff: Handoff,
+        messages: list[dict[str, Any]],
+        round_index: int,
+        stop_reason: StopReason | None,
+    ) -> None:
+        """Run the Tier-C Decider on an explicit ``NEXT: human`` head (msg-4180 §4).
+
+        Fires only for an author-written human handoff: a field/body mismatch also resolves to
+        ``HandoffKind.HUMAN`` but is a conductor safety valve, not somebody asking the human, so
+        it is skipped. ``gate_result`` is ``None`` — this conductor does not run the Tier-C
+        admission gate — so the result is always recorded as out-of-gate (see
+        :mod:`..decider.hook`). ``stop_reason`` is logged beside the decision, never modified.
+        """
+        if self._decider is None:
+            return
+        if handoff.kind is not HandoffKind.HUMAN or handoff.mismatch_reason is not None:
+            return
+        thread_msgs = [
+            ThreadMessage(
+                msg_id=_msg_id(m),
+                author=_author(m),
+                content=_content(m),
+                parsed_next=parse_next_token(_content(m)),
+            )
+            for m in messages
+        ]
+        # The head was resolved to HUMAN (possibly via the structured field with no body line);
+        # state its parsed_next as the reserved token so the Decider's own gate agrees.
+        head = thread_msgs[-1]
+        thread_msgs[-1] = ThreadMessage(
+            msg_id=head.msg_id, author=head.author, content=head.content, parsed_next=HUMAN_TOKEN
+        )
+        await run_tierc_hook(
+            self._decider,
+            thread_id=self._thread_ref.thread_id,
+            round_index=round_index,
+            roster=self._roster,
+            messages=thread_msgs,
+            stop=stop_reason.value if stop_reason is not None else None,
         )
 
     def _route(

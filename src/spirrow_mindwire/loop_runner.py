@@ -73,10 +73,12 @@ from pathlib import Path
 
 from .adapters._sdk_result import emit_sdk_error_marker, find_sdk_error_signal
 from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter, _PathScopeGuard
+from .adapters.decider_lexora import build_decider
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .config import MindwireSettings, NaysayerGatingConfig, Stage3LoopConfig, load_settings
+from .decider.verdict import TierCThresholds
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
     EVENT_FIELD_AUTHOR,
@@ -791,6 +793,21 @@ def build_conductor(
     # watcher path) — driver-化 unify, ADR-19 N-1; no parallel watcher is added.
     orchestrator = PrReviewOrchestrator(mcp, driver=pr_review_driver)
     thread_ref = _thread_ref(loop_cfg.project, cond_cfg.task_thread_id)
+    # Tier-C Decider (T-decider-conductor-hook step 2): ``None`` unless backend=lexora and
+    # [decider.tierc].mode is on. A half-configured enablement is a startup error, not a silent off.
+    dec_cfg = settings.decider
+    try:
+        decider = build_decider(
+            config_backend=dec_cfg.backend,
+            tierc_mode=dec_cfg.tierc.mode,
+            thresholds=TierCThresholds(
+                genuine_min=dec_cfg.thresholds.tierc_genuine_min,
+                genuine_max=dec_cfg.thresholds.tierc_genuine_max,
+                spurious_min=dec_cfg.thresholds.tierc_spurious_min,
+            ),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"decider misconfigured ([decider] in mindwire.toml): {exc}") from exc
     try:
         conductor = Conductor(
             mcp=mcp,
@@ -817,6 +834,7 @@ def build_conductor(
             # already a structural off-switch that does not need a flag — an unreadable rollup
             # degrades to the pre-wiring path (fire the gate) inside ``Conductor._admit``.
             rollup_source=_PerCallCheckRollupSource(),
+            decider=decider,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc

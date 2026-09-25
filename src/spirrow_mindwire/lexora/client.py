@@ -352,6 +352,43 @@ class LexoraClient:
             )
         return _parse_completion(payload)
 
+    async def decide(self, body: dict[str, Any]) -> dict[str, Any]:
+        """``POST /v1/decide`` — the Decider endpoint (T-decider-conductor-hook step 2).
+
+        ``body`` is the request already assembled by
+        :func:`spirrow_mindwire.decider.wire.build_decide_request` (the single builder shared by
+        the live adapter and the replay script, so the two can never send different bytes). This
+        method only transports it and returns the decoded JSON object.
+
+        Same fail-loud policy as :meth:`chat_completion`: a transport failure, a non-2xx status,
+        or a body that is not a JSON object raises :class:`LexoraHTTPError` (timeouts as the
+        :class:`LexoraTimeoutError` subtype). Interpreting the envelope — ``provider`` /
+        ``decision_id`` / ``answers`` — is the adapter's job, not this layer's.
+        """
+        try:
+            resp = await self._client.post("/v1/decide", json=body)
+        except httpx.TimeoutException as e:
+            raise LexoraTimeoutError(f"POST /v1/decide timed out: {e}") from e
+        except httpx.RequestError as e:
+            raise LexoraHTTPError(f"POST /v1/decide: {e}") from e
+        # Strictly 200 (Bohr msg-4180 §2-4: "200 以外" is a transport failure) — Lexora absorbs its
+        # own provider failures into a 200 with ``provider="null"``, so any other status means the
+        # endpoint itself did not answer.
+        if resp.status_code != 200:
+            raise LexoraHTTPError(
+                f"/v1/decide returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+            )
+        try:
+            payload = resp.json()
+        except ValueError as e:
+            raise LexoraHTTPError(f"/v1/decide: malformed JSON: {e}") from e
+        if not isinstance(payload, dict):
+            raise LexoraHTTPError(
+                f"/v1/decide: expected a JSON object, got {type(payload).__name__}"
+            )
+        return payload
+
 
 def _error_detail(resp: httpx.Response) -> str:
     """Best-effort extraction of a FastAPI ``{"detail": ...}`` error string."""

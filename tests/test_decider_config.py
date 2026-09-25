@@ -21,12 +21,13 @@ from spirrow_mindwire.config import (
 )
 
 
-def test_decider_defaults_are_all_off() -> None:
-    """default 状態で全 mode が off (D12 の shadow 先行デプロイ前の初期状態)。"""
+def test_decider_defaults_backend_off_tierc_shadow() -> None:
+    """default: backend=off (∴ Decider は構築されない)、Track B mode=off、
+    Tier-C mode=shadow (step 2 / Bohr msg-4180 §4 の既定値)。"""
     cfg = DeciderConfig()
     assert cfg.mode == "off"
     assert cfg.backend == "off"
-    assert cfg.tierc.mode == "off"
+    assert cfg.tierc.mode == "shadow"
 
 
 def test_decider_tierc_mode_accepts_all_four_values() -> None:
@@ -52,10 +53,11 @@ def test_decider_tierc_mode_rejects_unknown_value() -> None:
 
 
 def test_default_settings_expose_decider_block() -> None:
-    """MindwireSettings に ``decider`` field が生えていて、default で off。"""
+    """MindwireSettings に ``decider`` field が生えていて、backend は default で off。"""
     settings = MindwireSettings()
     assert isinstance(settings.decider, DeciderConfig)
-    assert settings.decider.tierc.mode == "off"
+    assert settings.decider.backend == "off"
+    assert settings.decider.tierc.mode == "shadow"
     assert settings.decider.mode == "off"
 
 
@@ -69,7 +71,8 @@ def test_loading_toml_without_decider_block_keeps_defaults(tmp_path: Path) -> No
     )
     settings = load_settings(toml)
     assert settings.decider.mode == "off"
-    assert settings.decider.tierc.mode == "off"
+    assert settings.decider.backend == "off"
+    assert settings.decider.tierc.mode == "shadow"
 
 
 def test_loading_toml_with_shadow_tierc(tmp_path: Path) -> None:
