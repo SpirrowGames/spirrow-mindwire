@@ -642,3 +642,13 @@ def test_replay_without_endpoint_is_unchanged_dry_run(tmp_path: Path) -> None:
     assert replay.main(["--track", "tierc", "--fixture", str(fixture), "--out", str(out)]) == 0
     rec = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
     assert "decision" not in rec
+
+
+def test_default_settings_build_no_decider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tierc default is shadow (msg-4180 §4) but backend default is off → no Decider, no HTTP."""
+    from spirrow_mindwire.config import MindwireSettings
+
+    monkeypatch.delenv("MINDWIRE_DECIDER_BACKEND", raising=False)
+    cfg = MindwireSettings().decider
+    assert cfg.tierc.mode == "shadow"
+    assert build_decider(config_backend=cfg.backend, tierc_mode=cfg.tierc.mode) is None
