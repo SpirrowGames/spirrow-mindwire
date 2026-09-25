@@ -167,6 +167,20 @@ def log_decision(
     return record
 
 
+_HUMAN_NEXT = "human"
+"""The reserved ``parsed_next`` of a human handoff (same value the adapter gates on)."""
+
+
+def _is_tierc_target(decider: Decider, state: DecisionState) -> bool:
+    """Whether this turn is one the Tier-C Decider is meant to evaluate at all.
+
+    Mirrors the non-gate half of the adapter's own skip condition: a Decider in mode ``off``
+    or a head that is not ``NEXT: human`` is not a target, so a ``None`` from ``evaluate`` there
+    is not a "missed" turn.
+    """
+    return decider.tierc_mode != "off" and state.parsed_next == _HUMAN_NEXT
+
+
 async def run_tierc_hook(
     decider: Decider,
     *,
@@ -193,9 +207,12 @@ async def run_tierc_hook(
         logger.warning("decider hook failed; stop decision unaffected", exc_info=True)
         return None
     if dr is None:
-        # msg-4196 DECIDED 2: an un-gated turn is still recorded (outcome empty) so the turns
-        # missed before step 2b wires the admission gate can be counted.
-        if state.gate_result is None:
+        # msg-4196 DECIDED 2: a turn the hook TARGETED but did not send because the admission
+        # gate did not run is still recorded (outcome empty), so the turns missed before step 2b
+        # wires the gate can be counted. ``evaluate`` also returns ``None`` for turns that were
+        # never targets (mode off, head not ``NEXT: human``); those write nothing — ``gate_result
+        # is None`` alone cannot tell the two apart (PR-gate on #345).
+        if _is_tierc_target(decider, state) and state.gate_result is None:
             log_decision(
                 thread_id=thread_id,
                 round_index=round_index,

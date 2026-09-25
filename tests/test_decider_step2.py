@@ -565,6 +565,44 @@ async def test_hook_logs_not_called_line_for_ungated_turn(
 
 
 @pytest.mark.anyio
+async def test_hook_writes_no_line_for_non_human_head(caplog: pytest.LogCaptureFixture) -> None:
+    """PR-gate on #345: ``evaluate`` → None on a non-human head is not a "missed" turn."""
+    msgs = [
+        ThreadMessage("m1", "Bohr", "design\n\nNEXT: Einstein", "Einstein"),
+        ThreadMessage("m2", "Einstein", "critique\n\nNEXT: Bohr", "Bohr"),
+    ]
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        got = await run_tierc_hook(
+            _StubDecider(None),
+            thread_id="T",
+            round_index=1,
+            roster={},
+            messages=msgs,
+            stop=None,
+        )
+    assert got is None
+    assert _decider_lines(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_hook_writes_no_line_when_decider_mode_off(caplog: pytest.LogCaptureFixture) -> None:
+    """PR-gate on #345: a Decider in mode ``off`` targets nothing, so it logs nothing."""
+    decider = _StubDecider(None)
+    decider.tierc_mode = "off"
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        got = await run_tierc_hook(
+            decider,
+            thread_id="T",
+            round_index=1,
+            roster={},
+            messages=_msgs(),
+            stop="human",
+        )
+    assert got is None
+    assert _decider_lines(caplog) == []
+
+
+@pytest.mark.anyio
 async def test_hook_with_gate_logs_gate_columns(caplog: pytest.LogCaptureFixture) -> None:
     dr = _dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE))
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
