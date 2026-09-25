@@ -17,12 +17,12 @@ Conductor フック配線は step 2 扱い ∴ ここには入らない。本 mo
 汚す」との architectural advisory を出した。同 msg で **non-blocking** と
 明記されている ∴ 本 PR では設計 v3.4 §3.2 (`DecisionState.gate_result`)
 と Fermi msg-4066 の DECIDED (「state_builder が `gate_result` を turn から
-コピー」がテスト要件) をそのまま採る。 LLM 送信 payload から `gate_result`
-を除外する責務は step 2 の adapter (``decider_lexora.py``) の serialize 側
-に置く — 本 module の ``DecisionState`` は Conductor 側と replay 側で共有
-される内部表現で、adapter は最終送信直前に必要な field だけを選んで詰め
-れば足りる。Einstein の懸念は step 2 で adapter 側の serialize test として
-実装する。
+コピー」がテスト要件) をそのまま採る。 step 1 時点ではここに「送信 payload
+から `gate_result` を除外する責務は step 2 の adapter に置く」と書いていたが、
+step 2 の Bohr msg-4180 §2-1 は replay の serialize (``gate_result`` を含む) を
+そのまま ``decider/wire.py`` に移すと決めた (設計 v3.4 §6.4 も ``gate_result``
+を feature として扱う)。 ∴ 現行の wire は ``gate_result`` を含む — 詳細と
+変更点は ``decider/wire.py`` の docstring を参照。
 """
 
 from __future__ import annotations

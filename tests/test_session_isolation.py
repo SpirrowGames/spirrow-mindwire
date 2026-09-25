@@ -57,6 +57,7 @@ _NOT_SDK_BACKED: dict[str, str] = {
         "(implementer.py) via session_isolation_kwargs()"
     ),
     "naysayer_lexora.py": "reaches Lexora over HTTP; builds no SDK session",
+    "decider_lexora.py": "reaches Lexora /v1/decide over HTTP; builds no SDK session",
 }
 
 
