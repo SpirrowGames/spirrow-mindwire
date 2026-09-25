@@ -7,8 +7,10 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
    ``state_builder`` — the same builder the replay uses);
 2. ``dr = await decider.evaluate(state)`` — ``None`` only if the Decider was not called;
 3. ``log_decision(...)`` — **always** when called, every outcome, with ``decision_id`` and
-   ``outcome`` and the rule ``stop`` on the same line (msg-4182 / msg-4186 §2: pre-emption by a
-   rule stop is read off the ``stop`` column; ``dr`` is never rewritten);
+   ``outcome``, the gate columns ``gate_kind`` / ``gate_is_grey_zone`` and the rule ``stop`` on
+   the same line (msg-4182 / msg-4186 §2: pre-emption by a rule stop is read off the ``stop``
+   column; ``dr`` is never rewritten), and also once, with ``outcome`` empty, when the Decider
+   was not called because the admission gate did not run (msg-4196 DECIDED 2);
 4. the acting branch is gated on ``dr.actionable_verdict`` only (msg-4184) and on a mode of
    ``annotate`` / ``bounce`` — which step 2 refuses at build time, so in shadow it never runs.
 
@@ -21,10 +23,13 @@ and logged — it must never reach the stop decision.
 evaluation join (thread_id + round + decision_id) off the conductor's own log. It is not posted
 to any chatroom thread, so no chatroom fallback surface is involved.
 
-**Known limitation (reported, not fixed here).** The live Conductor does not run the Tier-C
+**Admission gate not wired yet (msg-4196).** The live Conductor does not run the Tier-C
 admission gate (``tier_c_admission_gate.decide_admission`` has no caller in ``conductor/``), so
-``gate_result`` is ``None`` on every live turn and every live verdict is OUT_OF_GATE →
-``actionable_verdict`` is always ``None`` live until the admission gate is wired in.
+``gate_result`` is ``None`` on every live turn. msg-4196 DECIDED 1: such a turn is **not** sent to
+Lexora (``evaluate`` returns ``None``); DECIDED 2: the hook still writes one ``decider_decision``
+line for it with an empty ``outcome`` and ``gate_kind`` / ``gate_is_grey_zone`` = ``None``, so the
+turns missed before the gate is wired (step 2b) can be counted, and pre-/post-wiring lines are
+told apart by the gate columns rather than by date.
 """
 
 from __future__ import annotations
@@ -114,19 +119,49 @@ def turn_from_messages(
     )
 
 
+_NOT_CALLED_FIELDS: dict[str, Any] = {
+    "outcome": None,
+    "decision_id": None,
+    "provider": None,
+    "raw_answers": None,
+    "verdict": None,
+    "policy": None,
+    "questions_version": None,
+    "latency_ms": None,
+    "error": None,
+}
+"""The ``decision_result_to_dict`` keys, all empty: the line for a turn the hook targeted but
+did not send to Lexora (msg-4196 DECIDED 2 — ``outcome`` empty)."""
+
+
 def log_decision(
-    *, thread_id: str, round_index: int, stop: str | None, dr: DecisionResult
+    *,
+    thread_id: str,
+    round_index: int,
+    stop: str | None,
+    dr: DecisionResult | None,
+    gate_result: AdmissionGateResult | None,
 ) -> dict[str, Any]:
     """Write one decision record to the conductor log and return it (msg-4182).
 
     The one place (with the replay record) allowed to read ``dr.verdict`` directly — through
     :func:`decision_result_to_dict` — because the §6.3 tally needs out-of-gate records too.
+
+    ``gate_kind`` / ``gate_is_grey_zone`` (msg-4196 DECIDED 2) are ``None`` when the admission
+    gate did not run. ``dr=None`` writes the same keys with ``outcome`` empty — the "hook
+    targeted this turn, Decider not called" line.
     """
     record: dict[str, Any] = {
         "thread_id": thread_id,
         "round_index": round_index,
         "stop": stop,
-        **decision_result_to_dict(dr),
+        "gate_kind": (
+            gate_result.kind.value
+            if gate_result is not None and gate_result.kind is not None
+            else None
+        ),
+        "gate_is_grey_zone": gate_result.is_grey_zone if gate_result is not None else None,
+        **(decision_result_to_dict(dr) if dr is not None else _NOT_CALLED_FIELDS),
     }
     logger.info("decider_decision %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
     return record
@@ -158,8 +193,24 @@ async def run_tierc_hook(
         logger.warning("decider hook failed; stop decision unaffected", exc_info=True)
         return None
     if dr is None:
+        # msg-4196 DECIDED 2: an un-gated turn is still recorded (outcome empty) so the turns
+        # missed before step 2b wires the admission gate can be counted.
+        if state.gate_result is None:
+            log_decision(
+                thread_id=thread_id,
+                round_index=round_index,
+                stop=stop,
+                dr=None,
+                gate_result=None,
+            )
         return None
-    log_decision(thread_id=thread_id, round_index=round_index, stop=stop, dr=dr)
+    log_decision(
+        thread_id=thread_id,
+        round_index=round_index,
+        stop=stop,
+        dr=dr,
+        gate_result=state.gate_result,
+    )
 
     # msg-4184 §2: acting code reads ``actionable_verdict`` only. annotate / bounce are refused
     # at build time in step 2, so under shadow this branch is structurally dead; the shape is

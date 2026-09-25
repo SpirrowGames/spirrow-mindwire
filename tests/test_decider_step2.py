@@ -2,7 +2,8 @@
 
 Spec: Bohr msg-4180 (wire / Null rule / extraction / transport / policy / replay --endpoint),
 msg-4182 (``DecisionResult``), msg-4184 (``actionable_verdict`` + invariants), msg-4186 (gate =
-``is_grey_zone``; 4-valued outcome), msg-4188 (always call ``/v1/decide``, then branch).
+``is_grey_zone``; 4-valued outcome), msg-4188 (always call ``/v1/decide``, then branch),
+msg-4196 (DECIDED 1: ``gate_result is None`` → no call; DECIDED 2: gate columns + not-called line).
 """
 
 from __future__ import annotations
@@ -287,17 +288,33 @@ async def test_jev_in_grey_zone_synthesises_in_gate_verdict() -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("gate", [ADMIT_LABELLED, None])
-async def test_out_of_grey_zone_still_calls_and_is_out_of_gate(
-    gate: AdmissionGateResult | None,
-) -> None:
+async def test_out_of_grey_zone_still_calls_and_is_out_of_gate() -> None:
     c = FakeClient(_payload())
-    dr = await decide_once(_state(gate), client=c, policy="p")
-    assert len(c.bodies) == 1  # always called (msg-4188 step 1)
+    dr = await decide_once(_state(ADMIT_LABELLED), client=c, policy="p")
+    assert len(c.bodies) == 1  # always called once a gate result exists (msg-4188 step 1)
     assert dr.outcome is DecisionOutcome.EVALUATED
     assert dr.decision_id == "d-1"
     assert dr.verdict is not None and dr.verdict.scope is TierCScope.OUT_OF_GATE
     assert dr.actionable_verdict is None
+
+
+@pytest.mark.anyio
+async def test_gate_none_makes_zero_http_and_evaluate_returns_none() -> None:
+    """msg-4196 DECIDED 1 (replaces msg-4188's "None → call → OUT_OF_GATE")."""
+    c = FakeClient(_payload())
+    shadow = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c)
+    assert await shadow.evaluate(_state(None)) is None
+    assert c.bodies == []
+    assert c.closed == 0  # no client was even built
+
+
+@pytest.mark.anyio
+async def test_decide_once_refuses_gate_none_before_any_http() -> None:
+    """msg-4196 DECIDED 1: the ``None → OUT_OF_GATE`` path is withdrawn, not just unused."""
+    c = FakeClient(_payload())
+    with pytest.raises(ValueError, match="gate_result"):
+        await decide_once(_state(None), client=c, policy="p")
+    assert c.bodies == []
 
 
 @pytest.mark.anyio
@@ -443,13 +460,39 @@ def test_log_decision_always_writes_id_and_outcome(
     dr: DecisionResult, caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        rec = log_decision(thread_id="T-x", round_index=3, stop="human", dr=dr)
+        rec = log_decision(thread_id="T-x", round_index=3, stop="human", dr=dr, gate_result=GREY)
     assert rec["outcome"] == dr.outcome.value
+    assert rec["gate_kind"] == "ADMIT_UNSURE" and rec["gate_is_grey_zone"] is True
     assert "decision_id" in rec and rec["decision_id"] == dr.decision_id
     assert rec["stop"] == "human"
     line = next(r.getMessage() for r in caplog.records if "decider_decision" in r.getMessage())
     logged = json.loads(line.split("decider_decision ", 1)[1])
     assert logged["outcome"] == dr.outcome.value and logged["decision_id"] == dr.decision_id
+
+
+def test_log_decision_gate_columns_for_labelled_admit() -> None:
+    """msg-4196 DECIDED 2: ``gate_kind`` may be ``None`` even when the gate ran."""
+    dr = _dr(DecisionOutcome.EVALUATED, _v(TierCScope.OUT_OF_GATE))
+    rec = log_decision(
+        thread_id="T", round_index=1, stop="human", dr=dr, gate_result=ADMIT_LABELLED
+    )
+    assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is False
+
+
+def test_log_decision_not_called_line_has_empty_outcome_and_same_keys() -> None:
+    """msg-4196 DECIDED 2: the "targeted but not sent" line — outcome empty, gate columns None."""
+    called = log_decision(
+        thread_id="T",
+        round_index=1,
+        stop="human",
+        dr=_dr(DecisionOutcome.NO_VERDICT_NULL, None),
+        gate_result=GREY,
+    )
+    rec = log_decision(thread_id="T", round_index=1, stop="human", dr=None, gate_result=None)
+    assert set(rec) == set(called)
+    assert rec["outcome"] is None and rec["decision_id"] is None
+    assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is None
+    assert rec["stop"] == "human"
 
 
 class _StubDecider:
@@ -490,6 +533,53 @@ async def test_hook_with_preexisting_stop_logs_both_and_keeps_dr() -> None:
         _StubDecider(dr), thread_id="T", round_index=1, roster={}, messages=_msgs(), stop="human"
     )
     assert got is dr
+
+
+def _decider_lines(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    return [
+        json.loads(r.getMessage().split("decider_decision ", 1)[1])
+        for r in caplog.records
+        if r.getMessage().startswith("decider_decision ")
+    ]
+
+
+@pytest.mark.anyio
+async def test_hook_logs_not_called_line_for_ungated_turn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """msg-4196 DECIDED 2: gate did not run → evaluate None → still one line, outcome empty."""
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        got = await run_tierc_hook(
+            _StubDecider(None),
+            thread_id="T",
+            round_index=1,
+            roster={},
+            messages=_msgs(),
+            stop="human",
+        )
+    assert got is None
+    lines = _decider_lines(caplog)
+    assert len(lines) == 1
+    assert lines[0]["outcome"] is None and lines[0]["gate_is_grey_zone"] is None
+    assert lines[0]["stop"] == "human"
+
+
+@pytest.mark.anyio
+async def test_hook_with_gate_logs_gate_columns(caplog: pytest.LogCaptureFixture) -> None:
+    dr = _dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE))
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        await run_tierc_hook(
+            _StubDecider(dr),
+            thread_id="T",
+            round_index=1,
+            roster={},
+            messages=_msgs(),
+            stop="human",
+            gate_result=GREY,
+        )
+    (line,) = _decider_lines(caplog)
+    assert line["outcome"] == "evaluated"
+    assert line["gate_kind"] == "ADMIT_UNSURE" and line["gate_is_grey_zone"] is True
 
 
 @pytest.mark.anyio
