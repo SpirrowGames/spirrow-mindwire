@@ -226,17 +226,23 @@ class DeciderLexoraAdapter:
     def tierc_mode(self) -> str:
         return self._tierc_mode
 
+    def is_target(self, state: DecisionState) -> bool:
+        """Whether this Decider evaluates ``state`` at all, gate aside (PR-gate advisory on #345).
+
+        The single owner of the "is this turn a Tier-C target" rule: mode not ``off`` and head
+        ``NEXT: human``. :meth:`evaluate` and the Conductor hook both ask this method rather than
+        each restating the condition, so the hook's "targeted but not sent" line cannot drift
+        from what :meth:`evaluate` actually skips.
+        """
+        return self._tierc_mode != "off" and state.parsed_next == HUMAN_NEXT
+
     async def evaluate(self, state: DecisionState) -> DecisionResult | None:
         """``None`` iff the Decider was not called (msg-4182); otherwise always a result.
 
-        Not called when the mode is off, the head is not ``NEXT: human``, or the admission gate
-        did not run (``gate_result is None`` — msg-4196 DECIDED 1: zero HTTP, zero Jev billing).
+        Not called when :meth:`is_target` is false, or the admission gate did not run
+        (``gate_result is None`` — msg-4196 DECIDED 1: zero HTTP, zero Jev billing).
         """
-        if (
-            self._tierc_mode == "off"
-            or state.parsed_next != HUMAN_NEXT
-            or state.gate_result is None
-        ):
+        if not self.is_target(state) or state.gate_result is None:
             return None
         client = self._client_factory()
         try:
