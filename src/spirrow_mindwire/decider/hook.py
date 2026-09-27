@@ -1,43 +1,44 @@
-"""Conductor-side Tier-C Decider hook (T-decider-conductor-hook step 2, shadow).
+"""Conductor-side Tier-C Decider hook (T-decider-conductor-hook step 2 / 2b, shadow).
 
 Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its rule-based routing
-(``_route``) has produced a stop (or a forced consult) for a ``NEXT: human`` head. What it does:
+(``_route``) has decided the turn. What it does:
 
-1. build the :class:`~.state.DecisionState` from the thread (``turn_from_messages`` →
-   ``state_builder`` — the same builder the replay uses);
-2. ``dr = await decider.evaluate(state)`` — ``None`` only if the Decider was not called;
-3. ``log_decision(...)`` — **always** when called, every outcome, with ``decision_id`` and
-   ``outcome``, the gate columns ``gate_kind`` / ``gate_is_grey_zone`` and the rule ``stop`` on
-   the same line (msg-4182 / msg-4186 §2: pre-emption by a rule stop is read off the ``stop``
-   column; ``dr`` is never rewritten), and also once, with ``outcome`` empty, when the Decider
-   was not called because the admission gate did not run (msg-4196 DECIDED 2);
-4. the acting branch is gated on ``dr.actionable_verdict`` only (msg-4184) and on a mode of
-   ``annotate`` / ``bounce`` — which step 2 refuses at build time, so in shadow it never runs.
+0. **entry check** (msg-4203 DECIDED 2b-3, :func:`is_tierc_entry`): only a turn whose rule stop
+   is ``HUMAN``, whose author wrote ``NEXT: human`` themself, and whose author holds the
+   ``proposer`` role in the roster. Any other turn returns at once — no gate, no Lexora call, no
+   log line;
+1. run the admission gate **compute-only** (msg-4200 DECIDED 2b-1 / 2b-2,
+   :func:`compute_gate_result`): ``retry_lookup`` always ``False``, the decision's log entries
+   discarded (nothing is written to the decisions log), a gate exception → ``gate_result=None``;
+2. build the :class:`~.state.DecisionState` (``turn_from_messages`` → ``state_builder`` — the same
+   builder the replay uses) with that ``gate_result``;
+3. ask the Decider whether the turn is a target (``decider.is_target`` — mode / head; the rule
+   lives in the Decider, not here); if the gate gave no result, write the empty-``outcome`` line
+   (msg-4196 DECIDED 2) and do not call Lexora (DECIDED 1); otherwise ``decider.evaluate``;
+4. ``log_decision(...)`` — every outcome, with ``decision_id`` / ``outcome``, the gate columns
+   ``gate_kind`` / ``gate_is_grey_zone`` and the rule ``stop`` on the same line;
+5. the acting branch is gated on ``dr.actionable_verdict`` only (msg-4184) and on a mode of
+   ``annotate`` / ``bounce`` — which is refused at build time, so in shadow it never runs.
 
-**Monotonicity (D20).** Nothing here returns a new stop. The hook returns the result only so a
-caller/test can observe it; the Conductor discards it. Any exception from the Decider is caught
-and logged — it must never reach the stop decision.
+**Monotonicity (D20).** Nothing here returns a new stop, and the gate's admit / bounce is never
+used for stop, notification or routing — only as Decider input and a log column. The hook returns
+the result only so a caller/test can observe it; the Conductor discards it. Any exception is
+caught and logged — it must never reach the stop decision.
 
 **Reader of the log line.** The payload is a structured ``logger.info`` record under the logger
 ``spirrow_mindwire.decider.hook`` (prefix ``decider_decision``), read by the operator / the §6
 evaluation join (thread_id + round + decision_id) off the conductor's own log. It is not posted
 to any chatroom thread, so no chatroom fallback surface is involved.
-
-**Admission gate not wired yet (msg-4196).** The live Conductor does not run the Tier-C
-admission gate (``tier_c_admission_gate.decide_admission`` has no caller in ``conductor/``), so
-``gate_result`` is ``None`` on every live turn. msg-4196 DECIDED 1: such a turn is **not** sent to
-Lexora (``evaluate`` returns ``None``); DECIDED 2: the hook still writes one ``decider_decision``
-line for it with an empty ``outcome`` and ``gate_kind`` / ``gate_is_grey_zone`` = ``None``, so the
-turns missed before the gate is wired (step 2b) can be counted, and pre-/post-wiring lines are
-told apart by the gate columns rather than by date.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from spirrow_mindwire.decider.result import DecisionResult, decision_result_to_dict
@@ -47,6 +48,13 @@ from spirrow_mindwire.decider.state import (
     EventSummary,
     SimpleTurn,
     state_builder,
+)
+from spirrow_mindwire.tier_c_admission_gate import (
+    AdmissionDecision,
+    LogKind,
+    RetryAdmitReason,
+    RetryLookup,
+    decide_admission,
 )
 from spirrow_mindwire.value_objects import Role
 
@@ -65,6 +73,8 @@ class Decider(Protocol):
 
     @property
     def tierc_mode(self) -> str: ...
+
+    def is_target(self, state: DecisionState) -> bool: ...
 
     async def evaluate(self, state: DecisionState) -> DecisionResult | None: ...
 
@@ -167,18 +177,125 @@ def log_decision(
     return record
 
 
-_HUMAN_NEXT = "human"
-"""The reserved ``parsed_next`` of a human handoff (same value the adapter gates on)."""
+_STOP_HUMAN = "human"
+"""``StopReason.HUMAN.value`` — the rule stop the Tier-C hook enters on (msg-4203). Spelled as
+the string because the Conductor passes ``stop_reason.value`` and ``conductor.core`` imports this
+module (importing ``StopReason`` back would be circular)."""
 
 
-def _is_tierc_target(decider: Decider, state: DecisionState) -> bool:
-    """Whether this turn is one the Tier-C Decider is meant to evaluate at all.
+def _roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
+    """``roster[author]``, falling back to a case-insensitive match (the rule the Conductor routes
+    by), else ``None``. An author absent from the roster (e.g. ``pr-gate-relay``) is ``None`` and
+    therefore not a Tier-C target — the safe, non-intercepting side (msg-4203)."""
+    direct = roster.get(author)
+    if direct is not None:
+        return direct
+    folded = author.casefold()
+    for identity, role in roster.items():
+        if identity.casefold() == folded:
+            return role
+    return None
 
-    Mirrors the non-gate half of the adapter's own skip condition: a Decider in mode ``off``
-    or a head that is not ``NEXT: human`` is not a target, so a ``None`` from ``evaluate`` there
-    is not a "missed" turn.
+
+def is_tierc_entry(
+    *,
+    original_stop: str | None,
+    author_wrote_next_human: bool,
+    author_role: Role | None,
+) -> bool:
+    """The Tier-C hook's entry condition (msg-4203 DECIDED 2b-3 revised; approved msg-4204).
+
+    All three must hold:
+
+    * ``original_stop == HUMAN`` — the rule-stop snapshot (design §3.3.b / D21), replacing
+      msg-4184's ``stop is None``;
+    * the author wrote ``NEXT: human`` themself — a field/body mismatch that resolved to HUMAN is
+      a conductor safety valve, not someone asking the human;
+    * the author's roster role is ``proposer`` — by role, not by persona name, so a renamed
+      proposer does not silently drop out. An implementer's merge handoff, a naysayer's exit turn
+      (``VERDICT: APPROVE``) and an off-roster infra author never enter (Einstein msg-4202).
+
+    Checked at the hook's entry, before anything else: a non-target turn gets no admission-gate
+    computation, no Lexora call and no ``decider_decision`` line — in shadow and active alike, so
+    what shadow measures is what active will act on.
     """
-    return decider.tierc_mode != "off" and state.parsed_next == _HUMAN_NEXT
+    return original_stop == _STOP_HUMAN and author_wrote_next_human and author_role is Role.PROPOSER
+
+
+def never_retry(uuid_: str, author: str) -> bool:
+    """msg-4200 DECIDED 2b-1: the compute-only gate's ``retry_lookup`` — always ``False``.
+
+    No live path has ever bounced anyone (``append_log_entry`` / ``build_retry_lookup`` have no
+    caller in ``src/``), so "no unresolved bounce exists" is the true answer today. A ``RETRY:``
+    prefix therefore falls through to label evaluation — what a real gate does for a retry that
+    matches nothing. When the gate is wired for real and writes the decisions log, that PR swaps
+    this for ``build_retry_lookup(log_path)`` in one step (no mixed period).
+    """
+    return False
+
+
+_GATE_KINDS: frozenset[LogKind] = frozenset(
+    {LogKind.ADMIT_UNSURE, LogKind.BOUNCED, LogKind.RETRY_ADMIT}
+)
+
+
+def gate_result_from_decision(decision: AdmissionDecision) -> AdmissionGateResult:
+    """``AdmissionDecision`` → the compact §3.5 / D17 ``AdmissionGateResult``.
+
+    ``kind`` is the decision's ``ADMIT_UNSURE`` / ``BOUNCED`` / ``RETRY_ADMIT`` entry, or ``None``
+    for a plain or label-migration admit (``AdmissionGateResult`` docstring). ``log_entries`` are
+    read here and then dropped — nothing writes them.
+    """
+    kind: LogKind | None = None
+    retry_reason: RetryAdmitReason | None = None
+    for entry in decision.log_entries:
+        if entry.kind in _GATE_KINDS:
+            kind = entry.kind
+            if entry.kind is LogKind.RETRY_ADMIT:
+                retry_reason = RetryAdmitReason(str(entry.payload["reason"]))
+    return AdmissionGateResult(
+        verdict=decision.verdict,
+        kind=kind,
+        label=decision.normalized_label,
+        retry_admit_reason=retry_reason,
+        bounce_reason=decision.bounce_reason,
+    )
+
+
+def _new_bounce_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def compute_gate_result(
+    *,
+    body: str,
+    author: str,
+    now: datetime,
+    retry_lookup: RetryLookup = never_retry,
+    bounce_uuid_factory: Callable[[], str] = _new_bounce_uuid,
+) -> AdmissionGateResult | None:
+    """Run the admission gate compute-only (msg-4200 DECIDED 2b-1 / 2b-2).
+
+    * **Nothing is written.** ``AdmissionDecision.log_entries`` are discarded: a ``BOUNCED`` row
+      for a bounce that never happened would, once the gate is wired for real, poison the retry
+      state and admit a phantom ``RETRY_ADMIT``.
+    * ``bounce_uuid`` is fresh per call and discarded (``decide_admission`` docstring contract).
+    * An exception from the gate yields ``None``: the Decider is then not called (msg-4196
+      DECIDED 1) and the hook writes its empty-``outcome`` line. The stop is unaffected.
+    * The result feeds the Decider and the log only — never stop, notification or routing.
+    """
+    try:
+        decision = decide_admission(
+            body=body,
+            author=author,
+            retry_lookup=retry_lookup,
+            now=now,
+            bounce_uuid=bounce_uuid_factory(),
+        )
+        return gate_result_from_decision(decision)
+    except Exception:
+        logger.warning("admission gate failed in the decider hook; gate_result=None", exc_info=True)
+        return None
 
 
 async def run_tierc_hook(
@@ -189,10 +306,27 @@ async def run_tierc_hook(
     roster: Mapping[str, Role],
     messages: Sequence[ThreadMessage],
     stop: str | None,
-    gate_result: AdmissionGateResult | None = None,
+    author_wrote_next_human: bool,
+    now: datetime | None = None,
 ) -> DecisionResult | None:
-    """Evaluate + log. Returns the result for observation; it never changes ``stop``."""
+    """Entry check → admission gate (compute-only) → evaluate + log. Never changes ``stop``.
+
+    ``stop`` is the rule-stop snapshot (``original_stop``, D21): read for the entry condition and
+    written to the log line, never modified. ``now`` defaults to the wall clock.
+    """
+    head = messages[-1] if messages else None
+    if head is None or not is_tierc_entry(
+        original_stop=stop,
+        author_wrote_next_human=author_wrote_next_human,
+        author_role=_roster_role(roster, head.author),
+    ):
+        return None
     try:
+        gate_result = compute_gate_result(
+            body=head.content,
+            author=head.author,
+            now=now if now is not None else datetime.now(UTC),
+        )
         state = state_builder(
             turn_from_messages(
                 thread_id=thread_id,
@@ -202,24 +336,23 @@ async def run_tierc_hook(
                 gate_result=gate_result,
             )
         )
+        # The Decider owns "is this turn a target" (mode / head); the hook asks rather than
+        # restating the rule (PR-gate advisory 1 on #345). Not a target → nothing is written.
+        if not decider.is_target(state):
+            return None
+        if state.gate_result is None:
+            # msg-4196 DECIDED 2: a targeted turn the gate could not classify is not sent
+            # (DECIDED 1) but still leaves one line with ``outcome`` empty.
+            log_decision(
+                thread_id=thread_id, round_index=round_index, stop=stop, dr=None, gate_result=None
+            )
+            return None
         dr = await decider.evaluate(state)
     except Exception:
         logger.warning("decider hook failed; stop decision unaffected", exc_info=True)
         return None
     if dr is None:
-        # msg-4196 DECIDED 2: a turn the hook TARGETED but did not send because the admission
-        # gate did not run is still recorded (outcome empty), so the turns missed before step 2b
-        # wires the gate can be counted. ``evaluate`` also returns ``None`` for turns that were
-        # never targets (mode off, head not ``NEXT: human``); those write nothing — ``gate_result
-        # is None`` alone cannot tell the two apart (PR-gate on #345).
-        if _is_tierc_target(decider, state) and state.gate_result is None:
-            log_decision(
-                thread_id=thread_id,
-                round_index=round_index,
-                stop=stop,
-                dr=None,
-                gate_result=None,
-            )
+        # Not reachable under the Decider contract (target + gate ran ⇒ called); nothing to log.
         return None
     log_decision(
         thread_id=thread_id,
@@ -229,11 +362,12 @@ async def run_tierc_hook(
         gate_result=state.gate_result,
     )
 
-    # msg-4184 §2: acting code reads ``actionable_verdict`` only. annotate / bounce are refused
-    # at build time in step 2, so under shadow this branch is structurally dead; the shape is
-    # fixed here so later steps start from it.
+    # msg-4184 §2: acting code reads ``actionable_verdict`` only. The entry check above already
+    # guarantees ``original_stop == HUMAN`` (msg-4203 DECIDED 2b-3, replacing msg-4184's
+    # ``stop is None``). annotate / bounce are refused at build time, so under shadow this branch
+    # is structurally dead; the shape is fixed here so later steps start from it.
     av = dr.actionable_verdict
-    if decider.tierc_mode in ACTING_TIERC_MODES and av is not None and stop is None:
+    if decider.tierc_mode in ACTING_TIERC_MODES and av is not None:
         logger.warning(
             "decider tierc mode %r has no acting implementation yet; verdict %s not acted on",
             decider.tierc_mode,
@@ -247,7 +381,11 @@ __all__ = [
     "RECENT_EVENTS_N",
     "Decider",
     "ThreadMessage",
+    "compute_gate_result",
+    "gate_result_from_decision",
+    "is_tierc_entry",
     "log_decision",
+    "never_retry",
     "run_tierc_hook",
     "turn_from_messages",
 ]

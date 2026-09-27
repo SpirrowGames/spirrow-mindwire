@@ -3,7 +3,8 @@
 Spec: Bohr msg-4180 (wire / Null rule / extraction / transport / policy / replay --endpoint),
 msg-4182 (``DecisionResult``), msg-4184 (``actionable_verdict`` + invariants), msg-4186 (gate =
 ``is_grey_zone``; 4-valued outcome), msg-4188 (always call ``/v1/decide``, then branch),
-msg-4196 (DECIDED 1: ``gate_result is None`` → no call; DECIDED 2: gate columns + not-called line).
+msg-4196 (DECIDED 1: ``gate_result is None`` → no call; DECIDED 2: gate columns + not-called line),
+msg-4200 / msg-4203 (step 2b: compute-only admission gate, proposer-only entry; tests 1-10).
 """
 
 from __future__ import annotations
@@ -13,15 +14,17 @@ import importlib.util
 import json
 import logging
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from test_conductor_core import _ROSTER as ROSTER
-from test_conductor_core import _FakeChatroomMcp, _ScriptedDispatcher, _thread_ref
+from test_conductor_core import _attested, _FakeChatroomMcp, _ScriptedDispatcher, _thread_ref
 
 from spirrow_mindwire import decider as decider_facade
+from spirrow_mindwire import tier_c_admission_gate
 from spirrow_mindwire.adapters import decider_lexora
 from spirrow_mindwire.adapters.decider_lexora import (
     DECIDER_TIMEOUT_SECONDS,
@@ -30,9 +33,13 @@ from spirrow_mindwire.adapters.decider_lexora import (
     decide_once,
 )
 from spirrow_mindwire.conductor.core import Conductor, StopReason
+from spirrow_mindwire.decider import hook as hook_mod
 from spirrow_mindwire.decider.hook import (
     ThreadMessage,
+    compute_gate_result,
+    is_tierc_entry,
     log_decision,
+    never_retry,
     run_tierc_hook,
     turn_from_messages,
 )
@@ -61,7 +68,7 @@ from spirrow_mindwire.decider.wire import (
     state_to_wire,
 )
 from spirrow_mindwire.lexora.client import LexoraClient, LexoraHTTPError, LexoraTimeoutError
-from spirrow_mindwire.tier_c_admission_gate import AdmissionVerdict, LogKind
+from spirrow_mindwire.tier_c_admission_gate import AdmissionVerdict, LogKind, RetryAdmitReason
 from spirrow_mindwire.value_objects import Role
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -71,6 +78,7 @@ GREY = AdmissionGateResult(
     verdict=AdmissionVerdict.ADMIT, kind=LogKind.ADMIT_UNSURE, label="unsure:goal?"
 )
 ADMIT_LABELLED = AdmissionGateResult(verdict=AdmissionVerdict.ADMIT, kind=None, label="goal")
+NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
 
 
 def _state(
@@ -502,6 +510,9 @@ class _StubDecider:
         self.exc = exc
         self.states: list[DecisionState] = []
 
+    def is_target(self, state: DecisionState) -> bool:
+        return self.tierc_mode != "off" and state.parsed_next == "human"
+
     async def evaluate(self, state: DecisionState) -> DecisionResult | None:
         self.states.append(state)
         if self.exc is not None:
@@ -509,11 +520,50 @@ class _StubDecider:
         return self.result
 
 
-def _msgs() -> list[ThreadMessage]:
+def _msgs(head_author: str = "Bohr", head_body: str | None = None) -> list[ThreadMessage]:
+    body = "x" * 900 + "\n\nNEXT: human" if head_body is None else head_body
     return [
         ThreadMessage("m1", "Einstein", "critique\n\nNEXT: Bohr", "Bohr"),
-        ThreadMessage("m2", "Bohr", "x" * 900 + "\n\nNEXT: human", "human"),
+        ThreadMessage("m2", head_author, body, "human"),
     ]
+
+
+async def _hook(
+    decider: Any,
+    *,
+    messages: list[ThreadMessage] | None = None,
+    stop: str | None = "human",
+    author_wrote_next_human: bool = True,
+) -> DecisionResult | None:
+    return await run_tierc_hook(
+        decider,
+        thread_id="T",
+        round_index=1,
+        roster=ROSTER,
+        messages=_msgs() if messages is None else messages,
+        stop=stop,
+        author_wrote_next_human=author_wrote_next_human,
+        now=NOW,
+    )
+
+
+class _GateSpy:
+    """Counts ``decide_admission`` calls made through the hook (msg-4203 tests 6-8)."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, exc: Exception | None = None) -> None:
+        self.calls = 0
+        self.decisions: list[Any] = []
+        real = tier_c_admission_gate.decide_admission
+
+        def spy(**kw: Any) -> Any:
+            self.calls += 1
+            if exc is not None:
+                raise exc
+            d = real(**kw)
+            self.decisions.append(d)
+            return d
+
+        monkeypatch.setattr(hook_mod, "decide_admission", spy)
 
 
 def test_turn_from_messages_shape() -> None:
@@ -525,13 +575,96 @@ def test_turn_from_messages_shape() -> None:
     assert t.gate_result is None
 
 
+@pytest.mark.parametrize(
+    ("original_stop", "wrote", "role", "expected"),
+    [
+        ("human", True, Role.PROPOSER, True),
+        (None, True, Role.PROPOSER, False),  # forced naysayer consult: no rule stop yet
+        ("settled", True, Role.PROPOSER, False),
+        ("human", False, Role.PROPOSER, False),  # field/body mismatch safety valve
+        ("human", True, Role.IMPLEMENTER, False),
+        ("human", True, Role.NAYSAYER, False),
+        ("human", True, None, False),  # off-roster author
+    ],
+)
+def test_is_tierc_entry(
+    original_stop: str | None, wrote: bool, role: Role | None, expected: bool
+) -> None:
+    """msg-4203 DECIDED 2b-3 (revised): all three conditions, checked at the hook entry."""
+    assert (
+        is_tierc_entry(original_stop=original_stop, author_wrote_next_human=wrote, author_role=role)
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "verdict", "kind", "label", "grey"),
+    [
+        ("x\nTIER-C: goal\nNEXT: human", AdmissionVerdict.ADMIT, None, "goal", False),
+        (
+            "x\nTIER-C: unsure:goal?\nNEXT: human",
+            AdmissionVerdict.ADMIT,
+            LogKind.ADMIT_UNSURE,
+            "unsure:goal?",
+            True,
+        ),
+        ("x\nNEXT: human", AdmissionVerdict.BOUNCE, LogKind.BOUNCED, None, False),
+    ],
+)
+def test_compute_gate_result_maps_decision(
+    body: str, verdict: AdmissionVerdict, kind: LogKind | None, label: str | None, grey: bool
+) -> None:
+    g = compute_gate_result(body=body, author="Bohr", now=NOW)
+    assert g is not None
+    assert (g.verdict, g.kind, g.label, g.is_grey_zone) == (verdict, kind, label, grey)
+
+
+def test_compute_gate_result_retry_prefix_falls_through_to_labels() -> None:
+    """Test 3 (msg-4200): retry_lookup is always False, so a ``RETRY:`` body is label-evaluated."""
+    body = "RETRY: 1234-abcd\nx\nTIER-C: unsure:goal?\nNEXT: human"
+    g = compute_gate_result(body=body, author="Bohr", now=NOW)
+    assert g is not None
+    assert g.kind is LogKind.ADMIT_UNSURE and g.retry_admit_reason is None
+    assert never_retry("1234-abcd", "Bohr") is False
+
+
+def test_compute_gate_result_retry_admit_reason_when_lookup_matches() -> None:
+    """The mapping carries ``retry_admit_reason`` (for when a real lookup is wired)."""
+    body = "RETRY: u-1\nx\nTIER-C: release-cross-repo\nNEXT: human"
+    g = compute_gate_result(body=body, author="Bohr", now=NOW, retry_lookup=lambda u, a: True)
+    assert g is not None and g.kind is LogKind.RETRY_ADMIT
+    assert g.retry_admit_reason is RetryAdmitReason.SECOND_TIME_FORCE_ADMIT and g.is_grey_zone
+
+
+def test_compute_gate_result_exception_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    _GateSpy(monkeypatch, exc=RuntimeError("gate down"))
+    assert compute_gate_result(body="NEXT: human", author="Bohr", now=NOW) is None
+
+
+@pytest.mark.anyio
+async def test_hook_proposer_human_builds_gate_result_and_calls_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test 1 (msg-4200, read as "proposer-written NEXT: human" per msg-4203): gate → one HTTP."""
+    c = FakeClient(_payload())
+    adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c)
+    spy = _GateSpy(monkeypatch)
+    body = "x\nTIER-C: unsure:goal?\nNEXT: human"
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        dr = await _hook(adapter, messages=_msgs(head_body=body))
+    assert spy.calls == 1
+    assert len(c.bodies) == 1
+    assert dr is not None and dr.outcome is DecisionOutcome.EVALUATED
+    (line,) = _decider_lines(caplog)
+    assert line["gate_kind"] == "ADMIT_UNSURE" and line["gate_is_grey_zone"] is True
+    assert line["stop"] == "human"
+
+
 @pytest.mark.anyio
 async def test_hook_with_preexisting_stop_logs_both_and_keeps_dr() -> None:
     """msg-4186 §2 (c): a rule stop does not rewrite ``dr``; both land on the log line."""
     dr = _dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE))
-    got = await run_tierc_hook(
-        _StubDecider(dr), thread_id="T", round_index=1, roster={}, messages=_msgs(), stop="human"
-    )
+    got = await _hook(_StubDecider(dr))
     assert got is dr
 
 
@@ -544,93 +677,114 @@ def _decider_lines(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
 
 
 @pytest.mark.anyio
-async def test_hook_logs_not_called_line_for_ungated_turn(
+async def test_hook_gate_exception_no_http_one_empty_line(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test 4 (msg-4200 2b-2): gate raises → gate_result None → 0 HTTP, 1 line outcome empty."""
+    _GateSpy(monkeypatch, exc=RuntimeError("gate down"))
+    c = FakeClient(_payload())
+    adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c)
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        got = await _hook(adapter)
+    assert got is None
+    assert c.bodies == []
+    (line,) = _decider_lines(caplog)
+    assert line["outcome"] is None and line["gate_is_grey_zone"] is None
+    assert line["gate_kind"] is None and line["stop"] == "human"
+
+
+@pytest.mark.parametrize(
+    ("head_author", "head_body"),
+    [
+        # Test 6: the implementer's merge handoff.
+        ("Heisenberg", "PR #9 opened.\nTIER-C: merge-protected\nNEXT: human"),
+        # Test 7: the naysayer's exit turn.
+        ("Einstein", "VERDICT: APPROVE\n\nNEXT: human"),
+        # Test 8: an off-roster infra author.
+        ("pr-gate-relay", "VERDICT: APPROVE (ci=success)\n\nNEXT: human"),
+    ],
+)
+@pytest.mark.anyio
+async def test_hook_non_proposer_human_is_not_entered(
+    head_author: str,
+    head_body: str,
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """msg-4196 DECIDED 2: gate did not run → evaluate None → still one line, outcome empty."""
+    """Tests 6-8 (msg-4203): gate 0 calls, HTTP 0, no ``decider_decision`` line."""
+    spy = _GateSpy(monkeypatch)
+    c = FakeClient(_payload())
+    adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c)
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        got = await run_tierc_hook(
-            _StubDecider(None),
-            thread_id="T",
-            round_index=1,
-            roster={},
-            messages=_msgs(),
-            stop="human",
-        )
+        got = await _hook(adapter, messages=_msgs(head_author=head_author, head_body=head_body))
     assert got is None
-    lines = _decider_lines(caplog)
-    assert len(lines) == 1
-    assert lines[0]["outcome"] is None and lines[0]["gate_is_grey_zone"] is None
-    assert lines[0]["stop"] == "human"
+    assert spy.calls == 0
+    assert c.bodies == []
+    assert _decider_lines(caplog) == []
 
 
+@pytest.mark.parametrize(
+    ("stop", "wrote"),
+    [(None, True), ("settled", True), ("human", False)],
+)
 @pytest.mark.anyio
-async def test_hook_writes_no_line_for_non_human_head(caplog: pytest.LogCaptureFixture) -> None:
-    """PR-gate on #345: ``evaluate`` → None on a non-human head is not a "missed" turn."""
-    msgs = [
-        ThreadMessage("m1", "Bohr", "design\n\nNEXT: Einstein", "Einstein"),
-        ThreadMessage("m2", "Einstein", "critique\n\nNEXT: Bohr", "Bohr"),
-    ]
+async def test_hook_proposer_without_human_stop_or_own_handoff_is_not_entered(
+    stop: str | None, wrote: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    spy = _GateSpy(monkeypatch)
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        got = await run_tierc_hook(
-            _StubDecider(None),
-            thread_id="T",
-            round_index=1,
-            roster={},
-            messages=msgs,
-            stop=None,
-        )
-    assert got is None
+        got = await _hook(stub, stop=stop, author_wrote_next_human=wrote)
+    assert got is None and spy.calls == 0 and stub.states == []
     assert _decider_lines(caplog) == []
 
 
 @pytest.mark.anyio
-async def test_hook_writes_no_line_when_decider_mode_off(caplog: pytest.LogCaptureFixture) -> None:
-    """PR-gate on #345: a Decider in mode ``off`` targets nothing, so it logs nothing."""
+async def test_hook_asks_decider_is_target_and_writes_no_line_when_not(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """PR-gate advisory 1 on #345: the hook asks ``decider.is_target``; not a target → nothing."""
     decider = _StubDecider(None)
     decider.tierc_mode = "off"
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        got = await run_tierc_hook(
-            decider,
-            thread_id="T",
-            round_index=1,
-            roster={},
-            messages=_msgs(),
-            stop="human",
-        )
+        got = await _hook(decider)
     assert got is None
+    assert decider.states == []
     assert _decider_lines(caplog) == []
 
 
+def test_hook_does_not_restate_the_target_rule() -> None:
+    """Advisory 1 on #345: the "mode / head" rule lives in the Decider, not in hook.py."""
+    src = (ROOT / "src" / "spirrow_mindwire" / "decider" / "hook.py").read_text(encoding="utf-8")
+    assert "_is_tierc_target" not in src
+    assert 'tierc_mode != "off"' not in src
+
+
+def test_adapter_is_target() -> None:
+    shadow = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: FakeClient())
+    off = DeciderLexoraAdapter(tierc_mode="off", client_factory=lambda: FakeClient())
+    assert shadow.is_target(_state()) is True
+    assert shadow.is_target(_state(parsed_next="Bohr")) is False
+    assert off.is_target(_state()) is False
+
+
 @pytest.mark.anyio
-async def test_hook_with_gate_logs_gate_columns(caplog: pytest.LogCaptureFixture) -> None:
-    dr = _dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE))
+async def test_hook_annotate_branch_entered_on_proposer_human_stop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test 9 (msg-4203): proposer ``NEXT: human`` + HUMAN stop + injected annotate → the acting
+    branch is reached (the old ``stop is None`` condition would have skipped it)."""
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    stub.tierc_mode = "annotate"  # build_decider refuses annotate; injected for this test only
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        await run_tierc_hook(
-            _StubDecider(dr),
-            thread_id="T",
-            round_index=1,
-            roster={},
-            messages=_msgs(),
-            stop="human",
-            gate_result=GREY,
-        )
-    (line,) = _decider_lines(caplog)
-    assert line["outcome"] == "evaluated"
-    assert line["gate_kind"] == "ADMIT_UNSURE" and line["gate_is_grey_zone"] is True
+        got = await _hook(stub)
+    assert got is not None
+    assert any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.anyio
 async def test_hook_swallows_decider_exceptions() -> None:
-    got = await run_tierc_hook(
-        _StubDecider(exc=RuntimeError("boom")),
-        thread_id="T",
-        round_index=1,
-        roster={},
-        messages=_msgs(),
-        stop="human",
-    )
-    assert got is None
+    assert await _hook(_StubDecider(exc=RuntimeError("boom"))) is None
 
 
 def _verdict_reads(path: Path) -> list[tuple[str, int]]:
@@ -652,7 +806,10 @@ def _verdict_reads(path: Path) -> list[tuple[str, int]]:
 def test_hook_code_never_reads_raw_verdict() -> None:
     """msg-4184 §2-3: acting code uses ``actionable_verdict``; ``.verdict`` only in log_decision."""
     hook = ROOT / "src" / "spirrow_mindwire" / "decider" / "hook.py"
-    assert all(fn == "log_decision" for fn, _ in _verdict_reads(hook)), _verdict_reads(hook)
+    # ``gate_result_from_decision`` reads ``AdmissionDecision.verdict`` (admit / bounce — the
+    # admission gate's own answer, copied into the Decider's input), not a Decider verdict.
+    allowed = {"log_decision", "gate_result_from_decision"}
+    assert all(fn in allowed for fn, _ in _verdict_reads(hook)), _verdict_reads(hook)
     core = ROOT / "src" / "spirrow_mindwire" / "conductor" / "core.py"
     assert all(fn != "_decider_hook" for fn, _ in _verdict_reads(core))
     assert "dr.verdict" not in core.read_text(encoding="utf-8")
@@ -672,17 +829,34 @@ def _conductor_with(mcp: _FakeChatroomMcp, disp: _ScriptedDispatcher, dec: Any) 
     )
 
 
-async def _run(dec: Any) -> tuple[Any, _ScriptedDispatcher, _FakeChatroomMcp]:
+_PROPOSER_HUMAN = "revised\n\nNEXT: human"  # no TIER-C label → the gate bounces (no-label)
+
+
+async def _run(
+    dec: Any,
+    *,
+    seed: tuple[str, str] = ("Bohr", "design\n\nNEXT: Einstein"),
+    replies: dict[Role, list[str]] | None = None,
+) -> tuple[Any, _ScriptedDispatcher, _FakeChatroomMcp]:
+    """Default: Bohr → Einstein critique → Bohr ``NEXT: human`` (naysayer already consulted, so
+    the rule stop is HUMAN on the proposer's own head)."""
     mcp = _FakeChatroomMcp()
-    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
-    disp = _ScriptedDispatcher(mcp, {Role.NAYSAYER: ["critique\n\nNEXT: human"]})
+    mcp.seed(author=seed[0], content=seed[1])
+    if replies is None:
+        replies = {
+            Role.NAYSAYER: [_attested("critique\n\nNEXT: Bohr")],
+            Role.PROPOSER: [_PROPOSER_HUMAN],
+        }
+    disp = _ScriptedDispatcher(mcp, replies)
     outcome = await _conductor_with(mcp, disp, dec).run()
     return outcome, disp, mcp
 
 
 @pytest.mark.anyio
-async def test_conductor_calls_decider_on_explicit_human_and_stop_is_unchanged() -> None:
+async def test_conductor_calls_decider_on_proposer_human_and_stop_is_unchanged() -> None:
+    """Test 5 (msg-4200): the gate bounces this head, yet stop / dispatch / posts are unchanged."""
     baseline, bdisp, bmcp = await _run(None)
+    assert baseline.stop_reason is StopReason.HUMAN
     for dr in (
         _dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)),
         _dr(DecisionOutcome.TRANSPORT_ERROR, None, None),
@@ -696,7 +870,8 @@ async def test_conductor_calls_decider_on_explicit_human_and_stop_is_unchanged()
         assert len(stub.states) == 1
         st = stub.states[0]
         assert st.parsed_next == "human"
-        assert st.gate_result is None  # the conductor does not run the admission gate
+        assert st.gate_result is not None
+        assert st.gate_result.verdict is AdmissionVerdict.BOUNCE  # bounce changes nothing
 
 
 @pytest.mark.anyio
@@ -714,6 +889,71 @@ async def test_conductor_does_not_call_decider_on_non_human_heads() -> None:
     mcp.seed(author="Bohr", content="done\n\nNEXT: none")
     await _conductor_with(mcp, _ScriptedDispatcher(mcp, {}), stub).run()
     assert stub.states == []
+
+
+@pytest.mark.anyio
+async def test_conductor_naysayer_exit_human_is_not_evaluated(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test 7 at Conductor level: the naysayer's ``VERDICT: APPROVE`` / ``NEXT: human`` stop."""
+    spy = _GateSpy(monkeypatch)
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        outcome, _, _ = await _run(
+            stub, replies={Role.NAYSAYER: [_attested("VERDICT: APPROVE\n\nNEXT: human")]}
+        )
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert spy.calls == 0 and stub.states == []
+    assert _decider_lines(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_conductor_forced_naysayer_escalation_leaves_one_proposer_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test 10 (msg-4203): Bohr ``NEXT: human`` → forced Einstein consult (no rule stop yet, not
+    entered) → Bohr ``NEXT: human`` again → HUMAN stop → exactly one line, for the proposer."""
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.OUT_OF_GATE)))
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        outcome, disp, _ = await _run(
+            stub,
+            seed=("Bohr", "design\n\nNEXT: human"),
+            replies={
+                Role.NAYSAYER: [_attested("critique\n\nNEXT: Bohr")],
+                Role.PROPOSER: [_PROPOSER_HUMAN],
+            },
+        )
+    assert outcome.stop_reason is StopReason.HUMAN
+    # the forced consult did happen, on the proposer's first NEXT: human (m1)
+    assert disp.dispatches[0] == (Role.NAYSAYER, "m1")
+    assert outcome.forced_naysayer_turns == 1
+    assert len(stub.states) == 1
+    assert stub.states[0].recent_events[0].author == "Bohr"  # newest first: the proposer's head
+    (line,) = _decider_lines(caplog)
+    assert line["stop"] == "human"
+
+
+@pytest.mark.anyio
+async def test_conductor_never_writes_the_decisions_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test 2 (msg-4200 2b-1): the compute-only gate writes nothing, even on a bounce."""
+    from spirrow_mindwire import tier_c_decisions_log as dlog
+
+    writes: list[str] = []
+    for name in ("append_log_entry", "append_log_entries", "build_retry_lookup"):
+        monkeypatch.setattr(dlog, name, lambda *a, _n=name, **k: writes.append(_n))
+    monkeypatch.chdir(tmp_path)
+    spy = _GateSpy(monkeypatch)
+    c = FakeClient(_payload())
+    adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c)
+    await _run(adapter)
+    assert spy.calls == 1
+    # the gate DID produce entries (a BOUNCED row) — they were discarded, not written
+    assert spy.decisions[0].log_entries
+    assert writes == []
+    assert list(tmp_path.iterdir()) == []
+    assert len(c.bodies) == 1  # test 1 at Conductor level: one HTTP call
 
 
 # --------------------------------------------------------------------------- replay --endpoint

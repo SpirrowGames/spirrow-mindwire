@@ -571,17 +571,21 @@ class Conductor:
         round_index: int,
         stop_reason: StopReason | None,
     ) -> None:
-        """Run the Tier-C Decider on an explicit ``NEXT: human`` head (msg-4180 §4).
+        """Hand the turn to the Tier-C Decider hook (msg-4180 §4; step 2b msg-4200 / msg-4203).
 
-        Fires only for an author-written human handoff: a field/body mismatch also resolves to
-        ``HandoffKind.HUMAN`` but is a conductor safety valve, not somebody asking the human, so
-        it is skipped. ``gate_result`` is ``None`` — this conductor does not run the Tier-C
-        admission gate — so the result is always recorded as out-of-gate (see
-        :mod:`..decider.hook`). ``stop_reason`` is logged beside the decision, never modified.
+        The entry condition is decided inside :func:`..decider.hook.run_tierc_hook` (msg-4203:
+        "判定はフックの入口"): rule stop ``HUMAN`` **and** an author-written ``NEXT: human`` **and**
+        the author's roster role is ``proposer``. This method only lifts the one fact the hook
+        cannot see — whether the author wrote the handoff themself (a field/body mismatch also
+        resolves to ``HandoffKind.HUMAN`` but is a conductor safety valve, not somebody asking
+        the human). The hook runs the admission gate compute-only (nothing written to the
+        decisions log) and sends the turn to Lexora only when the gate produced a result
+        (msg-4196 DECIDED 1). ``stop_reason`` is the rule-stop snapshot: it decides entry and is
+        logged beside the decision, never modified.
         """
         if self._decider is None:
             return
-        if handoff.kind is not HandoffKind.HUMAN or handoff.mismatch_reason is not None:
+        if handoff.kind is not HandoffKind.HUMAN:
             return
         thread_msgs = [
             ThreadMessage(
@@ -605,6 +609,8 @@ class Conductor:
             roster=self._roster,
             messages=thread_msgs,
             stop=stop_reason.value if stop_reason is not None else None,
+            author_wrote_next_human=handoff.mismatch_reason is None,
+            now=datetime.now(UTC),
         )
 
     def _route(
