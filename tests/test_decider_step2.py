@@ -40,6 +40,7 @@ from spirrow_mindwire.decider.hook import (
     is_tierc_entry,
     log_decision,
     never_retry,
+    routed_from_route,
     run_tierc_hook,
     turn_from_messages,
 )
@@ -468,7 +469,9 @@ def test_log_decision_always_writes_id_and_outcome(
     dr: DecisionResult, caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        rec = log_decision(thread_id="T-x", round_index=3, stop="human", dr=dr, gate_result=GREY)
+        rec = log_decision(
+            thread_id="T-x", round_index=3, stop="human", routed="stop", dr=dr, gate_result=GREY
+        )
     assert rec["outcome"] == dr.outcome.value
     assert rec["gate_kind"] == "ADMIT_UNSURE" and rec["gate_is_grey_zone"] is True
     assert "decision_id" in rec and rec["decision_id"] == dr.decision_id
@@ -482,7 +485,7 @@ def test_log_decision_gate_columns_for_labelled_admit() -> None:
     """msg-4196 DECIDED 2: ``gate_kind`` may be ``None`` even when the gate ran."""
     dr = _dr(DecisionOutcome.EVALUATED, _v(TierCScope.OUT_OF_GATE))
     rec = log_decision(
-        thread_id="T", round_index=1, stop="human", dr=dr, gate_result=ADMIT_LABELLED
+        thread_id="T", round_index=1, stop="human", routed="stop", dr=dr, gate_result=ADMIT_LABELLED
     )
     assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is False
 
@@ -493,14 +496,18 @@ def test_log_decision_not_called_line_has_empty_outcome_and_same_keys() -> None:
         thread_id="T",
         round_index=1,
         stop="human",
+        routed="stop",
         dr=_dr(DecisionOutcome.NO_VERDICT_NULL, None),
         gate_result=GREY,
     )
-    rec = log_decision(thread_id="T", round_index=1, stop="human", dr=None, gate_result=None)
+    rec = log_decision(
+        thread_id="T", round_index=1, stop="human", routed="stop", dr=None, gate_result=None
+    )
     assert set(rec) == set(called)
     assert rec["outcome"] is None and rec["decision_id"] is None
     assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is None
     assert rec["stop"] == "human"
+    assert rec["routed"] == called["routed"] == "stop"  # msg-4237 2c-3: same column on both
 
 
 class _StubDecider:
@@ -533,6 +540,8 @@ async def _hook(
     *,
     messages: list[ThreadMessage] | None = None,
     stop: str | None = "human",
+    is_forced: bool = False,
+    target_role: Role | None = None,
     author_wrote_next_human: bool = True,
 ) -> DecisionResult | None:
     return await run_tierc_hook(
@@ -542,6 +551,9 @@ async def _hook(
         roster=ROSTER,
         messages=_msgs() if messages is None else messages,
         stop=stop,
+        is_forced=is_forced,
+        target_role=target_role,
+        naysayer_role=Role.NAYSAYER,
         author_wrote_next_human=author_wrote_next_human,
         now=NOW,
     )
@@ -576,25 +588,40 @@ def test_turn_from_messages_shape() -> None:
 
 
 @pytest.mark.parametrize(
-    ("original_stop", "wrote", "role", "expected"),
+    ("wrote", "role", "expected"),
     [
-        ("human", True, Role.PROPOSER, True),
-        (None, True, Role.PROPOSER, False),  # forced naysayer consult: no rule stop yet
-        ("settled", True, Role.PROPOSER, False),
-        ("human", False, Role.PROPOSER, False),  # field/body mismatch safety valve
-        ("human", True, Role.IMPLEMENTER, False),
-        ("human", True, Role.NAYSAYER, False),
-        ("human", True, None, False),  # off-roster author
+        (True, Role.PROPOSER, True),
+        (False, Role.PROPOSER, False),  # field/body mismatch safety valve
+        (True, Role.IMPLEMENTER, False),
+        (True, Role.NAYSAYER, False),
+        (True, None, False),  # off-roster author
     ],
 )
-def test_is_tierc_entry(
-    original_stop: str | None, wrote: bool, role: Role | None, expected: bool
+def test_is_tierc_entry(wrote: bool, role: Role | None, expected: bool) -> None:
+    """msg-4237 DECIDED 2c-1: author-written ``NEXT: human`` + proposer; the rule stop is not
+    part of the entry any more (it is recorded as ``routed``)."""
+    assert is_tierc_entry(author_wrote_next_human=wrote, author_role=role) is expected
+
+
+@pytest.mark.parametrize(
+    ("stop", "is_forced", "target", "expected"),
+    [
+        ("human", False, None, "stop"),
+        (None, True, Role.NAYSAYER, "forced_naysayer"),
+        (None, False, Role.IMPLEMENTER, "other"),
+        (None, True, Role.IMPLEMENTER, "other"),  # forced, but not to the naysayer role
+        (None, False, Role.NAYSAYER, "other"),  # naysayer target, but not forced
+        ("settled", False, None, "other"),
+    ],
+)
+def test_routed_from_route(
+    stop: str | None, is_forced: bool, target: Role | None, expected: str
 ) -> None:
-    """msg-4203 DECIDED 2b-3 (revised): all three conditions, checked at the hook entry."""
-    assert (
-        is_tierc_entry(original_stop=original_stop, author_wrote_next_human=wrote, author_role=role)
-        is expected
+    """msg-4239 DECIDED 2c-1 (revised): read from ``_route``'s outputs, never inferred."""
+    got = routed_from_route(
+        stop=stop, is_forced=is_forced, target_role=target, naysayer_role=Role.NAYSAYER
     )
+    assert got == expected
 
 
 @pytest.mark.parametrize(
@@ -723,20 +750,52 @@ async def test_hook_non_proposer_human_is_not_entered(
     assert _decider_lines(caplog) == []
 
 
-@pytest.mark.parametrize(
-    ("stop", "wrote"),
-    [(None, True), ("settled", True), ("human", False)],
-)
 @pytest.mark.anyio
-async def test_hook_proposer_without_human_stop_or_own_handoff_is_not_entered(
-    stop: str | None, wrote: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_hook_proposer_mismatch_human_is_not_entered(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """A field/body mismatch that resolved to HUMAN is not the proposer asking the human."""
     spy = _GateSpy(monkeypatch)
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        got = await _hook(stub, stop=stop, author_wrote_next_human=wrote)
+        got = await _hook(stub, author_wrote_next_human=False)
     assert got is None and spy.calls == 0 and stub.states == []
     assert _decider_lines(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_hook_proposer_forced_consult_is_entered_and_record_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """msg-4237 2c-1 / 2c-2 at hook level: ``stop=None`` + forced to the naysayer is entered
+    (one ``routed=forced_naysayer`` line) and, even under annotate, the acting branch is not."""
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    stub.tierc_mode = "annotate"  # injected; build_decider refuses it
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        got = await _hook(stub, stop=None, is_forced=True, target_role=Role.NAYSAYER)
+    assert got is not None and len(stub.states) == 1
+    (line,) = _decider_lines(caplog)
+    assert line["routed"] == "forced_naysayer" and line["stop"] is None
+    assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_hook_routed_other_logs_row_and_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """Test 13 (msg-4239): a combination ``_route`` cannot produce today, passed straight in:
+    one ``routed=other`` line, a WARNING naming it, and no acting branch even under annotate."""
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    stub.tierc_mode = "annotate"
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        got = await _hook(stub, stop=None, is_forced=False, target_role=Role.IMPLEMENTER)
+    assert got is not None
+    (line,) = _decider_lines(caplog)
+    assert line["routed"] == "other"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "decider routed=other" in w and "stop=None" in w and "target=implementer" in w
+        for w in warnings
+    ), warnings
+    assert not any("has no acting implementation yet" in w for w in warnings)
 
 
 @pytest.mark.anyio
@@ -780,6 +839,8 @@ async def test_hook_annotate_branch_entered_on_proposer_human_stop(
         got = await _hook(stub)
     assert got is not None
     assert any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
+    (line,) = _decider_lines(caplog)
+    assert line["routed"] == "stop"
 
 
 @pytest.mark.anyio
@@ -908,14 +969,38 @@ async def test_conductor_naysayer_exit_human_is_not_evaluated(
 
 
 @pytest.mark.anyio
-async def test_conductor_forced_naysayer_escalation_leaves_one_proposer_line(
+async def test_conductor_forced_consult_ended_by_naysayer_leaves_one_forced_line(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Test 10 (msg-4203): Bohr ``NEXT: human`` → forced Einstein consult (no rule stop yet, not
-    entered) → Bohr ``NEXT: human`` again → HUMAN stop → exactly one line, for the proposer."""
+    """Test 10 (msg-4237, replaced): Bohr ``NEXT: human`` in a segment with no naysayer message:
+    forced Einstein consult, one ``routed=forced_naysayer`` line (no acting branch); Einstein
+    ends it with ``NEXT: human``: no further line (total 1)."""
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.OUT_OF_GATE)))
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
         outcome, disp, _ = await _run(
+            stub,
+            seed=("Bohr", "design\n\nNEXT: human"),
+            replies={Role.NAYSAYER: [_attested("VERDICT: APPROVE\n\nNEXT: human")]},
+        )
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches[0] == (Role.NAYSAYER, "m1")
+    assert outcome.forced_naysayer_turns == 1
+    assert len(stub.states) == 1
+    assert stub.states[0].recent_events[0].author == "Bohr"
+    (line,) = _decider_lines(caplog)
+    assert line["routed"] == "forced_naysayer" and line["stop"] is None
+    assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_conductor_forced_consult_then_second_escalation_leaves_two_lines(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test 11 (msg-4237): 10, but Einstein returns ``NEXT: Bohr`` and Bohr escalates again:
+    a second, ``routed=stop`` line (two separate decision points, not a duplicate)."""
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.OUT_OF_GATE)))
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        outcome, _, _ = await _run(
             stub,
             seed=("Bohr", "design\n\nNEXT: human"),
             replies={
@@ -924,13 +1009,61 @@ async def test_conductor_forced_naysayer_escalation_leaves_one_proposer_line(
             },
         )
     assert outcome.stop_reason is StopReason.HUMAN
-    # the forced consult did happen, on the proposer's first NEXT: human (m1)
-    assert disp.dispatches[0] == (Role.NAYSAYER, "m1")
-    assert outcome.forced_naysayer_turns == 1
-    assert len(stub.states) == 1
-    assert stub.states[0].recent_events[0].author == "Bohr"  # newest first: the proposer's head
+    assert len(stub.states) == 2
+    lines = _decider_lines(caplog)
+    assert [ln["routed"] for ln in lines] == ["forced_naysayer", "stop"]
+    assert [ln["stop"] for ln in lines] == [None, "human"]
+
+
+@pytest.mark.anyio
+async def test_conductor_forced_line_under_annotate_changes_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test 12 (msg-4237): a ``routed=forced_naysayer`` row changes neither the stop nor any
+    post / dispatch even with tierc mode ``annotate`` (injected; build_decider refuses it)."""
+    seed = ("Bohr", "design\n\nNEXT: human")
+
+    def replies() -> dict[Role, list[str]]:
+        return {Role.NAYSAYER: [_attested("VERDICT: APPROVE\n\nNEXT: human")]}
+
+    baseline, bdisp, bmcp = await _run(None, seed=seed, replies=replies())
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    stub.tierc_mode = "annotate"
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        outcome, disp, mcp = await _run(stub, seed=seed, replies=replies())
+    assert outcome == baseline
+    assert disp.dispatches == bdisp.dispatches
+    assert mcp.posts == bmcp.posts
     (line,) = _decider_lines(caplog)
-    assert line["stop"] == "human"
+    assert line["routed"] == "forced_naysayer"
+    assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_conductor_round_cap_turn_never_reaches_the_hook(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test 14 (msg-4239): the head left when the loop exits on ``ROUND_CAP`` is never routed,
+    so a proposer ``NEXT: human`` there gets no hook call and no line."""
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_attested("critique\n\nNEXT: Bohr"))
+    disp = _ScriptedDispatcher(mcp, {Role.PROPOSER: [_PROPOSER_HUMAN]})
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    conductor = Conductor(
+        mcp=mcp,
+        dispatcher=disp,
+        thread_ref=_thread_ref(),
+        roster=ROSTER,
+        naysayer_identity="Einstein",
+        decider=stub,
+        max_rounds=1,
+    )
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        outcome = await conductor.run()
+    assert outcome.stop_reason is StopReason.ROUND_CAP
+    assert disp.dispatches == [(Role.PROPOSER, "m1")]  # Bohr did post NEXT: human after this
+    assert stub.states == []
+    assert _decider_lines(caplog) == []
 
 
 @pytest.mark.anyio

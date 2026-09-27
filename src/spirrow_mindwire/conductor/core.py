@@ -288,8 +288,9 @@ class Conductor:
         self._force_only_on_explicit_human = force_naysayer_only_on_explicit_human
         # Tier-C Decider (T-decider-conductor-hook step 2). ``None`` = off (the default and the
         # pre-step-2 behaviour, byte-for-byte). When wired it is an OBSERVER: ``_decider_hook``
-        # logs a decision on every explicit ``NEXT: human`` head and never changes the routing
-        # decision ``_route`` already made (D20 monotonicity).
+        # logs a decision on a proposer's own ``NEXT: human`` head — whether ``_route`` stopped it
+        # or sent it to a forced naysayer consult — and never changes the routing decision
+        # ``_route`` already made (D20 monotonicity).
         self._decider = decider
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
@@ -502,8 +503,10 @@ class Conductor:
                 handoff, messages
             )
             # Tier-C Decider hook: right after the rule-based routing decision, before it is acted
-            # on. Observation only — neither ``stop_reason`` nor ``target_role`` is read back.
-            await self._decider_hook(handoff, messages, round_index, stop_reason)
+            # on. Observation only — the hook reads ``_route``'s outputs, never writes them back.
+            await self._decider_hook(
+                handoff, messages, round_index, stop_reason, is_forced, target_role
+            )
             if target_role is None:
                 assert stop_reason is not None  # _route always sets a reason when it stops
                 # Bohr msg-179 §6 invariant: a message that carries a non-null next_participant
@@ -570,18 +573,23 @@ class Conductor:
         messages: list[dict[str, Any]],
         round_index: int,
         stop_reason: StopReason | None,
+        is_forced: bool,
+        target_role: Role | None,
     ) -> None:
-        """Hand the turn to the Tier-C Decider hook (msg-4180 §4; step 2b msg-4200 / msg-4203).
+        """Hand the turn to the Tier-C Decider hook (msg-4180 §4; 2b msg-4200; 2c msg-4237/4239).
 
-        The entry condition is decided inside :func:`..decider.hook.run_tierc_hook` (msg-4203:
-        "判定はフックの入口"): rule stop ``HUMAN`` **and** an author-written ``NEXT: human`` **and**
-        the author's roster role is ``proposer``. This method only lifts the one fact the hook
-        cannot see — whether the author wrote the handoff themself (a field/body mismatch also
-        resolves to ``HandoffKind.HUMAN`` but is a conductor safety valve, not somebody asking
-        the human). The hook runs the admission gate compute-only (nothing written to the
-        decisions log) and sends the turn to Lexora only when the gate produced a result
-        (msg-4196 DECIDED 1). ``stop_reason`` is the rule-stop snapshot: it decides entry and is
-        logged beside the decision, never modified.
+        Only a ``HandoffKind.HUMAN`` head reaches the hook. The rest of the entry condition is
+        decided inside :func:`..decider.hook.run_tierc_hook`: an author-written ``NEXT: human``
+        **and** the author's roster role is ``proposer`` (msg-4237 DECIDED 2c-1 — the rule stop
+        is no longer part of it, so a proposer escalation routed to a forced naysayer consult is
+        evaluated too). This method lifts the facts the hook cannot see: whether the author wrote
+        the handoff themself (a field/body mismatch also resolves to ``HandoffKind.HUMAN`` but is
+        a conductor safety valve, not somebody asking the human), and ``_route``'s own outputs —
+        ``stop_reason`` / ``is_forced`` / ``target_role`` plus the configured naysayer role — from
+        which the hook reads ``routed`` (``stop`` / ``forced_naysayer`` / ``other``, msg-4239)
+        rather than inferring it. The hook runs the admission gate compute-only (nothing written
+        to the decisions log) and sends the turn to Lexora only when the gate produced a result
+        (msg-4196 DECIDED 1). Every value passed is read only, never modified.
         """
         if self._decider is None:
             return
@@ -609,6 +617,9 @@ class Conductor:
             roster=self._roster,
             messages=thread_msgs,
             stop=stop_reason.value if stop_reason is not None else None,
+            is_forced=is_forced,
+            target_role=target_role,
+            naysayer_role=self._naysayer_role,
             author_wrote_next_human=handoff.mismatch_reason is None,
             now=datetime.now(UTC),
         )
