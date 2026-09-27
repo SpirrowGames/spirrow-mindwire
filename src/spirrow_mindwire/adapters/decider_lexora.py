@@ -11,18 +11,23 @@ never an exception into the Conductor.
 
 Spec (Bohr, reviewed by Einstein): msg-4180 (wire, Null rule, extraction, 5 s timeout, policy
 tags), msg-4182 / 4184 / 4186 (result type, ``actionable_verdict``, invariants), msg-4188 (call
-order). The call order, verbatim in effect:
+order), msg-4196 DECIDED 1 (``gate_result is None`` → no call). The call order, verbatim in
+effect:
 
-1. ``/v1/decide`` is **always** called — whatever ``gate_result`` is, including ``None``.
+0. ``gate_result is None`` → **no call**; :meth:`DeciderLexoraAdapter.evaluate` returns ``None``
+   (msg-4196 DECIDED 1, design §3.5 item 5). ``None`` means "the admission gate did not run",
+   not "outside the grey zone": a call would bill Jev for an answer with no scope label.
+1. otherwise ``/v1/decide`` is **always** called, whatever the gate verdict.
 2. transport failure / timeout / non-200 / unusable envelope → ``TRANSPORT_ERROR``.
 3. ``provider == "null"`` → ``NO_VERDICT_NULL`` (never synthesised:
    three 0.5s sum to 1.5 and read CONFIRMED).
 4. any of the 6 answers missing / wrong type / out of [0, 1] → ``NO_VERDICT_MALFORMED``.
-5. only now branch on the gate: grey zone → ``evaluate_tierc`` (IN_GATE); anything else,
-   ``gate_result is None`` included → ``build_out_of_gate_verdict`` (OUT_OF_GATE). Both are
-   ``EVALUATED`` with a ``decision_id``.
+5. only now branch on the gate: grey zone → ``evaluate_tierc`` (IN_GATE); any other gate
+   result → ``build_out_of_gate_verdict`` (OUT_OF_GATE). Both are ``EVALUATED`` with a
+   ``decision_id``. (msg-4186's "``None`` → OUT_OF_GATE" fallback is withdrawn by msg-4196.)
 
-The gate decides how answers are combined, never whether Lexora is called.
+Once a gate result exists, the gate decides how answers are combined, never whether Lexora is
+called.
 
 Enablement (msg-4180 §4): backend ``lexora`` — from env ``MINDWIRE_DECIDER_BACKEND`` when set,
 else ``[decider].backend`` — **and** ``MINDWIRE_LEXORA_URL`` set. :func:`build_decider` returns
@@ -104,7 +109,13 @@ async def decide_once(
 
     Shared by the live adapter and ``scripts/decider_replay.py --endpoint`` so both classify a
     response identically. Never raises for a Lexora-side problem.
+
+    Raises ``ValueError`` (before any HTTP) when ``state.gate_result is None``: msg-4196
+    DECIDED 1 keeps un-gated turns off ``/v1/decide`` entirely, so reaching here with one is a
+    caller bug, not a turn to bill and label OUT_OF_GATE.
     """
+    if state.gate_result is None:
+        raise ValueError("decide_once requires a gate_result (msg-4196 DECIDED 1)")
     body = build_decide_request(state, policy=policy)
 
     def _transport_error(reason: str) -> DecisionResult:
@@ -169,7 +180,7 @@ async def decide_once(
 
     # 5. only now does the gate matter.
     gate = state.gate_result
-    if gate is not None and gate.is_grey_zone:
+    if gate.is_grey_zone:
         verdict = evaluate_tierc(scores, thresholds)
     else:
         verdict = build_out_of_gate_verdict(scores)
@@ -216,8 +227,16 @@ class DeciderLexoraAdapter:
         return self._tierc_mode
 
     async def evaluate(self, state: DecisionState) -> DecisionResult | None:
-        """``None`` iff the Decider was not called (msg-4182); otherwise always a result."""
-        if self._tierc_mode == "off" or state.parsed_next != HUMAN_NEXT:
+        """``None`` iff the Decider was not called (msg-4182); otherwise always a result.
+
+        Not called when the mode is off, the head is not ``NEXT: human``, or the admission gate
+        did not run (``gate_result is None`` — msg-4196 DECIDED 1: zero HTTP, zero Jev billing).
+        """
+        if (
+            self._tierc_mode == "off"
+            or state.parsed_next != HUMAN_NEXT
+            or state.gate_result is None
+        ):
             return None
         client = self._client_factory()
         try:
