@@ -150,14 +150,52 @@ def test_escalation_selection_and_sets() -> None:
     assert builder.classify_set(msgs[3], None) == "eval"
 
 
-def test_label_template_is_blind() -> None:
-    fixture, labels, manifest = builder.build_outputs([("p", "T-x", _thread())], {})
+def test_outputs_split_and_following_only_in_materials() -> None:
+    population, fixture, materials, manifest = builder.build_outputs([("p", "T-x", _thread())], {})
     assert manifest["rows"] == 2
-    for lab in labels:
-        assert lab["label"] is None and lab["category"] is None
-        assert "decision" not in lab and "gate_result" not in lab
-    # the fixture carries no label field at all (msg-4219 §2)
+    # msg-4 (Bohr) and msg-6 (Latecomer) are both proposer-authored eval-window rows.
+    assert [r["eval_set"] for r in population] == ["body", "body"]
+    assert len(fixture) == len(materials) == 2
+    # the fixture carries no label and none of the later messages (seal (a) holds per row)
     assert all("label" not in r for r in fixture)
+    assert "FUTURE-ONLY-TEXT" not in json.dumps(fixture[0], ensure_ascii=False)
+    m0 = materials[0]
+    assert [x["msg_id"] for x in m0["following"]] == ["msg-5", "msg-6"]
+    assert [x["msg_id"] for x in m0["prior"]] == ["msg-1", "msg-2", "msg-3"]
+    assert m0["body"].startswith("please decide") and m0["body_truncated"] is False
+    assert "gate_result" not in m0 and "decision" not in m0
+
+
+def test_eval_set_rules() -> None:
+    base = {"set": "eval", "live_entry": True, "gate_result": {"verdict": "bounce"}}
+    assert builder.eval_set_of(base) == "body"
+    assert builder.eval_set_of({**base, "live_entry": False}) == "gate_only"
+    admit = {**base, "live_entry": False, "gate_result": {"verdict": "admit"}}
+    assert builder.eval_set_of(admit) == "supplement"
+    assert builder.eval_set_of({**base, "set": "retro_candidate"}) == "supplement"
+
+
+def test_material_body_cap() -> None:
+    msgs = _thread()
+    long = builder.RawMessage(
+        msg_id="msg-9",
+        author="Bohr",
+        content="x" * 9000 + "\nNEXT: human",
+        timestamp=T0,
+        role="proposer",
+        next_participant=None,
+    )
+    row = {
+        "thread_id": "T",
+        "round_index": 0,
+        "project": "p",
+        "msg_id": "msg-9",
+        "author": "Bohr",
+        "posted_at": "t",
+        "eval_set": "body",
+    }
+    m = builder.material_row(row, [*msgs[:2], long], 2)
+    assert len(m["body"]) == 8000 and m["body_truncated"] is True and m["body_chars"] > 9000
 
 
 def test_duplicate_key_across_projects_raises() -> None:
@@ -165,7 +203,9 @@ def test_duplicate_key_across_projects_raises() -> None:
         builder.build_outputs([("p1", "T-x", _thread()), ("p2", "T-x", _thread())], {})
 
 
-@pytest.mark.parametrize("script", ["build_tierc_eval_fixture", "tierc_eval_report"])
+@pytest.mark.parametrize(
+    "script", ["build_tierc_eval_fixture", "tierc_eval_report", "label_eval_set"]
+)
 def test_scripts_do_not_import_decision_request(script: str) -> None:
     env = {k: v for k, v in os.environ.items() if "DASHBOARD" not in k}
     path = ROOT / "scripts" / f"{script}.py"
@@ -327,6 +367,7 @@ def _row_obj(i: int, g: float, s: float) -> Any:
         server_verdict="UNSURE",
         outcome="evaluated",
         latency_ms=10,
+        eval_set="body",
     )
 
 
@@ -359,3 +400,200 @@ def test_render_smoke_reports_grey_zone_first() -> None:
     text = report.render(rows, {"Bohr": {("T", 1): _lab("spurious")}}, report.TierCThresholds())
     head = text.split("## (A) Jev")[0]
     assert "(B) grey zone" in head and "0/1" in head
+
+
+def test_category_other_counts_as_ambiguous() -> None:
+    labs = report.load_labels(
+        [{"thread_id": "T", "round_index": 1, "label": "spurious", "category": "OTHER"}]
+    )
+    assert labs[("T", 1)].label == "ambiguous"
+
+
+def test_supplement_is_not_in_headline() -> None:
+    body = _row_obj(1, 0.05, 0.9)
+    sup = report.Row(**{**body.__dict__, "key": ("T", 2), "eval_set": "supplement"})
+    labs = {"Bohr": {("T", 1): _lab("spurious"), ("T", 2): _lab("genuine")}}
+    text = report.render([body, sup], labs, report.TierCThresholds())
+    head = text.split("## Supplement set")[0]
+    assert "recall genuine (reaches human): n/a (0)" in head
+    assert "179 rows cannot be reproduced" in text
+
+
+# ---------------------------------------------------------------------------
+# labeller (msg-4231 / msg-4233)
+# ---------------------------------------------------------------------------
+
+labeller = _load("label_eval_set")
+
+
+def _materials(n: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "thread_id": "T",
+            "round_index": i,
+            "project": "p",
+            "author": "Bohr",
+            "posted_at": "t",
+            "eval_set": "body",
+            "body": f"body {i}",
+            "body_truncated": False,
+            "body_chars": 6,
+            "prior": [],
+            "following": [],
+        }
+        for i in range(n)
+    ]
+
+
+def _answer(keys: list[tuple[str, int]], label: str = "spurious") -> str:
+    lines = [
+        json.dumps(
+            {"thread_id": t, "round_index": r, "label": label, "category": "IMPL", "rationale": "x"}
+        )
+        for t, r in keys
+    ]
+    return "```jsonl\n" + "\n".join(lines) + "\n```"
+
+
+def _items_sent(messages: list[Any]) -> list[dict[str, Any]]:
+    return list(json.loads(messages[1].content.split("\n\n", 1)[1]))
+
+
+class _FakeLexora:
+    def __init__(self, replies: list[Any]) -> None:
+        self.replies = list(replies)
+        self.sent: list[list[Any]] = []
+
+    async def chat_completion(self, *, model: str, messages: list[Any], max_tokens: int) -> Any:
+        from spirrow_mindwire.lexora.client import ChatCompletion
+
+        self.sent.append(messages)
+        r = self.replies.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        if callable(r):
+            r = r(messages)
+        return ChatCompletion(
+            content=r,
+            reasoning_content=None,
+            finish_reason="stop",
+            model="m-" + model,
+            usage={"prompt_tokens": 5},
+        )
+
+    async def stats_costs_recent(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return [{"model": "m-naysayer", "tokens_input": 5, "backend": "gemini", "cost_usd": 0.1}]
+
+
+def _echo(messages: list[Any]) -> str:
+    return _answer([(i["thread_id"], i["round_index"]) for i in _items_sent(messages)])
+
+
+async def _nosleep(_: float) -> None:
+    return None
+
+
+def _run(client: Any, tmp_path: Path, n: int, batch: int = 15, who: str = "naysayer-tier") -> Any:
+    import asyncio
+
+    return asyncio.run(
+        labeller.label_all(
+            client=client,
+            labeller=who,
+            materials=_materials(n),
+            system="SYS",
+            out_dir=tmp_path,
+            batch_size=batch,
+            sleep=_nosleep,
+        )
+    )
+
+
+def _label_lines(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_parse_answer_rejects_wrong_keys_and_values() -> None:
+    keys = [("T", 0), ("T", 1)]
+    assert len(labeller.parse_answer(_answer(keys), keys)) == 2
+    with pytest.raises(ValueError, match="keys differ"):
+        labeller.parse_answer(_answer(keys[:1]), keys)
+    with pytest.raises(ValueError, match="label"):
+        labeller.parse_answer(_answer(keys, label="maybe"), keys)
+    with pytest.raises(ValueError, match="block"):
+        labeller.parse_answer("no block", keys)
+
+
+def test_labels_written_with_provenance(tmp_path: Path) -> None:
+    stats = _run(_FakeLexora([_echo, _echo]), tmp_path, 20)
+    rows = _label_lines(tmp_path / "labels.naysayer-tier.jsonl")
+    assert len(rows) == 20 and stats["batches"] == 2
+    assert rows[0]["backend"] == "gemini" and rows[0]["batch"] == 0 and rows[-1]["batch"] == 1
+    assert rows[0]["prompt_sha256"] == labeller.sha256_text("SYS")
+
+
+def test_format_failure_retries_once_then_stops_and_writes_nothing(tmp_path: Path) -> None:
+    fake = _FakeLexora([_echo, "garbage", "garbage again"])
+    with pytest.raises(labeller.LabelStopError, match="format failure"):
+        _run(fake, tmp_path, 20)
+    assert len(_label_lines(tmp_path / "labels.naysayer-tier.jsonl")) == 15  # batch 1 not written
+    assert len(list((tmp_path / "failures").iterdir())) == 1
+    assert len(fake.sent) == 3
+
+
+def test_format_failure_then_success_on_retry(tmp_path: Path) -> None:
+    _run(_FakeLexora(["garbage", _echo]), tmp_path, 3)
+    assert len(_label_lines(tmp_path / "labels.naysayer-tier.jsonl")) == 3
+
+
+def test_transport_retries_three_times_then_stops(tmp_path: Path) -> None:
+    from spirrow_mindwire.lexora.client import LexoraHTTPError, LexoraTimeoutError
+
+    ok = _FakeLexora(
+        [
+            LexoraTimeoutError("t"),
+            LexoraHTTPError("5", status_code=502),
+            LexoraHTTPError("conn"),
+            _echo,
+        ]
+    )
+    _run(ok, tmp_path, 2)  # 3 transport failures are not a format failure
+    with pytest.raises(labeller.LabelStopError, match="retries exhausted"):
+        _run(_FakeLexora([LexoraTimeoutError("t")] * 4), tmp_path / "b", 2)
+    with pytest.raises(labeller.LabelStopError, match="non-retryable"):
+        _run(_FakeLexora([LexoraHTTPError("bad", status_code=400)]), tmp_path / "c", 2)
+
+
+def test_resume_skips_labelled_keys(tmp_path: Path) -> None:
+    _run(_FakeLexora([_echo]), tmp_path, 3)
+    fake = _FakeLexora([_echo])
+    _run(fake, tmp_path, 5)
+    assert [i["round_index"] for i in _items_sent(fake.sent[0])] == [3, 4]
+
+
+def test_no_naysayer_preamble_and_no_other_outputs_are_sent(tmp_path: Path) -> None:
+    import asyncio
+
+    from spirrow_mindwire.naysayer.principles import build_preamble
+
+    prompt = (ROOT / "eval" / "tierc" / "label_prompt.md").read_text(encoding="utf-8")
+    rubric = (ROOT / "eval" / "tierc" / "RUBRIC.md").read_text(encoding="utf-8")
+    system = labeller.system_prompt(prompt, rubric)
+    fake = _FakeLexora([_echo])
+    asyncio.run(
+        labeller.label_all(
+            client=fake,
+            labeller="claude",
+            materials=_materials(2),
+            system=system,
+            out_dir=tmp_path,
+            sleep=_nosleep,
+        )
+    )
+    sent = "\n".join(m.content for m in fake.sent[0])
+    preamble = build_preamble()
+    assert preamble not in sent
+    assert preamble.splitlines()[0] not in sent
+    item = _items_sent(fake.sent[0])[0]
+    assert "decision" not in item and "label" not in item and "gate_result" not in item
+    assert rubric in sent

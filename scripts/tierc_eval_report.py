@@ -99,7 +99,8 @@ def load_labels(rows: Iterable[Mapping[str, Any]]) -> dict[Key, Label]:
             raise ValueError(f"{_key(r)}: unknown label {raw!r} (allowed: {LABELS})")
         cat = r.get("category")
         out[_key(r)] = Label(
-            label=str(raw),
+            # RUBRIC: category OTHER counts as ambiguous, whatever the label says (msg-4229 §3-3).
+            label="ambiguous" if cat == "OTHER" else str(raw),
             category=str(cat) if cat else None,
             rationale=str(r.get("rationale") or ""),
         )
@@ -169,6 +170,7 @@ class Row:
     grey_zone: bool
     live_entry: bool
     roster_source: str
+    eval_set: str
     body_head: str
     scores: dict[str, float] | None
     server_verdict: str | None
@@ -207,6 +209,7 @@ def join(replay: Sequence[Mapping[str, Any]], fixture: Sequence[Mapping[str, Any
                 grey_zone=bool(g and g.get("is_grey_zone")),
                 live_entry=bool(f.get("live_entry")),
                 roster_source=str(f.get("roster_source", "")),
+                eval_set=str(f.get("eval_set", "")),
                 body_head=str(state.get("head_summary", ""))[:160].replace("\n", " "),
                 scores=scores_of(rec),
                 server_verdict=str(sv["kind"]) if isinstance(sv, Mapping) else None,
@@ -362,21 +365,34 @@ def _pctl(xs: Sequence[int], q: float) -> str:
 
 
 def render(
-    rows: Sequence[Row],
+    all_rows: Sequence[Row],
     labellers: Mapping[str, Mapping[Key, Label]],
     th: TierCThresholds,
+    population: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     truth = consensus(labellers)
     lines: list[str] = ["# Tier-C replay evaluation — Jev", ""]
 
+    # Headline numbers are on the body set; supplement rows are reported on their own lines
+    # (msg-4229 §1). A row with no eval_set (e.g. a hand-made fixture) counts as body.
+    rows = [r for r in all_rows if r.eval_set in ("body", "")]
+    supplement = [r for r in all_rows if r.eval_set == "supplement"]
     n = len(rows)
-    grey = [r for r in rows if r.grey_zone]
+    grey = [r for r in all_rows if r.grey_zone]
     live = [r for r in rows if r.live_entry]
+    pop_grey = sum(
+        1 for p in population if p.get("gate_result") and p["gate_result"].get("is_grey_zone")
+    )
     lines += [
         "## (A) / (B) — read this first (msg-4219 §0, msg-4221)",
         "",
-        f"- rows replayed: {n}",
-        f"- **(B) grey zone (ADMIT_UNSURE / second_time_force_admit): {_pct(len(grey), n)}** — "
+        "- msg-3630's 179 rows cannot be reproduced (no per-row list was published); this "
+        "evaluation is not compared with that breakdown (msg-4229 §1).",
+        f"- harvested population (gate only, no Jev call): {len(population)} rows; "
+        f"**in the grey zone: {pop_grey}**",
+        f"- rows replayed: body {n}, supplement {len(supplement)}",
+        f"- **(B) grey zone (ADMIT_UNSURE / second_time_force_admit): "
+        f"{_pct(len(grey), len(all_rows))} of replayed rows** — "
         "under today's D18 gating only these reach Jev's verdict; (B) = this share x (A).",
         f"- rows the live hook's entry check would admit (proposer-authored `NEXT: human`): "
         f"{_pct(len(live), n)}; of those in the grey zone: "
@@ -386,11 +402,11 @@ def render(
         "- Changing D18 or the allowed labels would be an amendment grounded in ADR-2026-05-23-07 "
         "(msg-4224); that decision is out of scope here.",
         f"- rosters from today's config (`current_fallback`): "
-        f"{sum(1 for r in rows if r.roster_source == 'current_fallback')}",
-        f"- thresholds: genuine_min={th.genuine_min} genuine_max={th.genuine_max} "
-        f"spurious_min={th.spurious_min}",
+        f"{sum(1 for r in all_rows if r.roster_source == 'current_fallback')}",
+        f"- thresholds (fixed in advance, RUBRIC): genuine_min={th.genuine_min} "
+        f"genuine_max={th.genuine_max} spurious_min={th.spurious_min}",
         "",
-        "## (A) Jev's discrimination on all rows",
+        "## (A) Jev's discrimination — body set (headline)",
         "",
     ]
     views: dict[str, Mapping[Key, str]] = {"consensus": truth}
@@ -407,6 +423,13 @@ def render(
         )
         lines += [f"- Cohen's κ ({a} vs {b}): {'n/a' if k is None else f'{k:.3f}'} over {kn}", ""]
 
+    lines += ["## Supplement set (not in the headline)", ""]
+    if supplement:
+        lines += [f"- {k}: {v}" for k, v in headline(supplement, truth, th).items()]
+    else:
+        lines.append("- no rows")
+    lines.append("")
+
     def table(counter: Counter[tuple[str, str]]) -> list[str]:
         truths = [*LABELS, "unlabelled"]
         out = [
@@ -418,11 +441,14 @@ def render(
                 out.append(f"| {t} | " + " | ".join(str(counter[(t, v)]) for v in VERDICTS) + " |")
         return out
 
-    lines += ["### Confusion (consensus truth)", ""]
+    lines += ["### Confusion — body (consensus truth)", ""]
     lines += [*table(confusion(rows, truth, th)["all"]), ""]
+    if supplement:
+        lines += ["### Confusion — supplement (consensus truth)", ""]
+        lines += [*table(confusion(supplement, truth, th)["all"]), ""]
 
-    lines += ["## Misses — genuine judged LIKELY_NOT (one by one)", ""]
-    miss = misses(rows, truth, labellers, th)
+    lines += ["## Misses — genuine judged LIKELY_NOT (one by one, body and supplement)", ""]
+    miss = misses(all_rows, truth, labellers, th)
     lines += miss or ["- none"]
     lines.append("")
 
@@ -433,19 +459,19 @@ def render(
             if v.category:
                 cat_of.setdefault(k, v.category)
     by_cat: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
-    for r in rows:
-        by_cat[cat_of.get(r.key, "(none)")][
+    for r in all_rows:
+        by_cat[f"{cat_of.get(r.key, '(none)')} [{r.eval_set or 'body'}]"][
             (truth.get(r.key, "unlabelled"), recompute(r.scores, th)[0])
         ] += 1
     for cat, c in sorted(by_cat.items()):
         lines += [f"### {cat}", "", *table(c), ""]
 
     lines += ["## Breakdown by gate result", ""]
-    for g, c in sorted(confusion(rows, truth, th, by="gate_bucket").items()):
+    for g, c in sorted(confusion(all_rows, truth, th, by="gate_bucket").items()):
         lines += [f"### {g}", "", *table(c), ""]
 
-    lines += ["## Calibration", ""]
-    bins, a = calibration(rows, truth)
+    lines += ["## Calibration (body + supplement; genuine rows are too few in body alone)", ""]
+    bins, a = calibration(all_rows, truth)
     lines += ["| spurious max | n | actually spurious |", "|---|---|---|"]
     lines += [f"| {b} | {bn} | {_pct(bs, bn)} |" for b, bn, bs in bins]
     lines += [
@@ -453,12 +479,12 @@ def render(
         f"- AUC of genuine-sum (genuine* vs spurious): {'n/a' if a is None else f'{a:.3f}'}",
         "",
     ]
-    lines += ["### Threshold sweep (genuine_max = genuine_min x 2/3)", ""]
+    lines += ["### Threshold sweep — reference only, never a headline (RUBRIC), body set", ""]
     lines += ["| genuine_min | spurious_min | reduction | recall genuine |", "|---|---|---|---|"]
     lines += [f"| {g} | {s} | {red} | {rec} |" for g, s, red, rec in sweep(rows, truth)]
     lines.append("")
 
-    lines += [f"## Grey zone only (n = {len(grey)})", ""]
+    lines += [f"## Grey zone only (n = {len(grey)} of replayed rows)", ""]
     if grey:
         lines += [f"- {k}: {v}" for k, v in headline(grey, truth, th).items()]
         lines += table(confusion(grey, truth, th)["all"])
@@ -467,13 +493,15 @@ def render(
     lines.append("")
 
     lines += ["## Operations", ""]
-    oc = Counter(r.outcome or "not_called" for r in rows)
+    oc = Counter(r.outcome or "not_called" for r in all_rows)
     lines += [f"- outcome: {dict(oc)}"]
-    lines += [f"- error rate: {_pct(n - oc.get('evaluated', 0), n)}"]
-    lat = [r.latency_ms for r in rows if r.latency_ms is not None]
+    lines += [f"- error rate: {_pct(len(all_rows) - oc.get('evaluated', 0), len(all_rows))}"]
+    lat = [r.latency_ms for r in all_rows if r.latency_ms is not None]
     lines += [f"- latency ms p50={_pctl(lat, 0.5)} p95={_pctl(lat, 0.95)}"]
     agree = sum(
-        1 for r in rows if r.server_verdict is not None and r.scores is not None and not r.grey_zone
+        1
+        for r in all_rows
+        if r.server_verdict is not None and r.scores is not None and not r.grey_zone
     )
     lines += [
         f"- server verdict is scope=out_of_gate (UNSURE by construction) on {agree} rows; the "
@@ -489,22 +517,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replay", type=Path, required=True)
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--labels", action="append", default=[], help="NAME=PATH (repeatable)")
-    parser.add_argument("--genuine-min", type=float, default=None)
-    parser.add_argument("--genuine-max", type=float, default=None)
-    parser.add_argument("--spurious-min", type=float, default=None)
+    parser.add_argument(
+        "--population", type=Path, default=None, help="population.jsonl (gate-only rows)"
+    )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
 
-    th_kwargs = {
-        k: v
-        for k, v in (
-            ("genuine_min", args.genuine_min),
-            ("genuine_max", args.genuine_max),
-            ("spurious_min", args.spurious_min),
-        )
-        if v is not None
-    }
-    th = TierCThresholds(**th_kwargs)
+    # Thresholds are fixed in advance (RUBRIC, msg-4229 §3-4): the live defaults, no CLI knob.
+    th = TierCThresholds()
     labellers: dict[str, dict[Key, Label]] = {}
     for spec in args.labels:
         name, _, path = spec.partition("=")
@@ -513,7 +533,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         labellers[name] = load_labels(read_jsonl(Path(path)))
     rows = join(read_jsonl(args.replay), read_jsonl(args.fixture))
-    text = render(rows, labellers, th)
+    population = read_jsonl(args.population) if args.population is not None else []
+    text = render(rows, labellers, th, population)
     if args.out is not None:
         args.out.write_text(text + "\n", encoding="utf-8")
     else:
