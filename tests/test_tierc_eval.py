@@ -30,8 +30,13 @@ from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
 from spirrow_mindwire.decider.hook import compute_gate_result, never_retry
 from spirrow_mindwire.decider.questions import TIERC_QUESTIONS_V1
 from spirrow_mindwire.decider.result import DecisionOutcome, DecisionResult
+from spirrow_mindwire.decider.state import state_builder
 from spirrow_mindwire.decider.verdict import build_out_of_gate_verdict
-from spirrow_mindwire.decider.wire import gate_result_to_dict
+from spirrow_mindwire.decider.wire import (
+    POLICY_REPLAY_TIERC,
+    build_decide_request,
+    gate_result_to_dict,
+)
 from spirrow_mindwire.value_objects import Role
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -916,3 +921,111 @@ def test_committed_eval_jsonl_files_are_strict_jsonl() -> None:
             for lineno, line in enumerate(fh, start=1):
                 assert line.strip(), f"{path}:{lineno}: blank line in JSONL"
                 json.loads(line)
+
+
+# --- T-decider-tierc-fulltext-eval (Bohr msg-4311 / msg-4313 / msg-4318): --head-m -------------
+
+LONG = "L" * 1200 + "\n\nTIER-C: scope\nNEXT: human"
+
+
+def _long_thread() -> list[Any]:
+    return [
+        _msg(1, "Fermi", "P" * 900 + "\n\nNEXT: Bohr"),
+        _msg(2, "Bohr", "design\n\nNEXT: Einstein", role="proposer"),
+        _msg(3, "Einstein", "ok\n\nNEXT: Bohr", role="naysayer"),
+        _msg(4, "Bohr", LONG, role="proposer"),
+        _msg(5, "Heisenberg", "FUTURE-ONLY-TEXT\n\nNEXT: Bohr", role="implementer"),
+    ]
+
+
+def _outputs(threads: list[Any], head_m: int | None) -> list[dict[str, Any]]:
+    kw = {} if head_m is None else {"head_m": head_m}
+    fixture: list[dict[str, Any]] = builder.build_outputs(threads, {}, **kw)[1]
+    return fixture
+
+
+def _lines(rows: list[dict[str, Any]]) -> list[str]:
+    return [builder._fixture_line(r) for r in rows]
+
+
+def test_head_m_500_is_byte_identical_to_the_default_fixture() -> None:
+    """msg-4313 test 1: ``head_m=500`` reproduces the original (live) fixture byte for byte."""
+    threads = [("p", "T-x", _thread()), ("p", "T-long", _long_thread())]
+    assert _lines(_outputs(threads, 500)) == _lines(_outputs(threads, None))
+
+
+def test_head_m_8000_differs_only_in_the_escalations_two_fields() -> None:
+    """msg-4313 test 2: only ``head_summary`` and ``recent_events[0].body_head`` change."""
+    threads = [("p", "T-long", _long_thread())]
+    (old,) = _outputs(threads, None)
+    (new,) = _outputs(threads, 8000)
+    assert sorted(f for f in set(old) | set(new) if old.get(f) != new.get(f)) == [
+        "head_summary",
+        "recent_events",
+    ]
+    assert new["head_summary"] == LONG and len(old["head_summary"]) == 500
+    assert new["recent_events"][1:] == old["recent_events"][1:]
+    assert len(new["recent_events"]) == len(old["recent_events"])
+    e0_old, e0_new = old["recent_events"][0], new["recent_events"][0]
+    assert {k for k in e0_old if e0_old[k] != e0_new[k]} == {"body_head"}
+    # the earlier long message stays at the live 500 (msg-4311: only the escalation widens)
+    assert all(len(e["body_head"]) <= 500 for e in new["recent_events"][1:])
+
+
+@pytest.mark.parametrize("head_m", [None, 500, 8000, 50])
+def test_escalation_invariant_on_every_row(head_m: int | None) -> None:
+    """msg-4313 test 3: ``head_summary == recent_events[0].body_head`` and ev0 is the escalation."""
+    rows = _outputs([("p", "T-x", _thread()), ("p", "T-long", _long_thread())], head_m)
+    assert rows
+    for r in rows:
+        assert r["head_summary"] == r["recent_events"][0]["body_head"]
+        assert r["recent_events"][0]["msg_id"] == r["msg_id"]
+
+
+def test_short_escalation_request_is_byte_identical() -> None:
+    """msg-4313 test 4: a ≤500-char escalation sends exactly the original ``/v1/decide`` body."""
+    threads = [("p", "T-x", _thread())]
+    olds, news = _outputs(threads, None), _outputs(threads, 8000)
+    assert olds and len(olds) == len(news)
+    assert all(len(r["recent_events"][0]["body_head"]) < 500 for r in olds)
+    assert _lines(news) == _lines(olds)
+    old, new = olds[0], news[0]
+    s_old = state_builder(replay.parse_turn(old))
+    s_new = state_builder(replay.parse_turn(new))
+    req_old = build_decide_request(s_old, policy=POLICY_REPLAY_TIERC)
+    req_new = build_decide_request(s_new, policy=POLICY_REPLAY_TIERC)
+    assert json.dumps(req_new, sort_keys=True) == json.dumps(req_old, sort_keys=True)
+
+
+def test_fulltext_for_rebuilds_exactly_the_kept_rows() -> None:
+    threads = [("p", "T-x", _thread()), ("p", "T-long", _long_thread())]
+    fixture = _outputs(threads, None)
+    keep = [builder._entry(r) for r in fixture]
+    rows = builder.fulltext_for(
+        corrections={"keep": keep}, threads=threads, current_roster={}, head_m=8000
+    )
+    assert [(r["thread_id"], r["round_index"]) for r in rows] == [
+        (e["thread_id"], e["round_index"]) for e in keep
+    ]
+    with pytest.raises(ValueError, match="not rebuilt"):
+        builder.fulltext_for(
+            corrections={"keep": [*keep, {"thread_id": "T-none", "round_index": 0}]},
+            threads=threads,
+            current_roster={},
+            head_m=8000,
+        )
+
+
+def test_head_m_must_be_positive() -> None:
+    msgs = _thread()
+    with pytest.raises(ValueError, match="head_m"):
+        builder.build_eval_row(
+            project="p",
+            thread_id="T-x",
+            messages=msgs,
+            head_index=3,
+            current_roster={},
+            now=msgs[3].timestamp,
+            set_name="eval",
+            head_m=0,
+        )
