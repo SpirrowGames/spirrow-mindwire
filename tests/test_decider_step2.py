@@ -32,7 +32,7 @@ from spirrow_mindwire.adapters.decider_lexora import (
     build_decider,
     decide_once,
 )
-from spirrow_mindwire.conductor.core import Conductor, StopReason
+from spirrow_mindwire.conductor.core import Conductor, RouteDecision, StopReason
 from spirrow_mindwire.decider import hook as hook_mod
 from spirrow_mindwire.decider.hook import (
     RoutingInvariantError,
@@ -1229,7 +1229,7 @@ async def test_conductor_spawn_blocked_human_leaves_one_spawn_blocked_line(
 
 def _route_of(
     *msgs: tuple[str, str], identity_embodiment: dict[str, str] | None = None
-) -> tuple[Any, ...]:
+) -> RouteDecision:
     """``Conductor._route`` on a thread of ``(author, body)`` messages, the head resolved the way
     ``run`` resolves it."""
     from spirrow_mindwire.conductor.handoff import resolve_handoff
@@ -1248,48 +1248,122 @@ def _route_of(
         (
             (("Bohr", "d\n\nNEXT: human"),),
             _HUMAN_UNSPAWNABLE,
-            (None, "", False, False, True, StopReason.HUMAN),
+            RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=True,
+                stop_reason=StopReason.HUMAN,
+            ),
         ),
         # forced consult on an explicit NEXT: human (not saveable)
         (
             (("Bohr", "d\n\nNEXT: human"),),
             None,
-            (Role.NAYSAYER, "Einstein", True, False, False, None),
+            RouteDecision(
+                target_role=Role.NAYSAYER,
+                target_identity="Einstein",
+                is_forced=True,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=None,
+            ),
         ),
         # plain HUMAN stop after a naysayer consult
         (
             (("Einstein", _attested("c\n\nNEXT: Bohr")), ("Bohr", "d\n\nNEXT: human")),
             None,
-            (None, "", False, False, False, StopReason.HUMAN),
+            RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.HUMAN,
+            ),
         ),
         # guard (i) redirect → forced consult, saveable
         (
             (("Bohr", "d\n\nNEXT: Heisenberg"),),
             None,
-            (Role.NAYSAYER, "Einstein", True, True, False, None),
+            RouteDecision(
+                target_role=Role.NAYSAYER,
+                target_identity="Einstein",
+                is_forced=True,
+                is_saveable=True,
+                spawn_blocked=False,
+                stop_reason=None,
+            ),
         ),
         (
             (("Bohr", "d\n\nNEXT: Bohr"),),
             None,
-            (None, "", False, False, False, StopReason.SELF_HANDOFF),
+            RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.SELF_HANDOFF,
+            ),
         ),
-        ((("Bohr", "d\n\nNEXT: none"),), None, (None, "", False, False, False, StopReason.SETTLED)),
+        (
+            (("Bohr", "d\n\nNEXT: none"),),
+            None,
+            RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.SETTLED,
+            ),
+        ),
         (
             (("Einstein", _attested("no next line")),),
             None,
-            (None, "", False, False, False, StopReason.NO_HANDOFF),
+            RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.NO_HANDOFF,
+            ),
         ),
     ],
 )
 def test_route_spawn_blocked_true_only_on_spawn_blocked_exit(
     msgs: tuple[tuple[str, str], ...],
     embodiment: dict[str, str] | None,
-    expected: tuple[Any, ...],
+    expected: RouteDecision,
 ) -> None:
-    """Test 17 (msg-4280): ``_route``'s whole 6-tuple, position by position. ``spawn_blocked`` is
-    ``True`` only on the ``_spawn_blocked`` exit; a transposition of the three adjacent bools
-    (``is_forced`` / ``is_saveable`` / ``spawn_blocked``) at any return reds a row here."""
+    """Test 17 (msg-4280, retyped per human msg-4285): ``_route``'s whole :class:`RouteDecision`,
+    field by field. ``spawn_blocked`` is ``True`` only on the ``_spawn_blocked`` exit; a wrong
+    value in any of the three bools (``is_forced`` / ``is_saveable`` / ``spawn_blocked``) at any
+    exit reds a row here."""
     assert _route_of(*msgs, identity_embodiment=embodiment) == expected
+
+
+def test_route_decision_cannot_be_built_or_read_positionally() -> None:
+    """Human msg-4285 / Einstein msg-4281: the three adjacent bools cannot be transposed because
+    :class:`RouteDecision` accepts keywords only, requires every field, and is not iterable — so
+    neither a ``_route`` exit nor a caller can use positions."""
+    with pytest.raises(TypeError):
+        RouteDecision(None, "", False, False, True, StopReason.HUMAN)  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        RouteDecision(target_role=None, target_identity="", stop_reason=StopReason.HUMAN)  # type: ignore[call-arg]
+    decision = RouteDecision(
+        target_role=None,
+        target_identity="",
+        is_forced=False,
+        is_saveable=False,
+        spawn_blocked=True,
+        stop_reason=StopReason.HUMAN,
+    )
+    with pytest.raises(TypeError):
+        _role, _ident, _forced, _saveable, _blocked, _stop = decision  # type: ignore[misc]
 
 
 # --------------------------------------------------------------------------- replay --endpoint
