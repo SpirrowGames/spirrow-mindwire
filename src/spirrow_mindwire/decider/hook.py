@@ -9,9 +9,10 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
    proposer escalation that ``_route`` turned into a forced naysayer consult (``stop=None``) is
    evaluated too. Any other turn returns at once — no gate, no Lexora call, no log line;
    ``routed`` (msg-4239 DECIDED 2c-1 revised, :func:`routed_from_route`) then records what
-   ``_route`` actually did with the turn — ``stop`` / ``forced_naysayer`` — read from its return
-   values, never inferred. Each value requires the **whole** combination of ``stop`` /
-   ``is_forced`` / ``target_role`` that names it; any other combination (unreachable today) is a
+   ``_route`` actually did with the turn — ``stop`` / ``forced_naysayer`` / ``spawn_blocked``
+   (msg-4280 DECIDED 2c-4) — read from its return values, never inferred. Each value requires
+   the **whole** combination of ``stop`` / ``is_forced`` / ``target_role`` / ``spawn_blocked``
+   that names it; any other combination (unreachable today) is a
    :class:`RoutingInvariantError`, logged at ERROR with no row (see below);
 1. run the admission gate **compute-only** (msg-4200 DECIDED 2b-1 / 2b-2,
    :func:`compute_gate_result`): ``retry_lookup`` always ``False``, the decision's log entries
@@ -25,8 +26,8 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
    ``gate_kind`` / ``gate_is_grey_zone``, the rule ``stop`` and ``routed`` on the same line;
 5. the acting branch is gated on ``routed == "stop"`` (msg-4237 DECIDED 2c-2), on
    ``dr.actionable_verdict`` only (msg-4184) and on a mode of ``annotate`` / ``bounce`` — which is
-   refused at build time, so in shadow it never runs. ``forced_naysayer`` rows are record-only in
-   every mode.
+   refused at build time, so in shadow it never runs. ``forced_naysayer`` and ``spawn_blocked``
+   rows are record-only in every mode.
 
 **Fail loud, not fail open (Einstein msg-4240 advisory; PR-gate observation on #348).** A routing
 combination the mapping does not name raises :class:`RoutingInvariantError` (an
@@ -208,12 +209,18 @@ ROUTED_STOP = "stop"
 """``_route`` stopped the turn at the human (``original_stop == HUMAN``)."""
 ROUTED_FORCED_NAYSAYER = "forced_naysayer"
 """``_route`` sent the turn to a forced naysayer consult (``is_forced`` and target = naysayer)."""
+ROUTED_SPAWN_BLOCKED = "spawn_blocked"
+"""``_route`` stopped the turn on its ``_spawn_blocked`` branch (msg-4280 DECIDED 2c-4): the stop
+is ``HUMAN`` but it is a routing dead end, not a proposal stopped at the human — record-only in
+every mode. There is no ``StopReason.SPAWN_BLOCKED``; the fact comes from ``_route``'s own
+``spawn_blocked`` return value (msg-4278 / msg-4280)."""
 
 
 class RoutingInvariantError(AssertionError):
     """``_route`` returned a combination for a proposer ``NEXT: human`` that no ``routed`` value
     names. Unreachable today (``_human_terminal`` / ``_spawn_blocked`` are the only exits for a
-    ``HUMAN`` handoff); raised so a new ``_route`` branch fails loudly instead of being labelled."""
+    ``HUMAN`` handoff, and each maps to a named value); raised so a new ``_route`` branch fails
+    loudly instead of being labelled."""
 
 
 def _roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
@@ -263,6 +270,7 @@ def routed_from_route(
     stop: str | None,
     is_forced: bool,
     target_role: Role | None,
+    spawn_blocked: bool,
     naysayer_role: Role,
 ) -> str:
     """``routed`` from ``_route``'s own return values (msg-4239 DECIDED 2c-1 revised).
@@ -270,19 +278,24 @@ def routed_from_route(
     Read, not inferred, and exhaustive over the combination — no field short-circuits the others
     (PR-gate observation on #348):
 
-    * ``stop`` — rule stop ``HUMAN`` **and** not forced **and** no dispatch target;
-    * ``forced_naysayer`` — no rule stop **and** ``is_forced`` **and** target = naysayer role.
+    * ``stop`` — rule stop ``HUMAN`` **and** not forced **and** no dispatch target **and** not
+      ``spawn_blocked``;
+    * ``spawn_blocked`` — the same combination with ``spawn_blocked`` (msg-4280 DECIDED 2c-4);
+    * ``forced_naysayer`` — no rule stop **and** ``is_forced`` **and** target = naysayer role
+      **and** not ``spawn_blocked`` (``_route`` checks spawnability before every other branch,
+      so both at once is a broken invariant).
 
     Anything else — e.g. ``stop=HUMAN`` together with ``is_forced`` (mutually exclusive by
     definition) — raises :class:`RoutingInvariantError` (Einstein msg-4240 advisory: fail loudly
     rather than record an ``other`` label).
     """
     if stop == _STOP_HUMAN and not is_forced and target_role is None:
-        return ROUTED_STOP
-    if stop is None and is_forced and target_role is naysayer_role:
+        return ROUTED_SPAWN_BLOCKED if spawn_blocked else ROUTED_STOP
+    if stop is None and is_forced and target_role is naysayer_role and not spawn_blocked:
         return ROUTED_FORCED_NAYSAYER
     raise RoutingInvariantError(
         f"decider routing invariant broken: stop={stop} is_forced={is_forced} "
+        f"spawn_blocked={spawn_blocked} "
         f"target={target_role.value if target_role is not None else None}"
         " — _route に HUMAN 用の新しい分岐がないか確認"
     )
@@ -374,13 +387,15 @@ async def run_tierc_hook(
     stop: str | None,
     is_forced: bool,
     target_role: Role | None,
+    spawn_blocked: bool,
     naysayer_role: Role,
     author_wrote_next_human: bool,
     now: datetime | None = None,
 ) -> DecisionResult | None:
     """Entry check → admission gate (compute-only) → evaluate + log. Never changes the routing.
 
-    ``stop`` / ``is_forced`` / ``target_role`` are ``_route``'s return values for this turn
+    ``stop`` / ``is_forced`` / ``target_role`` / ``spawn_blocked`` are ``_route``'s return values
+    for this turn
     (``stop`` is the rule-stop snapshot, D21). They are read to derive ``routed``; ``stop`` and
     ``routed`` are written to the log line. None of them is modified. ``now`` defaults to the
     wall clock.
@@ -393,7 +408,11 @@ async def run_tierc_hook(
         return None
     try:
         routed = routed_from_route(
-            stop=stop, is_forced=is_forced, target_role=target_role, naysayer_role=naysayer_role
+            stop=stop,
+            is_forced=is_forced,
+            target_role=target_role,
+            spawn_blocked=spawn_blocked,
+            naysayer_role=naysayer_role,
         )
     except RoutingInvariantError:
         # Fail loud (ERROR + traceback), write no row, call nothing. Not re-raised: the hook must
@@ -449,7 +468,8 @@ async def run_tierc_hook(
 
     # msg-4184 §2: acting code reads ``actionable_verdict`` only. msg-4237 DECIDED 2c-2: only a
     # turn ``_route`` stopped at the human (``routed == "stop"``) may be acted on; a forced
-    # consult row is record-only in every mode (acting before the forced consult is a
+    # consult row, and a spawn-blocked dead end (msg-4280 DECIDED 2c-4), is record-only in every
+    # mode (acting before the forced consult is a
     # separate Takahito decision, like ``skip_naysayer_when_confirmed``). annotate / bounce are
     # refused at build time, so under shadow this branch is structurally dead.
     av = dr.actionable_verdict
@@ -466,6 +486,7 @@ __all__ = [
     "BODY_HEAD_M",
     "RECENT_EVENTS_N",
     "ROUTED_FORCED_NAYSAYER",
+    "ROUTED_SPAWN_BLOCKED",
     "ROUTED_STOP",
     "Decider",
     "RoutingInvariantError",
