@@ -74,7 +74,7 @@ import json
 import sys
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Literal
+from typing import IO, Any, Literal
 
 from spirrow_mindwire.adapters.decider_lexora import DECIDER_TIMEOUT_SECONDS, decide_once
 from spirrow_mindwire.decider.questions import (
@@ -278,14 +278,58 @@ def iter_fixture(path: Path) -> Iterable[dict[str, Any]]:
                 raise ValueError(f"{path}:{lineno}: invalid JSON — {exc}") from exc
 
 
+def record_key(rec: dict[str, Any]) -> tuple[str, int]:
+    """The replay-record join key ``(thread_id, round_index)`` (msg-4219 §2)."""
+    return (str(rec["thread_id"]), int(rec["round_index"]))
+
+
+def load_done_keys(path: Path) -> set[tuple[str, int]]:
+    """Keys already written to ``path`` by an earlier ``--resume`` run (msg-4219 §2).
+
+    Only records that carry a ``decision`` count as done: a record from a dry-run has no
+    decision and must not stop a later live run from sending it.
+    """
+    done: set[tuple[str, int]] = set()
+    if not path.is_file():
+        return done
+    for rec in iter_fixture(path):
+        if isinstance(rec.get("decision"), dict):
+            done.add(record_key(rec))
+    return done
+
+
 async def _decide_records(
-    states: list[DecisionState], records: list[dict[str, Any]], endpoint: str
-) -> None:
-    """``--endpoint`` 経路: 各 state を live と同じ ``decide_once`` に流し record に足す。"""
+    states: list[DecisionState],
+    records: list[dict[str, Any]],
+    endpoint: str,
+    *,
+    sink: IO[str],
+    done: set[tuple[str, int]],
+    max_calls: int | None,
+) -> tuple[int, int, int]:
+    """``--endpoint`` 経路: 各 state を live と同じ ``decide_once`` に流し record に足す。
+
+    Records are written as each call returns (not buffered), so a crashed or capped run
+    leaves every paid-for answer on disk for ``--resume`` to skip. ``max_calls`` stops the
+    run **before** the call that would exceed it (msg-4219 §2 billing brake): that record and
+    every later one are neither sent nor written. Returns ``(called, skipped_done,
+    not_sent_cap)``.
+    """
+    called = skipped_done = not_sent = 0
     async with LexoraClient(endpoint, timeout_seconds=DECIDER_TIMEOUT_SECONDS) as client:
         for state, rec in zip(states, records, strict=True):
+            if record_key(rec) in done:
+                skipped_done += 1
+                continue
+            if max_calls is not None and called >= max_calls:
+                not_sent += 1
+                continue
             dr = await decide_once(state, client=client, policy=POLICY_REPLAY_TIERC)
+            called += 1
             rec["decision"] = decision_result_to_dict(dr)
+            sink.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            sink.flush()
+    return called, skipped_done, not_sent
 
 
 def run_tierc_replay(
@@ -294,12 +338,28 @@ def run_tierc_replay(
     out: Path | None,
     mode: Literal["dry-run"],
     endpoint: str | None = None,
+    max_calls: int | None = None,
+    resume: bool = False,
 ) -> int:
     """Tier-C fixture を JSONL に吐く。
 
     ``endpoint`` が ``None`` なら dry-run (step 1 と同一出力)。 指定があれば
     各 record を ``/v1/decide`` に流し ``decision`` を付ける (msg-4180 §3)。
+
+    ``max_calls`` / ``resume`` (T-decider-tierc-replay-eval msg-4219 §2) are live-path only:
+    ``max_calls`` caps how many ``/v1/decide`` calls this run may make; ``resume`` appends to
+    ``out`` and skips every key already written there with a decision.
     """
+
+    if endpoint is None and (max_calls is not None or resume):
+        print("decider_replay: --max-calls / --resume need --endpoint", file=sys.stderr)
+        return 2
+    if resume and out is None:
+        print("decider_replay: --resume needs --out", file=sys.stderr)
+        return 2
+    if max_calls is not None and max_calls < 0:
+        print("decider_replay: --max-calls must be >= 0", file=sys.stderr)
+        return 2
 
     records: list[dict[str, Any]] = []
     states: list[DecisionState] = []
@@ -321,8 +381,31 @@ def run_tierc_replay(
         states.append(state)
         records.append(build_tierc_record(state))
 
+    keys = [record_key(r) for r in records]
+    if len(set(keys)) != len(keys):
+        # --resume skips by key, so a duplicate key would silently drop a turn.
+        print("decider_replay: duplicate (thread_id, round_index) in fixture", file=sys.stderr)
+        return 2
+
     if endpoint is not None:
-        asyncio.run(_decide_records(states, records, endpoint))
+        done = load_done_keys(out) if (resume and out is not None) else set()
+        sink = out.open("a" if resume else "w", encoding="utf-8") if out is not None else sys.stdout
+        try:
+            called, skipped_done, not_sent = asyncio.run(
+                _decide_records(
+                    states, records, endpoint, sink=sink, done=done, max_calls=max_calls
+                )
+            )
+        finally:
+            if out is not None:
+                sink.close()
+        print(
+            f"decider_replay: called {called} (skipped {skipped_done} already done, "
+            f"{not_sent} not sent: --max-calls={max_calls}; skipped {skipped_no_gate} "
+            f"non-gate turns, endpoint={endpoint})",
+            file=sys.stderr,
+        )
+        return 0
 
     sink = out.open("w", encoding="utf-8") if out is not None else sys.stdout
     try:
@@ -382,6 +465,20 @@ def main(argv: list[str] | None = None) -> int:
             "未指定なら dry-run。"
         ),
     )
+    parser.add_argument(
+        "--max-calls",
+        type=int,
+        default=None,
+        help=(
+            "--endpoint 時の /v1/decide 呼び出し上限 (課金の歯止め、msg-4219 §2)。 上限に"
+            "達したら以降の turn は送らず書かない (--resume で続きを流せる)。"
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="--out に追記し、decision 付きで出力済みの (thread_id, round_index) を飛ばす。",
+    )
     args = parser.parse_args(argv)
 
     if args.track != "tierc":
@@ -401,7 +498,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     return run_tierc_replay(
-        fixture=args.fixture, out=args.out, mode=args.mode, endpoint=args.endpoint
+        fixture=args.fixture,
+        out=args.out,
+        mode=args.mode,
+        endpoint=args.endpoint,
+        max_calls=args.max_calls,
+        resume=args.resume,
     )
 
 

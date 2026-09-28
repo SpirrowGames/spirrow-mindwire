@@ -83,6 +83,15 @@ _FIXTURE_FILES: frozenset[str] = frozenset(
 _INDEX_FILE = "spec/adr_index.yaml"
 
 
+def _is_eval_snapshot(rel_path: str) -> bool:
+    """Frozen evaluation data under ``eval/`` (T-decider-tierc-replay-eval): verbatim past chat
+    messages cut at fixed lengths, plus raw labeller output. They quote ids as data and do not
+    cite them; a 500-char cut can even leave half an id behind (``…-29-1`` of ``…-29-13``). They
+    are hash-locked, so rewriting them to satisfy this check is not an option. The ``.md`` files
+    there (the rubric, the prompt) are prose and are still scanned."""
+    return rel_path.startswith("eval/") and not rel_path.endswith(".md")
+
+
 @dataclass(frozen=True)
 class Occurrence:
     """A single ADR id token found at ``path``:``line`` (1-indexed line number)."""
@@ -142,6 +151,8 @@ def _iter_occurrences(repo_root: Path, files: tuple[str, ...]) -> list[Occurrenc
         # visible while skipping its occurrences would be lying by another name;
         # skipping the file entirely says out loud what is going on.
         if rel_path == _INDEX_FILE or rel_path in _FIXTURE_FILES:
+            continue
+        if _is_eval_snapshot(rel_path):
             continue
         full = repo_root / rel_path
         try:
