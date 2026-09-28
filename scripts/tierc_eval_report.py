@@ -603,15 +603,20 @@ def render(
     lines += [f"- error rate: {_pct(len(all_rows) - oc.get('evaluated', 0), len(all_rows))}"]
     lat = [r.latency_ms for r in all_rows if r.latency_ms is not None]
     lines += [f"- latency ms p50={_pctl(lat, 0.5)} p95={_pctl(lat, 0.95)}"]
-    agree = sum(
+    # Every gate result outside the grey zone — a valid-label ADMIT as much as a BOUNCE — takes
+    # ``build_out_of_gate_verdict`` in ``adapters/decider_lexora.py`` (step 5), so the ADMIT rows
+    # counted here are out_of_gate / UNSURE too (pinned by test_decider_replay.py
+    # ``test_dry_run_admit_valid_label_emits_out_of_gate``).
+    out_of_gate = sum(
         1
         for r in all_rows
         if r.server_verdict is not None and r.scores is not None and not r.grey_zone
     )
     lines += [
-        f"- mindwire-side verdict (``decider/verdict.py``, not the server) is scope=out_of_gate "
-        f"(UNSURE by construction) on {agree} rows; the recomputed verdict above is what (A) "
-        "reads.",
+        f"- mindwire-side verdict (``adapters/decider_lexora.py``, not the server) is "
+        f"scope=out_of_gate (UNSURE by construction) on {out_of_gate} rows — every non-grey-zone "
+        "gate result, valid-label ADMIT and BOUNCE alike; the recomputed verdict above is what "
+        "(A) reads.",
         "- cost per call: not in the replay record — read from Lexora usage.",
         "",
     ]
