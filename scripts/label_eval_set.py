@@ -22,6 +22,12 @@ provenance (``labeller``, ``model``, ``backend``, ``batch``, ``prompt_sha256``).
 response of every accepted batch is kept under ``raw/<labeller>/``. A run resumes by skipping
 keys already in the label file; nothing is ever edited by hand.
 
+**Chunked runs (msg-4246).** A turn has a 30-minute cap, so a run can be bounded with
+``--max-batches N`` and continued later with ``--resume`` (batches already in the label file are
+skipped). Without ``--resume`` the script refuses to touch a label file that already has rows,
+so a continuation is always an explicit choice. Every run, bounded or not, appends one line to
+``label_runs.jsonl`` with ``remaining`` (material rows still unlabelled).
+
 **Reader.** Files only; nothing is posted to a chatroom thread.
 """
 
@@ -52,8 +58,10 @@ _reconfigure_err = getattr(sys.stderr, "reconfigure", None)
 if _reconfigure_err is not None:
     _reconfigure_err(errors="backslashreplace")
 
-LABELLERS: dict[str, str] = {"naysayer-tier": "naysayer", "claude": "frontier"}
-"""labeller name → Lexora tier (msg-4231 names the files by model, not by persona)."""
+LABELLERS: dict[str, str] = {"naysayer-tier": "naysayer", "frontier-tier": "frontier"}
+"""labeller name → Lexora tier. msg-4231 names the files by model, not by persona; msg-4245 fixes
+the Claude-side labeller to Lexora's ``frontier`` tier and its file to
+``labels.frontier-tier.jsonl``."""
 
 LABELS: frozenset[str] = frozenset(
     {"genuine", "genuine-merge", "genuine-action", "spurious", "ambiguous"}
@@ -240,23 +248,38 @@ async def label_all(
     out_dir: Path,
     batch_size: int = BATCH_SIZE,
     sleep: Callable[[float], Any] = asyncio.sleep,
+    stats: dict[str, Any] | None = None,
+    max_batches: int | None = None,
 ) -> dict[str, Any]:
     """Label every material row not yet in ``labels.<labeller>.jsonl``. Raises
-    :class:`LabelStopError` on the first batch that cannot be labelled cleanly."""
+    :class:`LabelStopError` on the first batch that cannot be labelled cleanly.
+
+    ``stats`` (optional) is filled in place, so a caller still has the tokens and cost spent
+    when the run stops. ``max_batches`` bounds how many new batches this call sends; the rest
+    stay for a ``--resume`` run (msg-4246). ``stats["remaining"]`` is the count still unlabelled."""
+    if max_batches is not None and max_batches < 1:
+        raise LabelStopError(f"max_batches must be >= 1, got {max_batches}")
     model = LABELLERS[labeller]
     prompt_sha = sha256_text(system)
     label_path = out_dir / f"labels.{labeller}.jsonl"
     done = {(r["thread_id"], r["round_index"]) for r in read_jsonl(label_path)}
     todo = [m for m in materials if (m["thread_id"], m["round_index"]) not in done]
-    stats: dict[str, Any] = {
-        "batches": 0,
-        "rows": 0,
-        "tokens_in": 0,
-        "tokens_out": 0,
-        "cost_usd": 0.0,
-    }
+    if stats is None:
+        stats = {}
+    stats.update(
+        {
+            "batches": 0,
+            "rows": 0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "cost_usd": 0.0,
+            "remaining": len(todo),
+        }
+    )
     batch_no = len({r.get("batch") for r in read_jsonl(label_path)})
     for start in range(0, len(todo), batch_size):
+        if max_batches is not None and stats["batches"] >= max_batches:
+            break
         batch = todo[start : start + batch_size]
         expected = [(m["thread_id"], m["round_index"]) for m in batch]
         messages = [ChatMessage("system", system), ChatMessage("user", user_message(batch))]
@@ -281,11 +304,11 @@ async def label_all(
             fail_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             path = fail_dir / f"{labeller}-batch{batch_no:03d}-{stamp}.txt"
-            path.write_text("\n\n=====\n\n".join(raws), encoding="utf-8")
+            path.write_text("\n\n=====\n\n".join(raws), encoding="utf-8", newline="\n")
             raise LabelStopError(f"format failure twice on batch {batch_no}; raw kept at {path}")
         raw_dir = out_dir / "raw" / labeller
         raw_dir.mkdir(parents=True, exist_ok=True)
-        (raw_dir / f"batch{batch_no:03d}.txt").write_text(raws[-1], encoding="utf-8")
+        (raw_dir / f"batch{batch_no:03d}.txt").write_text(raws[-1], encoding="utf-8", newline="\n")
         with label_path.open("a", encoding="utf-8", newline="\n") as fh:
             for obj in parsed:
                 fh.write(
@@ -304,6 +327,7 @@ async def label_all(
                 )
         stats["batches"] += 1
         stats["rows"] += len(parsed)
+        stats["remaining"] -= len(parsed)
         print(
             f"label_eval_set: {labeller} batch {batch_no} ok ({len(parsed)} rows, "
             f"backend={result.backend}, model={result.model})",
@@ -327,7 +351,7 @@ LOCKED_FILES: tuple[str, ...] = (
     "materials.jsonl",
     "fixture.jsonl",
     "labels.naysayer-tier.jsonl",
-    "labels.claude.jsonl",
+    "labels.frontier-tier.jsonl",
 )
 
 
@@ -375,6 +399,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dir", type=Path, default=Path("eval/tierc"))
     parser.add_argument("--endpoint", default="http://100.79.84.62:8110")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue a label file that already has rows (done batches are skipped)",
+    )
+    parser.add_argument(
+        "--max-batches", type=int, default=None, help="send at most N new batches this run"
+    )
     args = parser.parse_args(argv)
 
     if args.lock:
@@ -392,6 +424,15 @@ def main(argv: list[str] | None = None) -> int:
     rubric = (args.dir / "RUBRIC.md").read_text(encoding="utf-8")
     system = system_prompt(prompt, rubric)
     materials = read_jsonl(args.dir / "materials.jsonl")
+    label_path = args.dir / f"labels.{args.labeller}.jsonl"
+    if read_jsonl(label_path) and not args.resume:
+        print(
+            f"label_eval_set: STOP — {label_path} already has rows; pass --resume to continue it",
+            file=sys.stderr,
+        )
+        return 1
+    if args.max_batches is not None and args.max_batches < 1:
+        parser.error("--max-batches must be >= 1")
 
     async def run() -> dict[str, Any]:
         async with LexoraClient(args.endpoint, timeout_seconds=900) as client:
@@ -402,13 +443,15 @@ def main(argv: list[str] | None = None) -> int:
                 system=system,
                 out_dir=args.dir,
                 batch_size=args.batch_size,
+                stats=stats,
+                max_batches=args.max_batches,
             )
 
     started = datetime.now(UTC).isoformat()
     status = "ok"
     stats: dict[str, Any] = {}
     try:
-        stats = asyncio.run(run())
+        asyncio.run(run())
     except LabelStopError as e:
         status = f"stop: {e}"
         print(f"label_eval_set: STOP — {e}", file=sys.stderr)
@@ -417,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
         "labeller": args.labeller,
         "started_at": started,
         "batch_size": args.batch_size,
+        "resume": args.resume,
+        "max_batches": args.max_batches,
         "prompt_sha256": sha256_text(system),
         "status": status,
         **stats,

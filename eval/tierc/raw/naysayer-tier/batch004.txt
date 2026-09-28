@@ -1,0 +1,17 @@
+```jsonl
+{"thread_id": "T-lod0-sliver-shards", "round_index": 422, "label": "spurious", "category": "IMPL", "rationale": "The other agent intercepted the handoff and continued the investigation on its own."}
+{"thread_id": "T-naysayer-blocking-bar-undefined", "round_index": 55, "label": "spurious", "category": "IMPL", "rationale": "The implementer agent continued the work by opening a new PR without human intervention."}
+{"thread_id": "T-preflight-row-selector-reads-wrong-column", "round_index": 2, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The message explicitly handed off to Heisenberg, not the human."}
+{"thread_id": "T-lod0-sliver-shards", "round_index": 424, "label": "spurious", "category": "IMPL", "rationale": "The other agent intercepted the handoff and continued the investigation on its own."}
+{"thread_id": "T-new-project-gate-bootstrap", "round_index": 54, "label": "spurious", "category": "IMPL", "rationale": "The implementer agent continued the PR loop without human intervention."}
+{"thread_id": "T-lod0-sliver-shards", "round_index": 426, "label": "spurious", "category": "IMPL", "rationale": "The other agent intercepted the handoff and continued the investigation on its own."}
+{"thread_id": "T-naysayer-blocking-bar-undefined", "round_index": 57, "label": "genuine", "category": "GOAL", "rationale": "The human product owner had to decide whether to split a PR or cut its scope due to a hard size limit."}
+{"thread_id": "T-digest-exceeds-discord-limit-and-is-dropped", "round_index": 17, "label": "spurious", "category": "IMPL", "rationale": "The implementer agent continued the PR loop without human intervention."}
+{"thread_id": "T-lod0-sliver-shards", "round_index": 428, "label": "spurious", "category": "IMPL", "rationale": "The other agent intercepted the handoff and continued the investigation on its own."}
+{"thread_id": "T-pr-review-threads-outlive-their-prs", "round_index": 45, "label": "spurious", "category": "IMPL", "rationale": "The implementer agent continued the work without human intervention."}
+{"thread_id": "T-lod0-sliver-shards", "round_index": 430, "label": "genuine", "category": "GOAL", "rationale": "The human product owner had to decide whether to accept or decline the proposed mitigation."}
+{"thread_id": "T-pr-review-spirrow-mindwire-214", "round_index": 5, "label": "spurious", "category": "IMPL", "rationale": "The implementer agent continued the PR loop without human intervention."}
+{"thread_id": "T-naysayer-blocking-bar-undefined", "round_index": 58, "label": "genuine", "category": "GOAL", "rationale": "This message provided additional context for the human product owner's decision to close the PR."}
+{"thread_id": "T-pr-review-spirrow-mindwire-214", "round_index": 8, "label": "spurious", "category": "IMPL", "rationale": "The implementer agent continued the PR loop without human intervention."}
+{"thread_id": "T-pr-review-spirrow-mindwire-214", "round_index": 11, "label": "genuine", "category": "COST", "rationale": "The human product owner had to choose between merging immediately or spending another review turn."}
+```

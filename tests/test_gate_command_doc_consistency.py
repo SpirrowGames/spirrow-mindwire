@@ -111,10 +111,11 @@ def _repo_text_files() -> list[tuple[str, str]]:
         for name in sorted(filenames):
             path = Path(dirpath) / name
             rel_parts = path.relative_to(_REPO).parts
-            if rel_parts[0] == "eval" and name.endswith(".jsonl"):
-                # Frozen evaluation snapshots (T-decider-tierc-replay-eval): verbatim past chat
-                # messages, hash-locked before use. They quote old prose and old command lines as
-                # data. They are not instructions, and editing them would break the lock.
+            if rel_parts[0] == "eval" and not name.endswith(".md"):
+                # Frozen evaluation data (T-decider-tierc-replay-eval): verbatim past chat
+                # messages and raw labeller output, hash-locked before use. They quote old prose
+                # and old command lines as data. They are not instructions, and editing them
+                # would break the lock. The .md files there (rubric, prompt) are still scanned.
                 continue
             try:
                 text = path.read_text(encoding="utf-8")

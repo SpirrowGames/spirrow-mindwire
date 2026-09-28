@@ -1,0 +1,17 @@
+```jsonl
+{"thread_id": "T-naysayer-skill-doc-has-two-divergent-copies", "round_index": 8, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr provided implementation instructions for Heisenberg but incorrectly routed to human."}
+{"thread_id": "T-naysayer-skill-doc-has-two-divergent-copies", "round_index": 11, "label": "genuine", "category": "GOAL", "rationale": "Bohr escalated a project policy decision regarding skill documents and explicitly required human resolution."}
+{"thread_id": "T-ledger-carveout-accepts-an-empty-approval", "round_index": 1, "label": "genuine", "category": "GOAL", "rationale": "Bohr escalated a cross-project policy decision that requires authorization from the human product owner."}
+{"thread_id": "T-o9-codify-gate-audit-predicate", "round_index": 3, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr provided implementation instructions for Heisenberg but incorrectly routed to human."}
+{"thread_id": "T-o9-codify-gate-audit-predicate", "round_index": 4, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr explicitly routed to Heisenberg, requiring no human intervention."}
+{"thread_id": "T-o9-codify-gate-audit-predicate", "round_index": 7, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr provided implementation instructions for Heisenberg but incorrectly routed to human."}
+{"thread_id": "T-t07-playproof-recorder", "round_index": 66, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr provided explicit instructions and routed to Heisenberg, requiring no human intervention."}
+{"thread_id": "T-t07-playproof-recorder", "round_index": 68, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr resolved the design and explicitly routed to Einstein, requiring no human intervention."}
+{"thread_id": "T-t07-playproof-recorder", "round_index": 72, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr provided implementation instructions for Heisenberg but incorrectly routed to human."}
+{"thread_id": "T-ci-window-ledger-anchor", "round_index": 54, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr explicitly routed to Heisenberg to implement a ticket, requiring no human intervention at this step."}
+{"thread_id": "T-materializechunk-zone-relocation-crash", "round_index": 144, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr provided implementation instructions for Heisenberg and Einstein, requiring no human intervention."}
+{"thread_id": "T-recording-lane-verdict-has-no-carrier-and-no-launcher", "round_index": 2, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr provided implementation instructions for Heisenberg but incorrectly routed to human."}
+{"thread_id": "T-recording-lane-verdict-has-no-carrier-and-no-launcher", "round_index": 4, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "Bohr provided a specific fix instruction for Heisenberg but incorrectly routed to human."}
+{"thread_id": "T-i3-i9-pin-sufficiency-unadjudicated", "round_index": 8, "label": "genuine-merge", "category": "MERGE", "rationale": "Bohr handed off the thread to the human product owner to approve a merge into a protected branch."}
+{"thread_id": "T-dashboard-system-page-retirement-unfiled", "round_index": 11, "label": "genuine", "category": "GOAL", "rationale": "Bohr escalated a scope decision regarding the retirement of a dashboard page for human resolution."}
+```

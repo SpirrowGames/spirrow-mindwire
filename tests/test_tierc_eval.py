@@ -583,7 +583,7 @@ def test_no_naysayer_preamble_and_no_other_outputs_are_sent(tmp_path: Path) -> N
     asyncio.run(
         labeller.label_all(
             client=fake,
-            labeller="claude",
+            labeller="frontier-tier",
             materials=_materials(2),
             system=system,
             out_dir=tmp_path,
@@ -597,3 +597,49 @@ def test_no_naysayer_preamble_and_no_other_outputs_are_sent(tmp_path: Path) -> N
     item = _items_sent(fake.sent[0])[0]
     assert "decision" not in item and "label" not in item and "gate_result" not in item
     assert rubric in sent
+
+
+def test_max_batches_bounds_a_run_and_resume_finishes_it(tmp_path: Path) -> None:
+    import asyncio
+
+    def go(fake: _FakeLexora, max_batches: int | None) -> Any:
+        return asyncio.run(
+            labeller.label_all(
+                client=fake,
+                labeller="naysayer-tier",
+                materials=_materials(12),
+                system="SYS",
+                out_dir=tmp_path,
+                batch_size=5,
+                sleep=_nosleep,
+                max_batches=max_batches,
+            )
+        )
+
+    first = _FakeLexora([_echo, _echo, _echo])
+    stats = go(first, 1)
+    assert len(first.sent) == 1 and stats["batches"] == 1 and stats["remaining"] == 7
+    rest = _FakeLexora([_echo, _echo])
+    stats = go(rest, None)
+    assert stats["batches"] == 2 and stats["remaining"] == 0
+    rows = _label_lines(tmp_path / "labels.naysayer-tier.jsonl")
+    assert len(rows) == 12 and sorted({r["batch"] for r in rows}) == [0, 1, 2]
+    with pytest.raises(labeller.LabelStopError, match="max_batches"):
+        go(_FakeLexora([]), 0)
+
+
+def test_cli_refuses_existing_label_file_without_resume(tmp_path: Path) -> None:
+    for name in ("label_prompt.md", "RUBRIC.md"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    (tmp_path / "materials.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "labels.frontier-tier.jsonl").write_text(
+        json.dumps({"thread_id": "T", "round_index": 0}) + "\n", encoding="utf-8"
+    )
+    rc = labeller.main(["--labeller", "frontier-tier", "--dir", str(tmp_path)])
+    assert rc == 1
+    assert not (tmp_path / "label_runs.jsonl").exists()  # nothing was sent, nothing logged
+
+
+def test_labeller_names_follow_msg_4245() -> None:
+    assert labeller.LABELLERS == {"naysayer-tier": "naysayer", "frontier-tier": "frontier"}
+    assert "labels.frontier-tier.jsonl" in labeller.LOCKED_FILES
