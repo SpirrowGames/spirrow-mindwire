@@ -110,6 +110,13 @@ def _repo_text_files() -> list[tuple[str, str]]:
         dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
         for name in sorted(filenames):
             path = Path(dirpath) / name
+            rel_parts = path.relative_to(_REPO).parts
+            if rel_parts[0] == "eval" and not name.endswith(".md"):
+                # Frozen evaluation data (T-decider-tierc-replay-eval): verbatim past chat
+                # messages and raw labeller output, hash-locked before use. They quote old prose
+                # and old command lines as data. They are not instructions, and editing them
+                # would break the lock. The .md files there (rubric, prompt) are still scanned.
+                continue
             try:
                 text = path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
