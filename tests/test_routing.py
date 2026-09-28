@@ -335,9 +335,13 @@ def _count_all_defs(name: str) -> tuple[int, list[Path]]:
     import ast
 
     paths: list[Path] = []
-    skip_dirs = {".venv", "__pycache__", ".mypy_cache", ".pytest_cache"}
-    for path in _repo_root().rglob("*.py"):
-        if any(part in skip_dirs for part in path.parts):
+    # ``.git`` is skipped because ``.git/mindwire-scratch/`` is the implementer's sanctioned scratch
+    # area and can hold a whole linked worktree of another branch — a second checkout of
+    # routing.py that is not part of this tree.
+    skip_dirs = {".git", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache"}
+    root = _repo_root()
+    for path in root.rglob("*.py"):
+        if any(part in skip_dirs for part in path.relative_to(root).parts):
             continue
         try:
             body = path.read_text(encoding="utf-8")
