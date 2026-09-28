@@ -35,6 +35,7 @@ from spirrow_mindwire.adapters.decider_lexora import (
 from spirrow_mindwire.conductor.core import Conductor, StopReason
 from spirrow_mindwire.decider import hook as hook_mod
 from spirrow_mindwire.decider.hook import (
+    RoutingInvariantError,
     ThreadMessage,
     compute_gate_result,
     is_tierc_entry,
@@ -608,10 +609,6 @@ def test_is_tierc_entry(wrote: bool, role: Role | None, expected: bool) -> None:
     [
         ("human", False, None, "stop"),
         (None, True, Role.NAYSAYER, "forced_naysayer"),
-        (None, False, Role.IMPLEMENTER, "other"),
-        (None, True, Role.IMPLEMENTER, "other"),  # forced, but not to the naysayer role
-        (None, False, Role.NAYSAYER, "other"),  # naysayer target, but not forced
-        ("settled", False, None, "other"),
     ],
 )
 def test_routed_from_route(
@@ -622,6 +619,32 @@ def test_routed_from_route(
         stop=stop, is_forced=is_forced, target_role=target, naysayer_role=Role.NAYSAYER
     )
     assert got == expected
+
+
+@pytest.mark.parametrize(
+    ("stop", "is_forced", "target"),
+    [
+        # PR-gate observation on #348: ``stop=HUMAN`` does not short-circuit the other fields.
+        ("human", True, None),
+        ("human", True, Role.NAYSAYER),
+        ("human", False, Role.NAYSAYER),
+        # Einstein msg-4240 advisory: formerly labelled ``other`` — now a hard invariant error.
+        (None, False, Role.IMPLEMENTER),
+        (None, True, Role.IMPLEMENTER),  # forced, but not to the naysayer role
+        (None, False, Role.NAYSAYER),  # naysayer target, but not forced
+        ("settled", False, None),
+    ],
+)
+def test_routed_from_route_unnamed_combination_raises(
+    stop: str | None, is_forced: bool, target: Role | None
+) -> None:
+    """Every combination outside the two named ones raises ``RoutingInvariantError`` (an
+    ``AssertionError``) — no ``other`` label exists."""
+    with pytest.raises(RoutingInvariantError) as ei:
+        routed_from_route(
+            stop=stop, is_forced=is_forced, target_role=target, naysayer_role=Role.NAYSAYER
+        )
+    assert isinstance(ei.value, AssertionError)
 
 
 @pytest.mark.parametrize(
@@ -779,23 +802,39 @@ async def test_hook_proposer_forced_consult_is_entered_and_record_only(
     assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize(
+    ("stop", "is_forced", "target"),
+    [
+        (None, False, Role.IMPLEMENTER),  # test 13 (msg-4239): the formerly-``other`` case
+        ("human", True, None),  # PR-gate observation on #348: stop=HUMAN *and* forced
+    ],
+)
 @pytest.mark.anyio
-async def test_hook_routed_other_logs_row_and_warning(caplog: pytest.LogCaptureFixture) -> None:
-    """Test 13 (msg-4239): a combination ``_route`` cannot produce today, passed straight in:
-    one ``routed=other`` line, a WARNING naming it, and no acting branch even under annotate."""
+async def test_hook_routing_invariant_fails_loud_without_row(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stop: str | None,
+    is_forced: bool,
+    target: Role | None,
+) -> None:
+    """Test 13 (revised per Einstein msg-4240 advisory + PR-gate on #348): a combination ``_route``
+    cannot produce today, passed straight in. The hook logs an ERROR carrying the
+    ``RoutingInvariantError`` traceback, writes **no** ``decider_decision`` row, runs no gate,
+    calls no Decider — and does not raise into the Conductor (D20)."""
+    spy = _GateSpy(monkeypatch)
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
     stub.tierc_mode = "annotate"
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        got = await _hook(stub, stop=None, is_forced=False, target_role=Role.IMPLEMENTER)
-    assert got is not None
-    (line,) = _decider_lines(caplog)
-    assert line["routed"] == "other"
-    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any(
-        "decider routed=other" in w and "stop=None" in w and "target=implementer" in w
-        for w in warnings
-    ), warnings
-    assert not any("has no acting implementation yet" in w for w in warnings)
+        got = await _hook(stub, stop=stop, is_forced=is_forced, target_role=target)
+    assert got is None
+    assert _decider_lines(caplog) == []
+    assert spy.calls == 0 and stub.states == []
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "decider routing invariant broken" in errors[0].getMessage()
+    assert errors[0].exc_info is not None
+    assert isinstance(errors[0].exc_info[1], RoutingInvariantError)
+    assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.anyio

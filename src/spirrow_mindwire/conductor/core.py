@@ -586,10 +586,11 @@ class Conductor:
         the handoff themself (a field/body mismatch also resolves to ``HandoffKind.HUMAN`` but is
         a conductor safety valve, not somebody asking the human), and ``_route``'s own outputs —
         ``stop_reason`` / ``is_forced`` / ``target_role`` plus the configured naysayer role — from
-        which the hook reads ``routed`` (``stop`` / ``forced_naysayer`` / ``other``, msg-4239)
-        rather than inferring it. The hook runs the admission gate compute-only (nothing written
-        to the decisions log) and sends the turn to Lexora only when the gate produced a result
-        (msg-4196 DECIDED 1). Every value passed is read only, never modified.
+        which the hook reads ``routed`` (``stop`` / ``forced_naysayer``, msg-4239; any other
+        combination is logged at ERROR with no row) rather than inferring it. The hook runs the
+        admission gate compute-only (nothing written to the decisions log) and sends the turn to
+        Lexora only when the gate produced a result (msg-4196 DECIDED 1). Every value
+        passed is read only, never modified.
         """
         if self._decider is None:
             return

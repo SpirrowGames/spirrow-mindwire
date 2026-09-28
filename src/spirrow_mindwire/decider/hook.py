@@ -9,8 +9,10 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
    proposer escalation that ``_route`` turned into a forced naysayer consult (``stop=None``) is
    evaluated too. Any other turn returns at once — no gate, no Lexora call, no log line;
    ``routed`` (msg-4239 DECIDED 2c-1 revised, :func:`routed_from_route`) then records what
-   ``_route`` actually did with the turn — ``stop`` / ``forced_naysayer`` / ``other`` — read from
-   its return values, never inferred. ``other`` is unreachable today and logs a WARNING;
+   ``_route`` actually did with the turn — ``stop`` / ``forced_naysayer`` — read from its return
+   values, never inferred. Each value requires the **whole** combination of ``stop`` /
+   ``is_forced`` / ``target_role`` that names it; any other combination (unreachable today) is a
+   :class:`RoutingInvariantError`, logged at ERROR with no row (see below);
 1. run the admission gate **compute-only** (msg-4200 DECIDED 2b-1 / 2b-2,
    :func:`compute_gate_result`): ``retry_lookup`` always ``False``, the decision's log entries
    discarded (nothing is written to the decisions log), a gate exception → ``gate_result=None``;
@@ -23,8 +25,16 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
    ``gate_kind`` / ``gate_is_grey_zone``, the rule ``stop`` and ``routed`` on the same line;
 5. the acting branch is gated on ``routed == "stop"`` (msg-4237 DECIDED 2c-2), on
    ``dr.actionable_verdict`` only (msg-4184) and on a mode of ``annotate`` / ``bounce`` — which is
-   refused at build time, so in shadow it never runs. ``forced_naysayer`` / ``other`` rows are
-   record-only in every mode.
+   refused at build time, so in shadow it never runs. ``forced_naysayer`` rows are record-only in
+   every mode.
+
+**Fail loud, not fail open (Einstein msg-4240 advisory; PR-gate observation on #348).** A routing
+combination the mapping does not name raises :class:`RoutingInvariantError` (an
+``AssertionError``) instead of being labelled. It is caught at this module's boundary and logged
+at ERROR with the traceback, and **no** ``decider_decision`` row is written and Lexora is not
+called — the telemetry never carries a meaningless label. It is not re-raised into the Conductor
+loop: D20 forbids the observer from changing the routing, and an escaping exception would stop
+the thread.
 
 **Monotonicity (D20).** Nothing here returns a new stop, and the gate's admit / bounce is never
 used for stop, notification or routing — only as Decider input and a log column. The hook returns
@@ -198,8 +208,12 @@ ROUTED_STOP = "stop"
 """``_route`` stopped the turn at the human (``original_stop == HUMAN``)."""
 ROUTED_FORCED_NAYSAYER = "forced_naysayer"
 """``_route`` sent the turn to a forced naysayer consult (``is_forced`` and target = naysayer)."""
-ROUTED_OTHER = "other"
-"""Neither of the above — unreachable from today's ``_route`` for a ``HUMAN`` handoff."""
+
+
+class RoutingInvariantError(AssertionError):
+    """``_route`` returned a combination for a proposer ``NEXT: human`` that no ``routed`` value
+    names. Unreachable today (``_human_terminal`` / ``_spawn_blocked`` are the only exits for a
+    ``HUMAN`` handoff); raised so a new ``_route`` branch fails loudly instead of being labelled."""
 
 
 def _roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
@@ -253,18 +267,25 @@ def routed_from_route(
 ) -> str:
     """``routed`` from ``_route``'s own return values (msg-4239 DECIDED 2c-1 revised).
 
-    Read, not inferred: ``stop`` when the rule stop is ``HUMAN``; ``forced_naysayer`` only when
-    ``_route`` said ``is_forced`` **and** targeted the naysayer role; anything else is ``other``.
-    ``other`` is unreachable from today's ``_route`` for a ``HUMAN`` handoff (``_human_terminal``
-    and ``_spawn_blocked`` are its only exits), so the hook logs a WARNING when it appears — a
-    new ``HUMAN`` branch in ``_route`` then shows up as a labelled row plus a warning instead of
-    being silently mislabelled ``forced_naysayer``.
+    Read, not inferred, and exhaustive over the combination — no field short-circuits the others
+    (PR-gate observation on #348):
+
+    * ``stop`` — rule stop ``HUMAN`` **and** not forced **and** no dispatch target;
+    * ``forced_naysayer`` — no rule stop **and** ``is_forced`` **and** target = naysayer role.
+
+    Anything else — e.g. ``stop=HUMAN`` together with ``is_forced`` (mutually exclusive by
+    definition) — raises :class:`RoutingInvariantError` (Einstein msg-4240 advisory: fail loudly
+    rather than record an ``other`` label).
     """
-    if stop == _STOP_HUMAN:
+    if stop == _STOP_HUMAN and not is_forced and target_role is None:
         return ROUTED_STOP
-    if is_forced and target_role is naysayer_role:
+    if stop is None and is_forced and target_role is naysayer_role:
         return ROUTED_FORCED_NAYSAYER
-    return ROUTED_OTHER
+    raise RoutingInvariantError(
+        f"decider routing invariant broken: stop={stop} is_forced={is_forced} "
+        f"target={target_role.value if target_role is not None else None}"
+        " — _route に HUMAN 用の新しい分岐がないか確認"
+    )
 
 
 def never_retry(uuid_: str, author: str) -> bool:
@@ -370,17 +391,15 @@ async def run_tierc_hook(
         author_role=_roster_role(roster, head.author),
     ):
         return None
-    routed = routed_from_route(
-        stop=stop, is_forced=is_forced, target_role=target_role, naysayer_role=naysayer_role
-    )
-    if routed == ROUTED_OTHER:
-        # msg-4239: unreachable today. A hard failure here would break D20 (the hook must never
-        # affect the routing), so it is a labelled row plus a loud warning instead.
-        logger.warning(
-            "decider routed=other: stop=%s target=%s — _route に HUMAN 用の新しい分岐がないか確認",
-            stop,
-            target_role.value if target_role is not None else None,
+    try:
+        routed = routed_from_route(
+            stop=stop, is_forced=is_forced, target_role=target_role, naysayer_role=naysayer_role
         )
+    except RoutingInvariantError:
+        # Fail loud (ERROR + traceback), write no row, call nothing. Not re-raised: the hook must
+        # never affect the routing (D20), and an escaping exception would stop the Conductor loop.
+        logger.error("decider routing invariant broken; no decider_decision row", exc_info=True)
+        return None
     try:
         gate_result = compute_gate_result(
             body=head.content,
@@ -430,7 +449,7 @@ async def run_tierc_hook(
 
     # msg-4184 §2: acting code reads ``actionable_verdict`` only. msg-4237 DECIDED 2c-2: only a
     # turn ``_route`` stopped at the human (``routed == "stop"``) may be acted on; a forced
-    # consult / ``other`` row is record-only in every mode (acting before the forced consult is a
+    # consult row is record-only in every mode (acting before the forced consult is a
     # separate Takahito decision, like ``skip_naysayer_when_confirmed``). annotate / bounce are
     # refused at build time, so under shadow this branch is structurally dead.
     av = dr.actionable_verdict
@@ -447,9 +466,9 @@ __all__ = [
     "BODY_HEAD_M",
     "RECENT_EVENTS_N",
     "ROUTED_FORCED_NAYSAYER",
-    "ROUTED_OTHER",
     "ROUTED_STOP",
     "Decider",
+    "RoutingInvariantError",
     "ThreadMessage",
     "compute_gate_result",
     "gate_result_from_decision",
