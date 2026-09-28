@@ -187,12 +187,22 @@ def historical_roster(
     return roster, (ROSTER_CURRENT_FALLBACK if used_current else ROSTER_HISTORICAL)
 
 
-def is_escalation(msg: RawMessage) -> bool:
-    """Would the conductor resolve this message to the human stop? (``resolve_handoff``)."""
-    return (
-        resolve_handoff(msg.content, {}, next_participant=msg.next_participant).kind
-        is HandoffKind.HUMAN
-    )
+def routing_roster(
+    upto: Sequence[RawMessage], current_roster: Mapping[str, Role]
+) -> dict[str, Role]:
+    """The roster ``resolve_handoff`` routes against when deciding *whether* a turn stops.
+
+    The live conductor resolves every handoff against its configured roster (``current_roster``
+    here), not an empty one. ``resolve_handoff`` is not roster-free: a ``next_participant`` field
+    naming a persona resolves to ``FIELD_UNRESOLVABLE`` → ``HUMAN`` against ``{}`` but to that
+    persona against the real roster, and a sentinel field with a ``NEXT: <persona>`` body flips
+    the other way. So selection must use the conductor's roster; the authors seen so far
+    (seal (b)'s historical roles) are overlaid so a persona since dropped from the config still
+    resolves. This roster is for routing only — the state's ``roster`` stays seal (b)'s.
+    """
+    roster = dict(current_roster)
+    roster.update(historical_roster(upto, current_roster)[0])
+    return roster
 
 
 def build_eval_row(
@@ -216,7 +226,11 @@ def build_eval_row(
     head = upto[-1]
     roster, roster_source = historical_roster(upto, current_roster)  # seal (b)
 
-    handoff = resolve_handoff(head.content, roster, next_participant=head.next_participant)
+    handoff = resolve_handoff(
+        head.content,
+        routing_roster(upto, current_roster),
+        next_participant=head.next_participant,
+    )
     author_wrote_next_human = handoff.mismatch_reason is None
     # The conductor states the resolved head's parsed_next as the reserved token
     # (core._decider_hook); every other message keeps its body token.
@@ -286,9 +300,14 @@ def rows_for_thread(
 ) -> list[tuple[dict[str, Any], int]]:
     out: list[tuple[dict[str, Any], int]] = []
     for i, m in enumerate(messages):
-        if not is_escalation(m):
+        handoff = resolve_handoff(
+            m.content,
+            routing_roster(messages[: i + 1], current_roster),
+            next_participant=m.next_participant,
+        )
+        if handoff.kind is not HandoffKind.HUMAN:
             continue
-        label = resolve_handoff(m.content, {}, next_participant=m.next_participant).tier_c_label
+        label = handoff.tier_c_label
         set_name = classify_set(m, label)
         if set_name is None:
             continue

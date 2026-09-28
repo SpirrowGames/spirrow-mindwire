@@ -13,6 +13,7 @@ Pins the conditions msg-4224 / msg-4226 attached to the design (Einstein approva
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import os
@@ -24,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
 from spirrow_mindwire.decider.hook import compute_gate_result, never_retry
 from spirrow_mindwire.decider.questions import TIERC_QUESTIONS_V1
 from spirrow_mindwire.decider.result import DecisionOutcome, DecisionResult
@@ -148,6 +150,44 @@ def test_escalation_selection_and_sets() -> None:
     assert builder.classify_set(old, "scope") == "retro_candidate"
     assert builder.classify_set(old, None) is None
     assert builder.classify_set(msgs[3], None) == "eval"
+
+
+def _with_field(m: Any, field: str) -> Any:
+    return dataclasses.replace(m, next_participant=field)
+
+
+def test_selection_routes_against_the_conductor_roster_not_an_empty_one() -> None:
+    """PR-gate #349: ``resolve_handoff`` depends on the roster, so selection must pass one.
+
+    Against ``{}`` a ``next_participant`` naming a persona is FIELD_UNRESOLVABLE → HUMAN; the
+    live conductor (configured roster) routes it to the persona, so it is not an escalation.
+    """
+    msgs = _thread()
+    # msg-3: field names Bohr, known only from his own earlier message (historical overlay).
+    msgs[2] = _with_field(_msg(3, "Einstein", "ok, no body token", role="naysayer"), "Bohr")
+    # msg-5: field names Einstein, known from the configured roster (no body NEXT either).
+    msgs[4] = _with_field(_msg(5, "Heisenberg", "done", role="implementer"), "Einstein")
+    roster = {"Einstein": Role.NAYSAYER}
+    rows = builder.rows_for_thread(
+        project="p", thread_id="T-x", messages=msgs, current_roster=roster
+    )
+    assert [r["msg_id"] for r, _ in rows] == ["msg-4", "msg-6"]
+    # The pre-fix behaviour, pinned so the test proves what it guards against.
+    assert resolve_handoff("done", {}, next_participant="Einstein").kind is HandoffKind.HUMAN
+
+
+def test_selection_keeps_a_sentinel_field_that_diverges_from_a_persona_body() -> None:
+    """The flip side: field ``none`` + body ``NEXT: Bohr`` is TARGET_DIVERGENCE → HUMAN once
+    Bohr resolves; against ``{}`` the body was ABSENT and the field won silently."""
+    msgs = _thread()
+    msgs[2] = _with_field(msgs[2], "none")
+    roster = {"Bohr": Role.PROPOSER, "Einstein": Role.NAYSAYER}
+    rows = builder.rows_for_thread(
+        project="p", thread_id="T-x", messages=msgs, current_roster=roster
+    )
+    assert [r["msg_id"] for r, _ in rows] == ["msg-3", "msg-4", "msg-6"]
+    assert rows[0][0]["author_wrote_next_human"] is False
+    assert rows[0][0]["live_entry"] is False
 
 
 def test_outputs_split_and_following_only_in_materials() -> None:
