@@ -991,6 +991,32 @@ async def test_conductor_does_not_call_decider_on_non_human_heads() -> None:
     assert stub.states == []
 
 
+@pytest.mark.parametrize(
+    "seed_body",
+    [
+        "design\n\nNEXT: Heisenberg",  # proposer → implementer (guard (i) path)
+        "design\n\nNEXT: Einstein",  # proposer → naysayer
+        "done\n\nNEXT: none",
+    ],
+)
+@pytest.mark.anyio
+async def test_conductor_proposer_non_human_handoff_never_reaches_routed_mapping(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, seed_body: str
+) -> None:
+    """PR-gate REQUEST_CHANGES on #348 @ 592024f: a proposer's valid non-human handoff has
+    ``mismatch_reason is None`` (so ``author_wrote_next_human=True``) and would raise
+    ``RoutingInvariantError`` if it reached ``routed_from_route``. ``_decider_hook`` returns on
+    ``handoff.kind is not HUMAN`` first, so the seed head gets no ERROR, no gate, no row."""
+    spy = _GateSpy(monkeypatch)
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    replies = {role: [_attested("ok\n\nNEXT: none")] for role in Role}
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        await _run(stub, seed=("Bohr", seed_body), replies=replies)
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert spy.calls == 0 and stub.states == []
+    assert _decider_lines(caplog) == []
+
+
 @pytest.mark.anyio
 async def test_conductor_naysayer_exit_human_is_not_evaluated(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

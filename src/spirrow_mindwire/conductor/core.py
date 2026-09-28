@@ -594,6 +594,10 @@ class Conductor:
         """
         if self._decider is None:
             return
+        # Load-bearing since 2c: the hook's entry no longer checks the rule stop, so a proposer's
+        # valid ``NEXT: <role>`` (mismatch_reason None) would otherwise reach ``routed_from_route``
+        # and raise RoutingInvariantError. Pinned by
+        # test_conductor_proposer_non_human_handoff_never_reaches_routed_mapping.
         if handoff.kind is not HandoffKind.HUMAN:
             return
         thread_msgs = [
