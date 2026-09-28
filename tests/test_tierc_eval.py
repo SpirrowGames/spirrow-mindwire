@@ -1116,3 +1116,38 @@ def test_contract_mismatch_stops_at_once(decision: dict[str, Any]) -> None:
     t = runner.Tally()
     runner.record_outcome(t, decision)
     assert t.stopped and "contract mismatch" in t.stopped
+
+
+# --- tierc_fulltext_report: the original AUC definition, paired bootstrap, change rates -------
+
+ftr = _load("tierc_fulltext_report")
+
+
+def _sc(g: float, s: float) -> dict[str, float]:
+    return _answers(g, s)
+
+
+def test_fulltext_auc_is_the_original_definition() -> None:
+    truth = {("T", 0): "genuine", ("T", 1): "spurious", ("T", 2): "ambiguous"}
+    scores = {("T", 0): _sc(0.9, 0.1), ("T", 1): _sc(0.1, 0.9), ("T", 2): _sc(0.0, 0.0)}
+    keys = list(truth)
+    assert ftr.auc_of(scores, truth, keys) == 1.0  # ambiguous left out
+    pos = [sum(scores[("T", 0)][q] for q in ftr.rep.TIER_C_GENUINE_KEYS)]
+    neg = [sum(scores[("T", 1)][q] for q in ftr.rep.TIER_C_GENUINE_KEYS)]
+    assert ftr.auc_of(scores, truth, keys) == ftr.rep.auc(pos, neg)
+
+
+def test_fulltext_bootstrap_same_input_has_zero_noise_delta() -> None:
+    truth = {("T", i): ("genuine" if i % 2 else "spurious") for i in range(12)}
+    s = {k: _sc(0.5 + (0.3 if v == "genuine" else 0.0) + k[1] / 100, 0.3) for k, v in truth.items()}
+    ci = ftr.bootstrap({"orig": s, "base": s, "full": s}, truth, list(truth), n=200, seed=1)
+    assert ci["Δ base-orig (noise)"] == (0.0, 0.0)
+    assert ci["Δ full-orig"] == (0.0, 0.0)
+
+
+def test_fulltext_change_counts_verdict_and_moved_answers() -> None:
+    th = ftr.TierCThresholds()
+    a, b = _sc(0.9, 0.1), _sc(0.1, 0.9)
+    changed, moved, mean = ftr.change(a, b, th)
+    assert changed and moved == 1.0 and mean > 0.5
+    assert ftr.change(a, dict(a), th) == (False, 0.0, 0.0)
