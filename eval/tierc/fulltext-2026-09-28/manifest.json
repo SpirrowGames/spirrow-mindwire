@@ -1,0 +1,118 @@
+{
+ "thread": "T-decider-tierc-fulltext-eval",
+ "spec_messages": [
+  "msg-4311",
+  "msg-4313",
+  "msg-4318",
+  "msg-4327",
+  "msg-4329",
+  "msg-4332",
+  "msg-4334"
+ ],
+ "created": "2026-09-28",
+ "files": {
+  "contract.full.out.jsonl": {
+   "sha256": "697ee3876824281fd04470e4ee2ce60c3cd59976894529826bf1cfe3bb4bee0e",
+   "sha256_as_generated_crlf": "331d0b0269dd97b0c1b5e4303455fac7e7066a7c7e82f64364b6377c78f1eca5",
+   "generated_at_commit": "da37200"
+  },
+  "corrections-2026-09-28-roster-selection.json": {
+   "sha256": "4bdca81073bd49ccbfd8a9f608f37974919f8642904a83e87663543f32140d18",
+   "sha256_as_generated_crlf": "57ad8a9f7b8dea041f3be40f04bd313cb83d11f9f3c7bc641277b17d6720155f",
+   "generated_at_commit": "fa20b3e"
+  },
+  "fixture.fulltext.m8000.jsonl": {
+   "sha256": "400f98ef0475258a158d2dbcecb637a0ec614349eae51a256d69cf3759cad0f3",
+   "sha256_as_generated_crlf": "400f98ef0475258a158d2dbcecb637a0ec614349eae51a256d69cf3759cad0f3",
+   "generated_at_commit": "5bfedfd"
+  },
+  "plan.json": {
+   "sha256": "09c78dfc72ed187b0619c87f339ffb2fed25b4cd03a6b2ffe94f142d9a632cb8",
+   "sha256_as_generated_crlf": "edcd4a35d4d28b74f0e6e6283bf0b3cd33db58a628fc8b926eda58e7943a65dc",
+   "generated_at_commit": "da37200"
+  },
+  "replay.base.jsonl": {
+   "sha256": "599bf307b46507c80e46bc7fa888d084e8922f6f4295f18c62e7a3e6b114a492",
+   "sha256_as_generated_crlf": "d195b85302f1ba0f168a0599ee945e187ef2157b8b052113e54c1d42e3a49ecc",
+   "generated_at_commit": "da37200"
+  },
+  "replay.full.jsonl": {
+   "sha256": "39ac75cacea83b020146280b08629aa4b7e1da68c062a310f68d77957fc9ca57",
+   "sha256_as_generated_crlf": "ccaf2cc5e910d77b712f208618e3686e50a453d95a601b7e103a203f5d711d00",
+   "generated_at_commit": "da37200"
+  },
+  "report.fulltext.md": {
+   "sha256": "8212b4e15b50cea771a35404ce9907c0a8682a052cb4a1d8efd20d2c346ed04a",
+   "sha256_as_generated_crlf": "86ae3d47ebf5198e9b96de8069f5fe12bb87460ba029ad91a364543ea7d61011",
+   "generated_at_commit": "d156079"
+  }
+ },
+ "line_endings": "Every file here is committed with LF. The scripts were run on Windows, where Python text mode wrote CRLF; sha256_as_generated_crlf is the sha of the file as written (the report reproduction check in the PR was done against that one). Normalising CRLF -> LF is the only difference.",
+ "seed": {
+  "plan": 20260928,
+  "bootstrap": 20260928,
+  "bootstrap_resamples": 10000
+ },
+ "labels_lock_commit": "2b80b53",
+ "references_not_in_this_directory": {
+  "original_fixture.jsonl": {
+   "sha256": "280bdd49ea725541570dc60c8f58cbcc4b59b6cc7f7e09b418c879ac02cc69ad",
+   "where": "#347 eval/tierc/fixture.jsonl"
+  },
+  "original_replay.jsonl (500-char comparison side)": {
+   "sha256": "2b804d94528b06af95eefa0bca306354e02281ed0b634455c931f5ba543f63c7",
+   "where": "#347 eval/tierc/replay.jsonl"
+  },
+  "harvest.json": {
+   "sha256": "78860ee4a0b0cf0beb30c170ce555a9080c2cad412cf20299675e9c74cec300d",
+   "where": "#347 eval/tierc/harvest.json (harvested_at 2026-09-27T16:33:33.962790+00:00)"
+  }
+ },
+ "jev_calls": {
+  "total": 137,
+  "cache_probe_base": 3,
+  "contract_full": 5,
+  "main_run": 129,
+  "errors": 0,
+  "stops": 0,
+  "endpoint": "Lexora /v1/decide, policy mindwire.replay.tierc, provider jev"
+ },
+ "reproduce": {
+  "placeholders": {
+   "<data>": "eval/tierc/fulltext-2026-09-28 (or a scratch copy)",
+   "<orig>": "#347 eval/tierc files: fixture.jsonl, harvest.json, replay.jsonl, labels.*.jsonl"
+  },
+  "steps": [
+   {
+    "commit": "fa20b3e",
+    "cmd": "python scripts/build_tierc_eval_fixture.py --corrections-for <orig>/fixture.jsonl --reproduce <orig>/harvest.json --corrections-out <data>/corrections-2026-09-28-roster-selection.json --selection-code-commit fa20b3e",
+    "note": "reads the chatroom (no Jev call); result keep 66 / exclude not_an_escalation 143 / added 0"
+   },
+   {
+    "commit": "5bfedfd",
+    "cmd": "python scripts/build_tierc_eval_fixture.py --fulltext-for <data>/corrections-2026-09-28-roster-selection.json --reproduce <orig>/harvest.json --head-m 8000 --fulltext-out <data>/fixture.fulltext.m8000.jsonl",
+    "note": "the same command with --head-m 500 gives the base fixture, byte-identical to the 66 kept rows of the original fixture (not committed)"
+   },
+   {
+    "commit": "da37200",
+    "cmd": "python scripts/tierc_fulltext_run.py --full <data>/fixture.fulltext.m8000.jsonl --base <m500> --original <orig>/fixture.jsonl --seed 20260928 --plan-out <scratch>/plan.cacheprobe.json --out-full <data>/replay.full.jsonl --out-base <data>/replay.base.jsonl --endpoint $MINDWIRE_LEXORA_URL --sides base --key T-mesher-gaussian-smoothing-dependency#20 --key T-lod0-sliver-shards#316 --key T-lod0-sliver-shards#396 --max-calls 3 --resume",
+    "note": "cache probe: 3 base rows, compared with the original answers (all differed by 0.01-0.02, new decision_id). These 3 rows were not sent back to back with their full side."
+   },
+   {
+    "commit": "da37200",
+    "cmd": "python scripts/tierc_fulltext_run.py --full <data>/fixture.fulltext.m8000.jsonl --base <m500> --original <orig>/fixture.jsonl --seed 20260928 --plan-out <scratch>/plan.contract.json --out-full <data>/contract.full.out.jsonl --out-base <scratch>/unused.jsonl --endpoint $MINDWIRE_LEXORA_URL --sides full --key T-lod0-sliver-shards#420 --key T-ci-window-ledger-anchor#54 --key T-ephemeral-develop-pr-retarget#84 --key T-lod0-sliver-shards#430 --key T-sweeper-posts-into-resolved-thread-blocks-r2-deploy#20 --max-calls 5",
+    "note": "contract check: top 5 by body_chars"
+   },
+   {
+    "commit": "da37200",
+    "cmd": "python scripts/tierc_fulltext_run.py --full <data>/fixture.fulltext.m8000.jsonl --base <m500> --original <orig>/fixture.jsonl --seed 20260928 --plan-out <data>/plan.json --out-full <data>/replay.full.jsonl --out-base <data>/replay.base.jsonl --endpoint $MINDWIRE_LEXORA_URL --resume --max-calls 129",
+    "note": "main run (resumes past the 3 probe rows)"
+   },
+   {
+    "commit": "d156079",
+    "cmd": "python scripts/tierc_fulltext_report.py --orig <orig>/replay.jsonl --base <data>/replay.base.jsonl --full <data>/replay.full.jsonl --fixture <orig>/fixture.jsonl --corrections <data>/corrections-2026-09-28-roster-selection.json --labels naysayer-tier=<orig>/labels.naysayer-tier.jsonl --labels frontier-tier=<orig>/labels.frontier-tier.jsonl --out <data>/report.fulltext.md",
+    "note": "defaults --boot 10000 --seed 20260928"
+   }
+  ]
+ }
+}

@@ -1151,3 +1151,27 @@ def test_fulltext_change_counts_verdict_and_moved_answers() -> None:
     changed, moved, mean = ftr.change(a, b, th)
     assert changed and moved == 1.0 and mean > 0.5
     assert ftr.change(a, dict(a), th) == (False, 0.0, 0.0)
+
+
+# --- eval/tierc/fulltext-2026-09-28: data is what manifest.json says (msg-4332 / msg-4334) -------
+
+FULLTEXT_DIR = ROOT / "eval" / "tierc" / "fulltext-2026-09-28"
+
+
+def test_fulltext_manifest_sha256_matches_every_committed_file() -> None:
+    """sha only (msg-4334): the report is not regenerated here, so the script may evolve."""
+    manifest = json.loads((FULLTEXT_DIR / "manifest.json").read_text(encoding="utf-8"))
+    files = manifest["files"]
+    assert set(files) == {
+        "fixture.fulltext.m8000.jsonl",
+        "replay.full.jsonl",
+        "replay.base.jsonl",
+        "plan.json",
+        "contract.full.out.jsonl",
+        "corrections-2026-09-28-roster-selection.json",
+        "report.fulltext.md",
+    }
+    for name, entry in files.items():
+        data = (FULLTEXT_DIR / name).read_bytes()
+        assert b"\r" not in data, f"{name}: committed with CR"
+        assert hashlib.sha256(data).hexdigest() == entry["sha256"], name
