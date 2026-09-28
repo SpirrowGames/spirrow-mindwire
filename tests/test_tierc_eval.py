@@ -680,3 +680,24 @@ def test_lock_records_row_provenance(tmp_path: Path) -> None:
 def test_lock_refuses_rows_labelled_under_another_prompt(tmp_path: Path) -> None:
     with pytest.raises(labeller.LabelStopError, match="prompt sha"):
         labeller.write_lock(_lock_dir(tmp_path, frontier_sha="other"))
+
+
+def test_committed_eval_jsonl_files_are_strict_jsonl() -> None:
+    """Every committed ``eval/tierc/**/*.jsonl`` line must be a JSON value (PR #347 gate).
+
+    ``decider_replay.iter_fixture`` tolerates ``#`` comments, but ``jq`` and a plain
+    ``json.loads(line)`` do not; a ``.jsonl`` file in the repo must parse with either.
+    """
+    files = sorted((ROOT / "eval" / "tierc").rglob("*.jsonl"))
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", "eval/tierc"], cwd=ROOT, capture_output=True, text=True
+    )
+    if tracked.returncode == 0 and tracked.stdout.strip():
+        names = set(tracked.stdout.split())
+        files = [p for p in files if p.relative_to(ROOT).as_posix() in names]
+    assert files, "no eval/tierc jsonl files found"
+    for path in files:
+        with path.open("r", encoding="utf-8") as fh:
+            for lineno, line in enumerate(fh, start=1):
+                assert line.strip(), f"{path}:{lineno}: blank line in JSONL"
+                json.loads(line)
