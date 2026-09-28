@@ -643,3 +643,40 @@ def test_cli_refuses_existing_label_file_without_resume(tmp_path: Path) -> None:
 def test_labeller_names_follow_msg_4245() -> None:
     assert labeller.LABELLERS == {"naysayer-tier": "naysayer", "frontier-tier": "frontier"}
     assert "labels.frontier-tier.jsonl" in labeller.LOCKED_FILES
+
+
+def _lock_dir(tmp_path: Path, frontier_sha: str | None = None) -> Path:
+    for name in ("label_prompt.md", "RUBRIC.md", "fixture.jsonl", "label_runs.jsonl"):
+        (tmp_path / name).write_text("x\n" if name.endswith(".md") else "", encoding="utf-8")
+    mats = [{"thread_id": "T", "round_index": i} for i in range(3)]
+    (tmp_path / "materials.jsonl").write_text(
+        "".join(json.dumps(m) + "\n" for m in mats), encoding="utf-8"
+    )
+    sha = labeller.sha256_text(labeller.system_prompt("x\n", "x\n"))
+    for who, (backend, model) in {
+        "naysayer-tier": ("gemini", "g-1"),
+        "frontier-tier": ("frontier", "claude-fable-5-1"),
+    }.items():
+        use = frontier_sha if (who == "frontier-tier" and frontier_sha) else sha
+        rows = [{**m, "backend": backend, "model": model, "prompt_sha256": use} for m in mats]
+        (tmp_path / f"labels.{who}.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+        )
+    return tmp_path
+
+
+def test_lock_records_row_provenance(tmp_path: Path) -> None:
+    manifest = labeller.write_lock(_lock_dir(tmp_path))
+    fr = manifest["labellers"]["frontier-tier"]
+    assert fr == {
+        "tier": "frontier",
+        "rows": 3,
+        "backends": ["frontier"],
+        "models": ["claude-fable-5-1"],
+    }
+    assert set(manifest["sha256"]) == set(labeller.LOCKED_FILES)
+
+
+def test_lock_refuses_rows_labelled_under_another_prompt(tmp_path: Path) -> None:
+    with pytest.raises(labeller.LabelStopError, match="prompt sha"):
+        labeller.write_lock(_lock_dir(tmp_path, frontier_sha="other"))

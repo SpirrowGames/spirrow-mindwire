@@ -1,3 +1,116 @@
 {
-  "status": "not locked: labels not produced yet (see harvest.json for counts)"
+  "locked_at": "2026-09-28T03:39:13.648329+00:00",
+  "sha256": {
+    "RUBRIC.md": "f809dcb32f4adb65e68cc52d908a15fed82b8f3926679fef5e815e76f87b07d1",
+    "label_prompt.md": "14bc6847c468c51a13b182344a04940b0b192bbbf7aba325bec4bf1f2da0edf8",
+    "materials.jsonl": "80e77b02f0dc68562e4a5a6e8db2d767b2d908f79330f1a2a45f4600515e7aa5",
+    "fixture.jsonl": "280bdd49ea725541570dc60c8f58cbcc4b59b6cc7f7e09b418c879ac02cc69ad",
+    "labels.naysayer-tier.jsonl": "e5d40bfc5bc6550112898d8171964f8ad14f91a9c0358ccae49a79b7dc883935",
+    "labels.frontier-tier.jsonl": "ba53ca15a4a8dfa5f2e9a706f240a52464112509d2f726da4fcc54940c62cec3"
+  },
+  "system_prompt_sha256": "28433e43d46c2b7da8dfe22d777b8d70bae12b5861db2fc2aa0300280caf8f10",
+  "labellers": {
+    "naysayer-tier": {
+      "tier": "naysayer",
+      "rows": 209,
+      "backends": [
+        "gemini"
+      ],
+      "models": [
+        "gemini-3.1-pro-preview"
+      ]
+    },
+    "frontier-tier": {
+      "tier": "frontier",
+      "rows": 209,
+      "backends": [
+        "frontier"
+      ],
+      "models": [
+        "claude-fable-5-1"
+      ]
+    }
+  },
+  "transport": "one client (LexoraClient) for both labellers — msg-4233 'ある場合'. Probe 2026-09-27 via /v1/models + cost rows: tier 'naysayer' -> backend gemini (gemini-3.1-pro-preview), raw prompt; tier 'frontier' -> backend frontier (claude-fable-5), raw prompt; 'claude-code-opus' -> backend claude_code adds a ~22.8k-token harness prompt (the one-sided preamble msg-4231 rules out); 'claude-sonnet-4-20250514' -> 404 upstream. The model each label file actually came from is read from its rows at lock time (``labellers.*.models``); the 2026-09-28 frontier-tier run returned 'claude-fable-5-1'.",
+  "label_runs": [
+    {
+      "labeller": "claude",
+      "started_at": "2026-09-27T16:36:00.913093+00:00",
+      "batch_size": 15,
+      "prompt_sha256": "28433e43d46c2b7da8dfe22d777b8d70bae12b5861db2fc2aa0300280caf8f10",
+      "status": "stop: transport: non-retryable /v1/chat/completions (frontier) returned 400: {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CfUHsWvZ4QfHc3ppcJ7Bd'}"
+    },
+    {
+      "labeller": "naysayer-tier",
+      "started_at": "2026-09-27T16:35:59.752699+00:00",
+      "batch_size": 15,
+      "prompt_sha256": "28433e43d46c2b7da8dfe22d777b8d70bae12b5861db2fc2aa0300280caf8f10",
+      "status": "ok",
+      "batches": 14,
+      "rows": 209,
+      "tokens_in": 1077200,
+      "tokens_out": 14712,
+      "cost_usd": 3.744184
+    },
+    {
+      "labeller": "frontier-tier",
+      "started_at": "2026-09-28T03:19:12.774341+00:00",
+      "batch_size": 15,
+      "resume": false,
+      "max_batches": 4,
+      "prompt_sha256": "28433e43d46c2b7da8dfe22d777b8d70bae12b5861db2fc2aa0300280caf8f10",
+      "status": "ok",
+      "batches": 4,
+      "rows": 60,
+      "tokens_in": 456858,
+      "tokens_out": 18248,
+      "cost_usd": 0.0,
+      "remaining": 149
+    },
+    {
+      "labeller": "frontier-tier",
+      "started_at": "2026-09-28T03:23:41.338740+00:00",
+      "batch_size": 15,
+      "resume": true,
+      "max_batches": 3,
+      "prompt_sha256": "28433e43d46c2b7da8dfe22d777b8d70bae12b5861db2fc2aa0300280caf8f10",
+      "status": "ok",
+      "batches": 3,
+      "rows": 45,
+      "tokens_in": 309455,
+      "tokens_out": 12083,
+      "cost_usd": 0.0,
+      "remaining": 104
+    },
+    {
+      "labeller": "frontier-tier",
+      "started_at": "2026-09-28T03:27:59.909718+00:00",
+      "batch_size": 15,
+      "resume": true,
+      "max_batches": 4,
+      "prompt_sha256": "28433e43d46c2b7da8dfe22d777b8d70bae12b5861db2fc2aa0300280caf8f10",
+      "status": "ok",
+      "batches": 4,
+      "rows": 60,
+      "tokens_in": 415799,
+      "tokens_out": 19679,
+      "cost_usd": 0.0,
+      "remaining": 44
+    },
+    {
+      "labeller": "frontier-tier",
+      "started_at": "2026-09-28T03:32:04.887191+00:00",
+      "batch_size": 15,
+      "resume": true,
+      "max_batches": 3,
+      "prompt_sha256": "28433e43d46c2b7da8dfe22d777b8d70bae12b5861db2fc2aa0300280caf8f10",
+      "status": "ok",
+      "batches": 3,
+      "rows": 44,
+      "tokens_in": 245555,
+      "tokens_out": 15096,
+      "cost_usd": 0.0,
+      "remaining": 0
+    }
+  ]
 }

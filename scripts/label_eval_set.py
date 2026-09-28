@@ -342,7 +342,9 @@ TRANSPORT_DECISION = (
     "/v1/models + cost rows: tier 'naysayer' -> backend gemini (gemini-3.1-pro-preview), raw "
     "prompt; tier 'frontier' -> backend frontier (claude-fable-5), raw prompt; "
     "'claude-code-opus' -> backend claude_code adds a ~22.8k-token harness prompt (the one-sided "
-    "preamble msg-4231 rules out); 'claude-sonnet-4-20250514' -> 404 upstream."
+    "preamble msg-4231 rules out); 'claude-sonnet-4-20250514' -> 404 upstream. The model each "
+    "label file actually came from is read from its rows at lock time (``labellers.*.models``); "
+    "the 2026-09-28 frontier-tier run returned 'claude-fable-5-1'."
 )
 
 LOCKED_FILES: tuple[str, ...] = (
@@ -364,25 +366,35 @@ def write_lock(directory: Path) -> dict[str, Any]:
     msg-4231). Refuses unless both label files cover every material row."""
     materials = read_jsonl(directory / "materials.jsonl")
     keys = {(m["thread_id"], m["round_index"]) for m in materials}
-    coverage: dict[str, int] = {}
-    for who in LABELLERS:
-        got = {
-            (r["thread_id"], r["round_index"])
-            for r in read_jsonl(directory / f"labels.{who}.jsonl")
-        }
-        if got != keys:
-            raise LabelStopError(f"{who}: labels cover {len(got & keys)}/{len(keys)} rows")
-        coverage[who] = len(got)
     prompt = (directory / "label_prompt.md").read_text(encoding="utf-8")
     rubric = (directory / "RUBRIC.md").read_text(encoding="utf-8")
+    prompt_sha = sha256_text(system_prompt(prompt, rubric))
+    coverage: dict[str, dict[str, Any]] = {}
+    for who in LABELLERS:
+        rows = read_jsonl(directory / f"labels.{who}.jsonl")
+        got = {(r["thread_id"], r["round_index"]) for r in rows}
+        if got != keys or len(rows) != len(got):
+            raise LabelStopError(
+                f"{who}: labels cover {len(got & keys)}/{len(keys)} rows ({len(rows)} lines)"
+            )
+        shas = {r.get("prompt_sha256") for r in rows}
+        if shas != {prompt_sha}:
+            # A label made under another prompt/rubric cannot be locked against this one
+            # (msg-4233: a prompt change relabels both sides from scratch).
+            raise LabelStopError(f"{who}: rows carry prompt sha {sorted(map(str, shas))}")
+        # The provenance actually recorded on the rows, not what the tier was expected to be
+        # (msg-4231 / msg-4263: the model name as the response returned it).
+        coverage[who] = {
+            "rows": len(rows),
+            "backends": sorted({str(r.get("backend")) for r in rows}),
+            "models": sorted({str(r.get("model")) for r in rows}),
+        }
     runs = read_jsonl(directory / "label_runs.jsonl")
     manifest = {
         "locked_at": datetime.now(UTC).isoformat(),
         "sha256": {name: file_sha256(directory / name) for name in LOCKED_FILES},
-        "system_prompt_sha256": sha256_text(system_prompt(prompt, rubric)),
-        "labellers": {
-            who: {"tier": tier, "rows": coverage[who]} for who, tier in LABELLERS.items()
-        },
+        "system_prompt_sha256": prompt_sha,
+        "labellers": {who: {"tier": tier, **coverage[who]} for who, tier in LABELLERS.items()},
         "transport": TRANSPORT_DECISION,
         "label_runs": runs,
     }
