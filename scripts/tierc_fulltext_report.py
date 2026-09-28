@@ -130,14 +130,18 @@ def change_table(
 
 
 def load_scores(path: Path, keys: set[Key]) -> dict[Key, dict[str, float]]:
+    """Each key's scores from its **last** scored record.
+
+    A run may hold a failed attempt (no scores) followed by a ``--resume`` retry: the failed
+    record is skipped, and a key with no scored record at all raises below.
+    """
     out: dict[Key, dict[str, float]] = {}
     for rec in rep.read_jsonl(path):
         k = rep._key(rec)
         if k in keys:
             s = rep.scores_of(rec)
-            if s is None:
-                raise ValueError(f"{path}: no scores at {k}")
-            out[k] = s
+            if s is not None:
+                out[k] = s
     missing = keys - set(out)
     if missing:
         raise ValueError(f"{path}: {len(missing)} rows missing, e.g. {sorted(missing)[:3]}")

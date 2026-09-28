@@ -1151,3 +1151,28 @@ def test_fulltext_change_counts_verdict_and_moved_answers() -> None:
     changed, moved, mean = ftr.change(a, b, th)
     assert changed and moved == 1.0 and mean > 0.5
     assert ftr.change(a, dict(a), th) == (False, 0.0, 0.0)
+
+
+# --- PR-gate #352 finding 1: a failed attempt then a --resume retry -----------------------------
+
+
+def _rec(key: tuple[str, int], decision: dict[str, Any]) -> dict[str, Any]:
+    return {"thread_id": key[0], "round_index": key[1], "decision": decision}
+
+
+def test_resume_retries_failed_rows_and_report_reads_the_retry(tmp_path: Path) -> None:
+    ok = {
+        "outcome": "evaluated",
+        "provider": "jev",
+        "raw_answers": {q.key: {"type": "noul", "noul": 0.5} for q in TIERC_QUESTIONS_V1},
+    }
+    failed = {"outcome": "transport_error", "raw_answers": None}
+    a, b = ("T", 0), ("T", 1)
+    path = _write_lines(tmp_path / "run.jsonl", [_rec(a, ok), _rec(b, failed)])
+    assert runner.evaluated_keys(path) == {a}  # b is sent again on --resume
+    assert runner.evaluated_keys(tmp_path / "absent.jsonl") == set()
+    with pytest.raises(ValueError, match="1 rows missing"):
+        ftr.load_scores(path, {a, b})  # b never succeeded
+    _write_lines(path, [_rec(a, ok), _rec(b, failed), _rec(b, ok)])
+    scores = ftr.load_scores(path, {a, b})
+    assert set(scores) == {a, b}

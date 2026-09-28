@@ -203,6 +203,22 @@ async def run(
     return t
 
 
+def evaluated_keys(path: Path) -> set[Key]:
+    """Keys ``--resume`` skips: those with an ``evaluated`` record in ``path`` (none if absent).
+
+    A failed attempt (``transport_error`` and the like, tolerated up to the 10% error rate) is
+    **not** done, so a resumed run sends that row again. ``decider_replay.load_done_keys`` counts
+    any record with a decision, which would leave a failed row neither retried nor reportable.
+    """
+    if not path.is_file():
+        return set()
+    return {
+        dr.record_key(rec)
+        for rec in dr.iter_fixture(path)
+        if isinstance(rec.get("decision"), dict) and rec["decision"].get("outcome") == "evaluated"
+    }
+
+
 def _load(path: Path) -> list[dict[str, Any]]:
     return list(dr.iter_fixture(path))
 
@@ -256,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     outs = {"full": a.out_full, "base": a.out_base}
-    done = {s: (dr.load_done_keys(outs[s]) if a.resume else set()) for s in SIDES}
+    done = {s: (evaluated_keys(outs[s]) if a.resume else set()) for s in SIDES}
     sinks = {s: outs[s].open("a" if a.resume else "w", encoding="utf-8") for s in sides}
     try:
         t = asyncio.run(
