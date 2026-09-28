@@ -1029,3 +1029,90 @@ def test_head_m_must_be_positive() -> None:
             set_name="eval",
             head_m=0,
         )
+
+
+# --- msg-4329: independent requests, interleave, no leak, stops -------------------------------
+
+runner = _load("tierc_fulltext_run")
+
+
+def _pair() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    threads = [("p", "T-x", _thread()), ("p", "T-long", _long_thread())]
+    return _outputs(threads, 8000), _outputs(threads, 500)
+
+
+def test_plan_interleaves_each_row_and_is_seeded() -> None:
+    keys = [("T-a", i) for i in range(40)]
+    steps = runner.plan(keys, 7)
+    assert steps == runner.plan(keys, 7)
+    assert [s.key for s in steps] == [k for k in keys for _ in range(2)]
+    for i in range(0, len(steps), 2):
+        assert {steps[i].side, steps[i + 1].side} == {"full", "base"}
+    firsts = {steps[i].side for i in range(0, len(steps), 2)}
+    assert firsts == {"full", "base"}  # the coin is actually drawn per row
+
+
+def test_check_plan_base_matches_original_and_no_cross_row_state() -> None:
+    full, base = _pair()
+    keys = [(r["thread_id"], r["round_index"]) for r in full]
+    ev = runner.check_plan(full=full, base=base, original=base, steps=runner.plan(keys, 1))
+    assert ev["base_equals_original"] == len(base)
+    # the long escalation's full body really is longer than its base body
+    long_key = next(k for k in keys if k[0] == "T-long")
+    f = {(r["thread_id"], r["round_index"]): r for r in full}
+    b = {(r["thread_id"], r["round_index"]): r for r in base}
+    assert len(runner.request_body(f[long_key])) > len(runner.request_body(b[long_key]))
+
+
+def test_check_plan_refuses_a_base_that_differs_from_the_original() -> None:
+    full, base = _pair()
+    tampered = [dict(r) for r in base]
+    tampered[0]["head_summary"] = tampered[0]["head_summary"] + "x"
+    keys = [(r["thread_id"], r["round_index"]) for r in full]
+    with pytest.raises(AssertionError, match="differs from the original"):
+        runner.check_plan(full=full, base=tampered, original=base, steps=runner.plan(keys, 1))
+
+
+def _ok(**over: Any) -> dict[str, Any]:
+    d: dict[str, Any] = {
+        "outcome": "evaluated",
+        "provider": "jev",
+        "raw_answers": {k: {"type": "noul", "noul": 0.5} for k in runner.QUESTION_KEYS},
+    }
+    d.update(over)
+    return d
+
+
+def test_stop_on_missing_raw_answers() -> None:
+    t = runner.Tally()
+    runner.record_outcome(t, _ok())
+    assert t.stopped is None
+    runner.record_outcome(t, _ok(raw_answers={"incurs_cost": {}}))
+    assert t.stopped and "raw_answers missing" in t.stopped
+
+
+def test_stop_on_error_rate_over_10_percent_after_10_calls() -> None:
+    t = runner.Tally()
+    runner.record_outcome(t, _ok(outcome="transport_error", raw_answers=None))
+    assert t.stopped is None  # 1/1 but fewer than 10 calls
+    for _ in range(8):
+        runner.record_outcome(t, _ok())
+    assert t.stopped is None
+    runner.record_outcome(t, _ok())  # 1/10 = 10%, not over
+    assert t.stopped is None
+    runner.record_outcome(t, _ok(outcome="transport_error", raw_answers=None))  # 2/11
+    assert t.stopped and "error rate" in t.stopped
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        {"outcome": "no_verdict_null", "provider": "null", "raw_answers": None},
+        {"outcome": "no_verdict_malformed", "provider": "jev", "raw_answers": {}},
+        {"outcome": "evaluated", "provider": "llm", "raw_answers": {}},
+    ],
+)
+def test_contract_mismatch_stops_at_once(decision: dict[str, Any]) -> None:
+    t = runner.Tally()
+    runner.record_outcome(t, decision)
+    assert t.stopped and "contract mismatch" in t.stopped
