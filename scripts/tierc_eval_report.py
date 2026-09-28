@@ -504,8 +504,9 @@ def render(
         if r.server_verdict is not None and r.scores is not None and not r.grey_zone
     )
     lines += [
-        f"- server verdict is scope=out_of_gate (UNSURE by construction) on {agree} rows; the "
-        "recomputed verdict above is what (A) reads.",
+        f"- mindwire-side verdict (``decider/verdict.py``, not the server) is scope=out_of_gate "
+        f"(UNSURE by construction) on {agree} rows; the recomputed verdict above is what (A) "
+        "reads.",
         "- cost per call: not in the replay record — read from Lexora usage.",
         "",
     ]

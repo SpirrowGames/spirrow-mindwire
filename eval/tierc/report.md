@@ -229,6 +229,14 @@
 - outcome: {'evaluated': 209}
 - error rate: 0/209 = 0.0%
 - latency ms p50=254 p95=332
-- server verdict is scope=out_of_gate (UNSURE by construction) on 209 rows; the recomputed verdict above is what (A) reads.
+- mindwire-side verdict (``decider/verdict.py``, not the server) is scope=out_of_gate (UNSURE by construction) on 209 rows; the recomputed verdict above is what (A) reads.
 - cost per call: not in the replay record — read from Lexora usage.
 
+
+## Limits of this result (hand-written, msg-4273 / msg-4275; not produced by `tierc_eval_report.py`)
+
+- **(a) Jev saw the live-shaped excerpt only.** The Turn is built by the live hook's functions (msg-4219 §2), so `head_summary` and every `recent_events[].body_head` are the first `BODY_HEAD_M` = 500 characters of each message (`decider/hook.py:65`, `:114`, `:123`). **All 209** escalation bodies are longer than 500 characters; the median is 9,685. The labellers read the body up to 8,000 characters (139 of 209 were cut there), plus the 3 following messages that Jev never sees (msg-4229 §2). This result therefore measures **Jev on live-shaped input**. It does not say whether Jev could separate the classes given more of the text.
+- **(b) The `scope` field is not in the request, but the gate result is.** `build_decide_request` (`decider/wire.py:89-96`), the one builder that live and replay share, sends `state`, `questions`, `policy` and `questions_version`, and nothing named `scope`. `scope` (`in_gate` / `out_of_gate`) and the UNSURE verdict are attached on the mindwire side after the answer returns (`decider/verdict.py`, `build_tierc_record` in `decider_replay.py`). However, `state` carries `gate_result`, including `is_grey_zone`, which is the value `scope` is derived from (`decider/wire.py` module docstring and `state_to_wire`). All 209 rows went out with `is_grey_zone: false`. Whether Lexora or Jev uses that field when forming its answers was not checked: the available spirrow-lexora checkout predates `/v1/decide` (msg-4275). So this is an **untested boundary**: Jev's answers on grey-zone rows (`is_grey_zone: true`), the only rows whose verdict live would act on, may differ from what was measured here.
+- **Jev's cost was not measured.** `/v1/decide` writes no row to Lexora's `/stats/costs/recent`. Between 2026-09-26 23:23Z and 2026-09-28 03:40Z the ledger shows only `/v1/chat/completions` and `/v1/messages`, and the pilot left no rows. The per-call measurement in msg-4219 §4-2 could not be done.
+- **Frontier-tier labelling cost is in tokens only.** Lexora's cost rows for `claude-fable-5-1` carry `pricing_known=0` and `cost_usd=0.0`. The run used 1,427,667 input and 65,106 output tokens over 14 batches. A dollar figure needs the unit price. The naysayer-tier labelling cost $3.74 (ledger).
+- `RUBRIC.md` still names the Claude-side labeller `claude`. The labeller that actually ran is `frontier-tier` (msg-4245). RUBRIC is part of the hash-locked system prompt (sha `28433e43…`), so it is deliberately left unedited.
