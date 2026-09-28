@@ -30,8 +30,13 @@ from spirrow_mindwire.conductor.handoff import HandoffKind, resolve_handoff
 from spirrow_mindwire.decider.hook import compute_gate_result, never_retry
 from spirrow_mindwire.decider.questions import TIERC_QUESTIONS_V1
 from spirrow_mindwire.decider.result import DecisionOutcome, DecisionResult
+from spirrow_mindwire.decider.state import state_builder
 from spirrow_mindwire.decider.verdict import build_out_of_gate_verdict
-from spirrow_mindwire.decider.wire import gate_result_to_dict
+from spirrow_mindwire.decider.wire import (
+    POLICY_REPLAY_TIERC,
+    build_decide_request,
+    gate_result_to_dict,
+)
 from spirrow_mindwire.value_objects import Role
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -958,3 +963,258 @@ def test_committed_eval_jsonl_files_are_strict_jsonl() -> None:
             for lineno, line in enumerate(fh, start=1):
                 assert line.strip(), f"{path}:{lineno}: blank line in JSONL"
                 json.loads(line)
+
+
+# --- T-decider-tierc-fulltext-eval (Bohr msg-4311 / msg-4313 / msg-4318): --head-m -------------
+
+LONG = "L" * 1200 + "\n\nTIER-C: scope\nNEXT: human"
+
+
+def _long_thread() -> list[Any]:
+    return [
+        _msg(1, "Fermi", "P" * 900 + "\n\nNEXT: Bohr"),
+        _msg(2, "Bohr", "design\n\nNEXT: Einstein", role="proposer"),
+        _msg(3, "Einstein", "ok\n\nNEXT: Bohr", role="naysayer"),
+        _msg(4, "Bohr", LONG, role="proposer"),
+        _msg(5, "Heisenberg", "FUTURE-ONLY-TEXT\n\nNEXT: Bohr", role="implementer"),
+    ]
+
+
+def _outputs(threads: list[Any], head_m: int | None) -> list[dict[str, Any]]:
+    kw = {} if head_m is None else {"head_m": head_m}
+    fixture: list[dict[str, Any]] = builder.build_outputs(threads, {}, **kw)[1]
+    return fixture
+
+
+def _lines(rows: list[dict[str, Any]]) -> list[str]:
+    return [builder._fixture_line(r) for r in rows]
+
+
+def test_head_m_500_is_byte_identical_to_the_default_fixture() -> None:
+    """msg-4313 test 1: ``head_m=500`` reproduces the original (live) fixture byte for byte."""
+    threads = [("p", "T-x", _thread()), ("p", "T-long", _long_thread())]
+    assert _lines(_outputs(threads, 500)) == _lines(_outputs(threads, None))
+
+
+def test_head_m_8000_differs_only_in_the_escalations_two_fields() -> None:
+    """msg-4313 test 2: only ``head_summary`` and ``recent_events[0].body_head`` change."""
+    threads = [("p", "T-long", _long_thread())]
+    (old,) = _outputs(threads, None)
+    (new,) = _outputs(threads, 8000)
+    assert sorted(f for f in set(old) | set(new) if old.get(f) != new.get(f)) == [
+        "head_summary",
+        "recent_events",
+    ]
+    assert new["head_summary"] == LONG and len(old["head_summary"]) == 500
+    assert new["recent_events"][1:] == old["recent_events"][1:]
+    assert len(new["recent_events"]) == len(old["recent_events"])
+    e0_old, e0_new = old["recent_events"][0], new["recent_events"][0]
+    assert {k for k in e0_old if e0_old[k] != e0_new[k]} == {"body_head"}
+    # the earlier long message stays at the live 500 (msg-4311: only the escalation widens)
+    assert all(len(e["body_head"]) <= 500 for e in new["recent_events"][1:])
+
+
+@pytest.mark.parametrize("head_m", [None, 500, 8000, 50])
+def test_escalation_invariant_on_every_row(head_m: int | None) -> None:
+    """msg-4313 test 3: ``head_summary == recent_events[0].body_head`` and ev0 is the escalation."""
+    rows = _outputs([("p", "T-x", _thread()), ("p", "T-long", _long_thread())], head_m)
+    assert rows
+    for r in rows:
+        assert r["head_summary"] == r["recent_events"][0]["body_head"]
+        assert r["recent_events"][0]["msg_id"] == r["msg_id"]
+
+
+def test_short_escalation_request_is_byte_identical() -> None:
+    """msg-4313 test 4: a ≤500-char escalation sends exactly the original ``/v1/decide`` body."""
+    threads = [("p", "T-x", _thread())]
+    olds, news = _outputs(threads, None), _outputs(threads, 8000)
+    assert olds and len(olds) == len(news)
+    assert all(len(r["recent_events"][0]["body_head"]) < 500 for r in olds)
+    assert _lines(news) == _lines(olds)
+    old, new = olds[0], news[0]
+    s_old = state_builder(replay.parse_turn(old))
+    s_new = state_builder(replay.parse_turn(new))
+    req_old = build_decide_request(s_old, policy=POLICY_REPLAY_TIERC)
+    req_new = build_decide_request(s_new, policy=POLICY_REPLAY_TIERC)
+    assert json.dumps(req_new, sort_keys=True) == json.dumps(req_old, sort_keys=True)
+
+
+def test_fulltext_for_rebuilds_exactly_the_kept_rows() -> None:
+    threads = [("p", "T-x", _thread()), ("p", "T-long", _long_thread())]
+    fixture = _outputs(threads, None)
+    keep = [builder._entry(r) for r in fixture]
+    rows = builder.fulltext_for(
+        corrections={"keep": keep}, threads=threads, current_roster={}, head_m=8000
+    )
+    assert [(r["thread_id"], r["round_index"]) for r in rows] == [
+        (e["thread_id"], e["round_index"]) for e in keep
+    ]
+    with pytest.raises(ValueError, match="not rebuilt"):
+        builder.fulltext_for(
+            corrections={"keep": [*keep, {"thread_id": "T-none", "round_index": 0}]},
+            threads=threads,
+            current_roster={},
+            head_m=8000,
+        )
+
+
+def test_head_m_must_be_positive() -> None:
+    msgs = _thread()
+    with pytest.raises(ValueError, match="head_m"):
+        builder.build_eval_row(
+            project="p",
+            thread_id="T-x",
+            messages=msgs,
+            head_index=3,
+            current_roster={},
+            now=msgs[3].timestamp,
+            set_name="eval",
+            head_m=0,
+        )
+
+
+# --- msg-4329: independent requests, interleave, no leak, stops -------------------------------
+
+runner = _load("tierc_fulltext_run")
+
+
+def _pair() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    threads = [("p", "T-x", _thread()), ("p", "T-long", _long_thread())]
+    return _outputs(threads, 8000), _outputs(threads, 500)
+
+
+def test_plan_interleaves_each_row_and_is_seeded() -> None:
+    keys = [("T-a", i) for i in range(40)]
+    steps = runner.plan(keys, 7)
+    assert steps == runner.plan(keys, 7)
+    assert [s.key for s in steps] == [k for k in keys for _ in range(2)]
+    for i in range(0, len(steps), 2):
+        assert {steps[i].side, steps[i + 1].side} == {"full", "base"}
+    firsts = {steps[i].side for i in range(0, len(steps), 2)}
+    assert firsts == {"full", "base"}  # the coin is actually drawn per row
+
+
+def test_check_plan_base_matches_original_and_no_cross_row_state() -> None:
+    full, base = _pair()
+    keys = [(r["thread_id"], r["round_index"]) for r in full]
+    ev = runner.check_plan(full=full, base=base, original=base, steps=runner.plan(keys, 1))
+    assert ev["base_equals_original"] == len(base)
+    # the long escalation's full body really is longer than its base body
+    long_key = next(k for k in keys if k[0] == "T-long")
+    f = {(r["thread_id"], r["round_index"]): r for r in full}
+    b = {(r["thread_id"], r["round_index"]): r for r in base}
+    assert len(runner.request_body(f[long_key])) > len(runner.request_body(b[long_key]))
+
+
+def test_check_plan_refuses_a_base_that_differs_from_the_original() -> None:
+    full, base = _pair()
+    tampered = [dict(r) for r in base]
+    tampered[0]["head_summary"] = tampered[0]["head_summary"] + "x"
+    keys = [(r["thread_id"], r["round_index"]) for r in full]
+    with pytest.raises(AssertionError, match="differs from the original"):
+        runner.check_plan(full=full, base=tampered, original=base, steps=runner.plan(keys, 1))
+
+
+def _ok(**over: Any) -> dict[str, Any]:
+    d: dict[str, Any] = {
+        "outcome": "evaluated",
+        "provider": "jev",
+        "raw_answers": {k: {"type": "noul", "noul": 0.5} for k in runner.QUESTION_KEYS},
+    }
+    d.update(over)
+    return d
+
+
+def test_stop_on_missing_raw_answers() -> None:
+    t = runner.Tally()
+    runner.record_outcome(t, _ok())
+    assert t.stopped is None
+    runner.record_outcome(t, _ok(raw_answers={"incurs_cost": {}}))
+    assert t.stopped and "raw_answers missing" in t.stopped
+
+
+def test_stop_on_error_rate_over_10_percent_after_10_calls() -> None:
+    t = runner.Tally()
+    runner.record_outcome(t, _ok(outcome="transport_error", raw_answers=None))
+    assert t.stopped is None  # 1/1 but fewer than 10 calls
+    for _ in range(8):
+        runner.record_outcome(t, _ok())
+    assert t.stopped is None
+    runner.record_outcome(t, _ok())  # 1/10 = 10%, not over
+    assert t.stopped is None
+    runner.record_outcome(t, _ok(outcome="transport_error", raw_answers=None))  # 2/11
+    assert t.stopped and "error rate" in t.stopped
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        {"outcome": "no_verdict_null", "provider": "null", "raw_answers": None},
+        {"outcome": "no_verdict_malformed", "provider": "jev", "raw_answers": {}},
+        {"outcome": "evaluated", "provider": "llm", "raw_answers": {}},
+    ],
+)
+def test_contract_mismatch_stops_at_once(decision: dict[str, Any]) -> None:
+    t = runner.Tally()
+    runner.record_outcome(t, decision)
+    assert t.stopped and "contract mismatch" in t.stopped
+
+
+# --- tierc_fulltext_report: the original AUC definition, paired bootstrap, change rates -------
+
+ftr = _load("tierc_fulltext_report")
+
+
+def _sc(g: float, s: float) -> dict[str, float]:
+    return _answers(g, s)
+
+
+def test_fulltext_auc_is_the_original_definition() -> None:
+    truth = {("T", 0): "genuine", ("T", 1): "spurious", ("T", 2): "ambiguous"}
+    scores = {("T", 0): _sc(0.9, 0.1), ("T", 1): _sc(0.1, 0.9), ("T", 2): _sc(0.0, 0.0)}
+    keys = list(truth)
+    assert ftr.auc_of(scores, truth, keys) == 1.0  # ambiguous left out
+    pos = [sum(scores[("T", 0)][q] for q in ftr.rep.TIER_C_GENUINE_KEYS)]
+    neg = [sum(scores[("T", 1)][q] for q in ftr.rep.TIER_C_GENUINE_KEYS)]
+    assert ftr.auc_of(scores, truth, keys) == ftr.rep.auc(pos, neg)
+
+
+def test_fulltext_bootstrap_same_input_has_zero_noise_delta() -> None:
+    truth = {("T", i): ("genuine" if i % 2 else "spurious") for i in range(12)}
+    s = {k: _sc(0.5 + (0.3 if v == "genuine" else 0.0) + k[1] / 100, 0.3) for k, v in truth.items()}
+    ci = ftr.bootstrap({"orig": s, "base": s, "full": s}, truth, list(truth), n=200, seed=1)
+    assert ci["Δ base-orig (noise)"] == (0.0, 0.0)
+    assert ci["Δ full-orig"] == (0.0, 0.0)
+
+
+def test_fulltext_change_counts_verdict_and_moved_answers() -> None:
+    th = ftr.TierCThresholds()
+    a, b = _sc(0.9, 0.1), _sc(0.1, 0.9)
+    changed, moved, mean = ftr.change(a, b, th)
+    assert changed and moved == 1.0 and mean > 0.5
+    assert ftr.change(a, dict(a), th) == (False, 0.0, 0.0)
+
+
+# --- PR-gate #352 finding 1: a failed attempt then a --resume retry -----------------------------
+
+
+def _rec(key: tuple[str, int], decision: dict[str, Any]) -> dict[str, Any]:
+    return {"thread_id": key[0], "round_index": key[1], "decision": decision}
+
+
+def test_resume_retries_failed_rows_and_report_reads_the_retry(tmp_path: Path) -> None:
+    ok = {
+        "outcome": "evaluated",
+        "provider": "jev",
+        "raw_answers": {q.key: {"type": "noul", "noul": 0.5} for q in TIERC_QUESTIONS_V1},
+    }
+    failed = {"outcome": "transport_error", "raw_answers": None}
+    a, b = ("T", 0), ("T", 1)
+    path = _write_lines(tmp_path / "run.jsonl", [_rec(a, ok), _rec(b, failed)])
+    assert runner.evaluated_keys(path) == {a}  # b is sent again on --resume
+    assert runner.evaluated_keys(tmp_path / "absent.jsonl") == set()
+    with pytest.raises(ValueError, match="1 rows missing"):
+        ftr.load_scores(path, {a, b})  # b never succeeded
+    _write_lines(path, [_rec(a, ok), _rec(b, failed), _rec(b, ok)])
+    scores = ftr.load_scores(path, {a, b})
+    assert set(scores) == {a, b}

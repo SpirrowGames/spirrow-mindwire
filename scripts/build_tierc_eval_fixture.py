@@ -21,7 +21,10 @@ messages *after* the escalation, which appear nowhere else; ``harvest.json`` —
 hook.compute_gate_result` (``retry_lookup=never_retry``, as step 2b-1) and
 :func:`~spirrow_mindwire.decider.hook.turn_from_messages` → ``state_builder`` →
 ``decider.wire.state_to_dict`` — the functions the live hook calls. Nothing here re-derives
-``head_summary`` / ``recent_events`` / ``prev_next``.
+``head_summary`` / ``recent_events`` / ``prev_next``. The one eval-only deviation is
+``--head-m`` (:func:`turn_for_eval`, T-decider-tierc-fulltext-eval msg-4311 / msg-4318): it widens
+the escalation's own text in ``head_summary`` and ``recent_events[0]`` together; at the default
+(live ``BODY_HEAD_M`` = 500) the output is byte-identical to live.
 
 **The three future-leak seals (msg-4226 §5, each pinned by a test):**
 
@@ -52,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import hashlib
 import json
 import sys
@@ -69,13 +73,14 @@ from spirrow_mindwire.conductor.handoff import (
     resolve_handoff,
 )
 from spirrow_mindwire.decider.hook import (
+    BODY_HEAD_M,
     ThreadMessage,
     compute_gate_result,
     is_tierc_entry,
     never_retry,
     turn_from_messages,
 )
-from spirrow_mindwire.decider.state import state_builder
+from spirrow_mindwire.decider.state import SimpleTurn, state_builder
 from spirrow_mindwire.decider.wire import state_to_dict
 from spirrow_mindwire.value_objects import Role
 
@@ -206,6 +211,46 @@ def routing_roster(
     return roster
 
 
+def turn_for_eval(
+    *,
+    head_m: int,
+    thread_id: str,
+    round_index: int,
+    roster: Mapping[str, Role],
+    messages: Sequence[ThreadMessage],
+    gate_result: Any = None,
+) -> SimpleTurn:
+    """T-decider-tierc-fulltext-eval (Bohr msg-4311, fixed in msg-4318): the live turn, with
+    the escalation's own text widened to ``head_m`` chars in **both** places it appears.
+
+    Live :func:`turn_from_messages` is called unchanged; only ``head_summary`` and
+    ``recent_events[0].body_head`` (newest-first, so the escalation itself) are replaced, both by
+    the same ``content[:head_m]`` — the live invariant ``head_summary ==
+    recent_events[0].body_head`` holds on every row, so the model never sees two versions of the
+    escalation. The other four events stay at the live ``BODY_HEAD_M``. Truncation is from the
+    head, as the labellers read it (msg-4318 §3). ``head_m == BODY_HEAD_M`` reproduces live.
+    """
+    if head_m < 1:
+        raise ValueError(f"turn_for_eval: head_m must be positive, got {head_m}")
+    turn = turn_from_messages(
+        thread_id=thread_id,
+        round_index=round_index,
+        roster=roster,
+        messages=messages,
+        gate_result=gate_result,
+    )
+    head = messages[-1]
+    ev0 = turn.recent_events[0]
+    if ev0.msg_id != head.msg_id:
+        raise AssertionError(f"recent_events[0] is {ev0.msg_id}, escalation is {head.msg_id}")
+    body = head.content[:head_m]
+    return dataclasses.replace(
+        turn,
+        head_summary=body,
+        recent_events=(dataclasses.replace(ev0, body_head=body), *turn.recent_events[1:]),
+    )
+
+
 def build_eval_row(
     *,
     project: str,
@@ -215,6 +260,7 @@ def build_eval_row(
     current_roster: Mapping[str, Role],
     now: datetime | None,
     set_name: str,
+    head_m: int = BODY_HEAD_M,
 ) -> dict[str, Any]:
     """One escalation → one ``decider_replay`` fixture row (plus metadata columns).
 
@@ -253,7 +299,8 @@ def build_eval_row(
         body=head.content, author=head.author, now=now, retry_lookup=never_retry
     )
     state = state_builder(
-        turn_from_messages(
+        turn_for_eval(
+            head_m=head_m,
             thread_id=thread_id,
             round_index=head_index,
             roster=roster,
@@ -298,6 +345,7 @@ def rows_for_thread(
     thread_id: str,
     messages: Sequence[RawMessage],
     current_roster: Mapping[str, Role],
+    head_m: int = BODY_HEAD_M,
 ) -> list[tuple[dict[str, Any], int]]:
     out: list[tuple[dict[str, Any], int]] = []
     for i, m in enumerate(messages):
@@ -320,6 +368,7 @@ def rows_for_thread(
             current_roster=current_roster,
             now=m.timestamp,
             set_name=set_name,
+            head_m=head_m,
         )
         out.append((row, i))
     return out
@@ -439,6 +488,7 @@ def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 def build_outputs(
     threads: Sequence[tuple[str, str, Sequence[RawMessage]]],
     current_roster: Mapping[str, Role],
+    head_m: int = BODY_HEAD_M,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """Pure: harvested threads → (population, Jev fixture, labelling materials, manifest).
 
@@ -449,7 +499,11 @@ def build_outputs(
     everything: list[tuple[dict[str, Any], Sequence[RawMessage], int]] = []
     for project, thread_id, msgs in threads:
         for row, i in rows_for_thread(
-            project=project, thread_id=thread_id, messages=msgs, current_roster=current_roster
+            project=project,
+            thread_id=thread_id,
+            messages=msgs,
+            current_roster=current_roster,
+            head_m=head_m,
         ):
             row["eval_set"] = eval_set_of(row)
             everything.append((row, msgs, i))
@@ -590,6 +644,33 @@ def corrections_for(
     }
 
 
+def fulltext_for(
+    *,
+    corrections: Mapping[str, Any],
+    threads: Sequence[tuple[str, str, Sequence[RawMessage]]],
+    current_roster: Mapping[str, Role],
+    head_m: int,
+) -> list[dict[str, Any]]:
+    """msg-4318 §1: the corrections file's kept rows, rebuilt with ``head_m``.
+
+    ``threads`` must be the harvest's view (:func:`as_of`). Raises unless the rebuilt key set is
+    exactly the corrections ``keep`` set, and unless every row keeps ``head_summary ==
+    recent_events[0].body_head`` with ``recent_events[0].msg_id`` the escalation's own.
+    """
+    _, fixture, _, _ = build_outputs(threads, current_roster, head_m=head_m)
+    keep = [(e["thread_id"], e["round_index"]) for e in corrections["keep"]]
+    by_key = {(r["thread_id"], r["round_index"]): r for r in fixture}
+    missing = sorted(set(keep) - set(by_key))
+    if missing or len(set(keep)) != len(keep):
+        raise ValueError(f"fulltext_for: kept rows not rebuilt (or duplicated): {missing}")
+    out = [by_key[k] for k in keep]
+    for r in out:
+        ev0 = r["recent_events"][0]
+        if r["head_summary"] != ev0["body_head"] or ev0["msg_id"] != r["msg_id"]:
+            raise AssertionError(f"fulltext_for: escalation invariant broken at {r['msg_id']}")
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out-dir", type=Path, default=None)
@@ -603,7 +684,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     corr.add_argument("--corrections-out", type=Path, default=None)
     corr.add_argument("--selection-code-commit", default=None)
+    parser.add_argument(
+        "--head-m",
+        type=int,
+        default=BODY_HEAD_M,
+        help="escalation text cap for head_summary and recent_events[0] (msg-4311; live = 500)",
+    )
+    full = parser.add_argument_group(
+        "fulltext mode (T-decider-tierc-fulltext-eval msg-4318): rebuild a corrections file's kept"
+        " rows with --head-m (needs --reproduce)"
+    )
+    full.add_argument("--fulltext-for", type=Path, default=None, help="the corrections file")
+    full.add_argument("--fulltext-out", type=Path, default=None)
     args = parser.parse_args(argv)
+
+    if args.fulltext_for is not None:
+        if None in (args.reproduce, args.fulltext_out):
+            parser.error("--fulltext-for needs --reproduce and --fulltext-out")
+        hv = json.loads(args.reproduce.read_text(encoding="utf-8"))
+        roster = {k: Role(v) for k, v in hv["current_roster"].items()}
+        harvested = asyncio.run(harvest(tuple(args.project or hv.get("projects") or PROJECTS)))
+        rows = fulltext_for(
+            corrections=json.loads(args.fulltext_for.read_text(encoding="utf-8")),
+            threads=as_of(harvested, parse_timestamp(hv["harvested_at"])),
+            current_roster=roster,
+            head_m=args.head_m,
+        )
+        args.fulltext_out.parent.mkdir(parents=True, exist_ok=True)
+        _write_jsonl(args.fulltext_out, rows)
+        print(json.dumps({"rows": len(rows), "head_m": args.head_m}), file=sys.stderr)
+        return 0
 
     if args.corrections_for is not None:
         if None in (args.reproduce, args.corrections_out, args.selection_code_commit):
@@ -632,7 +742,10 @@ def main(argv: list[str] | None = None) -> int:
 
     current_roster = dict(load_settings().conductor.roster)
     threads = asyncio.run(harvest(tuple(args.project or PROJECTS)))
-    population, fixture, materials, manifest = build_outputs(threads, current_roster)
+    population, fixture, materials, manifest = build_outputs(
+        threads, current_roster, head_m=args.head_m
+    )
+    manifest["head_m"] = args.head_m
     manifest["harvested_at"] = datetime.now(UTC).isoformat()
     manifest["current_roster"] = {k: v.value for k, v in current_roster.items()}
 
