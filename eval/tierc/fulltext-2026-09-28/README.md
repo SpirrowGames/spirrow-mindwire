@@ -11,11 +11,19 @@ Thread: `T-decider-tierc-fulltext-eval`. Design: Bohr msg-4311 / msg-4313 / msg-
 
 Conditions for continuing (msg-4332 §1): (1) collect more real escalations — billing, Takahito's call; (2) re-fit the thresholds on new data — the heaviest condition, since reduction was 0/12; (3) any proposal to widen the live `turn_from_messages` input must not cite this result — no fulltext effect was seen; live stays at 500 chars.
 
-| truth (genuine* / spurious) | AUC 500 orig | AUC 500 re-run | AUC 8,000 | ΔAUC 8,000−orig | ΔAUC re-run−orig (noise) | reduction | recall genuine* |
-|---|---|---|---|---|---|---|---|
-| consensus (37 / 12) | 0.705 [0.532, 0.860] | 0.705 | 0.730 [0.579, 0.862] | +0.025 [−0.131, +0.176] | +0.000 [−0.047, +0.050] | 0/12 ×3 | 37/37 ×3 |
-| naysayer-tier (50 / 16) | 0.712 | 0.708 | 0.744 [0.605, 0.866] | +0.032 [−0.089, +0.152] | −0.004 | 0/16 ×3 | 50/50 ×3 |
-| frontier-tier (46 / 19) | 0.546 | 0.555 | 0.569 [0.421, 0.717] | +0.023 [−0.105, +0.150] | +0.010 | 0/19 ×3 | 46/46 ×3 |
+The per-truth tables (AUC with 95% intervals, ΔAUC, reduction, recall, change rates) live only in `report.fulltext.md`; they are not restated here.
+
+## Files
+
+| file | rows | what |
+|---|---|---|
+| `fixture.fulltext.m8000.jsonl` | 66 | the 66 kept escalations, escalation text widened to 8,000 chars |
+| `replay.full.jsonl` | 66 | Jev on the 8,000-char side |
+| `replay.base.jsonl` | 66 | Jev on the 500-char side, re-run (same input as the original; the noise baseline) |
+| `contract.full.out.jsonl` | **5** | the contract check only: the 5 rows with the largest `body_chars`, 8,000-char side, sent before the main run (msg-4318 §5). It is **not** an evaluation output and is not part of the 66-row results. |
+| `plan.json` | 132 steps | the seeded send order of the main run |
+| `corrections-2026-09-28-roster-selection.json` | 209 (66 keep / 143 exclude) | which original fixture rows are real escalations. In an `exclude` entry's `detail`, `empty_roster` is how the message resolved with the old empty roster (`kind/mismatch_reason`), and `conductor_roster` is how it resolves against the conductor roster (`kind/target`). For example, `role/Heisenberg` means "a normal handoff to Heisenberg", not "the conductor's role", which is why the row is not an escalation. |
+| `report.fulltext.md` | — | the numbers |
 
 ## Limits
 
