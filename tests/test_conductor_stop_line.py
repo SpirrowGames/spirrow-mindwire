@@ -117,6 +117,11 @@ def test_blocked_on_is_parsed_with_canonical_wake(
         "stop: done",
         "Stop: blocked-on thread:T-foo wake:Bohr",
         "**STOP: done**",
+        # keyword and colon separated by decoration / whitespace (PR-gate #363 finding 1)
+        "**STOP**: done",
+        "STOP : done",
+        "__STOP__: blocked-on thread:T-foo wake:Bohr",
+        "`STOP`: done",
     ],
 )
 def test_malformed_lines(line: str) -> None:

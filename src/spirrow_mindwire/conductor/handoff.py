@@ -294,7 +294,12 @@ _TIER_C_LABEL_RE = re.compile(
 # for the mechanism's own D-8 ③ fallback and is never read off an author's line.
 STOP_TRIGGER_ARMS: tuple[str, ...] = ("thread", "pr", "deploy", "queue-empty")
 
-_STOP_KEYWORD_RE = re.compile(r"\A[\s*_`>]*(?P<keyword>STOP):\s*(?P<rest>.*?)\s*\Z", re.IGNORECASE)
+# Decoration or whitespace BETWEEN the keyword and the colon (`**STOP**: done`, `STOP : done`) is
+# also detected (PR-gate #363 finding 1): without it those lines fell through to ABSENT. Detection
+# only — a non-empty `gap` makes the line MALFORMED, it is never accepted.
+_STOP_KEYWORD_RE = re.compile(
+    r"\A[\s*_`>]*(?P<keyword>STOP)(?P<gap>[\s*_`>]*):\s*(?P<rest>.*?)\s*\Z", re.IGNORECASE
+)
 _STOP_BLOCKED_ON_RE = re.compile(
     r"\Ablocked-on (?P<arm>"
     + "|".join(re.escape(arm) for arm in STOP_TRIGGER_ARMS)
@@ -448,8 +453,9 @@ def _stop_line_above_last_next(body: str, roster: Mapping[str, Role]) -> StopLin
         return StopLine(StopStatus.ABSENT)
     rest = keyword.group("rest")
     raw = line.strip()
-    if keyword.group("keyword") != "STOP":
-        # Detected (so not ABSENT) but not the fixed spelling: `stop: done` is MALFORMED.
+    if keyword.group("keyword") != "STOP" or keyword.group("gap"):
+        # Detected (so not ABSENT) but not the fixed spelling: `stop: done`, `**STOP**: done` and
+        # `STOP : done` are MALFORMED.
         return StopLine(StopStatus.MALFORMED, raw=raw)
     if rest == "done":
         return StopLine(StopStatus.DONE, raw=raw)

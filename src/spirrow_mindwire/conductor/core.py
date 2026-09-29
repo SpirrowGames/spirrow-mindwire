@@ -914,18 +914,20 @@ class Conductor:
             # rejected, nothing is forwarded to magickit, and the route below is identical for
             # every value. `stop_line=absent` is the pre-cutover `unclassified` denominator.
             stop = handoff.stop_line
+            # resolve_handoff sets stop_line on every NONE handoff (handoff.py, resolve_handoff).
+            assert stop is not None
             logger.info(
                 "conductor none terminal: author=%s author_role=%s stop_line=%s "
                 "stop_disposition=%s stop_trigger=%s stop_wake=%s stop_raw=%r",
                 _author(messages[-1]),
                 author_role.value if author_role is not None else None,
-                stop.status.presence if stop is not None else "absent",
-                stop.status.value if stop is not None else None,
+                stop.status.presence,
+                stop.status.value,
                 f"{stop.trigger_arm}:{stop.trigger_operand}"
-                if stop is not None and stop.trigger_arm is not None
+                if stop.trigger_arm is not None
                 else None,
-                stop.wake if stop is not None else None,
-                stop.raw if stop is not None else None,
+                stop.wake,
+                stop.raw,
             )
             return RouteDecision(
                 target_role=None,
