@@ -1,13 +1,21 @@
-"""Conductor-side Tier-C Decider hook (T-decider-conductor-hook step 2 / 2b, tierc-v2; shadow).
+"""Conductor-side Tier-C Decider hook (T-decider-conductor-hook step 2 / 2b / 2c, tierc-v2; shadow).
 
 Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its rule-based routing
 (``_route``) has decided the turn. What it does:
 
-0. **entry check** (:func:`is_tierc_entry`): only a turn whose rule stop is ``HUMAN``, whose
-   author wrote ``NEXT: human`` themself, and whose author's roster role is one of
-   :data:`TIERC_ENTRY_ROLES` — ``proposer`` / ``implementer`` / ``naysayer`` (T-decider-tierc-v2
-   msg-4360 / msg-4382, widening msg-4203 DECIDED 2b-3's ``proposer`` only). Any other turn
-   returns at once — no gate, no Lexora call, no log line;
+0. **entry check** (msg-4237 DECIDED 2c-1, :func:`is_tierc_entry`): only a turn whose author
+   wrote ``NEXT: human`` themself and whose roster role is in :data:`TIERC_ENTRY_ROLES` —
+   ``proposer`` / ``implementer`` / ``naysayer`` (T-decider-tierc-v2 msg-4360 / msg-4382,
+   widening 2c-1's ``proposer`` only; the caller has already resolved the handoff to
+   ``HUMAN``). The rule stop is **not** part of the entry: an escalation that ``_route`` turned
+   into a forced naysayer consult (``stop=None``) is evaluated too. Any other turn returns at
+   once — no gate, no Lexora call, no log line;
+   ``routed`` (msg-4239 DECIDED 2c-1 revised, :func:`routed_from_route`) then records what
+   ``_route`` actually did with the turn — ``stop`` / ``forced_naysayer`` / ``spawn_blocked``
+   (msg-4280 DECIDED 2c-4) — read from its return values, never inferred. Each value requires
+   the **whole** combination of ``stop`` / ``is_forced`` / ``target_role`` / ``spawn_blocked``
+   that names it; any other combination (unreachable today) is a
+   :class:`RoutingInvariantError`, logged at ERROR with no row (see below);
 1. run the admission gate **compute-only** (msg-4200 DECIDED 2b-1 / 2b-2,
    :func:`compute_gate_result`): ``retry_lookup`` always ``False``, the decision's log entries
    discarded (nothing is written to the decisions log), a gate exception → ``gate_result=None``;
@@ -20,10 +28,20 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
    msg-4196 DECIDED 2 "empty-``outcome`` line" no longer exists. (A v1-configured Decider still
    skips such a turn; ``evaluate`` then returns ``None`` and no line is written.)
 4. ``log_decision(...)`` — every outcome, with ``decision_id`` / ``outcome``, the gate columns
-   ``gate_kind`` / ``gate_is_grey_zone``, the rule ``stop``, and (v2) ``matched_rule`` /
-   ``matched_rule_source`` / ``rules_sha256`` on the same line;
-5. the acting branch is gated on ``dr.actionable_verdict`` only (msg-4184) and on a mode of
-   ``annotate`` / ``bounce`` — which is refused at build time, so in shadow it never runs.
+   ``gate_kind`` / ``gate_is_grey_zone``, the rule ``stop``, ``routed`` and (v2)
+   ``matched_rule`` / ``matched_rule_source`` / ``rules_sha256`` on the same line;
+5. the acting branch is gated on ``routed == "stop"`` (msg-4237 DECIDED 2c-2), on
+   ``dr.actionable_verdict`` only (msg-4184) and on a mode of ``annotate`` / ``bounce`` — which is
+   refused at build time, so in shadow it never runs. ``forced_naysayer`` and ``spawn_blocked``
+   rows are record-only in every mode.
+
+**Fail loud, not fail open (Einstein msg-4240 advisory; PR-gate observation on #348).** A routing
+combination the mapping does not name raises :class:`RoutingInvariantError` (an
+``AssertionError``) instead of being labelled. It is caught at this module's boundary and logged
+at ERROR with the traceback, and **no** ``decider_decision`` row is written and Lexora is not
+called — the telemetry never carries a meaningless label. It is not re-raised into the Conductor
+loop: D20 forbids the observer from changing the routing, and an escaping exception would stop
+the thread.
 
 **Monotonicity (D20).** Nothing here returns a new stop, and the gate's admit / bounce is never
 used for stop, notification or routing — only as Decider input and a log column. The hook returns
@@ -175,6 +193,7 @@ def log_decision(
     thread_id: str,
     round_index: int,
     stop: str | None,
+    routed: str,
     dr: DecisionResult,
     gate_result: AdmissionGateResult | None,
 ) -> dict[str, Any]:
@@ -186,11 +205,15 @@ def log_decision(
     ``gate_kind`` / ``gate_is_grey_zone`` (msg-4196 DECIDED 2) are ``None`` when the admission
     gate did not run. The msg-4196 DECIDED 2 "targeted but not called" line (``dr=None``) is
     gone with tierc-v2 (msg-4380 Δ2): a targeted turn is always called.
+
+    ``routed`` (msg-4237 DECIDED 2c-3) is a record-level column like ``stop`` — it is not a
+    ``decision_result_to_dict`` key.
     """
     record: dict[str, Any] = {
         "thread_id": thread_id,
         "round_index": round_index,
         "stop": stop,
+        "routed": routed,
         "gate_kind": (
             gate_result.kind.value
             if gate_result is not None and gate_result.kind is not None
@@ -204,15 +227,33 @@ def log_decision(
 
 
 _STOP_HUMAN = "human"
-"""``StopReason.HUMAN.value`` — the rule stop the Tier-C hook enters on (msg-4203). Spelled as
-the string because the Conductor passes ``stop_reason.value`` and ``conductor.core`` imports this
-module (importing ``StopReason`` back would be circular)."""
+"""``StopReason.HUMAN.value``. Spelled as the string because the Conductor passes
+``stop_reason.value`` and ``conductor.core`` imports this module (importing ``StopReason`` back
+would be circular)."""
+
+ROUTED_STOP = "stop"
+"""``_route`` stopped the turn at the human (``original_stop == HUMAN``)."""
+ROUTED_FORCED_NAYSAYER = "forced_naysayer"
+"""``_route`` sent the turn to a forced naysayer consult (``is_forced`` and target = naysayer)."""
+ROUTED_SPAWN_BLOCKED = "spawn_blocked"
+"""``_route`` stopped the turn on its ``_spawn_blocked`` branch (msg-4280 DECIDED 2c-4): the stop
+is ``HUMAN`` but it is a routing dead end, not a proposal stopped at the human — record-only in
+every mode. There is no ``StopReason.SPAWN_BLOCKED``; the fact comes from ``_route``'s own
+``spawn_blocked`` return value (msg-4278 / msg-4280)."""
+
 
 TIERC_ENTRY_ROLES: frozenset[Role] = frozenset({Role.PROPOSER, Role.IMPLEMENTER, Role.NAYSAYER})
 """Roster roles whose ``NEXT: human`` enters the Tier-C hook — Takahito's "三者" (Bohr /
 Heisenberg / Einstein), msg-4360 decision 1 as fixed by msg-4382 (Einstein msg-4381 Objection 1:
 existing ``Role`` members only). Today this is every ``Role``; a test pins that, so adding a role
 forces an explicit decision here."""
+
+
+class RoutingInvariantError(AssertionError):
+    """``_route`` returned a combination for an entered ``NEXT: human`` that no ``routed`` value
+    names. Unreachable today (``_human_terminal`` / ``_spawn_blocked`` are the only exits for a
+    ``HUMAN`` handoff, and each maps to a named value); raised so a new ``_route`` branch fails
+    loudly instead of being labelled."""
 
 
 def _roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
@@ -231,17 +272,15 @@ def _roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
 
 def is_tierc_entry(
     *,
-    original_stop: str | None,
     author_wrote_next_human: bool,
     author_role: Role | None,
 ) -> bool:
-    """The Tier-C hook's entry condition (msg-4203 DECIDED 2b-3 revised; roles widened by
-    T-decider-tierc-v2 msg-4360 / msg-4382).
+    """The Tier-C hook's entry condition (msg-4237 DECIDED 2c-1; endorsed msg-4238 / msg-4240;
+    roles widened by T-decider-tierc-v2 msg-4360 / msg-4382).
 
-    All three must hold:
+    Called only for a head the Conductor resolved to ``HandoffKind.HUMAN`` (``_decider_hook``
+    returns earlier for any other kind). Both must hold:
 
-    * ``original_stop == HUMAN`` — the rule-stop snapshot (design §3.3.b / D21), replacing
-      msg-4184's ``stop is None`` (kept by msg-4360);
     * the author wrote ``NEXT: human`` themself — a field/body mismatch that resolved to HUMAN is
       a conductor safety valve, not someone asking the human (kept by msg-4360);
     * the author's roster role is in :data:`TIERC_ENTRY_ROLES` (``proposer`` / ``implementer`` /
@@ -251,15 +290,50 @@ def is_tierc_entry(
       merges are escalated when the PR is opened (msg-4361). The naysayer's own in-thread
       ``NEXT: human`` does enter.
 
+    The rule stop is deliberately **not** a condition (it was in 2b, msg-4203): a proposer's
+    ``NEXT: human`` in a segment with no naysayer message yet is routed to a forced consult with
+    ``stop=None``, and requiring ``HUMAN`` hid exactly that first escalation from the Decider
+    (Einstein msg-4236). What ``_route`` did is recorded as ``routed`` instead.
+
     Checked at the hook's entry, before anything else: a non-target turn gets no admission-gate
-    computation, no Lexora call and no ``decider_decision`` line — in shadow and active alike, so
-    what shadow measures is what active will act on.
+    computation, no Lexora call and no ``decider_decision`` line — in shadow and active alike.
     """
-    return (
-        original_stop == _STOP_HUMAN
-        and author_wrote_next_human
-        and author_role is not None
-        and author_role in TIERC_ENTRY_ROLES
+    return author_wrote_next_human and author_role is not None and author_role in TIERC_ENTRY_ROLES
+
+
+def routed_from_route(
+    *,
+    stop: str | None,
+    is_forced: bool,
+    target_role: Role | None,
+    spawn_blocked: bool,
+    naysayer_role: Role,
+) -> str:
+    """``routed`` from ``_route``'s own return values (msg-4239 DECIDED 2c-1 revised).
+
+    Read, not inferred, and exhaustive over the combination — no field short-circuits the others
+    (PR-gate observation on #348):
+
+    * ``stop`` — rule stop ``HUMAN`` **and** not forced **and** no dispatch target **and** not
+      ``spawn_blocked``;
+    * ``spawn_blocked`` — the same combination with ``spawn_blocked`` (msg-4280 DECIDED 2c-4);
+    * ``forced_naysayer`` — no rule stop **and** ``is_forced`` **and** target = naysayer role
+      **and** not ``spawn_blocked`` (``_route`` checks spawnability before every other branch,
+      so both at once is a broken invariant).
+
+    Anything else — e.g. ``stop=HUMAN`` together with ``is_forced`` (mutually exclusive by
+    definition) — raises :class:`RoutingInvariantError` (Einstein msg-4240 advisory: fail loudly
+    rather than record an ``other`` label).
+    """
+    if stop == _STOP_HUMAN and not is_forced and target_role is None:
+        return ROUTED_SPAWN_BLOCKED if spawn_blocked else ROUTED_STOP
+    if stop is None and is_forced and target_role is naysayer_role and not spawn_blocked:
+        return ROUTED_FORCED_NAYSAYER
+    raise RoutingInvariantError(
+        f"decider routing invariant broken: stop={stop} is_forced={is_forced} "
+        f"spawn_blocked={spawn_blocked} "
+        f"target={target_role.value if target_role is not None else None}"
+        " — _route に HUMAN 用の新しい分岐がないか確認"
     )
 
 
@@ -347,20 +421,39 @@ async def run_tierc_hook(
     roster: Mapping[str, Role],
     messages: Sequence[ThreadMessage],
     stop: str | None,
+    is_forced: bool,
+    target_role: Role | None,
+    spawn_blocked: bool,
+    naysayer_role: Role,
     author_wrote_next_human: bool,
     now: datetime | None = None,
 ) -> DecisionResult | None:
-    """Entry check → admission gate (compute-only) → evaluate + log. Never changes ``stop``.
+    """Entry check → admission gate (compute-only) → evaluate + log. Never changes the routing.
 
-    ``stop`` is the rule-stop snapshot (``original_stop``, D21): read for the entry condition and
-    written to the log line, never modified. ``now`` defaults to the wall clock.
+    ``stop`` / ``is_forced`` / ``target_role`` / ``spawn_blocked`` are ``_route``'s return values
+    for this turn
+    (``stop`` is the rule-stop snapshot, D21). They are read to derive ``routed``; ``stop`` and
+    ``routed`` are written to the log line. None of them is modified. ``now`` defaults to the
+    wall clock.
     """
     head = messages[-1] if messages else None
     if head is None or not is_tierc_entry(
-        original_stop=stop,
         author_wrote_next_human=author_wrote_next_human,
         author_role=_roster_role(roster, head.author),
     ):
+        return None
+    try:
+        routed = routed_from_route(
+            stop=stop,
+            is_forced=is_forced,
+            target_role=target_role,
+            spawn_blocked=spawn_blocked,
+            naysayer_role=naysayer_role,
+        )
+    except RoutingInvariantError:
+        # Fail loud (ERROR + traceback), write no row, call nothing. Not re-raised: the hook must
+        # never affect the routing (D20), and an escaping exception would stop the Conductor loop.
+        logger.error("decider routing invariant broken; no decider_decision row", exc_info=True)
         return None
     try:
         gate_result = compute_gate_result(
@@ -394,18 +487,21 @@ async def run_tierc_hook(
         thread_id=thread_id,
         round_index=round_index,
         stop=stop,
+        routed=routed,
         dr=dr,
         gate_result=state.gate_result,
     )
 
-    # msg-4184 §2: acting code reads ``actionable_verdict`` only. The entry check above already
-    # guarantees ``original_stop == HUMAN`` (msg-4203 DECIDED 2b-3, replacing msg-4184's
-    # ``stop is None``). annotate / bounce are refused at build time, so under shadow this branch
-    # is structurally dead; the shape is fixed here so later steps start from it. Before bounce is
+    # msg-4184 §2: acting code reads ``actionable_verdict`` only. msg-4237 DECIDED 2c-2: only a
+    # turn ``_route`` stopped at the human (``routed == "stop"``) may be acted on; a forced
+    # consult row, and a spawn-blocked dead end (msg-4280 DECIDED 2c-4), is record-only in every
+    # mode (acting before the forced consult is a
+    # separate Takahito decision, like ``skip_naysayer_when_confirmed``). annotate / bounce are
+    # refused at build time, so under shadow this branch is structurally dead. Before bounce is
     # enabled on tierc-v2 its entry condition must be redefined (v2 has no ``fired_reason``,
     # msg-4380 Δ4).
     av = dr.actionable_verdict
-    if decider.tierc_mode in ACTING_TIERC_MODES and av is not None:
+    if routed == ROUTED_STOP and decider.tierc_mode in ACTING_TIERC_MODES and av is not None:
         logger.warning(
             "decider tierc mode %r has no acting implementation yet; verdict %s not acted on",
             decider.tierc_mode,
@@ -417,8 +513,12 @@ async def run_tierc_hook(
 __all__ = [
     "BODY_HEAD_M",
     "RECENT_EVENTS_N",
+    "ROUTED_FORCED_NAYSAYER",
+    "ROUTED_SPAWN_BLOCKED",
+    "ROUTED_STOP",
     "TIERC_ENTRY_ROLES",
     "Decider",
+    "RoutingInvariantError",
     "ThreadMessage",
     "compute_gate_result",
     "count_dispute_rounds",
@@ -426,6 +526,7 @@ __all__ = [
     "is_tierc_entry",
     "log_decision",
     "never_retry",
+    "routed_from_route",
     "run_tierc_hook",
     "turn_from_messages",
 ]

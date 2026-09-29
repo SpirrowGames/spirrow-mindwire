@@ -1,0 +1,17 @@
+```jsonl
+{"thread_id": "T-dashboard-panels-do-not-name-the-project", "round_index": 20, "label": "genuine-action", "category": "HUMAN_ONLY_ACTION", "rationale": "The agent lacks permission to close the thread because the human is the owner, requiring human intervention."}
+{"thread_id": "T-not-waiting-conclair-contract-assumptions", "round_index": 9, "label": "genuine-action", "category": "HUMAN_ONLY_ACTION", "rationale": "The agent lacks the necessary permissions to close the thread since the human is the owner."}
+{"thread_id": "T-integrity-flags-sanctioned-force-close", "round_index": 23, "label": "ambiguous", "category": "OTHER", "rationale": "The message explicitly hands off to Heisenberg rather than a human."}
+{"thread_id": "T-duration-slack-underestimates-the-tick", "round_index": 7, "label": "ambiguous", "category": "OTHER", "rationale": "insufficient-context: the message is truncated and the reason for the handoff cannot be determined."}
+{"thread_id": "T-duration-slack-underestimates-the-tick", "round_index": 9, "label": "ambiguous", "category": "OTHER", "rationale": "insufficient-context: the message is truncated and the reason for the handoff cannot be determined."}
+{"thread_id": "T-streaming-ledger-row", "round_index": 8, "label": "ambiguous", "category": "OTHER", "rationale": "insufficient-context: the message is truncated and the reason for the handoff cannot be determined."}
+{"thread_id": "T-streaming-ledger-row", "round_index": 10, "label": "ambiguous", "category": "OTHER", "rationale": "insufficient-context: the message is truncated and the reason for the handoff cannot be determined."}
+{"thread_id": "T-streaming-ledger-row", "round_index": 12, "label": "ambiguous", "category": "OTHER", "rationale": "insufficient-context: the message is truncated and the reason for the handoff cannot be determined."}
+{"thread_id": "T-streaming-ledger-row", "round_index": 14, "label": "ambiguous", "category": "OTHER", "rationale": "insufficient-context: the message is truncated and the reason for the handoff cannot be determined."}
+{"thread_id": "T-adr12-step3-embodiment-column-removal", "round_index": 10, "label": "genuine-merge", "category": "MERGE", "rationale": "The loop needed human approval to merge the PR into the protected main branch and restart the service."}
+{"thread_id": "T-conclair-double-close-race-no-row-lock", "round_index": 12, "label": "ambiguous", "category": "OTHER", "rationale": "insufficient-context: the message is truncated and the reason for the handoff cannot be determined."}
+{"thread_id": "T-row-lock-decision-read-under-lock-unpinned", "round_index": 6, "label": "ambiguous", "category": "OTHER", "rationale": "The message explicitly hands off to Einstein rather than a human."}
+{"thread_id": "T-gate-firing-ignores-loop-state-and-prior-verdicts", "round_index": 12, "label": "ambiguous", "category": "OTHER", "rationale": "The message explicitly hands off to Einstein rather than a human."}
+{"thread_id": "T-gate-firing-ignores-loop-state-and-prior-verdicts", "round_index": 14, "label": "spurious", "category": "HUMAN_ONLY_ACTION", "rationale": "The agent requested the human to provision a new session, but the existing configuration already handled this context autonomously."}
+{"thread_id": "T-adr-index-omits-chatroom-body-locator", "round_index": 5, "label": "ambiguous", "category": "OTHER", "rationale": "The message explicitly hands off to Heisenberg rather than a human."}
+```

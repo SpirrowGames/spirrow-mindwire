@@ -1,0 +1,17 @@
+```jsonl
+{"thread_id": "T-model-alias-leak", "round_index": 2, "label": "spurious", "category": "IMPL", "rationale": "Agent provided code review feedback which was resolved by another agent without human input."}
+{"thread_id": "T-human-outage-degrade-close-only", "round_index": 0, "label": "genuine", "category": "GOAL", "rationale": "Agent correctly escalated a policy decision regarding proxy post capabilities and authority boundaries to the human product owner."}
+{"thread_id": "T-duration-slack-derivation", "round_index": 3, "label": "spurious", "category": "IMPL", "rationale": "Agent provided code corrections and implementation instructions that were carried out by another agent."}
+{"thread_id": "T-duration-slack-derivation", "round_index": 6, "label": "spurious", "category": "IMPL", "rationale": "Agent updated a rule and provided implementation instructions that another agent handled autonomously."}
+{"thread_id": "T-duration-slack-derivation", "round_index": 8, "label": "spurious", "category": "IMPL", "rationale": "Agent requested branch deletion and code adjustments which were executed by another agent."}
+{"thread_id": "T-duration-slack-derivation", "round_index": 10, "label": "spurious", "category": "IMPL", "rationale": "Agent provided final review feedback and rule withdrawals that were processed by another agent."}
+{"thread_id": "T-streaming-ledger-row", "round_index": 2, "label": "spurious", "category": "IMPL", "rationale": "Agent provided PR review feedback requiring a test addition that was implemented by another agent."}
+{"thread_id": "T-checkpoint-silent-partial-write", "round_index": 10, "label": "spurious", "category": "IMPL", "rationale": "Agent adjudicated a PR gate objection and provided code instructions handled by another agent."}
+{"thread_id": "T-material-store-per-request-sync-io", "round_index": 5, "label": "spurious", "category": "IMPL", "rationale": "Agent provided implementation instructions directly to another agent without requiring human intervention."}
+{"thread_id": "T-integrity-flags-sanctioned-force-close", "round_index": 17, "label": "genuine-action", "category": "HUMAN_ONLY_ACTION", "rationale": "Agent requested deployment to a live server and workspace changes which required human operator permissions to resolve."}
+{"thread_id": "T-streaming-ledger-row", "round_index": 5, "label": "spurious", "category": "IMPL", "rationale": "Agent unparked a task and directed another agent to start implementation without human involvement."}
+{"thread_id": "T-duration-slack-underestimates-the-tick", "round_index": 3, "label": "spurious", "category": "IMPL", "rationale": "Agent directed another agent to start the next work item without human involvement."}
+{"thread_id": "T-duration-slack-underestimates-the-tick", "round_index": 4, "label": "spurious", "category": "IMPL", "rationale": "Agent provided a correction to base SHAs for another agent to use during implementation."}
+{"thread_id": "T-duration-slack-underestimates-the-tick", "round_index": 5, "label": "spurious", "category": "IMPL", "rationale": "Agent provided a typo correction to another agent before implementation proceeded."}
+{"thread_id": "T-adr-2026-05-29-series-has-no-locatable-body", "round_index": 0, "label": "spurious", "category": "IMPL", "rationale": "Agent escalated to request a missing document link but located the document itself in the next turn."}
+```

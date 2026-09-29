@@ -37,14 +37,16 @@ from spirrow_mindwire.adapters.decider_lexora import (
     build_decider,
     decide_once,
 )
-from spirrow_mindwire.conductor.core import Conductor, StopReason
+from spirrow_mindwire.conductor.core import Conductor, RouteDecision, StopReason
 from spirrow_mindwire.decider import hook as hook_mod
 from spirrow_mindwire.decider.hook import (
+    RoutingInvariantError,
     ThreadMessage,
     compute_gate_result,
     is_tierc_entry,
     log_decision,
     never_retry,
+    routed_from_route,
     run_tierc_hook,
     turn_from_messages,
 )
@@ -479,7 +481,9 @@ def test_log_decision_always_writes_id_and_outcome(
     dr: DecisionResult, caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        rec = log_decision(thread_id="T-x", round_index=3, stop="human", dr=dr, gate_result=GREY)
+        rec = log_decision(
+            thread_id="T-x", round_index=3, stop="human", routed="stop", dr=dr, gate_result=GREY
+        )
     assert rec["outcome"] == dr.outcome.value
     assert rec["gate_kind"] == "ADMIT_UNSURE" and rec["gate_is_grey_zone"] is True
     assert "decision_id" in rec and rec["decision_id"] == dr.decision_id
@@ -493,7 +497,7 @@ def test_log_decision_gate_columns_for_labelled_admit() -> None:
     """msg-4196 DECIDED 2: ``gate_kind`` may be ``None`` even when the gate ran."""
     dr = _dr(DecisionOutcome.EVALUATED, _v(TierCScope.OUT_OF_GATE))
     rec = log_decision(
-        thread_id="T", round_index=1, stop="human", dr=dr, gate_result=ADMIT_LABELLED
+        thread_id="T", round_index=1, stop="human", routed="stop", dr=dr, gate_result=ADMIT_LABELLED
     )
     assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is False
 
@@ -505,6 +509,7 @@ def test_log_decision_gate_columns_none_when_gate_did_not_run() -> None:
         thread_id="T",
         round_index=1,
         stop="human",
+        routed="stop",
         dr=_dr(DecisionOutcome.NO_VERDICT_NULL, None),
         gate_result=None,
     )
@@ -544,6 +549,9 @@ async def _hook(
     *,
     messages: list[ThreadMessage] | None = None,
     stop: str | None = "human",
+    is_forced: bool = False,
+    target_role: Role | None = None,
+    spawn_blocked: bool = False,
     author_wrote_next_human: bool = True,
 ) -> DecisionResult | None:
     return await run_tierc_hook(
@@ -553,6 +561,10 @@ async def _hook(
         roster=ROSTER,
         messages=_msgs() if messages is None else messages,
         stop=stop,
+        is_forced=is_forced,
+        target_role=target_role,
+        spawn_blocked=spawn_blocked,
+        naysayer_role=Role.NAYSAYER,
         author_wrote_next_human=author_wrote_next_human,
         now=NOW,
     )
@@ -587,27 +599,96 @@ def test_turn_from_messages_shape() -> None:
 
 
 @pytest.mark.parametrize(
-    ("original_stop", "wrote", "role", "expected"),
+    ("wrote", "role", "expected"),
     [
-        ("human", True, Role.PROPOSER, True),
-        (None, True, Role.PROPOSER, False),  # forced naysayer consult: no rule stop yet
-        ("settled", True, Role.PROPOSER, False),
-        ("human", False, Role.PROPOSER, False),  # field/body mismatch safety valve
-        ("human", True, Role.IMPLEMENTER, True),  # tierc-v2 msg-4360 / msg-4382
-        ("human", True, Role.NAYSAYER, True),  # tierc-v2 msg-4360 / msg-4382
-        (None, True, Role.IMPLEMENTER, False),
-        ("human", False, Role.NAYSAYER, False),
-        ("human", True, None, False),  # off-roster author (pr-gate-relay): notification, msg-4361
+        (True, Role.PROPOSER, True),
+        (False, Role.PROPOSER, False),  # field/body mismatch safety valve
+        (True, Role.IMPLEMENTER, True),  # tierc-v2 msg-4360 / msg-4382
+        (True, Role.NAYSAYER, True),  # tierc-v2 msg-4360 / msg-4382
+        (False, Role.NAYSAYER, False),
+        (True, None, False),  # off-roster author (pr-gate-relay): notification, msg-4361
     ],
 )
-def test_is_tierc_entry(
-    original_stop: str | None, wrote: bool, role: Role | None, expected: bool
+def test_is_tierc_entry(wrote: bool, role: Role | None, expected: bool) -> None:
+    """msg-4237 DECIDED 2c-1, roles widened by tierc-v2 (msg-4360 / msg-4382): author-written
+    ``NEXT: human`` + proposer / implementer / naysayer; the rule stop is not part of the entry
+    (it is recorded as ``routed``)."""
+    assert is_tierc_entry(author_wrote_next_human=wrote, author_role=role) is expected
+
+
+@pytest.mark.parametrize(
+    ("stop", "is_forced", "target", "blocked", "expected"),
+    [
+        ("human", False, None, False, "stop"),
+        ("human", False, None, True, "spawn_blocked"),  # msg-4280 DECIDED 2c-4
+        (None, True, Role.NAYSAYER, False, "forced_naysayer"),
+    ],
+)
+def test_routed_from_route(
+    stop: str | None, is_forced: bool, target: Role | None, blocked: bool, expected: str
 ) -> None:
-    """msg-4203 DECIDED 2b-3 (revised), roles widened by tierc-v2: all three conditions."""
-    assert (
-        is_tierc_entry(original_stop=original_stop, author_wrote_next_human=wrote, author_role=role)
-        is expected
+    """msg-4239 DECIDED 2c-1 (revised) / msg-4280 2c-4: read from ``_route``'s outputs."""
+    got = routed_from_route(
+        stop=stop,
+        is_forced=is_forced,
+        target_role=target,
+        spawn_blocked=blocked,
+        naysayer_role=Role.NAYSAYER,
     )
+    assert got == expected
+
+
+@pytest.mark.parametrize(
+    ("stop", "is_forced", "target", "blocked"),
+    [
+        # Test 16 (msg-4278 / msg-4280): ``spawn_blocked`` together with a forced consult.
+        ("human", True, None, True),
+        (None, True, Role.NAYSAYER, True),
+    ],
+)
+def test_routed_from_route_spawn_blocked_with_forced_raises(
+    stop: str | None, is_forced: bool, target: Role | None, blocked: bool
+) -> None:
+    """Test 16: ``_route`` checks spawnability before every other branch, so ``spawn_blocked``
+    never co-occurs with a forced consult — if it does, the invariant is broken."""
+    with pytest.raises(RoutingInvariantError):
+        routed_from_route(
+            stop=stop,
+            is_forced=is_forced,
+            target_role=target,
+            spawn_blocked=blocked,
+            naysayer_role=Role.NAYSAYER,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stop", "is_forced", "target"),
+    [
+        # PR-gate observation on #348: ``stop=HUMAN`` does not short-circuit the other fields.
+        ("human", True, None),
+        ("human", True, Role.NAYSAYER),
+        ("human", False, Role.NAYSAYER),
+        # Einstein msg-4240 advisory: formerly labelled ``other`` — now a hard invariant error.
+        (None, False, Role.IMPLEMENTER),
+        (None, True, Role.IMPLEMENTER),  # forced, but not to the naysayer role
+        (None, False, Role.NAYSAYER),  # naysayer target, but not forced
+        ("settled", False, None),
+    ],
+)
+def test_routed_from_route_unnamed_combination_raises(
+    stop: str | None, is_forced: bool, target: Role | None
+) -> None:
+    """Every combination outside the two named ones raises ``RoutingInvariantError`` (an
+    ``AssertionError``) — no ``other`` label exists."""
+    with pytest.raises(RoutingInvariantError) as ei:
+        routed_from_route(
+            stop=stop,
+            is_forced=is_forced,
+            target_role=target,
+            spawn_blocked=False,
+            naysayer_role=Role.NAYSAYER,
+        )
+    assert isinstance(ei.value, AssertionError)
 
 
 @pytest.mark.parametrize(
@@ -760,20 +841,68 @@ async def test_hook_off_roster_human_is_not_entered(
     assert _decider_lines(caplog) == []
 
 
-@pytest.mark.parametrize(
-    ("stop", "wrote"),
-    [(None, True), ("settled", True), ("human", False)],
-)
 @pytest.mark.anyio
-async def test_hook_proposer_without_human_stop_or_own_handoff_is_not_entered(
-    stop: str | None, wrote: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_hook_proposer_mismatch_human_is_not_entered(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """A field/body mismatch that resolved to HUMAN is not the proposer asking the human."""
     spy = _GateSpy(monkeypatch)
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        got = await _hook(stub, stop=stop, author_wrote_next_human=wrote)
+        got = await _hook(stub, author_wrote_next_human=False)
     assert got is None and spy.calls == 0 and stub.states == []
     assert _decider_lines(caplog) == []
+
+
+@pytest.mark.anyio
+async def test_hook_proposer_forced_consult_is_entered_and_record_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """msg-4237 2c-1 / 2c-2 at hook level: ``stop=None`` + forced to the naysayer is entered
+    (one ``routed=forced_naysayer`` line) and, even under annotate, the acting branch is not."""
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    stub.tierc_mode = "annotate"  # injected; build_decider refuses it
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        got = await _hook(stub, stop=None, is_forced=True, target_role=Role.NAYSAYER)
+    assert got is not None and len(stub.states) == 1
+    (line,) = _decider_lines(caplog)
+    assert line["routed"] == "forced_naysayer" and line["stop"] is None
+    assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("stop", "is_forced", "target"),
+    [
+        (None, False, Role.IMPLEMENTER),  # test 13 (msg-4239): the formerly-``other`` case
+        ("human", True, None),  # PR-gate observation on #348: stop=HUMAN *and* forced
+    ],
+)
+@pytest.mark.anyio
+async def test_hook_routing_invariant_fails_loud_without_row(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stop: str | None,
+    is_forced: bool,
+    target: Role | None,
+) -> None:
+    """Test 13 (revised per Einstein msg-4240 advisory + PR-gate on #348): a combination ``_route``
+    cannot produce today, passed straight in. The hook logs an ERROR carrying the
+    ``RoutingInvariantError`` traceback, writes **no** ``decider_decision`` row, runs no gate,
+    calls no Decider — and does not raise into the Conductor (D20)."""
+    spy = _GateSpy(monkeypatch)
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    stub.tierc_mode = "annotate"
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        got = await _hook(stub, stop=stop, is_forced=is_forced, target_role=target)
+    assert got is None
+    assert _decider_lines(caplog) == []
+    assert spy.calls == 0 and stub.states == []
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "decider routing invariant broken" in errors[0].getMessage()
+    assert errors[0].exc_info is not None
+    assert isinstance(errors[0].exc_info[1], RoutingInvariantError)
+    assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.anyio
@@ -817,6 +946,8 @@ async def test_hook_annotate_branch_entered_on_proposer_human_stop(
         got = await _hook(stub)
     assert got is not None
     assert any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
+    (line,) = _decider_lines(caplog)
+    assert line["routed"] == "stop"
 
 
 @pytest.mark.anyio
@@ -855,7 +986,12 @@ def test_hook_code_never_reads_raw_verdict() -> None:
 # --------------------------------------------------------------------------- Conductor wiring
 
 
-def _conductor_with(mcp: _FakeChatroomMcp, disp: _ScriptedDispatcher, dec: Any) -> Conductor:
+def _conductor_with(
+    mcp: _FakeChatroomMcp,
+    disp: _ScriptedDispatcher,
+    dec: Any,
+    identity_embodiment: dict[str, str] | None = None,
+) -> Conductor:
     return Conductor(
         mcp=mcp,
         dispatcher=disp,
@@ -863,6 +999,7 @@ def _conductor_with(mcp: _FakeChatroomMcp, disp: _ScriptedDispatcher, dec: Any) 
         roster=ROSTER,
         naysayer_identity="Einstein",
         decider=dec,
+        identity_embodiment=identity_embodiment,
     )
 
 
@@ -874,6 +1011,7 @@ async def _run(
     *,
     seed: tuple[str, str] = ("Bohr", "design\n\nNEXT: Einstein"),
     replies: dict[Role, list[str]] | None = None,
+    identity_embodiment: dict[str, str] | None = None,
 ) -> tuple[Any, _ScriptedDispatcher, _FakeChatroomMcp]:
     """Default: Bohr → Einstein critique → Bohr ``NEXT: human`` (naysayer already consulted, so
     the rule stop is HUMAN on the proposer's own head)."""
@@ -885,7 +1023,7 @@ async def _run(
             Role.PROPOSER: [_PROPOSER_HUMAN],
         }
     disp = _ScriptedDispatcher(mcp, replies)
-    outcome = await _conductor_with(mcp, disp, dec).run()
+    outcome = await _conductor_with(mcp, disp, dec, identity_embodiment).run()
     return outcome, disp, mcp
 
 
@@ -928,6 +1066,32 @@ async def test_conductor_does_not_call_decider_on_non_human_heads() -> None:
     assert stub.states == []
 
 
+@pytest.mark.parametrize(
+    "seed_body",
+    [
+        "design\n\nNEXT: Heisenberg",  # proposer → implementer (guard (i) path)
+        "design\n\nNEXT: Einstein",  # proposer → naysayer
+        "done\n\nNEXT: none",
+    ],
+)
+@pytest.mark.anyio
+async def test_conductor_proposer_non_human_handoff_never_reaches_routed_mapping(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, seed_body: str
+) -> None:
+    """PR-gate REQUEST_CHANGES on #348 @ 592024f: a proposer's valid non-human handoff has
+    ``mismatch_reason is None`` (so ``author_wrote_next_human=True``) and would raise
+    ``RoutingInvariantError`` if it reached ``routed_from_route``. ``_decider_hook`` returns on
+    ``handoff.kind is not HUMAN`` first, so the seed head gets no ERROR, no gate, no row."""
+    spy = _GateSpy(monkeypatch)
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    replies = {role: [_attested("ok\n\nNEXT: none")] for role in Role}
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        await _run(stub, seed=("Bohr", seed_body), replies=replies)
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert spy.calls == 0 and stub.states == []
+    assert _decider_lines(caplog) == []
+
+
 @pytest.mark.anyio
 async def test_conductor_naysayer_exit_human_is_evaluated_and_stop_unchanged(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -950,14 +1114,41 @@ async def test_conductor_naysayer_exit_human_is_evaluated_and_stop_unchanged(
 
 
 @pytest.mark.anyio
-async def test_conductor_forced_naysayer_escalation_leaves_one_proposer_line(
+async def test_conductor_forced_consult_ended_by_naysayer_leaves_forced_and_naysayer_lines(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Test 10 (msg-4203): Bohr ``NEXT: human`` → forced Einstein consult (no rule stop yet, not
-    entered) → Bohr ``NEXT: human`` again → HUMAN stop → exactly one line, for the proposer."""
+    """Test 10 (msg-4237, replaced): Bohr ``NEXT: human`` in a segment with no naysayer message:
+    forced Einstein consult, one ``routed=forced_naysayer`` line (no acting branch). Einstein
+    ends it with ``NEXT: human`` — since tierc-v2 (msg-4360 / msg-4382) the naysayer's own
+    ``NEXT: human`` enters too, so a second, ``routed=stop`` line follows (total 2)."""
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.OUT_OF_GATE)))
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
         outcome, disp, _ = await _run(
+            stub,
+            seed=("Bohr", "design\n\nNEXT: human"),
+            replies={Role.NAYSAYER: [_attested("VERDICT: APPROVE\n\nNEXT: human")]},
+        )
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches[0] == (Role.NAYSAYER, "m1")
+    assert outcome.forced_naysayer_turns == 1
+    assert len(stub.states) == 2
+    assert stub.states[0].recent_events[0].author == "Bohr"
+    assert stub.states[1].recent_events[0].author == "Einstein"
+    lines = _decider_lines(caplog)
+    assert [ln["routed"] for ln in lines] == ["forced_naysayer", "stop"]
+    assert [ln["stop"] for ln in lines] == [None, "human"]
+    assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_conductor_forced_consult_then_second_escalation_leaves_two_lines(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test 11 (msg-4237): 10, but Einstein returns ``NEXT: Bohr`` and Bohr escalates again:
+    a second, ``routed=stop`` line (two separate decision points, not a duplicate)."""
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.OUT_OF_GATE)))
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        outcome, _, _ = await _run(
             stub,
             seed=("Bohr", "design\n\nNEXT: human"),
             replies={
@@ -966,13 +1157,63 @@ async def test_conductor_forced_naysayer_escalation_leaves_one_proposer_line(
             },
         )
     assert outcome.stop_reason is StopReason.HUMAN
-    # the forced consult did happen, on the proposer's first NEXT: human (m1)
-    assert disp.dispatches[0] == (Role.NAYSAYER, "m1")
-    assert outcome.forced_naysayer_turns == 1
-    assert len(stub.states) == 1
-    assert stub.states[0].recent_events[0].author == "Bohr"  # newest first: the proposer's head
-    (line,) = _decider_lines(caplog)
-    assert line["stop"] == "human"
+    assert len(stub.states) == 2
+    lines = _decider_lines(caplog)
+    assert [ln["routed"] for ln in lines] == ["forced_naysayer", "stop"]
+    assert [ln["stop"] for ln in lines] == [None, "human"]
+
+
+@pytest.mark.anyio
+async def test_conductor_forced_line_under_annotate_changes_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test 12 (msg-4237): a ``routed=forced_naysayer`` row changes neither the stop nor any
+    post / dispatch even with tierc mode ``annotate`` (injected; build_decider refuses it).
+    Since tierc-v2 the naysayer's closing ``NEXT: human`` adds a ``routed=stop`` row; only that
+    row reaches the (unbuilt) acting branch, and it changes nothing either."""
+    seed = ("Bohr", "design\n\nNEXT: human")
+
+    def replies() -> dict[Role, list[str]]:
+        return {Role.NAYSAYER: [_attested("VERDICT: APPROVE\n\nNEXT: human")]}
+
+    baseline, bdisp, bmcp = await _run(None, seed=seed, replies=replies())
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    stub.tierc_mode = "annotate"
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        outcome, disp, mcp = await _run(stub, seed=seed, replies=replies())
+    assert outcome == baseline
+    assert disp.dispatches == bdisp.dispatches
+    assert mcp.posts == bmcp.posts
+    assert [ln["routed"] for ln in _decider_lines(caplog)] == ["forced_naysayer", "stop"]
+    acting = [r for r in caplog.records if "has no acting implementation yet" in r.getMessage()]
+    assert len(acting) == 1  # the routed=stop row only; the forced row never acts
+
+
+@pytest.mark.anyio
+async def test_conductor_round_cap_turn_never_reaches_the_hook(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test 14 (msg-4239): the head left when the loop exits on ``ROUND_CAP`` is never routed,
+    so a proposer ``NEXT: human`` there gets no hook call and no line."""
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Einstein", content=_attested("critique\n\nNEXT: Bohr"))
+    disp = _ScriptedDispatcher(mcp, {Role.PROPOSER: [_PROPOSER_HUMAN]})
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    conductor = Conductor(
+        mcp=mcp,
+        dispatcher=disp,
+        thread_ref=_thread_ref(),
+        roster=ROSTER,
+        naysayer_identity="Einstein",
+        decider=stub,
+        max_rounds=1,
+    )
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        outcome = await conductor.run()
+    assert outcome.stop_reason is StopReason.ROUND_CAP
+    assert disp.dispatches == [(Role.PROPOSER, "m1")]  # Bohr did post NEXT: human after this
+    assert stub.states == []
+    assert _decider_lines(caplog) == []
 
 
 @pytest.mark.anyio
@@ -996,6 +1237,177 @@ async def test_conductor_never_writes_the_decisions_log(
     assert writes == []
     assert list(tmp_path.iterdir()) == []
     assert len(c.bodies) == 1  # test 1 at Conductor level: one HTTP call
+
+
+_HUMAN_UNSPAWNABLE = {"human": "web_ai_chat"}
+"""An embodiment table that (mis)configures ``human`` as a non-spawnable embodiment — the only way a
+proposer's ``NEXT: human`` reaches ``_route``'s ``_spawn_blocked`` branch (msg-4278)."""
+
+
+@pytest.mark.anyio
+async def test_conductor_spawn_blocked_human_leaves_one_spawn_blocked_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test 15 (msg-4280, revised): ``human`` configured as non-spawnable, Bohr ``NEXT: human``:
+    one ``routed=spawn_blocked`` row, no forced consult / saveable count added, no ERROR, and —
+    under an injected annotate — the acting branch is not entered (record-only)."""
+    stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
+    stub.tierc_mode = "annotate"  # injected; build_decider refuses it
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        outcome, disp, _ = await _run(
+            stub,
+            seed=("Bohr", "design\n\nNEXT: human"),
+            replies={},
+            identity_embodiment=_HUMAN_UNSPAWNABLE,
+        )
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches == []
+    assert outcome.forced_naysayer_turns == 0
+    assert outcome.forced_naysayer_turns_saveable == 0
+    assert len(stub.states) == 1
+    (line,) = _decider_lines(caplog)
+    assert line["routed"] == "spawn_blocked" and line["stop"] == "human"
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert not any("has no acting implementation yet" in r.getMessage() for r in caplog.records)
+
+
+def _route_of(
+    *msgs: tuple[str, str], identity_embodiment: dict[str, str] | None = None
+) -> RouteDecision:
+    """``Conductor._route`` on a thread of ``(author, body)`` messages, the head resolved the way
+    ``run`` resolves it."""
+    from spirrow_mindwire.conductor.handoff import resolve_handoff
+
+    mcp = _FakeChatroomMcp()
+    conductor = _conductor_with(mcp, _ScriptedDispatcher(mcp, {}), None, identity_embodiment)
+    messages = [{"msg_id": f"m{i}", "author": a, "content": b} for i, (a, b) in enumerate(msgs, 1)]
+    handoff = resolve_handoff(msgs[-1][1], ROSTER)
+    return conductor._route(handoff, messages)
+
+
+@pytest.mark.parametrize(
+    ("msgs", "embodiment", "expected"),
+    [
+        # the spawn-blocked exit — the only True
+        (
+            (("Bohr", "d\n\nNEXT: human"),),
+            _HUMAN_UNSPAWNABLE,
+            RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=True,
+                stop_reason=StopReason.HUMAN,
+            ),
+        ),
+        # forced consult on an explicit NEXT: human (not saveable)
+        (
+            (("Bohr", "d\n\nNEXT: human"),),
+            None,
+            RouteDecision(
+                target_role=Role.NAYSAYER,
+                target_identity="Einstein",
+                is_forced=True,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=None,
+            ),
+        ),
+        # plain HUMAN stop after a naysayer consult
+        (
+            (("Einstein", _attested("c\n\nNEXT: Bohr")), ("Bohr", "d\n\nNEXT: human")),
+            None,
+            RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.HUMAN,
+            ),
+        ),
+        # guard (i) redirect → forced consult, saveable
+        (
+            (("Bohr", "d\n\nNEXT: Heisenberg"),),
+            None,
+            RouteDecision(
+                target_role=Role.NAYSAYER,
+                target_identity="Einstein",
+                is_forced=True,
+                is_saveable=True,
+                spawn_blocked=False,
+                stop_reason=None,
+            ),
+        ),
+        (
+            (("Bohr", "d\n\nNEXT: Bohr"),),
+            None,
+            RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.SELF_HANDOFF,
+            ),
+        ),
+        (
+            (("Bohr", "d\n\nNEXT: none"),),
+            None,
+            RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.SETTLED,
+            ),
+        ),
+        (
+            (("Einstein", _attested("no next line")),),
+            None,
+            RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.NO_HANDOFF,
+            ),
+        ),
+    ],
+)
+def test_route_spawn_blocked_true_only_on_spawn_blocked_exit(
+    msgs: tuple[tuple[str, str], ...],
+    embodiment: dict[str, str] | None,
+    expected: RouteDecision,
+) -> None:
+    """Test 17 (msg-4280, retyped per human msg-4285): ``_route``'s whole :class:`RouteDecision`,
+    field by field. ``spawn_blocked`` is ``True`` only on the ``_spawn_blocked`` exit; a wrong
+    value in any of the three bools (``is_forced`` / ``is_saveable`` / ``spawn_blocked``) at any
+    exit reds a row here."""
+    assert _route_of(*msgs, identity_embodiment=embodiment) == expected
+
+
+def test_route_decision_cannot_be_built_or_read_positionally() -> None:
+    """Human msg-4285 / Einstein msg-4281: the three adjacent bools cannot be transposed because
+    :class:`RouteDecision` accepts keywords only, requires every field, and is not iterable — so
+    neither a ``_route`` exit nor a caller can use positions."""
+    with pytest.raises(TypeError):
+        RouteDecision(None, "", False, False, True, StopReason.HUMAN)  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        RouteDecision(target_role=None, target_identity="", stop_reason=StopReason.HUMAN)  # type: ignore[call-arg]
+    decision = RouteDecision(
+        target_role=None,
+        target_identity="",
+        is_forced=False,
+        is_saveable=False,
+        spawn_blocked=True,
+        stop_reason=StopReason.HUMAN,
+    )
+    with pytest.raises(TypeError):
+        _role, _ident, _forced, _saveable, _blocked, _stop = decision  # type: ignore[misc]
 
 
 # --------------------------------------------------------------------------- replay --endpoint

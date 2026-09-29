@@ -558,6 +558,10 @@ async def test_hook_v2_three_roles_logged_with_rule_and_sha(
             roster=ROSTER,
             messages=msgs,
             stop="human",
+            is_forced=False,
+            target_role=None,
+            spawn_blocked=False,
+            naysayer_role=Role.NAYSAYER,
             author_wrote_next_human=True,
         )
     assert dr is not None and dr.outcome is DecisionOutcome.EVALUATED
@@ -592,6 +596,10 @@ async def test_hook_v2_gate_exception_is_still_sent(
             roster=ROSTER,
             messages=[ThreadMessage("m1", "Bohr", "x\nNEXT: human", "human")],
             stop="human",
+            is_forced=False,
+            target_role=None,
+            spawn_blocked=False,
+            naysayer_role=Role.NAYSAYER,
             author_wrote_next_human=True,
         )
     assert dr is not None and len(c.bodies) == 1
@@ -616,6 +624,10 @@ async def test_hook_v2_off_roster_relay_not_entered(caplog: pytest.LogCaptureFix
                 ThreadMessage("m1", "pr-gate-relay", "VERDICT: APPROVE\nNEXT: human", "human")
             ],
             stop="human",
+            is_forced=False,
+            target_role=None,
+            spawn_blocked=False,
+            naysayer_role=Role.NAYSAYER,
             author_wrote_next_human=True,
         )
     assert dr is None and c.bodies == [] and _decider_lines(caplog) == []
