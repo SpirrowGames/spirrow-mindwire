@@ -47,6 +47,8 @@ from typing import Any, Protocol
 from spirrow_mindwire.config import DEFAULT_DATA_DIR
 from spirrow_mindwire.github.client import GitHubClient, PrRef, PrResolution, PrState
 from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
+from spirrow_mindwire.magickit.read_only import ReadOnlyMcp as _SharedReadOnlyMcp
+from spirrow_mindwire.magickit.read_only import ReadOnlyViolationError
 from spirrow_mindwire.pr_review_sweep.config import (
     ProjectEntry,
     SweepConfig,
@@ -75,8 +77,10 @@ _PAGE = 200
 _EVENT_PAGE = 500
 
 
-class Phase0WriteAttemptedError(RuntimeError):
-    """A tool outside :data:`READ_ONLY_TOOLS` was requested. Phase 0 does not write."""
+#: A tool outside :data:`READ_ONLY_TOOLS` was requested. Phase 0 does not write. The class
+#: is the shared one from :mod:`spirrow_mindwire.magickit.read_only`; the name is kept so
+#: existing callers and tests catch the same thing they always did.
+Phase0WriteAttemptedError = ReadOnlyViolationError
 
 
 class ToolCaller(Protocol):
@@ -87,19 +91,15 @@ class PrStateReader(Protocol):
     async def fetch_pr_state(self, pr: PrRef) -> PrState: ...
 
 
-class ReadOnlyMcp:
-    """Allowlist wrapper: the machine check behind this script's write-zero claim."""
+class ReadOnlyMcp(_SharedReadOnlyMcp):
+    """Allowlist wrapper: the machine check behind this script's write-zero claim.
+
+    The enforcement lives in :class:`spirrow_mindwire.magickit.read_only.ReadOnlyMcp`;
+    this subclass only binds Phase 0's allowlist and label.
+    """
 
     def __init__(self, inner: ToolCaller) -> None:
-        self._inner = inner
-
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        if name not in READ_ONLY_TOOLS:
-            raise Phase0WriteAttemptedError(
-                f"Phase 0 is read-only; refusing to call {name!r}. "
-                f"Allowed: {sorted(READ_ONLY_TOOLS)}"
-            )
-        return await self._inner.call_tool(name, arguments)
+        super().__init__(inner, READ_ONLY_TOOLS, label="Phase 0")
 
 
 def _as_dict(value: Any) -> dict[str, Any] | None:
