@@ -29,7 +29,10 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
    skips such a turn; ``evaluate`` then returns ``None`` and no line is written.)
 4. ``log_decision(...)`` — every outcome, with ``decision_id`` / ``outcome``, the gate columns
    ``gate_kind`` / ``gate_is_grey_zone``, the rule ``stop``, ``routed`` and (v2)
-   ``matched_rule`` / ``matched_rule_source`` / ``rules_sha256`` on the same line;
+   ``matched_rule`` / ``matched_rule_source`` / ``rules_sha256`` on the same line, plus the
+   point-in-time input (msg-4636 DECIDED 2d-3): ``latest_msg_id``, the ``roster`` used and
+   ``state_wire`` — the exact ``state`` string sent to Lexora — so an evaluation weeks later reads
+   what Jev saw instead of rebuilding it from a thread that has since grown;
 5. the acting branch is gated on ``routed == "stop"`` (msg-4237 DECIDED 2c-2), on
    ``dr.actionable_verdict`` only (msg-4184) and on a mode of ``annotate`` / ``bounce`` — which is
    refused at build time, so in shadow it never runs. ``forced_naysayer`` and ``spawn_blocked``
@@ -73,6 +76,7 @@ from spirrow_mindwire.decider.state import (
     SimpleTurn,
     state_builder,
 )
+from spirrow_mindwire.decider.wire import state_to_wire
 from spirrow_mindwire.tier_c_admission_gate import (
     AdmissionDecision,
     LogKind,
@@ -196,6 +200,9 @@ def log_decision(
     routed: str,
     dr: DecisionResult,
     gate_result: AdmissionGateResult | None,
+    latest_msg_id: str,
+    roster: Mapping[str, Role],
+    state_wire: str,
 ) -> dict[str, Any]:
     """Write one decision record to the conductor log and return it (msg-4182).
 
@@ -208,6 +215,13 @@ def log_decision(
 
     ``routed`` (msg-4237 DECIDED 2c-3) is a record-level column like ``stop`` — it is not a
     ``decision_result_to_dict`` key.
+
+    ``latest_msg_id`` / ``roster`` / ``state_wire`` (msg-4636 DECIDED 2d-3) record the input as
+    it was at decision time: the head message the state was cut at, the roster the turn used
+    (``{identity: role}``) and the ``state`` string exactly as sent to ``/v1/decide``
+    (:func:`~spirrow_mindwire.decider.wire.state_to_wire`). Record-only — no routing reads them
+    (D20). ``export_shadow_eval_set.py`` reads them instead of rebuilding the state, and a row
+    without them is outside the pre-registered evaluation (2d-3).
     """
     record: dict[str, Any] = {
         "thread_id": thread_id,
@@ -220,6 +234,9 @@ def log_decision(
             else None
         ),
         "gate_is_grey_zone": gate_result.is_grey_zone if gate_result is not None else None,
+        "latest_msg_id": latest_msg_id,
+        "roster": {identity: role.value for identity, role in roster.items()},
+        "state_wire": state_wire,
         **decision_result_to_dict(dr),
     }
     logger.info("decider_decision %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
@@ -490,6 +507,9 @@ async def run_tierc_hook(
         routed=routed,
         dr=dr,
         gate_result=state.gate_result,
+        latest_msg_id=head.msg_id,
+        roster=roster,
+        state_wire=state_to_wire(state),
     )
 
     # msg-4184 §2: acting code reads ``actionable_verdict`` only. msg-4237 DECIDED 2c-2: only a

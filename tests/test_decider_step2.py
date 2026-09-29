@@ -482,7 +482,15 @@ def test_log_decision_always_writes_id_and_outcome(
 ) -> None:
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
         rec = log_decision(
-            thread_id="T-x", round_index=3, stop="human", routed="stop", dr=dr, gate_result=GREY
+            thread_id="T-x",
+            round_index=3,
+            stop="human",
+            routed="stop",
+            dr=dr,
+            gate_result=GREY,
+            latest_msg_id="m9",
+            roster={"Bohr": Role.PROPOSER},
+            state_wire="{}",
         )
     assert rec["outcome"] == dr.outcome.value
     assert rec["gate_kind"] == "ADMIT_UNSURE" and rec["gate_is_grey_zone"] is True
@@ -497,7 +505,15 @@ def test_log_decision_gate_columns_for_labelled_admit() -> None:
     """msg-4196 DECIDED 2: ``gate_kind`` may be ``None`` even when the gate ran."""
     dr = _dr(DecisionOutcome.EVALUATED, _v(TierCScope.OUT_OF_GATE))
     rec = log_decision(
-        thread_id="T", round_index=1, stop="human", routed="stop", dr=dr, gate_result=ADMIT_LABELLED
+        thread_id="T",
+        round_index=1,
+        stop="human",
+        routed="stop",
+        dr=dr,
+        gate_result=ADMIT_LABELLED,
+        latest_msg_id="m9",
+        roster={"Bohr": Role.PROPOSER},
+        state_wire="{}",
     )
     assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is False
 
@@ -512,6 +528,9 @@ def test_log_decision_gate_columns_none_when_gate_did_not_run() -> None:
         routed="stop",
         dr=_dr(DecisionOutcome.NO_VERDICT_NULL, None),
         gate_result=None,
+        latest_msg_id="m9",
+        roster={"Bohr": Role.PROPOSER},
+        state_wire="{}",
     )
     assert rec["outcome"] == "no_verdict_null"
     assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is None
@@ -752,6 +771,52 @@ async def test_hook_proposer_human_builds_gate_result_and_calls_once(
     (line,) = _decider_lines(caplog)
     assert line["gate_kind"] == "ADMIT_UNSURE" and line["gate_is_grey_zone"] is True
     assert line["stop"] == "human"
+
+
+def _v2_rules() -> Any:
+    from spirrow_mindwire.decider.questions import load_tierc_rules, tierc_rules_template_path
+
+    return load_tierc_rules(tierc_rules_template_path())
+
+
+_V2_PAYLOAD: dict[str, Any] = {
+    "answers": {
+        "should_ask_human": {"noul": 0.2},
+        "matched_rule": {"choice": "none", "probabilities": {"none": 0.9}, "confidence": 0.8},
+    },
+    "provider": "jev",
+    "decision_id": "d-v2",
+    "latency_ms": 7,
+}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("questions", ["tierc-v1", "tierc-v2"])
+async def test_hook_row_carries_point_in_time_input_byte_identical_to_the_request(
+    questions: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test 18 (msg-4636 DECIDED 2d-3): the row's ``state_wire`` is byte-for-byte the ``state``
+    string the adapter sent to ``/v1/decide``; ``latest_msg_id`` is the head the state was cut
+    at; ``roster`` is the dict the turn used. v1 and v2 (the live default) alike."""
+    if questions == "tierc-v1":
+        c = FakeClient(_payload())
+        adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c)
+    else:
+        c = FakeClient(_V2_PAYLOAD)
+        adapter = DeciderLexoraAdapter(
+            tierc_mode="shadow", client_factory=lambda: c, rules=_v2_rules()
+        )
+    _GateSpy(monkeypatch)
+    body = "日本語 x\nTIER-C: unsure:goal?\nNEXT: human"
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        dr = await _hook(adapter, messages=_msgs(head_body=body))
+    assert dr is not None
+    (sent,) = c.bodies
+    (line,) = _decider_lines(caplog)
+    assert line["state_wire"].encode("utf-8") == sent["state"].encode("utf-8")
+    assert line["latest_msg_id"] == "m2" == _msgs()[-1].msg_id
+    assert line["roster"] == {k: v.value for k, v in ROSTER.items()}
+    assert json.loads(line["state_wire"])["roster"] == line["roster"]
 
 
 @pytest.mark.anyio
