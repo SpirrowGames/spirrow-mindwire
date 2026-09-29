@@ -1,0 +1,57 @@
+{
+  "by_author": {
+    "Bohr": 252,
+    "Einstein": 69,
+    "Fermi": 9,
+    "Heisenberg": 144,
+    "human": 174,
+    "operator": 6,
+    "operator-lane": 8,
+    "orchestrator": 17,
+    "pr-gate-relay": 183
+  },
+  "by_eval_set": {
+    "body": 195,
+    "gate_only": 653,
+    "supplement": 14
+  },
+  "by_set": {
+    "eval": 856,
+    "retro_candidate": 6
+  },
+  "current_roster": {
+    "Bohr": "proposer",
+    "Einstein": "naysayer",
+    "Heisenberg": "implementer"
+  },
+  "eval_since": "2026-09-01T00:00:00+00:00",
+  "eval_until": "2026-09-19T17:58:03+00:00",
+  "gate": {
+    "admit/-/-": 22,
+    "bounce/BOUNCED/no-label": 815,
+    "bounce/BOUNCED/other-not-admitted": 25
+  },
+  "grey_zone": 0,
+  "harvested_at": "2026-09-27T16:33:33.962790+00:00",
+  "live_entry": {
+    "False": 661,
+    "True": 201
+  },
+  "materials_body_truncated": 139,
+  "projects": [
+    "spirrow-mindwire",
+    "spirrow-magickit",
+    "spirrow-lexora",
+    "spirrow-voxelworld",
+    "spirrow-playproof",
+    "spirrow-verimend",
+    "spirrow-conclair",
+    "spirrow-unrealwise"
+  ],
+  "roster_source": {
+    "current_fallback": 3,
+    "historical": 206
+  },
+  "rows": 862,
+  "threads_scanned": 865
+}

@@ -1,0 +1,17 @@
+```jsonl
+{"thread_id": "T-operator-board", "round_index": 49, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent explicitly delegated implementation tasks to Heisenberg, making the handoff to the human unnecessary."}
+{"thread_id": "T-t07-stage2-warp-exporter", "round_index": 15, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent provided detailed implementation instructions to Heisenberg, who executed them without human intervention."}
+{"thread_id": "T-t07-stage2-warp-exporter", "round_index": 18, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent issued code fix tasks to Heisenberg, who completed them without requiring the human product owner."}
+{"thread_id": "T-adr-index-omits-chatroom-body-locator", "round_index": 7, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent directed Heisenberg to perform specific Git operations, which were handled entirely by the agent."}
+{"thread_id": "T-exclusive-resource-lease-queue", "round_index": 77, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent routed the design scope review to Einstein, who endorsed it without any human input."}
+{"thread_id": "T-operator-board", "round_index": 51, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent instructed Heisenberg to create a wiring PR, which was completed without involving the human."}
+{"thread_id": "T-adr-index-omits-chatroom-body-locator", "round_index": 9, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent delegated a specific code fix to Heisenberg, which was implemented autonomously."}
+{"thread_id": "T-t07-stage2-warp-exporter", "round_index": 21, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent assigned implementation tasks to Heisenberg, who executed them independently."}
+{"thread_id": "T-stalled-pr-has-no-detector", "round_index": 51, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent directed design questions to Einstein, who provided the review without human assistance."}
+{"thread_id": "T-operator-board", "round_index": 53, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent requested Heisenberg to implement specific code changes, which were successfully completed by the agent."}
+{"thread_id": "T-adr-index-omits-chatroom-body-locator", "round_index": 11, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent tasked Heisenberg with code modifications, and the human was not needed."}
+{"thread_id": "T-operator-board", "round_index": 55, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent assigned a specific code fix to Heisenberg, who implemented it without human intervention."}
+{"thread_id": "T-adr-index-omits-chatroom-body-locator", "round_index": 13, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent instructed Heisenberg to apply a code fix, which was resolved entirely by the agents."}
+{"thread_id": "T-pr-review-spirrow-playproof-61", "round_index": 5, "label": "genuine-merge", "category": "MERGE", "rationale": "The human was required to manually review and approve a Tier-C merge to the main branch."}
+{"thread_id": "T-t07-stage2-warp-exporter", "round_index": 30, "label": "genuine", "category": "GOAL", "rationale": "The agent successfully completed the thread's objective and returned control to the human product owner to close the thread."}
+```

@@ -1,0 +1,17 @@
+```jsonl
+{"thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo", "round_index": 25, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent handed off because it lacked the chatroom-MCP write tool, which is a routing/framework artifact."}
+{"thread_id": "T-public-repo-carries-real-infra-values", "round_index": 84, "label": "genuine-merge", "category": "MERGE", "rationale": "The thread was waiting on a merge into a protected main branch, which requires human approval."}
+{"thread_id": "T-spec-pin-hardening-and-id-audit", "round_index": 26, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent stopped to route to another agent dispatch with different tools, which is a framework artifact."}
+{"thread_id": "T-ci-ledger-alarm-destination", "round_index": 32, "label": "genuine-merge", "category": "MERGE", "rationale": "The handoff was to authorize a Tier-A merge into the develop branch."}
+{"thread_id": "T-ci-ledger-alarm-destination", "round_index": 39, "label": "genuine-merge", "category": "MERGE", "rationale": "The handoff was to authorize a Tier-A merge into the develop branch after a PR-gate re-fire."}
+{"thread_id": "T-ci-ledger-alarm-destination", "round_index": 47, "label": "genuine-merge", "category": "MERGE", "rationale": "The handoff was to authorize a Tier-A merge into the develop branch following PR-gate execution."}
+{"thread_id": "T-ci-ledger-alarm-destination", "round_index": 55, "label": "genuine-merge", "category": "MERGE", "rationale": "The handoff was to authorize a Tier-A merge into the develop branch and the subsequent opening of a new PR."}
+{"thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo", "round_index": 27, "label": "spurious", "category": "IMPL", "rationale": "The agent stopped because it lacked the git-shell tool to perform a rebase, which is an implementation limitation."}
+{"thread_id": "T-ci-ledger-alarm-destination", "round_index": 71, "label": "genuine-merge", "category": "MERGE", "rationale": "The handoff was explicitly to authorize and perform a merge into the develop branch."}
+{"thread_id": "T-ci-ledger-alarm-destination", "round_index": 76, "label": "genuine-merge", "category": "MERGE", "rationale": "The handoff was to authorize the merge of the PR into the develop branch."}
+{"thread_id": "T-merged-to-main-without-gate-artifact", "round_index": 33, "label": "genuine-merge", "category": "MERGE", "rationale": "The agent is structurally forbidden from merging to main and relies on the human handoff as the actual merge mechanism."}
+{"thread_id": "T-scoped-driver-verdict-never-reaches-chatroom", "round_index": 11, "label": "genuine", "category": "GOAL", "rationale": "The agent asked the human operator for operational usage data (telemetry) that only the human knows."}
+{"thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo", "round_index": 30, "label": "spurious", "category": "IMPL", "rationale": "The agent stopped solely because it lacked the git-shell tool to execute the rebase."}
+{"thread_id": "T-spec-pin-hardening-and-id-audit", "round_index": 28, "label": "spurious", "category": "ROUTING_ARTIFACT", "rationale": "The agent handed off to get a specific tool equipped to its dispatch, which is a routing artifact."}
+{"thread_id": "T-merged-to-main-without-gate-artifact", "round_index": 47, "label": "genuine", "category": "GOAL", "rationale": "The agent required human approval for the proposed dashboard design before proceeding to implementation."}
+```
