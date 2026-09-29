@@ -198,6 +198,7 @@ def _save_state(path: Path, state: dict[str, Record]) -> None:
     tmp.write_text(
         json.dumps(serialisable, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
+        newline="\n",
     )
     os.replace(tmp, path)
 

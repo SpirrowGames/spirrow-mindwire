@@ -479,7 +479,7 @@ def _write_summary(text: str) -> None:
     wrote_to_summary = False
     if summary_path:
         try:
-            with open(summary_path, "a", encoding="utf-8") as fp:
+            with open(summary_path, "a", encoding="utf-8", newline="\n") as fp:
                 fp.write(text)
                 wrote_to_summary = True
         except OSError:

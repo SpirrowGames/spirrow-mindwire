@@ -677,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     text = render(rows, labellers, th, population, corr, replayed)
     if args.out is not None:
-        args.out.write_text(text + "\n", encoding="utf-8")
+        args.out.write_text(text + "\n", encoding="utf-8", newline="\n")
     else:
         sys.stdout.write(text + "\n")
     return 0

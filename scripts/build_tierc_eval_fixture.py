@@ -732,7 +732,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         args.corrections_out.parent.mkdir(parents=True, exist_ok=True)
         args.corrections_out.write_text(
-            json.dumps(out, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8"
+            json.dumps(out, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
         )
         print(json.dumps(out["counts"], ensure_ascii=False), file=sys.stderr)
         return 0
@@ -755,7 +757,9 @@ def main(argv: list[str] | None = None) -> int:
     _write_jsonl(args.out_dir / "fixture.jsonl", fixture)
     _write_jsonl(args.out_dir / "materials.jsonl", materials)
     (args.out_dir / "harvest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2), file=sys.stderr)
     return 0
