@@ -576,9 +576,10 @@ def corrections_for(
     harvest used. A row is **kept** only if the rebuilt fixture line is byte-identical to the
     original — then what Jev was sent is what the fixed code would send. Every other row is
     **excluded** with a reason: ``not_an_escalation`` (with the old and new resolution),
-    ``moved_to_gate_only``, or ``rebuilt_row_differs`` (with the differing fields). This function
-    never re-labels a changed row; it excludes it. ``added`` lists rebuilt fixture rows the
-    original lacks — they were never replayed, so a report cannot use them.
+    ``moved_to_gate_only``, ``rebuilt_row_differs`` (with the differing fields), or
+    ``source_message_missing`` (the harvested threads no longer hold that message at that index).
+    This function never re-labels a changed row; it excludes it. ``added`` lists rebuilt fixture
+    rows the original lacks — they were never replayed, so a report cannot use them.
     """
     orig = [json.loads(line) for line in original_fixture_text.splitlines() if line.strip()]
     orig_line = {(r["thread_id"], r["round_index"]): _fixture_line(r) for r in orig}
@@ -594,13 +595,22 @@ def corrections_for(
             keep.append(_entry(r))
             continue
         entry = _entry(r)
-        if k not in new_pop:
-            msgs = msgs_of[r["thread_id"]]
-            m = msgs[r["round_index"]]
+        msgs = msgs_of.get(r["thread_id"], ())
+        i = r["round_index"]
+        if not (0 <= i < len(msgs) and msgs[i].msg_id == r["msg_id"]):
+            # The chatroom no longer holds this message at this position (thread deleted or
+            # moved, history truncated or reordered): the row cannot be rebuilt or diagnosed.
+            entry["reason"] = "source_message_missing"
+            entry["detail"] = {
+                "thread_found": r["thread_id"] in msgs_of,
+                "message_at_index": msgs[i].msg_id if 0 <= i < len(msgs) else None,
+            }
+        elif k not in new_pop:
+            m = msgs[i]
             old = resolve_handoff(m.content, {}, next_participant=m.next_participant)
             now = resolve_handoff(
                 m.content,
-                routing_roster(msgs[: r["round_index"] + 1], current_roster),
+                routing_roster(msgs[: i + 1], current_roster),
                 next_participant=m.next_participant,
             )
             entry["reason"] = "not_an_escalation"

@@ -628,6 +628,48 @@ def test_corrections_for_keeps_identical_rows_and_explains_exclusions() -> None:
     assert out["fixture_sha256"] == hashlib.sha256(original.encode("utf-8")).hexdigest()
 
 
+@pytest.mark.parametrize(
+    ("threads_of", "detail"),
+    [
+        (lambda msgs: [], {"thread_found": False, "message_at_index": None}),
+        (lambda msgs: [("p", "T-x", msgs[:2])], {"thread_found": True, "message_at_index": None}),
+        (
+            lambda msgs: [("p", "T-x", [msgs[0], msgs[1], msgs[3], msgs[4]])],
+            {"thread_found": True, "message_at_index": "msg-4"},
+        ),
+    ],
+    ids=["thread_gone", "history_truncated", "message_removed"],
+)
+def test_corrections_for_excludes_rows_whose_source_message_is_gone(
+    threads_of: Any, detail: dict[str, Any]
+) -> None:
+    """PR-gate on #350 @ d97d20a: a row whose thread or message the chatroom no longer holds is
+    excluded as ``source_message_missing``, not a KeyError / IndexError."""
+    msgs = _thread()
+    msgs[2] = _with_field(_msg(3, "Einstein", "ok, no body token", role="naysayer"), "Bohr")
+    roster = {"Einstein": Role.NAYSAYER}
+    row: dict[str, Any] = builder.build_eval_row(
+        project="p",
+        thread_id="T-x",
+        messages=msgs,
+        head_index=2,
+        current_roster=roster,
+        now=msgs[2].timestamp,
+        set_name="eval",
+    )
+    row["eval_set"] = builder.eval_set_of(row)
+    out = builder.corrections_for(
+        original_fixture_text=builder._fixture_line(row) + "\n",
+        threads=threads_of(msgs),
+        current_roster=roster,
+        selection_code_commit="c0ffee",
+    )
+    (ex,) = out["exclude"]
+    assert ex["msg_id"] == "msg-3" and ex["reason"] == "source_message_missing"
+    assert ex["detail"] == detail
+    assert out["keep"] == []
+
+
 def test_as_of_drops_later_messages_and_empty_threads() -> None:
     msgs = _thread()
     cut = msgs[2].timestamp
@@ -1151,6 +1193,31 @@ def test_fulltext_change_counts_verdict_and_moved_answers() -> None:
     changed, moved, mean = ftr.change(a, b, th)
     assert changed and moved == 1.0 and mean > 0.5
     assert ftr.change(a, dict(a), th) == (False, 0.0, 0.0)
+
+
+# --- PR-gate #352 finding 1: a failed attempt then a --resume retry -----------------------------
+
+
+def _rec(key: tuple[str, int], decision: dict[str, Any]) -> dict[str, Any]:
+    return {"thread_id": key[0], "round_index": key[1], "decision": decision}
+
+
+def test_resume_retries_failed_rows_and_report_reads_the_retry(tmp_path: Path) -> None:
+    ok = {
+        "outcome": "evaluated",
+        "provider": "jev",
+        "raw_answers": {q.key: {"type": "noul", "noul": 0.5} for q in TIERC_QUESTIONS_V1},
+    }
+    failed = {"outcome": "transport_error", "raw_answers": None}
+    a, b = ("T", 0), ("T", 1)
+    path = _write_lines(tmp_path / "run.jsonl", [_rec(a, ok), _rec(b, failed)])
+    assert runner.evaluated_keys(path) == {a}  # b is sent again on --resume
+    assert runner.evaluated_keys(tmp_path / "absent.jsonl") == set()
+    with pytest.raises(ValueError, match="1 rows missing"):
+        ftr.load_scores(path, {a, b})  # b never succeeded
+    _write_lines(path, [_rec(a, ok), _rec(b, failed), _rec(b, ok)])
+    scores = ftr.load_scores(path, {a, b})
+    assert set(scores) == {a, b}
 
 
 # --- eval/tierc/fulltext-2026-09-28: data is what manifest.json says (msg-4332 / msg-4334) -------
