@@ -1,6 +1,6 @@
 # Tier-C replay evaluation — Jev
 
-- corrections: **applied** — `eval\tierc\corrections\2026-09-28-roster-selection.json` (sha256 `c4cdd1ef83b19512f6279b4b9717c7d990610f3521aeb8180633e12dfabb8387`, selection code `61fb1b243169608708ef177e42e53838200550ab`); rows counted: **66 / 209** replayed. The population line below is not corrected.
+- corrections: **applied** — `eval\tierc\corrections\2026-09-28-roster-selection.json` (sha256 `91c4ea7845d6ec592409fd219b1b77ad6f84e1a113a0d27ee328be741e68f42f`, selection code `61fb1b243169608708ef177e42e53838200550ab`); rows counted: **66 / 209** replayed. The population line below is not corrected.
 
 ## (A) / (B) — read this first (msg-4219 §0, msg-4221)
 
