@@ -51,10 +51,12 @@ def _mode_leaves(node: ast.expr, scope: _Scope | None = None, depth: int = 0) ->
     if isinstance(node, ast.IfExp):
         return _mode_leaves(node.body, scope, depth) + _mode_leaves(node.orelse, scope, depth)
     if scope is not None and isinstance(node, ast.Name) and depth < _MAX_DEPTH:
-        found = scope.values_of(node.id)
-        if found:
-            values, where = found
-            return [leaf for v in values for leaf in _mode_leaves(v, where, depth + 1)]
+        b = scope.lookup(node.id)
+        if b is not None and b.values is not None:
+            leaves = [leaf for v in b.values for leaf in _mode_leaves(v, b.scope, depth + 1)]
+            if b.param is not None:
+                leaves.append(None)  # whatever the caller passed
+            return leaves
     return [None]
 
 
@@ -91,10 +93,12 @@ _COMPS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 class _Binding(NamedTuple):
     """How the nearest scope that binds a name binds it.
 
-    ``param`` is set for a function parameter (``default`` is its default, if any); ``values``
-    holds every plain ``name = value`` in that scope, or is ``None`` when any binding there is
-    one we cannot read. ``scope`` is the chain starting at the binding scope, so the values are
-    resolved where they were written, not where the name was used.
+    ``param`` is set when the name is a parameter of that function (``default`` is its default,
+    if any). ``values`` holds every plain ``name = value`` in the same scope — a parameter's body
+    reassignments included, since parameter and body are one local scope — or is ``None`` when
+    any binding there is one we cannot read. The analysis is flow-insensitive: the name may hold
+    the caller's value or any of ``values``. ``scope`` is the chain starting at the binding
+    scope, so the values are resolved where they were written, not where the name was used.
     """
 
     param: ast.arg | None
@@ -201,9 +205,9 @@ class _Scope:
         """The binding of ``name`` in the nearest scope that binds it, or ``None`` if none does."""
         for i, scope in enumerate(self.chain):
             here = _Scope(self.chain[i:])
+            # a parameter and the body's assignments are ONE local scope: read both (PR-gate
+            # #359 @ 74565d3 -- ``def f(mode): mode = "w"; p.open(mode)`` resolves to "w")
             p = self._param(scope, name)
-            if p is not None:
-                return _Binding(p[0], p[1], None, here)
             values: list[ast.expr] = []
             opaque = False
             for n in self._bindings_in(scope):
@@ -238,18 +242,12 @@ class _Scope:
                     opaque |= name in _named_targets(n.pattern)
                 elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     opaque |= n.name == name
+            arg, default = p if p is not None else (None, None)
             if opaque:
-                return _Binding(None, None, None, here)
-            if values:
-                return _Binding(None, None, values, here)
+                return _Binding(arg, default, None, here)
+            if values or arg is not None:
+                return _Binding(arg, default, values, here)
         return None
-
-    def values_of(self, name: str) -> tuple[list[ast.expr], _Scope] | None:
-        """The plain values of ``name`` and the scope they resolve in, if all are readable."""
-        b = self.lookup(name)
-        if b is None or b.values is None:
-            return None
-        return b.values, b.scope
 
 
 def _within(node: ast.AST, root: ast.AST) -> bool:
@@ -295,18 +293,21 @@ def _mentions_path_type(node: ast.expr | None) -> bool:
 
 def _is_path_expr(node: ast.expr, scope: _Scope, depth: int = 0) -> bool:
     """``node`` is visibly a ``pathlib`` path: ``Path(...)``, ``a / b``, a ``Path``-annotated
-    parameter, or a name every plain assignment of which is one of those."""
+    parameter, or a name with at least one plain assignment that is one of those."""
     if isinstance(node, ast.Call):
         return _mentions_path_type(node.func)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
         return True
     if isinstance(node, ast.Name) and depth < _MAX_DEPTH:
         b = scope.lookup(node.id)
-        if b is None:
+        if b is None or b.values is None:
             return False
-        if b.param is not None:
-            return _mentions_path_type(b.param.annotation)
-        return b.values is not None and all(_is_path_expr(v, b.scope, depth + 1) for v in b.values)
+        # ANY Path evidence is enough: ``def f(q: str): q = Path(q); q.open(m)`` is the common
+        # coerce-to-Path idiom and may write. Erring this way flags a receiver that is only
+        # sometimes a Path (loud, exemptable) rather than missing a writer (silent).
+        if b.param is not None and _mentions_path_type(b.param.annotation):
+            return True
+        return any(_is_path_expr(v, b.scope, depth + 1) for v in b.values)
     return False
 
 
@@ -319,11 +320,14 @@ def _provably_mode(node: ast.expr, scope: _Scope, depth: int = 0) -> bool:
         return _provably_mode(node.body, scope, depth) and _provably_mode(node.orelse, scope, depth)
     if isinstance(node, ast.Name) and depth < _MAX_DEPTH:
         b = scope.lookup(node.id)
-        if b is None:
+        if b is None or b.values is None:
             return False
-        if b.param is not None:
-            return b.default is not None and _is_mode_literal(b.default)
-        return b.values is not None and all(_provably_mode(v, b.scope, depth + 1) for v in b.values)
+        # every piece of evidence agrees, and there is at least one; a parameter with no
+        # default is no evidence either way, a default must be a mode literal
+        verdicts = [_provably_mode(v, b.scope, depth + 1) for v in b.values]
+        if b.param is not None and b.default is not None:
+            verdicts.append(_is_mode_literal(b.default))
+        return bool(verdicts) and all(verdicts)
     return False
 
 
@@ -490,6 +494,21 @@ def test_every_script_text_writer_declares_newline() -> None:
         # a class body is a scope for code directly in it, not for its methods
         ('class C:\n    m = "w"\n    p.open(m)', True),
         ('m = "r"\nclass C:\n    m = "w"\n    def f(self, p):\n        p.open(m)', False),
+        # PR-gate #359 @ 74565d3: a parameter reassigned in the body is still read
+        ('def f(mode):\n    mode = "w"\n    p.open(mode)', True),
+        ('def f(mode="r"):\n    mode = "w"\n    p.open(mode)', True),
+        ('def f(mode):\n    mode = "r"\n    p.open(mode)', True),  # caller's value unknown
+        ('def f(mode):\n    mode = "r"\n    open(x, mode)', True),
+        ('def f(mode):\n    mode = "w"\n    p.open(mode, newline="\\n")', False),
+        ('def f(name):\n    name = "a.txt"\n    zf.open(name)', False),
+        ('def f(mode="r"):\n    mode = "a.txt"\n    p.open(mode)', False),
+        ("def f(mode):\n    for mode in ms:\n        pass\n    p.open(mode)", False),
+        ("def f(q, m):\n    q = Path(q)\n    q.open(m)", True),
+        ("def f(q: str, m):\n    q = Path(q)\n    q.open(m)", True),  # coerce-to-Path idiom
+        ("q = Path(a)\nq = make()\nq.open(m)", True),  # any Path evidence is enough
+        ("def f(q: str, m):\n    q.open(m)", False),
+        ("f = lambda mode: p.open(mode)", False),
+        ('f = lambda mode="w": p.open(mode)', True),
         # defaults are evaluated in the enclosing scope
         ('m = "w"\ndef f(p, x=p.open(m)):\n    m = "r"', True),
         ('p.open("r+")', True),
