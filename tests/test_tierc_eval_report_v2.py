@@ -110,6 +110,9 @@ def test_v1_report_md_is_unchanged_byte_for_byte() -> None:
     )
     committed = (EVAL / "report.md").read_bytes().decode("utf-8")
     generated = text + "\n"
+    # Line by line first, so a failure names the first differing line.
+    gen_lines = generated.splitlines()
+    assert committed.splitlines()[: len(gen_lines)] == gen_lines
     assert committed.startswith(generated)
     assert committed[len(generated) :].startswith("\n---\n")
 
