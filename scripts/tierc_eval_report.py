@@ -10,7 +10,10 @@ that the gate is today's rules; count ``current_fallback`` rosters), Fermi msg-4
 * ``--replay`` — ``decider_replay.py --endpoint`` output (records carrying ``decision``);
 * ``--fixture`` — ``build_tierc_eval_fixture.py`` output (gate result, author, ``live_entry``,
   ``roster_source``);
-* ``--labels NAME=PATH`` — repeatable; one filled label file per labeller.
+* ``--labels NAME=PATH`` — repeatable; one filled label file per labeller;
+* ``--corrections PATH`` — optional; a ``build_tierc_eval_fixture.py --corrections-out`` file
+  naming which fixture rows are real escalations (msg-4298 / msg-4302). It is bound to one
+  fixture by sha and only ever *removes* rows; see :func:`load_corrections`.
 
 **Verdicts are recomputed** from each record's ``raw_answers`` with ``evaluate_tierc`` (the pure
 §4.4 function; thresholds settable) for every row — in-gate and out-of-gate alike — because (A)
@@ -33,6 +36,7 @@ asks what Jev *would* say. The server's own ``decision.verdict.kind`` is shown b
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import Counter, defaultdict
@@ -73,6 +77,92 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             if s and not s.startswith("#"):
                 out.append(json.loads(s))
     return out
+
+
+# ---------------------------------------------------------------------------
+# corrections (msg-4298 §2, msg-4302)
+# ---------------------------------------------------------------------------
+
+UNCORRECTED_FIXTURE_SHA256 = "280bdd49ea725541570dc60c8f58cbcc4b59b6cc7f7e09b418c879ac02cc69ad"
+"""The 2026-09-28 ``fixture.jsonl`` (``manifest.json``'s lock). 143 of its 209 rows are not
+escalations: the builder selected them against an empty roster (PR-gate #349). Reporting it
+without ``--corrections`` would silently re-issue the wrong headline, so that one input is
+refused (msg-4302 §2). Every other fixture — including every fresh one — runs with or without
+the flag."""
+
+CORRECTIONS_SCHEMA = 1
+CORRECTIONS_PATH_2026_09_28 = "eval/tierc/corrections/2026-09-28-roster-selection.json"
+
+
+class CorrectionsError(ValueError):
+    """The corrections file does not fit the fixture it is applied to. Always fatal."""
+
+
+@dataclass(frozen=True)
+class Corrections:
+    path: str
+    sha256: str
+    keep: frozenset[Key]
+    exclude: frozenset[Key]
+    selection_code_commit: str
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_corrections(
+    path: Path, fixture: Sequence[Mapping[str, Any]], fixture_sha256: str
+) -> Corrections:
+    """Read ``path`` and check it against the fixture it is about to filter.
+
+    Raises :class:`CorrectionsError` when the file is unreadable or not schema 1, was written for
+    another fixture (sha), names a row the fixture lacks or whose ``msg_id`` differs, lists a row
+    as both kept and excluded, or leaves a fixture row in neither list (a partial file must not
+    decide by omission).
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CorrectionsError(f"{path}: cannot read corrections: {exc}") from exc
+    if not isinstance(raw, dict) or raw.get("schema") != CORRECTIONS_SCHEMA:
+        raise CorrectionsError(f"{path}: not a schema-{CORRECTIONS_SCHEMA} corrections file")
+    if raw.get("fixture_sha256") != fixture_sha256:
+        raise CorrectionsError(
+            f"{path}: written for fixture sha {raw.get('fixture_sha256')!r}, "
+            f"but the fixture read has sha {fixture_sha256!r}"
+        )
+    msg_id_of = {_key(r): str(r.get("msg_id", "")) for r in fixture}
+
+    def keys(field: str) -> frozenset[Key]:
+        entries = raw.get(field)
+        if not isinstance(entries, list):
+            raise CorrectionsError(f"{path}: {field!r} must be a list")
+        out: set[Key] = set()
+        for e in entries:
+            k = _key(e)
+            if k not in msg_id_of:
+                raise CorrectionsError(f"{path}: {field} names {k}, which is not in the fixture")
+            if msg_id_of[k] != str(e.get("msg_id", "")):
+                raise CorrectionsError(
+                    f"{path}: {field} {k} has msg_id {e.get('msg_id')!r}; "
+                    f"the fixture has {msg_id_of[k]!r}"
+                )
+            out.add(k)
+        return frozenset(out)
+
+    keep, exclude = keys("keep"), keys("exclude")
+    if both := keep & exclude:
+        raise CorrectionsError(f"{path}: kept and excluded at once: {sorted(both)}")
+    if unlisted := set(msg_id_of) - keep - exclude:
+        raise CorrectionsError(f"{path}: fixture rows in neither list: {sorted(unlisted)}")
+    return Corrections(
+        path=str(path),
+        sha256=file_sha256(path),
+        keep=keep,
+        exclude=exclude,
+        selection_code_commit=str(raw.get("selection_code_commit", "")),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -369,9 +459,24 @@ def render(
     labellers: Mapping[str, Mapping[Key, Label]],
     th: TierCThresholds,
     population: Sequence[Mapping[str, Any]] = (),
+    corrections: Corrections | None = None,
+    replayed_before_corrections: int | None = None,
 ) -> str:
+    """With ``corrections``, ``all_rows`` / ``labellers`` must already be filtered
+    (:func:`apply_corrections`); this function only states that it happened (msg-4302 §4)."""
     truth = consensus(labellers)
     lines: list[str] = ["# Tier-C replay evaluation — Jev", ""]
+    if corrections is None:
+        lines += ["- corrections: **none applied** — every fixture row is counted.", ""]
+    else:
+        lines += [
+            f"- corrections: **applied** — `{corrections.path}` "
+            f"(sha256 `{corrections.sha256}`, selection code "
+            f"`{corrections.selection_code_commit}`); rows counted: "
+            f"**{len(all_rows)} / {replayed_before_corrections}** replayed. "
+            "The population line below is not corrected.",
+            "",
+        ]
 
     # Headline numbers are on the body set; supplement rows are reported on their own lines
     # (msg-4229 §1). A row with no eval_set (e.g. a hand-made fixture) counts as body.
@@ -498,19 +603,32 @@ def render(
     lines += [f"- error rate: {_pct(len(all_rows) - oc.get('evaluated', 0), len(all_rows))}"]
     lat = [r.latency_ms for r in all_rows if r.latency_ms is not None]
     lines += [f"- latency ms p50={_pctl(lat, 0.5)} p95={_pctl(lat, 0.95)}"]
-    agree = sum(
+    # Every gate result outside the grey zone — a valid-label ADMIT as much as a BOUNCE — takes
+    # ``build_out_of_gate_verdict`` in ``adapters/decider_lexora.py`` (step 5), so the ADMIT rows
+    # counted here are out_of_gate / UNSURE too (pinned by test_decider_replay.py
+    # ``test_dry_run_admit_valid_label_emits_out_of_gate``).
+    out_of_gate = sum(
         1
         for r in all_rows
         if r.server_verdict is not None and r.scores is not None and not r.grey_zone
     )
     lines += [
-        f"- mindwire-side verdict (``decider/verdict.py``, not the server) is scope=out_of_gate "
-        f"(UNSURE by construction) on {agree} rows; the recomputed verdict above is what (A) "
-        "reads.",
+        f"- mindwire-side verdict (``adapters/decider_lexora.py``, not the server) is "
+        f"scope=out_of_gate (UNSURE by construction) on {out_of_gate} rows — every non-grey-zone "
+        "gate result, valid-label ADMIT and BOUNCE alike; the recomputed verdict above is what "
+        "(A) reads.",
         "- cost per call: not in the replay record — read from Lexora usage.",
         "",
     ]
     return "\n".join(lines)
+
+
+def apply_corrections(
+    rows: Sequence[Row], labellers: Mapping[str, Mapping[Key, Label]], corr: Corrections
+) -> tuple[list[Row], dict[str, dict[Key, Label]]]:
+    """Keep only ``corr.keep``. Labels are filtered too, so κ and consensus see the same rows."""
+    kept = [r for r in rows if r.key in corr.keep]
+    return kept, {n: {k: v for k, v in m.items() if k in corr.keep} for n, m in labellers.items()}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -520,6 +638,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--labels", action="append", default=[], help="NAME=PATH (repeatable)")
     parser.add_argument(
         "--population", type=Path, default=None, help="population.jsonl (gate-only rows)"
+    )
+    parser.add_argument(
+        "--corrections", type=Path, default=None, help="corrections JSON (optional; msg-4302)"
     )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
@@ -533,9 +654,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"tierc_eval_report: --labels wants NAME=PATH, got {spec!r}", file=sys.stderr)
             return 2
         labellers[name] = load_labels(read_jsonl(Path(path)))
-    rows = join(read_jsonl(args.replay), read_jsonl(args.fixture))
+    fixture = read_jsonl(args.fixture)
+    fixture_sha = file_sha256(args.fixture)
+    rows = join(read_jsonl(args.replay), fixture)
     population = read_jsonl(args.population) if args.population is not None else []
-    text = render(rows, labellers, th, population)
+    corr: Corrections | None = None
+    replayed = len(rows)
+    if args.corrections is not None:
+        try:
+            corr = load_corrections(args.corrections, fixture, fixture_sha)
+        except CorrectionsError as exc:
+            print(f"tierc_eval_report: {exc}", file=sys.stderr)
+            return 2
+        rows, labellers = apply_corrections(rows, labellers, corr)
+    elif fixture_sha == UNCORRECTED_FIXTURE_SHA256:
+        print(
+            f"tierc_eval_report: {args.fixture} is the 2026-09-28 fixture; 143 of its 209 rows "
+            f"are not escalations (PR-gate #349). Pass --corrections "
+            f"{CORRECTIONS_PATH_2026_09_28}.",
+            file=sys.stderr,
+        )
+        return 2
+    text = render(rows, labellers, th, population, corr, replayed)
     if args.out is not None:
         args.out.write_text(text + "\n", encoding="utf-8")
     else:

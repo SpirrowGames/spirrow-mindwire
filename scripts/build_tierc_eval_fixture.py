@@ -21,7 +21,10 @@ messages *after* the escalation, which appear nowhere else; ``harvest.json`` —
 hook.compute_gate_result` (``retry_lookup=never_retry``, as step 2b-1) and
 :func:`~spirrow_mindwire.decider.hook.turn_from_messages` → ``state_builder`` →
 ``decider.wire.state_to_dict`` — the functions the live hook calls. Nothing here re-derives
-``head_summary`` / ``recent_events`` / ``prev_next``.
+``head_summary`` / ``recent_events`` / ``prev_next``. The one eval-only deviation is
+``--head-m`` (:func:`turn_for_eval`, T-decider-tierc-fulltext-eval msg-4311 / msg-4318): it widens
+the escalation's own text in ``head_summary`` and ``recent_events[0]`` together; at the default
+(live ``BODY_HEAD_M`` = 500) the output is byte-identical to live.
 
 **The three future-leak seals (msg-4226 §5, each pinned by a test):**
 
@@ -52,6 +55,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
+import hashlib
 import json
 import sys
 from collections import Counter
@@ -68,13 +73,14 @@ from spirrow_mindwire.conductor.handoff import (
     resolve_handoff,
 )
 from spirrow_mindwire.decider.hook import (
+    BODY_HEAD_M,
     ThreadMessage,
     compute_gate_result,
     is_tierc_entry,
     never_retry,
     turn_from_messages,
 )
-from spirrow_mindwire.decider.state import state_builder
+from spirrow_mindwire.decider.state import SimpleTurn, state_builder
 from spirrow_mindwire.decider.wire import state_to_dict
 from spirrow_mindwire.value_objects import Role
 
@@ -187,11 +193,61 @@ def historical_roster(
     return roster, (ROSTER_CURRENT_FALLBACK if used_current else ROSTER_HISTORICAL)
 
 
-def is_escalation(msg: RawMessage) -> bool:
-    """Would the conductor resolve this message to the human stop? (``resolve_handoff``)."""
-    return (
-        resolve_handoff(msg.content, {}, next_participant=msg.next_participant).kind
-        is HandoffKind.HUMAN
+def routing_roster(
+    upto: Sequence[RawMessage], current_roster: Mapping[str, Role]
+) -> dict[str, Role]:
+    """The roster ``resolve_handoff`` routes against when deciding *whether* a turn stops.
+
+    The live conductor resolves every handoff against its configured roster (``current_roster``
+    here), not an empty one. ``resolve_handoff`` is not roster-free: a ``next_participant`` field
+    naming a persona resolves to ``FIELD_UNRESOLVABLE`` → ``HUMAN`` against ``{}`` but to that
+    persona against the real roster, and a sentinel field with a ``NEXT: <persona>`` body flips
+    the other way. So selection must use the conductor's roster; the authors seen so far
+    (seal (b)'s historical roles) are overlaid so a persona since dropped from the config still
+    resolves. This roster is for routing only — the state's ``roster`` stays seal (b)'s.
+    """
+    roster = dict(current_roster)
+    roster.update(historical_roster(upto, current_roster)[0])
+    return roster
+
+
+def turn_for_eval(
+    *,
+    head_m: int,
+    thread_id: str,
+    round_index: int,
+    roster: Mapping[str, Role],
+    messages: Sequence[ThreadMessage],
+    gate_result: Any = None,
+) -> SimpleTurn:
+    """T-decider-tierc-fulltext-eval (Bohr msg-4311, fixed in msg-4318): the live turn, with
+    the escalation's own text widened to ``head_m`` chars in **both** places it appears.
+
+    Live :func:`turn_from_messages` is called unchanged; only ``head_summary`` and
+    ``recent_events[0].body_head`` (newest-first, so the escalation itself) are replaced, both by
+    the same ``content[:head_m]`` — the live invariant ``head_summary ==
+    recent_events[0].body_head`` holds on every row, so the model never sees two versions of the
+    escalation. The other four events stay at the live ``BODY_HEAD_M``. Truncation is from the
+    head, as the labellers read it (msg-4318 §3). ``head_m == BODY_HEAD_M`` reproduces live.
+    """
+    if head_m < 1:
+        raise ValueError(f"turn_for_eval: head_m must be positive, got {head_m}")
+    turn = turn_from_messages(
+        thread_id=thread_id,
+        round_index=round_index,
+        roster=roster,
+        messages=messages,
+        gate_result=gate_result,
+    )
+    head = messages[-1]
+    ev0 = turn.recent_events[0]
+    if ev0.msg_id != head.msg_id:
+        raise AssertionError(f"recent_events[0] is {ev0.msg_id}, escalation is {head.msg_id}")
+    body = head.content[:head_m]
+    return dataclasses.replace(
+        turn,
+        head_summary=body,
+        recent_events=(dataclasses.replace(ev0, body_head=body), *turn.recent_events[1:]),
     )
 
 
@@ -204,6 +260,7 @@ def build_eval_row(
     current_roster: Mapping[str, Role],
     now: datetime | None,
     set_name: str,
+    head_m: int = BODY_HEAD_M,
 ) -> dict[str, Any]:
     """One escalation → one ``decider_replay`` fixture row (plus metadata columns).
 
@@ -216,7 +273,11 @@ def build_eval_row(
     head = upto[-1]
     roster, roster_source = historical_roster(upto, current_roster)  # seal (b)
 
-    handoff = resolve_handoff(head.content, roster, next_participant=head.next_participant)
+    handoff = resolve_handoff(
+        head.content,
+        routing_roster(upto, current_roster),
+        next_participant=head.next_participant,
+    )
     author_wrote_next_human = handoff.mismatch_reason is None
     # The conductor states the resolved head's parsed_next as the reserved token
     # (core._decider_hook); every other message keeps its body token.
@@ -238,7 +299,8 @@ def build_eval_row(
         body=head.content, author=head.author, now=now, retry_lookup=never_retry
     )
     state = state_builder(
-        turn_from_messages(
+        turn_for_eval(
+            head_m=head_m,
             thread_id=thread_id,
             round_index=head_index,
             roster=roster,
@@ -283,12 +345,18 @@ def rows_for_thread(
     thread_id: str,
     messages: Sequence[RawMessage],
     current_roster: Mapping[str, Role],
+    head_m: int = BODY_HEAD_M,
 ) -> list[tuple[dict[str, Any], int]]:
     out: list[tuple[dict[str, Any], int]] = []
     for i, m in enumerate(messages):
-        if not is_escalation(m):
+        handoff = resolve_handoff(
+            m.content,
+            routing_roster(messages[: i + 1], current_roster),
+            next_participant=m.next_participant,
+        )
+        if handoff.kind is not HandoffKind.HUMAN:
             continue
-        label = resolve_handoff(m.content, {}, next_participant=m.next_participant).tier_c_label
+        label = handoff.tier_c_label
         set_name = classify_set(m, label)
         if set_name is None:
             continue
@@ -300,6 +368,7 @@ def rows_for_thread(
             current_roster=current_roster,
             now=m.timestamp,
             set_name=set_name,
+            head_m=head_m,
         )
         out.append((row, i))
     return out
@@ -419,6 +488,7 @@ def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 def build_outputs(
     threads: Sequence[tuple[str, str, Sequence[RawMessage]]],
     current_roster: Mapping[str, Role],
+    head_m: int = BODY_HEAD_M,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """Pure: harvested threads → (population, Jev fixture, labelling materials, manifest).
 
@@ -429,7 +499,11 @@ def build_outputs(
     everything: list[tuple[dict[str, Any], Sequence[RawMessage], int]] = []
     for project, thread_id, msgs in threads:
         for row, i in rows_for_thread(
-            project=project, thread_id=thread_id, messages=msgs, current_roster=current_roster
+            project=project,
+            thread_id=thread_id,
+            messages=msgs,
+            current_roster=current_roster,
+            head_m=head_m,
         ):
             row["eval_set"] = eval_set_of(row)
             everything.append((row, msgs, i))
@@ -472,17 +546,206 @@ def build_outputs(
     return population, fixture, materials, manifest
 
 
+def _fixture_line(row: Mapping[str, Any]) -> str:
+    """One fixture row exactly as :func:`_write_jsonl` writes it (byte comparison, msg-4298 §3)."""
+    return json.dumps(row, ensure_ascii=False, sort_keys=True)
+
+
+def as_of(
+    threads: Sequence[tuple[str, str, Sequence[RawMessage]]], cutoff: datetime
+) -> list[tuple[str, str, list[RawMessage]]]:
+    """The harvest's view: drop every message posted after ``cutoff`` (and threads left empty)."""
+    out = [(p, t, [m for m in msgs if m.timestamp <= cutoff]) for p, t, msgs in threads]
+    return [(p, t, msgs) for p, t, msgs in out if msgs]
+
+
+def _entry(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: row[k] for k in ("project", "thread_id", "round_index", "msg_id")}
+
+
+def corrections_for(
+    *,
+    original_fixture_text: str,
+    threads: Sequence[tuple[str, str, Sequence[RawMessage]]],
+    current_roster: Mapping[str, Role],
+    selection_code_commit: str,
+) -> dict[str, Any]:
+    """msg-4298 §2-§3: which rows of an already-replayed fixture the fixed selection still yields.
+
+    ``threads`` must be the harvest's view (:func:`as_of`) and ``current_roster`` the roster the
+    harvest used. A row is **kept** only if the rebuilt fixture line is byte-identical to the
+    original — then what Jev was sent is what the fixed code would send. Every other row is
+    **excluded** with a reason: ``not_an_escalation`` (with the old and new resolution),
+    ``moved_to_gate_only``, ``rebuilt_row_differs`` (with the differing fields), or
+    ``source_message_missing`` (the harvested threads no longer hold that message at that index).
+    This function never re-labels a changed row; it excludes it. ``added`` lists rebuilt fixture
+    rows the original lacks — they were never replayed, so a report cannot use them.
+    """
+    orig = [json.loads(line) for line in original_fixture_text.splitlines() if line.strip()]
+    orig_line = {(r["thread_id"], r["round_index"]): _fixture_line(r) for r in orig}
+    population, fixture, _, _ = build_outputs(threads, current_roster)
+    new_pop = {(r["thread_id"], r["round_index"]) for r in population}
+    new_fix = {(r["thread_id"], r["round_index"]): r for r in fixture}
+    msgs_of = {t: msgs for _, t, msgs in threads}
+    keep: list[dict[str, Any]] = []
+    exclude: list[dict[str, Any]] = []
+    for r in orig:
+        k = (r["thread_id"], r["round_index"])
+        if k in new_fix and _fixture_line(new_fix[k]) == orig_line[k]:
+            keep.append(_entry(r))
+            continue
+        entry = _entry(r)
+        msgs = msgs_of.get(r["thread_id"], ())
+        i = r["round_index"]
+        if not (0 <= i < len(msgs) and msgs[i].msg_id == r["msg_id"]):
+            # The chatroom no longer holds this message at this position (thread deleted or
+            # moved, history truncated or reordered): the row cannot be rebuilt or diagnosed.
+            entry["reason"] = "source_message_missing"
+            entry["detail"] = {
+                "thread_found": r["thread_id"] in msgs_of,
+                "message_at_index": msgs[i].msg_id if 0 <= i < len(msgs) else None,
+            }
+        elif k not in new_pop:
+            m = msgs[i]
+            old = resolve_handoff(m.content, {}, next_participant=m.next_participant)
+            now = resolve_handoff(
+                m.content,
+                routing_roster(msgs[: i + 1], current_roster),
+                next_participant=m.next_participant,
+            )
+            entry["reason"] = "not_an_escalation"
+            entry["detail"] = {
+                "next_participant": m.next_participant,
+                "empty_roster": f"{old.kind.value}/{old.mismatch_reason or '-'}",
+                "conductor_roster": f"{now.kind.value}/{now.identity or now.token or '-'}",
+            }
+        elif k not in new_fix:
+            entry["reason"] = "moved_to_gate_only"
+        else:
+            n = new_fix[k]
+            entry["reason"] = "rebuilt_row_differs"
+            entry["detail"] = {"fields": sorted(f for f in set(r) | set(n) if r.get(f) != n.get(f))}
+        exclude.append(entry)
+    added = [_entry(new_fix[k]) for k in sorted(set(new_fix) - set(orig_line))]
+    return {
+        "schema": 1,
+        "fixture_sha256": hashlib.sha256(original_fixture_text.encode("utf-8")).hexdigest(),
+        "selection_code_commit": selection_code_commit,
+        "roster": {k: v.value for k, v in current_roster.items()},
+        "counts": {
+            "fixture": len(orig),
+            "keep": len(keep),
+            "exclude": dict(Counter(e["reason"] for e in exclude)),
+            "added": len(added),
+        },
+        "keep": keep,
+        "exclude": exclude,
+        "added": added,
+    }
+
+
+def fulltext_for(
+    *,
+    corrections: Mapping[str, Any],
+    threads: Sequence[tuple[str, str, Sequence[RawMessage]]],
+    current_roster: Mapping[str, Role],
+    head_m: int,
+) -> list[dict[str, Any]]:
+    """msg-4318 §1: the corrections file's kept rows, rebuilt with ``head_m``.
+
+    ``threads`` must be the harvest's view (:func:`as_of`). Raises unless the rebuilt key set is
+    exactly the corrections ``keep`` set, and unless every row keeps ``head_summary ==
+    recent_events[0].body_head`` with ``recent_events[0].msg_id`` the escalation's own.
+    """
+    _, fixture, _, _ = build_outputs(threads, current_roster, head_m=head_m)
+    keep = [(e["thread_id"], e["round_index"]) for e in corrections["keep"]]
+    by_key = {(r["thread_id"], r["round_index"]): r for r in fixture}
+    missing = sorted(set(keep) - set(by_key))
+    if missing or len(set(keep)) != len(keep):
+        raise ValueError(f"fulltext_for: kept rows not rebuilt (or duplicated): {missing}")
+    out = [by_key[k] for k in keep]
+    for r in out:
+        ev0 = r["recent_events"][0]
+        if r["head_summary"] != ev0["body_head"] or ev0["msg_id"] != r["msg_id"]:
+            raise AssertionError(f"fulltext_for: escalation invariant broken at {r['msg_id']}")
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--project", action="append", default=None)
+    corr = parser.add_argument_group(
+        "corrections mode (msg-4298): check an already-replayed fixture against today's selection"
+    )
+    corr.add_argument("--corrections-for", type=Path, default=None, help="the original fixture")
+    corr.add_argument(
+        "--reproduce", type=Path, default=None, help="its harvest.json (harvested_at + roster)"
+    )
+    corr.add_argument("--corrections-out", type=Path, default=None)
+    corr.add_argument("--selection-code-commit", default=None)
+    parser.add_argument(
+        "--head-m",
+        type=int,
+        default=BODY_HEAD_M,
+        help="escalation text cap for head_summary and recent_events[0] (msg-4311; live = 500)",
+    )
+    full = parser.add_argument_group(
+        "fulltext mode (T-decider-tierc-fulltext-eval msg-4318): rebuild a corrections file's kept"
+        " rows with --head-m (needs --reproduce)"
+    )
+    full.add_argument("--fulltext-for", type=Path, default=None, help="the corrections file")
+    full.add_argument("--fulltext-out", type=Path, default=None)
     args = parser.parse_args(argv)
+
+    if args.fulltext_for is not None:
+        if None in (args.reproduce, args.fulltext_out):
+            parser.error("--fulltext-for needs --reproduce and --fulltext-out")
+        hv = json.loads(args.reproduce.read_text(encoding="utf-8"))
+        roster = {k: Role(v) for k, v in hv["current_roster"].items()}
+        harvested = asyncio.run(harvest(tuple(args.project or hv.get("projects") or PROJECTS)))
+        rows = fulltext_for(
+            corrections=json.loads(args.fulltext_for.read_text(encoding="utf-8")),
+            threads=as_of(harvested, parse_timestamp(hv["harvested_at"])),
+            current_roster=roster,
+            head_m=args.head_m,
+        )
+        args.fulltext_out.parent.mkdir(parents=True, exist_ok=True)
+        _write_jsonl(args.fulltext_out, rows)
+        print(json.dumps({"rows": len(rows), "head_m": args.head_m}), file=sys.stderr)
+        return 0
+
+    if args.corrections_for is not None:
+        if None in (args.reproduce, args.corrections_out, args.selection_code_commit):
+            parser.error(
+                "--corrections-for needs --reproduce, --corrections-out, --selection-code-commit"
+            )
+        hv = json.loads(args.reproduce.read_text(encoding="utf-8"))
+        roster = {k: Role(v) for k, v in hv["current_roster"].items()}
+        harvested = asyncio.run(harvest(tuple(args.project or hv.get("projects") or PROJECTS)))
+        out = corrections_for(
+            original_fixture_text=args.corrections_for.read_bytes().decode("utf-8"),
+            threads=as_of(harvested, parse_timestamp(hv["harvested_at"])),
+            current_roster=roster,
+            selection_code_commit=args.selection_code_commit,
+        )
+        args.corrections_out.parent.mkdir(parents=True, exist_ok=True)
+        args.corrections_out.write_text(
+            json.dumps(out, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(json.dumps(out["counts"], ensure_ascii=False), file=sys.stderr)
+        return 0
+    if args.out_dir is None:
+        parser.error("--out-dir is required (or use --corrections-for)")
 
     from spirrow_mindwire.config import load_settings
 
     current_roster = dict(load_settings().conductor.roster)
     threads = asyncio.run(harvest(tuple(args.project or PROJECTS)))
-    population, fixture, materials, manifest = build_outputs(threads, current_roster)
+    population, fixture, materials, manifest = build_outputs(
+        threads, current_roster, head_m=args.head_m
+    )
+    manifest["head_m"] = args.head_m
     manifest["harvested_at"] = datetime.now(UTC).isoformat()
     manifest["current_roster"] = {k: v.value for k, v in current_roster.items()}
 
