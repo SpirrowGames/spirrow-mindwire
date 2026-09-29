@@ -26,7 +26,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -51,9 +51,10 @@ def _mode_leaves(node: ast.expr, scope: _Scope | None = None, depth: int = 0) ->
     if isinstance(node, ast.IfExp):
         return _mode_leaves(node.body, scope, depth) + _mode_leaves(node.orelse, scope, depth)
     if scope is not None and isinstance(node, ast.Name) and depth < _MAX_DEPTH:
-        values = scope.values_of(node.id)
-        if values:
-            return [leaf for v in values for leaf in _mode_leaves(v, scope, depth + 1)]
+        found = scope.values_of(node.id)
+        if found:
+            values, where = found
+            return [leaf for v in values for leaf in _mode_leaves(v, where, depth + 1)]
     return [None]
 
 
@@ -84,93 +85,196 @@ def _is_mode_literal(node: ast.expr) -> bool:
 
 
 _FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+_COMPS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+class _Binding(NamedTuple):
+    """How the nearest scope that binds a name binds it.
+
+    ``param`` is set for a function parameter (``default`` is its default, if any); ``values``
+    holds every plain ``name = value`` in that scope, or is ``None`` when any binding there is
+    one we cannot read. ``scope`` is the chain starting at the binding scope, so the values are
+    resolved where they were written, not where the name was used.
+    """
+
+    param: ast.arg | None
+    default: ast.expr | None
+    values: list[ast.expr] | None
+    scope: _Scope
+
+
+def _named_targets(node: ast.AST) -> list[str]:
+    """Names bound by a target / pattern node (``a``, ``(a, b)``, ``*a``, ``case [a, *b]``)."""
+    out: list[str] = []
+    for x in ast.walk(node):
+        if isinstance(x, ast.Name):
+            out.append(x.id)
+        elif isinstance(x, (ast.MatchAs, ast.MatchStar)) and x.name is not None:
+            out.append(x.name)
+        elif isinstance(x, ast.MatchMapping) and x.rest is not None:
+            out.append(x.rest)
+    return out
 
 
 class _Scope:
     """What the names visible at one call are bound to, as far as an AST can tell.
 
-    Reads the innermost enclosing function (not functions nested inside it), then the module.
-    A name bound by anything but a plain ``name = value`` / ``name: T = value`` (``for``,
-    ``with``, ``import``, ``+=``, tuple unpacking, ``:=``, ``global`` ...) is unreadable and
-    yields ``None``; nothing is inferred from it. A parameter is also ``None`` from
-    :meth:`values_of` (the caller binds it) and is reported through :meth:`param`.
+    Follows Python's lexical scoping: the scope a name resolves in is the nearest enclosing
+    function, lambda or comprehension that binds it, then the module. A class body is a scope
+    only for code directly in it (methods do not see it). Comprehensions are their own scope
+    for their loop targets, while an ``:=`` inside one binds in the enclosing function (PEP 572).
+
+    Only a plain ``name = value`` / ``name: T = value`` is readable. Anything else that binds the
+    name in that scope — ``for``, ``with``, ``import``, ``+=``, unpacking, ``:=``, ``del``,
+    ``except ... as``, a ``match`` capture, ``def`` / ``class``, ``global`` / ``nonlocal`` — makes
+    the binding unreadable (``values is None``), and nothing is inferred from it.
     """
 
-    def __init__(self, call: ast.AST, parents: dict[ast.AST, ast.AST]) -> None:
-        self.chain: list[ast.AST] = []
-        cur = parents.get(call)
+    def __init__(self, chain: list[ast.AST]) -> None:
+        self.chain = chain
+
+    @classmethod
+    def at(cls, node: ast.AST, parents: dict[ast.AST, ast.AST]) -> _Scope:
+        chain: list[ast.AST] = []
+        child, cur = node, parents.get(node)
         while cur is not None:
-            if (isinstance(cur, _FUNCS) and not self.chain) or isinstance(cur, ast.Module):
-                self.chain.append(cur)
-            cur = parents.get(cur)
+            if isinstance(cur, _COMPS):
+                # the first iterable is evaluated in the enclosing scope, not the comprehension's
+                if not _within(node, cur.generators[0].iter):
+                    chain.append(cur)
+            elif isinstance(cur, _FUNCS):
+                # decorators, defaults and annotations are evaluated in the enclosing scope
+                if _in_body(child, cur):
+                    chain.append(cur)
+            elif isinstance(cur, ast.ClassDef):
+                if not chain and _in_body(child, cur):
+                    chain.append(cur)
+            elif isinstance(cur, ast.Module):
+                chain.append(cur)
+            child, cur = cur, parents.get(cur)
+        return cls(chain)
 
     @staticmethod
-    def _own_nodes(scope: ast.AST) -> list[ast.AST]:
+    def _bindings_in(scope: ast.AST) -> list[ast.AST]:
+        """The nodes whose bindings belong to ``scope`` itself."""
+        if isinstance(scope, _COMPS):
+            return list(scope.generators)
+        roots: list[ast.AST] = (
+            [scope.body] if isinstance(scope, ast.Lambda) else list(getattr(scope, "body", []))
+        )
         out: list[ast.AST] = []
-        todo = list(ast.iter_child_nodes(scope))
+        todo = list(roots)
         while todo:
             n = todo.pop()
-            if isinstance(n, (*_FUNCS, ast.ClassDef)):
-                continue  # a nested scope's bindings are its own
             out.append(n)
+            if isinstance(n, (*_FUNCS, ast.ClassDef)):
+                # its name binds here; its decorators / defaults / bases are evaluated here
+                todo += list(getattr(n, "decorator_list", []))
+                if isinstance(n, _FUNCS):
+                    todo += [d for d in n.args.defaults + n.args.kw_defaults if d is not None]
+                else:
+                    todo += n.bases + [k.value for k in n.keywords]
+                continue
+            if isinstance(n, _COMPS):
+                # loop targets are the comprehension's own; an := inside binds here (PEP 572)
+                todo.append(n.generators[0].iter)
+                out += [x for x in _walk_comp(n) if isinstance(x, ast.NamedExpr)]
+                continue
             todo.extend(ast.iter_child_nodes(n))
         return out
 
-    def param(self, name: str) -> tuple[ast.arg, ast.expr | None] | None:
-        """``(arg, default)`` if ``name`` is a parameter of the enclosing function."""
-        fn = self.chain[0] if self.chain and isinstance(self.chain[0], _FUNCS) else None
-        if fn is None:
+    @staticmethod
+    def _param(fn: ast.AST, name: str) -> tuple[ast.arg, ast.expr | None] | None:
+        if not isinstance(fn, _FUNCS):
             return None
         a = fn.args
         pos = a.posonlyargs + a.args
         defaults: list[ast.expr | None] = [None] * (len(pos) - len(a.defaults)) + list(a.defaults)
-        for arg, d in [
-            *zip(pos, defaults, strict=True),
-            *zip(a.kwonlyargs, a.kw_defaults, strict=True),
-        ]:
+        pairs = [*zip(pos, defaults, strict=True), *zip(a.kwonlyargs, a.kw_defaults, strict=True)]
+        pairs += [(v, None) for v in (a.vararg, a.kwarg) if v is not None]
+        for arg, d in pairs:
             if arg.arg == name:
                 return arg, d
         return None
 
-    def values_of(self, name: str) -> list[ast.expr] | None:
-        """Every value ``name`` is plainly assigned in the nearest scope binding it, else None."""
-        for scope in self.chain:
-            if isinstance(scope, _FUNCS) and self.param(name) is not None:
-                return None
+    def lookup(self, name: str) -> _Binding | None:
+        """The binding of ``name`` in the nearest scope that binds it, or ``None`` if none does."""
+        for i, scope in enumerate(self.chain):
+            here = _Scope(self.chain[i:])
+            p = self._param(scope, name)
+            if p is not None:
+                return _Binding(p[0], p[1], None, here)
             values: list[ast.expr] = []
             opaque = False
-            for n in self._own_nodes(scope):
-                targets: list[ast.AST] = []
+            for n in self._bindings_in(scope):
                 if isinstance(n, ast.Assign):
                     for t in n.targets:
-                        if isinstance(t, ast.Name):
-                            if t.id == name:
-                                values.append(n.value)
-                        else:
-                            targets.append(t)
+                        if isinstance(t, ast.Name) and t.id == name:
+                            values.append(n.value)
+                        elif not isinstance(t, ast.Name) and name in _named_targets(t):
+                            opaque = True
                 elif isinstance(n, ast.AnnAssign):
                     if isinstance(n.target, ast.Name) and n.target.id == name and n.value:
                         values.append(n.value)
                 elif isinstance(
                     n, (ast.For, ast.AsyncFor, ast.AugAssign, ast.NamedExpr, ast.comprehension)
                 ):
-                    targets.append(n.target)
+                    opaque |= name in _named_targets(n.target)
                 elif isinstance(n, (ast.With, ast.AsyncWith)):
-                    targets += [i.optional_vars for i in n.items if i.optional_vars is not None]
+                    opaque |= any(
+                        name in _named_targets(i.optional_vars)
+                        for i in n.items
+                        if i.optional_vars is not None
+                    )
+                elif isinstance(n, ast.Delete):
+                    opaque |= any(name in _named_targets(t) for t in n.targets)
                 elif isinstance(n, (ast.Import, ast.ImportFrom)):
                     opaque |= any((al.asname or al.name.split(".")[0]) == name for al in n.names)
                 elif isinstance(n, (ast.Global, ast.Nonlocal)):
                     opaque |= name in n.names
                 elif isinstance(n, ast.ExceptHandler):
                     opaque |= n.name == name
-                opaque |= any(
-                    isinstance(x, ast.Name) and x.id == name for t in targets for x in ast.walk(t)
-                )
+                elif isinstance(n, ast.match_case):
+                    opaque |= name in _named_targets(n.pattern)
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    opaque |= n.name == name
             if opaque:
-                return None
+                return _Binding(None, None, None, here)
             if values:
-                return values
+                return _Binding(None, None, values, here)
         return None
+
+    def values_of(self, name: str) -> tuple[list[ast.expr], _Scope] | None:
+        """The plain values of ``name`` and the scope they resolve in, if all are readable."""
+        b = self.lookup(name)
+        if b is None or b.values is None:
+            return None
+        return b.values, b.scope
+
+
+def _within(node: ast.AST, root: ast.AST) -> bool:
+    return any(x is node for x in ast.walk(root))
+
+
+def _in_body(child: ast.AST, scope: ast.AST) -> bool:
+    """``child`` (a direct child of ``scope``) belongs to its body, not its signature/header."""
+    body = getattr(scope, "body", None)
+    if isinstance(body, list):
+        return any(child is s for s in body)
+    return child is body  # Lambda: body is a single expression
+
+
+def _walk_comp(comp: ast.AST) -> list[ast.AST]:
+    """Nodes of a comprehension, descending into nested comprehensions but not functions."""
+    out: list[ast.AST] = []
+    todo = list(ast.iter_child_nodes(comp))
+    while todo:
+        n = todo.pop()
+        if isinstance(n, (*_FUNCS, ast.ClassDef)):
+            continue
+        out.append(n)
+        todo.extend(ast.iter_child_nodes(n))
+    return out
 
 
 _PATH_TYPES = frozenset(
@@ -197,11 +301,12 @@ def _is_path_expr(node: ast.expr, scope: _Scope, depth: int = 0) -> bool:
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
         return True
     if isinstance(node, ast.Name) and depth < _MAX_DEPTH:
-        p = scope.param(node.id)
-        if p is not None:
-            return _mentions_path_type(p[0].annotation)
-        values = scope.values_of(node.id)
-        return values is not None and all(_is_path_expr(v, scope, depth + 1) for v in values)
+        b = scope.lookup(node.id)
+        if b is None:
+            return False
+        if b.param is not None:
+            return _mentions_path_type(b.param.annotation)
+        return b.values is not None and all(_is_path_expr(v, b.scope, depth + 1) for v in b.values)
     return False
 
 
@@ -213,11 +318,12 @@ def _provably_mode(node: ast.expr, scope: _Scope, depth: int = 0) -> bool:
     if isinstance(node, ast.IfExp):
         return _provably_mode(node.body, scope, depth) and _provably_mode(node.orelse, scope, depth)
     if isinstance(node, ast.Name) and depth < _MAX_DEPTH:
-        p = scope.param(node.id)
-        if p is not None:
-            return p[1] is not None and _is_mode_literal(p[1])
-        values = scope.values_of(node.id)
-        return values is not None and all(_provably_mode(v, scope, depth + 1) for v in values)
+        b = scope.lookup(node.id)
+        if b is None:
+            return False
+        if b.param is not None:
+            return b.default is not None and _is_mode_literal(b.default)
+        return b.values is not None and all(_provably_mode(v, b.scope, depth + 1) for v in b.values)
     return False
 
 
@@ -271,7 +377,7 @@ def _unpinned_writers(source: str, filename: str) -> list[str]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        scope = _Scope(node, parents)
+        scope = _Scope.at(node, parents)
         func = node.func
         kwargs = {k.arg: k.value for k in node.keywords if k.arg is not None}
         if "newline" in kwargs or any(k.arg is None for k in node.keywords):
@@ -354,6 +460,38 @@ def test_every_script_text_writer_declares_newline() -> None:
         ("for m in modes:\n    open(f, m)", True),
         ("m = m\nopen(f, m)", True),
         ("m = m\np.open(m)", False),
+        # PR-gate #359 @ 948a718 (1): an enclosing function's binding is visible (closures).
+        ('def outer():\n    m = "w"\n    def inner(p):\n        p.open(m)', True),
+        ('def outer():\n    m = "r"\n    def inner(p):\n        p.open(m)', False),
+        ('m = "r"\ndef outer():\n    m = "w"\n    def inner(p):\n        p.open(m)', True),
+        ('def outer(m="w"):\n    def inner(p):\n        p.open(m)', True),
+        ("def outer(q: Path):\n    def inner(m):\n        q.open(m)", True),
+        # a value resolves where it was written, not where the name is used
+        ('m = "w"\ndef outer():\n    k = m\n    def inner(m):\n        p.open(k)', True),
+        # PR-gate #359 @ 948a718 (2): comprehension targets are the comprehension's own ...
+        ('m = "w"\n_ = [m for m in ("r",)]\np.open(m)', True),
+        ('m = "w"\n_ = {m: 1 for m in xs}\np.open(m)', True),
+        ('m = "w"\n_ = list(m for m in xs)\np.open(m)', True),
+        # ... but inside the comprehension the target shadows the outer name
+        ('m = "w"\n_ = [p.open(m) for m in xs]', False),
+        ('m = "w"\n_ = [open(f, m) for m in xs]', True),
+        # ... the first iterable is evaluated outside; := inside binds outside (PEP 572)
+        ('m = "w"\n_ = [x for x in p.open(m)]', True),
+        ('m = "w"\n_ = [(m := y) for y in xs]\np.open(m)', False),
+        # PR-gate #359 @ 948a718 (3): a match capture rebinds the name
+        ('m = "w"\nmatch val:\n    case m:\n        pass\np.open(m)', False),
+        ('m = "w"\nmatch val:\n    case [*m]:\n        pass\np.open(m)', False),
+        ('m = "w"\nmatch val:\n    case {**m}:\n        pass\np.open(m)', False),
+        ('m = "w"\nmatch val:\n    case [x] if x:\n        pass\np.open(m)', True),
+        # other rebindings that must not be read as the plain value
+        ('m = "w"\ndel m\np.open(m)', False),
+        ('m = "w"\ndef m():\n    pass\np.open(m)', False),
+        ('m = "w"\ntry:\n    pass\nexcept E as m:\n    pass\np.open(m)', False),
+        # a class body is a scope for code directly in it, not for its methods
+        ('class C:\n    m = "w"\n    p.open(m)', True),
+        ('m = "r"\nclass C:\n    m = "w"\n    def f(self, p):\n        p.open(m)', False),
+        # defaults are evaluated in the enclosing scope
+        ('m = "w"\ndef f(p, x=p.open(m)):\n    m = "r"', True),
         ('p.open("r+")', True),
         # PR-gate #356 bb73652: module / archive opens take (file, mode), not (mode, ...).
         ('gzip.open(path, "rb")', False),
