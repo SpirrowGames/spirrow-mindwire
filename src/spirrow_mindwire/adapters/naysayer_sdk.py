@@ -873,11 +873,16 @@ class NaysayerSdkAdapter:
                             message=str(shutdown_exc),
                             raised_at=datetime.now(UTC),
                         )
-                        raise NaysayerSdkDeliveryError(
+                        shutdown_err = NaysayerSdkDeliveryError(
                             f"per-turn client shutdown failed for session "
                             f"{handle.session_id} after a successful turn "
                             f"(subprocess may have leaked): {shutdown_exc}"
-                        ) from shutdown_exc
+                        )
+                        # Same value as ``session.error.code`` above, on the exception itself so
+                        # the conductor's ``error_code=`` names it without reading the session
+                        # (T-successful-turn-quarantined-on-sdk-lifecycle-failure, msg-4440).
+                        shutdown_err.code = "adapter.shutdown_failed"  # type: ignore[attr-defined]
+                        raise shutdown_err from shutdown_exc
                     # The main path was ALREADY raising when shutdown failed
                     # (state / session.error / the exception itself are all
                     # set by the except blocks above). Re-raising the shutdown

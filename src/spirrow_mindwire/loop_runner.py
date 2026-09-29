@@ -77,6 +77,7 @@ from .adapters.decider_lexora import build_decider
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
+from .conductor.core import ConductorStopSlot, ConductorStopSnapshot, StopReason
 from .config import (
     MindwireSettings,
     NaysayerGatingConfig,
@@ -755,6 +756,7 @@ def build_conductor(
     implementer: RoleAdapter | None = None,
     naysayer: RoleAdapter | None = None,
     pr_review_driver: NaysayerPrReviewDriver | None = None,
+    stop_slot: ConductorStopSlot | None = None,
 ) -> Stage3Conductor:
     """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
 
@@ -849,13 +851,34 @@ def build_conductor(
             # degrades to the pre-wiring path (fire the gate) inside ``Conductor._admit``.
             rollup_source=_PerCallCheckRollupSource(),
             decider=decider,
+            # Adapter-error side channel (T-successful-turn-quarantined-on-sdk-lifecycle-failure,
+            # Bohr msg-4440 D-1''): read by ``main`` to print the single ``conductor stopped:``
+            # line when a dispatch raised. ``None`` = no reader (tests, library callers).
+            stop_slot=stop_slot,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc
     return Stage3Conductor(mcp=mcp, registry=registry, dispatcher=dispatcher, conductor=conductor)
 
 
-async def run_conductor(settings: MindwireSettings) -> ConductorOutcome:
+def format_adapter_error_stop_line(snapshot: ConductorStopSnapshot) -> str:
+    """Render the single ``conductor stopped:`` line for an adapter error (Bohr msg-4440 D-2').
+
+    Same field order as :meth:`Conductor._stop` so the wrapper's ``Get-ConductorVerdict`` reads it
+    with the regexes it already has, plus a trailing ``error_code=`` (never empty — see
+    :func:`~spirrow_mindwire.conductor.core.adapter_error_code`). ``last_msg=None`` mirrors
+    ``_stop``'s rendering of a missing id, which the wrapper already parses as absence.
+    """
+    return (
+        f"conductor stopped: reason={StopReason.ADAPTER_ERROR.value} rounds={snapshot.rounds} "
+        f"forced_naysayer={snapshot.forced} forced_naysayer_saveable={snapshot.forced_saveable} "
+        f"last_msg={snapshot.last_msg_id} error_code={snapshot.error_code}"
+    )
+
+
+async def run_conductor(
+    settings: MindwireSettings, *, stop_slot: ConductorStopSlot | None = None
+) -> ConductorOutcome:
     """Build the conductor, drive the task thread once to a stop condition, and tear it down.
 
     Like :func:`run_loop`, runs the composition-root preflight
@@ -870,7 +893,7 @@ async def run_conductor(settings: MindwireSettings) -> ConductorOutcome:
     spawned adapter sessions are closed in ``finally`` so SDK subprocesses don't leak on shutdown.
     """
     _preflight(settings.loop)
-    cond = build_conductor(settings)
+    cond = build_conductor(settings, stop_slot=stop_slot)
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
         settings.loop.project,
@@ -1015,9 +1038,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     settings = load_settings()
+    # Created OUTSIDE ``asyncio.run`` so the except blocks below can read it after the loop has
+    # unwound (Bohr msg-4440 D-1''/D-2'). Only the conductor mode writes it.
+    stop_slot = ConductorStopSlot()
     try:
         if args.mode == "conductor":
-            asyncio.run(run_conductor(settings))
+            asyncio.run(run_conductor(settings, stop_slot=stop_slot))
         else:
             asyncio.run(run_loop(settings))
     except KeyboardInterrupt:
@@ -1073,17 +1099,33 @@ def main() -> None:
         # excepthook special-cases NOT to print. So the marker is provably the
         # last thing on stdout, and the traceback is preserved above it.
         #
-        # For any OTHER exception the block is a no-op — the plain ``raise``
-        # keeps existing behaviour unchanged.
+        # For any OTHER exception with no adapter-error snapshot (below) the
+        # block is a no-op — the plain ``raise`` keeps existing behaviour.
+        #
+        # Adapter-error stop line (T-successful-turn-quarantined-on-sdk-lifecycle-failure, Bohr
+        # msg-4440 D-2'): when the conductor recorded a snapshot in ``stop_slot`` (a dispatch
+        # raised), this is the ONE place that prints ``conductor stopped: reason=adapter_error
+        # … error_code=<code>`` — the conductor itself prints nothing for this case, so the
+        # wrapper's ``Select-Object -Last 1`` parser can never read a second, emptier line.
+        # Order: traceback → stop line → (SDK marker, if any) → ``sys.exit(1)``, which keeps the
+        # PR #181 contract "the marker is the last stdout line". ``KeyboardInterrupt`` and
+        # ``EnvironmentTerminalError`` are handled above and never reach here, so exit=2 and the
+        # clean interrupt stay line-free. No snapshot (a failure outside the dispatch) keeps the
+        # pre-change behaviour exactly.
         sig = find_sdk_error_signal(exc)
-        if sig is None:
+        snapshot = stop_slot.snapshot
+        if sig is None and snapshot is None:
             raise
         import traceback
 
         traceback.print_exception(exc, file=sys.stdout)
         sys.stdout.flush()
-        emit_sdk_error_marker(sig.detail)
-        sys.stdout.flush()
+        if snapshot is not None:
+            print(format_adapter_error_stop_line(snapshot), file=sys.stdout)
+            sys.stdout.flush()
+        if sig is not None:
+            emit_sdk_error_marker(sig.detail)
+            sys.stdout.flush()
         # SystemExit with an int argument bypasses the default excepthook's
         # traceback print, so nothing more lands on stderr after the marker.
         # Exit code stays 1 to match the pre-change behaviour the wrapper's
@@ -1104,6 +1146,7 @@ __all__ = [
     "build_proposer",
     "build_registry",
     "build_watches",
+    "format_adapter_error_stop_line",
     "main",
     "run_conductor",
     "run_loop",
