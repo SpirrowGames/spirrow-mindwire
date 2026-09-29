@@ -173,9 +173,17 @@ def test_stand_down_exits_3_through_main(monkeypatch: pytest.MonkeyPatch, tmp_pa
         loop_runner, "load_settings", lambda: _settings(repo_dir=tmp_path, project="")
     )
     monkeypatch.setattr("sys.argv", ["mindwire-loop", "--mode", "conductor"])
+    # Hermetic: ``main()`` takes no injected client, so ``run_conductor`` builds the real
+    # ``StreamableHttpChatroomMcp`` — which fails fast when MINDWIRE_MAGICKIT_MCP_URL is unset
+    # (CI) and would otherwise reach the LIVE magickit on a host where it is set. Unset the
+    # variable so local runs match CI, and substitute the fake so no transport is built at all.
+    monkeypatch.delenv("MINDWIRE_MAGICKIT_MCP_URL", raising=False)
+    mcp = _ResolutionMcp()
+    monkeypatch.setattr(loop_runner, "StreamableHttpChatroomMcp", lambda: mcp)
     with pytest.raises(SystemExit) as excinfo:
         loop_runner.main()
     assert excinfo.value.code == STAND_DOWN_EXIT_CODE
+    assert mcp.posts() == []  # thread unresolved → nothing posted (Bohr msg-4569)
 
 
 # --------------------------------------------------------------------------- #
