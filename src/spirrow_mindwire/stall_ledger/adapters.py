@@ -25,9 +25,11 @@ most once per record it opens without a trustworthy stored record.
 How each adapter maps its source onto the ledger's inputs is written on the adapter.
 Those mappings are the implementer's reading of the existing predicate types
 (``PrState`` / ``ThreadState`` / ``QuarantineState`` and ``ClassifierInput``); the
-spec names the sources and the invariants, not the field-by-field mapping, and every
-choice below leans to the loud side (a unit reads as needing an actor, or as
-unclassified) when the source cannot tell.
+spec names the sources and the invariants, not the field-by-field mapping. Where the
+source cannot tell, the choice leans to the loud side (a unit reads as needing an
+actor, or as unclassified) -- with ONE stated exception: :class:`ChatroomThreadAdapter`
+uses the 72h ``other_thread`` threshold for every thread, which is the QUIET side for a
+thread that was actually nominated (6h). The adapter's docstring says why.
 """
 
 from __future__ import annotations
@@ -461,9 +463,11 @@ class ChatroomThreadAdapter:
     * ``ThreadState.status`` = the listing's ``status``; ``dormant_until_expired`` is
       always True, because the listing carries no dormant-until pin -- reading every
       thread as un-pinned is the loud side.
-    * ``N`` = ``other_thread`` (72h). Telling a nominated thread (6h) apart needs the
-      last message's ``next_participant``, i.e. one body fetch per thread per heartbeat,
-      which the listing-only contract (msg-4683 §3-1) does not allow.
+    * ``N`` = ``other_thread`` (72h). **This is the quiet side** for a thread that was
+      actually nominated (``thread_with_nomination`` = 6h): such a stall opens up to
+      66h late. Telling the two apart needs the last message's ``next_participant``,
+      i.e. one body fetch per thread per heartbeat, which the listing-only contract
+      (msg-4683 §3-1) does not allow. Recorded as a known quiet-side residual.
     * motion: the thread head as one ``chatroom_msg`` event (``last_msg_id`` at
       ``last_activity_at``). That is the newest motion, which is all E needs.
     * ``ClassifierInput`` is all-False -> ``unclassified``.
