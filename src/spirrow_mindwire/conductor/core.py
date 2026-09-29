@@ -89,6 +89,7 @@ from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
 from ..value_objects import (
     ChatroomEvent,
+    Event,
     EventType,
     NewMessagePayload,
     Role,
@@ -105,6 +106,13 @@ from .gate_records import (
 )
 from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, parse_next_token, resolve_handoff
 from .roster import RoleResolutionError, derive_identity_by_role
+from .stand_down import (
+    StandDownError,
+    StandDownReason,
+    UnresolvedItem,
+    emit_stand_down,
+    stand_down_event,
+)
 
 if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
@@ -632,8 +640,20 @@ class Conductor:
                 # treatment the R3/R5 admission escalation gets — so the sweep records the stop
                 # against the message a human will actually open.
                 notice = self._terminal_notice(handoff, _author(latest), stop_reason)
+                # T44 (Bohr msg-4569 異議 1): an identity that did not resolve is a stand-down, and
+                # the thread HAS resolved, so the report goes to this thread — never elsewhere. The
+                # decision is the one ``_route`` already made (``spawn_blocked`` / NO_HANDOFF on a
+                # named-but-unknown target); this only names it on the event log.
+                stand_down = self._identity_stand_down(handoff, stop_reason, spawn_blocked)
+                if stand_down is not None:
+                    emit_stand_down(stand_down)
                 if notice is not None:
                     posted = await self._post_as_relay(notice)
+                    if stand_down is not None and not _msg_id(posted):
+                        # "chatroom で言えたら exit 0、言えなかったら非 0" (msg-4569): the notice
+                        # did not land (resolved thread / no msg_id), so this stop is silent in the
+                        # chatroom and must exit non-zero → wrapper quarantine + Discord.
+                        raise StandDownError(stand_down)
                     latest_msg_id = _msg_id(posted) or latest_msg_id
                 else:
                     # T-human-terminal-overuse D-1 (Bohr msg-2540 approved by Einstein msg-2539).
@@ -1024,6 +1044,53 @@ class Conductor:
                 f"次にやること: `{identity}` に依頼する内容であれば、その本人が投稿してから"
                 f"スレッドを進めてください。\n\n"
                 f"NEXT: {HUMAN_TOKEN}"
+            )
+        if reason is StopReason.NO_HANDOFF and handoff.kind is HandoffKind.ABSENT and handoff.token:
+            # T44 (Einstein msg-4548 / Bohr msg-4569 異議 1): ``NEXT: Bohrr`` — the head names a
+            # target, so a reader of the head believes someone was started. Without this line the
+            # thread just stops; that is the silent stop T44 exists to remove.
+            return (
+                f"Conductor stand-down — `NEXT:` の宛先が解決できません\n\n"
+                f"head の `NEXT:` は `{handoff.token}` を指していますが、これは roster の参加者"
+                f"でも `human` / `none` / `pr-review` でもありません (typo の可能性があります)。"
+                f"\n\n∴ 誰も spawn せず、人間の介入が必要な停止として扱いました "
+                f"(`conductor.stand_down` unresolved=identity)。\n\n"
+                f"次にやること: 正しい参加者名で `NEXT:` を書き直すか、`NEXT: human` で"
+                f"明示的に預けてください。head が動くまでループは再開しません。\n\n"
+                f"NEXT: {HUMAN_TOKEN}"
+            )
+        return None
+
+    def _identity_stand_down(
+        self, handoff: Handoff, reason: StopReason, spawn_blocked: bool
+    ) -> Event | None:
+        """The ``conductor.stand_down`` event for a stop caused by an unresolved identity.
+
+        Reads the decision ``_route`` already made rather than re-deriving it (no parallel
+        identity check, msg-4569): ``spawn_blocked`` is the router's own flag, and the unknown
+        target is the NO_HANDOFF stop on a head whose ``NEXT:`` named *something* (``token`` set)
+        that is neither a roster participant nor a sentinel. A head with no ``NEXT:`` at all is
+        not an identity failure — nothing was named — and stays out of this vocabulary.
+        """
+        project = self._thread_ref.project_id
+        thread = self._thread_ref.thread_id
+        if spawn_blocked:
+            blocked = self._spawn_blocked(handoff)
+            name, embodiment = blocked if blocked is not None else (handoff.token or "", "?")
+            return stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=StandDownReason.IDENTITY_NOT_SPAWNABLE,
+                project=project,
+                thread=thread,
+                detail=f"NEXT target {name!r} has embodiment {embodiment!r} (no adapter)",
+            )
+        if reason is StopReason.NO_HANDOFF and handoff.kind is HandoffKind.ABSENT and handoff.token:
+            return stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=StandDownReason.IDENTITY_UNRESOLVED,
+                project=project,
+                thread=thread,
+                detail=f"NEXT target {handoff.token!r} is not a roster participant or a sentinel",
             )
         return None
 

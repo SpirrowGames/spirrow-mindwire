@@ -78,6 +78,7 @@ from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .conductor.core import ConductorStopSlot, ConductorStopSnapshot, StopReason
+from .conductor.stand_down import post_stand_down_notice, resolve_launch
 from .config import (
     MindwireSettings,
     NaysayerGatingConfig,
@@ -877,7 +878,10 @@ def format_adapter_error_stop_line(snapshot: ConductorStopSnapshot) -> str:
 
 
 async def run_conductor(
-    settings: MindwireSettings, *, stop_slot: ConductorStopSlot | None = None
+    settings: MindwireSettings,
+    *,
+    stop_slot: ConductorStopSlot | None = None,
+    mcp: McpToolCaller | None = None,
 ) -> ConductorOutcome:
     """Build the conductor, drive the task thread once to a stop condition, and tear it down.
 
@@ -891,9 +895,49 @@ async def run_conductor(
     no-progress human fallback / the round cap). This entry therefore drives one design thread to
     its stop and exits — re-arming after the human responds is an operator / follow-up concern. The
     spawned adapter sessions are closed in ``finally`` so SDK subprocesses don't leak on shutdown.
+
+    T44 fail-closed resolution (T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down,
+    Bohr msg-4569): before the preflight and before any adapter is built, project → thread →
+    repo_dir are resolved by :func:`~spirrow_mindwire.conductor.stand_down.resolve_launch`. An
+    unresolved project / thread raises :class:`~spirrow_mindwire.conductor.stand_down.
+    StandDownError` (exit 3 → wrapper quarantine). An unresolved repo_dir in a resolved thread is
+    posted there ending ``NEXT: human`` and the run returns a HUMAN stop (exit 0). Nothing is
+    spawned on either path. ``mcp`` is injectable for tests; the same client is handed to
+    :func:`build_conductor` so resolution and the run read the chatroom through one transport.
     """
+    if mcp is None:
+        mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
+    project = settings.loop.project
+    thread_id = settings.conductor.task_thread_id
+    resolution = await resolve_launch(
+        mcp=mcp,
+        project=project,
+        thread_id=thread_id,
+        repo_dir=settings.loop.repo_dir,
+    )
+    if resolution.stand_down is not None:
+        posted = await post_stand_down_notice(
+            mcp, project=project, thread_id=thread_id, event=resolution.stand_down
+        )
+        # Same ``conductor stopped:`` line shape as ``Conductor._stop`` so the wrapper's
+        # ``Get-ConductorVerdict`` parses it with no change. HUMAN (not a new reason) for the same
+        # reason the spawn-unavailable stop uses it: the operator's notification set is keyed on
+        # the reason string, and this IS a stop that waits on a person.
+        outcome = ConductorOutcome(
+            rounds=0,
+            stop_reason=StopReason.HUMAN,
+            last_msg_id=posted,
+            forced_naysayer_turns=0,
+        )
+        logger.info(
+            "conductor stopped: reason=%s rounds=0 forced_naysayer=0 "
+            "forced_naysayer_saveable=0 last_msg=%s",
+            outcome.stop_reason.value,
+            posted,
+        )
+        return outcome
     _preflight(settings.loop)
-    cond = build_conductor(settings, stop_slot=stop_slot)
+    cond = build_conductor(settings, mcp=mcp, stop_slot=stop_slot)
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
         settings.loop.project,
