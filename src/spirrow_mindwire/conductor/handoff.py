@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from ..github.client import parse_pr_ref
@@ -266,6 +266,83 @@ _TIER_C_LABEL_RE = re.compile(
 )
 
 
+# ---- STOP: disposition line (T-next-line-carries-who-not-why, Slice 1 — Bohr msg-4718 §1) ---- #
+# `NEXT:` says WHO acts next; it cannot say WHY nobody does. `NEXT: none` today collapses four
+# situations (msg-2014 §1: done / awaiting a decision / waiting on a condition / forgot to
+# nominate). The design keeps the `NEXT:` grammar untouched (D-1) and carries the "why" on a
+# sibling line immediately above the final `NEXT: none`:
+#
+#     STOP: done
+#     STOP: blocked-on <thread:|pr:|deploy:|queue-empty:><operand> wake:<agent>
+#
+# Slice 1 is a DARK LAUNCH (msg-4718 §1): this module PARSES the line into a typed value and the
+# conductor LOGS it on the measurement-only path TIER-C already uses. Nothing is rejected, nothing
+# is forwarded to magickit, routing is unchanged, and the emission prompt
+# (`_HANDOFF_PROTOCOL_CORE`) deliberately does NOT teach the form — a prompt that promises
+# "write this and the thread resolves / parks" must ship in the same unit as the mechanism that
+# keeps that promise (Einstein msg-4717 BLOCKING, accepted in msg-4718 §0/§2).
+#
+# The form is FIXED and read strictly (msg-4718 §1-1: "崩れた行は寛容に読まず malformed"). The
+# `STOP:` keyword itself is detected loosely (case, leading decoration, whitespace after the
+# colon) on purpose: a loosely-written STOP line must land in MALFORMED, where it is visible, and
+# never fall through to ABSENT, where it would silently inflate the unclassified baseline — the
+# same corruption TIER-C's relaxed keyword guards against. Everything AFTER the keyword must match
+# the fixed form exactly.
+#
+# `human` as a trigger or a wake is MALFORMED (B-5, msg-4716 §2): an agent's only route to stop
+# on a human is `NEXT: human`, which is the Decider's entry. `parked(human, human)` is reserved
+# for the mechanism's own D-8 ③ fallback and is never read off an author's line.
+STOP_TRIGGER_ARMS: tuple[str, ...] = ("thread", "pr", "deploy", "queue-empty")
+
+_STOP_KEYWORD_RE = re.compile(r"\A[\s*_`>]*(?P<keyword>STOP):\s*(?P<rest>.*?)\s*\Z", re.IGNORECASE)
+_STOP_BLOCKED_ON_RE = re.compile(
+    r"\Ablocked-on (?P<arm>"
+    + "|".join(re.escape(arm) for arm in STOP_TRIGGER_ARMS)
+    + r"):(?P<operand>\S+) wake:(?P<wake>\S+)\Z"
+)
+
+
+class StopStatus(StrEnum):
+    """What the line above a final ``NEXT: none`` says about why the thread stops.
+
+    ``ABSENT`` is the measurement Slice 1 exists for (msg-4718 §1-2(b)): a ``NEXT: none`` with no
+    ``STOP:`` line is the pre-cutover ``unclassified`` denominator. ``DONE`` / ``BLOCKED_ON`` are
+    the two accepted forms; together they are "present". ``MALFORMED`` is a line that announced
+    itself as ``STOP:`` but did not match the fixed form (including any ``human`` trigger/wake).
+    """
+
+    ABSENT = "absent"
+    DONE = "done"
+    BLOCKED_ON = "blocked_on"
+    MALFORMED = "malformed"
+
+    @property
+    def presence(self) -> str:
+        """The 3-valued presence the log records: ``present`` / ``absent`` / ``malformed``."""
+        if self is StopStatus.ABSENT:
+            return "absent"
+        if self is StopStatus.MALFORMED:
+            return "malformed"
+        return "present"
+
+
+@dataclass(frozen=True)
+class StopLine:
+    """The typed ``STOP:`` disposition parsed off the line above a final ``NEXT: none``.
+
+    ``trigger_arm`` / ``trigger_operand`` / ``wake`` are set only for ``BLOCKED_ON``; ``wake`` is
+    the roster's canonical identity. ``raw`` is the stripped line for every status except
+    ``ABSENT`` (so a MALFORMED line can be read back from the log). Slice 1's only consumer is the
+    measurement log; the typed value exists so the later slice's forwarding has one parser.
+    """
+
+    status: StopStatus
+    trigger_arm: str | None = None
+    trigger_operand: str | None = None
+    wake: str | None = None
+    raw: str | None = None
+
+
 @dataclass(frozen=True)
 class Handoff:
     """The resolved handoff target of a message's final ``NEXT:`` line.
@@ -304,6 +381,11 @@ class Handoff:
     ``token`` is intentionally NOT enforced by the type: the invariant is inherited from
     #184 and left as-is here (the scope of this change is the reason-code split, not the
     surrounding token invariants — see PR body §「非目標」).
+
+    ``stop_line`` is the ``STOP:`` disposition (T-next-line-carries-who-not-why Slice 1): set to a
+    :class:`StopLine` exactly when ``kind is HandoffKind.NONE`` — including ``StopStatus.ABSENT``
+    when no such line was written — and ``None`` on every other kind (not measured there). Like
+    ``tier_c_label`` it is measurement only: nothing routes differently on it.
     """
 
     kind: HandoffKind
@@ -313,6 +395,7 @@ class Handoff:
     tier_c_label: str | None = None
     mismatch_reason: MismatchReason | None = None
     mismatch_body_token: str | None = None
+    stop_line: StopLine | None = None
 
 
 def _last_next_raw(body: str) -> str | None:
@@ -327,6 +410,65 @@ def _last_next_raw(body: str) -> str | None:
     if not matches:
         return None
     return str(matches[-1]).strip() or None
+
+
+def _line_above_last_next(body: str) -> str | None:
+    """The line immediately above the **last** ``NEXT:`` line, or ``None`` if there is none.
+
+    Shared by the two annotation readers (``TIER-C:`` and ``STOP:``) so both look at exactly the
+    same line: n-1 where n is the final ``NEXT:``, no blank-line skipping, no wider window.
+    """
+    matches = list(_NEXT_LINE_RE.finditer(body))
+    if not matches:
+        return None
+    last_next_start = matches[-1].start()
+    if last_next_start == 0:
+        return None
+    # The ``^`` of the last NEXT: line sits at ``last_next_start``; the previous line's ``\n``
+    # is at ``last_next_start - 1`` (if the file starts at 0, MULTILINE's ``^`` also matches
+    # position 0, which we already excluded above).
+    prev_line_end = last_next_start - 1  # exclusive of the delimiting \n
+    prev_line_start = body.rfind("\n", 0, prev_line_end) + 1  # rfind returns -1 → 0
+    return body[prev_line_start:prev_line_end]
+
+
+def _stop_line_above_last_next(body: str, roster: Mapping[str, Role]) -> StopLine:
+    """Parse the ``STOP:`` disposition on the line above the last ``NEXT:`` (Slice 1, msg-4718 §1).
+
+    Never raises and never returns ``None``: the caller only asks on a ``NEXT: none`` terminal,
+    where "no STOP line" is itself the measurement (``StopStatus.ABSENT``). ``wake`` must resolve
+    on the roster (a registered agent of this thread); ``human`` / ``none`` / an unknown name is
+    ``MALFORMED``. There is no ``human`` trigger arm, so ``blocked-on human`` is ``MALFORMED`` too.
+    """
+    line = _line_above_last_next(body)
+    if line is None:
+        return StopLine(StopStatus.ABSENT)
+    keyword = _STOP_KEYWORD_RE.match(line)
+    if keyword is None:
+        return StopLine(StopStatus.ABSENT)
+    rest = keyword.group("rest")
+    raw = line.strip()
+    if keyword.group("keyword") != "STOP":
+        # Detected (so not ABSENT) but not the fixed spelling: `stop: done` is MALFORMED.
+        return StopLine(StopStatus.MALFORMED, raw=raw)
+    if rest == "done":
+        return StopLine(StopStatus.DONE, raw=raw)
+    blocked = _STOP_BLOCKED_ON_RE.match(rest)
+    if blocked is None:
+        return StopLine(StopStatus.MALFORMED, raw=raw)
+    wake = blocked.group("wake")
+    if wake.casefold() in (HUMAN_TOKEN, NONE_TOKEN):
+        return StopLine(StopStatus.MALFORMED, raw=raw)
+    resolved = _roster_lookup(roster, wake)
+    if resolved is None:
+        return StopLine(StopStatus.MALFORMED, raw=raw)
+    return StopLine(
+        StopStatus.BLOCKED_ON,
+        trigger_arm=blocked.group("arm"),
+        trigger_operand=blocked.group("operand"),
+        wake=resolved[0],
+        raw=raw,
+    )
 
 
 def _tier_c_label_above_last_next(body: str) -> str | None:
@@ -347,18 +489,9 @@ def _tier_c_label_above_last_next(body: str) -> str | None:
     :func:`resolve_handoff` reports for :attr:`Handoff.kind` — the tag is additive observability
     only.
     """
-    matches = list(_NEXT_LINE_RE.finditer(body))
-    if not matches:
+    prev_line = _line_above_last_next(body)
+    if prev_line is None:
         return None
-    last_next_start = matches[-1].start()
-    if last_next_start == 0:
-        return None
-    # The ``^`` of the last NEXT: line sits at ``last_next_start``; the previous line's ``\n``
-    # is at ``last_next_start - 1`` (if the file starts at 0, MULTILINE's ``^`` also matches
-    # position 0, which we already excluded above).
-    prev_line_end = last_next_start - 1  # exclusive of the delimiting \n
-    prev_line_start = body.rfind("\n", 0, prev_line_end) + 1  # rfind returns -1 → 0
-    prev_line = body[prev_line_start:prev_line_end]
     match = _TIER_C_LABEL_RE.match(prev_line)
     if match is None:
         return None
@@ -435,9 +568,16 @@ def resolve_handoff(
     body_handoff = _resolve_body(body, roster)
     field_value = next_participant.strip() if next_participant is not None else ""
     if not field_value:
-        return body_handoff
-    field_handoff = _resolve_field(field_value, roster)
-    return _reconcile(field_handoff, body_handoff)
+        resolved = body_handoff
+    else:
+        resolved = _reconcile(_resolve_field(field_value, roster), body_handoff)
+    if resolved.kind is HandoffKind.NONE:
+        # STOP: disposition (Slice 1, measurement only). Attached AFTER reconciliation so a
+        # field-driven NONE whose body also says `NEXT: none` keeps the body's STOP line instead
+        # of being miscounted as ABSENT. A field NONE with no body NEXT: has no line above any
+        # NEXT:, which reads as ABSENT — correct: nobody wrote a STOP line.
+        resolved = replace(resolved, stop_line=_stop_line_above_last_next(body, roster))
+    return resolved
 
 
 def _resolve_body(body: str, roster: Mapping[str, Role]) -> Handoff:
@@ -713,10 +853,13 @@ __all__ = [
     "HUMAN_TOKEN",
     "NONE_TOKEN",
     "PR_REVIEW_TOKEN",
+    "STOP_TRIGGER_ARMS",
     "TIER_C_LABELS",
     "Handoff",
     "HandoffKind",
     "MismatchReason",
+    "StopLine",
+    "StopStatus",
     "build_handoff_protocol_block",
     "parse_next_token",
     "resolve_handoff",
