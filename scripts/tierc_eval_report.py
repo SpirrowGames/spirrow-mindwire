@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
@@ -411,13 +412,16 @@ def calibration(
                 sum(1 for r in inb if truth[r.key] == "spurious"),
             )
         )
+    # ``math.fsum``, not ``sum``: the AUC counts exact ties, and 3.12+ ``sum`` (compensated) and
+    # 3.11 ``sum`` (plain) land on different last bits — 0.705 vs 0.706 on the committed replay.
+    # ``fsum`` is correctly rounded on every version and gives the committed 0.705.
     pos = [
-        sum(r.scores[k] for k in TIER_C_GENUINE_KEYS)
+        math.fsum(r.scores[k] for k in TIER_C_GENUINE_KEYS)
         for r in scored
         if r.scores is not None and truth[r.key] in GENUINE_CLASSES
     ]
     neg = [
-        sum(r.scores[k] for k in TIER_C_GENUINE_KEYS)
+        math.fsum(r.scores[k] for k in TIER_C_GENUINE_KEYS)
         for r in scored
         if r.scores is not None and truth[r.key] == "spurious"
     ]
