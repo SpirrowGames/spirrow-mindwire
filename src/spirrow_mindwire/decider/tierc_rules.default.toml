@@ -1,0 +1,31 @@
+# Tier-C 五ヶ条 — 「人間に問うべきもの」(Takahito 確定 2026-09-28、T-decider-tierc-v2-all-escalations msg-4361)
+#
+# これは雛形です。実行時に読まれる正本は <data_dir>/config/tierc_rules.toml
+# (mindwire.toml と同じディレクトリ、[decider.tierc].rules_path で上書き可)。
+# 正本の初回配置: `mindwire init-config tierc-rules` (既存ファイルは上書きしない)。
+# 文言を直したら conductor を再起動してください (起動時に 1 回だけ読みます)。
+#
+# 形式: [[rule]] を並べる。id は rule_<番号> (一意)、text は必須、note は任意 (text の下に添えて渡す)。
+# 問いの枠の文 (「このハンドオフは人間に問うべきか」など) はコード側 (decider/questions.py) にあり、
+# ここにはルールの文言だけを書きます。判断に使ったファイルの sha256 は rules_sha256 として記録されます。
+
+[[rule]]
+id = "rule_1"
+text = "金銭的コストの増加が見込まれる変更、アイデアの承認"
+
+[[rule]]
+id = "rule_2"
+text = "対象となるプロジェクトに対して決めた仕様の追加、削除、変更を伴う変更の承認"
+
+[[rule]]
+id = "rule_3"
+text = "取り消せない操作や外部への公開（データ・リポジトリの削除、force push などの履歴書き換え、ストア / SNS など外部への公開）"
+
+[[rule]]
+id = "rule_4"
+text = "人間にしかできない作業の依頼（PAT 等の資格情報の更新、課金・クレジット追加、Takahito の PC での操作、Takahito の手元にしかない情報の提供）"
+
+[[rule]]
+id = "rule_5"
+text = "AI 同士で決着がつかない対立の裁定（proposer と naysayer が合意に至らないとき）"
+note = "目安: naysayer が同じ設計を差し戻し、proposer が改訂する往復が 3 回以上続き、その間に VERDICT: APPROVE がない (state の dispute_rounds がその往復数)"

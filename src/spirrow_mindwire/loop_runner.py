@@ -77,8 +77,14 @@ from .adapters.decider_lexora import build_decider
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
-from .config import MindwireSettings, NaysayerGatingConfig, Stage3LoopConfig, load_settings
-from .decider.verdict import TierCThresholds
+from .config import (
+    MindwireSettings,
+    NaysayerGatingConfig,
+    Stage3LoopConfig,
+    load_settings,
+    resolve_tierc_rules_path,
+)
+from .decider.verdict import TierCThresholds, TierCV2Thresholds
 from .dispatcher.core import Dispatcher
 from .dispatcher.event_log import (
     EVENT_FIELD_AUTHOR,
@@ -804,6 +810,14 @@ def build_conductor(
                 genuine_min=dec_cfg.thresholds.tierc_genuine_min,
                 genuine_max=dec_cfg.thresholds.tierc_genuine_max,
                 spurious_min=dec_cfg.thresholds.tierc_spurious_min,
+            ),
+            # tierc-v2 (msg-4380 / 4382 / 4384): the rules file is read here, once; a missing or
+            # malformed file refuses startup through the ValueError below.
+            questions=dec_cfg.tierc.questions,
+            rules_path=resolve_tierc_rules_path(settings),
+            v2_thresholds=TierCV2Thresholds(
+                ask_min=dec_cfg.thresholds.tierc_v2_ask_min,
+                not_ask_max=dec_cfg.thresholds.tierc_v2_not_ask_max,
             ),
         )
     except ValueError as exc:

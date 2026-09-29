@@ -615,9 +615,10 @@ class Conductor:
 
         Only a ``HandoffKind.HUMAN`` head reaches the hook. The rest of the entry condition is
         decided inside :func:`..decider.hook.run_tierc_hook`: an author-written ``NEXT: human``
-        **and** the author's roster role is ``proposer`` (msg-4237 DECIDED 2c-1 — the rule stop
-        is no longer part of it, so a proposer escalation routed to a forced naysayer consult is
-        evaluated too). This method lifts the facts the hook cannot see: whether the author wrote
+        **and** the author's roster role is ``proposer`` / ``implementer`` / ``naysayer``
+        (T-decider-tierc-v2 msg-4360 / msg-4382; msg-4237 DECIDED 2c-1 — the rule stop is no
+        longer part of it, so an escalation routed to a forced naysayer consult is evaluated
+        too). This method lifts the facts the hook cannot see: whether the author wrote
         the handoff themself (a field/body mismatch also resolves to ``HandoffKind.HUMAN`` but is
         a conductor safety valve, not somebody asking the human), and ``_route``'s own outputs —
         ``stop_reason`` / ``is_forced`` / ``target_role`` / ``spawn_blocked`` plus the configured
@@ -625,9 +626,9 @@ class Conductor:
         ``spawn_blocked``, msg-4239 / msg-4280; any other combination is logged at ERROR with no
         row) rather than inferring it. ``spawn_blocked`` is ``_route``'s own answer; this method
         does not call :meth:`_spawn_blocked` again (Einstein msg-4279). The hook runs the
-        admission gate compute-only (nothing written to the decisions log) and sends the turn to
-        Lexora only when the gate produced a result (msg-4196 DECIDED 1). Every value
-        passed is read only, never modified.
+        admission gate compute-only (nothing written to the decisions log); under tierc-v2 the
+        turn goes to Lexora whether or not the gate produced a result (msg-4380 Δ2). Every
+        value passed is read only, never modified.
         """
         if self._decider is None:
             return

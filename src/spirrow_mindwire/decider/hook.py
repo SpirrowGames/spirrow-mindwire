@@ -1,13 +1,15 @@
-"""Conductor-side Tier-C Decider hook (T-decider-conductor-hook step 2 / 2b / 2c, shadow).
+"""Conductor-side Tier-C Decider hook (T-decider-conductor-hook step 2 / 2b / 2c, tierc-v2; shadow).
 
 Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its rule-based routing
 (``_route``) has decided the turn. What it does:
 
 0. **entry check** (msg-4237 DECIDED 2c-1, :func:`is_tierc_entry`): only a turn whose author
-   wrote ``NEXT: human`` themself and holds the ``proposer`` role in the roster (the caller has
-   already resolved the handoff to ``HUMAN``). The rule stop is **not** part of the entry: a
-   proposer escalation that ``_route`` turned into a forced naysayer consult (``stop=None``) is
-   evaluated too. Any other turn returns at once — no gate, no Lexora call, no log line;
+   wrote ``NEXT: human`` themself and whose roster role is in :data:`TIERC_ENTRY_ROLES` —
+   ``proposer`` / ``implementer`` / ``naysayer`` (T-decider-tierc-v2 msg-4360 / msg-4382,
+   widening 2c-1's ``proposer`` only; the caller has already resolved the handoff to
+   ``HUMAN``). The rule stop is **not** part of the entry: an escalation that ``_route`` turned
+   into a forced naysayer consult (``stop=None``) is evaluated too. Any other turn returns at
+   once — no gate, no Lexora call, no log line;
    ``routed`` (msg-4239 DECIDED 2c-1 revised, :func:`routed_from_route`) then records what
    ``_route`` actually did with the turn — ``stop`` / ``forced_naysayer`` / ``spawn_blocked``
    (msg-4280 DECIDED 2c-4) — read from its return values, never inferred. Each value requires
@@ -18,12 +20,16 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
    :func:`compute_gate_result`): ``retry_lookup`` always ``False``, the decision's log entries
    discarded (nothing is written to the decisions log), a gate exception → ``gate_result=None``;
 2. build the :class:`~.state.DecisionState` (``turn_from_messages`` → ``state_builder`` — the same
-   builder the replay uses) with that ``gate_result``;
+   builder the replay uses) with that ``gate_result`` and the rule_5 feature ``dispute_rounds``
+   (:func:`count_dispute_rounds`, over the whole thread — msg-4380 Δ5);
 3. ask the Decider whether the turn is a target (``decider.is_target`` — mode / head; the rule
-   lives in the Decider, not here); if the gate gave no result, write the empty-``outcome`` line
-   (msg-4196 DECIDED 2) and do not call Lexora (DECIDED 1); otherwise ``decider.evaluate``;
+   lives in the Decider, not here), then ``decider.evaluate``. Under tierc-v2 a turn with
+   ``gate_result=None`` is sent as well (msg-4380 Δ2, overriding msg-4196 DECIDED 1), so the
+   msg-4196 DECIDED 2 "empty-``outcome`` line" no longer exists. (A v1-configured Decider still
+   skips such a turn; ``evaluate`` then returns ``None`` and no line is written.)
 4. ``log_decision(...)`` — every outcome, with ``decision_id`` / ``outcome``, the gate columns
-   ``gate_kind`` / ``gate_is_grey_zone``, the rule ``stop`` and ``routed`` on the same line;
+   ``gate_kind`` / ``gate_is_grey_zone``, the rule ``stop``, ``routed`` and (v2)
+   ``matched_rule`` / ``matched_rule_source`` / ``rules_sha256`` on the same line;
 5. the acting branch is gated on ``routed == "stop"`` (msg-4237 DECIDED 2c-2), on
    ``dr.actionable_verdict`` only (msg-4184) and on a mode of ``annotate`` / ``bounce`` — which is
    refused at build time, so in shadow it never runs. ``forced_naysayer`` and ``spawn_blocked``
@@ -52,6 +58,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -113,6 +120,7 @@ def turn_from_messages(
     roster: Mapping[str, Role],
     messages: Sequence[ThreadMessage],
     gate_result: AdmissionGateResult | None = None,
+    dispute_rounds: int | None = None,
 ) -> SimpleTurn:
     """Thread (oldest → newest) → ``SimpleTurn`` for ``state_builder``.
 
@@ -143,22 +151,41 @@ def turn_from_messages(
         prev_next=prev.parsed_next if prev is not None else None,
         diff_stat=None,
         gate_result=gate_result,
+        dispute_rounds=dispute_rounds,
     )
 
 
-_NOT_CALLED_FIELDS: dict[str, Any] = {
-    "outcome": None,
-    "decision_id": None,
-    "provider": None,
-    "raw_answers": None,
-    "verdict": None,
-    "policy": None,
-    "questions_version": None,
-    "latency_ms": None,
-    "error": None,
-}
-"""The ``decision_result_to_dict`` keys, all empty: the line for a turn the hook targeted but
-did not send to Lexora (msg-4196 DECIDED 2 — ``outcome`` empty)."""
+_VERDICT_APPROVE_RE = re.compile(r"^[\s>*_`]*VERDICT:\s*APPROVE\b", re.MULTILINE)
+"""A naysayer ``VERDICT: APPROVE`` line (markdown emphasis / quote tolerated)."""
+
+
+def count_dispute_rounds(roster: Mapping[str, Role], messages: Sequence[ThreadMessage]) -> int:
+    """The rule_5 feature ``dispute_rounds`` (msg-4380 Δ5): proposer↔naysayer rounds since the
+    last naysayer ``VERDICT: APPROVE``, over the **whole** thread (not the N=5 ``recent_events``).
+
+    Walking oldest → newest, only messages whose author's roster role is ``proposer`` or
+    ``naysayer`` count. A round is a naysayer message without ``VERDICT: APPROVE`` whose
+    preceding counted message is the proposer's — i.e. the naysayer pushed back on a proposer
+    submission. A naysayer ``VERDICT: APPROVE`` resets the count to 0. Other authors
+    (implementer, the human, off-roster relays) neither count nor reset.
+
+    A feature only: nothing escalates on it (automatic escalation after N rounds would change
+    the routing — D20 — and is out of scope, msg-4380 Δ5). The rule_5 note in the rules file
+    names 3 rounds as the guideline the model reads.
+    """
+    rounds = 0
+    last: Role | None = None
+    for m in messages:
+        role = _roster_role(roster, m.author)
+        if role is Role.NAYSAYER:
+            if _VERDICT_APPROVE_RE.search(m.content):
+                rounds = 0
+            elif last is Role.PROPOSER:
+                rounds += 1
+            last = role
+        elif role is Role.PROPOSER:
+            last = role
+    return rounds
 
 
 def log_decision(
@@ -167,7 +194,7 @@ def log_decision(
     round_index: int,
     stop: str | None,
     routed: str,
-    dr: DecisionResult | None,
+    dr: DecisionResult,
     gate_result: AdmissionGateResult | None,
 ) -> dict[str, Any]:
     """Write one decision record to the conductor log and return it (msg-4182).
@@ -176,12 +203,11 @@ def log_decision(
     :func:`decision_result_to_dict` — because the §6.3 tally needs out-of-gate records too.
 
     ``gate_kind`` / ``gate_is_grey_zone`` (msg-4196 DECIDED 2) are ``None`` when the admission
-    gate did not run. ``dr=None`` writes the same keys with ``outcome`` empty — the "hook
-    targeted this turn, Decider not called" line.
+    gate did not run. The msg-4196 DECIDED 2 "targeted but not called" line (``dr=None``) is
+    gone with tierc-v2 (msg-4380 Δ2): a targeted turn is always called.
 
-    ``routed`` (msg-4237 DECIDED 2c-3) is a record-level column like ``stop``, so the called line
-    and the empty-``outcome`` line carry it alike — it is not a ``decision_result_to_dict`` key
-    and therefore not part of ``_NOT_CALLED_FIELDS``.
+    ``routed`` (msg-4237 DECIDED 2c-3) is a record-level column like ``stop`` — it is not a
+    ``decision_result_to_dict`` key.
     """
     record: dict[str, Any] = {
         "thread_id": thread_id,
@@ -194,7 +220,7 @@ def log_decision(
             else None
         ),
         "gate_is_grey_zone": gate_result.is_grey_zone if gate_result is not None else None,
-        **(decision_result_to_dict(dr) if dr is not None else _NOT_CALLED_FIELDS),
+        **decision_result_to_dict(dr),
     }
     logger.info("decider_decision %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
     return record
@@ -216,8 +242,15 @@ every mode. There is no ``StopReason.SPAWN_BLOCKED``; the fact comes from ``_rou
 ``spawn_blocked`` return value (msg-4278 / msg-4280)."""
 
 
+TIERC_ENTRY_ROLES: frozenset[Role] = frozenset({Role.PROPOSER, Role.IMPLEMENTER, Role.NAYSAYER})
+"""Roster roles whose ``NEXT: human`` enters the Tier-C hook — Takahito's "三者" (Bohr /
+Heisenberg / Einstein), msg-4360 decision 1 as fixed by msg-4382 (Einstein msg-4381 Objection 1:
+existing ``Role`` members only). Today this is every ``Role``; a test pins that, so adding a role
+forces an explicit decision here."""
+
+
 class RoutingInvariantError(AssertionError):
-    """``_route`` returned a combination for a proposer ``NEXT: human`` that no ``routed`` value
+    """``_route`` returned a combination for an entered ``NEXT: human`` that no ``routed`` value
     names. Unreachable today (``_human_terminal`` / ``_spawn_blocked`` are the only exits for a
     ``HUMAN`` handoff, and each maps to a named value); raised so a new ``_route`` branch fails
     loudly instead of being labelled."""
@@ -242,17 +275,20 @@ def is_tierc_entry(
     author_wrote_next_human: bool,
     author_role: Role | None,
 ) -> bool:
-    """The Tier-C hook's entry condition (msg-4237 DECIDED 2c-1; endorsed msg-4238 / msg-4240).
+    """The Tier-C hook's entry condition (msg-4237 DECIDED 2c-1; endorsed msg-4238 / msg-4240;
+    roles widened by T-decider-tierc-v2 msg-4360 / msg-4382).
 
     Called only for a head the Conductor resolved to ``HandoffKind.HUMAN`` (``_decider_hook``
     returns earlier for any other kind). Both must hold:
 
     * the author wrote ``NEXT: human`` themself — a field/body mismatch that resolved to HUMAN is
-      a conductor safety valve, not someone asking the human;
-    * the author's roster role is ``proposer`` — by role, not by persona name, so a renamed
-      proposer does not silently drop out. An implementer's merge handoff, a naysayer's exit turn
-      (``VERDICT: APPROVE``, including a forced consult that ends the escalation) and an
-      off-roster infra author never enter (Einstein msg-4202, Bohr msg-4235 §1).
+      a conductor safety valve, not someone asking the human (kept by msg-4360);
+    * the author's roster role is in :data:`TIERC_ENTRY_ROLES` (``proposer`` / ``implementer`` /
+      ``naysayer``) — by role, not by persona name, so a renamed agent does not silently drop
+      out. An off-roster author (e.g. ``pr-gate-relay``) has no roster role and never enters:
+      its APPROVE → ``NEXT: human`` is a merge-wait **notification**, not a question — main
+      merges are escalated when the PR is opened (msg-4361). The naysayer's own in-thread
+      ``NEXT: human`` does enter.
 
     The rule stop is deliberately **not** a condition (it was in 2b, msg-4203): a proposer's
     ``NEXT: human`` in a segment with no naysayer message yet is routed to a forced consult with
@@ -262,7 +298,7 @@ def is_tierc_entry(
     Checked at the hook's entry, before anything else: a non-target turn gets no admission-gate
     computation, no Lexora call and no ``decider_decision`` line — in shadow and active alike.
     """
-    return author_wrote_next_human and author_role is Role.PROPOSER
+    return author_wrote_next_human and author_role is not None and author_role in TIERC_ENTRY_ROLES
 
 
 def routed_from_route(
@@ -359,8 +395,8 @@ def compute_gate_result(
       for a bounce that never happened would, once the gate is wired for real, poison the retry
       state and admit a phantom ``RETRY_ADMIT``.
     * ``bounce_uuid`` is fresh per call and discarded (``decide_admission`` docstring contract).
-    * An exception from the gate yields ``None``: the Decider is then not called (msg-4196
-      DECIDED 1) and the hook writes its empty-``outcome`` line. The stop is unaffected.
+    * An exception from the gate yields ``None``. Under tierc-v2 the turn is still sent, with
+      ``gate_result: null`` (msg-4380 Δ2); a v1 Decider skips it. The stop is unaffected.
     * The result feeds the Decider and the log only — never stop, notification or routing.
     """
     try:
@@ -432,30 +468,20 @@ async def run_tierc_hook(
                 roster=roster,
                 messages=messages,
                 gate_result=gate_result,
+                dispute_rounds=count_dispute_rounds(roster, messages),
             )
         )
         # The Decider owns "is this turn a target" (mode / head); the hook asks rather than
         # restating the rule (PR-gate advisory 1 on #345). Not a target → nothing is written.
         if not decider.is_target(state):
             return None
-        if state.gate_result is None:
-            # msg-4196 DECIDED 2: a targeted turn the gate could not classify is not sent
-            # (DECIDED 1) but still leaves one line with ``outcome`` empty.
-            log_decision(
-                thread_id=thread_id,
-                round_index=round_index,
-                stop=stop,
-                routed=routed,
-                dr=None,
-                gate_result=None,
-            )
-            return None
+        # tierc-v2: sent whether or not the gate produced a result (msg-4380 Δ2).
         dr = await decider.evaluate(state)
     except Exception:
         logger.warning("decider hook failed; stop decision unaffected", exc_info=True)
         return None
     if dr is None:
-        # Not reachable under the Decider contract (target + gate ran ⇒ called); nothing to log.
+        # Only a v1-configured Decider with gate_result=None (msg-4196 DECIDED 1); nothing to log.
         return None
     log_decision(
         thread_id=thread_id,
@@ -471,7 +497,9 @@ async def run_tierc_hook(
     # consult row, and a spawn-blocked dead end (msg-4280 DECIDED 2c-4), is record-only in every
     # mode (acting before the forced consult is a
     # separate Takahito decision, like ``skip_naysayer_when_confirmed``). annotate / bounce are
-    # refused at build time, so under shadow this branch is structurally dead.
+    # refused at build time, so under shadow this branch is structurally dead. Before bounce is
+    # enabled on tierc-v2 its entry condition must be redefined (v2 has no ``fired_reason``,
+    # msg-4380 Δ4).
     av = dr.actionable_verdict
     if routed == ROUTED_STOP and decider.tierc_mode in ACTING_TIERC_MODES and av is not None:
         logger.warning(
@@ -488,10 +516,12 @@ __all__ = [
     "ROUTED_FORCED_NAYSAYER",
     "ROUTED_SPAWN_BLOCKED",
     "ROUTED_STOP",
+    "TIERC_ENTRY_ROLES",
     "Decider",
     "RoutingInvariantError",
     "ThreadMessage",
     "compute_gate_result",
+    "count_dispute_rounds",
     "gate_result_from_decision",
     "is_tierc_entry",
     "log_decision",
