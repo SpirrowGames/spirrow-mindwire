@@ -27,7 +27,13 @@ import json
 from dataclasses import asdict
 from typing import Any
 
-from spirrow_mindwire.decider.questions import TIERC_QUESTIONS_V1, TIERC_QUESTIONS_VERSION
+from spirrow_mindwire.decider.questions import (
+    TIERC_QUESTIONS_V1,
+    TIERC_QUESTIONS_VERSION,
+    TIERC_V2_QUESTIONS_VERSION,
+    TierCRules,
+    tierc_v2_questions,
+)
 from spirrow_mindwire.decider.state import AdmissionGateResult, DecisionState
 
 POLICY_LIVE_TIERC = "mindwire.conductor.tierc"
@@ -53,8 +59,13 @@ def gate_result_to_dict(gate: AdmissionGateResult | None) -> dict[str, Any] | No
 
 
 def state_to_dict(state: DecisionState) -> dict[str, Any]:
-    """``DecisionState`` → plain dict. Moved verbatim from the replay's ``_state_to_json``."""
-    return {
+    """``DecisionState`` → plain dict. Moved verbatim from the replay's ``_state_to_json``.
+
+    ``dispute_rounds`` (v2 rule_5 feature, msg-4380 Δ5) is emitted **only when computed**: a
+    state without it (every pre-v2 replay fixture) serialises to the same bytes as before, so
+    hash-locked v1 replays stay byte-identical.
+    """
+    d: dict[str, Any] = {
         "thread_id": state.thread_id,
         "round_index": state.round_index,
         "roster": {k: v.value for k, v in state.roster.items()},
@@ -65,6 +76,9 @@ def state_to_dict(state: DecisionState) -> dict[str, Any]:
         "diff_stat": asdict(state.diff_stat) if state.diff_stat else None,
         "gate_result": gate_result_to_dict(state.gate_result),
     }
+    if state.dispute_rounds is not None:
+        d["dispute_rounds"] = state.dispute_rounds
+    return d
 
 
 def state_to_wire(state: DecisionState) -> str:
@@ -86,13 +100,27 @@ def questions_to_wire() -> dict[str, dict[str, Any]]:
     }
 
 
-def build_decide_request(state: DecisionState, *, policy: str) -> dict[str, Any]:
-    """The full ``/v1/decide`` request body — the one builder live and replay share."""
+def build_decide_request(
+    state: DecisionState, *, policy: str, rules: TierCRules | None = None
+) -> dict[str, Any]:
+    """The full ``/v1/decide`` request body — the one builder live and replay share.
+
+    ``rules=None`` → the v1 set (bytes unchanged from before v2). ``rules`` given → the v2 set
+    (``should_ask_human`` + ``matched_rule``, built from the rules file) with
+    ``questions_version="tierc-v2"``.
+    """
+    if rules is None:
+        return {
+            "state": state_to_wire(state),
+            "questions": questions_to_wire(),
+            "policy": policy,
+            "questions_version": TIERC_QUESTIONS_VERSION,
+        }
     return {
         "state": state_to_wire(state),
-        "questions": questions_to_wire(),
+        "questions": tierc_v2_questions(rules),
         "policy": policy,
-        "questions_version": TIERC_QUESTIONS_VERSION,
+        "questions_version": TIERC_V2_QUESTIONS_VERSION,
     }
 
 

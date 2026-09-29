@@ -5,6 +5,11 @@ msg-4182 (``DecisionResult``), msg-4184 (``actionable_verdict`` + invariants), m
 ``is_grey_zone``; 4-valued outcome), msg-4188 (always call ``/v1/decide``, then branch),
 msg-4196 (DECIDED 1: ``gate_result is None`` → no call; DECIDED 2: gate columns + not-called line),
 msg-4200 / msg-4203 (step 2b: compute-only admission gate, proposer-only entry; tests 1-10).
+
+T-decider-tierc-v2-all-escalations (msg-4360 / 4361 / 4380-4384) changed three things pinned here:
+the entry roles are proposer / implementer / naysayer (tests 6-7 now enter), the msg-4196
+DECIDED 2 empty-``outcome`` line is gone, and ``build_decider`` defaults to tierc-v2 (a rules
+file). The v2 behaviour itself is tested in ``test_decider_tierc_v2.py``.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ from spirrow_mindwire.decider.hook import (
     run_tierc_hook,
     turn_from_messages,
 )
+from spirrow_mindwire.decider.questions import tierc_rules_template_path
 from spirrow_mindwire.decider.result import DecisionOutcome, DecisionResult
 from spirrow_mindwire.decider.state import (
     AdmissionGateResult,
@@ -423,8 +429,13 @@ def test_build_decider_off_paths(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_build_decider_env_backend_overrides_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINDWIRE_DECIDER_BACKEND", "lexora")
     monkeypatch.setenv("MINDWIRE_LEXORA_URL", "http://lexora.test")
-    d = build_decider(config_backend="off", tierc_mode="shadow")
+    d = build_decider(
+        config_backend="off", tierc_mode="shadow", rules_path=tierc_rules_template_path()
+    )
     assert isinstance(d, DeciderLexoraAdapter)
+    assert d.rules is not None  # tierc-v2 is the default question set
+    v1 = build_decider(config_backend="off", tierc_mode="shadow", questions="tierc-v1")
+    assert isinstance(v1, DeciderLexoraAdapter) and v1.rules is None
 
 
 def test_build_decider_lexora_requires_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -487,20 +498,20 @@ def test_log_decision_gate_columns_for_labelled_admit() -> None:
     assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is False
 
 
-def test_log_decision_not_called_line_has_empty_outcome_and_same_keys() -> None:
-    """msg-4196 DECIDED 2: the "targeted but not sent" line — outcome empty, gate columns None."""
-    called = log_decision(
+def test_log_decision_gate_columns_none_when_gate_did_not_run() -> None:
+    """The msg-4196 DECIDED 2 not-called line is gone (tierc-v2 msg-4380 Δ2: a gate-less turn is
+    sent); the gate columns of a called line are ``None`` when the gate did not run."""
+    rec = log_decision(
         thread_id="T",
         round_index=1,
         stop="human",
         dr=_dr(DecisionOutcome.NO_VERDICT_NULL, None),
-        gate_result=GREY,
+        gate_result=None,
     )
-    rec = log_decision(thread_id="T", round_index=1, stop="human", dr=None, gate_result=None)
-    assert set(rec) == set(called)
-    assert rec["outcome"] is None and rec["decision_id"] is None
+    assert rec["outcome"] == "no_verdict_null"
     assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is None
     assert rec["stop"] == "human"
+    assert not hasattr(hook_mod, "_NOT_CALLED_FIELDS")
 
 
 class _StubDecider:
@@ -582,15 +593,17 @@ def test_turn_from_messages_shape() -> None:
         (None, True, Role.PROPOSER, False),  # forced naysayer consult: no rule stop yet
         ("settled", True, Role.PROPOSER, False),
         ("human", False, Role.PROPOSER, False),  # field/body mismatch safety valve
-        ("human", True, Role.IMPLEMENTER, False),
-        ("human", True, Role.NAYSAYER, False),
-        ("human", True, None, False),  # off-roster author
+        ("human", True, Role.IMPLEMENTER, True),  # tierc-v2 msg-4360 / msg-4382
+        ("human", True, Role.NAYSAYER, True),  # tierc-v2 msg-4360 / msg-4382
+        (None, True, Role.IMPLEMENTER, False),
+        ("human", False, Role.NAYSAYER, False),
+        ("human", True, None, False),  # off-roster author (pr-gate-relay): notification, msg-4361
     ],
 )
 def test_is_tierc_entry(
     original_stop: str | None, wrote: bool, role: Role | None, expected: bool
 ) -> None:
-    """msg-4203 DECIDED 2b-3 (revised): all three conditions, checked at the hook entry."""
+    """msg-4203 DECIDED 2b-3 (revised), roles widened by tierc-v2: all three conditions."""
     assert (
         is_tierc_entry(original_stop=original_stop, author_wrote_next_human=wrote, author_role=role)
         is expected
@@ -677,10 +690,12 @@ def _decider_lines(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
 
 
 @pytest.mark.anyio
-async def test_hook_gate_exception_no_http_one_empty_line(
+async def test_hook_gate_exception_v1_decider_no_http_no_line(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Test 4 (msg-4200 2b-2): gate raises → gate_result None → 0 HTTP, 1 line outcome empty."""
+    """Test 4 (msg-4200 2b-2) under a **v1** Decider: gate raises → gate_result None → 0 HTTP.
+    The msg-4196 DECIDED 2 empty-``outcome`` line is gone (msg-4380 Δ2), so no line either; the
+    v2 counterpart (the turn IS sent) is in ``test_decider_tierc_v2.py``."""
     _GateSpy(monkeypatch, exc=RuntimeError("gate down"))
     c = FakeClient(_payload())
     adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c)
@@ -688,30 +703,52 @@ async def test_hook_gate_exception_no_http_one_empty_line(
         got = await _hook(adapter)
     assert got is None
     assert c.bodies == []
-    (line,) = _decider_lines(caplog)
-    assert line["outcome"] is None and line["gate_is_grey_zone"] is None
-    assert line["gate_kind"] is None and line["stop"] == "human"
+    assert _decider_lines(caplog) == []
 
 
 @pytest.mark.parametrize(
     ("head_author", "head_body"),
     [
-        # Test 6: the implementer's merge handoff.
+        # Test 6: the implementer's merge handoff — entered since tierc-v2 (msg-4360 / 4382).
         ("Heisenberg", "PR #9 opened.\nTIER-C: merge-protected\nNEXT: human"),
-        # Test 7: the naysayer's exit turn.
+        # Test 7: the naysayer's own in-thread NEXT: human — entered since tierc-v2.
         ("Einstein", "VERDICT: APPROVE\n\nNEXT: human"),
-        # Test 8: an off-roster infra author.
-        ("pr-gate-relay", "VERDICT: APPROVE (ci=success)\n\nNEXT: human"),
     ],
 )
 @pytest.mark.anyio
-async def test_hook_non_proposer_human_is_not_entered(
+async def test_hook_implementer_and_naysayer_human_are_entered(
     head_author: str,
     head_body: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Tests 6-8 (msg-4203): gate 0 calls, HTTP 0, no ``decider_decision`` line."""
+    """Tests 6-7 flipped by tierc-v2 (msg-4203 2b-3 overridden): gate once, HTTP once, one line."""
+    spy = _GateSpy(monkeypatch)
+    c = FakeClient(_payload())
+    adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c)
+    with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
+        got = await _hook(adapter, messages=_msgs(head_author=head_author, head_body=head_body))
+    assert got is not None
+    assert spy.calls == 1
+    assert len(c.bodies) == 1
+    assert len(_decider_lines(caplog)) == 1
+
+
+@pytest.mark.parametrize(
+    ("head_author", "head_body"),
+    [
+        # Test 8: an off-roster infra author — its APPROVE → human is a notification (msg-4361).
+        ("pr-gate-relay", "VERDICT: APPROVE (ci=success)\n\nNEXT: human"),
+    ],
+)
+@pytest.mark.anyio
+async def test_hook_off_roster_human_is_not_entered(
+    head_author: str,
+    head_body: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test 8 (msg-4203, kept by msg-4361): gate 0 calls, HTTP 0, no ``decider_decision`` line."""
     spy = _GateSpy(monkeypatch)
     c = FakeClient(_payload())
     adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: c)
@@ -892,19 +929,24 @@ async def test_conductor_does_not_call_decider_on_non_human_heads() -> None:
 
 
 @pytest.mark.anyio
-async def test_conductor_naysayer_exit_human_is_not_evaluated(
+async def test_conductor_naysayer_exit_human_is_evaluated_and_stop_unchanged(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Test 7 at Conductor level: the naysayer's ``VERDICT: APPROVE`` / ``NEXT: human`` stop."""
+    """Test 7 at Conductor level, flipped by tierc-v2 (msg-4360 / 4382): the naysayer's own
+    ``NEXT: human`` enters the hook; the stop stays exactly what the rules made it (D20)."""
+    baseline, _, _ = await _run(
+        None, replies={Role.NAYSAYER: [_attested("VERDICT: APPROVE\n\nNEXT: human")]}
+    )
     spy = _GateSpy(monkeypatch)
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
         outcome, _, _ = await _run(
             stub, replies={Role.NAYSAYER: [_attested("VERDICT: APPROVE\n\nNEXT: human")]}
         )
+    assert outcome == baseline
     assert outcome.stop_reason is StopReason.HUMAN
-    assert spy.calls == 0 and stub.states == []
-    assert _decider_lines(caplog) == []
+    assert spy.calls == 1 and len(stub.states) == 1
+    assert len(_decider_lines(caplog)) == 1
 
 
 @pytest.mark.anyio

@@ -29,6 +29,22 @@ effect:
 Once a gate result exists, the gate decides how answers are combined, never whether Lexora is
 called.
 
+**tierc-v2 (T-decider-tierc-v2-all-escalations; Bohr msg-4380 / 4382 / 4384, Einstein-approved).**
+When the adapter is built with a rules file (``[decider.tierc].questions = "tierc-v2"``, the
+default) the order above changes in two places, and only there:
+
+* step 0 is gone: a ``gate_result is None`` turn is sent too (msg-4380 Δ2, overriding msg-4196
+  DECIDED 1 — its reason, "no scope label", went away with D18) and goes out as
+  ``gate_result: null``;
+* step 5 has no gate branch (D18 grey-zone gating is withdrawn, msg-4360): every turn is
+  ``evaluate_tierc_v2(should_ask_human)`` with scope ``IN_GATE``. ``gate_kind`` /
+  ``gate_is_grey_zone`` stay as feature + log columns.
+
+Step 4 checks ``should_ask_human`` only. ``matched_rule`` (a ``choice`` question) is validated
+separately; a bad one never makes the record MALFORMED — it leaves ``matched_rule=None`` plus
+``matched_rule_error`` (display-only, msg-4380 Δ3). The v1 path is kept unchanged for the v1
+replay comparison.
+
 Enablement (msg-4180 §4): backend ``lexora`` — from env ``MINDWIRE_DECIDER_BACKEND`` when set,
 else ``[decider].backend`` — **and** ``MINDWIRE_LEXORA_URL`` set. :func:`build_decider` returns
 ``None`` when the Decider is off, and refuses (``ValueError``) a half-configured enablement rather
@@ -41,16 +57,27 @@ import logging
 import math
 import os
 from collections.abc import Callable, Mapping
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Any, Literal, Protocol
 
+from ..decider.questions import (
+    MATCHED_RULE_KEY,
+    SHOULD_ASK_HUMAN_KEY,
+    TIERC_QUESTIONS_VERSION,
+    TIERC_V2_QUESTIONS_VERSION,
+    TierCRules,
+    load_tierc_rules,
+)
 from ..decider.result import DecisionOutcome, DecisionResult
 from ..decider.state import DecisionState
 from ..decider.verdict import (
     TIER_C_GENUINE_KEYS,
     TIER_C_SPURIOUS_KEYS,
     TierCThresholds,
+    TierCV2Thresholds,
     build_out_of_gate_verdict,
     evaluate_tierc,
+    evaluate_tierc_v2,
 )
 from ..decider.wire import POLICY_LIVE_TIERC, build_decide_request
 from ..lexora.client import LexoraClient, LexoraError
@@ -66,6 +93,13 @@ _BACKEND_ENV = "MINDWIRE_DECIDER_BACKEND"
 _URL_ENV = "MINDWIRE_LEXORA_URL"
 _ALL_TIERC_KEYS: tuple[str, ...] = TIER_C_GENUINE_KEYS + TIER_C_SPURIOUS_KEYS
 
+MATCHED_RULE_SOURCE_CHOICE = "choice"
+"""``matched_rule_source`` of a ``choice`` answer. Lexora ``/v1/decide`` accepts
+``type: "choice"`` (spirrow-lexora main 344d467, ``decide/contract.py``), so this is msg-4382's
+path (a) and the only one built; the noul-argmax fallback (b) is not needed."""
+
+QuestionSet = Literal["tierc-v1", "tierc-v2"]
+
 
 class DecideClient(Protocol):
     """The one Lexora method the Decider drives (satisfied by :class:`LexoraClient`)."""
@@ -75,15 +109,18 @@ class DecideClient(Protocol):
     async def aclose(self) -> None: ...
 
 
-def _extract_noul(answers: Any) -> tuple[dict[str, float] | None, str | None]:
-    """``{"k": {"noul": p}}`` → ``{"k": p}`` for all 6 Tier-C keys, or ``(None, reason)``.
+def _extract_noul(
+    answers: Any, keys: tuple[str, ...] = _ALL_TIERC_KEYS
+) -> tuple[dict[str, float] | None, str | None]:
+    """``{"k": {"noul": p}}`` → ``{"k": p}`` for every key in ``keys`` (default: the 6 v1 keys),
+    or ``(None, reason)``.
 
     No partial synthesis (§2-3): one bad answer and the whole record is MALFORMED.
     """
     if not isinstance(answers, Mapping):
         return None, f"answers is {type(answers).__name__}, expected an object"
     scores: dict[str, float] = {}
-    for key in _ALL_TIERC_KEYS:
+    for key in keys:
         entry = answers.get(key)
         if not isinstance(entry, Mapping) or "noul" not in entry:
             return None, f"answer {key!r} missing or has no 'noul'"
@@ -98,25 +135,52 @@ def _extract_noul(answers: Any) -> tuple[dict[str, float] | None, str | None]:
     return scores, None
 
 
+def _extract_matched_rule(answers: Any, rules: TierCRules) -> tuple[str | None, str | None]:
+    """``{"matched_rule": {"choice": "rule_k", ...}}`` → ``("rule_k", None)``, or
+    ``(None, reason)``. The choice must be one of the options that were sent."""
+    entry = answers.get(MATCHED_RULE_KEY) if isinstance(answers, Mapping) else None
+    if not isinstance(entry, Mapping) or "choice" not in entry:
+        return None, f"answer {MATCHED_RULE_KEY!r} missing or has no 'choice'"
+    choice = entry["choice"]
+    if not isinstance(choice, str) or choice not in rules.matched_rule_options:
+        return None, (
+            f"answer {MATCHED_RULE_KEY!r} choice={choice!r} is not one of "
+            f"{list(rules.matched_rule_options)}"
+        )
+    return choice, None
+
+
 async def decide_once(
     state: DecisionState,
     *,
     client: DecideClient,
     policy: str,
     thresholds: TierCThresholds | None = None,
+    rules: TierCRules | None = None,
+    v2_thresholds: TierCV2Thresholds | None = None,
 ) -> DecisionResult:
     """One ``/v1/decide`` round-trip → :class:`DecisionResult`, following msg-4188's order.
 
     Shared by the live adapter and ``scripts/decider_replay.py --endpoint`` so both classify a
     response identically. Never raises for a Lexora-side problem.
 
-    Raises ``ValueError`` (before any HTTP) when ``state.gate_result is None``: msg-4196
-    DECIDED 1 keeps un-gated turns off ``/v1/decide`` entirely, so reaching here with one is a
-    caller bug, not a turn to bill and label OUT_OF_GATE.
+    ``rules=None`` is the v1 set, and raises ``ValueError`` (before any HTTP) when
+    ``state.gate_result is None`` (msg-4196 DECIDED 1). ``rules`` given is tierc-v2: every state
+    is sent, gate result or not (msg-4380 Δ2); ``thresholds`` is then unused and
+    ``v2_thresholds`` applies.
     """
-    if state.gate_result is None:
+    if rules is None and state.gate_result is None:
         raise ValueError("decide_once requires a gate_result (msg-4196 DECIDED 1)")
-    body = build_decide_request(state, policy=policy)
+    body = build_decide_request(state, policy=policy, rules=rules)
+    version_fields: dict[str, Any] = (
+        {"questions_version": TIERC_QUESTIONS_VERSION}
+        if rules is None
+        else {
+            "questions_version": TIERC_V2_QUESTIONS_VERSION,
+            "rules_sha256": rules.sha256,
+            "matched_rule_source": MATCHED_RULE_SOURCE_CHOICE,
+        }
+    )
 
     def _transport_error(reason: str) -> DecisionResult:
         logger.warning("decider /v1/decide transport error (policy=%s): %s", policy, reason)
@@ -128,6 +192,7 @@ async def decide_once(
             verdict=None,
             policy=policy,
             error=reason,
+            **version_fields,
         )
 
     # 1-2. always call; any transport-level failure is TRANSPORT_ERROR.
@@ -161,11 +226,26 @@ async def decide_once(
             policy=policy,
             latency_ms=latency_ms,
             error=error,
+            **version_fields,
         )
 
-    # 3. NullProvider: record, never synthesise.
+    # 3. NullProvider: record, never synthesise (its choice answer is options[0] — meaningless,
+    #    so matched_rule stays None too).
     if provider == "null":
         return _no_verdict(DecisionOutcome.NO_VERDICT_NULL, None)
+
+    if rules is not None:
+        return _v2_result(
+            answers=answers,
+            rules=rules,
+            thresholds=v2_thresholds,
+            decision_id=str(decision_id),
+            provider=provider,
+            raw_answers=raw_answers,
+            policy=policy,
+            latency_ms=latency_ms,
+            no_verdict=_no_verdict,
+        )
 
     # 4. malformed answers.
     scores, reason = _extract_noul(answers)
@@ -178,8 +258,9 @@ async def decide_once(
         )
         return _no_verdict(DecisionOutcome.NO_VERDICT_MALFORMED, reason)
 
-    # 5. only now does the gate matter.
+    # 5. only now branch on the gate (v1 only; non-None was checked on entry).
     gate = state.gate_result
+    assert gate is not None
     if gate.is_grey_zone:
         verdict = evaluate_tierc(scores, thresholds)
     else:
@@ -195,6 +276,53 @@ async def decide_once(
     )
 
 
+def _v2_result(
+    *,
+    answers: Any,
+    rules: TierCRules,
+    thresholds: TierCV2Thresholds | None,
+    decision_id: str,
+    provider: str,
+    raw_answers: Mapping[str, Any] | None,
+    policy: str,
+    latency_ms: int | None,
+    no_verdict: Callable[[DecisionOutcome, str | None], DecisionResult],
+) -> DecisionResult:
+    """tierc-v2 steps 4-5: ``should_ask_human`` alone decides MALFORMED and the verdict;
+    ``matched_rule`` is validated on its own and never changes the outcome (msg-4380 Δ3)."""
+    scores, reason = _extract_noul(answers, (SHOULD_ASK_HUMAN_KEY,))
+    if scores is None:
+        logger.warning(
+            "decider /v1/decide malformed answers (decision_id=%s provider=%s): %s",
+            decision_id,
+            provider,
+            reason,
+        )
+        return no_verdict(DecisionOutcome.NO_VERDICT_MALFORMED, reason)
+    matched_rule, rule_error = _extract_matched_rule(answers, rules)
+    if rule_error is not None:
+        logger.warning(
+            "decider /v1/decide matched_rule unusable (decision_id=%s provider=%s): %s",
+            decision_id,
+            provider,
+            rule_error,
+        )
+    return DecisionResult(
+        outcome=DecisionOutcome.EVALUATED,
+        decision_id=decision_id,
+        provider=provider,
+        raw_answers=raw_answers,
+        verdict=evaluate_tierc_v2(scores[SHOULD_ASK_HUMAN_KEY], thresholds),
+        policy=policy,
+        questions_version=TIERC_V2_QUESTIONS_VERSION,
+        latency_ms=latency_ms,
+        matched_rule=matched_rule,
+        matched_rule_source=MATCHED_RULE_SOURCE_CHOICE,
+        matched_rule_error=rule_error,
+        rules_sha256=rules.sha256,
+    )
+
+
 def _default_client_factory(url: str) -> Callable[[], DecideClient]:
     def factory() -> DecideClient:
         return LexoraClient(url, timeout_seconds=DECIDER_TIMEOUT_SECONDS)
@@ -207,6 +335,7 @@ class DeciderLexoraAdapter:
 
     A fresh client per call (closed in ``finally``): the hook fires only on ``NEXT: human``
     turns, so pooling buys nothing and a per-call client leaves no teardown for the Conductor.
+    ``rules`` set = tierc-v2 (the rules file read once at build time); ``None`` = tierc-v1.
     """
 
     def __init__(
@@ -216,38 +345,53 @@ class DeciderLexoraAdapter:
         client_factory: Callable[[], DecideClient],
         thresholds: TierCThresholds | None = None,
         policy: str = POLICY_LIVE_TIERC,
+        rules: TierCRules | None = None,
+        v2_thresholds: TierCV2Thresholds | None = None,
     ) -> None:
         self._tierc_mode = tierc_mode
         self._client_factory = client_factory
         self._thresholds = thresholds
         self._policy = policy
+        self._rules = rules
+        self._v2_thresholds = v2_thresholds
 
     @property
     def tierc_mode(self) -> str:
         return self._tierc_mode
+
+    @property
+    def rules(self) -> TierCRules | None:
+        return self._rules
 
     def is_target(self, state: DecisionState) -> bool:
         """Whether this Decider evaluates ``state`` at all, gate aside (PR-gate advisory on #345).
 
         The single owner of the "is this turn a Tier-C target" rule: mode not ``off`` and head
         ``NEXT: human``. :meth:`evaluate` and the Conductor hook both ask this method rather than
-        each restating the condition, so the hook's "targeted but not sent" line cannot drift
-        from what :meth:`evaluate` actually skips.
+        each restating the condition.
         """
         return self._tierc_mode != "off" and state.parsed_next == HUMAN_NEXT
 
     async def evaluate(self, state: DecisionState) -> DecisionResult | None:
         """``None`` iff the Decider was not called (msg-4182); otherwise always a result.
 
-        Not called when :meth:`is_target` is false, or the admission gate did not run
-        (``gate_result is None`` — msg-4196 DECIDED 1: zero HTTP, zero Jev billing).
+        Not called when :meth:`is_target` is false. Under v1 (no rules) also not called when the
+        admission gate did not run (``gate_result is None`` — msg-4196 DECIDED 1); under v2 a
+        targeted turn is always sent (msg-4380 Δ2).
         """
-        if not self.is_target(state) or state.gate_result is None:
+        if not self.is_target(state):
+            return None
+        if self._rules is None and state.gate_result is None:
             return None
         client = self._client_factory()
         try:
             return await decide_once(
-                state, client=client, policy=self._policy, thresholds=self._thresholds
+                state,
+                client=client,
+                policy=self._policy,
+                thresholds=self._thresholds,
+                rules=self._rules,
+                v2_thresholds=self._v2_thresholds,
             )
         finally:
             try:
@@ -268,6 +412,9 @@ def build_decider(
     tierc_mode: str,
     thresholds: TierCThresholds | None = None,
     client_factory: Callable[[], DecideClient] | None = None,
+    questions: QuestionSet = "tierc-v2",
+    rules_path: Path | None = None,
+    v2_thresholds: TierCV2Thresholds | None = None,
 ) -> DeciderLexoraAdapter | None:
     """Composition-root factory. ``None`` = Decider off (no HTTP will ever be made).
 
@@ -275,6 +422,12 @@ def build_decider(
     ``lexora`` without ``MINDWIRE_LEXORA_URL``, or a Tier-C mode whose acting half is not built
     yet (``annotate`` / ``bounce`` — step 2 ships shadow only; accepting them would log as if
     annotating while annotating nothing).
+
+    ``questions="tierc-v2"`` reads the rules file at ``rules_path`` **once, here** (msg-4384: no
+    hot-reload; edit the file, then restart). A missing, unreadable or malformed file raises
+    :class:`~spirrow_mindwire.decider.questions.TierCRulesError` (a ``ValueError``) — the same
+    refuse-to-start policy as a missing ``MINDWIRE_LEXORA_URL``. The packaged template is never
+    read as a fallback (msg-4382: one canonical copy).
     """
     backend = resolve_backend(config_backend)
     if backend == "off" or tierc_mode == "off":
@@ -286,6 +439,8 @@ def build_decider(
             f"[decider.tierc].mode={tierc_mode!r} is not implemented yet: step 2 wires "
             "'shadow' only (annotate / bounce land in later steps)"
         )
+    if questions not in ("tierc-v1", "tierc-v2"):
+        raise ValueError(f"unknown [decider.tierc].questions {questions!r}")
     if client_factory is None:
         url = os.environ.get(_URL_ENV, "").strip()
         if not url:
@@ -293,15 +448,32 @@ def build_decider(
                 f"decider backend 'lexora' requires {_URL_ENV} to be set (msg-4180 §4)"
             )
         client_factory = _default_client_factory(url)
+    rules: TierCRules | None = None
+    if questions == "tierc-v2":
+        if rules_path is None:
+            raise ValueError("[decider.tierc].questions='tierc-v2' requires a rules file path")
+        rules = load_tierc_rules(rules_path)
+        logger.info(
+            "decider tierc-v2 rules loaded from %s (rules_sha256=%s, %d rules)",
+            rules.source,
+            rules.sha256,
+            len(rules.rules),
+        )
     return DeciderLexoraAdapter(
-        tierc_mode=tierc_mode, client_factory=client_factory, thresholds=thresholds
+        tierc_mode=tierc_mode,
+        client_factory=client_factory,
+        thresholds=thresholds,
+        rules=rules,
+        v2_thresholds=v2_thresholds,
     )
 
 
 __all__ = [
     "DECIDER_TIMEOUT_SECONDS",
+    "MATCHED_RULE_SOURCE_CHOICE",
     "DecideClient",
     "DeciderLexoraAdapter",
+    "QuestionSet",
     "build_decider",
     "decide_once",
     "resolve_backend",

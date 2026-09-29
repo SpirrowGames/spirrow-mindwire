@@ -575,13 +575,14 @@ class Conductor:
 
         The entry condition is decided inside :func:`..decider.hook.run_tierc_hook` (msg-4203:
         "判定はフックの入口"): rule stop ``HUMAN`` **and** an author-written ``NEXT: human`` **and**
-        the author's roster role is ``proposer``. This method only lifts the one fact the hook
+        the author's roster role is ``proposer`` / ``implementer`` / ``naysayer``
+        (T-decider-tierc-v2 msg-4360 / msg-4382). This method only lifts the one fact the hook
         cannot see — whether the author wrote the handoff themself (a field/body mismatch also
         resolves to ``HandoffKind.HUMAN`` but is a conductor safety valve, not somebody asking
         the human). The hook runs the admission gate compute-only (nothing written to the
-        decisions log) and sends the turn to Lexora only when the gate produced a result
-        (msg-4196 DECIDED 1). ``stop_reason`` is the rule-stop snapshot: it decides entry and is
-        logged beside the decision, never modified.
+        decisions log); under tierc-v2 the turn goes to Lexora whether or not the gate produced
+        a result (msg-4380 Δ2). ``stop_reason`` is the rule-stop snapshot: it decides entry and
+        is logged beside the decision, never modified.
         """
         if self._decider is None:
             return

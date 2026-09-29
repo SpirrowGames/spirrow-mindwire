@@ -42,6 +42,7 @@ from typing import Final
 from spirrow_mindwire.decider.questions import (
     TIERC_QUESTIONS_V1,
     TIERC_QUESTIONS_VERSION,
+    TIERC_V2_QUESTIONS_VERSION,
     TierCQuestionKind,
 )
 
@@ -363,16 +364,91 @@ def build_out_of_gate_verdict(
     )
 
 
+# ---------------------------------------------------------------------------
+# Tier-C v2 — should_ask_human 1 本の閾値合成 (msg-4380 Δ4、Einstein msg-4381 承認)
+# ---------------------------------------------------------------------------
+
+DEFAULT_V2_ASK_MIN: Final[float] = 0.60
+"""``should_ask_human >= ask_min`` → CONFIRMED。 v1 の 0.60 を流用し replay 前に固定 (事前登録)。"""
+
+DEFAULT_V2_NOT_ASK_MAX: Final[float] = 0.40
+"""``should_ask_human < not_ask_max`` → LIKELY_NOT。 v1 の 0.40 を流用し replay 前に固定。"""
+
+
+@dataclass(frozen=True)
+class TierCV2Thresholds:
+    """v2 の 2 閾値。 どちらも [0, 1]、``not_ask_max <= ask_min`` (帯が重ならない)。"""
+
+    ask_min: float = DEFAULT_V2_ASK_MIN
+    not_ask_max: float = DEFAULT_V2_NOT_ASK_MAX
+
+    def __post_init__(self) -> None:
+        for name, value in (("ask_min", self.ask_min), ("not_ask_max", self.not_ask_max)):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name}={value} must be within [0.0, 1.0] (one noul value)")
+        if self.not_ask_max > self.ask_min:
+            raise ValueError(
+                f"not_ask_max={self.not_ask_max} must be <= ask_min={self.ask_min} "
+                "(otherwise one probability is both CONFIRMED and LIKELY_NOT)"
+            )
+
+
+@dataclass(frozen=True)
+class TierCV2Verdict:
+    """v2 の verdict。 ``ask_score`` = ``should_ask_human`` の確率。
+
+    * ``scope`` は常に ``IN_GATE`` — D18 grey-zone gating は v2 で撤廃 (msg-4360)、
+      全件が合成に乗る。
+    * ``fired_reason`` は常に ``None`` — v1 の §4.5 bounce 入場条件 (``answerable_from_thread``) に
+      当たるものが v2 には無い。 bounce に上げる前に入場条件を定義し直す必要がある (msg-4380 Δ4)。
+      shadow の間は実害が無い。
+    * ``matched_rule`` は verdict に入れない (合成に使わないため、``DecisionResult`` 側に載せる)。
+    """
+
+    kind: TierCVerdictKind
+    ask_score: float
+    scope: TierCScope = TierCScope.IN_GATE
+    fired_reason: None = None
+    questions_version: str = TIERC_V2_QUESTIONS_VERSION
+
+
+def evaluate_tierc_v2(
+    should_ask_human: float, thresholds: TierCV2Thresholds | None = None
+) -> TierCV2Verdict:
+    """``p = should_ask_human`` → ``p >= ask_min`` CONFIRMED / ``p < not_ask_max`` LIKELY_NOT /
+    それ以外 UNSURE (msg-4380 Δ4)。 ``p`` は [0, 1] (範囲外は ``ValueError``)。純関数。"""
+    th = thresholds if thresholds is not None else TierCV2Thresholds()
+    if not 0.0 <= should_ask_human <= 1.0:
+        raise ValueError(f"should_ask_human={should_ask_human!r} out of range [0.0, 1.0]")
+    if should_ask_human >= th.ask_min:
+        kind = TierCVerdictKind.CONFIRMED
+    elif should_ask_human < th.not_ask_max:
+        kind = TierCVerdictKind.LIKELY_NOT
+    else:
+        kind = TierCVerdictKind.UNSURE
+    return TierCV2Verdict(kind=kind, ask_score=should_ask_human)
+
+
+AnyTierCVerdict = TierCVerdict | TierCV2Verdict
+"""v1 / v2 どちらかの verdict (``DecisionResult.verdict`` の型)。"""
+
+
 __all__ = [
     "DEFAULT_GENUINE_MAX",
     "DEFAULT_GENUINE_MIN",
     "DEFAULT_SPURIOUS_MIN",
+    "DEFAULT_V2_ASK_MIN",
+    "DEFAULT_V2_NOT_ASK_MAX",
     "TIER_C_GENUINE_KEYS",
     "TIER_C_SPURIOUS_KEYS",
+    "AnyTierCVerdict",
     "TierCScope",
     "TierCThresholds",
+    "TierCV2Thresholds",
+    "TierCV2Verdict",
     "TierCVerdict",
     "TierCVerdictKind",
     "build_out_of_gate_verdict",
     "evaluate_tierc",
+    "evaluate_tierc_v2",
 ]

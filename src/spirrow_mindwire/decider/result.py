@@ -27,22 +27,25 @@ from enum import StrEnum
 from typing import Any
 
 from spirrow_mindwire.decider.questions import TIERC_QUESTIONS_VERSION
-from spirrow_mindwire.decider.verdict import TierCScope, TierCVerdict
+from spirrow_mindwire.decider.verdict import AnyTierCVerdict, TierCScope, TierCV2Verdict
 
 
 class DecisionOutcome(StrEnum):
     """How far one ``/v1/decide`` call got (msg-4186: 4 values, no scope in here)."""
 
     EVALUATED = "evaluated"
-    """A non-null provider answered all 6 questions in range; a verdict was synthesised
-    (``evaluate_tierc`` in the grey zone, ``build_out_of_gate_verdict`` outside it)."""
+    """A non-null provider answered the verdict questions in range; a verdict was synthesised.
+    v1: all 6 (``evaluate_tierc`` in the grey zone, ``build_out_of_gate_verdict`` outside it);
+    v2: ``should_ask_human`` (``evaluate_tierc_v2``, every turn — no grey-zone gating)."""
 
     NO_VERDICT_NULL = "no_verdict_null"
     """``provider == "null"`` — NullProvider's flat 0.5s would sum to 1.5 genuine and read as
     CONFIRMED every time, so no verdict is built (msg-4180 §2-2)."""
 
     NO_VERDICT_MALFORMED = "no_verdict_malformed"
-    """An answer was missing, the wrong type, or outside [0, 1] — no partial synthesis (§2-3)."""
+    """A verdict answer was missing, the wrong type, or outside [0, 1] — no partial synthesis
+    (§2-3). In v2 only ``should_ask_human`` counts; a bad ``matched_rule`` does not make the
+    record MALFORMED (it is display-only — msg-4380 Δ3)."""
 
     TRANSPORT_ERROR = "transport_error"
     """Connection failure, timeout, non-200, or an envelope with no usable ``decision_id`` /
@@ -51,17 +54,32 @@ class DecisionOutcome(StrEnum):
 
 @dataclass(frozen=True)
 class DecisionResult:
-    """One Decider call's result, carried intact to ``log_decision`` (msg-4182)."""
+    """One Decider call's result, carried intact to ``log_decision`` (msg-4182).
+
+    The v2 fields (msg-4380 Δ3 / msg-4382 Objection 2) are ``None`` on a v1 result:
+
+    * ``matched_rule`` — the rule id (or ``none``) Lexora chose for ``matched_rule``; ``None``
+      when the answer was missing / invalid (then ``matched_rule_error`` says why) or no answer
+      was obtained at all. Display / log only — never part of the verdict.
+    * ``matched_rule_source`` — how ``matched_rule`` was obtained: ``"choice"`` (a ``choice``
+      question; the only path built — Lexora accepts ``choice``, so msg-4382's noul-argmax
+      fallback is not needed).
+    * ``rules_sha256`` — sha256 of the rules file the questions were built from.
+    """
 
     outcome: DecisionOutcome
     decision_id: str | None
     provider: str | None
     raw_answers: Mapping[str, Any] | None
-    verdict: TierCVerdict | None
+    verdict: AnyTierCVerdict | None
     policy: str
     questions_version: str = TIERC_QUESTIONS_VERSION
     latency_ms: int | None = None
     error: str | None = None
+    matched_rule: str | None = None
+    matched_rule_source: str | None = None
+    matched_rule_error: str | None = None
+    rules_sha256: str | None = None
 
     def __post_init__(self) -> None:
         # msg-4186 invariants (msg-4184 §4 as amended): verdict present iff EVALUATED; a missing
@@ -81,7 +99,7 @@ class DecisionResult:
             )
 
     @property
-    def actionable_verdict(self) -> TierCVerdict | None:
+    def actionable_verdict(self) -> AnyTierCVerdict | None:
         """The only verdict anything may act on (msg-4184 §1, as amended by msg-4186).
 
         ``EVALUATED`` **and** ``scope is IN_GATE``. An out-of-gate record (grey-zone outside,
@@ -105,21 +123,35 @@ def decision_result_to_dict(dr: DecisionResult) -> dict[str, Any]:
         "decision_id": dr.decision_id,
         "provider": dr.provider,
         "raw_answers": dict(dr.raw_answers) if dr.raw_answers is not None else None,
-        "verdict": (
-            None
-            if v is None
-            else {
-                "kind": v.kind.value,
-                "scope": v.scope.value,
-                "genuine_score": v.genuine_score,
-                "spurious_score": v.spurious_score,
-                "fired_reason": v.fired_reason,
-            }
-        ),
+        "verdict": _verdict_to_dict(v),
         "policy": dr.policy,
         "questions_version": dr.questions_version,
         "latency_ms": dr.latency_ms,
         "error": dr.error,
+        "matched_rule": dr.matched_rule,
+        "matched_rule_source": dr.matched_rule_source,
+        "matched_rule_error": dr.matched_rule_error,
+        "rules_sha256": dr.rules_sha256,
+    }
+
+
+def _verdict_to_dict(v: AnyTierCVerdict | None) -> dict[str, Any] | None:
+    """v1: genuine / spurious scores; v2: ``ask_score``. Both carry kind / scope / fired_reason."""
+    if v is None:
+        return None
+    if isinstance(v, TierCV2Verdict):
+        return {
+            "kind": v.kind.value,
+            "scope": v.scope.value,
+            "ask_score": v.ask_score,
+            "fired_reason": v.fired_reason,
+        }
+    return {
+        "kind": v.kind.value,
+        "scope": v.scope.value,
+        "genuine_score": v.genuine_score,
+        "spurious_score": v.spurious_score,
+        "fired_reason": v.fired_reason,
     }
 
 

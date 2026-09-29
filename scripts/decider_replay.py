@@ -62,8 +62,21 @@ Tier-C fixture のみを想定する。
     }
 
 ``--endpoint`` 指定時は record に ``"decision": {outcome, decision_id, provider,
-raw_answers, verdict, policy, questions_version, latency_ms, error}`` が加わる
-(live の ``log_decision`` と同じ shape)。
+raw_answers, verdict, policy, questions_version, latency_ms, error, matched_rule,
+matched_rule_source, matched_rule_error, rules_sha256}`` が加わる (live の ``log_decision`` と
+同じ shape)。
+
+**tierc-v2** (T-decider-tierc-v2-all-escalations msg-4380 / 4382 / 4384): ``--questions tierc-v2
+--rules PATH`` で五ヶ条の問いセットを使う。 v1 との違い:
+
+* ``gate_result`` が ``null`` の turn も skip しない (D18 撤廃 + msg-4380 Δ2: 全件 Jev に通す)。
+  ``scope`` は全件 ``in_gate``。
+* record に ``rules_sha256`` が付く。 ``--endpoint`` 時は使ったルールファイルを
+  ``--rules-snapshot-dir`` (既定 ``eval/tierc/rules/``) に ``<rules_sha256>.toml`` として保存し、
+  各 record の ``rules_sha256`` から引けるようにする (msg-4382 評価の再現性)。
+* fixture 行の ``dispute_rounds`` (任意、rule_5 の feature) を state に載せる。
+
+``--questions`` の既定は ``tierc-v1`` (既存の replay / fixture の挙動を変えない)。
 """
 
 from __future__ import annotations
@@ -71,6 +84,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -80,6 +94,10 @@ from spirrow_mindwire.adapters.decider_lexora import DECIDER_TIMEOUT_SECONDS, de
 from spirrow_mindwire.decider.questions import (
     TIERC_QUESTIONS_V1,
     TIERC_QUESTIONS_VERSION,
+    TIERC_V2_QUESTIONS_VERSION,
+    TierCRules,
+    load_tierc_rules,
+    tierc_v2_questions,
 )
 from spirrow_mindwire.decider.result import decision_result_to_dict
 from spirrow_mindwire.decider.state import (
@@ -213,7 +231,17 @@ def parse_turn(row: dict[str, Any]) -> SimpleTurn:
         prev_next=None if row.get("prev_next") is None else str(row["prev_next"]),
         diff_stat=_parse_diff_stat(diff_raw),
         gate_result=gate_result,
+        dispute_rounds=_parse_dispute_rounds(row.get("dispute_rounds")),
     )
+
+
+def _parse_dispute_rounds(raw: Any) -> int | None:
+    """Optional tierc-v2 rule_5 feature (msg-4380 Δ5); absent / null → not computed."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ValueError(f"dispute_rounds must be a non-negative int, got {raw!r}")
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +251,29 @@ def parse_turn(row: dict[str, Any]) -> SimpleTurn:
 
 def _questions_to_json() -> list[dict[str, Any]]:
     return [{"key": q.key, "kind": q.kind.value, "prompt": q.prompt} for q in TIERC_QUESTIONS_V1]
+
+
+def build_tierc_v2_record(state: DecisionState, rules: TierCRules) -> dict[str, Any]:
+    """tierc-v2 の dry-run record。 scope は常に ``in_gate`` (D18 撤廃、msg-4360)。"""
+    return {
+        "thread_id": state.thread_id,
+        "round_index": state.round_index,
+        "questions_version": TIERC_V2_QUESTIONS_VERSION,
+        "rules_sha256": rules.sha256,
+        "scope": TierCScope.IN_GATE.value,
+        "questions": tierc_v2_questions(rules),
+        "state": state_to_dict(state),
+    }
+
+
+def snapshot_rules(rules: TierCRules, snapshot_dir: Path) -> Path:
+    """Copy the rules file to ``<snapshot_dir>/<rules_sha256>.toml`` (msg-4382). An existing
+    snapshot with that name has the same bytes by construction, so it is left alone."""
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    dest = snapshot_dir / f"{rules.sha256}.toml"
+    if not dest.exists():
+        shutil.copyfile(rules.source, dest)
+    return dest
 
 
 def build_tierc_record(state: DecisionState) -> dict[str, Any]:
@@ -306,6 +357,7 @@ async def _decide_records(
     sink: IO[str],
     done: set[tuple[str, int]],
     max_calls: int | None,
+    rules: TierCRules | None = None,
 ) -> tuple[int, int, int]:
     """``--endpoint`` 経路: 各 state を live と同じ ``decide_once`` に流し record に足す。
 
@@ -324,7 +376,12 @@ async def _decide_records(
             if max_calls is not None and called >= max_calls:
                 not_sent += 1
                 continue
-            dr = await decide_once(state, client=client, policy=POLICY_REPLAY_TIERC)
+            if rules is None:
+                dr = await decide_once(state, client=client, policy=POLICY_REPLAY_TIERC)
+            else:
+                dr = await decide_once(
+                    state, client=client, policy=POLICY_REPLAY_TIERC, rules=rules
+                )
             called += 1
             rec["decision"] = decision_result_to_dict(dr)
             sink.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -340,8 +397,12 @@ def run_tierc_replay(
     endpoint: str | None = None,
     max_calls: int | None = None,
     resume: bool = False,
+    rules: TierCRules | None = None,
+    rules_snapshot_dir: Path | None = None,
 ) -> int:
     """Tier-C fixture を JSONL に吐く。
+
+    ``rules`` given = tierc-v2 (every turn, gate or not; ``in_gate``); ``None`` = tierc-v1.
 
     ``endpoint`` が ``None`` なら dry-run (step 1 と同一出力)。 指定があれば
     各 record を ``/v1/decide`` に流し ``decision`` を付ける (msg-4180 §3)。
@@ -371,15 +432,17 @@ def run_tierc_replay(
             print(f"decider_replay: skip malformed turn: {exc}", file=sys.stderr)
             continue
 
-        if turn.gate_result is None:
-            # Tier-C 対象外 (Track B 単独)。 step 1 では Track B 未実装 ∴
-            # skip して count だけ残す。
+        if turn.gate_result is None and rules is None:
+            # v1: Tier-C 対象外 (Track B 単独)。 step 1 では Track B 未実装 ∴
+            # skip して count だけ残す。 v2 は skip しない (msg-4380 Δ2)。
             skipped_no_gate += 1
             continue
 
         state = state_builder(turn)
         states.append(state)
-        records.append(build_tierc_record(state))
+        records.append(
+            build_tierc_record(state) if rules is None else build_tierc_v2_record(state, rules)
+        )
 
     keys = [record_key(r) for r in records]
     if len(set(keys)) != len(keys):
@@ -388,12 +451,23 @@ def run_tierc_replay(
         return 2
 
     if endpoint is not None:
+        if rules is not None:
+            snap = snapshot_rules(
+                rules, rules_snapshot_dir if rules_snapshot_dir is not None else _SNAPSHOT_DIR
+            )
+            print(f"decider_replay: rules snapshot {snap}", file=sys.stderr)
         done = load_done_keys(out) if (resume and out is not None) else set()
         sink = out.open("a" if resume else "w", encoding="utf-8") if out is not None else sys.stdout
         try:
             called, skipped_done, not_sent = asyncio.run(
                 _decide_records(
-                    states, records, endpoint, sink=sink, done=done, max_calls=max_calls
+                    states,
+                    records,
+                    endpoint,
+                    sink=sink,
+                    done=done,
+                    max_calls=max_calls,
+                    rules=rules,
                 )
             )
         finally:
@@ -422,6 +496,10 @@ def run_tierc_replay(
         file=sys.stderr,
     )
     return 0
+
+
+_SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "eval" / "tierc" / "rules"
+"""Default ``--rules-snapshot-dir``: ``eval/tierc/rules/`` in this repository (msg-4382)."""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -479,6 +557,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="--out に追記し、decision 付きで出力済みの (thread_id, round_index) を飛ばす。",
     )
+    parser.add_argument(
+        "--questions",
+        choices=("tierc-v1", "tierc-v2"),
+        default="tierc-v1",
+        help="問いセット。 tierc-v2 (五ヶ条) は --rules が必要。 既定 tierc-v1。",
+    )
+    parser.add_argument(
+        "--rules",
+        type=Path,
+        default=None,
+        help="tierc-v2 のルールファイル (tierc_rules.toml)。",
+    )
+    parser.add_argument(
+        "--rules-snapshot-dir",
+        type=Path,
+        default=None,
+        help="--endpoint 時にルールファイルを <sha256>.toml で保存する先 (既定 eval/tierc/rules)。",
+    )
     args = parser.parse_args(argv)
 
     if args.track != "tierc":
@@ -497,6 +593,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    rules: TierCRules | None = None
+    if args.questions == "tierc-v2":
+        if args.rules is None:
+            print("decider_replay: --questions tierc-v2 needs --rules", file=sys.stderr)
+            return 2
+        try:
+            rules = load_tierc_rules(args.rules)
+        except ValueError as exc:
+            print(f"decider_replay: {exc}", file=sys.stderr)
+            return 2
+    elif args.rules is not None:
+        print("decider_replay: --rules is only for --questions tierc-v2", file=sys.stderr)
+        return 2
+
     return run_tierc_replay(
         fixture=args.fixture,
         out=args.out,
@@ -504,6 +614,8 @@ def main(argv: list[str] | None = None) -> int:
         endpoint=args.endpoint,
         max_calls=args.max_calls,
         resume=args.resume,
+        rules=rules,
+        rules_snapshot_dir=args.rules_snapshot_dir,
     )
 
 

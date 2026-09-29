@@ -469,6 +469,22 @@ class DeciderThresholdsConfig(_StrictModel):
     tierc_genuine_max: float = Field(default=0.40, ge=0.0, le=3.0)
     tierc_spurious_min: float = Field(default=0.60, ge=0.0, le=1.0)
 
+    # Tier-C v2 (T-decider-tierc-v2-all-escalations msg-4380 Δ4): ``should_ask_human`` 1 本。
+    # >= ask_min → CONFIRMED / < not_ask_max → LIKELY_NOT / それ以外 UNSURE。 初期値は v1 の
+    # 0.60 / 0.40 を流用し replay 前に固定 (事前登録)。意味論の SOT は
+    # :class:`~spirrow_mindwire.decider.verdict.TierCV2Thresholds`。
+    tierc_v2_ask_min: float = Field(default=0.60, ge=0.0, le=1.0)
+    tierc_v2_not_ask_max: float = Field(default=0.40, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _v2_bands_do_not_overlap(self) -> Self:
+        if self.tierc_v2_not_ask_max > self.tierc_v2_ask_min:
+            raise ValueError(
+                f"tierc_v2_not_ask_max={self.tierc_v2_not_ask_max} must be <= "
+                f"tierc_v2_ask_min={self.tierc_v2_ask_min}"
+            )
+        return self
+
 
 class DeciderTierCConfig(_StrictModel):
     """``[decider.tierc]`` — Tier-C フック (§3.3.b) の運用モード。
@@ -496,10 +512,21 @@ class DeciderTierCConfig(_StrictModel):
     出したときに ``force_naysayer_only_on_explicit_human`` の Gemini
     相談を省く cost lever (§5)。 shadow / annotate / bounce のいずれ
     でも参照可能で、 default は False。
+
+    :attr:`questions` は問いセット (T-decider-tierc-v2 msg-4380 Δ3)。 live の既定は
+    ``tierc-v2`` (五ヶ条)、``tierc-v1`` は v1 replay 比較のために残す。 v2 では grey-zone
+    gating (D18) は無く、``NEXT: human`` の対象ターンは全件 Lexora に送る。
+
+    :attr:`rules_path` は五ヶ条ルールファイルの正本 (msg-4382 Objection 3)。未指定なら
+    ``<data_dir>/config/tierc_rules.toml`` (mindwire.toml と同じディレクトリ —
+    :func:`resolve_tierc_rules_path`)。初回配置は ``mindwire init-config tierc-rules``。
+    起動時に 1 回だけ読む ∴ 文言を直したら conductor を再起動する (msg-4384)。
     """
 
     mode: Literal["off", "shadow", "annotate", "bounce"] = "shadow"
     skip_naysayer_when_confirmed: bool = False
+    questions: Literal["tierc-v1", "tierc-v2"] = "tierc-v2"
+    rules_path: Path | None = None
 
 
 class DeciderConfig(_StrictModel):
@@ -603,6 +630,20 @@ class MindwireSettings(BaseSettings):
         return v
 
 
+TIERC_RULES_FILENAME = "tierc_rules.toml"
+"""The canonical Tier-C rules file name under ``<data_dir>/config/`` (msg-4382 Objection 3)."""
+
+
+def resolve_tierc_rules_path(settings: MindwireSettings) -> Path:
+    """``[decider.tierc].rules_path`` when set (``expanduser`` applied), else
+    ``<data_dir>/config/tierc_rules.toml`` — beside ``mindwire.toml``, outside the installed
+    package, so a package update never overwrites Takahito's edits."""
+    configured = settings.decider.tierc.rules_path
+    if configured is not None:
+        return configured.expanduser()
+    return settings.paths.config_dir / TIERC_RULES_FILENAME
+
+
 def _default_config_path() -> Path:
     """Resolve the default ``mindwire.toml`` path.
 
@@ -665,6 +706,7 @@ def load_settings(config_path: Path | None = None) -> MindwireSettings:
 __all__ = [
     "CONFIG_SCHEMA_VERSION",
     "DEFAULT_DATA_DIR",
+    "TIERC_RULES_FILENAME",
     "ClaudeCodeConfig",
     "ConductorConfig",
     "DeciderConfig",
@@ -681,4 +723,5 @@ __all__ = [
     "Stage3LoopConfig",
     "WatcherConfig",
     "load_settings",
+    "resolve_tierc_rules_path",
 ]

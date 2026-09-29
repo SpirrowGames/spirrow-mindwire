@@ -155,6 +155,7 @@ class Turn(Protocol):
     prev_next: str | None
     diff_stat: DiffStat | None
     gate_result: AdmissionGateResult | None
+    dispute_rounds: int | None
 
 
 @dataclass
@@ -180,6 +181,11 @@ class SimpleTurn:
     prev_next: str | None = None
     diff_stat: DiffStat | None = None
     gate_result: AdmissionGateResult | None = None
+    dispute_rounds: int | None = None
+    """Tier-C v2 rule_5 feature (msg-4380 Δ5): proposer→naysayer rounds since the last
+    ``VERDICT: APPROVE``, counted over the whole thread by the hook
+    (:func:`spirrow_mindwire.decider.hook.count_dispute_rounds`). ``None`` = not computed
+    (replay fixtures built before v2) — and then it is left off the wire entirely."""
 
 
 @dataclass(frozen=True)
@@ -204,6 +210,7 @@ class DecisionState:
     prev_next: str | None
     diff_stat: DiffStat | None
     gate_result: AdmissionGateResult | None
+    dispute_rounds: int | None = None
 
 
 def state_builder(turn: Turn) -> DecisionState:
@@ -234,6 +241,7 @@ def state_builder(turn: Turn) -> DecisionState:
         prev_next=turn.prev_next,
         diff_stat=turn.diff_stat,
         gate_result=turn.gate_result,
+        dispute_rounds=turn.dispute_rounds,
     )
 
 
