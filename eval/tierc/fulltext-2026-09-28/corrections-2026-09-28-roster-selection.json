@@ -1,0 +1,2135 @@
+{
+ "added": [],
+ "counts": {
+  "added": 0,
+  "exclude": {
+   "not_an_escalation": 143
+  },
+  "fixture": 209,
+  "keep": 66
+ },
+ "exclude": [
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-289",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 3,
+   "thread_id": "T-evidence-policy-s8-self-application"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-290",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 4,
+   "thread_id": "T-evidence-policy-s8-self-application"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-294",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 6,
+   "thread_id": "T-evidence-policy-s8-self-application"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-297",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 8,
+   "thread_id": "T-evidence-policy-s8-self-application"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-300",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 10,
+   "thread_id": "T-evidence-policy-s8-self-application"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-303",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 12,
+   "thread_id": "T-evidence-policy-s8-self-application"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-315",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 2,
+   "thread_id": "T-runner-placement-and-evidence-level"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-319",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 4,
+   "thread_id": "T-runner-placement-and-evidence-level"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-325",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 6,
+   "thread_id": "T-runner-placement-and-evidence-level"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-329",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 8,
+   "thread_id": "T-runner-placement-and-evidence-level"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-333",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 10,
+   "thread_id": "T-runner-placement-and-evidence-level"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-341",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 2,
+   "thread_id": "T-t04-playproof-http-surface"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-345",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 4,
+   "thread_id": "T-t04-playproof-http-surface"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-348",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 6,
+   "thread_id": "T-t04-playproof-http-surface"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-351",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 8,
+   "thread_id": "T-t04-playproof-http-surface"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-356",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 10,
+   "thread_id": "T-t04-playproof-http-surface"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-359",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 12,
+   "thread_id": "T-t04-playproof-http-surface"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-364",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 14,
+   "thread_id": "T-t04-playproof-http-surface"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-370",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 16,
+   "thread_id": "T-t04-playproof-http-surface"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-379",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 2,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-381",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 4,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-383",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 6,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-385",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 8,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-390",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 11,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-393",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 13,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-395",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 15,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3060",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 406,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3062",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 81,
+   "thread_id": "T-ephemeral-develop-pr-retarget"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3064",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 81,
+   "thread_id": "T-T227-P0-spec-kickoff"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-401",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 19,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3066",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 408,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-3070",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 83,
+   "thread_id": "T-ephemeral-develop-pr-retarget"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3074",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 27,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-408",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 23,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3079",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 410,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-414",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 26,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3088",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 29,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-419",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 29,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3089",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 412,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3093",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 31,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3096",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 414,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3100",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 33,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3106",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 37,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3109",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 39,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3112",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 416,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3114",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 418,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2392",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 52,
+   "thread_id": "T-new-project-gate-bootstrap"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3120",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 422,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2397",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 55,
+   "thread_id": "T-naysayer-blocking-bar-undefined"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2400",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 2,
+   "thread_id": "T-preflight-row-selector-reads-wrong-column"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3122",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 424,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2408",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 54,
+   "thread_id": "T-new-project-gate-bootstrap"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3124",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 426,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2418",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 17,
+   "thread_id": "T-digest-exceeds-discord-limit-and-is-dropped"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3126",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 428,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2422",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 45,
+   "thread_id": "T-pr-review-threads-outlive-their-prs"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2425",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 5,
+   "thread_id": "T-pr-review-spirrow-mindwire-214"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2429",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 8,
+   "thread_id": "T-pr-review-spirrow-mindwire-214"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2450",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 31,
+   "thread_id": "T-gate-bootstrap-close-refused-and-tick-crash"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3129",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 49,
+   "thread_id": "T-carveout7-ue-integration-ci-gate"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3136",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 53,
+   "thread_id": "T-carveout7-ue-integration-ci-gate"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3139",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 55,
+   "thread_id": "T-carveout7-ue-integration-ci-gate"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3146",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 41,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3148",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 43,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2521",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 60,
+   "thread_id": "T-naysayer-blocking-bar-undefined"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3155",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 45,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-437",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 41,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3159",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 47,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3162",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 49,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-092",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 11,
+   "thread_id": "T-silent-routing"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-095",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 13,
+   "thread_id": "T-silent-routing"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-3173",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 137,
+   "thread_id": "T-materializechunk-zone-relocation-crash"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-126",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 2,
+   "thread_id": "T-model-alias-leak"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Bohr",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Bohr"
+   },
+   "msg_id": "msg-244",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 0,
+   "thread_id": "T-human-outage-degrade-close-only"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-164",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 3,
+   "thread_id": "T-duration-slack-derivation"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-168",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 6,
+   "thread_id": "T-duration-slack-derivation"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-173",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 8,
+   "thread_id": "T-duration-slack-derivation"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-178",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 10,
+   "thread_id": "T-duration-slack-derivation"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-187",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 2,
+   "thread_id": "T-streaming-ledger-row"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-323",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 10,
+   "thread_id": "T-checkpoint-silent-partial-write"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-326",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 5,
+   "thread_id": "T-material-store-per-request-sync-io"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-327",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 17,
+   "thread_id": "T-integrity-flags-sanctioned-force-close"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-199",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 5,
+   "thread_id": "T-streaming-ledger-row"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-206",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 3,
+   "thread_id": "T-duration-slack-underestimates-the-tick"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-207",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 4,
+   "thread_id": "T-duration-slack-underestimates-the-tick"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-208",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 5,
+   "thread_id": "T-duration-slack-underestimates-the-tick"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-371",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 23,
+   "thread_id": "T-integrity-flags-sanctioned-force-close"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-213",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 7,
+   "thread_id": "T-duration-slack-underestimates-the-tick"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-217",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 9,
+   "thread_id": "T-duration-slack-underestimates-the-tick"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-222",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 8,
+   "thread_id": "T-streaming-ledger-row"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-226",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 10,
+   "thread_id": "T-streaming-ledger-row"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-230",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 12,
+   "thread_id": "T-streaming-ledger-row"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-236",
+   "project": "spirrow-lexora",
+   "reason": "not_an_escalation",
+   "round_index": 14,
+   "thread_id": "T-streaming-ledger-row"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-455",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 12,
+   "thread_id": "T-conclair-double-close-race-no-row-lock"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-489",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 6,
+   "thread_id": "T-row-lock-decision-read-under-lock-unpinned"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-494",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 12,
+   "thread_id": "T-gate-firing-ignores-loop-state-and-prior-verdicts"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2671",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 5,
+   "thread_id": "T-adr-index-omits-chatroom-body-locator"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-554",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 11,
+   "thread_id": "T-sweeper-posts-into-resolved-thread-blocks-r2-deploy"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-555",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 12,
+   "thread_id": "T-sweeper-posts-into-resolved-thread-blocks-r2-deploy"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-558",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 3,
+   "thread_id": "T-unavailable-reason-empty-diagnostic"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-559",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 14,
+   "thread_id": "T-sweeper-posts-into-resolved-thread-blocks-r2-deploy"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-565",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 5,
+   "thread_id": "T-unavailable-reason-empty-diagnostic"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-569",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 7,
+   "thread_id": "T-unavailable-reason-empty-diagnostic"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-572",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 9,
+   "thread_id": "T-unavailable-reason-empty-diagnostic"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-596",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 10,
+   "thread_id": "T-sweep-sequentiality-load-bearing-but-unpinned"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-597",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 17,
+   "thread_id": "T-sweeper-posts-into-resolved-thread-blocks-r2-deploy"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-638",
+   "project": "spirrow-magickit",
+   "reason": "not_an_escalation",
+   "round_index": 22,
+   "thread_id": "T-sweep-pin-blind-to-launch-paths-added-beside-the-spawn"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-479",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 12,
+   "thread_id": "T-t07-stage2-warp-exporter"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2731",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 49,
+   "thread_id": "T-operator-board"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-484",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 15,
+   "thread_id": "T-t07-stage2-warp-exporter"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-491",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 18,
+   "thread_id": "T-t07-stage2-warp-exporter"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2737",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 7,
+   "thread_id": "T-adr-index-omits-chatroom-body-locator"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2738",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 77,
+   "thread_id": "T-exclusive-resource-lease-queue"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2742",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 51,
+   "thread_id": "T-operator-board"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2743",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 9,
+   "thread_id": "T-adr-index-omits-chatroom-body-locator"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-497",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 21,
+   "thread_id": "T-t07-stage2-warp-exporter"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-2744",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 51,
+   "thread_id": "T-stalled-pr-has-no-detector"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2751",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 53,
+   "thread_id": "T-operator-board"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2754",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 11,
+   "thread_id": "T-adr-index-omits-chatroom-body-locator"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2756",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 55,
+   "thread_id": "T-operator-board"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2760",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 13,
+   "thread_id": "T-adr-index-omits-chatroom-body-locator"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2772",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 4,
+   "thread_id": "T-pr-gate-relay-belongs-to-the-conductor-not-the-gate"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-2779",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 69,
+   "thread_id": "T-new-project-gate-bootstrap"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2780",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 84,
+   "thread_id": "T-gate-silently-suppresses-approve-on-truncated-diff"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2835",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 7,
+   "thread_id": "T-pr-gate-relay-belongs-to-the-conductor-not-the-gate"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2845",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 59,
+   "thread_id": "T-stalled-pr-has-no-detector"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-2852",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 41,
+   "thread_id": "T-public-repo-carries-real-infra-values"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2853",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 62,
+   "thread_id": "T-stalled-pr-has-no-detector"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-2859",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 2,
+   "thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-2866",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 43,
+   "thread_id": "T-public-repo-carries-real-infra-values"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3006",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 4,
+   "thread_id": "T-naysayer-skill-doc-has-two-divergent-copies"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3007",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 5,
+   "thread_id": "T-naysayer-skill-doc-has-two-divergent-copies"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-3009",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 12,
+   "thread_id": "T-pr-gate-relay-belongs-to-the-conductor-not-the-gate"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3012",
+   "project": "spirrow-mindwire",
+   "reason": "not_an_escalation",
+   "round_index": 8,
+   "thread_id": "T-naysayer-skill-doc-has-two-divergent-copies"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-528",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 3,
+   "thread_id": "T-o9-codify-gate-audit-predicate"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-529",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 4,
+   "thread_id": "T-o9-codify-gate-audit-predicate"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-533",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 7,
+   "thread_id": "T-o9-codify-gate-audit-predicate"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-543",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 66,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Einstein",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Einstein"
+   },
+   "msg_id": "msg-545",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 68,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-551",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 72,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-569",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 2,
+   "thread_id": "T-recording-lane-verdict-has-no-carrier-and-no-launcher"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-3209",
+   "project": "spirrow-voxelworld",
+   "reason": "not_an_escalation",
+   "round_index": 144,
+   "thread_id": "T-materializechunk-zone-relocation-crash"
+  },
+  {
+   "detail": {
+    "conductor_roster": "role/Heisenberg",
+    "empty_roster": "human/field_unresolvable",
+    "next_participant": "Heisenberg"
+   },
+   "msg_id": "msg-571",
+   "project": "spirrow-playproof",
+   "reason": "not_an_escalation",
+   "round_index": 4,
+   "thread_id": "T-recording-lane-verdict-has-no-carrier-and-no-launcher"
+  }
+ ],
+ "fixture_sha256": "280bdd49ea725541570dc60c8f58cbcc4b59b6cc7f7e09b418c879ac02cc69ad",
+ "keep": [
+  {
+   "msg_id": "msg-2672",
+   "project": "spirrow-voxelworld",
+   "round_index": 20,
+   "thread_id": "T-mesher-gaussian-smoothing-dependency"
+  },
+  {
+   "msg_id": "msg-2782",
+   "project": "spirrow-voxelworld",
+   "round_index": 316,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "msg_id": "msg-2897",
+   "project": "spirrow-voxelworld",
+   "round_index": 396,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "msg_id": "msg-2909",
+   "project": "spirrow-voxelworld",
+   "round_index": 398,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "msg_id": "msg-2919",
+   "project": "spirrow-voxelworld",
+   "round_index": 401,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "msg_id": "msg-3044",
+   "project": "spirrow-voxelworld",
+   "round_index": 76,
+   "thread_id": "T-ephemeral-develop-pr-retarget"
+  },
+  {
+   "msg_id": "msg-310",
+   "project": "spirrow-playproof",
+   "round_index": 16,
+   "thread_id": "T-evidence-policy-s8-self-application"
+  },
+  {
+   "msg_id": "msg-311",
+   "project": "spirrow-playproof",
+   "round_index": 8,
+   "thread_id": "T-pr-review-spirrow-playproof-38"
+  },
+  {
+   "msg_id": "msg-3052",
+   "project": "spirrow-voxelworld",
+   "round_index": 404,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "msg_id": "msg-425",
+   "project": "spirrow-playproof",
+   "round_index": 32,
+   "thread_id": "T-t07-playproof-recorder"
+  },
+  {
+   "msg_id": "msg-3101",
+   "project": "spirrow-voxelworld",
+   "round_index": 1,
+   "thread_id": "T-release-squash-violates-obl-merge-commit"
+  },
+  {
+   "msg_id": "msg-3116",
+   "project": "spirrow-voxelworld",
+   "round_index": 84,
+   "thread_id": "T-ephemeral-develop-pr-retarget"
+  },
+  {
+   "msg_id": "msg-3118",
+   "project": "spirrow-voxelworld",
+   "round_index": 420,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "msg_id": "msg-2414",
+   "project": "spirrow-mindwire",
+   "round_index": 57,
+   "thread_id": "T-naysayer-blocking-bar-undefined"
+  },
+  {
+   "msg_id": "msg-3128",
+   "project": "spirrow-voxelworld",
+   "round_index": 430,
+   "thread_id": "T-lod0-sliver-shards"
+  },
+  {
+   "msg_id": "msg-2426",
+   "project": "spirrow-mindwire",
+   "round_index": 58,
+   "thread_id": "T-naysayer-blocking-bar-undefined"
+  },
+  {
+   "msg_id": "msg-2433",
+   "project": "spirrow-mindwire",
+   "round_index": 11,
+   "thread_id": "T-pr-review-spirrow-mindwire-214"
+  },
+  {
+   "msg_id": "msg-2502",
+   "project": "spirrow-mindwire",
+   "round_index": 14,
+   "thread_id": "T-pr-review-spirrow-mindwire-214"
+  },
+  {
+   "msg_id": "msg-346",
+   "project": "spirrow-magickit",
+   "round_index": 0,
+   "thread_id": "T-adr-2026-05-29-series-has-no-locatable-body"
+  },
+  {
+   "msg_id": "msg-349",
+   "project": "spirrow-magickit",
+   "round_index": 20,
+   "thread_id": "T-dashboard-panels-do-not-name-the-project"
+  },
+  {
+   "msg_id": "msg-352",
+   "project": "spirrow-magickit",
+   "round_index": 9,
+   "thread_id": "T-not-waiting-conclair-contract-assumptions"
+  },
+  {
+   "msg_id": "msg-450",
+   "project": "spirrow-magickit",
+   "round_index": 10,
+   "thread_id": "T-adr12-step3-embodiment-column-removal"
+  },
+  {
+   "msg_id": "msg-525",
+   "project": "spirrow-magickit",
+   "round_index": 14,
+   "thread_id": "T-gate-firing-ignores-loop-state-and-prior-verdicts"
+  },
+  {
+   "msg_id": "msg-566",
+   "project": "spirrow-magickit",
+   "round_index": 16,
+   "thread_id": "T-sweeper-posts-into-resolved-thread-blocks-r2-deploy"
+  },
+  {
+   "msg_id": "msg-576",
+   "project": "spirrow-magickit",
+   "round_index": 12,
+   "thread_id": "T-unavailable-reason-empty-diagnostic"
+  },
+  {
+   "msg_id": "msg-611",
+   "project": "spirrow-magickit",
+   "round_index": 20,
+   "thread_id": "T-sweeper-posts-into-resolved-thread-blocks-r2-deploy"
+  },
+  {
+   "msg_id": "msg-634",
+   "project": "spirrow-magickit",
+   "round_index": 21,
+   "thread_id": "T-sweeper-posts-into-resolved-thread-blocks-r2-deploy"
+  },
+  {
+   "msg_id": "msg-517",
+   "project": "spirrow-playproof",
+   "round_index": 5,
+   "thread_id": "T-pr-review-spirrow-playproof-61"
+  },
+  {
+   "msg_id": "msg-518",
+   "project": "spirrow-playproof",
+   "round_index": 30,
+   "thread_id": "T-t07-stage2-warp-exporter"
+  },
+  {
+   "msg_id": "msg-2767",
+   "project": "spirrow-mindwire",
+   "round_index": 15,
+   "thread_id": "T-adr-index-omits-chatroom-body-locator"
+  },
+  {
+   "msg_id": "msg-2778",
+   "project": "spirrow-mindwire",
+   "round_index": 6,
+   "thread_id": "T-pr-gate-relay-belongs-to-the-conductor-not-the-gate"
+  },
+  {
+   "msg_id": "msg-687",
+   "project": "spirrow-magickit",
+   "round_index": 36,
+   "thread_id": "T-gate-firing-ignores-loop-state-and-prior-verdicts"
+  },
+  {
+   "msg_id": "msg-3017",
+   "project": "spirrow-mindwire",
+   "round_index": 11,
+   "thread_id": "T-naysayer-skill-doc-has-two-divergent-copies"
+  },
+  {
+   "msg_id": "msg-523",
+   "project": "spirrow-playproof",
+   "round_index": 1,
+   "thread_id": "T-ledger-carveout-accepts-an-empty-approval"
+  },
+  {
+   "msg_id": "msg-3183",
+   "project": "spirrow-voxelworld",
+   "round_index": 54,
+   "thread_id": "T-ci-window-ledger-anchor"
+  },
+  {
+   "msg_id": "msg-723",
+   "project": "spirrow-magickit",
+   "round_index": 8,
+   "thread_id": "T-i3-i9-pin-sufficiency-unadjudicated"
+  },
+  {
+   "msg_id": "msg-740",
+   "project": "spirrow-magickit",
+   "round_index": 11,
+   "thread_id": "T-dashboard-system-page-retirement-unfiled"
+  },
+  {
+   "msg_id": "msg-3107",
+   "project": "spirrow-mindwire",
+   "round_index": 25,
+   "thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo"
+  },
+  {
+   "msg_id": "msg-3108",
+   "project": "spirrow-mindwire",
+   "round_index": 84,
+   "thread_id": "T-public-repo-carries-real-infra-values"
+  },
+  {
+   "msg_id": "msg-3138",
+   "project": "spirrow-mindwire",
+   "round_index": 26,
+   "thread_id": "T-spec-pin-hardening-and-id-audit"
+  },
+  {
+   "msg_id": "msg-3244",
+   "project": "spirrow-voxelworld",
+   "round_index": 32,
+   "thread_id": "T-ci-ledger-alarm-destination"
+  },
+  {
+   "msg_id": "msg-3253",
+   "project": "spirrow-voxelworld",
+   "round_index": 39,
+   "thread_id": "T-ci-ledger-alarm-destination"
+  },
+  {
+   "msg_id": "msg-3262",
+   "project": "spirrow-voxelworld",
+   "round_index": 47,
+   "thread_id": "T-ci-ledger-alarm-destination"
+  },
+  {
+   "msg_id": "msg-3271",
+   "project": "spirrow-voxelworld",
+   "round_index": 55,
+   "thread_id": "T-ci-ledger-alarm-destination"
+  },
+  {
+   "msg_id": "msg-3198",
+   "project": "spirrow-mindwire",
+   "round_index": 27,
+   "thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo"
+  },
+  {
+   "msg_id": "msg-3288",
+   "project": "spirrow-voxelworld",
+   "round_index": 71,
+   "thread_id": "T-ci-ledger-alarm-destination"
+  },
+  {
+   "msg_id": "msg-3294",
+   "project": "spirrow-voxelworld",
+   "round_index": 76,
+   "thread_id": "T-ci-ledger-alarm-destination"
+  },
+  {
+   "msg_id": "msg-808",
+   "project": "spirrow-magickit",
+   "round_index": 33,
+   "thread_id": "T-merged-to-main-without-gate-artifact"
+  },
+  {
+   "msg_id": "msg-3259",
+   "project": "spirrow-mindwire",
+   "round_index": 11,
+   "thread_id": "T-scoped-driver-verdict-never-reaches-chatroom"
+  },
+  {
+   "msg_id": "msg-3261",
+   "project": "spirrow-mindwire",
+   "round_index": 30,
+   "thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo"
+  },
+  {
+   "msg_id": "msg-3289",
+   "project": "spirrow-mindwire",
+   "round_index": 28,
+   "thread_id": "T-spec-pin-hardening-and-id-audit"
+  },
+  {
+   "msg_id": "msg-829",
+   "project": "spirrow-magickit",
+   "round_index": 47,
+   "thread_id": "T-merged-to-main-without-gate-artifact"
+  },
+  {
+   "msg_id": "msg-3359",
+   "project": "spirrow-mindwire",
+   "round_index": 14,
+   "thread_id": "T-scoped-driver-verdict-never-reaches-chatroom"
+  },
+  {
+   "msg_id": "msg-3363",
+   "project": "spirrow-mindwire",
+   "round_index": 35,
+   "thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo"
+  },
+  {
+   "msg_id": "msg-3414",
+   "project": "spirrow-mindwire",
+   "round_index": 40,
+   "thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo"
+  },
+  {
+   "msg_id": "msg-3432",
+   "project": "spirrow-mindwire",
+   "round_index": 31,
+   "thread_id": "T-spec-pin-hardening-and-id-audit"
+  },
+  {
+   "msg_id": "msg-3453",
+   "project": "spirrow-mindwire",
+   "round_index": 36,
+   "thread_id": "T-scoped-driver-verdict-never-reaches-chatroom"
+  },
+  {
+   "msg_id": "msg-885",
+   "project": "spirrow-magickit",
+   "round_index": 94,
+   "thread_id": "T-merged-to-main-without-gate-artifact"
+  },
+  {
+   "msg_id": "msg-888",
+   "project": "spirrow-magickit",
+   "round_index": 97,
+   "thread_id": "T-merged-to-main-without-gate-artifact"
+  },
+  {
+   "msg_id": "msg-3457",
+   "project": "spirrow-mindwire",
+   "round_index": 45,
+   "thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo"
+  },
+  {
+   "msg_id": "msg-3471",
+   "project": "spirrow-mindwire",
+   "round_index": 34,
+   "thread_id": "T-spec-pin-hardening-and-id-audit"
+  },
+  {
+   "msg_id": "msg-3475",
+   "project": "spirrow-mindwire",
+   "round_index": 51,
+   "thread_id": "T-loop-control-keyed-by-project-resource-is-the-repo"
+  },
+  {
+   "msg_id": "msg-3486",
+   "project": "spirrow-mindwire",
+   "round_index": 37,
+   "thread_id": "T-spec-pin-hardening-and-id-audit"
+  },
+  {
+   "msg_id": "msg-915",
+   "project": "spirrow-magickit",
+   "round_index": 116,
+   "thread_id": "T-merged-to-main-without-gate-artifact"
+  },
+  {
+   "msg_id": "msg-665",
+   "project": "spirrow-playproof",
+   "round_index": 66,
+   "thread_id": "T-recording-lane-verdict-has-no-carrier-and-no-launcher"
+  },
+  {
+   "msg_id": "msg-3452",
+   "project": "spirrow-voxelworld",
+   "round_index": 157,
+   "thread_id": "T-materializechunk-zone-relocation-crash"
+  }
+ ],
+ "roster": {
+  "Bohr": "proposer",
+  "Einstein": "naysayer",
+  "Heisenberg": "implementer"
+ },
+ "schema": 1,
+ "selection_code_commit": "fa20b3e"
+}

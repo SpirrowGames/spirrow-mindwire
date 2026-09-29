@@ -1218,3 +1218,27 @@ def test_resume_retries_failed_rows_and_report_reads_the_retry(tmp_path: Path) -
     _write_lines(path, [_rec(a, ok), _rec(b, failed), _rec(b, ok)])
     scores = ftr.load_scores(path, {a, b})
     assert set(scores) == {a, b}
+
+
+# --- eval/tierc/fulltext-2026-09-28: data is what manifest.json says (msg-4332 / msg-4334) -------
+
+FULLTEXT_DIR = ROOT / "eval" / "tierc" / "fulltext-2026-09-28"
+
+
+def test_fulltext_manifest_sha256_matches_every_committed_file() -> None:
+    """sha only (msg-4334): the report is not regenerated here, so the script may evolve."""
+    manifest = json.loads((FULLTEXT_DIR / "manifest.json").read_text(encoding="utf-8"))
+    files = manifest["files"]
+    assert set(files) == {
+        "fixture.fulltext.m8000.jsonl",
+        "replay.full.jsonl",
+        "replay.base.jsonl",
+        "plan.json",
+        "contract.full.out.jsonl",
+        "corrections-2026-09-28-roster-selection.json",
+        "report.fulltext.md",
+    }
+    for name, entry in files.items():
+        data = (FULLTEXT_DIR / name).read_bytes()
+        assert b"\r" not in data, f"{name}: committed with CR"
+        assert hashlib.sha256(data).hexdigest() == entry["sha256"], name
