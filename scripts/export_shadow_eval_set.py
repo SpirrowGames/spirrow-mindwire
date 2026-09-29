@@ -1,49 +1,54 @@
 """Export the Tier-C production-shadow rows as an evaluation set — T-decider-conductor-hook step 2d.
 
-Spec: Bohr msg-4634 DECIDED 2d-2 (export → lock → label → measure; Jev's output in a separate
-file the labellers never read; negative test on the labeller file) and msg-4636 DECIDED 2d-3
-(read the point-in-time input the hook logged instead of rebuilding it; the counted scope is the
-rows that carry ``state_wire`` + ``latest_msg_id`` with the registered ``rules_sha256``; the
-labeller material is cut at ``latest_msg_id``; the Jev file is ``--replay``-shaped, the fixture
-``--fixture``-shaped). Einstein approved msg-4636.
+Spec (Bohr, each approved by Einstein): msg-4634 DECIDED 2d-2 (export → lock → label → measure;
+Jev's output in a separate file the labellers never read), msg-4636 DECIDED 2d-3 (read the
+point-in-time input the hook logged instead of rebuilding it; ``--replay`` / ``--fixture``
+shapes), msg-4639 DECIDED 2d-4 / 2d-6 (count ``tierc-v2`` rows only; ``following`` = the 3
+messages after, as in the replay), msg-4641 DECIDED 2d-7 (a row with fewer than 3 is counted when
+its thread ended with ``NEXT: none`` or has been quiet for 72 h at ``--as-of``, otherwise held)
+and msg-4643 DECIDED 2d-8 (everything after ``--as-of`` is dropped first).
 
-**Nothing is rebuilt.** This script never calls ``state_builder`` / ``turn_from_messages`` and
-imports nothing from ``spirrow_mindwire.decider`` (pinned by a test): the Jev-side ``state`` is
-``json.loads`` of the ``state_wire`` string the hook logged — the bytes Lexora was sent — and the
-roster is the one the hook logged. Rebuilding weeks later would read a thread that has grown,
-today's roster and today's builder (msg-4636 §確かめた事実 1-3).
+**Step 0 — the ``--as-of`` cut (2d-8).** Straight after reading, before any other logic, every
+thread message and every ``decider_decision`` row with a timestamp **after** ``--as-of`` is
+dropped (``== as_of`` is kept). Everything below — the last message, ``NEXT: none``, the 72-hour
+test, ``following`` / ``following_n``, the ``round_index`` position, the duplicate check — reads
+only what is left, so the same inputs and the same ``--as-of`` give the same bytes however much
+the threads and the log have grown since. ``--as-of`` must be timezone-aware ISO 8601 and not in
+the future (a future value would age live threads into "quiet"). A row without ``logged_at``
+cannot be placed in time; it is one of the rows without point-in-time columns (below).
 
-**Inputs.**
+**Nothing is rebuilt (2d-3).** This script never calls ``state_builder`` / ``turn_from_messages``
+and imports nothing from ``spirrow_mindwire.decider`` itself (pinned by a test): the Jev-side
+``state`` is ``json.loads`` of the ``state_wire`` string the hook logged — the bytes Lexora was
+sent — and the roster is the one the hook logged. The material constants are imported from
+``build_tierc_eval_fixture`` so the replay and the shadow share one definition (2d-6).
 
-* ``--log PATH`` (repeatable) — conductor log files; every line containing ``decider_decision ``
-  is a hook row (``hook.log_decision``: the JSON after that prefix);
-* ``--rules-sha256 HEX`` — the ``rules_sha256`` registered in ``eval/tierc/shadow-prereg.md``;
-* ``--project NAME`` (repeatable) — chatroom projects to fetch the counted rows' threads from
-  (for the labeller material only).
+**Inputs.** ``--log PATH`` (repeatable; every line containing ``decider_decision `` is a hook
+row), ``--rules-sha256 HEX`` (the value registered in ``eval/tierc/shadow-prereg.md``),
+``--project NAME`` (repeatable; where to fetch the counted rows' threads), ``--as-of``.
 
-**Scope (msg-4636 DECIDED 2d-3).** A row is *counted* when it has ``state_wire`` and
-``latest_msg_id``, ``routed == "stop"`` and ``rules_sha256`` equals ``--rules-sha256``. Every
-other row is only counted by reason (:func:`classify`): no point-in-time columns (written before
-this change was deployed), ``forced_naysayer`` / ``spawn_blocked`` (the separate table msg-4634
-2d-1 asks for), a different ``rules_sha256``.
+**Scope.** :func:`classify` puts each surviving row in one bucket: no point-in-time columns
+(``state_wire`` / ``latest_msg_id`` / ``logged_at``), ``routed:<value>`` for a row ``_route`` did
+not stop (the separate forced / spawn-blocked table, 2d-1), a questions version other than
+``tierc-v2`` (2d-4), a different ``rules_sha256``, else a candidate. A candidate is ``counted``
+when its thread has 3 messages after it, or fewer and the thread is terminated / quiet (2d-7);
+otherwise ``held`` — counted by number only, exported on a later ``--as-of``.
 
 **Outputs.**
 
 * ``<out-dir>/materials.jsonl`` — what the labellers read (``label_eval_set.py --dir``): the
-  ``latest_msg_id`` message and the 5 before it, **nothing after it** (``following`` is always
-  empty). No Jev column appears here (pinned by a negative test);
-* ``<out-dir>/fixture.jsonl`` — the ``tierc_eval_report.py --fixture`` join rows (thread / author /
-  ``msg_id`` = ``latest_msg_id`` / ``roster_source=logged``). No Jev column either;
+  message, the 5 before it and ``following`` (up to 3 after it), ``following_n``. No Jev column;
+* ``<out-dir>/fixture.jsonl`` — the ``tierc_eval_report.py --fixture`` join rows (thread /
+  author / ``msg_id`` = ``latest_msg_id`` / ``roster_source=logged`` / ``following_n``);
 * ``--replay-out`` — the Jev side in ``decider_replay.py --endpoint`` record shape (``state`` +
   ``decision``), read by ``tierc_eval_report.py --replay``. It must not be inside ``--out-dir``;
-* ``<out-dir>/export.json`` — the counts by reason and the inputs used.
+* ``<out-dir>/export.json`` — the counts by bucket, ``as_of`` and the inputs used.
 
 **Join key.** ``tierc_eval_report.py`` joins on ``(thread_id, round_index)``. The conductor's
-``round_index`` is its per-run loop counter and restarts at 0 on every dispatch, so two
-escalations in one thread can share it. As in the replay fixture (``build_tierc_eval_fixture.py``)
-the exported ``round_index`` is therefore the ``latest_msg_id`` message's 0-based position in its
-thread — stable and unique per thread; the logged counter is kept as ``conductor_round_index``.
-Two counted rows for the same ``latest_msg_id`` stop the export (:class:`ExportError`).
+``round_index`` is its per-run loop counter and restarts at 0 on every dispatch, so the exported
+``round_index`` is the ``latest_msg_id`` message's 0-based position in its thread, as in the
+replay fixture (adopted in msg-4639); the logged counter is kept as ``conductor_round_index``.
+Two candidate rows for the same ``latest_msg_id`` stop the export (:class:`ExportError`).
 
 **Reader of the output.** Files only; nothing is posted to any chatroom thread.
 """
@@ -57,25 +62,39 @@ import sys
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from build_tierc_eval_fixture import (  # the sibling script, as tierc_fulltext_run does
+    MATERIAL_BODY_MAX,
+    MATERIAL_FOLLOWING_N,
+    MATERIAL_HEAD_M,
+    MATERIAL_PRIOR_N,
+)
+
+from spirrow_mindwire.conductor.handoff import parse_next_token
+
 LOG_PREFIX = "decider_decision "
 ROUTED_STOP = "stop"
+QUESTIONS_V2 = "tierc-v2"
 EVAL_SET_SHADOW = "shadow"
 ROSTER_SOURCE_LOGGED = "logged"
+QUIET_AFTER = timedelta(hours=72)
+"""msg-4641 DECIDED 2d-7 condition 2: the thread's last message is at least this old at
+``--as-of`` (exactly 72 h counts)."""
+TERMINAL_NEXT = "none"
 
 COUNTED = "counted"
+HELD = "held_following"
 NO_POINT_IN_TIME = "no_point_in_time_columns"
+NOT_V2 = "questions_version_not_tierc_v2"
 RULES_SHA_MISMATCH = "rules_sha256_mismatch"
-REASONS: tuple[str, ...] = (COUNTED, NO_POINT_IN_TIME, RULES_SHA_MISMATCH)
-""":func:`classify` also returns ``routed:<value>`` for a row ``_route`` did not stop."""
-
-MATERIAL_BODY_MAX = 8000
-MATERIAL_PRIOR_N = 5
-MATERIAL_HEAD_M = 500
-"""Same material shape as the replay's ``build_tierc_eval_fixture.material_row`` (msg-4229 §2),
-except ``following``, which is always empty here (msg-4636 DECIDED 2d-3)."""
+CANDIDATE = "candidate"
+""":func:`classify` returns ``candidate`` / ``routed:<value>`` / one of the reasons above;
+``counted`` vs ``held`` is decided later, against the thread (:func:`following_ready`)."""
 
 JEV_COLUMNS: frozenset[str] = frozenset(
     {
@@ -102,7 +121,7 @@ state). None may appear in a labeller-facing file (msg-4634 DECIDED 2d-2)."""
 
 
 class ExportError(ValueError):
-    """The log cannot be exported as one evaluation set. Always fatal."""
+    """The input cannot be exported as one evaluation set. Always fatal."""
 
 
 @dataclass(frozen=True)
@@ -111,6 +130,47 @@ class Message:
     author: str
     content: str
     timestamp: str
+
+
+# ---------------------------------------------------------------------------
+# time (2d-8)
+# ---------------------------------------------------------------------------
+
+
+def parse_time(raw: str, what: str) -> datetime:
+    """Timezone-aware ISO 8601 → ``datetime``. A naive or unparseable value is an error."""
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ExportError(f"{what}: not ISO 8601: {raw!r}") from exc
+    if ts.tzinfo is None:
+        raise ExportError(f"{what}: no timezone: {raw!r}")
+    return ts
+
+
+def parse_as_of(raw: str, now: datetime) -> datetime:
+    """msg-4643 DECIDED 2d-8: timezone-aware, and not after ``now``."""
+    as_of = parse_time(raw, "--as-of")
+    if as_of > now:
+        raise ExportError(f"--as-of {raw} is in the future (now {now.isoformat()})")
+    return as_of
+
+
+def cut_rows(rows: Sequence[Mapping[str, Any]], as_of: datetime) -> list[Mapping[str, Any]]:
+    """Drop every row logged after ``as_of``. A row without ``logged_at`` is kept here and falls
+    into ``no_point_in_time_columns`` (it predates the column, and so this change)."""
+    out: list[Mapping[str, Any]] = []
+    for r in rows:
+        at = r.get("logged_at")
+        if at and parse_time(str(at), "logged_at") > as_of:
+            continue
+        out.append(r)
+    return out
+
+
+def cut_thread(thread: Sequence[Message], as_of: datetime) -> list[Message]:
+    """Drop every message posted after ``as_of`` (``== as_of`` stays)."""
+    return [m for m in thread if parse_time(m.timestamp, f"{m.msg_id} timestamp") <= as_of]
 
 
 # ---------------------------------------------------------------------------
@@ -138,55 +198,72 @@ def parse_log_lines(lines: Iterable[str]) -> list[dict[str, Any]]:
 
 
 def classify(row: Mapping[str, Any], rules_sha256: str) -> str:
-    """msg-4636 DECIDED 2d-3: ``counted``, or why not."""
-    if not row.get("state_wire") or not row.get("latest_msg_id"):
+    """The row-only buckets (2d-3 / 2d-4). ``candidate`` still needs the thread check."""
+    if not row.get("state_wire") or not row.get("latest_msg_id") or not row.get("logged_at"):
         return NO_POINT_IN_TIME
     if row.get("routed") != ROUTED_STOP:
         return f"routed:{row.get('routed')}"
+    if row.get("questions_version") != QUESTIONS_V2:
+        return NOT_V2
     if row.get("rules_sha256") != rules_sha256:
         return RULES_SHA_MISMATCH
-    return COUNTED
+    return CANDIDATE
 
 
-def select(
+def candidates(
     rows: Sequence[Mapping[str, Any]], rules_sha256: str
 ) -> tuple[list[Mapping[str, Any]], Counter[str]]:
-    """The counted rows (log order) and the count of every row by :func:`classify` reason."""
+    """The candidate rows (log order) and every other row counted by bucket."""
     counts: Counter[str] = Counter()
-    counted: list[Mapping[str, Any]] = []
+    out: list[Mapping[str, Any]] = []
     for r in rows:
-        reason = classify(r, rules_sha256)
-        counts[reason] += 1
-        if reason == COUNTED:
-            counted.append(r)
-    seen: Counter[str] = Counter(str(r["latest_msg_id"]) for r in counted)
+        bucket = classify(r, rules_sha256)
+        if bucket == CANDIDATE:
+            out.append(r)
+        else:
+            counts[bucket] += 1
+    seen: Counter[str] = Counter(str(r["latest_msg_id"]) for r in out)
     if dup := sorted(m for m, n in seen.items() if n > 1):
-        raise ExportError(f"more than one counted row for latest_msg_id {dup}")
-    return counted, counts
+        raise ExportError(f"more than one candidate row for latest_msg_id {dup}")
+    return out, counts
 
 
 # ---------------------------------------------------------------------------
-# outputs
+# thread side
 # ---------------------------------------------------------------------------
 
 
-def _cut(thread: Sequence[Message], latest_msg_id: str) -> tuple[list[Message], int]:
-    """``thread`` up to and including ``latest_msg_id`` (its index). Nothing after it."""
+def position(thread: Sequence[Message], latest_msg_id: str) -> int:
     for i, m in enumerate(thread):
         if m.msg_id == latest_msg_id:
-            return list(thread[: i + 1]), i
-    raise ExportError(f"{latest_msg_id} is not in the fetched thread")
+            return i
+    raise ExportError(f"{latest_msg_id} is not in the fetched thread up to --as-of")
+
+
+def following_ready(thread: Sequence[Message], i: int, as_of: datetime) -> bool:
+    """msg-4641 DECIDED 2d-7: 3 messages after ``i``, or the thread ended with ``NEXT: none``,
+    or its last message is at least 72 h before ``as_of``. ``thread`` is already cut at
+    ``as_of``."""
+    if len(thread) - (i + 1) >= MATERIAL_FOLLOWING_N:
+        return True
+    last = thread[-1]
+    token = parse_next_token(last.content)
+    if token is not None and token.casefold() == TERMINAL_NEXT:
+        return True
+    return as_of - parse_time(last.timestamp, f"{last.msg_id} timestamp") >= QUIET_AFTER
 
 
 def _head(m: Message) -> dict[str, str]:
     return {"msg_id": m.msg_id, "author": m.author, "head": m.content[:MATERIAL_HEAD_M]}
 
 
-def material_row(row: Mapping[str, Any], project: str, thread: Sequence[Message]) -> dict[str, Any]:
-    """What a labeller reads — the thread cut at ``latest_msg_id`` (msg-4636 DECIDED 2d-3)."""
-    upto, i = _cut(thread, str(row["latest_msg_id"]))
-    head = upto[i]
+def material_row(
+    row: Mapping[str, Any], project: str, thread: Sequence[Message], i: int
+) -> dict[str, Any]:
+    """What a labeller reads — the replay's ``material_row`` shape plus ``following_n``."""
+    head = thread[i]
     body = head.content
+    following = [_head(m) for m in thread[i + 1 : i + 1 + MATERIAL_FOLLOWING_N]]
     return {
         "thread_id": str(row["thread_id"]),
         "round_index": i,
@@ -198,8 +275,9 @@ def material_row(row: Mapping[str, Any], project: str, thread: Sequence[Message]
         "body": body[:MATERIAL_BODY_MAX],
         "body_truncated": len(body) > MATERIAL_BODY_MAX,
         "body_chars": len(body),
-        "prior": [_head(m) for m in upto[max(0, i - MATERIAL_PRIOR_N) : i]],
-        "following": [],
+        "prior": [_head(m) for m in thread[max(0, i - MATERIAL_PRIOR_N) : i]],
+        "following": following,
+        "following_n": len(following),
     }
 
 
@@ -217,6 +295,7 @@ def fixture_row(material: Mapping[str, Any], row: Mapping[str, Any]) -> dict[str
         "live_entry": True,
         "roster": dict(row.get("roster") or {}),
         "roster_source": ROSTER_SOURCE_LOGGED,
+        "following_n": material["following_n"],
     }
 
 
@@ -246,6 +325,7 @@ def replay_record(row: Mapping[str, Any], round_index: int) -> dict[str, Any]:
         "round_index": round_index,
         "conductor_round_index": row.get("round_index"),
         "msg_id": str(row["latest_msg_id"]),
+        "logged_at": row.get("logged_at"),
         "questions_version": row.get("questions_version"),
         "state": json.loads(str(row["state_wire"])),
         "decision": {k: row.get(k) for k in _DECISION_KEYS},
@@ -256,28 +336,44 @@ def build_outputs(
     rows: Sequence[Mapping[str, Any]],
     rules_sha256: str,
     threads: Mapping[str, tuple[str, Sequence[Message]]],
+    as_of: datetime,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """Pure: log rows + fetched threads → (materials, fixture, replay, export summary).
 
-    ``threads`` maps ``thread_id`` → ``(project, messages oldest → newest)``."""
-    counted, counts = select(rows, rules_sha256)
+    ``threads`` maps ``thread_id`` → ``(project, messages oldest → newest)``. The ``as_of`` cut
+    is the first thing done to both (2d-8)."""
+    kept = cut_rows(rows, as_of)
+    cands, counts = candidates(kept, rules_sha256)
+    cut: dict[str, tuple[str, list[Message]]] = {
+        tid: (project, cut_thread(msgs, as_of)) for tid, (project, msgs) in threads.items()
+    }
     materials: list[dict[str, Any]] = []
     fixture: list[dict[str, Any]] = []
     replay: list[dict[str, Any]] = []
-    for r in counted:
+    for r in cands:
         tid = str(r["thread_id"])
-        if tid not in threads:
+        if tid not in cut:
             raise ExportError(f"thread {tid} was not fetched")
-        project, msgs = threads[tid]
-        m = material_row(r, project, msgs)
+        project, msgs = cut[tid]
+        i = position(msgs, str(r["latest_msg_id"]))
+        if not following_ready(msgs, i, as_of):
+            counts[HELD] += 1
+            continue
+        counts[COUNTED] += 1
+        m = material_row(r, project, msgs, i)
         materials.append(m)
         fixture.append(fixture_row(m, r))
-        replay.append(replay_record(r, int(m["round_index"])))
+        replay.append(replay_record(r, i))
     summary = {
+        "as_of": as_of.isoformat(),
         "rules_sha256": rules_sha256,
-        "rows_read": len(rows),
-        "by_reason": dict(sorted(counts.items())),
-        "counted": len(counted),
+        # Only what survives the cut: a count of rows after ``as_of`` would change as the log
+        # grows, and 22d asks for the same bytes on the same ``as_of``.
+        "rows_up_to_as_of": len(kept),
+        "by_bucket": dict(sorted(counts.items())),
+        "counted": counts[COUNTED],
+        "held": counts[HELD],
+        "following_n_lt_3": sum(1 for m in materials if m["following_n"] < MATERIAL_FOLLOWING_N),
     }
     return materials, fixture, replay, summary
 
@@ -318,7 +414,7 @@ async def fetch_threads(
                     timestamp=str(m.get("timestamp", "")),
                 )
                 for m in (body.get("messages") or [])
-                if isinstance(m, dict)
+                if isinstance(m, dict) and m.get("timestamp")
             ]
             if msgs:
                 out[tid] = (project, msgs)
@@ -328,11 +424,12 @@ async def fetch_threads(
     return out, errors
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, now: datetime | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--log", type=Path, action="append", required=True)
     parser.add_argument("--rules-sha256", required=True)
     parser.add_argument("--project", action="append", required=True)
+    parser.add_argument("--as-of", required=True, help="timezone-aware ISO 8601 (msg-4643)")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--replay-out", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -346,18 +443,23 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        as_of = parse_as_of(args.as_of, now if now is not None else datetime.now(UTC))
+    except ExportError as exc:
+        print(f"export_shadow_eval_set: {exc}", file=sys.stderr)
+        return 2
     rows: list[dict[str, Any]] = []
     for path in args.log:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
             rows.extend(parse_log_lines(fh))
     try:
-        counted, _ = select(rows, args.rules_sha256)
+        cands, _ = candidates(cut_rows(rows, as_of), args.rules_sha256)
         threads, errors = asyncio.run(
-            fetch_threads((str(r["thread_id"]) for r in counted), args.project)
+            fetch_threads((str(r["thread_id"]) for r in cands), args.project)
         )
         for tid, errs in sorted(errors.items()):
             print(f"export_shadow_eval_set: {tid} not fetched: {errs}", file=sys.stderr)
-        materials, fixture, replay, summary = build_outputs(rows, args.rules_sha256, threads)
+        materials, fixture, replay, summary = build_outputs(rows, args.rules_sha256, threads, as_of)
     except ExportError as exc:
         print(f"export_shadow_eval_set: {exc}", file=sys.stderr)
         return 1

@@ -30,6 +30,14 @@ asks what Jev *would* say. The server's own ``decision.verdict.kind`` is shown b
 
 "Human reached" = CONFIRMED or UNSURE (D2 monotonicity: UNSURE goes to the human).
 
+**Two question versions (T-decider-conductor-hook msg-4639 DECIDED 2d-5).** A record whose
+``questions_version`` is ``tierc-v2`` is recomputed from ``raw_answers["should_ask_human"]`` with
+``evaluate_tierc_v2`` (``TierCV2Thresholds``); every other record takes the v1 path above,
+unchanged. v1 and v2 rows get separate sections — headline, sweep and AUC per version. An
+input with no v2 row renders exactly as before (the committed ``eval/tierc/report.md`` is
+pinned byte for byte). The v2 section applies msg-4639 DECIDED 2d-4: a single ``NO_VERDICT``
+among its rows makes the set **INVALID** and no headline is computed; ``MALFORMED`` is counted.
+
 **Reader of the output.** Markdown on stdout / ``--out``. Nothing is posted anywhere.
 """
 
@@ -46,12 +54,15 @@ from pathlib import Path
 from typing import Any
 
 from spirrow_mindwire.adapters.decider_lexora import _extract_noul
+from spirrow_mindwire.decider.questions import SHOULD_ASK_HUMAN_KEY
 from spirrow_mindwire.decider.verdict import (
     TIER_C_GENUINE_KEYS,
     TIER_C_SPURIOUS_KEYS,
     TierCThresholds,
+    TierCV2Thresholds,
     TierCVerdictKind,
     evaluate_tierc,
+    evaluate_tierc_v2,
 )
 
 _reconfigure_out = getattr(sys.stdout, "reconfigure", None)
@@ -238,6 +249,15 @@ def scores_of(record: Mapping[str, Any]) -> dict[str, float] | None:
     return scores
 
 
+def ask_score_of(record: Mapping[str, Any]) -> float | None:
+    """v2: ``raw_answers["should_ask_human"]["noul"]``, or ``None`` when absent / malformed."""
+    decision = record.get("decision")
+    if not isinstance(decision, Mapping):
+        return None
+    scores, _ = _extract_noul(decision.get("raw_answers"), (SHOULD_ASK_HUMAN_KEY,))
+    return None if scores is None else scores[SHOULD_ASK_HUMAN_KEY]
+
+
 def recompute(scores: Mapping[str, float] | None, th: TierCThresholds) -> tuple[str, str | None]:
     if scores is None:
         return "NO_VERDICT", None
@@ -266,6 +286,9 @@ class Row:
     server_verdict: str | None
     outcome: str | None
     latency_ms: int | None
+    questions_version: str = ""
+    ask_score: float | None = None
+    following_n: int | None = None
 
 
 def gate_bucket(g: Mapping[str, Any] | None) -> str:
@@ -305,6 +328,11 @@ def join(replay: Sequence[Mapping[str, Any]], fixture: Sequence[Mapping[str, Any
                 server_verdict=str(sv["kind"]) if isinstance(sv, Mapping) else None,
                 outcome=str(d["outcome"]) if d.get("outcome") else None,
                 latency_ms=int(d["latency_ms"]) if d.get("latency_ms") is not None else None,
+                questions_version=str(
+                    rec.get("questions_version") or d.get("questions_version") or ""
+                ),
+                ask_score=ask_score_of(rec),
+                following_n=int(f["following_n"]) if f.get("following_n") is not None else None,
             )
         )
     return rows
@@ -461,8 +489,49 @@ def render(
     population: Sequence[Mapping[str, Any]] = (),
     corrections: Corrections | None = None,
     replayed_before_corrections: int | None = None,
+    th_v2: TierCV2Thresholds | None = None,
 ) -> str:
-    """With ``corrections``, ``all_rows`` / ``labellers`` must already be filtered
+    """Split by questions version (msg-4639 DECIDED 2d-5). No v2 row → the v1 report, unchanged.
+
+    Labels are narrowed to each section's keys only when both versions are present, so a pure
+    v1 input sees exactly the labellers it was given."""
+    v2 = [r for r in all_rows if r.questions_version == V2]
+    v1 = [r for r in all_rows if r.questions_version != V2]
+    if not v2:
+        return _render_v1(
+            all_rows, labellers, th, population, corrections, replayed_before_corrections
+        )
+    parts: list[str] = []
+    if v1:
+        keys1 = {r.key for r in v1}
+        labs1 = {n: {k: v for k, v in m.items() if k in keys1} for n, m in labellers.items()}
+        parts.append(
+            _render_v1(v1, labs1, th, population, corrections, replayed_before_corrections)
+        )
+        keys2 = {r.key for r in v2}
+        labellers = {n: {k: v for k, v in m.items() if k in keys2} for n, m in labellers.items()}
+    parts.append(
+        render_v2(
+            v2,
+            labellers,
+            th_v2 if th_v2 is not None else TierCV2Thresholds(),
+            corrections,
+            replayed_before_corrections,
+        )
+    )
+    return "\n\n".join(parts)
+
+
+def _render_v1(
+    all_rows: Sequence[Row],
+    labellers: Mapping[str, Mapping[Key, Label]],
+    th: TierCThresholds,
+    population: Sequence[Mapping[str, Any]] = (),
+    corrections: Corrections | None = None,
+    replayed_before_corrections: int | None = None,
+) -> str:
+    """The v1 report (unchanged by 2d-5). With ``corrections``, ``all_rows`` / ``labellers``
+    must already be filtered
     (:func:`apply_corrections`); this function only states that it happened (msg-4302 §4)."""
     truth = consensus(labellers)
     lines: list[str] = ["# Tier-C replay evaluation — Jev", ""]
@@ -623,6 +692,181 @@ def render(
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# tierc-v2 (msg-4639 DECIDED 2d-4 / 2d-5, msg-4641 DECIDED 2d-7 / advisory)
+# ---------------------------------------------------------------------------
+
+V2 = "tierc-v2"
+
+SWEEP_V2: tuple[tuple[float, float], ...] = ((0.50, 0.33), (0.60, 0.40), (0.70, 0.47), (0.80, 0.53))
+"""msg-4641: the v2 sweep as a constant table of ``(ask_min, not_ask_max)`` — no arithmetic, so
+no float noise. Exploratory only: a pick from it is the next shadow period's hypothesis, never
+a result on the same data (msg-4634 2d-1)."""
+
+MALFORMED_OUTCOME = "no_verdict_malformed"
+
+
+def recompute_v2(ask: float | None, th: TierCV2Thresholds) -> str:
+    return "NO_VERDICT" if ask is None else evaluate_tierc_v2(ask, th).kind.value
+
+
+def validity_v2(rows: Sequence[Row], th: TierCV2Thresholds) -> tuple[list[Row], int]:
+    """(rows recomputed to ``NO_VERDICT``, ``MALFORMED`` count). Any of the former → INVALID."""
+    nv = [r for r in rows if recompute_v2(r.ask_score, th) == "NO_VERDICT"]
+    return nv, sum(1 for r in rows if r.outcome == MALFORMED_OUTCOME)
+
+
+def headline_v2(
+    rows: Sequence[Row], truth: Mapping[Key, str], th: TierCV2Thresholds
+) -> dict[str, str]:
+    """Reduction (spurious → LIKELY_NOT) and recall per genuine class, on the v2 verdict."""
+    out: dict[str, str] = {}
+    spur = [r for r in rows if truth.get(r.key) == "spurious"]
+    ln = [r for r in spur if recompute_v2(r.ask_score, th) == "LIKELY_NOT"]
+    out["spurious labelled (criterion: >= 12 to decide)"] = str(len(spur))
+    out["reduction (spurious → LIKELY_NOT)"] = _pct(len(ln), len(spur))
+    for cls in GENUINE_CLASSES:
+        g = [r for r in rows if truth.get(r.key) == cls]
+        hit = [r for r in g if reaches_human(recompute_v2(r.ask_score, th))]
+        out[f"recall {cls} (reaches human)"] = _pct(len(hit), len(g))
+    out["ambiguous (excluded)"] = str(sum(1 for r in rows if truth.get(r.key) == "ambiguous"))
+    out["unlabelled (excluded)"] = str(sum(1 for r in rows if r.key not in truth))
+    return out
+
+
+def auc_v2(rows: Sequence[Row], truth: Mapping[Key, str]) -> tuple[float | None, int, int]:
+    """AUC of ``should_ask_human`` (genuine* vs spurious), with the two counts."""
+    pos = [
+        r.ask_score for r in rows if r.ask_score is not None and truth.get(r.key) in GENUINE_CLASSES
+    ]
+    neg = [r.ask_score for r in rows if r.ask_score is not None and truth.get(r.key) == "spurious"]
+    return auc(pos, neg), len(pos), len(neg)
+
+
+def sweep_v2(rows: Sequence[Row], truth: Mapping[Key, str]) -> list[tuple[float, float, str, str]]:
+    out: list[tuple[float, float, str, str]] = []
+    for ask_min, not_ask_max in SWEEP_V2:
+        h = headline_v2(rows, truth, TierCV2Thresholds(ask_min=ask_min, not_ask_max=not_ask_max))
+        out.append(
+            (
+                ask_min,
+                not_ask_max,
+                h["reduction (spurious → LIKELY_NOT)"],
+                h["recall genuine (reaches human)"],
+            )
+        )
+    return out
+
+
+def _verdict_table(counter: Counter[tuple[str, str]]) -> list[str]:
+    out = [
+        "| truth \\ Jev | " + " | ".join(VERDICTS) + " |",
+        "|---" * (len(VERDICTS) + 1) + "|",
+    ]
+    for t in [*LABELS, "unlabelled"]:
+        if any(counter[(t, v)] for v in VERDICTS):
+            out.append(f"| {t} | " + " | ".join(str(counter[(t, v)]) for v in VERDICTS) + " |")
+    return out
+
+
+def render_v2(
+    rows: Sequence[Row],
+    labellers: Mapping[str, Mapping[Key, Label]],
+    th: TierCV2Thresholds,
+    corrections: Corrections | None = None,
+    replayed_before_corrections: int | None = None,
+) -> str:
+    """The tierc-v2 section (msg-4639 DECIDED 2d-4 / 2d-5, msg-4641 DECIDED 2d-7)."""
+    truth = consensus(labellers)
+    n = len(rows)
+    lines: list[str] = ["# Tier-C evaluation — Jev, tierc-v2", ""]
+    if corrections is None:
+        lines += ["- corrections: **none applied** — every fixture row is counted.", ""]
+    else:
+        lines += [
+            f"- corrections: **applied** — `{corrections.path}` (sha256 `{corrections.sha256}`); "
+            f"rows counted: **{n} / {replayed_before_corrections}** replayed.",
+            "",
+        ]
+    no_verdict, malformed = validity_v2(rows, th)
+    lines += ["## Validity — read this first (msg-4639 DECIDED 2d-4)", ""]
+    lines += [
+        f"- rows: {n}",
+        f"- thresholds (pre-registered, `verdict.py` DEFAULT_V2_*): ask_min={th.ask_min} "
+        f"not_ask_max={th.not_ask_max}",
+        f"- NO_VERDICT rows: {len(no_verdict)}",
+        f"- MALFORMED (outcome `{MALFORMED_OUTCOME}`): {_pct(malformed, n)}",
+        f"- outcome: {dict(Counter(r.outcome or 'not_called' for r in rows))}",
+    ]
+    if no_verdict:
+        lines += [
+            "",
+            f"**INVALID** — {len(no_verdict)} row(s) have no v2 verdict. A missing verdict "
+            "reaches the human, so recall would pass without Jev having answered. No headline, "
+            "sweep or AUC is computed.",
+            "",
+        ]
+        lines += [
+            f"- {r.msg_id} `{r.key[0]}` r{r.key[1]} — outcome={r.outcome}" for r in no_verdict
+        ]
+        return "\n".join(lines)
+    lines += ["- **valid**: every row has a v2 verdict.", ""]
+
+    lines += ["## Headline", ""]
+    views: dict[str, Mapping[Key, str]] = {"consensus": truth}
+    for who, m in labellers.items():
+        views[who] = {k: v.label for k, v in m.items()}
+    for name, view in views.items():
+        lines.append(f"### truth = {name}")
+        lines += [f"- {k}: {v}" for k, v in headline_v2(rows, view, th).items()]
+        lines.append("")
+    if len(labellers) == 2:
+        (a, am), (b, bm) = labellers.items()
+        k, kn = cohen_kappa(
+            {x: y.label for x, y in am.items()}, {x: y.label for x, y in bm.items()}
+        )
+        lines += [f"- Cohen's κ ({a} vs {b}): {'n/a' if k is None else f'{k:.3f}'} over {kn}", ""]
+
+    conf: Counter[tuple[str, str]] = Counter(
+        (truth.get(r.key, "unlabelled"), recompute_v2(r.ask_score, th)) for r in rows
+    )
+    lines += ["### Confusion (consensus truth)", "", *_verdict_table(conf), ""]
+
+    lines += ["## Misses — genuine judged LIKELY_NOT", ""]
+    miss = [
+        f"- **{r.msg_id}** `{r.key[0]}` r{r.key[1]} ({truth[r.key]}) — "
+        f"should_ask_human={r.ask_score:.2f}\n  - body head: {r.body_head}"
+        for r in rows
+        if r.ask_score is not None
+        and truth.get(r.key) in GENUINE_CLASSES
+        and recompute_v2(r.ask_score, th) == "LIKELY_NOT"
+    ]
+    lines += miss or ["- none"]
+    lines.append("")
+
+    short = [r for r in rows if r.following_n is not None and r.following_n < 3]
+    by_truth = dict(sorted(Counter(truth.get(r.key, "unlabelled") for r in short).items()))
+    lines += ["## Rows with following_n < 3 (msg-4641 DECIDED 2d-7)", ""]
+    lines += [f"- rows: {_pct(len(short), n)}", f"- consensus truth: {by_truth}", ""]
+
+    a, npos, nneg = auc_v2(rows, truth)
+    lines += ["## Separation", ""]
+    lines += [
+        f"- AUC of should_ask_human (genuine* vs spurious): "
+        f"{'n/a' if a is None else f'{a:.3f}'} ({npos} vs {nneg})",
+        "",
+    ]
+    lines += ["### Threshold sweep v2 — exploratory only, never a headline (msg-4634 2d-1)", ""]
+    lines += ["| ask_min | not_ask_max | reduction | recall genuine |", "|---|---|---|---|"]
+    lines += [f"| {x:.2f} | {y:.2f} | {red} | {rec} |" for x, y, red, rec in sweep_v2(rows, truth)]
+    lines.append("")
+
+    lines += ["## Operations", ""]
+    lat = [r.latency_ms for r in rows if r.latency_ms is not None]
+    lines += [f"- latency ms p50={_pctl(lat, 0.5)} p95={_pctl(lat, 0.95)}"]
+    return "\n".join(lines)
+
+
 def apply_corrections(
     rows: Sequence[Row], labellers: Mapping[str, Mapping[Key, Label]], corr: Corrections
 ) -> tuple[list[Row], dict[str, dict[Key, Label]]]:
@@ -675,7 +919,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    text = render(rows, labellers, th, population, corr, replayed)
+    text = render(rows, labellers, th, population, corr, replayed, th_v2=TierCV2Thresholds())
     if args.out is not None:
         args.out.write_text(text + "\n", encoding="utf-8", newline="\n")
     else:

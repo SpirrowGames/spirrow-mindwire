@@ -491,6 +491,7 @@ def test_log_decision_always_writes_id_and_outcome(
             latest_msg_id="m9",
             roster={"Bohr": Role.PROPOSER},
             state_wire="{}",
+            logged_at=NOW,
         )
     assert rec["outcome"] == dr.outcome.value
     assert rec["gate_kind"] == "ADMIT_UNSURE" and rec["gate_is_grey_zone"] is True
@@ -514,6 +515,7 @@ def test_log_decision_gate_columns_for_labelled_admit() -> None:
         latest_msg_id="m9",
         roster={"Bohr": Role.PROPOSER},
         state_wire="{}",
+        logged_at=NOW,
     )
     assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is False
 
@@ -531,6 +533,7 @@ def test_log_decision_gate_columns_none_when_gate_did_not_run() -> None:
         latest_msg_id="m9",
         roster={"Bohr": Role.PROPOSER},
         state_wire="{}",
+        logged_at=NOW,
     )
     assert rec["outcome"] == "no_verdict_null"
     assert rec["gate_kind"] is None and rec["gate_is_grey_zone"] is None
@@ -817,6 +820,8 @@ async def test_hook_row_carries_point_in_time_input_byte_identical_to_the_reques
     assert line["latest_msg_id"] == "m2" == _msgs()[-1].msg_id
     assert line["roster"] == {k: v.value for k, v in ROSTER.items()}
     assert json.loads(line["state_wire"])["roster"] == line["roster"]
+    # msg-4643 DECIDED 2d-8: the row carries its own time (the hook's ``now``).
+    assert line["logged_at"] == NOW.isoformat()
 
 
 @pytest.mark.anyio

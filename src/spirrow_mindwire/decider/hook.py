@@ -30,7 +30,8 @@ Called by :class:`~spirrow_mindwire.conductor.core.Conductor` right after its ru
 4. ``log_decision(...)`` — every outcome, with ``decision_id`` / ``outcome``, the gate columns
    ``gate_kind`` / ``gate_is_grey_zone``, the rule ``stop``, ``routed`` and (v2)
    ``matched_rule`` / ``matched_rule_source`` / ``rules_sha256`` on the same line, plus the
-   point-in-time input (msg-4636 DECIDED 2d-3): ``latest_msg_id``, the ``roster`` used and
+   point-in-time input (msg-4636 DECIDED 2d-3): ``latest_msg_id``, the ``roster`` used,
+   ``logged_at`` (msg-4643 DECIDED 2d-8: the ``--as-of`` cut needs the row's own time) and
    ``state_wire`` — the exact ``state`` string sent to Lexora — so an evaluation weeks later reads
    what Jev saw instead of rebuilding it from a thread that has since grown;
 5. the acting branch is gated on ``routed == "stop"`` (msg-4237 DECIDED 2c-2), on
@@ -203,6 +204,7 @@ def log_decision(
     latest_msg_id: str,
     roster: Mapping[str, Role],
     state_wire: str,
+    logged_at: datetime,
 ) -> dict[str, Any]:
     """Write one decision record to the conductor log and return it (msg-4182).
 
@@ -222,7 +224,13 @@ def log_decision(
     (:func:`~spirrow_mindwire.decider.wire.state_to_wire`). Record-only — no routing reads them
     (D20). ``export_shadow_eval_set.py`` reads them instead of rebuilding the state, and a row
     without them is outside the pre-registered evaluation (2d-3).
+
+    ``logged_at`` (msg-4643 DECIDED 2d-8) is the time of the decision, timezone-aware ISO 8601.
+    The exporter drops every row with ``logged_at > --as-of`` before anything else; the conductor
+    log itself carries no timestamp (``basicConfig`` default format), so the row has to.
     """
+    if logged_at.tzinfo is None:
+        raise ValueError("logged_at must be timezone-aware")
     record: dict[str, Any] = {
         "thread_id": thread_id,
         "round_index": round_index,
@@ -235,6 +243,7 @@ def log_decision(
         ),
         "gate_is_grey_zone": gate_result.is_grey_zone if gate_result is not None else None,
         "latest_msg_id": latest_msg_id,
+        "logged_at": logged_at.isoformat(),
         "roster": {identity: role.value for identity, role in roster.items()},
         "state_wire": state_wire,
         **decision_result_to_dict(dr),
@@ -472,11 +481,12 @@ async def run_tierc_hook(
         # never affect the routing (D20), and an escaping exception would stop the Conductor loop.
         logger.error("decider routing invariant broken; no decider_decision row", exc_info=True)
         return None
+    at = now if now is not None else datetime.now(UTC)
     try:
         gate_result = compute_gate_result(
             body=head.content,
             author=head.author,
-            now=now if now is not None else datetime.now(UTC),
+            now=at,
         )
         state = state_builder(
             turn_from_messages(
@@ -510,6 +520,7 @@ async def run_tierc_hook(
         latest_msg_id=head.msg_id,
         roster=roster,
         state_wire=state_to_wire(state),
+        logged_at=at,
     )
 
     # msg-4184 §2: acting code reads ``actionable_verdict`` only. msg-4237 DECIDED 2c-2: only a
