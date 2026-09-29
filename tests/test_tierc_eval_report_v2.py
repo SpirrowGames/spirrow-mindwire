@@ -189,33 +189,142 @@ def test_malformed_is_counted_and_invalidates() -> None:
     assert "**INVALID**" in text
 
 
-def test_mixed_input_renders_both_versions() -> None:
-    v1 = {
-        "thread_id": "V1",
-        "round_index": 1,
+# ------------------------------------------------------------------ 2d-11 (msg-4648 / 4650)
+
+exporter = _load("export_shadow_eval_set")
+
+
+def _v1_rec(key: tuple[str, int]) -> dict[str, Any]:
+    return {
+        "thread_id": key[0],
+        "round_index": key[1],
         "questions_version": "tierc-v1",
         "state": {"head_summary": "h", "gate_result": None},
         "decision": {"outcome": "evaluated", "raw_answers": None},
     }
-    recs = [v1, _rec(("V2", 1), 0.9)]
-    text = _render(recs, [{**_fx(("V1", 1)), "eval_set": "body"}, _fx(("V2", 1))], {})
-    assert text.index("# Tier-C replay evaluation — Jev") < text.index(
-        "# Tier-C evaluation — Jev, tierc-v2"
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def _v2_export(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
+    """A v2 export written by the exporter's own ``write_outputs``: (out_dir, replay, fixture,
+    export.json, labels)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "RUBRIC-v2.md").write_text("rubric v2\n", encoding="utf-8")
+    (src / "label_prompt-v2.md").write_text("prompt v2\n", encoding="utf-8")
+    out = tmp_path / "lab"
+    replay = tmp_path / "jev" / "replay.jsonl"
+    keys = [("G", 1), ("S", 1)]
+    exporter.write_outputs(
+        out,
+        replay,
+        [{"thread_id": t, "round_index": r, "body": "b"} for t, r in keys],
+        [_fx(k) for k in keys],
+        [_rec(("G", 1), 0.9), _rec(("S", 1), 0.1)],
+        {"as_of": "2026-10-15T00:00:00+00:00", "counted": 2},
+        sources={"rubric": src / "RUBRIC-v2.md", "label_prompt": src / "label_prompt-v2.md"},
+    )
+    labels = tmp_path / "labels.jsonl"
+    _write_jsonl(
+        labels,
+        [
+            {"thread_id": "G", "round_index": 1, "label": "genuine"},
+            {"thread_id": "S", "round_index": 1, "label": "spurious"},
+        ],
+    )
+    return out, replay, out / "fixture.jsonl", out / "export.json", labels
+
+
+def _cli(replay: Path, fixture: Path, labels: Path, *extra: str) -> int:
+    return int(
+        report.main(
+            ["--replay", str(replay), "--fixture", str(fixture), "--labels", f"a={labels}", *extra]
+        )
     )
 
 
-def test_cli_runs_on_exporter_shaped_files_without_corrections(tmp_path: Path) -> None:
-    """2d-2 (d): ``--replay`` / ``--fixture`` from the exporter, no ``--corrections``."""
-    rp, fp, lp, out = (tmp_path / n for n in ("r.jsonl", "f.jsonl", "l.jsonl", "o.md"))
-    rp.write_text(json.dumps(_rec(("G", 1), 0.8)) + "\n", encoding="utf-8")
-    fp.write_text(json.dumps(_fx(("G", 1))) + "\n", encoding="utf-8")
-    lp.write_text(
-        json.dumps({"thread_id": "G", "round_index": 1, "label": "genuine"}) + "\n",
-        encoding="utf-8",
+def test_v1_run_without_manifest_still_runs(tmp_path: Path) -> None:
+    """23a, CLI half (bytes: ``test_v1_report_md_is_unchanged_byte_for_byte``)."""
+    rp, fp, lp = tmp_path / "r.jsonl", tmp_path / "f.jsonl", tmp_path / "l.jsonl"
+    _write_jsonl(rp, [_v1_rec(("V", 1))])
+    _write_jsonl(fp, [{**_fx(("V", 1)), "eval_set": "body"}])
+    _write_jsonl(lp, [])
+    assert _cli(rp, fp, lp, "--out", str(tmp_path / "o.md")) == 0
+    assert (
+        (tmp_path / "o.md")
+        .read_text(encoding="utf-8")
+        .startswith("# Tier-C replay evaluation — Jev")
     )
-    rc = report.main(
-        ["--replay", str(rp), "--fixture", str(fp), "--labels", f"a={lp}", "--out", str(out)]
-    )
-    assert rc == 0
+
+
+def test_v2_run_without_manifest_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """23b: no ``--export-manifest`` → refused; deleting ``export.json`` opens nothing."""
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path)
+    manifest.unlink()
+    assert _cli(replay, fixture, labels) == 2
+    assert "requires --export-manifest" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("which", ["replay", "fixture", "materials"])
+def test_one_changed_byte_is_refused(
+    tmp_path: Path, which: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """23c: a byte changed in any of the three locked files → refused, naming the file."""
+    out, replay, fixture, manifest, labels = _v2_export(tmp_path)
+    target = {"replay": replay, "fixture": fixture, "materials": out / "materials.jsonl"}[which]
+    target.write_bytes(target.read_bytes() + b" ")
+    assert _cli(replay, fixture, labels, "--export-manifest", str(manifest)) == 2
+    err = capsys.readouterr().err
+    assert which in err and "changed after it was written" in err
+
+
+def test_v1_run_with_manifest_is_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """23d: nothing would be checked, so the argument is refused."""
+    _, _, _, manifest, labels = _v2_export(tmp_path)
+    rp, fp = tmp_path / "r1.jsonl", tmp_path / "f1.jsonl"
+    _write_jsonl(rp, [_v1_rec(("V", 1))])
+    _write_jsonl(fp, [{**_fx(("V", 1)), "eval_set": "body"}])
+    assert _cli(rp, fp, labels, "--export-manifest", str(manifest)) == 2
+    assert "v1 run" in capsys.readouterr().err
+
+
+def test_valid_v2_run_prints_the_export_lock(tmp_path: Path) -> None:
+    """23e: accepted; ``as_of`` and the four sha256 open the v2 section."""
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path)
+    out = tmp_path / "o.md"
+    assert _cli(replay, fixture, labels, "--export-manifest", str(manifest), "--out", str(out)) == 0
     text = out.read_text(encoding="utf-8")
+    lock = json.loads(manifest.read_text(encoding="utf-8"))
+    head = text.split("## Validity", 1)[0]
+    assert "- as_of: 2026-10-15T00:00:00+00:00" in head
+    assert report.file_sha256(manifest) in head
+    for k in ("materials", "fixture", "replay"):
+        assert lock["files"][k]["sha256"] in head
     assert "**valid**" in text and "recall genuine (reaches human): 1/1 = 100.0%" in text
+
+
+@pytest.mark.parametrize("with_manifest", [False, True])
+def test_mixed_versions_are_refused_as_mixed(
+    tmp_path: Path, with_manifest: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """23f: refused for the version mix, with or without a manifest — not as a hash mismatch."""
+    _, replay, fixture, manifest, labels = _v2_export(tmp_path)
+    mixed = tmp_path / "mixed.jsonl"
+    _write_jsonl(mixed, [*report.read_jsonl(replay), _v1_rec(("V", 1))])
+    extra = ["--export-manifest", str(manifest)] if with_manifest else []
+    assert _cli(mixed, fixture, labels, *extra) == 2
+    err = capsys.readouterr().err
+    assert "v1 only or v2 only" in err and "changed after" not in err
+
+
+def test_render_refuses_mixed_rows() -> None:
+    rows = report.join([_v1_rec(("V", 1)), _rec(("W", 1), 0.9)], [_fx(("V", 1)), _fx(("W", 1))])
+    with pytest.raises(report.InputError, match="v1 only or v2 only"):
+        report.render(rows, {}, report.TierCThresholds())

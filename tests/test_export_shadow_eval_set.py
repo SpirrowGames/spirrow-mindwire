@@ -503,3 +503,220 @@ async def test_hook_log_line_exports_the_state_jev_was_sent(
     assert materials[0]["msg_id"] == "msg-2" and materials[0]["round_index"] == 2
     assert materials[0]["following_n"] == 1
     assert fixture[0]["roster"] == {"Bohr": "proposer", "Einstein": "naysayer"}
+
+
+# --------------------------------------------------------------------------- 2d-10 / 2d-12
+
+
+labeller = _load("label_eval_set")
+EVAL = ROOT / "eval" / "tierc"
+
+
+def _labelled_dir(tmp_path: Path, prompt: str, rubric: str) -> Path:
+    """A lockable directory labelled under ``prompt`` + ``rubric`` (names inside it)."""
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / prompt).write_text("prompt text\n", encoding="utf-8")
+    (d / rubric).write_text("rubric text\n", encoding="utf-8")
+    (d / "fixture.jsonl").write_text("", encoding="utf-8")
+    mats = [{"thread_id": "T", "round_index": i} for i in range(2)]
+    (d / "materials.jsonl").write_text("".join(json.dumps(m) + "\n" for m in mats), "utf-8")
+    sha = labeller.sha256_text(labeller.system_prompt("prompt text\n", "rubric text\n"))
+    for who in labeller.LABELLERS:
+        rows = [{**m, "backend": "b", "model": "m", "prompt_sha256": sha} for m in mats]
+        (d / f"labels.{who}.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+        )
+    return d
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "./RUBRIC-v2.md",
+        "sub/RUBRIC-v2.md",
+        "../RUBRIC-v2.md",
+        "ABSOLUTE",
+        "sub\\RUBRIC-v2.md",
+        "C:RUBRIC-v2.md",
+        "",
+        "..",
+    ],
+)
+def test_rubric_file_must_be_a_bare_name(tmp_path: Path, name: str) -> None:
+    """24a (msg-4654 DECIDED 2d-12): any path spelling is refused — labelling and lock alike."""
+    d = _labelled_dir(tmp_path, "label_prompt-v2.md", "RUBRIC-v2.md")
+    if name == "ABSOLUTE":
+        name = str((d / "RUBRIC-v2.md").resolve())
+    with pytest.raises(labeller.LabelStopError, match="not a path"):
+        labeller.write_lock(d, "label_prompt-v2.md", name)
+    args = ["--dir", str(d), "--prompt-file", "label_prompt-v2.md", "--rubric-file", name]
+    assert labeller.main([*args, "--labeller", "naysayer-tier", "--resume"]) == 1
+    assert labeller.main([*args, "--lock"]) == 1
+    assert not (d / "manifest.json").exists()
+
+
+def test_rubric_file_must_exist_in_dir(tmp_path: Path) -> None:
+    """24b: a name not present directly in ``--dir`` is refused."""
+    d = _labelled_dir(tmp_path, "label_prompt-v2.md", "RUBRIC-v2.md")
+    with pytest.raises(labeller.LabelStopError, match="is not a file"):
+        labeller.write_lock(d, "label_prompt-v2.md", "RUBRIC-v9.md")
+
+
+def test_manifest_keys_are_the_names_used(tmp_path: Path) -> None:
+    """24c + msg-4652: the ``sha256`` keys are the given names, the values the files that built
+    the system prompt; no v1 rubric / prompt key remains."""
+    d = _labelled_dir(tmp_path, "label_prompt-v2.md", "RUBRIC-v2.md")
+    m = labeller.write_lock(d, "label_prompt-v2.md", "RUBRIC-v2.md")
+    assert "RUBRIC.md" not in m["sha256"] and "label_prompt.md" not in m["sha256"]
+    assert set(m["sha256"]) == set(labeller.locked_files("label_prompt-v2.md", "RUBRIC-v2.md"))
+    assert m["sha256"]["RUBRIC-v2.md"] == labeller.file_sha256(d / "RUBRIC-v2.md")
+    assert m["sha256"]["label_prompt-v2.md"] == labeller.file_sha256(d / "label_prompt-v2.md")
+    assert m["system_prompt_sha256"] == labeller.sha256_text(
+        labeller.read_system_prompt(d, "label_prompt-v2.md", "RUBRIC-v2.md")
+    )
+
+
+def test_manifest_reproduces_when_the_dir_is_copied(tmp_path: Path) -> None:
+    """24d: copy ``--dir`` elsewhere; every sha256 is the same."""
+    import shutil
+
+    d = _labelled_dir(tmp_path, "label_prompt-v2.md", "RUBRIC-v2.md")
+    first = labeller.write_lock(d, "label_prompt-v2.md", "RUBRIC-v2.md")
+    moved = shutil.copytree(d, tmp_path / "elsewhere" / "d")
+    second = labeller.write_lock(moved, "label_prompt-v2.md", "RUBRIC-v2.md")
+    for k in ("sha256", "system_prompt_sha256"):
+        assert first[k] == second[k]
+
+
+def test_defaults_keep_the_v1_lock() -> None:
+    """msg-4646 / msg-4652: with the defaults, the committed v1 manifest's system-prompt and file
+    hashes are what the code computes today."""
+    assert labeller.locked_files("label_prompt.md", "RUBRIC.md") == labeller.LOCKED_FILES
+    committed = json.loads((EVAL / "manifest.json").read_text(encoding="utf-8"))
+    system = labeller.read_system_prompt(EVAL, "label_prompt.md", "RUBRIC.md")
+    assert labeller.sha256_text(system) == committed["system_prompt_sha256"]
+    for name in ("RUBRIC.md", "label_prompt.md"):
+        assert labeller.file_sha256(EVAL / name) == committed["sha256"][name]
+
+
+# --------------------------------------------------------------------------- 2d-9 / 2d-13 / 23g
+
+
+def test_export_places_the_v2_rubric_and_prompt(tmp_path: Path) -> None:
+    """25a: both files beside the export, byte-equal to ``eval/tierc``, sha256 in export.json."""
+    materials, fixture, replay, summary = _build([_row()], {"T-a": ("p", _thread(10))})
+    export = ex.write_outputs(
+        tmp_path / "lab", tmp_path / "r.jsonl", materials, fixture, replay, summary
+    )
+    for key, name in (("rubric", "RUBRIC-v2.md"), ("label_prompt", "label_prompt-v2.md")):
+        placed = tmp_path / "lab" / name
+        assert placed.read_bytes() == (EVAL / name).read_bytes()
+        assert export[key] == {"name": name, "sha256": labeller.file_sha256(EVAL / name)}
+    on_disk = json.loads((tmp_path / "lab" / "export.json").read_text(encoding="utf-8"))
+    assert on_disk == export
+    assert on_disk["as_of"] == AS_OF.isoformat()
+    for key, path in (
+        ("materials", tmp_path / "lab" / "materials.jsonl"),
+        ("fixture", tmp_path / "lab" / "fixture.jsonl"),
+        ("replay", tmp_path / "r.jsonl"),
+    ):
+        assert on_disk["files"][key]["sha256"] == labeller.file_sha256(path)
+
+
+def test_export_refuses_a_different_rubric_already_there(tmp_path: Path) -> None:
+    """25b: a same-named file with other bytes stops the export before anything is written."""
+    out = tmp_path / "lab"
+    out.mkdir()
+    (out / "RUBRIC-v2.md").write_text("not the registered rubric\n", encoding="utf-8")
+    materials, fixture, replay, summary = _build([_row()], {"T-a": ("p", _thread(10))})
+    with pytest.raises(ex.ExportError, match=r"RUBRIC-v2.md"):
+        ex.write_outputs(out, tmp_path / "r.jsonl", materials, fixture, replay, summary)
+    assert sorted(p.name for p in out.iterdir()) == ["RUBRIC-v2.md"]
+    assert not (tmp_path / "r.jsonl").exists()
+    # identical bytes are fine
+    (out / "RUBRIC-v2.md").write_bytes((EVAL / "RUBRIC-v2.md").read_bytes())
+    ex.write_outputs(out, tmp_path / "r.jsonl", materials, fixture, replay, summary)
+
+
+class _EchoLabeller:
+    async def chat_completion(self, *, model: str, messages: list[Any], max_tokens: int) -> Any:
+        from spirrow_mindwire.lexora.client import ChatCompletion
+
+        items = json.loads(messages[1].content.split("\n\n", 1)[1])
+        lines = [
+            json.dumps(
+                {
+                    "thread_id": i["thread_id"],
+                    "round_index": i["round_index"],
+                    "label": "spurious",
+                    "category": "IMPL",
+                    "rationale": "x",
+                }
+            )
+            for i in items
+        ]
+        return ChatCompletion(
+            content="```jsonl\n" + "\n".join(lines) + "\n```",
+            reasoning_content=None,
+            finish_reason="stop",
+            model="m-" + model,
+            usage={"prompt_tokens": 1},
+        )
+
+    async def stats_costs_recent(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return []
+
+
+def test_export_label_lock_report_end_to_end(tmp_path: Path) -> None:
+    """23g + 25c (msg-4652 / msg-4656): export → label (both labellers, fake endpoint) → lock →
+    report. Labelling leaves fixture / materials untouched, the lock's hashes equal the export's,
+    and the report accepts the run."""
+    import asyncio
+
+    out, replay_path = tmp_path / "lab", tmp_path / "jev" / "replay.jsonl"
+    rows = [_row(), _row(thread_id="T-b", latest="msg-2", logged_at=_at(2.5))]
+    materials, fixture, replay, summary = _build(
+        rows, {"T-a": ("p", _thread(12)), "T-b": ("q", _thread(6))}
+    )
+    export = ex.write_outputs(out, replay_path, materials, fixture, replay, summary)
+    system = labeller.read_system_prompt(out, "label_prompt-v2.md", "RUBRIC-v2.md")
+
+    async def _nosleep(_: float) -> None:
+        return None
+
+    for who in labeller.LABELLERS:
+        asyncio.run(
+            labeller.label_all(
+                client=_EchoLabeller(),
+                labeller=who,
+                materials=labeller.read_jsonl(out / "materials.jsonl"),
+                system=system,
+                out_dir=out,
+                sleep=_nosleep,
+            )
+        )
+    manifest = labeller.write_lock(out, "label_prompt-v2.md", "RUBRIC-v2.md")
+    for key, name in (("materials", "materials.jsonl"), ("fixture", "fixture.jsonl")):
+        assert labeller.file_sha256(out / name) == export["files"][key]["sha256"]
+        assert manifest["sha256"][name] == export["files"][key]["sha256"]
+    assert manifest["sha256"]["RUBRIC-v2.md"] == export["rubric"]["sha256"]
+    assert manifest["sha256"]["label_prompt-v2.md"] == export["label_prompt"]["sha256"]
+    rc = report.main(
+        [
+            "--replay",
+            str(replay_path),
+            "--fixture",
+            str(out / "fixture.jsonl"),
+            "--labels",
+            f"naysayer-tier={out / 'labels.naysayer-tier.jsonl'}",
+            "--labels",
+            f"frontier-tier={out / 'labels.frontier-tier.jsonl'}",
+            "--export-manifest",
+            str(out / "export.json"),
+            "--out",
+            str(tmp_path / "report.md"),
+        ]
+    )
+    assert rc == 0
+    assert "## Export lock" in (tmp_path / "report.md").read_text(encoding="utf-8")

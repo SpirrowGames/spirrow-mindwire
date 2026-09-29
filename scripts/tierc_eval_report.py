@@ -38,6 +38,15 @@ input with no v2 row renders exactly as before (the committed ``eval/tierc/repor
 pinned byte for byte). The v2 section applies msg-4639 DECIDED 2d-4: a single ``NO_VERDICT``
 among its rows makes the set **INVALID** and no headline is computed; ``MALFORMED`` is counted.
 
+**One version per run, and the export lock (msg-4648 / msg-4650 DECIDED 2d-11).** Straight after
+reading ``--replay`` the report refuses a mix of ``tierc-v2`` and other records ("a run is v1
+only or v2 only"). A v2 run requires ``--export-manifest PATH`` — the exporter's ``export.json``,
+no default and never guessed from a location — and refuses unless the sha256 of ``--replay``,
+``--fixture`` and the manifest's ``materials.jsonl`` (beside the manifest) all equal the
+manifest's. ``as_of`` is not compared (nothing else carries it); it is printed at the top of the
+v2 section with the three hashes and the manifest's own sha256. A v1 run given
+``--export-manifest`` is an error: nothing would be checked, so nothing may claim it was.
+
 **Reader of the output.** Markdown on stdout / ``--out``. Nothing is posted anywhere.
 """
 
@@ -108,6 +117,72 @@ CORRECTIONS_PATH_2026_09_28 = "eval/tierc/corrections/2026-09-28-roster-selectio
 
 class CorrectionsError(ValueError):
     """The corrections file does not fit the fixture it is applied to. Always fatal."""
+
+
+class InputError(ValueError):
+    """The inputs cannot be evaluated as one run (mixed versions, export lock). Always fatal."""
+
+
+@dataclass(frozen=True)
+class ExportLock:
+    """The verified ``export.json`` (msg-4650): what the v2 section prints at its top."""
+
+    path: str
+    sha256: str
+    as_of: str
+    materials_sha256: str
+    fixture_sha256: str
+    replay_sha256: str
+
+
+def record_version(rec: Mapping[str, Any]) -> str:
+    d = rec.get("decision") if isinstance(rec.get("decision"), Mapping) else {}
+    assert isinstance(d, Mapping)
+    return str(rec.get("questions_version") or d.get("questions_version") or "")
+
+
+def run_version(replay: Sequence[Mapping[str, Any]]) -> str:
+    """``"v2"`` when every record is ``tierc-v2``, ``"v1"`` when none is; a mix is an
+    :class:`InputError` (msg-4650: one evaluation is v1 only or v2 only)."""
+    v2 = sum(1 for r in replay if record_version(r) == V2)
+    if v2 and v2 != len(replay):
+        raise InputError(
+            f"--replay mixes {v2} tierc-v2 record(s) with {len(replay) - v2} other(s); "
+            "one evaluation run is v1 only or v2 only"
+        )
+    return "v2" if v2 else "v1"
+
+
+def verify_export_lock(manifest: Path, fixture: Path, replay: Path) -> ExportLock:
+    """msg-4650 DECIDED 2d-11: the three sha256 must equal ``export.json``'s; ``as_of`` is read,
+    not compared."""
+    try:
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+        files = raw["files"]
+        want = {k: str(files[k]["sha256"]) for k in ("materials", "fixture", "replay")}
+        materials = manifest.parent / str(files["materials"]["name"])
+        as_of = str(raw["as_of"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise InputError(f"{manifest}: not an export.json: {exc}") from exc
+    got = {"materials": materials, "fixture": fixture, "replay": replay}
+    for key, path in got.items():
+        try:
+            sha = file_sha256(path)
+        except OSError as exc:
+            raise InputError(f"{key} {path}: unreadable: {exc}") from exc
+        if sha != want[key]:
+            raise InputError(
+                f"{key} {path} has sha256 {sha}, but {manifest} records {want[key]}; "
+                "the export was changed after it was written"
+            )
+    return ExportLock(
+        path=str(manifest),
+        sha256=file_sha256(manifest),
+        as_of=as_of,
+        materials_sha256=want["materials"],
+        fixture_sha256=want["fixture"],
+        replay_sha256=want["replay"],
+    )
 
 
 @dataclass(frozen=True)
@@ -494,36 +569,25 @@ def render(
     corrections: Corrections | None = None,
     replayed_before_corrections: int | None = None,
     th_v2: TierCV2Thresholds | None = None,
+    export: ExportLock | None = None,
 ) -> str:
-    """Split by questions version (msg-4639 DECIDED 2d-5). No v2 row → the v1 report, unchanged.
-
-    Labels are narrowed to each section's keys only when both versions are present, so a pure
-    v1 input sees exactly the labellers it was given."""
+    """One version per run (msg-4639 DECIDED 2d-5, msg-4650). No v2 row → the v1 report,
+    unchanged; all v2 → the v2 section; a mix is an :class:`InputError`."""
     v2 = [r for r in all_rows if r.questions_version == V2]
-    v1 = [r for r in all_rows if r.questions_version != V2]
     if not v2:
         return _render_v1(
             all_rows, labellers, th, population, corrections, replayed_before_corrections
         )
-    parts: list[str] = []
-    if v1:
-        keys1 = {r.key for r in v1}
-        labs1 = {n: {k: v for k, v in m.items() if k in keys1} for n, m in labellers.items()}
-        parts.append(
-            _render_v1(v1, labs1, th, population, corrections, replayed_before_corrections)
-        )
-        keys2 = {r.key for r in v2}
-        labellers = {n: {k: v for k, v in m.items() if k in keys2} for n, m in labellers.items()}
-    parts.append(
-        render_v2(
-            v2,
-            labellers,
-            th_v2 if th_v2 is not None else TierCV2Thresholds(),
-            corrections,
-            replayed_before_corrections,
-        )
+    if len(v2) != len(all_rows):
+        raise InputError("rows mix tierc-v2 with other versions; one run is v1 only or v2 only")
+    return render_v2(
+        v2,
+        labellers,
+        th_v2 if th_v2 is not None else TierCV2Thresholds(),
+        corrections,
+        replayed_before_corrections,
+        export,
     )
-    return "\n\n".join(parts)
 
 
 def _render_v1(
@@ -779,11 +843,25 @@ def render_v2(
     th: TierCV2Thresholds,
     corrections: Corrections | None = None,
     replayed_before_corrections: int | None = None,
+    export: ExportLock | None = None,
 ) -> str:
-    """The tierc-v2 section (msg-4639 DECIDED 2d-4 / 2d-5, msg-4641 DECIDED 2d-7)."""
+    """The tierc-v2 section (msg-4639 DECIDED 2d-4 / 2d-5, msg-4641 DECIDED 2d-7, msg-4650)."""
     truth = consensus(labellers)
     n = len(rows)
     lines: list[str] = ["# Tier-C evaluation — Jev, tierc-v2", ""]
+    if export is None:
+        lines += ["- export lock: **none** (not verified — library call, not the CLI)", ""]
+    else:
+        lines += [
+            "## Export lock (msg-4650 DECIDED 2d-11)",
+            "",
+            f"- as_of: {export.as_of}",
+            f"- export.json: `{export.path}` sha256 `{export.sha256}`",
+            f"- materials.jsonl sha256 `{export.materials_sha256}` — verified",
+            f"- fixture.jsonl sha256 `{export.fixture_sha256}` — verified",
+            f"- replay sha256 `{export.replay_sha256}` — verified",
+            "",
+        ]
     if corrections is None:
         lines += ["- corrections: **none applied** — every fixture row is counted.", ""]
     else:
@@ -890,8 +968,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--corrections", type=Path, default=None, help="corrections JSON (optional; msg-4302)"
     )
+    parser.add_argument(
+        "--export-manifest",
+        type=Path,
+        default=None,
+        help="the exporter's export.json; required for a tierc-v2 run (msg-4648 / msg-4650)",
+    )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
+
+    replay_records = read_jsonl(args.replay)
+    export: ExportLock | None = None
+    try:
+        version = run_version(replay_records)
+        if version == "v2":
+            if args.export_manifest is None:
+                raise InputError("a tierc-v2 run requires --export-manifest (msg-4648)")
+            export = verify_export_lock(args.export_manifest, args.fixture, args.replay)
+        elif args.export_manifest is not None:
+            raise InputError(
+                "--export-manifest given for a v1 run; nothing would be checked (msg-4648)"
+            )
+    except InputError as exc:
+        print(f"tierc_eval_report: {exc}", file=sys.stderr)
+        return 2
 
     # Thresholds are fixed in advance (RUBRIC, msg-4229 §3-4): the live defaults, no CLI knob.
     th = TierCThresholds()
@@ -904,7 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
         labellers[name] = load_labels(read_jsonl(Path(path)))
     fixture = read_jsonl(args.fixture)
     fixture_sha = file_sha256(args.fixture)
-    rows = join(read_jsonl(args.replay), fixture)
+    rows = join(replay_records, fixture)
     population = read_jsonl(args.population) if args.population is not None else []
     corr: Corrections | None = None
     replayed = len(rows)
@@ -923,7 +1023,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    text = render(rows, labellers, th, population, corr, replayed, th_v2=TierCV2Thresholds())
+    text = render(
+        rows, labellers, th, population, corr, replayed, th_v2=TierCV2Thresholds(), export=export
+    )
     if args.out is not None:
         args.out.write_text(text + "\n", encoding="utf-8", newline="\n")
     else:

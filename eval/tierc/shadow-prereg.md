@@ -1,10 +1,10 @@
 # Tier-C production shadow — pre-registration (tierc-v2)
 
-Thread: `T-decider-conductor-hook`, step 2d. Decisions: Bohr msg-4634 (2d-1 / 2d-2), msg-4636 (2d-3), msg-4639 (2d-4 / 2d-5 / 2d-6), msg-4641 (2d-7), msg-4643 (2d-8); each approved by Einstein.
+Thread: `T-decider-conductor-hook`, step 2d. Decisions: Bohr msg-4634 (2d-1 / 2d-2), msg-4636 (2d-3), msg-4639 (2d-4 / 2d-5 / 2d-6), msg-4641 (2d-7), msg-4643 (2d-8), msg-4646 (2d-9 / 2d-10), msg-4648 + msg-4650 (2d-11), msg-4652, msg-4654 (2d-12), msg-4656 (2d-13); each approved by Einstein.
 
 This file is written **before** any counted shadow row exists. It ships in the same PR as the hook change that adds the point-in-time columns. So any row that carries those columns was written after this registration (2d-3).
 
-**Status: incomplete.** Two values below are not filled in yet. They are marked `PENDING`, and the PR stays a draft until they are.
+**Status: one value is still `PENDING`:** `rules_sha256` (§2). The PR stays a draft until it is filled in.
 
 ## 1. What is counted
 
@@ -29,10 +29,15 @@ A row that fails any condition appears only as a count, per reason, in `export.j
 | Questions version | `tierc-v2` | `config.py:528` (live default) |
 | `ask_min` | **0.60** | `verdict.py:371` `DEFAULT_V2_ASK_MIN`. Fixed before the replay; cited here, not chosen here (2d-4) |
 | `not_ask_max` | **0.40** | `verdict.py:374` `DEFAULT_V2_NOT_ASK_MAX`, same |
+| `RUBRIC-v2.md` sha256 | `c99ce23c7bad069e0d419d9bd18d2764959f037b61f3f7907ac99fba3f65376c` | `eval/tierc/RUBRIC-v2.md` at this commit (2d-10) |
+| `label_prompt-v2.md` sha256 | `48cda10df37f2050599b4262f875d44b268cbb0f362dfff1c8d5b62238d0fe72` | `eval/tierc/label_prompt-v2.md` at this commit (2d-10) |
 | `rules_sha256` | `PENDING`: the operator copies it from the production daemon's start-up log line `decider tierc-v2 rules loaded from … (rules_sha256=…)` (`decider_lexora.py:457`, msg-4639) | production |
-| `--as-of` | `PENDING`: written here and in the manifest when the single export before the lock is run (§5, msg-4641) | export run |
 
 The report recomputes every verdict from `raw_answers["should_ask_human"]` using the registered thresholds. A different `[decider].tierc_v2_*` value in the production config therefore does not change what is measured.
+
+**`--as-of` is not a registered value** (msg-4646). The rule for choosing it is registered instead: it is the time of the single export run just before labelling, and that time must satisfy §7. Its value is recorded in `export.json` (2d-9) and printed at the top of the report (2d-11).
+
+`RUBRIC-v2.md:7-12` asks that the rubric and prompt hashes be recorded before any v2 row goes to Jev. For the shadow, this commit is that point: counted rows can only be written after it (msg-4636).
 
 ## 3. Primary hypothesis (one)
 
@@ -58,34 +63,42 @@ Also reported, not criteria:
 
 ## 5. Procedure
 
-1. **Export once**, with `--as-of` set to the time of the run (timezone-aware ISO 8601, not in the future):
+1. **Export once**, with `--as-of` set to the time of the run (timezone-aware ISO 8601, not in the future; §2 gives the rule):
    ```
    uv run python scripts/export_shadow_eval_set.py --log <conductor log> [--log …] \
      --rules-sha256 <§2> --project <project> [--project …] --as-of <ISO 8601> \
      --out-dir eval/tierc/shadow-<date> --replay-out <path outside that directory>
    ```
    - The exporter drops every message and row after `--as-of` before doing anything else (2d-8).
-   - Record `--as-of` in §2 and the manifest.
    - Jev's side goes to `--replay-out`. It never sits in the labellers' directory (2d-2).
-2. **Copy** `eval/tierc/label_prompt.md` and `eval/tierc/RUBRIC.md` into `eval/tierc/shadow-<date>/` unchanged. The prompt is not edited, so the system-prompt hash is the replay's (2d-6).
-3. **Label** with the replay's labellers, reading `materials.jsonl` only:
+   - The exporter also copies `eval/tierc/RUBRIC-v2.md` and `eval/tierc/label_prompt-v2.md` into the directory under the same names (2d-13).
+   - It writes `export.json` with `as_of`, the counts, the sha256 of `materials.jsonl`, `fixture.jsonl` and the replay file, and the name + sha256 of the rubric and prompt (2d-9, 2d-13).
+2. **Check and commit.**
+   - Check that `export.json`'s `rubric.sha256` and `label_prompt.sha256` equal §2.
+   - Commit the directory, including `export.json`, before any labelling (2d-9).
+3. **Label** with the replay's labellers, reading `materials.jsonl` only, under the v2 rubric and prompt:
    ```
-   uv run python scripts/label_eval_set.py --dir eval/tierc/shadow-<date> --labeller naysayer-tier
-   uv run python scripts/label_eval_set.py --dir eval/tierc/shadow-<date> --labeller frontier-tier
+   uv run python scripts/label_eval_set.py --dir eval/tierc/shadow-<date> \
+     --prompt-file label_prompt-v2.md --rubric-file RUBRIC-v2.md --labeller naysayer-tier
+   uv run python scripts/label_eval_set.py --dir eval/tierc/shadow-<date> \
+     --prompt-file label_prompt-v2.md --rubric-file RUBRIC-v2.md --labeller frontier-tier
    ```
-4. **Lock**:
+   `--prompt-file` and `--rubric-file` take bare file names inside `--dir` (2d-12).
+4. **Lock** after labelling (msg-4646: the order is label → lock):
    ```
-   uv run python scripts/label_eval_set.py --dir eval/tierc/shadow-<date> --lock
+   uv run python scripts/label_eval_set.py --dir eval/tierc/shadow-<date> \
+     --prompt-file label_prompt-v2.md --rubric-file RUBRIC-v2.md --lock
    ```
-   This writes the manifest hashes of the prompt, rubric, materials, fixture and both label files.
-   > **Order note for Bohr.** 2d-2 lists "lock, then label". `label_eval_set.py --lock` refuses to run until both label files cover every material row (`write_lock`), so the lock comes after labelling. It still comes **before** any label is joined to Jev's output, which is the separation msg-4224 asks for. Please confirm or amend.
-5. **Measure** without `--corrections` (2d-2 (d)):
+   The manifest records the sha256 of the v2 rubric and prompt (under those names), the materials, the fixture and both label files.
+5. **Measure** without `--corrections`, with the export lock (2d-2 (d), 2d-11):
    ```
    uv run python scripts/tierc_eval_report.py --replay <replay-out> \
      --fixture eval/tierc/shadow-<date>/fixture.jsonl \
      --labels naysayer-tier=eval/tierc/shadow-<date>/labels.naysayer-tier.jsonl \
-     --labels frontier-tier=eval/tierc/shadow-<date>/labels.frontier-tier.jsonl
+     --labels frontier-tier=eval/tierc/shadow-<date>/labels.frontier-tier.jsonl \
+     --export-manifest eval/tierc/shadow-<date>/export.json
    ```
+   The report refuses the run if the replay, fixture or materials no longer match `export.json`. It also refuses if the records mix versions.
 
 ## 6. Exploration (never a result on this data)
 

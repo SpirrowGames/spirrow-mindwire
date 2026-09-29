@@ -42,7 +42,16 @@ otherwise ``held`` — counted by number only, exported on a later ``--as-of``.
   author / ``msg_id`` = ``latest_msg_id`` / ``roster_source=logged`` / ``following_n``);
 * ``--replay-out`` — the Jev side in ``decider_replay.py --endpoint`` record shape (``state`` +
   ``decision``), read by ``tierc_eval_report.py --replay``. It must not be inside ``--out-dir``;
-* ``<out-dir>/export.json`` — the counts by bucket, ``as_of`` and the inputs used.
+* ``<out-dir>/export.json`` — the export lock (msg-4646 DECIDED 2d-9): ``as_of``, the counts by
+  bucket, the sha256 of ``materials.jsonl`` / ``fixture.jsonl`` / the replay file (checked by
+  ``tierc_eval_report.py --export-manifest``, msg-4648 / msg-4650 DECIDED 2d-11), and the name +
+  sha256 of the rubric and label prompt copied beside them;
+* ``<out-dir>/RUBRIC-v2.md`` and ``<out-dir>/label_prompt-v2.md`` — byte copies of
+  ``eval/tierc/RUBRIC-v2.md`` / ``eval/tierc/label_prompt-v2.md`` under the same names (msg-4656
+  DECIDED 2d-13). The sources are constants, not arguments. An existing file of that name with
+  other bytes stops the export before anything is written; identical bytes are left as they are.
+  Label with ``label_eval_set.py --dir <out-dir> --prompt-file label_prompt-v2.md
+  --rubric-file RUBRIC-v2.md``.
 
 **Join key.** ``tierc_eval_report.py`` joins on ``(thread_id, round_index)``. The conductor's
 ``round_index`` is its per-run loop counter and restarts at 0 on every dispatch, so the exported
@@ -57,6 +66,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 from collections import Counter
@@ -86,6 +96,17 @@ QUIET_AFTER = timedelta(hours=72)
 """msg-4641 DECIDED 2d-7 condition 2: the thread's last message is at least this old at
 ``--as-of`` (exactly 72 h counts)."""
 TERMINAL_NEXT = "none"
+
+EVAL_DIR = Path(__file__).resolve().parent.parent / "eval" / "tierc"
+LABEL_INPUTS: dict[str, Path] = {
+    "rubric": EVAL_DIR / "RUBRIC-v2.md",
+    "label_prompt": EVAL_DIR / "label_prompt-v2.md",
+}
+"""msg-4656 DECIDED 2d-13: the v2 rubric / prompt the exporter places in ``--out-dir``. Fixed in
+code so the runner cannot substitute another file for the pre-registered one."""
+MATERIALS_NAME = "materials.jsonl"
+FIXTURE_NAME = "fixture.jsonl"
+EXPORT_NAME = "export.json"
 
 COUNTED = "counted"
 HELD = "held_following"
@@ -384,6 +405,56 @@ def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             fh.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def check_label_inputs(out_dir: Path, sources: Mapping[str, Path]) -> None:
+    """msg-4656 DECIDED 2d-13: refuse when ``out_dir`` already holds one of the names with other
+    bytes. Checked before anything is written, so a refused export leaves no partial output."""
+    for src in sources.values():
+        dst = out_dir / src.name
+        if dst.exists() and dst.read_bytes() != src.read_bytes():
+            raise ExportError(f"{dst} exists with other content than {src}; not overwriting")
+
+
+def write_outputs(
+    out_dir: Path,
+    replay_out: Path,
+    materials: Sequence[Mapping[str, Any]],
+    fixture: Sequence[Mapping[str, Any]],
+    replay: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+    sources: Mapping[str, Path] = LABEL_INPUTS,
+) -> dict[str, Any]:
+    """Write the three sets, copy the rubric / prompt, then ``export.json`` (2d-9 / 2d-13)."""
+    check_label_inputs(out_dir, sources)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    replay_out.parent.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(out_dir / MATERIALS_NAME, materials)
+    _write_jsonl(out_dir / FIXTURE_NAME, fixture)
+    _write_jsonl(replay_out, replay)
+    placed: dict[str, dict[str, str]] = {}
+    for key, src in sources.items():
+        dst = out_dir / src.name
+        if not dst.exists():
+            dst.write_bytes(src.read_bytes())
+        placed[key] = {"name": src.name, "sha256": _sha256(dst)}
+    export: dict[str, Any] = {
+        **summary,
+        "files": {
+            "materials": {"name": MATERIALS_NAME, "sha256": _sha256(out_dir / MATERIALS_NAME)},
+            "fixture": {"name": FIXTURE_NAME, "sha256": _sha256(out_dir / FIXTURE_NAME)},
+            "replay": {"path": str(replay_out), "sha256": _sha256(replay_out)},
+        },
+        **placed,
+    }
+    (out_dir / EXPORT_NAME).write_text(
+        json.dumps(export, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n"
+    )
+    return export
+
+
 async def fetch_threads(
     thread_ids: Iterable[str], projects: Sequence[str]
 ) -> tuple[dict[str, tuple[str, list[Message]]], dict[str, list[str]]]:
@@ -463,17 +534,14 @@ def main(argv: list[str] | None = None, *, now: datetime | None = None) -> int:
     except ExportError as exc:
         print(f"export_shadow_eval_set: {exc}", file=sys.stderr)
         return 1
-    out_dir.mkdir(parents=True, exist_ok=True)
-    replay_out.parent.mkdir(parents=True, exist_ok=True)
-    _write_jsonl(out_dir / "materials.jsonl", materials)
-    _write_jsonl(out_dir / "fixture.jsonl", fixture)
-    _write_jsonl(replay_out, replay)
     summary["logs"] = [str(p) for p in args.log]
     summary["projects"] = list(args.project)
-    (out_dir / "export.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n"
-    )
-    print(json.dumps(summary, ensure_ascii=False, indent=2), file=sys.stderr)
+    try:
+        export = write_outputs(out_dir, replay_out, materials, fixture, replay, summary)
+    except ExportError as exc:
+        print(f"export_shadow_eval_set: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(export, ensure_ascii=False, indent=2), file=sys.stderr)
     return 0
 
 
