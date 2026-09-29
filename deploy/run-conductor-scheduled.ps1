@@ -1803,14 +1803,18 @@ function Get-StarvedKeys {
 # --- parse the conductor's own verdict ----------------------------------------------------------
 # The daemon's last word on stdout looks like:
 #   conductor stopped: reason=none rounds=0 forced_naysayer=0 ... last_msg=msg-1919
-# Returns @{ reason; rounds; last_msg }; nulls mean "could not tell".
+# Returns @{ reason; rounds; last_msg; error_code }; nulls mean "could not tell".
+# `error_code=` is only on the adapter-error line loop_runner.main prints when an adapter's
+# deliver_event raised (`reason=adapter_error`, T-successful-turn-quarantined-on-sdk-lifecycle-
+# failure Bohr msg-4440 D-2'); every other stop line has none and leaves it $null.
 function Get-ConductorVerdict {
     param([string[]]$Output)
 
     $line = $Output | Where-Object { $_ -match 'conductor stopped:' } | Select-Object -Last 1
-    $verdict = @{ reason = $null; rounds = $null; last_msg = $null }
+    $verdict = @{ reason = $null; rounds = $null; last_msg = $null; error_code = $null }
     if (-not $line) { return $verdict }
     if ($line -match 'reason=(\S+)') { $verdict.reason = $Matches[1] }
+    if ($line -match 'error_code=(\S+)') { $verdict.error_code = $Matches[1] }
     if ($line -match 'rounds=(\d+)') { $verdict.rounds = [int]$Matches[1] }
     # `last_msg=None` is Python's None reaching stdout, i.e. the conductor had no message to report.
     # Matched by \S+ like any id, so without this it was stored as the literal head "None" — never
@@ -1818,6 +1822,35 @@ function Get-ConductorVerdict {
     # indistinguishable from a real head in both the state file and the log.
     if ($line -match 'last_msg=(\S+)' -and $Matches[1] -ne 'None') { $verdict.last_msg = $Matches[1] }
     return $verdict
+}
+
+# --- adapter-error quarantine wording (T-successful-turn-quarantined-on-sdk-lifecycle-failure) ---
+# Bohr msg-4436 D-3 (carried by msg-4438 / msg-4440): a quarantine caused by an adapter's
+# deliver_event raising names the adapter's error code in its stop reason, so the notification and
+# the record say WHAT failed instead of `reason=` (empty). Any other verdict passes its reason
+# through unchanged — including $null, which is what a run that died before printing any stop line
+# still produces.
+function Get-QuarantineStopReason {
+    param($Verdict)
+    if ($Verdict.reason -eq 'adapter_error' -and $Verdict.error_code) {
+        return "adapter_error:$($Verdict.error_code)"
+    }
+    return $Verdict.reason
+}
+
+# The K-budget systemic alert's cause line. $Codes holds one entry per quarantine of this sweep:
+# the adapter error code, or '' for a quarantine that carried none. When every entry is an
+# `adapter.*` code the alert says the adapter lifecycle is the suspect, not the threads — the
+# 2026-09-30 wave (msg-4420) sent the reader looking at the threads first. The K count is unchanged.
+function Get-SystemicCauseHint {
+    param([string[]]$Codes)
+    $all = @($Codes)
+    if ($all.Count -eq 0) { return '' }
+    $shown = ($all | ForEach-Object { if ($_) { $_ } else { '(no error_code)' } }) -join ', '
+    $hint = " error_code: $shown。"
+    $adapterOnly = @($all | Where-Object { $_ -like 'adapter.*' }).Count -eq $all.Count
+    if ($adapterOnly) { $hint += "スレッドではなく adapter のライフサイクルが疑わしい。" }
+    return $hint
 }
 
 # --- push notification (C-2) --------------------------------------------------------------------
@@ -3573,6 +3606,7 @@ try {
     $held = 0
     $quarantineSkipped = 0     # candidates dropped because already quarantined
     $newlyQuarantined = 0      # non-zero exits this tick
+    $quarantineErrorCodes = @()  # error_code per quarantine this tick ('' if none) — K alert only
     $notReached = 0            # candidates the sweep never got to (K-cap, worked-and-broke)
     $sweepSignature = @()
     $dispositions = @{}        # key -> "worked" | "no-work" | "head-skipped" | "quarantined-skipped" | "held" | "not-reached"
@@ -3864,14 +3898,16 @@ try {
             # msg-2601 §2 counts a "receiver exists but no one supplies it" as the same
             # bug family the ledger was built to catch (row 6: ``$RepoRoot`` — 受け口はあるが誰も読まない).
             $failureClass = Get-FailureClass -SessionLogTail $tail -RepoRoot $repoRoot
+            $quarantineReason = Get-QuarantineStopReason -Verdict $verdict
+            $quarantineErrorCodes += if ($verdict.error_code) { "$($verdict.error_code)" } else { '' }
             $rec = New-QuarantineRecord `
-                -FirstFailureAt $nowIso -ExitCode $code -StopReason $verdict.reason `
+                -FirstFailureAt $nowIso -ExitCode $code -StopReason $quarantineReason `
                 -FailureHead $probeHead -FailureControl $currentControl `
                 -SessionLogPath $logPath -SessionLogTail $tail `
                 -FailureClass $failureClass
             $quarantineState[$cand.key] = $rec
             $newlyQuarantined++
-            Write-Log "quarantined $($cand.key): exit=$code reason=$($verdict.reason) — sweep CONTINUES (signal is the notification, not the stop)"
+            Write-Log "quarantined $($cand.key): exit=$code reason=$quarantineReason rounds=$($verdict.rounds) last_msg=$($verdict.last_msg) — sweep CONTINUES (signal is the notification, not the stop)"
 
             # Initial-quarantine notification. Fires once per newly-recorded quarantine. Signature
             # is the failure fingerprint so a re-quarantine after Clear-Quarantine (which drops the
@@ -3880,13 +3916,19 @@ try {
             $reproHint = Get-QuarantineReproHint -Fingerprint $rec.failure_fingerprint `
                                                  -SessionLogPath $rec.session_log_path `
                                                  -Key $cand.key
-            $notificationBody = "MindWire: **$($cand.key)** を隔離しました (exit=$code, reason=$($verdict.reason))。" +
+            $notificationBody = "MindWire: **$($cand.key)** を隔離しました (exit=$code, reason=$quarantineReason)。" +
                                 "以後この tick からは skip されます。復帰するには " +
                                 "``pwsh deploy/Clear-Quarantine.ps1 -Thread '$($cand.key)' -Reason '...'``。" +
                                 "ダイジェストにも別掲されます。"
+            if ($verdict.reason -eq 'adapter_error') {
+                # msg-4436 D-3: the failing turn's reply never reached the thread (both adapter
+                # paths raise before on_reply, msg-4435), but the rounds before it did.
+                $notificationBody += "`n前のラウンドまで $($verdict.rounds) 件は投稿済み (last_msg=$($verdict.last_msg))。" +
+                                     "失敗したターンの reply は失われています。session_log を確認してください。"
+            }
             if ($reproHint) { $notificationBody += "`n$reproHint" }
             Send-NotificationIfChanged -State $notifyState -Key "__quarantine__/$($cand.key)" `
-                -Signature "${nowIso}:${code}:$($verdict.reason):${probeHead}" `
+                -Signature "${nowIso}:${code}:${quarantineReason}:${probeHead}" `
                 -Message $notificationBody
 
             # K-budget short-circuit. Two quarantines in one sweep suggest a shared cause; keep
@@ -3902,7 +3944,8 @@ try {
                     -Signature (Get-SystemicAlertSignature -Now $nowUtc -Count $newlyQuarantined) `
                     -Message ("MindWire: 同一 sweep で K=$QuarantineFailureBudget 件の quarantine が発生しました。" +
                               "systemic な原因の可能性が高いため、この tick を打ち切ります。" +
-                              "残候補はスキップ (`not-reached`) 扱いで飢餓計測に載ります。")
+                              "残候補はスキップ (`not-reached`) 扱いで飢餓計測に載ります。" +
+                              (Get-SystemicCauseHint -Codes $quarantineErrorCodes))
                 $breakReason = 'k-budget-hit'
                 break
             }

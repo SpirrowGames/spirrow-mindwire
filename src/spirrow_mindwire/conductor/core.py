@@ -202,6 +202,12 @@ class StopReason(StrEnum):
     # tick re-reads the same handoff and re-derives admission from the fresh rollup; the wait is
     # therefore held by GitHub's state, not by a mindwire-side timer (§A-2 statelessness).
     CI_WAIT = "ci_wait"
+    # An adapter's ``deliver_event`` raised (T-successful-turn-quarantined-on-sdk-lifecycle-failure,
+    # Bohr msg-4440 D-1''). NEVER returned from :meth:`Conductor.run` and never logged by the
+    # conductor: the exception propagates unchanged, and ``loop_runner.main`` is the single place
+    # that prints the ``conductor stopped: reason=adapter_error …`` line, reading the state the
+    # conductor left in :class:`ConductorStopSlot`.
+    ADAPTER_ERROR = "adapter_error"
 
 
 @dataclass(frozen=True)
@@ -217,6 +223,53 @@ class ConductorOutcome:
     # ``force_naysayer_only_on_explicit_human`` would drop. With that lever off (default) this
     # is the counterfactual saving; with it on it is ~0 (those consults no longer fire). Counted.
     forced_naysayer_turns_saveable: int = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class ConductorStopSnapshot:
+    """The conductor's state at the moment a dispatch raised (Bohr msg-4440 D-1'').
+
+    ``rounds`` is the number of rounds COMPLETED before the raising one (the ``round_index`` of
+    the raising round — same counting :meth:`Conductor._stop` uses), ``last_msg_id`` the head the
+    raising dispatch was delivering, ``error_code`` never empty (see :func:`adapter_error_code`).
+    """
+
+    rounds: int
+    last_msg_id: str | None
+    forced: int
+    forced_saveable: int
+    error_code: str
+
+
+@dataclass
+class ConductorStopSlot:
+    """A mutable side channel the composition root hands the conductor (Bohr msg-4440 D-1'').
+
+    Exists so the exception that escapes :meth:`Conductor.run` is never touched: attaching the
+    snapshot to the exception can fail (``__slots__``), and wrapping it would break the
+    type-based ``except EnvironmentTerminalError`` routing in ``loop_runner.main`` (exit=2).
+    Writing a field of an object we own cannot fail either way.
+    """
+
+    snapshot: ConductorStopSnapshot | None = None
+
+
+def adapter_error_code(exc: BaseException) -> str:
+    """Name the failure for ``error_code=``: the adapter's ``.code`` if usable, else the class name.
+
+    Never empty and never raises. ``.code`` is used only when it is a non-empty ``str`` with no
+    whitespace — the wrapper parses ``error_code=`` as a run of non-whitespace, so a code with a
+    space would be truncated, and a non-string ``.code`` (an HTTP status, ``SystemExit``'s int) is
+    not an adapter error code. A ``.code`` property that itself raises falls back to the class
+    name (msg-4440).
+    """
+    try:
+        code = getattr(exc, "code", None)
+    except Exception:
+        code = None
+    if isinstance(code, str) and code and not any(ch.isspace() for ch in code):
+        return code
+    return type(exc).__name__
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -263,6 +316,7 @@ class Conductor:
         rollup_source: CheckRollupSource | None = None,
         identity_embodiment: Mapping[str, str] | None = None,
         decider: Decider | None = None,
+        stop_slot: ConductorStopSlot | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -315,6 +369,9 @@ class Conductor:
         # or sent it to a forced naysayer consult — and never changes the routing decision
         # ``_route`` already made (D20 monotonicity).
         self._decider = decider
+        # Adapter-error side channel (Bohr msg-4440 D-1''). ``None`` = nobody reads it; the
+        # dispatch still re-raises unchanged, so a bare Conductor behaves exactly as before.
+        self._stop_slot = stop_slot
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
         # ``supervised`` baseline, so a bare Conductor never self-authorises code. The state is
@@ -491,7 +548,14 @@ class Conductor:
                                 implementer_identity,
                             )
                             sessions[implementer_identity] = handle
-                        await self._dispatcher.dispatch(handle, self._to_event(route_msg, messages))
+                        await self._dispatch_recording(
+                            handle,
+                            route_msg,
+                            messages,
+                            rounds=round_index,
+                            forced=forced,
+                            forced_saveable=forced_saveable,
+                        )
                         processed_msg_id = route_msg_id
                         continue
                     # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through.
@@ -516,7 +580,14 @@ class Conductor:
                     sessions[implementer_identity] = handle
                 # Dispatch the implementer on the RELAY event (the verdict + critique), not its own
                 # pr-review trigger — else it wakes blind to what it must fix (Tier B msg-567 #1).
-                await self._dispatcher.dispatch(handle, self._to_event(relay_msg, messages))
+                await self._dispatch_recording(
+                    handle,
+                    relay_msg,
+                    messages,
+                    rounds=round_index,
+                    forced=forced,
+                    forced_saveable=forced_saveable,
+                )
                 # Track the relay: a silent implementer leaves the relay as the next latest, so the
                 # no-progress guard stops it (the relay's NEXT is never re-routed).
                 processed_msg_id = relay_msg_id
@@ -594,7 +665,14 @@ class Conductor:
                     self._thread_ref, target_role, target_identity
                 )
                 sessions[target_identity] = handle
-            await self._dispatcher.dispatch(handle, self._to_event(latest, messages))
+            await self._dispatch_recording(
+                handle,
+                latest,
+                messages,
+                rounds=round_index,
+                forced=forced,
+                forced_saveable=forced_saveable,
+            )
             processed_msg_id = latest_msg_id
         return self._stop(
             self._max_rounds, StopReason.ROUND_CAP, processed_msg_id, forced, forced_saveable
@@ -1592,6 +1670,37 @@ class Conductor:
             thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
         )
 
+    async def _dispatch_recording(
+        self,
+        handle: SessionHandle,
+        msg: dict[str, Any],
+        messages: list[dict[str, Any]],
+        *,
+        rounds: int,
+        forced: int,
+        forced_saveable: int,
+    ) -> None:
+        """Dispatch ``msg``; if the adapter raises, record a snapshot and re-raise unchanged.
+
+        Bohr msg-4440 D-1'': the ONLY place the conductor observes an adapter delivery failure.
+        It writes :class:`ConductorStopSlot` and does a bare ``raise`` — the exception's identity,
+        type and chain are untouched (``loop_runner.main`` routes ``KeyboardInterrupt`` /
+        ``EnvironmentTerminalError`` by type), and nothing is logged here: the single
+        ``conductor stopped:`` line for this case is printed by ``loop_runner.main``.
+        """
+        try:
+            await self._dispatcher.dispatch(handle, self._to_event(msg, messages))
+        except BaseException as exc:
+            if self._stop_slot is not None:
+                self._stop_slot.snapshot = ConductorStopSnapshot(
+                    rounds=rounds,
+                    last_msg_id=_msg_id(msg) or None,
+                    forced=forced,
+                    forced_saveable=forced_saveable,
+                    error_code=adapter_error_code(exc),
+                )
+            raise
+
     def _stop(
         self,
         rounds: int,
@@ -1676,6 +1785,9 @@ __all__ = [
     "Conductor",
     "ConductorDispatcher",
     "ConductorOutcome",
+    "ConductorStopSlot",
+    "ConductorStopSnapshot",
     "RouteDecision",
     "StopReason",
+    "adapter_error_code",
 ]

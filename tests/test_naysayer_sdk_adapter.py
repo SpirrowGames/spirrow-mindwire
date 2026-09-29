@@ -989,6 +989,9 @@ async def test_shutdown_failure_after_successful_turn_is_propagated(
     assert captured == []
     # Contract match with the main ``except`` blocks:
     assert "subprocess may have leaked" in str(excinfo.value)
+    # The exception carries the same code as session.error so the conductor's ``error_code=`` can
+    # name it (T-successful-turn-quarantined-on-sdk-lifecycle-failure, msg-4440).
+    assert getattr(excinfo.value, "code", None) == "adapter.shutdown_failed"
     assert isinstance(excinfo.value.__cause__, RuntimeError)
     assert "disconnect failed" in str(excinfo.value.__cause__)
     hs = await adapter.health(handle)

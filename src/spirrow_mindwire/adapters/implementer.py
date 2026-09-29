@@ -310,7 +310,13 @@ class ImplementerSdkTurnTimeoutError(ImplementerSdkDeliveryError):
 
     Wraps :class:`SdkTurnTimeoutError` from the shared drain helper.
     Error code: ``adapter.turn_timeout``.
+
+    ``code`` carries the same value as ``session.error.code`` so the conductor can name the failure
+    on the ``conductor stopped: … error_code=`` line without reaching into the adapter session
+    (T-successful-turn-quarantined-on-sdk-lifecycle-failure, Bohr msg-4438 / msg-4440).
     """
+
+    code = "adapter.turn_timeout"
 
 
 class ImplementerSdkHaltError(AdapterHaltError):

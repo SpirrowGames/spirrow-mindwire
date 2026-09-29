@@ -147,6 +147,40 @@ Check "reason still parsed" 'hold' $v.reason
 $v = Get-ConductorVerdict -Output @('conductor stopped: reason=human rounds=17 forced_naysayer=0 last_msg=msg-2167')
 Check "real id parsed" 'msg-2167' $v.last_msg
 Check "rounds parsed" 17 $v.rounds
+Check "no error_code on an ordinary stop line" $null $v.error_code
+
+Write-Host ""
+Write-Host "Get-ConductorVerdict / quarantine wording — adapter_error line (msg-4440 D-3)"
+# T-successful-turn-quarantined-on-sdk-lifecycle-failure: loop_runner.main prints this line (and
+# only this one) when an adapter's deliver_event raised. The shape is pinned on the Python side by
+# tests/test_adapter_error_stop_line.py; this side pins that the wrapper reads every field of it.
+foreach ($name in 'Get-QuarantineStopReason', 'Get-SystemicCauseHint') {
+    $fn = Get-FunctionAst -Name $name
+    if (-not $fn) { throw "function not found in sweep script: $name" }
+    Invoke-Expression $fn.Extent.Text
+}
+$adapterLine = 'conductor stopped: reason=adapter_error rounds=3 forced_naysayer=1 forced_naysayer_saveable=0 last_msg=msg-4413 error_code=adapter.shutdown_failed'
+$v = Get-ConductorVerdict -Output @('Traceback (most recent call last):', '  ...', $adapterLine)
+Check "adapter_error reason parsed" 'adapter_error' $v.reason
+Check "adapter_error rounds parsed" 3 $v.rounds
+Check "adapter_error last_msg parsed" 'msg-4413' $v.last_msg
+Check "adapter_error error_code parsed" 'adapter.shutdown_failed' $v.error_code
+Check "quarantine reason names the code" 'adapter_error:adapter.shutdown_failed' (Get-QuarantineStopReason -Verdict $v)
+$v = Get-ConductorVerdict -Output @('conductor stopped: reason=adapter_error rounds=0 forced_naysayer=0 forced_naysayer_saveable=0 last_msg=None error_code=RuntimeError')
+Check "last_msg=None still absence on adapter_error" $null $v.last_msg
+Check "class-name error_code parsed" 'RuntimeError' $v.error_code
+$v = Get-ConductorVerdict -Output @('no stop line at all')
+Check "no line: quarantine reason stays null" $null (Get-QuarantineStopReason -Verdict $v)
+$v = Get-ConductorVerdict -Output @('conductor stopped: reason=human rounds=2 forced_naysayer=0 last_msg=msg-1')
+Check "non-adapter reason passes through" 'human' (Get-QuarantineStopReason -Verdict $v)
+$hint = Get-SystemicCauseHint -Codes @('adapter.turn_timeout', 'adapter.shutdown_failed')
+Check "systemic hint lists the codes" $true ($hint -like '*adapter.turn_timeout, adapter.shutdown_failed*')
+Check "systemic hint blames the adapter lifecycle when all are adapter.*" $true ($hint -like '*adapter のライフサイクル*')
+$hint = Get-SystemicCauseHint -Codes @('adapter.turn_timeout', '')
+Check "mixed: no adapter-lifecycle claim" $false ($hint -like '*adapter のライフサイクル*')
+Check "mixed: missing code is named" $true ($hint -like '*(no error_code)*')
+$hint = Get-SystemicCauseHint -Codes @('RuntimeError', 'adapter.turn_timeout')
+Check "class-name code is not adapter.*" $false ($hint -like '*adapter のライフサイクル*')
 
 Write-Host ""
 if ($script:failures -gt 0) {

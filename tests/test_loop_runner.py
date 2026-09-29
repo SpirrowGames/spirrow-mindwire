@@ -655,14 +655,20 @@ def test_build_conductor_wires_conductor_from_config(tmp_path: Path) -> None:
     proposer = _StubAdapter("fake-proposer", _proposer_caps())
     implementer = _StubAdapter("fake-implementer", _exec_caps())
     naysayer = _StubAdapter("fake-naysayer", _naysayer_caps())
+    from spirrow_mindwire.conductor.core import ConductorStopSlot
+
+    slot = ConductorStopSlot()
     cond = build_conductor(
         _conductor_settings(human_identity="takahito"),
         mcp=_FakeMcp(_FakeChatroom()),
         proposer=proposer,
         implementer=implementer,
         naysayer=naysayer,
+        stop_slot=slot,
     )
     assert isinstance(cond, Stage3Conductor)
+    # msg-4440 D-1'': the adapter-error side channel reaches the Conductor main() will read.
+    assert cond.conductor._stop_slot is slot
     assert cond.registry.qualified_for(Role.IMPLEMENTER)[0] is implementer
     assert cond.registry.qualified_for(Role.NAYSAYER) == [naysayer]
     # PR-2b-3 D-1: [conductor].human_identity is wired into the Conductor (carve-out ① identity).
@@ -746,9 +752,9 @@ async def test_run_conductor_drives_round_trip_and_closes_sessions(
     # run_conductor calls build_conductor(settings) with no injection; patch it to inject our fakes.
     real_build = loop_runner.build_conductor
 
-    def _build(settings: MindwireSettings) -> Stage3Conductor:
+    def _build(settings: MindwireSettings, **kw: Any) -> Stage3Conductor:
         return real_build(
-            settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer
+            settings, mcp=mcp, proposer=proposer, implementer=implementer, naysayer=naysayer, **kw
         )
 
     monkeypatch.setattr(loop_runner, "build_conductor", _build)
@@ -784,13 +790,14 @@ async def test_run_conductor_stops_on_hold_through_the_real_composition_root(
     )
     real_build = loop_runner.build_conductor
 
-    def _build(settings: MindwireSettings) -> Stage3Conductor:
+    def _build(settings: MindwireSettings, **kw: Any) -> Stage3Conductor:
         return real_build(
             settings,
             mcp=mcp,
             proposer=_StubAdapter("fake-proposer", _proposer_caps()),
             implementer=_StubAdapter("fake-implementer", _exec_caps()),
             naysayer=naysayer,
+            **kw,
         )
 
     monkeypatch.setattr(loop_runner, "build_conductor", _build)
@@ -817,7 +824,7 @@ async def test_run_conductor_closes_sessions_even_when_run_raises(
             nonlocal closed
             closed = True
 
-    monkeypatch.setattr(loop_runner, "build_conductor", lambda _s: _BoomConductor())
+    monkeypatch.setattr(loop_runner, "build_conductor", lambda _s, **_kw: _BoomConductor())
     with pytest.raises(RuntimeError, match="drive boom"):
         await run_conductor(_conductor_settings())
     assert closed
@@ -826,7 +833,7 @@ async def test_run_conductor_closes_sessions_even_when_run_raises(
 def test_main_routes_to_conductor_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 
-    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+    async def _fake_run_conductor(_settings: MindwireSettings, **_kw: object) -> None:
         calls.append("conductor")
 
     async def _fake_run_loop(_settings: MindwireSettings) -> None:
@@ -843,7 +850,7 @@ def test_main_routes_to_conductor_mode(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_main_defaults_to_watcher_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 
-    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+    async def _fake_run_conductor(_settings: MindwireSettings, **_kw: object) -> None:
         calls.append("conductor")
 
     async def _fake_run_loop(_settings: MindwireSettings) -> None:
@@ -908,7 +915,7 @@ def test_main_reemits_sdk_error_marker_on_exit(
         "captured_fields": {"session_id": "exit-test-sid"},
     }
 
-    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+    async def _fake_run_conductor(_settings: MindwireSettings, **_kw: object) -> None:
         try:
             raise SdkIsErrorSignal(signal_detail)
         except SdkIsErrorSignal as sig:
@@ -975,7 +982,7 @@ def test_main_does_nothing_extra_when_the_error_has_no_sdk_signal(
     fidelity for the 99 % case that has nothing to do with the SDK.
     """
 
-    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+    async def _fake_run_conductor(_settings: MindwireSettings, **_kw: object) -> None:
         raise RuntimeError("unrelated crash")
 
     monkeypatch.setattr(loop_runner, "run_conductor", _fake_run_conductor)
@@ -1014,7 +1021,7 @@ def test_main_exits_two_and_emits_payload_on_environment_terminal(
     from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
     from spirrow_mindwire.github.client import PrRef as ClientPrRef
 
-    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+    async def _fake_run_conductor(_settings: MindwireSettings, **_kw: object) -> None:
         raise EnvironmentTerminalError(
             pr=ClientPrRef("spirrowgames", "spirrow-mindwire", 192),
             scope=Scope.ENVIRONMENT_CREDENTIAL,
@@ -1056,7 +1063,7 @@ def test_main_exit_two_payload_carries_repo_for_permission_scope(
     from spirrow_mindwire.github.client import EnvironmentTerminalError, Scope
     from spirrow_mindwire.github.client import PrRef as ClientPrRef
 
-    async def _fake_run_conductor(_settings: MindwireSettings) -> None:
+    async def _fake_run_conductor(_settings: MindwireSettings, **_kw: object) -> None:
         raise EnvironmentTerminalError(
             pr=ClientPrRef("other-owner", "other-repo", 7),
             scope=Scope.ENVIRONMENT_PERMISSION,
