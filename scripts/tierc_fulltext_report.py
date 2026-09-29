@@ -219,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     runs = {r: load_scores(getattr(a, r), set(keys)) for r in RUNS}
     text = render(runs, truths, keys, boot=a.boot, seed=a.seed)
     if a.out:
-        a.out.write_text(text, encoding="utf-8")
+        a.out.write_text(text, encoding="utf-8", newline="\n")
     sys.stdout.write(text)
     return 0
 

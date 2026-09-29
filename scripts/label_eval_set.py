@@ -399,7 +399,7 @@ def write_lock(directory: Path) -> dict[str, Any]:
         "label_runs": runs,
     }
     (directory / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n"
     )
     return manifest
 

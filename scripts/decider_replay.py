@@ -457,7 +457,11 @@ def run_tierc_replay(
             )
             print(f"decider_replay: rules snapshot {snap}", file=sys.stderr)
         done = load_done_keys(out) if (resume and out is not None) else set()
-        sink = out.open("a" if resume else "w", encoding="utf-8") if out is not None else sys.stdout
+        sink = (
+            out.open("a" if resume else "w", encoding="utf-8", newline="\n")
+            if out is not None
+            else sys.stdout
+        )
         try:
             called, skipped_done, not_sent = asyncio.run(
                 _decide_records(
@@ -481,7 +485,7 @@ def run_tierc_replay(
         )
         return 0
 
-    sink = out.open("w", encoding="utf-8") if out is not None else sys.stdout
+    sink = out.open("w", encoding="utf-8", newline="\n") if out is not None else sys.stdout
     try:
         for rec in records:
             sink.write(json.dumps(rec, ensure_ascii=False) + "\n")

@@ -266,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         + "\n",
         encoding="utf-8",
+        newline="\n",
     )
     print(json.dumps(evidence), file=sys.stderr)
     if a.endpoint is None:
@@ -273,7 +274,9 @@ def main(argv: list[str] | None = None) -> int:
 
     outs = {"full": a.out_full, "base": a.out_base}
     done = {s: (evaluated_keys(outs[s]) if a.resume else set()) for s in SIDES}
-    sinks = {s: outs[s].open("a" if a.resume else "w", encoding="utf-8") for s in sides}
+    sinks = {
+        s: outs[s].open("a" if a.resume else "w", encoding="utf-8", newline="\n") for s in sides
+    }
     try:
         t = asyncio.run(
             run(
