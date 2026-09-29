@@ -219,6 +219,29 @@ class ConductorOutcome:
     forced_naysayer_turns_saveable: int = 0
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class RouteDecision:
+    """What :meth:`Conductor._route` decided for one head (human msg-4285, Einstein msg-4281).
+
+    A keyword-only dataclass rather than a bare tuple or a ``NamedTuple``: ``is_forced`` /
+    ``is_saveable`` / ``spawn_blocked`` are three adjacent bools, and a positional form lets a
+    transposition pass the type checker. ``kw_only`` makes every construction name its fields and a
+    dataclass is not iterable, so a caller cannot unpack it positionally either — the transposition
+    is ruled out by structure, not only by a test. Every field is required so each exit of
+    ``_route`` states all six values instead of inheriting a silent default.
+
+    Exactly one of ``target_role`` / ``stop_reason`` is set. The meaning of each flag is documented
+    on :meth:`Conductor._route`.
+    """
+
+    target_role: Role | None
+    target_identity: str
+    is_forced: bool
+    is_saveable: bool
+    spawn_blocked: bool
+    stop_reason: StopReason | None
+
+
 class Conductor:
     """Serial, NEXT-driven driver for one design thread (the autonomous relay, msg-520)."""
 
@@ -288,8 +311,9 @@ class Conductor:
         self._force_only_on_explicit_human = force_naysayer_only_on_explicit_human
         # Tier-C Decider (T-decider-conductor-hook step 2). ``None`` = off (the default and the
         # pre-step-2 behaviour, byte-for-byte). When wired it is an OBSERVER: ``_decider_hook``
-        # logs a decision on every explicit ``NEXT: human`` head and never changes the routing
-        # decision ``_route`` already made (D20 monotonicity).
+        # logs a decision on a proposer's own ``NEXT: human`` head — whether ``_route`` stopped it
+        # or sent it to a forced naysayer consult — and never changes the routing decision
+        # ``_route`` already made (D20 monotonicity).
         self._decider = decider
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
@@ -498,12 +522,24 @@ class Conductor:
                 processed_msg_id = relay_msg_id
                 continue
 
-            target_role, target_identity, is_forced, is_saveable, stop_reason = self._route(
-                handoff, messages
-            )
+            route = self._route(handoff, messages)
+            target_role = route.target_role
+            target_identity = route.target_identity
+            is_forced = route.is_forced
+            is_saveable = route.is_saveable
+            spawn_blocked = route.spawn_blocked
+            stop_reason = route.stop_reason
             # Tier-C Decider hook: right after the rule-based routing decision, before it is acted
-            # on. Observation only — neither ``stop_reason`` nor ``target_role`` is read back.
-            await self._decider_hook(handoff, messages, round_index, stop_reason)
+            # on. Observation only — the hook reads ``_route``'s outputs, never writes them back.
+            await self._decider_hook(
+                handoff,
+                messages,
+                round_index,
+                stop_reason,
+                is_forced=is_forced,
+                target_role=target_role,
+                spawn_blocked=spawn_blocked,
+            )
             if target_role is None:
                 assert stop_reason is not None  # _route always sets a reason when it stops
                 # Bohr msg-179 §6 invariant: a message that carries a non-null next_participant
@@ -570,21 +606,35 @@ class Conductor:
         messages: list[dict[str, Any]],
         round_index: int,
         stop_reason: StopReason | None,
+        *,
+        is_forced: bool,
+        target_role: Role | None,
+        spawn_blocked: bool,
     ) -> None:
-        """Hand the turn to the Tier-C Decider hook (msg-4180 §4; step 2b msg-4200 / msg-4203).
+        """Hand the turn to the Tier-C Decider hook (msg-4180 §4; 2b 4200; 2c 4237/4239/4280).
 
-        The entry condition is decided inside :func:`..decider.hook.run_tierc_hook` (msg-4203:
-        "判定はフックの入口"): rule stop ``HUMAN`` **and** an author-written ``NEXT: human`` **and**
-        the author's roster role is ``proposer``. This method only lifts the one fact the hook
-        cannot see — whether the author wrote the handoff themself (a field/body mismatch also
-        resolves to ``HandoffKind.HUMAN`` but is a conductor safety valve, not somebody asking
-        the human). The hook runs the admission gate compute-only (nothing written to the
-        decisions log) and sends the turn to Lexora only when the gate produced a result
-        (msg-4196 DECIDED 1). ``stop_reason`` is the rule-stop snapshot: it decides entry and is
-        logged beside the decision, never modified.
+        Only a ``HandoffKind.HUMAN`` head reaches the hook. The rest of the entry condition is
+        decided inside :func:`..decider.hook.run_tierc_hook`: an author-written ``NEXT: human``
+        **and** the author's roster role is ``proposer`` (msg-4237 DECIDED 2c-1 — the rule stop
+        is no longer part of it, so a proposer escalation routed to a forced naysayer consult is
+        evaluated too). This method lifts the facts the hook cannot see: whether the author wrote
+        the handoff themself (a field/body mismatch also resolves to ``HandoffKind.HUMAN`` but is
+        a conductor safety valve, not somebody asking the human), and ``_route``'s own outputs —
+        ``stop_reason`` / ``is_forced`` / ``target_role`` / ``spawn_blocked`` plus the configured
+        naysayer role — from which the hook reads ``routed`` (``stop`` / ``forced_naysayer`` /
+        ``spawn_blocked``, msg-4239 / msg-4280; any other combination is logged at ERROR with no
+        row) rather than inferring it. ``spawn_blocked`` is ``_route``'s own answer; this method
+        does not call :meth:`_spawn_blocked` again (Einstein msg-4279). The hook runs the
+        admission gate compute-only (nothing written to the decisions log) and sends the turn to
+        Lexora only when the gate produced a result (msg-4196 DECIDED 1). Every value
+        passed is read only, never modified.
         """
         if self._decider is None:
             return
+        # Load-bearing since 2c: the hook's entry no longer checks the rule stop, so a proposer's
+        # valid ``NEXT: <role>`` (mismatch_reason None) would otherwise reach ``routed_from_route``
+        # and raise RoutingInvariantError. Pinned by
+        # test_conductor_proposer_non_human_handoff_never_reaches_routed_mapping.
         if handoff.kind is not HandoffKind.HUMAN:
             return
         thread_msgs = [
@@ -609,21 +659,30 @@ class Conductor:
             roster=self._roster,
             messages=thread_msgs,
             stop=stop_reason.value if stop_reason is not None else None,
+            is_forced=is_forced,
+            target_role=target_role,
+            spawn_blocked=spawn_blocked,
+            naysayer_role=self._naysayer_role,
             author_wrote_next_human=handoff.mismatch_reason is None,
             now=datetime.now(UTC),
         )
 
-    def _route(
-        self, handoff: Handoff, messages: list[dict[str, Any]]
-    ) -> tuple[Role | None, str, bool, bool, StopReason | None]:
+    def _route(self, handoff: Handoff, messages: list[dict[str, Any]]) -> RouteDecision:
         """Decide who to dispatch (``role is None`` = stop with the returned ``StopReason``).
 
-        Returns ``(target_role, target_identity, is_forced, is_saveable, stop_reason)``; exactly one
-        of ``target_role`` / ``stop_reason`` is set. ``is_saveable`` (the shadow flag) is ``True``
-        iff this forced consult is on a non-explicit-human terminal (a guard-(i) redirect or an
-        ABSENT / Q-A turn) — exactly what ``force_naysayer_only_on_explicit_human`` would drop.
-        Deciding it HERE, with the forcing logic, keeps it the single source of truth so the
-        counterfactual metric cannot drift from the lever it shadows. The routing precedence:
+        Returns a :class:`RouteDecision` (``target_role``, ``target_identity``, ``is_forced``,
+        ``is_saveable``, ``spawn_blocked``, ``stop_reason``, all by name); exactly one of
+        ``target_role`` / ``stop_reason`` is set. ``is_saveable``
+        (the shadow flag) is ``True`` iff this forced consult is on a non-explicit-human terminal (a
+        guard-(i) redirect or an ABSENT / Q-A turn) — exactly what
+        ``force_naysayer_only_on_explicit_human`` would drop. Deciding it HERE, with the forcing
+        logic, keeps it the single source of truth so the counterfactual metric cannot drift from
+        the lever it shadows. ``spawn_blocked`` is ``True`` iff this call stopped on the
+        :meth:`_spawn_blocked` branch below, and ``False`` on every other exit — decided here for
+        the same reason, so the Decider hook reads the stop from the router that made it instead
+        of re-deriving it (msg-4280 DECIDED 2c-4). Every field is set by keyword, so the three
+        bools cannot be transposed; ``test_route_spawn_blocked_true_only_on_spawn_blocked_exit``
+        pins each exit's values. The routing precedence:
 
         - **guard (i)** — a handoff to the implementer from any non-human author is the
           design→implement Tier-C gate (msg-543): redirect to the human terminal unless carve-out ①
@@ -664,7 +723,14 @@ class Conductor:
                 embodiment,
                 handoff.kind.value,
             )
-            return None, "", False, False, StopReason.HUMAN
+            return RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=True,
+                stop_reason=StopReason.HUMAN,
+            )
 
         # Self-handoff (design §6.1): the head hands to its own author. Detected here, before
         # ``spawn_instance``, because one layer down the adapter's self-filter drops the delivery
@@ -683,7 +749,14 @@ class Conductor:
                 author,
                 handoff.identity,
             )
-            return None, "", False, False, StopReason.SELF_HANDOFF
+            return RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.SELF_HANDOFF,
+            )
 
         # guard (i): design→implement Tier-C gate. The predicate itself lives in
         # :mod:`spirrow_mindwire.routing` (T-operator-board msg-2544 §C-3 single-source extraction);
@@ -716,7 +789,14 @@ class Conductor:
             )
             if verdict is GuardIVerdict.HONOR:
                 assert handoff.identity is not None
-                return handoff.role, handoff.identity, False, False, None
+                return RouteDecision(
+                    target_role=handoff.role,
+                    target_identity=handoff.identity,
+                    is_forced=False,
+                    is_saveable=False,
+                    spawn_blocked=False,
+                    stop_reason=None,
+                )
             # guard-(i) redirect is NOT an explicit human handoff: under the cost lever it does not
             # force a consult (explicit_human=False).
             return self._human_terminal(messages, explicit_human=False)
@@ -739,10 +819,24 @@ class Conductor:
 
         if handoff.kind is HandoffKind.ROLE:
             assert handoff.role is not None and handoff.identity is not None
-            return handoff.role, handoff.identity, False, False, None
+            return RouteDecision(
+                target_role=handoff.role,
+                target_identity=handoff.identity,
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=None,
+            )
 
         if handoff.kind is HandoffKind.NONE:
-            return None, "", False, False, StopReason.SETTLED
+            return RouteDecision(
+                target_role=None,
+                target_identity="",
+                is_forced=False,
+                is_saveable=False,
+                spawn_blocked=False,
+                stop_reason=StopReason.SETTLED,
+            )
 
         # ABSENT — guard (ii) / Q-A reversal (msg-542 Demand 2): a content-bearing turn that fails
         # to route still terminates at the human, but a non-naysayer's un-reviewed content must
@@ -758,8 +852,22 @@ class Conductor:
             and not self._naysayer_consulted(messages)
         ):
             # ABSENT / Q-A is a non-explicit-human terminal → saveable.
-            return self._naysayer_role, self._naysayer_identity, True, True, None
-        return None, "", False, False, StopReason.NO_HANDOFF
+            return RouteDecision(
+                target_role=self._naysayer_role,
+                target_identity=self._naysayer_identity,
+                is_forced=True,
+                is_saveable=True,
+                spawn_blocked=False,
+                stop_reason=None,
+            )
+        return RouteDecision(
+            target_role=None,
+            target_identity="",
+            is_forced=False,
+            is_saveable=False,
+            spawn_blocked=False,
+            stop_reason=StopReason.NO_HANDOFF,
+        )
 
     def _spawn_blocked(self, handoff: Handoff) -> tuple[str, str] | None:
         """``(identity, embodiment)`` when ``handoff`` names a target that must not be spawned.
@@ -842,7 +950,7 @@ class Conductor:
 
     def _human_terminal(
         self, messages: list[dict[str, Any]], *, explicit_human: bool = True
-    ) -> tuple[Role | None, str, bool, bool, StopReason | None]:
+    ) -> RouteDecision:
         """Resolve a turn that terminates at the human (explicit ``NEXT: human`` or a guard (i)
         redirect): force one naysayer consult if none has happened in this segment (Obj2 —
         consultation, not veto), otherwise stop at the human for the Tier-C decision.
@@ -865,8 +973,22 @@ class Conductor:
             # condition above is ``explicit_human OR not self._force_only_on_explicit_human``, so it
             # fires for explicit_human=False too. An explicit human handoff (explicit_human=True) is
             # kept (not saveable). Covered by test_forced_naysayer_saveable_counts_guard_i_redirect.
-            return self._naysayer_role, self._naysayer_identity, True, not explicit_human, None
-        return None, "", False, False, StopReason.HUMAN
+            return RouteDecision(
+                target_role=self._naysayer_role,
+                target_identity=self._naysayer_identity,
+                is_forced=True,
+                is_saveable=not explicit_human,
+                spawn_blocked=False,
+                stop_reason=None,
+            )
+        return RouteDecision(
+            target_role=None,
+            target_identity="",
+            is_forced=False,
+            is_saveable=False,
+            spawn_blocked=False,
+            stop_reason=StopReason.HUMAN,
+        )
 
     async def _read_control(self) -> ControlState:
         """Refresh the project's loop control state for this round and report what we act on.
@@ -1553,5 +1675,6 @@ __all__ = [
     "Conductor",
     "ConductorDispatcher",
     "ConductorOutcome",
+    "RouteDecision",
     "StopReason",
 ]

@@ -319,10 +319,11 @@ def build_eval_row(
             "roster_source": roster_source,
             "tier_c_label": handoff.tier_c_label,
             "author_wrote_next_human": author_wrote_next_human,
-            # Would the live hook's entry check (msg-4203) have let this turn in? Measurement
-            # column for the (B) estimate only — the replay calls every row regardless.
+            # Would the live hook's entry check (msg-4237 DECIDED 2c-1) have let this turn in?
+            # Measurement column for the (B) estimate only — the replay calls every row regardless.
+            # 2c dropped the rule stop from the entry; the constant ``original_stop="human"`` this
+            # call passed under 2b always satisfied it, so the column's values are unchanged.
             "live_entry": is_tierc_entry(
-                original_stop="human",
                 author_wrote_next_human=author_wrote_next_human,
                 author_role=_lookup_casefold(roster, head.author),
             ),
