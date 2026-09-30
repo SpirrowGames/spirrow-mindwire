@@ -153,3 +153,119 @@ async def test_gate_fetch_pr_diff_measures_the_same_bytes_as_the_helper() -> Non
 def test_cli_parser_registers_pr_diff_size() -> None:
     args = cli._build_parser().parse_args(["pr-diff-size", "--repo", _REPO, "--pr", "5"])
     assert (args.command, args.repo, args.pr, args.head) == ("pr-diff-size", _REPO, 5, None)
+
+
+# --- Default CLI paths (PR #396 gate, REQUEST_CHANGES: `untested` at pr_diff_size.py:114) ---
+# The typical invocation `mindwire pr-diff-size --repo o/r --pr N` omits both `--head` (→
+# local_head_sha) and the injected client (→ _measure_with_default_client). These tests run
+# those two paths for real: a real `git` repository for the head, and the real GitHubClient
+# class constructed by the default path (only its HTTP transport is swapped for a mock).
+
+
+def _git(cwd: Any, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def git_head(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "commit", "-q", "--allow-empty", "-m", "c1")
+    monkeypatch.chdir(tmp_path)
+    return _git(tmp_path, "rev-parse", "HEAD")
+
+
+def test_local_head_sha_is_git_rev_parse_head(git_head: str) -> None:
+    assert pr_diff_size.local_head_sha() == git_head
+    assert len(git_head) == 40
+
+
+def test_omitted_head_measures_the_local_head_commit(
+    git_head: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Metadata reports a stale head; the default must measure local HEAD, not metadata.
+    calls: list[str] = []
+    handler = _handler(diffs={git_head: "x" * 10}, calls=calls, meta_head=_STALE_HEAD)
+    code, out, _err = _run(handler, None, capsys)
+    assert code == pr_diff_size.EXIT_FIX_NOW
+    assert f"head={git_head}" in out and "decision=fix-now" in out
+    assert any(p.endswith(f"...{git_head}") for p in calls)
+    assert not any(p.endswith(f"...{_STALE_HEAD}") for p in calls)
+
+
+def test_omitted_head_outside_a_git_repo_fails_loud(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    code = pr_diff_size.run(_REPO, _PR.number, None, client=_NeverCalled())
+    captured = capsys.readouterr()
+    assert code == pr_diff_size.EXIT_ERROR
+    assert "decision=" not in captured.out
+    assert "pr-diff-size: error:" in captured.err
+
+
+def _patch_default_client(
+    monkeypatch: pytest.MonkeyPatch, handler: Any, constructed: list[dict[str, Any]]
+) -> None:
+    """Make the default path's real GitHubClient talk to ``handler`` instead of the network."""
+    from spirrow_mindwire.github import client as client_mod
+
+    real = client_mod.GitHubClient
+
+    class _Recording(real):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            constructed.append({"args": args, "kwargs": dict(kwargs)})
+            kwargs.setdefault("token", "tok")
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(client_mod, "GitHubClient", _Recording)
+
+
+def test_omitted_client_uses_the_default_github_client(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    t = pr_review._DIFF_WARN_THRESHOLD
+    constructed: list[dict[str, Any]] = []
+    _patch_default_client(monkeypatch, _handler(diffs={_FRESH_HEAD: "x" * (t + 1)}), constructed)
+    code = pr_diff_size.run(_REPO, _PR.number, _FRESH_HEAD)
+    out = capsys.readouterr().out
+    # Constructed exactly once, with no arguments: token and transport are the defaults.
+    assert constructed == [{"args": (), "kwargs": {}}]
+    assert code == pr_diff_size.EXIT_SPLIT
+    assert f"original_chars={t + 1}" in out and "decision=split" in out
+
+
+def test_omitted_client_http_failure_fails_loud(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    constructed: list[dict[str, Any]] = []
+    _patch_default_client(monkeypatch, _handler(diffs={}), constructed)
+    code = pr_diff_size.run(_REPO, _PR.number, "deadbeef")
+    captured = capsys.readouterr()
+    assert len(constructed) == 1
+    assert code == pr_diff_size.EXIT_ERROR
+    assert "decision=" not in captured.out
+    assert "is the commit pushed?" in captured.err
+
+
+def test_fully_default_invocation_local_head_and_default_client(
+    git_head: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `mindwire pr-diff-size --repo o/r --pr N` end to end through the CLI entry point.
+    constructed: list[dict[str, Any]] = []
+    _patch_default_client(monkeypatch, _handler(diffs={git_head: "x" * 5}), constructed)
+    args = cli._build_parser().parse_args(["pr-diff-size", "--repo", _REPO, "--pr", "7"])
+    code = pr_diff_size.run(args.repo, args.pr, args.head)
+    out = capsys.readouterr().out
+    assert len(constructed) == 1
+    assert code == pr_diff_size.EXIT_FIX_NOW
+    assert f"head={git_head}" in out and "original_chars=5" in out
