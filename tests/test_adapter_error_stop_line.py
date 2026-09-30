@@ -16,6 +16,7 @@ handed and re-raises the exception UNCHANGED; ``loop_runner.main`` is the single
 from __future__ import annotations
 
 import logging
+import typing
 from pathlib import Path
 from typing import Any
 
@@ -199,7 +200,10 @@ def test_adapter_raise_sites_carry_code() -> None:
 def test_delivery_error_base_declares_code_as_none() -> None:
     # The contract lives on the base class (human msg-4910), and its default is None rather than
     # a generic string (Einstein msg-5001).
-    assert "code" in vars(AdapterDeliveryError)
+    # The declaration is checked through the MRO-aware type hints, not ``vars()`` of this exact
+    # class, so moving the annotation to an intermediate base or mixin still passes (PR-gate
+    # advisory on #389). An undeclared attribute would have no hint and fail here.
+    assert typing.get_type_hints(AdapterDeliveryError)["code"] == (str | None)
     assert AdapterDeliveryError.code is None
     assert AdapterDeliveryError("x").code is None
 
