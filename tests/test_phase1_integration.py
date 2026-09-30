@@ -28,6 +28,7 @@ from spirrow_mindwire.dispatcher.event_log import (
     EVENT_FIELD_FAILED_EVENT_ID,
     EVENT_KIND_DELIVERY_FAILED,
     EVENT_KIND_REPLY_SENT,
+    EVENT_KIND_SPAWN_READY,
 )
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
 from spirrow_mindwire.value_objects import (
@@ -157,7 +158,9 @@ async def test_smoke_proposer_round_trip(tmp_path: Path) -> None:
     assert posted_body.startswith("reply text")
     assert posted_body.rstrip().splitlines()[-1].startswith("<!-- source:")
     assert gateway.posts[0]["idempotency_key"] == f"{handle.session_id}:1"
-    assert [e.kind for e in events] == [EVENT_KIND_REPLY_SENT]
+    # T43: the spawn's connect logs spawn.ready first, then the turn's reply.sent.
+    assert [e.kind for e in events] == [EVENT_KIND_SPAWN_READY, EVENT_KIND_REPLY_SENT]
+    events = events[1:]
     assert events[0].fields[EVENT_FIELD_AUTHOR] == "proposer-1"  # T26: author = instance_id
     # anchor #6 (I3 v2.2 / T26): the chatroom author and the event-log author are
     # the same identity SOT — assert the equality directly so a future one-sided
@@ -175,8 +178,8 @@ async def test_delivery_failure_logs_failed_event(tmp_path: Path) -> None:
         await disp.dispatch(handle, _event())
 
     assert gateway.posts == []  # no reply posted on failure
-    assert [e.kind for e in events] == [EVENT_KIND_DELIVERY_FAILED]
-    failed = events[0]
+    assert [e.kind for e in events] == [EVENT_KIND_SPAWN_READY, EVENT_KIND_DELIVERY_FAILED]
+    failed = events[1]
     assert failed.fields[EVENT_FIELD_AUTHOR] == "proposer-1"  # I3 v2.2 / T26: author = instance_id
     assert failed.fields[EVENT_FIELD_FAILED_EVENT_ID] == "01JEVENT"  # the failed ChatroomEvent id
     assert failed.fields[EVENT_FIELD_ERROR]  # non-empty error string

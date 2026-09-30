@@ -31,9 +31,13 @@ EVENT_FIELD_IDEMPOTENCY_KEY = "idempotency_key"
 EVENT_FIELD_FAILED_EVENT_ID = "failed_event_id"
 EVENT_FIELD_ERROR = "error"
 EVENT_FIELD_DENIAL = "denial"
+EVENT_FIELD_AFTER_S = "after_s"
+EVENT_FIELD_CC_SESSION_UUID = "cc_session_uuid"
 
 EVENT_KIND_REPLY_SENT = "reply.sent"
 EVENT_KIND_DELIVERY_FAILED = "delivery.failed"
+EVENT_KIND_SPAWN_READY = "spawn.ready"
+EVENT_KIND_SESSION_CC_UUID = "session.cc_session_uuid"
 
 
 def reply_sent_event(
@@ -102,9 +106,62 @@ def delivery_failed_event(
     )
 
 
+def spawn_ready_event(handle: SessionHandle, *, after_s: float) -> Event:
+    """Build the observational ``spawn.ready`` entry (T43, Bohr msg-4888 / msg-4957).
+
+    Emitted by an adapter at the moment its SDK ``connect()`` has returned — the
+    point after which the returned handle is usable. ``after_s`` is the wall time
+    that connect took. No other readiness word exists: ``launched_unconfirmed``
+    was dropped because no current adapter would emit it (Einstein msg-4887).
+
+    The "connect done ⇒ ready" reading holds only while no out-of-process MCP
+    server is attached; ``tests/test_role_tool_surface.py`` pins that premise and
+    goes red if it stops being true.
+
+    The adapter is recorded under the anchor #6 key ``adapter_id`` rather than a
+    bare ``adapter`` so the same fact is not spelled two ways in one log.
+    """
+    return Event(
+        event_id=new_ulid(),
+        occurred_at=datetime.now(UTC),
+        kind=EVENT_KIND_SPAWN_READY,
+        fields={
+            EVENT_FIELD_AUTHOR: handle.instance_id,
+            EVENT_FIELD_SESSION_ID: handle.session_id,
+            EVENT_FIELD_ADAPTER_ID: handle.adapter_id,
+            EVENT_FIELD_AFTER_S: round(after_s, 3),
+        },
+    )
+
+
+def cc_session_uuid_event(handle: SessionHandle, *, cc_session_uuid: str) -> Event:
+    """Build the observational ``session.cc_session_uuid`` entry (T45 loop side).
+
+    Links mindwire's per-spawn ULID (``session_id``) to the Claude Code session
+    UUID the SDK reports in its ``SystemMessage(subtype="init")``. The two are
+    different identifiers and are never stored under the same name (Bohr
+    msg-4884 §2). Emitted when the adapter first observes the UUID for a session
+    and again only if it changes; pushing it to Conclair waits on the schema
+    decided with T47 (msg-4957 §3).
+    """
+    return Event(
+        event_id=new_ulid(),
+        occurred_at=datetime.now(UTC),
+        kind=EVENT_KIND_SESSION_CC_UUID,
+        fields={
+            EVENT_FIELD_AUTHOR: handle.instance_id,
+            EVENT_FIELD_SESSION_ID: handle.session_id,
+            EVENT_FIELD_ADAPTER_ID: handle.adapter_id,
+            EVENT_FIELD_CC_SESSION_UUID: cc_session_uuid,
+        },
+    )
+
+
 __all__ = [
     "EVENT_FIELD_ADAPTER_ID",
+    "EVENT_FIELD_AFTER_S",
     "EVENT_FIELD_AUTHOR",
+    "EVENT_FIELD_CC_SESSION_UUID",
     "EVENT_FIELD_DENIAL",
     "EVENT_FIELD_ERROR",
     "EVENT_FIELD_FAILED_EVENT_ID",
@@ -114,6 +171,10 @@ __all__ = [
     "EVENT_FIELD_SESSION_ID",
     "EVENT_KIND_DELIVERY_FAILED",
     "EVENT_KIND_REPLY_SENT",
+    "EVENT_KIND_SESSION_CC_UUID",
+    "EVENT_KIND_SPAWN_READY",
+    "cc_session_uuid_event",
     "delivery_failed_event",
     "reply_sent_event",
+    "spawn_ready_event",
 ]

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -42,11 +43,13 @@ from claude_agent_sdk import (
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
+    SystemMessage,
     TextBlock,
     ToolPermissionContext,
 )
 
 from ..conductor.handoff import build_handoff_protocol_block
+from ..dispatcher.event_log import cc_session_uuid_event, spawn_ready_event
 from ..exceptions import (
     AdapterDeliveryError,
     AdapterHaltError,
@@ -60,6 +63,7 @@ from ..value_objects import (
     Capability,
     ChatroomEvent,
     ErrorInfo,
+    Event,
     EventType,
     HealthStatus,
     ReplyDraft,
@@ -140,6 +144,10 @@ class _Session:
     # ``ClaudeAgentOptions``.
     options: Any = None
     error: ErrorInfo | None = None
+    # T45 (loop side): the Claude Code session UUID from the SDK's
+    # ``SystemMessage(subtype="init")``. Not ``session_id`` — that name belongs to
+    # mindwire's per-spawn ULID on the handle (Bohr msg-4884 §2).
+    cc_session_uuid: str | None = None
 
 
 class ClaudeCodeSdkSpawnError(AdapterSpawnError):
@@ -184,6 +192,7 @@ async def _drain_reply(
     client: _SdkClient,
     *,
     turn_timeout_seconds: float | None = None,
+    on_init: Callable[[str], None] | None = None,
 ) -> str:
     """Drain one SDK response, returning the concatenated assistant text.
 
@@ -204,6 +213,12 @@ async def _drain_reply(
     The caller in :meth:`ClaudeCodeSdkAdapter.deliver_event` picks the
     ``ErrorInfo.code`` off the exception type (``adapter.sdk_is_error`` vs
     ``adapter.delivery_failed`` vs ``adapter.turn_timeout``).
+
+    ``on_init`` (T45) is called with the Claude Code session UUID when the stream
+    carries a ``SystemMessage(subtype="init")`` with a non-empty ``session_id``.
+    It is called before the turn's outcome is known, so the UUID is recorded
+    even for a turn that then fails — that is the turn someone will want to find
+    the transcript of.
     """
     if turn_timeout_seconds is not None:
         # PR-gate #299 round 2 blocker: ``asyncio.wait_for`` cannot tell OUR
@@ -222,7 +237,7 @@ async def _drain_reply(
         timeout_ctx = asyncio.timeout(turn_timeout_seconds)
         try:
             async with timeout_ctx:
-                return await _drain_reply(client, turn_timeout_seconds=None)
+                return await _drain_reply(client, turn_timeout_seconds=None, on_init=on_init)
         except TimeoutError as exc:
             if timeout_ctx.expired():
                 raise SdkTurnTimeoutError(
@@ -239,6 +254,8 @@ async def _drain_reply(
                     chunks.append(block.text)
         elif isinstance(msg, ResultMessage):
             final = msg
+        elif on_init is not None and (uuid := _init_session_uuid(msg)) is not None:
+            on_init(uuid)
     if final is None:
         # Incomplete / aborted turn — treat as a protocol error rather than a
         # silent empty reply, so deliver_event can mark the session FAILED.
@@ -257,6 +274,35 @@ async def _drain_reply(
         emit_sdk_error_marker(detail)
         raise SdkIsErrorSignal(detail)
     return "".join(chunks)
+
+
+def _init_session_uuid(msg: Any) -> str | None:
+    """The Claude Code session UUID carried by an ``init`` system message, else ``None``."""
+    if not isinstance(msg, SystemMessage) or msg.subtype != "init":
+        return None
+    value = msg.data.get("session_id") if isinstance(msg.data, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+async def _emit_observational(ctx: SpawnContext, event: Event) -> None:
+    """Hand ``event`` to ``ctx.on_event_log`` without letting it break the caller (I7).
+
+    The dispatcher's own sink is already isolated, but an adapter cannot assume
+    it was handed that one; a raising log callback must not turn a successful
+    spawn or turn into a failed one.
+    """
+    try:
+        await ctx.on_event_log(event)
+    except Exception:
+        logger.warning("on_event_log raised for %s; isolated per I7", event.kind, exc_info=True)
+
+
+async def _note_cc_session_uuid(session: Any, handle: SessionHandle, uuid: str | None) -> None:
+    """Record ``uuid`` on ``session`` and log it, once per distinct value (T45 loop side)."""
+    if uuid is None or uuid == session.cc_session_uuid:
+        return
+    session.cc_session_uuid = uuid
+    await _emit_observational(session.ctx, cc_session_uuid_event(handle, cc_session_uuid=uuid))
 
 
 async def _shutdown(client: _SdkClient) -> None:
@@ -431,6 +477,7 @@ class ClaudeCodeSdkAdapter:
             # neither (see ``_cli_selection``).
             **cli_selection_kwargs(model=self._model, cli_path=self._cli_path),
         )
+        connect_started = time.monotonic()
         try:
             client = self._client_factory(options)
             await client.connect()
@@ -458,6 +505,10 @@ class ClaudeCodeSdkAdapter:
             # so the harness can derive the source marker from it on every
             # reply without asking the agent to declare it (D3 / msg-805).
             options=options,
+        )
+        # T43: connect() has returned, so this handle is usable now.
+        await _emit_observational(
+            ctx, spawn_ready_event(handle, after_s=time.monotonic() - connect_started)
         )
         return handle
 
@@ -531,9 +582,10 @@ class ClaudeCodeSdkAdapter:
         # than in a shared helper because the wrapping ``ClaudeCodeSdkDeliveryError``
         # is class-specific and the ``on_reply`` seam is only present in the
         # adapter, not the drain.
+        observed_uuid: list[str] = []
         try:
             await session.client.query(_build_prompt(event, session.own_role))
-            body = await _drain_reply(session.client)
+            body = await _drain_reply(session.client, on_init=observed_uuid.append)
         except SdkIsErrorSignal as sig:
             session.state = SessionState.FAILED
             session.error = ErrorInfo(
@@ -554,6 +606,10 @@ class ClaudeCodeSdkAdapter:
             raise ClaudeCodeSdkDeliveryError(
                 f"deliver_event failed for session {handle.session_id}: {exc}"
             ) from exc
+        finally:
+            # T45: recorded on success AND failure — a failed turn is the one whose
+            # transcript someone will go looking for.
+            await _note_cc_session_uuid(session, handle, next(iter(observed_uuid), None))
 
         # on_reply outside the SDK-drain try but still inside a try — the
         # pre-change comment ("on_reply is inside the try: a raising dispatcher
