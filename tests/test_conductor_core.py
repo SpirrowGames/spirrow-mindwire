@@ -2002,24 +2002,18 @@ async def test_admission_defers_on_pending_ci_without_firing_the_gate() -> None:
 
 
 @pytest.mark.anyio
-async def test_ci_wait_is_not_a_human_stop() -> None:
-    # The stop reason is deliberately its own value and NOT `human`. The sweep's notification
-    # predicate is the KEY SET of deploy/lib/StopReason.ps1's phrase map, so a reason absent
-    # from that map is silent — which is the intended treatment for "CI is still running", and
-    # is why `ci_wait` must not be spelled `human` to reuse an existing branch.
+async def test_ci_wait_is_its_own_value_not_human() -> None:
+    # The stop reason is deliberately its own value and NOT `human`. Spelling it `human` to
+    # reuse an existing branch would make "CI is still running" wake a person.
+    #
+    # This test pins only the VALUE. Whether `ci_wait` stays out of the notification set is
+    # NOT checked here any more: a hand-written copy of that set used to live here, and it
+    # went stale (5 values, missing `self_handoff_to_human`; T-stop-reason-map-drift-pin,
+    # Bohr msg-4825 §1). The closed-world check is the D-4-6 block in
+    # tests/Test-StopReasonPhrase.ps1. It imports this enum and asserts that every value is
+    # either a key of Get-StopReasonPhraseMap (notifying) or in its test-only `$unnotified`
+    # ledger (silent, which is where `ci_wait` lives), and never both.
     assert StopReason.CI_WAIT.value == "ci_wait"
-    # The VALUE is what deploy/lib/StopReason.ps1's phrase map is keyed by, and membership in
-    # that map is the sweep's notification predicate. Mirrored here rather than imported
-    # (the map is PowerShell); Test-StopReasonPhrase.ps1 pins the map's own key set, so the two
-    # pins together catch a drift in either direction.
-    notifying: set[str] = {
-        "human",
-        "no_handoff_to_human",
-        "no_progress_to_human",
-        "round_cap",
-        "empty_thread",
-    }
-    assert StopReason.CI_WAIT.value not in notifying
 
 
 @pytest.mark.anyio

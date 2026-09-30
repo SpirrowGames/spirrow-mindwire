@@ -37,6 +37,11 @@
 #               'human' via R3, which IS in the map above.
 # This set is not a narrowing of the notification predicate (note 1): every reason that means
 # "the loop parked and needs a person" is still in the map. Do not add 'ci_wait' to it.
+# 'adapter_error' is silent here too. Its exit is non-zero, so it takes the quarantine path,
+# where the K alert sounds. That is not this map's notification.
+# Exhaustiveness is checked in CI: the $unnotified ledger in tests/Test-StopReasonPhrase.ps1
+# (D-4-6) must cover, together with this map's keys, every conductor StopReason value, with
+# no reason in both (T-stop-reason-map-drift-pin).
 #
 # 2026-09-14 (design §6.1): 'self_handoff_to_human' joined the MAP, not this set. A thread
 # whose head hands to its own author cannot move until a person edits that head, which is
