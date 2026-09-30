@@ -210,6 +210,8 @@ def test_omitted_head_outside_a_git_repo_fails_loud(
     assert code == pr_diff_size.EXIT_ERROR
     assert "decision=" not in captured.out
     assert "pr-diff-size: error:" in captured.err
+    # git's own stderr reaches the caller, not only the exit status.
+    assert "not a git repository" in captured.err.lower()
 
 
 def _patch_default_client(

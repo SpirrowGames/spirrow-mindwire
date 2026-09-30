@@ -94,9 +94,13 @@ async def measure(client: _DiffSource, pr: PrRef, head_sha: str) -> DiffSize:
 
 def local_head_sha() -> str:
     """``git rev-parse HEAD`` of the current directory; raises on failure (no empty default)."""
-    out = subprocess.run(
-        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-    ).stdout.strip()
+    proc = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        # Carry git's own stderr (e.g. "fatal: not a git repository") so the
+        # caller sees why it failed, not only the exit status.
+        detail = (proc.stderr or "").strip() or f"exit status {proc.returncode}"
+        raise RuntimeError(f"git rev-parse HEAD failed: {detail}")
+    out = proc.stdout.strip()
     if not out:
         raise RuntimeError("git rev-parse HEAD returned nothing")
     return out
