@@ -7,6 +7,7 @@ transport (only the chatroom + models are faked) to prove the production round-t
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1375,6 +1376,33 @@ async def test_pr_gate_comment_stops_at_human_without_dispatch() -> None:
     assert outcome.stop_reason is StopReason.HUMAN
     assert disp.dispatches == []  # no implementer dispatch on COMMENT
     assert mcp.posts[-1]["author"] == "pr-gate-relay"  # the verdict relay is still posted
+
+
+class _SkipApprovePrGate(_ScriptedPrGate):
+    """A :class:`_ScriptedPrGate` whose outcomes carry ``skipped_head_unchanged=True``."""
+
+    async def fire_pr_review(
+        self, *, project: str, pr_ref: str, design_thread: str, implementer: str | None = None
+    ) -> tuple[ThreadRef, PrReviewOutcome, dict[str, Any]]:
+        ref, outcome, relay = await super().fire_pr_review(
+            project=project, pr_ref=pr_ref, design_thread=design_thread, implementer=implementer
+        )
+        return ref, dataclasses.replace(outcome, skipped_head_unchanged=True), relay
+
+
+@pytest.mark.anyio
+async def test_pr_gate_head_unchanged_approve_stops_at_human_without_dispatch() -> None:
+    # T-infra-failure-posts-empty-rc msg-4802 test 5: after C-1 the head-unchanged skip only ever
+    # re-posts APPROVE. That outcome must stop at the human and spawn nobody — the conductor does
+    # not read ``skipped_head_unchanged``; routing is verdict-driven and APPROVE is non-RC.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _SkipApprovePrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()
+    assert gate.fired == ["acme/widgets#7"]
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches == []
 
 
 @pytest.mark.anyio
