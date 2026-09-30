@@ -83,10 +83,7 @@ Cost invariants worth stating outright, because the spec depends on them:
   processes one candidate per run, and a session takes wall-clock time. Measured 2026-09-17 to
   2026-09-30 (method under ``BASE`` below): a session launched on the progress path ran a median
   of 3.2 min (p90 23.4 min, n=424), and the most progress-path launches any one thread received
-  inside 60 minutes was 6. The figure that stood here before, "15-25 min -> effective 2-4
-  launches/hour/thread", understates the rate: nothing in the environment holds a progressing
-  thread to 4 launches an hour. This is a *load-bearing operational premise*, not a design
-  guarantee.
+  inside 60 minutes was 6. This is a *load-bearing operational premise*, not a design guarantee.
 - **``eligible_at`` is a display value only**. It is emitted on every verdict (for report-mode
   audit and for the log) but never persisted to the record — the record only stores observations
   (``last_launch_at`` etc.), and :func:`decide` recomputes the eligibility each call. Storing a
@@ -134,13 +131,9 @@ from .handoff import HUMAN_TOKEN, NONE_TOKEN, parse_next_token
 #     - Sessions that posted at least one round (n=504): p25 2.2 min, median 5.7 min, p75 13.4
 #       min, p90 25.2 min, max 64.9 min; 80% shorter than 15 min.
 #     - All sessions: 8% ran 15 min or longer.
-#   The figure that stood here before, "~15-25 min typical (measured 2026-08-11)", and the claim
-#   built on it, that 15 min sits at the typical session floor, do not describe these sessions:
-#   15 min is near the 80th percentile of a session that did work, not its floor. The same
-#   method on the 2026-08-02 to 2026-08-11 logs gives a median of 6.2 min for such sessions
-#   (n=102), so the older figure was not reproduced for its own period either; how it was
-#   obtained is not recorded. 15 min therefore stands as a policy call on the no-progress relaunch
-#   rate, not as a value derived from session length.
+#   15 min is near the 80th percentile of a session that did work, so it is not a session-length
+#   floor. It stands as a policy call on the no-progress relaunch rate, not as a value derived
+#   from session length.
 #
 # CAP
 #   The steady-state ceiling for the degenerate path. At 60 min a "spin" thread produces 1
