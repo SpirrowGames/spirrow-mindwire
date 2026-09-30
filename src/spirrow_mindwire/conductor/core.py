@@ -557,10 +557,14 @@ class Conductor:
                                 implementer_identity,
                             )
                             sessions[implementer_identity] = handle
+                        # R-1b (T-dispatched-turn msg-4871 §3): ``route_msg`` was posted after
+                        # this round's fetch, so it is not in ``messages``. The context builder
+                        # requires the trigger to be present; append it NON-destructively so
+                        # nothing else this round reads sees a changed list.
                         await self._dispatch_recording(
                             handle,
                             route_msg,
-                            messages,
+                            [*messages, route_msg],
                             rounds=round_index,
                             forced=forced,
                             forced_saveable=forced_saveable,
@@ -592,10 +596,12 @@ class Conductor:
                     sessions[implementer_identity] = handle
                 # Dispatch the implementer on the RELAY event (the verdict + critique), not its own
                 # pr-review trigger — else it wakes blind to what it must fix (Tier B msg-567 #1).
+                # R-1b: ``relay_msg`` post-dates this round's fetch; hand the builder
+                # ``[*messages, relay_msg]`` (a new list — ``messages`` stays as fetched).
                 await self._dispatch_recording(
                     handle,
                     relay_msg,
-                    messages,
+                    [*messages, relay_msg],
                     rounds=round_index,
                     forced=forced,
                     forced_saveable=forced_saveable,
