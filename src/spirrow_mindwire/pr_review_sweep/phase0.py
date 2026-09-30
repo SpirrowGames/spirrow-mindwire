@@ -134,11 +134,11 @@ _LIVENESS_STATUSES = frozenset({"active", "awaiting_reply"})
 #: status this deployment has never seen is out of scope rather than swept.
 INTAKE_STATUSES = frozenset({"parked", "active", "awaiting_reply"})
 
-#: The statuses that mean the thread is already finished (:data:`FINISHED_STATUSES`) are
-#: defined once in :mod:`spirrow_mindwire.chatroom.status` and re-exported here, because the
-#: sweep's head-skip admission reads the same set (T-sweep-admission-ignores-thread-status).
-#: Here it is used only so an exclusion can say *why* it happened -- an unrecognised status
-#: is excluded too, for a different reason.
+# The statuses that mean the thread is already finished (:data:`FINISHED_STATUSES`) are
+# defined once in :mod:`spirrow_mindwire.chatroom.status` and re-exported here, because the
+# sweep's head-skip admission reads the same set (T-sweep-admission-ignores-thread-status).
+# Here it is used only so an exclusion can say *why* it happened -- an unrecognised status
+# is excluded too, for a different reason.
 
 #: Exclusion reasons. Two, not one: see the module docstring.
 OUT_OF_SCOPE_FINISHED = "out-of-scope-finished"
