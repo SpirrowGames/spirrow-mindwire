@@ -80,8 +80,10 @@ Cost invariants worth stating outright, because the spec depends on them:
   the sweep's full cadence) — that is intentional (the human-approved invariant "a progressing
   thread never backs off") and is instead bounded by the environment: Windows scheduler's
   ``MultipleInstancesPolicy=IgnoreNew`` keeps the conductor to one live process, the conductor
-  processes one candidate per run, and measured session length is 15-25 min -> effective 2-4
-  launches/hour/thread. This is a *load-bearing operational premise*, not a design guarantee.
+  processes one candidate per run, and a session takes wall-clock time. Measured 2026-09-17 to
+  2026-09-30 (method under ``BASE`` below): a session launched on the progress path ran a median
+  of 3.2 min (p90 23.4 min, n=424), and the most progress-path launches any one thread received
+  inside 60 minutes was 6. This is a *load-bearing operational premise*, not a design guarantee.
 - **``eligible_at`` is a display value only**. It is emitted on every verdict (for report-mode
   audit and for the log) but never persisted to the record — the record only stores observations
   (``last_launch_at`` etc.), and :func:`decide` recomputes the eligibility each call. Storing a
@@ -114,11 +116,24 @@ from .handoff import HUMAN_TOKEN, NONE_TOKEN, parse_next_token
 #   ``MultipleInstancesPolicy=IgnoreNew`` does that on its own (see docs/deploy.md's task table),
 #   because a tick that fires while a session is still running is dropped. So BASE is not
 #   required to be >= session length + 1 tick, and 15 min does not meet that bound: sessions are
-#   ``PT4H`` (14400 s) worst case (kill) and ~15-25 min typical (measured 2026-08-11 on this
-#   project's threads). Consequence: after a session at or above the typical floor ends, the
-#   next tick already finds BASE elapsed, so BASE only delays a relaunch after a session shorter
-#   than 15 min. 15 min is set at the typical session floor so that a short no-progress run is
-#   held back to roughly the pace of a normal one, without adding delay to normal-length runs.
+#   ``PT4H`` (14400 s) worst case (kill).
+#
+#   What BASE does in practice: it is the floor on how soon a thread that made no progress is
+#   launched again. A session that itself ran 15 min or longer has used BASE up by the time it
+#   ends, so BASE only delays the relaunch after a shorter session, and that is nearly all of
+#   them.
+#
+#   Measured 2026-09-17 to 2026-09-30 from the wrapper's ``conductor-YYYY-MM-DD.log`` files on
+#   the conductor host: all projects, wall clock from a candidate's ``head_skip LAUNCH`` line to its
+#   ``-> exit=`` line, 1294 sessions.
+#     - Sessions followed by a no-progress relaunch, the ones BASE acts on (n=796): median under
+#       1 min, p90 6.0 min, 96% shorter than 15 min.
+#     - Sessions that posted at least one round (n=504): p25 2.2 min, median 5.7 min, p75 13.4
+#       min, p90 25.2 min, max 64.9 min; 80% shorter than 15 min.
+#     - All sessions: 8% ran 15 min or longer.
+#   15 min is near the 80th percentile of a session that did work, so it is not a session-length
+#   floor. It stands as a policy call on the no-progress relaunch rate, not as a value derived
+#   from session length.
 #
 # CAP
 #   The steady-state ceiling for the degenerate path. At 60 min a "spin" thread produces 1
