@@ -243,8 +243,8 @@ trap {
 
 # --- logging ------------------------------------------------------------------------------------
 # At a short sweep interval the common tick is "nothing moved", and writing a dozen lines for that
-# would put a dozen lines per tick of noise every day between the entries that matter. So detail is buffered and only
-# committed once the tick proves it did something; an idle tick collapses to a single line.
+# would bury the entries that matter under thousands of lines of noise a day. So detail is buffered
+# and only committed once the tick proves it did something; an idle tick collapses to a single line.
 $script:pendingLines = New-Object System.Collections.Generic.List[string]
 $script:logCommitted = $false
 
