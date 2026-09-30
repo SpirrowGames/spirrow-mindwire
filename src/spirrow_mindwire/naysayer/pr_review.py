@@ -49,7 +49,7 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any
+from typing import Any, NoReturn
 
 from ..github.client import (
     CiState,
@@ -2694,8 +2694,12 @@ class NaysayerPrReviewDriver:
           as before this change.
         """
         commit_id = receipt.head_sha or None
-        attempt = 1
-        while True:
+        # Bounded by construction: at most _SUBMIT_MAX_ATTEMPTS iterations. Every exit is
+        # explicit in this body — ``return`` on success / LANDED / fallback, ``raise`` on
+        # everything else (PR-gate #366 advisory: termination must not rest on a helper's
+        # side effect). The final attempt can never take the retry branch
+        # (``attempt < _SUBMIT_MAX_ATTEMPTS`` is false), so it always reaches the raise.
+        for attempt in range(1, _SUBMIT_MAX_ATTEMPTS + 1):
             try:
                 await self._github.submit_review(
                     pr, event=receipt.event, body=receipt.body, commit_id=commit_id
@@ -2741,10 +2745,13 @@ class NaysayerPrReviewDriver:
                             )
                             return
                         if state is LandedState.NOT_LANDED:
-                            attempt += 1
                             continue
                         # UNKNOWN: fail closed — re-raise the original error below.
                 await self._classify_and_reraise(pr, exc, origin="submit")
+                raise  # unreachable — _classify_and_reraise is NoReturn
+        raise AssertionError(  # pragma: no cover - the last attempt always returns or raises
+            "unreachable: _submit_review's final attempt returns or raises"
+        )
 
     async def _retry_guard(self, pr: PrRef, *, head_sha: str) -> LandedState:
         """Idempotency guard before a submit retry: has our review for ``head_sha`` landed?
@@ -2759,7 +2766,7 @@ class NaysayerPrReviewDriver:
             reviews = await self._github.fetch_pr_reviews_strict(pr)
         except GitHubHTTPError as read_exc:
             await self._classify_and_reraise(pr, read_exc, origin="submit-retry-guard")
-            raise  # unreachable — _classify_and_reraise always raises
+            raise  # unreachable — _classify_and_reraise is NoReturn
         return landed(
             reviews,
             head_sha=head_sha,
@@ -2786,8 +2793,11 @@ class NaysayerPrReviewDriver:
             )
         except GitHubHTTPError as fallback_exc:
             await self._classify_and_reraise(pr, fallback_exc, origin="submit-comment-fallback")
+            raise  # unreachable — _classify_and_reraise is NoReturn
 
-    async def _classify_and_reraise(self, pr: PrRef, exc: GitHubHTTPError, *, origin: str) -> None:
+    async def _classify_and_reraise(
+        self, pr: PrRef, exc: GitHubHTTPError, *, origin: str
+    ) -> NoReturn:
         """Classify a :class:`GitHubHTTPError`, probe if terminal, then raise the typed variant.
 
         Central funnel used by both the primary submit and the same-identity 422 COMMENT
@@ -3006,7 +3016,7 @@ class NaysayerPrReviewDriver:
             prior = await self._github.fetch_pr_reviews_strict(pr)
         except GitHubHTTPError as read_exc:
             await self._classify_and_reraise(pr, read_exc, origin="read")
-            raise  # unreachable — _classify_and_reraise always raises
+            raise  # unreachable — _classify_and_reraise is NoReturn
         head_landed = landed(
             prior,
             head_sha=ci.head_sha,
