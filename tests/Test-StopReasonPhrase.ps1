@@ -248,9 +248,22 @@ $unnotified = @(
     'adapter_error'  # adapter raised; exit!=0 -> quarantine, where the K alert sounds
 )
 
-$pyProbe = 'import json; from spirrow_mindwire.conductor.core import StopReason; print(json.dumps(sorted(r.value for r in StopReason)))'
+# The probe ALWAYS writes one stderr line before the JSON. That forces the stderr-merge path
+# below to run on every gate run, not only when uv happens to print a warning or progress line.
+# No double quotes inside the probe: when a native argument contains `"`, the quoting gets
+# mangled on the way to python.exe.
+$pyProbe = 'import json, sys; from spirrow_mindwire.conductor.core import StopReason; print(''probe: stderr line (intentional)'', file=sys.stderr, flush=True); print(json.dumps(sorted(r.value for r in StopReason)))'
 $enumValues = $null
 $probeError = $null
+# PR-gate #369 round 1: with `2>&1`, each native stderr line arrives as an ErrorRecord. Under
+# this file's $ErrorActionPreference = 'Stop', some hosts (Windows PowerShell 5.1) turn the
+# first such record into a terminating error. The try would then jump to catch before
+# $LASTEXITCODE is read, and every run would fail for the wrong reason. pwsh 7.6 does not
+# throw here, but the check must not depend on the host version. So the preference is
+# lowered to 'Continue' for the native call ONLY and restored in finally. Fail-closed still
+# holds: exit != 0, no JSON line, and an empty list are each checked explicitly below.
+$savedErrorAction = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 try {
     $probeOut = & uv run --project $repoRoot python -c $pyProbe 2>&1
     $probeExit = $LASTEXITCODE
@@ -271,9 +284,13 @@ try {
 catch {
     $probeError = "probe failed: $($_.Exception.Message)"
 }
+finally {
+    $ErrorActionPreference = $savedErrorAction
+}
 if ($null -eq $probeError -and ($null -eq $enumValues -or $enumValues.Count -eq 0)) {
     $probeError = 'probe returned an empty StopReason value list'
 }
+Check 'caller $ErrorActionPreference restored to Stop after the uv probe' 'Stop' $ErrorActionPreference
 CheckTrue 'StopReason enum is readable via uv run (fail-closed: exit!=0 / bad JSON / empty = RED)' `
     ($null -eq $probeError) $probeError
 
