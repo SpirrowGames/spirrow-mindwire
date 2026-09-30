@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from test_conductor_core import (
+    _GREEN,
     _RED,
     _conductor,
     _FakeChatroomMcp,
@@ -219,3 +220,37 @@ async def test_ci_route_without_msg_id_stops_at_human_before_the_builder() -> No
     outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
     assert outcome.stop_reason is StopReason.HUMAN
     assert disp.dispatches == []
+
+
+@pytest.mark.anyio
+async def test_a_relay_after_a_ci_route_sees_the_route_post_in_its_context() -> None:
+    """PR-gate #371 objection 1: "route_msg then relay_msg in one round → stale context".
+
+    The two cannot share a round: the CI-route branch ends in ``continue`` and the relay
+    only fires on ``GateAdmission.INVOKE``, so a relay always comes from a LATER round, and
+    every round re-fetches ``messages``. This drives exactly the scenario the objection
+    names (red → ci-route → implementer re-nominates → green → REQUEST_CHANGES relay) and
+    pins that the relay turn's history contains the ci-route post, without the conductor
+    ever mutating a fetched list.
+    """
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="the design\n\nNEXT: Heisenberg")
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.REQUEST_CHANGES)
+    disp = _ScriptedDispatcher(
+        mcp, {Role.IMPLEMENTER: ["fixed CI\n\nNEXT: pr-review acme/widgets#7"]}
+    )
+    source = _ScriptedRollupSource(_rollup(*_RED), _rollup(*_GREEN))
+    c = _conductor(mcp, disp, orchestrator=gate, rollup_source=source)
+    fetched = _capture_fetches(c)
+    await c.run()
+    assert len(disp.events) >= 2, [e.payload.body[:40] for e in disp.events]
+    route_event, relay_event = disp.events[0], disp.events[1]
+    assert "ADMISSION: route_implementer" in route_event.payload.body
+    assert "VERDICT: REQUEST_CHANGES" in relay_event.payload.body
+    ctx = relay_event.thread_context
+    assert ctx is not None
+    history = ([ctx.opener] if ctx.opener else []) + list(ctx.recent)
+    assert route_event.payload.msg_id in [m.msg_id for m in history]
+    # the relay's context is built from a later fetch than the route's
+    assert any(route_event.payload.msg_id in [m["msg_id"] for m in f] for f in fetched[1:])
