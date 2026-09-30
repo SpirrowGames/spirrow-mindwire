@@ -61,7 +61,7 @@ Enumerated by grepping every `chatroom_post_message` and `chatroom_open_thread` 
 `spirrowgames-ops` is a **GitHub identity**, not a magickit chatroom author, so it is out of scope
 for this epic (which is about the `role` column on chatroom messages and the `allowed_roles`
 column on chatroom-side identity records). It is listed for completeness so the enumeration is
-not read as three-when-there-are-four; the classification below covers the three chatroom names.
+not read as four-when-there-are-five; the classification below covers the four chatroom names.
 
 There is also `conductor-probe`, which `scripts/thread_heads.py` used (until
 T-unread-correlated-count-scale moved that probe to `chatroom_list_threads`, which takes no identity)
@@ -246,9 +246,9 @@ live-corpus finding not a spec change).
 
 | Spec requirement (msg-id, ¶)                                                                     | Reflected here?                                                                                        |
 | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
-| msg-1179 §5: implementer classifies each identity by primary-source read, records reasoning     | Yes — three sections above, one per identity, each with quoted primary source                          |
-| msg-1179 §5: three classified, "not all-machine by default"                                     | Yes — `naysayer-pr-review` = participant, other two = machine, with the divergence explained          |
-| msg-1484 §2 / msg-1485: machinery uses `allowed_roles = ∅`, not a fabricated enum member         | Yes — the "consequence for the write half" bullets say `allowed_roles=[]` for both machine identities  |
+| msg-1179 §5: implementer classifies each identity by primary-source read, records reasoning     | Yes — four sections above, one per chatroom identity, each with quoted primary source                  |
+| msg-1179 §5: three classified, "not all-machine by default"                                     | Yes — `naysayer-pr-review` = participant, other three = machine, with the divergence explained        |
+| msg-1484 §2 / msg-1485: machinery uses `allowed_roles = ∅`, not a fabricated enum member         | Yes — the "consequence for the write half" bullets say `allowed_roles=[]` for every machine identity  |
 | msg-1484 §5: `naysayer-pr-review` as participant means role MUST be supplied, not erased        | Yes — that exact quote is cited under `naysayer-pr-review`'s section                                   |
 | msg-1493 §2 as corrected by msg-1585 §3: `allowed_roles := legitimate`                          | Yes — decided here; `legitimate` IS the entitlement, no live read needed to fix it                     |
 | msg-1493 §3: residual ≠ ∅ ⇒ surface as finding, do NOT silently drop                            | Deferred to `scripts/identity_findings.py`                                                             |
