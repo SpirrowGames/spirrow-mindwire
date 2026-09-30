@@ -13,7 +13,8 @@ Two checks (Bohr msg-4426 §1; the static one kept by the human's decision after
    the test rejects is *not deciding*. Reads, binary writes and ``sys.stdout`` are not checked.
    A mode that cannot be read statically counts as a write (fail loud, not silent). Where the
    receiver of ``x.open(...)`` is misread (an AST cannot see types), a ``# newline-exempt:
-   <reason>`` comment on the call is the escape hatch (see ``_open_mode_pos``).
+   <reason>`` comment on the call is the escape hatch (see ``_open_mode_pos``). The check looks
+   at each call expression on its own: it resolves no names, so it has no scoping rules.
 2. **Behaviour.** The two writers of ``build_tierc_eval_fixture.py`` that were unpinned
    (corrections JSON, ``harvest.json``) produce files with no ``\\r`` byte.
 """
@@ -26,7 +27,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple
+from typing import Any
 
 import pytest
 
@@ -37,26 +38,12 @@ SCRIPTS = ROOT / "scripts"
 # --------------------------------------------------------------------------- static check
 
 
-_MAX_DEPTH = 8  # name -> value hops followed before giving up (also breaks ``m = m`` cycles)
-
-
-def _mode_leaves(node: ast.expr, scope: _Scope | None = None, depth: int = 0) -> list[str | None]:
-    """Every string a mode expression can take; ``None`` for a leaf that is not a literal.
-
-    With a ``scope``, a bare name is followed to what it is plainly bound to there
-    (``m = "w"`` -> ``"w"``); a name bound in a way that cannot be read stays ``None``.
-    """
+def _mode_leaves(node: ast.expr) -> list[str | None]:
+    """Every string a mode expression can take; ``None`` for a leaf that is not a literal."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return [node.value]
     if isinstance(node, ast.IfExp):
-        return _mode_leaves(node.body, scope, depth) + _mode_leaves(node.orelse, scope, depth)
-    if scope is not None and isinstance(node, ast.Name) and depth < _MAX_DEPTH:
-        b = scope.lookup(node.id)
-        if b is not None and b.values is not None:
-            leaves = [leaf for v in b.values for leaf in _mode_leaves(v, b.scope, depth + 1)]
-            if b.param is not None:
-                leaves.append(None)  # whatever the caller passed
-            return leaves
+        return _mode_leaves(node.body) + _mode_leaves(node.orelse)
     return [None]
 
 
@@ -74,6 +61,9 @@ _MODULE_OPENS = frozenset({"gzip", "bz2", "lzma", "io", "codecs"})
 # Receivers whose ``open`` never yields a text stream (fd / archive handle).
 _NEVER_TEXT = frozenset({"os", "tarfile"})
 
+# Constructors whose result has ``Path.open(mode, ...)``.
+_PATH_CTORS = frozenset({"Path", "PosixPath", "WindowsPath"})
+
 EXEMPT_MARK = "# newline-exempt:"
 """Escape hatch for a call the heuristic misreads (e.g. ``zf.open("a.txt", "w")`` on a
 ``ZipFile``, which is binary and takes no ``newline=``). Put it on a line of the call, followed
@@ -86,252 +76,30 @@ def _is_mode_literal(node: ast.expr) -> bool:
     return all(m is not None and m and len(m) <= 4 and set(m) <= _MODE_CHARS for m in leaves)
 
 
-_FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-_COMPS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-
-
-class _Binding(NamedTuple):
-    """How the nearest scope that binds a name binds it.
-
-    ``param`` is set when the name is a parameter of that function (``default`` is its default,
-    if any). ``values`` holds every plain ``name = value`` in the same scope — a parameter's body
-    reassignments included, since parameter and body are one local scope — or is ``None`` when
-    any binding there is one we cannot read. The analysis is flow-insensitive: the name may hold
-    the caller's value or any of ``values``. ``scope`` is the chain starting at the binding
-    scope, so the values are resolved where they were written, not where the name was used.
-    """
-
-    param: ast.arg | None
-    default: ast.expr | None
-    values: list[ast.expr] | None
-    scope: _Scope
-
-
-def _named_targets(node: ast.AST) -> list[str]:
-    """Names bound by a target / pattern node (``a``, ``(a, b)``, ``*a``, ``case [a, *b]``)."""
-    out: list[str] = []
-    for x in ast.walk(node):
-        if isinstance(x, ast.Name):
-            out.append(x.id)
-        elif isinstance(x, (ast.MatchAs, ast.MatchStar)) and x.name is not None:
-            out.append(x.name)
-        elif isinstance(x, ast.MatchMapping) and x.rest is not None:
-            out.append(x.rest)
-    return out
-
-
-class _Scope:
-    """What the names visible at one call are bound to, as far as an AST can tell.
-
-    Follows Python's lexical scoping: the scope a name resolves in is the nearest enclosing
-    function, lambda or comprehension that binds it, then the module. A class body is a scope
-    only for code directly in it (methods do not see it). Comprehensions are their own scope
-    for their loop targets, while an ``:=`` inside one binds in the enclosing function (PEP 572).
-
-    Only a plain ``name = value`` / ``name: T = value`` is readable. Anything else that binds the
-    name in that scope — ``for``, ``with``, ``import``, ``+=``, unpacking, ``:=``, ``del``,
-    ``except ... as``, a ``match`` capture, ``def`` / ``class``, ``global`` / ``nonlocal`` — makes
-    the binding unreadable (``values is None``), and nothing is inferred from it.
-    """
-
-    def __init__(self, chain: list[ast.AST]) -> None:
-        self.chain = chain
-
-    @classmethod
-    def at(cls, node: ast.AST, parents: dict[ast.AST, ast.AST]) -> _Scope:
-        chain: list[ast.AST] = []
-        child, cur = node, parents.get(node)
-        while cur is not None:
-            if isinstance(cur, _COMPS):
-                # the first iterable is evaluated in the enclosing scope, not the comprehension's
-                if not _within(node, cur.generators[0].iter):
-                    chain.append(cur)
-            elif isinstance(cur, _FUNCS):
-                # decorators, defaults and annotations are evaluated in the enclosing scope
-                if _in_body(child, cur):
-                    chain.append(cur)
-            elif isinstance(cur, ast.ClassDef):
-                if not chain and _in_body(child, cur):
-                    chain.append(cur)
-            elif isinstance(cur, ast.Module):
-                chain.append(cur)
-            child, cur = cur, parents.get(cur)
-        return cls(chain)
-
-    @staticmethod
-    def _bindings_in(scope: ast.AST) -> list[ast.AST]:
-        """The nodes whose bindings belong to ``scope`` itself."""
-        if isinstance(scope, _COMPS):
-            return list(scope.generators)
-        roots: list[ast.AST] = (
-            [scope.body] if isinstance(scope, ast.Lambda) else list(getattr(scope, "body", []))
-        )
-        out: list[ast.AST] = []
-        todo = list(roots)
-        while todo:
-            n = todo.pop()
-            out.append(n)
-            if isinstance(n, (*_FUNCS, ast.ClassDef)):
-                # its name binds here; its decorators / defaults / bases are evaluated here
-                todo += list(getattr(n, "decorator_list", []))
-                if isinstance(n, _FUNCS):
-                    todo += [d for d in n.args.defaults + n.args.kw_defaults if d is not None]
-                else:
-                    todo += n.bases + [k.value for k in n.keywords]
-                continue
-            if isinstance(n, _COMPS):
-                # loop targets are the comprehension's own; an := inside binds here (PEP 572)
-                todo.append(n.generators[0].iter)
-                out += [x for x in _walk_comp(n) if isinstance(x, ast.NamedExpr)]
-                continue
-            todo.extend(ast.iter_child_nodes(n))
-        return out
-
-    @staticmethod
-    def _param(fn: ast.AST, name: str) -> tuple[ast.arg, ast.expr | None] | None:
-        if not isinstance(fn, _FUNCS):
-            return None
-        a = fn.args
-        pos = a.posonlyargs + a.args
-        defaults: list[ast.expr | None] = [None] * (len(pos) - len(a.defaults)) + list(a.defaults)
-        pairs = [*zip(pos, defaults, strict=True), *zip(a.kwonlyargs, a.kw_defaults, strict=True)]
-        pairs += [(v, None) for v in (a.vararg, a.kwarg) if v is not None]
-        for arg, d in pairs:
-            if arg.arg == name:
-                return arg, d
-        return None
-
-    def lookup(self, name: str) -> _Binding | None:
-        """The binding of ``name`` in the nearest scope that binds it, or ``None`` if none does."""
-        for i, scope in enumerate(self.chain):
-            here = _Scope(self.chain[i:])
-            # a parameter and the body's assignments are ONE local scope: read both (PR-gate
-            # #359 @ 74565d3 -- ``def f(mode): mode = "w"; p.open(mode)`` resolves to "w")
-            p = self._param(scope, name)
-            values: list[ast.expr] = []
-            opaque = False
-            for n in self._bindings_in(scope):
-                if isinstance(n, ast.Assign):
-                    for t in n.targets:
-                        if isinstance(t, ast.Name) and t.id == name:
-                            values.append(n.value)
-                        elif not isinstance(t, ast.Name) and name in _named_targets(t):
-                            opaque = True
-                elif isinstance(n, ast.AnnAssign):
-                    if isinstance(n.target, ast.Name) and n.target.id == name and n.value:
-                        values.append(n.value)
-                elif isinstance(
-                    n, (ast.For, ast.AsyncFor, ast.AugAssign, ast.NamedExpr, ast.comprehension)
-                ):
-                    opaque |= name in _named_targets(n.target)
-                elif isinstance(n, (ast.With, ast.AsyncWith)):
-                    opaque |= any(
-                        name in _named_targets(i.optional_vars)
-                        for i in n.items
-                        if i.optional_vars is not None
-                    )
-                elif isinstance(n, ast.Delete):
-                    opaque |= any(name in _named_targets(t) for t in n.targets)
-                elif isinstance(n, (ast.Import, ast.ImportFrom)):
-                    opaque |= any((al.asname or al.name.split(".")[0]) == name for al in n.names)
-                elif isinstance(n, (ast.Global, ast.Nonlocal)):
-                    opaque |= name in n.names
-                elif isinstance(n, ast.ExceptHandler):
-                    opaque |= n.name == name
-                elif isinstance(n, ast.match_case):
-                    opaque |= name in _named_targets(n.pattern)
-                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    opaque |= n.name == name
-            arg, default = p if p is not None else (None, None)
-            if opaque:
-                return _Binding(arg, default, None, here)
-            if values or arg is not None:
-                return _Binding(arg, default, values, here)
-        return None
-
-
-def _within(node: ast.AST, root: ast.AST) -> bool:
-    return any(x is node for x in ast.walk(root))
-
-
-def _in_body(child: ast.AST, scope: ast.AST) -> bool:
-    """``child`` (a direct child of ``scope``) belongs to its body, not its signature/header."""
-    body = getattr(scope, "body", None)
-    if isinstance(body, list):
-        return any(child is s for s in body)
-    return child is body  # Lambda: body is a single expression
-
-
-def _walk_comp(comp: ast.AST) -> list[ast.AST]:
-    """Nodes of a comprehension, descending into nested comprehensions but not functions."""
-    out: list[ast.AST] = []
-    todo = list(ast.iter_child_nodes(comp))
-    while todo:
-        n = todo.pop()
-        if isinstance(n, (*_FUNCS, ast.ClassDef)):
-            continue
-        out.append(n)
-        todo.extend(ast.iter_child_nodes(n))
-    return out
-
-
-_PATH_TYPES = frozenset(
-    {"Path", "PurePath", "PosixPath", "WindowsPath", "PurePosixPath", "PureWindowsPath"}
-)
-
-
-def _mentions_path_type(node: ast.expr | None) -> bool:
-    """An annotation naming a ``pathlib`` type (``Path``, ``Path | None``, ``Optional[Path]``)."""
-    if node is None:
-        return False
-    return any(
-        (isinstance(x, ast.Name) and x.id in _PATH_TYPES)
-        or (isinstance(x, ast.Attribute) and x.attr in _PATH_TYPES)
-        for x in ast.walk(node)
-    )
-
-
-def _is_path_expr(node: ast.expr, scope: _Scope, depth: int = 0) -> bool:
-    """``node`` is visibly a ``pathlib`` path: ``Path(...)``, ``a / b``, a ``Path``-annotated
-    parameter, or a name with at least one plain assignment that is one of those."""
-    if isinstance(node, ast.Call):
-        return _mentions_path_type(node.func)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-        return True
-    if isinstance(node, ast.Name) and depth < _MAX_DEPTH:
-        b = scope.lookup(node.id)
-        if b is None or b.values is None:
-            return False
-        # ANY Path evidence is enough: ``def f(q: str): q = Path(q); q.open(m)`` is the common
-        # coerce-to-Path idiom and may write. Erring this way flags a receiver that is only
-        # sometimes a Path (loud, exemptable) rather than missing a writer (silent).
-        if b.param is not None and _mentions_path_type(b.param.annotation):
-            return True
-        return any(_is_path_expr(v, b.scope, depth + 1) for v in b.values)
-    return False
-
-
-def _provably_mode(node: ast.expr, scope: _Scope, depth: int = 0) -> bool:
-    """``node`` can only be a mode string: a mode literal, or a name bound only to mode literals
-    (a parameter counts when its default is a mode literal)."""
-    if _is_mode_literal(node):
-        return True
+def _says_mode(node: ast.expr) -> bool:
+    """The argument reads as a mode on its face: it is named ``mode`` / ``*_mode``
+    (``mode``, ``file_mode``, ``args.mode``), or is a ternary with such a branch or a
+    mode-literal branch (``m if c else "w"``). Names are not resolved."""
     if isinstance(node, ast.IfExp):
-        return _provably_mode(node.body, scope, depth) and _provably_mode(node.orelse, scope, depth)
-    if isinstance(node, ast.Name) and depth < _MAX_DEPTH:
-        b = scope.lookup(node.id)
-        if b is None or b.values is None:
-            return False
-        # every piece of evidence agrees, and there is at least one; a parameter with no
-        # default is no evidence either way, a default must be a mode literal
-        verdicts = [_provably_mode(v, b.scope, depth + 1) for v in b.values]
-        if b.param is not None and b.default is not None:
-            verdicts.append(_is_mode_literal(b.default))
-        return bool(verdicts) and all(verdicts)
+        return _says_mode(node.body) or _says_mode(node.orelse)
+    if isinstance(node, ast.Constant):
+        return _is_mode_literal(node)
+    ident = getattr(node, "id", None) or getattr(node, "attr", None)
+    return isinstance(ident, str) and (ident.lower() == "mode" or ident.lower().endswith("_mode"))
+
+
+def _looks_like_path(node: ast.expr) -> bool:
+    """The receiver is a ``pathlib`` path on its face: ``Path(...)``, ``pathlib.Path(...)`` or
+    ``a / b``. Names are not resolved."""
+    if isinstance(node, ast.BinOp):
+        return isinstance(node.op, ast.Div)
+    if isinstance(node, ast.Call):
+        ctor = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        return ctor in _PATH_CTORS
     return False
 
 
-def _open_mode_pos(func: ast.expr, args: list[ast.expr], scope: _Scope) -> int | None:
+def _open_mode_pos(func: ast.expr, args: list[ast.expr]) -> int | None:
     """Positional index of the mode for an ``open`` call, or ``None`` if it is not a file open.
 
     Builtin ``open`` and ``<module>.open`` take ``(file, mode)``; ``Path.open`` takes
@@ -339,12 +107,13 @@ def _open_mode_pos(func: ast.expr, args: list[ast.expr], scope: _Scope) -> int |
     so the call shape decides: a mode-shaped literal first means ``Path.open``; a non-mode
     literal (``zf.open("a.txt", ...)``) or two or more positionals mean ``(file, mode)``.
 
-    A lone non-literal (``x.open(v)``) is ``Path``-style only on evidence: ``v`` is provably a
-    mode (bound only to mode literals, or a parameter defaulting to one), or ``x`` is visibly a
-    ``Path``. Without either it is ``(file,)`` with the default mode ``"r"``, i.e. a read — the
-    PR-gate advisory on #356 @ 417b3be (``zf.open(file_var)`` must not be flagged). The cost is
-    the mirror case: ``x.open(v)`` where neither side is visible — e.g. an unannotated
-    parameter ``p`` opened with a caller-supplied mode — is no longer flagged.
+    A lone non-literal (``x.open(v)``) is ``(file,)`` with the default mode ``"r"`` -- a read,
+    not flagged (PR-gate advisory on #356 @ 417b3be: ``zf.open(file_var)``) -- unless the call
+    itself says otherwise: ``v`` reads as a mode (``_says_mode``) or ``x`` is a path expression
+    (``_looks_like_path``). Only the call expression is looked at. Nothing is followed to an
+    assignment, a parameter or an annotation, so there is no scoping to get wrong; the cost is
+    that ``m = "w"; p.open(m)`` and ``def f(p: Path, m): p.open(m)`` are NOT flagged. Name the
+    argument ``mode``, or pass ``newline=``, and the check sees it.
     """
     if isinstance(func, ast.Name):
         return 1 if func.id == "open" else None
@@ -359,9 +128,7 @@ def _open_mode_pos(func: ast.expr, args: list[ast.expr], scope: _Scope) -> int |
         return 0
     if isinstance(args[0], ast.Constant) or len(args) >= 2:
         return 1
-    if _provably_mode(args[0], scope) or _is_path_expr(func.value, scope):
-        return 0
-    return 1
+    return 0 if _says_mode(args[0]) or _looks_like_path(func.value) else 1
 
 
 def _exempt(node: ast.Call, lines: list[str]) -> bool:
@@ -376,12 +143,9 @@ def _unpinned_writers(source: str, filename: str) -> list[str]:
     """``file:line`` of each text-writing call in ``source`` with no ``newline=`` keyword."""
     found: list[str] = []
     lines = source.splitlines()
-    tree = ast.parse(source, filename=filename)
-    parents = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
-    for node in ast.walk(tree):
+    for node in ast.walk(ast.parse(source, filename=filename)):
         if not isinstance(node, ast.Call):
             continue
-        scope = _Scope.at(node, parents)
         func = node.func
         kwargs = {k.arg: k.value for k in node.keywords if k.arg is not None}
         if "newline" in kwargs or any(k.arg is None for k in node.keywords):
@@ -391,7 +155,7 @@ def _unpinned_writers(source: str, filename: str) -> list[str]:
         if isinstance(func, ast.Attribute) and func.attr == "write_text":
             found.append(f"{filename}:{node.lineno} write_text")
             continue
-        mode_pos = _open_mode_pos(func, node.args, scope)
+        mode_pos = _open_mode_pos(func, node.args)
         if mode_pos is None:
             continue
         if "mode" in kwargs:
@@ -402,7 +166,7 @@ def _unpinned_writers(source: str, filename: str) -> list[str]:
             mode_node = None  # default "r"
         if mode_node is None:
             continue
-        if any(_writes_text(m) for m in _mode_leaves(mode_node, scope)):
+        if any(_writes_text(m) for m in _mode_leaves(mode_node)):
             found.append(f"{filename}:{node.lineno} open")
     return found
 
@@ -433,84 +197,47 @@ def test_every_script_text_writer_declares_newline() -> None:
         ('p.open("w")', True),
         ('p.open("a" if resume else "w", encoding="utf-8")', True),
         ('p.open("r" if x else "rb")', False),
-        # PR-gate advisory #356 @ 417b3be: a lone unknown argument to an unknown receiver is a
-        # file name (a read), not a mode -- unless the argument or the receiver shows otherwise.
+        # PR-gate advisory #356 @ 417b3be: a lone non-literal argument to an unknown receiver is
+        # a file name (a read), not a mode ...
         ("p.open(m)", False),
         ("zf.open(file_var)", False),
+        ("zf.open(member.filename)", False),
+        ("zf.open(model_path)", False),  # "mode" inside a longer word is not a mode name
         ("def f(name):\n    return zf.open(name)", False),
-        ('name = "export.txt"\nzf.open(name)', False),
-        ('m = "w"\np.open(m)', True),
-        ('m = "r"\np.open(m)', False),
-        ('m = "a" if resume else "w"\np.open(m)', True),
-        ('m = "w"\np.open(m, newline="\\n")', False),
-        ('def f(p, mode="w"):\n    p.open(mode)', True),
-        ('def f(p, *, mode="w"):\n    p.open(mode)', True),
-        # the default marks ``mode`` as a mode; the value is the caller's, so it may write
-        ('def f(p, mode="r"):\n    p.open(mode)', True),
-        ("def f(p: Path, m):\n    p.open(m)", True),
-        ("def f(p: Path | None, m):\n    p.open(m)", True),
-        ("def f(p: Optional[Path], m):\n    p.open(m)", True),
-        ("def f(p: pathlib.Path, m):\n    p.open(m)", True),
-        ("def f(zf: ZipFile, name):\n    zf.open(name)", False),
+        # ... unless the call itself says otherwise: the argument reads as a mode ...
+        ("p.open(mode)", True),
+        ("p.open(args.mode)", True),
+        ("p.open(file_mode)", True),
+        ("p.open(MODE)", True),
+        ('p.open(m if x else "w")', True),
+        ('p.open(m if x else "r")', True),  # "r" marks a mode; ``m`` is unknown, so may write
+        ("p.open(mode if x else other)", True),
+        ('p.open(mode, newline="\\n")', False),
+        ("zf.open(name if x else other)", False),
+        ('zf.open(name if x else "export.txt")', False),
+        # ... or the receiver is a path expression
         ("Path(x).open(m)", True),
+        ("pathlib.Path(x).open(m)", True),
         ("(root / 'a.txt').open(m)", True),
-        ("q = root / 'a.txt'\nq.open(m)", True),
-        ('m = "w"\nopen(f, m)', True),
-        ('m = "r"\nopen(f, m)', False),
-        ('m = "w"\ndef g(p):\n    m = "r"\n    p.open(m)', False),
-        ('m = "r"\ndef g(p):\n    p.open(m)', False),
-        ('m = "w"\ndef g(p):\n    p.open(m)', True),
-        ('m = "w"\nfor m in modes:\n    p.open(m)', False),
+        ("(root // n).open(m)", False),
+        ("make(x).open(m)", False),
+        # Names are NOT resolved (human decision C on #359): pinned so the boundary is a
+        # decision, not an accident. The mode position is unknown, so these are not flagged.
+        ('m = "w"\np.open(m)', False),
+        ("def f(p: Path, m):\n    p.open(m)", False),
+        ("q = root / 'a.txt'\nq.open(m)", False),
+        # In a known mode position an unreadable mode is still a write, whatever it is bound to.
+        ('m = "r"\nopen(f, m)', True),
         ("for m in modes:\n    open(f, m)", True),
-        ("m = m\nopen(f, m)", True),
-        ("m = m\np.open(m)", False),
-        # PR-gate #359 @ 948a718 (1): an enclosing function's binding is visible (closures).
-        ('def outer():\n    m = "w"\n    def inner(p):\n        p.open(m)', True),
-        ('def outer():\n    m = "r"\n    def inner(p):\n        p.open(m)', False),
-        ('m = "r"\ndef outer():\n    m = "w"\n    def inner(p):\n        p.open(m)', True),
-        ('def outer(m="w"):\n    def inner(p):\n        p.open(m)', True),
-        ("def outer(q: Path):\n    def inner(m):\n        q.open(m)", True),
-        # a value resolves where it was written, not where the name is used
-        ('m = "w"\ndef outer():\n    k = m\n    def inner(m):\n        p.open(k)', True),
-        # PR-gate #359 @ 948a718 (2): comprehension targets are the comprehension's own ...
-        ('m = "w"\n_ = [m for m in ("r",)]\np.open(m)', True),
-        ('m = "w"\n_ = {m: 1 for m in xs}\np.open(m)', True),
-        ('m = "w"\n_ = list(m for m in xs)\np.open(m)', True),
-        # ... but inside the comprehension the target shadows the outer name
-        ('m = "w"\n_ = [p.open(m) for m in xs]', False),
-        ('m = "w"\n_ = [open(f, m) for m in xs]', True),
-        # ... the first iterable is evaluated outside; := inside binds outside (PEP 572)
-        ('m = "w"\n_ = [x for x in p.open(m)]', True),
-        ('m = "w"\n_ = [(m := y) for y in xs]\np.open(m)', False),
-        # PR-gate #359 @ 948a718 (3): a match capture rebinds the name
-        ('m = "w"\nmatch val:\n    case m:\n        pass\np.open(m)', False),
-        ('m = "w"\nmatch val:\n    case [*m]:\n        pass\np.open(m)', False),
-        ('m = "w"\nmatch val:\n    case {**m}:\n        pass\np.open(m)', False),
-        ('m = "w"\nmatch val:\n    case [x] if x:\n        pass\np.open(m)', True),
-        # other rebindings that must not be read as the plain value
-        ('m = "w"\ndel m\np.open(m)', False),
-        ('m = "w"\ndef m():\n    pass\np.open(m)', False),
-        ('m = "w"\ntry:\n    pass\nexcept E as m:\n    pass\np.open(m)', False),
-        # a class body is a scope for code directly in it, not for its methods
-        ('class C:\n    m = "w"\n    p.open(m)', True),
-        ('m = "r"\nclass C:\n    m = "w"\n    def f(self, p):\n        p.open(m)', False),
-        # PR-gate #359 @ 74565d3: a parameter reassigned in the body is still read
-        ('def f(mode):\n    mode = "w"\n    p.open(mode)', True),
-        ('def f(mode="r"):\n    mode = "w"\n    p.open(mode)', True),
-        ('def f(mode):\n    mode = "r"\n    p.open(mode)', True),  # caller's value unknown
-        ('def f(mode):\n    mode = "r"\n    open(x, mode)', True),
-        ('def f(mode):\n    mode = "w"\n    p.open(mode, newline="\\n")', False),
-        ('def f(name):\n    name = "a.txt"\n    zf.open(name)', False),
-        ('def f(mode="r"):\n    mode = "a.txt"\n    p.open(mode)', False),
-        ("def f(mode):\n    for mode in ms:\n        pass\n    p.open(mode)", False),
-        ("def f(q, m):\n    q = Path(q)\n    q.open(m)", True),
-        ("def f(q: str, m):\n    q = Path(q)\n    q.open(m)", True),  # coerce-to-Path idiom
-        ("q = Path(a)\nq = make()\nq.open(m)", True),  # any Path evidence is enough
-        ("def f(q: str, m):\n    q.open(m)", False),
-        ("f = lambda mode: p.open(mode)", False),
-        ('f = lambda mode="w": p.open(mode)', True),
-        # defaults are evaluated in the enclosing scope
-        ('m = "w"\ndef f(p, x=p.open(m)):\n    m = "r"', True),
+        ("def f(p, mode):\n    p.open(mode)", True),
+        # PR-gate #359 @ b7e4f9f / operator msg-4791: a name that is only READ by a statement
+        # (subscript slice, attribute base, ``case Cls(...)``) must not hide a writer.
+        ('mode = "w"\nd[mode] = 1\np.open(mode)', True),
+        ('mode = "w"\nmode.attr = 1\np.open(mode)', True),
+        ('mode = "w"\nmatch v:\n    case mode.X:\n        pass\np.open(mode)', True),
+        ('mode = "w"\nmatch v:\n    case mode(x=a):\n        pass\np.open(mode)', True),
+        # Einstein msg-4796: nor may a walrus inside a subscript target
+        ('d[(mode := "w")] = 2\np.open(mode)', True),
         ('p.open("r+")', True),
         # PR-gate #356 bb73652: module / archive opens take (file, mode), not (mode, ...).
         ('gzip.open(path, "rb")', False),
