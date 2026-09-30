@@ -1272,7 +1272,9 @@ class _FakeGitHubCi:
         # Kept for GitHubReviewClient Protocol compliance.
         return []
 
-    async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
+    async def submit_review(
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     async def probe_identity(self) -> int:
