@@ -28,6 +28,7 @@ Option (i)), never duplicated into ``HealthStatus.details`` (I2).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -55,6 +56,7 @@ from ..exceptions import (
     AdapterHaltError,
     AdapterHealthError,
     AdapterSpawnError,
+    AdapterSpawnTimeoutError,
 )
 from ..ports import SpawnContext
 from ..thread_context import build_turn_prompt
@@ -73,6 +75,11 @@ from ..value_objects import (
     ThreadRef,
 )
 from ._cli_selection import cli_selection_kwargs
+from ._connect_budget import (
+    DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    SdkConnectTimeoutError,
+    connect_bounded,
+)
 from ._sdk_result import (
     SdkIsErrorSignal,
     capture_is_error_detail,
@@ -152,6 +159,16 @@ class _Session:
 
 class ClaudeCodeSdkSpawnError(AdapterSpawnError):
     """``spawn`` failure for the Claude Code SDK adapter (§3.4)."""
+
+
+class ClaudeCodeSdkSpawnTimeoutError(ClaudeCodeSdkSpawnError, AdapterSpawnTimeoutError):
+    """``connect()`` was still running when the spawn budget ran out (Bohr msg-5053 D-4).
+
+    Before this, a proposer whose connect hung raised nothing at all: the process sat in
+    ``spawn`` and the conductor's retry-then-``NEXT: human`` path (D-2 / D-3) could never start.
+    Being an :class:`~spirrow_mindwire.exceptions.AdapterSpawnTimeoutError` is what lets the
+    conductor retry it; error code ``adapter.spawn_timeout``, the implementer's.
+    """
 
 
 class ClaudeCodeSdkDeliveryError(AdapterDeliveryError):
@@ -428,10 +445,14 @@ class ClaudeCodeSdkAdapter:
         model: str | None = None,
         cli_path: str | Path | None = None,
         client_factory: Callable[[Any], _SdkClient] | None = None,
+        spawn_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
     ) -> None:
         self._cwd = cwd
         self._system_prompt = system_prompt
         self._builtin_tools = list(builtin_tools)
+        # The budget for ``connect()`` in ``spawn``. The implementer's number, and a constructor
+        # argument only: no environment override (Bohr msg-5053 D-4).
+        self._spawn_timeout_seconds = spawn_timeout_seconds
         # Both default to None = the SDK's own choice (its bundled CLI, that CLI's
         # default model), which is what every session ran on before these existed.
         # They travel together on purpose — see ``_cli_selection`` for why naming a
@@ -478,9 +499,27 @@ class ClaudeCodeSdkAdapter:
             **cli_selection_kwargs(model=self._model, cli_path=self._cli_path),
         )
         connect_started = time.monotonic()
+        client: _SdkClient | None = None
         try:
             client = self._client_factory(options)
-            await client.connect()
+            await connect_bounded(client, self._spawn_timeout_seconds)
+        except SdkConnectTimeoutError as exc:
+            # By the time this is reached the SDK (0.1.77) has already ended the CLI process it
+            # started: its ``connect()`` does that itself when cancelled (see ``_connect_budget``).
+            # The disconnect below is kept as a bounded second attempt, as the implementer has,
+            # for an SDK that stops doing so. What nothing here reaches is whatever that CLI
+            # process started itself: unlike the implementer there is no Job Object behind this
+            # adapter, so those descendants are not reaped by a timeout (PR-gate #385 advisory).
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(client.disconnect(), timeout=5.0)
+            raise ClaudeCodeSdkSpawnTimeoutError(
+                f"adapter.spawn_timeout: SDK spawn did not connect inside "
+                f"{self._spawn_timeout_seconds}s for role {role.value} on "
+                f"thread {thread_ref.thread_id}",
+                adapter_id=self.adapter_id,
+                timeout_s=self._spawn_timeout_seconds,
+            ) from exc
         except Exception as exc:
             raise ClaudeCodeSdkSpawnError(
                 f"spawn failed for role {role.value} on thread {thread_ref.thread_id}: {exc}"

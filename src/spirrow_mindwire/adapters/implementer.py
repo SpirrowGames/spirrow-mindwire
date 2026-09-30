@@ -81,6 +81,7 @@ from ..exceptions import (
     AdapterHaltError,
     AdapterHealthError,
     AdapterSpawnError,
+    AdapterSpawnTimeoutError,
 )
 from ..naysayer.adr_index import load_adr_entries
 from ..obligations import ObligationsManifest
@@ -101,6 +102,7 @@ from ..value_objects import (
 )
 from . import _sdk_job_hook
 from ._cli_selection import cli_selection_kwargs
+from ._connect_budget import DEFAULT_CONNECT_TIMEOUT_SECONDS
 from ._sdk_job_hook import (
     _JOB_HANDLE_CTX,
     JobState,
@@ -122,7 +124,9 @@ from .claude_code_sdk import (
 # conductor-4h). Both are conservative — smaller than the Task Scheduler's 4 h
 # wall by a wide margin, larger than any healthy turn. Overridable via the
 # constructor + env vars for operational tuning.
-_DEFAULT_SPAWN_TIMEOUT_SECONDS = 60.0
+# The spawn budget is the shared connect budget: the proposer uses the same number (Bohr msg-5053
+# D-4), and defining this one from it is what keeps the two from drifting.
+_DEFAULT_SPAWN_TIMEOUT_SECONDS = DEFAULT_CONNECT_TIMEOUT_SECONDS
 _DEFAULT_TURN_TIMEOUT_SECONDS = 30 * 60.0  # 30 minutes — a long turn is fine,
 # a session that eats hours is what we exist to break.
 
@@ -296,12 +300,16 @@ class ImplementerSdkSpawnError(AdapterSpawnError):
     """``spawn`` failure for the implementer adapter (§3.4)."""
 
 
-class ImplementerSdkSpawnTimeoutError(ImplementerSdkSpawnError):
+class ImplementerSdkSpawnTimeoutError(ImplementerSdkSpawnError, AdapterSpawnTimeoutError):
     """``spawn`` exceeded its init time budget (v12 B-4).
 
     Distinct subclass so the dispatcher / conductor can tell "the SDK never
     connected" from "the SDK connected but errored". Error code:
     ``adapter.spawn_timeout``.
+
+    Also an :class:`~spirrow_mindwire.exceptions.AdapterSpawnTimeoutError` (Bohr
+    msg-5053 D-2): that Port-level class is what the conductor catches to retry
+    the spawn once, so it never has to import this one.
     """
 
 
@@ -695,7 +703,9 @@ class ImplementerSdkAdapter:
             raise ImplementerSdkSpawnTimeoutError(
                 f"adapter.spawn_timeout: SDK spawn did not connect inside "
                 f"{self._spawn_timeout_seconds}s for role {role.value} on "
-                f"thread {thread_ref.thread_id}"
+                f"thread {thread_ref.thread_id}",
+                adapter_id=self.adapter_id,
+                timeout_s=self._spawn_timeout_seconds,
             ) from exc
         except ImplementerSdkSpawnError:
             # Already a spawn error — pass through so the caller sees our

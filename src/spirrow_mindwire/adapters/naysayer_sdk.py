@@ -116,6 +116,7 @@ from ..value_objects import (
     SessionState,
     ThreadRef,
 )
+from ._connect_budget import DEFAULT_CONNECT_TIMEOUT_SECONDS, connect_bounded
 from ._sdk_result import (
     SdkIsErrorSignal,
     capture_is_error_detail,
@@ -439,8 +440,13 @@ class NaysayerSdkAdapter:
         expected_backend: str = NAYSAYER_EXPECTED_BACKEND,
         preflight: Callable[[], Awaitable[AttestationRecord]] | None = None,
         shutdown_grace: timedelta = timedelta(seconds=5),
+        connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
     ) -> None:
         self._cwd = Path(cwd)
+        # Upper bound on the per-turn ``connect()`` in deliver_event (Einstein
+        # msg-5054 advisory on T-agmsg-transport-lessons-readiness-session-claim-
+        # board). The same number the proposer and implementer spawn with.
+        self._connect_timeout_seconds = connect_timeout_seconds
         # Upper bound on the per-turn client shutdown that deliver_event's
         # finally runs itself (halt's own shutdown is bounded by its ``grace``
         # argument). Defaults to halt's default grace.
@@ -796,7 +802,14 @@ class NaysayerSdkAdapter:
                     )
                 client = self._client_factory(session.options)
                 session.client = client
-            await client.connect()
+            # Bounded: this adapter connects per turn, not at spawn, so the
+            # conductor's spawn-timeout retry never sees it. A connect still
+            # running at the deadline raises ``SdkConnectTimeoutError`` and
+            # takes the generic branch below — FAILED, ``adapter.delivery_failed``,
+            # the budget named in the message — and the ``finally`` shuts the
+            # abandoned client down. No retry here: the turn fails loudly.
+            # The ``query`` and the drain after it are still unbounded.
+            await connect_bounded(client, self._connect_timeout_seconds)
             await client.query(_build_prompt(event, session.own_role))
             body, result = await _drain_reply(client)
             body_success = True

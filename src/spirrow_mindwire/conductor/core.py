@@ -79,6 +79,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
 from ..decider.hook import Decider, ThreadMessage, run_proceed_clearance, run_tierc_hook
+from ..exceptions import AdapterSpawnTimeoutError
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
 from ..github.client import CheckRollup, PrRef, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
@@ -115,6 +116,13 @@ from .handoff import (
     resolve_handoff,
 )
 from .roster import RoleResolutionError, derive_identity_by_role
+from .spawn_timeout import (
+    SPAWN_ATTEMPTS,
+    SpawnGaveUp,
+    emit_spawn_timeout,
+    render_spawn_timeout_notice,
+    spawn_timeout_event,
+)
 from .stall import StalledError, emit_stalled, is_stalled, render_stalled_notice, stalled_event
 from .stand_down import (
     StandDownError,
@@ -578,11 +586,18 @@ class Conductor:
                             )
                         handle = sessions.get(implementer_identity)
                         if handle is None:
-                            handle = await self._dispatcher.spawn_instance(
-                                self._thread_ref,
-                                self._implementer_role,
-                                implementer_identity,
+                            spawned = await self._spawn(
+                                self._implementer_role, implementer_identity
                             )
+                            if isinstance(spawned, SpawnGaveUp):
+                                return self._stop(
+                                    round_index,
+                                    StopReason.HUMAN,
+                                    spawned.notice_msg_id,
+                                    forced,
+                                    forced_saveable,
+                                )
+                            handle = spawned
                             sessions[implementer_identity] = handle
                         # R-1b (T-dispatched-turn msg-4871 §3): ``route_msg`` was posted after
                         # this round's fetch, so it is not in ``messages``. The context builder
@@ -617,9 +632,16 @@ class Conductor:
                     return self._stop(round_index, StopReason.HUMAN, last, forced, forced_saveable)
                 handle = sessions.get(implementer_identity)
                 if handle is None:
-                    handle = await self._dispatcher.spawn_instance(
-                        self._thread_ref, self._implementer_role, implementer_identity
-                    )
+                    spawned = await self._spawn(self._implementer_role, implementer_identity)
+                    if isinstance(spawned, SpawnGaveUp):
+                        return self._stop(
+                            round_index,
+                            StopReason.HUMAN,
+                            spawned.notice_msg_id,
+                            forced,
+                            forced_saveable,
+                        )
+                    handle = spawned
                     sessions[implementer_identity] = handle
                 # Dispatch the implementer on the RELAY event (the verdict + critique), not its own
                 # pr-review trigger — else it wakes blind to what it must fix (Tier B msg-567 #1).
@@ -748,6 +770,21 @@ class Conductor:
                 return self._stop(
                     round_index, StopReason.STALLED, posted_id, forced, forced_saveable
                 )
+            # The session first, the forced-consult count after: a spawn that gave up stops the
+            # run here, and a consult that never ran must not be reported as one that did.
+            handle = sessions.get(target_identity)
+            if handle is None:
+                spawned = await self._spawn(target_role, target_identity)
+                if isinstance(spawned, SpawnGaveUp):
+                    return self._stop(
+                        round_index,
+                        StopReason.HUMAN,
+                        spawned.notice_msg_id,
+                        forced,
+                        forced_saveable,
+                    )
+                handle = spawned
+                sessions[target_identity] = handle
             if is_forced:
                 forced += 1
                 # ``is_saveable`` comes from _route (the single source of truth for the forcing
@@ -755,13 +792,6 @@ class Conductor:
                 # always; read it with the lever off to size the potential saving.
                 if is_saveable:
                     forced_saveable += 1
-
-            handle = sessions.get(target_identity)
-            if handle is None:
-                handle = await self._dispatcher.spawn_instance(
-                    self._thread_ref, target_role, target_identity
-                )
-                sessions[target_identity] = handle
             await self._dispatch_recording(
                 handle,
                 latest,
@@ -1932,6 +1962,62 @@ class Conductor:
             ),
             thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
         )
+
+    async def _spawn(self, role: Role, identity: str) -> SessionHandle | SpawnGaveUp:
+        """Spawn the session for ``identity``: the one spawn path (Bohr msg-5053 D-1..D-3).
+
+        Returns the handle, or :class:`~.spawn_timeout.SpawnGaveUp` when every attempt timed out
+        and the notice saying so landed in the thread; the caller then stops on
+        ``StopReason.HUMAN`` against that notice. See :mod:`.spawn_timeout` for the rule.
+
+        Only :class:`~spirrow_mindwire.exceptions.AdapterSpawnTimeoutError` is handled. Every
+        other exception leaves here exactly as the dispatcher raised it, first attempt, no retry
+        and no notice: a spawn that failed for a stated reason fails the same way again, and its
+        exit 1 → quarantine path is unchanged.
+        """
+        for attempt in range(1, SPAWN_ATTEMPTS + 1):
+            try:
+                return await self._dispatcher.spawn_instance(self._thread_ref, role, identity)
+            except AdapterSpawnTimeoutError as exc:
+                event = spawn_timeout_event(
+                    adapter_id=exc.adapter_id,
+                    instance_id=identity,
+                    role=role,
+                    attempt=attempt,
+                    timeout_s=exc.timeout_s,
+                )
+                emit_spawn_timeout(event)
+                if attempt < SPAWN_ATTEMPTS:
+                    continue
+                # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader:
+                # the human who owns this thread, who opens it because its head asked for a turn
+                # that never ran. Fallback when the thread is gone: disposition (3), fail loudly.
+                # ``_post_as_conductor_relay`` turns a ThreadResolvedError into an empty
+                # ``msg_id``; that, a post with no ``msg_id``, or a post that raised re-raises
+                # the timeout itself → exit 1 → the wrapper's quarantine and Discord alert, with
+                # the ``spawn.timeout`` lines above in the log tail. The refusal is never posted
+                # into another thread.
+                try:
+                    posted = await self._post_as_conductor_relay(render_spawn_timeout_notice(event))
+                except Exception as post_exc:
+                    logger.warning(
+                        "spawn.timeout notice could not be posted in thread %r (%s: %s) — "
+                        "re-raising the spawn timeout",
+                        self._thread_ref.thread_id,
+                        type(post_exc).__name__,
+                        post_exc,
+                    )
+                    raise exc from None
+                posted_id = _msg_id(posted)
+                if not posted_id:
+                    logger.warning(
+                        "spawn.timeout notice did not land in thread %r — "
+                        "re-raising the spawn timeout",
+                        self._thread_ref.thread_id,
+                    )
+                    raise
+                return SpawnGaveUp(notice_msg_id=posted_id)
+        raise AssertionError("unreachable: the last attempt returns or raises")
 
     async def _dispatch_recording(
         self,
