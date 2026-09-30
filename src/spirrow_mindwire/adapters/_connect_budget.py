@@ -14,8 +14,17 @@ this module is the same budget for the adapters that had none.
   going when we stopped waiting, and the two get different treatment upstream (only the second
   is retried by the conductor).
 
-What this does not do: reap the subprocess. A caller that gets :class:`SdkConnectTimeoutError`
-owns the client and must shut it down.
+Two things the budget is not (read from SDK 0.1.77 and measured once against a child that never
+answers the handshake: 3 s budget, error surfaced after 13 s, direct child already dead):
+
+- It is not the wall-clock bound. When the budget expires, ``connect()`` is cancelled, and the
+  SDK's ``connect()`` answers a cancellation by shutting its own subprocess down before it lets
+  the cancellation out: about 5 s waiting for a clean exit, then terminate, then up to 5 s more.
+  :class:`SdkConnectTimeoutError` therefore surfaces up to roughly 10 s **after** the budget.
+- It does not reap the subprocess tree. The SDK ends the CLI process it started; anything that
+  process started itself is not followed. Only a Job Object does that, and only the implementer
+  has one. A caller that gets :class:`SdkConnectTimeoutError` still owns the client and must
+  shut it down, which with this SDK finds nothing left to do.
 """
 
 from __future__ import annotations
@@ -40,7 +49,10 @@ class SdkConnectTimeoutError(RuntimeError):
 
 
 async def connect_bounded(client: _Connectable, timeout_seconds: float) -> None:
-    """Await ``client.connect()`` for at most ``timeout_seconds``.
+    """Cancel ``client.connect()`` once ``timeout_seconds`` have passed.
+
+    The call returns when the cancelled ``connect()`` has finished unwinding, which is later than
+    the budget by however long the SDK's own teardown takes (see the module docstring).
 
     ``asyncio.timeout`` rather than ``asyncio.wait_for`` so that ``expired()`` can tell our
     deadline from a ``TimeoutError`` the SDK raised itself (same reasoning as the turn budget in

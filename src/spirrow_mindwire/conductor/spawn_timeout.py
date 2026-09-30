@@ -38,8 +38,9 @@ logger = logging.getLogger(__name__)
 EVENT_KIND_SPAWN_TIMEOUT = "spawn.timeout"
 
 # A policy constant, not a knob: the first attempt plus exactly one retry (msg-5053 D-2). With
-# the adapters' 60 s connect budget, a spawn that never connects costs two budgets before the
-# conductor speaks.
+# the adapters' 60 s connect budget, a spawn that never connects costs two budgets, plus the
+# SDK's teardown after each (up to roughly 10 s, see ``adapters/_connect_budget``), before the
+# conductor speaks. ``timeout_s`` in the event is the budget, not that elapsed time.
 SPAWN_ATTEMPTS = 2
 
 

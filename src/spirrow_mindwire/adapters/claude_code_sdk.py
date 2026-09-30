@@ -504,10 +504,12 @@ class ClaudeCodeSdkAdapter:
             client = self._client_factory(options)
             await connect_bounded(client, self._spawn_timeout_seconds)
         except SdkConnectTimeoutError as exc:
-            # The connect is abandoned, so its CLI subprocess may still be there. Ask the SDK to
-            # let go of it, for a bounded time and best-effort, exactly as the implementer does.
-            # Unlike the implementer there is no Job Object behind this adapter, so a disconnect
-            # that fails here can leave that subprocess running until the daemon exits.
+            # By the time this is reached the SDK (0.1.77) has already ended the CLI process it
+            # started: its ``connect()`` does that itself when cancelled (see ``_connect_budget``).
+            # The disconnect below is kept as a bounded second attempt, as the implementer has,
+            # for an SDK that stops doing so. What nothing here reaches is whatever that CLI
+            # process started itself: unlike the implementer there is no Job Object behind this
+            # adapter, so those descendants are not reaped by a timeout (PR-gate #385 advisory).
             if client is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(client.disconnect(), timeout=5.0)
