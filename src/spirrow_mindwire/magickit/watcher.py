@@ -202,11 +202,14 @@ class ChatroomWatcher:
             # dispatch failure still escapes to :meth:`run`'s logged swallow.
             try:
                 event = self._to_event(watch.thread_ref, msg, messages)
-            except ThreadContextTriggerMissing:
-                logger.exception(
+            except ThreadContextTriggerMissing as exc:
+                # ERROR, not ``exception``: this is an expected, cleanly-recovered input
+                # refusal, so the reason is logged without a traceback (#375 advisory).
+                logger.error(
                     "ThreadContextTriggerMissing: skipping %s (not dispatched, not retried);"
-                    " continuing the poll batch",
+                    " continuing the poll batch: %s",
                     seen_key,
+                    exc,
                 )
                 continue
             await self._dispatcher.dispatch(handle, event)

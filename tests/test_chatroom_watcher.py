@@ -364,7 +364,10 @@ async def test_a_trigger_missing_message_does_not_abort_the_rest_of_the_poll(
     with caplog.at_level("ERROR", logger="spirrow_mindwire.magickit.watcher"):
         assert await w.poll_once() == 1
     assert [e.payload.msg_id for e in disp.events] == ["msg-3"]
-    assert any("ThreadContextTriggerMissing" in r.getMessage() for r in caplog.records)
+    skips = [r for r in caplog.records if "ThreadContextTriggerMissing" in r.getMessage()]
+    assert skips
+    # An expected, recovered refusal: ERROR level, no traceback (#375 advisory).
+    assert all(r.levelname == "ERROR" and r.exc_info is None for r in skips)
     # at-most-once: the bad message is not retried on the next poll.
     assert await w.poll_once() == 0
     assert len(disp.events) == 1
