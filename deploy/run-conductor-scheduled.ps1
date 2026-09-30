@@ -757,6 +757,7 @@ function Invoke-HeadSkipCommitLaunch {
     }
     $launchesSameHead = 0
     $launchHeadMsgId = ''
+    $readWarning = $null
     $jsonLine = @($raw | ForEach-Object { "$_" } | Where-Object { $_ -match '^\s*\{' }) | Select-Object -Last 1
     if ($jsonLine) {
         try {
@@ -766,9 +767,17 @@ function Invoke-HeadSkipCommitLaunch {
                 if ($null -ne $rec.head_msg_id_at_launch) { $launchHeadMsgId = [string]$rec.head_msg_id_at_launch }
             }
         }
-        catch { $launchesSameHead = 0; $launchHeadMsgId = '' }
+        catch { $launchesSameHead = 0; $launchHeadMsgId = ''; $readWarning = "record JSON unparseable: $($_.Exception.Message)" }
     }
-    return @{ ok = $true; error = $null; launches_same_head = $launchesSameHead; head_msg_id = $launchHeadMsgId }
+    # A committed LAUNCH always carries launches_same_head >= 1 (head_skip.commit_launch). Reading 0
+    # back therefore means the record keys drifted from this reader (renamed in record_to_json) or
+    # the JSON line is missing — which would disable the T42 watchdog without an error. Fail OPEN
+    # (the launch still proceeds, count 0 = no watchdog) but LOUD: the caller logs this warning.
+    # The key names are pinned against record_to_json by tests/test_conductor_stall.py.
+    if ($null -eq $readWarning -and $launchesSameHead -lt 1) {
+        $readWarning = 'launches_same_head missing or < 1 in the committed record (key drift?)'
+    }
+    return @{ ok = $true; error = $null; launches_same_head = $launchesSameHead; head_msg_id = $launchHeadMsgId; warning = $readWarning }
 }
 
 # Invoke `head_skip_decide.py --mode commit-terminal --payload <payload>` for one thread.
@@ -3781,6 +3790,9 @@ try {
             Write-Log "head_skip commit-launch FAILED for $($cand.key) — $($commitResult.error)"
             throw ("head_skip commit-launch systemic failure on $($cand.key): $($commitResult.error). " +
                    "The tick is aborted (fail-closed per Bohr msg-1430 §W-3).")
+        }
+        if ($commitResult.warning) {
+            Write-Log "WARN T42 stall watchdog disabled for $($cand.key) this launch — $($commitResult.warning)"
         }
 
         # All three must move together: the daemon reads the thread from [conductor] but the project

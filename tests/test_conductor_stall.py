@@ -422,3 +422,29 @@ def test_blank_repo_dir_reads_as_unset(blank: str) -> None:
     # Path("") is Path(".") — the current directory, which passes an is_dir() check.
     assert Path(blank.strip()) == Path(".")
     assert Stage3LoopConfig.model_validate({"repo_dir": blank}).repo_dir is None
+
+
+# --------------------------------------------------------------------------- #
+# 6. Python/PowerShell key contract (PR #372 gate advisory, structure)
+# --------------------------------------------------------------------------- #
+
+_SCHEDULED_PS1 = Path(__file__).resolve().parents[1] / "deploy" / "run-conductor-scheduled.ps1"
+
+
+@pytest.mark.parametrize("key", ["launches_same_head", "head_msg_id_at_launch"])
+def test_wrapper_reads_the_record_keys_record_to_json_writes(key: str) -> None:
+    """The sweep reads ``.record.<key>`` from commit-launch's JSON, and falls back to 0 / '' if the
+    key is absent. A rename on the Python side would therefore disable the watchdog without an
+    error; this pins both names on both sides so a rename reds here instead."""
+    written = record_to_json(_launch(None, "m7", _T0))
+    assert key in written
+    assert f"$rec.{key}" in _SCHEDULED_PS1.read_text(encoding="utf-8")
+
+
+def test_wrapper_warns_loudly_when_the_count_reads_back_zero() -> None:
+    """A committed LAUNCH always has a count >= 1, so 0 read back means drift: the wrapper must
+    log a WARN rather than silently pass ``--launches-same-head 0``."""
+    assert _launch(None, "m7", _T0).launches_same_head >= 1
+    text = _SCHEDULED_PS1.read_text(encoding="utf-8")
+    assert "$launchesSameHead -lt 1" in text
+    assert "WARN T42 stall watchdog disabled" in text
