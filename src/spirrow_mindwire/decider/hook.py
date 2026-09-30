@@ -73,6 +73,7 @@ from spirrow_mindwire.decider.state import (
     SimpleTurn,
     state_builder,
 )
+from spirrow_mindwire.decider.verdict import TierCVerdictKind
 from spirrow_mindwire.tier_c_admission_gate import (
     AdmissionDecision,
     LogKind,
@@ -101,6 +102,10 @@ class Decider(Protocol):
     def is_target(self, state: DecisionState) -> bool: ...
 
     async def evaluate(self, state: DecisionState) -> DecisionResult | None: ...
+
+    async def clear_proceed(self, state: DecisionState) -> DecisionResult | None:
+        """D-4' G3: evaluate a naysayer's proceed handoff; ``None`` = not called."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -510,6 +515,80 @@ async def run_tierc_hook(
     return dr
 
 
+def proceed_cleared(dr: DecisionResult | None) -> bool:
+    """G3's single reading of a proceed-clearance result: cleared iff the Decider was called,
+    produced an actionable verdict (``EVALUATED`` ∧ ``IN_GATE`` — msg-4184: acting code reads
+    ``actionable_verdict`` only) and that verdict is ``LIKELY_NOT`` ("not a matter for the
+    human"). ``CONFIRMED``, ``UNSURE``, a null / malformed / transport-error outcome and "not
+    called" are all *not cleared* — the fail-closed side (Bohr msg-4856 §3 G3)."""
+    if dr is None:
+        return False
+    av = dr.actionable_verdict
+    return av is not None and av.kind is TierCVerdictKind.LIKELY_NOT
+
+
+async def run_proceed_clearance(
+    decider: Decider | None,
+    *,
+    thread_id: str,
+    round_index: int,
+    roster: Mapping[str, Role],
+    messages: Sequence[ThreadMessage],
+) -> bool:
+    """D-4' G3 (T-pr-2b-3-human-identity-delegate, Takahito "B" decide): may the naysayer's
+    proceed handoff at the head of ``messages`` go to the implementer without a human?
+
+    **This is a gate, not an observer** — unlike :func:`run_tierc_hook` (D20 shadow), its answer
+    feeds carve-out ③ in :func:`spirrow_mindwire.routing.guard_proposer_to_implementer`. It is
+    monotone in the safe direction: it can only keep the door to code *closed*; it never opens a
+    route the rule-based guard would have closed. Hence every failure mode answers ``False``:
+
+    * ``decider is None`` (``backend=off`` — the production state at msg-4746): ``False``, so
+      under ``run`` a code handoff still stops at the human until the Decider is enabled (the
+      accepted price of G3, msg-4856 §3).
+    * the Decider declines to call (``None``), errors, or returns anything but an actionable
+      ``LIKELY_NOT``: ``False`` (:func:`proceed_cleared`).
+
+    No admission gate runs (``gate_result=None``): the gate classifies ``NEXT: human`` labels and
+    has nothing to say about a proceed turn.
+
+    **Reader of the log line.** One ``decider_proceed_clearance`` ``logger.info`` record per call
+    that reached the Decider, read by the operator off the conductor's own log — a separate prefix
+    from ``decider_decision`` so the §6 escalation tally is not mixed with proceed turns. Nothing
+    is posted to a chatroom thread, so no chatroom fallback surface is involved.
+    """
+    if decider is None or not messages:
+        return False
+    try:
+        state = state_builder(
+            turn_from_messages(
+                thread_id=thread_id,
+                round_index=round_index,
+                roster=roster,
+                messages=messages,
+                gate_result=None,
+                dispute_rounds=count_dispute_rounds(roster, messages),
+            )
+        )
+        dr = await decider.clear_proceed(state)
+    except Exception:
+        logger.warning("decider proceed clearance failed; carve-out ③ stays closed", exc_info=True)
+        return False
+    cleared = proceed_cleared(dr)
+    if dr is not None:
+        record: dict[str, Any] = {
+            "thread_id": thread_id,
+            "round_index": round_index,
+            "head_msg_id": messages[-1].msg_id,
+            "cleared": cleared,
+            **decision_result_to_dict(dr),
+        }
+        logger.info(
+            "decider_proceed_clearance %s", json.dumps(record, ensure_ascii=False, sort_keys=True)
+        )
+    return cleared
+
+
 __all__ = [
     "BODY_HEAD_M",
     "RECENT_EVENTS_N",
@@ -526,7 +605,9 @@ __all__ = [
     "is_tierc_entry",
     "log_decision",
     "never_retry",
+    "proceed_cleared",
     "routed_from_route",
+    "run_proceed_clearance",
     "run_tierc_hook",
     "turn_from_messages",
 ]
