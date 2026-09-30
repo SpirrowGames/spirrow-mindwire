@@ -6,6 +6,7 @@ review submit) without a live GitHub.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -1732,9 +1733,10 @@ async def test_submit_review_401_carries_no_retry_hint() -> None:
 
 @pytest.mark.anyio
 async def test_submit_review_single_attempt_semantics() -> None:
-    # PR-A ships classification, not retries. A caller that wants retries must
-    # add them behind an idempotency guard (PR-B, msg-3276). Guard: one POST per
-    # invocation, no built-in retry loop.
+    # The client is a single-attempt wire primitive. Retries live in the naysayer
+    # driver behind the head-scoped landed() guard (PR-B', msg-4780/msg-4781): the
+    # client has no head_sha, so a retry here could not tell this head's review
+    # from an earlier one's. Guard: one POST per invocation, no built-in retry loop.
     call_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1745,7 +1747,38 @@ async def test_submit_review_single_attempt_semantics() -> None:
     async with _client(handler) as client:
         with pytest.raises(GitHubHTTPError):
             await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x")
-    assert call_count == 1, "submit_review must be single-attempt in PR-A"
+    assert call_count == 1, "submit_review must stay single-attempt (retry lives in the driver)"
+
+
+@pytest.mark.anyio
+async def test_submit_review_sends_commit_id_when_given() -> None:
+    # PR-B' msg-4781 item 3: the POST is pinned to the commit the driver's landed()
+    # guard checks, so a moving head cannot turn a lost-response retry into a
+    # second review on the new head.
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, content=b'{"id": 1}')
+
+    async with _client(handler) as client:
+        await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x", commit_id="abc123")
+    assert seen == [{"event": "APPROVE", "body": "x", "commit_id": "abc123"}]
+
+
+@pytest.mark.anyio
+async def test_submit_review_omits_commit_id_when_none() -> None:
+    # Omitted, not sent as null: the request body stays byte-identical to the
+    # pre-PR-B' shape for every caller that does not pin a commit.
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, content=b'{"id": 1}')
+
+    async with _client(handler) as client:
+        await client.submit_review(_PR, event=ReviewEvent.APPROVE, body="x")
+    assert seen == [{"event": "APPROVE", "body": "x"}]
 
 
 # ---------- probe_identity() (scope probe payload) ----------

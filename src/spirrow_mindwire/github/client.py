@@ -441,7 +441,7 @@ class GitHubReviewClient(Protocol):
     async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]: ...
 
     async def submit_review(
-        self, pr: PrRef, *, event: ReviewEvent, body: str
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
     ) -> dict[str, Any]: ...
 
     async def probe_identity(self) -> int: ...
@@ -1334,8 +1334,19 @@ class GitHubClient:
             page += 1
         return out
 
-    async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
+    async def submit_review(
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
+    ) -> dict[str, Any]:
         """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event.
+
+        ``commit_id`` (optional) is GitHub's own API parameter: when given, the review
+        is attached to that commit instead of to whatever the PR head is when the POST
+        arrives. It is sent only when not ``None``, so omitting it leaves the request
+        body byte-identical to before. This client attaches no meaning to it — the
+        caller that retries (``NaysayerPrReviewDriver._submit_review``) pins the POST
+        to the same commit its ``landed()`` guard checks, so a head that moves between
+        a lost-response POST and the retry cannot produce a second review
+        (T-gate-review-submit-failure-handling msg-4781 item 3).
 
         On non-2xx the raised :class:`GitHubHTTPError` carries the header-derived
         ``retry_after`` and ``rate_limited`` fields (D-1) so the caller's classifier
@@ -1346,11 +1357,17 @@ class GitHubClient:
         A caller that wants retries must add them behind an idempotency guard
         (T-gate-review-submit-failure-handling PR-B: retries and ``landed()``
         ship together, never separately, or a POST whose response leg drops
-        can double-post — msg-1981 §4.2, msg-3275/msg-3276).
+        can double-post — msg-1981 §4.2, msg-3275/msg-3276). The retry lives in
+        the naysayer driver, not here: this method has no ``head_sha`` to scope a
+        guard by, so a client-level retry would mistake an earlier head's review
+        for this one's (msg-4780).
         """
         path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
         try:
-            resp = await self._client.post(path, json={"event": event.value, "body": body})
+            payload: dict[str, Any] = {"event": event.value, "body": body}
+            if commit_id is not None:
+                payload["commit_id"] = commit_id
+            resp = await self._client.post(path, json=payload)
         except httpx.RequestError as exc:
             raise GitHubHTTPError(f"POST {path} (review): {exc}") from exc
         if resp.status_code >= 400:

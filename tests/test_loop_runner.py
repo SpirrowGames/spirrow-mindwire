@@ -271,7 +271,9 @@ class _FakeGitHub:
     async def find_cross_pr_head_bound_approves(self, pr: Any, *, reviewer_login: str) -> Any:
         raise AssertionError("not called")
 
-    async def submit_review(self, pr: Any, *, event: Any, body: str) -> Any:
+    async def submit_review(
+        self, pr: Any, *, event: Any, body: str, commit_id: str | None = None
+    ) -> Any:
         raise AssertionError("not called")
 
     async def probe_identity(self) -> int:

@@ -165,6 +165,44 @@ _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED")
 # write reach GitHub").
 _ALL_LANDED_STATES = ("APPROVED", "CHANGES_REQUESTED", "COMMENTED")
 
+# In-run transient retry of the review POST (T-gate-review-submit-failure-handling PR-B',
+# design msg-4781 + msg-4783, accepted by Einstein after msg-4785). The retry lives HERE,
+# not in the GitHub client: only the driver holds the receipt's ``head_sha`` that scopes
+# the ``landed()`` idempotency guard (msg-4780).
+#
+# * At most ``_SUBMIT_MAX_ATTEMPTS`` POSTs of the primary verdict per run.
+# * A server-supplied ``retry_after`` is honoured EXACTLY — never shortened, never
+#   jittered. Above ``_RETRY_AFTER_MAX_S`` the retry budget is abandoned and the original
+#   error re-raised unchanged (msg-4782): truncating a server wait would spend the
+#   remaining attempts inside the throttle window.
+# * With no ``retry_after`` (transport error, 5xx, 429 without the header) the driver's
+#   own fixed schedule applies — values we chose.
+#
+# ``_RETRY_AFTER_MAX_S = 60``: msg-4783 asked for it to come from a configured
+# orchestrator timeout if one exists. None exists on main (checked 2026-09-30): the
+# scheduled wrapper runs the loop with no wall-clock kill (its process timeouts belong to
+# the decision composer and the material PUT), so the design's 60 s stands. Worst case in
+# one run: 3 POSTs + 2 x 60 s sleeps ≈ 2 minutes.
+_SUBMIT_MAX_ATTEMPTS = 3
+_RETRY_AFTER_MAX_S = 60.0
+_SUBMIT_FALLBACK_BACKOFF_S: tuple[float, ...] = (2.0, 8.0)
+
+
+def _submit_retry_delay(exc: GitHubHTTPError, retry_index: int) -> float | None:
+    """Seconds to wait before retry number ``retry_index`` (0-based), or ``None`` = abort.
+
+    ``None`` means "abandon the retry budget and re-raise": the server asked for a wait
+    longer than one run honours (msg-4783 table, row 2). A server ``retry_after`` at or
+    below :data:`_RETRY_AFTER_MAX_S` is returned as-is (row 1). No ``retry_after`` takes
+    our own schedule (row 3).
+    """
+    if exc.retry_after is not None:
+        if exc.retry_after > _RETRY_AFTER_MAX_S:
+            return None
+        return float(exc.retry_after)
+    return _SUBMIT_FALLBACK_BACKOFF_S[min(retry_index, len(_SUBMIT_FALLBACK_BACKOFF_S) - 1)]
+
+
 # The suppression-marker sentinel the replay path writes when a target-terminal
 # rejection makes further re-POSTs futile (msg-1984 §2). Its presence for the
 # current head is the ONE dedup ledger the driver keeps — same shape rationale as
@@ -1991,8 +2029,12 @@ class NaysayerPrReviewDriver:
         max_review_rounds: int = 0,
         review_login: str = _DEFAULT_REVIEW_LOGIN,
         shadow: bool = False,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._model = model
+        # Injected so the submit-retry backoff (``_submit_review``) is testable without real
+        # waiting; production uses asyncio.sleep.
+        self._sleep = sleep
         self._max_tokens = max_tokens
         self._skip_if_head_unchanged = skip_if_head_unchanged
         self._max_review_rounds = max_review_rounds
@@ -2610,30 +2652,125 @@ class NaysayerPrReviewDriver:
           Q6 answer, msg-1986). ``UNKNOWN`` from the probe means we could not decide
           scope — fail-safe: propagate as an ordinary :class:`GitHubHTTPError` so the
           existing exit-1 / quarantine path handles it (DESIGN v3 §3 "未分類は必ず 1").
-        * **anything else** (RETRYABLE transport, 5xx, unclassified) — re-raise, same
+        * **RETRYABLE** (transport, 5xx, 429, throttled 403 — :func:`classify_http_error`):
+          retried in-run, at most :data:`_SUBMIT_MAX_ATTEMPTS` POSTs in total, behind the
+          ``landed()`` idempotency guard (PR-B', msg-4781 / msg-4783). After each failed
+          attempt the order is: delay decision → possible abort → sleep → guard → POST.
+
+          - delay: :func:`_submit_retry_delay`. A server ``retry_after`` above
+            :data:`_RETRY_AFTER_MAX_S` abandons the budget — no sleep, no guard, the
+            original error re-raised unchanged (never truncated, msg-4782).
+          - guard: :meth:`_retry_guard` reads reviews STRICTLY and asks
+            ``landed(head_sha=receipt.head_sha, states=_ALL_LANDED_STATES)``. LANDED → the
+            lost-response POST did reach GitHub; return without a second POST (msg-3275
+            invariant). NOT_LANDED → POST again. UNKNOWN → stop and re-raise the original
+            error (fail closed; the replay pass owns it). A failing guard read goes through
+            :meth:`_classify_and_reraise`, so a dead token is still exit 2.
+          - a receipt with no ``head_sha`` cannot be guarded (``landed`` would answer
+            UNKNOWN), so it is never retried — decided before sleeping, not after.
+          - budget exhausted → the last RETRYABLE error is re-raised unchanged, exactly as
+            before PR-B' (exit 1 → quarantine, which notifies; msg-4785).
+
+          Every POST — primary, retry, and the COMMENT fallback — passes
+          ``commit_id=receipt.head_sha`` so GitHub attaches the review to the same commit
+          the guard checks; a head that moves between a lost response and the retry cannot
+          yield a second review on the new head (msg-4781 item 3).
+        * **anything else** (TERMINAL with UNKNOWN scope, unclassified) — re-raise, same
           as before this change.
         """
-        try:
-            await self._github.submit_review(pr, event=receipt.event, body=receipt.body)
-        except GitHubHTTPError as exc:
-            if exc.status_code == 422 and "own pull request" in str(exc).lower():
-                # Same body carries the ORIGINAL verdict footer; that is intentional
-                # (msg-1987 Q5-A rationale: record the attempted event, not the fallback).
-                # The fallback POST goes through the SAME classification funnel — a
-                # 401/403/404 on the fallback must land in EnvironmentTerminalError /
-                # TargetTerminalError / raw-UNKNOWN just like the primary, so an
-                # environment outage during the fallback does NOT quarantine the thread
-                # (PR-gate #280 objection 2026-09-17: unclassified fallback fell through).
-                try:
-                    await self._github.submit_review(
-                        pr, event=ReviewEvent.COMMENT, body=receipt.body
-                    )
-                except GitHubHTTPError as fallback_exc:
-                    await self._classify_and_reraise(
-                        pr, fallback_exc, origin="submit-comment-fallback"
-                    )
+        commit_id = receipt.head_sha or None
+        attempt = 1
+        while True:
+            try:
+                await self._github.submit_review(
+                    pr, event=receipt.event, body=receipt.body, commit_id=commit_id
+                )
                 return
-            await self._classify_and_reraise(pr, exc, origin="submit")
+            except GitHubHTTPError as exc:
+                if exc.status_code == 422 and "own pull request" in str(exc).lower():
+                    await self._submit_same_identity_fallback(pr, receipt=receipt)
+                    return
+                if (
+                    commit_id is not None
+                    and attempt < _SUBMIT_MAX_ATTEMPTS
+                    and classify_http_error(exc) is Retryability.RETRYABLE
+                ):
+                    delay = _submit_retry_delay(exc, attempt - 1)
+                    if delay is None:
+                        logger.warning(
+                            "naysayer submit retry abandoned: pr=%s retry_after=%s exceeds "
+                            "%.0fs — re-raising without truncating the server wait",
+                            pr.slug,
+                            exc.retry_after,
+                            _RETRY_AFTER_MAX_S,
+                        )
+                    else:
+                        logger.warning(
+                            "naysayer submit retry: pr=%s attempt=%d/%d status_code=%s "
+                            "retry_after=%s sleep=%.1fs",
+                            pr.slug,
+                            attempt,
+                            _SUBMIT_MAX_ATTEMPTS,
+                            exc.status_code,
+                            exc.retry_after,
+                            delay,
+                        )
+                        await self._sleep(delay)
+                        state = await self._retry_guard(pr, head_sha=commit_id)
+                        if state is LandedState.LANDED:
+                            logger.info(
+                                "naysayer submit retry: review already landed for %s "
+                                "head=%s — the lost-response POST reached GitHub; no re-POST",
+                                pr.slug,
+                                commit_id[:12],
+                            )
+                            return
+                        if state is LandedState.NOT_LANDED:
+                            attempt += 1
+                            continue
+                        # UNKNOWN: fail closed — re-raise the original error below.
+                await self._classify_and_reraise(pr, exc, origin="submit")
+
+    async def _retry_guard(self, pr: PrRef, *, head_sha: str) -> LandedState:
+        """Idempotency guard before a submit retry: has our review for ``head_sha`` landed?
+
+        Uses the STRICT fetcher (a read failure raises rather than reading as "empty",
+        which would authorise a double POST) and routes that failure through the same
+        :meth:`_classify_and_reraise` funnel as a submit failure, so a dead token found
+        by the guard is still :class:`EnvironmentTerminalError` (exit 2) and a transient
+        read failure stops the retry loop with a raw :class:`GitHubHTTPError`.
+        """
+        try:
+            reviews = await self._github.fetch_pr_reviews_strict(pr)
+        except GitHubHTTPError as read_exc:
+            await self._classify_and_reraise(pr, read_exc, origin="submit-retry-guard")
+            raise  # unreachable — _classify_and_reraise always raises
+        return landed(
+            reviews,
+            head_sha=head_sha,
+            login=self._review_login,
+            states=_ALL_LANDED_STATES,
+        )
+
+    async def _submit_same_identity_fallback(self, pr: PrRef, *, receipt: ReviewReceipt) -> None:
+        """T22 same-identity 422 → re-submit the receipt body once as a COMMENT (no retry).
+
+        Same body carries the ORIGINAL verdict footer; that is intentional (msg-1987 Q5-A
+        rationale: record the attempted event, not the fallback). The fallback POST goes
+        through the SAME classification funnel — a 401/403/404 on the fallback must land in
+        EnvironmentTerminalError / TargetTerminalError / raw-UNKNOWN just like the primary,
+        so an environment outage during the fallback does NOT quarantine the thread
+        (PR-gate #280 objection 2026-09-17: unclassified fallback fell through).
+        """
+        try:
+            await self._github.submit_review(
+                pr,
+                event=ReviewEvent.COMMENT,
+                body=receipt.body,
+                commit_id=receipt.head_sha or None,
+            )
+        except GitHubHTTPError as fallback_exc:
+            await self._classify_and_reraise(pr, fallback_exc, origin="submit-comment-fallback")
 
     async def _classify_and_reraise(self, pr: PrRef, exc: GitHubHTTPError, *, origin: str) -> None:
         """Classify a :class:`GitHubHTTPError`, probe if terminal, then raise the typed variant.
@@ -2645,9 +2782,9 @@ class NaysayerPrReviewDriver:
 
         Semantics:
 
-        * ``Retryability.RETRYABLE`` → re-raise the raw ``exc`` (a caller that wants
-          retries adds them behind an idempotency guard — retries + ``landed()``
-          ship together in PR-B, msg-3276).
+        * ``Retryability.RETRYABLE`` → re-raise the raw ``exc``. Retries happen in the
+          caller, behind the ``landed()`` guard (:meth:`_submit_review`, PR-B'); by the
+          time a RETRYABLE error reaches this funnel the caller has decided to stop.
         * ``Retryability.TERMINAL`` + ``Scope.ENVIRONMENT_*`` → raise
           :class:`EnvironmentTerminalError` (daemon exits 2, alert-not-quarantine).
         * ``Retryability.TERMINAL`` + ``Scope.TARGET`` → raise
