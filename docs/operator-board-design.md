@@ -2,7 +2,7 @@
 
 > **実インフラ値**（ホスト名 / IP / パス）は [[platform:infra-registry]] が正本。この文書は `{{PLACEHOLDER}}` で参照する（規約 §3.1）。
 
-版: **0.3.5** / 2026-09-08 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除、msg-2567 → msg-2569 で v0.3.1 blocking 解除、msg-（v0.3.4 endorse）で §17 承認、msg-2664 で §17 second-round correctness + structure 指摘、msg-（v0.3.5 endorse）で §17.1 4 行目 + §17.3 承認）+ PR-review naysayer（PR #224 msg-(gate) → v0.3.2 で 2 件 blocking 解除、round-2 → v0.3.3 で 1 件 blocking 解除、round-3 → APPROVE with structure advisory on `ci_clock_start`）/ v0.2 差分の正本: Bohr msg-2544 / v0.3 差分の正本: Bohr msg-2566 / v0.3.1 差分の正本: Bohr msg-2568 / v0.3.2 差分の正本: 本ファイル §5.2A（Heisenberg、PR-review msg-(gate) 受け入れ）/ v0.3.3 差分の正本: 本ファイル §5.2A.4 R1a/R1b 行（Heisenberg、PR-review msg-(gate) round-2 受け入れ）/ v0.3.4 差分の正本: 本ファイル §17（Bohr msg-2595、人 msg-2594 decide 後の残余レジスタ新設）/ v0.3.5 差分の正本: 本ファイル §17.1 4 行目 + §17.3（Bohr msg-2665、Einstein msg-2664 の correctness + structure 指摘を受け入れ、gate pending 保留の re-fire 経路欠落を §17 に固定）
+版: **0.3.6** / 2026-10-01 / 起草: Claude（Cowork セッション）/ 決定者: Takahito / 設計レビュー: Einstein（msg-2543 → msg-2545 で blocking 解除、msg-2567 → msg-2569 で v0.3.1 blocking 解除、msg-（v0.3.4 endorse）で §17 承認、msg-2664 で §17 second-round correctness + structure 指摘、msg-（v0.3.5 endorse）で §17.1 4 行目 + §17.3 承認）+ PR-review naysayer（PR #224 msg-(gate) → v0.3.2 で 2 件 blocking 解除、round-2 → v0.3.3 で 1 件 blocking 解除、round-3 → APPROVE with structure advisory on `ci_clock_start`）/ v0.2 差分の正本: Bohr msg-2544 / v0.3 差分の正本: Bohr msg-2566 / v0.3.1 差分の正本: Bohr msg-2568 / v0.3.2 差分の正本: 本ファイル §5.2A（Heisenberg、PR-review msg-(gate) 受け入れ）/ v0.3.3 差分の正本: 本ファイル §5.2A.4 R1a/R1b 行（Heisenberg、PR-review msg-(gate) round-2 受け入れ）/ v0.3.4 差分の正本: 本ファイル §17（Bohr msg-2595、人 msg-2594 decide 後の残余レジスタ新設）/ v0.3.5 差分の正本: 本ファイル §17.1 4 行目 + §17.3（Bohr msg-2665、Einstein msg-2664 の correctness + structure 指摘を受け入れ、gate pending 保留の re-fire 経路欠落を §17 に固定） / v0.3.6 差分の正本: 本ファイル §18（T47 セッション状態の語彙。Bohr msg-5196 / msg-5199、Einstein msg-5200、human が Tier-C 判断点 3 として採用）
 設計 SOT: chatroom `spirrow-mindwire/T-operator-board`。本文はその同期コピー。
 対象リポジトリ: spirrow-conclair（状態）・spirrow-mindwire（tick / executor）・spirrow-magickit（UI）
 根拠: 2026-09-03〜04 operator セッションの実測（116 判断点）、light ティア判断リプレイ（一致 85%）、3 リポジトリのソース調査（conclair `cb517af` / mindwire `60f52b1` / magickit `6bfa87d`）
@@ -222,6 +222,7 @@ ALTER TABLE project_control ADD COLUMN desired_expires_at TIMESTAMPTZ NULL;
 | R-MERGED | ready_for_human / any | gh で `merged=true` | `post_merge` | repo プロファイルの post-merge 手順（mindwire: sync-repo.ps1）→ 台帳 close 可否判定 → `NEXT: Bohr` 相当で proposing へ | |
 | R-POSTMERGE-DONE | post_merge | 後処理完了 ∧ thread resolved | `done` | | |
 | R-POSTMERGE-NEXT | post_merge | 後処理完了 ∧ thread active | `proposing` | Bohr を起こす | |
+| **R-RELAY-STOP** | any | head が `conductor-relay` の停止通知で `mindwire:stop v1` マーカーを持つ（**R-HUMAN より先に評価**）【v0.3.6 §18.4】 | `stalled` | `facts.stop_kind` / `facts.stop_event` をマーカーから設定。composer は呼ばない | |
 | R-HUMAN | any | `NEXT: human`（役の Tier-C 依頼） | `ready_for_human` | composer で material 生成、`presented_hash` 記録 | J-ESCALATE（依頼段落に選択肢が無い／operator 権限で済む内容なら差し戻し） |
 | R-NONE-COND | any | `NEXT: none` ∧ 本文に着手条件 | `waiting` | `waiting_on` を構造化して保存 | J-COND（条件の抽出） |
 | R-NONE-SETTLED | any | `NEXT: none` ∧ thread resolved | `done` | | |
@@ -579,6 +580,7 @@ profile  = "ephemeral-develop"
 - **msg-（PR #229 fix v0.3.4 round-5）Heisenberg（全面受け入れ）**: 押し戻しゼロ。naysayer の指摘は factual に正しい。schema 検証（`gh api graphql __type CheckRun/CheckSuite`, 2026-09-08）: `CheckRun.checkSuite: CheckSuite!` (non-null) かつ `CheckSuite.createdAt: DateTime!` (non-null) が schema 上保証される。∴ どんな CheckRun にも必ず parent CheckSuite が存在し、その createdAt は必ず取れる。matrix job / `needs:` chain / concurrency-limited queue も同じ workflow run の parent CheckSuite を共有するため、Defense B の caller mapping (`CheckRow.created_at = parent.checkSuite.createdAt`) で必ず non-null timestamp が入る。修正: (1) Defense B 節に schema-guarantee 根拠段落を追加（どのケースをカバーするかを明示、`gh api graphql __type` 検証 note 付き）、(2) shield-breaking 条件を (a) obligation 違反、(b) API-platform 非後方互換変更 の 2 条件に縮約、matrix / `needs:` を除去、workflow-shape change trigger PR 警戒も撤回。RES-CI-CLOCK-FALLBACK の deferred 判断は据え置き（防御 A + 防御 B の 2 層は保持、shield-breaking 表面が縮んだだけで防御力は増した）。round-2/round-4 review-treatment note を round-5 の縮約を反映して書き直し。版番号は v0.3.4 維持（fix commit）。#229 の head が動いたので #236 も §17.3.2 rebase 規律に従い rebase。
 - **msg-2730 pr-review naysayer（PR #236 gate round-1、v0.3.5 content review、REQUEST_CHANGES ci=success）**: BLOCKING 1 件（invariant、where=`docs/operator-board-design.md:565`）— 「#236 が更新後の #229 head に正しく rebase されているなら、#229 の review 修正ログ（round-1〜round-5）は base 側に既に存在し、この diff では変更のない context 行として現れなければならない。しかし実際は全て `+` で導入されている ∴ 実装者が #229 の更新履歴を base に持たせず stacked 側の本 PR に直接ペーストして二重管理している」＋「ファイル先頭で版番号を 0.3.5 へ上げながら追加ログ中で『版番号は v0.3.4 維持』と主張するのは事実と矛盾し読み手を欺瞞する」。**explicit endorse 3 件**（① §17.3.1 のエスカレーション境界と cap の分離＝operator lane の駐機予算 30 分と gate 内部の `CAP_NOCLOCK` 12h の流用禁止、② §17.3.2 の rebase 規律＝「畳むか同梱するか」の判断自体を禁じて D8 症状を構造的に閉じた点、③ 未 vendoring ADR ポインタの防御的扱い＝`ADR-2026-06-03-16` の body 取得後に矛盾したら silent edit せず設計ターンの trigger にする、OBL-DECLARE-UNREADABLE の正しい実践）。ADR pointers=2（ADR-06-03-16 / ADR-06-04-19、いずれも VERDICT に非寄与）。
 - **msg-2731 Bohr（PR #236 gate round-1 の裁定 = 棄却、本エントリは Heisenberg が記録・実測を再現）**: BLOCKING の事実的前提が 3 つとも測定で偽。**主張 A「#236 は #229 の更新後 head に rebase されていない」→ 偽**: `git merge-base <#236 head ce4c23e> origin/main` = `f56ee51` であり、これは PR #229 の最終 head（`git rev-parse refs/remotes/pr/229` = `f56ee51`、2026-09-08T07:17Z に `ce49f5a` として main へ merge 済）そのもの ∴ #236 は #229 最終 head の直系子孫で、これ以上 rebase された状態は定義上存在しない。**主張 B「#229 の review 修正ログが base 側に存在するはず」→ 偽（前提が成立しない）**: `PR #229 fix v0.3.4` の出現数は base `f56ee51` = **0**、head `ce4c23e` = **5**（`origin/main` `b0b1829` でも **0**）。#229 の 5 commit はすべて §17.2 本文の修正で、#229 は自分自身の round ログを §14 に一度も書いていない。§14 の review 履歴台帳を前へ運ぶことは後続版である #236 の成果物内容そのものであって、base から失われた context ではない。**主張 B'「二重管理している」→ 偽**: base 出現数が 0 である以上、当該行は世界に 1 箇所しか存在しない。**主張 C「v0.3.5 へ上げる diff の中で『版番号は v0.3.4 維持』と書くのは矛盾・欺瞞」→ 偽（主語の取り違え）**: 係争 5 行はいずれも §14 決定ログのエントリで、bold の主語が `PR #229 fix v0.3.4 round-N` と自分の対象を名指ししており、base の版ヘッダ実測が `版: **0.3.4**` である以上 #229 の fix commit についての真な言明である。一方 #236 が `0.3.5` へ上げるのは §17.1 4 行目（`RES-GATE-PENDING-NO-REFIRE`）＋ §17.3 を新規に足すからで、ヘッダの `v0.3.5 差分の正本:` 行がその根拠を明示している ∴ 別の PR についての 2 つの真な言明であって矛盾も欺瞞も無い。**∴ 係争 5 行は編集しない** — 記述は実測で真であり、偽の異議に合わせて正確な履歴記録を書き換えることは、記録の正確さを reviewer の誤読に譲り渡すことになる。付随: `where` の行番号は今回も不正確（head `ce4c23e` の 565 行目は msg-2664 Einstein のエントリで、係争 5 行は 569 / 571 / 573 / 575 / 577 行目。7 周中 5 周で不正確 ∴ 同定キーは逐語引用であって行番号ではない）。**advisory（blocking ではない）**: diff の中に書かれた自己言及的なプロセス主張（「本 PR は rebase 済み」等）は git を実行できない diff-only の reviewer には原理的に検証不能であり、本ラウンドの false objection の発生源である（§17.2 の `head_pushed_at` proxy 誤りや round-4 のサンプリング flaw と同族の「検証者が立っている場所から検証できない主張」の型）— ただし当該記述は真かつ §17.3.2 が要求する記録なので #236 の欠陥ではなく、修正は要求しない。**本 PR (#236) の版は v0.3.5 のまま（本エントリは fix commit）**。§17.3.2 の rebase 規律は #229 が merge 済で終端に達し stack の親が main に移ったため、本 fix で `origin/main`（`b0b1829`）へ rebase して force-push した（`docs/operator-board-design.md` の blob は `f56ee51` と `b0b1829` で同一の `bb922d94` ∴ 内容 no-op・衝突なし。以後の reviewer から「rebase されているか」という問い自体が消える）。手動発火した gate が design thread に `pr-gate-relay` を投げない件（本ラウンドの verdict が台帳スレッドにしか存在しなかった原因）は、§17.3.2 の「常に独立、常に rebase」に従い本 PR に同梱せず別 PR・別行として立てる。
+- **msg-5196 / msg-5199 Bohr、msg-5198 / msg-5200 Einstein、human 採用（v0.3.6、T47）**: セッション状態の語彙を §18 として追加。観測の軸（`observation` / `observation_reason`）だけを足し、状態は 1〜5 の優先順でカードから導く（msg-5198 edge-case 指摘で `idle` を残り全部に）。R-RELAY-STOP と `mindwire:stop v1` マーカーで conductor-relay の停止通知 3 種を R-HUMAN から外す。通知を投稿できなかったときは終了コードで分けず log tail で分類（msg-5198 correctness 指摘、spawn timeout は exit 1）。log 行の前置きへの対処（msg-5200 advisory）は P1。マーカーは Heisenberg の T47 PR で実装。
 
 ## 15. 開発の進め方（2026-09-05 Takahito 承認）
 
@@ -643,6 +645,7 @@ board が動くまでの唯一の耐久面はこの設計書。∴ 「宣言し�
 | **RES-WIRING** | `gate_admission` の呼び出し元が存在しない。§5.2A の期待効果表（gate invocation ・ relay noise ・ 人の停止の削減）は未実現。今の production は依然として旧経路 | 呼び出し元数 = 0（`grep -r "gate_admission(" src/` が `def gate_admission` 以外 0 行）→ **配線後は 1**（`conductor/core.py` の `Conductor._admit`）。production で配線が生きている観測物は 2 つ: ① `NEXT: pr-review` を踏むたび毎回出る `gate admission for <ref>: rule=<R> admission=<verdict>` の INFO ログ ② R4 のときだけ thread に残る `<!-- mindwire:ci-route v1 ... -->` マーカ（deferral は無記録ゆえ、赤 CI の routing だけが痕跡を残す） | 無し（**scheduled**、次の PR）。配線 PR は本文で `RES-WIRING` を名指しすること | **closed**（配線 PR で discharge。`nomination_is_self` の読み替え 1 件を deviation として PR 本文で開示。既定 ON で、rollup を読めなければ配線前の挙動に縮退する） |
 | **RES-A-GAP** | A landing（本設計の §5.2A `gate_admission`）〜 board 稼働の間、人の停止に集約可視面が無い（msg-2568 §C の期間限定 gap）| 無し（期間限定） | board 稼働で自動消滅 | 期限付き受容 |
 | **RES-GATE-PENDING-NO-REFIRE** | PR-gate が pending CI で保留するとき `NEXT: human` で終端し、再発火経路が無い。時間が答える問いで人を止める（実例: msg-2600, 2026-09-08。本設計スレッド自身の中で発生した D7 症状） | gate の `COMMENT (ci=pending)` msg の直後の `NEXT:` が `human` であること | 無し。board の `gate` → `waiting`（`waiting_on = {ci: <head>}`）＋ tick 再発火で自動消滅 | 期限付き受容（board 稼働で消滅） |
+| **RES-SDK-DESCENDANT-LEAK** | proposer / naysayer の SDK セッションは Job Object を持たない。connect timeout（#385）のとき、CLI の直接の子は SDK が cancel 時に終わらせるが、その子孫は残る（Heisenberg msg-5093 の実測、stand-in 実行ファイル 1 回、Windows。本物の `claude` CLI の子孫の挙動は未観測）| loop host で孤児プロセスが実際に見つかること | 孤児プロセスの実見、または T49（常駐）に GO が出たとき → Job Object の設計ターン | deferred（Bohr msg-5196 DECIDED、Einstein msg-5198 endorse） |
 
 ### 17.2 RES-CI-CLOCK-FALLBACK の中身 —「`head_pushed_at` に替えるだけ」ではない（Bohr msg-2595 §C）
 
@@ -726,3 +729,97 @@ board が稼働するまでの間、本行は「board 稼働で自動消滅」�
 **rebase 規律（Einstein msg-（v0.3.5 endorse 相当）の stacked-PR orphan 指摘、msg-2664 対応**）: `#229` が REQUEST_CHANGES を受けて fix commit + force-push で頭が動いた場合、この stacked PR（本行を持つ）の base が dead commit を指すことになる。**`#229` を動かした直後に、常に本 stacked PR を新しい `#229` head に rebase して force-push すること**。「畳むか同梱するか」の判断を挟んだ瞬間に memory 依存が戻る（記録先 bind の目的に反する）ので、`#229` が REQUEST_CHANGES を受けても本 stacked PR を畳まない。常に独立、常に rebase。
 
 **ADR-2026-06-03-16（naysayer CI-gate、approve-while-red 防止）との整合**: msg-2657 の「docs-only だから CI を飛ばす」を規則として持たない msg-2665 §B の判断は、本 ADR が SOT である approve-while-red 防止の invariant に整合する（本 ADR の body は本 repo に vendoring されておらず、Heisenberg 本ターンの実測でも `docs/adr/` に存在せず spec/adr_index.yaml が title のみを持つ状態。OBL-DECLARE-UNREADABLE により本 pointer は title からの推論ではなく、msg-2665 §C の指示「読んでから引く」の第 2 分岐「読めなかったら pointer のまま置く」として記録する。本 ADR body が repo に入った後の設計ターンで、§B の判断と本 ADR の実文が矛盾していれば silent edit で辻褄を合わせず設計ターンの trigger にすること）。
+
+## 18. セッション状態の語彙 — 観測の軸と状態の導出【v0.3.6、T47】
+
+出所: `spirrow-mindwire/T-agmsg-transport-lessons-readiness-session-claim-board`。Fermi msg-3099 §4（agmsg `where.sh` / `peek.sh` 由来の 2 軸案）→ Bohr msg-5196（S-1〜S-4）→ Einstein msg-5198（blocking 2 件）→ Bohr msg-5199（改訂）→ Einstein msg-5200（endorse、advisory 1 件）→ human 採用（Tier-C 判断点 3）。
+
+Fermi 案の「状態」軸を新しい enum として持つと、§5.1 の列と同じ内容を二重に持つことになる。∴ **観測の軸だけを新しく足し、状態はカードから導く値にする**。新しい列は作らない。
+
+### 18.1 観測の軸（S-1）
+
+`board_cards` に 2 列を足す。
+
+```
+observation         TEXT NOT NULL DEFAULT 'observed' CHECK IN ('observed','unobserved'),
+observation_reason  TEXT NULL CHECK IN ('node_offline','chatroom_unreachable','log_unreadable','never_ticked'),
+CHECK ((observation = 'unobserved') = (observation_reason IS NOT NULL))
+```
+
+- `observation_reason` は `unobserved` のとき必須、`observed` のとき NULL。
+- `node_offline` = `board_nodes.last_tick_at` が 2 tick 以上止まっている。
+- `unobserved` のカードでは、列は「最後に観測できた値」として残す。描画はグレーの斜線と「最終観測 <時刻>」。**`idle` や通常の列と同じ色では描かない**（agmsg `where.sh` が `resolved=false`（判定不能）を「ペイン無し」と報告することを禁じているのと同じ理由）。
+
+### 18.2 状態の導出（S-2、msg-5199 改訂）
+
+セッション状態は列そのものではなく、カードから導く値。**上から順に見て、最初に当たったものを採る**。P1 で実装する純関数の仕様であり、テストは「全列 × `in_flight` の有無 × observation」を総当たりする。どのカードにも必ずちょうど 1 つの状態が付く。
+
+| 順 | 条件 | 状態 |
+|---|---|---|
+| 1 | `observation = unobserved` | `unobserved(reason)`（状態は出さない。列は最後に観測できた値として残す） |
+| 2 | 列が `ready_for_human` | `awaiting_approval` |
+| 3 | 列が `stalled` | `facts.stop_kind` の値（§18.3） |
+| 4 | `in_flight` がある（列は問わない） | `working` |
+| 5 | それ以外すべて | `idle`（残り） |
+
+- 1 を最初に置く理由: 観測できていないカードで最後に見えた値（例: `working`）を出すと、`resolved=false` を「ペイン無し」と報告するのと同じ誤りになる。
+- **`idle` は止まっている証拠にはならない**。「どの規則も発火していない」という意味だけ（agmsg `peek.sh` の注記と同じ）。`proposing` で `in_flight` が無い tick の合間のカードもここに入る。埋もれないのは R-SILENT が 3 tick / 6 tick で拾うから。
+- Fermi の語との対応: `awaiting_approval` = `ready_for_human`、`working` = `in_flight` あり、`stalled` / `stand_down` = 列 `stalled` の `stop_kind`（`stand_down` 用の列は作らない）、`idle` = 残り。
+
+### 18.3 `facts.stop_kind` と `facts.stop_event`
+
+- `facts.stop_kind ∈ {stalled, stand_down, spawn_timeout, quarantine, silent, human_spin}`。
+- `facts.stop_event` には元の事象（`conductor.stalled` / `conductor.stand_down` / `spawn.timeout`）のフィールドをそのまま入れる。停止通知のマーカー（§18.4）の payload から `kind` を除いたものと同じ。
+- 列 `stalled` に入る経路ごとの値:
+
+| 経路 | `stop_kind` |
+|---|---|
+| R-RELAY-STOP（§18.4、マーカーあり） | マーカーの `kind` から: `conductor.stalled` → `stalled`、`conductor.stand_down` → `stand_down`、`spawn.timeout` → `spawn_timeout` |
+| R-QUAR（exit≠0、§18.5） | log tail から `stand_down` / `stalled` / `spawn_timeout`、どれでもなければ `quarantine` |
+| R-SILENT | `silent` |
+| R-HUMAN-SPIN | `human_spin` |
+
+- **未割り当て（P1 前に決めること）**: §6.3 は `StopReason.empty_thread` を `stalled` に、`no_handoff_to_human` / `no_progress_to_human` / `round_cap` を J-STALL 経由で `stalled` か `ready_for_human` に流す。これらが `stalled` に入ったときの `stop_kind` は上の 6 値のどれにも当たらない。§18.2 の順 3 が全域になるには、この割り当てが要る。本版では決めていない（Heisenberg が T47 実装時に気付いた欠け。値を足すか既存値に寄せるかは設計ターン）。
+
+### 18.4 R-RELAY-STOP（S-3 前半、R-HUMAN より優先）
+
+| ID | from | 条件 | to | 行為 | 判断 |
+|---|---|---|---|---|---|
+| R-RELAY-STOP | any | head の author が `conductor-relay` で、本文に `mindwire:stop v1` マーカーがある | `stalled` | `facts.stop_kind` / `facts.stop_event` をマーカーから設定 | |
+
+- R-HUMAN に拾わせない理由: R-HUMAN は composer に選択肢付きの判断材料を作らせる。watchdog の停止が「判断の依頼」に見え、それ自体が聞くまでもない問いになる（D7）。
+- マーカー（実装済、`src/spirrow_mindwire/conductor/stop_marker.py`）:
+
+  ```
+  <!-- mindwire:stop v1 {"kind":"conductor.stalled","project":"...","thread":"...",...} -->
+  ```
+
+  payload = 事象の `kind` と、その事象のフィールドを平らに並べたもの。停止通知 3 種（`render_stalled_notice` / `render_stand_down_notice` / `render_spawn_timeout_notice`）すべてに付く。spawn timeout の通知は最後の試行の事象から作るので `attempt = SPAWN_ATTEMPTS`。
+- 置き場所: 最後の `NEXT: human` 行の**上**に 1 行、間に空行を 1 つ。`NEXT:` は最終行のまま、`NEXT:` の直上の行は空のまま（`TIER-C:` / `STOP:` の読み手に影響しない）。§5.2A.5 の ci-route マーカーは `NEXT:` の後ろに置くが、本マーカーはこの 2 点のため前に置く。
+- 読み手は `parse_stop_marker`（同モジュール）。書きは厳密、読みは寛容（空白や改行の揺れを許し、壊れたマーカーは例外にせず無視する）。自由文のフィールドに `-->` が入っても payload の中で閉じないよう、書き手は `>` をエスケープする（ci-route マーカーと同じ）。
+- 壊れたマーカーを無視した場合、その通知は R-HUMAN に落ちる。これはマーカー導入前と同じ扱い。
+
+### 18.5 通知を投稿できなかった場合（S-3 後半、msg-5199 改訂）
+
+停止通知が投稿できなかったとき、終了コードは停止の種類で決まらない。stand_down は exit 3、stalled は exit 4 だが、**spawn timeout は元の例外を上げ直すので exit 1**（#385 D-3「新しい exit code は足さない」）。∴ 終了コードでは分けない。
+
+- **対象**: 終了コードが 0 以外すべて（R-QUAR が扱うもの全部）。
+- **判定**: log tail を次の順で見て、最初に当たったものを `stop_kind` にする。コードで決める（LLM は使わない）。
+  1. `conductor.stand_down` の事象行 → `stand_down`
+  2. `conductor.stalled` の事象行 → `stalled`
+  3. `spawn.timeout` の事象行で、かつ `attempt=` が `SPAWN_ATTEMPTS`（現在 2）→ `spawn_timeout`
+  4. どれにも当たらない → `quarantine`。ここで初めて J-STALL（LLM）に回す。
+- 3 で `attempt` まで見る理由: 1 回目で timeout し、再試行は成功し、その後に別の原因で落ちた run がありうる。log tail には `attempt=1` の行だけが残り、これを spawn timeout と分類すると原因を取り違える。
+- **語彙の正本**: 事象名は `EVENT_KIND_STAND_DOWN`（`conductor/stand_down.py`）、`EVENT_KIND_STALLED`（`conductor/stall.py`）、`EVENT_KIND_SPAWN_TIMEOUT` と `SPAWN_ATTEMPTS`（`conductor/spawn_timeout.py`）の定数から取る。**P1 の実装はこれらの文字列を直に書かないこと。**
+- **行の先頭一致にしない（Einstein msg-5200 advisory、P1 で扱う）**: 事象行はロガー経由で出るので、log tail の行にはタイムスタンプやレベルなどの前置きが付きうる。行の 0 文字目への一致では当たらず、毎回 J-STALL に落ちる。P1 では、前置きの後ろのメッセージ本体で事象名を探すこと。その log tail の実際の書式（wrapper が quarantine 記録に書く `session_log_tail`）は本版では確認していない。
+- **P1 のテスト**: 3 種それぞれ、行が無い場合、`attempt=1` だけの場合、前置き付きの行、を log tail の fixture で固定する。
+
+### 18.6 描画と通知（S-4）
+
+- 並び順: 上から `ready_for_human`（黄）、`stalled`（赤）、残り。`unobserved` はどの色とも違う表示（§18.1）。
+- 新しい通知経路は作らない。`stalled` の Discord 通知は、今の wrapper の park と quarantine の経路が既に送っている。`ready_for_human` の通知は §8 のとおり。
+
+### 18.7 本版の範囲
+
+- 入ったもの: 本節、§5.2 への R-RELAY-STOP 行、停止通知 3 種へのマーカーとそのテスト（`tests/test_stop_marker.py`）、§17.1 の `RES-SDK-DESCENDANT-LEAK` 行。
+- 入っていないもの: ボード本体（`board_cards` の列追加、状態導出の純関数、R-RELAY-STOP、log tail の判定）は P1。T45 のフック申告は T47 から切り離して別に起案（Bohr msg-5196）。wrapper の起動ごとの wall clock は T47 の次に起案（同）。

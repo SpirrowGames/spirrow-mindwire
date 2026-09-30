@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 from ..ulid_util import new_ulid
 from ..value_objects import Event, Role
 from .handoff import HUMAN_TOKEN
+from .stop_marker import render_stop_marker
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,7 @@ def render_spawn_timeout_notice(event: Event) -> str:
         f"connect が終わらなかった原因は特定していません。\n\n"
         f"次にやること: ループ host で Claude Code CLI が起動して応答するかを確認してください。"
         f"直したら、進め先の `NEXT:` を書いてください。head が動くまでループは再開しません。\n\n"
+        f"{render_stop_marker(event)}\n\n"
         f"NEXT: {HUMAN_TOKEN}"
     )
 

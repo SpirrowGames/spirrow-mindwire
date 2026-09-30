@@ -55,6 +55,7 @@ from ..ulid_util import new_ulid
 from ..value_objects import Event
 from .gate_records import RELAY_AUTHOR
 from .handoff import HUMAN_TOKEN
+from .stop_marker import render_stop_marker
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +246,7 @@ def render_stand_down_notice(event: Event) -> str:
         f"Conductor は誰も起動しません。その理由をここに残します。\n\n"
         f"次にやること: 上の項目を直してから、このスレッドの head に進め先の `NEXT:` を"
         f"書いてください。head が動くまでループは再開しません。\n\n"
+        f"{render_stop_marker(event)}\n\n"
         f"NEXT: {HUMAN_TOKEN}"
     )
 
