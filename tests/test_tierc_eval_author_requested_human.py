@@ -72,33 +72,62 @@ def _row(head_content: str, field: str | None) -> dict[str, Any]:
     )
 
 
-@pytest.mark.parametrize(
-    ("head_content", "field", "expected"),
-    [
-        pytest.param("decide\n\nTIER-C: goal\nNEXT: human", None, True, id="body-next-human"),
-        pytest.param("decide, no body token", "human", True, id="field-human"),
-        pytest.param("design\n\nNEXT: Einstein", "none", False, id="target-divergence"),
-        pytest.param("design\n\nNEXT: Einstein", "Schrodinger", False, id="field-unresolvable"),
-    ],
-)
+# One case list, and the branch check runs on the very call that produces the column: the
+# resolver is wrapped, so each case asserts the ``Handoff`` that ``build_eval_row`` itself resolved
+# from these exact inputs (not a proxy resolve on other strings). ``AUTHOR`` marks the
+# author-requested branch.
+AUTHOR = "author_requested_human"
+FOUR_HUMAN_PATHS = [
+    pytest.param("decide\n\nTIER-C: goal\nNEXT: human", None, AUTHOR, True, id="body-next-human"),
+    pytest.param("decide, no body token", "human", AUTHOR, True, id="field-human"),
+    pytest.param(
+        "design\n\nNEXT: Einstein",
+        "none",
+        MismatchReason.TARGET_DIVERGENCE,
+        False,
+        id="target-divergence",
+    ),
+    pytest.param(
+        "design\n\nNEXT: Einstein",
+        "Schrodinger",
+        MismatchReason.FIELD_UNRESOLVABLE,
+        False,
+        id="field-unresolvable",
+    ),
+]
+
+
+@pytest.mark.parametrize(("head_content", "field", "branch", "expected"), FOUR_HUMAN_PATHS)
 def test_column_on_the_four_human_paths(
-    head_content: str, field: str | None, expected: bool
+    monkeypatch: pytest.MonkeyPatch,
+    head_content: str,
+    field: str | None,
+    branch: object,
+    expected: bool,
 ) -> None:
+    seen: list[Handoff] = []
+    real = builder.resolve_handoff
+
+    def spy(*args: Any, **kwargs: Any) -> Handoff:
+        h: Handoff = real(*args, **kwargs)
+        seen.append(h)
+        return h
+
+    monkeypatch.setattr(builder, "resolve_handoff", spy)
     row = _row(head_content, field)
+
+    # The case reaches the resolver branch it is named for, on the builder's own call.
+    assert len(seen) == 1
+    handoff = seen[0]
+    assert handoff.kind is HandoffKind.HUMAN
+    if branch == AUTHOR:
+        assert handoff.author_requested_human is True
+        assert handoff.mismatch_reason is None
+    else:
+        assert handoff.author_requested_human is False
+        assert handoff.mismatch_reason is branch
+
     assert row["author_wrote_next_human"] is expected
-
-
-def test_four_paths_are_the_paths_they_claim() -> None:
-    """Keep the parametrisation honest: each case really hits the resolver branch it names."""
-    resolve = builder.resolve_handoff
-    body_h = resolve("x\n\nNEXT: human", ROSTER, next_participant=None)
-    field_h = resolve("x", ROSTER, next_participant="human")
-    div = resolve("x\n\nNEXT: Einstein", ROSTER, next_participant="none")
-    unres = resolve("x\n\nNEXT: Einstein", ROSTER, next_participant="Schrodinger")
-    assert body_h.kind is field_h.kind is div.kind is unres.kind is HandoffKind.HUMAN
-    assert body_h.author_requested_human and field_h.author_requested_human
-    assert div.mismatch_reason is MismatchReason.TARGET_DIVERGENCE
-    assert unres.mismatch_reason is MismatchReason.FIELD_UNRESOLVABLE
 
 
 def test_human_without_author_request_or_mismatch_is_false(
