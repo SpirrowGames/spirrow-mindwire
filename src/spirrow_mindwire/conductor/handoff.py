@@ -304,6 +304,22 @@ class Handoff:
     ``token`` is intentionally NOT enforced by the type: the invariant is inherited from
     #184 and left as-is here (the scope of this change is the reason-code split, not the
     surrounding token invariants — see PR body §「非目標」).
+
+    ``author_requested_human`` is ``True`` iff the **author themself** named the human: the
+    body's final ``NEXT: human`` or a ``human`` ``next_participant`` field (including a field
+    ``human`` the body agrees with or is silent on). It is set in exactly those two resolver
+    branches and nowhere else. It exists so a consumer asking "did the author ask for the
+    human?" reads a positive fact instead of deriving it from ``mismatch_reason is None`` —
+    that negation was correct only while every other ``HUMAN`` producer was a mismatch, and
+    would silently turn every future non-mismatch escalation into an author request
+    (T-reconcile-field-mismatch-flag-overloaded msg-4861 / msg-4864 U1).
+
+    Because it is a second field describing the cause of a ``HUMAN`` handoff, the combination
+    is checked at construction (msg-4864 U1, "不正な組は構築時に落とす"): ``True`` requires
+    ``kind is HUMAN`` and ``mismatch_reason is None``, and :meth:`__post_init__` raises
+    :class:`ValueError` otherwise. The check is a local guardrail — every ``Handoff`` is built
+    in this module — not a substitute for a single sum type (the naysayer reply to msg-4864
+    accepted this trade-off over widening :class:`MismatchReason`).
     """
 
     kind: HandoffKind
@@ -313,6 +329,20 @@ class Handoff:
     tier_c_label: str | None = None
     mismatch_reason: MismatchReason | None = None
     mismatch_body_token: str | None = None
+    author_requested_human: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.author_requested_human:
+            return
+        if self.kind is not HandoffKind.HUMAN:
+            raise ValueError(
+                f"author_requested_human=True requires kind=HUMAN, got kind={self.kind.value}"
+            )
+        if self.mismatch_reason is not None:
+            raise ValueError(
+                "author_requested_human=True is incompatible with a conductor escalation "
+                f"(mismatch_reason={self.mismatch_reason.value})"
+            )
 
 
 def _last_next_raw(body: str) -> str | None:
@@ -467,7 +497,10 @@ def _resolve_body(body: str, roster: Mapping[str, Role]) -> Handoff:
         # simply stays None. This is intentionally parsed ONLY on the HUMAN terminal: the ROLE /
         # PR_REVIEW / NONE / ABSENT paths do not carry a Tier-C claim in v1.
         return Handoff(
-            HandoffKind.HUMAN, token=token, tier_c_label=_tier_c_label_above_last_next(body)
+            HandoffKind.HUMAN,
+            token=token,
+            tier_c_label=_tier_c_label_above_last_next(body),
+            author_requested_human=True,
         )
     if folded == NONE_TOKEN:
         return Handoff(HandoffKind.NONE, token=token)
@@ -524,7 +557,7 @@ def _resolve_field(field_value: str, roster: Mapping[str, Role]) -> Handoff:
         # No tier_c_label on the field route: the calibration tag is a body-only annotation
         # (msg-890 §3 reads it off the line above the NEXT:). A field-driven HUMAN records its
         # class through the mismatch event or through absence, not through a body scan.
-        return Handoff(HandoffKind.HUMAN, token=token)
+        return Handoff(HandoffKind.HUMAN, token=token, author_requested_human=True)
     if folded == NONE_TOKEN:
         return Handoff(HandoffKind.NONE, token=token)
     match = _roster_lookup(roster, token)
