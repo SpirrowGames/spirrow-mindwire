@@ -277,7 +277,7 @@ def _roster_role(roster: Mapping[str, Role], author: str) -> Role | None:
 
 def is_tierc_entry(
     *,
-    author_wrote_next_human: bool,
+    author_requested_human: bool,
     author_role: Role | None,
 ) -> bool:
     """The Tier-C hook's entry condition (msg-4237 DECIDED 2c-1; endorsed msg-4238 / msg-4240;
@@ -286,8 +286,9 @@ def is_tierc_entry(
     Called only for a head the Conductor resolved to ``HandoffKind.HUMAN`` (``_decider_hook``
     returns earlier for any other kind). Both must hold:
 
-    * the author wrote ``NEXT: human`` themself — a field/body mismatch that resolved to HUMAN is
-      a conductor safety valve, not someone asking the human (kept by msg-4360);
+    * the author named the human themself (body ``NEXT: human`` or field ``human`` — the
+      :attr:`Handoff.author_requested_human` fact) — a field/body mismatch that resolved to HUMAN
+      is a conductor safety valve, not someone asking the human (kept by msg-4360);
     * the author's roster role is in :data:`TIERC_ENTRY_ROLES` (``proposer`` / ``implementer`` /
       ``naysayer``) — by role, not by persona name, so a renamed agent does not silently drop
       out. An off-roster author (e.g. ``pr-gate-relay``) has no roster role and never enters:
@@ -303,7 +304,7 @@ def is_tierc_entry(
     Checked at the hook's entry, before anything else: a non-target turn gets no admission-gate
     computation, no Lexora call and no ``decider_decision`` line — in shadow and active alike.
     """
-    return author_wrote_next_human and author_role is not None and author_role in TIERC_ENTRY_ROLES
+    return author_requested_human and author_role is not None and author_role in TIERC_ENTRY_ROLES
 
 
 def routed_from_route(
@@ -430,7 +431,7 @@ async def run_tierc_hook(
     target_role: Role | None,
     spawn_blocked: bool,
     naysayer_role: Role,
-    author_wrote_next_human: bool,
+    author_requested_human: bool,
     now: datetime | None = None,
 ) -> DecisionResult | None:
     """Entry check → admission gate (compute-only) → evaluate + log. Never changes the routing.
@@ -443,7 +444,7 @@ async def run_tierc_hook(
     """
     head = messages[-1] if messages else None
     if head is None or not is_tierc_entry(
-        author_wrote_next_human=author_wrote_next_human,
+        author_requested_human=author_requested_human,
         author_role=_roster_role(roster, head.author),
     ):
         return None

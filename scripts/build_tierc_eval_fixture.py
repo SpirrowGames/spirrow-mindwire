@@ -324,7 +324,7 @@ def build_eval_row(
             # 2c dropped the rule stop from the entry; the constant ``original_stop="human"`` this
             # call passed under 2b always satisfied it, so the column's values are unchanged.
             "live_entry": is_tierc_entry(
-                author_wrote_next_human=author_wrote_next_human,
+                author_requested_human=author_wrote_next_human,
                 author_role=_lookup_casefold(roster, head.author),
             ),
         }

@@ -555,7 +555,7 @@ async def _hook(
     is_forced: bool = False,
     target_role: Role | None = None,
     spawn_blocked: bool = False,
-    author_wrote_next_human: bool = True,
+    author_requested_human: bool = True,
 ) -> DecisionResult | None:
     return await run_tierc_hook(
         decider,
@@ -568,7 +568,7 @@ async def _hook(
         target_role=target_role,
         spawn_blocked=spawn_blocked,
         naysayer_role=Role.NAYSAYER,
-        author_wrote_next_human=author_wrote_next_human,
+        author_requested_human=author_requested_human,
         now=NOW,
     )
 
@@ -616,7 +616,7 @@ def test_is_tierc_entry(wrote: bool, role: Role | None, expected: bool) -> None:
     """msg-4237 DECIDED 2c-1, roles widened by tierc-v2 (msg-4360 / msg-4382): author-written
     ``NEXT: human`` + proposer / implementer / naysayer; the rule stop is not part of the entry
     (it is recorded as ``routed``)."""
-    assert is_tierc_entry(author_wrote_next_human=wrote, author_role=role) is expected
+    assert is_tierc_entry(author_requested_human=wrote, author_role=role) is expected
 
 
 @pytest.mark.parametrize(
@@ -852,7 +852,7 @@ async def test_hook_proposer_mismatch_human_is_not_entered(
     spy = _GateSpy(monkeypatch)
     stub = _StubDecider(_dr(DecisionOutcome.EVALUATED, _v(TierCScope.IN_GATE)))
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        got = await _hook(stub, author_wrote_next_human=False)
+        got = await _hook(stub, author_requested_human=False)
     assert got is None and spy.calls == 0 and stub.states == []
     assert _decider_lines(caplog) == []
 
