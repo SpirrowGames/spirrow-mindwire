@@ -1663,3 +1663,39 @@ def test_s9_single_huge_scalar_dict_element_is_still_bounded() -> None:
     (elem,) = detail["captured_fields"]["permission_denials"]
     assert len(elem) <= 600
     assert len(json.dumps(detail, ensure_ascii=False)) < 10_000
+
+
+def test_s9_absent_with_only_stop_reason_does_not_claim_every_field_empty() -> None:
+    """PR #368 PR-gate objection 1: ``stop_reason`` is captured but not judged,
+    so ``absent`` must not read as "every captured field was empty"."""
+    detail = capture_is_error_detail(_FakeResultMessage(stop_reason="max_tokens"))
+    assert detail["reason_source"] == "absent"
+    assert detail["captured_fields"]["stop_reason"] == "max_tokens"
+    assert "known reason fields captured" not in detail["message"]
+    assert "errors, api_error_status, permission_denials, result" in detail["message"]
+    assert "no subtype" in detail["message"]
+
+
+def test_s9_unreadable_subtype_is_no_classification_not_a_prefix() -> None:
+    """PR #368 PR-gate objection 2: a subtype whose read raised must not leak
+    into the ``SDK is_error[...]`` prefix."""
+
+    class _HostileSubtype:
+        session_id = "s"
+        duration_ms = 1
+        num_turns = 1
+        stop_reason = None
+        errors: ClassVar[list[str]] = ["boom"]
+        api_error_status = None
+        permission_denials = None
+        result = None
+
+        @property
+        def subtype(self) -> str:
+            raise RuntimeError("hostile subtype")
+
+    detail = capture_is_error_detail(_HostileSubtype())
+    assert detail["reason_source"] == "field:errors"
+    assert detail["message"] == "SDK is_error; errors=['boom']"
+    assert "[" not in detail["message"].split(";")[0]
+    assert detail["captured_fields"]["subtype"] == {"capture_failed": True}

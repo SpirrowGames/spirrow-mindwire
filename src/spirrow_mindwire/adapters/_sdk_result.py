@@ -36,8 +36,14 @@ msg-1721) requires:
     at all" stay two values.
 
 ``"absent"``
-    Every known field was empty/None. The reason is genuinely missing on this
-    ``ResultMessage``. In this branch — and ONLY here — a defensive reflection
+    No reason field (``_REASON_PRIORITY``: ``errors`` / ``api_error_status`` /
+    ``permission_denials`` / ``result``) and no ``subtype`` carried a value.
+    This is NOT "every captured field was empty": ``stop_reason`` and the
+    session facts are captured but are not reason candidates (S-9 R-1, thread
+    msg-4807 §3), so they may be populated here — they are in
+    ``captured_fields`` and in the dump, and the message says which fields
+    were judged. The reason is missing on this ``ResultMessage``.
+    In this branch — and ONLY here — a defensive reflection
     dump of the object is attached so the next iteration can widen the
     hand-picked list from evidence (§1-2 in msg-1721: the reflection is confined
     to the ``absent`` branch precisely because that is the one branch where
@@ -774,8 +780,9 @@ def _pick_reason(raw: dict[str, Any], summary: dict[str, Any]) -> tuple[str, str
 
     3. No reason field, but a subtype → ``subtype_only``.
 
-    4. Everything empty → ``absent`` with the sentence explaining that N
-       fields were captured and none carried a reason.
+    4. No reason field and no subtype → ``absent``. The message names the
+       fields that were judged; ``stop_reason`` / session facts are not among
+       them and may be populated (see ``captured_fields``).
 
     Note the deliberate difference between step 1 and step 2: step 1 fires ONLY
     for non-empty strings on ``result`` (the common case), but if ``result``
@@ -810,8 +817,8 @@ def _pick_reason(raw: dict[str, Any], summary: dict[str, Any]) -> tuple[str, str
     return (
         "absent",
         (
-            f"SDK reported is_error; {len(_KNOWN_REASON_FIELDS)} known reason "
-            "fields captured, none carried a reason"
+            f"SDK reported is_error; no subtype, and of the {len(_REASON_PRIORITY)} "
+            f"reason fields ({', '.join(_REASON_PRIORITY)}) none carried a reason"
         ),
     )
 
