@@ -2707,8 +2707,9 @@ class NaysayerPrReviewDriver:
         """
         commit_id = receipt.head_sha or None
         # Bounded by construction: at most _SUBMIT_MAX_ATTEMPTS iterations. Every exit is a
-        # statement in this body — ``return`` on success / LANDED / fallback, and
-        # ``raise self._classify_exception(...)`` on everything else. The classifier only
+        # statement in this body — ``return`` on success, on guard LANDED, and after the
+        # same-identity 422 COMMENT fallback (called in-loop, just below), and
+        # ``raise await self._classify_exception(...)`` on everything else. The classifier only
         # BUILDS the exception; the ``raise`` here is what ends the loop (PR-gate #366
         # advisory + #392 objection: termination must not rest on a helper's side effect).
         # The final attempt can never take the retry branch (``attempt <
