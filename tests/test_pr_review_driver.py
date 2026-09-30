@@ -251,9 +251,35 @@ async def test_request_changes_flow() -> None:
 
 @pytest.mark.anyio
 async def test_skip_if_head_unchanged_reuses_prior_verdict_without_lexora() -> None:
-    # The naysayer already reviewed THIS head (its last verdict review's commit_id == ci.head_sha)
-    # → skip the Lexora/Gemini call and reuse the prior verdict; no new GitHub review submitted.
+    # The naysayer already APPROVED this head (its last verdict review's commit_id == ci.head_sha)
+    # → skip the Lexora/Gemini call and reuse the prior APPROVE; no new GitHub review submitted.
+    # (T-infra-failure-posts-empty-rc msg-4802 test 2. This test was RC-based before C-1; an RC
+    # prior now runs a full review — see test_skip_if_head_unchanged_never_reposts_request_changes.)
     lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert lexora.calls == []  # no Gemini call
+    assert github.submitted == []  # the existing review stands; no duplicate
+    assert outcome.skipped_head_unchanged is True
+    assert outcome.verdict is ReviewEvent.APPROVE
+    assert len(posted) == 1  # a short note is still posted to the thread
+
+
+@pytest.mark.anyio
+async def test_skip_if_head_unchanged_never_reposts_request_changes() -> None:
+    # T-infra-failure-posts-empty-rc msg-4802 C-1 / test 1 (msg-2136 F-7): a prior
+    # CHANGES_REQUESTED on the unchanged head must NOT be re-posted by the skip — that re-post
+    # carried no critique, yet an RC routes the conductor to the implementer. The full review
+    # runs instead, and the RC that goes out carries the model's own critique.
+    lexora = _FakeLexora(content="line 3 is still wrong\n\nVERDICT: REQUEST_CHANGES")
     github = _FakeGitHub(
         ci=CiStatus(CiState.SUCCESS, "headsha", []),
         reviews=[
@@ -264,11 +290,58 @@ async def test_skip_if_head_unchanged_reuses_prior_verdict_without_lexora() -> N
     driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
     outcome = await driver.review(_pr(), post_critique=post)
 
-    assert lexora.calls == []  # no Gemini call
-    assert github.submitted == []  # the existing review stands; no duplicate
-    assert outcome.skipped_head_unchanged is True
+    assert lexora.calls != []  # full review ran (2-pass, so >= 1 call)
+    assert outcome.skipped_head_unchanged is False
+    assert all("Skipping a re-review" not in body for body in posted)
     assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
-    assert len(posted) == 1  # a short note is still posted to the thread
+    assert "line 3 is still wrong" in posted[0]
+
+
+@pytest.mark.anyio
+async def test_skip_approve_cache_does_not_mask_current_ci_failure() -> None:
+    # msg-4802 test 3 (Einstein msg-2137): the CI gate runs BEFORE the head-unchanged skip, so a
+    # cached APPROVE for this head can never be re-posted over a CI that has since gone red.
+    lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.FAILURE, "headsha", ["build"]),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(lexora=lexora, github=github, skip_if_head_unchanged=True)
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.ci_gated is True
+    assert outcome.skipped_head_unchanged is False
+    assert outcome.verdict is ReviewEvent.REQUEST_CHANGES
+    assert [event for _, event, _ in github.submitted] == [ReviewEvent.REQUEST_CHANGES]
+    assert lexora.calls == []
+
+
+@pytest.mark.anyio
+async def test_skip_rc_prior_falls_through_to_round_cap() -> None:
+    # msg-4802 test 4: an RC prior on the unchanged head is no longer skipped, so with the round
+    # cap enabled and reached, the cap applies — COMMENT, stop at the human, no Gemini call. This
+    # is the bound on the extra re-review cost that C-1 accepts.
+    lexora = _FakeLexora()
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=github, skip_if_head_unchanged=True, max_review_rounds=1
+    )
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert outcome.skipped_head_unchanged is False
+    assert outcome.rounds_capped is True
+    assert outcome.verdict is ReviewEvent.COMMENT
+    assert [event for _, event, _ in github.submitted] == [ReviewEvent.COMMENT]
+    assert lexora.calls == []
 
 
 @pytest.mark.anyio
@@ -368,6 +441,30 @@ async def test_round_cap_counts_only_verdict_reviews() -> None:
 async def test_shadow_mode_measures_skip_without_acting() -> None:
     # shadow=True: the head-unchanged skip is computed + recorded (would_skip_head_unchanged) but
     # NOT acted on — the full Gemini review still runs (no behaviour / coverage change).
+    # The prior is APPROVED: since msg-4802 C-1/C-2 only an APPROVE prior is skip-eligible, in
+    # shadow mode too (see test_shadow_mode_does_not_count_rc_prior_as_would_skip).
+    lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
+    github = _FakeGitHub(
+        ci=CiStatus(CiState.SUCCESS, "headsha", []),
+        reviews=[
+            ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:00Z"),
+        ],
+    )
+    _posted, post = _capture()
+    driver = NaysayerPrReviewDriver(
+        lexora=lexora, github=github, skip_if_head_unchanged=True, shadow=True
+    )
+    outcome = await driver.review(_pr(), post_critique=post)
+
+    assert lexora.calls != []  # full review ran (NOT skipped) — 2-pass, so >= 1 call
+    assert outcome.would_skip_head_unchanged is True
+    assert outcome.skipped_head_unchanged is False
+
+
+@pytest.mark.anyio
+async def test_shadow_mode_does_not_count_rc_prior_as_would_skip() -> None:
+    # msg-4802 C-2: shadow mode goes through _skip_unchanged_response, so an RC prior on the
+    # unchanged head is not a would-skip either (would_skip counts before/after C-1 differ).
     lexora = _FakeLexora(content="x\n\nVERDICT: APPROVE")
     github = _FakeGitHub(
         ci=CiStatus(CiState.SUCCESS, "headsha", []),
@@ -381,9 +478,8 @@ async def test_shadow_mode_measures_skip_without_acting() -> None:
     )
     outcome = await driver.review(_pr(), post_critique=post)
 
-    assert lexora.calls != []  # full review ran (NOT skipped) — 2-pass, so >= 1 call
-    assert outcome.would_skip_head_unchanged is True
-    assert outcome.skipped_head_unchanged is False
+    assert lexora.calls != []
+    assert outcome.would_skip_head_unchanged is False
 
 
 @pytest.mark.anyio
@@ -418,7 +514,8 @@ async def test_shadow_skip_takes_precedence_over_cap() -> None:
         reviews=[
             # 2 verdict reviews (>= cap 2); the latest is against the current head (→ skip too).
             ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "old", "2026-06-10T00:00:01Z"),
-            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:02Z"),
+            # APPROVED: only an APPROVE prior is skip-eligible (msg-4802 C-1).
+            ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:02Z"),
         ],
     )
     _posted, post = _capture()
@@ -820,7 +917,8 @@ async def test_head_unchanged_skip_does_not_claim_current_principles_version() -
     github = _FakeGitHub(
         ci=CiStatus(CiState.SUCCESS, "headsha", []),
         reviews=[
-            ReviewInfo("spirrowgames-ops", "CHANGES_REQUESTED", "headsha", "2026-06-10T00:00:00Z"),
+            # APPROVED: only an APPROVE prior is skip-eligible (msg-4802 C-1).
+            ReviewInfo("spirrowgames-ops", "APPROVED", "headsha", "2026-06-10T00:00:00Z"),
         ],
     )
     _posted, post = _capture()

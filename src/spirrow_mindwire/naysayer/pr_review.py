@@ -2539,16 +2539,27 @@ class NaysayerPrReviewDriver:
     def _skip_unchanged_response(
         self, pr: PrRef, ci: CiStatus, prior: list[ReviewInfo]
     ) -> tuple[ReviewEvent, str] | None:
-        """A (verdict, body) reusing the prior verdict iff the naysayer already reviewed this head.
+        """An (APPROVE, body) reuse iff the naysayer already APPROVED this exact head.
 
         Returns ``None`` (→ proceed to a full review) when the head SHA is unknown, there is no
-        prior verdict review, or the latest verdict review was against a different commit.
+        prior verdict review, the latest verdict review was against a different commit, or the
+        latest verdict review on this head was ``CHANGES_REQUESTED``.
+
+        Rule: **the skip only re-posts APPROVE** (T-infra-failure-posts-empty-rc msg-4802 C-1,
+        from msg-2136 F-7). A re-posted REQUEST_CHANGES would carry no critique — the skip body
+        is a fixed "prior verdict stands" note and :class:`ReviewInfo` has no review body to
+        quote — yet the conductor routes any RC to the implementer, which would be woken with
+        nothing it can fix. An APPROVE re-post is harmless: the conductor stops at the human and
+        a real ``APPROVED`` review for this head already exists on GitHub (msg-2136 F-9). An RC
+        prior therefore runs a full review; that re-review is itself a verdict review, so an
+        enabled ``max_review_rounds`` cap bounds how many repeats an unchanged head can buy.
+        Shadow mode (``would_skip_head_unchanged``) goes through this function and follows the
+        same rule.
 
         The head-match check is delegated to :func:`~spirrow_mindwire.github.reviews.landed`
         (T-gate-review-submit-failure-handling DESIGN v3 §2 — ONE definition, three sites); the
-        prior-verdict pick that selects WHICH verdict to reuse still runs here because the shape
-        of that decision (reuse APPROVE vs reuse REQUEST_CHANGES) is domain policy, not the
-        shared "is anything landed" predicate.
+        prior-verdict pick that decides WHETHER to reuse stays here because it is domain policy,
+        not the shared "is anything landed" predicate.
         """
         if ci.head_sha is None:
             return None
@@ -2565,7 +2576,11 @@ class NaysayerPrReviewDriver:
             # Guarded by the LANDED check above, but keeps the local invariant explicit —
             # a landed review at this head is what selects the verdict text to reuse.
             return None
-        verdict = ReviewEvent.APPROVE if latest.state == "APPROVED" else ReviewEvent.REQUEST_CHANGES
+        if latest.state != "APPROVED":
+            # CHANGES_REQUESTED on this head → full review, never a critique-less RC re-post
+            # (msg-4802 C-1). See the docstring for why only APPROVE is reusable.
+            return None
+        verdict = ReviewEvent.APPROVE
         body = (
             f"No change since the last naysayer review of {pr.slug} "
             f"(head {ci.head_sha[:12]}): the prior verdict {verdict.value} stands. "
