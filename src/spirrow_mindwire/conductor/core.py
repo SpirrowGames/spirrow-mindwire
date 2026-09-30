@@ -745,7 +745,7 @@ class Conductor:
             # A positive fact set only where the author named the human (handoff.py), never
             # derived from ``mismatch_reason is None``: that negation would count any future
             # non-mismatch HUMAN escalation as an author request (msg-4861 / msg-4864 U1).
-            author_wrote_next_human=handoff.author_requested_human,
+            author_requested_human=handoff.author_requested_human,
             now=datetime.now(UTC),
         )
 

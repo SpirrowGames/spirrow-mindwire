@@ -562,7 +562,7 @@ async def test_hook_v2_three_roles_logged_with_rule_and_sha(
             target_role=None,
             spawn_blocked=False,
             naysayer_role=Role.NAYSAYER,
-            author_wrote_next_human=True,
+            author_requested_human=True,
         )
     assert dr is not None and dr.outcome is DecisionOutcome.EVALUATED
     (line,) = _decider_lines(caplog)
@@ -600,7 +600,7 @@ async def test_hook_v2_gate_exception_is_still_sent(
             target_role=None,
             spawn_blocked=False,
             naysayer_role=Role.NAYSAYER,
-            author_wrote_next_human=True,
+            author_requested_human=True,
         )
     assert dr is not None and len(c.bodies) == 1
     assert json.loads(c.bodies[0]["state"])["gate_result"] is None
@@ -628,7 +628,7 @@ async def test_hook_v2_off_roster_relay_not_entered(caplog: pytest.LogCaptureFix
             target_role=None,
             spawn_blocked=False,
             naysayer_role=Role.NAYSAYER,
-            author_wrote_next_human=True,
+            author_requested_human=True,
         )
     assert dr is None and c.bodies == [] and _decider_lines(caplog) == []
 

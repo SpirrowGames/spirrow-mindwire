@@ -168,7 +168,7 @@ async def test_conductor_passes_the_positive_fact_to_the_hook(
 ) -> None:
     calls = await _hook_calls(monkeypatch, content=content, next_participant=field)
     assert calls, "a HUMAN head must reach the hook"
-    assert calls[0]["author_wrote_next_human"] is expected
+    assert calls[0]["author_requested_human"] is expected
 
 
 @pytest.mark.anyio
@@ -192,4 +192,4 @@ async def test_conductor_does_not_read_a_non_mismatch_escalation_as_an_author_re
     monkeypatch.setattr(core_mod, "resolve_handoff", _escalate)
     calls = await _hook_calls(monkeypatch, content="revised\n\nNEXT: Heisenberg")
     assert calls, "a HUMAN head must reach the hook"
-    assert calls[0]["author_wrote_next_human"] is False
+    assert calls[0]["author_requested_human"] is False
