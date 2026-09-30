@@ -120,7 +120,14 @@ _ROLES = ("proposer", "implementer", "naysayer")
 
 @pytest.mark.parametrize("role", _ROLES)
 def test_a_builtin_tools_hold_no_out_of_band_channel(role: str, tmp_path: Path) -> None:
-    tools = set(_role_options(role, tmp_path).tools or [])
+    declared = _role_options(role, tmp_path).tools
+    # ``tools=None`` means "not declared", which the SDK may widen to its default built-in set —
+    # so an undeclared surface cannot pass this check by looking empty (PR #376 review).
+    assert declared is not None, (
+        f"{role} does not declare tools= explicitly; the built-in surface is then the SDK "
+        f"default and cannot be checked for out-of-band channels (T46 (a))"
+    )
+    tools = set(declared)
     leaked = tools & _OUT_OF_BAND_BUILTINS
     assert not leaked, (
         f"{role}'s built-in tools include {sorted(leaked)} — a path from one agent to another "
