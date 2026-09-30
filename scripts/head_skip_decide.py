@@ -319,6 +319,19 @@ async def _decide_all(
                 head_body = ""
                 head_fetched = False
                 actual_msg_id = head_msg_id
+                # PR #364 gate: the body is unknown, but a status we already observed on THIS
+                # head is still evidence — without it a known-resolved thread whose re-fetch
+                # fails (TTL expiry) would fall open into a paid-for LAUNCH, the exact cost this
+                # stage exists to stop. Only for the SAME head: a head that moved means the
+                # thread took a message after we looked, so a "resolved" seen on the old head
+                # no longer describes it — stay "" (fail-open) there.
+                thread_status = (
+                    rec.last_observed_status
+                    if rec is not None
+                    and head_msg_id
+                    and rec.last_observed_head_msg_id == head_msg_id
+                    else ""
+                )
             else:
                 actual_msg_id, head_body, thread_status = fetched
                 head_fetched = True

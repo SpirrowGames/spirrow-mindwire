@@ -340,3 +340,62 @@ def test_cache_hit_skips_resolved_without_fetching(monkeypatch: pytest.MonkeyPat
     assert second[0]["decision"] == "skip"
     assert second[0]["reason"] == "thread-resolved"
     assert "commit_launch_payload" not in second[0]
+
+
+class _FailingMcp:
+    """Every fetch returns a shape ``_fetch_head_body`` treats as a failure."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def call_tool(self, name: str, params: dict[str, object]) -> object:
+        self.calls += 1
+        return {"messages": []}
+
+
+def _observed(head: str, status: str) -> Record:
+    return commit_observation(now=_T0, head_msg_id=head, token="einstein", record=None,
+                              thread_status=status)  # fmt: skip
+
+
+def test_failed_refetch_on_same_head_keeps_the_observed_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #364 gate: TTL expired → re-fetch → fetch fails. The status seen on this same head
+    must still gate Stage 0, and the cached observation must not be overwritten."""
+    state = {"T-r": _observed("msg-1084", "resolved")}
+    fake = _FailingMcp()
+    later = _T0 + timedelta(hours=2)  # past HEAD_CACHE_TTL → cache miss → fetch
+    new_state, verdicts = _run(
+        monkeypatch, fake,  # type: ignore[arg-type]
+        [{"thread_id": "T-r", "head_msg_id": "msg-1084", "control_state": "run"}],
+        state, now=later,
+    )  # fmt: skip
+    assert fake.calls == 1
+    v = verdicts[0]
+    assert v["head_fetched"] is False
+    assert v["decision"] == "skip"
+    assert v["reason"] == "thread-resolved"
+    assert "commit_launch_payload" not in v
+    assert new_state["T-r"].last_observed_status == "resolved"
+
+
+def test_failed_fetch_on_a_moved_head_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A head that moved took a message after we looked — the old 'resolved' is stale."""
+    state = {"T-r": _observed("msg-1084", "resolved")}
+    _, verdicts = _run(
+        monkeypatch, _FailingMcp(),  # type: ignore[arg-type]
+        [{"thread_id": "T-r", "head_msg_id": "msg-1090", "control_state": "run"}],
+        state,
+    )  # fmt: skip
+    assert verdicts[0]["decision"] == "launch"
+    assert verdicts[0]["thread_status"] == ""
+
+
+def test_failed_fetch_with_no_record_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, verdicts = _run(
+        monkeypatch, _FailingMcp(),  # type: ignore[arg-type]
+        [{"thread_id": "T-r", "head_msg_id": "msg-1", "control_state": "run"}],
+        {},
+    )  # fmt: skip
+    assert verdicts[0]["decision"] == "launch"
