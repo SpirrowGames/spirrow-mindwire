@@ -65,9 +65,13 @@ not read as three-when-there-are-four; the classification below covers the three
 
 There is also `conductor-probe`, which `scripts/thread_heads.py` used (until
 T-unread-correlated-count-scale moved that probe to `chatroom_list_threads`, which takes no identity)
-as a "never posts and never marks read" inbox identity to enumerate thread heads. Since it is defined to never write, it does not appear in the observed-supply set the §2
-derivation reads from. Listed for completeness; classification: **machine** (`allowed_roles = ∅`),
-same reasoning as `pr-gate-relay` below.
+as a "never posts and never marks read" inbox identity to enumerate thread heads. It is **retired**:
+no code in this repository calls magickit under that name any more, so it has no entry in
+`spec/identity/legitimate_roles.yaml`. That is deliberate rather than an omission — a chatroom post
+authored as `conductor-probe` is therefore reported by `scripts/identity_findings.py` under
+`unclassified_authors` (the signal that the write half must not proceed), whatever role it does or
+does not claim. While the entry existed (`kind: machine`, `legitimate: []`), only a post that
+claimed a role would have surfaced, as `residual`; a role-less post would have been absorbed.
 
 ## Classification
 

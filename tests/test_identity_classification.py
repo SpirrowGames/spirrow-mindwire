@@ -334,7 +334,7 @@ class TestShippedFile:
         # Smoke test on the actual file: a hand-edit that breaks the invariants is
         # caught here rather than at live-script run time.
         loaded = load_legitimate_roles(default_classification_path())
-        # The five names from docs/identity-classification.md must appear.
+        # The four names from docs/identity-classification.md must appear.
         # ``conductor-relay`` is D-1a (T-human-terminal-overuse msg-2540 §1-4, Einstein Obj-1):
         # the D-1 write-back writer needs a registered identity or ``identity_findings`` would
         # surface it as an unclassified author on every tick after the landing.
@@ -342,7 +342,6 @@ class TestShippedFile:
             "naysayer-pr-review",
             "orchestrator",
             "pr-gate-relay",
-            "conductor-probe",
             "conductor-relay",
         ):
             entry = loaded.by_key(name)
@@ -352,8 +351,8 @@ class TestShippedFile:
         # Only naysayer is a participant.
         assert naysayer.kind == "participant"
         assert naysayer.legitimate == frozenset({"naysayer"})
-        # The other four are machines.
-        for name in ("orchestrator", "pr-gate-relay", "conductor-probe", "conductor-relay"):
+        # The other three are machines.
+        for name in ("orchestrator", "pr-gate-relay", "conductor-relay"):
             entry = loaded.by_key(name)
             assert entry is not None
             assert entry.kind == "machine"
