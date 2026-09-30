@@ -708,7 +708,7 @@ class Conductor:
                 stall_event = stalled_event(
                     project=self._thread_ref.project_id,
                     thread=self._thread_ref.thread_id,
-                    head_msg_id=latest_msg_id or "",
+                    head_msg_id=latest_msg_id,
                     launches_same_head=self._launches_same_head,
                     target=target_identity,
                 )
