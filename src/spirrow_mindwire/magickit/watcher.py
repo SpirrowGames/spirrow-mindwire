@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..dispatcher.core import Dispatcher
-from ..thread_context import build_thread_context
+from ..thread_context import ThreadContextTriggerMissing, build_thread_context
 from ..value_objects import (
     ChatroomEvent,
     EventType,
@@ -195,7 +195,21 @@ class ChatroomWatcher:
             # (e.g. ThreadContextTriggerMissing) skips this one message rather than
             # retrying it forever and wedging the watch (at-most-once, msg-4871 §1).
             self._seen.add(seen_key)
-            await self._dispatcher.dispatch(handle, self._to_event(watch.thread_ref, msg, messages))
+            # The failure is isolated to THIS message (human decision after the #371
+            # APPROVE advisory): letting it escape aborted the rest of the batch, so
+            # valid messages behind it waited a whole poll interval. Narrow on
+            # purpose — only the builder's fail-closed refusal is caught here; a
+            # dispatch failure still escapes to :meth:`run`'s logged swallow.
+            try:
+                event = self._to_event(watch.thread_ref, msg, messages)
+            except ThreadContextTriggerMissing:
+                logger.exception(
+                    "ThreadContextTriggerMissing: skipping %s (not dispatched, not retried);"
+                    " continuing the poll batch",
+                    seen_key,
+                )
+                continue
+            await self._dispatcher.dispatch(handle, event)
             count += 1
         return count
 
