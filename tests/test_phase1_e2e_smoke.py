@@ -70,7 +70,11 @@ from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkAdapter
 from spirrow_mindwire.dispatcher.core import Dispatcher
-from spirrow_mindwire.dispatcher.event_log import EVENT_FIELD_AUTHOR, EVENT_KIND_REPLY_SENT
+from spirrow_mindwire.dispatcher.event_log import (
+    EVENT_FIELD_AUTHOR,
+    EVENT_KIND_REPLY_SENT,
+    EVENT_KIND_SPAWN_READY,
+)
 from spirrow_mindwire.dispatcher.registry import InMemoryAdapterRegistry
 from spirrow_mindwire.magickit.client import MagickitMcpError
 from spirrow_mindwire.magickit.gateway import MagickitChatroomGateway
@@ -493,9 +497,11 @@ async def test_e2e_single_thread_full_cycle(tmp_path: Path) -> None:
     )
 
     # Observational audit channel (I7 sink): one reply.sent per adapter reply, in
-    # order, no delivery.failed.
-    assert {e.kind for e in h.events} == {EVENT_KIND_REPLY_SENT}
-    assert [e.fields[EVENT_FIELD_AUTHOR] for e in h.events] == [
+    # order, no delivery.failed. The only other kind is T43's spawn.ready, one per
+    # spawned SDK session that connects at spawn.
+    assert {e.kind for e in h.events} <= {EVENT_KIND_REPLY_SENT, EVENT_KIND_SPAWN_READY}
+    replies = [e for e in h.events if e.kind == EVENT_KIND_REPLY_SENT]
+    assert [e.fields[EVENT_FIELD_AUTHOR] for e in replies] == [
         "proposer-1",
         "naysayer-1",
         "proposer-1",
@@ -559,9 +565,11 @@ async def test_e2e_two_threads_concurrent_role_isolation(tmp_path: Path) -> None
     # Audit channel stays clean under concurrency: 8 replies (4 per stream), all
     # reply.sent, each attributed to its own stream's instances (no merge across
     # the concurrently-running streams).
-    assert {e.kind for e in h.events} == {EVENT_KIND_REPLY_SENT}
-    assert len(h.events) == 8
-    assert {e.fields[EVENT_FIELD_AUTHOR] for e in h.events} == {
+    # (T43's spawn.ready entries are the only other kind; they are not replies.)
+    assert {e.kind for e in h.events} <= {EVENT_KIND_REPLY_SENT, EVENT_KIND_SPAWN_READY}
+    replies = [e for e in h.events if e.kind == EVENT_KIND_REPLY_SENT]
+    assert len(replies) == 8
+    assert {e.fields[EVENT_FIELD_AUTHOR] for e in replies} == {
         "proposer-A",
         "naysayer-A",
         "implementer-A",

@@ -64,6 +64,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -74,6 +75,7 @@ from claude_agent_sdk import (
 )
 
 from ..conductor.handoff import build_handoff_protocol_block
+from ..dispatcher.event_log import spawn_ready_event
 from ..exceptions import (
     AdapterDeliveryError,
     AdapterHaltError,
@@ -110,6 +112,8 @@ from .claude_code_sdk import (
     SdkTurnTimeoutError,
     _default_client_factory,
     _drain_reply,
+    _emit_observational,
+    _note_cc_session_uuid,
     _SdkClient,
     _shutdown,
 )
@@ -346,6 +350,9 @@ class _Session:
     # on close, so a double-cleanup does not attempt to close the same handle
     # twice (which on Windows can destroy a recycled handle).
     job_state: JobState | None = None
+    # T45 (loop side): the Claude Code session UUID from ``SystemMessage(init)``;
+    # distinct from the handle's mindwire ULID ``session_id`` (Bohr msg-4884 §2).
+    cc_session_uuid: str | None = None
 
 
 def _build_prompt(event: ChatroomEvent, own_role: Role) -> str:
@@ -630,6 +637,7 @@ class ImplementerSdkAdapter:
             client = self._client_factory(options)
             job_handle_for_ctx = session.job_state.handle if session.job_state is not None else None
             token = _JOB_HANDLE_CTX.set(job_handle_for_ctx)
+            connect_started = time.monotonic()
             try:
                 await asyncio.wait_for(
                     client.connect(),
@@ -665,6 +673,15 @@ class ImplementerSdkAdapter:
             )
             self._sessions[handle] = session
             session_registered = True
+            # T43 (Bohr msg-4888): connect() returned inside the spawn budget, so the
+            # handle is usable. That is the whole readiness signal — no second clock,
+            # no deferred delivery. It stands in for "listening" only while the session
+            # has no out-of-process MCP server; tests/test_role_tool_surface.py pins
+            # that. A session that connected and then never answers is the stall
+            # watchdog's case (conductor.stalled, T42), not this one's.
+            await _emit_observational(
+                ctx, spawn_ready_event(handle, after_s=time.monotonic() - connect_started)
+            )
             return handle
 
         except TimeoutError as exc:
@@ -743,11 +760,13 @@ class ImplementerSdkAdapter:
         # command cannot hold the drain open past our wall. A hit here
         # raises ``SdkTurnTimeoutError`` which we wrap as
         # ``adapter.turn_timeout``.
+        observed_uuid: list[str] = []
         try:
             await session.client.query(_build_prompt(event, session.own_role))
             body = await _drain_reply(
                 session.client,
                 turn_timeout_seconds=self._turn_timeout_seconds,
+                on_init=observed_uuid.append,
             )
             await session.ctx.on_reply(
                 ReplyDraft(
@@ -776,6 +795,10 @@ class ImplementerSdkAdapter:
             raise ImplementerSdkDeliveryError(
                 f"deliver_event failed for session {handle.session_id}: {exc}"
             ) from exc
+        finally:
+            # T45: recorded on success AND failure (a timed-out turn is the one whose
+            # transcript is wanted).
+            await _note_cc_session_uuid(session, handle, next(iter(observed_uuid), None))
 
         session.last_active_at = datetime.now(UTC)
         session.state = SessionState.IDLE
