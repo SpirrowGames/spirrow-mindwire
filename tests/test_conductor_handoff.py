@@ -1307,6 +1307,52 @@ def test_handoff_core_drops_design_approval_example_and_lists_the_four_types() -
         assert stale not in build_handoff_protocol_block(Role.PROPOSER)
 
 
+class TestLabelProseIsDerivedNotHardcoded:
+    """PR #365 review (invariant): the label prose and its count follow ADMIT_LABELS."""
+
+    def test_definitions_cover_exactly_the_admitted_set(self) -> None:
+        from spirrow_mindwire.conductor import handoff
+        from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS
+
+        assert frozenset(handoff._TIER_C_LABEL_DEFINITIONS) == ADMIT_LABELS
+
+    def test_mismatched_definitions_fail_loudly(self) -> None:
+        from spirrow_mindwire.conductor import handoff
+        from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS
+
+        extra = frozenset({*ADMIT_LABELS, "new-fifth-label"})
+        with pytest.raises(RuntimeError, match="new-fifth-label"):
+            handoff._check_label_definitions(handoff._TIER_C_LABEL_DEFINITIONS, extra)
+        missing = {k: v for k, v in handoff._TIER_C_LABEL_DEFINITIONS.items() if k != "cost"}
+        with pytest.raises(RuntimeError):
+            handoff._check_label_definitions(missing, ADMIT_LABELS)
+
+    def test_example_label_must_be_admitted(self) -> None:
+        from spirrow_mindwire.conductor import handoff
+
+        assert handoff._admitted_example("goal") == "goal"
+        with pytest.raises(RuntimeError, match="scope"):
+            handoff._admitted_example("scope")
+
+    def test_count_word_follows_len(self) -> None:
+        from spirrow_mindwire.conductor import handoff
+
+        expected = handoff._count_word(len(TIER_C_LABELS))
+        assert expected == handoff._TIER_C_COUNT_WORD
+        assert handoff._count_word(5) == "five"
+        assert handoff._count_word(12) == "12"
+        block = build_handoff_protocol_block(Role.IMPLEMENTER)
+        assert f"closed set of {handoff._TIER_C_COUNT_WORD}:" in block
+        assert f"the {handoff._TIER_C_COUNT_WORD} Tier-C types above" in block
+
+    def test_prose_is_rendered_from_the_definitions(self) -> None:
+        from spirrow_mindwire.conductor import handoff
+
+        block = build_handoff_protocol_block(Role.PROPOSER)
+        for label in TIER_C_LABELS:
+            assert f"`{label}` ({handoff._TIER_C_LABEL_DEFINITIONS[label]})" in block, label
+
+
 class TestLegacyLabelsStillMeasured:
     """The parser keeps recording legacy / unsure labels — measurement, not admission."""
 

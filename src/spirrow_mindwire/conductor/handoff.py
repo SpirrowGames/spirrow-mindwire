@@ -249,8 +249,11 @@ class MismatchReason(StrEnum):
 # cost / irreversible / merge-protected), and the emission guidance below was teaching authors
 # the old set while the gate judged them by the new one. :data:`TIER_C_LABELS` is now DERIVED
 # from :data:`~spirrow_mindwire.tier_c_admission_gate.ADMIT_LABELS` (sorted, so the prompt text
-# is stable), which makes a drift between "what the prompt teaches" and "what the gate admits"
-# unrepresentable rather than merely tested for.
+# is stable). The prose that DEFINES each label, and the stated count, are rendered from
+# ``_TIER_C_LABEL_DEFINITIONS`` (below, next to the prompt), whose key set is checked against
+# ``ADMIT_LABELS`` at import: a label added to or removed from the gate without a matching
+# definition fails the import of this module rather than leaving the prompt teaching the old set.
+# (PR #365 review: the first cut hardcoded the four names and the word "four" in the prose.)
 #
 # The PARSER still accepts the legacy labels (``scope`` / ``billing`` / ``release-cross-repo``)
 # and the gate's unsure label. That is measurement, not admission: a legacy label is exactly the
@@ -616,6 +619,58 @@ def _same_target(a: Handoff, b: Handoff) -> bool:
 # names) has one source of truth and cannot drift between emit and parse.
 # --------------------------------------------------------------------------- #
 
+# PR #365 review (invariant): the per-label prose is data keyed by label, not a hand-written
+# sentence, and the count is len(), not the literal word "four". The key set MUST equal
+# ``ADMIT_LABELS``; the check runs at import, so the prompt can neither teach a label the gate
+# does not admit nor omit one it does. Order follows :data:`TIER_C_LABELS` (sorted), the same
+# order the "Allowed labels" line uses.
+_TIER_C_LABEL_DEFINITIONS: dict[str, str] = {
+    "goal": "the product's goal, spec, scope or direction changes",
+    "cost": "money spent changes: a new external service, API billing up or down",
+    "irreversible": (
+        "cannot be undone: data deletion, public release, destructive migration, history "
+        "rewrite, an external side effect"
+    ),
+    "merge-protected": "a merge to a protected branch, or a deploy only a human can perform",
+}
+
+
+def _check_label_definitions(definitions: dict[str, str], admitted: frozenset[str]) -> None:
+    """Fail loudly when the prompt's label definitions and the gate's admitted set diverge."""
+    if frozenset(definitions) != admitted:
+        raise RuntimeError(
+            f"handoff._TIER_C_LABEL_DEFINITIONS keys {sorted(definitions)} != "
+            f"tier_c_admission_gate.ADMIT_LABELS {sorted(admitted)}: define every admitted "
+            "label (and only those) before the handoff prompt can teach it"
+        )
+
+
+_check_label_definitions(_TIER_C_LABEL_DEFINITIONS, ADMIT_LABELS)
+
+_NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+
+
+def _count_word(n: int) -> str:
+    return _NUMBER_WORDS[n] if 0 <= n < len(_NUMBER_WORDS) else str(n)
+
+
+def _render_label_definitions(labels: tuple[str, ...]) -> str:
+    parts = [f"`{label}` ({_TIER_C_LABEL_DEFINITIONS[label]})" for label in labels]
+    if len(parts) <= 1:
+        return "".join(parts)
+    return ", ".join(parts[:-1]) + ", and " + parts[-1]
+
+
+def _admitted_example(label: str) -> str:
+    """Return ``label`` for a worked example, failing the import if the gate no longer admits it."""
+    if label not in ADMIT_LABELS:
+        raise RuntimeError(f"handoff example label {label!r} is not in ADMIT_LABELS")
+    return label
+
+
+_TIER_C_COUNT_WORD = _count_word(len(TIER_C_LABELS))
+_TIER_C_DEFINITIONS_PROSE = _render_label_definitions(TIER_C_LABELS)
+
 _HANDOFF_PROTOCOL_CORE = f"""\
 ---
 Conductor handoff protocol (REQUIRED)
@@ -630,11 +685,7 @@ with exactly one handoff line, and make it the FINAL line of your reply:
 appears as a message author in this thread) or one of two reserved words:
 
   - `NEXT: {HUMAN_TOKEN}` — hand to the human ONLY for a Tier-C decision. Tier-C \
-is a closed set of four: `goal` (the product's goal, spec, scope or direction \
-changes), `cost` (money spent changes: a new external service, API billing up or \
-down), `irreversible` (cannot be undone: data deletion, public release, destructive \
-migration, history rewrite, an external side effect), and `merge-protected` (a merge \
-to a protected branch, or a deploy only a human can perform). Anything else is NOT \
+is a closed set of {_TIER_C_COUNT_WORD}: {_TIER_C_DEFINITIONS_PROSE}. Anything else is NOT \
 Tier-C — decide it yourself and proceed: the implementation approach, whether and how \
 to address review findings (advisory or REQUEST_CHANGES), test strategy, naming, \
 refactor extent, work order, splitting PRs or threads, approving an internal \
@@ -652,10 +703,11 @@ out literally (for example `NEXT: {HUMAN_TOKEN}`) and put nothing after it."""
 # what the labels ARE and deliberately promises no bounce: the gate's bounce is not wired into
 # routing (msg-4768 U1, moved to the Decider threads), so promising one would be a false claim.
 _TIER_C_LABEL_GUIDANCE = (
-    f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` — the four Tier-C types above, and "
-    "nothing else. If you genuinely cannot tell whether a decision touches the goal, write "
-    f"`TIER-C: {UNSURE_LABEL}` and say in one line what is unclear. `other:<reason>` or a "
-    "missing label is not a Tier-C admission: if none of the four applies, it is not Tier-C, "
+    f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` — the {_TIER_C_COUNT_WORD} Tier-C "
+    "types above, and nothing else. If you genuinely cannot tell whether a decision touches "
+    f"the goal, write `TIER-C: {UNSURE_LABEL}` and say in one line what is unclear. "
+    "`other:<reason>` or a missing label is not a Tier-C admission: if none of the "
+    f"{_TIER_C_COUNT_WORD} applies, it is not Tier-C, "
     "so decide it yourself and proceed."
 )
 
@@ -685,7 +737,7 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "code, so that you cannot bypass its objections (the conductor structurally redirects "
         f"such a handoff). Hand to `{HUMAN_TOKEN}` only for a decision that is genuinely Tier-C, "
         "and name the type on the line above your handoff, e.g.:\n\n"
-        "    TIER-C: goal\n"
+        f"    TIER-C: {_admitted_example('goal')}\n"
         f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     # D-3 (T-human-terminal-overuse, Bohr msg-2540 §4 D-3 approved by Einstein msg-2539 Obj-3):
@@ -704,7 +756,7 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself. "
         f"When you hand to `{HUMAN_TOKEN}`, name the Tier-C type on the line above your handoff, "
         "e.g.:\n\n"
-        "    TIER-C: merge-protected\n"
+        f"    TIER-C: {_admitted_example('merge-protected')}\n"
         f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     Role.NAYSAYER: (
