@@ -30,11 +30,13 @@ from __future__ import annotations
 
 import asyncio
 import typing
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from claude_agent_sdk import create_sdk_mcp_server
 from claude_agent_sdk.types import McpSdkServerConfig
 
 from spirrow_mindwire.adapters._session_isolation import session_isolation_kwargs
@@ -135,15 +137,31 @@ def test_a_builtin_tools_hold_no_out_of_band_channel(role: str, tmp_path: Path) 
     )
 
 
+def _server_type(cfg: Any) -> Any:
+    """The transport ``type`` a server config declares, whatever shape the config has.
+
+    In the pinned SDK every server config is a ``TypedDict`` (a plain ``dict`` at runtime), so the
+    mapping branch is the live one. The attribute branch is there so that a config object is judged
+    by the type it declares rather than rejected for not being a ``dict`` (PR #376 review). A
+    config with no ``type`` at all reads as ``None`` — the SDK treats that as stdio, so it is not
+    in-process.
+    """
+    if isinstance(cfg, Mapping):
+        return cfg.get("type")
+    return getattr(cfg, "type", None)
+
+
+def _non_sdk_servers(servers: Mapping[str, Any]) -> dict[str, Any]:
+    """Name → declared type of every attached server that is not in-process (``type: "sdk"``)."""
+    return {
+        name: declared for name, cfg in servers.items() if (declared := _server_type(cfg)) != "sdk"
+    }
+
+
 @pytest.mark.parametrize("role", _ROLES)
 def test_b_mcp_servers_are_in_process_sdk_only(role: str, tmp_path: Path) -> None:
     # stdio / http servers: see the module docstring — this also re-opens T43's ready rule.
-    servers = dict(_role_options(role, tmp_path).mcp_servers or {})
-    not_sdk = {
-        name: (cfg.get("type") if isinstance(cfg, dict) else type(cfg).__name__)
-        for name, cfg in servers.items()
-        if not (isinstance(cfg, dict) and cfg.get("type") == "sdk")
-    }
+    not_sdk = _non_sdk_servers(dict(_role_options(role, tmp_path).mcp_servers or {}))
     assert not not_sdk, (
         f"{role} attaches non-in-process MCP servers {not_sdk}. Say in the PR why they open no "
         f"agent-to-agent path outside the chatroom (T46), and redesign T43's spawn.ready rule, "
@@ -165,6 +183,35 @@ def test_b_watcher_mcp_server_is_an_sdk_server() -> None:
     """The one MCP server the codebase builds (watcher, ``{"mindwire": ...}``) is in-process."""
     hints = typing.get_type_hints(build_mindwire_mcp_server)
     assert hints["return"] is McpSdkServerConfig
+
+
+def test_b_check_accepts_a_real_in_process_server() -> None:
+    """The (b) check is not vacuous: a real in-process server passes it.
+
+    No role attaches a server today, so the per-role check above never sees one. This feeds it
+    what ``create_sdk_mcp_server`` actually returns — the same call the watcher's builder makes —
+    so the day a role attaches that server, the check is already known to accept it.
+    """
+    real = create_sdk_mcp_server(name="probe", version="0.0.0", tools=[])
+    assert _non_sdk_servers({"probe": real}) == {}
+    # Same verdict when the config is an object rather than a mapping.
+    assert _non_sdk_servers({"probe": SimpleNamespace(type="sdk")}) == {}
+
+
+@pytest.mark.parametrize(
+    "cfg, declared",
+    [
+        ({"type": "stdio", "command": "x"}, "stdio"),
+        ({"command": "x"}, None),  # stdio's ``type`` is optional in the SDK
+        ({"type": "http", "url": "http://h"}, "http"),
+        ({"type": "sse", "url": "http://h"}, "sse"),
+        (SimpleNamespace(type="http", url="http://h"), "http"),
+        (SimpleNamespace(command="x"), None),
+    ],
+)
+def test_b_check_rejects_out_of_process_servers(cfg: Any, declared: Any) -> None:
+    """The (b) check goes red for every out-of-process transport, in either config shape."""
+    assert _non_sdk_servers({"probe": cfg}) == {"probe": declared}
 
 
 @pytest.mark.parametrize("role", _ROLES)
