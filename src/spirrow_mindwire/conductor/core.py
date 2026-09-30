@@ -294,6 +294,10 @@ def adapter_error_code(exc: BaseException) -> str:
     space would be truncated, and a non-string ``.code`` (an HTTP status, ``SystemExit``'s int) is
     not an adapter error code. A ``.code`` property that itself raises falls back to the class
     name (msg-4440).
+
+    The attribute is declared on :class:`~spirrow_mindwire.exceptions.AdapterDeliveryError`
+    (``code: str | None = None``), so an adapter's delivery failure has it by contract. The read
+    below stays dynamic because a dispatch can raise anything, not only a delivery error.
     """
     try:
         code = getattr(exc, "code", None)
