@@ -61,6 +61,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from ..github.client import parse_pr_ref
+from ..tier_c_admission_gate import (
+    ADMIT_LABELS,
+    LEGACY_LABEL_MAP,
+    RELEASE_CROSS_REPO_LABEL,
+    UNSURE_LABEL,
+)
 from ..value_objects import Role
 
 # A handoff line must stand on its own (``^...$`` with MULTILINE). We take the LAST one so a
@@ -237,12 +243,26 @@ class MismatchReason(StrEnum):
 # tag is parsed by the conductor's routing, so it lives with the routing — same defence Bohr made
 # in msg-890 §1 for placing the revised proposer guidance here rather than in obligations. Adding
 # a net-new entry to obligations.yaml is explicitly out of scope for this change.
-TIER_C_LABELS: tuple[str, ...] = (
-    "irreversible",
-    "billing",
-    "scope",
-    "merge-protected",
-    "release-cross-repo",
+#
+# T-tier-c-admission-gate U2 (Bohr msg-4768 / msg-4776): the enum is no longer defined here. It
+# was a second, stale copy of the closed set the admission gate owns (msg-3630 §2.1 — goal /
+# cost / irreversible / merge-protected), and the emission guidance below was teaching authors
+# the old set while the gate judged them by the new one. :data:`TIER_C_LABELS` is now DERIVED
+# from :data:`~spirrow_mindwire.tier_c_admission_gate.ADMIT_LABELS` (sorted, so the prompt text
+# is stable), which makes a drift between "what the prompt teaches" and "what the gate admits"
+# unrepresentable rather than merely tested for.
+#
+# The PARSER still accepts the legacy labels (``scope`` / ``billing`` / ``release-cross-repo``)
+# and the gate's unsure label. That is measurement, not admission: a legacy label is exactly the
+# residual usage the 14-day audit wants to count, and dropping it from the parse would record it
+# as ABSENT — the silent mis-classification this block's opening paragraph forbids. Only
+# :data:`TIER_C_LABELS` is ever taught to an author.
+TIER_C_LABELS: tuple[str, ...] = tuple(sorted(ADMIT_LABELS))
+_TIER_C_PARSE_LABELS: tuple[str, ...] = (
+    *TIER_C_LABELS,
+    *sorted(LEGACY_LABEL_MAP),
+    RELEASE_CROSS_REPO_LABEL,
+    UNSURE_LABEL,
 )
 # `other:<reason>` is admitted separately (its reason text is free-form). Enum alternatives are
 # joined into a single non-capturing alternation; case is folded on match. Whitespace between
@@ -260,7 +280,9 @@ TIER_C_LABELS: tuple[str, ...] = (
 # relaxed.
 _TIER_C_LABEL_RE = re.compile(
     r"\A\s*TIER-C:\s*"
-    r"(?P<label>" + "|".join(re.escape(lbl) for lbl in TIER_C_LABELS) + r"|other:\s*\S[^\r\n]*?)"
+    r"(?P<label>"
+    + "|".join(re.escape(lbl) for lbl in _TIER_C_PARSE_LABELS)
+    + r"|other:\s*\S[^\r\n]*?)"
     r"\s*\Z",
     re.IGNORECASE,
 )
@@ -607,12 +629,35 @@ with exactly one handoff line, and make it the FINAL line of your reply:
 `<name>` is either another participant's persona name (spelled exactly as it \
 appears as a message author in this thread) or one of two reserved words:
 
-  - `NEXT: {HUMAN_TOKEN}` — hand to the human for a Tier-C decision (e.g. \
-approving a design for implementation, or merging to the main branch).
+  - `NEXT: {HUMAN_TOKEN}` — hand to the human ONLY for a Tier-C decision. Tier-C \
+is a closed set of four: `goal` (the product's goal, spec, scope or direction \
+changes), `cost` (money spent changes: a new external service, API billing up or \
+down), `irreversible` (cannot be undone: data deletion, public release, destructive \
+migration, history rewrite, an external side effect), and `merge-protected` (a merge \
+to a protected branch, or a deploy only a human can perform). Anything else is NOT \
+Tier-C — decide it yourself and proceed: the implementation approach, whether and how \
+to address review findings (advisory or REQUEST_CHANGES), test strategy, naming, \
+refactor extent, work order, splitting PRs or threads, approving an internal \
+mechanism's design, and "may I proceed?".
   - `NEXT: {NONE_TOKEN}` — the thread is settled; there is nothing left to do.
 
 The handoff line is part of your verbatim reply, not meta-commentary: write it \
 out literally (for example `NEXT: {HUMAN_TOKEN}`) and put nothing after it."""
+
+# U2 (T-tier-c-admission-gate msg-4768): the label list taught to proposer and implementer is the
+# admission gate's closed set, rendered from :data:`TIER_C_LABELS` (itself derived from
+# ``ADMIT_LABELS``), so the prompt cannot list a label the gate does not admit. ``other:<reason>``
+# is no longer taught: msg-3630 §2.2 makes it a non-ticket. The unsure label is the one sanctioned
+# way to ask "does this touch the goal?" (msg-3630 §2.1, "迷ったら相談してよい"). The text says
+# what the labels ARE and deliberately promises no bounce: the gate's bounce is not wired into
+# routing (msg-4768 U1, moved to the Decider threads), so promising one would be a false claim.
+_TIER_C_LABEL_GUIDANCE = (
+    f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` — the four Tier-C types above, and "
+    "nothing else. If you genuinely cannot tell whether a decision touches the goal, write "
+    f"`TIER-C: {UNSURE_LABEL}` and say in one line what is unclear. `other:<reason>` or a "
+    "missing label is not a Tier-C admission: if none of the four applies, it is not Tier-C, "
+    "so decide it yourself and proceed."
+)
 
 _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
     # A (T-human-terminal-overuse, human GO msg after Einstein ACCEPT msg-891): after you
@@ -640,11 +685,8 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "code, so that you cannot bypass its objections (the conductor structurally redirects "
         f"such a handoff). Hand to `{HUMAN_TOKEN}` only for a decision that is genuinely Tier-C, "
         "and name the type on the line above your handoff, e.g.:\n\n"
-        "    TIER-C: scope\n"
-        f"    NEXT: {HUMAN_TOKEN}\n\n"
-        f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` / `other:<one-line reason>`. This is "
-        "a calibration tag the conductor records so we can tell judgement-Tier-C apart from "
-        "routing-artefact Tier-C; it does NOT redefine what Tier-C is."
+        "    TIER-C: goal\n"
+        f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     # D-3 (T-human-terminal-overuse, Bohr msg-2540 §4 D-3 approved by Einstein msg-2539 Obj-3):
     # implementer receives the same TIER-C: <label> emission guidance the proposer already has (A
@@ -663,10 +705,7 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         f"When you hand to `{HUMAN_TOKEN}`, name the Tier-C type on the line above your handoff, "
         "e.g.:\n\n"
         "    TIER-C: merge-protected\n"
-        f"    NEXT: {HUMAN_TOKEN}\n\n"
-        f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` / `other:<one-line reason>`. This is "
-        "a calibration tag the conductor records so we can tell judgement-Tier-C apart from "
-        "routing-artefact Tier-C; it does NOT redefine what Tier-C is."
+        f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     Role.NAYSAYER: (
         "As the naysayer: after your critique, hand back to the proposer if your objections need a "

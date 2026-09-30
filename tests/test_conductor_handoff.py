@@ -331,8 +331,10 @@ def test_proposer_block_teaches_tier_c_syntax_and_enum() -> None:
     assert "TIER-C:" in block
     for label in TIER_C_LABELS:
         assert f"`{label}`" in block, f"enum label {label!r} missing from proposer guidance"
-    assert "other:<one-line reason>" in block
-    assert "does NOT redefine" in block  # calibration-not-definition mantra kept in the text
+    # U2 (T-tier-c-admission-gate msg-4768): `other:` is no longer taught as a label — msg-3630
+    # §2.2 makes it a non-ticket — and the unsure label is the sanctioned way to ask.
+    assert "other:<one-line reason>" not in block
+    assert "unsure:goal?" in block
 
 
 def test_implementer_block_hands_back_to_proposer_and_never_merges() -> None:
@@ -352,8 +354,10 @@ def test_implementer_block_teaches_tier_c_syntax_and_enum() -> None:
     assert "TIER-C:" in block
     for label in TIER_C_LABELS:
         assert f"`{label}`" in block, f"enum label {label!r} missing from implementer guidance"
-    assert "other:<one-line reason>" in block
-    assert "does NOT redefine" in block  # calibration-not-definition mantra kept in the text
+    # U2 (T-tier-c-admission-gate msg-4768): `other:` is no longer taught as a label — msg-3630
+    # §2.2 makes it a non-ticket — and the unsure label is the sanctioned way to ask.
+    assert "other:<one-line reason>" not in block
+    assert "unsure:goal?" in block
 
 
 def test_naysayer_block_does_not_carry_tier_c_guidance() -> None:
@@ -1276,3 +1280,42 @@ class TestRealTrafficCorpus:
         texts = [text for _, _, text in self._records()]
         assert any(t.startswith("**NEXT: Heisenberg**") for t in texts)
         assert any(t.startswith("→ **NEXT: human**") for t in texts)
+
+
+# ---- U2 (T-tier-c-admission-gate, Bohr msg-4768 / msg-4776) ---------------------------------- #
+
+
+def test_tier_c_labels_are_derived_from_the_admission_gate_enum() -> None:
+    # One source of truth: what the prompt teaches is exactly what the gate admits.
+    from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS
+
+    assert frozenset(TIER_C_LABELS) == ADMIT_LABELS
+    assert len(TIER_C_LABELS) == len(ADMIT_LABELS)
+
+
+def test_handoff_core_drops_design_approval_example_and_lists_the_four_types() -> None:
+    # msg-3630 §2.7: "approving a design for implementation" taught internal design approval
+    # as Tier-C. It is gone; the four types and the not-Tier-C list are in its place.
+    for role in (Role.PROPOSER, Role.IMPLEMENTER, Role.NAYSAYER):
+        block = build_handoff_protocol_block(role)
+        assert "approving a design for implementation" not in block
+        for label in ("goal", "cost", "irreversible", "merge-protected"):
+            assert f"`{label}`" in block, (role, label)
+        assert "Tier-C — decide it yourself" in block
+        assert "whether and how to address review findings" in block
+    for stale in ("`scope`", "`billing`", "`release-cross-repo`"):
+        assert stale not in build_handoff_protocol_block(Role.PROPOSER)
+
+
+class TestLegacyLabelsStillMeasured:
+    """The parser keeps recording legacy / unsure labels — measurement, not admission."""
+
+    def test_legacy_and_unsure_labels_parse(self) -> None:
+        for label in ("scope", "billing", "release-cross-repo", "unsure:goal?"):
+            h = resolve_handoff(f"TIER-C: {label}\nNEXT: human", _ROSTER)
+            assert h.tier_c_label == label, label
+
+    def test_new_labels_parse(self) -> None:
+        for label in ("goal", "cost", "irreversible", "merge-protected"):
+            h = resolve_handoff(f"TIER-C: {label}\nNEXT: human", _ROSTER)
+            assert h.tier_c_label == label, label
