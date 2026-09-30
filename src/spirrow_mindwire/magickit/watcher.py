@@ -181,7 +181,7 @@ class ChatroomWatcher:
         return count
 
     async def _poll_watch(self, watch: WatchSpec, handle: SessionHandle) -> int:
-        count = 0
+        dispatched_count = 0
         # numeric msg-id order = chronological = occurred_at order (msg-190 note 1).
         messages = await self._fetch_messages(watch)
         for msg in messages:
@@ -213,8 +213,8 @@ class ChatroomWatcher:
                 )
                 continue
             await self._dispatcher.dispatch(handle, event)
-            count += 1
-        return count
+            dispatched_count += 1
+        return dispatched_count
 
     def _to_event(
         self, thread_ref: ThreadRef, msg: dict[str, Any], messages: list[Any]
