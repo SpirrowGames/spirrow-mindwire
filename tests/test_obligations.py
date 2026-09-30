@@ -634,3 +634,45 @@ def test_obl_spec_receipt_body_matches_landed_spec_section_4_2() -> None:
         f"OBL-SPEC-RECEIPT body drifted from spec/design/T-spec-pin-hardening-and-id-audit.md §4-2 "
         f"(spec len={len(expected)}, manifest len={len(actual)})."
     )
+
+
+# --------------------------------------------------------------------------- #
+# T-fix-now-vs-followup-is-mechanical (DECIDED msg-5233; design Bohr msg-5241 §2).
+# Delivery itself is covered by the canary two-prime tests above (every entry of a role);
+# these pin what those canaries cannot: the role each entry is filed under, that the bodies
+# name the threshold only by reference, and that the command they teach is the real one.
+# --------------------------------------------------------------------------- #
+
+
+def test_fix_now_obligations_are_filed_under_their_roles() -> None:
+    manifest = load_manifest()
+    roles = {o.id: o.role for o in manifest.obligations}
+    assert roles["OBL-FIX-NOW-DEFAULT"] is Role.IMPLEMENTER
+    assert roles["OBL-FIX-NOW-REVIEW"] is Role.NAYSAYER
+
+
+def test_fix_now_obligation_bodies_carry_no_threshold_number() -> None:
+    from spirrow_mindwire.naysayer import pr_review
+
+    manifest = load_manifest()
+    bodies = [o.body for o in manifest.obligations if o.id.startswith("OBL-FIX-NOW-")]
+    assert len(bodies) == 2
+    for body in bodies:
+        for n in (pr_review._DIFF_WARN_THRESHOLD, pr_review._MAX_DIFF_CHARS):
+            assert str(n) not in body and f"{n:,}" not in body
+        assert "`mindwire pr-diff-size" in body
+
+
+def test_fix_now_default_teaches_the_real_command_and_revert_format() -> None:
+    from spirrow_mindwire import cli
+
+    (entry,) = [o for o in load_manifest().obligations if o.id == "OBL-FIX-NOW-DEFAULT"]
+    # The command line the body teaches parses with the real CLI parser.
+    args = cli._build_parser().parse_args(["pr-diff-size", "--repo", "o/r", "--pr", "1"])
+    assert args.command == "pr-diff-size"
+    assert "`mindwire pr-diff-size --repo <owner/repo> --pr <n>`" in entry.body
+    assert 'Revert "<original commit subject>" — moved to follow-up <tracking thread ID>' in (
+        entry.body
+    )
+    assert "exit 3" in entry.body and "exit 0" in entry.body
+    assert "force-push" in entry.body

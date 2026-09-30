@@ -908,7 +908,9 @@ is a closed set of {_TIER_C_COUNT_WORD}: {_TIER_C_DEFINITIONS_PROSE}. Anything e
 Tier-C — decide it yourself and proceed: the implementation approach, whether and how \
 to address review findings (advisory or REQUEST_CHANGES), test strategy, naming, \
 refactor extent, work order, splitting PRs or threads, approving an internal \
-mechanism's design, and "may I proceed?".
+mechanism's design, whether to fix a finding in the current PR or a follow-up \
+(fixed rule: fix now; split only if the PR's gate-measured diff would exceed the \
+gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proceed?".
   - `NEXT: {NONE_TOKEN}` — the thread is settled; there is nothing left to do.
 
 The handoff line is part of your verbatim reply, not meta-commentary: write it \
