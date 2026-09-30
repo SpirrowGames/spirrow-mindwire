@@ -139,6 +139,8 @@ def test_human_without_author_request_or_mismatch_is_false(
     plain = Handoff(HandoffKind.HUMAN)
     assert plain.mismatch_reason is None and plain.author_requested_human is False
     monkeypatch.setattr(builder, "resolve_handoff", lambda *a, **k: plain)
-    row = _row("decide\n\nNEXT: human", None)
+    # The head names a roster member, not the human, so the input agrees with the stubbed
+    # escalation: the author did not ask for the human (e.g. a max-turns escalation).
+    row = _row("decide\n\nNEXT: Bohr", None)
     assert row["author_wrote_next_human"] is False
     assert row["live_entry"] is False
