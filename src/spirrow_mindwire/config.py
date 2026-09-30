@@ -353,7 +353,7 @@ class Stage3LoopConfig(_StrictModel):
 
     watches: tuple[LoopWatchConfig, ...] = ()
 
-    @field_validator("role_model", "role_cli_path", mode="before")
+    @field_validator("role_model", "role_cli_path", "repo_dir", mode="before")
     @classmethod
     def _blank_means_unset(cls, v: object) -> object:
         """Treat an empty / whitespace-only value as "not configured".
@@ -363,6 +363,11 @@ class Stage3LoopConfig(_StrictModel):
         ``role_model`` would send ``--model ""`` and ``role_cli_path`` would
         coerce to ``Path(".")`` — a directory offered to the SDK as an
         executable — which are two confusing failures for one obvious intent.
+
+        ``repo_dir`` joined for the same ``Path(".")`` trap (T42 PR, PR #357 gate advisory):
+        ``repo_dir = ""`` would become the current directory, pass T44's ``is_dir()`` check
+        and point the implementer at wherever the daemon happened to start. Read as unset, it
+        takes T44's ``repo_dir_unset`` stand-down instead.
         """
         if isinstance(v, str) and not v.strip():
             return None
