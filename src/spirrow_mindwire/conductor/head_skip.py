@@ -109,12 +109,16 @@ from .handoff import HUMAN_TOKEN, NONE_TOKEN, parse_next_token
 # and record the observation in the git commit message.
 #
 # BASE
-#   Rationale: must be >= session_timeout + 1 tick so a single conductor launch cannot overlap
-#   its own next scheduled tick under the ``MultipleInstancesPolicy=IgnoreNew`` scheduler
-#   contract. Session timeout is ``PT4H`` (14400 s) worst case (kill) but ~15-25 min typical
-#   (measured 2026-08-11 on this project's threads); the tick cadence is minute-scale (see
-#   docs/deploy.md's task table). Choosing 15 min matches the typical session floor with one
-#   tick of headroom without imposing untuned delay.
+#   Rationale: BASE is the first no-progress backoff step, measured from ``last_launch_at``. It is
+#   NOT what keeps a conductor launch from overlapping its own next tick: the scheduler's
+#   ``MultipleInstancesPolicy=IgnoreNew`` does that on its own (see docs/deploy.md's task table),
+#   because a tick that fires while a session is still running is dropped. So BASE is not
+#   required to be >= session length + 1 tick, and 15 min does not meet that bound: sessions are
+#   ``PT4H`` (14400 s) worst case (kill) and ~15-25 min typical (measured 2026-08-11 on this
+#   project's threads). Consequence: after a session at or above the typical floor ends, the
+#   next tick already finds BASE elapsed, so BASE only delays a relaunch after a session shorter
+#   than 15 min. 15 min is set at the typical session floor so that a short no-progress run is
+#   held back to roughly the pace of a normal one, without adding delay to normal-length runs.
 #
 # CAP
 #   The steady-state ceiling for the degenerate path. At 60 min a "spin" thread produces 1
