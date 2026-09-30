@@ -41,6 +41,27 @@ class TestKnownShapes:
         tail = 'ClaudeCodeSdkDeliveryError: subtype="error_during_execution" ...'
         assert classify_failure(tail) == "sdk-error-during-execution"
 
+    def test_sdk_error_during_execution_post_s9_prefix_form(self) -> None:
+        """T-sdk-is-error-loses-the-reason S-9 R-1: the subtype is now a prefix
+        (``SDK is_error[<subtype>]; <reason>``). The biggest bucket must not go
+        silent because the message shape changed."""
+        tail = (
+            "ClaudeCodeSdkDeliveryError: deliver_event failed for session s: "
+            "SDK is_error[error_during_execution]; errors=['AxiosError: 403']"
+        )
+        assert classify_failure(tail) == "sdk-error-during-execution"
+
+    def test_sdk_error_post_s9_prefix_with_other_subtype_falls_to_generic(self) -> None:
+        tail = "ClaudeCodeSdkDeliveryError: SDK is_error[pending_confirmation]; errors=['x']"
+        assert classify_failure(tail) == "sdk-is-error-generic"
+
+    def test_sdk_error_post_s9_prefix_on_other_line_does_not_bond(self) -> None:
+        tail = (
+            "ClaudeCodeSdkDeliveryError: SDK is_error[pending_confirmation]; errors=['x']\n"
+            "unrelated: SDK is_error[error_during_execution]"
+        )
+        assert classify_failure(tail) == "sdk-is-error-generic"
+
     def test_sdk_error_without_recognised_subtype_falls_to_generic(self) -> None:
         tail = "ClaudeCodeSdkDeliveryError: SDK is_error; subtype='pending_confirmation'"
         assert classify_failure(tail) == "sdk-is-error-generic"
@@ -176,3 +197,45 @@ class TestPatternDisciplineNoCrossLineBridging:
             "later: conflict resolution algorithm ran on some other subsystem"
         )
         assert classify_failure(tail) == UNKNOWN_LABEL
+
+
+class TestThreadResolvedOnPost:
+    """T-sweep-admission-ignores-thread-status D2 (Bohr msg-4613 §2, operator msg-4172).
+
+    The fixture is the two ``session_log_tail`` lines operator pasted from ``quarantine.json``,
+    verbatim (the ``…`` elisions are the operator's). Before D2 this tail classified as
+    ``unknown`` even though it names the exception type twice.
+    """
+
+    _OPERATOR_TAIL = (
+        "spirrow_mindwire.magickit.client.ThreadResolvedError: … "
+        "error_type='ChatroomThreadResolvedError' …\n"
+        "spirrow_mindwire.adapters.naysayer_sdk.NaysayerSdkDeliveryError: deliver_event failed "
+        "for session 01M36Z7QT57YJTNC8K22KFYXYP: … error_type='ChatroomThreadResolvedError' …"
+    )
+
+    def test_operator_tail_verbatim(self) -> None:
+        assert classify_failure(self._OPERATOR_TAIL) == "thread-resolved-on-post"
+
+    def test_each_operator_line_alone(self) -> None:
+        for line in self._OPERATOR_TAIL.splitlines():
+            assert classify_failure(line) == "thread-resolved-on-post"
+
+    def test_wins_over_claude_sdk_wrapper_on_the_same_line(self) -> None:
+        # Without first-position precedence, sdk-is-error-generic would take this line.
+        line = (
+            "ClaudeCodeSdkDeliveryError: deliver_event failed for session X: "
+            "error_type='ChatroomThreadResolvedError'"
+        )
+        assert classify_failure(line) == "thread-resolved-on-post"
+
+    def test_bare_client_exception_name(self) -> None:
+        assert classify_failure("ThreadResolvedError: thread is resolved") == (
+            "thread-resolved-on-post"
+        )
+
+    def test_word_boundary_rejects_a_longer_identifier(self) -> None:
+        assert classify_failure("NotThreadResolvedErrorish happened") == UNKNOWN_LABEL
+
+    def test_is_listed_first(self) -> None:
+        assert known_labels()[0] == "thread-resolved-on-post"

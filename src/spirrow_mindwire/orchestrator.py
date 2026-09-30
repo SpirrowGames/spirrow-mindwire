@@ -23,11 +23,20 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .conductor.gate_records import RELAY_AUTHOR, render_relay_heading
+from .conductor.gate_records import (
+    ADVISORY_SELF_TRIAGE_INSTRUCTION,
+    MERGE_REQUEST_TIER_C_LINE,
+    RELAY_AUTHOR,
+    RelayRoute,
+    carries_advisory,
+    decide_relay_route,
+    prior_advisory_approvals,
+    render_relay_heading,
+)
 from .conductor.handoff import HUMAN_TOKEN
 from .github.client import CiState, CiStatus, GitHubReviewClient, PrRef, ReviewEvent, parse_pr_ref
 from .magickit.client import MagickitMcpError, McpToolCaller, ThreadResolvedError
-from .naysayer.pr_review import NaysayerPrReviewDriver, PrReviewOutcome
+from .naysayer.pr_review import NaysayerPrReviewDriver, PrReviewOutcome, parse_objections
 from .value_objects import Role, ThreadRef
 
 logger = logging.getLogger(__name__)
@@ -421,9 +430,16 @@ class PrReviewOrchestrator:
     ) -> dict[str, Any]:
         """Post the verdict (+ critique body) into the design thread as the relay author.
 
-        Informational only — the conductor routes from ``outcome.verdict``; this post is the
-        human-readable record and the implementer's fix context on a RC. Its ``NEXT:`` line
-        mirrors that route for readability and is never re-parsed (no author is trusted; msg-557).
+        This is where the relay's route is decided (U3', T-tier-c-admission-gate msg-4776): the
+        returned dict carries ``"route"`` (:class:`RelayRoute`), which the conductor branches on;
+        the post is the human-readable record and the implementer's context (the fix on a RC,
+        the advisories to triage on a first advisory APPROVE). Its ``NEXT:`` line is written
+        from that same ``route`` and is never re-parsed (no author is trusted; msg-557).
+
+        Reader / fallback surface (OBL-CHATROOM-PRODUCER-READER-SURFACE): the intended reader is
+        the routed-to participant (implementer or human) in the design thread; on a resolved
+        thread the disposition is (1), the GitHub PR review — see the ``ThreadResolvedError``
+        handler below.
 
         The heading names the head SHA the gate reviewed
         (:func:`~spirrow_mindwire.conductor.gate_records.render_relay_heading`). That is not
@@ -437,16 +453,34 @@ class PrReviewOrchestrator:
         read) is used, not what admission observed a moment earlier, so a push that lands
         between the two is recorded against the diff that was really reviewed.
         """
-        nxt = (
-            implementer
-            if outcome.verdict is ReviewEvent.REQUEST_CHANGES and implementer
-            else HUMAN_TOKEN
-        )
+        # U3' (T-tier-c-admission-gate msg-4774 / msg-4776): the route is decided HERE, once, by
+        # :func:`decide_relay_route`, and returned on the relay dict as ``"route"``. The printed
+        # ``NEXT:`` and the conductor's branch are both read off that one value, so they cannot
+        # disagree (Einstein msg-4775 #2). The design thread's history is read only when it can
+        # change the answer — an advisory-carrying APPROVE — so every other verdict costs no
+        # extra chatroom call.
+        objections = parse_objections(outcome.body).status
+        prior: int | None = 0
+        if implementer and carries_advisory(outcome.verdict, objections):
+            prior = await self._prior_advisory_approvals(
+                project=project, design_thread=design_thread, pr_ref=pr_ref
+            )
+        route = decide_relay_route(outcome.verdict, objections, prior, implementer)
+        tail: list[str] = []
+        if route is RelayRoute.IMPLEMENTER:
+            assert implementer  # decide_relay_route never picks IMPLEMENTER without one
+            if outcome.verdict is ReviewEvent.APPROVE:
+                tail.append(ADVISORY_SELF_TRIAGE_INSTRUCTION)
+            tail.append(f"NEXT: {implementer}")
+        elif outcome.verdict is ReviewEvent.APPROVE:
+            # Every APPROVE that stops at the human is a merge request (msg-4772 / msg-4774).
+            tail.append(f"{MERGE_REQUEST_TIER_C_LINE}\nNEXT: {HUMAN_TOKEN}")
+        else:
+            tail.append(f"NEXT: {HUMAN_TOKEN}")
         body = (
             f"{render_relay_heading(pr_ref, outcome.head_sha)}\n\n"
             f"VERDICT: {outcome.verdict.value} (ci={outcome.ci_state.value})\n\n"
-            f"{outcome.body}\n\n"
-            f"NEXT: {nxt}"
+            f"{outcome.body}\n\n" + "\n\n".join(tail)
         )
         try:
             result = await self._mcp.call_tool(
@@ -483,10 +517,44 @@ class PrReviewOrchestrator:
                 design_thread,
                 exc,
             )
-            return {"msg_id": "", "author": RELAY_AUTHOR, "content": body}
+            return {"msg_id": "", "author": RELAY_AUTHOR, "content": body, "route": route}
         msg = result.get("msg") if isinstance(result, dict) else None
         msg_id = str(msg.get("msg_id") or "") if isinstance(msg, dict) else ""
-        return {"msg_id": msg_id, "author": RELAY_AUTHOR, "content": body}
+        return {"msg_id": msg_id, "author": RELAY_AUTHOR, "content": body, "route": route}
+
+    async def _prior_advisory_approvals(
+        self, *, project: str, design_thread: str, pr_ref: str
+    ) -> int | None:
+        """Count this PR's earlier advisory-carrying APPROVE relays in the design thread.
+
+        ``None`` when the thread cannot be read: :func:`decide_relay_route` then fails to the
+        human, because the count that stops an advisory chain (#305) is unknown. The design
+        thread was already proven to exist before the review was paid for
+        (:meth:`_validate_design_thread`), so a failure here is a transport fault, not a
+        missing destination.
+        """
+        try:
+            payload = await self._mcp.call_tool(
+                "chatroom_get_thread",
+                {"project": project, "thread_id": design_thread, "mode": "full"},
+            )
+        except MagickitMcpError as exc:
+            logger.warning(
+                "pr-gate relay: could not read design thread %r to count prior advisory "
+                "APPROVEs (%s); routing to the human",
+                design_thread,
+                exc,
+            )
+            return None
+        if not isinstance(payload, dict):
+            return None
+        messages = payload.get("messages") or []
+        pairs = [
+            (str(m.get("author") or ""), str(m.get("content") or ""))
+            for m in messages
+            if isinstance(m, dict)
+        ]
+        return prior_advisory_approvals(pairs, pr_ref)
 
     async def _resolve_thread_id(self, *, project: str, pr: PrRef) -> _ResolvedThread:
         """Pick the thread id this PR's gate writes to, and prove it is free or ours.

@@ -184,4 +184,24 @@ Drive→Git 移行（Phase 2）は 2026-09-11 に完了し、`spec/adr_index.yam
 
 ---
 
+## 7. 注記 (2026-09-30): agent 間の通信は chatroom だけを通す — T46
+
+本文（§2.3 を含む）は書き換えない。この節は注記だけで、§2 の決定を増やしも減らしもしない。
+
+- **不変条件**: ループの 3 役（proposer / implementer / naysayer）のセッションには、chatroom を経由せずに別の agent へ
+  メッセージや作業を渡す経路が無い。Claude Code 組み込みの `Task` / `Agent`（sub-agent）や `SendMessage` /
+  `ListAgents` 系、および別セッションへ届く MCP tool が該当する。これらはスレッドに痕跡を残さず、人も naysayer も
+  読めない（出典: fujibee/agmsg SKILL.md の同趣旨の警告、Fermi msg-3099 §3）。
+- **何が守っているか**: 名前で弾く実行時の denylist ではない（名前の分からない MCP tool には効かないため。Bohr msg-4886
+  §1、Einstein msg-4887 承認）。役ごとの callable 面は組み立て側だけが決める —— `tools=` の組み込み集合、
+  `mcp_servers`、それ以外をホストから継承させない `setting_sources=[]` + `strict_mcp_config=True`
+  （`src/spirrow_mindwire/adapters/_session_isolation.py`）。この 3 点を `tests/test_role_tool_surface.py` が本番の
+  builder から固定する。
+- **サーバーを足すとき**: 別プロセスの MCP サーバー（stdio / http）を役に足す PR は上のテストを赤にする。その PR で、
+  足したサーバーが chatroom を経由しない通信経路を開かないことを説明し、あわせて T43 の `spawn.ready`
+  （connect 完了 = ready）の条件を設計し直すこと。
+- 記録: chatroom thread `T-agmsg-transport-lessons-readiness-session-claim-board`（Bohr msg-4957、Einstein msg-4956 ほか）。
+
+---
+
 > **Provenance**: canonical reflection of `ADR-2026-05-23-07-stage3-autonomy-gating.md` (source author: main / claude.ai). Reflected to Drive by claude-code per §2.5 (Tier C, Takahito pre-GO obtained). Recorded in chatroom thread `T-phase2-stage3-autonomy-gating`.

@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from spirrow_mindwire.conductor.gate_records import render_relay_heading, verdict_heads
+from spirrow_mindwire.conductor.gate_records import RelayRoute, render_relay_heading, verdict_heads
 from spirrow_mindwire.github.client import CiState, CiStatus, PrRef, ReviewEvent, ReviewInfo
 from spirrow_mindwire.magickit.client import MagickitMcpError, raise_if_envelope
 from spirrow_mindwire.magickit.watcher import ChatroomWatcher, WatchSpec
@@ -1165,8 +1165,12 @@ async def test_one_fire_lands_in_both_the_ledger_and_the_design_thread() -> None
         f"{render_relay_heading('o/r#7', 'sha1')}\n\n"
         "VERDICT: APPROVE (ci=success)\n\n"
         "LGTM\n\nVERDICT: APPROVE\n\n"
+        # U3' (T-tier-c-admission-gate msg-4774): an APPROVE that stops at the human is a merge
+        # request, and says so with the merge-protected Tier-C label.
+        "TIER-C: merge-protected\n"
         "NEXT: human"
     )
+    assert relay["route"] is RelayRoute.HUMAN
     assert relay["author"] == "pr-gate-relay"
     assert relay["content"] == design["content"]
 
@@ -1272,7 +1276,9 @@ class _FakeGitHubCi:
         # Kept for GitHubReviewClient Protocol compliance.
         return []
 
-    async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
+    async def submit_review(
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     async def probe_identity(self) -> int:

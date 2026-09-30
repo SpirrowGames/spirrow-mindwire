@@ -509,10 +509,10 @@ function Add-LeaseWaiter {
 
     .DESCRIPTION
         Why waiting_since is preserved on a re-enqueue (this IS the contract):
-          The sweep tick runs every ~5 min. If a candidate declares `requires: editor` and the
+          The sweep tick recurs on a short interval. If a candidate declares `requires: editor` and the
           lease is held, the wrapper calls Register-LeaseWaiter → Add-LeaseWaiter on it every
           tick until the lease frees. Refreshing `waiting_since` on those repeat calls would
-          reset the wait clock every 5 min, so the waiter that arrived first would never age
+          reset the wait clock every tick, so the waiter that arrived first would never age
           past a fresher one — grant-time FIFO (msg-1183 D-3) collapses to "the last one to
           re-attempt wins". The idempotent-with-preserve behaviour is what makes "waiting_since
           FIFO" a real ordering rather than sweep-tick noise. The regression test §8
@@ -553,7 +553,7 @@ function Add-LeaseWaiter {
     foreach ($w in $existing) {
         $k = if ($w -is [hashtable]) { $w['key'] } else { $w.key }
         # Already queued: return WITHOUT touching `waiting_since` — this is the FIFO-preserving
-        # branch the SYNOPSIS above documents. Refreshing would reset the wait clock every ~5-min
+        # branch the SYNOPSIS above documents. Refreshing would reset the wait clock every
         # sweep tick and collapse FIFO to "last re-attempt wins" (msg-2181 blocker fix).
         if ($k -eq $WaiterKey) { return }
     }
@@ -1641,7 +1641,7 @@ function Save-CorruptedStateBackup {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     # Filename-safe UTC stamp — colons are invalid in Windows filenames, and file managers show
     # T/Z/- fine. The stamp resolves to the second, which is enough for forensic pairing (the
-    # sweep runs on a 5-minute cadence — sub-second collisions cannot happen).
+    # sweep runs at most once per scheduled tick, minutes apart — sub-second collisions cannot happen).
     $stamp = [datetime]::UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ")
     $badPath = "$Path.bad-$stamp"
     Move-Item -LiteralPath $Path -Destination $badPath

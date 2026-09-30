@@ -16,6 +16,7 @@ handed and re-raises the exception UNCHANGED; ``loop_runner.main`` is the single
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -30,7 +31,7 @@ from spirrow_mindwire.conductor.core import (
     StopReason,
     adapter_error_code,
 )
-from spirrow_mindwire.config import MindwireSettings
+from spirrow_mindwire.config import ConductorConfig, MindwireSettings, Stage3LoopConfig
 from spirrow_mindwire.value_objects import ChatroomEvent, Role, SessionHandle
 
 # --------------------------------------------------------------------------- #
@@ -200,7 +201,12 @@ _SNAPSHOT = ConductorStopSnapshot(
 
 def _patch_main(monkeypatch: pytest.MonkeyPatch, body: Any) -> None:
     async def _fake_run_conductor(
-        _settings: MindwireSettings, *, stop_slot: ConductorStopSlot | None = None
+        _settings: MindwireSettings,
+        *,
+        stop_slot: ConductorStopSlot | None = None,
+        # T42: main() now also forwards the sweep's stall-watchdog input (defaults never stall).
+        launches_same_head: int = 0,
+        launch_head_msg_id: str | None = None,
     ) -> None:
         assert stop_slot is not None, "main must hand the conductor a stop slot"
         await body(stop_slot)
@@ -320,8 +326,25 @@ async def test_environment_terminal_through_a_real_conductor_is_not_wrapped() ->
     assert slot.snapshot is not None
 
 
+class _ReadableThreadMcp:
+    """Answers only the T44 launch-resolution read: the thread exists."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        assert name == "chatroom_get_thread", name
+        return {"messages": []}
+
+
+def _resolvable_settings(tmp_path: Path) -> MindwireSettings:
+    # T44: run_conductor resolves project / thread / repo_dir before building anything, so the
+    # settings must name a thread and an existing repo_dir to reach build_conductor at all.
+    return MindwireSettings(
+        loop=Stage3LoopConfig(repo_dir=tmp_path),
+        conductor=ConductorConfig(task_thread_id="T-slot"),
+    )
+
+
 def test_run_conductor_threads_the_slot_into_the_conductor(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from spirrow_mindwire.conductor.core import ConductorOutcome
 
@@ -349,5 +372,9 @@ def test_run_conductor_threads_the_slot_into_the_conductor(
     monkeypatch.setattr(loop_runner, "build_conductor", _fake_build)
     monkeypatch.setattr(loop_runner, "_preflight", lambda _cfg: None)
     slot = ConductorStopSlot()
-    asyncio.run(loop_runner.run_conductor(MindwireSettings(), stop_slot=slot))
+    asyncio.run(
+        loop_runner.run_conductor(
+            _resolvable_settings(tmp_path), stop_slot=slot, mcp=_ReadableThreadMcp()
+        )
+    )
     assert seen == [slot]
