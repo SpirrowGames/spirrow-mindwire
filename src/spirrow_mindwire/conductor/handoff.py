@@ -66,6 +66,7 @@ from ..tier_c_admission_gate import (
     LEGACY_LABEL_MAP,
     RELEASE_CROSS_REPO_LABEL,
     UNSURE_LABEL,
+    require_admitted,
 )
 from ..value_objects import Role
 
@@ -882,9 +883,7 @@ def _render_label_definitions(labels: tuple[str, ...]) -> str:
 
 def _admitted_example(label: str) -> str:
     """Return ``label`` for a worked example, failing the import if the gate no longer admits it."""
-    if label not in ADMIT_LABELS:
-        raise RuntimeError(f"handoff example label {label!r} is not in ADMIT_LABELS")
-    return label
+    return require_admitted(label, where="handoff example")
 
 
 _TIER_C_COUNT_WORD = _count_word(len(TIER_C_LABELS))

@@ -287,3 +287,45 @@ def test_counter_reads_a_heading_without_a_head_sha() -> None:
 
 def test_counter_is_zero_on_empty_history() -> None:
     assert prior_advisory_approvals([], _PR) == 0
+
+
+# ---------------------------------------------------------------------------
+# PR #365 PR-gate advisory (msg-4850), human-chosen B: the merge-request label is resolved
+# against the gate's admitted set, not hardcoded beside it.
+# ---------------------------------------------------------------------------
+
+
+def test_merge_request_label_is_admitted_and_drives_both_texts() -> None:
+    from spirrow_mindwire.conductor.gate_records import MERGE_REQUEST_TIER_C_LABEL
+    from spirrow_mindwire.tier_c_admission_gate import ADMIT_LABELS
+
+    assert MERGE_REQUEST_TIER_C_LABEL in ADMIT_LABELS
+    assert f"TIER-C: {MERGE_REQUEST_TIER_C_LABEL}" == MERGE_REQUEST_TIER_C_LINE
+    # The implementer instruction teaches the same line, not a second copy of the label.
+    assert f"`{MERGE_REQUEST_TIER_C_LINE}`" in ADVISORY_SELF_TRIAGE_INSTRUCTION
+
+
+def test_require_admitted_fails_loudly_on_an_unadmitted_label() -> None:
+    from spirrow_mindwire.tier_c_admission_gate import require_admitted
+
+    assert require_admitted("merge-protected", where="t") == "merge-protected"
+    with pytest.raises(RuntimeError, match=r"gate_records: .*'merge-guarded'"):
+        require_admitted("merge-guarded", where="gate_records")
+
+
+def test_gate_records_import_fails_if_gate_drops_merge_protected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gate that stops admitting the label makes gate_records unimportable (no silent drift)."""
+    import importlib
+    import sys
+
+    import spirrow_mindwire.tier_c_admission_gate as gate
+
+    monkeypatch.setattr(gate, "ADMIT_LABELS", frozenset({"goal", "cost", "irreversible"}))
+    saved = sys.modules.pop("spirrow_mindwire.conductor.gate_records")
+    try:
+        with pytest.raises(RuntimeError, match="merge-protected"):
+            importlib.import_module("spirrow_mindwire.conductor.gate_records")
+    finally:
+        sys.modules["spirrow_mindwire.conductor.gate_records"] = saved
