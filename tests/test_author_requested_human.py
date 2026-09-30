@@ -100,10 +100,7 @@ def test_stop_line_head_resolves_absent_on_this_tree() -> None:
 def test_stop_line_above_next_none_is_not_an_author_request() -> None:
     # The #363 form: ``STOP:`` annotates a final ``NEXT: none``. It resolves NONE (never HUMAN),
     # so it can never read as the author naming the human, whatever the STOP line says.
-    h = resolve_handoff("x
-
-STOP: blocked-on human wake:human
-NEXT: none", _R)
+    h = resolve_handoff("x\n\nSTOP: blocked-on human wake:human\nNEXT: none", _R)
     assert h.kind is HandoffKind.NONE
     assert h.stop_line is not None
     assert h.author_requested_human is False
