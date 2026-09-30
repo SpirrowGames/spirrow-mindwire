@@ -21,7 +21,9 @@ from spirrow_mindwire.conductor.core import (
     StopReason,
 )
 from spirrow_mindwire.conductor.gate_records import (
+    RelayRoute,
     ci_route_heads,
+    decide_relay_route,
     render_ci_route_marker,
     render_relay_heading,
 )
@@ -36,7 +38,7 @@ from spirrow_mindwire.magickit.client import (
     raise_if_envelope,
 )
 from spirrow_mindwire.magickit.gateway import MagickitChatroomGateway
-from spirrow_mindwire.naysayer.pr_review import PrReviewOutcome
+from spirrow_mindwire.naysayer.pr_review import PrReviewOutcome, parse_objections
 from spirrow_mindwire.ports import SpawnContext
 from spirrow_mindwire.source_marker import append_markers
 from spirrow_mindwire.ulid_util import new_ulid
@@ -249,11 +251,19 @@ class _ScriptedPrGate:
     round-trip pin over production's *actual* output lives in ``tests/test_orchestrator.py``.
     """
 
-    def __init__(self, mcp: _FakeChatroomMcp, *verdicts: ReviewEvent) -> None:
+    def __init__(
+        self,
+        mcp: _FakeChatroomMcp,
+        *verdicts: ReviewEvent,
+        route_override: RelayRoute | None = None,
+    ) -> None:
         self._mcp = mcp
         self._verdicts = list(verdicts)
         self.fired: list[str] = []
         self.design_threads: list[str] = []
+        # U3' test 10: force a route that disagrees with the verdict, to prove the conductor
+        # branches on the relay's ``route`` and not on the verdict.
+        self._route_override = route_override
 
     async def fire_pr_review(
         self, *, project: str, pr_ref: str, design_thread: str, implementer: str | None = None
@@ -262,14 +272,23 @@ class _ScriptedPrGate:
         self.design_threads.append(design_thread)
         verdict = self._verdicts.pop(0) if len(self._verdicts) > 1 else self._verdicts[0]
         outcome = _pr_outcome(verdict)
-        nxt = implementer if verdict is ReviewEvent.REQUEST_CHANGES and implementer else "human"
+        # U3': the route comes from the SAME pure function production's relay writer calls.
+        route = self._route_override or decide_relay_route(
+            verdict, parse_objections(outcome.body).status, 0, implementer
+        )
+        nxt = implementer if route is RelayRoute.IMPLEMENTER and implementer else "human"
         content = (
             f"{render_relay_heading(pr_ref, outcome.head_sha)}\n\n"
             f"VERDICT: {verdict.value} (ci={outcome.ci_state.value})\n\n"
             f"{outcome.body}\n\n"
             f"NEXT: {nxt}"
         )
-        relay: dict[str, Any] = {"msg_id": "", "author": "pr-gate-relay", "content": content}
+        relay: dict[str, Any] = {
+            "msg_id": "",
+            "author": "pr-gate-relay",
+            "content": content,
+            "route": route,
+        }
         try:
             result = await self._mcp.call_tool(
                 "chatroom_post_message",
@@ -1441,6 +1460,49 @@ async def test_pr_gate_relay_without_msg_id_fails_safe_to_human() -> None:
     outcome = await _conductor(mcp, disp, orchestrator=gate).run()
     assert outcome.stop_reason is StopReason.HUMAN
     assert disp.dispatches == []
+
+
+# ---- U3' (T-tier-c-admission-gate msg-4774 / msg-4776) --------------------------------------- #
+
+
+@pytest.mark.anyio
+async def test_u3_7_relay_post_failure_stops_at_human_even_on_implementer_route() -> None:
+    # U3' test 7: the relay-post fail-safe stays in the conductor and beats the policy route. An
+    # IMPLEMENTER route with no relay msg_id still stops at the human.
+    mcp = _NoMsgIdMcp()
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE, route_override=RelayRoute.IMPLEMENTER)
+    disp = _ScriptedDispatcher(mcp, {})
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches == []
+
+
+@pytest.mark.anyio
+async def test_u3_10_conductor_follows_relay_route_not_verdict() -> None:
+    # U3' test 10: the conductor's branch is read off the relay's ``route``, the same value the
+    # relay's NEXT: line is written from. A route that disagrees with the verdict (APPROVE routed
+    # to the implementer — the first-advisory row) must be obeyed, and the NEXT: line agrees.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE, route_override=RelayRoute.IMPLEMENTER)
+    disp = _ScriptedDispatcher(mcp, {Role.IMPLEMENTER: ["DECIDED: x — y\n\nNEXT: human"]})
+    outcome = await _conductor(mcp, disp, orchestrator=gate).run()
+    # The first dispatch is the implementer, woken on the relay. (What the conductor does with
+    # the implementer's own NEXT: human afterwards is the pre-existing routing, not U3'.)
+    assert disp.dispatches[0][0] is Role.IMPLEMENTER
+    assert parse_next_token(disp.events[0].payload.body) == "Heisenberg"
+    assert gate.fired == ["acme/widgets#7"]
+    _ = outcome
+
+    # And the reverse: a REQUEST_CHANGES whose route says HUMAN stops, with no dispatch.
+    mcp2 = _FakeChatroomMcp()
+    mcp2.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate2 = _ScriptedPrGate(mcp2, ReviewEvent.REQUEST_CHANGES, route_override=RelayRoute.HUMAN)
+    disp2 = _ScriptedDispatcher(mcp2, {})
+    outcome2 = await _conductor(mcp2, disp2, orchestrator=gate2).run()
+    assert disp2.dispatches == []
+    assert outcome2.stop_reason is StopReason.HUMAN
 
 
 @pytest.mark.anyio

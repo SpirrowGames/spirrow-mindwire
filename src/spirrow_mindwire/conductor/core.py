@@ -80,7 +80,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
 from ..decider.hook import Decider, ThreadMessage, run_tierc_hook
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
-from ..github.client import CheckRollup, PrRef, ReviewEvent, parse_pr_ref
+from ..github.client import CheckRollup, PrRef, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
@@ -98,6 +98,7 @@ from ..value_objects import (
 from .control import BASELINE_CONTROL_STATE, ControlState, LoopControl
 from .gate_records import (
     RELAY_AUTHOR,
+    RelayRoute,
     ci_route_heads,
     normalize_sha,
     render_ci_route_marker,
@@ -559,15 +560,18 @@ class Conductor:
                         processed_msg_id = route_msg_id
                         continue
                     # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through.
-                verdict, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
+                relay_route, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
                 implementer_identity = self._implementer_identity
-                # A missing relay id (post result with no msg_id) breaks no-progress tracking on
-                # the continue path, so fail-safe to the human instead of re-processing the relay
-                # next round (Tier B msg-572 #2). APPROVE / COMMENT also stop at the human.
+                # U3' (T-tier-c-admission-gate msg-4776): WHERE to go is decided once, by the relay
+                # writer (``gate_records.decide_relay_route``), and read here off the relay — this
+                # branch no longer re-derives it from the verdict. What stays here are the two
+                # execution fail-safes, which are not policy: a missing relay id (post result with
+                # no msg_id) breaks no-progress tracking on the continue path (Tier B msg-572 #2),
+                # and no implementer persona means nobody to dispatch. Both stop at the human.
                 if (
                     not relay_msg_id
-                    or verdict is not ReviewEvent.REQUEST_CHANGES
+                    or relay_route is not RelayRoute.IMPLEMENTER
                     or not implementer_identity
                 ):
                     last = relay_msg_id or latest_msg_id
@@ -1212,7 +1216,7 @@ class Conductor:
         messages = result.get("messages", []) if isinstance(result, dict) else []
         return [m for m in messages if isinstance(m, dict)]
 
-    async def _fire_pr_gate(self, pr_ref: str) -> tuple[ReviewEvent, dict[str, Any]]:
+    async def _fire_pr_gate(self, pr_ref: str) -> tuple[RelayRoute, dict[str, Any]]:
         """Fire the Tier B naysayer review on ``pr_ref`` and take back its verdict (PR-2b-2).
 
         Synchronous (ADR-19 N-1): the orchestrator runs the CI-gate + Gemini judge + GitHub
@@ -1220,17 +1224,23 @@ class Conductor:
         verdict (with the critique body, so the implementer has its fix context) into the design
         thread named here. The relay used to live in this class, which made the destination a
         property of the *caller*: a hand-run driver held no design thread and silently relayed
-        nothing. Returns the verdict and the relay **message**, so the implementer is dispatched
-        on that relay event and sees the critique, not its own trigger (Tier B msg-567 #1).
+        nothing. Returns the relay route (U3', decided once by the relay writer) and the relay
+        **message**, so the implementer is dispatched on that relay event and sees the critique,
+        not its own trigger (Tier B msg-567 #1).
         """
         assert self._orchestrator is not None
-        _thread_ref, outcome, relay_msg = await self._orchestrator.fire_pr_review(
+        _thread_ref, _outcome, relay_msg = await self._orchestrator.fire_pr_review(
             project=self._thread_ref.project_id,
             pr_ref=pr_ref,
             design_thread=self._thread_ref.thread_id,
             implementer=self._implementer_identity,
         )
-        return outcome.verdict, relay_msg
+        # The route the relay writer decided (U3'). A relay dict without one — a caller that
+        # predates U3', or a malformed return — fails to the human, the safe direction.
+        route = relay_msg.get("route") if isinstance(relay_msg, dict) else None
+        if not isinstance(route, RelayRoute):
+            route = RelayRoute.HUMAN
+        return route, relay_msg
 
     async def _post_as_relay(self, body: str) -> dict[str, Any]:
         """Post ``body`` into the design thread under the reserved relay author.

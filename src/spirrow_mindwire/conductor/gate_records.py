@@ -46,6 +46,11 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Sequence
+from enum import StrEnum
+
+from ..github.client import ReviewEvent
+from ..github.reviews import parse_verdict_footer
+from ..naysayer.pr_review import ObjectionParse, parse_objections
 
 #: The reserved author under which the conductor's PR-gate verdict relay (and the R3/R4/R5
 #: admission posts) are written. Both readers below are restricted to messages authored under
@@ -158,10 +163,133 @@ def verdict_heads(bodies: Iterable[str]) -> frozenset[str]:
     return frozenset(heads)
 
 
+# ---- U3' (T-tier-c-admission-gate, Bohr msg-4774 / msg-4776, Einstein go) -------------------- #
+#
+# Where a verdict relay sends the loop next. Before this, the rule lived twice — once in
+# ``orchestrator._post_design_relay`` (the printed ``NEXT:``) and once in ``conductor.core`` (the
+# real stop / dispatch) — and both said "REQUEST_CHANGES → implementer, everything else →
+# human". So an APPROVE carrying advisory objections parked at the human, who was then asked
+# "fix this nit before merge?" (msg-3630 §1 source 2; this thread's own msg-3817 → msg-3835 →
+# PR #325 → msg-3904 spent two human decisions on one merge). The rule now lives ONLY in
+# :func:`decide_relay_route`; the relay writer calls it once and both the printed ``NEXT:`` and
+# the conductor's branch are read off its answer (Einstein msg-4775 #2).
+#
+# Merge authority is preserved structurally: no row sends an APPROVE anywhere but the human
+# except the FIRST advisory-carrying APPROVE on a PR, and that row only inserts one implementer
+# turn before the same merge request (the implementer is told to end with TIER-C:
+# merge-protected / NEXT: human). Every misread fails toward the human or toward exactly one
+# extra implementer turn — never past the merge hand-off (msg-4774 "パーサー").
+
+
+class RelayRoute(StrEnum):
+    """The one routing answer the verdict relay produces (msg-4776 #2)."""
+
+    IMPLEMENTER = "implementer"
+    HUMAN = "human"
+
+
+#: Appended (above the ``NEXT:`` line) ONLY on the first-advisory → implementer route, so the
+#: implementer knows on the spot what to do with an advisory-only APPROVE without its global
+#: system prompt growing for a PR-gate edge case (Einstein msg-4775 #1, Bohr msg-4776 #1 — text
+#: verbatim from msg-4776). It must never contain a column-zero objections sentinel or a verdict
+#: footer: :func:`prior_advisory_approvals` re-parses relay bodies, and the instruction must not
+#: change what they parse as.
+ADVISORY_SELF_TRIAGE_INSTRUCTION = (
+    "Advisory のみの APPROVE。human に「直すか」を聞かずに、自分で裁くこと: 安く直せるなら同じ "
+    "PR で直して push する (再ゲートになる)。見送る advisory は `DECIDED: <どれを> — <理由>` を "
+    "1 行ずつ書く。見送りだけで終える場合は、最後に `TIER-C: merge-protected` と `NEXT: human` "
+    "を書いて merge を依頼する。"
+)
+
+#: The label an APPROVE → human relay carries on the line above its ``NEXT: human``: every such
+#: hand-off is a merge request, i.e. the ``merge-protected`` Tier-C type (msg-4772 / msg-4774).
+MERGE_REQUEST_TIER_C_LINE = "TIER-C: merge-protected"
+
+#: Objection-parse statuses that mean "no advisory to triage". ``MISSING`` is here on purpose:
+#: an unreadable block is not evidence of an advisory, and the safe direction is the human
+#: (msg-4774 table row 2).
+_NO_ADVISORY = frozenset({ObjectionParse.EMPTY, ObjectionParse.MISSING})
+
+
+def carries_advisory(verdict: ReviewEvent, objections: ObjectionParse) -> bool:
+    """True iff this is an APPROVE whose objection block parsed to something other than
+    ``EMPTY`` / ``MISSING`` — i.e. an APPROVE with (non-blocking) objections attached."""
+    return verdict is ReviewEvent.APPROVE and objections not in _NO_ADVISORY
+
+
+def prior_advisory_approvals(messages: Iterable[tuple[str, str]], pr_ref: str) -> int:
+    """How many earlier verdict relays for ``pr_ref`` were an APPROVE carrying advisories.
+
+    ``messages`` is ``(author, body)`` for the design thread. Counted: messages by
+    :data:`RELAY_AUTHOR` whose first line is this PR's relay heading, whose verdict footer says
+    ``event=APPROVE``, and whose objection block parses to neither ``EMPTY`` nor ``MISSING``.
+    REQUEST_CHANGES relays and clean APPROVEs are NOT counted — counting every relay (the
+    ``verdict_heads`` shape) would call the first advisory after a fixed REQUEST_CHANGES a
+    "second" one and skip the implementer's triage turn (Einstein msg-4773).
+
+    Same trust model as the rest of this module: author filtering is noise rejection, not
+    authentication, and a forged record can only raise this count — which routes to the human,
+    i.e. makes the loop do less, never more.
+    """
+    heading = render_relay_heading(pr_ref, None)
+    count = 0
+    for author, body in messages:
+        if author != RELAY_AUTHOR:
+            continue
+        stripped = body.strip()
+        first_line = stripped.splitlines()[0] if stripped else ""
+        if first_line != heading and not first_line.startswith(f"{heading} @"):
+            continue
+        footer = parse_verdict_footer(body)
+        if footer is None or footer[1] is not ReviewEvent.APPROVE:
+            continue
+        if carries_advisory(ReviewEvent.APPROVE, parse_objections(body).status):
+            count += 1
+    return count
+
+
+def decide_relay_route(
+    verdict: ReviewEvent,
+    objections: ObjectionParse,
+    prior_advisory_approvals: int | None,
+    implementer: str | None,
+) -> RelayRoute:
+    """The msg-4774 table, and the ONLY place it is evaluated. Pure.
+
+    ============================  ==========================  ===========
+    verdict / objections          prior advisory APPROVEs     route
+    ============================  ==========================  ===========
+    REQUEST_CHANGES               —                           implementer
+    APPROVE, EMPTY or MISSING     —                           human
+    APPROVE, anything else        0                           implementer
+    APPROVE, anything else        ≥ 1                         human
+    COMMENT                       —                           human
+    ============================  ==========================  ===========
+
+    ``prior_advisory_approvals is None`` means the history could not be read; that fails to the
+    human (the count that would stop an advisory chain is unknown, so do not start one). No
+    implementer persona also fails to the human — there is nobody to route to. Relay-post
+    failure is the conductor's fail-safe, not a policy row, and stays there (msg-4776 #2).
+    """
+    if not implementer:
+        return RelayRoute.HUMAN
+    if verdict is ReviewEvent.REQUEST_CHANGES:
+        return RelayRoute.IMPLEMENTER
+    if carries_advisory(verdict, objections) and prior_advisory_approvals == 0:
+        return RelayRoute.IMPLEMENTER
+    return RelayRoute.HUMAN
+
+
 __all__ = [
+    "ADVISORY_SELF_TRIAGE_INSTRUCTION",
+    "MERGE_REQUEST_TIER_C_LINE",
     "RELAY_AUTHOR",
+    "RelayRoute",
+    "carries_advisory",
     "ci_route_heads",
+    "decide_relay_route",
     "normalize_sha",
+    "prior_advisory_approvals",
     "render_ci_route_marker",
     "render_relay_heading",
     "verdict_heads",
