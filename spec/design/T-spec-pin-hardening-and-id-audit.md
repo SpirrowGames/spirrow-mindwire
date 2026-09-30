@@ -223,18 +223,26 @@ receipt（§4-2）はこの code をそのまま書く。§3 に新しい reason
     one, do not abbreviate one, and do not translate one. Do not raise,
     do not retry with a guess, and do not repair the pin.
 
-    Reachability has one network rule. If the pinned commit is already
-    an ancestor of your local `origin/main`, accept it and fetch
-    nothing. Only if it is not — or if you have no `origin/main` ref at
-    all — run `git fetch origin +refs/heads/main:refs/remotes/origin/main`
-    exactly once and judge again. If that fetch fails or is unavailable
-    to you, the verdict is NO-PIN/FETCH_UNAVAILABLE: you could not
-    determine the answer. If the fetch succeeds and the commit is still
-    not reachable, the verdict is NO-PIN/COMMIT_UNREACHABLE: the pin
-    names a commit that is not on `main`, which usually means the
-    specification was never merged. Report whichever code you got; they
-    have different causes and different fixes, and collapsing them costs
-    the reader the diagnosis.
+    Reachability has one network rule. Judge it with
+    `git merge-base --is-ancestor <commit> origin/main` and read the exit
+    status, not just whether it is zero. Exit 0 means reachable. Exit 1
+    means git knows the commit and it is not reachable. Any other status
+    (typically 128, which means git does not know the commit, for example
+    in a shallow clone or when the hash is wrong) means you could not
+    determine the answer. If the first judgement is exit 0, accept the
+    commit and fetch nothing. Otherwise, or if you have no `origin/main`
+    ref at all, run
+    `git fetch origin +refs/heads/main:refs/remotes/origin/main` exactly
+    once and judge again with the same command. If that fetch fails or is
+    unavailable to you, the verdict is NO-PIN/FETCH_UNAVAILABLE. If the
+    fetch succeeds, the second judgement decides: exit 0 accepts; exit 1
+    is NO-PIN/COMMIT_UNREACHABLE, meaning the pin names a commit that is
+    not on `main`, which usually means the specification was never merged;
+    any other status is NO-PIN/FETCH_UNAVAILABLE, because you still could
+    not determine the answer. Do not deepen or unshallow the clone, and do
+    not fetch a second time. Report whichever code you got; they have
+    different causes and different fixes, and collapsing them costs the
+    reader the diagnosis.
 
     NO-PIN is a state to report, not an obstacle to route around. Say
     NO-PIN in your reply with its reason code. What you may do after
