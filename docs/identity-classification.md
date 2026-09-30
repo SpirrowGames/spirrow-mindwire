@@ -63,9 +63,9 @@ for this epic (which is about the `role` column on chatroom messages and the `al
 column on chatroom-side identity records). It is listed for completeness so the enumeration is
 not read as three-when-there-are-four; the classification below covers the three chatroom names.
 
-There is also `conductor-probe` in `scripts/thread_heads.py`, which the module docstring says
-"never posts and never marks read": it is a read-only inbox identity used to enumerate thread
-heads. Since it is defined to never write, it does not appear in the observed-supply set the §2
+There is also `conductor-probe`, which `scripts/thread_heads.py` used (until
+T-unread-correlated-count-scale moved that probe to `chatroom_list_threads`, which takes no identity)
+as a "never posts and never marks read" inbox identity to enumerate thread heads. Since it is defined to never write, it does not appear in the observed-supply set the §2
 derivation reads from. Listed for completeness; classification: **machine** (`allowed_roles = ∅`),
 same reasoning as `pr-gate-relay` below.
 

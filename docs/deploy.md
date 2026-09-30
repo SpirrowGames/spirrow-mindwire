@@ -473,7 +473,7 @@ Launching the conductor is not uniformly cheap:
   nothing (`no_progress_to_human`), the tick has bought nothing and billed for it.
 
 So the wrapper does not launch blindly. **`scripts/thread_heads.py`** answers "did anything change?"
-from data: one `chatroom_my_unread` call returns every thread's `latest_msg_id` without fetching a
+from data: one `chatroom_list_threads` call returns every open thread's `last_msg_id` without fetching a
 single message body (~1 s for all threads at once). If a thread's head equals the `last_msg` the
 conductor reported last time, the conductor would resolve the same handoff and reach the same stop —
 so it is not launched at all.
@@ -530,23 +530,20 @@ An earlier design used a cooldown timer instead. It was dropped: a timer guesses
 might be worthwhile, the head id knows.
 
 **Everything unknown fails open.** A probe failure, a thread missing from the probe's result, or a
-thread with no recorded head all launch the conductor anyway. The probe's exclusion rule is not fully
-characterised — it reported 11 threads where `chatroom_list_threads` showed 33 active, omitting the
-`T-pr-review-*` family — so a gap must cost one cheap run rather than silently parking a live thread
-forever.
+thread with no recorded head all launch the conductor anyway: a gap must cost one cheap run rather
+than silently parking a live thread forever.
 
-> **2026-08-02 update (K-5 triage)**: the 33-active state above is historical. K-5 closed 22 threads
-> (the whole `T-pr-review-150`〜`167` review-record family plus the settled May–June threads),
-> leaving **11 active** — matching what the probe was returning at the time. Probe and
-> `chatroom_list_threads` should now agree, but the exclusion rule itself is *still* not
-> characterised, so the fail-open stance stays.
-
-> **The probe identity must never post and never mark read.** `chatroom_my_unread` is an inbox: it
-> lists threads with unread messages, so an identity whose read cursor has advanced under-reports
-> *silently*. Measured: `Heisenberg` returned 5 of 11 threads and omitted two live candidates, while
-> the dedicated `conductor-probe` identity returned all 11. Nothing in this repo calls
-> `chatroom_mark_read`; if anything ever does for that identity, the probe goes blind and the sweep
-> quietly degrades to "launch everything".
+> **2026-09-30 (T-unread-correlated-count-scale)**: the probe used to call `chatroom_my_unread` as a
+> dedicated never-reads identity (`conductor-probe`), so that every thread stayed unread and hence
+> listed. That inbox evaluates a per-thread unread count for every thread in conclair — a cursorless
+> identity is its worst case — and the probe only ever read the head id. At 100× today's data the
+> inbox call measured 657 ms against 15 ms for the listing on the same rows (conclair perf harness,
+> CI run 35128633398). The inbox's exclusion rule was also never fully characterised (it once reported
+> 11 threads where `chatroom_list_threads` showed 33 active). The probe now calls
+> `chatroom_list_threads` with every status except `resolved` — the inbox's `include_resolved=false`
+> set — and reads `last_msg_id`. Before the switch the two were compared live on all six projects:
+> identical thread sets, identical head ids (216/216). No identity is involved any more, so there is
+> no read cursor that can blind the probe.
 
 ### State and logs
 

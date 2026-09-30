@@ -24,7 +24,7 @@
 # expensive case is a thread whose `NEXT:` names a role: the conductor DISPATCHES that role, the role
 # posts nothing, and the tick has burned an inference for no progress (measured 2026-08-02 on
 # T-track-b-seam-octree-retirement). Polling that on every tick would be one wasted dispatch per tick —
-# (24h / tick interval) a day. The head probe answers "did anything change?" from data — one `chatroom_my_unread` call, no
+# (24h / tick interval) a day. The head probe answers "did anything change?" from data — one `chatroom_list_threads` call, no
 # message bodies, no inference, ~1 s for every thread at once — so unchanged threads are never
 # launched at all. This replaces an earlier cooldown-timer design: a timer guesses, the head id knows.
 #
