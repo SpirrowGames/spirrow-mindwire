@@ -1699,3 +1699,51 @@ def test_s9_unreadable_subtype_is_no_classification_not_a_prefix() -> None:
     assert detail["message"] == "SDK is_error; errors=['boom']"
     assert "[" not in detail["message"].split(";")[0]
     assert detail["captured_fields"]["subtype"] == {"capture_failed": True}
+
+
+def test_s9_raw_subtype_is_the_sentinel_object_not_the_summary_dict() -> None:
+    """PR #368 PR-gate round 3 read the RAW side as holding
+    ``{"capture_failed": True}``. It holds the sentinel object; the dict is
+    summary-only. Pin both halves so the two sides cannot be conflated."""
+    from spirrow_mindwire.adapters import _sdk_result as m
+
+    class _HostileSubtype:
+        session_id = "s"
+        duration_ms = 1
+        num_turns = 1
+        stop_reason = None
+        errors: ClassVar[list[str]] = ["boom"]
+        api_error_status = None
+        permission_denials = None
+        result = None
+
+        @property
+        def subtype(self) -> str:
+            raise RuntimeError("hostile subtype")
+
+    raw, summary = m._capture_known(_HostileSubtype())
+    assert raw["subtype"] is m._CAPTURE_ERROR_SENTINEL
+    assert summary["subtype"] == {"capture_failed": True}
+    assert m._classification_text(raw, summary) == ""
+    # Even if a summary-side failure marker ever reached the raw side, it
+    # must not become a prefix.
+    assert m._classification_text({"subtype": "x"}, {"subtype": {"capture_failed": True}}) == ""
+
+
+def test_s9_hostile_subtype_costs_the_prefix_not_the_reason() -> None:
+    """A ``subtype`` whose ``__bool__``/``__len__`` raise used to escape
+    ``_pick_reason`` and turn the whole detail into ``capture_failed``,
+    losing a readable ``errors`` reason."""
+
+    class _HostileStr(str):
+        def __len__(self) -> int:
+            raise RuntimeError("hostile len")
+
+        def __bool__(self) -> bool:
+            raise RuntimeError("hostile bool")
+
+    detail = capture_is_error_detail(
+        _FakeResultMessage(subtype=_HostileStr("error_during_execution"), errors=["boom"])
+    )
+    assert detail["reason_source"] == "field:errors"
+    assert detail["message"] == "SDK is_error; errors=['boom']"

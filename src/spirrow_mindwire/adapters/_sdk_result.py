@@ -749,16 +749,38 @@ def _is_empty_reason_value(value: Any) -> bool:
 def _classification_text(raw: dict[str, Any], summary: dict[str, Any]) -> str:
     """Return the ``subtype`` as a bounded string, or ``""`` when there is none.
 
-    Emptiness is judged on the RAW value (same rule as the reason fields, so a
-    capture-failure sentinel or ``""`` is "no classification"); the text comes
-    from the SUMMARY so it is length-bounded. ``[`` / ``]`` are not escaped:
-    the prefix is for a human reader and the stall-ledger's single-line regex,
-    and the SDK's subtype values are plain identifiers.
+    Three states are "no classification", each checked explicitly here rather
+    than left implicit in a helper (PR #368 PR-gate rounds 2-3 read the
+    implicit version as leaking; it did not, but the invariant should be
+    legible at the call site):
+
+    * the RAW value is the capture-failure sentinel object (the read raised).
+      Note the RAW dict holds the sentinel *object*; the ``{"capture_failed":
+      True}`` dict exists only on the SUMMARY side.
+    * the RAW value is empty per :func:`_is_empty_reason_value`.
+    * the SUMMARY is one of the failure markers (``capture_failed`` /
+      ``summarize_failed`` dicts) — never rendered as a prefix.
+
+    The whole body is fail-safe: the classification is an annotation on the
+    message, so a hostile ``subtype`` (``__bool__`` / ``__len__`` raising)
+    must cost the prefix, not the reason. Before this guard such a value
+    escaped :func:`_pick_reason` and collapsed the entire detail into
+    ``capture_failed``, discarding a readable ``errors=[…]``.
+
+    The text comes from the SUMMARY so it is length-bounded. ``[`` / ``]``
+    are not escaped: the prefix is for a human reader and the stall-ledger's
+    single-line regex, and the SDK's subtype values are plain identifiers.
     """
-    if _is_empty_reason_value(raw.get(_CLASSIFICATION_FIELD)):
+    try:
+        raw_value = raw.get(_CLASSIFICATION_FIELD)
+        if raw_value is _CAPTURE_ERROR_SENTINEL or _is_empty_reason_value(raw_value):
+            return ""
+        value = summary.get(_CLASSIFICATION_FIELD)
+        if isinstance(value, dict):
+            return ""
+        return value if isinstance(value, str) else str(value)
+    except Exception:
         return ""
-    value = summary.get(_CLASSIFICATION_FIELD)
-    return value if isinstance(value, str) else str(value)
 
 
 def _pick_reason(raw: dict[str, Any], summary: dict[str, Any]) -> tuple[str, str]:
