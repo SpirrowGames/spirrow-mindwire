@@ -141,6 +141,11 @@ class _Stub:
     async def evaluate(self, state: Any) -> None:
         return None
 
+    async def clear_proceed(self, state: Any) -> None:
+        # ``Decider`` protocol member since D-4' G3 (#377). Raising, not returning ``None``:
+        # a test here that starts reaching carve-out ③ fails loudly instead of passing through.
+        raise NotImplementedError("these tests never reach carve-out ③")
+
 
 async def _hook_calls(
     monkeypatch: pytest.MonkeyPatch, *, content: str, next_participant: str | None = None
