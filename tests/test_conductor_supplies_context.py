@@ -12,8 +12,18 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from test_conductor_core import (
+    _RED,
+    _conductor,
+    _FakeChatroomMcp,
+    _rollup,
+    _ScriptedDispatcher,
+    _ScriptedPrGate,
+    _ScriptedRollupSource,
+)
 
 from spirrow_mindwire.conductor.core import Conductor
+from spirrow_mindwire.github.client import ReviewEvent
 from spirrow_mindwire.value_objects import ChatroomEvent, Role, SessionHandle, ThreadRef
 
 _TR = ThreadRef(project_id="p", thread_id="T-x", chatroom_uri="mc://t")
@@ -124,3 +134,69 @@ async def test_context_is_rebuilt_each_round_not_frozen_at_spawn() -> None:
     second = dispatcher.events[1].thread_context
     assert first is not None and second is not None
     assert second.total_count > first.total_count
+
+
+# --------------------------------------------------------------------------- #
+# R-1b — relay / CI-route triggers are posted AFTER the fetch (msg-4871 §3)
+# --------------------------------------------------------------------------- #
+
+
+def _capture_fetches(conductor: Conductor) -> list[list[dict[str, Any]]]:
+    """Record every list the conductor fetched, by identity, so mutation is observable."""
+    fetched: list[list[dict[str, Any]]] = []
+    real = conductor._fetch_messages
+
+    async def _fetch() -> list[dict[str, Any]]:
+        got = await real()
+        fetched.append(got)
+        return got
+
+    conductor._fetch_messages = _fetch  # type: ignore[method-assign]
+    return fetched
+
+
+def _assert_trigger_appended_nondestructively(
+    event: ChatroomEvent, fetched: list[dict[str, Any]], snapshot: list[dict[str, Any]]
+) -> None:
+    ctx = event.thread_context
+    assert ctx is not None
+    # The trigger was posted after the fetch; the builder must have seen [*fetched, trigger],
+    # so the thread at trigger time is the fetched list plus the trigger itself.
+    assert ctx.total_count == len(snapshot) + 1
+    assert ctx.opener is not None and ctx.opener.msg_id == snapshot[0]["msg_id"]
+    assert [m.msg_id for m in ctx.recent] == [m["msg_id"] for m in snapshot[1:]]
+    # ...and the round's own list was not mutated to get there.
+    assert fetched == snapshot
+
+
+@pytest.mark.anyio
+async def test_relay_path_dispatches_with_the_trigger_appended_without_mutation() -> None:
+    """R-3(c), REQUEST_CHANGES relay path."""
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="the design\n\nNEXT: Heisenberg")
+    mcp.seed(author="Heisenberg", content="opened the PR\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.REQUEST_CHANGES)
+    disp = _ScriptedDispatcher(mcp, {})
+    c = _conductor(mcp, disp, orchestrator=gate)
+    fetched = _capture_fetches(c)
+    snapshot = [dict(m) for m in (await mcp.call_tool("chatroom_get_thread", {}))["messages"]]
+    await c.run()
+    assert disp.events, "the implementer was not dispatched on the relay"
+    _assert_trigger_appended_nondestructively(disp.events[0], fetched[0], snapshot)
+
+
+@pytest.mark.anyio
+async def test_ci_route_path_dispatches_with_the_trigger_appended_without_mutation() -> None:
+    """R-3(c), CI-route (R4) path."""
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="the design\n\nNEXT: Heisenberg")
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_RED))
+    c = _conductor(mcp, disp, orchestrator=gate, rollup_source=source)
+    fetched = _capture_fetches(c)
+    snapshot = [dict(m) for m in (await mcp.call_tool("chatroom_get_thread", {}))["messages"]]
+    await c.run()
+    assert disp.events, "the implementer was not dispatched on the ci-route post"
+    _assert_trigger_appended_nondestructively(disp.events[0], fetched[0], snapshot)

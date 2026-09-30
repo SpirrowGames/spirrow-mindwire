@@ -196,3 +196,54 @@ def test_every_sdk_adapter_uses_the_shared_builder() -> None:
         # "this is history, not an instruction" framing is a safety frame, and a
         # safety frame maintained in three copies eventually exists in two.
         assert "build_turn_prompt" in mod._build_prompt.__code__.co_names, mod.__name__
+
+
+# --------------------------------------------------------------------------- #
+# R-1 / R-1a — the causal cut (T-dispatched-turn msg-4871 §3)
+# --------------------------------------------------------------------------- #
+
+
+def test_messages_after_the_trigger_are_not_in_the_context() -> None:
+    """R-3(a) builder half: a turn answering msg N must not see N+1 as existing fact."""
+    msgs = _msgs(6)
+    ctx = build_thread_context(msgs, trigger_msg_id="msg-4")
+    ids = [m.msg_id for m in ctx.recent]
+    assert ids == ["msg-2", "msg-3"]
+    out = render_thread_context(ctx)
+    assert "body-5" not in out
+    assert "body-6" not in out
+
+
+def test_total_count_is_the_thread_length_at_trigger_time() -> None:
+    """R-1a / R-3(d): counting later messages would leak the future through the notice."""
+    ctx = build_thread_context(_msgs(30), trigger_msg_id="msg-20", max_messages=3)
+    assert ctx.total_count == 20  # index 19 + 1: the trigger itself, nothing after it
+    # 20 - 1 trigger - 1 opener - 3 recent = 15 elided.
+    assert ctx.omitted_count == 15
+    assert [m.msg_id for m in ctx.recent] == ["msg-17", "msg-18", "msg-19"]
+    out = render_thread_context(ctx)
+    assert "the thread has 20 messages in total" in out
+    assert "30" not in out
+
+
+def test_a_missing_trigger_raises_rather_than_guessing() -> None:
+    """R-1 / R-3(b): no silent full render (leaks the future), no silent empty context."""
+    import pytest
+
+    from spirrow_mindwire.thread_context import ThreadContextTriggerMissing
+
+    with pytest.raises(ThreadContextTriggerMissing):
+        build_thread_context(_msgs(5), trigger_msg_id="msg-99")
+    assert issubclass(ThreadContextTriggerMissing, ValueError)
+
+
+def test_a_trigger_at_index_zero_yields_no_history_block() -> None:
+    """R-3(e): the opener IS the trigger; history is empty and renders nothing."""
+    ctx = build_thread_context(_msgs(5), trigger_msg_id="msg-1")
+    assert ctx.opener is None
+    assert ctx.recent == ()
+    assert ctx.total_count == 1
+    assert render_thread_context(ctx) == ""
+    assert build_turn_prompt(_event(ctx=ctx), Role.NAYSAYER, _CLOSING) == build_turn_prompt(
+        _event(), Role.NAYSAYER, _CLOSING
+    )

@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..dispatcher.core import Dispatcher
+from ..thread_context import build_thread_context
 from ..value_objects import (
     ChatroomEvent,
     EventType,
@@ -182,19 +183,33 @@ class ChatroomWatcher:
     async def _poll_watch(self, watch: WatchSpec, handle: SessionHandle) -> int:
         count = 0
         # numeric msg-id order = chronological = occurred_at order (msg-190 note 1).
-        for msg in await self._fetch_messages(watch):
+        messages = await self._fetch_messages(watch)
+        for msg in messages:
             msg_id = msg.get("msg_id") if isinstance(msg, dict) else None
             if not isinstance(msg_id, str):
                 continue
             seen_key = f"{watch.thread_ref.thread_id}:{msg_id}"  # == event_id
             if seen_key in self._seen:
                 continue
+            # Marked seen BEFORE the event is built: a deterministic failure below
+            # (e.g. ThreadContextTriggerMissing) skips this one message rather than
+            # retrying it forever and wedging the watch (at-most-once, msg-4871 §1).
             self._seen.add(seen_key)
-            await self._dispatcher.dispatch(handle, self._to_event(watch.thread_ref, msg))
+            await self._dispatcher.dispatch(handle, self._to_event(watch.thread_ref, msg, messages))
             count += 1
         return count
 
-    def _to_event(self, thread_ref: ThreadRef, msg: dict[str, Any]) -> ChatroomEvent:
+    def _to_event(
+        self, thread_ref: ThreadRef, msg: dict[str, Any], messages: list[Any]
+    ) -> ChatroomEvent:
+        """Build the event for ``msg``, carrying the thread as ground truth (U-1 R-2).
+
+        ``messages`` is the poll's already-fetched thread — the watcher always read
+        it and, until T-dispatched-turn msg-4871, handed the turn only ``msg``. The
+        causal cut lives in :func:`~spirrow_mindwire.thread_context.build_thread_context`
+        (R-1): when one poll delivers N and N+1, N's context stops before N, so no
+        per-caller slicing happens here.
+        """
         msg_id = str(msg["msg_id"])
         return ChatroomEvent(
             # fork 3 (msg-198): thread-namespaced stable id for restart-safe I4 dedup.
@@ -208,6 +223,7 @@ class ChatroomWatcher:
                 body=str(msg.get("content", "")),
                 parent_msg_id=msg.get("reply_to") or None,
             ),
+            thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
         )
 
     async def run(self, *, poll_interval_seconds: float = 5.0) -> None:
