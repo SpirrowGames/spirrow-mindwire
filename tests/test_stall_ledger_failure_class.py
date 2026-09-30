@@ -41,6 +41,27 @@ class TestKnownShapes:
         tail = 'ClaudeCodeSdkDeliveryError: subtype="error_during_execution" ...'
         assert classify_failure(tail) == "sdk-error-during-execution"
 
+    def test_sdk_error_during_execution_post_s9_prefix_form(self) -> None:
+        """T-sdk-is-error-loses-the-reason S-9 R-1: the subtype is now a prefix
+        (``SDK is_error[<subtype>]; <reason>``). The biggest bucket must not go
+        silent because the message shape changed."""
+        tail = (
+            "ClaudeCodeSdkDeliveryError: deliver_event failed for session s: "
+            "SDK is_error[error_during_execution]; errors=['AxiosError: 403']"
+        )
+        assert classify_failure(tail) == "sdk-error-during-execution"
+
+    def test_sdk_error_post_s9_prefix_with_other_subtype_falls_to_generic(self) -> None:
+        tail = "ClaudeCodeSdkDeliveryError: SDK is_error[pending_confirmation]; errors=['x']"
+        assert classify_failure(tail) == "sdk-is-error-generic"
+
+    def test_sdk_error_post_s9_prefix_on_other_line_does_not_bond(self) -> None:
+        tail = (
+            "ClaudeCodeSdkDeliveryError: SDK is_error[pending_confirmation]; errors=['x']\n"
+            "unrelated: SDK is_error[error_during_execution]"
+        )
+        assert classify_failure(tail) == "sdk-is-error-generic"
+
     def test_sdk_error_without_recognised_subtype_falls_to_generic(self) -> None:
         tail = "ClaudeCodeSdkDeliveryError: SDK is_error; subtype='pending_confirmation'"
         assert classify_failure(tail) == "sdk-is-error-generic"

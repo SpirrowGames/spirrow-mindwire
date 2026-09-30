@@ -78,8 +78,16 @@ _SIGNATURES: tuple[FailureSignature, ...] = (
         # ``.*?`` + ``re.DOTALL`` combination and makes the single-line contract
         # visible in the pattern itself, so a future edit that adds DOTALL back has
         # nothing to gain from it (the char class already excludes ``\n``).
+        #
+        # T-sdk-is-error-loses-the-reason S-9 R-1 moved the subtype out of the
+        # reason slot and into a message prefix, so post-S-9 lines read
+        #     ClaudeCodeSdkDeliveryError: SDK is_error[error_during_execution]; errors=[…]
+        # Both shapes stay recognised: historical tails keep the old form forever,
+        # and dropping it would silently re-bucket them as generic.
         pattern=re.compile(
-            r"ClaudeCodeSdkDeliveryError[^\n]*?subtype\s*=\s*['\"]?error_during_execution['\"]?",
+            r"ClaudeCodeSdkDeliveryError[^\n]*?"
+            r"(?:subtype\s*=\s*['\"]?error_during_execution['\"]?"
+            r"|SDK\s+is_error\[error_during_execution\])",
         ),
         description="Claude Code SDK reported is_error / error_during_execution",
     ),
