@@ -795,8 +795,8 @@ async def test_sdk_is_error_absent_reason_is_captured_as_absent_not_defaulted(
     assert "sdk_error_detail=" in captured.out
     assert '"reason_source": "absent"' in captured.out
     assert "absent_dump" in captured.out
-    # The failure message names the state ("N known reason fields captured,
-    # none carried a reason") so ``absent`` and "we did not look" are legibly
+    # The failure message names the state ("… of the N reason fields (…) none
+    # carried a reason") so ``absent`` and "we did not look" are legibly
     # different outcomes. The pre-change constant appeared regardless of which
     # of the two had happened, and this asserts we no longer reach for it.
     assert "SDK session reported is_error" not in hs.error.message
