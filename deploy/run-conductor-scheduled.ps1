@@ -3713,7 +3713,16 @@ try {
             # every decide-visited candidate's clock. Repeating it would be a no-op but the
             # duplication would be a lie: it would suggest the refresh depends on the disposition,
             # which is the exact confusion the batch refresh exists to end.
-            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head_skip SKIP (stop-token: $($v.token), head $probeHead), not launching"
+            # reason names WHICH stage skipped (stop-token / terminal-stop:* / thread-<status>);
+            # the token alone is empty on a status skip and would say nothing.
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — head_skip SKIP (reason=$($v.reason), token=$($v.token), head $probeHead), not launching"
+            # Stage 0 (T-sweep-admission-ignores-thread-status): a finished thread still listed in
+            # sweep.json is an operator bookkeeping slip. Log only — no notification, because it
+            # would fire every tick until the entry is removed. Grep for STALE SWEEP ENTRY.
+            if ("$($v.reason)" -like 'thread-*') {
+                $staleStatus = if ($v.PSObject.Properties.Name -contains 'thread_status') { "$($v.thread_status)" } else { '' }
+                Write-Log "STALE SWEEP ENTRY [$($cand.key)]: status=$staleStatus — sweep.json から外すこと"
+            }
             continue
         }
         if ($decision -eq 'defer') {

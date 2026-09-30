@@ -126,14 +126,33 @@ if _reconfigure_err is not None:
     _reconfigure_err(errors="backslashreplace")
 
 
+def _thread_status_of(result: dict[str, Any]) -> str:
+    """The magickit thread status inside a ``chatroom_get_thread(mode="full")`` response.
+
+    The status is NESTED: ``result["thread"]["status"]``. There is no top-level ``status`` key
+    (operator measurement against production magickit, msg-4749: top-level keys are
+    ``digest`` / ``messages`` / ``mode`` / ``thread``). ``chatroom_list_threads`` items are shaped
+    differently (top-level ``status``), which is why the extraction lives with each caller and
+    only the ``is_terminal_status`` judgment is shared.
+
+    Every malformed shape — no ``thread`` key, ``thread`` not a dict, no / empty ``status`` —
+    yields ``""``, which Stage 0 treats as unknown and fails open on (Einstein, blocking 1).
+    """
+    thread_obj = result.get("thread")
+    if not isinstance(thread_obj, dict):
+        return ""
+    return str(thread_obj.get("status") or "")
+
+
 async def _fetch_head_body(
     mcp: StreamableHttpChatroomMcp, project: str, thread_id: str
-) -> tuple[str, str] | None:
-    """Return ``(head_msg_id, head_body)`` for the last message of a thread, or ``None`` on error.
+) -> tuple[str, str, str] | None:
+    """Return ``(head_msg_id, head_body, thread_status)`` for a thread, or ``None`` on error.
 
     Errors are swallowed (fail-open at the caller): a probe gap costs one launched candidate,
     never a silent park. ``None`` means "could not fetch"; the caller synthesises an UNRESOLVED
-    body and lets :func:`decide` fall open into LAUNCH.
+    body and lets :func:`decide` fall open into LAUNCH. ``thread_status`` is ``""`` when the
+    response carries none (see :func:`_thread_status_of`).
     """
     try:
         result: Any = await mcp.call_tool(
@@ -156,7 +175,7 @@ async def _fetch_head_body(
         return None
     msg_id = str(last.get("msg_id") or "")
     body = str(last.get("content") or "")
-    return (msg_id, body) if msg_id else None
+    return (msg_id, body, _thread_status_of(result)) if msg_id else None
 
 
 def _load_state(path: Path) -> dict[str, Record]:
@@ -210,6 +229,7 @@ def _build_commit_launch_payload(
     verdict: Verdict,
     control_state: str,
     head_fetched: bool,
+    thread_status: str = "",
 ) -> dict[str, Any]:
     """The self-describing blob the sweep feeds back to ``commit-launch`` for one thread.
 
@@ -226,6 +246,7 @@ def _build_commit_launch_payload(
         "attempts_after": int(verdict.attempts_after),
         "control_state": control_state,
         "head_fetched": bool(head_fetched),
+        "thread_status": thread_status,
     }
 
 
@@ -275,6 +296,9 @@ async def _decide_all(
         #      recovery path).
         head_body: str
         head_fetched: bool
+        # ``""`` = unknown → Stage 0 fails open. Set from the fetch, or from the cached
+        # observation on a cache hit (otherwise a cache hit would hide a resolved thread).
+        thread_status = ""
         if can_reuse_cached_parse(rec, head_msg_id, now):
             # Synthesise a body from the cached NORMALISED token. Round-tripping the same
             # normalised token through ``parse_head_token`` reproduces the identical token, so
@@ -285,6 +309,7 @@ async def _decide_all(
             head_body = f"NEXT: {rec.last_observed_nomination}"
             head_fetched = False
             actual_msg_id = head_msg_id
+            thread_status = rec.last_observed_status
         else:
             fetched = await _fetch_head_body(mcp, project, thread_id)
             if fetched is None:
@@ -295,7 +320,7 @@ async def _decide_all(
                 head_fetched = False
                 actual_msg_id = head_msg_id
             else:
-                actual_msg_id, head_body = fetched
+                actual_msg_id, head_body, thread_status = fetched
                 head_fetched = True
 
         v: Verdict = decide(
@@ -304,6 +329,7 @@ async def _decide_all(
             head_body=head_body,
             control_state=control_state,
             record=rec,
+            thread_status=thread_status,
         )
 
         # Observation-only refresh. NEVER touches the launch baseline (that is the
@@ -323,12 +349,15 @@ async def _decide_all(
                 head_msg_id=actual_msg_id,
                 token=parse_head_token(head_body),
                 record=rec,
+                thread_status=thread_status,
             )
 
         payload = verdict_to_json(v)
         payload["thread_id"] = thread_id
         payload["head_msg_id"] = actual_msg_id
         payload["head_fetched"] = head_fetched
+        # Carried so the wrapper can name the status in its STALE SWEEP ENTRY line.
+        payload["thread_status"] = thread_status
         # LAUNCH decisions carry a self-describing commit-launch payload for the sweep to
         # feed back to ``commit-launch`` if it decides to actually start this thread.
         if v.decision is Decision.LAUNCH:
@@ -338,6 +367,7 @@ async def _decide_all(
                 verdict=v,
                 control_state=control_state,
                 head_fetched=head_fetched,
+                thread_status=thread_status,
             )
         verdicts.append(payload)
 
@@ -386,6 +416,7 @@ def _apply_commit_launch(
         control_state=str(payload.get("control_state") or ""),
         head_fetched=bool(payload.get("head_fetched", True)),
         prior_record=prior,
+        thread_status=str(payload.get("thread_status") or ""),
     )
     state[thread_id] = new_record
     _save_state(state_path, state)
