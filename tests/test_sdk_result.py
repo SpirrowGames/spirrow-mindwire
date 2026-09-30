@@ -1753,16 +1753,14 @@ def test_capture_list_is_derived_from_reason_priority_and_classification() -> No
     """The capture list cannot drift from the reason list (#368 advisory, decision B).
 
     A reason candidate missing from the capture list never reaches ``raw`` and
-    would silently never be evaluated. The capture list is derived, so this
-    pins the derivation and the unchanged ``captured_fields`` key order.
+    would silently never be evaluated. This pins that invariant (subset, not a
+    re-run of the derivation) and the unchanged ``captured_fields`` key order.
     """
     from spirrow_mindwire.adapters import _sdk_result as m
 
     known = m._KNOWN_REASON_FIELDS
     assert set(m._REASON_PRIORITY) <= set(known)
     assert m._CLASSIFICATION_FIELD in known
-    derived = (m._CLASSIFICATION_FIELD, *m._CAPTURE_ONLY_FIELDS, *m._REASON_PRIORITY)
-    assert known == derived
     assert known == (
         "subtype",
         "stop_reason",
