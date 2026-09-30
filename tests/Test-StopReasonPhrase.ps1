@@ -16,16 +16,17 @@
 #          default phrase, (c) does NOT match any known-reason phrase, (d) does NOT contain
 #          "判断待ち", (e) `reason=<raw>` still appears in the header.
 #
-# D-4-6 (Bohr) — pin `set(map.keys()) == set(StopReason values)` — is DELIBERATELY NOT
-# implemented here. The Python enum StopReason has SEVEN values, of which the map covers
-# FIVE by policy (SETTLED and HOLD are silent by design; see the comment above $needsHuman
-# in deploy/run-conductor-scheduled.ps1). Encoding the exclusion list into this test would
-# create a second SOT for that policy, which is exactly what Bohr's D-4-6 fallback covers:
-# "列挙可能でなければこの pin は作らない — テストに 5 種を直書きすると 2 つ目の SOT になるため。
-# その場合の drift 検出は 5 の未知既定（実行時の警報）に委ねる。"
-# D-4-5 IS that drift signal: a new StopReason value in conductor/core.py that reaches the
-# notification path without a phrase entry here will land in the unknown-reason branch and
-# produce the loud "未知の停止理由で停止しました" header in production — noisy on purpose.
+# D-4-6 closed-world pin (T-stop-reason-map-drift-pin, Bohr msg-4827 U1', endorsed by Einstein).
+# History: #172 left this pin out on purpose (msg-1468: 7 enum values, 5 map keys, and a
+# hand-written exclusion list would have been a second SOT). The premise changed. Three
+# values were added in 37 days, and the hand-written copy in tests/test_conductor_core.py
+# went stale (5 values, missing 'self_handoff_to_human'). The block at the bottom of this
+# file now reads the Python enum SEMANTICALLY: `uv run python -c` imports StopReason, with
+# no regex over source and no export build step. It then asserts
+#   enum values == (Get-StopReasonPhraseMap).Keys ∪ $unnotified   and   Keys ∩ $unnotified = ∅.
+# $unnotified is a test-only ledger and is never read at runtime. The notification predicate's
+# SOT is still the map's key set. Getting the ledger wrong reds this gate and changes no
+# notification. D-4-5's runtime loud default stays as the second line of defence.
 
 $ErrorActionPreference = 'Stop'
 
@@ -223,6 +224,74 @@ $golden = "MindWire: **T-x** (proj-x) — $(Get-StopReasonPhrase -StopReason 'hu
 $actual = New-NotificationHeader -ThreadId 'T-x' -Project 'proj-x' `
     -StopReason 'human' -Rounds 2 -LastMsgId 'msg-42'
 Check 'canonical human header matches golden byte-for-byte' $golden $actual
+
+# ---------------------------------------------------------------------------------------
+# D-4-6 closed-world pin: every Python StopReason value is classified exactly once,
+# either as NOTIFYING (a key of Get-StopReasonPhraseMap) or as UNNOTIFIED (the ledger below).
+# (T-stop-reason-map-drift-pin, Bohr msg-4827 U1' §2.1.)
+#
+# The enum is read by importing it through `uv run`, the same toolchain .mindwire-gate has
+# already synced. `--project $repoRoot` makes the call independent of the CWD (msg-2601 §1-2).
+# FAIL-CLOSED: a non-zero exit, unparseable JSON, or an empty array is RED, never a skip.
+# A missing Python is a breakage of this gate, the same way a missing pwsh is (.mindwire-gate).
+# ---------------------------------------------------------------------------------------
+Write-Host ''
+Write-Host 'D-4-6: Python StopReason == phrase-map keys UNION $unnotified ledger (disjoint)'
+
+# UNNOTIFIED LEDGER: test-only, never consulted at runtime. Each line names the path that
+# covers the reason instead of a Discord notification. Adding a value here is a deliberate
+# act; the alternative is adding it to Get-StopReasonPhraseMap (see StopReason.ps1 note 1).
+$unnotified = @(
+    'none'           # thread settled: the normal end, the sweep just moves on
+    'hold'           # the operator asked for the stop, so telling them is not news
+    'ci_wait'        # pre-gate CI-wait DEFER (design v0.3.1 §5.2A); past the cap it becomes 'human'
+    'adapter_error'  # adapter raised; exit!=0 -> quarantine, where the K alert sounds
+)
+
+$pyProbe = 'import json; from spirrow_mindwire.conductor.core import StopReason; print(json.dumps(sorted(r.value for r in StopReason)))'
+$enumValues = $null
+$probeError = $null
+try {
+    $probeOut = & uv run --project $repoRoot python -c $pyProbe 2>&1
+    $probeExit = $LASTEXITCODE
+    if ($probeExit -ne 0) {
+        $probeError = "uv run exited $probeExit`: $($probeOut -join ' | ')"
+    }
+    else {
+        # uv may write progress to stderr (merged by 2>&1); the JSON is the last stdout line.
+        $jsonLine = @($probeOut | Where-Object { $_ -is [string] -and $_.TrimStart().StartsWith('[') }) | Select-Object -Last 1
+        if (-not $jsonLine) {
+            $probeError = "no JSON array in probe output: $($probeOut -join ' | ')"
+        }
+        else {
+            $enumValues = @($jsonLine | ConvertFrom-Json)
+        }
+    }
+}
+catch {
+    $probeError = "probe failed: $($_.Exception.Message)"
+}
+if ($null -eq $probeError -and ($null -eq $enumValues -or $enumValues.Count -eq 0)) {
+    $probeError = 'probe returned an empty StopReason value list'
+}
+CheckTrue 'StopReason enum is readable via uv run (fail-closed: exit!=0 / bad JSON / empty = RED)' `
+    ($null -eq $probeError) $probeError
+
+if ($null -eq $probeError) {
+    $notifying = @((Get-StopReasonPhraseMap).Keys)
+    $classified = @($notifying) + @($unnotified)
+
+    $unclassified = @($enumValues | Where-Object { $classified -notcontains $_ } | Sort-Object)
+    $notInEnum = @($classified | Where-Object { $enumValues -notcontains $_ } | Sort-Object)
+    $overlap = @($notifying | Where-Object { $unnotified -contains $_ } | Sort-Object)
+
+    $detail = 'unclassified enum values (add to Get-StopReasonPhraseMap or to $unnotified): [{0}]; classified but not in enum (stale map key or ledger row): [{1}]' -f `
+        ($unclassified -join ', '), ($notInEnum -join ', ')
+    CheckTrue 'set(StopReason) == phrase-map keys UNION $unnotified' `
+        (($unclassified.Count -eq 0) -and ($notInEnum.Count -eq 0)) $detail
+    CheckTrue 'phrase-map keys INTERSECT $unnotified is empty (a reason is notifying XOR silent)' `
+        ($overlap.Count -eq 0) ("in both: [{0}]" -f ($overlap -join ', '))
+}
 
 Write-Host ''
 if ($script:failures -gt 0) {
