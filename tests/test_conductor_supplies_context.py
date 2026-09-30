@@ -16,13 +16,14 @@ from test_conductor_core import (
     _RED,
     _conductor,
     _FakeChatroomMcp,
+    _NoMsgIdMcp,
     _rollup,
     _ScriptedDispatcher,
     _ScriptedPrGate,
     _ScriptedRollupSource,
 )
 
-from spirrow_mindwire.conductor.core import Conductor
+from spirrow_mindwire.conductor.core import Conductor, StopReason
 from spirrow_mindwire.github.client import ReviewEvent
 from spirrow_mindwire.value_objects import ChatroomEvent, Role, SessionHandle, ThreadRef
 
@@ -200,3 +201,21 @@ async def test_ci_route_path_dispatches_with_the_trigger_appended_without_mutati
     await c.run()
     assert disp.events, "the implementer was not dispatched on the ci-route post"
     _assert_trigger_appended_nondestructively(disp.events[0], fetched[0], snapshot)
+
+
+@pytest.mark.anyio
+async def test_ci_route_without_msg_id_stops_at_human_before_the_builder() -> None:
+    """R-1b: a ci-route post with no ``msg_id`` could not satisfy the builder's contract.
+
+    It never reaches it: the existing empty-id fail-safe stops at the human first, so
+    ThreadContextTriggerMissing is not the failure mode. (The relay twin is pinned by
+    ``test_pr_gate_relay_without_msg_id_fails_safe_to_human`` in test_conductor_core.)
+    """
+    mcp = _NoMsgIdMcp()
+    mcp.seed(author="Heisenberg", content="opened\n\nNEXT: pr-review acme/widgets#7")
+    gate = _ScriptedPrGate(mcp, ReviewEvent.APPROVE)
+    disp = _ScriptedDispatcher(mcp, {})
+    source = _ScriptedRollupSource(_rollup(*_RED))
+    outcome = await _conductor(mcp, disp, orchestrator=gate, rollup_source=source).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert disp.dispatches == []
