@@ -66,10 +66,10 @@ from typing import Any
 # no knowledge of the sweep schedule at all.
 #
 # The value is a policy pick, not a measurement. Two things constrain it: the sweep
-# cadence (5 min) sets the smallest interval that can advance the heartbeat, and the
-# operator's tolerance for "detector may have died" sets the largest one before the
-# digest should turn red. 4h is comfortably above both a routine transient network
-# hiccup (self-clearing within one 5-min tick) and a scheduled maintenance window
+# cadence (one tick, see docs/deploy.md) sets the smallest interval that can advance the
+# heartbeat, and the operator's tolerance for "detector may have died" sets the largest
+# one before the digest should turn red. 4h is comfortably above both a routine transient network
+# hiccup (self-clearing within a tick or two) and a scheduled maintenance window
 # (the two we have observed lasted 20 min and 40 min); it stays well under the 24h
 # starvation threshold the same digest already uses so a stale heartbeat surfaces
 # BEFORE the operator's own attention interval elapses.
