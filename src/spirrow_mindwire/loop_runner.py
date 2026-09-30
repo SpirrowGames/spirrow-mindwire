@@ -425,7 +425,7 @@ def _resolve_role_cli_path_or_exit(configured: Path | None) -> Path | None:
 
     Unset is the normal case and returns ``None`` (the SDK uses its vendored
     CLI). Set-but-wrong is checked here, at daemon startup, rather than left to
-    the first spawn: the sweep runs the daemon every five minutes, so a typo'd
+    the first spawn: the sweep runs the daemon on every tick, so a typo'd
     path would otherwise surface as a per-tick spawn failure — the shape an
     operator reads as "the loop is broken" rather than "one setting is wrong".
 

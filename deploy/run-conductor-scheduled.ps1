@@ -18,13 +18,13 @@
 # state every round and fails closed on it — which is why this probe fails open. See
 # Invoke-ControlProbe.
 #
-# Why (1)+(2) exist — this is what makes a 5-minute cadence affordable. A thread whose last message
+# Why (1)+(2) exist — this is what makes a short sweep interval affordable. A thread whose last message
 # is `NEXT: none` / `NEXT: human` is finished or waiting on Takahito, so the conductor exits at once
 # with `rounds=0`; that costs an MCP read and no inference, which is cheap but pointless. The
 # expensive case is a thread whose `NEXT:` names a role: the conductor DISPATCHES that role, the role
 # posts nothing, and the tick has burned an inference for no progress (measured 2026-08-02 on
-# T-track-b-seam-octree-retirement). Polling that every 5 minutes would be 288 wasted dispatches a
-# day. The head probe answers "did anything change?" from data — one `chatroom_my_unread` call, no
+# T-track-b-seam-octree-retirement). Polling that on every tick would be one wasted dispatch per tick —
+# (24h / tick interval) a day. The head probe answers "did anything change?" from data — one `chatroom_my_unread` call, no
 # message bodies, no inference, ~1 s for every thread at once — so unchanged threads are never
 # launched at all. This replaces an earlier cooldown-timer design: a timer guesses, the head id knows.
 #
@@ -68,7 +68,7 @@ $ErrorActionPreference = "Stop"
 #     quarantines are observed — that is a candidate-order problem, not a K problem.
 #
 #   $QuarantineEscalatedAfter      = 24h
-#     sweep cadence is 5min; 24h = 288 unattended ticks. Matches "the human reads the digest once a
+#     24h = (24h / tick interval) unattended ticks, whatever the sweep interval is. Matches "the human reads the digest once a
 #     day" — below that "escalated overnight" becomes routine and the tier loses meaning.
 #
 #   $QuarantineStaleAfter          = 7d
@@ -200,8 +200,8 @@ if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path 
 # Self-contained: the trap references only `$logPath` (defined above), `$env:*` (process env),
 # and .NET/PS builtins. It does not call `Write-Log` / `Format-LogLine` / `Send-Notification`
 # (all defined below), and it does not touch state files (`$dataDir\state\*.json`). No dedup or
-# marker file: at a 5-min cadence, a rebooting-daemon-that-cannot-start deserves a ping every
-# 5 min (Einstein msg-3581 Obj-2), not a debounce that could suppress a live outage.
+# marker file: a rebooting-daemon-that-cannot-start deserves a ping every tick (Einstein
+# msg-3581 Obj-2), not a debounce that could suppress a live outage.
 #
 # Webhook lookup uses `$env:MINDWIRE_NOTIFY_DISCORD_WEBHOOK` (process env, which Windows merges
 # from Machine ∪ User at process start), not `[Environment]::GetEnvironmentVariable(..., 'User')`
@@ -242,9 +242,9 @@ trap {
 }
 
 # --- logging ------------------------------------------------------------------------------------
-# At a 5-minute cadence the common tick is "nothing moved", and writing a dozen lines for that would
-# put ~3k lines of noise a day between the entries that matter. So detail is buffered and only
-# committed once the tick proves it did something; an idle tick collapses to a single line.
+# At a short sweep interval the common tick is "nothing moved", and writing a dozen lines for that
+# would bury the entries that matter under thousands of lines of noise a day. So detail is buffered
+# and only committed once the tick proves it did something; an idle tick collapses to a single line.
 $script:pendingLines = New-Object System.Collections.Generic.List[string]
 $script:logCommitted = $false
 
@@ -1150,19 +1150,19 @@ function Format-DurationDigest {
 # Cadence-advancing outcomes:
 #   * sent(ok)              — the full digest landed.
 #   * degraded(ok)          — the fixed-length fallback landed after a full 400.
-#   * skipped(no-webhook)   — the operator has deliberately no channel; retrying every 5 minutes
+#   * skipped(no-webhook)   — the operator has deliberately no channel; retrying on every tick
 #                             accomplishes nothing and would log-spam the daemon.
 #   * failed(deterministic-permanent) — the webhook is gone (401/403/404). PR-gate review
 #                             (2026-08-30): my Get-NotificationFailureClass docstring literally
 #                             said "Do NOT send a second POST" for this class, but the earlier
-#                             predicate ignored $class and refused to advance, spamming 404s every
-#                             5 minutes for the rest of the day. Advance the period so the
+#                             predicate ignored $class and refused to advance, spamming 404s on
+#                             every tick for the rest of the day. Advance the period so the
 #                             next-tick check sees "already sent" and stops.
 #   * failed(deterministic-payload) — only reached when the FULL digest 400s AND the degraded
 #                             fallback ALSO 400s. Retrying the same tick will fail the same way;
 #                             advance to prevent spam. (This branch is defensive — the degraded
 #                             message is fixed and small; if it 400s, something more fundamental
-#                             is broken and 5-minute spam does not help.)
+#                             is broken and per-tick spam does not help.)
 #
 # Held (returns $false):
 #   * failed(transient)     — network / 5xx / 429 / unknown. The next tick has a real chance to
@@ -1186,7 +1186,7 @@ function Test-DigestDelivered {
     }
     if ($status -eq 'sent' -or $status -eq 'skipped' -or $status -eq 'degraded') { return $true }
     # A non-retryable failure class still advances cadence — the whole point of "non-retryable" is
-    # that a 2nd POST this tick, or a 3rd POST 5 minutes later, is guaranteed to fail the same way.
+    # that a 2nd POST this tick, or a 3rd POST one tick later, is guaranteed to fail the same way.
     # Held would mean spam. Advanced means "we tried once, we know it won't work, don't try again
     # until tomorrow"; ⚠ still lights up because Test-DigestFullSuccess is separate.
     if ($status -eq 'failed' -and ($class -eq 'deterministic-permanent' -or $class -eq 'deterministic-payload')) {
@@ -1232,7 +1232,7 @@ function Resolve-DigestSendResult {
 
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106 §3, msg-2104): the digest cadence
 # is per-PERIOD, not per-interval. A period id is a wall-clock local date string; the predicate
-# "period P ≠ period Q" is jitter-immune because a 5-minute tick offset does not cross a date
+# "period P ≠ period Q" is jitter-immune because a tick-sized offset (minutes) does not cross a date
 # boundary. This is the whole point of the shift from `last_sent_at` (a timestamp) to
 # `last_sent_period` (a discrete id) — the jitter tolerance that Einstein msg-2104 proposed as a
 # fudge constant becomes structurally unnecessary.
@@ -1338,8 +1338,8 @@ function New-DegradedDigestMessage {
 # alert. Bucketed on the UTC date, NOT on the tick timestamp, because the failure this de-noise
 # addresses is not "same tick, twice" (impossible — the sweep breaks at K) but "adjacent ticks,
 # same underlying wave": during a real systemic outage, tick T fills its K=2 budget and stops; tick
-# T+5min skips the first 2 quarantined threads, fails the next 2, and hits the budget again — and
-# every one of the next 288 ticks does the same. A per-tick timestamp defeats the dedup and turns
+# T+1 skips the first 2 quarantined threads, fails the next 2, and hits the budget again — and
+# every remaining tick of the day does the same. A per-tick timestamp defeats the dedup and turns
 # the day into a Discord flood; a per-day bucket fires ONCE per day of an ongoing wave, then falls
 # silent. If the wave clears and returns days later, the day bucket has moved and the alert re-arms.
 # (Tier B naysayer, PR #138 round 2.)
@@ -1952,7 +1952,7 @@ function Send-Notification {
         # deliberately chosen not to run with Discord alerts, and a retry loop makes no sense: the
         # webhook will not appear on its own. The digest gate advances its clock on 'skipped' so
         # a webhook-less run does not permanently flood the log with "sending daily digest" and
-        # "notification skipped" every 5 minutes forever. (Tier B naysayer, PR #138 round 5.)
+        # "notification skipped" on every tick forever. (Tier B naysayer, PR #138 round 5.)
         Write-Log "notification skipped (MINDWIRE_NOTIFY_DISCORD_WEBHOOK not set)"
         return @{ status = 'skipped'; class = 'no-webhook'; http_status = 0; error = $null }
     }
@@ -2008,7 +2008,7 @@ function Send-NotificationIfChanged {
         return
     }
     # The dedup record is intentional on every outcome (sent / skipped / any failure class). A
-    # failed send does NOT undo the dedup, or a webhook outage would repeat every 5 minutes forever,
+    # failed send does NOT undo the dedup, or a webhook outage would repeat on every tick forever,
     # retraining the channel into noise. A 'skipped' status (no webhook) is treated the same: mark
     # the signature so we do not spam the log with skip messages on every re-attempt.
     # (Endorsed by Tier B naysayer on round 2 of #138.)
@@ -2020,7 +2020,7 @@ function Send-NotificationIfChanged {
     # bypasses the check naturally — `Test-NotificationSuppressed` returns false when the recorded
     # $State[$Key] does not equal the new $Signature — so recording the failed signature never
     # blocks a new-signature alert from firing. Skipping the record produced the exact spam loop
-    # this path exists to prevent: same alert, same signature, 400 every 5 minutes, forever.
+    # this path exists to prevent: same alert, same signature, 400 on every tick, forever.
     #
     # The msg-2013 §3(b) concern ("永久に失われる") that D-3 was addressing is already covered by
     # msg-2099 D-4: the digest is a state sync and re-lists every currently-waiting thread daily,
@@ -2043,7 +2043,7 @@ function Send-NotificationIfChanged {
 #         Silence-on-failure is the failure mode the whole thread was opened to end (msg-1370 §1).
 #   I-3 — the composer is invoked ONCE per (project/thread_id, signature) stop. The dedup is done
 #         BEFORE the CLI is invoked, by consulting pending-decisions.json: same signature => cached
-#         envelope, no CLI call. That is what makes the composer affordable at a 5-minute cadence
+#         envelope, no CLI call. That is what makes the composer affordable at the sweep's cadence
 #         (measured 08-20: the same signature straddled several ticks; naive dispatch would burn
 #         one inference per tick).
 #
@@ -2286,8 +2286,8 @@ function Push-DecisionMaterial {
     )
 
     # DM-3: same dedup predicate as the notification. A same-signature repeat tick must not
-    # re-fire the PUT any more than it re-fires the notification. Without this gate a driven-by-
-    # tick 5-minute cadence would hammer the receiver with an unbounded PUT stream on every parked
+    # re-fire the PUT any more than it re-fires the notification. Without this gate the tick-
+    # driven cadence would hammer the receiver with an unbounded PUT stream on every parked
     # thread — the YAGNI-rejected "retry queue" fallen in through the back door.
     if (Test-NotificationSuppressed -State $NotifyState -Key $Key -Signature $Signature) {
         # Silent-by-design: the same tick will also suppress the notification below, and we already
@@ -2790,7 +2790,7 @@ function Format-DecisionMessage {
 #      whether the PUT succeeded, failed, or was skipped for freshness.
 #
 # The dedup on step 2 is `Test-NotificationSuppressed` (the SAME predicate step 4 consults) —
-# without it the PUT would fire on every 5-minute tick against a driven-by-human-response wait,
+# without it the PUT would fire on every tick against a driven-by-human-response wait,
 # which is the "無設計の再試行" msg-1445 §DM-3 rules out.
 function Send-HumanParkAlert {
     param(
@@ -3350,7 +3350,7 @@ try {
     # Deploy first, so a tick either updates the code or uses it — never both. When the pull moves
     # HEAD this tick STOPS: the wrapper was parsed from the old file at startup while
     # run-conductor.ps1 would be read from disk after the pull, and a sweep spanning two versions is
-    # not a thing worth debugging later. The cost is one 5-minute cycle of latency after a merge.
+    # not a thing worth debugging later. The cost is one tick of latency after a merge.
     $sync = Invoke-RepoSync
     if ($null -ne $sync) {
         if ($sync.status -eq 'updated') {
@@ -3868,7 +3868,7 @@ try {
             # Signature is STATE-DERIVED (scope + repo + status_code), not time-derived. A
             # persistent env-terminal fault (revoked PAT, org-disabled repo) produces the same
             # signature on every sweep, so ``Send-NotificationIfChanged`` fires ONCE per state
-            # change instead of every 5 minutes. An earlier revision embedded ``$nowIso`` in
+            # change instead of every tick. An earlier revision embedded ``$nowIso`` in
             # the signature, which made every tick a "new" signature and defeated the whole
             # dedup — pr-review caught it on #280 @ 64bc63f. Restoring the state-derived form
             # is what makes the map-shape dedup work at all (:func:`Test-NotificationSuppressed`
@@ -3980,8 +3980,8 @@ try {
             if ($newlyQuarantined -ge $QuarantineFailureBudget) {
                 Write-Log "quarantine budget K=$QuarantineFailureBudget hit in one sweep — stopping (systemic cause suspected)"
                 # Day-bucketed signature (see Get-SystemicAlertSignature): one alert per UTC day of
-                # an ongoing systemic wave, then silence. A tick-level timestamp here spammed every
-                # 5 minutes — exactly the "retraining the channel into noise" mode this file avoids
+                # an ongoing systemic wave, then silence. A tick-level timestamp here spammed on
+                # every tick — exactly the "retraining the channel into noise" mode this file avoids
                 # elsewhere.
                 Send-NotificationIfChanged -State $notifyState -Key "__quarantine_systemic__" `
                     -Signature (Get-SystemicAlertSignature -Now $nowUtc -Count $newlyQuarantined) `
@@ -4144,7 +4144,7 @@ try {
     # Period + delivery-time drops both by CONSTRUCTION — no jitter constant, no drift math.
     #
     # Webhook-less runs (msg-2106 D-3 preservation of #138 R5): still advance last_sent_period so
-    # the loop does not re-enter this branch every 5 minutes. But `last_full_success_period` is NOT
+    # the loop does not re-enter this branch on every tick. But `last_full_success_period` is NOT
     # advanced — a channel that does not exist has not been informed, and the ⚠ predicate is
     # deliberately blind to whether the reason is "no webhook" or "webhook 400s" (both mean the
     # human has not gotten the digest).
@@ -4268,7 +4268,7 @@ try {
         Write-QuietSummary "nothing to run ($held/$($candidates.Count) held by loop control, $skipped heads unchanged, $quarantineSkipped quarantined)"
     }
     elseif ($skipped -eq $candidates.Count) {
-        # The steady state at a 5-minute cadence. One line, no notification: by definition nothing
+        # The steady state at a short sweep interval. One line, no notification: by definition nothing
         # changed, so there is nothing new to tell anyone.
         Write-QuietSummary "no thread moved ($skipped/$($candidates.Count) heads unchanged) — nothing to do"
     }

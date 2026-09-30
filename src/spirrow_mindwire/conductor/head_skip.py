@@ -57,7 +57,7 @@ occupied the sweep's whole throughput and *starved* the other 13 candidates behi
    ``last_observed_nomination``, so backoff is correctly reset. The both-populated guard on
    disjunct (c) prevents a persistent-network-outage loop where the fail-open synthetic
    ``token=""`` would otherwise trip the disjunct against the preserved observation on every
-   failed-fetch tick, resetting the backoff and launching every 5 min forever (Tier B
+   failed-fetch tick, resetting the backoff and launching on every tick forever (Tier B
    naysayer round 4). Head-msg-id changes ALONE do NOT count as progress: two different
    msg-ids that both say ``NEXT: Bohr`` under the same control state are, for scheduling
    purposes, the same input. The head msg-id is still recorded (``head_msg_id_at_launch``)
@@ -112,8 +112,9 @@ from .handoff import HUMAN_TOKEN, NONE_TOKEN, parse_next_token
 #   Rationale: must be >= session_timeout + 1 tick so a single conductor launch cannot overlap
 #   its own next scheduled tick under the ``MultipleInstancesPolicy=IgnoreNew`` scheduler
 #   contract. Session timeout is ``PT4H`` (14400 s) worst case (kill) but ~15-25 min typical
-#   (measured 2026-08-11 on this project's threads); the tick cadence is 5 min. Choosing 15 min
-#   matches the typical session floor with one tick of headroom without imposing untuned delay.
+#   (measured 2026-08-11 on this project's threads); the tick cadence is minute-scale (see
+#   docs/deploy.md's task table). Choosing 15 min matches the typical session floor with one
+#   tick of headroom without imposing untuned delay.
 #
 # CAP
 #   The steady-state ceiling for the degenerate path. At 60 min a "spin" thread produces 1
@@ -499,7 +500,7 @@ def decide(
     #        observation (the round-2 anti-poisoning rule) while ``decide()`` sees a
     #        synthesised empty ``token`` from the failed fetch. Without this guard, disjunct 3
     #        would then read ``"" != <preserved observation>`` = True on every subsequent
-    #        failed-fetch tick, reset the backoff to 0, and launch every 5 min forever —
+    #        failed-fetch tick, reset the backoff to 0, and launch on every tick forever —
     #        exactly the degenerate loop the module was written to prevent. Requiring
     #        ``token != ""`` recognises that a fail-open synthetic empty is not a real
     #        observation of movement and therefore is not eligible to trip disjunct 3. Disjunct
@@ -779,7 +780,7 @@ def needs_head_reparse(record: Record | None, now: datetime) -> bool:
     :attr:`HEAD_CACHE_TTL` has elapsed since the last observation.
 
     This is the ONLY automatic recovery path when the operational premise "head msg-id changes on
-    every intervention" is broken. It is 60 min, not 5 min, because it is the safety-net, not the
+    every intervention" is broken. It is 60 min, not one tick, because it is the safety-net, not the
     fast path: it must be tight enough that a real edit cannot sit indefinitely, but loose enough
     that a well-behaved (edit-free) intervention pattern does not pay per-tick fetch cost.
     """

@@ -21,7 +21,7 @@ Design intent (msg-1370 §2 / msg-1384 §1 D-22):
   so the dashboard can degrade visibly (D-22 / D-28: "black-box degrade
   is worse than a visible one"), and the ``signature`` so the wrapper
   can dedup (I-3: one composer call per ``reason:last_msg``, not one
-  per five-minute tick).
+  per sweep tick).
 """
 
 from __future__ import annotations

@@ -579,8 +579,8 @@ class NaysayerSdkAdapter:
         # that would let an un-attested naysayer post (Tier-C msg-970 §2).
         #
         # The quarantine holds until a human clears it (``Clear-Quarantine.ps1``);
-        # ticks are 5 minutes apart, so a transient outage that resolves itself
-        # still needs that clear.
+        # the next tick being only minutes away does not help, so a transient outage
+        # that resolves itself still needs that clear.
         try:
             await self._run_preflight()  # dry-run: result deliberately discarded
         except Exception as exc:

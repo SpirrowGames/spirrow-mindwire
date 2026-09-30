@@ -3,8 +3,8 @@
 Why this exists: the sweep used to launch the conductor once per candidate on every tick just to
 discover that nothing had changed. That is cheap for a settled thread (an MCP read, no inference)
 but NOT cheap for one whose ``NEXT:`` names a role — the conductor dispatches that role, the role
-posts nothing, and the tick has burned an inference for no progress. At a 5-minute cadence that is
-288 wasted dispatches a day.
+posts nothing, and the tick has burned an inference for no progress. Repeated every tick, that is
+(24h / tick interval) wasted dispatches a day.
 
 The fix is to decide "has this thread moved?" from data instead of from a timer: the conductor
 already reports ``last_msg=msg-NNNN`` per run, and ``chatroom_my_unread`` returns ``latest_msg_id``
