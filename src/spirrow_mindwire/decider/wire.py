@@ -30,6 +30,7 @@ from typing import Any
 from spirrow_mindwire.decider.questions import (
     TIERC_QUESTIONS_V1,
     TIERC_QUESTIONS_VERSION,
+    TIERC_V2_PROCEED_QUESTIONS_VERSION,
     TIERC_V2_QUESTIONS_VERSION,
     TierCRules,
     tierc_v2_questions,
@@ -42,6 +43,10 @@ POLICY_LIVE_TIERC = "mindwire.conductor.tierc"
 POLICY_REPLAY_TIERC = "mindwire.replay.tierc"
 """``policy`` tag for ``scripts/decider_replay.py`` (msg-4180 §2-5) — keeps replay traffic
 separable from live traffic in Lexora's decision log."""
+
+POLICY_LIVE_PROCEED = "mindwire.conductor.proceed"
+"""D-4' G3: the policy tag on a naysayer proceed-clearance call, kept apart from
+``POLICY_LIVE_TIERC`` so the §6 tally of ``NEXT: human`` escalations is not mixed with it."""
 
 
 def gate_result_to_dict(gate: AdmissionGateResult | None) -> dict[str, Any] | None:
@@ -101,14 +106,25 @@ def questions_to_wire() -> dict[str, dict[str, Any]]:
 
 
 def build_decide_request(
-    state: DecisionState, *, policy: str, rules: TierCRules | None = None
+    state: DecisionState, *, policy: str, rules: TierCRules | None = None, proceed: bool = False
 ) -> dict[str, Any]:
     """The full ``/v1/decide`` request body — the one builder live and replay share.
 
     ``rules=None`` → the v1 set (bytes unchanged from before v2). ``rules`` given → the v2 set
     (``should_ask_human`` + ``matched_rule``, built from the rules file) with
-    ``questions_version="tierc-v2"``.
+    ``questions_version="tierc-v2"``. ``proceed=True`` (D-4' G3) asks the same keys of a
+    naysayer's proceed handoff (``questions_version="tierc-v2-proceed"``); it requires ``rules``
+    — v1 has no proceed variant.
     """
+    if proceed:
+        if rules is None:
+            raise ValueError("a proceed-clearance request requires the tierc-v2 rules")
+        return {
+            "state": state_to_wire(state),
+            "questions": tierc_v2_questions(rules, proceed=True),
+            "policy": policy,
+            "questions_version": TIERC_V2_PROCEED_QUESTIONS_VERSION,
+        }
     if rules is None:
         return {
             "state": state_to_wire(state),
@@ -125,6 +141,7 @@ def build_decide_request(
 
 
 __all__ = [
+    "POLICY_LIVE_PROCEED",
     "POLICY_LIVE_TIERC",
     "POLICY_REPLAY_TIERC",
     "build_decide_request",

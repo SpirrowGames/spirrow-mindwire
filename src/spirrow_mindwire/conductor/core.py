@@ -78,13 +78,13 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
-from ..decider.hook import Decider, ThreadMessage, run_tierc_hook
+from ..decider.hook import Decider, ThreadMessage, run_proceed_clearance, run_tierc_hook
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
 from ..github.client import CheckRollup, PrRef, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
-from ..routing import GuardIVerdict, guard_proposer_to_implementer
+from ..routing import GuardIVerdict, carve_out_iii_admissible, guard_proposer_to_implementer
 from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
 from ..value_objects import (
@@ -105,7 +105,15 @@ from .gate_records import (
     render_ci_route_marker,
     verdict_heads,
 )
-from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, parse_next_token, resolve_handoff
+from .handoff import (
+    HUMAN_TOKEN,
+    Handoff,
+    HandoffKind,
+    declares_no_tier_c,
+    declares_tier_c,
+    parse_next_token,
+    resolve_handoff,
+)
 from .roster import RoleResolutionError, derive_identity_by_role
 from .stall import StalledError, emit_stalled, is_stalled, render_stalled_notice, stalled_event
 from .stand_down import (
@@ -401,6 +409,11 @@ class Conductor:
         # re-read every round in ``run`` (see ``_read_control``); this is only the seed.
         self._control = control
         self._control_state: ControlState = BASELINE_CONTROL_STATE
+        # D-4' G3: the Decider's proceed clearance for ONE head, keyed by that head's msg id
+        # (``_prefetch_proceed_clearance``). ``_route`` is synchronous and the Decider is not, so
+        # the answer is fetched before ``_route`` and read back through a thunk; a missing or
+        # stale entry reads as "not cleared" (fail-closed).
+        self._proceed_clearance: tuple[str, bool] | None = None
         # The implementer persona is derived from the roster (the single source of truth for role
         # assignment) — not a ctor arg, which would risk disjoint state (Tier B msg-567 #2). The
         # resolver lives in :mod:`.roster` and is shared with the hand-run PR-gate driver so both
@@ -625,6 +638,11 @@ class Conductor:
                 processed_msg_id = relay_msg_id
                 continue
 
+            # D-4' G3: fetch the Decider's clearance for a naysayer proceed BEFORE the synchronous
+            # ``_route`` consults it. Only called when every other carve-out ③ condition already
+            # holds (``carve_out_iii_admissible``, the same rule ``_route`` applies), so a
+            # proposer's handoff, a supervised project or an undeclared proceed costs no call.
+            await self._prefetch_proceed_clearance(handoff, messages, round_index)
             route = self._route(handoff, messages)
             target_role = route.target_role
             target_identity = route.target_identity
@@ -939,11 +957,18 @@ class Conductor:
             # form's scope exactly (``_attested`` is reached only for a non-human naysayer
             # under RUN), and a future carve-out that needs the attest bit for a different
             # role/state combination edits ``routing.py`` only.
+            #
+            # D-4' (T-pr-2b-3-human-identity-delegate, Takahito "B" decide): G1 / G2 / G3 are
+            # thunks for the same reason — the predicate owns when they are read.
+            head_id = _msg_id(messages[-1])
             verdict = guard_proposer_to_implementer(
                 author_is_human=self._is_human(author),
                 author_is_naysayer=author_role is self._naysayer_role,
                 control_state_is_run=self._control_state is ControlState.RUN,
                 message_is_attested=lambda: self._attested(messages[-1]),
+                segment_declares_tier_c=lambda: self._segment_declares_tier_c(messages),
+                naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(messages[-1])),
+                decider_clears=lambda: self._proceed_cleared_for(head_id),
             )
             if verdict is GuardIVerdict.HONOR:
                 assert handoff.identity is not None
@@ -1235,6 +1260,85 @@ class Conductor:
         self._control_state = state
         await self._control.report_observed(state)
         return state
+
+    def _segment_declares_tier_c(self, messages: list[dict[str, Any]]) -> bool:
+        """D-4' G1: has anyone declared a Tier-C since the human last spoke?
+
+        Scans newest → oldest and stops at the most recent message authored by the human
+        (:meth:`_is_human`, the carve-out ① test) — the ONLY reset boundary (Bohr msg-4858 §2,
+        after Einstein msg-4857's edge case: an implementer failure/return must not erase a
+        declaration). Implementer, proposer, naysayer and conductor-relay messages are all scanned
+        and none of them resets. With no human message in the thread, the whole thread is scanned.
+        Any ``TIER-C: <label>`` line (``other:`` included, :func:`.handoff.declares_tier_c`) makes
+        it ``True`` — and it stays ``True`` on every later turn until the human speaks (latch).
+
+        The human boundary is author-string trust, the same D-3 environment trust model as
+        :meth:`_is_human` (msg-598 Q2=yes, re-accepted for G1 in msg-4858 §2).
+        """
+        for msg in reversed(messages):
+            if self._is_human(_author(msg)):
+                return False
+            if declares_tier_c(_content(msg)):
+                return True
+        return False
+
+    def _proceed_cleared_for(self, head_msg_id: str) -> bool:
+        """G3 read-back: the prefetched Decider clearance for exactly this head, else ``False``."""
+        cached = self._proceed_clearance
+        return bool(head_msg_id) and cached is not None and cached == (head_msg_id, True)
+
+    async def _prefetch_proceed_clearance(
+        self, handoff: Handoff, messages: list[dict[str, Any]], round_index: int
+    ) -> None:
+        """D-4' G3: ask the Decider whether this naysayer proceed may reach code without a human.
+
+        Runs only for a ``ROLE`` handoff to the implementer whose author is not the human and for
+        which :func:`~spirrow_mindwire.routing.carve_out_iii_admissible` — the very rule
+        ``_route``'s guard applies before its own ``decider_clears`` thunk — already holds. The
+        result is cached against the head's msg id; ``_route`` reads it back via
+        :meth:`_proceed_cleared_for`. With no Decider wired (``backend=off``) the cache records
+        "not cleared" and carve-out ③ stays closed (the accepted price of G3).
+        """
+        self._proceed_clearance = None
+        if not messages or handoff.kind is not HandoffKind.ROLE:
+            return
+        if handoff.role is not self._implementer_role:
+            return
+        head = messages[-1]
+        author = _author(head)
+        if self._is_human(author):
+            return
+        if not carve_out_iii_admissible(
+            author_is_naysayer=self._roster_role(author) is self._naysayer_role,
+            control_state_is_run=self._control_state is ControlState.RUN,
+            message_is_attested=lambda: self._attested(head),
+            segment_declares_tier_c=lambda: self._segment_declares_tier_c(messages),
+            naysayer_declared_no_tier_c=lambda: declares_no_tier_c(_content(head)),
+        ):
+            return
+        cleared = await run_proceed_clearance(
+            self._decider,
+            thread_id=self._thread_ref.thread_id,
+            round_index=round_index,
+            roster=self._roster,
+            messages=[
+                ThreadMessage(
+                    msg_id=_msg_id(m),
+                    author=_author(m),
+                    content=_content(m),
+                    parsed_next=parse_next_token(_content(m)),
+                )
+                for m in messages
+            ],
+        )
+        head_id = _msg_id(head)
+        if not cleared:
+            logger.info(
+                "conductor carve-out ③ not cleared by the Decider (G3): head=%s decider=%s",
+                head_id,
+                "off" if self._decider is None else "on",
+            )
+        self._proceed_clearance = (head_id, cleared) if head_id else None
 
     def _is_human(self, author: str) -> bool:
         """Is ``author`` the human (Tier-C) identity? Case-insensitive; empty identity ⇒ never (a
@@ -1652,7 +1756,10 @@ class Conductor:
             "ではありません。\n"
             "- ③ attested independent naysayer proceed under control=`run` — 不適合: "
             "author が naysayer でない、あるいは attest 済でない、あるいは control が "
-            "`run` ではありません。\n\n"
+            "`run` ではありません。あるいは D-4' guardrail のいずれかで閉じています — "
+            "G1: human の直近の発言より後に `TIER-C:` 行がある / G2: proceed の `NEXT:` "
+            "直上の行が `TIER-C-CHECK: none` ではない / G3: Tier-C Decider が proceed を "
+            "承認しなかった (Decider 無効時を含む)。\n\n"
             "実装へ進める経路は 2 つだけです — human が直接 `NEXT: <implementer>` を "
             "書く (carve-out ①)、あるいは attested naysayer が control=`run` 下で "
             "`NEXT: <implementer>` を書く (carve-out ③) — どちらも proposer が "

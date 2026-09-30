@@ -535,6 +535,9 @@ class _StubDecider:
             raise self.exc
         return self.result
 
+    async def clear_proceed(self, state: DecisionState) -> DecisionResult | None:
+        return None
+
 
 def _msgs(head_author: str = "Bohr", head_body: str | None = None) -> list[ThreadMessage]:
     body = "x" * 900 + "\n\nNEXT: human" if head_body is None else head_body

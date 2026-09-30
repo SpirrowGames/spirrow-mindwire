@@ -156,6 +156,21 @@ _V2_MATCHED_RULE_INSTRUCTIONS = (
 )
 _V2_NONE_DESCRIPTION = "五ヶ条のどれにも当たらない"
 
+# D-4' G3 (T-pr-2b-3-human-identity-delegate, Bohr msg-4856 §3 G3, Takahito "B" decide): the
+# same two keys, asked of a naysayer's proceed handoff (``NEXT: <implementer>``) instead of a
+# ``NEXT: human`` escalation. The frame sentences differ, so this is its own set version
+# (the rule above: 枠の文を変えたら version を上げる). The rules file and its sha256 are shared.
+TIERC_V2_PROCEED_QUESTIONS_VERSION = "tierc-v2-proceed"
+"""G3 proceed-clearance set version (the ``tierc-v2`` keys with proceed-turn frame sentences)."""
+_V2_PROCEED_SHOULD_ASK_QUESTION = (
+    "このハンドオフ(naysayer が承認し NEXT: implementer で実装着手を指示するもの)は、"
+    "五ヶ条のいずれかに当たり、実装前に人間に問うべきものか。"
+)
+_V2_PROCEED_MATCHED_RULE_INSTRUCTIONS = (
+    "この実装着手のハンドオフが当たる五ヶ条のルールを 1 つ選べ。"
+    "複数に当たるなら最もよく当たるもの、どれにも当たらなければ none。"
+)
+
 _RULE_ID_RE = re.compile(r"^rule_[1-9][0-9]*$")
 
 TIERC_RULES_TEMPLATE_NAME = "tierc_rules.default.toml"
@@ -261,14 +276,21 @@ def render_rules_bullets(rules: TierCRules) -> str:
     return "\n".join(lines)
 
 
-def tierc_v2_questions(rules: TierCRules) -> dict[str, dict[str, Any]]:
+def tierc_v2_questions(rules: TierCRules, *, proceed: bool = False) -> dict[str, dict[str, Any]]:
     """v2 の ``questions`` (``/v1/decide`` の wire 形、宣言順)。
 
     ``matched_rule`` の instructions には五ヶ条の全文を繰り返さない — 各条の文言は選択肢の
     ``description`` が持つ (Einstein の最終レビュー advisory 1 の趣旨:
     同じ全文を問いごとに重ねない)。
+
+    ``proceed=True`` は D-4' G3 の実装着手ハンドオフ用の枠の文 (set version
+    ``tierc-v2-proceed``)。 key と criteria は同じなので回答の解釈は共通。
     """
-    should_ask = f"{_V2_RULES_HEADER}\n{render_rules_bullets(rules)}\n\n{_V2_SHOULD_ASK_QUESTION}"
+    question = _V2_PROCEED_SHOULD_ASK_QUESTION if proceed else _V2_SHOULD_ASK_QUESTION
+    rule_instructions = (
+        _V2_PROCEED_MATCHED_RULE_INSTRUCTIONS if proceed else _V2_MATCHED_RULE_INSTRUCTIONS
+    )
+    should_ask = f"{_V2_RULES_HEADER}\n{render_rules_bullets(rules)}\n\n{question}"
     options = [{"name": r.id, "description": r.text} for r in rules.rules]
     options.append({"name": MATCHED_RULE_NONE, "description": _V2_NONE_DESCRIPTION})
     return {
@@ -279,7 +301,7 @@ def tierc_v2_questions(rules: TierCRules) -> dict[str, dict[str, Any]]:
         },
         MATCHED_RULE_KEY: {
             "type": "choice",
-            "instructions": _V2_MATCHED_RULE_INSTRUCTIONS,
+            "instructions": rule_instructions,
             "criteria": options,
         },
     }
@@ -292,6 +314,7 @@ __all__ = [
     "TIERC_QUESTIONS_V1",
     "TIERC_QUESTIONS_VERSION",
     "TIERC_RULES_TEMPLATE_NAME",
+    "TIERC_V2_PROCEED_QUESTIONS_VERSION",
     "TIERC_V2_QUESTIONS_VERSION",
     "TIERC_V2_SHOULD_ASK_CRITERIA",
     "TierCQuestion",

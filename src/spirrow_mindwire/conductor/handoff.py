@@ -534,6 +534,46 @@ def _tier_c_label_above_last_next(body: str) -> str | None:
     return lowered
 
 
+# ---- D-4' guardrails (T-pr-2b-3-human-identity-delegate, Bohr msg-4856 / msg-4858) ---- #
+# Unlike the calibration reader above, these two ARE routing inputs: carve-out ③
+# (:func:`spirrow_mindwire.routing.carve_out_iii_admissible`) reads them. The
+# measurement path (``Handoff.tier_c_label``) keeps its non-blocking contract; these
+# are separate functions so neither side's semantics can leak into the other.
+TIER_C_CHECK_KEYWORD = "TIER-C-CHECK"
+"""The naysayer's G2 self-declaration keyword (``TIER-C-CHECK: none``)."""
+TIER_C_CHECK_NONE = "none"
+"""The only value that opens carve-out ③ (G2). Anything else — including a Tier-C label — keeps
+it closed."""
+
+_TIER_C_CHECK_RE = re.compile(r"\A\s*TIER-C-CHECK:\s*(?P<value>\S.*?)\s*\Z", re.IGNORECASE)
+
+
+def declares_tier_c(body: str) -> bool:
+    """G1: does ANY line of ``body`` declare a Tier-C (``TIER-C: <label>``, ``other:`` included)?
+
+    Same line grammar as the calibration reader (:data:`_TIER_C_LABEL_RE`, anchored to the whole
+    line) but over every line, not only the one above ``NEXT:`` — a declaration anywhere in the
+    segment must latch the gate (msg-4858 §2). Prose that merely mentions ``TIER-C: scope``
+    mid-sentence does not match; a line-quoted declaration does, which closes the gate: the
+    fail-closed direction, undone by one human turn (msg-4858 §3).
+    """
+    return any(_TIER_C_LABEL_RE.match(line) for line in body.splitlines())
+
+
+def declares_no_tier_c(body: str) -> bool:
+    """G2: is the line directly above the final ``NEXT:`` exactly ``TIER-C-CHECK: none``?
+
+    Strict on purpose — this is the side that OPENS the gate, so it must not be satisfied by a
+    quote elsewhere in the body. Keyword case-insensitive, value ``none`` case-insensitive,
+    surrounding whitespace ignored; anything else (missing, other value, decorated) is ``False``.
+    """
+    prev_line = _line_above_last_next(body)
+    if prev_line is None:
+        return False
+    match = _TIER_C_CHECK_RE.match(prev_line)
+    return match is not None and match.group("value").casefold() == TIER_C_CHECK_NONE
+
+
 def _name_from_raw(raw: str) -> str | None:
     """The participant name at the head of a raw NEXT token, or ``None`` if there is not one."""
     match = _PARTICIPANT_NAME_RE.match(raw)
@@ -912,7 +952,14 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "autonomously the conductor builds it directly, otherwise it routes your go to the human "
         f"for the Tier-C decision; or hand to `{HUMAN_TOKEN}` to escalate a concern that needs the "
         "human now. You are advisory, not a veto — but your escalation pulls the human back in "
-        "however autonomously the loop is running."
+        "however autonomously the loop is running. When you hand to the implementer, put exactly "
+        f"`{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}` on the line directly above your `NEXT:` "
+        "line, and only after checking that what you approve to build needs no human decision: "
+        "no increase in money spent, no addition / removal / change to a spec already decided for "
+        "the project, nothing irreversible or externally published, no task only the human can "
+        "do, and no proposer-naysayer conflict you could not settle. If any of those applies, "
+        "hand to the human instead. Without the check line the conductor "
+        "does not build autonomously — it routes your go to the human."
     ),
 }
 
@@ -951,6 +998,8 @@ __all__ = [
     "NONE_TOKEN",
     "PR_REVIEW_TOKEN",
     "STOP_TRIGGER_ARMS",
+    "TIER_C_CHECK_KEYWORD",
+    "TIER_C_CHECK_NONE",
     "TIER_C_LABELS",
     "Handoff",
     "HandoffKind",
@@ -958,6 +1007,8 @@ __all__ = [
     "StopLine",
     "StopStatus",
     "build_handoff_protocol_block",
+    "declares_no_tier_c",
+    "declares_tier_c",
     "parse_next_token",
     "resolve_handoff",
 ]
