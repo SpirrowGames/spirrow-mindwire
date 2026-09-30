@@ -399,3 +399,57 @@ def test_failed_fetch_with_no_record_fails_open(monkeypatch: pytest.MonkeyPatch)
         {},
     )  # fmt: skip
     assert verdicts[0]["decision"] == "launch"
+
+
+def test_cache_hit_skip_does_not_slide_the_ttl_so_a_reopen_is_seen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #364 gate round 2, objection 1: a cached ``resolved`` must not lock a thread out.
+
+    Cache-hit SKIPs must leave the record untouched (``head_observed_at`` does NOT move), so
+    HEAD_CACHE_TTL counts from the last real fetch. An operator re-opening the thread without
+    posting is therefore seen at the first tick past the TTL, however many cache-hit SKIPs ran
+    in between.
+    """
+    head = "msg-1084"
+    cand = [{"thread_id": "T-r", "head_msg_id": head, "control_state": "run"}]
+    fake = _ShapedMcp({"T-r": _measured_shape(head, "x\n\nNEXT: Einstein", "resolved")})
+    state, _ = _run(monkeypatch, fake, cand, {})
+    observed_at = state["T-r"].head_observed_at
+    assert observed_at == _T0
+
+    # Tick every 5 min for 55 min: all cache hits, all SKIP, record never rewritten.
+    for minutes in range(5, 60, 5):
+        before = state["T-r"]
+        state, verdicts = _run(monkeypatch, fake, cand, state, now=_T0 + timedelta(minutes=minutes))
+        assert verdicts[0]["head_fetched"] is False
+        assert verdicts[0]["decision"] == "skip"
+        assert state["T-r"] == before
+        assert state["T-r"].head_observed_at == observed_at
+    assert fake.calls == ["T-r"]
+
+    # Operator re-opens the thread with no new message. First tick past the TTL re-fetches.
+    fake._responses["T-r"] = _measured_shape(head, "x\n\nNEXT: Einstein", "active")
+    state, verdicts = _run(monkeypatch, fake, cand, state, now=_T0 + timedelta(minutes=60))
+    assert fake.calls == ["T-r", "T-r"]
+    assert verdicts[0]["head_fetched"] is True
+    assert verdicts[0]["decision"] == "launch"
+    assert state["T-r"].last_observed_status == "active"
+
+
+def test_failed_fetch_leaves_the_whole_record_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PR #364 gate round 2, objection 2: a failed fetch is not an observation.
+
+    ``commit_observation`` runs only when ``head_fetched``; a failed fetch must not overwrite
+    ``last_observed_nomination`` with the empty parse, nor refresh ``head_observed_at``.
+    """
+    rec = commit_observation(now=_T0, head_msg_id="msg-9", token="none", record=None,
+                             thread_status="active")  # fmt: skip
+    later = _T0 + timedelta(hours=2)
+    new_state, verdicts = _run(
+        monkeypatch, _FailingMcp(),  # type: ignore[arg-type]
+        [{"thread_id": "T-p", "head_msg_id": "msg-9", "control_state": "run"}],
+        {"T-p": rec}, now=later,
+    )  # fmt: skip
+    assert verdicts[0]["head_fetched"] is False
+    assert new_state["T-p"] == rec
