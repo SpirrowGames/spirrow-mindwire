@@ -5,8 +5,9 @@ T-reconcile-field-mismatch-flag-overloaded msg-4861 / msg-4864 U1: ``core.py`` u
 positive intent from the absence of a mismatch. That held only while every ``HUMAN`` producer
 other than the author's own was a mismatch escalation. These tests pin the positive predicate
 at the resolver, the construction-time rejection of contradictory combinations, and the
-conductor wiring — plus the ``STOP:`` head, which on this tree has no parser and resolves to
-ABSENT, so it never reaches the hook.
+conductor wiring — plus the ``STOP:`` head, which never reaches the hook: a STOP-only head has
+no final ``NEXT:`` and resolves ABSENT, and the #363 parser reads ``STOP:`` only as an
+annotation above a final ``NEXT: none`` (a NONE handoff).
 """
 
 from __future__ import annotations
@@ -85,13 +86,26 @@ def test_non_human_handoffs_are_not_author_requests(body: str, field: str | None
 
 
 def test_stop_line_head_resolves_absent_on_this_tree() -> None:
-    # msg-4864 U1 pre-check, recorded as a pin: no ``STOP:`` parser exists in ``src/`` on the
-    # base this change was made against, so a STOP-only head has no final ``NEXT:`` and
-    # resolves ABSENT. If a STOP parser lands and changes this, the test is meant to go red so
-    # the author of that change decides what ``author_requested_human`` should be for it.
+    # msg-4864 U1 pre-check, recorded as a pin. The branch was cut before the ``STOP:`` parser
+    # (#363) was on main; after merging it, a STOP-only head still has no final ``NEXT:`` and
+    # resolves ABSENT. If a later change makes a STOP line resolve differently, this test is
+    # meant to go red so the author of that change decides what ``author_requested_human``
+    # should be for it.
     h = resolve_handoff("halted: gate red\n\nSTOP: gate_red", _R)
     assert h.kind is HandoffKind.ABSENT
     assert h.mismatch_reason is None
+    assert h.author_requested_human is False
+
+
+def test_stop_line_above_next_none_is_not_an_author_request() -> None:
+    # The #363 form: ``STOP:`` annotates a final ``NEXT: none``. It resolves NONE (never HUMAN),
+    # so it can never read as the author naming the human, whatever the STOP line says.
+    h = resolve_handoff("x
+
+STOP: blocked-on human wake:human
+NEXT: none", _R)
+    assert h.kind is HandoffKind.NONE
+    assert h.stop_line is not None
     assert h.author_requested_human is False
 
 

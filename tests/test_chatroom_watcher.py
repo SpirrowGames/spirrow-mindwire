@@ -264,3 +264,81 @@ async def test_stop_halts_sessions() -> None:
     await watcher.stop()
     assert len(adapter.halted) == 1
     assert await watcher.poll_once() == 0  # handles cleared → nothing to poll
+
+
+# --------------------------------------------------------------------------- #
+# T-dispatched-turn-gets-one-message U-1 (msg-4871 §3): the watcher supplies the
+# thread too, cut causally at each trigger.
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingDispatcher:
+    """Duck-typed dispatcher: records the events the watcher builds, nothing else."""
+
+    def __init__(self) -> None:
+        self.events: list[ChatroomEvent] = []
+
+    async def spawn_instance(
+        self, thread_ref: ThreadRef, role: Role, instance_id: str
+    ) -> SessionHandle:
+        return SessionHandle(
+            session_id=new_ulid(),
+            instance_id=instance_id,
+            adapter_id="rec",
+            thread_ref=thread_ref,
+            role=role,
+            started_at=_TS,
+        )
+
+    async def dispatch(self, handle: SessionHandle, event: ChatroomEvent) -> None:
+        self.events.append(event)
+
+
+def _rendered(event: ChatroomEvent) -> str:
+    from spirrow_mindwire.thread_context import build_turn_prompt
+
+    return build_turn_prompt(event, Role.PROPOSER, "Reply.")
+
+
+@pytest.mark.anyio
+async def test_watcher_prompt_carries_the_thread_opener() -> None:
+    """R-3(f): the watcher used to hand the turn the trigger and nothing else."""
+    mcp = _FakeMcp([_msg("msg-1", author="Bohr", content="THE-OPENER")])
+    disp = _RecordingDispatcher()
+    w = ChatroomWatcher(mcp, disp, [WatchSpec(_thread_ref(), Role.PROPOSER)])  # type: ignore[arg-type]
+    await w.start()
+    mcp.messages = [*mcp.messages, _msg("msg-2", content="the new one")]
+    assert await w.poll_once() == 1
+    out = _rendered(disp.events[0])
+    assert "=== Thread so far" in out
+    assert "THE-OPENER" in out
+    assert out.index("THE-OPENER") < out.index("New message from human:")
+
+
+@pytest.mark.anyio
+async def test_a_batched_poll_does_not_show_a_turn_its_own_future() -> None:
+    """R-3(a): N and N+1 arrive in one poll; N's turn must not see N+1 (body OR count)."""
+    mcp = _FakeMcp(
+        [
+            _msg("msg-1", author="Bohr", content="THE-OPENER"),
+            _msg("msg-2", content="MIDDLE"),
+        ]
+    )
+    disp = _RecordingDispatcher()
+    w = ChatroomWatcher(mcp, disp, [WatchSpec(_thread_ref(), Role.PROPOSER)])  # type: ignore[arg-type]
+    await w.start()
+    mcp.messages = [
+        *mcp.messages,
+        _msg("msg-3", content="BODY-OF-N"),
+        _msg("msg-4", content="BODY-OF-N-PLUS-1"),
+    ]
+    assert await w.poll_once() == 2
+    first, second = disp.events
+    assert first.payload.msg_id == "msg-3"
+    assert "BODY-OF-N-PLUS-1" not in _rendered(first)
+    assert first.thread_context is not None
+    assert first.thread_context.total_count == 3
+    assert second.payload.msg_id == "msg-4"
+    assert "BODY-OF-N" in _rendered(second)
+    assert second.thread_context is not None
+    assert second.thread_context.total_count == 4

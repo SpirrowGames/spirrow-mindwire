@@ -66,6 +66,19 @@ class FailureSignature:
 # discipline the test suite pins) not local (one flag removed one time).
 _SIGNATURES: tuple[FailureSignature, ...] = (
     FailureSignature(
+        label="thread-resolved-on-post",
+        # T-sweep-admission-ignores-thread-status D2 (Bohr msg-4613 §2). The role's
+        # inference SUCCEEDED and magickit refused the post because the thread had been
+        # resolved; ``client.py`` raises ``ThreadResolvedError`` (from the server's
+        # ``ChatroomThreadResolvedError`` envelope) and the adapter chains it. FIRST in the
+        # list on purpose: when the Claude adapter wraps it, the same line also carries
+        # ``ClaudeCodeSdkDeliveryError``, and ``sdk-is-error-generic`` below would steal it.
+        # This is the more specific cause, so it wins. Fixed identifiers, single line, no
+        # distance bound needed.
+        pattern=re.compile(r"ChatroomThreadResolvedError|\bThreadResolvedError\b"),
+        description="Role reply was discarded: the thread was resolved before post",
+    ),
+    FailureSignature(
         label="sdk-error-during-execution",
         # M-2 top signature: msg-2354 §1 records this as 25/20/5/0 occurrences on
         # 08-30/31/09-01/02. The log line the SDK adapter emits carries both the
@@ -78,8 +91,16 @@ _SIGNATURES: tuple[FailureSignature, ...] = (
         # ``.*?`` + ``re.DOTALL`` combination and makes the single-line contract
         # visible in the pattern itself, so a future edit that adds DOTALL back has
         # nothing to gain from it (the char class already excludes ``\n``).
+        #
+        # T-sdk-is-error-loses-the-reason S-9 R-1 moved the subtype out of the
+        # reason slot and into a message prefix, so post-S-9 lines read
+        #     ClaudeCodeSdkDeliveryError: SDK is_error[error_during_execution]; errors=[…]
+        # Both shapes stay recognised: historical tails keep the old form forever,
+        # and dropping it would silently re-bucket them as generic.
         pattern=re.compile(
-            r"ClaudeCodeSdkDeliveryError[^\n]*?subtype\s*=\s*['\"]?error_during_execution['\"]?",
+            r"ClaudeCodeSdkDeliveryError[^\n]*?"
+            r"(?:subtype\s*=\s*['\"]?error_during_execution['\"]?"
+            r"|SDK\s+is_error\[error_during_execution\])",
         ),
         description="Claude Code SDK reported is_error / error_during_execution",
     ),

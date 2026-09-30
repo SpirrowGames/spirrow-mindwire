@@ -57,10 +57,16 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from ..github.client import parse_pr_ref
+from ..tier_c_admission_gate import (
+    ADMIT_LABELS,
+    LEGACY_LABEL_MAP,
+    RELEASE_CROSS_REPO_LABEL,
+    UNSURE_LABEL,
+)
 from ..value_objects import Role
 
 # A handoff line must stand on its own (``^...$`` with MULTILINE). We take the LAST one so a
@@ -237,12 +243,29 @@ class MismatchReason(StrEnum):
 # tag is parsed by the conductor's routing, so it lives with the routing — same defence Bohr made
 # in msg-890 §1 for placing the revised proposer guidance here rather than in obligations. Adding
 # a net-new entry to obligations.yaml is explicitly out of scope for this change.
-TIER_C_LABELS: tuple[str, ...] = (
-    "irreversible",
-    "billing",
-    "scope",
-    "merge-protected",
-    "release-cross-repo",
+#
+# T-tier-c-admission-gate U2 (Bohr msg-4768 / msg-4776): the enum is no longer defined here. It
+# was a second, stale copy of the closed set the admission gate owns (msg-3630 §2.1 — goal /
+# cost / irreversible / merge-protected), and the emission guidance below was teaching authors
+# the old set while the gate judged them by the new one. :data:`TIER_C_LABELS` is now DERIVED
+# from :data:`~spirrow_mindwire.tier_c_admission_gate.ADMIT_LABELS` (sorted, so the prompt text
+# is stable). The prose that DEFINES each label, and the stated count, are rendered from
+# ``_TIER_C_LABEL_DEFINITIONS`` (below, next to the prompt), whose key set is checked against
+# ``ADMIT_LABELS`` at import: a label added to or removed from the gate without a matching
+# definition fails the import of this module rather than leaving the prompt teaching the old set.
+# (PR #365 review: the first cut hardcoded the four names and the word "four" in the prose.)
+#
+# The PARSER still accepts the legacy labels (``scope`` / ``billing`` / ``release-cross-repo``)
+# and the gate's unsure label. That is measurement, not admission: a legacy label is exactly the
+# residual usage the 14-day audit wants to count, and dropping it from the parse would record it
+# as ABSENT — the silent mis-classification this block's opening paragraph forbids. Only
+# :data:`TIER_C_LABELS` is ever taught to an author.
+TIER_C_LABELS: tuple[str, ...] = tuple(sorted(ADMIT_LABELS))
+_TIER_C_PARSE_LABELS: tuple[str, ...] = (
+    *TIER_C_LABELS,
+    *sorted(LEGACY_LABEL_MAP),
+    RELEASE_CROSS_REPO_LABEL,
+    UNSURE_LABEL,
 )
 # `other:<reason>` is admitted separately (its reason text is free-form). Enum alternatives are
 # joined into a single non-capturing alternation; case is folded on match. Whitespace between
@@ -260,10 +283,94 @@ TIER_C_LABELS: tuple[str, ...] = (
 # relaxed.
 _TIER_C_LABEL_RE = re.compile(
     r"\A\s*TIER-C:\s*"
-    r"(?P<label>" + "|".join(re.escape(lbl) for lbl in TIER_C_LABELS) + r"|other:\s*\S[^\r\n]*?)"
+    r"(?P<label>"
+    + "|".join(re.escape(lbl) for lbl in _TIER_C_PARSE_LABELS)
+    + r"|other:\s*\S[^\r\n]*?)"
     r"\s*\Z",
     re.IGNORECASE,
 )
+
+
+# ---- STOP: disposition line (T-next-line-carries-who-not-why, Slice 1 — Bohr msg-4718 §1) ---- #
+# `NEXT:` says WHO acts next; it cannot say WHY nobody does. `NEXT: none` today collapses four
+# situations (msg-2014 §1: done / awaiting a decision / waiting on a condition / forgot to
+# nominate). The design keeps the `NEXT:` grammar untouched (D-1) and carries the "why" on a
+# sibling line immediately above the final `NEXT: none`:
+#
+#     STOP: done
+#     STOP: blocked-on <thread:|pr:|deploy:|queue-empty:><operand> wake:<agent>
+#
+# Slice 1 is a DARK LAUNCH (msg-4718 §1): this module PARSES the line into a typed value and the
+# conductor LOGS it on the measurement-only path TIER-C already uses. Nothing is rejected, nothing
+# is forwarded to magickit, routing is unchanged, and the emission prompt
+# (`_HANDOFF_PROTOCOL_CORE`) deliberately does NOT teach the form — a prompt that promises
+# "write this and the thread resolves / parks" must ship in the same unit as the mechanism that
+# keeps that promise (Einstein msg-4717 BLOCKING, accepted in msg-4718 §0/§2).
+#
+# The form is FIXED and read strictly (msg-4718 §1-1: "崩れた行は寛容に読まず malformed"). The
+# `STOP:` keyword itself is detected loosely (case, leading decoration, whitespace after the
+# colon) on purpose: a loosely-written STOP line must land in MALFORMED, where it is visible, and
+# never fall through to ABSENT, where it would silently inflate the unclassified baseline — the
+# same corruption TIER-C's relaxed keyword guards against. Everything AFTER the keyword must match
+# the fixed form exactly.
+#
+# `human` as a trigger or a wake is MALFORMED (B-5, msg-4716 §2): an agent's only route to stop
+# on a human is `NEXT: human`, which is the Decider's entry. `parked(human, human)` is reserved
+# for the mechanism's own D-8 ③ fallback and is never read off an author's line.
+STOP_TRIGGER_ARMS: tuple[str, ...] = ("thread", "pr", "deploy", "queue-empty")
+
+# Decoration or whitespace BETWEEN the keyword and the colon (`**STOP**: done`, `STOP : done`) is
+# also detected (PR-gate #363 finding 1): without it those lines fell through to ABSENT. Detection
+# only — a non-empty `gap` makes the line MALFORMED, it is never accepted.
+_STOP_KEYWORD_RE = re.compile(
+    r"\A[\s*_`>]*(?P<keyword>STOP)(?P<gap>[\s*_`>]*):\s*(?P<rest>.*?)\s*\Z", re.IGNORECASE
+)
+_STOP_BLOCKED_ON_RE = re.compile(
+    r"\Ablocked-on (?P<arm>"
+    + "|".join(re.escape(arm) for arm in STOP_TRIGGER_ARMS)
+    + r"):(?P<operand>\S+) wake:(?P<wake>\S+)\Z"
+)
+
+
+class StopStatus(StrEnum):
+    """What the line above a final ``NEXT: none`` says about why the thread stops.
+
+    ``ABSENT`` is the measurement Slice 1 exists for (msg-4718 §1-2(b)): a ``NEXT: none`` with no
+    ``STOP:`` line is the pre-cutover ``unclassified`` denominator. ``DONE`` / ``BLOCKED_ON`` are
+    the two accepted forms; together they are "present". ``MALFORMED`` is a line that announced
+    itself as ``STOP:`` but did not match the fixed form (including any ``human`` trigger/wake).
+    """
+
+    ABSENT = "absent"
+    DONE = "done"
+    BLOCKED_ON = "blocked_on"
+    MALFORMED = "malformed"
+
+    @property
+    def presence(self) -> str:
+        """The 3-valued presence the log records: ``present`` / ``absent`` / ``malformed``."""
+        if self is StopStatus.ABSENT:
+            return "absent"
+        if self is StopStatus.MALFORMED:
+            return "malformed"
+        return "present"
+
+
+@dataclass(frozen=True)
+class StopLine:
+    """The typed ``STOP:`` disposition parsed off the line above a final ``NEXT: none``.
+
+    ``trigger_arm`` / ``trigger_operand`` / ``wake`` are set only for ``BLOCKED_ON``; ``wake`` is
+    the roster's canonical identity. ``raw`` is the stripped line for every status except
+    ``ABSENT`` (so a MALFORMED line can be read back from the log). Slice 1's only consumer is the
+    measurement log; the typed value exists so the later slice's forwarding has one parser.
+    """
+
+    status: StopStatus
+    trigger_arm: str | None = None
+    trigger_operand: str | None = None
+    wake: str | None = None
+    raw: str | None = None
 
 
 @dataclass(frozen=True)
@@ -320,6 +427,11 @@ class Handoff:
     :class:`ValueError` otherwise. The check is a local guardrail — every ``Handoff`` is built
     in this module — not a substitute for a single sum type (the naysayer reply to msg-4864
     accepted this trade-off over widening :class:`MismatchReason`).
+
+    ``stop_line`` is the ``STOP:`` disposition (T-next-line-carries-who-not-why Slice 1): set to a
+    :class:`StopLine` exactly when ``kind is HandoffKind.NONE`` — including ``StopStatus.ABSENT``
+    when no such line was written — and ``None`` on every other kind (not measured there). Like
+    ``tier_c_label`` it is measurement only: nothing routes differently on it.
     """
 
     kind: HandoffKind
@@ -329,6 +441,7 @@ class Handoff:
     tier_c_label: str | None = None
     mismatch_reason: MismatchReason | None = None
     mismatch_body_token: str | None = None
+    stop_line: StopLine | None = None
     author_requested_human: bool = False
 
     def __post_init__(self) -> None:
@@ -359,6 +472,66 @@ def _last_next_raw(body: str) -> str | None:
     return str(matches[-1]).strip() or None
 
 
+def _line_above_last_next(body: str) -> str | None:
+    """The line immediately above the **last** ``NEXT:`` line, or ``None`` if there is none.
+
+    Shared by the two annotation readers (``TIER-C:`` and ``STOP:``) so both look at exactly the
+    same line: n-1 where n is the final ``NEXT:``, no blank-line skipping, no wider window.
+    """
+    matches = list(_NEXT_LINE_RE.finditer(body))
+    if not matches:
+        return None
+    last_next_start = matches[-1].start()
+    if last_next_start == 0:
+        return None
+    # The ``^`` of the last NEXT: line sits at ``last_next_start``; the previous line's ``\n``
+    # is at ``last_next_start - 1`` (if the file starts at 0, MULTILINE's ``^`` also matches
+    # position 0, which we already excluded above).
+    prev_line_end = last_next_start - 1  # exclusive of the delimiting \n
+    prev_line_start = body.rfind("\n", 0, prev_line_end) + 1  # rfind returns -1 → 0
+    return body[prev_line_start:prev_line_end]
+
+
+def _stop_line_above_last_next(body: str, roster: Mapping[str, Role]) -> StopLine:
+    """Parse the ``STOP:`` disposition on the line above the last ``NEXT:`` (Slice 1, msg-4718 §1).
+
+    Never raises and never returns ``None``: the caller only asks on a ``NEXT: none`` terminal,
+    where "no STOP line" is itself the measurement (``StopStatus.ABSENT``). ``wake`` must resolve
+    on the roster (a registered agent of this thread); ``human`` / ``none`` / an unknown name is
+    ``MALFORMED``. There is no ``human`` trigger arm, so ``blocked-on human`` is ``MALFORMED`` too.
+    """
+    line = _line_above_last_next(body)
+    if line is None:
+        return StopLine(StopStatus.ABSENT)
+    keyword = _STOP_KEYWORD_RE.match(line)
+    if keyword is None:
+        return StopLine(StopStatus.ABSENT)
+    rest = keyword.group("rest")
+    raw = line.strip()
+    if keyword.group("keyword") != "STOP" or keyword.group("gap"):
+        # Detected (so not ABSENT) but not the fixed spelling: `stop: done`, `**STOP**: done` and
+        # `STOP : done` are MALFORMED.
+        return StopLine(StopStatus.MALFORMED, raw=raw)
+    if rest == "done":
+        return StopLine(StopStatus.DONE, raw=raw)
+    blocked = _STOP_BLOCKED_ON_RE.match(rest)
+    if blocked is None:
+        return StopLine(StopStatus.MALFORMED, raw=raw)
+    wake = blocked.group("wake")
+    if wake.casefold() in (HUMAN_TOKEN, NONE_TOKEN):
+        return StopLine(StopStatus.MALFORMED, raw=raw)
+    resolved = _roster_lookup(roster, wake)
+    if resolved is None:
+        return StopLine(StopStatus.MALFORMED, raw=raw)
+    return StopLine(
+        StopStatus.BLOCKED_ON,
+        trigger_arm=blocked.group("arm"),
+        trigger_operand=blocked.group("operand"),
+        wake=resolved[0],
+        raw=raw,
+    )
+
+
 def _tier_c_label_above_last_next(body: str) -> str | None:
     """``TIER-C: <label>`` on the line above the **last** ``NEXT:`` line, or ``None``.
 
@@ -377,18 +550,9 @@ def _tier_c_label_above_last_next(body: str) -> str | None:
     :func:`resolve_handoff` reports for :attr:`Handoff.kind` — the tag is additive observability
     only.
     """
-    matches = list(_NEXT_LINE_RE.finditer(body))
-    if not matches:
+    prev_line = _line_above_last_next(body)
+    if prev_line is None:
         return None
-    last_next_start = matches[-1].start()
-    if last_next_start == 0:
-        return None
-    # The ``^`` of the last NEXT: line sits at ``last_next_start``; the previous line's ``\n``
-    # is at ``last_next_start - 1`` (if the file starts at 0, MULTILINE's ``^`` also matches
-    # position 0, which we already excluded above).
-    prev_line_end = last_next_start - 1  # exclusive of the delimiting \n
-    prev_line_start = body.rfind("\n", 0, prev_line_end) + 1  # rfind returns -1 → 0
-    prev_line = body[prev_line_start:prev_line_end]
     match = _TIER_C_LABEL_RE.match(prev_line)
     if match is None:
         return None
@@ -465,9 +629,16 @@ def resolve_handoff(
     body_handoff = _resolve_body(body, roster)
     field_value = next_participant.strip() if next_participant is not None else ""
     if not field_value:
-        return body_handoff
-    field_handoff = _resolve_field(field_value, roster)
-    return _reconcile(field_handoff, body_handoff)
+        resolved = body_handoff
+    else:
+        resolved = _reconcile(_resolve_field(field_value, roster), body_handoff)
+    if resolved.kind is HandoffKind.NONE:
+        # STOP: disposition (Slice 1, measurement only). Attached AFTER reconciliation so a
+        # field-driven NONE whose body also says `NEXT: none` keeps the body's STOP line instead
+        # of being miscounted as ABSENT. A field NONE with no body NEXT: has no line above any
+        # NEXT:, which reads as ABSENT — correct: nobody wrote a STOP line.
+        resolved = replace(resolved, stop_line=_stop_line_above_last_next(body, roster))
+    return resolved
 
 
 def _resolve_body(body: str, roster: Mapping[str, Role]) -> Handoff:
@@ -627,6 +798,58 @@ def _same_target(a: Handoff, b: Handoff) -> bool:
 # names) has one source of truth and cannot drift between emit and parse.
 # --------------------------------------------------------------------------- #
 
+# PR #365 review (invariant): the per-label prose is data keyed by label, not a hand-written
+# sentence, and the count is len(), not the literal word "four". The key set MUST equal
+# ``ADMIT_LABELS``; the check runs at import, so the prompt can neither teach a label the gate
+# does not admit nor omit one it does. Order follows :data:`TIER_C_LABELS` (sorted), the same
+# order the "Allowed labels" line uses.
+_TIER_C_LABEL_DEFINITIONS: dict[str, str] = {
+    "goal": "the product's goal, spec, scope or direction changes",
+    "cost": "money spent changes: a new external service, API billing up or down",
+    "irreversible": (
+        "cannot be undone: data deletion, public release, destructive migration, history "
+        "rewrite, an external side effect"
+    ),
+    "merge-protected": "a merge to a protected branch, or a deploy only a human can perform",
+}
+
+
+def _check_label_definitions(definitions: dict[str, str], admitted: frozenset[str]) -> None:
+    """Fail loudly when the prompt's label definitions and the gate's admitted set diverge."""
+    if frozenset(definitions) != admitted:
+        raise RuntimeError(
+            f"handoff._TIER_C_LABEL_DEFINITIONS keys {sorted(definitions)} != "
+            f"tier_c_admission_gate.ADMIT_LABELS {sorted(admitted)}: define every admitted "
+            "label (and only those) before the handoff prompt can teach it"
+        )
+
+
+_check_label_definitions(_TIER_C_LABEL_DEFINITIONS, ADMIT_LABELS)
+
+_NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+
+
+def _count_word(n: int) -> str:
+    return _NUMBER_WORDS[n] if 0 <= n < len(_NUMBER_WORDS) else str(n)
+
+
+def _render_label_definitions(labels: tuple[str, ...]) -> str:
+    parts = [f"`{label}` ({_TIER_C_LABEL_DEFINITIONS[label]})" for label in labels]
+    if len(parts) <= 1:
+        return "".join(parts)
+    return ", ".join(parts[:-1]) + ", and " + parts[-1]
+
+
+def _admitted_example(label: str) -> str:
+    """Return ``label`` for a worked example, failing the import if the gate no longer admits it."""
+    if label not in ADMIT_LABELS:
+        raise RuntimeError(f"handoff example label {label!r} is not in ADMIT_LABELS")
+    return label
+
+
+_TIER_C_COUNT_WORD = _count_word(len(TIER_C_LABELS))
+_TIER_C_DEFINITIONS_PROSE = _render_label_definitions(TIER_C_LABELS)
+
 _HANDOFF_PROTOCOL_CORE = f"""\
 ---
 Conductor handoff protocol (REQUIRED)
@@ -640,12 +863,32 @@ with exactly one handoff line, and make it the FINAL line of your reply:
 `<name>` is either another participant's persona name (spelled exactly as it \
 appears as a message author in this thread) or one of two reserved words:
 
-  - `NEXT: {HUMAN_TOKEN}` — hand to the human for a Tier-C decision (e.g. \
-approving a design for implementation, or merging to the main branch).
+  - `NEXT: {HUMAN_TOKEN}` — hand to the human ONLY for a Tier-C decision. Tier-C \
+is a closed set of {_TIER_C_COUNT_WORD}: {_TIER_C_DEFINITIONS_PROSE}. Anything else is NOT \
+Tier-C — decide it yourself and proceed: the implementation approach, whether and how \
+to address review findings (advisory or REQUEST_CHANGES), test strategy, naming, \
+refactor extent, work order, splitting PRs or threads, approving an internal \
+mechanism's design, and "may I proceed?".
   - `NEXT: {NONE_TOKEN}` — the thread is settled; there is nothing left to do.
 
 The handoff line is part of your verbatim reply, not meta-commentary: write it \
 out literally (for example `NEXT: {HUMAN_TOKEN}`) and put nothing after it."""
+
+# U2 (T-tier-c-admission-gate msg-4768): the label list taught to proposer and implementer is the
+# admission gate's closed set, rendered from :data:`TIER_C_LABELS` (itself derived from
+# ``ADMIT_LABELS``), so the prompt cannot list a label the gate does not admit. ``other:<reason>``
+# is no longer taught: msg-3630 §2.2 makes it a non-ticket. The unsure label is the one sanctioned
+# way to ask "does this touch the goal?" (msg-3630 §2.1, "迷ったら相談してよい"). The text says
+# what the labels ARE and deliberately promises no bounce: the gate's bounce is not wired into
+# routing (msg-4768 U1, moved to the Decider threads), so promising one would be a false claim.
+_TIER_C_LABEL_GUIDANCE = (
+    f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` — the {_TIER_C_COUNT_WORD} Tier-C "
+    "types above, and nothing else. If you genuinely cannot tell whether a decision touches "
+    f"the goal, write `TIER-C: {UNSURE_LABEL}` and say in one line what is unclear. "
+    "`other:<reason>` or a missing label is not a Tier-C admission: if none of the "
+    f"{_TIER_C_COUNT_WORD} applies, it is not Tier-C, "
+    "so decide it yourself and proceed."
+)
 
 _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
     # A (T-human-terminal-overuse, human GO msg after Einstein ACCEPT msg-891): after you
@@ -673,11 +916,8 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "code, so that you cannot bypass its objections (the conductor structurally redirects "
         f"such a handoff). Hand to `{HUMAN_TOKEN}` only for a decision that is genuinely Tier-C, "
         "and name the type on the line above your handoff, e.g.:\n\n"
-        "    TIER-C: scope\n"
-        f"    NEXT: {HUMAN_TOKEN}\n\n"
-        f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` / `other:<one-line reason>`. This is "
-        "a calibration tag the conductor records so we can tell judgement-Tier-C apart from "
-        "routing-artefact Tier-C; it does NOT redefine what Tier-C is."
+        f"    TIER-C: {_admitted_example('goal')}\n"
+        f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     # D-3 (T-human-terminal-overuse, Bohr msg-2540 §4 D-3 approved by Einstein msg-2539 Obj-3):
     # implementer receives the same TIER-C: <label> emission guidance the proposer already has (A
@@ -695,11 +935,8 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself. "
         f"When you hand to `{HUMAN_TOKEN}`, name the Tier-C type on the line above your handoff, "
         "e.g.:\n\n"
-        "    TIER-C: merge-protected\n"
-        f"    NEXT: {HUMAN_TOKEN}\n\n"
-        f"Allowed labels: `{'` / `'.join(TIER_C_LABELS)}` / `other:<one-line reason>`. This is "
-        "a calibration tag the conductor records so we can tell judgement-Tier-C apart from "
-        "routing-artefact Tier-C; it does NOT redefine what Tier-C is."
+        f"    TIER-C: {_admitted_example('merge-protected')}\n"
+        f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     Role.NAYSAYER: (
         "As the naysayer: after your critique, hand back to the proposer if your objections need a "
@@ -746,10 +983,13 @@ __all__ = [
     "HUMAN_TOKEN",
     "NONE_TOKEN",
     "PR_REVIEW_TOKEN",
+    "STOP_TRIGGER_ARMS",
     "TIER_C_LABELS",
     "Handoff",
     "HandoffKind",
     "MismatchReason",
+    "StopLine",
+    "StopStatus",
     "build_handoff_protocol_block",
     "parse_next_token",
     "resolve_handoff",

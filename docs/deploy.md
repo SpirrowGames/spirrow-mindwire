@@ -113,7 +113,7 @@ role_cli_path = "C:/Users/<you>/.local/bin/claude.exe"
 ```
 
 A `role_cli_path` that is not a file, or is not executable, stops the daemon at startup with a named
-error rather than failing once per five-minute tick. It is resolved to an absolute path there too —
+error rather than failing once per tick. It is resolved to an absolute path there too —
 a relative one would be read against the daemon's working directory by that check and against the
 session's `cwd` by the SDK, which are not the same directory.
 
@@ -259,11 +259,14 @@ Task settings that matter (Windows):
 | Setting | Value | Why |
 |---|---|---|
 | Action | `pwsh -NoProfile -File <daemon-checkout>\deploy\run-conductor-scheduled.ps1` | the wrapper, not the raw launcher — and the **daemon** checkout, not a working one (above) |
-| Trigger | at logon **and** a repeating trigger, 5 min, indefinite | the head probe makes a short interval nearly free; see below |
+| Trigger | at logon **and** a repeating trigger, 1 min, indefinite | the head probe makes a short interval nearly free; see below |
 | `MultipleInstancesPolicy` | `IgnoreNew` | a tick that fires while the previous sweep is still working is dropped — this is the whole of the "already running?" handling, no lock file needed |
 | `ExecutionTimeLimit` | `PT4H` | a real design round can take a while; `PT2H` was cutting runs off |
-| `RestartCount` / `RestartInterval` | `3` / `PT10M` | transient MCP or inference failures retry instead of waiting for the next tick |
 | Run as | the user holding `MINDWIRE_NAYSAYER_GITHUB_TOKEN`, the webhook var, and the Claude subscription | the wrapper reads the webhook from the **User** env scope |
+
+There is deliberately **no `RestartCount` / `RestartInterval`**: the repeating trigger already runs
+the next tick sooner than any restart interval worth setting, so a failed tick is simply retried by
+the next one. If the task still carries them from an older setup, remove them.
 
 ### Deploying a merged change
 
@@ -290,7 +293,7 @@ Three rules are load-bearing:
 - **A tick either updates the code or uses it, never both.** The wrapper was parsed from the old file
   at startup, while `run-conductor.ps1` would be read from disk *after* the pull — a sweep spanning
   two versions is not a thing worth debugging later. So a deploy tick launches nothing; the cost is
-  one 5-minute cycle of latency after a merge.
+  one tick of latency after a merge.
 - **Nothing but a pure fast-forward is ever performed.** A dirty tree or a diverged branch means
   someone has work here; resolving that automatically would be the script inventing an answer nobody
   asked for. Untracked files never block — the live host deliberately carries untracked working notes,
@@ -460,7 +463,7 @@ driving those from an unattended schedule would spend money on a timer, so it st
 with their verdicts recorded — but the exclusion rule here stays for future `T-pr-review-*`
 threads.)
 
-### Why the sweep is cheap enough to run every 5 minutes
+### Why the sweep is cheap enough to run on a short interval
 
 Launching the conductor is not uniformly cheap:
 
@@ -546,7 +549,7 @@ forever.
 
 | Path | Contents |
 |---|---|
-| `<data_dir>/logs/conductor-YYYY-MM-DD.log` | sweep log. Detail is buffered and only committed when a tick actually does something — an idle tick collapses to one line, which is what keeps a 5-minute cadence readable |
+| `<data_dir>/logs/conductor-YYYY-MM-DD.log` | sweep log. Detail is buffered and only committed when a tick actually does something — an idle tick collapses to one line, which is what keeps a minute-scale cadence readable |
 | `<data_dir>/logs/clock-YYYY-MM-DD.log` | clock-sync log |
 | `<data_dir>/state/head_skip.json` | per-thread head-skip predicate record (nomination-target, launch attempts, cached observation) — the skip decision above. Single writer: `scripts/head_skip_decide.py`; atomic replace |
 | `<data_dir>/state/notified.json` | last alert fired per thread, for de-duplication |

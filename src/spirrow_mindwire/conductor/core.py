@@ -80,7 +80,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
 from ..decider.hook import Decider, ThreadMessage, run_tierc_hook
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
-from ..github.client import CheckRollup, PrRef, ReviewEvent, parse_pr_ref
+from ..github.client import CheckRollup, PrRef, parse_pr_ref
 from ..identity.embodiment import blocked_embodiment, normalize_embodiment_table
 from ..identity.normalize import normalize_identity_key
 from ..magickit.client import McpToolCaller, ThreadResolvedError
@@ -89,6 +89,7 @@ from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
 from ..value_objects import (
     ChatroomEvent,
+    Event,
     EventType,
     NewMessagePayload,
     Role,
@@ -98,6 +99,7 @@ from ..value_objects import (
 from .control import BASELINE_CONTROL_STATE, ControlState, LoopControl
 from .gate_records import (
     RELAY_AUTHOR,
+    RelayRoute,
     ci_route_heads,
     normalize_sha,
     render_ci_route_marker,
@@ -105,6 +107,14 @@ from .gate_records import (
 )
 from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, parse_next_token, resolve_handoff
 from .roster import RoleResolutionError, derive_identity_by_role
+from .stall import StalledError, emit_stalled, is_stalled, render_stalled_notice, stalled_event
+from .stand_down import (
+    StandDownError,
+    StandDownReason,
+    UnresolvedItem,
+    emit_stand_down,
+    stand_down_event,
+)
 
 if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
@@ -192,6 +202,12 @@ class StopReason(StrEnum):
     # ended on NO_PROGRESS. Measured on two threads that sat that way for days at one retry per
     # hour. Detecting it in ``_route`` means the spawn never happens and the stop names its cause.
     SELF_HANDOFF = "self_handoff_to_human"
+    # T42 generic stall watchdog (:mod:`.stall`): the sweep has launched this same head
+    # ``STALL_THRESHOLD`` times in a row and nothing was posted. Not spawned; a STALLED notice
+    # ending ``NEXT: human`` is posted and the run exits 0 (msg-4569). In head_skip's
+    # TERMINAL_STOP_REASONS alongside NO_PROGRESS / SELF_HANDOFF (same meaning: this head goes
+    # nowhere if re-run).
+    STALLED = "stalled_to_human"
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
     HOLD = "hold"  # the project's loop control state is `hold` (or could not be read)
@@ -317,6 +333,8 @@ class Conductor:
         identity_embodiment: Mapping[str, str] | None = None,
         decider: Decider | None = None,
         stop_slot: ConductorStopSlot | None = None,
+        launches_same_head: int = 0,
+        launch_head_msg_id: str | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -372,6 +390,11 @@ class Conductor:
         # Adapter-error side channel (Bohr msg-4440 D-1''). ``None`` = nobody reads it; the
         # dispatch still re-raises unchanged, so a bare Conductor behaves exactly as before.
         self._stop_slot = stop_slot
+        # T42 stall watchdog input, handed down by the sweep (``--launches-same-head`` /
+        # ``--launch-head-msg-id``). The defaults (0 / None) never stall, so a bare Conductor
+        # and every caller that predates T42 behave exactly as before.
+        self._launches_same_head = launches_same_head
+        self._launch_head_msg_id = launch_head_msg_id
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
         # ``supervised`` baseline, so a bare Conductor never self-authorises code. The state is
@@ -548,10 +571,14 @@ class Conductor:
                                 implementer_identity,
                             )
                             sessions[implementer_identity] = handle
+                        # R-1b (T-dispatched-turn msg-4871 §3): ``route_msg`` was posted after
+                        # this round's fetch, so it is not in ``messages``. The context builder
+                        # requires the trigger to be present; append it NON-destructively so
+                        # nothing else this round reads sees a changed list.
                         await self._dispatch_recording(
                             handle,
                             route_msg,
-                            messages,
+                            [*messages, route_msg],
                             rounds=round_index,
                             forced=forced,
                             forced_saveable=forced_saveable,
@@ -559,15 +586,18 @@ class Conductor:
                         processed_msg_id = route_msg_id
                         continue
                     # GateAdmission.INVOKE (R0-OVERRIDE / R1b / R7) falls through.
-                verdict, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
+                relay_route, relay_msg = await self._fire_pr_gate(parsed_ref.slug)
                 relay_msg_id = _msg_id(relay_msg)
                 implementer_identity = self._implementer_identity
-                # A missing relay id (post result with no msg_id) breaks no-progress tracking on
-                # the continue path, so fail-safe to the human instead of re-processing the relay
-                # next round (Tier B msg-572 #2). APPROVE / COMMENT also stop at the human.
+                # U3' (T-tier-c-admission-gate msg-4776): WHERE to go is decided once, by the relay
+                # writer (``gate_records.decide_relay_route``), and read here off the relay — this
+                # branch no longer re-derives it from the verdict. What stays here are the two
+                # execution fail-safes, which are not policy: a missing relay id (post result with
+                # no msg_id) breaks no-progress tracking on the continue path (Tier B msg-572 #2),
+                # and no implementer persona means nobody to dispatch. Both stop at the human.
                 if (
                     not relay_msg_id
-                    or verdict is not ReviewEvent.REQUEST_CHANGES
+                    or relay_route is not RelayRoute.IMPLEMENTER
                     or not implementer_identity
                 ):
                     last = relay_msg_id or latest_msg_id
@@ -580,10 +610,12 @@ class Conductor:
                     sessions[implementer_identity] = handle
                 # Dispatch the implementer on the RELAY event (the verdict + critique), not its own
                 # pr-review trigger — else it wakes blind to what it must fix (Tier B msg-567 #1).
+                # R-1b: ``relay_msg`` post-dates this round's fetch; hand the builder
+                # ``[*messages, relay_msg]`` (a new list — ``messages`` stays as fetched).
                 await self._dispatch_recording(
                     handle,
                     relay_msg,
-                    messages,
+                    [*messages, relay_msg],
                     rounds=round_index,
                     forced=forced,
                     forced_saveable=forced_saveable,
@@ -632,8 +664,20 @@ class Conductor:
                 # treatment the R3/R5 admission escalation gets — so the sweep records the stop
                 # against the message a human will actually open.
                 notice = self._terminal_notice(handoff, _author(latest), stop_reason)
+                # T44 (Bohr msg-4569 異議 1): an identity that did not resolve is a stand-down, and
+                # the thread HAS resolved, so the report goes to this thread — never elsewhere. The
+                # decision is the one ``_route`` already made (``spawn_blocked`` / NO_HANDOFF on a
+                # named-but-unknown target); this only names it on the event log.
+                stand_down = self._identity_stand_down(handoff, stop_reason, spawn_blocked)
+                if stand_down is not None:
+                    emit_stand_down(stand_down)
                 if notice is not None:
                     posted = await self._post_as_relay(notice)
+                    if stand_down is not None and not _msg_id(posted):
+                        # "chatroom で言えたら exit 0、言えなかったら非 0" (msg-4569): the notice
+                        # did not land (resolved thread / no msg_id), so this stop is silent in the
+                        # chatroom and must exit non-zero → wrapper quarantine + Discord.
+                        raise StandDownError(stand_down)
                     latest_msg_id = _msg_id(posted) or latest_msg_id
                 else:
                     # T-human-terminal-overuse D-1 (Bohr msg-2540 approved by Einstein msg-2539).
@@ -651,6 +695,41 @@ class Conductor:
                         posted = await self._post_as_conductor_relay(redirect_body)
                         latest_msg_id = _msg_id(posted) or latest_msg_id
                 return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
+            # T42 stall watchdog (:mod:`.stall`). Only on the first round, because the sweep's
+            # count describes the head this launch started on; a later round is on a head this
+            # run itself moved. Only where ``_route`` chose a participant to spawn, which is the
+            # roster-resolved "AI-addressed" test (msg-4532 §1) — the PR-gate path (a CI wait on
+            # one head is legitimate) and every stop above never reach here.
+            if round_index == 0 and is_stalled(
+                launches_same_head=self._launches_same_head,
+                launch_head_msg_id=self._launch_head_msg_id,
+                head_msg_id=latest_msg_id or "",
+            ):
+                stall_event = stalled_event(
+                    project=self._thread_ref.project_id,
+                    thread=self._thread_ref.thread_id,
+                    head_msg_id=latest_msg_id or "",
+                    launches_same_head=self._launches_same_head,
+                    target=target_identity,
+                )
+                emit_stalled(stall_event)
+                # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader:
+                # the human who owns this thread, who opens it because its head asked for work.
+                # Fallback when the thread is gone: disposition (3), fail loudly. ``_post_as_relay``
+                # turns a ThreadResolvedError into an empty ``msg_id``; that, or any post that
+                # returns no ``msg_id``, raises StalledError → exit 4 → the wrapper's quarantine
+                # and Discord alert, with the ``conductor.stalled`` line above in the log tail.
+                posted = await self._post_as_relay(render_stalled_notice(stall_event))
+                posted_id = _msg_id(posted)
+                if not posted_id:
+                    logger.warning(
+                        "conductor.stalled notice did not land in thread %r — exiting non-zero",
+                        self._thread_ref.thread_id,
+                    )
+                    raise StalledError(stall_event)
+                return self._stop(
+                    round_index, StopReason.STALLED, posted_id, forced, forced_saveable
+                )
             if is_forced:
                 forced += 1
                 # ``is_saveable`` comes from _route (the single source of truth for the forcing
@@ -911,6 +990,27 @@ class Conductor:
             )
 
         if handoff.kind is HandoffKind.NONE:
+            # T-next-line-carries-who-not-why Slice 1 (Bohr msg-4718 §1-2): record the STOP:
+            # line above the author's `NEXT: none` — present / absent / malformed, plus the typed
+            # disposition. MEASUREMENT ONLY, same discipline as the TIER-C tag above: nothing is
+            # rejected, nothing is forwarded to magickit, and the route below is identical for
+            # every value. `stop_line=absent` is the pre-cutover `unclassified` denominator.
+            stop = handoff.stop_line
+            # resolve_handoff sets stop_line on every NONE handoff (handoff.py, resolve_handoff).
+            assert stop is not None
+            logger.info(
+                "conductor none terminal: author=%s author_role=%s stop_line=%s "
+                "stop_disposition=%s stop_trigger=%s stop_wake=%s stop_raw=%r",
+                _author(messages[-1]),
+                author_role.value if author_role is not None else None,
+                stop.status.presence,
+                stop.status.value,
+                f"{stop.trigger_arm}:{stop.trigger_operand}"
+                if stop.trigger_arm is not None
+                else None,
+                stop.wake,
+                stop.raw,
+            )
             return RouteDecision(
                 target_role=None,
                 target_identity="",
@@ -1027,6 +1127,53 @@ class Conductor:
                 f"次にやること: `{identity}` に依頼する内容であれば、その本人が投稿してから"
                 f"スレッドを進めてください。\n\n"
                 f"NEXT: {HUMAN_TOKEN}"
+            )
+        if reason is StopReason.NO_HANDOFF and handoff.kind is HandoffKind.ABSENT and handoff.token:
+            # T44 (Einstein msg-4548 / Bohr msg-4569 異議 1): ``NEXT: Bohrr`` — the head names a
+            # target, so a reader of the head believes someone was started. Without this line the
+            # thread just stops; that is the silent stop T44 exists to remove.
+            return (
+                f"Conductor stand-down — `NEXT:` の宛先が解決できません\n\n"
+                f"head の `NEXT:` は `{handoff.token}` を指していますが、これは roster の参加者"
+                f"でも `human` / `none` / `pr-review` でもありません (typo の可能性があります)。"
+                f"\n\n∴ 誰も spawn せず、人間の介入が必要な停止として扱いました "
+                f"(`conductor.stand_down` unresolved=identity)。\n\n"
+                f"次にやること: 正しい参加者名で `NEXT:` を書き直すか、`NEXT: human` で"
+                f"明示的に預けてください。head が動くまでループは再開しません。\n\n"
+                f"NEXT: {HUMAN_TOKEN}"
+            )
+        return None
+
+    def _identity_stand_down(
+        self, handoff: Handoff, reason: StopReason, spawn_blocked: bool
+    ) -> Event | None:
+        """The ``conductor.stand_down`` event for a stop caused by an unresolved identity.
+
+        Reads the decision ``_route`` already made rather than re-deriving it (no parallel
+        identity check, msg-4569): ``spawn_blocked`` is the router's own flag, and the unknown
+        target is the NO_HANDOFF stop on a head whose ``NEXT:`` named *something* (``token`` set)
+        that is neither a roster participant nor a sentinel. A head with no ``NEXT:`` at all is
+        not an identity failure — nothing was named — and stays out of this vocabulary.
+        """
+        project = self._thread_ref.project_id
+        thread = self._thread_ref.thread_id
+        if spawn_blocked:
+            blocked = self._spawn_blocked(handoff)
+            name, embodiment = blocked if blocked is not None else (handoff.token or "", "?")
+            return stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=StandDownReason.IDENTITY_NOT_SPAWNABLE,
+                project=project,
+                thread=thread,
+                detail=f"NEXT target {name!r} has embodiment {embodiment!r} (no adapter)",
+            )
+        if reason is StopReason.NO_HANDOFF and handoff.kind is HandoffKind.ABSENT and handoff.token:
+            return stand_down_event(
+                unresolved=UnresolvedItem.IDENTITY,
+                reason=StandDownReason.IDENTITY_UNRESOLVED,
+                project=project,
+                thread=thread,
+                detail=f"NEXT target {handoff.token!r} is not a roster participant or a sentinel",
             )
         return None
 
@@ -1215,7 +1362,7 @@ class Conductor:
         messages = result.get("messages", []) if isinstance(result, dict) else []
         return [m for m in messages if isinstance(m, dict)]
 
-    async def _fire_pr_gate(self, pr_ref: str) -> tuple[ReviewEvent, dict[str, Any]]:
+    async def _fire_pr_gate(self, pr_ref: str) -> tuple[RelayRoute, dict[str, Any]]:
         """Fire the Tier B naysayer review on ``pr_ref`` and take back its verdict (PR-2b-2).
 
         Synchronous (ADR-19 N-1): the orchestrator runs the CI-gate + Gemini judge + GitHub
@@ -1223,17 +1370,23 @@ class Conductor:
         verdict (with the critique body, so the implementer has its fix context) into the design
         thread named here. The relay used to live in this class, which made the destination a
         property of the *caller*: a hand-run driver held no design thread and silently relayed
-        nothing. Returns the verdict and the relay **message**, so the implementer is dispatched
-        on that relay event and sees the critique, not its own trigger (Tier B msg-567 #1).
+        nothing. Returns the relay route (U3', decided once by the relay writer) and the relay
+        **message**, so the implementer is dispatched on that relay event and sees the critique,
+        not its own trigger (Tier B msg-567 #1).
         """
         assert self._orchestrator is not None
-        _thread_ref, outcome, relay_msg = await self._orchestrator.fire_pr_review(
+        _thread_ref, _outcome, relay_msg = await self._orchestrator.fire_pr_review(
             project=self._thread_ref.project_id,
             pr_ref=pr_ref,
             design_thread=self._thread_ref.thread_id,
             implementer=self._implementer_identity,
         )
-        return outcome.verdict, relay_msg
+        # The route the relay writer decided (U3'). A relay dict without one — a caller that
+        # predates U3', or a malformed return — fails to the human, the safe direction.
+        route = relay_msg.get("route") if isinstance(relay_msg, dict) else None
+        if not isinstance(route, RelayRoute):
+            route = RelayRoute.HUMAN
+        return route, relay_msg
 
     async def _post_as_relay(self, body: str) -> dict[str, Any]:
         """Post ``body`` into the design thread under the reserved relay author.

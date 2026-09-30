@@ -197,10 +197,50 @@ class PrState:
     closed_at: datetime | None = None
     merged: bool = False
     head_sha: str | None = None
+    # GitHub's ``mergeable_state`` (``clean`` / ``dirty`` / ``blocked`` / ``unstable`` /
+    # ``unknown`` / ...), verbatim, for an OPEN PR. ``None`` when the payload lacked it.
+    # Added for the stall ledger's ``needs_actor`` read (msg-4685 §3); S0 ignores it.
+    mergeable_state: str | None = None
 
     @property
     def slug(self) -> str:
         return self.ref.slug
+
+
+@dataclass(frozen=True)
+class OpenPr:
+    """One row of the open-PR listing (``GET /repos/{o}/{r}/pulls?state=open``).
+
+    Only the listing's own fields. The listing carries no review, merge-state or body
+    information, and this type deliberately has no field for any of them.
+    """
+
+    ref: PrRef
+    draft: bool
+    head_sha: str
+    created_at: datetime
+
+
+class OpenPrListingError(Exception):
+    """The open-PR listing could not be read completely.
+
+    ``outcome`` is one of ``http_error`` / ``timeout`` / ``auth_failure`` /
+    ``parse_error`` -- the stall ledger's ``FetchOutcome`` values, spelled as strings so
+    this module does not import the ledger at import time.
+    """
+
+    def __init__(self, message: str, *, outcome: str) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+
+
+@dataclass(frozen=True)
+class OpenPrListing:
+    """A complete open-PR listing: the rows that parsed, and how many did not."""
+
+    prs: tuple[OpenPr, ...]
+    examined: int
+    unrecognized: int
 
 
 @dataclass(frozen=True)
@@ -211,6 +251,11 @@ class ReviewInfo:
     state: str  # APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED / PENDING
     commit_id: str | None  # the head SHA the review was submitted against
     submitted_at: str | None
+    # The review's own id. Added for the stall ledger (T-stalled-pr-has-no-detector msg-4685
+    # §3): a review is a motion event, and the one body fetch the ledger may make
+    # (``fetch_review_body``) needs the id. Defaulted so every existing construction is
+    # unchanged.
+    review_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -441,7 +486,7 @@ class GitHubReviewClient(Protocol):
     async def fetch_pr_reviews_strict(self, pr: PrRef) -> list[ReviewInfo]: ...
 
     async def submit_review(
-        self, pr: PrRef, *, event: ReviewEvent, body: str
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
     ) -> dict[str, Any]: ...
 
     async def probe_identity(self) -> int: ...
@@ -866,6 +911,100 @@ class GitHubClient:
             rows=rows,
         )
 
+    async def list_open_prs(self, owner: str, repo: str) -> OpenPrListing:
+        """Every open PR in ``owner/repo``, following pagination (stall ledger msg-4685 §1).
+
+        The request is :func:`~spirrow_mindwire.stall_ledger.heartbeat.build_open_pr_query`'s
+        output, sent unchanged; only ``page`` is added to walk the pages. The builder is
+        imported lazily so this module keeps no import-time dependency on the ledger.
+
+        Fail direction is LOUD and whole-listing: any transport / non-2xx / non-list page
+        raises :class:`OpenPrListingError`, because a listing missing its later pages
+        would read as "those PRs closed" and close their ledger records. A row that is a
+        dict but lacks a field :class:`OpenPr` needs is not dropped silently; it is
+        counted in ``unrecognized`` so the caller's accounting invariant sees it.
+        """
+        from ..stall_ledger.heartbeat import build_open_pr_query
+
+        query = build_open_pr_query(owner, repo)
+        path = str(query["path"])
+        base_params: dict[str, Any] = dict(query["params"])
+        per_page = int(base_params["per_page"])
+        prs: list[OpenPr] = []
+        examined = 0
+        unrecognized = 0
+        page = 1
+        while True:
+            params = {**base_params, "page": page}
+            try:
+                resp = await self._client.get(path, params=params)
+            except httpx.TimeoutException as exc:
+                raise OpenPrListingError(f"GET {path}: {exc}", outcome="timeout") from exc
+            except httpx.RequestError as exc:
+                raise OpenPrListingError(f"GET {path}: {exc}", outcome="http_error") from exc
+            if resp.status_code in (401, 403) and not _is_rate_limited(resp):
+                raise OpenPrListingError(
+                    f"GET {path} -> {resp.status_code}: {_error_detail(resp)}",
+                    outcome="auth_failure",
+                )
+            if resp.status_code >= 400:
+                raise OpenPrListingError(
+                    f"GET {path} -> {resp.status_code}: {_error_detail(resp)}",
+                    outcome="http_error",
+                )
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                raise OpenPrListingError(
+                    f"GET {path}: malformed JSON: {exc}", outcome="parse_error"
+                ) from exc
+            if not isinstance(rows, list):
+                raise OpenPrListingError(
+                    f"GET {path}: expected a list, got {type(rows).__name__}",
+                    outcome="parse_error",
+                )
+            for row in rows:
+                examined += 1
+                parsed = _open_pr_row(owner, repo, row)
+                if parsed is None:
+                    unrecognized += 1
+                else:
+                    prs.append(parsed)
+            if len(rows) < per_page:
+                break
+            page += 1
+        return OpenPrListing(prs=tuple(prs), examined=examined, unrecognized=unrecognized)
+
+    async def fetch_review_body(self, pr: PrRef, review_id: str) -> str | None:
+        """``GET /repos/{o}/{r}/pulls/{n}/reviews/{id}`` -> the review's body.
+
+        Returns ``None`` only on ``404`` (the review is gone). Every other failure raises
+        :class:`GitHubHTTPError`: the stall ledger reads "could not fetch" and "deleted"
+        as two different reasons (msg-4683 §2), so they cannot share a return value.
+        """
+        path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews/{quote(review_id)}"
+        try:
+            resp = await self._client.get(path)
+        except httpx.RequestError as exc:
+            raise GitHubHTTPError(f"GET {path} (review body): {exc}") from exc
+        if resp.status_code == 404:
+            return None
+        if resp.status_code >= 400:
+            raise GitHubHTTPError(
+                f"GET {path} (review body) returned {resp.status_code}: {_error_detail(resp)}",
+                status_code=resp.status_code,
+                retry_after=_retry_after_seconds(resp),
+                rate_limited=_is_rate_limited(resp),
+            )
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise GitHubHTTPError(f"GET {path} (review body): malformed JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise GitHubHTTPError(f"GET {path} (review body): payload is not an object")
+        body = payload.get("body")
+        return body if isinstance(body, str) else ""
+
     async def fetch_pr_state(self, pr: PrRef) -> PrState:
         """``GET /repos/{owner}/{repo}/pulls/{n}`` → terminality facts for the sweep's S0.
 
@@ -912,7 +1051,13 @@ class GitHubClient:
         head = payload.get("head")
         head_sha = str(head.get("sha")) if isinstance(head, dict) and head.get("sha") else None
         if state == "open":
-            return PrState(ref=pr, resolution=PrResolution.OPEN, head_sha=head_sha)
+            mergeable = payload.get("mergeable_state")
+            return PrState(
+                ref=pr,
+                resolution=PrResolution.OPEN,
+                head_sha=head_sha,
+                mergeable_state=mergeable if isinstance(mergeable, str) else None,
+            )
         if state != "closed":
             # A third state would mean the API contract moved under us. Refusing to
             # guess is the same rule as the 403 case above.
@@ -963,12 +1108,14 @@ class GitHubClient:
                 login = str(user.get("login") or "") if isinstance(user, dict) else ""
                 cid = row.get("commit_id")
                 submitted = row.get("submitted_at")
+                rid = row.get("id")
                 out.append(
                     ReviewInfo(
                         login=login,
                         state=str(row.get("state") or ""),
                         commit_id=str(cid) if cid else None,
                         submitted_at=str(submitted) if submitted else None,
+                        review_id=str(rid) if rid is not None else None,
                     )
                 )
             if len(rows) < 100:
@@ -1031,12 +1178,14 @@ class GitHubClient:
                 login = str(user.get("login") or "") if isinstance(user, dict) else ""
                 cid = row.get("commit_id")
                 submitted = row.get("submitted_at")
+                rid = row.get("id")
                 out.append(
                     ReviewInfo(
                         login=login,
                         state=str(row.get("state") or ""),
                         commit_id=str(cid) if cid else None,
                         submitted_at=str(submitted) if submitted else None,
+                        review_id=str(rid) if rid is not None else None,
                     )
                 )
             if len(rows) < 100:
@@ -1334,8 +1483,19 @@ class GitHubClient:
             page += 1
         return out
 
-    async def submit_review(self, pr: PrRef, *, event: ReviewEvent, body: str) -> dict[str, Any]:
+    async def submit_review(
+        self, pr: PrRef, *, event: ReviewEvent, body: str, commit_id: str | None = None
+    ) -> dict[str, Any]:
         """``POST /repos/{owner}/{repo}/pulls/{n}/reviews`` with a verdict event.
+
+        ``commit_id`` (optional) is GitHub's own API parameter: when given, the review
+        is attached to that commit instead of to whatever the PR head is when the POST
+        arrives. It is sent only when not ``None``, so omitting it leaves the request
+        body byte-identical to before. This client attaches no meaning to it — the
+        caller that retries (``NaysayerPrReviewDriver._submit_review``) pins the POST
+        to the same commit its ``landed()`` guard checks, so a head that moves between
+        a lost-response POST and the retry cannot produce a second review
+        (T-gate-review-submit-failure-handling msg-4781 item 3).
 
         On non-2xx the raised :class:`GitHubHTTPError` carries the header-derived
         ``retry_after`` and ``rate_limited`` fields (D-1) so the caller's classifier
@@ -1346,11 +1506,17 @@ class GitHubClient:
         A caller that wants retries must add them behind an idempotency guard
         (T-gate-review-submit-failure-handling PR-B: retries and ``landed()``
         ship together, never separately, or a POST whose response leg drops
-        can double-post — msg-1981 §4.2, msg-3275/msg-3276).
+        can double-post — msg-1981 §4.2, msg-3275/msg-3276). The retry lives in
+        the naysayer driver, not here: this method has no ``head_sha`` to scope a
+        guard by, so a client-level retry would mistake an earlier head's review
+        for this one's (msg-4780).
         """
         path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}/reviews"
         try:
-            resp = await self._client.post(path, json={"event": event.value, "body": body})
+            payload: dict[str, Any] = {"event": event.value, "body": body}
+            if commit_id is not None:
+                payload["commit_id"] = commit_id
+            resp = await self._client.post(path, json=payload)
         except httpx.RequestError as exc:
             raise GitHubHTTPError(f"POST {path} (review): {exc}") from exc
         if resp.status_code >= 400:
@@ -1506,6 +1672,29 @@ class GitHubClient:
                 rate_limited=_is_rate_limited(resp),
             )
         return resp.text
+
+
+def _open_pr_row(owner: str, repo: str, row: object) -> OpenPr | None:
+    """One listing row -> :class:`OpenPr`, or ``None`` if it lacks a field the type needs."""
+    if not isinstance(row, dict):
+        return None
+    number = row.get("number")
+    head = row.get("head")
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    created = _parse_github_timestamp(row.get("created_at"))
+    draft = row.get("draft")
+    if not isinstance(number, int) or isinstance(number, bool):
+        return None
+    if not isinstance(head_sha, str) or not head_sha or created is None:
+        return None
+    if not isinstance(draft, bool):
+        return None
+    return OpenPr(
+        ref=PrRef(owner=owner, repo=repo, number=number),
+        draft=draft,
+        head_sha=head_sha,
+        created_at=created,
+    )
 
 
 def _check_row(node: dict[str, Any]) -> CheckRow | None:

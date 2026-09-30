@@ -648,7 +648,7 @@ async def test_failure_report_does_not_claim_close_will_wait_24h() -> None:
     assert "will not attempt to close this thread again for" not in body
     # And the correct semantics must be stated positively.
     assert "close attempt itself is NOT rate-limited" in body
-    assert "every 5-minute tick" in body
+    assert "every scheduled tick" in body
 
 
 # --- PR-gate #209 blocking #2 regression: read failure must fail-closed and preserve state -----

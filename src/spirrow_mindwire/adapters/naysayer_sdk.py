@@ -159,6 +159,20 @@ class NaysayerSdkDeliveryError(AdapterDeliveryError):
     """``deliver_event`` failure for the naysayer SDK agent (§3.4)."""
 
 
+class NaysayerSdkShutdownError(NaysayerSdkDeliveryError):
+    """Per-turn client shutdown failed after a successful turn (msg-4102).
+
+    ``code`` is the single source of the ``adapter.shutdown_failed`` value:
+    ``deliver_event`` writes it into ``session.error.code`` from here, and the
+    conductor's ``error_code=`` reads it off the exception
+    (T-successful-turn-quarantined-on-sdk-lifecycle-failure, PR #355 advisory).
+    Subclasses :class:`NaysayerSdkDeliveryError`, so existing ``except`` sites
+    that catch the delivery error are unaffected.
+    """
+
+    code = "adapter.shutdown_failed"
+
+
 class NaysayerSdkHaltError(AdapterHaltError):
     """``halt`` failure for the naysayer SDK agent (§3.4)."""
 
@@ -565,8 +579,8 @@ class NaysayerSdkAdapter:
         # that would let an un-attested naysayer post (Tier-C msg-970 §2).
         #
         # The quarantine holds until a human clears it (``Clear-Quarantine.ps1``);
-        # ticks are 5 minutes apart, so a transient outage that resolves itself
-        # still needs that clear.
+        # the next tick being only minutes away does not help, so a transient outage
+        # that resolves itself still needs that clear.
         try:
             await self._run_preflight()  # dry-run: result deliberately discarded
         except Exception as exc:
@@ -869,20 +883,18 @@ class NaysayerSdkAdapter:
                         # quota. Fail-loud rather than swallowing (Principle 5).
                         session.state = SessionState.FAILED
                         session.error = ErrorInfo(
-                            code="adapter.shutdown_failed",
+                            code=NaysayerSdkShutdownError.code,
                             message=str(shutdown_exc),
                             raised_at=datetime.now(UTC),
                         )
-                        shutdown_err = NaysayerSdkDeliveryError(
+                        # ``session.error.code`` above and the exception's own
+                        # ``.code`` (read by the conductor's ``error_code=``) both
+                        # come from the class attribute — one place, no drift.
+                        raise NaysayerSdkShutdownError(
                             f"per-turn client shutdown failed for session "
                             f"{handle.session_id} after a successful turn "
                             f"(subprocess may have leaked): {shutdown_exc}"
-                        )
-                        # Same value as ``session.error.code`` above, on the exception itself so
-                        # the conductor's ``error_code=`` names it without reading the session
-                        # (T-successful-turn-quarantined-on-sdk-lifecycle-failure, msg-4440).
-                        shutdown_err.code = "adapter.shutdown_failed"  # type: ignore[attr-defined]
-                        raise shutdown_err from shutdown_exc
+                        ) from shutdown_exc
                     # The main path was ALREADY raising when shutdown failed
                     # (state / session.error / the exception itself are all
                     # set by the except blocks above). Re-raising the shutdown
