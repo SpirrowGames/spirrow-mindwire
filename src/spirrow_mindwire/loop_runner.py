@@ -758,6 +758,8 @@ def build_conductor(
     naysayer: RoleAdapter | None = None,
     pr_review_driver: NaysayerPrReviewDriver | None = None,
     stop_slot: ConductorStopSlot | None = None,
+    launches_same_head: int = 0,
+    launch_head_msg_id: str | None = None,
 ) -> Stage3Conductor:
     """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
 
@@ -856,6 +858,9 @@ def build_conductor(
             # Bohr msg-4440 D-1''): read by ``main`` to print the single ``conductor stopped:``
             # line when a dispatch raised. ``None`` = no reader (tests, library callers).
             stop_slot=stop_slot,
+            # T42 stall watchdog input from the sweep (see :mod:`.conductor.stall`).
+            launches_same_head=launches_same_head,
+            launch_head_msg_id=launch_head_msg_id,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc
@@ -882,6 +887,8 @@ async def run_conductor(
     *,
     stop_slot: ConductorStopSlot | None = None,
     mcp: McpToolCaller | None = None,
+    launches_same_head: int = 0,
+    launch_head_msg_id: str | None = None,
 ) -> ConductorOutcome:
     """Build the conductor, drive the task thread once to a stop condition, and tear it down.
 
@@ -904,6 +911,10 @@ async def run_conductor(
     posted there ending ``NEXT: human`` and the run returns a HUMAN stop (exit 0). Nothing is
     spawned on either path. ``mcp`` is injectable for tests; the same client is handed to
     :func:`build_conductor` so resolution and the run read the chatroom through one transport.
+
+    T42 stall watchdog: ``launches_same_head`` / ``launch_head_msg_id`` are the sweep's count of
+    consecutive launches on one head and that head (``--launches-same-head`` /
+    ``--launch-head-msg-id``). They are handed to the Conductor unchanged; the defaults never stall.
     """
     if mcp is None:
         mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
@@ -937,7 +948,13 @@ async def run_conductor(
         )
         return outcome
     _preflight(settings.loop)
-    cond = build_conductor(settings, mcp=mcp, stop_slot=stop_slot)
+    cond = build_conductor(
+        settings,
+        mcp=mcp,
+        stop_slot=stop_slot,
+        launches_same_head=launches_same_head,
+        launch_head_msg_id=launch_head_msg_id,
+    )
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
         settings.loop.project,
@@ -1080,6 +1097,23 @@ def main() -> None:
             "conductor: NEXT-driven single-thread design conductor (msg-523)"
         ),
     )
+    # T42 stall watchdog (conductor mode only). Written by the sweep from the head_skip record it
+    # committed just before this launch; see :mod:`spirrow_mindwire.conductor.stall`. Absent =
+    # 0 / None, which never stalls, so a hand-run ``mindwire-loop --mode conductor`` is unchanged.
+    parser.add_argument(
+        "--launches-same-head",
+        type=int,
+        default=0,
+        help=(
+            "conductor: consecutive launches the sweep has committed on the current head, "
+            "counting this one (T42 stall watchdog)"
+        ),
+    )
+    parser.add_argument(
+        "--launch-head-msg-id",
+        default=None,
+        help="conductor: the head msg id --launches-same-head was counted on (T42)",
+    )
     args = parser.parse_args()
     settings = load_settings()
     # Created OUTSIDE ``asyncio.run`` so the except blocks below can read it after the loop has
@@ -1087,7 +1121,14 @@ def main() -> None:
     stop_slot = ConductorStopSlot()
     try:
         if args.mode == "conductor":
-            asyncio.run(run_conductor(settings, stop_slot=stop_slot))
+            asyncio.run(
+                run_conductor(
+                    settings,
+                    stop_slot=stop_slot,
+                    launches_same_head=args.launches_same_head,
+                    launch_head_msg_id=args.launch_head_msg_id or None,
+                )
+            )
         else:
             asyncio.run(run_loop(settings))
     except KeyboardInterrupt:

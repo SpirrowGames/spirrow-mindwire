@@ -148,7 +148,18 @@ STOP_TOKENS: frozenset[str] = frozenset({NONE_TOKEN, HUMAN_TOKEN})
 # Values are the string form of :class:`spirrow_mindwire.conductor.core.StopReason` members. The
 # link is pinned by a test rather than an import: this module is loaded by the sweep CLI, which
 # has no business importing the conductor (and its GitHub / MCP dependencies) to read two strings.
-TERMINAL_STOP_REASONS: frozenset[str] = frozenset({"no_progress_to_human", "self_handoff_to_human"})
+#
+# ``stalled_to_human`` (T42, the generic stall watchdog) joined on 2026-09-30. Membership is decided
+# by what a reason MEANS for this head, not by whether the conductor posted a notice for it:
+# every reason here says "running this exact head again achieves nothing". That is the
+# definition of a stall (the same head launched :data:`~spirrow_mindwire.conductor.stall.
+# STALL_THRESHOLD` times with nothing posted), so leaving it out would manage one terminal state
+# by two rules (Einstein, T-silent-stops thread). The criterion is not "has a notice ending in
+# ``NEXT: human``": ``no_progress_to_human`` posts nothing and depends on this set to park, and
+# ``self_handoff_to_human`` depends on it whenever its notice fails to land.
+TERMINAL_STOP_REASONS: frozenset[str] = frozenset(
+    {"no_progress_to_human", "self_handoff_to_human", "stalled_to_human"}
+)
 
 
 class Decision(StrEnum):
@@ -267,6 +278,16 @@ class Record:
     # ``last_observed_nomination`` and fed back to :func:`decide` on a cache hit, when no fetch
     # runs and the status would otherwise be invisible. ``""`` fails open in Stage 0.
     last_observed_status: str = ""
+    # T42 stall watchdog: how many LAUNCHes in a row were committed on ``head_msg_id_at_launch``,
+    # counting the latest one. Launch family: only :func:`commit_launch` changes it (+1 on the
+    # same head, back to 1 on a different head); a DEFER, SKIP, park or observation leaves it
+    # alone, so a backoff tick can never move the stall threshold (Bohr, T-silent-stops thread,
+    # instruction 1). It is keyed on ``head_msg_id_at_launch`` and deliberately NOT on
+    # ``last_observed_head_msg_id``, which moves on every evaluation. An observed count of this
+    # module's own actions, not a derived schedule value, so it fits the all-observation rule
+    # above (Einstein Objection 2). ``0`` = never launched, or a record written before the field
+    # existed.
+    launches_same_head: int = 0
 
 
 # --- Parser --------------------------------------------------------------------------------------
@@ -598,6 +619,17 @@ def commit_launch(
         obs_nomination = prior_record.last_observed_nomination if prior_record else ""
         obs_at = prior_record.head_observed_at if prior_record else None
         obs_status = prior_record.last_observed_status if prior_record else ""
+    # T42: the same-head run grows only when this launch is on the head the last launch was on.
+    # An empty head id (the probe could not say) never grows it — an unknown head is not evidence
+    # of a stall, and a false STALLED would park a live thread.
+    if (
+        prior_record is not None
+        and head_msg_id
+        and prior_record.head_msg_id_at_launch == head_msg_id
+    ):
+        launches_same_head = prior_record.launches_same_head + 1
+    else:
+        launches_same_head = 1
     # The terminal fields are deliberately NOT carried forward: a LAUNCH means the head moved off
     # whatever we terminated on (or an operator forced one), so the old outcome no longer
     # describes this thread. Leaving them set would make the NEXT run's own outcome ambiguous —
@@ -612,6 +644,7 @@ def commit_launch(
         last_observed_head_msg_id=obs_head_msg_id,
         last_observed_nomination=obs_nomination,
         last_observed_status=obs_status,
+        launches_same_head=launches_same_head,
     )
 
 
@@ -667,6 +700,8 @@ def commit_observation(
         # this stage exists to close.
         terminal_stop_reason=record.terminal_stop_reason,
         terminal_head_msg_id=record.terminal_head_msg_id,
+        # Launch family — an observation never moves it (T42).
+        launches_same_head=record.launches_same_head,
     )
 
 
@@ -707,6 +742,8 @@ def commit_terminal(
         last_observed_status=base.last_observed_status,
         terminal_stop_reason=reason if terminal else "",
         terminal_head_msg_id=head_msg_id if terminal and head_msg_id else "",
+        # Launch family — an outcome never moves it (T42).
+        launches_same_head=base.launches_same_head,
     )
 
 
@@ -778,6 +815,7 @@ def record_to_json(record: Record) -> dict[str, Any]:
         "terminal_stop_reason": record.terminal_stop_reason,
         "terminal_head_msg_id": record.terminal_head_msg_id,
         "last_observed_status": record.last_observed_status,
+        "launches_same_head": int(record.launches_same_head),
     }
 
 
@@ -805,6 +843,9 @@ def record_from_json(data: dict[str, Any] | None) -> Record | None:
         terminal_stop_reason=str(data.get("terminal_stop_reason") or ""),
         terminal_head_msg_id=str(data.get("terminal_head_msg_id") or ""),
         last_observed_status=str(data.get("last_observed_status") or ""),
+        # A record written before T42 has no such key: read it as 0 (never counted), which can
+        # only under-count a stall, never invent one.
+        launches_same_head=int(data.get("launches_same_head") or 0),
     )
 
 

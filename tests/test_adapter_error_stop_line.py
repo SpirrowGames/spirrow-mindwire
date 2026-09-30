@@ -201,7 +201,12 @@ _SNAPSHOT = ConductorStopSnapshot(
 
 def _patch_main(monkeypatch: pytest.MonkeyPatch, body: Any) -> None:
     async def _fake_run_conductor(
-        _settings: MindwireSettings, *, stop_slot: ConductorStopSlot | None = None
+        _settings: MindwireSettings,
+        *,
+        stop_slot: ConductorStopSlot | None = None,
+        # T42: main() now also forwards the sweep's stall-watchdog input (defaults never stall).
+        launches_same_head: int = 0,
+        launch_head_msg_id: str | None = None,
     ) -> None:
         assert stop_slot is not None, "main must hand the conductor a stop slot"
         await body(stop_slot)

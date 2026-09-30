@@ -47,6 +47,9 @@
 # whose head hands to its own author cannot move until a person edits that head, which is
 # exactly the class of stop note 1 says must stay audible.
 #
+# 2026-09-30 (T42): 'stalled_to_human' joined the MAP for the same reason. The stall watchdog
+# posts STALLED and exits 0, so this notification is how the operator hears about it.
+#
 # NO TOP-LEVEL SIDE EFFECTS: this file is dot-sourced by both the runner and the tests, so
 # any assignment at script scope here would mutate the caller's scope. Do NOT set
 # $ErrorActionPreference here (PR-gate finding on #172): the runner already declares its own
@@ -68,6 +71,7 @@ function Get-StopReasonPhraseMap {
         'no_handoff_to_human'   = "NEXT: が読めず human に fallback して停止しました"
         'no_progress_to_human'  = "dispatch した role が何も投稿せず停止しました"
         'self_handoff_to_human' = "自己ハンドオフ（author == next）のため人間の介入が必要です"
+        'stalled_to_human'      = "同じ head で起動を繰り返しても進捗がないため停止しました（stall watchdog）"
         'round_cap'             = "ラウンド上限で停止しました（暴走バックストップ発動）"
         'empty_thread'          = "スレッドにメッセージがありません（優先リストの指定ミスの可能性）"
     }

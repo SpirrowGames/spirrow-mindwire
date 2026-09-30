@@ -717,7 +717,11 @@ function Invoke-HeadSkipDecide {
 }
 
 # Invoke `head_skip_decide.py --mode commit-launch --payload <payload>` for one thread. Returns:
-#   @{ ok = $true / $false; error = $null / diagnostic }
+#   @{ ok = $true / $false; error = $null / diagnostic; launches_same_head = <int>; head_msg_id = <string> }
+# `launches_same_head` / `head_msg_id` are read back from the record the CLI just committed and are
+# the T42 stall watchdog's input to the conductor (src/spirrow_mindwire/conductor/stall.py). An
+# unreadable record gives 0 / '' — which never stalls — rather than failing the commit: the commit
+# itself succeeded, and the watchdog is a fallback, not a reason to abort the tick.
 # Called BEFORE spawning the conductor session for the chosen candidate — that is the
 # "session-start-before write" contract that survives a forced kill (head_skip.py docstring).
 function Invoke-HeadSkipCommitLaunch {
@@ -751,7 +755,29 @@ function Invoke-HeadSkipCommitLaunch {
         $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
         return @{ ok = $false; error = "head_skip commit-launch exited ${code}: $tail" }
     }
-    return @{ ok = $true; error = $null }
+    $launchesSameHead = 0
+    $launchHeadMsgId = ''
+    $readWarning = $null
+    $jsonLine = @($raw | ForEach-Object { "$_" } | Where-Object { $_ -match '^\s*\{' }) | Select-Object -Last 1
+    if ($jsonLine) {
+        try {
+            $rec = ($jsonLine | ConvertFrom-Json).record
+            if ($null -ne $rec) {
+                if ($null -ne $rec.launches_same_head) { $launchesSameHead = [int]$rec.launches_same_head }
+                if ($null -ne $rec.head_msg_id_at_launch) { $launchHeadMsgId = [string]$rec.head_msg_id_at_launch }
+            }
+        }
+        catch { $launchesSameHead = 0; $launchHeadMsgId = ''; $readWarning = "record JSON unparseable: $($_.Exception.Message)" }
+    }
+    # A committed LAUNCH always carries launches_same_head >= 1 (head_skip.commit_launch). Reading 0
+    # back therefore means the record keys drifted from this reader (renamed in record_to_json) or
+    # the JSON line is missing — which would disable the T42 watchdog without an error. Fail OPEN
+    # (the launch still proceeds, count 0 = no watchdog) but LOUD: the caller logs this warning.
+    # The key names are pinned against record_to_json by tests/test_conductor_stall.py.
+    if ($null -eq $readWarning -and $launchesSameHead -lt 1) {
+        $readWarning = 'launches_same_head missing or < 1 in the committed record (key drift?)'
+    }
+    return @{ ok = $true; error = $null; launches_same_head = $launchesSameHead; head_msg_id = $launchHeadMsgId; warning = $readWarning }
 }
 
 # Invoke `head_skip_decide.py --mode commit-terminal --payload <payload>` for one thread.
@@ -3765,6 +3791,9 @@ try {
             throw ("head_skip commit-launch systemic failure on $($cand.key): $($commitResult.error). " +
                    "The tick is aborted (fail-closed per Bohr msg-1430 §W-3).")
         }
+        if ($commitResult.warning) {
+            Write-Log "WARN T42 stall watchdog disabled for $($cand.key) this launch — $($commitResult.warning)"
+        }
 
         # All three must move together: the daemon reads the thread from [conductor] but the project
         # and the implementer's clone from [loop], so a stale [loop] would drive the right thread
@@ -3774,7 +3803,12 @@ try {
         Set-TomlValue -Path $configPath -Section 'conductor' -Key 'task_thread_id' -Value $thread
 
         $launched++
-        $output = (& $inner *>&1) | ForEach-Object { "$_" }
+        # T42 stall watchdog: hand the conductor the same-head launch count the commit above just
+        # recorded, pinned to the head it was counted on. The conductor stands down (posts STALLED,
+        # `NEXT: human`, exit 0) at the threshold; the sweep only counts (it never posts).
+        $stallArgs = @('--launches-same-head', "$($commitResult.launches_same_head)")
+        if ($commitResult.head_msg_id) { $stallArgs += @('--launch-head-msg-id', "$($commitResult.head_msg_id)") }
+        $output = (& $inner @stallArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
         $verdict = Get-ConductorVerdict -Output $output
         # Keep the daemon's raw output only when the run was eventful; a plain `rounds=0` stop is
@@ -3979,8 +4013,8 @@ try {
         # written to fix. See head_skip_decide.py's docstring for the two-phase protocol.
         $sweepSignature += "$($cand.key)=$($verdict.last_msg)"
 
-        # Design §6.2: record (or clear) this thread's terminal stop. A `no_progress_to_human`
-        # or `self_handoff_to_human` run parks the thread until its head moves — head_skip's
+        # Design §6.2: record (or clear) this thread's terminal stop. A `no_progress_to_human`,
+        # `self_handoff_to_human` or `stalled_to_human` (T42) run parks the thread until its head moves — head_skip's
         # Stage 1b then SKIPs it instead of DEFERring, which is what ends the 72-retry spin
         # measured on T-human-outage-degrade-close-only. Every other reason clears the state.
         $terminalResult = Invoke-HeadSkipCommitTerminal -ThreadId $thread `

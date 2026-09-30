@@ -107,6 +107,7 @@ from .gate_records import (
 )
 from .handoff import HUMAN_TOKEN, Handoff, HandoffKind, parse_next_token, resolve_handoff
 from .roster import RoleResolutionError, derive_identity_by_role
+from .stall import StalledError, emit_stalled, is_stalled, render_stalled_notice, stalled_event
 from .stand_down import (
     StandDownError,
     StandDownReason,
@@ -201,6 +202,12 @@ class StopReason(StrEnum):
     # ended on NO_PROGRESS. Measured on two threads that sat that way for days at one retry per
     # hour. Detecting it in ``_route`` means the spawn never happens and the stop names its cause.
     SELF_HANDOFF = "self_handoff_to_human"
+    # T42 generic stall watchdog (:mod:`.stall`): the sweep has launched this same head
+    # ``STALL_THRESHOLD`` times in a row and nothing was posted. Not spawned; a STALLED notice
+    # ending ``NEXT: human`` is posted and the run exits 0 (msg-4569). In head_skip's
+    # TERMINAL_STOP_REASONS alongside NO_PROGRESS / SELF_HANDOFF (same meaning: this head goes
+    # nowhere if re-run).
+    STALLED = "stalled_to_human"
     ROUND_CAP = "round_cap"  # runaway backstop
     EMPTY = "empty_thread"  # the thread has no messages to act on
     HOLD = "hold"  # the project's loop control state is `hold` (or could not be read)
@@ -326,6 +333,8 @@ class Conductor:
         identity_embodiment: Mapping[str, str] | None = None,
         decider: Decider | None = None,
         stop_slot: ConductorStopSlot | None = None,
+        launches_same_head: int = 0,
+        launch_head_msg_id: str | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -381,6 +390,11 @@ class Conductor:
         # Adapter-error side channel (Bohr msg-4440 D-1''). ``None`` = nobody reads it; the
         # dispatch still re-raises unchanged, so a bare Conductor behaves exactly as before.
         self._stop_slot = stop_slot
+        # T42 stall watchdog input, handed down by the sweep (``--launches-same-head`` /
+        # ``--launch-head-msg-id``). The defaults (0 / None) never stall, so a bare Conductor
+        # and every caller that predates T42 behave exactly as before.
+        self._launches_same_head = launches_same_head
+        self._launch_head_msg_id = launch_head_msg_id
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
         # ``supervised`` baseline, so a bare Conductor never self-authorises code. The state is
@@ -681,6 +695,41 @@ class Conductor:
                         posted = await self._post_as_conductor_relay(redirect_body)
                         latest_msg_id = _msg_id(posted) or latest_msg_id
                 return self._stop(round_index, stop_reason, latest_msg_id, forced, forced_saveable)
+            # T42 stall watchdog (:mod:`.stall`). Only on the first round, because the sweep's
+            # count describes the head this launch started on; a later round is on a head this
+            # run itself moved. Only where ``_route`` chose a participant to spawn, which is the
+            # roster-resolved "AI-addressed" test (msg-4532 §1) — the PR-gate path (a CI wait on
+            # one head is legitimate) and every stop above never reach here.
+            if round_index == 0 and is_stalled(
+                launches_same_head=self._launches_same_head,
+                launch_head_msg_id=self._launch_head_msg_id,
+                head_msg_id=latest_msg_id or "",
+            ):
+                stall_event = stalled_event(
+                    project=self._thread_ref.project_id,
+                    thread=self._thread_ref.thread_id,
+                    head_msg_id=latest_msg_id or "",
+                    launches_same_head=self._launches_same_head,
+                    target=target_identity,
+                )
+                emit_stalled(stall_event)
+                # Producer declaration (OBL-CHATROOM-PRODUCER-READER-SURFACE). Intended reader:
+                # the human who owns this thread, who opens it because its head asked for work.
+                # Fallback when the thread is gone: disposition (3), fail loudly. ``_post_as_relay``
+                # turns a ThreadResolvedError into an empty ``msg_id``; that, or any post that
+                # returns no ``msg_id``, raises StalledError → exit 4 → the wrapper's quarantine
+                # and Discord alert, with the ``conductor.stalled`` line above in the log tail.
+                posted = await self._post_as_relay(render_stalled_notice(stall_event))
+                posted_id = _msg_id(posted)
+                if not posted_id:
+                    logger.warning(
+                        "conductor.stalled notice did not land in thread %r — exiting non-zero",
+                        self._thread_ref.thread_id,
+                    )
+                    raise StalledError(stall_event)
+                return self._stop(
+                    round_index, StopReason.STALLED, posted_id, forced, forced_saveable
+                )
             if is_forced:
                 forced += 1
                 # ``is_saveable`` comes from _route (the single source of truth for the forcing
