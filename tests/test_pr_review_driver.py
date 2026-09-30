@@ -4909,6 +4909,25 @@ async def test_submit_retry_budget_exhausted_reraises_last_error() -> None:
 
 
 @pytest.mark.anyio
+async def test_submit_retry_final_attempt_with_retry_after_raises_last_error() -> None:
+    # PR-gate #392 @ 639dd9f objection: "if _submit_retry_delay returns a delay on the final
+    # attempt, the loop hits `continue`, falls out, and crashes with AssertionError". Every
+    # attempt here carries an honourable retry_after, so a delay IS available on the final
+    # attempt. The `attempt < _SUBMIT_MAX_ATTEMPTS` guard keeps the final attempt out of
+    # the retry branch: no third sleep/read, the LAST error is re-raised through the
+    # classifier, and the post-loop AssertionError is never reached.
+    events: list[str] = []
+    errors = [_http(429, retry_after=30) for _ in range(3)]
+    github = _RetryScriptGitHub(head="sha-ra-final", script=list(errors), events=events)
+    _posted, post = _capture()
+    with pytest.raises(GitHubHTTPError) as excinfo:
+        await _retry_driver(github, events).review(_pr(), post_critique=post)
+    assert excinfo.value is errors[2]
+    assert not isinstance(excinfo.value, AssertionError)
+    assert events == ["post", "sleep:30", "read", "post", "sleep:30", "read", "post"]
+
+
+@pytest.mark.anyio
 async def test_submit_retry_unknown_head_never_retries() -> None:
     # UNKNOWN stops the loop: with no head_sha the guard can only answer UNKNOWN, so the
     # driver does not retry at all -- decided before sleeping. One POST, no pinning.
