@@ -19,8 +19,15 @@ occupied the sweep's whole throughput and *starved* the other 13 candidates behi
    token against a persona roster — an unknown persona name is NOT allowed to fall into "not a
    loop participant, skip"; it fails **open** into a launch (fail-open = fail-safe here).
 
-2. **Runs a two-stage judgment** (:func:`decide`):
+2. **Runs a two-stage judgment** (:func:`decide`), preceded by a status gate:
 
+   - **Stage 0 (thread status, T-sweep-admission-ignores-thread-status).** A thread whose
+     magickit status is finished (:func:`spirrow_mindwire.chatroom.status.is_terminal_status`)
+     → :attr:`Decision.SKIP` with reason ``thread-<status>``. Without it a finished thread left
+     in ``sweep.json`` was LAUNCHed, the role spent a full inference, and magickit refused the
+     post only afterwards (``ChatroomThreadResolvedError``). Stage 0 fails **open**: an empty
+     status (fetch failed, field missing) or an unrecognised one decides nothing and falls
+     through to Stage 1.
    - **Stage 1 (stop tokens).** ``token in {none, human}`` → :attr:`Decision.SKIP` with reason
      ``stop-token``. Stage 1 reads *nothing else* — no timing state, no record, no clock. This is
      what fixes the failure this module was written for: the stop-token skip set is fixed at
@@ -89,6 +96,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
+
+from spirrow_mindwire.chatroom.status import is_terminal_status
 
 from .handoff import HUMAN_TOKEN, NONE_TOKEN, parse_next_token
 
@@ -253,6 +262,11 @@ class Record:
     last_observed_nomination: str = ""
     terminal_stop_reason: str = ""
     terminal_head_msg_id: str = ""
+    # The magickit thread status seen at the last successful fetch (``""`` = never observed or a
+    # record written before this field existed). Observation family: refreshed with
+    # ``last_observed_nomination`` and fed back to :func:`decide` on a cache hit, when no fetch
+    # runs and the status would otherwise be invisible. ``""`` fails open in Stage 0.
+    last_observed_status: str = ""
 
 
 # --- Parser --------------------------------------------------------------------------------------
@@ -323,14 +337,16 @@ def decide(
     head_body: str,
     control_state: str,
     record: Record | None,
+    thread_status: str = "",
 ) -> Verdict:
-    """The two-stage predicate.
+    """The two-stage predicate, preceded by the Stage 0 thread-status gate.
 
     ``now`` is the wall-clock UTC of this evaluation, injected so the caller can time-travel in
     tests. ``head_msg_id`` / ``head_body`` come from the sweep's probe. ``control_state`` is the
     project's current control state as the sweep observed it this tick (or ``""`` when the probe
     could not read it — the fail-open case). ``record`` is the persisted state for this thread, or
-    ``None`` when the thread has never launched.
+    ``None`` when the thread has never launched. ``thread_status`` is the magickit thread status
+    (``""`` when unknown — the fail-open case; Stage 0 then decides nothing).
 
     :func:`decide` is pure — it never touches the record. The caller is responsible for calling
     :func:`commit_launch` on a LAUNCH before actually starting the conductor process (the
@@ -340,6 +356,27 @@ def decide(
     """
     token = parse_head_token(head_body)
     raw = parse_next_token(head_body)
+
+    # --- Stage 0: thread-status judgment. Reads NOTHING but the status string. ---------------
+    #
+    # Runs before Stage 1 because it answers a prior question: not "who is nominated?" but "can
+    # this thread take a message at all?". A finished thread refuses the post only AFTER the
+    # role session has spent its inference, so a head that says ``NEXT: Bohr`` on a resolved
+    # thread is not a launch but a paid-for discard. Fail-open: ``""`` / unknown → fall through.
+    # The reason carries the status itself so the wrapper log does not mislabel ``superseded``
+    # as ``resolved`` (Einstein advisory 2).
+    if is_terminal_status(thread_status):
+        return Verdict(
+            decision=Decision.SKIP,
+            reason=f"thread-{thread_status}",
+            token=token,
+            token_raw=raw,
+            progressed=False,
+            attempts_before=record.launch_attempts if record else 0,
+            attempts_after=record.launch_attempts if record else 0,
+            delay=timedelta(0),
+            eligible_at=None,
+        )
 
     # --- Stage 1: stop-token judgment. Reads NOTHING but the token. --------------------------
     #
@@ -516,6 +553,7 @@ def commit_launch(
     control_state: str,
     head_fetched: bool = True,
     prior_record: Record | None = None,
+    thread_status: str = "",
 ) -> Record:
     """Build the Record to persist BEFORE actually starting the conductor session.
 
@@ -550,6 +588,7 @@ def commit_launch(
         obs_head_msg_id = head_msg_id
         obs_nomination = verdict.token
         obs_at: datetime | None = now
+        obs_status = thread_status
     else:
         # Fail-open LAUNCH on a failed fetch — the observation-side of the record must NOT move
         # (empty observation would poison the cache for HEAD_CACHE_TTL). Carry forward whatever
@@ -558,6 +597,7 @@ def commit_launch(
         obs_head_msg_id = prior_record.last_observed_head_msg_id if prior_record else ""
         obs_nomination = prior_record.last_observed_nomination if prior_record else ""
         obs_at = prior_record.head_observed_at if prior_record else None
+        obs_status = prior_record.last_observed_status if prior_record else ""
     # The terminal fields are deliberately NOT carried forward: a LAUNCH means the head moved off
     # whatever we terminated on (or an operator forced one), so the old outcome no longer
     # describes this thread. Leaving them set would make the NEXT run's own outcome ambiguous —
@@ -571,6 +611,7 @@ def commit_launch(
         head_observed_at=obs_at,
         last_observed_head_msg_id=obs_head_msg_id,
         last_observed_nomination=obs_nomination,
+        last_observed_status=obs_status,
     )
 
 
@@ -580,6 +621,7 @@ def commit_observation(
     head_msg_id: str,
     token: str,
     record: Record | None,
+    thread_status: str = "",
 ) -> Record:
     """Update the observation fields for a NON-LAUNCH evaluation (SKIP, DEFER, or passive re-parse).
 
@@ -607,6 +649,7 @@ def commit_observation(
             head_observed_at=now,
             last_observed_head_msg_id=head_msg_id,
             last_observed_nomination=token,
+            last_observed_status=thread_status,
         )
     return Record(
         last_launch_at=record.last_launch_at,
@@ -617,6 +660,7 @@ def commit_observation(
         head_observed_at=now,
         last_observed_head_msg_id=head_msg_id,
         last_observed_nomination=token,
+        last_observed_status=thread_status,
         # Carried, not dropped. An observation is not an outcome: the SKIP this function is most
         # often called after IS the terminal skip, so rebuilding the record without these two
         # fields would erase the terminal state on the very next tick and re-open the retry loop
@@ -660,6 +704,7 @@ def commit_terminal(
         head_observed_at=base.head_observed_at,
         last_observed_head_msg_id=base.last_observed_head_msg_id,
         last_observed_nomination=base.last_observed_nomination,
+        last_observed_status=base.last_observed_status,
         terminal_stop_reason=reason if terminal else "",
         terminal_head_msg_id=head_msg_id if terminal and head_msg_id else "",
     )
@@ -732,6 +777,7 @@ def record_to_json(record: Record) -> dict[str, Any]:
         "last_observed_nomination": record.last_observed_nomination,
         "terminal_stop_reason": record.terminal_stop_reason,
         "terminal_head_msg_id": record.terminal_head_msg_id,
+        "last_observed_status": record.last_observed_status,
     }
 
 
@@ -758,6 +804,7 @@ def record_from_json(data: dict[str, Any] | None) -> Record | None:
         last_observed_nomination=str(data.get("last_observed_nomination") or ""),
         terminal_stop_reason=str(data.get("terminal_stop_reason") or ""),
         terminal_head_msg_id=str(data.get("terminal_head_msg_id") or ""),
+        last_observed_status=str(data.get("last_observed_status") or ""),
     )
 
 
