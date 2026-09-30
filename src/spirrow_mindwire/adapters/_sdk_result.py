@@ -88,24 +88,6 @@ import json
 import sys
 from typing import Any, TextIO
 
-# Known fields on ``claude_agent_sdk.ResultMessage`` (SDK observed 2026-08-26,
-# S-0). ``result`` is enumerated so the general capture pass records it in
-# ``captured_fields`` alongside the others; the reason-source selection logic
-# below treats it as the highest-priority reason field independently.
-#
-# This tuple is the CAPTURE list (what lands in ``captured_fields``). Which of
-# these may be picked as the *reason* is decided by ``_REASON_PRIORITY`` below —
-# the two used to be the same tuple, and that is how ``subtype`` ended up
-# shadowing the real reason (S-9 R-1).
-_KNOWN_REASON_FIELDS: tuple[str, ...] = (
-    "subtype",
-    "stop_reason",
-    "errors",
-    "api_error_status",
-    "permission_denials",
-    "result",
-)
-
 # The failure's classification. Rendered as a message prefix, never picked as
 # the reason (S-9 R-1, thread msg-4807 §3). 36 days of quarantine history showed
 # ``field:subtype`` as the majority ``reason_source`` with the value always
@@ -123,6 +105,29 @@ _REASON_PRIORITY: tuple[str, ...] = (
     "api_error_status",
     "permission_denials",
     "result",
+)
+
+# Fields captured for the reader but neither the classification nor a reason
+# candidate. ``stop_reason`` was never observed as ``field:stop_reason`` in the
+# quarantine history (0 of 77) and msg-4807 §3 does not list it.
+_CAPTURE_ONLY_FIELDS: tuple[str, ...] = ("stop_reason",)
+
+# Known fields on ``claude_agent_sdk.ResultMessage`` (SDK observed 2026-08-26,
+# S-0): the CAPTURE list (what lands in ``captured_fields``).
+#
+# It is DERIVED from the three tuples above rather than spelled out, so a
+# field added to ``_REASON_PRIORITY`` cannot be forgotten here — a reason
+# candidate that is never captured never reaches ``raw`` and would silently
+# never be evaluated (PR-gate advisory on #368 @ 97d3bea, human decision B on
+# thread T-sdk-is-error-loses-the-reason). The resulting order is the one the
+# hand-written tuple had (subtype, stop_reason, errors, api_error_status,
+# permission_denials, result), so ``captured_fields`` key order is unchanged.
+# ``result`` is in here via ``_REASON_PRIORITY``; the str-``result`` fast path
+# in ``_pick_reason`` treats it as the highest-priority reason independently.
+_KNOWN_REASON_FIELDS: tuple[str, ...] = (
+    _CLASSIFICATION_FIELD,
+    *_CAPTURE_ONLY_FIELDS,
+    *_REASON_PRIORITY,
 )
 
 # Session facts to always capture on failure so the quarantine marker carries
