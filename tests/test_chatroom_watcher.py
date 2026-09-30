@@ -342,3 +342,32 @@ async def test_a_batched_poll_does_not_show_a_turn_its_own_future() -> None:
     assert "BODY-OF-N" in _rendered(second)
     assert second.thread_context is not None
     assert second.thread_context.total_count == 4
+
+
+@pytest.mark.anyio
+async def test_a_trigger_missing_message_does_not_abort_the_rest_of_the_poll(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Human decision after #371 APPROVE: isolate ThreadContextTriggerMissing per message.
+
+    An empty-string ``msg_id`` passes the ``isinstance(str)`` filter but is dropped by
+    the context builder's parser, so its context build raises. Before the fix the
+    exception escaped ``_poll_watch`` and the valid message after it waited a whole
+    poll interval. Now that one message is skipped loudly (still at-most-once: it is
+    in ``_seen``) and the rest of the batch dispatches in the SAME poll.
+    """
+    mcp = _FakeMcp([_msg("msg-1", author="Bohr", content="THE-OPENER")])
+    disp = _RecordingDispatcher()
+    w = ChatroomWatcher(mcp, disp, [WatchSpec(_thread_ref(), Role.PROPOSER)])  # type: ignore[arg-type]
+    await w.start()
+    mcp.messages = [*mcp.messages, _msg("", content="BAD"), _msg("msg-3", content="GOOD")]
+    with caplog.at_level("ERROR", logger="spirrow_mindwire.magickit.watcher"):
+        assert await w.poll_once() == 1
+    assert [e.payload.msg_id for e in disp.events] == ["msg-3"]
+    skips = [r for r in caplog.records if "ThreadContextTriggerMissing" in r.getMessage()]
+    assert skips
+    # An expected, recovered refusal: ERROR level, no traceback (#375 advisory).
+    assert all(r.levelname == "ERROR" and r.exc_info is None for r in skips)
+    # at-most-once: the bad message is not retried on the next poll.
+    assert await w.poll_once() == 0
+    assert len(disp.events) == 1
