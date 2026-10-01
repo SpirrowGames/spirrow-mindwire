@@ -339,18 +339,33 @@ exit 0
     Check 'temp file removed (real run)' 0 (Get-ProbeInputLeftovers).Count
 
     # --- T: temp-file hygiene --------------------------------------------------------------------
-    Write-Host 'T1 — a locked temp file: WARN logged, no exception escapes'
+    Write-Host 'T1 — an undeletable temp file: WARN logged, no exception escapes'
+    # The delete failure is injected by shadowing Remove-Item, not by holding a FileShare.None
+    # handle: on Linux (the CI runner) an open handle does not block unlink, so a real lock only
+    # reproduces the failure on Windows. The shadow reproduces it on every platform.
     $locked = New-ProbeInputFile -Json '{}' -Label 'lock test'
     CheckTrue 'label is sanitised into the name' ((Split-Path -Leaf $locked) -like 'mindwire-probe-lock-test-*.json')
-    $fs = [System.IO.File]::Open($locked, 'Open', 'Read', 'None')
+    $script:removeAttempts = 0
+    $script:failRemove = $true
+    # Flag-gated shadow: while $script:failRemove is set it fails like a locked file; otherwise it
+    # passes straight through to the real cmdlet, so nothing after T1 is affected.
+    function script:Remove-Item {
+        if ($script:failRemove) {
+            $script:removeAttempts++
+            throw [System.IO.IOException]::new('The process cannot access the file because it is being used by another process.')
+        }
+        Microsoft.PowerShell.Management\Remove-Item @args
+    }
     $script:logLines.Clear()
     $threw = $false
     try { Remove-ProbeInputFile -Path $locked -DelayMs 10 } catch { $threw = $true }
-    finally { $fs.Dispose() }
+    finally { $script:failRemove = $false }
     Check 'no exception' $false $threw
-    CheckTrue 'WARN line names the path' (@($script:logLines | Where-Object { $_ -like "WARN probe temp file not removed: $locked (*" }).Count -eq 1)
+    Check 'delete retried 3 times' 3 $script:removeAttempts
+    CheckTrue 'WARN line names the path' (@($script:logLines | Where-Object { $_ -like "WARN probe temp file not removed: $locked (*being used by another process*" }).Count -eq 1)
+    CheckTrue 'file still present after failed removal' (Test-Path -LiteralPath $locked)
     Remove-ProbeInputFile -Path $locked
-    CheckTrue 'removable once unlocked' (-not (Test-Path -LiteralPath $locked))
+    CheckTrue 'removable once the failure clears' (-not (Test-Path -LiteralPath $locked))
 
     Write-Host 'T2 — startup sweep removes only mindwire-probe-*.json older than the bound'
     $sweepDir = Join-Path $scratch 'sweep'
