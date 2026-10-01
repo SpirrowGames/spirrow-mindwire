@@ -14,9 +14,19 @@ before the write half can supply values to ``upsert_identity``:
      derivation Einstein required in msg-1492, in the msg-1585 §3 corrected form
      (``allowed_roles = legitimate``; the observation feeds ``residual`` / ``unused`` only).
 
-The script is READ-ONLY. It never posts, never marks read, never touches the identity
-store. It is the "測る" half of msg-1491 §4's read/write split — always executable, does
-not depend on the readiness lock.
+  5. Store check (write half, msg-1706 §4). For every classified identity, the record the
+     identity store actually holds (``get_identity``) is run through the same two-way guard
+     the write path uses (:func:`~spirrow_mindwire.identity.check_store_record`). This is
+     what makes a record written by hand with ``upsert_identity``, bypassing
+     ``scripts/register_identities.py`` (for example ``machine`` with a role, or a
+     participant marked ``machine``), show up. Mindwire's guard only binds mindwire's own
+     writes, and Prismind deliberately does not enforce the pairing (msg-1706 §1). Before
+     this check existed the script never read the store, so such a record went undetected
+     (measured when PR-B started).
+
+The script is READ-ONLY. It never posts, never marks read, and never writes the identity
+store (``get_identity`` is its only store call). It is the "測る" half of msg-1491 §4's
+read/write split. It can always run and does not depend on the readiness lock.
 
 Output shape (stdout JSON):
 
@@ -49,6 +59,10 @@ Output shape (stdout JSON):
         ...
       ],
       "unclassified_authors": ["some-new-author"],
+      "store": [
+        {"identity_name": "pr-gate-relay", "kind": "machine", "status": "found",
+         "independence_class": "machine", "allowed_roles": [], "violations": []}
+      ],
       "collisions": {"foo-bar": ["foo-bar", "Foo_Bar"]},
       "errors": [],
       "totals": {
@@ -59,7 +73,9 @@ Output shape (stdout JSON):
         "unclassified_authors": 1,
         "authors_with_residual": 0,
         "authors_with_unused": 0,
-        "collision_groups": 0
+        "collision_groups": 0,
+        "store_unregistered": 0,
+        "store_violations": 0
       }
     }
 
@@ -74,6 +90,11 @@ Exit codes:
   0 — findings produced (the JSON above is on stdout, even if there are unclassified
       authors or non-empty residuals — those are outcomes, not errors)
   1 — the script itself failed (transport dead, classification file unreadable, etc.)
+
+``store_violations > 0`` means some classified identity's live record disagrees with its
+classification, which is tampering or drift. ``store_unregistered > 0`` means
+``scripts/register_identities.py --apply`` has not been run, or has not covered that
+identity.
 
 Non-empty ``unclassified_authors`` or ``collisions`` or ``authors_with_residual > 0`` is
 the SIGNAL that the write half MUST NOT proceed until each is resolved (``authors_with_unused``
@@ -98,13 +119,18 @@ from spirrow_mindwire.identity import (
     ClassificationError,
     IdentityCollisionError,
     LegitimateRolesFile,
+    check_store_record,
     default_classification_path,
     derive_allowed_and_residual,
     find_collisions,
     load_legitimate_roles,
     normalize_identity_key,
 )
-from spirrow_mindwire.magickit.client import MagickitMcpError, StreamableHttpChatroomMcp
+from spirrow_mindwire.magickit.client import (
+    MagickitMcpError,
+    McpToolCaller,
+    StreamableHttpChatroomMcp,
+)
 
 # PR #153 (`13618e9`, `feat: conductor supplies role...`) merged 2026-08-17 in
 # `spirrow-mindwire`. Bohr's msg-1484 §4 pins the scope to "deploy 以降に post した author"
@@ -190,7 +216,12 @@ def _in_scope(msg: dict[str, Any], cutoff: datetime, since_msg_id: str | None) -
         because the padding is fixed and the ids are monotonic per chatroom project. When
         the caller supplies this AND the message id compares less than the cutoff, drop.
       * ``cutoff``: an aware :class:`datetime` (parsed once in ``main()`` — see
-        :func:`_parse_cutoff`). Compared against the message's ``created_at``. A
+        :func:`_parse_cutoff`). Compared against the message's ``created_at``, or,
+        when that is absent, its ``timestamp``. The live ``chatroom_get_thread``
+        payload carries ``timestamp`` and has no ``created_at`` (measured at the
+        start of PR-B on msg-1179). The original ``created_at``-only lookup
+        therefore failed open on every live message, and the cutoff was never
+        applied. A
         message whose ``created_at`` is missing or unparseable is treated as in-scope
         (fail-open on the read side — we would rather over-include than silently drop
         an unreadable message that the write half then never sees a finding about).
@@ -203,7 +234,7 @@ def _in_scope(msg: dict[str, Any], cutoff: datetime, since_msg_id: str | None) -
         this_id = str(msg.get("msg_id") or "")
         if this_id and this_id < since_msg_id:
             return False
-    created_at = msg.get("created_at")
+    created_at = msg.get("created_at") or msg.get("timestamp")
     if not isinstance(created_at, str) or not created_at:
         return True
     try:
@@ -284,6 +315,34 @@ def _summarise(
     return entries, unclassified, residual_count, unused_count
 
 
+async def _check_store(
+    mcp: McpToolCaller, classification: LegitimateRolesFile
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Read each classified identity's store record and run the write-path guard on it.
+
+    Returns ``(rows, errors)``. A transport failure on one identity is recorded in ``errors``
+    and the identity is reported as ``lookup_failed``. It is never folded into "consistent".
+    """
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for entry in classification.entries:
+        try:
+            got: Any = await mcp.call_tool("get_identity", {"identity_name": entry.name})
+        except MagickitMcpError as exc:
+            errors.append({"identity_name": entry.name, "reason": f"get_identity failed: {exc}"})
+            rows.append(
+                {
+                    "identity_name": entry.name,
+                    "kind": entry.kind,
+                    "status": "lookup_failed",
+                    "violations": [],
+                }
+            )
+            continue
+        rows.append(check_store_record(entry, got if isinstance(got, dict) else {}))
+    return rows, errors
+
+
 async def _measure(
     projects: Iterable[str],
     since_iso: str,
@@ -343,6 +402,9 @@ async def _measure(
                 role_key: str | None = role_raw if isinstance(role_raw, str) and role_raw else None
                 author_role_counts[author][role_key] += 1
 
+    store_rows, store_errors = await _check_store(mcp, classification)
+    errors.extend(store_errors)
+
     plain_counts = {a: dict(rc) for a, rc in author_role_counts.items()}
     entries, unclassified, residual_count, unused_count = _summarise(plain_counts, classification)
     collisions = find_collisions(plain_counts.keys())
@@ -356,6 +418,7 @@ async def _measure(
         },
         "authors": entries,
         "unclassified_authors": unclassified,
+        "store": store_rows,
         "collisions": collisions,
         "errors": errors,
         "totals": {
@@ -373,6 +436,8 @@ async def _measure(
             # zero and this number never gates the write half (msg-1585 §3).
             "authors_with_unused": unused_count,
             "collision_groups": len(collisions),
+            "store_unregistered": sum(1 for r in store_rows if r["status"] != "found"),
+            "store_violations": sum(1 for r in store_rows if r["violations"]),
         },
     }
 

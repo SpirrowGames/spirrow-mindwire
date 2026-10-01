@@ -26,6 +26,11 @@
 #       legitimate:  list[str] — the roles this identity may honestly claim.
 #                    kind=machine MUST have legitimate=[] (invariant per docs).
 #                    kind=participant MUST have len(legitimate) >= 1 (invariant).
+#       independence_class:  participant only, optional at load time but REQUIRED to register
+#                    (the registration constructor refuses a participant without one rather
+#                    than guess — msg-1179 §5). A machine MUST NOT carry this field: its value
+#                    is derived from kind by identity/registration.py::build_upsert_identity_args
+#                    so the machine value string lives in one place (msg-1706 §2).
 #       primary_source:  one-line pointer, "path::symbol" or "path::§heading"
 #       reason:      short prose justification, cross-referenced to the doc
 #
@@ -38,6 +43,11 @@ identities:
   - name: naysayer-pr-review
     kind: participant
     legitimate: ["naysayer"]
+    # msg-1704 §4 / §5: the Gemini-tier independent naysayer (Einstein endorsed msg-1705 /
+    # msg-1707). NOTE the forward effect msg-1704 §5 asks every reader to see: once the
+    # magickit reader that treats `independence_class == "independent"` as a naysayer lands
+    # (magickit config.py migration comment), this identity is promoted alongside Einstein.
+    independence_class: independent
     primary_source: "src/spirrow_mindwire/orchestrator.py::PrReviewOrchestrator.post_critique"
     reason: >-
       The `body` argument is the return value of NaysayerPrReviewDriver.review — the
