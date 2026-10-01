@@ -240,14 +240,20 @@ def test_every_script_text_writer_declares_newline() -> None:
         ('m = "r"\nopen(f, m)', True),
         ("for m in modes:\n    open(f, m)", True),
         ("def f(p, mode):\n    p.open(mode)", True),
-        # PR-gate #359 @ b7e4f9f / operator msg-4791: a name that is only READ by a statement
-        # (subscript slice, attribute base, ``case Cls(...)``) must not hide a writer.
+        # The shapes from PR-gate #359 @ b7e4f9f / operator msg-4791 / Einstein msg-4796 broke
+        # the name resolution that existed at b7e4f9f. That resolution is gone (decision C): the
+        # statements before the call are not read at all. These rows are flagged ONLY because the
+        # argument is named ``mode`` (``_says_mode``); they pin that no preceding statement can
+        # change the verdict on the call, not any tracking of reads vs writes.
         ('mode = "w"\nd[mode] = 1\np.open(mode)', True),
         ('mode = "w"\nmode.attr = 1\np.open(mode)', True),
         ('mode = "w"\nmatch v:\n    case mode.X:\n        pass\np.open(mode)', True),
         ('mode = "w"\nmatch v:\n    case mode(x=a):\n        pass\np.open(mode)', True),
-        # Einstein msg-4796: nor may a walrus inside a subscript target
         ('d[(mode := "w")] = 2\np.open(mode)', True),
+        # The same shapes with an unnamed variable are NOT flagged: the binding is not followed
+        # (PR-gate #359 @ 4e9f593 pinned this boundary).
+        ('m = "w"\nd[m] = 1\np.open(m)', False),
+        ('d[(m := "w")] = 2\np.open(m)', False),
         ('p.open("r+")', True),
         # PR-gate #356 bb73652: module / archive opens take (file, mode), not (mode, ...).
         ('gzip.open(path, "rb")', False),
