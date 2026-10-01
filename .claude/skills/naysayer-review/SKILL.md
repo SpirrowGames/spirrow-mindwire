@@ -71,8 +71,12 @@ threads).
    ``verdict は `T-pr-review-<repo>-<n>` の msg-NNN にある（VERDICT: X）``. This is
    not a duplicate of anything step 5 names — it is a pointer, not the chatroom
    post and not the GitHub review — and **copying the critique body there is
-   still forbidden**: an in-family relay of a Tier B judgement is exactly what
-   the independence contract above exists to prevent. Skip it only when the
+   still forbidden**, because it would be a duplicate post: the driver's relay
+   (`_post_design_relay`, `src/spirrow_mindwire/orchestrator.py`) already posts
+   the verdict *and* the critique body into the design thread, and the critique
+   also sits in the ledger and the GitHub review. (This is not an independence
+   rule — the contract above asks for a **verbatim** relay and forbids editing
+   the critique, not copying it.) Skip it only when the
    driver printed a non-empty `relay=` (it already did this for you); a
    `relay=DROPPED` line (exit 2) means it did not, so do it by hand.
 6. If the driver reports no naysayer reply (Lexora/GitHub/chatroom unreachable),
