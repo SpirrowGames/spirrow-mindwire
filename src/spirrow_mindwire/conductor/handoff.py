@@ -881,11 +881,6 @@ def _render_label_definitions(labels: tuple[str, ...]) -> str:
     return ", ".join(parts[:-1]) + ", and " + parts[-1]
 
 
-def _admitted_example(label: str) -> str:
-    """Return ``label`` for a worked example, failing the import if the gate no longer admits it."""
-    return require_admitted(label, where="handoff example")
-
-
 _TIER_C_COUNT_WORD = _count_word(len(TIER_C_LABELS))
 _TIER_C_DEFINITIONS_PROSE = _render_label_definitions(TIER_C_LABELS)
 
@@ -957,7 +952,7 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "code, so that you cannot bypass its objections (the conductor structurally redirects "
         f"such a handoff). Hand to `{HUMAN_TOKEN}` only for a decision that is genuinely Tier-C, "
         "and name the type on the line above your handoff, e.g.:\n\n"
-        f"    TIER-C: {_admitted_example('goal')}\n"
+        f"    TIER-C: {require_admitted('goal', where='handoff example')}\n"
         f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     # D-3 (T-human-terminal-overuse, Bohr msg-2540 §4 D-3 approved by Einstein msg-2539 Obj-3):
@@ -976,7 +971,7 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself. "
         f"When you hand to `{HUMAN_TOKEN}`, name the Tier-C type on the line above your handoff, "
         "e.g.:\n\n"
-        f"    TIER-C: {_admitted_example('merge-protected')}\n"
+        f"    TIER-C: {require_admitted('merge-protected', where='handoff example')}\n"
         f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     Role.NAYSAYER: (
