@@ -47,7 +47,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -106,17 +107,35 @@ class TaskLocks:
 
     One instance per process (:data:`PROCESS_TASK_LOCKS`) so every implementer session in the
     daemon shares it. It does nothing across processes; see the module docstring.
+
+    Entries are reference-counted and evicted when the last holder or waiter leaves, so a
+    long-running daemon does not accumulate one lock per task it ever touched (PR #409 gate
+    advisory). The count is changed only in synchronous code on the event loop, so taking and
+    releasing it cannot interleave with another coroutine.
     """
 
     def __init__(self) -> None:
-        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._locks: dict[tuple[str, str], tuple[asyncio.Lock, int]] = {}
 
-    def lock(self, project_id: str, task_id: str) -> asyncio.Lock:
+    def __len__(self) -> int:
+        return len(self._locks)
+
+    @asynccontextmanager
+    async def hold(self, project_id: str, task_id: str) -> AsyncIterator[None]:
         key = (project_id, task_id)
-        existing = self._locks.get(key)
-        if existing is None:
-            existing = self._locks[key] = asyncio.Lock()
-        return existing
+        lock, users = self._locks.get(key, (None, 0))
+        if lock is None:
+            lock = asyncio.Lock()
+        self._locks[key] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            _, remaining = self._locks[key]
+            if remaining <= 1:
+                del self._locks[key]
+            else:
+                self._locks[key] = (lock, remaining - 1)
 
 
 PROCESS_TASK_LOCKS = TaskLocks()
@@ -163,7 +182,7 @@ class LedgerNotes:
         try:
             task_id = _require(task_id, "task_id")
             text = _require(text, "text")
-            async with self.locks.lock(self.project_id, task_id):
+            async with self.locks.hold(self.project_id, task_id):
                 task, phase = await self._read(task_id)
                 prior = task.get("notes")
                 prior_notes = prior if isinstance(prior, str) else ""

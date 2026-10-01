@@ -178,6 +178,48 @@ async def test_concurrent_appends_to_one_task_are_serialised_and_both_survive() 
     assert mcp.notes["T42"].startswith("base\n\n")
     # Serialised: read, write, read, write — never read, read.
     assert [name for name, _ in mcp.calls] == ["get_task", "update_task"] * 2
+    assert len(locks) == 0  # evicted once the last holder left
+
+
+@pytest.mark.anyio
+async def test_task_lock_is_evicted_only_after_the_last_waiter_leaves() -> None:
+    """PR #409 advisory: no per-task lock outlives its users, and eviction never splits a queue."""
+    locks = TaskLocks()
+    order: list[str] = []
+    release_first = asyncio.Event()
+
+    async def first() -> None:
+        async with locks.hold("p", "T42"):
+            order.append("first-in")
+            await release_first.wait()
+            order.append("first-out")
+
+    async def later(name: str) -> None:
+        async with locks.hold("p", "T42"):
+            order.append(f"{name}-in")
+            await asyncio.sleep(0)
+            order.append(f"{name}-out")
+
+    t1 = asyncio.create_task(first())
+    await asyncio.sleep(0)
+    t2 = asyncio.create_task(later("second"))
+    t3 = asyncio.create_task(later("third"))
+    await asyncio.sleep(0)
+    assert len(locks) == 1
+    release_first.set()
+    await asyncio.gather(t1, t2, t3)
+
+    assert order == ["first-in", "first-out", "second-in", "second-out", "third-in", "third-out"]
+    assert len(locks) == 0
+
+
+@pytest.mark.anyio
+async def test_task_lock_is_evicted_when_the_holder_raises() -> None:
+    locks = TaskLocks()
+    with pytest.raises(RuntimeError):
+        async with locks.hold("p", "T42"):
+            raise RuntimeError("boom")
+    assert len(locks) == 0
 
 
 @pytest.mark.anyio
