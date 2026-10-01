@@ -616,6 +616,212 @@ function Test-HoldForCandidate {
     return (Test-HoldObserved -Control $ownerControl)
 }
 
+# --- bounded probe launcher (T-parked-humans-probe-has-no-timeout, Bohr msg-5414 §1–§2) ----------
+#
+# WHY: every post-processing probe used to be `& uv run python <script>` (some fed via `$payload |`)
+# with NO upper bound on the wait. On 2026-10-01 the parked-humans probe sat at 0 CPU / 0 TCP for
+# 20+ minutes, the wrapper never returned, the scheduled task refused every later start
+# (0x800710E0), and every project's conductor stopped for ~77 minutes — silently. One probe that
+# can wait forever is a silent stop of the whole loop.
+#
+# THE CONTRACT (helper side — process control only):
+#   * The helper knows nothing about the target script's CLI. It takes argv, launches
+#     `uv run python <argv...>` from the repo root, and never writes to the child's stdin: stdin is
+#     redirected and CLOSED immediately after start, so the child and every grandchild inherit an
+#     already-closed pipe instead of the console or this process's stdin.
+#   * Payloads never go through stdin or argv. The CALLER writes structured data to a temp file
+#     (New-ProbeInputFile), passes the path with the target script's own file flag, and removes the
+#     file in `finally` (Remove-ProbeInputFile). argv only ever carries short scalars.
+#   * stdout / stderr are read with ReadToEndAsync so a full pipe cannot deadlock the child.
+#   * On timeout: Kill($true) — the whole tree (uv -> venv trampoline -> python) — then
+#     WaitForExit($KillGraceMs). NEVER the parameterless WaitForExit(): it also waits for the
+#     redirected streams to close, and a surviving grandchild holding the pipe would hang us again.
+#     The stream tasks are abandoned on this path for the same reason.
+#   * Every wait in here is bounded. On the normal path the stream tasks are awaited for at most
+#     $KillGraceMs after the root exited; a grandchild that outlived its parent and keeps the pipe
+#     open is killed and reported, not waited on.
+#
+# Returns @{ ok; timedOut; killConfirmed; code; stdout; stderr; elapsedSec; pid; error }.
+#   ok        $true when the process ran to completion within the bound (any exit code)
+#   timedOut  $true when the bound fired and the tree was killed
+#   error     $null, or a diagnostic for a failed start / unclosed streams / timeout
+# Each caller keeps its own fail-open / fail-closed policy for a non-ok result.
+#
+# Reusable as is by T-silent-stops-need-a-generic-watchdog-and-a-loud-stand-down (msg-5323 §3):
+# this is the inner net (bounded per probe); that thread's watchdog is the outer net.
+$HeadSkipProbeTimeoutSeconds = 120
+$HeadProbeTimeoutSeconds = 120
+$ParkedHumansProbeTimeoutSeconds = 120
+$ControlProbeTimeoutSeconds = 120
+$PredictedResourceProbeTimeoutSeconds = 120
+$GateBootstrapProbeTimeoutSeconds = 120
+$ProbeKillGraceMs = 5000
+$ProbeInputFilePrefix = 'mindwire-probe-'
+$ProbeInputFileMaxAgeMinutes = 60
+# Where probe input files live. %TEMP% in production; tests point it at a private directory so a
+# leaked file is countable.
+$ProbeInputDirectory = [System.IO.Path]::GetTempPath()
+
+function Invoke-BoundedUvProbe {
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [Parameter(Mandatory)][string]$Label,
+        [int]$KillGraceMs = $ProbeKillGraceMs,
+        [string]$WorkingDirectory = $repoRoot,
+        # The command prefix. Production always uses the default; tests substitute a fake probe
+        # launcher (e.g. pwsh -File) so the bound and the tree kill run without uv.
+        [string[]]$Launcher = @('uv', 'run', 'python')
+    )
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Launcher[0]
+    foreach ($a in @($Launcher | Select-Object -Skip 1)) { $psi.ArgumentList.Add([string]$a) }
+    foreach ($a in $Arguments) { $psi.ArgumentList.Add([string]$a) }
+    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    # The streams are decoded as UTF-8 above; have python encode them that way too instead of the
+    # console code page (machine-read JSON is ASCII either way — this keeps log tails legible).
+    $psi.Environment['PYTHONIOENCODING'] = 'utf-8'
+
+    $result = @{
+        ok = $false; timedOut = $false; killConfirmed = $false; code = $null
+        stdout = ''; stderr = ''; elapsedSec = 0.0; pid = $null; error = $null
+    }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $proc = $null
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+    }
+    catch {
+        $result.error = "cannot start $($Launcher[0]): $($_.Exception.Message)"
+        return $result
+    }
+    try {
+        $result.pid = $proc.Id
+        # Closed before anything else runs: nothing in the tree can block on reading stdin.
+        try { $proc.StandardInput.Close() } catch { }
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        if (-not $proc.WaitForExit([int]([TimeSpan]::FromSeconds($TimeoutSeconds).TotalMilliseconds))) {
+            $result.timedOut = $true
+            try { $proc.Kill($true) } catch { }
+            # Bounded on purpose — see the header. The streams are NOT awaited on this path.
+            $result.killConfirmed = [bool]$proc.WaitForExit($KillGraceMs)
+            $sw.Stop()
+            $result.elapsedSec = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+            if (-not $result.killConfirmed) {
+                Write-Log "KILL-UNCONFIRMED pid=$($result.pid) label=$Label (root still alive ${KillGraceMs}ms after Kill(entireProcessTree))"
+            }
+            Write-Log "TIMEOUT label=$Label elapsed=$($result.elapsedSec)s pid=$($result.pid) (bound ${TimeoutSeconds}s, process tree killed)"
+            $result.error = "timed out after ${TimeoutSeconds}s (process tree killed)"
+            return $result
+        }
+
+        $result.code = $proc.ExitCode
+        $streamsDone = $false
+        try { $streamsDone = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask), $KillGraceMs) }
+        catch { $streamsDone = $false }
+        $sw.Stop()
+        $result.elapsedSec = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+        if (-not $streamsDone) {
+            # The root exited but something it spawned still holds the pipe. Kill what is left of
+            # the tree and report — never wait on it.
+            try { $proc.Kill($true) } catch { }
+            Write-Log "STREAMS-UNCLOSED label=$Label pid=$($result.pid) exit=$($result.code) (output pipe still open ${KillGraceMs}ms after exit)"
+            $result.error = "process exited $($result.code) but its output streams did not close within ${KillGraceMs}ms"
+            return $result
+        }
+        $result.stdout = $stdoutTask.Result
+        $result.stderr = $stderrTask.Result
+        $result.ok = $true
+        return $result
+    }
+    finally {
+        if ($proc) {
+            try { if (-not $proc.HasExited) { $proc.Kill($true) } } catch { }
+            $proc.Dispose()
+        }
+    }
+}
+
+# Output lines of a bounded probe, stdout first then stderr — the same material the old `2>&1`
+# capture held, used for log / diagnostic tails. JSON is parsed from stdout only.
+function Get-ProbeOutputLines {
+    param([hashtable]$Result)
+    $lines = @()
+    foreach ($s in @($Result.stdout, $Result.stderr)) {
+        if ($s) { $lines += @($s -split "`r?`n" | Where-Object { $_ -ne '' }) }
+    }
+    return , $lines
+}
+
+function Get-ProbeJsonLine {
+    param([hashtable]$Result)
+    if (-not $Result.stdout) { return $null }
+    return ($Result.stdout -split "`r?`n" | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+}
+
+# Write a probe payload to %TEMP%\mindwire-probe-<label>-<guid>.json (UTF-8, no BOM) and return
+# the path. The caller owns the file and MUST hand it to Remove-ProbeInputFile in `finally`.
+function New-ProbeInputFile {
+    param(
+        [Parameter(Mandatory)][string]$Json,
+        [Parameter(Mandatory)][string]$Label,
+        [string]$Directory = $ProbeInputDirectory
+    )
+    $safe = ($Label -replace '[^A-Za-z0-9-]', '-')
+    $name = '{0}{1}-{2}.json' -f $ProbeInputFilePrefix, $safe, [guid]::NewGuid().ToString('N')
+    $path = Join-Path $Directory $name
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($path, $Json, $utf8NoBom)
+    return $path
+}
+
+# Remove a probe input file: up to $Attempts tries $DelayMs apart (a just-killed child may still
+# hold the handle for a moment). A final failure is LOGGED — never thrown, never silenced. The
+# stale-file sweep at the next wrapper start is the backstop.
+function Remove-ProbeInputFile {
+    param([string]$Path, [int]$Attempts = 3, [int]$DelayMs = 200)
+    if ([string]::IsNullOrEmpty($Path)) { return }
+    $lastError = $null
+    for ($i = 1; $i -le $Attempts; $i++) {
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            if ($i -lt $Attempts) { Start-Sleep -Milliseconds $DelayMs }
+        }
+    }
+    Write-Log "WARN probe temp file not removed: $Path ($lastError)"
+}
+
+# Startup backstop: delete probe input files older than $MaxAgeMinutes. Every such file finishes
+# its job in seconds, so an hour-old one is certainly debris. One that cannot be deleted (still
+# locked) is left for the next run; the failure is logged, not thrown.
+function Remove-StaleProbeInputFiles {
+    param(
+        [string]$Directory = $ProbeInputDirectory,
+        [int]$MaxAgeMinutes = $ProbeInputFileMaxAgeMinutes
+    )
+    $cutoff = (Get-Date).ToUniversalTime().AddMinutes(-$MaxAgeMinutes)
+    $stale = @(Get-ChildItem -LiteralPath $Directory -Filter "$ProbeInputFilePrefix*.json" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTimeUtc -lt $cutoff })
+    foreach ($f in $stale) {
+        try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop }
+        catch { Write-Log "WARN stale probe temp file not removed: $($f.FullName) ($($_.Exception.Message)) — next run retries" }
+    }
+}
+
 # --- head-skip nomination predicate wiring (T-sweep-intake-and-quarantine-stalls) ---------------
 #
 # The skip rule now lives inside scripts/head_skip_decide.py (module: head_skip.py). The wrapper's
@@ -677,30 +883,34 @@ function Invoke-HeadSkipDecide {
     }
     $payload = ConvertTo-Json -InputObject @($items) -Depth 4 -Compress
 
+    # Same invocation path as every other probe (Invoke-BoundedUvProbe): `uv run python` from the
+    # repo root so the module import resolves against this checkout. Reusing the same interpreter
+    # path is deliberate (msg-1430 §W-3 tail): there is never a version where `decide` and
+    # `commit-launch` disagree on runtime. The batch goes through a temp file (`--candidates`),
+    # never stdin (T-parked-humans-probe-has-no-timeout). A timeout is a SYSTEMIC failure here
+    # like any other: ok=$false, and the caller fails closed (W-3 layer 2).
+    $tmp = $null
     try {
-        Push-Location $repoRoot
-        try {
-            # Same invocation pattern as Invoke-HeadProbe / Invoke-ParkedHumansProbe: run under
-            # `uv run python` from the repo root so the module import resolves against this
-            # checkout. Reusing the same interpreter path is deliberate (msg-1430 §W-3 tail): if
-            # a future refactor needs a different python it needs to touch one place, not two,
-            # so there is never a version where `decide` and `commit-launch` disagree on runtime.
-            $raw = $payload | & uv run python $decideScript `
-                --project $Project --state-file $StateFilePath --mode $Mode 2>&1
-            $code = $LASTEXITCODE
-        }
-        finally { Pop-Location }
+        $tmp = New-ProbeInputFile -Json $payload -Label 'head-skip-decide'
+        $r = Invoke-BoundedUvProbe -Label 'head-skip-decide' -TimeoutSeconds $HeadSkipProbeTimeoutSeconds `
+            -Arguments @($decideScript, '--project', $Project, '--state-file', $StateFilePath, '--mode', $Mode, '--candidates', $tmp)
     }
     catch {
         return @{ ok = $false; verdicts = @{}; error = "head_skip decide invocation failed: $($_.Exception.Message)" }
     }
+    finally { Remove-ProbeInputFile -Path $tmp }
 
+    if (-not $r.ok) {
+        return @{ ok = $false; verdicts = @{}; error = "head_skip decide invocation failed: $($r.error)" }
+    }
+    $code = $r.code
+    $raw = Get-ProbeOutputLines -Result $r
     if ($code -ne 0) {
         $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
         return @{ ok = $false; verdicts = @{}; error = "head_skip decide exited ${code}: $tail" }
     }
 
-    $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+    $json = Get-ProbeJsonLine -Result $r
     if (-not $json) {
         return @{ ok = $false; verdicts = @{}; error = "head_skip decide produced no JSON on stdout" }
     }
@@ -722,7 +932,7 @@ function Invoke-HeadSkipDecide {
     return @{ ok = $true; verdicts = $verdictMap; error = $null }
 }
 
-# Invoke `head_skip_decide.py --mode commit-launch --payload <payload>` for one thread. Returns:
+# Invoke `head_skip_decide.py --mode commit-launch --payload-file <tmp>` for one thread. Returns:
 #   @{ ok = $true / $false; error = $null / diagnostic; launches_same_head = <int>; head_msg_id = <string> }
 # `launches_same_head` / `head_msg_id` are read back from the record the CLI just committed and are
 # the T42 stall watchdog's input to the conductor (src/spirrow_mindwire/conductor/stall.py). An
@@ -745,18 +955,25 @@ function Invoke-HeadSkipCommitLaunch {
     }
     $payloadJson = ConvertTo-Json -InputObject $Payload -Depth 6 -Compress
 
+    # `--payload-file`, never inline `--payload`: a JSON string in argv passes through three
+    # quoting layers (pwsh -> uv -> venv trampoline -> python) that are not guaranteed to agree
+    # (T-parked-humans-probe-has-no-timeout, Bohr msg-5410). Fail-closed on timeout, as on any
+    # other systemic failure.
+    $tmp = $null
     try {
-        Push-Location $repoRoot
-        try {
-            $raw = & uv run python $decideScript `
-                --state-file $StateFilePath --mode commit-launch --payload $payloadJson 2>&1
-            $code = $LASTEXITCODE
-        }
-        finally { Pop-Location }
+        $tmp = New-ProbeInputFile -Json $payloadJson -Label 'head-skip-commit-launch'
+        $r = Invoke-BoundedUvProbe -Label 'head-skip-commit-launch' -TimeoutSeconds $HeadSkipProbeTimeoutSeconds `
+            -Arguments @($decideScript, '--state-file', $StateFilePath, '--mode', 'commit-launch', '--payload-file', $tmp)
     }
     catch {
         return @{ ok = $false; error = "head_skip commit-launch invocation failed: $($_.Exception.Message)" }
     }
+    finally { Remove-ProbeInputFile -Path $tmp }
+    if (-not $r.ok) {
+        return @{ ok = $false; error = "head_skip commit-launch invocation failed: $($r.error)" }
+    }
+    $code = $r.code
+    $raw = Get-ProbeOutputLines -Result $r
     if ($code -ne 0) {
         $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
         return @{ ok = $false; error = "head_skip commit-launch exited ${code}: $tail" }
@@ -786,7 +1003,7 @@ function Invoke-HeadSkipCommitLaunch {
     return @{ ok = $true; error = $null; launches_same_head = $launchesSameHead; head_msg_id = $launchHeadMsgId; warning = $readWarning }
 }
 
-# Invoke `head_skip_decide.py --mode commit-terminal --payload <payload>` for one thread.
+# Invoke `head_skip_decide.py --mode commit-terminal --payload-file <tmp>` for one thread.
 # Returns: @{ ok = $true / $false; error = $null / diagnostic }
 #
 # Called AFTER the conductor session returns — the mirror of commit-launch, and deliberately the
@@ -823,18 +1040,23 @@ function Invoke-HeadSkipCommitTerminal {
     }
     $payloadJson = ConvertTo-Json -InputObject $payload -Depth 4 -Compress
 
+    # `--payload-file`, never inline `--payload` (see Invoke-HeadSkipCommitLaunch). Fail-open on
+    # timeout like any other failure here: ok=$false, the caller logs it.
+    $tmp = $null
     try {
-        Push-Location $repoRoot
-        try {
-            $raw = & uv run python $decideScript `
-                --state-file $StateFilePath --mode commit-terminal --payload $payloadJson 2>&1
-            $code = $LASTEXITCODE
-        }
-        finally { Pop-Location }
+        $tmp = New-ProbeInputFile -Json $payloadJson -Label 'head-skip-commit-terminal'
+        $r = Invoke-BoundedUvProbe -Label 'head-skip-commit-terminal' -TimeoutSeconds $HeadSkipProbeTimeoutSeconds `
+            -Arguments @($decideScript, '--state-file', $StateFilePath, '--mode', 'commit-terminal', '--payload-file', $tmp)
     }
     catch {
         return @{ ok = $false; error = "head_skip commit-terminal invocation failed: $($_.Exception.Message)" }
     }
+    finally { Remove-ProbeInputFile -Path $tmp }
+    if (-not $r.ok) {
+        return @{ ok = $false; error = "head_skip commit-terminal invocation failed: $($r.error)" }
+    }
+    $code = $r.code
+    $raw = Get-ProbeOutputLines -Result $r
     if ($code -ne 0) {
         $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
         return @{ ok = $false; error = "head_skip commit-terminal exited ${code}: $tail" }
@@ -3242,15 +3464,20 @@ function Invoke-HeadProbe {
         return $null
     }
     try {
-        Push-Location $repoRoot
-        try { $raw = & uv run python $probe --project $Project 2>&1; $code = $LASTEXITCODE }
-        finally { Pop-Location }
+        $r = Invoke-BoundedUvProbe -Label "head-probe-$Project" -TimeoutSeconds $HeadProbeTimeoutSeconds `
+            -Arguments @($probe, '--project', $Project)
+        if (-not $r.ok) {
+            Write-Log "head probe did not complete ($($r.error)) — failing open"
+            return $null
+        }
+        $code = $r.code
+        $raw = Get-ProbeOutputLines -Result $r
 
         if ($code -ne 0) {
             Write-Log "head probe exited $code — failing open. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
             return $null
         }
-        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        $json = Get-ProbeJsonLine -Result $r
         if (-not $json) { Write-Log "head probe produced no JSON — failing open"; return $null }
 
         $obj = $json | ConvertFrom-Json
@@ -3311,20 +3538,34 @@ function Invoke-ParkedHumansProbe {
     }
     $payload = @{ candidates = $items } | ConvertTo-Json -Depth 5 -Compress
 
+    # The candidates go through a temp file (`--input`), never stdin: the 2026-10-01 stall was
+    # this exact call sitting at 0 CPU for 20+ minutes with no bound (T-parked-humans-probe-has-
+    # no-timeout). Same `uv run` from the repo root as every other probe (Invoke-BoundedUvProbe).
+    $tmp = $null
     try {
-        Push-Location $repoRoot
-        try {
-            # Same invocation pattern as Invoke-HeadProbe: run under `uv run` from the repo root
-            # so the module import resolves against this checkout's environment.
-            $raw = $payload | & uv run python $probe --project $Project 2>&1
-            $code = $LASTEXITCODE
-        }
-        finally { Pop-Location }
+        $tmp = New-ProbeInputFile -Json $payload -Label "parked-humans-$Project"
+        $r = Invoke-BoundedUvProbe -Label "parked-humans-$Project" -TimeoutSeconds $ParkedHumansProbeTimeoutSeconds `
+            -Arguments @($probe, '--project', $Project, '--input', $tmp)
     }
     catch {
         Write-Log "parked-humans probe [$Project] threw ($($_.Exception.Message)) — treating as no-parked (fail-closed)"
         return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = "invocation failed: $($_.Exception.Message)" }); polled = 0 }
     }
+    finally { Remove-ProbeInputFile -Path $tmp }
+
+    if ($r.timedOut) {
+        # Fail-closed (no parked) like every whole-poll failure, but NOT silent: the error row
+        # lands in the digest's fetch-error section (I-2). Before this, a hung probe produced
+        # nothing at all until an operator killed it by hand.
+        Write-Log "parked-humans probe [$Project] timed out after $($r.elapsedSec)s (bound ${ParkedHumansProbeTimeoutSeconds}s, pid=$($r.pid), killConfirmed=$($r.killConfirmed)) — treating as no-parked"
+        return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = "timed out after ${ParkedHumansProbeTimeoutSeconds}s (process tree killed)" }); polled = 0 }
+    }
+    if (-not $r.ok) {
+        Write-Log "parked-humans probe [$Project] did not complete ($($r.error)) — treating as no-parked (fail-closed)"
+        return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = "invocation failed: $($r.error)" }); polled = 0 }
+    }
+    $code = $r.code
+    $raw = Get-ProbeOutputLines -Result $r
 
     if ($code -ne 0) {
         $tail = ($raw | ForEach-Object { "$_" }) -join ' / '
@@ -3332,7 +3573,7 @@ function Invoke-ParkedHumansProbe {
         return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = "exit=${code}: $tail" }); polled = 0 }
     }
 
-    $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+    $json = Get-ProbeJsonLine -Result $r
     if (-not $json) {
         Write-Log "parked-humans probe [$Project] produced no JSON — treating as no-parked"
         return @{ parked = @(); errors = @(@{ thread_id = '__probe__'; reason = 'no JSON on stdout' }); polled = 0 }
@@ -3390,15 +3631,20 @@ function Invoke-ControlProbe {
         return $null
     }
     try {
-        Push-Location $repoRoot
-        try { $raw = & uv run python $probe --project $Project 2>&1; $code = $LASTEXITCODE }
-        finally { Pop-Location }
+        $r = Invoke-BoundedUvProbe -Label "control-probe-$Project" -TimeoutSeconds $ControlProbeTimeoutSeconds `
+            -Arguments @($probe, '--project', $Project)
+        if (-not $r.ok) {
+            Write-Log "control probe did not complete ($($r.error)) — failing open (the conductor still enforces)"
+            return $null
+        }
+        $code = $r.code
+        $raw = Get-ProbeOutputLines -Result $r
 
         if ($code -ne 0) {
             Write-Log "control probe exited $code — failing open. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
             return $null
         }
-        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        $json = Get-ProbeJsonLine -Result $r
         if (-not $json) { Write-Log "control probe produced no JSON — failing open"; return $null }
         return ($json | ConvertFrom-Json)
     }
@@ -3436,22 +3682,28 @@ function Invoke-PredictedResourceProbe {
     }
 
     # Compact JSON with `Depth 3` is enough for `{ "repo_dirs": [str, ...] }` and keeps the
-    # single-line stdin small so we can see it in a log if we need to.
+    # single-line payload small so we can see it in a log if we need to. It goes through a temp
+    # file (`--input`), not stdin and not one `--repo-dir` per entry in argv
+    # (T-parked-humans-probe-has-no-timeout, Bohr msg-5410 / msg-5414 §3).
     $payload = @{ repo_dirs = $RepoDirs } | ConvertTo-Json -Depth 3 -Compress
 
+    $tmp = $null
     try {
-        Push-Location $repoRoot
-        try {
-            $raw = $payload | & uv run python $probe --stdin-json 2>&1
-            $code = $LASTEXITCODE
+        $tmp = New-ProbeInputFile -Json $payload -Label 'predicted-resource'
+        $r = Invoke-BoundedUvProbe -Label 'predicted-resource' -TimeoutSeconds $PredictedResourceProbeTimeoutSeconds `
+            -Arguments @($probe, '--input', $tmp)
+        if (-not $r.ok) {
+            Write-Log "predicted-resource probe did not complete ($($r.error)) — failing open"
+            return $null
         }
-        finally { Pop-Location }
+        $code = $r.code
+        $raw = Get-ProbeOutputLines -Result $r
 
         if ($code -ne 0) {
             Write-Log "predicted-resource probe exited $code — failing open. Output: $(($raw | ForEach-Object { "$_" }) -join ' / ')"
             return $null
         }
-        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        $json = Get-ProbeJsonLine -Result $r
         if (-not $json) {
             Write-Log "predicted-resource probe produced no JSON — failing open"
             return $null
@@ -3462,6 +3714,7 @@ function Invoke-PredictedResourceProbe {
         Write-Log "predicted-resource probe failed ($($_.Exception.Message)) — failing open"
         return $null
     }
+    finally { Remove-ProbeInputFile -Path $tmp }
 
     $map = @{}
     if ($null -eq $obj.resolutions) {
@@ -3592,14 +3845,15 @@ function Invoke-GateBootstrapTick {
         return $null
     }
     try {
-        Push-Location $repoRoot
-        try {
-            $raw = & uv run python $probe --project $Project --repo-dir $RepoDir 2>&1
-            $code = $LASTEXITCODE
+        $r = Invoke-BoundedUvProbe -Label "gate-bootstrap-$Project" -TimeoutSeconds $GateBootstrapProbeTimeoutSeconds `
+            -Arguments @($probe, '--project', $Project, '--repo-dir', $RepoDir)
+        if (-not $r.ok) {
+            Write-Log "gate-bootstrap [$Project]: probe did not complete ($($r.error)) — sweep continues (fail-open)"
+            return $null
         }
-        finally { Pop-Location }
+        $code = $r.code
 
-        $json = $raw | ForEach-Object { "$_" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
+        $json = Get-ProbeJsonLine -Result $r
         if (-not $json) {
             Write-Log "gate-bootstrap [$Project]: no JSON on stdout (exit=$code) — failing open"
             return $null
@@ -3670,6 +3924,10 @@ try {
                           "ループは現在チェックアウトされているコードで動き続けます（古い可能性があります）。")
         }
     }
+
+    # Backstop for probe input files a previous run could not remove (T-parked-humans-probe-has-
+    # no-timeout, Bohr msg-5414 §2). Before the sweep, so it runs every tick that sweeps.
+    Remove-StaleProbeInputFiles
 
     $candidates = Get-SweepCandidates -Path $sweepConfigPath
     Write-Log "sweep list ($($candidates.Count) candidates from $sweepConfigPath): $(($candidates | ForEach-Object { $_.key }) -join ', ')"
