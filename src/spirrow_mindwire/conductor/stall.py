@@ -46,6 +46,7 @@ from datetime import UTC, datetime
 from ..ulid_util import new_ulid
 from ..value_objects import Event
 from .handoff import HUMAN_TOKEN
+from .stop_marker import render_stop_marker
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,7 @@ def render_stalled_notice(event: Event) -> str:
         f"次にやること: sweep / conductor のログで、この head に対する直前の起動が"
         f"何も投稿せずに終わった理由を確認してください。直したら、進め先の `NEXT:` を"
         f"書いてください。head が動くまでループは再開しません。\n\n"
+        f"{render_stop_marker(event)}\n\n"
         f"NEXT: {HUMAN_TOKEN}"
     )
 
