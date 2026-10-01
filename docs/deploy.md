@@ -484,8 +484,8 @@ the project's loop control state (`state/heads.json`, entry per thread). At an u
 naysayer→implementer handoff stops at the human gate under `hold` / `supervised` but dispatches
 the implementer under `run` (carve-out ③ — since the D-4' guardrails, only when the naysayer's
 proceed carries `TIER-C-CHECK: none` on the line above its `NEXT:`, no `TIER-C:` line has been
-posted since the human last spoke, and the Tier-C Decider clears the proceed; with the Decider off
-(`backend=off`) a `run` project stops at the human gate for code, like `supervised`).
+posted since the human last spoke, and the Tier-C Decider has not vetoed the proceed — G3 is a
+veto, so with the Decider off (`backend=off`), undecided or failing, G1 and G2 alone decide).
 
 That head-equality predicate has been retired (T-sweep-intake-and-quarantine-stalls, Bohr
 msg-1428〜msg-1432). Measured 2026-08-11, it burned inferences on a `T-track-b-seam-octree-

@@ -414,9 +414,10 @@ class DeciderLexoraAdapter:
         """D-4' G3: evaluate a naysayer's proceed handoff (``NEXT: <implementer>``).
 
         ``None`` iff the Decider was not called: mode ``off``, or no tierc-v2 rules (v1 has no
-        proceed variant). The caller treats ``None`` — like every non-``LIKELY_NOT`` result — as
-        "not cleared", so carve-out ③ stays closed (fail-closed). Unlike :meth:`evaluate` this
-        does NOT require ``parsed_next == human``: the proceed turn is exactly the one that isn't.
+        proceed variant). G3 is a veto (msg-5219): the caller treats ``None`` — like every result
+        that is not an actionable tierc-v2 ``CONFIRMED`` — as "no veto", and G1 / G2 decide.
+        Unlike :meth:`evaluate` this does NOT require ``parsed_next == human``: the proceed turn
+        is exactly the one that isn't.
         """
         if self._tierc_mode == "off" or self._rules is None:
             return None

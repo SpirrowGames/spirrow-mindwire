@@ -8,6 +8,7 @@ transport (only the chatroom + models are faked) to prove the production round-t
 from __future__ import annotations
 
 import dataclasses
+import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -236,11 +237,11 @@ def _conductor(
 
 
 class _ClearingDecider:
-    """A Decider that clears every naysayer proceed (G3 ``LIKELY_NOT``) and counts the calls.
+    """A Decider that never vetoes a naysayer proceed (G3 ``LIKELY_NOT``) and counts the calls.
 
-    Carve-out ③ needs an affirmative Decider clearance since D-4' G3, so the tests below that
-    exercise the pre-D-4' ③ semantics wire this in and hold G3 on its open side. The G3 rows
-    themselves live in ``test_conductor_d4_guardrails.py``.
+    Since msg-5219 G3 is a veto, so carve-out ③ would also open with no Decider at all; the tests
+    below that exercise the pre-D-4' ③ semantics still wire this in so they can count the
+    Decider calls. The G3 rows themselves are in the D-4' block of this file.
     """
 
     tierc_mode = "shadow"
@@ -1353,7 +1354,9 @@ async def test_the_stamp_gate_is_noise_reduction_not_authentication() -> None:
 # D-4' guardrails on carve-out ③ (T-pr-2b-3-human-identity-delegate; Bohr msg-4856 §3 / msg-4858,
 # naysayer msg-4857 / msg-4859, Takahito "B" decide). G1: a Tier-C declared since the human last
 # spoke closes ③ (latch; only a human message resets). G2: the proceed must carry
-# ``TIER-C-CHECK: none``. G3: the Decider must clear the proceed (off ⇒ closed).
+# ``TIER-C-CHECK: none``. G3 (since Takahito's msg-5219 "a" decide, Bohr msg-5227 / msg-5229):
+# a VETO — the Decider closes ③ only on an actionable "ask the human" (tierc-v2 CONFIRMED); off,
+# no verdict, error, grey zone and LIKELY_NOT leave G1 / G2 to decide; a missing prefetch closes.
 # Scenarios 1-4 are msg-4858 §4 verbatim.
 # --------------------------------------------------------------------------- #
 
@@ -1453,20 +1456,22 @@ async def test_d4_g2_proceed_without_the_check_line_stops_at_the_human() -> None
 
 
 @pytest.mark.anyio
-async def test_d4_g3_no_decider_means_run_behaves_as_supervised_for_code() -> None:
-    # backend=off (the production state today): every other guard open, still no code.
+async def test_d4_g3_no_decider_lets_g1_g2_decide() -> None:
+    # msg-5227 §3 test 1 — the 13 redirects of msg-5219 reproduced: backend=off, run, attested
+    # naysayer, ``TIER-C-CHECK: none`` → the implementer is dispatched (G3 is a veto, not a gate).
     mcp = _FakeChatroomMcp()
     mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
     disp = _design_to_code_dispatcher(mcp)
     outcome = await _conductor(mcp, disp, control=_FakeControl(ControlState.RUN)).run()
-    assert [role for role, _ in disp.dispatches] == [Role.PROPOSER, Role.NAYSAYER]
-    assert outcome.stop_reason is StopReason.HUMAN
+    assert [role for role, _ in disp.dispatches] == [Role.PROPOSER, Role.NAYSAYER, Role.IMPLEMENTER]
+    assert outcome.stop_reason is StopReason.SETTLED
 
 
 class _VerdictDecider(_ClearingDecider):
-    def __init__(self, kind: TierCVerdictKind | None) -> None:
+    def __init__(self, kind: TierCVerdictKind | None, ask_score: float = 0.5) -> None:
         super().__init__()
         self._kind = kind
+        self._ask_score = ask_score
 
     async def clear_proceed(self, state: Any) -> Any:
         self.proceed_calls += 1
@@ -1477,19 +1482,24 @@ class _VerdictDecider(_ClearingDecider):
             decision_id="d-2",
             provider="stub",
             raw_answers=None,
-            verdict=TierCV2Verdict(kind=self._kind, ask_score=0.5),
+            verdict=TierCV2Verdict(kind=self._kind, ask_score=self._ask_score),
             policy="mindwire.conductor.proceed",
         )
 
 
+class _RaisingDecider(_ClearingDecider):
+    async def clear_proceed(self, state: Any) -> Any:
+        self.proceed_calls += 1
+        raise RuntimeError("decider down")
+
+
 @pytest.mark.anyio
-@pytest.mark.parametrize("kind", [TierCVerdictKind.CONFIRMED, TierCVerdictKind.UNSURE, None])
-async def test_d4_g3_anything_but_likely_not_stops_at_the_human(
-    kind: TierCVerdictKind | None,
-) -> None:
+async def test_d4_g3_confirmed_vetoes_and_the_notice_says_so() -> None:
+    # msg-5227 §3 test 2 / R4: CONFIRMED (p >= 0.60) closes ③ even with G1 / G2 open, and the
+    # guard-(i) write-back names the Jev veto with its score.
     mcp = _FakeChatroomMcp()
     mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
-    decider = _VerdictDecider(kind)
+    decider = _VerdictDecider(TierCVerdictKind.CONFIRMED, ask_score=0.6)
     disp = _design_to_code_dispatcher(mcp)
     outcome = await _conductor(
         mcp, disp, control=_FakeControl(ControlState.RUN), decider=decider
@@ -1497,6 +1507,104 @@ async def test_d4_g3_anything_but_likely_not_stops_at_the_human(
     assert Role.IMPLEMENTER not in [role for role, _ in disp.dispatches]
     assert outcome.stop_reason is StopReason.HUMAN
     assert decider.proceed_calls == 1
+    relays = [m["content"] for m in mcp._messages if m["author"] == CONDUCTOR_RELAY_AUTHOR]
+    assert any("Jev が人に聞くべきと判定 (p=0.60)" in body for body in relays), relays
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "decider",
+    [
+        _VerdictDecider(TierCVerdictKind.UNSURE, ask_score=0.5),
+        _VerdictDecider(TierCVerdictKind.LIKELY_NOT, ask_score=0.1),
+        _VerdictDecider(None),
+        _RaisingDecider(),
+    ],
+    ids=["unsure", "likely_not", "not_called", "raises"],
+)
+async def test_d4_g3_no_actionable_ask_does_not_veto(decider: _ClearingDecider) -> None:
+    # msg-5227 §3 test 3: grey zone / LIKELY_NOT / no verdict / error → G3 stays open.
+    decider.proceed_calls = 0
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
+    disp = _design_to_code_dispatcher(mcp)
+    outcome = await _conductor(
+        mcp, disp, control=_FakeControl(ControlState.RUN), decider=decider
+    ).run()
+    assert Role.IMPLEMENTER in [role for role, _ in disp.dispatches]
+    assert outcome.stop_reason is StopReason.SETTLED
+    assert decider.proceed_calls == 1
+
+
+@pytest.mark.anyio
+async def test_d4_g1_g2_close_before_a_vetoing_decider_is_asked() -> None:
+    # msg-5227 §3 test 4: a closed G2 closes ③ whatever the Decider would say, and it is not asked.
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="human", content="kickoff\n\nNEXT: Bohr")
+    decider = _VerdictDecider(TierCVerdictKind.LIKELY_NOT, ask_score=0.1)
+    disp = _design_to_code_dispatcher(
+        mcp, naysayer_reply=_attested("sound, build it\n\nNEXT: Heisenberg")
+    )
+    outcome = await _conductor(
+        mcp, disp, control=_FakeControl(ControlState.RUN), decider=decider
+    ).run()
+    assert Role.IMPLEMENTER not in [role for role, _ in disp.dispatches]
+    assert outcome.stop_reason is StopReason.HUMAN
+    assert decider.proceed_calls == 0
+
+
+def _proceed_thread() -> tuple[list[dict[str, Any]], Any]:
+    from spirrow_mindwire.conductor.handoff import resolve_handoff
+
+    proceed = _attested("sound, build it\n\nTIER-C-CHECK: none\nNEXT: Heisenberg")
+    messages = [
+        {"msg_id": "m1", "author": "human", "content": "kickoff\n\nNEXT: Bohr"},
+        {"msg_id": "m2", "author": "Bohr", "content": "design\n\nNEXT: Einstein"},
+        {"msg_id": "m3", "author": "Einstein", "content": proceed},
+    ]
+    return messages, resolve_handoff(proceed, _ROSTER)
+
+
+def _run_conductor(decider: Any = None) -> Conductor:
+    mcp = _FakeChatroomMcp()
+    conductor = _conductor(mcp, _ScriptedDispatcher(mcp, {}), decider=decider)
+    conductor._control_state = ControlState.RUN
+    return conductor
+
+
+def test_d4_g3_route_without_prefetch_closes(caplog: pytest.LogCaptureFixture) -> None:
+    # msg-5229 R3' test 6: no prefetch (cache empty) → the conductor cannot show the Decider was
+    # consulted → REDIRECT with an error log, even though G1 / G2 are open.
+    messages, handoff = _proceed_thread()
+    conductor = _run_conductor()
+    with caplog.at_level(logging.ERROR, logger="spirrow_mindwire.conductor.core"):
+        route = conductor._route(handoff, messages)
+    assert route.target_role is not Role.IMPLEMENTER
+    assert any("G3 prefetch missing for head=m3" in r.getMessage() for r in caplog.records)
+    assert conductor._g3_close_reason == "prefetch-missing"
+
+
+@pytest.mark.anyio
+async def test_d4_g3_prefetch_for_another_head_closes() -> None:
+    # msg-5229 R3' test 7: a cache entry for a different head is not this head's consult.
+    messages, handoff = _proceed_thread()
+    conductor = _run_conductor()
+    await conductor._prefetch_proceed_veto(handoff, messages, 0)
+    assert conductor._proceed_veto == ("m3", False, None)
+    other = [*messages[:-1], {**messages[-1], "msg_id": "m4"}]
+    route = conductor._route(handoff, other)
+    assert route.target_role is not Role.IMPLEMENTER
+
+
+@pytest.mark.anyio
+async def test_d4_g3_off_prefetch_then_route_honours() -> None:
+    # msg-5229 R3' test 8: backend=off still writes an entry (not vetoed) → HONOR via the cache.
+    messages, handoff = _proceed_thread()
+    conductor = _run_conductor()
+    await conductor._prefetch_proceed_veto(handoff, messages, 0)
+    route = conductor._route(handoff, messages)
+    assert route.target_role is Role.IMPLEMENTER
+    assert conductor._g3_close_reason is None
 
 
 @pytest.mark.anyio

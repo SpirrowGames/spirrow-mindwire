@@ -1,7 +1,9 @@
-"""D-4' guardrails on carve-out ③ — predicate, parsers and the Decider's proceed clearance.
+"""D-4' guardrails on carve-out ③ — predicate, parsers and the Decider's proceed veto.
 
 Spec (thread T-pr-2b-3-human-identity-delegate): Bohr msg-4856 §3 (G1 Tier-C-declared segment
-closes ③, G2 ``TIER-C-CHECK: none`` required on the naysayer's proceed, G3 Decider clearance),
+closes ③, G2 ``TIER-C-CHECK: none`` required on the naysayer's proceed, G3 Decider — originally a
+clearance, since Takahito's msg-5219 "a" decide a VETO: Bohr msg-5227 R1-R4 / msg-5229 R3',
+endorsed by Einstein msg-5228 / msg-5230),
 msg-4858 §2 (G1 segment resets ONLY on a human-authored message, latches, no merge reset;
 §4 the four pinned scenarios — those drive the conductor and live in ``test_conductor_core.py``),
 endorsed by the naysayer in msg-4857 / msg-4859; Takahito's "B" decide selects G1+G2+G3 and
@@ -27,7 +29,7 @@ from spirrow_mindwire.conductor.handoff import (
     declares_no_tier_c,
     declares_tier_c,
 )
-from spirrow_mindwire.decider.hook import ThreadMessage, proceed_cleared, run_proceed_clearance
+from spirrow_mindwire.decider.hook import ThreadMessage, proceed_vetoed, run_proceed_veto
 from spirrow_mindwire.decider.questions import (
     SHOULD_ASK_HUMAN_KEY,
     TIERC_V2_PROCEED_QUESTIONS_VERSION,
@@ -37,7 +39,12 @@ from spirrow_mindwire.decider.questions import (
 )
 from spirrow_mindwire.decider.result import DecisionOutcome, DecisionResult
 from spirrow_mindwire.decider.state import DecisionState, SimpleTurn, state_builder
-from spirrow_mindwire.decider.verdict import TierCV2Verdict, TierCVerdictKind
+from spirrow_mindwire.decider.verdict import (
+    TierCScope,
+    TierCV2Verdict,
+    TierCVerdict,
+    TierCVerdictKind,
+)
 from spirrow_mindwire.decider.wire import POLICY_LIVE_PROCEED, build_decide_request
 from spirrow_mindwire.lexora.client import LexoraTimeoutError
 from spirrow_mindwire.routing import (
@@ -69,13 +76,13 @@ def _guard(
     attested: bool = True,
     declared: bool = False,
     checked: bool = True,
-    cleared: bool = True,
+    vetoed: bool = False,
 ) -> tuple[GuardIVerdict, dict[str, _Thunk]]:
     thunks = {
         "attest": _Thunk(attested),
         "declared": _Thunk(declared),
         "checked": _Thunk(checked),
-        "cleared": _Thunk(cleared),
+        "vetoed": _Thunk(vetoed),
     }
     verdict = guard_proposer_to_implementer(
         author_is_human=human,
@@ -84,7 +91,7 @@ def _guard(
         message_is_attested=thunks["attest"],
         segment_declares_tier_c=thunks["declared"],
         naysayer_declared_no_tier_c=thunks["checked"],
-        decider_clears=thunks["cleared"],
+        decider_vetoes=thunks["vetoed"],
     )
     return verdict, thunks
 
@@ -105,7 +112,7 @@ def test_all_guards_open_honours() -> None:
     [
         {"declared": True},  # G1
         {"checked": False},  # G2
-        {"cleared": False},  # G3
+        {"vetoed": True},  # G3 (veto)
         {"attested": False},
         {"run": False},
         {"naysayer": False},
@@ -118,7 +125,7 @@ def test_any_single_closed_guard_redirects(closing: dict[str, bool]) -> None:
 
 def test_human_author_honours_even_with_a_declared_segment_and_no_decider() -> None:
     # carve-out ① is the Tier-C gate itself; none of the D-4' thunks is read.
-    verdict, thunks = _guard(human=True, declared=True, checked=False, cleared=False)
+    verdict, thunks = _guard(human=True, declared=True, checked=False, vetoed=True)
     assert verdict is GuardIVerdict.HONOR
     assert all(t.calls == 0 for t in thunks.values())
 
@@ -127,7 +134,7 @@ def test_decider_is_consulted_last_and_only_when_everything_else_holds() -> None
     # The Decider is the one network-bound thunk: a closed G1 / G2 / attest must spare the call.
     for closing in ({"declared": True}, {"checked": False}, {"attested": False}, {"run": False}):
         _, thunks = _guard(**closing)
-        assert thunks["cleared"].calls == 0, closing
+        assert thunks["vetoed"].calls == 0, closing
 
 
 def test_segment_scan_is_not_read_for_an_unattested_post() -> None:
@@ -228,29 +235,53 @@ def test_naysayer_guidance_teaches_the_check_line() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# G3 — the Decider's proceed clearance
+# G3 — the Decider's proceed veto (msg-5219)
 # --------------------------------------------------------------------------- #
 
 
-def _result(kind: TierCVerdictKind | None, outcome: DecisionOutcome) -> DecisionResult:
+def _result(
+    kind: TierCVerdictKind | None, outcome: DecisionOutcome, p: float = 0.5
+) -> DecisionResult:
     return DecisionResult(
         outcome=outcome,
         decision_id=None if outcome is DecisionOutcome.TRANSPORT_ERROR else "d-1",
         provider=None if outcome is DecisionOutcome.TRANSPORT_ERROR else "jev",
         raw_answers=None,
-        verdict=TierCV2Verdict(kind=kind, ask_score=0.5) if kind is not None else None,
+        verdict=TierCV2Verdict(kind=kind, ask_score=p) if kind is not None else None,
         policy=POLICY_LIVE_PROCEED,
     )
 
 
-def test_proceed_cleared_only_on_likely_not() -> None:
-    assert proceed_cleared(_result(TierCVerdictKind.LIKELY_NOT, DecisionOutcome.EVALUATED))
-    assert not proceed_cleared(_result(TierCVerdictKind.UNSURE, DecisionOutcome.EVALUATED))
-    assert not proceed_cleared(_result(TierCVerdictKind.CONFIRMED, DecisionOutcome.EVALUATED))
-    assert not proceed_cleared(_result(None, DecisionOutcome.NO_VERDICT_NULL))
-    assert not proceed_cleared(_result(None, DecisionOutcome.NO_VERDICT_MALFORMED))
-    assert not proceed_cleared(_result(None, DecisionOutcome.TRANSPORT_ERROR))
-    assert not proceed_cleared(None)
+def test_proceed_vetoed_only_on_confirmed() -> None:
+    # msg-5227 R2: only an actionable tierc-v2 CONFIRMED vetoes.
+    assert proceed_vetoed(_result(TierCVerdictKind.CONFIRMED, DecisionOutcome.EVALUATED))
+    assert not proceed_vetoed(_result(TierCVerdictKind.UNSURE, DecisionOutcome.EVALUATED))
+    assert not proceed_vetoed(_result(TierCVerdictKind.LIKELY_NOT, DecisionOutcome.EVALUATED))
+    assert not proceed_vetoed(_result(None, DecisionOutcome.NO_VERDICT_NULL))
+    assert not proceed_vetoed(_result(None, DecisionOutcome.NO_VERDICT_MALFORMED))
+    assert not proceed_vetoed(_result(None, DecisionOutcome.TRANSPORT_ERROR))
+    assert not proceed_vetoed(None)
+
+
+def test_proceed_veto_ignores_a_v1_verdict() -> None:
+    # msg-5227 R2: a v1 configuration never vetoes, even with a v1 CONFIRMED in-gate verdict.
+    v1 = TierCVerdict(
+        kind=TierCVerdictKind.CONFIRMED,
+        genuine_score=0.9,
+        spurious_score=0.1,
+        fired_reason=None,
+        scope=TierCScope.IN_GATE,
+    )
+    dr = DecisionResult(
+        outcome=DecisionOutcome.EVALUATED,
+        decision_id="d-1",
+        provider="jev",
+        raw_answers=None,
+        verdict=v1,
+        policy=POLICY_LIVE_PROCEED,
+    )
+    assert dr.actionable_verdict is not None
+    assert not proceed_vetoed(dr)
 
 
 class _FakeClient:
@@ -340,17 +371,26 @@ async def test_decide_once_proceed_records_the_proceed_version() -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(("p", "cleared"), [(0.1, True), (0.5, False), (0.9, False)])
-async def test_adapter_clear_proceed_end_to_end(
-    p: float, cleared: bool, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("p", "vetoed"),
+    [
+        (0.1, False),  # LIKELY_NOT
+        (0.5, False),  # UNSURE (grey zone) — msg-5219: G3 does not close
+        (0.5999, False),  # boundary, msg-5227 §3 test 5
+        (0.60, True),  # tierc_v2_ask_min — CONFIRMED vetoes
+        (0.9, True),
+    ],
+)
+async def test_adapter_proceed_veto_end_to_end(
+    p: float, vetoed: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
     client = _FakeClient(_payload(p))
     adapter = DeciderLexoraAdapter(tierc_mode="shadow", client_factory=lambda: client, rules=RULES)
     with caplog.at_level(logging.INFO, logger="spirrow_mindwire.decider.hook"):
-        got = await run_proceed_clearance(
+        got = await run_proceed_veto(
             adapter, thread_id="T", round_index=1, roster=ROSTER, messages=_proceed_msgs()
         )
-    assert got is cleared
+    assert got == (vetoed, p)
     assert client.bodies[0]["questions_version"] == TIERC_V2_PROCEED_QUESTIONS_VERSION
     sent_state = json.loads(client.bodies[0]["state"])
     assert sent_state["parsed_next"] == "heisenberg"
@@ -359,13 +399,15 @@ async def test_adapter_clear_proceed_end_to_end(
         for r in caplog.records
         if r.getMessage().startswith("decider_proceed_clearance ")
     ]
-    assert line["cleared"] is cleared and line["head_msg_id"] == "m2"
+    assert line["vetoed"] is vetoed and line["head_msg_id"] == "m2"
+    assert line["ask_score"] == p
     # never mixed into the §6 escalation tally
     assert not any(r.getMessage().startswith("decider_decision ") for r in caplog.records)
 
 
 @pytest.mark.anyio
-async def test_clearance_fails_closed() -> None:
+async def test_no_verdict_does_not_veto() -> None:
+    # msg-5219: off / no verdict / error / v1 / null → G3 does not close (G1 / G2 decide).
     kw: dict[str, Any] = {
         "thread_id": "T",
         "round_index": 1,
@@ -373,34 +415,34 @@ async def test_clearance_fails_closed() -> None:
         "messages": _proceed_msgs(),
     }
     # backend=off: no Decider at all
-    assert await run_proceed_clearance(None, **kw) is False
+    assert await run_proceed_veto(None, **kw) == (False, None)
     # mode off / v1 rules: the adapter declines to call
     off = DeciderLexoraAdapter(
         tierc_mode="off", client_factory=lambda: _FakeClient(_payload(0.0)), rules=RULES
     )
-    assert await run_proceed_clearance(off, **kw) is False
+    assert await run_proceed_veto(off, **kw) == (False, None)
     v1 = DeciderLexoraAdapter(
         tierc_mode="shadow", client_factory=lambda: _FakeClient(_payload(0.0))
     )
-    assert await run_proceed_clearance(v1, **kw) is False
+    assert await run_proceed_veto(v1, **kw) == (False, None)
     # transport failure
     broken = DeciderLexoraAdapter(
         tierc_mode="shadow",
         client_factory=lambda: _FakeClient(exc=LexoraTimeoutError("slow")),
         rules=RULES,
     )
-    assert await run_proceed_clearance(broken, **kw) is False
+    assert await run_proceed_veto(broken, **kw) == (False, None)
     # null provider
     null = _payload(0.0)
     null["provider"] = "null"
     nullp = DeciderLexoraAdapter(
         tierc_mode="shadow", client_factory=lambda: _FakeClient(null), rules=RULES
     )
-    assert await run_proceed_clearance(nullp, **kw) is False
+    assert await run_proceed_veto(nullp, **kw) == (False, None)
 
 
 @pytest.mark.anyio
-async def test_clearance_swallows_a_raising_decider() -> None:
+async def test_veto_swallows_a_raising_decider() -> None:
     class _Raises:
         tierc_mode = "shadow"
 
@@ -413,7 +455,7 @@ async def test_clearance_swallows_a_raising_decider() -> None:
         async def clear_proceed(self, state: DecisionState) -> DecisionResult | None:
             raise RuntimeError("boom")
 
-    got = await run_proceed_clearance(
+    got = await run_proceed_veto(
         _Raises(), thread_id="T", round_index=1, roster=ROSTER, messages=_proceed_msgs()
     )
-    assert got is False
+    assert got == (False, None)
