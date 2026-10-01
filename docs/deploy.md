@@ -555,12 +555,15 @@ than silently parking a live thread forever.
 | `<data_dir>/state/notified.json` | last alert fired per thread, for de-duplication |
 | `<data_dir>/state/quarantine.json` | quarantined threads — one entry per `project/thread_id`; see *Quarantine and daily digest* |
 | `<data_dir>/state/quarantine-history.json` | append-only clear log; every `Clear-Quarantine` writes its `-Reason` here |
+| `<data_dir>/state/retry-pending.json` | `{ pending, events }` — threads whose first failure is waiting for its one automatic retry, plus the retry events the next digest counts; see *Retry once before quarantine*. Single writer: the sweep |
 | `<data_dir>/state/evaluated.json` | `first_seen_at` + `last_evaluated_at` per **live** thread; the starvation metric pivots on the current sweep list and prunes ex-live keys |
 | `<data_dir>/state/digest.json` | `last_sent_at` of the daily digest — one send per 24h max |
 | `<data_dir>/state/leases.json` | exclusive-resource lease map — one entry per resource name (v1: `editor`), each with holder / acquired_at / queue / audit fields. **Only shape `{...}` (JSON object) is treated as a valid migration marker** (see § Migration boundary). A missing file is treated as UNMIGRATED, NOT bootstrap: lease-requiring candidates are deferred and the wrapper refuses to create the file automatically. If a subsequent tick reads the file and finds any non-object root (root array, root scalar, JSON parse error, blank/whitespace, `[]`), the P4-3 v4.1 policy fails closed: `verdict='unreadable'`, T-5 flush skipped, corrupt file preserved in place as forensic evidence. `Save-CorruptedStateBackup` (the `.bad-<utc>` rename) is NOT invoked on that path. Do NOT delete or truncate without following the recovery steps in § Migration boundary |
 
 Deleting `head_skip.json` costs one full bootstrap sweep (every thread launches once, no
 backoff); `notified.json` at most one duplicate alert.
+Deleting `retry-pending.json` forgets every pending first failure, so each of those threads gets
+one more retry than it would have; it never quarantines anything by itself.
 Deleting `quarantine.json` **un-quarantines every thread silently** — do not do it as a shortcut for
 `Clear-Quarantine`; the history file exists precisely so cleared-with-reason and cleared-without-
 context are not confusable later. Deleting `evaluated.json` resets the starvation clock (harmless,
@@ -588,14 +591,52 @@ mechanism that keeps the NEXT unknown breakage from dying the same silent way.
    fires,
 2. does **not** stop the sweep — the next candidate is tried, so downstream work still progresses.
 
+Since 2026-10-01 (1) applies only to a failure that happens **twice in a row**. The first failure is
+retried once automatically; see *Retry once before quarantine* below.
+
 The old sweep-break fail-safe is retained but re-aimed: only a **failure to write the declaration**
 (and a "conductor stopped: … rounds=…" line that never arrived) breaks the sweep. If we cannot
 even record what went wrong, we still cannot quietly move on.
 
-**K-budget (2 per sweep).** Two quarantines in one tick suggest a shared cause; a third would spend
+**K-budget (2 per sweep).** Two failures in one tick suggest a shared cause; a third would spend
 another inference on that same cause before stopping. At K=2 the sweep breaks and a "systemic
 cause suspected" notification fires. Remaining candidates count as `not-reached` on the starvation
-metric — the honesty rule below.
+metric — the honesty rule below. K counts **failures**: a first failure (now retried, not
+quarantined) counts the same as a failed retry. A K hit does **not** promote pending retries to
+quarantine; once a systemic wave clears, the next tick's retries recover them.
+
+**Retry once before quarantine** (T-retry-once-before-quarantine; decided msg-5424, design msg-5434
+/ msg-5441 / msg-5449). On 2026-10-01, 8 of 9 quarantined threads had failed exactly once on a
+transient SDK error and waited up to a day for a manual clear. The rule now:
+
+| Event | What the sweep does | Log prefix |
+|---|---|---|
+| exit ∉ {0, 2}, nothing pending | write `retry-pending.json`; **no** quarantine, **no** Discord alert | `retry-scheduled` |
+| a pending thread gets a LAUNCH verdict | launch it — this is its one retry; `--retry-of <error_code>@<first_failure_at>` is added only when the head is the one the first failure saw | `retry-launch` |
+| a pending thread is no longer on the sweep list | discard the pending record (not quarantined; the same prune `evaluated.json` gets) | `retry-dropped` |
+| the retry exits 0 | clear the pending record | `retry-recovered` |
+| the retry exits 2 | leave the pending record as is (environment fault, not the thread's) | — |
+| the retry fails again | quarantine with `consecutive_failures=2`, the first failure's `first_failure_at` (the 24h escalation counts from it) and `first_attempt`; alert "再試行でも失敗したため隔離" | `retry-failed→quarantined` |
+
+- **When.** Never inside the same sweep. A pending thread is not excluded from the head-skip decide
+  batch; it is retried on the next LAUNCH verdict, so head_skip's backoff and T42's
+  `launches_same_head` (STALLED at 3) count and bound the retry like any other launch. DEFER /
+  SKIP carry the pending record over.
+- **Count reset.** Only an exit 0 clears it, not a head change. A thread that posts and then fails
+  in SDK teardown on every run moves its head each time, and would never be quarantined otherwise.
+- **Same-head re-fire.** The conductor attaches a fixed "check the working tree / branch / existing
+  PR before acting; do not repeat a push, PR or comment" notice to the retry's first prompt. It does
+  this only for roles in `RETRY_NOTICE_ROLES` (`src/spirrow_mindwire/conductor/retry_notice.py`;
+  today, the implementer only). Every other role's prompt is unchanged.
+  The sweep passes `--retry-of` only when the head being launched equals the head recorded at the
+  first failure; on a moved head the notice would claim a failed attempt at a message nobody has
+  attempted yet, so it is left out (the launch still counts as the retry).
+- **Digest.** The summary line carries `再試行 N / 回復 M / 再試行後隔離 Q` since the last full
+  digest. A `再試行待ち [retry-pending]` section lists pending threads, and those pending ≥24h are
+  marked `24h+` and listed first. A pending record is never timed out into quarantine: a long
+  exit-2 outage is the environment's fault and already has its own alert.
+- **Q3 scope.** spec/msg-814 Q3 ("解除は人手のみ") now applies to quarantined threads only. The
+  automatic retry of a first failure is the one exception, and `Clear-Quarantine` is unchanged.
 
 **Escalation ladder.** A quarantine record's derived state is a function of its age, not any
 scheduling flag (it stays skipped either way):
@@ -606,7 +647,8 @@ scheduling flag (it stays skipped either way):
 | 24h–7d | `escalated` | broken out at the top of the digest; state-transition alert fires once |
 | ≥7d | `stale` | "fix it or fold the thread"; state-transition alert fires once |
 
-Only a human clear (`Clear-Quarantine`) ever transitions a thread out. There is deliberately no
+Only a human clear (`Clear-Quarantine`) ever transitions a quarantined thread out (Q3 — the
+one-retry rule above acts before quarantine, never after). There is deliberately no
 auto-clear on a `(head, control)` change — see *Fingerprint hint* below.
 
 **Fingerprint hint.** Each quarantine record stores the `(head, control)` pair observed at the

@@ -79,6 +79,7 @@ from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .conductor.core import ConductorStopSlot, ConductorStopSnapshot, StopReason
+from .conductor.retry_notice import RetryOf, parse_retry_of
 from .conductor.stand_down import post_stand_down_notice, resolve_launch
 from .conductor.tierc_gate import TierCGate
 from .config import (
@@ -763,6 +764,7 @@ def build_conductor(
     stop_slot: ConductorStopSlot | None = None,
     launches_same_head: int = 0,
     launch_head_msg_id: str | None = None,
+    retry_of: RetryOf | None = None,
 ) -> Stage3Conductor:
     """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
 
@@ -880,6 +882,9 @@ def build_conductor(
             # T42 stall watchdog input from the sweep (see :mod:`.conductor.stall`).
             launches_same_head=launches_same_head,
             launch_head_msg_id=launch_head_msg_id,
+            # T-retry-once-before-quarantine D-4: the failed launch this run re-fires (``None`` =
+            # not a retry). See :mod:`.conductor.retry_notice`.
+            retry_of=retry_of,
             # Tier-C admission gate, enforced (DECIDED 2e-1b); ``None`` under mode="off".
             tierc_gate=tierc_gate,
         )
@@ -910,6 +915,7 @@ async def run_conductor(
     mcp: McpToolCaller | None = None,
     launches_same_head: int = 0,
     launch_head_msg_id: str | None = None,
+    retry_of: RetryOf | None = None,
 ) -> ConductorOutcome:
     """Build the conductor, drive the task thread once to a stop condition, and tear it down.
 
@@ -936,6 +942,9 @@ async def run_conductor(
     T42 stall watchdog: ``launches_same_head`` / ``launch_head_msg_id`` are the sweep's count of
     consecutive launches on one head and that head (``--launches-same-head`` /
     ``--launch-head-msg-id``). They are handed to the Conductor unchanged; the defaults never stall.
+
+    T-retry-once-before-quarantine D-4: ``retry_of`` is the parsed ``--retry-of`` value, the failed
+    launch this run re-fires. Handed to the Conductor unchanged; ``None`` changes no prompt.
     """
     if mcp is None:
         mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
@@ -975,6 +984,7 @@ async def run_conductor(
         stop_slot=stop_slot,
         launches_same_head=launches_same_head,
         launch_head_msg_id=launch_head_msg_id,
+        retry_of=retry_of,
     )
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
@@ -1135,6 +1145,16 @@ def main() -> None:
         default=None,
         help="conductor: the head msg id --launches-same-head was counted on (T42)",
     )
+    # T-retry-once-before-quarantine D-4. Written by the sweep only on the one automatic re-launch
+    # after a first failure. Absent = not a retry, so a hand-run conductor is unchanged.
+    parser.add_argument(
+        "--retry-of",
+        default=None,
+        help=(
+            "conductor: <error_code>@<first_failure_at> of the failed launch this run re-fires; "
+            "roles in RETRY_NOTICE_ROLES get a check-before-acting notice on round 0"
+        ),
+    )
     args = parser.parse_args()
     settings = load_settings()
     # Created OUTSIDE ``asyncio.run`` so the except blocks below can read it after the loop has
@@ -1148,6 +1168,7 @@ def main() -> None:
                     stop_slot=stop_slot,
                     launches_same_head=args.launches_same_head,
                     launch_head_msg_id=args.launch_head_msg_id or None,
+                    retry_of=parse_retry_of(args.retry_of),
                 )
             )
         else:

@@ -123,6 +123,7 @@ from .handoff import (
     parse_next_token,
     resolve_handoff,
 )
+from .retry_notice import RetryOf, retry_notice_for
 from .roster import RoleResolutionError, derive_identity_by_role
 from .spawn_timeout import (
     SPAWN_ATTEMPTS,
@@ -365,6 +366,7 @@ class Conductor:
         launches_same_head: int = 0,
         launch_head_msg_id: str | None = None,
         tierc_gate: TierCGate | None = None,
+        retry_of: RetryOf | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -431,6 +433,10 @@ class Conductor:
         # and every caller that predates T42 behave exactly as before.
         self._launches_same_head = launches_same_head
         self._launch_head_msg_id = launch_head_msg_id
+        # T-retry-once-before-quarantine D-4: the failed launch this run re-fires, handed down by
+        # the sweep (``--retry-of``). ``None`` (the default) = not a retry; no prompt changes.
+        # Read only by ``_dispatch_recording``, through :func:`.retry_notice.retry_notice_for`.
+        self._retry_of = retry_of
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
         # ``supervised`` baseline, so a bare Conductor never self-authorises code. The state is
@@ -627,6 +633,7 @@ class Conductor:
                             handle,
                             route_msg,
                             [*messages, route_msg],
+                            role=self._implementer_role,
                             rounds=round_index,
                             forced=forced,
                             forced_saveable=forced_saveable,
@@ -671,6 +678,7 @@ class Conductor:
                     handle,
                     relay_msg,
                     [*messages, relay_msg],
+                    role=self._implementer_role,
                     rounds=round_index,
                     forced=forced,
                     forced_saveable=forced_saveable,
@@ -735,6 +743,7 @@ class Conductor:
                         handle,
                         bounce_msg,
                         [*messages, bounce_msg],
+                        role=author_role,
                         rounds=round_index,
                         forced=forced,
                         forced_saveable=forced_saveable,
@@ -855,6 +864,7 @@ class Conductor:
                 handle,
                 latest,
                 messages,
+                role=target_role,
                 rounds=round_index,
                 forced=forced,
                 forced_saveable=forced_saveable,
@@ -2071,7 +2081,13 @@ class Conductor:
         )
         return await self._post_as_relay(body)
 
-    def _to_event(self, msg: dict[str, Any], messages: list[dict[str, Any]]) -> ChatroomEvent:
+    def _to_event(
+        self,
+        msg: dict[str, Any],
+        messages: list[dict[str, Any]],
+        *,
+        retry_notice: str | None = None,
+    ) -> ChatroomEvent:
         """Build the event for ``msg``, carrying the thread as ground truth (D-3).
 
         ``messages`` is this round's freshly-fetched thread. The conductor has always
@@ -2101,6 +2117,7 @@ class Conductor:
                 parent_msg_id=msg.get("reply_to") or None,
             ),
             thread_context=build_thread_context(messages, trigger_msg_id=msg_id),
+            retry_notice=retry_notice,
         )
 
     async def _spawn(self, role: Role, identity: str) -> SessionHandle | SpawnGaveUp:
@@ -2165,6 +2182,7 @@ class Conductor:
         msg: dict[str, Any],
         messages: list[dict[str, Any]],
         *,
+        role: Role,
         rounds: int,
         forced: int,
         forced_saveable: int,
@@ -2176,9 +2194,24 @@ class Conductor:
         type and chain are untouched (``loop_runner.main`` routes ``KeyboardInterrupt`` /
         ``EnvironmentTerminalError`` by type), and nothing is logged here: the single
         ``conductor stopped:`` line for this case is printed by ``loop_runner.main``.
+
+        ``role`` is the role ``handle`` was spawned for (the dispatcher contract makes it the
+        adapter's ``own_role``). It decides, with ``rounds``, whether this dispatch carries the
+        T-retry-once-before-quarantine notice: see :func:`.retry_notice.retry_notice_for`.
         """
+        notice = retry_notice_for(self._retry_of, role.value, rounds=rounds)
+        if self._retry_of is not None and rounds == 0:
+            logger.info(
+                "retry-of %s@%s: dispatching role=%s, notice=%s",
+                self._retry_of.error_code,
+                self._retry_of.first_failure_at,
+                role.value,
+                "attached" if notice is not None else "none (role not in RETRY_NOTICE_ROLES)",
+            )
         try:
-            await self._dispatcher.dispatch(handle, self._to_event(msg, messages))
+            await self._dispatcher.dispatch(
+                handle, self._to_event(msg, messages, retry_notice=notice)
+            )
         except BaseException as exc:
             if self._stop_slot is not None:
                 self._stop_slot.snapshot = ConductorStopSnapshot(

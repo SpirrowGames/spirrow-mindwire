@@ -231,6 +231,13 @@ class ChatroomEvent:
     a spawn-time snapshot would be round one's thread forever. ``None`` means no
     context was supplied (the watcher path) and the prompt renders exactly as it
     did before this field existed.
+
+    ``retry_notice`` (T-retry-once-before-quarantine D-4) is a fixed paragraph telling the turn
+    that the previous launch on this same message failed. Like ``thread_context`` it rides on the
+    event, and it is rendered as its own prompt block, so the trigger message's body stays the
+    author's text. ``None`` is the default and leaves the prompt byte-for-byte as before. Whether
+    it is set is decided by the conductor (:mod:`spirrow_mindwire.conductor.retry_notice`), never
+    by an adapter.
     """
 
     event_id: str  # ULID, dedup key
@@ -239,6 +246,7 @@ class ChatroomEvent:
     occurred_at: datetime  # iso_z
     payload: EventPayload  # union by event_type
     thread_context: ThreadContext | None = None
+    retry_notice: str | None = None
 
 
 # --------------------------------------------------------------------------- #
