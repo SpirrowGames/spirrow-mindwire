@@ -225,24 +225,26 @@ receipt（§4-2）はこの code をそのまま書く。§3 に新しい reason
 
     Reachability has one network rule. Judge it with
     `git merge-base --is-ancestor <commit> origin/main` and read the exit
-    status, not just whether it is zero. Exit 0 means reachable. Exit 1
-    means git knows the commit and it is not reachable. Any other status
-    (typically 128, which means git does not know the commit, for example
-    in a shallow clone or when the hash is wrong) means you could not
-    determine the answer. If the first judgement is exit 0, accept the
-    commit and fetch nothing. Otherwise, or if you have no `origin/main`
-    ref at all, run
+    status: 0 means the pinned commit is on `main`. If the first judgement
+    gives 0, accept the pin and fetch nothing. On any other status —
+    including when you have no `origin/main` ref at all — run
     `git fetch origin +refs/heads/main:refs/remotes/origin/main` exactly
-    once and judge again with the same command. If that fetch fails or is
-    unavailable to you, the verdict is NO-PIN/FETCH_UNAVAILABLE. If the
-    fetch succeeds, the second judgement decides: exit 0 accepts; exit 1
-    is NO-PIN/COMMIT_UNREACHABLE, meaning the pin names a commit that is
-    not on `main`, which usually means the specification was never merged;
-    any other status is NO-PIN/FETCH_UNAVAILABLE, because you still could
-    not determine the answer. Do not deepen or unshallow the clone, and do
-    not fetch a second time. Report whichever code you got; they have
-    different causes and different fixes, and collapsing them costs the
-    reader the diagnosis.
+    once and judge again. If that fetch fails or is unavailable to you,
+    the verdict is NO-PIN/FETCH_UNAVAILABLE: you could not determine the
+    answer. If the fetch succeeds and the second judgement gives 0, accept
+    the pin. If it gives any other status, run
+    `git rev-parse --is-shallow-repository` before deciding. If it prints
+    `false`, the verdict is NO-PIN/COMMIT_UNREACHABLE: a full clone that
+    has just fetched `main` holds every commit on `main`, so a pinned
+    commit it does not know (exit 128) or knows but cannot reach (exit 1)
+    is not on `main`, which usually means the specification was never
+    merged. If it prints `true`, prints anything else, or fails, the
+    verdict is NO-PIN/FETCH_UNAVAILABLE: a shallow clone lacks the history
+    needed to rule the commit out, so a negative judgement there means you
+    could not determine the answer. Do not deepen or unshallow the clone,
+    and do not fetch a second time. Report whichever code you got; they
+    have different causes and different fixes, and collapsing them costs
+    the reader the diagnosis.
 
     NO-PIN is a state to report, not an obstacle to route around. Say
     NO-PIN in your reply with its reason code. What you may do after
