@@ -272,6 +272,28 @@ def test_malformed_operator_forms_stand_down(body: str, fault: OperatorFault) ->
     assert handoff.kind is HandoffKind.ABSENT and handoff.operator_fault is fault
 
 
+def test_tier_c_check_elsewhere_does_not_satisfy_the_line_above_next() -> None:
+    # PR #402 gate finding 1 (pinned): ``TIER-C-CHECK: none`` quoted at the top of the message,
+    # the task two lines up, and an unrelated line directly above ``NEXT: operator``. G2 reads
+    # only the line directly above the final ``NEXT:`` (``declares_no_tier_c`` ->
+    # ``_line_above_last_next``), so this must stand down, never be accepted.
+    body = "TIER-C-CHECK: none\nOPERATOR-TASK: re-arm the hook\ngarbage line\nNEXT: operator"
+    handoff = resolve_handoff(body, _ROSTER)
+    assert handoff.kind is HandoffKind.ABSENT
+    assert handoff.operator_fault is OperatorFault.NO_TIER_C_CHECK
+    assert handoff.human_ask is None
+
+
+def test_field_only_operator_stands_down_with_the_missing_task_reason() -> None:
+    # PR #402 gate finding 2 (pinned): field ``operator`` and a body with no ``NEXT:`` line.
+    # ``_reconcile`` row 3 (body ABSENT -> field wins) keeps ``OPERATOR_WORK``, so the 3-line
+    # check runs and stands down with ``NO_TASK`` -- not a TARGET_DIVERGENCE park.
+    handoff = resolve_handoff("Some prose, no handoff line.", _ROSTER, next_participant="operator")
+    assert handoff.kind is HandoffKind.ABSENT
+    assert handoff.operator_fault is OperatorFault.NO_TASK
+    assert handoff.mismatch_reason is None
+
+
 def test_operator_fault_values_are_stand_down_reasons() -> None:
     reasons = {r.value for r in StandDownReason}
     assert {f.value for f in OperatorFault} <= reasons

@@ -877,8 +877,10 @@ def _resolve_field(field_value: str, roster: Mapping[str, Role]) -> Handoff:
         return Handoff(HandoffKind.NONE, token=token)
     if folded == OPERATOR_TOKEN:
         # Same token, same meaning as the body route; the 3-line form is checked against the
-        # body after reconciliation (a field-only ``operator`` has no lines above any NEXT:, so
-        # it stands down with the missing-line reason, which is the honest answer).
+        # body after reconciliation. A field-only ``operator`` (body has no NEXT:) takes
+        # :func:`_reconcile` row 3 (body ABSENT -> field wins), keeps ``OPERATOR_WORK``, and so
+        # reaches :func:`_check_operator`, which stands it down with ``NO_TASK`` (no lines above
+        # any NEXT:). Pinned by test_field_only_operator_stands_down_with_the_missing_task_reason.
         return Handoff(HandoffKind.HUMAN, token=token, human_ask=HumanAsk.OPERATOR_WORK)
     return _resolve_participant(roster, token)
 
