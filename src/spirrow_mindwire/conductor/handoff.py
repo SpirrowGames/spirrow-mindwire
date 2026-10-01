@@ -66,6 +66,7 @@ from ..tier_c_admission_gate import (
     LEGACY_LABEL_MAP,
     RELEASE_CROSS_REPO_LABEL,
     UNSURE_LABEL,
+    require_admitted,
 )
 from ..value_objects import Role
 
@@ -880,13 +881,6 @@ def _render_label_definitions(labels: tuple[str, ...]) -> str:
     return ", ".join(parts[:-1]) + ", and " + parts[-1]
 
 
-def _admitted_example(label: str) -> str:
-    """Return ``label`` for a worked example, failing the import if the gate no longer admits it."""
-    if label not in ADMIT_LABELS:
-        raise RuntimeError(f"handoff example label {label!r} is not in ADMIT_LABELS")
-    return label
-
-
 _TIER_C_COUNT_WORD = _count_word(len(TIER_C_LABELS))
 _TIER_C_DEFINITIONS_PROSE = _render_label_definitions(TIER_C_LABELS)
 
@@ -908,7 +902,9 @@ is a closed set of {_TIER_C_COUNT_WORD}: {_TIER_C_DEFINITIONS_PROSE}. Anything e
 Tier-C — decide it yourself and proceed: the implementation approach, whether and how \
 to address review findings (advisory or REQUEST_CHANGES), test strategy, naming, \
 refactor extent, work order, splitting PRs or threads, approving an internal \
-mechanism's design, and "may I proceed?".
+mechanism's design, whether to fix a finding in the current PR or a follow-up \
+(fixed rule: fix now; split only if the PR's gate-measured diff would exceed the \
+gate's warn threshold — measure with `mindwire pr-diff-size`), and "may I proceed?".
   - `NEXT: {NONE_TOKEN}` — the thread is settled; there is nothing left to do.
 
 The handoff line is part of your verbatim reply, not meta-commentary: write it \
@@ -956,7 +952,7 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         "code, so that you cannot bypass its objections (the conductor structurally redirects "
         f"such a handoff). Hand to `{HUMAN_TOKEN}` only for a decision that is genuinely Tier-C, "
         "and name the type on the line above your handoff, e.g.:\n\n"
-        f"    TIER-C: {_admitted_example('goal')}\n"
+        f"    TIER-C: {require_admitted('goal', where='handoff example')}\n"
         f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     # D-3 (T-human-terminal-overuse, Bohr msg-2540 §4 D-3 approved by Einstein msg-2539 Obj-3):
@@ -975,7 +971,7 @@ _ROLE_HANDOFF_GUIDANCE: dict[Role, str] = {
         f"such as merging, hand to `{HUMAN_TOKEN}` — you never merge to the main branch yourself. "
         f"When you hand to `{HUMAN_TOKEN}`, name the Tier-C type on the line above your handoff, "
         "e.g.:\n\n"
-        f"    TIER-C: {_admitted_example('merge-protected')}\n"
+        f"    TIER-C: {require_admitted('merge-protected', where='handoff example')}\n"
         f"    NEXT: {HUMAN_TOKEN}\n\n" + _TIER_C_LABEL_GUIDANCE
     ),
     Role.NAYSAYER: (

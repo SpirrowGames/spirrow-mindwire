@@ -29,9 +29,8 @@
 #       primary_source:  one-line pointer, "path::symbol" or "path::§heading"
 #       reason:      short prose justification, cross-referenced to the doc
 #
-# Only the three chatroom-post identities are enumerated. `spirrowgames-ops` is a GitHub
-# identity (not a chatroom author) and is out of scope. `conductor-probe` is defined by its
-# module docstring to never write, so it appears with kind=machine for completeness only.
+# Only the chatroom-post identities are enumerated. `spirrowgames-ops` is a GitHub
+# identity (not a chatroom author) and is out of scope.
 
 version: 1
 
@@ -69,17 +68,6 @@ identities:
       evidence the I-6 invariant exists to make meaningful." The relay's body is the
       conductor's own framing wrapping the driver's outcome, not the naysayer's verbatim
       critique.
-
-  - name: conductor-probe
-    kind: machine
-    legitimate: []
-    primary_source: "scripts/thread_heads.py::DEFAULT_IDENTITY"
-    reason: >-
-      Module docstring: "A dedicated identity that never posts and never marks read keeps
-      every thread unread, hence listed. Nothing here calls chatroom_mark_read; keep it
-      that way or this probe goes blind." Defined by contract not to write; listed for
-      completeness so a live-corpus finding of a post authored by this name would surface
-      as an unexpected write (residual) rather than be silently absorbed.
 
   - name: conductor-relay
     kind: machine

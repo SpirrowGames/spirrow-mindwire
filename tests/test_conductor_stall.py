@@ -183,6 +183,8 @@ def test_no_progress_still_needs_the_registry() -> None:
         (STALL_THRESHOLD, "m7", "m8", False),  # head moved since the sweep counted: progress
         (STALL_THRESHOLD, None, "m7", False),  # an unpinned count is not evidence
         (STALL_THRESHOLD, "", "m7", False),
+        (STALL_THRESHOLD, "m7", "", False),  # a head with no id is not a head to stall on
+        (STALL_THRESHOLD, "", "", False),  # two blanks agreeing is not evidence either
     ],
 )
 def test_is_stalled(count: int, pinned: str | None, head: str, expected: bool) -> None:
@@ -343,6 +345,20 @@ async def test_below_threshold_or_moved_head_spawns_normally() -> None:
         await asyncio.wait_for(_conductor(mcp, dispatcher, moved).run(), timeout=0.05)
     assert dispatcher.dispatches == 2
     assert mcp.posts == []
+
+
+@pytest.mark.anyio
+async def test_an_empty_thread_stops_as_empty_before_the_stall_check() -> None:
+    # The stall check reads the head id without a fallback, so pin why that is sound: a thread
+    # with no messages returns EMPTY before any head id exists, whatever count the sweep passed.
+    mcp = _FakeChatroomMcp()
+    dispatcher = _SilentHangDispatcher()
+    rec = Record(head_msg_id_at_launch="", launches_same_head=STALL_THRESHOLD)
+
+    outcome = await _conductor(mcp, dispatcher, rec).run()
+
+    assert outcome.stop_reason is StopReason.EMPTY
+    assert mcp.posts == [] and dispatcher.spawns == []
 
 
 @pytest.mark.anyio

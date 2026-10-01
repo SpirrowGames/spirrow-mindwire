@@ -23,7 +23,16 @@ import pytest
 from test_conductor_core import _ROSTER, _FakeChatroomMcp, _ScriptedDispatcher, _thread_ref
 
 from spirrow_mindwire import loop_runner
-from spirrow_mindwire.adapters.implementer import ImplementerSdkTurnTimeoutError
+from spirrow_mindwire.adapters.claude_code_sdk import ClaudeCodeSdkDeliveryError
+from spirrow_mindwire.adapters.implementer import (
+    ImplementerSdkDeliveryError,
+    ImplementerSdkTurnTimeoutError,
+)
+from spirrow_mindwire.adapters.naysayer_lexora import NaysayerLexoraDeliveryError
+from spirrow_mindwire.adapters.naysayer_sdk import (
+    NaysayerSdkDeliveryError,
+    NaysayerSdkShutdownError,
+)
 from spirrow_mindwire.conductor.core import (
     Conductor,
     ConductorStopSlot,
@@ -32,6 +41,7 @@ from spirrow_mindwire.conductor.core import (
     adapter_error_code,
 )
 from spirrow_mindwire.config import ConductorConfig, MindwireSettings, Stage3LoopConfig
+from spirrow_mindwire.exceptions import AdapterDeliveryError
 from spirrow_mindwire.value_objects import ChatroomEvent, Role, SessionHandle
 
 # --------------------------------------------------------------------------- #
@@ -184,6 +194,51 @@ def test_adapter_error_code(exc: BaseException, expected: str) -> None:
 def test_adapter_raise_sites_carry_code() -> None:
     assert ImplementerSdkTurnTimeoutError("x").code == "adapter.turn_timeout"
     # The naysayer shutdown site is pinned end-to-end in test_naysayer_sdk_adapter.py.
+
+
+def test_delivery_error_base_declares_code_as_none() -> None:
+    # The contract lives on the base class (human msg-4910), and its default is None rather than
+    # a generic string (Einstein msg-5001).
+    # The declaration itself is not re-checked here: ``mypy src tests`` in the gate rejects the
+    # typed reads below if ``code`` is undeclared anywhere in the MRO, and at runtime they raise
+    # AttributeError. No ``vars()``/type-hint introspection, so moving the declaration to an
+    # intermediate base or mixin stays green (PR-gate advisories on #389).
+    assert AdapterDeliveryError.code is None
+    assert AdapterDeliveryError("x").code is None
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        AdapterDeliveryError,
+        ClaudeCodeSdkDeliveryError,
+        ImplementerSdkDeliveryError,
+        NaysayerLexoraDeliveryError,
+        NaysayerSdkDeliveryError,
+    ],
+)
+def test_delivery_error_without_a_code_keeps_its_class_name(
+    cls: type[AdapterDeliveryError],
+) -> None:
+    # The None default must not cost the stop line the adapter's identity: a delivery error that
+    # names no code is still reported by its concrete class (msg-5001).
+    exc = cls("x")
+    assert exc.code is None
+    assert adapter_error_code(exc) == cls.__name__
+
+
+@pytest.mark.parametrize(
+    ("cls", "expected"),
+    [
+        (ImplementerSdkTurnTimeoutError, "adapter.turn_timeout"),
+        (NaysayerSdkShutdownError, "adapter.shutdown_failed"),
+    ],
+)
+def test_delivery_error_subclass_override_wins(
+    cls: type[AdapterDeliveryError], expected: str
+) -> None:
+    assert cls.code == expected
+    assert adapter_error_code(cls("x")) == expected
 
 
 # --------------------------------------------------------------------------- #

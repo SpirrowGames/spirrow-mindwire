@@ -1307,6 +1307,22 @@ def test_handoff_core_drops_design_approval_example_and_lists_the_four_types() -
         assert stale not in build_handoff_protocol_block(Role.PROPOSER)
 
 
+def test_fix_now_vs_follow_up_is_listed_as_not_tier_c_for_every_role() -> None:
+    # T-fix-now-vs-followup-is-mechanical (DECIDED msg-5233, design msg-5241 §1): the
+    # fix-now-or-follow-up question is decided by the gate's measured diff, never by the human.
+    # The block names the helper and the threshold by reference only — no hard-coded number, so
+    # a change to the gate's constants cannot make this prose lie.
+    from spirrow_mindwire.naysayer import pr_review
+
+    for role in (Role.PROPOSER, Role.IMPLEMENTER, Role.NAYSAYER):
+        block = build_handoff_protocol_block(role)
+        assert "whether to fix a finding in the current PR or a follow-up" in block, role
+        assert "`mindwire pr-diff-size`" in block, role
+        assert "gate's warn threshold" in block, role
+        assert f"{pr_review._DIFF_WARN_THRESHOLD:,}" not in block, role
+        assert str(pr_review._DIFF_WARN_THRESHOLD) not in block, role
+
+
 class TestLabelProseIsDerivedNotHardcoded:
     """PR #365 review (invariant): the label prose and its count follow ADMIT_LABELS."""
 
@@ -1327,12 +1343,11 @@ class TestLabelProseIsDerivedNotHardcoded:
         with pytest.raises(RuntimeError):
             handoff._check_label_definitions(missing, ADMIT_LABELS)
 
-    def test_example_label_must_be_admitted(self) -> None:
-        from spirrow_mindwire.conductor import handoff
-
-        assert handoff._admitted_example("goal") == "goal"
-        with pytest.raises(RuntimeError, match="scope"):
-            handoff._admitted_example("scope")
+    def test_worked_examples_render_admitted_labels(self) -> None:
+        # require_admitted itself is covered in tests/test_relay_route.py, and importing this
+        # module already proves the import-time check passed; pin only the rendered output here.
+        assert "    TIER-C: goal\n" in build_handoff_protocol_block(Role.PROPOSER)
+        assert "    TIER-C: merge-protected\n" in build_handoff_protocol_block(Role.IMPLEMENTER)
 
     def test_count_word_follows_len(self) -> None:
         from spirrow_mindwire.conductor import handoff

@@ -87,7 +87,16 @@ class AdapterDeliveryError(AdapterError):
     """Raised by ``RoleAdapter.deliver_event`` on failure (ADR-06 §3.4).
 
     Typical: session closed / payload validation failure.
+
+    ``code`` is the declared contract for the ``adapter.*`` catalog code a delivery failure
+    carries on the exception itself (human msg-4910, Einstein msg-5001). A subclass that stands
+    for exactly one failure overrides it at class level (``adapter.turn_timeout``,
+    ``adapter.shutdown_failed``). The base value is ``None``, deliberately not a generic string:
+    the conductor's ``error_code=`` falls back to the concrete class name when there is no code,
+    and a default such as ``adapter.delivery_failed`` would erase which adapter failed.
     """
+
+    code: str | None = None
 
 
 __all__ = [

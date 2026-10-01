@@ -577,8 +577,18 @@ class GitHubClient:
         diff), which is exactly what fail-loud is meant to preclude. An
         unreachable / non-2xx response is loud, and that is the trade.
         """
-        # Step 1 — read metadata for base.ref and head.sha. Same JSON we already
-        # read on the CI path (see :meth:`_fetch_ci_status_rest`).
+        base_ref, head_sha = await self.fetch_pr_base_and_head(pr)
+        return await self.fetch_compare_diff(pr.owner, pr.repo, base_ref, head_sha)
+
+    async def fetch_pr_base_and_head(self, pr: PrRef) -> tuple[str, str]:
+        """Step 1 of :meth:`fetch_pr_diff`: the PR's ``(base.ref, head.sha)``, fail-loud.
+
+        Split out (T-fix-now-vs-followup-is-mechanical, Bohr msg-5239 §1) so a caller that
+        already knows the head it means — ``mindwire pr-diff-size`` right after a push, when
+        this metadata's ``head.sha`` may still lag — can take ``base.ref`` from here and pass
+        its own head to :meth:`fetch_compare_diff`. The gate still reads both from here.
+        """
+        # Same JSON we already read on the CI path (see :meth:`_fetch_ci_status_rest`).
         meta_path = f"/repos/{pr.owner}/{pr.repo}/pulls/{pr.number}"
         try:
             resp = await self._client.get(meta_path)
@@ -597,15 +607,22 @@ class GitHubClient:
             raise GitHubHTTPError(f"GET {meta_path} (pr meta): malformed response: {exc}") from exc
         if not base_ref or not head_sha:
             raise GitHubHTTPError(f"GET {meta_path} (pr meta): missing base.ref or head.sha")
+        return base_ref, head_sha
 
-        # Step 2 — three-dot compare. `base_ref` is URL-encoded because a
-        # feature-branch name may contain `/` (e.g. `feature/stacked`); leaving
-        # a raw slash in the path segment routes to a different endpoint and
-        # returns 404. Head is a hex SHA and needs no encoding, but the same
+    async def fetch_compare_diff(self, owner: str, repo: str, base_ref: str, head_sha: str) -> str:
+        """Step 2 of :meth:`fetch_pr_diff`: the three-dot ``compare`` diff, fail-loud.
+
+        This is the exact artifact the PR gate measures (``len()`` of this text is the gate's
+        ``DiffView.original_chars``). A head SHA GitHub does not know (not yet pushed) is a
+        non-2xx here and raises :class:`GitHubHTTPError` — never an empty diff.
+        """
+        # `base_ref` is URL-encoded because a feature-branch name may contain `/` (e.g.
+        # `feature/stacked`); leaving a raw slash in the path segment routes to a different
+        # endpoint and returns 404. Head is a hex SHA and needs no encoding, but the same
         # `quote` call is harmless on it.
         base_seg = quote(base_ref, safe="")
         head_seg = quote(head_sha, safe="")
-        compare_path = f"/repos/{pr.owner}/{pr.repo}/compare/{base_seg}...{head_seg}"
+        compare_path = f"/repos/{owner}/{repo}/compare/{base_seg}...{head_seg}"
         try:
             resp = await self._client.get(
                 compare_path, headers={"Accept": "application/vnd.github.v3.diff"}

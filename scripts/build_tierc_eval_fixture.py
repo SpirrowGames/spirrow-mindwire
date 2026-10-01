@@ -278,7 +278,7 @@ def build_eval_row(
         routing_roster(upto, current_roster),
         next_participant=head.next_participant,
     )
-    author_requested_human = handoff.mismatch_reason is None
+    author_requested_human = handoff.author_requested_human
     # The conductor states the resolved head's parsed_next as the reserved token
     # (core._decider_hook); every other message keeps its body token.
     thread_msgs = [
@@ -318,6 +318,7 @@ def build_eval_row(
             "set": set_name,
             "roster_source": roster_source,
             "tier_c_label": handoff.tier_c_label,
+            # Stored column name — kept as-is (committed eval/tierc data + byte-exact keep check).
             "author_wrote_next_human": author_requested_human,
             # Would the live hook's entry check (msg-4237 DECIDED 2c-1) have let this turn in?
             # Measurement column for the (B) estimate only — the replay calls every row regardless.
