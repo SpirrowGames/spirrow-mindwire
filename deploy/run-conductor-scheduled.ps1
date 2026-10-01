@@ -1119,6 +1119,44 @@ function Get-RetryFirstAttempt {
     }
 }
 
+# Does the --retry-of notice tell the truth on THIS launch? The notice says "the previous launch on
+# this same message failed" (conductor.retry_notice). That is only true when the head being launched
+# now is the head the first failure was observed on. D-3 deliberately keeps a pending retry across a
+# head move (a turn that posts and then fails in SDK teardown moves the head every run), so a
+# pending thread can be relaunched on a NEW head — and there the notice would claim a failed attempt
+# at a message nobody has attempted yet (PR #403 gate, objection 2). Strict: both heads must be
+# known and equal. An unknown head on either side cannot confirm "same message", so no notice.
+# The launch is still the thread's one retry either way (the count is head-independent, D-3); only
+# the notice is gated.
+function Test-RetryNoticeHeadMatches {
+    param($Record, [string]$ProbeHead)
+    if ($null -eq $Record -or [string]::IsNullOrWhiteSpace($ProbeHead)) { return $false }
+    $fp = $Record.failure_fingerprint
+    $failedHead = if ($null -eq $fp) { $null } elseif ($fp -is [hashtable]) { $fp['head'] } else { $fp.head }
+    if ([string]::IsNullOrWhiteSpace("$failedHead")) { return $false }
+    return ("$failedHead" -eq $ProbeHead)
+}
+
+# Drop pending retries for threads that are no longer on the sweep list (PR #403 gate, objection 1).
+# Only the candidate loop clears a pending record (exit 0) or promotes it (second failure); a thread
+# taken off sweep.json never reaches that loop again, so without this its record would sit in
+# retry-pending.json forever and render in every digest with no supported way to clear it
+# (Clear-Quarantine deliberately does not touch retry-pending). Same rule, same reason, as the
+# evaluated.json prune on $liveKeys. Losing the record is the safe direction: a thread put back on
+# the list and failing again starts from a first failure (one more retry), it is never quarantined
+# on a stale count. Returns the removed keys so the caller can log each one.
+function Remove-RetryPendingNotLive {
+    param([hashtable]$RetryState, [string[]]$LiveKeys = @())
+    $removed = @()
+    foreach ($k in @($RetryState.pending.Keys)) {
+        if ($LiveKeys -notcontains $k) {
+            [void]$RetryState.pending.Remove($k)
+            $removed += $k
+        }
+    }
+    return $removed
+}
+
 # T-stalled-pr-has-no-detector Deliverable 6 wire-up. Extracts the failure class from
 # the session log tail by invoking the Python classifier over stdin. The classifier's
 # rules (which regex catches which error label) are the single SOT so a new signature
@@ -3866,6 +3904,12 @@ try {
     foreach ($k in @($evaluatedState.Keys)) {
         if ($liveKeys -notcontains $k) { [void]$evaluatedState.Remove($k) }
     }
+    # Same prune for retry-pending (Remove-RetryPendingNotLive's header). Report mode never writes
+    # retry-pending.json, so pruning the in-memory copy there changes nothing on disk.
+    foreach ($k in (Remove-RetryPendingNotLive -RetryState $retryState -LiveKeys $liveKeys)) {
+        Confirm-LogWorthKeeping
+        Write-Log "retry-dropped ${k}: no longer on the sweep list — pending retry discarded (not quarantined)"
+    }
 
     # Record first-seen for every live candidate that has never entered the file. This is the
     # timestamp the starvation clock ticks from when the candidate never actually launches (held on
@@ -4070,12 +4114,21 @@ try {
         if ($commitResult.head_msg_id) { $stallArgs += @('--launch-head-msg-id', "$($commitResult.head_msg_id)") }
         # T-retry-once-before-quarantine D-4: a launch of a retry-pending thread IS its one retry.
         # --retry-of lets the conductor warn roles in RETRY_NOTICE_ROLES (the implementer) that the
-        # failed launch may already have pushed / opened a PR / commented on this same head.
+        # failed launch may already have pushed / opened a PR / commented on this same head. It is
+        # passed only when the head IS that same head (Test-RetryNoticeHeadMatches): on a moved head
+        # the notice would claim a failed attempt at a message nobody has attempted yet.
         if ($retryState.pending.ContainsKey($cand.key)) {
-            $retryOf = Get-RetryOfArgument -Record $retryState.pending[$cand.key]
-            $stallArgs += @('--retry-of', $retryOf)
             $retryLaunched++
-            Write-Log "retry-launch $($cand.key): --retry-of $retryOf (launches_same_head=$($commitResult.launches_same_head))"
+            $pendingForLaunch = $retryState.pending[$cand.key]
+            $retryOf = Get-RetryOfArgument -Record $pendingForLaunch
+            if (Test-RetryNoticeHeadMatches -Record $pendingForLaunch -ProbeHead "$probeHead") {
+                $stallArgs += @('--retry-of', $retryOf)
+                Write-Log "retry-launch $($cand.key): --retry-of $retryOf (same head $probeHead, launches_same_head=$($commitResult.launches_same_head))"
+            }
+            else {
+                $failedHead = $pendingForLaunch.failure_fingerprint.head
+                Write-Log "retry-launch $($cand.key): head moved ($failedHead -> $probeHead) — no --retry-of notice; still the one retry of $retryOf"
+            }
         }
         $output = (& $inner @stallArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }

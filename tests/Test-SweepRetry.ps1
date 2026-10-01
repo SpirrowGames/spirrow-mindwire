@@ -37,6 +37,7 @@ $functions = $ast.FindAll(
 foreach ($name in 'New-QuarantineRecord', 'ConvertTo-RetryPendingState', 'New-RetryPendingRecord',
                   'ConvertTo-RetryIso', 'Get-RetryOfArgument', 'Add-RetryEvent',
                   'Register-CandidateFailure', 'Register-CandidateSuccess', 'Get-RetryFirstAttempt',
+                  'Test-RetryNoticeHeadMatches', 'Remove-RetryPendingNotLive',
                   'Get-DerivedQuarantineState', 'Get-FingerprintHint', 'Get-QuarantineReproHint',
                   'Format-DurationDigest', 'New-DailyDigest', 'Save-JsonState', 'ConvertTo-UtcInstant') {
     $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
@@ -187,6 +188,32 @@ Check "pending overflow is counted, not silent" $true ($bd -match '\+\d+ 件（�
 Check "判断待ち keeps its floor row behind a long retry list" $true ($bd -match 'proj/T-parked')
 
 # ------------------------------------------------------------------------------------------------
+Write-Host "Test-RetryNoticeHeadMatches — the notice only on the head the first failure saw (PR #403 objection 2)"
+$recHead = New-Pending -At $t0.ToString('o') -Head 'msg-1'
+Check "same head -> notice" $true (Test-RetryNoticeHeadMatches -Record $recHead -ProbeHead 'msg-1')
+Check "moved head -> no notice" $false (Test-RetryNoticeHeadMatches -Record $recHead -ProbeHead 'msg-2')
+Check "unknown probe head -> no notice" $false (Test-RetryNoticeHeadMatches -Record $recHead -ProbeHead '')
+Check "unknown failure head -> no notice" $false (Test-RetryNoticeHeadMatches -Record (New-Pending -At $t0.ToString('o') -Head '') -ProbeHead 'msg-1')
+$rtHead = ConvertTo-RetryPendingState -Raw (@{ pending = @{ $key = $recHead }; events = @() } | ConvertTo-Json -Depth 6 | ConvertFrom-Json -AsHashtable)
+Check "same head after a JSON round-trip -> notice" $true (Test-RetryNoticeHeadMatches -Record $rtHead.pending[$key] -ProbeHead 'msg-1')
+$rtObj = ConvertTo-RetryPendingState -Raw @{ pending = (@{ $key = $recHead } | ConvertTo-Json -Depth 6 | ConvertFrom-Json); events = @() }
+Check "same head on a PSCustomObject record -> notice" $true (Test-RetryNoticeHeadMatches -Record $rtObj.pending[$key] -ProbeHead 'msg-1')
+
+Write-Host "Remove-RetryPendingNotLive — a thread off the sweep list leaves no ghost (PR #403 objection 1)"
+$ghost = ConvertTo-RetryPendingState -Raw @{}
+$ghost.pending['proj/T-live'] = New-Pending -At $t0.ToString('o')
+$ghost.pending['proj/T-gone'] = New-Pending -At $t0.ToString('o')
+$gone = Remove-RetryPendingNotLive -RetryState $ghost -LiveKeys @('proj/T-live', 'proj/T-other')
+Check "the off-list key is reported" 'proj/T-gone' (@($gone) -join ',')
+Check "the off-list key is removed" $false $ghost.pending.ContainsKey('proj/T-gone')
+Check "the live key is kept" $true $ghost.pending.ContainsKey('proj/T-live')
+Check "nothing to remove -> empty list" 0 @(Remove-RetryPendingNotLive -RetryState $ghost -LiveKeys @('proj/T-live')).Count
+Check "pruning adds no retry event (it is not a retry outcome)" 0 @($ghost.events).Count
+$gd = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} -HeadsByProject @{} -ControlByProject @{} `
+    -Now $t0.AddHours(30) -LiveKeys @('proj/T-live') -RetryState $ghost
+Check "the pruned thread is gone from the digest" $false ($gd -match 'T-gone')
+
+# ------------------------------------------------------------------------------------------------
 Write-Host "Sweep body — structure the retry path depends on"
 $ifs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] }, $true)
 function Find-IfByCondition {
@@ -211,6 +238,13 @@ $retryArg = Find-IfByCondition '$retryState.pending.ContainsKey($cand.key)'
 Check "--retry-of is passed only under the pending check" $true ($retryArg -match "--retry-of")
 $sweepText = $ast.Extent.Text
 Check "--retry-of appears nowhere else" 1 ([regex]::Matches($sweepText, "'--retry-of'")).Count
+$headGate = Find-IfByCondition 'Test-RetryNoticeHeadMatches -Record $pendingForLaunch -ProbeHead "$probeHead"'
+Check "--retry-of is passed only under the same-head check" $true ($headGate -match "'--retry-of'")
+Check "the retry is counted whether or not the head moved" $false ($headGate -match 'retryLaunched')
+$pruneCall = $ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.GetCommandName() -eq 'Remove-RetryPendingNotLive' }, $true) | Select-Object -First 1
+Check "the sweep prunes retry-pending on the live sweep list" $true ($null -ne $pruneCall -and $pruneCall.Extent.Text -match '-LiveKeys \$liveKeys')
 
 $defer = Find-IfByCondition "`$decision -eq 'defer'"
 Check "DEFER carries pending over (does not touch retry state)" $false ($defer -match 'retryState|Register-Candidate')

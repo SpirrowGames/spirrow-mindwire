@@ -612,7 +612,8 @@ transient SDK error and waited up to a day for a manual clear. The rule now:
 | Event | What the sweep does | Log prefix |
 |---|---|---|
 | exit ∉ {0, 2}, nothing pending | write `retry-pending.json`; **no** quarantine, **no** Discord alert | `retry-scheduled` |
-| a pending thread gets a LAUNCH verdict | launch it with `--retry-of <error_code>@<first_failure_at>` | `retry-launch` |
+| a pending thread gets a LAUNCH verdict | launch it — this is its one retry; `--retry-of <error_code>@<first_failure_at>` is added only when the head is the one the first failure saw | `retry-launch` |
+| a pending thread is no longer on the sweep list | discard the pending record (not quarantined; the same prune `evaluated.json` gets) | `retry-dropped` |
 | the retry exits 0 | clear the pending record | `retry-recovered` |
 | the retry exits 2 | leave the pending record as is (environment fault, not the thread's) | — |
 | the retry fails again | quarantine with `consecutive_failures=2`, the first failure's `first_failure_at` (the 24h escalation counts from it) and `first_attempt`; alert "再試行でも失敗したため隔離" | `retry-failed→quarantined` |
@@ -627,6 +628,9 @@ transient SDK error and waited up to a day for a manual clear. The rule now:
   PR before acting; do not repeat a push, PR or comment" notice to the retry's first prompt. It does
   this only for roles in `RETRY_NOTICE_ROLES` (`src/spirrow_mindwire/conductor/retry_notice.py`;
   today, the implementer only). Every other role's prompt is unchanged.
+  The sweep passes `--retry-of` only when the head being launched equals the head recorded at the
+  first failure; on a moved head the notice would claim a failed attempt at a message nobody has
+  attempted yet, so it is left out (the launch still counts as the retry).
 - **Digest.** The summary line carries `再試行 N / 回復 M / 再試行後隔離 Q` since the last full
   digest. A `再試行待ち [retry-pending]` section lists pending threads, and those pending ≥24h are
   marked `24h+` and listed first. A pending record is never timed out into quarantine: a long
