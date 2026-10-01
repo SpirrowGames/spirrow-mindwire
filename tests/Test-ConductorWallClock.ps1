@@ -11,7 +11,8 @@
 #        grandchild are dead afterwards; the temp files are gone.
 #   U  — a kill that cannot be confirmed: exit 7 and the run_kill_unconfirmed line.
 #   W  — structure: run-conductor.ps1 no longer calls uv directly and exits with the bounded
-#        run's code; the sweep's dispatch loop stops on exit 7 with a break.
+#        run's code; it reads the hard budget from config/mindwire.toml with a '/' path; the
+#        sweep's dispatch loop stops on exit 7 with a break.
 #
 # The Python soft budget and the literals shared between the languages are in
 # tests/test_run_budget.py.
@@ -142,6 +143,15 @@ Start-Sleep -Seconds 120
     Check 'W2 run-conductor.ps1 calls Invoke-ConductorBounded once' 1 @($cmds | Where-Object { $_.GetCommandName() -eq 'Invoke-ConductorBounded' }).Count
     $last = $rast.EndBlock.Statements[-1]
     Check 'W3 run-conductor.ps1 ends with exit $run.code' 'exit $run.code' $last.Extent.Text
+    # The hard-budget config path must use '/' : on Linux/macOS a '\' is a filename character, so
+    # 'config\mindwire.toml' would miss the file and silently fall back to the default hard budget
+    # while Python reads the real one (PR #407 gate, REQUEST_CHANGES @ 9d7208d).
+    $budgetCall = @($cmds | Where-Object { $_.GetCommandName() -eq 'Get-ConductorHardBudgetSeconds' })
+    Check 'W8 run-conductor.ps1 reads the hard budget once' 1 $budgetCall.Count
+    if ($budgetCall.Count -eq 1) {
+        $t = $budgetCall[0].Extent.Text
+        Check 'W9 the hard-budget config path is config/mindwire.toml (no backslash)' $true ($t.Contains('"config/mindwire.toml"') -and -not $t.Contains('\'))
+    }
 
     $sweep = Join-Path $repoRoot 'deploy/run-conductor-scheduled.ps1'
     $sast = [System.Management.Automation.Language.Parser]::ParseFile($sweep, [ref]$null, [ref]$null)

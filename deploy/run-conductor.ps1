@@ -80,7 +80,7 @@ Write-Host "[adr18] starting Stage 3 conductor daemon (project + thread from min
 # in the thread. See deploy/lib/ConductorBudget.ps1 for the contract.
 . (Join-Path $PSScriptRoot 'lib/ConductorBudget.ps1')
 $dataDir = if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } else { Join-Path $HOME "spirrow-mindwire-data" }
-$hardBudget = Get-ConductorHardBudgetSeconds -ConfigPath (Join-Path $dataDir "config\mindwire.toml")
+$hardBudget = Get-ConductorHardBudgetSeconds -ConfigPath (Join-Path $dataDir "config/mindwire.toml")
 $run = Invoke-ConductorBounded -FilePath 'uv' `
     -Arguments (@('run', 'mindwire-loop', '--mode', 'conductor') + @($args)) `
     -HardBudgetSeconds $hardBudget -WorkingDirectory $repoRoot
