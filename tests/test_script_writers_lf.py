@@ -89,13 +89,19 @@ def _says_mode(node: ast.expr) -> bool:
 
 
 def _looks_like_path(node: ast.expr) -> bool:
-    """The receiver is a ``pathlib`` path on its face: ``Path(...)``, ``pathlib.Path(...)`` or
-    ``a / b``. Names are not resolved."""
+    """The receiver is a ``pathlib`` path on its face: ``Path(...)``, ``pathlib.Path(...)``, a
+    classmethod on the class (``Path.cwd()``, ``pathlib.Path.home()``) or ``a / b``. Names are not
+    resolved."""
     if isinstance(node, ast.BinOp):
         return isinstance(node.op, ast.Div)
     if isinstance(node, ast.Call):
         ctor = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-        return ctor in _PATH_CTORS
+        if ctor in _PATH_CTORS:
+            return True
+        # PR-gate #359 @ ff8af95: ``Path.cwd()`` names ``cwd``, not ``Path``; look at its owner.
+        if isinstance(node.func, ast.Attribute):
+            owner = node.func.value
+            return (getattr(owner, "id", None) or getattr(owner, "attr", None)) in _PATH_CTORS
     return False
 
 
@@ -218,6 +224,10 @@ def test_every_script_text_writer_declares_newline() -> None:
         # ... or the receiver is a path expression
         ("Path(x).open(m)", True),
         ("pathlib.Path(x).open(m)", True),
+        ("Path.cwd().open(m)", True),  # PR-gate #359 @ ff8af95: classmethod constructors
+        ("Path.home().open(m)", True),
+        ("pathlib.Path.cwd().open(m)", True),
+        ("zf.cwd().open(m)", False),
         ("(root / 'a.txt').open(m)", True),
         ("(root // n).open(m)", False),
         ("make(x).open(m)", False),
