@@ -139,7 +139,7 @@ from .stand_down import (
     emit_stand_down,
     stand_down_event,
 )
-from .tierc_gate import TierCGate, is_bounce_notice, render_bounce_body
+from .tierc_gate import TierCGate, bounced_msg_id, is_bounce_notice, render_bounce_body
 
 if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
@@ -978,7 +978,9 @@ class Conductor:
             )
             if decision.verdict is not AdmissionVerdict.BOUNCE:
                 return None
-            body = render_bounce_body(author=author, decision=decision)
+            body = render_bounce_body(
+                author=author, decision=decision, bounced_msg_id=_msg_id(latest)
+            )
         except Exception:
             logger.warning(
                 "tierc_gate failed on msg=%s; stopping at the human (fail-open)",
@@ -1579,6 +1581,7 @@ class Conductor:
         the two cannot ping-pong.)
         """
         segment = messages[:-1]  # exclude the latest msg (the one now handing to human)
+        bounced = _bounced_msg_ids(messages)
         boundary = 0
         for i, msg in enumerate(segment):
             # Layer 3: a past message that ended a segment with ``next_participant: human`` (with
@@ -1591,8 +1594,9 @@ class Conductor:
             )
             # 2e-1b: a ``NEXT: human`` the admission gate bounced never reached the human, so it
             # does not end the segment — else the author's RETRY / relabelled reply would force a
-            # second consult of a design the naysayer already reviewed.
-            if past.kind is HandoffKind.HUMAN and not _bounced_at(messages, i):
+            # second consult of a design the naysayer already reviewed. Matched by the msg_id
+            # the notice names, not by adjacency: another post can land in between (#398 advisory).
+            if past.kind is HandoffKind.HUMAN and _msg_id(msg) not in bounced:
                 boundary = i + 1
         return any(
             self._roster_role(_author(msg)) is self._naysayer_role and self._attested(msg)
@@ -2208,12 +2212,20 @@ class Conductor:
         )
 
 
-def _bounced_at(messages: list[dict[str, Any]], i: int) -> bool:
-    """Is ``messages[i]`` followed directly by the admission gate's bounce notice (2e-1b)?"""
-    if i + 1 >= len(messages):
-        return False
-    nxt = messages[i + 1]
-    return _author(nxt) == CONDUCTOR_RELAY_AUTHOR and is_bounce_notice(_content(nxt))
+def _bounced_msg_ids(messages: list[dict[str, Any]]) -> frozenset[str]:
+    """msg_ids the admission gate bounced (2e-1b), read from the ``conductor-relay`` notices.
+
+    Only ``conductor-relay`` posts count, so a role quoting a notice cannot mark a message as
+    bounced. Empty ids are dropped.
+    """
+    ids: set[str] = set()
+    for msg in messages:
+        if _author(msg) != CONDUCTOR_RELAY_AUTHOR:
+            continue
+        bounced = bounced_msg_id(_content(msg))
+        if bounced:
+            ids.add(bounced)
+    return frozenset(ids)
 
 
 def _msg_id(msg: dict[str, Any]) -> str:

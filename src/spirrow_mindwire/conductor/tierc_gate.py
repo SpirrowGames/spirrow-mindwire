@@ -37,6 +37,7 @@ its uuid, so it can never be redeemed and is harmless.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -118,14 +119,31 @@ def is_bounce_notice(content: str) -> bool:
     return content.lstrip().startswith(TIERC_BOUNCE_HEADER)
 
 
-def render_bounce_body(*, author: str, decision: AdmissionDecision) -> str:
+_BOUNCED_LINE_RE: re.Pattern[str] = re.compile(r"^bounced: `(?P<msg_id>[^`\s]+)`\r?$", re.MULTILINE)
+
+
+def bounced_msg_id(content: str) -> str | None:
+    """The msg_id a bounce notice names on its ``bounced:`` line, else ``None``.
+
+    The notice names the message it bounced instead of relying on being posted right after it:
+    another post can land between the ``NEXT: human`` and the notice (PR-gate advisory on #398),
+    so adjacency is not a reliable link. ``None`` for anything that is not a bounce notice.
+    """
+    if not is_bounce_notice(content):
+        return None
+    match = _BOUNCED_LINE_RE.search(content)
+    return match.group("msg_id") if match is not None else None
+
+
+def render_bounce_body(*, author: str, decision: AdmissionDecision, bounced_msg_id: str) -> str:
     """The bounce notice posted under ``conductor-relay``, ending ``NEXT: <author>``.
 
     The final line is the only line-start ``NEXT:``; every other mention (``NEXT: human``,
     ``TIER-C: <label>``) is inline inside backticks so neither the handoff parser (last line-start
     ``NEXT:``) nor the G1 latch (a whole-line ``TIER-C:``) can read it. The ``RETRY:`` line is the
     one line meant to be copied verbatim, so it stands alone; this post's author is not a roster
-    role, so the gate never reads it here.
+    role, so the gate never reads it here. ``bounced_msg_id`` is written on its own
+    ``bounced: `<msg_id>``` line for :func:`bounced_msg_id` to read back.
     """
     retry_uuid = bounce_retry_uuid(decision)
     reason = decision.bounce_reason.value if decision.bounce_reason is not None else "unknown"
@@ -133,6 +151,7 @@ def render_bounce_body(*, author: str, decision: AdmissionDecision) -> str:
     hint_line = f"ヒント: {decision.bounce_hint}\n\n" if decision.bounce_hint else ""
     return (
         f"{TIERC_BOUNCE_HEADER}\n\n"
+        f"bounced: `{bounced_msg_id}`\n\n"
         f"{author} の `NEXT: human` は人に届けず、書いた本人に差し戻しました"
         f" (理由: `{reason}`)。\n\n"
         f"{hint_line}"
@@ -153,6 +172,7 @@ __all__ = [
     "TIERC_BOUNCE_HEADER",
     "TierCGate",
     "bounce_retry_uuid",
+    "bounced_msg_id",
     "is_bounce_notice",
     "render_bounce_body",
 ]

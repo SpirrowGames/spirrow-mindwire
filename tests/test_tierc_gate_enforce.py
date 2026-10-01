@@ -36,6 +36,7 @@ from spirrow_mindwire.conductor.handoff import parse_next_token
 from spirrow_mindwire.conductor.tierc_gate import (
     TIERC_BOUNCE_HEADER,
     TierCGate,
+    bounced_msg_id,
     is_bounce_notice,
     render_bounce_body,
 )
@@ -368,7 +369,8 @@ def test_notice_parse_is_hijack_safe() -> None:
     d = decide_admission(
         body=UNLABELLED, author="Bohr", retry_lookup=never_retry, now=NOW, bounce_uuid="u-9"
     )
-    body = render_bounce_body(author="Bohr", decision=d)
+    body = render_bounce_body(author="Bohr", decision=d, bounced_msg_id="m3")
+    assert bounced_msg_id(body) == "m3"
     assert body.startswith(TIERC_BOUNCE_HEADER)
     assert parse_next_token(body) == "Bohr"
     next_lines = [ln for ln in body.splitlines() if ln.startswith("NEXT:")]
@@ -543,3 +545,63 @@ def test_measure_buckets_counts_and_ids_only() -> None:
     ]
     assert secret not in json.dumps(out)
     assert "x" not in out["i_bounce_by_reason"]
+
+
+# --------------------------------------------------------------------------- #398 advisory
+
+
+def _consulted(msgs: list[tuple[str, str]]) -> bool:
+    mcp = _FakeChatroomMcp()
+    for author, content in msgs:
+        mcp.seed(author=author, content=content)
+    conductor = Conductor(
+        mcp=mcp,
+        dispatcher=_ScriptedDispatcher(mcp, {}),
+        thread_ref=_thread_ref(),
+        roster=ROSTER,
+        naysayer_identity="Einstein",
+    )
+    thread = mcp._messages  # the seeded dicts, ids m1..mN
+    return conductor._naysayer_consulted(thread)
+
+
+def _notice_for(msg_id: str) -> str:
+    d = decide_admission(
+        body=UNLABELLED, author="Bohr", retry_lookup=never_retry, now=NOW, bounce_uuid="u-1"
+    )
+    return render_bounce_body(author="Bohr", decision=d, bounced_msg_id=msg_id)
+
+
+def test_bounced_human_is_not_a_boundary_even_with_an_interleaved_post() -> None:
+    """PR-gate advisory on #398: a post between the ``NEXT: human`` and its notice."""
+    msgs = [
+        ("Bohr", "design\n\nNEXT: Einstein"),
+        ("Einstein", _attested("critique\n\nNEXT: Bohr")),
+        ("Bohr", UNLABELLED),  # m3, bounced
+        ("operator", "fyi: unrelated note"),  # m4, interleaved
+        (CONDUCTOR_RELAY_AUTHOR, _notice_for("m3")),  # m5
+        ("Bohr", "relabelled\n\nTIER-C: goal\nNEXT: human"),  # m6, the head
+    ]
+    assert _consulted(msgs) is True
+
+
+def test_a_notice_naming_another_message_does_not_unbound_this_one() -> None:
+    msgs = [
+        ("Bohr", "design\n\nNEXT: Einstein"),
+        ("Einstein", _attested("critique\n\nNEXT: Bohr")),
+        ("Bohr", UNLABELLED),  # m3 — reached the human (no notice names it)
+        (CONDUCTOR_RELAY_AUTHOR, _notice_for("m99")),
+        ("Bohr", "next\n\nTIER-C: goal\nNEXT: human"),
+    ]
+    assert _consulted(msgs) is False
+
+
+def test_a_role_quoting_a_notice_does_not_mark_a_bounce() -> None:
+    msgs = [
+        ("Bohr", "design\n\nNEXT: Einstein"),
+        ("Einstein", _attested("critique\n\nNEXT: Bohr")),
+        ("Bohr", UNLABELLED),  # m3
+        ("Heisenberg", _notice_for("m3")),  # not conductor-relay
+        ("Bohr", "next\n\nTIER-C: goal\nNEXT: human"),
+    ]
+    assert _consulted(msgs) is False
