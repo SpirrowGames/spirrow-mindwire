@@ -78,8 +78,19 @@ from .adapters.decider_lexora import resolve_backend as resolve_decider_backend
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
-from .conductor.core import ConductorStopSlot, ConductorStopSnapshot, StopReason
+from .conductor.core import (
+    CONDUCTOR_RELAY_AUTHOR,
+    ConductorStopSlot,
+    ConductorStopSnapshot,
+    StopReason,
+)
 from .conductor.retry_notice import RetryOf, parse_retry_of
+from .conductor.run_budget import (
+    RunPhase,
+    post_run_timeout_notice,
+    run_with_budget,
+    validate_budgets,
+)
 from .conductor.stand_down import post_stand_down_notice, resolve_launch
 from .conductor.tierc_gate import TierCGate
 from .config import (
@@ -765,6 +776,7 @@ def build_conductor(
     launches_same_head: int = 0,
     launch_head_msg_id: str | None = None,
     retry_of: RetryOf | None = None,
+    run_phase: RunPhase | None = None,
 ) -> Stage3Conductor:
     """Assemble the NEXT-driven conductor from settings (conductor-mode composition root).
 
@@ -887,6 +899,8 @@ def build_conductor(
             retry_of=retry_of,
             # Tier-C admission gate, enforced (DECIDED 2e-1b); ``None`` under mode="off".
             tierc_gate=tierc_gate,
+            # Wall-clock budget (msg-5498 W-1): the phase the run_timeout event reports.
+            run_phase=run_phase,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc
@@ -945,17 +959,91 @@ async def run_conductor(
 
     T-retry-once-before-quarantine D-4: ``retry_of`` is the parsed ``--retry-of`` value, the failed
     launch this run re-fires. Handed to the Conductor unchanged; ``None`` changes no prompt.
+
+    Wall-clock budget (msg-5496 / msg-5498 W-1): everything above runs inside
+    :func:`~spirrow_mindwire.conductor.run_budget.run_with_budget`, bounded by
+    ``[conductor].run_budget_s``. On expiry the ``conductor.run_timeout`` line is written, the run
+    is cancelled, and a stop notice is posted (exit 0) or, if it cannot be posted within
+    ``RELAY_POST_BUDGET_S``, :class:`~spirrow_mindwire.conductor.run_budget.RunTimeoutError` is
+    raised (exit 5). The budgets are checked first, before anything is read or spawned.
     """
+    cond_cfg = settings.conductor
+    validate_budgets(
+        run_budget_s=cond_cfg.run_budget_s, run_hard_budget_s=cond_cfg.run_hard_budget_s
+    )
     if mcp is None:
         mcp = StreamableHttpChatroomMcp()  # MINDWIRE_MAGICKIT_MCP_URL or default
+    run_phase = RunPhase()
+    project = settings.loop.project
+    thread_id = cond_cfg.task_thread_id
+    chatroom = mcp
+
+    async def _body() -> ConductorOutcome:
+        return await _run_conductor_once(
+            settings,
+            mcp=chatroom,
+            stop_slot=stop_slot,
+            launches_same_head=launches_same_head,
+            launch_head_msg_id=launch_head_msg_id,
+            retry_of=retry_of,
+            run_phase=run_phase,
+        )
+
+    outcome, timed_out = await run_with_budget(
+        _body,
+        budget_s=cond_cfg.run_budget_s,
+        run_phase=run_phase,
+        project=project,
+        thread=thread_id,
+    )
+    if timed_out is None:
+        assert outcome is not None
+        return outcome
+    # The ``conductor.run_timeout`` line is already in the log (run_with_budget wrote it at the
+    # deadline). Producer declaration: see ``post_run_timeout_notice`` — reader = the thread's
+    # human; fallback = disposition (3), exit 5 via RunTimeoutError.
+    posted = await post_run_timeout_notice(
+        mcp, project=project, thread_id=thread_id, event=timed_out, author=CONDUCTOR_RELAY_AUTHOR
+    )
+    # Same ``conductor stopped:`` line shape as ``Conductor._stop``; HUMAN for the same reason the
+    # spawn-timeout give-up uses it (a person has to act; Stage 1 SKIPs the ``NEXT: human`` head).
+    # ``rounds`` counts the round that was cut off: see ``RunPhase.rounds_started``.
+    stopped = ConductorOutcome(
+        rounds=run_phase.rounds_started,
+        stop_reason=StopReason.HUMAN,
+        last_msg_id=posted,
+        forced_naysayer_turns=0,
+    )
+    logger.info(
+        "conductor stopped: reason=%s rounds=%d forced_naysayer=0 "
+        "forced_naysayer_saveable=0 last_msg=%s",
+        stopped.stop_reason.value,
+        stopped.rounds,
+        posted,
+    )
+    return stopped
+
+
+async def _run_conductor_once(
+    settings: MindwireSettings,
+    *,
+    mcp: McpToolCaller,
+    stop_slot: ConductorStopSlot | None,
+    launches_same_head: int,
+    launch_head_msg_id: str | None,
+    retry_of: RetryOf | None,
+    run_phase: RunPhase,
+) -> ConductorOutcome:
+    """The body :func:`run_conductor` bounds: resolve, preflight, build, run, tear down."""
     project = settings.loop.project
     thread_id = settings.conductor.task_thread_id
-    resolution = await resolve_launch(
-        mcp=mcp,
-        project=project,
-        thread_id=thread_id,
-        repo_dir=settings.loop.repo_dir,
-    )
+    with run_phase.enter("launch.resolve"):
+        resolution = await resolve_launch(
+            mcp=mcp,
+            project=project,
+            thread_id=thread_id,
+            repo_dir=settings.loop.repo_dir,
+        )
     if resolution.stand_down is not None:
         posted = await post_stand_down_notice(
             mcp, project=project, thread_id=thread_id, event=resolution.stand_down
@@ -985,6 +1073,7 @@ async def run_conductor(
         launches_same_head=launches_same_head,
         launch_head_msg_id=launch_head_msg_id,
         retry_of=retry_of,
+        run_phase=run_phase,
     )
     logger.info(
         "conductor started: project=%s thread=%s roster=%d max_rounds=%d",
@@ -1006,7 +1095,8 @@ async def run_conductor(
         )
         return outcome
     finally:
-        await cond.aclose()
+        with run_phase.enter("teardown"):
+            await cond.aclose()
 
 
 def _preflight(cfg: Stage3LoopConfig) -> None:

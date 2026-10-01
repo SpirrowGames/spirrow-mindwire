@@ -48,6 +48,13 @@ naysayer_identity = "Einstein"
 human_identity = "human"
 # Runaway backstop: max serial turns before the conductor stops (default 40).
 max_rounds = 40
+# Wall-clock budgets for one run, in seconds. Soft: the conductor logs `conductor.run_timeout`,
+# posts a stop notice ending `NEXT: human` and exits (0 if posted, 5 if not). Hard: run-conductor.ps1
+# kills the process tree (exit 6; 7 if the kill cannot be confirmed, which also stops the rest of the
+# sweep tick). hard must exceed soft + 30 s; the daemon refuses to start otherwise. Defaults are
+# p99 x 1.5 of the measured run time and soft + 15 min.
+run_budget_s = 3940
+run_hard_budget_s = 4840
 # Cost lever (default false). When true, the conductor forces an Obj2 naysayer consult ONLY on an
 # explicit `NEXT: human` (the genuine Tier-C handoff) — not on a guard-(i) design->implement redirect
 # or an ABSENT / Q-A un-routed turn, which then fall straight through to the human. Trims redundant

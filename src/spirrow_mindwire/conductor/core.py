@@ -70,6 +70,7 @@ structurally out of the loop.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -128,6 +129,7 @@ from .handoff import (
 )
 from .retry_notice import RetryOf, retry_notice_for
 from .roster import RoleResolutionError, derive_identity_by_role
+from .run_budget import RunPhase, enter_phase
 from .spawn_timeout import (
     SPAWN_ATTEMPTS,
     SpawnGaveUp,
@@ -421,6 +423,7 @@ class Conductor:
         launch_head_msg_id: str | None = None,
         tierc_gate: TierCGate | None = None,
         retry_of: RetryOf | None = None,
+        run_phase: RunPhase | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -491,6 +494,9 @@ class Conductor:
         # the sweep (``--retry-of``). ``None`` (the default) = not a retry; no prompt changes.
         # Read only by ``_dispatch_recording``, through :func:`.retry_notice.retry_notice_for`.
         self._retry_of = retry_of
+        # Wall-clock budget (msg-5498 W-1): where the run is, for the ``phase`` field of
+        # ``conductor.run_timeout``. ``None`` = nobody reads it (tests, library callers).
+        self._run_phase = run_phase
         # Per-project loop control (Part C). ``None`` means no control plane was wired — NOT that
         # one was consulted and answered; the conductor then holds the pre-inversion
         # ``supervised`` baseline, so a bare Conductor never self-authorises code. The state is
@@ -544,6 +550,8 @@ class Conductor:
         forced = 0
         forced_saveable = 0
         for round_index in range(self._max_rounds):
+            if self._run_phase is not None:
+                self._run_phase.rounds_started = round_index + 1
             # Control first: a `hold` then costs one MCP read and no thread fetch, and reading it
             # per round rather than per run is what bounds an operator's HOLD to one round of
             # latency. Unreadable ⇒ `hold` (control.FAILSAFE_CONTROL_STATE) — never fail open.
@@ -1789,14 +1797,15 @@ class Conductor:
         # for a *different* class of bug (a well-formed but oddly-shaped
         # response); the envelope path used to hide inside it and no longer
         # does.
-        result = await self._mcp.call_tool(
-            "chatroom_get_thread",
-            {
-                "project": self._thread_ref.project_id,
-                "thread_id": self._thread_ref.thread_id,
-                "mode": "full",
-            },
-        )
+        with enter_phase(self._run_phase, "thread.read"):
+            result = await self._mcp.call_tool(
+                "chatroom_get_thread",
+                {
+                    "project": self._thread_ref.project_id,
+                    "thread_id": self._thread_ref.thread_id,
+                    "mode": "full",
+                },
+            )
         messages = result.get("messages", []) if isinstance(result, dict) else []
         return [m for m in messages if isinstance(m, dict)]
 
@@ -1813,12 +1822,13 @@ class Conductor:
         not its own trigger (Tier B msg-567 #1).
         """
         assert self._orchestrator is not None
-        _thread_ref, _outcome, relay_msg = await self._orchestrator.fire_pr_review(
-            project=self._thread_ref.project_id,
-            pr_ref=pr_ref,
-            design_thread=self._thread_ref.thread_id,
-            implementer=self._implementer_identity,
-        )
+        with enter_phase(self._run_phase, "pr_gate.review"):
+            _thread_ref, _outcome, relay_msg = await self._orchestrator.fire_pr_review(
+                project=self._thread_ref.project_id,
+                pr_ref=pr_ref,
+                design_thread=self._thread_ref.thread_id,
+                implementer=self._implementer_identity,
+            )
         # The route the relay writer decided (U3'). A relay dict without one — a caller that
         # predates U3', or a malformed return — fails to the human, the safe direction.
         route = relay_msg.get("route") if isinstance(relay_msg, dict) else None
@@ -2308,7 +2318,8 @@ class Conductor:
         """
         for attempt in range(1, SPAWN_ATTEMPTS + 1):
             try:
-                return await self._dispatcher.spawn_instance(self._thread_ref, role, identity)
+                with enter_phase(self._run_phase, f"{role.value}.spawn"):
+                    return await self._dispatcher.spawn_instance(self._thread_ref, role, identity)
             except AdapterSpawnTimeoutError as exc:
                 event = spawn_timeout_event(
                     adapter_id=exc.adapter_id,
@@ -2383,9 +2394,15 @@ class Conductor:
                 "attached" if notice is not None else "none (role not in RETRY_NOTICE_ROLES)",
             )
         try:
-            await self._dispatcher.dispatch(
-                handle, self._to_event(msg, messages, retry_notice=notice)
-            )
+            with enter_phase(self._run_phase, f"{role.value}.dispatch"):
+                await self._dispatcher.dispatch(
+                    handle, self._to_event(msg, messages, retry_notice=notice)
+                )
+        except asyncio.CancelledError:
+            # A cancellation is the wall-clock budget taking the run back (msg-5498 W-1), not an
+            # adapter failure. Recording a snapshot here would make ``loop_runner.main`` print an
+            # ``adapter_error`` stop line and exit 1 over the run_timeout's own exit code.
+            raise
         except BaseException as exc:
             if self._stop_slot is not None:
                 self._stop_slot.snapshot = ConductorStopSnapshot(

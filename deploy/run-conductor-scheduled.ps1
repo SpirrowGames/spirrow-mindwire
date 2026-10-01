@@ -124,6 +124,11 @@ $DigestBudget = 1950
 # because the gate is "period ≠ last_sent_period AND local ≥ this time", not "elapsed ≥ 24h".
 $DailyDigestDeliveryTime = [TimeSpan]::FromHours(9)
 
+# Exit code of run-conductor.ps1 when the hard wall-clock budget killed the run but could not
+# confirm the tree is gone. Mirrors $ConductorKillUnconfirmedExitCode in deploy/lib/ConductorBudget.ps1
+# and RUN_KILL_UNCONFIRMED_EXIT_CODE in conductor/run_budget.py (a pytest pins all three).
+$ConductorKillUnconfirmedExitCode = 7
+
 # --- paths -------------------------------------------------------------------------------------
 # mindwire-loop reads <data_dir>/config/mindwire.toml; honour the same env var run-conductor.ps1 does.
 $dataDir = if ($env:MINDWIRE_PATHS__DATA_DIR) { $env:MINDWIRE_PATHS__DATA_DIR } else { Join-Path $HOME "spirrow-mindwire-data" }
@@ -4608,6 +4613,24 @@ try {
                 -Message $notificationBody
         }
         if ($code -ne 0) {
+            # Exit 7 — the hard wall-clock budget killed the run but could not confirm the process
+            # tree is gone (deploy/lib/ConductorBudget.ps1; T-agmsg-transport-lessons-readiness-
+            # session-claim-board msg-5498 W-3). An orphan may still be running against this
+            # project, so launching anything else this tick could break the "one subprocess per
+            # project per tick" Concurrency profile without anyone seeing it. The failure itself has
+            # already gone down the ordinary retry/quarantine path above; this only stops the tick.
+            # Exits 5 and 6 get no branch: the log tail names them (design §18.5).
+            if ($code -eq $ConductorKillUnconfirmedExitCode) {
+                Write-Log "kill-unconfirmed $($cand.key): exit=$code — an orphaned conductor tree may still be running; stopping the rest of this tick's sweep"
+                Send-NotificationIfChanged -State $notifyState -Key "__conductor_kill_unconfirmed__/$($cand.key)" `
+                    -Signature "${nowIso}:${code}:${probeHead}" `
+                    -Message ("MindWire: **$($cand.key)** の conductor を時間上限で止めましたが、" +
+                              "プロセスツリーが終了したことを確認できませんでした (exit=$code)。" +
+                              "孤児プロセスが残っている可能性があるため、この tick の残りの sweep を止めました。" +
+                              "ループ host で mindwire-loop / claude のプロセスを確認してください。")
+                $breakReason = 'kill-unconfirmed'
+                break
+            }
             # K-budget short-circuit. Two failures in one sweep suggest a shared cause; keep
             # spending inferences past the second is the exact "keep bleeding" failure mode this
             # design refuses. The sweep breaks and fires a systemic-cause notification.
