@@ -605,3 +605,59 @@ def test_a_role_quoting_a_notice_does_not_mark_a_bounce() -> None:
         ("Bohr", "next\n\nTIER-C: goal\nNEXT: human"),
     ]
     assert _consulted(msgs) is False
+
+
+# --------------------------------------------------------------------------- #398 RC: guard (i)
+
+
+def _guard_i_thread(with_bounce: bool) -> _FakeChatroomMcp:
+    """Bohr earns one D-1 redirect, then (optionally) has a ``NEXT: human`` bounced, then
+    nominates the implementer again. The head is that second nomination."""
+    mcp = _FakeChatroomMcp()
+    mcp.seed(author="Bohr", content="design\n\nNEXT: Einstein")
+    mcp.seed(author="Einstein", content=_attested("review\n\nNEXT: Bohr"))
+    mcp.seed(author="Bohr", content="disposition 1\n\nNEXT: Heisenberg")  # m3
+    mcp.seed(
+        author=CONDUCTOR_RELAY_AUTHOR,
+        content="Conductor stop — guard (i) redirect (prior)\n\nNEXT: Bohr",
+    )  # m4: the prior D-1 redirect
+    if with_bounce:
+        mcp.seed(author="Bohr", content=UNLABELLED)  # m5, bounced
+        mcp.seed(author=CONDUCTOR_RELAY_AUTHOR, content=_notice_for("m5"))  # m6
+    mcp.seed(author="Bohr", content="disposition 2\n\nNEXT: Heisenberg")
+    return mcp
+
+
+def _guard_i_conductor(mcp: _FakeChatroomMcp) -> Conductor:
+    return Conductor(
+        mcp=mcp,
+        dispatcher=_ScriptedDispatcher(mcp, {}),
+        thread_ref=_thread_ref(),
+        roster=ROSTER,
+        naysayer_identity="Einstein",
+    )
+
+
+@pytest.mark.parametrize(("with_bounce", "expected"), [(True, False), (False, True)])
+def test_bounce_notice_ends_the_guard_i_episode(with_bounce: bool, expected: bool) -> None:
+    """PR-gate RC on #398: the backwards search stops at a bounce notice (``False``) and does
+    not reach the earlier D-1 redirect; without the notice the same redirect is found."""
+    mcp = _guard_i_thread(with_bounce)
+    conductor = _guard_i_conductor(mcp)
+    assert conductor._has_prior_guard_i_relay_in_episode(mcp._messages, "Bohr") is expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("with_bounce", "target"), [(True, "Bohr"), (False, "human")])
+async def test_redirect_after_a_bounce_goes_back_to_the_author(
+    with_bounce: bool, target: str
+) -> None:
+    """End to end: after a bounce, the next D-1 redirect is a fresh first redirect
+    (``NEXT: Bohr``); without the bounce it is the D-1c second redirect (``NEXT: human``)."""
+    mcp = _guard_i_thread(with_bounce)
+    outcome = await _guard_i_conductor(mcp).run()
+    assert outcome.stop_reason is StopReason.HUMAN
+    last = mcp.posts[-1]
+    assert last["author"] == CONDUCTOR_RELAY_AUTHOR
+    assert not is_bounce_notice(last["content"])
+    assert parse_next_token(last["content"]) == target
