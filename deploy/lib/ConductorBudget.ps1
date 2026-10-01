@@ -60,9 +60,14 @@ function Get-ConductorHardBudgetSeconds {
             $t = $line.Trim()
             if ($t -match '^\[([^\]]+)\]\s*(#.*)?$') { $section = $Matches[1].Trim(); continue }
             if ($section -eq 'conductor' -and $t -match '^run_hard_budget_s\s*=\s*([^#]+?)\s*(#.*)?$') {
+                # A duplicate key is a TOML error: tomllib (which the Python settings use) refuses
+                # the file ("Cannot overwrite a value"). Throw here too, rather than picking the
+                # first or the last occurrence and silently disagreeing with the soft budget's view.
+                if ($null -ne $raw) {
+                    throw "$ConfigPath defines [conductor].run_hard_budget_s more than once (TOML forbids duplicate keys)"
+                }
                 $raw = $Matches[1].Trim()
                 $source = "$ConfigPath [conductor].run_hard_budget_s"
-                break
             }
         }
     }

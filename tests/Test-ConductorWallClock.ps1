@@ -3,7 +3,7 @@
 # endorsed by Einstein msg-5499 / msg-5501).
 #
 #   B  — Get-ConductorHardBudgetSeconds: env first, then [conductor].run_hard_budget_s, then the
-#        default; a value that is not a positive number throws.
+#        default; a value that is not a positive number throws, and so does a duplicate key.
 #   N  — Invoke-ConductorBounded, normal exit: > 64 KB of output does not block the child (files,
 #        not pipes); every line comes back, stderr then stdout; the exit code passes through;
 #        an argument with a space arrives as one argument; the temp files are gone.
@@ -67,6 +67,12 @@ try {
     $threw = $false
     try { Get-ConductorHardBudgetSeconds -ConfigPath $toml -EnvValue '0' | Out-Null } catch { $threw = $true }
     Check 'B5 zero throws' $true $threw
+    $dup = Join-Path $scratch 'dup.toml'
+    Set-Content -LiteralPath $dup -Encoding utf8 -Value @(
+        '[conductor]', 'run_hard_budget_s = 1800', 'run_hard_budget_s = 3600')
+    $threw = $false
+    try { Get-ConductorHardBudgetSeconds -ConfigPath $dup -EnvValue '' | Out-Null } catch { $threw = $true }
+    Check 'B6 a duplicate [conductor] key throws, as tomllib does' $true $threw
 
     # ---------------------------------------------------------------- N
     $chatty = Write-ChildScript 'chatty.ps1' @'
