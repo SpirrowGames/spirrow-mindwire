@@ -57,6 +57,16 @@
 # sure the NEXT unknown failure does not die in the same silent way — i.e., that "the sweep died"
 # announces itself, whatever the reason.
 
+# Launch budgets (T-sweep-starves-deep-candidates, Bohr msg-5588 / msg-5590). Precedence: this
+# argument > environment variable (MINDWIRE_SWEEP_LAUNCH_BUDGET_SEC / MINDWIRE_SWEEP_GATE_BUDGET_SEC)
+# > the default in deploy/lib/SweepFairness.ps1. 0 means "not passed". The scheduled task passes
+# neither, so the env var or the default applies; see docs/deploy.md "Launch fairness" for how
+# these relate to the task's trigger interval.
+param(
+    [int]$LaunchBudgetSeconds = 0,
+    [int]$GateBudgetSeconds = 0
+)
+
 $ErrorActionPreference = "Stop"
 
 # --- tunables ------------------------------------------------------------------------------------
@@ -85,6 +95,11 @@ $QuarantineFailureBudget  = 2
 $QuarantineEscalatedAfter = [TimeSpan]::FromHours(24)
 $QuarantineStaleAfter     = [TimeSpan]::FromDays(7)
 $StarvedThreshold         = [TimeSpan]::FromHours(24)
+# Launch-wait starvation (T-sweep-starves-deep-candidates, msg-5586 §5): a live candidate whose
+# decide verdict has been LAUNCH for this long without being launched. Separate from
+# $StarvedThreshold, because "not evaluated" and "evaluated but never launched" are different
+# failures. W-2c's last_evaluated_at refresh hid the second one (#392 / #361 / #359, 2026-10-02).
+$LaunchWaitStarvedThreshold = [TimeSpan]::FromHours(6)
 
 # Session-log tail length kept with a quarantine record. Kept here to keep the whole tuning
 # surface in one section.
@@ -170,6 +185,9 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # at the bottom). Extracted per Bohr msg-1466 D-3 / Einstein msg-1467 §3-A4: the extracted file is
 # the testability seam, not a refactor.
 . (Join-Path $PSScriptRoot 'lib/StopReason.ps1')
+# Launch fairness (T-sweep-starves-deep-candidates): dispatch order, launch_wait_since, gate lane,
+# and the two-clock admission rule. Pure helpers; the dispatch loop below is a skeleton around them.
+. (Join-Path $PSScriptRoot 'lib/SweepFairness.ps1')
 # Lease.ps1 owns the canonical Get-JsonState (msg-2172 reader collapse). The wrapper's inline
 # reader that used to live at line ~172 is gone; dot-sourcing here brings Get-JsonState into the
 # wrapper's script scope. Order matters: Write-Log is defined further down and Get-JsonState's
@@ -445,12 +463,19 @@ function Update-EvaluatedTimestamp {
     # way out so downstream readers always receive the same shape regardless of whether the value
     # came from disk or from an in-memory write earlier this tick.
     $firstSeen = $null
+    $launchWait = $null
     if ($State.ContainsKey($Key) -and $null -ne $State[$Key]) {
         $priorInstant = ConvertTo-UtcInstant $State[$Key].first_seen_at
         if ($priorInstant) { $firstSeen = $priorInstant.ToString("o") }
+        # launch_wait_since (T-sweep-starves-deep-candidates) is carried through unchanged. An
+        # evaluation is NOT a launch, and resetting the wait clock here is the exact masking that
+        # hid #392 / #361 / #359 from the old starvation metric.
+        $priorWait = ConvertTo-UtcInstant $State[$Key].launch_wait_since
+        if ($priorWait) { $launchWait = $priorWait.ToString("o") }
     }
     $row = @{ last_evaluated_at = $Now.ToUniversalTime().ToString("o") }
     if ($firstSeen) { $row.first_seen_at = $firstSeen }
+    if ($launchWait) { $row.launch_wait_since = $launchWait }
     $State[$Key] = $row
 }
 
@@ -1858,7 +1883,14 @@ function New-DailyDigest {
         # T-retry-once-before-quarantine D-6: the sweep's retry state
         # (ConvertTo-RetryPendingState shape: @{ pending; events }). Default empty, so a caller
         # that predates the retry path renders the same sections it always did.
-        [hashtable]$RetryState = @{ pending = @{}; events = @() }
+        [hashtable]$RetryState = @{ pending = @{}; events = @() },
+        # T-sweep-starves-deep-candidates (msg-5586 §5): launch-wait starvation, the output of
+        # Get-LaunchWaitStarved (deploy/lib/SweepFairness.ps1): objects { key; age }, oldest first.
+        # Computed by the caller so the log line and this section read the same list. The default
+        # is empty, so a caller that predates the metric gets an empty section.
+        [array]$LaunchWaitStarved = @(),
+        # The threshold the caller used to build $LaunchWaitStarved; only rendered in the header.
+        [TimeSpan]$LaunchWaitThreshold = [TimeSpan]::FromHours(6)
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -1993,13 +2025,18 @@ function New-DailyDigest {
     $escalatedList   = @($escalatedList   | Sort-Object -Property AgeSeconds -Descending)
     $quarantinedList = @($quarantinedList | Sort-Object -Property AgeSeconds -Descending)
     $starvedList     = @($starvedList     | Sort-Object -Property AgeSeconds -Descending)
+    # 起動待ち飢餓 rows. Already oldest-first (Get-LaunchWaitStarved sorts them).
+    $launchWaitList = @()
+    foreach ($lw in $LaunchWaitStarved) {
+        $launchWaitList += [PSCustomObject]@{ Line = "  $($lw.key)   $(Format-DurationDigest -Span $lw.age)"; AgeSeconds = [int64]$lw.age.TotalSeconds }
+    }
 
     # Build the compact summary line first (msg-2099 D-1: "1 行目で行動が決まる — 件数と最古の
     # 待ち日数"). Emitted even when both sections are 0 so the format is stable across empty and
     # non-empty days.
     $totalQ = $escalatedList.Count + $quarantinedList.Count + $staleList.Count
     $oldestQuarantineDays = if ($oldestQuarantineAge) { [int]($oldestQuarantineAge.TotalDays) } else { 0 }
-    $summary = "human-parked $($HumanParked.Count) / 隔離 $totalQ / 飢餓 $($starvedList.Count) / 最古 ${oldestQuarantineDays}d" +
+    $summary = "human-parked $($HumanParked.Count) / 隔離 $totalQ / 飢餓 $($starvedList.Count) / 起動待ち $($launchWaitList.Count) / 最古 ${oldestQuarantineDays}d" +
                " / 再試行 $($retryCounts.scheduled) / 回復 $($retryCounts.recovered) / 再試行後隔離 $($retryCounts.quarantined)"
 
     $lines = @()
@@ -2216,6 +2253,12 @@ function New-DailyDigest {
     $starvedHeadLines = @("", "飢餓 (24h 以上評価されていない): $($starvedList.Count) 件")
     if ($starvedList.Count -eq 0) { $starvedHeadLines += "  (該当なし)" }
 
+    # 起動待ち飢餓 (T-sweep-starves-deep-candidates §5): evaluated every tick but not launched.
+    # Emitted at 0 件 too, like 飢餓 above. It is a separate section because it is a separate
+    # failure: these candidates DO get evaluated, which is why 飢餓 could not show them.
+    $launchWaitHeadLines = @("", "起動待ち飢餓 (LAUNCH 判定のまま $([int]$LaunchWaitThreshold.TotalHours)h 以上起動されていない): $($launchWaitList.Count) 件")
+    if ($launchWaitList.Count -eq 0) { $launchWaitHeadLines += "  (該当なし)" }
+
     $footerLines = @(
         ""
         "(0 件でも送信しています — 通知チャネル自体の生存確認を兼ねます。"
@@ -2226,7 +2269,9 @@ function New-DailyDigest {
     # Read bottom-up. Each value is the exact number of characters the renderer will still emit
     # after the named section, with every later row-emitting section reduced to its floor. Passed
     # as -Reserve so a section physically cannot consume a later section's floor.
-    $reserveAfterStarved  = _LinesCost $footerLines
+    $reserveAfterLaunchWait = _LinesCost $footerLines
+    $reserveAfterStarved  = (_LinesCost $launchWaitHeadLines) +
+                            (_SectionFloorCost -Entries $launchWaitList -Indent '  ') + $reserveAfterLaunchWait
     $reserveAfterFetchErr = (_LinesCost $starvedHeadLines) +
                             (_SectionFloorCost -Entries $starvedList -Indent '  ') + $reserveAfterStarved
     $reserveAfterParked   = (_LinesCost $fetchErrHeadLines) +
@@ -2318,6 +2363,15 @@ function New-DailyDigest {
         # defect: on 2026-09-03 it rendered 1 of 3 rows because 隔離 and 判断待ち had already run.
         $runLen = [ref]($lines -join "`n").Length
         $result = _AddSectionEntries -Entries $starvedList -MaxLen $Budget -Reserve $reserveAfterStarved -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
+    }
+
+    # 起動待ち飢餓 is now the last row-emitting section; only the footer follows it.
+    $lines += $launchWaitHeadLines
+    if ($launchWaitList.Count -gt 0) {
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $launchWaitList -MaxLen $Budget -Reserve $reserveAfterLaunchWait -RunningLen $runLen
         $lines += $result.Emitted
         $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
@@ -3906,6 +3960,9 @@ function Invoke-GateBootstrapTick {
 $exitCode = 0
 try {
     Write-Log "=== scheduled conductor run starting (host $env:COMPUTERNAME, user $env:USERNAME) ==="
+    # tickElapsed's origin (T-sweep-starves-deep-candidates, msg-5590): the START of the tick, so
+    # LaunchBudgetSeconds bounds everything (sync, probes, decide, launches), not just the loop.
+    $tickStartUtc = Get-SweepNowUtc
 
     # Loaded before the deploy step, which already needs it to dedupe its own alerts.
     $notifyState = Get-JsonState -Path $notifyStatePath
@@ -3956,6 +4013,13 @@ try {
     # Backstop for probe input files a previous run could not remove (T-parked-humans-probe-has-
     # no-timeout, Bohr msg-5414 §2). Before the sweep, so it runs every tick that sweeps.
     Remove-StaleProbeInputFiles
+
+    # Launch budgets: argument > env > default, and GateBudgetSeconds < LaunchBudgetSeconds, or the
+    # tick aborts here as a configuration error (Resolve-SweepBudgets throws). Resolved AFTER the
+    # deploy step on purpose: a bad budget must not also stop the sync that could ship its fix.
+    $sweepBudgets = Resolve-SweepBudgets -LaunchArgument $LaunchBudgetSeconds -GateArgument $GateBudgetSeconds `
+        -LaunchEnv ([Environment]::GetEnvironmentVariable($script:SweepLaunchBudgetEnv)) `
+        -GateEnv ([Environment]::GetEnvironmentVariable($script:SweepGateBudgetEnv))
 
     $candidates = Get-SweepCandidates -Path $sweepConfigPath
     Write-Log "sweep list ($($candidates.Count) candidates from $sweepConfigPath): $(($candidates | ForEach-Object { $_.key }) -join ', ')"
@@ -4109,6 +4173,7 @@ try {
     # structurally invisible to the starvation metric and re-play msg-1427 §1's 12-hour silence
     # on the metric layer.
     $headSkipMode = Get-HeadSkipMode
+    $decideStartUtc = Get-SweepNowUtc
     $decideVerdicts = @{}
     foreach ($proj in ($candidates | ForEach-Object { $_.project } | Sort-Object -Unique)) {
         $projControl = $controlByProject[$proj]
@@ -4143,6 +4208,8 @@ try {
             $decideVerdicts["$proj/$tid"] = $decideResult.verdicts[$tid]
         }
     }
+
+    $decideSeconds = Get-SweepElapsedSeconds -Since $decideStartUtc -Now (Get-SweepNowUtc)
 
     # W-2c: refresh the starvation clock for every candidate that received a decide verdict.
     # See Update-EvaluatedTimestamp's header for the full "which dispositions count as evaluated"
@@ -4206,6 +4273,38 @@ try {
         if (-not $evaluatedState.ContainsKey($k)) {
             $evaluatedState[$k] = @{ first_seen_at = $nowUtc.ToString("o") }
         }
+    }
+
+    # --- launch fairness (T-sweep-starves-deep-candidates, Bohr msg-5592 / msg-5596) ------------
+    # launch_wait_since from the verdicts: SKIP clears it, LAUNCH sets it if absent, DEFER keeps it.
+    # Each candidate that actually launches clears it again in the loop. Report mode is a dry run
+    # that launches nothing, so it leaves the clock alone (otherwise every LAUNCH would accrue wait
+    # and show up as launch-wait starvation for a sweep that was never meant to launch).
+    if ($headSkipMode -ne 'report') {
+        Update-LaunchWaitFromVerdicts -EvaluatedState $evaluatedState -Verdicts $decideVerdicts -Now $nowUtc
+    }
+    # Dispatch order: non-launch candidates first (sweep.json order), then the gate lane, then the
+    # role lane, each lane oldest launch_wait_since first (Get-OrderedSweepCandidates). The dispatch
+    # loop below must iterate `$candidates` (tests/Test-SweepSequentiality.ps1 S2), so the ordered
+    # list is put in that variable for the loop and the sweep.json order is restored right after it.
+    # Everything after the loop that walks $candidates (the not-reached pass, the parked-humans poll)
+    # keeps sweep.json order.
+    $sweepOrderCandidates = $candidates
+    $candidates = Get-OrderedSweepCandidates -Candidates $sweepOrderCandidates -Verdicts $decideVerdicts `
+        -EvaluatedState $evaluatedState -Now $nowUtc
+    $gateCandidateCount = @($candidates | Where-Object {
+        $decideVerdicts.ContainsKey($_.key) -and (Get-SweepLane -Verdict $decideVerdicts[$_.key]) -eq 'gate' }).Count
+    $launchScheduler = New-LaunchScheduler -LaunchBudgetSeconds $sweepBudgets.launch -GateBudgetSeconds $sweepBudgets.gate
+    # loopElapsed's origin: decide time is excluded, so a slow decide cannot close the gate lane
+    # (Einstein msg-5589). The tick budget (tickElapsed) still includes it.
+    $loopStartUtc = Get-SweepNowUtc
+    $preLoopSeconds = Get-SweepElapsedSeconds -Since $tickStartUtc -Now $loopStartUtc
+    if ($preLoopSeconds -ge $sweepBudgets.launch) {
+        Confirm-LogWorthKeeping
+        $overheadWhat = if ($decideSeconds -ge $sweepBudgets.launch) { 'decide overhead exceeds launch budget' }
+                        else { 'pre-loop overhead exceeds launch budget' }
+        Write-Log (("WARN $overheadWhat (pre-loop={0:N1}s decide={1:N1}s launch budget={2}s) — nothing will be " +
+                    "launched this tick; fix the budget or the slow phase") -f $preLoopSeconds, $decideSeconds, $sweepBudgets.launch)
     }
 
     $inner = Join-Path $PSScriptRoot "run-conductor.ps1"
@@ -4362,8 +4461,26 @@ try {
             continue
         }
 
+        # Admission (T-sweep-starves-deep-candidates, msg-5596): checked immediately before each
+        # launch, against the two clocks. Every decision is recorded in $launchScheduler.attempts.
+        $lane = Get-SweepLane -Verdict $v
+        $admitNow = Get-SweepNowUtc
+        $admission = Request-LaunchAdmission -Scheduler $launchScheduler -Lane $lane -Key $cand.key `
+            -TickElapsed (Get-SweepElapsedSeconds -Since $tickStartUtc -Now $admitNow) `
+            -LoopElapsed (Get-SweepElapsedSeconds -Since $loopStartUtc -Now $admitNow)
+        if (-not $admission.admit) {
+            if ($admission.scope -eq 'break') {
+                Confirm-LogWorthKeeping
+                Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — launch budget spent (lane=$lane), not launching it or anything after it (launch_wait_since kept)"
+                $breakReason = 'time-budget'
+                break
+            }
+            Write-Log "candidate $attempt/$($candidates.Count): $($cand.key) — gate lane closed ($($admission.reason)), not launching (launch_wait_since kept)"
+            continue
+        }
+
         Confirm-LogWorthKeeping
-        Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) (head_skip LAUNCH, reason=$($v.reason), token=$($v.token)) ---"
+        Write-Log "--- candidate $attempt/$($candidates.Count): $($cand.key) (head_skip LAUNCH, lane=$lane, admission=$($admission.reason), reason=$($v.reason), token=$($v.token)) ---"
         # commit-launch BEFORE spawn: the "session-start-before write" contract that survives a
         # forced kill (head_skip.py docstring, test #10). The record is written with
         # attempts_after=v.attempts_after so the backoff floor applies to any retry, even one after
@@ -4393,6 +4510,9 @@ try {
         Set-TomlValue -Path $configPath -Section 'conductor' -Key 'task_thread_id' -Value $thread
 
         $launched++
+        # Past commit-launch, so this IS a launch: G counts it, and the wait clock clears.
+        Complete-LaunchAttempt -Scheduler $launchScheduler -Lane $lane -Outcome 'launched'
+        Clear-LaunchWait -EvaluatedState $evaluatedState -Key $cand.key
         # T42 stall watchdog: hand the conductor the same-head launch count the commit above just
         # recorded, pinned to the head it was counted on. The conductor stands down (posts STALLED,
         # `NEXT: human`, exit 0) at the threshold; the sweep only counts (it never posts).
@@ -4694,9 +4814,14 @@ try {
 
         if ($verdict.rounds -gt 0) {
             $dispositions[$cand.key] = 'worked'
-            Write-Log "thread did work (rounds=$($verdict.rounds), reason=$($verdict.reason)) — sweep done"
             $didWork = $true
-            break
+            # Gate lane: work does not end the sweep (msg-5586 §2). Role lane: it does, as before.
+            if ((Get-PostRunAction -Lane $lane -Rounds $verdict.rounds) -eq 'break') {
+                Write-Log "thread did work (rounds=$($verdict.rounds), reason=$($verdict.reason)) — sweep done"
+                break
+            }
+            Write-Log "gate did work (rounds=$($verdict.rounds), reason=$($verdict.reason)) — gate lane continues"
+            continue
         }
         $dispositions[$cand.key] = 'no-work'
         Write-Log "no work (rounds=0, reason=$($verdict.reason)) — advancing to the next candidate"
@@ -4707,11 +4832,32 @@ try {
     # "we did not ask." Different failure modes, different fixes (candidate order vs. probe gap vs.
     # sweep break). Not-reached does NOT reset the evaluation timestamp — that is how a permanently
     # backed-up sweep shows up as starvation instead of "healthy and idle."
+    $candidates = $sweepOrderCandidates
     foreach ($cand in $candidates) {
         if (-not $dispositions.ContainsKey($cand.key)) {
             $dispositions[$cand.key] = 'not-reached'
             $notReached++
         }
+    }
+
+    # Tick timing (msg-5590): one line every tick, so the budgets can be tuned against measurements.
+    $tickEndUtc = Get-SweepNowUtc
+    $tickSeconds = Get-SweepElapsedSeconds -Since $tickStartUtc -Now $tickEndUtc
+    $loopSeconds = Get-SweepElapsedSeconds -Since $loopStartUtc -Now $tickEndUtc
+    $gateClosedNote = if ($launchScheduler.gate_closed_reason) { ", gate lane closed: $($launchScheduler.gate_closed_reason)" } else { '' }
+    Write-Log ("tick elapsed={0:N1}s decide={1:N1}s loop={2:N1}s budget=gate {3}/launch {4}s (gate launched {5}/{6} of {7} candidate(s){8})" -f `
+        $tickSeconds, $decideSeconds, $loopSeconds, $sweepBudgets.gate, $sweepBudgets.launch,
+        $launchScheduler.gate_launched, $launchScheduler.gate_max, $gateCandidateCount, $gateClosedNote)
+    if ($tickSeconds -gt $sweepBudgets.launch) {
+        # Admission bounds when a launch may START, not how long it runs, so a launch admitted near
+        # the budget can take the tick past it. Said loudly so the numbers get revisited.
+        Confirm-LogWorthKeeping
+        Write-Log ("WARN tick exceeded launch budget (elapsed={0:N1}s > launch {1}s)" -f $tickSeconds, $sweepBudgets.launch)
+    }
+    $invariantViolation = Test-GateAdmissionInvariant -Scheduler $launchScheduler -GateCandidateCount $gateCandidateCount
+    if ($invariantViolation) {
+        Confirm-LogWorthKeeping
+        Write-Log "WARN gate admission invariant violated: $invariantViolation"
     }
     Write-Log ("dispositions: " + (($dispositions.Keys | Sort-Object | ForEach-Object { "$($_)=$($dispositions[$_])" }) -join ', '))
 
@@ -4740,6 +4886,15 @@ try {
     if ($starved.Count -gt 0) {
         Confirm-LogWorthKeeping
         Write-Log "starved threads (>=$(Format-DurationDigest -Span $StarvedThreshold) since last evaluation): $($starved -join ', ')"
+    }
+    # Launch-wait starvation (msg-5586 §5): evaluated, LAUNCH, and still not launched. A separate
+    # line from the one above, because it is a separate failure.
+    $launchWaitStarved = Get-LaunchWaitStarved -EvaluatedState $evaluatedState -LiveKeys $liveKeys `
+        -Now $nowUtc -Threshold $LaunchWaitStarvedThreshold
+    if ($launchWaitStarved.Count -gt 0) {
+        Confirm-LogWorthKeeping
+        Write-Log ("launch-wait starved threads (>=$(Format-DurationDigest -Span $LaunchWaitStarvedThreshold) LAUNCH without a launch): " +
+                   (($launchWaitStarved | ForEach-Object { "$($_.key) ($(Format-DurationDigest -Span $_.age))" }) -join ', '))
     }
 
     # T-decision-request-composer S4 (D-32). Poll for threads currently parked on a human
@@ -4829,7 +4984,8 @@ try {
                 -ParkedPollErrors $parkedPollErrors `
                 -Budget $DigestBudget `
                 -HealthWarning $healthWarning `
-                -RetryState $retryState
+                -RetryState $retryState `
+                -LaunchWaitStarved $launchWaitStarved -LaunchWaitThreshold $LaunchWaitStarvedThreshold
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest
