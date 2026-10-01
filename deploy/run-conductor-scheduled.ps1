@@ -1664,6 +1664,19 @@ function New-DailyDigest {
             }
         }
         $suffix = if ($questionSnippet) { "   — $questionSnippet" } else { "   — (問い未生成)" }
+        # D7 (T-next-role-name-stands-down-to-human): a park that is not a decision says so on its
+        # row, so it is not read as one. The lane comes from scripts/parked_humans.py.
+        $lane = if ($p.PSObject.Properties.Name -contains 'lane' -and $p.lane) { "$($p.lane)" } else { 'decision' }
+        if ($lane -eq 'operator_work') {
+            $task = if ($p.PSObject.Properties.Name -contains 'operator_task') { "$($p.operator_task)" } else { '' }
+            $suffix = "   — [operator 作業] $task"
+        }
+        elseif ($lane -eq 'misroute') {
+            $suffix = "   — [宛先誤り・再ルーティング待ち]"
+        }
+        elseif (($p.PSObject.Properties.Name -contains 'protocol_violation') -and $p.protocol_violation) {
+            $suffix = "   — [protocol 違反: Tier-C を operator に渡そうとした]$suffix"
+        }
         $parkedEntries += [PSCustomObject]@{ Line = "  $key   [$head]$suffix"; AgeSeconds = 0 }
     }
 
@@ -1683,7 +1696,16 @@ function New-DailyDigest {
     $escHeadLine   = "  [escalated] — 24h 以上経過"
     $quarHeadLine  = "  [quarantined]"
 
-    $parkedHeadLines = @("", "判断待ち: $($HumanParked.Count) 件")
+    # D7: the header counts decisions only; operator work and misroutes are named next to it.
+    $laneOf = { param($x) if ($x.PSObject.Properties.Name -contains 'lane' -and $x.lane) { "$($x.lane)" } else { 'decision' } }
+    $operatorCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'operator_work' }).Count
+    $misrouteCount = @($HumanParked | Where-Object { (& $laneOf $_) -eq 'misroute' }).Count
+    $decisionCount = $HumanParked.Count - $operatorCount - $misrouteCount
+    $parkedHeader = "判断待ち: $decisionCount 件"
+    if ($operatorCount -gt 0 -or $misrouteCount -gt 0) {
+        $parkedHeader += "（ほか operator 作業 $operatorCount 件 / 宛先誤り $misrouteCount 件）"
+    }
+    $parkedHeadLines = @("", $parkedHeader)
     if ($HumanParked.Count -eq 0) { $parkedHeadLines += "  (該当なし)" }
 
     # The count-line stays unconditional (PR-gate review round 2, 2026-08-30): the operator needs
@@ -3069,6 +3091,12 @@ function Invoke-ParkedHumansProbe {
             thread_id   = "$($p.thread_id)"
             head_msg_id = "$($p.head_msg_id)"
             token       = "$($p.token)"
+            # D7 (T-next-role-name-stands-down-to-human): the board lane, decided Python-side by
+            # spirrow_mindwire.conductor.parked_lane. A probe that predates the field reads as
+            # 'decision', which is how every park was listed before.
+            lane               = if ($p.PSObject.Properties.Name -contains 'lane' -and $p.lane) { "$($p.lane)" } else { 'decision' }
+            operator_task      = if ($p.PSObject.Properties.Name -contains 'operator_task') { "$($p.operator_task)" } else { '' }
+            protocol_violation = ($p.PSObject.Properties.Name -contains 'protocol_violation') -and [bool]$p.protocol_violation
         }
     }
     $errorsOut = @()

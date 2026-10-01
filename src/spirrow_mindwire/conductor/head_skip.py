@@ -101,7 +101,14 @@ from typing import Any
 
 from spirrow_mindwire.chatroom.status import is_terminal_status
 
-from .handoff import HUMAN_TOKEN, NONE_TOKEN, parse_next_token
+from .handoff import (
+    HUMAN_TOKEN,
+    NONE_TOKEN,
+    OPERATOR_TOKEN,
+    HumanAsk,
+    parse_next_token,
+    resolve_handoff,
+)
 
 # --- Constants (policy calls, not derived values) ------------------------------------------------
 #
@@ -154,7 +161,20 @@ HEAD_CACHE_TTL: timedelta = timedelta(minutes=60)
 # to it silently expands the skip surface (the exact failure this module was written to prevent),
 # and removing from it silently shrinks the launch-open surface (a stop signal would become a spin
 # instead of a quiet park). Any change here needs a test change and an ADR reference.
-STOP_TOKENS: frozenset[str] = frozenset({NONE_TOKEN, HUMAN_TOKEN})
+#
+# ``operator`` joined with T-next-role-name-stands-down-to-human D5 (Bohr msg-5416, design approved
+# by Einstein msg-5429): a ``NEXT: operator`` parks exactly like ``NEXT: human``. No ADR covers
+# it; the decision reference is that thread. It is the one member that is CONDITIONAL: Stage 1
+# SKIPs it only when the head is a well-formed operator request (:func:`_is_parked_operator`). A
+# malformed one must launch, because the conductor is what posts the stand-down notice that moves
+# the head — skipping it here would park it silently, which is the failure this set guards.
+STOP_TOKENS: frozenset[str] = frozenset({NONE_TOKEN, HUMAN_TOKEN, OPERATOR_TOKEN})
+
+
+def _is_parked_operator(head_body: str) -> bool:
+    """Is this ``NEXT: operator`` head the accepted 3-line form? Asks the grammar owner."""
+    return resolve_handoff(head_body, {}).human_ask is HumanAsk.OPERATOR_WORK
+
 
 # Conductor stop reasons that TERMINATE a thread until its head moves (design §6.2).
 #
@@ -425,7 +445,7 @@ def decide(
     # so the closed-set invariant is visible: this is the ONLY place the head-skip cache can
     # return SKIP, and expanding it requires editing STOP_TOKENS. Any downstream code that
     # short-circuits SKIP on other conditions is a bug (see test #13).
-    if token in STOP_TOKENS:
+    if token in STOP_TOKENS and (token != OPERATOR_TOKEN or _is_parked_operator(head_body)):
         return Verdict(
             decision=Decision.SKIP,
             reason="stop-token",

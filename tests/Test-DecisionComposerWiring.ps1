@@ -390,6 +390,25 @@ CheckTrue 'row lists the key' ($section -match 'p/T-a') $section
 CheckTrue 'row lists the head msg id' ($section -match '\[msg-100\]') $section
 CheckTrue 'placeholder present when cache is empty' ($section -match '\(問い未生成\)') $section
 
+# --- D7 (T-next-role-name-stands-down-to-human): lanes from scripts/parked_humans.py -----------
+Write-Host ''
+Write-Host 'New-DailyDigest — operator work / misroute are counted apart from decisions and labelled'
+$parkedLanes = @(
+    [PSCustomObject]@{ key = 'p/T-d'; project = 'p'; thread_id = 'T-d'; head_msg_id = 'msg-1'; lane = 'decision'; operator_task = ''; protocol_violation = $false }
+    [PSCustomObject]@{ key = 'p/T-o'; project = 'p'; thread_id = 'T-o'; head_msg_id = 'msg-2'; lane = 'operator_work'; operator_task = 'install the pre-commit hook'; protocol_violation = $false }
+    [PSCustomObject]@{ key = 'p/T-m'; project = 'p'; thread_id = 'T-m'; head_msg_id = 'msg-3'; lane = 'misroute'; operator_task = ''; protocol_violation = $false }
+    [PSCustomObject]@{ key = 'p/T-v'; project = 'p'; thread_id = 'T-v'; head_msg_id = 'msg-4'; lane = 'decision'; operator_task = ''; protocol_violation = $true }
+)
+$digestLanes = New-DailyDigest -QuarantineState @{} -EvaluatedState @{} `
+    -HeadsByProject @{} -ControlByProject @{} -Now $script:nowUtc -LiveKeys @() `
+    -HumanParked $parkedLanes -PendingDecisionsState @{} -ParkedPollErrors @()
+$section = Get-DigestSection -Digest $digestLanes -Header '判断待ち:'
+CheckTrue 'header counts decisions only (2 of 4)' ($section -match '判断待ち: 2 件') $section
+CheckTrue 'header names the operator / misroute counts' ($section -match 'operator 作業 1 件 / 宛先誤り 1 件') $section
+CheckTrue 'operator row shows its task' ($section -match 'p/T-o.*\[operator 作業\] install the pre-commit hook') $section
+CheckTrue 'misroute row is labelled' ($section -match 'p/T-m.*\[宛先誤り・再ルーティング待ち\]') $section
+CheckTrue 'protocol-violation decision row is labelled and keeps its question slot' ($section -match 'p/T-v.*\[protocol 違反: Tier-C を operator に渡そうとした\].*\(問い未生成\)') $section
+
 # --- N>0 with a matching cache row: question is enriched onto the row --------------------------
 Write-Host ''
 Write-Host 'New-DailyDigest — matching cache row folds the question snippet onto the row'

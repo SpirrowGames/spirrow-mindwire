@@ -21,6 +21,7 @@ import pytest
 
 from spirrow_mindwire.adapters.decider_lexora import DeciderLexoraAdapter, decide_once
 from spirrow_mindwire.conductor.handoff import (
+    _ROLE_HANDOFF_GUIDANCE,
     TIER_C_CHECK_KEYWORD,
     TIER_C_CHECK_NONE,
     build_handoff_protocol_block,
@@ -224,7 +225,11 @@ def test_declares_no_tier_c_rejects_everything_else(body: str) -> None:
 def test_naysayer_guidance_teaches_the_check_line() -> None:
     block = build_handoff_protocol_block(Role.NAYSAYER)
     assert f"`{TIER_C_CHECK_KEYWORD}: {TIER_C_CHECK_NONE}`" in block
-    assert f"{TIER_C_CHECK_KEYWORD}" not in build_handoff_protocol_block(Role.PROPOSER)
+    # The proposer's OWN guidance never teaches the check line (it is the naysayer's proceed
+    # declaration). The shared protocol does carry it since T-next-role-name-stands-down-to-human
+    # D4''' (msg-5426): it is the middle line of the ``NEXT: operator`` form every role may use,
+    # and it has no effect on guard (i) there (carve-out ③ reads it only from a naysayer).
+    assert f"{TIER_C_CHECK_KEYWORD}" not in _ROLE_HANDOFF_GUIDANCE[Role.PROPOSER]
 
 
 # --------------------------------------------------------------------------- #

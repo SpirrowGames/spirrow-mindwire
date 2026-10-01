@@ -183,10 +183,12 @@ def test_only_the_two_stop_tokens_return_skip(token: str) -> None:
     assert verdict.decision is not Decision.SKIP
 
 
-def test_stop_tokens_frozen_set_is_exactly_none_and_human() -> None:
+def test_stop_tokens_frozen_set_is_exactly_none_human_and_operator() -> None:
     # A separate pin so a would-be expander of the closed set has to update this test AND remove
     # the invariant reason above. Frozenset equality would be brittle to reorderings; use set().
-    assert set(STOP_TOKENS) == {"none", "human"}
+    # ``operator`` joined with T-next-role-name-stands-down-to-human D5 (msg-5416 / msg-5429), and
+    # is conditional on a well-formed head (tests/test_next_role_alias_and_operator.py).
+    assert set(STOP_TOKENS) == {"none", "human", "operator"}
 
 
 # --- 3. fail-open on UNRESOLVED -----------------------------------------------------------------
