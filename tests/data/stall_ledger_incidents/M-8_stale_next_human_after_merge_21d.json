@@ -1,0 +1,38 @@
+{
+  "id": "M-8",
+  "title": "stale NEXT: human on T-operator-board for ~21 days after PR #243 was merged",
+  "observed_by": "operator",
+  "observed_at": "2026-09-30T00:00Z",
+  "spec_thread": "T-operator-board",
+  "spec_msg_ids": [
+    "msg-2830",
+    "msg-4882",
+    "msg-4898"
+  ],
+  "provenance": {
+    "source": "chatroom body + gh: PR #243 merge commit b88e7742f2b5 merged 2026-09-09T06:32:20Z (takayan0908); T-operator-board head stayed msg-2830 (PR-gate APPROVE relay, NEXT: human) until operator msg-4882 unparked it (~21 days)",
+    "captured_at": "2026-10-01T00:00Z",
+    "captured_by": "Heisenberg (implementer), from operator msg-4882 and Bohr msg-4898 §2"
+  },
+  "predicate_input": {
+    "kind": "thread",
+    "identifier": "spirrow-mindwire/T-operator-board",
+    "thread_state": {
+      "status": "active",
+      "dormant_until_expired": true
+    },
+    "n_threshold_hours": 6,
+    "hours_since_last_participant_motion": 500
+  },
+  "expected_verdict": "not-representable",
+  "not_representable_reason": "Three-layer structural residual (Bohr msg-2831 §3(a), Einstein msg-2749 §5). (schema layer) no field on the ThreadState / request boundary carries the completion time of the awaited Tier-C act; (granularity layer) such a field would have to live on the INDIVIDUAL REQUEST rather than on ThreadState because a single 'NEXT: human' line can carry more than one Tier-C request (Einstein E-10); (consumer layer) scripts/parked_humans.py reads only the thread head's last NEXT: line and has no concept of act-fulfilment (Einstein E-9), so a ledger-side fix alone cannot preserve the §7 disjointness. Absent all three, the incident (merged, thread silent) and a valid counterexample (Tier-C not yet performed) construct byte-equivalent ThreadState objects — see test_m5_collision_pin_incident_equivalent_to_valid_wait for the machine assertion.",
+  "residual": {
+    "receipt_thread": "T-next-line-carries-who-not-why",
+    "missing_layers": [
+      "schema: no field carries the completion time of the awaited act",
+      "granularity: a fulfilment field would have to live on the individual request, not on ThreadState — a single 'NEXT: human' line can carry more than one request (Einstein E-10)",
+      "consumer: scripts/parked_humans.py reads only the thread head's last NEXT: line and has no concept of act-fulfilment (Einstein E-9), so a ledger-side fix alone cannot preserve the §7 disjointness"
+    ]
+  },
+  "notes": "Same class as M-5, recorded separately because it recurred at 26x the duration (19h -> ~21 days) after M-5 was captured. msg-2830 was a PR-gate APPROVE relay with 'NEXT: human' (the Tier-C merge of #243). The human merged #243 on 2026-09-09; nothing advanced the thread afterwards, and T-operator-board had P0..P4 still pending, so closing it would have been wrong too (Einstein msg-4899 BLOCKING). The fix path chosen by the human decide after msg-4901 is the successor T-merged-pr-advances-thread (merge -> post to the relaying thread and hand to the proposer; NEXT: none only on an explicit 'Closes-thread:' declaration). That successor acts on the merge event itself and does not need the stall detector to represent this shape; the detector-side residual stays as in M-5. hours_since_last_participant_motion is an approximation (~21 days); msg-2830's exact post time was not read in this turn."
+}
