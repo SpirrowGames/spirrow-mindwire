@@ -442,3 +442,59 @@ def test_cli_malformed_stdin_exits_2() -> None:
     code, _, stderr = _run_cli("--stdin-json", stdin="not json")
     assert code == 2
     assert "stdin" in stderr.lower() or "json" in stderr.lower()
+
+
+# --- CLI: --input <file> (T-parked-humans-probe-has-no-timeout, Bohr msg-5414 §4) ---
+
+
+def test_cli_input_file_matches_stdin_json(tmp_path: Path) -> None:
+    """``--input <file>`` yields exactly what ``--stdin-json`` yields for the
+    same payload — the wrapper switched transports, not semantics."""
+
+    payload_in = json.dumps({"repo_dirs": ["not-absolute", "also-not-absolute"]})
+    f = tmp_path / "in.json"
+    f.write_text(payload_in, encoding="utf-8")
+    code_f, out_f, err_f = _run_cli("--input", str(f))
+    code_s, out_s, _ = _run_cli("--stdin-json", stdin=payload_in)
+    assert code_f == 0, f"stderr={err_f!r}"
+    assert code_s == 0
+    assert json.loads(out_f) == json.loads(out_s)
+
+
+def test_cli_input_and_stdin_json_are_exclusive(tmp_path: Path) -> None:
+    """Passing both sources is a wiring bug: argparse rejects it with exit 2."""
+
+    f = tmp_path / "in.json"
+    f.write_text(json.dumps({"repo_dirs": ["x"]}), encoding="utf-8")
+    code, _, stderr = _run_cli("--input", str(f), "--stdin-json", stdin="{}")
+    assert code == 2
+    assert "not allowed" in stderr
+
+
+def test_cli_input_malformed_file_exits_2(tmp_path: Path) -> None:
+    """A malformed file exits 2 and the error names the file source, not stdin."""
+
+    f = tmp_path / "in.json"
+    f.write_text("not json", encoding="utf-8")
+    code, _, stderr = _run_cli("--input", str(f))
+    assert code == 2
+    assert "file JSON" in stderr
+    assert "stdin" not in stderr
+
+
+def test_cli_input_wrong_shape_exits_2(tmp_path: Path) -> None:
+    """Valid JSON with the wrong shape is rejected with the file wording."""
+
+    f = tmp_path / "in.json"
+    f.write_text(json.dumps({"repo_dirs": "not-a-list"}), encoding="utf-8")
+    code, _, stderr = _run_cli("--input", str(f))
+    assert code == 2
+    assert "file JSON must have 'repo_dirs'" in stderr
+
+
+def test_cli_input_missing_file_exits_2(tmp_path: Path) -> None:
+    """An unreadable path is malformed CLI input, exit 2."""
+
+    code, _, stderr = _run_cli("--input", str(tmp_path / "absent.json"))
+    assert code == 2
+    assert "cannot read file input" in stderr

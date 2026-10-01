@@ -15,6 +15,14 @@ Input:
     --repo-dir <PATH>         (repeatable)
 Or:
     --stdin-json              (reads {"repo_dirs": ["...", "..."]} from stdin)
+Or:
+    --input <PATH>            (reads the same {"repo_dirs": [...]} object from a
+                               UTF-8 file; mutually exclusive with --stdin-json)
+
+The sweep wrapper uses ``--input``: it closes the child's stdin immediately
+after start so a probe can never block on an EOF that does not propagate
+through the ``uv`` -> venv trampoline -> python chain
+(T-parked-humans-probe-has-no-timeout, Bohr msg-5414 §4).
 
 Output (stdout, always exactly one JSON object, ASCII-only):
     {"resolutions": [
@@ -53,27 +61,51 @@ if _reconfigure_err is not None:
     _reconfigure_err(errors="backslashreplace")
 
 
+def _parse_repo_dirs_payload(raw: str, source: str) -> list[str]:
+    """Validate a ``{"repo_dirs": [str, ...]}`` payload read from ``source``.
+
+    ``source`` is ``"stdin"`` or ``"file"`` and only changes the wording of the
+    error, so an operator reading the log knows which input was malformed.
+    """
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"resolve_resource: cannot parse {source} JSON: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    if not isinstance(payload, dict):
+        print(f"resolve_resource: {source} JSON must be an object", file=sys.stderr)
+        raise SystemExit(2)
+    rds = payload.get("repo_dirs")
+    if not isinstance(rds, list) or not all(isinstance(x, str) for x in rds):
+        print(
+            f"resolve_resource: {source} JSON must have 'repo_dirs': [str, ...]",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return rds
+
+
 def _read_repo_dirs(args: argparse.Namespace) -> list[str]:
-    if args.stdin_json:
-        try:
-            payload = json.load(sys.stdin)
-        except json.JSONDecodeError as exc:
-            print(f"resolve_resource: cannot parse stdin JSON: {exc}", file=sys.stderr)
-            raise SystemExit(2) from exc
-        if not isinstance(payload, dict):
-            print("resolve_resource: stdin JSON must be an object", file=sys.stderr)
-            raise SystemExit(2)
-        rds = payload.get("repo_dirs")
-        if not isinstance(rds, list) or not all(isinstance(x, str) for x in rds):
+    if args.input is not None:
+        if args.repo_dir:
             print(
-                "resolve_resource: stdin JSON must have 'repo_dirs': [str, ...]",
+                "resolve_resource: --input cannot be combined with --repo-dir",
                 file=sys.stderr,
             )
             raise SystemExit(2)
-        return rds
+        try:
+            with open(args.input, encoding="utf-8") as f:
+                raw = f.read()
+        except OSError as exc:
+            print(f"resolve_resource: cannot read file input: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        return _parse_repo_dirs_payload(raw, "file")
+    if args.stdin_json:
+        return _parse_repo_dirs_payload(sys.stdin.read(), "stdin")
     if not args.repo_dir:
         print(
-            "resolve_resource: at least one --repo-dir is required (or --stdin-json)",
+            "resolve_resource: at least one --repo-dir is required (or --input / --stdin-json)",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -99,10 +131,17 @@ def main() -> int:
         default=None,
         help="One repo_dir to resolve; repeat for a batch",
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
         "--stdin-json",
         action="store_true",
         help="Read {'repo_dirs': [str, ...]} from stdin instead of --repo-dir",
+    )
+    source.add_argument(
+        "--input",
+        default=None,
+        metavar="PATH",
+        help="Read {'repo_dirs': [str, ...]} from a UTF-8 file instead of --repo-dir",
     )
     args = parser.parse_args()
 
