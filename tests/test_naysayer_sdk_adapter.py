@@ -993,8 +993,9 @@ async def test_shutdown_failure_after_successful_turn_is_propagated(
     # Contract match with the main ``except`` blocks:
     assert "subprocess may have leaked" in str(excinfo.value)
     # The exception carries the same code as session.error so the conductor's ``error_code=`` can
-    # name it (T-successful-turn-quarantined-on-sdk-lifecycle-failure, msg-4440).
-    assert getattr(excinfo.value, "code", None) == "adapter.shutdown_failed"
+    # name it (T-successful-turn-quarantined-on-sdk-lifecycle-failure, msg-4440). ``code`` is
+    # declared on the base ``AdapterDeliveryError`` (msg-4910), so this is a typed read.
+    assert excinfo.value.code == "adapter.shutdown_failed"
     # The code lives on the class (one place); session.error reads the same attribute,
     # and the subclass still satisfies every ``except NaysayerSdkDeliveryError`` site.
     assert type(excinfo.value) is NaysayerSdkShutdownError
