@@ -21,7 +21,6 @@ from spirrow_mindwire.conductor.handoff import (
     resolve_handoff,
 )
 from spirrow_mindwire.github.client import PrRef, parse_pr_ref
-from spirrow_mindwire.tier_c_admission_gate import require_admitted
 from spirrow_mindwire.value_objects import Role
 
 _ROSTER = {"Bohr": Role.PROPOSER, "Heisenberg": Role.IMPLEMENTER, "Einstein": Role.NAYSAYER}
@@ -1344,15 +1343,9 @@ class TestLabelProseIsDerivedNotHardcoded:
         with pytest.raises(RuntimeError):
             handoff._check_label_definitions(missing, ADMIT_LABELS)
 
-    def test_example_label_must_be_admitted(self) -> None:
-        from spirrow_mindwire.conductor import handoff
-
-        # The worked examples call require_admitted directly (the one-line wrapper is gone), so
-        # pin both the check itself and that the rendered examples carry admitted labels.
-        assert require_admitted("goal", where="handoff example") == "goal"
-        with pytest.raises(RuntimeError, match="scope"):
-            require_admitted("scope", where="handoff example")
-        assert not hasattr(handoff, "_admitted_example")
+    def test_worked_examples_render_admitted_labels(self) -> None:
+        # require_admitted itself is covered in tests/test_relay_route.py, and importing this
+        # module already proves the import-time check passed; pin only the rendered output here.
         assert "    TIER-C: goal\n" in build_handoff_protocol_block(Role.PROPOSER)
         assert "    TIER-C: merge-protected\n" in build_handoff_protocol_block(Role.IMPLEMENTER)
 
