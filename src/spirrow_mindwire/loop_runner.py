@@ -74,16 +74,19 @@ from pathlib import Path
 from .adapters._sdk_result import emit_sdk_error_marker, find_sdk_error_signal
 from .adapters.claude_code_sdk import ClaudeCodeSdkAdapter, _PathScopeGuard
 from .adapters.decider_lexora import build_decider
+from .adapters.decider_lexora import resolve_backend as resolve_decider_backend
 from .adapters.implementer import ImplementerSdkAdapter
 from .adapters.naysayer_sdk import NaysayerSdkAdapter
 from .conductor import Conductor, ConductorOutcome, LoopControlReader
 from .conductor.core import ConductorStopSlot, ConductorStopSnapshot, StopReason
 from .conductor.stand_down import post_stand_down_notice, resolve_launch
+from .conductor.tierc_gate import TierCGate
 from .config import (
     MindwireSettings,
     NaysayerGatingConfig,
     Stage3LoopConfig,
     load_settings,
+    resolve_tier_c_decisions_log_path,
     resolve_tierc_rules_path,
 )
 from .decider.verdict import TierCThresholds, TierCV2Thresholds
@@ -827,6 +830,22 @@ def build_conductor(
         )
     except ValueError as exc:
         raise SystemExit(f"decider misconfigured ([decider] in mindwire.toml): {exc}") from exc
+    # One INFO line each, on every start, whatever the value (DECIDED 2e-1b, the msg-4748
+    # recurrence fix): the Decider sat at backend=off for days with nothing in the log to say so.
+    # ``built`` is whether a Decider object exists — the only fact the hook acts on.
+    logger.info(
+        "decider: backend=%s tierc=%s questions=%s built=%s",
+        resolve_decider_backend(dec_cfg.backend),
+        dec_cfg.tierc.mode,
+        dec_cfg.tierc.questions,
+        "yes" if decider is not None else "no",
+    )
+    tierc_gate: TierCGate | None = None
+    if settings.tierc_gate.mode == "enforce":
+        tierc_gate = TierCGate(log_path=resolve_tier_c_decisions_log_path(settings))
+        logger.info("tierc_gate: enforce (log=%s)", tierc_gate.log_path)
+    else:
+        logger.info("tierc_gate: off")
     try:
         conductor = Conductor(
             mcp=mcp,
@@ -861,6 +880,8 @@ def build_conductor(
             # T42 stall watchdog input from the sweep (see :mod:`.conductor.stall`).
             launches_same_head=launches_same_head,
             launch_head_msg_id=launch_head_msg_id,
+            # Tier-C admission gate, enforced (DECIDED 2e-1b); ``None`` under mode="off".
+            tierc_gate=tierc_gate,
         )
     except ValueError as exc:
         raise SystemExit(f"conductor misconfigured ([conductor] in mindwire.toml): {exc}") from exc

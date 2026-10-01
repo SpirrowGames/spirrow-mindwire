@@ -563,6 +563,23 @@ class DeciderConfig(_StrictModel):
     tierc: DeciderTierCConfig = Field(default_factory=DeciderTierCConfig)
 
 
+class TierCGateConfig(_StrictModel):
+    """``[tierc_gate]`` — the Tier-C admission gate's acting mode (T-decider-conductor-hook 2e-1b).
+
+    * ``off`` (default) — the gate runs compute-only inside the Decider hook, as before: nothing
+      is written, nothing is bounced.
+    * ``enforce`` — a role-authored ``NEXT: human`` that ``_route`` stopped at the human and that
+      the gate bounces goes back to its author (one ``RETRY: <uuid>`` always reaches the human; a
+      gate failure reaches the human). State lives in
+      ``<data_dir>/state/tier_c_decisions_log.jsonl`` (:func:`resolve_tier_c_decisions_log_path`).
+      See :mod:`spirrow_mindwire.conductor.tierc_gate`.
+
+    Independent of ``[decider]``: the gate is deterministic and needs no Lexora backend.
+    """
+
+    mode: Literal["off", "enforce"] = "off"
+
+
 class NaysayerGatingConfig(_StrictModel):
     """PR-review debounce knobs (cost lever) for the Tier B naysayer gate.
 
@@ -622,6 +639,7 @@ class MindwireSettings(BaseSettings):
     conductor: ConductorConfig = Field(default_factory=ConductorConfig)
     naysayer_gating: NaysayerGatingConfig = Field(default_factory=NaysayerGatingConfig)
     decider: DeciderConfig = Field(default_factory=DeciderConfig)
+    tierc_gate: TierCGateConfig = Field(default_factory=TierCGateConfig)
 
     @field_validator("schema_version")
     @classmethod
@@ -633,6 +651,15 @@ class MindwireSettings(BaseSettings):
                 "Migrate the config or pin a compatible MindWire version."
             )
         return v
+
+
+TIER_C_DECISIONS_LOG_FILENAME = "tier_c_decisions_log.jsonl"
+"""The admission gate's single append-only log under ``<data_dir>/state/`` (2e-1b, msg-5141)."""
+
+
+def resolve_tier_c_decisions_log_path(settings: MindwireSettings) -> Path:
+    """``<data_dir>/state/tier_c_decisions_log.jsonl`` — the enforced gate's log and RETRY store."""
+    return settings.paths.data_dir / "state" / TIER_C_DECISIONS_LOG_FILENAME
 
 
 TIERC_RULES_FILENAME = "tierc_rules.toml"
@@ -712,6 +739,7 @@ __all__ = [
     "CONFIG_SCHEMA_VERSION",
     "DEFAULT_DATA_DIR",
     "TIERC_RULES_FILENAME",
+    "TIER_C_DECISIONS_LOG_FILENAME",
     "ClaudeCodeConfig",
     "ConductorConfig",
     "DeciderConfig",
@@ -726,7 +754,9 @@ __all__ = [
     "PathsConfig",
     "PhanthandConfig",
     "Stage3LoopConfig",
+    "TierCGateConfig",
     "WatcherConfig",
     "load_settings",
+    "resolve_tier_c_decisions_log_path",
     "resolve_tierc_rules_path",
 ]

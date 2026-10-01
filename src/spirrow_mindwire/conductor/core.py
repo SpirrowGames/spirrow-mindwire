@@ -78,7 +78,14 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..config import DEFAULT_CONDUCTOR_MAX_ROUNDS
-from ..decider.hook import Decider, ThreadMessage, run_proceed_clearance, run_tierc_hook
+from ..decider.hook import (
+    Decider,
+    ThreadMessage,
+    is_tierc_entry,
+    never_retry,
+    run_proceed_clearance,
+    run_tierc_hook,
+)
 from ..exceptions import AdapterSpawnTimeoutError
 from ..gate_admission import RED_CONCLUSIONS, AdmissionResult, GateAdmission, gate_admission
 from ..github.client import CheckRollup, PrRef, parse_pr_ref
@@ -88,6 +95,7 @@ from ..magickit.client import McpToolCaller, ThreadResolvedError
 from ..routing import GuardIVerdict, carve_out_iii_admissible, guard_proposer_to_implementer
 from ..source_marker import parse_attestation_marker
 from ..thread_context import build_thread_context
+from ..tier_c_admission_gate import AdmissionVerdict
 from ..value_objects import (
     ChatroomEvent,
     Event,
@@ -131,6 +139,7 @@ from .stand_down import (
     emit_stand_down,
     stand_down_event,
 )
+from .tierc_gate import TierCGate, bounced_msg_id, is_bounce_notice, render_bounce_body
 
 if TYPE_CHECKING:
     from ..naysayer.pr_review import PrReviewOutcome
@@ -355,6 +364,7 @@ class Conductor:
         stop_slot: ConductorStopSlot | None = None,
         launches_same_head: int = 0,
         launch_head_msg_id: str | None = None,
+        tierc_gate: TierCGate | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
@@ -407,6 +417,12 @@ class Conductor:
         # or sent it to a forced naysayer consult — and never changes the routing decision
         # ``_route`` already made (D20 monotonicity).
         self._decider = decider
+        # Tier-C admission gate, enforced (T-decider-conductor-hook DECIDED 2e-1b). ``None`` =
+        # ``[tierc_gate] mode = "off"``: the gate stays compute-only inside the Decider hook and the
+        # conductor behaves byte-for-byte as before. When set, a role-authored ``NEXT: human`` the
+        # gate bounces goes back to its author (``_enforce_tierc_gate``) — the one sanctioned
+        # exception to D20 monotonicity, bounded by RETRY / fail-open (see :mod:`.tierc_gate`).
+        self._tierc_gate = tierc_gate
         # Adapter-error side channel (Bohr msg-4440 D-1''). ``None`` = nobody reads it; the
         # dispatch still re-raises unchanged, so a bare Conductor behaves exactly as before.
         self._stop_slot = stop_slot
@@ -687,6 +703,45 @@ class Conductor:
                 target_role=target_role,
                 spawn_blocked=spawn_blocked,
             )
+            # Tier-C admission gate, enforced (DECIDED 2e-1b). Only a turn ``_route`` stopped at the
+            # human is a candidate: a forced naysayer consult has not reached the human yet, and a
+            # spawn-blocked dead end is not somebody asking. A bounce posts the notice and
+            # dispatches the author directly on it (as the PR-gate relay dispatches the
+            # implementer) — routing the notice's ``NEXT: <author>`` through ``_route`` would send
+            # an implementer author into guard (i).
+            if (
+                target_role is None
+                and stop_reason is StopReason.HUMAN
+                and not spawn_blocked
+                and self._tierc_gate is not None
+            ):
+                bounce_msg = await self._enforce_tierc_gate(handoff, latest)
+                if bounce_msg is not None:
+                    author_identity, author_role = self._roster_entry(_author(latest))
+                    handle = sessions.get(author_identity)
+                    if handle is None:
+                        spawned = await self._spawn(author_role, author_identity)
+                        if isinstance(spawned, SpawnGaveUp):
+                            return self._stop(
+                                round_index,
+                                StopReason.HUMAN,
+                                spawned.notice_msg_id,
+                                forced,
+                                forced_saveable,
+                            )
+                        handle = spawned
+                        sessions[author_identity] = handle
+                    await self._dispatch_recording(
+                        handle,
+                        bounce_msg,
+                        [*messages, bounce_msg],
+                        rounds=round_index,
+                        forced=forced,
+                        forced_saveable=forced_saveable,
+                    )
+                    # A silent author leaves the notice as the next latest → NO_PROGRESS.
+                    processed_msg_id = _msg_id(bounce_msg)
+                    continue
             if target_role is None:
                 assert stop_reason is not None  # _route always sets a reason when it stops
                 # Bohr msg-179 §6 invariant: a message that carries a non-null next_participant
@@ -878,7 +933,81 @@ class Conductor:
             # non-mismatch HUMAN escalation as an author request (msg-4861 / msg-4864 U1).
             author_requested_human=handoff.author_requested_human,
             now=datetime.now(UTC),
+            # Under enforce the compute-only gate reads the live RETRY store, so the Decider sees
+            # the verdict the enforced gate acts on (msg-5143); off keeps ``never_retry``.
+            retry_lookup=(
+                self._tierc_gate.retry_lookup if self._tierc_gate is not None else never_retry
+            ),
         )
+
+    async def _enforce_tierc_gate(
+        self, handoff: Handoff, latest: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Run the enforced admission gate on a head ``_route`` stopped at the human (2e-1b).
+
+        Returns the posted bounce notice when the head was bounced back to its author, else
+        ``None`` — and ``None`` means "stop at the human exactly as with the gate off". Entered only
+        for an author-written ``NEXT: human`` (a field/body mismatch is a conductor safety valve,
+        not a request) by a proposer / implementer / naysayer — the Decider hook's entry rule
+        (:func:`~..decider.hook.is_tierc_entry`), so ``pr-gate-relay``, ``conductor-relay``,
+        operator and the human are never gated (msg-5141 condition 3).
+
+        Fail-open (msg-5141 condition 2): an exception from the gate or the log write, a failure
+        to render the notice, or a notice that did not land (resolved thread / no ``msg_id``) all
+        return ``None``. The gate's rows are written before the notice is posted
+        (:meth:`.tierc_gate.TierCGate.admit`).
+        """
+        gate = self._tierc_gate
+        if gate is None:
+            return None
+        if handoff.kind is not HandoffKind.HUMAN or not handoff.author_requested_human:
+            return None
+        author = _author(latest)
+        if not is_tierc_entry(author_requested_human=True, author_role=self._roster_role(author)):
+            return None
+        try:
+            decision = gate.admit(
+                body=_content(latest),
+                author=author,
+                thread=self._thread_ref.thread_id,
+                msg_id=_msg_id(latest),
+                now=datetime.now(UTC),
+            )
+            logger.info(
+                "tierc_gate decision: msg=%s author=%s verdict=%s rule=%s",
+                _msg_id(latest),
+                author,
+                decision.verdict.value,
+                decision.rule,
+            )
+            if decision.verdict is not AdmissionVerdict.BOUNCE:
+                return None
+            body = render_bounce_body(
+                author=author, decision=decision, bounced_msg_id=_msg_id(latest)
+            )
+        except Exception:
+            logger.warning(
+                "tierc_gate failed on msg=%s; stopping at the human (fail-open)",
+                _msg_id(latest),
+                exc_info=True,
+            )
+            return None
+        posted = await self._post_as_conductor_relay(body)
+        if not _msg_id(posted):
+            logger.warning(
+                "tierc_gate bounce notice for msg=%s did not land; stopping at the human",
+                _msg_id(latest),
+            )
+            return None
+        return posted
+
+    def _roster_entry(self, author: str) -> tuple[str, Role]:
+        """``(roster identity, role)`` for a roster author, matched case-insensitively like
+        :meth:`_roster_role`. Only called for an author :func:`is_tierc_entry` admitted."""
+        for identity, role in self._roster.items():
+            if identity.casefold() == author.casefold():
+                return identity, role
+        raise KeyError(author)
 
     def _route(self, handoff: Handoff, messages: list[dict[str, Any]]) -> RouteDecision:
         """Decide who to dispatch (``role is None`` = stop with the returned ``StopReason``).
@@ -1456,6 +1585,7 @@ class Conductor:
         the two cannot ping-pong.)
         """
         segment = messages[:-1]  # exclude the latest msg (the one now handing to human)
+        bounced = _bounced_msg_ids(messages)
         boundary = 0
         for i, msg in enumerate(segment):
             # Layer 3: a past message that ended a segment with ``next_participant: human`` (with
@@ -1466,7 +1596,11 @@ class Conductor:
             past = resolve_handoff(
                 _content(msg), self._roster, next_participant=_next_participant(msg)
             )
-            if past.kind is HandoffKind.HUMAN:
+            # 2e-1b: a ``NEXT: human`` the admission gate bounced never reached the human, so it
+            # does not end the segment — else the author's RETRY / relabelled reply would force a
+            # second consult of a design the naysayer already reviewed. Matched by the msg_id
+            # the notice names, not by adjacency: another post can land in between (#398 advisory).
+            if past.kind is HandoffKind.HUMAN and _msg_id(msg) not in bounced:
                 boundary = i + 1
         return any(
             self._roster_role(_author(msg)) is self._naysayer_role and self._attested(msg)
@@ -1750,7 +1884,9 @@ class Conductor:
         for msg in reversed(messages[:-1]):
             msg_author = _author(msg)
             if msg_author == CONDUCTOR_RELAY_AUTHOR:
-                return True
+                # A Tier-C bounce notice (2e-1b) is a different write-back, not a D-1 redirect: it
+                # ends the episode like any other non-author post rather than counting toward D-1c.
+                return not is_bounce_notice(_content(msg))
             if msg_author != current_author:
                 return False
         return False
@@ -2078,6 +2214,22 @@ class Conductor:
             forced_naysayer_turns=forced,
             forced_naysayer_turns_saveable=forced_saveable,
         )
+
+
+def _bounced_msg_ids(messages: list[dict[str, Any]]) -> frozenset[str]:
+    """msg_ids the admission gate bounced (2e-1b), read from the ``conductor-relay`` notices.
+
+    Only ``conductor-relay`` posts count, so a role quoting a notice cannot mark a message as
+    bounced. Empty ids are dropped.
+    """
+    ids: set[str] = set()
+    for msg in messages:
+        if _author(msg) != CONDUCTOR_RELAY_AUTHOR:
+            continue
+        bounced = bounced_msg_id(_content(msg))
+        if bounced:
+            ids.add(bounced)
+    return frozenset(ids)
 
 
 def _msg_id(msg: dict[str, Any]) -> str:

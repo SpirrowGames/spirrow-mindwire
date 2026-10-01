@@ -433,8 +433,13 @@ async def run_tierc_hook(
     naysayer_role: Role,
     author_requested_human: bool,
     now: datetime | None = None,
+    retry_lookup: RetryLookup = never_retry,
 ) -> DecisionResult | None:
     """Entry check → admission gate (compute-only) → evaluate + log. Never changes the routing.
+
+    ``retry_lookup`` is the gate's RETRY store. ``never_retry`` while the gate is compute-only;
+    under ``[tierc_gate] mode = "enforce"`` the Conductor passes the live decisions-log lookup so
+    the ``gate_result`` the Decider sees is the verdict the enforced gate acts on (msg-5143).
 
     ``stop`` / ``is_forced`` / ``target_role`` / ``spawn_blocked`` are ``_route``'s return values
     for this turn
@@ -466,6 +471,7 @@ async def run_tierc_hook(
             body=head.content,
             author=head.author,
             now=now if now is not None else datetime.now(UTC),
+            retry_lookup=retry_lookup,
         )
         state = state_builder(
             turn_from_messages(
