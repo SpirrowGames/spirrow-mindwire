@@ -44,6 +44,8 @@
 # Fix: SIGNAL and SCHEDULING are separated. A non-zero exit now
 #   (a) is DECLARED — the candidate is quarantined (record written + Discord notification), and
 #   (b) does NOT stop the sweep — the next candidate is tried, so downstream work still progresses.
+# (2026-10-01, T-retry-once-before-quarantine, decided msg-5424: a FIRST failure is retried once
+# on a later tick before (a) applies — see the retry-pending block below the quarantine block.)
 # The old sweep-break fail-safe is retained but re-aimed: only a FAILURE TO WRITE THE DECLARATION
 # breaks the sweep. That reason still holds — if we cannot even record what went wrong, we must not
 # quietly move on. See the quarantine block below (Test-QuarantineDerivedState / New-DailyDigest
@@ -139,6 +141,10 @@ $headSkipStatePath = Join-Path $dataDir "state\head_skip.json"
 $sweepConfigPath = Join-Path $dataDir "config\sweep.json"
 $quarantineStatePath = Join-Path $dataDir "state\quarantine.json"
 $quarantineHistoryPath = Join-Path $dataDir "state\quarantine-history.json"
+# T-retry-once-before-quarantine D-3: threads whose first failure is waiting for its one automatic
+# retry. Written only by this sweep (single writer), so it needs no merge-on-write. Deliberately
+# NOT folded into quarantine.json — see the retry-pending block below the quarantine block.
+$retryPendingStatePath = Join-Path $dataDir "state\retry-pending.json"
 $evaluatedStatePath = Join-Path $dataDir "state\evaluated.json"
 $digestStatePath = Join-Path $dataDir "state\digest.json"
 # T-digest-exceeds-discord-limit-and-is-dropped D-6 (msg-2106): notify-health carries just enough to
@@ -849,7 +855,8 @@ function Get-HeadSkipMode {
 }
 
 # --- quarantine ---------------------------------------------------------------------------------
-# A quarantined thread has failed at least once and will not be launched again by this wrapper until
+# A quarantined thread has failed TWICE IN A ROW (its first failure was retried once — see the
+# retry-pending block below) and will not be launched again by this wrapper until
 # a human clears it (deploy/Clear-Quarantine.ps1). Records live in <data_dir>/state/quarantine.json,
 # one entry per `project/thread_id`. The head-skip state file $headSkipStatePath is separate —
 # different owner (the CLI), different concern (nomination-predicate observation), different life
@@ -864,15 +871,22 @@ function Get-HeadSkipMode {
 #
 # WHAT THIS FILE STORES — the minimum needed to (a) explain what broke last time and (b) let a
 # human decide whether to clear. It does NOT store anything used to AUTO-CLEAR: there is no auto
-# clear path (Q3, spec/msg-814). Fields:
+# clear path (Q3, spec/msg-814). Q3 was narrowed on 2026-10-01 (T-retry-once-before-quarantine,
+# msg-5424 rule 2) to exempt only "a first failure is retried once automatically"; once a thread
+# is quarantined, release is still a human's explicit Clear-Quarantine and nothing else. Fields:
 #   state                  quarantined | escalated | stale (derived from first_failure_at)
-#   first_failure_at       ISO 8601, UTC — set once
-#   last_failure_at        ISO 8601, UTC — refreshed if the same fingerprint fails again
-#   consecutive_failures   how many times the quarantine has been re-hit (usually 1: quarantined
-#                          threads are SKIPPED, so a re-hit needs a manual re-run or a probe change)
+#   first_failure_at       ISO 8601, UTC — the FIRST of the failures that led here (carried over
+#                          from the retry-pending record, so the 24h escalation counts from it)
+#   last_failure_at        ISO 8601, UTC — the failure that triggered the quarantine
+#   consecutive_failures   how many non-zero exits in a row led to this quarantine: 2 on the
+#                          retry path (first failure + failed retry). Records written before
+#                          2026-10-01 carry 1 (they were quarantined on the first failure)
+#   first_attempt          { exit_code; error_code; stop_reason; failure_fingerprint } of the first
+#                          failure; absent on a record written before the retry path existed
 #   exit_code              the conductor's exit code at the failure
 #   stop_reason            the parsed `reason=...`, or $null if the run died before that line
-#   failure_fingerprint    { head; control } observed at the failure — see the fingerprint rule
+#   failure_fingerprint    { head; control } observed at the LATEST failure — see the fingerprint
+#                          rule (the first failure's is in first_attempt)
 #   session_log_path       path to today's sweep log, so the tail can be found in context
 #   session_log_tail       last $SessionLogTailLines of the conductor's stdout+stderr for this run
 #
@@ -910,20 +924,198 @@ function New-QuarantineRecord {
         # Optional so all existing callers (the tests lift this function's AST directly
         # and call it with the old signature) keep working with an ``unknown`` default;
         # the sweep passes the resolved value explicitly.
-        [string]$FailureClass = 'unknown'
+        [string]$FailureClass = 'unknown',
+        # T-retry-once-before-quarantine D-3. All three optional, so the old call shape still
+        # produces the old record. The sweep's retry path passes them: last_failure_at = this
+        # (second) failure, consecutive_failures = 2, first_attempt = the retry-pending record's
+        # summary of the first failure. An empty -LastFailureAt means "same as first".
+        [string]$LastFailureAt = '',
+        [int]$ConsecutiveFailures = 1,
+        $FirstAttempt = $null
     )
 
-    return @{
+    $rec = @{
         state                = 'quarantined'
         first_failure_at     = $FirstFailureAt
-        last_failure_at      = $FirstFailureAt
-        consecutive_failures = 1
+        last_failure_at      = if ($LastFailureAt) { $LastFailureAt } else { $FirstFailureAt }
+        consecutive_failures = $ConsecutiveFailures
         exit_code            = $ExitCode
         stop_reason          = $StopReason
         failure_fingerprint  = @{ head = $FailureHead; control = $FailureControl }
         failure_class        = $FailureClass
         session_log_path     = $SessionLogPath
         session_log_tail     = $SessionLogTail
+    }
+    if ($null -ne $FirstAttempt) { $rec['first_attempt'] = $FirstAttempt }
+    return $rec
+}
+
+# --- retry-pending (T-retry-once-before-quarantine) ---------------------------------------------
+# DECIDED by Takahito, msg-5424: a failed launch is retried ONCE automatically; only a failed retry
+# is quarantined. Design: Bohr msg-5434 (v1) + msg-5441 (v2) + msg-5449 (D-4 addendum), approved by
+# Einstein msg-5452. Why: on 2026-10-01, 8 of 9 quarantined threads had consecutive_failures=1
+# (adapter.turn_timeout / adapter.shutdown_failed / ClaudeCodeSdkDeliveryError / bare exit 1), and
+# each sat until an operator cleared it — up to a day for one transient SDK failure.
+#
+# D-1 WHEN: on a LATER TICK, through the ordinary decide -> commit-launch -> spawn path, never inside
+#   the same sweep. A transient cause tends to repeat if hit again at once; a turn_timeout retry
+#   would double the wait for every later candidate; and the ordinary path is what makes the retry
+#   count in head_skip's backoff and in T42's launches_same_head. So a pending thread is NOT
+#   excluded from decide (a quarantined one is). It is retried only when decide says LAUNCH; a
+#   DEFER / SKIP carries the pending record over unchanged.
+# D-2 WHAT COUNTS: every exit other than 0 and 2, exactly the set that used to quarantine. "Unknown
+#   failure -> quarantine" becomes "unknown failure -> one retry -> quarantine". No error_code is
+#   exempt. Exit 2 (environment, not the thread's fault) neither consumes nor clears a pending
+#   retry; a pending record held up by a long exit-2 outage is not timed out into quarantine
+#   (msg-5441: that would charge the environment's fault to the thread) — the digest marks it 24h+.
+# D-3 STATE: this file, not quarantine.json. Every quarantine.json reader (the ContainsKey skip,
+#   the digest, derived states, Clear-Quarantine, merge-on-write) treats every key as quarantined,
+#   so a pending record there would be mis-read by all of them. The failure count resets ONLY on
+#   an exit 0, never on a head change: a thread that posts and then fails in SDK teardown every
+#   time moves its head on every run, and would never be quarantined if a head change reset it.
+# D-4 SAME-HEAD SAFETY: the retry launch carries --retry-of; the conductor turns it into a notice
+#   for roles in RETRY_NOTICE_ROLES only (src/spirrow_mindwire/conductor/retry_notice.py). The
+#   upper bound is the existing machinery: T42 (threshold 3) and head_skip's backoff.
+# D-5 K=2: a first failure and a failed retry both count as "a failure this sweep". At K the sweep
+#   stops as before, but pending records are NOT promoted to quarantine — once a systemic outage
+#   clears, the next tick's retries recover them.
+# D-6 RECORD: the log prefixes `retry-scheduled` / `retry-recovered` / `retry-failed→quarantined`
+#   (fixed, grep-stable), and events[] for the digest's summary counts, pruned when a digest is
+#   delivered.
+#
+# File shape: { "pending": { "<project/thread>": <New-RetryPendingRecord> },
+#               "events":  [ { at; key; kind } ] }   kind: one of $RetryEventKinds
+
+$RetryEventKinds = @('retry-scheduled', 'retry-recovered', 'retry-failed-quarantined')
+
+# events[] is pruned when a FULL digest lands (the counts have then been seen). A host with no
+# webhook never prunes, so the list is also capped, newest kept. The cap only bounds the file; it
+# is far above any day's real count (one event per failure / recovery).
+$RetryEventsCap = 500
+
+function Add-RetryEvent {
+    param([hashtable]$RetryState, [string]$At, [string]$Key, [string]$Kind)
+    $all = @($RetryState.events) + @(@{ at = $At; key = $Key; kind = $Kind })
+    if ($all.Count -gt $script:RetryEventsCap) {
+        $all = @($all[($all.Count - $script:RetryEventsCap)..($all.Count - 1)])
+    }
+    $RetryState.events = $all
+}
+
+# Normalise whatever Get-JsonState returned into @{ pending = [hashtable]; events = [array] }.
+# Nested JSON objects come back as PSCustomObject; the pending map is converted to a hashtable so
+# ContainsKey / Remove work. The records themselves stay as they are (dot access works on both).
+function ConvertTo-RetryPendingState {
+    param([hashtable]$Raw)
+    $pending = @{}
+    $events = @()
+    if ($null -ne $Raw) {
+        $p = $Raw['pending']
+        if ($p -is [hashtable]) {
+            foreach ($k in @($p.Keys)) { $pending[$k] = $p[$k] }
+        }
+        elseif ($null -ne $p) {
+            foreach ($prop in $p.PSObject.Properties) { $pending[$prop.Name] = $prop.Value }
+        }
+        if ($null -ne $Raw['events']) { $events = @($Raw['events']) }
+    }
+    return @{ pending = $pending; events = $events }
+}
+
+function New-RetryPendingRecord {
+    param(
+        [string]$FirstFailureAt,
+        [int]$ExitCode,
+        [string]$StopReason,
+        [string]$ErrorCode,
+        [string]$FailureClass = 'unknown',
+        [string]$FailureHead,
+        [string]$FailureControl,
+        [string]$SessionLogPath
+    )
+    return @{
+        first_failure_at    = $FirstFailureAt
+        exit_code           = $ExitCode
+        stop_reason         = $StopReason
+        error_code          = $ErrorCode
+        failure_class       = $FailureClass
+        failure_fingerprint = @{ head = $FailureHead; control = $FailureControl }
+        session_log_path    = $SessionLogPath
+    }
+}
+
+# A first_failure_at that went through ConvertFrom-Json is a [DateTime]; one written this tick is a
+# string. Both must render as the same ISO 8601 UTC text, so neither the --retry-of value nor the
+# quarantine record's carried-over first_failure_at depends on which tick the record was born on.
+function ConvertTo-RetryIso {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return '' }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime().ToString('o') }
+    return "$Value"
+}
+
+# The `--retry-of` value the sweep hands the conductor: "<error_code>@<first_failure_at>". A first
+# failure with no error_code (a bare exit 1) is named by its exit code, so the notice never says
+# "failed with nothing". Parsed on the Python side by conductor.retry_notice.parse_retry_of.
+function Get-RetryOfArgument {
+    param($Record)
+    $code = if ($Record.error_code) { "$($Record.error_code)" } else { "exit-$($Record.exit_code)" }
+    $at = ConvertTo-RetryIso $Record.first_failure_at
+    return "$code@$at"
+}
+
+# Apply one exit other than 0 / 2 to the retry state. Returns the action the caller must take:
+#   @{ action = 'retry-scheduled'; first = $null }       first failure: pending written, NO
+#                                                        quarantine, NO Discord alert (the log line
+#                                                        and the digest are the record)
+#   @{ action = 'quarantine'; first = <pending record> } the retry failed too: pending removed, and
+#                                                        the caller quarantines with `first` carried
+# The caller builds the quarantine record itself (it already holds every input
+# New-QuarantineRecord needs). Keeping this function to the state transition is what lets the
+# transition be tested in isolation.
+function Register-CandidateFailure {
+    param(
+        [hashtable]$RetryState,
+        [string]$Key,
+        [hashtable]$Record,
+        [datetime]$Now
+    )
+    $pending = $RetryState.pending
+    $at = $Now.ToUniversalTime().ToString('o')
+    if ($pending.ContainsKey($Key)) {
+        $first = $pending[$Key]
+        [void]$pending.Remove($Key)
+        Add-RetryEvent -RetryState $RetryState -At $at -Key $Key -Kind 'retry-failed-quarantined'
+        return @{ action = 'quarantine'; first = $first }
+    }
+    $pending[$Key] = $Record
+    Add-RetryEvent -RetryState $RetryState -At $at -Key $Key -Kind 'retry-scheduled'
+    return @{ action = 'retry-scheduled'; first = $null }
+}
+
+# Apply one exit 0. Returns $true when it cleared a pending retry (the caller logs retry-recovered).
+# Exit 0 is the ONLY thing that resets the count (D-3); a head change does not.
+function Register-CandidateSuccess {
+    param(
+        [hashtable]$RetryState,
+        [string]$Key,
+        [datetime]$Now
+    )
+    if (-not $RetryState.pending.ContainsKey($Key)) { return $false }
+    [void]$RetryState.pending.Remove($Key)
+    $at = $Now.ToUniversalTime().ToString('o')
+    Add-RetryEvent -RetryState $RetryState -At $at -Key $Key -Kind 'retry-recovered'
+    return $true
+}
+
+# The `first_attempt` block a retry-path quarantine record carries (D-3 / D-5).
+function Get-RetryFirstAttempt {
+    param($Pending)
+    return @{
+        exit_code           = $Pending.exit_code
+        error_code          = $Pending.error_code
+        stop_reason         = $Pending.stop_reason
+        failure_fingerprint = $Pending.failure_fingerprint
     }
 }
 
@@ -1402,7 +1594,11 @@ function New-DailyDigest {
         # notify-health.json. Prepended above the header when set — non-null iff the last full
         # success is ≥ 2 periods old. Never affects the dedup signature: msg-2101 D-7 forbids
         # letting rendering-side ephemera reach any suppression predicate.
-        [string]$HealthWarning = $null
+        [string]$HealthWarning = $null,
+        # T-retry-once-before-quarantine D-6: the sweep's retry state
+        # (ConvertTo-RetryPendingState shape: @{ pending; events }). Default empty, so a caller
+        # that predates the retry path renders the same sections it always did.
+        [hashtable]$RetryState = @{ pending = @{}; events = @() }
     )
 
     # Split by derived state (based on age, not stored — the digest is a snapshot of reality now).
@@ -1469,6 +1665,42 @@ function New-DailyDigest {
         }
     }
 
+    # Retry-pending rows (T-retry-once-before-quarantine D-6 + msg-5441's addition). One row per
+    # thread whose first failure is waiting for its one retry, with its age since that failure.
+    # An entry at or past $QuarantineEscalatedAfter is marked `24h+` and sorts first. The threshold
+    # is deliberately the SAME value as the quarantine escalation (the same reason the header gives
+    # for $StarvedThreshold): two different "24h" lines would be a distinction nobody can explain.
+    # Display only — no state, no scheduling effect, no time-out into quarantine (msg-5441).
+    $retryList = @()
+    $retryPending = if ($RetryState -and $RetryState.pending) { $RetryState.pending } else { @{} }
+    foreach ($key in $retryPending.Keys) {
+        $prec = $retryPending[$key]
+        $pAt = ConvertTo-UtcInstant $prec.first_failure_at
+        $pSpan = if ($pAt) { $Now - $pAt } else { [TimeSpan]::Zero }
+        $overdue = ($pSpan -ge $script:QuarantineEscalatedAfter)
+        $pCode = if ($prec.error_code) { "$($prec.error_code)" } else { "exit=$($prec.exit_code)" }
+        $mark = if ($overdue) { "24h+ " } else { "" }
+        $retryList += [PSCustomObject]@{
+            Line       = "  $mark$key   $(Format-DurationDigest -Span $pSpan)   ($pCode)"
+            AgeSeconds = [int64]$pSpan.TotalSeconds
+            Overdue    = [int]$overdue
+        }
+    }
+    $retryList = @($retryList | Sort-Object -Property @{ Expression = 'Overdue'; Descending = $true },
+                                                       @{ Expression = 'AgeSeconds'; Descending = $true })
+    # Summary counts since the last full digest (events[] is pruned on a full delivery). Counted
+    # inline rather than via a helper so this renderer stays liftable on its own by the tests.
+    $retryCounts = @{ scheduled = 0; recovered = 0; quarantined = 0 }
+    foreach ($ev in @($(if ($RetryState) { $RetryState.events } else { @() }))) {
+        if ($null -eq $ev) { continue }
+        $evKind = if ($ev -is [hashtable]) { $ev['kind'] } else { $ev.kind }
+        switch ("$evKind") {
+            'retry-scheduled'          { $retryCounts.scheduled++ }
+            'retry-recovered'          { $retryCounts.recovered++ }
+            'retry-failed-quarantined' { $retryCounts.quarantined++ }
+        }
+    }
+
     # Starvation. Pivoted on $LiveKeys, NOT $EvaluatedState.Keys — the same reason the header of
     # this function spells out. A live key that is absent from $EvaluatedState (never launched) is
     # a legitimate starvation candidate; a state key that is not live (folded from the sweep list)
@@ -1507,7 +1739,8 @@ function New-DailyDigest {
     # non-empty days.
     $totalQ = $escalatedList.Count + $quarantinedList.Count + $staleList.Count
     $oldestQuarantineDays = if ($oldestQuarantineAge) { [int]($oldestQuarantineAge.TotalDays) } else { 0 }
-    $summary = "human-parked $($HumanParked.Count) / 隔離 $totalQ / 飢餓 $($starvedList.Count) / 最古 ${oldestQuarantineDays}d"
+    $summary = "human-parked $($HumanParked.Count) / 隔離 $totalQ / 飢餓 $($starvedList.Count) / 最古 ${oldestQuarantineDays}d" +
+               " / 再試行 $($retryCounts.scheduled) / 回復 $($retryCounts.recovered) / 再試行後隔離 $($retryCounts.quarantined)"
 
     $lines = @()
     # T-digest-exceeds-discord-limit-and-is-dropped D-6: ⚠ line ABOVE the header when set. Prepending
@@ -1682,6 +1915,11 @@ function New-DailyDigest {
     $staleHeadLine = "  [stale] — 直すか、スレッドを畳むか決めよ"
     $escHeadLine   = "  [escalated] — 24h 以上経過"
     $quarHeadLine  = "  [quarantined]"
+    # Emitted only when something is pending; the summary line carries the 0 every day.
+    $retryHeadLines = @()
+    if ($retryList.Count -gt 0) {
+        $retryHeadLines = @("", "再試行待ち [retry-pending]: $($retryList.Count) 件（1 回目の失敗後、次の tick 以降で 1 回だけ再試行）")
+    }
 
     $parkedHeadLines = @("", "判断待ち: $($HumanParked.Count) 件")
     if ($HumanParked.Count -eq 0) { $parkedHeadLines += "  (該当なし)" }
@@ -1711,8 +1949,10 @@ function New-DailyDigest {
                             (_SectionFloorCost -Entries $starvedList -Indent '  ') + $reserveAfterStarved
     $reserveAfterParked   = (_LinesCost $fetchErrHeadLines) +
                             (_SectionFloorCost -Entries $errorEntries -Indent '    ') + $reserveAfterFetchErr
-    $reserveAfterQuar     = (_LinesCost $parkedHeadLines) +
+    $reserveAfterRetry    = (_LinesCost $parkedHeadLines) +
                             (_SectionFloorCost -Entries $parkedEntries -Indent '  ') + $reserveAfterParked
+    $reserveAfterQuar     = (_LinesCost $retryHeadLines) +
+                            (_SectionFloorCost -Entries $retryList -Indent '  ') + $reserveAfterRetry
     $reserveAfterEsc      = $reserveAfterQuar
     if ($quarantinedList.Count -gt 0) {
         $reserveAfterEsc += (_LinesCost @($quarHeadLine)) + (_SectionFloorCost -Entries $quarantinedList -Indent '  ')
@@ -1753,6 +1993,16 @@ function New-DailyDigest {
             $lines += $result.Emitted
             $lines += _SectionOverflowLines -Result $result -Indent '  '
         }
+    }
+
+    # 再試行待ち (T-retry-once-before-quarantine D-6). Between 隔離 and 判断待ち: it is the tier
+    # just below quarantine, and it gets the same floor discipline as every other section.
+    if ($retryList.Count -gt 0) {
+        $lines += $retryHeadLines
+        $runLen = [ref]($lines -join "`n").Length
+        $result = _AddSectionEntries -Entries $retryList -MaxLen $Budget -Reserve $reserveAfterRetry -RunningLen $runLen
+        $lines += $result.Emitted
+        $lines += _SectionOverflowLines -Result $result -Indent '  '
     }
 
     # 判断待ち — emitted even at 0 件, mirroring the "silent day is the point" contract of 飢餓
@@ -3510,6 +3760,8 @@ try {
     # contract. Only quarantine.json needs this — the head-skip state file has a single writer
     # (scripts/head_skip_decide.py) and is never edited by an operator during a sweep.
     $quarantineOriginalKeys = @($quarantineState.Keys)
+    # T-retry-once-before-quarantine D-3. Single writer (this sweep), so no original-keys snapshot.
+    $retryState = ConvertTo-RetryPendingState -Raw (Get-JsonState -Path $retryPendingStatePath)
     $nowUtc = [DateTime]::UtcNow
 
     # --- head-skip decide batch (Bohr msg-1430 §W-2) --------------------------------------------
@@ -3545,6 +3797,8 @@ try {
         $eligible = @()
         foreach ($c in $projCands) {
             if ($quarantineState.ContainsKey($c.key)) { continue }
+            # A retry-pending thread is deliberately NOT excluded (T-retry-once-before-quarantine
+            # D-1): its retry is fired only on a LAUNCH verdict, so backoff paces it like any launch.
             $hid = if ($null -ne $projHeads -and $projHeads.ContainsKey($c.thread_id)) { "$($projHeads[$c.thread_id])" } else { "" }
             $ctl = if ($null -ne $projControl) { "$($projControl.desired_state)" } else { "" }
             $eligible += @{ thread_id = $c.thread_id; head_msg_id = $hid; control_state = $ctl }
@@ -3631,8 +3885,14 @@ try {
     $skipped = 0
     $held = 0
     $quarantineSkipped = 0     # candidates dropped because already quarantined
-    $newlyQuarantined = 0      # non-zero exits this tick
-    $quarantineErrorCodes = @()  # error_code per quarantine this tick ('' if none) — K alert only
+    $newlyQuarantined = 0      # failed retries quarantined this tick
+    # T-retry-once-before-quarantine D-5: K counts FAILURES (first failures + failed retries), not
+    # quarantines — a first failure no longer quarantines, but it is still a failure in this sweep.
+    $sweepFailures = 0
+    $retryScheduled = 0        # first failures put on retry-pending this tick
+    $retryRecovered = 0        # retries that exited 0 this tick
+    $retryLaunched = 0         # launches this tick that were a retry
+    $quarantineErrorCodes = @()  # error_code per failure this tick ('' if none) — K alert only
     $notReached = 0            # candidates the sweep never got to (K-cap, worked-and-broke)
     $sweepSignature = @()
     $dispositions = @{}        # key -> "worked" | "no-work" | "head-skipped" | "quarantined-skipped" | "held" | "not-reached"
@@ -3808,6 +4068,15 @@ try {
         # `NEXT: human`, exit 0) at the threshold; the sweep only counts (it never posts).
         $stallArgs = @('--launches-same-head', "$($commitResult.launches_same_head)")
         if ($commitResult.head_msg_id) { $stallArgs += @('--launch-head-msg-id', "$($commitResult.head_msg_id)") }
+        # T-retry-once-before-quarantine D-4: a launch of a retry-pending thread IS its one retry.
+        # --retry-of lets the conductor warn roles in RETRY_NOTICE_ROLES (the implementer) that the
+        # failed launch may already have pushed / opened a PR / commented on this same head.
+        if ($retryState.pending.ContainsKey($cand.key)) {
+            $retryOf = Get-RetryOfArgument -Record $retryState.pending[$cand.key]
+            $stallArgs += @('--retry-of', $retryOf)
+            $retryLaunched++
+            Write-Log "retry-launch $($cand.key): --retry-of $retryOf (launches_same_head=$($commitResult.launches_same_head))"
+        }
         $output = (& $inner @stallArgs *>&1) | ForEach-Object { "$_" }
         $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
         $verdict = Get-ConductorVerdict -Output $output
@@ -3913,7 +4182,9 @@ try {
             continue
         }
 
-        # NON-ZERO EXIT — quarantine, notify, keep going. The old wrapper broke the sweep here
+        # NON-ZERO EXIT — retry once, then quarantine; notify; keep going. (T-retry-once-before-
+        # quarantine, msg-5424: the FIRST failure goes to retry-pending and is relaunched on a later
+        # tick; only a failed retry reaches the quarantine below.) The old wrapper broke the sweep here
         # (silent), which was the exact failure mode of the 2026-08-11 5h starvation on threads
         # BEHIND the broken candidate. The direct cause of that starvation is fixed elsewhere
         # (#136 / OBL-MERGE-MECHANISM); this branch exists to keep the NEXT unknown breakage from
@@ -3942,15 +4213,38 @@ try {
             # bug family the ledger was built to catch (row 6: ``$RepoRoot`` — 受け口はあるが誰も読まない).
             $failureClass = Get-FailureClass -SessionLogTail $tail -RepoRoot $repoRoot
             $quarantineReason = Get-QuarantineStopReason -Verdict $verdict
-            $quarantineErrorCodes += if ($verdict.error_code) { "$($verdict.error_code)" } else { '' }
-            $rec = New-QuarantineRecord `
+            $errorCode = if ($verdict.error_code) { "$($verdict.error_code)" } else { '' }
+            $quarantineErrorCodes += $errorCode
+            $sweepFailures++
+            $pendingRec = New-RetryPendingRecord `
                 -FirstFailureAt $nowIso -ExitCode $code -StopReason $quarantineReason `
+                -ErrorCode $errorCode -FailureClass $failureClass `
+                -FailureHead $probeHead -FailureControl $currentControl -SessionLogPath $logPath
+            $transition = Register-CandidateFailure -RetryState $retryState -Key $cand.key `
+                -Record $pendingRec -Now $nowUtc
+        }
+        if ($code -ne 0 -and $transition.action -eq 'retry-scheduled') {
+            # First failure: no quarantine and no Discord alert. The log line is the immediate
+            # record; the digest's summary counts and [retry-pending] section are the daily one.
+            $retryScheduled++
+            Write-Log "retry-scheduled $($cand.key): exit=$code reason=$quarantineReason error_code=$errorCode rounds=$($verdict.rounds) last_msg=$($verdict.last_msg) — retried once on a later tick, not quarantined"
+        }
+        elseif ($code -ne 0) {
+            # The retry failed too — quarantine, carrying the first failure over (D-3).
+            $first = $transition.first
+            $firstIso = ConvertTo-RetryIso $first.first_failure_at
+            if (-not $firstIso) { $firstIso = $nowIso }
+            $rec = New-QuarantineRecord `
+                -FirstFailureAt $firstIso -ExitCode $code -StopReason $quarantineReason `
                 -FailureHead $probeHead -FailureControl $currentControl `
                 -SessionLogPath $logPath -SessionLogTail $tail `
-                -FailureClass $failureClass
+                -FailureClass $failureClass `
+                -LastFailureAt $nowIso -ConsecutiveFailures 2 `
+                -FirstAttempt (Get-RetryFirstAttempt -Pending $first)
             $quarantineState[$cand.key] = $rec
             $newlyQuarantined++
-            Write-Log "quarantined $($cand.key): exit=$code reason=$quarantineReason rounds=$($verdict.rounds) last_msg=$($verdict.last_msg) — sweep CONTINUES (signal is the notification, not the stop)"
+            $firstCode = if ($first.error_code) { "$($first.error_code)" } else { "exit=$($first.exit_code)" }
+            Write-Log "retry-failed→quarantined $($cand.key): exit=$code reason=$quarantineReason error_code=$errorCode rounds=$($verdict.rounds) last_msg=$($verdict.last_msg) (first failure: $firstCode at $firstIso) — sweep CONTINUES (signal is the notification, not the stop)"
 
             # Initial-quarantine notification. Fires once per newly-recorded quarantine. Signature
             # is the failure fingerprint so a re-quarantine after Clear-Quarantine (which drops the
@@ -3959,7 +4253,7 @@ try {
             $reproHint = Get-QuarantineReproHint -Fingerprint $rec.failure_fingerprint `
                                                  -SessionLogPath $rec.session_log_path `
                                                  -Key $cand.key
-            $notificationBody = "MindWire: **$($cand.key)** を隔離しました (exit=$code, reason=$quarantineReason)。" +
+            $notificationBody = "MindWire: **$($cand.key)** は再試行でも失敗したため隔離しました (exit=$code, reason=$quarantineReason; 1 回目: $firstCode)。" +
                                 "以後この tick からは skip されます。復帰するには " +
                                 "``pwsh deploy/Clear-Quarantine.ps1 -Thread '$($cand.key)' -Reason '...'``。" +
                                 "ダイジェストにも別掲されます。"
@@ -3973,26 +4267,38 @@ try {
             Send-NotificationIfChanged -State $notifyState -Key "__quarantine__/$($cand.key)" `
                 -Signature "${nowIso}:${code}:${quarantineReason}:${probeHead}" `
                 -Message $notificationBody
-
-            # K-budget short-circuit. Two quarantines in one sweep suggest a shared cause; keep
+        }
+        if ($code -ne 0) {
+            # K-budget short-circuit. Two failures in one sweep suggest a shared cause; keep
             # spending inferences past the second is the exact "keep bleeding" failure mode this
             # design refuses. The sweep breaks and fires a systemic-cause notification.
-            if ($newlyQuarantined -ge $QuarantineFailureBudget) {
-                Write-Log "quarantine budget K=$QuarantineFailureBudget hit in one sweep — stopping (systemic cause suspected)"
+            # T-retry-once-before-quarantine D-5: counted on FAILURES (first failures included),
+            # and a K hit does NOT promote the pending ones to quarantine — after a systemic wave
+            # clears, the next tick's retries recover them instead of leaving two for a human.
+            if ($sweepFailures -ge $QuarantineFailureBudget) {
+                Write-Log "failure budget K=$QuarantineFailureBudget hit in one sweep ($newlyQuarantined quarantined, $retryScheduled retry-scheduled) — stopping (systemic cause suspected)"
                 # Day-bucketed signature (see Get-SystemicAlertSignature): one alert per UTC day of
                 # an ongoing systemic wave, then silence. A tick-level timestamp here spammed on
                 # every tick — exactly the "retraining the channel into noise" mode this file avoids
                 # elsewhere.
                 Send-NotificationIfChanged -State $notifyState -Key "__quarantine_systemic__" `
-                    -Signature (Get-SystemicAlertSignature -Now $nowUtc -Count $newlyQuarantined) `
-                    -Message ("MindWire: 同一 sweep で K=$QuarantineFailureBudget 件の quarantine が発生しました。" +
+                    -Signature (Get-SystemicAlertSignature -Now $nowUtc -Count $sweepFailures) `
+                    -Message ("MindWire: 同一 sweep で K=$QuarantineFailureBudget 件の失敗が発生しました " +
+                              "(隔離 $newlyQuarantined / 再試行待ち $retryScheduled)。" +
                               "systemic な原因の可能性が高いため、この tick を打ち切ります。" +
+                              "再試行待ちは隔離に格上げせず、次の tick 以降で再試行します。" +
                               "残候補はスキップ (`not-reached`) 扱いで飢餓計測に載ります。" +
                               (Get-SystemicCauseHint -Codes $quarantineErrorCodes))
                 $breakReason = 'k-budget-hit'
                 break
             }
             continue
+        }
+        # Exit 0 — the ONLY thing that clears a pending retry (D-3). Exit 2 already `continue`d
+        # above without touching retry-pending, so it neither consumes nor clears a retry.
+        if (Register-CandidateSuccess -RetryState $retryState -Key $cand.key -Now $nowUtc) {
+            $retryRecovered++
+            Write-Log "retry-recovered $($cand.key): exit=0 reason=$($verdict.reason) rounds=$($verdict.rounds) last_msg=$($verdict.last_msg) — retry-pending cleared"
         }
         # Fail-safe: no parseable verdict on a zero-exit means we do not actually know whether work
         # happened. That is a declaration failure — the whole point of the record-on-fail path above
@@ -4081,6 +4387,11 @@ try {
         -OriginalKeys $quarantineOriginalKeys -DiskPath $quarantineStatePath
     Save-JsonState -Path $quarantineStatePath -State $mergedQuarantine
     Save-JsonState -Path $evaluatedStatePath -State $evaluatedState
+    # retry-pending.json: single writer (this sweep), so a plain write. Report mode launches
+    # nothing and therefore changed nothing here; it writes nothing either (msg-5434 test list).
+    if ($headSkipMode -ne 'report') {
+        Save-JsonState -Path $retryPendingStatePath -State $retryState
+    }
 
     # Starvation report. Included in the log every tick that logs anything (an idle tick still
     # collapses to one line), so the metric is visible without waiting for the digest. The digest is
@@ -4178,7 +4489,8 @@ try {
                 -HumanParked $humanParked -PendingDecisionsState $pendingDecisionsState `
                 -ParkedPollErrors $parkedPollErrors `
                 -Budget $DigestBudget `
-                -HealthWarning $healthWarning
+                -HealthWarning $healthWarning `
+                -RetryState $retryState
             Confirm-LogWorthKeeping
             Write-Log "sending daily digest ($($quarantineState.Count) quarantined, $($starved.Count) starved, $($humanParked.Count) human-parked, payload=$($digest.Length) chars)"
             $result = Send-Notification -Message $digest
@@ -4250,6 +4562,13 @@ try {
             # contents, so ⚠ must stay lit until a full digest lands.
             if (Test-DigestFullSuccess -Result $result) {
                 $notifyHealth['last_full_success_period'] = $currentPeriod
+                # T-retry-once-before-quarantine D-6: the summary counts are "since the last digest
+                # the human actually read", so events[] is pruned only on a FULL delivery — a
+                # degraded one did not show them.
+                if ($headSkipMode -ne 'report' -and @($retryState.events).Count -gt 0) {
+                    $retryState.events = @()
+                    Save-JsonState -Path $retryPendingStatePath -State $retryState
+                }
             }
             Save-JsonState -Path $notifyHealthPath -State $notifyHealth
         }
@@ -4257,9 +4576,9 @@ try {
 
     # Summary line categories, ranked so the most-informative wording wins. Order matters:
     # quarantine and K-hit are louder than a plain idle sweep.
-    if ($newlyQuarantined -gt 0) {
+    if ($newlyQuarantined -gt 0 -or $retryScheduled -gt 0 -or $retryRecovered -gt 0) {
         Confirm-LogWorthKeeping
-        Write-Log "sweep summary: $newlyQuarantined newly quarantined, $quarantineSkipped skipped-as-quarantined, $held held, $skipped head-skipped, $launched launched, $notReached not-reached"
+        Write-Log "sweep summary: $newlyQuarantined newly quarantined, $retryScheduled retry-scheduled, $retryRecovered retry-recovered, $retryLaunched retry-launched, $($retryState.pending.Count) retry-pending, $quarantineSkipped skipped-as-quarantined, $held held, $skipped head-skipped, $launched launched, $notReached not-reached"
     }
     elseif ($held -gt 0 -and ($held + $skipped + $quarantineSkipped) -eq $candidates.Count) {
         # Nothing ran, and at least part of the reason was a deliberate HOLD. Said separately from

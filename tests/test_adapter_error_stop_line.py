@@ -40,6 +40,7 @@ from spirrow_mindwire.conductor.core import (
     StopReason,
     adapter_error_code,
 )
+from spirrow_mindwire.conductor.retry_notice import RetryOf
 from spirrow_mindwire.config import ConductorConfig, MindwireSettings, Stage3LoopConfig
 from spirrow_mindwire.exceptions import AdapterDeliveryError
 from spirrow_mindwire.value_objects import ChatroomEvent, Role, SessionHandle
@@ -262,6 +263,8 @@ def _patch_main(monkeypatch: pytest.MonkeyPatch, body: Any) -> None:
         # T42: main() now also forwards the sweep's stall-watchdog input (defaults never stall).
         launches_same_head: int = 0,
         launch_head_msg_id: str | None = None,
+        # T-retry-once-before-quarantine D-4: and the sweep's --retry-of (None = not a retry).
+        retry_of: RetryOf | None = None,
     ) -> None:
         assert stop_slot is not None, "main must hand the conductor a stop slot"
         await body(stop_slot)

@@ -212,6 +212,10 @@ def build_turn_prompt(event: ChatroomEvent, own_role: Role, closing: str) -> str
     if history:
         blocks.append(history)
     blocks.append(f"New message from {payload.author}:\n\n{payload.body}")
+    # T-retry-once-before-quarantine D-4: its own block, after the trigger and before the
+    # closing, so it is never mistaken for part of the author's message. Absent → no block.
+    if event.retry_notice:
+        blocks.append(event.retry_notice)
     blocks.append(closing)
     return "\n\n".join(blocks)
 
